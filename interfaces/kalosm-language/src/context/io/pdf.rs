@@ -38,12 +38,19 @@ impl IntoDocument for PdfDocument {
         let doc = load_pdf(&self.path).await?;
         let title = doc
             .get_toc()
-            .map_err(FsDocumentError::Decode)?
-            .toc
-            .into_iter()
-            .min_by_key(|toc| toc.level)
-            .map(|toc| toc.title.to_string())
-            .unwrap_or_default();
+            .ok()
+            .and_then(|toc| {
+                toc.toc
+                    .into_iter()
+                    .min_by_key(|toc| toc.level)
+                    .map(|toc| toc.title.to_string())
+            })
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or("Untitled Document")
+                    .to_string()
+            });
         let text = get_pdf_text(&doc)?;
         if !text.errors.is_empty() {
             tracing::error!(

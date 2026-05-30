@@ -1,51 +1,108 @@
 use std::{
-    borrow::Cow,
     fmt::Debug,
-    num::{NonZeroU64, NonZeroUsize},
-    path::PathBuf,
-    sync::Arc,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
-use lru::LruCache;
-use parking_lot::RwLock;
-use rustc_hash::FxBuildHasher;
-use wgpu::{BindGroupLayout, BufferUsages, Limits, PipelineLayout, ShaderModule};
+use fusor_tile_ir_runtime::{BufferPool, KernelCache};
+use wgpu::{BackendOptions, Dx12BackendOptions};
 
-#[derive(Debug)]
-struct CachedBuffer {
-    writen: bool,
-    buffer: Arc<wgpu::Buffer>,
+use crate::{compute_graph::ComputeGraph, kernel_selection::CooperativeMatrixCaps};
+
+const GPU_POLL_SPIN_BUDGET: Duration = Duration::from_millis(2);
+
+fn poll_until_queue_empty(device: &wgpu::Device) -> Result<wgpu::PollStatus, wgpu::PollError> {
+    let start = Instant::now();
+    loop {
+        let status = device.poll(wgpu::PollType::Poll)?;
+        if status.is_queue_empty() {
+            return Ok(status);
+        }
+        if start.elapsed() >= GPU_POLL_SPIN_BUDGET {
+            return device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        std::thread::yield_now();
+    }
 }
 
-impl CachedBuffer {
-    fn new(buffer: Arc<wgpu::Buffer>, writen: bool) -> Self {
-        Self { writen, buffer }
+async fn select_adapter(
+    instance: &wgpu::Instance,
+    backends: wgpu::Backends,
+) -> Result<wgpu::Adapter, crate::Error> {
+    let desired_adapter_name = std::env::var("WGPU_ADAPTER_NAME")
+        .ok()
+        .map(|name| name.to_ascii_lowercase());
+
+    let mut adapters = instance.enumerate_adapters(backends).await;
+    if let Some(desired_adapter_name) = desired_adapter_name {
+        return adapters
+            .into_iter()
+            .find(|adapter| {
+                adapter
+                    .get_info()
+                    .name
+                    .to_ascii_lowercase()
+                    .contains(&desired_adapter_name)
+            })
+            .ok_or_else(|| {
+                crate::Error::msg(format!(
+                    "WGPU_ADAPTER_NAME={desired_adapter_name:?} did not match any available adapter"
+                ))
+            });
     }
 
-    fn initialized(&self) -> bool {
-        self.writen
+    if !adapters.is_empty() {
+        adapters.sort_by_key(adapter_preference_rank);
+        return Ok(adapters.remove(0));
     }
 
-    fn set_initialized(&mut self) {
-        self.writen = true;
+    let preferred = wgpu::PowerPreference::from_env().unwrap_or_default();
+    let mut last_error = None;
+    for power_preference in [
+        preferred,
+        wgpu::PowerPreference::HighPerformance,
+        wgpu::PowerPreference::LowPower,
+        wgpu::PowerPreference::None,
+    ] {
+        match instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await
+        {
+            Ok(adapter) => return Ok(adapter),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    let detail = last_error
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "no adapter returned".to_string());
+    Err(crate::Error::msg(format!(
+        "failed to find a suitable GPU adapter: {detail}"
+    )))
+}
+
+fn adapter_preference_rank(adapter: &wgpu::Adapter) -> u8 {
+    match adapter.get_info().device_type {
+        wgpu::DeviceType::DiscreteGpu => 0,
+        wgpu::DeviceType::IntegratedGpu => 1,
+        wgpu::DeviceType::VirtualGpu => 2,
+        wgpu::DeviceType::Other => 3,
+        wgpu::DeviceType::Cpu => 4,
     }
 }
 
 struct DeviceInner {
-    device: wgpu::Device,
+    device: Arc<wgpu::Device>,
     adapter: wgpu::Adapter,
-    queue: wgpu::Queue,
-    cache: Option<wgpu::PipelineCache>,
-    cache_file: Option<PathBuf>,
-    bind_group_layout_cache:
-        RwLock<LruCache<Vec<wgpu::BindGroupLayoutEntry>, BindGroupLayout, FxBuildHasher>>,
-    pipeline_layout_cache: RwLock<LruCache<BindGroupLayout, wgpu::PipelineLayout, FxBuildHasher>>,
-    shader_module_cache: RwLock<LruCache<String, wgpu::ShaderModule, FxBuildHasher>>,
-    compute_pipeline_cache:
-        RwLock<LruCache<(PipelineLayout, ShaderModule), wgpu::ComputePipeline, FxBuildHasher>>,
-    // Cache for buffer allocations, keyed by size in bytes
-    buffer_allocation_cache:
-        RwLock<LruCache<(u64, BufferUsages), Vec<CachedBuffer>, FxBuildHasher>>,
+    queue: Arc<wgpu::Queue>,
+    kernel_cache: KernelCache,
+    buffer_pool: BufferPool,
+    cooperative_matrix_caps: CooperativeMatrixCaps,
+    compute_graph: OnceLock<ComputeGraph>,
 }
 
 impl Debug for DeviceInner {
@@ -57,6 +114,22 @@ impl Debug for DeviceInner {
     }
 }
 
+/// A weak reference to a [`Device`] that does not prevent cleanup.
+///
+/// Used internally to break reference cycles (e.g., between Device and ComputeGraph).
+#[derive(Clone, Debug)]
+pub struct WeakDevice {
+    inner: std::sync::Weak<DeviceInner>,
+}
+
+impl WeakDevice {
+    /// Attempt to upgrade to a strong [`Device`] reference.
+    /// Returns `None` if the device has already been dropped.
+    pub fn upgrade(&self) -> Option<Device> {
+        self.inner.upgrade().map(|inner| Device { inner })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Device {
     inner: Arc<DeviceInner>,
@@ -64,82 +137,115 @@ pub struct Device {
 
 impl Device {
     pub async fn new() -> Result<Self, crate::Error> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+        let dx_compiler = wgpu::Dx12Compiler::from_env().unwrap_or_default();
+        let backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            backend_options: BackendOptions {
+                dx12: Dx12BackendOptions {
+                    shader_compiler: dx_compiler,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let adapter = select_adapter(&instance, backends).await?;
+        let adapter_features = adapter.features();
+        let mut required_features = wgpu::Features::empty();
+        if adapter_features.contains(wgpu::Features::SUBGROUP) {
+            required_features |= wgpu::Features::SUBGROUP;
+        }
+        if adapter_features.contains(wgpu::Features::SHADER_F16) {
+            required_features |= wgpu::Features::SHADER_F16;
+        }
+        if std::env::var_os("FUSOR_TRACE_GPU_KERNELS").is_some() {
+            if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+                required_features |= wgpu::Features::TIMESTAMP_QUERY;
+                if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
+                    required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
+                }
+            } else {
+                eprintln!(
+                    "FUSOR_TRACE_GPU_KERNELS requested, but adapter does not support timestamp queries"
+                );
+            }
+        }
+        let mut experimental_features = wgpu::ExperimentalFeatures::default();
+        if adapter_features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            required_features |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
+            // SAFETY: cooperative matrix is an experimental feature that requires opting in
+            experimental_features = unsafe { wgpu::ExperimentalFeatures::enabled() };
+        }
+        let cooperative_matrix_properties =
+            if required_features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+                adapter.cooperative_matrix_properties()
+            } else {
+                Vec::new()
+            };
+        let cooperative_matrix_caps = CooperativeMatrixCaps::from_properties(
+            required_features,
+            &cooperative_matrix_properties,
+        );
+        if std::env::var_os("FUSOR_TRACE_GPU_KERNELS").is_some()
+            && !cooperative_matrix_properties.is_empty()
+        {
+            eprintln!("Fusor cooperative matrix properties: {cooperative_matrix_properties:?}");
+            eprintln!("Fusor cooperative matrix caps: {cooperative_matrix_caps:?}");
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Fusor ML Device"),
-                required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16,
-                required_limits: Limits {
-                    max_buffer_size: adapter.limits().max_buffer_size,
-                    max_compute_workgroup_storage_size: adapter
-                        .limits()
-                        .max_compute_workgroup_storage_size,
-                    max_storage_buffer_binding_size: adapter
-                        .limits()
-                        .max_storage_buffer_binding_size,
-                    ..Default::default()
-                },
+                required_features,
+                required_limits: adapter.limits(),
+                experimental_features,
                 ..Default::default()
             })
             .await?;
 
-        use wgpu::PipelineCacheDescriptor;
-        let filename = wgpu::util::pipeline_cache_key(&adapter.get_info());
-        let (cache, cache_file) = if let Some(filename) = filename {
-            let cache_dir: PathBuf = PathBuf::from(".fusor").join("pipeline_cache");
-            let cache_path = cache_dir.join(&filename);
-            let cache_data = std::fs::read(&cache_path).ok();
-            let pipeline_cache = unsafe {
-                device.create_pipeline_cache(&PipelineCacheDescriptor {
-                    data: cache_data.as_deref(),
-                    label: Some("Fusor ML Pipeline Cache"),
-                    fallback: true,
-                })
-            };
-            (Some(pipeline_cache), Some(cache_path))
-        } else {
-            (None, None)
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
+
+        let kernel_cache = KernelCache::new(device.clone(), &adapter);
+        let buffer_pool = BufferPool::new(device.clone(), queue.clone());
+
+        let inner = Arc::new(DeviceInner {
+            device,
+            adapter,
+            queue,
+            kernel_cache,
+            buffer_pool,
+            cooperative_matrix_caps,
+            compute_graph: OnceLock::new(),
+        });
+
+        let device = Device {
+            inner: inner.clone(),
         };
 
-        let cache_size = const { NonZeroUsize::new(2048).unwrap() };
-        let bind_group_layout_cache =
-            RwLock::new(LruCache::with_hasher(cache_size, Default::default()));
-        let pipeline_layout_cache =
-            RwLock::new(LruCache::with_hasher(cache_size, Default::default()));
-        let shader_module_cache =
-            RwLock::new(LruCache::with_hasher(cache_size, Default::default()));
-        let compute_pipeline_cache =
-            RwLock::new(LruCache::with_hasher(cache_size, Default::default()));
-        let buffer_allocation_cache = RwLock::new(LruCache::with_hasher(
-            const { NonZeroUsize::new(128).unwrap() },
-            Default::default(),
-        ));
+        // Initialize the compute graph now that we have a valid device
+        inner
+            .compute_graph
+            .set(ComputeGraph::new(&device))
+            .ok()
+            .expect("compute_graph should only be set once");
 
-        let device = Self {
-            inner: Arc::new(DeviceInner {
-                device,
-                adapter,
-                queue,
-                cache,
-                cache_file,
-                bind_group_layout_cache,
-                pipeline_layout_cache,
-                shader_module_cache,
-                compute_pipeline_cache,
-                buffer_allocation_cache,
-            }),
-        };
+        let device = Device { inner };
 
         #[cfg(not(target_arch = "wasm32"))]
         std::thread::spawn({
-            let device = device.clone();
+            let weak_inner = Arc::downgrade(&device.inner);
             move || loop {
-                let Ok(status) = device.wgpu_device().poll(wgpu::PollType::Wait) else {
+                let Some(inner) = weak_inner.upgrade() else {
+                    break;
+                };
+                let result = poll_until_queue_empty(&inner.device);
+                drop(inner);
+                let Ok(status) = result else {
                     break;
                 };
                 if status == wgpu::PollStatus::QueueEmpty {
-                    std::thread::sleep(std::time::Duration::from_nanos(10));
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
         });
@@ -147,27 +253,79 @@ impl Device {
         Ok(device)
     }
 
-    pub(crate) fn create_shader_module<'a>(
-        &self,
-        source: impl Into<Cow<'a, str>>,
-    ) -> wgpu::ShaderModule {
-        // SAFTEY: All kernels don't access memory outside of bounds and don't have unbounded loops
-        unsafe {
-            self.inner.device.create_shader_module_trusted(
-                wgpu::ShaderModuleDescriptor {
-                    label: Some("Fusor ML Shader Module"),
-                    source: wgpu::ShaderSource::Wgsl(source.into()),
-                },
-                wgpu::ShaderRuntimeChecks::unchecked(),
-            )
+    /// Create a weak reference to this device that doesn't prevent cleanup.
+    pub fn downgrade(&self) -> WeakDevice {
+        WeakDevice {
+            inner: Arc::downgrade(&self.inner),
         }
     }
 
     pub fn limits(&self) -> wgpu::Limits {
-        let mut limits = self.inner.adapter.limits();
-        limits.max_subgroup_size = limits.max_subgroup_size.max(64);
-        limits.min_subgroup_size = limits.min_subgroup_size.max(4);
-        limits
+        self.inner.adapter.limits()
+    }
+
+    #[doc(hidden)]
+    pub fn nary_direct_input_binding_budget(&self) -> usize {
+        let limits = self.limits();
+        let storage_bindings = limits.max_storage_buffers_per_shader_stage as usize;
+        let bind_group_bindings = limits.max_bindings_per_bind_group as usize;
+
+        // The direct n-ary kernel binds every unique input tensor plus one
+        // output tensor, all as storage buffers in a single bind group.
+        storage_bindings.min(bind_group_bindings).saturating_sub(1)
+    }
+
+    #[doc(hidden)]
+    pub fn is_cpu_adapter(&self) -> bool {
+        self.inner.adapter.get_info().device_type == wgpu::DeviceType::Cpu
+    }
+
+    pub fn features(&self) -> wgpu::Features {
+        self.inner.device.features()
+    }
+
+    pub fn subgroups_supported(&self) -> bool {
+        self.features().contains(wgpu::Features::SUBGROUP)
+    }
+
+    pub fn min_subgroup_size(&self) -> u32 {
+        self.inner.adapter.get_info().subgroup_min_size
+    }
+
+    pub fn max_subgroup_size(&self) -> u32 {
+        self.inner.adapter.get_info().subgroup_max_size
+    }
+
+    pub(crate) fn backend(&self) -> wgpu::Backend {
+        self.inner.adapter.get_info().backend
+    }
+
+    pub fn fixed_width_subgroup_size(&self) -> Option<u32> {
+        if !self.subgroups_supported() {
+            return None;
+        }
+
+        let min = self.min_subgroup_size();
+        let max = self.max_subgroup_size();
+        if min == max && matches!(min, 4 | 8 | 16 | 32 | 64) {
+            return Some(min);
+        }
+
+        // Apple GPUs execute subgroup operations with 32-wide SIMD groups even
+        // though wgpu reports the broader Metal range.
+        if self.backend() == wgpu::Backend::Metal && min <= 32 && max >= 32 {
+            return Some(32);
+        }
+
+        None
+    }
+
+    pub fn f16_supported(&self) -> bool {
+        self.features().contains(wgpu::Features::SHADER_F16)
+    }
+
+    pub(crate) fn cooperative_matrix_caps(&self) -> CooperativeMatrixCaps {
+        self.inner.cooperative_matrix_caps
     }
 
     pub fn wgpu_adapter(&self) -> &wgpu::Adapter {
@@ -178,114 +336,36 @@ impl Device {
         &self.inner.device
     }
 
-    pub(crate) fn wgpu_queue(&self) -> &wgpu::Queue {
+    pub fn wgpu_queue(&self) -> &wgpu::Queue {
         &self.inner.queue
     }
 
-    pub(crate) fn wgpu_cache(&self) -> Option<&wgpu::PipelineCache> {
-        self.inner.cache.as_ref()
+    pub(crate) fn is_same_device(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
-    pub(crate) fn wgpu_cache_file(&self) -> Option<&PathBuf> {
-        self.inner.cache_file.as_ref()
+    /// Block until all submitted GPU work has completed.
+    pub fn poll_wait(&self) {
+        poll_until_queue_empty(&self.inner.device).expect("Failed to poll GPU device");
     }
 
-    pub(crate) fn bind_group_layout_cache(
-        &self,
-    ) -> &RwLock<LruCache<Vec<wgpu::BindGroupLayoutEntry>, BindGroupLayout, FxBuildHasher>> {
-        &self.inner.bind_group_layout_cache
-    }
-
-    pub(crate) fn pipeline_layout_cache(
-        &self,
-    ) -> &RwLock<LruCache<BindGroupLayout, wgpu::PipelineLayout, FxBuildHasher>> {
-        &self.inner.pipeline_layout_cache
-    }
-
-    pub(crate) fn shader_module_cache(
-        &self,
-    ) -> &RwLock<LruCache<String, wgpu::ShaderModule, FxBuildHasher>> {
-        &self.inner.shader_module_cache
-    }
-
-    pub(crate) fn compute_pipeline_cache(
-        &self,
-    ) -> &RwLock<LruCache<(PipelineLayout, ShaderModule), wgpu::ComputePipeline, FxBuildHasher>>
-    {
-        &self.inner.compute_pipeline_cache
+    pub(crate) fn kernel_cache(&self) -> &KernelCache {
+        &self.inner.kernel_cache
     }
 
     /// Reset the initialized flag on all cached buffers.
     pub fn reset_initialized_buffers(&self) {
-        let mut cache = self.inner.buffer_allocation_cache.write();
-        for (_, buffers) in cache.iter_mut() {
-            for buffer in buffers {
-                buffer.writen = false;
-            }
-        }
-    }
-
-    /// Try to get a buffer from the allocation cache. Returns None if no buffer of the requested size is available.
-    pub(crate) fn get_cached_buffer(
-        &self,
-        size: u64,
-        usage: wgpu::BufferUsages,
-        to_initilize: bool,
-    ) -> Option<Arc<wgpu::Buffer>> {
-        let mut cache = self.inner.buffer_allocation_cache.write();
-        let items = cache.get_mut(&(size, usage))?;
-        items.iter_mut().find_map(|a| {
-            if Arc::strong_count(&a.buffer) == 1 {
-                if to_initilize {
-                    if a.initialized() {
-                        return None;
-                    }
-                    a.set_initialized();
-                }
-                Some(a.buffer.clone())
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Get or create a buffer of the specified size for a use
-    fn create_buffer_inner(
-        &self,
-        size: u64,
-        usage: wgpu::BufferUsages,
-        to_initilize: bool,
-    ) -> Arc<wgpu::Buffer> {
-        // Try to get a buffer from the cache first
-        self.get_cached_buffer(size, usage, to_initilize)
-            .unwrap_or_else(|| {
-                let new_buffer = self.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Tensor Buffer"),
-                    size,
-                    usage,
-                    mapped_at_creation: false,
-                });
-
-                let buffer = Arc::new(new_buffer);
-                self.inner
-                    .buffer_allocation_cache
-                    .write()
-                    .get_or_insert_mut((size, usage), Vec::new)
-                    .push(CachedBuffer::new(buffer.clone(), to_initilize));
-                buffer
-            })
+        self.inner.buffer_pool.reset_initialized_buffers();
     }
 
     /// Get or create a buffer of the specified size.
     pub fn create_buffer(&self, size: u64, usage: wgpu::BufferUsages) -> Arc<wgpu::Buffer> {
-        self.create_buffer_inner(size, usage, false)
+        self.inner.buffer_pool.create_buffer(size, usage)
     }
 
     /// Get or create a buffer of the specified size.
     pub fn create_buffer_init(&self, data: &[u8], usage: wgpu::BufferUsages) -> Arc<wgpu::Buffer> {
-        let buffer = self.create_buffer_inner(data.len() as u64, usage, true);
-        self.wgpu_queue().write_buffer(&buffer, 0, data);
-        buffer
+        self.inner.buffer_pool.create_buffer_init(data, usage)
     }
 
     /// Get or create a buffer of the specified size.
@@ -295,17 +375,27 @@ impl Device {
         usage: wgpu::BufferUsages,
         len: u64,
     ) -> Arc<wgpu::Buffer> {
-        let mut iter = data.into_iter();
-        let buffer = self.create_buffer_inner(len, usage, true);
-        if let Some(len) = NonZeroU64::new(buffer.size()) {
-            if let Some(mut write) = self.wgpu_queue().write_buffer_with(&buffer, 0, len) {
-                write.iter_mut().zip(&mut iter).for_each(|(a, b)| *a = b);
-            } else {
-                panic!("Failed to map buffer for writing");
-            }
-        } else {
-            panic!("Failed to map buffer for writing");
-        }
-        buffer
+        self.inner
+            .buffer_pool
+            .create_buffer_init_iter(data, usage, len)
+    }
+
+    pub(crate) fn compute_graph(&self) -> &ComputeGraph {
+        self.inner
+            .compute_graph
+            .get()
+            .expect("compute_graph should be initialized")
+    }
+
+    /// Resolve multiple compute-graph nodes in a single pass. All targets share
+    /// one execution graph so intermediate results can be freed as soon as every
+    /// consumer within the batch has been computed. This keeps peak GPU memory
+    /// much lower than resolving targets one-by-one.
+    pub fn resolve_batch(&self, keys: &[crate::compute_graph::NodeIndex]) -> usize {
+        self.compute_graph().resolve_batch(keys)
+    }
+
+    pub fn detach_cached(&self, keys: &[crate::compute_graph::NodeIndex]) {
+        self.compute_graph().detach_cached(keys)
     }
 }

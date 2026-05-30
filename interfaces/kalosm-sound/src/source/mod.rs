@@ -4,7 +4,9 @@ use futures_util::StreamExt;
 use rodio::buffer::SamplesBuffer;
 use std::time::Duration;
 
+#[cfg(feature = "source")]
 mod mic;
+#[cfg(feature = "source")]
 pub use mic::*;
 
 /// A streaming audio source for single channel audio. This trait is implemented for all types that implement `rodio::Source` automatically.
@@ -62,6 +64,32 @@ where
 
     fn sample_rate(&self) -> u32 {
         self.sample_rate()
+    }
+}
+
+/// An async audio source from a stream of samples.
+pub struct AsyncSourceFromStream<I: Stream<Item = f32>> {
+    stream: I,
+    sample_rate: u32,
+}
+
+impl<I: Stream<Item = f32>> AsyncSourceFromStream<I> {
+    /// Create a new async audio source from a stream of samples.
+    pub fn new(stream: I, sample_rate: u32) -> Self {
+        Self {
+            stream,
+            sample_rate,
+        }
+    }
+}
+
+impl<I: Stream<Item = f32> + std::marker::Unpin> AsyncSource for AsyncSourceFromStream<I> {
+    fn as_stream(&mut self) -> impl Stream<Item = f32> + '_ {
+        &mut self.stream
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 }
 

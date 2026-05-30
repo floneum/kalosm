@@ -552,7 +552,7 @@ impl<C: Class> ClassifierOutput<C> {
     {
         self.classes
             .iter()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .max_by(|(_, a), (_, b)| f32::total_cmp(a, b))
             .map(|(c, _)| c.clone())
             .unwrap()
     }

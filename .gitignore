@@ -1,5 +1,7 @@
 /sandbox
 /target
+/.lavapipe
+/.talvos
 /db
 /documents
 /plugin/target
@@ -13,7 +15,11 @@ debug.log
 workflow.json
 tokenizer.json
 *.cpp
+!prototypes/phase-token-prototype/examples/bench_ggml_qmatmul.cpp
 *.wgsl
 out.txt
 todo.md
 rust-analyzer
+/.claude
+**/.claude/
+profiles

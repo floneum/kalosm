@@ -1,0 +1,134 @@
+name: windows
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - interfaces/*/src/**
+      - interfaces/*/examples/**
+      - interfaces/*/Cargo.toml
+      - models/*/src/**
+      - models/*/examples/**
+      - models/*/Cargo.toml
+      - floneum/*/src/**
+      - floneum/*/examples/**
+      - floneum/*/Cargo.toml
+      - fusor-ml/*/src/**
+      - fusor-ml/*/tests/**
+      - fusor-ml/*/examples/**
+      - fusor-ml/*/Cargo.toml
+      - src/**
+      - .github/**
+      - Cargo.toml
+      - Cargo.lock
+
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches:
+      - main
+    paths:
+      - interfaces/*/src/**
+      - interfaces/*/examples/**
+      - interfaces/*/Cargo.toml
+      - models/*/src/**
+      - models/*/examples/**
+      - models/*/Cargo.toml
+      - floneum/*/src/**
+      - floneum/*/examples/**
+      - floneum/*/Cargo.toml
+      - fusor-ml/*/src/**
+      - fusor-ml/*/tests/**
+      - fusor-ml/*/examples/**
+      - fusor-ml/*/Cargo.toml
+      - src/**
+      - .github/**
+      - Cargo.toml
+      - Cargo.lock
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    if: github.event.pull_request.draft == false
+    runs-on: windows-2022
+    name: (${{ matrix.target }}, ${{ matrix.cfg_release_channel }})
+    env:
+      CFG_RELEASE_CHANNEL: ${{ matrix.cfg_release_channel }}
+    strategy:
+      matrix:
+        target: [x86_64-pc-windows-msvc]
+        cfg_release_channel: [stable]
+
+    steps:
+      - name: disable git eol translation
+        run: git config --global core.autocrlf false
+
+      - name: checkout
+        uses: actions/checkout@v6
+
+      # `dtolnay/rust-toolchain` is a single-step toolchain install that
+      # uses the GitHub Actions toolchain cache; much faster than the
+      # `Invoke-WebRequest win.rustup.rs` dance.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # WARP and DXC are small downloads (a few MB each) but redirecting
+      # them through the GitHub Actions cache means we don't pull from
+      # nuget / GitHub releases on every PR run.
+      - name: Cache WARP/DXC downloads
+        id: cache-warp-dxc
+        uses: actions/cache@v4
+        with:
+          path: |
+            warp
+            dxc
+          # Bump the suffix when the WARP / DXC versions below change.
+          key: ${{ runner.os }}-warp-1.0.8-dxc-1.7.2308-v1
+
+      - name: Setup WARP
+        if: steps.cache-warp-dxc.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          curl -L --retry 5 https://www.nuget.org/api/v2/package/Microsoft.Direct3D.WARP/1.0.8 -o warp.zip
+          7z e warp.zip -owarp build/native/amd64/d3d10warp.dll
+
+      - name: Setup DXC
+        if: steps.cache-warp-dxc.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          curl -L --retry 5 https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.7.2308/dxc_2023_08_14.zip -o dxc.zip
+          7z e dxc.zip -odxc bin/x64/dxcompiler.dll bin/x64/dxil.dll
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct from the Linux cache so we don't ever try to restore
+          # x86_64-unknown-linux-gnu artefacts onto x86_64-pc-windows-msvc.
+          shared-key: "windows-stable"
+          cache-all-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: test
+        shell: cmd
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
+          WGPU_DX12_COMPILER: Dxc
+        run: |
+          rustc -Vv
+          cargo -V
+          mkdir target\debug\deps 2>nul
+          copy warp\d3d10warp.dll target\debug\deps\
+          copy dxc\dxcompiler.dll target\debug\deps\
+          copy dxc\dxil.dll target\debug\deps\
+          cargo test --all --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape --exclude kalosm-parse-macro --exclude fusor-core --exclude rbert --exclude rwhisper --exclude kalosm-learning

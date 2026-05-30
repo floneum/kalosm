@@ -62,8 +62,6 @@ impl<S: AsyncSource + Unpin> Stream for DenoisedStream<S> {
             let sample = ready!(stream.as_mut().poll_next(cx));
             if let Some(sample) = sample {
                 let scaled = sample * SCALE_FACTOR;
-                debug_assert!(scaled >= i16::MIN as f32);
-                debug_assert!(scaled <= i16::MAX as f32);
                 this.input_buffer[this.fill_index] = scaled;
                 this.fill_index += 1;
             } else {
@@ -80,8 +78,6 @@ impl<S: AsyncSource + Unpin> Stream for DenoisedStream<S> {
         // Rescale the output
         for output in &mut this.output {
             *output /= SCALE_FACTOR;
-            debug_assert!(*output >= -1.0);
-            debug_assert!(*output <= 1.0);
         }
         let samples = SamplesBuffer::new(1, sample_rate, this.output);
         Poll::Ready(Some(VoiceActivityDetectorOutput {

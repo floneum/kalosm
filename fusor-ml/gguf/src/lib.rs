@@ -1,12 +1,14 @@
 //! Support for [GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) files
 
+// Enable NEON dot product intrinsics for faster quantized matmul on Apple Silicon (nightly only)
+#![cfg_attr(all(target_arch = "aarch64", nightly), feature(stdarch_neon_dotprod))]
+
 // Tensor layout is described at https://github.com/ggml-org/llama.cpp/wiki/Tensor-Encoding-Schemes
 // Modified from https://github.com/huggingface/candle/blob/e286cf7cc9e34bc426a542264b818e35e6eed05b/candle-core/src/quantized/gguf_file.rs#L31
 
 use std::{fmt::Display, mem::offset_of};
 
 use bytemuck::{AnyBitPattern, Contiguous, Pod, Zeroable};
-use enumset::EnumSetType;
 use rustc_hash::FxHashMap;
 
 const GGUF_MAGIC_BYTES: [u8; 4] = *b"GGUF";
@@ -29,7 +31,7 @@ fn check_magic<R: std::io::Read>(reader: &mut R) -> Result<(), GgufReadError> {
 
 pub const DEFAULT_ALIGNMENT: u64 = 32;
 
-#[derive(EnumSetType, Debug, Hash)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
 pub enum GgmlType {
     F32 = 0,
     F16 = 1,
@@ -109,6 +111,7 @@ impl GgmlType {
             Self::F32 => std::mem::size_of::<f32>(),
             Self::F16 => std::mem::size_of::<half::f16>(),
             Self::Q4K => std::mem::size_of::<BlockQ4K>(),
+            Self::Q5K => std::mem::size_of::<BlockQ5K>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q4_0 => std::mem::size_of::<BlockQ4_0>(),
             Self::Q5_0 => std::mem::size_of::<BlockQ5_0>(),
@@ -165,65 +168,35 @@ impl TryFrom<u32> for GgufVersion {
     }
 }
 
-fn read_le_u8<R: std::io::Read>(reader: &mut R) -> Result<u8, GgufReadError> {
-    let mut bytes = [0; 1];
-    reader.read_exact(&mut bytes)?;
-    Ok(u8::from_le_bytes(bytes))
+macro_rules! define_read_le {
+    ($($ty:ty),*) => {
+        paste::paste! {
+            $(
+                fn [<read_le_ $ty>]<R: std::io::Read>(reader: &mut R) -> Result<$ty, GgufReadError> {
+                    let mut bytes = [0u8; std::mem::size_of::<$ty>()];
+                    reader.read_exact(&mut bytes)?;
+                    Ok(<$ty>::from_le_bytes(bytes))
+                }
+            )*
+        }
+    };
 }
 
-fn read_le_u16<R: std::io::Read>(reader: &mut R) -> Result<u16, GgufReadError> {
-    let mut bytes = [0; 2];
-    reader.read_exact(&mut bytes)?;
-    Ok(u16::from_le_bytes(bytes))
+macro_rules! define_write_le {
+    ($($ty:ty),*) => {
+        paste::paste! {
+            $(
+                fn [<write_le_ $ty>]<W: std::io::Write>(writer: &mut W, value: $ty) -> Result<(), GgufWriteError> {
+                    writer.write_all(&value.to_le_bytes())?;
+                    Ok(())
+                }
+            )*
+        }
+    };
 }
 
-fn read_le_u32<R: std::io::Read>(reader: &mut R) -> Result<u32, GgufReadError> {
-    let mut bytes = [0; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_le_u64<R: std::io::Read>(reader: &mut R) -> Result<u64, GgufReadError> {
-    let mut bytes = [0; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn read_le_i8<R: std::io::Read>(reader: &mut R) -> Result<i8, GgufReadError> {
-    let mut bytes = [0; 1];
-    reader.read_exact(&mut bytes)?;
-    Ok(i8::from_le_bytes(bytes))
-}
-
-fn read_le_i16<R: std::io::Read>(reader: &mut R) -> Result<i16, GgufReadError> {
-    let mut bytes = [0; 2];
-    reader.read_exact(&mut bytes)?;
-    Ok(i16::from_le_bytes(bytes))
-}
-
-fn read_le_i32<R: std::io::Read>(reader: &mut R) -> Result<i32, GgufReadError> {
-    let mut bytes = [0; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(i32::from_le_bytes(bytes))
-}
-
-fn read_le_i64<R: std::io::Read>(reader: &mut R) -> Result<i64, GgufReadError> {
-    let mut bytes = [0; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(i64::from_le_bytes(bytes))
-}
-
-fn read_le_f32<R: std::io::Read>(reader: &mut R) -> Result<f32, GgufReadError> {
-    let mut bytes = [0; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(f32::from_le_bytes(bytes))
-}
-
-fn read_le_f64<R: std::io::Read>(reader: &mut R) -> Result<f64, GgufReadError> {
-    let mut bytes = [0; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(f64::from_le_bytes(bytes))
-}
+define_read_le!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
+define_write_le!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
 
 fn read_array_length<R: std::io::Read>(
     reader: &mut R,
@@ -233,56 +206,6 @@ fn read_array_length<R: std::io::Read>(
         GgufVersion::V1 => read_le_u32(reader)? as usize,
         GgufVersion::V2 | GgufVersion::V3 => read_le_u64(reader)? as usize,
     })
-}
-
-fn write_le_u8<W: std::io::Write>(writer: &mut W, value: u8) -> Result<(), GgufWriteError> {
-    writer.write_all(&value.to_le_bytes())?;
-    Ok(())
-}
-
-fn write_le_u16<W: std::io::Write>(writer: &mut W, value: u16) -> Result<(), GgufWriteError> {
-    writer.write_all(&value.to_le_bytes())?;
-    Ok(())
-}
-
-fn write_le_u32<W: std::io::Write>(writer: &mut W, value: u32) -> Result<(), GgufWriteError> {
-    writer.write_all(&value.to_le_bytes())?;
-    Ok(())
-}
-
-fn write_le_u64<W: std::io::Write>(writer: &mut W, value: u64) -> Result<(), GgufWriteError> {
-    writer.write_all(&value.to_le_bytes())?;
-    Ok(())
-}
-
-fn write_le_i8<W: std::io::Write>(writer: &mut W, value: i8) -> Result<(), GgufWriteError> {
-    writer.write_all(&value.to_le_bytes())?;
-    Ok(())
-}
-
-fn write_le_i16<W: std::io::Write>(writer: &mut W, value: i16) -> Result<(), GgufWriteError> {
-    writer.write_all(&value.to_le_bytes())?;
-    Ok(())
-}
-
-fn write_le_i32<W: std::io::Write>(writer: &mut W, value: i32) -> Result<(), GgufWriteError> {
-    writer.write_all(&value.to_le_bytes())?;
-    Ok(())
-}
-
-fn write_le_i64<W: std::io::Write>(writer: &mut W, value: i64) -> Result<(), GgufWriteError> {
-    writer.write_all(&value.to_le_bytes())?;
-    Ok(())
-}
-
-fn write_le_f32<W: std::io::Write>(writer: &mut W, value: f32) -> Result<(), GgufWriteError> {
-    writer.write_all(&value.to_le_bytes())?;
-    Ok(())
-}
-
-fn write_le_f64<W: std::io::Write>(writer: &mut W, value: f64) -> Result<(), GgufWriteError> {
-    writer.write_all(&value.to_le_bytes())?;
-    Ok(())
 }
 
 fn write_array_length<W: std::io::Write>(
@@ -324,6 +247,8 @@ pub enum GgufWriteError {
     Io(#[from] std::io::Error),
     #[error("unknown tensor {0}")]
     UnknownTensor(String),
+    #[error("cannot write empty array (type cannot be determined)")]
+    EmptyArray,
 }
 
 #[derive(Debug, PartialEq)]
@@ -365,6 +290,32 @@ pub struct GgufMetadata {
     pub metadata: FxHashMap<Box<str>, GgufValue>,
     pub tensor_infos: FxHashMap<Box<str>, GgufTensorMetadata>,
     pub tensor_data_offset: u64,
+}
+
+impl GgufMetadata {
+    /// Look up a metadata value by key with suffix-aware matching.
+    ///
+    /// If the key starts with `.`, searches for metadata keys that end with the given suffix
+    /// and returns the value for the shortest matching key. This allows architecture-prefixed
+    /// keys like `qwen3.attention.head_count` to be found with `.attention.head_count`.
+    pub fn get_value(&self, key: &str) -> Option<&GgufValue> {
+        if key.starts_with('.') {
+            self.metadata
+                .iter()
+                .filter(|(k, _)| k.ends_with(key))
+                .min_by_key(|(k, _)| k.len())
+                .map(|(_, v)| v)
+        } else {
+            self.metadata.get(key)
+        }
+    }
+
+    /// Get the model architecture from the `general.architecture` metadata key.
+    pub fn architecture(&self) -> Option<String> {
+        self.get_value("general.architecture")
+            .and_then(|v| v.to_string().ok())
+            .map(|s| s.to_string())
+    }
 }
 
 fn read_string<R: std::io::Read>(
@@ -530,7 +481,8 @@ impl GgufValue {
             Self::Bool(v) => write_le_u8(writer, if *v { 1 } else { 0 }),
             Self::String(s) => write_string(writer, s, version),
             Self::Array(arr) => {
-                let value_type = arr[0].value_type();
+                let first = arr.first().ok_or(GgufWriteError::EmptyArray)?;
+                let value_type = first.value_type();
                 write_le_u32(writer, value_type as u32)?;
                 let len = arr.len();
                 write_array_length(writer, version, len)?;
@@ -544,7 +496,14 @@ impl GgufValue {
 }
 
 macro_rules! try_into_gguf_value {
-    ($variant:ident, $value:ty $(=> from $($from:ident)+)?) => {
+    ($convert: ident, $variant:ident, $value:ty $(=> from $($from:ident)+)?) => {
+        impl GgufValue {
+            #[doc = concat!("Convert the GGUF value to a `", stringify!($value), "` if possible.")]
+            pub fn $convert(&self) -> Result<$value, GgufReadError> {
+                self.try_into()
+            }
+        }
+
         impl TryInto<$value> for GgufValue {
             type Error = GgufReadError;
 
@@ -582,19 +541,19 @@ macro_rules! try_into_gguf_value {
         }
     };
 }
-try_into_gguf_value!(U8, u8 => from U16 U32 U64);
-try_into_gguf_value!(I8, i8 => from I16 I32 I64);
-try_into_gguf_value!(U16, u16 => from U8 U32 U64);
-try_into_gguf_value!(I16, i16 => from I8 I32 I64);
-try_into_gguf_value!(U32, u32 => from U8 U16 U64);
-try_into_gguf_value!(I32, i32 => from I8 I16 I64);
-try_into_gguf_value!(U64, u64 => from U8 U16 U32);
-try_into_gguf_value!(I64, i64 => from I8 I16 I32);
-try_into_gguf_value!(F32, f32 => from F64);
-try_into_gguf_value!(F64, f64 => from F32);
-try_into_gguf_value!(Bool, bool);
-try_into_gguf_value!(String, Box<str>);
-try_into_gguf_value!(Array, Box<[GgufValue]>);
+try_into_gguf_value!(to_u8, U8, u8 => from U16 U32 U64 I8 I16 I32 I64);
+try_into_gguf_value!(to_i8, I8, i8 => from I16 I32 I64 U8 U16 U32 U64);
+try_into_gguf_value!(to_u16, U16, u16 => from U8 U32 U64 I8 I16 I32 I64);
+try_into_gguf_value!(to_i16, I16, i16 => from I8 I32 I64 U8 U16 U32 U64);
+try_into_gguf_value!(to_u32, U32, u32 => from U8 U16 U64 I8 I16 I32 I64);
+try_into_gguf_value!(to_i32, I32, i32 => from I8 I16 I64 U8 U16 U32 U64);
+try_into_gguf_value!(to_u64, U64, u64 => from U8 U16 U32 I8 I16 I32 I64);
+try_into_gguf_value!(to_i64, I64, i64 => from I8 I16 I32 U8 U16 U32 U64);
+try_into_gguf_value!(to_f32, F32, f32 => from F64);
+try_into_gguf_value!(to_f64, F64, f64 => from F32);
+try_into_gguf_value!(to_bool, Bool, bool);
+try_into_gguf_value!(to_string, String, Box<str>);
+try_into_gguf_value!(to_array, Array, Box<[GgufValue]>);
 
 impl GgufMetadata {
     pub fn read<R: std::io::Seek + std::io::Read>(reader: &mut R) -> Result<Self, GgufReadError> {
@@ -704,26 +663,101 @@ impl GgufMetadata {
     }
 }
 
-pub trait GgufBlock: Pod + Sized {
+/// Copy `src` into `bytes` starting at `offset`. Used internally by every
+/// `into_gpu_storage_bytes*` impl to pack a struct field into a fixed-layout
+/// byte array. Inlined so the per-field three-line pattern collapses to one
+/// call without runtime cost.
+#[inline(always)]
+fn pack_field(bytes: &mut [u8], offset: usize, src: &[u8]) {
+    bytes[offset..offset + src.len()].copy_from_slice(src);
+}
+
+/// Read a `T` (must be `AnyBitPattern`) out of `bytes` at `offset`. Counterpart
+/// to [`pack_field`] used by every `from_gpu_storage_bytes` impl.
+#[inline(always)]
+fn unpack_field<T: AnyBitPattern>(bytes: &[u8], offset: usize) -> T {
+    let end = offset + std::mem::size_of::<T>();
+    *bytemuck::from_bytes(&bytes[offset..end])
+}
+
+/// AVX2 signed×signed i8x32 dot product into i32, using the standard
+/// `sign_epi8` + `maddubs_epi16` + `madd_epi16` + 7-instruction horizontal-sum
+/// tail. Shared by Q4_0 and Q8_0 32-byte vec_dot paths.
+///
+/// `qx_signed` is the centered/sign-relevant operand whose sign drives the
+/// `sign_epi8` trick. For Q8_0 pass the i8 weight vector; for Q4_0 pass the
+/// nibble-unpacked, centered-by-8 vector.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn avx2_i8x32_signed_dot(
+    qx_signed: std::arch::x86_64::__m256i,
+    qy: std::arch::x86_64::__m256i,
+) -> i32 {
+    use std::arch::x86_64::*;
+    // Sign trick for signed × signed dot product
+    let qxabs = _mm256_sign_epi8(qx_signed, qx_signed);
+    let qysign = _mm256_sign_epi8(qy, qx_signed);
+    // maddubs: pairs of u8 × i8 → saturated i16, then madd to i32
+    let prod16 = _mm256_maddubs_epi16(qxabs, qysign);
+    let prod32 = _mm256_madd_epi16(prod16, _mm256_set1_epi16(1));
+    // Horizontal sum of 8 i32 lanes
+    let hi128 = _mm256_extracti128_si256(prod32, 1);
+    let lo128 = _mm256_castsi256_si128(prod32);
+    let sum128 = _mm_add_epi32(lo128, hi128);
+    let hi64 = _mm_shuffle_epi32(sum128, 0x4E);
+    let sum64 = _mm_add_epi32(sum128, hi64);
+    let hi32 = _mm_shuffle_epi32(sum64, 0xB1);
+    let result = _mm_add_epi32(sum64, hi32);
+    _mm_cvtsi128_si32(result)
+}
+
+pub trait GgufBlock: Pod + Sized + Sync {
     const BLOCK_SIZE: usize;
 
     type Bytes: AsRef<[u8]> + Copy;
+    type BytesF32: AsRef<[u8]> + Copy;
     type AsBytes: AsRef<[u8]> + Copy;
     type Dequantized: AsRef<[f32]> + Copy;
 
+    /// The activation block type for integer dot product.
+    /// For 32-element blocks (Q4_0, Q5_0, Q8_0), this is BlockQ8_0.
+    /// For 256-element K-quant blocks (Q4_K, Q6_K), this is BlockQ8K.
+    type ActivationBlock: Pod + Sized;
+
     fn finite(&self) -> bool;
-    fn into_wgsl_bytes(self) -> Self::Bytes;
-    fn from_wgsl_bytes(bytes: Self::Bytes) -> Self;
+    fn into_gpu_storage_bytes(self) -> Self::Bytes;
+    fn into_gpu_storage_bytes_f32(self) -> Self::BytesF32;
+    fn from_gpu_storage_bytes(bytes: Self::Bytes) -> Self;
 
     fn dequantize(&self) -> Self::Dequantized;
+
+    /// Compute integer dot product with a quantized activation block.
+    ///
+    /// This performs the dot product directly on quantized values and applies
+    /// the scale factors at the end, avoiding the overhead of full dequantization.
+    /// Returns the dot product result with scales already applied.
+    fn vec_dot(&self, activation: &Self::ActivationBlock) -> f32;
+
+    /// Quantize a slice of f32 values into an activation block.
+    ///
+    /// The slice must have exactly `BLOCK_SIZE` elements.
+    fn quantize_activation(data: &[f32]) -> Self::ActivationBlock;
 }
 
 const Q4_0_BLOCK_SIZE: usize = 32;
 
 #[derive(AnyBitPattern, Clone, Copy)]
 #[repr(C)]
-struct BlockQ4_0Wgsl {
+struct BlockQ4_0Gpu {
     pub(crate) scale: half::f16,
+    pub(crate) data: [u32; Q4_0_BLOCK_SIZE / 8],
+}
+
+#[derive(AnyBitPattern, Clone, Copy)]
+#[repr(C)]
+struct BlockQ4_0GpuF32 {
+    pub(crate) scale: f32,
     pub(crate) data: [u32; Q4_0_BLOCK_SIZE / 8],
 }
 
@@ -742,33 +776,51 @@ impl BlockQ4_0 {
 impl GgufBlock for BlockQ4_0 {
     const BLOCK_SIZE: usize = Q4_0_BLOCK_SIZE;
 
-    type Bytes = [u8; std::mem::size_of::<BlockQ4_0Wgsl>()];
+    type Bytes = [u8; std::mem::size_of::<BlockQ4_0Gpu>()];
+    type BytesF32 = [u8; std::mem::size_of::<BlockQ4_0GpuF32>()];
     type AsBytes = [u8; std::mem::size_of::<Self>()];
     type Dequantized = [f32; Q4_0_BLOCK_SIZE];
+    type ActivationBlock = BlockQ8_0;
 
     fn finite(&self) -> bool {
         self.scale.is_finite()
     }
 
-    fn into_wgsl_bytes(self) -> Self::Bytes {
-        let mut bytes = [0; std::mem::size_of::<BlockQ4_0Wgsl>()];
-        let scale_offset = offset_of!(BlockQ4_0Wgsl, scale);
-        let scale_bytes = bytemuck::bytes_of(&self.scale);
-        bytes[scale_offset..scale_offset + scale_bytes.len()].copy_from_slice(scale_bytes);
-        let data_offset = offset_of!(BlockQ4_0Wgsl, data);
-        let data_bytes = bytemuck::cast_slice(&self.data);
-        bytes[data_offset..data_offset + data_bytes.len()].copy_from_slice(data_bytes);
+    fn into_gpu_storage_bytes_f32(self) -> Self::BytesF32 {
+        let mut bytes = [0; std::mem::size_of::<BlockQ4_0GpuF32>()];
+        let scale_f32 = self.scale.to_f32();
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4_0GpuF32, scale),
+            bytemuck::bytes_of(&scale_f32),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4_0GpuF32, data),
+            bytemuck::cast_slice(&self.data),
+        );
         bytes
     }
 
-    fn from_wgsl_bytes(bytes: Self::Bytes) -> Self {
-        let scale_offset = offset_of!(BlockQ4_0Wgsl, scale);
-        let scale_bytes = &bytes[scale_offset..scale_offset + std::mem::size_of::<half::f16>()];
-        let scale = *bytemuck::from_bytes(scale_bytes);
-        let data_offset = offset_of!(BlockQ4_0Wgsl, data);
-        let data_bytes =
-            &bytes[data_offset..data_offset + std::mem::size_of::<[u32; Q4_0_BLOCK_SIZE / 8]>()];
-        let data = *bytemuck::from_bytes(data_bytes);
+    fn into_gpu_storage_bytes(self) -> Self::Bytes {
+        let mut bytes = [0; std::mem::size_of::<BlockQ4_0Gpu>()];
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4_0Gpu, scale),
+            bytemuck::bytes_of(&self.scale),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4_0Gpu, data),
+            bytemuck::cast_slice(&self.data),
+        );
+        bytes
+    }
+
+    fn from_gpu_storage_bytes(bytes: Self::Bytes) -> Self {
+        let scale = unpack_field::<half::f16>(&bytes, offset_of!(BlockQ4_0Gpu, scale));
+        let data =
+            unpack_field::<[u8; Q4_0_BLOCK_SIZE / 2]>(&bytes, offset_of!(BlockQ4_0Gpu, data));
         Self { scale, data }
     }
 
@@ -792,14 +844,113 @@ impl GgufBlock for BlockQ4_0 {
 
         data
     }
+
+    #[cfg(all(target_arch = "aarch64", nightly))]
+    fn vec_dot(&self, y: &Self::ActivationBlock) -> f32 {
+        use std::arch::aarch64::*;
+        const CENTER: i8 = 8;
+        unsafe {
+            // Load 16 packed Q4 bytes
+            let q4_bytes = vld1q_u8(self.data.as_ptr());
+
+            // Unpack low and high nibbles
+            let mask_low = vdupq_n_u8(0x0F);
+            let q4_lo_u8 = vandq_u8(q4_bytes, mask_low);
+            let q4_hi_u8 = vshrq_n_u8(q4_bytes, 4);
+
+            // Convert to signed and subtract center (8)
+            let center = vdupq_n_s8(CENTER);
+            let q4_lo = vsubq_s8(vreinterpretq_s8_u8(q4_lo_u8), center);
+            let q4_hi = vsubq_s8(vreinterpretq_s8_u8(q4_hi_u8), center);
+
+            // Load activation values (first 16 for low nibbles, next 16 for high nibbles)
+            let y_lo = vld1q_s8(y.data.as_ptr());
+            let y_hi = vld1q_s8(y.data.as_ptr().add(16));
+
+            // Use vdotq_s32 for fast i8x4 dot products
+            let acc = vdupq_n_s32(0);
+            let acc = vdotq_s32(acc, q4_lo, y_lo);
+            let acc = vdotq_s32(acc, q4_hi, y_hi);
+            let sum = vaddvq_s32(acc);
+
+            let scale = self.scale.to_f32() * y.scale.to_f32();
+            (sum as f32) * scale
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn vec_dot(&self, y: &Self::ActivationBlock) -> f32 {
+        let sum = if is_x86_feature_detected!("avx2") {
+            #[target_feature(enable = "avx2")]
+            unsafe fn dot_avx2(q4_data: *const u8, q8_data: *const i8) -> i32 {
+                use std::arch::x86_64::*;
+                unsafe {
+                    // Load 16 packed Q4_0 bytes
+                    let q4_packed = _mm_loadu_si128(q4_data as *const __m128i);
+                    // Unpack: low nibbles in lower lane, high nibbles in upper lane
+                    let lo = _mm256_castsi128_si256(q4_packed);
+                    let q4_256 = _mm256_inserti128_si256(lo, _mm_srli_epi32(q4_packed, 4), 1);
+                    let q4_bytes = _mm256_and_si256(q4_256, _mm256_set1_epi8(0x0F));
+                    // Center: subtract 8 (Q4_0 values 0-15 → -8..+7)
+                    let centered = _mm256_sub_epi8(q4_bytes, _mm256_set1_epi8(8));
+                    // Load 32 Q8_0 activation values
+                    let qy = _mm256_loadu_si256(q8_data as *const __m256i);
+                    avx2_i8x32_signed_dot(centered, qy)
+                }
+            }
+            unsafe { dot_avx2(self.data.as_ptr(), y.data.as_ptr()) }
+        } else {
+            q4_0_vec_dot_scalar(&self.data, &y.data)
+        };
+        let scale = self.scale.to_f32() * y.scale.to_f32();
+        (sum as f32) * scale
+    }
+
+    #[cfg(not(any(all(target_arch = "aarch64", nightly), target_arch = "x86_64")))]
+    fn vec_dot(&self, y: &Self::ActivationBlock) -> f32 {
+        let sum = q4_0_vec_dot_scalar(&self.data, &y.data);
+        let scale = self.scale.to_f32() * y.scale.to_f32();
+        (sum as f32) * scale
+    }
+
+    fn quantize_activation(data: &[f32]) -> Self::ActivationBlock {
+        let arr: &[f32; 32] = data.try_into().expect("data must have 32 elements");
+        BlockQ8_0::quantize(arr)
+    }
+}
+
+// Used by both the x86_64 AVX2 fallback path and the generic "neither
+// aarch64-nightly nor x86_64" platform path. Skipped only on aarch64+nightly
+// where the NEON intrinsics path doesn't need it.
+#[cfg(not(all(target_arch = "aarch64", nightly)))]
+#[inline(always)]
+fn q4_0_vec_dot_scalar(data: &[u8; 16], y_data: &[i8; 32]) -> i32 {
+    const CENTER: i8 = 8;
+    let mut sum: i32 = 0;
+    for i in 0..16 {
+        let byte = data[i];
+        let q4_lo = (byte & 0x0F) as i8 - CENTER;
+        let q4_hi = (byte >> 4) as i8 - CENTER;
+        sum += (q4_lo as i32) * (y_data[i] as i32);
+        sum += (q4_hi as i32) * (y_data[i + 16] as i32);
+    }
+    sum
 }
 
 const Q5_0_BLOCK_SIZE: usize = 32;
 
 #[derive(AnyBitPattern, Clone, Copy)]
 #[repr(C)]
-struct BlockQ5_0Wgsl {
+struct BlockQ5_0Gpu {
     pub(crate) scale: half::f16,
+    pub(crate) data_high_bits: [u32; (Q5_0_BLOCK_SIZE / 8) / 4],
+    pub(crate) data_low_bits: [u32; (Q5_0_BLOCK_SIZE / 2) / 4],
+}
+
+#[derive(AnyBitPattern, Clone, Copy)]
+#[repr(C)]
+struct BlockQ5_0GpuF32 {
+    pub(crate) scale: f32,
     pub(crate) data_high_bits: [u32; (Q5_0_BLOCK_SIZE / 8) / 4],
     pub(crate) data_low_bits: [u32; (Q5_0_BLOCK_SIZE / 2) / 4],
 }
@@ -823,42 +974,67 @@ impl BlockQ5_0 {
 impl GgufBlock for BlockQ5_0 {
     const BLOCK_SIZE: usize = Q5_0_BLOCK_SIZE;
 
-    type Bytes = [u8; std::mem::size_of::<BlockQ5_0Wgsl>()];
+    type Bytes = [u8; std::mem::size_of::<BlockQ5_0Gpu>()];
+    type BytesF32 = [u8; std::mem::size_of::<BlockQ5_0GpuF32>()];
     type AsBytes = [u8; std::mem::size_of::<Self>()];
     type Dequantized = [f32; Q5_0_BLOCK_SIZE];
+    type ActivationBlock = BlockQ8_0;
 
     fn finite(&self) -> bool {
         self.scale.is_finite()
     }
 
-    fn into_wgsl_bytes(self) -> Self::Bytes {
-        let mut bytes = [0; std::mem::size_of::<BlockQ5_0Wgsl>()];
-        let scale_offset = offset_of!(BlockQ5_0Wgsl, scale);
-        let scale_bytes = bytemuck::bytes_of(&self.scale);
-        bytes[scale_offset..scale_offset + scale_bytes.len()].copy_from_slice(scale_bytes);
-        let data_high_bits_offset = offset_of!(BlockQ5_0Wgsl, data_high_bits);
-        let data_high_bits_bytes = bytemuck::cast_slice(&self.data_high_bits);
-        bytes[data_high_bits_offset..data_high_bits_offset + data_high_bits_bytes.len()]
-            .copy_from_slice(data_high_bits_bytes);
-        let data_low_bits_offset = offset_of!(BlockQ5_0Wgsl, data_low_bits);
-        let data_low_bits_bytes = bytemuck::cast_slice(&self.data_low_bits);
-        bytes[data_low_bits_offset..data_low_bits_offset + data_low_bits_bytes.len()]
-            .copy_from_slice(data_low_bits_bytes);
+    fn into_gpu_storage_bytes_f32(self) -> Self::BytesF32 {
+        let mut bytes = [0; std::mem::size_of::<BlockQ5_0GpuF32>()];
+        let scale_f32 = self.scale.to_f32();
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5_0GpuF32, scale),
+            bytemuck::bytes_of(&scale_f32),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5_0GpuF32, data_high_bits),
+            bytemuck::cast_slice(&self.data_high_bits),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5_0GpuF32, data_low_bits),
+            bytemuck::cast_slice(&self.data_low_bits),
+        );
         bytes
     }
 
-    fn from_wgsl_bytes(bytes: Self::Bytes) -> Self {
-        let scale_offset = offset_of!(BlockQ5_0Wgsl, scale);
-        let scale_bytes = &bytes[scale_offset..scale_offset + std::mem::size_of::<half::f16>()];
-        let scale = *bytemuck::from_bytes(scale_bytes);
-        let data_high_bits_offset = offset_of!(BlockQ5_0Wgsl, data_high_bits);
-        let data_high_bits_bytes = &bytes[data_high_bits_offset
-            ..data_high_bits_offset + std::mem::size_of::<[u8; Q5_0_BLOCK_SIZE / 8]>()];
-        let data_high_bits = *bytemuck::from_bytes(data_high_bits_bytes);
-        let data_low_bits_offset = offset_of!(BlockQ5_0Wgsl, data_low_bits);
-        let data_low_bits_bytes = &bytes[data_low_bits_offset
-            ..data_low_bits_offset + std::mem::size_of::<[u8; Q5_0_BLOCK_SIZE / 2]>()];
-        let data_low_bits = *bytemuck::from_bytes(data_low_bits_bytes);
+    fn into_gpu_storage_bytes(self) -> Self::Bytes {
+        let mut bytes = [0; std::mem::size_of::<BlockQ5_0Gpu>()];
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5_0Gpu, scale),
+            bytemuck::bytes_of(&self.scale),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5_0Gpu, data_high_bits),
+            bytemuck::cast_slice(&self.data_high_bits),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5_0Gpu, data_low_bits),
+            bytemuck::cast_slice(&self.data_low_bits),
+        );
+        bytes
+    }
+
+    fn from_gpu_storage_bytes(bytes: Self::Bytes) -> Self {
+        let scale = unpack_field::<half::f16>(&bytes, offset_of!(BlockQ5_0Gpu, scale));
+        let data_high_bits = unpack_field::<[u8; Q5_0_BLOCK_SIZE / 8]>(
+            &bytes,
+            offset_of!(BlockQ5_0Gpu, data_high_bits),
+        );
+        let data_low_bits = unpack_field::<[u8; Q5_0_BLOCK_SIZE / 2]>(
+            &bytes,
+            offset_of!(BlockQ5_0Gpu, data_low_bits),
+        );
         Self {
             scale,
             data_high_bits,
@@ -895,14 +1071,51 @@ impl GgufBlock for BlockQ5_0 {
 
         out
     }
+
+    fn vec_dot(&self, y: &Self::ActivationBlock) -> f32 {
+        const CENTER: i8 = 16;
+        const FIFTH_BIT: u8 = 0x10;
+        let high_bits: u32 = bytemuck::cast(self.data_high_bits);
+        let mut sum: i32 = 0;
+
+        for i in 0..16 {
+            let byte = self.data_low_bits[i];
+            let low = byte & 0x0F;
+            let high = byte >> 4;
+
+            let low_bit = ((high_bits >> i) << 4) as u8 & FIFTH_BIT;
+            let high_bit = (high_bits >> (i + 12)) as u8 & FIFTH_BIT;
+
+            let q5_lo = (low | low_bit) as i8 - CENTER;
+            let q5_hi = (high | high_bit) as i8 - CENTER;
+
+            sum += (q5_lo as i32) * (y.data[i] as i32);
+            sum += (q5_hi as i32) * (y.data[i + 16] as i32);
+        }
+
+        let scale = self.scale.to_f32() * y.scale.to_f32();
+        (sum as f32) * scale
+    }
+
+    fn quantize_activation(data: &[f32]) -> Self::ActivationBlock {
+        let arr: &[f32; 32] = data.try_into().expect("data must have 32 elements");
+        BlockQ8_0::quantize(arr)
+    }
 }
 
 const Q8_0_BLOCK_SIZE: usize = 32;
 
 #[derive(AnyBitPattern, Clone, Copy)]
 #[repr(C)]
-struct BlockQ8_0Wgsl {
+struct BlockQ8_0Gpu {
     pub(crate) scale: half::f16,
+    pub(crate) data: [u32; Q8_0_BLOCK_SIZE / 4],
+}
+
+#[derive(AnyBitPattern, Clone, Copy)]
+#[repr(C)]
+struct BlockQ8_0GpuF32 {
+    pub(crate) scale: f32,
     pub(crate) data: [u32; Q8_0_BLOCK_SIZE / 4],
 }
 
@@ -916,38 +1129,154 @@ pub struct BlockQ8_0 {
 impl BlockQ8_0 {
     pub const BLOCK_SIZE: usize = Q8_0_BLOCK_SIZE;
     pub const WEIGHTS_SIZE: usize = Q8_0_BLOCK_SIZE;
+
+    /// Quantize 32 f32 values into a Q8_0 block.
+    ///
+    /// This finds the maximum absolute value, computes a scale factor,
+    /// and quantizes each value to an i8 in the range [-127, 127].
+    pub fn quantize(data: &[f32; 32]) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                // Safety: AVX2 is detected at runtime
+                return unsafe { Self::quantize_avx2(data) };
+            }
+        }
+
+        Self::quantize_scalar(data)
+    }
+
+    #[inline(always)]
+    fn quantize_scalar(data: &[f32; 32]) -> Self {
+        let max_abs = data.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let scale = max_abs / 127.0;
+        let inv_scale = if max_abs != 0.0 { 127.0 / max_abs } else { 0.0 };
+
+        let mut qs = [0i8; 32];
+        for (i, &v) in data.iter().enumerate() {
+            qs[i] = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
+        }
+
+        Self {
+            scale: half::f16::from_f32(scale),
+            data: qs,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn quantize_avx2(data: &[f32; 32]) -> Self {
+        use std::arch::x86_64::*;
+        unsafe {
+            // Load 32 floats (4 × __m256)
+            let v0 = _mm256_loadu_ps(data.as_ptr());
+            let v1 = _mm256_loadu_ps(data.as_ptr().add(8));
+            let v2 = _mm256_loadu_ps(data.as_ptr().add(16));
+            let v3 = _mm256_loadu_ps(data.as_ptr().add(24));
+
+            // Find max absolute value (clear sign bit)
+            let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFFu32 as i32));
+            let abs0 = _mm256_and_ps(v0, abs_mask);
+            let abs1 = _mm256_and_ps(v1, abs_mask);
+            let abs2 = _mm256_and_ps(v2, abs_mask);
+            let abs3 = _mm256_and_ps(v3, abs_mask);
+            let max_all = _mm256_max_ps(_mm256_max_ps(abs0, abs1), _mm256_max_ps(abs2, abs3));
+
+            // Horizontal max of 8 floats
+            let hi128 = _mm256_extractf128_ps(max_all, 1);
+            let lo128 = _mm256_castps256_ps128(max_all);
+            let max128 = _mm_max_ps(lo128, hi128);
+            let max64 = _mm_max_ps(max128, _mm_movehl_ps(max128, max128));
+            let max32 = _mm_max_ss(max64, _mm_shuffle_ps(max64, max64, 1));
+            let max_abs = _mm_cvtss_f32(max32);
+
+            let scale = max_abs / 127.0;
+            let inv_scale = if max_abs != 0.0 { 127.0 / max_abs } else { 0.0 };
+            let s = _mm256_set1_ps(inv_scale);
+
+            // Scale and round to nearest integer
+            let q0 = _mm256_cvtps_epi32(_mm256_mul_ps(v0, s));
+            let q1 = _mm256_cvtps_epi32(_mm256_mul_ps(v1, s));
+            let q2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, s));
+            let q3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, s));
+
+            // Pack i32 → i16 → i8 using SSE to avoid AVX2 lane interleaving
+            let q0_lo = _mm256_castsi256_si128(q0);
+            let q0_hi = _mm256_extracti128_si256(q0, 1);
+            let q1_lo = _mm256_castsi256_si128(q1);
+            let q1_hi = _mm256_extracti128_si256(q1, 1);
+            let q2_lo = _mm256_castsi256_si128(q2);
+            let q2_hi = _mm256_extracti128_si256(q2, 1);
+            let q3_lo = _mm256_castsi256_si128(q3);
+            let q3_hi = _mm256_extracti128_si256(q3, 1);
+
+            let p0 = _mm_packs_epi32(q0_lo, q0_hi); // data[0..8] as i16
+            let p1 = _mm_packs_epi32(q1_lo, q1_hi); // data[8..16] as i16
+            let p2 = _mm_packs_epi32(q2_lo, q2_hi); // data[16..24] as i16
+            let p3 = _mm_packs_epi32(q3_lo, q3_hi); // data[24..32] as i16
+
+            let b_lo = _mm_packs_epi16(p0, p1); // data[0..16] as i8
+            let b_hi = _mm_packs_epi16(p2, p3); // data[16..32] as i8
+
+            let mut qs = [0i8; 32];
+            _mm_storeu_si128(qs.as_mut_ptr() as *mut __m128i, b_lo);
+            _mm_storeu_si128(qs.as_mut_ptr().add(16) as *mut __m128i, b_hi);
+
+            Self {
+                scale: half::f16::from_f32(scale),
+                data: qs,
+            }
+        }
+    }
 }
 
 impl GgufBlock for BlockQ8_0 {
     const BLOCK_SIZE: usize = Q8_0_BLOCK_SIZE;
 
-    type Bytes = [u8; std::mem::size_of::<BlockQ8_0Wgsl>()];
+    type Bytes = [u8; std::mem::size_of::<BlockQ8_0Gpu>()];
+    type BytesF32 = [u8; std::mem::size_of::<BlockQ8_0GpuF32>()];
     type AsBytes = [u8; std::mem::size_of::<Self>()];
     type Dequantized = [f32; Q8_0_BLOCK_SIZE];
+    type ActivationBlock = BlockQ8_0;
 
     fn finite(&self) -> bool {
         self.scale.is_finite()
     }
 
-    fn into_wgsl_bytes(self) -> Self::Bytes {
-        let mut bytes = [0; std::mem::size_of::<BlockQ8_0Wgsl>()];
-        let scale_offset = offset_of!(BlockQ8_0Wgsl, scale);
-        let scale_bytes = bytemuck::bytes_of(&self.scale);
-        bytes[scale_offset..scale_offset + scale_bytes.len()].copy_from_slice(scale_bytes);
-        let data_offset = offset_of!(BlockQ8_0Wgsl, data);
-        let data_bytes = bytemuck::cast_slice(&self.data);
-        bytes[data_offset..data_offset + data_bytes.len()].copy_from_slice(data_bytes);
+    fn into_gpu_storage_bytes_f32(self) -> Self::BytesF32 {
+        let mut bytes = [0; std::mem::size_of::<BlockQ8_0GpuF32>()];
+        let scale_f32 = self.scale.to_f32();
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ8_0GpuF32, scale),
+            bytemuck::bytes_of(&scale_f32),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ8_0GpuF32, data),
+            bytemuck::cast_slice(&self.data),
+        );
         bytes
     }
 
-    fn from_wgsl_bytes(bytes: Self::Bytes) -> Self {
-        let scale_offset = offset_of!(BlockQ8_0Wgsl, scale);
-        let scale_bytes = &bytes[scale_offset..scale_offset + std::mem::size_of::<half::f16>()];
-        let scale = *bytemuck::from_bytes(scale_bytes);
-        let data_offset = offset_of!(BlockQ8_0Wgsl, data);
-        let data_bytes =
-            &bytes[data_offset..data_offset + std::mem::size_of::<[i8; Q8_0_BLOCK_SIZE]>()];
-        let data = *bytemuck::from_bytes(data_bytes);
+    fn into_gpu_storage_bytes(self) -> Self::Bytes {
+        let mut bytes = [0; std::mem::size_of::<BlockQ8_0Gpu>()];
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ8_0Gpu, scale),
+            bytemuck::bytes_of(&self.scale),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ8_0Gpu, data),
+            bytemuck::cast_slice(&self.data),
+        );
+        bytes
+    }
+
+    fn from_gpu_storage_bytes(bytes: Self::Bytes) -> Self {
+        let scale = unpack_field::<half::f16>(&bytes, offset_of!(BlockQ8_0Gpu, scale));
+        let data = unpack_field::<[i8; Q8_0_BLOCK_SIZE]>(&bytes, offset_of!(BlockQ8_0Gpu, data));
         Self { scale, data }
     }
 
@@ -957,15 +1286,138 @@ impl GgufBlock for BlockQ8_0 {
 
         std::array::from_fn(|i| self.data[i] as f32 * scale)
     }
+
+    #[cfg(all(target_arch = "aarch64", nightly))]
+    fn vec_dot(&self, y: &Self::ActivationBlock) -> f32 {
+        use std::arch::aarch64::*;
+        unsafe {
+            // Load 32 i8 values from each block (2 NEON registers each)
+            let x0 = vld1q_s8(self.data.as_ptr());
+            let x1 = vld1q_s8(self.data.as_ptr().add(16));
+            let y0 = vld1q_s8(y.data.as_ptr());
+            let y1 = vld1q_s8(y.data.as_ptr().add(16));
+
+            // Use vdotq_s32: computes 4 simultaneous i8x4 dot products per instruction
+            // Each lane accumulates: a[i*4+0]*b[i*4+0] + a[i*4+1]*b[i*4+1] + a[i*4+2]*b[i*4+2] + a[i*4+3]*b[i*4+3]
+            let acc = vdupq_n_s32(0);
+            let acc = vdotq_s32(acc, x0, y0);
+            let acc = vdotq_s32(acc, x1, y1);
+
+            // Horizontal sum of 4 i32 lanes
+            let sum = vaddvq_s32(acc);
+
+            let scale = self.scale.to_f32() * y.scale.to_f32();
+            (sum as f32) * scale
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn vec_dot(&self, y: &Self::ActivationBlock) -> f32 {
+        let sum = if is_x86_feature_detected!("avx2") {
+            #[target_feature(enable = "avx2")]
+            unsafe fn dot_avx2(x_data: *const i8, y_data: *const i8) -> i32 {
+                use std::arch::x86_64::*;
+                unsafe {
+                    let qx = _mm256_loadu_si256(x_data as *const __m256i);
+                    let qy = _mm256_loadu_si256(y_data as *const __m256i);
+                    avx2_i8x32_signed_dot(qx, qy)
+                }
+            }
+            unsafe { dot_avx2(self.data.as_ptr(), y.data.as_ptr()) }
+        } else {
+            q8_0_vec_dot_scalar(&self.data, &y.data)
+        };
+        let scale = self.scale.to_f32() * y.scale.to_f32();
+        (sum as f32) * scale
+    }
+
+    #[cfg(not(any(all(target_arch = "aarch64", nightly), target_arch = "x86_64")))]
+    fn vec_dot(&self, y: &Self::ActivationBlock) -> f32 {
+        let sum = q8_0_vec_dot_scalar(&self.data, &y.data);
+        let scale = self.scale.to_f32() * y.scale.to_f32();
+        (sum as f32) * scale
+    }
+
+    fn quantize_activation(data: &[f32]) -> Self::ActivationBlock {
+        let arr: &[f32; 32] = data.try_into().expect("data must have 32 elements");
+        BlockQ8_0::quantize(arr)
+    }
+}
+
+// Used by both the x86_64 AVX2 fallback path and the generic "neither
+// aarch64-nightly nor x86_64" platform path. Skipped only on aarch64+nightly
+// where the NEON intrinsics path doesn't need it.
+#[cfg(not(all(target_arch = "aarch64", nightly)))]
+#[inline(always)]
+fn q8_0_vec_dot_scalar(x_data: &[i8; 32], y_data: &[i8; 32]) -> i32 {
+    let mut sum: i32 = 0;
+    for i in 0..32 {
+        sum += (x_data[i] as i32) * (y_data[i] as i32);
+    }
+    sum
 }
 
 const K_BLOCK_SIZE: usize = 256;
 
+/// Q8_K block type for quantized activations in K-quant dot products.
+///
+/// This is used to quantize f32 activations for integer dot product
+/// with Q4_K and Q6_K weight blocks. Each block stores 256 i8 values
+/// with a single f16 scale factor.
+#[derive(Zeroable, Pod, Clone, Copy, PartialEq, Debug)]
+#[repr(C)]
+pub struct BlockQ8K {
+    /// Scale factor for the block
+    pub scale: half::f16,
+    /// Quantized i8 values
+    pub data: [i8; K_BLOCK_SIZE],
+}
+
+impl BlockQ8K {
+    pub const BLOCK_SIZE: usize = K_BLOCK_SIZE;
+
+    /// Quantize 256 f32 values into a Q8_K block.
+    ///
+    /// This finds the maximum absolute value, computes a scale factor,
+    /// and quantizes each value to an i8 in the range [-127, 127].
+    pub fn quantize(data: &[f32; K_BLOCK_SIZE]) -> Self {
+        // Find max absolute value for scale
+        let max_abs = data.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let scale = max_abs / 127.0;
+        let inv_scale = if max_abs != 0.0 { 127.0 / max_abs } else { 0.0 };
+
+        let mut qs = [0i8; K_BLOCK_SIZE];
+        for (i, &v) in data.iter().enumerate() {
+            qs[i] = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
+        }
+
+        Self {
+            scale: half::f16::from_f32(scale),
+            data: qs,
+        }
+    }
+
+    /// Dequantize the block back to f32 values.
+    pub fn dequantize(&self) -> [f32; K_BLOCK_SIZE] {
+        let scale = self.scale.to_f32();
+        std::array::from_fn(|i| self.data[i] as f32 * scale)
+    }
+}
+
 #[derive(AnyBitPattern, Clone, Copy)]
 #[repr(C)]
-pub struct BlockQ4KWgsl {
+pub struct BlockQ4KGpu {
     scale: half::f16,
     min: half::f16,
+    scales: [u32; 12 / 4],
+    data: [u32; (K_BLOCK_SIZE / 2) / 4],
+}
+
+#[derive(AnyBitPattern, Clone, Copy)]
+#[repr(C)]
+pub struct BlockQ4KGpuF32 {
+    scale: f32,
+    min: f32,
     scales: [u32; 12 / 4],
     data: [u32; (K_BLOCK_SIZE / 2) / 4],
 }
@@ -996,45 +1448,73 @@ impl BlockQ4K {
 impl GgufBlock for BlockQ4K {
     const BLOCK_SIZE: usize = K_BLOCK_SIZE;
 
-    type Bytes = [u8; std::mem::size_of::<BlockQ4KWgsl>()];
+    type Bytes = [u8; std::mem::size_of::<BlockQ4KGpu>()];
+    type BytesF32 = [u8; std::mem::size_of::<BlockQ4KGpuF32>()];
     type AsBytes = [u8; std::mem::size_of::<Self>()];
     type Dequantized = [f32; K_BLOCK_SIZE];
+    type ActivationBlock = BlockQ8K;
 
     fn finite(&self) -> bool {
         self.scale.is_finite() && self.min.is_finite()
     }
 
-    fn into_wgsl_bytes(self) -> Self::Bytes {
-        let mut bytes = [0; std::mem::size_of::<BlockQ4KWgsl>()];
-        let scale_offset = offset_of!(BlockQ4KWgsl, scale);
-        let scale_bytes = bytemuck::bytes_of(&self.scale);
-        bytes[scale_offset..scale_offset + scale_bytes.len()].copy_from_slice(scale_bytes);
-        let min_offset = offset_of!(BlockQ4KWgsl, min);
-        let min_bytes = bytemuck::bytes_of(&self.min);
-        bytes[min_offset..min_offset + min_bytes.len()].copy_from_slice(min_bytes);
-        let scales_offset = offset_of!(BlockQ4KWgsl, scales);
-        let scales_bytes = bytemuck::cast_slice(&self.scales);
-        bytes[scales_offset..scales_offset + scales_bytes.len()].copy_from_slice(scales_bytes);
-        let data_offset = offset_of!(BlockQ4KWgsl, data);
-        let data_bytes = bytemuck::cast_slice(&self.data);
-        bytes[data_offset..data_offset + data_bytes.len()].copy_from_slice(data_bytes);
+    fn into_gpu_storage_bytes_f32(self) -> Self::BytesF32 {
+        let mut bytes = [0; std::mem::size_of::<BlockQ4KGpuF32>()];
+        let scale_f32 = self.scale.to_f32();
+        let min_f32 = self.min.to_f32();
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpuF32, scale),
+            bytemuck::bytes_of(&scale_f32),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpuF32, min),
+            bytemuck::bytes_of(&min_f32),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpuF32, scales),
+            bytemuck::bytes_of(&self.scales),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpuF32, data),
+            bytemuck::cast_slice(&self.data),
+        );
         bytes
     }
 
-    fn from_wgsl_bytes(bytes: Self::Bytes) -> Self {
-        let scale_offset = offset_of!(BlockQ4KWgsl, scale);
-        let scale_bytes = &bytes[scale_offset..scale_offset + std::mem::size_of::<half::f16>()];
-        let scale = *bytemuck::from_bytes(scale_bytes);
-        let min_offset = offset_of!(BlockQ4KWgsl, min);
-        let min_bytes = &bytes[min_offset..min_offset + std::mem::size_of::<half::f16>()];
-        let min = *bytemuck::from_bytes(min_bytes);
-        let scales_offset = offset_of!(BlockQ4KWgsl, scales);
-        let scales_bytes = &bytes[scales_offset..scales_offset + std::mem::size_of::<[u8; 12]>()];
-        let scales = *bytemuck::from_bytes(scales_bytes);
-        let data_offset = offset_of!(BlockQ4KWgsl, data);
-        let data_bytes =
-            &bytes[data_offset..data_offset + std::mem::size_of::<[u32; K_BLOCK_SIZE / 2 / 4]>()];
-        let data = *bytemuck::from_bytes(data_bytes);
+    fn into_gpu_storage_bytes(self) -> Self::Bytes {
+        let mut bytes = [0; std::mem::size_of::<BlockQ4KGpu>()];
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpu, scale),
+            bytemuck::bytes_of(&self.scale),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpu, min),
+            bytemuck::bytes_of(&self.min),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpu, scales),
+            bytemuck::cast_slice(&self.scales),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpu, data),
+            bytemuck::cast_slice(&self.data),
+        );
+        bytes
+    }
+
+    fn from_gpu_storage_bytes(bytes: Self::Bytes) -> Self {
+        let scale = unpack_field::<half::f16>(&bytes, offset_of!(BlockQ4KGpu, scale));
+        let min = unpack_field::<half::f16>(&bytes, offset_of!(BlockQ4KGpu, min));
+        let scales = unpack_field::<[u8; 12]>(&bytes, offset_of!(BlockQ4KGpu, scales));
+        let data = unpack_field::<[u8; K_BLOCK_SIZE / 2]>(&bytes, offset_of!(BlockQ4KGpu, data));
         Self {
             scale,
             min,
@@ -1047,13 +1527,9 @@ impl GgufBlock for BlockQ4K {
         let weights = &self.data;
         let super_block_scale = self.scale.to_f32();
         let super_block_min = self.min.to_f32();
-        let scales = bytemuck::cast_slice(&self.scales);
 
         let mut data = [0.0; K_BLOCK_SIZE];
-        let (first_scales, first_offset) = first_scales_min_k4(scales);
-        let (second_scales, second_offset) = second_scales_min_k4(scales);
-        let scales: [u8; 8] = bytemuck::cast([first_scales, second_scales]);
-        let offsets: [u8; 8] = bytemuck::cast([first_offset, second_offset]);
+        let (scales, offsets) = unpack_k4_scales_offsets(&self.scales);
         let mut pair_index = 0;
         for chunk_index in (0..K_BLOCK_SIZE / 2).step_by(32) {
             let out_chunk_index = chunk_index * 2;
@@ -1078,15 +1554,380 @@ impl GgufBlock for BlockQ4K {
 
         data
     }
+
+    #[cfg(all(target_arch = "aarch64", nightly))]
+    fn vec_dot(&self, y: &Self::ActivationBlock) -> f32 {
+        use std::arch::aarch64::*;
+
+        let super_scale = self.scale.to_f32() * y.scale.to_f32();
+        let super_min = self.min.to_f32() * y.scale.to_f32();
+
+        // Extract scales and offsets (same as dequantize logic)
+        let (scales, offsets) = unpack_k4_scales_offsets(&self.scales);
+
+        unsafe {
+            let mask_low = vdupq_n_u8(0x0F);
+
+            let mut scale_dot_sum = 0.0f32;
+            let mut offset_y_sum = 0.0f32;
+            let mut pair_index = 0;
+
+            // Vector of ones for computing activation sums via dot product
+            let ones = vdupq_n_s8(1);
+
+            for chunk_index in (0..128).step_by(32) {
+                let out_chunk_index = chunk_index * 2;
+
+                // Load 32 weight bytes as two 16-byte vectors
+                let w0 = vld1q_u8(self.data.as_ptr().add(chunk_index));
+                let w1 = vld1q_u8(self.data.as_ptr().add(chunk_index + 16));
+
+                // Extract low and high nibbles (values 0-15, fit in signed i8)
+                let q_lo_0 = vreinterpretq_s8_u8(vandq_u8(w0, mask_low));
+                let q_lo_1 = vreinterpretq_s8_u8(vandq_u8(w1, mask_low));
+                let q_hi_0 = vreinterpretq_s8_u8(vshrq_n_u8(w0, 4));
+                let q_hi_1 = vreinterpretq_s8_u8(vshrq_n_u8(w1, 4));
+
+                // Load activation values
+                let y_lo_0 = vld1q_s8(y.data.as_ptr().add(out_chunk_index));
+                let y_lo_1 = vld1q_s8(y.data.as_ptr().add(out_chunk_index + 16));
+                let y_hi_0 = vld1q_s8(y.data.as_ptr().add(out_chunk_index + 32));
+                let y_hi_1 = vld1q_s8(y.data.as_ptr().add(out_chunk_index + 48));
+
+                // Low nibbles integer dot product using vdotq_s32
+                let acc_lo = vdupq_n_s32(0);
+                let acc_lo = vdotq_s32(acc_lo, q_lo_0, y_lo_0);
+                let acc_lo = vdotq_s32(acc_lo, q_lo_1, y_lo_1);
+                let int_dot_lo = vaddvq_s32(acc_lo);
+
+                // High nibbles integer dot product
+                let acc_hi = vdupq_n_s32(0);
+                let acc_hi = vdotq_s32(acc_hi, q_hi_0, y_hi_0);
+                let acc_hi = vdotq_s32(acc_hi, q_hi_1, y_hi_1);
+                let int_dot_hi = vaddvq_s32(acc_hi);
+
+                // Sum of y values for offset correction using vdotq_s32 with ones
+                let y_sum_acc_lo = vdupq_n_s32(0);
+                let y_sum_acc_lo = vdotq_s32(y_sum_acc_lo, y_lo_0, ones);
+                let y_sum_acc_lo = vdotq_s32(y_sum_acc_lo, y_lo_1, ones);
+                let y_sum_lo = vaddvq_s32(y_sum_acc_lo);
+
+                let y_sum_acc_hi = vdupq_n_s32(0);
+                let y_sum_acc_hi = vdotq_s32(y_sum_acc_hi, y_hi_0, ones);
+                let y_sum_acc_hi = vdotq_s32(y_sum_acc_hi, y_hi_1, ones);
+                let y_sum_hi = vaddvq_s32(y_sum_acc_hi);
+
+                // Apply group scales and accumulate
+                let low_scale = scales[pair_index] as f32;
+                let low_offset = offsets[pair_index] as f32;
+                pair_index += 1;
+
+                let high_scale = scales[pair_index] as f32;
+                let high_offset = offsets[pair_index] as f32;
+                pair_index += 1;
+
+                scale_dot_sum += low_scale * (int_dot_lo as f32) + high_scale * (int_dot_hi as f32);
+                offset_y_sum += low_offset * (y_sum_lo as f32) + high_offset * (y_sum_hi as f32);
+            }
+
+            super_scale * scale_dot_sum - super_min * offset_y_sum
+        }
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", nightly)))]
+    fn vec_dot(&self, y: &Self::ActivationBlock) -> f32 {
+        let super_scale = self.scale.to_f32() * y.scale.to_f32();
+        let super_min = self.min.to_f32() * y.scale.to_f32();
+
+        // Extract scales and offsets (same as dequantize logic)
+        let (scales, offsets) = unpack_k4_scales_offsets(&self.scales);
+
+        let mut sum = 0.0f32;
+        let mut pair_index = 0;
+
+        for chunk_index in (0..128).step_by(32) {
+            let out_chunk_index = chunk_index * 2;
+
+            let low_scale = scales[pair_index] as f32 * super_scale;
+            let low_offset = offsets[pair_index] as f32 * super_min;
+            pair_index += 1;
+
+            let high_scale = scales[pair_index] as f32 * super_scale;
+            let high_offset = offsets[pair_index] as f32 * super_min;
+            pair_index += 1;
+
+            for offset in 0..32 {
+                let weight_byte = self.data[chunk_index + offset];
+                let q_lo = (weight_byte & 0xF) as f32;
+                let q_hi = (weight_byte >> 4) as f32;
+
+                let w_lo = low_scale * q_lo - low_offset;
+                let w_hi = high_scale * q_hi - high_offset;
+
+                let y_lo = y.data[out_chunk_index + offset] as f32;
+                let y_hi = y.data[out_chunk_index + offset + 32] as f32;
+
+                sum += w_lo * y_lo + w_hi * y_hi;
+            }
+        }
+
+        sum
+    }
+
+    fn quantize_activation(data: &[f32]) -> Self::ActivationBlock {
+        let arr: &[f32; K_BLOCK_SIZE] = data.try_into().expect("data must have 256 elements");
+        BlockQ8K::quantize(arr)
+    }
 }
 
 #[derive(AnyBitPattern, Clone, Copy)]
 #[repr(C)]
-pub struct BlockQ6KWgsl {
+pub struct BlockQ5KGpu {
+    scale: half::f16,
+    min: half::f16,
+    scales: [u32; 12 / 4],
+    qh: [u32; (K_BLOCK_SIZE / 8) / 4],
+    qs: [u32; (K_BLOCK_SIZE / 2) / 4],
+}
+
+#[derive(AnyBitPattern, Clone, Copy)]
+#[repr(C)]
+pub struct BlockQ5KGpuF32 {
+    scale: f32,
+    min: f32,
+    scales: [u32; 12 / 4],
+    qh: [u32; (K_BLOCK_SIZE / 8) / 4],
+    qs: [u32; (K_BLOCK_SIZE / 2) / 4],
+}
+
+#[derive(Zeroable, Pod, Clone, Copy, PartialEq, Debug)]
+#[repr(C)]
+pub struct BlockQ5K {
+    scale: half::f16,
+    min: half::f16,
+    scales: [u8; 12],
+    qh: [u8; K_BLOCK_SIZE / 8],
+    qs: [u8; K_BLOCK_SIZE / 2],
+}
+
+impl BlockQ5K {
+    pub const BLOCK_SIZE: usize = K_BLOCK_SIZE;
+    pub const SCALES_SIZE: usize = 12;
+    pub const QH_SIZE: usize = K_BLOCK_SIZE / 8;
+    pub const QS_SIZE: usize = K_BLOCK_SIZE / 2;
+
+    pub fn scale(&self) -> f32 {
+        self.scale.to_f32()
+    }
+
+    pub fn min(&self) -> f32 {
+        self.min.to_f32()
+    }
+}
+
+impl GgufBlock for BlockQ5K {
+    const BLOCK_SIZE: usize = K_BLOCK_SIZE;
+
+    type Bytes = [u8; std::mem::size_of::<BlockQ5KGpu>()];
+    type BytesF32 = [u8; std::mem::size_of::<BlockQ5KGpuF32>()];
+    type AsBytes = [u8; std::mem::size_of::<Self>()];
+    type Dequantized = [f32; K_BLOCK_SIZE];
+    type ActivationBlock = BlockQ8K;
+
+    fn finite(&self) -> bool {
+        self.scale.is_finite() && self.min.is_finite()
+    }
+
+    fn into_gpu_storage_bytes_f32(self) -> Self::BytesF32 {
+        let mut bytes = [0; std::mem::size_of::<BlockQ5KGpuF32>()];
+        let scale_f32 = self.scale.to_f32();
+        let min_f32 = self.min.to_f32();
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpuF32, scale),
+            bytemuck::bytes_of(&scale_f32),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpuF32, min),
+            bytemuck::bytes_of(&min_f32),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpuF32, scales),
+            bytemuck::bytes_of(&self.scales),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpuF32, qh),
+            bytemuck::bytes_of(&self.qh),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpuF32, qs),
+            bytemuck::cast_slice(&self.qs),
+        );
+        bytes
+    }
+
+    fn into_gpu_storage_bytes(self) -> Self::Bytes {
+        let mut bytes = [0; std::mem::size_of::<BlockQ5KGpu>()];
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpu, scale),
+            bytemuck::bytes_of(&self.scale),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpu, min),
+            bytemuck::bytes_of(&self.min),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpu, scales),
+            bytemuck::cast_slice(&self.scales),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpu, qh),
+            bytemuck::cast_slice(&self.qh),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpu, qs),
+            bytemuck::cast_slice(&self.qs),
+        );
+        bytes
+    }
+
+    fn from_gpu_storage_bytes(bytes: Self::Bytes) -> Self {
+        let scale = unpack_field::<half::f16>(&bytes, offset_of!(BlockQ5KGpu, scale));
+        let min = unpack_field::<half::f16>(&bytes, offset_of!(BlockQ5KGpu, min));
+        let scales = unpack_field::<[u8; 12]>(&bytes, offset_of!(BlockQ5KGpu, scales));
+        let qh = unpack_field::<[u8; K_BLOCK_SIZE / 8]>(&bytes, offset_of!(BlockQ5KGpu, qh));
+        let qs = unpack_field::<[u8; K_BLOCK_SIZE / 2]>(&bytes, offset_of!(BlockQ5KGpu, qs));
+        Self {
+            scale,
+            min,
+            scales,
+            qh,
+            qs,
+        }
+    }
+
+    // https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-quants.c
+    fn dequantize(&self) -> [f32; K_BLOCK_SIZE] {
+        let super_block_scale = self.scale.to_f32();
+        let super_block_min = self.min.to_f32();
+
+        let mut data = [0.0; K_BLOCK_SIZE];
+        let (scales, offsets) = unpack_k4_scales_offsets(&self.scales);
+
+        let mut ql_offset = 0usize;
+        let mut scale_idx = 0usize;
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+
+        for chunk in 0..4 {
+            let out_offset = chunk * 64;
+
+            let d1 = scales[scale_idx] as f32 * super_block_scale;
+            let m1 = offsets[scale_idx] as f32 * super_block_min;
+            scale_idx += 1;
+            let d2 = scales[scale_idx] as f32 * super_block_scale;
+            let m2 = offsets[scale_idx] as f32 * super_block_min;
+            scale_idx += 1;
+
+            for l in 0..32 {
+                let ql = self.qs[ql_offset + l];
+                let qh = self.qh[l];
+                let q_lo = (ql & 0xF) + if (qh & u1) != 0 { 16 } else { 0 };
+                data[out_offset + l] = d1 * q_lo as f32 - m1;
+            }
+
+            for l in 0..32 {
+                let ql = self.qs[ql_offset + l];
+                let qh = self.qh[l];
+                let q_hi = (ql >> 4) + if (qh & u2) != 0 { 16 } else { 0 };
+                data[out_offset + 32 + l] = d2 * q_hi as f32 - m2;
+            }
+
+            ql_offset += 32;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+
+        data
+    }
+
+    fn vec_dot(&self, y: &Self::ActivationBlock) -> f32 {
+        let super_scale = self.scale.to_f32() * y.scale.to_f32();
+        let super_min = self.min.to_f32() * y.scale.to_f32();
+
+        let (scales, offsets) = unpack_k4_scales_offsets(&self.scales);
+
+        let mut sum = 0.0f32;
+        let mut ql_offset = 0usize;
+        let mut scale_idx = 0usize;
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+
+        for chunk in 0..4 {
+            let out_offset = chunk * 64;
+
+            let d1 = scales[scale_idx] as f32 * super_scale;
+            let m1 = offsets[scale_idx] as f32 * super_min;
+            scale_idx += 1;
+            let d2 = scales[scale_idx] as f32 * super_scale;
+            let m2 = offsets[scale_idx] as f32 * super_min;
+            scale_idx += 1;
+
+            for l in 0..32 {
+                let ql = self.qs[ql_offset + l];
+                let qh = self.qh[l];
+                let q_lo = (ql & 0xF) + if (qh & u1) != 0 { 16 } else { 0 };
+                let w = d1 * q_lo as f32 - m1;
+                sum += w * y.data[out_offset + l] as f32;
+            }
+
+            for l in 0..32 {
+                let ql = self.qs[ql_offset + l];
+                let qh = self.qh[l];
+                let q_hi = (ql >> 4) + if (qh & u2) != 0 { 16 } else { 0 };
+                let w = d2 * q_hi as f32 - m2;
+                sum += w * y.data[out_offset + 32 + l] as f32;
+            }
+
+            ql_offset += 32;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+
+        sum
+    }
+
+    fn quantize_activation(data: &[f32]) -> Self::ActivationBlock {
+        let arr: &[f32; K_BLOCK_SIZE] = data.try_into().expect("data must have 256 elements");
+        BlockQ8K::quantize(arr)
+    }
+}
+
+#[derive(AnyBitPattern, Clone, Copy)]
+#[repr(C)]
+pub struct BlockQ6KGpu {
     pub(crate) data_low_bits: [u32; (K_BLOCK_SIZE / 2) / 4],
     pub(crate) data_high_bits: [u32; (K_BLOCK_SIZE / 4) / 4],
     pub(crate) scales: [u32; (K_BLOCK_SIZE / 16) / 4],
     pub(crate) scale: half::f16,
+}
+
+#[derive(AnyBitPattern, Clone, Copy)]
+#[repr(C)]
+pub struct BlockQ6KGpuF32 {
+    pub(crate) data_low_bits: [u32; (K_BLOCK_SIZE / 2) / 4],
+    pub(crate) data_high_bits: [u32; (K_BLOCK_SIZE / 4) / 4],
+    pub(crate) scales: [u32; (K_BLOCK_SIZE / 16) / 4],
+    pub(crate) scale: f32,
 }
 
 #[derive(Zeroable, Pod, Clone, Copy, PartialEq, Debug)]
@@ -1112,49 +1953,75 @@ impl BlockQ6K {
 impl GgufBlock for BlockQ6K {
     const BLOCK_SIZE: usize = K_BLOCK_SIZE;
 
-    type Bytes = [u8; std::mem::size_of::<BlockQ6KWgsl>()];
+    type Bytes = [u8; std::mem::size_of::<BlockQ6KGpu>()];
+    type BytesF32 = [u8; std::mem::size_of::<BlockQ6KGpuF32>()];
     type AsBytes = [u8; std::mem::size_of::<Self>()];
     type Dequantized = [f32; K_BLOCK_SIZE];
+    type ActivationBlock = BlockQ8K;
 
     fn finite(&self) -> bool {
         self.scale.is_finite()
     }
 
-    fn into_wgsl_bytes(self) -> Self::Bytes {
-        let mut bytes = [0; std::mem::size_of::<BlockQ6KWgsl>()];
-        let data_low_bits_offset = offset_of!(BlockQ6KWgsl, data_low_bits);
-        let data_low_bits_bytes = bytemuck::cast_slice(&self.data_low_bits);
-        bytes[data_low_bits_offset..data_low_bits_offset + data_low_bits_bytes.len()]
-            .copy_from_slice(data_low_bits_bytes);
-        let data_high_bits_offset = offset_of!(BlockQ6KWgsl, data_high_bits);
-        let data_high_bits_bytes = bytemuck::cast_slice(&self.data_high_bits);
-        bytes[data_high_bits_offset..data_high_bits_offset + data_high_bits_bytes.len()]
-            .copy_from_slice(data_high_bits_bytes);
-        let scales_offset = offset_of!(BlockQ6KWgsl, scales);
-        let scales_bytes = bytemuck::cast_slice(&self.scales);
-        bytes[scales_offset..scales_offset + scales_bytes.len()].copy_from_slice(scales_bytes);
-        let scale_offset = offset_of!(BlockQ6KWgsl, scale);
-        let scale_bytes = bytemuck::bytes_of(&self.scale);
-        bytes[scale_offset..scale_offset + scale_bytes.len()].copy_from_slice(scale_bytes);
+    fn into_gpu_storage_bytes_f32(self) -> Self::BytesF32 {
+        let mut bytes = [0; std::mem::size_of::<BlockQ6KGpuF32>()];
+        let scale_f32 = self.scale.to_f32();
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ6KGpuF32, data_low_bits),
+            bytemuck::cast_slice(&self.data_low_bits),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ6KGpuF32, data_high_bits),
+            bytemuck::cast_slice(&self.data_high_bits),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ6KGpuF32, scales),
+            bytemuck::bytes_of(&self.scales),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ6KGpuF32, scale),
+            bytemuck::bytes_of(&scale_f32),
+        );
         bytes
     }
 
-    fn from_wgsl_bytes(bytes: Self::Bytes) -> Self {
-        let data_low_bits_offset = offset_of!(BlockQ6KWgsl, data_low_bits);
-        let data_low_bits_bytes = &bytes[data_low_bits_offset
-            ..data_low_bits_offset + std::mem::size_of::<[u8; K_BLOCK_SIZE / 2]>()];
-        let data_low_bits = *bytemuck::from_bytes(data_low_bits_bytes);
-        let data_high_bits_offset = offset_of!(BlockQ6KWgsl, data_high_bits);
-        let data_high_bits_bytes = &bytes[data_high_bits_offset
-            ..data_high_bits_offset + std::mem::size_of::<[u8; K_BLOCK_SIZE / 4]>()];
-        let data_high_bits = *bytemuck::from_bytes(data_high_bits_bytes);
-        let scales_offset = offset_of!(BlockQ6KWgsl, scales);
-        let scales_bytes =
-            &bytes[scales_offset..scales_offset + std::mem::size_of::<[i8; K_BLOCK_SIZE / 16]>()];
-        let scales = *bytemuck::from_bytes(scales_bytes);
-        let scale_offset = offset_of!(BlockQ6KWgsl, scale);
-        let scale_bytes = &bytes[scale_offset..scale_offset + std::mem::size_of::<half::f16>()];
-        let scale = *bytemuck::from_bytes(scale_bytes);
+    fn into_gpu_storage_bytes(self) -> Self::Bytes {
+        let mut bytes = [0; std::mem::size_of::<BlockQ6KGpu>()];
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ6KGpu, data_low_bits),
+            bytemuck::cast_slice(&self.data_low_bits),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ6KGpu, data_high_bits),
+            bytemuck::cast_slice(&self.data_high_bits),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ6KGpu, scales),
+            bytemuck::cast_slice(&self.scales),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ6KGpu, scale),
+            bytemuck::bytes_of(&self.scale),
+        );
+        bytes
+    }
+
+    fn from_gpu_storage_bytes(bytes: Self::Bytes) -> Self {
+        let data_low_bits =
+            unpack_field::<[u8; K_BLOCK_SIZE / 2]>(&bytes, offset_of!(BlockQ6KGpu, data_low_bits));
+        let data_high_bits =
+            unpack_field::<[u8; K_BLOCK_SIZE / 4]>(&bytes, offset_of!(BlockQ6KGpu, data_high_bits));
+        let scales =
+            unpack_field::<[i8; K_BLOCK_SIZE / 16]>(&bytes, offset_of!(BlockQ6KGpu, scales));
+        let scale = unpack_field::<half::f16>(&bytes, offset_of!(BlockQ6KGpu, scale));
         Self {
             data_low_bits,
             data_high_bits,
@@ -1216,6 +2083,56 @@ impl GgufBlock for BlockQ6K {
 
         data
     }
+
+    fn vec_dot(&self, y: &Self::ActivationBlock) -> f32 {
+        const CENTER: i8 = 32;
+        const TWO_BITS: u8 = 0b11;
+        const FOUR_BITS: u8 = 0b1111;
+
+        let scale = self.scale.to_f32() * y.scale.to_f32();
+        let mut sum = 0.0f32;
+
+        for chunk_index in 0..2 {
+            let output_index = chunk_index * 128;
+            let lower_index = chunk_index * 64;
+            let high_index = chunk_index * 32;
+            let base_scale_index = chunk_index * 8;
+
+            for high_byte_index in 0..32 {
+                let sc_idx = base_scale_index + high_byte_index / 16;
+                let high_byte = self.data_high_bits[high_index + high_byte_index];
+                let first_low = self.data_low_bits[lower_index + high_byte_index];
+                let second_low = self.data_low_bits[lower_index + high_byte_index + 32];
+
+                // Reconstruct 6-bit values
+                let q1 = ((high_byte & TWO_BITS) << 4 | (first_low & FOUR_BITS)) as i8 - CENTER;
+                let q2 =
+                    (((high_byte >> 2) & TWO_BITS) << 4 | (second_low & FOUR_BITS)) as i8 - CENTER;
+                let q3 = (((high_byte >> 4) & TWO_BITS) << 4 | (first_low >> 4)) as i8 - CENTER;
+                let q4 = (((high_byte >> 6) & TWO_BITS) << 4 | (second_low >> 4)) as i8 - CENTER;
+
+                let s1 = self.scales[sc_idx] as f32;
+                let s2 = self.scales[sc_idx + 2] as f32;
+                let s3 = self.scales[sc_idx + 4] as f32;
+                let s4 = self.scales[sc_idx + 6] as f32;
+
+                sum += scale * s1 * (q1 as f32) * (y.data[output_index + high_byte_index] as f32);
+                sum +=
+                    scale * s2 * (q2 as f32) * (y.data[output_index + high_byte_index + 32] as f32);
+                sum +=
+                    scale * s3 * (q3 as f32) * (y.data[output_index + high_byte_index + 64] as f32);
+                sum +=
+                    scale * s4 * (q4 as f32) * (y.data[output_index + high_byte_index + 96] as f32);
+            }
+        }
+
+        sum
+    }
+
+    fn quantize_activation(data: &[f32]) -> Self::ActivationBlock {
+        let arr: &[f32; K_BLOCK_SIZE] = data.try_into().expect("data must have 256 elements");
+        BlockQ8K::quantize(arr)
+    }
 }
 
 const SIX_BITS_MASK: u32 = 0b0011_1111_0011_1111_0011_1111_0011_1111;
@@ -1270,6 +2187,272 @@ fn second_scales_min_k4(packed_scales: &[u32]) -> (u32, u32) {
     (second_scales, second_offsets)
 }
 
+/// Unpack the 12 packed-scale bytes of a K-quant block (Q4_K, Q5_K dequantize/vec_dot)
+/// into two 8-byte arrays of per-group scales and offsets. Every K4-style impl
+/// needs the same four-line `first_scales_min_k4` + `second_scales_min_k4` +
+/// double `bytemuck::cast` dance to materialize these arrays; collapsing it
+/// here saves five copies of that boilerplate.
+///
+/// Accepts the raw 12-byte field directly. Because `BlockQ4K` / `BlockQ5K`
+/// only have 2-byte struct alignment, a `&[u8]` taken from `&self.scales`
+/// is not guaranteed to be 4-byte aligned in memory, so we copy it into a
+/// 4-byte aligned `[u32; 3]` before applying the bit-extraction logic.
+#[inline(always)]
+fn unpack_k4_scales_offsets(packed_scales: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
+    let packed: [u32; 3] = bytemuck::cast(*packed_scales);
+    let (first_scales, first_offset) = first_scales_min_k4(&packed);
+    let (second_scales, second_offset) = second_scales_min_k4(&packed);
+    let scales: [u8; 8] = bytemuck::cast([first_scales, second_scales]);
+    let offsets: [u8; 8] = bytemuck::cast([first_offset, second_offset]);
+    (scales, offsets)
+}
+
+#[cfg(test)]
+#[allow(clippy::needless_range_loop)]
+mod vec_dot_tests {
+    use super::*;
+
+    /// Generic helper: assert that `block.vec_dot(&act)` matches
+    /// `dequantize(block) · dequant_acts` within `tolerance * max(|expected|, 1)`.
+    ///
+    /// Every per-block "vec_dot matches dequantize" test had the same 20-line
+    /// scaffold differing only in (a) how the weight block is constructed and
+    /// (b) the tolerance. This helper takes the already-built block plus the
+    /// dequantized activations and runs the comparison.
+    fn assert_vec_dot_matches_dequantize<B: GgufBlock>(
+        block: &B,
+        act_block: &B::ActivationBlock,
+        dequant_acts: &[f32],
+        tolerance_frac: f32,
+        label: &str,
+    ) where
+        B::Dequantized: AsRef<[f32]>,
+    {
+        let dequant_weights = block.dequantize();
+        let expected: f32 = dequant_weights
+            .as_ref()
+            .iter()
+            .zip(dequant_acts.iter())
+            .map(|(w, a)| w * a)
+            .sum();
+
+        let actual = block.vec_dot(act_block);
+
+        let tolerance = expected.abs().max(1.0) * tolerance_frac;
+        assert!(
+            (actual - expected).abs() < tolerance,
+            "{} vec_dot mismatch: expected {}, got {}, diff {} (tolerance {})",
+            label,
+            expected,
+            actual,
+            (actual - expected).abs(),
+            tolerance
+        );
+    }
+
+    /// Build a Q8_K activation block with the test fixture data used by
+    /// `test_q4_k_vec_dot_vs_dequantize` and `test_q5_k_vec_dot_vs_dequantize`.
+    /// Returns the block and its dequantized values so callers can use both.
+    fn q8k_test_activation() -> (BlockQ8K, [f32; 256]) {
+        let act_data: [f32; 256] = std::array::from_fn(|i| ((i as f32) - 128.0) * 0.01);
+        let block = BlockQ8K::quantize(&act_data);
+        let dequant = block.dequantize();
+        (block, dequant)
+    }
+
+    #[test]
+    fn test_q8_0_quantize_roundtrip() {
+        let data: [f32; 32] = std::array::from_fn(|i| (i as f32 - 16.0) * 0.1);
+        let block = BlockQ8_0::quantize(&data);
+        let dequant = block.dequantize();
+        for (a, b) in data.iter().zip(&dequant) {
+            assert!(
+                (a - b).abs() < 0.02,
+                "Quantization roundtrip error: {} vs {}",
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn test_q8_0_vec_dot() {
+        // Create two Q8_0 blocks with known values
+        let data_a: [f32; 32] = std::array::from_fn(|i| (i as f32) * 0.1);
+        let data_b: [f32; 32] = std::array::from_fn(|i| ((i as f32) - 16.0) * 0.05);
+
+        let block_a = BlockQ8_0::quantize(&data_a);
+        let block_b = BlockQ8_0::quantize(&data_b);
+
+        // Compute expected result using dequantized values
+        let dequant_a = block_a.dequantize();
+        let dequant_b = block_b.dequantize();
+        let expected: f32 = dequant_a.iter().zip(&dequant_b).map(|(a, b)| a * b).sum();
+
+        // Compute using vec_dot
+        let actual = block_a.vec_dot(&block_b);
+
+        // Allow small error due to quantization
+        let tolerance = expected.abs().max(1.0) * 0.05;
+        assert!(
+            (actual - expected).abs() < tolerance,
+            "vec_dot mismatch: expected {}, got {}, diff {}",
+            expected,
+            actual,
+            (actual - expected).abs()
+        );
+    }
+
+    #[test]
+    fn test_q8k_quantize_roundtrip() {
+        let data: [f32; 256] = std::array::from_fn(|i| ((i as f32) - 128.0) * 0.01);
+        let block = BlockQ8K::quantize(&data);
+        let dequant = block.dequantize();
+        for (a, b) in data.iter().zip(&dequant) {
+            assert!(
+                (a - b).abs() < 0.02,
+                "Quantization roundtrip error: {} vs {}",
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn test_q4_k_vec_dot_vs_dequantize() {
+        let block = BlockQ4K {
+            scale: half::f16::from_f32(0.1),
+            min: half::f16::from_f32(0.05),
+            scales: [8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96],
+            data: std::array::from_fn(|i| ((i * 3) % 256) as u8),
+        };
+        let (act_block, dequant_acts) = q8k_test_activation();
+        assert_vec_dot_matches_dequantize(&block, &act_block, &dequant_acts, 0.10, "Q4_K");
+    }
+
+    #[test]
+    fn test_q4_k_raw_bytes_match_native_gpu_storage() {
+        let block = BlockQ4K {
+            scale: half::f16::from_f32(0.123),
+            min: half::f16::from_f32(0.456),
+            scales: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            data: std::array::from_fn(|i| (i * 3) as u8),
+        };
+
+        assert_eq!(
+            bytemuck::bytes_of(&block),
+            block.into_gpu_storage_bytes().as_ref()
+        );
+    }
+
+    #[test]
+    fn test_q5_k_vec_dot_vs_dequantize() {
+        let block = BlockQ5K {
+            scale: half::f16::from_f32(0.1),
+            min: half::f16::from_f32(0.05),
+            scales: [8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96],
+            qh: std::array::from_fn(|i| ((i * 7) % 256) as u8), // high bits pattern
+            qs: std::array::from_fn(|i| ((i * 3) % 256) as u8), // low 4-bit values
+        };
+        let (act_block, dequant_acts) = q8k_test_activation();
+        assert_vec_dot_matches_dequantize(&block, &act_block, &dequant_acts, 0.10, "Q5_K");
+    }
+
+    #[test]
+    fn test_q5_k_raw_bytes_match_native_gpu_storage() {
+        let block = BlockQ5K {
+            scale: half::f16::from_f32(0.123),
+            min: half::f16::from_f32(0.456),
+            scales: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            qh: std::array::from_fn(|i| i as u8),
+            qs: std::array::from_fn(|i| (i * 2) as u8),
+        };
+
+        assert_eq!(
+            bytemuck::bytes_of(&block),
+            block.into_gpu_storage_bytes().as_ref()
+        );
+    }
+
+    #[test]
+    fn test_q5_k_dequantize_basic() {
+        // Test that Q5K dequantization produces sensible values
+        let block = BlockQ5K {
+            scale: half::f16::from_f32(1.0),
+            min: half::f16::from_f32(0.0),
+            scales: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], // Unit scales
+            qh: [0; 32],                                  // No high bits set
+            qs: std::array::from_fn(|i| {
+                // Pack values: low nibble = i%16, high nibble = (i+1)%16
+                let lo = (i % 16) as u8;
+                let hi = ((i + 1) % 16) as u8;
+                lo | (hi << 4)
+            }),
+        };
+
+        let dequant = block.dequantize();
+
+        // Verify first few values make sense
+        // With scale=1, min=0, scales[0]=1, and qh=0:
+        // value[i] = (qs[i] & 0xF) * scale - min = (i % 16) * 1 - 0 = i % 16
+        for i in 0..16 {
+            let expected = (i % 16) as f32;
+            assert!(
+                (dequant[i] - expected).abs() < 0.01,
+                "Q5K dequantize[{}]: expected {}, got {}",
+                i,
+                expected,
+                dequant[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_q5_k_high_bits() {
+        // Test that the high bits (qh) are properly handled
+        let block = BlockQ5K {
+            scale: half::f16::from_f32(1.0),
+            min: half::f16::from_f32(0.0),
+            scales: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            qh: [0xFF; 32], // All high bits set (adds 16 to each value)
+            qs: [0; 128],   // All low bits zero
+        };
+
+        let dequant = block.dequantize();
+
+        // With qh bits set, value = (0 + 16) * scale - min = 16
+        for i in 0..32 {
+            assert!(
+                (dequant[i] - 16.0).abs() < 0.01,
+                "Q5K with high bits dequantize[{}]: expected 16, got {}",
+                i,
+                dequant[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_q5_k_gpu_storage_bytes_roundtrip() {
+        let original = BlockQ5K {
+            scale: half::f16::from_f32(0.123),
+            min: half::f16::from_f32(0.456),
+            scales: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            qh: std::array::from_fn(|i| i as u8),
+            qs: std::array::from_fn(|i| (i * 2) as u8),
+        };
+
+        // Round-trip through GPU storage bytes
+        let gpu_storage_bytes = original.into_gpu_storage_bytes();
+        let reconstructed = BlockQ5K::from_gpu_storage_bytes(gpu_storage_bytes);
+
+        assert_eq!(original.scale, reconstructed.scale);
+        assert_eq!(original.min, reconstructed.min);
+        assert_eq!(original.scales, reconstructed.scales);
+        assert_eq!(original.qh, reconstructed.qh);
+        assert_eq!(original.qs, reconstructed.qs);
+    }
+}
+
 #[cfg(test)]
 async fn tiny_llama() -> impl std::io::Read + std::io::Seek {
     let url = "https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf";
@@ -1320,27 +2503,6 @@ async fn test_round_trip_tiny_llama() {
             )
             .unwrap();
     }
-
-    // // Read the data again and assert everything is the same
-    // let mut reader = std::io::Cursor::new(writer);
-    // let new_metadata = GgufMetadata::read(&mut reader).unwrap();
-    // assert_eq!(new_metadata, metadata);
-
-    // // Read the tensor bytes
-    // let mut new_tensors = HashMap::new();
-    // for (tensor_name, tensor_info) in new_metadata.tensor_infos.iter() {
-    //     println!("{}: {:?}", tensor_name, tensor_info);
-    //     let tensor_bytes = tensor_info
-    //         .read_tensor_bytes(&mut reader, new_metadata.tensor_data_offset)
-    //         .unwrap();
-    //     new_tensors.insert(tensor_name.clone(), tensor_bytes);
-    // }
-
-    // // Assert all the tensors are the same
-    // for (name, tensor) in tensors {
-    //     let new_tensor = new_tensors.get(&name).unwrap();
-    //     assert_eq!(&tensor, new_tensor);
-    // }
 }
 
 #[test]
@@ -1486,4 +2648,111 @@ async fn test_load_tiny_llama() {
             _ => todo!(),
         }
     }
+}
+
+#[test]
+fn test_q8_0_quantize_roundtrip() {
+    // Test that quantizing and dequantizing f32 values gives reasonable results
+    let data: [f32; 32] = std::array::from_fn(|i| (i as f32 - 16.0) * 0.1);
+    let block = BlockQ8_0::quantize(&data);
+    let dequant = block.dequantize();
+    for (a, b) in data.iter().zip(&dequant) {
+        // Quantization to 8-bit introduces ~1% error
+        assert!(
+            (a - b).abs() < 0.02,
+            "Mismatch: original={}, dequantized={}",
+            a,
+            b
+        );
+    }
+}
+
+#[test]
+fn test_q8_k_quantize_roundtrip() {
+    // Test that quantizing and dequantizing f32 values gives reasonable results
+    let data: [f32; K_BLOCK_SIZE] = std::array::from_fn(|i| (i as f32 - 128.0) * 0.01);
+    let block = BlockQ8K::quantize(&data);
+    let dequant = block.dequantize();
+    for (a, b) in data.iter().zip(&dequant) {
+        // Quantization to 8-bit introduces ~1% error
+        assert!(
+            (a - b).abs() < 0.02,
+            "Mismatch: original={}, dequantized={}",
+            a,
+            b
+        );
+    }
+}
+
+#[test]
+fn test_vec_dot_q8_0_matches_dequantize() {
+    // Test that vec_dot gives the same result as dequantize-then-dot
+    let weight_data: [f32; 32] = std::array::from_fn(|i| (i as f32 - 16.0) * 0.05);
+    let activation_data: [f32; 32] = std::array::from_fn(|i| ((i as f32) * 0.1).sin());
+
+    // Create weight block by quantizing the weight data
+    let weight_block = BlockQ8_0::quantize(&weight_data);
+    let activation_block = BlockQ8_0::quantize(&activation_data);
+
+    // Compute vec_dot
+    let vec_dot_result = weight_block.vec_dot(&activation_block);
+
+    // Compute dequantize-then-dot
+    let weight_dequant = weight_block.dequantize();
+    let act_dequant = activation_block.dequantize();
+    let dequant_dot: f32 = weight_dequant
+        .iter()
+        .zip(&act_dequant)
+        .map(|(w, a)| w * a)
+        .sum();
+
+    // Results should be very close (within quantization error)
+    assert!(
+        (vec_dot_result - dequant_dot).abs() < 0.5,
+        "vec_dot={}, dequant_dot={}, diff={}",
+        vec_dot_result,
+        dequant_dot,
+        (vec_dot_result - dequant_dot).abs()
+    );
+}
+
+#[test]
+fn test_vec_dot_q4_0_matches_dequantize() {
+    // Create a Q4_0 block with known values
+    let mut raw_bytes = Vec::new();
+    let scale_f16 = half::f16::from_f32(0.1);
+    raw_bytes.extend_from_slice(&scale_f16.to_le_bytes());
+    // Pack 32 4-bit values: indices 0-15 in low nibble, 16-31 in high nibble
+    for i in 0..16 {
+        let low_val = (i % 16) as u8; // indices 0-15
+        let high_val = ((i + 8) % 16) as u8; // indices 16-31
+        let packed = low_val | (high_val << 4);
+        raw_bytes.push(packed);
+    }
+    let weight_block: BlockQ4_0 = *bytemuck::from_bytes(&raw_bytes);
+
+    // Create activation block
+    let activation_data: [f32; 32] = std::array::from_fn(|i| ((i as f32) * 0.2).cos());
+    let activation_block = BlockQ8_0::quantize(&activation_data);
+
+    // Compute vec_dot
+    let vec_dot_result = weight_block.vec_dot(&activation_block);
+
+    // Compute dequantize-then-dot
+    let weight_dequant = weight_block.dequantize();
+    let act_dequant = activation_block.dequantize();
+    let dequant_dot: f32 = weight_dequant
+        .iter()
+        .zip(&act_dequant)
+        .map(|(w, a)| w * a)
+        .sum();
+
+    // Results should be close (within quantization error)
+    assert!(
+        (vec_dot_result - dequant_dot).abs() < 1.0,
+        "vec_dot={}, dequant_dot={}, diff={}",
+        vec_dot_result,
+        dequant_dot,
+        (vec_dot_result - dequant_dot).abs()
+    );
 }

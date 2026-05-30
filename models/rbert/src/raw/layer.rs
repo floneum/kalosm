@@ -1,5 +1,5 @@
-use fusor_core::{Device, VarBuilder};
-use fusor_core::{Result, Tensor};
+use fusor::{Device, VarBuilder};
+use fusor::{Result, Tensor};
 
 use super::{BertAttention, BertIntermediate, BertOutput};
 

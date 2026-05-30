@@ -1,18 +1,13 @@
-use std::{fmt::Debug, ops::Range, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
 
-use crate::{
-    DataType, Layout, MaxRank, Tensor, TensorData, compute_graph::AnyComputeKey,
-    mir::operation::Operation, slice_shape, slice_strides,
-};
+use crate::{Layout, Tensor, TensorData, compute_graph::NodeIndex, mir::operation::Operation};
 
-type MapSize = Arc<dyn Fn(&[usize]) -> Box<[usize]> + Send + Sync>;
-type MapStride = Arc<dyn Fn(usize, &[usize]) -> (usize, Box<[usize]>) + Send + Sync>;
+type MapLayout = Arc<dyn Fn(&Layout) -> Layout + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct MapLayoutOperation {
-    pub(crate) input: AnyComputeKey,
-    pub(crate) map_size: MapSize,
-    pub(crate) map_stride: MapStride,
+    pub(crate) input: NodeIndex,
+    pub(crate) map_layout_fn: MapLayout,
 }
 
 impl Debug for MapLayoutOperation {
@@ -25,14 +20,12 @@ impl Debug for MapLayoutOperation {
 
 impl MapLayoutOperation {
     pub fn new(
-        input: AnyComputeKey,
-        map_size: impl Fn(&[usize]) -> Box<[usize]> + Send + Sync + 'static,
-        map_stride: impl Fn(usize, &[usize]) -> (usize, Box<[usize]>) + Send + Sync + 'static,
+        input: NodeIndex,
+        map_layout_fn: impl Fn(&Layout) -> Layout + Send + Sync + 'static,
     ) -> Self {
         Self {
             input,
-            map_size: Arc::new(map_size),
-            map_stride: Arc::new(map_stride),
+            map_layout_fn: Arc::new(map_layout_fn),
         }
     }
 
@@ -46,8 +39,7 @@ impl MapLayoutOperation {
     }
 
     pub fn map_layout(&self, layout: &Layout) -> Layout {
-        let (offset, strides) = (self.map_stride)(layout.offset(), layout.strides());
-        Layout::from_parts(offset, (self.map_size)(layout.shape()), strides)
+        (self.map_layout_fn)(layout)
     }
 
     pub fn run(&self, graph: &mut crate::compute_graph::ComputeGraphInner) -> TensorData {
@@ -72,7 +64,7 @@ impl Operation for MapLayoutOperation {
         [1, 1, 1]
     }
 
-    fn visit_dependencies(&self, f: &mut dyn FnMut(AnyComputeKey)) {
+    fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
         f(self.input);
     }
 
@@ -92,13 +84,13 @@ impl Operation for MapLayoutOperation {
         self.map_tensor(input).into()
     }
 
-    fn build_kernel(
+    fn build_direct_kernel(
         &self,
         _: &crate::compute_graph::ComputeGraphInner,
         _: &crate::mir::workgroup_shape::WorkgroupShape,
         _: &[crate::mir::inputs::MirValue],
-        _: &mut crate::mir::kernel::GenericKernel,
-    ) {
+    ) -> Option<crate::mir::kernel_backend::DirectKernel> {
+        None
     }
 
     fn name(&self) -> String {
@@ -106,294 +98,93 @@ impl Operation for MapLayoutOperation {
     }
 }
 
-impl<const R: usize, T: DataType> Tensor<R, T> {
-    pub fn slice(&self, slices: [Range<usize>; R]) -> Tensor<R, T> {
-        self.add_map_layout(MapLayoutOperation::new(
-            self.key(),
-            {
-                let slices = slices.clone();
-                move |shape| slice_shape(&slices, shape)
-            },
-            move |offset, strides| slice_strides(&slices, offset, strides),
-        ))
+impl Tensor {
+    pub fn restride(&self, specs: impl Into<Box<[crate::StrideSpec]>>) -> Tensor {
+        let specs = specs.into();
+        self.add_map_layout(MapLayoutOperation::new(self.key(), move |layout| {
+            layout.restride(&specs)
+        }))
     }
 
-    pub fn permute(&self, axes: [usize; R]) -> Tensor<R, T> {
-        for &axis in &axes {
-            assert!(axis < self.rank());
-        }
-        for i in 0..R {
-            for j in (i + 1)..R {
-                assert!(axes[i] != axes[j], "Axes must be unique");
-            }
-        }
-        self.add_map_layout(MapLayoutOperation::new(
-            self.key(),
-            move |shape| (0..R).map(|i| shape[axes[i]]).collect::<Box<[usize]>>(),
-            move |offset, strides| {
-                let new_strides = (0..R).map(|i| strides[axes[i]]).collect::<Box<[usize]>>();
-                (offset, new_strides)
-            },
-        ))
-    }
-
-    pub fn transpose(&self, first_axis: usize, second_axis: usize) -> Tensor<R, T> {
-        assert!(first_axis < self.rank());
-        assert!(second_axis < self.rank());
-        self.add_map_layout(MapLayoutOperation::new(
-            self.key(),
-            move |shape| {
-                let mut shape: Box<[usize]> = shape.into();
-                shape.swap(first_axis, second_axis);
-                shape
-            },
-            move |offset, strides| {
-                let mut strides: Box<[usize]> = strides.into();
-                strides.swap(first_axis, second_axis);
-                (offset, strides)
-            },
-        ))
-    }
-
-    pub fn t(&self) -> Tensor<R, T> {
-        const {
+    /// Replace the tensor's layout with `new_layout`, treating the underlying
+    /// buffer as a flat blob. The user-supplied offset and strides are absolute
+    /// (in buffer elements), so the input must itself be a contiguous view with
+    /// offset 0 — otherwise the user's strides would compose nonsensically with
+    /// the input's own strides and silently read the wrong elements.
+    ///
+    /// Callers that need to re-layout a non-contiguous view should materialize
+    /// it first (e.g. with `to_concrete()`), or use [`restride`] which composes
+    /// stride specs relative to the input's current strides.
+    pub fn restride_layout(&self, new_layout: Layout) -> Tensor {
+        self.add_map_layout(MapLayoutOperation::new(self.key(), move |input_layout| {
             assert!(
-                R >= 2,
-                "The tensor must have at least 2 dimensions to transpose"
-            )
-        };
-        let last_dim = self.rank() - 1;
-        let second_last_dim = self.rank() - 2;
-        self.transpose(last_dim, second_last_dim)
+                input_layout.is_contiguous() && input_layout.offset() == 0,
+                "restride_layout requires a contiguous, offset-0 input — got \
+                 offset={} strides={:?} shape={:?}. Call `.to_concrete()` first, \
+                 or use `restride` for stride composition.",
+                input_layout.offset(),
+                input_layout.strides(),
+                input_layout.shape()
+            );
+            new_layout.clone()
+        }))
     }
 
-    pub fn broadcast_as<const R2: usize>(&self, out_shape: [usize; R2]) -> Tensor<R2, T> {
-        const {
-            assert!(
-                R2 >= R,
-                "The output dimension must be more than the input dimension"
-            )
-        };
-
-        let current_shape = *self.shape();
-
-        self.add_map_layout(MapLayoutOperation::new(
-            self.key(),
-            move |_| out_shape.into(),
-            move |offset, strides| {
-                let mut new_strides = [0; R2];
-                let mut current_shape_iter = current_shape.into_iter().rev().peekable();
-                let mut strides_iter = strides.iter().rev();
-
-                for (new_strides_fill, new_shape) in out_shape.into_iter().enumerate().rev() {
-                    let stride = if let Some(current_dim) = current_shape_iter.next_if(|&current_dim|current_dim == new_shape || (current_dim == 1 && new_shape > 1 )) {
-                        let stride = *strides_iter.next().unwrap();
-                        // Matching dim, use the same stride
-                        if current_dim == new_shape {
-                            stride
-                        }
-                        // Broadcasted dim, set stride to 0
-                        else {
-                            0
-                        }
+    pub(crate) fn broadcast_as(&self, out_shape: impl AsRef<[usize]>) -> Tensor {
+        let out_shape = out_shape.as_ref();
+        let shape = self.shape();
+        assert!(
+            out_shape.len() >= shape.len(),
+            "The output rank must be at least the input rank"
+        );
+        let specs: Vec<crate::StrideSpec> = (0..out_shape.len())
+            .map(|out_i| {
+                let in_i = out_i as isize - (out_shape.len() as isize - shape.len() as isize);
+                if in_i < 0 {
+                    crate::StrideSpec::dim_with(0, out_shape[out_i], 0)
+                } else {
+                    let in_i = in_i as usize;
+                    if shape[in_i] == 1 && out_shape[out_i] > 1 {
+                        crate::StrideSpec::dim_with(in_i, out_shape[out_i], 0)
                     } else {
-                        // New dimension
-                        0
-                    };
-                    new_strides[new_strides_fill] = stride;
+                        crate::StrideSpec::dim(in_i, out_shape[out_i])
+                    }
                 }
-                assert_eq!(current_shape_iter.len(), 0, "failed to broadcast tensor: input shape {current_shape:?} is not compatible with output shape {out_shape:?}");
-                (offset, new_strides.into())
-            },
-        ))
+            })
+            .collect();
+        self.restride(specs)
     }
 
-    pub(crate) fn broadcast_together<const R2: usize, const R3: usize>(
-        first: &Tensor<R, T>,
-        second: &Tensor<R2, T>,
-    ) -> (Tensor<R3, T>, Tensor<R3, T>)
-    where
-        (Tensor<R, T>, Tensor<R2, T>): MaxRank<R3, T>,
-    {
-        const {
-            assert!(
-                R3 == if R > R2 { R } else { R2 },
-                "The output dimension must be the maximum of the two input dimensions"
-            )
-        };
-
-        let shape = if first.rank() > second.rank() {
-            std::array::from_fn(|i| first.shape()[i])
-        } else if first.rank() < second.rank() {
-            std::array::from_fn(|i| second.shape()[i])
-        } else {
-            std::array::from_fn(|i| first.shape()[i].max(second.shape()[i]))
-        };
-        (first.broadcast_as(shape), second.broadcast_as(shape))
+    pub(crate) fn broadcast_together(first: &Tensor, second: &Tensor) -> (Tensor, Tensor) {
+        assert_eq!(first.datatype(), second.datatype());
+        let first_shape = first.shape();
+        let second_shape = second.shape();
+        let rank = first_shape.len().max(second_shape.len());
+        let shape: Vec<usize> = (0..rank)
+            .map(|i| {
+                let a = i + first_shape.len();
+                let b = i + second_shape.len();
+                let a = if a >= rank { first_shape[a - rank] } else { 1 };
+                let b = if b >= rank { second_shape[b - rank] } else { 1 };
+                assert!(
+                    a == b || a == 1 || b == 1,
+                    "Cannot broadcast shapes {:?} and {:?}",
+                    first_shape,
+                    second_shape
+                );
+                a.max(b)
+            })
+            .collect();
+        (first.broadcast_as(&shape), second.broadcast_as(&shape))
     }
 
-    pub(crate) fn broadcast_then_elementwise_op<const R2: usize, const R3: usize>(
-        first: &Tensor<R, T>,
-        second: &Tensor<R2, T>,
-        op: impl Fn(Tensor<R3, T>, Tensor<R3, T>) -> Tensor<R3, T>,
-    ) -> Tensor<R3, T>
-    where
-        (Tensor<R, T>, Tensor<R2, T>): MaxRank<R3, T>,
-    {
-        let (b1, b2) = Self::broadcast_together(first, second);
+    pub(crate) fn broadcast_then_elementwise_op(
+        first: &Tensor,
+        second: &Tensor,
+        op: impl Fn(Tensor, Tensor) -> Tensor,
+    ) -> Tensor {
+        let (b1, b2) = Tensor::broadcast_together(first, second);
         assert_eq!(b1.shape(), b2.shape());
         op(b1, b2)
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_transpose() {
-    use crate::Device;
-
-    let device = Device::new().await.unwrap();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-    let transposed = tensor.transpose(0, 1);
-    let as_slice = transposed.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-    assert_eq!(as_slice[[0, 0]], 1.);
-    assert_eq!(as_slice[[0, 1]], 3.);
-    assert_eq!(as_slice[[0, 2]], 5.);
-    assert_eq!(as_slice[[1, 0]], 2.);
-    assert_eq!(as_slice[[1, 1]], 4.);
-    assert_eq!(as_slice[[1, 2]], 6.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_broadcast_as() {
-    use crate::Device;
-
-    let device = Device::new().await.unwrap();
-
-    let data = [[1., 2.], [3., 4.]];
-    let tensor = Tensor::new(&device, &data);
-    let broadcasted = tensor.broadcast_as([2, 2, 3]);
-    println!("{broadcasted:?}");
-    let as_slice = broadcasted.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-    for i in 0..2 {
-        assert_eq!(as_slice[[0, 0, i]], 1.);
-        assert_eq!(as_slice[[0, 1, i]], 2.);
-        assert_eq!(as_slice[[1, 0, i]], 3.);
-        assert_eq!(as_slice[[1, 1, i]], 4.);
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_broadcast_as_non_continuous() {
-    use crate::Device;
-
-    let device = Device::new().await.unwrap();
-
-    let data = [[1., 2., -1.], [3., 4., -1.]];
-    let tensor = Tensor::new(&device, &data);
-    println!("tensor: {tensor:?}");
-    let sliced = tensor.slice([0..2, 0..2]);
-    println!("sliced: {sliced:?}");
-    let broadcasted = sliced.broadcast_as([2, 2, 3]);
-    println!("{broadcasted:?}");
-    let as_slice = broadcasted.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-    for i in 0..2 {
-        assert_eq!(as_slice[[0, 0, i]], 1.);
-        assert_eq!(as_slice[[0, 1, i]], 2.);
-        assert_eq!(as_slice[[1, 0, i]], 3.);
-        assert_eq!(as_slice[[1, 1, i]], 4.);
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_broadcast_together_first_larger() {
-    use crate::Device;
-
-    let device = Device::new().await.unwrap();
-
-    let data1 = [[1., 2.], [3., 4.]];
-    let tensor1 = Tensor::new(&device, &data1);
-    let data2 = [10., 20.];
-    let tensor2 = Tensor::new(&device, &data2);
-    let (b1, b2) = Tensor::broadcast_together(&tensor1, &tensor2);
-    println!("{b1:?}");
-    println!("{b2:?}");
-    let as_slice1 = b1.as_slice().await.unwrap();
-    let as_slice2 = b2.as_slice().await.unwrap();
-    println!("{as_slice1:?}");
-    println!("{as_slice2:?}");
-    assert_eq!(as_slice1[[0, 0]], 1.);
-    assert_eq!(as_slice1[[0, 1]], 2.);
-    assert_eq!(as_slice1[[1, 0]], 3.);
-    assert_eq!(as_slice1[[1, 1]], 4.);
-
-    assert_eq!(as_slice2[[0, 0]], 10.);
-    assert_eq!(as_slice2[[0, 1]], 20.);
-    assert_eq!(as_slice2[[1, 0]], 10.);
-    assert_eq!(as_slice2[[1, 1]], 20.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_broadcast_together_second_larger() {
-    use crate::Device;
-
-    let device = Device::new().await.unwrap();
-
-    let data1 = [[1., 2.], [3., 4.]];
-    let tensor1 = Tensor::new(&device, &data1);
-    let data2 = [10., 20.];
-    let tensor2 = Tensor::new(&device, &data2);
-    let (b2, b1) = Tensor::broadcast_together(&tensor2, &tensor1);
-    println!("{b1:?}");
-    println!("{b2:?}");
-    let as_slice1 = b1.as_slice().await.unwrap();
-    let as_slice2 = b2.as_slice().await.unwrap();
-    println!("{as_slice1:?}");
-    println!("{as_slice2:?}");
-    assert_eq!(as_slice1[[0, 0]], 1.);
-    assert_eq!(as_slice1[[0, 1]], 2.);
-    assert_eq!(as_slice1[[1, 0]], 3.);
-    assert_eq!(as_slice1[[1, 1]], 4.);
-
-    assert_eq!(as_slice2[[0, 0]], 10.);
-    assert_eq!(as_slice2[[0, 1]], 20.);
-    assert_eq!(as_slice2[[1, 0]], 10.);
-    assert_eq!(as_slice2[[1, 1]], 20.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_broadcast_together_same_size() {
-    use crate::Device;
-
-    let device = Device::new().await.unwrap();
-
-    let data1 = [[1.], [2.]];
-    let tensor1 = Tensor::new(&device, &data1);
-    let data2 = [[10., 20.]];
-    let tensor2 = Tensor::new(&device, &data2);
-    let (b2, b1) = Tensor::broadcast_together(&tensor2, &tensor1);
-    println!("{b1:?}");
-    println!("{b2:?}");
-    let as_slice1 = b1.as_slice().await.unwrap();
-    let as_slice2 = b2.as_slice().await.unwrap();
-    println!("{as_slice1:?}");
-    println!("{as_slice2:?}");
-    assert_eq!(as_slice1[[0, 0]], 1.);
-    assert_eq!(as_slice1[[0, 1]], 1.);
-    assert_eq!(as_slice1[[1, 0]], 2.);
-    assert_eq!(as_slice1[[1, 1]], 2.);
-
-    assert_eq!(as_slice2[[0, 0]], 10.);
-    assert_eq!(as_slice2[[0, 1]], 20.);
-    assert_eq!(as_slice2[[1, 0]], 10.);
-    assert_eq!(as_slice2[[1, 1]], 20.);
 }

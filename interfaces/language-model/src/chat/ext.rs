@@ -1,6 +1,8 @@
 use std::error::Error;
 
+#[cfg(not(target_arch = "wasm32"))]
 use super::BoxedChatModel;
+#[cfg(not(target_arch = "wasm32"))]
 use super::BoxedStructuredChatModel;
 use super::Chat;
 use super::ChatModel;
@@ -89,6 +91,7 @@ pub trait ChatModelExt: CreateChatSession {
     /// }
     /// # }
     /// ```
+    #[cfg(not(target_arch = "wasm32"))]
     fn boxed_chat_model(self) -> BoxedChatModel
     where
         Self: ChatModel<
@@ -173,6 +176,7 @@ pub trait ChatModelExt: CreateChatSession {
     /// }
     /// # }
     /// ```
+    #[cfg(not(target_arch = "wasm32"))]
     fn boxed_typed_chat_model<T>(self) -> BoxedStructuredChatModel<T>
     where
         Self: StructuredChatModel<

@@ -29,18 +29,17 @@ const EXAMPLES: &[(&str, &str)]= &[
     ("Docker containers provide a lightweight and portable way to package and deploy applications, along with their dependencies. This approach streamlines the deployment process and ensures consistency across different environments.", "What is the purpose of Docker containers in application deployment?"),
 ];
 
-#[tokio::main]
-async fn main() {
-    let llm = Llama::builder()
-        .with_source(LlamaSource::qwen_2_5_0_5b_instruct())
-        .build()
-        .await
-        .unwrap();
-    const QUESTION_STARTERS: [&str; 9] = [
-        "Who", "What", "When", "Where", "Why", "How", "Which", "Whom", "Whose",
-    ];
-    let constraints =
-        IndexParser::new(
+fn main() {
+    pollster::block_on(async {
+        let llm = Llama::builder()
+            .with_source(LlamaSource::qwen_2_5_0_5b_instruct())
+            .build()
+            .await
+            .unwrap();
+        const QUESTION_STARTERS: [&str; 9] = [
+            "Who", "What", "When", "Where", "Why", "How", "Which", "Whom", "Whose",
+        ];
+        let constraints = IndexParser::new(
             QUESTION_STARTERS
                 .iter()
                 .copied()
@@ -51,16 +50,17 @@ async fn main() {
             |c| matches!(c, ' ' | '?' | 'a'..='z' | 'A'..='Z' | '0'..='9' | ','),
         ))
         .repeat(1..=5);
-    let task = llm.task("You generate hypothetical questions that may be answered by the given text. The questions restate any information necessary to understand the question")
-        .with_constraints(constraints);
-    let mut annealing = kalosm::PromptAnnealer::builder(EXAMPLES, task)
-        .with_initial_temperature(0.6)
-        .with_initial_choice_range(1..4)
-        .build()
-        .await
-        .unwrap();
+        let task = llm.task("You generate hypothetical questions that may be answered by the given text. The questions restate any information necessary to understand the question")
+            .with_constraints(constraints);
+        let mut annealing = kalosm::PromptAnnealer::builder(EXAMPLES, task)
+            .with_initial_temperature(0.6)
+            .with_initial_choice_range(1..4)
+            .build()
+            .await
+            .unwrap();
 
-    let result = annealing.run().await;
+        let result = annealing.run().await;
 
-    println!("Result: {result:?}");
+        println!("Result: {result:?}");
+    });
 }

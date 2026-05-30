@@ -15,11 +15,13 @@ on:
       - floneum/*/examples/**
       - floneum/*/Cargo.toml
       - fusor-ml/*/src/**
+      - fusor-ml/*/tests/**
       - fusor-ml/*/examples/**
       - fusor-ml/*/Cargo.toml
       - src/**
       - .github/**
       - Cargo.toml
+      - Cargo.lock
 
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -36,80 +38,154 @@ on:
       - floneum/*/examples/**
       - floneum/*/Cargo.toml
       - fusor-ml/*/src/**
+      - fusor-ml/*/tests/**
       - fusor-ml/*/examples/**
       - fusor-ml/*/Cargo.toml
       - src/**
       - .github/**
       - Cargo.toml
+      - Cargo.lock
 
-# workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+
+# `CARGO_INCREMENTAL=0` keeps the cache lean — `Swatinem/rust-cache` wipes
+# incremental artifacts before saving, so building them just to throw them
+# away wastes wall time. Backtraces on test failures help diagnose CI-only
+# flakes without re-runs.
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Bump when the apt dependency list below changes so the next run
+  # rebuilds the apt archive instead of restoring a stale one.
+  APT_CACHE_VERSION: "v2"
 
 jobs:
   check:
     if: github.event.pull_request.draft == false
     name: Check
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
+      # Checkout MUST come before `Swatinem/rust-cache` so the cache key
+      # hashes the real `Cargo.lock`. Without it every job gets the same
+      # toolchain-only key and clobbers the previous job's cache.
+      - uses: actions/checkout@v6
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
+          version: ${{ env.APT_CACHE_VERSION }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update
-      - run: sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
-      - uses: actions/checkout@v4
+        with:
+          # `shared-key` makes every Linux job in this PR share one cache
+          # slot, so once `check` warms the deps `test` / `clippy` /
+          # `docs` all hit it. `cache-all-crates` includes registry
+          # sources (~hundreds of MB) but means dep-only churn doesn't
+          # blow the entire cache.
+          shared-key: "linux-stable"
+          cache-all-crates: "true"
+          # Only push cache from main, so PR-only caches don't churn the
+          # 10GB-per-repo Actions cache budget.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check workspace
         run: cargo check --all --examples --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape
 
   test:
     if: github.event.pull_request.draft == false
     name: Test Suite
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v6
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev mesa-vulkan-drivers vulkan-tools
+          version: ${{ env.APT_CACHE_VERSION }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update
-      - run: sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
-      - uses: actions/checkout@v4
+        with:
+          shared-key: "linux-stable"
+          cache-all-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Configure lavapipe
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          icd_dir=/usr/share/vulkan/icd.d
+          if [[ ! -d "$icd_dir" ]]; then
+            echo "Vulkan ICD directory was not installed: $icd_dir" >&2
+            exit 1
+          fi
+
+          lvp_icd="$(find "$icd_dir" -maxdepth 1 -name 'lvp_icd*.json' -print -quit)"
+          if [[ -z "$lvp_icd" ]]; then
+            echo "Lavapipe ICD not found in $icd_dir" >&2
+            ls -la "$icd_dir" >&2
+            exit 1
+          fi
+
+          echo "Using lavapipe ICD: $lvp_icd"
+          echo "VK_DRIVER_FILES=$lvp_icd" >> "$GITHUB_ENV"
+          echo "WGPU_BACKEND=vulkan" >> "$GITHUB_ENV"
+          echo "MESA_SHADER_CACHE_DISABLE=1" >> "$GITHUB_ENV"
+          echo "LIBGL_ALWAYS_SOFTWARE=1" >> "$GITHUB_ENV"
+
+          VK_DRIVER_FILES="$lvp_icd" WGPU_BACKEND=vulkan MESA_SHADER_CACHE_DISABLE=1 LIBGL_ALWAYS_SOFTWARE=1 vulkaninfo --summary
       - name: Run tests
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: cargo test --lib --bins --tests --examples --workspace --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape --exclude fusor-core --exclude kalosm-learning --exclude rbert
+          FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
+        run: cargo test --lib --bins --tests --examples --workspace --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape --exclude fusor-core --exclude rbert --exclude rwhisper --exclude kalosm-learning
 
   doc:
     if: github.event.pull_request.draft == false
     name: Docs
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v6
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
+          version: ${{ env.APT_CACHE_VERSION }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update
-      - run: sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
-      - uses: actions/checkout@v4
-      - run: cargo test --doc --workspace --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape
+        with:
+          shared-key: "linux-stable"
+          cache-all-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --doc --workspace --features kalosm/language,kalosm/llama,kalosm/bert,kalosm/structured,kalosm/fs-documents,kalosm/sound,kalosm/sound-denoise,kalosm/sound-source,kalosm/sound-voice-detection,kalosm/vision,kalosm/remote,kalosm/scrape,kalosm/surrealdb-local
 
   fmt:
     if: github.event.pull_request.draft == false
     name: Rustfmt
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: rustup component add rustfmt
-      - uses: actions/checkout@v4
+        with:
+          components: rustfmt
       - run: cargo fmt --all -- --check
 
   clippy:
     if: github.event.pull_request.draft == false
     name: Clippy
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v6
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
+          version: ${{ env.APT_CACHE_VERSION }}
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update
-      - run: sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
-      - run: rustup component add clippy
-      - uses: actions/checkout@v4
+        with:
+          shared-key: "linux-stable"
+          cache-all-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --examples --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape -- -D warnings

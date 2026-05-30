@@ -1,6 +1,7 @@
 use std::{future::Future, hash::BuildHasher, num::NonZeroUsize, sync::Mutex};
 
-use crate::{Embedder, Embedding, EmbeddingInput, WasmNotSend};
+use crate::{Embedder, Embedding, EmbeddingInput};
+use kalosm_model_types::WasmNotSend;
 
 /// Embedding models can be expensive to run. This struct wraps an embedding model with a cache that stores embeddings that have been computed before.
 ///

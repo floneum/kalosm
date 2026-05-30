@@ -6,7 +6,7 @@ use std::sync::Arc;
 pub(crate) type BoxedFuture<'a, T> = Pin<Box<dyn FutureWasmNotSend<Output = T> + 'a>>;
 
 use crate::embedding::Embedding;
-use crate::{FutureWasmNotSend, WasmNotSend, WasmNotSendSync};
+use kalosm_model_types::{FutureWasmNotSend, WasmNotSend, WasmNotSendSync};
 
 /// A model that can be used to embed text. This trait is generic over the vector space that the model uses to help keep track of what embeddings came from which model.
 ///

@@ -1,11 +1,11 @@
 use rwhisper::ChunkedTranscriptionTask;
 
-use super::voice_audio_detector::*;
+use super::denoise::*;
 use super::voice_audio_detector_ext::*;
 use crate::AsyncSource;
 
 /// An extension trait for [`AsyncSource`] that integrates with [`crate::Whisper`].
-pub trait AsyncSourceTranscribeExt: AsyncSource + Unpin + Send + Sized + 'static {
+pub trait AsyncSourceTranscribeExt: AsyncSource + Unpin + Sized + 'static {
     /// Chunk the audio stream into segments based on voice activity and then transcribe those segments.  The model will transcribe segments of speech that are separated by silence.
     ///
     /// ```rust, no_run
@@ -35,13 +35,14 @@ pub trait AsyncSourceTranscribeExt: AsyncSource + Unpin + Send + Sized + 'static
     fn transcribe(
         self,
         model: rwhisper::Whisper,
-    ) -> ChunkedTranscriptionTask<VoiceActivityRechunkerStream<VoiceActivityDetectorStream<Self>>>
-    {
+    ) -> ChunkedTranscriptionTask<VoiceActivityRechunkerStream<DenoisedStream<Self>>> {
         rwhisper::TranscribeChunkedAudioStreamExt::transcribe(
-            self.voice_activity_stream().rechunk_voice_activity(),
+            self.denoise_and_detect_voice_activity()
+                .rechunk_voice_activity()
+                .with_end_threshold(0.01),
             model,
         )
     }
 }
 
-impl<S: AsyncSource + Unpin + Send + Sized + 'static> AsyncSourceTranscribeExt for S {}
+impl<S: AsyncSource + Unpin + Sized + 'static> AsyncSourceTranscribeExt for S {}

@@ -9,72 +9,60 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["llm", "llama", "mistral", "agents", "nlp"]
 
 [dependencies]
-candle-core.workspace = true
-candle-nn.workspace = true
-candle-transformers.workspace = true
-tokenizers = { workspace = true, features = ["onig"] }
+fusor = { workspace = true, default-features = false }
+fusor-gguf = { workspace = true }
+kalosm-tokenizer.workspace = true
 
-ahash = "0.8.12"
-accelerate-src = { version = "0.3.2", optional = true }
-intel-mkl-src = { version = "0.8.1", features = [
-    "mkl-static-lp64-iomp",
-], optional = true }
-cudarc = { version = "0.9.14", features = ["f16"], optional = true }
 half = { version = "2.3.1" }
 
 tracing = "0.1.37"
 rand.workspace = true
-tokio = { version = "1.32.0", features = ["rt"] }
-rayon = { version = "1.8.0" }
-llm-samplers.workspace = true
-kalosm-sample.workspace = true
-kalosm-language-model = { workspace = true, features = ["sample"] }
+rayon = { version = "1.8.0", optional = true }
+kalosm-sample = { workspace = true, optional = true }
+kalosm-language-model = { workspace = true, features = ["serde"] }
 kalosm-model-types.workspace = true
-kalosm-common = { workspace = true, features = ["candle", "tokio"] }
+kalosm-common = { workspace = true }
 thiserror.workspace = true
-safetensors = "0.4.5"
-minijinja = { version = "2.5.0", features = ["json", "loader"] }
+minijinja = { version = "2.5.0", features = ["loader"] }
 minijinja-contrib = { version = "2.5.0", features = ["pycompat"] }
-chrono = "0.4.41"
+chrono = { version = "0.4.41", default-features = false, features = ["now", "std"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1.0.139"
-image.workspace = true
+serde_json = { version = "1.0.139", optional = true }
+futures-util = { workspace = true }
+futures-channel = { workspace = true }
+pollster = { version = "0.4", optional = true }
+regex = "1"
+tokenizers = { workspace = true, features = ["fancy-regex"], optional = true }
+
+image = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"], optional = true }
 
 [dev-dependencies]
+ahash = "0.8.12"
+pollster = "0.4"
 tracing-subscriber = "0.3.18"
 pretty_assertions = "1.4.1"
-kalosm = { workspace = true, features = ["language"], default-features = true }
+kalosm = { workspace = true, features = [
+    "language",
+    "structured",
+], default-features = true }
 anyhow.workspace = true
 kalosm-streams.workspace = true
-reqwest = "0.12.15"
+reqwest = { version = "0.12" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
-default = []
-accelerate = [
-    "dep:accelerate-src",
-    "candle-core/accelerate",
-    "candle-nn/accelerate",
-    "candle-transformers/accelerate",
-]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-cudnn = ["candle-core/cudnn"]
-mkl = [
-    "dep:intel-mkl-src",
-    "candle-core/mkl",
-    "candle-nn/mkl",
-    "candle-transformers/mkl",
-]
-nccl = [
-    "cuda",
-    "cudarc/nccl",
-    "half/num-traits",
-    "half/use-intrinsics",
-    "half/rand_distr",
-]
-metal = [
-    "candle-core/metal",
-    "candle-nn/metal",
-    "candle-transformers/metal",
-    "kalosm-common/metal",
-]
-extra_assertions = []
+default = ["gpu"]
+cpu = ["fusor/cpu"]
+gpu = ["fusor/gpu"]
+chat-template-json = ["minijinja/json"]
+hf-config-json = ["dep:serde_json"]
+vision = ["dep:image", "dep:pollster", "kalosm-language-model/media"]
+structured = ["dep:kalosm-sample", "kalosm-language-model/structured", "dep:rayon"]
+hf-tokenizer-json = ["dep:tokenizers", "dep:getrandom"]
+
+[[example]]
+name = "structured"
+required-features = ["structured"]

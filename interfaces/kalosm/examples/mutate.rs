@@ -1,26 +1,27 @@
 use kalosm::{language::*, BertDistance, TestCases};
 use kalosm_language::search::Hypothetical;
 
-#[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt::init();
+fn main() {
+    pollster::block_on(async {
+        tracing_subscriber::fmt::init();
 
-    let llm = Llama::new_chat().await.unwrap();
+        let llm = Llama::new_chat().await.unwrap();
 
-    let mutator = Mutator::builder(llm.clone()).build().unwrap();
+        let mutator = Mutator::builder(llm.clone()).build().unwrap();
 
-    let mut text = "You generate isolated hypothetical questions with any necessary information that may be answered by the given text".to_string();
-    let mut max_score = eval_with_prompt(llm.clone(), &text).await.unwrap();
-    loop {
-        let new_text = mutator.mutate(&text).await.unwrap();
-        let new_score = eval_with_prompt(llm.clone(), &new_text).await.unwrap();
-        if new_score > max_score {
-            println!("new prompt was better: {new_text}");
-            println!("new max score: {new_score}");
-            max_score = new_score;
-            text = new_text;
+        let mut text = "You generate isolated hypothetical questions with any necessary information that may be answered by the given text".to_string();
+        let mut max_score = eval_with_prompt(llm.clone(), &text).await.unwrap();
+        loop {
+            let new_text = mutator.mutate(&text).await.unwrap();
+            let new_score = eval_with_prompt(llm.clone(), &new_text).await.unwrap();
+            if new_score > max_score {
+                println!("new prompt was better: {new_text}");
+                println!("new max score: {new_score}");
+                max_score = new_score;
+                text = new_text;
+            }
         }
-    }
+    });
 }
 
 const TASK_DESCRIPTION: &str =
@@ -164,7 +165,7 @@ async fn eval_with_prompt(llm: Llama, prompt: &str) -> anyhow::Result<f64> {
     println!("evaluating prompt: {prompt}");
 
     let hypothetical = Hypothetical::builder(llm)
-        .with_task_description(prompt.into())
+        .with_task_description(prompt)
         .build();
 
     let mut llama_test_cases = TestCases::new();

@@ -8,8 +8,8 @@ use super::EmbeddedIndexedTableError;
 
 use super::IntoEmbeddingIndexedTableSearchFilter;
 use super::{EmbeddingIndexedTable, EmbeddingIndexedTableSearchResult};
-use kalosm_language::prelude::*;
-use kalosm_language::rbert::BertLoadingError;
+use crate::language::*;
+use rbert::BertLoadingError;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use surrealdb::Connection;
@@ -110,6 +110,11 @@ impl<C: Connection, R, M: Embedder, K: Chunker> DocumentTable<C, R, M, K> {
     /// Get the raw embedding model.
     pub fn embedding_model(&self) -> &M {
         &self.embedding_model
+    }
+
+    /// Get the raw chunker.
+    pub fn chunker(&self) -> &K {
+        &self.chunker
     }
 
     /// Delete the table from the database and clear the vector database. Returns the contents of the table.

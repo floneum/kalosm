@@ -1,7 +1,7 @@
 use crate::GenerationParameters;
 use crate::ModelConstraints;
 use futures_util::Future;
-use serde::{Deserialize, Serialize};
+use kalosm_model_types::{WasmNotSend, WasmNotSendSync};
 use std::fmt::Arguments;
 use std::fmt::Display;
 
@@ -11,7 +11,9 @@ mod task;
 pub use task::*;
 mod chat_builder;
 pub use chat_builder::*;
+#[cfg(not(target_arch = "wasm32"))]
 mod boxed;
+#[cfg(not(target_arch = "wasm32"))]
 pub use boxed::*;
 mod content;
 pub use content::*;
@@ -72,10 +74,10 @@ pub trait CreateChatSession {
 ///     // Create a new model which implements the CreateChatSession trait
 ///     let llm = Llama::new_chat().await.unwrap();
 ///     // Create a new chat session for the model
-///     let mut chat_session = llm.new_chat_session().unwrap();
-///     // Add a message to the chat session
-///     llm.add_messages_with_callback(
-///         &mut chat_session,
+///     let chat_session = llm.new_chat_session().unwrap();
+///     // Add a message to the chat session — the updated session is returned
+///     let _chat_session = llm.add_messages_with_callback(
+///         chat_session,
 ///         &[ChatMessage::new(MessageType::UserMessage, "Hello, world!")],
 ///         GenerationParameters::new(),
 ///         |token| {
@@ -90,14 +92,18 @@ pub trait CreateChatSession {
 pub trait ChatModel<Sampler = GenerationParameters>: CreateChatSession {
     /// Add messages to the chat session with a callback that is called for each token.
     ///
+    /// The session is taken by value and the updated session is returned in the
+    /// future's output. On error the session is consumed and not returned —
+    /// callers should discard the chat.
+    ///
     /// See [`Chat::add_message`] for nicer API with examples
     fn add_messages_with_callback<'a>(
         &'a self,
-        session: &'a mut Self::ChatSession,
-        messages: &[ChatMessage],
+        session: Self::ChatSession,
+        messages: &'a [ChatMessage],
         sampler: Sampler,
-        on_token: impl FnMut(String) -> Result<(), Self::Error> + Send + Sync + 'static,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+        on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
+    ) -> impl Future<Output = Result<Self::ChatSession, Self::Error>> + WasmNotSend + 'a;
 }
 
 /// A trait for unstructured chat models that support structured generation. While this trait is implemented for
@@ -113,11 +119,11 @@ pub trait ChatModel<Sampler = GenerationParameters>: CreateChatSession {
 ///     // Create a new model which implements the CreateChatSession trait
 ///     let llm = Llama::new_chat().await.unwrap();
 ///     // Create a new chat session for the model
-///     let mut chat_session = llm.new_chat_session().unwrap();
+///     let chat_session = llm.new_chat_session().unwrap();
 ///     // Create a parser for your data. Any type that implements the `Parse` trait has the `new_parser` method
 ///     let parser = i32::new_parser();
-///     // Add a message to the chat session with the given constraints
-///     let mut result: i32 = llm.add_message_with_callback_and_constraints(&mut chat_session, &[ChatMessage::new(MessageType::UserMessage, "5 + 5")], GenerationParameters::new(), parser, |token| {
+///     // Add a message with the given constraints; both the updated session and the parsed result are returned
+///     let (_chat_session, result): (_, i32) = llm.add_message_with_callback_and_constraints(chat_session, &[ChatMessage::new(MessageType::UserMessage, "5 + 5")], GenerationParameters::new(), parser, |token| {
 ///         println!("{token}");
 ///         Ok(())
 ///     }).await.unwrap();
@@ -129,15 +135,22 @@ pub trait StructuredChatModel<Constraints: ModelConstraints, Sampler = Generatio
 {
     /// Add messages to the chat session with a callback that is called for each token and a constraints the response must follow.
     ///
+    /// The session is taken by value and returned alongside the parsed output.
+    /// On error the session is consumed and not returned.
+    ///
     /// See [`ChatResponseBuilder::with_constraints`] for nicer API with examples
     fn add_message_with_callback_and_constraints<'a>(
         &'a self,
-        session: &'a mut Self::ChatSession,
-        messages: &[ChatMessage],
+        session: Self::ChatSession,
+        messages: &'a [ChatMessage],
         sampler: Sampler,
         constraints: Constraints,
-        on_token: impl FnMut(String) -> Result<(), Self::Error> + Send + Sync + 'static,
-    ) -> impl Future<Output = Result<Constraints::Output, Self::Error>> + Send + 'a;
+        on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
+    ) -> impl Future<Output = Result<(Self::ChatSession, Constraints::Output), Self::Error>>
+           + WasmNotSend
+           + 'a
+    where
+        Constraints::Output: 'a;
 }
 
 /// A trait that defines the default constraints for a type with this chat model.
@@ -155,66 +168,6 @@ pub trait CreateDefaultChatConstraintsForType<T>:
 pub trait ChatSession {
     /// The type of error the chat session may return during operations.
     type Error: Send + Sync + 'static;
-
-    /// Serialize the session into bytes.
-    fn write_to(&self, into: &mut Vec<u8>) -> Result<(), Self::Error>;
-
-    /// # Loading sessions
-    ///
-    /// Sessions can be deserialized to and from bytes using the [`ChatSession::from_bytes`] method.
-    /// Caching a session avoids re-processing the text again when the session is resumed.
-    ///
-    /// ```rust, no_run
-    /// use kalosm::language::*;
-    ///
-    /// #[tokio::main]
-    /// async fn main() {
-    ///     let mut llm = Llama::new_chat().await.unwrap();
-    ///     let mut chat = llm.chat();
-    ///
-    ///     // Feed some text into the session
-    ///     chat(&"What is the capital of France?").await.unwrap();
-    ///
-    ///     // Save the session to bytes
-    ///     let session = chat.session().unwrap();
-    ///     let session_as_bytes = session.to_bytes().unwrap();
-    ///
-    ///     // And write those bytes to a file
-    ///     std::fs::write("session.bin", session_as_bytes).unwrap();
-    /// }
-    /// ```
-    fn to_bytes(&self) -> Result<Vec<u8>, Self::Error> {
-        let mut bytes = Vec::new();
-        self.write_to(&mut bytes)?;
-        Ok(bytes)
-    }
-
-    /// # Loading sessions
-    ///
-    /// Sessions can be deserialized to and from bytes using the [`ChatSession::from_bytes`] method.
-    /// Caching a session avoids re-processing the text again when the session is resumed.
-    ///
-    /// ```rust, no_run
-    /// use kalosm::language::*;
-    ///
-    /// #[tokio::main]
-    /// async fn main() {
-    ///     let mut llm = Llama::new_chat().await.unwrap();
-    ///     // Load a chat session from a file
-    ///     let session =
-    ///         LlamaChatSession::from_bytes(std::fs::read("session.bin").unwrap().as_slice()).unwrap();
-    ///     let mut chat = llm.chat().with_session(session);
-    ///
-    ///     // Feed some more text into the session
-    ///     chat(&"What was my first question?")
-    ///         .to_std_out()
-    ///         .await
-    ///         .unwrap();
-    /// }
-    /// ```
-    fn from_bytes(bytes: &[u8]) -> Result<Self, Self::Error>
-    where
-        Self: std::marker::Sized;
 
     /// # Session History
     ///
@@ -282,21 +235,23 @@ pub fn prompt_input(prompt: impl Display) -> Result<String, std::io::Error> {
 }
 
 /// The type of a chat message
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MessageType {
     /// A system prompt message. System prompts should always be the first message in a chat session.
-    #[serde(rename = "developer")]
+    #[cfg_attr(feature = "serde", serde(rename = "developer"))]
     SystemPrompt,
     /// A user message.
-    #[serde(rename = "user")]
+    #[cfg_attr(feature = "serde", serde(rename = "user"))]
     UserMessage,
     /// A model answer.
-    #[serde(rename = "assistant")]
+    #[cfg_attr(feature = "serde", serde(rename = "assistant"))]
     ModelAnswer,
 }
 
 /// A single item in the chat history.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ChatMessage {
     role: MessageType,
     content: MessageContent,

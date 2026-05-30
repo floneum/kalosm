@@ -1,6 +1,5 @@
-use candle_core::{Device, Tensor};
-use kalosm_common::{KvCache, TensorCache};
-use std::collections::HashMap;
+use fusor::cache::KvCache;
+use fusor::{Device, FloatDataType, SimdElement};
 
 use super::LlamaConfig;
 
@@ -8,17 +7,20 @@ use super::LlamaConfig;
 const CONCAT_DIMENSION: usize = 2;
 
 /// A cache for llama inference. This cache will speed up generation of sequential text significantly.
-#[derive(Debug, Clone)]
+///
+/// Note: The KV cache internally uses f32 for SIMD compatibility, regardless of the model's
+/// storage type F. This enables f16 models to work with f32 computation.
+#[derive(Clone)]
 pub struct LlamaCache {
-    max_seq_len: usize,
     pub(crate) start_time: u32,
     pub(crate) tokens: Vec<u32>,
-    pub(crate) blocks: Vec<KvCache>,
+    /// KV cache blocks - always f32 for SIMD operations
+    pub(crate) blocks: Vec<KvCache<f32>>,
 }
 
 impl LlamaCache {
     /// Create a new cache for a model
-    pub fn new(config: &LlamaConfig) -> Self {
+    pub fn new<G: FloatDataType + SimdElement>(config: &LlamaConfig<G>) -> Self {
         let max_seq_len = config.context_length;
         let mut blocks = Vec::with_capacity(config.n_layer);
         for layer_idx in 0..config.n_layer {
@@ -38,7 +40,6 @@ impl LlamaCache {
         }
         Self {
             start_time: 0,
-            max_seq_len,
             tokens: Vec::new(),
             blocks,
         }
@@ -51,105 +52,30 @@ impl LlamaCache {
         }
     }
 
-    /// Get the tensor map for this cache. This can be used to save the cache to disk.
-    pub fn get_tensor_map(&self, device: &Device) -> HashMap<String, Tensor> {
-        let mut map = HashMap::with_capacity(self.blocks.len());
-        for (i, kv_cache) in self.blocks.iter().enumerate() {
-            if let (Ok(Some(k)), Ok(Some(v))) = (kv_cache.k(), kv_cache.v()) {
-                map.insert(
-                    format!("llama.cache.blocks.{i}.key"),
-                    k.to_device(device).unwrap(),
-                );
-                map.insert(
-                    format!("llama.cache.blocks.{i}.value"),
-                    v.to_device(device).unwrap(),
-                );
+    pub(crate) fn reserve_decode(&mut self, device: &Device, additional_tokens: usize) {
+        if additional_tokens == 0 || self.tokens.is_empty() {
+            return;
+        }
+        let target_seq_len = self.tokens.len().saturating_add(additional_tokens);
+        let mut keys = Vec::with_capacity(self.blocks.len() * 2);
+        for block in &mut self.blocks {
+            block.reserve(device, target_seq_len, &mut keys);
+        }
+        if !keys.is_empty() {
+            device.resolve_batch(&keys);
+            if let Some(device) = device.as_gpu() {
+                device.poll_wait();
             }
         }
-        if !self.tokens.is_empty() {
-            // Tensor from iter panics or segfaults if the iterator is empty
-            map.insert(
-                "llama.cache.tokens".to_string(),
-                Tensor::from_iter(self.tokens.iter().copied(), device).unwrap(),
-            );
-        }
-        map.insert(
-            "llama.cache.max_seq_len".to_string(),
-            Tensor::new(self.max_seq_len as u32, device).unwrap(),
-        );
-        map.insert(
-            "llama.cache.start_time".to_string(),
-            Tensor::new(self.start_time, device).unwrap(),
-        );
-        map
     }
 
-    /// Create a cache from a tensor map. This can be used to load a cache from disk.
-    pub fn from_tensor_map(map: HashMap<String, Tensor>) -> candle_core::Result<Self> {
-        let tokens: Vec<u32> = map
-            .get("llama.cache.tokens")
-            .and_then(|tokens| tokens.to_vec1().ok())
-            .unwrap_or_default();
-        let max_seq_len = map
-            .get("llama.cache.max_seq_len")
-            .and_then(|max_seq_len| max_seq_len.to_scalar::<u32>().ok())
-            .unwrap_or(2048) as usize;
-        let start_time = map
-            .get("llama.cache.start_time")
-            .and_then(|start_time| start_time.to_scalar::<u32>().ok())
-            .unwrap_or(0);
-        let mut blocks = Vec::with_capacity(24);
-        for (k, v) in map {
-            if let Some(i) = k.strip_prefix("llama.cache.blocks.") {
-                let i = i
-                    .strip_suffix(".key")
-                    .unwrap_or_else(|| i.strip_suffix(".value").unwrap());
-                let i = i.parse::<usize>().unwrap_or(0);
-                if i >= blocks.len() {
-                    blocks.resize(i + 1, KvCache::new(CONCAT_DIMENSION, max_seq_len));
-                }
-                if k.ends_with(".key") {
-                    match blocks.get_mut(i) {
-                        Some(cache) => {
-                            let key_cache = cache.k_cache_mut();
-                            let len = v.dim(CONCAT_DIMENSION)?;
-                            *key_cache = TensorCache::new(CONCAT_DIMENSION, len);
-                            key_cache.append(&v)?;
-                        }
-                        _ => {
-                            let mut cache = KvCache::new(CONCAT_DIMENSION, max_seq_len);
-                            let key_cache = cache.k_cache_mut();
-                            let len = v.dim(CONCAT_DIMENSION)?;
-                            *key_cache = TensorCache::new(CONCAT_DIMENSION, len);
-                            key_cache.append(&v)?;
-                            blocks[i] = cache;
-                        }
-                    }
-                } else if k.ends_with(".value") {
-                    match blocks.get_mut(i) {
-                        Some(cache) => {
-                            let value_cache = cache.v_cache_mut();
-                            let len = v.dim(CONCAT_DIMENSION)?;
-                            *value_cache = TensorCache::new(CONCAT_DIMENSION, len);
-                            value_cache.append(&v)?;
-                        }
-                        _ => {
-                            let mut cache = KvCache::new(CONCAT_DIMENSION, max_seq_len);
-                            let value_cache = cache.v_cache_mut();
-                            let len = v.dim(CONCAT_DIMENSION)?;
-                            *value_cache = TensorCache::new(CONCAT_DIMENSION, len);
-                            value_cache.append(&v)?;
-                            blocks[i] = cache;
-                        }
-                    }
-                }
-            }
+    pub(crate) fn detach(&mut self, device: &Device) {
+        let mut keys = Vec::with_capacity(self.blocks.len() * 2);
+        for block in &mut self.blocks {
+            block.detach_keys(&mut keys);
         }
-        Ok(Self {
-            start_time,
-            tokens,
-            blocks,
-            max_seq_len,
-        })
+        if !keys.is_empty() {
+            device.detach_cached(&keys);
+        }
     }
 }

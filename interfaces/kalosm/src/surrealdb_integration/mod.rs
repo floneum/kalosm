@@ -1,4 +1,4 @@
-use kalosm_language::prelude::*;
+use crate::language::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::future::{Future, IntoFuture};
@@ -8,6 +8,9 @@ use surrealdb::{Connection, RecordId, RecordIdKey, Surreal};
 
 #[cfg(feature = "language")]
 pub(crate) mod document_table;
+
+#[cfg(feature = "language")]
+pub(crate) mod hybrid_search;
 
 /// An error that can occur when adding or searching for an embedding to the embedding indexed table.
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +57,10 @@ impl From<surrealdb::Error> for EmbeddedIndexedTableError {
 pub struct DocumentLink {
     document_id: RecordIdKey,
     byte_range: std::ops::Range<usize>,
+    /// Optional materialized chunk text (only present when hybrid search is enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    chunk_text: Option<String>,
 }
 
 /// An object with associated embedding ids.
@@ -150,6 +157,7 @@ impl<C: Connection, R> EmbeddingIndexedTable<C, R> {
                     .content(DocumentLink {
                         document_id: id.clone(),
                         byte_range,
+                        chunk_text: None,
                     })
                     .await?;
             }
@@ -264,6 +272,55 @@ impl<C: Connection, R> EmbeddingIndexedTable<C, R> {
             filter: None,
             phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Insert with materialized chunk text (for hybrid search only)
+    /// Only accessible within the crate, specifically for hybrid_search module
+    pub(crate) async fn insert_with_chunk_text(
+        &self,
+        chunks: impl IntoIterator<Item = Chunk>,
+        value: R,
+        extract_text: impl Fn(&R, &Range<usize>) -> String,
+    ) -> Result<RecordIdKey, EmbeddedIndexedTableError>
+    where
+        R: Serialize + DeserializeOwned + 'static,
+    {
+        let id_uuid = surrealdb::sql::Uuid::new_v7().0;
+        let id = RecordIdKey::from(id_uuid);
+
+        let mut embedding_ids = Vec::new();
+        let thing = RecordId::from_table_key(self.table.clone(), id.clone());
+
+        for chunk in chunks {
+            let chunk_embedding_ids = self.vector_db.add_embeddings(chunk.embeddings)?;
+            for embedding_id in &chunk_embedding_ids {
+                let byte_range = chunk.byte_range.clone();
+                let chunk_text = extract_text(&value, &byte_range);
+
+                let link = RecordId::from_table_key(self.table_links(), embedding_id.0 as i64);
+
+                // Create link WITH chunk_text
+                self.db
+                    .create::<Option<DocumentLink>>(link)
+                    .content(DocumentLink {
+                        document_id: id.clone(),
+                        byte_range,
+                        chunk_text: Some(chunk_text),
+                    })
+                    .await?;
+            }
+            embedding_ids.push((chunk.byte_range.clone(), chunk_embedding_ids));
+        }
+
+        self.db
+            .create::<Option<ObjectWithEmbeddingIds<R>>>(thing)
+            .content(ObjectWithEmbeddingIds {
+                object: value,
+                chunks: embedding_ids,
+            })
+            .await?;
+
+        Ok(id)
     }
 }
 

@@ -2,7 +2,7 @@
 
 use std::{num::NonZeroUsize, sync::Arc};
 
-use fusor_core::{
+use fusor::{
     cache::{AttentionMask, KvCache, MaskCache, TensorCache},
     layers::{Conv1d, Conv1dConfig, Embedding, LayerNorm, Linear},
     Device, Error, Result, Tensor, VarBuilder,
@@ -13,14 +13,49 @@ use crate::config::Config;
 
 pub(crate) mod timestamps;
 
-fn conv1d(config: Conv1dConfig, device: &Device, vb: &mut VarBuilder) -> Result<Conv1d> {
-    let weight = vb.get("weight", device)?.dequantize();
-    let bias = vb.get("bias", device)?.dequantize();
+fn conv1d(
+    config: Conv1dConfig,
+    device: &Device,
+    vb: &mut VarBuilder,
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+) -> Result<Conv1d<crate::WhisperDType>> {
+    let weight_q = vb.get("weight", device)?;
+    let weight_shape = weight_q.shape();
+
+    // Handle both 2D and 3D weight formats
+    let weight: Tensor<3, crate::WhisperDType> = if weight_shape.len() == 3 {
+        // Already 3D: [out_channels, in_channels, kernel_size]
+        weight_q.dequantize()
+    } else {
+        // 2D: reshape from [out_channels, in_channels*kernel_size] to [out_channels, in_channels, kernel_size]
+        let weight_2d: Tensor<2, crate::WhisperDType> = weight_q.dequantize();
+        weight_2d
+            .reshape([out_channels, in_channels, kernel_size])
+            .to_concrete()
+    };
+
+    let bias_q = vb.get("bias", device)?;
+    let bias_shape = bias_q.shape();
+
+    // Handle 1D, 2D bias formats
+    let bias: Tensor<1, crate::WhisperDType> = if bias_shape.len() == 1 {
+        bias_q.dequantize()
+    } else {
+        let bias_2d: Tensor<2, crate::WhisperDType> = bias_q.dequantize();
+        // Squeeze to rank 1: assume shape is (1, out_channels) or (out_channels, 1)
+        if bias_2d.shape()[0] == 1 {
+            bias_2d.squeeze(0).to_concrete()
+        } else {
+            bias_2d.squeeze(1).to_concrete()
+        }
+    };
     Ok(Conv1d::new(weight, Some(bias), config))
 }
 
 struct MultiHeadAttentionCache {
-    kv_cache: KvCache,
+    kv_cache: KvCache<crate::WhisperDType>,
 }
 
 impl MultiHeadAttentionCache {
@@ -33,10 +68,10 @@ impl MultiHeadAttentionCache {
 
 // https://github.com/openai/whisper/blob/f572f2161ba831bae131364c3bffdead7af6d210/whisper/model.py#L62
 struct MultiHeadAttention {
-    query: Linear,
-    key: Linear,
-    value: Linear,
-    out: Linear,
+    query: Linear<crate::WhisperDType>,
+    key: Linear<crate::WhisperDType>,
+    value: Linear<crate::WhisperDType>,
+    out: Linear<crate::WhisperDType>,
     n_head: usize,
     softmax_span: tracing::Span,
     matmul_span: tracing::Span,
@@ -63,25 +98,39 @@ impl MultiHeadAttention {
 
     fn forward_kv(
         &self,
-        x: &Tensor<3, f32>,
+        x: &Tensor<3, crate::WhisperDType>,
         cache: Option<&mut MultiHeadAttentionCache>,
-    ) -> Result<(Tensor<3, f32>, Tensor<3, f32>)> {
+    ) -> Result<(
+        Tensor<3, crate::WhisperDType>,
+        Tensor<3, crate::WhisperDType>,
+    )> {
+        let device = x.device();
         let key_states = self.key.forward(x);
         let value_states = self.value.forward(x);
         let (key_states, value_states) = match cache {
             None => (key_states, value_states),
-            Some(cache) => cache.kv_cache.append(&key_states, &value_states),
+            Some(cache) => {
+                let key_states_4d = key_states.unsqueeze(2).to_concrete();
+                let value_states_4d = value_states.unsqueeze(2).to_concrete();
+                let (k, v) = cache
+                    .kv_cache
+                    .append(&device, &key_states_4d, &value_states_4d);
+                (k.squeeze(2).to_concrete(), v.squeeze(2).to_concrete())
+            }
         };
         Ok((key_states, value_states))
     }
 
     fn forward(
         &mut self,
-        query: &Tensor<3, f32>,
-        kv: (Tensor<3, f32>, Tensor<3, f32>),
-        mask: Option<&AttentionMask>,
-        attention_output: Option<&mut TensorCache<4, f32>>,
-    ) -> Result<Tensor<3, f32>> {
+        query: &Tensor<3, crate::WhisperDType>,
+        kv: (
+            Tensor<3, crate::WhisperDType>,
+            Tensor<3, crate::WhisperDType>,
+        ),
+        mask: Option<&AttentionMask<crate::WhisperDType>>,
+        attention_output: Option<&mut TensorCache<4, crate::WhisperDType>>,
+    ) -> Result<Tensor<3, crate::WhisperDType>> {
         let query_states = self.query.forward(query);
         let (key_states, value_states) = &kv;
         let wv = self.qkv_attention(
@@ -94,62 +143,79 @@ impl MultiHeadAttention {
         Ok(self.out.forward(&wv))
     }
 
-    fn reshape_head(&self, x: &Tensor<3, f32>) -> Tensor<4, f32> {
-        let [n_batch, n_ctx, n_state] = *x.shape();
-        let target_dims = [n_batch, n_ctx, self.n_head, n_state / self.n_head];
-        x.reshape(target_dims).transpose(1, 2)
-    }
-
     fn qkv_attention(
         &self,
-        q: &Tensor<3, f32>,
-        k: &Tensor<3, f32>,
-        v: &Tensor<3, f32>,
-        mask: Option<&AttentionMask>,
-        attention_output: Option<&mut TensorCache<4, f32>>,
-    ) -> Result<Tensor<3, f32>> {
-        let [_, _, n_state] = *q.shape();
-        let scale = ((n_state / self.n_head) as f64).powf(-0.25) as f32;
-        let q = self.reshape_head(q) * scale;
-        let k = self.reshape_head(k).transpose(2, 3) * scale;
-        let v = self.reshape_head(v);
+        q: &Tensor<3, crate::WhisperDType>,
+        k: &Tensor<3, crate::WhisperDType>,
+        v: &Tensor<3, crate::WhisperDType>,
+        mask: Option<&AttentionMask<crate::WhisperDType>>,
+        attention_output: Option<&mut TensorCache<4, crate::WhisperDType>>,
+    ) -> Result<Tensor<3, crate::WhisperDType>> {
+        let device = q.device();
+        let [n_batch, n_ctx_q, n_state] = q.shape();
+        let [_, n_ctx_kv, _] = k.shape();
+        let head_dim = n_state / self.n_head;
+        let scale = crate::WhisperDType::from((head_dim as f32).powf(-0.25));
+
+        // Reshape Q: [n_batch, n_ctx_q, n_state] -> [n_batch, n_head, n_ctx_q, head_dim]
+        let q_target_dims = [n_batch, n_ctx_q, self.n_head, head_dim];
+        let q_reshaped = q.reshape(q_target_dims);
+        let q_transposed = q_reshaped.transpose(1, 2);
+        let q = q_transposed.mul_scalar(scale);
+
+        // Reshape K/V: [n_batch, n_ctx_kv, n_state] -> [n_batch, n_head, n_ctx_kv, head_dim]
+        // For self-attention n_ctx_kv == n_ctx_q, for cross-attention they differ
+        let kv_target_dims = [n_batch, n_ctx_kv, self.n_head, head_dim];
+        let k_reshaped = k.reshape(kv_target_dims);
+        let k_transposed = k_reshaped.transpose(1, 2);
+        let k_transposed2 = k_transposed.transpose(2, 3);
+        let k = k_transposed2.mul_scalar(scale);
+        let v_reshaped = v.reshape(kv_target_dims);
+        let v = v_reshaped.transpose(1, 2);
+
         let mut qk = {
             let _enter = self.matmul_span.enter();
             q.mat_mul(&k)
         };
+
         if let Some(mask) = mask {
             mask.forward(&mut qk)
         }
         if let Some(out) = attention_output {
-            out.append(&qk);
+            out.append(&device, &qk);
         }
         let w = {
             let _enter = self.softmax_span.enter();
-            qk.softmax_last_dim()
+            qk.softmax_last_dim_fused()
         };
-        let wv = {
+
+        let wv_raw = {
             let _enter = self.matmul_span.enter();
             w.mat_mul(&v)
-        }
-        .transpose(1, 2)
-        .flatten_last_n::<1, _>();
+        };
+
+        let wv = wv_raw.transpose(1, 2).flatten_last_n::<1, _>();
+
         Ok(wv)
     }
 }
 
 struct ResidualAttentionBlockCache {
     attn: MultiHeadAttentionCache,
-    feature_attn_cache: Option<(Tensor<3, f32>, Tensor<3, f32>)>,
+    feature_attn_cache: Option<(
+        Tensor<3, crate::WhisperDType>,
+        Tensor<3, crate::WhisperDType>,
+    )>,
 }
 
 // https://github.com/openai/whisper/blob/f572f2161ba831bae131364c3bffdead7af6d210/whisper/model.py#L111
 struct ResidualAttentionBlock {
     attn: MultiHeadAttention,
-    attn_ln: LayerNorm<1>,
-    cross_attn: Option<(MultiHeadAttention, LayerNorm<1>)>,
-    mlp_linear1: Linear,
-    mlp_linear2: Linear,
-    mlp_ln: LayerNorm<1>,
+    attn_ln: LayerNorm<1, crate::WhisperDType>,
+    cross_attn: Option<(MultiHeadAttention, LayerNorm<1, crate::WhisperDType>)>,
+    mlp_linear1: Linear<crate::WhisperDType>,
+    mlp_linear2: Linear<crate::WhisperDType>,
+    mlp_ln: LayerNorm<1, crate::WhisperDType>,
     span: tracing::Span,
 }
 
@@ -182,53 +248,73 @@ impl ResidualAttentionBlock {
 
     fn forward(
         &mut self,
-        audio_features_kv: Option<(Tensor<3, f32>, Tensor<3, f32>)>,
-        x: &Tensor<3, f32>,
-        mask: Option<&AttentionMask>,
+        audio_features_kv: Option<(
+            Tensor<3, crate::WhisperDType>,
+            Tensor<3, crate::WhisperDType>,
+        )>,
+        x: &Tensor<3, crate::WhisperDType>,
+        mask: Option<&AttentionMask<crate::WhisperDType>>,
         mut cache: Option<&mut ResidualAttentionBlockCache>,
-        attention_output: Option<&mut TensorCache<4, f32>>,
-    ) -> Result<Tensor<3, f32>> {
+        attention_output: Option<&mut TensorCache<4, crate::WhisperDType>>,
+    ) -> Result<Tensor<3, crate::WhisperDType>> {
         let _enter = self.span.enter();
 
-        let attn_ln_x = self.attn_ln.forward(x);
+        let attn_ln_x = self.attn_ln.forward_fused(x);
         let kv = self
             .attn
             .forward_kv(&attn_ln_x, cache.as_mut().map(|cache| &mut cache.attn))?;
         let attn = self.attn.forward(&attn_ln_x, kv, mask, None)?;
-        let mut x = x + &attn;
+        let mut x = (x + &attn).to_concrete();
+
         if let (Some(kv), Some((attn, ln))) = (audio_features_kv, &mut self.cross_attn) {
-            let ln_x = ln.forward(&x);
-            x = &x + &attn.forward(&ln_x, kv, None, attention_output)?;
+            let ln_x = ln.forward_fused(&x);
+            let attn_out = attn.forward(&ln_x, kv, None, attention_output)?;
+            x = (&x + &attn_out).to_concrete();
         }
-        let mlp = self
-            .mlp_linear2
-            .forward(&self.mlp_linear1.forward(&self.mlp_ln.forward(&x)).gelu());
-        Ok(x + mlp)
+        let mlp = self.mlp_linear2.forward(
+            &self
+                .mlp_linear1
+                .forward(&self.mlp_ln.forward_fused(&x))
+                .gelu(),
+        );
+        let result = (x + mlp).to_concrete();
+
+        Ok(result)
     }
 }
 
-fn sinusoids(length: usize, channels: usize, device: &Device) -> Tensor<2, f32> {
+fn sinusoids(length: usize, channels: usize, device: &Device) -> Tensor<2, crate::WhisperDType> {
     let max_timescale = 10000f32;
-    let log_timescale_increment = max_timescale.ln() / (channels / 2 - 1) as f32;
+    let log_timescale_increment = crate::WhisperDType::from(max_timescale.ln())
+        / crate::WhisperDType::from((channels / 2 - 1) as f32);
     let inv_timescales: Vec<_> = (0..channels / 2)
-        .map(|i| (i as f32 * (-log_timescale_increment)).exp())
+        .map(|i| (crate::WhisperDType::from(i as f32) * (-log_timescale_increment)).exp())
         .collect();
-    let inv_timescales = Tensor::new(device, inv_timescales.as_slice()).unsqueeze(0);
-    let arange = Tensor::arange(device, 0, length as u32)
-        .cast::<f32>()
-        .unsqueeze(1);
+    let inv_timescales_1d = Tensor::new(device, inv_timescales.as_slice());
+    let inv_timescales = inv_timescales_1d.unsqueeze(0);
+    let arange_u32 = fusor::arange(device, 0u32, length as u32);
+    let arange_cast = arange_u32.cast::<crate::WhisperDType>();
+    let arange = arange_cast.unsqueeze(1);
     let sh = [length, channels / 2];
-    let scaled_time = arange.broadcast_as(sh) * inv_timescales.broadcast_as(sh);
-    Tensor::cat([scaled_time.sin(), scaled_time.cos()], 1)
+    let arange_broadcast = arange.broadcast_as(sh);
+    let inv_timescales_broadcast = inv_timescales.broadcast_as(sh);
+    let scaled_time = (&arange_broadcast * &inv_timescales_broadcast).to_concrete();
+    Tensor::cat(
+        [
+            scaled_time.sin().to_concrete(),
+            scaled_time.cos().to_concrete(),
+        ],
+        1,
+    )
 }
 
 // https://github.com/openai/whisper/blob/f572f2161ba831bae131364c3bffdead7af6d210/whisper/model.py#L143
 pub struct AudioEncoder {
-    conv1: Conv1d,
-    conv2: Conv1d,
-    positional_embedding: Tensor<2, f32>,
+    conv1: Conv1d<crate::WhisperDType>,
+    conv2: Conv1d<crate::WhisperDType>,
+    positional_embedding: Tensor<2, crate::WhisperDType>,
     blocks: Vec<ResidualAttentionBlock>,
-    ln_post: LayerNorm<1>,
+    ln_post: LayerNorm<1, crate::WhisperDType>,
     span: tracing::Span,
     conv1_span: tracing::Span,
     conv2_span: tracing::Span,
@@ -254,8 +340,9 @@ impl AudioEncoder {
             groups: 1,
             dilation: 1,
         };
-        let conv1 = conv1d(cfg1, device, &mut vb.pp("conv1"))?;
-        let conv2 = conv1d(cfg2, device, &mut vb.pp("conv2"))?;
+        let n_mels = cfg.num_mel_bins;
+        let conv1 = conv1d(cfg1, device, &mut vb.pp("conv1"), n_mels, n_state, 3)?;
+        let conv2 = conv1d(cfg2, device, &mut vb.pp("conv2"), n_state, n_state, 3)?;
         let positional_embedding = sinusoids(n_ctx, n_state, device);
         let blocks = (0..cfg.encoder_layers)
             .map(|i| {
@@ -280,8 +367,12 @@ impl AudioEncoder {
         })
     }
 
-    pub fn forward(&mut self, x: &Tensor<3, f32>) -> Result<Tensor<3, f32>> {
+    pub fn forward(
+        &mut self,
+        x: &Tensor<3, crate::WhisperDType>,
+    ) -> Result<Tensor<3, crate::WhisperDType>> {
         let _enter = self.span.enter();
+
         let x = {
             let _enter = self.conv1_span.enter();
             self.conv1.forward(x).gelu()
@@ -291,13 +382,16 @@ impl AudioEncoder {
             self.conv2.forward(&x).gelu()
         };
         let x = x.transpose(1, 2);
-        let [_bsize, seq_len, _hidden] = *x.shape();
+        let [_bsize, seq_len, _hidden] = x.shape();
+
         let positional_embedding = self.positional_embedding.narrow(0, 0, seq_len);
         let mut x = x.add_(&positional_embedding);
+
         for block in self.blocks.iter_mut() {
-            x = block.forward(None, &x, None, None, None)?
+            x = block.forward(None, &x, None, None, None)?;
         }
-        let x = self.ln_post.forward(&x);
+        let x = self.ln_post.forward_fused(&x);
+
         Ok(x)
     }
 }
@@ -316,12 +410,12 @@ impl TextDecoderCache {
 
 // https://github.com/openai/whisper/blob/f572f2161ba831bae131364c3bffdead7af6d210/whisper/model.py#L176
 pub struct TextDecoder {
-    token_embedding: Embedding,
-    positional_embedding: Tensor<2, f32>,
+    token_embedding: Embedding<crate::WhisperDType>,
+    positional_embedding: Tensor<2, crate::WhisperDType>,
     blocks: Vec<ResidualAttentionBlock>,
-    ln: LayerNorm<1>,
+    ln: LayerNorm<1, crate::WhisperDType>,
     max_target_positions: usize,
-    mask_cache: Arc<MaskCache>,
+    mask_cache: Arc<MaskCache<crate::WhisperDType>>,
     span: tracing::Span,
     span_final: tracing::Span,
 }
@@ -360,10 +454,10 @@ impl TextDecoder {
     pub fn forward(
         &mut self,
         tokens: &[u32],
-        audio_features: &Tensor<2, f32>,
+        audio_features: &Tensor<2, crate::WhisperDType>,
         cache: &mut TextDecoderCache,
-        mut attention_output: Option<&mut [TensorCache<4, f32>]>,
-    ) -> Result<Tensor<3, f32>> {
+        mut attention_output: Option<&mut [TensorCache<4, crate::WhisperDType>]>,
+    ) -> Result<Tensor<3, crate::WhisperDType>> {
         let index_pos = cache.tokens.len();
         cache.tokens.extend_from_slice(tokens);
         let seq_len = tokens.len();
@@ -371,21 +465,21 @@ impl TextDecoder {
             return Err(Error::msg("exceeded max sequence length"));
         }
         let device = audio_features.device();
-        let mask = self
-            .mask_cache
-            .get_mask(seq_len, index_pos, None, device)
-            .map_err(Error::msg)?;
-        let x = Tensor::new(device, tokens);
+        let mask = self.mask_cache.get_mask(seq_len, index_pos, None, &device);
+        let x: Tensor<1, u32> = Tensor::new(&device, tokens);
         // The model expects a batch dim but this inference loop does not handle
         // it so we add it at this point.
-        let x = x.unsqueeze(0);
+        let x = x.unsqueeze(0).to_concrete();
 
         let _enter = self.span.enter();
         let token_embedding = self.token_embedding.forward(&x);
         let positional_embedding = self.positional_embedding.narrow(0, index_pos, seq_len);
+
         let mut x = token_embedding.add_(&positional_embedding);
+
         // Add batch dimension to audio_features for forward_kv
-        let audio_features_batched = audio_features.unsqueeze(0);
+        let audio_features_batched = audio_features.unsqueeze(0).to_concrete();
+
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if cache.blocks.len() <= i {
                 cache.blocks.push(ResidualAttentionBlockCache {
@@ -401,16 +495,23 @@ impl TextDecoder {
             let attention_output = attention_output.as_mut().map(|outputs| &mut outputs[i]);
             x = block.forward(query, &x, Some(&mask), Some(block_cache), attention_output)?;
         }
-        let out = self.ln.forward(&x);
+
+        let out = self.ln.forward_fused(&x);
+
         Ok(out)
     }
 
-    pub fn final_linear(&self, x: &Tensor<3, f32>) -> Result<Tensor<3, f32>> {
+    pub fn final_linear(
+        &self,
+        x: &Tensor<3, crate::WhisperDType>,
+    ) -> Result<Tensor<3, crate::WhisperDType>> {
         let embeddings = self.token_embedding.embeddings_quantized();
+
         let logits = {
             let _enter = self.span_final.enter();
             x.q_mat_mul(embeddings)
         };
+
         Ok(logits)
     }
 
@@ -442,8 +543,8 @@ impl Whisper {
         filter_width: NonZeroUsize,
         n_frames: usize,
         mask: Vec<Vec<bool>>,
-        attention_output: &[TensorCache<4, f32>],
-    ) -> Result<Vec<Vec<f32>>> {
+        attention_output: &[TensorCache<4, crate::WhisperDType>],
+    ) -> Result<Vec<Vec<crate::WhisperDType>>> {
         let Some(attention_heads) = attention_heads else {
             panic!(
                 "The attention heads for word-level timestamps are not available for this model",

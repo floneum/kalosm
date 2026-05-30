@@ -1,4 +1,5 @@
 use crate::MessageContent;
+use kalosm_model_types::{WasmNotSend, WasmNotSendSync};
 
 use super::{
     CreateDefaultCompletionConstraintsForType, CreateTextCompletionSession, ModelConstraints,
@@ -46,8 +47,8 @@ impl TextCompletionModel for BoxedTextCompletionModel {
         session: &'a mut Self::Session,
         text: MessageContent,
         sampler: super::GenerationParameters,
-        on_token: impl FnMut(String) -> Result<(), Self::Error> + Send + Sync + 'static,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
+    ) -> impl Future<Output = Result<(), Self::Error>> + WasmNotSend + 'a {
         self.model
             .add_messages_with_callback_boxed(session, text, sampler, Box::new(on_token))
     }
@@ -97,8 +98,8 @@ impl<T> TextCompletionModel for BoxedStructuredTextCompletionModel<T> {
         session: &'a mut Self::Session,
         text: MessageContent,
         sampler: super::GenerationParameters,
-        on_token: impl FnMut(String) -> Result<(), Self::Error> + Send + Sync + 'static,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
+    ) -> impl Future<Output = Result<(), Self::Error>> + WasmNotSend + 'a {
         self.model
             .add_messages_with_callback_boxed(session, text, sampler, Box::new(on_token))
     }
@@ -113,8 +114,8 @@ impl<T> StructuredTextCompletionModel<BoxedCompletionConstraintsForType<T>>
         text: MessageContent,
         sampler: super::GenerationParameters,
         parser: BoxedCompletionConstraintsForType<T>,
-        on_token: impl FnMut(String) -> Result<(), Self::Error> + Send + Sync + 'static,
-    ) -> impl Future<Output = Result<T, Self::Error>> + Send + 'a {
+        on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
+    ) -> impl Future<Output = Result<T, Self::Error>> + WasmNotSend + 'a {
         self.model.add_messages_with_callback_and_parser_boxed(
             session,
             text,
@@ -139,37 +140,11 @@ impl Clone for BoxedTextCompletionSession {
 impl TextCompletionSession for BoxedTextCompletionSession {
     type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-    fn write_to(&self, into: &mut Vec<u8>) -> Result<(), Self::Error> {
-        self.session.write_to_boxed(into)
-    }
-
-    fn from_bytes(_: &[u8]) -> Result<Self, Self::Error>
-    where
-        Self: std::marker::Sized,
-    {
-        #[derive(Debug)]
-        struct FromBytesNotSupported;
-
-        impl std::error::Error for FromBytesNotSupported {}
-
-        impl std::fmt::Display for FromBytesNotSupported {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "FromBytesNotSupported")
-            }
-        }
-
-        Err(Box::new(FromBytesNotSupported))
-    }
-
     fn try_clone(&self) -> Result<Self, Self::Error>
     where
         Self: std::marker::Sized,
     {
         self.session.try_clone_boxed()
-    }
-
-    fn to_bytes(&self) -> Result<Vec<u8>, Self::Error> {
-        self.session.to_bytes_boxed()
     }
 }
 
@@ -209,17 +184,9 @@ where
 }
 
 trait DynTextCompletionSession {
-    fn write_to_boxed(
-        &self,
-        into: &mut Vec<u8>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>;
-
     fn try_clone_boxed(
         &self,
     ) -> Result<BoxedTextCompletionSession, Box<dyn std::error::Error + Send + Sync + 'static>>;
-
-    fn to_bytes_boxed(&self)
-        -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync + 'static>>;
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 
@@ -229,14 +196,6 @@ trait DynTextCompletionSession {
 impl<S: TextCompletionSession<Error: Error> + Clone + Send + Sync + 'static>
     DynTextCompletionSession for S
 {
-    fn write_to_boxed(
-        &self,
-        into: &mut Vec<u8>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-        self.write_to(into)
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
-    }
-
     fn try_clone_boxed(
         &self,
     ) -> Result<BoxedTextCompletionSession, Box<dyn std::error::Error + Send + Sync + 'static>>
@@ -246,13 +205,6 @@ impl<S: TextCompletionSession<Error: Error> + Clone + Send + Sync + 'static>
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         let session = Box::new(session) as Box<dyn DynTextCompletionSession + Send + Sync>;
         Ok(BoxedTextCompletionSession { session })
-    }
-
-    fn to_bytes_boxed(
-        &self,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync + 'static>> {
-        self.to_bytes()
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {

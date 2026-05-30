@@ -1,56 +1,102 @@
-use candle_core::{IndexOp, Tensor};
-use candle_nn::{Conv2d, Conv2dConfig, Module};
-use candle_transformers::quantized_var_builder::VarBuilder;
+use fusor::{
+    AddOp, CastTensor, CastTo, Device, FloatDataType, FloatOps, MatmulImpl, MulOp, SimdBinaryOp,
+    SimdElement, SimdReduceOp, SumOp, Tensor, VarBuilder,
+};
 
-pub(crate) struct Qwen2_5VisionPatchEmbed {
+#[derive(Debug, Clone, Copy)]
+pub struct Conv3dConfig {
+    pub padding: usize,
+    pub stride: usize,
+}
+
+impl Default for Conv3dConfig {
+    fn default() -> Self {
+        Self {
+            padding: 0,
+            stride: 1,
+        }
+    }
+}
+
+pub struct Conv3d<T: fusor::DataType + SimdElement> {
+    weight: Tensor<5, T>, // (out_channels, in_channels, kernel_h, kernel_w, temporal)
+    bias: Option<Tensor<1, T>>, // (out_channels,)
+    config: Conv3dConfig,
+}
+
+impl<T: FloatDataType + SimdElement + FloatOps + MatmulImpl> Conv3d<T>
+where
+    MulOp: SimdBinaryOp<T>,
+    AddOp: SimdBinaryOp<T>,
+    SumOp: SimdReduceOp<T>,
+{
+    pub fn new(weight: Tensor<5, T>, bias: Option<Tensor<1, T>>, config: Conv3dConfig) -> Self {
+        Self {
+            weight,
+            bias,
+            config,
+        }
+    }
+
+    pub fn forward(&self, input: &Tensor<5, T>) -> Tensor<5, T> {
+        input.conv(
+            &self.weight,
+            self.bias.as_ref(),
+            [
+                self.config.padding,
+                self.config.padding,
+                self.config.padding,
+            ],
+            [self.config.stride, self.config.stride, self.config.stride],
+        )
+    }
+}
+
+pub(crate) struct Qwen2_5VisionPatchEmbed<F: FloatDataType + SimdElement> {
     patch_size: usize,
     temporal_patch_size: usize,
     in_channels: usize,
     embed_dim: usize,
-    first_frame_conv: candle_nn::Conv2d,
-    second_frame_conv: candle_nn::Conv2d,
+    conv: Conv3d<F>,
 }
 
-impl Qwen2_5VisionPatchEmbed {
+impl<F: FloatDataType + SimdElement + FloatOps + MatmulImpl> Qwen2_5VisionPatchEmbed<F>
+where
+    F: CastTo<f32> + CastTensor<f32>,
+    f32: CastTo<F> + CastTensor<F>,
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
+{
     pub fn new(
         patch_size: usize,
         temporal_patch_size: usize,
         in_channels: usize,
-        embed_dim: usize,
-        vb: &VarBuilder,
-    ) -> candle_core::Result<Self> {
-        let device = vb.device();
-        let ws_1 = vb
-            .get((embed_dim, in_channels, patch_size, patch_size), "weight")?
-            .dequantize_f16(device)?;
-        let ws_2 = vb
-            .get((embed_dim, in_channels, patch_size, patch_size), "weight.1")?
-            .dequantize_f16(device)?;
-
-        Self::from_weight(
-            patch_size,
-            temporal_patch_size,
-            in_channels,
-            embed_dim,
-            &ws_1,
-            &ws_2,
-        )
-    }
-
-    pub fn from_weight(
-        patch_size: usize,
-        temporal_patch_size: usize,
-        in_channels: usize,
-        embed_dim: usize,
-        weight_one: &Tensor,
-        weight_two: &Tensor,
-    ) -> candle_core::Result<Self> {
+        hidden_size: usize,
+        vb: &mut VarBuilder,
+        device: &Device,
+    ) -> fusor::Result<Self> {
+        // GGUF stores Conv3D weights split into two Conv2D tensors along the temporal dimension
+        // - "weight" contains temporal slice 0: [out_channels, in_channels, kernel_h, kernel_w]
+        // - "weight.1" contains temporal slice 1: [out_channels, in_channels, kernel_h, kernel_w]
+        // We need to stack them to form [out_channels, in_channels, temporal, kernel_h, kernel_w]
         assert_eq!(
             temporal_patch_size, 2,
-            "Only 2 temporal patch size is supported"
+            "Only 2 temporal patch size is supported for 5D weights"
         );
 
-        let cfg = Conv2dConfig {
+        let weight_0 = vb.get("weight", device)?;
+        let weight_1 = vb.get("weight.1", device)?;
+
+        // Dequantize to 4D f32 tensors then cast to F
+        let weight_0: Tensor<4, F> = weight_0.dequantize().cast();
+        let weight_1: Tensor<4, F> = weight_1.dequantize().cast();
+
+        // Stack along the temporal dimension (dim 2) to create 5D tensor
+        // [out_channels, in_channels, kernel_h, kernel_w] -> [out_channels, in_channels, 2, kernel_h, kernel_w]
+        let weight: Tensor<5, F> = Tensor::stack([weight_0, weight_1], 2);
+
+        let cfg = Conv3dConfig {
             stride: patch_size,
             ..Default::default()
         };
@@ -59,65 +105,50 @@ impl Qwen2_5VisionPatchEmbed {
             patch_size,
             temporal_patch_size,
             in_channels,
-            embed_dim,
-            first_frame_conv: Conv2d::new(weight_one.contiguous()?, None, cfg),
-            second_frame_conv: Conv2d::new(weight_two.contiguous()?, None, cfg),
+            embed_dim: hidden_size,
+            conv: Conv3d::new(weight, None, cfg),
         })
     }
 
-    pub fn forward(&self, hidden_states: &Tensor) -> candle_core::Result<Tensor> {
-        let target_dtype = self.first_frame_conv.weight().dtype();
-        let hidden_states = hidden_states
-            .reshape((
-                (),
+    pub fn temporal_patch_size(&self) -> usize {
+        self.temporal_patch_size
+    }
+
+    pub fn forward(&self, hidden_states: &Tensor<2, F>) -> fusor::Result<Tensor<2, F>> {
+        let [num_patches, _] = hidden_states.shape();
+
+        // Input: (num_patches, in_channels * temporal * patch * patch)
+        // Reshape to (num_patches, in_channels, temporal, patch, patch)
+        let x = hidden_states
+            .reshape([
+                num_patches,
                 self.in_channels,
                 self.temporal_patch_size,
                 self.patch_size,
                 self.patch_size,
-            ))?
-            .to_dtype(target_dtype)?;
-        // Index on temporal dimension
-        let (first_frame, second_frame) = split_frames(&hidden_states)?;
+            ])
+            .to_concrete();
 
-        // Reduce with both convs
-        let first_frame = self
-            .first_frame_conv
-            .forward(&first_frame.contiguous()?)?
-            .reshape(((), self.embed_dim))?;
-        let second_frame = self
-            .second_frame_conv
-            .forward(&second_frame.contiguous()?)?
-            .reshape(((), self.embed_dim))?;
-        // Concatenate on temporal dimension
-        let combined = (first_frame + second_frame)?.unsqueeze(2)?;
-
-        // Reshape to (batch_size, embed_dim)
-        combined.reshape(((), self.embed_dim))
+        let out = self.conv.forward(&x);
+        Ok(out
+            .reshape([
+                out.shape().iter().product::<usize>() / self.embed_dim,
+                self.embed_dim,
+            ])
+            .to_concrete())
     }
 }
 
-fn split_frames(x: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
-    let first_frame = x.i((.., .., 0, .., ..))?;
-    let second_frame = x.i((.., .., 1, .., ..))?;
-    Ok((first_frame, second_frame))
-}
-
-#[test]
-fn test_vision_patch_embed() {
-    use candle_core::{DType, Device};
+#[cfg(test)]
+#[tokio::test]
+async fn test_vision_patch_embed() {
+    use fusor::ToVec2;
 
     let embed_dim = 4;
     let in_channels = 3;
     let temporal_patch_size = 2;
     let patch_size = 2;
 
-    let dims = [
-        embed_dim,
-        in_channels,
-        temporal_patch_size,
-        patch_size,
-        patch_size,
-    ];
     let weights = [
         [
             [
@@ -177,46 +208,38 @@ fn test_vision_patch_embed() {
         ],
     ];
 
-    let weight = Tensor::from_iter(
-        weights.into_iter().flatten().flatten().flatten().flatten(),
-        &Device::Cpu,
-    )
-    .unwrap()
-    .reshape(&dims)
-    .unwrap();
-    let (weight_1, weight_2) = split_frames(&weight).unwrap();
+    let device = Device::new().await.unwrap();
 
-    let patch_embed = Qwen2_5VisionPatchEmbed::from_weight(
+    let weight = Tensor::new(&device, &weights);
+
+    let patch_embed = Qwen2_5VisionPatchEmbed {
         patch_size,
         temporal_patch_size,
         in_channels,
         embed_dim,
-        &weight_1,
-        &weight_2,
-    )
-    .unwrap();
+        conv: Conv3d::new(
+            weight,
+            None,
+            Conv3dConfig {
+                stride: patch_size,
+                ..Default::default()
+            },
+        ),
+    };
 
     let input = [[
         [[[0., 1.], [2., 3.]], [[4., 5.], [6., 7.]]],
         [[[8., 9.], [10., 11.]], [[12., 13.], [14., 15.]]],
         [[[16., 17.], [18., 19.]], [[20., 21.], [22., 23.]]],
     ]];
-    let input = Tensor::from_iter(
-        input.into_iter().flatten().flatten().flatten().flatten(),
-        &Device::Cpu,
-    )
-    .unwrap()
-    .reshape(&[1, in_channels, temporal_patch_size, patch_size, patch_size])
-    .unwrap()
-    .to_dtype(DType::F32)
-    .unwrap();
+    let input = Tensor::new(&device, &input);
 
     let output = patch_embed
-        .forward(&input)
+        .forward(&input.reshape((1, ())).to_concrete())
         .unwrap()
-        .to_dtype(DType::F32)
-        .unwrap();
-    let output_vec = output.to_vec2::<f32>().unwrap();
+        .cast::<f32>();
+    let output_slice = output.as_slice().await.unwrap();
+    let output_vec = output_slice.to_vec2();
     println!("Output: {output_vec:?}");
     let expected_output = [[0.3058, 0.6866, -0.7391, -0.6952]];
     assert_2d_vec_eq(output_vec, expected_output, 1e-2);

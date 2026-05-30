@@ -114,6 +114,7 @@ Even with a relatively small dataset, a classifier built on top of an embedding 
 ```rust, no_run
 # use kalosm::language::*;
 # use kalosm_learning::*;
+# use kalosm_common::accelerated_device_if_available;
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[derive(Debug, Clone, Copy, Class)]
@@ -189,6 +190,7 @@ Next, train a classifier on the dataset:
 ```rust, no_run
 # use kalosm::language::*;
 # use kalosm_learning::*;
+# use kalosm_common::accelerated_device_if_available;
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 # #[derive(Debug, Clone, Copy, Class)]
@@ -226,7 +228,7 @@ Next, train a classifier on the dataset:
 #     "The city with the most people in the world is Tokyo",
 #     "The most spoken language in the United States is English",
 # ];
-# 
+#
 # for question in QUESTIONS {
 #     dataset.add(question, SentenceType::Question).await?;
 # }

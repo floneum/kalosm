@@ -3,17 +3,17 @@ mod denoise;
 #[cfg(feature = "denoise")]
 pub use denoise::*;
 
-#[cfg(feature = "voice_detection")]
+#[cfg(feature = "voice-detection")]
 mod voice_audio_detector;
-#[cfg(feature = "voice_detection")]
+#[cfg(feature = "voice-detection")]
 pub use voice_audio_detector::*;
 
-#[cfg(any(feature = "voice_detection", feature = "denoise"))]
+#[cfg(any(feature = "voice-detection", feature = "denoise"))]
 mod voice_audio_detector_ext;
-#[cfg(any(feature = "voice_detection", feature = "denoise"))]
+#[cfg(any(feature = "voice-detection", feature = "denoise"))]
 pub use voice_audio_detector_ext::*;
 
-#[cfg(feature = "voice_detection")]
+#[cfg(feature = "denoise")]
 mod transcribe;
-#[cfg(feature = "voice_detection")]
+#[cfg(feature = "denoise")]
 pub use transcribe::*;

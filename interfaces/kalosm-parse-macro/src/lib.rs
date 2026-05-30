@@ -136,32 +136,38 @@ use syn::{DataEnum, Fields, FieldsNamed, LitInt, Path, TypePath, Variant};
 ///     Quit,
 /// }
 /// ```
-#[proc_macro_derive(Parse, attributes(parse))]
-pub fn derive_parse(input: TokenStream) -> TokenStream {
-    // Parse the input tokens into a syntax tree
-    let input = parse_macro_input!(input as DeriveInput);
-
+/// Shared `derive_parse` / `derive_schema` scaffolding. Walks
+/// `input.data` to the right leaf (unit struct, named struct, unit enum,
+/// data enum) and delegates to the caller-supplied leaf builder. Both
+/// derive entry points were ~60 lines of identical match scaffolding
+/// differing only in which leaf builder they pick.
+///
+/// `unit_struct` handles both `syn::Fields::Unit` and named-but-empty
+/// structs; the `is_empty_named` flag tells the closure which one it is
+/// (the original `derive_parse` used `Self {}` vs `Self` for the constructor).
+fn dispatch_derive(
+    input: DeriveInput,
+    unit_struct: impl FnOnce(&[syn::Attribute], &Ident, bool) -> TokenStream2,
+    named_struct: impl FnOnce(StructParser) -> TokenStream2,
+    unit_enum: impl FnOnce(Vec<syn::Attribute>, DataEnum, Ident) -> TokenStream2,
+    data_enum: impl FnOnce(EnumParser) -> syn::Result<TokenStream2>,
+) -> TokenStream {
     match input.data {
         syn::Data::Struct(data) => match data.fields {
             syn::Fields::Named(fields) => {
                 let ty = input.ident;
                 if fields.named.is_empty() {
-                    return TokenStream::from(impl_unit_parser(
-                        &input.attrs,
-                        &ty,
-                        quote! { Self {} },
-                    ));
+                    return TokenStream::from(unit_struct(&input.attrs, &ty, true));
                 }
                 let struct_parser = match StructParser::new(input.attrs, fields, ty) {
                     Ok(parser) => parser,
                     Err(err) => return err.to_compile_error().into(),
                 };
-
-                TokenStream::from(struct_parser.parser())
+                TokenStream::from(named_struct(struct_parser))
             }
             syn::Fields::Unit => {
                 let ty = input.ident;
-                TokenStream::from(impl_unit_parser(&input.attrs, &ty, quote! { Self }))
+                TokenStream::from(unit_struct(&input.attrs, &ty, false))
             }
             _ => syn::Error::new(
                 input.ident.span(),
@@ -184,14 +190,12 @@ pub fn derive_parse(input: TokenStream) -> TokenStream {
                 .any(|variant| !matches!(&variant.fields, syn::Fields::Unit));
 
             if has_fields {
-                match EnumParser::new(input.attrs, data, ty)
-                    .and_then(|parser| parser.quote_parser())
-                {
+                match EnumParser::new(input.attrs, data, ty).and_then(data_enum) {
                     Ok(parser) => parser,
                     Err(err) => err.to_compile_error(),
                 }
             } else {
-                unit_enum_parser(input.attrs, data, ty)
+                unit_enum(input.attrs, data, ty)
             }
             .into()
         }
@@ -204,68 +208,35 @@ pub fn derive_parse(input: TokenStream) -> TokenStream {
     }
 }
 
+#[proc_macro_derive(Parse, attributes(parse))]
+pub fn derive_parse(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    dispatch_derive(
+        input,
+        |attrs, ty, is_empty_named| {
+            let construct = if is_empty_named {
+                quote! { Self {} }
+            } else {
+                quote! { Self }
+            };
+            impl_unit_parser(attrs, ty, construct)
+        },
+        |sp| sp.parser(),
+        unit_enum_parser,
+        |ep| ep.quote_parser(),
+    )
+}
+
 #[proc_macro_derive(Schema, attributes(parse))]
 pub fn derive_schema(input: TokenStream) -> TokenStream {
-    // Parse the input tokens into a syntax tree
     let input = parse_macro_input!(input as DeriveInput);
-
-    match input.data {
-        syn::Data::Struct(data) => match data.fields {
-            syn::Fields::Named(fields) => {
-                let ty = input.ident;
-                if fields.named.is_empty() {
-                    return TokenStream::from(unit_schema(&input.attrs, &ty));
-                }
-                let struct_parser = match StructParser::new(input.attrs, fields, ty) {
-                    Ok(parser) => parser,
-                    Err(err) => return err.to_compile_error().into(),
-                };
-
-                TokenStream::from(struct_parser.quote_schema())
-            }
-            syn::Fields::Unit => {
-                let ty = input.ident;
-                TokenStream::from(unit_schema(&input.attrs, &ty))
-            }
-            _ => syn::Error::new(
-                input.ident.span(),
-                "Only structs with named fields are supported",
-            )
-            .to_compile_error()
-            .into(),
-        },
-        syn::Data::Enum(data) => {
-            let ty = input.ident;
-            if data.variants.is_empty() {
-                return syn::Error::new(ty.span(), "Enums with no variants are not supported")
-                    .to_compile_error()
-                    .into();
-            }
-
-            let has_fields = data
-                .variants
-                .iter()
-                .any(|variant| !matches!(&variant.fields, syn::Fields::Unit));
-
-            if has_fields {
-                match EnumParser::new(input.attrs, data, ty)
-                    .and_then(|parser| parser.quote_schema())
-                {
-                    Ok(parser) => parser,
-                    Err(err) => err.to_compile_error(),
-                }
-            } else {
-                unit_enum_schema(data, ty)
-            }
-            .into()
-        }
-        _ => syn::Error::new(
-            input.ident.span(),
-            "Only structs and unit value enums are supported",
-        )
-        .to_compile_error()
-        .into(),
-    }
+    dispatch_derive(
+        input,
+        |attrs, ty, _is_empty_named| unit_schema(attrs, ty),
+        |sp| sp.quote_schema(),
+        |_attrs, data, ty| unit_enum_schema(data, ty),
+        |ep| ep.quote_schema(),
+    )
 }
 
 struct StructParser {
@@ -1294,19 +1265,19 @@ impl Parse for ParserType {
 #[test]
 fn type_parses() {
     assert!(matches!(
-        dbg!(syn::parse2::<ParserType>(quote! { String })).unwrap(),
+        syn::parse2::<ParserType>(quote! { String }).unwrap(),
         ParserType::String(_)
     ));
     assert!(matches!(
-        dbg!(syn::parse2::<ParserType>(quote! { std::string::String })).unwrap(),
+        syn::parse2::<ParserType>(quote! { std::string::String }).unwrap(),
         ParserType::String(_)
     ));
     assert!(matches!(
-        dbg!(syn::parse2::<ParserType>(quote! { i32 })).unwrap(),
+        syn::parse2::<ParserType>(quote! { i32 }).unwrap(),
         ParserType::Integer(_)
     ));
     assert!(matches!(
-        dbg!(syn::parse2::<ParserType>(quote! { f32 })).unwrap(),
+        syn::parse2::<ParserType>(quote! { f32 }).unwrap(),
         ParserType::Number(_)
     ));
 }

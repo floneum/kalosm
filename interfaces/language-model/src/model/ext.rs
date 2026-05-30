@@ -5,6 +5,7 @@ use futures_util::FutureExt;
 use futures_util::Stream;
 use futures_util::StreamExt;
 use std::any::Any;
+#[cfg(not(target_arch = "wasm32"))]
 use std::error::Error;
 use std::future::IntoFuture;
 use std::pin::Pin;
@@ -14,12 +15,30 @@ use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::task::Poll;
 
+// On wasm32, futures don't need to be Send, and Box<dyn Any> doesn't need Send
+#[cfg(not(target_arch = "wasm32"))]
+type BoxedTaskFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+#[cfg(target_arch = "wasm32")]
+type BoxedTaskFuture = Pin<Box<dyn Future<Output = ()>>>;
+
+#[cfg(not(target_arch = "wasm32"))]
+type BoxedAny = Box<dyn Any + Send>;
+#[cfg(target_arch = "wasm32")]
+type BoxedAny = Box<dyn Any>;
+
+#[cfg(not(target_arch = "wasm32"))]
+type BoxedIntoFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+#[cfg(target_arch = "wasm32")]
+type BoxedIntoFuture<T> = Pin<Box<dyn Future<Output = T>>>;
+
 use crate::GenerationParameters;
 use crate::MessageContent;
 use crate::ModelConstraints;
 use crate::NoConstraints;
 
+#[cfg(not(target_arch = "wasm32"))]
 use super::BoxedStructuredTextCompletionModel;
+#[cfg(not(target_arch = "wasm32"))]
 use super::BoxedTextCompletionModel;
 use super::CreateDefaultCompletionConstraintsForType;
 use super::CreateTextCompletionSession;
@@ -48,6 +67,7 @@ pub trait TextCompletionModelExt: CreateTextCompletionSession {
 
     /// Erase the type of the text completion model. This can be used to make multiple implementations of
     /// [`TextCompletionModel`] compatible with the same type.
+    #[cfg(not(target_arch = "wasm32"))]
     fn boxed_completion_model(self) -> BoxedTextCompletionModel
     where
         Self: TextCompletionModel<
@@ -67,6 +87,7 @@ pub trait TextCompletionModelExt: CreateTextCompletionSession {
 
     /// Erase the type of the structured text completion model. This can be used to make multiple implementations of
     /// [`StructuredTextCompletionModel`] compatible with the same type.
+    #[cfg(not(target_arch = "wasm32"))]
     fn boxed_typed_completion_model<T>(self) -> BoxedStructuredTextCompletionModel<T>
     where
         Self: StructuredTextCompletionModel<
@@ -136,9 +157,9 @@ pub struct TextCompletionBuilder<
     model: Option<M>,
     constraints: Option<Constraints>,
     sampler: Option<Sampler>,
-    task: OnceLock<RwLock<Pin<Box<dyn Future<Output = ()> + Send>>>>,
+    task: OnceLock<RwLock<BoxedTaskFuture>>,
     #[allow(clippy::type_complexity)]
-    result: Option<Receiver<Result<Box<dyn Any + Send>, M::Error>>>,
+    result: Option<Receiver<Result<BoxedAny, M::Error>>>,
     queued_tokens: Option<UnboundedReceiver<String>>,
 }
 
@@ -233,9 +254,9 @@ impl<M: CreateTextCompletionSession, Constraints, Sampler>
     /// # #[tokio::main]
     /// # async fn main() {
     /// let model = Llama::new().await.unwrap();
-    /// // Create the sampler to use for the text completion
-    /// let sampler = GenerationParameters::default().sampler();
-    /// // Create a completion request with the sampler
+    /// // Create the generation parameters to use for the text completion
+    /// let sampler = GenerationParameters::default().with_temperature(0.8);
+    /// // Create a completion request with the generation parameters
     /// let mut stream = model
     ///     .complete("Here is a list of 5 primes: ")
     ///     .with_sampler(sampler);
@@ -275,7 +296,7 @@ where
                 .sampler
                 .take()
                 .expect("TextCompletionBuilder cannot be turned into a future twice");
-            let (mut tx, rx) = futures_channel::mpsc::unbounded();
+            let (tx, rx) = futures_channel::mpsc::unbounded();
             let (result_tx, result_rx) = futures_channel::oneshot::channel();
             self.queued_tokens = Some(rx);
             self.result = Some(result_rx);
@@ -284,7 +305,7 @@ where
                 let all_text = all_text.clone();
                 move |tok: String| {
                     all_text.lock().unwrap().push_str(&tok);
-                    _ = tx.start_send(tok);
+                    _ = tx.unbounded_send(tok);
                     Ok(())
                 }
             };
@@ -295,10 +316,10 @@ where
                     .await?;
                 let mut all_text = all_text.lock().unwrap();
                 let all_text = std::mem::take(&mut *all_text);
-                Ok(Box::new(all_text) as Box<dyn Any + Send>)
+                Ok(Box::new(all_text) as BoxedAny)
             };
             let wrapped = async move {
-                let result: Result<Box<dyn Any + Send>, M::Error> = future.await;
+                let result: Result<BoxedAny, M::Error> = future.await;
                 _ = result_tx.send(result);
             };
             let task = Box::pin(wrapped);
@@ -323,11 +344,13 @@ where
     ) -> std::task::Poll<Option<Self::Item>> {
         let myself = Pin::get_mut(self);
         myself.ensure_unstructured_task_started();
-        {
-            if let Some(token) = &mut myself.queued_tokens {
-                if let Poll::Ready(Some(token)) = token.poll_next_unpin(cx) {
+        if let Some(token) = &mut myself.queued_tokens {
+            match token.poll_next_unpin(cx) {
+                Poll::Ready(Some(token)) => {
                     return Poll::Ready(Some(token));
                 }
+                Poll::Ready(None) => {}
+                Poll::Pending => {}
             }
         }
         let mut task = myself.task.get().unwrap().write().unwrap();
@@ -342,7 +365,7 @@ where
     M::Session: Clone + Send + Sync + Unpin + 'static,
 {
     type Output = Result<String, M::Error>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+    type IntoFuture = BoxedIntoFuture<Self::Output>;
 
     fn into_future(mut self) -> Self::IntoFuture {
         self.ensure_unstructured_task_started();
@@ -380,12 +403,12 @@ where
                 .constraints
                 .take()
                 .expect("TextCompletionBuilder cannot be turned into a future twice");
-            let (mut tx, rx) = futures_channel::mpsc::unbounded();
+            let (tx, rx) = futures_channel::mpsc::unbounded();
             let (result_tx, result_rx) = futures_channel::oneshot::channel();
             self.queued_tokens = Some(rx);
             self.result = Some(result_rx);
             let on_token = move |tok: String| {
-                _ = tx.start_send(tok);
+                _ = tx.unbounded_send(tok);
                 Ok(())
             };
             let future = async move {
@@ -399,10 +422,10 @@ where
                         on_token,
                     )
                     .await
-                    .map(|value| Box::new(value) as Box<dyn Any + Send>)
+                    .map(|value| Box::new(value) as BoxedAny)
             };
             let wrapped = async move {
-                let result: Result<Box<dyn Any + Send>, M::Error> = future.await;
+                let result: Result<BoxedAny, M::Error> = future.await;
                 _ = result_tx.send(result);
             };
             let task = Box::pin(wrapped);
@@ -450,7 +473,7 @@ where
     Constraints::Output: Send + 'static,
 {
     type Output = Result<Constraints::Output, M::Error>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+    type IntoFuture = BoxedIntoFuture<Self::Output>;
 
     fn into_future(mut self) -> Self::IntoFuture {
         self.ensure_structured_task_started();

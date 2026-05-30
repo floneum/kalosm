@@ -3,10 +3,11 @@ use crate::{CreateParserState, ParseStatus, Parser};
 type CharFilter = fn(char) -> bool;
 
 /// A parser that parses until a literal is found.
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct StopOn<S: AsRef<str> = &'static str, F: Fn(char) -> bool + 'static = CharFilter> {
     literal: S,
     character_filter: F,
+    len_range: std::ops::RangeInclusive<usize>,
 }
 
 impl<S: AsRef<str>> CreateParserState for StopOn<S> {
@@ -20,6 +21,7 @@ impl<S: AsRef<str>> From<S> for StopOn<S> {
         Self {
             literal,
             character_filter: |_| true,
+            len_range: 0..=usize::MAX,
         }
     }
 }
@@ -30,6 +32,7 @@ impl<S: AsRef<str>> StopOn<S> {
         Self {
             literal,
             character_filter: |_| true,
+            len_range: 0..=usize::MAX,
         }
     }
 }
@@ -40,7 +43,14 @@ impl<S: AsRef<str>, F: Fn(char) -> bool + 'static> StopOn<S, F> {
         StopOn {
             literal: self.literal,
             character_filter,
+            len_range: self.len_range,
         }
+    }
+
+    /// Set the length range of the parsed text (excluding the stop literal).
+    pub fn with_length(mut self, len_range: std::ops::RangeInclusive<usize>) -> Self {
+        self.len_range = len_range;
+        self
     }
 
     /// Get the literal that this parser stops on.
@@ -90,7 +100,9 @@ impl<S: AsRef<str>, F: Fn(char) -> bool + 'static> Parser for StopOn<S, F> {
         let mut new_offset = state.offset;
         let mut text = state.text.clone();
 
-        let input_str = std::str::from_utf8(input).unwrap();
+        let Ok(input_str) = std::str::from_utf8(input) else {
+            crate::bail!(StopOnParseError);
+        };
         let literal_length = self.literal.as_ref().len();
         let mut literal_iter = self.literal.as_ref()[state.offset..].chars();
 
@@ -106,6 +118,11 @@ impl<S: AsRef<str>, F: Fn(char) -> bool + 'static> Parser for StopOn<S, F> {
 
                 if new_offset == literal_length {
                     text += std::str::from_utf8(&input[..i + 1]).unwrap();
+                    // Check if the content length (excluding the stop literal) is within range
+                    let content_len = text.len() - literal_length;
+                    if !self.len_range.contains(&content_len) {
+                        crate::bail!(StopOnParseError);
+                    }
                     return Ok(ParseStatus::Finished {
                         result: text,
                         remaining: &input[i + 1..],
@@ -114,6 +131,12 @@ impl<S: AsRef<str>, F: Fn(char) -> bool + 'static> Parser for StopOn<S, F> {
             } else {
                 literal_iter = self.literal.as_ref()[state.offset..].chars();
                 new_offset = 0;
+            }
+
+            // Check if the content length (excluding partial literal match) exceeds max
+            let current_content_len = text.len() + i + 1 - new_offset;
+            if current_content_len > *self.len_range.end() {
+                crate::bail!(StopOnParseError);
             }
         }
 
@@ -182,6 +205,39 @@ fn literal_parser() {
                 text: "Goodbye, world!".into()
             },
             required_next: "".into()
+        })
+    );
+}
+
+#[test]
+fn stop_on_with_length() {
+    // Test with max length of 5 (content before the stop literal)
+    let parser = StopOn::new("!").with_length(0..=5);
+    let state = StopOnOffset::default();
+
+    // "Hello" is 5 chars, should succeed
+    assert_eq!(
+        parser.parse(&state, b"Hello!"),
+        Ok(ParseStatus::Finished {
+            result: "Hello!".to_string(),
+            remaining: &[]
+        })
+    );
+
+    // "Helloo" is 6 chars of content before "!", should fail
+    assert!(parser.parse(&state, b"Helloo!").is_err());
+
+    // Test min length
+    let parser = StopOn::new("!").with_length(3..=10);
+    // "Hi" is only 2 chars, should fail
+    assert!(parser.parse(&state, b"Hi!").is_err());
+
+    // "Hey" is 3 chars, should succeed
+    assert_eq!(
+        parser.parse(&state, b"Hey!"),
+        Ok(ParseStatus::Finished {
+            result: "Hey!".to_string(),
+            remaining: &[]
         })
     );
 }

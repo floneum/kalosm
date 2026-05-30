@@ -33,9 +33,8 @@ use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_util::{Stream, StreamExt};
 use image::ImageBuffer;
 use kalosm_common::{Cache, CacheError};
-use kalosm_language_model::ModelBuilder;
-use kalosm_model_types::FileSource;
 pub use kalosm_model_types::ModelLoadingProgress;
+use kalosm_model_types::{FileSource, ModelBuilder};
 
 use model::{WuerstcheModelSettings, WuerstchenInner};
 

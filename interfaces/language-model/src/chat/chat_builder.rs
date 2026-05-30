@@ -2,13 +2,13 @@ use crate::GenerationParameters;
 use crate::ModelConstraints;
 use crate::NoConstraints;
 use crate::ToChatMessage;
-use async_lock::Mutex as AsyncMutex;
 use futures_channel::mpsc::UnboundedReceiver;
 use futures_channel::oneshot::Receiver;
 use futures_util::Future;
 use futures_util::FutureExt;
 use futures_util::Stream;
 use futures_util::StreamExt;
+use kalosm_model_types::{WasmNotSend, WasmNotSendSync};
 use std::any::Any;
 use std::fmt::Debug;
 use std::future::IntoFuture;
@@ -21,6 +21,22 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::task::Poll;
+
+// On wasm32, futures don't need to be Send, and Box<dyn Any> doesn't need Send
+#[cfg(not(target_arch = "wasm32"))]
+type BoxedTaskFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+#[cfg(target_arch = "wasm32")]
+type BoxedTaskFuture = Pin<Box<dyn Future<Output = ()>>>;
+
+#[cfg(not(target_arch = "wasm32"))]
+type BoxedAny = Box<dyn Any + Send>;
+#[cfg(target_arch = "wasm32")]
+type BoxedAny = Box<dyn Any>;
+
+#[cfg(not(target_arch = "wasm32"))]
+type BoxedIntoFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+#[cfg(target_arch = "wasm32")]
+type BoxedIntoFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 use super::ChatMessage;
 use super::ChatModel;
@@ -36,8 +52,12 @@ use super::StructuredChatModel;
 #[doc = include_str!("../../docs/chat.md")]
 pub struct Chat<M: CreateChatSession> {
     model: Arc<M>,
-    #[allow(clippy::type_complexity)]
-    session: OnceLock<Result<Arc<AsyncMutex<M::ChatSession>>, M::Error>>,
+    /// The current session, or `None` if it has not been initialized yet or has
+    /// been moved into an in-flight [`ChatResponseBuilder`]. Initialized lazily
+    /// on first use. If a generation future fails or is dropped mid-stream,
+    /// this slot stays `None` and the next call will re-initialize via
+    /// [`CreateChatSession::new_chat_session`].
+    session: Option<Result<M::ChatSession, M::Error>>,
     queued_messages: Vec<ChatMessage>,
 }
 
@@ -54,20 +74,17 @@ impl<M: CreateChatSession> Clone for Chat<M> {
     fn clone(&self) -> Self {
         let model = self.model.clone();
         let mut queued_messages = self.queued_messages.clone();
-        let session = OnceLock::new();
-        if let Some(Ok(old_session)) = self.session.get() {
-            #[cfg(target_arch = "wasm32")]
-            let old_session = old_session.try_lock().unwrap();
-            #[cfg(not(target_arch = "wasm32"))]
-            let old_session = old_session.lock_blocking();
-            if let Ok(old_session) = old_session.try_clone() {
-                session
-                    .set(Ok(Arc::new(AsyncMutex::new(old_session))))
-                    .unwrap_or_else(|_| panic!("Chat session should be empty initially"));
-            } else {
-                queued_messages.extend_from_slice(&old_session.history());
-            }
-        }
+        let session = match self.session.as_ref() {
+            Some(Ok(old_session)) => match old_session.try_clone() {
+                Ok(cloned) => Some(Ok(cloned)),
+                Err(_) => {
+                    queued_messages.extend_from_slice(&old_session.history());
+                    None
+                }
+            },
+            // Session in flight (None) or previously failed (Some(Err)) — start fresh.
+            _ => None,
+        };
 
         Self {
             session,
@@ -94,7 +111,7 @@ impl<M: CreateChatSession> Chat<M> {
     pub fn new(model: M) -> Chat<M> {
         Self {
             model: Arc::new(model),
-            session: OnceLock::new(),
+            session: None,
             queued_messages: Vec::new(),
         }
     }
@@ -115,13 +132,11 @@ impl<M: CreateChatSession> Chat<M> {
     /// ```
     pub fn with_system_prompt(mut self, system_prompt: impl ToString) -> Self {
         #[cfg(debug_assertions)]
-        if let Some(Ok(session)) = self.session.get() {
-            if let Some(session) = session.try_lock() {
-                let mut existing_history = session.history();
-                existing_history.extend_from_slice(&self.queued_messages);
-                if !existing_history.is_empty() {
-                    tracing::error!("System prompt should be the first message in the history. System prompt was added to the end of the history: {:?}", existing_history);
-                }
+        if let Some(Ok(session)) = self.session.as_ref() {
+            let mut existing_history = session.history();
+            existing_history.extend_from_slice(&self.queued_messages);
+            if !existing_history.is_empty() {
+                tracing::error!("System prompt should be the first message in the history. System prompt was added to the end of the history: {:?}", existing_history);
             }
         }
 
@@ -142,10 +157,11 @@ impl<M: CreateChatSession> Chat<M> {
     /// # #[tokio::main]
     /// # async fn main() {
     /// let model = Llama::new_chat().await.unwrap();
-    /// // Load the model session from the filesystem
-    /// let session =
-    ///     LlamaChatSession::from_bytes(std::fs::read("chat.llama").unwrap().as_slice()).unwrap();
-    /// // Start the chat session with the cached session
+    /// // Get a session from an existing chat
+    /// let mut old_chat = model.chat();
+    /// old_chat(&"Hello!").to_std_out().await.unwrap();
+    /// let session = old_chat.session().unwrap().try_clone().unwrap();
+    /// // Start a new chat session with the cloned session
     /// let mut chat = model.chat().with_session(session);
     /// # }
     /// ```
@@ -156,9 +172,8 @@ impl<M: CreateChatSession> Chat<M> {
         self.queued_messages = existing_history;
 
         // Set the new chat session
-        self.session
-            .set(Ok(Arc::new(AsyncMutex::new(session))))
-            .unwrap_or_else(|_| panic!("Chat session already set"));
+        assert!(self.session.is_none(), "Chat session already set");
+        self.session = Some(Ok(session));
 
         self
     }
@@ -233,41 +248,18 @@ impl<M: CreateChatSession> Chat<M> {
         }
     }
 
-    fn session_clone(&mut self) -> Result<Arc<AsyncMutex<M::ChatSession>>, M::Error> {
-        let session = self.session.get_or_init(|| {
-            self.model
-                .new_chat_session()
-                .map(|session| Arc::new(AsyncMutex::new(session)))
-        });
-
-        match session {
-            Ok(session) => Ok(session.clone()),
-            Err(_) => {
-                let session_owned = self.session.take().unwrap();
-                match session_owned {
-                    Ok(_) => unreachable!(),
-                    Err(session_err) => Err(session_err),
-                }
-            }
-        }
+    /// Take the session out of the chat, initializing it lazily if necessary.
+    /// Returns `Err(M::Error)` if initialization failed; the error is consumed
+    /// and the slot is left empty so future calls can retry.
+    fn session_take(&mut self) -> Result<M::ChatSession, M::Error> {
+        self.session
+            .take()
+            .unwrap_or_else(|| self.model.new_chat_session())
     }
 
-    /// Get a reference to the chat session or an error if the session failed to load.
+    /// Get a reference to the chat session, initializing it if needed.
     ///
-    /// You can use the session to save the chat for later:
-    /// ```rust, no_run
-    /// # use kalosm::language::*;
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let model = Llama::new_chat().await.unwrap();
-    /// let mut chat = model.chat();
-    /// let session = chat.session().unwrap();
-    /// let bytes = session.to_bytes().unwrap();
-    /// std::fs::write("./chat.llama", bytes).unwrap();
-    /// # }
-    /// ```
-    ///
-    /// Or get the chat history:
+    /// You can use the session to get the chat history:
     /// ```rust, no_run
     /// # use kalosm::language::*;
     /// # #[tokio::main]
@@ -283,22 +275,11 @@ impl<M: CreateChatSession> Chat<M> {
     /// println!("{:?}", history);
     /// # }
     /// ```
-    pub fn session(&self) -> Result<impl Deref<Target = M::ChatSession> + use<'_, M>, &M::Error> {
-        match self
-            .session
-            .get_or_init(|| {
-                self.model
-                    .new_chat_session()
-                    .map(|session| Arc::new(AsyncMutex::new(session)))
-            })
-            .as_ref()
-        {
-            #[cfg(target_arch = "wasm32")]
-            Ok(session) => Ok(session.try_lock().unwrap()),
-            #[cfg(not(target_arch = "wasm32"))]
-            Ok(session) => Ok(session.lock_blocking()),
-            Err(err) => Err(err),
+    pub fn session(&mut self) -> Result<&M::ChatSession, &M::Error> {
+        if self.session.is_none() {
+            self.session = Some(self.model.new_chat_session());
         }
+        self.session.as_ref().unwrap().as_ref()
     }
 }
 
@@ -444,9 +425,9 @@ pub struct ChatResponseBuilder<
     chat_session: MaybeOwnedSession<'a, M>,
     constraints: Option<Constraints>,
     sampler: Option<Sampler>,
-    task: OnceLock<RwLock<Pin<Box<dyn Future<Output = ()> + Send>>>>,
+    task: OnceLock<RwLock<BoxedTaskFuture>>,
     #[allow(clippy::type_complexity)]
-    result: Option<Receiver<Result<Box<dyn Any + Send>, M::Error>>>,
+    result: Option<Receiver<Result<(M::ChatSession, BoxedAny), M::Error>>>,
     queued_tokens: Option<UnboundedReceiver<String>>,
 }
 
@@ -606,9 +587,9 @@ impl<'a, M: CreateChatSession, Constraints, Sampler>
 
 impl<M, Sampler> ChatResponseBuilder<'_, M, NoConstraints, Sampler>
 where
-    Sampler: Send + Unpin + 'static,
-    M: ChatModel<Sampler> + Send + Sync + Clone + Unpin + 'static,
-    M::ChatSession: Send + Sync + Unpin + 'static,
+    Sampler: WasmNotSend + Unpin + 'static,
+    M: ChatModel<Sampler> + WasmNotSendSync + Clone + Unpin + 'static,
+    M::ChatSession: WasmNotSendSync + Unpin + 'static,
 {
     fn ensure_unstructured_task_started(&mut self) {
         if self.task.get().is_none() {
@@ -630,20 +611,23 @@ where
                     Ok(())
                 }
             };
-            let session = self.chat_session.session_clone();
+            // Take ownership of the session — the slot stays `None` for the
+            // duration of generation. If the response is dropped mid-stream,
+            // the session is dropped with the future and the next call will
+            // re-initialize.
+            let session = self.chat_session.session_take();
             let model = self.chat_session.model.clone();
             let future = async move {
                 let session = session?;
-                let mut session = session.lock().await;
-                model
-                    .add_messages_with_callback(&mut session, &messages, sampler, on_token)
+                let updated = model
+                    .add_messages_with_callback(session, &messages, sampler, on_token)
                     .await?;
                 let mut all_text = all_text.lock().unwrap();
                 let all_text = std::mem::take(&mut *all_text);
-                Ok(Box::new(all_text) as Box<dyn Any + Send>)
+                Ok((updated, Box::new(all_text) as BoxedAny))
             };
             let wrapped = async move {
-                let result: Result<Box<dyn Any + Send>, M::Error> = future.await;
+                let result: Result<(M::ChatSession, BoxedAny), M::Error> = future.await;
                 _ = result_tx.send(result);
             };
             let task = Box::pin(wrapped);
@@ -656,10 +640,10 @@ where
 
 impl<M, Sampler> Stream for ChatResponseBuilder<'_, M, NoConstraints, Sampler>
 where
-    Sampler: Send + Unpin + 'static,
-    M: ChatModel<Sampler> + Send + Sync + Clone + Unpin + 'static,
-    M::ChatSession: Send + Sync + Unpin + 'static,
-    M::Error: Send + Sync + Unpin,
+    Sampler: WasmNotSend + Unpin + 'static,
+    M: ChatModel<Sampler> + WasmNotSendSync + Clone + Unpin + 'static,
+    M::ChatSession: WasmNotSendSync + Unpin + 'static,
+    M::Error: WasmNotSendSync + Unpin,
 {
     type Item = String;
 
@@ -680,6 +664,14 @@ where
         match task.poll_unpin(cx) {
             Poll::Ready(_) => {
                 *task = Box::pin(async move {});
+                drop(task);
+                // The result channel is ready as soon as the task completes.
+                // Pluck the updated session out and put it back into Chat.
+                if let Some(rx) = myself.result.as_mut() {
+                    if let Ok(Some(Ok((session, _)))) = rx.try_recv() {
+                        myself.chat_session.session = Some(Ok(session));
+                    }
+                }
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -689,12 +681,12 @@ where
 
 impl<'a, M, Sampler> IntoFuture for ChatResponseBuilder<'a, M, NoConstraints, Sampler>
 where
-    Sampler: Send + Unpin + 'static,
-    M: ChatModel<Sampler> + Send + Sync + Unpin + Clone + 'static,
-    M::ChatSession: Clone + Send + Sync + Unpin + 'static,
+    Sampler: WasmNotSend + Unpin + 'static,
+    M: ChatModel<Sampler> + WasmNotSendSync + Unpin + Clone + 'static,
+    M::ChatSession: Clone + WasmNotSendSync + Unpin + 'static,
 {
     type Output = Result<String, M::Error>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture = BoxedIntoFuture<'a, Self::Output>;
 
     fn into_future(mut self) -> Self::IntoFuture {
         self.ensure_unstructured_task_started();
@@ -702,18 +694,24 @@ where
         Box::pin(async move {
             self.task.into_inner().unwrap().into_inner().unwrap().await;
             let result = self.result.take().unwrap().await.unwrap();
-            result.map(|boxed| *boxed.downcast::<String>().unwrap())
+            match result {
+                Ok((session, boxed)) => {
+                    self.chat_session.session = Some(Ok(session));
+                    Ok(*boxed.downcast::<String>().unwrap())
+                }
+                Err(err) => Err(err),
+            }
         })
     }
 }
 
 impl<M, Constraints, Sampler> ChatResponseBuilder<'_, M, Constraints, Sampler>
 where
-    Constraints: ModelConstraints + Send + Sync + Unpin + 'static,
-    Sampler: Send + Unpin + 'static,
-    M: StructuredChatModel<Constraints, Sampler> + Send + Sync + Clone + Unpin + 'static,
-    M::ChatSession: Clone + Send + Sync + Unpin + 'static,
-    Constraints::Output: Send + 'static,
+    Constraints: ModelConstraints + WasmNotSendSync + Unpin + 'static,
+    Sampler: WasmNotSend + Unpin + 'static,
+    M: StructuredChatModel<Constraints, Sampler> + WasmNotSendSync + Clone + Unpin + 'static,
+    M::ChatSession: Clone + WasmNotSendSync + Unpin + 'static,
+    Constraints::Output: WasmNotSend + 'static,
 {
     fn ensure_structured_task_started(&mut self) {
         if self.task.get().is_none() {
@@ -734,24 +732,23 @@ where
                 _ = tx.start_send(tok);
                 Ok(())
             };
-            let session = self.chat_session.session_clone();
+            let session = self.chat_session.session_take();
             let model = self.chat_session.model.clone();
             let future = async move {
                 let session = session?;
-                let mut session = session.lock().await;
-                model
+                let (updated, value) = model
                     .add_message_with_callback_and_constraints(
-                        &mut session,
+                        session,
                         &messages,
                         sampler,
                         constraints,
                         on_token,
                     )
-                    .await
-                    .map(|value| Box::new(value) as Box<dyn Any + Send>)
+                    .await?;
+                Ok((updated, Box::new(value) as BoxedAny))
             };
             let wrapped = async move {
-                let result: Result<Box<dyn Any + Send>, M::Error> = future.await;
+                let result: Result<(M::ChatSession, BoxedAny), M::Error> = future.await;
                 _ = result_tx.send(result);
             };
             let task = Box::pin(wrapped);
@@ -764,12 +761,12 @@ where
 
 impl<M, Constraints, Sampler> Stream for ChatResponseBuilder<'_, M, Constraints, Sampler>
 where
-    Constraints: ModelConstraints + Send + Sync + Unpin + 'static,
-    Sampler: Send + Unpin + 'static,
-    M: StructuredChatModel<Constraints, Sampler> + Send + Sync + Clone + Unpin + 'static,
-    M::ChatSession: Clone + Send + Sync + Unpin + 'static,
-    M::Error: Send + Sync + Unpin,
-    Constraints::Output: Send + 'static,
+    Constraints: ModelConstraints + WasmNotSendSync + Unpin + 'static,
+    Sampler: WasmNotSend + Unpin + 'static,
+    M: StructuredChatModel<Constraints, Sampler> + WasmNotSendSync + Clone + Unpin + 'static,
+    M::ChatSession: Clone + WasmNotSendSync + Unpin + 'static,
+    M::Error: WasmNotSendSync + Unpin,
+    Constraints::Output: WasmNotSend + 'static,
 {
     type Item = String;
 
@@ -790,6 +787,12 @@ where
         match task.poll_unpin(cx) {
             Poll::Ready(_) => {
                 *task = Box::pin(async move {});
+                drop(task);
+                if let Some(rx) = myself.result.as_mut() {
+                    if let Ok(Some(Ok((session, _)))) = rx.try_recv() {
+                        myself.chat_session.session = Some(Ok(session));
+                    }
+                }
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -799,14 +802,14 @@ where
 
 impl<'a, M, Constraints, Sampler> IntoFuture for ChatResponseBuilder<'a, M, Constraints, Sampler>
 where
-    Constraints: ModelConstraints + Send + Sync + Unpin + 'static,
-    Sampler: Send + Unpin + 'static,
-    M: StructuredChatModel<Constraints, Sampler> + Send + Sync + Clone + Unpin + 'static,
-    M::ChatSession: Clone + Send + Sync + Unpin + 'static,
-    Constraints::Output: Send + 'static,
+    Constraints: ModelConstraints + WasmNotSendSync + Unpin + 'static,
+    Sampler: WasmNotSend + Unpin + 'static,
+    M: StructuredChatModel<Constraints, Sampler> + WasmNotSendSync + Clone + Unpin + 'static,
+    M::ChatSession: Clone + WasmNotSendSync + Unpin + 'static,
+    Constraints::Output: WasmNotSend + 'static,
 {
     type Output = Result<Constraints::Output, M::Error>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture = BoxedIntoFuture<'a, Self::Output>;
 
     fn into_future(mut self) -> Self::IntoFuture {
         self.ensure_structured_task_started();
@@ -814,7 +817,13 @@ where
         Box::pin(async move {
             self.task.into_inner().unwrap().into_inner().unwrap().await;
             let result = self.result.take().unwrap().await.unwrap();
-            result.map(|boxed| *boxed.downcast::<Constraints::Output>().unwrap())
+            match result {
+                Ok((session, boxed)) => {
+                    self.chat_session.session = Some(Ok(session));
+                    Ok(*boxed.downcast::<Constraints::Output>().unwrap())
+                }
+                Err(err) => Err(err),
+            }
         })
     }
 }

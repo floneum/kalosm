@@ -4,38 +4,56 @@
 
 pub use device::*;
 pub use element_wise::CastTensor;
-pub use layout::*;
+pub use fusor_gguf::GgufReadError;
+pub use fusor_tile_ir_kernels::PairedEpilogue;
+pub use fusor_types::{
+    Layout, SlidingWindow, StrideSpec, TILE_SIZE, TensorSlice, slice_shape, slice_strides,
+};
 pub use quantized::*;
 pub use rank::*;
 pub use reduce::*;
+pub use tensor::MappedBuffer;
 pub use tensor::*;
 
-pub(crate) use element_wise::*;
-pub use matmul::*;
-pub(crate) use pair_wise::*;
-pub use varbuilder::VarBuilder;
+#[cfg(feature = "graphvis")]
+pub use tabbycat;
 
-pub mod cache;
+// Re-export wasm-compatible Send/Sync traits
+pub use wgpu::{WasmNotSend, WasmNotSendSync, WasmNotSync};
+
+pub use matmul::*;
+pub use resize::ShapeWithOneHole;
+
 mod composite;
 mod compute_graph;
+pub use compute_graph::NodeIndex;
 mod device;
 mod element_wise;
+mod flash_attention;
+pub(crate) use flash_attention::{FlashAttentionInputs, FlashAttentionOperation};
 mod index_select;
-pub mod layers;
+#[doc(hidden)]
+pub mod kernel_selection;
 mod layout;
 mod map_layout;
 pub mod matmul;
 mod mir;
+mod nary_direct;
+mod nary_wise;
 mod pair_wise;
 mod quantized;
-mod quantized_types_wgsl;
 mod rank;
 mod reduce;
+mod reduce_direct;
+mod rms_norm;
+pub(crate) use rms_norm::RmsNormOperation;
 mod resize;
+mod sampling;
 mod slice_assign;
+mod softmax;
 mod tensor;
-mod util;
-mod varbuilder;
+mod top_k;
+pub use top_k::{GpuMirostat2Sampler, GpuMirostat2SamplerParams};
 mod visit_tiled;
 
 #[derive(thiserror::Error, Debug)]
@@ -44,7 +62,7 @@ pub enum Error {
     RequestDeviceError(#[from] wgpu::RequestDeviceError),
     #[error("GGUF error {0}")]
     GgufError(#[from] fusor_gguf::GgufReadError),
-    #[error("WGSL async buffer error {0}")]
+    #[error("Buffer async error {0}")]
     BufferAsyncError(#[from] wgpu::BufferAsyncError),
     #[error("VarBuilder error {0}")]
     VarBuilder(String),

@@ -184,14 +184,11 @@ impl OcrSource {
             let source = format!("Config ({})", self.model);
             let mut create_progress = ModelLoadingProgress::downloading_progress(source);
             let cache = Cache::default();
-            let config_filename = cache
-                .get(&self.config, |progress| handler(create_progress(progress)))
+            let config_bytes = cache
+                .get_bytes(&self.config, |progress| handler(create_progress(progress)))
                 .await?;
-            let config: Config = serde_json::from_reader(
-                std::fs::File::open(config_filename)
-                    .expect("FileSource::download should return a valid path"),
-            )
-            .map_err(LoadOcrError::LoadConfig)?;
+            let config: Config =
+                serde_json::from_slice(&config_bytes).map_err(LoadOcrError::LoadConfig)?;
             (config.encoder, config.decoder)
         };
 
@@ -205,12 +202,12 @@ impl OcrSource {
         let source = format!("Tokenizer ({})", self.tokenizer);
         let mut create_progress = ModelLoadingProgress::downloading_progress(source);
         let cache = Cache::default();
-        let tokenizer_filename = cache
-            .get(&self.tokenizer, |progress| {
+        let tokenizer = cache
+            .get_bytes(&self.tokenizer, |progress| {
                 handler(create_progress(progress))
             })
             .await?;
-        Tokenizer::from_file(&tokenizer_filename).map_err(LoadOcrError::LoadTokenizer)
+        Tokenizer::from_bytes(&tokenizer).map_err(LoadOcrError::LoadTokenizer)
     }
 }
 

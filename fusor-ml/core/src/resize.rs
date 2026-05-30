@@ -1,21 +1,22 @@
-use std::fmt::Write;
-
 use crate::{
-    DataTypeEnum, SmallerRank, TILE_SIZE, Tensor, TensorData,
-    compute_graph::AnyComputeKey,
+    DataTypeEnum, Layout, TILE_SIZE, Tensor, TensorData,
+    compute_graph::NodeIndex,
     map_layout::MapLayoutOperation,
     mir::{
-        kernel::GenericKernel,
+        inputs::MirValue,
+        kernel_backend::DirectKernel,
         operation::Operation,
-        workgroup_shape::{Constraint, WorkgroupShapeConstraints},
+        workgroup_shape::{Constraint, WorkgroupShape, WorkgroupShapeConstraints},
     },
+    nary_wise::{NaryExpr, NaryOp, NaryOperation, NaryScalar},
+    visit_tiled::distribute_workgroups,
 };
 
 const BLOCKSIZE: u32 = 256;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResizeOperation {
-    pub(crate) input: AnyComputeKey,
+    pub(crate) input: NodeIndex,
     pub(crate) current_shape: Box<[usize]>,
     pub(crate) new_shape: Box<[usize]>,
     pub(crate) fill_shape: Box<[usize]>,
@@ -23,7 +24,7 @@ pub(crate) struct ResizeOperation {
 
 impl ResizeOperation {
     pub fn new(
-        input: AnyComputeKey,
+        input: NodeIndex,
         current_shape: Box<[usize]>,
         new_shape: Box<[usize]>,
         fill_shape: Box<[usize]>,
@@ -49,8 +50,11 @@ impl ResizeOperation {
             return None;
         }
 
-        let input = graph.cached_results.get(&self.input)?;
+        let input = graph.get_cached_result(self.input)?;
         let input_layout = input.layout();
+        if !is_row_major_contiguous(input_layout) {
+            return None;
+        }
 
         // Find the chunks of strides that are contiguous in the input
         let mut contiguous_stride_chunks = Vec::new();
@@ -96,53 +100,65 @@ impl ResizeOperation {
         }
         new_strides.reverse();
 
-        Some(MapLayoutOperation::new(
-            self.input,
-            move |_| new_shape.clone(),
-            move |_, _| (offset, new_strides.as_slice().into()),
+        Some(MapLayoutOperation::new(self.input, move |_layout| {
+            Layout::from_parts(offset, new_shape.clone(), new_strides.as_slice().into())
+        }))
+    }
+
+    fn copy_expression(&self) -> Option<NaryExpr> {
+        let flat = row_major_flat_expr(&self.fill_shape)?;
+        let input_indices = row_major_indices_from_flat(flat, &self.current_shape)?;
+        Some(NaryExpr::indexed_input(0, input_indices))
+    }
+
+    fn in_fill_bounds_expression(&self) -> NaryExpr {
+        let mut condition = NaryExpr::scalar(NaryScalar::U32(1));
+        for (dim, &fill) in self.fill_shape.iter().enumerate() {
+            let lt_fill = NaryExpr::unary_op(
+                NaryExpr::DimIndex(dim),
+                "lt_fill",
+                NaryOp::LessConst(NaryScalar::U32(fill as u32)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            );
+            condition = NaryExpr::mul(condition, lt_fill, DataTypeEnum::U32);
+        }
+        condition
+    }
+
+    fn zero_expression(datatype: DataTypeEnum) -> NaryExpr {
+        let zero = match datatype {
+            DataTypeEnum::F32 => NaryScalar::F32(0.0),
+            DataTypeEnum::F16 => NaryScalar::F16(half::f16::from_f32(0.0)),
+            DataTypeEnum::U32 => NaryScalar::U32(0),
+        };
+        NaryExpr::scalar(zero)
+    }
+
+    fn expression(&self, datatype: DataTypeEnum) -> Option<NaryExpr> {
+        let copied = self.copy_expression()?;
+        if self.fill_shape == self.new_shape {
+            return Some(copied);
+        }
+        Some(NaryExpr::select(
+            self.in_fill_bounds_expression(),
+            copied,
+            Self::zero_expression(datatype),
+            DataTypeEnum::U32,
+            datatype,
         ))
     }
+}
 
-    fn kernel(
-        &self,
-        input_rank: u32,
-        datatype: DataTypeEnum,
-        tile_size: u32,
-        kernel: &mut GenericKernel,
-    ) {
-        let global_id = kernel.global_id();
-        let input = kernel.add_tensor_input(input_rank, true, datatype);
-        let output = kernel.add_tensor_input(self.new_shape.len() as u32, true, datatype);
-
-        for local_index in 0..tile_size {
-            writeln!(kernel, "{{").unwrap();
-            for (prefix, tensor) in [("input", &input), ("output", &output)] {
-                writeln!(
-                    kernel,
-                    "var {prefix}_remaining_index = {global_id}.x * {tile_size} + {local_index};"
-                )
-                .unwrap();
-                for i in (0..tensor.rank()).rev() {
-                    let shape_i = tensor.shape_binding(i);
-                    writeln!(
-                        kernel,
-                        "let {prefix}_index_{i} = {prefix}_remaining_index % {shape_i};",
-                    )
-                    .unwrap();
-                    writeln!(kernel, "{prefix}_remaining_index /= {shape_i};",).unwrap();
-                }
-            }
-            write!(kernel, "let input_index = ").unwrap();
-            input.strided_index(kernel, (0..).map(|i| format!("input_index_{i}")));
-            writeln!(kernel, ";").unwrap();
-            write!(kernel, "let output_index = ").unwrap();
-            output.strided_index(kernel, (0..).map(|i| format!("output_index_{i}")));
-            writeln!(kernel, ";").unwrap();
-            writeln!(kernel, "{output}[output_index] = {input}[input_index];").unwrap();
-
-            writeln!(kernel, "}}").unwrap();
+fn is_row_major_contiguous(layout: &Layout) -> bool {
+    let mut expected_stride = 1usize;
+    for (dim, stride) in layout.shape().iter().zip(layout.strides()).rev() {
+        if *dim > 1 && *stride != expected_stride {
+            return false;
         }
+        expected_stride = expected_stride.saturating_mul(*dim);
     }
+    true
 }
 
 impl Operation for ResizeOperation {
@@ -162,16 +178,19 @@ impl Operation for ResizeOperation {
         _: &crate::mir::workgroup_shape::WorkgroupShape,
         inputs: &[crate::mir::inputs::MirValue],
     ) -> [u32; 3] {
-        let input = inputs[1].as_tensor().unwrap();
-        [
-            (input.layout().shape().iter().product::<usize>() as u32)
-                .div_ceil(TILE_SIZE * BLOCKSIZE),
-            1,
-            1,
-        ]
+        let output = inputs[1].as_tensor().unwrap();
+        let total_workgroups = (output.layout().shape().iter().product::<usize>() as u32)
+            .div_ceil(TILE_SIZE * BLOCKSIZE);
+        distribute_workgroups(
+            total_workgroups,
+            output
+                .device()
+                .limits()
+                .max_compute_workgroups_per_dimension,
+        )
     }
 
-    fn visit_dependencies(&self, f: &mut dyn FnMut(AnyComputeKey)) {
+    fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
         f(self.input);
     }
 
@@ -179,24 +198,31 @@ impl Operation for ResizeOperation {
         &self,
         nodes: &crate::compute_graph::ComputeGraphInner,
     ) -> Vec<crate::mir::inputs::MirValue> {
-        let input = nodes.cached_results.get(&self.input).unwrap().clone();
+        let input = nodes.get_cached_result(self.input).unwrap().clone();
         let output = TensorData::new_for_shape(input.device(), &self.new_shape, input.datatype());
-        let output_sliced =
-            output.slice(&self.fill_shape.iter().map(|x| 0..*x).collect::<Vec<_>>());
-        vec![input.into(), output_sliced.into()]
+        vec![input.into(), output.into()]
     }
 
-    fn build_kernel(
+    fn build_direct_kernel(
         &self,
-        _: &crate::compute_graph::ComputeGraphInner,
-        _: &crate::mir::workgroup_shape::WorkgroupShape,
-        inputs: &[crate::mir::inputs::MirValue],
-        kernel: &mut GenericKernel,
-    ) {
-        let input = inputs[0].as_tensor().unwrap();
-        let rank = input.layout().rank() as u32;
-        let datatype = input.datatype();
-        self.kernel(rank, datatype, TILE_SIZE, kernel);
+        graph: &crate::compute_graph::ComputeGraphInner,
+        workgroup_shape: &WorkgroupShape,
+        inputs: &[MirValue],
+    ) -> Option<DirectKernel> {
+        let input = inputs[0].as_tensor()?;
+        let operation = NaryOperation {
+            inputs: vec![self.input],
+            expression: self.expression(input.datatype())?,
+            shape: self.new_shape.clone(),
+            output_datatype: input.datatype(),
+        };
+        crate::nary_direct::build_nary_direct_kernel_to_output(
+            &operation,
+            graph,
+            workgroup_shape,
+            inputs,
+            1,
+        )
     }
 
     fn output(
@@ -231,19 +257,76 @@ impl Operation for ResizeOperation {
     }
 }
 
-impl<const R: usize, T: crate::DataType> Tensor<R, T> {
-    pub fn resize(&self, new_shape: [usize; R]) -> Tensor<R, T> {
-        let new_shape = new_shape.into();
+fn row_major_flat_expr(shape: &[usize]) -> Option<NaryExpr> {
+    let mut flat = NaryExpr::scalar(NaryScalar::U32(0));
+    for axis in 0..shape.len() {
+        let stride = shape[axis + 1..]
+            .iter()
+            .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
+        let dim = NaryExpr::DimIndex(axis);
+        let term = if stride == 1 {
+            dim
+        } else {
+            NaryExpr::unary_op(
+                dim,
+                "mul_const",
+                NaryOp::MulConst(NaryScalar::U32(stride)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            )
+        };
+        flat = NaryExpr::add(flat, term, DataTypeEnum::U32);
+    }
+    Some(flat)
+}
+
+fn row_major_indices_from_flat(flat: NaryExpr, shape: &[usize]) -> Option<Vec<NaryExpr>> {
+    let mut indices = Vec::with_capacity(shape.len());
+    for axis in 0..shape.len() {
+        let divisor = shape[axis + 1..]
+            .iter()
+            .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
+        let dim = u32::try_from(shape[axis]).ok()?;
+        let quotient = if divisor == 1 {
+            flat.clone()
+        } else {
+            NaryExpr::unary_op(
+                flat.clone(),
+                "div_const",
+                NaryOp::DivConst(NaryScalar::U32(divisor)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            )
+        };
+        indices.push(if dim == 1 {
+            NaryExpr::scalar(NaryScalar::U32(0))
+        } else {
+            NaryExpr::unary_op(
+                quotient,
+                "rem_const",
+                NaryOp::RemConst(NaryScalar::U32(dim)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            )
+        });
+    }
+    Some(indices)
+}
+
+impl Tensor {
+    pub fn resize(&self, new_shape: impl AsRef<[usize]>) -> Tensor {
+        let new_shape: Box<[usize]> = new_shape.as_ref().into();
         let input = self.key();
         self.add_resize(ResizeOperation::new(
             input,
-            (*self.shape()).into(),
+            self.shape().into(),
             new_shape,
-            (*self.shape()).into(),
+            self.shape().into(),
         ))
     }
 
-    pub fn reshape<const R2: usize>(&self, new_shape: [usize; R2]) -> Tensor<R2, T> {
+    pub fn reshape(&self, new_shape: impl AsRef<[usize]>) -> Tensor {
+        let new_shape = new_shape.as_ref();
         assert_eq!(
             new_shape.iter().product::<usize>(),
             self.shape().iter().product::<usize>(),
@@ -256,177 +339,54 @@ impl<const R: usize, T: crate::DataType> Tensor<R, T> {
         let input = self.key();
         self.add_resize(ResizeOperation::new(
             input,
-            (*self.shape()).into(),
+            self.shape().into(),
             new_shape.clone(),
             new_shape.clone(),
         ))
     }
 
-    pub fn flatten_last_n<const FROM_END: usize, const O: usize>(&self) -> Tensor<O, T>
-    where
-        Self: SmallerRank<FROM_END, O, T>,
-    {
-        let new_shape = std::array::from_fn(|i| {
-            if i < self.rank() - 1 - FROM_END {
-                self.shape()[i]
-            } else if i == self.rank() - 1 - FROM_END {
-                self.shape()[i..].iter().product()
-            } else {
-                1
-            }
-        });
+    pub fn flatten_last_n(&self, from_end: usize) -> Tensor {
+        assert!(
+            from_end < self.rank(),
+            "flatten_last_n FROM_END must be less than input rank"
+        );
+        let out_rank = self.rank() - from_end;
+        let new_shape: Vec<usize> = (0..out_rank)
+            .map(|i| {
+                if i < self.rank() - 1 - from_end {
+                    self.shape()[i]
+                } else if i == self.rank() - 1 - from_end {
+                    self.shape()[i..].iter().product()
+                } else {
+                    1
+                }
+            })
+            .collect();
         self.reshape(new_shape)
     }
 
-    pub fn flatten_first_n<const FROM_START: usize, const O: usize>(&self) -> Tensor<O, T>
-    where
-        Self: SmallerRank<FROM_START, O, T>,
-    {
-        let new_shape = std::array::from_fn(|i| {
-            if i == 0 {
-                self.shape()[..=FROM_START].iter().product()
-            } else {
-                self.shape()[i - FROM_START]
-            }
-        });
+    pub fn flatten_first_n(&self, from_start: usize) -> Tensor {
+        assert!(
+            from_start < self.rank(),
+            "flatten_first_n FROM_START must be less than input rank"
+        );
+        let out_rank = self.rank() - from_start;
+        let new_shape: Vec<usize> = (0..out_rank)
+            .map(|i| {
+                if i == 0 {
+                    self.shape()[..=from_start].iter().product()
+                } else {
+                    self.shape()[i + from_start]
+                }
+            })
+            .collect();
         self.reshape(new_shape)
     }
 
-    pub fn flatten_all(&self) -> Tensor<1, T> {
+    pub fn flatten_all(&self) -> Tensor {
         let size = self.shape().iter().product();
         self.reshape([size])
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_resize() {
-    use crate::Device;
-
-    let device = Device::new().await.unwrap();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-    let tensor = tensor.resize([30, 20]);
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-    assert_eq!(as_slice[[0, 0]], 1.);
-    assert_eq!(as_slice[[0, 1]], 2.);
-    assert_eq!(as_slice[[1, 0]], 3.);
-    assert_eq!(as_slice[[1, 1]], 4.);
-    assert_eq!(as_slice[[2, 0]], 5.);
-    assert_eq!(as_slice[[2, 1]], 6.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_reshape() {
-    use crate::Device;
-
-    let device = Device::new().await.unwrap();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-    let tensor = tensor.reshape([2, 3]);
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-    assert_eq!(as_slice[[0, 0]], 1.);
-    assert_eq!(as_slice[[0, 1]], 2.);
-    assert_eq!(as_slice[[0, 2]], 3.);
-    assert_eq!(as_slice[[1, 0]], 4.);
-    assert_eq!(as_slice[[1, 1]], 5.);
-    assert_eq!(as_slice[[1, 2]], 6.);
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-    let tensor = tensor.reshape([6]);
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-    assert_eq!(as_slice[[0]], 1.);
-    assert_eq!(as_slice[[1]], 2.);
-    assert_eq!(as_slice[[2]], 3.);
-    assert_eq!(as_slice[[3]], 4.);
-    assert_eq!(as_slice[[4]], 5.);
-    assert_eq!(as_slice[[5]], 6.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_transposed_reshape() {
-    use crate::Device;
-
-    let device = Device::new().await.unwrap();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-    let tensor = tensor.t();
-    let tensor = tensor.reshape([2, 3]);
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-    assert_eq!(as_slice[[0, 0]], 1.);
-    assert_eq!(as_slice[[0, 1]], 3.);
-    assert_eq!(as_slice[[0, 2]], 5.);
-    assert_eq!(as_slice[[1, 0]], 2.);
-    assert_eq!(as_slice[[1, 1]], 4.);
-    assert_eq!(as_slice[[1, 2]], 6.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_flatten_last_n() {
-    use crate::Device;
-
-    let device = Device::new().await.unwrap();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-    let tensor = tensor.flatten_last_n::<1, _>();
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-    assert_eq!(as_slice[[0]], 1.);
-    assert_eq!(as_slice[[1]], 2.);
-    assert_eq!(as_slice[[2]], 3.);
-    assert_eq!(as_slice[[3]], 4.);
-    assert_eq!(as_slice[[4]], 5.);
-    assert_eq!(as_slice[[5]], 6.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_flatten_first_n() {
-    use crate::Device;
-
-    let device = Device::new().await.unwrap();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-    let tensor = tensor.flatten_first_n::<1, _>();
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-    assert_eq!(as_slice[[0]], 1.);
-    assert_eq!(as_slice[[1]], 2.);
-    assert_eq!(as_slice[[2]], 3.);
-    assert_eq!(as_slice[[3]], 4.);
-    assert_eq!(as_slice[[4]], 5.);
-    assert_eq!(as_slice[[5]], 6.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_flatten_all() {
-    use crate::Device;
-
-    let device = Device::new().await.unwrap();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-    let tensor = tensor.flatten_all();
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-    assert_eq!(as_slice[[0]], 1.);
-    assert_eq!(as_slice[[1]], 2.);
-    assert_eq!(as_slice[[2]], 3.);
-    assert_eq!(as_slice[[3]], 4.);
-    assert_eq!(as_slice[[4]], 5.);
-    assert_eq!(as_slice[[5]], 6.);
-}
+pub use fusor_types::ShapeWithOneHole;

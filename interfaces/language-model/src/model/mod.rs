@@ -1,3 +1,5 @@
+use kalosm_model_types::{WasmNotSend, WasmNotSendSync};
+#[cfg(feature = "structured")]
 use kalosm_sample::Parser;
 use std::{convert::Infallible, future::Future};
 
@@ -5,89 +7,45 @@ mod generation_parameters;
 pub use generation_parameters::*;
 mod ext;
 pub use ext::*;
+#[cfg(not(target_arch = "wasm32"))]
 mod boxed;
+#[cfg(not(target_arch = "wasm32"))]
 pub use boxed::*;
 
 use crate::MessageContent;
+
+/// A parser for any type that implements the [`Schema`](kalosm_sample::Schema) trait and [`Deserialize`](serde::Deserialize).
+///
+/// Used by remote chat model adapters (e.g. OpenAI, Anthropic) to enforce structured
+/// JSON schema generation at the API level.
+#[derive(Debug, Clone, Copy)]
+pub struct SchemaParser<P> {
+    phantom: std::marker::PhantomData<P>,
+}
+
+impl<P> Default for SchemaParser<P> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<P> SchemaParser<P> {
+    /// Create a new parser for the given schema.
+    pub const fn new() -> Self {
+        Self {
+            phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<P> ModelConstraints for SchemaParser<P> {
+    type Output = P;
+}
 
 #[doc = include_str!("../../docs/completion_session.md")]
 pub trait TextCompletionSession {
     /// The type of error the session may return during operations.
     type Error: Send + Sync + 'static;
-
-    /// Serialize the session into bytes. This method is identical to [`TextCompletionSession::to_bytes`] except it can re-use an existing [`Vec`] buffer.
-    fn write_to(&self, into: &mut Vec<u8>) -> Result<(), Self::Error>;
-
-    /// # Loading sessions
-    ///
-    /// Sessions can be deserialized to and from bytes using the [`TextCompletionSession::from_bytes`] method.
-    /// Caching a session avoids re-processing the text again when the session is resumed.
-    ///
-    /// ```rust, no_run
-    /// use kalosm::language::*;
-    /// use std::io::Write;
-    ///
-    /// #[tokio::main]
-    /// async fn main() {
-    ///     let mut llm = Llama::new().await.unwrap();
-    ///     let mut session = llm.new_session().unwrap();
-    ///
-    ///     // Feed some text into the session
-    ///     llm.stream_text_with_callback(
-    ///         &mut session,
-    ///         "The capital of France is ".into(),
-    ///         GenerationParameters::new().with_max_length(0),
-    ///         |_| Ok(()),
-    ///     )
-    ///     .await
-    ///     .unwrap();
-    ///
-    ///     // Save the session to bytes
-    ///     let session_as_bytes = session.to_bytes().unwrap();
-    ///
-    ///     // And write those bytes to a file
-    ///     std::fs::write("session.bin", session_as_bytes).unwrap();
-    /// }
-    /// ```
-    fn to_bytes(&self) -> Result<Vec<u8>, Self::Error> {
-        let mut bytes = Vec::new();
-        self.write_to(&mut bytes)?;
-        Ok(bytes)
-    }
-
-    /// # Loading sessions
-    ///
-    /// Sessions can be deserialized to and from bytes using the [`TextCompletionSession::from_bytes`] method.
-    /// Caching a session avoids re-processing the text again when the session is resumed.
-    ///
-    /// ```rust, no_run
-    /// use kalosm::language::*;
-    /// use std::io::Write;
-    ///
-    /// #[tokio::main]
-    /// async fn main() {
-    ///     let mut llm = Llama::new().await.unwrap();
-    ///     // Load a text completion session from a file
-    ///     let mut session =
-    ///         LlamaSession::from_bytes(std::fs::read("session.bin").unwrap().as_slice()).unwrap();
-    ///
-    ///     // Feed some more text into the session
-    ///     llm.stream_text_with_callback(
-    ///         &mut session,
-    ///         "The capital of France is ".into(),
-    ///         GenerationParameters::new(),
-    ///         |token| {
-    ///             println!("{token}");
-    ///             Ok(())
-    ///         },
-    ///     )
-    ///     .await
-    ///     .unwrap();
-    /// }
-    /// ```
-    fn from_bytes(bytes: &[u8]) -> Result<Self, Self::Error>
-    where
-        Self: std::marker::Sized;
 
     /// # Cloning Sessions
     ///
@@ -137,14 +95,6 @@ pub trait TextCompletionSession {
 impl TextCompletionSession for () {
     type Error = Infallible;
 
-    fn write_to(&self, _into: &mut Vec<u8>) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    fn from_bytes(_bytes: &[u8]) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
     fn try_clone(&self) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -160,6 +110,7 @@ pub trait ModelConstraints {
     type Output;
 }
 
+#[cfg(feature = "structured")]
 impl<P: Parser> ModelConstraints for P {
     type Output = <P as Parser>::Output;
 }
@@ -243,8 +194,8 @@ pub trait TextCompletionModel<Sampler = GenerationParameters>: CreateTextComplet
         session: &'a mut Self::Session,
         text: MessageContent,
         sampler: Sampler,
-        on_token: impl FnMut(String) -> Result<(), Self::Error> + Send + Sync + 'static,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+        on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
+    ) -> impl Future<Output = Result<(), Self::Error>> + WasmNotSend + 'a;
 }
 
 /// A trait for text completion models that support structured generation. While this trait is implemented for
@@ -283,6 +234,54 @@ pub trait StructuredTextCompletionModel<
         text: MessageContent,
         sampler: Sampler,
         parser: Constraints,
-        on_token: impl FnMut(String) -> Result<(), Self::Error> + Send + Sync + 'static,
-    ) -> impl Future<Output = Result<Constraints::Output, Self::Error>> + Send + 'a;
+        on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
+    ) -> impl Future<Output = Result<Constraints::Output, Self::Error>> + WasmNotSend + 'a;
+}
+
+/// Remove JSON Schema properties that are not supported by structured output APIs
+/// (e.g. Anthropic, OpenAI). This strips validation-only keywords like `minLength`,
+/// `pattern`, `minimum`, `maxItems`, etc. that would cause API errors.
+#[cfg(all(feature = "structured", any(feature = "anthropic", feature = "openai")))]
+pub(crate) fn remove_unsupported_schema_properties(schema: &mut serde_json::Value) {
+    match schema {
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+        serde_json::Value::Array(array) => {
+            for item in array {
+                remove_unsupported_schema_properties(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            map.retain(|key, value| {
+                const UNSUPPORTED_PROPERTIES: [&str; 19] = [
+                    "minLength",
+                    "maxLength",
+                    "pattern",
+                    "format",
+                    "minimum",
+                    "maximum",
+                    "multipleOf",
+                    "patternProperties",
+                    "unevaluatedProperties",
+                    "propertyNames",
+                    "minProperties",
+                    "maxProperties",
+                    "unevaluatedItems",
+                    "contains",
+                    "minContains",
+                    "maxContains",
+                    "minItems",
+                    "maxItems",
+                    "uniqueItems",
+                ];
+                if UNSUPPORTED_PROPERTIES.contains(&key.as_str()) {
+                    return false;
+                }
+                remove_unsupported_schema_properties(value);
+                true
+            });
+        }
+    }
 }

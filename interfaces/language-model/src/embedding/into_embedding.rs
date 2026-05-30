@@ -1,6 +1,7 @@
 use futures_util::Future;
+use kalosm_model_types::WasmNotSend;
 
-use crate::{Embedder, EmbedderExt, Embedding, WasmNotSend};
+use crate::{Embedder, EmbedderExt, Embedding};
 
 /// Convert a type into an embedding with an embedding model.
 pub trait IntoEmbedding {

@@ -15,11 +15,13 @@ on:
       - floneum/*/examples/**
       - floneum/*/Cargo.toml
       - fusor-ml/*/src/**
+      - fusor-ml/*/tests/**
       - fusor-ml/*/examples/**
       - fusor-ml/*/Cargo.toml
       - src/**
       - .github/**
       - Cargo.toml
+      - Cargo.lock
 
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -36,16 +38,22 @@ on:
       - floneum/*/examples/**
       - floneum/*/Cargo.toml
       - fusor-ml/*/src/**
+      - fusor-ml/*/tests/**
       - fusor-ml/*/examples/**
       - fusor-ml/*/Cargo.toml
       - src/**
       - .github/**
       - Cargo.toml
+      - Cargo.lock
 
-# workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
   test:
@@ -53,12 +61,19 @@ jobs:
     name: Mac Test Suite
     runs-on: macos-latest
     steps:
+      # Checkout before rust-cache so the cache key hashes Cargo.lock
+      # instead of just the toolchain.
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/checkout@v4
+        with:
+          shared-key: "macos-stable"
+          cache-all-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run tests
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
         run: cargo test --all --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape,kalosm/metal --exclude fusor-core

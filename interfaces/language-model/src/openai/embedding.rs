@@ -1,6 +1,6 @@
 use super::{NoOpenAIAPIKeyError, OpenAICompatibleClient};
-use crate::{Embedder, Embedding, ModelBuilder};
-use kalosm_model_types::ModelLoadingProgress;
+use crate::{Embedder, Embedding};
+use kalosm_model_types::{ModelBuilder, ModelLoadingProgress};
 use serde::Deserialize;
 use std::future::Future;
 use thiserror::Error;
@@ -144,8 +144,9 @@ impl Embedder for OpenAICompatibleEmbeddingModel {
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&serde_json::json!({
+                "model": self.model,
                 "input": input,
-                "model": self.model
+                "encoding_format": "float"
             }))
             .send()
             .await?;
@@ -166,8 +167,9 @@ impl Embedder for OpenAICompatibleEmbeddingModel {
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&serde_json::json!({
+                "model": self.model,
                 "input": input,
-                "model": self.model
+                "encoding_format": "float"
             }))
             .send()
             .await?;
@@ -201,7 +203,10 @@ mod tests {
     #[tokio::test]
     async fn test_small_embedding_model() {
         let model = OpenAICompatibleEmbeddingModelBuilder::new()
-            .with_text_embedding_3_small()
+            .with_client(
+                crate::OpenAICompatibleClient::new().with_base_url("https://openrouter.ai/api/v1"),
+            )
+            .with_model("openai/text-embedding-3-small")
             .build();
 
         let embeddings = model
@@ -218,7 +223,10 @@ mod tests {
     #[tokio::test]
     async fn test_large_embedding_model() {
         let model = OpenAICompatibleEmbeddingModelBuilder::new()
-            .with_text_embedding_3_large()
+            .with_client(
+                crate::OpenAICompatibleClient::new().with_base_url("https://openrouter.ai/api/v1"),
+            )
+            .with_model("openai/text-embedding-3-large")
             .build();
 
         let embeddings = model

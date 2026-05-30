@@ -11,9 +11,13 @@ use rustfft::{num_complex::Complex, FftPlanner};
 use crate::config::{Config, CHUNK_LENGTH, HOP_LENGTH, N_FFT};
 
 fn get_num_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    if cfg!(target_arch = "wasm32") {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    }
 }
 
 fn fft(input: &mut [Complex<f32>], fft_out: &mut Vec<f32>) {
@@ -135,27 +139,38 @@ pub fn log_mel_spectrogram_(
 
     // use scope to allow for non static references to be passed to the threads
     // and directly collect the results into a single vector
-    let all_outputs = thread::scope(|s| {
+    let all_outputs = if cfg!(target_arch = "wasm32") {
         (0..n_threads)
-            // create threads and return their handles
             .map(|thread_id| {
-                let hann = Arc::clone(&hann);
-                let samples = Arc::clone(&samples);
-                let filters = Arc::clone(&filters);
-                // spawn new thread and start work
-                s.spawn(move || {
-                    log_mel_spectrogram_w(
-                        thread_id, &hann, &samples, &filters, fft_size, fft_step, n_len, n_mel,
-                        n_threads,
-                    )
-                })
+                log_mel_spectrogram_w(
+                    thread_id, &hann, &samples, &filters, fft_size, fft_step, n_len, n_mel,
+                    n_threads,
+                )
             })
             .collect::<Vec<_>>()
-            .into_iter()
-            // wait for each thread to finish and collect their results
-            .map(|handle| handle.join().expect("Thread failed"))
-            .collect::<Vec<_>>()
-    });
+    } else {
+        thread::scope(|s| {
+            (0..n_threads)
+                // create threads and return their handles
+                .map(|thread_id| {
+                    let hann = Arc::clone(&hann);
+                    let samples = Arc::clone(&samples);
+                    let filters = Arc::clone(&filters);
+                    // spawn new thread and start work
+                    s.spawn(move || {
+                        log_mel_spectrogram_w(
+                            thread_id, &hann, &samples, &filters, fft_size, fft_step, n_len, n_mel,
+                            n_threads,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                // wait for each thread to finish and collect their results
+                .map(|handle| handle.join().expect("Thread failed"))
+                .collect::<Vec<_>>()
+        })
+    };
 
     let l = all_outputs[0].len();
     let mut mel = vec![0.0; l];

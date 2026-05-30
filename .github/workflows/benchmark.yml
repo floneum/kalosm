@@ -1,81 +1,152 @@
 on: [pull_request]
 name: benchmark fusor
+
+# Re-run on a new commit only — let the prior run finish on the old SHA.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# All benches run on the same macos-latest runner and build the same
+# `fusor` deps, so anchor them at one shared cache slot and only
+# save from the base branch to keep the Actions cache from churning.
+# `cache-on-failure: "true"` so a broken bench still leaves a useful
+# cache for the next run.
 jobs:
   qmatmul:
     if: github.event.pull_request.draft == false
     name: qmatmul benchmark
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/checkout@v4
-      - uses: boa-dev/criterion-compare-action@v3
         with:
-          cwd: "fusor-ml/core"
+          shared-key: "macos-bench"
+          workspaces: fusor-ml/fusor
+          cache-all-crates: "true"
+          cache-on-failure: "true"
+          # Bench runs only on PRs, so we never see `refs/heads/main`
+          # here; leave save-if at its default (always save) so the PR's
+          # own cache warms across re-runs within the PR.
+      - uses: ./.github/actions/criterion-compare
+        with:
+          cwd: "fusor-ml/fusor"
           benchName: "qmatmul"
           branchName: ${{ github.base_ref }}
+          baseFallbackCwd: "fusor-ml/core"
   matmul:
     if: github.event.pull_request.draft == false
     name: matmul benchmark
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/checkout@v4
-      - uses: boa-dev/criterion-compare-action@v3
         with:
-          cwd: "fusor-ml/core"
+          shared-key: "macos-bench"
+          workspaces: fusor-ml/fusor
+          cache-all-crates: "true"
+          cache-on-failure: "true"
+          # Bench runs only on PRs, so we never see `refs/heads/main`
+          # here; leave save-if at its default (always save) so the PR's
+          # own cache warms across re-runs within the PR.
+      - uses: ./.github/actions/criterion-compare
+        with:
+          cwd: "fusor-ml/fusor"
           benchName: "matmul"
           branchName: ${{ github.base_ref }}
+          baseFallbackCwd: "fusor-ml/core"
+          criterionArgs: "matmul-wgpu --sample-size 10 --warm-up-time 1 --measurement-time 2"
   elementwise:
     if: github.event.pull_request.draft == false
     name: elementwise benchmark
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/checkout@v4
-      - uses: boa-dev/criterion-compare-action@v3
         with:
-          cwd: "fusor-ml/core"
+          shared-key: "macos-bench"
+          workspaces: fusor-ml/fusor
+          cache-all-crates: "true"
+          cache-on-failure: "true"
+          # Bench runs only on PRs, so we never see `refs/heads/main`
+          # here; leave save-if at its default (always save) so the PR's
+          # own cache warms across re-runs within the PR.
+      - uses: ./.github/actions/criterion-compare
+        with:
+          cwd: "fusor-ml/fusor"
           benchName: "elementwise"
           branchName: ${{ github.base_ref }}
+          baseFallbackCwd: "fusor-ml/core"
   fused:
     if: github.event.pull_request.draft == false
     name: fused benchmark
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/checkout@v4
-      - uses: boa-dev/criterion-compare-action@v3
         with:
-          cwd: "fusor-ml/core"
+          shared-key: "macos-bench"
+          workspaces: fusor-ml/fusor
+          cache-all-crates: "true"
+          cache-on-failure: "true"
+          # Bench runs only on PRs, so we never see `refs/heads/main`
+          # here; leave save-if at its default (always save) so the PR's
+          # own cache warms across re-runs within the PR.
+      - uses: ./.github/actions/criterion-compare
+        with:
+          cwd: "fusor-ml/fusor"
           benchName: "fused"
           branchName: ${{ github.base_ref }}
+          baseFallbackCwd: "fusor-ml/core"
   reduce:
     if: github.event.pull_request.draft == false
     name: reduce benchmark
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/checkout@v4
-      - uses: boa-dev/criterion-compare-action@v3
         with:
-          cwd: "fusor-ml/core"
+          shared-key: "macos-bench"
+          workspaces: fusor-ml/fusor
+          cache-all-crates: "true"
+          cache-on-failure: "true"
+          # Bench runs only on PRs, so we never see `refs/heads/main`
+          # here; leave save-if at its default (always save) so the PR's
+          # own cache warms across re-runs within the PR.
+      - uses: ./.github/actions/criterion-compare
+        with:
+          cwd: "fusor-ml/fusor"
           benchName: "reduce"
           branchName: ${{ github.base_ref }}
+          baseFallbackCwd: "fusor-ml/core"
   pairwise:
     if: github.event.pull_request.draft == false
     name: pairwise benchmark
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/checkout@v4
-      - uses: boa-dev/criterion-compare-action@v3
         with:
-          cwd: "fusor-ml/core"
+          shared-key: "macos-bench"
+          workspaces: fusor-ml/fusor
+          cache-all-crates: "true"
+          cache-on-failure: "true"
+          # Bench runs only on PRs, so we never see `refs/heads/main`
+          # here; leave save-if at its default (always save) so the PR's
+          # own cache warms across re-runs within the PR.
+      - uses: ./.github/actions/criterion-compare
+        with:
+          cwd: "fusor-ml/fusor"
           benchName: "pairwise"
           branchName: ${{ github.base_ref }}
+          baseFallbackCwd: "fusor-ml/core"

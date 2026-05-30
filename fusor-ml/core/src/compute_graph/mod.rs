@@ -1,248 +1,51 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Weak, atomic::AtomicUsize};
+use std::{any::Any, sync::Arc};
 
-use arc_swap::{ArcSwap, ArcSwapAny};
-use dependency_map::{DependencyMap, visit_dependencies};
 use parking_lot::RwLock;
+pub use petgraph::graph::NodeIndex;
+use petgraph::prelude::StableGraph;
+use petgraph::visit::EdgeRef;
 use resolve::Resolver;
 use rustc_hash::FxHashMap;
+#[cfg(feature = "graphvis")]
 use tabbycat::Graph;
-use wgpu::CommandEncoderDescriptor;
 
-mod dependency_map;
 mod layout_pass;
 mod queue;
 mod resolve;
+#[cfg(test)]
+mod tests;
+#[cfg(feature = "graphvis")]
 mod visualize;
 
 use crate::{
-    DataTypeEnum, Device, ElementWiseOperation, MatMulOperation, PairWiseOperation, QMatrix,
-    ReduceOperation, dequantize::DequantizeOperation, index_select::IndexSelectOperation,
-    map_layout::MapLayoutOperation, mir::operation::Operation, quantized::matmul::QMatMulOperation,
-    resize::ResizeOperation, slice_assign::SliceAssignOperation, tensor::TensorData,
+    DataTypeEnum, Device, FlashAttentionOperation, MatMulOperation, QMatrix, ReduceOperation,
+    RmsNormOperation,
+    compute_graph::resolve::ResolverResult,
+    dequantize::DequantizeOperation,
+    map_layout::MapLayoutOperation,
+    mir::{inputs::MirValue, operation::Operation},
+    nary_wise::NaryOperation,
+    quantized::embedding::QEmbeddingOperation,
+    quantized::matmul::QMatMulOperation,
+    resize::ResizeOperation,
+    slice_assign::SliceAssignOperation,
+    tensor::{TensorData, TensorLayoutInfo},
     visit_tiled::MaybeQData,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct ElementWiseComputeNodeKey(usize);
-impl ElementWiseComputeNodeKey {
-    fn new() -> Self {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        Self(COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct PairWiseComputeNodeKey(usize);
-impl PairWiseComputeNodeKey {
-    fn new() -> Self {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        Self(COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct MatMulComputeNodeKey(usize);
-impl MatMulComputeNodeKey {
-    fn new() -> Self {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        Self(COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct ReduceComputeNodeKey(usize);
-impl ReduceComputeNodeKey {
-    fn new() -> Self {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        Self(COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct MapLayoutComputeNodeKey(usize);
-impl MapLayoutComputeNodeKey {
-    fn new() -> Self {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        Self(COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct ResizeComputeNodeKey(usize);
-impl ResizeComputeNodeKey {
-    fn new() -> Self {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        Self(COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct SliceAssignComputeNodeKey(usize);
-impl SliceAssignComputeNodeKey {
-    fn new() -> Self {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        Self(COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct IndexSelectComputeNodeKey(usize);
-impl IndexSelectComputeNodeKey {
-    fn new() -> Self {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        Self(COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct TensorComputeNodeKey(usize);
-impl TensorComputeNodeKey {
-    fn new() -> Self {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        Self(COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct DequantizeComputeKey(usize);
-impl DequantizeComputeKey {
-    fn new() -> Self {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        Self(COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct CustomComputeKey(usize);
-impl CustomComputeKey {
-    pub(crate) fn new() -> Self {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        Self(COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct QMatMulComputeNodeKey(usize);
-impl QMatMulComputeNodeKey {
-    fn new() -> Self {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        Self(COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum AnyComputeKey {
-    ElementWise(ElementWiseComputeNodeKey),
-    PairWise(PairWiseComputeNodeKey),
-    MatMul(MatMulComputeNodeKey),
-    Reduce(ReduceComputeNodeKey),
-    MapLayout(MapLayoutComputeNodeKey),
-    Resize(ResizeComputeNodeKey),
-    SliceAssign(SliceAssignComputeNodeKey),
-    IndexSelect(IndexSelectComputeNodeKey),
-    Tensor(TensorComputeNodeKey),
-    QMatMul(QMatMulComputeNodeKey),
-    Dequantize(DequantizeComputeKey),
-    Custom(CustomComputeKey),
-}
-
-impl From<ElementWiseComputeNodeKey> for AnyComputeKey {
-    fn from(value: ElementWiseComputeNodeKey) -> Self {
-        Self::ElementWise(value)
-    }
-}
-
-impl From<PairWiseComputeNodeKey> for AnyComputeKey {
-    fn from(value: PairWiseComputeNodeKey) -> Self {
-        Self::PairWise(value)
-    }
-}
-
-impl From<MatMulComputeNodeKey> for AnyComputeKey {
-    fn from(value: MatMulComputeNodeKey) -> Self {
-        Self::MatMul(value)
-    }
-}
-
-impl From<ReduceComputeNodeKey> for AnyComputeKey {
-    fn from(value: ReduceComputeNodeKey) -> Self {
-        Self::Reduce(value)
-    }
-}
-
-impl From<TensorComputeNodeKey> for AnyComputeKey {
-    fn from(value: TensorComputeNodeKey) -> Self {
-        Self::Tensor(value)
-    }
-}
-
-impl From<MapLayoutComputeNodeKey> for AnyComputeKey {
-    fn from(value: MapLayoutComputeNodeKey) -> Self {
-        Self::MapLayout(value)
-    }
-}
-
-impl From<ResizeComputeNodeKey> for AnyComputeKey {
-    fn from(value: ResizeComputeNodeKey) -> Self {
-        Self::Resize(value)
-    }
-}
-
-impl From<SliceAssignComputeNodeKey> for AnyComputeKey {
-    fn from(value: SliceAssignComputeNodeKey) -> Self {
-        Self::SliceAssign(value)
-    }
-}
-
-impl From<IndexSelectComputeNodeKey> for AnyComputeKey {
-    fn from(value: IndexSelectComputeNodeKey) -> Self {
-        Self::IndexSelect(value)
-    }
-}
-
-impl From<QMatMulComputeNodeKey> for AnyComputeKey {
-    fn from(value: QMatMulComputeNodeKey) -> Self {
-        Self::QMatMul(value)
-    }
-}
-
-impl From<DequantizeComputeKey> for AnyComputeKey {
-    fn from(value: DequantizeComputeKey) -> Self {
-        Self::Dequantize(value)
-    }
-}
-
-impl From<CustomComputeKey> for AnyComputeKey {
-    fn from(value: CustomComputeKey) -> Self {
-        Self::Custom(value)
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct ComputeGraph {
-    inner: Arc<ArcSwap<RwLock<ComputeGraphInner>>>,
+    inner: Arc<RwLock<ComputeGraphInner>>,
 }
 
 impl ComputeGraph {
-    pub(crate) fn new(device: Device) -> Self {
-        let myself = Self {
-            inner: Arc::new(ArcSwap::new(Arc::new(RwLock::new(ComputeGraphInner::new(
-                device,
-            ))))),
-        };
-
-        let weak = Arc::downgrade(&myself.inner);
-        myself.with_mut(|inner| {
-            inner.pointed_to_by.push(weak);
-        });
-        myself
+    pub(crate) fn new(device: &Device) -> Self {
+        let inner = Arc::new(RwLock::new(ComputeGraphInner::new(device)));
+        Self { inner }
     }
 
     fn with_mut<R, F: FnOnce(&mut ComputeGraphInner) -> R>(&self, f: F) -> R {
-        let write = self.inner.load();
-        let mut inner = write.write();
+        let mut inner = self.inner.write();
         let result = f(&mut inner);
         #[cfg(feature = "extra_assertions")]
         {
@@ -251,653 +54,795 @@ impl ComputeGraph {
         result
     }
 
-    pub(crate) fn merge(&self, other: &Self) {
-        if Arc::ptr_eq(&self.inner.load(), &other.inner.load()) {
-            return;
-        }
-        self.with_mut(|inner| {
-            other.with_mut(|other_inner| {
-                inner.nodes.merge(&mut other_inner.nodes);
-
-                inner
-                    .cached_results
-                    .extend(other_inner.cached_results.drain());
-                inner.dependency_map.merge(&mut other_inner.dependency_map);
-            })
-        });
-
-        other.point_to(self);
+    fn create_node(&self, node: ComputeGraphNodeVariant) -> NodeIndex {
+        self.with_mut(|inner| inner.create_node(node))
     }
 
-    fn point_to(&self, target: &Self) {
-        {
-            if Arc::ptr_eq(&self.inner.load(), &target.inner.load()) {
-                return;
+    pub(crate) fn create_nary(&self, op: NaryOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::Nary(op))
+    }
+
+    pub(crate) fn create_mat_mul(&self, op: MatMulOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::MatMul(op))
+    }
+
+    pub(crate) fn create_q_mat_mul(&self, op: QMatMulOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::QMatMul(Box::new(op)))
+    }
+
+    pub(crate) fn create_q_embedding(&self, op: QEmbeddingOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::QEmbedding(op))
+    }
+
+    pub(crate) fn create_reduce(&self, op: ReduceOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::Reduce(op))
+    }
+
+    pub(crate) fn create_graph_op(&self, op: Arc<dyn GraphOperation>) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::GraphOp(op))
+    }
+
+    pub(crate) fn create_rms_norm(&self, op: RmsNormOperation) -> NodeIndex {
+        self.create_graph_op(Arc::new(op))
+    }
+
+    pub(crate) fn create_flash_attention(&self, op: FlashAttentionOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::FlashAttention(op))
+    }
+
+    pub(crate) fn create_map_layout(&self, op: MapLayoutOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::MapLayout(op))
+    }
+
+    pub(crate) fn create_resize(&self, op: ResizeOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::Resize(op))
+    }
+
+    pub(crate) fn create_slice_assign(&self, op: SliceAssignOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::SliceAssign(op))
+    }
+
+    pub(crate) fn create_tensor(&self, op: TensorData) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::Tensor(op))
+    }
+
+    pub(crate) fn dequantize(&self, matrix: QMatrix, ty: DataTypeEnum) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::Dequantize(
+            DequantizeOperation::new(matrix, ty),
+        ))
+    }
+
+    pub(crate) fn resolve(&self, key: NodeIndex) -> ResolverResult {
+        if let Some(data) = {
+            let inner = self.inner.read();
+            inner.get_cached_result(key).cloned()
+        } {
+            return ResolverResult {
+                data,
+                total_kernels: 0,
+            };
+        }
+
+        if let Some(data) = {
+            let mut inner = self.inner.write();
+            let data = inner.try_resolve_direct_qmatmul(key);
+            #[cfg(feature = "extra_assertions")]
+            {
+                inner.verify_integrity()
             }
+            data
+        } {
+            return data;
         }
 
-        let pointed_to_by = self.with_mut(|inner| std::mem::take(&mut inner.pointed_to_by));
-
-        for pointed_to in pointed_to_by {
-            if let Some(pointed_to) = pointed_to.upgrade() {
-                if Arc::ptr_eq(&pointed_to, &target.inner) {
-                    continue;
-                }
-                let pointed_to = Self { inner: pointed_to };
-                pointed_to.point_to(target);
+        let (data, removed) = {
+            let mut inner = self.inner.write();
+            let mut removed = Vec::new();
+            let mut resolver = Resolver::new(&mut inner, key);
+            let data = resolver.run(&mut inner, &mut removed);
+            inner.try_auto_flush(&mut removed);
+            #[cfg(feature = "extra_assertions")]
+            {
+                inner.verify_integrity()
             }
-        }
-
-        target.with_mut(|inner| {
-            inner.pointed_to_by.push(Arc::downgrade(&self.inner));
-        });
-        let target = target.inner.load_full();
-        self.inner.store(target);
-    }
-
-    pub(crate) fn create_element_wise(
-        &self,
-        function: ElementWiseOperation,
-    ) -> ElementWiseComputeNodeKey {
-        let id = ElementWiseComputeNodeKey::new();
-        self.with_mut(|inner| {
-            inner.nodes.element_wise.insert(id, function);
-            inner.add_reference(id.into());
-        });
-        id
-    }
-
-    pub(crate) fn create_pair_wise(&self, function: PairWiseOperation) -> PairWiseComputeNodeKey {
-        let id = PairWiseComputeNodeKey::new();
-        self.with_mut(|inner| {
-            inner.nodes.pair_wise.insert(id, function);
-            inner.add_reference(id.into());
-        });
-        id
-    }
-
-    pub(crate) fn create_mat_mul(&self, function: MatMulOperation) -> MatMulComputeNodeKey {
-        let id = MatMulComputeNodeKey::new();
-        self.with_mut(|inner| {
-            inner.nodes.mat_mul.insert(id, function);
-            inner.add_reference(id.into());
-        });
-        id
-    }
-
-    pub(crate) fn create_q_mat_mul(&self, function: QMatMulOperation) -> QMatMulComputeNodeKey {
-        let id = QMatMulComputeNodeKey::new();
-        self.with_mut(|inner| {
-            inner.nodes.q_mat_mul.insert(id, function);
-            inner.add_reference(id.into());
-        });
-        id
-    }
-
-    pub(crate) fn create_reduce(&self, function: ReduceOperation) -> ReduceComputeNodeKey {
-        let id = ReduceComputeNodeKey::new();
-        self.with_mut(|inner| {
-            inner.nodes.reduce.insert(id, function);
-            inner.add_reference(id.into());
-        });
-        id
-    }
-
-    pub(crate) fn create_map_layout(&self, op: MapLayoutOperation) -> MapLayoutComputeNodeKey {
-        let id = MapLayoutComputeNodeKey::new();
-        self.with_mut(|inner| {
-            inner.nodes.map_layout.insert(id, op);
-            inner.add_reference(id.into());
-        });
-        id
-    }
-
-    pub(crate) fn create_resize(&self, op: ResizeOperation) -> ResizeComputeNodeKey {
-        let id = ResizeComputeNodeKey::new();
-        self.with_mut(|inner| {
-            inner.nodes.resize.insert(id, op);
-            inner.add_reference(id.into());
-        });
-        id
-    }
-
-    pub(crate) fn create_slice_assign(
-        &self,
-        op: SliceAssignOperation,
-    ) -> SliceAssignComputeNodeKey {
-        let id = SliceAssignComputeNodeKey::new();
-        self.with_mut(|inner| {
-            inner.nodes.slice_assign.insert(id, op);
-            inner.add_reference(id.into());
-        });
-        id
-    }
-
-    pub(crate) fn create_index_select(
-        &self,
-        op: IndexSelectOperation,
-    ) -> IndexSelectComputeNodeKey {
-        let id = IndexSelectComputeNodeKey::new();
-        self.with_mut(|inner| {
-            inner.nodes.index_select.insert(id, op);
-            inner.add_reference(id.into());
-        });
-        id
-    }
-
-    pub(crate) fn create_tensor(&self, info: TensorData) -> TensorComputeNodeKey {
-        let id = TensorComputeNodeKey::new();
-        self.with_mut(|inner| {
-            inner.nodes.tensor.insert(id, info);
-            inner.add_reference(id.into());
-        });
-        id
-    }
-
-    pub(crate) fn dequantize(&self, matrix: QMatrix, ty: DataTypeEnum) -> DequantizeComputeKey {
-        let id = DequantizeComputeKey::new();
-        self.with_mut(|inner| {
-            inner
-                .nodes
-                .dequantize
-                .insert(id, DequantizeOperation::new(matrix, ty));
-            inner.add_reference(id.into());
-        });
-        id
-    }
-
-    pub(crate) fn create_custom(
-        &self,
-        operation: Arc<dyn Operation + Send + Sync>,
-    ) -> CustomComputeKey {
-        let id = CustomComputeKey::new();
-        self.with_mut(|inner| {
-            inner.nodes.custom.insert(id, operation);
-            inner.add_reference(id.into());
-        });
-        id
-    }
-
-    pub(crate) fn resolve(&self, key: AnyComputeKey, device: &Device) -> TensorData {
-        let mut encoder = device
-            .wgpu_device()
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("ComputeGraph Encoder"),
-            });
-        let data = self.with_mut(|inner| Resolver::new(inner, key, &mut encoder).run());
-        device.wgpu_queue().submit(Some(encoder.finish()));
-        // Reset the written flag on all buffers
-        device.reset_initialized_buffers();
-
-        // Flush the cache to a file
-        if let (Some(pipeline_cache), Some(cache_file)) =
-            (device.wgpu_cache(), device.wgpu_cache_file())
-        {
-            let data = pipeline_cache.get_data();
-            if let Some(data) = data {
-                let temp_file = cache_file.with_extension("temp");
-                std::fs::write(&temp_file, &data).unwrap();
-                std::fs::rename(&temp_file, cache_file).unwrap();
-            }
-        }
+            (data, removed)
+        };
+        // Drop removed nodes now that the resolver has submitted its commands.
+        drop(removed);
 
         data
     }
 
-    pub(crate) fn graphvis(&self, key: AnyComputeKey) -> Graph {
-        self.with_mut(|inner| inner.graphvis(key))
+    /// Resolve multiple targets in a single pass. Since sequential `resolve()`
+    /// now reuses kernels across sibling targets (via the
+    /// `live_descendant_count` predicate in the freeing path), this is
+    /// primarily a hint to share one command-encoder submission.
+    pub(crate) fn resolve_batch(&self, keys: &[NodeIndex]) -> usize {
+        if keys.is_empty() {
+            return 0;
+        }
+        let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+            || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+        let start = trace.then(std::time::Instant::now);
+        let total_kernels;
+        let removed = {
+            let mut inner = self.inner.write();
+            let mut removed = Vec::new();
+            let mut resolver = Resolver::new_batch(&mut inner, keys.to_vec());
+            let result = resolver.run(&mut inner, &mut removed);
+            total_kernels = result.total_kernels;
+            if let Some(start) = start {
+                eprintln!(
+                    "resolve_batch keys={} kernels={} elapsed={:?}",
+                    keys.len(),
+                    result.total_kernels,
+                    start.elapsed()
+                );
+            }
+            inner.try_auto_flush(&mut removed);
+            #[cfg(feature = "extra_assertions")]
+            {
+                inner.verify_integrity()
+            }
+            removed
+        };
+        drop(removed);
+        total_kernels
     }
 
-    pub(crate) fn remove_reference(&self, key: AnyComputeKey) {
-        self.with_mut(|inner| {
-            inner.remove_reference(key);
-        });
+    #[cfg(feature = "graphvis")]
+    pub(crate) fn graphvis(&self, root: NodeIndex) -> Graph {
+        self.with_mut(|inner| inner.graphvis(root))
     }
 
-    pub(crate) fn add_reference(&self, key: AnyComputeKey) {
-        self.with_mut(|inner| {
-            inner.add_reference(key);
-        });
+    pub(crate) fn add_reference(&self, key: NodeIndex) {
+        self.with_mut(|inner| inner.add_reference(key));
     }
 
-    pub(crate) fn graph_hash(&self, key: AnyComputeKey) -> u64 {
-        self.with_mut(|inner| inner.graph_hash(key))
+    pub(crate) fn remove_reference(&self, key: NodeIndex) {
+        let removed = {
+            let mut inner = self.inner.write();
+            let mut removed = Vec::new();
+            inner.remove_reference(key, &mut removed);
+            #[cfg(feature = "extra_assertions")]
+            {
+                inner.verify_integrity()
+            }
+            removed
+        };
+        drop(removed);
+    }
+
+    pub(crate) fn detach_cached(&self, keys: &[NodeIndex]) {
+        let removed = {
+            let mut inner = self.inner.write();
+            let mut removed = Vec::new();
+            inner.detach_cached(keys, &mut removed);
+            #[cfg(feature = "extra_assertions")]
+            {
+                inner.verify_integrity()
+            }
+            removed
+        };
+        drop(removed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_flush_threshold(&self, threshold: usize) {
+        self.inner.write().flush_threshold = threshold;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn node_count(&self) -> usize {
+        self.inner.read().nodes.nodes.node_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_descendant_count(&self, key: NodeIndex) -> u32 {
+        self.inner
+            .read()
+            .nodes
+            .nodes
+            .node_weight(key)
+            .map(|n| n.live_descendant_count)
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_cached_for_test(&self, key: NodeIndex) -> bool {
+        self.inner
+            .read()
+            .nodes
+            .nodes
+            .node_weight(key)
+            .map(|n| n.cached.is_some())
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_node_count(&self) -> usize {
+        let inner = self.inner.read();
+        inner
+            .nodes
+            .nodes
+            .node_indices()
+            .filter(|idx| {
+                inner
+                    .nodes
+                    .nodes
+                    .node_weight(*idx)
+                    .map(|n| n.cached.is_some())
+                    .unwrap_or(false)
+            })
+            .count()
     }
 }
 
 #[derive(Default)]
 pub(crate) struct ComputeGraphNodes {
-    pub(crate) element_wise: FxHashMap<ElementWiseComputeNodeKey, ElementWiseOperation>,
-    pub(crate) pair_wise: FxHashMap<PairWiseComputeNodeKey, PairWiseOperation>,
-    pub(crate) mat_mul: FxHashMap<MatMulComputeNodeKey, MatMulOperation>,
-    pub(crate) reduce: FxHashMap<ReduceComputeNodeKey, ReduceOperation>,
-    pub(crate) map_layout: FxHashMap<MapLayoutComputeNodeKey, MapLayoutOperation>,
-    pub(crate) resize: FxHashMap<ResizeComputeNodeKey, ResizeOperation>,
-    pub(crate) slice_assign: FxHashMap<SliceAssignComputeNodeKey, SliceAssignOperation>,
-    pub(crate) index_select: FxHashMap<IndexSelectComputeNodeKey, IndexSelectOperation>,
-    pub(crate) tensor: FxHashMap<TensorComputeNodeKey, TensorData>,
-    pub(crate) q_mat_mul: FxHashMap<QMatMulComputeNodeKey, QMatMulOperation>,
-    pub(crate) dequantize: FxHashMap<DequantizeComputeKey, DequantizeOperation>,
-    pub(crate) custom: FxHashMap<CustomComputeKey, Arc<dyn Operation + Send + Sync>>,
+    pub(crate) nodes: StableGraph<ComputeGraphNode, ()>,
 }
 
-impl ComputeGraphNodes {
-    pub(crate) fn merge(&mut self, other: &mut Self) {
-        self.element_wise.extend(other.element_wise.drain());
-        self.pair_wise.extend(other.pair_wise.drain());
-        self.mat_mul.extend(other.mat_mul.drain());
-        self.reduce.extend(other.reduce.drain());
-        self.map_layout.extend(other.map_layout.drain());
-        self.resize.extend(other.resize.drain());
-        self.slice_assign.extend(other.slice_assign.drain());
-        self.index_select.extend(other.index_select.drain());
-        self.tensor.extend(other.tensor.drain());
-        self.q_mat_mul.extend(other.q_mat_mul.drain());
-        self.dequantize.extend(other.dequantize.drain());
-        self.custom.extend(other.custom.drain());
+pub(crate) struct ComputeGraphNode {
+    variant: ComputeGraphNodeVariant,
+    reference_count: u32,
+    // Number of outgoing edges to children that are currently
+    // `alive_uncached()` (see below). Maintained eagerly; lets the resolver
+    // free intermediates only when no user-held lazy tensor still needs this
+    // node's result to be re-computed. Sequential `resolve()` calls can then
+    // reuse shared ancestors instead of recomputing them, matching
+    // `resolve_batch`. A descendant that has already been resolved (cached)
+    // no longer contributes, so deep chains where only the final tensor is
+    // held still free intermediates eagerly during the resolve.
+    live_descendant_count: u32,
+    cached: Option<TensorData>,
+}
+
+impl ComputeGraphNode {
+    /// True iff this node is still uncached AND has a path to a user-held
+    /// `LazyTensorData` (directly or transitively). Drives counter
+    /// propagation: a parent counts this child in its
+    /// `live_descendant_count` iff `alive_uncached() == true`.
+    fn alive_uncached(&self) -> bool {
+        self.cached.is_none() && (self.reference_count > 0 || self.live_descendant_count > 0)
+    }
+
+    /// True iff this node's `cached` buffer should be preserved past the
+    /// current resolve: either user code holds a `LazyTensorData` for it, or
+    /// some still-uncached live descendant will benefit from it on a future
+    /// resolve. Independent of this node's own `cached` state.
+    fn should_keep_cached(&self) -> bool {
+        self.reference_count > 0 || self.live_descendant_count > 0
+    }
+}
+
+pub(crate) trait GraphOperation: Operation + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+
+    fn category(&self) -> &'static str;
+
+    fn output_layout(
+        &self,
+        input_layouts: &FxHashMap<NodeIndex, TensorLayoutInfo>,
+    ) -> Option<TensorLayoutInfo>;
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ComputeGraphNodeVariant {
+    Nary(NaryOperation),
+    SliceAssign(SliceAssignOperation),
+    Resize(ResizeOperation),
+    MapLayout(MapLayoutOperation),
+    Dequantize(DequantizeOperation),
+    QEmbedding(QEmbeddingOperation),
+    MatMul(MatMulOperation),
+    QMatMul(Box<QMatMulOperation>),
+    Tensor(TensorData),
+    Reduce(ReduceOperation),
+    FlashAttention(FlashAttentionOperation),
+    GraphOp(Arc<dyn GraphOperation>),
+}
+
+impl ComputeGraphNodeVariant {
+    fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
+        match &self {
+            ComputeGraphNodeVariant::Nary(op) => {
+                for input in &op.inputs {
+                    f(*input);
+                }
+            }
+            ComputeGraphNodeVariant::MatMul(op) => {
+                f(op.first);
+                f(op.second);
+            }
+            ComputeGraphNodeVariant::QMatMul(op) => {
+                f(op.input);
+                if let Some(epilogue) = &op.pre_element_wise_expr {
+                    for extra in &epilogue.extras {
+                        f(*extra);
+                    }
+                }
+                if let Some(epilogue) = &op.post_element_wise_expr {
+                    for extra in &epilogue.extras {
+                        f(*extra);
+                    }
+                }
+                if let Some(paired) = &op.paired {
+                    for extra in &paired.extras {
+                        f(*extra);
+                    }
+                }
+            }
+            ComputeGraphNodeVariant::QEmbedding(op) => {
+                f(op.indexes);
+            }
+            ComputeGraphNodeVariant::Reduce(op) => f(op.value),
+            ComputeGraphNodeVariant::FlashAttention(op) => op.visit_dependencies(f),
+            ComputeGraphNodeVariant::GraphOp(op) => op.visit_dependencies(f),
+            ComputeGraphNodeVariant::MapLayout(op) => f(op.input),
+            ComputeGraphNodeVariant::Resize(op) => f(op.input),
+            ComputeGraphNodeVariant::SliceAssign(op) => {
+                f(op.input);
+                f(op.value);
+            }
+            ComputeGraphNodeVariant::Dequantize(_) => {}
+            ComputeGraphNodeVariant::Tensor(_) => {}
+        }
     }
 }
 
 pub(crate) struct ComputeGraphInner {
-    pub(crate) device: Device,
+    pub(crate) device: crate::WeakDevice,
     pub(crate) nodes: ComputeGraphNodes,
+    // Auto-flush all pending lazy outputs once the graph grows past this many
+    // nodes. Bounds memory growth on fully-lazy loops (e.g. vision encoders)
+    // where the user would otherwise need to sprinkle explicit `resolve()`
+    // calls. 0 disables.
+    flush_threshold: usize,
+}
 
-    pub(crate) cached_results: FxHashMap<AnyComputeKey, TensorData>,
+const DEFAULT_FLUSH_THRESHOLD: usize = 8192;
 
-    dependency_map: DependencyMap,
-
-    pointed_to_by: Vec<Weak<ArcSwapAny<Arc<RwLock<ComputeGraphInner>>>>>,
+fn read_flush_threshold() -> usize {
+    std::env::var("FUSOR_GRAPH_FLUSH_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_FLUSH_THRESHOLD)
 }
 
 impl ComputeGraphInner {
-    fn new(device: Device) -> Self {
+    fn new(device: &Device) -> Self {
+        Self {
+            device: device.downgrade(),
+            nodes: ComputeGraphNodes::default(),
+            flush_threshold: read_flush_threshold(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(device: crate::WeakDevice) -> Self {
         Self {
             device,
             nodes: ComputeGraphNodes::default(),
-            cached_results: Default::default(),
-            dependency_map: DependencyMap::default(),
-            pointed_to_by: Vec::new(),
+            flush_threshold: 0,
         }
     }
 
-    fn add_reference(&mut self, key: AnyComputeKey) {
-        match self.dependency_map.reference_count.get_mut(&key) {
-            Some(count) => {
-                *count += 1;
-            }
-            None => {
-                self.dependency_map.reference_count.insert(key, 1);
-                self.dependency_map.add_dependents(key, &self.nodes);
-            }
-        }
-    }
-
-    fn remove_reference(&mut self, key: AnyComputeKey) {
-        if let Some(count) = self.dependency_map.reference_count.get_mut(&key) {
-            *count -= 1;
-            // Remove the node if it is dead
-            self.check_life(key);
-        }
-    }
-
-    fn check_life(&mut self, key: AnyComputeKey) {
-        if let Some(count) = self.dependency_map.reference_count.get(&key) {
-            if *count > 0 {
-                // The node still has references, so it is alive
-                return;
-            }
-        } else {
-            // The node is already dead
+    /// If the graph has grown past the configured threshold, materialize every
+    /// pending lazy output (nodes with `reference_count > 0 && cached.is_none()`)
+    /// in a single batched resolve. The user has already expressed intent to
+    /// consume each of those outputs (via a live `LazyTensorData` handle), so
+    /// this never forces work the user didn't ask for — it just compresses the
+    /// schedule. Called from the end of `resolve()` / `resolve_batch()`.
+    fn try_auto_flush(&mut self, removed: &mut Vec<ComputeGraphNode>) {
+        if self.flush_threshold == 0 {
             return;
         }
-        // Check if any of the nodes that depend on this key are alive
-        if let Some(dependents) = self.dependency_map.dependant_map.get(&key) {
-            for dependant in dependents {
-                // If the dependant still exists and it hasn't been computed yet
-                // keep this node alive
-                let alive = self.dependency_map.reference_count.contains_key(dependant);
-                let computed = self.cached_results.contains_key(dependant);
-                if alive && !computed {
-                    return;
+        if self.nodes.nodes.node_count() < self.flush_threshold {
+            return;
+        }
+        let pending: Vec<NodeIndex> = self
+            .nodes
+            .nodes
+            .node_indices()
+            .filter(|&k| {
+                let Some(n) = self.nodes.nodes.node_weight(k) else {
+                    return false;
+                };
+                n.reference_count > 0 && n.cached.is_none()
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let mut resolver = Resolver::new_batch(self, pending);
+        let _ = resolver.run(self, removed);
+    }
+
+    /// Upgrade the weak device reference to a strong one.
+    /// Panics if the device has been dropped (should not happen during normal operation).
+    pub(crate) fn device(&self) -> Device {
+        self.device
+            .upgrade()
+            .expect("Device was dropped while ComputeGraph is still in use")
+    }
+
+    fn create_node(&mut self, node: ComputeGraphNodeVariant) -> NodeIndex {
+        let node = self.nodes.nodes.add_node(ComputeGraphNode {
+            variant: node,
+            reference_count: 1,
+            live_descendant_count: 0,
+            cached: None,
+        });
+        // New node has `reference_count = 1`, so it is alive. Adding edges
+        // below propagates that liveness up to each dependency.
+        self.add_dependency_edges(node);
+        node
+    }
+
+    fn add_reference(&mut self, key: NodeIndex) {
+        let transitioned_alive = {
+            let node = self.nodes.nodes.node_weight_mut(key).unwrap();
+            let prev_alive = node.alive_uncached();
+            node.reference_count += 1;
+            !prev_alive && node.alive_uncached()
+        };
+        if transitioned_alive {
+            self.propagate_alive_change(key, true);
+        }
+    }
+
+    fn add_dependency_edges(&mut self, key: NodeIndex) {
+        let mut dependencies = Vec::new();
+        self.visit_dependencies(key, &mut |dep| {
+            dependencies.push(dep);
+        });
+        for dep in dependencies {
+            self.add_dependency_edge(dep, key);
+        }
+    }
+
+    /// Add an edge `from -> to` and maintain `live_descendant_count`.
+    pub(crate) fn add_dependency_edge(&mut self, from: NodeIndex, to: NodeIndex) {
+        self.nodes.nodes.add_edge(from, to, ());
+        let to_alive = self
+            .nodes
+            .nodes
+            .node_weight(to)
+            .map(|n| n.alive_uncached())
+            .unwrap_or(false);
+        if !to_alive {
+            return;
+        }
+        let from_transitioned = {
+            let Some(from_node) = self.nodes.nodes.node_weight_mut(from) else {
+                return;
+            };
+            let prev_alive = from_node.alive_uncached();
+            from_node.live_descendant_count = from_node
+                .live_descendant_count
+                .checked_add(1)
+                .expect("live_descendant_count overflow");
+            !prev_alive && from_node.alive_uncached()
+        };
+        if from_transitioned {
+            self.propagate_alive_change(from, true);
+        }
+    }
+
+    /// Propagate an `alive_uncached`-state change to all ancestors.
+    /// `now_alive = true` if `start` transitioned not-alive_uncached →
+    /// alive_uncached, otherwise the reverse.
+    fn propagate_alive_change(&mut self, start: NodeIndex, now_alive: bool) {
+        let mut stack = vec![start];
+        while let Some(child) = stack.pop() {
+            let parents: Vec<NodeIndex> = self
+                .nodes
+                .nodes
+                .neighbors_directed(child, petgraph::Direction::Incoming)
+                .collect();
+            for parent in parents {
+                let parent_transitioned = {
+                    let Some(parent_node) = self.nodes.nodes.node_weight_mut(parent) else {
+                        continue;
+                    };
+                    let prev_parent_alive = parent_node.alive_uncached();
+                    if now_alive {
+                        parent_node.live_descendant_count = parent_node
+                            .live_descendant_count
+                            .checked_add(1)
+                            .expect("live_descendant_count overflow");
+                    } else {
+                        parent_node.live_descendant_count =
+                            parent_node.live_descendant_count.saturating_sub(1);
+                    }
+                    prev_parent_alive != parent_node.alive_uncached()
+                };
+                if parent_transitioned {
+                    stack.push(parent);
                 }
             }
         }
+    }
+
+    fn visit_dependencies(&self, key: NodeIndex, f: &mut dyn FnMut(NodeIndex)) {
+        if let Some(node) = self.nodes.nodes.node_weight(key) {
+            node.variant.visit_dependencies(f);
+        }
+    }
+
+    fn ensure_tensor_cached(&mut self, key: NodeIndex) -> Option<()> {
+        if self.get_cached_result(key).is_some() {
+            return Some(());
+        }
+
+        let data = match self.nodes.nodes.node_weight(key)?.variant.clone() {
+            ComputeGraphNodeVariant::Tensor(data) => data,
+            _ => return None,
+        };
+        self.set_cached_result(key, data);
+        Some(())
+    }
+
+    fn try_submit_direct_qmatmul(
+        &mut self,
+        operation: &QMatMulOperation,
+    ) -> Option<(TensorData, usize)> {
+        self.ensure_tensor_cached(operation.input)?;
+
+        let device = self.device();
+        let workgroup_shape = crate::mir::workgroup_shape::WorkgroupShape::new(1, 1, 1);
+        let inputs = operation.inputs(self);
+        let direct_kernel_plan = operation
+            .build_direct_kernels(self, &workgroup_shape, &inputs)
+            .ok()?;
+        let MirValue::Tensor(output) = operation.output(self, &inputs) else {
+            return None;
+        };
+
+        let mut command_encoder =
+            device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("QMatMul Direct Encoder"),
+                });
+        let total_kernels = direct_kernel_plan.dispatch_count();
+        for direct_kernel in direct_kernel_plan.into_kernels() {
+            direct_kernel.run(device.kernel_cache(), &mut command_encoder);
+        }
+        if total_kernels > 0 {
+            device.wgpu_queue().submit(Some(command_encoder.finish()));
+            device.reset_initialized_buffers();
+        }
+
+        Some((output, total_kernels))
+    }
+
+    fn try_resolve_direct_qmatmul(&mut self, key: NodeIndex) -> Option<ResolverResult> {
+        let operation = match self.nodes.nodes.node_weight(key)?.variant.clone() {
+            ComputeGraphNodeVariant::QMatMul(operation) => operation,
+            _ => return None,
+        };
+        let (output, total_kernels) = self.try_submit_direct_qmatmul(&operation)?;
+        self.set_cached_result(key, output.clone());
+        Some(ResolverResult {
+            data: output,
+            total_kernels,
+        })
+    }
+
+    fn remove_reference(&mut self, key: NodeIndex, removed: &mut Vec<ComputeGraphNode>) {
+        let transitioned_dead = {
+            let node = self.nodes.nodes.node_weight_mut(key).unwrap();
+            let prev_alive = node.alive_uncached();
+            node.reference_count = node.reference_count.saturating_sub(1);
+            prev_alive && !node.alive_uncached()
+        };
+        if transitioned_dead {
+            self.propagate_alive_change(key, false);
+        }
+        self.check_life(key, removed);
+    }
+
+    fn check_life(&mut self, key: NodeIndex, removed: &mut Vec<ComputeGraphNode>) {
+        // The node is needed iff it has external references OR some
+        // uncached live descendant. `live_descendant_count` is maintained
+        // eagerly, so this is O(1).
+        match self
+            .nodes
+            .nodes
+            .node_weight(key)
+            .map(|n| n.should_keep_cached())
+        {
+            Some(true) | None => return,
+            Some(false) => {}
+        }
 
         let mut dependencies = Vec::new();
-        visit_dependencies(&self.nodes, key, |dependency| {
+        self.visit_dependencies(key, &mut |dependency| {
             dependencies.push(dependency);
         });
 
-        // If no other nodes depend on this key and it has zero references, it is dead
-        // remove it from the graph
-        self.remove_key(key);
+        // Not needed — remove it. Per the invariant above, the node's
+        // `alive_uncached` was already false (cached.is_some() or
+        // ref==luc==0), so its contribution to each parent's
+        // `live_descendant_count` is already 0; no further bookkeeping is
+        // needed when the edges go away with the node.
+        self.remove_key(key, removed);
 
-        // Then check if any nodes it depends on are alive
         for dependency in dependencies {
-            self.check_life(dependency);
+            self.check_life(dependency, removed);
         }
     }
 
-    fn remove_key(&mut self, key: AnyComputeKey) {
-        // Remove the cached result if it exists
-        visit_dependencies(&self.nodes, key, |dependency| {
-            if let Some(map) = self.dependency_map.dependant_map.get_mut(&dependency) {
-                map.remove(&key);
+    fn remove_key(&mut self, key: NodeIndex, removed: &mut Vec<ComputeGraphNode>) {
+        // Remove the node from the graph (this also removes all edges)
+        if let Some(node) = self.nodes.nodes.remove_node(key) {
+            removed.push(node);
+        }
+    }
+
+    fn detach_cached(&mut self, keys: &[NodeIndex], removed: &mut Vec<ComputeGraphNode>) {
+        for &key in keys {
+            let Some(data) = self.get_cached_result(key).cloned() else {
+                continue;
+            };
+
+            let mut dependencies = Vec::new();
+            self.visit_dependencies(key, &mut |dependency| {
+                dependencies.push(dependency);
+            });
+
+            if let Some(node) = self.nodes.nodes.node_weight_mut(key) {
+                node.variant = ComputeGraphNodeVariant::Tensor(data.clone());
+                node.cached = Some(data);
             }
-        });
-        self.dependency_map.dependant_map.remove(&key);
-        self.cached_results.remove(&key);
-        self.dependency_map.reference_count.remove(&key);
-        match key {
-            AnyComputeKey::ElementWise(element_wise_compute_node_key) => {
-                self.nodes
-                    .element_wise
-                    .remove(&element_wise_compute_node_key);
+
+            // Decoupling `key` from its dependencies: each parent loses `key`
+            // as a child. Because we just set `key.cached = Some(...)`, `key`
+            // is no longer `alive_uncached`, so its parents' counter already
+            // doesn't include it — removing the edges needs no further
+            // counter bookkeeping. The dependencies themselves may become
+            // collectable, so we still check_life them below.
+            let incoming: Vec<petgraph::graph::EdgeIndex> = self
+                .nodes
+                .nodes
+                .edges_directed(key, petgraph::Direction::Incoming)
+                .map(|edge| edge.id())
+                .collect();
+            for edge_id in incoming {
+                self.nodes.nodes.remove_edge(edge_id);
             }
-            AnyComputeKey::PairWise(pair_wise_compute_node_key) => {
-                self.nodes.pair_wise.remove(&pair_wise_compute_node_key);
-            }
-            AnyComputeKey::MatMul(mat_mul_compute_node_key) => {
-                self.nodes.mat_mul.remove(&mat_mul_compute_node_key);
-            }
-            AnyComputeKey::Reduce(reduce_compute_node_key) => {
-                self.nodes.reduce.remove(&reduce_compute_node_key);
-            }
-            AnyComputeKey::MapLayout(map_layout_compute_node_key) => {
-                self.nodes.map_layout.remove(&map_layout_compute_node_key);
-            }
-            AnyComputeKey::Resize(resize_compute_node_key) => {
-                self.nodes.resize.remove(&resize_compute_node_key);
-            }
-            AnyComputeKey::SliceAssign(slice_assign_compute_node_key) => {
-                self.nodes
-                    .slice_assign
-                    .remove(&slice_assign_compute_node_key);
-            }
-            AnyComputeKey::IndexSelect(index_select_compute_node_key) => {
-                self.nodes
-                    .index_select
-                    .remove(&index_select_compute_node_key);
-            }
-            AnyComputeKey::QMatMul(q_mat_mul_compute_node_key) => {
-                self.nodes.q_mat_mul.remove(&q_mat_mul_compute_node_key);
-            }
-            AnyComputeKey::Tensor(tensor_compute_node_key) => {
-                self.nodes.tensor.remove(&tensor_compute_node_key);
-            }
-            AnyComputeKey::Dequantize(dequantize_compute_key) => {
-                self.nodes.dequantize.remove(&dequantize_compute_key);
-            }
-            AnyComputeKey::Custom(custom_compute_key) => {
-                self.nodes.custom.remove(&custom_compute_key);
+
+            for dependency in dependencies {
+                self.check_life(dependency, removed);
             }
         }
     }
 
-    pub(crate) fn get_result_or_qmatrix(&self, key: AnyComputeKey) -> Option<MaybeQData> {
-        let result = if let AnyComputeKey::Dequantize(key) = key {
-            let tensor = &self.nodes.dequantize.get(&key)?;
-            tensor.matrix.clone().into()
-        } else {
-            self.cached_results.get(&key)?.clone().into()
+    pub(crate) fn get_result_or_qmatrix(&self, key: NodeIndex) -> Option<MaybeQData> {
+        let node = self.nodes.nodes.node_weight(key)?;
+        if let Some(cached) = &node.cached {
+            return Some(cached.clone().into());
+        }
+        match &node.variant {
+            ComputeGraphNodeVariant::Dequantize(op) => Some(op.matrix.clone().into()),
+            ComputeGraphNodeVariant::Tensor(op) => Some(op.clone().into()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn get_result(&self, key: NodeIndex) -> Option<TensorData> {
+        self.get_cached_result(key).cloned()
+    }
+
+    pub(crate) fn set_cached_result(&mut self, key: NodeIndex, data: TensorData) {
+        // Setting `cached` flips `alive_uncached` false: a cached node no
+        // longer needs to be recomputed, so its parents can free their own
+        // cached buffers once no other uncached descendant remains. Propagate
+        // the transition so ancestor counters reflect the new state.
+        let transitioned_dead = {
+            let node = self.nodes.nodes.node_weight_mut(key).unwrap();
+            let prev_alive = node.alive_uncached();
+            node.cached = Some(data);
+            prev_alive && !node.alive_uncached()
         };
-        Some(result)
+        if transitioned_dead {
+            self.propagate_alive_change(key, false);
+        }
     }
 
-    pub(crate) fn get_result(&self, key: AnyComputeKey) -> Option<TensorData> {
-        self.cached_results.get(&key).cloned()
+    pub(crate) fn get_cached_result(&self, key: NodeIndex) -> Option<&TensorData> {
+        self.nodes
+            .nodes
+            .node_weight(key)
+            .and_then(|n| n.cached.as_ref())
+    }
+
+    pub(crate) fn has_live_reference(&self, key: NodeIndex) -> bool {
+        self.nodes
+            .nodes
+            .node_weight(key)
+            .map(|n| n.reference_count > 0)
+            .unwrap_or(false)
+    }
+
+    /// Returns true if this node's cached buffer would still benefit some
+    /// future resolve: either the user holds a `LazyTensorData` for it
+    /// directly, or some uncached live descendant will read its cached value
+    /// instead of recomputing. Backed by the eagerly-maintained
+    /// `live_descendant_count`, so this is O(1).
+    pub(crate) fn has_live_lazy_descendant(&self, key: NodeIndex) -> bool {
+        self.nodes
+            .nodes
+            .node_weight(key)
+            .map(|n| n.should_keep_cached())
+            .unwrap_or(false)
     }
 
     #[cfg(feature = "extra_assertions")]
-    fn contains_key(&self, key: AnyComputeKey) -> bool {
-        if self.cached_results.contains_key(&key) {
-            return true;
-        }
-        match key {
-            AnyComputeKey::ElementWise(key) => self.nodes.element_wise.contains_key(&key),
-            AnyComputeKey::PairWise(key) => self.nodes.pair_wise.contains_key(&key),
-            AnyComputeKey::MatMul(key) => self.nodes.mat_mul.contains_key(&key),
-            AnyComputeKey::Reduce(key) => self.nodes.reduce.contains_key(&key),
-            AnyComputeKey::MapLayout(key) => self.nodes.map_layout.contains_key(&key),
-            AnyComputeKey::Resize(key) => self.nodes.resize.contains_key(&key),
-            AnyComputeKey::SliceAssign(key) => self.nodes.slice_assign.contains_key(&key),
-            AnyComputeKey::IndexSelect(key) => self.nodes.index_select.contains_key(&key),
-            AnyComputeKey::Tensor(key) => self.nodes.tensor.contains_key(&key),
-            AnyComputeKey::QMatMul(key) => self.nodes.q_mat_mul.contains_key(&key),
-            AnyComputeKey::Dequantize(key) => self.nodes.dequantize.contains_key(&key),
-            AnyComputeKey::Custom(key) => self.nodes.custom.contains_key(&key),
-        }
+    fn contains_key(&self, key: NodeIndex) -> bool {
+        self.nodes.nodes.contains_node(key)
     }
 
     #[cfg(feature = "extra_assertions")]
     fn verify_integrity(&self) {
-        // Check that all node references exist in the graph
-        for key in self.dependency_map.reference_count.keys() {
-            assert!(
-                self.contains_key(*key),
-                "{key:?} does not exist in the reference map"
-            );
-        }
-        for (key, dependants) in self.dependency_map.dependant_map.iter() {
-            assert!(
-                self.contains_key(*key),
-                "{key:?} is in the dependant map, but it doesn't exist"
-            );
-            for dependant in dependants {
+        // Check that all edges point to existing nodes
+        for key in self.nodes.nodes.node_indices() {
+            for neighbor in self.nodes.nodes.neighbors(key) {
                 assert!(
-                    self.contains_key(*dependant),
-                    "the dependant {dependant:?} of {key:?} does not exist"
+                    self.nodes.nodes.contains_node(neighbor),
+                    "edge points to non-existent node {neighbor:?}"
                 );
             }
         }
 
-        let keys = self
-            .nodes
-            .element_wise
-            .keys()
-            .copied()
-            .map(AnyComputeKey::from)
-            .chain(
-                self.nodes
-                    .pair_wise
-                    .keys()
-                    .copied()
-                    .map(AnyComputeKey::from),
-            )
-            .chain(self.nodes.mat_mul.keys().copied().map(AnyComputeKey::from))
-            .chain(self.nodes.reduce.keys().copied().map(AnyComputeKey::from))
-            .chain(
-                self.nodes
-                    .map_layout
-                    .keys()
-                    .copied()
-                    .map(AnyComputeKey::from),
-            )
-            .chain(self.nodes.resize.keys().copied().map(AnyComputeKey::from))
-            .chain(
-                self.nodes
-                    .slice_assign
-                    .keys()
-                    .copied()
-                    .map(AnyComputeKey::from),
-            )
-            .chain(
-                self.nodes
-                    .index_select
-                    .keys()
-                    .copied()
-                    .map(AnyComputeKey::from),
-            )
-            .chain(self.nodes.tensor.keys().copied().map(AnyComputeKey::from))
-            .chain(
-                self.nodes
-                    .q_mat_mul
-                    .keys()
-                    .copied()
-                    .map(AnyComputeKey::from),
-            )
-            .chain(
-                self.nodes
-                    .dequantize
-                    .keys()
-                    .copied()
-                    .map(AnyComputeKey::from),
-            );
-
-        for key in keys {
-            if self.cached_results.contains_key(&key) {
+        // Check that all dependencies of non-cached nodes exist
+        for key in self.nodes.nodes.node_indices() {
+            let is_cached = self
+                .nodes
+                .nodes
+                .node_weight(key)
+                .map(|n| n.cached.is_some())
+                .unwrap_or(false);
+            if is_cached {
                 continue;
             }
-            visit_dependencies(&self.nodes, key, |dependency| {
-                assert!(self.contains_key(dependency));
+            self.visit_dependencies(key, &mut |dependency| {
+                assert!(
+                    self.contains_key(dependency),
+                    "dependency {dependency:?} of {key:?} does not exist"
+                );
             });
         }
-    }
 
-    pub(crate) fn graph_hash(&self, key: AnyComputeKey) -> u64 {
-        let mut cache = FxHashMap::default();
-        self.compute_node_hash(key, &mut cache)
-    }
-
-    fn compute_node_hash(
-        &self,
-        key: AnyComputeKey,
-        cache: &mut FxHashMap<AnyComputeKey, u64>,
-    ) -> u64 {
-        if let Some(&hash) = cache.get(&key) {
-            return hash;
+        // Check that `live_descendant_count` matches the number of outgoing
+        // edges to `alive_uncached()` children.
+        for key in self.nodes.nodes.node_indices() {
+            let expected: u32 = self
+                .nodes
+                .nodes
+                .neighbors_directed(key, petgraph::Direction::Outgoing)
+                .filter(|child| {
+                    self.nodes
+                        .nodes
+                        .node_weight(*child)
+                        .map(|n| n.alive_uncached())
+                        .unwrap_or(false)
+                })
+                .count()
+                .try_into()
+                .expect("live_descendant_count exceeds u32");
+            let actual = self
+                .nodes
+                .nodes
+                .node_weight(key)
+                .map(|n| n.live_descendant_count)
+                .unwrap_or(0);
+            assert_eq!(
+                actual, expected,
+                "live_descendant_count mismatch at {key:?}: expected {expected}, got {actual}"
+            );
         }
-
-        let mut hasher = DefaultHasher::new();
-
-        let discriminant = std::mem::discriminant(&key);
-        discriminant.hash(&mut hasher);
-        match key {
-            AnyComputeKey::Tensor(tensor_key) => {
-                if let Some(tensor) = self.nodes.tensor.get(&tensor_key) {
-                    tensor.info().datatype().hash(&mut hasher);
-                    tensor.info().shape().hash(&mut hasher);
-                }
-            }
-            AnyComputeKey::ElementWise(ew_key) => {
-                if let Some(op) = self.nodes.element_wise.get(&ew_key) {
-                    let dep_hash = self.compute_node_hash(op.value, cache);
-                    dep_hash.hash(&mut hasher);
-                    op.shape.hash(&mut hasher);
-                    // Hash element-wise functions
-                    for func in op.functions.iter() {
-                        func.datatype.hash(&mut hasher);
-                        func.operation.hash(&mut hasher);
-                        if let Some(name) = &func.name {
-                            name.hash(&mut hasher);
-                        }
-                    }
-                }
-            }
-            AnyComputeKey::PairWise(pw_key) => {
-                if let Some(op) = self.nodes.pair_wise.get(&pw_key) {
-                    let first_hash = self.compute_node_hash(op.first, cache);
-                    let second_hash = self.compute_node_hash(op.second, cache);
-                    first_hash.hash(&mut hasher);
-                    second_hash.hash(&mut hasher);
-                    op.function.datatype.hash(&mut hasher);
-                    op.function.operation.hash(&mut hasher);
-                    if let Some(name) = &op.function.name {
-                        name.hash(&mut hasher);
-                    }
-                }
-            }
-            AnyComputeKey::MatMul(mm_key) => {
-                if let Some(op) = self.nodes.mat_mul.get(&mm_key) {
-                    let first_hash = self.compute_node_hash(op.first, cache);
-                    let second_hash = self.compute_node_hash(op.second, cache);
-                    first_hash.hash(&mut hasher);
-                    second_hash.hash(&mut hasher);
-                    op.datatype.hash(&mut hasher);
-                    op.first_shape.hash(&mut hasher);
-                    op.second_shape.hash(&mut hasher);
-                    op.out_shape.hash(&mut hasher);
-                }
-            }
-            AnyComputeKey::QMatMul(qmm_key) => {
-                if let Some(op) = self.nodes.q_mat_mul.get(&qmm_key) {
-                    let input_hash = self.compute_node_hash(op.input, cache);
-                    input_hash.hash(&mut hasher);
-                    op.input_datatype.hash(&mut hasher);
-                    op.in_shape.hash(&mut hasher);
-                    op.out_shape.hash(&mut hasher);
-                    // Hash quantized matrix properties
-                    op.matrix.shape().hash(&mut hasher);
-                    op.matrix.datatype().hash(&mut hasher);
-                }
-            }
-            AnyComputeKey::Reduce(reduce_key) => {
-                if let Some(op) = self.nodes.reduce.get(&reduce_key) {
-                    let dep_hash = self.compute_node_hash(op.value, cache);
-                    dep_hash.hash(&mut hasher);
-                    op.axis.hash(&mut hasher);
-                    op.shape.hash(&mut hasher);
-                    op.function.datatype.hash(&mut hasher);
-                    op.function.operation.hash(&mut hasher);
-                    op.function.initial_value.hash(&mut hasher);
-                    if let Some(name) = &op.function.name {
-                        name.hash(&mut hasher);
-                    }
-                }
-            }
-            AnyComputeKey::MapLayout(ml_key) => {
-                if let Some(op) = self.nodes.map_layout.get(&ml_key) {
-                    let dep_hash = self.compute_node_hash(op.input, cache);
-                    dep_hash.hash(&mut hasher);
-                }
-            }
-            AnyComputeKey::Resize(resize_key) => {
-                if let Some(op) = self.nodes.resize.get(&resize_key) {
-                    let dep_hash = self.compute_node_hash(op.input, cache);
-                    dep_hash.hash(&mut hasher);
-                    op.current_shape.hash(&mut hasher);
-                    op.new_shape.hash(&mut hasher);
-                    op.fill_shape.hash(&mut hasher);
-                }
-            }
-            AnyComputeKey::SliceAssign(sa_key) => {
-                if let Some(op) = self.nodes.slice_assign.get(&sa_key) {
-                    let input_hash = self.compute_node_hash(op.input, cache);
-                    let value_hash = self.compute_node_hash(op.value, cache);
-                    input_hash.hash(&mut hasher);
-                    value_hash.hash(&mut hasher);
-                    for slice in op.slices.iter() {
-                        slice.start.hash(&mut hasher);
-                        slice.end.hash(&mut hasher);
-                    }
-                }
-            }
-            AnyComputeKey::IndexSelect(is_key) => {
-                if let Some(op) = self.nodes.index_select.get(&is_key) {
-                    let input_hash = self.compute_node_hash(op.input, cache);
-                    let indexes_hash = self.compute_node_hash(op.indexes, cache);
-                    input_hash.hash(&mut hasher);
-                    indexes_hash.hash(&mut hasher);
-                    op.datatype.hash(&mut hasher);
-                    op.dimension.hash(&mut hasher);
-                    op.value_shape.hash(&mut hasher);
-                    op.indexes_shape.hash(&mut hasher);
-                }
-            }
-            AnyComputeKey::Dequantize(dq_key) => {
-                if let Some(op) = self.nodes.dequantize.get(&dq_key) {
-                    op.datatype.hash(&mut hasher);
-                    op.matrix.shape().hash(&mut hasher);
-                    op.matrix.datatype().hash(&mut hasher);
-                }
-            }
-            AnyComputeKey::Custom(_) => {
-                // Custom operations don't have a stable hash representation
-            }
-        }
-
-        let hash = hasher.finish();
-        cache.insert(key, hash);
-        hash
     }
 }

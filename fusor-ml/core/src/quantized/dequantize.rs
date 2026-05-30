@@ -1,22 +1,67 @@
 use fusor_gguf::GgmlType;
+use fusor_tile_ir as tile_ir;
+use fusor_tile_ir_kernels as tile_ir_kernels;
 
-use crate::Layout;
 use crate::mir::inputs::MirValue;
 use crate::mir::operation::Operation;
-use crate::mir::workgroup_shape::WorkgroupShapeConstraints;
 use crate::{
-    DataType, DataTypeEnum, Device, ElementWiseFunctions, LazyTensorData, Tensor, TensorData,
-    TensorInfo, compute_graph::ComputeGraph, mir::kernel::GenericKernel,
+    CastTensor, DataType, DataTypeEnum, Device, Layout, LazyTensorData, Tensor, TensorData,
+    TensorInfo,
+    mir::{
+        kernel_backend,
+        kernel_backend::DirectKernel,
+        workgroup_shape::{Constraint, WorkgroupShapeConstraints},
+    },
+    nary_wise::UnaryFunctionChain,
 };
-use std::fmt::Write;
 
-use super::{QMatrix, dequantize_block};
+use super::{QMatrix, QMatrixStorageLayout};
 
-#[derive(Debug)]
+struct DequantizeDirectKernelVariant;
+
+struct QDequantizeKernelParams {
+    matrix_buffer: std::sync::Arc<wgpu::Buffer>,
+    output_buffer: std::sync::Arc<wgpu::Buffer>,
+    output_layout: tile_ir::Layout,
+    output_element: tile_ir::ElementType,
+    format: tile_ir::GgmlQuantFormat,
+    k: u32,
+    n: u32,
+    dispatch_x: u32,
+}
+
+fn emit_qdequantize_kernel(
+    kb: &mut tile_ir::KernelBuilder<std::sync::Arc<wgpu::Buffer>>,
+    params: QDequantizeKernelParams,
+) -> Option<()> {
+    let q = tile_ir_kernels::quantized_matrix_for(
+        kb,
+        params.matrix_buffer,
+        params.format,
+        params.k,
+        params.n,
+    );
+    let y = kb.write_element::<1>(
+        params.output_element,
+        tile_ir::KernelTensorRef::new(params.output_buffer, params.output_layout),
+    );
+    tile_ir_kernels::qdequantize(kb.program(), &q, &y, params.dispatch_x);
+    Some(())
+}
+
+fn datatype_element(datatype: DataTypeEnum) -> Option<tile_ir::ElementType> {
+    Some(match datatype {
+        DataTypeEnum::F32 => tile_ir::ElementType::F32,
+        DataTypeEnum::F16 => tile_ir::ElementType::F16,
+        DataTypeEnum::U32 => return None,
+    })
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct DequantizeOperation {
     pub(crate) matrix: QMatrix,
     pub(crate) datatype: DataTypeEnum,
-    post_dequantize: ElementWiseFunctions,
+    pub(crate) post_dequantize: UnaryFunctionChain,
 }
 
 impl DequantizeOperation {
@@ -24,25 +69,57 @@ impl DequantizeOperation {
         DequantizeOperation {
             matrix,
             datatype,
-            post_dequantize: ElementWiseFunctions::empty(datatype),
+            post_dequantize: UnaryFunctionChain::empty(datatype),
         }
     }
 
-    pub(crate) fn set_post_element_wise(&mut self, post_dequantize: ElementWiseFunctions) {
-        self.post_dequantize = post_dequantize;
-    }
-
-    fn elements_per_block(&self) -> u32 {
-        self.matrix.datatype.block_size() as u32
+    fn direct_quant_format(&self) -> Option<tile_ir::GgmlQuantFormat> {
+        Some(match self.matrix.datatype {
+            GgmlType::Q4_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q4_0Native
+            }
+            GgmlType::Q4_0 => tile_ir::GgmlQuantFormat::Q4_0,
+            GgmlType::Q4_1 => tile_ir::GgmlQuantFormat::Q4_1,
+            GgmlType::Q5_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q5_0Native
+            }
+            GgmlType::Q5_0 => tile_ir::GgmlQuantFormat::Q5_0,
+            GgmlType::Q5_1 => tile_ir::GgmlQuantFormat::Q5_1,
+            GgmlType::Q8_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q8_0Native
+            }
+            GgmlType::Q8_0 => tile_ir::GgmlQuantFormat::Q8_0,
+            GgmlType::Q8_1 => tile_ir::GgmlQuantFormat::Q8_1,
+            GgmlType::Q2K => tile_ir::GgmlQuantFormat::Q2K,
+            GgmlType::Q3K => tile_ir::GgmlQuantFormat::Q3K,
+            GgmlType::Q4K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q4KNative
+            }
+            GgmlType::Q4K => tile_ir::GgmlQuantFormat::Q4K,
+            GgmlType::Q5K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q5KNative
+            }
+            GgmlType::Q5K => tile_ir::GgmlQuantFormat::Q5K,
+            GgmlType::Q6K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q6KNative
+            }
+            GgmlType::Q6K => tile_ir::GgmlQuantFormat::Q6K,
+            GgmlType::Q8K => tile_ir::GgmlQuantFormat::Q8K,
+            GgmlType::F16 | GgmlType::F32 => return None,
+        })
     }
 }
 
 impl Operation for DequantizeOperation {
     fn workgroup_shape_constraints(
         &self,
-        _: &Device,
+        _device: &Device,
     ) -> crate::mir::workgroup_shape::WorkgroupShapeConstraints {
-        WorkgroupShapeConstraints::new()
+        let mut constraints = WorkgroupShapeConstraints::new();
+        constraints.add_constraint(0, Constraint::Equals(16));
+        constraints.add_constraint(1, Constraint::Equals(16));
+        constraints.add_constraint(2, Constraint::Equals(1));
+        constraints
     }
 
     fn dispatch_size(
@@ -50,26 +127,22 @@ impl Operation for DequantizeOperation {
         workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
         _: &[MirValue],
     ) -> [u32; 3] {
-        std::array::from_fn(|i| match i.cmp(&(self.matrix.shape.len() - 1)) {
-            std::cmp::Ordering::Less => {
-                let n = self.matrix.shape[i];
-                (n as u32).div_ceil(workgroup_shape.component(i))
-            }
-            std::cmp::Ordering::Equal => {
-                let n = self.matrix.shape[i];
-                (n as u32).div_ceil(workgroup_shape.component(i) * self.elements_per_block())
-            }
-            std::cmp::Ordering::Greater => 1,
-        })
+        let total = self
+            .matrix
+            .shape
+            .iter()
+            .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))
+            .unwrap_or(u32::MAX);
+        let lanes = workgroup_shape.x() * workgroup_shape.y() * workgroup_shape.z();
+        [total.div_ceil(lanes), 1, 1]
     }
 
-    fn visit_dependencies(&self, _: &mut dyn FnMut(crate::compute_graph::AnyComputeKey)) {}
+    fn visit_dependencies(&self, _: &mut dyn FnMut(crate::compute_graph::NodeIndex)) {}
 
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
         let shape = &self.matrix.shape;
-        let datatype = self.datatype;
-        let output_tensor = TensorData::new_for_shape(&nodes.device, shape, datatype);
-        vec![MirValue::from(self.matrix.clone()), output_tensor.into()]
+        let output_tensor = TensorData::new_for_shape(&nodes.device(), shape, self.datatype);
+        vec![self.matrix.clone().into(), output_tensor.into()]
     }
 
     fn output(&self, _: &crate::compute_graph::ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
@@ -77,72 +150,85 @@ impl Operation for DequantizeOperation {
         output_tensor.into()
     }
 
-    fn build_kernel(
+    fn build_direct_kernel(
         &self,
-        _: &crate::compute_graph::ComputeGraphInner,
-        _: &crate::mir::workgroup_shape::WorkgroupShape,
-        _: &[MirValue],
-        kernel: &mut GenericKernel,
-    ) {
-        let datatype = self.datatype;
-        let rank = self.matrix.shape.len() as u32;
-
-        let input = kernel.add_q_matrix_input(rank, self.matrix.datatype);
-        let output = kernel.add_tensor_input(rank, true, datatype);
-
-        let post_element_wise = self.post_dequantize.add_functions(kernel);
-        let process_output = |input: &str| {
-            post_element_wise
-                .iter()
-                .fold(input.to_string(), |acc, f| f.call(vec![acc]))
-        };
-
-        let global_id = kernel.global_id();
-        let elements_per_block = self.elements_per_block();
-
-        for (dim, axis) in ["x", "y", "z"]
-            .iter()
-            .enumerate()
-            .take(self.matrix.shape.len())
+        graph: &crate::compute_graph::ComputeGraphInner,
+        _workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
+        inputs: &[MirValue],
+    ) -> Option<DirectKernel> {
+        if !matches!(self.datatype, DataTypeEnum::F32 | DataTypeEnum::F16)
+            || !self.post_dequantize.functions.is_empty()
+            || (self.datatype == DataTypeEnum::F16 && !graph.device().f16_supported())
         {
-            writeln!(kernel, "let index_{dim} = {global_id}.{axis};").unwrap();
+            return None;
+        }
+        let [matrix, output] = inputs else {
+            return None;
+        };
+        let MirValue::QMatrix(matrix) = matrix else {
+            return None;
+        };
+        let output = output.as_tensor()?;
+        if output.datatype() != self.datatype {
+            return None;
         }
 
-        write!(kernel, "let chunk_index = ").unwrap();
-        input.strided_index(kernel, (0..).map(|i| format!("index_{i}")));
-        writeln!(kernel, ";").unwrap();
-        writeln!(kernel, "let chunk = {input}[chunk_index];").unwrap();
-
-        dequantize_block(
-            kernel,
-            self.matrix.datatype,
-            "chunk".to_string(),
-            datatype,
-            |i, data, kernel| {
-                let indexes: Box<[_]> = (0..rank)
-                    .map(|dim| {
-                        let base = format!("index_{dim}");
-                        if dim == rank - 1 {
-                            format!("{base} * {elements_per_block} + {i}")
-                        } else {
-                            base
-                        }
-                    })
-                    .collect();
-                output.check_bounds(kernel, indexes.clone(), |kernel| {
-                    write!(kernel, "let output_index = ").unwrap();
-                    output.strided_index(kernel, indexes);
-                    writeln!(kernel, ";").unwrap();
-
-                    writeln!(
-                        kernel,
-                        "{output}[output_index] = {};",
-                        process_output(&data)
-                    )
-                    .unwrap();
-                });
-            },
+        let format = self.direct_quant_format()?;
+        let k = *self.matrix.shape.last()? as u32;
+        let n: u32 = self
+            .matrix
+            .shape
+            .iter()
+            .rev()
+            .skip(1)
+            .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
+        let total = k.checked_mul(n)?;
+        let workgroups = total.div_ceil(256);
+        let max_workgroups = graph
+            .device()
+            .limits()
+            .max_compute_workgroups_per_dimension
+            .max(1);
+        let dispatch_x = workgroups.min(max_workgroups);
+        let dispatch_y = workgroups.div_ceil(dispatch_x);
+        if dispatch_y > max_workgroups {
+            return None;
+        }
+        let cache_key = self.kernel_cache_key_with_dispatch(
+            kernel_backend::KernelVariantKey::of::<DequantizeDirectKernelVariant>(),
+            Some(_workgroup_shape),
+            [dispatch_x, dispatch_y, 1],
+            inputs,
         );
+        let matrix_buffer = matrix.buffer().clone();
+        let output_buffer = output.buffer().clone();
+        let output_layout = tile_ir::Layout::contiguous(
+            tile_ir::MemoryLevel::Storage,
+            tile_ir::Shape::new([total]),
+        );
+        let output_datatype = self.datatype;
+        kernel_backend::run_kernel(
+            graph.device().kernel_cache(),
+            self.name(),
+            cache_key,
+            [dispatch_x, dispatch_y, 1],
+            move |kb| {
+                emit_qdequantize_kernel(
+                    kb,
+                    QDequantizeKernelParams {
+                        matrix_buffer,
+                        output_buffer,
+                        output_layout,
+                        output_element: datatype_element(output_datatype)?,
+                        format,
+                        k,
+                        n,
+                        dispatch_x,
+                    },
+                )?;
+                Some(())
+            },
+        )
     }
 
     fn name(&self) -> String {
@@ -151,152 +237,42 @@ impl Operation for DequantizeOperation {
 }
 
 impl QMatrix {
-    pub fn dequantize<const R: usize, T: DataType>(&self) -> Tensor<R, T> {
-        assert_eq!(
-            self.shape.len(),
-            R,
-            "Dequantize: expected {}D tensor, got {}D tensor. Shape: {:?}",
-            R,
-            self.shape.len(),
-            self.shape
-        );
+    pub fn dequantize<T>(&self) -> Tensor
+    where
+        T: DataType,
+        f32: CastTensor<T>,
+    {
+        if T::DATA_TYPE == DataTypeEnum::F16 && !self.device.f16_supported() {
+            let tensor = self.dequantize::<f32>();
+            return tensor.cast::<T>();
+        }
 
-        // If the types already match, just return a view of the existing data
-        if self.datatype == GgmlType::F32 && T::WGSL_TYPE == DataTypeEnum::F32
-            || self.datatype == GgmlType::F16 && T::WGSL_TYPE == DataTypeEnum::F16
-        {
+        if matches!(self.datatype, GgmlType::F32 | GgmlType::F16) {
             let device = &self.device;
             let buffer = self.buffer.clone();
             let layout = Layout::contiguous(&self.shape);
-            let datatype = T::WGSL_TYPE;
-            return Tensor::from_parts(LazyTensorData::new(TensorData::new_from_parts(
+            let datatype = match self.datatype {
+                GgmlType::F32 => DataTypeEnum::F32,
+                GgmlType::F16 => DataTypeEnum::F16,
+                _ => unreachable!("dense matrix datatype checked above"),
+            };
+            let tensor = Tensor::from_parts(LazyTensorData::new(TensorData::new_from_parts(
                 device, buffer, layout, datatype,
             )));
+            return tensor.cast_to(T::DATA_TYPE);
         }
 
         let device = self.device.clone();
-        let graph = ComputeGraph::new(device.clone());
-        let key = graph.dequantize(self.clone(), T::WGSL_TYPE);
+        let key = device
+            .compute_graph()
+            .dequantize(self.clone(), T::DATA_TYPE);
 
         let data = LazyTensorData::from_parts(
             device,
-            graph,
-            TensorInfo::new(self.shape().into(), T::WGSL_TYPE),
-            key.into(),
+            TensorInfo::new(self.shape().into(), T::DATA_TYPE),
+            key,
         );
 
         Tensor::from_parts(data)
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_dequantize_smol_lm() {
-    use crate::Device;
-    use fusor_gguf::GgufMetadata;
-    use num_traits::float::Float;
-
-    let device = Device::new().await.unwrap();
-
-    let url = "https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf";
-    let bytes = reqwest::get(url).await.unwrap().bytes().await.unwrap();
-    let mut reader = std::io::Cursor::new(&bytes);
-    let metadata = GgufMetadata::read(&mut reader).unwrap();
-    let mut reader = std::io::Cursor::new(&bytes);
-    let candle_metadata = candle_core::quantized::gguf_file::Content::read(&mut reader).unwrap();
-
-    for (name, candle_q_matrix_metadata) in candle_metadata.tensor_infos {
-        let tensor = metadata.tensor_infos.get(&*name).unwrap();
-        println!("{name}: {tensor:?}");
-
-        let candle_q_tensor = candle_q_matrix_metadata
-            .read(
-                &mut reader,
-                candle_metadata.tensor_data_offset,
-                &candle_core::Device::Cpu,
-            )
-            .unwrap();
-        let candle_result = candle_q_tensor
-            .dequantize_f16(&candle_core::Device::Cpu)
-            .unwrap();
-
-        let candle_result_doubled = (&candle_result * 2.0).unwrap();
-
-        let q_matrix_metadata = metadata.tensor_infos.get(&*name).unwrap();
-
-        let q_matrix = QMatrix::read(
-            &device,
-            q_matrix_metadata,
-            &mut reader,
-            metadata.tensor_data_offset,
-        )
-        .unwrap();
-        assert_eq!(candle_result.shape().dims(), q_matrix.shape());
-
-        match candle_result.rank() {
-            1 => {
-                let fusor_result = q_matrix.dequantize::<1, half::f16>();
-                let candle_result = candle_result.to_vec1::<half::f16>().unwrap();
-                let result = fusor_result.as_slice().await.unwrap();
-                for i in 0..candle_result.len() {
-                    let expected = candle_result[i];
-                    let actual = result[[i]];
-                    if (expected - actual).abs() > half::f16::from_f32(0.01) {
-                        assert_eq!(
-                            expected, actual,
-                            "Mismatch at ({i}) - expected: {expected}, actual: {actual}"
-                        );
-                    }
-                }
-
-                let fusor_result = q_matrix.dequantize::<1, half::f16>() * half::f16::from_f32(2.0);
-                let candle_result = candle_result_doubled.to_vec1::<half::f16>().unwrap();
-                let result = fusor_result.as_slice().await.unwrap();
-                for i in 0..candle_result.len() {
-                    let expected = candle_result[i];
-                    let actual = result[[i]];
-                    if (expected - actual).abs() > half::f16::from_f32(0.01) {
-                        assert_eq!(
-                            expected, actual,
-                            "Mismatch at ({i}) - expected: {expected}, actual: {actual}"
-                        );
-                    }
-                }
-            }
-            2 => {
-                let fusor_result = q_matrix.dequantize::<2, half::f16>();
-                let candle_result = candle_result.to_vec2::<half::f16>().unwrap();
-                let result = fusor_result.as_slice().await.unwrap();
-                for x in 0..candle_result.len() {
-                    for y in 0..candle_result[0].len() {
-                        let expected = candle_result[x][y];
-                        let actual = result[[x, y]];
-                        if (expected - actual).abs() > half::f16::from_f32(0.01) {
-                            assert_eq!(
-                                expected, actual,
-                                "Mismatch at ({x}, {y}) - expected: {expected}, actual: {actual}"
-                            );
-                        }
-                    }
-                }
-
-                let fusor_result = q_matrix.dequantize::<2, half::f16>() * half::f16::from_f32(2.0);
-                let candle_result = candle_result_doubled.to_vec2::<half::f16>().unwrap();
-                let result = fusor_result.as_slice().await.unwrap();
-                for x in 0..candle_result.len() {
-                    for y in 0..candle_result[0].len() {
-                        let expected = candle_result[x][y];
-                        let actual = result[[x, y]];
-                        if (expected - actual).abs() > half::f16::from_f32(0.01) {
-                            assert_eq!(
-                                expected, actual,
-                                "Mismatch at ({x}, {y}) - expected: {expected}, actual: {actual}"
-                            );
-                        }
-                    }
-                }
-            }
-            _ => todo!(),
-        }
     }
 }

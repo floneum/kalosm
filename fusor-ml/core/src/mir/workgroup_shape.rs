@@ -8,8 +8,6 @@ use parking_lot::RwLock;
 use rustc_hash::FxBuildHasher;
 use std::{num::NonZeroUsize, sync::OnceLock};
 
-use crate::mir::kernel::GenericKernel;
-
 const MAX_WORKGROUP_SIZE: u32 = 256;
 
 #[derive(Debug, Clone, Copy)]
@@ -55,27 +53,6 @@ impl WorkgroupShape {
     pub(crate) fn shape(&self) -> [u32; 3] {
         self.shape
     }
-
-    pub(crate) fn component(&self, i: usize) -> u32 {
-        assert!(i < 3, "Index must be 0, 1, or 2");
-        self.shape[i]
-    }
-
-    pub(crate) fn linearized_workgroup_index(&self, kernel: &mut GenericKernel) -> String {
-        let mut merged = "0".to_string();
-        let mut product = 1;
-        for (component, real_size) in ["x", "y", "z"].iter().zip(self.shape()) {
-            merged += &format!(
-                " + {}.{} * {}",
-                kernel.workgroup_index(),
-                component,
-                product
-            );
-            product *= real_size;
-        }
-
-        merged
-    }
 }
 
 impl IntoIterator for WorkgroupShape {
@@ -115,7 +92,7 @@ impl WorkgroupShapeConstraints {
         possible_workgroup_shapes().filter(move |shape| self.is_valid(shape))
     }
 
-    pub(crate) fn solve(&self, limits: &wgpu::Limits) -> Option<WorkgroupShape> {
+    pub(crate) fn solve(&self, max_subgroup_size: u32) -> Option<WorkgroupShape> {
         static CACHE: OnceLock<
             RwLock<LruCache<WorkgroupShapeConstraints, Option<WorkgroupShape>, FxBuildHasher>>,
         > = OnceLock::new();
@@ -131,19 +108,13 @@ impl WorkgroupShapeConstraints {
             self.possible().min_by_key(|shape| {
                 let linearized = shape.linearized();
                 (linearized as i64)
-                    + if shape.x() % limits.max_subgroup_size == 0 {
+                    + if max_subgroup_size == 0 || shape.x() % max_subgroup_size == 0 {
                         0
                     } else {
                         1024
                     }
             })
         })
-    }
-
-    pub(crate) fn merge(&mut self, other: &Self) {
-        for (i, constraints) in other.shape.iter().enumerate() {
-            self.shape[i].extend(constraints.clone());
-        }
     }
 }
 
@@ -153,61 +124,6 @@ fn possible_workgroup_shapes() -> impl Iterator<Item = WorkgroupShape> {
             (1..=(MAX_WORKGROUP_SIZE / (x * y))).map(move |z| WorkgroupShape::new(x, y, z))
         })
     })
-}
-
-#[test]
-fn test_all_possible_workgroup_shapes() {
-    assert_eq!(possible_workgroup_shapes().count(), 5136);
-}
-
-#[cfg(test)]
-fn test_limits() -> wgpu::Limits {
-    wgpu::Limits {
-        max_subgroup_size: 64,
-        ..Default::default()
-    }
-}
-
-#[test]
-fn test_workgroup_shape_constraints() {
-    let mut constraints = WorkgroupShapeConstraints::new();
-    constraints.add_constraint(0, Constraint::Equals(4));
-    constraints.add_constraint(1, Constraint::LessThan(3));
-
-    let valid_shapes: Vec<_> = constraints.possible().collect();
-    println!("Valid shapes: {valid_shapes:#?}");
-    for shape in valid_shapes {
-        assert_eq!(shape.shape[0], 4);
-        assert!(shape.shape[1] < 3);
-    }
-
-    let valid_shape = constraints.solve(&test_limits());
-    assert_eq!(valid_shape.unwrap().shape, [4, 1, 1]);
-    assert_eq!(valid_shape.unwrap().linearized(), 4);
-}
-
-#[test]
-fn test_many_workgroup_shape_constraints() {
-    let mut constraints = WorkgroupShapeConstraints::new();
-    constraints.add_constraint(0, Constraint::Equals(4));
-    constraints.add_constraint(1, Constraint::LessThan(3));
-
-    let mut constraints2 = WorkgroupShapeConstraints::new();
-    constraints2.add_constraint(1, Constraint::Equals(2));
-
-    let mut merged = WorkgroupShapeConstraints::new();
-    merged.merge(&constraints);
-    merged.merge(&constraints2);
-    let valid_shapes: Vec<_> = merged.possible().collect();
-    println!("Valid shapes: {valid_shapes:#?}");
-    for shape in valid_shapes {
-        assert_eq!(shape.shape[0], 4);
-        assert!(shape.shape[1] < 3);
-    }
-
-    let valid_shape = merged.solve(&test_limits());
-    assert_eq!(valid_shape.unwrap().shape, [4, 2, 1]);
-    assert_eq!(valid_shape.unwrap().linearized(), 8);
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -240,5 +156,33 @@ impl Constraint {
             Constraint::LessThan(value) => shape < *value,
             Constraint::Not(inner) => !inner.fits(shape),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Constraint, WorkgroupShapeConstraints, possible_workgroup_shapes};
+
+    const TEST_MAX_SUBGROUP_SIZE: u32 = 64;
+
+    #[test]
+    fn test_all_possible_workgroup_shapes() {
+        assert_eq!(possible_workgroup_shapes().count(), 5136);
+    }
+
+    #[test]
+    fn test_workgroup_shape_constraints() {
+        let mut constraints = WorkgroupShapeConstraints::new();
+        constraints.add_constraint(0, Constraint::Equals(4));
+        constraints.add_constraint(1, Constraint::LessThan(3));
+
+        for shape in constraints.possible() {
+            assert_eq!(shape.shape()[0], 4);
+            assert!(shape.shape()[1] < 3);
+        }
+
+        let valid_shape = constraints.solve(TEST_MAX_SUBGROUP_SIZE).unwrap();
+        assert_eq!(valid_shape.shape(), [4, 1, 1]);
+        assert_eq!(valid_shape.linearized(), 4);
     }
 }
