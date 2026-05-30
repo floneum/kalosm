@@ -25,7 +25,7 @@ There are three different packages in Kalosm:
 
 - `kalosm::language` - A simple interface for text generation and embedding models and surrounding tools. It includes support for search databases, and text collection from websites, RSS feeds, and search engines.
 - `kalosm::audio` - A simple interface for audio transcription and surrounding tools. It includes support for microphone input, transcription with the `whisper` model, and voice activity detection.
-- `kalosm::vision` - A simple interface for image generation and segmentation models and surrounding tools. It includes support for the `wuerstchen` and `segment-anything` models and integration with the [image](https://docs.rs/image/latest/image/) crate.
+- `kalosm::vision` - A simple interface for image segmentation models and surrounding tools. It includes support for the `segment-anything` model and integration with the [image](https://docs.rs/image/latest/image/) crate.
 
 A complete guide for Kalosm is available on the [Kalosm website](https://floneum.com/kalosm/), and examples are available in the [examples folder](https://github.com/floneum/floneum/tree/main/interfaces/kalosm/examples).
 
@@ -73,7 +73,7 @@ cargo run --release
 
 ## What can you do with Kalosm?
 
-You can think of Kalosm as the plumbing between different pre-trained models and each other or the surrounding world. Kalosm makes it easy to build applications that use pre-trained models to generate text, audio, and images. Here are some examples of what you can build with Kalosm:
+You can think of Kalosm as the plumbing between different pre-trained models and each other or the surrounding world. Kalosm makes it easy to build applications that use pre-trained models to generate text, transcribe audio, and segment images. Here are some examples of what you can build with Kalosm:
 
 <details>
 <summary>Local text generation</summary>
@@ -353,31 +353,6 @@ async fn main() -> Result<(), anyhow::Error> {
     text_stream.to_std_out().await.unwrap();
 
     Ok(())
-}
-```
-
-</details>
-
-<details>
-<summary>Image generation</summary>
-
-In addition to language, audio, and embedding models, Kalosm also supports image generation. For example, you can use Kalosm to generate images from text:
-
-```rust, no_run
-use kalosm::vision::*;
-
-#[tokio::main]
-async fn main() {
-    let model = Wuerstchen::new().await.unwrap();
-    let settings = WuerstchenInferenceSettings::new(
-        "a cute cat with a hat in a room covered with fur with incredible detail",
-    );
-    let mut images = model.run(settings);
-    while let Some(image) = images.next().await {
-        if let Some(buf) = image.generated_image() {
-            buf.save(&format!("{}.png",image.sample_num())).unwrap();
-        }
-    }
 }
 ```
 

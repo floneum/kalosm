@@ -1,4 +1,4 @@
-// Modified from https://github.com/huggingface/candle/blob/main/candle-transformers/src/models/whisper/quantized_model.rs
+// Adapted from an upstream Whisper quantized model implementation.
 
 use std::{num::NonZeroUsize, sync::Arc};
 

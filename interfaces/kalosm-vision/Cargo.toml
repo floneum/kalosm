@@ -6,20 +6,12 @@ description = "A set of pretrained vision models "
 license = "MIT/Apache-2.0"
 repository = "https://github.com/floneum/floneum"
 authors = ["Evan Almloff <evanalmloff@gmail.com>"]
-keywords = ["ai", "segment-anything", "ocr"]
+keywords = ["ai", "segment-anything"]
 
 [dependencies]
 image.workspace = true
-kalosm-ocr.workspace = true
-rwuerstchen.workspace = true
 segment-anything-rs.workspace = true
 
 [dev-dependencies]
 kalosm = { workspace = true, features = ["vision"], default-features = true }
-futures-util = { workspace = true }
 tokio = { version = "1", features = ["full"] }
-
-[features]
-metal = ["kalosm-ocr/metal", "rwuerstchen/metal", "segment-anything-rs/metal"]
-cublas = ["kalosm-ocr/cuda", "rwuerstchen/cuda", "segment-anything-rs/cuda"]
-mkl = ["kalosm-ocr/mkl", "rwuerstchen/mkl", "segment-anything-rs/mkl"]

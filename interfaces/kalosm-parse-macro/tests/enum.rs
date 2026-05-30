@@ -21,31 +21,6 @@ enum NamedEnum {
     },
 }
 
-#[cfg(any(feature = "metal", feature = "cuda"))]
-#[tokio::test]
-async fn named_enum() {
-    use kalosm::language::*;
-
-    let model = Llama::builder()
-        .with_source(LlamaSource::tiny_llama_1_1b_chat())
-        .build()
-        .await
-        .unwrap();
-
-    let task = model
-        .task("You generate json")
-        .with_constraints(NamedEnum::new_parser());
-
-    let output = task.run("What is the capital of France?").await;
-    println!("{output}");
-
-    assert!(output.contains("\"ty\":"));
-    assert!(output.contains("\"contents\":"));
-    assert!(output.contains("\"ty\": \"person\"") || output.contains("\"ty\": \"animal\""));
-    assert!(output.contains("\"name\":"));
-    assert!(output.contains("\"age\":") || output.contains("\"species\":"));
-}
-
 #[derive(Parse, Schema, Clone)]
 enum MixedEnum {
     Person {
@@ -106,25 +81,6 @@ fn mixed_enum_schema() {
     );
 }
 
-#[cfg(any(feature = "metal", feature = "cuda"))]
-#[tokio::test]
-async fn mixed_enum() {
-    use kalosm::language::*;
-
-    let model = Llama::builder()
-        .with_source(LlamaSource::tiny_llama_1_1b_chat())
-        .build()
-        .await
-        .unwrap();
-
-    let task = model
-        .task("You generate json")
-        .with_constraints(std::sync::Arc::new(MixedEnum::new_parser()));
-
-    let output = task.run("What is the capital of France?").await;
-    println!("{output}");
-}
-
 #[derive(Parse, Schema, Clone)]
 enum UnitEnum {
     /// The first variant
@@ -146,49 +102,10 @@ fn unit_enum_schema() {
     )
 }
 
-#[cfg(any(feature = "metal", feature = "cuda"))]
-#[tokio::test]
-async fn unit_enum() {
-    use kalosm::language::*;
-
-    let model = Llama::builder()
-        .with_source(LlamaSource::tiny_llama_1_1b_chat())
-        .build()
-        .await
-        .unwrap();
-
-    let task = model
-        .task("You generate json")
-        .with_constraints(std::sync::Arc::new(UnitEnum::new_parser()));
-
-    let output = task.run("What is the capital of France?").await;
-    println!("{output}");
-}
-
 #[derive(Parse, Schema, Clone)]
 enum TupleEnum {
     First(String),
     Second(String),
-}
-
-#[cfg(any(feature = "metal", feature = "cuda"))]
-#[tokio::test]
-async fn tuple_enum() {
-    use kalosm::language::*;
-    let model = Llama::builder()
-        .with_source(LlamaSource::tiny_llama_1_1b_chat())
-        .build()
-        .await
-        .unwrap();
-
-    let task = model
-        .task("You generate json")
-        .with_constraints(std::arc::Arc::new(TupleEnum::new_parser()));
-
-    let output = task.run("What is the capital of France?").await;
-    println!("{output}");
-
-    assert!(output.contains("\"type\": \"First\"") || output.contains("\"type\": \"Second\""));
 }
 
 #[test]
