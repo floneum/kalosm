@@ -4,7 +4,7 @@
 //!
 //! Llama 7B is a very small but performant language model that can be easily run on your local machine.
 //!
-//! This library uses [Candle](https://github.com/huggingface/candle) to run Llama.
+//! This library uses Fusor to run Llama.
 //!
 //! ## Usage
 //!

@@ -1,4 +1,4 @@
-// Based on https://github.com/nicksenger/candle/tree/feat/whisper-dtw with some optimizations and refactoring
+// Based on an upstream Whisper DTW implementation with optimizations and refactoring.
 // https://rtavenar.github.io/blog/dtw.html is a good resource for understanding the dtw algorithm
 
 use fusor::Tensor;
