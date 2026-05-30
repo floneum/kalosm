@@ -1,37 +1,45 @@
 //! # Segment Anything RS
 //! A rust wrapper for [Segment Anything](https://segment-anything.com/)
 //!
+//! The model uses fusor tensors and prefers GPU execution when available,
+//! automatically falling back to CPU otherwise.
+//!
 //! ## Usage
 //!
 //! ```rust, no_run
 //! use segment_anything_rs::*;
 //!
-//! let model = SegmentAnything::builder().build().unwrap();
+//! # async fn run() {
+//! let model = SegmentAnything::builder().build().await.unwrap();
 //! let image = image::open("examples/landscape.jpg").unwrap();
-//! let images = model.segment_everything(image).unwrap();
+//! let images = model.segment_everything(image).await.unwrap();
 //! for (i, img) in images.iter().enumerate() {
 //!     img.save(&format!("{}.png", i)).unwrap();
 //! }
+//! # }
 //! ```
 
 #![warn(missing_docs)]
-#[cfg(feature = "mkl")]
-extern crate intel_mkl_src;
 
-#[cfg(feature = "accelerate")]
-extern crate accelerate_src;
+mod mask_generation;
+mod raw;
 
-use candle_core::DType;
-use candle_core::{Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::segment_anything::sam::{self, Sam};
+use fusor::{Concrete, Device, Tensor, ToVec1, VarBuilder};
 use image::{DynamicImage, GenericImage, GenericImageView, ImageBuffer, Rgba};
-use kalosm_common::CacheError;
+use kalosm_model_types::FileSource;
+use mask_generation::LowResMaskBatch;
+use raw::sam::{build_point_grid, Sam, IMAGE_SIZE};
+
+/// Number of prompt-grid points per image side in `segment_everything`.
+const SEGMENT_EVERYTHING_POINTS_PER_SIDE: usize = 32;
+/// Number of grid points evaluated per forward pass in `segment_everything`.
+const SEGMENT_EVERYTHING_BATCH_SIZE: usize = 64;
 
 /// A builder for [`SegmentAnything`].
 #[derive(Default)]
 pub struct SegmentAnythingBuilder {
     source: SegmentAnythingSource,
+    local_path: Option<std::path::PathBuf>,
 }
 
 impl SegmentAnythingBuilder {
@@ -41,39 +49,61 @@ impl SegmentAnythingBuilder {
         self
     }
 
-    /// Builds the [`SegmentAnything`] model.
-    pub fn build(self) -> Result<SegmentAnything, LoadSegmentAnythingError> {
-        SegmentAnything::new(self)
+    /// Load weights from a local GGUF file instead of downloading from
+    /// Hugging Face. Pair with [`SegmentAnythingBuilder::source`] (or rely on
+    /// the default `tiny` source) to indicate which architecture the file
+    /// contains.
+    pub fn gguf_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.local_path = Some(path.into());
+        self
     }
+
+    /// Builds the [`SegmentAnything`] model.
+    pub async fn build(self) -> Result<SegmentAnything, LoadSegmentAnythingError> {
+        SegmentAnything::new(self).await
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentAnythingArchitecture {
+    MobileSamTiny,
+    SamVitB,
 }
 
 /// The source of the model.
 pub struct SegmentAnythingSource {
     model: String,
     filename: String,
-    tiny: bool,
+    architecture: SegmentAnythingArchitecture,
 }
 
 impl SegmentAnythingSource {
-    /// Creates a new [`SegmentAnythingSource`].
+    /// Creates a new [`SegmentAnythingSource`] for a SAM ViT-B checkpoint.
     pub fn new(model: impl Into<String>, filename: impl Into<String>) -> Self {
         Self {
             model: model.into(),
             filename: filename.into(),
-            tiny: false,
+            architecture: SegmentAnythingArchitecture::SamVitB,
+        }
+    }
+
+    /// Creates a new [`SegmentAnythingSource`] for a MobileSAM TinyViT checkpoint.
+    pub fn mobile_sam_tiny(model: impl Into<String>, filename: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            filename: filename.into(),
+            architecture: SegmentAnythingArchitecture::MobileSamTiny,
         }
     }
 
     /// Create the tiny SAM model source.
     pub fn tiny() -> Self {
-        let mut self_ = Self::new("lmz/candle-sam", "mobile_sam-tiny-vitt.safetensors");
-        self_.tiny = true;
-        self_
+        Self::mobile_sam_tiny("Demonthos/MobileSamGguf", "mobile_sam-tiny-vitt.gguf")
     }
 
     /// Create a normal sized model source.
     pub fn medium() -> Self {
-        Self::new("lmz/candle-sam", "sam_vit_b_01ec64.safetensors")
+        Self::new("Demonthos/MobileSamGguf", "sam_vit_b_01ec64.gguf")
     }
 }
 
@@ -118,24 +148,36 @@ impl SegmentAnythingInferenceSettings {
     }
 
     /// Add a point to the list of points to segment.
-    pub fn add_goal_point(mut self, x: impl Into<f64>, y: impl Into<f64>) -> Self {
+    ///
+    /// Coordinates are normalized to `[0, 1]` (0.5 is the middle of the image).
+    /// Renamed from `add_goal_point` in 0.5 to flag the absolute-to-normalized
+    /// coordinate switch - old pixel-based callers should divide by image size.
+    pub fn add_goal_point_normalized(mut self, x: impl Into<f64>, y: impl Into<f64>) -> Self {
         self.goal_points.push((x.into(), y.into()));
         self
     }
 
     /// Set the list of points to segment.
+    ///
+    /// Coordinates are normalized to `[0, 1]`.
     pub fn set_goal_points(mut self, points: Vec<(f64, f64)>) -> Self {
         self.goal_points = points;
         self
     }
 
     /// Add a point to the list of points to avoid.
-    pub fn add_avoid_points(mut self, x: impl Into<f64>, y: impl Into<f64>) -> Self {
+    ///
+    /// Coordinates are normalized to `[0, 1]` (0.5 is the middle of the image).
+    /// Renamed from `add_avoid_points` in 0.5 to flag the absolute-to-normalized
+    /// coordinate switch and fix the singular/plural mismatch.
+    pub fn add_avoid_point_normalized(mut self, x: impl Into<f64>, y: impl Into<f64>) -> Self {
         self.avoid_points.push((x.into(), y.into()));
         self
     }
 
     /// Set the list of points to avoid.
+    ///
+    /// Coordinates are normalized to `[0, 1]`.
     pub fn set_avoid_points(mut self, points: Vec<(f64, f64)>) -> Self {
         self.avoid_points = points;
         self
@@ -155,12 +197,15 @@ impl SegmentAnythingInferenceSettings {
 /// An error that can occur when loading a [`SegmentAnything`] model.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadSegmentAnythingError {
-    /// An error that can occur when trying to load a [`SegmentAnything`] model into a device.
-    #[error("Failed to load model into device: {0}")]
-    LoadModel(#[from] candle_core::Error),
+    /// An error that can occur when initializing the runtime for a [`SegmentAnything`] model.
+    #[error("Failed to initialize model runtime: {0}")]
+    LoadModel(#[from] fusor::Error),
     /// An error that can occur when downloading a [`SegmentAnything`] model from Hugging Face.
     #[error("Failed to download model from Hugging Face: {0}")]
-    DownloadModel(#[from] CacheError),
+    DownloadModel(#[from] kalosm_common::CacheError),
+    /// An IO error opening the model file.
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// An error that can occur when running a [`SegmentAnything`] model.
@@ -168,7 +213,7 @@ pub enum LoadSegmentAnythingError {
 pub enum SegmentAnythingInferenceError {
     /// An error that can occur when trying to run a [`SegmentAnything`] model.
     #[error("Failed to run model: {0}")]
-    RunModel(#[from] candle_core::Error),
+    RunModel(#[from] fusor::Error),
     /// An error that can occur when converting the result of a [`SegmentAnything`] model to an image.
     #[error("Failed to merge masks")]
     MergeMasks,
@@ -176,8 +221,8 @@ pub enum SegmentAnythingInferenceError {
 
 /// The [segment anything](https://segment-anything.com/) model.
 pub struct SegmentAnything {
-    device: Device,
     sam: Sam,
+    device: Device,
 }
 
 impl SegmentAnything {
@@ -186,26 +231,25 @@ impl SegmentAnything {
         SegmentAnythingBuilder::default()
     }
 
-    fn new(settings: SegmentAnythingBuilder) -> Result<Self, LoadSegmentAnythingError> {
-        let SegmentAnythingBuilder { source } = settings;
-        let model = {
-            let source = kalosm_model_types::FileSource::huggingface(
-                source.model,
-                "main".to_string(),
-                source.filename,
-            );
-            pollster::block_on(kalosm_common::Cache::default().get(&source, |_| {}))?
+    async fn new(settings: SegmentAnythingBuilder) -> Result<Self, LoadSegmentAnythingError> {
+        let SegmentAnythingBuilder { source, local_path } = settings;
+        let model_path = match local_path {
+            Some(path) => path,
+            None => {
+                let source =
+                    FileSource::huggingface(source.model, "main".to_string(), source.filename);
+                kalosm_common::Cache::default().get(&source, |_| {}).await?
+            }
         };
-        // Currently, candle doesn't support some operations that are required for segment anything
-        // let device = kalosm_common::accelerated_device_if_available()?;
-        let device = Device::Cpu;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model], DType::F32, &device)? };
-        let sam = if source.tiny {
-            sam::Sam::new_tiny(vb)? // tiny vit_t
-        } else {
-            sam::Sam::new(768, 12, 12, &[2, 5, 8, 11], vb)? // sam_vit_b
+        let device = Device::auto().await;
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&model_path)?);
+        let mut vb = VarBuilder::from_gguf(&mut reader)
+            .map_err(|e| fusor::Error::msg(format!("Failed to read GGUF: {e}")))?;
+        let sam = match source.architecture {
+            SegmentAnythingArchitecture::MobileSamTiny => Sam::load_tiny(&device, &mut vb)?,
+            SegmentAnythingArchitecture::SamVitB => Sam::load_vit_b(&device, &mut vb)?,
         };
-        Ok(Self { device, sam })
+        Ok(Self { sam, device })
     }
 
     /// Segment an image from a list of points. Returns a [`DynamicImage`] mask.
@@ -214,17 +258,18 @@ impl SegmentAnything {
     /// ```rust, no_run
     /// use segment_anything_rs::*;
     ///
-    /// let model = SegmentAnything::builder().build().unwrap();
+    /// # async fn run() {
+    /// let model = SegmentAnything::builder().build().await.unwrap();
     /// let image = image::open("examples/landscape.jpg").unwrap();
-    /// let x = image.width() / 2;
-    /// let y = image.height() / 4;
     /// let images = model
-    ///     .segment_from_points(SegmentAnythingInferenceSettings::new(image).add_goal_point(x, y))
+    ///     .segment_from_points(SegmentAnythingInferenceSettings::new(image).add_goal_point_normalized(0.5, 0.25))
+    ///     .await
     ///     .unwrap();
     ///
     /// images.save("out.png").unwrap();
+    /// # }
     /// ```
-    pub fn segment_from_points(
+    pub async fn segment_from_points(
         &self,
         settings: SegmentAnythingInferenceSettings,
     ) -> Result<DynamicImage, SegmentAnythingInferenceError> {
@@ -239,7 +284,7 @@ impl SegmentAnything {
         let image_width = image.width();
         let image_height = image.height();
 
-        let image_tensor = self.image_to_tensor(image)?;
+        let image_tensor = self.image_to_tensor(image);
 
         let points = {
             let mut points = Vec::new();
@@ -252,13 +297,33 @@ impl SegmentAnything {
             points
         };
 
-        let (mask, _iou_predictions) = self.sam.forward(&image_tensor, &points, false)?;
+        let (mask, _iou_predictions) = self.sam.forward(&image_tensor, &points, false);
 
-        let mask = (mask.ge(threshold)? * 255.)?;
-        let (_one, h, w) = mask.dims3()?;
-        let mask = mask.expand((3, h, w))?;
+        let mask_shape = mask.shape();
+        let h = mask_shape[2];
+        let w = mask_shape[3];
 
-        let mask_pixels = mask.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
+        // Get first mask (batch=0, mask=0)
+        let mask_n0 = mask.narrow(0, 0, 1);
+        let mask_n1 = mask_n0.narrow(1, 0, 1);
+        let mask_2d = mask_n1.reshape([h, w]);
+
+        // Threshold: >= threshold -> 255, else 0
+        let threshold_mask = mask_2d.gt_scalar(threshold - 1e-6);
+
+        let mask_u8: Tensor<2, f32> = threshold_mask.mul_scalar(255.0f32);
+
+        // Expand to 3 channels: (H, W) -> (3, H, W)
+        let mask_reshaped = mask_u8.reshape([1, h, w]);
+        let mask_3ch = mask_reshaped.broadcast_as([3, h, w]);
+
+        // Permute to (H, W, 3) and flatten
+        let mask_t1 = mask_3ch.transpose(0, 1); // (H, 3, W)
+        let mask_hwc = mask_t1.transpose(1, 2); // (H, W, 3);
+        let mask_flat = mask_hwc.reshape([h * w * 3]);
+        let mask_slice = mask_flat.as_slice().await?;
+        let mask_pixels: Vec<u8> = mask_slice.to_vec1().iter().map(|&v| v as u8).collect();
+
         let mask_img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
             image::ImageBuffer::from_raw(w as u32, h as u32, mask_pixels)
                 .ok_or(SegmentAnythingInferenceError::MergeMasks)?;
@@ -270,9 +335,9 @@ impl SegmentAnything {
         ))
     }
 
-    fn image_to_tensor(&self, image: DynamicImage) -> candle_core::Result<Tensor> {
+    fn image_to_tensor(&self, image: DynamicImage) -> Tensor<3, f32, Concrete<f32, 3>> {
         let image = {
-            let resize_longest = sam::IMAGE_SIZE;
+            let resize_longest = IMAGE_SIZE;
             let (height, width) = (image.height(), image.width());
             let resize_longest = resize_longest as u32;
             let (height, width) = if height < width {
@@ -287,11 +352,16 @@ impl SegmentAnything {
         let (height, width) = (image.height() as usize, image.width() as usize);
         let img = image.to_rgb8();
         let data = img.into_raw();
-        let image = Tensor::from_vec(data, (height, width, 3), &self.device)?.permute((2, 0, 1))?;
-
-        let image = image.to_device(&self.device)?;
-
-        Ok(image)
+        // Convert u8 to f32
+        let data_f32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
+        let device = &self.device;
+        // (H, W, 3) -> permute to (3, H, W)
+        let image: Tensor<3, f32, Concrete<f32, 3>> =
+            Tensor::from_slice(device, [height, width, 3], &data_f32)
+                .transpose(1, 2) // (H, 3, W)
+                .transpose(0, 1) // (3, H, W)
+                .to_concrete();
+        image
     }
 
     /// Segment everything in an image. Returns a list of [`DynamicImage`] masks.
@@ -301,40 +371,94 @@ impl SegmentAnything {
     /// ```rust, no_run
     /// use segment_anything_rs::*;
     ///
-    /// let model = SegmentAnything::builder().build().unwrap();
+    /// # async fn run() {
+    /// let model = SegmentAnything::builder().build().await.unwrap();
     /// let image = image::open("examples/landscape.jpg").unwrap();
-    /// let images = model.segment_everything(image).unwrap();
+    /// let images = model.segment_everything(image).await.unwrap();
     /// for (i, img) in images.iter().enumerate() {
     ///     img.save(&format!("{}.png", i)).unwrap();
     /// }
+    /// # }
     /// ```
-    pub fn segment_everything(
+    pub async fn segment_everything(
         &self,
         image: DynamicImage,
     ) -> Result<Vec<DynamicImage>, SegmentAnythingInferenceError> {
-        let image = self.image_to_tensor(image)?;
+        let image_width = image.width();
+        let image_height = image.height();
+        let image_tensor = self.image_to_tensor(image);
+        let original_h = image_tensor.shape()[1];
+        let original_w = image_tensor.shape()[2];
 
-        let bboxes = self.sam.generate_masks(&image, 32, 0, 512. / 1500., 1)?;
+        // Compute image embeddings once
+        let img_embeddings = self.sam.embeddings(&image_tensor);
+
+        let point_grid = build_point_grid(SEGMENT_EVERYTHING_POINTS_PER_SIDE);
+
+        let mut candidates = Vec::new();
+
+        for chunk in point_grid.chunks(SEGMENT_EVERYTHING_BATCH_SIZE) {
+            let batch_points: Vec<(f64, f64, bool)> =
+                chunk.iter().map(|&(px, py)| (px, py, true)).collect();
+
+            let (low_res_masks, iou_preds) = self.sam.forward_for_embeddings_batched(
+                &img_embeddings,
+                original_h,
+                original_w,
+                &batch_points,
+                true, // multimask_output: get 3 mask alternatives per point
+            );
+
+            // Read masks and IoU predictions to CPU in one shot
+            let masks_shape = low_res_masks.shape(); // (batch, 3, h, w)
+            let batch = masks_shape[0];
+            let n_masks_per_point = masks_shape[1];
+            let mask_h = masks_shape[2];
+            let mask_w = masks_shape[3];
+            let mask_pixels = mask_h * mask_w;
+            let total_mask_elems = batch * n_masks_per_point * mask_pixels;
+
+            // The low-res masks are at 1/4 of IMAGE_SIZE (256x256) and represent the
+            // padded 1024x1024 image space. The actual image occupies only the top-left
+            // (original_h, original_w) region of that 1024x1024 space. Compute the
+            // corresponding crop region at the low-res mask scale.
+            let crop_h = mask_generation::low_res_crop_extent(original_h, mask_h);
+            let crop_w = mask_generation::low_res_crop_extent(original_w, mask_w);
+
+            let masks_flat = low_res_masks.reshape([total_mask_elems]);
+            let masks_slice = masks_flat.as_slice().await?;
+            let masks_vec = masks_slice.to_vec1();
+
+            let total_iou_elems = batch * n_masks_per_point;
+            let iou_flat = iou_preds.reshape([total_iou_elems]);
+            let iou_slice = iou_flat.as_slice().await?;
+            let iou_vec = iou_slice.to_vec1();
+
+            mask_generation::collect_mask_candidates(
+                LowResMaskBatch {
+                    masks: &masks_vec,
+                    iou: &iou_vec,
+                    batch,
+                    masks_per_point: n_masks_per_point,
+                    mask_w,
+                    crop_h,
+                    crop_w,
+                },
+                &mut candidates,
+            );
+        }
+
+        let candidates = mask_generation::suppress_overlaps(candidates);
         let mut masks = Vec::new();
-        for bbox in bboxes {
-            let mask = (&bbox.data.to_dtype(DType::U8)? * 255.)?;
-            let (h, w) = mask.dims2()?;
-            let mask = mask.broadcast_as((3, h, w))?;
-            let (channel, height, width) = mask.dims3()?;
-            if channel != 3 {
-                return Err(candle_core::Error::Msg(
-                    "save_image expects an input of shape (3, height, width)".to_string(),
-                )
-                .into());
-            }
-            let mask = mask.permute((1, 2, 0))?.flatten_all()?;
-            let pixels = mask.to_vec1::<u8>()?;
-            let image: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
-                image::ImageBuffer::from_raw(width as u32, height as u32, pixels)
-                    .ok_or(SegmentAnythingInferenceError::MergeMasks)?;
-            let image = image::DynamicImage::from(image);
-            let image =
-                image.resize_to_fill(w as u32, h as u32, image::imageops::FilterType::CatmullRom);
+        for candidate in candidates {
+            let mask_img = candidate
+                .into_image()
+                .ok_or(SegmentAnythingInferenceError::MergeMasks)?;
+            let image = image::DynamicImage::from(mask_img).resize_exact(
+                image_width,
+                image_height,
+                image::imageops::FilterType::Nearest,
+            );
             masks.push(image);
         }
 

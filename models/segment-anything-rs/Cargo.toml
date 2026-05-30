@@ -1,6 +1,6 @@
 [package]
 name = "segment-anything-rs"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "A simple interface for Segment Anything models "
 license = "MIT/Apache-2.0"
@@ -9,27 +9,17 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["ai", "segment-anything", "segmentation", "computer-vision"]
 
 [dependencies]
-candle-core.workspace = true
-candle-nn.workspace = true
-candle-transformers.workspace = true
-kalosm-common.workspace = true
+fusor = { workspace = true, features = ["cpu", "gpu"] }
+kalosm-common = { workspace = true }
 kalosm-model-types.workspace = true
-pollster = "0.4"
 thiserror.workspace = true
-
-accelerate-src = { version = "0.3.2", optional = true }
-intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"], optional = true }
-cudarc = { version = "0.9.14", features = ["f16"], optional = true }
-half = { version = "2.3.1", features = ["num-traits", "use-intrinsics", "rand_distr"], optional = true }
-
-tracing = "0.1.37"
 image.workspace = true
 
 [features]
-flash = ["candle-transformers/flash-attn"]
-accelerate = ["dep:accelerate-src", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-cudnn = ["candle-core/cudnn"]
-mkl = ["dep:intel-mkl-src", "candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
-nccl = ["cuda", "cudarc/nccl", "dep:half"]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+cuda = []
+cudnn = []
+mkl = []
+metal = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

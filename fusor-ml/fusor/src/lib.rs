@@ -34,7 +34,7 @@ pub use composite::{
 };
 pub use device::Device;
 pub use error::Error;
-pub use fusion::Fusion;
+pub use fusion::{Concrete, Fusion};
 pub use fusor_types::{D, Dim, FromArray, Layout, StrideSpec};
 
 /// Result type for fusor operations.

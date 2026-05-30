@@ -4,7 +4,7 @@
 
 use crate::cpu::{EqOp, GtOp, GteOp, LtOp, LteOp, NeOp, SimdBinaryOp};
 use crate::gpu::DataType;
-use crate::{SimdElement, Tensor};
+use crate::{Fusion, SimdElement, Tensor};
 
 /// Emit a scalar-comparison method that dispatches CPU/GPU.
 ///
@@ -15,7 +15,7 @@ use crate::{SimdElement, Tensor};
 macro_rules! scalar_cmp {
     ($(#[$meta:meta])* $method:ident, $op:ident, $cpu_method:ident, |$gt:ident, $gs:ident| $gpu_call:expr) => {
         $(#[$meta])*
-        pub fn $method(&self, scalar: D) -> Self
+        pub fn $method(&self, scalar: D) -> Tensor<R, D>
         where
             $op: SimdBinaryOp<D>,
         {
@@ -31,8 +31,9 @@ macro_rules! scalar_cmp {
 macro_rules! tensor_cmp {
     ($(#[$meta:meta])* $method:ident, $op:ident, $cpu_method:ident) => {
         $(#[$meta])*
-        pub fn $method(&self, rhs: &Self) -> Self
+        pub fn $method<B2>(&self, rhs: &Tensor<R, D, B2>) -> Tensor<R, D>
         where
+            B2: Fusion<R, D>,
             $op: SimdBinaryOp<D>,
         {
             self.dispatch_cpu_only_pair(rhs, |a, b| a.as_ref().$cpu_method(b.as_ref()).to_concrete())
@@ -44,7 +45,7 @@ macro_rules! tensor_cmp {
 macro_rules! cmp_alias {
     ($(#[$meta:meta])* $method:ident, $op:ident, $target:ident) => {
         $(#[$meta])*
-        pub fn $method(&self, rhs: D) -> Self
+        pub fn $method(&self, rhs: D) -> Tensor<R, D>
         where
             $op: SimdBinaryOp<D>,
         {
@@ -53,9 +54,10 @@ macro_rules! cmp_alias {
     };
 }
 
-impl<const R: usize, D> Tensor<R, D>
+impl<const R: usize, D, B> Tensor<R, D, B>
 where
     D: SimdElement + DataType + Default,
+    B: Fusion<R, D>,
 {
     tensor_cmp!(
         /// Element-wise equality comparison between two tensors.

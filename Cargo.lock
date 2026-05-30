@@ -7742,21 +7742,14 @@ dependencies = [
 
 [[package]]
 name = "segment-anything-rs"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
- "accelerate-src",
- "candle-core",
- "candle-nn",
- "candle-transformers",
- "cudarc 0.9.15",
- "half",
+ "fusor",
  "image 0.25.10",
- "intel-mkl-src",
  "kalosm-common",
  "kalosm-model-types",
- "pollster",
  "thiserror 2.0.18",
- "tracing",
+ "tokio",
 ]
 
 [[package]]

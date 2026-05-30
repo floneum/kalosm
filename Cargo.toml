@@ -67,7 +67,7 @@ kalosm-llama = { path = "./models/kalosm-llama", version = "0.4.0", default-feat
 kalosm-tokenizer = { path = "./models/kalosm-tokenizer", version = "0.4.0" }
 rwhisper = { path = "./models/rwhisper", version = "0.4.0", default-features = false }
 rwuerstchen = { path = "./models/rwuerstchen", version = "0.4.0" }
-segment-anything-rs = { path = "./models/segment-anything-rs", version = "0.4.0" }
+segment-anything-rs = { path = "./models/segment-anything-rs", version = "0.5.0" }
 kalosm-ocr = { path = "./models/kalosm-ocr", version = "0.4.0" }
 fusor = { path = "./fusor-ml/fusor", version = "0.1.0", default-features = false }
 fusor-core = { path = "./fusor-ml/core", version = "0.1.0" }

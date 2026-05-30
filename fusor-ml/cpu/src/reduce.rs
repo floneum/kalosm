@@ -586,8 +586,11 @@ pub fn layer_norm_last_dim_fused<const R: usize>(
 
     if tensor.layout().is_contiguous() && weight.layout().is_contiguous() {
         let in_data: &[f32] = tensor.data();
-        let weight_data: &[f32] = weight.data();
-        let bias_data: Option<&[f32]> = bias.map(|b| b.data() as &[f32]);
+        // Weight/bias are broadcast over leading dims; the materialized contiguous
+        // buffer repeats one row's values, so the first `last_dim` elements are
+        // exactly the per-row weights expected by `layer_norm_row`.
+        let weight_data: &[f32] = &weight.data()[..last_dim];
+        let bias_data: Option<&[f32]> = bias.map(|b| &b.data()[..last_dim] as &[f32]);
         let out_data = output.data_mut();
 
         // Process rows in parallel for large tensors
@@ -610,8 +613,8 @@ pub fn layer_norm_last_dim_fused<const R: usize>(
         // Fall back to non-fused for non-contiguous
         // This is slower but handles all cases
         let in_data: &[f32] = tensor.data();
-        let weight_data: &[f32] = weight.data();
-        let bias_data: Option<&[f32]> = bias.map(|b| b.data() as &[f32]);
+        let weight_data: &[f32] = &weight.data()[..last_dim];
+        let bias_data: Option<&[f32]> = bias.map(|b| &b.data()[..last_dim] as &[f32]);
         let out_data = output.data_mut();
 
         let mut row_buffer = vec![0.0f32; last_dim];

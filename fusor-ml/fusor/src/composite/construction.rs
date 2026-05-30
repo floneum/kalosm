@@ -59,6 +59,16 @@ where
         Self::splat(&self.device(), D::default(), shape)
     }
 
+    /// Create a tensor filled with ones on the specified device.
+    pub fn ones(device: &Device, shape: [usize; R]) -> Self {
+        Self::splat(device, D::one(), shape)
+    }
+
+    /// Create a tensor filled with ones that has the same shape as this tensor.
+    pub fn ones_like(&self) -> Self {
+        Self::splat(&self.device(), D::one(), self.shape())
+    }
+
     /// Create a tensor filled with a specific value.
     pub fn splat(device: &Device, value: D, shape: [usize; R]) -> Self {
         match device {
