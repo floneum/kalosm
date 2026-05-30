@@ -34,6 +34,24 @@ pub(crate) async fn gpu_device_for_test() -> Option<Device> {
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn gpu_device_for_large_sam_test() -> Option<Device> {
+    const MIN_STORAGE_BINDING_BYTES: u64 = 576 * 1024 * 1024;
+
+    let device = gpu_device_for_test().await?;
+    if let Some(gpu) = device.as_gpu() {
+        let limit = gpu.limits().max_storage_buffer_binding_size as u64;
+        if limit < MIN_STORAGE_BINDING_BYTES {
+            eprintln!(
+                "skipping large SAM GPU test: adapter max_storage_buffer_binding_size \
+                 is {limit}, need at least {MIN_STORAGE_BINDING_BYTES}"
+            );
+            return None;
+        }
+    }
+    Some(device)
+}
+
 use fusor::{Concrete, Device, Tensor, ToVec1, VarBuilder};
 use image::{DynamicImage, GenericImage, GenericImageView, ImageBuffer, Rgba};
 use raw::sam::{
@@ -709,7 +727,7 @@ mod tests {
     /// End-to-end smoke test: load model, run inference, verify mask is non-trivial.
     #[tokio::test]
     async fn test_load_tiny_model() {
-        let Some(device) = crate::gpu_device_for_test().await else {
+        let Some(device) = crate::gpu_device_for_large_sam_test().await else {
             return;
         };
         let model = SegmentAnything::builder()
@@ -1060,7 +1078,7 @@ mod tests {
     /// Uses the exact same reshape+as_slice reading pattern as segment_everything.
     #[tokio::test]
     async fn test_batched_vs_unbatched() {
-        let Some(device) = crate::gpu_device_for_test().await else {
+        let Some(device) = crate::gpu_device_for_large_sam_test().await else {
             return;
         };
         let model = SegmentAnything::builder()
