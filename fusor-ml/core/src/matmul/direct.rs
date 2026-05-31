@@ -127,7 +127,7 @@ pub(crate) fn build_serial_matmul_direct_kernel(
             let y_storage = storage_write(kb, y_meta_body.datatype, y_tensor);
 
             kb.program()
-                .program_grid::<BLOCK>(dispatch_size, |program| {
+                .program_grid(BLOCK as u32, dispatch_size, |program| {
                     let lane = program.lane();
                     let group = linear_group(program, dispatch_size);
                     let flat = group * BLOCK as u32 + lane.clone();
@@ -136,7 +136,7 @@ pub(crate) fn build_serial_matmul_direct_kernel(
 
                     let value_at =
                         |program: &mut tile_ir::tile::TileBlock<'_>,
-                         k_index: tile_ir::tile::Tile<tile_ir::U32>| {
+                         k_index: tile_ir::tile::Tile| {
                             let mut a_coords = dims[..rank - 1].to_vec();
                             a_coords.push(k_index.clone());
                             let mut b_coords = dims[..rank - 2].to_vec();
@@ -171,19 +171,27 @@ pub(crate) fn build_serial_matmul_direct_kernel(
                         };
 
                     let sum = match acc_dtype {
-                        DataTypeEnum::F32 => ValueTile::F32(program.loop_fold(
-                            tile_ir::TileReduceOp::Sum,
-                            k,
-                            tile_ir::TileLiteral::f32(0.0),
-                            |program, k_index| value_at(program, k_index).into_f32(),
-                        )),
+                        DataTypeEnum::F32 => {
+                            let [acc] = program.fold(
+                                tile_ir::tile::range(k),
+                                [tile_ir::tile::Tile::literal(tile_ir::TileLiteral::f32(0.0))],
+                                |program, k_index, [acc]| {
+                                    [acc + value_at(program, k_index).into_f32()]
+                                },
+                            );
+                            ValueTile::F32(acc)
+                        }
                         DataTypeEnum::F16 => unreachable!("matmul accumulates f16 products in f32"),
-                        DataTypeEnum::U32 => ValueTile::U32(program.loop_fold(
-                            tile_ir::TileReduceOp::Sum,
-                            k,
-                            tile_ir::TileLiteral::U32(0),
-                            |program, k_index| value_at(program, k_index).into_u32(),
-                        )),
+                        DataTypeEnum::U32 => {
+                            let [acc] = program.fold(
+                                tile_ir::tile::range(k),
+                                [tile_ir::tile::Tile::literal(tile_ir::TileLiteral::U32(0))],
+                                |program, k_index, [acc]| {
+                                    [acc + value_at(program, k_index).into_u32()]
+                                },
+                            );
+                            ValueTile::U32(acc)
+                        }
                     };
                     let sum = sum.cast_to(result_dtype);
                     let (sum, sum_ty) =
@@ -204,10 +212,12 @@ fn storage_read<B>(
     datatype: DataTypeEnum,
     tensor: tile_ir::KernelTensorRef<B>,
 ) -> crate::nary_direct::Storage2 {
+    let element = crate::nary_direct::datatype_element(datatype);
+    let storage = kb.read(element, tensor);
     match datatype {
-        DataTypeEnum::F32 => crate::nary_direct::Storage2::F32(kb.read::<tile_ir::F32, 2>(tensor)),
-        DataTypeEnum::F16 => crate::nary_direct::Storage2::F16(kb.read::<tile_ir::F16, 2>(tensor)),
-        DataTypeEnum::U32 => crate::nary_direct::Storage2::U32(kb.read::<tile_ir::U32, 2>(tensor)),
+        DataTypeEnum::F32 => crate::nary_direct::Storage2::F32(storage),
+        DataTypeEnum::F16 => crate::nary_direct::Storage2::F16(storage),
+        DataTypeEnum::U32 => crate::nary_direct::Storage2::U32(storage),
     }
 }
 
@@ -216,17 +226,16 @@ fn storage_write<B>(
     datatype: DataTypeEnum,
     tensor: tile_ir::KernelTensorRef<B>,
 ) -> crate::nary_direct::Storage2 {
+    let element = crate::nary_direct::datatype_element(datatype);
+    let storage = kb.write(element, tensor);
     match datatype {
-        DataTypeEnum::F32 => crate::nary_direct::Storage2::F32(kb.write::<tile_ir::F32, 2>(tensor)),
-        DataTypeEnum::F16 => crate::nary_direct::Storage2::F16(kb.write::<tile_ir::F16, 2>(tensor)),
-        DataTypeEnum::U32 => crate::nary_direct::Storage2::U32(kb.write::<tile_ir::U32, 2>(tensor)),
+        DataTypeEnum::F32 => crate::nary_direct::Storage2::F32(storage),
+        DataTypeEnum::F16 => crate::nary_direct::Storage2::F16(storage),
+        DataTypeEnum::U32 => crate::nary_direct::Storage2::U32(storage),
     }
 }
 
-fn output_dims_from_flat_u32(
-    flat: tile_ir::tile::Tile<tile_ir::U32>,
-    shape: &[u32],
-) -> Vec<tile_ir::tile::Tile<tile_ir::U32>> {
+fn output_dims_from_flat_u32(flat: tile_ir::tile::Tile, shape: &[u32]) -> Vec<tile_ir::tile::Tile> {
     let shape = shape.iter().map(|dim| *dim as usize).collect::<Vec<_>>();
     output_dims_from_flat(flat, &shape)
 }

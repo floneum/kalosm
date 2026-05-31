@@ -1,9 +1,9 @@
-use fusor_tile_ir::{TileLiteral, TileReduceOp, Vector, WorkgroupAxis, F32};
+use fusor_tile_ir::tile::{range, Tile};
+use fusor_tile_ir::{ElementType, ScalarElement, TileLiteral, WorkgroupAxis};
 
 use super::types::RmsNormVec4Meta;
-use fusor_tile_ir::tile::Tile;
 
-const RMS_NORM_VEC4_BLOCK: usize = 128;
+const RMS_NORM_VEC4_BLOCK: u32 = 128;
 
 /// Tensor bindings and shape metadata for [`rms_norm_vec4`].
 ///
@@ -86,25 +86,25 @@ pub fn rms_norm_vec4<B>(
         return None;
     }
 
-    let chunks = meta.cols_vec.div_ceil(RMS_NORM_VEC4_BLOCK as u32);
+    let chunks = meta.cols_vec.div_ceil(RMS_NORM_VEC4_BLOCK);
     let eps = meta.eps.get();
 
-    let input = kb.read::<Vector<F32, 4>, 1>(input);
-    let residual = residual.map(|r| kb.read::<Vector<F32, 4>, 1>(r));
-    let weight = kb.read::<Vector<F32, 4>, 1>(weight);
-    let bias = bias.map(|b| kb.read::<Vector<F32, 4>, 1>(b));
-    let output = kb.write::<Vector<F32, 4>, 1>(output);
+    let vec4 = ElementType::vector(ScalarElement::F32, 4);
+    let input = kb.read(vec4, input);
+    let residual = residual.map(|r| kb.read(vec4, r));
+    let weight = kb.read(vec4, weight);
+    let bias = bias.map(|b| kb.read(vec4, b));
+    let output = kb.write(vec4, output);
     let phase = kb.program();
 
-    phase.program_grid::<RMS_NORM_VEC4_BLOCK>([rows, 1, 1], |program| {
+    phase.program_grid(RMS_NORM_VEC4_BLOCK, [rows, 1, 1], |program| {
         let row = program.program_id(WorkgroupAxis::X);
         let lane = program.lane();
-        let partial_sum = program.loop_fold(
-            TileReduceOp::Sum,
-            chunks,
-            TileLiteral::f32(0.0),
-            |program, loop_index| {
-                let reduce_col = loop_index * RMS_NORM_VEC4_BLOCK as u32 + lane.clone();
+        let [partial_sum] = program.fold(
+            range(chunks),
+            [Tile::literal(TileLiteral::f32(0.0))],
+            |program, loop_index, [acc]| {
+                let reduce_col = loop_index * RMS_NORM_VEC4_BLOCK + lane.clone();
                 let reduce_mask = reduce_col.lt(meta.cols_vec);
                 let input_index = row.clone() * meta.input_row_stride_vec + reduce_col.clone();
                 let mut value = program.load(
@@ -122,16 +122,16 @@ pub fn rms_norm_vec4<B>(
                             TileLiteral::f32(0.0),
                         );
                 }
-                program.vector_dot::<F32, 4>(value.clone(), value)
+                [acc + program.vector_dot(value.clone(), value)]
             },
         );
-        let total_sum = program.group_reduce_sum(RMS_NORM_VEC4_BLOCK as u32, partial_sum);
+        let total_sum = program.group_reduce_sum(RMS_NORM_VEC4_BLOCK, partial_sum);
         let mean = total_sum / Tile::literal(TileLiteral::f32(meta.cols as f32));
         let scale = (mean + Tile::literal(TileLiteral::f32(eps))).inverse_sqrt();
         let scale = program.bind(scale);
 
-        for chunk in 0..chunks {
-            let col = lane.clone() + chunk * RMS_NORM_VEC4_BLOCK as u32;
+        program.loop_range(chunks, |program, chunk| {
+            let col = lane.clone() + chunk * RMS_NORM_VEC4_BLOCK;
             let mask = col.lt(meta.cols_vec);
             let input_index = row.clone() * meta.input_row_stride_vec + col.clone();
             let mut value =
@@ -145,7 +145,7 @@ pub fn rms_norm_vec4<B>(
                         TileLiteral::f32(0.0),
                     );
             }
-            let scale = program.vector_splat::<F32, 4>(scale.clone());
+            let scale = program.vector_splat::<4>(ScalarElement::F32, scale.clone());
             let weight = program.load(weight.at(col.clone()), mask.clone(), TileLiteral::f32(0.0));
             let mut normalized = value * scale * weight;
             if let Some(bias) = &bias {
@@ -154,7 +154,7 @@ pub fn rms_norm_vec4<B>(
             }
             let output_index = row.clone() * meta.output_row_stride_vec + col;
             program.store(output.at(output_index), normalized, mask);
-        }
+        });
     });
     Some(())
 }

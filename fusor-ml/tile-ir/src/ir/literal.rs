@@ -18,7 +18,7 @@ impl F32Bits {
 
 /// A typed scalar literal stored by bits so IR equality remains exact. Vector
 /// constants are not literals — they are built by composing scalar literals
-/// (e.g. `Expr::ComposeVector`).
+/// (e.g. `ExprKind::Vec`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileLiteral {
     /// 32-bit floating point literal.

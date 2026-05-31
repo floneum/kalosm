@@ -93,31 +93,33 @@ pub(crate) fn build_reduce_direct_kernel(
                 tile_ir::KernelTensorRef::new(input_buffer.clone(), input_layout.clone());
             let output_tensor =
                 tile_ir::KernelTensorRef::new(output_buffer.clone(), output_layout.clone());
+            let input_element = crate::nary_direct::datatype_element(input_meta_body.datatype);
             let input_storage = match input_meta_body.datatype {
                 DataTypeEnum::F32 => {
-                    crate::nary_direct::Storage2::F32(kb.read::<tile_ir::F32, 2>(input_tensor))
+                    crate::nary_direct::Storage2::F32(kb.read(input_element, input_tensor))
                 }
                 DataTypeEnum::F16 => {
-                    crate::nary_direct::Storage2::F16(kb.read::<tile_ir::F16, 2>(input_tensor))
+                    crate::nary_direct::Storage2::F16(kb.read(input_element, input_tensor))
                 }
                 DataTypeEnum::U32 => {
-                    crate::nary_direct::Storage2::U32(kb.read::<tile_ir::U32, 2>(input_tensor))
+                    crate::nary_direct::Storage2::U32(kb.read(input_element, input_tensor))
                 }
             };
+            let output_element = crate::nary_direct::datatype_element(output_meta_body.datatype);
             let output_storage = match output_meta_body.datatype {
                 DataTypeEnum::F32 => {
-                    crate::nary_direct::Storage2::F32(kb.write::<tile_ir::F32, 2>(output_tensor))
+                    crate::nary_direct::Storage2::F32(kb.write(output_element, output_tensor))
                 }
                 DataTypeEnum::F16 => {
-                    crate::nary_direct::Storage2::F16(kb.write::<tile_ir::F16, 2>(output_tensor))
+                    crate::nary_direct::Storage2::F16(kb.write(output_element, output_tensor))
                 }
                 DataTypeEnum::U32 => {
-                    crate::nary_direct::Storage2::U32(kb.write::<tile_ir::U32, 2>(output_tensor))
+                    crate::nary_direct::Storage2::U32(kb.write(output_element, output_tensor))
                 }
             };
 
             kb.program()
-                .program_grid::<BLOCK>(dispatch_size, |program| {
+                .program_grid(BLOCK as u32, dispatch_size, |program| {
                     let lane = program.lane();
                     let group = linear_group(program, dispatch_size);
                     let flat = group * BLOCK as u32 + lane.clone();
@@ -126,7 +128,7 @@ pub(crate) fn build_reduce_direct_kernel(
                     let base = layout_index(&input_meta_body, &dims);
                     let value_at =
                         |program: &mut tile_ir::tile::TileBlock<'_>,
-                         loop_index: tile_ir::tile::Tile<tile_ir::U32>| {
+                         loop_index: tile_ir::tile::Tile| {
                             let value_index = base.clone() + loop_index * reduce_stride;
                             let value = input_storage.load(program, value_index, in_bounds.clone());
                             let (value, value_ty) = apply_unary_function_chain(
@@ -140,25 +142,56 @@ pub(crate) fn build_reduce_direct_kernel(
                                 .cast_to(reduce_dtype)
                         };
 
+                    let reduce_binary = reduce_op.binary();
                     let reduced = match reduce_dtype {
-                        DataTypeEnum::F32 => ValueTile::F32(program.loop_fold(
-                            reduce_op,
-                            reduce_size,
-                            tile_literal_for(initial, DataTypeEnum::F32),
-                            |program, loop_index| value_at(program, loop_index).into_f32(),
-                        )),
-                        DataTypeEnum::F16 => ValueTile::F16(program.loop_fold(
-                            reduce_op,
-                            reduce_size,
-                            tile_literal_for(initial, DataTypeEnum::F16),
-                            |program, loop_index| value_at(program, loop_index).into_f16(),
-                        )),
-                        DataTypeEnum::U32 => ValueTile::U32(program.loop_fold(
-                            reduce_op,
-                            reduce_size,
-                            tile_literal_for(initial, DataTypeEnum::U32),
-                            |program, loop_index| value_at(program, loop_index).into_u32(),
-                        )),
+                        DataTypeEnum::F32 => {
+                            let [acc] = program.fold(
+                                tile_ir::tile::range(reduce_size),
+                                [tile_ir::tile::Tile::literal(tile_literal_for(
+                                    initial,
+                                    DataTypeEnum::F32,
+                                ))],
+                                |program, loop_index, [acc]| {
+                                    [acc.binary(
+                                        reduce_binary,
+                                        value_at(program, loop_index).into_f32(),
+                                    )]
+                                },
+                            );
+                            ValueTile::F32(acc)
+                        }
+                        DataTypeEnum::F16 => {
+                            let [acc] = program.fold(
+                                tile_ir::tile::range(reduce_size),
+                                [tile_ir::tile::Tile::literal(tile_literal_for(
+                                    initial,
+                                    DataTypeEnum::F16,
+                                ))],
+                                |program, loop_index, [acc]| {
+                                    [acc.binary(
+                                        reduce_binary,
+                                        value_at(program, loop_index).into_f16(),
+                                    )]
+                                },
+                            );
+                            ValueTile::F16(acc)
+                        }
+                        DataTypeEnum::U32 => {
+                            let [acc] = program.fold(
+                                tile_ir::tile::range(reduce_size),
+                                [tile_ir::tile::Tile::literal(tile_literal_for(
+                                    initial,
+                                    DataTypeEnum::U32,
+                                ))],
+                                |program, loop_index, [acc]| {
+                                    [acc.binary(
+                                        reduce_binary,
+                                        value_at(program, loop_index).into_u32(),
+                                    )]
+                                },
+                            );
+                            ValueTile::U32(acc)
+                        }
                     };
 
                     let (reduced, reduced_ty) =
@@ -200,9 +233,9 @@ fn tile_literal_for(value: NaryScalar, target: DataTypeEnum) -> tile_ir::TileLit
 }
 
 fn output_dims_from_flat_usize(
-    flat: tile_ir::tile::Tile<tile_ir::U32>,
+    flat: tile_ir::tile::Tile,
     shape: &[u32],
-) -> Vec<tile_ir::tile::Tile<tile_ir::U32>> {
+) -> Vec<tile_ir::tile::Tile> {
     let shape = shape.iter().map(|dim| *dim as usize).collect::<Vec<_>>();
     output_dims_from_flat(flat, &shape)
 }

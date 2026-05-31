@@ -1,54 +1,117 @@
 use super::*;
 
 impl<'a> Lowerer<'a> {
-    pub(super) fn tile_layout(&self, tile: TileRef) -> Result<&Layout, LowerError> {
-        let decl = self
-            .ir
-            .tiles()
-            .get(tile.id.index())
-            .ok_or(LowerError::UnknownTile(tile.id))?;
-        if decl.element != tile.element {
-            return Err(LowerError::TileElementMismatch {
-                tile: tile.id,
-                declared: decl.element,
-                used: tile.element,
-            });
-        }
+    // ---- decl resolution (pointer-keyed maps, no Vec side tables) ----
 
-        Ok(&decl.layout)
+    pub(super) fn buffer_global(
+        &self,
+        buffer: &Buffer,
+    ) -> Result<Handle<GlobalVariable>, LowerError> {
+        self.globals
+            .borrow()
+            .get(&buffer_key(buffer))
+            .copied()
+            .ok_or(LowerError::UnsupportedOperation("buffer not declared"))
+    }
+
+    pub(super) fn tile_global(&self, tile: &Tile) -> Option<Handle<GlobalVariable>> {
+        self.globals.borrow().get(&tile_key(tile)).copied()
+    }
+
+    pub(super) fn tile_local(&self, tile: &Tile) -> Option<Handle<LocalVariable>> {
+        self.locals.borrow().get(&tile_key(tile)).copied()
+    }
+
+    pub(super) fn private_local(&self, local: &Local) -> Result<Handle<LocalVariable>, LowerError> {
+        self.locals
+            .borrow()
+            .get(&local_key(local))
+            .copied()
+            .ok_or(LowerError::UnsupportedOperation("local not declared"))
+    }
+
+    // ---- demand-allocated scratch ----
+
+    /// Intern (or allocate) the scratch local for `(kind, element, depth)`.
+    /// Allocated lazily into the function-local arena; a non-f16 adapter falls
+    /// back to f32 storage so an f16 scratch slot still validates.
+    pub(super) fn scratch_local(
+        &self,
+        kind: ScratchKind,
+        element: ElementType,
+        depth: u32,
+    ) -> Result<Handle<LocalVariable>, LowerError> {
+        let key = (kind, element, depth);
+        if let Some(handle) = self.scratch.borrow().get(&key).copied() {
+            return Ok(handle);
+        }
+        let stored = if element.uses_f16() && !self.uses_f16 {
+            ElementType::F32
+        } else {
+            element
+        };
+        let ty = self.element_type(stored)?;
+        let handle = self.create_local(ty);
+        self.scratch.borrow_mut().insert(key, handle);
+        Ok(handle)
+    }
+
+    pub(super) fn scratch_u32(&self, kind: ScratchKind, depth: u32) -> Handle<LocalVariable> {
+        self.scratch_local(kind, ElementType::U32, depth)
+            .expect("u32 scratch always resolves")
+    }
+
+    pub(super) fn scratch_f32(&self, kind: ScratchKind, depth: u32) -> Handle<LocalVariable> {
+        self.scratch_local(kind, ElementType::F32, depth)
+            .expect("f32 scratch always resolves")
+    }
+
+    /// Demand-allocate an `i32`-typed scratch local. Keyed under the `U32`
+    /// element slot (the only i32 scratch is the Q8 activation sum), but
+    /// materialised with the signed-32 type.
+    pub(super) fn scratch_i32(&self, kind: ScratchKind, depth: u32) -> Handle<LocalVariable> {
+        let key = (kind, ElementType::U32, depth);
+        if let Some(handle) = self.scratch.borrow().get(&key).copied() {
+            return handle;
+        }
+        let handle = self.create_local(self.i32_ty);
+        self.scratch.borrow_mut().insert(key, handle);
+        handle
+    }
+
+    // ---- tile pointer + layout resolution ----
+
+    pub(super) fn tile_layout<'t>(&self, tile: &'t Tile) -> &'t Layout {
+        &tile.layout
     }
 
     pub(super) fn tile_dynamic_pointer(
         &self,
         expressions: &mut Arena<Expression>,
-        tile: TileRef,
+        tile: &Tile,
         index: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        self.tile_layout(tile)?;
-
         let base = self.tile_base_expression(expressions, tile)?;
-        let (_, offset) = self.storage_tile_and_offset(tile)?;
-        Ok(self.access_offset_pointer(expressions, body, base, index, offset))
+        Ok(self.access_offset_pointer(expressions, body, base, index, 0))
     }
 
     pub(super) fn tile_base_expression(
         &self,
         expressions: &mut Arena<Expression>,
-        tile: TileRef,
+        tile: &Tile,
     ) -> Result<Handle<Expression>, LowerError> {
-        let (storage_tile, _) = self.storage_tile_and_offset(tile)?;
-        let layout = self.tile_layout(storage_tile)?;
-
-        let id = storage_tile.id;
-        let unknown = || LowerError::UnknownTile(id);
-        match layout.memory_level() {
+        match tile.layout.memory_level() {
             MemoryLevel::Workgroup => {
-                let global = lookup_handle(&self.tile_globals, id.index(), unknown)?;
+                let global = self
+                    .tile_global(tile)
+                    .ok_or(LowerError::UnsupportedOperation("tile not declared"))?;
                 Ok(self.global_var(expressions, global))
             }
             MemoryLevel::Private => {
-                let local = lookup_handle(&self.tile_locals, id.index(), unknown)?;
+                let local = self
+                    .tile_local(tile)
+                    .ok_or(LowerError::UnsupportedOperation("tile not declared"))?;
                 Ok(self.local_var(expressions, local))
             }
             memory => Err(LowerError::UnsupportedMemoryLevel(memory)),
@@ -66,9 +129,7 @@ impl<'a> Lowerer<'a> {
         Ok(self.access_offset_pointer(expressions, body, base, index, view.offset))
     }
 
-    /// `&base[index + offset]`. Threads through the same emit dance both
-    /// `tile_dynamic_pointer` and `storage_dynamic_pointer` need: bias the
-    /// index by a constant, then `Expression::Access`.
+    /// `&base[index + offset]`.
     pub(super) fn access_offset_pointer(
         &self,
         expressions: &mut Arena<Expression>,
@@ -86,47 +147,12 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         view: &StorageView,
     ) -> Result<Handle<Expression>, LowerError> {
-        self.storage_layout(view)?;
-        let global = lookup_handle(&self.buffer_globals, view.buffer.id.index(), || {
-            LowerError::UnknownBuffer(view.buffer.id)
-        })?;
+        let global = self.buffer_global(&view.buffer)?;
         Ok(self.global_var(expressions, global))
     }
 
-    pub(super) fn storage_layout<'view>(
-        &self,
-        view: &'view StorageView,
-    ) -> Result<&'view Layout, LowerError> {
-        let decl = self
-            .ir
-            .buffers()
-            .get(view.buffer.id.index())
-            .ok_or(LowerError::UnknownBuffer(view.buffer.id))?;
-        if decl.element != view.buffer.element {
-            return Err(LowerError::UnsupportedOperation("buffer element mismatch"));
-        }
-        Ok(&view.layout)
-    }
-
-    pub(super) fn private_local(
-        &self,
-        local: LocalRef,
-    ) -> Result<Handle<LocalVariable>, LowerError> {
-        let decl = self
-            .ir
-            .locals()
-            .get(local.id.index())
-            .ok_or(LowerError::UnknownLocal(local.id))?;
-        if decl.element != local.element {
-            return Err(LowerError::LocalElementMismatch {
-                local: local.id,
-                declared: decl.element,
-                used: local.element,
-            });
-        }
-        lookup_handle(&self.private_locals, local.id.index(), || {
-            LowerError::UnknownLocal(local.id)
-        })
+    pub(super) fn storage_layout<'view>(&self, view: &'view StorageView) -> &'view Layout {
+        &view.layout
     }
 
     pub(super) fn is_u32_literal(
@@ -154,7 +180,7 @@ impl<'a> Lowerer<'a> {
         coords: &[Handle<Expression>],
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        let layout = self.storage_layout(view)?;
+        let layout = self.storage_layout(view);
         self.storage_index_from_multi_flatten(expressions, layout.indexing(), coords, body)
     }
 
@@ -247,15 +273,4 @@ impl<'a> Lowerer<'a> {
             },
         )
     }
-}
-
-/// Resolve a side-table slot of `Option<Handle<H>>` indexed by an IR id.
-/// Returns the handle if both the slot exists and was filled in, otherwise
-/// produces the caller's "unknown id" error.
-fn lookup_handle<H, E>(
-    table: &[Option<Handle<H>>],
-    index: usize,
-    err: impl FnOnce() -> E,
-) -> Result<Handle<H>, E> {
-    table.get(index).copied().flatten().ok_or_else(err)
 }

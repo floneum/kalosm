@@ -1,11 +1,5 @@
-mod ids;
-pub use ids::{BlockDequantId, BufferId, CoopFragmentId, LocalId, TileId};
-
 mod element;
-pub use element::{
-    Bool, CoopElement, CoopMatrixRole, ElementType, FloatElement, Numeric, ScalarElement,
-    ScalarMarker, Vector, F16, F32, U32,
-};
+pub use element::{CoopMatrixRole, ElementType, ScalarElement};
 
 mod literal;
 pub use literal::{F32Bits, TileBinaryOp, TileCompareOp, TileLiteral, TileReduceOp, TileUnaryOp};
@@ -15,16 +9,11 @@ pub use layout::{AxisGroup, Layout, MemoryLevel, MultiFlattenMap, Shape, SubAxis
 
 mod storage;
 pub use storage::{
-    BufferAccess, BufferDecl, BufferRef, LocalRef, StorageView, TileDecl, TileRef, WorkgroupAxis,
+    Buffer, BufferAccess, BufferDecl, Local, LocalDecl, StorageView, Tile, TileDecl, WorkgroupAxis,
 };
 
 mod expr;
-pub use expr::{
-    Builtin, DotK, Expr, LoadSource, PackedActivations, TileLinearLoadExpr, TileLoadExpr,
-};
+pub use expr::{Addr, Builtin, CoopSrc, Expr, ExprKind, Node, QuantActivation, ReduceKind, Source};
 
 mod program;
-pub use program::{
-    CoopOperandRole, CopySource, FoldAccumulator, KernelIr, TileIndexedStoreStmt, TileProgramOp,
-    TileStmt, TileStoreStmt,
-};
+pub use program::{Accumulator, KernelIr, Stmt};

@@ -1,110 +1,96 @@
-use std::marker::PhantomData;
-
 use super::value::boxed_index;
-use super::*;
-use crate::ir::{AxisGroup, Layout, MultiFlattenMap, Shape, StorageView, SubAxis, U32};
+use super::Tile;
+use crate::ir::{Addr, ElementType, Layout, Shape, StorageView};
 
-/// Typed handle to a storage buffer view declared on a [`Program`].
+/// Runtime-typed handle to a storage buffer view declared on a
+/// [`Program`](super::Program).
 ///
-/// `T` is the element type exposed to the tile API and `R` is the logical
-/// rank of the view. Use [`Storage::view`] to inspect the underlying
-/// [`StorageView`](crate::StorageView).
-pub struct Storage<T, const R: usize> {
+/// The element type and logical rank are runtime data carried by the view (see
+/// ARBOR_DESIGN.md §2) — there are no `Numeric`/const-`R` type parameters. Use
+/// [`Storage::view`] to inspect the underlying [`StorageView`].
+#[derive(Clone)]
+pub struct Storage {
     pub(crate) view: StorageView,
-    pub(super) _ty: PhantomData<T>,
 }
 
-/// Marker for storage whose element type is carried by the [`StorageView`]
-/// instead of a compile-time [`Numeric`] marker.
-pub struct RuntimeElement;
-
-/// Convert rank-specific index syntax into storage address components.
-pub trait StorageIndex<const R: usize> {
-    #[doc(hidden)]
-    fn storage_index(self) -> [Box<crate::ir::Expr>; R];
+/// Convert rank-specific index syntax into a memory [`Addr`].
+///
+/// Only rank-1 (`Addr::Linear`) and rank-2 (`Addr::Rc2`) addresses are
+/// representable in the IR; higher-rank views are flattened at the frontend.
+pub trait StorageIndex {
+    /// Lower this index syntax into a memory address.
+    fn storage_addr(self) -> Addr;
 }
 
-impl<I> StorageIndex<1> for I
+impl<I> StorageIndex for I
 where
-    I: Into<Tile<U32>>,
+    I: Into<Tile>,
 {
-    fn storage_index(self) -> [Box<crate::ir::Expr>; 1] {
-        [boxed_index(self)]
+    fn storage_addr(self) -> Addr {
+        Addr::Linear(boxed_index(self))
     }
 }
 
-impl<I> StorageIndex<1> for (I,)
+impl<I> StorageIndex for (I,)
 where
-    I: Into<Tile<U32>>,
+    I: Into<Tile>,
 {
-    fn storage_index(self) -> [Box<crate::ir::Expr>; 1] {
-        [boxed_index(self.0)]
+    fn storage_addr(self) -> Addr {
+        Addr::Linear(boxed_index(self.0))
     }
 }
 
-impl<I, const R: usize> StorageIndex<R> for [I; R]
+impl<R, C> StorageIndex for (R, C)
 where
-    I: Into<Tile<U32>>,
+    R: Into<Tile>,
+    C: Into<Tile>,
 {
-    fn storage_index(self) -> [Box<crate::ir::Expr>; R] {
-        self.map(boxed_index)
-    }
-}
-
-macro_rules! impl_tuple_storage_index {
-    ($rank:literal, $($name:ident),+ $(,)?) => {
-        impl<$($name),+> StorageIndex<$rank> for ($($name,)+)
-        where
-            $($name: Into<Tile<U32>>,)+
-        {
-            #[allow(non_snake_case)]
-            fn storage_index(self) -> [Box<crate::ir::Expr>; $rank] {
-                let ($($name,)+) = self;
-                [$(boxed_index($name),)+]
-            }
+    fn storage_addr(self) -> Addr {
+        Addr::Rc2 {
+            row: boxed_index(self.0),
+            col: boxed_index(self.1),
         }
-    };
+    }
 }
 
-impl_tuple_storage_index!(2, A, B);
-impl_tuple_storage_index!(3, A, B, C);
-impl_tuple_storage_index!(4, A, B, C, D);
-impl_tuple_storage_index!(5, A, B, C, D, E);
-impl_tuple_storage_index!(6, A, B, C, D, E, F);
+impl Storage {
+    /// The runtime element type of this storage view.
+    pub fn element(&self) -> ElementType {
+        self.view.buffer.element
+    }
 
-impl<T, const R: usize> Storage<T, R> {
+    /// The logical rank of this storage view.
+    pub fn rank(&self) -> usize {
+        self.view.layout.shape().rank()
+    }
+
     /// Underlying storage view.
     pub fn view(&self) -> &StorageView {
         &self.view
     }
 
-    /// Address one element in this storage view.
-    pub fn at(&self, index: impl StorageIndex<R>) -> Address<T, R> {
-        Address {
+    /// The view's logical layout.
+    pub fn layout(&self) -> &Layout {
+        &self.view.layout
+    }
+
+    /// Address one element in this storage view (rank-1 linear or rank-2
+    /// row/col).
+    pub fn at(&self, index: impl StorageIndex) -> super::value::Address {
+        super::value::Address {
             view: self.view.clone(),
-            indices: index.storage_index(),
-            _ty: PhantomData,
+            addr: index.storage_addr(),
         }
     }
 
-    /// Construct a typed storage handle from an existing view. Caller is
-    /// responsible for ensuring the view's element type matches `T` and its
-    /// layout's rank matches `R`.
+    /// Construct a storage handle from an existing view.
     pub fn from_view(view: StorageView) -> Self {
-        Self {
-            view,
-            _ty: PhantomData,
-        }
+        Self { view }
     }
 
-    /// Re-view this storage as rank `R2` with arbitrary `(extent, stride)`
-    /// per axis. Strides may overlap (non-injective views); the resulting
-    /// view is affine — no divmod indexing.
-    pub fn restride<const R2: usize>(
-        &self,
-        extents: [u32; R2],
-        strides: [u32; R2],
-    ) -> Storage<T, R2> {
+    /// Re-view this storage with arbitrary `(extent, stride)` per axis. Strides
+    /// may overlap (non-injective views); the resulting view is affine.
+    pub fn restride<const R2: usize>(&self, extents: [u32; R2], strides: [u32; R2]) -> Storage {
         assert!(
             self.view.layout.is_affine(),
             "restride source must be an affine view",
@@ -116,63 +102,10 @@ impl<T, const R: usize> Storage<T, R> {
         );
         Storage {
             view: StorageView {
-                buffer: self.view.buffer,
+                buffer: self.view.buffer.clone(),
                 offset: self.view.offset,
                 layout,
             },
-            _ty: PhantomData,
-        }
-    }
-
-    /// Fuse adjacent axes into groups, lowering rank from `R` to `R2` via
-    /// divmod indexing. `groups[i]` lists the source axes (most-significant
-    /// first) of output axis `i`.
-    pub fn flatten_axes<const R2: usize>(&self, groups: [&[usize]; R2]) -> Storage<T, R2> {
-        assert!(
-            self.view.layout.is_affine(),
-            "flatten_axes source must be an affine view",
-        );
-        let src_dims = self.view.layout.shape().dims();
-        let src_strides = self.view.layout.affine_strides();
-
-        let mut new_extents = [0u32; R2];
-        let new_groups: Vec<AxisGroup> = groups
-            .iter()
-            .enumerate()
-            .map(|(out_axis, axes)| {
-                assert!(!axes.is_empty(), "axis group must be non-empty");
-                let mut extent_product: u32 = 1;
-                let sub_axes = axes
-                    .iter()
-                    .map(|&src_axis| {
-                        let extent = src_dims[src_axis].get();
-                        extent_product = extent_product
-                            .checked_mul(extent)
-                            .expect("flatten_axes extent overflow");
-                        SubAxis {
-                            extent,
-                            stride: src_strides[src_axis],
-                        }
-                    })
-                    .collect();
-                new_extents[out_axis] = extent_product;
-                AxisGroup { sub_axes }
-            })
-            .collect();
-
-        let indexing = MultiFlattenMap { groups: new_groups };
-        let layout = Layout::with_indexing(
-            self.view.layout.memory_level(),
-            Shape::new(new_extents),
-            indexing,
-        );
-        Storage {
-            view: StorageView {
-                buffer: self.view.buffer,
-                offset: self.view.offset,
-                layout,
-            },
-            _ty: PhantomData,
         }
     }
 }

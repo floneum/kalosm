@@ -1,33 +1,7 @@
-use super::{BufferId, ElementType, Layout, LocalId, TileId};
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 
-/// A storage buffer declaration.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct BufferDecl {
-    /// Buffer id.
-    pub id: BufferId,
-    /// Buffer element type.
-    pub element: ElementType,
-    /// Buffer layout.
-    pub layout: Layout,
-    /// Required storage access.
-    pub access: BufferAccess,
-}
-
-/// A storage buffer reference.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct BufferRef {
-    /// Buffer id.
-    pub id: BufferId,
-    /// Buffer element type.
-    pub element: ElementType,
-}
-
-impl BufferRef {
-    /// Create a typed reference to an existing buffer declaration.
-    pub const fn new(id: BufferId, element: ElementType) -> Self {
-        Self { id, element }
-    }
-}
+use super::{ElementType, Layout};
 
 /// Access required for a storage buffer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -38,57 +12,59 @@ pub enum BufferAccess {
     ReadWrite,
 }
 
+/// A storage buffer declaration. Owned by the nodes that name it via an
+/// [`Rc`]; `binding` is the single externally-meaningful name (see
+/// ARBOR_DESIGN.md §3). A declaration *is* its identity — there is no
+/// `BufferId`; sharing is `Rc` identity (`Rc::as_ptr`).
+#[derive(Debug)]
+pub struct BufferDecl {
+    /// Binding slot — the one externally-meaningful name.
+    pub binding: u32,
+    /// Buffer element type.
+    pub element: ElementType,
+    /// Buffer layout.
+    pub layout: Layout,
+    /// Required storage access.
+    pub access: BufferAccess,
+}
+
 /// A typed workgroup tile declaration. Tiles are always workgroup-level and
-/// always own their storage — the IR has no other shape today.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// always own their storage — the IR has no other shape today. Owned by use
+/// sites via an [`Rc`]; identity is `Rc::as_ptr`, not an id.
+#[derive(Debug)]
 pub struct TileDecl {
-    /// Tile id.
-    pub id: TileId,
     /// Tile element type.
     pub element: ElementType,
     /// Tile layout.
     pub layout: Layout,
 }
 
-/// A typed reference to a tile declaration.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct TileRef {
-    /// Tile id.
-    pub id: TileId,
-    /// Tile element type.
-    pub element: ElementType,
-}
-
-impl TileRef {
-    /// Create a typed reference to an existing tile declaration.
-    pub const fn new(id: TileId, element: ElementType) -> Self {
-        Self { id, element }
-    }
-}
-
-/// A typed private per-invocation local. Used both as the declaration in
-/// `KernelIr::locals` and as the reference embedded in `Expr::LoadLocal` /
-/// `TileStmt::StoreLocal` — they carry the same fields.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LocalRef {
-    /// Local id.
-    pub id: LocalId,
+/// A typed private per-invocation local. Owned by use sites via an [`Rc`]: a
+/// `Loop` owns its `index` and each `Accumulator.local`, so scoping is
+/// structural and there is no `LocalId`.
+#[derive(Debug)]
+pub struct LocalDecl {
     /// Local element type.
     pub element: ElementType,
 }
 
-impl LocalRef {
-    /// Create a typed reference to an existing private local.
-    pub const fn new(id: LocalId, element: ElementType) -> Self {
-        Self { id, element }
-    }
-}
+/// Shared, `Rc`-owned handle to a storage buffer declaration.
+pub type Buffer = Rc<BufferDecl>;
+/// Shared, `Rc`-owned handle to a workgroup tile declaration.
+pub type Tile = Rc<TileDecl>;
+/// Shared, `Rc`-owned handle to a private local declaration.
+pub type Local = Rc<LocalDecl>;
 
 /// A shaped view into a storage buffer.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// `Hash`/`PartialEq`/`Eq` identify the `buffer` by `Rc::as_ptr`, so a view is
+/// equal iff it names the *same* declaration with the same offset/layout. This
+/// keeps `QuantizedMatrix` (which embeds a view) hashable for the kernel cache
+/// key.
+#[derive(Clone, Debug)]
 pub struct StorageView {
     /// Referenced storage buffer.
-    pub buffer: BufferRef,
+    pub buffer: Buffer,
     /// Element offset into `buffer`.
     pub offset: u32,
     /// Logical view layout.
@@ -97,12 +73,30 @@ pub struct StorageView {
 
 impl StorageView {
     /// Construct a storage view directly over `buffer`.
-    pub fn root(buffer: BufferRef, layout: Layout) -> Self {
+    pub fn root(buffer: Buffer, layout: Layout) -> Self {
         Self {
             buffer,
             offset: 0,
             layout,
         }
+    }
+}
+
+impl PartialEq for StorageView {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.buffer, &other.buffer)
+            && self.offset == other.offset
+            && self.layout == other.layout
+    }
+}
+
+impl Eq for StorageView {}
+
+impl Hash for StorageView {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (Rc::as_ptr(&self.buffer) as usize).hash(state);
+        self.offset.hash(state);
+        self.layout.hash(state);
     }
 }
 

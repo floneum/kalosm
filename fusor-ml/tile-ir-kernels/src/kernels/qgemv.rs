@@ -1,9 +1,24 @@
 //! Quantized GEMV program kernels.
+//!
+//! Runtime-typed port: the const-generic markers (`Storage<F32, 2>` /
+//! `Tile<U32>` / `program_grid::<BLOCK>`) are gone — every handle carries its
+//! [`fusor_tile_ir::ElementType`] / dims as data and the workgroup `block` is a
+//! runtime `u32`.
+//!
+//! The over-fused multi-format `QuantizedDot` op surface (the
+//! `q{4,6}k_block` GGML fused dots) was removed from the IR. The composable
+//! quantized primitive is `Expr::Dequantize` (one `Shared(Dequantize)` node
+//! projected per-lane with `LaneOf`), surfaced as
+//! [`load_quantized_block_vec`](fusor_tile_ir::tile::TileBlock::load_quantized_block_vec);
+//! the kernel composes an ordinary dot over it via [`dot4_sum`]. The two fused
+//! dots that composition cannot match compactly — the f32 block dot and the Q8
+//! DP4a dot — are kept as `quantized_dot_f32` / `quantized_dot_q8`. The
+//! `(format, values_per_lane)` choice that picks between them stays in the
+//! kernel as [`select_qgemv_dot`]; `values_per_lane` is a caller TILING choice,
+//! not `(format, dims)`-derivable, so it is not pushed into the lowerer.
 
-use fusor_tile_ir::tile::{
-    BlockCoord, Mask, Program, Q4KActivations, QuantizedDot, Storage, Tile, TileBlock,
-};
-use fusor_tile_ir::{GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, F32, U32};
+use fusor_tile_ir::tile::{range, Mask, Program, Storage, Tile, TileBlock};
+use fusor_tile_ir::{GgmlQuantFormat, QuantizedMatrix, TileLiteral};
 
 use crate::dispatch::{
     q4k_default_large, q4k_default_mid, q4k_default_tall, q4k_large_override, q4k_mid_override,
@@ -11,11 +26,9 @@ use crate::dispatch::{
     qgemv_subgroups_per_workgroup_for_shape, QgemvShape,
 };
 use crate::grid::{
-    dot4_sum, q4k_ggml_iteration, q4k_lane_decomposition, q6k_ggml_iteration,
-    q6k_lane_decomposition, qgemv_grid, qgemv_program_scope, Q4KGgmlIterationRequest, Q4KLane,
-    Q6KGgmlIterationRequest, Q6KLane, QgemvStoreTarget,
+    dot4_sum, qgemv_grid, qgemv_program_scope, store_qgemv_sums_with_epilogue, QgemvStoreTarget,
 };
-use crate::types::matrix_shape;
+use crate::types::{apply_qmatmul_pre_epilogue, matrix_shape, QmatmulEpilogues, QmatmulExtra};
 
 /// Converts qgemv epilogue inputs into the internal pre/post epilogue bundle.
 ///
@@ -23,12 +36,12 @@ use crate::types::matrix_shape;
 /// epilogue or `&QmatmulEpilogues` for explicit pre/post control.
 pub trait IntoQgemvEpilogues<'a> {
     /// Convert into a qgemv epilogue bundle.
-    fn into_qgemv_epilogues(self) -> crate::types::QmatmulEpilogues<'a>;
+    fn into_qgemv_epilogues(self) -> QmatmulEpilogues<'a>;
 }
 
 impl<'a> IntoQgemvEpilogues<'a> for Option<&'a crate::UnaryEpilogue> {
-    fn into_qgemv_epilogues(self) -> crate::types::QmatmulEpilogues<'a> {
-        crate::types::QmatmulEpilogues {
+    fn into_qgemv_epilogues(self) -> QmatmulEpilogues<'a> {
+        QmatmulEpilogues {
             pre: None,
             pre_with_extras: None,
             pre_extra_inputs: &[],
@@ -40,20 +53,20 @@ impl<'a> IntoQgemvEpilogues<'a> for Option<&'a crate::UnaryEpilogue> {
     }
 }
 
-impl<'a> IntoQgemvEpilogues<'a> for &'a crate::types::QmatmulEpilogues<'a> {
-    fn into_qgemv_epilogues(self) -> crate::types::QmatmulEpilogues<'a> {
+impl<'a> IntoQgemvEpilogues<'a> for &'a QmatmulEpilogues<'a> {
+    fn into_qgemv_epilogues(self) -> QmatmulEpilogues<'a> {
         self.clone()
     }
 }
 
 #[derive(Clone, Copy)]
 struct QgemvTensors<'a> {
-    a: &'a Storage<F32, 2>,
+    a: &'a Storage,
     b: &'a QuantizedMatrix,
-    y: &'a Storage<F32, 2>,
+    y: &'a Storage,
 }
 
-const fn qgemv_shape(block: u32, subgroups: u32, cols_per_subgroup: u32) -> QgemvShape {
+fn qgemv_shape(block: u32, subgroups: u32, cols_per_subgroup: u32) -> QgemvShape {
     QgemvShape {
         subgroups,
         cols_per_subgroup,
@@ -67,22 +80,22 @@ const fn qgemv_shape(block: u32, subgroups: u32, cols_per_subgroup: u32) -> Qgem
 /// with no epilogue pass `None` (or `Option::<&UnaryEpilogue>::None`).
 ///
 /// ```
-/// use fusor_tile_ir::{tile, GgmlQuantFormat, Shape, F32};
+/// use fusor_tile_ir::{tile, GgmlQuantFormat, Shape, ScalarElement};
 /// use fusor_tile_ir_kernels::{qgemv_with_epilogue, quantized_matrix, UnaryEpilogue};
 ///
 /// let ir = tile::build(|program| {
-///     let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
+///     let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, 256]));
 ///     let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 128);
-///     let y = program.storage_write::<F32, 2>(Shape::new([1, 128]));
+///     let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, 128]));
 ///     qgemv_with_epilogue(program, &a, &b, &y, 1, Option::<&UnaryEpilogue>::None);
 /// });
 /// # let _ = ir;
 /// ```
 pub fn qgemv_with_epilogue<'a>(
     program: &mut Program,
-    a: &Storage<F32, 2>,
+    a: &Storage,
     b: &QuantizedMatrix,
-    y: &Storage<F32, 2>,
+    y: &Storage,
     workgroups_x: u32,
     epilogues: impl IntoQgemvEpilogues<'a>,
 ) {
@@ -90,68 +103,31 @@ pub fn qgemv_with_epilogue<'a>(
     qgemv_tile_with_epilogue(program, a, b, y, workgroups_x, &epilogues);
 }
 
-/// Variant-dispatched Q4K ggml qgemv. Picks the right monomorphization for
-/// the supplied shape and threads optional unary epilogues through it.
-fn qgemv_q4k_dispatch_with_epilogue(
-    program: &mut Program,
-    shape: impl Into<QgemvShape>,
-    tensors: QgemvTensors<'_>,
-    workgroups_x: u32,
-    epilogues: &crate::types::QmatmulEpilogues<'_>,
-) {
-    let shape = shape.into();
-    match shape.block {
-        32 => qgemv_q4k_ggml_with_epilogue::<32>(program, tensors, workgroups_x, epilogues, shape),
-        64 => qgemv_q4k_ggml_with_epilogue::<64>(program, tensors, workgroups_x, epilogues, shape),
-        128 => {
-            qgemv_q4k_ggml_with_epilogue::<128>(program, tensors, workgroups_x, epilogues, shape)
-        }
-        256 => {
-            qgemv_q4k_ggml_with_epilogue::<256>(program, tensors, workgroups_x, epilogues, shape)
-        }
-        other => panic!("unsupported Q4K qgemv BLOCK {other}"),
-    }
-}
-
-/// Variant-dispatched Q6K ggml qgemv. Same role as the Q4K dispatch helper,
-/// but for Q6K shapes.
-fn qgemv_q6k_dispatch_with_epilogue(
-    program: &mut Program,
-    shape: impl Into<QgemvShape>,
-    tensors: QgemvTensors<'_>,
-    workgroups_x: u32,
-    epilogues: &crate::types::QmatmulEpilogues<'_>,
-) {
-    let shape = shape.into();
-    match shape.block {
-        64 => qgemv_q6k_ggml_with_epilogue::<64>(program, tensors, workgroups_x, epilogues, shape),
-        128 => {
-            qgemv_q6k_ggml_with_epilogue::<128>(program, tensors, workgroups_x, epilogues, shape)
-        }
-        256 => {
-            qgemv_q6k_ggml_with_epilogue::<256>(program, tensors, workgroups_x, epilogues, shape)
-        }
-        other => panic!("unsupported Q6K qgemv BLOCK {other}"),
-    }
-}
-
 /// Format-dispatched qgemv body with optional pre/post unary epilogues.
+///
+/// Every arm routes to [`qgemv_perf_with_epilogue`], the single surviving body.
+/// The per-format Q4K/Q6K "ggml" specializations consumed the over-fused
+/// `QuantizedDot::q{4,6}k_block` dot, which the IR no longer exposes (the
+/// `q{4,6}k_ggml_dot` lowering helpers are dead with no builder front-door); the
+/// composable `Dequantize` + [`dot4_sum`] path replaces them. The shape tables
+/// (`q4k_*_override` / `q6k_*_override`) are kept so the workgroup geometry for
+/// the large/mid/tall regimes is unchanged; only the dot composition differs.
 pub(crate) fn qgemv_tile_with_epilogue(
     program: &mut Program,
-    a: &Storage<F32, 2>,
+    a: &Storage,
     b: &QuantizedMatrix,
-    y: &Storage<F32, 2>,
+    y: &Storage,
     workgroups_x: u32,
-    ep: &crate::types::QmatmulEpilogues<'_>,
+    ep: &QmatmulEpilogues<'_>,
 ) {
-    let [m, _] = matrix_shape(&a.view().layout);
+    let [m, _] = matrix_shape(a.layout());
     assert_eq!(m, 1, "qgemv requires a single input row");
     let tensors = QgemvTensors { a, b, y };
 
     match b.format {
         GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native => {
             if b.cols >= 8192 {
-                return qgemv_perf_with_epilogue::<128>(
+                return qgemv_perf_with_epilogue(
                     program,
                     tensors,
                     workgroups_x,
@@ -160,7 +136,7 @@ pub(crate) fn qgemv_tile_with_epilogue(
                     8,
                 );
             }
-            qgemv_perf_with_epilogue::<128>(
+            qgemv_perf_with_epilogue(
                 program,
                 tensors,
                 workgroups_x,
@@ -169,7 +145,7 @@ pub(crate) fn qgemv_tile_with_epilogue(
                 8,
             )
         }
-        GgmlQuantFormat::Q8_1 => qgemv_perf_with_epilogue::<128>(
+        GgmlQuantFormat::Q8_1 => qgemv_perf_with_epilogue(
             program,
             tensors,
             workgroups_x,
@@ -180,10 +156,10 @@ pub(crate) fn qgemv_tile_with_epilogue(
         GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative => {
             if b.rows <= 4096 && b.cols >= 4096 && b.cols < 8192 {
                 let shape = q4k_mid_override(q4k_default_mid(b.rows, b.cols));
-                return qgemv_q4k_dispatch_with_epilogue(program, shape, tensors, workgroups_x, ep);
+                return qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, shape, 16);
             }
             if b.rows <= 4096 && b.cols <= 4096 {
-                return qgemv_perf_with_epilogue::<256>(
+                return qgemv_perf_with_epilogue(
                     program,
                     tensors,
                     workgroups_x,
@@ -194,14 +170,14 @@ pub(crate) fn qgemv_tile_with_epilogue(
             }
             if b.rows <= 4096 && b.cols >= 8192 {
                 let shape = q4k_large_override(q4k_default_large(b.rows, b.cols));
-                return qgemv_q4k_dispatch_with_epilogue(program, shape, tensors, workgroups_x, ep);
+                return qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, shape, 16);
             }
             if b.rows > 4096 && b.cols <= 4096 {
                 let shape = q4k_tall_override(q4k_default_tall(b.rows, b.cols));
-                return qgemv_q4k_dispatch_with_epilogue(program, shape, tensors, workgroups_x, ep);
+                return qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, shape, 16);
             }
             if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, b.cols) == 8 {
-                return qgemv_perf_with_epilogue::<256>(
+                return qgemv_perf_with_epilogue(
                     program,
                     tensors,
                     workgroups_x,
@@ -210,7 +186,7 @@ pub(crate) fn qgemv_tile_with_epilogue(
                     8,
                 );
             }
-            qgemv_perf_with_epilogue::<128>(
+            qgemv_perf_with_epilogue(
                 program,
                 tensors,
                 workgroups_x,
@@ -219,7 +195,7 @@ pub(crate) fn qgemv_tile_with_epilogue(
                 8,
             )
         }
-        GgmlQuantFormat::Q5_0 | GgmlQuantFormat::Q5_0Native => qgemv_perf_with_epilogue::<64>(
+        GgmlQuantFormat::Q5_0 | GgmlQuantFormat::Q5_0Native => qgemv_perf_with_epilogue(
             program,
             tensors,
             workgroups_x,
@@ -231,41 +207,26 @@ pub(crate) fn qgemv_tile_with_epilogue(
         | GgmlQuantFormat::Q4_0Native
         | GgmlQuantFormat::Q4_1
         | GgmlQuantFormat::Q5_1
-        | GgmlQuantFormat::Q2K => qgemv_perf_with_epilogue::<64>(
-            program,
-            tensors,
-            workgroups_x,
-            ep,
-            qgemv_shape(64, 2, 4),
-            8,
-        ),
-        GgmlQuantFormat::Q3K | GgmlQuantFormat::Q8K => qgemv_perf_with_epilogue::<64>(
-            program,
-            tensors,
-            workgroups_x,
-            ep,
-            qgemv_shape(64, 2, 2),
-            8,
-        ),
-        GgmlQuantFormat::Q5K | GgmlQuantFormat::Q5KNative => qgemv_perf_with_epilogue::<64>(
-            program,
-            tensors,
-            workgroups_x,
-            ep,
-            qgemv_shape(64, 2, 1),
-            8,
-        ),
+        | GgmlQuantFormat::Q2K => {
+            qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, qgemv_shape(64, 2, 4), 8)
+        }
+        GgmlQuantFormat::Q3K | GgmlQuantFormat::Q8K => {
+            qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, qgemv_shape(64, 2, 2), 8)
+        }
+        GgmlQuantFormat::Q5K | GgmlQuantFormat::Q5KNative => {
+            qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, qgemv_shape(64, 2, 1), 8)
+        }
         GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative => {
             if b.rows <= 4096 && b.cols >= 8192 {
                 let shape = q6k_large_override(q6k_default_large(b.rows, b.cols));
-                return qgemv_q6k_dispatch_with_epilogue(program, shape, tensors, workgroups_x, ep);
+                return qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, shape, 8);
             }
             if b.rows > 4096 && b.cols <= 4096 {
                 let shape = q6k_tall_override(q6k_default_tall(b.rows, b.cols));
-                return qgemv_q6k_dispatch_with_epilogue(program, shape, tensors, workgroups_x, ep);
+                return qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, shape, 8);
             }
             if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, b.cols) == 4 {
-                return qgemv_perf_with_epilogue::<128>(
+                return qgemv_perf_with_epilogue(
                     program,
                     tensors,
                     workgroups_x,
@@ -274,7 +235,7 @@ pub(crate) fn qgemv_tile_with_epilogue(
                     8,
                 );
             }
-            qgemv_perf_with_epilogue::<256>(
+            qgemv_perf_with_epilogue(
                 program,
                 tensors,
                 workgroups_x,
@@ -286,301 +247,74 @@ pub(crate) fn qgemv_tile_with_epilogue(
     }
 }
 
-mod ggml_family_sealed {
-    pub trait Sealed {}
-}
-
-/// One ggml-format iteration's outputs as consumed by
-/// `qgemv_ggml_with_epilogue`. Mirrors `Q{4,6}KGgmlIteration` but parameterized
-/// over the format's activation payload.
-struct GgmlIteration<A> {
-    block: Tile<U32>,
-    in_bounds: Mask,
-    activations: A,
-}
-
-/// Sealed local trait abstracting the per-format pieces shared by the two
-/// `qgemv_q{4,6}k_ggml_with_epilogue` functions: the block-count divisor used
-/// to derive `block_iterations`, the lane decomposition, the per-pass
-/// iteration helper, and the format-specific `QuantizedDot` constructor.
+/// Which dot the perf body emits for a `(format, values_per_lane)` pair.
+/// `values_per_lane` is a caller TILING choice, not `(format, dims)`-derivable,
+/// so the selection stays in the kernel rather than the lowerer.
 ///
-/// All trait items are `pub(crate)`-visible only via the impls below; the
-/// `Sealed` supertrait keeps the implementer set closed to Q4K/Q6K.
-trait GgmlQuantFamily: ggml_family_sealed::Sealed {
-    /// `block_iterations = block_count.div_ceil(BLOCK_DIV)` — 4 for Q4K, 2 for Q6K.
-    const BLOCK_DIV: u32;
-    type Lane;
-    type Activations: Clone;
-
-    fn supports_format(format: GgmlQuantFormat) -> bool;
-
-    fn lane_decomposition(lane: &Tile<U32>) -> Self::Lane;
-
-    fn iteration(
-        program: &mut TileBlock<'_>,
-        loop_index: Tile<U32>,
-        a: &Storage<F32, 2>,
-        block_count: u32,
-        full_block_iterations: bool,
-        lane: &Self::Lane,
-    ) -> GgmlIteration<Self::Activations>;
-
-    fn quantized_dot(
-        activations: Self::Activations,
-        b: &QuantizedMatrix,
-        block: &Tile<U32>,
-        lane: &Self::Lane,
-        col: Tile<U32>,
-        mask: Mask,
-    ) -> QuantizedDot;
+/// `F32Vec` and `BlockThenDot4` both dequantize the block to f32 and compose
+/// [`dot4_sum`] (the over-fused `f32_activations_vec` builder lowered
+/// identically to dequant+dot4, so they are folded together). `Q8Vec` is the
+/// irreducible Q8 DP4a path — it keeps the weights quantized and emits
+/// `Dot4I8Packed` via [`quantized_dot_q8`](TileBlock::quantized_dot_q8), which
+/// `Dequantize` + `dot4_sum` cannot express.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum QgemvDot {
+    /// Dequantize the block and dot against the f32 activation vector (folds
+    /// into `BlockThenDot4` — byte-identical lowering).
+    F32Vec,
+    /// Q8 DP4a dot against int8-packed activations, weights kept quantized.
+    Q8Vec,
+    /// Dequantize the block to `values_per_lane` f32 tiles via one
+    /// `Shared(Dequantize)`, then compose `dot4_sum`.
+    BlockThenDot4,
 }
 
-/// Q4K ggml family marker.
-enum Q4KFamily {}
-impl ggml_family_sealed::Sealed for Q4KFamily {}
-impl GgmlQuantFamily for Q4KFamily {
-    const BLOCK_DIV: u32 = 4;
-    type Lane = Q4KLane;
-    type Activations = Q4KActivations;
-
-    fn supports_format(format: GgmlQuantFormat) -> bool {
-        format.is_q4k_family()
+/// Classify the qgemv dot path for `(format, values_per_lane, q6k_vocab_f32_dot)`.
+/// Mirrors the original `qgemv_perf` format if-chain. `n_cols`-derived gates
+/// (the q8 `>= 8192` accumulate split) live in the lowerer, so they are not an
+/// input here.
+fn select_qgemv_dot(
+    format: GgmlQuantFormat,
+    values_per_lane: u32,
+    q6k_vocab_f32_dot: bool,
+) -> QgemvDot {
+    if format.is_q8_0_family() && values_per_lane == 8 {
+        return QgemvDot::F32Vec;
     }
-
-    fn lane_decomposition(lane: &Tile<U32>) -> Self::Lane {
-        q4k_lane_decomposition(lane)
+    if format.is_q4k_family()
+        && (values_per_lane == 8 || values_per_lane == 16 || values_per_lane == 32)
+    {
+        return QgemvDot::F32Vec;
     }
-
-    fn iteration(
-        program: &mut TileBlock<'_>,
-        loop_index: Tile<U32>,
-        a: &Storage<F32, 2>,
-        block_count: u32,
-        full_block_iterations: bool,
-        lane: &Self::Lane,
-    ) -> GgmlIteration<Self::Activations> {
-        let pass = q4k_ggml_iteration(
-            program,
-            Q4KGgmlIterationRequest {
-                loop_index,
-                a,
-                row: 0,
-                block_count,
-                full_block_iterations,
-                lane,
-                base_mask: Mask::all(),
-            },
-        );
-        GgmlIteration {
-            block: pass.block,
-            in_bounds: pass.in_bounds,
-            activations: pass.activations,
-        }
+    if format.is_q6k_family() && values_per_lane == 8 {
+        return QgemvDot::F32Vec;
     }
-
-    fn quantized_dot(
-        activations: Self::Activations,
-        b: &QuantizedMatrix,
-        block: &Tile<U32>,
-        lane: &Self::Lane,
-        col: Tile<U32>,
-        mask: Mask,
-    ) -> QuantizedDot {
-        QuantizedDot::q4k_block(
-            activations,
-            b,
-            BlockCoord::new(block, &lane.iq, &lane.ir),
-            col,
-            mask,
-            0.0,
-        )
+    if format.is_q6k_family() && !q6k_vocab_f32_dot {
+        return QgemvDot::Q8Vec;
     }
+    QgemvDot::BlockThenDot4
 }
 
-/// Q6K ggml family marker.
-enum Q6KFamily {}
-impl ggml_family_sealed::Sealed for Q6KFamily {}
-impl GgmlQuantFamily for Q6KFamily {
-    const BLOCK_DIV: u32 = 2;
-    type Lane = Q6KLane;
-    type Activations = [Tile<F32>; 16];
-
-    fn supports_format(format: GgmlQuantFormat) -> bool {
-        format.is_q6k_family()
-    }
-
-    fn lane_decomposition(lane: &Tile<U32>) -> Self::Lane {
-        q6k_lane_decomposition(lane)
-    }
-
-    fn iteration(
-        program: &mut TileBlock<'_>,
-        loop_index: Tile<U32>,
-        a: &Storage<F32, 2>,
-        block_count: u32,
-        full_block_iterations: bool,
-        lane: &Self::Lane,
-    ) -> GgmlIteration<Self::Activations> {
-        let pass = q6k_ggml_iteration(
-            program,
-            Q6KGgmlIterationRequest {
-                loop_index,
-                a,
-                row: 0,
-                block_count,
-                full_block_iterations,
-                lane,
-                base_mask: Mask::all(),
-            },
-        );
-        GgmlIteration {
-            block: pass.block,
-            in_bounds: pass.in_bounds,
-            activations: pass.activations,
-        }
-    }
-
-    fn quantized_dot(
-        activations: Self::Activations,
-        b: &QuantizedMatrix,
-        block: &Tile<U32>,
-        lane: &Self::Lane,
-        col: Tile<U32>,
-        mask: Mask,
-    ) -> QuantizedDot {
-        QuantizedDot::q6k_block(
-            activations,
-            b,
-            BlockCoord::new(block, &lane.ip, &lane.il),
-            col,
-            mask,
-            0.0,
-        )
-    }
-}
-
-/// Format-generic ggml-format qgemv body with optional pre/post unary
-/// epilogues. Monomorphizes to the same IR the per-format
-/// `qgemv_q{4,6}k_ggml_with_epilogue` shims previously produced by hand.
-fn qgemv_ggml_with_epilogue<F: GgmlQuantFamily, const BLOCK: usize>(
-    program: &mut Program,
-    tensors: QgemvTensors<'_>,
-    workgroups_x: u32,
-    epilogues: &crate::types::QmatmulEpilogues<'_>,
-    shape: QgemvShape,
-) {
-    const SUBGROUP_SIZE: u32 = 32;
-    let QgemvTensors { a, b, y } = tensors;
-    let subgroups = shape.subgroups;
-    let cols_per_subgroup = shape.cols_per_subgroup;
-    debug_assert_eq!(shape.block, BLOCK as u32);
-    debug_assert_eq!(subgroups * SUBGROUP_SIZE, BLOCK as u32);
-    debug_assert!(F::supports_format(b.format));
-
-    let [_, k] = matrix_shape(&a.view().layout);
-    let grid = qgemv_grid(subgroups, cols_per_subgroup, b.cols, workgroups_x);
-    let block_count = k.div_ceil(256);
-    let block_iterations = block_count.div_ceil(F::BLOCK_DIV);
-    let full_block_iterations = block_count.is_multiple_of(F::BLOCK_DIV);
-    let b_cloned = b.clone();
-    let cols_per_subgroup_usize = cols_per_subgroup as usize;
-
-    program.program_grid::<BLOCK>([grid.workgroups_x, grid.dispatch_y, 1], |program| {
-        let scope = qgemv_program_scope(program, grid, cols_per_subgroup);
-        let col0 = scope.col0;
-        let lane = scope.lane;
-        let fmt_lane = F::lane_decomposition(&lane);
-
-        let zero = TileLiteral::f32(0.0);
-        let sums: Vec<Tile> = program.loop_fold_vec(
-            TileReduceOp::Sum,
-            block_iterations,
-            vec![zero; cols_per_subgroup_usize],
-            |program, loop_index| {
-                let pass = F::iteration(
-                    program,
-                    loop_index,
-                    a,
-                    block_count,
-                    full_block_iterations,
-                    &fmt_lane,
-                );
-
-                (0..cols_per_subgroup)
-                    .map(|c| {
-                        let col = col0.clone() + c;
-                        let mask = grid.mask(full_block_iterations, pass.in_bounds.clone(), &col);
-                        program.quantized_dot(F::quantized_dot(
-                            pass.activations.clone(),
-                            &b_cloned,
-                            &pass.block,
-                            &fmt_lane,
-                            col,
-                            mask,
-                        ))
-                    })
-                    .collect()
-            },
-        );
-
-        crate::grid::store_qgemv_sums_with_epilogue(
-            program,
-            sums,
-            QgemvStoreTarget {
-                y,
-                col0,
-                lane,
-                full_cols: grid.full_cols,
-                n_cols: grid.n_cols,
-                epilogues,
-            },
-        );
-    });
-}
-
-/// Q4K ggml-format qgemv body with optional pre/post unary epilogues.
-fn qgemv_q4k_ggml_with_epilogue<const BLOCK: usize>(
-    program: &mut Program,
-    tensors: QgemvTensors<'_>,
-    workgroups_x: u32,
-    epilogues: &crate::types::QmatmulEpilogues<'_>,
-    shape: QgemvShape,
-) {
-    qgemv_ggml_with_epilogue::<Q4KFamily, BLOCK>(program, tensors, workgroups_x, epilogues, shape)
-}
-
-/// Q6K ggml-format qgemv body with optional pre/post unary epilogues.
-fn qgemv_q6k_ggml_with_epilogue<const BLOCK: usize>(
-    program: &mut Program,
-    tensors: QgemvTensors<'_>,
-    workgroups_x: u32,
-    epilogues: &crate::types::QmatmulEpilogues<'_>,
-    shape: QgemvShape,
-) {
-    qgemv_ggml_with_epilogue::<Q6KFamily, BLOCK>(program, tensors, workgroups_x, epilogues, shape)
-}
-
-/// Generic subgroup-partitioned qgemv body with optional pre- and post-reduce
-/// epilogues, covering the formats that don't have a dedicated `qgemv_q*_ggml`
-/// path. `pre` is applied to each loaded activation tile before the dot;
+/// Subgroup-partitioned qgemv body with optional pre- and post-reduce
+/// epilogues. `pre` is applied to each loaded activation tile before the dot;
 /// `post` is applied to each per-output tile before the store.
-fn qgemv_perf_with_epilogue<const BLOCK: usize>(
+fn qgemv_perf_with_epilogue(
     program: &mut Program,
     tensors: QgemvTensors<'_>,
     workgroups_x: u32,
-    epilogues: &crate::types::QmatmulEpilogues<'_>,
+    epilogues: &QmatmulEpilogues<'_>,
     shape: QgemvShape,
     values_per_lane: u32,
 ) {
     const SUBGROUP_SIZE: u32 = 32;
     let QgemvTensors { a, b, y } = tensors;
+    let block = shape.block;
     let subgroups = shape.subgroups;
     let cols_per_subgroup = shape.cols_per_subgroup;
-    debug_assert_eq!(shape.block, BLOCK as u32);
-    debug_assert_eq!(subgroups * SUBGROUP_SIZE, BLOCK as u32);
+    debug_assert_eq!(subgroups * SUBGROUP_SIZE, block);
     debug_assert!(values_per_lane == 8 || values_per_lane == 16 || values_per_lane == 32);
-    debug_assert!(matches!(cols_per_subgroup, 1 | 2 | 4 | 8));
-    let [_, k] = matrix_shape(&a.view().layout);
+    debug_assert!(matches!(cols_per_subgroup, 1 | 2 | 3 | 4 | 8));
+    let [_, k] = matrix_shape(a.layout());
     let grid = qgemv_grid(subgroups, cols_per_subgroup, b.cols, workgroups_x);
     let k_per_iter = SUBGROUP_SIZE * values_per_lane;
     let k_iterations = k.div_ceil(k_per_iter);
@@ -588,18 +322,19 @@ fn qgemv_perf_with_epilogue<const BLOCK: usize>(
     let full_k_iterations = k.is_multiple_of(k_per_iter);
     let b_cloned = b.clone();
     let q6k_vocab_f32_dot = b.format.is_q6k_family() && b.rows <= 4096 && b.cols >= 65_536;
+    let dot_path = select_qgemv_dot(b.format, values_per_lane, q6k_vocab_f32_dot);
     let cols_per_subgroup_usize = cols_per_subgroup as usize;
-    program.program_grid::<BLOCK>([grid.workgroups_x, grid.dispatch_y, 1], |program| {
+
+    program.program_grid(block, [grid.workgroups_x, grid.dispatch_y, 1], |program| {
         let scope = qgemv_program_scope(program, grid, cols_per_subgroup);
         let col0 = scope.col0;
         let lane = scope.lane;
 
-        let zero = TileLiteral::f32(0.0);
-        let sums: Vec<Tile> = program.loop_fold_vec(
-            TileReduceOp::Sum,
-            k_iterations,
+        let zero = Tile::literal(TileLiteral::f32(0.0));
+        let sums: Vec<Tile> = program.fold_vec(
+            range(k_iterations),
             vec![zero; cols_per_subgroup_usize],
-            |program, loop_index| {
+            |program, loop_index, accs| {
                 let k_base = loop_index * k_per_iter + lane.clone() * values_per_lane;
                 let in_bounds_k = if full_k_iterations {
                     Mask::all()
@@ -609,93 +344,53 @@ fn qgemv_perf_with_epilogue<const BLOCK: usize>(
 
                 let a_bound: Vec<Tile> = (0..values_per_lane)
                     .map(|i| {
-                        let scalar =
-                            program.load(a.at((0, k_base.clone() + i)), in_bounds_k.clone(), 0.0);
+                        let scalar = program.load(
+                            a.at((0u32, k_base.clone() + i)),
+                            in_bounds_k.clone(),
+                            0.0,
+                        );
                         let k_index = k_base.clone() + i;
                         let pre_extras = epilogues
                             .pre_extra_inputs
                             .iter()
                             .map(|extra| match extra {
-                                crate::types::QmatmulExtra::Column(vector) => {
+                                QmatmulExtra::Column(vector) => {
                                     program.load(vector.at(&k_index), k_index.lt(k_size), 0.0)
                                 }
-                                crate::types::QmatmulExtra::Pointwise(tensor) => {
-                                    program.load(tensor.at((0, &k_index)), k_index.lt(k_size), 0.0)
-                                }
+                                QmatmulExtra::Pointwise(tensor) => program.load(
+                                    tensor.at((0u32, &k_index)),
+                                    k_index.lt(k_size),
+                                    0.0,
+                                ),
                             })
                             .collect::<Vec<_>>();
-                        let scalar =
-                            crate::types::apply_qmatmul_pre_epilogue(epilogues, scalar, pre_extras);
+                        let scalar = apply_qmatmul_pre_epilogue(epilogues, scalar, pre_extras);
                         program.bind(scalar)
                     })
                     .collect();
 
-                (0..cols_per_subgroup)
-                    .map(|c| {
-                        let col = col0.clone() + c;
+                accs.into_iter()
+                    .enumerate()
+                    .map(|(c, acc)| {
+                        let col = col0.clone() + c as u32;
                         let mask = grid.mask(full_k_iterations, in_bounds_k.clone(), &col);
-                        if b_cloned.format.is_q8_0_family()
-                            && values_per_lane == 8
-                            && grid.n_cols >= 8192
-                        {
-                            return program.quantized_dot(QuantizedDot::f32_activations_vec(
-                                a_bound.clone(),
-                                &b_cloned,
-                                &k_base,
-                                &col,
-                                mask,
-                                0.0,
-                            ));
-                        }
-                        if b_cloned.format.is_q4k_family()
-                            && (values_per_lane == 8
-                                || values_per_lane == 16
-                                || values_per_lane == 32)
-                        {
-                            return program.quantized_dot(QuantizedDot::f32_activations_vec(
-                                a_bound.clone(),
-                                &b_cloned,
-                                &k_base,
-                                &col,
-                                mask,
-                                0.0,
-                            ));
-                        }
-                        if b_cloned.format.is_q6k_family() && values_per_lane == 8 {
-                            return program.quantized_dot(QuantizedDot::f32_activations_vec(
-                                a_bound.clone(),
-                                &b_cloned,
-                                &k_base,
-                                &col,
-                                mask,
-                                0.0,
-                            ));
-                        }
-                        if b_cloned.format.is_q6k_family() && !q6k_vocab_f32_dot {
-                            return program.quantized_dot(QuantizedDot::q8_activations_vec(
-                                a_bound.clone(),
-                                &b_cloned,
-                                &k_base,
-                                &col,
-                                mask,
-                                0.0,
-                            ));
-                        }
-                        let bs = program.load_quantized_block_vec(
-                            values_per_lane,
+                        let part = qgemv_dot_part(
+                            program,
+                            dot_path,
+                            &a_bound,
                             &b_cloned,
+                            values_per_lane,
                             &k_base,
                             &col,
                             mask,
-                            0.0,
                         );
-                        dot4_sum(program, &a_bound, &bs)
+                        acc + part
                     })
                     .collect()
             },
         );
 
-        crate::grid::store_qgemv_sums_with_epilogue(
+        store_qgemv_sums_with_epilogue(
             program,
             sums,
             QgemvStoreTarget {
@@ -708,4 +403,33 @@ fn qgemv_perf_with_epilogue<const BLOCK: usize>(
             },
         );
     });
+}
+
+/// Emit one column's quantized dot contribution for the perf body.
+///
+/// The [`QgemvDot::Q8Vec`] path keeps the weights quantized and emits the Q8
+/// DP4a dot ([`quantized_dot_q8`](TileBlock::quantized_dot_q8)) — the fast path
+/// that `Dequantize` + [`dot4_sum`] cannot express. The `F32Vec` and
+/// `BlockThenDot4` paths both dequantize the block to f32 and compose
+/// [`dot4_sum`]: `f32_activations_vec` lowered identically to dequant+dot4, so
+/// folding them together is byte-identical (verified by the qgemv goldens).
+#[allow(clippy::too_many_arguments)]
+fn qgemv_dot_part(
+    program: &mut TileBlock<'_>,
+    dot_path: QgemvDot,
+    a_bound: &[Tile],
+    b: &QuantizedMatrix,
+    values_per_lane: u32,
+    k_base: &Tile,
+    col: &Tile,
+    mask: Mask,
+) -> Tile {
+    match dot_path {
+        QgemvDot::F32Vec => program.quantized_dot_f32(a_bound, b, k_base, col, mask, 0.0),
+        QgemvDot::Q8Vec => program.quantized_dot_q8(a_bound, b, k_base, col, mask, 0.0),
+        QgemvDot::BlockThenDot4 => {
+            let bs = program.load_quantized_block_vec(values_per_lane, b, k_base, col, mask, 0.0);
+            dot4_sum(program, a_bound, &bs)
+        }
+    }
 }

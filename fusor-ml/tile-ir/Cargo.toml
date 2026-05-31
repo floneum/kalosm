@@ -8,6 +8,7 @@ autoexamples = false
 [dependencies]
 bytemuck = "1.25.0"
 half = "2.4.1"
+rustc-hash = "2.1.1"
 naga = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", package = "naga" }
 pollster = "0.4.0"
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["std", "naga-ir"] }

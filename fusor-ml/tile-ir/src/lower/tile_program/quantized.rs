@@ -1,329 +1,179 @@
 use super::*;
-use crate::lower::quantized::GgmlBlockCoords;
 
 impl<'a> Lowerer<'a> {
-    /// Lower a unified `Expr::QuantizedDot`. Activations and K coordinate are
-    /// materialised once, then the format-specific helper is selected by the
-    /// `(format, activations, k, block_n)` tuple. Unsupported combinations
-    /// return `LowerError::UnsupportedOperation` with the same messages the
-    /// pre-merge helpers used.
-    pub(in crate::lower) fn lower_tile_quantized_dot_expr(
+    /// Lower an `ExprKind::Dequantize`, producing its `lanes` f32 handles. The
+    /// `lanes` width carries the caller's `values_per_lane` tiling choice. The
+    /// emit-once memoization (so all `LaneOf` projections share one helper
+    /// emission) is handled by the `Shared` wrapper above this; this method
+    /// always emits the dequant helper once.
+    pub(in crate::lower) fn lower_dequantize(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
-        request: QuantizedDotLowering<'_>,
-    ) -> Result<Handle<Expression>, LowerError> {
-        let QuantizedDotLowering {
-            src,
-            activations,
-            k,
-            col,
-            masked,
-            block_n,
-        } = request;
-        match (activations, k) {
-            (PackedActivations::F32(a), DotK::Base(k_base)) => {
-                let a_handles = self.lower_tile_exprs_lane(
-                    expressions,
-                    scratch,
-                    body,
-                    a,
-                    masked.spill_depth + 1,
-                )?;
-                self.lower_masked_quantized_col_value(
-                    expressions,
-                    scratch,
-                    body,
-                    MaskedQuantizedCol {
-                        k_base,
-                        col,
-                        masked,
-                    },
-                    |expressions, k_base, col, body| match (src.format, block_n) {
-                        (GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native, 8) => {
-                            let a8: [Handle<Expression>; 8] =
-                                a_handles.as_slice().try_into().map_err(|_| {
-                                    LowerError::UnsupportedOperation(
-                                        "f32 activation dot only supports dot8",
-                                    )
-                                })?;
-                            self.dequantize_q8_0_dot8(expressions, src, k_base, col, &a8, body)
-                        }
-                        (GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative, 8) => {
-                            let a8: [Handle<Expression>; 8] =
-                                a_handles.as_slice().try_into().map_err(|_| {
-                                    LowerError::UnsupportedOperation(
-                                        "f32 activation dot only supports dot8",
-                                    )
-                                })?;
-                            self.dequantize_q6k_dot8(expressions, src, k_base, col, &a8, body)
-                        }
-                        (GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative, 8 | 16 | 32) => {
-                            self.q4k_f32_dot(expressions, src, k_base, col, &a_handles, body)
-                        }
-                        _ => Err(LowerError::UnsupportedOperation(
-                            "f32 activation dot only supports Q8_0/Q6K dot8 or Q4K dot8/dot16/dot32",
-                        )),
-                    },
-                )
-            }
-            (PackedActivations::Q8(a), DotK::Base(k_base)) => {
-                let a_handles = self.lower_tile_exprs_lane(
-                    expressions,
-                    scratch,
-                    body,
-                    a,
-                    masked.spill_depth + 1,
-                )?;
-                let a_packs =
-                    self.cached_q8_activation_packs(expressions, scratch, body, &a_handles)?;
-                self.lower_masked_quantized_col_value(
-                    expressions,
-                    scratch,
-                    body,
-                    MaskedQuantizedCol {
-                        k_base,
-                        col,
-                        masked,
-                    },
-                    |expressions, k_base, col, body| match (src.format, block_n) {
-                        (GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative, 8 | 16) => self
-                            .q4k_q8_activation_dot(expressions, src, k_base, col, &a_packs, body),
-                        (GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative, 8 | 16) => self
-                            .q6k_q8_activation_dot(expressions, src, k_base, col, &a_packs, body),
-                        _ => Err(LowerError::UnsupportedOperation(
-                            "q8 activation dot only supports Q4K/Q6K dot8/dot16",
-                        )),
-                    },
-                )
-            }
-            (
-                PackedActivations::Q4KGgml { low, high, sums },
-                DotK::Block {
-                    block,
-                    c0: iq,
-                    c1: ir,
-                },
-            ) => {
-                if low.len() != 16 || high.len() != 16 || sums.len() != 4 {
-                    return Err(LowerError::UnsupportedOperation(
-                        "q4k ggml dot requires 16 low activations, 16 high activations, and 4 sums",
-                    ));
-                }
-                if !src.format.is_q4k_family() {
-                    return Err(LowerError::UnsupportedOperation(
-                        "q4k ggml dot only supports Q4K formats",
-                    ));
-                }
-
-                let low_handles = self.lower_tile_exprs_lane(
-                    expressions,
-                    scratch,
-                    body,
-                    low,
-                    masked.spill_depth + 1,
-                )?;
-                let high_handles = self.lower_tile_exprs_lane(
-                    expressions,
-                    scratch,
-                    body,
-                    high,
-                    masked.spill_depth + 1,
-                )?;
-                let sum_handles = self.lower_tile_exprs_lane(
-                    expressions,
-                    scratch,
-                    body,
-                    sums,
-                    masked.spill_depth + 1,
-                )?;
-
-                self.lower_masked_f32_value(
-                    expressions,
-                    scratch,
-                    body,
-                    masked,
-                    |expressions, block_body| {
-                        let coords = self.lower_ggml_block_coords(
-                            expressions,
-                            scratch,
-                            block_body,
-                            GgmlBlockCoordExprs {
-                                block,
-                                c0: iq,
-                                c1: ir,
-                                col,
-                                spill_depth: masked.spill_depth,
-                            },
-                        )?;
-                        self.q4k_ggml_dot(
-                            expressions,
-                            src,
-                            coords,
-                            crate::lower::quantized::Q4KGgmlActivationHandles {
-                                low: &low_handles,
-                                high: &high_handles,
-                                sums: &sum_handles,
-                            },
-                            block_body,
-                        )
-                    },
-                )
-            }
-            (
-                PackedActivations::F32(a),
-                DotK::Block {
-                    block,
-                    c0: ip,
-                    c1: il,
-                },
-            ) => {
-                if a.len() != 16 {
-                    return Err(LowerError::UnsupportedOperation(
-                        "q6k ggml dot requires 16 activations",
-                    ));
-                }
-                if !src.format.is_q6k_family() {
-                    return Err(LowerError::UnsupportedOperation(
-                        "q6k ggml dot only supports Q6K formats",
-                    ));
-                }
-
-                let a_handles = self.lower_tile_exprs_lane(
-                    expressions,
-                    scratch,
-                    body,
-                    a,
-                    masked.spill_depth + 1,
-                )?;
-
-                self.lower_masked_f32_value(
-                    expressions,
-                    scratch,
-                    body,
-                    masked,
-                    |expressions, block_body| {
-                        let coords = self.lower_ggml_block_coords(
-                            expressions,
-                            scratch,
-                            block_body,
-                            GgmlBlockCoordExprs {
-                                block,
-                                c0: ip,
-                                c1: il,
-                                col,
-                                spill_depth: masked.spill_depth,
-                            },
-                        )?;
-                        self.q6k_ggml_dot(expressions, src, coords, &a_handles, block_body)
-                    },
-                )
-            }
-            (PackedActivations::Q8(_), DotK::Block { .. }) => {
-                Err(LowerError::UnsupportedOperation(
-                    "q8 activation dot does not support block-shaped K coordinates",
-                ))
-            }
-            (PackedActivations::Q4KGgml { .. }, DotK::Base(_)) => {
-                Err(LowerError::UnsupportedOperation(
-                    "q4k ggml dot requires a block-shaped K coordinate",
-                ))
-            }
-        }
-    }
-
-    pub(in crate::lower) fn lower_tile_exprs_lane(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        exprs: &[Expr],
-        spill_depth: usize,
+        dequant: &Expr,
+        outer_spill: usize,
     ) -> Result<Vec<Handle<Expression>>, LowerError> {
-        exprs
+        let ExprKind::Dequantize {
+            src,
+            k_base,
+            col,
+            mask,
+            fill,
+            lanes,
+        } = dequant.kind()
+        else {
+            return Err(LowerError::UnsupportedOperation(
+                "expected a Dequantize node",
+            ));
+        };
+        let block_n = *lanes;
+        let spill_depth = outer_spill;
+
+        if mask.is_constant_true() {
+            let k_base_handle = self.lower_expr_lane(expressions, body, k_base, spill_depth)?;
+            let col_handle = self.lower_expr_lane(expressions, body, col, spill_depth)?;
+            return self.dequantize_quantized_block_values(
+                expressions,
+                src,
+                k_base_handle,
+                col_handle,
+                block_n,
+                body,
+            );
+        }
+
+        // Masked: fill all N lane locals, then overwrite under the mask.
+        let tmp_locals: Vec<_> = (0..block_n)
+            .map(|i| self.scratch_f32(ScratchKind::BlockDequant, i))
+            .collect();
+        let fill_source = fill.element();
+        let fill_value = self.lower_expr_lane(expressions, body, fill, spill_depth)?;
+        let fill_value =
+            self.cast_tile_value(expressions, body, fill_value, fill_source, ElementType::F32);
+        for local in &tmp_locals {
+            self.store_local(expressions, body, *local, fill_value);
+        }
+
+        let mask_handle = self.lower_expr_lane(expressions, body, mask, spill_depth)?;
+        let mut accept = Block::new();
+        let k_base_handle = self.lower_expr_lane(expressions, &mut accept, k_base, spill_depth)?;
+        let col_handle = self.lower_expr_lane(expressions, &mut accept, col, spill_depth)?;
+        let values = self.dequantize_quantized_block_values(
+            expressions,
+            src,
+            k_base_handle,
+            col_handle,
+            block_n,
+            &mut accept,
+        )?;
+        for (local, value) in tmp_locals.iter().zip(values.iter()) {
+            self.store_local(expressions, &mut accept, *local, *value);
+        }
+        body.push(
+            Statement::If {
+                condition: mask_handle,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+
+        // Materialize the locals into SSA loads we hand back per lane.
+        Ok(tmp_locals
             .iter()
-            .map(|expr| self.lower_tile_expr_lane(expressions, scratch, body, expr, spill_depth))
-            .collect()
+            .map(|local| self.load_local(expressions, body, *local))
+            .collect())
     }
 
-    /// Lower the four `(block, c0, c1, col)` index expressions used by Q4K and
-    /// Q6K ggml dot helpers.
-    pub(in crate::lower) fn lower_ggml_block_coords(
+    /// Lower an `ExprKind::QuantizedDot` — a fused per-column quantized dot. The
+    /// activations are materialised once (and Q8-packed once, outside the column
+    /// mask), then the masked column emits the format-specific fused dot:
+    /// `QuantActivation::F32` decodes the weights to f32 (Q8_0/Q6K dot8, Q4K
+    /// dot8/16/32), `Q8` keeps them quantized and emits `Dot4I8Packed`. Mirrors
+    /// the pre-refactor `QuantizedDot { activations: F32(_)|Q8(_), k: Base(_) }`
+    /// lowering so the emitted Naga is byte-identical.
+    pub(in crate::lower) fn lower_quantized_dot(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
-        coords: GgmlBlockCoordExprs<'_>,
-    ) -> Result<GgmlBlockCoords, LowerError> {
-        Ok(GgmlBlockCoords {
-            block: self.lower_tile_expr_lane(
-                expressions,
-                scratch,
-                body,
-                coords.block,
-                coords.spill_depth,
-            )?,
-            c0: self.lower_tile_expr_lane(
-                expressions,
-                scratch,
-                body,
-                coords.c0,
-                coords.spill_depth,
-            )?,
-            c1: self.lower_tile_expr_lane(
-                expressions,
-                scratch,
-                body,
-                coords.c1,
-                coords.spill_depth,
-            )?,
-            col: self.lower_tile_expr_lane(
-                expressions,
-                scratch,
-                body,
-                coords.col,
-                coords.spill_depth,
-            )?,
-        })
-    }
-
-    pub(in crate::lower) fn lower_masked_quantized_col_value(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        request: MaskedQuantizedCol<'_>,
-        lower_value: impl FnOnce(
-            &mut Arena<Expression>,
-            Handle<Expression>,
-            Handle<Expression>,
-            &mut Block,
-        ) -> Result<Handle<Expression>, LowerError>,
+        expr: &Expr,
+        spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
+        let ExprKind::QuantizedDot {
+            src,
+            packing,
+            activations,
+            k_base,
+            col,
+            mask,
+            fill,
+        } = expr.kind()
+        else {
+            return Err(LowerError::UnsupportedOperation(
+                "expected a QuantizedDot node",
+            ));
+        };
+        let block_n = activations.len();
+        let a_handles = self.lower_exprs_lane(expressions, body, activations, spill_depth + 1)?;
+
+        // Q8 packs the activations once, outside the per-column mask.
+        let a_packs = match packing {
+            QuantActivation::Q8 => {
+                Some(self.cached_q8_activation_packs(expressions, body, &a_handles)?)
+            }
+            QuantActivation::F32 => None,
+        };
+
         self.lower_masked_f32_value(
             expressions,
-            scratch,
             body,
-            request.masked,
+            MaskedF32Value {
+                mask: &**mask,
+                fill: &**fill,
+                spill_depth,
+            },
             |expressions, block| {
-                let k_base = self.lower_tile_expr_lane(
-                    expressions,
-                    scratch,
-                    block,
-                    request.k_base,
-                    request.masked.spill_depth,
-                )?;
-                let col = self.lower_tile_expr_lane(
-                    expressions,
-                    scratch,
-                    block,
-                    request.col,
-                    request.masked.spill_depth,
-                )?;
-                lower_value(expressions, k_base, col, block)
+                let k = self.lower_expr_lane(expressions, block, k_base, spill_depth)?;
+                let c = self.lower_expr_lane(expressions, block, col, spill_depth)?;
+                match packing {
+                    QuantActivation::F32 => match (src.format, block_n) {
+                        (GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native, 8) => {
+                            let a8 = Self::expect_dot8(&a_handles)?;
+                            self.dequantize_q8_0_dot8(expressions, src, k, c, &a8, block)
+                        }
+                        (GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative, 8) => {
+                            let a8 = Self::expect_dot8(&a_handles)?;
+                            self.dequantize_q6k_dot8(expressions, src, k, c, &a8, block)
+                        }
+                        (GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative, 8 | 16 | 32) => {
+                            self.q4k_f32_dot(expressions, src, k, c, &a_handles, block)
+                        }
+                        _ => Err(LowerError::UnsupportedOperation(
+                            "f32 activation dot only supports Q8_0/Q6K dot8 or Q4K dot8/16/32",
+                        )),
+                    },
+                    QuantActivation::Q8 => {
+                        let a_packs = a_packs.as_ref().expect("q8 packs materialised above");
+                        match src.format {
+                            GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative => {
+                                self.q6k_q8_activation_dot(expressions, src, k, c, a_packs, block)
+                            }
+                            _ => Err(LowerError::UnsupportedOperation(
+                                "q8 activation dot only supports Q6K",
+                            )),
+                        }
+                    }
+                }
             },
         )
+    }
+
+    fn expect_dot8(
+        a_handles: &[Handle<Expression>],
+    ) -> Result<[Handle<Expression>; 8], LowerError> {
+        a_handles
+            .try_into()
+            .map_err(|_| LowerError::UnsupportedOperation("f32 activation dot only supports dot8"))
     }
 
     pub(in crate::lower) fn dequantize_quantized_block_values(
@@ -358,153 +208,9 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    pub(in crate::lower) fn lower_tile_quantized_block_lane(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        request: QuantizedBlockLaneLowering<'_>,
-    ) -> Result<Handle<Expression>, LowerError> {
-        let QuantizedBlockLaneLowering {
-            id,
-            src,
-            k_base,
-            col,
-            masked,
-            block_n,
-            lane,
-        } = request;
-        let MaskedF32Value {
-            mask,
-            fill,
-            spill_depth,
-        } = masked;
-        if lane >= block_n {
-            return Err(LowerError::UnsupportedOperation(
-                "quantized block lane out of range",
-            ));
-        }
-        if let Some(values) = self.block_dequant_cache.borrow().get(&id).cloned() {
-            return Ok(values[lane as usize]);
-        }
-
-        if mask.is_constant_true() {
-            let k_base_handle =
-                self.lower_tile_expr_lane(expressions, scratch, body, k_base, spill_depth)?;
-            let col_handle =
-                self.lower_tile_expr_lane(expressions, scratch, body, col, spill_depth)?;
-            let values = self.dequantize_quantized_block_values(
-                expressions,
-                src,
-                k_base_handle,
-                col_handle,
-                block_n,
-                body,
-            )?;
-            self.block_dequant_cache
-                .borrow_mut()
-                .insert(id, values.clone());
-            return Ok(values[lane as usize]);
-        }
-
-        // First lane request: emit the shared dequant helper into a masked
-        // block. Cache the resulting per-lane handles for siblings.
-        let tmp_locals: Vec<_> = (0..block_n)
-            .map(|i| {
-                self.block_dequant_value_local(scratch, i)
-                    .ok_or(LowerError::UnsupportedOperation(
-                        "quantized block lane exceeds available scratch locals",
-                    ))
-            })
-            .collect::<Result<_, _>>()?;
-        let fill_source = fill.element();
-        let fill_value =
-            self.lower_tile_expr_lane(expressions, scratch, body, fill, spill_depth)?;
-        let fill_value =
-            self.cast_tile_value(expressions, body, fill_value, fill_source, ElementType::F32);
-        for local in &tmp_locals {
-            self.store_local(expressions, body, *local, fill_value);
-        }
-
-        let mask_handle =
-            self.lower_tile_expr_lane(expressions, scratch, body, mask, spill_depth)?;
-        let mut accept = Block::new();
-        let k_base_handle =
-            self.lower_tile_expr_lane(expressions, scratch, &mut accept, k_base, spill_depth)?;
-        let col_handle =
-            self.lower_tile_expr_lane(expressions, scratch, &mut accept, col, spill_depth)?;
-        let values = self.dequantize_quantized_block_values(
-            expressions,
-            src,
-            k_base_handle,
-            col_handle,
-            block_n,
-            &mut accept,
-        )?;
-        for (local, value) in tmp_locals.iter().zip(values.iter()) {
-            self.store_local(expressions, &mut accept, *local, *value);
-        }
-        body.push(
-            Statement::If {
-                condition: mask_handle,
-                accept,
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-
-        // Materialize the locals into SSA loads we hand back per lane.
-        let handles: Vec<_> = tmp_locals
-            .iter()
-            .map(|local| self.load_local(expressions, body, *local))
-            .collect();
-        self.block_dequant_cache
-            .borrow_mut()
-            .insert(id, handles.clone());
-        Ok(handles[lane as usize])
-    }
-
-    pub(in crate::lower) fn block_dequant_value_local(
-        &self,
-        scratch: ScratchLocals,
-        index: u32,
-    ) -> Option<Handle<LocalVariable>> {
-        scratch.block_dequant.get(index as usize).copied()
-    }
-
-    pub(in crate::lower) fn tile_expr_spill_local(
-        &self,
-        scratch: ScratchLocals,
-        element: ElementType,
-        depth: usize,
-    ) -> Result<Handle<LocalVariable>, LowerError> {
-        scratch
-            .spills
-            .get(Self::element_scratch_index(element)?)
-            .and_then(|spills| spills.get(depth))
-            .copied()
-            .ok_or(LowerError::UnsupportedOperation(
-                "tile expression nesting is too deep",
-            ))
-    }
-
-    pub(in crate::lower) fn tile_value_local(
-        scratch: ScratchLocals,
-        element: ElementType,
-    ) -> Result<Handle<LocalVariable>, LowerError> {
-        scratch
-            .values
-            .get(Self::element_scratch_index(element)?)
-            .copied()
-            .ok_or(LowerError::UnsupportedOperation(
-                "unsupported tile value type",
-            ))
-    }
-
     pub(in crate::lower) fn lower_masked_f32_value(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
         masked: MaskedF32Value<'_>,
         lower_value: impl FnOnce(
@@ -518,7 +224,7 @@ impl<'a> Lowerer<'a> {
 
         let fill_source = masked.fill.element();
         let fill_handle =
-            self.lower_tile_expr_lane(expressions, scratch, body, masked.fill, masked.spill_depth)?;
+            self.lower_expr_lane(expressions, body, masked.fill, masked.spill_depth)?;
         let fill_handle = self.cast_tile_value(
             expressions,
             body,
@@ -528,7 +234,6 @@ impl<'a> Lowerer<'a> {
         );
         self.lower_masked_value_to_local(
             expressions,
-            scratch,
             body,
             MaskedLocalValue {
                 mask: masked.mask,
@@ -543,7 +248,6 @@ impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn lower_masked_value_to_local(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
         masked: MaskedLocalValue<'_>,
         lower_accept_value: impl FnOnce(
@@ -551,7 +255,7 @@ impl<'a> Lowerer<'a> {
             &mut Block,
         ) -> Result<Handle<Expression>, LowerError>,
     ) -> Result<Handle<Expression>, LowerError> {
-        let tmp = Self::tile_value_local(scratch, masked.element)?;
+        let tmp = self.scratch_local(ScratchKind::Value, masked.element, 0)?;
         let tmp_ptr = self.local_var(expressions, tmp);
         body.push(
             Statement::Store {
@@ -561,8 +265,7 @@ impl<'a> Lowerer<'a> {
             Span::default(),
         );
 
-        let mask =
-            self.lower_tile_expr_lane(expressions, scratch, body, masked.mask, masked.spill_depth)?;
+        let mask = self.lower_expr_lane(expressions, body, masked.mask, masked.spill_depth)?;
         let mut accept = Block::new();
         let value = lower_accept_value(expressions, &mut accept)?;
         accept.push(

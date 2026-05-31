@@ -554,30 +554,26 @@ struct RmsNormTileIrParams<'a> {
 }
 
 fn build_rms_norm_tile_ir(params: RmsNormTileIrParams<'_>) -> Option<tile_ir::KernelIr> {
-    match params.storage_datatype {
-        DataTypeEnum::F32 => build_rms_norm_tile_ir_typed::<tile_ir::F32>(
-            params.input_view,
-            params.residual_view,
-            params.weight,
-            params.bias,
-            params.output_view,
-            params.eps,
-            params.post_chain,
-        ),
-        DataTypeEnum::F16 => build_rms_norm_tile_ir_typed::<tile_ir::F16>(
-            params.input_view,
-            params.residual_view,
-            params.weight,
-            params.bias,
-            params.output_view,
-            params.eps,
-            params.post_chain,
-        ),
-        DataTypeEnum::U32 => None,
-    }
+    let element = match params.storage_datatype {
+        DataTypeEnum::F32 => tile_ir::ElementType::F32,
+        DataTypeEnum::F16 => tile_ir::ElementType::F16,
+        DataTypeEnum::U32 => return None,
+    };
+    build_rms_norm_tile_ir_typed(
+        element,
+        params.input_view,
+        params.residual_view,
+        params.weight,
+        params.bias,
+        params.output_view,
+        params.eps,
+        params.post_chain,
+    )
 }
 
-fn build_rms_norm_tile_ir_typed<Stor>(
+#[allow(clippy::too_many_arguments)]
+fn build_rms_norm_tile_ir_typed(
+    element: tile_ir::ElementType,
     input_view: crate::mir::tile_direct::DirectMatrixLayout,
     residual_view: Option<crate::mir::tile_direct::DirectMatrixLayout>,
     weight: &TensorData,
@@ -585,10 +581,8 @@ fn build_rms_norm_tile_ir_typed<Stor>(
     output_view: crate::mir::tile_direct::DirectMatrixLayout,
     eps: f32,
     post_chain: UnaryFunctionChain,
-) -> Option<tile_ir::KernelIr>
-where
-    Stor: tile_ir::FloatElement + tile_ir_kernels::AccumCast<tile_ir::F32>,
-{
+) -> Option<tile_ir::KernelIr> {
+    let zero_fill = rms_norm_zero_fill(element);
     let rows = input_view.rows;
     let cols = input_view.cols;
     let input_storage_layout = input_view.layout.clone();
@@ -609,8 +603,9 @@ where
     };
 
     Some(tile_ir::tile::build(move |phase| {
-        let input = tile_storage_read_with_direct_layout_typed::<Stor>(
+        let input = tile_storage_read_with_direct_layout_typed(
             phase,
+            element,
             crate::mir::tile_direct::DirectMatrixLayout {
                 rows,
                 cols,
@@ -619,8 +614,9 @@ where
             },
         );
         let residual = residual_storage_layout.map(|layout| {
-            tile_storage_read_with_direct_layout_typed::<Stor>(
+            tile_storage_read_with_direct_layout_typed(
                 phase,
+                element,
                 crate::mir::tile_direct::DirectMatrixLayout {
                     rows,
                     cols,
@@ -629,15 +625,17 @@ where
                 },
             )
         });
-        let weight = phase.storage_read_with_layout_offset::<Stor, 2>(weight_layout, weight_offset);
+        let weight = phase.storage_read_with_layout_offset(element, weight_layout, weight_offset);
         let bias = bias_layout.map(|layout| {
-            phase.storage_read_with_layout_offset::<Stor, 2>(
+            phase.storage_read_with_layout_offset(
+                element,
                 layout,
                 bias_offset.expect("bias offset exists when bias layout exists"),
             )
         });
-        let output = tile_storage_write_with_direct_layout_typed::<Stor>(
+        let output = tile_storage_write_with_direct_layout_typed(
             phase,
+            element,
             crate::mir::tile_direct::DirectMatrixLayout {
                 rows,
                 cols,
@@ -646,59 +644,74 @@ where
             },
         );
 
+        // Runtime-typed accumulate-split (ARBOR_DESIGN.md §2): values are loaded
+        // in their storage element type and accumulated in f32. The cast is a
+        // no-op (no IR node) when the storage element is already f32, matching
+        // the old `AccumCast::into_accum` identity for F32.
+        let into_accum = |value: tile_ir::tile::Tile| -> tile_ir::tile::Tile {
+            if element == tile_ir::ElementType::F32 {
+                value
+            } else {
+                value.cast(tile_ir::ElementType::F32)
+            }
+        };
+        let from_accum = |value: tile_ir::tile::Tile| -> tile_ir::tile::Tile {
+            if element == tile_ir::ElementType::F32 {
+                value
+            } else {
+                value.cast(element)
+            }
+        };
+
         let chunks = cols.div_ceil(BLOCK as u32);
-        phase.program_grid::<BLOCK>([rows, 1, 1], |program| {
+        phase.program_grid(BLOCK as u32, [rows, 1, 1], |program| {
             let row = program.program_id(tile_ir::WorkgroupAxis::X);
             let lane = program.lane();
-            let sum_square = program.loop_reduce_sum(chunks, |program, loop_index| {
-                let reduce_col = loop_index * BLOCK as u32 + lane.clone();
-                let reduce_mask = reduce_col.clone().lt(cols);
-                let mut value = Stor::into_accum(program.load(
-                    input.at((&row, &reduce_col)),
-                    reduce_mask.clone(),
-                    Stor::ZERO_STORAGE,
-                ));
-                if let Some(residual) = &residual {
-                    value = value
-                        + Stor::into_accum(program.load(
-                            residual.at((&row, &reduce_col)),
-                            reduce_mask,
-                            Stor::ZERO_STORAGE,
-                        ));
-                }
-                value.clone() * value
-            });
-            let rms = (sum_square / tile_ir::tile::Tile::literal(cols as f32)
+            let [sum_square] = program.fold(
+                tile_ir::tile::range(chunks),
+                [tile_ir::tile::Tile::literal(0.0f32)],
+                |program, loop_index, [acc]| {
+                    let reduce_col = loop_index * BLOCK as u32 + lane.clone();
+                    let reduce_mask = reduce_col.clone().lt(cols);
+                    let mut value = into_accum(program.load(
+                        input.at((&row, &reduce_col)),
+                        reduce_mask.clone(),
+                        zero_fill,
+                    ));
+                    if let Some(residual) = &residual {
+                        value = value
+                            + into_accum(program.load(
+                                residual.at((&row, &reduce_col)),
+                                reduce_mask,
+                                zero_fill,
+                            ));
+                    }
+                    [acc + value.clone() * value]
+                },
+            );
+            let total_sum = program.group_reduce_sum(BLOCK as u32, sum_square);
+            let rms = (total_sum / tile_ir::tile::Tile::literal(cols as f32)
                 + tile_ir::tile::Tile::literal(eps))
             .unary(tile_ir::TileUnaryOp::Sqrt);
             for chunk in 0..chunks {
                 let col = lane.clone() + chunk * BLOCK as u32;
                 let mask = col.lt(cols);
-                let mut value = Stor::into_accum(program.load(
-                    input.at((&row, &col)),
-                    mask.clone(),
-                    Stor::ZERO_STORAGE,
-                ));
+                let mut value =
+                    into_accum(program.load(input.at((&row, &col)), mask.clone(), zero_fill));
                 if let Some(residual) = &residual {
                     value = value
-                        + Stor::into_accum(program.load(
+                        + into_accum(program.load(
                             residual.at((&row, &col)),
                             mask.clone(),
-                            Stor::ZERO_STORAGE,
+                            zero_fill,
                         ));
                 }
-                let weight = Stor::into_accum(program.load(
-                    weight.at((0, &col)),
-                    mask.clone(),
-                    Stor::ZERO_STORAGE,
-                ));
+                let weight =
+                    into_accum(program.load(weight.at((0, &col)), mask.clone(), zero_fill));
                 let mut normalized = value / rms.clone() * weight;
                 if let Some(bias) = &bias {
-                    let bias_value = Stor::into_accum(program.load(
-                        bias.at((0, &col)),
-                        mask.clone(),
-                        Stor::ZERO_STORAGE,
-                    ));
+                    let bias_value =
+                        into_accum(program.load(bias.at((0, &col)), mask.clone(), zero_fill));
                     normalized = normalized + bias_value;
                 }
                 // Apply any fused post-element-wise chain in-register before
@@ -710,10 +723,19 @@ where
                             .expect("rms_norm post-chain validated at fuse time");
                     normalized = val;
                 }
-                program.store(output.at((&row, col)), Stor::from_accum(normalized), mask);
+                program.store(output.at((&row, col)), from_accum(normalized), mask);
             }
         });
     }))
+}
+
+/// The storage-typed zero used as the masked-out fill for rms-norm loads.
+/// Mirrors the old `AccumCast::ZERO_STORAGE` constant.
+fn rms_norm_zero_fill(element: tile_ir::ElementType) -> tile_ir::TileLiteral {
+    match element {
+        tile_ir::ElementType::F16 => tile_ir::TileLiteral::F16(0),
+        _ => tile_ir::TileLiteral::f32(0.0),
+    }
 }
 
 fn vector_as_row_layout(layout: &crate::Layout) -> Option<tile_ir::Layout> {

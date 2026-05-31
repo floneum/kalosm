@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt;
 
 use naga::{
@@ -9,13 +8,13 @@ use naga::{
     ScalarKind, ShaderStage, Span, Statement, StorageAccess, SubgroupOperation, Type, TypeInner,
     VectorSize,
 };
+use rustc_hash::FxHashMap;
 
 use crate::ir::{
-    AxisGroup, BlockDequantId, BufferAccess, BufferId, CoopFragmentId, CoopMatrixRole,
-    CoopOperandRole, CopySource, DotK, ElementType, Expr, KernelIr, Layout, LoadSource, LocalId,
-    LocalRef, MemoryLevel, MultiFlattenMap, PackedActivations, ScalarElement, StorageView,
-    TileBinaryOp, TileCompareOp, TileId, TileLinearLoadExpr, TileLiteral, TileLoadExpr,
-    TileProgramOp, TileReduceOp, TileRef, TileStmt, TileStoreStmt, TileUnaryOp,
+    Accumulator, Addr, AxisGroup, Buffer, BufferAccess, Builtin, CoopMatrixRole, CoopSrc,
+    ElementType, Expr, ExprKind, KernelIr, Layout, Local, LocalDecl, MemoryLevel, MultiFlattenMap,
+    Node, QuantActivation, ReduceKind, ScalarElement, Source, Stmt, StorageView, Tile,
+    TileBinaryOp, TileCompareOp, TileLiteral, TileReduceOp, TileUnaryOp,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 
@@ -53,34 +52,10 @@ impl NagaKernel {
 /// Errors produced by the Naga lowering pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LowerError {
-    /// An event referenced a tile that was never allocated.
-    UnknownTile(TileId),
-    /// An operation referenced a private local that was never allocated.
-    UnknownLocal(LocalId),
-    /// An operation referenced a storage buffer that was never declared.
-    UnknownBuffer(BufferId),
     /// The Naga lowerer cannot emit this memory level.
     UnsupportedMemoryLevel(MemoryLevel),
     /// The typed IR operation is outside the supported lowering subset.
     UnsupportedOperation(&'static str),
-    /// An operation used a tile as a different element type than its declaration.
-    TileElementMismatch {
-        /// Tile whose declared element type was violated.
-        tile: TileId,
-        /// Declared element type.
-        declared: ElementType,
-        /// Element type used by the operation.
-        used: ElementType,
-    },
-    /// An operation used a local as a different element type than its declaration.
-    LocalElementMismatch {
-        /// Local whose declared element type was violated.
-        local: LocalId,
-        /// Declared element type.
-        declared: ElementType,
-        /// Element type used by the operation.
-        used: ElementType,
-    },
     /// Naga rejected the generated module.
     Validation(String),
 }
@@ -88,31 +63,10 @@ pub enum LowerError {
 impl fmt::Display for LowerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownTile(tile) => write!(f, "unknown tile {:?}", tile),
-            Self::UnknownLocal(local) => write!(f, "unknown local {:?}", local),
-            Self::UnknownBuffer(buffer) => write!(f, "unknown buffer {:?}", buffer),
             Self::UnsupportedMemoryLevel(memory) => {
                 write!(f, "unsupported memory level {:?}", memory)
             }
             Self::UnsupportedOperation(op) => write!(f, "unsupported operation {op}"),
-            Self::TileElementMismatch {
-                tile,
-                declared,
-                used,
-            } => write!(
-                f,
-                "tile {:?} declared as {:?} but used as {:?}",
-                tile, declared, used
-            ),
-            Self::LocalElementMismatch {
-                local,
-                declared,
-                used,
-            } => write!(
-                f,
-                "local {:?} declared as {:?} but used as {:?}",
-                local, declared, used
-            ),
             Self::Validation(error) => write!(f, "naga validation failed: {error}"),
         }
     }
@@ -120,49 +74,26 @@ impl fmt::Display for LowerError {
 
 impl std::error::Error for LowerError {}
 
-struct Lowerer<'a> {
-    ir: &'a KernelIr,
-    module: Module,
-    f32_ty: Handle<Type>,
-    f32_vec2_ty: Handle<Type>,
-    f32_vec3_ty: Handle<Type>,
-    f32_vec4_ty: Handle<Type>,
-    i32_ty: Handle<Type>,
-    i32_vec4_ty: Handle<Type>,
-    f16_ty: Option<Handle<Type>>,
-    f16_vec2_ty: Option<Handle<Type>>,
-    f16_vec3_ty: Option<Handle<Type>>,
-    f16_vec4_ty: Option<Handle<Type>>,
-    u32_ty: Handle<Type>,
-    u32_vec2_ty: Handle<Type>,
-    u32_vec3_ty: Handle<Type>,
-    u32_vec4_ty: Handle<Type>,
-    bool_ty: Handle<Type>,
-    bool_vec2_ty: Handle<Type>,
-    bool_vec3_ty: Handle<Type>,
-    bool_vec4_ty: Handle<Type>,
-    buffer_globals: Vec<Option<Handle<GlobalVariable>>>,
-    tile_globals: Vec<Option<Handle<GlobalVariable>>>,
-    tile_locals: Vec<Option<Handle<LocalVariable>>>,
-    private_locals: Vec<Option<Handle<LocalVariable>>>,
-    live_tiles: Vec<bool>,
-    workgroup_invocations: u32,
-    workgroup_size: [u32; 3],
-    subgroup_usage: analysis::SubgroupIndexUsage,
-    block_dequant_cache: RefCell<HashMap<BlockDequantId, Vec<Handle<Expression>>>>,
-    q8_activation_pack_cache: RefCell<HashMap<Vec<Handle<Expression>>, Q8ActivationPacks>>,
-    coop_matrix_types: HashMap<ElementType, Handle<Type>>,
-    /// SSA-cached cooperatively-loaded fragments. The producer
-    /// (`TileStmt::LoadCoop`) inserts its fresh `CoopFragmentId`; consumers
-    /// (`TileStmt::Mma`) read by id within the same scope. Cleared at
-    /// boundaries via `snapshot_coop_loop_caches`.
-    coop_fragment_cache: RefCell<HashMap<CoopFragmentId, Handle<Expression>>>,
-    /// Latest SSA value of each cooperative accumulator, keyed by the
-    /// accumulator's `LocalId`. Lets MMAs chain through SSA — `mma(c=load)`
-    /// once, then `mma(c=last_ssa)` for the rest of the scope, with a single
-    /// Store at scope end.
-    coop_acc_value_cache: RefCell<HashMap<LocalId, Handle<Expression>>>,
-    uses_cooperative_matrix: bool,
+/// Demand-allocated private scratch local kinds. Locals are interned lazily by
+/// `(ScratchKind, ElementType, depth)`; each distinct key allocates exactly one
+/// `LocalVariable`, preserving the local count (which only drops, never grows)
+/// from the old eagerly-allocated `ScratchLocals`.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub(super) enum ScratchKind {
+    /// The counted/unstructured loop index (`u32`).
+    LoopIndex,
+    /// A masked-value spill local (one per masked load/reduce).
+    Value,
+    /// A reduce-accumulator spill local (deepens with nesting).
+    Spill,
+    /// A dequantized block-lane value local (`f32`).
+    BlockDequant,
+    /// A Q8 activation scale local (`f32`).
+    Q8Scale,
+    /// A Q8 activation pack local (`u32`).
+    Q8Pack,
+    /// A Q8 activation sum local (`i32`).
+    Q8Sum,
 }
 
 #[derive(Clone)]
@@ -179,81 +110,79 @@ struct Q8ActivationPackValues {
     sums_i32: Vec<Handle<Expression>>,
 }
 
-struct TileLoopCacheSnapshot {
-    block_dequant: Vec<(BlockDequantId, Vec<Handle<Expression>>)>,
+struct Lowerer<'a> {
+    ir: &'a KernelIr,
+    module: Module,
+    /// One `ElementType -> Handle<Type>` interner, replacing the ~18 cached
+    /// type-handle fields. `f16` types are gated up front so an f16 handle on a
+    /// non-f16 adapter yields `UnsupportedOperation` rather than mis-lowering.
+    types: RefCell<FxHashMap<ElementType, Handle<Type>>>,
+    f32_ty: Handle<Type>,
+    f32_vec4_ty: Handle<Type>,
+    i32_ty: Handle<Type>,
+    i32_vec4_ty: Handle<Type>,
+    u32_ty: Handle<Type>,
+    u32_vec3_ty: Handle<Type>,
+    /// `true` once `uses_f16` is decided up front (not lazy first-use).
+    uses_f16: bool,
+    /// Buffer / tile global variables, keyed by `Rc::as_ptr` of the decl.
+    globals: RefCell<FxHashMap<*const (), Handle<GlobalVariable>>>,
+    /// Private locals (program locals + private-level tiles), keyed by
+    /// `Rc::as_ptr` of the decl.
+    locals: RefCell<FxHashMap<*const (), Handle<LocalVariable>>>,
+    /// Demand-allocated scratch locals interned by `(kind, element, depth)`.
+    scratch: RefCell<FxHashMap<(ScratchKind, ElementType, u32), Handle<LocalVariable>>>,
+    /// The function-local arena, owned during lowering so scratch can be
+    /// demand-allocated through shared `&self` and moved into the function at
+    /// the end. Kept disjoint from `function.expressions`.
+    func_locals: RefCell<Arena<LocalVariable>>,
+    /// `q8_activation_pack_cache`: dedups the activation pack of one set of
+    /// activation handles within a store/quant scope.
+    q8_activation_pack_cache: RefCell<FxHashMap<Vec<Handle<Expression>>, Q8ActivationPacks>>,
+    /// Latest SSA value of each cooperative accumulator, keyed by the
+    /// accumulator local's `Rc::as_ptr`. Lets MMAs chain through SSA — one
+    /// `Load` then N `CooperativeMultiplyAdd`, one `Store` at scope end.
+    coop_acc_value_cache: RefCell<FxHashMap<*const LocalDecl, Handle<Expression>>>,
+    /// `Shared(Dequantize)` -> the N projected lane handles, keyed on
+    /// `Rc::as_ptr` of the shared `Node`. The dequant helper runs once.
+    dequant_memo: RefCell<FxHashMap<*const Node, Vec<Handle<Expression>>>>,
+    /// `Shared(_)` emit-once, keyed on `Rc::as_ptr` of the shared `Node`.
+    expr_memo: RefCell<FxHashMap<*const Node, Handle<Expression>>>,
+    workgroup_invocations: u32,
+    workgroup_size: [u32; 3],
+    caps: analysis::Capabilities,
+    /// First-use-ordered declarations from the one analysis walk, emitted as the
+    /// global/local arenas (buffers sorted by binding at global-creation time).
+    buffer_decls: Vec<Buffer>,
+    tile_decls: Vec<Tile>,
+    local_decls: Vec<Local>,
+}
+
+/// Snapshot of the per-iteration caches that are scoped to one loop iteration:
+/// `dequant_memo` + `expr_memo` (block-lane / shared SSA) and the coop
+/// acc-value + q8 activation caches. Drained at the iteration boundary and
+/// restored on exit.
+struct LoopCacheSnapshot {
+    dequant_memo: Vec<(*const Node, Vec<Handle<Expression>>)>,
+    expr_memo: Vec<(*const Node, Handle<Expression>)>,
 }
 
 struct CoopLoopCacheSnapshot {
-    fragments: Vec<(CoopFragmentId, Handle<Expression>)>,
-    acc_values: Vec<(LocalId, Handle<Expression>)>,
+    acc_values: Vec<(*const LocalDecl, Handle<Expression>)>,
 }
 
-#[derive(Copy, Clone)]
-struct ScratchLocals {
-    loop_index: Handle<LocalVariable>,
-    values: [Handle<LocalVariable>; SCRATCH_ELEMENT_COUNT],
-    spills: [[Handle<LocalVariable>; 32]; SCRATCH_ELEMENT_COUNT],
-    block_dequant: [Handle<LocalVariable>; 16],
-    q8_activation_scales: [Handle<LocalVariable>; 4],
-    q8_activation_packs: [Handle<LocalVariable>; 4],
-    q8_activation_sums_i32: [Handle<LocalVariable>; 4],
+/// Pointer-key helpers for the Rc-keyed decl maps.
+fn buffer_key(buffer: &Buffer) -> *const () {
+    std::rc::Rc::as_ptr(buffer) as *const ()
 }
 
-const SCRATCH_ELEMENT_COUNT: usize = 16;
-const SCRATCH_ELEMENTS: [ElementType; SCRATCH_ELEMENT_COUNT] = [
-    ElementType::F32,
-    ElementType::F16,
-    ElementType::U32,
-    ElementType::Bool,
-    ElementType::Vector {
-        scalar: ScalarElement::F32,
-        lanes: 2,
-    },
-    ElementType::Vector {
-        scalar: ScalarElement::F32,
-        lanes: 3,
-    },
-    ElementType::Vector {
-        scalar: ScalarElement::F32,
-        lanes: 4,
-    },
-    ElementType::Vector {
-        scalar: ScalarElement::F16,
-        lanes: 2,
-    },
-    ElementType::Vector {
-        scalar: ScalarElement::F16,
-        lanes: 3,
-    },
-    ElementType::Vector {
-        scalar: ScalarElement::F16,
-        lanes: 4,
-    },
-    ElementType::Vector {
-        scalar: ScalarElement::U32,
-        lanes: 2,
-    },
-    ElementType::Vector {
-        scalar: ScalarElement::U32,
-        lanes: 3,
-    },
-    ElementType::Vector {
-        scalar: ScalarElement::U32,
-        lanes: 4,
-    },
-    ElementType::Vector {
-        scalar: ScalarElement::Bool,
-        lanes: 2,
-    },
-    ElementType::Vector {
-        scalar: ScalarElement::Bool,
-        lanes: 3,
-    },
-    ElementType::Vector {
-        scalar: ScalarElement::Bool,
-        lanes: 4,
-    },
-];
+fn tile_key(tile: &Tile) -> *const () {
+    std::rc::Rc::as_ptr(tile) as *const ()
+}
+
+fn local_key(local: &Local) -> *const () {
+    std::rc::Rc::as_ptr(local) as *const ()
+}
 
 mod analysis;
 mod block;

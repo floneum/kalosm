@@ -6,13 +6,14 @@
 //! per-lane tile expressions and lowered to a validated Naga compute module.
 //!
 //! ```
-//! use fusor_tile_ir::{tile, Shape, F32};
+//! use fusor_tile_ir::{tile, Shape, ScalarElement};
 //!
 //! let ir = tile::build(|program| {
-//!     let input = program.storage_read::<F32, 2>(Shape::new([1, 128]));
-//!     let output = program.storage_write::<F32, 2>(Shape::new([1, 128]));
+//!     let f32 = ScalarElement::F32.element();
+//!     let input = program.storage_read(f32, Shape::new([1, 128]));
+//!     let output = program.storage_write(f32, Shape::new([1, 128]));
 //!
-//!     program.program_grid::<128>([1, 1, 1], |program| {
+//!     program.program_grid(128, [1, 1, 1], |program| {
 //!         let lane = program.lane();
 //!         let mask = lane.clone().lt(128u32);
 //!         let value = program.load(input.at((0u32, lane.clone())), mask.clone(), 0.0);
@@ -31,10 +32,11 @@ mod quantized;
 pub mod tile;
 
 pub use ir::{
-    AxisGroup, Bool, CoopElement, CoopMatrixRole, ElementType, F32Bits, FloatElement, KernelIr,
-    Layout, MemoryLevel, MultiFlattenMap, Numeric, ScalarElement, ScalarMarker, Shape, StorageView,
-    SubAxis, TileBinaryOp, TileCompareOp, TileLiteral, TileReduceOp, TileRef, TileUnaryOp, Vector,
-    WorkgroupAxis, F16, F32, U32,
+    Accumulator, Addr, AxisGroup, Buffer, BufferAccess, BufferDecl, Builtin, CoopMatrixRole,
+    CoopSrc, ElementType, Expr, ExprKind, F32Bits, KernelIr, Layout, Local, LocalDecl, MemoryLevel,
+    MultiFlattenMap, Node, ReduceKind, ScalarElement, Shape, Source, Stmt, StorageView, SubAxis,
+    Tile, TileBinaryOp, TileCompareOp, TileDecl, TileLiteral, TileReduceOp, TileUnaryOp,
+    WorkgroupAxis,
 };
 pub use kernel_builder::{KernelBuilder, KernelTensorRef};
 pub use lower::{LowerError, NagaKernel};

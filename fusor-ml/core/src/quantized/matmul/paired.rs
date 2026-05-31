@@ -167,11 +167,14 @@ impl QMatMulOperation {
         // Build IR + binding list together via `KernelBuilder` so the runtime
         // buffer order can't drift from the IR's storage declaration order.
         let mut kb = tile_ir::KernelBuilder::<std::sync::Arc<wgpu::Buffer>>::new();
-        let a = kb.read::<tile_ir::F32, 2>(tile_ir::KernelTensorRef::with_offset(
-            input.buffer().clone(),
-            a_view.layout.clone(),
-            a_view.offset,
-        ));
+        let a = kb.read(
+            tile_ir::ElementType::F32,
+            tile_ir::KernelTensorRef::with_offset(
+                input.buffer().clone(),
+                a_view.layout.clone(),
+                a_view.offset,
+            ),
+        );
         let b = tile_ir_kernels::quantized_matrix_for(
             &mut kb,
             matrix.buffer().clone(),
@@ -179,22 +182,28 @@ impl QMatMulOperation {
             k,
             pair_len * 2,
         );
-        let extras: Vec<tile_ir::tile::Storage<tile_ir::F32, 1>> = extra_views
+        let extras: Vec<tile_ir::tile::Storage> = extra_views
             .iter()
             .zip(extras_tensors.iter())
             .map(|(view, tensor)| {
-                kb.read::<tile_ir::F32, 1>(tile_ir::KernelTensorRef::with_offset(
-                    tensor.buffer().clone(),
-                    view.tile_layout.clone(),
-                    view.offset,
-                ))
+                kb.read(
+                    tile_ir::ElementType::F32,
+                    tile_ir::KernelTensorRef::with_offset(
+                        tensor.buffer().clone(),
+                        view.tile_layout.clone(),
+                        view.offset,
+                    ),
+                )
             })
             .collect();
-        let y = kb.write::<tile_ir::F32, 2>(tile_ir::KernelTensorRef::with_offset(
-            output.buffer().clone(),
-            y_view.layout.clone(),
-            y_view.offset,
-        ));
+        let y = kb.write(
+            tile_ir::ElementType::F32,
+            tile_ir::KernelTensorRef::with_offset(
+                output.buffer().clone(),
+                y_view.layout.clone(),
+                y_view.offset,
+            ),
+        );
         tile_ir_kernels::qgemv_q4k_paired(
             kb.program(),
             tile_ir_kernels::Q4KPairedGgml {
@@ -564,29 +573,38 @@ impl QMatMulOperation {
 
         let epilogue = paired.epilogue.clone();
         let mut kb = tile_ir::KernelBuilder::<std::sync::Arc<wgpu::Buffer>>::new();
-        let projected_storage = kb.read::<tile_ir::F32, 2>(tile_ir::KernelTensorRef::with_offset(
-            projected.buffer().clone(),
-            projected_view.layout,
-            projected_view.offset,
-        ));
+        let projected_storage = kb.read(
+            tile_ir::ElementType::F32,
+            tile_ir::KernelTensorRef::with_offset(
+                projected.buffer().clone(),
+                projected_view.layout,
+                projected_view.offset,
+            ),
+        );
         let extra_storages = extra_views
             .iter()
             .zip(extras.iter())
             .map(|(view, extra)| {
-                kb.read::<tile_ir::F32, 1>(tile_ir::KernelTensorRef::with_offset(
-                    extra.buffer().clone(),
-                    view.layout.clone(),
-                    view.offset,
-                ))
+                kb.read(
+                    tile_ir::ElementType::F32,
+                    tile_ir::KernelTensorRef::with_offset(
+                        extra.buffer().clone(),
+                        view.layout.clone(),
+                        view.offset,
+                    ),
+                )
             })
             .collect::<Vec<_>>();
-        let output_storage = kb.write::<tile_ir::F32, 2>(tile_ir::KernelTensorRef::with_offset(
-            output.buffer().clone(),
-            output_view.layout,
-            output_view.offset,
-        ));
+        let output_storage = kb.write(
+            tile_ir::ElementType::F32,
+            tile_ir::KernelTensorRef::with_offset(
+                output.buffer().clone(),
+                output_view.layout,
+                output_view.offset,
+            ),
+        );
         kb.program()
-            .program_grid::<BLOCK>(dispatch_size, |program| {
+            .program_grid(BLOCK as u32, dispatch_size, |program| {
                 let lane = program.lane();
                 let group = program.program_id(tile_ir::WorkgroupAxis::X)
                     + program.program_id(tile_ir::WorkgroupAxis::Y) * dispatch_x;
