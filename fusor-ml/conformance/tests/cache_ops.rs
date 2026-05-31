@@ -112,6 +112,35 @@ async fn tensor_cache_append_and_reset_work_across_varied_cases() {
 }
 
 #[tokio::test]
+async fn tensor_cache_gpu_lazy_appends_preserve_pending_writes() {
+    let Some(device) = available_devices().await.into_iter().find(Device::is_gpu) else {
+        return;
+    };
+
+    let mut expected: TensorCache<3, f32> = TensorCache::new(1, 8);
+    let mut actual: TensorCache<3, f32> = TensorCache::new(1, 8);
+    let mut expected_tensor = None;
+    let mut actual_tensor = None;
+
+    for (step, &chunk_len) in [5usize, 1, 1].iter().enumerate() {
+        let data = tensor_data(chunk_len * 2, step as f32 + 0.5);
+        let cpu_tensor = Tensor::from_slice(&Device::Cpu, [1, chunk_len, 2], &data);
+        let device_tensor = Tensor::from_slice(&device, [1, chunk_len, 2], &data);
+
+        expected_tensor = Some(expected.append(&Device::Cpu, &cpu_tensor));
+        actual_tensor = Some(actual.append(&device, &device_tensor));
+    }
+
+    exact_eq(
+        actual_tensor.as_ref().unwrap(),
+        expected_tensor.as_ref().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(actual.current_seq_len(), expected.current_seq_len());
+}
+
+#[tokio::test]
 async fn kv_cache_append_and_reset_work_across_varied_cases() {
     for device in available_devices().await {
         for &(max_sequence_len, batch, heads, dim, chunk_lens) in &[

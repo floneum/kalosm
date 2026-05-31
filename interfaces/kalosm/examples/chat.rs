@@ -3,7 +3,6 @@
 // KALOSM_LLAMA_GPU_SAMPLE_TOKEN=1 \
 // KALOSM_LLAMA_GPU_FUSED_LOGITS=1 \
 // KALOSM_LLAMA_GPU_SAMPLE_TOP_K=128 \
-// KALOSM_LLAMA_UNBOUNDED_DECODE_RESERVE=512 \
 // cargo run -p kalosm --example chat --features llama --release
 use kalosm::language::*;
 use std::io::{BufWriter, Write};

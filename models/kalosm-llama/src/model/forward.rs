@@ -67,9 +67,6 @@ where
                     start.elapsed()
                 );
             }
-            if let Some(cache) = cache {
-                cache.detach(device);
-            }
         } else if trace_enabled {
             eprintln!("forward_logits_on_cpu path={path} decode_eligible={decode_eligible}");
         }
@@ -329,9 +326,6 @@ where
                     "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
                     start.elapsed()
                 );
-            }
-            if let Some(cache) = cache {
-                cache.detach(device);
             }
         }
         Box::pin(async move {

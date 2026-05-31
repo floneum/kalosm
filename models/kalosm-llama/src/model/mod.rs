@@ -111,13 +111,6 @@ fn gpu_sample_top_k(config: &GpuSamplerConfig) -> usize {
         .max(1)
 }
 
-fn unbounded_decode_reserve_tokens() -> usize {
-    std::env::var("KALOSM_LLAMA_UNBOUNDED_DECODE_RESERVE")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(256)
-}
-
 struct LlamaGpuSamplerState {
     sampler: Mirostat2Sampler,
     config: GpuSamplerConfig,
