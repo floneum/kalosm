@@ -1,6 +1,14 @@
 use super::*;
 use crate::ir::ReduceKind;
 
+struct LoopReduceValue<'a> {
+    value: &'a Expr,
+    iterations: u32,
+    index: &'a Local,
+    op: TileReduceOp,
+    spill_depth: usize,
+}
+
 impl<'a> Lowerer<'a> {
     /// Lower an `ExprKind::Reduce`, dispatching on `ReduceKind`:
     /// - `Subgroup` → a `subgroupAdd`/`subgroupMax`/... collective.
@@ -38,11 +46,13 @@ impl<'a> Lowerer<'a> {
                 let value = self.lower_loop_reduce_value(
                     expressions,
                     body,
-                    value,
-                    *iterations,
-                    index,
-                    op,
-                    spill_depth,
+                    LoopReduceValue {
+                        value,
+                        iterations: *iterations,
+                        index,
+                        op,
+                        spill_depth,
+                    },
                 )?;
                 self.lower_reduce_value(expressions, body, scratch, value, op, *group_size)
             }
@@ -53,12 +63,15 @@ impl<'a> Lowerer<'a> {
         &self,
         expressions: &mut Arena<Expression>,
         body: &mut Block,
-        value: &Expr,
-        iterations: u32,
-        index: &Local,
-        op: TileReduceOp,
-        spill_depth: usize,
+        reduce: LoopReduceValue<'_>,
     ) -> Result<Handle<Expression>, LowerError> {
+        let LoopReduceValue {
+            value,
+            iterations,
+            index,
+            op,
+            spill_depth,
+        } = reduce;
         let element = value.element();
         let acc = self.scratch_local(ScratchKind::Spill, element, 0)?;
         let initial = expressions.append(Self::tile_reduce_identity(op, element), Span::default());

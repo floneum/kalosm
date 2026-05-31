@@ -774,6 +774,24 @@ struct DecodeOutputLoop<'a> {
     kv_local: &'a PrivateLocal,
 }
 
+struct FlashDecodeSmallBlock<B> {
+    q: fusor_tile_ir::KernelTensorRef<B>,
+    k: fusor_tile_ir::KernelTensorRef<B>,
+    v: fusor_tile_ir::KernelTensorRef<B>,
+    output: fusor_tile_ir::KernelTensorRef<B>,
+    params: fusor_tile_ir::KernelTensorRef<B>,
+    meta: FlashDecodeSmallMeta,
+}
+
+struct FlashDecodeSplitPartialsBlock<B> {
+    q: fusor_tile_ir::KernelTensorRef<B>,
+    k: fusor_tile_ir::KernelTensorRef<B>,
+    v: fusor_tile_ir::KernelTensorRef<B>,
+    scratch: fusor_tile_ir::KernelTensorRef<B>,
+    params: fusor_tile_ir::KernelTensorRef<B>,
+    meta: FlashDecodeSmallMeta,
+}
+
 fn append_decode_output_loop(program: &mut TileBlock<'_>, request: DecodeOutputLoop<'_>) {
     let DecodeOutputLoop {
         v,
@@ -820,13 +838,16 @@ fn append_decode_output_loop(program: &mut TileBlock<'_>, request: DecodeOutputL
 fn flash_decode_small_block<B>(
     kb: &mut fusor_tile_ir::KernelBuilder<B>,
     block: u32,
-    q: fusor_tile_ir::KernelTensorRef<B>,
-    k: fusor_tile_ir::KernelTensorRef<B>,
-    v: fusor_tile_ir::KernelTensorRef<B>,
-    output: fusor_tile_ir::KernelTensorRef<B>,
-    params: fusor_tile_ir::KernelTensorRef<B>,
-    meta: FlashDecodeSmallMeta,
+    args: FlashDecodeSmallBlock<B>,
 ) {
+    let FlashDecodeSmallBlock {
+        q,
+        k,
+        v,
+        output,
+        params,
+        meta,
+    } = args;
     let q = kb.read(ElementType::F32, q);
     let k = kb.read(ElementType::F32, k);
     let v = kb.read(ElementType::F32, v);
@@ -1062,13 +1083,16 @@ fn flash_decode_small_block<B>(
 fn flash_decode_split_partials_block<B>(
     kb: &mut fusor_tile_ir::KernelBuilder<B>,
     block: u32,
-    q: fusor_tile_ir::KernelTensorRef<B>,
-    k: fusor_tile_ir::KernelTensorRef<B>,
-    v: fusor_tile_ir::KernelTensorRef<B>,
-    scratch: fusor_tile_ir::KernelTensorRef<B>,
-    params: fusor_tile_ir::KernelTensorRef<B>,
-    meta: FlashDecodeSmallMeta,
+    args: FlashDecodeSplitPartialsBlock<B>,
 ) {
+    let FlashDecodeSplitPartialsBlock {
+        q,
+        k,
+        v,
+        scratch,
+        params,
+        meta,
+    } = args;
     let q = kb.read(ElementType::F32, q);
     let k = kb.read(ElementType::F32, k);
     let v = kb.read(ElementType::F32, v);
@@ -1210,7 +1234,18 @@ pub fn flash_decode_split_partials<B>(
     if !matches!(meta.decode_block, 128 | 256 | 512 | 1024) {
         return None;
     }
-    flash_decode_split_partials_block(kb, meta.decode_block, q, k, v, scratch, params, meta);
+    flash_decode_split_partials_block(
+        kb,
+        meta.decode_block,
+        FlashDecodeSplitPartialsBlock {
+            q,
+            k,
+            v,
+            scratch,
+            params,
+            meta,
+        },
+    );
     Some(())
 }
 
@@ -1303,6 +1338,17 @@ pub fn flash_decode_small<B>(
     if !matches!(meta.decode_block, 128 | 256 | 512 | 1024) {
         return None;
     }
-    flash_decode_small_block(kb, meta.decode_block, q, k, v, output, params, meta);
+    flash_decode_small_block(
+        kb,
+        meta.decode_block,
+        FlashDecodeSmallBlock {
+            q,
+            k,
+            v,
+            output,
+            params,
+            meta,
+        },
+    );
     Some(())
 }

@@ -128,8 +128,8 @@ impl<'a> Lowerer<'a> {
             expressions,
             body,
             MaskedF32Value {
-                mask: &**mask,
-                fill: &**fill,
+                mask,
+                fill,
                 spill_depth,
             },
             |expressions, block| {
