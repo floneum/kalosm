@@ -41,8 +41,9 @@
 //! gliner.cache_labels(&labels).await?;
 //!
 //! // Fast inference with cached labels
+//! let documents = ["Apple Inc. was founded by Steve Jobs.", "Microsoft is in Seattle."];
 //! for text in documents {
-//!     let entities = gliner.extract_with_cached_labels(&text).await?;
+//!     let entities = gliner.extract_with_cached_labels(text).await?;
 //!     // Process entities...
 //! }
 //! # Ok(())
@@ -322,11 +323,14 @@ impl Gliner {
     ///
     /// This significantly speeds up inference when using fixed label sets.
     pub async fn cache_labels(&mut self, labels: &[&str]) -> Result<(), GlinerError> {
+        // `materialized()` severs the lazy encoder graph into a standalone
+        // buffer; `to_concrete()` would only clone the lazy GPU tensor and
+        // re-run the encoder on every reuse.
         let label_embeddings = self
             .label_encoder
             .encode_labels(labels)
             .await?
-            .to_concrete();
+            .materialized();
         self.cached_labels = Some(CachedLabels::new(
             labels.iter().map(|s| s.to_string()).collect(),
             label_embeddings,
@@ -427,16 +431,34 @@ impl Gliner {
             return Ok(Vec::new());
         }
 
-        // Get label embeddings (compute if not cached or labels differ)
-        let label_embeddings = if let Some(ref cached) = self.cached_labels {
-            let cached_labels: Vec<&str> = cached.labels.iter().map(|s| s.as_str()).collect();
-            if cached_labels == labels {
-                cached.embeddings.clone()
-            } else {
-                self.label_encoder.encode_labels(labels).await?
-            }
+        // Get label embeddings, reusing the cache when the label set is
+        // unchanged. The label encoder is independent of the input text, so a
+        // fixed label set (the common case when extracting over many texts)
+        // only needs encoding once. Auto-populate the cache on a miss so the
+        // default `extract`/`extract_batch` path amortizes label encoding
+        // without requiring an explicit `cache_labels` call.
+        let labels_match = self.cached_labels.as_ref().is_some_and(|cached| {
+            cached.labels.len() == labels.len()
+                && cached
+                    .labels
+                    .iter()
+                    .zip(labels.iter())
+                    .all(|(cached, label)| cached == label)
+        });
+        let label_embeddings = if labels_match {
+            self.cached_labels.as_ref().unwrap().embeddings.clone()
         } else {
-            self.label_encoder.encode_labels(labels).await?
+            // `materialized()` (not `to_concrete()`) resolves the encoder graph
+            // into a standalone output buffer, severing the lazy graph so reuse
+            // does not re-run the label encoder. `to_concrete()` only clones the
+            // lazy GPU tensor, which would drag the whole encoder into every
+            // subsequent extract.
+            let embeddings = self.label_encoder.encode_labels(labels).await?.materialized();
+            self.cached_labels = Some(CachedLabels::new(
+                labels.iter().map(|s| s.to_string()).collect(),
+                embeddings.clone(),
+            ));
+            embeddings
         };
 
         self.extract_internal_batch(texts, labels, &label_embeddings)
