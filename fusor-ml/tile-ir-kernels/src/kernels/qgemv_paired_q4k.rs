@@ -1,15 +1,21 @@
 //! Q4K paired-epilogue GEMV program kernels.
 
-use fusor_tile_ir::tile::{BlockCoord, Mask, Program, QuantizedDot, Storage, Tile, TileBlock};
-use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F32, U32};
+use fusor_tile_ir::tile::{range, Program, Storage, Tile};
+use fusor_tile_ir::{QuantizedMatrix, WorkgroupAxis};
 
-use crate::grid::{q4k_ggml_iteration, q4k_lane_decomposition, Q4KGgmlIterationRequest};
+use crate::grid::dot4_sum;
 use crate::types::{matrix_shape, PairedEpilogue};
 
-/// Tile shape for `qgemv_q4k_paired_ggml::<BLOCK>(…)`. The kernel only
-/// monomorphizes on `block` (the workgroup-size literal); `subgroups` and
-/// `pairs_per_subgroup` ride along as runtime args, and `dots_per_subgroup`
-/// always equals `pairs_per_subgroup * 2`.
+/// Q4K block dequantizes into 8 contiguous f32 weights per lane (one
+/// `Dequantize` shared node), so the K-loop advances 8 elements per lane.
+const VALUES_PER_LANE: u32 = 8;
+/// Subgroup width assumed by the Q4K paired tiling.
+const SUBGROUP_SIZE: u32 = 32;
+
+/// Tile shape for `qgemv_q4k_paired_ggml`. The kernel only takes `block` (the
+/// workgroup-size literal) as a runtime arg; `subgroups` and `pairs_per_subgroup`
+/// ride along as runtime args, and `dots_per_subgroup` always equals
+/// `pairs_per_subgroup * 2`.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Q4KPairedShape {
     pub subgroups: u32,
@@ -78,16 +84,17 @@ pub fn qgemv_q4k_paired_dispatch(
 /// column pair, applies `epilogue` in-register, and writes the paired result.
 ///
 /// ```no_run
-/// # use fusor_tile_ir::{tile, GgmlQuantFormat, Shape, F32};
+/// # use fusor_tile_ir::{tile, GgmlQuantFormat, ScalarElement, Shape};
 /// # use fusor_tile_ir_kernels::{
 /// #     PairedEpilogue, Q4KPairedGgml, Q4KPairedShape, qgemv_q4k_paired, quantized_matrix,
 /// # };
 /// let epilogue =
 ///     PairedEpilogue::with_extras("mul", 0, |tiles| tiles[0].clone() * tiles[1].clone());
 /// let ir = tile::build(|program| {
-///     let a = program.storage_read::<F32, 2>(Shape::new([1, 4096]));
+///     let f32 = ScalarElement::F32.element();
+///     let a = program.storage_read(f32, Shape::new([1, 4096]));
 ///     let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 4096, 8192);
-///     let y = program.storage_write::<F32, 2>(Shape::new([1, 4096]));
+///     let y = program.storage_write(f32, Shape::new([1, 4096]));
 ///     qgemv_q4k_paired(
 ///         program,
 ///         Q4KPairedGgml {
@@ -106,11 +113,11 @@ pub fn qgemv_q4k_paired_dispatch(
 /// ```
 pub struct Q4KPairedGgml<'a> {
     /// Single-row or batched activation matrix.
-    pub a: &'a Storage<F32, 2>,
+    pub a: &'a Storage,
     /// Q4K matrix with `pair_cols * 2` columns.
     pub b: &'a QuantizedMatrix,
     /// Output matrix with `pair_cols` columns.
-    pub y: &'a Storage<F32, 2>,
+    pub y: &'a Storage,
     /// Number of gate/up pairs in `b`.
     pub pair_cols: u32,
     /// Number of rows from `a` and `y` covered by the launch.
@@ -122,25 +129,20 @@ pub struct Q4KPairedGgml<'a> {
     /// Register-level operation applied to each `(gate, up)` pair.
     pub epilogue: &'a PairedEpilogue,
     /// One-dimensional extra tensors consumed by `epilogue`.
-    pub extras: &'a [Storage<F32, 1>],
-}
-
-/// Build a Q4K paired-epilogue GEMV body. Dispatches on `shape.block` to the
-/// matching `program_grid::<BLOCK>` monomorphization; `subgroups` and
-/// `pairs_per_subgroup` pass through as runtime args.
-pub fn qgemv_q4k_paired(program: &mut Program, spec: Q4KPairedGgml<'_>) {
-    match spec.shape.block {
-        64 => qgemv_q4k_paired_ggml::<64>(program, spec),
-        128 => qgemv_q4k_paired_ggml::<128>(program, spec),
-        256 => qgemv_q4k_paired_ggml::<256>(program, spec),
-        other => panic!("unsupported Q4K paired qgemv BLOCK {other}"),
-    }
+    pub extras: &'a [Storage],
 }
 
 /// Q4K paired-epilogue qgemv body. The kernel reduces the gate and up halves
 /// of a `[gate; up]` matmul output and applies the supplied `PairedEpilogue`
 /// in-register before the single output store.
-fn qgemv_q4k_paired_ggml<const BLOCK: usize>(program: &mut Program, spec: Q4KPairedGgml<'_>) {
+///
+/// Runtime-typed (ARBOR_DESIGN.md §2/§5): `shape.block` is threaded into
+/// `program_grid` as a runtime workgroup-size literal — no `program_grid::<BLOCK>`
+/// monomorphization and no `match block` fan-out. Each Q4K block is dequantized
+/// to 8 f32 weights through **one** `Dequantize` shared node
+/// (`load_quantized_block_vec`), then composed with the activations through the
+/// shared `dot4_sum` helper.
+pub fn qgemv_q4k_paired(program: &mut Program, spec: Q4KPairedGgml<'_>) {
     let Q4KPairedGgml {
         a,
         b,
@@ -156,7 +158,7 @@ fn qgemv_q4k_paired_ggml<const BLOCK: usize>(program: &mut Program, spec: Q4KPai
     let pairs_per_subgroup = shape.pairs_per_subgroup;
     let pairs_per_subgroup_usize = pairs_per_subgroup as usize;
     let dots_per_subgroup_usize = pairs_per_subgroup_usize * 2;
-    debug_assert_eq!(shape.block as usize, BLOCK);
+    debug_assert_eq!(subgroups * SUBGROUP_SIZE, shape.block);
     debug_assert_eq!(
         extras.len(),
         epilogue.extras_count(),
@@ -165,20 +167,20 @@ fn qgemv_q4k_paired_ggml<const BLOCK: usize>(program: &mut Program, spec: Q4KPai
     debug_assert!(b.format.is_q4k_family());
     debug_assert_eq!(b.cols, pair_cols * 2);
 
-    let [_, k] = matrix_shape(&a.view().layout);
+    let [_, k] = matrix_shape(a.layout());
     let cols_per_workgroup = subgroups * pairs_per_subgroup;
     let cols_workgroups = pair_cols.div_ceil(cols_per_workgroup);
     let m_rows = m_rows.max(1);
     let total_workgroups = cols_workgroups * m_rows;
     let workgroups_x = workgroups_x.min(total_workgroups.max(1));
     let dispatch_y = total_workgroups.div_ceil(workgroups_x);
-    let block_count = k.div_ceil(256);
-    let block_iterations = block_count.div_ceil(4);
-    let full_block_iterations = block_count.is_multiple_of(4);
+    let k_per_iter = SUBGROUP_SIZE * VALUES_PER_LANE;
+    let k_iterations = k.div_ceil(k_per_iter);
+    let full_k_iterations = k.is_multiple_of(k_per_iter);
     let full_cols = pair_cols.is_multiple_of(cols_per_workgroup);
     let b_cloned = b.clone();
 
-    program.program_grid::<BLOCK>([workgroups_x, dispatch_y, 1], |program| {
+    program.program_grid(shape.block, [workgroups_x, dispatch_y, 1], |program| {
         let workgroup_idx = program.program_id(WorkgroupAxis::X)
             + program.program_id(WorkgroupAxis::Y) * workgroups_x;
         let row = workgroup_idx.clone() / cols_workgroups;
@@ -188,40 +190,34 @@ fn qgemv_q4k_paired_ggml<const BLOCK: usize>(program: &mut Program, spec: Q4KPai
         let subgroup_col_base = program.subgroup_id() * pairs_per_subgroup;
         let col0 = col_group_base + subgroup_col_base;
         let lane = program.subgroup_lane();
-        let q4k_lane = q4k_lane_decomposition(&lane);
 
-        let zero = TileLiteral::f32(0.0);
-        let sums: Vec<Tile> = program.loop_fold_vec(
-            TileReduceOp::Sum,
-            block_iterations,
-            vec![zero; dots_per_subgroup_usize],
-            |program, loop_index| {
-                let pass = q4k_ggml_iteration(
-                    program,
-                    Q4KGgmlIterationRequest {
-                        loop_index,
-                        a,
-                        row: row.clone(),
-                        block_count,
-                        full_block_iterations,
-                        lane: &q4k_lane,
-                        base_mask: row_in_bounds.clone(),
-                    },
-                );
-
-                let dot = |program: &mut TileBlock<'_>, col: Tile<U32>, mask: Mask| {
-                    program.quantized_dot(QuantizedDot::q4k_block(
-                        pass.activations.clone(),
-                        &b_cloned,
-                        BlockCoord::new(&pass.block, &q4k_lane.iq, &q4k_lane.ir),
-                        &col,
-                        mask,
-                        0.0,
-                    ))
+        let sums: Vec<Tile> = program.fold_vec(
+            range(k_iterations),
+            vec![program.f32(0.0); dots_per_subgroup_usize],
+            |program, loop_index, accs| {
+                let k_base = loop_index * k_per_iter + lane.clone() * VALUES_PER_LANE;
+                let in_bounds_k = if full_k_iterations {
+                    row_in_bounds.clone()
+                } else {
+                    row_in_bounds.clone().and(k_base.lt(k))
                 };
 
-                (0..dots_per_subgroup_usize)
-                    .map(|idx| {
+                // Activations are shared across every gate/up dot in this
+                // subgroup pass: 8 contiguous f32 loads at `k_base + i`.
+                let acts: Vec<Tile> = (0..VALUES_PER_LANE)
+                    .map(|i| {
+                        let scalar = program.load(
+                            a.at((row.clone(), k_base.clone() + i)),
+                            in_bounds_k.clone(),
+                            0.0,
+                        );
+                        program.bind(scalar)
+                    })
+                    .collect();
+
+                accs.into_iter()
+                    .enumerate()
+                    .map(|(idx, acc)| {
                         let offset = idx % pairs_per_subgroup_usize;
                         let gate = col0.clone() + offset as u32;
                         let col = if idx < pairs_per_subgroup_usize {
@@ -230,11 +226,19 @@ fn qgemv_q4k_paired_ggml<const BLOCK: usize>(program: &mut Program, spec: Q4KPai
                             gate.clone() + pair_cols
                         };
                         let mask = if full_cols {
-                            pass.in_bounds.clone()
+                            in_bounds_k.clone()
                         } else {
-                            pass.in_bounds.clone().and(gate.lt(pair_cols))
+                            in_bounds_k.clone().and(gate.lt(pair_cols))
                         };
-                        dot(program, col, mask)
+                        let bs = program.load_quantized_block_vec(
+                            VALUES_PER_LANE,
+                            &b_cloned,
+                            &k_base,
+                            &col,
+                            mask,
+                            0.0,
+                        );
+                        acc + dot4_sum(program, &acts, &bs)
                     })
                     .collect()
             },
@@ -245,9 +249,9 @@ fn qgemv_q4k_paired_ggml<const BLOCK: usize>(program: &mut Program, spec: Q4KPai
             let gate = program.subgroup_reduce_sum(sums[offset].clone());
             let up = program.subgroup_reduce_sum(sums[offset + pairs_per_subgroup_usize].clone());
             let store_lane = if full_cols {
-                lane.eq(0)
+                lane.eq(0u32)
             } else {
-                lane.eq(0).and(col.lt(pair_cols))
+                lane.eq(0u32).and(col.lt(pair_cols))
             };
             let mask = store_lane.and(row_in_bounds.clone());
             // Load any per-column extras (e.g. bias vectors) at the current
@@ -255,13 +259,7 @@ fn qgemv_q4k_paired_ggml<const BLOCK: usize>(program: &mut Program, spec: Q4KPai
             // tensors of length `pair_cols`.
             let extra_tiles: Vec<Tile> = extras
                 .iter()
-                .map(|extra| {
-                    program.load(
-                        extra.at(col.clone()),
-                        mask.clone(),
-                        fusor_tile_ir::TileLiteral::f32(0.0),
-                    )
-                })
+                .map(|extra| program.load(extra.at(col.clone()), mask.clone(), 0.0))
                 .collect();
             let value = epilogue.apply(gate, up, &extra_tiles);
             program.store(y.at((row.clone(), col)), value, mask);

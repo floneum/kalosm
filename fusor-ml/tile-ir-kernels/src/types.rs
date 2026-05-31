@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use fusor_tile_ir::tile::{Storage, Tile};
-use fusor_tile_ir::{Layout, TileLiteral, F32};
+use fusor_tile_ir::{Layout, TileLiteral};
 
 type PairedEpilogueBuilder = dyn Fn(&[Tile]) -> Tile + Send + Sync;
 type UnaryEpilogueBuilder = dyn Fn(Tile) -> Tile + Send + Sync;
@@ -321,16 +321,17 @@ pub struct QmatmulEpilogues<'a> {
     pub post_extra_inputs: &'a [QmatmulExtra<'a>],
     /// Optional rank-1 vector that is added to the accumulator before the
     /// cooperative store. This is a lowering choice for expressions whose
-    /// post-op can be represented as `acc + column_vector`.
-    pub post_acc_init_col_vector: Option<&'a Storage<F32, 1>>,
+    /// post-op can be represented as `acc + column_vector`. Runtime-typed
+    /// (ARBOR_DESIGN.md §2): the rank/element travel in the `Storage` view.
+    pub post_acc_init_col_vector: Option<&'a Storage>,
 }
 
 #[derive(Clone, Copy)]
 pub enum QmatmulExtra<'a> {
-    /// Rank-1 vector indexed by input/output column.
-    Column(&'a Storage<F32, 1>),
-    /// Rank-2 tensor indexed pointwise by the qmatmul dispatch row/column.
-    Pointwise(&'a Storage<F32, 2>),
+    /// Rank-1 f32 vector indexed by input/output column.
+    Column(&'a Storage),
+    /// Rank-2 f32 tensor indexed pointwise by the qmatmul dispatch row/column.
+    Pointwise(&'a Storage),
 }
 
 impl<'a> QmatmulEpilogues<'a> {

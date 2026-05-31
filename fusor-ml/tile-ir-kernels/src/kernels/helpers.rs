@@ -1,50 +1,81 @@
-use fusor_tile_ir::{
-    tile::{CoopAcc, CoopFragment, CoopRole, Storage, Tile, TileBlock, Workgroup},
-    CoopElement, FloatElement, Numeric, TileLiteral, F16, F32, U32,
-};
+use fusor_tile_ir::tile::{CoopAcc, Storage, Tile, TileBlock, WorkgroupTile};
+use fusor_tile_ir::{ElementType, ScalarElement, TileLiteral};
 
 use crate::types::QmatmulExtra;
 
-/// Storage-side conversion to/from an accumulator element type. The
-/// `<F32, F32>` and `<F16, F16>` impls are identity; the `<F16, F32>` impl
-/// inserts the cast pair that lets F16 storage be loaded into F32
-/// accumulators and stored back. Used by the unified
-/// `batched_matmul_with_epilogues<Stor, Accum, ...>` / `batched_gemv_*`
+/// Storage-side conversion to/from an accumulator element type. Runtime-typed
+/// (ARBOR_DESIGN.md §2): the storage and accumulator elements are
+/// [`ScalarElement`] data, not Rust marker types. The `F32 -> F32` /
+/// `F16 -> F16` cases are identity; the `F16 -> F32` case inserts the cast
+/// pair that lets F16 storage be loaded into F32 accumulators and stored back.
+/// Used by the unified `batched_matmul_with_epilogues` / `batched_gemv_*`
 /// kernels so we don't have to duplicate every body per (storage, accum) pair.
-pub trait AccumCast<Accum: FloatElement>: FloatElement {
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AccumCast {
+    storage: ScalarElement,
+    accum: ScalarElement,
+}
+
+impl AccumCast {
+    /// Promote `storage` loads into `accum` accumulators. Both must be float
+    /// scalars (`F32` or `F16`); the only non-identity pair is `F16 -> F32`.
+    pub fn new(storage: ScalarElement, accum: ScalarElement) -> Self {
+        assert!(
+            matches!(storage, ScalarElement::F32 | ScalarElement::F16),
+            "AccumCast storage element must be a float scalar"
+        );
+        assert!(
+            matches!(accum, ScalarElement::F32 | ScalarElement::F16),
+            "AccumCast accum element must be a float scalar"
+        );
+        Self { storage, accum }
+    }
+
+    /// The storage scalar element.
+    pub fn storage(&self) -> ScalarElement {
+        self.storage
+    }
+
+    /// The accumulator scalar element.
+    pub fn accum(&self) -> ScalarElement {
+        self.accum
+    }
+
     /// Storage-typed zero literal — for kernel load `fill` arguments.
-    const ZERO_STORAGE: TileLiteral;
+    pub fn zero_storage(&self) -> TileLiteral {
+        zero_literal(self.storage)
+    }
+
     /// Accumulator-typed zero literal — for fold init / select fallback.
-    const ZERO_ACCUM: TileLiteral;
+    pub fn zero_accum(&self) -> TileLiteral {
+        zero_literal(self.accum)
+    }
+
     /// Promote a freshly-loaded storage tile to the accumulator type.
-    fn into_accum(tile: Tile<Self>) -> Tile<Accum>
-    where
-        Self: Sized;
+    pub fn into_accum(&self, tile: Tile) -> Tile {
+        if self.storage == self.accum {
+            tile
+        } else {
+            tile.cast(self.accum.element())
+        }
+    }
+
     /// Demote a post-epilogue accumulator tile back to storage for the store.
-    fn from_accum(tile: Tile<Accum>) -> Tile<Self>
-    where
-        Self: Sized;
-}
-
-impl AccumCast<F32> for F32 {
-    const ZERO_STORAGE: TileLiteral = TileLiteral::F32(fusor_tile_ir::F32Bits(0));
-    const ZERO_ACCUM: TileLiteral = TileLiteral::F32(fusor_tile_ir::F32Bits(0));
-    fn into_accum(tile: Tile<F32>) -> Tile<F32> {
-        tile
-    }
-    fn from_accum(tile: Tile<F32>) -> Tile<F32> {
-        tile
+    pub fn from_accum(&self, tile: Tile) -> Tile {
+        if self.storage == self.accum {
+            tile
+        } else {
+            tile.cast(self.storage.element())
+        }
     }
 }
 
-impl AccumCast<F32> for F16 {
-    const ZERO_STORAGE: TileLiteral = TileLiteral::F16(0);
-    const ZERO_ACCUM: TileLiteral = TileLiteral::F32(fusor_tile_ir::F32Bits(0));
-    fn into_accum(tile: Tile<F16>) -> Tile<F32> {
-        tile.cast::<F32>()
-    }
-    fn from_accum(tile: Tile<F32>) -> Tile<F16> {
-        tile.cast::<F16>()
+fn zero_literal(element: ScalarElement) -> TileLiteral {
+    match element {
+        ScalarElement::F32 => TileLiteral::f32(0.0),
+        ScalarElement::F16 => TileLiteral::F16(0),
+        ScalarElement::U32 => TileLiteral::U32(0),
+        ScalarElement::Bool => TileLiteral::Bool(false),
     }
 }
 
@@ -57,7 +88,7 @@ pub(super) enum IndexComponent {
     /// Compile-time scalar component that can be folded into the base offset.
     Static(u32),
     /// Per-lane component that must remain in the tile expression.
-    Dynamic(Box<Tile<U32>>),
+    Dynamic(Box<Tile>),
 }
 
 /// Convert one scalar or per-lane value into an index component.
@@ -72,13 +103,13 @@ impl Index for u32 {
     }
 }
 
-impl Index for Tile<U32> {
+impl Index for Tile {
     fn into_component(self) -> IndexComponent {
         IndexComponent::Dynamic(Box::new(self))
     }
 }
 
-impl Index for &Tile<U32> {
+impl Index for &Tile {
     fn into_component(self) -> IndexComponent {
         IndexComponent::Dynamic(Box::new(self.clone()))
     }
@@ -180,7 +211,7 @@ pub(super) fn index_n<const R: usize>(
     offset: u32,
     strides: [u32; R],
     components: impl IntoIndexExpr<R>,
-) -> Tile<U32> {
+) -> Tile {
     let mut folded_offset = offset;
     let mut dynamic_components = Vec::with_capacity(R);
     for (component, stride) in components.into_indices().into_iter().zip(strides) {
@@ -210,15 +241,13 @@ pub(super) fn index_n<const R: usize>(
 /// `combine(lhs, rhs)` at each level. The combine closure is the only
 /// difference between sum/max/bitwise-or reductions, which previously each
 /// had their own near-identical loop.
-pub(super) fn reduce_workgroup<T>(
+pub(super) fn reduce_workgroup(
     program: &mut TileBlock<'_>,
-    scratch: Workgroup<T>,
-    lane: Tile<U32>,
-    combine: impl Fn(Tile<T>, Tile<T>) -> Tile<T>,
-) where
-    T: Numeric,
-{
-    let mut stride = program.block_size() as u32 / 2;
+    scratch: &WorkgroupTile,
+    lane: Tile,
+    combine: impl Fn(Tile, Tile) -> Tile,
+) {
+    let mut stride = program.block_size() / 2;
     while stride > 0 {
         let participates = program
             .index(lane.clone())
@@ -234,19 +263,33 @@ pub(super) fn reduce_workgroup<T>(
     }
 }
 
-/// Allocate a `rows x cols` grid of zero-initialized 8x8 cooperative
-/// accumulators. Shared between dense and quantized cooperative matmul.
-pub(super) fn zero_coop_acc_grid<T: CoopElement>(
+/// The 8x8 cooperative-matrix fragment shape shared by every coop helper.
+const COOP_DIM: u32 = 8;
+
+/// Allocate a `rows x cols` grid of cooperative accumulators, initializing each
+/// cell from `init`. The init closure receives `(program, grid_row, grid_col)`
+/// and returns the coop-`C` value to seed the accumulator — `coop_zero(..)` for
+/// the zero-init case, or a `coop_load_c_broadcast(..)` fragment for the
+/// preloaded-C case. Folds the old `zero_coop_acc_grid` + `coop_set_c_grid` into
+/// one shape (ARBOR_DESIGN.md §4: accumulators are mutable locals seeded through
+/// `store_local_coop`).
+pub(super) fn coop_acc_grid<Init>(
     program: &mut TileBlock<'_>,
+    scalar: ScalarElement,
     rows: u32,
     cols: u32,
-) -> Vec<Vec<CoopAcc<T, 8, 8>>> {
+    mut init: Init,
+) -> Vec<Vec<CoopAcc>>
+where
+    Init: FnMut(&mut TileBlock<'_>, u32, u32) -> Tile,
+{
     (0..rows)
-        .map(|_| {
+        .map(|r| {
             (0..cols)
-                .map(|_| {
-                    let acc = program.alloc_coop_acc::<T, 8, 8>();
-                    program.zero_coop_acc(&acc);
+                .map(|c| {
+                    let acc = program.alloc_coop_acc(scalar, COOP_DIM, COOP_DIM);
+                    let seed = init(program, r, c);
+                    program.store_local_coop(&acc, seed);
                     acc
                 })
                 .collect()
@@ -254,39 +297,79 @@ pub(super) fn zero_coop_acc_grid<T: CoopElement>(
         .collect()
 }
 
-/// Cooperatively load `rows` A-role 8x8 fragments from a workgroup tile.
-pub(super) fn coop_load_a_fragments<T: CoopElement>(
+/// Allocate a `rows x cols` grid of zero-initialized 8x8 cooperative
+/// accumulators. Shared between dense and quantized cooperative matmul.
+pub(super) fn zero_coop_acc_grid(
     program: &mut TileBlock<'_>,
-    tile: Workgroup<T>,
-    sg_row_base: &Tile<U32>,
+    scalar: ScalarElement,
+    rows: u32,
+    cols: u32,
+) -> Vec<Vec<CoopAcc>> {
+    coop_acc_grid(program, scalar, rows, cols, |program, _, _| {
+        program.coop_zero(scalar, COOP_DIM, COOP_DIM)
+    })
+}
+
+/// Allocate a `rows x cols` grid of cooperative accumulators seeded from a
+/// rank-1 column vector: every accumulator in grid-column `c` is initialized
+/// from the C-role broadcast fragment at `col_base + c * 8`. Folds the old
+/// `zero_coop_acc_grid` + `coop_load_c_broadcast_fragments` + `coop_set_c_grid`
+/// trio into one call (ARBOR_DESIGN.md §4) — the qmatmul "preloaded C" path.
+pub(super) fn coop_acc_grid_set_c(
+    program: &mut TileBlock<'_>,
+    vector: &Storage,
+    col_base: &Tile,
+    scalar: ScalarElement,
+    rows: u32,
+    cols: u32,
+) -> Vec<Vec<CoopAcc>> {
+    let c_frags = coop_load_c_broadcast_fragments(program, vector, col_base, cols, scalar);
+    coop_acc_grid(program, scalar, rows, cols, |_program, _r, c| {
+        c_frags[c as usize].clone()
+    })
+}
+
+/// Cooperatively load `rows` A-role 8x8 fragments from a workgroup tile.
+pub(super) fn coop_load_a_fragments(
+    program: &TileBlock<'_>,
+    tile: &WorkgroupTile,
+    sg_row_base: &Tile,
     kk: u32,
     rows: u32,
-) -> Vec<CoopFragment<T, 8, 8>> {
-    const COOP_DIM: u32 = 8;
+    scalar: ScalarElement,
+) -> Vec<Tile> {
     (0..rows)
         .map(|r| {
-            program.coop_load::<T, 8, 8>(
-                CoopRole::A,
-                program.coop_tile_load(tile, sg_row_base.clone() + r * COOP_DIM, kk * COOP_DIM),
+            program.coop_load_a(
+                tile,
+                sg_row_base.clone() + r * COOP_DIM,
+                kk * COOP_DIM,
+                scalar,
+                COOP_DIM,
+                COOP_DIM,
             )
         })
         .collect()
 }
 
 /// Cooperatively load `cols` B-role 8x8 fragments from a workgroup tile.
-pub(super) fn coop_load_b_fragments<T: CoopElement>(
-    program: &mut TileBlock<'_>,
-    tile: Workgroup<T>,
-    sg_col_base: &Tile<U32>,
+pub(super) fn coop_load_b_fragments(
+    program: &TileBlock<'_>,
+    tile: &WorkgroupTile,
+    sg_col_base: &Tile,
     kk: u32,
     cols: u32,
-) -> Vec<CoopFragment<T, 8, 8>> {
-    const COOP_DIM: u32 = 8;
+    scalar: ScalarElement,
+) -> Vec<Tile> {
     (0..cols)
         .map(|c| {
-            program.coop_load::<T, 8, 8>(
-                CoopRole::B,
-                program.coop_tile_load(tile, kk * COOP_DIM, sg_col_base.clone() + c * COOP_DIM),
+            program.coop_load_b(
+                tile,
+                kk * COOP_DIM,
+                sg_col_base.clone() + c * COOP_DIM,
+                scalar,
+                COOP_DIM,
+                COOP_DIM,
             )
         })
         .collect()
@@ -294,41 +377,42 @@ pub(super) fn coop_load_b_fragments<T: CoopElement>(
 
 /// Cooperatively load `cols` C-role fragments from a rank-1 column vector,
 /// broadcasting each 8-column slice across the fragment rows.
-pub(super) fn coop_load_c_broadcast_fragments<T: CoopElement>(
-    program: &mut TileBlock<'_>,
-    vector: &Storage<T, 1>,
-    col_base: &Tile<U32>,
+pub(super) fn coop_load_c_broadcast_fragments(
+    program: &TileBlock<'_>,
+    vector: &Storage,
+    col_base: &Tile,
     cols: u32,
-) -> Vec<CoopFragment<T, 8, 8>> {
-    const COOP_DIM: u32 = 8;
+    scalar: ScalarElement,
+) -> Vec<Tile> {
     (0..cols)
-        .map(|c| program.coop_load_broadcast_cols(vector, col_base.clone() + c * COOP_DIM))
+        .map(|c| {
+            program.coop_load_c_broadcast(
+                vector,
+                col_base.clone() + c * COOP_DIM,
+                scalar,
+                COOP_DIM,
+                COOP_DIM,
+            )
+        })
         .collect()
 }
 
-/// MMA every `a_frag` × `b_frag` pair into the matching accumulator.
-pub(super) fn coop_mma_grid<T: CoopElement>(
+/// MMA every `a_frag` × `b_frag` pair into the matching accumulator. Each cell
+/// emits `store_local_coop(acc, coop_mma(a, b, load_local_coop(acc)))`, which
+/// the lowerer threads through the coop acc-value SSA memo
+/// (ARBOR_DESIGN.md §6).
+pub(super) fn coop_mma_grid(
     program: &mut TileBlock<'_>,
-    accs: &[Vec<CoopAcc<T, 8, 8>>],
-    a_frags: &[CoopFragment<T, 8, 8>],
-    b_frags: &[CoopFragment<T, 8, 8>],
+    accs: &[Vec<CoopAcc>],
+    a_frags: &[Tile],
+    b_frags: &[Tile],
 ) {
     for (r, a) in a_frags.iter().enumerate() {
         for (c, b) in b_frags.iter().enumerate() {
-            program.coop_mma(&accs[r][c], a, b);
-        }
-    }
-}
-
-/// Initialize every accumulator row from a C-role column-broadcast fragment.
-pub(super) fn coop_set_c_grid<T: CoopElement>(
-    program: &mut TileBlock<'_>,
-    accs: &[Vec<CoopAcc<T, 8, 8>>],
-    c_frags: &[CoopFragment<T, 8, 8>],
-) {
-    for row_accs in accs {
-        for (c, acc) in row_accs.iter().enumerate() {
-            program.coop_set_acc(acc, &c_frags[c]);
+            let acc = &accs[r][c];
+            let c_value = program.load_local_coop(acc);
+            let mma = program.coop_mma(a.clone(), b.clone(), c_value);
+            program.store_local_coop(acc, mma);
         }
     }
 }
@@ -352,10 +436,10 @@ pub(super) fn dispatch_grid_1d(total_workgroups: u32, max_per_dim: u32) -> [u32;
 pub(super) fn load_qmatmul_extra(
     program: &mut TileBlock<'_>,
     extra: &QmatmulExtra<'_>,
-    row: &Tile<U32>,
-    col: &Tile<U32>,
+    row: &Tile,
+    col: &Tile,
     n_cols: u32,
-) -> Tile<F32> {
+) -> Tile {
     match extra {
         QmatmulExtra::Column(vector) => program.load(vector.at(col), col.lt(n_cols), 0.0),
         QmatmulExtra::Pointwise(tensor) => program.load(tensor.at((row, col)), col.lt(n_cols), 0.0),
@@ -367,17 +451,16 @@ pub(super) fn load_qmatmul_extra(
 /// kernels pass the batch row offset; single-batch quantized matmul passes
 /// `None`.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn coop_store_acc_grid<T: CoopElement>(
+pub(super) fn coop_store_acc_grid(
     program: &mut TileBlock<'_>,
-    accs: &[Vec<CoopAcc<T, 8, 8>>],
-    y: &Storage<T, 2>,
-    y_batch_base: Option<&Tile<U32>>,
-    row_base: &Tile<U32>,
-    col_base: &Tile<U32>,
-    sg_row_base: &Tile<U32>,
-    sg_col_base: &Tile<U32>,
+    accs: &[Vec<CoopAcc>],
+    y: &Storage,
+    y_batch_base: Option<&Tile>,
+    row_base: &Tile,
+    col_base: &Tile,
+    sg_row_base: &Tile,
+    sg_col_base: &Tile,
 ) {
-    const COOP_DIM: u32 = 8;
     for (r, row_accs) in accs.iter().enumerate() {
         for (c, acc) in row_accs.iter().enumerate() {
             let local_row = row_base.clone() + sg_row_base.clone() + r as u32 * COOP_DIM;
@@ -389,4 +472,38 @@ pub(super) fn coop_store_acc_grid<T: CoopElement>(
             program.coop_store(acc, y, row, col);
         }
     }
+}
+
+/// The scalar component of a (possibly vector / coop) element type. Used by the
+/// ported coop helpers where the fragment scalar must be recovered from a
+/// runtime [`ElementType`].
+pub(super) fn scalar_of(element: ElementType) -> ScalarElement {
+    match element {
+        ElementType::F32 => ScalarElement::F32,
+        ElementType::F16 => ScalarElement::F16,
+        ElementType::U32 => ScalarElement::U32,
+        ElementType::Bool => ScalarElement::Bool,
+        ElementType::Vector { scalar, .. } => scalar,
+        ElementType::CoopMatrix { scalar, .. } => scalar,
+    }
+}
+
+/// Zero literal for a float `element` (F32 or F16). Panics on other types —
+/// callers (flash / softmax) only ever stage F32 and F16.
+pub(super) fn zero_fill(element: ElementType) -> TileLiteral {
+    match scalar_of(element) {
+        ScalarElement::F32 => TileLiteral::f32(0.0),
+        ScalarElement::F16 => TileLiteral::F16(0),
+        _ => panic!("only F32 and F16 element types are supported"),
+    }
+}
+
+/// Whether `element`'s scalar is a float (F32 or F16).
+pub(super) fn supports_float(element: ElementType) -> bool {
+    matches!(scalar_of(element), ScalarElement::F32 | ScalarElement::F16)
+}
+
+/// A `u32` literal tile.
+pub(super) fn u32_tile(value: u32) -> Tile {
+    Tile::literal(TileLiteral::U32(value))
 }

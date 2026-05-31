@@ -1,27 +1,31 @@
-use super::block::tiles_to_exprs;
-use super::value::boxed_u32_literal;
-use super::*;
+use super::block::load_local_expr;
+use super::value::FoldIter;
+use super::{Tile, TileBlock};
 use crate::ir::{
-    ElementType, Expr, Layout, LocalRef, MemoryLevel, Numeric, ScalarElement, Shape, TileBinaryOp,
-    TileLiteral, TileReduceOp, TileStmt, F32, U32,
+    Accumulator, ElementType, Expr, ExprKind, Layout, MemoryLevel, ReduceKind, ScalarElement,
+    Shape, TileBinaryOp, TileLiteral, TileReduceOp,
 };
 
 macro_rules! tile_reduce_entrypoints {
     ($(($reduce:ident, $loop_reduce:ident, $group_reduce:ident, $subgroup_reduce:ident, $op:ident)),+ $(,)?) => {
         $(
-            pub fn $reduce<T: Numeric>(&mut self, value: Tile<T>) -> Tile<T> {
+            /// Cross-lane reduction across the whole workgroup.
+            pub fn $reduce(&mut self, value: Tile) -> Tile {
                 self.reduce(TileReduceOp::$op, value)
             }
-            pub fn $loop_reduce<T: Numeric, F>(&mut self, iterations: u32, body: F) -> Tile<T>
+            /// Per-lane accumulation across `iterations`, then a workgroup tree.
+            pub fn $loop_reduce<F>(&mut self, iterations: u32, body: F) -> Tile
             where
-                F: FnOnce(&mut Self, Tile<U32>) -> Tile<T>,
+                F: FnOnce(&mut Self, Tile) -> Tile,
             {
                 self.loop_reduce(TileReduceOp::$op, iterations, body)
             }
-            pub fn $group_reduce<T: Numeric>(&mut self, group_size: u32, value: Tile<T>) -> Tile<T> {
-                self.group_reduce::<T>(TileReduceOp::$op, group_size, value)
+            /// Cross-lane reduction over contiguous-lane groups of `group_size`.
+            pub fn $group_reduce(&mut self, group_size: u32, value: Tile) -> Tile {
+                self.group_reduce(TileReduceOp::$op, group_size, value)
             }
-            pub fn $subgroup_reduce<T: Numeric>(&self, value: Tile<T>) -> Tile<T> {
+            /// Reduction across one subgroup.
+            pub fn $subgroup_reduce(&self, value: Tile) -> Tile {
                 self.subgroup_reduce(TileReduceOp::$op, value)
             }
         )+
@@ -29,144 +33,6 @@ macro_rules! tile_reduce_entrypoints {
 }
 
 impl TileBlock<'_> {
-    pub fn sum<T: Numeric>(&self, values: impl IntoIterator<Item = Tile<T>>) -> Tile<T> {
-        let mut exprs = tiles_to_exprs(values);
-        if exprs.is_empty() {
-            return Tile::from_expr(zero_expr(T::ELEMENT));
-        }
-        while exprs.len() > 1 {
-            let mut next = Vec::with_capacity(exprs.len().div_ceil(2));
-            let mut iter = exprs.into_iter();
-            while let Some(left) = iter.next() {
-                match iter.next() {
-                    Some(right) => next.push(Expr::Binary {
-                        op: TileBinaryOp::Add,
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    }),
-                    None => next.push(left),
-                }
-            }
-            exprs = next;
-        }
-        Tile::from_expr(exprs.pop().expect("at least one element"))
-    }
-
-    pub fn fold<const N: usize, F>(
-        &mut self,
-        iter: super::FoldIter,
-        initial: [Tile<F32>; N],
-        body: F,
-    ) -> [Tile<F32>; N]
-    where
-        F: FnOnce(&mut Self, Tile<U32>, [Tile<F32>; N]) -> [Tile<F32>; N],
-    {
-        assert!(N > 0);
-        let initial_exprs = tiles_to_exprs(initial);
-        let iter_var_local = self.program.alloc_local::<U32>();
-        let acc_locals: [LocalRef; N] = std::array::from_fn(|_| self.program.alloc_local::<F32>());
-        self.stmt_stack.push(Vec::new());
-        let iter_element = Tile::from_expr(Expr::LoadLocal(iter_var_local));
-        let acc_tiles: [Tile<F32>; N] =
-            std::array::from_fn(|i| Tile::from_expr(Expr::LoadLocal(acc_locals[i])));
-        let new_state = body(self, iter_element, acc_tiles);
-        let body_stmts = self.stmt_stack.pop().expect("fold body frame missing");
-        let accumulators = new_state
-            .into_iter()
-            .enumerate()
-            .map(|(i, new)| crate::ir::FoldAccumulator {
-                name: acc_locals[i].id,
-                element: acc_locals[i].element,
-                init: initial_exprs[i].clone(),
-                update: new.expr,
-            })
-            .collect();
-        self.push_stmt(TileStmt::Fold {
-            count: iter.count,
-            iter_var: iter_var_local.id,
-            body: body_stmts,
-            accumulators,
-        });
-        std::array::from_fn(|i| Tile::from_expr(Expr::LoadLocal(acc_locals[i])))
-    }
-
-    pub fn loop_fold_n<const N: usize, T: Numeric, F>(
-        &mut self,
-        op: TileReduceOp,
-        iterations: u32,
-        initials: [TileLiteral; N],
-        body: F,
-    ) -> [Tile<T>; N]
-    where
-        F: FnOnce(&mut Self, Tile<U32>) -> [Tile<T>; N],
-    {
-        let result = self.loop_fold_vec(op, iterations, initials.to_vec(), |slf, iter| {
-            body(slf, iter).to_vec()
-        });
-        let mut iter = result.into_iter();
-        std::array::from_fn(|_| iter.next().expect("loop_fold_vec returned wrong arity"))
-    }
-
-    /// Runtime-sized variant of [`loop_fold_n`]. The number of accumulators
-    /// is determined by `initials.len()`; the body closure must return a Vec
-    /// of the same length.
-    pub fn loop_fold_vec<T: Numeric, F>(
-        &mut self,
-        op: TileReduceOp,
-        iterations: u32,
-        initials: Vec<TileLiteral>,
-        body: F,
-    ) -> Vec<Tile<T>>
-    where
-        F: FnOnce(&mut Self, Tile<U32>) -> Vec<Tile<T>>,
-    {
-        let n = initials.len();
-        assert!(iterations > 0);
-        assert!(n > 0);
-        for initial in &initials {
-            assert_eq!(initial.element(), T::ELEMENT);
-        }
-        let acc_locals: Vec<LocalRef> = (0..n).map(|_| self.program.alloc_local::<T>()).collect();
-        let iter_var_local = self.program.alloc_local::<U32>();
-        self.stmt_stack.push(Vec::new());
-        let bodies = body(self, Tile::from_expr(Expr::LoadLocal(iter_var_local)));
-        assert_eq!(
-            bodies.len(),
-            n,
-            "loop_fold_vec body returned {} lanes, expected {n}",
-            bodies.len()
-        );
-        let body_stmts = self
-            .stmt_stack
-            .pop()
-            .expect("loop_fold_vec body frame missing");
-        let binary_op = op.binary();
-        let accumulators = bodies
-            .into_iter()
-            .enumerate()
-            .map(|(i, lane_value)| crate::ir::FoldAccumulator {
-                name: acc_locals[i].id,
-                element: acc_locals[i].element,
-                init: Expr::Literal(initials[i]),
-                update: Expr::Binary {
-                    op: binary_op,
-                    left: Box::new(Expr::LoadLocal(acc_locals[i])),
-                    right: Box::new(lane_value.expr),
-                },
-            })
-            .collect();
-        self.push_stmt(TileStmt::Fold {
-            count: boxed_u32_literal(iterations),
-            iter_var: iter_var_local.id,
-            body: body_stmts,
-            accumulators,
-        });
-        acc_locals
-            .into_iter()
-            .map(|local| Tile::from_expr(Expr::LoadLocal(local)))
-            .collect()
-    }
-
     tile_reduce_entrypoints!(
         (
             reduce_sum,
@@ -191,121 +57,196 @@ impl TileBlock<'_> {
         ),
     );
 
-    pub fn loop_fold<T: Numeric, F>(
+    /// Pairwise tree-sum of a set of values into a single value (no cross-lane
+    /// communication). Returns the zero of `element` for an empty input.
+    pub fn sum(&self, values: impl IntoIterator<Item = Tile>, element: ElementType) -> Tile {
+        let mut exprs: Vec<Expr> = values.into_iter().map(Tile::into_expr).collect();
+        if exprs.is_empty() {
+            return Tile::from_expr(zero_expr(element));
+        }
+        while exprs.len() > 1 {
+            let mut next = Vec::with_capacity(exprs.len().div_ceil(2));
+            let mut iter = exprs.into_iter();
+            while let Some(left) = iter.next() {
+                match iter.next() {
+                    Some(right) => {
+                        let ty = left.element();
+                        next.push(Expr::new(
+                            ExprKind::Binary {
+                                op: TileBinaryOp::Add,
+                                left: Box::new(left),
+                                right: Box::new(right),
+                            },
+                            ty,
+                        ));
+                    }
+                    None => next.push(left),
+                }
+            }
+            exprs = next;
+        }
+        Tile::from_expr(exprs.pop().expect("at least one element"))
+    }
+
+    /// Counted loop carrying `N` f32 accumulators. The body returns the new
+    /// accumulator values each iteration; the loop returns the final values.
+    pub fn fold<const N: usize, F>(
         &mut self,
-        op: TileReduceOp,
-        iterations: u32,
-        initial: TileLiteral,
+        iter: FoldIter,
+        initial: [Tile; N],
         body: F,
-    ) -> Tile<T>
+    ) -> [Tile; N]
     where
-        F: FnOnce(&mut Self, Tile<U32>) -> Tile<T>,
+        F: FnOnce(&mut Self, Tile, [Tile; N]) -> [Tile; N],
     {
-        assert!(iterations > 0);
-        assert_eq!(initial.element(), T::ELEMENT);
-        let acc_local = self.program.alloc_local::<T>();
-        let iter_var_local = self.program.alloc_local::<U32>();
-        self.stmt_stack.push(Vec::new());
-        let value = body(self, Tile::from_expr(Expr::LoadLocal(iter_var_local)));
-        let body_stmts = self.stmt_stack.pop().expect("loop_fold body frame missing");
-        self.push_stmt(TileStmt::Fold {
-            count: boxed_u32_literal(iterations),
-            iter_var: iter_var_local.id,
-            body: body_stmts,
-            accumulators: vec![crate::ir::FoldAccumulator {
-                name: acc_local.id,
-                element: acc_local.element,
-                init: Expr::Literal(initial),
-                update: Expr::Binary {
-                    op: op.binary(),
-                    left: Box::new(Expr::LoadLocal(acc_local)),
-                    right: Box::new(value.expr),
-                },
-            }],
+        assert!(N > 0);
+        let result = self.fold_vec(iter, initial.into_iter().collect(), |slf, idx, accs| {
+            let accs: [Tile; N] = accs
+                .try_into()
+                .unwrap_or_else(|_| panic!("fold accumulator arity mismatch"));
+            body(slf, idx, accs).into_iter().collect()
         });
-        Tile::from_expr(Expr::LoadLocal(acc_local))
+        result
+            .try_into()
+            .unwrap_or_else(|_| panic!("fold returned wrong arity"))
     }
 
-    fn subgroup_reduce<T: Numeric>(&self, op: TileReduceOp, value: Tile<T>) -> Tile<T> {
-        Tile::from_expr(Expr::SubgroupReduce {
-            op,
-            value: Box::new(value.expr),
-        })
-    }
-
-    fn group_reduce<T: Numeric>(
-        &mut self,
-        op: TileReduceOp,
-        group_size: u32,
-        value: Tile<T>,
-    ) -> Tile<T> {
-        let block = self.block_size() as u32;
-        assert!(group_size > 0 && group_size <= block && group_size.is_power_of_two());
-        let scratch = self.program.alloc_tile::<T>(Layout::contiguous(
-            MemoryLevel::Workgroup,
-            Shape::new([block]),
-        ));
-        Tile::from_expr(Expr::Reduce {
-            op,
-            iterations: 1,
-            iter_var: None,
-            value: Box::new(value.expr),
-            scratch: scratch.into(),
-            group_size,
-        })
-    }
-
-    fn reduce<T: Numeric>(&mut self, op: TileReduceOp, value: Tile<T>) -> Tile<T> {
-        let block = self.block_size();
-        let scratch = self.program.alloc_tile::<T>(Layout::contiguous(
-            MemoryLevel::Workgroup,
-            Shape::new([block as u32]),
-        ));
-        Tile::from_expr(Expr::Reduce {
-            op,
-            iterations: 1,
-            iter_var: None,
-            value: Box::new(value.expr),
-            scratch: scratch.into(),
-            group_size: block as u32,
-        })
-    }
-
-    fn loop_reduce<T: Numeric, F>(&mut self, op: TileReduceOp, iterations: u32, body: F) -> Tile<T>
+    /// Runtime-sized [`fold`](Self::fold). The body must return a Vec the same
+    /// length as `initial`.
+    pub fn fold_vec<F>(&mut self, iter: FoldIter, initial: Vec<Tile>, body: F) -> Vec<Tile>
     where
-        F: FnOnce(&mut Self, Tile<U32>) -> Tile<T>,
+        F: FnOnce(&mut Self, Tile, Vec<Tile>) -> Vec<Tile>,
+    {
+        let n = initial.len();
+        assert!(n > 0, "fold needs at least one accumulator");
+        let acc_locals: Vec<_> = initial
+            .iter()
+            .map(|t| self.program.alloc_local(t.element()))
+            .collect();
+        let index = self.program.alloc_local(ElementType::U32);
+
+        self.open_frame();
+        let acc_tiles: Vec<Tile> = acc_locals
+            .iter()
+            .map(|l| load_local_expr(l.decl()))
+            .collect();
+        let new_state = body(self, load_local_expr(index.decl()), acc_tiles);
+        assert_eq!(new_state.len(), n, "fold body returned wrong arity");
+        let body_stmts = self.close_frame();
+
+        let accumulators: Vec<Accumulator> = acc_locals
+            .iter()
+            .zip(initial)
+            .zip(new_state)
+            .map(|((local, init), update)| Accumulator {
+                local: local.decl().clone(),
+                init: init.into_expr(),
+                update: update.into_expr(),
+            })
+            .collect();
+
+        self.push_counted_loop(
+            iter.count_expr(),
+            Some(index.decl().clone()),
+            accumulators,
+            body_stmts,
+        );
+
+        acc_locals
+            .into_iter()
+            .map(|l| load_local_expr(l.decl()))
+            .collect()
+    }
+
+    // ---- internals -------------------------------------------------------
+
+    fn subgroup_reduce(&self, op: TileReduceOp, value: Tile) -> Tile {
+        let ty = value.element();
+        Tile::new(
+            ExprKind::Reduce {
+                op,
+                kind: ReduceKind::Subgroup,
+                value: Box::new(value.into_expr()),
+            },
+            ty,
+        )
+    }
+
+    fn group_reduce(&mut self, op: TileReduceOp, group_size: u32, value: Tile) -> Tile {
+        let block = self.block_size();
+        assert!(group_size > 0 && group_size <= block && group_size.is_power_of_two());
+        let scratch = self.alloc_reduce_scratch(value.element());
+        let ty = value.element();
+        Tile::new(
+            ExprKind::Reduce {
+                op,
+                kind: ReduceKind::Workgroup {
+                    scratch: scratch.decl().clone(),
+                    group_size,
+                },
+                value: Box::new(value.into_expr()),
+            },
+            ty,
+        )
+    }
+
+    fn reduce(&mut self, op: TileReduceOp, value: Tile) -> Tile {
+        let block = self.block_size();
+        self.group_reduce(op, block, value)
+    }
+
+    fn loop_reduce<F>(&mut self, op: TileReduceOp, iterations: u32, body: F) -> Tile
+    where
+        F: FnOnce(&mut Self, Tile) -> Tile,
     {
         assert!(iterations > 0);
         let block = self.block_size();
-        let scratch = self.program.alloc_tile::<T>(Layout::contiguous(
-            MemoryLevel::Workgroup,
-            Shape::new([block as u32]),
-        ));
-        let iter_var_local = self.program.alloc_local::<U32>();
-        self.stmt_stack.push(Vec::new());
-        let value = body(self, Tile::from_expr(Expr::LoadLocal(iter_var_local)));
-        let leaked = self
-            .stmt_stack
-            .pop()
-            .expect("loop_reduce body frame missing");
-        assert!(leaked.is_empty());
-        Tile::from_expr(Expr::Reduce {
-            op,
-            iterations,
-            iter_var: Some(iter_var_local.id),
-            value: Box::new(value.expr),
-            scratch: scratch.into(),
-            group_size: block as u32,
-        })
+        let index = self.program.alloc_local(ElementType::U32);
+        self.open_frame();
+        let value = body(self, load_local_expr(index.decl()));
+        let leaked = self.close_frame();
+        assert!(
+            leaked.is_empty(),
+            "loop_reduce body must be side-effect-free"
+        );
+        let scratch = self.alloc_reduce_scratch(value.element());
+        let ty = value.element();
+        Tile::new(
+            ExprKind::Reduce {
+                op,
+                kind: ReduceKind::Loop {
+                    iterations,
+                    index: index.decl().clone(),
+                    scratch: scratch.decl().clone(),
+                    group_size: block,
+                },
+                value: Box::new(value.into_expr()),
+            },
+            ty,
+        )
+    }
+
+    fn alloc_reduce_scratch(&mut self, element: ElementType) -> super::value::WorkgroupTile {
+        let block = self.block_size();
+        self.program.alloc_tile(
+            element,
+            Layout::contiguous(MemoryLevel::Workgroup, Shape::new([block])),
+        )
+    }
+}
+
+impl FoldIter {
+    pub(super) fn count_expr(self) -> Expr {
+        *self.count
     }
 }
 
 fn zero_expr(element: ElementType) -> Expr {
-    match element {
-        ElementType::F32 => Expr::Literal(TileLiteral::f32(0.0)),
-        ElementType::F16 => Expr::Literal(TileLiteral::F16(0)),
-        ElementType::U32 => Expr::Literal(TileLiteral::U32(0)),
-        ElementType::Bool => Expr::Literal(TileLiteral::Bool(false)),
+    let kind = match element {
+        ElementType::F32 => ExprKind::Literal(TileLiteral::f32(0.0)),
+        ElementType::F16 => ExprKind::Literal(TileLiteral::F16(0)),
+        ElementType::U32 => ExprKind::Literal(TileLiteral::U32(0)),
+        ElementType::Bool => ExprKind::Literal(TileLiteral::Bool(false)),
         ElementType::Vector { scalar, lanes } => {
             let literal = match scalar {
                 ScalarElement::F32 => TileLiteral::f32(0.0),
@@ -313,12 +254,19 @@ fn zero_expr(element: ElementType) -> Expr {
                 ScalarElement::U32 => TileLiteral::U32(0),
                 ScalarElement::Bool => TileLiteral::Bool(false),
             };
-            Expr::ComposeVector {
-                scalar,
-                lanes,
-                values: (0..lanes).map(|_| Expr::Literal(literal)).collect(),
-            }
+            let parts = (0..lanes)
+                .map(|_| Expr::new(ExprKind::Literal(literal), scalar.element()))
+                .collect();
+            return Expr::new(
+                ExprKind::Vec {
+                    scalar,
+                    lanes,
+                    parts,
+                },
+                element,
+            );
         }
-        ElementType::CoopMatrix { .. } => panic!("unsupported cooperative matrix sum"),
-    }
+        ElementType::CoopMatrix { .. } => panic!("cannot zero a cooperative-matrix value"),
+    };
+    Expr::new(kind, element)
 }

@@ -1,7 +1,7 @@
 //! Quantized matrix program inputs.
 
 use fusor_tile_ir::tile::{Program, Storage};
-use fusor_tile_ir::{GgmlQuantFormat, KernelBuilder, QuantizedMatrix, Shape, U32};
+use fusor_tile_ir::{ElementType, GgmlQuantFormat, KernelBuilder, QuantizedMatrix, Shape};
 
 /// Declare a quantized matrix on a [`KernelBuilder`] and remember its runtime
 /// binding.
@@ -53,7 +53,7 @@ pub fn quantized_matrix(
         .and_then(|blocks| blocks.checked_mul(format.block_bytes()))
         .map(|bytes| bytes.div_ceil(4))
         .expect("quantized matrix word count overflow");
-    let data: Storage<U32, 1> = program.storage_read(Shape::new([words]));
+    let data: Storage = program.storage_read(ElementType::U32, Shape::new([words]));
     QuantizedMatrix {
         data: data.view().clone(),
         format,

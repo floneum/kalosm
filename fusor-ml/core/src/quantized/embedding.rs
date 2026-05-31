@@ -46,18 +46,17 @@ fn emit_qembedding_kernel(
         embedding_dim,
         num_embeddings,
     );
-    let indexes = kb.read::<tile_ir::U32, 2>(tile_ir::KernelTensorRef::with_offset(
-        indexes_buffer,
-        indexes_layout,
-        indexes_offset,
-    ));
-    let y = kb.write_element::<2>(
+    let indexes = kb.read(
+        tile_ir::ElementType::U32,
+        tile_ir::KernelTensorRef::with_offset(indexes_buffer, indexes_layout, indexes_offset),
+    );
+    let y = kb.write(
         output_element,
         tile_ir::KernelTensorRef::with_offset(output_buffer, output_layout, output_offset),
     );
 
     kb.program()
-        .program_grid::<BLOCK>(dispatch_size, |program| {
+        .program_grid(BLOCK as u32, dispatch_size, |program| {
             let lane = program.lane();
             let group = program.program_id(tile_ir::WorkgroupAxis::X)
                 + program.program_id(tile_ir::WorkgroupAxis::Y) * dispatch_size[0];
@@ -71,7 +70,7 @@ fn emit_qembedding_kernel(
                 tile_ir::TileLiteral::U32(0),
             );
             let value = program.load_quantized(&q, dim.clone(), token, in_bounds.clone(), 0.0);
-            program.store_element(y.at((index_pos, dim)), value, in_bounds);
+            program.store_cast(y.at((index_pos, dim)), value, in_bounds);
         });
     Some(())
 }

@@ -1,9 +1,9 @@
 use fusor_tile_ir::{
-    tile::{self, Mask, Tile, TileBlock},
-    TileLiteral, TileUnaryOp, F32, U32,
+    tile::{Mask, Storage, Tile, TileBlock},
+    ElementType, ScalarElement, TileLiteral, TileUnaryOp,
 };
 
-use super::helpers::{index_n, NEG_MAX_F32, TOP_K_BLOCK};
+use super::helpers::{index_n, reduce_workgroup, NEG_MAX_F32, TOP_K_BLOCK};
 use super::types::Mirostat2Meta;
 
 const GPU_SAMPLE_STATUS_RETRY_NEEDED: u32 = 0;
@@ -12,9 +12,9 @@ const GPU_SAMPLE_STATUS_INVALID: u32 = 2;
 
 fn mirostat_top_value(
     program: &TileBlock<'_>,
-    values: &tile::Storage<F32, 1>,
+    values: &Storage,
     meta: Mirostat2Meta,
-    index: Tile<U32>,
+    index: Tile,
 ) -> Tile {
     let index = index_n(meta.values_offset, [meta.values_stride], index);
     program.load(values.at(index), Mask::all(), TileLiteral::f32(NEG_MAX_F32))
@@ -22,34 +22,29 @@ fn mirostat_top_value(
 
 fn mirostat_top_id(
     program: &TileBlock<'_>,
-    ids: &tile::Storage<U32, 1>,
+    ids: &Storage,
     meta: Mirostat2Meta,
-    index: Tile<U32>,
-) -> Tile<U32> {
+    index: Tile,
+) -> Tile {
     let index = index_n(meta.ids_offset, [meta.ids_stride], index);
     program.load(ids.at(index), Mask::all(), TileLiteral::U32(u32::MAX))
 }
 
 fn mirostat_top_weight(
     program: &TileBlock<'_>,
-    values: &tile::Storage<F32, 1>,
+    values: &Storage,
     meta: Mirostat2Meta,
     max_value: Tile,
-    index: Tile<U32>,
+    index: Tile,
 ) -> Tile {
     (mirostat_top_value(program, values, meta, index) - max_value).exp()
 }
 
-fn load_param_f32(program: &TileBlock<'_>, params: &tile::Storage<F32, 1>, index: u32) -> Tile {
+fn load_param_f32(program: &TileBlock<'_>, params: &Storage, index: u32) -> Tile {
     program.load(params.at(index), Mask::all(), TileLiteral::f32(0.0))
 }
 
-fn store_sample_result(
-    program: &mut TileBlock<'_>,
-    output: &tile::Storage<U32, 1>,
-    status: u32,
-    token: Tile<U32>,
-) {
+fn store_sample_result(program: &mut TileBlock<'_>, output: &Storage, status: u32, token: Tile) {
     program.store(
         output.at(0),
         Tile::literal(TileLiteral::U32(status)),
@@ -127,26 +122,25 @@ pub fn mirostat2<B>(kb: &mut fusor_tile_ir::KernelBuilder<B>, spec: Mirostat2<B>
         return None;
     }
 
-    let ids = kb.read::<U32, 1>(ids);
-    let values = kb.read::<F32, 1>(values);
-    let state = kb.write::<F32, 1>(state);
-    let params = kb.read::<F32, 1>(params);
-    let output = kb.write::<U32, 1>(output);
-    let exactness_flag = exactness_flag.map(|tensor| kb.read::<U32, 1>(tensor));
+    let ids = kb.read(ElementType::U32, ids);
+    let values = kb.read(ElementType::F32, values);
+    let state = kb.write(ElementType::F32, state);
+    let params = kb.read(ElementType::F32, params);
+    let output = kb.write(ElementType::U32, output);
+    let exactness_flag = exactness_flag.map(|tensor| kb.read(ElementType::U32, tensor));
     let phase = kb.program();
-    let scratch = phase.alloc_workgroup_array::<F32>(TOP_K_BLOCK as u32);
+    let scratch = phase.alloc_workgroup_array(ScalarElement::F32, TOP_K_BLOCK as u32);
 
-    phase.program_grid::<TOP_K_BLOCK>([1, 1, 1], |program| {
+    phase.program_grid(TOP_K_BLOCK as u32, [1, 1, 1], |program| {
         let lane = program.lane();
-        let index = program.private::<U32>();
-        let local_sum = program.private::<F32>();
-        let reduce_step = program.private::<U32>();
-        let cutoff = program.private::<U32>();
-        let scan = program.private::<U32>();
-        let cutoff_sum = program.private::<F32>();
-        let cumulative = program.private::<F32>();
-        let selected = program.private::<U32>();
-        let selected_probability = program.private::<F32>();
+        let index = program.private(ElementType::U32);
+        let local_sum = program.private(ElementType::F32);
+        let cutoff = program.private(ElementType::U32);
+        let scan = program.private(ElementType::U32);
+        let cutoff_sum = program.private(ElementType::F32);
+        let cumulative = program.private(ElementType::F32);
+        let selected = program.private(ElementType::U32);
+        let selected_probability = program.private(ElementType::F32);
 
         if let Some(exactness_flag) = &exactness_flag {
             let flag = program.load(exactness_flag.at(0), Mask::all(), TileLiteral::U32(0));
@@ -207,27 +201,10 @@ pub fn mirostat2<B>(kb: &mut fusor_tile_ir::KernelBuilder<B>, spec: Mirostat2<B>
         });
 
         let local_sum_value = program.load_local(&local_sum);
-        program.store_workgroup(scratch, lane.clone(), local_sum_value);
+        program.store_workgroup(&scratch, lane.clone(), local_sum_value);
         program.workgroup_barrier();
 
-        program.store_local(
-            &reduce_step,
-            Tile::literal(TileLiteral::U32(TOP_K_BLOCK as u32 / 2)),
-        );
-        program.loop_forever(|program| {
-            let step = program.load_local(&reduce_step);
-            program.break_if(step.clone().eq(Tile::literal(TileLiteral::U32(0))));
-            let participates = program.index(lane.clone()).lt(step.clone());
-            program.if_then(participates, |program| {
-                let rhs_index = program.index(lane.clone()) + step.clone();
-                let lhs = program.load_workgroup(scratch, lane.clone());
-                let rhs = program.load_workgroup(scratch, rhs_index);
-                program.store_workgroup(scratch, lane.clone(), lhs + rhs);
-            });
-            program.workgroup_barrier();
-            let step = program.load_local(&reduce_step);
-            program.store_local(&reduce_step, step / Tile::literal(TileLiteral::U32(2)));
-        });
+        reduce_workgroup(program, &scratch, lane.clone(), |lhs, rhs| lhs + rhs);
 
         let first_lane = program
             .index(lane.clone())
@@ -236,7 +213,7 @@ pub fn mirostat2<B>(kb: &mut fusor_tile_ir::KernelBuilder<B>, spec: Mirostat2<B>
             first_lane,
             |program| {
                 let epsilon = Tile::literal(TileLiteral::f32(1.0e-20));
-                let total = program.load_workgroup(scratch, 0).max(epsilon.clone());
+                let total = program.load_workgroup(&scratch, 0).max(epsilon.clone());
                 let mu = program.load(state.at(0), Mask::all(), TileLiteral::f32(0.0));
                 program.store_local(&cutoff, Tile::literal(TileLiteral::U32(0)));
                 program.store_local(&scan, Tile::literal(TileLiteral::U32(0)));

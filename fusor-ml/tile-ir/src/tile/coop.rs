@@ -1,279 +1,175 @@
-use std::marker::PhantomData;
-
-use super::value::boxed_index;
-use super::*;
-use crate::ir::{
-    CoopElement, CoopMatrixRole, CoopOperandRole, ElementType, Expr, Numeric, TileRef, TileStmt,
-    U32,
-};
-
-/// Workgroup tile coordinates for `TileBlock::mma_from_tiles`.
-pub struct CoopTileLoad {
-    tile: TileRef,
-    row: Box<Expr>,
-    col: Box<Expr>,
-}
-
-/// Cooperative-matrix operand role for generic fragment loads.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CoopRole {
-    /// Load an A operand fragment.
-    A,
-    /// Load a B operand fragment.
-    B,
-    /// Load a C/accumulator operand fragment.
-    C,
-}
-
-impl From<CoopRole> for CoopOperandRole {
-    fn from(value: CoopRole) -> Self {
-        match value {
-            CoopRole::A => Self::A,
-            CoopRole::B => Self::B,
-            CoopRole::C => Self::C,
-        }
-    }
-}
-
-impl CoopTileLoad {
-    /// Create a cooperative tile-load descriptor.
-    pub fn new(
-        tile: impl Into<TileRef>,
-        row: impl Into<Tile<U32>>,
-        col: impl Into<Tile<U32>>,
-    ) -> Self {
-        Self {
-            tile: tile.into(),
-            row: boxed_index(row),
-            col: boxed_index(col),
-        }
-    }
-}
+use super::block::load_coop_acc;
+use super::value::WorkgroupTile;
+use super::value::{boxed_index, CoopAcc};
+use super::{Storage, Tile, TileBlock};
+use crate::ir::{Addr, CoopMatrixRole, CoopSrc, ElementType, Expr, ExprKind, ScalarElement, Stmt};
 
 impl TileBlock<'_> {
-    /// Allocate a cooperative-matrix accumulator.
-    ///
-    /// ```
-    /// use fusor_tile_ir::{tile, F32};
-    ///
-    /// let ir = tile::build(|program| {
-    ///     program.program_grid::<32>([1, 1, 1], |block| {
-    ///         let acc = block.alloc_coop_acc::<F32, 8, 8>();
-    ///         block.zero_coop_acc(&acc);
-    ///     });
-    /// });
-    /// # let _ = ir;
-    /// ```
-    pub fn alloc_coop_acc<T: CoopElement, const ROWS: usize, const COLS: usize>(
-        &mut self,
-    ) -> CoopAcc<T, ROWS, COLS> {
+    /// Allocate a cooperative-matrix accumulator local (role `C`). Coop
+    /// accumulators are mutable private locals; zero/set/mma are composed
+    /// through [`store_local_coop`](Self::store_local_coop):
+    /// - zero: `store_local_coop(acc, coop_zero(..))`
+    /// - set:  `store_local_coop(acc, coop_load_c_broadcast(..))`
+    /// - mma:  `store_local_coop(acc, coop_mma(a, b, load_local_coop(acc)))`
+    pub fn alloc_coop_acc(&mut self, scalar: ScalarElement, rows: u32, cols: u32) -> CoopAcc {
         assert!(
-            ROWS == 8 || ROWS == 16,
+            rows == 8 || rows == 16,
             "cooperative-matrix rows must be 8 or 16"
         );
         assert!(
-            COLS == 8 || COLS == 16,
+            cols == 8 || cols == 16,
             "cooperative-matrix columns must be 8 or 16"
         );
-        let local = self.program.alloc_local_element(ElementType::coop_matrix(
-            T::SCALAR,
-            CoopMatrixRole::C,
-            ROWS as u32,
-            COLS as u32,
-        ));
-        CoopAcc {
-            local,
-            _ty: PhantomData,
-        }
+        self.program.alloc_coop_acc(scalar, rows, cols)
     }
 
-    /// Zero an accumulator before MMA use.
-    pub fn zero_coop_acc<T, const ROWS: usize, const COLS: usize>(
-        &mut self,
-        acc: &CoopAcc<T, ROWS, COLS>,
-    ) {
-        self.push_stmt(TileStmt::ZeroCoopAcc { acc: acc.local });
+    /// Load the current SSA value of a coop accumulator.
+    pub fn load_local_coop(&self, acc: &CoopAcc) -> Tile {
+        load_coop_acc(acc)
     }
 
-    /// Copy a dense storage tile into workgroup memory.
-    pub fn copy_storage_to_tile<T: Numeric>(
-        &mut self,
-        dst: impl Into<TileRef>,
-        src: &Storage<T, 2>,
-        row_offset: impl Into<Tile<U32>>,
-        col_offset: impl Into<Tile<U32>>,
-    ) {
-        self.push_stmt(TileStmt::CopyToWorkgroupTile {
-            dst: dst.into(),
-            src: crate::ir::CopySource::Storage(src.view.clone()),
-            row_offset: boxed_index(row_offset),
-            col_offset: boxed_index(col_offset),
+    /// Store a coop value into an accumulator. The lowerer chains MMA stores
+    /// through the acc-value SSA memo (1 Load + N MMA + 1 Store per iteration).
+    pub fn store_local_coop(&mut self, acc: &CoopAcc, value: Tile) {
+        self.push_stmt(Stmt::StoreLocal {
+            dst: acc.decl().clone(),
+            value: value.into_expr(),
         });
     }
 
-    /// Copy and dequantize a quantized matrix tile into workgroup memory.
-    pub fn copy_quant_to_tile(
-        &mut self,
-        dst: impl Into<TileRef>,
-        src: &crate::quantized::QuantizedMatrix,
-        row_offset: impl Into<Tile<U32>>,
-        col_offset: impl Into<Tile<U32>>,
-    ) {
-        self.push_stmt(TileStmt::CopyToWorkgroupTile {
-            dst: dst.into(),
-            src: crate::ir::CopySource::Quantized(src.clone()),
-            row_offset: boxed_index(row_offset),
-            col_offset: boxed_index(col_offset),
-        });
-    }
-
-    /// `acc += A * B` using two cooperative tile-load descriptors.
+    /// A zeroed coop-`C` accumulator value. Composed via
+    /// `store_local_coop(acc, coop_zero(..))` for the zero-init case.
     ///
-    /// Convenience wrapper that emits typed A/B fragment loads, then
-    /// [`coop_mma`](Self::coop_mma). For MMAs that share an A or B operand
-    /// across the inner row x col grid, prefer the explicit load calls so
-    /// fragment handles can be reused.
-    pub fn mma_from_tiles<T: CoopElement, const ROWS: usize, const COLS: usize>(
-        &mut self,
-        acc: &CoopAcc<T, ROWS, COLS>,
-        a: CoopTileLoad,
-        b: CoopTileLoad,
-    ) {
-        let a = self.coop_load::<T, ROWS, COLS>(CoopRole::A, a);
-        let b = self.coop_load::<T, ROWS, COLS>(CoopRole::B, b);
-        self.coop_mma(acc, &a, &b);
+    /// Shaped as a `Cast` of an f32 zero literal to the coop-`C` element type:
+    /// it introduces no spurious decls, and the lowerer lowers a cast to a
+    /// cooperative-matrix type as `Expression::ZeroValue` (there is no real
+    /// scalar→fragment cast).
+    pub fn coop_zero(&self, scalar: ScalarElement, rows: u32, cols: u32) -> Tile {
+        let coop = ElementType::coop_matrix(scalar, CoopMatrixRole::C, rows, cols);
+        Tile::new(
+            ExprKind::Cast {
+                value: Box::new(Expr::new(
+                    ExprKind::Literal(crate::ir::TileLiteral::f32(0.0)),
+                    ElementType::F32,
+                )),
+                to: coop,
+            },
+            coop,
+        )
     }
 
-    /// Build a cooperative tile-load descriptor for later use.
-    pub fn coop_tile_load(
+    /// Cooperatively load an A-role fragment from a region of a workgroup tile.
+    pub fn coop_load_a(
         &self,
-        tile: impl Into<TileRef>,
-        row: impl Into<Tile<U32>>,
-        col: impl Into<Tile<U32>>,
-    ) -> CoopTileLoad {
-        CoopTileLoad::new(tile, row, col)
+        tile: &WorkgroupTile,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
+        scalar: ScalarElement,
+        rows: u32,
+        cols: u32,
+    ) -> Tile {
+        self.coop_load_tile(CoopMatrixRole::A, tile, row, col, scalar, rows, cols)
     }
 
-    /// Cooperatively load a fragment from a workgroup tile.
-    pub fn coop_load<T: CoopElement, const ROWS: usize, const COLS: usize>(
-        &mut self,
-        role: CoopRole,
-        load: CoopTileLoad,
-    ) -> CoopFragment<T, ROWS, COLS> {
-        assert!(
-            ROWS == 8 || ROWS == 16,
-            "cooperative-matrix rows must be 8 or 16"
-        );
-        assert!(
-            COLS == 8 || COLS == 16,
-            "cooperative-matrix columns must be 8 or 16"
-        );
-        let id = self.program.next_coop_fragment_id();
-        let role = CoopOperandRole::from(role);
-        self.push_stmt(TileStmt::LoadCoop {
-            id,
-            role,
-            scalar: T::SCALAR,
-            rows: ROWS as u32,
-            cols: COLS as u32,
-            tile: load.tile,
-            row: load.row,
-            col: load.col,
-        });
-        CoopFragment {
-            id,
-            role,
-            _ty: PhantomData,
-        }
+    /// Cooperatively load a B-role fragment from a region of a workgroup tile.
+    pub fn coop_load_b(
+        &self,
+        tile: &WorkgroupTile,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
+        scalar: ScalarElement,
+        rows: u32,
+        cols: u32,
+    ) -> Tile {
+        self.coop_load_tile(CoopMatrixRole::B, tile, row, col, scalar, rows, cols)
     }
 
-    /// Cooperatively load a rank-1 vector slice as a C-role fragment,
-    /// broadcasting the selected columns across all rows.
-    pub fn coop_load_broadcast_cols<T: CoopElement, const ROWS: usize, const COLS: usize>(
-        &mut self,
-        src: &Storage<T, 1>,
-        col: impl Into<Tile<U32>>,
-    ) -> CoopFragment<T, ROWS, COLS> {
-        assert!(
-            ROWS == 8 || ROWS == 16,
-            "cooperative-matrix rows must be 8 or 16"
-        );
-        assert!(
-            COLS == 8 || COLS == 16,
-            "cooperative-matrix columns must be 8 or 16"
-        );
-        let id = self.program.next_coop_fragment_id();
-        self.push_stmt(TileStmt::LoadCoopBroadcast {
-            id,
-            role: CoopOperandRole::C,
-            scalar: T::SCALAR,
-            rows: ROWS as u32,
-            cols: COLS as u32,
-            src: src.view.clone(),
-            col: boxed_index(col),
-        });
-        CoopFragment {
-            id,
-            role: CoopOperandRole::C,
-            _ty: PhantomData,
-        }
+    #[allow(clippy::too_many_arguments)]
+    fn coop_load_tile(
+        &self,
+        role: CoopMatrixRole,
+        tile: &WorkgroupTile,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
+        scalar: ScalarElement,
+        rows: u32,
+        cols: u32,
+    ) -> Tile {
+        assert!(rows == 8 || rows == 16, "coop rows must be 8 or 16");
+        assert!(cols == 8 || cols == 16, "coop cols must be 8 or 16");
+        Tile::new(
+            ExprKind::CoopLoad {
+                role,
+                scalar,
+                rows,
+                cols,
+                src: CoopSrc::TileRegion {
+                    tile: tile.decl().clone(),
+                    row: boxed_index(row),
+                    col: boxed_index(col),
+                },
+            },
+            ElementType::coop_matrix(scalar, role, rows, cols),
+        )
     }
 
-    /// `acc += a * b` where `a`/`b` are fragments previously loaded with the
-    /// same scalar and cooperative shape.
-    pub fn coop_mma<T: CoopElement, const ROWS: usize, const COLS: usize>(
+    /// Cooperatively load a C-role fragment from a rank-1 storage vector,
+    /// broadcasting the selected columns across all fragment rows.
+    pub fn coop_load_c_broadcast(
+        &self,
+        src: &Storage,
+        col: impl Into<Tile>,
+        scalar: ScalarElement,
+        rows: u32,
+        cols: u32,
+    ) -> Tile {
+        assert!(rows == 8 || rows == 16, "coop rows must be 8 or 16");
+        assert!(cols == 8 || cols == 16, "coop cols must be 8 or 16");
+        Tile::new(
+            ExprKind::CoopLoad {
+                role: CoopMatrixRole::C,
+                scalar,
+                rows,
+                cols,
+                src: CoopSrc::BroadcastCol {
+                    src: src.view().clone(),
+                    col: boxed_index(col),
+                },
+            },
+            ElementType::coop_matrix(scalar, CoopMatrixRole::C, rows, cols),
+        )
+    }
+
+    /// `a * b + c` over cooperative fragments — value-producing. Compose with
+    /// `store_local_coop(acc, coop_mma(a, b, load_local_coop(acc)))`.
+    pub fn coop_mma(&self, a: Tile, b: Tile, c: Tile) -> Tile {
+        let ty = c.element();
+        Tile::new(
+            ExprKind::CoopMma {
+                a: Box::new(a.into_expr()),
+                b: Box::new(b.into_expr()),
+                c: Box::new(c.into_expr()),
+            },
+            ty,
+        )
+    }
+
+    /// Cooperatively store an accumulator to `dst` at `(row, col)`. A distinct
+    /// collective primitive — never a per-lane store.
+    pub fn coop_store(
         &mut self,
-        acc: &CoopAcc<T, ROWS, COLS>,
-        a: &CoopFragment<T, ROWS, COLS>,
-        b: &CoopFragment<T, ROWS, COLS>,
+        acc: &CoopAcc,
+        dst: &Storage,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
     ) {
-        assert_eq!(
-            a.role,
-            CoopOperandRole::A,
-            "coop_mma A operand must be an A-role fragment"
-        );
-        assert_eq!(
-            b.role,
-            CoopOperandRole::B,
-            "coop_mma B operand must be a B-role fragment"
-        );
-        self.push_stmt(TileStmt::Mma {
-            acc: acc.local,
-            a: a.id,
-            b: b.id,
-        });
-    }
-
-    /// Initialize `acc` from a C-role cooperative fragment.
-    pub fn coop_set_acc<T, const ROWS: usize, const COLS: usize>(
-        &mut self,
-        acc: &CoopAcc<T, ROWS, COLS>,
-        c: &CoopFragment<T, ROWS, COLS>,
-    ) {
-        assert_eq!(
-            c.role,
-            CoopOperandRole::C,
-            "coop_set_acc operand must be a C-role fragment"
-        );
-        self.push_stmt(TileStmt::SetCoopAcc {
-            acc: acc.local,
-            c: c.id,
-        });
-    }
-
-    /// Cooperatively store `acc` to `dst` at (row, col).
-    pub fn coop_store<T: CoopElement, const ROWS: usize, const COLS: usize>(
-        &mut self,
-        acc: &CoopAcc<T, ROWS, COLS>,
-        dst: &Storage<T, 2>,
-        row: impl Into<Tile<U32>>,
-        col: impl Into<Tile<U32>>,
-    ) {
-        self.push_stmt(TileStmt::StoreCoopAcc {
-            acc: acc.local,
-            dst: dst.view.clone(),
-            row: boxed_index(row),
-            col: boxed_index(col),
+        self.push_stmt(Stmt::CoopStore {
+            acc: acc.decl().clone(),
+            dst: dst.view().clone(),
+            addr: Addr::Rc2 {
+                row: boxed_index(row),
+                col: boxed_index(col),
+            },
         });
     }
 }

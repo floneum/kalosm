@@ -2702,6 +2702,7 @@ dependencies = [
  "half",
  "naga",
  "pollster",
+ "rustc-hash 2.1.1",
  "wgpu",
 ]
 

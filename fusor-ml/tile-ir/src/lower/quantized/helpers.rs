@@ -170,7 +170,10 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    pub(in crate::lower) fn q4k_load_d_dmin(
+    /// Load the `(d, dmin)` super-block scales of a Q4K/Q5K block. Both families
+    /// store the pair identically — two f32 words, or one packed f16 pair in the
+    /// `*Native` layout.
+    pub(in crate::lower) fn load_k_d_dmin(
         &self,
         e: &mut Arena<Expression>,
         matrix: &QuantizedMatrix,
@@ -178,13 +181,15 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
     ) -> Result<(Handle<Expression>, Handle<Expression>), LowerError> {
         match matrix.format {
-            GgmlQuantFormat::Q4K => Ok((
+            GgmlQuantFormat::Q4K | GgmlQuantFormat::Q5K => Ok((
                 self.load_word_f32(e, matrix, base, 0, body)?,
                 self.load_word_f32(e, matrix, base, 1, body)?,
             )),
-            GgmlQuantFormat::Q4KNative => self.load_f16_pair_word_f32(e, matrix, base, 0, body),
+            GgmlQuantFormat::Q4KNative | GgmlQuantFormat::Q5KNative => {
+                self.load_f16_pair_word_f32(e, matrix, base, 0, body)
+            }
             _ => Err(LowerError::UnsupportedOperation(
-                "q4k d/dmin load requires a Q4K format",
+                "k-quant d/dmin load requires a Q4K or Q5K format",
             )),
         }
     }
@@ -238,25 +243,6 @@ impl<'a> Lowerer<'a> {
             GgmlQuantFormat::Q5KNative => Ok((1, 2, 3)),
             _ => Err(LowerError::UnsupportedOperation(
                 "q5k scale offsets require a Q5K format",
-            )),
-        }
-    }
-
-    pub(in crate::lower) fn q5k_load_d_dmin(
-        &self,
-        e: &mut Arena<Expression>,
-        matrix: &QuantizedMatrix,
-        base: Handle<Expression>,
-        body: &mut Block,
-    ) -> Result<(Handle<Expression>, Handle<Expression>), LowerError> {
-        match matrix.format {
-            GgmlQuantFormat::Q5K => Ok((
-                self.load_word_f32(e, matrix, base, 0, body)?,
-                self.load_word_f32(e, matrix, base, 1, body)?,
-            )),
-            GgmlQuantFormat::Q5KNative => self.load_f16_pair_word_f32(e, matrix, base, 0, body),
-            _ => Err(LowerError::UnsupportedOperation(
-                "q5k d/dmin load requires a Q5K format",
             )),
         }
     }
@@ -821,22 +807,6 @@ impl<'a> Lowerer<'a> {
         )
     }
 
-    pub(in crate::lower) fn u8_lane_f32(
-        &self,
-        e: &mut Arena<Expression>,
-        body: &mut Block,
-        word: Handle<Expression>,
-        lane: u32,
-    ) -> Handle<Expression> {
-        let shifted = if lane == 0 {
-            word
-        } else {
-            self.shr_lit(e, body, word, lane * 8)
-        };
-        let byte = self.and_lit(e, body, shifted, 0xff);
-        self.as_f32(e, body, byte)
-    }
-
     /// `as_f32(quant) - 32.0`. Both Q3K scales and Q6K quants are stored
     /// unsigned with a +32 bias; subtracting 32 recenters them around zero.
     pub(in crate::lower) fn center_quant_by_32(
@@ -848,73 +818,6 @@ impl<'a> Lowerer<'a> {
         let quant = self.as_f32(e, body, quant);
         let center = self.f32(e, 32.0);
         self.sub(e, body, quant, center)
-    }
-
-    pub(in crate::lower) fn q4k_ggml_accumulate_word_scalar(
-        &self,
-        e: &mut Arena<Expression>,
-        body: &mut Block,
-        word: Handle<Expression>,
-        activations: &[Handle<Expression>],
-        pair: usize,
-        sums: &mut [Handle<Expression>; 4],
-    ) {
-        let high_word = self.shr_lit(e, body, word, 16);
-        let entries = [
-            (word, 0usize, pair * 4, 0x000f_u32),
-            (word, 1usize, pair * 4 + 1, 0x0f00_u32),
-            (word, 2usize, pair * 4 + 8, 0x00f0_u32),
-            (word, 3usize, pair * 4 + 9, 0xf000_u32),
-            (high_word, 0usize, pair * 4 + 2, 0x000f_u32),
-            (high_word, 1usize, pair * 4 + 3, 0x0f00_u32),
-            (high_word, 2usize, pair * 4 + 10, 0x00f0_u32),
-            (high_word, 3usize, pair * 4 + 11, 0xf000_u32),
-        ];
-
-        for (source, sum_index, activation_index, mask) in entries {
-            let masked = self.and_lit(e, body, source, mask);
-            let quant = self.as_f32(e, body, masked);
-            let term = self.mul(e, body, activations[activation_index], quant);
-            sums[sum_index] = self.add(e, body, sums[sum_index], term);
-        }
-    }
-
-    pub(in crate::lower) fn q4k_ggml_accumulate_word_vector(
-        &self,
-        e: &mut Arena<Expression>,
-        body: &mut Block,
-        word: Handle<Expression>,
-        activations: &[Handle<Expression>],
-        pair: usize,
-        sums: &mut [Handle<Expression>; 4],
-    ) {
-        let high_word = self.shr_lit(e, body, word, 16);
-        for (source, activation_base) in [(word, pair * 4), (high_word, pair * 4 + 2)] {
-            let q0 = self.and_lit(e, body, source, 0x000f);
-            let q0 = self.as_f32(e, body, q0);
-            let q1 = self.and_lit(e, body, source, 0x0f00);
-            let q1 = self.as_f32(e, body, q1);
-            let q2 = self.and_lit(e, body, source, 0x00f0);
-            let q2 = self.as_f32(e, body, q2);
-            let q3 = self.and_lit(e, body, source, 0xf000);
-            let q3 = self.as_f32(e, body, q3);
-            let quant_vec = self.compose_f32_vec4(e, body, [q0, q1, q2, q3]);
-            let activation_vec = self.compose_f32_vec4(
-                e,
-                body,
-                [
-                    activations[activation_base],
-                    activations[activation_base + 1],
-                    activations[activation_base + 8],
-                    activations[activation_base + 9],
-                ],
-            );
-            let terms = self.mul(e, body, activation_vec, quant_vec);
-            for (sum_index, sum) in sums.iter_mut().enumerate() {
-                let term = self.vec4_component(e, body, terms, sum_index as u32);
-                *sum = self.add(e, body, *sum, term);
-            }
-        }
     }
 
     pub(in crate::lower) fn pack_i8x4(

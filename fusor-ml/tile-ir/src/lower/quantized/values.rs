@@ -192,7 +192,7 @@ impl<'a> Lowerer<'a> {
             body,
         );
 
-        let (d, dmin) = self.q4k_load_d_dmin(expressions, matrix, base, body)?;
+        let (d, dmin) = self.load_k_d_dmin(expressions, matrix, base, body)?;
         let group = self.shr_lit(expressions, body, q_base, 5);
         let (scale_byte, min_byte) =
             self.q4k_scale_min_bytes(expressions, matrix, base, group, body)?;
@@ -512,20 +512,6 @@ impl<'a> Lowerer<'a> {
         Ok(self.mul(expressions, body, sum, parts.scale))
     }
 
-    pub(in crate::lower) fn q4k_q8_activation_dot(
-        &self,
-        expressions: &mut Arena<Expression>,
-        matrix: &QuantizedMatrix,
-        k_base: Handle<Expression>,
-        col: Handle<Expression>,
-        a: &Q8ActivationPacks,
-        body: &mut Block,
-    ) -> Result<Handle<Expression>, LowerError> {
-        self.q8_activation_pack_pair_dot(expressions, body, k_base, a, |s, e, b, k, off| {
-            s.q4k_q8_activation_dot8(e, matrix, QuantDotCoords { k_base: k, col }, a, off, b)
-        })
-    }
-
     /// Sum a per-pair dot product over every 2-pack chunk of the activation
     /// stream. Shared by Q4K and Q6K x Q8 activation dot helpers.
     pub(in crate::lower) fn q8_activation_pack_pair_dot(
@@ -554,36 +540,6 @@ impl<'a> Lowerer<'a> {
             let chunk = chunk(self, expressions, body, k, pack_offset)?;
             total = self.add(expressions, body, total, chunk);
         }
-        Ok(total)
-    }
-
-    pub(in crate::lower) fn q4k_q8_activation_dot8(
-        &self,
-        expressions: &mut Arena<Expression>,
-        matrix: &QuantizedMatrix,
-        coords: QuantDotCoords,
-        a: &Q8ActivationPacks,
-        pack_offset: usize,
-        body: &mut Block,
-    ) -> Result<Handle<Expression>, LowerError> {
-        if !matrix.format.is_q4k_family() || a.len < pack_offset + 2 {
-            return Err(LowerError::UnsupportedOperation(
-                "q4k x q8 activation dot requires a Q4K format and two activation packs",
-            ));
-        }
-
-        let block = self.q4k_quant_packs8(expressions, matrix, coords.k_base, coords.col, body)?;
-        let total = self.q8_activation_packs_dot(
-            expressions,
-            body,
-            a,
-            pack_offset,
-            Q8ActivationDotRhs {
-                scale: block.scale,
-                packs: block.data,
-                min: Some(block.min),
-            },
-        );
         Ok(total)
     }
 
