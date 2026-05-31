@@ -7,8 +7,8 @@
 //! `core` uses `Arc<wgpu::Buffer>`; tests can use `()`.
 
 use crate::{
-    tile::{Program, RuntimeElement, Storage},
-    ElementType, KernelIr, Layout, Numeric,
+    tile::{Program, Storage},
+    ElementType, KernelIr, Layout,
 };
 
 /// A runtime binding paired with the IR layout that describes how the kernel
@@ -62,15 +62,16 @@ impl<B> KernelBuilder<B> {
     ///
     /// ```
     /// use fusor_tile_ir::{
-    ///     KernelBuilder, KernelTensorRef, Layout, MemoryLevel, Shape, TileLiteral, F32,
+    ///     KernelBuilder, KernelTensorRef, Layout, MemoryLevel, ScalarElement, Shape, TileLiteral,
     /// };
     ///
     /// let layout = Layout::contiguous(MemoryLevel::Storage, Shape::new([16]));
+    /// let f32 = ScalarElement::F32.element();
     /// let mut kb = KernelBuilder::<&'static str>::new();
-    /// let input = kb.read::<F32, 1>(KernelTensorRef::new("input", layout.clone()));
-    /// let output = kb.write::<F32, 1>(KernelTensorRef::new("output", layout));
+    /// let input = kb.read(f32, KernelTensorRef::new("input", layout.clone()));
+    /// let output = kb.write(f32, KernelTensorRef::new("output", layout));
     ///
-    /// kb.program().program_grid::<16>([1, 1, 1], |block| {
+    /// kb.program().program_grid(16, [1, 1, 1], |block| {
     ///     let lane = block.lane();
     ///     let mask = lane.clone().lt(16u32);
     ///     let value = block.load(input.at(lane.clone()), mask.clone(), TileLiteral::f32(0.0));
@@ -93,45 +94,17 @@ impl<B> KernelBuilder<B> {
         &mut self.program
     }
 
-    /// Declare a read-only typed storage binding.
-    pub fn read<T: Numeric, const R: usize>(
-        &mut self,
-        tensor: KernelTensorRef<B>,
-    ) -> Storage<T, R> {
+    /// Declare a read-only storage binding of the given runtime element type.
+    pub fn read(&mut self, element: ElementType, tensor: KernelTensorRef<B>) -> Storage {
         self.declare_storage(tensor, |program, layout, offset| {
-            program.storage_read_with_layout_offset::<T, R>(layout, offset)
+            program.storage_read_with_layout_offset(element, layout, offset)
         })
     }
 
-    /// Declare a read-write typed storage binding.
-    pub fn write<T: Numeric, const R: usize>(
-        &mut self,
-        tensor: KernelTensorRef<B>,
-    ) -> Storage<T, R> {
+    /// Declare a read-write storage binding of the given runtime element type.
+    pub fn write(&mut self, element: ElementType, tensor: KernelTensorRef<B>) -> Storage {
         self.declare_storage(tensor, |program, layout, offset| {
-            program.storage_write_with_layout_offset::<T, R>(layout, offset)
-        })
-    }
-
-    /// Declare a read-only storage binding whose element type is known at runtime.
-    pub fn read_element<const R: usize>(
-        &mut self,
-        element: ElementType,
-        tensor: KernelTensorRef<B>,
-    ) -> Storage<RuntimeElement, R> {
-        self.declare_storage(tensor, |program, layout, offset| {
-            program.storage_read_element_with_layout_offset::<R>(element, layout, offset)
-        })
-    }
-
-    /// Declare a read-write storage binding whose element type is known at runtime.
-    pub fn write_element<const R: usize>(
-        &mut self,
-        element: ElementType,
-        tensor: KernelTensorRef<B>,
-    ) -> Storage<RuntimeElement, R> {
-        self.declare_storage(tensor, |program, layout, offset| {
-            program.storage_write_element_with_layout_offset::<R>(element, layout, offset)
+            program.storage_write_with_layout_offset(element, layout, offset)
         })
     }
 

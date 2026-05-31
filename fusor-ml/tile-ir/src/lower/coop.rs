@@ -1,76 +1,57 @@
 use super::*;
-use crate::lower::tile_program::{CoopBroadcastLoad, CoopFragmentLoad, TileFoldLowering};
+use crate::ir::{Addr, CoopSrc};
 use naga::{Barrier, CooperativeData, CooperativeRole};
 
 impl<'a> Lowerer<'a> {
-    /// Lower non-store tile statements. Coop ops emit cooperative-matrix
-    /// Loads/MMA/Store.
-    pub(super) fn lower_tile_stmt_body(
+    pub(super) fn lower_stmt_body(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
-        stmts: &[TileStmt],
+        stmts: &[Stmt],
     ) -> Result<(), LowerError> {
         for stmt in stmts {
-            self.lower_tile_stmt(expressions, scratch, body, stmt)?;
+            self.lower_stmt(expressions, body, stmt)?;
         }
         Ok(())
     }
 
-    pub(super) fn lower_tile_stmt(
+    pub(super) fn lower_stmt(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
-        stmt: &TileStmt,
+        stmt: &Stmt,
     ) -> Result<(), LowerError> {
         match stmt {
-            TileStmt::Store(store) => self.lower_tile_store_stmt(expressions, scratch, body, store),
-            TileStmt::StoreIndexed(store) => {
-                self.lower_tile_indexed_store_stmt(expressions, scratch, body, store)
+            Stmt::Store {
+                dst,
+                addr,
+                value,
+                mask,
+            } => self.lower_store_stmt(expressions, body, dst, addr, value, mask),
+            Stmt::StoreLocal { dst, value } => {
+                self.lower_store_local(expressions, body, dst, value)
             }
-            TileStmt::StoreLocal { dst, value } => {
-                let value_ty = value.element();
-                if value_ty != dst.element {
-                    return Err(LowerError::LocalElementMismatch {
-                        local: dst.id,
-                        declared: dst.element,
-                        used: value_ty,
-                    });
-                }
-                let value = self.lower_tile_expr(expressions, scratch, body, value)?;
-                let local = self.private_local(*dst)?;
-                self.store_local(expressions, body, local, value);
-                Ok(())
-            }
-            TileStmt::StoreWorkgroup { dst, index, value } => {
-                let value_ty = value.element();
-                if value_ty != dst.element {
-                    return Err(LowerError::TileElementMismatch {
-                        tile: dst.id,
-                        declared: dst.element,
-                        used: value_ty,
-                    });
-                }
-                let value = self.lower_tile_expr(expressions, scratch, body, value)?;
-                let index = self.lower_tile_expr(expressions, scratch, body, index)?;
-                let pointer = self.tile_dynamic_pointer(expressions, *dst, index, body)?;
+            Stmt::StoreTile { dst, index, value } => {
+                let value = self.lower_expr(expressions, body, value)?;
+                let index = self.lower_expr(expressions, body, index)?;
+                let pointer = self.tile_dynamic_pointer(expressions, dst, index, body)?;
                 body.push(Statement::Store { pointer, value }, Span::default());
                 Ok(())
             }
-            TileStmt::If {
+            Stmt::FillTile { dst, value } => self.lower_fill_tile(expressions, body, dst, value),
+            Stmt::CoopStore { acc, dst, addr } => {
+                self.lower_store_coop_acc(expressions, body, acc, dst, addr)
+            }
+            Stmt::If {
                 condition,
                 accept,
                 reject,
             } => {
                 let condition_ty = condition.element();
-                let condition = self.lower_tile_expr(expressions, scratch, body, condition)?;
+                let condition = self.lower_expr(expressions, body, condition)?;
                 let condition = self.condition_value(expressions, body, condition, condition_ty);
-                let mut accept_block = Block::new();
-                self.lower_tile_stmt_body(expressions, scratch, &mut accept_block, accept)?;
-                let mut reject_block = Block::new();
-                self.lower_tile_stmt_body(expressions, scratch, &mut reject_block, reject)?;
+                let accept_block = self.lower_branch_block(expressions, accept)?;
+                let reject_block = self.lower_branch_block(expressions, reject)?;
                 body.push(
                     Statement::If {
                         condition,
@@ -81,10 +62,27 @@ impl<'a> Lowerer<'a> {
                 );
                 Ok(())
             }
-            TileStmt::Loop { body: inner } => {
+            Stmt::Loop {
+                count: Some(count),
+                index,
+                accumulators,
+                body: loop_body,
+            } => self.lower_counted_loop(
+                expressions,
+                body,
+                count,
+                index.as_ref(),
+                accumulators,
+                loop_body,
+            ),
+            Stmt::Loop {
+                count: None,
+                body: inner,
+                ..
+            } => {
                 self.flush_coop_acc_cache(expressions, body);
                 let mut loop_body = Block::new();
-                self.lower_tile_stmt_body(expressions, scratch, &mut loop_body, inner)?;
+                self.lower_stmt_body(expressions, &mut loop_body, inner)?;
                 self.flush_coop_acc_cache(expressions, &mut loop_body);
                 body.push(
                     Statement::Loop {
@@ -96,308 +94,165 @@ impl<'a> Lowerer<'a> {
                 );
                 Ok(())
             }
-            TileStmt::Break => {
+            Stmt::Break => {
                 body.push(Statement::Break, Span::default());
                 Ok(())
             }
-            TileStmt::Return => {
+            Stmt::Return => {
                 body.push(Statement::Return { value: None }, Span::default());
                 Ok(())
             }
-            TileStmt::Barrier => {
+            Stmt::Barrier => {
                 body.push(
                     Statement::ControlBarrier(Barrier::WORK_GROUP),
                     Span::default(),
                 );
                 Ok(())
             }
-            TileStmt::ZeroCoopAcc { acc } => {
-                let local = self.private_local(*acc)?;
-                let ty = self.element_type(acc.element)?;
-                let zero = expressions.append(Expression::ZeroValue(ty), Span::default());
-                self.store_local(expressions, body, local, zero);
-                Ok(())
-            }
-            TileStmt::CopyToWorkgroupTile {
-                dst,
-                src,
-                row_offset,
-                col_offset,
-            } => {
-                let offsets = TileCoordExprs {
-                    row: row_offset,
-                    col: col_offset,
-                };
-                match src {
-                    CopySource::Storage(view) => {
-                        self.lower_copy_to_tile(expressions, scratch, body, *dst, view, offsets)
-                    }
-                    CopySource::Quantized(matrix) => self.lower_copy_quant_to_tile(
-                        expressions,
-                        scratch,
-                        body,
-                        *dst,
-                        matrix,
-                        offsets,
-                    ),
-                }
-            }
-            TileStmt::StoreCoopAcc { acc, dst, row, col } => self.lower_store_coop_acc(
-                expressions,
-                scratch,
-                body,
-                *acc,
-                dst,
-                TileCoordExprs { row, col },
-            ),
-            TileStmt::LoadCoop {
-                id,
-                role,
-                tile,
-                row,
-                col,
-                scalar,
-                rows,
-                cols,
-            } => self.lower_load_coop_fragment(
-                expressions,
-                scratch,
-                body,
-                CoopFragmentLoad {
-                    id: *id,
-                    tile: *tile,
-                    row,
-                    col,
-                    role: match role {
-                        CoopOperandRole::A => CooperativeRole::A,
-                        CoopOperandRole::B => CooperativeRole::B,
-                        CoopOperandRole::C => CooperativeRole::C,
-                    },
-                    scalar: *scalar,
-                    rows: *rows,
-                    cols: *cols,
-                },
-            ),
-            TileStmt::LoadCoopBroadcast {
-                id,
-                role,
-                src,
-                col,
-                scalar,
-                rows,
-                cols,
-            } => self.lower_load_coop_broadcast(
-                expressions,
-                scratch,
-                body,
-                CoopBroadcastLoad {
-                    id: *id,
-                    src,
-                    col,
-                    role: match role {
-                        CoopOperandRole::A => CooperativeRole::A,
-                        CoopOperandRole::B => CooperativeRole::B,
-                        CoopOperandRole::C => CooperativeRole::C,
-                    },
-                    scalar: *scalar,
-                    rows: *rows,
-                    cols: *cols,
-                },
-            ),
-            TileStmt::Mma { acc, a, b } => self.lower_coop_mma(expressions, body, *acc, *a, *b),
-            TileStmt::SetCoopAcc { acc, c } => self.lower_set_coop_acc(expressions, body, *acc, *c),
-            TileStmt::Fold {
-                count,
-                iter_var,
-                body: fold_body,
-                accumulators,
-            } => self.lower_tile_fold_stmt(
-                expressions,
-                scratch,
-                body,
-                TileFoldLowering {
-                    count,
-                    iter_var: *iter_var,
-                    body: fold_body,
-                    accumulators,
-                },
-            ),
         }
     }
 
-    fn lower_load_coop_fragment(
+    /// Lower `Stmt::StoreLocal`. Coop accumulators participate in the SSA
+    /// acc-value memo: an MMA-valued store updates the memo and defers the
+    /// store to the next flush (giving 1 Load + N MMA + 1 Store per iteration);
+    /// any other coop-valued store (zero/set) writes immediately and clears the
+    /// memo so the next MMA reloads once.
+    fn lower_store_local(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
-        request: CoopFragmentLoad<'_>,
+        dst: &Local,
+        value: &Expr,
     ) -> Result<(), LowerError> {
-        let CoopFragmentLoad {
-            id,
-            tile,
-            row,
-            col,
-            role,
-            scalar,
-            rows,
-            cols,
-        } = request;
-        let layout = self.tile_layout(tile)?;
-        let expected_tile_element = scalar.element();
-        if tile.element != expected_tile_element {
-            return Err(LowerError::TileElementMismatch {
-                tile: tile.id,
-                declared: tile.element,
-                used: expected_tile_element,
-            });
+        let is_coop = matches!(dst.element, ElementType::CoopMatrix { .. });
+        if is_coop && matches!(value.kind(), ExprKind::CoopMma { .. }) {
+            let next = self.lower_expr(expressions, body, value)?;
+            self.coop_acc_value_cache
+                .borrow_mut()
+                .insert(local_key_decl(dst), next);
+            return Ok(());
         }
-        let stride_u = Self::row_major_tile_stride(layout)?;
-        let row_h = self.lower_tile_expr(expressions, scratch, body, row)?;
-        let col_h = self.lower_tile_expr(expressions, scratch, body, col)?;
-        let index = self.tile_matrix_index_inline(expressions, body, row_h, col_h, stride_u);
-        let ptr = self.tile_dynamic_pointer(expressions, tile, index, body)?;
-        let stride = self.u32(expressions, stride_u);
-        let frag = self.emit(
-            expressions,
-            body,
-            Expression::CooperativeLoad {
-                columns: Self::cooperative_size(cols)?,
-                rows: Self::cooperative_size(rows)?,
-                role,
-                data: CooperativeData {
-                    pointer: ptr,
-                    stride,
-                    row_major: false,
-                },
-            },
-        );
-        self.coop_fragment_cache.borrow_mut().insert(id, frag);
+        let value = self.lower_expr(expressions, body, value)?;
+        let local = self.private_local(dst)?;
+        if is_coop {
+            self.coop_acc_value_cache
+                .borrow_mut()
+                .remove(&local_key_decl(dst));
+        }
+        self.store_local(expressions, body, local, value);
         Ok(())
     }
 
-    fn lower_load_coop_broadcast(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        request: CoopBroadcastLoad<'_>,
-    ) -> Result<(), LowerError> {
-        let CoopBroadcastLoad {
-            id,
-            src,
-            col,
-            role,
-            scalar,
-            rows,
-            cols,
-        } = request;
-        let layout = self.storage_layout(src)?;
-        if layout.shape().rank() != 1 {
-            return Err(LowerError::UnsupportedOperation(
-                "coop broadcast load expects rank-1 storage",
-            ));
-        }
-        if src.buffer.element != scalar.element() {
-            return Err(LowerError::UnsupportedOperation(
-                "coop broadcast load element mismatch",
-            ));
-        }
-        let col_h = self.lower_tile_expr(expressions, scratch, body, col)?;
-        let ptr = self.storage_dynamic_pointer(expressions, src, col_h, body)?;
-        let stride = self.u32(expressions, 0);
-        let frag = self.emit(
-            expressions,
-            body,
-            Expression::CooperativeLoad {
-                columns: Self::cooperative_size(cols)?,
-                rows: Self::cooperative_size(rows)?,
-                role,
-                data: CooperativeData {
-                    pointer: ptr,
-                    stride,
-                    row_major: true,
-                },
-            },
-        );
-        self.coop_fragment_cache.borrow_mut().insert(id, frag);
-        Ok(())
-    }
-
-    fn lower_coop_mma(
+    /// Lower an `ExprKind::CoopLoad` to a cooperative-matrix load expression.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::lower) fn lower_coop_load(
         &self,
         expressions: &mut Arena<Expression>,
         body: &mut Block,
-        acc: LocalRef,
-        a_id: CoopFragmentId,
-        b_id: CoopFragmentId,
-    ) -> Result<(), LowerError> {
-        let acc_local = self.private_local(acc)?;
-        let a = self.coop_fragment_handle(a_id, "A")?;
-        let b = self.coop_fragment_handle(b_id, "B")?;
-        // Get the current SSA value of this accumulator: cache hit → reuse;
-        // cache miss → emit one Load from the accumulator local. Subsequent
-        // MMAs in this scope chain through SSA without touching the local.
-        let c = match self.coop_acc_value_cache.borrow().get(&acc.id).copied() {
-            Some(value) => value,
-            None => {
-                let acc_ptr = self.local_var(expressions, acc_local);
-                Self::emit_load(expressions, body, acc_ptr)
-            }
+        role: CoopMatrixRole,
+        scalar: ScalarElement,
+        rows: u32,
+        cols: u32,
+        src: &CoopSrc,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let role = match role {
+            CoopMatrixRole::A => CooperativeRole::A,
+            CoopMatrixRole::B => CooperativeRole::B,
+            CoopMatrixRole::C => CooperativeRole::C,
         };
-        let next = self.emit(
+        match src {
+            CoopSrc::TileRegion { tile, row, col } => {
+                let layout = self.tile_layout(tile);
+                let stride_u = Self::row_major_tile_stride(layout)?;
+                let _ = scalar;
+                let row_h = self.lower_expr(expressions, body, row)?;
+                let col_h = self.lower_expr(expressions, body, col)?;
+                let index =
+                    self.tile_matrix_index_inline(expressions, body, row_h, col_h, stride_u);
+                let ptr = self.tile_dynamic_pointer(expressions, tile, index, body)?;
+                let stride = self.u32(expressions, stride_u);
+                Ok(self.emit(
+                    expressions,
+                    body,
+                    Expression::CooperativeLoad {
+                        columns: Self::cooperative_size(cols)?,
+                        rows: Self::cooperative_size(rows)?,
+                        role,
+                        data: CooperativeData {
+                            pointer: ptr,
+                            stride,
+                            row_major: false,
+                        },
+                    },
+                ))
+            }
+            CoopSrc::BroadcastCol { src, col } => {
+                let layout = self.storage_layout(src);
+                if layout.shape().rank() != 1 {
+                    return Err(LowerError::UnsupportedOperation(
+                        "coop broadcast load expects rank-1 storage",
+                    ));
+                }
+                let col_h = self.lower_expr(expressions, body, col)?;
+                let ptr = self.storage_dynamic_pointer(expressions, src, col_h, body)?;
+                let stride = self.u32(expressions, 0);
+                Ok(self.emit(
+                    expressions,
+                    body,
+                    Expression::CooperativeLoad {
+                        columns: Self::cooperative_size(cols)?,
+                        rows: Self::cooperative_size(rows)?,
+                        role,
+                        data: CooperativeData {
+                            pointer: ptr,
+                            stride,
+                            row_major: true,
+                        },
+                    },
+                ))
+            }
+        }
+    }
+
+    /// Lower an `ExprKind::CoopMma`. When `c` is a `LoadLocal(acc)` of a coop
+    /// accumulator with a live memo entry, the cached SSA value is reused so no
+    /// extra `Load` is emitted; otherwise `c` lowers normally (a single Load).
+    pub(in crate::lower) fn lower_coop_mma(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        a: &Expr,
+        b: &Expr,
+        c: &Expr,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let a = self.lower_expr(expressions, body, a)?;
+        let b = self.lower_expr(expressions, body, b)?;
+        let c = self.lower_expr(expressions, body, c)?;
+        Ok(self.emit(
             expressions,
             body,
             Expression::CooperativeMultiplyAdd { a, b, c },
-        );
-        self.coop_acc_value_cache.borrow_mut().insert(acc.id, next);
-        Ok(())
+        ))
     }
 
-    fn lower_set_coop_acc(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        acc: LocalRef,
-        c_id: CoopFragmentId,
-    ) -> Result<(), LowerError> {
-        let acc_local = self.private_local(acc)?;
-        let c = self.coop_fragment_handle(c_id, "C")?;
-        self.coop_acc_value_cache.borrow_mut().remove(&acc.id);
-        self.store_local(expressions, body, acc_local, c);
-        Ok(())
-    }
-
-    /// Look up a previously-loaded coop fragment by id. Both operands of an
-    /// MMA need this lookup; `role` is interpolated into the error message
-    /// when the fragment isn't in the cache.
-    fn coop_fragment_handle(
-        &self,
-        id: CoopFragmentId,
-        role: &'static str,
-    ) -> Result<Handle<Expression>, LowerError> {
-        self.coop_fragment_cache
+    /// The current SSA value cached for a coop accumulator local, if any.
+    pub(in crate::lower) fn coop_acc_value(&self, local: &Local) -> Option<Handle<Expression>> {
+        self.coop_acc_value_cache
             .borrow()
-            .get(&id)
+            .get(&local_key_decl(local))
             .copied()
-            .ok_or(LowerError::UnsupportedOperation(match role {
-                "A" => "coop_mma A fragment not loaded in current scope",
-                "B" => "coop_mma B fragment not loaded in current scope",
-                "C" => "coop C fragment not loaded in current scope",
-                _ => "coop_mma fragment not loaded in current scope",
-            }))
     }
 
-    /// Flush every cached accumulator SSA back to its local. Called at the
-    /// end of any scope where the cache must not leak (loop body iteration
-    /// boundary, before reads of the local, end of program body, etc.).
+    /// Flush every cached accumulator SSA back to its local. Called at the end
+    /// of any scope where the cache must not leak.
     pub(super) fn flush_coop_acc_cache(
         &self,
         expressions: &mut Arena<Expression>,
         body: &mut Block,
     ) {
         let drained: Vec<_> = self.coop_acc_value_cache.borrow_mut().drain().collect();
-        for (local_id, value) in drained {
-            let acc_local = match self.private_locals.get(local_id.index()).copied().flatten() {
+        for (decl_ptr, value) in drained {
+            let acc_local = match self.locals.borrow().get(&(decl_ptr as *const ())).copied() {
                 Some(l) => l,
                 None => continue,
             };
@@ -441,35 +296,61 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// Lower a `Stmt::FillTile`. `value` is the per-element source — a masked
+    /// `Load`, dense or quantized. The dense and quant cases share one emitter;
+    /// each recognizes the contiguous vec4 fast path internally.
+    fn lower_fill_tile(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        dst: &Tile,
+        value: &Expr,
+    ) -> Result<(), LowerError> {
+        let ExprKind::Load {
+            src,
+            addr,
+            mask,
+            fill,
+        } = value.kind()
+        else {
+            return Err(LowerError::UnsupportedOperation(
+                "FillTile value must be a Load",
+            ));
+        };
+        let Addr::Rc2 { row, col } = addr else {
+            return Err(LowerError::UnsupportedOperation(
+                "FillTile value must be a rank-2 Load",
+            ));
+        };
+        match src {
+            Source::Storage(view) => {
+                self.lower_copy_to_tile(expressions, body, dst, view, row, col, mask, fill)
+            }
+            Source::Quantized(matrix) => {
+                self.lower_copy_quant_to_tile(expressions, body, dst, matrix, row, col)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn lower_copy_to_tile(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
-        dst: TileRef,
+        dst: &Tile,
         src: &StorageView,
-        offsets: TileCoordExprs<'_>,
+        row_offset: &Expr,
+        col_offset: &Expr,
+        _mask: &Expr,
+        _fill: &Expr,
     ) -> Result<(), LowerError> {
-        if dst.element != src.buffer.element {
-            return Err(LowerError::TileElementMismatch {
-                tile: dst.id,
-                declared: dst.element,
-                used: src.buffer.element,
-            });
-        }
-        let layout = self.tile_layout(dst)?;
+        let layout = self.tile_layout(dst);
         let [rows, cols] = Self::tile_shape(layout)?;
         let stride = Self::row_major_tile_stride(layout)?;
         let local = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
-        let row_base = self.lower_tile_expr(expressions, scratch, body, offsets.row)?;
-        let col_base = self.lower_tile_expr(expressions, scratch, body, offsets.col)?;
+        let row_base = self.lower_expr(expressions, body, row_offset)?;
+        let col_base = self.lower_expr(expressions, body, col_offset)?;
 
-        // Vec4 fast path: when both the storage and tile inner strides are 1
-        // and the tile inner extent is a multiple of 4, each lane covers four
-        // consecutive inner-axis elements per pass. Issuing four sequential
-        // loads in a row lets the driver coalesce them into a single wider
-        // transaction on Apple Silicon. Mirrors the hand-written tile-load in
-        // `coop_gemm.rs`.
         const VEC: u32 = 4;
         if cols.is_multiple_of(VEC) && Self::storage_has_unit_inner_stride(&src.layout) {
             let groups_per_row = cols / VEC;
@@ -564,7 +445,6 @@ impl<'a> Lowerer<'a> {
                 "workgroup tile size overflow",
             ))?;
         let lane_layout = CopyLaneLayout {
-            dst,
             cols,
             stride,
             row_base,
@@ -577,7 +457,13 @@ impl<'a> Lowerer<'a> {
                 global_row,
                 global_col,
                 tile_ptr,
-            } = self.copy_lane_pointer_and_globals(expressions, &mut accept, flat, lane_layout)?;
+            } = self.copy_lane_pointer_and_globals(
+                expressions,
+                &mut accept,
+                flat,
+                dst,
+                lane_layout,
+            )?;
             let storage_index = self.storage_index_from_coords(
                 expressions,
                 src,
@@ -594,14 +480,11 @@ impl<'a> Lowerer<'a> {
                 },
                 Span::default(),
             );
-
             Ok(accept)
         })
     }
 
     /// True if the storage view's innermost axis is contiguous (stride 1).
-    /// Vec4 loads can only fold to a single transaction when consecutive cols
-    /// land on consecutive storage addresses.
     fn storage_has_unit_inner_stride(layout: &Layout) -> bool {
         if !layout.is_affine() {
             return false;
@@ -613,25 +496,20 @@ impl<'a> Lowerer<'a> {
     fn lower_copy_quant_to_tile(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
-        dst: TileRef,
+        dst: &Tile,
         src: &QuantizedMatrix,
-        offsets: TileCoordExprs<'_>,
+        row_offset: &Expr,
+        col_offset: &Expr,
     ) -> Result<(), LowerError> {
         if !matches!(dst.element, ElementType::F32 | ElementType::F16) {
-            return Err(LowerError::TileElementMismatch {
-                tile: dst.id,
-                declared: dst.element,
-                used: ElementType::F32,
-            });
+            return Err(LowerError::UnsupportedOperation(
+                "quantized tile copy requires an f32/f16 tile",
+            ));
         }
-        let layout = self.tile_layout(dst)?;
+        let layout = self.tile_layout(dst);
         let [rows, cols] = Self::tile_shape(layout)?;
         let stride = Self::row_major_tile_stride(layout)?;
-        // We dispatch into format-specific N-wide vectorized helpers when N
-        // divides the tile-row dimension. Otherwise we fall back to one
-        // dequant per invocation per pass.
         let n = match src.format {
             GgmlQuantFormat::Q8_0
             | GgmlQuantFormat::Q8_0Native
@@ -643,8 +521,8 @@ impl<'a> Lowerer<'a> {
             _ => 0,
         };
         let local = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
-        let row_base = self.lower_tile_expr(expressions, scratch, body, offsets.row)?;
-        let col_base = self.lower_tile_expr(expressions, scratch, body, offsets.col)?;
+        let row_base = self.lower_expr(expressions, body, row_offset)?;
+        let col_base = self.lower_expr(expressions, body, col_offset)?;
 
         if n > 0 && rows.is_multiple_of(n) {
             let groups_per_col = rows / n;
@@ -793,10 +671,8 @@ impl<'a> Lowerer<'a> {
             return Ok(());
         }
 
-        // Scalar fallback: one element per invocation per pass.
         let total = rows * cols;
         let lane_layout = CopyLaneLayout {
-            dst,
             cols,
             stride,
             row_base,
@@ -808,7 +684,13 @@ impl<'a> Lowerer<'a> {
                 global_row,
                 global_col,
                 tile_ptr,
-            } = self.copy_lane_pointer_and_globals(expressions, &mut accept, flat, lane_layout)?;
+            } = self.copy_lane_pointer_and_globals(
+                expressions,
+                &mut accept,
+                flat,
+                dst,
+                lane_layout,
+            )?;
             let row_ok = self.cmp_lit(
                 expressions,
                 &mut accept,
@@ -880,21 +762,30 @@ impl<'a> Lowerer<'a> {
         })
     }
 
+    /// Lower `Stmt::CoopStore` to a `Statement::CooperativeStore`. Never routed
+    /// through the per-lane `Store` path.
     fn lower_store_coop_acc(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
-        acc: LocalRef,
+        acc: &Local,
         dst: &StorageView,
-        coords: TileCoordExprs<'_>,
+        addr: &Addr,
     ) -> Result<(), LowerError> {
         // Flush any pending acc SSA so the Load below sees the current value.
         self.flush_coop_acc_cache(expressions, body);
         let acc_local = self.private_local(acc)?;
         let (stride_u, row_major) = Self::cooperative_store_layout(&dst.layout)?;
-        let row_h = self.lower_tile_expr(expressions, scratch, body, coords.row)?;
-        let col_h = self.lower_tile_expr(expressions, scratch, body, coords.col)?;
+        let (row, col) = match addr {
+            Addr::Rc2 { row, col } => (row, col),
+            Addr::Linear(_) => {
+                return Err(LowerError::UnsupportedOperation(
+                    "cooperative store requires a rank-2 address",
+                ));
+            }
+        };
+        let row_h = self.lower_expr(expressions, body, row)?;
+        let col_h = self.lower_expr(expressions, body, col)?;
         let storage_index =
             self.storage_index_from_coords(expressions, dst, &[row_h, col_h], body)?;
         let storage_ptr = self.storage_dynamic_pointer(expressions, dst, storage_index, body)?;
@@ -973,18 +864,15 @@ impl<'a> Lowerer<'a> {
         self.add(expressions, body, row_offset, col)
     }
 
-    /// Resolve a flat invocation index into the destination tile pointer plus
-    /// the source's global (row, col). Shared by `lower_copy_to_tile` and the
-    /// scalar fallback in `lower_copy_quant_to_tile`.
     fn copy_lane_pointer_and_globals(
         &self,
         expressions: &mut Arena<Expression>,
         body: &mut Block,
         flat: Handle<Expression>,
+        dst: &Tile,
         layout: CopyLaneLayout,
     ) -> Result<CopyLaneCoords, LowerError> {
         let CopyLaneLayout {
-            dst,
             cols,
             stride,
             row_base,
@@ -1005,23 +893,22 @@ impl<'a> Lowerer<'a> {
     }
 }
 
-/// One copy lane's resolved global source (row, col) and destination tile
-/// pointer. Returned by `Lowerer::copy_lane_pointer_and_globals`.
-pub(super) struct CopyLaneCoords {
-    pub global_row: Handle<Expression>,
-    pub global_col: Handle<Expression>,
-    pub tile_ptr: Handle<Expression>,
+/// `Rc::as_ptr` key for a `Local` decl, typed as `*const LocalDecl` for the
+/// coop acc-value memo.
+fn local_key_decl(local: &Local) -> *const LocalDecl {
+    std::rc::Rc::as_ptr(local)
 }
 
-#[derive(Clone, Copy)]
-struct TileCoordExprs<'a> {
-    row: &'a Expr,
-    col: &'a Expr,
+/// One copy lane's resolved global source (row, col) and destination tile
+/// pointer.
+struct CopyLaneCoords {
+    global_row: Handle<Expression>,
+    global_col: Handle<Expression>,
+    tile_ptr: Handle<Expression>,
 }
 
 #[derive(Clone, Copy)]
 struct CopyLaneLayout {
-    dst: TileRef,
     cols: u32,
     stride: u32,
     row_base: Handle<Expression>,

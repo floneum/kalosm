@@ -1,4 +1,6 @@
-use fusor_tile_ir::{tile, GgmlQuantFormat, KernelIr, Shape, TileLiteral, WorkgroupAxis, F32};
+use fusor_tile_ir::{
+    tile, GgmlQuantFormat, KernelIr, ScalarElement, Shape, TileLiteral, WorkgroupAxis,
+};
 use fusor_tile_ir_kernels as tile_ir_kernels;
 
 fn fused_bias_gelu_residual_ir(rows: u32, cols: u32) -> KernelIr {
@@ -6,12 +8,13 @@ fn fused_bias_gelu_residual_ir(rows: u32, cols: u32) -> KernelIr {
     assert!(cols <= BLOCK as u32, "example emits one tile per row");
 
     tile::build(|phase| {
-        let x = phase.storage_read::<F32, 2>(Shape::new([rows, cols]));
-        let bias = phase.storage_read::<F32, 1>(Shape::new([cols]));
-        let residual = phase.storage_read::<F32, 2>(Shape::new([rows, cols]));
-        let y = phase.storage_write::<F32, 2>(Shape::new([rows, cols]));
+        let f32 = ScalarElement::F32.element();
+        let x = phase.storage_read(f32, Shape::new([rows, cols]));
+        let bias = phase.storage_read(f32, Shape::new([cols]));
+        let residual = phase.storage_read(f32, Shape::new([rows, cols]));
+        let y = phase.storage_write(f32, Shape::new([rows, cols]));
 
-        phase.program_grid::<BLOCK>([1, rows, 1], |program| {
+        phase.program_grid(BLOCK as u32, [1, rows, 1], |program| {
             let row = program.program_id(WorkgroupAxis::Y);
             let col = program.lane();
             let mask = col.lt(cols);
@@ -34,11 +37,12 @@ fn fused_rms_norm_silu_ir(rows: u32, cols: u32, eps: f32) -> KernelIr {
     assert!(cols <= BLOCK as u32, "example emits one tile per row");
 
     tile::build(|phase| {
-        let x = phase.storage_read::<F32, 2>(Shape::new([rows, cols]));
-        let weight = phase.storage_read::<F32, 1>(Shape::new([cols]));
-        let y = phase.storage_write::<F32, 2>(Shape::new([rows, cols]));
+        let f32 = ScalarElement::F32.element();
+        let x = phase.storage_read(f32, Shape::new([rows, cols]));
+        let weight = phase.storage_read(f32, Shape::new([cols]));
+        let y = phase.storage_write(f32, Shape::new([rows, cols]));
 
-        phase.program_grid::<BLOCK>([1, rows, 1], |program| {
+        phase.program_grid(BLOCK as u32, [1, rows, 1], |program| {
             let row = program.program_id(WorkgroupAxis::Y);
             let col = program.lane();
             let mask = col.lt(cols);
@@ -65,10 +69,11 @@ fn softmax_ir(rows: u32, cols: u32) -> KernelIr {
     assert!(cols <= BLOCK as u32, "example emits one tile per row");
 
     tile::build(|phase| {
-        let x = phase.storage_read::<F32, 2>(Shape::new([rows, cols]));
-        let y = phase.storage_write::<F32, 2>(Shape::new([rows, cols]));
+        let f32 = ScalarElement::F32.element();
+        let x = phase.storage_read(f32, Shape::new([rows, cols]));
+        let y = phase.storage_write(f32, Shape::new([rows, cols]));
 
-        phase.program_grid::<BLOCK>([1, rows, 1], |program| {
+        phase.program_grid(BLOCK as u32, [1, rows, 1], |program| {
             let row = program.program_id(WorkgroupAxis::Y);
             let col = program.lane();
             let mask = col.lt(cols);
@@ -85,9 +90,10 @@ fn softmax_ir(rows: u32, cols: u32) -> KernelIr {
 
 fn qmatmul_ir(format: GgmlQuantFormat, m: u32, n: u32, k: u32) -> KernelIr {
     tile::build(|phase| {
-        let a = phase.storage_read::<F32, 2>(Shape::new([m, k]));
+        let f32 = ScalarElement::F32.element();
+        let a = phase.storage_read(f32, Shape::new([m, k]));
         let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
-        let y = phase.storage_write::<F32, 2>(Shape::new([m, n]));
+        let y = phase.storage_write(f32, Shape::new([m, n]));
 
         tile_ir_kernels::qmatmul_with_epilogue(
             phase,
@@ -103,9 +109,10 @@ fn qmatmul_ir(format: GgmlQuantFormat, m: u32, n: u32, k: u32) -> KernelIr {
 
 fn qgemv_ir(format: GgmlQuantFormat, n: u32, k: u32) -> KernelIr {
     tile::build(|phase| {
-        let a = phase.storage_read::<F32, 2>(Shape::new([1, k]));
+        let f32 = ScalarElement::F32.element();
+        let a = phase.storage_read(f32, Shape::new([1, k]));
         let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
-        let y = phase.storage_write::<F32, 2>(Shape::new([1, n]));
+        let y = phase.storage_write(f32, Shape::new([1, n]));
 
         tile_ir_kernels::qgemv_with_epilogue(
             phase,
@@ -120,9 +127,10 @@ fn qgemv_ir(format: GgmlQuantFormat, n: u32, k: u32) -> KernelIr {
 
 fn qgemv_with_silu_epilogue_ir(format: GgmlQuantFormat, n: u32, k: u32) -> KernelIr {
     tile::build(|phase| {
-        let a = phase.storage_read::<F32, 2>(Shape::new([1, k]));
+        let f32 = ScalarElement::F32.element();
+        let a = phase.storage_read(f32, Shape::new([1, k]));
         let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
-        let y = phase.storage_write::<F32, 2>(Shape::new([1, n]));
+        let y = phase.storage_write(f32, Shape::new([1, n]));
 
         // Kernel helpers can accept Tile IR closures too. The qgemv body owns
         // the quantized dot product, then injects this epilogue before the

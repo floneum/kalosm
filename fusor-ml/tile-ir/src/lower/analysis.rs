@@ -1,324 +1,312 @@
 use super::*;
 
-/// Which subgroup builtins are referenced anywhere in the IR. Aggregated by
-/// `Lowerer::subgroup_index_usage` so that one tree walk fills all four flags
-/// instead of four separate single-flag walks.
-#[derive(Copy, Clone, Default, PartialEq, Eq)]
-pub(super) struct SubgroupIndexUsage {
+/// Everything one fused analysis walk over the IR tree discovers: the
+/// [`Capabilities`] and the deduplicated, first-use-ordered declaration lists
+/// the lowerer emits as the global/local arenas. Filled by [`Analysis::run`].
+#[derive(Default)]
+pub(super) struct Analysis {
+    pub caps: Capabilities,
+    pub buffers: Vec<Buffer>,
+    pub tiles: Vec<Tile>,
+    pub locals: Vec<Local>,
+    buffer_seen: FxHashMap<*const (), ()>,
+    tile_seen: FxHashMap<*const (), ()>,
+    local_seen: FxHashMap<*const (), ()>,
+}
+
+/// Capability flags aggregated up front (not lazy first-use). `uses_f16` is
+/// decided here so an f16 handle on a non-f16 adapter still yields
+/// `UnsupportedOperation`.
+#[derive(Copy, Clone, Default)]
+pub(super) struct Capabilities {
+    pub uses_f16: bool,
+    pub native_f16_scales: bool,
+    pub uses_subgroup_reduce: bool,
+    pub uses_coop: bool,
     pub subgroup_id: bool,
     pub subgroup_lane: bool,
     pub subgroup_size: bool,
     pub num_subgroups: bool,
 }
 
-impl<'a> Lowerer<'a> {
-    pub(super) fn max_tile_program_block(ir: &KernelIr) -> u32 {
-        ir.body().block
-    }
-
-    pub(super) fn live_tiles(ir: &KernelIr) -> Vec<bool> {
-        let mut live = vec![false; ir.tiles().len()];
-        for stmt in &ir.body().body {
-            Self::mark_tile_stmt_live(stmt, &mut live);
+impl Analysis {
+    pub(super) fn run(ir: &KernelIr) -> Self {
+        let mut analysis = Analysis::default();
+        for buffer in &ir.buffers {
+            analysis.note_buffer(buffer);
         }
-        live
+        for stmt in &ir.body {
+            analysis.visit_stmt(stmt);
+        }
+        analysis
     }
 
-    fn mark_tile_stmt_live(stmt: &TileStmt, live: &mut [bool]) {
+    fn note_element(&mut self, element: ElementType) {
+        if element.uses_f16() {
+            self.caps.uses_f16 = true;
+        }
+    }
+
+    fn note_buffer(&mut self, buffer: &Buffer) {
+        self.note_element(buffer.element);
+        if self.buffer_seen.insert(buffer_key(buffer), ()).is_none() {
+            self.buffers.push(buffer.clone());
+        }
+    }
+
+    fn note_view(&mut self, view: &StorageView) {
+        self.note_buffer(&view.buffer);
+    }
+
+    fn note_quant(&mut self, matrix: &QuantizedMatrix) {
+        self.note_view(&matrix.data);
+        if matrix.format.has_native_f16_scales() {
+            self.caps.native_f16_scales = true;
+        }
+    }
+
+    fn note_tile(&mut self, tile: &Tile) {
+        self.note_element(tile.element);
+        if self.tile_seen.insert(tile_key(tile), ()).is_none() {
+            self.tiles.push(tile.clone());
+        }
+    }
+
+    fn note_local(&mut self, local: &Local) {
+        self.note_element(local.element);
+        if self.local_seen.insert(local_key(local), ()).is_none() {
+            self.locals.push(local.clone());
+        }
+    }
+
+    fn visit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            TileStmt::Store(store) => Self::mark_tile_expr_live(&store.value, live),
-            TileStmt::StoreIndexed(store) => Self::mark_tile_expr_live(&store.value, live),
-            TileStmt::StoreLocal { value, .. } => Self::mark_tile_expr_live(value, live),
-            TileStmt::StoreWorkgroup { dst, value, .. } => {
-                Self::mark_tile_live(*dst, live);
-                Self::mark_tile_expr_live(value, live);
+            Stmt::Store {
+                dst,
+                addr,
+                value,
+                mask,
+            } => {
+                self.note_view(dst);
+                self.visit_addr(addr);
+                self.visit_expr(value);
+                self.visit_expr(mask);
             }
-            TileStmt::CopyToWorkgroupTile { dst, .. } => Self::mark_tile_live(*dst, live),
-            TileStmt::LoadCoop { tile, .. } => Self::mark_tile_live(*tile, live),
-            TileStmt::ZeroCoopAcc { .. }
-            | TileStmt::Barrier
-            | TileStmt::Mma { .. }
-            | TileStmt::LoadCoopBroadcast { .. }
-            | TileStmt::SetCoopAcc { .. }
-            | TileStmt::StoreCoopAcc { .. } => {}
-            TileStmt::If {
+            Stmt::StoreLocal { dst, value } => {
+                self.note_local(dst);
+                self.visit_expr(value);
+            }
+            Stmt::StoreTile { dst, index, value } => {
+                self.note_tile(dst);
+                self.visit_expr(index);
+                self.visit_expr(value);
+            }
+            Stmt::FillTile { dst, value } => {
+                self.note_tile(dst);
+                self.visit_expr(value);
+            }
+            Stmt::CoopStore { acc, dst, addr } => {
+                self.caps.uses_coop = true;
+                self.note_local(acc);
+                self.note_view(dst);
+                self.visit_addr(addr);
+            }
+            Stmt::If {
                 condition,
                 accept,
                 reject,
             } => {
-                Self::mark_tile_expr_live(condition, live);
+                self.visit_expr(condition);
                 for s in accept.iter().chain(reject.iter()) {
-                    Self::mark_tile_stmt_live(s, live);
+                    self.visit_stmt(s);
                 }
             }
-            TileStmt::Loop { body } => {
-                for s in body {
-                    Self::mark_tile_stmt_live(s, live);
-                }
-            }
-            TileStmt::Fold {
+            Stmt::Loop {
                 count,
-                body: fold_body,
+                index,
                 accumulators,
-                ..
+                body,
             } => {
-                Self::mark_tile_expr_live(count, live);
-                for stmt in fold_body {
-                    Self::mark_tile_stmt_live(stmt, live);
+                if let Some(count) = count {
+                    self.visit_expr(count);
+                }
+                if let Some(index) = index {
+                    self.note_local(index);
                 }
                 for acc in accumulators {
-                    Self::mark_tile_expr_live(&acc.init, live);
-                    Self::mark_tile_expr_live(&acc.update, live);
+                    self.note_local(&acc.local);
+                    self.visit_expr(&acc.init);
+                    self.visit_expr(&acc.update);
+                }
+                for s in body {
+                    self.visit_stmt(s);
                 }
             }
-            TileStmt::Break | TileStmt::Return => {}
+            Stmt::Break | Stmt::Return | Stmt::Barrier => {}
         }
     }
 
-    pub(super) fn uses_cooperative_matrix(ir: &KernelIr) -> bool {
-        ir.body()
-            .body
-            .iter()
-            .any(Self::tile_stmt_uses_cooperative_matrix)
-    }
-
-    pub(super) fn uses_subgroup_reduce(ir: &KernelIr) -> bool {
-        Self::tile_programs_expr_any(ir, |expr| matches!(expr, Expr::SubgroupReduce { .. }))
-    }
-
-    pub(super) fn uses_shader_float16_in_float32(ir: &KernelIr) -> bool {
-        Self::tile_programs_expr_any(ir, Self::expr_uses_native_f16_scales)
-            || ir.body().body.iter().any(|stmt| {
-                Self::tile_stmt_tree_any(stmt, &mut |stmt| {
-                    matches!(
-                        stmt,
-                        TileStmt::CopyToWorkgroupTile {
-                            src: CopySource::Quantized(matrix),
-                            ..
-                        } if matrix.format.has_native_f16_scales()
-                    )
-                })
-            })
-    }
-
-    fn expr_uses_native_f16_scales(expr: &Expr) -> bool {
-        match expr {
-            Expr::Load(load) => matches!(
-                &load.src,
-                LoadSource::Quantized(matrix) if matrix.format.has_native_f16_scales()
-            ),
-            Expr::QuantizedBlockLane { src, .. } | Expr::QuantizedDot { src, .. } => {
-                src.format.has_native_f16_scales()
+    fn visit_addr(&mut self, addr: &Addr) {
+        match addr {
+            Addr::Linear(index) => self.visit_expr(index),
+            Addr::Rc2 { row, col } => {
+                self.visit_expr(row);
+                self.visit_expr(col);
             }
-            _ => false,
         }
     }
 
-    pub(super) fn subgroup_index_usage(ir: &KernelIr) -> SubgroupIndexUsage {
-        let mut usage = SubgroupIndexUsage::default();
-        Self::tile_programs_expr_any(ir, |expr| {
-            if let Expr::Builtin(builtin) = expr {
-                use crate::ir::Builtin;
-                match builtin {
-                    Builtin::SubgroupId => usage.subgroup_id = true,
-                    Builtin::SubgroupLane => usage.subgroup_lane = true,
-                    Builtin::SubgroupSize => usage.subgroup_size = true,
-                    Builtin::NumSubgroups => usage.num_subgroups = true,
-                    _ => {}
-                }
-            }
-            // Always continue: we want to collect every flag.
-            false
-        });
-        usage
+    fn visit_source(&mut self, src: &Source) {
+        match src {
+            Source::Storage(view) => self.note_view(view),
+            Source::Quantized(matrix) => self.note_quant(matrix),
+        }
     }
 
-    pub(super) fn tile_programs_expr_any<F>(ir: &KernelIr, mut pred: F) -> bool
-    where
-        F: FnMut(&Expr) -> bool,
-    {
-        ir.body()
-            .body
-            .iter()
-            .any(|stmt| Self::tile_stmt_expr_any(stmt, &mut pred))
+    fn visit_coop_src(&mut self, src: &CoopSrc) {
+        match src {
+            CoopSrc::TileRegion { tile, row, col } => {
+                self.note_tile(tile);
+                self.visit_expr(row);
+                self.visit_expr(col);
+            }
+            CoopSrc::BroadcastCol { src, col } => {
+                self.note_view(src);
+                self.visit_expr(col);
+            }
+        }
     }
 
-    pub(super) fn tile_stmt_expr_any<F>(stmt: &TileStmt, pred: &mut F) -> bool
-    where
-        F: FnMut(&Expr) -> bool,
-    {
-        match stmt {
-            TileStmt::Store(store) => Self::tile_expr_any(&store.value, pred),
-            TileStmt::StoreIndexed(store) => Self::tile_expr_any(&store.value, pred),
-            TileStmt::StoreLocal { value, .. } | TileStmt::StoreWorkgroup { value, .. } => {
-                Self::tile_expr_any(value, pred)
+    fn visit_reduce_kind(&mut self, kind: &ReduceKind) {
+        match kind {
+            ReduceKind::Subgroup => self.caps.uses_subgroup_reduce = true,
+            ReduceKind::Workgroup { scratch, .. } => self.note_tile(scratch),
+            ReduceKind::Loop { index, scratch, .. } => {
+                self.note_local(index);
+                self.note_tile(scratch);
             }
-            TileStmt::If {
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        self.note_element(expr.element());
+        match expr.kind() {
+            ExprKind::Literal(_) => {}
+            ExprKind::Builtin(builtin) => match builtin {
+                Builtin::SubgroupId => self.caps.subgroup_id = true,
+                Builtin::SubgroupLane => self.caps.subgroup_lane = true,
+                Builtin::SubgroupSize => self.caps.subgroup_size = true,
+                Builtin::NumSubgroups => self.caps.num_subgroups = true,
+                Builtin::Lane | Builtin::ProgramId(_) => {}
+            },
+            ExprKind::LoadLocal(local) => self.note_local(local),
+            ExprKind::Load {
+                src,
+                addr,
+                mask,
+                fill,
+            } => {
+                self.visit_source(src);
+                self.visit_addr(addr);
+                self.visit_expr(mask);
+                self.visit_expr(fill);
+            }
+            ExprKind::LoadTile { tile, index } => {
+                self.note_tile(tile);
+                self.visit_expr(index);
+            }
+            ExprKind::Unary { value, .. } => self.visit_expr(value),
+            ExprKind::Binary { left, right, .. } | ExprKind::Compare { left, right, .. } => {
+                self.visit_expr(left);
+                self.visit_expr(right);
+            }
+            ExprKind::Cast { value, to } | ExprKind::Bitcast { value, to } => {
+                self.note_element(*to);
+                self.visit_expr(value);
+            }
+            ExprKind::Select {
                 condition,
                 accept,
                 reject,
             } => {
-                Self::tile_expr_any(condition, pred)
-                    || accept
-                        .iter()
-                        .chain(reject.iter())
-                        .any(|stmt| Self::tile_stmt_expr_any(stmt, pred))
+                self.visit_expr(condition);
+                self.visit_expr(accept);
+                self.visit_expr(reject);
             }
-            TileStmt::Loop { body } => body.iter().any(|stmt| Self::tile_stmt_expr_any(stmt, pred)),
-            TileStmt::Fold {
-                count,
-                body: fold_body,
-                accumulators,
-                ..
-            } => {
-                Self::tile_expr_any(count, pred)
-                    || fold_body.iter().any(|s| Self::tile_stmt_expr_any(s, pred))
-                    || accumulators.iter().any(|acc| {
-                        Self::tile_expr_any(&acc.init, pred)
-                            || Self::tile_expr_any(&acc.update, pred)
-                    })
+            ExprKind::Vec { parts, .. } => {
+                for part in parts {
+                    self.visit_expr(part);
+                }
             }
-            TileStmt::StoreCoopAcc { row, col, .. } => {
-                Self::tile_expr_any(row, pred) || Self::tile_expr_any(col, pred)
+            ExprKind::Dot { left, right } => {
+                self.visit_expr(left);
+                self.visit_expr(right);
             }
-            TileStmt::CopyToWorkgroupTile {
-                row_offset,
-                col_offset,
-                ..
-            } => Self::tile_expr_any(row_offset, pred) || Self::tile_expr_any(col_offset, pred),
-            TileStmt::LoadCoop { row, col, .. } => {
-                Self::tile_expr_any(row, pred) || Self::tile_expr_any(col, pred)
+            ExprKind::Reduce { kind, value, .. } => {
+                self.visit_reduce_kind(kind);
+                self.visit_expr(value);
             }
-            TileStmt::LoadCoopBroadcast { col, .. } => Self::tile_expr_any(col, pred),
-            TileStmt::ZeroCoopAcc { .. }
-            | TileStmt::Barrier
-            | TileStmt::Mma { .. }
-            | TileStmt::SetCoopAcc { .. }
-            | TileStmt::Break
-            | TileStmt::Return => false,
-        }
-    }
-
-    pub(super) fn tile_expr_any<F>(expr: &Expr, pred: &mut F) -> bool
-    where
-        F: FnMut(&Expr) -> bool,
-    {
-        pred(expr) || Self::tile_expr_children_any(expr, |child| Self::tile_expr_any(child, pred))
-    }
-
-    pub(super) fn tile_expr_children_any<F>(expr: &Expr, mut pred: F) -> bool
-    where
-        F: FnMut(&Expr) -> bool,
-    {
-        match expr {
-            Expr::Reduce { value, .. } => pred(value),
-            Expr::LoadLocal(_) | Expr::Literal(_) | Expr::Builtin(_) => false,
-            Expr::Load(load) => {
-                pred(&load.row) || pred(&load.col) || pred(&load.mask) || pred(&load.fill)
+            ExprKind::CoopLoad { src, .. } => {
+                self.caps.uses_coop = true;
+                self.visit_coop_src(src);
             }
-            Expr::LoadLinear(load) => pred(&load.index) || pred(&load.mask) || pred(&load.fill),
-            Expr::LoadWorkgroup { index, .. } => pred(index),
-            Expr::QuantizedBlockLane {
+            ExprKind::CoopMma { a, b, c } => {
+                self.caps.uses_coop = true;
+                self.visit_expr(a);
+                self.visit_expr(b);
+                self.visit_expr(c);
+            }
+            ExprKind::Dequantize {
+                src,
                 k_base,
                 col,
                 mask,
                 fill,
                 ..
-            } => pred(k_base) || pred(col) || pred(mask) || pred(fill),
-            Expr::Unary { value, .. }
-            | Expr::Cast { value, .. }
-            | Expr::Bitcast { value, .. }
-            | Expr::SubgroupReduce { value, .. } => pred(value),
-            Expr::Binary { left, right, .. }
-            | Expr::Compare { left, right, .. }
-            | Expr::VectorDot { left, right, .. } => pred(left) || pred(right),
-            Expr::Select {
-                condition,
-                accept,
-                reject,
-            } => pred(condition) || pred(accept) || pred(reject),
-            Expr::ComposeVector { values, .. } => values.iter().any(pred),
-            Expr::QuantizedDot {
+            } => {
+                self.note_quant(src);
+                self.visit_expr(k_base);
+                self.visit_expr(col);
+                self.visit_expr(mask);
+                self.visit_expr(fill);
+            }
+            ExprKind::QuantizedDot {
+                src,
                 activations,
-                k,
+                k_base,
                 col,
                 mask,
                 fill,
-                ..
+                packing: _,
             } => {
-                let activations_match = match activations {
-                    PackedActivations::F32(a) | PackedActivations::Q8(a) => a.iter().any(&mut pred),
-                    PackedActivations::Q4KGgml { low, high, sums } => low
-                        .iter()
-                        .chain(high.iter())
-                        .chain(sums.iter())
-                        .any(&mut pred),
-                };
-                let k_match = match k {
-                    DotK::Base(k_base) => pred(k_base),
-                    DotK::Block { block, c0, c1 } => pred(block) || pred(c0) || pred(c1),
-                };
-                activations_match || k_match || pred(col) || pred(mask) || pred(fill)
+                // Visit the activations (buffer `a`) before the quantized
+                // weights (`src`, buffer `b`) so first-use buffer order matches
+                // the dequant+dot path and the builder's creation order.
+                for activation in activations {
+                    self.visit_expr(activation);
+                }
+                self.note_quant(src);
+                self.visit_expr(k_base);
+                self.visit_expr(col);
+                self.visit_expr(mask);
+                self.visit_expr(fill);
             }
+            ExprKind::LaneOf { block, .. } => self.visit_expr(block),
+            ExprKind::Shared(inner) => self.visit_expr(inner),
         }
     }
+}
 
-    fn tile_stmt_uses_cooperative_matrix(stmt: &TileStmt) -> bool {
-        // `CopyToWorkgroupTile` is plain workgroup-memory staging — it only
-        // uses `LocalInvocationIndex`. The real cooperative-matrix signal is
-        // a load/store/MMA against an accumulator. Counting the workgroup
-        // copy here would force SUBGROUP/COOPERATIVE_MATRIX capabilities on
-        // workgroup-only kernels like `qmatmul_workgroup`, breaking adapters
-        // (Mesa lavapipe in Linux CI) without `Features::SUBGROUP`.
-        Self::tile_stmt_tree_any(stmt, &mut |s| {
-            matches!(
-                s,
-                TileStmt::ZeroCoopAcc { .. }
-                    | TileStmt::LoadCoop { .. }
-                    | TileStmt::LoadCoopBroadcast { .. }
-                    | TileStmt::Mma { .. }
-                    | TileStmt::SetCoopAcc { .. }
-                    | TileStmt::StoreCoopAcc { .. }
-            )
-        })
+impl<'a> Lowerer<'a> {
+    pub(super) fn collect_buffers(&self) -> Vec<Buffer> {
+        self.buffer_decls.clone()
     }
 
-    /// Pre-order tree-any over a `TileStmt`: returns true if `pred` matches
-    /// the statement itself or any nested child. Visitors that test a
-    /// statement-shape predicate (no expr walking) compose on top of this.
-    fn tile_stmt_tree_any(stmt: &TileStmt, pred: &mut impl FnMut(&TileStmt) -> bool) -> bool {
-        if pred(stmt) {
-            return true;
-        }
-        match stmt {
-            TileStmt::If { accept, reject, .. } => accept
-                .iter()
-                .chain(reject.iter())
-                .any(|s| Self::tile_stmt_tree_any(s, pred)),
-            TileStmt::Loop { body } | TileStmt::Fold { body, .. } => {
-                body.iter().any(|s| Self::tile_stmt_tree_any(s, pred))
-            }
-            _ => false,
-        }
+    pub(super) fn collect_tiles(&self) -> Vec<Tile> {
+        self.tile_decls.clone()
     }
 
-    fn mark_tile_expr_live(expr: &Expr, live: &mut [bool]) {
-        match expr {
-            Expr::LoadWorkgroup { src, .. } => Self::mark_tile_live(*src, live),
-            Expr::Reduce { scratch, .. } => {
-                Self::mark_tile_live(*scratch, live);
-            }
-            _ => {}
-        }
-        Self::tile_expr_children_any(expr, |child| {
-            Self::mark_tile_expr_live(child, live);
-            false
-        });
-    }
-
-    pub(super) fn mark_tile_live(tile: TileRef, live: &mut [bool]) {
-        if let Some(slot) = live.get_mut(tile.id.index()) {
-            *slot = true;
-        }
+    pub(super) fn collect_locals(&self) -> Vec<Local> {
+        self.local_decls.clone()
     }
 }

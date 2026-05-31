@@ -3,37 +3,6 @@
 //! `fusor-tile-ir` contains the IR, lowerer, and generic tile builder. This
 //! crate contains concrete kernels: dense matmul/GEMV, quantized matmul/GEMV,
 //! dequantization, flash attention, top-k, RMS norm, and Mirostat sampling.
-//!
-//! ```
-//! use fusor_tile_ir::{tile, GgmlQuantFormat, Shape, F32};
-//! use fusor_tile_ir_kernels::{qgemv_with_epilogue, quantized_matrix, UnaryEpilogue};
-//!
-//! let ir = tile::build(|program| {
-//!     let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
-//!     let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 128);
-//!     let y = program.storage_write::<F32, 2>(Shape::new([1, 128]));
-//!     qgemv_with_epilogue(program, &a, &b, &y, 1, Option::<&UnaryEpilogue>::None);
-//! });
-//! # let _ = ir;
-//! ```
-//!
-//! For runtime-owned bindings, pair kernel constructors with
-//! [`fusor_tile_ir::KernelBuilder`]:
-//!
-//! ```
-//! use fusor_tile_ir::{
-//!     ElementType, GgmlQuantFormat, KernelBuilder, KernelTensorRef, Layout, MemoryLevel, Shape,
-//! };
-//! use fusor_tile_ir_kernels::{qdequantize, quantized_matrix_for};
-//!
-//! let mut kb = KernelBuilder::<&'static str>::new();
-//! let q = quantized_matrix_for(&mut kb, "matrix", GgmlQuantFormat::Q4K, 256, 4);
-//! let layout = Layout::contiguous(MemoryLevel::Storage, Shape::new([1024]));
-//! let y = kb.write_element::<1>(ElementType::F32, KernelTensorRef::new("output", layout));
-//! qdequantize(kb.program(), &q, &y, 1);
-//! let (_ir, bindings) = kb.finish();
-//! assert_eq!(bindings, ["matrix", "output"]);
-//! ```
 
 mod dispatch;
 mod grid;

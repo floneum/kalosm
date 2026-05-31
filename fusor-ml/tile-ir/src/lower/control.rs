@@ -1,5 +1,4 @@
 use super::*;
-use crate::lower::tile_program::TileFoldLowering;
 
 impl<'a> Lowerer<'a> {
     pub(super) fn push_guarded_or_full_block(
@@ -63,12 +62,11 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Same shape as `emit_counted_loop` but takes a dynamic `iterations`
-    /// expression. Compares `loop_index >= iterations_expr` at the top of
-    /// each iteration and breaks when true.
+    /// expression. Compares `loop_index >= iterations_expr` at the top of each
+    /// iteration and breaks when true.
     pub(super) fn emit_dynamic_counted_loop<T>(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
         iterations: Handle<Expression>,
         build_body: impl FnOnce(
@@ -77,7 +75,8 @@ impl<'a> Lowerer<'a> {
             Handle<Expression>,
         ) -> Result<T, LowerError>,
     ) -> Result<T, LowerError> {
-        let loop_ptr = self.local_var(expressions, scratch.loop_index);
+        let loop_local = self.scratch_u32(ScratchKind::LoopIndex, 0);
+        let loop_ptr = self.local_var(expressions, loop_local);
         let zero = self.u32(expressions, 0);
         body.push(
             Statement::Store {
@@ -110,7 +109,7 @@ impl<'a> Lowerer<'a> {
         let result = build_body(expressions, &mut loop_body, loop_index)?;
 
         loop_body.push(
-            self.increment_u32_local(expressions, scratch.loop_index, 1),
+            self.increment_u32_local(expressions, loop_local, 1),
             Span::default(),
         );
         body.push(
@@ -127,7 +126,6 @@ impl<'a> Lowerer<'a> {
     pub(super) fn emit_counted_loop<T>(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
         iterations: u32,
         build_body: impl FnOnce(
@@ -137,38 +135,52 @@ impl<'a> Lowerer<'a> {
         ) -> Result<T, LowerError>,
     ) -> Result<T, LowerError> {
         let count = self.u32(expressions, iterations);
-        self.emit_dynamic_counted_loop(expressions, scratch, body, count, build_body)
+        self.emit_dynamic_counted_loop(expressions, body, count, build_body)
     }
 
-    pub(super) fn snapshot_tile_loop_caches(&self) -> TileLoopCacheSnapshot {
-        let snapshot = TileLoopCacheSnapshot {
-            block_dequant: self.block_dequant_cache.borrow_mut().drain().collect(),
+    // ---- per-iteration cache snapshot / restore ----
+
+    pub(super) fn snapshot_loop_caches(&self) -> LoopCacheSnapshot {
+        let snapshot = LoopCacheSnapshot {
+            dequant_memo: self.dequant_memo.borrow_mut().drain().collect(),
+            expr_memo: self.expr_memo.borrow_mut().drain().collect(),
         };
         self.q8_activation_pack_cache.borrow_mut().clear();
         snapshot
     }
 
-    pub(super) fn restore_tile_loop_caches(&self, snapshot: TileLoopCacheSnapshot) {
-        Self::replace_cache(&self.block_dequant_cache, snapshot.block_dequant);
+    pub(super) fn restore_loop_caches(&self, snapshot: LoopCacheSnapshot) {
+        Self::replace_cache(&self.dequant_memo, snapshot.dequant_memo);
+        Self::replace_cache(&self.expr_memo, snapshot.expr_memo);
         self.q8_activation_pack_cache.borrow_mut().clear();
+    }
+
+    pub(super) fn lower_branch_block(
+        &self,
+        expressions: &mut Arena<Expression>,
+        stmts: &[Stmt],
+    ) -> Result<Block, LowerError> {
+        let saved = self.snapshot_loop_caches();
+        let mut block = Block::new();
+        let result = self.lower_stmt_body(expressions, &mut block, stmts);
+        self.restore_loop_caches(saved);
+        result.map(|()| block)
     }
 
     pub(super) fn snapshot_coop_loop_caches(&self) -> CoopLoopCacheSnapshot {
         CoopLoopCacheSnapshot {
-            fragments: self.coop_fragment_cache.borrow_mut().drain().collect(),
             acc_values: self.coop_acc_value_cache.borrow_mut().drain().collect(),
         }
     }
 
     pub(super) fn restore_coop_loop_caches(&self, snapshot: CoopLoopCacheSnapshot) {
-        Self::replace_cache(&self.coop_fragment_cache, snapshot.fragments);
         Self::replace_cache(&self.coop_acc_value_cache, snapshot.acc_values);
     }
 
-    /// Drain `cache` and refill it with `entries`. Snapshot/restore helpers
-    /// use this to atomically reset a cache to a previously-recorded set.
+    /// Drain `cache` and refill it with `entries`. Snapshot/restore helpers use
+    /// this to atomically reset a cache to a previously-recorded set.
     fn replace_cache<K: std::hash::Hash + Eq, V>(
-        cache: &RefCell<HashMap<K, V>>,
+        cache: &RefCell<FxHashMap<K, V>>,
         entries: Vec<(K, V)>,
     ) {
         let mut cache = cache.borrow_mut();
@@ -176,72 +188,62 @@ impl<'a> Lowerer<'a> {
         cache.extend(entries);
     }
 
-    /// Lower a `TileStmt::Fold`. Initializes each accumulator local from its
-    /// `init` expression in the surrounding scope, then emits a counted loop
-    /// over `0..count`. Inside the loop body, the iterator value is stored
-    /// into `iter_var`'s local, the body statements run, and each
-    /// accumulator's `update` expression is evaluated and stored back into its
-    /// local. After the loop, the locals hold the final values and are read by
-    /// subsequent `LoadLocal`s in the surrounding scope.
-    pub(super) fn lower_tile_fold_stmt(
+    /// Lower a counted `Stmt::Loop` (`count: Some(..)`). Initializes each
+    /// accumulator local from its `init` expression in the surrounding scope,
+    /// then emits a counted loop over `0..count`. Inside the loop body, the
+    /// iterator value is stored into `index`'s local, the body statements run,
+    /// and each accumulator's `update` expression is evaluated and stored back.
+    pub(super) fn lower_counted_loop(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
-        request: TileFoldLowering<'_>,
+        count: &Expr,
+        index: Option<&Local>,
+        accumulators: &[Accumulator],
+        loop_body: &[Stmt],
     ) -> Result<(), LowerError> {
-        let TileFoldLowering {
-            count,
-            iter_var,
-            body: fold_body,
-            accumulators,
-        } = request;
         // 1. Initialize each accumulator local from its init expression.
         for acc in accumulators {
-            let init_value = self.lower_tile_expr(expressions, scratch, body, &acc.init)?;
-            let local = self.private_local(LocalRef::new(acc.name, acc.element))?;
+            let init_value = self.lower_expr(expressions, body, &acc.init)?;
+            let local = self.private_local(&acc.local)?;
             self.store_local(expressions, body, local, init_value);
         }
 
         // 2. Lower the iterator's count expression in the surrounding scope.
-        let count_handle = self.lower_tile_expr(expressions, scratch, body, count)?;
+        let count_handle = self.lower_expr(expressions, body, count)?;
 
-        // 3. Emit the counted loop. Inside the body, store the loop index into
-        //    iter_var's local so subsequent LoadLocal(iter_var) reads see it.
-        let iter_var_local = self.private_local(LocalRef::new(iter_var, ElementType::U32))?;
+        // 3. Emit the counted loop, storing the loop index into `index`'s local.
+        let iter_var_local = index.map(|i| self.private_local(i)).transpose()?;
         self.emit_dynamic_counted_loop(
             expressions,
-            scratch,
             body,
             count_handle,
-            |expressions, loop_body, loop_index| {
-                // Store the loop index into iter_var's local.
-                self.store_local(expressions, loop_body, iter_var_local, loop_index);
+            |expressions, loop_block, loop_index| {
+                if let Some(iter_var_local) = iter_var_local {
+                    self.store_local(expressions, loop_block, iter_var_local, loop_index);
+                }
 
                 // Snapshot caches whose SSA handles are scoped to the outer
                 // block so the body's lowering can repopulate them inside the
                 // loop, then restore on exit. Coop fragments and acc-value SSA
-                // chains live within one iteration only; flush at the
-                // iteration boundary.
-                let tile_saved = self.snapshot_tile_loop_caches();
+                // chains live within one iteration only; flush at the iteration
+                // boundary.
+                let saved = self.snapshot_loop_caches();
                 let coop_saved = self.snapshot_coop_loop_caches();
 
-                for stmt in fold_body {
-                    self.lower_tile_stmt(expressions, scratch, loop_body, stmt)?;
+                for stmt in loop_body {
+                    self.lower_stmt(expressions, loop_block, stmt)?;
                 }
 
-                // Lower each accumulator's update expression and store it back
-                // into the accumulator's local.
                 for acc in accumulators {
-                    let value =
-                        self.lower_tile_expr(expressions, scratch, loop_body, &acc.update)?;
-                    let acc_local = self.private_local(LocalRef::new(acc.name, acc.element))?;
-                    self.store_local(expressions, loop_body, acc_local, value);
+                    let value = self.lower_expr(expressions, loop_block, &acc.update)?;
+                    let acc_local = self.private_local(&acc.local)?;
+                    self.store_local(expressions, loop_block, acc_local, value);
                 }
 
-                self.flush_coop_acc_cache(expressions, loop_body);
+                self.flush_coop_acc_cache(expressions, loop_block);
                 self.restore_coop_loop_caches(coop_saved);
-                self.restore_tile_loop_caches(tile_saved);
+                self.restore_loop_caches(saved);
                 Ok(())
             },
         )

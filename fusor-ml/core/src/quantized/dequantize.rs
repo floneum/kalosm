@@ -41,7 +41,7 @@ fn emit_qdequantize_kernel(
         params.k,
         params.n,
     );
-    let y = kb.write_element::<1>(
+    let y = kb.write(
         params.output_element,
         tile_ir::KernelTensorRef::new(params.output_buffer, params.output_layout),
     );

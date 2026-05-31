@@ -1,307 +1,6 @@
 use super::*;
 
-type Q4KGgmlAccumulateWord<'a> = fn(
-    &Lowerer<'a>,
-    &mut Arena<Expression>,
-    &mut Block,
-    Handle<Expression>,
-    &[Handle<Expression>],
-    usize,
-    &mut [Handle<Expression>; 4],
-);
-
 impl<'a> Lowerer<'a> {
-    pub(in crate::lower) fn q4k_ggml_dot(
-        &self,
-        expressions: &mut Arena<Expression>,
-        matrix: &QuantizedMatrix,
-        coords: GgmlBlockCoords,
-        activations: Q4KGgmlActivationHandles<'_>,
-        body: &mut Block,
-    ) -> Result<Handle<Expression>, LowerError> {
-        let Q4KGgmlActivationHandles {
-            low: a_low,
-            high: a_high,
-            sums,
-        } = activations;
-        if !matrix.format.is_q4k_family()
-            || a_low.len() != 16
-            || a_high.len() != 16
-            || sums.len() != 4
-        {
-            return Err(LowerError::UnsupportedOperation(
-                "q4k ggml dot requires a Q4K format, 16 low/high activations, and 4 sums",
-            ));
-        }
-        let GgmlBlockCoords {
-            block,
-            c0: iq,
-            c1: ir,
-            col,
-        } = coords;
-
-        let base = self.quantized_block_base(
-            expressions,
-            matrix,
-            block,
-            col,
-            matrix.format.block_words(),
-            body,
-        );
-        let (d, dmin) = self.q4k_load_d_dmin(expressions, matrix, base, body)?;
-        let (scale_offset, min_offset, extra_offset) = match matrix.format {
-            GgmlQuantFormat::Q4K => (2, 3, 4),
-            GgmlQuantFormat::Q4KNative => (1, 2, 3),
-            _ => unreachable!("q4k family checked above"),
-        };
-
-        let scale_shift = self.shl_lit(expressions, body, iq, 4);
-        let sc0 = self.load_word(expressions, matrix, base, scale_offset, body)?;
-        let sc1 = self.load_word(expressions, matrix, base, min_offset, body)?;
-        let sc2 = self.load_word(expressions, matrix, base, extra_offset, body)?;
-        let sc0 = self.shr(expressions, body, sc0, scale_shift);
-        let sc1 = self.shr(expressions, body, sc1, scale_shift);
-        let sc2 = self.shr(expressions, body, sc2, scale_shift);
-
-        let first_two = self.and_lit(expressions, body, sc0, 0x3f3f);
-        let second_two = self.and_lit(expressions, body, sc1, 0x3f3f);
-        let third_low = self.and_lit(expressions, body, sc2, 0x0f0f);
-        let third_high = self.and_lit(expressions, body, sc0, 0xc0c0);
-        let third_high = self.shr_lit(expressions, body, third_high, 2);
-        let third_two = self.bin(
-            expressions,
-            body,
-            BinaryOperator::InclusiveOr,
-            third_low,
-            third_high,
-        );
-        let fourth_low = self.shr_lit(expressions, body, sc2, 4);
-        let fourth_low = self.and_lit(expressions, body, fourth_low, 0x0f0f);
-        let fourth_high = self.and_lit(expressions, body, sc1, 0xc0c0);
-        let fourth_high = self.shr_lit(expressions, body, fourth_high, 2);
-        let fourth_two = self.bin(
-            expressions,
-            body,
-            BinaryOperator::InclusiveOr,
-            fourth_low,
-            fourth_high,
-        );
-
-        let odd_scales = [
-            self.u8_lane_f32(expressions, body, first_two, 0),
-            self.u8_lane_f32(expressions, body, first_two, 1),
-            self.u8_lane_f32(expressions, body, third_two, 0),
-            self.u8_lane_f32(expressions, body, third_two, 1),
-        ];
-        let even_scales = [
-            self.u8_lane_f32(expressions, body, second_two, 0),
-            self.u8_lane_f32(expressions, body, second_two, 1),
-            self.u8_lane_f32(expressions, body, fourth_two, 0),
-            self.u8_lane_f32(expressions, body, fourth_two, 1),
-        ];
-
-        let iq_words = self.shl_lit(expressions, body, iq, 3);
-        let ir_words = self.shl_lit(expressions, body, ir, 1);
-        let data_offset = self.bin(expressions, body, BinaryOperator::Add, iq_words, ir_words);
-
-        let mut first_sums = [self.f32(expressions, 0.0); 4];
-        let mut second_sums = [self.f32(expressions, 0.0); 4];
-        let accumulate: Q4KGgmlAccumulateWord<'a> = if matrix.rows <= 4096 && matrix.cols >= 8192 {
-            Self::q4k_ggml_accumulate_word_vector
-        } else {
-            Self::q4k_ggml_accumulate_word_scalar
-        };
-        let data_base = self.q4k_data_word_offset(matrix.format)?;
-        for j in 0..2 {
-            let word_off = self.add_lit(expressions, body, data_offset, data_base + j as u32);
-            let word = self.load_word_dynamic(expressions, matrix, base, word_off, body)?;
-            accumulate(self, expressions, body, word, a_low, j, &mut first_sums);
-
-            let word_off = self.add_lit(expressions, body, data_offset, data_base + 16 + j as u32);
-            let word = self.load_word_dynamic(expressions, matrix, base, word_off, body)?;
-            accumulate(self, expressions, body, word, a_high, j, &mut second_sums);
-        }
-
-        let inv_256 = self.f32(expressions, 1.0 / 256.0);
-        let inv_16 = self.f32(expressions, 1.0 / 16.0);
-        let one = self.f32(expressions, 1.0);
-        let small_shift_sums = self.compose_f32_vec4(
-            expressions,
-            body,
-            [first_sums[0], first_sums[2], second_sums[0], second_sums[2]],
-        );
-        let large_shift_sums = self.compose_f32_vec4(
-            expressions,
-            body,
-            [first_sums[1], first_sums[3], second_sums[1], second_sums[3]],
-        );
-        let inv_256_vec =
-            self.compose_f32_vec4(expressions, body, [inv_256, inv_256, inv_256, inv_256]);
-        let large_shift_sums = self.mul(expressions, body, large_shift_sums, inv_256_vec);
-        let combined = self.bin(
-            expressions,
-            body,
-            BinaryOperator::Add,
-            small_shift_sums,
-            large_shift_sums,
-        );
-        let odd_scales = self.compose_f32_vec4(expressions, body, odd_scales);
-        let weighted = self.mul(expressions, body, combined, odd_scales);
-        let shift4 = self.compose_f32_vec4(expressions, body, [one, inv_16, one, inv_16]);
-        let scaled_dot = self.dot_f32_vec4(expressions, body, weighted, shift4);
-        let scaled_dot = self.mul(expressions, body, d, scaled_dot);
-
-        let sum_vec =
-            self.compose_f32_vec4(expressions, body, [sums[0], sums[1], sums[2], sums[3]]);
-        let even_scales = self.compose_f32_vec4(expressions, body, even_scales);
-        let min_dot = self.dot_f32_vec4(expressions, body, sum_vec, even_scales);
-        let min_dot = self.mul(expressions, body, dmin, min_dot);
-        let total = self.sub(expressions, body, scaled_dot, min_dot);
-        Ok(total)
-    }
-
-    pub(in crate::lower) fn q6k_ggml_dot(
-        &self,
-        expressions: &mut Arena<Expression>,
-        matrix: &QuantizedMatrix,
-        coords: GgmlBlockCoords,
-        a: &[Handle<Expression>],
-        body: &mut Block,
-    ) -> Result<Handle<Expression>, LowerError> {
-        if !matrix.format.is_q6k_family() || a.len() != 16 {
-            return Err(LowerError::UnsupportedOperation(
-                "q6k ggml dot requires a Q6K format and 16 activations",
-            ));
-        }
-        let GgmlBlockCoords {
-            block,
-            c0: ip,
-            c1: il,
-            col,
-        } = coords;
-
-        let base = self.quantized_block_base(
-            expressions,
-            matrix,
-            block,
-            col,
-            matrix.format.block_words(),
-            body,
-        );
-        let d = self.q6k_load_d(expressions, matrix, base, body)?;
-
-        let l0 = self.shl_lit(expressions, body, il, 2);
-        let low_base = self.shl_lit(expressions, body, ip, 6);
-        let low_byte_offset = self.add(expressions, body, low_base, l0);
-        let low_word_offset = self.shr_lit(expressions, body, low_byte_offset, 2);
-        let q1_word = self.load_word_dynamic(expressions, matrix, base, low_word_offset, body)?;
-        let q2_word_offset = self.add_lit(expressions, body, low_word_offset, 8);
-        let q2_word = self.load_word_dynamic(expressions, matrix, base, q2_word_offset, body)?;
-
-        let high_base = self.shl_lit(expressions, body, ip, 5);
-        let high_byte_offset = self.add(expressions, body, high_base, l0);
-        let high_word_offset = self.shr_lit(expressions, body, high_byte_offset, 2);
-        let high_word_offset = self.add_lit(expressions, body, high_word_offset, 32);
-        let qh_word = self.load_word_dynamic(expressions, matrix, base, high_word_offset, body)?;
-
-        let scale_base = self.shl_lit(expressions, body, ip, 3);
-        let scale_low = self.shr_lit(expressions, body, il, 2);
-        let scale_index = self.bin(
-            expressions,
-            body,
-            BinaryOperator::Add,
-            scale_base,
-            scale_low,
-        );
-        let scale_word0_offset = self.shr_lit(expressions, body, scale_index, 2);
-        let scale_word0_offset = self.add_lit(expressions, body, scale_word0_offset, 48);
-        let scale_word1_offset = self.add_lit(expressions, body, scale_word0_offset, 1);
-        let scale_word0 =
-            self.load_word_dynamic(expressions, matrix, base, scale_word0_offset, body)?;
-        let scale_word1 =
-            self.load_word_dynamic(expressions, matrix, base, scale_word1_offset, body)?;
-        let scale_lane0 = self.and_lit(expressions, body, scale_index, 3);
-        let scale_lane1 = self.add_lit(expressions, body, scale_lane0, 2);
-        let scales = [
-            self.byte_at(expressions, body, scale_word0, scale_lane0),
-            self.byte_at(expressions, body, scale_word0, scale_lane1),
-            self.byte_at(expressions, body, scale_word1, scale_lane0),
-            self.byte_at(expressions, body, scale_word1, scale_lane1),
-        ]
-        .map(|byte| self.signed_byte_f32(expressions, body, byte));
-
-        let mut sums = [self.f32(expressions, 0.0); 4];
-        for l in 0..4 {
-            let lane = self.u32(expressions, l as u32);
-            let q1_byte = self.byte_at(expressions, body, q1_word, lane);
-            let q2_byte = self.byte_at(expressions, body, q2_word, lane);
-            let qh_byte = self.byte_at(expressions, body, qh_word, lane);
-
-            let q0_low = self.and_lit(expressions, body, q1_byte, 0x0f);
-            let q0_high = self.and_lit(expressions, body, qh_byte, 0x03);
-            let q0_high = self.shl_lit(expressions, body, q0_high, 4);
-            let q0 = self.bin(
-                expressions,
-                body,
-                BinaryOperator::InclusiveOr,
-                q0_low,
-                q0_high,
-            );
-            let q0 = self.center_quant_by_32(expressions, body, q0);
-
-            let q1_low = self.and_lit(expressions, body, q2_byte, 0x0f);
-            let q1_high = self.and_lit(expressions, body, qh_byte, 0x0c);
-            let q1_high = self.shl_lit(expressions, body, q1_high, 2);
-            let q1 = self.bin(
-                expressions,
-                body,
-                BinaryOperator::InclusiveOr,
-                q1_low,
-                q1_high,
-            );
-            let q1 = self.center_quant_by_32(expressions, body, q1);
-
-            let q2_low = self.shr_lit(expressions, body, q1_byte, 4);
-            let q2_high = self.and_lit(expressions, body, qh_byte, 0x30);
-            let q2 = self.bin(
-                expressions,
-                body,
-                BinaryOperator::InclusiveOr,
-                q2_low,
-                q2_high,
-            );
-            let q2 = self.center_quant_by_32(expressions, body, q2);
-
-            let q3_low = self.shr_lit(expressions, body, q2_byte, 4);
-            let q3_high = self.and_lit(expressions, body, qh_byte, 0xc0);
-            let q3_high = self.shr_lit(expressions, body, q3_high, 2);
-            let q3 = self.bin(
-                expressions,
-                body,
-                BinaryOperator::InclusiveOr,
-                q3_low,
-                q3_high,
-            );
-            let q3 = self.center_quant_by_32(expressions, body, q3);
-
-            for (sum, activation, quant) in [
-                (0, a[4 * l], q0),
-                (1, a[4 * l + 1], q1),
-                (2, a[4 * l + 2], q2),
-                (3, a[4 * l + 3], q3),
-            ] {
-                let weighted = self.mul(expressions, body, activation, quant);
-                sums[sum] = self.bin(expressions, body, BinaryOperator::Add, sums[sum], weighted);
-            }
-        }
-
-        let sum_vec = self.compose_f32_vec4(expressions, body, sums);
-        let scale_vec = self.compose_f32_vec4(expressions, body, scales);
-        let weighted = self.dot_f32_vec4(expressions, body, sum_vec, scale_vec);
-        let total = self.mul(expressions, body, d, weighted);
-        Ok(total)
-    }
-
     pub(in crate::lower) fn q6k_q8_activation_dot(
         &self,
         expressions: &mut Arena<Expression>,
@@ -385,7 +84,6 @@ impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn cached_q8_activation_packs(
         &self,
         e: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
         a: &[Handle<Expression>],
     ) -> Result<Q8ActivationPacks, LowerError> {
@@ -395,7 +93,7 @@ impl<'a> Lowerer<'a> {
         }
 
         let values = self.q8_activation_pack_values(e, a, body)?;
-        let packs = Self::q8_activation_pack_locals(scratch, values.packs.len())?;
+        let packs = self.q8_activation_pack_locals(values.packs.len())?;
         self.q8_activation_pack_cache.borrow_mut().clear();
         self.store_q8_activation_pack_values(e, body, &packs, values);
         self.q8_activation_pack_cache
@@ -458,20 +156,22 @@ impl<'a> Lowerer<'a> {
     }
 
     pub(in crate::lower) fn q8_activation_pack_locals(
-        scratch: ScratchLocals,
+        &self,
         len: usize,
     ) -> Result<Q8ActivationPacks, LowerError> {
-        if len > scratch.q8_activation_packs.len() {
+        if len > 4 {
             return Err(LowerError::UnsupportedOperation(
                 "q8 activation packing supports at most four packs",
             ));
         }
-
+        let scales = std::array::from_fn(|i| self.scratch_f32(ScratchKind::Q8Scale, i as u32));
+        let packs = std::array::from_fn(|i| self.scratch_u32(ScratchKind::Q8Pack, i as u32));
+        let sums_i32 = std::array::from_fn(|i| self.scratch_i32(ScratchKind::Q8Sum, i as u32));
         Ok(Q8ActivationPacks {
             len,
-            scales: scratch.q8_activation_scales,
-            packs: scratch.q8_activation_packs,
-            sums_i32: scratch.q8_activation_sums_i32,
+            scales,
+            packs,
+            sums_i32,
         })
     }
 
@@ -491,38 +191,6 @@ impl<'a> Lowerer<'a> {
             self.store_local(e, body, locals.packs[i], values.packs[i]);
             self.store_local(e, body, locals.sums_i32[i], values.sums_i32[i]);
         }
-    }
-
-    pub(in crate::lower) fn q4k_quant_packs8(
-        &self,
-        expressions: &mut Arena<Expression>,
-        matrix: &QuantizedMatrix,
-        k_base: Handle<Expression>,
-        col: Handle<Expression>,
-        body: &mut Block,
-    ) -> Result<Q4KQuantBlock<2>, LowerError> {
-        let parts = self.q4k_block_parts(expressions, matrix, k_base, col, body)?;
-        let (words, nibble_shift) =
-            self.q4k_quant_words::<2>(expressions, matrix, &parts, false, body)?;
-
-        let data = std::array::from_fn(|chunk| {
-            let mut packed_values = Vec::with_capacity(4);
-            for lane in 0..4 {
-                let source_lane = chunk * 4 + lane;
-                let byte_lane = self.u32(expressions, (source_lane % 4) as u32);
-                let byte = self.byte_at(expressions, body, words[source_lane / 4], byte_lane);
-                let shifted = self.shr(expressions, body, byte, nibble_shift);
-                let quant = self.and_lit(expressions, body, shifted, 0x0f);
-                packed_values.push(self.as_i32(expressions, body, quant));
-            }
-            self.pack_i8x4(expressions, body, packed_values)
-                .expect("q4k packs exactly four i8 values")
-        });
-        Ok(Q4KQuantBlock {
-            scale: parts.scale,
-            min: parts.min,
-            data,
-        })
     }
 
     pub(in crate::lower) fn q4k_quant_values<const N: usize, const WORDS: usize>(
@@ -556,19 +224,6 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    pub(in crate::lower) fn q4k_block_parts(
-        &self,
-        expressions: &mut Arena<Expression>,
-        matrix: &QuantizedMatrix,
-        k_base: Handle<Expression>,
-        col: Handle<Expression>,
-        body: &mut Block,
-    ) -> Result<Q4KBlockParts, LowerError> {
-        let block = self.div_literal_u32_emitted(expressions, k_base, 256, body);
-        let q_base = self.and_lit(expressions, body, k_base, 255);
-        self.q4k_block_parts_from_block(expressions, matrix, block, q_base, col, body)
-    }
-
     pub(in crate::lower) fn q4k_block_parts_from_block(
         &self,
         expressions: &mut Arena<Expression>,
@@ -586,7 +241,7 @@ impl<'a> Lowerer<'a> {
             matrix.format.block_words(),
             body,
         );
-        let (d, dmin) = self.q4k_load_d_dmin(expressions, matrix, base, body)?;
+        let (d, dmin) = self.load_k_d_dmin(expressions, matrix, base, body)?;
         let group = self.shr_lit(expressions, body, q_base, 5);
         let (scale_byte, min_byte) =
             self.q4k_scale_min_bytes(expressions, matrix, base, group, body)?;

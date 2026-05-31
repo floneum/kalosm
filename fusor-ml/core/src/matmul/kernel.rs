@@ -217,35 +217,26 @@ impl MatMulOperation {
                 pre_b: pre_b.as_ref(),
                 post: post.as_ref(),
             };
-            match datatype {
-                DataTypeEnum::F32 => dispatch_direct_tile_matmul::<tile_ir::F32>(
-                    phase,
-                    a_view.clone(),
-                    b_view.clone(),
-                    y_view.clone(),
-                    coop_variant,
-                    variant,
-                    use_shared_tile,
-                    shape,
-                    &epilogues,
-                    max_wg_per_dim,
-                ),
-                DataTypeEnum::F16 => dispatch_direct_tile_matmul::<tile_ir::F16>(
-                    phase,
-                    a_view.clone(),
-                    b_view.clone(),
-                    y_view.clone(),
-                    coop_variant,
-                    variant,
-                    use_shared_tile,
-                    shape,
-                    &epilogues,
-                    max_wg_per_dim,
-                ),
+            let element = match datatype {
+                DataTypeEnum::F32 => tile_ir::ElementType::F32,
+                DataTypeEnum::F16 => tile_ir::ElementType::F16,
                 _ => unreachable!("direct tile matmul only supports f32/f16"),
-            }
+            };
+            dispatch_direct_tile_matmul(
+                phase,
+                element,
+                a_view.clone(),
+                b_view.clone(),
+                y_view.clone(),
+                coop_variant,
+                variant,
+                use_shared_tile,
+                shape,
+                &epilogues,
+                max_wg_per_dim,
+            );
         });
-        let dispatch_size = ir.body().grid;
+        let dispatch_size = ir.grid;
         if dispatch_size.iter().any(|dim| *dim > max_wg_per_dim) {
             return None;
         }
@@ -433,10 +424,9 @@ impl Operation for MatMulOperation {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_direct_tile_matmul<
-    T: tile_ir::CoopElement + tile_ir_kernels::AccumCast<tile_ir::F32>,
->(
+fn dispatch_direct_tile_matmul(
     phase: &mut tile_ir::tile::Program,
+    element: tile_ir::ElementType,
     a_view: DirectMatrixLayout,
     b_view: DirectMatrixLayout,
     y_view: DirectMatrixLayout,
@@ -447,11 +437,11 @@ fn dispatch_direct_tile_matmul<
     epilogues: &tile_ir_kernels::DenseMatmulEpilogues<'_>,
     max_wg_per_dim: u32,
 ) {
-    let a = tile_storage_read_with_direct_layout_typed::<T>(phase, a_view);
-    let b = tile_storage_read_with_direct_layout_typed::<T>(phase, b_view);
-    let y = tile_storage_write_with_direct_layout_typed::<T>(phase, y_view);
+    let a = tile_storage_read_with_direct_layout_typed(phase, element, a_view);
+    let b = tile_storage_read_with_direct_layout_typed(phase, element, b_view);
+    let y = tile_storage_write_with_direct_layout_typed(phase, element, y_view);
     if let Some(tile) = coop_variant
-        && tile_ir_kernels::try_batched_coop_matmul::<T>(
+        && tile_ir_kernels::try_batched_coop_matmul(
             phase,
             tile_ir_kernels::DenseMatmulTensors {
                 a: &a,
@@ -471,7 +461,7 @@ fn dispatch_direct_tile_matmul<
         return;
     }
     match variant {
-        DirectTileMatmulVariant::Gemv => tile_ir_kernels::batched_gemv_with_epilogues::<T>(
+        DirectTileMatmulVariant::Gemv => tile_ir_kernels::batched_gemv_with_epilogues(
             phase,
             &a,
             &b,
@@ -482,7 +472,7 @@ fn dispatch_direct_tile_matmul<
         ),
         DirectTileMatmulVariant::MatMul => {
             if use_shared_tile {
-                tile_ir_kernels::batched_matmul_with_epilogues::<T>(
+                tile_ir_kernels::batched_matmul_with_epilogues(
                     phase,
                     &a,
                     &b,
@@ -492,7 +482,7 @@ fn dispatch_direct_tile_matmul<
                     max_wg_per_dim,
                 )
             } else {
-                tile_ir_kernels::batched_matmul_register_with_epilogues::<T>(
+                tile_ir_kernels::batched_matmul_register_with_epilogues(
                     phase,
                     &a,
                     &b,

@@ -1,50 +1,98 @@
 use super::*;
+use crate::ir::ReduceKind;
+
+struct LoopReduceValue<'a> {
+    value: &'a Expr,
+    iterations: u32,
+    index: &'a Local,
+    op: TileReduceOp,
+    spill_depth: usize,
+}
 
 impl<'a> Lowerer<'a> {
-    pub(in crate::lower) fn lower_tile_loop_reduce_value(
+    /// Lower an `ExprKind::Reduce`, dispatching on `ReduceKind`:
+    /// - `Subgroup` → a `subgroupAdd`/`subgroupMax`/... collective.
+    /// - `Workgroup { scratch, group_size }` → cross-lane shared-memory tree.
+    /// - `Loop { iterations, index, scratch, group_size }` → per-lane
+    ///   accumulation across `iterations` loop iterations, then the tree.
+    pub(in crate::lower) fn lower_reduce(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
         body: &mut Block,
+        op: TileReduceOp,
+        kind: &ReduceKind,
         value: &Expr,
-        spec: TileLoopReduceSpec,
+        spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
+        match kind {
+            ReduceKind::Subgroup => {
+                let element = value.element();
+                let value = self.lower_expr_lane(expressions, body, value, spill_depth)?;
+                self.lower_subgroup_reduce_value(expressions, body, value, op, element)
+            }
+            ReduceKind::Workgroup {
+                scratch,
+                group_size,
+            } => {
+                let value = self.lower_expr_lane(expressions, body, value, spill_depth)?;
+                self.lower_reduce_value(expressions, body, scratch, value, op, *group_size)
+            }
+            ReduceKind::Loop {
+                iterations,
+                index,
+                scratch,
+                group_size,
+            } => {
+                let value = self.lower_loop_reduce_value(
+                    expressions,
+                    body,
+                    LoopReduceValue {
+                        value,
+                        iterations: *iterations,
+                        index,
+                        op,
+                        spill_depth,
+                    },
+                )?;
+                self.lower_reduce_value(expressions, body, scratch, value, op, *group_size)
+            }
+        }
+    }
+
+    fn lower_loop_reduce_value(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        reduce: LoopReduceValue<'_>,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let LoopReduceValue {
+            value,
+            iterations,
+            index,
+            op,
+            spill_depth,
+        } = reduce;
         let element = value.element();
-        let acc = self.tile_expr_spill_local(scratch, element, 0)?;
-        let initial = expressions.append(
-            Self::tile_reduce_identity(spec.op, element),
-            Span::default(),
-        );
+        let acc = self.scratch_local(ScratchKind::Spill, element, 0)?;
+        let initial = expressions.append(Self::tile_reduce_identity(op, element), Span::default());
         self.store_local(expressions, body, acc, initial);
 
-        let iter_var_local = self.private_local(LocalRef::new(spec.iter_var, ElementType::U32))?;
+        let iter_var_local = self.private_local(index)?;
         self.emit_counted_loop(
             expressions,
-            scratch,
             body,
-            spec.iterations,
+            iterations,
             |expressions, loop_body, loop_index| {
-                // Bind the loop's iter_var local so the value expression's
-                // LoadLocal(iter_var) references resolve to the current index.
                 self.store_local(expressions, loop_body, iter_var_local, loop_index);
-                // Cache entries reference values scoped to the outer block. Snapshot
-                // expression-handle caches, but drop q8 activation locals because the
-                // loop body may overwrite the shared scratch slots.
-                let saved = self.snapshot_tile_loop_caches();
-                let value = self.lower_tile_expr_lane(
-                    expressions,
-                    scratch,
-                    loop_body,
-                    value,
-                    spec.spill_depth + 1,
-                )?;
-                self.restore_tile_loop_caches(saved);
+                let saved = self.snapshot_loop_caches();
+                let value = self.lower_expr_lane(expressions, loop_body, value, spill_depth + 1)?;
+                self.restore_loop_caches(saved);
                 let acc_ptr = self.local_var(expressions, acc);
                 let acc_value = Self::emit_load(expressions, loop_body, acc_ptr);
                 let reduced = self.emit(
                     expressions,
                     loop_body,
-                    Self::tile_reduce_expression(spec.op, acc_value, value),
+                    Self::tile_reduce_expression(op, acc_value, value),
                 );
                 self.store_local(expressions, loop_body, acc, reduced);
                 Ok(())
@@ -55,12 +103,12 @@ impl<'a> Lowerer<'a> {
         Ok(Self::emit_load(expressions, body, acc_ptr))
     }
 
-    pub(in crate::lower) fn lower_tile_reduce_value(
+    fn lower_reduce_value(
         &self,
         expressions: &mut Arena<Expression>,
         body: &mut Block,
+        scratch_tile: &Tile,
         value: Handle<Expression>,
-        scratch_tile: TileRef,
         op: TileReduceOp,
         group_size: u32,
     ) -> Result<Handle<Expression>, LowerError> {
@@ -117,8 +165,7 @@ impl<'a> Lowerer<'a> {
                     right: limit,
                 },
             );
-            let accept =
-                self.lower_tile_reduce_step(expressions, scratch_tile, lane, stride, op)?;
+            let accept = self.lower_reduce_step(expressions, scratch_tile, lane, stride, op)?;
             body.push(
                 Statement::If {
                     condition: participates,
@@ -139,10 +186,10 @@ impl<'a> Lowerer<'a> {
         Ok(Self::emit_load(expressions, body, result_ptr))
     }
 
-    pub(in crate::lower) fn lower_tile_reduce_step(
+    fn lower_reduce_step(
         &self,
         expressions: &mut Arena<Expression>,
-        scratch_tile: TileRef,
+        scratch_tile: &Tile,
         lane: Handle<Expression>,
         stride: u32,
         op: TileReduceOp,
@@ -168,7 +215,7 @@ impl<'a> Lowerer<'a> {
         Ok(body)
     }
 
-    pub(in crate::lower) fn lower_tile_subgroup_reduce_value(
+    fn lower_subgroup_reduce_value(
         &self,
         expressions: &mut Arena<Expression>,
         body: &mut Block,
@@ -184,9 +231,9 @@ impl<'a> Lowerer<'a> {
         };
         let result_ty = match element {
             ElementType::F32 => self.f32_ty,
-            ElementType::F16 => self.f16_ty.ok_or(LowerError::UnsupportedOperation(
-                "subgroup reduce on f16 requires f16 capability",
-            ))?,
+            ElementType::F16 => self.element_type(ElementType::F16).map_err(|_| {
+                LowerError::UnsupportedOperation("subgroup reduce on f16 requires f16 capability")
+            })?,
             ElementType::U32 => self.u32_ty,
             ElementType::Vector { .. } => {
                 return Err(LowerError::UnsupportedOperation(
@@ -218,5 +265,35 @@ impl<'a> Lowerer<'a> {
             Span::default(),
         );
         Ok(result)
+    }
+
+    pub(in crate::lower) fn tile_reduce_identity(
+        op: TileReduceOp,
+        element: ElementType,
+    ) -> Expression {
+        let (f32_value, f16_value, u32_value, bool_value) = match op {
+            TileReduceOp::Sum => (0.0_f32, 0.0_f32, 0_u32, false),
+            TileReduceOp::Product => (1.0_f32, 1.0_f32, 1_u32, true),
+            TileReduceOp::Max => (f32::MIN, -65504.0, 0_u32, false),
+            TileReduceOp::Min => (f32::MAX, 65504.0, u32::MAX, true),
+        };
+        match element {
+            ElementType::F32 => Expression::Literal(Literal::F32(f32_value)),
+            ElementType::F16 => Expression::Literal(Literal::F16(half::f16::from_f32(f16_value))),
+            ElementType::U32 => Expression::Literal(Literal::U32(u32_value)),
+            ElementType::Bool => Expression::Literal(Literal::Bool(bool_value)),
+            ElementType::Vector { .. } => panic!("vector reductions are not supported"),
+            ElementType::CoopMatrix { .. } => {
+                panic!("cooperative-matrix reductions are not supported")
+            }
+        }
+    }
+
+    pub(in crate::lower) fn tile_reduce_expression(
+        op: TileReduceOp,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Expression {
+        Self::tile_binary_expression(op.binary(), left, right)
     }
 }

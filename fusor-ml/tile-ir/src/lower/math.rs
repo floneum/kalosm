@@ -1,25 +1,6 @@
 use super::*;
 
 impl<'a> Lowerer<'a> {
-    pub(super) fn storage_tile_and_offset(
-        &self,
-        tile: TileRef,
-    ) -> Result<(TileRef, u32), LowerError> {
-        let decl = self
-            .ir
-            .tiles()
-            .get(tile.id.index())
-            .ok_or(LowerError::UnknownTile(tile.id))?;
-        if decl.element != tile.element {
-            return Err(LowerError::TileElementMismatch {
-                tile: tile.id,
-                declared: decl.element,
-                used: tile.element,
-            });
-        }
-        Ok((tile, 0))
-    }
-
     pub(super) fn add_literal_u32_emitted(
         &self,
         expressions: &mut Arena<Expression>,

@@ -299,7 +299,7 @@ impl<'a> Lowerer<'a> {
     ) -> Result<Handle<Expression>, LowerError> {
         let group = self.shr_lit(e, body, q, 5);
         let (d, dmin, scale_byte, min_byte, data_base) = if q5 {
-            let (d, dmin) = self.q5k_load_d_dmin(e, matrix, base, body)?;
+            let (d, dmin) = self.load_k_d_dmin(e, matrix, base, body)?;
             (
                 d,
                 dmin,
@@ -308,7 +308,7 @@ impl<'a> Lowerer<'a> {
                 self.q5k_data_byte_offset(matrix.format)?,
             )
         } else {
-            let (d, dmin) = self.q4k_load_d_dmin(e, matrix, base, body)?;
+            let (d, dmin) = self.load_k_d_dmin(e, matrix, base, body)?;
             let (scale_byte, min_byte) = self.q4k_scale_min_bytes(e, matrix, base, group, body)?;
             (
                 d,

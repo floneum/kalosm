@@ -1,93 +1,40 @@
-use std::marker::PhantomData;
+use std::rc::Rc;
 
-use super::*;
+use super::value::{CoopAcc, PrivateLocal, WorkgroupTile};
+use super::{Storage, TileBlock};
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId, KernelIr, Layout,
-    LocalRef, MemoryLevel, Numeric, Shape, StorageView, TileDecl, TileProgramOp, TileRef, F32,
+    BufferAccess, BufferDecl, CoopMatrixRole, ElementType, KernelIr, Layout, LocalDecl,
+    MemoryLevel, ScalarElement, Shape, StorageView, TileDecl,
 };
-
-macro_rules! storage_accessors {
-    ($read:ident, $write:ident($($arg:ident: $ty:ty),*) => ($layout:expr, $offset:expr)) => {
-        /// Declare a read-only typed storage view.
-        pub fn $read<T: Numeric, const R: usize>(&mut self, $($arg: $ty),*) -> Storage<T, R> {
-            self.storage_with_layout_and_access($layout, $offset, BufferAccess::Read)
-        }
-
-        /// Declare a read-write typed storage view.
-        pub fn $write<T: Numeric, const R: usize>(&mut self, $($arg: $ty),*) -> Storage<T, R> {
-            self.storage_with_layout_and_access(
-                $layout,
-                $offset,
-                BufferAccess::ReadWrite,
-            )
-        }
-    };
-}
-
-macro_rules! element_storage_accessors {
-    ($read:ident, $write:ident($($arg:ident: $ty:ty),*) => ($layout:expr, $offset:expr)) => {
-        /// Declare a read-only storage view with an element type known at runtime.
-        pub fn $read<const R: usize>(
-            &mut self,
-            element: crate::ElementType,
-            $($arg: $ty),*
-        ) -> Storage<RuntimeElement, R> {
-            self.storage_element_with_layout_and_access(element, $layout, $offset, BufferAccess::Read)
-        }
-
-        /// Declare a read-write storage view with an element type known at runtime.
-        pub fn $write<const R: usize>(
-            &mut self,
-            element: crate::ElementType,
-            $($arg: $ty),*
-        ) -> Storage<RuntimeElement, R> {
-            self.storage_element_with_layout_and_access(
-                element,
-                $layout,
-                $offset,
-                BufferAccess::ReadWrite,
-            )
-        }
-    };
-}
 
 /// Builder for one tile IR kernel.
 ///
 /// A `Program` owns storage declarations, scratch allocations, and the single
-/// tile program body. Most callers construct one through [`build`](crate::tile::build).
+/// tile program body. Most callers construct one through
+/// [`build`](crate::tile::build).
+///
+/// Runtime-typed (ARBOR_DESIGN.md §2): storage / tile / local declarations carry
+/// an [`ElementType`] as data, not a marker type. The five old `next_*` counters
+/// collapse to one `next_binding` — tiles and locals are `Rc`-identified, so the
+/// only externally-meaningful name left is the buffer binding slot.
 pub struct Program {
     pub(crate) ir: KernelIr,
-    /// Builder-only counter for fresh `BufferId`s. Lives here (not on
-    /// `KernelIr`) because the finished IR is immutable data — the counter
-    /// is only needed during construction.
-    pub(crate) next_buffer: u32,
-    /// Builder-only counter for fresh `TileId`s. Same reasoning as
-    /// `next_buffer`.
-    pub(crate) next_tile: u32,
-    /// Builder-only counter for fresh `LocalId`s. Same reasoning as
-    /// `next_buffer`.
-    pub(crate) next_local: u32,
-    /// Builder-only counter for fresh `BlockDequantId`s. Lives here (not on
-    /// `KernelIr`) because these ids are SSA-scoped names allocated by the
-    /// builder and never observed off the finished IR.
-    pub(crate) next_block_dequant: u32,
-    /// Builder-only counter for fresh `CoopFragmentId`s. Same reasoning as
-    /// `next_block_dequant`.
-    pub(crate) next_coop_fragment: u32,
+    /// Builder-only counter for fresh buffer binding slots. Lives here (not on
+    /// `KernelIr`) because the finished IR is immutable data — the counter is
+    /// only needed during construction. Tiles and locals need no counter: a
+    /// declaration *is* its identity (`Rc::as_ptr`).
+    pub(crate) next_binding: u32,
 }
 
 impl Program {
-    /// Create an empty builder. Most callers should use [`build`] instead;
-    /// this is for [`crate::kernel_builder::KernelBuilder`] which owns the
-    /// program plus a parallel binding list.
+    /// Create an empty builder. Most callers should use
+    /// [`build`](crate::tile::build) instead; this is for
+    /// [`crate::KernelBuilder`] which owns the program plus a parallel binding
+    /// list.
     pub fn new() -> Self {
         Self {
             ir: KernelIr::default(),
-            next_buffer: 0,
-            next_tile: 0,
-            next_local: 0,
-            next_block_dequant: 0,
-            next_coop_fragment: 0,
+            next_binding: 0,
         }
     }
 
@@ -104,201 +51,193 @@ impl Default for Program {
 }
 
 impl Program {
-    storage_accessors!(
-        storage_read,
-        storage_write(shape: Shape) => (
-            Layout::contiguous(MemoryLevel::Storage, shape),
-            0
-        )
-    );
-    storage_accessors!(
-        storage_read_with_layout,
-        storage_write_with_layout(layout: Layout) => (layout, 0)
-    );
-    storage_accessors!(
-        storage_read_with_layout_offset,
-        storage_write_with_layout_offset(layout: Layout, offset: u32) => (layout, offset)
-    );
-    element_storage_accessors!(
-        storage_read_element,
-        storage_write_element(shape: Shape) => (
-            Layout::contiguous(MemoryLevel::Storage, shape),
-            0
-        )
-    );
-    element_storage_accessors!(
-        storage_read_element_with_layout,
-        storage_write_element_with_layout(layout: Layout) => (layout, 0)
-    );
-    element_storage_accessors!(
-        storage_read_element_with_layout_offset,
-        storage_write_element_with_layout_offset(layout: Layout, offset: u32) => (layout, offset)
-    );
+    // ---- storage declarations -------------------------------------------
 
-    fn storage_with_layout_and_access<T: Numeric, const R: usize>(
-        &mut self,
-        layout: Layout,
-        offset: u32,
-        access: BufferAccess,
-    ) -> Storage<T, R> {
-        let view =
-            self.storage_view_with_layout_and_access::<R>(T::ELEMENT, layout, offset, access);
-        Storage {
-            view,
-            _ty: PhantomData,
-        }
+    /// Declare a read-only storage view of `element` with the given `shape`.
+    pub fn storage_read(&mut self, element: ElementType, shape: Shape) -> Storage {
+        self.storage_with_layout_and_access(
+            element,
+            Layout::contiguous(MemoryLevel::Storage, shape),
+            0,
+            BufferAccess::Read,
+        )
     }
 
-    fn storage_element_with_layout_and_access<const R: usize>(
-        &mut self,
-        element: crate::ElementType,
-        layout: Layout,
-        offset: u32,
-        access: BufferAccess,
-    ) -> Storage<RuntimeElement, R> {
-        let view = self.storage_view_with_layout_and_access::<R>(element, layout, offset, access);
-        Storage {
-            view,
-            _ty: PhantomData,
-        }
+    /// Declare a read-write storage view of `element` with the given `shape`.
+    pub fn storage_write(&mut self, element: ElementType, shape: Shape) -> Storage {
+        self.storage_with_layout_and_access(
+            element,
+            Layout::contiguous(MemoryLevel::Storage, shape),
+            0,
+            BufferAccess::ReadWrite,
+        )
     }
 
-    fn storage_view_with_layout_and_access<const R: usize>(
+    /// Declare a read-only storage view with an explicit layout.
+    pub fn storage_read_with_layout(&mut self, element: ElementType, layout: Layout) -> Storage {
+        self.storage_with_layout_and_access(element, layout, 0, BufferAccess::Read)
+    }
+
+    /// Declare a read-write storage view with an explicit layout.
+    pub fn storage_write_with_layout(&mut self, element: ElementType, layout: Layout) -> Storage {
+        self.storage_with_layout_and_access(element, layout, 0, BufferAccess::ReadWrite)
+    }
+
+    /// Declare a read-only storage view with an explicit layout and element
+    /// offset.
+    pub fn storage_read_with_layout_offset(
         &mut self,
-        element: crate::ElementType,
+        element: ElementType,
+        layout: Layout,
+        offset: u32,
+    ) -> Storage {
+        self.storage_with_layout_and_access(element, layout, offset, BufferAccess::Read)
+    }
+
+    /// Declare a read-write storage view with an explicit layout and element
+    /// offset.
+    pub fn storage_write_with_layout_offset(
+        &mut self,
+        element: ElementType,
+        layout: Layout,
+        offset: u32,
+    ) -> Storage {
+        self.storage_with_layout_and_access(element, layout, offset, BufferAccess::ReadWrite)
+    }
+
+    fn storage_with_layout_and_access(
+        &mut self,
+        element: ElementType,
         layout: Layout,
         offset: u32,
         access: BufferAccess,
-    ) -> StorageView {
+    ) -> Storage {
         assert_eq!(
             layout.memory_level(),
             MemoryLevel::Storage,
             "storage tensors must use MemoryLevel::Storage"
         );
-        assert_eq!(layout.shape().rank(), R, "storage rank mismatch");
-        let buffer = self.alloc_buffer_element(element, layout.clone(), access);
-        StorageView {
-            buffer,
-            offset,
-            layout,
+        let buffer = self.alloc_buffer(element, layout.clone(), access);
+        Storage {
+            view: StorageView {
+                buffer,
+                offset,
+                layout,
+            },
         }
     }
 
-    /// Emit a tile-program body over a dispatch grid.
-    pub fn program_grid<const BLOCK: usize>(
+    fn alloc_buffer(
         &mut self,
-        grid: [u32; 3],
-        body: impl FnOnce(&mut TileBlock<'_>),
-    ) {
-        assert!(BLOCK > 0, "tile block size must be non-zero");
-        assert!(
-            BLOCK <= 1024 && BLOCK.is_power_of_two(),
-            "tile block size must be a power of two at most 1024"
-        );
-        let mut block = TileBlock {
-            program: self,
-            grid,
-            block: BLOCK,
-            body: Vec::new(),
-            stmt_stack: Vec::new(),
-        };
-        body(&mut block);
-        block.program.ir.body = TileProgramOp {
-            grid,
-            block: BLOCK as u32,
-            body: block.body,
-        };
-    }
-
-    fn alloc_buffer_element(
-        &mut self,
-        element: crate::ElementType,
+        element: ElementType,
         layout: Layout,
         access: BufferAccess,
-    ) -> BufferRef {
-        let id = crate::ir::BufferId(post_inc(&mut self.next_buffer));
-        let buffer = BufferRef::new(id, element);
-        self.ir.buffers.push(BufferDecl {
-            id,
+    ) -> crate::ir::Buffer {
+        let binding = self.next_binding;
+        self.next_binding += 1;
+        let buffer = Rc::new(BufferDecl {
+            binding,
             element,
             layout,
             access,
         });
+        self.ir.buffers.push(buffer.clone());
         buffer
     }
 
-    pub(super) fn next_block_dequant_id(&mut self) -> BlockDequantId {
-        BlockDequantId(post_inc(&mut self.next_block_dequant))
+    // ---- grid ------------------------------------------------------------
+
+    /// Emit a tile-program body over a dispatch grid with a runtime `block`
+    /// (workgroup invocation) count.
+    ///
+    /// `block` is a runtime `u32`, not a const generic (ARBOR_DESIGN.md §5): the
+    /// lowerer bakes it as a shader-compile-time `@workgroup_size`, so the
+    /// emitted Naga and the kernel cache key are unchanged versus the old
+    /// `program_grid::<BLOCK>`.
+    pub fn program_grid(
+        &mut self,
+        block: u32,
+        grid: [u32; 3],
+        body: impl FnOnce(&mut TileBlock<'_>),
+    ) {
+        assert!(block > 0, "tile block size must be non-zero");
+        assert!(
+            block <= 1024 && block.is_power_of_two(),
+            "tile block size must be a power of two at most 1024"
+        );
+        let mut tile_block = TileBlock {
+            program: self,
+            grid,
+            block,
+            body: Vec::new(),
+            stmt_stack: Vec::new(),
+        };
+        body(&mut tile_block);
+        let statements = tile_block.body;
+        tile_block.program.ir.grid = grid;
+        tile_block.program.ir.block = block;
+        tile_block.program.ir.body = statements;
     }
 
-    pub(super) fn next_coop_fragment_id(&mut self) -> CoopFragmentId {
-        CoopFragmentId(post_inc(&mut self.next_coop_fragment))
-    }
-
-    pub(super) fn alloc_local<T: Numeric>(&mut self) -> LocalRef {
-        self.alloc_local_element(T::ELEMENT)
-    }
-
-    pub(super) fn alloc_local_element(&mut self, element: crate::ElementType) -> LocalRef {
-        let id = crate::ir::LocalId(post_inc(&mut self.next_local));
-        let local = LocalRef::new(id, element);
-        self.ir.locals.push(local);
-        local
-    }
+    // ---- tile / local allocation ----------------------------------------
 
     /// Allocate a rank-2 workgroup-scope tile of shape `[rows, cols]`.
-    pub fn alloc_workgroup_tile<T: Numeric>(&mut self, rows: u32, cols: u32) -> Workgroup<T> {
-        self.alloc_workgroup_tile_padded::<T>(rows, cols, 0)
+    pub fn alloc_workgroup_tile(
+        &mut self,
+        element: ScalarElement,
+        rows: u32,
+        cols: u32,
+    ) -> WorkgroupTile {
+        self.alloc_workgroup_tile_padded(element, rows, cols, 0)
     }
 
-    /// Allocate a rank-2 workgroup-scope tile of shape `[rows, cols]` with
-    /// `inner_pad` extra elements of stride between consecutive rows. Used to
-    /// pad away bank conflicts on the inner axis (e.g. on Apple Silicon).
-    pub fn alloc_workgroup_tile_padded<T: Numeric>(
+    /// Allocate a rank-2 workgroup-scope tile with `inner_pad` extra stride
+    /// elements between consecutive rows (to dodge bank conflicts).
+    pub fn alloc_workgroup_tile_padded(
         &mut self,
+        element: ScalarElement,
         rows: u32,
         cols: u32,
         inner_pad: u32,
-    ) -> Workgroup<T> {
-        self.alloc_tile::<T>(Layout::row_major_padded(
-            MemoryLevel::Workgroup,
-            Shape::new([rows, cols]),
-            inner_pad,
-        ))
-    }
-
-    /// Allocate a workgroup-scope f32 tile of shape `[rows, cols]`.
-    pub fn alloc_workgroup_tile_f32(&mut self, rows: u32, cols: u32) -> Workgroup<F32> {
-        self.alloc_workgroup_tile::<F32>(rows, cols)
+    ) -> WorkgroupTile {
+        self.alloc_tile(
+            element.element(),
+            Layout::row_major_padded(MemoryLevel::Workgroup, Shape::new([rows, cols]), inner_pad),
+        )
     }
 
     /// Allocate a rank-1 workgroup-scope scratch array.
-    pub fn alloc_workgroup_array<T: Numeric>(&mut self, len: u32) -> Workgroup<T> {
-        self.alloc_tile::<T>(Layout::contiguous(
-            MemoryLevel::Workgroup,
-            Shape::new([len]),
-        ))
+    pub fn alloc_workgroup_array(&mut self, element: ScalarElement, len: u32) -> WorkgroupTile {
+        self.alloc_tile(
+            element.element(),
+            Layout::contiguous(MemoryLevel::Workgroup, Shape::new([len])),
+        )
     }
 
-    pub(super) fn alloc_tile<T: Numeric>(&mut self, layout: Layout) -> Workgroup<T> {
-        let id = crate::ir::TileId(post_inc(&mut self.next_tile));
-        let tile = TileRef::new(id, T::ELEMENT);
-        self.ir.tiles.push(TileDecl {
-            id,
-            element: T::ELEMENT,
-            layout,
-        });
-        Workgroup {
-            tile,
-            _ty: PhantomData,
+    pub(super) fn alloc_tile(&mut self, element: ElementType, layout: Layout) -> WorkgroupTile {
+        WorkgroupTile {
+            tile: Rc::new(TileDecl { element, layout }),
         }
     }
-}
 
-/// Returns the current value and post-increments. The builder uses this for
-/// every fresh `BufferId` / `TileId` / `LocalId` / SSA id.
-fn post_inc(counter: &mut u32) -> u32 {
-    let value = *counter;
-    *counter += 1;
-    value
+    pub(super) fn alloc_local(&mut self, element: ElementType) -> PrivateLocal {
+        PrivateLocal {
+            local: Rc::new(LocalDecl { element }),
+        }
+    }
+
+    /// Allocate a cooperative-matrix accumulator local of the given scalar and
+    /// shape (always `CoopMatrixRole::C`).
+    pub(super) fn alloc_coop_acc(
+        &mut self,
+        scalar: ScalarElement,
+        rows: u32,
+        cols: u32,
+    ) -> CoopAcc {
+        CoopAcc {
+            local: Rc::new(LocalDecl {
+                element: ElementType::coop_matrix(scalar, CoopMatrixRole::C, rows, cols),
+            }),
+        }
+    }
 }

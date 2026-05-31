@@ -532,8 +532,8 @@ fn qmatmul_variant_supports_coop_acc_init(
 }
 
 enum QmatmulExtraStorage {
-    Column(tile_ir::tile::Storage<tile_ir::F32, 1>),
-    Pointwise(tile_ir::tile::Storage<tile_ir::F32, 2>),
+    Column(tile_ir::tile::Storage),
+    Pointwise(tile_ir::tile::Storage),
 }
 
 impl QmatmulExtraStorage {

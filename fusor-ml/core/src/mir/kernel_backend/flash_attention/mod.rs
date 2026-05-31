@@ -46,33 +46,24 @@ fn dispatch_streaming_flash_attention(
     input_dtype: DataTypeEnum,
     subgroup_size: u32,
 ) -> Option<()> {
-    match input_dtype {
-        DataTypeEnum::F32 => tile_ir_kernels::flash_attention::<tile_ir::F32, _>(
-            kb,
-            tile_ir_kernels::FlashAttentionTensors {
-                q,
-                k,
-                v,
-                mask,
-                output,
-            },
-            meta,
-            subgroup_size,
-        ),
-        DataTypeEnum::F16 => tile_ir_kernels::flash_attention::<tile_ir::F16, _>(
-            kb,
-            tile_ir_kernels::FlashAttentionTensors {
-                q,
-                k,
-                v,
-                mask,
-                output,
-            },
-            meta,
-            subgroup_size,
-        ),
-        _ => None,
-    }
+    let element = match input_dtype {
+        DataTypeEnum::F32 => tile_ir::ElementType::F32,
+        DataTypeEnum::F16 => tile_ir::ElementType::F16,
+        _ => return None,
+    };
+    tile_ir_kernels::flash_attention(
+        kb,
+        element,
+        tile_ir_kernels::FlashAttentionTensors {
+            q,
+            k,
+            v,
+            mask,
+            output,
+        },
+        meta,
+        subgroup_size,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -87,35 +78,25 @@ fn dispatch_streaming_tiled_flash_attention(
     input_dtype: DataTypeEnum,
     subgroup_size: u32,
 ) -> Option<()> {
-    match input_dtype {
-        DataTypeEnum::F32 => tile_ir_kernels::flash_attention_tiled::<tile_ir::F32, _>(
-            kb,
-            tile_ir_kernels::FlashAttentionTensors {
-                q,
-                k,
-                v,
-                mask,
-                output,
-            },
-            meta,
-            subgroup_size,
-            FLASH_STREAMING_TILED_Q_BLOCK,
-        ),
-        DataTypeEnum::F16 => tile_ir_kernels::flash_attention_tiled::<tile_ir::F16, _>(
-            kb,
-            tile_ir_kernels::FlashAttentionTensors {
-                q,
-                k,
-                v,
-                mask,
-                output,
-            },
-            meta,
-            subgroup_size,
-            FLASH_STREAMING_TILED_Q_BLOCK,
-        ),
-        _ => None,
-    }
+    let element = match input_dtype {
+        DataTypeEnum::F32 => tile_ir::ElementType::F32,
+        DataTypeEnum::F16 => tile_ir::ElementType::F16,
+        _ => return None,
+    };
+    tile_ir_kernels::flash_attention_tiled(
+        kb,
+        element,
+        tile_ir_kernels::FlashAttentionTensors {
+            q,
+            k,
+            v,
+            mask,
+            output,
+        },
+        meta,
+        subgroup_size,
+        FLASH_STREAMING_TILED_Q_BLOCK,
+    )
 }
 
 /// Returns true when the per-shape gating for the tiled (Q-batched) streaming

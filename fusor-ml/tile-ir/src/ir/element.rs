@@ -1,22 +1,10 @@
-use std::marker::PhantomData;
-
-macro_rules! numeric_markers {
-    ($(($(#[$meta:meta])* $name:ident, $scalar:expr, $element:expr)),+ $(,)?) => {
-        $(
-            $(#[$meta])*
-            #[derive(Copy, Clone, Debug)]
-            pub struct $name;
-
-            impl ScalarMarker for $name {
-                const SCALAR: ScalarElement = $scalar;
-            }
-
-            impl Numeric for $name {
-                const ELEMENT: ElementType = $element;
-            }
-        )+
-    };
-}
+//! Runtime element types.
+//!
+//! tile-ir is runtime-typed (see ARBOR_DESIGN.md §2): element types are *data*
+//! carried on `Node.ty`, not Rust marker types or const generics. The typed
+//! frontend (`fusor`) owns compile-time element/shape/rank correctness; this
+//! module only models the runtime element enums and the cooperative-matrix
+//! role (also data, not typestate).
 
 /// Scalar elements that can back scalar, vector, and cooperative-matrix IR
 /// values.
@@ -45,6 +33,10 @@ impl ScalarElement {
 }
 
 /// Cooperative-matrix role encoded in an [`ElementType::CoopMatrix`].
+///
+/// A data enum (not typestate): it collapses the old `CoopOperandRole` +
+/// `CoopRole` chain. Making `{8, 16}` shapes unrepresentable is `fusor`'s job,
+/// not tile-ir's (see ARBOR_DESIGN.md §2/§3).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CoopMatrixRole {
     /// Left-hand MMA operand.
@@ -55,7 +47,7 @@ pub enum CoopMatrixRole {
     C,
 }
 
-/// Element types represented by the typed IR.
+/// Element types represented by the runtime-typed IR.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ElementType {
     /// 32-bit floating point scalar.
@@ -73,7 +65,8 @@ pub enum ElementType {
         /// Vector lane count. Naga lowering supports 2, 3, and 4 lanes.
         lanes: u32,
     },
-    /// Cooperative-matrix value of the given scalar, role, and shape.
+    /// Cooperative-matrix value of the given scalar, role, and shape. Coop
+    /// fragment dims are runtime `u32` — there is no `CoopSize` const-generic.
     CoopMatrix {
         /// Scalar component type.
         scalar: ScalarElement,
@@ -123,75 +116,3 @@ impl ElementType {
         )
     }
 }
-
-/// Marker for scalar types that can be named by typed IR wrappers.
-pub trait ScalarMarker {
-    /// Scalar represented by this marker.
-    const SCALAR: ScalarElement;
-}
-
-/// Numeric element markers that can appear in the typed IR.
-pub trait Numeric {
-    /// Element type represented by this marker.
-    const ELEMENT: ElementType;
-}
-
-/// Marker for scalar types accepted by vector dot products.
-pub trait FloatElement: ScalarMarker + Numeric {}
-
-/// Marker for scalar types accepted by cooperative-matrix fragments.
-pub trait CoopElement: FloatElement {}
-
-/// Packed vector marker.
-///
-/// ```
-/// use fusor_tile_ir::{ElementType, Numeric, Vector, F32};
-///
-/// type F32x2 = Vector<F32, 2>;
-/// assert_eq!(
-///     F32x2::ELEMENT,
-///     ElementType::vector(fusor_tile_ir::ScalarElement::F32, 2)
-/// );
-/// ```
-#[derive(Copy, Clone, Debug)]
-pub struct Vector<T, const LANES: usize>(PhantomData<T>);
-
-impl<T: ScalarMarker, const LANES: usize> Numeric for Vector<T, LANES> {
-    const ELEMENT: ElementType = ElementType::Vector {
-        scalar: T::SCALAR,
-        lanes: LANES as u32,
-    };
-}
-
-numeric_markers!(
-    (
-        /// A sample numeric marker.
-        F32,
-        ScalarElement::F32,
-        ElementType::F32
-    ),
-    (
-        /// Half-precision floating point storage marker.
-        F16,
-        ScalarElement::F16,
-        ElementType::F16
-    ),
-    (
-        /// Packed u32 storage marker.
-        U32,
-        ScalarElement::U32,
-        ElementType::U32
-    ),
-    (
-        /// Boolean private/control value marker.
-        Bool,
-        ScalarElement::Bool,
-        ElementType::Bool
-    ),
-);
-
-impl FloatElement for F32 {}
-impl FloatElement for F16 {}
-
-impl CoopElement for F32 {}
-impl CoopElement for F16 {}
