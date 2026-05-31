@@ -18,7 +18,7 @@ where
             device,
             tokens,
             images,
-            mut cache,
+            cache,
             tokenizer,
         } = ctx;
         #[cfg(not(debug_assertions))]
@@ -46,7 +46,7 @@ where
         };
         let token_start = trace_enabled.then(std::time::Instant::now);
         let build_start = trace_enabled.then(std::time::Instant::now);
-        let logits = model.forward(tokens, images, device, cache.as_deref_mut());
+        let logits = model.forward(tokens, images, device, cache);
         if let Some(start) = build_start {
             eprintln!(
                 "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",
@@ -290,7 +290,7 @@ where
             device,
             tokens,
             images,
-            mut cache,
+            cache,
             tokenizer: _,
         } = ctx;
         let trace = decode_trace_enabled();
@@ -304,7 +304,7 @@ where
         };
         let token_start = trace.then(std::time::Instant::now);
         let build_start = trace.then(std::time::Instant::now);
-        let hidden = model.forward_last_hidden_f32(tokens, images, device, cache.as_deref_mut());
+        let hidden = model.forward_last_hidden_f32(tokens, images, device, cache);
         if let Some(start) = build_start {
             eprintln!(
                 "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",

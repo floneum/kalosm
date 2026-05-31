@@ -8,12 +8,12 @@ use crate::{Device, SimdElement, Tensor, cat};
 /// A growable tensor cache.
 /// This cache manages tensor data with exponentially larger allocations as the sequence length increases.
 ///
-/// On GPU the cache owns a single concrete backing buffer and writes newly
-/// appended data into it in place. Lazy writes are chained through the latest
-/// full backing tensor, so resolving only the newest cache view still observes
-/// any earlier unresolved appends. The buffer only materializes when it has to
-/// grow (a rare power-of-two reallocation), not on every append, so
-/// steady-state decode still resolves as part of the forward pass.
+/// On GPU the cache owns a backing buffer and writes newly appended data into
+/// it in place. Lazy writes are chained through the latest full backing tensor,
+/// so resolving only the newest cache view still observes any earlier
+/// unresolved appends. Growth (a rare power-of-two reallocation) stays lazy too,
+/// so neither appends nor grows trigger a separate GPU submission — everything
+/// resolves in-band with the forward pass.
 #[derive(Clone)]
 pub struct TensorCache<const R: usize, D: SimdElement> {
     /// The latest valid `[0..current_seq_len]` view of the cache. This is what
@@ -112,10 +112,11 @@ where
     }
 
     /// Ensure the GPU backing buffer can hold `required_seq_len` tokens,
-    /// (re)allocating a concrete power-of-two buffer that preserves existing
-    /// data. The new buffer is built from the latest backing tensor (which may
-    /// include unresolved in-place writes) and `detach`ed into a fresh concrete
-    /// leaf so per-token in-place writes target a materialized buffer.
+    /// (re)allocating a power-of-two buffer that preserves existing data. The
+    /// new buffer is built from the latest backing tensor (which may include
+    /// unresolved in-place writes) with `cat`, and left lazy: it is resolved
+    /// in-band by the forward pass's own resolve, so a grow does not trigger a
+    /// separate mid-forward GPU submission.
     fn ensure_capacity_gpu(
         &mut self,
         device: &Device,
@@ -161,18 +162,14 @@ where
             Tensor::from_slice(device, shape, &zeros)
         };
 
-        let backing = padded
-            .as_gpu()
-            .expect("append_gpu requires a GPU tensor")
-            .detach();
-        self.backing = Some(Tensor::Gpu(backing));
+        self.backing = Some(padded);
         self.allocated_seq_len = new_allocated;
     }
 
-    /// GPU sliding-window append: build a fresh concrete backing holding the
-    /// last `max_sequence_len` tokens of `[existing .. v]`. Mirrors the CPU
-    /// overflow path, then `detach`es so subsequent appends keep working
-    /// in place.
+    /// GPU sliding-window append: build a fresh backing holding the last
+    /// `max_sequence_len` tokens of `[existing .. v]`. Mirrors the CPU overflow
+    /// path and stays lazy, so the eviction resolves in-band with the forward
+    /// pass rather than as a separate mid-forward submission.
     fn append_gpu_evict(&mut self, v: &Tensor<R, D>, v_shape: &[usize; R]) -> Tensor<R, D> {
         let max = self.max_sequence_len;
         let seq_len = v_shape[self.concat_dim];
@@ -191,14 +188,9 @@ where
         tensors.push(v.clone());
         let combined = cat(tensors, self.concat_dim);
         let combined_len = combined.shape()[self.concat_dim];
-        let backing = Tensor::Gpu(
-            combined
-                .narrow(self.concat_dim, combined_len - max, max)
-                .to_concrete()
-                .as_gpu()
-                .expect("append_gpu requires a GPU tensor")
-                .detach(),
-        );
+        let backing = combined
+            .narrow(self.concat_dim, combined_len - max, max)
+            .to_concrete();
 
         self.allocated_seq_len = max;
         self.current_seq_len = max;
