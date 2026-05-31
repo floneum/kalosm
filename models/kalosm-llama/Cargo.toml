@@ -39,6 +39,9 @@ image = { workspace = true, optional = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"], optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = "0.9"
+
 [dev-dependencies]
 ahash = "0.8.12"
 pollster = "0.4"

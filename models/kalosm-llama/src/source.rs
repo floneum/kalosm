@@ -2,6 +2,14 @@ use fusor_gguf::GgufReadError;
 use kalosm_common::CacheError;
 use kalosm_model_types::{FileLoadingProgress, FileSource};
 
+/// Backing storage for a loaded model file. On native targets this is a
+/// memory-mapped view of the cached GGUF (lazy, zero upfront copy); on WASM it
+/// is an in-memory buffer. Both deref to `[u8]`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type ModelBytes = memmap2::Mmap;
+#[cfg(target_arch = "wasm32")]
+pub(crate) type ModelBytes = Vec<u8>;
+
 #[cfg(feature = "hf-config-json")]
 use crate::raw::RopeScalingConfig;
 
@@ -225,11 +233,36 @@ impl LlamaSource {
 
     pub(crate) async fn model(
         &self,
-        mut progress: impl FnMut(FileLoadingProgress),
-    ) -> Result<Vec<Vec<u8>>, LlamaSourceError> {
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))] mut progress: impl FnMut(
+            FileLoadingProgress,
+        ),
+    ) -> Result<Vec<ModelBytes>, LlamaSourceError> {
         let mut model_bytes = Vec::new();
         for file in &self.model {
-            model_bytes.push(self.cache.get_bytes(file, &mut progress).await?);
+            // Memory-map the (cached) model file rather than reading the whole
+            // multi-GB GGUF into a Vec up front. The OS pages weights in lazily
+            // as each tensor is read during upload, eliminating one full read +
+            // allocation pass over the entire file. WASM has no mmap, so it
+            // falls back to reading the bytes into memory.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let path = self.cache.get(file, &mut progress).await?;
+                let handle = std::fs::File::open(&path).map_err(CacheError::from)?;
+                // SAFETY: model cache files are treated as immutable for the
+                // lifetime of the mapping (we only ever read them).
+                let mmap = unsafe { memmap2::Mmap::map(&handle) }.map_err(CacheError::from)?;
+                // We read the whole file (every tensor) exactly once, in order.
+                // Kick off sequential read-ahead so a cold page cache prefetches
+                // from disk in the background and overlaps with parsing/upload,
+                // instead of stalling on a page fault per tensor.
+                let _ = mmap.advise(memmap2::Advice::Sequential);
+                let _ = mmap.advise(memmap2::Advice::WillNeed);
+                model_bytes.push(mmap);
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                model_bytes.push(self.cache.get_bytes(file, &mut progress).await?);
+            }
         }
         Ok(model_bytes)
     }

@@ -512,7 +512,7 @@ where
                 // Read metadata from all model files
                 let mut files_with_metadata = Vec::new();
                 for bytes in &model_bytes {
-                    let mut cursor = std::io::Cursor::new(bytes);
+                    let mut cursor = std::io::Cursor::new(&bytes[..]);
                     let metadata = GgufMetadata::read(&mut cursor)?;
                     files_with_metadata.push((metadata, cursor));
                 }
