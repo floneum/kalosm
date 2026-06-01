@@ -241,6 +241,25 @@ impl Tile {
     pub fn bit_or(self, rhs: impl Into<Tile>) -> Self {
         self.binary(TileBinaryOp::BitOr, rhs.into())
     }
+    /// Logical shift right (for u32 lanes).
+    pub fn shift_right(self, rhs: impl Into<Tile>) -> Self {
+        self.binary(TileBinaryOp::Shr, rhs.into())
+    }
+    /// Shift left (for u32 lanes).
+    pub fn shift_left(self, rhs: impl Into<Tile>) -> Self {
+        self.binary(TileBinaryOp::Shl, rhs.into())
+    }
+    /// Unpack a `u32` lane holding two packed f16 values into a `vec2<f32>`
+    /// (lane 0 = low half, lane 1 = high half).
+    pub fn unpack2x16float(self) -> Self {
+        Self::new(
+            ExprKind::Unary {
+                op: TileUnaryOp::Unpack2x16Float,
+                value: Box::new(self.expr),
+            },
+            ElementType::vector(ScalarElement::F32, 2),
+        )
+    }
     // ---- bool ops ----
     /// A statically-true mask (`Bool(true)`).
     pub fn all() -> Mask {

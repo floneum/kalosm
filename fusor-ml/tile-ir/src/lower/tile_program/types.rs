@@ -89,6 +89,7 @@ impl<'a> Lowerer<'a> {
             TileUnaryOp::Acosh => MathFunction::Acosh,
             TileUnaryOp::Atanh => MathFunction::Atanh,
             TileUnaryOp::Abs => MathFunction::Abs,
+            TileUnaryOp::Unpack2x16Float => MathFunction::Unpack2x16float,
             TileUnaryOp::Neg => return None,
         })
     }
@@ -107,6 +108,8 @@ impl<'a> Lowerer<'a> {
             TileBinaryOp::BitAnd => BinaryOperator::And,
             TileBinaryOp::BitOr => BinaryOperator::InclusiveOr,
             TileBinaryOp::BitXor => BinaryOperator::ExclusiveOr,
+            TileBinaryOp::Shr => BinaryOperator::ShiftRight,
+            TileBinaryOp::Shl => BinaryOperator::ShiftLeft,
             TileBinaryOp::LogicalAnd => BinaryOperator::LogicalAnd,
             TileBinaryOp::LogicalOr => BinaryOperator::LogicalOr,
             TileBinaryOp::Pow | TileBinaryOp::Min | TileBinaryOp::Max => {

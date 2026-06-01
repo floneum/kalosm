@@ -668,11 +668,8 @@ where
         if let Some(vision_encoder) = &self.vision_encoder {
             for ((pixels, grid), range) in images.iter().zip(&grid_thw).zip(image_token_ranges) {
                 let pixels_f: Tensor<2, F> = pixels.cast();
-                let t_vision_build = std::time::Instant::now();
                 let image_embeds = vision_encoder.forward_image(&pixels_f, *grid)?;
-                let build_elapsed = t_vision_build.elapsed();
                 let image_embeds_3d = image_embeds.unsqueeze(0);
-                eprintln!("[timing] vision graph build={:.2?}", build_elapsed);
                 embeddings =
                     embeddings.slice_assign([0..batch_size, range, 0..embed_dim], &image_embeds_3d);
             }
