@@ -18,7 +18,9 @@ use fusor_tile_ir::tile::{range, Program, Storage, Tile, TileBlock};
 use fusor_tile_ir::{ElementType, GgmlQuantFormat, QuantizedMatrix};
 
 use crate::dispatch::QgemvShape;
-use crate::grid::{qgemv_grid, qgemv_program_scope, store_qgemv_sums_with_epilogue, QgemvStoreTarget};
+use crate::grid::{
+    qgemv_grid, qgemv_program_scope, store_qgemv_sums_with_epilogue, QgemvStoreTarget,
+};
 use crate::types::{matrix_shape, QmatmulEpilogues};
 
 /// Q6K word offset of the super-block scale `d` (an f32 word for the f32-scale
@@ -125,9 +127,8 @@ pub(crate) fn qgemv_q6k_ggml(
                 } else {
                     block_idx.clone().lt(block_count)
                 };
-                let vector_base = block_idx.clone() * 256u32
-                    + q6k_lane.ip.clone() * 128u32
-                    + q6k_lane.l0.clone();
+                let vector_base =
+                    block_idx.clone() * 256u32 + q6k_lane.ip.clone() * 128u32 + q6k_lane.l0.clone();
                 let acts = load_q6k_ggml_activations(program, a, &row, &vector_base, &in_bounds);
                 accs.into_iter()
                     .enumerate()

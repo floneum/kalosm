@@ -578,8 +578,8 @@ pub(crate) fn q4k_ggml_dot_tiles(
 fn accumulate_q4k_word(word: &Tile, acts: &[Tile], act_base: usize, sums: &mut [Tile; 4]) {
     let high_word = word.clone().shift_right(16u32);
     for (source, base) in [(word.clone(), act_base), (high_word, act_base + 2)] {
-        sums[0] =
-            sums[0].clone() + acts[base].clone() * (source.clone() & 0x000fu32).cast(ElementType::F32);
+        sums[0] = sums[0].clone()
+            + acts[base].clone() * (source.clone() & 0x000fu32).cast(ElementType::F32);
         sums[1] = sums[1].clone()
             + acts[base + 1].clone() * (source.clone() & 0x0f00u32).cast(ElementType::F32);
         sums[2] = sums[2].clone()
