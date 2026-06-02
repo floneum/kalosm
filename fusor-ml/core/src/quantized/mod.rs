@@ -474,10 +474,7 @@ impl QMatrix {
             (unsupported, _) => return Err(GgufReadError::UnsupportedDType(unsupported as u32)),
         };
         let datatype = ty;
-        // Weights are written once and live for the model's lifetime, so map the
-        // buffer at creation and copy straight in (one memcpy) rather than going
-        // through the queue staging belt.
-        let buffer = device.create_buffer_init_mapped(
+        let buffer = device.create_buffer_init(
             &storage_bytes,
             wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
