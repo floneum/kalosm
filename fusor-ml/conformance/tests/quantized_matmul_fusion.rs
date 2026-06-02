@@ -74,7 +74,7 @@ async fn rmsnorm_post_relu_resolves_to_single_kernel() {
     let Tensor::Gpu(gpu_out) = output else {
         panic!("expected GPU tensor");
     };
-    let kernels = gpu_device.resolve_batch(&[gpu_out.key()]);
+    let kernels = gpu_out.count_kernels_to_resolve();
     assert_eq!(
         kernels, 1,
         "expected fuser to collapse rms_norm -> relu to 1 dispatch, got {kernels}"
@@ -106,7 +106,7 @@ async fn q4k_qmatmul_pre_relu_resolves_to_single_kernel() {
     let Tensor::Gpu(gpu_out) = output else {
         panic!("expected GPU tensor");
     };
-    let kernels = gpu_device.resolve_batch(&[gpu_out.key()]);
+    let kernels = gpu_out.count_kernels_to_resolve();
     assert_eq!(
         kernels, 1,
         "expected fuser to collapse relu -> q_mat_mul to 1 dispatch, got {kernels}"
@@ -125,7 +125,7 @@ async fn q4k_qmatmul_post_relu_resolves_to_single_kernel() {
     let weight_shape = [4, 512];
     let raw_bytes = q4k_raw_bytes(weight_shape);
     let input_data = vec![vec![0.1f32; weight_shape[1]]; 1];
-    let Some(gpu_device) = device.as_gpu() else {
+    let Some(_) = device.as_gpu() else {
         panic!("expected GPU device");
     };
 
@@ -137,7 +137,7 @@ async fn q4k_qmatmul_post_relu_resolves_to_single_kernel() {
     let Tensor::Gpu(natural_gpu) = output else {
         panic!("expected GPU tensor");
     };
-    let natural_kernels = gpu_device.resolve_batch(&[natural_gpu.key()]);
+    let natural_kernels = natural_gpu.count_kernels_to_resolve();
     assert_eq!(
         natural_kernels, 1,
         "expected fuser to collapse q_mat_mul -> relu to 1 dispatch, got {natural_kernels}"

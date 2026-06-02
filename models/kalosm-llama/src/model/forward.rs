@@ -58,9 +58,9 @@ where
         let logits: fusor::Tensor<1, f32> = logits.cast();
         let len = logits.shape()[0];
         let mut kernels = 0;
-        if let Some(logits_key) = logits.gpu_key() {
+        if let Some(gpu_logits) = logits.as_gpu() {
             let resolve_start = trace_enabled.then(std::time::Instant::now);
-            kernels = device.resolve_batch(&[logits_key]);
+            kernels = gpu_logits.count_kernels_to_resolve();
             if let Some(start) = resolve_start {
                 eprintln!(
                     "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
@@ -318,9 +318,9 @@ where
         let hidden = hidden.squeeze(0).to_concrete();
         let output_matrix = model.output_matrix().clone();
         let mut kernels = 0;
-        if let Some(hidden_key) = hidden.gpu_key() {
+        if let Some(gpu_hidden) = hidden.as_gpu() {
             let resolve_start = trace.then(std::time::Instant::now);
-            kernels = device.resolve_batch(&[hidden_key]);
+            kernels = gpu_hidden.count_kernels_to_resolve();
             if let Some(start) = resolve_start {
                 eprintln!(
                     "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",

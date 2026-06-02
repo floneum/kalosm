@@ -152,43 +152,6 @@ impl ComputeGraph {
         data
     }
 
-    /// Resolve multiple targets in a single pass. Since sequential `resolve()`
-    /// now reuses kernels across sibling targets (via the
-    /// `live_descendant_count` predicate in the freeing path), this is
-    /// primarily a hint to share one command-encoder submission.
-    pub(crate) fn resolve_batch(&self, keys: &[NodeIndex]) -> usize {
-        if keys.is_empty() {
-            return 0;
-        }
-        let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-            || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
-        let start = trace.then(std::time::Instant::now);
-        let total_kernels;
-        let removed = {
-            let mut inner = self.inner.write();
-            let mut removed = Vec::new();
-            let mut resolver = Resolver::new_batch(&mut inner, keys.to_vec());
-            let result = resolver.run(&mut inner, &mut removed);
-            total_kernels = result.total_kernels;
-            if let Some(start) = start {
-                eprintln!(
-                    "resolve_batch keys={} kernels={} elapsed={:?}",
-                    keys.len(),
-                    result.total_kernels,
-                    start.elapsed()
-                );
-            }
-            inner.try_auto_flush(&mut removed);
-            #[cfg(feature = "extra_assertions")]
-            {
-                inner.verify_integrity()
-            }
-            removed
-        };
-        drop(removed);
-        total_kernels
-    }
-
     #[cfg(feature = "graphvis")]
     pub(crate) fn graphvis(&self, root: NodeIndex) -> Graph {
         self.with_mut(|inner| inner.graphvis(root))
@@ -275,10 +238,10 @@ pub(crate) struct ComputeGraphNode {
     // `alive_uncached()` (see below). Maintained eagerly; lets the resolver
     // free intermediates only when no user-held lazy tensor still needs this
     // node's result to be re-computed. Sequential `resolve()` calls can then
-    // reuse shared ancestors instead of recomputing them, matching
-    // `resolve_batch`. A descendant that has already been resolved (cached)
-    // no longer contributes, so deep chains where only the final tensor is
-    // held still free intermediates eagerly during the resolve.
+    // reuse shared ancestors instead of recomputing them. A descendant that
+    // has already been resolved (cached) no longer contributes, so deep chains
+    // where only the final tensor is held still free intermediates eagerly
+    // during the resolve.
     live_descendant_count: u32,
     cached: Option<TensorData>,
 }
@@ -418,7 +381,7 @@ impl ComputeGraphInner {
     /// in a single batched resolve. The user has already expressed intent to
     /// consume each of those outputs (via a live `LazyTensorData` handle), so
     /// this never forces work the user didn't ask for — it just compresses the
-    /// schedule. Called from the end of `resolve()` / `resolve_batch()`.
+    /// schedule. Called from the end of `resolve()`.
     fn try_auto_flush(&mut self, removed: &mut Vec<ComputeGraphNode>) {
         if self.flush_threshold == 0 {
             return;

@@ -62,8 +62,7 @@ fn bench_flash_attention_vision(device: &Device) {
     let cold = Instant::now();
     {
         let y = q.flash_attention(&k, &v, 1.0 / (80f32).sqrt(), None);
-        let key = y.key();
-        device.resolve_batch(&[key]);
+        let _ = y.count_kernels_to_resolve();
         device.poll_wait();
         drop(y);
     }
@@ -71,8 +70,7 @@ fn bench_flash_attention_vision(device: &Device) {
 
     for _ in 0..WARMUP_BATCHES {
         let y = q.flash_attention(&k, &v, 1.0 / (80f32).sqrt(), None);
-        let key = y.key();
-        device.resolve_batch(&[key]);
+        let _ = y.count_kernels_to_resolve();
         device.poll_wait();
         drop(y);
     }
@@ -81,8 +79,7 @@ fn bench_flash_attention_vision(device: &Device) {
     for _ in 0..MEASURED_BATCHES {
         let start = Instant::now();
         let y = q.flash_attention(&k, &v, 1.0 / (80f32).sqrt(), None);
-        let key = y.key();
-        device.resolve_batch(&[key]);
+        let _ = y.count_kernels_to_resolve();
         device.poll_wait();
         samples.push(start.elapsed());
         drop(y);
@@ -122,8 +119,7 @@ fn bench_flash_attention_vision(device: &Device) {
 
     for _ in 0..WARMUP_BATCHES {
         let y = q.flash_attention(&k, &v, 1.0 / (80f32).sqrt(), Some(&mask));
-        let key = y.key();
-        device.resolve_batch(&[key]);
+        let _ = y.count_kernels_to_resolve();
         device.poll_wait();
         drop(y);
     }
@@ -132,8 +128,7 @@ fn bench_flash_attention_vision(device: &Device) {
     for _ in 0..MEASURED_BATCHES {
         let start = Instant::now();
         let y = q.flash_attention(&k, &v, 1.0 / (80f32).sqrt(), Some(&mask));
-        let key = y.key();
-        device.resolve_batch(&[key]);
+        let _ = y.count_kernels_to_resolve();
         device.poll_wait();
         masked_samples.push(start.elapsed());
         drop(y);
@@ -173,8 +168,7 @@ fn bench_matmul(device: &Device, name: &str, m: usize, k: usize, n: usize) {
     let cold_start = Instant::now();
     {
         let y = a.mat_mul(&b);
-        let key = y.key();
-        device.resolve_batch(&[key]);
+        let _ = y.count_kernels_to_resolve();
         device.poll_wait();
         drop(y);
     }
@@ -208,15 +202,13 @@ fn bench_matmul(device: &Device, name: &str, m: usize, k: usize, n: usize) {
 }
 
 fn run_batch(device: &Device, a: &Tensor, b: &Tensor) -> (Duration, usize) {
-    let mut keys = Vec::with_capacity(DISPATCHES_PER_BATCH);
     let mut outputs = Vec::with_capacity(DISPATCHES_PER_BATCH);
     for _ in 0..DISPATCHES_PER_BATCH {
         let y = a.mat_mul(b);
-        keys.push(y.key());
         outputs.push(y);
     }
     let start = Instant::now();
-    let kernels = device.resolve_batch(&keys);
+    let kernels = outputs.iter().map(Tensor::count_kernels_to_resolve).sum();
     device.poll_wait();
     let elapsed = start.elapsed();
     drop(outputs);
