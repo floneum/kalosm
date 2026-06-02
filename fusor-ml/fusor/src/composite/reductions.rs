@@ -1,126 +1,107 @@
 //! Axis reduction operations that work on both CPU and GPU backends.
 
-use crate::{ConcreteTensor, DivOp, FloatOps, SimdBinaryOp, SimdElement, Tensor};
-use fusor_core::{DataType, FloatDataType, LastRank as GpuLastRank};
-use fusor_cpu::{
+use crate::cpu::{
     LastRank as CpuLastRank, MaxOp, MinOp, ProdOp, SimdReduceOp, SumOp, TensorBacking,
 };
+use crate::gpu::{DataType, FloatDataType, LastRank as GpuLastRank};
+use crate::{ConcreteTensor, DivOp, FloatOps, SimdBinaryOp, SimdElement, Tensor};
+
+/// Emit a rank-reducing axis reduction method that dispatches CPU/GPU.
+///
+/// `$method` is the public name (e.g. `sum`).
+/// `$op` is the SIMD reduce op marker (e.g. `SumOp`).
+/// `$cpu_method` is the CPU tensor method (e.g. `sum_axis`).
+/// `$gpu_method` is the GPU tensor method (e.g. `sum`).
+macro_rules! axis_reduce {
+    ($(#[$meta:meta])* $method:ident, $op:ident, $cpu_method:ident, $gpu_method:ident) => {
+        $(#[$meta])*
+        pub fn $method<const OUT_RANK: usize>(
+            &self,
+            axis: usize,
+        ) -> Tensor<OUT_RANK, D, ConcreteTensor<D, OUT_RANK>>
+        where
+            ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
+            crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+            $op: SimdReduceOp<D>,
+        {
+            self.dispatch_ref(
+                |t| t.as_ref().$cpu_method::<OUT_RANK>(axis),
+                |t| t.$gpu_method(axis),
+            )
+        }
+    };
+}
+
+/// Emit a keepdim variant that calls the rank-reducing form then reshapes.
+///
+/// `$method` is the public name (e.g. `sum_keepdim`).
+/// `$base` is the rank-reducing method to call (e.g. `sum`).
+macro_rules! axis_reduce_keepdim {
+    ($(#[$meta:meta])* $method:ident, $base:ident, $op:ident) => {
+        $(#[$meta])*
+        pub fn $method<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
+        where
+            ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
+            crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+            $op: SimdReduceOp<D>,
+        {
+            let mut kept_shape = self.shape();
+            kept_shape[axis] = 1;
+            self.$base::<OUT_RANK>(axis).reshape(kept_shape).to_concrete()
+        }
+    };
+}
 
 impl<const R: usize, D, B> Tensor<R, D, B>
 where
     D: SimdElement + DataType + FloatDataType + FloatOps + Default,
     B: TensorBacking<R, Elem = D>,
 {
-    /// Sum along a specific axis, reducing the tensor rank by 1.
-    ///
-    /// # Arguments
-    /// * `axis` - The axis to reduce along (0 to R-1)
-    ///
-    /// # Type Parameters
-    /// - `OUT_RANK`: The output tensor rank (must be R - 1)
-    pub fn sum<const OUT_RANK: usize>(
-        &self,
-        axis: usize,
-    ) -> Tensor<OUT_RANK, D, ConcreteTensor<D, OUT_RANK>>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        SumOp: SimdReduceOp<D>,
-    {
-        self.dispatch_ref(|t| t.as_ref().sum_axis::<OUT_RANK>(axis), |t| t.sum(axis))
-    }
+    axis_reduce!(
+        /// Sum along a specific axis, reducing the tensor rank by 1.
+        ///
+        /// # Arguments
+        /// * `axis` - The axis to reduce along (0 to R-1)
+        ///
+        /// # Type Parameters
+        /// - `OUT_RANK`: The output tensor rank (must be R - 1)
+        sum, SumOp, sum_axis, sum
+    );
 
-    /// Maximum along a specific axis, reducing the tensor rank by 1.
-    pub fn max<const OUT_RANK: usize>(
-        &self,
-        axis: usize,
-    ) -> Tensor<OUT_RANK, D, ConcreteTensor<D, OUT_RANK>>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        MaxOp: SimdReduceOp<D>,
-    {
-        self.dispatch_ref(|t| t.as_ref().max_axis::<OUT_RANK>(axis), |t| t.max(axis))
-    }
+    axis_reduce!(
+        /// Maximum along a specific axis, reducing the tensor rank by 1.
+        max, MaxOp, max_axis, max
+    );
 
-    /// Minimum along a specific axis, reducing the tensor rank by 1.
-    pub fn min<const OUT_RANK: usize>(
-        &self,
-        axis: usize,
-    ) -> Tensor<OUT_RANK, D, ConcreteTensor<D, OUT_RANK>>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        MinOp: SimdReduceOp<D>,
-    {
-        self.dispatch_ref(|t| t.as_ref().min_axis::<OUT_RANK>(axis), |t| t.min(axis))
-    }
+    axis_reduce!(
+        /// Minimum along a specific axis, reducing the tensor rank by 1.
+        min, MinOp, min_axis, min
+    );
 
-    /// Product along a specific axis, reducing the tensor rank by 1.
-    pub fn product<const OUT_RANK: usize>(
-        &self,
-        axis: usize,
-    ) -> Tensor<OUT_RANK, D, ConcreteTensor<D, OUT_RANK>>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        ProdOp: SimdReduceOp<D>,
-    {
-        self.dispatch_ref(
-            |t| t.as_ref().prod_axis::<OUT_RANK>(axis),
-            |t| t.product(axis),
-        )
-    }
+    axis_reduce!(
+        /// Product along a specific axis, reducing the tensor rank by 1.
+        product, ProdOp, prod_axis, product
+    );
 
-    /// Product along a specific axis, keeping the reduced dimension with size 1.
-    pub fn product_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        ProdOp: SimdReduceOp<D>,
-    {
-        let mut kept_shape = self.shape();
-        kept_shape[axis] = 1;
-        self.product::<OUT_RANK>(axis)
-            .reshape(kept_shape)
-            .to_concrete()
-    }
+    axis_reduce_keepdim!(
+        /// Product along a specific axis, keeping the reduced dimension with size 1.
+        product_keepdim, product, ProdOp
+    );
 
-    /// Sum along a specific axis, keeping the reduced dimension with size 1.
-    pub fn sum_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        SumOp: SimdReduceOp<D>,
-    {
-        let mut kept_shape = self.shape();
-        kept_shape[axis] = 1;
-        self.sum::<OUT_RANK>(axis).reshape(kept_shape).to_concrete()
-    }
+    axis_reduce_keepdim!(
+        /// Sum along a specific axis, keeping the reduced dimension with size 1.
+        sum_keepdim, sum, SumOp
+    );
 
-    /// Max along a specific axis, keeping the reduced dimension with size 1.
-    pub fn max_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        MaxOp: SimdReduceOp<D>,
-    {
-        let mut kept_shape = self.shape();
-        kept_shape[axis] = 1;
-        self.max::<OUT_RANK>(axis).reshape(kept_shape).to_concrete()
-    }
+    axis_reduce_keepdim!(
+        /// Max along a specific axis, keeping the reduced dimension with size 1.
+        max_keepdim, max, MaxOp
+    );
 
-    /// Min along a specific axis, keeping the reduced dimension with size 1.
-    pub fn min_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        MinOp: SimdReduceOp<D>,
-    {
-        let mut kept_shape = self.shape();
-        kept_shape[axis] = 1;
-        self.min::<OUT_RANK>(axis).reshape(kept_shape).to_concrete()
-    }
+    axis_reduce_keepdim!(
+        /// Min along a specific axis, keeping the reduced dimension with size 1.
+        min_keepdim, min, MinOp
+    );
 
     /// Mean along a specific axis, reducing the tensor rank by 1.
     pub fn mean<const OUT_RANK: usize>(
@@ -129,7 +110,7 @@ where
     ) -> Tensor<OUT_RANK, D, ConcreteTensor<D, OUT_RANK>>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Div<Output = D>,
         DivOp: SimdBinaryOp<D>,
@@ -144,7 +125,7 @@ where
     pub fn mean_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Div<Output = D>,
         DivOp: SimdBinaryOp<D>,
@@ -164,7 +145,7 @@ where
     ) -> Tensor<OUT_RANK, D, ConcreteTensor<D, OUT_RANK>>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D> + std::ops::Sub<Output = D> + std::ops::Div<Output = D>,
         crate::MulOp: SimdBinaryOp<D>,
@@ -185,7 +166,7 @@ where
     pub fn var_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D> + std::ops::Sub<Output = D> + std::ops::Div<Output = D>,
         crate::MulOp: SimdBinaryOp<D>,
@@ -200,152 +181,5 @@ where
         let mean_x2 = x_sq.mean_keepdim::<OUT_RANK>(axis);
         // mean(x^2) - mean(x)^2
         (&mean_x2 - &mean_x_sq).to_concrete()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_sum_cpu() {
-        // 2x3 tensor
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-
-        // Sum along axis 0: [1+4, 2+5, 3+6] = [5, 7, 9]
-        let result: Tensor<1, f32, _> = t.sum::<1>(0);
-        let slice = result.as_slice().await.unwrap();
-        assert!((slice[[0]] - 5.0).abs() < 0.001);
-        assert!((slice[[1]] - 7.0).abs() < 0.001);
-        assert!((slice[[2]] - 9.0).abs() < 0.001);
-
-        // Sum along axis 1: [1+2+3, 4+5+6] = [6, 15]
-        let result: Tensor<1, f32, _> = t.sum::<1>(1);
-        let slice = result.as_slice().await.unwrap();
-        assert!((slice[[0]] - 6.0).abs() < 0.001);
-        assert!((slice[[1]] - 15.0).abs() < 0.001);
-    }
-
-    #[tokio::test]
-    async fn test_max_cpu() {
-        let data = [1.0f32, 5.0, 3.0, 4.0, 2.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-
-        // Max along axis 0: [max(1,4), max(5,2), max(3,6)] = [4, 5, 6]
-        let result: Tensor<1, f32, _> = t.max::<1>(0);
-        let slice = result.as_slice().await.unwrap();
-        assert!((slice[[0]] - 4.0).abs() < 0.001);
-        assert!((slice[[1]] - 5.0).abs() < 0.001);
-        assert!((slice[[2]] - 6.0).abs() < 0.001);
-
-        // Max along axis 1: [max(1,5,3), max(4,2,6)] = [5, 6]
-        let result: Tensor<1, f32, _> = t.max::<1>(1);
-        let slice = result.as_slice().await.unwrap();
-        assert!((slice[[0]] - 5.0).abs() < 0.001);
-        assert!((slice[[1]] - 6.0).abs() < 0.001);
-    }
-
-    #[tokio::test]
-    async fn test_min_cpu() {
-        let data = [1.0f32, 5.0, 3.0, 4.0, 2.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-
-        // Min along axis 0: [min(1,4), min(5,2), min(3,6)] = [1, 2, 3]
-        let result: Tensor<1, f32, _> = t.min::<1>(0);
-        let slice = result.as_slice().await.unwrap();
-        assert!((slice[[0]] - 1.0).abs() < 0.001);
-        assert!((slice[[1]] - 2.0).abs() < 0.001);
-        assert!((slice[[2]] - 3.0).abs() < 0.001);
-    }
-
-    #[tokio::test]
-    async fn test_sum_keepdim_cpu() {
-        // 2x3 tensor
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-
-        // Sum along axis 1, keepdim -> shape [2, 1]
-        // Row 0 sum: 1+2+3 = 6, Row 1 sum: 4+5+6 = 15
-        let result = t.sum_keepdim::<1>(1);
-        assert_eq!(result.shape(), [2, 1]); // Keepdim shape
-        let slice = result.as_slice().await.unwrap();
-        assert!((slice[[0, 0]] - 6.0).abs() < 0.001);
-        assert!((slice[[1, 0]] - 15.0).abs() < 0.001);
-    }
-
-    #[tokio::test]
-    async fn test_mean_cpu() {
-        // 2x3 tensor
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-
-        // Mean along axis 1: [(1+2+3)/3, (4+5+6)/3] = [2, 5]
-        let result: Tensor<1, f32, _> = t.mean::<1>(1);
-        let slice = result.as_slice().await.unwrap();
-        assert!((slice[[0]] - 2.0).abs() < 0.001);
-        assert!((slice[[1]] - 5.0).abs() < 0.001);
-    }
-
-    #[tokio::test]
-    async fn test_mean_keepdim_cpu() {
-        // 2x3 tensor
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-
-        // Mean along axis 1, keepdim -> shape [2, 1]
-        let result = t.mean_keepdim::<1>(1);
-        assert_eq!(result.shape(), [2, 1]); // Keepdim shape
-        let slice = result.as_slice().await.unwrap();
-        assert!((slice[[0, 0]] - 2.0).abs() < 0.001);
-        assert!((slice[[1, 0]] - 5.0).abs() < 0.001);
-    }
-
-    #[tokio::test]
-    async fn test_var_cpu() {
-        // Test variance: var([1, 2, 3]) = mean([1, 4, 9]) - mean([1, 2, 3])^2
-        //                              = 14/3 - 4 = 2/3 ≈ 0.6667
-        let data = [1.0f32, 2.0, 3.0];
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &data));
-
-        let result: Tensor<0, f32, _> = t.var::<0>(0);
-        let slice = result.as_slice().await.unwrap();
-        let expected = 2.0 / 3.0; // population variance
-        assert!(
-            (slice[[]] - expected).abs() < 0.001,
-            "Expected {}, got {}",
-            expected,
-            slice[[]]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_var_2d_cpu() {
-        // 2x3 tensor
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-
-        // Variance along axis 1
-        // Row 0: [1, 2, 3] -> mean=2, var = (1+4+9)/3 - 4 = 14/3 - 4 = 2/3
-        // Row 1: [4, 5, 6] -> mean=5, var = (16+25+36)/3 - 25 = 77/3 - 25 = 2/3
-        let result: Tensor<1, f32, _> = t.var::<1>(1);
-        let slice = result.as_slice().await.unwrap();
-        let expected = 2.0 / 3.0;
-        assert!((slice[[0]] - expected).abs() < 0.001);
-        assert!((slice[[1]] - expected).abs() < 0.001);
-    }
-
-    #[tokio::test]
-    async fn test_var_keepdim_cpu() {
-        // 2x3 tensor
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-
-        let result = t.var_keepdim::<1>(1);
-        assert_eq!(result.shape(), [2, 1]); // Keepdim shape
-        let slice = result.as_slice().await.unwrap();
-        let expected = 2.0 / 3.0;
-        assert!((slice[[0, 0]] - expected).abs() < 0.001);
-        assert!((slice[[1, 0]] - expected).abs() < 0.001);
     }
 }

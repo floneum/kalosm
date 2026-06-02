@@ -2,10 +2,10 @@ mod common;
 
 use common::{binary_map2, unary_map2, where_cond1, where_cond2};
 use fusor::{Device, Tensor};
-use fusor_conformance::{FuzzGenerator, approx_compare};
+use fusor_conformance::{FuzzGenerator, approx_compare, approx_or_relative_compare};
 use rand::distr::Uniform;
 
-const SHAPE: [usize; 2] = [4, 5];
+const SHAPE: [usize; 2] = [45, 45];
 
 fn signed() -> FuzzGenerator<2, f32> {
     FuzzGenerator::<2, f32>::new(SHAPE)
@@ -43,14 +43,139 @@ fn acosh_domain() -> FuzzGenerator<2, f32> {
         .with_distribution(Uniform::new(1.01, 3.5).unwrap())
 }
 
+fn eq_f32(l: f32, r: f32) -> bool {
+    l == r
+}
+
+fn lt_f32(l: f32, r: f32) -> bool {
+    l < r
+}
+
+fn lte_f32(l: f32, r: f32) -> bool {
+    l <= r
+}
+
+fn gt_f32(l: f32, r: f32) -> bool {
+    l > r
+}
+
+fn gte_f32(l: f32, r: f32) -> bool {
+    l >= r
+}
+
 macro_rules! fuzz_unary {
     ($name:ident, $gen:expr, $op:expr, $ref_fn:expr, $tol:expr) => {
+        fuzz_unary_compare!($name, $gen, $op, $ref_fn, approx_compare::<2, f32>($tol));
+    };
+}
+
+macro_rules! fuzz_unary_compare {
+    ($name:ident, $gen:expr, $op:expr, $ref_fn:expr, $compare:expr) => {
         fusor_conformance::assert(async |x: Tensor<2, f32>| ($op)(x))
             .arg($gen)
             .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
                 Tensor::new(&device, &unary_map2(&v, $ref_fn))
             })
+            .compare_with($compare)
+            .runs(3)
+            .await
+            .unwrap();
+    };
+}
+
+macro_rules! fuzz_unary_native_math {
+    ($name:ident, $gen:expr, $op:expr, $ref_fn:expr, $abs_tol:expr, $rel_tol:expr) => {
+        fuzz_unary_compare!(
+            $name,
+            $gen,
+            $op,
+            $ref_fn,
+            approx_or_relative_compare::<2>($abs_tol, $rel_tol)
+        );
+    };
+}
+
+macro_rules! fuzz_broadcast_binary {
+    ($gen_a:expr, $gen_b:expr, $op:expr, $ref_fn:expr, $tol:expr) => {
+        fusor_conformance::assert($op)
+            .arg($gen_a.clone())
+            .arg($gen_b.clone())
+            .equal_to_resolved_with_device(async |a: Vec<Vec<f32>>, b: Vec<f32>, device: Device| {
+                let out = common::broadcast_binary_2d_1d(&a, &b, $ref_fn);
+                Tensor::new(&device, &out)
+            })
             .compare_with(approx_compare::<2, f32>($tol))
+            .runs(3)
+            .await
+            .unwrap();
+    };
+}
+
+macro_rules! fuzz_same_shape_binary {
+    ($gen_a:expr, $gen_b:expr, $op:expr, $ref_fn:expr, $tol:expr) => {
+        fusor_conformance::assert($op)
+            .arg($gen_a.clone())
+            .arg($gen_b.clone())
+            .equal_to_resolved_with_device(
+                async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
+                    let out = binary_map2(&a, &b, $ref_fn);
+                    Tensor::new(&device, &out)
+                },
+            )
+            .compare_with(approx_compare::<2, f32>($tol))
+            .runs(3)
+            .await
+            .unwrap();
+    };
+}
+
+macro_rules! fuzz_scalar_compare {
+    ($fuzz:expr, $op:expr, $ref_fn:expr $(,)?) => {
+        fusor_conformance::assert($op)
+            .arg($fuzz.clone())
+            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+                Tensor::new(&device, &common::compare_scalar_map2(&v, 0.25, $ref_fn))
+            })
+            .compare_with(approx_compare::<2, f32>(0.0))
+            .runs(3)
+            .await
+            .unwrap();
+    };
+}
+
+macro_rules! fuzz_tensor_compare {
+    ($fuzz:expr, $gen_b:expr, $op:expr, $ref_fn:expr) => {
+        fusor_conformance::assert($op)
+            .arg($fuzz.clone())
+            .arg($gen_b.clone())
+            .equal_to_resolved_with_device(
+                async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
+                    Tensor::new(&device, &common::compare_tensor_map2(&a, &b, $ref_fn))
+                },
+            )
+            .compare_with(approx_compare::<2, f32>(0.0))
+            .devices([Device::Cpu])
+            .runs(3)
+            .await
+            .unwrap();
+    };
+}
+
+macro_rules! fuzz_large_binary_1d {
+    ($shape:expr, $gen_a:expr, $gen_b:expr, $op:expr, $ref_fn:expr) => {
+        fusor_conformance::assert($op)
+            .arg($gen_a.clone())
+            .arg($gen_b.clone())
+            .equal_to_resolved_with_device(async |a: Vec<f32>, b: Vec<f32>, device: Device| {
+                let out: Vec<f32> = a
+                    .iter()
+                    .copied()
+                    .zip(b.iter().copied())
+                    .map($ref_fn)
+                    .collect();
+                Tensor::from_slice(&device, $shape, &out)
+            })
+            .compare_with(approx_compare::<1, f32>(1e-6))
             .runs(3)
             .await
             .unwrap();
@@ -68,94 +193,110 @@ async fn unary_math_ops_match_host_reference() {
         1e-6
     );
 
+    // Native GPU transcendental functions use backend-specific approximations.
+    // Compare them with absolute-or-relative tolerances so values near zero
+    // still stay tight while larger outputs are not judged by absolute error
+    // alone. This avoids making Windows WARP match libm polynomial choices
+    // exactly while still catching algorithmic regressions.
+
     // exp
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _exp,
         signed(),
         |x: Tensor<2, f32>| x.exp().to_concrete(),
         f32::exp,
-        1e-3
+        1e-3,
+        3e-4
     );
 
     // exp2
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _exp2,
         signed(),
         |x: Tensor<2, f32>| x.exp2().to_concrete(),
         f32::exp2,
-        1e-3
+        1e-3,
+        3e-4
     );
 
     // sin
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _sin,
         signed(),
         |x: Tensor<2, f32>| x.sin().to_concrete(),
         f32::sin,
-        1e-5
+        1e-4,
+        3e-4
     );
 
     // cos
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _cos,
         signed(),
         |x: Tensor<2, f32>| x.cos().to_concrete(),
         f32::cos,
-        1e-5
+        1e-4,
+        3e-4
     );
 
     // tan
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _tan,
         tan_domain(),
         |x: Tensor<2, f32>| x.tan().to_concrete(),
         f32::tan,
-        1e-4
+        1e-4,
+        3e-4
     );
 
     // tanh
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _tanh,
         signed(),
         |x: Tensor<2, f32>| x.tanh().to_concrete(),
         f32::tanh,
-        1e-5
+        5e-4,
+        5e-4
     );
 
     // atan
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _atan,
         signed(),
         |x: Tensor<2, f32>| x.atan().to_concrete(),
         f32::atan,
-        1e-5
+        1e-4,
+        3e-4
     );
 
     // sinh
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _sinh,
         signed(),
         |x: Tensor<2, f32>| x.sinh().to_concrete(),
         f32::sinh,
-        1e-3
+        1e-4,
+        3e-4
     );
 
     // cosh
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _cosh,
         signed(),
         |x: Tensor<2, f32>| x.cosh().to_concrete(),
         f32::cosh,
-        1e-3
+        1e-4,
+        5e-4
     );
 
     // asinh
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _asinh,
         signed(),
         |x: Tensor<2, f32>| x.asinh().to_concrete(),
         f32::asinh,
-        1e-5
+        1e-4,
+        3e-4
     );
 
     // approximate_exp
@@ -177,12 +318,13 @@ async fn unary_math_ops_match_host_reference() {
     );
 
     // tanh_exact
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _tanh_exact,
         signed(),
         |x: Tensor<2, f32>| x.tanh_exact(),
         f32::tanh,
-        1e-6
+        5e-4,
+        5e-4
     );
 
     // sqr
@@ -198,66 +340,80 @@ async fn unary_math_ops_match_host_reference() {
 #[tokio::test]
 async fn restricted_domain_unary_ops_match_host_reference() {
     // sqrt
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _sqrt,
         positive(),
         |x: Tensor<2, f32>| x.sqrt().to_concrete(),
         f32::sqrt,
-        1e-6
+        1e-4,
+        3e-4
     );
 
     // log
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _log,
         positive(),
         |x: Tensor<2, f32>| x.log().to_concrete(),
         f32::ln,
-        1e-5
+        1e-4,
+        3e-4
     );
 
     // log2
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _log2,
         positive(),
         |x: Tensor<2, f32>| x.log2().to_concrete(),
         f32::log2,
-        1e-5
+        1e-4,
+        3e-4
     );
 
+    // Inverse trig / hyperbolic functions diverge from libm by ~2e-4 on the
+    // lavapipe/llvmpipe Linux CI adapter when the `unit()` distribution
+    // samples close to the asymptotes (asin'(±0.95) ≈ 3.2, amplifying
+    // input ULP error). 1e-3 covers the observed lavapipe drift while
+    // still catching algorithmic regressions (which would be orders of
+    // magnitude larger). macOS Metal stays well under 1e-5.
+
     // asin
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _asin,
         unit(),
         |x: Tensor<2, f32>| x.asin().to_concrete(),
         f32::asin,
-        2e-5
+        1e-3,
+        3e-4
     );
 
     // acos
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _acos,
         unit(),
         |x: Tensor<2, f32>| x.acos().to_concrete(),
         f32::acos,
-        2e-5
+        1e-3,
+        3e-4
     );
 
     // atanh
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _atanh,
         unit(),
         |x: Tensor<2, f32>| x.atanh().to_concrete(),
         f32::atanh,
-        2e-5
+        1e-3,
+        3e-4
     );
 
     // acosh
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _acosh,
         acosh_domain(),
         |x: Tensor<2, f32>| x.acosh().to_concrete(),
         f32::acosh,
-        2e-5
+        1e-3,
+        3e-4
     );
 }
 
@@ -280,11 +436,11 @@ async fn activation_and_scalar_ops_match_host_reference() {
         1e-6
     );
 
-    // silu
-    fuzz_unary!(_silu, signed(), |x: Tensor<2, f32>| x.silu(), silu, 1e-5);
+    // Windows WARP's sigmoid/exp path can leave small non-zero tails.
+    fuzz_unary!(_silu, signed(), |x: Tensor<2, f32>| x.silu(), silu, 2e-3);
 
-    // gelu
-    fuzz_unary!(_gelu, signed(), |x: Tensor<2, f32>| x.gelu(), gelu, 1e-4);
+    // gelu compounds the same WARP tanh drift in its polynomial approximation.
+    fuzz_unary!(_gelu, signed(), |x: Tensor<2, f32>| x.gelu(), gelu, 1e-3);
 
     // add_scalar
     fuzz_unary!(
@@ -323,12 +479,13 @@ async fn activation_and_scalar_ops_match_host_reference() {
     );
 
     // pow_scalar
-    fuzz_unary!(
+    fuzz_unary_native_math!(
         _pow_scalar,
         positive(),
         |x: Tensor<2, f32>| x.pow_scalar(2.5),
         |v: f32| v.powf(2.5),
-        1e-4
+        1e-4,
+        3e-4
     );
 
     // max_scalar
@@ -370,56 +527,40 @@ async fn binary_ops_match_host_reference() {
         .with_distribution(Uniform::new(0.5, 2.5).unwrap());
 
     // add broadcast 2d + 1d
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<1, f32>| a.add_::<1, 2, _>(&b))
-        .arg(gen_a.clone())
-        .arg(gen_b_1d.clone())
-        .equal_to_resolved_with_device(async |a: Vec<Vec<f32>>, b: Vec<f32>, device: Device| {
-            let out = common::broadcast_binary_2d_1d(&a, &b, |l, r| l + r);
-            Tensor::new(&device, &out)
-        })
-        .compare_with(approx_compare::<2, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_broadcast_binary!(
+        gen_a,
+        gen_b_1d,
+        async |a: Tensor<2, f32>, b: Tensor<1, f32>| a.add_::<1, 2, _>(&b),
+        |l, r| l + r,
+        1e-6
+    );
 
     // sub broadcast
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<1, f32>| a.sub_::<1, 2, _>(&b))
-        .arg(gen_a.clone())
-        .arg(gen_b_1d.clone())
-        .equal_to_resolved_with_device(async |a: Vec<Vec<f32>>, b: Vec<f32>, device: Device| {
-            let out = common::broadcast_binary_2d_1d(&a, &b, |l, r| l - r);
-            Tensor::new(&device, &out)
-        })
-        .compare_with(approx_compare::<2, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_broadcast_binary!(
+        gen_a,
+        gen_b_1d,
+        async |a: Tensor<2, f32>, b: Tensor<1, f32>| a.sub_::<1, 2, _>(&b),
+        |l, r| l - r,
+        1e-6
+    );
 
     // mul broadcast
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<1, f32>| a.mul_::<1, 2, _>(&b))
-        .arg(gen_a.clone())
-        .arg(gen_b_1d.clone())
-        .equal_to_resolved_with_device(async |a: Vec<Vec<f32>>, b: Vec<f32>, device: Device| {
-            let out = common::broadcast_binary_2d_1d(&a, &b, |l, r| l * r);
-            Tensor::new(&device, &out)
-        })
-        .compare_with(approx_compare::<2, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_broadcast_binary!(
+        gen_a,
+        gen_b_1d,
+        async |a: Tensor<2, f32>, b: Tensor<1, f32>| a.mul_::<1, 2, _>(&b),
+        |l, r| l * r,
+        1e-6
+    );
 
     // div broadcast
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<1, f32>| a.div_::<1, 2, _>(&b))
-        .arg(gen_a.clone())
-        .arg(gen_b_1d.clone())
-        .equal_to_resolved_with_device(async |a: Vec<Vec<f32>>, b: Vec<f32>, device: Device| {
-            let out = common::broadcast_binary_2d_1d(&a, &b, |l, r| l / r);
-            Tensor::new(&device, &out)
-        })
-        .compare_with(approx_compare::<2, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_broadcast_binary!(
+        gen_a,
+        gen_b_1d,
+        async |a: Tensor<2, f32>, b: Tensor<1, f32>| a.div_::<1, 2, _>(&b),
+        |l, r| l / r,
+        1e-6
+    );
 
     // pow elementwise 2d
     fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.pow_::<2, 2, _>(&b))
@@ -442,153 +583,63 @@ async fn comparison_and_conditionals_match_expected() {
     let fuzz = signed();
 
     // eq_scalar
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.eq_scalar(0.25))
-        .arg(fuzz.clone())
-        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-            Tensor::new(
-                &device,
-                &common::compare_scalar_map2(&v, 0.25, |l, r| l == r),
-            )
-        })
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_scalar_compare!(fuzz, async |x: Tensor<2, f32>| x.eq_scalar(0.25), eq_f32);
 
     // lt_scalar
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.lt_scalar(0.25))
-        .arg(fuzz.clone())
-        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-            Tensor::new(
-                &device,
-                &common::compare_scalar_map2(&v, 0.25, |l, r| l < r),
-            )
-        })
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_scalar_compare!(fuzz, async |x: Tensor<2, f32>| x.lt_scalar(0.25), lt_f32);
 
     // lte_scalar
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.lte_scalar(0.25))
-        .arg(fuzz.clone())
-        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-            Tensor::new(
-                &device,
-                &common::compare_scalar_map2(&v, 0.25, |l, r| l <= r),
-            )
-        })
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_scalar_compare!(fuzz, async |x: Tensor<2, f32>| x.lte_scalar(0.25), lte_f32);
 
     // gt_scalar
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.gt_scalar(0.25))
-        .arg(fuzz.clone())
-        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-            Tensor::new(
-                &device,
-                &common::compare_scalar_map2(&v, 0.25, |l, r| l > r),
-            )
-        })
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_scalar_compare!(fuzz, async |x: Tensor<2, f32>| x.gt_scalar(0.25), gt_f32);
 
     // gte_scalar
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.gte_scalar(0.25))
-        .arg(fuzz.clone())
-        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-            Tensor::new(
-                &device,
-                &common::compare_scalar_map2(&v, 0.25, |l, r| l >= r),
-            )
-        })
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_scalar_compare!(fuzz, async |x: Tensor<2, f32>| x.gte_scalar(0.25), gte_f32);
 
     let gen_b = FuzzGenerator::<2, f32>::new(SHAPE)
         .with_seed(120)
         .with_distribution(Uniform::new(-2.0, 2.0).unwrap());
 
     // eq_tensor
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.eq_tensor(&b))
-        .arg(fuzz.clone())
-        .arg(gen_b.clone())
-        .equal_to_resolved_with_device(
-            async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-                Tensor::new(&device, &common::compare_tensor_map2(&a, &b, |l, r| l == r))
-            },
-        )
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .devices([Device::Cpu])
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_tensor_compare!(
+        fuzz,
+        gen_b,
+        async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.eq_tensor(&b),
+        eq_f32
+    );
 
     // lt_tensor
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.lt_tensor(&b))
-        .arg(fuzz.clone())
-        .arg(gen_b.clone())
-        .equal_to_resolved_with_device(
-            async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-                Tensor::new(&device, &common::compare_tensor_map2(&a, &b, |l, r| l < r))
-            },
-        )
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .devices([Device::Cpu])
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_tensor_compare!(
+        fuzz,
+        gen_b,
+        async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.lt_tensor(&b),
+        lt_f32
+    );
 
     // lte_tensor
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.lte_tensor(&b))
-        .arg(fuzz.clone())
-        .arg(gen_b.clone())
-        .equal_to_resolved_with_device(
-            async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-                Tensor::new(&device, &common::compare_tensor_map2(&a, &b, |l, r| l <= r))
-            },
-        )
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .devices([Device::Cpu])
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_tensor_compare!(
+        fuzz,
+        gen_b,
+        async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.lte_tensor(&b),
+        lte_f32
+    );
 
     // gt_tensor
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.gt_tensor(&b))
-        .arg(fuzz.clone())
-        .arg(gen_b.clone())
-        .equal_to_resolved_with_device(
-            async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-                Tensor::new(&device, &common::compare_tensor_map2(&a, &b, |l, r| l > r))
-            },
-        )
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .devices([Device::Cpu])
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_tensor_compare!(
+        fuzz,
+        gen_b,
+        async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.gt_tensor(&b),
+        gt_f32
+    );
 
     // gte_tensor
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.gte_tensor(&b))
-        .arg(fuzz.clone())
-        .arg(gen_b.clone())
-        .equal_to_resolved_with_device(
-            async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-                Tensor::new(&device, &common::compare_tensor_map2(&a, &b, |l, r| l >= r))
-            },
-        )
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .devices([Device::Cpu])
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_tensor_compare!(
+        fuzz,
+        gen_b,
+        async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.gte_tensor(&b),
+        gte_f32
+    );
 
     // where_cond
     let gen_cond = FuzzGenerator::<2, f32>::new(SHAPE)
@@ -629,69 +680,45 @@ async fn same_shape_binary_ops_match_host_reference() {
         .with_distribution(Uniform::new(0.1, 3.0).unwrap());
 
     // add
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.add_::<2, 2, _>(&b))
-        .arg(gen_a.clone())
-        .arg(gen_b.clone())
-        .equal_to_resolved_with_device(
-            async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-                let out = binary_map2(&a, &b, |l, r| l + r);
-                Tensor::new(&device, &out)
-            },
-        )
-        .compare_with(approx_compare::<2, f32>(1e-5))
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_same_shape_binary!(
+        gen_a,
+        gen_b,
+        async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.add_::<2, 2, _>(&b),
+        |l, r| l + r,
+        1e-5
+    );
 
     // sub
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.sub_::<2, 2, _>(&b))
-        .arg(gen_a.clone())
-        .arg(gen_b.clone())
-        .equal_to_resolved_with_device(
-            async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-                let out = binary_map2(&a, &b, |l, r| l - r);
-                Tensor::new(&device, &out)
-            },
-        )
-        .compare_with(approx_compare::<2, f32>(1e-5))
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_same_shape_binary!(
+        gen_a,
+        gen_b,
+        async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.sub_::<2, 2, _>(&b),
+        |l, r| l - r,
+        1e-5
+    );
 
     // mul
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.mul_::<2, 2, _>(&b))
-        .arg(gen_a.clone())
-        .arg(gen_b.clone())
-        .equal_to_resolved_with_device(
-            async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-                let out = binary_map2(&a, &b, |l, r| l * r);
-                Tensor::new(&device, &out)
-            },
-        )
-        .compare_with(approx_compare::<2, f32>(1e-5))
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_same_shape_binary!(
+        gen_a,
+        gen_b,
+        async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.mul_::<2, 2, _>(&b),
+        |l, r| l * r,
+        1e-5
+    );
 
     // div
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.div_::<2, 2, _>(&b))
-        .arg(gen_a.clone())
-        .arg(gen_b.clone())
-        .equal_to_resolved_with_device(
-            async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-                let out = binary_map2(&a, &b, |l, r| l / r);
-                Tensor::new(&device, &out)
-            },
-        )
-        .compare_with(approx_compare::<2, f32>(1e-5))
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_same_shape_binary!(
+        gen_a,
+        gen_b,
+        async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.div_::<2, 2, _>(&b),
+        |l, r| l / r,
+        1e-5
+    );
 }
 
 #[tokio::test]
 async fn large_tensor_binary_and_conditional_regressions() {
-    const LARGE_SHAPE_1D: [usize; 1] = [1024];
+    const LARGE_SHAPE_1D: [usize; 1] = [2048];
 
     let gen_binary_a = FuzzGenerator::<1, f32>::new(LARGE_SHAPE_1D)
         .with_seed(140)
@@ -700,53 +727,34 @@ async fn large_tensor_binary_and_conditional_regressions() {
         .with_seed(141)
         .with_distribution(Uniform::new(0.5, 4.0).unwrap());
 
-    fusor_conformance::assert(async |a: Tensor<1, f32>, b: Tensor<1, f32>| a.add_::<1, 1, _>(&b))
-        .arg(gen_binary_a.clone())
-        .arg(gen_binary_b.clone())
-        .equal_to_resolved_with_device(async |a: Vec<f32>, b: Vec<f32>, device: Device| {
-            let out: Vec<f32> = a.iter().zip(b.iter()).map(|(l, r)| l + r).collect();
-            Tensor::from_slice(&device, LARGE_SHAPE_1D, &out)
-        })
-        .compare_with(approx_compare::<1, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
-
-    fusor_conformance::assert(async |a: Tensor<1, f32>, b: Tensor<1, f32>| a.sub_::<1, 1, _>(&b))
-        .arg(gen_binary_a.clone())
-        .arg(gen_binary_b.clone())
-        .equal_to_resolved_with_device(async |a: Vec<f32>, b: Vec<f32>, device: Device| {
-            let out: Vec<f32> = a.iter().zip(b.iter()).map(|(l, r)| l - r).collect();
-            Tensor::from_slice(&device, LARGE_SHAPE_1D, &out)
-        })
-        .compare_with(approx_compare::<1, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
-
-    fusor_conformance::assert(async |a: Tensor<1, f32>, b: Tensor<1, f32>| a.mul_::<1, 1, _>(&b))
-        .arg(gen_binary_a.clone())
-        .arg(gen_binary_b.clone())
-        .equal_to_resolved_with_device(async |a: Vec<f32>, b: Vec<f32>, device: Device| {
-            let out: Vec<f32> = a.iter().zip(b.iter()).map(|(l, r)| l * r).collect();
-            Tensor::from_slice(&device, LARGE_SHAPE_1D, &out)
-        })
-        .compare_with(approx_compare::<1, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
-
-    fusor_conformance::assert(async |a: Tensor<1, f32>, b: Tensor<1, f32>| a.div_::<1, 1, _>(&b))
-        .arg(gen_binary_a.clone())
-        .arg(gen_binary_b.clone())
-        .equal_to_resolved_with_device(async |a: Vec<f32>, b: Vec<f32>, device: Device| {
-            let out: Vec<f32> = a.iter().zip(b.iter()).map(|(l, r)| l / r).collect();
-            Tensor::from_slice(&device, LARGE_SHAPE_1D, &out)
-        })
-        .compare_with(approx_compare::<1, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
+    fuzz_large_binary_1d!(
+        LARGE_SHAPE_1D,
+        gen_binary_a,
+        gen_binary_b,
+        async |a: Tensor<1, f32>, b: Tensor<1, f32>| a.add_::<1, 1, _>(&b),
+        |(l, r)| l + r
+    );
+    fuzz_large_binary_1d!(
+        LARGE_SHAPE_1D,
+        gen_binary_a,
+        gen_binary_b,
+        async |a: Tensor<1, f32>, b: Tensor<1, f32>| a.sub_::<1, 1, _>(&b),
+        |(l, r)| l - r
+    );
+    fuzz_large_binary_1d!(
+        LARGE_SHAPE_1D,
+        gen_binary_a,
+        gen_binary_b,
+        async |a: Tensor<1, f32>, b: Tensor<1, f32>| a.mul_::<1, 1, _>(&b),
+        |(l, r)| l * r
+    );
+    fuzz_large_binary_1d!(
+        LARGE_SHAPE_1D,
+        gen_binary_a,
+        gen_binary_b,
+        async |a: Tensor<1, f32>, b: Tensor<1, f32>| a.div_::<1, 1, _>(&b),
+        |(l, r)| l / r
+    );
 
     let gen_cmp_a = FuzzGenerator::<1, f32>::new(LARGE_SHAPE_1D)
         .with_seed(142)
@@ -800,7 +808,7 @@ async fn large_tensor_binary_and_conditional_regressions() {
 
 #[tokio::test]
 async fn where_cond_fuzzed() {
-    const SHAPE_1D: [usize; 1] = [32];
+    const SHAPE_1D: [usize; 1] = [2048];
     // Condition: values in -1..1 so we get a mix of positive and non-positive
     let gen_cond = FuzzGenerator::<1, f32>::new(SHAPE_1D)
         .with_seed(10)
@@ -835,7 +843,7 @@ async fn where_cond_fuzzed() {
 
 #[tokio::test]
 async fn large_tensor_unary_ops_fuzzed() {
-    const LARGE_SHAPE: [usize; 2] = [32, 32];
+    const LARGE_SHAPE: [usize; 2] = [45, 45];
 
     // sin
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.sin().to_concrete())
@@ -910,4 +918,37 @@ async fn large_tensor_unary_ops_fuzzed() {
         .runs(3)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn tanh_exact_saturation_at_large_magnitudes() {
+    // The default fuzz distribution rarely produces |x| > 4, but `tanh_exact`
+    // must remain accurate when the input saturates the function. This pins
+    // the saturation regression that the per-op test
+    // `core/src/element_wise.rs::test_tanh_exact_large_values` used to cover.
+    const SHAPE: [usize; 2] = [3, 2];
+    let positive: Vec<Vec<f32>> = (0..SHAPE[0])
+        .map(|row| {
+            (0..SHAPE[1])
+                .map(|col| 4.0 + (row * SHAPE[1] + col) as f32 * 1.5)
+                .collect()
+        })
+        .collect();
+    let negative: Vec<Vec<f32>> = positive
+        .iter()
+        .map(|row| row.iter().map(|x| -x).collect())
+        .collect();
+
+    for samples in [&positive, &negative] {
+        let flat: Vec<f32> = samples.iter().flatten().copied().collect();
+        let expected: Vec<f32> = flat.iter().map(|x| x.tanh()).collect();
+        for device in fusor_conformance::available_devices().await {
+            let input = Tensor::from_slice(&device, SHAPE, &flat);
+            let actual = input.tanh_exact().to_concrete();
+            let expected_tensor = Tensor::from_slice(&device, SHAPE, &expected);
+            fusor_conformance::approx_eq(&actual, &expected_tensor, 2e-4)
+                .await
+                .unwrap();
+        }
+    }
 }

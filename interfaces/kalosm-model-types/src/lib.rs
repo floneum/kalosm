@@ -36,6 +36,177 @@ pub struct FileLoadingProgress {
     pub progress: u64,
 }
 
+#[cfg(feature = "loading-progress-bar")]
+#[derive(Default)]
+struct LoadingIndicator {
+    downloads: std::collections::HashMap<String, FileLoadingProgress>,
+    last_render: Option<std::time::Instant>,
+    rendered_line: bool,
+    last_loading_percent: Option<u32>,
+}
+
+#[cfg(feature = "loading-progress-bar")]
+impl LoadingIndicator {
+    fn update(&mut self, progress: ModelLoadingProgress) {
+        match progress {
+            ModelLoadingProgress::Downloading { source, progress } => {
+                let is_finished = progress.size > 0 && progress.progress >= progress.size;
+                self.downloads.insert(source.clone(), progress.clone());
+
+                if is_finished || self.should_render() {
+                    self.render_download(&source, &progress);
+                }
+            }
+            ModelLoadingProgress::Loading { progress } => self.render_loading(progress),
+        }
+    }
+
+    fn should_render(&mut self) -> bool {
+        const MIN_RENDER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let now = std::time::Instant::now();
+        let should_render = match self.last_render {
+            Some(last_render) => now.duration_since(last_render) >= MIN_RENDER_INTERVAL,
+            None => true,
+        };
+        if should_render {
+            self.last_render = Some(now);
+        }
+        should_render
+    }
+
+    fn render_download(&mut self, source: &str, progress: &FileLoadingProgress) {
+        use std::io::Write;
+
+        let percent = percent(progress.progress, progress.size);
+        let speed = progress.start_time.and_then(|start_time| {
+            bytes_per_second(progress.progress, progress.cached_size, start_time)
+        });
+        let eta = progress.start_time.and_then(|start_time| {
+            estimate_time_remaining(
+                progress.progress,
+                progress.cached_size,
+                progress.size,
+                start_time,
+            )
+        });
+
+        let mut stderr = std::io::stderr().lock();
+        let _ = write!(
+            stderr,
+            "\r\x1b[KDownloading {source} {percent:>6.2}% ({}/{}, {}/s, ETA {})",
+            format_bytes(progress.progress),
+            format_bytes(progress.size),
+            speed.map(format_bytes).unwrap_or_else(|| "-".to_string()),
+            eta.map(format_duration).unwrap_or_else(|| "-".to_string()),
+        );
+        let _ = stderr.flush();
+        self.rendered_line = true;
+    }
+
+    fn render_loading(&mut self, progress: f32) {
+        use std::io::Write;
+
+        if self.rendered_line {
+            let _ = writeln!(std::io::stderr().lock());
+            self.rendered_line = false;
+        }
+
+        for (source, progress) in self.downloads.drain() {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "Downloaded {source} ({})",
+                format_bytes(progress.size)
+            );
+        }
+
+        let percent = (progress.clamp(0.0, 1.0) * 100.0).round() as u32;
+        if self.last_loading_percent == Some(percent) {
+            return;
+        }
+        self.last_loading_percent = Some(percent);
+
+        let _ = writeln!(std::io::stderr().lock(), "Loading {percent}%");
+    }
+}
+
+#[cfg(feature = "loading-progress-bar")]
+fn percent(progress: u64, size: u64) -> f64 {
+    if size == 0 {
+        0.0
+    } else {
+        progress as f64 / size as f64 * 100.0
+    }
+}
+
+#[cfg(feature = "loading-progress-bar")]
+fn bytes_per_second(
+    progress: u64,
+    cached_size: u64,
+    start_time: std::time::Instant,
+) -> Option<u64> {
+    let elapsed = start_time.elapsed().as_secs_f64();
+    if elapsed <= f64::EPSILON {
+        None
+    } else {
+        Some(((progress.saturating_sub(cached_size) as f64) / elapsed) as u64)
+    }
+}
+
+#[cfg(feature = "loading-progress-bar")]
+fn estimate_time_remaining(
+    progress: u64,
+    cached_size: u64,
+    size: u64,
+    start_time: std::time::Instant,
+) -> Option<std::time::Duration> {
+    let bytes_per_second = bytes_per_second(progress, cached_size, start_time)?;
+    if bytes_per_second == 0 || progress >= size {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(
+            (size - progress) / bytes_per_second,
+        ))
+    }
+}
+
+#[cfg(feature = "loading-progress-bar")]
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = UNITS[0];
+
+    for next_unit in UNITS.iter().skip(1) {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next_unit;
+    }
+
+    if unit == "B" {
+        format!("{bytes} {unit}")
+    } else {
+        format!("{value:.2} {unit}")
+    }
+}
+
+#[cfg(feature = "loading-progress-bar")]
+fn format_duration(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 impl ModelLoadingProgress {
     /// Create a new downloading progress
     pub fn downloading(source: String, file_loading_progress: FileLoadingProgress) -> Self {
@@ -88,45 +259,8 @@ impl ModelLoadingProgress {
     /// A default loading progress bar
     pub fn multi_bar_loading_indicator() -> impl FnMut(ModelLoadingProgress) + Send + Sync + 'static
     {
-        use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-        use std::collections::HashMap;
-        let m = MultiProgress::new();
-        let sty = ProgressStyle::with_template(
-            "{spinner:.green} {msg} [{elapsed_precise}] [{bar:40.cyan/blue}] ({decimal_bytes_per_sec}, ETA {eta})",
-        )
-        .unwrap();
-        let mut progress_bars = HashMap::new();
-
-        move |progress| match progress {
-            Self::Downloading {
-                source,
-                progress:
-                    FileLoadingProgress {
-                        progress,
-                        size,
-                        cached_size,
-                        ..
-                    },
-                ..
-            } => {
-                let progress_bar = progress_bars.entry(source.clone()).or_insert_with(|| {
-                    let pb = m.add(ProgressBar::new(size));
-                    pb.set_message(format!("Downloading {source}"));
-                    pb.set_style(sty.clone());
-                    pb.set_position(cached_size);
-                    pb
-                });
-
-                progress_bar.set_position(progress);
-            }
-            ModelLoadingProgress::Loading { progress } => {
-                for pb in progress_bars.values_mut() {
-                    pb.finish();
-                }
-                let progress = progress * 100.;
-                m.println(format!("Loading {progress:.2}%")).unwrap();
-            }
-        }
+        let mut indicator = LoadingIndicator::default();
+        move |progress| indicator.update(progress)
     }
 }
 

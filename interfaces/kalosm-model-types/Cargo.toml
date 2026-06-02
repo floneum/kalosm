@@ -8,11 +8,8 @@ repository = "https://github.com/floneum/floneum"
 authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["llm", "llama", "mistral", "agents", "nlp"]
 
-[dependencies]
-indicatif = { version = "0.17.8", optional = true }
-
 [features]
-loading-progress-bar = ["dep:indicatif"]
+loading-progress-bar = []
 
 [dev-dependencies]
 kalosm = { workspace = true, features = [

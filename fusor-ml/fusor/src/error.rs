@@ -4,7 +4,7 @@
 #[derive(Debug)]
 pub enum Error {
     /// GPU device error from fusor-core.
-    Gpu(fusor_core::Error),
+    Gpu(crate::gpu::Error),
     /// Device mismatch error - tensors are on different devices.
     DeviceMismatch {
         /// Description of what operation failed.
@@ -51,14 +51,14 @@ impl std::error::Error for Error {
     }
 }
 
-impl From<fusor_core::Error> for Error {
-    fn from(e: fusor_core::Error) -> Self {
+impl From<crate::gpu::Error> for Error {
+    fn from(e: crate::gpu::Error) -> Self {
         Error::Gpu(e)
     }
 }
 
-impl From<fusor_core::GgufReadError> for Error {
-    fn from(e: fusor_core::GgufReadError) -> Self {
+impl From<crate::gpu::GgufReadError> for Error {
+    fn from(e: crate::gpu::GgufReadError) -> Self {
         // Convert GGUF errors to our error type
         Error::VarBuilder(e.to_string())
     }

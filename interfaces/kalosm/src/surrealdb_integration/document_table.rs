@@ -8,8 +8,8 @@ use super::EmbeddedIndexedTableError;
 
 use super::IntoEmbeddingIndexedTableSearchFilter;
 use super::{EmbeddingIndexedTable, EmbeddingIndexedTableSearchResult};
-use kalosm_language::prelude::*;
-use kalosm_language::rbert::BertLoadingError;
+use crate::language::*;
+use rbert::BertLoadingError;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use surrealdb::Connection;

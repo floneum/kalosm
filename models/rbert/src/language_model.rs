@@ -169,75 +169,81 @@ impl Deref for Bert {
 }
 
 #[cfg(test)]
-#[tokio::test]
-async fn test_bert() {
-    use crate::BertSource;
+#[test]
+fn test_bert() {
+    pollster::block_on(async {
+        use crate::BertSource;
 
-    let bert = Bert::builder()
-        .with_source(BertSource::snowflake_arctic_embed_extra_small())
-        .build()
-        .await
-        .unwrap();
-    let result = bert("The quick brown fox jumps over the lazy dog.")
-        .await
-        .unwrap();
-    println!("{result:?}");
+        let bert = Bert::builder()
+            .with_source(BertSource::snowflake_arctic_embed_extra_small())
+            .build()
+            .await
+            .unwrap();
+        let result = bert("The quick brown fox jumps over the lazy dog.")
+            .await
+            .unwrap();
+        println!("{result:?}");
+    });
 }
 
 #[cfg(test)]
-#[tokio::test]
-async fn test_qwen3_embedding() {
-    use crate::BertSource;
+#[test]
+fn test_qwen3_embedding() {
+    pollster::block_on(async {
+        use crate::BertSource;
 
-    let model = Bert::builder()
-        .with_source(BertSource::qwen3_embedding_0_6b())
-        .build()
-        .await
-        .unwrap();
+        let model = Bert::builder()
+            .with_source(BertSource::qwen3_embedding_0_6b())
+            .build()
+            .await
+            .unwrap();
 
-    let result = model
-        .embed_string("The quick brown fox jumps over the lazy dog.".to_string())
-        .await
-        .unwrap();
+        let result = model
+            .embed_string("The quick brown fox jumps over the lazy dog.".to_string())
+            .await
+            .unwrap();
 
-    let vec = result.vector();
-    println!("Qwen3 embedding dimension: {}", vec.len());
-    println!("First 5 values: {:?}", &vec[..5]);
-    assert!(!vec.is_empty());
-    assert_eq!(vec.len(), 1024); // Qwen3-Embedding-0.6B has 1024 dimensions
+        let vec = result.vector();
+        println!("Qwen3 embedding dimension: {}", vec.len());
+        println!("First 5 values: {:?}", &vec[..5]);
+        assert!(!vec.is_empty());
+        assert_eq!(vec.len(), 1024); // Qwen3-Embedding-0.6B has 1024 dimensions
+    });
 }
 
 #[cfg(test)]
-#[tokio::test]
-async fn test_qwen3_batch_embedding() {
-    use crate::{BertSource, Pooling};
+#[test]
+fn test_qwen3_batch_embedding() {
+    pollster::block_on(async {
+        use crate::{BertSource, Pooling};
 
-    let model = Bert::builder()
-        .with_source(BertSource::qwen3_embedding_0_6b())
-        .build()
-        .await
-        .unwrap();
+        let model = Bert::builder()
+            .with_source(BertSource::qwen3_embedding_0_6b())
+            .build()
+            .await
+            .unwrap();
 
-    // Two sentences of different lengths to exercise padding
-    let sentences = vec![
-        "Short sentence.",
-        "This is a significantly longer sentence to test batch padding behavior.",
-    ];
+        // Two sentences of different lengths to exercise padding
+        let sentences = vec![
+            "Short sentence.",
+            "This is a significantly longer sentence to test batch padding behavior.",
+        ];
 
-    let results = model
-        .embed_batch_with_pooling(sentences, Pooling::Last)
-        .await
-        .unwrap();
+        let results = model
+            .embed_batch_with_pooling(sentences, Pooling::Last)
+            .await
+            .unwrap();
 
-    assert_eq!(results.len(), 2);
-    for (i, emb) in results.iter().enumerate() {
-        let vec = emb.vector();
-        assert_eq!(vec.len(), 1024, "embedding {i} has wrong dimension");
-        // Verify L2 normalization (norm should be ~1.0)
-        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!(
-            (norm - 1.0).abs() < 0.01,
-            "embedding {i} is not L2-normalized: norm = {norm}"
-        );
-    }
+        assert_eq!(results.len(), 2);
+        for (i, emb) in results.iter().enumerate() {
+            let vec = emb.vector();
+            assert_eq!(vec.len(), 1024, "embedding {i} has wrong dimension");
+            // Verify L2 normalization (norm should be ~1.0)
+            let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 0.01,
+                "embedding {i} is not L2-normalized: norm = {norm}"
+            );
+        }
+    });
 }

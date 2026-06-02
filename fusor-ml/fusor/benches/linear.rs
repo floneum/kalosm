@@ -1,7 +1,6 @@
 #![allow(unused)]
 use std::time::Duration;
 
-use candle_core::MetalDevice;
 use candle_core::backend::BackendDevice;
 use candle_nn::Module;
 use criterion::BatchSize;
@@ -16,6 +15,12 @@ use criterion::{criterion_group, criterion_main};
 use criterion::async_executor::FuturesExecutor;
 use kalosm_common::Cache;
 use kalosm_model_types::FileSource;
+
+fn candle_gpu_device() -> Option<candle_core::Device> {
+    candle_core::Device::new_cuda(0)
+        .or_else(|_| candle_core::Device::new_metal(0))
+        .ok()
+}
 
 fn linear(c: &mut Criterion) {
     use candle_core::Module;
@@ -49,64 +54,65 @@ fn linear(c: &mut Criterion) {
                 let linear = Linear::load(&device, &mut var_builder.pp(name)).unwrap();
                 let quantization = linear.quantization();
 
-                let mut group = c.benchmark_group(format!("linear-wgpu-{width}-{quantization}"));
+                let group_name = format!("linear-{width}-{quantization}");
+                let mut group = c.benchmark_group(&group_name);
+                group.sample_size(20);
+                group.plot_config(
+                    criterion::PlotConfiguration::default()
+                        .summary_scale(criterion::AxisScale::Logarithmic),
+                );
 
                 let device = device.clone();
-                let random_data = random_data.clone();
-                group.bench_with_input(
-                    BenchmarkId::new("linear-wgpu", size),
-                    &size,
-                    move |b, &s| {
-                        let device = device.clone();
-                        let random_data = random_data.clone();
-                        b.to_async(FuturesExecutor).iter_custom(async |iters| {
-                            let flat_data: Vec<f32> =
-                                random_data.iter().flat_map(|r| r.iter().copied()).collect();
-                            let tensor: Tensor<2, f32> =
-                                Tensor::from_slice(&device, [size, width], &flat_data);
-                            tensor.as_gpu().unwrap().materialize().await;
-                            let mut sum = Duration::ZERO;
-                            while sum.is_zero() {
-                                for _ in 0..iters {
-                                    let start = std::time::Instant::now();
-                                    let new = linear.forward(&tensor.unsqueeze::<3>(0));
-                                    new.as_gpu().unwrap().materialize().await;
-                                    sum += start.elapsed();
-                                }
+                let fusor_random_data = random_data.clone();
+                group.bench_with_input(BenchmarkId::new("fusor-gpu", size), &size, move |b, &s| {
+                    let device = device.clone();
+                    let random_data = fusor_random_data.clone();
+                    b.to_async(FuturesExecutor).iter_custom(async |iters| {
+                        let flat_data: Vec<f32> =
+                            random_data.iter().flat_map(|r| r.iter().copied()).collect();
+                        let tensor: Tensor<2, f32> =
+                            Tensor::from_slice(&device, [size, width], &flat_data);
+                        tensor.as_gpu().unwrap().materialize().await;
+                        let mut sum = Duration::ZERO;
+                        while sum.is_zero() {
+                            for _ in 0..iters {
+                                let start = std::time::Instant::now();
+                                let new = linear.forward(&tensor.unsqueeze::<3>(0));
+                                new.as_gpu().unwrap().materialize().await;
+                                sum += start.elapsed();
                             }
-                            sum
-                        });
-                    },
-                );
-            }
+                        }
+                        sum
+                    });
+                });
 
-            #[cfg(target_os = "macos")]
-            {
-                let candle_device = candle_core::Device::Metal(MetalDevice::new(0).unwrap());
-                bench_candle_with_device(
-                    &bytes,
-                    size,
-                    random_data.clone(),
-                    candle_device,
-                    "linear-candle-metal",
-                    name,
-                    width,
-                    c,
-                );
-            }
+                if let Some(candle_device) = candle_gpu_device() {
+                    bench_candle_with_device(
+                        &bytes,
+                        size,
+                        random_data.clone(),
+                        candle_device,
+                        "candle-gpu",
+                        name,
+                        width,
+                        &mut group,
+                    );
+                }
 
-            {
-                let candle_device = candle_core::Device::Cpu;
-                bench_candle_with_device(
-                    &bytes,
-                    size,
-                    random_data.clone(),
-                    candle_device,
-                    "linear-candle-cpu",
-                    name,
-                    width,
-                    c,
-                );
+                {
+                    let candle_device = candle_core::Device::Cpu;
+                    bench_candle_with_device(
+                        &bytes,
+                        size,
+                        random_data.clone(),
+                        candle_device,
+                        "candle-cpu",
+                        name,
+                        width,
+                        &mut group,
+                    );
+                }
+                group.finish();
             }
         }
     }
@@ -121,7 +127,7 @@ fn bench_candle_with_device(
     name: &str,
     matrix_name: &str,
     width: usize,
-    c: &mut Criterion,
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
 ) {
     use candle_transformers::quantized_nn::{Linear, linear};
     let var_builder = candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(
@@ -138,9 +144,6 @@ fn bench_candle_with_device(
         .unwrap();
     let quantization = weight.dtype();
     let linear = Linear::from_arc(weight, Some(bias)).unwrap();
-    let mut group = c.benchmark_group(format!("{name}-{width}-{quantization:?}"));
-    let group = group.sample_size(20);
-
     group.bench_with_input(BenchmarkId::new(name, size), &size, move |b, &s| {
         b.to_async(FuturesExecutor).iter_batched(
             || {

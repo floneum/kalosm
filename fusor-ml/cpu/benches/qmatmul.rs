@@ -1,6 +1,7 @@
 use aligned_vec::AVec;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use fusor_cpu::{BlockQ8_0, ConcreteTensor, QuantizedTensor, Tensor};
+use fusor_cpu::__private::{ConcreteTensor, QuantizedTensor, TypedTensor};
+use fusor_cpu::BlockQ8_0;
 use half::f16;
 
 /// Helper to create a Q8_0 block from scale and data
@@ -45,8 +46,8 @@ fn bench_qmatmul(c: &mut Criterion) {
                 let mut blocks_vec: AVec<BlockQ8_0> = AVec::with_capacity(64, num_blocks);
                 for i in 0..num_blocks {
                     let mut data = [0i8; 32];
-                    for j in 0..32 {
-                        data[j] = ((i + j) % 100) as i8 - 50;
+                    for (j, slot) in data.iter_mut().enumerate() {
+                        *slot = ((i + j) % 100) as i8 - 50;
                     }
                     blocks_vec.push(make_q8_0_block(0.1, data));
                 }
@@ -63,15 +64,15 @@ fn bench_qmatmul(c: &mut Criterion) {
             &(m, k, n),
             |b, &(m, k, n)| {
                 let lhs_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
-                let lhs = Tensor::from_slice([m, k], &lhs_data);
+                let lhs = TypedTensor::from_slice([m, k], &lhs_data);
 
                 let rhs_shape = [k, n];
                 let num_blocks = (k * n) / 32;
                 let mut blocks_vec: AVec<BlockQ8_0> = AVec::with_capacity(64, num_blocks);
                 for i in 0..num_blocks {
                     let mut data = [0i8; 32];
-                    for j in 0..32 {
-                        data[j] = ((i + j) % 100) as i8 - 50;
+                    for (j, slot) in data.iter_mut().enumerate() {
+                        *slot = ((i + j) % 100) as i8 - 50;
                     }
                     blocks_vec.push(make_q8_0_block(0.1, data));
                 }
@@ -80,7 +81,7 @@ fn bench_qmatmul(c: &mut Criterion) {
 
                 b.iter(|| {
                     let rhs_dequant = rhs.dequantize();
-                    let rhs_tensor = Tensor::new(rhs_dequant);
+                    let rhs_tensor = TypedTensor::new(rhs_dequant);
                     black_box(lhs.clone().matmul(black_box(rhs_tensor)))
                 });
             },

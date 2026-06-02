@@ -1,7 +1,9 @@
 //! Linear layer implementation.
 
-use crate::{CastTensor, CastTo, DataType, Device, QMatrix, SimdElement, Tensor, VarBuilder};
-use fusor_cpu::GgmlType;
+use crate::{
+    CastTensor, CastTo, DataType, Device, Fusion, GgmlType, QMatrix, SimdElement, Tensor,
+    VarBuilder,
+};
 
 /// A linear (fully connected) layer with quantized weights.
 ///
@@ -52,6 +54,20 @@ impl<T: DataType + SimdElement + Default> Linear<T> {
     }
 }
 
+/// Run `q_mat_mul(weight)` over a 3D input by flattening (batch, seq, in) to
+/// (batch * seq, in), multiplying, then reshaping back. Shared by both the f32
+/// and the cast-via-f32 forward paths.
+fn q_mat_mul_3d(input: &Tensor<3, f32>, weight: &QMatrix) -> Tensor<3, f32> {
+    let [batch, seq_len, in_features] = input.shape();
+    let out_features = weight.shape()[0];
+
+    let input_2d: Tensor<2, f32> = input.reshape([batch * seq_len, in_features]).to_concrete();
+    let output_2d = input_2d.q_mat_mul(weight);
+    output_2d
+        .reshape([batch, seq_len, out_features])
+        .to_concrete()
+}
+
 // f32-specific implementations for loading and forward
 impl Linear<f32> {
     /// Load a Linear layer from a VarBuilder.
@@ -71,7 +87,23 @@ impl Linear<f32> {
     /// Output shape: (batch, seq_len, out_features)
     pub fn forward<B>(&self, input: &Tensor<3, f32, B>) -> Tensor<3, f32>
     where
-        B: fusor_cpu::TensorBacking<3, Elem = f32>,
+        B: Fusion<3, f32>,
+    {
+        let input_concrete = input.to_concrete();
+        let output = q_mat_mul_3d(&input_concrete, &self.weight);
+        if let Some(bias) = &self.bias {
+            output.add_(bias)
+        } else {
+            output
+        }
+    }
+    /// Forward pass for 2D input (batch, in_features)
+    ///
+    /// Input shape: (batch, in_features)
+    /// Output shape: (batch, out_features)
+    pub fn forward_2d<B>(&self, input: &Tensor<2, f32, B>) -> Tensor<2, f32>
+    where
+        B: Fusion<2, f32>,
     {
         let output = input.q_mat_mul(&self.weight);
 
@@ -94,23 +126,16 @@ where
     /// Converts input to f32 for computation, then converts back.
     pub fn forward_generic<B>(&self, input: &Tensor<3, T, B>) -> Tensor<3, T>
     where
-        B: fusor_cpu::TensorBacking<3, Elem = T>,
+        B: Fusion<3, T>,
     {
-        // Cast input to f32
         let input_f32 = input.cast::<f32>();
-
-        // Do quantized matmul in f32
-        let output_f32 = input_f32.q_mat_mul(&self.weight);
-
-        // Add bias if present (in f32)
+        let output_f32 = q_mat_mul_3d(&input_f32, &self.weight);
         let output_f32 = if let Some(bias) = &self.bias {
             let bias_f32: Tensor<1, f32> = bias.cast();
             output_f32.add_(&bias_f32)
         } else {
             output_f32
         };
-
-        // Cast back to T
         output_f32.cast()
     }
 }

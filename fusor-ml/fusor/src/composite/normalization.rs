@@ -1,13 +1,13 @@
 //! Normalization operations that work on both CPU and GPU backends.
 
+use crate::cpu::{LastRank as CpuLastRank, MaxOp, SimdReduceOp, SumOp, TensorBacking};
+use crate::gpu::{
+    DataType, FloatDataType, LastRank as GpuLastRank, NextRankInner as GpuNextRankInner,
+};
 use crate::{
     AddOp, ConcreteTensor, DivOp, ExpOp, FloatOps, MulOp, SimdBinaryOp, SimdElement, SimdUnaryOp,
     SqrtOp, SubOp, Tensor,
 };
-use fusor_core::{
-    DataType, FloatDataType, LastRank as GpuLastRank, NextRankInner as GpuNextRankInner,
-};
-use fusor_cpu::{LastRank as CpuLastRank, MaxOp, SimdReduceOp, SumOp, TensorBacking};
 
 impl<const R: usize, D, B> Tensor<R, D, B>
 where
@@ -22,9 +22,11 @@ where
     pub fn softmax<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         MaxOp: SimdReduceOp<D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Sub<Output = D> + std::ops::Div<Output = D>,
@@ -34,7 +36,7 @@ where
     {
         match self {
             Tensor::Cpu(_) => self.softmax_cpu_impl(axis),
-            Tensor::Gpu(t) => Tensor::Gpu(t.softmax(axis)),
+            Tensor::Gpu(t) => Tensor::Gpu(t.softmax::<OUT_RANK>(axis)),
         }
     }
 
@@ -45,9 +47,10 @@ where
     pub fn softmax_last_dim<const OUT_RANK: usize>(&self) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         MaxOp: SimdReduceOp<D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Sub<Output = D> + std::ops::Div<Output = D>,
@@ -65,9 +68,10 @@ where
     pub fn softmax_slow<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         MaxOp: SimdReduceOp<D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Sub<Output = D> + std::ops::Div<Output = D>,
@@ -85,9 +89,10 @@ where
     pub fn softmax_slow_last_dim<const OUT_RANK: usize>(&self) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         MaxOp: SimdReduceOp<D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Sub<Output = D> + std::ops::Div<Output = D>,
@@ -102,9 +107,9 @@ where
     fn softmax_cpu_impl<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         MaxOp: SimdReduceOp<D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Sub<Output = D> + std::ops::Div<Output = D>,
@@ -147,9 +152,9 @@ where
     ) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D> + std::ops::Div<Output = D> + std::ops::Add<Output = D>,
         MulOp: SimdBinaryOp<D>,
@@ -201,9 +206,9 @@ where
     ) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D>
             + std::ops::Div<Output = D>
@@ -287,29 +292,30 @@ where
     ) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D>
             + std::ops::Div<Output = D>
             + std::ops::Add<Output = D>
-            + fusor_core::CastTensor<f32>,
-        f32: fusor_core::CastTensor<D>,
+            + crate::gpu::CastTensor<f32>,
+        f32: crate::gpu::CastTensor<D>,
         MulOp: SimdBinaryOp<D>,
         DivOp: SimdBinaryOp<D>,
         AddOp: SimdBinaryOp<D>,
         SqrtOp: SimdUnaryOp<D>,
-        (fusor_core::Tensor<R, D>, fusor_core::Tensor<W, D>): fusor_core::MaxRank<R, D>,
+        (crate::gpu::Tensor<R, D>, crate::gpu::Tensor<W, D>): crate::gpu::MaxRank<R, D>,
     {
         match (self, weight, bias) {
             // GPU path - use the optimized fused kernel
-            (Tensor::Gpu(input), Tensor::Gpu(weight), bias_opt) => {
+            (Tensor::Gpu(input), Tensor::Gpu(gpu_weight), bias_opt) => {
                 let gpu_bias = bias_opt.map(|b| match b {
                     Tensor::Gpu(bias) => bias,
                     _ => panic!("Bias must be on GPU when input is on GPU"),
                 });
-                Tensor::Gpu(input.rms_norm_fused(weight, gpu_bias, eps))
+                Tensor::Gpu(input.rms_norm_fused::<W, OUT_RANK>(gpu_weight, gpu_bias, eps))
             }
             // CPU path - use composite operations
             (Tensor::Cpu(_), Tensor::Cpu(_), _) => {
@@ -327,22 +333,71 @@ where
     ) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D>
             + std::ops::Div<Output = D>
             + std::ops::Add<Output = D>
-            + fusor_core::CastTensor<f32>,
-        f32: fusor_core::CastTensor<D>,
+            + crate::gpu::CastTensor<f32>,
+        f32: crate::gpu::CastTensor<D>,
         MulOp: SimdBinaryOp<D>,
         DivOp: SimdBinaryOp<D>,
         AddOp: SimdBinaryOp<D>,
         SqrtOp: SimdUnaryOp<D>,
-        (fusor_core::Tensor<R, D>, fusor_core::Tensor<W, D>): fusor_core::MaxRank<R, D>,
+        (crate::gpu::Tensor<R, D>, crate::gpu::Tensor<W, D>): crate::gpu::MaxRank<R, D>,
     {
         self.rms_norm_fused::<W, OUT_RANK>(weight, None, eps)
+    }
+
+    /// Fused `(input + residual) -> RMSNorm` kernel for transformer block boundaries.
+    pub fn rms_norm_residual_fused<const W: usize, const OUT_RANK: usize, B2>(
+        &self,
+        residual: &Tensor<R, D, B2>,
+        weight: &Tensor<W, D, ConcreteTensor<D, W>>,
+        bias: Option<&Tensor<W, D, ConcreteTensor<D, W>>>,
+        eps: f32,
+    ) -> Tensor<R, D>
+    where
+        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
+        SumOp: SimdReduceOp<D>,
+        D: std::ops::Mul<Output = D>
+            + std::ops::Div<Output = D>
+            + std::ops::Add<Output = D>
+            + crate::gpu::CastTensor<f32>,
+        f32: crate::gpu::CastTensor<D>,
+        MulOp: SimdBinaryOp<D>,
+        DivOp: SimdBinaryOp<D>,
+        AddOp: SimdBinaryOp<D>,
+        SqrtOp: SimdUnaryOp<D>,
+        B2: TensorBacking<R, Elem = D>,
+        (crate::gpu::Tensor<R, D>, crate::gpu::Tensor<W, D>): crate::gpu::MaxRank<R, D>,
+    {
+        match (self, residual, weight, bias) {
+            (Tensor::Gpu(input), Tensor::Gpu(gpu_residual), Tensor::Gpu(gpu_weight), bias_opt) => {
+                let gpu_bias = bias_opt.map(|b| match b {
+                    Tensor::Gpu(bias) => bias,
+                    _ => panic!("Bias must be on GPU when input is on GPU"),
+                });
+                Tensor::Gpu(input.rms_norm_residual_fused::<W, OUT_RANK>(
+                    gpu_residual,
+                    gpu_weight,
+                    gpu_bias,
+                    eps,
+                ))
+            }
+            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_), _) => {
+                let combined = (self + residual).to_concrete();
+                combined.rms_norm_fused_cpu_impl::<W, OUT_RANK>(weight, bias, eps)
+            }
+            _ => panic!("All tensors must be on the same device"),
+        }
     }
 
     /// CPU implementation of fused RMS norm using composite operations
@@ -354,9 +409,9 @@ where
     ) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D> + std::ops::Div<Output = D> + std::ops::Add<Output = D>,
         MulOp: SimdBinaryOp<D>,
@@ -409,7 +464,7 @@ where
 impl<const R: usize, B> Tensor<R, f32, B>
 where
     B: TensorBacking<R, Elem = f32>,
-    fusor_core::Tensor<R, f32>: fusor_core::LastRankInner,
+    crate::gpu::Tensor<R, f32>: crate::gpu::LastRankInner,
 {
     /// Optimized fused layer norm along the last dimension for f32.
     ///
@@ -426,9 +481,9 @@ where
     ) -> Tensor<R, f32>
     where
         ConcreteTensor<f32, R>: CpuLastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
-        <fusor_core::Tensor<R, f32> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, f32>>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, f32> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, f32>>,
         SumOp: SimdReduceOp<f32>,
         AddOp: SimdBinaryOp<f32>,
         SubOp: SimdBinaryOp<f32>,
@@ -468,13 +523,13 @@ where
                     }
                     None => None,
                 };
-                let result = fusor_cpu::layer_norm_last_dim_fused(
+                let result = crate::cpu::layer_norm_last_dim_fused(
                     input.inner(),
                     weight.inner(),
                     bias.as_ref().map(|bias| bias.inner()),
                     eps,
                 );
-                Tensor::Cpu(fusor_cpu::Tensor::new(result))
+                Tensor::Cpu(crate::cpu::TypedTensor::new(result))
             }
             (Tensor::Gpu(_), Tensor::Gpu(_)) => {
                 if matches!(bias, Some(Tensor::Cpu(_))) {
@@ -498,514 +553,16 @@ where
     /// pass through memory, which is significantly faster for large tensors.
     pub fn softmax_last_dim_fused<const OUT_RANK: usize>(&self) -> Tensor<R, f32>
     where
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
     {
         self.dispatch_ref(
             |t| {
                 // Make contiguous if needed, then use fused kernel
                 let contiguous = t.as_ref().make_contiguous();
-                let result = fusor_cpu::softmax_last_dim_fused(contiguous.inner());
-                fusor_cpu::Tensor::new(result)
+                let result = crate::cpu::softmax_last_dim_fused(contiguous.inner());
+                crate::cpu::TypedTensor::new(result)
             },
             |t| t.softmax_last_dim::<OUT_RANK>(),
         )
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::identity_op, clippy::useless_conversion)]
-mod tests {
-    use super::*;
-    use crate::Layout;
-
-    #[tokio::test]
-    async fn test_softmax_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([6], &data));
-
-        let result = t.softmax::<0>(0);
-        let slice = result.as_slice().await.unwrap();
-
-        // Compute expected softmax
-        let max_val = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp_vals: Vec<f32> = data.iter().map(|x| (x - max_val).exp()).collect();
-        let sum_exp: f32 = exp_vals.iter().sum();
-        let expected: Vec<f32> = exp_vals.iter().map(|x| x / sum_exp).collect();
-
-        for i in 0..6 {
-            assert!(
-                (slice[[i]] - expected[i]).abs() < 0.001,
-                "Mismatch at index {}: got {}, expected {}",
-                i,
-                slice[[i]],
-                expected[i]
-            );
-        }
-
-        // Check that softmax sums to 1
-        let sum: f32 = (0..6).map(|i| slice[[i]]).sum();
-        assert!((sum - 1.0).abs() < 0.001);
-    }
-
-    #[tokio::test]
-    async fn test_softmax_2d_cpu() {
-        // 2x3 tensor, softmax along axis 1
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-
-        let result = t.softmax::<1>(1);
-        let slice = result.as_slice().await.unwrap();
-
-        // Each row should sum to 1
-        let sum_row0: f32 = (0..3).map(|j| slice[[0, j]]).sum();
-        let sum_row1: f32 = (0..3).map(|j| slice[[1, j]]).sum();
-        assert!((sum_row0 - 1.0).abs() < 0.001);
-        assert!((sum_row1 - 1.0).abs() < 0.001);
-    }
-
-    #[tokio::test]
-    async fn test_rms_norm_cpu() {
-        // Simple test: normalize [1, 2, 3] with weight [1, 1, 1]
-        let data = [1.0f32, 2.0, 3.0];
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &data));
-        let weight: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &[1.0, 1.0, 1.0]));
-
-        let result = t.rms_norm::<0, _>(&weight, 1e-5);
-        let slice = result.as_slice().await.unwrap();
-
-        // rms = sqrt(mean([1, 4, 9])) = sqrt(14/3) ~ 2.16
-        let rms = ((1.0 + 4.0 + 9.0) / 3.0_f32 + 1e-5).sqrt();
-        let expected: Vec<f32> = data.iter().map(|x| x / rms).collect();
-
-        for i in 0..3 {
-            assert!(
-                (slice[[i]] - expected[i]).abs() < 0.01,
-                "Mismatch at index {}: got {}, expected {}",
-                i,
-                slice[[i]],
-                expected[i]
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_rms_norm_2d_cpu() {
-        // 2x3 tensor
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-        let weight: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
-            [2, 3],
-            &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-        ));
-
-        let result = t.rms_norm::<1, _>(&weight, 1e-5);
-        let slice = result.as_slice().await.unwrap();
-
-        // Row 0: [1, 2, 3] -> rms = sqrt((1+4+9)/3 + eps) = sqrt(14/3 + eps)
-        let rms0 = ((1.0 + 4.0 + 9.0) / 3.0_f32 + 1e-5).sqrt();
-        assert!((slice[[0, 0]] - 1.0 / rms0).abs() < 0.01);
-        assert!((slice[[0, 1]] - 2.0 / rms0).abs() < 0.01);
-        assert!((slice[[0, 2]] - 3.0 / rms0).abs() < 0.01);
-
-        // Row 1: [4, 5, 6] -> rms = sqrt((16+25+36)/3 + eps) = sqrt(77/3 + eps)
-        let rms1 = ((16.0 + 25.0 + 36.0) / 3.0_f32 + 1e-5).sqrt();
-        assert!((slice[[1, 0]] - 4.0 / rms1).abs() < 0.01);
-        assert!((slice[[1, 1]] - 5.0 / rms1).abs() < 0.01);
-        assert!((slice[[1, 2]] - 6.0 / rms1).abs() < 0.01);
-    }
-
-    #[tokio::test]
-    async fn test_layer_norm_cpu() {
-        // Simple test with remove_mean=false (RMS-like)
-        let data = [1.0f32, 2.0, 3.0];
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &data));
-        let weight: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &[2.0, 2.0, 2.0]));
-
-        let result = t.layer_norm::<0, _, ConcreteTensor<_, _>>(&weight, None, 1e-5, false);
-        let slice = result.as_slice().await.unwrap();
-
-        // With remove_mean=false, this should be like rms_norm but with weight=2
-        let rms = ((1.0 + 4.0 + 9.0) / 3.0_f32 + 1e-5).sqrt();
-        let expected: Vec<f32> = data.iter().map(|x| (x / rms) * 2.0).collect();
-
-        for i in 0..3 {
-            assert!(
-                (slice[[i]] - expected[i]).abs() < 0.01,
-                "Mismatch at index {}: got {}, expected {}",
-                i,
-                slice[[i]],
-                expected[i]
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_layer_norm_with_mean_removal() {
-        // Test with remove_mean=true (standard layer norm)
-        let data = [1.0f32, 2.0, 3.0];
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &data));
-        let weight: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &[1.0, 1.0, 1.0]));
-
-        let result = t.layer_norm::<0, _, ConcreteTensor<_, _>>(&weight, None, 1e-5, true);
-        let slice = result.as_slice().await.unwrap();
-
-        // mean = 2, centered = [-1, 0, 1]
-        // var = mean([1, 0, 1]) = 2/3
-        // std = sqrt(2/3 + eps)
-        let var: f32 = 2.0 / 3.0;
-        let std = (var + 1e-5).sqrt();
-        let expected: Vec<f32> = vec![(-1.0) / std, 0.0 / std, 1.0 / std];
-
-        for i in 0..3 {
-            assert!(
-                (slice[[i]] - expected[i]).abs() < 0.01,
-                "Mismatch at index {}: got {}, expected {}",
-                i,
-                slice[[i]],
-                expected[i]
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_layer_norm_last_dim_fused_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0, 0.5, -1.0, 2.5, 6.0];
-        let input: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 4], &data));
-
-        let weight: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[1.5, 0.5, 2.0, 1.0]));
-        let bias: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[0.1, -0.2, 0.3, -0.4]));
-
-        let fused = input.layer_norm_last_dim_fused::<1, 1, _, _>(&weight, Some(&bias), 1e-5);
-        let weight_broadcast = weight.broadcast_as([2, 4]);
-        let bias_broadcast = bias.broadcast_as([2, 4]);
-        let composite =
-            input.layer_norm::<1, _, _>(&weight_broadcast, Some(&bias_broadcast), 1e-5, true);
-
-        let fused_slice = fused.as_slice().await.unwrap();
-        let composite_slice = composite.as_slice().await.unwrap();
-
-        for i in 0..2 {
-            for j in 0..4 {
-                assert!(
-                    (fused_slice[[i, j]] - composite_slice[[i, j]]).abs() < 0.001,
-                    "Mismatch at [{}, {}]: fused={}, composite={}",
-                    i,
-                    j,
-                    fused_slice[[i, j]],
-                    composite_slice[[i, j]]
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_cpu_make_contiguous_helper() {
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t = fusor_cpu::Tensor::from_slice([2, 3], &data);
-
-        let layout = Layout::from_parts(0, vec![3, 2].into_boxed_slice(), vec![1, 3].into());
-        let restrided = t.restride_layout(layout);
-        let contiguous = restrided.make_contiguous();
-
-        assert!(contiguous.inner().layout().is_contiguous());
-
-        let slice = contiguous.as_slice();
-        assert_eq!(slice[[0, 0]], 1.0);
-        assert_eq!(slice[[0, 1]], 4.0);
-        assert_eq!(slice[[1, 0]], 2.0);
-        assert_eq!(slice[[1, 1]], 5.0);
-        assert_eq!(slice[[2, 0]], 3.0);
-        assert_eq!(slice[[2, 1]], 6.0);
-    }
-
-    #[tokio::test]
-    async fn test_softmax_cpu_vs_gpu() {
-        use crate::Device;
-
-        // Create random-ish data similar to attention scores
-        let data: Vec<f32> = (0..1 * 8 * 100 * 100)
-            .map(|i| (i as f32 * 0.001).sin() * 10.0)
-            .collect();
-
-        // CPU version
-        let cpu_tensor: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 8, 100, 100], &data));
-        let cpu_result = cpu_tensor.softmax::<3>(3);
-        let cpu_slice = cpu_result.as_slice().await.unwrap();
-
-        // GPU version
-        let gpu_device = Device::new().await.expect("GPU required for this test");
-        let gpu_tensor: Tensor<4, f32> = Tensor::from_slice(&gpu_device, [1, 8, 100, 100], &data);
-        let gpu_result = gpu_tensor.softmax::<3>(3);
-        let gpu_slice = gpu_result.as_slice().await.unwrap();
-
-        // Compare
-        assert_eq!(cpu_slice.shape(), gpu_slice.shape());
-
-        let mut max_diff = 0.0f32;
-        let mut sum_diff = 0.0f32;
-        let mut count = 0;
-        for i in 0..cpu_slice.shape()[0] {
-            for j in 0..cpu_slice.shape()[1] {
-                for k in 0..cpu_slice.shape()[2].min(50) {
-                    for l in 0..cpu_slice.shape()[3].min(50) {
-                        let cpu_val: f32 = cpu_slice[[i, j, k, l]].into();
-                        let gpu_val: f32 = gpu_slice[[i, j, k, l]].into();
-                        let diff = (cpu_val - gpu_val).abs();
-                        max_diff = max_diff.max(diff);
-                        sum_diff += diff;
-                        count += 1;
-                    }
-                }
-            }
-        }
-
-        eprintln!(
-            "Softmax CPU vs GPU: max_diff={}, mean_diff={}",
-            max_diff,
-            sum_diff / count as f32
-        );
-        eprintln!(
-            "CPU[0,0,0,0..5]: {:?}",
-            (0..5)
-                .map(|i| cpu_slice[[0, 0, 0, i]])
-                .collect::<Vec<f32>>()
-        );
-        eprintln!(
-            "GPU[0,0,0,0..5]: {:?}",
-            (0..5)
-                .map(|i| gpu_slice[[0, 0, 0, i]])
-                .collect::<Vec<f32>>()
-        );
-
-        assert!(
-            max_diff < 0.001,
-            "Softmax CPU and GPU outputs differ too much: max_diff={}",
-            max_diff
-        );
-    }
-
-    #[tokio::test]
-    async fn test_rms_norm_fused_vs_composite() {
-        use crate::Device;
-
-        let gpu_device = Device::new().await.expect("GPU required for this test");
-
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let weight_data = [1.0f32, 1.0, 1.0, 1.0];
-        let eps = 1e-5f32;
-
-        // Composite RMS norm (CPU path: layer_norm with remove_mean=false)
-        let cpu_input: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 4], &data));
-        let cpu_weight: Tensor<2, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 4], &[1.0; 8]));
-        let composite_result = cpu_input.rms_norm::<1, _>(&cpu_weight, eps);
-        let composite_output = composite_result.as_slice().await.unwrap();
-
-        // Fused RMS norm (GPU path)
-        let gpu_input: Tensor<2, f32> = Tensor::from_slice(&gpu_device, [2, 4], &data);
-        let gpu_weight: Tensor<1, f32, ConcreteTensor<f32, 1>> =
-            Tensor::from_slice(&gpu_device, [4], &weight_data);
-        let fused_result = gpu_input.rms_norm_fused::<1, 1>(&gpu_weight, None, eps);
-        let fused_output = fused_result.as_slice().await.unwrap();
-
-        for i in 0..2 {
-            for j in 0..4 {
-                assert!(
-                    (composite_output[[i, j]] - fused_output[[i, j]]).abs() < 0.001,
-                    "Mismatch at [{}, {}]: composite={}, fused={}",
-                    i,
-                    j,
-                    composite_output[[i, j]],
-                    fused_output[[i, j]]
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_rms_norm_fused_with_bias() {
-        use crate::Device;
-
-        let gpu_device = Device::new().await.expect("GPU required for this test");
-
-        let data = [1.0f32, 2.0, 3.0, 4.0];
-        let weight_data = [2.0f32, 3.0];
-        let bias_data = [0.5f32, 0.5];
-        let eps = 1e-5f32;
-
-        // Composite: CPU rms_norm + manual bias
-        let cpu_input: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 2], &data));
-        let cpu_weight: Tensor<2, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 2], &[2.0, 3.0, 2.0, 3.0]));
-        let cpu_bias: Tensor<2, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 2], &[0.5, 0.5, 0.5, 0.5]));
-        let composite_result =
-            cpu_input.layer_norm::<1, _, _>(&cpu_weight, Some(&cpu_bias), eps, false);
-        let composite_output = composite_result.as_slice().await.unwrap();
-
-        // Fused: GPU
-        let gpu_input: Tensor<2, f32> = Tensor::from_slice(&gpu_device, [2, 2], &data);
-        let gpu_weight: Tensor<1, f32, ConcreteTensor<f32, 1>> =
-            Tensor::from_slice(&gpu_device, [2], &weight_data);
-        let gpu_bias: Tensor<1, f32, ConcreteTensor<f32, 1>> =
-            Tensor::from_slice(&gpu_device, [2], &bias_data);
-        let fused_result = gpu_input.rms_norm_fused::<1, 1>(&gpu_weight, Some(&gpu_bias), eps);
-        let fused_output = fused_result.as_slice().await.unwrap();
-
-        for i in 0..2 {
-            for j in 0..2 {
-                assert!(
-                    (composite_output[[i, j]] - fused_output[[i, j]]).abs() < 0.001,
-                    "Mismatch at [{}, {}]: composite={}, fused={}",
-                    i,
-                    j,
-                    composite_output[[i, j]],
-                    fused_output[[i, j]]
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_rms_norm_fused_large() {
-        use crate::Device;
-
-        let gpu_device = Device::new().await.expect("GPU required for this test");
-
-        let hidden_size = 512;
-        let batch_size = 4;
-
-        let input_data: Vec<f32> = (0..batch_size * hidden_size)
-            .map(|i| ((i % 10) as f32) * 0.1)
-            .collect();
-        let weight_data: Vec<f32> = vec![1.0; hidden_size];
-
-        let eps = 1e-5f32;
-
-        // CPU composite
-        let cpu_input: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
-            [batch_size, hidden_size],
-            &input_data,
-        ));
-        // Broadcast weight to full shape for composite rms_norm
-        let cpu_weight: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([hidden_size], &weight_data));
-        let cpu_weight_broadcast = cpu_weight.broadcast_as([batch_size, hidden_size]);
-        let composite_result = cpu_input.rms_norm::<1, _>(&cpu_weight_broadcast, eps);
-        let composite_output = composite_result.as_slice().await.unwrap();
-
-        // GPU fused
-        let gpu_input: Tensor<2, f32> =
-            Tensor::from_slice(&gpu_device, [batch_size, hidden_size], &input_data);
-        let gpu_weight: Tensor<1, f32, ConcreteTensor<f32, 1>> =
-            Tensor::from_slice(&gpu_device, [hidden_size], &weight_data);
-        let fused_result = gpu_input.rms_norm_fused::<1, 1>(&gpu_weight, None, eps);
-        let fused_output = fused_result.as_slice().await.unwrap();
-
-        for i in 0..batch_size {
-            for j in 0..hidden_size {
-                let diff = (composite_output[[i, j]] - fused_output[[i, j]]).abs();
-                assert!(
-                    diff < 0.01,
-                    "Mismatch at [{}, {}]: composite={}, fused={}, diff={}",
-                    i,
-                    j,
-                    composite_output[[i, j]],
-                    fused_output[[i, j]],
-                    diff
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_layer_norm_cpu_vs_gpu() {
-        use crate::Device;
-
-        // Create random-ish data similar to hidden states
-        let data: Vec<f32> = (0..1 * 100 * 384)
-            .map(|i| (i as f32 * 0.001).sin() * 2.0)
-            .collect();
-        let weight_data: Vec<f32> = (0..384)
-            .map(|i| 0.9 + (i as f32 * 0.001).cos() * 0.2)
-            .collect();
-        let bias_data: Vec<f32> = (0..384).map(|i| (i as f32 * 0.0001).sin() * 0.1).collect();
-
-        // CPU version
-        let cpu_tensor: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 100, 384], &data));
-        let cpu_weight_1d: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([384], &weight_data));
-        let cpu_weight_broadcast = cpu_weight_1d.broadcast_as([1, 100, 384]);
-        let cpu_bias: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([384], &bias_data));
-        let cpu_bias_broadcast = cpu_bias.broadcast_as([1, 100, 384]);
-        let cpu_result = cpu_tensor.layer_norm::<2, _, _>(
-            &cpu_weight_broadcast,
-            Some(&cpu_bias_broadcast),
-            1e-5,
-            true,
-        );
-        let cpu_slice = cpu_result.as_slice().await.unwrap();
-
-        // GPU version
-        let gpu_device = Device::new().await.expect("GPU required for this test");
-        let gpu_tensor: Tensor<3, f32> = Tensor::from_slice(&gpu_device, [1, 100, 384], &data);
-        let gpu_weight_1d: Tensor<1, f32> = Tensor::from_slice(&gpu_device, [384], &weight_data);
-        let gpu_weight_broadcast = gpu_weight_1d.broadcast_as([1, 100, 384]);
-        let gpu_bias: Tensor<1, f32> = Tensor::from_slice(&gpu_device, [384], &bias_data);
-        let gpu_bias_broadcast = gpu_bias.broadcast_as([1, 100, 384]);
-        let gpu_result = gpu_tensor.layer_norm::<2, _, _>(
-            &gpu_weight_broadcast,
-            Some(&gpu_bias_broadcast),
-            1e-5,
-            true,
-        );
-        let gpu_slice = gpu_result.as_slice().await.unwrap();
-
-        // Compare
-        assert_eq!(cpu_slice.shape(), gpu_slice.shape());
-
-        let mut max_diff = 0.0f32;
-        let mut sum_diff = 0.0f32;
-        let mut count = 0;
-        for i in 0..cpu_slice.shape()[0] {
-            for j in 0..cpu_slice.shape()[1].min(50) {
-                for k in 0..cpu_slice.shape()[2].min(100) {
-                    let cpu_val: f32 = cpu_slice[[i, j, k]].into();
-                    let gpu_val: f32 = gpu_slice[[i, j, k]].into();
-                    let diff = (cpu_val - gpu_val).abs();
-                    max_diff = max_diff.max(diff);
-                    sum_diff += diff;
-                    count += 1;
-                }
-            }
-        }
-
-        eprintln!(
-            "LayerNorm CPU vs GPU: max_diff={}, mean_diff={}",
-            max_diff,
-            sum_diff / count as f32
-        );
-        eprintln!(
-            "CPU[0,0,0..5]: {:?}",
-            (0..5).map(|i| cpu_slice[[0, 0, i]]).collect::<Vec<f32>>()
-        );
-        eprintln!(
-            "GPU[0,0,0..5]: {:?}",
-            (0..5).map(|i| gpu_slice[[0, 0, i]]).collect::<Vec<f32>>()
-        );
-
-        assert!(
-            max_diff < 0.01,
-            "LayerNorm CPU and GPU outputs differ too much: max_diff={}",
-            max_diff
-        );
     }
 }

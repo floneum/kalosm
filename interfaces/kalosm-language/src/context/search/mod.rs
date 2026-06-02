@@ -143,6 +143,7 @@ pub async fn search(api_key: &str, query: &str) -> Result<SearchResult, reqwest:
     res.json().await
 }
 
+#[cfg(all(test, feature = "tokio"))]
 #[tokio::test]
 async fn search_result() {
     if let Some(key) = option_env!("SERPER_API_KEY") {

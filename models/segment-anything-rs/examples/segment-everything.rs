@@ -1,10 +1,18 @@
 use segment_anything_rs::*;
 
-fn main() {
-    let model = SegmentAnything::builder().build().unwrap();
-    let image = image::open("examples/landscape.jpg").unwrap();
-    let images = model.segment_everything(image).unwrap();
-    for (i, img) in images.iter().enumerate() {
-        img.save(format!("{i}.png")).unwrap();
+#[tokio::main]
+async fn main() {
+    let model = SegmentAnything::builder()
+        .build()
+        .await
+        .expect("Failed to load model");
+
+    let image_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/landscape.jpg");
+    let image = image::open(&image_path).unwrap();
+    let masks = model.segment_everything(image).await.unwrap();
+
+    for (i, mask) in masks.iter().enumerate() {
+        mask.save(format!("{i}.png")).unwrap();
     }
 }

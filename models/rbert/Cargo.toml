@@ -9,7 +9,7 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["ai", "llm", "bert", "nlp", "transformers"]
 
 [dependencies]
-fusor = { workspace = true }
+fusor = { workspace = true, default-features = false }
 fusor-gguf = { workspace = true }
 tokenizers = { workspace = true, features = ["fancy-regex"] }
 thiserror.workspace = true
@@ -20,14 +20,16 @@ serde = { version = "1", features = ["derive"] }
 
 kalosm-common = { workspace = true }
 kalosm-model-types.workspace = true
-kalosm-language-model.workspace = true
+kalosm-language-model = { workspace = true, features = ["cache"] }
 pollster = "0.4.0"
+
+[features]
+default = ["cpu", "gpu"]
+cpu = ["fusor/cpu"]
+gpu = ["fusor/gpu"]
 
 [dev-dependencies]
 anyhow.workspace = true
 kalosm = { workspace = true, features = ["language"] }
 postcard = { version = "1.0.8", features = ["use-std"] }
-tokio = { version = "1", features = ["full"] }
-
-[features]
-tokio = ["kalosm-common/tokio"]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

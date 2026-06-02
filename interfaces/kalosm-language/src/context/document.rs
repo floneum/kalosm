@@ -1,4 +1,5 @@
 use std::{convert::Infallible, future::Future};
+#[cfg(feature = "document-extraction")]
 use url::Url;
 pub use whatlang::Lang;
 
@@ -151,9 +152,11 @@ where
 }
 
 /// An error that can occur when extracting a document from a URL.
+#[cfg(feature = "document-extraction")]
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractDocumentError {
     /// An error occurred when fetching the HTML.
+    #[cfg(feature = "web-documents")]
     #[error("Failed to fetch HTML: {0}")]
     FetchHtml(#[from] reqwest::Error),
     /// An error occurred when extracting the article.
@@ -164,11 +167,13 @@ pub enum ExtractDocumentError {
     ParseUrl(#[from] url::ParseError),
 }
 
+#[cfg(feature = "web-documents")]
 pub(crate) async fn get_article(url: Url) -> Result<Document, ExtractDocumentError> {
     let html = reqwest::get(url.clone()).await?.text().await?;
     extract_article(&html)
 }
 
+#[cfg(feature = "document-extraction")]
 pub(crate) fn extract_article(html: &str) -> Result<Document, ExtractDocumentError> {
     let cleaned =
         readability::extractor::extract(&mut html.as_bytes(), &Url::parse("https://example.com")?)
@@ -176,6 +181,7 @@ pub(crate) fn extract_article(html: &str) -> Result<Document, ExtractDocumentErr
     Ok(Document::from_parts(cleaned.title, cleaned.text))
 }
 
+#[cfg(feature = "web-documents")]
 impl IntoDocument for Url {
     type Error = ExtractDocumentError;
 

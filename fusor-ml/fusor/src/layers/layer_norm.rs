@@ -1,16 +1,66 @@
 //! Layer normalization implementation.
 
-use crate::{ConcreteTensor, Device, SimdElement, Tensor, VarBuilder};
-use fusor_core::{DataType, FloatDataType};
-use fusor_cpu::{FloatOps, TensorBacking};
+use crate::fusion::Concrete;
+use crate::{
+    DataType, Device, DivOp, FloatDataType, FloatOps, Fusion, MulOp, SimdBinaryOp, SimdElement,
+    SimdReduceOp, SimdUnaryOp, SqrtOp, SubOp, SumOp, Tensor, VarBuilder,
+};
+
+fn dequantize_vector_f32(
+    tensor: crate::QMatrix,
+    name: &str,
+) -> crate::Result<Tensor<1, f32, Concrete<f32, 1>>> {
+    match tensor.shape().len() {
+        1 => {
+            let tensor: Tensor<1, f32> = tensor.dequantize();
+            Ok(tensor.to_concrete())
+        }
+        2 => {
+            let tensor: Tensor<2, f32> = tensor.dequantize();
+            let shape = tensor.shape();
+            if shape[0] == 1 {
+                Ok(tensor.squeeze(0).to_concrete())
+            } else if shape[1] == 1 {
+                Ok(tensor.squeeze(1).to_concrete())
+            } else {
+                Err(crate::Error::VarBuilder(format!(
+                    "{name} must be a vector or squeezed vector, got shape {shape:?}",
+                )))
+            }
+        }
+        rank => Err(crate::Error::VarBuilder(format!(
+            "{name} must be rank 1 or 2, got rank {rank}",
+        ))),
+    }
+}
+
+fn load_vector_f32(
+    device: &Device,
+    vb: &mut VarBuilder,
+    name: &str,
+) -> crate::Result<Tensor<1, f32, Concrete<f32, 1>>> {
+    let tensor = vb.get(name, device)?;
+    dequantize_vector_f32(tensor, name)
+}
+
+fn load_optional_vector_f32(
+    device: &Device,
+    vb: &mut VarBuilder,
+    name: &str,
+) -> crate::Result<Option<Tensor<1, f32, Concrete<f32, 1>>>> {
+    let Ok(tensor) = vb.get(name, device) else {
+        return Ok(None);
+    };
+    dequantize_vector_f32(tensor, name).map(Some)
+}
 
 /// Layer Normalization.
 ///
 /// Normalizes the input over the last dimension.
 /// Formula: output = (input - mean) / sqrt(variance + eps) * weight + bias
 pub struct LayerNorm<const N: usize, D: SimdElement> {
-    weight: Tensor<N, D, ConcreteTensor<D, N>>,
-    bias: Option<Tensor<N, D, ConcreteTensor<D, N>>>,
+    weight: Tensor<N, D, Concrete<D, N>>,
+    bias: Option<Tensor<N, D, Concrete<D, N>>>,
     eps: f32,
 }
 
@@ -22,20 +72,20 @@ where
     ///
     /// Weight and bias should have shape (normalized_dim,).
     pub fn new(
-        weight: Tensor<N, D, ConcreteTensor<D, N>>,
-        bias: Option<Tensor<N, D, ConcreteTensor<D, N>>>,
+        weight: Tensor<N, D, Concrete<D, N>>,
+        bias: Option<Tensor<N, D, Concrete<D, N>>>,
         eps: f32,
     ) -> Self {
         Self { weight, bias, eps }
     }
 
     /// Get the weight tensor.
-    pub fn weight(&self) -> &Tensor<N, D, ConcreteTensor<D, N>> {
+    pub fn weight(&self) -> &Tensor<N, D, Concrete<D, N>> {
         &self.weight
     }
 
     /// Get the bias tensor if present.
-    pub fn bias(&self) -> Option<&Tensor<N, D, ConcreteTensor<D, N>>> {
+    pub fn bias(&self) -> Option<&Tensor<N, D, Concrete<D, N>>> {
         self.bias.as_ref()
     }
 
@@ -52,19 +102,19 @@ where
     /// Forward pass for 2D input (batch, features).
     ///
     /// Normalizes over the last dimension (features).
-    pub fn forward_2d<B>(&self, input: &Tensor<2, D, B>) -> Tensor<2, D, ConcreteTensor<D, 2>>
+    pub fn forward_2d<B>(&self, input: &Tensor<2, D, B>) -> Tensor<2, D, Concrete<D, 2>>
     where
         D: std::ops::Add<Output = D>
             + std::ops::Sub<Output = D>
             + std::ops::Mul<Output = D>
             + std::ops::Div<Output = D>,
-        crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::SubOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::DivOp: fusor_cpu::SimdBinaryOp<D>,
-        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
-        fusor_cpu::SqrtOp: fusor_cpu::SimdUnaryOp<D>,
-        B: TensorBacking<2, Elem = D>,
+        crate::AddOp: SimdBinaryOp<D>,
+        SubOp: SimdBinaryOp<D>,
+        MulOp: SimdBinaryOp<D>,
+        DivOp: SimdBinaryOp<D>,
+        SumOp: SimdReduceOp<D>,
+        SqrtOp: SimdUnaryOp<D>,
+        B: Fusion<2, D>,
     {
         // Broadcast weight to input shape
         let weight_broadcast: Tensor<2, D, _> = self.weight.broadcast_as(input.shape());
@@ -81,19 +131,19 @@ where
     /// Forward pass for 3D input (batch, seq_len, features).
     ///
     /// Normalizes over the last dimension (features).
-    pub fn forward<B>(&self, input: &Tensor<3, D, B>) -> Tensor<3, D, ConcreteTensor<D, 3>>
+    pub fn forward<B>(&self, input: &Tensor<3, D, B>) -> Tensor<3, D, Concrete<D, 3>>
     where
         D: std::ops::Add<Output = D>
             + std::ops::Sub<Output = D>
             + std::ops::Mul<Output = D>
             + std::ops::Div<Output = D>,
-        crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::SubOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::DivOp: fusor_cpu::SimdBinaryOp<D>,
-        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
-        fusor_cpu::SqrtOp: fusor_cpu::SimdUnaryOp<D>,
-        B: TensorBacking<3, Elem = D>,
+        crate::AddOp: SimdBinaryOp<D>,
+        SubOp: SimdBinaryOp<D>,
+        MulOp: SimdBinaryOp<D>,
+        DivOp: SimdBinaryOp<D>,
+        SumOp: SimdReduceOp<D>,
+        SqrtOp: SimdUnaryOp<D>,
+        B: Fusion<3, D>,
     {
         // Broadcast weight to input shape
         let weight_broadcast: Tensor<3, D, _> = self.weight.broadcast_as(input.shape());
@@ -115,7 +165,7 @@ impl LayerNorm<1, f32> {
     /// as it computes mean, variance, and normalization in fewer passes.
     pub fn forward_fused<B>(&self, input: &Tensor<3, f32, B>) -> Tensor<3, f32>
     where
-        B: TensorBacking<3, Elem = f32>,
+        B: Fusion<3, f32>,
     {
         input.layer_norm_last_dim_fused::<2, 1, _, _>(&self.weight, self.bias.as_ref(), self.eps)
     }
@@ -126,126 +176,159 @@ impl LayerNorm<1, f32> {
     /// - weight: Tensor with shape matching the normalized dimension
     /// - bias (optional): Tensor with same shape as weight
     pub fn load(device: &Device, vb: &mut VarBuilder, eps: f32) -> crate::Result<Self> {
-        let weight_q = vb.get("weight", device)?;
-        let weight_shape = weight_q.shape();
-
-        // Handle both 1D and 2D weight formats
-        let weight: Tensor<1, f32> = if weight_shape.len() == 1 {
-            weight_q.dequantize()
-        } else {
-            let weight_2d: Tensor<2, f32> = weight_q.dequantize();
-            // Squeeze to 1D
-            if weight_2d.shape()[0] == 1 {
-                weight_2d.squeeze(0).to_concrete()
-            } else {
-                weight_2d.squeeze(1).to_concrete()
-            }
-        };
-
-        let bias = vb.get("bias", device).ok().map(|b| {
-            let bias_shape = b.shape();
-            if bias_shape.len() == 1 {
-                b.dequantize()
-            } else {
-                let bias_2d: Tensor<2, f32> = b.dequantize();
-                if bias_2d.shape()[0] == 1 {
-                    bias_2d.squeeze(0).to_concrete()
-                } else {
-                    bias_2d.squeeze(1).to_concrete()
-                }
-            }
-        });
-
-        Ok(Self::new(weight.to_concrete(), bias, eps))
+        let weight = load_vector_f32(device, vb, "weight")?;
+        let bias = load_optional_vector_f32(device, vb, "bias")?;
+        Ok(Self::new(weight, bias, eps))
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Layer normalization with a selectable reduction axis.
+///
+/// `axis == None` normalizes the last dimension. `axis == Some(a)` normalizes
+/// dimension `a` by transposing that axis to the end, applying the common
+/// last-dimension path, then transposing back.
+pub struct LayerNormNd<D: SimdElement = f32> {
+    weight: Tensor<1, D, Concrete<D, 1>>,
+    bias: Option<Tensor<1, D, Concrete<D, 1>>>,
+    axis: Option<usize>,
+    eps: f32,
+}
 
-    #[tokio::test]
-    async fn test_layer_norm_2d() {
-        // Weight and bias: (3,)
-        let weight_data = [1.0f32, 1.0, 1.0];
-        let bias_data = [0.0f32, 0.0, 0.0];
-        let weight: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &weight_data));
-        let bias: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &bias_data));
-
-        let layer_norm = LayerNorm::new(weight, Some(bias), 1e-5);
-
-        // Input: (2, 3)
-        let input_data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let input: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &input_data));
-
-        let output = layer_norm.forward_2d(&input);
-        let result = output.as_slice().await.unwrap();
-
-        assert_eq!(result.shape(), &[2, 3]);
-
-        // Each row should have mean ~0 and std ~1 after normalization
-        // For [1, 2, 3]: mean=2, std=sqrt(2/3)
-        // Normalized: [-sqrt(3/2), 0, sqrt(3/2)] ≈ [-1.22, 0, 1.22]
-        let expected_val = (3.0f32 / 2.0).sqrt();
-        assert!((result[[0, 0]] - (-expected_val)).abs() < 1e-4);
-        assert!(result[[0, 1]].abs() < 1e-4);
-        assert!((result[[0, 2]] - expected_val).abs() < 1e-4);
-    }
-
-    #[tokio::test]
-    async fn test_layer_norm_3d() {
-        let weight_data = [1.0f32, 1.0];
-        let weight: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2], &weight_data));
-
-        let layer_norm = LayerNorm::new(weight, None, 1e-5);
-
-        // Input: (1, 2, 2)
-        let input_data = [1.0f32, 3.0, 2.0, 4.0];
-        let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 2], &input_data));
-
-        let output = layer_norm.forward(&input);
-        let result = output.as_slice().await.unwrap();
-
-        assert_eq!(result.shape(), &[1, 2, 2]);
-
-        // First position [1, 3]: mean=2, std=1, normalized=[-1, 1]
-        assert!((result[[0, 0, 0]] - (-1.0)).abs() < 1e-4);
-        assert!((result[[0, 0, 1]] - 1.0).abs() < 1e-4);
-    }
-
-    #[tokio::test]
-    async fn test_layer_norm_forward_fused_cpu() {
-        let weight: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2], &[1.5f32, 0.5]));
-        let bias: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2], &[0.25f32, -0.75]));
-        let layer_norm = LayerNorm::new(weight, Some(bias), 1e-5);
-
-        let input_data = [1.0f32, 3.0, 2.0, 4.0];
-        let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 2], &input_data));
-
-        let fused = layer_norm.forward_fused(&input);
-        let reference = layer_norm.forward(&input);
-
-        let fused = fused.as_slice().await.unwrap();
-        let reference = reference.as_slice().await.unwrap();
-
-        for i in 0..1 {
-            for j in 0..2 {
-                for k in 0..2 {
-                    assert!(
-                        (fused[[i, j, k]] - reference[[i, j, k]]).abs() < 1e-4,
-                        "Mismatch at [{}, {}, {}]: fused={}, reference={}",
-                        i,
-                        j,
-                        k,
-                        fused[[i, j, k]],
-                        reference[[i, j, k]]
-                    );
-                }
-            }
+impl<D> LayerNormNd<D>
+where
+    D: SimdElement + DataType + FloatDataType + FloatOps + Default,
+{
+    /// Create a LayerNorm that normalizes the last dimension.
+    pub fn new(
+        weight: Tensor<1, D, Concrete<D, 1>>,
+        bias: Option<Tensor<1, D, Concrete<D, 1>>>,
+        eps: f32,
+    ) -> Self {
+        Self {
+            weight,
+            bias,
+            axis: None,
+            eps,
         }
+    }
+
+    /// Create a LayerNorm that normalizes the given axis.
+    pub fn new_over_axis(
+        weight: Tensor<1, D, Concrete<D, 1>>,
+        bias: Option<Tensor<1, D, Concrete<D, 1>>>,
+        axis: usize,
+        eps: f32,
+    ) -> Self {
+        Self {
+            weight,
+            bias,
+            axis: Some(axis),
+            eps,
+        }
+    }
+
+    pub fn weight(&self) -> &Tensor<1, D, Concrete<D, 1>> {
+        &self.weight
+    }
+
+    pub fn bias(&self) -> Option<&Tensor<1, D, Concrete<D, 1>>> {
+        self.bias.as_ref()
+    }
+
+    pub fn eps(&self) -> f32 {
+        self.eps
+    }
+
+    /// Forward pass for 2D input.
+    pub fn forward_2d<B>(&self, input: &Tensor<2, D, B>) -> Tensor<2, D, Concrete<D, 2>>
+    where
+        D: std::ops::Add<Output = D>
+            + std::ops::Sub<Output = D>
+            + std::ops::Mul<Output = D>
+            + std::ops::Div<Output = D>,
+        crate::AddOp: SimdBinaryOp<D>,
+        SubOp: SimdBinaryOp<D>,
+        MulOp: SimdBinaryOp<D>,
+        DivOp: SimdBinaryOp<D>,
+        SumOp: SimdReduceOp<D>,
+        SqrtOp: SimdUnaryOp<D>,
+        B: Fusion<2, D>,
+    {
+        self.forward(input)
+    }
+
+    /// Forward pass for any input rank. `OUT_RANK` equals `N - 1`.
+    pub fn forward<const N: usize, const OUT_RANK: usize, B>(
+        &self,
+        input: &Tensor<N, D, B>,
+    ) -> Tensor<N, D, Concrete<D, N>>
+    where
+        B: Fusion<N, D>,
+        D: std::ops::Add<Output = D>
+            + std::ops::Sub<Output = D>
+            + std::ops::Mul<Output = D>
+            + std::ops::Div<Output = D>,
+        crate::AddOp: SimdBinaryOp<D>,
+        SubOp: SimdBinaryOp<D>,
+        MulOp: SimdBinaryOp<D>,
+        DivOp: SimdBinaryOp<D>,
+        SumOp: SimdReduceOp<D>,
+        SqrtOp: SimdUnaryOp<D>,
+        Concrete<D, N>: crate::cpu::LastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<N, D>: crate::gpu::LastRank<OUT_RANK, D>,
+        <crate::gpu::Tensor<N, D> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<N, D>>,
+    {
+        let shape = input.shape();
+        let axis = self.axis.unwrap_or(N - 1);
+
+        if axis == N - 1 {
+            let weight_b: Tensor<N, D, _> = self.weight.broadcast_as(shape);
+            let bias_b: Option<Tensor<N, D, _>> = self.bias.as_ref().map(|b| b.broadcast_as(shape));
+            return input.layer_norm(&weight_b, bias_b.as_ref(), D::from_f32(self.eps), true);
+        }
+
+        let mut permuted_shape = shape;
+        permuted_shape.swap(axis, N - 1);
+        let permuted = input.transpose(axis, N - 1).to_concrete();
+        let weight_b: Tensor<N, D, _> = self.weight.broadcast_as(permuted_shape);
+        let bias_b: Option<Tensor<N, D, _>> =
+            self.bias.as_ref().map(|b| b.broadcast_as(permuted_shape));
+        let normed: Tensor<N, D> =
+            permuted.layer_norm(&weight_b, bias_b.as_ref(), D::from_f32(self.eps), true);
+        normed.transpose(axis, N - 1).to_concrete()
+    }
+}
+
+impl LayerNormNd<f32> {
+    /// Load a last-dim LayerNorm from a `VarBuilder`. Bias is optional.
+    pub fn load(device: &Device, vb: &mut VarBuilder, eps: f32) -> crate::Result<Self> {
+        let weight = load_vector_f32(device, vb, "weight")?;
+        let bias = load_optional_vector_f32(device, vb, "bias")?;
+        Ok(Self::new(weight, bias, eps))
+    }
+
+    /// Load a LayerNorm that normalizes `axis`. Bias is optional.
+    pub fn load_over_axis(
+        device: &Device,
+        vb: &mut VarBuilder,
+        axis: usize,
+        eps: f32,
+    ) -> crate::Result<Self> {
+        let weight = load_vector_f32(device, vb, "weight")?;
+        let bias = load_optional_vector_f32(device, vb, "bias")?;
+        Ok(Self::new_over_axis(weight, bias, axis, eps))
+    }
+
+    /// Fused CPU fast path for normalizing the last dim of a rank-3 tensor.
+    pub fn forward_fused<B>(&self, input: &Tensor<3, f32, B>) -> Tensor<3, f32>
+    where
+        B: Fusion<3, f32>,
+    {
+        if matches!(self.axis, Some(axis) if axis != 2) {
+            return self.forward(input);
+        }
+
+        input.layer_norm_last_dim_fused::<2, 1, _, _>(&self.weight, self.bias.as_ref(), self.eps)
     }
 }

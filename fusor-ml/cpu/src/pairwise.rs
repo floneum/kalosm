@@ -4,8 +4,8 @@ use std::ops::{Add as StdAdd, Div as StdDiv, Mul as StdMul, Rem as StdRem, Sub a
 
 use pulp::Simd;
 
-use crate::{ConcreteTensor, SimdElement, TensorBacking, materialize_expr};
-use fusor_types::Layout;
+use crate::SimdElement;
+use crate::define_tensor_op;
 
 /// Trait for binary operations that have SIMD support
 pub trait SimdBinaryOp<E: SimdElement>: Copy {
@@ -130,187 +130,43 @@ impl_rem_op_scalar!(u64);
 impl_rem_op_scalar!(i32);
 impl_rem_op_scalar!(i64);
 
-/// Macro to define binary tensor operations (Add, Sub, Mul, Div)
-macro_rules! define_binary_tensor_op {
-    ($name:ident, $std_trait:ident, $simd_op:ty, $error_msg:literal) => {
-        pub struct $name<
-            E: SimdElement,
-            const R: usize,
-            T1: TensorBacking<R, Elem = E>,
-            T2: TensorBacking<R, Elem = E>,
-        > {
-            lhs: T1,
-            rhs: T2,
-            _marker: std::marker::PhantomData<E>,
-        }
-
-        impl<E, const R: usize, T1, T2> $name<E, R, T1, T2>
-        where
-            E: SimdElement,
-            T1: TensorBacking<R, Elem = E>,
-            T2: TensorBacking<R, Elem = E>,
-        {
-            pub fn new(lhs: T1, rhs: T2) -> Self {
-                Self {
-                    lhs,
-                    rhs,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-        }
-
-        impl<E, const R: usize, T1, T2> crate::LazyBacking for $name<E, R, T1, T2>
-        where
-            E: SimdElement + $std_trait<Output = E> + Default,
-            $simd_op: SimdBinaryOp<E>,
-            T1: TensorBacking<R, Elem = E>,
-            T2: TensorBacking<R, Elem = E>,
-        {
-            type Elem = E;
-
+// f16 binary ops: f16 has no native pulp SIMD, so `f16::Simd<S> = F16Scalar`
+// (single-lane wrapper). Each op forwards through f32 for math correctness.
+macro_rules! impl_f16_binary_op {
+    ($op:ty, $f:expr) => {
+        impl SimdBinaryOp<half::f16> for $op {
             #[inline(always)]
-            fn eval_scalar(&self, idx: usize) -> E {
-                <$simd_op>::apply_scalar(self.lhs.eval_scalar(idx), self.rhs.eval_scalar(idx))
+            fn apply_simd_vec<S: Simd>(
+                _simd: S,
+                a: crate::F16Scalar,
+                b: crate::F16Scalar,
+            ) -> crate::F16Scalar {
+                let f: fn(half::f16, half::f16) -> half::f16 = $f;
+                crate::F16Scalar(f(a.0, b.0))
             }
 
             #[inline(always)]
-            fn eval_simd<S: Simd>(&self, simd: S, base_idx: usize) -> E::Simd<S> {
-                <$simd_op>::apply_simd_vec(
-                    simd,
-                    self.lhs.eval_simd(simd, base_idx),
-                    self.rhs.eval_simd(simd, base_idx),
-                )
-            }
-        }
-
-        impl<E, const R: usize, T1, T2> TensorBacking<R> for $name<E, R, T1, T2>
-        where
-            E: SimdElement + $std_trait<Output = E> + Default,
-            $simd_op: SimdBinaryOp<E>,
-            T1: TensorBacking<R, Elem = E>,
-            T2: TensorBacking<R, Elem = E>,
-        {
-            fn layout(&self) -> Layout {
-                Layout::contiguous(self.lhs.layout().shape())
-            }
-
-            fn to_concrete(&self) -> ConcreteTensor<E, R> {
-                let shape: [usize; R] = self
-                    .lhs
-                    .layout()
-                    .shape()
-                    .try_into()
-                    .expect("Shape length mismatch");
-                materialize_expr(self, shape)
+            fn apply_scalar(a: half::f16, b: half::f16) -> half::f16 {
+                let f: fn(half::f16, half::f16) -> half::f16 = $f;
+                f(a, b)
             }
         }
     };
 }
 
+impl_f16_binary_op!(AddOp, |a: half::f16, b: half::f16| a + b);
+impl_f16_binary_op!(SubOp, |a: half::f16, b: half::f16| a - b);
+impl_f16_binary_op!(MulOp, |a: half::f16, b: half::f16| a * b);
+impl_f16_binary_op!(DivOp, |a: half::f16, b: half::f16| half::f16::from_f32(
+    a.to_f32() / b.to_f32()
+));
+impl_f16_binary_op!(RemOp, |a: half::f16, b: half::f16| half::f16::from_f32(
+    a.to_f32() % b.to_f32()
+));
+
 // Binary tensor operations
-define_binary_tensor_op!(Add, StdAdd, AddOp, "Tensor rank mismatch in Add");
-define_binary_tensor_op!(Sub, StdSub, SubOp, "Tensor rank mismatch in Sub");
-define_binary_tensor_op!(Mul, StdMul, MulOp, "Tensor rank mismatch in Mul");
-define_binary_tensor_op!(Div, StdDiv, DivOp, "Tensor rank mismatch in Div");
-define_binary_tensor_op!(Rem, StdRem, RemOp, "Tensor rank mismatch in Rem");
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{LazyBacking, TensorBacking};
-
-    #[test]
-    fn test_add_expr() {
-        let a = ConcreteTensor::<f32, 1>::from_slice([4], &[1.0, 2.0, 3.0, 4.0]);
-        let b = ConcreteTensor::<f32, 1>::from_slice([4], &[10.0, 20.0, 30.0, 40.0]);
-
-        let add_expr: Add<f32, 1, _, _> = Add::new(&a, &b);
-
-        // Test layout methods
-        assert_eq!(add_expr.layout().num_elements(), 4);
-        assert_eq!(add_expr.layout().shape(), &[4]);
-        assert!(add_expr.layout().is_contiguous());
-
-        // Test scalar evaluation
-        assert_eq!(add_expr.eval_scalar(0), 11.0);
-        assert_eq!(add_expr.eval_scalar(1), 22.0);
-        assert_eq!(add_expr.eval_scalar(3), 44.0);
-
-        // Test materialization
-        let result = add_expr.to_concrete();
-        assert_eq!(result.get([0]), 11.0);
-        assert_eq!(result.get([3]), 44.0);
-    }
-
-    #[test]
-    fn test_mul_expr() {
-        let a = ConcreteTensor::<f32, 1>::from_slice([4], &[1.0, 2.0, 3.0, 4.0]);
-        let b = ConcreteTensor::<f32, 1>::from_slice([4], &[2.0, 3.0, 4.0, 5.0]);
-
-        let mul_expr: Mul<f32, 1, _, _> = Mul::new(&a, &b);
-
-        assert_eq!(mul_expr.eval_scalar(0), 2.0);
-        assert_eq!(mul_expr.eval_scalar(1), 6.0);
-        assert_eq!(mul_expr.eval_scalar(2), 12.0);
-        assert_eq!(mul_expr.eval_scalar(3), 20.0);
-    }
-
-    #[test]
-    fn test_fused_expr_mul_add() {
-        let x = ConcreteTensor::<f32, 1>::from_slice([4], &[1.0, 2.0, 3.0, 4.0]);
-        let y = ConcreteTensor::<f32, 1>::from_slice([4], &[2.0, 2.0, 2.0, 2.0]);
-        let z = ConcreteTensor::<f32, 1>::from_slice([4], &[10.0, 10.0, 10.0, 10.0]);
-
-        // Create fused expression: x * y + z
-        let mul_expr: Mul<f32, 1, _, _> = Mul::new(&x, &y);
-        let add_expr: Add<f32, 1, _, _> = Add::new(mul_expr, &z);
-
-        // Verify the fused expression evaluates correctly
-        assert_eq!(add_expr.eval_scalar(0), 12.0); // 1*2 + 10
-        assert_eq!(add_expr.eval_scalar(1), 14.0); // 2*2 + 10
-        assert_eq!(add_expr.eval_scalar(2), 16.0); // 3*2 + 10
-        assert_eq!(add_expr.eval_scalar(3), 18.0); // 4*2 + 10
-
-        // Materialize and verify
-        let result = add_expr.to_concrete();
-        assert_eq!(result.get([0]), 12.0);
-        assert_eq!(result.get([3]), 18.0);
-    }
-
-    #[test]
-    fn test_sub_div_expr() {
-        let a = ConcreteTensor::<f32, 1>::from_slice([3], &[10.0, 20.0, 30.0]);
-        let b = ConcreteTensor::<f32, 1>::from_slice([3], &[2.0, 4.0, 5.0]);
-
-        let sub_expr: Sub<f32, 1, _, _> = Sub::new(&a, &b);
-        assert_eq!(sub_expr.eval_scalar(0), 8.0);
-        assert_eq!(sub_expr.eval_scalar(1), 16.0);
-        assert_eq!(sub_expr.eval_scalar(2), 25.0);
-
-        let div_expr: Div<f32, 1, _, _> = Div::new(&a, &b);
-        assert_eq!(div_expr.eval_scalar(0), 5.0);
-        assert_eq!(div_expr.eval_scalar(1), 5.0);
-        assert_eq!(div_expr.eval_scalar(2), 6.0);
-    }
-
-    #[test]
-    fn test_rem_expr() {
-        let a = ConcreteTensor::<u32, 1>::from_slice([4], &[10, 17, 25, 100]);
-        let b = ConcreteTensor::<u32, 1>::from_slice([4], &[3, 5, 7, 30]);
-
-        let rem_expr: Rem<u32, 1, _, _> = Rem::new(&a, &b);
-
-        // Test scalar evaluation
-        assert_eq!(rem_expr.eval_scalar(0), 1); // 10 % 3 = 1
-        assert_eq!(rem_expr.eval_scalar(1), 2); // 17 % 5 = 2
-        assert_eq!(rem_expr.eval_scalar(2), 4); // 25 % 7 = 4
-        assert_eq!(rem_expr.eval_scalar(3), 10); // 100 % 30 = 10
-
-        // Test materialization
-        let result = rem_expr.to_concrete();
-        assert_eq!(result.get([0]), 1);
-        assert_eq!(result.get([1]), 2);
-        assert_eq!(result.get([2]), 4);
-        assert_eq!(result.get([3]), 10);
-    }
-}
+define_tensor_op!(@binary Add, AddOp, std_trait = StdAdd);
+define_tensor_op!(@binary Sub, SubOp, std_trait = StdSub);
+define_tensor_op!(@binary Mul, MulOp, std_trait = StdMul);
+define_tensor_op!(@binary Div, DivOp, std_trait = StdDiv);
+define_tensor_op!(@binary Rem, RemOp, std_trait = StdRem);

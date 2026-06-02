@@ -17,6 +17,7 @@ mod reductions;
 mod rope;
 mod shape;
 mod to_vec;
+mod upsample;
 mod where_cond;
 
 pub use flash_attention::MaskKind;

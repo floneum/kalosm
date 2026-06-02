@@ -51,6 +51,7 @@ impl BertSelfAttention {
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Tensor<3, f32> {
         let _enter = self.span.enter();
+        let scale = 1.0 / (self.attention_head_size as f32).sqrt();
         let query_layer = self.query.forward(hidden_states);
         let key_layer = self.key.forward(hidden_states);
         let value_layer = self.value.forward(hidden_states);
@@ -59,12 +60,11 @@ impl BertSelfAttention {
         let key_layer = self.transpose_for_scores(&key_layer);
         let value_layer = self.transpose_for_scores(&value_layer);
 
-        let attention_scores = query_layer.mat_mul(&key_layer.t());
-        let mut attention_scores =
-            attention_scores.div_scalar((self.attention_head_size as f32).sqrt());
+        let context_layer = if let Some(attention_mask) = attention_mask {
+            let attention_scores = query_layer.mat_mul(&key_layer.t());
+            let mut attention_scores = attention_scores.mul_scalar(scale);
 
-        // If there is an attention mask, filter the attention scores by that mask
-        if let Some(attention_mask) = attention_mask {
+            // If there is an attention mask, filter the attention scores by that mask
             // The attention mask is a tensor of shape (bsize, seq_len)
             // the attention scores are a tensor of shape (bsize, _, seq_len, seq_len)
             // We expand the attention mask to (bsize, 1, 1, seq_len)
@@ -79,13 +79,13 @@ impl BertSelfAttention {
             let device = attention_scores.device();
             let on_false = Tensor::splat(&device, FALSE_MIN, shape);
             attention_scores = mask.where_cond(&attention_scores, &on_false);
-        }
 
-        let attention_probs = {
             let _enter_sm = self.span_softmax.enter();
-            attention_scores.softmax_last_dim::<3>()
+            let attention_probs = attention_scores.softmax_last_dim::<3>();
+            attention_probs.mat_mul(&value_layer)
+        } else {
+            query_layer.flash_attention(&key_layer, &value_layer, scale, None)
         };
-        let context_layer = attention_probs.mat_mul(&value_layer);
         let context_layer = context_layer.transpose(1, 2).to_concrete();
         context_layer.flatten_last_n::<1, _>()
     }

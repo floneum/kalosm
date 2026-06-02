@@ -8,6 +8,6 @@ repository = "https://github.com/floneum/floneum"
 authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 
 [dependencies]
-futures-util = "0.3.28"
+futures-util = { workspace = true }
 pin-project-lite = "0.2"
-futures-channel = "0.3.30"
+futures-channel = { workspace = true }

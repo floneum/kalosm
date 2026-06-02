@@ -1,6 +1,9 @@
 //! Embedding layer implementation.
 
-use crate::{CastTensor, CastTo, DataType, Device, QMatrix, SimdElement, Tensor, VarBuilder};
+use crate::{
+    CastTensor, CastTo, DataType, Device, Fusion, QMatrix, SimdElement, Tensor, VarBuilder,
+};
+use fusor_gguf::GgmlType;
 
 /// Embedding layer for token/position embeddings.
 ///
@@ -9,7 +12,7 @@ use crate::{CastTensor, CastTo, DataType, Device, QMatrix, SimdElement, Tensor, 
 #[derive(Clone)]
 pub struct Embedding<T: SimdElement> {
     embeddings_quantized: Option<QMatrix>,
-    embeddings: Tensor<2, T>,
+    embeddings: Option<Tensor<2, T>>,
     num_embeddings: usize,
     embedding_dim: usize,
 }
@@ -23,7 +26,7 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
 
         Self {
             embeddings_quantized: None,
-            embeddings,
+            embeddings: Some(embeddings),
             num_embeddings,
             embedding_dim,
         }
@@ -42,8 +45,9 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
         indices: &Tensor<N, u32, B>,
     ) -> Tensor<M, T>
     where
-        B: fusor_cpu::TensorBacking<N, Elem = u32>,
-        fusor_core::Tensor<N, u32>: fusor_core::NextRank<M, u32>,
+        B: Fusion<N, u32>,
+        crate::gpu::Tensor<N, u32>: crate::gpu::NextRank<M, u32>,
+        f32: CastTensor<T> + CastTo<T>,
     {
         // Calculate final output dimensions: input_dims + [embedding_dim]
         let input_shape = indices.shape();
@@ -55,7 +59,39 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
             }
         });
 
-        match (indices, &self.embeddings) {
+        if self.embeddings.is_none()
+            && let Some(quantized) = &self.embeddings_quantized
+            && !matches!(quantized.ggml_type(), GgmlType::F16 | GgmlType::F32)
+        {
+            return match (indices, quantized) {
+                (Tensor::Cpu(cpu_indices), quantized) if quantized.is_cpu() => {
+                    let dense: Tensor<2, f32> = quantized.dequantize();
+                    let dense: Tensor<2, T> = dense.cast();
+                    let Tensor::Cpu(cpu_embeddings) = dense else {
+                        unreachable!("CPU quantized embedding dequantized to a GPU tensor");
+                    };
+                    let indices_flat = cpu_indices.as_ref().flatten_all();
+                    let values = cpu_embeddings.as_ref().index_select(0, indices_flat);
+                    Tensor::Cpu(values.reshape(final_dims).to_concrete())
+                }
+                (Tensor::Gpu(gpu_indices), QMatrix::Gpu(gpu_embeddings)) => {
+                    let indices_flat = gpu_indices.flatten_all();
+                    let values =
+                        gpu_embeddings.index_select_rows_to(indices_flat.as_core(), T::DATA_TYPE);
+                    Tensor::Gpu(crate::GpuTensor::from_core(
+                        values.reshape(final_dims).cast::<T>(),
+                    ))
+                }
+                _ => panic!("Indices and embeddings must be on the same device"),
+            };
+        }
+
+        let embeddings = self
+            .embeddings
+            .as_ref()
+            .expect("dense embeddings unavailable for this embedding table");
+
+        match (indices, embeddings) {
             (Tensor::Cpu(cpu_indices), Tensor::Cpu(cpu_embeddings)) => {
                 // CPU path
                 let indices_flat = cpu_indices.as_ref().flatten_all();
@@ -74,7 +110,9 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
 
     /// Get the dequantized embedding table.
     pub fn embeddings(&self) -> &Tensor<2, T> {
-        &self.embeddings
+        self.embeddings
+            .as_ref()
+            .expect("dense embeddings unavailable for this embedding table")
     }
 
     /// Get the number of embeddings.
@@ -94,7 +132,7 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
     {
         Embedding {
             embeddings_quantized: self.embeddings_quantized,
-            embeddings: self.embeddings.cast(),
+            embeddings: self.embeddings.map(|embeddings| embeddings.cast()),
             num_embeddings: self.num_embeddings,
             embedding_dim: self.embedding_dim,
         }
@@ -105,10 +143,18 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
 impl Embedding<f32> {
     /// Create a new embedding layer with the given quantized embedding table.
     pub fn new(embeddings_quantized: QMatrix) -> Self {
-        let embeddings: Tensor<2, f32> = embeddings_quantized.dequantize();
-        let shape = embeddings.shape();
+        let shape = embeddings_quantized.shape();
         let num_embeddings = shape[0];
         let embedding_dim = shape[1];
+        let embeddings = if embeddings_quantized.is_cpu()
+            || matches!(
+                embeddings_quantized.ggml_type(),
+                GgmlType::F16 | GgmlType::F32
+            ) {
+            Some(embeddings_quantized.dequantize())
+        } else {
+            None
+        };
 
         Self {
             embeddings_quantized: Some(embeddings_quantized),
@@ -153,87 +199,5 @@ impl Embedding<f32> {
         self.embeddings_quantized
             .as_ref()
             .expect("No quantized embeddings available")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_embedding_1d() {
-        // Create embedding table: (3, 2) - 3 embeddings, each of dimension 2
-        let emb_data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let embeddings: Tensor<2, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([3, 2], &emb_data));
-
-        let embedding_layer = Embedding::new_from_tensor(embeddings);
-
-        // Input: indices [0, 2, 1]
-        let indices_data = [0u32, 2, 1];
-        let indices: Tensor<1, u32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &indices_data));
-
-        let result: Tensor<2, f32> = embedding_layer.forward(&indices);
-
-        assert_eq!(result.shape(), [3, 2]);
-
-        let output = result.as_slice().await.unwrap();
-
-        // index 0 -> [1, 2]
-        assert_eq!(output[[0, 0]], 1.0);
-        assert_eq!(output[[0, 1]], 2.0);
-        // index 2 -> [5, 6]
-        assert_eq!(output[[1, 0]], 5.0);
-        assert_eq!(output[[1, 1]], 6.0);
-        // index 1 -> [3, 4]
-        assert_eq!(output[[2, 0]], 3.0);
-        assert_eq!(output[[2, 1]], 4.0);
-    }
-
-    #[tokio::test]
-    async fn test_embedding_2d() {
-        // Create embedding table: (3, 2) - 3 embeddings, each of dimension 2
-        let emb_data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let embeddings: Tensor<2, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([3, 2], &emb_data));
-
-        let embedding_layer = Embedding::new_from_tensor(embeddings);
-
-        // Input: 2D indices [[0, 1], [2, 0]]
-        let indices_data = [0u32, 1, 2, 0];
-        let indices: Tensor<2, u32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 2], &indices_data));
-
-        let result: Tensor<3, f32> = embedding_layer.forward(&indices);
-
-        assert_eq!(result.shape(), [2, 2, 2]);
-
-        let output = result.as_slice().await.unwrap();
-
-        // batch 0, seq 0 -> index 0 -> [1, 2]
-        assert_eq!(output[[0, 0, 0]], 1.0);
-        assert_eq!(output[[0, 0, 1]], 2.0);
-        // batch 0, seq 1 -> index 1 -> [3, 4]
-        assert_eq!(output[[0, 1, 0]], 3.0);
-        assert_eq!(output[[0, 1, 1]], 4.0);
-        // batch 1, seq 0 -> index 2 -> [5, 6]
-        assert_eq!(output[[1, 0, 0]], 5.0);
-        assert_eq!(output[[1, 0, 1]], 6.0);
-        // batch 1, seq 1 -> index 0 -> [1, 2]
-        assert_eq!(output[[1, 1, 0]], 1.0);
-        assert_eq!(output[[1, 1, 1]], 2.0);
-    }
-
-    #[tokio::test]
-    async fn test_embedding_properties() {
-        let emb_data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let embeddings: Tensor<2, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &emb_data));
-
-        let embedding_layer = Embedding::new_from_tensor(embeddings);
-
-        assert_eq!(embedding_layer.num_embeddings(), 2);
-        assert_eq!(embedding_layer.embedding_dim(), 3);
     }
 }

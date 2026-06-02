@@ -44,11 +44,11 @@ impl CreateChatSession for BoxedChatModel {
 impl ChatModel for BoxedChatModel {
     fn add_messages_with_callback<'a>(
         &'a self,
-        session: &'a mut Self::ChatSession,
-        messages: &[ChatMessage],
+        session: Self::ChatSession,
+        messages: &'a [ChatMessage],
         sampler: crate::GenerationParameters,
         on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
-    ) -> impl Future<Output = Result<(), Self::Error>> + WasmNotSend + 'a {
+    ) -> impl Future<Output = Result<Self::ChatSession, Self::Error>> + WasmNotSend + 'a {
         self.model
             .add_messages_with_callback_boxed(session, messages, sampler, Box::new(on_token))
     }
@@ -95,11 +95,11 @@ impl<T> CreateChatSession for BoxedStructuredChatModel<T> {
 impl<T> ChatModel for BoxedStructuredChatModel<T> {
     fn add_messages_with_callback<'a>(
         &'a self,
-        session: &'a mut Self::ChatSession,
-        messages: &[ChatMessage],
+        session: Self::ChatSession,
+        messages: &'a [ChatMessage],
         sampler: crate::GenerationParameters,
         on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
-    ) -> impl Future<Output = Result<(), Self::Error>> + WasmNotSend + 'a {
+    ) -> impl Future<Output = Result<Self::ChatSession, Self::Error>> + WasmNotSend + 'a {
         self.model
             .add_messages_with_callback_boxed(session, messages, sampler, Box::new(on_token))
     }
@@ -110,12 +110,15 @@ impl<T: 'static> StructuredChatModel<BoxedChatConstraintsForType<T>>
 {
     fn add_message_with_callback_and_constraints<'a>(
         &'a self,
-        session: &'a mut Self::ChatSession,
-        messages: &[ChatMessage],
+        session: Self::ChatSession,
+        messages: &'a [ChatMessage],
         sampler: crate::GenerationParameters,
         constraints: BoxedChatConstraintsForType<T>,
         on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
-    ) -> impl Future<Output = Result<T, Self::Error>> + WasmNotSend + 'a {
+    ) -> impl Future<Output = Result<(Self::ChatSession, T), Self::Error>> + WasmNotSend + 'a
+    where
+        T: 'a,
+    {
         self.model.add_message_with_callback_and_constraints_boxed(
             session,
             messages,
@@ -207,7 +210,7 @@ trait DynChatSession {
         &self,
     ) -> Result<BoxedChatSession, Box<dyn std::error::Error + Send + Sync + 'static>>;
 
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+    fn into_any_box(self: Box<Self>) -> Box<dyn std::any::Any + Send + Sync>;
 
     fn clone_(&self) -> BoxedChatSession;
 }
@@ -227,7 +230,7 @@ impl<S: ChatSession<Error: Error> + Send + Sync + Clone + 'static> DynChatSessio
         Ok(BoxedChatSession { session })
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+    fn into_any_box(self: Box<Self>) -> Box<dyn std::any::Any + Send + Sync> {
         self
     }
 
@@ -241,11 +244,11 @@ impl<S: ChatSession<Error: Error> + Send + Sync + Clone + 'static> DynChatSessio
 trait DynChatModel: DynCreateChatSession {
     fn add_messages_with_callback_boxed<'a>(
         &'a self,
-        session: &'a mut BoxedChatSession,
-        messages: &[super::ChatMessage],
+        session: BoxedChatSession,
+        messages: &'a [super::ChatMessage],
         sampler: crate::GenerationParameters,
         on_token: BoxedTokenClosure,
-    ) -> BoxedMaybeFuture<'a>;
+    ) -> BoxedMaybeFuture<'a, BoxedChatSession>;
 }
 
 impl<S> DynChatModel for S
@@ -261,17 +264,19 @@ where
 {
     fn add_messages_with_callback_boxed<'a>(
         &'a self,
-        session: &'a mut BoxedChatSession,
-        messages: &[super::ChatMessage],
+        session: BoxedChatSession,
+        messages: &'a [super::ChatMessage],
         sampler: crate::GenerationParameters,
         mut on_token: BoxedTokenClosure,
-    ) -> BoxedMaybeFuture<'a> {
-        let session = session.session.as_any_mut();
-
-        let Some(session) = session.downcast_mut::<S::ChatSession>() else {
-            return Box::pin(async move {
-                Err(Box::new(MismatchedSessionType) as Box<dyn Error + Send + Sync>)
-            });
+    ) -> BoxedMaybeFuture<'a, BoxedChatSession> {
+        let any = session.session.into_any_box();
+        let session = match any.downcast::<S::ChatSession>() {
+            Ok(session) => *session,
+            Err(_) => {
+                return Box::pin(async move {
+                    Err(Box::new(MismatchedSessionType) as Box<dyn Error + Send + Sync>)
+                });
+            }
         };
         let on_token = move |token: String| {
             if let Err(err) = on_token(token) {
@@ -281,11 +286,15 @@ where
         };
         let future = self.add_messages_with_callback(session, messages, sampler, on_token);
         // Double box prevents a rust compiler error with lifetimes. See https://github.com/rust-lang/rust/issues/102211
-        let future: Pin<Box<dyn Future<Output = Result<(), _>> + Send>> = Box::pin(future);
+        let future: Pin<Box<dyn Future<Output = Result<S::ChatSession, _>> + Send>> =
+            Box::pin(future);
         Box::pin(async move {
-            future
+            let updated = future
                 .await
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+            Ok(BoxedChatSession {
+                session: Box::new(updated),
+            })
         })
     }
 }
@@ -302,12 +311,12 @@ impl<T> ModelConstraints for BoxedChatConstraintsForType<T> {
 trait DynStructuredChatModel<T>: DynChatModel {
     fn add_message_with_callback_and_constraints_boxed<'a>(
         &'a self,
-        session: &'a mut BoxedChatSession,
-        messages: &[ChatMessage],
+        session: BoxedChatSession,
+        messages: &'a [ChatMessage],
         sampler: crate::GenerationParameters,
         constraints: BoxedChatConstraintsForType<T>,
         on_token: BoxedTokenClosure,
-    ) -> BoxedMaybeFuture<'a, T>;
+    ) -> BoxedMaybeFuture<'a, (BoxedChatSession, T)>;
 }
 
 impl<S, T> DynStructuredChatModel<T> for S
@@ -325,20 +334,22 @@ where
 {
     fn add_message_with_callback_and_constraints_boxed<'a>(
         &'a self,
-        session: &'a mut BoxedChatSession,
-        messages: &[ChatMessage],
+        session: BoxedChatSession,
+        messages: &'a [ChatMessage],
         sampler: crate::GenerationParameters,
         _: BoxedChatConstraintsForType<T>,
         mut on_token: BoxedTokenClosure,
-    ) -> BoxedMaybeFuture<'a, T> {
+    ) -> BoxedMaybeFuture<'a, (BoxedChatSession, T)> {
         let constraints =
             <S as CreateDefaultChatConstraintsForType<T>>::create_default_constraints();
-        let session = session.session.as_any_mut();
-
-        let Some(session) = session.downcast_mut::<S::ChatSession>() else {
-            return Box::pin(async move {
-                Err(Box::new(MismatchedSessionType) as Box<dyn Error + Send + Sync>)
-            });
+        let any = session.session.into_any_box();
+        let session = match any.downcast::<S::ChatSession>() {
+            Ok(session) => *session,
+            Err(_) => {
+                return Box::pin(async move {
+                    Err(Box::new(MismatchedSessionType) as Box<dyn Error + Send + Sync>)
+                });
+            }
         };
 
         let on_token = move |token: String| {
@@ -356,11 +367,19 @@ where
             on_token,
         );
         // Double box prevents a rust compiler error with lifetimes. See https://github.com/rust-lang/rust/issues/102211
-        let future: Pin<Box<dyn Future<Output = Result<T, _>> + Send>> = Box::pin(future);
+        #[allow(clippy::type_complexity)]
+        let future: Pin<Box<dyn Future<Output = Result<(S::ChatSession, T), _>> + Send>> =
+            Box::pin(future);
         Box::pin(async move {
-            future
+            let (updated, value) = future
                 .await
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+            Ok((
+                BoxedChatSession {
+                    session: Box::new(updated),
+                },
+                value,
+            ))
         })
     }
 }

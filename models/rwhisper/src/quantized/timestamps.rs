@@ -1,4 +1,4 @@
-// Based on https://github.com/nicksenger/candle/tree/feat/whisper-dtw with some optimizations and refactoring
+// Based on an upstream Whisper DTW implementation with optimizations and refactoring.
 // https://rtavenar.github.io/blog/dtw.html is a good resource for understanding the dtw algorithm
 
 use fusor::Tensor;
@@ -24,7 +24,7 @@ pub(super) async fn extract_timestamps(
             tensors_to_stack.push(squeezed.to_concrete());
         }
     }
-    let stacked = Tensor::stack(tensors_to_stack.into_iter(), 0);
+    let stacked = Tensor::stack(tensors_to_stack, 0);
     let permuted = stacked.permute([1, 0, 2, 3]);
     let weights = permuted.narrow(3, 0, n_frames.min(N_FRAMES) / 2);
 

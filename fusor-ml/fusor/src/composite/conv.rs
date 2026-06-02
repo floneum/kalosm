@@ -1,29 +1,42 @@
 //! Convolution operations that work on both CPU and GPU backends.
 
+use crate::gpu::{DataType, FloatDataType};
 use crate::{ConcreteTensor, FloatOps, MatmulImpl, SimdElement, Tensor};
-use fusor_core::{DataType, FloatDataType};
 use fusor_types::SlidingWindow;
 
 impl<const R: usize, D> Tensor<R, D>
 where
     D: SimdElement + DataType + FloatDataType + FloatOps + Default,
 {
-    /// Pad a specific axis with zeros on both sides.
-    fn pad_axis(&self, axis: usize, padding: usize) -> Self {
-        if padding == 0 {
+    /// Pad a specific axis with zeros on both sides (symmetric).
+    ///
+    /// Equivalent to `pad_with_zeros(axis, padding, padding)`.
+    pub fn pad_axis(&self, axis: usize, padding: usize) -> Self {
+        self.pad_with_zeros(axis, padding, padding)
+    }
+
+    /// Pad a specific axis with zeros on left and right sides separately.
+    pub fn pad_with_zeros(&self, axis: usize, left: usize, right: usize) -> Self {
+        if left == 0 && right == 0 {
             return self.clone();
         }
 
         let shape = self.shape();
+        let mut parts: Vec<Self> = Vec::new();
 
-        // Create left padding shape
-        let mut pad_shape = shape;
-        pad_shape[axis] = padding;
-        let pad_left = Self::zeros(&self.device(), pad_shape);
-        let pad_right = Self::zeros(&self.device(), pad_shape);
+        if left > 0 {
+            let mut pad_shape = shape;
+            pad_shape[axis] = left;
+            parts.push(Self::zeros(&self.device(), pad_shape));
+        }
+        parts.push(self.clone());
+        if right > 0 {
+            let mut pad_shape = shape;
+            pad_shape[axis] = right;
+            parts.push(Self::zeros(&self.device(), pad_shape));
+        }
 
-        // Concatenate: [pad_left, self, pad_right] along the axis
-        super::cat([pad_left, self.clone(), pad_right], axis)
+        super::cat(parts, axis)
     }
 }
 
@@ -71,7 +84,7 @@ where
     /// Unified convolution method that handles different tensor formats:
     /// - Multi-channel convolution (R = 2 + DIFF): (batch, channels, ...spatial) format
     ///
-    /// For Conv1d: R=3, DIFF=1 gives (batch, in_channels, length) -> (batch, out_channels, out_length)
+    /// For 1D conv: R=3, DIFF=1 gives (batch, in_channels, length) -> (batch, out_channels, out_length)
     pub fn conv<const WEIGHT_RANK: usize, const DIFF: usize, const R2: usize>(
         &self,
         weight: &Tensor<WEIGHT_RANK, D, ConcreteTensor<D, WEIGHT_RANK>>,
@@ -80,11 +93,11 @@ where
         strides: [usize; DIFF],
     ) -> Self
     where
-        ConcreteTensor<D, R>: fusor_cpu::LargerRank<R2, DIFF, D>,
-        fusor_core::Tensor<R, D>: fusor_core::LargerRank<DIFF, R2, D>,
-        crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
-        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
+        ConcreteTensor<D, R>: crate::cpu::LargerRank<R2, DIFF, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::LargerRank<DIFF, R2, D>,
+        crate::MulOp: crate::cpu::SimdBinaryOp<D>,
+        crate::AddOp: crate::cpu::SimdBinaryOp<D>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<D>,
     {
         // Extract dimensions
         let input_shape = self.shape();
@@ -197,229 +210,130 @@ where
             output_final.to_concrete()
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    /// Grouped convolution lowered to a single sliding_window_view + batched matmul.
+    /// Weight is in PyTorch grouped layout: `(out_channels, in_channels / groups, ...kernel)`.
+    pub fn grouped_conv<const WEIGHT_RANK: usize, const DIFF: usize, const R2: usize>(
+        &self,
+        weight: &Tensor<WEIGHT_RANK, D, ConcreteTensor<D, WEIGHT_RANK>>,
+        bias: Option<&Tensor<1, D, ConcreteTensor<D, 1>>>,
+        padding: [usize; DIFF],
+        strides: [usize; DIFF],
+        groups: usize,
+    ) -> Self
+    where
+        ConcreteTensor<D, R>: crate::cpu::LargerRank<R2, DIFF, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::LargerRank<DIFF, R2, D>,
+        crate::MulOp: crate::cpu::SimdBinaryOp<D>,
+        crate::AddOp: crate::cpu::SimdBinaryOp<D>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<D>,
+    {
+        let input_shape = self.shape();
+        let weight_shape = weight.shape();
+        let spatial_start = R - DIFF;
 
-    #[tokio::test]
-    async fn test_conv_1d_cpu() {
-        // Input: (batch=1, in_channels=1, length=5)
-        let input_data = [1.0f32, 2.0, 3.0, 4.0, 5.0];
-        let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 5], &input_data));
+        assert_eq!(R, 2 + DIFF);
+        let batch = input_shape[0];
+        let in_channels = input_shape[1];
+        let out_channels = weight_shape[0];
+        assert_eq!(in_channels % groups, 0);
+        assert_eq!(out_channels % groups, 0);
+        let in_ch_per_group = in_channels / groups;
+        let out_ch_per_group = out_channels / groups;
+        assert_eq!(weight_shape[1], in_ch_per_group);
 
-        // Weight: (out_channels=1, in_channels=1, kernel_size=3)
-        let weight_data = [0.2f32, 0.5, 0.3];
-        let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &weight_data));
+        let padded = if padding.iter().any(|&p| p > 0) {
+            let mut result = self.clone();
+            for (i, padding) in padding.iter().copied().enumerate() {
+                let axis = R - DIFF + i;
+                if padding > 0 {
+                    result = result.pad_axis(axis, padding);
+                }
+            }
+            result
+        } else {
+            self.clone()
+        };
 
-        let bias_val = 0.1f32;
-        let bias: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1], &[bias_val]));
-
-        // Perform convolution with stride 1 and no padding
-        let output = input.conv(&weight, Some(&bias), [0], [1]);
-
-        // Expected values for the 1D convolution
-        let input_flat = [1.0f32, 2.0, 3.0, 4.0, 5.0];
-        let weight_flat = [0.2f32, 0.5, 0.3];
-        let expected: Vec<f32> = input_flat
-            .windows(weight_flat.len())
-            .map(|window| {
-                window
-                    .iter()
-                    .zip(weight_flat.iter())
-                    .map(|(x, w)| x * w)
-                    .sum::<f32>()
-                    + bias_val
-            })
-            .collect();
-
-        let output_data = output.as_slice().await.unwrap();
-        assert_eq!(output_data.shape(), &[1, 1, expected.len()]);
-        for i in 0..expected.len() {
-            let val = output_data[[0, 0, i]];
-            let expected_val = expected[i];
-            assert!(
-                (val - expected_val).abs() < 1e-5,
-                "Mismatch at index {}: got {}, expected {}",
-                i,
-                val,
-                expected_val
-            );
+        let mut out_spatial_size = 1;
+        for i in 0..DIFF {
+            let padded_len = input_shape[spatial_start + i] + 2 * padding[i];
+            let kernel_len = weight_shape[spatial_start + i];
+            let out_len = (padded_len - kernel_len) / strides[i] + 1;
+            out_spatial_size *= out_len;
         }
-    }
 
-    #[tokio::test]
-    async fn test_conv_1d_strided_cpu() {
-        // Input: (batch=1, in_channels=1, length=5)
-        let input_data = [1.0f32, 2.0, 3.0, 4.0, 5.0];
-        let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 5], &input_data));
+        let windows: [SlidingWindow; DIFF] = std::array::from_fn(|i| {
+            let axis = R - DIFF + i;
+            let kernel_size = weight_shape[spatial_start + i];
+            SlidingWindow::new(axis, kernel_size, strides[i])
+        });
+        let windows_tensor: Tensor<R2, D, _> = padded.sliding_window_view(windows);
 
-        // Weight: (out_channels=1, in_channels=1, kernel_size=3)
-        let weight_data = [0.2f32, 0.5, 0.3];
-        let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &weight_data));
+        let kernel_size: usize = weight_shape[spatial_start..].iter().product();
 
-        let bias_val = 0.1f32;
-        let bias: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1], &[bias_val]));
-        let stride = 2;
+        // Permute and flatten exactly like the groups=1 path. Materialize
+        // before the rank-3 split so the channel-dim split is over actual
+        // contiguous memory rather than a permuted strided view.
+        let windows_transposed = windows_tensor.permute(Self::window_permutation::<R2, DIFF>());
+        let windows_flat: Tensor<2, D, _> = windows_transposed
+            .reshape([batch * out_spatial_size, in_channels * kernel_size])
+            .to_concrete();
 
-        let output = input.conv(&weight, Some(&bias), [0], [stride]);
+        // Split inner dim into (groups, in_ch_per_group * kernel_size).
+        let windows_3d: Tensor<3, D, _> = windows_flat
+            .reshape([
+                batch * out_spatial_size,
+                groups,
+                in_ch_per_group * kernel_size,
+            ])
+            .to_concrete();
+        let windows_grouped = windows_3d.transpose(0, 1).to_concrete();
+        // (groups, batch * out_spatial, in_ch_per_group * kernel_size)
 
-        let input_flat = [1.0f32, 2.0, 3.0, 4.0, 5.0];
-        let weight_flat = [0.2f32, 0.5, 0.3];
-        let expected: Vec<f32> = input_flat
-            .windows(weight_flat.len())
-            .step_by(stride)
-            .map(|window| {
-                window
-                    .iter()
-                    .zip(weight_flat.iter())
-                    .map(|(x, w)| x * w)
-                    .sum::<f32>()
-                    + bias_val
-            })
-            .collect();
+        // Weight: (out_channels, ipg, ...kernel) -> (groups, opg, ipg * kernel_size)
+        let weight_grouped: Tensor<3, D, _> = weight
+            .reshape([groups, out_ch_per_group, in_ch_per_group * kernel_size])
+            .to_concrete();
+        let weight_grouped_t = weight_grouped.transpose(1, 2).to_concrete();
 
-        let output_data = output.as_slice().await.unwrap();
-        assert_eq!(output_data.shape(), &[1, 1, expected.len()]);
-        for i in 0..expected.len() {
-            let val = output_data[[0, 0, i]];
-            let expected_val = expected[i];
-            assert!(
-                (val - expected_val).abs() < 1e-5,
-                "Mismatch at index {}: got {}, expected {}",
-                i,
-                val,
-                expected_val
-            );
+        let output_grouped = windows_grouped.mat_mul(&weight_grouped_t).to_concrete();
+        // (groups, batch * out_spatial, out_ch_per_group)
+
+        let output_t = output_grouped.transpose(0, 1).to_concrete();
+        let output: Tensor<2, D, _> = output_t
+            .reshape([batch * out_spatial_size, out_channels])
+            .to_concrete();
+
+        let output_reshaped: Tensor<R, D, _> = output.reshape(std::array::from_fn(|axis| {
+            if axis == 0 {
+                batch
+            } else if axis <= DIFF {
+                let spatial_axis = spatial_start + axis - 1;
+                let padded_len = input_shape[spatial_axis] + 2 * padding[axis - 1];
+                let kernel_len = weight_shape[spatial_axis];
+                (padded_len - kernel_len) / strides[axis - 1] + 1
+            } else {
+                out_channels
+            }
+        }));
+        let output_transposed = output_reshaped.permute(Self::output_permutation::<DIFF>());
+
+        let mut output_shape = input_shape;
+        output_shape[1] = out_channels;
+        for i in 0..DIFF {
+            let padded_len = input_shape[spatial_start + i] + 2 * padding[i];
+            let kernel_len = weight_shape[spatial_start + i];
+            output_shape[spatial_start + i] = (padded_len - kernel_len) / strides[i] + 1;
         }
-    }
+        let output_final = output_transposed.reshape(output_shape);
 
-    #[tokio::test]
-    async fn test_conv_1d_multi_channel_bias_cpu() {
-        let input: Tensor<3, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
-            [1, 2, 4],
-            &[0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        ));
-        let weight: Tensor<3, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
-            [2, 2, 1],
-            &[0.0f32, 0.0, 0.0, 0.0],
-        ));
-        let bias: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2], &[0.5, -1.5]));
-
-        let output = input.conv(&weight, Some(&bias), [0], [1]);
-        let output_data = output.as_slice().await.unwrap();
-
-        assert_eq!(output_data.shape(), &[1, 2, 4]);
-        for index in 0..4 {
-            assert!((output_data[[0, 0, index]] - 0.5).abs() < 1e-6);
-            assert!((output_data[[0, 1, index]] + 1.5).abs() < 1e-6);
+        if let Some(bias) = bias {
+            let bias_reshaped = bias.reshape(Self::bias_broadcast_shape(out_channels));
+            let bias_broadcast: Tensor<R, D, _> = bias_reshaped.broadcast_as(output_shape);
+            output_final.add_(&bias_broadcast)
+        } else {
+            output_final.to_concrete()
         }
-    }
-
-    #[tokio::test]
-    async fn test_conv_1d_with_padding_cpu() {
-        // Input: (1, 1, 3)
-        let input_data = [1.0f32, 2.0, 3.0];
-        let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &input_data));
-
-        // Weight: (1, 1, 3)
-        let weight_data = [1.0f32, 1.0, 1.0];
-        let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &weight_data));
-
-        let output = input.conv(&weight, None, [1], [1]);
-
-        // With padding=1, input becomes [0, 1, 2, 3, 0]
-        // Output shape should be (1, 1, 3)
-        assert_eq!(output.shape(), [1, 1, 3]);
-
-        let result = output.as_slice().await.unwrap();
-
-        // Manual calculation:
-        // output[0] = 0*1 + 1*1 + 2*1 = 3
-        // output[1] = 1*1 + 2*1 + 3*1 = 6
-        // output[2] = 2*1 + 3*1 + 0*1 = 5
-
-        assert!((result[[0, 0, 0]] - 3.0).abs() < 1e-5);
-        assert!((result[[0, 0, 1]] - 6.0).abs() < 1e-5);
-        assert!((result[[0, 0, 2]] - 5.0).abs() < 1e-5);
-    }
-
-    #[tokio::test]
-    async fn test_conv_1d_multi_channel_cpu() {
-        // Input: (1, 2, 4) - 2 input channels
-        // Channel 0: [1, 2, 3, 4], Channel 1: [5, 6, 7, 8]
-        let input_data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 4], &input_data));
-
-        // Weight: (3, 2, 2) - 3 output channels, 2 input channels, kernel size 2
-        // out_ch 0: [[1, 0], [0, 1]]
-        // out_ch 1: [[0.5, 0.5], [0.5, 0.5]]
-        // out_ch 2: [[1, 1], [1, 1]]
-        let weight_data = [
-            1.0f32, 0.0, 0.0, 1.0, // out_channel 0
-            0.5, 0.5, 0.5, 0.5, // out_channel 1
-            1.0, 1.0, 1.0, 1.0, // out_channel 2
-        ];
-        let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([3, 2, 2], &weight_data));
-
-        let output = input.conv(&weight, None, [0], [1]);
-
-        // Output shape should be (1, 3, 3)
-        assert_eq!(output.shape(), [1, 3, 3]);
-
-        let result = output.as_slice().await.unwrap();
-
-        // For position 0: in_ch0 window [1,2], in_ch1 window [5,6]
-        //   out_ch 0 weights [[1,0], [0,1]]: 1*1 + 2*0 + 5*0 + 6*1 = 7
-        //   out_ch 1 weights [[0.5,0.5], [0.5,0.5]]: 1*0.5 + 2*0.5 + 5*0.5 + 6*0.5 = 7
-        //   out_ch 2 weights [[1,1], [1,1]]: 1*1 + 2*1 + 5*1 + 6*1 = 14
-
-        // Out channel 0
-        assert!((result[[0, 0, 0]] - 7.0).abs() < 1e-5);
-        assert!((result[[0, 0, 1]] - 9.0).abs() < 1e-5);
-        assert!((result[[0, 0, 2]] - 11.0).abs() < 1e-5);
-
-        // Out channel 1
-        assert!((result[[0, 1, 0]] - 7.0).abs() < 1e-5);
-        assert!((result[[0, 1, 1]] - 9.0).abs() < 1e-5);
-        assert!((result[[0, 1, 2]] - 11.0).abs() < 1e-5);
-
-        // Out channel 2
-        assert!((result[[0, 2, 0]] - 14.0).abs() < 1e-5);
-        assert!((result[[0, 2, 1]] - 18.0).abs() < 1e-5);
-        assert!((result[[0, 2, 2]] - 22.0).abs() < 1e-5);
-    }
-
-    #[tokio::test]
-    async fn test_conv_2d_cpu() {
-        // Input: (batch=1, in_channels=1, height=3, width=3)
-        let input: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
-            [1, 1, 3, 3],
-            &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
-        ));
-
-        // Weight: (out_channels=1, in_channels=1, kernel_h=2, kernel_w=2)
-        let weight: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
-            [1, 1, 2, 2],
-            &[1.0f32, 0.0, 0.0, 1.0],
-        ));
-
-        let output = input.conv(&weight, None, [0, 0], [1, 1]);
-        let result = output.as_slice().await.unwrap();
-
-        assert_eq!(result.shape(), &[1, 1, 2, 2]);
-        assert!((result[[0, 0, 0, 0]] - 6.0).abs() < 1e-5);
-        assert!((result[[0, 0, 0, 1]] - 8.0).abs() < 1e-5);
-        assert!((result[[0, 0, 1, 0]] - 12.0).abs() < 1e-5);
-        assert!((result[[0, 0, 1, 1]] - 14.0).abs() < 1e-5);
     }
 }

@@ -1,7 +1,7 @@
 //! Attention mask implementation.
 
+use crate::gpu::FloatDataType;
 use crate::{ConcreteTensor, Device, SimdElement, Tensor};
-use fusor_core::FloatDataType;
 
 /// Attention mask for causal (decoder) attention
 ///
@@ -9,15 +9,34 @@ use fusor_core::FloatDataType;
 #[derive(Clone)]
 pub struct AttentionMask<D: SimdElement> {
     mask: Tensor<2, D, ConcreteTensor<D, 2>>,
+    /// `true` when the mask is exactly the strict lower-triangular causal
+    /// mask of shape `[n, n]`. Hint to GPU flash attention so it can skip the
+    /// mask tensor entirely and prune upper-triangle work.
+    is_strict_causal: bool,
 }
 
 impl<D: SimdElement + FloatDataType + Default> AttentionMask<D>
 where
-    crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
+    crate::AddOp: crate::cpu::SimdBinaryOp<D>,
 {
     /// Create a new attention mask
     pub fn new(mask: Tensor<2, D, ConcreteTensor<D, 2>>) -> Self {
-        Self { mask }
+        Self {
+            mask,
+            is_strict_causal: false,
+        }
+    }
+
+    /// Returns true if this is a strict lower-triangular causal mask. The
+    /// GPU flash attention kernel can then skip masking work entirely.
+    pub fn is_strict_causal(&self) -> bool {
+        self.is_strict_causal
+    }
+
+    /// Marks this mask as a strict lower-triangular causal mask.
+    pub fn mark_strict_causal(mut self) -> Self {
+        self.is_strict_causal = true;
+        self
     }
 
     /// Create a causal mask for the given sequence length
@@ -33,16 +52,16 @@ where
         }
 
         let mask: Tensor<2, D> = match device {
-            Device::Cpu => Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            Device::Cpu => Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
                 [seq_len, seq_len],
                 &mask_data,
             )),
             Device::Gpu(gpu) => {
                 let data_chunks: Vec<&[D]> = mask_data.chunks(seq_len).collect();
-                Tensor::Gpu(fusor_core::Tensor::new(gpu, data_chunks))
+                Tensor::Gpu(crate::gpu::Tensor::new(gpu, data_chunks))
             }
         };
-        Self::new(mask)
+        Self::new(mask).mark_strict_causal()
     }
 
     /// Apply the mask to attention scores
@@ -54,10 +73,10 @@ where
     pub fn apply<'a, const R: usize>(
         &'a self,
         attention_scores: &'a Tensor<R, D>,
-    ) -> Tensor<R, D, fusor_cpu::Add<D, R, ConcreteTensor<D, R>, &'a ConcreteTensor<D, R>>>
+    ) -> Tensor<R, D, crate::cpu::Add<D, R, ConcreteTensor<D, R>, &'a ConcreteTensor<D, R>>>
     where
         D: std::ops::Add<Output = D>,
-        (fusor_core::Tensor<2, D>, fusor_core::Tensor<R, D>): fusor_core::MaxRank<R, D>,
+        (crate::gpu::Tensor<2, D>, crate::gpu::Tensor<R, D>): crate::gpu::MaxRank<R, D>,
     {
         // Broadcast the mask to match the attention scores shape
         let mask_broadcast: Tensor<R, D, _> = self.mask.broadcast_as(attention_scores.shape());
@@ -71,88 +90,12 @@ where
     pub fn forward<const R: usize>(&self, attention_scores: &mut Tensor<R, D>)
     where
         D: std::ops::Add<Output = D>,
-        (fusor_core::Tensor<2, D>, fusor_core::Tensor<R, D>): fusor_core::MaxRank<R, D>,
+        (crate::gpu::Tensor<2, D>, crate::gpu::Tensor<R, D>): crate::gpu::MaxRank<R, D>,
     {
         *attention_scores = self.apply(attention_scores).to_concrete();
     }
 
     pub fn mask(&self) -> &Tensor<2, D, ConcreteTensor<D, 2>> {
         &self.mask
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_attention_mask_causal() {
-        let device = Device::cpu();
-
-        let seq_len = 3;
-        let mask: AttentionMask<f32> = AttentionMask::causal(&device, seq_len);
-
-        assert_eq!(mask.mask().shape(), [3, 3]);
-
-        let mask_data = mask.mask().clone().as_slice().await.unwrap();
-
-        // Lower triangular should be 0, upper triangular should be -inf
-        assert_eq!(mask_data[[0, 0]], 0.0);
-        assert_eq!(mask_data[[0, 1]], f32::NEG_INFINITY);
-        assert_eq!(mask_data[[0, 2]], f32::NEG_INFINITY);
-
-        assert_eq!(mask_data[[1, 0]], 0.0);
-        assert_eq!(mask_data[[1, 1]], 0.0);
-        assert_eq!(mask_data[[1, 2]], f32::NEG_INFINITY);
-
-        assert_eq!(mask_data[[2, 0]], 0.0);
-        assert_eq!(mask_data[[2, 1]], 0.0);
-        assert_eq!(mask_data[[2, 2]], 0.0);
-    }
-
-    #[tokio::test]
-    async fn test_attention_mask_apply_4d() {
-        let device = Device::cpu();
-
-        let mask: AttentionMask<f32> = AttentionMask::causal(&device, 2);
-
-        // Create attention scores: (1, 1, 2, 2)
-        let scores_data = [1.0f32, 2.0, 3.0, 4.0];
-        let scores: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 2, 2], &scores_data));
-
-        let masked = mask.apply(&scores);
-
-        let output = masked.as_slice().await.unwrap();
-
-        // [0][0] = 1.0 + 0 = 1.0
-        // [0][1] = 2.0 + -inf = -inf
-        // [1][0] = 3.0 + 0 = 3.0
-        // [1][1] = 4.0 + 0 = 4.0
-        assert_eq!(output[[0, 0, 0, 0]], 1.0);
-        assert_eq!(output[[0, 0, 0, 1]], f32::NEG_INFINITY);
-        assert_eq!(output[[0, 0, 1, 0]], 3.0);
-        assert_eq!(output[[0, 0, 1, 1]], 4.0);
-    }
-
-    #[tokio::test]
-    async fn test_attention_mask_apply_3d() {
-        let device = Device::cpu();
-
-        let mask: AttentionMask<f32> = AttentionMask::causal(&device, 2);
-
-        // Create attention scores: (1, 2, 2)
-        let scores_data = [1.0f32, 2.0, 3.0, 4.0];
-        let scores: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 2], &scores_data));
-
-        let masked = mask.apply(&scores);
-
-        let output = masked.as_slice().await.unwrap();
-
-        assert_eq!(output[[0, 0, 0]], 1.0);
-        assert_eq!(output[[0, 0, 1]], f32::NEG_INFINITY);
-        assert_eq!(output[[0, 1, 0]], 3.0);
-        assert_eq!(output[[0, 1, 1]], 4.0);
     }
 }

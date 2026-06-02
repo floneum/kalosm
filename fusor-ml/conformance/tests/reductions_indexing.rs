@@ -2,13 +2,13 @@ mod common;
 
 use common::{index_select1, index_select2, keepdim2, mean_axis2, reduce_axis2, var_axis2};
 use fusor::{Device, Tensor, arange};
-use fusor_conformance::{FuzzGenerator, approx_compare};
+use fusor_conformance::{FuzzGenerator, approx_compare, f16_capable_devices, relative_compare};
 use half::f16;
 use rand::distr::Uniform;
 
 #[tokio::test]
 async fn reductions_match_host_reference() {
-    const SHAPE: [usize; 2] = [3, 4];
+    const SHAPE: [usize; 2] = [45, 45];
     let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
         .with_seed(200)
         .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
@@ -63,7 +63,11 @@ async fn reductions_match_host_reference() {
         .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
             Tensor::from_slice(&device, [SHAPE[0]], &reduce_axis2(&v, 1, 1.0, |a, b| a * b))
         })
-        .compare_with(approx_compare::<1, f32>(1e-3))
+        // Product of 45 values in [0.5, 2.0] grows to ~1e5 in some seeds;
+        // an absolute 1e-3 tolerance becomes meaningless. 0.01% relative
+        // catches accuracy regressions while accommodating GPU-vs-host
+        // accumulation order.
+        .compare_with(relative_compare::<1>(1e-4))
         .runs(3)
         .await
         .unwrap();
@@ -122,7 +126,7 @@ async fn reductions_match_host_reference() {
                 &keepdim2(&reduce_axis2(&v, 1, 1.0, |a, b| a * b), 1),
             )
         })
-        .compare_with(approx_compare::<2, f32>(1e-3))
+        .compare_with(relative_compare::<2>(1e-4))
         .runs(3)
         .await
         .unwrap();
@@ -175,7 +179,7 @@ async fn reductions_match_host_reference() {
 #[tokio::test]
 async fn indexing_cast_and_rank_specific_indexing_match_reference() {
     // index_select, slice_assign, and cast use fuzzed data
-    const SHAPE: [usize; 2] = [4, 4];
+    const SHAPE: [usize; 2] = [45, 45];
     let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
         .with_seed(210)
         .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
@@ -221,6 +225,7 @@ async fn indexing_cast_and_rank_specific_indexing_match_reference() {
         x.cast::<f16>().cast::<f32>().to_concrete()
     })
     .arg(fuzz)
+    .devices(f16_capable_devices().await)
     .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
         let out: Vec<Vec<f32>> = v
             .iter()
@@ -228,7 +233,9 @@ async fn indexing_cast_and_rank_specific_indexing_match_reference() {
             .collect();
         Tensor::new(&device, &out)
     })
-    .compare_with(approx_compare::<2, f32>(1e-6))
+    // WARP/DX12 can round f32 -> f16 one half-precision ULP differently
+    // from the CPU reference in this value range.
+    .compare_with(approx_compare::<2, f32>(5e-3))
     .runs(3)
     .await
     .unwrap();
@@ -237,7 +244,7 @@ async fn indexing_cast_and_rank_specific_indexing_match_reference() {
 #[tokio::test]
 async fn full_tensor_reductions_fuzzed() {
     // 2D reductions with fuzzed data + non-contiguous layouts
-    const SHAPE: [usize; 2] = [8, 16];
+    const SHAPE: [usize; 2] = [45, 45];
     let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
         .with_seed(42)
         .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
@@ -330,6 +337,96 @@ async fn full_tensor_reductions_fuzzed() {
         .unwrap();
 }
 
+fn reduce_axis3_mid(
+    input: &[Vec<Vec<f32>>],
+    init: f32,
+    f: impl Fn(f32, f32) -> f32 + Copy,
+) -> Vec<Vec<f32>> {
+    let batch = input.len();
+    let cols = input[0][0].len();
+    (0..batch)
+        .map(|b| {
+            (0..cols)
+                .map(|c| input[b].iter().map(|row| row[c]).fold(init, f))
+                .collect()
+        })
+        .collect()
+}
+
+fn mean_axis3_mid(input: &[Vec<Vec<f32>>]) -> Vec<Vec<f32>> {
+    let m = input[0].len() as f32;
+    reduce_axis3_mid(input, 0.0, |a, b| a + b)
+        .into_iter()
+        .map(|row| row.into_iter().map(|v| v / m).collect())
+        .collect()
+}
+
+#[tokio::test]
+async fn middle_axis_rank3_reductions_match_host_reference() {
+    const SHAPE: [usize; 3] = [3, 8, 5];
+    let fuzz = FuzzGenerator::<3, f32>::new(SHAPE)
+        .with_seed(220)
+        .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
+
+    // sum along middle axis 1
+    fusor_conformance::assert(async |x: Tensor<3, f32>| x.sum::<2>(1))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+            Tensor::new(&device, &reduce_axis3_mid(&v, 0.0, |a, b| a + b))
+        })
+        .compare_with(approx_compare::<2, f32>(1e-4))
+        .runs(3)
+        .await
+        .unwrap();
+
+    // mean along middle axis 1
+    fusor_conformance::assert(async |x: Tensor<3, f32>| x.mean::<2>(1))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+            Tensor::new(&device, &mean_axis3_mid(&v))
+        })
+        .compare_with(approx_compare::<2, f32>(1e-4))
+        .runs(3)
+        .await
+        .unwrap();
+
+    // max along middle axis 1
+    fusor_conformance::assert(async |x: Tensor<3, f32>| x.max::<2>(1))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+            Tensor::new(&device, &reduce_axis3_mid(&v, f32::NEG_INFINITY, f32::max))
+        })
+        .compare_with(approx_compare::<2, f32>(1e-5))
+        .runs(3)
+        .await
+        .unwrap();
+
+    // min along middle axis 1
+    fusor_conformance::assert(async |x: Tensor<3, f32>| x.min::<2>(1))
+        .arg(fuzz)
+        .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+            Tensor::new(&device, &reduce_axis3_mid(&v, f32::INFINITY, f32::min))
+        })
+        .compare_with(approx_compare::<2, f32>(1e-5))
+        .runs(3)
+        .await
+        .unwrap();
+
+    // product along middle axis 1 — bounded range to avoid overflow
+    let fuzz_small = FuzzGenerator::<3, f32>::new(SHAPE)
+        .with_seed(221)
+        .with_distribution(Uniform::new(0.5, 2.0).unwrap());
+    fusor_conformance::assert(async |x: Tensor<3, f32>| x.product::<2>(1))
+        .arg(fuzz_small)
+        .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+            Tensor::new(&device, &reduce_axis3_mid(&v, 1.0, |a, b| a * b))
+        })
+        .compare_with(relative_compare::<2>(1e-4))
+        .runs(3)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn full_tensor_sum_large_fuzzed() {
     // Large 2D sum to test accumulation precision with non-contiguous layouts
@@ -358,7 +455,7 @@ async fn index_select_fuzzed() {
     static DUP_INDICES: &[u32] = &[0, 0, 2, 2, 1, 1];
 
     // 1D index_select with fuzzed data, dim=0
-    const SHAPE_1D: [usize; 1] = [32];
+    const SHAPE_1D: [usize; 1] = [2048];
     let gen_1d = FuzzGenerator::<1, f32>::new(SHAPE_1D).with_seed(50);
 
     fusor_conformance::assert(async |x: Tensor<1, f32>| {
@@ -376,7 +473,7 @@ async fn index_select_fuzzed() {
     .unwrap();
 
     // 2D index_select dim=0 with fuzzed data
-    const SHAPE_2D: [usize; 2] = [8, 6];
+    const SHAPE_2D: [usize; 2] = [45, 45];
     let gen_2d = FuzzGenerator::<2, f32>::new(SHAPE_2D).with_seed(51);
 
     fusor_conformance::assert(async |x: Tensor<2, f32>| {
@@ -475,6 +572,39 @@ async fn index_select_single_rank_and_large_regressions() {
                 let source_row = SIZE - 1 - row;
                 (0..SIZE)
                     .map(|col| (source_row * SIZE + col) as f32)
+                    .collect()
+            })
+            .collect();
+        Tensor::new(&device, &rows)
+    })
+    .compare_with(approx_compare::<2, f32>(0.0))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn index_select_embedding_width_regression() {
+    const SOURCE_ROWS: usize = 64;
+    const SELECTED_ROWS: usize = 48;
+    const WIDTH: usize = 4096;
+
+    fusor_conformance::assert(async |device: Device| {
+        let input: Tensor<2, f32> = arange(&device, 0.0f32, (SOURCE_ROWS * WIDTH) as f32)
+            .reshape([SOURCE_ROWS, WIDTH])
+            .to_concrete();
+        let indices: Vec<u32> = (0..SELECTED_ROWS)
+            .map(|row| ((row * 7) % SOURCE_ROWS) as u32)
+            .collect();
+        let indices = Tensor::from_slice(&device, [SELECTED_ROWS], &indices);
+        input.index_select(0, &indices)
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(async |device: Device| {
+        let rows: Vec<Vec<f32>> = (0..SELECTED_ROWS)
+            .map(|row| {
+                let source_row = (row * 7) % SOURCE_ROWS;
+                (0..WIDTH)
+                    .map(|col| (source_row * WIDTH + col) as f32)
                     .collect()
             })
             .collect();

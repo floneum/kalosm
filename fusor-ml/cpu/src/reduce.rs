@@ -226,6 +226,75 @@ impl_reduce_op!(ProdOp, i32, 1, splat_i32s, mul_i32s);
 impl_reduce_op!(ProdOp, u16, 1, splat_u16s, mul_u16s);
 impl_reduce_op!(ProdOp, u32, 1, splat_u32s, mul_u32s);
 
+// f16 reductions: f16 has no native pulp SIMD, so the SIMD vector type is
+// `F16Scalar` (a single-lane wrapper). Implement scalar combine and forward
+// SIMD ops through the scalar path. Sum/Prod accumulate via f32 to keep the
+// running total in higher precision before re-rounding.
+impl ScalarCombine<half::f16> for SumOp {
+    #[inline(always)]
+    fn combine(a: half::f16, b: half::f16) -> half::f16 {
+        half::f16::from_f32(a.to_f32() + b.to_f32())
+    }
+}
+impl ScalarCombine<half::f16> for MaxOp {
+    #[inline(always)]
+    fn combine(a: half::f16, b: half::f16) -> half::f16 {
+        if a >= b { a } else { b }
+    }
+}
+impl ScalarCombine<half::f16> for MinOp {
+    #[inline(always)]
+    fn combine(a: half::f16, b: half::f16) -> half::f16 {
+        if a <= b { a } else { b }
+    }
+}
+impl ScalarCombine<half::f16> for ProdOp {
+    #[inline(always)]
+    fn combine(a: half::f16, b: half::f16) -> half::f16 {
+        half::f16::from_f32(a.to_f32() * b.to_f32())
+    }
+}
+
+macro_rules! impl_f16_reduce_op {
+    ($op:ty, $identity:expr) => {
+        impl SimdReduceOp<half::f16> for $op {
+            #[inline(always)]
+            fn identity() -> half::f16 {
+                $identity
+            }
+
+            #[inline(always)]
+            fn splat_identity<S: Simd>(_simd: S) -> crate::F16Scalar {
+                crate::F16Scalar($identity)
+            }
+
+            #[inline(always)]
+            fn combine_simd_vec<S: Simd>(
+                _simd: S,
+                a: crate::F16Scalar,
+                b: crate::F16Scalar,
+            ) -> crate::F16Scalar {
+                crate::F16Scalar(<$op as ScalarCombine<half::f16>>::combine(a.0, b.0))
+            }
+
+            #[inline(always)]
+            fn combine_scalar(a: half::f16, b: half::f16) -> half::f16 {
+                <$op as ScalarCombine<half::f16>>::combine(a, b)
+            }
+
+            #[inline(always)]
+            fn reduce_simd_vec<S: Simd>(_simd: S, v: crate::F16Scalar) -> half::f16 {
+                v.0
+            }
+        }
+    };
+}
+
+impl_f16_reduce_op!(SumOp, half::f16::ZERO);
+impl_f16_reduce_op!(MaxOp, half::f16::NEG_INFINITY);
+impl_f16_reduce_op!(MinOp, half::f16::INFINITY);
+impl_f16_reduce_op!(ProdOp, half::f16::ONE);
+
 /// Helper struct for dispatching reduce operations via Arch::dispatch
 struct ReduceOpDispatch<'a, E: SimdElement, Op: SimdReduceOp<E>> {
     input: &'a [E],
@@ -517,8 +586,11 @@ pub fn layer_norm_last_dim_fused<const R: usize>(
 
     if tensor.layout().is_contiguous() && weight.layout().is_contiguous() {
         let in_data: &[f32] = tensor.data();
-        let weight_data: &[f32] = weight.data();
-        let bias_data: Option<&[f32]> = bias.map(|b| b.data() as &[f32]);
+        // Weight/bias are broadcast over leading dims; the materialized contiguous
+        // buffer repeats one row's values, so the first `last_dim` elements are
+        // exactly the per-row weights expected by `layer_norm_row`.
+        let weight_data: &[f32] = &weight.data()[..last_dim];
+        let bias_data: Option<&[f32]> = bias.map(|b| &b.data()[..last_dim] as &[f32]);
         let out_data = output.data_mut();
 
         // Process rows in parallel for large tensors
@@ -541,8 +613,8 @@ pub fn layer_norm_last_dim_fused<const R: usize>(
         // Fall back to non-fused for non-contiguous
         // This is slower but handles all cases
         let in_data: &[f32] = tensor.data();
-        let weight_data: &[f32] = weight.data();
-        let bias_data: Option<&[f32]> = bias.map(|b| b.data() as &[f32]);
+        let weight_data: &[f32] = &weight.data()[..last_dim];
+        let bias_data: Option<&[f32]> = bias.map(|b| &b.data()[..last_dim] as &[f32]);
         let out_data = output.data_mut();
 
         let mut row_buffer = vec![0.0f32; last_dim];
