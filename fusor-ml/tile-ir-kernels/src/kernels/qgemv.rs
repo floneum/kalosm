@@ -28,6 +28,10 @@ use crate::dispatch::{
 use crate::grid::{
     dot4_sum, qgemv_grid, qgemv_program_scope, store_qgemv_sums_with_epilogue, QgemvStoreTarget,
 };
+use crate::kernels::qgemv_paired_q4k::{
+    load_q4k_ggml_activations, q4k_ggml_dot_tiles, q4k_lane_decomposition,
+};
+use crate::kernels::qgemv_q6k::qgemv_q6k_ggml;
 use crate::types::{apply_qmatmul_pre_epilogue, matrix_shape, QmatmulEpilogues, QmatmulExtra};
 
 /// Converts qgemv epilogue inputs into the internal pre/post epilogue bundle.
@@ -154,46 +158,29 @@ pub(crate) fn qgemv_tile_with_epilogue(
             8,
         ),
         GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative => {
-            if b.rows <= 4096 && b.cols >= 4096 && b.cols < 8192 {
-                let shape = q4k_mid_override(q4k_default_mid(b.rows, b.cols));
-                return qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, shape, 16);
+            let shape = if b.rows <= 4096 && b.cols >= 4096 && b.cols < 8192 {
+                q4k_mid_override(q4k_default_mid(b.rows, b.cols))
+            } else if b.rows <= 4096 && b.cols <= 4096 {
+                qgemv_shape(256, 8, 4)
+            } else if b.rows <= 4096 && b.cols >= 8192 {
+                q4k_large_override(q4k_default_large(b.rows, b.cols))
+            } else if b.rows > 4096 && b.cols <= 4096 {
+                q4k_tall_override(q4k_default_tall(b.rows, b.cols))
+            } else if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, b.cols) == 8 {
+                qgemv_shape(256, 8, 8)
+            } else {
+                qgemv_shape(128, 4, 8)
+            };
+            // The decode matmuls (no pre-epilogue) take the ggml super-block-
+            // amortized dot, which decodes each 256-element super-block's
+            // scale/min once per lane instead of re-decoding per 16-element
+            // chunk. The rare pre-epilogue case keeps the generic dequant dot
+            // (the strided ggml gather has no per-`k` index to feed a pre-op).
+            if qgemv_pre_epilogue_is_empty(ep) {
+                return qgemv_q4k_ggml(program, tensors, workgroups_x, ep, shape);
             }
-            if b.rows <= 4096 && b.cols <= 4096 {
-                return qgemv_perf_with_epilogue(
-                    program,
-                    tensors,
-                    workgroups_x,
-                    ep,
-                    qgemv_shape(256, 8, 4),
-                    16,
-                );
-            }
-            if b.rows <= 4096 && b.cols >= 8192 {
-                let shape = q4k_large_override(q4k_default_large(b.rows, b.cols));
-                return qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, shape, 16);
-            }
-            if b.rows > 4096 && b.cols <= 4096 {
-                let shape = q4k_tall_override(q4k_default_tall(b.rows, b.cols));
-                return qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, shape, 16);
-            }
-            if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, b.cols) == 8 {
-                return qgemv_perf_with_epilogue(
-                    program,
-                    tensors,
-                    workgroups_x,
-                    ep,
-                    qgemv_shape(256, 8, 8),
-                    8,
-                );
-            }
-            qgemv_perf_with_epilogue(
-                program,
-                tensors,
-                workgroups_x,
-                ep,
-                qgemv_shape(128, 4, 8),
-                8,
-            )
+            let values_per_lane = if shape.cols_per_subgroup == 8 { 8 } else { 16 };
+            qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, shape, values_per_lane)
         }
         GgmlQuantFormat::Q5_0 | GgmlQuantFormat::Q5_0Native => qgemv_perf_with_epilogue(
             program,
@@ -225,24 +212,22 @@ pub(crate) fn qgemv_tile_with_epilogue(
                 let shape = q6k_tall_override(q6k_default_tall(b.rows, b.cols));
                 return qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, shape, 8);
             }
-            if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, b.cols) == 4 {
-                return qgemv_perf_with_epilogue(
-                    program,
-                    tensors,
-                    workgroups_x,
-                    ep,
-                    qgemv_shape(128, 4, 4),
-                    8,
-                );
+            let (shape, values_per_lane) =
+                if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, b.cols) == 4 {
+                    (qgemv_shape(128, 4, 4), 8)
+                } else {
+                    (qgemv_shape(256, 8, 4), 16)
+                };
+            // The decode matmuls (no pre-epilogue) take the ggml super-block-
+            // amortized dot, which decodes each 256-element super-block's `d`
+            // and sub-block scales once per 16-element lane region instead of
+            // re-decoding per 8-element chunk. Only the word-aligned f32-scale
+            // `Q6K` layout uses raw-word addressing; the 210-byte `Q6KNative`
+            // block and the rare pre-epilogue case keep the generic dequant dot.
+            if b.format == GgmlQuantFormat::Q6K && qgemv_pre_epilogue_is_empty(ep) {
+                return qgemv_q6k_ggml(program, a, b, y, workgroups_x, ep, shape);
             }
-            qgemv_perf_with_epilogue(
-                program,
-                tensors,
-                workgroups_x,
-                ep,
-                qgemv_shape(256, 8, 4),
-                16,
-            )
+            qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, shape, values_per_lane)
         }
     }
 }
@@ -385,6 +370,103 @@ fn qgemv_perf_with_epilogue(
                             mask,
                         );
                         acc + part
+                    })
+                    .collect()
+            },
+        );
+
+        store_qgemv_sums_with_epilogue(
+            program,
+            sums,
+            QgemvStoreTarget {
+                y,
+                col0,
+                lane,
+                full_cols: grid.full_cols,
+                n_cols: grid.n_cols,
+                epilogues,
+            },
+        );
+    });
+}
+
+/// `true` when no pre-reduce epilogue is attached, so the activation stream can
+/// be gathered with the ggml strided pattern (which has no per-`k` index to feed
+/// a pre-epilogue).
+fn qgemv_pre_epilogue_is_empty(epilogues: &QmatmulEpilogues<'_>) -> bool {
+    epilogues.pre.is_none()
+        && epilogues.pre_with_extras.is_none()
+        && epilogues.pre_extra_inputs.is_empty()
+}
+
+/// Non-paired Q4K qgemv built on the ggml super-block-amortized decode — the
+/// same decomposition as the paired SwiGLU kernel ([`qgemv_q4k_paired_ggml`]).
+/// A 32-lane subgroup covers 4 super-blocks per pass (`ix = lane / 8`); each
+/// lane decodes its super-block's scale/min once and consumes a strided 8-byte
+/// region. This restores the per-super-block decode amortization that the
+/// generic `quantized_dot_f32` path lost when it re-decodes the metadata for
+/// every 8/16-element chunk. Only valid with an empty pre-epilogue.
+fn qgemv_q4k_ggml(
+    program: &mut Program,
+    tensors: QgemvTensors<'_>,
+    workgroups_x: u32,
+    epilogues: &QmatmulEpilogues<'_>,
+    shape: QgemvShape,
+) {
+    const SUBGROUP_SIZE: u32 = 32;
+    let QgemvTensors { a, b, y } = tensors;
+    let block = shape.block;
+    let subgroups = shape.subgroups;
+    let cols_per_subgroup = shape.cols_per_subgroup;
+    debug_assert_eq!(subgroups * SUBGROUP_SIZE, block);
+    debug_assert!(b.format.is_q4k_family());
+    let grid = qgemv_grid(subgroups, cols_per_subgroup, b.cols, workgroups_x);
+    let [_, k] = matrix_shape(a.layout());
+    let block_count = k.div_ceil(256);
+    let block_iterations = block_count.div_ceil(4);
+    let full_block_iterations = block_count.is_multiple_of(4);
+    let blocks_per_col = b.rows / b.format.block_elements();
+    let block_words = b.format.block_words();
+    let native = b.format == GgmlQuantFormat::Q4KNative;
+    let qwords = Storage::from_view(b.data.clone());
+    let cols_usize = cols_per_subgroup as usize;
+    let row = Tile::u32(0);
+
+    program.program_grid(block, [grid.workgroups_x, grid.dispatch_y, 1], |program| {
+        let scope = qgemv_program_scope(program, grid, cols_per_subgroup);
+        let col0 = scope.col0;
+        let lane = scope.lane;
+        let q4k_lane = q4k_lane_decomposition(&lane);
+
+        let sums: Vec<Tile> = program.fold_vec(
+            range(block_iterations),
+            vec![Tile::f32(0.0); cols_usize],
+            |program, loop_index, accs| {
+                let block_idx = loop_index * 4u32 + q4k_lane.ix.clone();
+                let in_bounds = if full_block_iterations {
+                    Tile::bool(true)
+                } else {
+                    block_idx.clone().lt(block_count)
+                };
+                let vector_base = block_idx.clone() * 256u32
+                    + q4k_lane.iq.clone() * 64u32
+                    + q4k_lane.ir.clone() * 8u32;
+                let acts = load_q4k_ggml_activations(program, a, &row, &vector_base, &in_bounds);
+                accs.into_iter()
+                    .enumerate()
+                    .map(|(c, acc)| {
+                        let col = col0.clone() + c as u32;
+                        acc + q4k_ggml_dot_tiles(
+                            program,
+                            &qwords,
+                            blocks_per_col,
+                            block_words,
+                            native,
+                            &block_idx,
+                            &col,
+                            &q4k_lane,
+                            &acts,
+                        )
                     })
                     .collect()
             },

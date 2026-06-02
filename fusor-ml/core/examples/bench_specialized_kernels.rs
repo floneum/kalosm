@@ -162,15 +162,13 @@ where
     F: FnMut() -> Tensor,
 {
     let mut outputs = Vec::with_capacity(dispatches);
-    let mut keys = Vec::with_capacity(dispatches);
     for _ in 0..dispatches {
         let output = make_output();
-        keys.push(output.key());
         outputs.push(output);
     }
 
     let start = std::time::Instant::now();
-    let kernels = device.resolve_batch(&keys);
+    let kernels = outputs.iter().map(Tensor::count_kernels_to_resolve).sum();
     device.poll_wait();
     let elapsed = start.elapsed();
     drop(outputs);

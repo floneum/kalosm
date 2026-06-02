@@ -210,7 +210,7 @@ impl<'a> Lowerer<'a> {
         if self.uses_f16 {
             capabilities |= naga::valid::Capabilities::SHADER_FLOAT16;
         }
-        if self.caps.native_f16_scales {
+        if self.caps.native_f16_scales || self.caps.unpacks_f16 {
             capabilities |= naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32;
         }
         if self.caps.uses_subgroup_reduce || self.caps.subgroup_id {

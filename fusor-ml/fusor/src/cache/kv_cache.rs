@@ -61,28 +61,6 @@ where
         (keys, values)
     }
 
-    /// Reserve enough key/value sequence storage to avoid growth during future appends.
-    pub fn reserve(
-        &mut self,
-        device: &Device,
-        target_seq_len: usize,
-        keys: &mut Vec<crate::NodeIndex>,
-    ) {
-        if let Some(key) = self.key.reserve(device, target_seq_len) {
-            keys.push(key);
-        }
-        if let Some(key) = self.value.reserve(device, target_seq_len) {
-            keys.push(key);
-        }
-    }
-
-    /// Add live key/value GPU nodes to a batch of already-resolved nodes that
-    /// should be rebased to graph leaves.
-    pub fn detach_keys(&self, keys: &mut Vec<crate::NodeIndex>) {
-        self.key.detach_key(keys);
-        self.value.detach_key(keys);
-    }
-
     /// Get the current sequence length
     pub fn current_seq_len(&self) -> usize {
         self.key.current_seq_len()

@@ -8,6 +8,14 @@ fn build_intermediate(device: &Device) -> Tensor {
     (&input * 2.0) + 1.0
 }
 
+fn build_matmul_intermediate(device: &Device) -> Tensor {
+    let left_rows = vec![vec![1.0f32, 2.0, 3.0, 4.0]; 8];
+    let right_rows = vec![vec![0.25f32, 0.5, 0.75, 1.0]; 4];
+    let left = Tensor::new::<f32, 2, _>(device, &left_rows);
+    let right = Tensor::new::<f32, 2, _>(device, &right_rows);
+    left.mat_mul(&right)
+}
+
 #[test]
 fn sequential_resolve_reuses_shared_ancestor() {
     pollster::block_on(async {
@@ -19,29 +27,24 @@ fn sequential_resolve_reuses_shared_ancestor() {
         // the user-facing `x` handle so its node is only kept alive by the
         // descendants — exactly the case where the old freeing predicate would
         // throw the buffer away and force `b.resolve()` to recompute.
-        let seq_total = {
-            let x = build_intermediate(&device);
+        let (a_kernels, b_kernels) = {
+            let x = build_matmul_intermediate(&device);
             let a = x.sin();
             let b = x.cos();
             drop(x);
             let a_kernels = a.data().materialize().1;
             let b_kernels = b.data().materialize().1;
-            a_kernels + b_kernels
+            (a_kernels, b_kernels)
         };
 
-        let batch_total = {
-            let x = build_intermediate(&device);
-            let a = x.sin();
-            let b = x.cos();
-            drop(x);
-            device.resolve_batch(&[a.key(), b.key()])
-        };
-
+        assert!(
+            a_kernels > 0,
+            "first resolve should dispatch at least one kernel",
+        );
         assert_eq!(
-            seq_total, batch_total,
-            "sequential resolve should reuse shared ancestors and dispatch the \
-             same number of kernels as resolve_batch (got seq={seq_total}, \
-             batch={batch_total})",
+            b_kernels, 1,
+            "second resolve should reuse the shared ancestor and only dispatch \
+             the final operation (got {b_kernels})",
         );
     });
 }

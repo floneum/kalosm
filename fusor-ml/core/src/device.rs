@@ -386,16 +386,4 @@ impl Device {
             .get()
             .expect("compute_graph should be initialized")
     }
-
-    /// Resolve multiple compute-graph nodes in a single pass. All targets share
-    /// one execution graph so intermediate results can be freed as soon as every
-    /// consumer within the batch has been computed. This keeps peak GPU memory
-    /// much lower than resolving targets one-by-one.
-    pub fn resolve_batch(&self, keys: &[crate::compute_graph::NodeIndex]) -> usize {
-        self.compute_graph().resolve_batch(keys)
-    }
-
-    pub fn detach_cached(&self, keys: &[crate::compute_graph::NodeIndex]) {
-        self.compute_graph().detach_cached(keys)
-    }
 }

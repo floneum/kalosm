@@ -60,18 +60,6 @@ where
                     )
                 }
                 .await?;
-                {
-                    let mut session_lock = session
-                        .cache
-                        .write()
-                        .map_err(|err| LlamaModelError::Session(err.to_string()))?;
-                    let reserve_tokens = if max_tokens == u32::MAX {
-                        unbounded_decode_reserve_tokens()
-                    } else {
-                        max_tokens as usize
-                    };
-                    session_lock.reserve_decode(&self.device, reserve_tokens);
-                }
 
                 let stop_token = self.model.config.stop_token;
                 let mut tokens_generated = 0;
@@ -101,10 +89,6 @@ where
                             .cache
                             .write()
                             .map_err(|err| LlamaModelError::Session(err.to_string()))?;
-                        if max_tokens == u32::MAX {
-                            session_lock
-                                .reserve_decode(&self.device, unbounded_decode_reserve_tokens());
-                        }
                         Self::forward_sample_token(
                             ForwardInputs {
                                 model: &self.model,
@@ -159,18 +143,6 @@ where
             )
         }
         .await?;
-        {
-            let mut session_lock = session
-                .cache
-                .write()
-                .map_err(|err| LlamaModelError::Session(err.to_string()))?;
-            let reserve_tokens = if max_tokens == u32::MAX {
-                unbounded_decode_reserve_tokens()
-            } else {
-                max_tokens as usize
-            };
-            session_lock.reserve_decode(&self.device, reserve_tokens);
-        }
         let mut logits = logits_from_sorted_top_k(logit_probs);
         // This stores a buffer of text that has been generated to check against the stop_on string. It should never be longer than the stop_on string.
         let mut queued_text_matching_stop_on = String::new();
@@ -250,9 +222,6 @@ where
                     .cache
                     .write()
                     .map_err(|err| LlamaModelError::Session(err.to_string()))?;
-                if max_tokens == u32::MAX {
-                    session_lock.reserve_decode(&self.device, unbounded_decode_reserve_tokens());
-                }
                 Self::forward_top_k(
                     &self.model,
                     &self.device,

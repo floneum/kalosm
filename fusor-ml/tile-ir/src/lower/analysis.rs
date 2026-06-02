@@ -21,6 +21,12 @@ pub(super) struct Analysis {
 pub(super) struct Capabilities {
     pub uses_f16: bool,
     pub native_f16_scales: bool,
+    /// `unpack2x16float` reads two f16 lanes out of a `u32` into `vec2<f32>`,
+    /// which naga gates behind `SHADER_FLOAT16_IN_FLOAT32` just like native
+    /// f16 scales. A kernel can reach it without any quantized source (e.g. the
+    /// Q4K paired ggml path decodes the f16 `d`/`dmin` header from raw words),
+    /// so the flag is raised from the op itself rather than the matrix.
+    pub unpacks_f16: bool,
     pub uses_subgroup_reduce: bool,
     pub uses_coop: bool,
     pub subgroup_id: bool,
@@ -215,7 +221,12 @@ impl Analysis {
                 self.note_tile(tile);
                 self.visit_expr(index);
             }
-            ExprKind::Unary { value, .. } => self.visit_expr(value),
+            ExprKind::Unary { op, value } => {
+                if *op == TileUnaryOp::Unpack2x16Float {
+                    self.caps.unpacks_f16 = true;
+                }
+                self.visit_expr(value);
+            }
             ExprKind::Binary { left, right, .. } | ExprKind::Compare { left, right, .. } => {
                 self.visit_expr(left);
                 self.visit_expr(right);
