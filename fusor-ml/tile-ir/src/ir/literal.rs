@@ -18,7 +18,7 @@ impl F32Bits {
 
 /// A typed scalar literal stored by bits so IR equality remains exact. Vector
 /// constants are not literals — they are built by composing scalar literals
-/// (e.g. `Expr::ComposeVector`).
+/// (e.g. `ExprKind::Vec`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileLiteral {
     /// 32-bit floating point literal.
@@ -109,6 +109,8 @@ pub enum TileUnaryOp {
     Atanh,
     /// Absolute value.
     Abs,
+    /// Unpack a `u32` holding two packed f16 values into a `vec2<f32>`.
+    Unpack2x16Float,
     /// Arithmetic negation.
     Neg,
 }
@@ -138,6 +140,10 @@ pub enum TileBinaryOp {
     BitOr,
     /// Bitwise xor.
     BitXor,
+    /// Bitwise shift right (logical, for u32 lanes).
+    Shr,
+    /// Bitwise shift left.
+    Shl,
     /// Logical and.
     LogicalAnd,
     /// Logical or.

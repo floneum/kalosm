@@ -1,30 +1,6 @@
 # Kalosm Vision
 
-Kalosm Vision is a collection of image models and utilities for the Kalosm framework. It includes utilities for generating images from text and segmenting images into objects.
-
-## Image Generation
-
-You can use the [`Wuerstchen`] model to generate images from text:
-
-```rust, no_run
-use futures_util::StreamExt;
-use kalosm_vision::{Wuerstchen, WuerstchenInferenceSettings};
-
-#[tokio::main]
-async fn main() {
-    let model = Wuerstchen::builder().build().await.unwrap();
-    let settings = WuerstchenInferenceSettings::new(
-        "a cute cat with a hat in a room covered with fur with incredible detail",
-    );
-
-    let mut images = model.run(settings);
-    while let Some(image) = images.next().await {
-        if let Some(buf) = image.generated_image() {
-            buf.save(&format!("{}.png", image.sample_num())).unwrap();
-        }
-    }
-}
-```
+Kalosm Vision is a collection of image models and utilities for the Kalosm framework. It includes utilities for segmenting images into objects.
 
 ## Image Segmentation
 

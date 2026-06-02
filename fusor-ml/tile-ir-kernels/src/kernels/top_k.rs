@@ -1,6 +1,6 @@
 use fusor_tile_ir::{
     tile::{self, Mask, Tile, TileBlock},
-    Bool, TileLiteral, TileUnaryOp, WorkgroupAxis, F32, U32,
+    ElementType, ScalarElement, TileLiteral, TileUnaryOp, WorkgroupAxis,
 };
 
 use super::helpers::{index_n, reduce_workgroup, MAX_F32, NEG_MAX_F32, TOP_K_BLOCK};
@@ -16,21 +16,17 @@ fn is_finite(value: Tile) -> Mask {
     self_equal.and(finite_magnitude)
 }
 
-fn better_candidate(value: Tile, id: Tile<U32>, best_value: Tile, best_id: Tile<U32>) -> Mask {
+fn better_candidate(value: Tile, id: Tile, best_value: Tile, best_id: Tile) -> Mask {
     let value_greater = value.clone().gt(best_value.clone());
     let value_equal = value.eq(best_value);
     let id_greater = id.gt(best_id);
     value_greater.or(value_equal.and(id_greater))
 }
 
-fn load_processor_param_f32(
-    program: &TileBlock<'_>,
-    params: &tile::Storage<U32, 1>,
-    index: u32,
-) -> Tile {
+fn load_processor_param_f32(program: &TileBlock<'_>, params: &tile::Storage, index: u32) -> Tile {
     program
         .load(params.at(index), Mask::all(), TileLiteral::U32(0))
-        .bitcast::<F32>()
+        .bitcast(ElementType::F32)
 }
 
 /// Select sorted top-k candidates within each chunk of an input vector.
@@ -54,28 +50,32 @@ pub fn top_k_chunk<B>(
         return None;
     }
 
-    let input = kb.read::<F32, 1>(input);
-    let output_ids = kb.write::<U32, 1>(output_ids);
-    let output_values = kb.write::<F32, 1>(output_values);
-    let processors =
-        processors.map(|(prev, params)| (kb.read::<U32, 1>(prev), kb.read::<U32, 1>(params)));
+    let input = kb.read(ElementType::F32, input);
+    let output_ids = kb.write(ElementType::U32, output_ids);
+    let output_values = kb.write(ElementType::F32, output_values);
+    let processors = processors.map(|(prev, params)| {
+        (
+            kb.read(ElementType::U32, prev),
+            kb.read(ElementType::U32, params),
+        )
+    });
     let phase = kb.program();
-    let scratch_values = phase.alloc_workgroup_array::<F32>(TOP_K_BLOCK as u32);
-    let scratch_ids = phase.alloc_workgroup_array::<U32>(TOP_K_BLOCK as u32);
+    let scratch_values = phase.alloc_workgroup_array(ScalarElement::F32, TOP_K_BLOCK as u32);
+    let scratch_ids = phase.alloc_workgroup_array(ScalarElement::U32, TOP_K_BLOCK as u32);
     let chunks = meta.input_len.div_ceil(TOP_K_CHUNK);
 
-    phase.program_grid::<TOP_K_BLOCK>([chunks, 1, 1], |program| {
+    phase.program_grid(TOP_K_BLOCK as u32, [chunks, 1, 1], |program| {
         let lane = program.lane();
         let chunk = program.program_id(WorkgroupAxis::X);
-        let current_value = program.private::<F32>();
-        let current_id = program.private::<U32>();
-        let previous_index = program.private::<U32>();
-        let previous_len_local = program.private::<U32>();
-        let repeated = program.private::<Bool>();
-        let sort_current_value = program.private::<F32>();
-        let sort_current_id = program.private::<U32>();
-        let sort_partner_value = program.private::<F32>();
-        let sort_partner_id = program.private::<U32>();
+        let current_value = program.private(ElementType::F32);
+        let current_id = program.private(ElementType::U32);
+        let previous_index = program.private(ElementType::U32);
+        let previous_len_local = program.private(ElementType::U32);
+        let repeated = program.private(ElementType::Bool);
+        let sort_current_value = program.private(ElementType::F32);
+        let sort_current_id = program.private(ElementType::U32);
+        let sort_partner_value = program.private(ElementType::F32);
+        let sort_partner_id = program.private(ElementType::U32);
 
         program.store_local(&current_value, Tile::literal(TileLiteral::f32(NEG_MAX_F32)));
         program.store_local(&current_id, Tile::literal(TileLiteral::U32(u32::MAX)));
@@ -170,8 +170,8 @@ pub fn top_k_chunk<B>(
 
         let value = program.load_local(&current_value);
         let id = program.load_local(&current_id);
-        program.store_workgroup(scratch_values, lane.clone(), value);
-        program.store_workgroup(scratch_ids, lane.clone(), id);
+        program.store_workgroup(&scratch_values, lane.clone(), value);
+        program.store_workgroup(&scratch_ids, lane.clone(), id);
         program.workgroup_barrier();
 
         let mut size = 2;
@@ -183,10 +183,10 @@ pub fn top_k_chunk<B>(
                     .index(lane.clone() & stride)
                     .eq(Tile::literal(TileLiteral::U32(0)));
                 program.if_then(lower_lane, |program| {
-                    let current_value = program.load_workgroup(scratch_values, lane.clone());
-                    let current_id = program.load_workgroup(scratch_ids, lane.clone());
-                    let partner_value = program.load_workgroup(scratch_values, partner.clone());
-                    let partner_id = program.load_workgroup(scratch_ids, partner.clone());
+                    let current_value = program.load_workgroup(&scratch_values, lane.clone());
+                    let current_id = program.load_workgroup(&scratch_ids, lane.clone());
+                    let partner_value = program.load_workgroup(&scratch_values, partner.clone());
+                    let partner_id = program.load_workgroup(&scratch_ids, partner.clone());
                     program.store_local(&sort_current_value, current_value);
                     program.store_local(&sort_current_id, current_id);
                     program.store_local(&sort_partner_value, partner_value);
@@ -221,17 +221,17 @@ pub fn top_k_chunk<B>(
                         let partner_value = program.load_local(&sort_partner_value);
                         let partner_id = program.load_local(&sort_partner_id);
                         program.store_workgroup(
-                            scratch_values,
+                            &scratch_values,
                             lane.clone(),
                             partner_value.clone(),
                         );
-                        program.store_workgroup(scratch_ids, lane.clone(), partner_id.clone());
+                        program.store_workgroup(&scratch_ids, lane.clone(), partner_id.clone());
                         program.store_workgroup(
-                            scratch_values,
+                            &scratch_values,
                             partner.clone(),
                             current_value.clone(),
                         );
-                        program.store_workgroup(scratch_ids, partner.clone(), current_id.clone());
+                        program.store_workgroup(&scratch_ids, partner.clone(), current_id.clone());
                     });
                 });
                 program.workgroup_barrier();
@@ -242,8 +242,8 @@ pub fn top_k_chunk<B>(
 
         let writes_output = lane.lt(meta.output_per_chunk);
         let output_index = program.index(chunk * meta.output_per_chunk + lane.clone());
-        let selected_value = program.load_workgroup(scratch_values, lane.clone());
-        let selected_id = program.load_workgroup(scratch_ids, lane.clone());
+        let selected_value = program.load_workgroup(&scratch_values, lane.clone());
+        let selected_id = program.load_workgroup(&scratch_ids, lane.clone());
         program.store(
             output_values.at(output_index.clone()),
             selected_value,
@@ -268,18 +268,18 @@ pub fn top_k_exactness<B>(
         return None;
     }
 
-    let top_values = kb.read::<F32, 1>(top_values);
-    let chunk_values = kb.read::<F32, 1>(chunk_values);
-    let flag = kb.write::<U32, 1>(flag);
+    let top_values = kb.read(ElementType::F32, top_values);
+    let chunk_values = kb.read(ElementType::F32, chunk_values);
+    let flag = kb.write(ElementType::U32, flag);
     let phase = kb.program();
-    let scratch = phase.alloc_workgroup_array::<U32>(TOP_K_BLOCK as u32);
+    let scratch = phase.alloc_workgroup_array(ScalarElement::U32, TOP_K_BLOCK as u32);
 
-    phase.program_grid::<TOP_K_BLOCK>([1, 1, 1], |program| {
+    phase.program_grid(TOP_K_BLOCK as u32, [1, 1, 1], |program| {
         let lane = program.lane();
-        let chunk = program.private::<U32>();
-        let inexact = program.private::<U32>();
-        let threshold_local = program.private::<F32>();
-        let threshold_finite_local = program.private::<Bool>();
+        let chunk = program.private(ElementType::U32);
+        let inexact = program.private(ElementType::U32);
+        let threshold_local = program.private(ElementType::F32);
+        let threshold_finite_local = program.private(ElementType::Bool);
 
         let threshold_rank = Tile::literal(TileLiteral::U32(meta.top_k - 1));
         let threshold_index = index_n(
@@ -337,16 +337,16 @@ pub fn top_k_exactness<B>(
         });
 
         let inexact_value = program.load_local(&inexact);
-        program.store_workgroup(scratch, lane.clone(), inexact_value);
+        program.store_workgroup(&scratch, lane.clone(), inexact_value);
         program.workgroup_barrier();
 
-        reduce_workgroup(program, scratch, lane.clone(), |lhs, rhs| lhs.bit_or(rhs));
+        reduce_workgroup(program, &scratch, lane.clone(), |lhs, rhs| lhs.bit_or(rhs));
 
         let first_lane = program
             .index(lane.clone())
             .eq(Tile::literal(TileLiteral::U32(0)));
         program.if_then(first_lane, |program| {
-            let root = program.load_workgroup(scratch, 0);
+            let root = program.load_workgroup(&scratch, 0);
             let exact = root.eq(Tile::literal(TileLiteral::U32(0)));
             program.if_else(
                 exact,
@@ -375,27 +375,27 @@ pub fn top_k_merge<B>(
         return None;
     }
 
-    let input_ids = kb.read::<U32, 1>(input_ids);
-    let input_values = kb.read::<F32, 1>(input_values);
-    let output_ids = kb.write::<U32, 1>(output_ids);
-    let output_values = kb.write::<F32, 1>(output_values);
+    let input_ids = kb.read(ElementType::U32, input_ids);
+    let input_values = kb.read(ElementType::F32, input_values);
+    let output_ids = kb.write(ElementType::U32, output_ids);
+    let output_values = kb.write(ElementType::F32, output_values);
     let phase = kb.program();
-    let chunk_positions = phase.alloc_workgroup_array::<U32>(meta.chunks);
-    let scratch_values = phase.alloc_workgroup_array::<F32>(TOP_K_BLOCK as u32);
-    let scratch_ids = phase.alloc_workgroup_array::<U32>(TOP_K_BLOCK as u32);
-    let scratch_chunks = phase.alloc_workgroup_array::<U32>(TOP_K_BLOCK as u32);
+    let chunk_positions = phase.alloc_workgroup_array(ScalarElement::U32, meta.chunks);
+    let scratch_values = phase.alloc_workgroup_array(ScalarElement::F32, TOP_K_BLOCK as u32);
+    let scratch_ids = phase.alloc_workgroup_array(ScalarElement::U32, TOP_K_BLOCK as u32);
+    let scratch_chunks = phase.alloc_workgroup_array(ScalarElement::U32, TOP_K_BLOCK as u32);
 
-    phase.program_grid::<TOP_K_BLOCK>([1, 1, 1], |program| {
+    phase.program_grid(TOP_K_BLOCK as u32, [1, 1, 1], |program| {
         let lane = program.lane();
-        let rank = program.private::<U32>();
-        let scan_chunk = program.private::<U32>();
-        let local_best_value = program.private::<F32>();
-        let local_best_id = program.private::<U32>();
-        let local_best_chunk = program.private::<U32>();
-        let reduce_step = program.private::<U32>();
-        let selected_value_local = program.private::<F32>();
-        let selected_id_local = program.private::<U32>();
-        let selected_chunk_local = program.private::<U32>();
+        let rank = program.private(ElementType::U32);
+        let scan_chunk = program.private(ElementType::U32);
+        let local_best_value = program.private(ElementType::F32);
+        let local_best_id = program.private(ElementType::U32);
+        let local_best_chunk = program.private(ElementType::U32);
+        let reduce_step = program.private(ElementType::U32);
+        let selected_value_local = program.private(ElementType::F32);
+        let selected_id_local = program.private(ElementType::U32);
+        let selected_chunk_local = program.private(ElementType::U32);
 
         program.store_local(&scan_chunk, program.index(lane.clone()));
         program.loop_forever(|program| {
@@ -406,7 +406,7 @@ pub fn top_k_merge<B>(
                     .ge(Tile::literal(TileLiteral::U32(meta.chunks))),
             );
             program.store_workgroup(
-                chunk_positions,
+                &chunk_positions,
                 chunk.clone(),
                 Tile::literal(TileLiteral::U32(0)),
             );
@@ -440,7 +440,7 @@ pub fn top_k_merge<B>(
                         .clone()
                         .ge(Tile::literal(TileLiteral::U32(meta.chunks))),
                 );
-                let position = program.load_workgroup(chunk_positions, chunk.clone());
+                let position = program.load_workgroup(&chunk_positions, chunk.clone());
                 let in_chunk = position
                     .clone()
                     .lt(Tile::literal(TileLiteral::U32(meta.chunk_len)));
@@ -480,9 +480,9 @@ pub fn top_k_merge<B>(
             let best_value = program.load_local(&local_best_value);
             let best_id = program.load_local(&local_best_id);
             let best_chunk = program.load_local(&local_best_chunk);
-            program.store_workgroup(scratch_values, lane.clone(), best_value);
-            program.store_workgroup(scratch_ids, lane.clone(), best_id);
-            program.store_workgroup(scratch_chunks, lane.clone(), best_chunk);
+            program.store_workgroup(&scratch_values, lane.clone(), best_value);
+            program.store_workgroup(&scratch_ids, lane.clone(), best_id);
+            program.store_workgroup(&scratch_chunks, lane.clone(), best_chunk);
             program.workgroup_barrier();
 
             program.store_local(
@@ -495,11 +495,11 @@ pub fn top_k_merge<B>(
                 let participates = program.index(lane.clone()).lt(step.clone());
                 program.if_then(participates, |program| {
                     let other_index = program.index(lane.clone()) + step.clone();
-                    let other_value = program.load_workgroup(scratch_values, other_index.clone());
-                    let other_id = program.load_workgroup(scratch_ids, other_index.clone());
-                    let other_chunk = program.load_workgroup(scratch_chunks, other_index);
-                    let current_value = program.load_workgroup(scratch_values, lane.clone());
-                    let current_id = program.load_workgroup(scratch_ids, lane.clone());
+                    let other_value = program.load_workgroup(&scratch_values, other_index.clone());
+                    let other_id = program.load_workgroup(&scratch_ids, other_index.clone());
+                    let other_chunk = program.load_workgroup(&scratch_chunks, other_index);
+                    let current_value = program.load_workgroup(&scratch_values, lane.clone());
+                    let current_id = program.load_workgroup(&scratch_ids, lane.clone());
                     let better = better_candidate(
                         other_value.clone(),
                         other_id.clone(),
@@ -507,9 +507,9 @@ pub fn top_k_merge<B>(
                         current_id,
                     );
                     program.if_then(better, |program| {
-                        program.store_workgroup(scratch_values, lane.clone(), other_value.clone());
-                        program.store_workgroup(scratch_ids, lane.clone(), other_id.clone());
-                        program.store_workgroup(scratch_chunks, lane.clone(), other_chunk.clone());
+                        program.store_workgroup(&scratch_values, lane.clone(), other_value.clone());
+                        program.store_workgroup(&scratch_ids, lane.clone(), other_id.clone());
+                        program.store_workgroup(&scratch_chunks, lane.clone(), other_chunk.clone());
                     });
                 });
                 program.workgroup_barrier();
@@ -521,9 +521,9 @@ pub fn top_k_merge<B>(
                 .index(lane.clone())
                 .eq(Tile::literal(TileLiteral::U32(0)));
             program.if_then(first_lane, |program| {
-                let selected_value = program.load_workgroup(scratch_values, 0);
-                let selected_id = program.load_workgroup(scratch_ids, 0);
-                let selected_chunk = program.load_workgroup(scratch_chunks, 0);
+                let selected_value = program.load_workgroup(&scratch_values, 0);
+                let selected_id = program.load_workgroup(&scratch_ids, 0);
+                let selected_chunk = program.load_workgroup(&scratch_chunks, 0);
                 program.store_local(&selected_value_local, selected_value);
                 program.store_local(&selected_id_local, selected_id);
                 program.store_local(&selected_chunk_local, selected_chunk);
@@ -542,9 +542,9 @@ pub fn top_k_merge<B>(
                     .clone()
                     .lt(Tile::literal(TileLiteral::U32(meta.chunks)));
                 program.if_then(valid_chunk, |program| {
-                    let position = program.load_workgroup(chunk_positions, selected_chunk.clone());
+                    let position = program.load_workgroup(&chunk_positions, selected_chunk.clone());
                     program.store_workgroup(
-                        chunk_positions,
+                        &chunk_positions,
                         selected_chunk,
                         position + Tile::literal(TileLiteral::U32(1)),
                     );

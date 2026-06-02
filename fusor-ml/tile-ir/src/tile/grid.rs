@@ -8,15 +8,15 @@ use crate::ir::KernelIr;
 /// return the binding list alongside the IR.
 ///
 /// ```
-/// use fusor_tile_ir::{tile, Shape, TileLiteral, F32};
+/// use fusor_tile_ir::{tile, Shape, ScalarElement};
 ///
 /// let ir = tile::build(|program| {
-///     let x = program.storage_read::<F32, 1>(Shape::new([32]));
-///     let y = program.storage_write::<F32, 1>(Shape::new([32]));
-///     program.program_grid::<32>([1, 1, 1], |block| {
+///     let x = program.storage_read(ScalarElement::F32.element(), Shape::new([32]));
+///     let y = program.storage_write(ScalarElement::F32.element(), Shape::new([32]));
+///     program.program_grid(32, [1, 1, 1], |block| {
 ///         let lane = block.lane();
 ///         let mask = lane.clone().lt(32u32);
-///         let value = block.load(x.at(lane.clone()), mask.clone(), TileLiteral::f32(0.0));
+///         let value = block.load(x.at(lane.clone()), mask.clone(), 0.0);
 ///         block.store(y.at(lane), value, mask);
 ///     });
 /// });

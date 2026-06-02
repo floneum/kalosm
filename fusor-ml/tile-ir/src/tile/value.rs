@@ -1,320 +1,281 @@
-use std::marker::PhantomData;
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Rem, Sub};
 
 use crate::ir::{
-    Bool, CoopFragmentId, CoopOperandRole, ElementType, Expr, LocalRef, Numeric, StorageView,
-    TileBinaryOp, TileCompareOp, TileIndexedStoreStmt, TileLinearLoadExpr, TileLiteral,
-    TileLoadExpr, TileRef, TileStoreStmt, TileUnaryOp, F16, F32, U32,
+    Builtin, ElementType, Expr, ExprKind, Local, ScalarElement, StorageView, Tile as TileDeclRc,
+    TileBinaryOp, TileCompareOp, TileLiteral, TileUnaryOp,
 };
 
-#[derive(Copy, Clone)]
-pub struct CoopAcc<T, const ROWS: usize, const COLS: usize> {
-    pub(super) local: LocalRef,
-    pub(super) _ty: PhantomData<T>,
-}
-
-#[derive(Copy, Clone)]
-pub struct CoopFragment<T, const ROWS: usize, const COLS: usize> {
-    pub(super) id: CoopFragmentId,
-    pub(super) role: CoopOperandRole,
-    pub(super) _ty: PhantomData<T>,
-}
-
+/// A rank-1-per-lane tile value. Runtime-typed (ARBOR_DESIGN.md §2): the
+/// element type travels in the IR (`Expr::element()`), not in a Rust marker
+/// type. `Clone` is an `Rc` bump on the inner `Expr`.
 #[derive(Clone)]
-pub struct FoldIter {
-    pub(crate) count: Box<Expr>,
-}
-
-pub fn range(count: impl Into<Tile<U32>>) -> FoldIter {
-    FoldIter {
-        count: Box::new(count.into().expr),
-    }
-}
-
-pub struct Address<T, const R: usize> {
-    pub(super) view: StorageView,
-    pub(super) indices: [Box<Expr>; R],
-    pub(super) _ty: PhantomData<T>,
-}
-
-impl<T, const R: usize> Address<T, R> {
-    pub(super) fn load_expr(self, mask: Expr, fill: TileLiteral) -> Expr {
-        let mut indices = self.indices.into_iter();
-        match R {
-            1 => {
-                let fill = match self.view.buffer.element {
-                    ElementType::Vector { scalar, lanes } => {
-                        assert!((2..=4).contains(&lanes));
-                        assert_eq!(fill.element(), scalar.element());
-                        Expr::ComposeVector {
-                            scalar,
-                            lanes,
-                            values: (0..lanes).map(|_| Expr::Literal(fill)).collect(),
-                        }
-                    }
-                    element => {
-                        assert_eq!(fill.element(), element);
-                        Expr::Literal(fill)
-                    }
-                };
-                Expr::LoadLinear(TileLinearLoadExpr {
-                    src: self.view,
-                    index: indices.next().expect("rank-1 address has an index"),
-                    mask: Box::new(mask),
-                    fill: Box::new(fill),
-                })
-            }
-            2 => Expr::Load(TileLoadExpr {
-                src: crate::ir::LoadSource::Storage(self.view),
-                row: indices.next().expect("rank-2 address has a row"),
-                col: indices.next().expect("rank-2 address has a column"),
-                mask: Box::new(mask),
-                fill: Box::new(Expr::Literal(fill)),
-            }),
-            _ => panic!("tile storage I/O supports rank-1 and rank-2 addresses"),
-        }
-    }
-
-    pub(super) fn store_stmt(self, value: Expr, mask: Expr) -> crate::ir::TileStmt {
-        let mut indices = self.indices.into_iter();
-        match R {
-            1 => crate::ir::TileStmt::StoreIndexed(TileIndexedStoreStmt {
-                dst: self.view,
-                index: indices.next().expect("rank-1 address has an index"),
-                value,
-                mask: Box::new(mask),
-            }),
-            2 => crate::ir::TileStmt::Store(TileStoreStmt {
-                dst: self.view,
-                row: indices.next().expect("rank-2 address has a row"),
-                col: indices.next().expect("rank-2 address has a column"),
-                value,
-                mask: Box::new(mask),
-            }),
-            _ => panic!("tile storage I/O supports rank-1 and rank-2 addresses"),
-        }
-    }
-}
-
-pub struct Local<T> {
-    pub(super) local: LocalRef,
-    pub(super) _ty: PhantomData<T>,
-}
-
-pub struct Workgroup<T> {
-    pub(super) tile: TileRef,
-    pub(super) _ty: PhantomData<T>,
-}
-
-impl<T> Copy for Workgroup<T> {}
-
-impl<T> Clone for Workgroup<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<T> From<Workgroup<T>> for TileRef {
-    fn from(value: Workgroup<T>) -> Self {
-        value.tile
-    }
-}
-
-pub(super) fn boxed_u32_literal(value: u32) -> Box<Expr> {
-    Box::new(Expr::Literal(TileLiteral::U32(value)))
-}
-
-pub(super) fn boxed_index(value: impl Into<Tile<U32>>) -> Box<Expr> {
-    Box::new(value.into().expr)
-}
-
-pub type Mask = Tile<Bool>;
-
-pub struct Tile<T: Numeric = F32> {
+pub struct Tile {
     pub(super) expr: Expr,
-    pub(super) _ty: PhantomData<T>,
 }
 
-impl<T: Numeric> Clone for Tile<T> {
-    fn clone(&self) -> Self {
-        Self {
-            expr: self.expr.clone(),
-            _ty: PhantomData,
-        }
-    }
-}
+/// A `Bool`-typed tile used as a per-lane mask. Just a [`Tile`] whose element
+/// type is `Bool`.
+pub type Mask = Tile;
 
-impl<T: Numeric> Tile<T> {
+impl Tile {
     pub(super) fn from_expr(expr: Expr) -> Self {
-        debug_assert_eq!(expr.element(), T::ELEMENT, "typed tile element mismatch");
-        Self {
-            expr,
-            _ty: PhantomData,
-        }
+        Self { expr }
     }
 
+    pub(super) fn new(kind: ExprKind, ty: ElementType) -> Self {
+        Self::from_expr(Expr::new(kind, ty))
+    }
+
+    /// The runtime element type of this value.
+    pub fn element(&self) -> ElementType {
+        self.expr.element()
+    }
+
+    /// Borrow the underlying IR expression.
+    pub fn expr(&self) -> &Expr {
+        &self.expr
+    }
+
+    /// Consume and return the underlying IR expression.
+    pub fn into_expr(self) -> Expr {
+        self.expr
+    }
+
+    /// A typed scalar literal value.
     pub fn literal(value: impl Into<TileLiteral>) -> Self {
-        Self::from_expr(Expr::Literal(value.into()))
+        let value = value.into();
+        Self::new(ExprKind::Literal(value), value.element())
     }
 
+    /// An f32 literal.
+    pub fn f32(value: f32) -> Self {
+        Self::literal(TileLiteral::f32(value))
+    }
+
+    /// An f16 literal from raw IEEE bits.
+    pub fn f16_bits(value: u16) -> Self {
+        Self::literal(TileLiteral::F16(value))
+    }
+
+    /// A u32 literal.
+    pub fn u32(value: u32) -> Self {
+        Self::literal(TileLiteral::U32(value))
+    }
+
+    /// A bool literal.
+    pub fn bool(value: bool) -> Self {
+        Self::literal(TileLiteral::Bool(value))
+    }
+
+    /// A built-in u32 quantity (lane id, program id, subgroup builtins).
+    pub(super) fn builtin(builtin: Builtin) -> Self {
+        Self::new(ExprKind::Builtin(builtin), ElementType::U32)
+    }
+
+    /// The structural hash powering `signature_hash` / the kernel cache key.
+    /// O(1) — read from the cached bottom-up hash on the node.
+    pub fn structural_hash(&self) -> u64 {
+        self.expr.structural_hash()
+    }
+
+    /// Alias retained for the cache-key call sites that named it `signature_hash`.
     pub fn signature_hash(&self) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        self.expr.hash(&mut hasher);
-        hasher.finish()
+        self.structural_hash()
     }
 
+    /// Apply a unary op, preserving the operand element type.
     pub fn unary(self, op: TileUnaryOp) -> Self {
-        Self::from_expr(Expr::Unary {
-            op,
-            value: Box::new(self.expr),
-        })
+        let ty = self.element();
+        Self::new(
+            ExprKind::Unary {
+                op,
+                value: Box::new(self.expr),
+            },
+            ty,
+        )
     }
 
-    pub fn cast<To: Numeric>(self) -> Tile<To> {
-        Tile::from_expr(Expr::Cast {
-            value: Box::new(self.expr),
-            to: To::ELEMENT,
-        })
-    }
-
-    pub fn bitcast<To: Numeric>(self) -> Tile<To> {
-        Tile::from_expr(Expr::Bitcast {
-            value: Box::new(self.expr),
-            to: To::ELEMENT,
-        })
-    }
-
-    pub fn select(condition: Mask, accept: Self, reject: Self) -> Self {
-        Self::from_expr(Expr::Select {
-            condition: Box::new(condition.expr),
-            accept: Box::new(accept.expr),
-            reject: Box::new(reject.expr),
-        })
-    }
-
-    pub fn compare_bool(op: TileCompareOp, left: Self, right: Self) -> Mask {
-        Tile::<Bool>::from_expr(Expr::Compare {
-            op,
-            left: Box::new(left.expr),
-            right: Box::new(right.expr),
-        })
-    }
-
-    pub fn lt(&self, rhs: impl Into<Tile<T>>) -> Mask {
-        Self::compare_bool(TileCompareOp::Lt, self.clone(), rhs.into())
-    }
-
-    pub fn le(&self, rhs: impl Into<Tile<T>>) -> Mask {
-        Self::compare_bool(TileCompareOp::Le, self.clone(), rhs.into())
-    }
-
-    pub fn gt(&self, rhs: impl Into<Tile<T>>) -> Mask {
-        Self::compare_bool(TileCompareOp::Gt, self.clone(), rhs.into())
-    }
-
-    pub fn ge(&self, rhs: impl Into<Tile<T>>) -> Mask {
-        Self::compare_bool(TileCompareOp::Ge, self.clone(), rhs.into())
-    }
-
-    pub fn eq(&self, rhs: impl Into<Tile<T>>) -> Mask {
-        Self::compare_bool(TileCompareOp::Eq, self.clone(), rhs.into())
-    }
-
-    pub fn ne(&self, rhs: impl Into<Tile<T>>) -> Mask {
-        Self::compare_bool(TileCompareOp::Ne, self.clone(), rhs.into())
-    }
-
+    /// Apply a binary op, preserving the left operand element type.
     pub fn binary(self, op: TileBinaryOp, rhs: Self) -> Self {
-        Self::from_expr(Expr::Binary {
-            op,
-            left: Box::new(self.expr),
-            right: Box::new(rhs.expr),
-        })
+        let ty = self.element();
+        Self::new(
+            ExprKind::Binary {
+                op,
+                left: Box::new(self.expr),
+                right: Box::new(rhs.expr),
+            },
+            ty,
+        )
     }
 
-    pub fn max(self, rhs: impl Into<Tile<T>>) -> Self {
+    /// Numeric cast to a runtime element type.
+    pub fn cast(self, to: ElementType) -> Self {
+        Self::new(
+            ExprKind::Cast {
+                value: Box::new(self.expr),
+                to,
+            },
+            to,
+        )
+    }
+
+    /// Reinterpreting bitcast to a runtime element type.
+    pub fn bitcast(self, to: ElementType) -> Self {
+        Self::new(
+            ExprKind::Bitcast {
+                value: Box::new(self.expr),
+                to,
+            },
+            to,
+        )
+    }
+
+    /// Per-lane select; `accept`/`reject` share the result element type.
+    pub fn select(condition: Mask, accept: Self, reject: Self) -> Self {
+        let ty = accept.element();
+        Self::new(
+            ExprKind::Select {
+                condition: Box::new(condition.expr),
+                accept: Box::new(accept.expr),
+                reject: Box::new(reject.expr),
+            },
+            ty,
+        )
+    }
+
+    fn compare(op: TileCompareOp, left: Self, right: Self) -> Mask {
+        Self::new(
+            ExprKind::Compare {
+                op,
+                left: Box::new(left.expr),
+                right: Box::new(right.expr),
+            },
+            ElementType::Bool,
+        )
+    }
+
+    /// `self < rhs`.
+    pub fn lt(&self, rhs: impl Into<Tile>) -> Mask {
+        Self::compare(TileCompareOp::Lt, self.clone(), rhs.into())
+    }
+    /// `self <= rhs`.
+    pub fn le(&self, rhs: impl Into<Tile>) -> Mask {
+        Self::compare(TileCompareOp::Le, self.clone(), rhs.into())
+    }
+    /// `self > rhs`.
+    pub fn gt(&self, rhs: impl Into<Tile>) -> Mask {
+        Self::compare(TileCompareOp::Gt, self.clone(), rhs.into())
+    }
+    /// `self >= rhs`.
+    pub fn ge(&self, rhs: impl Into<Tile>) -> Mask {
+        Self::compare(TileCompareOp::Ge, self.clone(), rhs.into())
+    }
+    /// `self == rhs`.
+    pub fn eq(&self, rhs: impl Into<Tile>) -> Mask {
+        Self::compare(TileCompareOp::Eq, self.clone(), rhs.into())
+    }
+    /// `self != rhs`.
+    pub fn ne(&self, rhs: impl Into<Tile>) -> Mask {
+        Self::compare(TileCompareOp::Ne, self.clone(), rhs.into())
+    }
+
+    /// Elementwise maximum.
+    pub fn max(self, rhs: impl Into<Tile>) -> Self {
         self.binary(TileBinaryOp::Max, rhs.into())
     }
-
-    pub fn min(self, rhs: impl Into<Tile<T>>) -> Self {
+    /// Elementwise minimum.
+    pub fn min(self, rhs: impl Into<Tile>) -> Self {
         self.binary(TileBinaryOp::Min, rhs.into())
     }
-}
 
-impl Tile<F32> {
+    // ---- float math (callers ensure the element is a float at the frontend) ----
+    /// Exponential.
     pub fn exp(self) -> Self {
         self.unary(TileUnaryOp::Exp)
     }
+    /// Base-2 exponential.
     pub fn exp2(self) -> Self {
         self.unary(TileUnaryOp::Exp2)
     }
+    /// Hyperbolic tangent.
     pub fn tanh(self) -> Self {
         self.unary(TileUnaryOp::Tanh)
     }
+    /// Reciprocal square root.
     pub fn inverse_sqrt(self) -> Self {
         self.unary(TileUnaryOp::InverseSqrt)
     }
+    /// Arithmetic negation.
     pub fn neg_unary(self) -> Self {
         self.unary(TileUnaryOp::Neg)
     }
+    /// Sigmoid `1 / (1 + exp(-x))`.
     pub fn sigmoid(self) -> Self {
-        let one = Self::literal(1.0);
+        let one = Self::f32(1.0);
         one.clone() / (one + self.neg_unary().exp())
     }
+    /// SiLU `x * sigmoid(x)`.
     pub fn silu(self) -> Self {
         self.clone() * self.sigmoid()
     }
+    /// Tanh-approximation GELU.
     pub fn gelu(self) -> Self {
-        let half = Self::literal(0.5);
-        let one = Self::literal(1.0);
-        let coeff = Self::literal(0.044_715);
-        let sqrt_2_over_pi = Self::literal(0.797_884_6);
+        let half = Self::f32(0.5);
+        let one = Self::f32(1.0);
+        let coeff = Self::f32(0.044_715);
+        let sqrt_2_over_pi = Self::f32(0.797_884_6);
         let x = self;
         let x_cubed = x.clone() * x.clone() * x.clone();
         let inner = sqrt_2_over_pi * (x.clone() + coeff * x_cubed);
         half * x * (one + inner.tanh())
     }
+    /// `max(x, 0)`.
     pub fn relu(self) -> Self {
-        let zero = Self::literal(0.0);
+        let zero = Self::f32(0.0);
         let condition = self.gt(zero.clone());
         Self::select(condition, self, zero)
     }
-}
 
-impl Tile<F16> {
-    pub fn literal_bits(value: u16) -> Self {
-        Self::from_expr(Expr::Literal(TileLiteral::F16(value)))
-    }
-}
-
-impl Tile<U32> {
-    pub fn from_index(index: impl Into<Tile<U32>>) -> Self {
-        index.into()
-    }
-    pub fn bit_and(self, rhs: impl Into<Tile<U32>>) -> Self {
-        self.binary(TileBinaryOp::BitAnd, rhs.into())
-    }
-    pub fn bit_or(self, rhs: impl Into<Tile<U32>>) -> Self {
+    // ---- u32 bit ops ----
+    /// Bitwise or.
+    pub fn bit_or(self, rhs: impl Into<Tile>) -> Self {
         self.binary(TileBinaryOp::BitOr, rhs.into())
     }
-    pub fn bit_xor(self, rhs: impl Into<Tile<U32>>) -> Self {
-        self.binary(TileBinaryOp::BitXor, rhs.into())
+    /// Logical shift right (for u32 lanes).
+    pub fn shift_right(self, rhs: impl Into<Tile>) -> Self {
+        self.binary(TileBinaryOp::Shr, rhs.into())
     }
-}
-
-impl Tile<Bool> {
-    pub fn all() -> Self {
-        Self::literal(TileLiteral::Bool(true))
+    /// Shift left (for u32 lanes).
+    pub fn shift_left(self, rhs: impl Into<Tile>) -> Self {
+        self.binary(TileBinaryOp::Shl, rhs.into())
     }
-    pub fn and(self, rhs: impl Into<Tile<Bool>>) -> Self {
+    /// Unpack a `u32` lane holding two packed f16 values into a `vec2<f32>`
+    /// (lane 0 = low half, lane 1 = high half).
+    pub fn unpack2x16float(self) -> Self {
+        Self::new(
+            ExprKind::Unary {
+                op: TileUnaryOp::Unpack2x16Float,
+                value: Box::new(self.expr),
+            },
+            ElementType::vector(ScalarElement::F32, 2),
+        )
+    }
+    // ---- bool ops ----
+    /// A statically-true mask (`Bool(true)`).
+    pub fn all() -> Mask {
+        Self::bool(true)
+    }
+    /// Logical and.
+    pub fn and(self, rhs: impl Into<Tile>) -> Self {
         self.binary(TileBinaryOp::LogicalAnd, rhs.into())
     }
-    pub fn or(self, rhs: impl Into<Tile<Bool>>) -> Self {
+    /// Logical or.
+    pub fn or(self, rhs: impl Into<Tile>) -> Self {
         self.binary(TileBinaryOp::LogicalOr, rhs.into())
     }
 }
+
+// ---- conversions into Tile ----
 
 impl From<TileLiteral> for Tile {
     fn from(value: TileLiteral) -> Self {
@@ -322,60 +283,64 @@ impl From<TileLiteral> for Tile {
     }
 }
 
-impl From<f32> for Tile<F32> {
+impl From<f32> for Tile {
     fn from(value: f32) -> Self {
-        Self::literal(TileLiteral::f32(value))
+        Self::f32(value)
     }
 }
 
-impl From<u32> for Tile<U32> {
+impl From<u32> for Tile {
     fn from(value: u32) -> Self {
-        Self::literal(TileLiteral::U32(value))
+        Self::u32(value)
     }
 }
 
-impl From<i32> for Tile<U32> {
+impl From<&u32> for Tile {
+    fn from(value: &u32) -> Self {
+        Self::u32(*value)
+    }
+}
+
+impl From<i32> for Tile {
     fn from(value: i32) -> Self {
         assert!(
             value >= 0,
-            "negative integer literal cannot become a U32 tile"
+            "negative integer literal cannot become a u32 tile"
         );
-        Self::literal(TileLiteral::U32(value as u32))
+        Self::u32(value as u32)
     }
 }
 
-impl From<&u32> for Tile<U32> {
-    fn from(value: &u32) -> Self {
-        Self::literal(TileLiteral::U32(*value))
-    }
-}
-
-impl From<usize> for Tile<U32> {
+impl From<usize> for Tile {
     fn from(value: usize) -> Self {
-        Self::literal(TileLiteral::U32(value as u32))
+        Self::u32(value as u32)
     }
 }
 
-impl From<bool> for Tile<Bool> {
+impl From<bool> for Tile {
     fn from(value: bool) -> Self {
-        Self::literal(TileLiteral::Bool(value))
+        Self::bool(value)
     }
 }
 
-impl<T: Numeric> From<&Tile<T>> for Tile<T> {
-    fn from(value: &Tile<T>) -> Self {
+impl From<&Tile> for Tile {
+    fn from(value: &Tile) -> Self {
         value.clone()
     }
 }
 
+/// Box the IR expression behind an index-like tile.
+pub(super) fn boxed_index(value: impl Into<Tile>) -> Box<Expr> {
+    Box::new(value.into().expr)
+}
+
 macro_rules! impl_tile_binary {
     ($trait:ident, $method:ident, $op:expr) => {
-        impl<T, Rhs> $trait<Rhs> for Tile<T>
+        impl<Rhs> $trait<Rhs> for Tile
         where
-            T: Numeric,
-            Rhs: Into<Tile<T>>,
+            Rhs: Into<Tile>,
         {
-            type Output = Tile<T>;
+            type Output = Tile;
             fn $method(self, rhs: Rhs) -> Self::Output {
                 self.binary($op, rhs.into())
             }
@@ -391,3 +356,144 @@ impl_tile_binary!(Rem, rem, TileBinaryOp::Rem);
 impl_tile_binary!(BitAnd, bitand, TileBinaryOp::BitAnd);
 impl_tile_binary!(BitOr, bitor, TileBinaryOp::BitOr);
 impl_tile_binary!(BitXor, bitxor, TileBinaryOp::BitXor);
+
+/// A private per-invocation local, runtime-typed. Holds the `Rc<LocalDecl>`;
+/// `clone` is an `Rc` bump.
+#[derive(Clone)]
+pub struct PrivateLocal {
+    pub(super) local: Local,
+}
+
+impl PrivateLocal {
+    /// The runtime element type of this local.
+    pub fn element(&self) -> ElementType {
+        self.local.element
+    }
+
+    pub(super) fn decl(&self) -> &Local {
+        &self.local
+    }
+}
+
+/// A cooperative-matrix accumulator: a mutable coop-`C`-typed private local.
+/// Coop ops are value-producing and composed through `store_local`/`load_local`.
+#[derive(Clone)]
+pub struct CoopAcc {
+    pub(super) local: Local,
+}
+
+impl CoopAcc {
+    /// Element type (a `CoopMatrix { role: C, .. }`).
+    pub fn element(&self) -> ElementType {
+        self.local.element
+    }
+
+    pub(super) fn decl(&self) -> &Local {
+        &self.local
+    }
+}
+
+/// A workgroup (or private) scratch tile handle, runtime-typed. Holds the
+/// `Rc<TileDecl>`; `clone` is an `Rc` bump.
+#[derive(Clone)]
+pub struct WorkgroupTile {
+    pub(super) tile: TileDeclRc,
+}
+
+impl WorkgroupTile {
+    /// The runtime element type of this tile.
+    pub fn element(&self) -> ElementType {
+        self.tile.element
+    }
+
+    pub(super) fn decl(&self) -> &TileDeclRc {
+        &self.tile
+    }
+}
+
+/// Iteration bound for a counted loop / fold. Carries the (boxed) count
+/// expression so `range(n)` reads naturally at call sites.
+#[derive(Clone)]
+pub struct FoldIter {
+    pub(crate) count: Box<Expr>,
+}
+
+/// Counted-loop bound for `fold`. Accepts any index-like tile.
+pub fn range(count: impl Into<Tile>) -> FoldIter {
+    FoldIter {
+        count: boxed_index(count),
+    }
+}
+
+/// A workgroup scratch tile + per-element source address — the components of a
+/// storage/quant access. Returned by [`Storage::at`](super::Storage::at).
+pub struct Address {
+    pub(super) view: StorageView,
+    pub(super) addr: crate::ir::Addr,
+}
+
+impl Address {
+    pub(super) fn load_expr(self, mask: Expr, fill: Expr) -> Expr {
+        // A dense storage load produces the buffer's element type verbatim: a
+        // load from a vector buffer is a vector value, a scalar buffer a scalar.
+        let element = self.view.buffer.element;
+        // For a vector buffer the masked-out fill must itself be a vector, so
+        // compose the scalar fill literal across all lanes (the old builder did
+        // this inline). The lowerer's `cast_tile_value` does a scalar cast, not
+        // a splat, so the fill has to arrive pre-composed.
+        let fill = match element {
+            ElementType::Vector { scalar, lanes } => {
+                let scalar_element = scalar.element();
+                let fill = if fill.element() == scalar_element {
+                    fill
+                } else {
+                    Expr::new(
+                        ExprKind::Cast {
+                            value: Box::new(fill),
+                            to: scalar_element,
+                        },
+                        scalar_element,
+                    )
+                };
+                Expr::new(
+                    ExprKind::Vec {
+                        scalar,
+                        lanes,
+                        parts: (0..lanes).map(|_| fill.clone()).collect(),
+                    },
+                    element,
+                )
+            }
+            _ => fill,
+        };
+        Expr::new(
+            ExprKind::Load {
+                src: crate::ir::Source::Storage(self.view),
+                addr: self.addr,
+                mask: Box::new(mask),
+                fill: Box::new(fill),
+            },
+            element,
+        )
+    }
+
+    pub(super) fn store_stmt(self, value: Expr, mask: Expr) -> crate::ir::Stmt {
+        crate::ir::Stmt::Store {
+            dst: self.view,
+            addr: self.addr,
+            value,
+            mask: Box::new(mask),
+        }
+    }
+}
+
+/// Default fill expression for a given scalar element (the zero of that type).
+pub(super) fn zero_fill(element: ScalarElement) -> Expr {
+    let literal = match element {
+        ScalarElement::F32 => TileLiteral::f32(0.0),
+        ScalarElement::F16 => TileLiteral::F16(0),
+        ScalarElement::U32 => TileLiteral::U32(0),
+        ScalarElement::Bool => TileLiteral::Bool(false),
+    };
+    Expr::new(ExprKind::Literal(literal), element.element())
+}

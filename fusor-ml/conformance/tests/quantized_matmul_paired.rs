@@ -252,7 +252,7 @@ async fn q4k_paired_pattern_resolves_to_single_kernel() {
     let Tensor::Gpu(natural_gpu) = output else {
         panic!("expected GPU tensor");
     };
-    let natural_kernels = gpu_device.resolve_batch(&[natural_gpu.key()]);
+    let natural_kernels = natural_gpu.count_kernels_to_resolve();
 
     assert_eq!(
         natural_kernels, 1,
@@ -348,7 +348,7 @@ async fn q4k_paired_with_bias_resolves_to_single_kernel() {
     let Tensor::Gpu(gpu_out) = output else {
         panic!("expected GPU tensor");
     };
-    let kernels = gpu_device.resolve_batch(&[gpu_out.key()]);
+    let kernels = gpu_out.count_kernels_to_resolve();
     assert_eq!(
         kernels, 1,
         "expected fuser to collapse biased silu(gate+gb)*up_biased to 1 dispatch, got {kernels}"

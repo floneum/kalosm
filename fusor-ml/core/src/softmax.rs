@@ -158,8 +158,9 @@ impl SoftmaxOperation {
         Some(axis_len.div_ceil(block))
     }
 
-    fn dispatch_softmax<E: tile_ir::Numeric>(
+    fn dispatch_softmax(
         &self,
+        element: tile_ir::ElementType,
         device: &Device,
         input: &TensorData,
         output: &TensorData,
@@ -189,14 +190,15 @@ impl SoftmaxOperation {
                 let mut kb = tile_ir::KernelBuilder::<()>::new();
                 let input_ref = tile_ir::KernelTensorRef::new((), layout.clone());
                 let output_ref = tile_ir::KernelTensorRef::new((), layout);
-                tile_ir_kernels::softmax::<E, _>(&mut kb, input_ref, output_ref, meta)?;
+                tile_ir_kernels::softmax(&mut kb, element, input_ref, output_ref, meta)?;
                 Some(kb.finish().0)
             },
         )
     }
 
-    fn dispatch_split_softmax<E: tile_ir::Numeric>(
+    fn dispatch_split_softmax(
         &self,
+        element: tile_ir::ElementType,
         device: &Device,
         input: &TensorData,
         output: &TensorData,
@@ -243,8 +245,9 @@ impl SoftmaxOperation {
                 let mut kb = tile_ir::KernelBuilder::<()>::new();
                 let input_ref = tile_ir::KernelTensorRef::new((), partial_layout.clone());
                 let scratch_ref = tile_ir::KernelTensorRef::new((), partial_layout);
-                tile_ir_kernels::softmax_partials::<E, _>(
+                tile_ir_kernels::softmax_partials(
                     &mut kb,
+                    element,
                     input_ref,
                     scratch_ref,
                     partial_meta,
@@ -321,8 +324,9 @@ impl SoftmaxOperation {
                 let input_ref = tile_ir::KernelTensorRef::new((), write_layout.clone());
                 let scratch_ref = tile_ir::KernelTensorRef::new((), write_layout.clone());
                 let output_ref = tile_ir::KernelTensorRef::new((), write_layout);
-                tile_ir_kernels::softmax_write::<E, _>(
+                tile_ir_kernels::softmax_write(
                     &mut kb,
+                    element,
                     input_ref,
                     scratch_ref,
                     output_ref,
@@ -411,16 +415,16 @@ impl Operation for SoftmaxOperation {
 
         match self.datatype {
             DataTypeEnum::F32 if meta.split_blocks == 1 => {
-                self.dispatch_softmax::<tile_ir::F32>(&device, input, output, meta)
+                self.dispatch_softmax(tile_ir::ElementType::F32, &device, input, output, meta)
             }
             DataTypeEnum::F16 if meta.split_blocks == 1 => {
-                self.dispatch_softmax::<tile_ir::F16>(&device, input, output, meta)
+                self.dispatch_softmax(tile_ir::ElementType::F16, &device, input, output, meta)
             }
             DataTypeEnum::F32 => {
-                self.dispatch_split_softmax::<tile_ir::F32>(&device, input, output, meta)
+                self.dispatch_split_softmax(tile_ir::ElementType::F32, &device, input, output, meta)
             }
             DataTypeEnum::F16 => {
-                self.dispatch_split_softmax::<tile_ir::F16>(&device, input, output, meta)
+                self.dispatch_split_softmax(tile_ir::ElementType::F16, &device, input, output, meta)
             }
             DataTypeEnum::U32 => None,
         }

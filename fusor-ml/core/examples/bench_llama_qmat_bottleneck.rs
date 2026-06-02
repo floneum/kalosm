@@ -174,7 +174,6 @@ fn run_batch(
     paired: bool,
 ) -> usize {
     let mut outputs = Vec::with_capacity(dispatches);
-    let mut keys = Vec::with_capacity(dispatches);
     for _ in 0..dispatches {
         let output = if let Some((first, second)) = add2 {
             input.q_mat_mul_add2(weight, first, second)
@@ -183,10 +182,9 @@ fn run_batch(
         } else {
             input.q_mat_mul(weight)
         };
-        keys.push(output.key());
         outputs.push(output);
     }
-    let kernels = device.resolve_batch(&keys);
+    let kernels = outputs.iter().map(Tensor::count_kernels_to_resolve).sum();
     device.poll_wait();
     drop(outputs);
     kernels

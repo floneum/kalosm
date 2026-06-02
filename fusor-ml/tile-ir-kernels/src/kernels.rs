@@ -7,6 +7,7 @@ mod mirostat;
 mod qdequantize;
 mod qgemv;
 mod qgemv_paired_q4k;
+mod qgemv_q6k;
 mod qmatmul;
 mod qmatmul_workgroup;
 mod quantized_matrix;

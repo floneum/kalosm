@@ -1,47 +1,6 @@
 use super::*;
 
 impl<'a> Lowerer<'a> {
-    pub(in crate::lower) fn tile_reduce_identity(
-        op: TileReduceOp,
-        element: ElementType,
-    ) -> Expression {
-        let (f32_value, f16_value, u32_value, bool_value) = match op {
-            TileReduceOp::Sum => (0.0_f32, 0.0_f32, 0_u32, false),
-            TileReduceOp::Product => (1.0_f32, 1.0_f32, 1_u32, true),
-            TileReduceOp::Max => (f32::MIN, -65504.0, 0_u32, false),
-            TileReduceOp::Min => (f32::MAX, 65504.0, u32::MAX, true),
-        };
-        match element {
-            ElementType::F32 => Expression::Literal(Literal::F32(f32_value)),
-            ElementType::F16 => Expression::Literal(Literal::F16(half::f16::from_f32(f16_value))),
-            ElementType::U32 => Expression::Literal(Literal::U32(u32_value)),
-            ElementType::Bool => Expression::Literal(Literal::Bool(bool_value)),
-            ElementType::Vector { .. } => panic!("vector reductions are not supported"),
-            ElementType::CoopMatrix { .. } => {
-                panic!("cooperative-matrix reductions are not supported")
-            }
-        }
-    }
-
-    pub(in crate::lower) fn tile_reduce_expression(
-        op: TileReduceOp,
-        left: Handle<Expression>,
-        right: Handle<Expression>,
-    ) -> Expression {
-        Self::tile_binary_expression(op.binary(), left, right)
-    }
-
-    pub(in crate::lower) fn element_scratch_index(
-        element: ElementType,
-    ) -> Result<usize, LowerError> {
-        SCRATCH_ELEMENTS
-            .iter()
-            .position(|candidate| *candidate == element)
-            .ok_or(LowerError::UnsupportedOperation(
-                "unsupported tile value type",
-            ))
-    }
-
     pub(in crate::lower) fn tile_literal(value: TileLiteral) -> Expression {
         match value {
             TileLiteral::F32(value) => Expression::Literal(Literal::F32(value.get())),
@@ -130,6 +89,7 @@ impl<'a> Lowerer<'a> {
             TileUnaryOp::Acosh => MathFunction::Acosh,
             TileUnaryOp::Atanh => MathFunction::Atanh,
             TileUnaryOp::Abs => MathFunction::Abs,
+            TileUnaryOp::Unpack2x16Float => MathFunction::Unpack2x16float,
             TileUnaryOp::Neg => return None,
         })
     }
@@ -148,6 +108,8 @@ impl<'a> Lowerer<'a> {
             TileBinaryOp::BitAnd => BinaryOperator::And,
             TileBinaryOp::BitOr => BinaryOperator::InclusiveOr,
             TileBinaryOp::BitXor => BinaryOperator::ExclusiveOr,
+            TileBinaryOp::Shr => BinaryOperator::ShiftRight,
+            TileBinaryOp::Shl => BinaryOperator::ShiftLeft,
             TileBinaryOp::LogicalAnd => BinaryOperator::LogicalAnd,
             TileBinaryOp::LogicalOr => BinaryOperator::LogicalOr,
             TileBinaryOp::Pow | TileBinaryOp::Min | TileBinaryOp::Max => {

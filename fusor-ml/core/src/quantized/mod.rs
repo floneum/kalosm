@@ -239,25 +239,25 @@ fn qmatrix_storage_layout_for_parts_with_env(
     shader_f16_supported: bool,
     env_override: Option<&str>,
 ) -> QMatrixStorageLayout {
+    // Q6K is always stored with f32 scales. Its native block is 210 bytes —
+    // not a multiple of 4 — so blocks past the first are not word-aligned, which
+    // the raw-word ggml qgemv dot (`qgemv_q6k_ggml`) cannot address. The
+    // f32-scale layout is 212 bytes (word-aligned) and feeds that amortized
+    // decode; the +2 bytes/block (~0.9%) is paid back many times over by the
+    // faster kernel. Q4K/Q5K keep their native f16-scale layout (their native
+    // blocks are word-aligned, and native f16 scales read less memory).
+    if ty == GgmlType::Q6K {
+        return QMatrixStorageLayout::GpuF32Scales;
+    }
     if matches!(
         ty,
-        GgmlType::Q4_0
-            | GgmlType::Q5_0
-            | GgmlType::Q8_0
-            | GgmlType::Q4K
-            | GgmlType::Q5K
-            | GgmlType::Q6K
+        GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K
     ) && native_half_scale_storage_enabled(shader_f16_supported, env_override)
     {
         QMatrixStorageLayout::Native
     } else if matches!(
         ty,
-        GgmlType::Q4_0
-            | GgmlType::Q5_0
-            | GgmlType::Q8_0
-            | GgmlType::Q4K
-            | GgmlType::Q5K
-            | GgmlType::Q6K
+        GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K
     ) {
         QMatrixStorageLayout::GpuF32Scales
     } else {

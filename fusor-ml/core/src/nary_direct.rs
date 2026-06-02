@@ -136,11 +136,24 @@ impl NaryOperation {
     }
 }
 
+/// Map a [`DataTypeEnum`] to the runtime tile-ir element type. Used to carry
+/// the element type of a `ValueTile`/`Storage2` now that the tile-ir API is
+/// runtime-typed (ARBOR_DESIGN.md §2): the `Tile`/`Storage` values are
+/// non-generic and the element travels in the IR, so the `ValueTile`/`Storage2`
+/// tag exists only to drive the cast/load/store routing below.
+pub(crate) fn datatype_element(datatype: DataTypeEnum) -> tile_ir::ElementType {
+    match datatype {
+        DataTypeEnum::F32 => tile_ir::ElementType::F32,
+        DataTypeEnum::F16 => tile_ir::ElementType::F16,
+        DataTypeEnum::U32 => tile_ir::ElementType::U32,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum ValueTile {
-    F32(tile_ir::tile::Tile<tile_ir::F32>),
-    F16(tile_ir::tile::Tile<tile_ir::F16>),
-    U32(tile_ir::tile::Tile<tile_ir::U32>),
+    F32(tile_ir::tile::Tile),
+    F16(tile_ir::tile::Tile),
+    U32(tile_ir::tile::Tile),
     Bool(tile_ir::tile::Mask),
 }
 
@@ -148,16 +161,18 @@ impl ValueTile {
     pub(crate) fn cast_to(self, target: DataTypeEnum) -> Self {
         match (self, target) {
             (Self::F32(v), DataTypeEnum::F32) => Self::F32(v),
-            (Self::F32(v), DataTypeEnum::F16) => Self::F16(v.cast::<tile_ir::F16>()),
-            (Self::F32(v), DataTypeEnum::U32) => Self::U32(v.cast::<tile_ir::U32>()),
-            (Self::F16(v), DataTypeEnum::F32) => Self::F32(v.cast::<tile_ir::F32>()),
+            (Self::F32(v), DataTypeEnum::F16) => Self::F16(v.cast(tile_ir::ElementType::F16)),
+            (Self::F32(v), DataTypeEnum::U32) => Self::U32(v.cast(tile_ir::ElementType::U32)),
+            (Self::F16(v), DataTypeEnum::F32) => Self::F32(v.cast(tile_ir::ElementType::F32)),
             (Self::F16(v), DataTypeEnum::F16) => Self::F16(v),
-            (Self::F16(v), DataTypeEnum::U32) => Self::U32(v.cast::<tile_ir::U32>()),
-            (Self::U32(v), DataTypeEnum::F32) => Self::F32(v.cast::<tile_ir::F32>()),
-            (Self::U32(v), DataTypeEnum::F16) => Self::F16(v.cast::<tile_ir::F16>()),
+            (Self::F16(v), DataTypeEnum::U32) => Self::U32(v.cast(tile_ir::ElementType::U32)),
+            (Self::U32(v), DataTypeEnum::F32) => Self::F32(v.cast(tile_ir::ElementType::F32)),
+            (Self::U32(v), DataTypeEnum::F16) => Self::F16(v.cast(tile_ir::ElementType::F16)),
             (Self::U32(v), DataTypeEnum::U32) => Self::U32(v),
             (Self::Bool(v), DataTypeEnum::F32) => Self::F32(bool_as_f32(v)),
-            (Self::Bool(v), DataTypeEnum::F16) => Self::F16(bool_as_f32(v).cast::<tile_ir::F16>()),
+            (Self::Bool(v), DataTypeEnum::F16) => {
+                Self::F16(bool_as_f32(v).cast(tile_ir::ElementType::F16))
+            }
             (Self::Bool(v), DataTypeEnum::U32) => Self::U32(bool_as_u32(v)),
         }
     }
@@ -169,14 +184,14 @@ impl ValueTile {
         }
     }
 
-    pub(crate) fn into_f16(self) -> tile_ir::tile::Tile<tile_ir::F16> {
+    pub(crate) fn into_f16(self) -> tile_ir::tile::Tile {
         match self.cast_to(DataTypeEnum::F16) {
             Self::F16(v) => v,
             _ => unreachable!(),
         }
     }
 
-    pub(crate) fn into_u32(self) -> tile_ir::tile::Tile<tile_ir::U32> {
+    pub(crate) fn into_u32(self) -> tile_ir::tile::Tile {
         match self.cast_to(DataTypeEnum::U32) {
             Self::U32(v) => v,
             _ => unreachable!(),
@@ -187,7 +202,7 @@ impl ValueTile {
         match self {
             Self::Bool(v) => v,
             Self::F32(v) => v.ne(0.0),
-            Self::F16(v) => v.ne(tile_ir::tile::Tile::<tile_ir::F16>::literal_bits(0)),
+            Self::F16(v) => v.ne(tile_ir::tile::Tile::f16_bits(0)),
             Self::U32(v) => v.ne(0u32),
         }
     }
@@ -213,13 +228,28 @@ impl ValueTile {
 
     fn compare(self, op: tile_ir::TileCompareOp, rhs: Self, output: DataTypeEnum) -> Self {
         let mask = match (self, rhs) {
-            (Self::F32(a), Self::F32(b)) => tile_ir::tile::Tile::compare_bool(op, a, b),
-            (Self::F16(a), Self::F16(b)) => tile_ir::tile::Tile::compare_bool(op, a, b),
-            (Self::U32(a), Self::U32(b)) => tile_ir::tile::Tile::compare_bool(op, a, b),
-            (Self::Bool(a), Self::Bool(b)) => tile_ir::tile::Tile::compare_bool(op, a, b),
+            (Self::F32(a), Self::F32(b))
+            | (Self::F16(a), Self::F16(b))
+            | (Self::U32(a), Self::U32(b))
+            | (Self::Bool(a), Self::Bool(b)) => compare_bool(op, a, b),
             _ => panic!("nary direct compare called with mismatched tile types"),
         };
         ValueTile::Bool(mask).cast_to(output)
+    }
+}
+
+fn compare_bool(
+    op: tile_ir::TileCompareOp,
+    left: tile_ir::tile::Tile,
+    right: tile_ir::tile::Tile,
+) -> tile_ir::tile::Mask {
+    match op {
+        tile_ir::TileCompareOp::Lt => left.lt(right),
+        tile_ir::TileCompareOp::Le => left.le(right),
+        tile_ir::TileCompareOp::Gt => left.gt(right),
+        tile_ir::TileCompareOp::Ge => left.ge(right),
+        tile_ir::TileCompareOp::Eq => left.eq(right),
+        tile_ir::TileCompareOp::Ne => left.ne(right),
     }
 }
 
@@ -227,21 +257,21 @@ fn bool_as_f32(value: tile_ir::tile::Mask) -> tile_ir::tile::Tile {
     tile_ir::tile::Tile::select(value, 1.0.into(), 0.0.into())
 }
 
-fn bool_as_u32(value: tile_ir::tile::Mask) -> tile_ir::tile::Tile<tile_ir::U32> {
+fn bool_as_u32(value: tile_ir::tile::Mask) -> tile_ir::tile::Tile {
     tile_ir::tile::Tile::select(value, 1u32.into(), 0u32.into())
 }
 
 pub(crate) enum Storage2 {
-    F32(tile_ir::tile::Storage<tile_ir::F32, 2>),
-    F16(tile_ir::tile::Storage<tile_ir::F16, 2>),
-    U32(tile_ir::tile::Storage<tile_ir::U32, 2>),
+    F32(tile_ir::tile::Storage),
+    F16(tile_ir::tile::Storage),
+    U32(tile_ir::tile::Storage),
 }
 
 impl Storage2 {
     pub(crate) fn load(
         &self,
         program: &tile_ir::tile::TileBlock<'_>,
-        index: tile_ir::tile::Tile<tile_ir::U32>,
+        index: tile_ir::tile::Tile,
         mask: tile_ir::tile::Mask,
     ) -> ValueTile {
         let index = tile_ir::tile::Tile::select(mask, index, tile_u32(0));
@@ -268,7 +298,7 @@ impl Storage2 {
     pub(crate) fn store(
         &self,
         program: &mut tile_ir::tile::TileBlock<'_>,
-        index: tile_ir::tile::Tile<tile_ir::U32>,
+        index: tile_ir::tile::Tile,
         value: ValueTile,
         mask: tile_ir::tile::Mask,
     ) {
@@ -302,25 +332,16 @@ pub(crate) fn declare_storage(
         tile_ir::Shape::new([1, meta.allocation_len]),
         &[0, 1],
     );
-    match (meta.datatype, write) {
-        (DataTypeEnum::F32, true) => {
-            Storage2::F32(phase.storage_write_with_layout_offset::<tile_ir::F32, 2>(layout, 0))
-        }
-        (DataTypeEnum::F32, false) => {
-            Storage2::F32(phase.storage_read_with_layout_offset::<tile_ir::F32, 2>(layout, 0))
-        }
-        (DataTypeEnum::F16, true) => {
-            Storage2::F16(phase.storage_write_with_layout_offset::<tile_ir::F16, 2>(layout, 0))
-        }
-        (DataTypeEnum::F16, false) => {
-            Storage2::F16(phase.storage_read_with_layout_offset::<tile_ir::F16, 2>(layout, 0))
-        }
-        (DataTypeEnum::U32, true) => {
-            Storage2::U32(phase.storage_write_with_layout_offset::<tile_ir::U32, 2>(layout, 0))
-        }
-        (DataTypeEnum::U32, false) => {
-            Storage2::U32(phase.storage_read_with_layout_offset::<tile_ir::U32, 2>(layout, 0))
-        }
+    let element = datatype_element(meta.datatype);
+    let storage = if write {
+        phase.storage_write_with_layout_offset(element, layout, 0)
+    } else {
+        phase.storage_read_with_layout_offset(element, layout, 0)
+    };
+    match meta.datatype {
+        DataTypeEnum::F32 => Storage2::F32(storage),
+        DataTypeEnum::F16 => Storage2::F16(storage),
+        DataTypeEnum::U32 => Storage2::U32(storage),
     }
 }
 
@@ -343,7 +364,7 @@ fn build_nary_tile_ir<const BLOCK_SIZE: usize>(
             .map(|(binding, meta)| declare_storage(phase, meta, binding == output_index))
             .collect::<Vec<_>>();
 
-        phase.program_grid::<BLOCK_SIZE>(dispatch_size, |program| {
+        phase.program_grid(BLOCK_SIZE as u32, dispatch_size, |program| {
             let lane = program.lane();
             let group = linear_group(program, dispatch_size);
             let flat_index = group * BLOCK_SIZE as u32 + lane.clone();
@@ -368,7 +389,7 @@ fn build_nary_tile_ir<const BLOCK_SIZE: usize>(
 fn eval_nary_expr(
     program: &mut tile_ir::tile::TileBlock<'_>,
     expr: &NaryExpr,
-    dims: &[tile_ir::tile::Tile<tile_ir::U32>],
+    dims: &[tile_ir::tile::Tile],
     storages: &[Storage2],
     metas: &[TensorMeta],
     mask: tile_ir::tile::Mask,
@@ -417,7 +438,7 @@ fn eval_nary_expr(
 fn eval_associative_binary_tree(
     program: &mut tile_ir::tile::TileBlock<'_>,
     expr: &NaryExpr,
-    dims: &[tile_ir::tile::Tile<tile_ir::U32>],
+    dims: &[tile_ir::tile::Tile],
     storages: &[Storage2],
     metas: &[TensorMeta],
     mask: tile_ir::tile::Mask,
@@ -759,9 +780,9 @@ fn compare_const(
 }
 
 pub(crate) fn output_dims_from_flat(
-    flat: tile_ir::tile::Tile<tile_ir::U32>,
+    flat: tile_ir::tile::Tile,
     shape: &[usize],
-) -> Vec<tile_ir::tile::Tile<tile_ir::U32>> {
+) -> Vec<tile_ir::tile::Tile> {
     (0..shape.len())
         .map(|axis| {
             let dim = shape[axis] as u32;
@@ -783,8 +804,8 @@ pub(crate) fn output_dims_from_flat(
 
 pub(crate) fn layout_index(
     meta: &TensorMeta,
-    coords: &[tile_ir::tile::Tile<tile_ir::U32>],
-) -> tile_ir::tile::Tile<tile_ir::U32> {
+    coords: &[tile_ir::tile::Tile],
+) -> tile_ir::tile::Tile {
     let mut index = tile_u32(meta.offset);
     for (axis, (coord, stride)) in coords.iter().zip(&meta.strides).enumerate() {
         if *stride == 0 || meta.shape.get(axis).copied() == Some(1) {
@@ -798,7 +819,7 @@ pub(crate) fn layout_index(
 pub(crate) fn linear_group(
     program: &tile_ir::tile::TileBlock<'_>,
     dispatch_size: [u32; 3],
-) -> tile_ir::tile::Tile<tile_ir::U32> {
+) -> tile_ir::tile::Tile {
     program.program_id(tile_ir::WorkgroupAxis::X)
         + program.program_id(tile_ir::WorkgroupAxis::Y) * dispatch_size[0]
         + program.program_id(tile_ir::WorkgroupAxis::Z)
@@ -819,7 +840,7 @@ pub(crate) fn tile_literal(value: NaryScalar) -> ValueTile {
     }
 }
 
-pub(crate) fn tile_u32(value: u32) -> tile_ir::tile::Tile<tile_ir::U32> {
+pub(crate) fn tile_u32(value: u32) -> tile_ir::tile::Tile {
     tile_ir::tile::Tile::literal(tile_ir::TileLiteral::U32(value))
 }
 

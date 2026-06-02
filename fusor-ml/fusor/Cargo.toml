@@ -20,9 +20,9 @@ half = "2.4"
 tokio = { version = "1.43.0", features = ["full"] }
 half = "2.4"
 criterion.workspace = true
-candle-core = { workspace = true }
-candle-nn = { workspace = true }
-candle-transformers = { workspace = true }
+candle-core = "0.9.0"
+candle-nn = "0.9.0"
+candle-transformers = "0.9.0"
 kalosm-common = { workspace = true }
 kalosm-model-types.workspace = true
 rand.workspace = true
@@ -30,11 +30,6 @@ futures = "0.3.31"
 fusor-core = { path = "../core" }
 fusor-gguf = { path = "../gguf" }
 ndarray = "0.16.1"
-
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-candle-core = { workspace = true, features = ["metal"] }
-candle-nn = { workspace = true, features = ["metal"] }
-candle-transformers = { workspace = true, features = ["metal"] }
 
 [lib]
 bench = false

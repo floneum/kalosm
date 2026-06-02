@@ -304,9 +304,17 @@ impl QMatMulOperation {
         let post_with_extras_for_ir = post_epilogue_with_extras.clone();
         let ir = tile_ir::tile::build(move |phase| {
             if f16_storage {
-                let a = tile_storage_read_with_direct_layout_typed::<tile_ir::F16>(phase, a_view);
+                let a = tile_storage_read_with_direct_layout_typed(
+                    phase,
+                    tile_ir::ElementType::F16,
+                    a_view,
+                );
                 let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
-                let y = tile_storage_write_with_direct_layout_typed::<tile_ir::F16>(phase, y_view);
+                let y = tile_storage_write_with_direct_layout_typed(
+                    phase,
+                    tile_ir::ElementType::F16,
+                    y_view,
+                );
                 let epilogues = tile_ir_kernels::QmatmulEpilogues::default();
                 if m == 1 {
                     tile_ir_kernels::qgemv_workgroup_storage_f16_with_epilogue(
@@ -342,7 +350,8 @@ impl QMatMulOperation {
                     } else {
                         let shape = extra.layout().shape();
                         assert_eq!(shape.len(), 1);
-                        QmatmulExtraStorage::Column(phase.storage_read::<tile_ir::F32, 1>(
+                        QmatmulExtraStorage::Column(phase.storage_read(
+                            tile_ir::ElementType::F32,
                             tile_ir::Shape::new([shape[0] as u32]),
                         ))
                     }
@@ -363,7 +372,8 @@ impl QMatMulOperation {
                     } else {
                         let shape = extra.layout().shape();
                         assert_eq!(shape.len(), 1);
-                        QmatmulExtraStorage::Column(phase.storage_read::<tile_ir::F32, 1>(
+                        QmatmulExtraStorage::Column(phase.storage_read(
+                            tile_ir::ElementType::F32,
                             tile_ir::Shape::new([shape[0] as u32]),
                         ))
                     }
@@ -454,7 +464,7 @@ impl QMatMulOperation {
             };
             tile_ir_kernels::qmatmul_with_epilogue(phase, &a, &b, &y, &epilogues, tile.bm, tile.bn);
         });
-        let dispatch_size = ir.body().grid;
+        let dispatch_size = ir.grid;
         if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
             return None;
         }

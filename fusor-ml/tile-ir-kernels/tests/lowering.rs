@@ -1,6 +1,6 @@
 use fusor_tile_ir::{
     tile, ElementType, F32Bits, GgmlQuantFormat, KernelBuilder, KernelTensorRef, Layout,
-    MemoryLevel, NagaKernel, Shape, F16, F32,
+    MemoryLevel, NagaKernel, ScalarElement, Shape,
 };
 use fusor_tile_ir_kernels::{
     batched_gemv_with_epilogues, batched_matmul_with_epilogues, flash_attention,
@@ -22,8 +22,9 @@ fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
 fn streaming_flash_attention_regression_shape_lowers_to_naga() {
     let layout = linear_storage_layout();
     let mut kb = KernelBuilder::<()>::new();
-    flash_attention::<F32, ()>(
+    flash_attention::<()>(
         &mut kb,
+        ScalarElement::F32.element(),
         FlashAttentionTensors {
             q: KernelTensorRef::new((), layout.clone()),
             k: KernelTensorRef::new((), layout.clone()),
@@ -96,9 +97,9 @@ fn rms_norm_vec4_minimal_lowers() {
 
 fn qgemv_ir(format: GgmlQuantFormat, rows: u32, cols: u32) -> fusor_tile_ir::KernelIr {
     tile::build(|program| {
-        let a = program.storage_read::<F32, 2>(Shape::new([1, rows]));
+        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, rows]));
         let b = quantized_matrix(program, format, rows, cols);
-        let y = program.storage_write::<F32, 2>(Shape::new([1, cols]));
+        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, cols]));
         qgemv_with_epilogue(program, &a, &b, &y, 1, Option::<&UnaryEpilogue>::None);
     })
 }
@@ -113,6 +114,12 @@ fn generic_q8_qgemv_lowers() {
 fn q4k_ggml_qgemv_lowers() {
     let ir = qgemv_ir(GgmlQuantFormat::Q4K, 4096, 8192);
     lower_or_fail(&ir, "q4k ggml qgemv");
+}
+
+#[test]
+fn q4k_mid_qgemv_with_three_cols_per_subgroup_lowers() {
+    let ir = qgemv_ir(GgmlQuantFormat::Q4K, 4096, 5120);
+    lower_or_fail(&ir, "q4k mid qgemv 4x3");
 }
 
 #[test]
@@ -132,9 +139,9 @@ fn q4k_paired_epilogue_lowers() {
     let ir = tile::build(|program| {
         let rows = 4096;
         let pair_cols = 4096;
-        let a = program.storage_read::<F32, 2>(Shape::new([1, rows]));
+        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, rows]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q4K, rows, pair_cols * 2);
-        let y = program.storage_write::<F32, 2>(Shape::new([1, pair_cols]));
+        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, pair_cols]));
         let epilogue =
             PairedEpilogue::with_extras("mul", 0, |tiles| tiles[0].clone() * tiles[1].clone());
         qgemv_q4k_paired(
@@ -160,9 +167,9 @@ fn q4k_native_paired_epilogue_lowers() {
     let ir = tile::build(|program| {
         let rows = 4096;
         let pair_cols = 4096;
-        let a = program.storage_read::<F32, 2>(Shape::new([1, rows]));
+        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, rows]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, rows, pair_cols * 2);
-        let y = program.storage_write::<F32, 2>(Shape::new([1, pair_cols]));
+        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, pair_cols]));
         let epilogue =
             PairedEpilogue::with_extras("mul", 0, |tiles| tiles[0].clone() * tiles[1].clone());
         qgemv_q4k_paired(
@@ -186,9 +193,9 @@ fn q4k_native_paired_epilogue_lowers() {
 #[test]
 fn scalar_qmatmul_lowers() {
     let ir = tile::build(|program| {
-        let a = program.storage_read::<F32, 2>(Shape::new([8, 256]));
+        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([8, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 16);
-        let y = program.storage_write::<F32, 2>(Shape::new([8, 16]));
+        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([8, 16]));
         qmatmul_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 8, 4);
     });
     lower_or_fail(&ir, "scalar qmatmul");
@@ -197,9 +204,9 @@ fn scalar_qmatmul_lowers() {
 #[test]
 fn cooperative_qmatmul_lowers() {
     let ir = tile::build(|program| {
-        let a = program.storage_read::<F32, 2>(Shape::new([64, 256]));
+        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([64, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 64);
-        let y = program.storage_write::<F32, 2>(Shape::new([64, 64]));
+        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([64, 64]));
         qmatmul_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 64, 64);
     });
     lower_or_fail(&ir, "cooperative qmatmul");
@@ -214,10 +221,19 @@ fn batched_dense_f32_matmul_lowers() {
             k: 256,
             n: 4,
         };
-        let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
-        let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
-        let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        batched_matmul_with_epilogues::<F32>(
+        let a = program.storage_read(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.m, shape.k]),
+        );
+        let b = program.storage_read(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.k, shape.n]),
+        );
+        let y = program.storage_write(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.m, shape.n]),
+        );
+        batched_matmul_with_epilogues(
             program,
             &a,
             &b,
@@ -239,10 +255,19 @@ fn batched_dense_f32_gemv_lowers() {
             k: 256,
             n: 1,
         };
-        let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
-        let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
-        let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        batched_gemv_with_epilogues::<F32>(
+        let a = program.storage_read(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.m, shape.k]),
+        );
+        let b = program.storage_read(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.k, shape.n]),
+        );
+        let y = program.storage_write(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.m, shape.n]),
+        );
+        batched_gemv_with_epilogues(
             program,
             &a,
             &b,
@@ -264,13 +289,19 @@ fn batched_dense_f16_matmul_lowers() {
             k: 128,
             n: 4,
         };
-        let a = program
-            .storage_read::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.m, shape.k]));
-        let b = program
-            .storage_read::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.k, shape.n]));
-        let y = program
-            .storage_write::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        batched_matmul_with_epilogues::<fusor_tile_ir::F16>(
+        let a = program.storage_read(
+            ScalarElement::F16.element(),
+            Shape::new([shape.batch * shape.m, shape.k]),
+        );
+        let b = program.storage_read(
+            ScalarElement::F16.element(),
+            Shape::new([shape.batch * shape.k, shape.n]),
+        );
+        let y = program.storage_write(
+            ScalarElement::F16.element(),
+            Shape::new([shape.batch * shape.m, shape.n]),
+        );
+        batched_matmul_with_epilogues(
             program,
             &a,
             &b,
@@ -292,13 +323,19 @@ fn batched_dense_f16_gemv_lowers() {
             k: 128,
             n: 1,
         };
-        let a = program
-            .storage_read::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.m, shape.k]));
-        let b = program
-            .storage_read::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.k, shape.n]));
-        let y = program
-            .storage_write::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        batched_gemv_with_epilogues::<fusor_tile_ir::F16>(
+        let a = program.storage_read(
+            ScalarElement::F16.element(),
+            Shape::new([shape.batch * shape.m, shape.k]),
+        );
+        let b = program.storage_read(
+            ScalarElement::F16.element(),
+            Shape::new([shape.batch * shape.k, shape.n]),
+        );
+        let y = program.storage_write(
+            ScalarElement::F16.element(),
+            Shape::new([shape.batch * shape.m, shape.n]),
+        );
+        batched_gemv_with_epilogues(
             program,
             &a,
             &b,
@@ -320,10 +357,19 @@ fn cooperative_dense_f32_matmul_lowers() {
             k: 256,
             n: 64,
         };
-        let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
-        let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
-        let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul::<F32>(
+        let a = program.storage_read(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.m, shape.k]),
+        );
+        let b = program.storage_read(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.k, shape.n]),
+        );
+        let y = program.storage_write(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.m, shape.n]),
+        );
+        assert!(try_batched_coop_matmul(
             program,
             DenseMatmulTensors {
                 a: &a,
@@ -352,10 +398,19 @@ fn cooperative_dense_f16_matmul_lowers() {
             k: 256,
             n: 64,
         };
-        let a = program.storage_read::<F16, 2>(Shape::new([shape.batch * shape.m, shape.k]));
-        let b = program.storage_read::<F16, 2>(Shape::new([shape.batch * shape.k, shape.n]));
-        let y = program.storage_write::<F16, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul::<F16>(
+        let a = program.storage_read(
+            ScalarElement::F16.element(),
+            Shape::new([shape.batch * shape.m, shape.k]),
+        );
+        let b = program.storage_read(
+            ScalarElement::F16.element(),
+            Shape::new([shape.batch * shape.k, shape.n]),
+        );
+        let y = program.storage_write(
+            ScalarElement::F16.element(),
+            Shape::new([shape.batch * shape.m, shape.n]),
+        );
+        assert!(try_batched_coop_matmul(
             program,
             DenseMatmulTensors {
                 a: &a,
@@ -384,10 +439,19 @@ fn cooperative_dense_f32_matmul_128x128_lowers() {
             k: 256,
             n: 128,
         };
-        let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
-        let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
-        let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul::<F32>(
+        let a = program.storage_read(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.m, shape.k]),
+        );
+        let b = program.storage_read(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.k, shape.n]),
+        );
+        let y = program.storage_write(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.m, shape.n]),
+        );
+        assert!(try_batched_coop_matmul(
             program,
             DenseMatmulTensors {
                 a: &a,
@@ -416,10 +480,19 @@ fn cooperative_dense_f32_matmul_128x64_lowers() {
             k: 256,
             n: 64,
         };
-        let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
-        let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
-        let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul::<F32>(
+        let a = program.storage_read(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.m, shape.k]),
+        );
+        let b = program.storage_read(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.k, shape.n]),
+        );
+        let y = program.storage_write(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.m, shape.n]),
+        );
+        assert!(try_batched_coop_matmul(
             program,
             DenseMatmulTensors {
                 a: &a,
@@ -450,10 +523,19 @@ fn cooperative_dense_f32_matmul_128x256_npass_lowers() {
             k: 256,
             n: 256,
         };
-        let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
-        let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
-        let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul::<F32>(
+        let a = program.storage_read(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.m, shape.k]),
+        );
+        let b = program.storage_read(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.k, shape.n]),
+        );
+        let y = program.storage_write(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.m, shape.n]),
+        );
+        assert!(try_batched_coop_matmul(
             program,
             DenseMatmulTensors {
                 a: &a,
@@ -477,7 +559,7 @@ fn cooperative_dense_f32_matmul_128x256_npass_lowers() {
 fn qdequantize_lowers() {
     let ir = tile::build(|program| {
         let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 4);
-        let y = program.storage_write_element::<1>(ElementType::F32, Shape::new([1024]));
+        let y = program.storage_write(ElementType::F32, Shape::new([1024]));
         qdequantize(program, &b, &y, 1);
     });
     lower_or_fail(&ir, "qdequantize");
@@ -487,7 +569,7 @@ fn qdequantize_lowers() {
 fn q4k_native_qdequantize_lowers() {
     let ir = tile::build(|program| {
         let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 4);
-        let y = program.storage_write_element::<1>(ElementType::F32, Shape::new([1024]));
+        let y = program.storage_write(ElementType::F32, Shape::new([1024]));
         qdequantize(program, &b, &y, 1);
     });
     lower_or_fail(&ir, "q4k native qdequantize");
@@ -497,7 +579,7 @@ fn q4k_native_qdequantize_lowers() {
 fn qdequantize_f16_output_lowers() {
     let ir = tile::build(|program| {
         let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 4);
-        let y = program.storage_write_element::<1>(ElementType::F16, Shape::new([1024]));
+        let y = program.storage_write(ElementType::F16, Shape::new([1024]));
         qdequantize(program, &b, &y, 1);
     });
     lower_or_fail(&ir, "qdequantize f16 output");
@@ -512,9 +594,9 @@ fn qmatmul_epilogue_fallback_ir(post: Option<&UnaryEpilogue>) -> fusor_tile_ir::
     tile::build(|program| {
         // `m = 2` skips the `m == 1` qgemv branch.
         // BM*BN*BK = 64*64*32 = 131072 != 256 — forces the fallback path.
-        let a = program.storage_read::<F32, 2>(Shape::new([2, 64]));
+        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([2, 64]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 64, 64);
-        let y = program.storage_write::<F32, 2>(Shape::new([2, 64]));
+        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([2, 64]));
         let epilogues = QmatmulEpilogues {
             pre: None,
             pre_with_extras: None,
@@ -555,9 +637,9 @@ fn module_uses_tanh(module: &naga::Module) -> bool {
 #[test]
 fn workgroup_qmatmul_lowers_without_subgroups() {
     let ir = tile::build(|program| {
-        let a = program.storage_read::<F32, 2>(Shape::new([32, 256]));
+        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([32, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 32);
-        let y = program.storage_write::<F32, 2>(Shape::new([32, 32]));
+        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([32, 32]));
         qmatmul_workgroup_with_epilogues(program, &a, &b, &y, &QmatmulEpilogues::empty(), 65_535);
     });
     let lowered = lower_or_fail(&ir, "workgroup qmatmul");
@@ -570,9 +652,9 @@ fn workgroup_qmatmul_lowers_without_subgroups() {
 #[test]
 fn f16_staged_workgroup_qmatmul_lowers_without_subgroups() {
     let ir = tile::build(|program| {
-        let a = program.storage_read::<F32, 2>(Shape::new([32, 256]));
+        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([32, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 32);
-        let y = program.storage_write::<F32, 2>(Shape::new([32, 32]));
+        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([32, 32]));
         qmatmul_workgroup_f16_with_epilogues(
             program,
             &a,
@@ -596,9 +678,9 @@ fn f16_staged_workgroup_qmatmul_lowers_without_subgroups() {
 #[test]
 fn workgroup_qgemv_lowers_without_subgroups() {
     let ir = tile::build(|program| {
-        let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
+        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 128);
-        let y = program.storage_write::<F32, 2>(Shape::new([1, 128]));
+        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, 128]));
         qgemv_workgroup_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 65_535);
     });
     let lowered = lower_or_fail(&ir, "workgroup qgemv");
@@ -611,9 +693,9 @@ fn workgroup_qgemv_lowers_without_subgroups() {
 #[test]
 fn f16_staged_workgroup_qgemv_lowers_without_subgroups() {
     let ir = tile::build(|program| {
-        let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
+        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 128);
-        let y = program.storage_write::<F32, 2>(Shape::new([1, 128]));
+        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, 128]));
         qgemv_workgroup_f16_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 65_535);
     });
     let lowered = lower_or_fail(&ir, "f16 staged workgroup qgemv");
@@ -630,9 +712,9 @@ fn f16_staged_workgroup_qgemv_lowers_without_subgroups() {
 #[test]
 fn q4k_native_workgroup_qgemv_lowers_without_subgroups() {
     let ir = tile::build(|program| {
-        let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
+        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 128);
-        let y = program.storage_write::<F32, 2>(Shape::new([1, 128]));
+        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, 128]));
         qgemv_workgroup_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 65_535);
     });
     let lowered = lower_or_fail(&ir, "q4k native workgroup qgemv");

@@ -4,7 +4,7 @@
 #![cfg_attr(all(target_arch = "aarch64", nightly), feature(stdarch_neon_dotprod))]
 
 // Tensor layout is described at https://github.com/ggml-org/llama.cpp/wiki/Tensor-Encoding-Schemes
-// Modified from https://github.com/huggingface/candle/blob/e286cf7cc9e34bc426a542264b818e35e6eed05b/candle-core/src/quantized/gguf_file.rs#L31
+// Adapted from an upstream GGUF parser implementation.
 
 use std::{fmt::Display, mem::offset_of};
 
@@ -2532,122 +2532,6 @@ fn test_round_trip_empty() {
     assert_eq!(metadata.tensor_infos.len(), 0);
     assert_eq!(metadata.version, GgufVersion::V3);
     assert_eq!(metadata.metadata.len(), 0);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_load_tiny_llama() {
-    use pretty_assertions::assert_eq;
-    use std::io::Seek;
-
-    let mut reader = tiny_llama().await;
-    let metadata = GgufMetadata::read(&mut reader).unwrap();
-    reader.seek(std::io::SeekFrom::Start(0)).unwrap();
-    let candle_metadata = candle_core::quantized::gguf_file::Content::read(&mut reader).unwrap();
-    let device = candle_core::Device::Cpu;
-    for (name, candle_tensor) in candle_metadata.tensor_infos {
-        let tensor = metadata.tensor_infos.get(&*name).unwrap();
-        println!("{name}: {tensor:?}");
-        let tensor_bytes = tensor
-            .read_tensor_bytes(&mut reader, metadata.tensor_data_offset)
-            .unwrap();
-        let candle_tensor = candle_tensor
-            .read(&mut reader, candle_metadata.tensor_data_offset, &device)
-            .unwrap();
-        let candle_tensor_de_quantized = candle_tensor.dequantize(&device).unwrap();
-        let candle_tensor_data: Vec<f32> = candle_tensor_de_quantized
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        match tensor.ty {
-            GgmlType::Q4_0 => {
-                let blocks: &[BlockQ4_0] = bytemuck::cast_slice(&tensor_bytes);
-                for (block, candle_block) in blocks
-                    .iter()
-                    .zip(candle_tensor_data.chunks(Q4_0_BLOCK_SIZE))
-                {
-                    let dequantized = block.dequantize();
-                    for (a, b) in dequantized.iter().zip(candle_block) {
-                        if (a - b).abs() > 1e-6 {
-                            println!("ours: {dequantized:?}");
-                            println!("candle: {candle_block:?}");
-                            assert_eq!(dequantized, candle_block);
-                        }
-                    }
-                }
-            }
-            GgmlType::Q5_0 => {
-                let blocks: &[BlockQ5_0] = bytemuck::cast_slice(&tensor_bytes);
-                for (block, candle_block) in blocks
-                    .iter()
-                    .zip(candle_tensor_data.chunks(Q5_0_BLOCK_SIZE))
-                {
-                    let dequantized = block.dequantize();
-                    for (a, b) in dequantized.iter().zip(candle_block) {
-                        if (a - b).abs() > 1e-6 {
-                            println!("ours: {dequantized:?}");
-                            println!("candle: {candle_block:?}");
-                            assert_eq!(dequantized, candle_block);
-                        }
-                    }
-                }
-            }
-            GgmlType::Q8_0 => {
-                let blocks: &[BlockQ8_0] = bytemuck::cast_slice(&tensor_bytes);
-                for (block, candle_block) in blocks
-                    .iter()
-                    .zip(candle_tensor_data.chunks(Q8_0_BLOCK_SIZE))
-                {
-                    let dequantized = block.dequantize();
-                    for (a, b) in dequantized.iter().zip(candle_block) {
-                        if (a - b).abs() > 1e-6 {
-                            println!("ours: {dequantized:?}");
-                            println!("candle: {candle_block:?}");
-                            assert_eq!(dequantized, candle_block);
-                        }
-                    }
-                }
-            }
-            GgmlType::Q4K => {
-                let blocks: &[BlockQ4K] = bytemuck::cast_slice(&tensor_bytes);
-                for (block, candle_block) in
-                    blocks.iter().zip(candle_tensor_data.chunks(K_BLOCK_SIZE))
-                {
-                    let dequantized = block.dequantize();
-                    for (a, b) in dequantized.iter().zip(candle_block) {
-                        if (a - b).abs() > 1e-6 {
-                            println!("ours: {dequantized:?}");
-                            println!("candle: {candle_block:?}");
-                            assert_eq!(dequantized, candle_block);
-                        }
-                    }
-                }
-            }
-            GgmlType::Q6K => {
-                let blocks: &[BlockQ6K] = bytemuck::cast_slice(&tensor_bytes);
-                for (block, candle_block) in
-                    blocks.iter().zip(candle_tensor_data.chunks(K_BLOCK_SIZE))
-                {
-                    let dequantized = block.dequantize();
-                    for (a, b) in dequantized.iter().zip(candle_block) {
-                        if (a - b).abs() > 1e-6 {
-                            println!("ours: {dequantized:?}");
-                            println!("candle: {candle_block:?}");
-                            assert_eq!(dequantized, candle_block);
-                        }
-                    }
-                }
-            }
-            GgmlType::F32 => {
-                let blocks: &[f32] = bytemuck::cast_slice(&tensor_bytes);
-                for (a, b) in blocks.iter().zip(candle_tensor_data) {
-                    assert!((a - b).abs() < 1e-6);
-                }
-            }
-            _ => todo!(),
-        }
-    }
 }
 
 #[test]

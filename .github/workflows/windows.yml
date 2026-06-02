@@ -62,6 +62,9 @@ jobs:
     name: (${{ matrix.target }}, ${{ matrix.cfg_release_channel }})
     env:
       CFG_RELEASE_CHANNEL: ${{ matrix.cfg_release_channel }}
+      # WARP/DX12 conformance tests share one software adapter inside each
+      # test binary; keep them serialized to avoid backend aborts.
+      RUST_TEST_THREADS: "1"
     strategy:
       matrix:
         target: [x86_64-pc-windows-msvc]
@@ -131,4 +134,4 @@ jobs:
           copy warp\d3d10warp.dll target\debug\deps\
           copy dxc\dxcompiler.dll target\debug\deps\
           copy dxc\dxil.dll target\debug\deps\
-          cargo test --all --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape --exclude kalosm-parse-macro --exclude fusor-core --exclude rbert --exclude rwhisper --exclude kalosm-learning
+          cargo test --all --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape --exclude kalosm-parse-macro --exclude fusor-core --exclude rbert --exclude rwhisper
