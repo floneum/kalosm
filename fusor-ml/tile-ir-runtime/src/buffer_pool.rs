@@ -184,6 +184,35 @@ impl BufferPool {
         buffer
     }
 
+    /// Create a fresh buffer initialized from `data` via `mapped_at_creation`,
+    /// copying the bytes straight into the buffer's own memory.
+    ///
+    /// Unlike [`create_buffer_init`], this skips the queue staging belt (no
+    /// extra staging copy and no queued GPU copy on submit) — a single memcpy.
+    /// It always allocates a new buffer (no pooling), so it is meant for
+    /// long-lived, write-once data like model weights, not transient
+    /// inference-time allocations.
+    pub fn create_buffer_init_mapped(
+        &self,
+        data: &[u8],
+        usage: wgpu::BufferUsages,
+    ) -> Arc<wgpu::Buffer> {
+        let padded_len = padded_copy_size(data.len() as u64);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Weight Buffer"),
+            size: padded_len,
+            usage,
+            mapped_at_creation: true,
+        });
+        {
+            let mut view = buffer.slice(..).get_mapped_range_mut();
+            view[..data.len()].copy_from_slice(data);
+            view[data.len()..].fill(0);
+        }
+        buffer.unmap();
+        Arc::new(buffer)
+    }
+
     /// Get or create a buffer initialized from a byte iterator.
     pub fn create_buffer_init_iter(
         &self,

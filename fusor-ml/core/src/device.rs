@@ -371,6 +371,17 @@ impl Device {
         self.inner.buffer_pool.create_buffer_init(data, usage)
     }
 
+    /// Create a fresh, write-once buffer initialized from `data` via
+    /// `mapped_at_creation` (single memcpy, no staging belt). For long-lived
+    /// data like model weights — not transient inference allocations.
+    pub fn create_buffer_init_mapped(
+        &self,
+        data: &[u8],
+        usage: wgpu::BufferUsages,
+    ) -> Arc<wgpu::Buffer> {
+        self.inner.buffer_pool.create_buffer_init_mapped(data, usage)
+    }
+
     /// Get or create a buffer of the specified size.
     pub fn create_buffer_init_iter(
         &self,
