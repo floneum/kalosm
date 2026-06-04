@@ -208,7 +208,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -219,7 +219,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -326,7 +326,7 @@ dependencies = [
  "heed",
  "memmap2",
  "nohash",
- "ordered-float 4.6.0",
+ "ordered-float",
  "page_size",
  "rand 0.8.5",
  "rayon",
@@ -1324,7 +1324,7 @@ checksum = "fe6d2e5af09e8c8ad56c969f2157a3d4238cebc7c55f0a517728c38f7b200f81"
 dependencies = [
  "serde",
  "termcolor",
- "unicode-width 0.2.2",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -2355,7 +2355,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2630,6 +2630,7 @@ dependencies = [
 name = "fusor-conformance"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "fusor",
  "fusor-types",
  "half",
@@ -2661,6 +2662,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber 0.3.23",
+ "web-time",
  "wgpu",
 ]
 
@@ -3158,7 +3160,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.18",
- "windows 0.62.2",
+ "windows 0.54.0",
 ]
 
 [[package]]
@@ -3705,7 +3707,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -3957,7 +3959,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi 0.5.2",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4248,6 +4250,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
+ "web-time",
 ]
 
 [[package]]
@@ -4256,6 +4259,7 @@ version = "0.4.0"
 dependencies = [
  "kalosm",
  "tokio",
+ "web-time",
 ]
 
 [[package]]
@@ -4867,7 +4871,7 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "28.0.0"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#8a1a65f02f552843859ef0e463e87ce9fc7d2cfd"
+source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#13293a3894ca955babcd5d2e6bbd6a2b62b0079a"
 dependencies = [
  "arrayvec",
  "bit-set 0.8.0",
@@ -5082,7 +5086,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5385,15 +5389,6 @@ name = "ordered-float"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "ordered-float"
-version = "5.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f4779c6901a562440c3786d08192c6fbda7c1c2060edd10006b05ee35d10f2d"
 dependencies = [
  "num-traits",
 ]
@@ -6918,7 +6913,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7482,7 +7477,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8036,7 +8031,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9093,7 +9088,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "wgpu"
 version = "28.0.0"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#8a1a65f02f552843859ef0e463e87ce9fc7d2cfd"
+source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#13293a3894ca955babcd5d2e6bbd6a2b62b0079a"
 dependencies = [
  "arrayvec",
  "bitflags 2.11.0",
@@ -9121,7 +9116,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core"
 version = "28.0.0"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#8a1a65f02f552843859ef0e463e87ce9fc7d2cfd"
+source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#13293a3894ca955babcd5d2e6bbd6a2b62b0079a"
 dependencies = [
  "arrayvec",
  "bit-set 0.8.0",
@@ -9145,13 +9140,14 @@ dependencies = [
  "wgpu-core-deps-apple",
  "wgpu-core-deps-windows-linux-android",
  "wgpu-hal",
+ "wgpu-naga-bridge",
  "wgpu-types",
 ]
 
 [[package]]
 name = "wgpu-core-deps-apple"
 version = "28.0.0"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#8a1a65f02f552843859ef0e463e87ce9fc7d2cfd"
+source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#13293a3894ca955babcd5d2e6bbd6a2b62b0079a"
 dependencies = [
  "wgpu-hal",
 ]
@@ -9159,7 +9155,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-windows-linux-android"
 version = "28.0.0"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#8a1a65f02f552843859ef0e463e87ce9fc7d2cfd"
+source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#13293a3894ca955babcd5d2e6bbd6a2b62b0079a"
 dependencies = [
  "wgpu-hal",
 ]
@@ -9167,7 +9163,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "28.0.0"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#8a1a65f02f552843859ef0e463e87ce9fc7d2cfd"
+source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#13293a3894ca955babcd5d2e6bbd6a2b62b0079a"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -9191,7 +9187,7 @@ dependencies = [
  "objc2-metal",
  "objc2-quartz-core",
  "once_cell",
- "ordered-float 5.1.0",
+ "ordered-float",
  "parking_lot",
  "portable-atomic",
  "portable-atomic-util",
@@ -9202,15 +9198,25 @@ dependencies = [
  "renderdoc-sys",
  "smallvec 1.15.1",
  "thiserror 2.0.18",
+ "wgpu-naga-bridge",
  "wgpu-types",
  "windows 0.62.2",
  "windows-core 0.62.2",
 ]
 
 [[package]]
+name = "wgpu-naga-bridge"
+version = "28.0.0"
+source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#13293a3894ca955babcd5d2e6bbd6a2b62b0079a"
+dependencies = [
+ "naga",
+ "wgpu-types",
+]
+
+[[package]]
 name = "wgpu-types"
 version = "28.0.0"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#8a1a65f02f552843859ef0e463e87ce9fc7d2cfd"
+source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#13293a3894ca955babcd5d2e6bbd6a2b62b0079a"
 dependencies = [
  "bitflags 2.11.0",
  "bytemuck",
@@ -9261,7 +9267,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

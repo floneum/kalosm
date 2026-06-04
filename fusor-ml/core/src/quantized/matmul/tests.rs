@@ -115,6 +115,29 @@ mod selection_tests {
     }
 
     #[test]
+    fn single_row_direct_path_does_not_require_coop_matrix() {
+        assert!(!qmatmul_path_requires_coop(QMatmulPath::SingleRow));
+        assert!(!qmatmul_path_requires_coop(QMatmulPath::Q5SmallSingleRow));
+        assert!(qmatmul_path_requires_coop(QMatmulPath::Tile {
+            tile: QCoopTile::new(64, 64),
+            cached: false,
+        }));
+
+        let selector = qmatmul_direct_selector();
+        let caps = no_coop_caps(false);
+        assert!(caps.subgroups_supported);
+        assert!(!qmatmul_coop_supported(caps));
+        assert_eq!(
+            selector.select(
+                KernelShape::new([1, 4096, 8192]),
+                &ctx(tile_ir::GgmlQuantFormat::Q4K, false),
+                caps,
+            ),
+            Some(QMatmulPath::SingleRow)
+        );
+    }
+
+    #[test]
     fn coop_acc_init_only_claims_shapes_the_coop_path_will_take() {
         assert!(qmatmul_variant_supports_coop_acc_init(
             QMatmulPath::Tile {
@@ -275,7 +298,7 @@ mod tests {
                 out_shape: Box::new([1, weight_shape[0]]),
                 pre_element_wise_expr: None,
                 post_element_wise_expr: None,
-                paired: None,
+                post_accumulator_offsets: Box::new([]),
             };
             let kernel = operation
                 .build_direct_kernel(
@@ -326,7 +349,7 @@ mod tests {
                 out_shape: output_shape.into(),
                 pre_element_wise_expr: None,
                 post_element_wise_expr: None,
-                paired: None,
+                post_accumulator_offsets: Box::new([]),
             };
 
             operation

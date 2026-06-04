@@ -28,7 +28,7 @@ use crate::dispatch::{
 use crate::grid::{
     dot4_sum, qgemv_grid, qgemv_program_scope, store_qgemv_sums_with_epilogue, QgemvStoreTarget,
 };
-use crate::kernels::qgemv_paired_q4k::{
+use crate::kernels::qgemv_q4k_ggml::{
     load_q4k_ggml_activations, q4k_ggml_dot_tiles, q4k_lane_decomposition,
 };
 use crate::kernels::qgemv_q6k::qgemv_q6k_ggml;
@@ -52,6 +52,7 @@ impl<'a> IntoQgemvEpilogues<'a> for Option<&'a crate::UnaryEpilogue> {
             post: self,
             post_with_extras: None,
             post_extra_inputs: &[],
+            post_accumulator_offsets: &[],
             post_acc_init_col_vector: None,
         }
     }
@@ -127,10 +128,11 @@ pub(crate) fn qgemv_tile_with_epilogue(
     let [m, _] = matrix_shape(a.layout());
     assert_eq!(m, 1, "qgemv requires a single input row");
     let tensors = QgemvTensors { a, b, y };
+    let output_cols = ep.post_output_cols(b.cols);
 
     match b.format {
         GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native => {
-            if b.cols >= 8192 {
+            if output_cols >= 8192 {
                 return qgemv_perf_with_epilogue(
                     program,
                     tensors,
@@ -158,15 +160,15 @@ pub(crate) fn qgemv_tile_with_epilogue(
             8,
         ),
         GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative => {
-            let shape = if b.rows <= 4096 && b.cols >= 4096 && b.cols < 8192 {
-                q4k_mid_override(q4k_default_mid(b.rows, b.cols))
-            } else if b.rows <= 4096 && b.cols <= 4096 {
+            let shape = if b.rows <= 4096 && output_cols >= 4096 && output_cols < 8192 {
+                q4k_mid_override(q4k_default_mid(b.rows, output_cols))
+            } else if b.rows <= 4096 && output_cols <= 4096 {
                 qgemv_shape(256, 8, 4)
-            } else if b.rows <= 4096 && b.cols >= 8192 {
-                q4k_large_override(q4k_default_large(b.rows, b.cols))
-            } else if b.rows > 4096 && b.cols <= 4096 {
-                q4k_tall_override(q4k_default_tall(b.rows, b.cols))
-            } else if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, b.cols) == 8 {
+            } else if b.rows <= 4096 && output_cols >= 8192 {
+                q4k_large_override(q4k_default_large(b.rows, output_cols))
+            } else if b.rows > 4096 && output_cols <= 4096 {
+                q4k_tall_override(q4k_default_tall(b.rows, output_cols))
+            } else if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, output_cols) == 8 {
                 qgemv_shape(256, 8, 8)
             } else {
                 qgemv_shape(128, 4, 8)
@@ -176,7 +178,7 @@ pub(crate) fn qgemv_tile_with_epilogue(
             // scale/min once per lane instead of re-decoding per 16-element
             // chunk. The rare pre-epilogue case keeps the generic dequant dot
             // (the strided ggml gather has no per-`k` index to feed a pre-op).
-            if qgemv_pre_epilogue_is_empty(ep) {
+            if b.rows.is_multiple_of(b.format.block_elements()) && qgemv_pre_epilogue_is_empty(ep) {
                 return qgemv_q4k_ggml(program, tensors, workgroups_x, ep, shape);
             }
             let values_per_lane = if shape.cols_per_subgroup == 8 { 8 } else { 16 };
@@ -204,16 +206,16 @@ pub(crate) fn qgemv_tile_with_epilogue(
             qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, qgemv_shape(64, 2, 1), 8)
         }
         GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative => {
-            if b.rows <= 4096 && b.cols >= 8192 {
-                let shape = q6k_large_override(q6k_default_large(b.rows, b.cols));
+            if b.rows <= 4096 && output_cols >= 8192 {
+                let shape = q6k_large_override(q6k_default_large(b.rows, output_cols));
                 return qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, shape, 8);
             }
-            if b.rows > 4096 && b.cols <= 4096 {
-                let shape = q6k_tall_override(q6k_default_tall(b.rows, b.cols));
+            if b.rows > 4096 && output_cols <= 4096 {
+                let shape = q6k_tall_override(q6k_default_tall(b.rows, output_cols));
                 return qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, shape, 8);
             }
             let (shape, values_per_lane) =
-                if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, b.cols) == 4 {
+                if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, output_cols) == 4 {
                     (qgemv_shape(128, 4, 4), 8)
                 } else {
                     (qgemv_shape(256, 8, 4), 16)
@@ -224,7 +226,10 @@ pub(crate) fn qgemv_tile_with_epilogue(
             // re-decoding per 8-element chunk. Only the word-aligned f32-scale
             // `Q6K` layout uses raw-word addressing; the 210-byte `Q6KNative`
             // block and the rare pre-epilogue case keep the generic dequant dot.
-            if b.format == GgmlQuantFormat::Q6K && qgemv_pre_epilogue_is_empty(ep) {
+            if b.rows.is_multiple_of(b.format.block_elements())
+                && b.format == GgmlQuantFormat::Q6K
+                && qgemv_pre_epilogue_is_empty(ep)
+            {
                 return qgemv_q6k_ggml(program, a, b, y, workgroups_x, ep, shape);
             }
             qgemv_perf_with_epilogue(program, tensors, workgroups_x, ep, shape, values_per_lane)
@@ -300,7 +305,8 @@ fn qgemv_perf_with_epilogue(
     debug_assert!(values_per_lane == 8 || values_per_lane == 16 || values_per_lane == 32);
     debug_assert!(matches!(cols_per_subgroup, 1 | 2 | 3 | 4 | 8));
     let [_, k] = matrix_shape(a.layout());
-    let grid = qgemv_grid(subgroups, cols_per_subgroup, b.cols, workgroups_x);
+    let output_cols = epilogues.post_output_cols(b.cols);
+    let grid = qgemv_grid(subgroups, cols_per_subgroup, output_cols, workgroups_x);
     let k_per_iter = SUBGROUP_SIZE * values_per_lane;
     let k_iterations = k.div_ceil(k_per_iter);
     let k_size = k;
@@ -309,6 +315,8 @@ fn qgemv_perf_with_epilogue(
     let q6k_vocab_f32_dot = b.format.is_q6k_family() && b.rows <= 4096 && b.cols >= 65_536;
     let dot_path = select_qgemv_dot(b.format, values_per_lane, q6k_vocab_f32_dot);
     let cols_per_subgroup_usize = cols_per_subgroup as usize;
+    let post_accumulator_offsets = (!epilogues.post_accumulator_offsets.is_empty())
+        .then(|| epilogues.post_accumulator_offsets().to_vec());
 
     program.program_grid(block, [grid.workgroups_x, grid.dispatch_y, 1], |program| {
         let scope = qgemv_program_scope(program, grid, cols_per_subgroup);
@@ -316,64 +324,97 @@ fn qgemv_perf_with_epilogue(
         let lane = scope.lane;
 
         let zero = Tile::literal(TileLiteral::f32(0.0));
-        let sums: Vec<Tile> = program.fold_vec(
-            range(k_iterations),
-            vec![zero; cols_per_subgroup_usize],
-            |program, loop_index, accs| {
-                let k_base = loop_index * k_per_iter + lane.clone() * values_per_lane;
-                let in_bounds_k = if full_k_iterations {
-                    Mask::all()
-                } else {
-                    k_base.lt(k_size)
-                };
+        let sums: Vec<Tile> = if let Some(post_accumulator_offsets) = &post_accumulator_offsets {
+            let value_arity = post_accumulator_offsets.len();
+            program.fold_vec(
+                range(k_iterations),
+                vec![zero; cols_per_subgroup_usize * value_arity],
+                |program, loop_index, accs| {
+                    let k_base = loop_index * k_per_iter + lane.clone() * values_per_lane;
+                    let in_bounds_k = if full_k_iterations {
+                        Mask::all()
+                    } else {
+                        k_base.lt(k_size)
+                    };
 
-                let a_bound: Vec<Tile> = (0..values_per_lane)
-                    .map(|i| {
-                        let scalar = program.load(
-                            a.at((0u32, k_base.clone() + i)),
-                            in_bounds_k.clone(),
-                            0.0,
-                        );
-                        let k_index = k_base.clone() + i;
-                        let pre_extras = epilogues
-                            .pre_extra_inputs
-                            .iter()
-                            .map(|extra| match extra {
-                                QmatmulExtra::Column(vector) => {
-                                    program.load(vector.at(&k_index), k_index.lt(k_size), 0.0)
-                                }
-                                QmatmulExtra::Pointwise(tensor) => program.load(
-                                    tensor.at((0u32, &k_index)),
-                                    k_index.lt(k_size),
-                                    0.0,
-                                ),
-                            })
-                            .collect::<Vec<_>>();
-                        let scalar = apply_qmatmul_pre_epilogue(epilogues, scalar, pre_extras);
-                        program.bind(scalar)
-                    })
-                    .collect();
+                    let a_bound = load_qgemv_activations(
+                        program,
+                        a,
+                        epilogues,
+                        values_per_lane,
+                        &k_base,
+                        k_size,
+                        in_bounds_k.clone(),
+                    );
 
-                accs.into_iter()
-                    .enumerate()
-                    .map(|(c, acc)| {
-                        let col = col0.clone() + c as u32;
-                        let mask = grid.mask(full_k_iterations, in_bounds_k.clone(), &col);
-                        let part = qgemv_dot_part(
-                            program,
-                            dot_path,
-                            &a_bound,
-                            &b_cloned,
-                            values_per_lane,
-                            &k_base,
-                            &col,
-                            mask,
-                        );
-                        acc + part
-                    })
-                    .collect()
-            },
-        );
+                    accs.into_iter()
+                        .enumerate()
+                        .map(|(idx, acc)| {
+                            let c = idx / value_arity;
+                            let value_idx = idx % value_arity;
+                            let output_col = col0.clone() + c as u32;
+                            let matrix_col =
+                                output_col.clone() + post_accumulator_offsets[value_idx];
+                            let mask =
+                                grid.mask(full_k_iterations, in_bounds_k.clone(), &output_col);
+                            let part = qgemv_dot_part(
+                                program,
+                                dot_path,
+                                &a_bound,
+                                &b_cloned,
+                                values_per_lane,
+                                &k_base,
+                                &matrix_col,
+                                mask,
+                            );
+                            acc + part
+                        })
+                        .collect()
+                },
+            )
+        } else {
+            program.fold_vec(
+                range(k_iterations),
+                vec![zero; cols_per_subgroup_usize],
+                |program, loop_index, accs| {
+                    let k_base = loop_index * k_per_iter + lane.clone() * values_per_lane;
+                    let in_bounds_k = if full_k_iterations {
+                        Mask::all()
+                    } else {
+                        k_base.lt(k_size)
+                    };
+
+                    let a_bound = load_qgemv_activations(
+                        program,
+                        a,
+                        epilogues,
+                        values_per_lane,
+                        &k_base,
+                        k_size,
+                        in_bounds_k.clone(),
+                    );
+
+                    accs.into_iter()
+                        .enumerate()
+                        .map(|(c, acc)| {
+                            let col = col0.clone() + c as u32;
+                            let mask = grid.mask(full_k_iterations, in_bounds_k.clone(), &col);
+                            let part = qgemv_dot_part(
+                                program,
+                                dot_path,
+                                &a_bound,
+                                &b_cloned,
+                                values_per_lane,
+                                &k_base,
+                                &col,
+                                mask,
+                            );
+                            acc + part
+                        })
+                        .collect()
+                },
+            )
+        };
 
         store_qgemv_sums_with_epilogue(
             program,
@@ -390,6 +431,37 @@ fn qgemv_perf_with_epilogue(
     });
 }
 
+fn load_qgemv_activations(
+    program: &mut TileBlock<'_>,
+    a: &Storage,
+    epilogues: &QmatmulEpilogues<'_>,
+    values_per_lane: u32,
+    k_base: &Tile,
+    k_size: u32,
+    in_bounds_k: Mask,
+) -> Vec<Tile> {
+    (0..values_per_lane)
+        .map(|i| {
+            let scalar = program.load(a.at((0u32, k_base.clone() + i)), in_bounds_k.clone(), 0.0);
+            let k_index = k_base.clone() + i;
+            let pre_extras = epilogues
+                .pre_extra_inputs
+                .iter()
+                .map(|extra| match extra {
+                    QmatmulExtra::Column(vector) => {
+                        program.load(vector.at(&k_index), k_index.lt(k_size), 0.0)
+                    }
+                    QmatmulExtra::Pointwise(tensor) => {
+                        program.load(tensor.at((0u32, &k_index)), k_index.lt(k_size), 0.0)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let scalar = apply_qmatmul_pre_epilogue(epilogues, scalar, pre_extras);
+            program.bind(scalar)
+        })
+        .collect()
+}
+
 /// `true` when no pre-reduce epilogue is attached, so the activation stream can
 /// be gathered with the ggml strided pattern (which has no per-`k` index to feed
 /// a pre-epilogue).
@@ -399,12 +471,11 @@ fn qgemv_pre_epilogue_is_empty(epilogues: &QmatmulEpilogues<'_>) -> bool {
         && epilogues.pre_extra_inputs.is_empty()
 }
 
-/// Non-paired Q4K qgemv built on the ggml super-block-amortized decode — the
-/// same decomposition as the paired SwiGLU kernel ([`qgemv_q4k_paired_ggml`]).
-/// A 32-lane subgroup covers 4 super-blocks per pass (`ix = lane / 8`); each
-/// lane decodes its super-block's scale/min once and consumes a strided 8-byte
-/// region. This restores the per-super-block decode amortization that the
-/// generic `quantized_dot_f32` path lost when it re-decodes the metadata for
+/// Q4K qgemv built on the ggml super-block-amortized decode. A 32-lane subgroup
+/// covers 4 super-blocks per pass (`ix = lane / 8`); each lane decodes its
+/// super-block's scale/min once and consumes a strided 8-byte region. This
+/// restores the per-super-block decode amortization that the generic
+/// `quantized_dot_f32` path lost when it re-decodes the metadata for
 /// every 8/16-element chunk. Only valid with an empty pre-epilogue.
 fn qgemv_q4k_ggml(
     program: &mut Program,
@@ -420,7 +491,8 @@ fn qgemv_q4k_ggml(
     let cols_per_subgroup = shape.cols_per_subgroup;
     debug_assert_eq!(subgroups * SUBGROUP_SIZE, block);
     debug_assert!(b.format.is_q4k_family());
-    let grid = qgemv_grid(subgroups, cols_per_subgroup, b.cols, workgroups_x);
+    let output_cols = epilogues.post_output_cols(b.cols);
+    let grid = qgemv_grid(subgroups, cols_per_subgroup, output_cols, workgroups_x);
     let [_, k] = matrix_shape(a.layout());
     let block_count = k.div_ceil(256);
     let block_iterations = block_count.div_ceil(4);
@@ -430,6 +502,8 @@ fn qgemv_q4k_ggml(
     let native = b.format == GgmlQuantFormat::Q4KNative;
     let qwords = Storage::from_view(b.data.clone());
     let cols_usize = cols_per_subgroup as usize;
+    let post_accumulator_offsets = (!epilogues.post_accumulator_offsets.is_empty())
+        .then(|| epilogues.post_accumulator_offsets().to_vec());
     let row = Tile::u32(0);
 
     program.program_grid(block, [grid.workgroups_x, grid.dispatch_y, 1], |program| {
@@ -438,39 +512,82 @@ fn qgemv_q4k_ggml(
         let lane = scope.lane;
         let q4k_lane = q4k_lane_decomposition(&lane);
 
-        let sums: Vec<Tile> = program.fold_vec(
-            range(block_iterations),
-            vec![Tile::f32(0.0); cols_usize],
-            |program, loop_index, accs| {
-                let block_idx = loop_index * 4u32 + q4k_lane.ix.clone();
-                let in_bounds = if full_block_iterations {
-                    Tile::bool(true)
-                } else {
-                    block_idx.clone().lt(block_count)
-                };
-                let vector_base = block_idx.clone() * 256u32
-                    + q4k_lane.iq.clone() * 64u32
-                    + q4k_lane.ir.clone() * 8u32;
-                let acts = load_q4k_ggml_activations(program, a, &row, &vector_base, &in_bounds);
-                accs.into_iter()
-                    .enumerate()
-                    .map(|(c, acc)| {
-                        let col = col0.clone() + c as u32;
-                        acc + q4k_ggml_dot_tiles(
-                            program,
-                            &qwords,
-                            blocks_per_col,
-                            block_words,
-                            native,
-                            &block_idx,
-                            &col,
-                            &q4k_lane,
-                            &acts,
-                        )
-                    })
-                    .collect()
-            },
-        );
+        let sums: Vec<Tile> = if let Some(post_accumulator_offsets) = &post_accumulator_offsets {
+            let value_arity = post_accumulator_offsets.len();
+            program.fold_vec(
+                range(block_iterations),
+                vec![Tile::f32(0.0); cols_usize * value_arity],
+                |program, loop_index, accs| {
+                    let block_idx = loop_index * 4u32 + q4k_lane.ix.clone();
+                    let in_bounds = if full_block_iterations {
+                        Tile::bool(true)
+                    } else {
+                        block_idx.clone().lt(block_count)
+                    };
+                    let vector_base = block_idx.clone() * 256u32
+                        + q4k_lane.iq.clone() * 64u32
+                        + q4k_lane.ir.clone() * 8u32;
+                    let acts =
+                        load_q4k_ggml_activations(program, a, &row, &vector_base, &in_bounds);
+                    accs.into_iter()
+                        .enumerate()
+                        .map(|(idx, acc)| {
+                            let c = idx / value_arity;
+                            let value_idx = idx % value_arity;
+                            let output_col = col0.clone() + c as u32;
+                            let matrix_col =
+                                output_col.clone() + post_accumulator_offsets[value_idx];
+                            acc + q4k_ggml_dot_tiles(
+                                program,
+                                &qwords,
+                                blocks_per_col,
+                                block_words,
+                                native,
+                                &block_idx,
+                                &matrix_col,
+                                &q4k_lane,
+                                &acts,
+                            )
+                        })
+                        .collect()
+                },
+            )
+        } else {
+            program.fold_vec(
+                range(block_iterations),
+                vec![Tile::f32(0.0); cols_usize],
+                |program, loop_index, accs| {
+                    let block_idx = loop_index * 4u32 + q4k_lane.ix.clone();
+                    let in_bounds = if full_block_iterations {
+                        Tile::bool(true)
+                    } else {
+                        block_idx.clone().lt(block_count)
+                    };
+                    let vector_base = block_idx.clone() * 256u32
+                        + q4k_lane.iq.clone() * 64u32
+                        + q4k_lane.ir.clone() * 8u32;
+                    let acts =
+                        load_q4k_ggml_activations(program, a, &row, &vector_base, &in_bounds);
+                    accs.into_iter()
+                        .enumerate()
+                        .map(|(c, acc)| {
+                            let col = col0.clone() + c as u32;
+                            acc + q4k_ggml_dot_tiles(
+                                program,
+                                &qwords,
+                                blocks_per_col,
+                                block_words,
+                                native,
+                                &block_idx,
+                                &col,
+                                &q4k_lane,
+                                &acts,
+                            )
+                        })
+                        .collect()
+                },
+            )
+        };
 
         store_qgemv_sums_with_epilogue(
             program,

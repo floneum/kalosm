@@ -6,7 +6,10 @@ use crate::{
     mir::kernel_backend,
     sampling::{
         TOP_K_BLOCK, TOP_K_CHUNK,
-        processors::{fixed_previous_tokens_data, processor_params_data},
+        processors::{
+            fixed_previous_tokens_data, fixed_previous_tokens_data_with_gpu_tail,
+            processor_params_data,
+        },
     },
     tensor::{DataTypeEnum, TensorData},
 };
@@ -145,6 +148,55 @@ pub(crate) fn chunk_top_k_pair_data_with_processors_with_encoder(
         output_per_chunk,
         Some((&previous_tokens, &params)),
         encoder,
+    )
+}
+
+pub(crate) fn chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder(
+    input: &TensorData,
+    previous_tokens: &[u32],
+    gpu_tail: Option<&TensorData>,
+    temperature: f32,
+    repetition_penalty: f32,
+    candidate_count: usize,
+    output_per_chunk: usize,
+    encoder: Option<&mut CommandEncoder>,
+) -> Option<(TensorData, TensorData)> {
+    let Some(gpu_tail) = gpu_tail else {
+        return chunk_top_k_pair_data_with_processors_with_encoder(
+            input,
+            previous_tokens,
+            temperature,
+            repetition_penalty,
+            candidate_count,
+            output_per_chunk,
+            encoder,
+        );
+    };
+    if gpu_tail.datatype() != DataTypeEnum::U32
+        || gpu_tail.layout().rank() != 1
+        || gpu_tail
+            .layout()
+            .shape()
+            .first()
+            .copied()
+            .unwrap_or_default()
+            == 0
+        || !input.device().is_same_device(gpu_tail.device())
+    {
+        return None;
+    }
+
+    let device = input.device();
+    let encoder = encoder?;
+    let (previous_tokens, previous_len) =
+        fixed_previous_tokens_data_with_gpu_tail(device, previous_tokens, gpu_tail, encoder);
+    let params = processor_params_data(device, temperature, repetition_penalty, previous_len);
+    chunk_top_k_pair_data_inner_with_encoder(
+        input,
+        candidate_count,
+        output_per_chunk,
+        Some((&previous_tokens, &params)),
+        Some(encoder),
     )
 }
 

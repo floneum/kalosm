@@ -149,6 +149,23 @@ impl<M: CreateChatSession> Chat<M> {
         self
     }
 
+    /// Adds existing chat messages to the queued history without starting a
+    /// model response. This is useful when resuming or replaying an editable
+    /// transcript before calling [`Chat::add_message`] for the next user turn.
+    pub fn with_messages<Messages, Msg>(mut self, messages: Messages) -> Self
+    where
+        Messages: IntoIterator<Item = Msg>,
+        Msg: IntoChatMessage,
+    {
+        self.queued_messages.extend(
+            messages
+                .into_iter()
+                .map(IntoChatMessage::into_chat_message),
+        );
+
+        self
+    }
+
     /// Starts the chat instance with the given model session. This can be useful for resuming a chat session with a long context that has already been processed.
     ///
     /// # Example
@@ -672,9 +689,22 @@ where
                         myself.chat_session.session = Some(Ok(session));
                     }
                 }
+                if let Some(token) = &mut myself.queued_tokens {
+                    if let Poll::Ready(Some(token)) = token.poll_next_unpin(cx) {
+                        return Poll::Ready(Some(token));
+                    }
+                }
                 Poll::Ready(None)
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                drop(task);
+                if let Some(token) = &mut myself.queued_tokens {
+                    if let Poll::Ready(Some(token)) = token.poll_next_unpin(cx) {
+                        return Poll::Ready(Some(token));
+                    }
+                }
+                Poll::Pending
+            }
         }
     }
 }
@@ -793,10 +823,138 @@ where
                         myself.chat_session.session = Some(Ok(session));
                     }
                 }
+                if let Some(token) = &mut myself.queued_tokens {
+                    if let Poll::Ready(Some(token)) = token.poll_next_unpin(cx) {
+                        return Poll::Ready(Some(token));
+                    }
+                }
                 Poll::Ready(None)
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                drop(task);
+                if let Some(token) = &mut myself.queued_tokens {
+                    if let Poll::Ready(Some(token)) = token.poll_next_unpin(cx) {
+                        return Poll::Ready(Some(token));
+                    }
+                }
+                Poll::Pending
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ChatModel, ChatSession, CreateChatSession, GenerationParameters, ModelConstraints,
+        StructuredChatModel,
+    };
+    use futures_util::StreamExt;
+    use std::{convert::Infallible, future::ready};
+
+    #[derive(Clone)]
+    struct FakeSession {
+        history: Vec<ChatMessage>,
+    }
+
+    impl ChatSession for FakeSession {
+        type Error = Infallible;
+
+        fn history(&self) -> Vec<ChatMessage> {
+            self.history.clone()
+        }
+
+        fn try_clone(&self) -> Result<Self, Self::Error>
+        where
+            Self: Sized,
+        {
+            Ok(self.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct ImmediateChatModel;
+
+    impl CreateChatSession for ImmediateChatModel {
+        type Error = Infallible;
+        type ChatSession = FakeSession;
+
+        fn new_chat_session(&self) -> Result<Self::ChatSession, Self::Error> {
+            Ok(FakeSession {
+                history: Vec::new(),
+            })
+        }
+    }
+
+    impl ChatModel<GenerationParameters> for ImmediateChatModel {
+        fn add_messages_with_callback<'a>(
+            &'a self,
+            mut session: Self::ChatSession,
+            messages: &'a [ChatMessage],
+            _sampler: GenerationParameters,
+            mut on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
+        ) -> impl Future<Output = Result<Self::ChatSession, Self::Error>> + WasmNotSend + 'a
+        {
+            session.history.extend_from_slice(messages);
+            on_token("unstructured".to_string()).unwrap();
+            session
+                .history
+                .push(ChatMessage::new(MessageType::ModelAnswer, "unstructured"));
+            ready(Ok(session))
+        }
+    }
+
+    #[derive(Clone)]
+    struct FixedConstraints;
+
+    impl ModelConstraints for FixedConstraints {
+        type Output = String;
+    }
+
+    impl StructuredChatModel<FixedConstraints, GenerationParameters> for ImmediateChatModel {
+        fn add_message_with_callback_and_constraints<'a>(
+            &'a self,
+            mut session: Self::ChatSession,
+            messages: &'a [ChatMessage],
+            _sampler: GenerationParameters,
+            _constraints: FixedConstraints,
+            mut on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
+        ) -> impl Future<Output = Result<(Self::ChatSession, String), Self::Error>> + WasmNotSend + 'a
+        where
+            String: 'a,
+        {
+            session.history.extend_from_slice(messages);
+            on_token("structured".to_string()).unwrap();
+            session
+                .history
+                .push(ChatMessage::new(MessageType::ModelAnswer, "structured"));
+            ready(Ok((session, "structured".to_string())))
+        }
+    }
+
+    #[tokio::test]
+    async fn unstructured_stream_drains_tokens_queued_by_ready_task() {
+        let model = ImmediateChatModel;
+        let mut chat = Chat::new(model);
+
+        let tokens: Vec<_> = chat.add_message("hello").collect().await;
+
+        assert_eq!(tokens, vec!["unstructured"]);
+    }
+
+    #[tokio::test]
+    async fn structured_stream_drains_tokens_queued_by_ready_task() {
+        let model = ImmediateChatModel;
+        let mut chat = Chat::new(model);
+
+        let tokens: Vec<_> = chat
+            .add_message("hello")
+            .with_constraints(FixedConstraints)
+            .collect()
+            .await;
+
+        assert_eq!(tokens, vec!["structured"]);
     }
 }
 

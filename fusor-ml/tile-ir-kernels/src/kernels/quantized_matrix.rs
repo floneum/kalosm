@@ -42,15 +42,12 @@ pub fn quantized_matrix(
         rows > 0 && cols > 0,
         "quantized matrix shape must be non-zero"
     );
-    assert_eq!(
-        rows % format.block_elements(),
-        0,
-        "quantized rows/K dimension must be a multiple of the format block size"
-    );
-    let blocks_per_col = rows / format.block_elements();
-    let words = blocks_per_col
+    let total_elements = rows
         .checked_mul(cols)
-        .and_then(|blocks| blocks.checked_mul(format.block_bytes()))
+        .expect("quantized matrix element count overflow");
+    let blocks = total_elements.div_ceil(format.block_elements());
+    let words = blocks
+        .checked_mul(format.block_bytes())
         .map(|bytes| bytes.div_ceil(4))
         .expect("quantized matrix word count overflow");
     let data: Storage = program.storage_read(ElementType::U32, Shape::new([words]));

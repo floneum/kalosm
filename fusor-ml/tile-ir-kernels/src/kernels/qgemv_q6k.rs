@@ -99,7 +99,8 @@ pub(crate) fn qgemv_q6k_ggml(
     let cols_per_subgroup = shape.cols_per_subgroup;
     debug_assert_eq!(subgroups * SUBGROUP_SIZE, block);
     debug_assert_eq!(b.format, GgmlQuantFormat::Q6K);
-    let grid = qgemv_grid(subgroups, cols_per_subgroup, b.cols, workgroups_x);
+    let output_cols = epilogues.post_output_cols(b.cols);
+    let grid = qgemv_grid(subgroups, cols_per_subgroup, output_cols, workgroups_x);
     let [_, k] = matrix_shape(a.layout());
     let block_count = k.div_ceil(256);
     // 2 super-blocks per subgroup pass (`ix = lane % 2`).
@@ -109,6 +110,8 @@ pub(crate) fn qgemv_q6k_ggml(
     let block_words = b.format.block_words();
     let qwords = Storage::from_view(b.data.clone());
     let cols_usize = cols_per_subgroup as usize;
+    let post_accumulator_offsets = (!epilogues.post_accumulator_offsets.is_empty())
+        .then(|| epilogues.post_accumulator_offsets().to_vec());
     let row = Tile::u32(0);
 
     program.program_grid(block, [grid.workgroups_x, grid.dispatch_y, 1], |program| {
@@ -117,37 +120,80 @@ pub(crate) fn qgemv_q6k_ggml(
         let lane = scope.lane;
         let q6k_lane = q6k_lane_decomposition(&lane);
 
-        let sums: Vec<Tile> = program.fold_vec(
-            range(block_iterations),
-            vec![Tile::f32(0.0); cols_usize],
-            |program, loop_index, accs| {
-                let block_idx = loop_index * 2u32 + q6k_lane.ix.clone();
-                let in_bounds = if full_block_iterations {
-                    Tile::bool(true)
-                } else {
-                    block_idx.clone().lt(block_count)
-                };
-                let vector_base =
-                    block_idx.clone() * 256u32 + q6k_lane.ip.clone() * 128u32 + q6k_lane.l0.clone();
-                let acts = load_q6k_ggml_activations(program, a, &row, &vector_base, &in_bounds);
-                accs.into_iter()
-                    .enumerate()
-                    .map(|(c, acc)| {
-                        let col = col0.clone() + c as u32;
-                        acc + q6k_ggml_dot_tiles(
-                            program,
-                            &qwords,
-                            blocks_per_col,
-                            block_words,
-                            &block_idx,
-                            &col,
-                            &q6k_lane,
-                            &acts,
-                        )
-                    })
-                    .collect()
-            },
-        );
+        let sums: Vec<Tile> = if let Some(post_accumulator_offsets) = &post_accumulator_offsets {
+            let value_arity = post_accumulator_offsets.len();
+            program.fold_vec(
+                range(block_iterations),
+                vec![Tile::f32(0.0); cols_usize * value_arity],
+                |program, loop_index, accs| {
+                    let block_idx = loop_index * 2u32 + q6k_lane.ix.clone();
+                    let in_bounds = if full_block_iterations {
+                        Tile::bool(true)
+                    } else {
+                        block_idx.clone().lt(block_count)
+                    };
+                    let vector_base = block_idx.clone() * 256u32
+                        + q6k_lane.ip.clone() * 128u32
+                        + q6k_lane.l0.clone();
+                    let acts =
+                        load_q6k_ggml_activations(program, a, &row, &vector_base, &in_bounds);
+                    accs.into_iter()
+                        .enumerate()
+                        .map(|(idx, acc)| {
+                            let c = idx / value_arity;
+                            let value_idx = idx % value_arity;
+                            let output_col = col0.clone() + c as u32;
+                            let matrix_col =
+                                output_col.clone() + post_accumulator_offsets[value_idx];
+                            acc + q6k_ggml_dot_tiles(
+                                program,
+                                &qwords,
+                                blocks_per_col,
+                                block_words,
+                                &block_idx,
+                                &matrix_col,
+                                &q6k_lane,
+                                &acts,
+                            )
+                        })
+                        .collect()
+                },
+            )
+        } else {
+            program.fold_vec(
+                range(block_iterations),
+                vec![Tile::f32(0.0); cols_usize],
+                |program, loop_index, accs| {
+                    let block_idx = loop_index * 2u32 + q6k_lane.ix.clone();
+                    let in_bounds = if full_block_iterations {
+                        Tile::bool(true)
+                    } else {
+                        block_idx.clone().lt(block_count)
+                    };
+                    let vector_base = block_idx.clone() * 256u32
+                        + q6k_lane.ip.clone() * 128u32
+                        + q6k_lane.l0.clone();
+                    let acts =
+                        load_q6k_ggml_activations(program, a, &row, &vector_base, &in_bounds);
+                    accs.into_iter()
+                        .enumerate()
+                        .map(|(c, acc)| {
+                            let col = col0.clone() + c as u32;
+                            acc + q6k_ggml_dot_tiles(
+                                program,
+                                &qwords,
+                                blocks_per_col,
+                                block_words,
+                                &block_idx,
+                                &col,
+                                &q6k_lane,
+                                &acts,
+                            )
+                        })
+                        .collect()
+                },
+            )
+        };
 
         store_qgemv_sums_with_epilogue(
             program,

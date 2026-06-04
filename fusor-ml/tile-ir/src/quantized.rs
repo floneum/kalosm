@@ -96,7 +96,7 @@ impl GgmlQuantFormat {
     }
 
     pub const fn matrix_storage_words(self, rows: u32, cols: u32) -> u32 {
-        let blocks = (rows / self.block_elements()) * cols;
+        let blocks = (rows * cols).div_ceil(self.block_elements());
         (blocks * self.block_bytes()).div_ceil(4)
     }
 

@@ -5,6 +5,7 @@ use fusor::{Device, FromArray};
 use crate::{
     AsyncFnMutTuple, GenTuple, GenerateFromDevice, IntoCompare, PushTuple, ResolveTensorTuple,
     available_devices,
+    tuple_macros::{BoxFuture, MaybeSend},
 };
 
 /// ```compile_fail
@@ -81,23 +82,34 @@ impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
 
     pub fn equal_to_resolved_op(
         self,
-        mut other: impl AsyncFnMutTuple<T::Output, Output = U> + Copy + Send + 'static,
+        mut other: impl AsyncFnMutTuple<T::Output, Output = U> + Copy + MaybeSend + 'static,
     ) -> Self
     where
         T: ResolveTensorTuple,
+        T::Output: 'static,
     {
         struct UnpackedTuple<T>(T);
 
+        #[cfg(not(target_arch = "wasm32"))]
         impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
         where
             F: FnMut(I) -> Fut,
             Fut: std::future::Future<Output = O> + Send + 'static,
         {
             type Output = O;
-            fn call_mut<'a>(
-                &'a mut self,
-                input: I,
-            ) -> Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>> {
+            fn call_mut<'a>(&'a mut self, input: I) -> BoxFuture<'a, Self::Output> {
+                Box::pin((self.0)(input))
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
+        where
+            F: FnMut(I) -> Fut,
+            Fut: std::future::Future<Output = O> + 'static,
+        {
+            type Output = O;
+            fn call_mut<'a>(&'a mut self, input: I) -> BoxFuture<'a, Self::Output> {
                 Box::pin((self.0)(input))
             }
         }
@@ -117,25 +129,36 @@ impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
         self,
         mut other: impl AsyncFnMutTuple<<T::Output as PushTuple<Device>>::Output, Output = U>
         + Copy
-        + Send
+        + MaybeSend
         + 'static,
     ) -> Self
     where
         T: ResolveTensorTuple,
         T::Output: PushTuple<Device>,
+        T::Output: 'static,
     {
         struct UnpackedTuple<T>(T);
 
+        #[cfg(not(target_arch = "wasm32"))]
         impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
         where
             F: FnMut(I) -> Fut,
             Fut: std::future::Future<Output = O> + Send + 'static,
         {
             type Output = O;
-            fn call_mut<'a>(
-                &'a mut self,
-                input: I,
-            ) -> Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>> {
+            fn call_mut<'a>(&'a mut self, input: I) -> BoxFuture<'a, Self::Output> {
+                Box::pin((self.0)(input))
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
+        where
+            F: FnMut(I) -> Fut,
+            Fut: std::future::Future<Output = O> + 'static,
+        {
+            type Output = O;
+            fn call_mut<'a>(&'a mut self, input: I) -> BoxFuture<'a, Self::Output> {
                 Box::pin((self.0)(input))
             }
         }
@@ -154,24 +177,35 @@ impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
 
     pub fn equal_to_array_op<const R: usize, D, A>(
         self,
-        mut other: impl AsyncFnMutTuple<T::Output, Output = A> + Copy + Send + 'static,
+        mut other: impl AsyncFnMutTuple<T::Output, Output = A> + Copy + MaybeSend + 'static,
     ) -> Self
     where
         T: ResolveTensorTuple,
+        T::Output: 'static,
         for<'a> U: FromArray<R, D, &'a A, Device>,
     {
         struct UnpackedTuple<T>(T);
 
+        #[cfg(not(target_arch = "wasm32"))]
         impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
         where
             F: FnMut(I) -> Fut,
             Fut: std::future::Future<Output = O> + Send + 'static,
         {
             type Output = O;
-            fn call_mut<'a>(
-                &'a mut self,
-                input: I,
-            ) -> Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>> {
+            fn call_mut<'a>(&'a mut self, input: I) -> BoxFuture<'a, Self::Output> {
+                Box::pin((self.0)(input))
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
+        where
+            F: FnMut(I) -> Fut,
+            Fut: std::future::Future<Output = O> + 'static,
+        {
+            type Output = O;
+            fn call_mut<'a>(&'a mut self, input: I) -> BoxFuture<'a, Self::Output> {
                 Box::pin((self.0)(input))
             }
         }
@@ -216,15 +250,40 @@ where
                     };
                     let expected_args = self.generators.generate(&baseline_device, run);
                     let expected = self.baseline.call_mut(expected_args).await;
-                    let args = self.generators.generate(device, run);
-                    for to_validate in &mut self.to_validate {
-                        let actual = to_validate.call_mut(args.clone()).await;
-                        compare_fn(&expected, &actual).await?;
+                    // Each GPU device is validated as itself plus three derived
+                    // handles (see `device_test_variants`): subgroups available
+                    // vs disabled, crossed with a cold vs poisoned buffer pool.
+                    // The no-subgroup + poisoned-pool combination is the one the
+                    // web build hits; both are properties of the device handle /
+                    // its allocations, not global state. Contiguous vs strided
+                    // inputs are woven across `runs` by the generators.
+                    for variant in device_test_variants(device) {
+                        let args = self.generators.generate(&variant, run);
+                        for to_validate in &mut self.to_validate {
+                            let actual = to_validate.call_mut(args.clone()).await;
+                            compare_fn(&expected, &actual).await?;
+                        }
                     }
                 }
             }
             Ok(())
         };
         Box::pin(future)
+    }
+}
+
+/// The device handles every op is validated against. A GPU device is expanded
+/// into the cross product of {subgroups, no subgroups} × {cold pool, poisoned
+/// pool}; the cold/subgroup variants come first so they run before the poisoned
+/// variants dirty the shared pool. The CPU device has no such variants.
+fn device_test_variants(device: &Device) -> Vec<Device> {
+    match device {
+        Device::Cpu => vec![device.clone()],
+        Device::Gpu(_) => vec![
+            device.clone(),
+            device.without_subgroups(),
+            device.with_poisoned_allocations(),
+            device.without_subgroups().with_poisoned_allocations(),
+        ],
     }
 }

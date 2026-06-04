@@ -5,8 +5,10 @@ use fusor_gguf::{BlockQ4_0, GgmlType};
 
 use super::{
     GPU_SAMPLE_STATUS_RETRY_NEEDED, GPU_SAMPLE_STATUS_SAMPLED, GpuMirostat2Sampler,
-    GpuMirostat2SamplerParams, mirostat::sample_from_sorted_top_k_data_with_encoder,
-    mirostat2_sample_token_to_host, topk::chunk_top_k_pair_data_with_processors_with_encoder,
+    GpuMirostat2SamplerParams, GpuStandardSamplerParams,
+    mirostat::sample_from_sorted_top_k_data_with_encoder, mirostat2_sample_token_to_host,
+    standard_sampler::sample_from_sorted_top_k_data_with_encoder as sample_standard_from_sorted_top_k_data_with_encoder,
+    topk::chunk_top_k_pair_data_with_processors_with_encoder,
 };
 
 #[test]
@@ -154,16 +156,13 @@ fn cpu_mirostat2_selected_token(values: &[f32], mu: f32, params: GpuMirostat2Sam
         .map(|(_, value)| (*value - max_value).exp())
         .sum::<f32>()
         .max(1.0e-20);
-    let mut cutoff = 0usize;
+    let mut cutoff = top.len();
     for (scan, (_, value)) in top.iter().enumerate() {
         let probability = (*value - max_value).exp() / total;
         if -probability.max(1.0e-20).log2() > mu {
             cutoff = scan.max(1);
             break;
         }
-    }
-    if cutoff == 0 {
-        cutoff = 1;
     }
 
     let cutoff_sum = top
@@ -183,6 +182,101 @@ fn cpu_mirostat2_selected_token(values: &[f32], mu: f32, params: GpuMirostat2Sam
         }
     }
     selected
+}
+
+#[test]
+fn backend_mirostat2_sampler_uses_full_top_k_without_surprise_cutoff() {
+    pollster::block_on(async {
+        let device = Device::new().await.unwrap();
+        let values = [1.0, 1.0, 1.0, 1.0];
+        let ids = [3u32, 2, 1, 0];
+        let value_buffer = device.create_buffer_init(
+            bytemuck::cast_slice(&values),
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+        let id_buffer = device.create_buffer_init(
+            bytemuck::cast_slice(&ids),
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+        let values_data =
+            TensorData::new_from_buffer(&device, value_buffer, &[values.len()], DataTypeEnum::F32);
+        let ids_data =
+            TensorData::new_from_buffer(&device, id_buffer, &[ids.len()], DataTypeEnum::U32);
+        let mu = 10.0;
+        let params = GpuMirostat2SamplerParams {
+            top_k: values.len(),
+            temperature: 1.0,
+            repetition_penalty: 1.0,
+            tau: 5.0,
+            eta: 0.1,
+            random: 0.8,
+        };
+        let mut sampler = GpuMirostat2Sampler::new(&device, mu);
+
+        let output = sample_from_sorted_top_k_data_with_encoder(
+            &ids_data,
+            &values_data,
+            &mut sampler,
+            params,
+            None,
+            None,
+        )
+        .unwrap();
+        let result = Tensor::from(output).as_slice::<1, u32>().await.unwrap();
+
+        assert_eq!(result.as_slice()[0], GPU_SAMPLE_STATUS_SAMPLED);
+        assert_eq!(result.as_slice()[1], 0);
+    });
+}
+
+#[test]
+fn backend_standard_sampler_applies_top_p_on_gpu() {
+    pollster::block_on(async {
+        let device = Device::new().await.unwrap();
+        let values = [1.0, 1.0, 1.0, 1.0];
+        let ids = [3u32, 2, 1, 0];
+        let value_buffer = device.create_buffer_init(
+            bytemuck::cast_slice(&values),
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+        let id_buffer = device.create_buffer_init(
+            bytemuck::cast_slice(&ids),
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+        let values_data =
+            TensorData::new_from_buffer(&device, value_buffer, &[values.len()], DataTypeEnum::F32);
+        let ids_data =
+            TensorData::new_from_buffer(&device, id_buffer, &[ids.len()], DataTypeEnum::U32);
+        let params = GpuStandardSamplerParams {
+            top_k: values.len(),
+            temperature: 1.0,
+            repetition_penalty: 1.0,
+            top_p: 0.5,
+            min_p: 0.0,
+            random: 0.8,
+        };
+
+        let output = sample_standard_from_sorted_top_k_data_with_encoder(
+            &ids_data,
+            &values_data,
+            params,
+            None,
+            None,
+        )
+        .unwrap();
+        let result = Tensor::from(output).as_slice::<1, u32>().await.unwrap();
+
+        assert_eq!(result.as_slice()[0], GPU_SAMPLE_STATUS_SAMPLED);
+        assert_eq!(result.as_slice()[1], 2);
+    });
 }
 
 #[test]

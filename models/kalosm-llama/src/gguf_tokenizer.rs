@@ -271,10 +271,10 @@ impl GGUFPreTokenizerConfig {
         vocab: HashMap<String, u32>,
         types: Vec<u8>,
         merges: Vec<(String, String)>,
-        bos: &str,
+        bos: Option<&str>,
         eos: &str,
     ) -> Result<GgufTokenizer, GgufTokenizerError> {
-        let bos_token = vocab[bos];
+        let bos_token = bos.map(|bos| vocab[bos]);
         let eos_token = vocab[eos];
         let max_token = vocab.values().copied().max().unwrap_or(0) as usize;
         let mut special_tokens = vec![false; max_token + 1];
@@ -282,7 +282,7 @@ impl GGUFPreTokenizerConfig {
 
         for (token, id) in &vocab {
             let token_type = types.get(*id as usize).copied().unwrap_or(1);
-            if token_type != 1 || *id == bos_token || *id == eos_token {
+            if token_type != 1 || Some(*id) == bos_token || *id == eos_token {
                 if let Some(special) = special_tokens.get_mut(*id as usize) {
                     *special = true;
                 }
@@ -328,7 +328,7 @@ pub(crate) struct GgufTokenizer {
     pre_tokenizer: PreTokenizer,
     special_tokens: Vec<bool>,
     special_token_matches: Vec<Vec<(Vec<u8>, u32)>>,
-    bos_token: u32,
+    bos_token: Option<u32>,
     add_bos: bool,
 }
 
@@ -354,11 +354,15 @@ impl GgufTokenizer {
         add_special_tokens: bool,
         buffers: &mut GgufEncodeBuffers,
     ) -> Result<Vec<u32>, GgufTokenizerError> {
-        let mut out = Vec::with_capacity(
-            (text.len() / 4).max(8) + usize::from(add_special_tokens && self.add_bos),
-        );
-        if add_special_tokens && self.add_bos {
-            out.push(self.bos_token);
+        let bos_to_prepend = if add_special_tokens && self.add_bos {
+            self.bos_token
+        } else {
+            None
+        };
+        let mut out =
+            Vec::with_capacity((text.len() / 4).max(8) + usize::from(bos_to_prepend.is_some()));
+        if let Some(bos_token) = bos_to_prepend {
+            out.push(bos_token);
         }
 
         let bytes = text.as_bytes();
@@ -661,7 +665,7 @@ mod tests {
             let config = get_pre_tokenizer(label, None);
             let (vocab, types, bos, eos) = byte_vocab();
             let native = config
-                .build(vocab.clone(), types.clone(), Vec::new(), &bos, &eos)
+                .build(vocab.clone(), types.clone(), Vec::new(), Some(bos.as_str()), &eos)
                 .unwrap();
             let legacy = legacy_tokenizer(&config, vocab, types, Vec::new(), &bos, &eos).unwrap();
 

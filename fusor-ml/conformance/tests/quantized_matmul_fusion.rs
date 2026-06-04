@@ -4,7 +4,7 @@ use common::quantized::{
     deterministic_input, q_mat_mul_input_fuzz, q4k_raw_bytes, q6k_raw_bytes, q8_0_raw_bytes,
     qmatrix_from_raw_bytes,
 };
-use fusor::{Device, GgmlType, Tensor};
+use fusor::{Device, GgmlType, QMatrix, Tensor};
 use fusor_conformance::{approx_compare, approx_eq, available_devices};
 use rand::distr::Uniform;
 
@@ -141,6 +141,40 @@ async fn q4k_qmatmul_post_relu_resolves_to_single_kernel() {
     assert_eq!(
         natural_kernels, 1,
         "expected fuser to collapse q_mat_mul -> relu to 1 dispatch, got {natural_kernels}"
+    );
+}
+
+#[tokio::test]
+async fn q4k_concat_split_swiglu_resolves_to_single_dynamic_qmatmul_kernel() {
+    let Ok(device) = fusor::Device::new().await else {
+        return;
+    };
+    let Some(gpu_device) = device.as_gpu() else {
+        panic!("expected GPU device");
+    };
+    if !gpu_device.subgroups_supported() {
+        return;
+    }
+
+    let weight_shape = [64, 512];
+    let raw_bytes = q4k_raw_bytes(weight_shape);
+    let input_data = vec![vec![0.1f32; weight_shape[1]]; 1];
+    let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
+    let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
+
+    let output = match (&input, &weights) {
+        (Tensor::Gpu(input), QMatrix::Gpu(weights)) => {
+            Tensor::<2, f32>::Gpu(input.q_mat_mul_paired_silu_product(weights)).to_concrete()
+        }
+        _ => panic!("expected GPU tensors"),
+    };
+    let Tensor::Gpu(gpu_out) = output else {
+        panic!("expected GPU tensor");
+    };
+    let kernels = gpu_out.count_kernels_to_resolve();
+    assert_eq!(
+        kernels, 1,
+        "expected dynamic split-gate qmatmul fusion to resolve to 1 dispatch, got {kernels}"
     );
 }
 

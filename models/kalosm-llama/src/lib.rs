@@ -467,6 +467,9 @@ pub(crate) struct GpuSamplerConfig {
     pub(crate) tau: f32,
     pub(crate) eta: f32,
     pub(crate) mu: f32,
+    pub(crate) sampling_strategy: kalosm_language_model::SamplingStrategy,
+    pub(crate) top_p: Option<f32>,
+    pub(crate) min_p: Option<f32>,
     pub(crate) repetition_penalty: f32,
     pub(crate) repetition_penalty_range: usize,
     pub(crate) top_k: Option<usize>,
@@ -487,6 +490,9 @@ impl GpuSamplerConfig {
             tau,
             eta,
             mu,
+            sampling_strategy: kalosm_language_model::SamplingStrategy::Mirostat2,
+            top_p: None,
+            min_p: None,
             repetition_penalty,
             repetition_penalty_range,
             top_k,
@@ -496,7 +502,7 @@ impl GpuSamplerConfig {
     pub(crate) fn from_generation_parameters(
         sampler: &kalosm_language_model::GenerationParameters,
     ) -> Self {
-        Self::new(
+        let mut config = Self::new(
             sampler.temperature(),
             sampler.tau(),
             sampler.eta(),
@@ -504,6 +510,10 @@ impl GpuSamplerConfig {
             sampler.repetition_penalty(),
             sampler.repetition_penalty_range() as usize,
             sampler.top_k().map(|top_k| top_k as usize),
-        )
+        );
+        config.sampling_strategy = sampler.sampling_strategy();
+        config.top_p = sampler.top_p().map(|top_p| top_p as f32);
+        config.min_p = sampler.min_p().map(|min_p| min_p as f32);
+        config
     }
 }

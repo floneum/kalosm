@@ -8,6 +8,12 @@ mod comparison;
 mod fuzz;
 mod tuple_macros;
 
+extern crate self as fusor_conformance;
+
+#[path = "../tests/common/mod.rs"]
+pub mod common;
+pub mod suite;
+
 use fusor::{DataType, Device, SimdElement, Tensor};
 use rand::rngs::StdRng;
 

@@ -4,12 +4,11 @@ use fusor_tile_ir::{
 };
 use fusor_tile_ir_kernels::{
     batched_gemv_with_epilogues, batched_matmul_with_epilogues, flash_attention,
-    linear_storage_layout, qdequantize, qgemv_q4k_paired, qgemv_with_epilogue,
-    qgemv_workgroup_f16_with_epilogue, qgemv_workgroup_with_epilogue, qmatmul_with_epilogue,
-    qmatmul_workgroup_f16_with_epilogues, qmatmul_workgroup_with_epilogues, quantized_matrix,
-    rms_norm_vec4, try_batched_coop_matmul, DenseCoopMatmulTile, DenseMatmulEpilogues,
-    DenseMatmulShape, DenseMatmulTensors, FlashAttentionDims, FlashAttentionMeta,
-    FlashAttentionTensors, PairedEpilogue, Q4KPairedGgml, QmatmulEpilogues, RmsNormVec4,
+    linear_storage_layout, qdequantize, qgemv_with_epilogue, qgemv_workgroup_f16_with_epilogue,
+    qgemv_workgroup_with_epilogue, qmatmul_with_epilogue, qmatmul_workgroup_f16_with_epilogues,
+    qmatmul_workgroup_with_epilogues, quantized_matrix, rms_norm_vec4, try_batched_coop_matmul,
+    DenseCoopMatmulTile, DenseMatmulEpilogues, DenseMatmulShape, DenseMatmulTensors,
+    FlashAttentionDims, FlashAttentionMeta, FlashAttentionTensors, QmatmulEpilogues, RmsNormVec4,
     RmsNormVec4Meta, TensorMeta, UnaryEpilogue,
 };
 
@@ -132,62 +131,6 @@ fn q4k_native_ggml_qgemv_lowers() {
 fn q6k_ggml_qgemv_lowers() {
     let ir = qgemv_ir(GgmlQuantFormat::Q6K, 4096, 8192);
     lower_or_fail(&ir, "q6k ggml qgemv");
-}
-
-#[test]
-fn q4k_paired_epilogue_lowers() {
-    let ir = tile::build(|program| {
-        let rows = 4096;
-        let pair_cols = 4096;
-        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, rows]));
-        let b = quantized_matrix(program, GgmlQuantFormat::Q4K, rows, pair_cols * 2);
-        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, pair_cols]));
-        let epilogue =
-            PairedEpilogue::with_extras("mul", 0, |tiles| tiles[0].clone() * tiles[1].clone());
-        qgemv_q4k_paired(
-            program,
-            Q4KPairedGgml {
-                a: &a,
-                b: &b,
-                y: &y,
-                pair_cols,
-                m_rows: 1,
-                workgroups_x: 1,
-                shape: fusor_tile_ir_kernels::Q4KPairedShape::new(8, 2, 256),
-                epilogue: &epilogue,
-                extras: &[],
-            },
-        );
-    });
-    lower_or_fail(&ir, "q4k paired qgemv");
-}
-
-#[test]
-fn q4k_native_paired_epilogue_lowers() {
-    let ir = tile::build(|program| {
-        let rows = 4096;
-        let pair_cols = 4096;
-        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, rows]));
-        let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, rows, pair_cols * 2);
-        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, pair_cols]));
-        let epilogue =
-            PairedEpilogue::with_extras("mul", 0, |tiles| tiles[0].clone() * tiles[1].clone());
-        qgemv_q4k_paired(
-            program,
-            Q4KPairedGgml {
-                a: &a,
-                b: &b,
-                y: &y,
-                pair_cols,
-                m_rows: 1,
-                workgroups_x: 1,
-                shape: fusor_tile_ir_kernels::Q4KPairedShape::new(8, 2, 256),
-                epilogue: &epilogue,
-                extras: &[],
-            },
-        );
-    });
-    lower_or_fail(&ir, "q4k native paired qgemv");
 }
 
 #[test]
@@ -604,6 +547,7 @@ fn qmatmul_epilogue_fallback_ir(post: Option<&UnaryEpilogue>) -> fusor_tile_ir::
             post,
             post_with_extras: None,
             post_extra_inputs: &[],
+            post_accumulator_offsets: &[],
             post_acc_init_col_vector: None,
         };
         qmatmul_with_epilogue(program, &a, &b, &y, &epilogues, 64, 64);

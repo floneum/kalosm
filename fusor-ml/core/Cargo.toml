@@ -24,6 +24,7 @@ petgraph = { version = "0.8.3", features = ["stable_graph", "std"], default-feat
 fusor-tile-ir = { workspace = true }
 fusor-tile-ir-kernels = { workspace = true }
 fusor-tile-ir-runtime = { workspace = true }
+web-time.workspace = true
 
 # Used by the hello example to fetch a GGUF model; gated by `example-net`
 # so `cargo test` doesn't pull in the full hyper/TLS stack.
@@ -37,6 +38,9 @@ wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["vulkan"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["webgpu"] }
 
 [features]
 default = []

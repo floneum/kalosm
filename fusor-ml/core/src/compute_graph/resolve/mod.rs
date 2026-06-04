@@ -1,20 +1,17 @@
-use std::{
-    collections::VecDeque,
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, str::FromStr, sync::Arc};
+
+use web_time::{Duration, Instant};
 
 use crate::{
     DataTypeEnum, Layout,
     compute_graph::layout_pass::LayoutPass,
     mir::{inputs::MirValue, kernel_backend::PreparedDirectDispatch, operation::Operation},
-    nary_direct::eval_nary_expr_on_tiles,
-    nary_wise::{ExtractedUnaryChain, NaryExpr, NaryOperation, UnaryFunctionChain},
+    nary_wise::{
+        ExtractedUnaryChain, NaryExpr, NaryOp, NaryOperation, NaryScalar, UnaryFunctionChain,
+    },
     quantized::matmul::{ElementwiseEpilogue, QMatMulOperation},
     tensor::TensorData,
 };
-use fusor_gguf::GgmlType;
 use petgraph::algo::toposort;
 use petgraph::stable_graph::StableGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -24,7 +21,6 @@ use super::{ComputeGraphInner, ComputeGraphNode, ComputeGraphNodeVariant, NodeIn
 mod execution;
 mod fusion_basic;
 mod fusion_matmul;
-mod fusion_paired;
 mod run;
 
 pub(crate) struct ResolverResult {
@@ -32,12 +28,14 @@ pub(crate) struct ResolverResult {
     pub(crate) total_kernels: usize,
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 struct DispatchRecord {
     dispatch: PreparedDirectDispatch,
-    name: Option<String>,
+    name: String,
     category: Option<String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct DispatchMetadata {
     name: Option<String>,
     category: Option<String>,
@@ -77,6 +75,7 @@ impl QueuedOperation {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 struct KernelProfileAggregate {
     count: usize,
@@ -84,6 +83,7 @@ struct KernelProfileAggregate {
     max_ns: f64,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl KernelProfileAggregate {
     fn record(&mut self, ns: f64) {
         self.count += 1;
@@ -133,8 +133,6 @@ struct OptimizeProfile {
     fuse_reduce: Duration,
     fuse_matmul_count: usize,
     fuse_matmul: Duration,
-    fuse_paired_qmatmul_count: usize,
-    fuse_paired_qmatmul: Duration,
     fuse_rmsnorm_count: usize,
     fuse_rmsnorm: Duration,
 }
@@ -146,7 +144,6 @@ impl OptimizeProfile {
 fuse_naries_count={} fuse_naries={:?} \
 fuse_reduce_count={} fuse_reduce={:?} \
 fuse_matmul_count={} fuse_matmul={:?} \
-fuse_paired_qmatmul_count={} fuse_paired_qmatmul={:?} \
 fuse_rmsnorm_count={} fuse_rmsnorm={:?}",
             self.iterations,
             self.changed,
@@ -156,8 +153,6 @@ fuse_rmsnorm_count={} fuse_rmsnorm={:?}",
             self.fuse_reduce,
             self.fuse_matmul_count,
             self.fuse_matmul,
-            self.fuse_paired_qmatmul_count,
-            self.fuse_paired_qmatmul,
             self.fuse_rmsnorm_count,
             self.fuse_rmsnorm,
         );
@@ -165,6 +160,7 @@ fuse_rmsnorm_count={} fuse_rmsnorm={:?}",
 }
 
 const DEFAULT_OPTIMIZE_NODE_LIMIT: usize = 512;
+const LARGE_GRAPH_NARY_FUSION_MIN_LAST_DIM: usize = 512;
 
 fn optimize_node_limit() -> usize {
     std::env::var("FUSOR_RESOLVE_OPTIMIZE_MAX_NODES")
@@ -230,13 +226,7 @@ fn node_category(variant: &ComputeGraphNodeVariant) -> &'static str {
         ComputeGraphNodeVariant::Dequantize(_) => "dequantize",
         ComputeGraphNodeVariant::QEmbedding(_) => "q_embedding",
         ComputeGraphNodeVariant::MatMul(_) => "matmul",
-        ComputeGraphNodeVariant::QMatMul(op) => {
-            if op.paired.is_some() {
-                "q_mat_paired"
-            } else {
-                "q_matmul"
-            }
-        }
+        ComputeGraphNodeVariant::QMatMul(_) => "q_matmul",
         ComputeGraphNodeVariant::Tensor(_) => "tensor",
         ComputeGraphNodeVariant::Reduce(_) => "reduce",
         ComputeGraphNodeVariant::FlashAttention(_) => "flash_attention",
@@ -269,6 +259,7 @@ fn padded_query_buffer_size(size: u64) -> u64 {
     ((size + align_mask) & !align_mask).max(wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn print_gpu_kernel_profile(
     records: &[DispatchMetadata],
     timestamps: &[u64],

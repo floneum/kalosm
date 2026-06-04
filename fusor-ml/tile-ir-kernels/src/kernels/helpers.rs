@@ -80,8 +80,10 @@ fn zero_literal(element: ScalarElement) -> TileLiteral {
 }
 
 pub(super) const TOP_K_BLOCK: usize = 256;
-pub(super) const MAX_F32: f32 = f32::MAX;
-pub(super) const NEG_MAX_F32: f32 = -f32::MAX;
+// Naga's WGSL writer prints `f32::MAX` as a decimal literal that the WGSL
+// parser rejects on WebGPU. Keep shader sentinels just below that edge.
+pub(super) const MAX_F32: f32 = 3.40282e38;
+pub(super) const NEG_MAX_F32: f32 = -MAX_F32;
 
 /// One component of a strided tensor index.
 pub(super) enum IndexComponent {

@@ -4,22 +4,70 @@ use common::quantized::{
     concrete_to_rows, q_mat_mul_input_fuzz, q4k_raw_bytes, qmatrix_from_raw_bytes,
 };
 use common::{matmul2, transpose2};
-use fusor::{BlockQ4K, Device, GgmlType, GgufBlock, QuantizedTensor, Tensor, ToVec2};
+use fusor::{BlockQ4K, Device, GgmlType, GgufBlock, QMatrix, QuantizedTensor, Tensor, ToVec2};
 use fusor_conformance::approx_compare;
 use rand::distr::Uniform;
 use std::mem::size_of;
 
 #[tokio::test]
-async fn q4k_paired_natural_form_matches_cpu_reference() {
-    for kind in [PairedKind::SwiGLU, PairedKind::GeGLU, PairedKind::ReGLU] {
+async fn q4k_concat_split_gated_natural_form_matches_cpu_reference() {
+    for kind in [GatedKind::SwiGLU, GatedKind::GeGLU, GatedKind::ReGLU] {
         for rows in [1, 4] {
-            paired_matches_cpu_for_rows(rows, kind).await;
+            gated_matches_cpu_for_rows(rows, kind).await;
         }
     }
 }
 
 #[tokio::test]
-async fn q4k_paired_llama_shape_one_hot_matches_cpu_reference() {
+async fn q4k_dynamic_paired_helper_swiglu_matches_cpu_reference_for_decode_row() {
+    let Ok(device) = Device::new().await else {
+        return;
+    };
+    let weight_shape = [64, 512];
+    let pair_len = weight_shape[0] / 2;
+    let raw_bytes = q4k_raw_bytes(weight_shape);
+    let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
+    let expected_weights = concrete_to_rows(
+        &QuantizedTensor::<BlockQ4K>::from_raw_bytes(weight_shape, &raw_bytes).dequantize::<2>(),
+        weight_shape,
+    );
+    let input_data = (0..weight_shape[1])
+        .map(|i| {
+            let bucket = (i.wrapping_mul(37).wrapping_add(11)) % 101;
+            (bucket as f32 - 50.0) * 0.0025
+        })
+        .collect::<Vec<_>>();
+    let input: Tensor<2, f32> = Tensor::from_slice(&device, [1, weight_shape[1]], &input_data);
+
+    let actual_tensor = match (&input, &weights) {
+        (Tensor::Gpu(input), QMatrix::Gpu(weights)) => {
+            Tensor::<2, f32>::Gpu(input.q_mat_mul_paired_silu_product(weights)).to_concrete()
+        }
+        _ => panic!("expected GPU tensors"),
+    };
+    let actual = actual_tensor.as_slice().await.unwrap();
+    let projected = matmul2(&[input_data], &transpose2(&expected_weights));
+    let expected = (0..pair_len)
+        .map(|col| {
+            let gate = projected[0][col];
+            let up = projected[0][col + pair_len];
+            (gate / (1.0 + (-gate).exp())) * up
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(actual.shape(), &[1, pair_len]);
+    for (col, expected) in expected.iter().copied().enumerate() {
+        let actual = actual[[0, col]];
+        let tolerance = 2.0f32.max(expected.abs() * 1.0e-4);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "col={col} actual={actual} expected={expected} tolerance={tolerance}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn q4k_concat_split_llama_shape_one_hot_matches_cpu_reference() {
     use fusor::D;
 
     let Ok(device) = Device::new().await else {
@@ -74,7 +122,7 @@ async fn q4k_paired_llama_shape_one_hot_matches_cpu_reference() {
 }
 
 #[tokio::test]
-async fn q4k_paired_llama_shape_dense_sampled_columns_match_cpu_reference() {
+async fn q4k_concat_split_llama_shape_dense_sampled_columns_match_cpu_reference() {
     use fusor::D;
 
     let Ok(device) = Device::new().await else {
@@ -141,21 +189,21 @@ async fn q4k_paired_llama_shape_dense_sampled_columns_match_cpu_reference() {
 }
 
 #[derive(Clone, Copy)]
-enum PairedKind {
+enum GatedKind {
     SwiGLU,
     GeGLU,
     ReGLU,
 }
 
-impl PairedKind {
+impl GatedKind {
     fn cpu_activation(self, x: f32) -> f32 {
         match self {
-            PairedKind::SwiGLU => x / (1.0 + (-x).exp()),
-            PairedKind::GeGLU => {
+            GatedKind::SwiGLU => x / (1.0 + (-x).exp()),
+            GatedKind::GeGLU => {
                 // tanh approximation matching the kernel-side helper
                 0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044_715 * x * x * x)).tanh())
             }
-            PairedKind::ReGLU => {
+            GatedKind::ReGLU => {
                 if x > 0.0 {
                     x
                 } else {
@@ -166,7 +214,7 @@ impl PairedKind {
     }
 }
 
-async fn paired_matches_cpu_for_rows(input_row_count: usize, kind: PairedKind) {
+async fn gated_matches_cpu_for_rows(input_row_count: usize, kind: GatedKind) {
     use fusor::D;
     let ty = GgmlType::Q4K;
     let weight_shape = [4, 512];
@@ -174,9 +222,8 @@ async fn paired_matches_cpu_for_rows(input_row_count: usize, kind: PairedKind) {
     let weights = QuantizedTensor::<BlockQ4K>::from_raw_bytes(weight_shape, &raw_bytes);
     let expected_weights = concrete_to_rows(&weights.dequantize::<2>(), weight_shape);
 
-    // Author the natural unfused source — the resolver's paired-fusion rule
-    // rewrites this into a single paired-mode QMatMul kernel. Correctness verifies
-    // both the rewrite and the kernel's per-output epilogue evaluation.
+    // Author the natural graph source. Correctness verifies the generic qmatmul
+    // plus dynamic nary path across gated FFN expressions.
     fusor_conformance::assert(move |input: Tensor<2, f32>| {
         let raw_bytes = raw_bytes.clone();
         async move {
@@ -185,9 +232,9 @@ async fn paired_matches_cpu_for_rows(input_row_count: usize, kind: PairedKind) {
             let gate = projected.narrow(D::Minus1, 0, 2).to_concrete();
             let up = projected.narrow(D::Minus1, 2, 2).to_concrete();
             let activated = match kind {
-                PairedKind::SwiGLU => gate.silu(),
-                PairedKind::GeGLU => gate.gelu(),
-                PairedKind::ReGLU => gate.relu(),
+                GatedKind::SwiGLU => gate.silu(),
+                GatedKind::GeGLU => gate.gelu(),
+                GatedKind::ReGLU => gate.relu(),
             };
             (activated * up).to_concrete()
         }
@@ -224,47 +271,10 @@ async fn paired_matches_cpu_for_rows(input_row_count: usize, kind: PairedKind) {
     .unwrap();
 }
 
-/// The fuser must collapse the natural `q_mat_mul → narrow → silu → mul(narrow)`
-/// pattern into a single dispatch. Without the rule the source would emit
-/// multiple kernels (matmul + nary).
-#[tokio::test]
-async fn q4k_paired_pattern_resolves_to_single_kernel() {
-    use fusor::D;
-    let Ok(device) = fusor::Device::new().await else {
-        return; // No GPU available in this environment.
-    };
-    let weight_shape = [4, 512];
-    let raw_bytes = q4k_raw_bytes(weight_shape);
-    let input_data = vec![vec![0.1f32; weight_shape[1]]; 1];
-    let Some(gpu_device) = device.as_gpu() else {
-        panic!("expected GPU device");
-    };
-    if !gpu_device.subgroups_supported() {
-        return;
-    }
-
-    let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
-    let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
-    let projected = input.q_mat_mul(&weights);
-    let gate = projected.narrow(D::Minus1, 0, 2).to_concrete();
-    let up = projected.narrow(D::Minus1, 2, 2).to_concrete();
-    let output = (gate.silu() * up).to_concrete();
-    let Tensor::Gpu(natural_gpu) = output else {
-        panic!("expected GPU tensor");
-    };
-    let natural_kernels = natural_gpu.count_kernels_to_resolve();
-
-    assert_eq!(
-        natural_kernels, 1,
-        "expected fuser to collapse paired pattern to 1 dispatch, got {natural_kernels}"
-    );
-}
-
 /// Authoring the natural source (`q_mat_mul → narrow → silu → mul(narrow)`)
-/// should produce results identical to the CPU reference, because the
-/// compute-graph fuser rewrites the pattern to a `paired-mode QMatMul` kernel.
+/// should produce results identical to the CPU reference.
 #[tokio::test]
-async fn q4k_paired_pattern_auto_fuses_to_paired_kernel() {
+async fn q4k_concat_split_swiglu_matches_cpu_reference() {
     use fusor::D;
     let ty = GgmlType::Q4K;
     let weight_shape = [4, 512];
@@ -276,8 +286,6 @@ async fn q4k_paired_pattern_auto_fuses_to_paired_kernel() {
         let raw_bytes = raw_bytes.clone();
         async move {
             let weights = qmatrix_from_raw_bytes(&input.device(), weight_shape, &raw_bytes, ty);
-            // Natural unfused authoring — the resolver's `try_fuse_paired_qmatmul`
-            // rule rewrites this subgraph to a single paired-fused kernel.
             let projected = input.q_mat_mul(&weights);
             let gate = projected.narrow(D::Minus1, 0, 2).to_concrete();
             let up = projected.narrow(D::Minus1, 2, 2).to_concrete();
@@ -312,45 +320,4 @@ async fn q4k_paired_pattern_auto_fuses_to_paired_kernel() {
     .runs(3)
     .await
     .unwrap();
-}
-
-/// Biased FFN pattern: `silu(gate + gate_bias) * (up + up_bias)`.
-/// The fuser detects this as a paired-with-extras pattern (2 matmul views +
-/// 2 broadcast bias vectors) and rewrites it to a single `paired-mode QMatMul`
-/// kernel that loads the biases per output column at epilogue time.
-#[tokio::test]
-async fn q4k_paired_with_bias_resolves_to_single_kernel() {
-    use fusor::D;
-    let Ok(device) = fusor::Device::new().await else {
-        return;
-    };
-    let Some(gpu_device) = device.as_gpu() else {
-        panic!("expected GPU device");
-    };
-    if !gpu_device.subgroups_supported() {
-        return;
-    }
-    let weight_shape = [4, 512];
-    let raw_bytes = q4k_raw_bytes(weight_shape);
-    let input_data = vec![vec![0.1f32; weight_shape[1]]; 1];
-    let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
-    let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
-    let gate_bias: Tensor<1, f32> = Tensor::new(&device, &vec![0.05f32, -0.05]);
-    let up_bias: Tensor<1, f32> = Tensor::new(&device, &vec![0.02f32, 0.03]);
-
-    let projected = input.q_mat_mul(&weights);
-    let gate = projected.narrow(D::Minus1, 0, 2).to_concrete();
-    let up = projected.narrow(D::Minus1, 2, 2).to_concrete();
-    let gate_biased = gate.add_(&gate_bias);
-    let up_biased = up.add_(&up_bias);
-    let output = (gate_biased.silu() * up_biased).to_concrete();
-
-    let Tensor::Gpu(gpu_out) = output else {
-        panic!("expected GPU tensor");
-    };
-    let kernels = gpu_out.count_kernels_to_resolve();
-    assert_eq!(
-        kernels, 1,
-        "expected fuser to collapse biased silu(gate+gb)*up_biased to 1 dispatch, got {kernels}"
-    );
 }

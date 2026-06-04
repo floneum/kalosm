@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use web_time::{Duration, Instant};
 
 #[cfg(feature = "vision")]
 pub(crate) fn debug_check_nan_f32<const R: usize>(
@@ -7,40 +8,48 @@ pub(crate) fn debug_check_nan_f32<const R: usize>(
     label: &str,
     index_pos: usize,
 ) {
-    if layer != 0 && layer != usize::MAX {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (t, layer, label, index_pos);
         return;
     }
-    let Ok(slice) = pollster::block_on(t.as_slice()) else {
-        return;
-    };
-    let mut nan = 0usize;
-    let mut pos_inf = 0usize;
-    let mut neg_inf = 0usize;
-    let mut max_abs = 0f32;
-    let mut sample_idx = 0usize;
-    let mut sample_vals = [0usize; 4];
-    for (i, v) in slice.as_slice().iter().enumerate() {
-        let v = *v;
-        if v.is_nan() {
-            nan += 1;
-            if sample_idx < sample_vals.len() {
-                sample_vals[sample_idx] = i;
-                sample_idx += 1;
-            }
-        } else if v == f32::INFINITY {
-            pos_inf += 1;
-        } else if v == f32::NEG_INFINITY {
-            neg_inf += 1;
-        } else if v.abs() > max_abs {
-            max_abs = v.abs();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if layer != 0 && layer != usize::MAX {
+            return;
         }
-    }
-    if nan > 0 || pos_inf > 0 || neg_inf > 0 {
-        eprintln!(
-            "trace_nan layer={layer} label={label} index_pos={index_pos} shape={:?} nan={nan} (first_nan_indices={:?}) +inf={pos_inf} -inf={neg_inf} max_abs={max_abs}",
-            t.shape(),
-            &sample_vals[..sample_idx]
-        );
+        let Ok(slice) = pollster::block_on(t.as_slice()) else {
+            return;
+        };
+        let mut nan = 0usize;
+        let mut pos_inf = 0usize;
+        let mut neg_inf = 0usize;
+        let mut max_abs = 0f32;
+        let mut sample_idx = 0usize;
+        let mut sample_vals = [0usize; 4];
+        for (i, v) in slice.as_slice().iter().enumerate() {
+            let v = *v;
+            if v.is_nan() {
+                nan += 1;
+                if sample_idx < sample_vals.len() {
+                    sample_vals[sample_idx] = i;
+                    sample_idx += 1;
+                }
+            } else if v == f32::INFINITY {
+                pos_inf += 1;
+            } else if v == f32::NEG_INFINITY {
+                neg_inf += 1;
+            } else if v.abs() > max_abs {
+                max_abs = v.abs();
+            }
+        }
+        if nan > 0 || pos_inf > 0 || neg_inf > 0 {
+            eprintln!(
+                "trace_nan layer={layer} label={label} index_pos={index_pos} shape={:?} nan={nan} (first_nan_indices={:?}) +inf={pos_inf} -inf={neg_inf} max_abs={max_abs}",
+                t.shape(),
+                &sample_vals[..sample_idx]
+            );
+        }
     }
 }
 
@@ -713,20 +722,89 @@ where
         F: CastTo<f32> + CastTensor<f32> + Default,
         f32: CastTo<F> + CastTensor<F>,
     {
-        let t_encode = std::time::Instant::now();
-        let (mut layer_in, seq_len, index_pos, pos_ids) =
+        let t_encode = Instant::now();
+        let (layer_in, seq_len, index_pos, pos_ids) =
             self.encode_tokens(tokens, images, device, cache.as_deref_mut())?;
+        self.forward_last_hidden_from_embeddings(
+            layer_in,
+            seq_len,
+            index_pos,
+            pos_ids,
+            device,
+            cache,
+            Some(t_encode.elapsed()),
+        )
+    }
+
+    pub(crate) fn forward_last_hidden_f32_gpu_token(
+        &self,
+        token: &Tensor<1, u32>,
+        device: &Device,
+        cache: &mut LlamaCache,
+    ) -> Result<(Tensor<2, f32>, usize)>
+    where
+        F: CastTo<f32> + CastTensor<f32> + Default,
+        f32: CastTo<F> + CastTensor<F>,
+    {
+        #[cfg(feature = "vision")]
+        if self.vision_encoder.is_some() {
+            return Err(fusor::Error::msg(
+                "GPU token run-ahead is only available for text-only models",
+            ));
+        }
+
+        if cache.tokens.len() + 1 > self.config.context_length {
+            return Err(fusor::Error::msg(
+                "GPU token run-ahead cannot trim a full context",
+            ));
+        }
+
+        let cache_slot = cache.tokens.len();
+        cache.tokens.push(0);
+        let x = token.unsqueeze(0);
+        let mut embeddings_f32 = self.tok_embeddings.forward(&x);
+        if let Some(scale) = self.tok_embedding_scale {
+            embeddings_f32 = (embeddings_f32 * scale).to_concrete();
+        }
+        let embeddings: Tensor<3, F> = embeddings_f32.cast();
+        let hidden = self.forward_last_hidden_from_embeddings(
+            embeddings,
+            1,
+            cache_slot,
+            None,
+            device,
+            Some(cache),
+            None,
+        )?;
+        Ok((hidden, cache_slot))
+    }
+
+    fn forward_last_hidden_from_embeddings(
+        &self,
+        mut layer_in: Tensor<3, F>,
+        seq_len: usize,
+        index_pos: usize,
+        pos_ids: Option<Tensor<2, F>>,
+        device: &Device,
+        mut cache: Option<&mut LlamaCache>,
+        encode_elapsed: Option<Duration>,
+    ) -> Result<Tensor<2, f32>>
+    where
+        F: CastTo<f32> + CastTensor<f32> + Default,
+        f32: CastTo<F> + CastTensor<F>,
+    {
         let _trace_text_prefill = seq_len > 1 && std::env::var_os("KALOSM_TRACE_TEXT").is_some();
         let trace_forward_timing =
             seq_len > 1 || std::env::var_os("KALOSM_TRACE_FORWARD_TIMING").is_some();
         if trace_forward_timing {
-            eprintln!(
-                "[timing] encode_tokens (incl. vision): {:.2?} seq_len={}",
-                t_encode.elapsed(),
-                seq_len
-            );
+            if let Some(encode_elapsed) = encode_elapsed {
+                eprintln!(
+                    "[timing] encode_tokens (incl. vision): {:.2?} seq_len={}",
+                    encode_elapsed, seq_len
+                );
+            }
         }
-        let t_text_layers = std::time::Instant::now();
+        let t_text_layers = Instant::now();
         let trace_layer_nan = seq_len == 1 && std::env::var_os("KALOSM_TRACE_LAYER_NAN").is_some();
         if trace_layer_nan {
             let probe: fusor::Tensor<3, f32> = layer_in.cast();
@@ -819,7 +897,8 @@ where
         }
         let x = self.norm.forward_generic(&layer_in);
         let x = x.i((.., seq_len - 1, ..));
-        Ok(x.cast::<f32>())
+        let out = x.cast::<f32>();
+        Ok(out)
     }
 
     pub(crate) fn output_matrix(&self) -> &QMatrix {

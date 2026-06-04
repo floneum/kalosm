@@ -86,9 +86,47 @@ pub(crate) fn store_qgemv_sums_with_epilogue(
     sums: Vec<Tile>,
     target: QgemvStoreTarget<'_>,
 ) {
-    for (offset, sum) in sums.into_iter().enumerate() {
+    if target.epilogues.post_accumulator_offsets.is_empty() {
+        for (offset, sum) in sums.into_iter().enumerate() {
+            let col = target.col0.clone() + offset as u32;
+            let reduced = program.subgroup_reduce_sum(sum);
+            let extras = target
+                .epilogues
+                .post_extra_inputs
+                .iter()
+                .map(|extra| match extra {
+                    crate::types::QmatmulExtra::Column(vector) => {
+                        program.load(vector.at(&col), col.lt(target.n_cols), 0.0)
+                    }
+                    crate::types::QmatmulExtra::Pointwise(tensor) => {
+                        let row = Tile::literal(TileLiteral::U32(0));
+                        program.load(tensor.at((row, &col)), col.lt(target.n_cols), 0.0)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let value =
+                crate::types::apply_qmatmul_post_epilogue(target.epilogues, reduced, extras);
+            let mut mask = target.lane.eq(0u32);
+            if !target.full_cols {
+                mask = mask.and(col.lt(target.n_cols));
+            }
+            program.store(target.y.at((0u32, col)), value, mask);
+        }
+        return;
+    }
+
+    let value_arity = target.epilogues.post_value_arity();
+    assert!(
+        sums.len().is_multiple_of(value_arity),
+        "qgemv sums must be grouped by output column"
+    );
+    for (offset, sums) in sums.chunks(value_arity).enumerate() {
         let col = target.col0.clone() + offset as u32;
-        let reduced = program.subgroup_reduce_sum(sum);
+        let reduced = sums
+            .iter()
+            .cloned()
+            .map(|sum| program.subgroup_reduce_sum(sum))
+            .collect::<Vec<_>>();
         let extras = target
             .epilogues
             .post_extra_inputs
@@ -103,7 +141,8 @@ pub(crate) fn store_qgemv_sums_with_epilogue(
                 }
             })
             .collect::<Vec<_>>();
-        let value = crate::types::apply_qmatmul_post_epilogue(target.epilogues, reduced, extras);
+        let value =
+            crate::types::apply_qmatmul_post_epilogue_values(target.epilogues, reduced, extras);
         let mut mask = target.lane.eq(0u32);
         if !target.full_cols {
             mask = mask.and(col.lt(target.n_cols));

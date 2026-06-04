@@ -300,10 +300,26 @@ impl<'a> Lowerer<'a> {
     ) -> Handle<Expression> {
         match builtin {
             Builtin::Lane => Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG),
-            Builtin::SubgroupId => Self::function_arg(expressions, SUBGROUP_ID_ARG),
-            Builtin::SubgroupLane => Self::function_arg(expressions, SUBGROUP_INVOCATION_ID_ARG),
-            Builtin::SubgroupSize => Self::function_arg(expressions, SUBGROUP_SIZE_ARG),
-            Builtin::NumSubgroups => Self::function_arg(expressions, NUM_SUBGROUPS_ARG),
+            Builtin::SubgroupId => Self::function_arg(
+                expressions,
+                self.subgroup_id_arg
+                    .expect("subgroup_id argument should be declared"),
+            ),
+            Builtin::SubgroupLane => Self::function_arg(
+                expressions,
+                self.subgroup_invocation_id_arg
+                    .expect("subgroup_invocation_id argument should be declared"),
+            ),
+            Builtin::SubgroupSize => Self::function_arg(
+                expressions,
+                self.subgroup_size_arg
+                    .expect("subgroup_size argument should be declared"),
+            ),
+            Builtin::NumSubgroups => Self::function_arg(
+                expressions,
+                self.num_subgroups_arg
+                    .expect("num_subgroups argument should be declared"),
+            ),
             Builtin::ProgramId(axis) => {
                 let wg = Self::function_arg(expressions, WORKGROUP_ID_ARG);
                 self.emit(

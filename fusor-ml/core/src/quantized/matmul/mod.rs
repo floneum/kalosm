@@ -1,7 +1,4 @@
-use std::{
-    fmt,
-    hash::{Hash, Hasher},
-};
+use std::{fmt, hash::Hash};
 
 use crate::{
     DataTypeEnum, Device, Layout, Tensor, TensorData,
@@ -23,7 +20,7 @@ use crate::{
         },
         workgroup_shape::{Constraint, WorkgroupShapeConstraints},
     },
-    nary_direct::apply_single_input_elementwise_expr,
+    nary_direct::{apply_multi_input_elementwise_expr, apply_single_input_elementwise_expr},
     nary_wise::{NaryExpr, NaryOp, NaryOperation},
 };
 use fusor_gguf::GgmlType;
@@ -35,8 +32,8 @@ use super::{
     QMatMulDirectPipelineKey, QMatrix, QMatrixStorageLayout, dequantize::DequantizeOperation,
 };
 
+mod fallback;
 mod kernel;
-mod paired;
 #[cfg(test)]
 mod tests;
 
@@ -137,9 +134,6 @@ enum QMatmulPath {
 
 struct QMatmulDirectFastKernelVariant;
 struct QMatmulDirectEpilogueKernelVariant;
-struct QMatmulPairedKernelVariant;
-struct QMatmulPairedExtrasKernelVariant;
-struct QMatmulPairedDenseFallbackKernelVariant;
 
 const QMATMUL_DIRECT_KERNEL_GENERATION: u64 = 0x514D_4154_4D49_5832;
 
@@ -156,6 +150,10 @@ fn qmatmul_coop_supported(caps: KernelDeviceCaps) -> bool {
         && caps
             .cooperative_matrix
             .supports(CooperativeMatrixKind::F32F32M8N8K8)
+}
+
+fn qmatmul_path_requires_coop(path: QMatmulPath) -> bool {
+    !matches!(path, QMatmulPath::SingleRow | QMatmulPath::Q5SmallSingleRow)
 }
 
 fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> {
@@ -316,18 +314,6 @@ fn qmatmul_operation_name(
     )
 }
 
-/// Paired-mode configuration on a `QMatMulOperation`. When present, the
-/// matmul produces `[gate; up]` columns and applies `epilogue.apply(gate, up,
-/// extras…)` to emit one output column per pair — `extras` are per-column
-/// broadcast tensors (e.g. bias vectors) the kernel loads at epilogue time.
-/// Populated by the resolver's `try_fuse_paired_qmatmul` rule.
-#[derive(Debug, Clone)]
-pub(crate) struct PairedConfig {
-    pub(crate) epilogue: tile_ir_kernels::PairedEpilogue,
-    pub(crate) pair_len: usize,
-    pub(crate) extras: Vec<NodeIndex>,
-}
-
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) struct ElementwiseEpilogue {
     pub(crate) expression: NaryExpr,
@@ -350,11 +336,11 @@ pub(crate) struct QMatMulOperation {
     /// and before store. This covers composite unary expressions like GELU
     /// that are not representable as a linear unary chain.
     pub(crate) post_element_wise_expr: Option<ElementwiseEpilogue>,
-    /// When `Some`, this operation produces a paired output (`out_shape[-1]`
-    /// = `paired.pair_len`, half of `matrix.shape[0]`) and dispatches to the
-    /// `qgemv_q4k_paired_*` kernel family. When `None`, it's a plain
-    /// quantized matmul with optional pre/post expression epilogues.
-    pub(crate) paired: Option<PairedConfig>,
+    /// Matrix-column offsets for accumulator values consumed by
+    /// `post_element_wise_expr`. Empty means the default single accumulator at
+    /// the output column. Non-empty is only lowered by the single-row qgemv
+    /// path.
+    pub(crate) post_accumulator_offsets: Box<[u32]>,
 }
 
 impl QMatMulOperation {
@@ -377,48 +363,7 @@ impl QMatMulOperation {
             out_shape,
             pre_element_wise_expr: None,
             post_element_wise_expr: None,
-            paired: None,
-        }
-    }
-
-    /// Build a paired-mode QMatMul that emits one output column per
-    /// gate/up pair via the supplied epilogue. `pair_len` must equal
-    /// `matrix.shape[0] / 2`; `extras.len()` must equal
-    /// `epilogue.extras_count()`. Used by the resolver's paired-fusion
-    /// rewrite.
-    pub(crate) fn new_paired(
-        input_datatype: DataTypeEnum,
-        input_shape: &[usize],
-        input: NodeIndex,
-        matrix: QMatrix,
-        pair_len: usize,
-        epilogue: tile_ir_kernels::PairedEpilogue,
-        extras: Vec<NodeIndex>,
-    ) -> Self {
-        assert_eq!(
-            extras.len(),
-            epilogue.extras_count(),
-            "QMatMulOperation::new_paired: extras.len() must equal epilogue.extras_count()"
-        );
-        let last_dim = input_shape.len() - 1;
-        let mut out_shape = input_shape.to_vec();
-        out_shape[last_dim] = pair_len;
-        assert_eq!(input_shape[last_dim], matrix.shape[1]);
-        assert_eq!(matrix.shape[0], pair_len * 2);
-        let out_shape = out_shape.into_boxed_slice();
-        QMatMulOperation {
-            input_datatype,
-            input,
-            matrix,
-            in_shape: input_shape.into(),
-            out_shape,
-            pre_element_wise_expr: None,
-            post_element_wise_expr: None,
-            paired: Some(PairedConfig {
-                epilogue,
-                pair_len,
-                extras,
-            }),
+            post_accumulator_offsets: Box::new([]),
         }
     }
 
@@ -427,7 +372,7 @@ impl QMatMulOperation {
     }
 
     fn n_size(&self) -> u32 {
-        self.matrix.shape[0] as u32
+        self.out_shape[self.out_shape.len() - 1] as u32
     }
 }
 
@@ -488,6 +433,7 @@ impl fmt::Display for QMatMulLoweringError {
 pub(crate) struct DirectKernelChains<'a> {
     pub pre_expr: Option<&'a ElementwiseEpilogue>,
     pub post_expr: Option<&'a ElementwiseEpilogue>,
+    pub post_accumulator_offsets: &'a [u32],
 }
 
 fn qmatmul_post_expr_is_column_add(expr: &ElementwiseEpilogue) -> bool {

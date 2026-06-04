@@ -1,24 +1,26 @@
 use super::*;
 
 impl<'a> Lowerer<'a> {
-    pub(in crate::lower) fn quantized_block_base(
+    pub(in crate::lower) fn quantized_flat_block_base_and_q(
         &self,
         e: &mut Arena<Expression>,
         matrix: &QuantizedMatrix,
-        block: Handle<Expression>,
+        k: Handle<Expression>,
         col: Handle<Expression>,
         block_words: u32,
         body: &mut Block,
-    ) -> Handle<Expression> {
-        let blocks_per_col = matrix.rows / matrix.format.block_elements();
-        let col_block = self.mul_literal_u32_emitted(e, col, blocks_per_col, body);
-        let block_index = self.add(e, body, col_block, block);
+    ) -> (Handle<Expression>, Handle<Expression>) {
+        let col_offset = self.mul_literal_u32_emitted(e, col, matrix.rows, body);
+        let flat = self.add(e, body, col_offset, k);
+        let block = self.div_literal_u32_emitted(e, flat, matrix.format.block_elements(), body);
+        let q = self.and_lit(e, body, flat, matrix.format.block_elements() - 1);
         let stride = if matrix.format.uses_byte_addressed_blocks() {
             matrix.format.block_bytes()
         } else {
             block_words
         };
-        self.mul_literal_u32_emitted(e, block_index, stride, body)
+        let base = self.mul_literal_u32_emitted(e, block, stride, body);
+        (base, q)
     }
 
     pub(in crate::lower) fn load_word(

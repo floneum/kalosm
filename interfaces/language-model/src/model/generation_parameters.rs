@@ -1,3 +1,12 @@
+/// The local token sampling algorithm to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplingStrategy {
+    /// Use Mirostat v2 adaptive surprise sampling.
+    Mirostat2,
+    /// Use conventional temperature sampling with top-k, top-p, and min-p filters.
+    Standard,
+}
+
 /// Parameters to use when generating text.
 #[derive(Debug)]
 pub struct GenerationParameters {
@@ -5,7 +14,9 @@ pub struct GenerationParameters {
     pub(crate) tau: f32,
     pub(crate) eta: f32,
     pub(crate) mu: f32,
+    pub(crate) sampling_strategy: SamplingStrategy,
     pub(crate) top_p: Option<f64>,
+    pub(crate) min_p: Option<f64>,
     pub(crate) top_k: Option<u32>,
     pub(crate) repetition_penalty: Option<f32>,
     pub(crate) repetition_penalty_range: u32,
@@ -20,7 +31,9 @@ impl PartialEq for GenerationParameters {
             && self.eta == other.eta
             && self.tau == other.tau
             && self.mu == other.mu
+            && self.sampling_strategy == other.sampling_strategy
             && self.top_p == other.top_p
+            && self.min_p == other.min_p
             && self.top_k == other.top_k
             && self.repetition_penalty == other.repetition_penalty
             && self.repetition_penalty_range == other.repetition_penalty_range
@@ -36,7 +49,9 @@ impl Clone for GenerationParameters {
             eta: self.eta,
             tau: self.tau,
             mu: self.mu,
+            sampling_strategy: self.sampling_strategy,
             top_p: self.top_p,
+            min_p: self.min_p,
             top_k: self.top_k,
             repetition_penalty: self.repetition_penalty,
             repetition_penalty_range: self.repetition_penalty_range,
@@ -61,7 +76,9 @@ impl GenerationParameters {
             eta: 0.1,
             tau: 5.,
             mu: 10.,
+            sampling_strategy: SamplingStrategy::Mirostat2,
             top_p: None,
+            min_p: None,
             top_k: None,
             repetition_penalty: None,
             repetition_penalty_range: 64,
@@ -71,9 +88,33 @@ impl GenerationParameters {
         }
     }
 
-    /// Set the top_p parameter to the generation parameters (only used by the OpenAI API).
+    /// Use Mirostat v2 adaptive surprise sampling.
+    pub fn with_mirostat_sampler(mut self) -> Self {
+        self.sampling_strategy = SamplingStrategy::Mirostat2;
+        self
+    }
+
+    /// Use conventional temperature sampling with top-k, top-p, and min-p filters.
+    pub fn with_standard_sampler(mut self) -> Self {
+        self.sampling_strategy = SamplingStrategy::Standard;
+        self
+    }
+
+    /// Set the sampling strategy to use when generating text.
+    pub fn with_sampling_strategy(mut self, sampling_strategy: SamplingStrategy) -> Self {
+        self.sampling_strategy = sampling_strategy;
+        self
+    }
+
+    /// Set the top-p nucleus sampling threshold.
     pub fn with_top_p(mut self, top_p: f64) -> Self {
         self.top_p = Some(top_p);
+        self
+    }
+
+    /// Set the min-p sampling threshold, relative to the highest-probability token.
+    pub fn with_min_p(mut self, min_p: f64) -> Self {
+        self.min_p = Some(min_p);
         self
     }
 
@@ -155,6 +196,21 @@ impl GenerationParameters {
     /// Get the mu to use when generating text.
     pub fn mu(&self) -> f32 {
         self.mu
+    }
+
+    /// Get the sampling strategy to use when generating text.
+    pub fn sampling_strategy(&self) -> SamplingStrategy {
+        self.sampling_strategy
+    }
+
+    /// Get the top-p nucleus sampling threshold.
+    pub fn top_p(&self) -> Option<f64> {
+        self.top_p
+    }
+
+    /// Get the min-p sampling threshold.
+    pub fn min_p(&self) -> Option<f64> {
+        self.min_p
     }
 
     /// Get the repetition penalty to use when generating text.

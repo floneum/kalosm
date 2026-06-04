@@ -8,7 +8,6 @@ use super::softmax::{softmax_partial_scale, workgroup_softmax_block};
 use super::types::{FlashAttentionDims, FlashAttentionMeta, FlashDecodeSmallMeta};
 
 const FLASH_BLOCK: u32 = 256;
-const DECODE_HEAD_DIM: u32 = 128;
 const TILED_OUTS_PER_SUBGROUP: u32 = 4;
 
 /// Runtime tensor bindings consumed by the streaming flash-attention kernels.
@@ -735,7 +734,7 @@ fn decode_score_for_kv(program: &mut TileBlock<'_>, request: DecodeScoreForKv<'_
     program.store_local(dim_local, u32_tile(0));
     program.loop_forever(|program| {
         let dim = program.load_local(dim_local);
-        program.break_if(dim.clone().ge(u32_tile(DECODE_HEAD_DIM)));
+        program.break_if(dim.clone().ge(u32_tile(meta.dims.head_dim)));
         let q_index = index_n(
             meta.q_offset,
             meta.q_strides,
@@ -977,7 +976,7 @@ fn flash_decode_small_block<B>(
                     );
                     program.workgroup_barrier();
                     program.store_local(&item, u32_tile(0));
-                    let out_condition = lane_value.clone().lt(u32_tile(DECODE_HEAD_DIM));
+                    let out_condition = lane_value.clone().lt(u32_tile(meta.dims.head_dim));
                     program.if_then(out_condition, |program| {
                         program.loop_forever(|program| {
                             let item_value = program.load_local(&item);
@@ -1006,7 +1005,7 @@ fn flash_decode_small_block<B>(
                     program.workgroup_barrier();
                     program.store_local(&kv_local, tile_base + u32_tile(block));
                 });
-                let out_condition = lane_value.clone().lt(u32_tile(DECODE_HEAD_DIM));
+                let out_condition = lane_value.clone().lt(u32_tile(meta.dims.head_dim));
                 program.if_then(out_condition, |program| {
                     let output_value = program.load_local(&acc);
                     let output_index = index_n(
@@ -1055,7 +1054,7 @@ fn flash_decode_small_block<B>(
             });
             program.workgroup_barrier();
 
-            let out_condition = lane_value.clone().lt(u32_tile(DECODE_HEAD_DIM));
+            let out_condition = lane_value.clone().lt(u32_tile(meta.dims.head_dim));
             program.if_then(out_condition, |program| {
                 program.store_local(&acc, f32_tile(0.0));
                 program.store_local(&kv_local, u32_tile(0));
@@ -1164,22 +1163,22 @@ fn flash_decode_split_partials_block<B>(
 
             let scratch_base = program.bind(
                 (row.clone() * u32_tile(meta.split_blocks) + split_block.clone())
-                    * u32_tile(DECODE_HEAD_DIM + 2),
+                    * u32_tile(meta.dims.head_dim + 2),
             );
             program.if_then(lane_value.clone().eq(u32_tile(0)), |program| {
                 program.store(
-                    scratch.at(scratch_base.clone() + DECODE_HEAD_DIM),
+                    scratch.at(scratch_base.clone() + meta.dims.head_dim),
                     stats.denom.clone(),
                     Mask::all(),
                 );
                 program.store(
-                    scratch.at(scratch_base.clone() + DECODE_HEAD_DIM + 1),
+                    scratch.at(scratch_base.clone() + meta.dims.head_dim + 1),
                     stats.max.clone(),
                     Mask::all(),
                 );
             });
 
-            let out_condition = lane_value.clone().lt(u32_tile(DECODE_HEAD_DIM));
+            let out_condition = lane_value.clone().lt(u32_tile(meta.dims.head_dim));
             program.if_then(out_condition, |program| {
                 program.store_local(&acc, f32_tile(0.0));
                 program.store_local(&item, u32_tile(0));
@@ -1224,7 +1223,8 @@ pub fn flash_decode_split_partials<B>(
     params: fusor_tile_ir::KernelTensorRef<B>,
     meta: FlashDecodeSmallMeta,
 ) -> Option<()> {
-    if meta.dims.head_dim != DECODE_HEAD_DIM
+    if meta.dims.head_dim == 0
+        || meta.dims.head_dim > meta.decode_block
         || meta.decode_block == 0
         || meta.groups == 0
         || meta.split_blocks < 2
@@ -1255,7 +1255,7 @@ pub fn flash_decode_split_reduce<B>(
     output: fusor_tile_ir::KernelTensorRef<B>,
     meta: FlashDecodeSmallMeta,
 ) -> Option<()> {
-    if meta.dims.head_dim != DECODE_HEAD_DIM || meta.groups == 0 || meta.split_blocks < 2 {
+    if meta.dims.head_dim == 0 || meta.groups == 0 || meta.split_blocks < 2 {
         return None;
     }
     let output_strides: [u32; 4] = meta.output_strides;
@@ -1263,7 +1263,7 @@ pub fn flash_decode_split_reduce<B>(
     let output = kb.write(ElementType::F32, output);
     let phase = kb.program();
     phase.program_grid(
-        DECODE_HEAD_DIM,
+        meta.dims.head_dim,
         [meta.dims.batch * meta.dims.num_heads, 1, 1],
         |program| {
             let lane = program.lane();
@@ -1271,13 +1271,13 @@ pub fn flash_decode_split_reduce<B>(
             let out_dim = lane.clone();
             let head_idx = row.clone() % meta.dims.num_heads;
             let batch_idx = row.clone() / meta.dims.num_heads;
-            let row_base =
-                program.bind(row.clone() * u32_tile(meta.split_blocks * (DECODE_HEAD_DIM + 2)));
+            let scratch_stride = meta.dims.head_dim + 2;
+            let row_base = program.bind(row.clone() * u32_tile(meta.split_blocks * scratch_stride));
             let mut max_score = f32_tile(NEG_MAX_F32);
             for split_block in 0..meta.split_blocks {
-                let block_base = row_base.clone() + split_block * (DECODE_HEAD_DIM + 2);
+                let block_base = row_base.clone() + split_block * scratch_stride;
                 let block_max = program.load(
-                    scratch.at(block_base + DECODE_HEAD_DIM + 1),
+                    scratch.at(block_base + meta.dims.head_dim + 1),
                     Mask::all(),
                     TileLiteral::f32(NEG_MAX_F32),
                 );
@@ -1288,14 +1288,14 @@ pub fn flash_decode_split_reduce<B>(
             let mut denom = f32_tile(0.0);
             let mut acc = f32_tile(0.0);
             for split_block in 0..meta.split_blocks {
-                let block_base = row_base.clone() + split_block * (DECODE_HEAD_DIM + 2);
+                let block_base = row_base.clone() + split_block * scratch_stride;
                 let block_denom = program.load(
-                    scratch.at(block_base.clone() + DECODE_HEAD_DIM),
+                    scratch.at(block_base.clone() + meta.dims.head_dim),
                     Mask::all(),
                     TileLiteral::f32(0.0),
                 );
                 let block_max = program.load(
-                    scratch.at(block_base.clone() + DECODE_HEAD_DIM + 1),
+                    scratch.at(block_base.clone() + meta.dims.head_dim + 1),
                     Mask::all(),
                     TileLiteral::f32(NEG_MAX_F32),
                 );
@@ -1321,7 +1321,7 @@ pub fn flash_decode_split_reduce<B>(
 
 /// Build the small F32 decode-attention kernel.
 ///
-/// Supports fixed head dimension 128 and the decode block sizes accepted by
+/// Supports head dimensions no larger than the decode block size and the decode block sizes accepted by
 /// [`FlashDecodeSmallMeta::decode_block`](crate::FlashDecodeSmallMeta::decode_block).
 pub fn flash_decode_small<B>(
     kb: &mut fusor_tile_ir::KernelBuilder<B>,
@@ -1332,7 +1332,11 @@ pub fn flash_decode_small<B>(
     params: fusor_tile_ir::KernelTensorRef<B>,
     meta: FlashDecodeSmallMeta,
 ) -> Option<()> {
-    if meta.dims.head_dim != DECODE_HEAD_DIM || meta.decode_block == 0 || meta.groups == 0 {
+    if meta.dims.head_dim == 0
+        || meta.dims.head_dim > meta.decode_block
+        || meta.decode_block == 0
+        || meta.groups == 0
+    {
         return None;
     }
     if !matches!(meta.decode_block, 128 | 256 | 512 | 1024) {

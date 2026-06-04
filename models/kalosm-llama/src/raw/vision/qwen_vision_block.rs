@@ -4,6 +4,7 @@ use fusor::{
     CastTensor, CastTo, Device, FloatDataType, QMatrix, SimdElement, StrideSpec, Tensor,
     VarBuilder,
 };
+use web_time::Instant;
 
 use fusor::RopeCache;
 
@@ -77,13 +78,13 @@ where
         };
         let xs_3d = xs.unsqueeze(0).to_concrete(); // [1, seq, dim]
         flush(&xs_3d);
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let after_norm = self.norm1.forward_generic(&xs_3d);
         flush(&after_norm);
         if trace {
             eprintln!("    norm1: {:.2?}", t0.elapsed());
         }
-        let t1 = std::time::Instant::now();
+        let t1 = Instant::now();
         let after_attention = self
             .attn
             .forward(&after_norm, cu_seqlens, rope_cache, cache)?;
@@ -95,20 +96,20 @@ where
         // Work in f32 for tensor addition
         let xs_3d_f32: Tensor<3, f32> = xs_3d.cast();
         let after_attention_f32: Tensor<3, f32> = after_attention.cast();
-        let t2 = std::time::Instant::now();
+        let t2 = Instant::now();
         let xs_3d: Tensor<3, F> = (xs_3d_f32 + after_attention_f32).cast();
         flush(&xs_3d);
         if trace {
             eprintln!("    res1:  {:.2?}", t2.elapsed());
         }
 
-        let t3 = std::time::Instant::now();
+        let t3 = Instant::now();
         let after_norm2 = self.norm2.forward_generic(&xs_3d);
         flush(&after_norm2);
         if trace {
             eprintln!("    norm2: {:.2?}", t3.elapsed());
         }
-        let t4 = std::time::Instant::now();
+        let t4 = Instant::now();
         let mlp_out = self.mlp.forward(&after_norm2);
         flush(&mlp_out);
         if trace {
@@ -118,7 +119,7 @@ where
         // Work in f32 for tensor addition
         let xs_3d_f32: Tensor<3, f32> = xs_3d.cast();
         let mlp_out_f32: Tensor<3, f32> = mlp_out.cast();
-        let t5 = std::time::Instant::now();
+        let t5 = Instant::now();
         let out: Tensor<3, F> = (xs_3d_f32 + mlp_out_f32).cast();
         flush(&out);
         if trace {
@@ -205,7 +206,7 @@ where
     ) -> fusor::Result<Tensor<3, F>> {
         let trace_attn = std::env::var_os("KALOSM_TRACE_ATTN").is_some();
         let [bsz, seq_len, _] = xs.shape();
-        let t_qkv = std::time::Instant::now();
+        let t_qkv = Instant::now();
 
         // One fused qkv matmul (output is [1, seq, 3 * embed_dim]); narrow
         // out the q/k/v slices as views — narrow is a layout-only op so we
@@ -271,7 +272,7 @@ where
         // V's slices (later, per window) to start from a contiguous tensor;
         // narrowing a transpose-view produces another non-contiguous view.
         let value_states = v.transpose(0, 1).unsqueeze(0).to_concrete();
-        let t_after_rope = std::time::Instant::now();
+        let t_after_rope = Instant::now();
         if trace_attn {
             value_states.as_gpu().map(|g| g.materialize_sync());
             eprintln!(
@@ -299,7 +300,7 @@ where
         // block-diagonal mask intended, but at window² scale (~64²) rather
         // than seq² (1944²). Full-attention layers (cu_seqlens=[0, seq])
         // skip the slicing and just run one regular flash call.
-        let t_flash = std::time::Instant::now();
+        let t_flash = Instant::now();
         let query_f32 = query_states;
         let key_f32 = key_states_f32;
         let value_f32 = value_states_f32;

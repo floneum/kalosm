@@ -18,12 +18,12 @@ use crate::{
 };
 
 use super::{
-    DECODE_HEAD_DIM, DECODE_SMALL_BLOCK, FLASH_STREAMING_SUBGROUP_SIZES,
-    FLASH_STREAMING_TILED_Q_BLOCK, FlashAttentionDirectKernelVariant, FlashAttentionKernelVariant,
-    FlashAttentionOperation, FlashDecodeSmallMeta, FlashDecodeSmallTensors, TensorMeta,
-    build_flash_decode_small_meta, dispatch_streaming_flash_attention,
-    dispatch_streaming_tiled_flash_attention, flash_attention_module_cache,
-    flash_streaming_tiled_eligible, select_flash_attention_variant, streaming_dispatch_size,
+    DECODE_SMALL_BLOCK, FLASH_STREAMING_SUBGROUP_SIZES, FLASH_STREAMING_TILED_Q_BLOCK,
+    FlashAttentionDirectKernelVariant, FlashAttentionKernelVariant, FlashAttentionOperation,
+    FlashDecodeSmallMeta, FlashDecodeSmallTensors, TensorMeta, build_flash_decode_small_meta,
+    dispatch_streaming_flash_attention, dispatch_streaming_tiled_flash_attention,
+    flash_attention_module_cache, flash_streaming_tiled_eligible, select_flash_attention_variant,
+    streaming_dispatch_size,
 };
 
 fn flash_decode_cache_variant(
@@ -169,13 +169,6 @@ impl Operation for FlashAttentionOperation {
         let output = inputs.get(output_index)?.as_tensor()?.clone();
         let device = graph.device();
 
-        // Streaming kernel: pick the effective hardware subgroup size and
-        // dispatch a monomorphization tiled to match.
-        let streaming_subgroup_size = device.fixed_width_subgroup_size()?;
-        if !FLASH_STREAMING_SUBGROUP_SIZES.contains(&streaming_subgroup_size) {
-            return None;
-        }
-
         let input_dtype = self.input_dtype;
         if !matches!(input_dtype, DataTypeEnum::F32 | DataTypeEnum::F16) {
             return None;
@@ -230,7 +223,7 @@ impl Operation for FlashAttentionOperation {
             input_dtype == DataTypeEnum::F32 && selected_variant.decode_block().is_some();
         let decode_candidate = mask_meta.is_none()
             && dims.q_seq_len == 1
-            && dims.head_dim == DECODE_HEAD_DIM
+            && dims.head_dim > 0
             && input_dtype == DataTypeEnum::F32;
         assert!(
             !decode_candidate || selected_variant.decode_block().is_some(),
@@ -264,6 +257,24 @@ impl Operation for FlashAttentionOperation {
             FlashAttentionKernelVariant::StreamingTiled
         } else {
             FlashAttentionKernelVariant::Streaming
+        };
+        // Decode-small uses workgroup reductions only. The streaming kernels
+        // partition lanes by the hardware subgroup width, so only those need a
+        // trusted fixed subgroup size.
+        let streaming_subgroup_size = match variant {
+            FlashAttentionKernelVariant::Streaming
+            | FlashAttentionKernelVariant::StreamingTiled => {
+                let size = device.fixed_width_subgroup_size()?;
+                if !FLASH_STREAMING_SUBGROUP_SIZES.contains(&size) {
+                    return None;
+                }
+                size
+            }
+            FlashAttentionKernelVariant::DecodeSmall => 0,
+            FlashAttentionKernelVariant::DecodeSplitPartials
+            | FlashAttentionKernelVariant::DecodeSplitReduce => {
+                unreachable!("split decode kernels are built as a sequence")
+            }
         };
         let dispatch_size = match variant {
             FlashAttentionKernelVariant::Streaming => streaming_dispatch_size(
@@ -303,7 +314,7 @@ impl Operation for FlashAttentionOperation {
                 .checked_mul(meta.dims.num_heads)
                 .expect("flash split decode row overflow");
             let scratch_elements =
-                rows as u64 * meta.split_blocks as u64 * (DECODE_HEAD_DIM as u64 + 2);
+                rows as u64 * meta.split_blocks as u64 * (meta.dims.head_dim as u64 + 2);
             let scratch_buffer = device.create_buffer(
                 scratch_elements * std::mem::size_of::<f32>() as u64,
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,

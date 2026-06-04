@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::sampler::{CpuMirostat2Sampler, Logits};
+use crate::sampler::{CpuSampler, Logits};
 use crate::tokenizer::{LlamaTokenizer, LlamaTokenizerError};
 #[cfg(feature = "structured")]
 use rayon::iter::{IntoParallelIterator, ParallelExtend, ParallelIterator};
@@ -47,7 +47,7 @@ impl TokenOutputStream {
     /// Samples a token from the logits.
     pub fn sample_token(
         &self,
-        sampler: &mut CpuMirostat2Sampler,
+        sampler: &mut CpuSampler,
         mut logits: Logits,
         stop_on: Option<&str>,
         top_k: usize,

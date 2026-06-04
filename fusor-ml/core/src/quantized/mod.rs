@@ -224,6 +224,11 @@ fn qmatrix_storage_layout_for_parts(
     ty: GgmlType,
     shader_f16_supported: bool,
 ) -> QMatrixStorageLayout {
+    #[cfg(target_arch = "wasm32")]
+    let shader_f16_supported = {
+        let _ = shader_f16_supported;
+        false
+    };
     qmatrix_storage_layout_for_parts_with_env(
         ty,
         shader_f16_supported,
