@@ -1,11 +1,10 @@
 use std::pin::Pin;
 
-use fusor::{Device, FromArray};
+use fusor::{Device, FromArray, WasmNotSend};
 
 use crate::{
     AsyncFnMutTuple, GenTuple, GenerateFromDevice, IntoCompare, PushTuple, ResolveTensorTuple,
-    available_devices,
-    tuple_macros::{BoxFuture, MaybeSend},
+    available_devices, tuple_macros::BoxFuture,
 };
 
 /// ```compile_fail
@@ -82,7 +81,7 @@ impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
 
     pub fn equal_to_resolved_op(
         self,
-        mut other: impl AsyncFnMutTuple<T::Output, Output = U> + Copy + MaybeSend + 'static,
+        mut other: impl AsyncFnMutTuple<T::Output, Output = U> + Copy + WasmNotSend + 'static,
     ) -> Self
     where
         T: ResolveTensorTuple,
@@ -90,23 +89,10 @@ impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
     {
         struct UnpackedTuple<T>(T);
 
-        #[cfg(not(target_arch = "wasm32"))]
         impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
         where
             F: FnMut(I) -> Fut,
-            Fut: std::future::Future<Output = O> + Send + 'static,
-        {
-            type Output = O;
-            fn call_mut<'a>(&'a mut self, input: I) -> BoxFuture<'a, Self::Output> {
-                Box::pin((self.0)(input))
-            }
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
-        where
-            F: FnMut(I) -> Fut,
-            Fut: std::future::Future<Output = O> + 'static,
+            Fut: std::future::Future<Output = O> + WasmNotSend + 'static,
         {
             type Output = O;
             fn call_mut<'a>(&'a mut self, input: I) -> BoxFuture<'a, Self::Output> {
@@ -129,7 +115,7 @@ impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
         self,
         mut other: impl AsyncFnMutTuple<<T::Output as PushTuple<Device>>::Output, Output = U>
         + Copy
-        + MaybeSend
+        + WasmNotSend
         + 'static,
     ) -> Self
     where
@@ -139,23 +125,10 @@ impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
     {
         struct UnpackedTuple<T>(T);
 
-        #[cfg(not(target_arch = "wasm32"))]
         impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
         where
             F: FnMut(I) -> Fut,
-            Fut: std::future::Future<Output = O> + Send + 'static,
-        {
-            type Output = O;
-            fn call_mut<'a>(&'a mut self, input: I) -> BoxFuture<'a, Self::Output> {
-                Box::pin((self.0)(input))
-            }
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
-        where
-            F: FnMut(I) -> Fut,
-            Fut: std::future::Future<Output = O> + 'static,
+            Fut: std::future::Future<Output = O> + WasmNotSend + 'static,
         {
             type Output = O;
             fn call_mut<'a>(&'a mut self, input: I) -> BoxFuture<'a, Self::Output> {
@@ -177,7 +150,7 @@ impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
 
     pub fn equal_to_array_op<const R: usize, D, A>(
         self,
-        mut other: impl AsyncFnMutTuple<T::Output, Output = A> + Copy + MaybeSend + 'static,
+        mut other: impl AsyncFnMutTuple<T::Output, Output = A> + Copy + WasmNotSend + 'static,
     ) -> Self
     where
         T: ResolveTensorTuple,
@@ -186,23 +159,10 @@ impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
     {
         struct UnpackedTuple<T>(T);
 
-        #[cfg(not(target_arch = "wasm32"))]
         impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
         where
             F: FnMut(I) -> Fut,
-            Fut: std::future::Future<Output = O> + Send + 'static,
-        {
-            type Output = O;
-            fn call_mut<'a>(&'a mut self, input: I) -> BoxFuture<'a, Self::Output> {
-                Box::pin((self.0)(input))
-            }
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
-        where
-            F: FnMut(I) -> Fut,
-            Fut: std::future::Future<Output = O> + 'static,
+            Fut: std::future::Future<Output = O> + WasmNotSend + 'static,
         {
             type Output = O;
             fn call_mut<'a>(&'a mut self, input: I) -> BoxFuture<'a, Self::Output> {
@@ -276,7 +236,7 @@ where
 /// into the cross product of {subgroups, no subgroups} × {cold pool, poisoned
 /// pool}; the cold/subgroup variants come first so they run before the poisoned
 /// variants dirty the shared pool. The CPU device has no such variants.
-fn device_test_variants(device: &Device) -> Vec<Device> {
+pub(crate) fn device_test_variants(device: &Device) -> Vec<Device> {
     match device {
         Device::Cpu => vec![device.clone()],
         Device::Gpu(_) => vec![

@@ -1,17 +1,16 @@
-mod common;
+//! Quantized matmul conformance cases.
 
-use common::quantized::{
+use crate::common::quantized::{
     QMatMulFuzz, QUANTIZED_FIXTURE_CASES, QuantizedFixture,
     assert_dequantize_matches_host_reference, assert_q_mat_mul_matches_host_reference, block_count,
     f16_weight_bytes, f32_weight_bytes, f32_weight_rows, q8_0_fixture, qmatrix_from_raw_bytes,
 };
 use fusor::{BlockQ5_0, Device, GgmlType, Tensor};
-use fusor_conformance::{approx_compare, available_devices};
+use fusor_conformance::{CaseResult, approx_compare, available_devices, ensure, ensure_eq};
 use rand::distr::Uniform;
 use std::mem::size_of;
 
-#[tokio::test]
-async fn quantized_dequantize_matches_cpu_reference() {
+pub async fn quantized_dequantize_matches_cpu_reference() -> CaseResult {
     for &(fixture, _, _) in QUANTIZED_FIXTURE_CASES
         .iter()
         .filter(|&&(_, _, dequantize)| dequantize)
@@ -31,12 +30,12 @@ async fn quantized_dequantize_matches_cpu_reference() {
             dequantized,
             dequantize_tol,
         )
-        .await;
+        .await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn quantized_q_mat_mul_matches_cpu_reference() {
+pub async fn quantized_q_mat_mul_matches_cpu_reference() -> CaseResult {
     for &(fixture, seed, _) in QUANTIZED_FIXTURE_CASES {
         let fixture = fixture();
         assert_q_mat_mul_matches_host_reference(
@@ -46,12 +45,12 @@ async fn quantized_q_mat_mul_matches_cpu_reference() {
                 distribution: Uniform::new(-0.25, 0.25).unwrap(),
             },
         )
-        .await;
+        .await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn q8_0_dequantize_then_add_matches_cpu_reference() {
+pub async fn q8_0_dequantize_then_add_matches_cpu_reference() -> CaseResult {
     let QuantizedFixture {
         ty,
         weight_shape,
@@ -78,15 +77,13 @@ async fn q8_0_dequantize_then_add_matches_cpu_reference() {
     })
     .compare_with(approx_compare::<2, f32>(1e-5))
     .await
-    .unwrap();
+    .map_err(Into::into)
 }
 
-#[tokio::test]
-async fn q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch() {
+pub async fn q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch() -> CaseResult {
     const Q5_0_QGEMV_COLS_PER_WORKGROUP: usize = 8;
     const QMATMUL_MAX_WORKGROUPS_PER_DIMENSION: usize = 1_024;
 
-    let mut exercised_subgroup_gpu = false;
     for device in available_devices().await {
         let Some(gpu) = device.as_gpu() else {
             continue;
@@ -94,7 +91,6 @@ async fn q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch() {
         if !gpu.subgroups_supported() {
             continue;
         }
-        exercised_subgroup_gpu = true;
 
         let max_workgroups = (gpu.limits().max_compute_workgroups_per_dimension as usize)
             .min(QMATMUL_MAX_WORKGROUPS_PER_DIMENSION);
@@ -109,20 +105,17 @@ async fn q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch() {
 
         let result = input.q_mat_mul(&weights).as_slice().await.unwrap();
 
-        assert_eq!(result.shape(), &[1, output_cols]);
-        assert!(
+        ensure_eq!(result.shape(), &[1, output_cols]);
+        ensure!(
             result.as_slice().iter().all(|value| *value == 0.0),
             "zero Q5_0 weights should produce zero qgemv output"
         );
     }
 
-    if !exercised_subgroup_gpu {
-        return;
-    }
+    Ok(())
 }
 
-#[tokio::test]
-async fn f32_q_matrix_q_mat_mul_matches_host_reference() {
+pub async fn f32_q_matrix_q_mat_mul_matches_host_reference() -> CaseResult {
     let fixture = QuantizedFixture {
         ty: GgmlType::F32,
         weight_shape: [2, 4],
@@ -139,11 +132,10 @@ async fn f32_q_matrix_q_mat_mul_matches_host_reference() {
             distribution: Uniform::new(-0.5, 0.5).unwrap(),
         },
     )
-    .await;
+    .await
 }
 
-#[tokio::test]
-async fn f16_q_matrix_q_mat_mul_matches_host_reference() {
+pub async fn f16_q_matrix_q_mat_mul_matches_host_reference() -> CaseResult {
     let fixture = QuantizedFixture {
         ty: GgmlType::F16,
         weight_shape: [2, 4],
@@ -160,5 +152,5 @@ async fn f16_q_matrix_q_mat_mul_matches_host_reference() {
             distribution: Uniform::new(-0.5, 0.5).unwrap(),
         },
     )
-    .await;
+    .await
 }

@@ -84,23 +84,35 @@ pub mod prelude {
     pub use kalosm_model_types::FileSource;
 }
 
-// On wasm32, callbacks don't need to be Send/Sync
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) type BoxedTokenCallback =
-    Box<dyn FnMut(String) -> Result<(), LlamaModelError> + Send + Sync>;
-#[cfg(target_arch = "wasm32")]
-pub(crate) type BoxedTokenCallback = Box<dyn FnMut(String) -> Result<(), LlamaModelError>>;
+// On wasm32, callbacks don't need to be Send/Sync; the `WasmNot*` markers encode that.
+pub(crate) trait TokenCallback:
+    FnMut(String) -> Result<(), LlamaModelError> + WasmNotSend + WasmNotSync
+{
+}
+impl<T: FnMut(String) -> Result<(), LlamaModelError> + WasmNotSend + WasmNotSync> TokenCallback
+    for T
+{
+}
+pub(crate) type BoxedTokenCallback = Box<dyn TokenCallback>;
 
 use std::future::Future;
 use std::pin::Pin;
 
-#[cfg(all(feature = "structured", not(target_arch = "wasm32")))]
-type BoxedRunner<F> = Box<
-    dyn for<'a> FnOnce(&'a LlamaModel<F>) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send,
->;
-#[cfg(all(feature = "structured", target_arch = "wasm32"))]
-type BoxedRunner<F> =
-    Box<dyn for<'a> FnOnce(&'a LlamaModel<F>) -> Pin<Box<dyn Future<Output = ()> + 'a>>>;
+#[cfg(feature = "structured")]
+trait Runner<F: FloatDataType + SimdElement>:
+    for<'a> FnOnce(&'a LlamaModel<F>) -> Pin<Box<dyn FutureWasmNotSend<Output = ()> + 'a>> + WasmNotSend
+{
+}
+#[cfg(feature = "structured")]
+impl<
+        F: FloatDataType + SimdElement,
+        T: for<'a> FnOnce(&'a LlamaModel<F>) -> Pin<Box<dyn FutureWasmNotSend<Output = ()> + 'a>>
+            + WasmNotSend,
+    > Runner<F> for T
+{
+}
+#[cfg(feature = "structured")]
+type BoxedRunner<F> = Box<dyn Runner<F>>;
 
 enum Task<F: FloatDataType + SimdElement = f32> {
     UnstructuredGeneration(UnstructuredGenerationTask<F>),

@@ -176,6 +176,15 @@ pub struct Model<F: FloatDataType + SimdElement = f32> {
     masks: MaskCache<f32>,
 }
 
+/// The embedded token inputs produced by [`Model::encode_tokens`], ready to be
+/// run through the transformer layers.
+pub(crate) struct EncodedTokens<F: FloatDataType + SimdElement> {
+    embeddings: Tensor<3, F>,
+    seq_len: usize,
+    index_pos: usize,
+    pos_ids: Option<Tensor<2, F>>,
+}
+
 impl<F: FloatDataType + SimdElement + FloatOps + MatmulImpl> Model<F>
 where
     MulOp: SimdBinaryOp<F>,
@@ -543,14 +552,25 @@ where
     AddOp: SimdBinaryOp<F>,
     SumOp: SimdReduceOp<F>,
 {
-    #[allow(clippy::type_complexity)]
+    pub(crate) fn supports_gpu_token_run_ahead(&self) -> bool {
+        #[cfg(feature = "vision")]
+        {
+            self.vision_encoder.is_none()
+        }
+
+        #[cfg(not(feature = "vision"))]
+        {
+            true
+        }
+    }
+
     pub fn encode_tokens(
         &self,
         raw_tokens: &[u32],
         raw_images: &[LlamaImage],
         device: &Device,
         mut cache: Option<&mut LlamaCache>,
-    ) -> Result<(Tensor<3, F>, usize, usize, Option<Tensor<2, F>>)> {
+    ) -> Result<EncodedTokens<F>> {
         #[cfg(feature = "vision")]
         let (tokens, images, grid_thw, image_token_ranges) = {
             let mut grid_thw = Vec::new();
@@ -692,7 +712,12 @@ where
             pos_ids = Some(pos_f);
         }
 
-        Ok((embeddings, seq_len, index_pos, pos_ids))
+        Ok(EncodedTokens {
+            embeddings,
+            seq_len,
+            index_pos,
+            pos_ids,
+        })
     }
 
     pub fn forward(
@@ -723,13 +748,9 @@ where
         f32: CastTo<F> + CastTensor<F>,
     {
         let t_encode = Instant::now();
-        let (layer_in, seq_len, index_pos, pos_ids) =
-            self.encode_tokens(tokens, images, device, cache.as_deref_mut())?;
+        let encoded = self.encode_tokens(tokens, images, device, cache.as_deref_mut())?;
         self.forward_last_hidden_from_embeddings(
-            layer_in,
-            seq_len,
-            index_pos,
-            pos_ids,
+            encoded,
             device,
             cache,
             Some(t_encode.elapsed()),
@@ -767,24 +788,20 @@ where
             embeddings_f32 = (embeddings_f32 * scale).to_concrete();
         }
         let embeddings: Tensor<3, F> = embeddings_f32.cast();
-        let hidden = self.forward_last_hidden_from_embeddings(
+        let encoded = EncodedTokens {
             embeddings,
-            1,
-            cache_slot,
-            None,
-            device,
-            Some(cache),
-            None,
-        )?;
+            seq_len: 1,
+            index_pos: cache_slot,
+            pos_ids: None,
+        };
+        let hidden =
+            self.forward_last_hidden_from_embeddings(encoded, device, Some(cache), None)?;
         Ok((hidden, cache_slot))
     }
 
     fn forward_last_hidden_from_embeddings(
         &self,
-        mut layer_in: Tensor<3, F>,
-        seq_len: usize,
-        index_pos: usize,
-        pos_ids: Option<Tensor<2, F>>,
+        encoded: EncodedTokens<F>,
         device: &Device,
         mut cache: Option<&mut LlamaCache>,
         encode_elapsed: Option<Duration>,
@@ -793,6 +810,12 @@ where
         F: CastTo<f32> + CastTensor<f32> + Default,
         f32: CastTo<F> + CastTensor<F>,
     {
+        let EncodedTokens {
+            embeddings: mut layer_in,
+            seq_len,
+            index_pos,
+            pos_ids,
+        } = encoded;
         let _trace_text_prefill = seq_len > 1 && std::env::var_os("KALOSM_TRACE_TEXT").is_some();
         let trace_forward_timing =
             seq_len > 1 || std::env::var_os("KALOSM_TRACE_FORWARD_TIMING").is_some();

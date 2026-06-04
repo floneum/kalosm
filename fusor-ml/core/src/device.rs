@@ -315,13 +315,13 @@ impl Device {
 
         #[cfg(not(target_arch = "wasm32"))]
         std::thread::spawn({
-            let weak_inner = Arc::downgrade(&device.inner);
+            let weak_device = Arc::downgrade(&device.inner.device);
             move || loop {
-                let Some(inner) = weak_inner.upgrade() else {
+                let Some(device) = weak_device.upgrade() else {
                     break;
                 };
-                let result = inner.device.poll(wgpu::PollType::Poll);
-                drop(inner);
+                let result = device.poll(wgpu::PollType::Poll);
+                drop(device);
                 let Ok(status) = result else {
                     break;
                 };
@@ -489,6 +489,61 @@ impl Device {
 #[cfg(test)]
 mod dirty_buffer_tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn derived_device_keeps_native_poller_alive() {
+        pollster::FutureExt::block_on(async {
+            let Ok(derived) = Device::new().await.map(|device| device.without_subgroups()) else {
+                return;
+            };
+
+            let buffer = derived
+                .wgpu_device()
+                .create_buffer(&wgpu::BufferDescriptor {
+                    size: 4,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                    label: Some("derived poller readback"),
+                });
+            derived.wgpu_queue().write_buffer(&buffer, 0, &[1, 2, 3, 4]);
+            let encoder = derived
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            derived.wgpu_queue().submit(Some(encoder.finish()));
+
+            let (sender, receiver) = std::sync::mpsc::channel();
+            buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = sender.send(result);
+                });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match receiver.try_recv() {
+                    Ok(result) => {
+                        result.unwrap();
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        panic!("derived device map_async did not complete before timeout");
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("derived device map_async callback sender dropped");
+                    }
+                }
+            }
+
+            let view = buffer.slice(..).get_mapped_range();
+            assert_eq!(&*view, &[1, 2, 3, 4]);
+            drop(view);
+            buffer.unmap();
+        });
+    }
 
     /// Positive control: a buffer handed out by a poisoned-allocation handle
     /// must read back as the poison byte, proving the poison actually lands on

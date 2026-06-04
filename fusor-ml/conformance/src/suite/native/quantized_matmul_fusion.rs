@@ -1,15 +1,14 @@
-mod common;
+//! Quantized matmul fusion conformance cases.
 
-use common::quantized::{
+use crate::common::quantized::{
     deterministic_input, q_mat_mul_input_fuzz, q4k_raw_bytes, q6k_raw_bytes, q8_0_raw_bytes,
     qmatrix_from_raw_bytes,
 };
 use fusor::{Device, GgmlType, QMatrix, Tensor};
-use fusor_conformance::{approx_compare, approx_eq, available_devices};
+use fusor_conformance::{approx_eq, available_devices, CaseResult, ensure_eq};
 use rand::distr::Uniform;
 
-#[tokio::test]
-async fn q4k_q6k_ffn_chain_matches_cpu_reference_for_decode_rows() {
+pub async fn q4k_q6k_ffn_chain_matches_cpu_reference_for_decode_rows() -> CaseResult {
     let hidden = 512usize;
     let intermediate = 512usize;
     let output = 128usize;
@@ -40,26 +39,25 @@ async fn q4k_q6k_ffn_chain_matches_cpu_reference_for_decode_rows() {
         834,
         Uniform::new(-0.25, 0.25).unwrap(),
     ))
-    .compare_with(approx_compare::<2, f32>(5.0))
+    .compare_with(fusor_conformance::approx_compare::<2, f32>(5.0))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
+    Ok(())
 }
 
 /// The fuser must collapse `rms_norm(...).relu()` (or any unary chain after
 /// an RmsNorm) into a single RmsNorm kernel dispatch — the kernel applies
 /// the chain in-register before the store. Without the rule, the unfused
 /// source resolves to 2 dispatches.
-#[tokio::test]
-async fn rmsnorm_post_relu_resolves_to_single_kernel() {
+pub async fn rmsnorm_post_relu_resolves_to_single_kernel() -> CaseResult {
     let Ok(device) = fusor::Device::new().await else {
-        return;
+        return Ok(());
     };
     let Some(gpu_device) = device.as_gpu() else {
-        panic!("expected GPU device");
+        return Err("expected GPU device".into());
     };
     if !gpu_device.subgroups_supported() {
-        return;
+        return Ok(());
     }
     let cols = 64usize;
     let input_data = vec![vec![0.1f32; cols]; 4];
@@ -72,61 +70,61 @@ async fn rmsnorm_post_relu_resolves_to_single_kernel() {
         .relu()
         .to_concrete();
     let Tensor::Gpu(gpu_out) = output else {
-        panic!("expected GPU tensor");
+        return Err("expected GPU tensor".into());
     };
     let kernels = gpu_out.count_kernels_to_resolve();
-    assert_eq!(
+    ensure_eq!(
         kernels, 1,
         "expected fuser to collapse rms_norm -> relu to 1 dispatch, got {kernels}"
     );
+    Ok(())
 }
 
 /// The fuser must collapse `relu(input).q_mat_mul(weights)` into a single
 /// QMatMul kernel — qgemv applies the activation to each loaded activation
 /// tile before the dot product. Without the pre-fusion rule, the unfused
 /// source resolves to 2 dispatches (nary + matmul).
-#[tokio::test]
-async fn q4k_qmatmul_pre_relu_resolves_to_single_kernel() {
+pub async fn q4k_qmatmul_pre_relu_resolves_to_single_kernel() -> CaseResult {
     let Ok(device) = fusor::Device::new().await else {
-        return;
+        return Ok(());
     };
     let weight_shape = [4, 512];
     let raw_bytes = q4k_raw_bytes(weight_shape);
     let input_data = vec![vec![0.1f32; weight_shape[1]]; 1];
     let Some(gpu_device) = device.as_gpu() else {
-        panic!("expected GPU device");
+        return Err("expected GPU device".into());
     };
     if !gpu_device.subgroups_supported() {
-        return;
+        return Ok(());
     }
 
     let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
     let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
     let output = input.relu().to_concrete().q_mat_mul(&weights).to_concrete();
     let Tensor::Gpu(gpu_out) = output else {
-        panic!("expected GPU tensor");
+        return Err("expected GPU tensor".into());
     };
     let kernels = gpu_out.count_kernels_to_resolve();
-    assert_eq!(
+    ensure_eq!(
         kernels, 1,
         "expected fuser to collapse relu -> q_mat_mul to 1 dispatch, got {kernels}"
     );
+    Ok(())
 }
 
 /// The fuser must collapse `q_mat_mul → unary chain` (e.g. relu, silu)
 /// into a single QMatMul kernel dispatch — qgemv kernels apply the chain
 /// in-register before storing. Without the fuser rule, the unfused source
 /// resolves to 2 dispatches (matmul + nary).
-#[tokio::test]
-async fn q4k_qmatmul_post_relu_resolves_to_single_kernel() {
+pub async fn q4k_qmatmul_post_relu_resolves_to_single_kernel() -> CaseResult {
     let Ok(device) = fusor::Device::new().await else {
-        return; // No GPU available.
+        return Ok(()); // No GPU available.
     };
     let weight_shape = [4, 512];
     let raw_bytes = q4k_raw_bytes(weight_shape);
     let input_data = vec![vec![0.1f32; weight_shape[1]]; 1];
     let Some(_) = device.as_gpu() else {
-        panic!("expected GPU device");
+        return Err("expected GPU device".into());
     };
 
     let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
@@ -135,25 +133,25 @@ async fn q4k_qmatmul_post_relu_resolves_to_single_kernel() {
     // Natural unfused source: matmul + relu. Fuser should collapse to 1 kernel.
     let output = input.q_mat_mul(&weights).relu().to_concrete();
     let Tensor::Gpu(natural_gpu) = output else {
-        panic!("expected GPU tensor");
+        return Err("expected GPU tensor".into());
     };
     let natural_kernels = natural_gpu.count_kernels_to_resolve();
-    assert_eq!(
+    ensure_eq!(
         natural_kernels, 1,
         "expected fuser to collapse q_mat_mul -> relu to 1 dispatch, got {natural_kernels}"
     );
+    Ok(())
 }
 
-#[tokio::test]
-async fn q4k_concat_split_swiglu_resolves_to_single_dynamic_qmatmul_kernel() {
+pub async fn q4k_concat_split_swiglu_resolves_to_single_dynamic_qmatmul_kernel() -> CaseResult {
     let Ok(device) = fusor::Device::new().await else {
-        return;
+        return Ok(());
     };
     let Some(gpu_device) = device.as_gpu() else {
-        panic!("expected GPU device");
+        return Err("expected GPU device".into());
     };
     if !gpu_device.subgroups_supported() {
-        return;
+        return Ok(());
     }
 
     let weight_shape = [64, 512];
@@ -166,20 +164,20 @@ async fn q4k_concat_split_swiglu_resolves_to_single_dynamic_qmatmul_kernel() {
         (Tensor::Gpu(input), QMatrix::Gpu(weights)) => {
             Tensor::<2, f32>::Gpu(input.q_mat_mul_paired_silu_product(weights)).to_concrete()
         }
-        _ => panic!("expected GPU tensors"),
+        _ => return Err("expected GPU tensors".into()),
     };
     let Tensor::Gpu(gpu_out) = output else {
-        panic!("expected GPU tensor");
+        return Err("expected GPU tensor".into());
     };
     let kernels = gpu_out.count_kernels_to_resolve();
-    assert_eq!(
+    ensure_eq!(
         kernels, 1,
         "expected dynamic split-gate qmatmul fusion to resolve to 1 dispatch, got {kernels}"
     );
+    Ok(())
 }
 
-#[tokio::test]
-async fn q8_0_qmatmul_post_column_add_nonmultiple_applies_epilogue() {
+pub async fn q8_0_qmatmul_post_column_add_nonmultiple_applies_epilogue() -> CaseResult {
     let weight_shape = [4, 64];
     let raw_bytes = q8_0_raw_bytes(weight_shape);
     let input_shape = [2, weight_shape[1]];
@@ -200,12 +198,12 @@ async fn q8_0_qmatmul_post_column_add_nonmultiple_applies_epilogue() {
         let input: Tensor<2, f32> = Tensor::from_slice(&device, input_shape, &input_data);
         let bias: Tensor<1, f32> = Tensor::from_slice(&device, [weight_shape[0]], &bias_data);
         let actual = input.q_mat_mul(&weights).add_(&bias).to_concrete();
-        approx_eq(&actual, &expected, 2.0).await.unwrap();
+        approx_eq(&actual, &expected, 2.0).await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn q8_0_qmatmul_post_mixed_extras_preserves_binding_order() {
+pub async fn q8_0_qmatmul_post_mixed_extras_preserves_binding_order() -> CaseResult {
     let weight_shape = [4, 64];
     let raw_bytes = q8_0_raw_bytes(weight_shape);
     let input_shape = [2, weight_shape[1]];
@@ -236,6 +234,7 @@ async fn q8_0_qmatmul_post_mixed_extras_preserves_binding_order() {
             .q_mat_mul(&weights)
             .add_(&residual_biased)
             .to_concrete();
-        approx_eq(&actual, &expected, 2.0).await.unwrap();
+        approx_eq(&actual, &expected, 2.0).await?;
     }
+    Ok(())
 }

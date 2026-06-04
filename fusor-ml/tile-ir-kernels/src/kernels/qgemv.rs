@@ -160,7 +160,7 @@ pub(crate) fn qgemv_tile_with_epilogue(
             8,
         ),
         GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative => {
-            let shape = if b.rows <= 4096 && output_cols >= 4096 && output_cols < 8192 {
+            let shape = if b.rows <= 4096 && (4096..8192).contains(&output_cols) {
                 q4k_mid_override(q4k_default_mid(b.rows, output_cols))
             } else if b.rows <= 4096 && output_cols <= 4096 {
                 qgemv_shape(256, 8, 4)

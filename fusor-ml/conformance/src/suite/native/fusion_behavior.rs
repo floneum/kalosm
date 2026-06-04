@@ -1,5 +1,7 @@
+//! Fusion behavior conformance cases.
+
 use fusor::{Device, Tensor};
-use fusor_conformance::approx_eq;
+use fusor_conformance::{CaseResult, approx_eq, ensure, ensure_eq};
 
 async fn gpu_device() -> Option<Device> {
     Device::gpu().await.ok()
@@ -31,10 +33,9 @@ fn attention_data(len: usize, offset: f32) -> Vec<f32> {
         .collect()
 }
 
-#[tokio::test]
-async fn gpu_nary_triple_add_fuses_into_one_kernel() {
+pub async fn gpu_nary_triple_add_fuses_into_one_kernel() -> CaseResult {
     let Some(device) = gpu_device().await else {
-        return;
+        return Ok(());
     };
 
     for shape in [[2, 2], [3, 5], [4, 3]] {
@@ -47,7 +48,7 @@ async fn gpu_nary_triple_add_fuses_into_one_kernel() {
 
         let sum = &a + &b;
         let result = &sum + &c;
-        assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+        ensure_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
         let actual = result.to_concrete();
 
         let cpu_a = Tensor::from_slice(&Device::Cpu, shape, &a_data);
@@ -55,14 +56,14 @@ async fn gpu_nary_triple_add_fuses_into_one_kernel() {
         let cpu_c = Tensor::from_slice(&Device::Cpu, shape, &c_data);
         let cpu_sum = &cpu_a + &cpu_b;
         let expected = (&cpu_sum + &cpu_c).to_concrete();
-        approx_eq(&actual, &expected, 1e-6).await.unwrap();
+        approx_eq(&actual, &expected, 1e-6).await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn gpu_nary_unary_chain_fuses_into_one_kernel() {
+pub async fn gpu_nary_unary_chain_fuses_into_one_kernel() -> CaseResult {
     let Some(device) = gpu_device().await else {
-        return;
+        return Ok(());
     };
 
     for shape in [[2, 2], [3, 4], [2, 7]] {
@@ -73,21 +74,21 @@ async fn gpu_nary_unary_chain_fuses_into_one_kernel() {
 
         let sum = (-a.clone()) + b.sin();
         let result = sum.cos() + 1.0;
-        assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+        ensure_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
         let actual = result.to_concrete();
 
         let cpu_a = Tensor::from_slice(&Device::Cpu, shape, &a_data);
         let cpu_b = Tensor::from_slice(&Device::Cpu, shape, &b_data);
         let cpu_sum = (-cpu_a.clone()) + cpu_b.sin();
         let expected = (cpu_sum.cos() + 1.0).to_concrete();
-        approx_eq(&actual, &expected, 1e-6).await.unwrap();
+        approx_eq(&actual, &expected, 1e-6).await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn gpu_nary_same_input_multiple_times_deduplicates_bindings() {
+pub async fn gpu_nary_same_input_multiple_times_deduplicates_bindings() -> CaseResult {
     let Some(device) = gpu_device().await else {
-        return;
+        return Ok(());
     };
 
     for shape in [[2, 2], [4, 3], [3, 6]] {
@@ -95,20 +96,20 @@ async fn gpu_nary_same_input_multiple_times_deduplicates_bindings() {
         let a = Tensor::from_slice(&device, shape, &a_data);
         let sum = &a + &a;
         let result = &sum + &a;
-        assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+        ensure_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
         let actual = result.to_concrete();
 
         let cpu_a = Tensor::from_slice(&Device::Cpu, shape, &a_data);
         let cpu_sum = &cpu_a + &cpu_a;
         let expected = (&cpu_sum + &cpu_a).to_concrete();
-        approx_eq(&actual, &expected, 1e-6).await.unwrap();
+        approx_eq(&actual, &expected, 1e-6).await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn gpu_nary_where_cond_fuses_into_one_kernel() {
+pub async fn gpu_nary_where_cond_fuses_into_one_kernel() -> CaseResult {
     let Some(device) = gpu_device().await else {
-        return;
+        return Ok(());
     };
 
     for shape in [[2, 2], [3, 5], [4, 4]] {
@@ -120,7 +121,7 @@ async fn gpu_nary_where_cond_fuses_into_one_kernel() {
         let on_false = Tensor::from_slice(&device, shape, &on_false_data);
 
         let result = condition.where_cond(&on_true, &on_false);
-        assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+        ensure_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
         let actual = result.to_concrete();
 
         let cpu_condition = Tensor::from_slice(&Device::Cpu, shape, &condition_values);
@@ -129,18 +130,18 @@ async fn gpu_nary_where_cond_fuses_into_one_kernel() {
         let expected = cpu_condition
             .where_cond(&cpu_on_true, &cpu_on_false)
             .to_concrete();
-        approx_eq(&actual, &expected, 1e-6).await.unwrap();
+        approx_eq(&actual, &expected, 1e-6).await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn gpu_flash_attention_fuses_into_one_kernel() {
+pub async fn gpu_flash_attention_fuses_into_one_kernel() -> CaseResult {
     let Some(device) = gpu_device().await else {
-        return;
+        return Ok(());
     };
-    let Device::Gpu(gpu) = &device else { return };
+    let Device::Gpu(gpu) = &device else { return Ok(()) };
     if gpu.fixed_width_subgroup_size().is_none() {
-        return;
+        return Ok(());
     }
 
     let q_shape = [1, 2, 3, 4];
@@ -159,7 +160,7 @@ async fn gpu_flash_attention_fuses_into_one_kernel() {
         .as_gpu()
         .expect("flash attention fusion test should produce a GPU tensor");
     let kernel_count = gpu_result.count_kernels_to_resolve();
-    assert_eq!(
+    ensure_eq!(
         kernel_count,
         1,
         "flash attention graph was not fused:\n{}",
@@ -173,15 +174,15 @@ async fn gpu_flash_attention_fuses_into_one_kernel() {
     let expected = cpu_q
         .flash_attention(&cpu_k, &cpu_v, scale, None)
         .to_concrete();
-    approx_eq(&actual, &expected, 1e-4).await.unwrap();
+    approx_eq(&actual, &expected, 1e-4).await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn gpu_residual_rms_norm_fuses_into_one_kernel() {
+pub async fn gpu_residual_rms_norm_fuses_into_one_kernel() -> CaseResult {
     let Some(device) = gpu_device().await else {
-        return;
+        return Ok(());
     };
-    let Device::Gpu(_) = &device else { return };
+    let Device::Gpu(_) = &device else { return Ok(()) };
 
     let shape = [1, 3, 256];
     let input_data = attention_data(shape.iter().product(), 0.25);
@@ -199,7 +200,7 @@ async fn gpu_residual_rms_norm_fuses_into_one_kernel() {
         .as_gpu()
         .expect("residual rms norm fusion test should produce a GPU tensor");
     let kernel_count = gpu_result.count_kernels_to_resolve();
-    assert_eq!(
+    ensure_eq!(
         kernel_count,
         1,
         "residual rms norm graph was not fused:\n{}",
@@ -213,13 +214,13 @@ async fn gpu_residual_rms_norm_fuses_into_one_kernel() {
     let expected = (cpu_input + cpu_residual)
         .rms_norm_fused::<1, 2>(&cpu_weight, None, 1e-5)
         .to_concrete();
-    approx_eq(&actual, &expected, 1e-4).await.unwrap();
+    approx_eq(&actual, &expected, 1e-4).await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn gpu_nary_fusion_respects_binding_limit() {
+pub async fn gpu_nary_fusion_respects_binding_limit() -> CaseResult {
     let Some(device) = gpu_device().await else {
-        return;
+        return Ok(());
     };
 
     let shape = [3, 4];
@@ -227,7 +228,7 @@ async fn gpu_nary_fusion_respects_binding_limit() {
     // Software adapters can report descriptor limits too high to build a
     // practical limit-plus-one stress case.
     if gpu.is_cpu_adapter() {
-        return;
+        return Ok(());
     }
     let max_fused_inputs = gpu.nary_direct_input_binding_budget();
     let num_tensors = max_fused_inputs.saturating_add(1).max(2);
@@ -241,7 +242,7 @@ async fn gpu_nary_fusion_respects_binding_limit() {
     let result = iter.fold(first, |acc, tensor| (&acc + tensor).to_concrete());
 
     let kernel_count = result.as_gpu().unwrap().count_kernels_to_resolve();
-    assert!(
+    ensure!(
         kernel_count > 1,
         "expected more than one kernel when exceeding the storage binding limit, got {}",
         kernel_count
@@ -255,35 +256,31 @@ async fn gpu_nary_fusion_respects_binding_limit() {
     let expected = cpu_iter
         .fold(cpu_first, |acc, tensor| (&acc + tensor).to_concrete())
         .to_concrete();
-    approx_eq(&result.to_concrete(), &expected, 1e-6)
-        .await
-        .unwrap();
+    approx_eq(&result.to_concrete(), &expected, 1e-6).await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn gpu_gelu_lowers_to_one_kernel() {
+pub async fn gpu_gelu_lowers_to_one_kernel() -> CaseResult {
     let Some(device) = gpu_device().await else {
-        return;
+        return Ok(());
     };
 
     for shape in [[2, 2], [3, 5], [4, 3]] {
         let data = matrix_data(shape, -0.4);
         let tensor = Tensor::from_slice(&device, shape, &data);
         let result = tensor.gelu();
-        assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+        ensure_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
 
         let cpu = Tensor::from_slice(&Device::Cpu, shape, &data);
         let expected = cpu.gelu().to_concrete();
-        approx_eq(&result.to_concrete(), &expected, 1e-3)
-            .await
-            .unwrap();
+        approx_eq(&result.to_concrete(), &expected, 1e-3).await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn gpu_matmul_then_unary_chain_fuses_into_one_kernel() {
+pub async fn gpu_matmul_then_unary_chain_fuses_into_one_kernel() -> CaseResult {
     let Some(device) = gpu_device().await else {
-        return;
+        return Ok(());
     };
 
     let a_shape = [2, 3];
@@ -295,20 +292,18 @@ async fn gpu_matmul_then_unary_chain_fuses_into_one_kernel() {
 
     let matmul = a.mat_mul(&b);
     let result = matmul.cos() + 1.0;
-    assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+    ensure_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
 
     let cpu_a = Tensor::from_slice(&Device::Cpu, a_shape, &a_data);
     let cpu_b = Tensor::from_slice(&Device::Cpu, b_shape, &b_data);
     let expected = (cpu_a.mat_mul(&cpu_b).cos() + 1.0).to_concrete();
-    approx_eq(&result.to_concrete(), &expected, 1e-5)
-        .await
-        .unwrap();
+    approx_eq(&result.to_concrete(), &expected, 1e-5).await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn gpu_unary_inputs_fuse_into_matmul_kernel() {
+pub async fn gpu_unary_inputs_fuse_into_matmul_kernel() -> CaseResult {
     let Some(device) = gpu_device().await else {
-        return;
+        return Ok(());
     };
 
     let a_shape = [2, 3];
@@ -319,20 +314,18 @@ async fn gpu_unary_inputs_fuse_into_matmul_kernel() {
     let b = Tensor::from_slice(&device, b_shape, &b_data);
 
     let result = (-a.clone()).mat_mul(&b.sin());
-    assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+    ensure_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
 
     let cpu_a = Tensor::from_slice(&Device::Cpu, a_shape, &a_data);
     let cpu_b = Tensor::from_slice(&Device::Cpu, b_shape, &b_data);
     let expected = (-cpu_a.clone()).mat_mul(&cpu_b.sin()).to_concrete();
-    approx_eq(&result.to_concrete(), &expected, 1e-5)
-        .await
-        .unwrap();
+    approx_eq(&result.to_concrete(), &expected, 1e-5).await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn gpu_reduce_then_unary_chain_fuses_into_one_kernel() {
+pub async fn gpu_reduce_then_unary_chain_fuses_into_one_kernel() -> CaseResult {
     let Some(device) = gpu_device().await else {
-        return;
+        return Ok(());
     };
 
     let shape = [3, 5];
@@ -340,23 +333,21 @@ async fn gpu_reduce_then_unary_chain_fuses_into_one_kernel() {
     let tensor = Tensor::from_slice(&device, shape, &data);
     let reduced = tensor.sum::<1>(0);
     let result = reduced.cos() + 1.0;
-    assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+    ensure_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
 
     let cpu = Tensor::from_slice(&Device::Cpu, shape, &data);
     let expected = (cpu.sum::<1>(0).cos() + 1.0).to_concrete();
-    approx_eq(&result.to_concrete(), &expected, 1e-5)
-        .await
-        .unwrap();
+    approx_eq(&result.to_concrete(), &expected, 1e-5).await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn gpu_indexing_then_arithmetic_matches_cpu() {
+pub async fn gpu_indexing_then_arithmetic_matches_cpu() -> CaseResult {
     // `i((row, ..))` produces a rank-1 view; chaining mul_scalar + add_scalar
     // exercises the index-then-arithmetic fusion path that no existing test
     // covers. We assert correctness against CPU; kernel-count is informational
     // (printed if the count is unexpected) since fusion details may change.
     let Some(device) = gpu_device().await else {
-        return;
+        return Ok(());
     };
 
     let shape = [4, 6];
@@ -369,13 +360,13 @@ async fn gpu_indexing_then_arithmetic_matches_cpu() {
     let cpu_input: fusor::Tensor<2, f32> = Tensor::from_slice(&Device::Cpu, shape, &data);
     let cpu_row = cpu_input.i((1, ..));
     let expected = (cpu_row.mul_scalar(2.0) + 0.5).to_concrete();
-    approx_eq(&actual, &expected, 1e-6).await.unwrap();
+    approx_eq(&actual, &expected, 1e-6).await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn gpu_reduce_then_gelu_uses_two_kernels() {
+pub async fn gpu_reduce_then_gelu_uses_two_kernels() -> CaseResult {
     let Some(device) = gpu_device().await else {
-        return;
+        return Ok(());
     };
 
     for shape in [[2, 4], [3, 6], [4, 5]] {
@@ -384,12 +375,11 @@ async fn gpu_reduce_then_gelu_uses_two_kernels() {
         let reduced = tensor.sum_keepdim::<1>(0);
         let result = reduced.gelu();
         // Resize between Reduce and Gelu prevents fusion of the two kernels.
-        assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 2);
+        ensure_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 2);
 
         let cpu = Tensor::from_slice(&Device::Cpu, shape, &data);
         let expected = cpu.sum_keepdim::<1>(0).gelu().to_concrete();
-        approx_eq(&result.to_concrete(), &expected, 1e-3)
-            .await
-            .unwrap();
+        approx_eq(&result.to_concrete(), &expected, 1e-3).await?;
     }
+    Ok(())
 }

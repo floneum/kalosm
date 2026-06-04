@@ -24,6 +24,14 @@ mod selection_tests {
         }
     }
 
+    fn no_subgroup_caps(high_tile_limits: bool) -> KernelDeviceCaps {
+        KernelDeviceCaps {
+            subgroups_supported: false,
+            cooperative_matrix: CooperativeMatrixCaps::default(),
+            ..caps(high_tile_limits)
+        }
+    }
+
     fn ctx(format: tile_ir::GgmlQuantFormat, y_supports_coop: bool) -> QMatmulDirectCtx {
         QMatmulDirectCtx {
             format,
@@ -122,6 +130,18 @@ mod selection_tests {
             tile: QCoopTile::new(64, 64),
             cached: false,
         }));
+        assert!(qmatmul_direct_path_supported(
+            QMatmulPath::SingleRow,
+            no_coop_caps(false)
+        ));
+        assert!(!qmatmul_direct_path_supported(
+            QMatmulPath::SingleRow,
+            no_subgroup_caps(false)
+        ));
+        assert!(!qmatmul_direct_path_supported(
+            QMatmulPath::Q5SmallSingleRow,
+            no_subgroup_caps(false)
+        ));
 
         let selector = qmatmul_direct_selector();
         let caps = no_coop_caps(false);
@@ -188,6 +208,29 @@ mod selection_tests {
             512,
             128,
             false,
+        ));
+    }
+
+    #[test]
+    fn custom_accumulator_offsets_must_cover_output_width() {
+        assert!(qmatmul_custom_accumulator_offsets_cover_output(1, 9, 10, 1));
+        assert!(qmatmul_custom_accumulator_offsets_cover_output(
+            1, 10, 10, 0
+        ));
+        assert!(!qmatmul_custom_accumulator_offsets_cover_output(
+            1, 5, 10, 1
+        ));
+        assert!(!qmatmul_custom_accumulator_offsets_cover_output(
+            1, 10, 10, 1
+        ));
+        assert!(!qmatmul_custom_accumulator_offsets_cover_output(
+            1,
+            u32::MAX,
+            10,
+            1
+        ));
+        assert!(!qmatmul_custom_accumulator_offsets_cover_output(
+            2, 9, 10, 1
         ));
     }
 }

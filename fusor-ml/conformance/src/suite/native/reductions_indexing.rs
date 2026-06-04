@@ -1,13 +1,12 @@
-mod common;
+//! Reduction/indexing conformance cases.
 
-use common::{index_select1, index_select2, keepdim2, mean_axis2, reduce_axis2, var_axis2};
+use crate::common::{index_select1, index_select2, keepdim2, mean_axis2, reduce_axis2, var_axis2};
 use fusor::{Device, Tensor, arange};
-use fusor_conformance::{FuzzGenerator, approx_compare, f16_capable_devices, relative_compare};
+use fusor_conformance::{CaseResult, FuzzGenerator, approx_compare, f16_capable_devices, relative_compare};
 use half::f16;
 use rand::distr::Uniform;
 
-#[tokio::test]
-async fn reductions_match_host_reference() {
+pub async fn reductions_match_host_reference() -> CaseResult {
     const SHAPE: [usize; 2] = [45, 45];
     let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
         .with_seed(200)
@@ -21,8 +20,7 @@ async fn reductions_match_host_reference() {
         })
         .compare_with(approx_compare::<1, f32>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // max along axis 0
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.max::<1>(0))
@@ -36,8 +34,7 @@ async fn reductions_match_host_reference() {
         })
         .compare_with(approx_compare::<1, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // min along axis 0
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.min::<1>(0))
@@ -51,8 +48,7 @@ async fn reductions_match_host_reference() {
         })
         .compare_with(approx_compare::<1, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // product along axis 1 (bounded to avoid overflow)
     let fuzz_small = FuzzGenerator::<2, f32>::new(SHAPE)
@@ -69,8 +65,7 @@ async fn reductions_match_host_reference() {
         // accumulation order.
         .compare_with(relative_compare::<1>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // sum_keepdim along axis 1
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.sum_keepdim::<1>(1))
@@ -83,8 +78,7 @@ async fn reductions_match_host_reference() {
         })
         .compare_with(approx_compare::<2, f32>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // max_keepdim along axis 0
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.max_keepdim::<1>(0))
@@ -97,8 +91,7 @@ async fn reductions_match_host_reference() {
         })
         .compare_with(approx_compare::<2, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // min_keepdim along axis 0
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.min_keepdim::<1>(0))
@@ -111,8 +104,7 @@ async fn reductions_match_host_reference() {
         })
         .compare_with(approx_compare::<2, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // product_keepdim along axis 1
     let fuzz_small2 = FuzzGenerator::<2, f32>::new(SHAPE)
@@ -128,8 +120,7 @@ async fn reductions_match_host_reference() {
         })
         .compare_with(relative_compare::<2>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // mean along axis 1
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.mean::<1>(1))
@@ -139,8 +130,7 @@ async fn reductions_match_host_reference() {
         })
         .compare_with(approx_compare::<1, f32>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // mean_keepdim along axis 1
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.mean_keepdim::<1>(1))
@@ -150,8 +140,7 @@ async fn reductions_match_host_reference() {
         })
         .compare_with(approx_compare::<2, f32>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // var along axis 1
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.var::<1>(1))
@@ -161,8 +150,7 @@ async fn reductions_match_host_reference() {
         })
         .compare_with(approx_compare::<1, f32>(1e-3))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // var_keepdim along axis 1
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.var_keepdim::<1>(1))
@@ -172,12 +160,12 @@ async fn reductions_match_host_reference() {
         })
         .compare_with(approx_compare::<2, f32>(1e-3))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
+
+    Ok(())
 }
 
-#[tokio::test]
-async fn indexing_cast_and_rank_specific_indexing_match_reference() {
+pub async fn indexing_cast_and_rank_specific_indexing_match_reference() -> CaseResult {
     // index_select, slice_assign, and cast use fuzzed data
     const SHAPE: [usize; 2] = [45, 45];
     let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
@@ -197,8 +185,7 @@ async fn indexing_cast_and_rank_specific_indexing_match_reference() {
     })
     .compare_with(approx_compare::<2, f32>(1e-6))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
 
     // slice_assign
     let fuzz_patch = FuzzGenerator::<2, f32>::new([2, 2])
@@ -211,14 +198,13 @@ async fn indexing_cast_and_rank_specific_indexing_match_reference() {
     .arg(fuzz_patch)
     .equal_to_resolved_with_device(
         async |v: Vec<Vec<f32>>, patch: Vec<Vec<f32>>, device: Device| {
-            let out = common::slice_assign2(&v, 1..3, 1..3, &patch);
+            let out = crate::common::slice_assign2(&v, 1..3, 1..3, &patch);
             Tensor::new(&device, &out)
         },
     )
     .compare_with(approx_compare::<2, f32>(1e-6))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
 
     // cast f32 -> f16 -> f32
     fusor_conformance::assert(async |x: Tensor<2, f32>| {
@@ -237,12 +223,12 @@ async fn indexing_cast_and_rank_specific_indexing_match_reference() {
     // from the CPU reference in this value range.
     .compare_with(approx_compare::<2, f32>(5e-3))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
+
+    Ok(())
 }
 
-#[tokio::test]
-async fn full_tensor_reductions_fuzzed() {
+pub async fn full_tensor_reductions_fuzzed() -> CaseResult {
     // 2D reductions with fuzzed data + non-contiguous layouts
     const SHAPE: [usize; 2] = [45, 45];
     let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
@@ -258,8 +244,7 @@ async fn full_tensor_reductions_fuzzed() {
         })
         .compare_with(approx_compare::<1, f32>(1e-3))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // sum along axis 0
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.sum::<1>(0))
@@ -270,8 +255,7 @@ async fn full_tensor_reductions_fuzzed() {
         })
         .compare_with(approx_compare::<1, f32>(1e-3))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // max along axis 1
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.max::<1>(1))
@@ -282,8 +266,7 @@ async fn full_tensor_reductions_fuzzed() {
         })
         .compare_with(approx_compare::<1, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // min along axis 0
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.min::<1>(0))
@@ -294,8 +277,7 @@ async fn full_tensor_reductions_fuzzed() {
         })
         .compare_with(approx_compare::<1, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // product along axis 1 (small range to avoid overflow)
     let fuzz_small = FuzzGenerator::<2, f32>::new([4, 6])
@@ -309,8 +291,7 @@ async fn full_tensor_reductions_fuzzed() {
         })
         .compare_with(approx_compare::<1, f32>(1e-2))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // mean along axis 1
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.mean::<1>(1))
@@ -321,8 +302,7 @@ async fn full_tensor_reductions_fuzzed() {
         })
         .compare_with(approx_compare::<1, f32>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // var along axis 1
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.var::<1>(1))
@@ -333,8 +313,9 @@ async fn full_tensor_reductions_fuzzed() {
         })
         .compare_with(approx_compare::<1, f32>(1e-3))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
+
+    Ok(())
 }
 
 fn reduce_axis3_mid(
@@ -361,8 +342,7 @@ fn mean_axis3_mid(input: &[Vec<Vec<f32>>]) -> Vec<Vec<f32>> {
         .collect()
 }
 
-#[tokio::test]
-async fn middle_axis_rank3_reductions_match_host_reference() {
+pub async fn middle_axis_rank3_reductions_match_host_reference() -> CaseResult {
     const SHAPE: [usize; 3] = [3, 8, 5];
     let fuzz = FuzzGenerator::<3, f32>::new(SHAPE)
         .with_seed(220)
@@ -376,8 +356,7 @@ async fn middle_axis_rank3_reductions_match_host_reference() {
         })
         .compare_with(approx_compare::<2, f32>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // mean along middle axis 1
     fusor_conformance::assert(async |x: Tensor<3, f32>| x.mean::<2>(1))
@@ -387,8 +366,7 @@ async fn middle_axis_rank3_reductions_match_host_reference() {
         })
         .compare_with(approx_compare::<2, f32>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // max along middle axis 1
     fusor_conformance::assert(async |x: Tensor<3, f32>| x.max::<2>(1))
@@ -398,8 +376,7 @@ async fn middle_axis_rank3_reductions_match_host_reference() {
         })
         .compare_with(approx_compare::<2, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // min along middle axis 1
     fusor_conformance::assert(async |x: Tensor<3, f32>| x.min::<2>(1))
@@ -409,8 +386,7 @@ async fn middle_axis_rank3_reductions_match_host_reference() {
         })
         .compare_with(approx_compare::<2, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // product along middle axis 1 — bounded range to avoid overflow
     let fuzz_small = FuzzGenerator::<3, f32>::new(SHAPE)
@@ -423,12 +399,12 @@ async fn middle_axis_rank3_reductions_match_host_reference() {
         })
         .compare_with(relative_compare::<2>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
+
+    Ok(())
 }
 
-#[tokio::test]
-async fn full_tensor_sum_large_fuzzed() {
+pub async fn full_tensor_sum_large_fuzzed() -> CaseResult {
     // Large 2D sum to test accumulation precision with non-contiguous layouts
     const SHAPE: [usize; 2] = [100, 100];
     let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
@@ -443,12 +419,12 @@ async fn full_tensor_sum_large_fuzzed() {
         })
         .compare_with(approx_compare::<1, f32>(1e-1))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
+
+    Ok(())
 }
 
-#[tokio::test]
-async fn index_select_fuzzed() {
+pub async fn index_select_fuzzed() -> CaseResult {
     static INDICES_1D: &[u32] = &[31, 15, 0, 7, 23, 3, 28, 10];
     static INDICES_2D_DIM0: &[u32] = &[7, 3, 0, 5, 1];
     static INDICES_2D_DIM1: &[u32] = &[5, 2, 0, 4];
@@ -469,8 +445,7 @@ async fn index_select_fuzzed() {
     })
     .compare_with(approx_compare::<1, f32>(1e-6))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
 
     // 2D index_select dim=0 with fuzzed data
     const SHAPE_2D: [usize; 2] = [45, 45];
@@ -487,8 +462,7 @@ async fn index_select_fuzzed() {
     })
     .compare_with(approx_compare::<2, f32>(1e-6))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
 
     // 2D index_select dim=1 with fuzzed data
     fusor_conformance::assert(async |x: Tensor<2, f32>| {
@@ -502,8 +476,7 @@ async fn index_select_fuzzed() {
     })
     .compare_with(approx_compare::<2, f32>(1e-6))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
 
     // Duplicate indices with fuzzed data
     let gen_3x4 = FuzzGenerator::<2, f32>::new([3, 4]).with_seed(52);
@@ -518,12 +491,12 @@ async fn index_select_fuzzed() {
     })
     .compare_with(approx_compare::<2, f32>(1e-6))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
+
+    Ok(())
 }
 
-#[tokio::test]
-async fn index_select_single_rank_and_large_regressions() {
+pub async fn index_select_single_rank_and_large_regressions() -> CaseResult {
     let single_gen = FuzzGenerator::<2, f32>::new([3, 2])
         .with_seed(53)
         .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
@@ -537,8 +510,7 @@ async fn index_select_single_rank_and_large_regressions() {
     })
     .compare_with(approx_compare::<2, f32>(0.0))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
 
     let gen_3d = FuzzGenerator::<3, f32>::new([2, 2, 2])
         .with_seed(54)
@@ -553,8 +525,7 @@ async fn index_select_single_rank_and_large_regressions() {
     })
     .compare_with(approx_compare::<3, f32>(0.0))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
 
     const SIZE: usize = 100;
     fusor_conformance::assert(async |device: Device| {
@@ -578,12 +549,12 @@ async fn index_select_single_rank_and_large_regressions() {
         Tensor::new(&device, &rows)
     })
     .compare_with(approx_compare::<2, f32>(0.0))
-    .await
-    .unwrap();
+    .await?;
+
+    Ok(())
 }
 
-#[tokio::test]
-async fn index_select_embedding_width_regression() {
+pub async fn index_select_embedding_width_regression() -> CaseResult {
     const SOURCE_ROWS: usize = 64;
     const SELECTED_ROWS: usize = 48;
     const WIDTH: usize = 4096;
@@ -611,6 +582,7 @@ async fn index_select_embedding_width_regression() {
         Tensor::new(&device, &rows)
     })
     .compare_with(approx_compare::<2, f32>(0.0))
-    .await
-    .unwrap();
+    .await?;
+
+    Ok(())
 }

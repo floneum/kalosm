@@ -1,12 +1,11 @@
-mod common;
+//! Matmul / conv / pool conformance cases.
 
-use common::{conv1d_ncw, matmul2, pool1d_ncw};
+use crate::common::{conv1d_ncw, matmul2, pool1d_ncw};
 use fusor::{Device, Tensor};
-use fusor_conformance::{FuzzGenerator, approx_compare, available_devices, f16_capable_devices};
+use fusor_conformance::{CaseResult, FuzzGenerator, approx_compare, available_devices, f16_capable_devices};
 use rand::distr::Uniform;
 
-#[tokio::test]
-async fn matmul_match_host_reference() {
+pub async fn matmul_match_host_reference() -> CaseResult {
     const M: usize = 64;
     const K: usize = 128;
     const N: usize = 64;
@@ -29,12 +28,11 @@ async fn matmul_match_host_reference() {
         )
         .compare_with(approx_compare::<2, f32>(1e-2))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn matmul_small_fixed_regression() {
+pub async fn matmul_small_fixed_regression() -> CaseResult {
     const LHS: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
     const RHS: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
 
@@ -48,12 +46,11 @@ async fn matmul_small_fixed_regression() {
         )
         .compare_with(approx_compare::<2, f32>(1e-6))
         .runs(1)
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn conv_and_pool_match_host_reference() {
+pub async fn conv_and_pool_match_host_reference() -> CaseResult {
     // Conv1D with fuzzed input
     let gen_conv = FuzzGenerator::<3, f32>::new([1..=1, 1..=1, 255..=257])
         .with_seed(310)
@@ -74,8 +71,7 @@ async fn conv_and_pool_match_host_reference() {
     })
     .compare_with(approx_compare::<3, f32>(1e-4))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
 
     // Pool: pool_max with fuzzed input
     let gen_pool = FuzzGenerator::<3, f32>::new([1..=1, 2..=2, 255..=257])
@@ -90,8 +86,7 @@ async fn conv_and_pool_match_host_reference() {
         })
         .compare_with(approx_compare::<3, f32>(1e-6))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // pool_min vs host reference
     fusor_conformance::assert(async |x: Tensor<3, f32>| x.pool_min([(2, 2)]))
@@ -101,8 +96,8 @@ async fn conv_and_pool_match_host_reference() {
         })
         .compare_with(approx_compare::<3, f32>(1e-6))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
 fn conv2d_nchw_ref(
@@ -269,8 +264,7 @@ fn flatten5(v: &[Vec<Vec<Vec<Vec<f32>>>>]) -> Vec<f32> {
         .collect()
 }
 
-#[tokio::test]
-async fn conv2d_matches_host_reference() {
+pub async fn conv2d_matches_host_reference() -> CaseResult {
     const BATCH: usize = 1;
     const IN_CH: usize = 3;
     const OUT_CH: usize = 4;
@@ -305,13 +299,12 @@ async fn conv2d_matches_host_reference() {
             .to_concrete();
         let expected = Tensor::from_slice(&device, out_shape, &expected_flat);
         fusor_conformance::approx_eq(&actual, &expected, 1e-3)
-            .await
-            .unwrap();
+            .await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn conv3d_matches_host_reference() {
+pub async fn conv3d_matches_host_reference() -> CaseResult {
     const BATCH: usize = 1;
     const IN_CH: usize = 2;
     const OUT_CH: usize = 2;
@@ -348,13 +341,12 @@ async fn conv3d_matches_host_reference() {
             .to_concrete();
         let expected = Tensor::from_slice(&device, out_shape, &expected_flat);
         fusor_conformance::approx_eq(&actual, &expected, 1e-3)
-            .await
-            .unwrap();
+            .await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn matmul_identity_matrix() {
+pub async fn matmul_identity_matrix() -> CaseResult {
     const M: usize = 2;
     const N: usize = 3;
     let fuzz = FuzzGenerator::<2, f32>::new([M, N])
@@ -375,8 +367,8 @@ async fn matmul_identity_matrix() {
     .equal_to(async |a: Tensor<2, f32>| a)
     .compare_with(approx_compare::<2, f32>(1e-5))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
+    Ok(())
 }
 
 fn batched3_matmul(lhs: &[Vec<Vec<f32>>], rhs: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<f32>>> {
@@ -387,8 +379,7 @@ fn batched3_matmul(lhs: &[Vec<Vec<f32>>], rhs: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<
         .collect()
 }
 
-#[tokio::test]
-async fn matmul_batched_3d_matches_host_reference() {
+pub async fn matmul_batched_3d_matches_host_reference() -> CaseResult {
     // Per-batch [M, K] @ [K, N] -> [M, N]. Replaces the deleted
     // `core/src/matmul/mod.rs::test_batched_matmul` and `fuzz_batched_matmul`.
     let gen_lhs = FuzzGenerator::<3, f32>::new([2, 3, 4])
@@ -408,12 +399,11 @@ async fn matmul_batched_3d_matches_host_reference() {
         )
         .compare_with(approx_compare::<3, f32>(1e-3))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn matmul_attention_4d_matches_host_reference() {
+pub async fn matmul_attention_4d_matches_host_reference() -> CaseResult {
     // Attention-shaped 4D matmul: [B, H, M, K] @ [B, H, K, N] regression
     // for the deleted `fusor/src/lib.rs::test_matmul_cpu_vs_gpu`. Smaller than
     // the original [1, 8, 100, 64] to keep CI fast — the original was a
@@ -442,13 +432,12 @@ async fn matmul_attention_4d_matches_host_reference() {
         let rhs = Tensor::from_slice(&device, SHAPE, &rhs_data);
         let actual = lhs.matmul(&rhs).to_concrete();
         fusor_conformance::approx_eq(&actual, &expected, 1e-3)
-            .await
-            .unwrap();
+            .await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn matmul_sgemv_variants_match_host_reference() {
+pub async fn matmul_sgemv_variants_match_host_reference() -> CaseResult {
     // [M, K] @ [K, 1] -> [M, 1] : single-output gemv
     let gen_mat = FuzzGenerator::<2, f32>::new([8, 12])
         .with_seed(370)
@@ -467,8 +456,7 @@ async fn matmul_sgemv_variants_match_host_reference() {
         )
         .compare_with(approx_compare::<2, f32>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // [M, K] @ [K, N] with N>1 multi-row variant — distinct GPU kernel path
     let gen_mat = FuzzGenerator::<2, f32>::new([8, 12])
@@ -488,8 +476,7 @@ async fn matmul_sgemv_variants_match_host_reference() {
         )
         .compare_with(approx_compare::<2, f32>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // Batched gemv: [B, M, K] @ [B, K, 1]
     let gen_mat = FuzzGenerator::<3, f32>::new([2, 6, 9])
@@ -509,12 +496,11 @@ async fn matmul_sgemv_variants_match_host_reference() {
         )
         .compare_with(approx_compare::<3, f32>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn matmul_transposed_operand_matches_host_reference() {
+pub async fn matmul_transposed_operand_matches_host_reference() -> CaseResult {
     // matmul where the right operand is the lazy transpose of a contiguous tensor.
     // Replaces the deleted `core/src/matmul/mod.rs::test_transposed_matmul`.
     let gen_lhs = FuzzGenerator::<2, f32>::new([6, 8])
@@ -540,12 +526,11 @@ async fn matmul_transposed_operand_matches_host_reference() {
     })
     .compare_with(approx_compare::<2, f32>(1e-4))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn matmul_non_contiguous_input_matches_host_reference() {
+pub async fn matmul_non_contiguous_input_matches_host_reference() -> CaseResult {
     // matmul on a sliced (non-contiguous) input. Replaces
     // `core/src/matmul/mod.rs::test_matrix_vector_mul_non_contiguous`.
     let gen_lhs_padded = FuzzGenerator::<2, f32>::new([6, 12])
@@ -567,8 +552,8 @@ async fn matmul_non_contiguous_input_matches_host_reference() {
     })
     .compare_with(approx_compare::<2, f32>(1e-4))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
+    Ok(())
 }
 
 /// Run the `M×K · K×N` f16 matmul on every f16-capable device and compare
@@ -576,7 +561,7 @@ async fn matmul_non_contiguous_input_matches_host_reference() {
 /// in the (M, N, K) const params, so this helper holds the shared setup.
 async fn assert_f16_matmul_matches_cpu_reference<const M: usize, const N: usize, const K: usize>(
     tolerance: half::f16,
-) {
+) -> CaseResult {
     use half::f16;
 
     fn data(seed: u32, total: usize) -> Vec<f16> {
@@ -600,33 +585,32 @@ async fn assert_f16_matmul_matches_cpu_reference<const M: usize, const N: usize,
         let rhs: Tensor<2, f16> = Tensor::from_slice(&device, [K, N], &rhs_data);
         let actual = lhs.matmul(&rhs).to_concrete();
         fusor_conformance::approx_eq(&actual, &expected, tolerance)
-            .await
-            .unwrap();
+            .await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn f16_matmul_coop_tile_matches_host_reference() {
+pub async fn f16_matmul_coop_tile_matches_host_reference() -> CaseResult {
     // Pins the f16 cooperative-matrix path: shape divides cleanly into the
     // smallest coop tile (Tile64x64, BK=16). Without f16 coop support this
     // would fall back to `batched_matmul_with_epilogues<F16, ...>`; with it,
     // dispatch lands on `try_batched_coop_matmul::<F16, 64, 64, 16>`.
-    assert_f16_matmul_matches_cpu_reference::<64, 64, 64>(half::f16::from_f32(5e-2)).await;
+    assert_f16_matmul_matches_cpu_reference::<64, 64, 64>(half::f16::from_f32(5e-2)).await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn f16_matmul_multi_tile_matches_host_reference() {
+pub async fn f16_matmul_multi_tile_matches_host_reference() -> CaseResult {
     // Regression for the cooperative-load bug in
     // `batched_matmul_with_epilogues`: f16 matmul disables coop selection
     // (allow_coop is f32-only), and tile-aligned shapes with m>32 / n>64
     // route to the shared-tile kernel. Multi-tile in M and N is needed so
     // the per-lane offsets that leaked into the cooperative load actually
     // shift global_row/global_col away from the workgroup tile base.
-    assert_f16_matmul_matches_cpu_reference::<64, 96, 64>(half::f16::from_f32(5e-2)).await;
+    assert_f16_matmul_matches_cpu_reference::<64, 96, 64>(half::f16::from_f32(5e-2)).await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn matmul_non_affine_prefix_matches_host_reference() {
+pub async fn matmul_non_affine_prefix_matches_host_reference() -> CaseResult {
     // 4D matmul with permuted batch dimensions. The contiguous source has
     // strides `[B1*M*K, M*K, K, 1]`; permuting `[0, 1, 2, 3] -> [1, 0, 2, 3]`
     // gives strides `[M*K, B1*M*K, K, 1]`, which is not affine across the
@@ -668,13 +652,12 @@ async fn matmul_non_affine_prefix_matches_host_reference() {
             .matmul(&rhs.permute([1, 0, 2, 3]))
             .to_concrete();
         fusor_conformance::approx_eq(&actual, &expected, 1e-3)
-            .await
-            .unwrap();
+            .await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn matmul_large_fuzzed() {
+pub async fn matmul_large_fuzzed() -> CaseResult {
     const M: usize = 256;
     const K: usize = 256;
     const N: usize = 256;
@@ -697,6 +680,6 @@ async fn matmul_large_fuzzed() {
         )
         .compare_with(approx_compare::<2, f32>(1e-2))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }

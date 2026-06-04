@@ -130,18 +130,30 @@ pub(crate) fn chunk_top_k_pair_data_with_encoder(
     )
 }
 
+/// Logit-processor settings (temperature scaling and repetition penalty)
+/// applied before the top-k reduction.
+#[derive(Clone, Copy)]
+pub(crate) struct ProcessorSettings {
+    pub temperature: f32,
+    pub repetition_penalty: f32,
+}
+
 pub(crate) fn chunk_top_k_pair_data_with_processors_with_encoder(
     input: &TensorData,
     previous_tokens: &[u32],
-    temperature: f32,
-    repetition_penalty: f32,
+    settings: ProcessorSettings,
     candidate_count: usize,
     output_per_chunk: usize,
     encoder: Option<&mut CommandEncoder>,
 ) -> Option<(TensorData, TensorData)> {
     let device = input.device();
     let (previous_tokens, previous_len) = fixed_previous_tokens_data(device, previous_tokens);
-    let params = processor_params_data(device, temperature, repetition_penalty, previous_len);
+    let params = processor_params_data(
+        device,
+        settings.temperature,
+        settings.repetition_penalty,
+        previous_len,
+    );
     chunk_top_k_pair_data_inner_with_encoder(
         input,
         candidate_count,
@@ -155,8 +167,7 @@ pub(crate) fn chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder(
     input: &TensorData,
     previous_tokens: &[u32],
     gpu_tail: Option<&TensorData>,
-    temperature: f32,
-    repetition_penalty: f32,
+    settings: ProcessorSettings,
     candidate_count: usize,
     output_per_chunk: usize,
     encoder: Option<&mut CommandEncoder>,
@@ -165,8 +176,7 @@ pub(crate) fn chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder(
         return chunk_top_k_pair_data_with_processors_with_encoder(
             input,
             previous_tokens,
-            temperature,
-            repetition_penalty,
+            settings,
             candidate_count,
             output_per_chunk,
             encoder,
@@ -190,7 +200,12 @@ pub(crate) fn chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder(
     let encoder = encoder?;
     let (previous_tokens, previous_len) =
         fixed_previous_tokens_data_with_gpu_tail(device, previous_tokens, gpu_tail, encoder);
-    let params = processor_params_data(device, temperature, repetition_penalty, previous_len);
+    let params = processor_params_data(
+        device,
+        settings.temperature,
+        settings.repetition_penalty,
+        previous_len,
+    );
     chunk_top_k_pair_data_inner_with_encoder(
         input,
         candidate_count,

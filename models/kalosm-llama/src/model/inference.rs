@@ -38,7 +38,10 @@ where
         if gpu_token_sampling_enabled() && stop_on.is_none() {
             if let Some(mut gpu_sampler) = LlamaGpuSamplerState::new(&self.device, sampler, seed) {
                 let top_k = gpu_sample_top_k(&gpu_sampler.config);
-                if gpu_run_ahead_enabled() && images.is_empty() {
+                if gpu_run_ahead_enabled()
+                    && images.is_empty()
+                    && self.model.supports_gpu_token_run_ahead()
+                {
                     let next_token = {
                         let previous_tokens = gpu_sampler.previous_tokens(&text_stream);
                         let mut session_lock = session
@@ -71,8 +74,8 @@ where
                                     .read()
                                     .map_err(|err| LlamaModelError::Session(err.to_string()))?
                                     .clone();
-                                if speculative_cache.tokens.len() + 1
-                                    <= self.model.config.context_length
+                                if speculative_cache.tokens.len()
+                                    < self.model.config.context_length
                                 {
                                     Self::forward_sample_token_from_gpu_token_pending(
                                         &self.model,

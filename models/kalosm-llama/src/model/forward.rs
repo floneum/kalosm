@@ -351,12 +351,14 @@ where
         let token_tensor = token.token_tensor();
         let (hidden, cache_slot) =
             model.forward_last_hidden_f32_gpu_token(&token_tensor, device, cache)?;
+        let (previous_tokens, include_gpu_tail) =
+            sampler.previous_tokens_for_gpu_tail(previous_tokens);
         let Some(sampled) = Self::forward_sample_token_pending_from_hidden(
             hidden,
             model,
             sampler,
             previous_tokens,
-            Some(token),
+            include_gpu_tail.then_some(token),
             top_k,
         )?
         else {

@@ -69,10 +69,12 @@ impl QMatMulOperation {
             return None;
         }
         if has_custom_accumulator_offsets {
-            if m != 1
-                || n.checked_add(max_accumulator_offset)
-                    .is_none_or(|cols| cols > matrix_n)
-            {
+            if !qmatmul_custom_accumulator_offsets_cover_output(
+                m,
+                n,
+                matrix_n,
+                max_accumulator_offset,
+            ) {
                 return None;
             }
         } else if n != matrix_n {
@@ -125,10 +127,9 @@ impl QMatMulOperation {
         let mut qmatmul_workgroups_x = 1;
         let y_supports_coop = tile_cooperative_store_layout_supported(&y_view.layout);
         let variant = select_qmatmul_direct_variant(format, m, k, n, y_supports_coop, caps);
-        // Single-row direct qgemv only needs subgroup collectives; multi-row
-        // direct qmatmul needs the cooperative-matrix path.
-        let use_workgroup_qmatmul =
-            (qmatmul_path_requires_coop(variant) && !qmatmul_coop_supported(caps)) || f16_storage;
+        // Single-row direct qgemv needs subgroup collectives; multi-row direct
+        // qmatmul also needs the cooperative-matrix path.
+        let use_workgroup_qmatmul = !qmatmul_direct_path_supported(variant, caps) || f16_storage;
         if has_custom_accumulator_offsets && use_workgroup_qmatmul {
             return None;
         }

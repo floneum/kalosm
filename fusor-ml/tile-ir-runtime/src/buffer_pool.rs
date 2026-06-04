@@ -190,10 +190,10 @@ impl BufferPool {
         if !usage.contains(BufferUsages::STORAGE) || !usage.contains(BufferUsages::COPY_DST) {
             return;
         }
-        if let Some(len) = NonZeroU64::new(buffer.size()) {
-            if let Some(mut write) = self.queue.write_buffer_with(buffer, 0, len) {
-                write.slice(..).fill(DIRTY_FILL_BYTE);
-            }
+        if let Some(len) = NonZeroU64::new(buffer.size())
+            && let Some(mut write) = self.queue.write_buffer_with(buffer, 0, len)
+        {
+            write.slice(..).fill(DIRTY_FILL_BYTE);
         }
     }
 

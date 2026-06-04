@@ -4,11 +4,12 @@ use crate::NoConstraints;
 use crate::ToChatMessage;
 use futures_channel::mpsc::UnboundedReceiver;
 use futures_channel::oneshot::Receiver;
+#[cfg(test)]
 use futures_util::Future;
 use futures_util::FutureExt;
 use futures_util::Stream;
 use futures_util::StreamExt;
-use kalosm_model_types::{WasmNotSend, WasmNotSendSync};
+use kalosm_model_types::{AnyWasmNotSend, FutureWasmNotSend, WasmNotSend, WasmNotSendSync};
 use std::any::Any;
 use std::fmt::Debug;
 use std::future::IntoFuture;
@@ -22,21 +23,13 @@ use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::task::Poll;
 
-// On wasm32, futures don't need to be Send, and Box<dyn Any> doesn't need Send
-#[cfg(not(target_arch = "wasm32"))]
-type BoxedTaskFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
-#[cfg(target_arch = "wasm32")]
-type BoxedTaskFuture = Pin<Box<dyn Future<Output = ()>>>;
+// On wasm32, futures don't need to be Send, and Box<dyn Any> doesn't need Send. The
+// `WasmNot*` marker traits encode that, so these aliases don't need to be cfg-split.
+type BoxedTaskFuture = Pin<Box<dyn FutureWasmNotSend<Output = ()>>>;
 
-#[cfg(not(target_arch = "wasm32"))]
-type BoxedAny = Box<dyn Any + Send>;
-#[cfg(target_arch = "wasm32")]
-type BoxedAny = Box<dyn Any>;
+type BoxedAny = Box<dyn AnyWasmNotSend>;
 
-#[cfg(not(target_arch = "wasm32"))]
-type BoxedIntoFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-#[cfg(target_arch = "wasm32")]
-type BoxedIntoFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+type BoxedIntoFuture<'a, T> = Pin<Box<dyn FutureWasmNotSend<Output = T> + 'a>>;
 
 use super::ChatMessage;
 use super::ChatModel;
@@ -157,11 +150,8 @@ impl<M: CreateChatSession> Chat<M> {
         Messages: IntoIterator<Item = Msg>,
         Msg: IntoChatMessage,
     {
-        self.queued_messages.extend(
-            messages
-                .into_iter()
-                .map(IntoChatMessage::into_chat_message),
-        );
+        self.queued_messages
+            .extend(messages.into_iter().map(IntoChatMessage::into_chat_message));
 
         self
     }
@@ -727,7 +717,7 @@ where
             match result {
                 Ok((session, boxed)) => {
                     self.chat_session.session = Some(Ok(session));
-                    Ok(*boxed.downcast::<String>().unwrap())
+                    Ok(*(boxed as Box<dyn Any>).downcast::<String>().unwrap())
                 }
                 Err(err) => Err(err),
             }
@@ -978,7 +968,9 @@ where
             match result {
                 Ok((session, boxed)) => {
                     self.chat_session.session = Some(Ok(session));
-                    Ok(*boxed.downcast::<Constraints::Output>().unwrap())
+                    Ok(*(boxed as Box<dyn Any>)
+                        .downcast::<Constraints::Output>()
+                        .unwrap())
                 }
                 Err(err) => Err(err),
             }

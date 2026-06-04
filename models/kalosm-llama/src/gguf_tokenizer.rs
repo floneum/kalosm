@@ -665,7 +665,13 @@ mod tests {
             let config = get_pre_tokenizer(label, None);
             let (vocab, types, bos, eos) = byte_vocab();
             let native = config
-                .build(vocab.clone(), types.clone(), Vec::new(), Some(bos.as_str()), &eos)
+                .build(
+                    vocab.clone(),
+                    types.clone(),
+                    Vec::new(),
+                    Some(bos.as_str()),
+                    &eos,
+                )
                 .unwrap();
             let legacy = legacy_tokenizer(&config, vocab, types, Vec::new(), &bos, &eos).unwrap();
 

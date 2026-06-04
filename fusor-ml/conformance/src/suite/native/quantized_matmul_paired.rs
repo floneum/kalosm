@@ -1,27 +1,26 @@
-mod common;
+//! Paired quantized matmul conformance cases.
 
-use common::quantized::{
+use crate::common::quantized::{
     concrete_to_rows, q_mat_mul_input_fuzz, q4k_raw_bytes, qmatrix_from_raw_bytes,
 };
-use common::{matmul2, transpose2};
+use crate::common::{matmul2, transpose2};
 use fusor::{BlockQ4K, Device, GgmlType, GgufBlock, QMatrix, QuantizedTensor, Tensor, ToVec2};
-use fusor_conformance::approx_compare;
+use fusor_conformance::{CaseResult, approx_compare, ensure, ensure_eq};
 use rand::distr::Uniform;
 use std::mem::size_of;
 
-#[tokio::test]
-async fn q4k_concat_split_gated_natural_form_matches_cpu_reference() {
+pub async fn q4k_concat_split_gated_natural_form_matches_cpu_reference() -> CaseResult {
     for kind in [GatedKind::SwiGLU, GatedKind::GeGLU, GatedKind::ReGLU] {
         for rows in [1, 4] {
-            gated_matches_cpu_for_rows(rows, kind).await;
+            gated_matches_cpu_for_rows(rows, kind).await?;
         }
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn q4k_dynamic_paired_helper_swiglu_matches_cpu_reference_for_decode_row() {
+pub async fn q4k_dynamic_paired_helper_swiglu_matches_cpu_reference_for_decode_row() -> CaseResult {
     let Ok(device) = Device::new().await else {
-        return;
+        return Ok(());
     };
     let weight_shape = [64, 512];
     let pair_len = weight_shape[0] / 2;
@@ -43,7 +42,7 @@ async fn q4k_dynamic_paired_helper_swiglu_matches_cpu_reference_for_decode_row()
         (Tensor::Gpu(input), QMatrix::Gpu(weights)) => {
             Tensor::<2, f32>::Gpu(input.q_mat_mul_paired_silu_product(weights)).to_concrete()
         }
-        _ => panic!("expected GPU tensors"),
+        _ => return Err("expected GPU tensors".to_string().into()),
     };
     let actual = actual_tensor.as_slice().await.unwrap();
     let projected = matmul2(&[input_data], &transpose2(&expected_weights));
@@ -55,23 +54,23 @@ async fn q4k_dynamic_paired_helper_swiglu_matches_cpu_reference_for_decode_row()
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(actual.shape(), &[1, pair_len]);
+    ensure_eq!(actual.shape(), &[1, pair_len]);
     for (col, expected) in expected.iter().copied().enumerate() {
         let actual = actual[[0, col]];
         let tolerance = 2.0f32.max(expected.abs() * 1.0e-4);
-        assert!(
+        ensure!(
             (actual - expected).abs() <= tolerance,
             "col={col} actual={actual} expected={expected} tolerance={tolerance}"
         );
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn q4k_concat_split_llama_shape_one_hot_matches_cpu_reference() {
+pub async fn q4k_concat_split_llama_shape_one_hot_matches_cpu_reference() -> CaseResult {
     use fusor::D;
 
     let Ok(device) = Device::new().await else {
-        return;
+        return Ok(());
     };
     let weight_shape = [14336usize, 4096usize];
     let pair_len = weight_shape[0] / 2;
@@ -104,7 +103,7 @@ async fn q4k_concat_split_llama_shape_one_hot_matches_cpu_reference() {
         .to_concrete();
     let actual = (gate.silu() * up).to_concrete().as_slice().await.unwrap();
 
-    assert_eq!(actual.shape(), &[input_rows, pair_len]);
+    ensure_eq!(actual.shape(), &[input_rows, pair_len]);
     for row in 0..input_rows {
         let input_value = input_data[row * weight_shape[1] + selected_k];
         for col in [0usize, 1, 63, 64, 511, 1024, 4095, pair_len - 1] {
@@ -113,20 +112,20 @@ async fn q4k_concat_split_llama_shape_one_hot_matches_cpu_reference() {
             let expected = (gate / (1.0 + (-gate).exp())) * up;
             let actual = actual[[row, col]];
             let tolerance = 2.0f32.max(expected.abs() * 1.0e-4);
-            assert!(
+            ensure!(
                 (actual - expected).abs() <= tolerance,
                 "row={row} col={col} actual={actual} expected={expected} tolerance={tolerance}"
             );
         }
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn q4k_concat_split_llama_shape_dense_sampled_columns_match_cpu_reference() {
+pub async fn q4k_concat_split_llama_shape_dense_sampled_columns_match_cpu_reference() -> CaseResult {
     use fusor::D;
 
     let Ok(device) = Device::new().await else {
-        return;
+        return Ok(());
     };
     let weight_shape = [14336usize, 4096usize];
     let pair_len = weight_shape[0] / 2;
@@ -155,7 +154,7 @@ async fn q4k_concat_split_llama_shape_dense_sampled_columns_match_cpu_reference(
         .to_concrete();
     let actual = (gate.silu() * up).to_concrete().as_slice().await.unwrap();
 
-    assert_eq!(actual.shape(), &[input_rows, pair_len]);
+    ensure_eq!(actual.shape(), &[input_rows, pair_len]);
     for row in [0usize, 1, 7, 17, 31, 47] {
         let input_row = &input_data[row * weight_shape[1]..(row + 1) * weight_shape[1]];
         for col in [0usize, 1, 63, 64, 511, 1024, 4095, pair_len - 1] {
@@ -180,12 +179,13 @@ async fn q4k_concat_split_llama_shape_dense_sampled_columns_match_cpu_reference(
             let expected = (gate / (1.0 + (-gate).exp())) * up;
             let actual = actual[[row, col]];
             let tolerance = 2.0f32.max(expected.abs() * 1.0e-4);
-            assert!(
+            ensure!(
                 (actual - expected).abs() <= tolerance,
                 "row={row} col={col} actual={actual} expected={expected} tolerance={tolerance}"
             );
         }
     }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -214,7 +214,7 @@ impl GatedKind {
     }
 }
 
-async fn gated_matches_cpu_for_rows(input_row_count: usize, kind: GatedKind) {
+async fn gated_matches_cpu_for_rows(input_row_count: usize, kind: GatedKind) -> CaseResult {
     use fusor::D;
     let ty = GgmlType::Q4K;
     let weight_shape = [4, 512];
@@ -267,14 +267,13 @@ async fn gated_matches_cpu_for_rows(input_row_count: usize, kind: GatedKind) {
     })
     .compare_with(approx_compare::<2, f32>(2.0))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
+    Ok(())
 }
 
 /// Authoring the natural source (`q_mat_mul → narrow → silu → mul(narrow)`)
 /// should produce results identical to the CPU reference.
-#[tokio::test]
-async fn q4k_concat_split_swiglu_matches_cpu_reference() {
+pub async fn q4k_concat_split_swiglu_matches_cpu_reference() -> CaseResult {
     use fusor::D;
     let ty = GgmlType::Q4K;
     let weight_shape = [4, 512];
@@ -318,6 +317,6 @@ async fn q4k_concat_split_swiglu_matches_cpu_reference() {
     })
     .compare_with(approx_compare::<2, f32>(2.0))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
+    Ok(())
 }

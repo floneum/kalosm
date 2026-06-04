@@ -1,8 +1,8 @@
-mod common;
+//! Elementwise op conformance cases.
 
-use common::{binary_map2, unary_map2, where_cond1, where_cond2};
+use crate::common::{binary_map2, unary_map2, where_cond1, where_cond2};
 use fusor::{Device, Tensor};
-use fusor_conformance::{FuzzGenerator, approx_compare, approx_or_relative_compare};
+use fusor_conformance::{CaseResult, FuzzGenerator, approx_compare, approx_or_relative_compare};
 use rand::distr::Uniform;
 
 const SHAPE: [usize; 2] = [45, 45];
@@ -78,8 +78,7 @@ macro_rules! fuzz_unary_compare {
             })
             .compare_with($compare)
             .runs(3)
-            .await
-            .unwrap();
+            .await?;
     };
 }
 
@@ -101,13 +100,12 @@ macro_rules! fuzz_broadcast_binary {
             .arg($gen_a.clone())
             .arg($gen_b.clone())
             .equal_to_resolved_with_device(async |a: Vec<Vec<f32>>, b: Vec<f32>, device: Device| {
-                let out = common::broadcast_binary_2d_1d(&a, &b, $ref_fn);
+                let out = crate::common::broadcast_binary_2d_1d(&a, &b, $ref_fn);
                 Tensor::new(&device, &out)
             })
             .compare_with(approx_compare::<2, f32>($tol))
             .runs(3)
-            .await
-            .unwrap();
+            .await?;
     };
 }
 
@@ -124,8 +122,7 @@ macro_rules! fuzz_same_shape_binary {
             )
             .compare_with(approx_compare::<2, f32>($tol))
             .runs(3)
-            .await
-            .unwrap();
+            .await?;
     };
 }
 
@@ -134,12 +131,14 @@ macro_rules! fuzz_scalar_compare {
         fusor_conformance::assert($op)
             .arg($fuzz.clone())
             .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-                Tensor::new(&device, &common::compare_scalar_map2(&v, 0.25, $ref_fn))
+                Tensor::new(
+                    &device,
+                    &crate::common::compare_scalar_map2(&v, 0.25, $ref_fn),
+                )
             })
             .compare_with(approx_compare::<2, f32>(0.0))
             .runs(3)
-            .await
-            .unwrap();
+            .await?;
     };
 }
 
@@ -150,14 +149,16 @@ macro_rules! fuzz_tensor_compare {
             .arg($gen_b.clone())
             .equal_to_resolved_with_device(
                 async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-                    Tensor::new(&device, &common::compare_tensor_map2(&a, &b, $ref_fn))
+                    Tensor::new(
+                        &device,
+                        &crate::common::compare_tensor_map2(&a, &b, $ref_fn),
+                    )
                 },
             )
             .compare_with(approx_compare::<2, f32>(0.0))
             .devices([Device::Cpu])
             .runs(3)
-            .await
-            .unwrap();
+            .await?;
     };
 }
 
@@ -177,13 +178,11 @@ macro_rules! fuzz_large_binary_1d {
             })
             .compare_with(approx_compare::<1, f32>(1e-6))
             .runs(3)
-            .await
-            .unwrap();
+            .await?;
     };
 }
 
-#[tokio::test]
-async fn unary_math_ops_match_host_reference() {
+pub async fn unary_math_ops_match_host_reference() -> CaseResult {
     // abs
     fuzz_unary!(
         _abs,
@@ -335,10 +334,10 @@ async fn unary_math_ops_match_host_reference() {
         |v: f32| v * v,
         1e-5
     );
+    Ok(())
 }
 
-#[tokio::test]
-async fn restricted_domain_unary_ops_match_host_reference() {
+pub async fn restricted_domain_unary_ops_match_host_reference() -> CaseResult {
     // sqrt
     fuzz_unary_native_math!(
         _sqrt,
@@ -415,6 +414,7 @@ async fn restricted_domain_unary_ops_match_host_reference() {
         1e-3,
         3e-4
     );
+    Ok(())
 }
 
 fn silu(v: f32) -> f32 {
@@ -425,8 +425,7 @@ fn gelu(v: f32) -> f32 {
     0.5 * v * (1.0 + ((2.0 / std::f32::consts::PI).sqrt() * (v + 0.044_715 * v.powi(3))).tanh())
 }
 
-#[tokio::test]
-async fn activation_and_scalar_ops_match_host_reference() {
+pub async fn activation_and_scalar_ops_match_host_reference() -> CaseResult {
     // relu
     fuzz_unary!(
         _relu,
@@ -514,10 +513,10 @@ async fn activation_and_scalar_ops_match_host_reference() {
         |v: f32| v.clamp(-0.75, 0.75),
         1e-6
     );
+    Ok(())
 }
 
-#[tokio::test]
-async fn binary_ops_match_host_reference() {
+pub async fn binary_ops_match_host_reference() -> CaseResult {
     let gen_a = positive();
     let gen_b_1d = FuzzGenerator::<1, f32>::new([SHAPE[1]])
         .with_seed(110)
@@ -574,12 +573,11 @@ async fn binary_ops_match_host_reference() {
         )
         .compare_with(approx_compare::<2, f32>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn comparison_and_conditionals_match_expected() {
+pub async fn comparison_and_conditionals_match_expected() -> CaseResult {
     let fuzz = signed();
 
     // eq_scalar
@@ -666,12 +664,11 @@ async fn comparison_and_conditionals_match_expected() {
     )
     .compare_with(approx_compare::<2, f32>(0.0))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn same_shape_binary_ops_match_host_reference() {
+pub async fn same_shape_binary_ops_match_host_reference() -> CaseResult {
     let gen_a = FuzzGenerator::<2, f32>::new(SHAPE)
         .with_seed(1)
         .with_distribution(Uniform::new(0.1, 3.0).unwrap());
@@ -714,10 +711,10 @@ async fn same_shape_binary_ops_match_host_reference() {
         |l, r| l / r,
         1e-5
     );
+    Ok(())
 }
 
-#[tokio::test]
-async fn large_tensor_binary_and_conditional_regressions() {
+pub async fn large_tensor_binary_and_conditional_regressions() -> CaseResult {
     const LARGE_SHAPE_1D: [usize; 1] = [2048];
 
     let gen_binary_a = FuzzGenerator::<1, f32>::new(LARGE_SHAPE_1D)
@@ -777,8 +774,7 @@ async fn large_tensor_binary_and_conditional_regressions() {
         .compare_with(approx_compare::<1, f32>(0.0))
         .devices([Device::Cpu])
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     let gen_cond = FuzzGenerator::<1, f32>::new(LARGE_SHAPE_1D)
         .with_seed(144)
@@ -802,12 +798,11 @@ async fn large_tensor_binary_and_conditional_regressions() {
     )
     .compare_with(approx_compare::<1, f32>(0.0))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn where_cond_fuzzed() {
+pub async fn where_cond_fuzzed() -> CaseResult {
     const SHAPE_1D: [usize; 1] = [2048];
     // Condition: values in -1..1 so we get a mix of positive and non-positive
     let gen_cond = FuzzGenerator::<1, f32>::new(SHAPE_1D)
@@ -837,12 +832,11 @@ async fn where_cond_fuzzed() {
     )
     .compare_with(approx_compare::<1, f32>(1e-6))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn large_tensor_unary_ops_fuzzed() {
+pub async fn large_tensor_unary_ops_fuzzed() -> CaseResult {
     const LARGE_SHAPE: [usize; 2] = [45, 45];
 
     // sin
@@ -853,8 +847,7 @@ async fn large_tensor_unary_ops_fuzzed() {
         })
         .compare_with(approx_compare::<2, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // cos
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.cos().to_concrete())
@@ -864,8 +857,7 @@ async fn large_tensor_unary_ops_fuzzed() {
         })
         .compare_with(approx_compare::<2, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // exp (bounded range to avoid overflow)
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.exp().to_concrete())
@@ -879,8 +871,7 @@ async fn large_tensor_unary_ops_fuzzed() {
         })
         .compare_with(approx_compare::<2, f32>(1e-3))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // sqrt (positive only)
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.sqrt().to_concrete())
@@ -894,8 +885,7 @@ async fn large_tensor_unary_ops_fuzzed() {
         })
         .compare_with(approx_compare::<2, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // neg
     fusor_conformance::assert(async |x: Tensor<2, f32>| (-x).to_concrete())
@@ -905,8 +895,7 @@ async fn large_tensor_unary_ops_fuzzed() {
         })
         .compare_with(approx_compare::<2, f32>(1e-6))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // abs
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.abs().to_concrete())
@@ -916,12 +905,11 @@ async fn large_tensor_unary_ops_fuzzed() {
         })
         .compare_with(approx_compare::<2, f32>(1e-6))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn tanh_exact_saturation_at_large_magnitudes() {
+pub async fn tanh_exact_saturation_at_large_magnitudes() -> CaseResult {
     // The default fuzz distribution rarely produces |x| > 4, but `tanh_exact`
     // must remain accurate when the input saturates the function. This pins
     // the saturation regression that the per-op test
@@ -947,8 +935,8 @@ async fn tanh_exact_saturation_at_large_magnitudes() {
             let actual = input.tanh_exact().to_concrete();
             let expected_tensor = Tensor::from_slice(&device, SHAPE, &expected);
             fusor_conformance::approx_eq(&actual, &expected_tensor, 2e-4)
-                .await
-                .unwrap();
+                .await?;
         }
     }
+    Ok(())
 }

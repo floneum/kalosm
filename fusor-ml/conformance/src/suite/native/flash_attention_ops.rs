@@ -1,5 +1,7 @@
+//! Flash attention conformance cases.
+
 use fusor::{Device, MaskKind, Tensor};
-use fusor_conformance::{ItemMismatchError, approx_eq, available_devices, f16_capable_devices};
+use fusor_conformance::{CaseResult, approx_eq, available_devices, ensure, f16_capable_devices};
 use half::f16;
 
 #[derive(Clone, Copy)]
@@ -44,7 +46,7 @@ async fn assert_flash_attention_case_f16(
     case: FlashCase,
     mask: Option<(Vec<f32>, MaskKind, [usize; 2])>,
     tol: f16,
-) {
+) -> CaseResult {
     let q_data: Vec<f16> = attention_data(
         case.batch * case.num_heads * case.q_seq_len * case.head_dim,
         0.1,
@@ -139,12 +141,12 @@ async fn assert_flash_attention_case_f16(
         } else {
             q.flash_attention(&k, &v, scale, None).to_concrete()
         };
-        approx_eq(&actual, &expected, tol).await.unwrap();
+        approx_eq(&actual, &expected, tol).await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn flash_attention_f16_matches_cpu_reference_on_varied_shapes() {
+pub async fn flash_attention_f16_matches_cpu_reference_on_varied_shapes() -> CaseResult {
     for case in [
         FlashCase {
             batch: 1,
@@ -171,12 +173,12 @@ async fn flash_attention_f16_matches_cpu_reference_on_varied_shapes() {
             head_dim: 128,
         },
     ] {
-        assert_flash_attention_case_f16(case, None, f16::from_f32(5e-3)).await;
+        assert_flash_attention_case_f16(case, None, f16::from_f32(5e-3)).await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn flash_attention_f16_with_qk_mask_matches_cpu_reference() {
+pub async fn flash_attention_f16_with_qk_mask_matches_cpu_reference() -> CaseResult {
     for case in [
         FlashCase {
             batch: 1,
@@ -205,15 +207,16 @@ async fn flash_attention_f16_with_qk_mask_matches_cpu_reference() {
             )),
             f16::from_f32(5e-3),
         )
-        .await;
+        .await?;
     }
+    Ok(())
 }
 
 async fn assert_flash_attention_case(
     case: FlashCase,
     mask: Option<(Vec<f32>, MaskKind, [usize; 2])>,
     tol: f32,
-) -> Result<(), ItemMismatchError> {
+) -> CaseResult {
     let q_data = attention_data(
         case.batch * case.num_heads * case.q_seq_len * case.head_dim,
         0.1,
@@ -310,8 +313,7 @@ async fn assert_flash_attention_case(
 ///
 /// Each shape is run multiple times because earlier decode failures were
 /// non-deterministic workgroup-memory races.
-#[tokio::test]
-async fn flash_attention_decode_tiled_matches_cpu_reference() {
+pub async fn flash_attention_decode_tiled_matches_cpu_reference() -> CaseResult {
     // (num_heads, num_kv_heads, kv_seq_len)
     // Shapes specifically chosen to stress decode block boundaries and the
     // tiled flash_decode_small_block path. head_dim=128 forces the decode-small
@@ -343,13 +345,14 @@ async fn flash_attention_decode_tiled_matches_cpu_reference() {
             let tol = if kv_seq_len > 1024 { 5e-3 } else { 1e-3 };
             assert_flash_attention_case(case, None, tol)
                 .await
-                .unwrap_or_else(|error| {
-                    panic!(
+                .map_err(|error| {
+                    format!(
                         "shape heads={num_heads} kv_heads={num_kv_heads} kv_seq={kv_seq_len} trial={trial}: {error:?}"
                     )
-                });
+                })?;
         }
     }
+    Ok(())
 }
 
 /// Same as the tiled test above, but builds Q with non-canonical strides
@@ -358,8 +361,7 @@ async fn flash_attention_decode_tiled_matches_cpu_reference() {
 /// via `index_n(meta.q_offset, meta.q_strides, ...)`, so different strides
 /// hit different memory addresses and exercise different control flow paths
 /// inside `flash_decode_small_block`.
-#[tokio::test]
-async fn flash_attention_decode_tiled_with_transposed_q_matches_cpu_reference() {
+pub async fn flash_attention_decode_tiled_with_transposed_q_matches_cpu_reference() -> CaseResult {
     let shapes = [(16, 2, 129), (16, 2, 257), (16, 2, 384), (16, 2, 569)];
 
     for (num_heads, num_kv_heads, kv_seq_len) in shapes {
@@ -417,14 +419,14 @@ async fn flash_attention_decode_tiled_with_transposed_q_matches_cpu_reference() 
             // Several trials to catch races.
             for _ in 0..4 {
                 let actual = q.flash_attention(&k, &v, scale, None).to_concrete();
-                approx_eq(&actual, &expected, 1e-3).await.unwrap();
+                approx_eq(&actual, &expected, 1e-3).await?;
             }
         }
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn flash_attention_subgroup_fallback_preserves_gpu_backend() {
+pub async fn flash_attention_subgroup_fallback_preserves_gpu_backend() -> CaseResult {
     let q_shape = [1, 1, 2, 4];
     let kv_shape = [1, 1, 3, 4];
     let q_data = attention_data(q_shape.iter().product(), 0.1);
@@ -444,15 +446,15 @@ async fn flash_attention_subgroup_fallback_preserves_gpu_backend() {
         let k = Tensor::from_slice(&device, kv_shape, &k_data);
         let v = Tensor::from_slice(&device, kv_shape, &v_data);
         let output = q.flash_attention(&k, &v, scale, None);
-        assert!(
+        ensure!(
             output.is_gpu(),
             "subgroup fallback should preserve the GPU backend"
         );
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn flash_attention_matches_cpu_reference_on_varied_shapes() {
+pub async fn flash_attention_matches_cpu_reference_on_varied_shapes() -> CaseResult {
     for case in [
         FlashCase {
             batch: 1,
@@ -487,12 +489,12 @@ async fn flash_attention_matches_cpu_reference_on_varied_shapes() {
             head_dim: 128,
         },
     ] {
-        assert_flash_attention_case(case, None, 1e-4).await.unwrap();
+        assert_flash_attention_case(case, None, 1e-4).await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn flash_attention_with_qk_mask_matches_cpu_reference_on_varied_shapes() {
+pub async fn flash_attention_with_qk_mask_matches_cpu_reference_on_varied_shapes() -> CaseResult {
     for case in [
         FlashCase {
             batch: 1,
@@ -529,13 +531,12 @@ async fn flash_attention_with_qk_mask_matches_cpu_reference_on_varied_shapes() {
             )),
             1e-4,
         )
-        .await
-        .unwrap();
+        .await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn flash_attention_gqa_matches_cpu_reference_on_varied_shapes() {
+pub async fn flash_attention_gqa_matches_cpu_reference_on_varied_shapes() -> CaseResult {
     for case in [
         FlashCase {
             batch: 1,
@@ -562,12 +563,12 @@ async fn flash_attention_gqa_matches_cpu_reference_on_varied_shapes() {
             head_dim: 4,
         },
     ] {
-        assert_flash_attention_case(case, None, 1e-4).await.unwrap();
+        assert_flash_attention_case(case, None, 1e-4).await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn flash_attention_with_kv_cache_matches_cpu_reference_on_varied_shapes() {
+pub async fn flash_attention_with_kv_cache_matches_cpu_reference_on_varied_shapes() -> CaseResult {
     // KV-cache regression: short Q sequence with a longer K/V sequence — the
     // typical autoregressive decode shape after appending to a KvCache.
     // Replaces the deleted `core/src/composite/flash_attention.rs::test_flash_attention_kv_cache_fuzz`.
@@ -618,13 +619,12 @@ async fn flash_attention_with_kv_cache_matches_cpu_reference_on_varied_shapes() 
         let mask = vec![0.0f32; case.q_seq_len * case.kv_seq_len];
         let shape = [case.q_seq_len, case.kv_seq_len];
         assert_flash_attention_case(case, Some((mask, MaskKind::QKMask, shape)), 1e-3)
-            .await
-            .unwrap();
+            .await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied_shapes() {
+pub async fn flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied_shapes() -> CaseResult {
     for case in [
         FlashCase {
             batch: 2,
@@ -661,9 +661,9 @@ async fn flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied_sha
             )),
             1e-4,
         )
-        .await
-        .unwrap();
+        .await?;
     }
+    Ok(())
 }
 
 /// Exercises the tiled (Q-batched) streaming flash attention kernel. The
@@ -672,8 +672,7 @@ async fn flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied_sha
 /// - exact Q-block alignment (q_seq_len = 64 = 8*8),
 /// - non-aligned tail (q_seq_len = 72, last block is partially valid),
 /// - non-aligned head_dim and odd kv_seq_len.
-#[tokio::test]
-async fn flash_attention_tiled_matches_cpu_reference_on_varied_shapes() {
+pub async fn flash_attention_tiled_matches_cpu_reference_on_varied_shapes() -> CaseResult {
     for case in [
         FlashCase {
             batch: 1,
@@ -708,14 +707,14 @@ async fn flash_attention_tiled_matches_cpu_reference_on_varied_shapes() {
             head_dim: 24,
         },
     ] {
-        assert_flash_attention_case(case, None, 1e-3).await.unwrap();
+        assert_flash_attention_case(case, None, 1e-3).await?;
     }
+    Ok(())
 }
 
 /// Same as above but with an additive QK mask, exercising the masked path
 /// through the tiled kernel.
-#[tokio::test]
-async fn flash_attention_tiled_with_mask_matches_cpu_reference() {
+pub async fn flash_attention_tiled_with_mask_matches_cpu_reference() -> CaseResult {
     for case in [
         FlashCase {
             batch: 1,
@@ -744,7 +743,7 @@ async fn flash_attention_tiled_with_mask_matches_cpu_reference() {
             )),
             1e-3,
         )
-        .await
-        .unwrap();
+        .await?;
     }
+    Ok(())
 }

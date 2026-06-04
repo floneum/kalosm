@@ -8,7 +8,7 @@ use super::{
     GpuMirostat2SamplerParams, GpuStandardSamplerParams,
     mirostat::sample_from_sorted_top_k_data_with_encoder, mirostat2_sample_token_to_host,
     standard_sampler::sample_from_sorted_top_k_data_with_encoder as sample_standard_from_sorted_top_k_data_with_encoder,
-    topk::chunk_top_k_pair_data_with_processors_with_encoder,
+    topk::{ProcessorSettings, chunk_top_k_pair_data_with_processors_with_encoder},
 };
 
 #[test]
@@ -84,8 +84,10 @@ fn processed_chunk_top_k_applies_temperature_and_repetition_penalty() {
         let (ids, logits) = chunk_top_k_pair_data_with_processors_with_encoder(
             &data,
             &previous_tokens,
-            0.5,
-            2.0,
+            ProcessorSettings {
+                temperature: 0.5,
+                repetition_penalty: 2.0,
+            },
             5,
             5,
             None,

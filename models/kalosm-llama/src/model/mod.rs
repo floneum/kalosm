@@ -178,6 +178,47 @@ impl LlamaGpuSamplerState {
         let len = tokens.len().min(self.config.repetition_penalty_range);
         tokens[tokens.len().saturating_sub(len)..].to_vec()
     }
+
+    fn previous_tokens_for_gpu_tail(&self, previous_tokens: Vec<u32>) -> (Vec<u32>, bool) {
+        trim_previous_tokens_for_gpu_tail(previous_tokens, self.config.repetition_penalty_range)
+    }
+}
+
+fn trim_previous_tokens_for_gpu_tail(
+    mut previous_tokens: Vec<u32>,
+    repetition_penalty_range: usize,
+) -> (Vec<u32>, bool) {
+    let host_len = repetition_penalty_range.saturating_sub(1);
+    if previous_tokens.len() > host_len {
+        let keep_from = previous_tokens.len() - host_len;
+        previous_tokens = previous_tokens.split_off(keep_from);
+    }
+    (previous_tokens, repetition_penalty_range > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim_previous_tokens_for_gpu_tail;
+
+    #[test]
+    fn gpu_tail_history_preserves_repetition_window() {
+        assert_eq!(
+            trim_previous_tokens_for_gpu_tail(vec![1, 2, 3, 4], 0),
+            (vec![], false)
+        );
+        assert_eq!(
+            trim_previous_tokens_for_gpu_tail(vec![1, 2, 3, 4], 1),
+            (vec![], true)
+        );
+        assert_eq!(
+            trim_previous_tokens_for_gpu_tail(vec![1, 2, 3, 4], 3),
+            (vec![3, 4], true)
+        );
+        assert_eq!(
+            trim_previous_tokens_for_gpu_tail(vec![1, 2], 5),
+            (vec![1, 2], true)
+        );
+    }
 }
 
 struct ForwardTrace {

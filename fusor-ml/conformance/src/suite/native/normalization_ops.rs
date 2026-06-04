@@ -1,8 +1,8 @@
-mod common;
+//! Normalization op conformance cases.
 
-use common::{layer_norm_last_dim_3d, rms_norm_last_dim_3d, softmax_last_dim_2d};
+use crate::common::{layer_norm_last_dim_3d, rms_norm_last_dim_3d, softmax_last_dim_2d};
 use fusor::{Device, Tensor};
-use fusor_conformance::{FuzzGenerator, approx_compare};
+use fusor_conformance::{CaseResult, FuzzGenerator, approx_compare};
 use rand::distr::Uniform;
 
 fn softmax_axis0_2d(input: &[Vec<f32>]) -> Vec<Vec<f32>> {
@@ -54,8 +54,7 @@ fn norm_bias(feature_count: usize) -> Vec<f32> {
         .collect()
 }
 
-#[tokio::test]
-async fn softmax_and_normalization_match_reference_paths() {
+pub async fn softmax_and_normalization_match_reference_paths() -> CaseResult {
     // Softmax with fuzzed input
     let gen_softmax = FuzzGenerator::<2, f32>::new([16..=45, 16..=45])
         .with_seed(400)
@@ -69,8 +68,7 @@ async fn softmax_and_normalization_match_reference_paths() {
         })
         .compare_with(approx_compare::<2, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // RMS norm with fuzzed input
     let gen_norm = FuzzGenerator::<3, f32>::new([2..=3, 16..=17, 255..=257])
@@ -96,8 +94,7 @@ async fn softmax_and_normalization_match_reference_paths() {
     })
     .compare_with(approx_compare::<3, f32>(1e-4))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
 
     // layer_norm vs host reference
     fusor_conformance::assert(async |x: Tensor<3, f32>| {
@@ -126,8 +123,7 @@ async fn softmax_and_normalization_match_reference_paths() {
     })
     .compare_with(approx_compare::<3, f32>(1e-4))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
 
     // rms_norm_fused (with bias) vs rms_norm + bias
     fusor_conformance::assert(async |x: Tensor<3, f32>| {
@@ -163,8 +159,7 @@ async fn softmax_and_normalization_match_reference_paths() {
     })
     .compare_with(approx_compare::<3, f32>(1e-4))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
 
     // rms_norm_residual_fused vs host reference on input + residual
     let gen_residual = FuzzGenerator::<3, f32>::new([2..=3, 16..=17, 255..=257])
@@ -223,8 +218,7 @@ async fn softmax_and_normalization_match_reference_paths() {
     )
     .compare_with(approx_compare::<3, f32>(1e-4))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
 
     // rms_norm_fused_no_bias vs rms_norm reference
     fusor_conformance::assert(async |x: Tensor<3, f32>| {
@@ -242,12 +236,11 @@ async fn softmax_and_normalization_match_reference_paths() {
     })
     .compare_with(approx_compare::<3, f32>(1e-4))
     .runs(3)
-    .await
-    .unwrap();
+    .await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn softmax_slow_variants_match_reference() {
+pub async fn softmax_slow_variants_match_reference() -> CaseResult {
     let gen_2d = FuzzGenerator::<2, f32>::new([16..=45, 16..=45])
         .with_seed(420)
         .with_distribution(Uniform::new(-4.0, 4.0).unwrap());
@@ -260,8 +253,7 @@ async fn softmax_slow_variants_match_reference() {
         })
         .compare_with(approx_compare::<2, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // softmax_slow_last_dim vs host reference
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow_last_dim::<1>())
@@ -271,8 +263,7 @@ async fn softmax_slow_variants_match_reference() {
         })
         .compare_with(approx_compare::<2, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
 
     // softmax_slow on axis 0 (column-wise) — non-last-dim path
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow::<1>(0))
@@ -282,12 +273,11 @@ async fn softmax_slow_variants_match_reference() {
         })
         .compare_with(approx_compare::<2, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn softmax_middle_axis_rank3_matches_reference() {
+pub async fn softmax_middle_axis_rank3_matches_reference() -> CaseResult {
     // Softmax on the middle dimension of a rank-3 tensor. Existing tests cover
     // only the last-dim path; this exercises the generic-axis softmax kernel.
     let gen_mid = FuzzGenerator::<3, f32>::new([2..=3, 16..=24, 16..=24])
@@ -301,12 +291,11 @@ async fn softmax_middle_axis_rank3_matches_reference() {
         })
         .compare_with(approx_compare::<3, f32>(1e-5))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn softmax_direct_boundary_lengths_match_reference() {
+pub async fn softmax_direct_boundary_lengths_match_reference() -> CaseResult {
     let cases = [
         [3usize, 1usize],
         [2, 127],
@@ -325,15 +314,15 @@ async fn softmax_direct_boundary_lengths_match_reference() {
                 .map(|i| ((i % 37) as f32 - 18.0) * 0.17)
                 .collect::<Vec<_>>();
             let input = Tensor::from_slice(&device, [rows, cols], &values);
-            let expected_rows = common::reshape2(&values, [rows, cols]);
+            let expected_rows = crate::common::reshape2(&values, [rows, cols]);
             let expected = Tensor::new(&device, &softmax_last_dim_2d(&expected_rows));
-            common::assert_approx_tensors(input.softmax::<1>(1), expected, 1e-5).await;
+            crate::common::assert_approx_tensors(input.softmax::<1>(1), expected, 1e-5).await?;
         }
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn softmax_direct_transposed_and_middle_axis_match_reference() {
+pub async fn softmax_direct_transposed_and_middle_axis_match_reference() -> CaseResult {
     for device in fusor_conformance::available_devices().await {
         let rows = 9usize;
         let cols = 257usize;
@@ -342,17 +331,19 @@ async fn softmax_direct_transposed_and_middle_axis_match_reference() {
             .collect::<Vec<_>>();
         let base = Tensor::from_slice(&device, [rows, cols], &values);
         let input = base.transpose(0, 1);
-        let expected_input = common::transpose2(&common::reshape2(&values, [rows, cols]));
+        let expected_input =
+            crate::common::transpose2(&crate::common::reshape2(&values, [rows, cols]));
         let expected = Tensor::new(&device, &softmax_last_dim_2d(&expected_input));
-        common::assert_approx_tensors(input.softmax::<1>(1), expected, 1e-5).await;
+        crate::common::assert_approx_tensors(input.softmax::<1>(1), expected, 1e-5).await?;
 
         let shape = [2usize, 513usize, 3usize];
         let values = (0..shape.iter().product::<usize>())
             .map(|i| ((i % 41) as f32 - 20.0) * 0.13)
             .collect::<Vec<_>>();
         let input = Tensor::from_slice(&device, shape, &values);
-        let expected_input = common::reshape3(&values, shape);
+        let expected_input = crate::common::reshape3(&values, shape);
         let expected = Tensor::new(&device, &softmax_middle_axis_3d(&expected_input));
-        common::assert_approx_tensors(input.softmax::<2>(1), expected, 1e-5).await;
+        crate::common::assert_approx_tensors(input.softmax::<2>(1), expected, 1e-5).await?;
     }
+    Ok(())
 }

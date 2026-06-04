@@ -95,7 +95,7 @@ pub async fn assert_dequantize_matches_host_reference(
     raw_bytes: Vec<u8>,
     dequantized: Vec<Vec<f32>>,
     dequantize_tol: f32,
-) {
+) -> fusor_conformance::CaseResult {
     fusor_conformance::assert(move |device: Device| {
         let raw_bytes = raw_bytes.clone();
         async move { qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, ty).dequantize::<2>() }
@@ -107,7 +107,7 @@ pub async fn assert_dequantize_matches_host_reference(
     })
     .compare_with(approx_compare::<2, f32>(dequantize_tol))
     .await
-    .unwrap();
+    .map_err(Into::into)
 }
 
 /// Fuzz configuration for input rows in `assert_q_mat_mul_matches_host_reference`.
@@ -119,7 +119,7 @@ pub struct QMatMulFuzz {
 pub async fn assert_q_mat_mul_matches_host_reference(
     fixture: &QuantizedFixture,
     fuzz: QMatMulFuzz,
-) {
+) -> fusor_conformance::CaseResult {
     use fusor::ToVec2;
 
     let ty = fixture.ty;
@@ -157,7 +157,7 @@ pub async fn assert_q_mat_mul_matches_host_reference(
     .compare_with(approx_compare::<2, f32>(q_mat_mul_tol))
     .runs(3)
     .await
-    .unwrap();
+    .map_err(Into::into)
 }
 
 pub fn deterministic_input(shape: &[usize], seed: u32) -> Vec<f32> {

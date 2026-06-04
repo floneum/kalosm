@@ -1,8 +1,8 @@
-mod common;
+//! RoPE op conformance cases.
 
-use common::{reshape4, rope_interleaved_4d, rope_normal_4d};
+use crate::common::{reshape4, rope_interleaved_4d, rope_normal_4d};
 use fusor::{Device, RopeCache, Tensor, ToVec1, base_inverse_frequency};
-use fusor_conformance::{FuzzGenerator, GenerateFromDevice, approx_compare, available_devices};
+use fusor_conformance::{CaseResult, FuzzGenerator, GenerateFromDevice, approx_compare, available_devices, ensure_eq};
 use rand::distr::Uniform;
 
 fn rope_tables(
@@ -168,8 +168,7 @@ macro_rules! assert_rope_matches_reference {
         })
         .compare_with(approx_compare::<4, f32>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
     };
 }
 
@@ -196,8 +195,7 @@ macro_rules! assert_rope_ops_match {
         })
         .compare_with(approx_compare::<4, f32>(1e-4))
         .runs(3)
-        .await
-        .unwrap();
+        .await?;
     };
 }
 
@@ -217,21 +215,19 @@ macro_rules! assert_cache_path_matches_direct_rope {
             let expected =
                 cache_expected_output(q, k, $cos.clone(), $sin.clone(), $output, $expected);
             fusor_conformance::approx_eq(&actual, &expected, 1e-4)
-                .await
-                .unwrap();
+                .await?;
         }
     };
 }
 
-#[tokio::test]
-async fn rope_and_cache_paths_match_reference_variants() {
+pub async fn rope_and_cache_paths_match_reference_variants() -> CaseResult {
     let expected = vec![
         1.0,
         1.0 / 10_000.0f32.powf(2.0 / 8.0),
         1.0 / 10_000.0f32.powf(4.0 / 8.0),
         1.0 / 10_000.0f32.powf(6.0 / 8.0),
     ];
-    assert_eq!(base_inverse_frequency(8, 10_000.0), expected);
+    ensure_eq!(base_inverse_frequency(8, 10_000.0), expected);
 
     let cos = cos_vec();
     let sin = sin_vec();
@@ -365,8 +361,7 @@ async fn rope_and_cache_paths_match_reference_variants() {
         }
     })
     .compare_with(approx_compare::<2, f32>(1e-6))
-    .await
-    .unwrap();
+    .await?;
 
     fusor_conformance::assert(async |device: Device| {
         RopeCache::new(4, 3, 10_000.0, &device)
@@ -383,6 +378,7 @@ async fn rope_and_cache_paths_match_reference_variants() {
         }
     })
     .compare_with(approx_compare::<2, f32>(1e-6))
-    .await
-    .unwrap();
+    .await?;
+
+    Ok(())
 }

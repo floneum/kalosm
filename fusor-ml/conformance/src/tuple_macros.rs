@@ -1,26 +1,13 @@
 use std::pin::Pin;
 
-use fusor::{DataType, Device, SimdElement, Tensor};
+use fusor::{DataType, Device, SimdElement, Tensor, WasmNotSend};
 
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
-
-#[cfg(target_arch = "wasm32")]
-pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
-
-#[cfg(not(target_arch = "wasm32"))]
+/// A future that is `Send` on non-wasm32 targets, but is not required to be on wasm32.
 #[doc(hidden)]
-pub trait MaybeSend: Send {}
+pub trait FutureWasmNotSend: std::future::Future + WasmNotSend {}
+impl<T: std::future::Future + WasmNotSend> FutureWasmNotSend for T {}
 
-#[cfg(not(target_arch = "wasm32"))]
-impl<T: Send> MaybeSend for T {}
-
-#[cfg(target_arch = "wasm32")]
-#[doc(hidden)]
-pub trait MaybeSend {}
-
-#[cfg(target_arch = "wasm32")]
-impl<T> MaybeSend for T {}
+pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn FutureWasmNotSend<Output = T> + 'a>>;
 
 #[doc(hidden)]
 pub trait AsyncFnMutTuple<Args> {
@@ -31,24 +18,10 @@ pub trait AsyncFnMutTuple<Args> {
 
 macro_rules! impl_fn_mut_tuple {
     ($($type:ident),*) => {
-        #[cfg(not(target_arch = "wasm32"))]
         impl<Fn, U, Fut, $($type),*> AsyncFnMutTuple<($($type,)*)> for Fn
         where
             Fn: FnMut($($type,)*) -> Fut,
-            Fut: std::future::Future<Output = U> + Send + 'static,
-        {
-            type Output = U;
-            #[allow(non_snake_case)]
-            fn call_mut<'a>(&'a mut self, ($($type,)*): ($($type,)*)) -> BoxFuture<'a, Self::Output> {
-                Box::pin((self)($($type,)*))
-            }
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        impl<Fn, U, Fut, $($type),*> AsyncFnMutTuple<($($type,)*)> for Fn
-        where
-            Fn: FnMut($($type,)*) -> Fut,
-            Fut: std::future::Future<Output = U> + 'static,
+            Fut: std::future::Future<Output = U> + WasmNotSend + 'static,
         {
             type Output = U;
             #[allow(non_snake_case)]

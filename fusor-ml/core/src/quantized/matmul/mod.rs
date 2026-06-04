@@ -156,6 +156,10 @@ fn qmatmul_path_requires_coop(path: QMatmulPath) -> bool {
     !matches!(path, QMatmulPath::SingleRow | QMatmulPath::Q5SmallSingleRow)
 }
 
+fn qmatmul_direct_path_supported(path: QMatmulPath, caps: KernelDeviceCaps) -> bool {
+    caps.subgroups_supported && (!qmatmul_path_requires_coop(path) || qmatmul_coop_supported(caps))
+}
+
 fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> {
     /// Helper to build a `Tile` variant with a given tile + cached flag.
     const fn tile(bm: u32, bn: u32, cached: bool) -> QMatmulPath {
@@ -458,6 +462,15 @@ fn qmatmul_post_expr_is_column_add(expr: &ElementwiseEpilogue) -> bool {
     };
     (is_input(&children[0], 0) && is_input(&children[1], 1))
         || (is_input(&children[0], 1) && is_input(&children[1], 0))
+}
+
+fn qmatmul_custom_accumulator_offsets_cover_output(
+    m: u32,
+    n: u32,
+    matrix_n: u32,
+    max_accumulator_offset: u32,
+) -> bool {
+    m == 1 && n.checked_add(max_accumulator_offset) == Some(matrix_n)
 }
 
 fn qmatmul_variant_supports_coop_acc_init(

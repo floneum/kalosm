@@ -17,7 +17,7 @@ use super::{
     },
     standard_sampler::sample_from_sorted_top_k_data_with_encoder as sample_standard_from_sorted_top_k_data_with_encoder,
     topk::{
-        chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder,
+        ProcessorSettings, chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder,
         chunk_top_k_pair_data_with_processors_with_encoder,
         merge_sorted_chunk_top_k_pair_data_with_encoder, top_k_exactness_flag_data_with_encoder,
     },
@@ -635,8 +635,10 @@ fn build_sample_attempt(
         PreviousTokenSource::HostOnly => chunk_top_k_pair_data_with_processors_with_encoder(
             input,
             previous_tokens,
-            params.temperature,
-            params.repetition_penalty,
+            ProcessorSettings {
+                temperature: params.temperature,
+                repetition_penalty: params.repetition_penalty,
+            },
             config.candidate_count,
             output_per_chunk,
             Some(&mut encoder),
@@ -646,8 +648,10 @@ fn build_sample_attempt(
                 input,
                 previous_tokens,
                 previous_gpu_token,
-                params.temperature,
-                params.repetition_penalty,
+                ProcessorSettings {
+                    temperature: params.temperature,
+                    repetition_penalty: params.repetition_penalty,
+                },
                 config.candidate_count,
                 output_per_chunk,
                 Some(&mut encoder),
@@ -736,8 +740,10 @@ fn build_standard_sample_attempt(
         PreviousTokenSource::HostOnly => chunk_top_k_pair_data_with_processors_with_encoder(
             input,
             previous_tokens,
-            params.temperature,
-            params.repetition_penalty,
+            ProcessorSettings {
+                temperature: params.temperature,
+                repetition_penalty: params.repetition_penalty,
+            },
             config.candidate_count,
             output_per_chunk,
             Some(&mut encoder),
@@ -747,8 +753,10 @@ fn build_standard_sample_attempt(
                 input,
                 previous_tokens,
                 previous_gpu_token,
-                params.temperature,
-                params.repetition_penalty,
+                ProcessorSettings {
+                    temperature: params.temperature,
+                    repetition_penalty: params.repetition_penalty,
+                },
                 config.candidate_count,
                 output_per_chunk,
                 Some(&mut encoder),

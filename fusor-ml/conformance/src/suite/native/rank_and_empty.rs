@@ -1,10 +1,7 @@
-//! Conformance for ranks above 3 and shapes containing zero-sized dimensions.
-//! Existing conformance stops at rank 3, but reductions, softmax, and rms_norm
-//! are rank-generic and need direct coverage. Empty-tensor cases cover
-//! elementwise ops and axis reductions when one or more dims is zero.
+//! Rank/empty-tensor conformance cases.
 
 use fusor::Tensor;
-use fusor_conformance::{approx_eq, approx_or_relative_eq, available_devices, exact_eq};
+use fusor_conformance::{CaseResult, approx_eq, approx_or_relative_eq, available_devices, ensure_eq, exact_eq};
 
 fn deterministic_data(total: usize, seed: u32) -> Vec<f32> {
     (0..total)
@@ -104,8 +101,7 @@ fn rms_norm_fused_4d(input: &[f32], shape: [usize; 4], weight: &[f32], eps: f32)
     out
 }
 
-#[tokio::test]
-async fn rank4_sum_per_axis_matches_reference() {
+pub async fn rank4_sum_per_axis_matches_reference() -> CaseResult {
     const SHAPE: [usize; 4] = [2, 3, 4, 5];
     let data = deterministic_data(SHAPE.iter().product(), 600);
 
@@ -121,13 +117,13 @@ async fn rank4_sum_per_axis_matches_reference() {
             };
             let actual = actual.to_concrete();
             let expected: Tensor<3, f32> = Tensor::from_slice(&device, out_shape, &expected_flat);
-            approx_eq(&actual, &expected, 1e-4).await.unwrap();
+            approx_eq(&actual, &expected, 1e-4).await?;
         }
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn rank4_mean_axis0_matches_reference() {
+pub async fn rank4_mean_axis0_matches_reference() -> CaseResult {
     const SHAPE: [usize; 4] = [3, 2, 4, 5];
     let data = deterministic_data(SHAPE.iter().product(), 601);
     let (sum_flat, out_shape) = sum_axis_4d(&data, SHAPE, 0);
@@ -138,12 +134,12 @@ async fn rank4_mean_axis0_matches_reference() {
         let input: Tensor<4, f32> = Tensor::from_slice(&device, SHAPE, &data);
         let actual = input.mean::<3>(0).to_concrete();
         let expected: Tensor<3, f32> = Tensor::from_slice(&device, out_shape, &expected_flat);
-        approx_eq(&actual, &expected, 1e-4).await.unwrap();
+        approx_eq(&actual, &expected, 1e-4).await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn rank4_softmax_last_dim_matches_reference() {
+pub async fn rank4_softmax_last_dim_matches_reference() -> CaseResult {
     const SHAPE: [usize; 4] = [2, 2, 3, 8];
     let data = deterministic_data(SHAPE.iter().product(), 602);
     let expected_flat = softmax_last_dim_4d(&data, SHAPE);
@@ -152,12 +148,12 @@ async fn rank4_softmax_last_dim_matches_reference() {
         let input: Tensor<4, f32> = Tensor::from_slice(&device, SHAPE, &data);
         let actual = input.softmax_last_dim::<3>().to_concrete();
         let expected: Tensor<4, f32> = Tensor::from_slice(&device, SHAPE, &expected_flat);
-        approx_eq(&actual, &expected, 1e-5).await.unwrap();
+        approx_eq(&actual, &expected, 1e-5).await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn rank4_rms_norm_fused_matches_reference() {
+pub async fn rank4_rms_norm_fused_matches_reference() -> CaseResult {
     const SHAPE: [usize; 4] = [2, 2, 3, 16];
     let data = deterministic_data(SHAPE.iter().product(), 603);
     let weight: Vec<f32> = (0..SHAPE[3]).map(|i| 1.0 + (i % 5) as f32 * 0.25).collect();
@@ -169,39 +165,38 @@ async fn rank4_rms_norm_fused_matches_reference() {
         let actual = input.rms_norm_fused::<1, 3>(&w, None, 1e-5).to_concrete();
         let expected: Tensor<4, f32> = Tensor::from_slice(&device, SHAPE, &expected_flat);
         approx_or_relative_eq(&actual, &expected, 1e-4, 1e-4)
-            .await
-            .unwrap();
+            .await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn empty_tensor_elementwise_add_returns_empty() {
+pub async fn empty_tensor_elementwise_add_returns_empty() -> CaseResult {
     // 0-sized leading dim — elementwise op must be well-defined on empty inputs.
     for device in available_devices().await {
         let a: Tensor<2, f32> = Tensor::zeros(&device, [0, 6]);
         let b: Tensor<2, f32> = Tensor::zeros(&device, [0, 6]);
         let out = a.add_::<2, 2, _>(&b).to_concrete();
-        assert_eq!(out.shape(), [0, 6]);
+        ensure_eq!(out.shape(), [0, 6]);
         let expected: Tensor<2, f32> = Tensor::zeros(&device, [0, 6]);
-        exact_eq(&out, &expected).await.unwrap();
+        exact_eq(&out, &expected).await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn empty_tensor_sum_along_zero_axis_returns_identity() {
+pub async fn empty_tensor_sum_along_zero_axis_returns_identity() -> CaseResult {
     // Reducing over a 0-sized axis: sum-identity is 0, so each output element
     // must be exactly 0 on both backends.
     for device in available_devices().await {
         let input: Tensor<2, f32> = Tensor::zeros(&device, [0, 4]);
         let out = input.sum::<1>(0).to_concrete();
-        assert_eq!(out.shape(), [4]);
+        ensure_eq!(out.shape(), [4]);
         let expected: Tensor<1, f32> = Tensor::zeros(&device, [4]);
-        exact_eq(&out, &expected).await.unwrap();
+        exact_eq(&out, &expected).await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn rank4_max_min_match_reference() {
+pub async fn rank4_max_min_match_reference() -> CaseResult {
     const SHAPE: [usize; 4] = [2, 3, 2, 4];
     let data = deterministic_data(SHAPE.iter().product(), 604);
     // Reduce along last axis; compute reference via flat indexing.
@@ -226,10 +221,11 @@ async fn rank4_max_min_match_reference() {
         let input: Tensor<4, f32> = Tensor::from_slice(&device, SHAPE, &data);
         let max_actual = input.max::<3>(3).to_concrete();
         let max_expected: Tensor<3, f32> = Tensor::from_slice(&device, out_shape, &max_ref);
-        approx_eq(&max_actual, &max_expected, 1e-6).await.unwrap();
+        approx_eq(&max_actual, &max_expected, 1e-6).await?;
 
         let min_actual = input.min::<3>(3).to_concrete();
         let min_expected: Tensor<3, f32> = Tensor::from_slice(&device, out_shape, &min_ref);
-        approx_eq(&min_actual, &min_expected, 1e-6).await.unwrap();
+        approx_eq(&min_actual, &min_expected, 1e-6).await?;
     }
+    Ok(())
 }

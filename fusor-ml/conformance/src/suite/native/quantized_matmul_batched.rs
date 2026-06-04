@@ -1,14 +1,14 @@
-mod common;
+//! Batched quantized matmul conformance cases.
 
-use common::quantized::{
+use crate::common::quantized::{
     deterministic_input, q4k_raw_bytes, q8_0_raw_bytes, qmatrix_from_raw_bytes,
 };
-use common::{matmul2, transpose2};
+use crate::common::{matmul2, transpose2};
 use fusor::{BlockQ4K, Device, GgmlType, GgufBlock, Tensor, ToVec2};
-use fusor_conformance::available_devices;
+use fusor_conformance::{CaseResult, available_devices, ensure, ensure_eq};
 use std::mem::size_of;
 
-async fn assert_q_mat_mul_3d_batch(input_rows: usize) {
+async fn assert_q_mat_mul_3d_batch(input_rows: usize) -> CaseResult {
     use fusor::Device;
 
     let weight_shape = [2usize, 64];
@@ -43,28 +43,26 @@ async fn assert_q_mat_mul_3d_batch(input_rows: usize) {
         }
         let expected = Tensor::new(&Device::Cpu, &expected_rows);
         fusor_conformance::approx_eq(&cpu_result, &expected, 5e-2)
-            .await
-            .unwrap();
+            .await?;
 
         for device in available_devices().await {
             let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
             let input: Tensor<3, f32> = Tensor::from_slice(&device, shape, &data);
             let actual = input.q_mat_mul(&weights).to_concrete();
             fusor_conformance::approx_eq(&actual, &cpu_result, 5e-2)
-                .await
-                .unwrap();
+                .await?;
         }
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn q_mat_mul_batched_3d_matches_host_reference() {
-    assert_q_mat_mul_3d_batch(1).await;
-    assert_q_mat_mul_3d_batch(3).await;
+pub async fn q_mat_mul_batched_3d_matches_host_reference() -> CaseResult {
+    assert_q_mat_mul_3d_batch(1).await?;
+    assert_q_mat_mul_3d_batch(3).await?;
+    Ok(())
 }
 
-#[tokio::test]
-async fn q_mat_mul_transposed_input_matches_host_reference() {
+pub async fn q_mat_mul_transposed_input_matches_host_reference() -> CaseResult {
     use fusor::Device;
 
     // Build [N, M, B] and transpose(0, 2) -> [B, M, N], matching the deleted
@@ -108,22 +106,20 @@ async fn q_mat_mul_transposed_input_matches_host_reference() {
         }
         let expected = Tensor::new(&Device::Cpu, &expected_rows);
         fusor_conformance::approx_eq(&cpu_result, &expected, 5e-2)
-            .await
-            .unwrap();
+            .await?;
 
         for device in available_devices().await {
             let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
             let input: Tensor<3, f32> = Tensor::from_slice(&device, shape, &data);
             let actual = input.transpose(0, 2).q_mat_mul(&weights).to_concrete();
             fusor_conformance::approx_eq(&actual, &cpu_result, 5e-2)
-                .await
-                .unwrap();
+                .await?;
         }
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn q_mat_mul_consumes_transpose_reshape_copy_matches_cpu_reference() {
+pub async fn q_mat_mul_consumes_transpose_reshape_copy_matches_cpu_reference() -> CaseResult {
     let weight_shape = [4usize, 4096usize];
     let raw_bytes = q8_0_raw_bytes(weight_shape);
     let input_shape = [1usize, 32usize, 2usize, 128usize];
@@ -145,25 +141,24 @@ async fn q_mat_mul_consumes_transpose_reshape_copy_matches_cpu_reference() {
         let reshaped = transposed.reshape([1, 2, 32 * 128]);
         let actual = reshaped.q_mat_mul(&weights).to_concrete();
         fusor_conformance::approx_eq(&actual, &cpu_result, 5e-2)
-            .await
-            .unwrap();
+            .await?;
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn q4k_llama_decode_transpose_reshape_qmatmul_matches_one_hot_reference() {
+pub async fn q4k_llama_decode_transpose_reshape_qmatmul_matches_one_hot_reference() -> CaseResult {
     let Some(device) = available_devices()
         .await
         .into_iter()
         .find(|device| device.as_gpu().is_some())
     else {
-        return;
+        return Ok(());
     };
     let Some(gpu_device) = device.as_gpu() else {
-        return;
+        return Ok(());
     };
     if !gpu_device.subgroups_supported() {
-        return;
+        return Ok(());
     }
 
     for (weight_shape, sample_cols) in [
@@ -176,18 +171,19 @@ async fn q4k_llama_decode_transpose_reshape_qmatmul_matches_one_hot_reference() 
             &[0usize, 1, 63, 64, 511, 1024, 4095, 8191, 14335][..],
         ),
     ] {
-        assert_q4k_llama_decode_transpose_reshape_shape(&device, weight_shape, sample_cols).await;
+        assert_q4k_llama_decode_transpose_reshape_shape(&device, weight_shape, sample_cols).await?;
     }
+    Ok(())
 }
 
 async fn assert_q4k_llama_decode_transpose_reshape_shape(
     device: &Device,
     weight_shape: [usize; 2],
     sample_cols: &[usize],
-) {
+) -> CaseResult {
     let [output_cols, hidden] = weight_shape;
     let input_shape = [1usize, 32usize, 48usize, 128usize];
-    assert_eq!(hidden, input_shape[1] * input_shape[3]);
+    ensure_eq!(hidden, input_shape[1] * input_shape[3]);
     let selected_k = 777usize;
     let selected_head = selected_k / input_shape[3];
     let selected_dim = selected_k % input_shape[3];
@@ -215,28 +211,28 @@ async fn assert_q4k_llama_decode_transpose_reshape_shape(
         .await
         .unwrap();
 
-    assert_eq!(actual.shape(), &[1, input_shape[2], output_cols]);
+    ensure_eq!(actual.shape(), &[1, input_shape[2], output_cols]);
     for row in [0usize, 1, 7, 17, 31, 47] {
         for &col in sample_cols {
             let block_index = col * blocks_per_row + selected_block_in_row;
             let offset = block_index * size_of::<BlockQ4K>();
-            assert!(offset + size_of::<BlockQ4K>() <= raw_bytes.len());
+            ensure!(offset + size_of::<BlockQ4K>() <= raw_bytes.len());
             let block = unsafe {
                 std::ptr::read_unaligned(raw_bytes.as_ptr().add(offset).cast::<BlockQ4K>())
             };
             let expected = row_values[row] * block.dequantize().as_ref()[selected_offset];
             let actual = actual[[0, row, col]];
             let tolerance = 1e-2_f32.max(expected.abs() * 1.0e-4);
-            assert!(
+            ensure!(
                 (actual - expected).abs() <= tolerance,
                 "shape={weight_shape:?} row={row} col={col} actual={actual} expected={expected} tolerance={tolerance}"
             );
         }
     }
+    Ok(())
 }
 
-#[tokio::test]
-async fn q_mat_mul_batched_matches_unbatched_property() {
+pub async fn q_mat_mul_batched_matches_unbatched_property() -> CaseResult {
     // Batched 3D q_mat_mul produces the same per-batch slice as 2D q_mat_mul
     // applied independently. Replaces
     // `cpu/src/quantized.rs::test_batched_q_mat_mul_matches_unbatched`.
@@ -267,8 +263,8 @@ async fn q_mat_mul_batched_matches_unbatched_property() {
                 .reshape([input_rows, weight_shape[0]])
                 .to_concrete();
             fusor_conformance::approx_eq(&batched_slice, &unbatched_result, 1e-4)
-                .await
-                .unwrap();
+                .await?;
         }
     }
+    Ok(())
 }

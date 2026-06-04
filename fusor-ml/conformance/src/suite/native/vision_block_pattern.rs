@@ -1,3 +1,5 @@
+//! Vision block pattern conformance cases.
+//!
 //! Regression test for the qwen-vision multi-block resolve pattern.
 //!
 //! Each "block" mimics the shape of `VisionBlock::forward`: narrow a fused QKV
@@ -113,8 +115,7 @@ async fn run_blocks(device: &fusor::Device, flush_every: Option<usize>) -> Vec<f
     result_data.as_slice().to_vec()
 }
 
-#[tokio::test]
-async fn vision_block_pattern_resolves_without_periodic_flush() {
+pub async fn vision_block_pattern_resolves_without_periodic_flush() {
     for device in available_devices().await {
         let _ = run_blocks(&device, None).await;
     }
@@ -124,8 +125,7 @@ async fn vision_block_pattern_resolves_without_periodic_flush() {
 /// vs. with the old qwen.rs `FLUSH_EVERY = 4` workaround. Doesn't assert a
 /// ratio (CI noise) — just prints both numbers so a human can sanity-check
 /// that dropping the flush isn't a regression.
-#[tokio::test]
-async fn vision_block_pattern_flush_vs_no_flush_timing() {
+pub async fn vision_block_pattern_flush_vs_no_flush_timing() {
     if std::env::var_os("FUSOR_FLUSH_TIMING").is_none() {
         // Off by default — only run when explicitly requested, since
         // micro-benchmarks in `cargo test` are noisy.
@@ -163,5 +163,18 @@ async fn vision_block_pattern_flush_vs_no_flush_timing() {
             no_flush_total / ITERS as u32,
             flush_total / ITERS as u32,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn vision_block_pattern_resolves_without_periodic_flush() {
+        super::vision_block_pattern_resolves_without_periodic_flush().await;
+    }
+
+    #[tokio::test]
+    async fn vision_block_pattern_flush_vs_no_flush_timing() {
+        super::vision_block_pattern_flush_vs_no_flush_timing().await;
     }
 }

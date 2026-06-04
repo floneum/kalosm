@@ -10,7 +10,6 @@ mod tuple_macros;
 
 extern crate self as fusor_conformance;
 
-#[path = "../tests/common/mod.rs"]
 pub mod common;
 pub mod suite;
 
@@ -26,6 +25,86 @@ pub use comparison::{
 pub use fuzz::{FuzzGenerator, FuzzSizeSpec, GenerateFromDevice, IntoFuzzShape};
 pub use tuple_macros::{AsyncFnMutTuple, GenTuple, PopTuple, PushTuple, ResolveTensorTuple};
 
+/// Error returned by a conformance case. A boxed error so cases (and the shared
+/// `common::assert_*` helpers) can return a comparison mismatch or a free-form
+/// message uniformly, and so failures can be reported rather than panicking —
+/// the browser conformance runner cannot recover from a wasm panic.
+pub type CaseError = Box<dyn std::error::Error>;
+
+/// Result of a conformance case.
+pub type CaseResult = Result<(), CaseError>;
+
+/// `assert!` that returns `Err` from a `CaseResult`-returning case instead of
+/// panicking, so browser failures are reported rather than aborting the app.
+#[macro_export]
+macro_rules! ensure {
+    ($cond:expr $(,)?) => {
+        if $cond {
+        } else {
+            return ::core::result::Result::Err(
+                format!("assertion failed: {}", ::core::stringify!($cond)).into(),
+            );
+        }
+    };
+    ($cond:expr, $($arg:tt)+) => {
+        if $cond {
+        } else {
+            return ::core::result::Result::Err(format!($($arg)+).into());
+        }
+    };
+}
+
+/// `assert_eq!` counterpart of [`ensure!`].
+#[macro_export]
+macro_rules! ensure_eq {
+    ($a:expr, $b:expr $(,)?) => {{
+        let (a, b) = (&$a, &$b);
+        if a != b {
+            return ::core::result::Result::Err(
+                format!(
+                    "assertion failed: `{} == {}`\n  left: `{:?}`\n right: `{:?}`",
+                    ::core::stringify!($a),
+                    ::core::stringify!($b),
+                    a,
+                    b
+                )
+                .into(),
+            );
+        }
+    }};
+    ($a:expr, $b:expr, $($arg:tt)+) => {{
+        let (a, b) = (&$a, &$b);
+        if a != b {
+            return ::core::result::Result::Err(format!($($arg)+).into());
+        }
+    }};
+}
+
+/// `assert_ne!` counterpart of [`ensure!`].
+#[macro_export]
+macro_rules! ensure_ne {
+    ($a:expr, $b:expr $(,)?) => {{
+        let (a, b) = (&$a, &$b);
+        if a == b {
+            return ::core::result::Result::Err(
+                format!(
+                    "assertion failed: `{} != {}`\n  both: `{:?}`",
+                    ::core::stringify!($a),
+                    ::core::stringify!($b),
+                    a
+                )
+                .into(),
+            );
+        }
+    }};
+    ($a:expr, $b:expr, $($arg:tt)+) => {{
+        let (a, b) = (&$a, &$b);
+        if a == b {
+            return ::core::result::Result::Err(format!($($arg)+).into());
+        }
+    }};
+}
+
 fn require_gpu() -> bool {
     std::env::var("FUSOR_CONFORMANCE_REQUIRE_GPU")
         .map(|value| {
@@ -35,17 +114,51 @@ fn require_gpu() -> bool {
         .unwrap_or(false)
 }
 
-/// Return all available devices: always CPU, plus GPU if available.
-pub async fn available_devices() -> Vec<Device> {
-    let mut devs = vec![Device::Cpu];
+async fn acquire_gpu() -> Option<Device> {
     match Device::gpu().await {
-        Ok(gpu) => devs.push(gpu),
+        Ok(gpu) => Some(gpu),
         Err(err) => {
             assert!(
                 !require_gpu(),
                 "GPU conformance is required but no GPU device was available: {err}"
             );
+            None
         }
+    }
+}
+
+/// Acquire the GPU device. `None` means no GPU is available.
+///
+/// In the browser the full conformance suite runs ~140 cases that each call
+/// [`available_devices`]; acquiring a fresh wgpu device per case is prohibitively
+/// slow, so the handle is memoized for the life of the page. Natively the cache
+/// is skipped — a thread-local holding a wgpu `Device` panics when dropped during
+/// thread teardown (wgpu's `Drop` touches already-destroyed thread-locals), and
+/// re-acquiring per case is cheap enough off the web.
+#[cfg(not(target_arch = "wasm32"))]
+async fn cached_gpu() -> Option<Device> {
+    acquire_gpu().await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn cached_gpu() -> Option<Device> {
+    thread_local! {
+        static GPU: std::cell::RefCell<Option<Option<Device>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    if let Some(cached) = GPU.with(|cell| cell.borrow().clone()) {
+        return cached;
+    }
+    let acquired = acquire_gpu().await;
+    GPU.with(|cell| *cell.borrow_mut() = Some(acquired.clone()));
+    acquired
+}
+
+/// Return all available devices: always CPU, plus GPU if available.
+pub async fn available_devices() -> Vec<Device> {
+    let mut devs = vec![Device::Cpu];
+    if let Some(gpu) = cached_gpu().await {
+        devs.push(gpu);
     }
     devs
 }
