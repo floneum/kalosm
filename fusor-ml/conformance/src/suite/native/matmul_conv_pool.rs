@@ -3,26 +3,36 @@
 use crate::common::{conv1d_ncw, matmul2, pool1d_ncw};
 use fusor::{Device, Tensor};
 use fusor_conformance::{
-    AssertionCase, AssertionCases, FuzzGenerator, approx_compare, f16_capable_devices,
+    AssertionCase, AssertionCases, FuzzGenerator, FuzzSizeSpec, approx_compare, f16_capable_devices,
+    with_shape_specs,
 };
 use rand::distr::Uniform;
 
 pub fn matmul_match_host_reference() -> AssertionCase {
-    const M: usize = 64;
-    const K: usize = 128;
-    const N: usize = 64;
-
-    let gen_lhs = FuzzGenerator::<2, f32>::new([M, K])
-        .with_seed(300)
-        .with_distribution(Uniform::new(-3.0, 3.0).unwrap());
-    let gen_rhs = FuzzGenerator::<2, f32>::new([K, N])
-        .with_seed(301)
-        .with_distribution(Uniform::new(-3.0, 3.0).unwrap());
+    // Sweep the inner `K` (128/256) and output `N` (64/256) dimensions so a
+    // single producer covers both the medium `[256, 128] @ [128, 64]` case and
+    // the large `[256, 256] @ [256, 256]` tiled-kernel path (folding in the old
+    // `matmul_large_fuzzed`). `M` is a true `Fixed` (it consumes no RNG draw),
+    // which keeps the shared `K` dimension the *first* sampled choice in both
+    // operands — both generators share the same shape seed, so that draw lands
+    // on the same index and the matmul stays dimension-consistent every run.
+    let gen_lhs = with_shape_specs(
+        FuzzGenerator::<2, f32>::new([256, 128])
+            .with_seed(300)
+            .with_distribution(Uniform::new(-3.0, 3.0).unwrap()),
+        [FuzzSizeSpec::Fixed(256), FuzzSizeSpec::from([128, 256])],
+    );
+    let gen_rhs = with_shape_specs(
+        FuzzGenerator::<2, f32>::new([128, 64])
+            .with_seed(301)
+            .with_distribution(Uniform::new(-3.0, 3.0).unwrap()),
+        [FuzzSizeSpec::from([128, 256]), FuzzSizeSpec::from([64, 256])],
+    );
 
     // matmul vs host reference
     fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.matmul(&b))
-        .arg(gen_lhs.clone())
-        .arg(gen_rhs.clone())
+        .arg(gen_lhs)
+        .arg(gen_rhs)
         .equal_to_resolved_with_device(
             async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
                 Tensor::new(&device, &matmul2(&a, &b))
@@ -673,30 +683,4 @@ pub fn matmul_non_affine_prefix_matches_host_reference() -> AssertionCase {
     .compare_with(approx_compare::<4, f32>(1e-3))
     .runs(1)
     .into_case("matmul_conv_pool::matmul_non_affine_prefix_matches_host_reference")
-}
-
-pub fn matmul_large_fuzzed() -> AssertionCase {
-    const M: usize = 256;
-    const K: usize = 256;
-    const N: usize = 256;
-
-    let gen_lhs = FuzzGenerator::<2, f32>::new([M, K])
-        .with_seed(100)
-        .with_distribution(Uniform::new(-2.0, 2.0).unwrap());
-    let gen_rhs = FuzzGenerator::<2, f32>::new([K, N])
-        .with_seed(101)
-        .with_distribution(Uniform::new(-2.0, 2.0).unwrap());
-
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.matmul(&b))
-        .arg(gen_lhs)
-        .arg(gen_rhs)
-        .equal_to_resolved_with_device(
-            async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-                let expected = matmul2(&a, &b);
-                Tensor::new(&device, &expected)
-            },
-        )
-        .compare_with(approx_compare::<2, f32>(1e-2))
-        .runs(3)
-        .into_case("matmul_conv_pool::matmul_large_fuzzed")
 }

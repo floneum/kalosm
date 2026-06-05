@@ -5,7 +5,10 @@ use crate::common::quantized::{
     qmatrix_from_raw_bytes,
 };
 use fusor::{Device, GgmlType, QMatrix, Tensor};
-use fusor_conformance::{AssertionCase, approx_compare, available_devices, exact_value_compare};
+use fusor_conformance::{
+    AssertionCase, AssertionCases, approx_compare, available_devices, cases_from_rows,
+    exact_value_compare,
+};
 use rand::distr::Uniform;
 
 async fn gpu_devices() -> Vec<Device> {
@@ -98,101 +101,115 @@ pub fn rmsnorm_post_relu_resolves_to_single_kernel() -> AssertionCase {
     )
 }
 
-/// The fuser must collapse `relu(input).q_mat_mul(weights)` into a single
-/// QMatMul kernel — qgemv applies the activation to each loaded activation
-/// tile before the dot product. Without the pre-fusion rule, the unfused
-/// source resolves to 2 dispatches (nary + matmul).
-pub fn q4k_qmatmul_pre_relu_resolves_to_single_kernel() -> AssertionCase {
+/// All three Q4K QMatMul fusion shapes must each collapse to a single QMatMul
+/// kernel dispatch:
+///   * `relu(input).q_mat_mul(weights)` — qgemv applies the activation to each
+///     loaded activation tile before the dot product (subgroup path only).
+///   * `q_mat_mul(...).relu()` — qgemv applies the unary chain in-register
+///     before the store (all GPU backends).
+///   * concat/split SwiGLU via `q_mat_mul_paired_silu_product` — the dynamic
+///     paired qmatmul fuses the gate/up product (subgroup path only).
+/// Without the corresponding fuser rule each source resolves to 2 dispatches.
+pub fn q4k_qmatmul_fusion_kernels() -> AssertionCases {
     let weight_shape = [4, 512];
-    let raw_bytes = q4k_raw_bytes(weight_shape);
-    let input_data = vec![vec![0.1f32; weight_shape[1]]; 1];
-    assert_gpu_kernel_property(
-        "quantized_matmul_fusion::q4k_qmatmul_pre_relu_resolves_to_single_kernel",
-        move |device| {
-            let Some(gpu) = device.as_gpu() else {
-                return true;
-            };
-            if !gpu.subgroups_supported() {
-                return true;
-            }
-            let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
-            let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
-            input
-                .relu()
-                .to_concrete()
-                .q_mat_mul(&weights)
-                .to_concrete()
-                .as_gpu()
-                .is_some_and(|gpu_out| gpu_out.count_kernels_to_resolve() == 1)
-        },
-    )
-}
+    let pre_relu_bytes = q4k_raw_bytes(weight_shape);
+    let pre_relu_input = vec![vec![0.1f32; weight_shape[1]]; 1];
 
-/// The fuser must collapse `q_mat_mul → unary chain` (e.g. relu, silu)
-/// into a single QMatMul kernel dispatch — qgemv kernels apply the chain
-/// in-register before storing. Without the fuser rule, the unfused source
-/// resolves to 2 dispatches (matmul + nary).
-pub fn q4k_qmatmul_post_relu_resolves_to_single_kernel() -> AssertionCase {
-    let weight_shape = [4, 512];
-    let raw_bytes = q4k_raw_bytes(weight_shape);
-    let input_data = vec![vec![0.1f32; weight_shape[1]]; 1];
-    assert_gpu_kernel_property(
-        "quantized_matmul_fusion::q4k_qmatmul_post_relu_resolves_to_single_kernel",
-        move |device| {
-            let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
-            let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
-            input
-                .q_mat_mul(&weights)
-                .relu()
-                .to_concrete()
-                .as_gpu()
-                .is_some_and(|gpu_out| gpu_out.count_kernels_to_resolve() == 1)
-        },
-    )
-}
+    let post_relu_bytes = q4k_raw_bytes(weight_shape);
+    let post_relu_input = vec![vec![0.1f32; weight_shape[1]]; 1];
 
-pub fn q4k_concat_split_swiglu_resolves_to_single_dynamic_qmatmul_kernel() -> AssertionCase {
-    let weight_shape = [64, 512];
-    let raw_bytes = q4k_raw_bytes(weight_shape);
-    let input_data = vec![vec![0.1f32; weight_shape[1]]; 1];
-    assert_gpu_kernel_property(
-        "quantized_matmul_fusion::q4k_concat_split_swiglu_resolves_to_single_dynamic_qmatmul_kernel",
-        move |device| {
-            let Some(gpu) = device.as_gpu() else {
-                return true;
-            };
-            if !gpu.subgroups_supported() {
-                return true;
-            }
-            let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
-            let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
-            match (&input, &weights) {
-                (Tensor::Gpu(input), QMatrix::Gpu(weights)) => {
-                    Tensor::<2, f32>::Gpu(input.q_mat_mul_paired_silu_product(weights))
-                        .to_concrete()
-                        .as_gpu()
-                        .is_some_and(|gpu_out| gpu_out.count_kernels_to_resolve() == 1)
+    let swiglu_shape = [64, 512];
+    let swiglu_bytes = q4k_raw_bytes(swiglu_shape);
+    let swiglu_input = vec![vec![0.1f32; swiglu_shape[1]]; 1];
+
+    cases_from_rows([
+        // `relu(input).q_mat_mul(weights)` pre-activation fusion (subgroup path).
+        assert_gpu_kernel_property(
+            "quantized_matmul_fusion::q4k_qmatmul_pre_relu_resolves_to_single_kernel",
+            move |device| {
+                let Some(gpu) = device.as_gpu() else {
+                    return true;
+                };
+                if !gpu.subgroups_supported() {
+                    return true;
                 }
-                _ => false,
-            }
-        },
-    )
+                let weights =
+                    qmatrix_from_raw_bytes(&device, weight_shape, &pre_relu_bytes, GgmlType::Q4K);
+                let input: Tensor<2, f32> = Tensor::new(&device, &pre_relu_input);
+                input
+                    .relu()
+                    .to_concrete()
+                    .q_mat_mul(&weights)
+                    .to_concrete()
+                    .as_gpu()
+                    .is_some_and(|gpu_out| gpu_out.count_kernels_to_resolve() == 1)
+            },
+        ),
+        // `q_mat_mul(...).relu()` post-activation fusion (all GPU backends).
+        assert_gpu_kernel_property(
+            "quantized_matmul_fusion::q4k_qmatmul_post_relu_resolves_to_single_kernel",
+            move |device| {
+                let weights =
+                    qmatrix_from_raw_bytes(&device, weight_shape, &post_relu_bytes, GgmlType::Q4K);
+                let input: Tensor<2, f32> = Tensor::new(&device, &post_relu_input);
+                input
+                    .q_mat_mul(&weights)
+                    .relu()
+                    .to_concrete()
+                    .as_gpu()
+                    .is_some_and(|gpu_out| gpu_out.count_kernels_to_resolve() == 1)
+            },
+        ),
+        // concat/split SwiGLU paired qmatmul fusion (subgroup path).
+        assert_gpu_kernel_property(
+            "quantized_matmul_fusion::q4k_concat_split_swiglu_resolves_to_single_dynamic_qmatmul_kernel",
+            move |device| {
+                let Some(gpu) = device.as_gpu() else {
+                    return true;
+                };
+                if !gpu.subgroups_supported() {
+                    return true;
+                }
+                let weights =
+                    qmatrix_from_raw_bytes(&device, swiglu_shape, &swiglu_bytes, GgmlType::Q4K);
+                let input: Tensor<2, f32> = Tensor::new(&device, &swiglu_input);
+                match (&input, &weights) {
+                    (Tensor::Gpu(input), QMatrix::Gpu(weights)) => {
+                        Tensor::<2, f32>::Gpu(input.q_mat_mul_paired_silu_product(weights))
+                            .to_concrete()
+                            .as_gpu()
+                            .is_some_and(|gpu_out| gpu_out.count_kernels_to_resolve() == 1)
+                    }
+                    _ => false,
+                }
+            },
+        ),
+    ])
 }
 
-pub fn q8_0_qmatmul_post_column_add_nonmultiple_applies_epilogue() -> AssertionCase {
+/// Q8_0 QMatMul epilogues must apply post-matmul extras (bias add, residual
+/// add) in the correct binding order:
+///   * a column-vector bias add on a non-block-multiple output width, and
+///   * a mixed bias-plus-residual chain, where the residual is pre-biased so
+///     the fused epilogue must preserve the binding order.
+/// Both are deterministic-seed Q8_0 matmuls checked against the CPU reference.
+pub fn q8_0_qmatmul_epilogue_tests() -> AssertionCases {
     let weight_shape = [4, 64];
-    let raw_bytes = q8_0_raw_bytes(weight_shape);
-    let input_shape = [2, weight_shape[1]];
-    let input_data = deterministic_input(&input_shape, 1_031);
-    let bias_data = vec![0.25f32, -0.5, 0.75, -1.0];
 
-    fusor_conformance::assert(move |device: Device| {
-        let raw_bytes = raw_bytes.clone();
-        let input_data = input_data.clone();
-        let bias_data = bias_data.clone();
+    // Column-add on a non-block-multiple output width.
+    let column_add_bytes = q8_0_raw_bytes(weight_shape);
+    let column_add_input_shape = [2, weight_shape[1]];
+    let column_add_input = deterministic_input(&column_add_input_shape, 1_031);
+    let column_add_bias = vec![0.25f32, -0.5, 0.75, -1.0];
+
+    let column_add = fusor_conformance::assert(move |device: Device| {
+        let raw_bytes = column_add_bytes.clone();
+        let input_data = column_add_input.clone();
+        let bias_data = column_add_bias.clone();
         async move {
             let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
-            let input: Tensor<2, f32> = Tensor::from_slice(&device, input_shape, &input_data);
+            let input: Tensor<2, f32> =
+                Tensor::from_slice(&device, column_add_input_shape, &input_data);
             let bias: Tensor<1, f32> = Tensor::from_slice(&device, [weight_shape[0]], &bias_data);
             input.q_mat_mul(&weights).add_(&bias).to_concrete()
         }
@@ -200,28 +217,29 @@ pub fn q8_0_qmatmul_post_column_add_nonmultiple_applies_epilogue() -> AssertionC
     .arg(|device: &Device| device.clone())
     .compare_with(approx_compare::<2, f32>(2.0))
     .runs(1)
-    .into_case("quantized_matmul_fusion::q8_0_qmatmul_post_column_add_nonmultiple_applies_epilogue")
-}
+    .into_case(
+        "quantized_matmul_fusion::q8_0_qmatmul_post_column_add_nonmultiple_applies_epilogue",
+    );
 
-pub fn q8_0_qmatmul_post_mixed_extras_preserves_binding_order() -> AssertionCase {
-    let weight_shape = [4, 64];
-    let raw_bytes = q8_0_raw_bytes(weight_shape);
-    let input_shape = [2, weight_shape[1]];
-    let output_shape = [2, weight_shape[0]];
-    let input_data = deterministic_input(&input_shape, 1_047);
-    let residual_data = deterministic_input(&output_shape, 1_211);
-    let bias_data = vec![0.4f32, -0.2, 0.1, -0.6];
+    // Mixed bias + residual chain that must preserve binding order.
+    let mixed_bytes = q8_0_raw_bytes(weight_shape);
+    let mixed_input_shape = [2, weight_shape[1]];
+    let mixed_output_shape = [2, weight_shape[0]];
+    let mixed_input = deterministic_input(&mixed_input_shape, 1_047);
+    let mixed_residual = deterministic_input(&mixed_output_shape, 1_211);
+    let mixed_bias = vec![0.4f32, -0.2, 0.1, -0.6];
 
-    fusor_conformance::assert(move |device: Device| {
-        let raw_bytes = raw_bytes.clone();
-        let input_data = input_data.clone();
-        let residual_data = residual_data.clone();
-        let bias_data = bias_data.clone();
+    let mixed_extras = fusor_conformance::assert(move |device: Device| {
+        let raw_bytes = mixed_bytes.clone();
+        let input_data = mixed_input.clone();
+        let residual_data = mixed_residual.clone();
+        let bias_data = mixed_bias.clone();
         async move {
             let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
-            let input: Tensor<2, f32> = Tensor::from_slice(&device, input_shape, &input_data);
+            let input: Tensor<2, f32> =
+                Tensor::from_slice(&device, mixed_input_shape, &input_data);
             let residual: Tensor<2, f32> =
-                Tensor::from_slice(&device, output_shape, &residual_data);
+                Tensor::from_slice(&device, mixed_output_shape, &residual_data);
             let bias: Tensor<1, f32> = Tensor::from_slice(&device, [weight_shape[0]], &bias_data);
             let residual_biased = residual.add_(&bias);
             input
@@ -233,5 +251,7 @@ pub fn q8_0_qmatmul_post_mixed_extras_preserves_binding_order() -> AssertionCase
     .arg(|device: &Device| device.clone())
     .compare_with(approx_compare::<2, f32>(2.0))
     .runs(1)
-    .into_case("quantized_matmul_fusion::q8_0_qmatmul_post_mixed_extras_preserves_binding_order")
+    .into_case("quantized_matmul_fusion::q8_0_qmatmul_post_mixed_extras_preserves_binding_order");
+
+    cases_from_rows([column_add, mixed_extras])
 }

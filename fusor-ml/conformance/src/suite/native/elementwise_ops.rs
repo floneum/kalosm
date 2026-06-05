@@ -4,8 +4,21 @@ use crate::common::{binary_map2, unary_map2, where_cond1, where_cond2};
 use fusor::{Device, Tensor};
 use fusor_conformance::{
     AssertionCase, AssertionCases, FuzzGenerator, approx_compare, approx_or_relative_compare,
+    cases_from_rows, unary_fuzz_case, with_shape_specs,
 };
 use rand::distr::Uniform;
+
+/// Shape sweep used by the host-reference unary rows: every run resamples each
+/// dim from {45, 100}, so a single assertion exercises both the small default
+/// size and a larger tensor (the coverage the deleted `large_tensor_*` fn used
+/// to provide) across the contiguous / transposed / sliced layouts.
+const UNARY_SWEEP: [[usize; 2]; 2] = [[45, 100], [45, 100]];
+
+/// Widen a fixed-shape unary generator to the small+large [`UNARY_SWEEP`] while
+/// preserving its seed / distribution / sampler.
+fn sweep(generator: FuzzGenerator<2, f32>) -> FuzzGenerator<2, f32> {
+    with_shape_specs(generator, UNARY_SWEEP)
+}
 
 const SHAPE: [usize; 2] = [45, 45];
 
@@ -222,264 +235,239 @@ macro_rules! fuzz_large_binary_1d {
 }
 
 pub fn unary_math_ops_match_host_reference() -> AssertionCases {
-    let mut assertions = AssertionCases::new();
-
-    // abs
-    fuzz_unary!(
-        assertions,
-        _abs,
-        signed(),
-        |x: Tensor<2, f32>| x.abs().to_concrete(),
-        f32::abs,
-        1e-6
-    );
-
-    // Native GPU transcendental functions use backend-specific approximations.
-    // Compare them with absolute-or-relative tolerances so values near zero
-    // still stay tight while larger outputs are not judged by absolute error
+    // Every row sweeps the small+large [`UNARY_SWEEP`] shape over `runs(6)` (two
+    // passes of the contiguous / transposed / sliced layout rotation), so these
+    // rows alone cover what the deleted `large_tensor_unary_ops_fuzzed` fn used
+    // to assert for sin/cos/exp/abs/neg at a larger size.
+    //
+    // Native GPU transcendental functions use backend-specific approximations,
+    // so they are compared with absolute-or-relative tolerances: values near
+    // zero stay tight while larger outputs are not judged by absolute error
     // alone. This avoids making Windows WARP match libm polynomial choices
     // exactly while still catching algorithmic regressions.
-
-    // exp
-    fuzz_unary_native_math!(
-        assertions,
-        _exp,
-        signed(),
-        |x: Tensor<2, f32>| x.exp().to_concrete(),
-        f32::exp,
-        1e-3,
-        3e-4
-    );
-
-    // exp2
-    fuzz_unary_native_math!(
-        assertions,
-        _exp2,
-        signed(),
-        |x: Tensor<2, f32>| x.exp2().to_concrete(),
-        f32::exp2,
-        1e-3,
-        3e-4
-    );
-
-    // sin
-    fuzz_unary_native_math!(
-        assertions,
-        _sin,
-        signed(),
-        |x: Tensor<2, f32>| x.sin().to_concrete(),
-        f32::sin,
-        1e-4,
-        3e-4
-    );
-
-    // cos
-    fuzz_unary_native_math!(
-        assertions,
-        _cos,
-        signed(),
-        |x: Tensor<2, f32>| x.cos().to_concrete(),
-        f32::cos,
-        1e-4,
-        3e-4
-    );
-
-    // tan
-    fuzz_unary_native_math!(
-        assertions,
-        _tan,
-        tan_domain(),
-        |x: Tensor<2, f32>| x.tan().to_concrete(),
-        f32::tan,
-        1e-4,
-        3e-4
-    );
-
-    // tanh
-    fuzz_unary_native_math!(
-        assertions,
-        _tanh,
-        signed(),
-        |x: Tensor<2, f32>| x.tanh().to_concrete(),
-        f32::tanh,
-        5e-4,
-        5e-4
-    );
-
-    // atan
-    fuzz_unary_native_math!(
-        assertions,
-        _atan,
-        signed(),
-        |x: Tensor<2, f32>| x.atan().to_concrete(),
-        f32::atan,
-        1e-4,
-        3e-4
-    );
-
-    // sinh
-    fuzz_unary_native_math!(
-        assertions,
-        _sinh,
-        signed(),
-        |x: Tensor<2, f32>| x.sinh().to_concrete(),
-        f32::sinh,
-        1e-4,
-        3e-4
-    );
-
-    // cosh
-    fuzz_unary_native_math!(
-        assertions,
-        _cosh,
-        signed(),
-        |x: Tensor<2, f32>| x.cosh().to_concrete(),
-        f32::cosh,
-        1e-4,
-        5e-4
-    );
-
-    // asinh
-    fuzz_unary_native_math!(
-        assertions,
-        _asinh,
-        signed(),
-        |x: Tensor<2, f32>| x.asinh().to_concrete(),
-        f32::asinh,
-        1e-4,
-        3e-4
-    );
-
-    // approximate_exp
-    fuzz_unary!(
-        assertions,
-        _approx_exp,
-        approx_exp_domain(),
-        |x: Tensor<2, f32>| x.approximate_exp(),
-        f32::exp,
-        6e-2
-    );
-
-    // less_approximate_exp
-    fuzz_unary!(
-        assertions,
-        _less_approx_exp,
-        approx_exp_domain(),
-        |x: Tensor<2, f32>| x.less_approximate_exp(),
-        f32::exp,
-        1.5e-2
-    );
-
-    // tanh_exact
-    fuzz_unary_native_math!(
-        assertions,
-        _tanh_exact,
-        signed(),
-        |x: Tensor<2, f32>| x.tanh_exact(),
-        f32::tanh,
-        5e-4,
-        5e-4
-    );
-
-    // sqr
-    fuzz_unary!(
-        assertions,
-        _sqr,
-        signed(),
-        |x: Tensor<2, f32>| x.sqr().to_concrete(),
-        |v: f32| v * v,
-        1e-5
-    );
-    assertions
+    cases_from_rows([
+        // abs
+        unary_fuzz_case(
+            "elementwise_ops::_abs",
+            sweep(signed()),
+            |x: Tensor<2, f32>| async move { x.abs().to_concrete() },
+            f32::abs,
+            approx_compare::<2, f32>(1e-6),
+            6,
+        ),
+        // neg (rehomed from the deleted large_tensor_unary_ops_fuzzed fn)
+        unary_fuzz_case(
+            "elementwise_ops::_neg",
+            sweep(signed()),
+            |x: Tensor<2, f32>| async move { (-x).to_concrete() },
+            |v: f32| -v,
+            approx_compare::<2, f32>(1e-6),
+            6,
+        ),
+        // exp
+        unary_fuzz_case(
+            "elementwise_ops::_exp",
+            sweep(signed()),
+            |x: Tensor<2, f32>| async move { x.exp().to_concrete() },
+            f32::exp,
+            approx_or_relative_compare::<2>(1e-3, 3e-4),
+            6,
+        ),
+        // exp2
+        unary_fuzz_case(
+            "elementwise_ops::_exp2",
+            sweep(signed()),
+            |x: Tensor<2, f32>| async move { x.exp2().to_concrete() },
+            f32::exp2,
+            approx_or_relative_compare::<2>(1e-3, 3e-4),
+            6,
+        ),
+        // sin
+        unary_fuzz_case(
+            "elementwise_ops::_sin",
+            sweep(signed()),
+            |x: Tensor<2, f32>| async move { x.sin().to_concrete() },
+            f32::sin,
+            approx_or_relative_compare::<2>(1e-4, 3e-4),
+            6,
+        ),
+        // cos
+        unary_fuzz_case(
+            "elementwise_ops::_cos",
+            sweep(signed()),
+            |x: Tensor<2, f32>| async move { x.cos().to_concrete() },
+            f32::cos,
+            approx_or_relative_compare::<2>(1e-4, 3e-4),
+            6,
+        ),
+        // tan
+        unary_fuzz_case(
+            "elementwise_ops::_tan",
+            sweep(tan_domain()),
+            |x: Tensor<2, f32>| async move { x.tan().to_concrete() },
+            f32::tan,
+            approx_or_relative_compare::<2>(1e-4, 3e-4),
+            6,
+        ),
+        // tanh
+        unary_fuzz_case(
+            "elementwise_ops::_tanh",
+            sweep(signed()),
+            |x: Tensor<2, f32>| async move { x.tanh().to_concrete() },
+            f32::tanh,
+            approx_or_relative_compare::<2>(5e-4, 5e-4),
+            6,
+        ),
+        // atan
+        unary_fuzz_case(
+            "elementwise_ops::_atan",
+            sweep(signed()),
+            |x: Tensor<2, f32>| async move { x.atan().to_concrete() },
+            f32::atan,
+            approx_or_relative_compare::<2>(1e-4, 3e-4),
+            6,
+        ),
+        // sinh
+        unary_fuzz_case(
+            "elementwise_ops::_sinh",
+            sweep(signed()),
+            |x: Tensor<2, f32>| async move { x.sinh().to_concrete() },
+            f32::sinh,
+            approx_or_relative_compare::<2>(1e-4, 3e-4),
+            6,
+        ),
+        // cosh
+        unary_fuzz_case(
+            "elementwise_ops::_cosh",
+            sweep(signed()),
+            |x: Tensor<2, f32>| async move { x.cosh().to_concrete() },
+            f32::cosh,
+            approx_or_relative_compare::<2>(1e-4, 5e-4),
+            6,
+        ),
+        // asinh
+        unary_fuzz_case(
+            "elementwise_ops::_asinh",
+            sweep(signed()),
+            |x: Tensor<2, f32>| async move { x.asinh().to_concrete() },
+            f32::asinh,
+            approx_or_relative_compare::<2>(1e-4, 3e-4),
+            6,
+        ),
+        // approximate_exp
+        unary_fuzz_case(
+            "elementwise_ops::_approx_exp",
+            sweep(approx_exp_domain()),
+            |x: Tensor<2, f32>| async move { x.approximate_exp() },
+            f32::exp,
+            approx_compare::<2, f32>(6e-2),
+            6,
+        ),
+        // less_approximate_exp
+        unary_fuzz_case(
+            "elementwise_ops::_less_approx_exp",
+            sweep(approx_exp_domain()),
+            |x: Tensor<2, f32>| async move { x.less_approximate_exp() },
+            f32::exp,
+            approx_compare::<2, f32>(1.5e-2),
+            6,
+        ),
+        // tanh_exact
+        unary_fuzz_case(
+            "elementwise_ops::_tanh_exact",
+            sweep(signed()),
+            |x: Tensor<2, f32>| async move { x.tanh_exact() },
+            f32::tanh,
+            approx_or_relative_compare::<2>(5e-4, 5e-4),
+            6,
+        ),
+        // sqr
+        unary_fuzz_case(
+            "elementwise_ops::_sqr",
+            sweep(signed()),
+            |x: Tensor<2, f32>| async move { x.sqr().to_concrete() },
+            |v: f32| v * v,
+            approx_compare::<2, f32>(1e-5),
+            6,
+        ),
+    ])
 }
 
 pub fn restricted_domain_unary_ops_match_host_reference() -> AssertionCases {
-    let mut assertions = AssertionCases::new();
-
-    // sqrt
-    fuzz_unary_native_math!(
-        assertions,
-        _sqrt,
-        positive(),
-        |x: Tensor<2, f32>| x.sqrt().to_concrete(),
-        f32::sqrt,
-        1e-4,
-        3e-4
-    );
-
-    // log
-    fuzz_unary_native_math!(
-        assertions,
-        _log,
-        positive(),
-        |x: Tensor<2, f32>| x.log().to_concrete(),
-        f32::ln,
-        1e-4,
-        3e-4
-    );
-
-    // log2
-    fuzz_unary_native_math!(
-        assertions,
-        _log2,
-        positive(),
-        |x: Tensor<2, f32>| x.log2().to_concrete(),
-        f32::log2,
-        1e-4,
-        3e-4
-    );
-
     // Inverse trig / hyperbolic functions diverge from libm by ~2e-4 on the
-    // lavapipe/llvmpipe Linux CI adapter when the `unit()` distribution
-    // samples close to the asymptotes (asin'(±0.95) ≈ 3.2, amplifying
-    // input ULP error). 1e-3 covers the observed lavapipe drift while
-    // still catching algorithmic regressions (which would be orders of
-    // magnitude larger). macOS Metal stays well under 1e-5.
-
-    // asin
-    fuzz_unary_native_math!(
-        assertions,
-        _asin,
-        unit(),
-        |x: Tensor<2, f32>| x.asin().to_concrete(),
-        f32::asin,
-        1e-3,
-        3e-4
-    );
-
-    // acos
-    fuzz_unary_native_math!(
-        assertions,
-        _acos,
-        unit(),
-        |x: Tensor<2, f32>| x.acos().to_concrete(),
-        f32::acos,
-        1e-3,
-        3e-4
-    );
-
-    // atanh
-    fuzz_unary_native_math!(
-        assertions,
-        _atanh,
-        unit(),
-        |x: Tensor<2, f32>| x.atanh().to_concrete(),
-        f32::atanh,
-        1e-3,
-        3e-4
-    );
-
-    // acosh
-    fuzz_unary_native_math!(
-        assertions,
-        _acosh,
-        acosh_domain(),
-        |x: Tensor<2, f32>| x.acosh().to_concrete(),
-        f32::acosh,
-        1e-3,
-        3e-4
-    );
-    assertions
+    // lavapipe/llvmpipe Linux CI adapter when the `unit()` distribution samples
+    // close to the asymptotes (asin'(±0.95) ≈ 3.2, amplifying input ULP error).
+    // 1e-3 covers the observed lavapipe drift while still catching algorithmic
+    // regressions (which would be orders of magnitude larger). macOS Metal stays
+    // well under 1e-5. Each row sweeps the small+large [`UNARY_SWEEP`] shape over
+    // `runs(6)`.
+    cases_from_rows([
+        // sqrt — `restricted_domain` row keeps the strict 1e-5 absolute tolerance
+        // the deleted `large_tensor_unary_ops_fuzzed::sqrt` regression pinned (do
+        // NOT loosen to the 1e-4/3e-4 native-math band).
+        unary_fuzz_case(
+            "elementwise_ops::_sqrt",
+            sweep(positive()),
+            |x: Tensor<2, f32>| async move { x.sqrt().to_concrete() },
+            f32::sqrt,
+            approx_compare::<2, f32>(1e-5),
+            6,
+        ),
+        // log
+        unary_fuzz_case(
+            "elementwise_ops::_log",
+            sweep(positive()),
+            |x: Tensor<2, f32>| async move { x.log().to_concrete() },
+            f32::ln,
+            approx_or_relative_compare::<2>(1e-4, 3e-4),
+            6,
+        ),
+        // log2
+        unary_fuzz_case(
+            "elementwise_ops::_log2",
+            sweep(positive()),
+            |x: Tensor<2, f32>| async move { x.log2().to_concrete() },
+            f32::log2,
+            approx_or_relative_compare::<2>(1e-4, 3e-4),
+            6,
+        ),
+        // asin
+        unary_fuzz_case(
+            "elementwise_ops::_asin",
+            sweep(unit()),
+            |x: Tensor<2, f32>| async move { x.asin().to_concrete() },
+            f32::asin,
+            approx_or_relative_compare::<2>(1e-3, 3e-4),
+            6,
+        ),
+        // acos
+        unary_fuzz_case(
+            "elementwise_ops::_acos",
+            sweep(unit()),
+            |x: Tensor<2, f32>| async move { x.acos().to_concrete() },
+            f32::acos,
+            approx_or_relative_compare::<2>(1e-3, 3e-4),
+            6,
+        ),
+        // atanh
+        unary_fuzz_case(
+            "elementwise_ops::_atanh",
+            sweep(unit()),
+            |x: Tensor<2, f32>| async move { x.atanh().to_concrete() },
+            f32::atanh,
+            approx_or_relative_compare::<2>(1e-3, 3e-4),
+            6,
+        ),
+        // acosh
+        unary_fuzz_case(
+            "elementwise_ops::_acosh",
+            sweep(acosh_domain()),
+            |x: Tensor<2, f32>| async move { x.acosh().to_concrete() },
+            f32::acosh,
+            approx_or_relative_compare::<2>(1e-3, 3e-4),
+            6,
+        ),
+    ])
 }
 
 fn silu(v: f32) -> f32 {
@@ -1003,92 +991,6 @@ pub fn where_cond_fuzzed() -> AssertionCase {
     .compare_with(approx_compare::<1, f32>(1e-6))
     .runs(3)
     .into_case("elementwise_ops::where_cond_fuzzed")
-}
-
-pub fn large_tensor_unary_ops_fuzzed() -> AssertionCases {
-    const LARGE_SHAPE: [usize; 2] = [45, 45];
-    let mut assertions = AssertionCases::new();
-
-    // sin
-    assertions.push(
-        fusor_conformance::assert(async |x: Tensor<2, f32>| x.sin().to_concrete())
-            .arg(FuzzGenerator::<2, f32>::new(LARGE_SHAPE).with_seed(1))
-            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-                Tensor::new(&device, &unary_map2(&v, f32::sin))
-            })
-            .compare_with(approx_or_relative_compare::<2>(1e-4, 3e-4))
-            .runs(3)
-            .into_case("elementwise_ops::large_tensor_unary_ops_fuzzed::sin"),
-    );
-
-    // cos
-    assertions.push(
-        fusor_conformance::assert(async |x: Tensor<2, f32>| x.cos().to_concrete())
-            .arg(FuzzGenerator::<2, f32>::new(LARGE_SHAPE).with_seed(2))
-            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-                Tensor::new(&device, &unary_map2(&v, f32::cos))
-            })
-            .compare_with(approx_or_relative_compare::<2>(1e-4, 3e-4))
-            .runs(3)
-            .into_case("elementwise_ops::large_tensor_unary_ops_fuzzed::cos"),
-    );
-
-    // exp (bounded range to avoid overflow)
-    assertions.push(
-        fusor_conformance::assert(async |x: Tensor<2, f32>| x.exp().to_concrete())
-            .arg(
-                FuzzGenerator::<2, f32>::new(LARGE_SHAPE)
-                    .with_seed(3)
-                    .with_distribution(Uniform::new(-5.0, 5.0).unwrap()),
-            )
-            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-                Tensor::new(&device, &unary_map2(&v, f32::exp))
-            })
-            .compare_with(approx_or_relative_compare::<2>(1e-3, 3e-4))
-            .runs(3)
-            .into_case("elementwise_ops::large_tensor_unary_ops_fuzzed::exp"),
-    );
-
-    // sqrt (positive only)
-    assertions.push(
-        fusor_conformance::assert(async |x: Tensor<2, f32>| x.sqrt().to_concrete())
-            .arg(
-                FuzzGenerator::<2, f32>::new(LARGE_SHAPE)
-                    .with_seed(4)
-                    .with_positive(),
-            )
-            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-                Tensor::new(&device, &unary_map2(&v, f32::sqrt))
-            })
-            .compare_with(approx_compare::<2, f32>(1e-5))
-            .runs(3)
-            .into_case("elementwise_ops::large_tensor_unary_ops_fuzzed::sqrt"),
-    );
-
-    // neg
-    assertions.push(
-        fusor_conformance::assert(async |x: Tensor<2, f32>| (-x).to_concrete())
-            .arg(FuzzGenerator::<2, f32>::new(LARGE_SHAPE).with_seed(5))
-            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-                Tensor::new(&device, &unary_map2(&v, |x| -x))
-            })
-            .compare_with(approx_compare::<2, f32>(1e-6))
-            .runs(3)
-            .into_case("elementwise_ops::large_tensor_unary_ops_fuzzed::neg"),
-    );
-
-    // abs
-    assertions.push(
-        fusor_conformance::assert(async |x: Tensor<2, f32>| x.abs().to_concrete())
-            .arg(FuzzGenerator::<2, f32>::new(LARGE_SHAPE).with_seed(6))
-            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-                Tensor::new(&device, &unary_map2(&v, f32::abs))
-            })
-            .compare_with(approx_compare::<2, f32>(1e-6))
-            .runs(3)
-            .into_case("elementwise_ops::large_tensor_unary_ops_fuzzed::abs"),
-    );
-    assertions
 }
 
 pub fn tanh_exact_saturation_at_large_magnitudes() -> AssertionCases {

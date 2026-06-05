@@ -12,6 +12,41 @@ use fusor_conformance::{
 use rand::distr::Uniform;
 use std::mem::size_of;
 
+/// Plain (unquantized) `QMatrix` fixtures defined alongside the suite rather than in the
+/// `quantized_fixture_cases!` table, because `F32`/`F16` have no `GgufBlock` to drive
+/// `build_fixture`. Each row carries the fixture plus the q_mat_mul input seed and a flag
+/// marking it for the dequantize sweep, mirroring `QUANTIZED_FIXTURE_CASES`.
+fn extra_qmatrix_fixtures() -> [(QuantizedFixture, u64, bool); 2] {
+    [
+        (
+            QuantizedFixture {
+                ty: GgmlType::F32,
+                weight_shape: [2, 4],
+                raw_bytes: f32_weight_bytes(),
+                input_row_count: 2,
+                dequantized: f32_weight_rows(),
+                dequantize_tol: 1e-6,
+                q_mat_mul_tol: 1e-6,
+            },
+            820,
+            true,
+        ),
+        (
+            QuantizedFixture {
+                ty: GgmlType::F16,
+                weight_shape: [2, 4],
+                raw_bytes: f16_weight_bytes(),
+                input_row_count: 2,
+                dequantized: f32_weight_rows(),
+                dequantize_tol: 1e-3,
+                q_mat_mul_tol: 1e-3,
+            },
+            821,
+            true,
+        ),
+    ]
+}
+
 pub fn quantized_dequantize_matches_cpu_reference() -> AssertionCases {
     let mut assertions = AssertionCases::new();
     for &(fixture, _, _) in QUANTIZED_FIXTURE_CASES
@@ -34,6 +69,26 @@ pub fn quantized_dequantize_matches_cpu_reference() -> AssertionCases {
             dequantize_tol,
         ));
     }
+    for (fixture, _, dequantize) in extra_qmatrix_fixtures() {
+        if !dequantize {
+            continue;
+        }
+        let QuantizedFixture {
+            ty,
+            weight_shape,
+            raw_bytes,
+            dequantized,
+            dequantize_tol,
+            ..
+        } = fixture;
+        assertions.push(assert_dequantize_matches_host_reference(
+            ty,
+            weight_shape,
+            raw_bytes,
+            dequantized,
+            dequantize_tol,
+        ));
+    }
     assertions
 }
 
@@ -46,6 +101,15 @@ pub fn quantized_q_mat_mul_matches_cpu_reference() -> AssertionCases {
             QMatMulFuzz {
                 seed,
                 distribution: Uniform::new(-0.25, 0.25).unwrap(),
+            },
+        ));
+    }
+    for (fixture, seed, _) in extra_qmatrix_fixtures() {
+        assertions.push(assert_q_mat_mul_matches_host_reference(
+            &fixture,
+            QMatMulFuzz {
+                seed,
+                distribution: Uniform::new(-0.5, 0.5).unwrap(),
             },
         ));
     }
@@ -123,42 +187,4 @@ pub fn q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch() -> AssertionCase 
     .baseline_on_test_device()
     .runs(1)
     .into_case("quantized_matmul::q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch")
-}
-
-pub fn f32_q_matrix_q_mat_mul_matches_host_reference() -> AssertionCase {
-    let fixture = QuantizedFixture {
-        ty: GgmlType::F32,
-        weight_shape: [2, 4],
-        raw_bytes: f32_weight_bytes(),
-        input_row_count: 2,
-        dequantized: f32_weight_rows(),
-        dequantize_tol: 1e-6,
-        q_mat_mul_tol: 1e-6,
-    };
-    assert_q_mat_mul_matches_host_reference(
-        &fixture,
-        QMatMulFuzz {
-            seed: 820,
-            distribution: Uniform::new(-0.5, 0.5).unwrap(),
-        },
-    )
-}
-
-pub fn f16_q_matrix_q_mat_mul_matches_host_reference() -> AssertionCase {
-    let fixture = QuantizedFixture {
-        ty: GgmlType::F16,
-        weight_shape: [2, 4],
-        raw_bytes: f16_weight_bytes(),
-        input_row_count: 2,
-        dequantized: f32_weight_rows(),
-        dequantize_tol: 1e-3,
-        q_mat_mul_tol: 1e-3,
-    };
-    assert_q_mat_mul_matches_host_reference(
-        &fixture,
-        QMatMulFuzz {
-            seed: 821,
-            distribution: Uniform::new(-0.5, 0.5).unwrap(),
-        },
-    )
 }

@@ -751,106 +751,103 @@ pub fn flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied_shape
 /// - exact Q-block alignment (q_seq_len = 64 = 8*8),
 /// - non-aligned tail (q_seq_len = 72, last block is partially valid),
 /// - non-aligned head_dim and odd kv_seq_len.
+///
+/// The trailing `masked` sub-cases additionally drive the tiled kernel through
+/// the additive-causal QKMask path (previously a separate
+/// `flash_attention_tiled_with_mask_matches_cpu_reference` test), keeping the
+/// tighter 1e-3 tolerance.
 pub fn flash_attention_tiled_matches_cpu_reference_on_varied_shapes() -> AssertionCases {
+    // (case, masked): unmasked shapes span the Q-block alignment cases above;
+    // masked shapes exercise the additive-causal QKMask path through the same
+    // tiled kernel.
     [
-        FlashCase {
-            batch: 1,
-            num_heads: 2,
-            num_kv_heads: 2,
-            q_seq_len: 64,
-            kv_seq_len: 64,
-            head_dim: 8,
-        },
-        FlashCase {
-            batch: 1,
-            num_heads: 2,
-            num_kv_heads: 1,
-            q_seq_len: 72,
-            kv_seq_len: 80,
-            head_dim: 16,
-        },
-        FlashCase {
-            batch: 2,
-            num_heads: 4,
-            num_kv_heads: 2,
-            q_seq_len: 65,
-            kv_seq_len: 35,
-            head_dim: 8,
-        },
-        FlashCase {
-            batch: 1,
-            num_heads: 4,
-            num_kv_heads: 4,
-            q_seq_len: 128,
-            kv_seq_len: 128,
-            head_dim: 24,
-        },
+        (
+            FlashCase {
+                batch: 1,
+                num_heads: 2,
+                num_kv_heads: 2,
+                q_seq_len: 64,
+                kv_seq_len: 64,
+                head_dim: 8,
+            },
+            false,
+        ),
+        (
+            FlashCase {
+                batch: 1,
+                num_heads: 2,
+                num_kv_heads: 1,
+                q_seq_len: 72,
+                kv_seq_len: 80,
+                head_dim: 16,
+            },
+            false,
+        ),
+        (
+            FlashCase {
+                batch: 2,
+                num_heads: 4,
+                num_kv_heads: 2,
+                q_seq_len: 65,
+                kv_seq_len: 35,
+                head_dim: 8,
+            },
+            false,
+        ),
+        (
+            FlashCase {
+                batch: 1,
+                num_heads: 4,
+                num_kv_heads: 4,
+                q_seq_len: 128,
+                kv_seq_len: 128,
+                head_dim: 24,
+            },
+            false,
+        ),
+        (
+            FlashCase {
+                batch: 1,
+                num_heads: 2,
+                num_kv_heads: 2,
+                q_seq_len: 64,
+                kv_seq_len: 32,
+                head_dim: 8,
+            },
+            true,
+        ),
+        (
+            FlashCase {
+                batch: 2,
+                num_heads: 2,
+                num_kv_heads: 2,
+                q_seq_len: 96,
+                kv_seq_len: 64,
+                head_dim: 16,
+            },
+            true,
+        ),
     ]
     .into_iter()
-    .map(|case| {
-        assert_flash_attention_case(
-            format!(
-                "flash_attention_ops::flash_attention_tiled_matches_cpu_reference_on_varied_shapes::b{}_h{}_kvh{}_q{}_kv{}_d{}",
-                case.batch,
-                case.num_heads,
-                case.num_kv_heads,
-                case.q_seq_len,
-                case.kv_seq_len,
-                case.head_dim
-            ),
-            case,
-            None,
-            1e-3,
-            1,
-        )
-    })
-    .collect::<Vec<_>>()
-    .into()
-}
-
-/// Same as above but with an additive QK mask, exercising the masked path
-/// through the tiled kernel.
-pub fn flash_attention_tiled_with_mask_matches_cpu_reference() -> AssertionCases {
-    [
-        FlashCase {
-            batch: 1,
-            num_heads: 2,
-            num_kv_heads: 2,
-            q_seq_len: 64,
-            kv_seq_len: 32,
-            head_dim: 8,
-        },
-        FlashCase {
-            batch: 2,
-            num_heads: 2,
-            num_kv_heads: 2,
-            q_seq_len: 96,
-            kv_seq_len: 64,
-            head_dim: 16,
-        },
-    ]
-    .into_iter()
-    .map(|case| {
-        let shape = [case.q_seq_len, case.kv_seq_len];
-        assert_flash_attention_case(
-            format!(
-                "flash_attention_ops::flash_attention_tiled_with_mask_matches_cpu_reference::b{}_h{}_kvh{}_q{}_kv{}_d{}",
-                case.batch,
-                case.num_heads,
-                case.num_kv_heads,
-                case.q_seq_len,
-                case.kv_seq_len,
-                case.head_dim
-            ),
-            case,
-            Some((
+    .map(|(case, masked)| {
+        let prefix = if masked { "masked::" } else { "" };
+        let name = format!(
+            "flash_attention_ops::flash_attention_tiled_matches_cpu_reference_on_varied_shapes::{prefix}b{}_h{}_kvh{}_q{}_kv{}_d{}",
+            case.batch,
+            case.num_heads,
+            case.num_kv_heads,
+            case.q_seq_len,
+            case.kv_seq_len,
+            case.head_dim
+        );
+        let mask = masked.then(|| {
+            (
                 qk_mask_data(case.q_seq_len, case.kv_seq_len),
                 MaskKind::QKMask,
-                shape,
-            )),
-            1e-3,
-            1,
-        )
+                [case.q_seq_len, case.kv_seq_len],
+            )
+        });
+        assert_flash_attention_case(name, case, mask, 1e-3, 1)
     })
     .collect::<Vec<_>>()
     .into()

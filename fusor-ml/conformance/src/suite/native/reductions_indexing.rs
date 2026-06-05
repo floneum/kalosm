@@ -4,7 +4,7 @@ use crate::common::{index_select1, index_select2, keepdim2, mean_axis2, reduce_a
 use fusor::{Device, Tensor, arange};
 use fusor_conformance::{
     AssertionCase, AssertionCases, FuzzGenerator, approx_compare, f16_capable_devices,
-    relative_compare,
+    relative_compare, with_shape_specs,
 };
 use half::f16;
 use rand::distr::Uniform;
@@ -28,6 +28,18 @@ pub fn reductions_match_host_reference() -> AssertionCases {
             .into_case("reductions_indexing::reductions_match_host_reference::sum_axis1"),
     );
 
+    // sum along axis 0
+    assertions.push(
+        fusor_conformance::assert(async |x: Tensor<2, f32>| x.sum::<1>(0))
+            .arg(fuzz.clone())
+            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+                Tensor::from_slice(&device, [SHAPE[1]], &reduce_axis2(&v, 0, 0.0, |a, b| a + b))
+            })
+            .compare_with(approx_compare::<1, f32>(1e-4))
+            .runs(3)
+            .into_case("reductions_indexing::reductions_match_host_reference::sum_axis0"),
+    );
+
     // max along axis 0
     assertions.push(
         fusor_conformance::assert(async |x: Tensor<2, f32>| x.max::<1>(0))
@@ -42,6 +54,22 @@ pub fn reductions_match_host_reference() -> AssertionCases {
             .compare_with(approx_compare::<1, f32>(1e-5))
             .runs(3)
             .into_case("reductions_indexing::reductions_match_host_reference::max_axis0"),
+    );
+
+    // max along axis 1
+    assertions.push(
+        fusor_conformance::assert(async |x: Tensor<2, f32>| x.max::<1>(1))
+            .arg(fuzz.clone())
+            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+                Tensor::from_slice(
+                    &device,
+                    [SHAPE[0]],
+                    &reduce_axis2(&v, 1, f32::NEG_INFINITY, f32::max),
+                )
+            })
+            .compare_with(approx_compare::<1, f32>(1e-5))
+            .runs(3)
+            .into_case("reductions_indexing::reductions_match_host_reference::max_axis1"),
     );
 
     // min along axis 0
@@ -60,20 +88,26 @@ pub fn reductions_match_host_reference() -> AssertionCases {
             .into_case("reductions_indexing::reductions_match_host_reference::min_axis0"),
     );
 
-    // product along axis 1 (bounded to avoid overflow)
-    let fuzz_small = FuzzGenerator::<2, f32>::new(SHAPE)
-        .with_seed(201)
-        .with_distribution(Uniform::new(0.5, 2.0).unwrap());
+    // product along axis 1 (bounded to avoid overflow). The reduced column dim is
+    // swept over [45, 4] so both the full-width [45, 45] reduction and a small
+    // [45, 4] product are exercised; the [45] row count (and thus the output
+    // length) is unchanged by the sweep.
+    let fuzz_small = with_shape_specs(
+        FuzzGenerator::<2, f32>::new(SHAPE)
+            .with_seed(201)
+            .with_distribution(Uniform::new(0.5, 2.0).unwrap()),
+        [[SHAPE[0], SHAPE[0]], [SHAPE[1], 4]],
+    );
     assertions.push(
         fusor_conformance::assert(async |x: Tensor<2, f32>| x.product::<1>(1))
             .arg(fuzz_small)
             .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
                 Tensor::from_slice(&device, [SHAPE[0]], &reduce_axis2(&v, 1, 1.0, |a, b| a * b))
             })
-            // Product of 45 values in [0.5, 2.0] grows to ~1e5 in some seeds;
-            // an absolute 1e-3 tolerance becomes meaningless. 0.01% relative
-            // catches accuracy regressions while accommodating GPU-vs-host
-            // accumulation order.
+            // Product of up to 45 values in [0.5, 2.0] grows to ~1e5 in some
+            // seeds; an absolute 1e-3 tolerance becomes meaningless. 0.01%
+            // relative catches accuracy regressions while accommodating
+            // GPU-vs-host accumulation order.
             .compare_with(relative_compare::<1>(1e-4))
             .runs(3)
             .into_case("reductions_indexing::reductions_match_host_reference::product_axis1"),
@@ -196,30 +230,13 @@ pub fn reductions_match_host_reference() -> AssertionCases {
 }
 
 pub fn indexing_cast_and_rank_specific_indexing_match_reference() -> AssertionCases {
-    // index_select, slice_assign, and cast use fuzzed data
+    // slice_assign and cast use fuzzed data. (index_select dim=1 is covered by
+    // index_select_fuzzed::rank2_dim1.)
     const SHAPE: [usize; 2] = [45, 45];
     let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
         .with_seed(210)
         .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
     let mut assertions = AssertionCases::new();
-
-    static IDX_DIM1: &[u32] = &[3, 1, 0];
-
-    // index_select dim=1
-    assertions.push(
-        fusor_conformance::assert(async |x: Tensor<2, f32>| {
-        let indices = Tensor::from_slice(&x.device(), [IDX_DIM1.len()], IDX_DIM1);
-        x.index_select(1, &indices)
-    })
-    .arg(fuzz.clone())
-    .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-        Tensor::new(&device, &index_select2(&v, 1, IDX_DIM1))
-    })
-    .compare_with(approx_compare::<2, f32>(1e-6))
-    .runs(3)
-    .into_case(
-        "reductions_indexing::indexing_cast_and_rank_specific_indexing_match_reference::index_select_dim1",
-    ));
 
     // slice_assign
     let fuzz_patch = FuzzGenerator::<2, f32>::new([2, 2])
@@ -264,111 +281,6 @@ pub fn indexing_cast_and_rank_specific_indexing_match_reference() -> AssertionCa
     .into_case(
         "reductions_indexing::indexing_cast_and_rank_specific_indexing_match_reference::cast_f16_round_trip",
     ));
-
-    assertions
-}
-
-pub fn full_tensor_reductions_fuzzed() -> AssertionCases {
-    // 2D reductions with fuzzed data + non-contiguous layouts
-    const SHAPE: [usize; 2] = [45, 45];
-    let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
-        .with_seed(42)
-        .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
-    let mut assertions = AssertionCases::new();
-
-    // sum along axis 1
-    assertions.push(
-        fusor_conformance::assert(async |x: Tensor<2, f32>| x.sum::<1>(1))
-            .arg(fuzz.clone())
-            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-                let out: Vec<f32> = v.iter().map(|row| row.iter().sum()).collect();
-                Tensor::from_slice(&device, [SHAPE[0]], &out)
-            })
-            .compare_with(approx_compare::<1, f32>(1e-3))
-            .runs(3)
-            .into_case("reductions_indexing::full_tensor_reductions_fuzzed::sum_axis1"),
-    );
-
-    // sum along axis 0
-    assertions.push(
-        fusor_conformance::assert(async |x: Tensor<2, f32>| x.sum::<1>(0))
-            .arg(fuzz.clone())
-            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-                let out = reduce_axis2(&v, 0, 0.0, |a, b| a + b);
-                Tensor::from_slice(&device, [SHAPE[1]], &out)
-            })
-            .compare_with(approx_compare::<1, f32>(1e-3))
-            .runs(3)
-            .into_case("reductions_indexing::full_tensor_reductions_fuzzed::sum_axis0"),
-    );
-
-    // max along axis 1
-    assertions.push(
-        fusor_conformance::assert(async |x: Tensor<2, f32>| x.max::<1>(1))
-            .arg(fuzz.clone())
-            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-                let out = reduce_axis2(&v, 1, f32::NEG_INFINITY, f32::max);
-                Tensor::from_slice(&device, [SHAPE[0]], &out)
-            })
-            .compare_with(approx_compare::<1, f32>(1e-5))
-            .runs(3)
-            .into_case("reductions_indexing::full_tensor_reductions_fuzzed::max_axis1"),
-    );
-
-    // min along axis 0
-    assertions.push(
-        fusor_conformance::assert(async |x: Tensor<2, f32>| x.min::<1>(0))
-            .arg(fuzz.clone())
-            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-                let out = reduce_axis2(&v, 0, f32::INFINITY, f32::min);
-                Tensor::from_slice(&device, [SHAPE[1]], &out)
-            })
-            .compare_with(approx_compare::<1, f32>(1e-5))
-            .runs(3)
-            .into_case("reductions_indexing::full_tensor_reductions_fuzzed::min_axis0"),
-    );
-
-    // product along axis 1 (small range to avoid overflow)
-    let fuzz_small = FuzzGenerator::<2, f32>::new([4, 6])
-        .with_seed(43)
-        .with_distribution(Uniform::new(0.5, 2.0).unwrap());
-    assertions.push(
-        fusor_conformance::assert(async |x: Tensor<2, f32>| x.product::<1>(1))
-            .arg(fuzz_small)
-            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-                let out = reduce_axis2(&v, 1, 1.0, |a, b| a * b);
-                Tensor::from_slice(&device, [4], &out)
-            })
-            .compare_with(approx_compare::<1, f32>(1e-2))
-            .runs(3)
-            .into_case("reductions_indexing::full_tensor_reductions_fuzzed::product_axis1"),
-    );
-
-    // mean along axis 1
-    assertions.push(
-        fusor_conformance::assert(async |x: Tensor<2, f32>| x.mean::<1>(1))
-            .arg(fuzz.clone())
-            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-                let out = mean_axis2(&v, 1);
-                Tensor::from_slice(&device, [SHAPE[0]], &out)
-            })
-            .compare_with(approx_compare::<1, f32>(1e-4))
-            .runs(3)
-            .into_case("reductions_indexing::full_tensor_reductions_fuzzed::mean_axis1"),
-    );
-
-    // var along axis 1
-    assertions.push(
-        fusor_conformance::assert(async |x: Tensor<2, f32>| x.var::<1>(1))
-            .arg(fuzz)
-            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-                let out = var_axis2(&v, 1);
-                Tensor::from_slice(&device, [SHAPE[0]], &out)
-            })
-            .compare_with(approx_compare::<1, f32>(1e-3))
-            .runs(3)
-            .into_case("reductions_indexing::full_tensor_reductions_fuzzed::var_axis1"),
-    );
 
     assertions
 }

@@ -7,6 +7,7 @@ use crate::common::{matmul2, transpose2};
 use fusor::{BlockQ4K, Device, GgmlType, GgufBlock, QMatrix, QuantizedTensor, Tensor, ToVec2};
 use fusor_conformance::{
     AssertionCase, AssertionCases, approx_compare, approx_or_relative_compare, available_devices,
+    cases_from_rows,
 };
 use rand::distr::Uniform;
 use std::mem::size_of;
@@ -93,7 +94,19 @@ pub fn q4k_dynamic_paired_helper_swiglu_matches_cpu_reference_for_decode_row() -
     )
 }
 
-pub fn q4k_concat_split_llama_shape_one_hot_matches_cpu_reference() -> AssertionCase {
+/// Both Llama-shaped (`[14336, 4096]`, 48 input rows) paired q4k matmul cases:
+/// the one-hot input (`selected_k = 777`) form and the dense-sampled-columns
+/// form. Each remains an independently named GPU-only sub-case so the distinct
+/// behaviors (sparse single-column dispatch vs. full-width accumulation) are
+/// preserved.
+pub fn q4k_concat_split_llama_shape_match_cpu_reference() -> AssertionCases {
+    cases_from_rows([
+        llama_shape_one_hot_case(),
+        llama_shape_dense_sampled_columns_case(),
+    ])
+}
+
+fn llama_shape_one_hot_case() -> AssertionCase {
     use fusor::D;
     let weight_shape = [14336usize, 4096usize];
     let pair_len = weight_shape[0] / 2;
@@ -169,11 +182,11 @@ pub fn q4k_concat_split_llama_shape_one_hot_matches_cpu_reference() -> Assertion
     .devices_async(gpu_devices())
     .runs(1)
     .into_case(
-        "quantized_matmul_paired::q4k_concat_split_llama_shape_one_hot_matches_cpu_reference",
+        "quantized_matmul_paired::q4k_concat_split_llama_shape_match_cpu_reference::one_hot",
     )
 }
 
-pub fn q4k_concat_split_llama_shape_dense_sampled_columns_match_cpu_reference() -> AssertionCase {
+fn llama_shape_dense_sampled_columns_case() -> AssertionCase {
     use fusor::D;
 
     let weight_shape = [14336usize, 4096usize];
@@ -270,7 +283,7 @@ pub fn q4k_concat_split_llama_shape_dense_sampled_columns_match_cpu_reference() 
     .devices_async(gpu_devices())
     .runs(1)
     .into_case(
-        "quantized_matmul_paired::q4k_concat_split_llama_shape_dense_sampled_columns_match_cpu_reference",
+        "quantized_matmul_paired::q4k_concat_split_llama_shape_match_cpu_reference::dense_sampled_columns",
     )
 }
 
@@ -368,58 +381,4 @@ fn gated_matches_cpu_for_rows(input_row_count: usize, kind: GatedKind) -> Assert
         kind.name(),
         input_row_count
     ))
-}
-
-/// Authoring the natural source (`q_mat_mul → narrow → silu → mul(narrow)`)
-/// should produce results identical to the CPU reference.
-pub fn q4k_concat_split_swiglu_matches_cpu_reference() -> AssertionCase {
-    use fusor::D;
-    let ty = GgmlType::Q4K;
-    let weight_shape = [4, 512];
-    let pair_len = weight_shape[0] / 2;
-    let raw_bytes = q4k_raw_bytes(weight_shape);
-    let weights = QuantizedTensor::<BlockQ4K>::from_raw_bytes(weight_shape, &raw_bytes);
-    let expected_weights = concrete_to_rows(&weights.dequantize::<2>(), weight_shape);
-
-    fusor_conformance::assert(move |input: Tensor<2, f32>| {
-        let raw_bytes = raw_bytes.clone();
-        async move {
-            let weights = qmatrix_from_raw_bytes(&input.device(), weight_shape, &raw_bytes, ty);
-            let projected = input.q_mat_mul(&weights);
-            let gate = projected.narrow(D::Minus1, 0, pair_len).to_concrete();
-            let up = projected
-                .narrow(D::Minus1, pair_len, pair_len)
-                .to_concrete();
-            (gate.silu() * up).to_concrete()
-        }
-    })
-    .arg(q_mat_mul_input_fuzz(
-        1,
-        [2, weight_shape[1]],
-        0x5A17_5516_6C76,
-        Uniform::new(-0.25, 0.25).unwrap(),
-    ))
-    .equal_to(move |input: Tensor<2, f32>| {
-        let expected_weights = expected_weights.clone();
-        async move {
-            let device = input.device();
-            let input_values = input.as_slice().await.unwrap().to_vec2();
-            let projected = matmul2(&input_values, &transpose2(&expected_weights));
-            let expected = projected
-                .iter()
-                .map(|row| {
-                    let silu = |x: f32| x / (1.0 + (-x).exp());
-                    (0..pair_len)
-                        .map(|col| silu(row[col]) * row[col + pair_len])
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-            Tensor::new(&device, &expected)
-        }
-    })
-    .compare_with(approx_compare::<2, f32>(2.0))
-    .baseline_on_test_device()
-    .devices_async(gpu_devices())
-    .runs(3)
-    .into_case("quantized_matmul_paired::q4k_concat_split_swiglu_matches_cpu_reference")
 }

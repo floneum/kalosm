@@ -286,6 +286,25 @@ fn make_sliced<const R: usize, T: SimdElement + DataType + Default>(
     padded.narrow(pad_dim, pad, shape[pad_dim]).to_concrete()
 }
 
+/// Replace a generator's shape specs with a wider sweep (e.g. `Choices`/`Range`)
+/// without rebuilding it, so a consolidated case can fuzz small + large shapes in
+/// one assertion. The value distribution, seeds, and sampler are preserved.
+///
+/// Lives here because `FuzzGenerator::shape_specs` is private.
+///
+/// ```ignore
+/// let gen = with_shape_specs(FuzzGenerator::<2, f32>::new([45, 45]), [[45, 256], [45, 256]]);
+/// // sweep small and large in one case:
+/// assert(op).arg(gen).equal_to(/* ... */).runs(6);
+/// ```
+pub fn with_shape_specs<const R: usize, T: SimdElement + DataType>(
+    mut generator: FuzzGenerator<R, T>,
+    shapes: impl IntoFuzzShape<R>,
+) -> FuzzGenerator<R, T> {
+    generator.shape_specs = shapes.into_shape_specs();
+    generator
+}
+
 impl<const R: usize> FuzzGenerator<R, f32> {
     pub fn with_positive(mut self) -> Self {
         self.distribution =

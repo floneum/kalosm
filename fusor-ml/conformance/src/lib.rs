@@ -6,6 +6,7 @@
 mod builder;
 mod comparison;
 mod fuzz;
+mod table;
 mod tuple_macros;
 
 extern crate self as fusor_conformance;
@@ -24,7 +25,8 @@ pub use comparison::{
     approx_or_relative_compare, approx_or_relative_eq, eq_with, exact_compare, exact_eq,
     exact_value_compare, relative_compare, relative_eq,
 };
-pub use fuzz::{FuzzGenerator, FuzzSizeSpec, GenerateFromDevice, IntoFuzzShape};
+pub use fuzz::{FuzzGenerator, FuzzSizeSpec, GenerateFromDevice, IntoFuzzShape, with_shape_specs};
+pub use table::{binary_fuzz_case, unary_fuzz_case};
 pub use tuple_macros::{AsyncFnMutTuple, GenTuple, PopTuple, PushTuple, ResolveTensorTuple};
 
 /// Error returned by a conformance case. A boxed error so cases (and the shared
@@ -209,4 +211,30 @@ pub fn sequential_tensor<const R: usize, T: DataType + SimdElement + From<u16>>(
 
 pub fn assert<T, U>(op: impl AsyncFnMutTuple<T, Output = U> + 'static) -> AssertBuilder<T, U> {
     AssertBuilder::new(op)
+}
+
+/// Flatten an iterator of per-row [`AssertionCase`]/[`AssertionCases`] into one
+/// [`AssertionCases`].
+///
+/// A consolidated producer builds a `Vec` of rows (each from
+/// [`unary_fuzz_case`]/[`binary_fuzz_case`] or any builder `.into_case(..)`) and
+/// folds them into a single returned `AssertionCases`, replacing repeated
+/// `assertions.push(...)` boilerplate.
+///
+/// ```ignore
+/// pub fn unary_math_ops_match_host_reference() -> AssertionCases {
+///     cases_from_rows([
+///         unary_fuzz_case("elementwise_ops::sin", signed(), sin_op, f32::sin, approx_compare::<2, f32>(1e-4), 3),
+///         unary_fuzz_case("elementwise_ops::cos", signed(), cos_op, f32::cos, approx_compare::<2, f32>(1e-4), 3),
+///     ])
+/// }
+/// ```
+pub fn cases_from_rows<C: Into<AssertionCases>>(
+    rows: impl IntoIterator<Item = C>,
+) -> AssertionCases {
+    let mut out = AssertionCases::new();
+    for row in rows {
+        out.extend(row.into());
+    }
+    out
 }
