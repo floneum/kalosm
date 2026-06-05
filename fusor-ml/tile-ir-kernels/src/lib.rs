@@ -30,5 +30,6 @@ pub use kernels::{
     RmsNormVec4Meta, SoftmaxMeta, StandardSampler, TensorMeta, TopKChunkMeta, TopKExactnessMeta,
 };
 pub use types::{
-    DenseMatmulEpilogues, QmatmulEpilogues, QmatmulExtra, UnaryEpilogue, UnaryEpilogueWithExtras,
+    cooperative_store_layout_supported, DenseMatmulEpilogues, QmatmulEpilogues, QmatmulExtra,
+    UnaryEpilogue, UnaryEpilogueWithExtras,
 };

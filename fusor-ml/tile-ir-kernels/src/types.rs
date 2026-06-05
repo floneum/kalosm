@@ -348,7 +348,7 @@ pub(crate) fn matrix_shape(layout: &Layout) -> [u32; 2] {
     ]
 }
 
-pub(crate) fn cooperative_store_layout_supported(layout: &Layout) -> bool {
+pub fn cooperative_store_layout_supported(layout: &Layout) -> bool {
     if !layout.is_affine() || layout.shape().rank() != 2 {
         return false;
     }

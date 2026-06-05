@@ -94,6 +94,13 @@ impl Resolver {
                     {
                         continue;
                     }
+                    if !qmatmul_op.supports_indexed_post_accumulator_offsets(
+                        &graph.device(),
+                        &nary.shape,
+                        &accumulator_offsets,
+                    ) {
+                        continue;
+                    }
 
                     let post_element_wise_expr = ElementwiseEpilogue {
                         expression,

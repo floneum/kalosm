@@ -152,8 +152,12 @@ fn qmatmul_coop_supported(caps: KernelDeviceCaps) -> bool {
             .supports(CooperativeMatrixKind::F32F32M8N8K8)
 }
 
+fn qmatmul_path_is_single_row_qgemv(path: QMatmulPath) -> bool {
+    matches!(path, QMatmulPath::SingleRow | QMatmulPath::Q5SmallSingleRow)
+}
+
 fn qmatmul_path_requires_coop(path: QMatmulPath) -> bool {
-    !matches!(path, QMatmulPath::SingleRow | QMatmulPath::Q5SmallSingleRow)
+    !qmatmul_path_is_single_row_qgemv(path)
 }
 
 fn qmatmul_direct_path_supported(path: QMatmulPath, caps: KernelDeviceCaps) -> bool {
@@ -378,6 +382,52 @@ impl QMatMulOperation {
     fn n_size(&self) -> u32 {
         self.out_shape[self.out_shape.len() - 1] as u32
     }
+
+    pub(crate) fn supports_indexed_post_accumulator_offsets(
+        &self,
+        device: &Device,
+        output_shape: &[usize],
+        accumulator_offsets: &[u32],
+    ) -> bool {
+        if self.input_datatype != DataTypeEnum::F32 {
+            return false;
+        }
+        let Some(format) = qmatrix_direct_quant_format(&self.matrix) else {
+            return false;
+        };
+        let Some((m, k)) = flattened_matrix_shape_u32(&self.in_shape) else {
+            return false;
+        };
+        let Some((y_m, n)) = flattened_matrix_shape_u32(output_shape) else {
+            return false;
+        };
+        if m != y_m {
+            return false;
+        }
+        let Some(&matrix_n) = self.matrix.shape().first() else {
+            return false;
+        };
+        let Ok(matrix_n) = u32::try_from(matrix_n) else {
+            return false;
+        };
+        let Some(max_accumulator_offset) = accumulator_offsets.iter().copied().max() else {
+            return false;
+        };
+
+        let caps = KernelDeviceCaps::from_device(device);
+        let variant = select_qmatmul_direct_variant(format, m, k, n, false, caps);
+        qmatmul_custom_accumulator_offsets_supported(
+            format,
+            variant,
+            m,
+            k,
+            n,
+            matrix_n,
+            max_accumulator_offset,
+            caps,
+            effective_qmatmul_max_workgroups_per_dimension(&device.limits()),
+        )
+    }
 }
 
 pub(crate) struct DirectKernelTensors<'a> {
@@ -488,6 +538,45 @@ fn qmatmul_variant_supports_coop_acc_init(
         QMatmulPath::Q5SmallSingleRow | QMatmulPath::SingleRow => return false,
     };
     m.is_multiple_of(tile.bm) && n.is_multiple_of(tile.bn)
+}
+
+fn qmatmul_qgemv_dispatch_supported(
+    format: tile_ir::GgmlQuantFormat,
+    k: u32,
+    n: u32,
+    max_workgroups_per_dimension: u32,
+) -> bool {
+    let qgemv_cols_per_workgroup = qgemv_cols_per_workgroup_for_direct(format, k, n);
+    let qgemv_workgroups = n.div_ceil(qgemv_cols_per_workgroup);
+    split_workgroups_2d(qgemv_workgroups, max_workgroups_per_dimension).is_some()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qmatmul_custom_accumulator_offsets_supported(
+    format: tile_ir::GgmlQuantFormat,
+    variant: QMatmulPath,
+    m: u32,
+    k: u32,
+    n: u32,
+    matrix_n: u32,
+    max_accumulator_offset: u32,
+    caps: KernelDeviceCaps,
+    max_workgroups_per_dimension: u32,
+) -> bool {
+    qmatmul_custom_accumulator_offsets_cover_output(m, n, matrix_n, max_accumulator_offset)
+        && qmatmul_path_is_single_row_qgemv(variant)
+        && qmatmul_direct_path_supported(variant, caps)
+        && qmatmul_qgemv_dispatch_supported(format, k, n, max_workgroups_per_dimension)
+}
+
+fn flattened_matrix_shape_u32(shape: &[usize]) -> Option<(u32, u32)> {
+    if shape.len() < 2 || shape.contains(&0) {
+        return None;
+    }
+    let rows = shape[..shape.len() - 1]
+        .iter()
+        .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))?;
+    Some((rows.try_into().ok()?, (*shape.last()?).try_into().ok()?))
 }
 
 enum QmatmulExtraStorage {
@@ -653,14 +742,6 @@ fn split_workgroups_2d(
 
 fn effective_qmatmul_max_workgroups_per_dimension(limits: &wgpu::Limits) -> u32 {
     limits.max_compute_workgroups_per_dimension.max(1)
-}
-
-fn tile_cooperative_store_layout_supported(layout: &tile_ir::Layout) -> bool {
-    if !layout.is_affine() || layout.shape().rank() != 2 {
-        return false;
-    }
-    let strides = layout.affine_strides();
-    strides[0] == 1 || strides[1] == 1
 }
 
 /// Output columns per workgroup for the direct qgemv path, by (format, K, N).

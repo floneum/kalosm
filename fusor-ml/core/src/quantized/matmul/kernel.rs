@@ -68,12 +68,23 @@ impl QMatMulOperation {
         if m != y_m || k != matrix.shape[1] as u32 {
             return None;
         }
+        let limits = device.limits();
+        let caps = KernelDeviceCaps::from_device(device);
+        let max_workgroups = effective_qmatmul_max_workgroups_per_dimension(&limits);
+        let y_supports_coop = tile_ir_kernels::cooperative_store_layout_supported(&y_view.layout);
+        let variant = select_qmatmul_direct_variant(format, m, k, n, y_supports_coop, caps);
+        let use_workgroup_qmatmul = !qmatmul_direct_path_supported(variant, caps) || f16_storage;
         if has_custom_accumulator_offsets {
-            if !qmatmul_custom_accumulator_offsets_cover_output(
+            if !qmatmul_custom_accumulator_offsets_supported(
+                format,
+                variant,
                 m,
+                k,
                 n,
                 matrix_n,
                 max_accumulator_offset,
+                caps,
+                max_workgroups,
             ) {
                 return None;
             }
@@ -121,18 +132,7 @@ impl QMatMulOperation {
                 (view.rows == m && view.cols == n).then_some(Some(view))
             })
             .collect::<Option<Vec<_>>>()?;
-        let limits = device.limits();
-        let caps = KernelDeviceCaps::from_device(device);
-        let max_workgroups = effective_qmatmul_max_workgroups_per_dimension(&limits);
         let mut qmatmul_workgroups_x = 1;
-        let y_supports_coop = tile_cooperative_store_layout_supported(&y_view.layout);
-        let variant = select_qmatmul_direct_variant(format, m, k, n, y_supports_coop, caps);
-        // Single-row direct qgemv needs subgroup collectives; multi-row direct
-        // qmatmul also needs the cooperative-matrix path.
-        let use_workgroup_qmatmul = !qmatmul_direct_path_supported(variant, caps) || f16_storage;
-        if has_custom_accumulator_offsets && use_workgroup_qmatmul {
-            return None;
-        }
         let use_f16_workgroup_tiles = f16_storage;
         let use_coop_acc_init_epilogue = !use_workgroup_qmatmul
             && !has_custom_accumulator_offsets

@@ -233,6 +233,32 @@ mod selection_tests {
             2, 9, 10, 1
         ));
     }
+
+    #[test]
+    fn indexed_post_accumulator_offsets_require_subgroup_direct_qgemv_support() {
+        let format = tile_ir::GgmlQuantFormat::Q4KNative;
+        let m = 1;
+        let k = 4096;
+        let n = 4096;
+        let variant = select_qmatmul_direct_variant(format, m, k, n, false, caps(false));
+        let supported = |caps, max_workgroups| {
+            qmatmul_custom_accumulator_offsets_supported(
+                format,
+                variant,
+                m,
+                k,
+                n,
+                n * 2,
+                n,
+                caps,
+                max_workgroups,
+            )
+        };
+
+        assert!(supported(caps(false), 65_535));
+        assert!(!supported(no_subgroup_caps(false), 65_535));
+        assert!(!supported(caps(false), 1));
+    }
 }
 
 #[cfg(test)]
@@ -465,6 +491,38 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    #[test]
+    fn q4k_paired_silu_single_row_no_subgroup_resolves() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let device = device.without_subgroups();
+
+            let weight_shape = [64usize, 512usize];
+            let raw_bytes = patterned_q4k_bytes(weight_shape);
+            let matrix =
+                QMatrix::from_parts(&device, &raw_bytes, weight_shape.into(), GgmlType::Q4K)
+                    .unwrap();
+            let input_values = (0..weight_shape[1])
+                .map(|index| {
+                    let bucket = (index.wrapping_mul(29).wrapping_add(5)) % 61;
+                    (bucket as f32 - 30.0) * 0.001
+                })
+                .collect::<Vec<_>>();
+            let input = Tensor::from_slice::<f32>(&device, [1, weight_shape[1]], &input_values);
+
+            let result = input
+                .q_mat_mul_paired_silu_product(&matrix)
+                .as_slice::<2, f32>()
+                .await
+                .unwrap();
+
+            assert_eq!(result.shape(), &[1, weight_shape[0] / 2]);
+            assert!(result.as_slice().iter().all(|value| value.is_finite()));
         });
     }
 
