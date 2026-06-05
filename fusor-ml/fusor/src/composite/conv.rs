@@ -132,9 +132,9 @@ where
                 Tensor::Gpu(bias) => Some(bias),
                 Tensor::Cpu(_) => None,
             });
-            if let Some(output) = input.try_conv_nd_direct::<WEIGHT_RANK, DIFF>(
-                weight, bias, padding, strides,
-            ) {
+            if let Some(output) =
+                input.try_conv_nd_direct::<WEIGHT_RANK, DIFF>(weight, bias, padding, strides)
+            {
                 return Tensor::Gpu(output);
             }
         }

@@ -58,7 +58,7 @@ fn binding_limit_sum_data(shape: [usize; 2], num_tensors: usize) -> Vec<f32> {
     for i in 0..num_tensors {
         for (out, value) in out
             .iter_mut()
-            .zip(matrix_data(shape, i as f32 * 0.3).into_iter())
+            .zip(matrix_data(shape, i as f32 * 0.3))
         {
             *out += value;
         }
