@@ -519,9 +519,11 @@ fn dispatch_direct_tile_matmul(
             if let Some(tile) = matmul_tile {
                 tile_ir_kernels::batched_matmul_with_epilogues(
                     phase,
-                    &a,
-                    &b,
-                    &y,
+                    tile_ir_kernels::DenseMatmulTensors {
+                        a: &a,
+                        b: &b,
+                        y: &y,
+                    },
                     shape,
                     epilogues,
                     max_wg_per_dim,

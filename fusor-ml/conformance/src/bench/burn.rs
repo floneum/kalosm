@@ -170,7 +170,7 @@ pub fn unary_trig_chain() -> BenchmarkCase {
                 shape,
                 &device,
             );
-            materialize_inputs(&[input.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&input)).await?;
 
             let samples = time_samples(config, || {
                 let output = input.clone().sin() + input.clone().cos();
@@ -198,7 +198,7 @@ pub fn activation_gelu() -> BenchmarkCase {
                 shape,
                 &device,
             );
-            materialize_inputs(&[input.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&input)).await?;
 
             let samples = time_samples(config, || {
                 let output = activation::gelu(input.clone());
@@ -232,8 +232,8 @@ pub fn broadcast_add() -> BenchmarkCase {
                 vector_shape,
                 &device,
             );
-            materialize_inputs(&[matrix.clone()]).await?;
-            materialize_inputs(&[vector.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&matrix)).await?;
+            materialize_inputs(std::slice::from_ref(&vector)).await?;
 
             let samples = time_samples(config, || {
                 let output = matrix.clone() + vector.clone().reshape([1, vector_shape[0]]);
@@ -263,7 +263,7 @@ pub fn transpose_then_elementwise() -> BenchmarkCase {
                     shape,
                     &device,
                 );
-                materialize_inputs(&[input.clone()]).await?;
+                materialize_inputs(std::slice::from_ref(&input)).await?;
 
                 let samples = time_samples(config, || {
                     let transposed = input.clone().transpose();
@@ -293,7 +293,7 @@ pub fn reduction_sum_last_dim() -> BenchmarkCase {
                 shape,
                 &device,
             );
-            materialize_inputs(&[input.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&input)).await?;
 
             let samples = time_samples(config, || {
                 let output = input.clone().sum_dim(1);
@@ -323,7 +323,7 @@ pub fn reduction_max_middle_axis() -> BenchmarkCase {
                     shape,
                     &device,
                 );
-                materialize_inputs(&[input.clone()]).await?;
+                materialize_inputs(std::slice::from_ref(&input)).await?;
 
                 let samples = time_samples(config, || {
                     let output = input.clone().max_dim(1);
@@ -352,7 +352,7 @@ pub fn softmax_last_dim() -> BenchmarkCase {
                 shape,
                 &device,
             );
-            materialize_inputs(&[input.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&input)).await?;
 
             let samples = time_samples(config, || {
                 let output = activation::softmax(input.clone(), 1);
@@ -380,7 +380,7 @@ pub fn softmax_middle_axis() -> BenchmarkCase {
                 shape,
                 &device,
             );
-            materialize_inputs(&[input.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&input)).await?;
 
             let samples = time_samples(config, || {
                 let output = activation::softmax(input.clone(), 1);
@@ -412,7 +412,7 @@ pub fn layer_norm_last_dim() -> BenchmarkCase {
             let layer = burn::nn::LayerNormConfig::new(last_dim)
                 .with_epsilon(1.0e-5)
                 .init::<Wgpu>(&device);
-            materialize_inputs(&[input.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&input)).await?;
 
             let samples = time_samples(config, || {
                 let output = layer.clone().forward(input.clone());
@@ -444,7 +444,7 @@ pub fn rms_norm_fused() -> BenchmarkCase {
             let rms = RmsNormConfig::new(last_dim)
                 .with_epsilon(1.0e-5)
                 .init::<Wgpu>(&device);
-            materialize_inputs(&[input.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&input)).await?;
 
             let samples = time_samples(config, || {
                 let output = rms.clone().forward(input.clone());
@@ -552,9 +552,9 @@ pub fn conv1d_small() -> BenchmarkCase {
                 bias_shape,
                 &device,
             );
-            materialize_inputs(&[input.clone()]).await?;
-            materialize_inputs(&[weight.clone()]).await?;
-            materialize_inputs(&[bias.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&input)).await?;
+            materialize_inputs(std::slice::from_ref(&weight)).await?;
+            materialize_inputs(std::slice::from_ref(&bias)).await?;
 
             let samples = time_samples(config, || {
                 let output = module::conv1d(
@@ -591,7 +591,7 @@ pub fn top_k_large() -> BenchmarkCase {
                 })
                 .collect::<Vec<_>>();
             let input = burn_tensor(values, [input_len], &device);
-            materialize_inputs(&[input.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&input)).await?;
 
             let samples = time_samples(config, || {
                 let output = input.clone().topk(k, 0);
@@ -620,7 +620,7 @@ pub fn top_k_qwen_vocab() -> BenchmarkCase {
                 [input_len],
                 &device,
             );
-            materialize_inputs(&[input.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&input)).await?;
 
             let samples = time_samples(config, || {
                 let output = input.clone().topk(k, 0);
@@ -655,8 +655,8 @@ pub fn q8_0_qgemv() -> BenchmarkCase {
                 dense_weight_shape,
                 &device,
             );
-            materialize_inputs(&[input.clone()]).await?;
-            materialize_inputs(&[weights.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&input)).await?;
+            materialize_inputs(std::slice::from_ref(&weights)).await?;
 
             let samples = time_samples(config, || {
                 let output = input.clone().matmul(weights.clone());
@@ -691,8 +691,8 @@ pub fn q4k_qgemv() -> BenchmarkCase {
                 dense_weight_shape,
                 &device,
             );
-            materialize_inputs(&[input.clone()]).await?;
-            materialize_inputs(&[weights.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&input)).await?;
+            materialize_inputs(std::slice::from_ref(&weights)).await?;
 
             let samples = time_samples(config, || {
                 let output = input.clone().matmul(weights.clone());
@@ -728,8 +728,8 @@ pub fn q4k_paired_silu() -> BenchmarkCase {
                 dense_weight_shape,
                 &device,
             );
-            materialize_inputs(&[input.clone()]).await?;
-            materialize_inputs(&[weights.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&input)).await?;
+            materialize_inputs(std::slice::from_ref(&weights)).await?;
 
             let samples = time_samples(config, || {
                 let projected = input.clone().matmul(weights.clone());
@@ -866,7 +866,7 @@ pub fn rope_fused_decode() -> BenchmarkCase {
                 &device,
             );
             let rope = RotaryEncodingConfig::new(seq_len * 2, head_dim).init::<Wgpu>(&device);
-            materialize_inputs(&[input.clone()]).await?;
+            materialize_inputs(std::slice::from_ref(&input)).await?;
 
             let samples = time_samples(config, || {
                 let output = rope.clone().forward(input.clone());

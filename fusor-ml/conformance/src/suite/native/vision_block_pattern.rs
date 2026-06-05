@@ -168,12 +168,14 @@ pub async fn vision_block_pattern_flush_vs_no_flush_timing() {
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn vision_block_pattern_resolves_without_periodic_flush() {
         let _gpu_guard = crate::suite::registry::gpu_test_guard();
         super::vision_block_pattern_resolves_without_periodic_flush().await;
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn vision_block_pattern_flush_vs_no_flush_timing() {
         let _gpu_guard = crate::suite::registry::gpu_test_guard();

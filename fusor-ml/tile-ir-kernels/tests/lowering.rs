@@ -8,8 +8,9 @@ use fusor_tile_ir_kernels::{
     qgemv_workgroup_with_epilogue, qmatmul_with_epilogue, qmatmul_workgroup_f16_with_epilogues,
     qmatmul_workgroup_with_epilogues, quantized_matrix, rms_norm_vec4, try_batched_coop_matmul,
     DenseCoopMatmulTile, DenseMatmulEpilogues, DenseMatmulShape, DenseMatmulTensors,
-    FlashAttentionDims, FlashAttentionMeta, FlashAttentionTensors, QmatmulEpilogues, RmsNormVec4,
-    RmsNormVec4Meta, TensorMeta, UnaryEpilogue, UnaryEpilogueWithExtras,
+    DenseMatmulTile, FlashAttentionDims, FlashAttentionMeta, FlashAttentionTensors,
+    QmatmulEpilogues, RmsNormVec4, RmsNormVec4Meta, TensorMeta, UnaryEpilogue,
+    UnaryEpilogueWithExtras,
 };
 
 fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
@@ -178,12 +179,15 @@ fn batched_dense_f32_matmul_lowers() {
         );
         batched_matmul_with_epilogues(
             program,
-            &a,
-            &b,
-            &y,
+            DenseMatmulTensors {
+                a: &a,
+                b: &b,
+                y: &y,
+            },
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            DenseMatmulTile::new(32, 32, 8, 4, 4, 64),
         );
     });
     lower_or_fail(&ir, "batched dense f32 matmul");
@@ -246,12 +250,15 @@ fn batched_dense_f16_matmul_lowers() {
         );
         batched_matmul_with_epilogues(
             program,
-            &a,
-            &b,
-            &y,
+            DenseMatmulTensors {
+                a: &a,
+                b: &b,
+                y: &y,
+            },
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            DenseMatmulTile::new(32, 32, 8, 4, 4, 64),
         );
     });
     lower_or_fail(&ir, "batched dense f16 matmul");

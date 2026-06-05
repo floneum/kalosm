@@ -34,23 +34,44 @@ pub(crate) struct ConvNdOperation {
     datatype: DataTypeEnum,
 }
 
+pub(crate) struct ConvNdNodes {
+    pub(crate) input: NodeIndex,
+    pub(crate) weight: NodeIndex,
+    pub(crate) bias: Option<NodeIndex>,
+}
+
+pub(crate) struct ConvNdShapeSpec<'a> {
+    pub(crate) input_shape: &'a [usize],
+    pub(crate) weight_shape: &'a [usize],
+    pub(crate) bias_shape: Option<&'a [usize]>,
+    pub(crate) padding: &'a [usize],
+    pub(crate) strides: &'a [usize],
+}
+
 impl ConvNdOperation {
     pub(crate) fn output_shape(&self) -> &[usize] {
         &self.output_shape
     }
 
     pub(crate) fn new(
-        input: NodeIndex,
-        weight: NodeIndex,
-        bias: Option<NodeIndex>,
-        input_shape: &[usize],
-        weight_shape: &[usize],
-        bias_shape: Option<&[usize]>,
-        padding: &[usize],
-        strides: &[usize],
+        nodes: ConvNdNodes,
+        spec: ConvNdShapeSpec<'_>,
         datatype: DataTypeEnum,
         device: &Device,
     ) -> Option<Self> {
+        let ConvNdNodes {
+            input,
+            weight,
+            bias,
+        } = nodes;
+        let ConvNdShapeSpec {
+            input_shape,
+            weight_shape,
+            bias_shape,
+            padding,
+            strides,
+        } = spec;
+
         let spatial_rank = padding.len();
         if spatial_rank == 0
             || strides.len() != spatial_rank
@@ -353,7 +374,7 @@ impl Operation for ConvNdOperation {
                         bias_storage
                             .load(
                                 program,
-                                layout_index(bias_meta, &[out_channel.clone()]),
+                                layout_index(bias_meta, std::slice::from_ref(&out_channel)),
                                 in_bounds.clone(),
                             )
                             .into_f32()

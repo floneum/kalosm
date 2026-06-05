@@ -1308,7 +1308,7 @@ async fn run_burn_case(
                 shape,
                 &device,
             );
-            burn_materialize_inputs(&[input.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&input)).await?;
             let samples = time_samples(config, || {
                 let output = input.clone().sin() + input.clone().cos();
                 async move { burn_materialize(output).await }
@@ -1330,7 +1330,7 @@ async fn run_burn_case(
                 shape,
                 &device,
             );
-            burn_materialize_inputs(&[input.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&input)).await?;
             let samples = time_samples(config, || {
                 let output = activation::gelu(input.clone());
                 async move { burn_materialize(output).await }
@@ -1358,8 +1358,8 @@ async fn run_burn_case(
                 vector_shape,
                 &device,
             );
-            burn_materialize_inputs(&[matrix.clone()]).await?;
-            burn_materialize_inputs(&[vector.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&matrix)).await?;
+            burn_materialize_inputs(std::slice::from_ref(&vector)).await?;
             let samples = time_samples(config, || {
                 let output = matrix.clone() + vector.clone().reshape([1, vector_shape[0]]);
                 async move { burn_materialize(output).await }
@@ -1381,7 +1381,7 @@ async fn run_burn_case(
                 shape,
                 &device,
             );
-            burn_materialize_inputs(&[input.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&input)).await?;
             let samples = time_samples(config, || {
                 let transposed = input.clone().transpose();
                 let output = transposed.clone() * transposed;
@@ -1404,7 +1404,7 @@ async fn run_burn_case(
                 shape,
                 &device,
             );
-            burn_materialize_inputs(&[input.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&input)).await?;
             let samples = time_samples(config, || {
                 let output = input.clone().sum_dim(1);
                 async move { burn_materialize(output).await }
@@ -1426,7 +1426,7 @@ async fn run_burn_case(
                 shape,
                 &device,
             );
-            burn_materialize_inputs(&[input.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&input)).await?;
             let samples = time_samples(config, || {
                 let output = input.clone().max_dim(1);
                 async move { burn_materialize(output).await }
@@ -1448,7 +1448,7 @@ async fn run_burn_case(
                 shape,
                 &device,
             );
-            burn_materialize_inputs(&[input.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&input)).await?;
             let samples = time_samples(config, || {
                 let output = activation::softmax(input.clone(), 1);
                 async move { burn_materialize(output).await }
@@ -1470,7 +1470,7 @@ async fn run_burn_case(
                 shape,
                 &device,
             );
-            burn_materialize_inputs(&[input.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&input)).await?;
             let samples = time_samples(config, || {
                 let output = activation::softmax(input.clone(), 1);
                 async move { burn_materialize(output).await }
@@ -1496,7 +1496,7 @@ async fn run_burn_case(
             let layer = LayerNormConfig::new(last_dim)
                 .with_epsilon(1.0e-5)
                 .init::<Wgpu>(&device);
-            burn_materialize_inputs(&[input.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&input)).await?;
             let samples = time_samples(config, || {
                 let output = layer.clone().forward(input.clone());
                 async move { burn_materialize(output).await }
@@ -1522,7 +1522,7 @@ async fn run_burn_case(
             let rms = RmsNormConfig::new(last_dim)
                 .with_epsilon(1.0e-5)
                 .init::<Wgpu>(&device);
-            burn_materialize_inputs(&[input.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&input)).await?;
             let samples = time_samples(config, || {
                 let output = rms.clone().forward(input.clone());
                 async move { burn_materialize(output).await }
@@ -1622,9 +1622,9 @@ async fn run_burn_case(
                 bias_shape,
                 &device,
             );
-            burn_materialize_inputs(&[input.clone()]).await?;
-            burn_materialize_inputs(&[weight.clone()]).await?;
-            burn_materialize_inputs(&[bias.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&input)).await?;
+            burn_materialize_inputs(std::slice::from_ref(&weight)).await?;
+            burn_materialize_inputs(std::slice::from_ref(&bias)).await?;
             let samples = time_samples(config, || {
                 let output = module::conv1d(
                     input.clone(),
@@ -1652,7 +1652,7 @@ async fn run_burn_case(
             let input_len = size.value;
             let k = if case == "top_k_qwen_vocab" { 40 } else { 64 };
             let input = burn_tensor(topk_values(input_len), [input_len], &device);
-            burn_materialize_inputs(&[input.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&input)).await?;
             let samples = time_samples(config, || {
                 let output = input.clone().topk(k, 0);
                 async move { burn_materialize(output).await }
@@ -1693,8 +1693,8 @@ async fn run_burn_case(
                 dense_weight_shape,
                 &device,
             );
-            burn_materialize_inputs(&[input.clone()]).await?;
-            burn_materialize_inputs(&[weights.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&input)).await?;
+            burn_materialize_inputs(std::slice::from_ref(&weights)).await?;
             let samples = time_samples(config, || {
                 let output = input.clone().matmul(weights.clone());
                 async move { burn_materialize(output).await }
@@ -1727,8 +1727,8 @@ async fn run_burn_case(
                 dense_weight_shape,
                 &device,
             );
-            burn_materialize_inputs(&[input.clone()]).await?;
-            burn_materialize_inputs(&[weights.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&input)).await?;
+            burn_materialize_inputs(std::slice::from_ref(&weights)).await?;
             let samples = time_samples(config, || {
                 let projected = input.clone().matmul(weights.clone());
                 let gate = projected.clone().narrow(1, 0, size.value);
@@ -1803,7 +1803,7 @@ async fn run_burn_case(
                 &device,
             );
             let rope = RotaryEncodingConfig::new(seq_len * 2, head_dim).init::<Wgpu>(&device);
-            burn_materialize_inputs(&[input.clone()]).await?;
+            burn_materialize_inputs(std::slice::from_ref(&input)).await?;
             let samples = time_samples(config, || {
                 let output = rope.clone().forward(input.clone());
                 async move { burn_materialize(output).await }

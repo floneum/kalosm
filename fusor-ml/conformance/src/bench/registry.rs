@@ -79,6 +79,7 @@ macro_rules! registry {
             }
 
             $(
+                #[allow(clippy::await_holding_lock)]
                 #[tokio::test]
                 async fn $case() {
                     let _gpu_guard = crate::suite::registry::gpu_test_guard();
@@ -172,6 +173,7 @@ mod burn_generated_tests {
     macro_rules! burn_tests {
         ($($case:ident),* $(,)?) => {
             $(
+                #[allow(clippy::await_holding_lock)]
                 #[tokio::test]
                 async fn $case() {
                     let _gpu_guard = crate::suite::registry::gpu_test_guard();

@@ -219,14 +219,13 @@ pub fn batched_gemv_with_epilogues(
 /// A is `[batch * m, k]`, B is `[batch * k, n]`, Y is `[batch * m, n]`.
 pub fn batched_matmul_with_epilogues(
     program: &mut Program,
-    a: &Storage,
-    b: &Storage,
-    y: &Storage,
+    tensors: DenseMatmulTensors<'_>,
     shape: DenseMatmulShape,
     epilogues: &DenseMatmulEpilogues<'_>,
     max_workgroups_per_dimension: u32,
     tile: DenseMatmulTile,
 ) {
+    let DenseMatmulTensors { a, b, y } = tensors;
     tile.validate();
     let DenseMatmulTile {
         bm,

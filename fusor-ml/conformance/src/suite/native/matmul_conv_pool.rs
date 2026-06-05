@@ -3,8 +3,8 @@
 use crate::common::{conv1d_ncw, matmul2, pool1d_ncw};
 use fusor::{Device, Tensor};
 use fusor_conformance::{
-    AssertionCase, AssertionCases, FuzzGenerator, FuzzSizeSpec, approx_compare, f16_capable_devices,
-    with_shape_specs,
+    AssertionCase, AssertionCases, FuzzGenerator, FuzzSizeSpec, approx_compare,
+    f16_capable_devices, with_shape_specs,
 };
 use rand::distr::Uniform;
 
@@ -26,7 +26,10 @@ pub fn matmul_match_host_reference() -> AssertionCase {
         FuzzGenerator::<2, f32>::new([128, 64])
             .with_seed(301)
             .with_distribution(Uniform::new(-3.0, 3.0).unwrap()),
-        [FuzzSizeSpec::from([128, 256]), FuzzSizeSpec::from([64, 256])],
+        [
+            FuzzSizeSpec::from([128, 256]),
+            FuzzSizeSpec::from([64, 256]),
+        ],
     );
 
     // matmul vs host reference

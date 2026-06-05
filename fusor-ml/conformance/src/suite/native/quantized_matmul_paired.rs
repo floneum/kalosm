@@ -181,9 +181,7 @@ fn llama_shape_one_hot_case() -> AssertionCase {
     .baseline_on_test_device()
     .devices_async(gpu_devices())
     .runs(1)
-    .into_case(
-        "quantized_matmul_paired::q4k_concat_split_llama_shape_match_cpu_reference::one_hot",
-    )
+    .into_case("quantized_matmul_paired::q4k_concat_split_llama_shape_match_cpu_reference::one_hot")
 }
 
 fn llama_shape_dense_sampled_columns_case() -> AssertionCase {

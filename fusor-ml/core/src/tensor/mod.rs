@@ -674,14 +674,18 @@ impl Tensor {
             return None;
         }
         let operation = ConvNdOperation::new(
-            self.data.key,
-            weight.data.key,
-            bias.map(|bias| bias.data.key),
-            self.shape(),
-            weight.shape(),
-            bias.map(|bias| bias.shape()),
-            padding,
-            strides,
+            crate::conv::ConvNdNodes {
+                input: self.data.key,
+                weight: weight.data.key,
+                bias: bias.map(|bias| bias.data.key),
+            },
+            crate::conv::ConvNdShapeSpec {
+                input_shape: self.shape(),
+                weight_shape: weight.shape(),
+                bias_shape: bias.map(|bias| bias.shape()),
+                padding,
+                strides,
+            },
             self.datatype(),
             self.device(),
         )?;

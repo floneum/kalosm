@@ -56,10 +56,7 @@ fn matrix_data(shape: [usize; 2], offset: f32) -> Vec<f32> {
 fn binding_limit_sum_data(shape: [usize; 2], num_tensors: usize) -> Vec<f32> {
     let mut out = vec![0.0; shape[0] * shape[1]];
     for i in 0..num_tensors {
-        for (out, value) in out
-            .iter_mut()
-            .zip(matrix_data(shape, i as f32 * 0.3))
-        {
+        for (out, value) in out.iter_mut().zip(matrix_data(shape, i as f32 * 0.3)) {
             *out += value;
         }
     }

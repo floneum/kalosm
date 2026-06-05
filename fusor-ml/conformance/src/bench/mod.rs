@@ -25,6 +25,7 @@ pub type BenchmarkError = Box<dyn std::error::Error>;
 pub type BenchmarkResult<T> = Result<T, BenchmarkError>;
 
 type CaseFuture<'a> = Pin<Box<dyn Future<Output = BenchmarkResult<BenchmarkReport>> + 'a>>;
+type BenchmarkRunner = dyn for<'a> FnOnce(&'a Device, BenchmarkConfig) -> CaseFuture<'a>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BenchmarkConfig {
@@ -150,7 +151,7 @@ pub enum BenchmarkEvent {
 
 pub struct BenchmarkCase {
     name: String,
-    run: Box<dyn for<'a> FnOnce(&'a Device, BenchmarkConfig) -> CaseFuture<'a>>,
+    run: Box<BenchmarkRunner>,
 }
 
 impl BenchmarkCase {

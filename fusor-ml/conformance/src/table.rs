@@ -26,10 +26,7 @@ fn row_major_indices<const R: usize>(shape: [usize; R]) -> impl Iterator<Item = 
 
 /// Materialize a reference tensor by mapping `host` element-wise over `input`,
 /// preserving its logical shape, on `input`'s device.
-async fn map_unary<const R: usize>(
-    input: Tensor<R, f32>,
-    host: fn(f32) -> f32,
-) -> Tensor<R, f32> {
+async fn map_unary<const R: usize>(input: Tensor<R, f32>, host: fn(f32) -> f32) -> Tensor<R, f32> {
     let device = input.device();
     let shape = input.shape();
     let slice = input.as_slice().await.unwrap();
@@ -77,7 +74,10 @@ pub fn unary_fuzz_case<F, Fut, const R: usize>(
     generator: FuzzGenerator<R, f32>,
     op: F,
     host: fn(f32) -> f32,
-    compare: impl for<'a> Fn(&'a Tensor<R, f32>, &'a Tensor<R, f32>) -> CompareFut<'a, ItemMismatchError>
+    compare: impl for<'a> Fn(
+        &'a Tensor<R, f32>,
+        &'a Tensor<R, f32>,
+    ) -> CompareFut<'a, ItemMismatchError>
     + Clone
     + 'static,
     runs: usize,
@@ -117,7 +117,10 @@ pub fn binary_fuzz_case<F, Fut, const R: usize>(
     gen_b: FuzzGenerator<R, f32>,
     op: F,
     host: fn(f32, f32) -> f32,
-    compare: impl for<'a> Fn(&'a Tensor<R, f32>, &'a Tensor<R, f32>) -> CompareFut<'a, ItemMismatchError>
+    compare: impl for<'a> Fn(
+        &'a Tensor<R, f32>,
+        &'a Tensor<R, f32>,
+    ) -> CompareFut<'a, ItemMismatchError>
     + Clone
     + 'static,
     runs: usize,

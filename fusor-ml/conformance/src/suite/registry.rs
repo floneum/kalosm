@@ -110,6 +110,7 @@ macro_rules! registry {
         #[cfg(test)]
         mod generated_tests {
             $(
+                #[allow(clippy::await_holding_lock)]
                 #[tokio::test]
                 async fn $case() {
                     let _gpu_guard = crate::suite::registry::gpu_test_guard();

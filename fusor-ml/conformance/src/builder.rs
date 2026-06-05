@@ -9,6 +9,7 @@ use crate::{
 
 type CaseFuture<'a> = Pin<Box<dyn Future<Output = CaseResult> + 'a>>;
 type DevicesFuture = Pin<Box<dyn Future<Output = Vec<Device>>>>;
+type AssertionRunner = dyn for<'a> FnOnce(&'a mut dyn FnMut(&str)) -> CaseFuture<'a>;
 
 enum DeviceSelection {
     Fixed(Vec<Device>),
@@ -17,7 +18,7 @@ enum DeviceSelection {
 
 pub struct AssertionCase {
     name: String,
-    run: Box<dyn for<'a> FnOnce(&'a mut dyn FnMut(&str)) -> CaseFuture<'a>>,
+    run: Box<AssertionRunner>,
 }
 
 #[derive(Default)]

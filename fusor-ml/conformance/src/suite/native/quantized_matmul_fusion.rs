@@ -109,6 +109,7 @@ pub fn rmsnorm_post_relu_resolves_to_single_kernel() -> AssertionCase {
 ///     before the store (all GPU backends).
 ///   * concat/split SwiGLU via `q_mat_mul_paired_silu_product` — the dynamic
 ///     paired qmatmul fuses the gate/up product (subgroup path only).
+///
 /// Without the corresponding fuser rule each source resolves to 2 dispatches.
 pub fn q4k_qmatmul_fusion_kernels() -> AssertionCases {
     let weight_shape = [4, 512];
@@ -192,6 +193,7 @@ pub fn q4k_qmatmul_fusion_kernels() -> AssertionCases {
 ///   * a column-vector bias add on a non-block-multiple output width, and
 ///   * a mixed bias-plus-residual chain, where the residual is pre-biased so
 ///     the fused epilogue must preserve the binding order.
+///
 /// Both are deterministic-seed Q8_0 matmuls checked against the CPU reference.
 pub fn q8_0_qmatmul_epilogue_tests() -> AssertionCases {
     let weight_shape = [4, 64];
@@ -236,8 +238,7 @@ pub fn q8_0_qmatmul_epilogue_tests() -> AssertionCases {
         let bias_data = mixed_bias.clone();
         async move {
             let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
-            let input: Tensor<2, f32> =
-                Tensor::from_slice(&device, mixed_input_shape, &input_data);
+            let input: Tensor<2, f32> = Tensor::from_slice(&device, mixed_input_shape, &input_data);
             let residual: Tensor<2, f32> =
                 Tensor::from_slice(&device, mixed_output_shape, &residual_data);
             let bias: Tensor<1, f32> = Tensor::from_slice(&device, [weight_shape[0]], &bias_data);
