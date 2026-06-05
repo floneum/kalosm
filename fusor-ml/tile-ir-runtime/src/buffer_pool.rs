@@ -11,8 +11,14 @@ use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
 use wgpu::{BufferUsages, COPY_BUFFER_ALIGNMENT};
 
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_FREE_BUFFERS_PER_BUCKET: usize = 4;
+#[cfg(target_arch = "wasm32")]
+const MAX_FREE_BUFFERS_PER_BUCKET: usize = 1;
+#[cfg(not(target_arch = "wasm32"))]
 const BUFFER_ALLOCATION_CACHE_SIZE: usize = 128;
+#[cfg(target_arch = "wasm32")]
+const BUFFER_ALLOCATION_CACHE_SIZE: usize = 32;
 
 /// Byte written into freshly handed-out (non-initialized) buffers when a tensor
 /// is allocated on a poisoned device (see `Device::with_poisoned_allocations`).
@@ -127,6 +133,9 @@ impl BufferPool {
         let items = cache.get_mut(&(size, usage))?;
         items.iter_mut().find_map(|a| {
             if Arc::strong_count(&a.buffer) == 1 {
+                if !to_initilize && a.initialized() {
+                    return None;
+                }
                 if to_initilize {
                     if a.initialized() {
                         return None;

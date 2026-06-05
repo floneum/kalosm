@@ -6,7 +6,8 @@ use fusor_gguf::{BlockQ4_0, GgmlType};
 use super::{
     GPU_SAMPLE_STATUS_RETRY_NEEDED, GPU_SAMPLE_STATUS_SAMPLED, GpuMirostat2Sampler,
     GpuMirostat2SamplerParams, GpuStandardSamplerParams,
-    mirostat::sample_from_sorted_top_k_data_with_encoder, mirostat2_sample_token_to_host,
+    mirostat::sample_from_sorted_top_k_data_with_encoder,
+    mirostat2_sample_token_to_host,
     standard_sampler::sample_from_sorted_top_k_data_with_encoder as sample_standard_from_sorted_top_k_data_with_encoder,
     topk::{ProcessorSettings, chunk_top_k_pair_data_with_processors_with_encoder},
 };
@@ -184,6 +185,40 @@ fn cpu_mirostat2_selected_token(values: &[f32], mu: f32, params: GpuMirostat2Sam
         }
     }
     selected
+}
+
+#[test]
+fn tensor_mirostat2_sampler_uses_processed_top_k_order() {
+    pollster::block_on(async {
+        let device = Device::new().await.unwrap();
+        let values = [9.0, 8.5, 7.0, 6.0, 2.5, 0.25, -1.0, -3.0];
+        for run_device in [
+            device.clone(),
+            device.without_subgroups(),
+            device.with_poisoned_allocations(),
+            device.without_subgroups().with_poisoned_allocations(),
+        ] {
+            let tensor = Tensor::new(&run_device, values.as_slice());
+            let mut sampler = GpuMirostat2Sampler::new(&run_device, 10.0);
+            let token = tensor
+                .sample_mirostat2_token(
+                    &mut sampler,
+                    &[],
+                    GpuMirostat2SamplerParams {
+                        top_k: 4,
+                        temperature: 1.0,
+                        repetition_penalty: 1.0,
+                        tau: 5.0,
+                        eta: 0.1,
+                        random: 0.0,
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(token, 0);
+        }
+    });
 }
 
 #[test]

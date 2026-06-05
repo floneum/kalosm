@@ -9,7 +9,7 @@ use fusor_tile_ir_kernels::{
     qmatmul_workgroup_with_epilogues, quantized_matrix, rms_norm_vec4, try_batched_coop_matmul,
     DenseCoopMatmulTile, DenseMatmulEpilogues, DenseMatmulShape, DenseMatmulTensors,
     FlashAttentionDims, FlashAttentionMeta, FlashAttentionTensors, QmatmulEpilogues, RmsNormVec4,
-    RmsNormVec4Meta, TensorMeta, UnaryEpilogue,
+    RmsNormVec4Meta, TensorMeta, UnaryEpilogue, UnaryEpilogueWithExtras,
 };
 
 fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
@@ -665,6 +665,30 @@ fn q4k_native_workgroup_qgemv_lowers_without_subgroups() {
     assert!(
         !module_uses_subgroup(lowered.module()),
         "native workgroup qgemv emitted subgroup ops"
+    );
+}
+
+#[test]
+fn workgroup_qgemv_accumulator_offsets_lower_without_subgroups() {
+    let post = UnaryEpilogueWithExtras::new_with_value_arity("paired_product", 2, 0, |values| {
+        values[0].clone() * values[1].clone()
+    });
+    let offsets = [0, 64];
+    let epilogues = QmatmulEpilogues {
+        post_with_extras: Some(&post),
+        post_accumulator_offsets: &offsets,
+        ..QmatmulEpilogues::empty()
+    };
+    let ir = tile::build(|program| {
+        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, 256]));
+        let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 128);
+        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, 64]));
+        qgemv_workgroup_with_epilogue(program, &a, &b, &y, &epilogues, 65_535);
+    });
+    let lowered = lower_or_fail(&ir, "workgroup qgemv accumulator offsets");
+    assert!(
+        !module_uses_subgroup(lowered.module()),
+        "workgroup qgemv accumulator offsets emitted subgroup ops"
     );
 }
 

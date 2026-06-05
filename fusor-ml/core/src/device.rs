@@ -108,9 +108,8 @@ struct DeviceInner {
     cooperative_matrix_caps: CooperativeMatrixCaps,
     compute_graph: OnceLock<ComputeGraph>,
     /// When set, this device reports `subgroups_supported() == false` so kernel
-    /// selection picks the no-subgroup fallbacks (the web build's only path —
-    /// it never requests `wgpu::Features::SUBGROUP`). A property of the device,
-    /// so it survives the `WeakDevice` upgrade kernel selection goes through.
+    /// selection picks the no-subgroup fallbacks. A property of the device, so
+    /// it survives the `WeakDevice` upgrade kernel selection goes through.
     disable_subgroups: bool,
     /// When set, kernel-output/scratch buffers allocated on this device are
     /// pre-filled with a poison pattern instead of left zeroed, reproducing the
@@ -218,6 +217,7 @@ impl Device {
         let adapter = select_adapter(&instance, backends).await?;
         let adapter_features = adapter.features();
         let mut required_features = wgpu::Features::empty();
+        #[cfg(not(target_arch = "wasm32"))]
         if adapter_features.contains(wgpu::Features::SUBGROUP) {
             required_features |= wgpu::Features::SUBGROUP;
         }
@@ -370,8 +370,8 @@ impl Device {
     pub fn subgroups_supported(&self) -> bool {
         // A device constructed via `without_subgroups()` (or built with
         // `FUSOR_DISABLE_SUBGROUPS` set) reports no subgroups, so kernel
-        // selection picks the no-subgroup fallbacks — the same paths the web
-        // build always takes (it never requests `wgpu::Features::SUBGROUP`).
+        // selection picks the no-subgroup fallbacks. Browser builds also take
+        // this path because they never request `wgpu::Features::SUBGROUP`.
         if self.inner.disable_subgroups {
             return false;
         }

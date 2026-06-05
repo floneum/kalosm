@@ -2,10 +2,12 @@
 
 use crate::common::{conv1d_ncw, matmul2, pool1d_ncw};
 use fusor::{Device, Tensor};
-use fusor_conformance::{CaseResult, FuzzGenerator, approx_compare, available_devices, f16_capable_devices};
+use fusor_conformance::{
+    AssertionCase, AssertionCases, FuzzGenerator, approx_compare, f16_capable_devices,
+};
 use rand::distr::Uniform;
 
-pub async fn matmul_match_host_reference() -> CaseResult {
+pub fn matmul_match_host_reference() -> AssertionCase {
     const M: usize = 64;
     const K: usize = 128;
     const N: usize = 64;
@@ -28,11 +30,10 @@ pub async fn matmul_match_host_reference() -> CaseResult {
         )
         .compare_with(approx_compare::<2, f32>(1e-2))
         .runs(3)
-        .await?;
-    Ok(())
+        .into_case("matmul_conv_pool::matmul_match_host_reference")
 }
 
-pub async fn matmul_small_fixed_regression() -> CaseResult {
+pub fn matmul_small_fixed_regression() -> AssertionCase {
     const LHS: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
     const RHS: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
 
@@ -46,11 +47,12 @@ pub async fn matmul_small_fixed_regression() -> CaseResult {
         )
         .compare_with(approx_compare::<2, f32>(1e-6))
         .runs(1)
-        .await?;
-    Ok(())
+        .into_case("matmul_conv_pool::matmul_small_fixed_regression")
 }
 
-pub async fn conv_and_pool_match_host_reference() -> CaseResult {
+pub fn conv_and_pool_match_host_reference() -> AssertionCases {
+    let mut assertions = AssertionCases::new();
+
     // Conv1D with fuzzed input
     let gen_conv = FuzzGenerator::<3, f32>::new([1..=1, 1..=1, 255..=257])
         .with_seed(310)
@@ -59,19 +61,21 @@ pub async fn conv_and_pool_match_host_reference() -> CaseResult {
     static CONV_WEIGHT: &[f32] = &[0.25, -0.5, 1.0];
     static CONV_BIAS: &[f32] = &[0.1];
 
-    fusor_conformance::assert(async |input: Tensor<3, f32>| {
-        let weight = Tensor::from_slice(&input.device(), [1, 1, 3], CONV_WEIGHT);
-        let bias = Tensor::from_slice(&input.device(), [1], CONV_BIAS);
-        input.conv(&weight, Some(&bias), [1], [2])
-    })
-    .arg(gen_conv)
-    .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-        let expected = conv1d_ncw(&v, &[vec![vec![0.25, -0.5, 1.0]]], Some(&[0.1]), 1, 2);
-        Tensor::new(&device, &expected)
-    })
-    .compare_with(approx_compare::<3, f32>(1e-4))
-    .runs(3)
-    .await?;
+    assertions.push(
+        fusor_conformance::assert(async |input: Tensor<3, f32>| {
+            let weight = Tensor::from_slice(&input.device(), [1, 1, 3], CONV_WEIGHT);
+            let bias = Tensor::from_slice(&input.device(), [1], CONV_BIAS);
+            input.conv(&weight, Some(&bias), [1], [2])
+        })
+        .arg(gen_conv)
+        .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+            let expected = conv1d_ncw(&v, &[vec![vec![0.25, -0.5, 1.0]]], Some(&[0.1]), 1, 2);
+            Tensor::new(&device, &expected)
+        })
+        .compare_with(approx_compare::<3, f32>(1e-4))
+        .runs(3)
+        .into_case("matmul_conv_pool::conv_and_pool_match_host_reference::conv1d"),
+    );
 
     // Pool: pool_max with fuzzed input
     let gen_pool = FuzzGenerator::<3, f32>::new([1..=1, 2..=2, 255..=257])
@@ -79,25 +83,29 @@ pub async fn conv_and_pool_match_host_reference() -> CaseResult {
         .with_distribution(Uniform::new(-4.0, 12.0).unwrap());
 
     // pool_max vs host reference
-    fusor_conformance::assert(async |x: Tensor<3, f32>| x.pool_max([(2, 2)]))
-        .arg(gen_pool.clone())
-        .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-            Tensor::new(&device, &pool1d_ncw(&v, 2, 2, f32::max, f32::NEG_INFINITY))
-        })
-        .compare_with(approx_compare::<3, f32>(1e-6))
-        .runs(3)
-        .await?;
+    assertions.push(
+        fusor_conformance::assert(async |x: Tensor<3, f32>| x.pool_max([(2, 2)]))
+            .arg(gen_pool.clone())
+            .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+                Tensor::new(&device, &pool1d_ncw(&v, 2, 2, f32::max, f32::NEG_INFINITY))
+            })
+            .compare_with(approx_compare::<3, f32>(1e-6))
+            .runs(3)
+            .into_case("matmul_conv_pool::conv_and_pool_match_host_reference::pool_max"),
+    );
 
     // pool_min vs host reference
-    fusor_conformance::assert(async |x: Tensor<3, f32>| x.pool_min([(2, 2)]))
-        .arg(gen_pool)
-        .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-            Tensor::new(&device, &pool1d_ncw(&v, 2, 2, f32::min, f32::INFINITY))
-        })
-        .compare_with(approx_compare::<3, f32>(1e-6))
-        .runs(3)
-        .await?;
-    Ok(())
+    assertions.push(
+        fusor_conformance::assert(async |x: Tensor<3, f32>| x.pool_min([(2, 2)]))
+            .arg(gen_pool)
+            .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+                Tensor::new(&device, &pool1d_ncw(&v, 2, 2, f32::min, f32::INFINITY))
+            })
+            .compare_with(approx_compare::<3, f32>(1e-6))
+            .runs(3)
+            .into_case("matmul_conv_pool::conv_and_pool_match_host_reference::pool_min"),
+    );
+    assertions
 }
 
 fn conv2d_nchw_ref(
@@ -264,7 +272,7 @@ fn flatten5(v: &[Vec<Vec<Vec<Vec<f32>>>>]) -> Vec<f32> {
         .collect()
 }
 
-pub async fn conv2d_matches_host_reference() -> CaseResult {
+pub fn conv2d_matches_host_reference() -> AssertionCase {
     const BATCH: usize = 1;
     const IN_CH: usize = 3;
     const OUT_CH: usize = 4;
@@ -290,21 +298,30 @@ pub async fn conv2d_matches_host_reference() -> CaseResult {
     let expected_flat = flatten4(&expected_nested);
     let out_shape = [BATCH, OUT_CH, H, W];
 
-    for device in available_devices().await {
-        let input = Tensor::from_slice(&device, [BATCH, IN_CH, H, W], &input_flat);
-        let weight = Tensor::from_slice(&device, [OUT_CH, IN_CH, KH, KW], &weight_flat);
-        let bias = Tensor::from_slice(&device, [OUT_CH], &bias_flat);
-        let actual = input
-            .conv(&weight, Some(&bias), [1, 1], [1, 1])
-            .to_concrete();
-        let expected = Tensor::from_slice(&device, out_shape, &expected_flat);
-        fusor_conformance::approx_eq(&actual, &expected, 1e-3)
-            .await?;
-    }
-    Ok(())
+    fusor_conformance::assert(move |device: Device| {
+        let input_flat = input_flat.clone();
+        let weight_flat = weight_flat.clone();
+        let bias_flat = bias_flat.clone();
+        async move {
+            let input = Tensor::from_slice(&device, [BATCH, IN_CH, H, W], &input_flat);
+            let weight = Tensor::from_slice(&device, [OUT_CH, IN_CH, KH, KW], &weight_flat);
+            let bias = Tensor::from_slice(&device, [OUT_CH], &bias_flat);
+            input
+                .conv(&weight, Some(&bias), [1, 1], [1, 1])
+                .to_concrete()
+        }
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(move |device: Device| {
+        let expected_flat = expected_flat.clone();
+        async move { Tensor::from_slice(&device, out_shape, &expected_flat) }
+    })
+    .compare_with(approx_compare::<4, f32>(1e-3))
+    .runs(1)
+    .into_case("matmul_conv_pool::conv2d_matches_host_reference")
 }
 
-pub async fn conv3d_matches_host_reference() -> CaseResult {
+pub fn conv3d_matches_host_reference() -> AssertionCase {
     const BATCH: usize = 1;
     const IN_CH: usize = 2;
     const OUT_CH: usize = 2;
@@ -332,21 +349,30 @@ pub async fn conv3d_matches_host_reference() -> CaseResult {
     let expected_flat = flatten5(&expected_nested);
     let out_shape = [BATCH, OUT_CH, DD, H, W];
 
-    for device in available_devices().await {
-        let input = Tensor::from_slice(&device, [BATCH, IN_CH, DD, H, W], &input_flat);
-        let weight = Tensor::from_slice(&device, [OUT_CH, IN_CH, KD, KH, KW], &weight_flat);
-        let bias = Tensor::from_slice(&device, [OUT_CH], &bias_flat);
-        let actual = input
-            .conv(&weight, Some(&bias), [1, 1, 1], [1, 1, 1])
-            .to_concrete();
-        let expected = Tensor::from_slice(&device, out_shape, &expected_flat);
-        fusor_conformance::approx_eq(&actual, &expected, 1e-3)
-            .await?;
-    }
-    Ok(())
+    fusor_conformance::assert(move |device: Device| {
+        let input_flat = input_flat.clone();
+        let weight_flat = weight_flat.clone();
+        let bias_flat = bias_flat.clone();
+        async move {
+            let input = Tensor::from_slice(&device, [BATCH, IN_CH, DD, H, W], &input_flat);
+            let weight = Tensor::from_slice(&device, [OUT_CH, IN_CH, KD, KH, KW], &weight_flat);
+            let bias = Tensor::from_slice(&device, [OUT_CH], &bias_flat);
+            input
+                .conv(&weight, Some(&bias), [1, 1, 1], [1, 1, 1])
+                .to_concrete()
+        }
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(move |device: Device| {
+        let expected_flat = expected_flat.clone();
+        async move { Tensor::from_slice(&device, out_shape, &expected_flat) }
+    })
+    .compare_with(approx_compare::<5, f32>(1e-3))
+    .runs(1)
+    .into_case("matmul_conv_pool::conv3d_matches_host_reference")
 }
 
-pub async fn matmul_identity_matrix() -> CaseResult {
+pub fn matmul_identity_matrix() -> AssertionCase {
     const M: usize = 2;
     const N: usize = 3;
     let fuzz = FuzzGenerator::<2, f32>::new([M, N])
@@ -367,8 +393,7 @@ pub async fn matmul_identity_matrix() -> CaseResult {
     .equal_to(async |a: Tensor<2, f32>| a)
     .compare_with(approx_compare::<2, f32>(1e-5))
     .runs(3)
-    .await?;
-    Ok(())
+    .into_case("matmul_conv_pool::matmul_identity_matrix")
 }
 
 fn batched3_matmul(lhs: &[Vec<Vec<f32>>], rhs: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<f32>>> {
@@ -379,7 +404,7 @@ fn batched3_matmul(lhs: &[Vec<Vec<f32>>], rhs: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<
         .collect()
 }
 
-pub async fn matmul_batched_3d_matches_host_reference() -> CaseResult {
+pub fn matmul_batched_3d_matches_host_reference() -> AssertionCase {
     // Per-batch [M, K] @ [K, N] -> [M, N]. Replaces the deleted
     // `core/src/matmul/mod.rs::test_batched_matmul` and `fuzz_batched_matmul`.
     let gen_lhs = FuzzGenerator::<3, f32>::new([2, 3, 4])
@@ -399,11 +424,10 @@ pub async fn matmul_batched_3d_matches_host_reference() -> CaseResult {
         )
         .compare_with(approx_compare::<3, f32>(1e-3))
         .runs(3)
-        .await?;
-    Ok(())
+        .into_case("matmul_conv_pool::matmul_batched_3d_matches_host_reference")
 }
 
-pub async fn matmul_attention_4d_matches_host_reference() -> CaseResult {
+pub fn matmul_attention_4d_matches_host_reference() -> AssertionCase {
     // Attention-shaped 4D matmul: [B, H, M, K] @ [B, H, K, N] regression
     // for the deleted `fusor/src/lib.rs::test_matmul_cpu_vs_gpu`. Smaller than
     // the original [1, 8, 100, 64] to keep CI fast — the original was a
@@ -423,21 +447,19 @@ pub async fn matmul_attention_4d_matches_host_reference() -> CaseResult {
     let lhs_data = data(0);
     let rhs_data = data(7);
 
-    let cpu_lhs = Tensor::from_slice(&Device::Cpu, SHAPE, &lhs_data);
-    let cpu_rhs = Tensor::from_slice(&Device::Cpu, SHAPE, &rhs_data);
-    let expected = cpu_lhs.matmul(&cpu_rhs).to_concrete();
-
-    for device in available_devices().await {
-        let lhs = Tensor::from_slice(&device, SHAPE, &lhs_data);
-        let rhs = Tensor::from_slice(&device, SHAPE, &rhs_data);
-        let actual = lhs.matmul(&rhs).to_concrete();
-        fusor_conformance::approx_eq(&actual, &expected, 1e-3)
-            .await?;
-    }
-    Ok(())
+    fusor_conformance::assert(async |lhs: Tensor<4, f32>, rhs: Tensor<4, f32>| {
+        lhs.matmul(&rhs).to_concrete()
+    })
+    .arg(move |device: &Device| Tensor::from_slice(device, SHAPE, &lhs_data))
+    .arg(move |device: &Device| Tensor::from_slice(device, SHAPE, &rhs_data))
+    .compare_with(approx_compare::<4, f32>(1e-3))
+    .runs(1)
+    .into_case("matmul_conv_pool::matmul_attention_4d_matches_host_reference")
 }
 
-pub async fn matmul_sgemv_variants_match_host_reference() -> CaseResult {
+pub fn matmul_sgemv_variants_match_host_reference() -> AssertionCases {
+    let mut assertions = AssertionCases::new();
+
     // [M, K] @ [K, 1] -> [M, 1] : single-output gemv
     let gen_mat = FuzzGenerator::<2, f32>::new([8, 12])
         .with_seed(370)
@@ -446,17 +468,21 @@ pub async fn matmul_sgemv_variants_match_host_reference() -> CaseResult {
         .with_seed(371)
         .with_distribution(Uniform::new(-2.0, 2.0).unwrap());
 
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.matmul(&b))
-        .arg(gen_mat)
-        .arg(gen_vec)
-        .equal_to_resolved_with_device(
-            async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-                Tensor::new(&device, &matmul2(&a, &b))
-            },
-        )
-        .compare_with(approx_compare::<2, f32>(1e-4))
-        .runs(3)
-        .await?;
+    assertions.push(
+        fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.matmul(&b))
+            .arg(gen_mat)
+            .arg(gen_vec)
+            .equal_to_resolved_with_device(
+                async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
+                    Tensor::new(&device, &matmul2(&a, &b))
+                },
+            )
+            .compare_with(approx_compare::<2, f32>(1e-4))
+            .runs(3)
+            .into_case(
+                "matmul_conv_pool::matmul_sgemv_variants_match_host_reference::single_output",
+            ),
+    );
 
     // [M, K] @ [K, N] with N>1 multi-row variant — distinct GPU kernel path
     let gen_mat = FuzzGenerator::<2, f32>::new([8, 12])
@@ -466,17 +492,21 @@ pub async fn matmul_sgemv_variants_match_host_reference() -> CaseResult {
         .with_seed(373)
         .with_distribution(Uniform::new(-2.0, 2.0).unwrap());
 
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.matmul(&b))
-        .arg(gen_mat)
-        .arg(gen_rhs)
-        .equal_to_resolved_with_device(
-            async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-                Tensor::new(&device, &matmul2(&a, &b))
-            },
-        )
-        .compare_with(approx_compare::<2, f32>(1e-4))
-        .runs(3)
-        .await?;
+    assertions.push(
+        fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.matmul(&b))
+            .arg(gen_mat)
+            .arg(gen_rhs)
+            .equal_to_resolved_with_device(
+                async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
+                    Tensor::new(&device, &matmul2(&a, &b))
+                },
+            )
+            .compare_with(approx_compare::<2, f32>(1e-4))
+            .runs(3)
+            .into_case(
+                "matmul_conv_pool::matmul_sgemv_variants_match_host_reference::multi_output",
+            ),
+    );
 
     // Batched gemv: [B, M, K] @ [B, K, 1]
     let gen_mat = FuzzGenerator::<3, f32>::new([2, 6, 9])
@@ -486,21 +516,23 @@ pub async fn matmul_sgemv_variants_match_host_reference() -> CaseResult {
         .with_seed(375)
         .with_distribution(Uniform::new(-2.0, 2.0).unwrap());
 
-    fusor_conformance::assert(async |a: Tensor<3, f32>, b: Tensor<3, f32>| a.matmul(&b))
-        .arg(gen_mat)
-        .arg(gen_vec)
-        .equal_to_resolved_with_device(
-            async |a: Vec<Vec<Vec<f32>>>, b: Vec<Vec<Vec<f32>>>, device: Device| {
-                Tensor::new(&device, &batched3_matmul(&a, &b))
-            },
-        )
-        .compare_with(approx_compare::<3, f32>(1e-4))
-        .runs(3)
-        .await?;
-    Ok(())
+    assertions.push(
+        fusor_conformance::assert(async |a: Tensor<3, f32>, b: Tensor<3, f32>| a.matmul(&b))
+            .arg(gen_mat)
+            .arg(gen_vec)
+            .equal_to_resolved_with_device(
+                async |a: Vec<Vec<Vec<f32>>>, b: Vec<Vec<Vec<f32>>>, device: Device| {
+                    Tensor::new(&device, &batched3_matmul(&a, &b))
+                },
+            )
+            .compare_with(approx_compare::<3, f32>(1e-4))
+            .runs(3)
+            .into_case("matmul_conv_pool::matmul_sgemv_variants_match_host_reference::batched"),
+    );
+    assertions
 }
 
-pub async fn matmul_transposed_operand_matches_host_reference() -> CaseResult {
+pub fn matmul_transposed_operand_matches_host_reference() -> AssertionCase {
     // matmul where the right operand is the lazy transpose of a contiguous tensor.
     // Replaces the deleted `core/src/matmul/mod.rs::test_transposed_matmul`.
     let gen_lhs = FuzzGenerator::<2, f32>::new([6, 8])
@@ -526,11 +558,10 @@ pub async fn matmul_transposed_operand_matches_host_reference() -> CaseResult {
     })
     .compare_with(approx_compare::<2, f32>(1e-4))
     .runs(3)
-    .await?;
-    Ok(())
+    .into_case("matmul_conv_pool::matmul_transposed_operand_matches_host_reference")
 }
 
-pub async fn matmul_non_contiguous_input_matches_host_reference() -> CaseResult {
+pub fn matmul_non_contiguous_input_matches_host_reference() -> AssertionCase {
     // matmul on a sliced (non-contiguous) input. Replaces
     // `core/src/matmul/mod.rs::test_matrix_vector_mul_non_contiguous`.
     let gen_lhs_padded = FuzzGenerator::<2, f32>::new([6, 12])
@@ -552,16 +583,15 @@ pub async fn matmul_non_contiguous_input_matches_host_reference() -> CaseResult 
     })
     .compare_with(approx_compare::<2, f32>(1e-4))
     .runs(3)
-    .await?;
-    Ok(())
+    .into_case("matmul_conv_pool::matmul_non_contiguous_input_matches_host_reference")
 }
 
 /// Run the `M×K · K×N` f16 matmul on every f16-capable device and compare
 /// against the host CPU reference. Both f16 matmul tests below differ only
 /// in the (M, N, K) const params, so this helper holds the shared setup.
-async fn assert_f16_matmul_matches_cpu_reference<const M: usize, const N: usize, const K: usize>(
+fn assert_f16_matmul_matches_cpu_reference<const M: usize, const N: usize, const K: usize>(
     tolerance: half::f16,
-) -> CaseResult {
+) -> AssertionCase {
     use half::f16;
 
     fn data(seed: u32, total: usize) -> Vec<f16> {
@@ -576,41 +606,38 @@ async fn assert_f16_matmul_matches_cpu_reference<const M: usize, const N: usize,
     let lhs_data = data(0, M * K);
     let rhs_data = data(7, K * N);
 
-    let cpu_lhs: Tensor<2, f16> = Tensor::from_slice(&Device::Cpu, [M, K], &lhs_data);
-    let cpu_rhs: Tensor<2, f16> = Tensor::from_slice(&Device::Cpu, [K, N], &rhs_data);
-    let expected = cpu_lhs.matmul(&cpu_rhs).to_concrete();
-
-    for device in f16_capable_devices().await {
-        let lhs: Tensor<2, f16> = Tensor::from_slice(&device, [M, K], &lhs_data);
-        let rhs: Tensor<2, f16> = Tensor::from_slice(&device, [K, N], &rhs_data);
-        let actual = lhs.matmul(&rhs).to_concrete();
-        fusor_conformance::approx_eq(&actual, &expected, tolerance)
-            .await?;
-    }
-    Ok(())
+    fusor_conformance::assert(async |lhs: Tensor<2, f16>, rhs: Tensor<2, f16>| {
+        lhs.matmul(&rhs).to_concrete()
+    })
+    .arg(move |device: &Device| Tensor::from_slice(device, [M, K], &lhs_data))
+    .arg(move |device: &Device| Tensor::from_slice(device, [K, N], &rhs_data))
+    .compare_with(approx_compare::<2, f16>(tolerance))
+    .devices_async(f16_capable_devices())
+    .runs(1)
+    .into_case(format!(
+        "matmul_conv_pool::f16_matmul_{M}x{N}x{K}_matches_host_reference"
+    ))
 }
 
-pub async fn f16_matmul_coop_tile_matches_host_reference() -> CaseResult {
+pub fn f16_matmul_coop_tile_matches_host_reference() -> AssertionCase {
     // Pins the f16 cooperative-matrix path: shape divides cleanly into the
     // smallest coop tile (Tile64x64, BK=16). Without f16 coop support this
     // would fall back to `batched_matmul_with_epilogues<F16, ...>`; with it,
     // dispatch lands on `try_batched_coop_matmul::<F16, 64, 64, 16>`.
-    assert_f16_matmul_matches_cpu_reference::<64, 64, 64>(half::f16::from_f32(5e-2)).await?;
-    Ok(())
+    assert_f16_matmul_matches_cpu_reference::<64, 64, 64>(half::f16::from_f32(5e-2))
 }
 
-pub async fn f16_matmul_multi_tile_matches_host_reference() -> CaseResult {
+pub fn f16_matmul_multi_tile_matches_host_reference() -> AssertionCase {
     // Regression for the cooperative-load bug in
     // `batched_matmul_with_epilogues`: f16 matmul disables coop selection
     // (allow_coop is f32-only), and tile-aligned shapes with m>32 / n>64
     // route to the shared-tile kernel. Multi-tile in M and N is needed so
     // the per-lane offsets that leaked into the cooperative load actually
     // shift global_row/global_col away from the workgroup tile base.
-    assert_f16_matmul_matches_cpu_reference::<64, 96, 64>(half::f16::from_f32(5e-2)).await?;
-    Ok(())
+    assert_f16_matmul_matches_cpu_reference::<64, 96, 64>(half::f16::from_f32(5e-2))
 }
 
-pub async fn matmul_non_affine_prefix_matches_host_reference() -> CaseResult {
+pub fn matmul_non_affine_prefix_matches_host_reference() -> AssertionCase {
     // 4D matmul with permuted batch dimensions. The contiguous source has
     // strides `[B1*M*K, M*K, K, 1]`; permuting `[0, 1, 2, 3] -> [1, 0, 2, 3]`
     // gives strides `[M*K, B1*M*K, K, 1]`, which is not affine across the
@@ -636,28 +663,19 @@ pub async fn matmul_non_affine_prefix_matches_host_reference() -> CaseResult {
     let lhs_data = data(0, B0 * B1 * M * K);
     let rhs_data = data(7, B0 * B1 * K * N);
 
-    let cpu_lhs = Tensor::from_slice(&Device::Cpu, [B0, B1, M, K], &lhs_data);
-    let cpu_rhs = Tensor::from_slice(&Device::Cpu, [B0, B1, K, N], &rhs_data);
-    // Swap the batch dims so the prefix becomes non-affine.
-    let expected = cpu_lhs
-        .permute([1, 0, 2, 3])
-        .matmul(&cpu_rhs.permute([1, 0, 2, 3]))
-        .to_concrete();
-
-    for device in available_devices().await {
-        let lhs = Tensor::from_slice(&device, [B0, B1, M, K], &lhs_data);
-        let rhs = Tensor::from_slice(&device, [B0, B1, K, N], &rhs_data);
-        let actual = lhs
-            .permute([1, 0, 2, 3])
+    fusor_conformance::assert(async |lhs: Tensor<4, f32>, rhs: Tensor<4, f32>| {
+        lhs.permute([1, 0, 2, 3])
             .matmul(&rhs.permute([1, 0, 2, 3]))
-            .to_concrete();
-        fusor_conformance::approx_eq(&actual, &expected, 1e-3)
-            .await?;
-    }
-    Ok(())
+            .to_concrete()
+    })
+    .arg(move |device: &Device| Tensor::from_slice(device, [B0, B1, M, K], &lhs_data))
+    .arg(move |device: &Device| Tensor::from_slice(device, [B0, B1, K, N], &rhs_data))
+    .compare_with(approx_compare::<4, f32>(1e-3))
+    .runs(1)
+    .into_case("matmul_conv_pool::matmul_non_affine_prefix_matches_host_reference")
 }
 
-pub async fn matmul_large_fuzzed() -> CaseResult {
+pub fn matmul_large_fuzzed() -> AssertionCase {
     const M: usize = 256;
     const K: usize = 256;
     const N: usize = 256;
@@ -680,6 +698,5 @@ pub async fn matmul_large_fuzzed() -> CaseResult {
         )
         .compare_with(approx_compare::<2, f32>(1e-2))
         .runs(3)
-        .await?;
-    Ok(())
+        .into_case("matmul_conv_pool::matmul_large_fuzzed")
 }

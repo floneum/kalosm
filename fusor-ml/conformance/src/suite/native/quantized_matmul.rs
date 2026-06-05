@@ -6,11 +6,14 @@ use crate::common::quantized::{
     f16_weight_bytes, f32_weight_bytes, f32_weight_rows, q8_0_fixture, qmatrix_from_raw_bytes,
 };
 use fusor::{BlockQ5_0, Device, GgmlType, Tensor};
-use fusor_conformance::{CaseResult, approx_compare, available_devices, ensure, ensure_eq};
+use fusor_conformance::{
+    AssertionCase, AssertionCases, approx_compare, available_devices, exact_value_compare,
+};
 use rand::distr::Uniform;
 use std::mem::size_of;
 
-pub async fn quantized_dequantize_matches_cpu_reference() -> CaseResult {
+pub fn quantized_dequantize_matches_cpu_reference() -> AssertionCases {
+    let mut assertions = AssertionCases::new();
     for &(fixture, _, _) in QUANTIZED_FIXTURE_CASES
         .iter()
         .filter(|&&(_, _, dequantize)| dequantize)
@@ -23,34 +26,33 @@ pub async fn quantized_dequantize_matches_cpu_reference() -> CaseResult {
             dequantize_tol,
             ..
         } = fixture();
-        assert_dequantize_matches_host_reference(
+        assertions.push(assert_dequantize_matches_host_reference(
             ty,
             weight_shape,
             raw_bytes,
             dequantized,
             dequantize_tol,
-        )
-        .await?;
+        ));
     }
-    Ok(())
+    assertions
 }
 
-pub async fn quantized_q_mat_mul_matches_cpu_reference() -> CaseResult {
+pub fn quantized_q_mat_mul_matches_cpu_reference() -> AssertionCases {
+    let mut assertions = AssertionCases::new();
     for &(fixture, seed, _) in QUANTIZED_FIXTURE_CASES {
         let fixture = fixture();
-        assert_q_mat_mul_matches_host_reference(
+        assertions.push(assert_q_mat_mul_matches_host_reference(
             &fixture,
             QMatMulFuzz {
                 seed,
                 distribution: Uniform::new(-0.25, 0.25).unwrap(),
             },
-        )
-        .await?;
+        ));
     }
-    Ok(())
+    assertions
 }
 
-pub async fn q8_0_dequantize_then_add_matches_cpu_reference() -> CaseResult {
+pub fn q8_0_dequantize_then_add_matches_cpu_reference() -> AssertionCase {
     let QuantizedFixture {
         ty,
         weight_shape,
@@ -76,22 +78,23 @@ pub async fn q8_0_dequantize_then_add_matches_cpu_reference() -> CaseResult {
         async move { Tensor::new(&device, &expected) }
     })
     .compare_with(approx_compare::<2, f32>(1e-5))
-    .await
-    .map_err(Into::into)
+    .into_case("quantized_matmul::q8_0_dequantize_then_add_matches_cpu_reference")
 }
 
-pub async fn q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch() -> CaseResult {
+pub fn q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch() -> AssertionCase {
     const Q5_0_QGEMV_COLS_PER_WORKGROUP: usize = 8;
     const QMATMUL_MAX_WORKGROUPS_PER_DIMENSION: usize = 1_024;
 
-    for device in available_devices().await {
-        let Some(gpu) = device.as_gpu() else {
-            continue;
-        };
-        if !gpu.subgroups_supported() {
-            continue;
-        }
-
+    fusor_conformance::assert(async |device: Device| {
+        let gpu = device.as_gpu().expect("filtered devices should be GPU");
+        let max_workgroups = (gpu.limits().max_compute_workgroups_per_dimension as usize)
+            .min(QMATMUL_MAX_WORKGROUPS_PER_DIMENSION);
+        let output_cols = max_workgroups * Q5_0_QGEMV_COLS_PER_WORKGROUP + 1;
+        (vec![1usize, output_cols], true)
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(async |device: Device| {
+        let gpu = device.as_gpu().expect("filtered devices should be GPU");
         let max_workgroups = (gpu.limits().max_compute_workgroups_per_dimension as usize)
             .min(QMATMUL_MAX_WORKGROUPS_PER_DIMENSION);
         let output_cols = max_workgroups * Q5_0_QGEMV_COLS_PER_WORKGROUP + 1;
@@ -104,18 +107,25 @@ pub async fn q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch() -> CaseResu
             Tensor::from_slice(&device, [1, weight_shape[1]], &input_values);
 
         let result = input.q_mat_mul(&weights).as_slice().await.unwrap();
-
-        ensure_eq!(result.shape(), &[1, output_cols]);
-        ensure!(
+        (
+            result.shape().to_vec(),
             result.as_slice().iter().all(|value| *value == 0.0),
-            "zero Q5_0 weights should produce zero qgemv output"
-        );
-    }
-
-    Ok(())
+        )
+    })
+    .compare_with(exact_value_compare())
+    .devices_async(async {
+        available_devices()
+            .await
+            .into_iter()
+            .filter(|device| device.as_gpu().is_some_and(|gpu| gpu.subgroups_supported()))
+            .collect()
+    })
+    .baseline_on_test_device()
+    .runs(1)
+    .into_case("quantized_matmul::q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch")
 }
 
-pub async fn f32_q_matrix_q_mat_mul_matches_host_reference() -> CaseResult {
+pub fn f32_q_matrix_q_mat_mul_matches_host_reference() -> AssertionCase {
     let fixture = QuantizedFixture {
         ty: GgmlType::F32,
         weight_shape: [2, 4],
@@ -132,10 +142,9 @@ pub async fn f32_q_matrix_q_mat_mul_matches_host_reference() -> CaseResult {
             distribution: Uniform::new(-0.5, 0.5).unwrap(),
         },
     )
-    .await
 }
 
-pub async fn f16_q_matrix_q_mat_mul_matches_host_reference() -> CaseResult {
+pub fn f16_q_matrix_q_mat_mul_matches_host_reference() -> AssertionCase {
     let fixture = QuantizedFixture {
         ty: GgmlType::F16,
         weight_shape: [2, 4],
@@ -152,5 +161,4 @@ pub async fn f16_q_matrix_q_mat_mul_matches_host_reference() -> CaseResult {
             distribution: Uniform::new(-0.5, 0.5).unwrap(),
         },
     )
-    .await
 }

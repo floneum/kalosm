@@ -881,27 +881,31 @@ fn flash_decode_small_block<B>(
 
             if meta.tiled {
                 program.store_workgroup(&reduce, lane.clone(), f32_tile(NEG_MAX_F32));
-                program.store_local(&kv_local, lane_value.clone());
+                program.store_local(&kv_local, u32_tile(0));
                 program.loop_forever(|program| {
-                    let kv = program.load_local(&kv_local);
-                    program.break_if(kv.clone().ge(active_kv_len.clone()));
-                    let score = decode_score_for_kv(
-                        program,
-                        DecodeScoreForKv {
-                            q: &q,
-                            k: &k,
-                            meta,
-                            batch_idx: batch_idx.clone(),
-                            head_idx: head_idx.clone(),
-                            kv_head_idx: kv_head_idx.clone(),
-                            kv: kv.clone(),
-                            score_acc: &score_acc,
-                            dim_local: &dim,
-                        },
-                    );
-                    let current = program.load_workgroup(&reduce, lane.clone());
-                    program.store_workgroup(&reduce, lane.clone(), current.max(score));
-                    program.store_local(&kv_local, kv + u32_tile(block));
+                    let tile_base = program.load_local(&kv_local);
+                    program.break_if(tile_base.clone().ge(active_kv_len.clone()));
+                    let kv = tile_base.clone() + lane_value.clone();
+                    let kv_valid = kv.clone().lt(active_kv_len.clone());
+                    program.if_then(kv_valid, |program| {
+                        let score = decode_score_for_kv(
+                            program,
+                            DecodeScoreForKv {
+                                q: &q,
+                                k: &k,
+                                meta,
+                                batch_idx: batch_idx.clone(),
+                                head_idx: head_idx.clone(),
+                                kv_head_idx: kv_head_idx.clone(),
+                                kv: kv.clone(),
+                                score_acc: &score_acc,
+                                dim_local: &dim,
+                            },
+                        );
+                        let current = program.load_workgroup(&reduce, lane.clone());
+                        program.store_workgroup(&reduce, lane.clone(), current.max(score));
+                    });
+                    program.store_local(&kv_local, tile_base + u32_tile(block));
                 });
                 program.workgroup_barrier();
                 reduce_workgroup(program, &reduce, lane.clone(), |lhs, rhs| lhs.max(rhs));
@@ -916,28 +920,32 @@ fn flash_decode_small_block<B>(
                 // intermittent wrong values for individual heads.
                 program.workgroup_barrier();
                 program.store_workgroup(&reduce, lane.clone(), f32_tile(0.0));
-                program.store_local(&kv_local, lane_value.clone());
+                program.store_local(&kv_local, u32_tile(0));
                 program.loop_forever(|program| {
-                    let kv = program.load_local(&kv_local);
-                    program.break_if(kv.clone().ge(active_kv_len.clone()));
-                    let score = decode_score_for_kv(
-                        program,
-                        DecodeScoreForKv {
-                            q: &q,
-                            k: &k,
-                            meta,
-                            batch_idx: batch_idx.clone(),
-                            head_idx: head_idx.clone(),
-                            kv_head_idx: kv_head_idx.clone(),
-                            kv: kv.clone(),
-                            score_acc: &score_acc,
-                            dim_local: &dim,
-                        },
-                    );
-                    let prob = (score - max_score.clone()).exp();
-                    let current = program.load_workgroup(&reduce, lane.clone());
-                    program.store_workgroup(&reduce, lane.clone(), current + prob);
-                    program.store_local(&kv_local, kv + u32_tile(block));
+                    let tile_base = program.load_local(&kv_local);
+                    program.break_if(tile_base.clone().ge(active_kv_len.clone()));
+                    let kv = tile_base.clone() + lane_value.clone();
+                    let kv_valid = kv.clone().lt(active_kv_len.clone());
+                    program.if_then(kv_valid, |program| {
+                        let score = decode_score_for_kv(
+                            program,
+                            DecodeScoreForKv {
+                                q: &q,
+                                k: &k,
+                                meta,
+                                batch_idx: batch_idx.clone(),
+                                head_idx: head_idx.clone(),
+                                kv_head_idx: kv_head_idx.clone(),
+                                kv: kv.clone(),
+                                score_acc: &score_acc,
+                                dim_local: &dim,
+                            },
+                        );
+                        let prob = (score - max_score.clone()).exp();
+                        let current = program.load_workgroup(&reduce, lane.clone());
+                        program.store_workgroup(&reduce, lane.clone(), current + prob);
+                    });
+                    program.store_local(&kv_local, tile_base + u32_tile(block));
                 });
                 program.workgroup_barrier();
                 reduce_workgroup(program, &reduce, lane.clone(), |lhs, rhs| lhs + rhs);

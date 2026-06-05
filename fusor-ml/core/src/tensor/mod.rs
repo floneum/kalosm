@@ -11,6 +11,7 @@ use crate::{
     Device, FlashAttentionInputs, FlashAttentionOperation, MatMulOperation, MatMulParams,
     ReduceFunction, ReduceOperation,
     compute_graph::NodeIndex,
+    conv::ConvNdOperation,
     map_layout::MapLayoutOperation,
     nary_wise::{NaryExpr, NaryFunction, NaryOp, NaryOperation, NaryScalar},
     quantized::QMatrix,
@@ -659,6 +660,41 @@ impl Tensor {
         Some(Self::from_parts(self.data.rms_norm(operation)))
     }
 
+    #[doc(hidden)]
+    pub fn try_conv_nd_direct(
+        &self,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        padding: &[usize],
+        strides: &[usize],
+    ) -> Option<Self> {
+        if self.datatype() != weight.datatype()
+            || bias.is_some_and(|bias| bias.datatype() != self.datatype())
+        {
+            return None;
+        }
+        let operation = ConvNdOperation::new(
+            self.data.key,
+            weight.data.key,
+            bias.map(|bias| bias.data.key),
+            self.shape(),
+            weight.shape(),
+            bias.map(|bias| bias.shape()),
+            padding,
+            strides,
+            self.datatype(),
+            self.device(),
+        )?;
+        let device = self.device().clone();
+        let info = TensorInfo::new(operation.output_shape().into(), self.datatype());
+        let key = device
+            .compute_graph()
+            .create_graph_op(std::sync::Arc::new(operation));
+        Some(Self::from_parts(LazyTensorData::from_parts(
+            device, info, key,
+        )))
+    }
+
     pub(crate) fn try_rms_norm_residual_direct(
         &self,
         residual: &Self,
@@ -739,6 +775,13 @@ impl Tensor {
                 causal,
                 self.datatype(),
             );
+        // Browser WebGPU backends have been observed to hang/crash on the
+        // split decode workgroup kernel. The composite fallback still runs on
+        // GPU and is the reliable browser path for q_seq_len == 1.
+        #[cfg(target_arch = "wasm32")]
+        if is_decode_candidate {
+            return None;
+        }
         // The streaming flash attention kernels emit a separate
         // monomorphization per hardware subgroup width and rely on
         // `subgroup_reduce_*`, so they can only target devices where we know

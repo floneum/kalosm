@@ -270,6 +270,28 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     }
 
     #[inline]
+    pub(crate) fn try_conv_nd_direct<const WEIGHT_RANK: usize, const DIFF: usize>(
+        &self,
+        weight: &Tensor<WEIGHT_RANK, D>,
+        bias: Option<&Tensor<1, D>>,
+        padding: [usize; DIFF],
+        strides: [usize; DIFF],
+    ) -> Option<Self> {
+        if R != 2 + DIFF || WEIGHT_RANK != 2 + DIFF {
+            return None;
+        }
+
+        self.inner
+            .try_conv_nd_direct(
+                weight.as_core(),
+                bias.map(|bias| bias.as_core()),
+                &padding,
+                &strides,
+            )
+            .map(Tensor::from_core)
+    }
+
+    #[inline]
     pub fn sum<const O: usize>(&self, dim: impl Dim<R>) -> Tensor<O, D> {
         Tensor::from_core(self.inner.sum(dim.resolve()))
     }

@@ -44,6 +44,7 @@ impl_fn_mut_tuple!(A, B, C, D, E, F);
 pub trait GenTuple {
     type Output;
     fn generate(&mut self, device: &Device, run: usize) -> Self::Output;
+    fn run_label(&self, run: usize) -> String;
 }
 
 macro_rules! impl_gen_tuple {
@@ -63,6 +64,25 @@ macro_rules! impl_gen_tuple {
                         $type.generate(device, run),
                     )*
                 )
+            }
+
+            #[allow(non_snake_case)]
+            fn run_label(&self, run: usize) -> String {
+                let ($($type,)*) = self;
+                let mut fragments = Vec::new();
+                $(
+                    if let Some(fragment) = $type.run_label_fragment(run) {
+                        if !fragments.contains(&fragment) {
+                            fragments.push(fragment);
+                        }
+                    }
+                )*
+
+                if fragments.is_empty() {
+                    format!("run{run}")
+                } else {
+                    format!("sample{run}_{}", fragments.join("_"))
+                }
             }
         }
     };

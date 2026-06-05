@@ -749,12 +749,7 @@ where
     {
         let t_encode = Instant::now();
         let encoded = self.encode_tokens(tokens, images, device, cache.as_deref_mut())?;
-        self.forward_last_hidden_from_embeddings(
-            encoded,
-            device,
-            cache,
-            Some(t_encode.elapsed()),
-        )
+        self.forward_last_hidden_from_embeddings(encoded, device, cache, Some(t_encode.elapsed()))
     }
 
     pub(crate) fn forward_last_hidden_f32_gpu_token(

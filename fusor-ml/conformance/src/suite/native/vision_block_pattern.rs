@@ -170,11 +170,13 @@ pub async fn vision_block_pattern_flush_vs_no_flush_timing() {
 mod tests {
     #[tokio::test]
     async fn vision_block_pattern_resolves_without_periodic_flush() {
+        let _gpu_guard = crate::suite::registry::gpu_test_guard();
         super::vision_block_pattern_resolves_without_periodic_flush().await;
     }
 
     #[tokio::test]
     async fn vision_block_pattern_flush_vs_no_flush_timing() {
+        let _gpu_guard = crate::suite::registry::gpu_test_guard();
         super::vision_block_pattern_flush_vs_no_flush_timing().await;
     }
 }

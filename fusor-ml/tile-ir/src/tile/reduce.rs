@@ -172,7 +172,8 @@ impl TileBlock<'_> {
         )
     }
 
-    fn group_reduce(&mut self, op: TileReduceOp, group_size: u32, value: Tile) -> Tile {
+    /// Cross-lane reduction over contiguous-lane groups of `group_size`.
+    pub fn group_reduce(&mut self, op: TileReduceOp, group_size: u32, value: Tile) -> Tile {
         let block = self.block_size();
         assert!(group_size > 0 && group_size <= block && group_size.is_power_of_two());
         let scratch = self.alloc_reduce_scratch(value.element());

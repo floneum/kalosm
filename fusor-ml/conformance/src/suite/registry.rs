@@ -1,51 +1,125 @@
 //! The shared conformance case registry.
 //!
-//! Every promoted case is listed here once as a `(name, fn)` entry. Both
-//! consumers drive off this single list:
+//! Every promoted suite is listed here once as a `(name, fn)` entry. The suite
+//! functions construct [`AssertionCase`] values without running them; both
+//! consumers drive execution off the collected list:
 //!   * `cargo test` — the `registry!` macro generates one `#[tokio::test]` per
-//!     case (see `generated_tests`), each calling the `suite::native::*`
-//!     function directly, and
+//!     suite (see `generated_tests`) and runs the suite's assertion list, and
 //!   * the in-browser WebGPU suite ([`super::webgpu::run_webgpu_kernel_suite`])
-//!     iterates [`cases`] so the browser runs the full native suite.
+//!     iterates [`assertions`] so the browser runs the same assertion list.
 //!
 //! Cases run on every device returned by [`crate::available_devices`] (CPU
 //! baseline + the GPU variant matrix), so the list is device-agnostic. Cases
 //! that only make sense natively (timing, intentional panics) are not listed.
 
-use crate::CaseResult;
+use crate::{AssertionCase, AssertionCases, CaseResult};
 
-/// Boxed future returned by a registered case.
-pub type CaseFuture = std::pin::Pin<Box<dyn std::future::Future<Output = CaseResult>>>;
+trait IntoAssertionCases {
+    fn into_assertion_cases(self, name: &'static str) -> Vec<AssertionCase>;
+}
 
-/// A registered case: its display name and a thunk that runs it.
-pub type RegisteredCase = (&'static str, fn() -> CaseFuture);
+impl IntoAssertionCases for AssertionCase {
+    fn into_assertion_cases(self, _name: &'static str) -> Vec<AssertionCase> {
+        vec![self]
+    }
+}
+
+impl IntoAssertionCases for AssertionCases {
+    fn into_assertion_cases(self, _name: &'static str) -> Vec<AssertionCase> {
+        self.into_vec()
+    }
+}
+
+fn suite_assertions(name: &'static str, cases: impl IntoAssertionCases) -> Vec<AssertionCase> {
+    cases.into_assertion_cases(name)
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub async fn run_cases(
+    cases: impl IntoIterator<Item = AssertionCase>,
+    mut progress: impl FnMut(&str),
+) -> CaseResult {
+    for case in cases {
+        let name = case.name().to_string();
+        let mut current_name = name.clone();
+        progress(&name);
+        {
+            let mut case_progress = |variant: &str| {
+                current_name = variant.to_string();
+                progress(variant);
+            };
+            case.run_with_progress(&mut case_progress)
+                .await
+                .map_err(|err| -> crate::CaseError { format!("{current_name}: {err}").into() })?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_case(name: &str) -> CaseResult {
+    let Some(case) = assertions().into_iter().find(|case| case.name() == name) else {
+        return Err(format!("unknown conformance case: {name}").into());
+    };
+    case.run().await
+}
 
 macro_rules! registry {
     ($($module:ident :: $case:ident),* $(,)?) => {
-        /// The full shared list of conformance cases.
-        pub fn cases() -> Vec<RegisteredCase> {
-            vec![
+        /// The full shared list of conformance assertions.
+        pub fn assertions() -> Vec<AssertionCase> {
+            let mut assertions = Vec::new();
+            $(
+                assertions.extend(suite_assertions(
+                    concat!(stringify!($module), "::", stringify!($case)),
+                    crate::suite::native::$module::$case(),
+                ));
+            )*
+            assertions
+        }
+
+        /// Back-compat alias for callers that still refer to conformance cases.
+        pub fn cases() -> Vec<AssertionCase> {
+            assertions()
+        }
+
+        pub fn assertions_for_suite(name: &str) -> Option<Vec<AssertionCase>> {
+            match name {
                 $(
-                    (
-                        concat!(stringify!($module), "::", stringify!($case)),
-                        (|| -> CaseFuture {
-                            Box::pin(crate::suite::native::$module::$case())
-                        }) as fn() -> CaseFuture,
-                    ),
+                    concat!(stringify!($module), "::", stringify!($case)) => {
+                        Some(suite_assertions(
+                            concat!(stringify!($module), "::", stringify!($case)),
+                            crate::suite::native::$module::$case(),
+                        ))
+                    }
                 )*
-            ]
+                _ => None,
+            }
         }
 
         /// One `#[tokio::test]` per registered case, generated from the same
-        /// list as [`cases`]. This is what `cargo test` runs natively: each case
-        /// fans out across `available_devices()` (CPU baseline + the GPU variant
-        /// matrix). Case names are globally unique, so a flat module is safe.
+        /// list as [`cases`]. This is what `cargo test` runs natively: each
+        /// generated test first constructs its suite's assertion list, then the
+        /// shared runner executes those assertions.
         #[cfg(test)]
         mod generated_tests {
             $(
                 #[tokio::test]
                 async fn $case() {
-                    crate::suite::native::$module::$case().await.unwrap();
+                    let _gpu_guard = crate::suite::registry::gpu_test_guard();
+                    let assertions = crate::suite::registry::assertions_for_suite(
+                        concat!(stringify!($module), "::", stringify!($case))
+                    )
+                    .expect("registered conformance suite should exist");
+                    crate::suite::registry::run_cases(assertions, |_| {})
+                    .await
+                    .unwrap();
                 }
             )*
         }

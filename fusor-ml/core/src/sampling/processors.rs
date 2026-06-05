@@ -86,5 +86,5 @@ pub(crate) fn processor_params_data(
         bytemuck::bytes_of(&params),
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
     );
-    TensorData::new_from_buffer(device, buffer, &[1], DataTypeEnum::U32)
+    TensorData::new_from_buffer(device, buffer, &[4], DataTypeEnum::U32)
 }

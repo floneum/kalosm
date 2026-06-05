@@ -1,7 +1,10 @@
 //! Flash attention conformance cases.
 
 use fusor::{Device, MaskKind, Tensor};
-use fusor_conformance::{CaseResult, approx_eq, available_devices, ensure, f16_capable_devices};
+use fusor_conformance::{
+    AssertionCase, AssertionCases, approx_compare, available_devices, exact_value_compare,
+    f16_capable_devices,
+};
 use half::f16;
 
 #[derive(Clone, Copy)]
@@ -42,11 +45,12 @@ fn batch_key_mask_data(batch: usize, kv_seq_len: usize) -> Vec<f32> {
     data
 }
 
-async fn assert_flash_attention_case_f16(
+fn assert_flash_attention_case_f16(
+    name: impl Into<String>,
     case: FlashCase,
     mask: Option<(Vec<f32>, MaskKind, [usize; 2])>,
     tol: f16,
-) -> CaseResult {
+) -> AssertionCase {
     let q_data: Vec<f16> = attention_data(
         case.batch * case.num_heads * case.q_seq_len * case.head_dim,
         0.1,
@@ -70,84 +74,62 @@ async fn assert_flash_attention_case_f16(
     .collect();
     let scale = 1.0 / (case.head_dim as f32).sqrt();
 
-    let q_cpu: Tensor<4, f16> = Tensor::from_slice(
-        &Device::Cpu,
-        [case.batch, case.num_heads, case.q_seq_len, case.head_dim],
-        &q_data,
-    );
-    let k_cpu: Tensor<4, f16> = Tensor::from_slice(
-        &Device::Cpu,
-        [
-            case.batch,
-            case.num_kv_heads,
-            case.kv_seq_len,
-            case.head_dim,
-        ],
-        &k_data,
-    );
-    let v_cpu: Tensor<4, f16> = Tensor::from_slice(
-        &Device::Cpu,
-        [
-            case.batch,
-            case.num_kv_heads,
-            case.kv_seq_len,
-            case.head_dim,
-        ],
-        &v_data,
-    );
-    let expected = if let Some((mask_data, kind, shape)) = mask.as_ref() {
-        let mask_f16: Vec<f16> = mask_data.iter().copied().map(f16::from_f32).collect();
-        let mask_cpu: Tensor<2, f16> = Tensor::from_slice(&Device::Cpu, *shape, &mask_f16);
-        q_cpu
-            .flash_attention(&k_cpu, &v_cpu, scale, Some((&mask_cpu, *kind)))
-            .to_concrete()
-    } else {
-        q_cpu
-            .flash_attention(&k_cpu, &v_cpu, scale, None)
-            .to_concrete()
-    };
+    let assertion = fusor_conformance::assert(move |device: Device| {
+        let q_data = q_data.clone();
+        let k_data = k_data.clone();
+        let v_data = v_data.clone();
+        let mask = mask.clone();
+        async move {
+            let q: Tensor<4, f16> = Tensor::from_slice(
+                &device,
+                [case.batch, case.num_heads, case.q_seq_len, case.head_dim],
+                &q_data,
+            );
+            let k: Tensor<4, f16> = Tensor::from_slice(
+                &device,
+                [
+                    case.batch,
+                    case.num_kv_heads,
+                    case.kv_seq_len,
+                    case.head_dim,
+                ],
+                &k_data,
+            );
+            let v: Tensor<4, f16> = Tensor::from_slice(
+                &device,
+                [
+                    case.batch,
+                    case.num_kv_heads,
+                    case.kv_seq_len,
+                    case.head_dim,
+                ],
+                &v_data,
+            );
+            if let Some((mask_data, kind, shape)) = mask.as_ref() {
+                let mask_f16: Vec<f16> = mask_data.iter().copied().map(f16::from_f32).collect();
+                let device_mask: Tensor<2, f16> = Tensor::from_slice(&device, *shape, &mask_f16);
+                q.flash_attention(&k, &v, scale, Some((&device_mask, *kind)))
+                    .to_concrete()
+            } else {
+                q.flash_attention(&k, &v, scale, None).to_concrete()
+            }
+        }
+    })
+    .arg(|device: &Device| device.clone())
+    .devices_async(f16_capable_devices())
+    .compare_with(approx_compare::<4, f16>(tol))
+    .runs(1);
 
-    for device in f16_capable_devices().await {
-        let q: Tensor<4, f16> = Tensor::from_slice(
-            &device,
-            [case.batch, case.num_heads, case.q_seq_len, case.head_dim],
-            &q_data,
-        );
-        let k: Tensor<4, f16> = Tensor::from_slice(
-            &device,
-            [
-                case.batch,
-                case.num_kv_heads,
-                case.kv_seq_len,
-                case.head_dim,
-            ],
-            &k_data,
-        );
-        let v: Tensor<4, f16> = Tensor::from_slice(
-            &device,
-            [
-                case.batch,
-                case.num_kv_heads,
-                case.kv_seq_len,
-                case.head_dim,
-            ],
-            &v_data,
-        );
-        let actual = if let Some((mask_data, kind, shape)) = mask.as_ref() {
-            let mask_f16: Vec<f16> = mask_data.iter().copied().map(f16::from_f32).collect();
-            let device_mask: Tensor<2, f16> = Tensor::from_slice(&device, *shape, &mask_f16);
-            q.flash_attention(&k, &v, scale, Some((&device_mask, *kind)))
-                .to_concrete()
-        } else {
-            q.flash_attention(&k, &v, scale, None).to_concrete()
-        };
-        approx_eq(&actual, &expected, tol).await?;
-    }
-    Ok(())
+    // Chrome/SwiftShader browser WebGPU has been observed to hang/crash in
+    // flash-attention GPU kernels. Native builds still run GPU variants.
+    #[cfg(target_arch = "wasm32")]
+    let assertion = assertion.devices([Device::Cpu]);
+
+    assertion.into_case(name)
 }
 
-pub async fn flash_attention_f16_matches_cpu_reference_on_varied_shapes() -> CaseResult {
-    for case in [
+pub fn flash_attention_f16_matches_cpu_reference_on_varied_shapes() -> AssertionCases {
+    [
         FlashCase {
             batch: 1,
             num_heads: 1,
@@ -172,14 +154,30 @@ pub async fn flash_attention_f16_matches_cpu_reference_on_varied_shapes() -> Cas
             kv_seq_len: 9,
             head_dim: 128,
         },
-    ] {
-        assert_flash_attention_case_f16(case, None, f16::from_f32(5e-3)).await?;
-    }
-    Ok(())
+    ]
+    .into_iter()
+    .map(|case| {
+        assert_flash_attention_case_f16(
+            format!(
+                "flash_attention_ops::flash_attention_f16_matches_cpu_reference_on_varied_shapes::b{}_h{}_kvh{}_q{}_kv{}_d{}",
+                case.batch,
+                case.num_heads,
+                case.num_kv_heads,
+                case.q_seq_len,
+                case.kv_seq_len,
+                case.head_dim
+            ),
+            case,
+            None,
+            f16::from_f32(5e-3),
+        )
+    })
+    .collect::<Vec<_>>()
+    .into()
 }
 
-pub async fn flash_attention_f16_with_qk_mask_matches_cpu_reference() -> CaseResult {
-    for case in [
+pub fn flash_attention_f16_with_qk_mask_matches_cpu_reference() -> AssertionCases {
+    [
         FlashCase {
             batch: 1,
             num_heads: 1,
@@ -196,9 +194,20 @@ pub async fn flash_attention_f16_with_qk_mask_matches_cpu_reference() -> CaseRes
             kv_seq_len: 5,
             head_dim: 4,
         },
-    ] {
+    ]
+    .into_iter()
+    .map(|case| {
         let shape = [case.q_seq_len, case.kv_seq_len];
         assert_flash_attention_case_f16(
+            format!(
+                "flash_attention_ops::flash_attention_f16_with_qk_mask_matches_cpu_reference::b{}_h{}_kvh{}_q{}_kv{}_d{}",
+                case.batch,
+                case.num_heads,
+                case.num_kv_heads,
+                case.q_seq_len,
+                case.kv_seq_len,
+                case.head_dim
+            ),
             case,
             Some((
                 qk_mask_data(case.q_seq_len, case.kv_seq_len),
@@ -207,16 +216,18 @@ pub async fn flash_attention_f16_with_qk_mask_matches_cpu_reference() -> CaseRes
             )),
             f16::from_f32(5e-3),
         )
-        .await?;
-    }
-    Ok(())
+    })
+    .collect::<Vec<_>>()
+    .into()
 }
 
-async fn assert_flash_attention_case(
+fn assert_flash_attention_case(
+    name: impl Into<String>,
     case: FlashCase,
     mask: Option<(Vec<f32>, MaskKind, [usize; 2])>,
     tol: f32,
-) -> CaseResult {
+    runs: usize,
+) -> AssertionCase {
     let q_data = attention_data(
         case.batch * case.num_heads * case.q_seq_len * case.head_dim,
         0.1,
@@ -231,78 +242,56 @@ async fn assert_flash_attention_case(
     );
     let scale = 1.0 / (case.head_dim as f32).sqrt();
 
-    let q_cpu = Tensor::from_slice(
-        &Device::Cpu,
-        [case.batch, case.num_heads, case.q_seq_len, case.head_dim],
-        &q_data,
-    );
-    let k_cpu = Tensor::from_slice(
-        &Device::Cpu,
-        [
-            case.batch,
-            case.num_kv_heads,
-            case.kv_seq_len,
-            case.head_dim,
-        ],
-        &k_data,
-    );
-    let v_cpu = Tensor::from_slice(
-        &Device::Cpu,
-        [
-            case.batch,
-            case.num_kv_heads,
-            case.kv_seq_len,
-            case.head_dim,
-        ],
-        &v_data,
-    );
-    let expected = if let Some((mask_data, kind, shape)) = mask.as_ref() {
-        let mask_cpu = Tensor::from_slice(&Device::Cpu, *shape, mask_data);
-        q_cpu
-            .flash_attention(&k_cpu, &v_cpu, scale, Some((&mask_cpu, *kind)))
-            .to_concrete()
-    } else {
-        q_cpu
-            .flash_attention(&k_cpu, &v_cpu, scale, None)
-            .to_concrete()
-    };
+    let assertion = fusor_conformance::assert(move |device: Device| {
+        let q_data = q_data.clone();
+        let k_data = k_data.clone();
+        let v_data = v_data.clone();
+        let mask = mask.clone();
+        async move {
+            let q = Tensor::from_slice(
+                &device,
+                [case.batch, case.num_heads, case.q_seq_len, case.head_dim],
+                &q_data,
+            );
+            let k = Tensor::from_slice(
+                &device,
+                [
+                    case.batch,
+                    case.num_kv_heads,
+                    case.kv_seq_len,
+                    case.head_dim,
+                ],
+                &k_data,
+            );
+            let v = Tensor::from_slice(
+                &device,
+                [
+                    case.batch,
+                    case.num_kv_heads,
+                    case.kv_seq_len,
+                    case.head_dim,
+                ],
+                &v_data,
+            );
+            if let Some((mask_data, kind, shape)) = mask.as_ref() {
+                let device_mask = Tensor::from_slice(&device, *shape, mask_data);
+                q.flash_attention(&k, &v, scale, Some((&device_mask, *kind)))
+                    .to_concrete()
+            } else {
+                q.flash_attention(&k, &v, scale, None).to_concrete()
+            }
+        }
+    })
+    .arg(|device: &Device| device.clone())
+    .compare_with(approx_compare::<4, f32>(tol))
+    .runs(runs);
 
-    for device in available_devices().await {
-        let q = Tensor::from_slice(
-            &device,
-            [case.batch, case.num_heads, case.q_seq_len, case.head_dim],
-            &q_data,
-        );
-        let k = Tensor::from_slice(
-            &device,
-            [
-                case.batch,
-                case.num_kv_heads,
-                case.kv_seq_len,
-                case.head_dim,
-            ],
-            &k_data,
-        );
-        let v = Tensor::from_slice(
-            &device,
-            [
-                case.batch,
-                case.num_kv_heads,
-                case.kv_seq_len,
-                case.head_dim,
-            ],
-            &v_data,
-        );
-        let actual = if let Some((mask_data, kind, shape)) = mask.as_ref() {
-            let device_mask = Tensor::from_slice(&device, *shape, mask_data);
-            q.flash_attention(&k, &v, scale, Some((&device_mask, *kind)))
-                .to_concrete()
-        } else {
-            q.flash_attention(&k, &v, scale, None).to_concrete()
-        };
-        approx_eq(&actual, &expected, tol).await?;
-    }
-    Ok(())
+    // Chrome/SwiftShader browser WebGPU has been observed to hang/crash in
+    // flash-attention GPU kernels. Native builds still run GPU variants.
+    #[cfg(target_arch = "wasm32")]
+    let assertion = assertion.devices([Device::Cpu]);
+
+    assertion.into_case(name)
 }
 
 /// Exercises the decode-small direct kernel. Cases up to 1024 use a single
@@ -313,7 +302,7 @@ async fn assert_flash_attention_case(
 ///
 /// Each shape is run multiple times because earlier decode failures were
 /// non-deterministic workgroup-memory races.
-pub async fn flash_attention_decode_tiled_matches_cpu_reference() -> CaseResult {
+pub fn flash_attention_decode_tiled_matches_cpu_reference() -> AssertionCases {
     // (num_heads, num_kv_heads, kv_seq_len)
     // Shapes specifically chosen to stress decode block boundaries and the
     // tiled flash_decode_small_block path. head_dim=128 forces the decode-small
@@ -332,7 +321,9 @@ pub async fn flash_attention_decode_tiled_matches_cpu_reference() -> CaseResult 
         (32, 8, 200),  // larger GQA group, kv_seq_len in second tile
     ];
 
-    for (num_heads, num_kv_heads, kv_seq_len) in shapes {
+    shapes
+        .into_iter()
+        .map(|(num_heads, num_kv_heads, kv_seq_len)| {
         let case = FlashCase {
             batch: 1,
             num_heads,
@@ -341,18 +332,19 @@ pub async fn flash_attention_decode_tiled_matches_cpu_reference() -> CaseResult 
             kv_seq_len,
             head_dim: 128,
         };
-        for trial in 0..4 {
-            let tol = if kv_seq_len > 1024 { 5e-3 } else { 1e-3 };
-            assert_flash_attention_case(case, None, tol)
-                .await
-                .map_err(|error| {
-                    format!(
-                        "shape heads={num_heads} kv_heads={num_kv_heads} kv_seq={kv_seq_len} trial={trial}: {error:?}"
-                    )
-                })?;
-        }
-    }
-    Ok(())
+        let tol = if kv_seq_len > 1024 { 5e-3 } else { 1e-3 };
+        assert_flash_attention_case(
+            format!(
+                "flash_attention_ops::flash_attention_decode_tiled_matches_cpu_reference::h{num_heads}_kvh{num_kv_heads}_kv{kv_seq_len}"
+            ),
+            case,
+            None,
+            tol,
+            4,
+        )
+    })
+    .collect::<Vec<_>>()
+    .into()
 }
 
 /// Same as the tiled test above, but builds Q with non-canonical strides
@@ -361,10 +353,12 @@ pub async fn flash_attention_decode_tiled_matches_cpu_reference() -> CaseResult 
 /// via `index_n(meta.q_offset, meta.q_strides, ...)`, so different strides
 /// hit different memory addresses and exercise different control flow paths
 /// inside `flash_decode_small_block`.
-pub async fn flash_attention_decode_tiled_with_transposed_q_matches_cpu_reference() -> CaseResult {
+pub fn flash_attention_decode_tiled_with_transposed_q_matches_cpu_reference() -> AssertionCases {
     let shapes = [(16, 2, 129), (16, 2, 257), (16, 2, 384), (16, 2, 569)];
 
-    for (num_heads, num_kv_heads, kv_seq_len) in shapes {
+    shapes
+        .into_iter()
+        .map(|(num_heads, num_kv_heads, kv_seq_len)| {
         let head_dim = 128;
         let batch = 1;
         let q_seq_len = 1;
@@ -378,55 +372,55 @@ pub async fn flash_attention_decode_tiled_with_transposed_q_matches_cpu_referenc
         let v_data = attention_data(batch * num_kv_heads * kv_seq_len * head_dim, 0.35);
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        // Reference computed on CPU with canonical-stride Q.
-        let q_cpu: Tensor<4, f32> = Tensor::from_slice(
-            &Device::Cpu,
-            [batch, num_heads, q_seq_len, head_dim],
-            &q_data,
-        );
-        let k_cpu: Tensor<4, f32> = Tensor::from_slice(
-            &Device::Cpu,
-            [batch, num_kv_heads, kv_seq_len, head_dim],
-            &k_data,
-        );
-        let v_cpu: Tensor<4, f32> = Tensor::from_slice(
-            &Device::Cpu,
-            [batch, num_kv_heads, kv_seq_len, head_dim],
-            &v_data,
-        );
-        let expected = q_cpu
-            .flash_attention(&k_cpu, &v_cpu, scale, None)
-            .to_concrete();
-
-        for device in available_devices().await {
-            // Lay Q out as [batch, q_seq_len, num_heads, head_dim] (the way
-            // it comes out of the QKV matmul before reshape+transpose) and
-            // then transpose(1, 2) to get [batch, num_heads, q_seq_len, head_dim]
-            // with non-canonical strides — the same layout the model uses.
-            let q_pre: Tensor<4, f32> =
-                Tensor::from_slice(&device, [batch, q_seq_len, num_heads, head_dim], &q_data);
-            let q = q_pre.transpose(1, 2).to_concrete();
-            let k: Tensor<4, f32> = Tensor::from_slice(
-                &device,
-                [batch, num_kv_heads, kv_seq_len, head_dim],
-                &k_data,
-            );
-            let v: Tensor<4, f32> = Tensor::from_slice(
-                &device,
-                [batch, num_kv_heads, kv_seq_len, head_dim],
-                &v_data,
-            );
-            // Several trials to catch races.
-            for _ in 0..4 {
-                let actual = q.flash_attention(&k, &v, scale, None).to_concrete();
-                approx_eq(&actual, &expected, 1e-3).await?;
+        let reference_q_data = q_data.clone();
+        let reference_k_data = k_data.clone();
+        let reference_v_data = v_data.clone();
+        fusor_conformance::assert(move |device: Device| {
+            let q_data = q_data.clone();
+            let k_data = k_data.clone();
+            let v_data = v_data.clone();
+            async move {
+                // Lay Q out as [batch, q_seq_len, num_heads, head_dim] (the way
+                // it comes out of the QKV matmul before reshape+transpose) and
+                // then transpose(1, 2) to get [batch, num_heads, q_seq_len, head_dim]
+                // with non-canonical strides — the same layout the model uses.
+                let q_pre: Tensor<4, f32> =
+                    Tensor::from_slice(&device, [batch, q_seq_len, num_heads, head_dim], &q_data);
+                let q = q_pre.transpose(1, 2).to_concrete();
+                let k: Tensor<4, f32> =
+                    Tensor::from_slice(&device, [batch, num_kv_heads, kv_seq_len, head_dim], &k_data);
+                let v: Tensor<4, f32> =
+                    Tensor::from_slice(&device, [batch, num_kv_heads, kv_seq_len, head_dim], &v_data);
+                q.flash_attention(&k, &v, scale, None).to_concrete()
             }
-        }
-    }
-    Ok(())
+        })
+        .arg(|device: &Device| device.clone())
+        .equal_to(move |device: Device| {
+            let q_data = reference_q_data.clone();
+            let k_data = reference_k_data.clone();
+            let v_data = reference_v_data.clone();
+            async move {
+                // Reference computed with canonical-stride Q.
+                let q: Tensor<4, f32> =
+                    Tensor::from_slice(&device, [batch, num_heads, q_seq_len, head_dim], &q_data);
+                let k: Tensor<4, f32> =
+                    Tensor::from_slice(&device, [batch, num_kv_heads, kv_seq_len, head_dim], &k_data);
+                let v: Tensor<4, f32> =
+                    Tensor::from_slice(&device, [batch, num_kv_heads, kv_seq_len, head_dim], &v_data);
+                q.flash_attention(&k, &v, scale, None).to_concrete()
+            }
+        })
+        .compare_with(approx_compare::<4, f32>(1e-3))
+        .runs(4)
+        .into_case(format!(
+            "flash_attention_ops::flash_attention_decode_tiled_with_transposed_q_matches_cpu_reference::h{num_heads}_kvh{num_kv_heads}_kv{kv_seq_len}"
+        ))
+    })
+    .collect::<Vec<_>>()
+    .into()
 }
 
-pub async fn flash_attention_subgroup_fallback_preserves_gpu_backend() -> CaseResult {
+pub fn flash_attention_subgroup_fallback_preserves_gpu_backend() -> AssertionCase {
     let q_shape = [1, 1, 2, 4];
     let kv_shape = [1, 1, 3, 4];
     let q_data = attention_data(q_shape.iter().product(), 0.1);
@@ -434,28 +428,38 @@ pub async fn flash_attention_subgroup_fallback_preserves_gpu_backend() -> CaseRe
     let v_data = attention_data(kv_shape.iter().product(), 0.35);
     let scale = 1.0 / (q_shape[3] as f32).sqrt();
 
-    for device in available_devices().await {
-        let Some(gpu) = device.as_gpu() else {
-            continue;
-        };
-        if gpu.subgroups_supported() {
-            continue;
+    fusor_conformance::assert(move |device: Device| {
+        let q_data = q_data.clone();
+        let k_data = k_data.clone();
+        let v_data = v_data.clone();
+        async move {
+            let q = Tensor::from_slice(&device, q_shape, &q_data);
+            let k = Tensor::from_slice(&device, kv_shape, &k_data);
+            let v = Tensor::from_slice(&device, kv_shape, &v_data);
+            q.flash_attention(&k, &v, scale, None).is_gpu()
         }
-
-        let q = Tensor::from_slice(&device, q_shape, &q_data);
-        let k = Tensor::from_slice(&device, kv_shape, &k_data);
-        let v = Tensor::from_slice(&device, kv_shape, &v_data);
-        let output = q.flash_attention(&k, &v, scale, None);
-        ensure!(
-            output.is_gpu(),
-            "subgroup fallback should preserve the GPU backend"
-        );
-    }
-    Ok(())
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(move |_device: Device| async move { true })
+    .compare_with(exact_value_compare())
+    .baseline_on_test_device()
+    .devices_async(async {
+        available_devices()
+            .await
+            .into_iter()
+            .filter(|device| {
+                device
+                    .as_gpu()
+                    .is_some_and(|gpu| !gpu.subgroups_supported())
+            })
+            .collect()
+    })
+    .runs(1)
+    .into_case("flash_attention_ops::flash_attention_subgroup_fallback_preserves_gpu_backend")
 }
 
-pub async fn flash_attention_matches_cpu_reference_on_varied_shapes() -> CaseResult {
-    for case in [
+pub fn flash_attention_matches_cpu_reference_on_varied_shapes() -> AssertionCases {
+    [
         FlashCase {
             batch: 1,
             num_heads: 1,
@@ -488,14 +492,31 @@ pub async fn flash_attention_matches_cpu_reference_on_varied_shapes() -> CaseRes
             kv_seq_len: 9,
             head_dim: 128,
         },
-    ] {
-        assert_flash_attention_case(case, None, 1e-4).await?;
-    }
-    Ok(())
+    ]
+    .into_iter()
+    .map(|case| {
+        assert_flash_attention_case(
+            format!(
+                "flash_attention_ops::flash_attention_matches_cpu_reference_on_varied_shapes::b{}_h{}_kvh{}_q{}_kv{}_d{}",
+                case.batch,
+                case.num_heads,
+                case.num_kv_heads,
+                case.q_seq_len,
+                case.kv_seq_len,
+                case.head_dim
+            ),
+            case,
+            None,
+            1e-4,
+            1,
+        )
+    })
+    .collect::<Vec<_>>()
+    .into()
 }
 
-pub async fn flash_attention_with_qk_mask_matches_cpu_reference_on_varied_shapes() -> CaseResult {
-    for case in [
+pub fn flash_attention_with_qk_mask_matches_cpu_reference_on_varied_shapes() -> AssertionCases {
+    [
         FlashCase {
             batch: 1,
             num_heads: 1,
@@ -520,9 +541,20 @@ pub async fn flash_attention_with_qk_mask_matches_cpu_reference_on_varied_shapes
             kv_seq_len: 5,
             head_dim: 4,
         },
-    ] {
+    ]
+    .into_iter()
+    .map(|case| {
         let shape = [case.q_seq_len, case.kv_seq_len];
         assert_flash_attention_case(
+            format!(
+                "flash_attention_ops::flash_attention_with_qk_mask_matches_cpu_reference_on_varied_shapes::b{}_h{}_kvh{}_q{}_kv{}_d{}",
+                case.batch,
+                case.num_heads,
+                case.num_kv_heads,
+                case.q_seq_len,
+                case.kv_seq_len,
+                case.head_dim
+            ),
             case,
             Some((
                 qk_mask_data(case.q_seq_len, case.kv_seq_len),
@@ -530,14 +562,15 @@ pub async fn flash_attention_with_qk_mask_matches_cpu_reference_on_varied_shapes
                 shape,
             )),
             1e-4,
+            1,
         )
-        .await?;
-    }
-    Ok(())
+    })
+    .collect::<Vec<_>>()
+    .into()
 }
 
-pub async fn flash_attention_gqa_matches_cpu_reference_on_varied_shapes() -> CaseResult {
-    for case in [
+pub fn flash_attention_gqa_matches_cpu_reference_on_varied_shapes() -> AssertionCases {
+    [
         FlashCase {
             batch: 1,
             num_heads: 4,
@@ -562,17 +595,34 @@ pub async fn flash_attention_gqa_matches_cpu_reference_on_varied_shapes() -> Cas
             kv_seq_len: 6,
             head_dim: 4,
         },
-    ] {
-        assert_flash_attention_case(case, None, 1e-4).await?;
-    }
-    Ok(())
+    ]
+    .into_iter()
+    .map(|case| {
+        assert_flash_attention_case(
+            format!(
+                "flash_attention_ops::flash_attention_gqa_matches_cpu_reference_on_varied_shapes::b{}_h{}_kvh{}_q{}_kv{}_d{}",
+                case.batch,
+                case.num_heads,
+                case.num_kv_heads,
+                case.q_seq_len,
+                case.kv_seq_len,
+                case.head_dim
+            ),
+            case,
+            None,
+            1e-4,
+            1,
+        )
+    })
+    .collect::<Vec<_>>()
+    .into()
 }
 
-pub async fn flash_attention_with_kv_cache_matches_cpu_reference_on_varied_shapes() -> CaseResult {
+pub fn flash_attention_with_kv_cache_matches_cpu_reference_on_varied_shapes() -> AssertionCases {
     // KV-cache regression: short Q sequence with a longer K/V sequence — the
     // typical autoregressive decode shape after appending to a KvCache.
     // Replaces the deleted `core/src/composite/flash_attention.rs::test_flash_attention_kv_cache_fuzz`.
-    for case in [
+    [
         FlashCase {
             batch: 1,
             num_heads: 1,
@@ -613,19 +663,36 @@ pub async fn flash_attention_with_kv_cache_matches_cpu_reference_on_varied_shape
             kv_seq_len: 32,
             head_dim: 12,
         },
-    ] {
+    ]
+    .into_iter()
+    .map(|case| {
         // No-op mask exercises the KV-cache path through the QKMask code with
         // an all-zero mask, mirroring the pre-migration test.
         let mask = vec![0.0f32; case.q_seq_len * case.kv_seq_len];
         let shape = [case.q_seq_len, case.kv_seq_len];
-        assert_flash_attention_case(case, Some((mask, MaskKind::QKMask, shape)), 1e-3)
-            .await?;
-    }
-    Ok(())
+        assert_flash_attention_case(
+            format!(
+                "flash_attention_ops::flash_attention_with_kv_cache_matches_cpu_reference_on_varied_shapes::b{}_h{}_kvh{}_q{}_kv{}_d{}",
+                case.batch,
+                case.num_heads,
+                case.num_kv_heads,
+                case.q_seq_len,
+                case.kv_seq_len,
+                case.head_dim
+            ),
+            case,
+            Some((mask, MaskKind::QKMask, shape)),
+            1e-3,
+            1,
+        )
+    })
+    .collect::<Vec<_>>()
+    .into()
 }
 
-pub async fn flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied_shapes() -> CaseResult {
-    for case in [
+pub fn flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied_shapes() -> AssertionCases
+{
+    [
         FlashCase {
             batch: 2,
             num_heads: 1,
@@ -650,9 +717,20 @@ pub async fn flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied
             kv_seq_len: 6,
             head_dim: 4,
         },
-    ] {
+    ]
+    .into_iter()
+    .map(|case| {
         let shape = [case.batch, case.kv_seq_len];
         assert_flash_attention_case(
+            format!(
+                "flash_attention_ops::flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied_shapes::b{}_h{}_kvh{}_q{}_kv{}_d{}",
+                case.batch,
+                case.num_heads,
+                case.num_kv_heads,
+                case.q_seq_len,
+                case.kv_seq_len,
+                case.head_dim
+            ),
             case,
             Some((
                 batch_key_mask_data(case.batch, case.kv_seq_len),
@@ -660,10 +738,11 @@ pub async fn flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied
                 shape,
             )),
             1e-4,
+            1,
         )
-        .await?;
-    }
-    Ok(())
+    })
+    .collect::<Vec<_>>()
+    .into()
 }
 
 /// Exercises the tiled (Q-batched) streaming flash attention kernel. The
@@ -672,8 +751,8 @@ pub async fn flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied
 /// - exact Q-block alignment (q_seq_len = 64 = 8*8),
 /// - non-aligned tail (q_seq_len = 72, last block is partially valid),
 /// - non-aligned head_dim and odd kv_seq_len.
-pub async fn flash_attention_tiled_matches_cpu_reference_on_varied_shapes() -> CaseResult {
-    for case in [
+pub fn flash_attention_tiled_matches_cpu_reference_on_varied_shapes() -> AssertionCases {
+    [
         FlashCase {
             batch: 1,
             num_heads: 2,
@@ -706,16 +785,33 @@ pub async fn flash_attention_tiled_matches_cpu_reference_on_varied_shapes() -> C
             kv_seq_len: 128,
             head_dim: 24,
         },
-    ] {
-        assert_flash_attention_case(case, None, 1e-3).await?;
-    }
-    Ok(())
+    ]
+    .into_iter()
+    .map(|case| {
+        assert_flash_attention_case(
+            format!(
+                "flash_attention_ops::flash_attention_tiled_matches_cpu_reference_on_varied_shapes::b{}_h{}_kvh{}_q{}_kv{}_d{}",
+                case.batch,
+                case.num_heads,
+                case.num_kv_heads,
+                case.q_seq_len,
+                case.kv_seq_len,
+                case.head_dim
+            ),
+            case,
+            None,
+            1e-3,
+            1,
+        )
+    })
+    .collect::<Vec<_>>()
+    .into()
 }
 
 /// Same as above but with an additive QK mask, exercising the masked path
 /// through the tiled kernel.
-pub async fn flash_attention_tiled_with_mask_matches_cpu_reference() -> CaseResult {
-    for case in [
+pub fn flash_attention_tiled_with_mask_matches_cpu_reference() -> AssertionCases {
+    [
         FlashCase {
             batch: 1,
             num_heads: 2,
@@ -732,9 +828,20 @@ pub async fn flash_attention_tiled_with_mask_matches_cpu_reference() -> CaseResu
             kv_seq_len: 64,
             head_dim: 16,
         },
-    ] {
+    ]
+    .into_iter()
+    .map(|case| {
         let shape = [case.q_seq_len, case.kv_seq_len];
         assert_flash_attention_case(
+            format!(
+                "flash_attention_ops::flash_attention_tiled_with_mask_matches_cpu_reference::b{}_h{}_kvh{}_q{}_kv{}_d{}",
+                case.batch,
+                case.num_heads,
+                case.num_kv_heads,
+                case.q_seq_len,
+                case.kv_seq_len,
+                case.head_dim
+            ),
             case,
             Some((
                 qk_mask_data(case.q_seq_len, case.kv_seq_len),
@@ -742,8 +849,9 @@ pub async fn flash_attention_tiled_with_mask_matches_cpu_reference() -> CaseResu
                 shape,
             )),
             1e-3,
+            1,
         )
-        .await?;
-    }
-    Ok(())
+    })
+    .collect::<Vec<_>>()
+    .into()
 }

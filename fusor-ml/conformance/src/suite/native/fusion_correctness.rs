@@ -2,7 +2,7 @@
 
 use crate::common::{binary_map2, unary_map2, where_cond2};
 use fusor::{Device, Tensor};
-use fusor_conformance::{CaseResult, FuzzGenerator, approx_compare};
+use fusor_conformance::{AssertionCase, AssertionCases, FuzzGenerator, approx_compare};
 use rand::distr::Uniform;
 
 fn fuzz(seed: u64) -> FuzzGenerator<2, f32> {
@@ -11,7 +11,7 @@ fn fuzz(seed: u64) -> FuzzGenerator<2, f32> {
         .with_distribution(Uniform::new(-3.0, 3.0).unwrap())
 }
 
-pub async fn nary_triple_add_fuzzed() -> CaseResult {
+pub fn nary_triple_add_fuzzed() -> AssertionCase {
     // (a + b) + c
     fusor_conformance::assert(
         async |a: Tensor<2, f32>, b: Tensor<2, f32>, c: Tensor<2, f32>| {
@@ -31,11 +31,10 @@ pub async fn nary_triple_add_fuzzed() -> CaseResult {
     )
     .compare_with(approx_compare::<2, f32>(1e-5))
     .runs(3)
-    .await?;
-    Ok(())
+    .into_case("fusion_correctness::nary_triple_add_fuzzed")
 }
 
-pub async fn nary_mixed_ops_fuzzed() -> CaseResult {
+pub fn nary_mixed_ops_fuzzed() -> AssertionCase {
     // (a + b) * c
     fusor_conformance::assert(
         async |a: Tensor<2, f32>, b: Tensor<2, f32>, c: Tensor<2, f32>| {
@@ -55,11 +54,10 @@ pub async fn nary_mixed_ops_fuzzed() -> CaseResult {
     )
     .compare_with(approx_compare::<2, f32>(1e-4))
     .runs(3)
-    .await?;
-    Ok(())
+    .into_case("fusion_correctness::nary_mixed_ops_fuzzed")
 }
 
-pub async fn nary_nested_pairwise_fuzzed() -> CaseResult {
+pub fn nary_nested_pairwise_fuzzed() -> AssertionCase {
     // (a + b) * (c - d)
     fusor_conformance::assert(
         async |a: Tensor<2, f32>, b: Tensor<2, f32>, c: Tensor<2, f32>, d: Tensor<2, f32>| {
@@ -86,11 +84,10 @@ pub async fn nary_nested_pairwise_fuzzed() -> CaseResult {
     )
     .compare_with(approx_compare::<2, f32>(1e-4))
     .runs(3)
-    .await?;
-    Ok(())
+    .into_case("fusion_correctness::nary_nested_pairwise_fuzzed")
 }
 
-pub async fn nary_unary_in_middle_fuzzed() -> CaseResult {
+pub fn nary_unary_in_middle_fuzzed() -> AssertionCase {
     // (-a + sin(b)).cos() + 1.0
     let fuzz_b = FuzzGenerator::<2, f32>::new([16..=45, 16..=45])
         .with_seed(31)
@@ -113,11 +110,10 @@ pub async fn nary_unary_in_middle_fuzzed() -> CaseResult {
     })
     .compare_with(approx_compare::<2, f32>(1e-3))
     .runs(3)
-    .await?;
-    Ok(())
+    .into_case("fusion_correctness::nary_unary_in_middle_fuzzed")
 }
 
-pub async fn nary_chain_then_pairwise_fuzzed() -> CaseResult {
+pub fn nary_chain_then_pairwise_fuzzed() -> AssertionCase {
     // (a + 1).exp() + sin(b)
     let fuzz_a = FuzzGenerator::<2, f32>::new([16..=45, 16..=45])
         .with_seed(40)
@@ -138,11 +134,10 @@ pub async fn nary_chain_then_pairwise_fuzzed() -> CaseResult {
     })
     .compare_with(approx_compare::<2, f32>(1e-3))
     .runs(3)
-    .await?;
-    Ok(())
+    .into_case("fusion_correctness::nary_chain_then_pairwise_fuzzed")
 }
 
-pub async fn nary_same_input_fuzzed() -> CaseResult {
+pub fn nary_same_input_fuzzed() -> AssertionCase {
     // a + a + a = 3a
     fusor_conformance::assert(async |a: Tensor<2, f32>| {
         let aa = a.add_::<2, 2, _>(&a);
@@ -155,11 +150,10 @@ pub async fn nary_same_input_fuzzed() -> CaseResult {
     })
     .compare_with(approx_compare::<2, f32>(1e-5))
     .runs(3)
-    .await?;
-    Ok(())
+    .into_case("fusion_correctness::nary_same_input_fuzzed")
 }
 
-pub async fn nary_where_cond_fuzzed() -> CaseResult {
+pub fn nary_where_cond_fuzzed() -> AssertionCase {
     let fuzz_cond = FuzzGenerator::<2, f32>::new([16..=45, 16..=45])
         .with_seed(60)
         .with_distribution(Uniform::new(-1.0, 1.0).unwrap());
@@ -184,11 +178,10 @@ pub async fn nary_where_cond_fuzzed() -> CaseResult {
     )
     .compare_with(approx_compare::<2, f32>(1e-6))
     .runs(3)
-    .await?;
-    Ok(())
+    .into_case("fusion_correctness::nary_where_cond_fuzzed")
 }
 
-pub async fn fused_cached_results_fuzzed() -> CaseResult {
+pub fn fused_cached_results_fuzzed() -> AssertionCases {
     // (tensor * 2 + 1).sum(0) then branch into *2 and *3
     // Tests that caching/sharing of intermediate results works correctly.
     let fuzz_3d = FuzzGenerator::<3, f32>::new([3..=4, 16..=22, 16..=22])
@@ -196,59 +189,66 @@ pub async fn fused_cached_results_fuzzed() -> CaseResult {
         .with_distribution(Uniform::new(-2.0, 2.0).unwrap());
 
     // times_two branch
-    fusor_conformance::assert(async |t: Tensor<3, f32>| {
-        let doubled = t.clone() * 2.0;
-        let plus_one = (doubled + 1.0).sum::<2>(0);
-        (plus_one * 2.0).to_concrete()
-    })
-    .arg(fuzz_3d.clone())
-    .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-        // manual: (data*2+1).sum(axis=0) * 2
-        let rows = v[0].len();
-        let cols = v[0][0].len();
-        let mut summed = vec![vec![0.0f32; cols]; rows];
-        for slice in &v {
-            for (r, row) in slice.iter().enumerate() {
-                for (c, val) in row.iter().enumerate() {
-                    summed[r][c] += val * 2.0 + 1.0;
+    let mut assertions = AssertionCases::new();
+
+    assertions.push(
+        fusor_conformance::assert(async |t: Tensor<3, f32>| {
+            let doubled = t.clone() * 2.0;
+            let plus_one = (doubled + 1.0).sum::<2>(0);
+            (plus_one * 2.0).to_concrete()
+        })
+        .arg(fuzz_3d.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+            // manual: (data*2+1).sum(axis=0) * 2
+            let rows = v[0].len();
+            let cols = v[0][0].len();
+            let mut summed = vec![vec![0.0f32; cols]; rows];
+            for slice in &v {
+                for (r, row) in slice.iter().enumerate() {
+                    for (c, val) in row.iter().enumerate() {
+                        summed[r][c] += val * 2.0 + 1.0;
+                    }
                 }
             }
-        }
-        let out = unary_map2(&summed, |x| x * 2.0);
-        Tensor::new(&device, &out)
-    })
-    .compare_with(approx_compare::<2, f32>(1e-2))
-    .runs(3)
-    .await?;
+            let out = unary_map2(&summed, |x| x * 2.0);
+            Tensor::new(&device, &out)
+        })
+        .compare_with(approx_compare::<2, f32>(1e-2))
+        .runs(3)
+        .into_case("fusion_correctness::fused_cached_results_fuzzed::times_two"),
+    );
 
     // times_three branch
-    fusor_conformance::assert(async |t: Tensor<3, f32>| {
-        let doubled = t.clone() * 2.0;
-        let plus_one = (doubled + 1.0).sum::<2>(0);
-        (plus_one * 3.0).to_concrete()
-    })
-    .arg(fuzz_3d)
-    .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-        let rows = v[0].len();
-        let cols = v[0][0].len();
-        let mut summed = vec![vec![0.0f32; cols]; rows];
-        for slice in &v {
-            for (r, row) in slice.iter().enumerate() {
-                for (c, val) in row.iter().enumerate() {
-                    summed[r][c] += val * 2.0 + 1.0;
+    assertions.push(
+        fusor_conformance::assert(async |t: Tensor<3, f32>| {
+            let doubled = t.clone() * 2.0;
+            let plus_one = (doubled + 1.0).sum::<2>(0);
+            (plus_one * 3.0).to_concrete()
+        })
+        .arg(fuzz_3d)
+        .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+            let rows = v[0].len();
+            let cols = v[0][0].len();
+            let mut summed = vec![vec![0.0f32; cols]; rows];
+            for slice in &v {
+                for (r, row) in slice.iter().enumerate() {
+                    for (c, val) in row.iter().enumerate() {
+                        summed[r][c] += val * 2.0 + 1.0;
+                    }
                 }
             }
-        }
-        let out = unary_map2(&summed, |x| x * 3.0);
-        Tensor::new(&device, &out)
-    })
-    .compare_with(approx_compare::<2, f32>(1e-2))
-    .runs(3)
-    .await?;
-    Ok(())
+            let out = unary_map2(&summed, |x| x * 3.0);
+            Tensor::new(&device, &out)
+        })
+        .compare_with(approx_compare::<2, f32>(1e-2))
+        .runs(3)
+        .into_case("fusion_correctness::fused_cached_results_fuzzed::times_three"),
+    );
+
+    assertions
 }
 
-pub async fn inplace_clone_immutability_fuzzed() -> CaseResult {
+pub fn inplace_clone_immutability_fuzzed() -> AssertionCase {
     // Verify that tensor + 1.0 gives correct values and cloning preserves immutability.
     // Running the same operation twice on a cloned tensor should give the same result.
     const SHAPE_3D: [usize; 3] = [4, 16, 32];
@@ -267,6 +267,5 @@ pub async fn inplace_clone_immutability_fuzzed() -> CaseResult {
         })
         .compare_with(approx_compare::<3, f32>(1e-6))
         .runs(3)
-        .await?;
-    Ok(())
+        .into_case("fusion_correctness::inplace_clone_immutability_fuzzed")
 }

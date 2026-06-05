@@ -74,8 +74,7 @@ where
                                     .read()
                                     .map_err(|err| LlamaModelError::Session(err.to_string()))?
                                     .clone();
-                                if speculative_cache.tokens.len()
-                                    < self.model.config.context_length
+                                if speculative_cache.tokens.len() < self.model.config.context_length
                                 {
                                     Self::forward_sample_token_from_gpu_token_pending(
                                         &self.model,

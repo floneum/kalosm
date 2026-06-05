@@ -3,7 +3,7 @@
 pub mod quantized;
 
 use fusor::{DataType, Device, SimdElement, Tensor};
-use fusor_conformance::{approx_compare, available_devices, exact_compare};
+use fusor_conformance::{approx_compare, exact_compare};
 
 pub async fn assert_approx_tensors<const R: usize>(
     actual: Tensor<R, f32>,
@@ -50,35 +50,72 @@ where
 }
 
 pub async fn assert_approx_devices<const R: usize>(
-    actual: impl Fn(&Device) -> Tensor<R, f32>,
-    expected: impl Fn(&Device) -> Tensor<R, f32>,
+    actual: impl Fn(&Device) -> Tensor<R, f32> + Clone + Send + 'static,
+    expected: impl Fn(&Device) -> Tensor<R, f32> + Clone + Send + 'static,
     tol: f32,
 ) -> fusor_conformance::CaseResult {
-    for device in available_devices().await {
-        assert_approx_tensors(actual(&device), expected(&device), tol).await?;
-    }
-    Ok(())
+    fusor_conformance::assert({
+        let actual = actual.clone();
+        move |device: Device| {
+            let actual = actual.clone();
+            async move { actual(&device) }
+        }
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(move |device: Device| {
+        let expected = expected.clone();
+        async move { expected(&device) }
+    })
+    .compare_with(approx_compare::<R, f32>(tol))
+    .await
+    .map_err(Into::into)
 }
 
 pub async fn assert_exact_devices<const R: usize, T>(
-    actual: impl Fn(&Device) -> Tensor<R, T>,
-    expected: impl Fn(&Device) -> Tensor<R, T>,
+    actual: impl Fn(&Device) -> Tensor<R, T> + Clone + Send + 'static,
+    expected: impl Fn(&Device) -> Tensor<R, T> + Clone + Send + 'static,
 ) -> fusor_conformance::CaseResult
 where
     T: DataType + SimdElement + PartialEq + 'static,
 {
-    for device in available_devices().await {
-        assert_exact_tensors(actual(&device), expected(&device)).await?;
-    }
-    Ok(())
+    fusor_conformance::assert({
+        let actual = actual.clone();
+        move |device: Device| {
+            let actual = actual.clone();
+            async move { actual(&device) }
+        }
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(move |device: Device| {
+        let expected = expected.clone();
+        async move { expected(&device) }
+    })
+    .compare_with(exact_compare::<R, T>())
+    .await
+    .map_err(Into::into)
 }
 
 pub async fn assert_approx_cpu<const R: usize>(
-    actual: impl Fn(&Device) -> Tensor<R, f32>,
-    expected: impl Fn(&Device) -> Tensor<R, f32>,
+    actual: impl Fn(&Device) -> Tensor<R, f32> + Clone + Send + 'static,
+    expected: impl Fn(&Device) -> Tensor<R, f32> + Clone + Send + 'static,
     tol: f32,
 ) -> fusor_conformance::CaseResult {
-    assert_approx_tensors(actual(&Device::Cpu), expected(&Device::Cpu), tol).await
+    fusor_conformance::assert({
+        let actual = actual.clone();
+        move |device: Device| {
+            let actual = actual.clone();
+            async move { actual(&device) }
+        }
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(move |device: Device| {
+        let expected = expected.clone();
+        async move { expected(&device) }
+    })
+    .compare_with(approx_compare::<R, f32>(tol))
+    .devices([Device::Cpu])
+    .await
+    .map_err(Into::into)
 }
 
 pub fn flatten2(input: &[Vec<f32>]) -> Vec<f32> {

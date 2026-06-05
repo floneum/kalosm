@@ -5,163 +5,193 @@ use crate::common::quantized::{
 };
 use crate::common::{matmul2, transpose2};
 use fusor::{BlockQ4K, Device, GgmlType, GgufBlock, Tensor, ToVec2};
-use fusor_conformance::{CaseResult, available_devices, ensure, ensure_eq};
+use fusor_conformance::{AssertionCase, AssertionCases, approx_compare, available_devices};
 use std::mem::size_of;
 
-async fn assert_q_mat_mul_3d_batch(input_rows: usize) -> CaseResult {
-    use fusor::Device;
+async fn gpu_devices() -> Vec<Device> {
+    available_devices()
+        .await
+        .into_iter()
+        .filter(|device| device.as_gpu().is_some())
+        .collect()
+}
 
+fn assert_q_mat_mul_3d_batch(input_rows: usize) -> AssertionCases {
     let weight_shape = [2usize, 64];
     let raw_bytes = q8_0_raw_bytes(weight_shape);
-    let cpu_weights =
-        qmatrix_from_raw_bytes(&Device::Cpu, weight_shape, &raw_bytes, GgmlType::Q8_0);
-    let dequantized_rows = cpu_weights
-        .dequantize::<2>()
-        .as_slice()
-        .await
-        .unwrap()
-        .to_vec2();
-    let weights_t = transpose2(&dequantized_rows);
+    let mut assertions = AssertionCases::new();
 
     for batch in [1usize, 2, 3] {
         let shape = [batch, input_rows, weight_shape[1]];
         let data = deterministic_input(&shape, 901 + batch as u32);
-
-        let cpu_input: Tensor<3, f32> = Tensor::from_slice(&Device::Cpu, shape, &data);
-        let cpu_result = cpu_input.q_mat_mul(&cpu_weights).to_concrete();
-
-        // Reference: batched matmul against the dequantized weights.
-        let mut expected_rows = Vec::with_capacity(batch);
-        for b in 0..batch {
-            let slice: Vec<Vec<f32>> = (0..input_rows)
-                .map(|m| {
-                    let start = ((b * input_rows) + m) * weight_shape[1];
-                    data[start..start + weight_shape[1]].to_vec()
-                })
-                .collect();
-            expected_rows.push(matmul2(&slice, &weights_t));
-        }
-        let expected = Tensor::new(&Device::Cpu, &expected_rows);
-        fusor_conformance::approx_eq(&cpu_result, &expected, 5e-2)
-            .await?;
-
-        for device in available_devices().await {
+        assertions.push(
+            fusor_conformance::assert({
+                let raw_bytes = raw_bytes.clone();
+                let data = data.clone();
+                move |device: Device| {
+                    let raw_bytes = raw_bytes.clone();
+                    let data = data.clone();
+                    async move {
             let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
             let input: Tensor<3, f32> = Tensor::from_slice(&device, shape, &data);
-            let actual = input.q_mat_mul(&weights).to_concrete();
-            fusor_conformance::approx_eq(&actual, &cpu_result, 5e-2)
-                .await?;
-        }
+                        input.q_mat_mul(&weights).to_concrete()
+                    }
+                }
+            })
+            .arg(|device: &Device| device.clone())
+            .equal_to({
+                let raw_bytes = raw_bytes.clone();
+                let data = data.clone();
+                move |device: Device| {
+                    let raw_bytes = raw_bytes.clone();
+                    let data = data.clone();
+                    async move {
+                        let cpu_weights = qmatrix_from_raw_bytes(
+                            &Device::Cpu,
+                            weight_shape,
+                            &raw_bytes,
+                            GgmlType::Q8_0,
+                        );
+                        let dequantized_rows = cpu_weights
+                            .dequantize::<2>()
+                            .as_slice()
+                            .await
+                            .unwrap()
+                            .to_vec2();
+                        let weights_t = transpose2(&dequantized_rows);
+                        let mut expected_rows = Vec::with_capacity(batch);
+                        for b in 0..batch {
+                            let slice: Vec<Vec<f32>> = (0..input_rows)
+                                .map(|m| {
+                                    let start = ((b * input_rows) + m) * weight_shape[1];
+                                    data[start..start + weight_shape[1]].to_vec()
+                                })
+                                .collect();
+                            expected_rows.push(matmul2(&slice, &weights_t));
+                        }
+                        Tensor::new(&device, &expected_rows)
+                    }
+                }
+            })
+            .compare_with(approx_compare::<3, f32>(5e-2))
+            .runs(1)
+            .into_case(format!(
+                "quantized_matmul_batched::q_mat_mul_batched_3d_matches_host_reference::rows{input_rows}_batch{batch}"
+            )),
+        );
     }
-    Ok(())
+    assertions
 }
 
-pub async fn q_mat_mul_batched_3d_matches_host_reference() -> CaseResult {
-    assert_q_mat_mul_3d_batch(1).await?;
-    assert_q_mat_mul_3d_batch(3).await?;
-    Ok(())
+pub fn q_mat_mul_batched_3d_matches_host_reference() -> AssertionCases {
+    let mut assertions = AssertionCases::new();
+    assertions.extend(assert_q_mat_mul_3d_batch(1));
+    assertions.extend(assert_q_mat_mul_3d_batch(3));
+    assertions
 }
 
-pub async fn q_mat_mul_transposed_input_matches_host_reference() -> CaseResult {
-    use fusor::Device;
-
+pub fn q_mat_mul_transposed_input_matches_host_reference() -> AssertionCases {
     // Build [N, M, B] and transpose(0, 2) -> [B, M, N], matching the deleted
     // `test_fuzz_q_mat_mul_transposed` topology.
     let weight_shape = [2usize, 64];
     let raw_bytes = q8_0_raw_bytes(weight_shape);
-    let cpu_weights =
-        qmatrix_from_raw_bytes(&Device::Cpu, weight_shape, &raw_bytes, GgmlType::Q8_0);
-    let dequantized_rows = cpu_weights
-        .dequantize::<2>()
-        .as_slice()
-        .await
-        .unwrap()
-        .to_vec2();
-    let weights_t = transpose2(&dequantized_rows);
+    let mut assertions = AssertionCases::new();
 
     for &(input_rows, batch) in &[(2usize, 2usize), (1, 3)] {
         let shape = [weight_shape[1], input_rows, batch];
         let data = deterministic_input(&shape, 1100 + batch as u32);
-
-        let cpu_input: Tensor<3, f32> = Tensor::from_slice(&Device::Cpu, shape, &data);
-        let cpu_result = cpu_input
-            .transpose(0, 2)
-            .q_mat_mul(&cpu_weights)
-            .to_concrete();
-
-        // Build expected via the transposed input layout.
-        let mut expected_rows = Vec::with_capacity(batch);
-        for b in 0..batch {
-            let slice: Vec<Vec<f32>> = (0..input_rows)
-                .map(|m| {
-                    (0..weight_shape[1])
-                        .map(|n| {
-                            let idx = (n * input_rows + m) * batch + b;
-                            data[idx]
-                        })
-                        .collect()
-                })
-                .collect();
-            expected_rows.push(matmul2(&slice, &weights_t));
-        }
-        let expected = Tensor::new(&Device::Cpu, &expected_rows);
-        fusor_conformance::approx_eq(&cpu_result, &expected, 5e-2)
-            .await?;
-
-        for device in available_devices().await {
-            let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
-            let input: Tensor<3, f32> = Tensor::from_slice(&device, shape, &data);
-            let actual = input.transpose(0, 2).q_mat_mul(&weights).to_concrete();
-            fusor_conformance::approx_eq(&actual, &cpu_result, 5e-2)
-                .await?;
-        }
+        assertions.push(
+            fusor_conformance::assert({
+                let raw_bytes = raw_bytes.clone();
+                let data = data.clone();
+                move |device: Device| {
+                    let raw_bytes = raw_bytes.clone();
+                    let data = data.clone();
+                    async move {
+                        let weights =
+                            qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
+                        let input: Tensor<3, f32> = Tensor::from_slice(&device, shape, &data);
+                        input.transpose(0, 2).q_mat_mul(&weights).to_concrete()
+                    }
+                }
+            })
+            .arg(|device: &Device| device.clone())
+            .equal_to({
+                let raw_bytes = raw_bytes.clone();
+                let data = data.clone();
+                move |device: Device| {
+                    let raw_bytes = raw_bytes.clone();
+                    let data = data.clone();
+                    async move {
+                        let cpu_weights = qmatrix_from_raw_bytes(
+                            &Device::Cpu,
+                            weight_shape,
+                            &raw_bytes,
+                            GgmlType::Q8_0,
+                        );
+                        let dequantized_rows = cpu_weights
+                            .dequantize::<2>()
+                            .as_slice()
+                            .await
+                            .unwrap()
+                            .to_vec2();
+                        let weights_t = transpose2(&dequantized_rows);
+                        let mut expected_rows = Vec::with_capacity(batch);
+                        for b in 0..batch {
+                            let slice: Vec<Vec<f32>> = (0..input_rows)
+                                .map(|m| {
+                                    (0..weight_shape[1])
+                                        .map(|n| {
+                                            let idx = (n * input_rows + m) * batch + b;
+                                            data[idx]
+                                        })
+                                        .collect()
+                                })
+                                .collect();
+                            expected_rows.push(matmul2(&slice, &weights_t));
+                        }
+                        Tensor::new(&device, &expected_rows)
+                    }
+                }
+            })
+            .compare_with(approx_compare::<3, f32>(5e-2))
+            .runs(1)
+            .into_case(format!(
+                "quantized_matmul_batched::q_mat_mul_transposed_input_matches_host_reference::rows{input_rows}_batch{batch}"
+            )),
+        );
     }
-    Ok(())
+    assertions
 }
 
-pub async fn q_mat_mul_consumes_transpose_reshape_copy_matches_cpu_reference() -> CaseResult {
+pub fn q_mat_mul_consumes_transpose_reshape_copy_matches_cpu_reference() -> AssertionCase {
     let weight_shape = [4usize, 4096usize];
     let raw_bytes = q8_0_raw_bytes(weight_shape);
     let input_shape = [1usize, 32usize, 2usize, 128usize];
     let data = deterministic_input(&input_shape, 1401);
 
-    let cpu_weights =
-        qmatrix_from_raw_bytes(&Device::Cpu, weight_shape, &raw_bytes, GgmlType::Q8_0);
-    let cpu_input: Tensor<4, f32> = Tensor::from_slice(&Device::Cpu, input_shape, &data);
-    let produced = cpu_input + 0.25;
-    let transposed = produced.transpose(1, 2);
-    let reshaped = transposed.reshape([1, 2, 32 * 128]);
-    let cpu_result = reshaped.q_mat_mul(&cpu_weights).to_concrete();
-
-    for device in available_devices().await {
-        let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
-        let input: Tensor<4, f32> = Tensor::from_slice(&device, input_shape, &data);
-        let produced = input + 0.25;
-        let transposed = produced.transpose(1, 2);
-        let reshaped = transposed.reshape([1, 2, 32 * 128]);
-        let actual = reshaped.q_mat_mul(&weights).to_concrete();
-        fusor_conformance::approx_eq(&actual, &cpu_result, 5e-2)
-            .await?;
-    }
-    Ok(())
+    fusor_conformance::assert(move |device: Device| {
+        let raw_bytes = raw_bytes.clone();
+        let data = data.clone();
+        async move {
+            let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
+            let input: Tensor<4, f32> = Tensor::from_slice(&device, input_shape, &data);
+            let produced = input + 0.25;
+            let transposed = produced.transpose(1, 2);
+            let reshaped = transposed.reshape([1, 2, 32 * 128]);
+            reshaped.q_mat_mul(&weights).to_concrete()
+        }
+    })
+    .arg(|device: &Device| device.clone())
+    .compare_with(approx_compare::<3, f32>(5e-2))
+    .runs(1)
+    .into_case(
+        "quantized_matmul_batched::q_mat_mul_consumes_transpose_reshape_copy_matches_cpu_reference",
+    )
 }
 
-pub async fn q4k_llama_decode_transpose_reshape_qmatmul_matches_one_hot_reference() -> CaseResult {
-    let Some(device) = available_devices()
-        .await
-        .into_iter()
-        .find(|device| device.as_gpu().is_some())
-    else {
-        return Ok(());
-    };
-    let Some(gpu_device) = device.as_gpu() else {
-        return Ok(());
-    };
-    if !gpu_device.subgroups_supported() {
-        return Ok(());
-    }
-
-    for (weight_shape, sample_cols) in [
+pub fn q4k_llama_decode_transpose_reshape_qmatmul_matches_one_hot_reference() -> AssertionCases {
+    [
         (
             [5120usize, 4096usize],
             &[0usize, 1, 63, 64, 511, 1024, 4095, 5119][..],
@@ -170,20 +200,22 @@ pub async fn q4k_llama_decode_transpose_reshape_qmatmul_matches_one_hot_referenc
             [14336usize, 4096usize],
             &[0usize, 1, 63, 64, 511, 1024, 4095, 8191, 14335][..],
         ),
-    ] {
-        assert_q4k_llama_decode_transpose_reshape_shape(&device, weight_shape, sample_cols).await?;
-    }
-    Ok(())
+    ]
+    .into_iter()
+    .map(|(weight_shape, sample_cols)| {
+        assert_q4k_llama_decode_transpose_reshape_shape(weight_shape, sample_cols)
+    })
+    .collect::<Vec<_>>()
+    .into()
 }
 
-async fn assert_q4k_llama_decode_transpose_reshape_shape(
-    device: &Device,
+fn assert_q4k_llama_decode_transpose_reshape_shape(
     weight_shape: [usize; 2],
     sample_cols: &[usize],
-) -> CaseResult {
+) -> AssertionCase {
     let [output_cols, hidden] = weight_shape;
     let input_shape = [1usize, 32usize, 48usize, 128usize];
-    ensure_eq!(hidden, input_shape[1] * input_shape[3]);
+    assert_eq!(hidden, input_shape[1] * input_shape[3]);
     let selected_k = 777usize;
     let selected_head = selected_k / input_shape[3];
     let selected_dim = selected_k % input_shape[3];
@@ -191,7 +223,9 @@ async fn assert_q4k_llama_decode_transpose_reshape_shape(
     let selected_offset = selected_k % BlockQ4K::BLOCK_SIZE;
     let blocks_per_row = hidden / BlockQ4K::BLOCK_SIZE;
     let raw_bytes = q4k_raw_bytes(weight_shape);
-    let weights = qmatrix_from_raw_bytes(device, weight_shape, &raw_bytes, GgmlType::Q4K);
+    let sample_cols = sample_cols.to_vec();
+    let sample_rows = vec![0usize, 1, 7, 17, 31, 47];
+    let sample_count = sample_rows.len() * sample_cols.len();
 
     let mut input_data = vec![-0.25f32; input_shape.iter().product()];
     let mut row_values = Vec::with_capacity(input_shape[2]);
@@ -201,38 +235,68 @@ async fn assert_q4k_llama_decode_transpose_reshape_shape(
         let index = ((selected_head * input_shape[2] + row) * input_shape[3]) + selected_dim;
         input_data[index] = row_value - 0.25;
     }
+    let expected_raw_bytes = raw_bytes.clone();
+    let expected_row_values = row_values.clone();
+    let expected_sample_rows = sample_rows.clone();
+    let expected_sample_cols = sample_cols.clone();
 
-    let input: Tensor<4, f32> = Tensor::from_slice(device, input_shape, &input_data);
-    let actual = (input + 0.25)
-        .transpose(1, 2)
-        .reshape([1, input_shape[2], hidden])
-        .q_mat_mul(&weights)
-        .as_slice()
-        .await
-        .unwrap();
-
-    ensure_eq!(actual.shape(), &[1, input_shape[2], output_cols]);
-    for row in [0usize, 1, 7, 17, 31, 47] {
-        for &col in sample_cols {
-            let block_index = col * blocks_per_row + selected_block_in_row;
-            let offset = block_index * size_of::<BlockQ4K>();
-            ensure!(offset + size_of::<BlockQ4K>() <= raw_bytes.len());
-            let block = unsafe {
-                std::ptr::read_unaligned(raw_bytes.as_ptr().add(offset).cast::<BlockQ4K>())
-            };
-            let expected = row_values[row] * block.dequantize().as_ref()[selected_offset];
-            let actual = actual[[0, row, col]];
-            let tolerance = 1e-2_f32.max(expected.abs() * 1.0e-4);
-            ensure!(
-                (actual - expected).abs() <= tolerance,
-                "shape={weight_shape:?} row={row} col={col} actual={actual} expected={expected} tolerance={tolerance}"
-            );
+    fusor_conformance::assert(move |device: Device| {
+        let raw_bytes = raw_bytes.clone();
+        let input_data = input_data.clone();
+        let sample_rows = sample_rows.clone();
+        let sample_cols = sample_cols.clone();
+        async move {
+            let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
+            let input: Tensor<4, f32> = Tensor::from_slice(&device, input_shape, &input_data);
+            let actual = (input + 0.25)
+                .transpose(1, 2)
+                .reshape([1, input_shape[2], hidden])
+                .q_mat_mul(&weights)
+                .as_slice()
+                .await
+                .unwrap();
+            assert_eq!(actual.shape(), &[1, input_shape[2], output_cols]);
+            let mut samples = Vec::with_capacity(sample_count);
+            for &row in &sample_rows {
+                for &col in &sample_cols {
+                    samples.push(actual[[0, row, col]]);
+                }
+            }
+            Tensor::from_slice(&device, [sample_count], &samples)
         }
-    }
-    Ok(())
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(move |device: Device| {
+        let raw_bytes = expected_raw_bytes.clone();
+        let row_values = expected_row_values.clone();
+        let sample_rows = expected_sample_rows.clone();
+        let sample_cols = expected_sample_cols.clone();
+        async move {
+            let mut expected = Vec::with_capacity(sample_count);
+            for row in sample_rows {
+                for &col in &sample_cols {
+                    let block_index = col * blocks_per_row + selected_block_in_row;
+                    let offset = block_index * size_of::<BlockQ4K>();
+                    assert!(offset + size_of::<BlockQ4K>() <= raw_bytes.len());
+                    let block = unsafe {
+                        std::ptr::read_unaligned(raw_bytes.as_ptr().add(offset).cast::<BlockQ4K>())
+                    };
+                    expected.push(row_values[row] * block.dequantize().as_ref()[selected_offset]);
+                }
+            }
+            Tensor::from_slice(&device, [sample_count], &expected)
+        }
+    })
+    .compare_with(approx_compare::<1, f32>(1e-2))
+    .baseline_on_test_device()
+    .devices_async(gpu_devices())
+    .runs(1)
+    .into_case(format!(
+        "quantized_matmul_batched::q4k_llama_decode_transpose_reshape_qmatmul_matches_one_hot_reference::{weight_shape:?}"
+    ))
 }
 
-pub async fn q_mat_mul_batched_matches_unbatched_property() -> CaseResult {
+pub fn q_mat_mul_batched_matches_unbatched_property() -> AssertionCase {
     // Batched 3D q_mat_mul produces the same per-batch slice as 2D q_mat_mul
     // applied independently. Replaces
     // `cpu/src/quantized.rs::test_batched_q_mat_mul_matches_unbatched`.
@@ -243,28 +307,40 @@ pub async fn q_mat_mul_batched_matches_unbatched_property() -> CaseResult {
     let shape = [batch, input_rows, weight_shape[1]];
     let data = deterministic_input(&shape, 1300);
 
-    for device in available_devices().await {
-        let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
-        let batched: Tensor<3, f32> = Tensor::from_slice(&device, shape, &data);
-        let batched_result = batched.q_mat_mul(&weights).to_concrete();
-
-        for b in 0..batch {
-            let slice_data: Vec<f32> = data
-                [b * input_rows * weight_shape[1]..(b + 1) * input_rows * weight_shape[1]]
-                .to_vec();
-            let unbatched: Tensor<2, f32> =
-                Tensor::from_slice(&device, [input_rows, weight_shape[1]], &slice_data);
-            let unbatched_result = unbatched.q_mat_mul(&weights).to_concrete();
-
-            // Pull batched slice as 2D for comparison.
-            let batched_slice = batched_result
-                .clone()
-                .slice([b..b + 1, 0..input_rows, 0..weight_shape[0]])
-                .reshape([input_rows, weight_shape[0]])
-                .to_concrete();
-            fusor_conformance::approx_eq(&batched_slice, &unbatched_result, 1e-4)
-                .await?;
+    fusor_conformance::assert({
+        let raw_bytes = raw_bytes.clone();
+        let data = data.clone();
+        move |device: Device| {
+            let raw_bytes = raw_bytes.clone();
+            let data = data.clone();
+            async move {
+                let weights =
+                    qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
+                let batched: Tensor<3, f32> = Tensor::from_slice(&device, shape, &data);
+                batched.q_mat_mul(&weights).to_concrete()
+            }
         }
-    }
-    Ok(())
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(move |device: Device| {
+        let raw_bytes = raw_bytes.clone();
+        let data = data.clone();
+        async move {
+            let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
+            let mut expected = Vec::with_capacity(batch);
+            for b in 0..batch {
+                let slice_data: Vec<f32> = data
+                    [b * input_rows * weight_shape[1]..(b + 1) * input_rows * weight_shape[1]]
+                    .to_vec();
+                let unbatched: Tensor<2, f32> =
+                    Tensor::from_slice(&device, [input_rows, weight_shape[1]], &slice_data);
+                let result = unbatched.q_mat_mul(&weights).to_concrete();
+                expected.push(result.as_slice().await.unwrap().to_vec2());
+            }
+            Tensor::new(&device, &expected)
+        }
+    })
+    .compare_with(approx_compare::<3, f32>(1e-4))
+    .runs(1)
+    .into_case("quantized_matmul_batched::q_mat_mul_batched_matches_unbatched_property")
 }

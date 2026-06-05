@@ -13,9 +13,14 @@ use parking_lot::RwLock;
 use rustc_hash::{FxBuildHasher, FxHasher};
 use wgpu::{BindGroupLayout, PipelineLayout};
 
+#[cfg(not(target_arch = "wasm32"))]
 const KERNEL_CACHE_SIZE: usize = 4096;
-const DIRECT_STORAGE3_BIND_GROUP_CACHE_SIZE: usize = 4096;
+#[cfg(target_arch = "wasm32")]
+const KERNEL_CACHE_SIZE: usize = 512;
+#[cfg(not(target_arch = "wasm32"))]
 const DIRECT_DYNAMIC_BIND_GROUP_CACHE_SIZE: usize = 4096;
+#[cfg(target_arch = "wasm32")]
+const DIRECT_DYNAMIC_BIND_GROUP_CACHE_SIZE: usize = 512;
 
 /// Content-addressed key used to dedupe compiled kernel modules, shader
 /// modules, and pipelines across dispatches of the same kernel.
@@ -97,27 +102,6 @@ pub fn module_cache(capacity: usize) -> ModuleCache {
     ))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DirectStorage3BindGroupKey {
-    input: usize,
-    weight: usize,
-    output: usize,
-}
-
-impl DirectStorage3BindGroupKey {
-    pub fn new(
-        input: &Arc<wgpu::Buffer>,
-        weight: &Arc<wgpu::Buffer>,
-        output: &Arc<wgpu::Buffer>,
-    ) -> Self {
-        Self {
-            input: Arc::as_ptr(input) as usize,
-            weight: Arc::as_ptr(weight) as usize,
-            output: Arc::as_ptr(output) as usize,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct CachedDirectBindGroup {
     pub(crate) bind_group: wgpu::BindGroup,
@@ -166,8 +150,8 @@ impl DirectDynamicBindGroupKey {
 
 /// Per-device caches for everything needed to compile and dispatch a kernel:
 /// bind-group layouts, pipeline layouts, the unified kernel cache (naga →
-/// shader → pipeline), bind groups for both the dynamic and 3-buffer paths,
-/// and the wgpu on-disk pipeline cache.
+/// shader → pipeline), read-only dynamic bind groups, and the wgpu on-disk
+/// pipeline cache.
 pub struct KernelCache {
     pub(crate) device: Arc<wgpu::Device>,
     pub(crate) wgpu_cache: Option<wgpu::PipelineCache>,
@@ -175,8 +159,6 @@ pub struct KernelCache {
     pub(crate) kernels: RwLock<LruCache<KernelCacheKey, Arc<CachedKernel>, FxBuildHasher>>,
     pub(crate) direct_dynamic_bind_group_cache:
         RwLock<LruCache<DirectDynamicBindGroupKey, CachedDirectBindGroup, FxBuildHasher>>,
-    pub(crate) direct_three_buffer_bind_group_cache:
-        RwLock<LruCache<DirectStorage3BindGroupKey, CachedDirectBindGroup, FxBuildHasher>>,
     direct_three_buffer_bind_group_layout: OnceLock<BindGroupLayout>,
     direct_three_buffer_pipeline_layout: OnceLock<PipelineLayout>,
 }
@@ -222,7 +204,6 @@ impl KernelCache {
             cache_file,
             kernels: make_lru(KERNEL_CACHE_SIZE),
             direct_dynamic_bind_group_cache: make_lru(DIRECT_DYNAMIC_BIND_GROUP_CACHE_SIZE),
-            direct_three_buffer_bind_group_cache: make_lru(DIRECT_STORAGE3_BIND_GROUP_CACHE_SIZE),
             direct_three_buffer_bind_group_layout: OnceLock::new(),
             direct_three_buffer_pipeline_layout: OnceLock::new(),
         }

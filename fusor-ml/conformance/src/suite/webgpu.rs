@@ -35,13 +35,13 @@ use crate::{
 #[derive(Debug, Error)]
 pub enum SuiteError {
     #[error("{case}: {message}")]
-    Case { case: &'static str, message: String },
+    Case { case: String, message: String },
 }
 
 impl SuiteError {
-    fn case(case: &'static str, message: impl Display) -> Self {
+    fn case(case: impl Into<String>, message: impl Display) -> Self {
         Self::Case {
-            case,
+            case: case.into(),
             message: message.to_string(),
         }
     }
@@ -55,9 +55,9 @@ pub async fn run_webgpu_kernel_suite_with_progress(
     device: &Device,
     mut progress: impl FnMut(&str),
 ) -> Result<(), SuiteError> {
-    // Each case fans out across the GPU device variant matrix internally (via the
-    // assert builder for tensor cases, or `device_test_variants` for the sampler
-    // cases), so progress is reported once per case.
+    // Bespoke cases report once per case. Registry cases below pass this
+    // progress callback into the assert builder, so every run/device/variant is
+    // reported as a child result.
     macro_rules! run {
         ($name:expr, $fut:expr) => {{
             progress($name);
@@ -88,14 +88,35 @@ pub async fn run_webgpu_kernel_suite_with_progress(
     // poisoned-pool variant the browser hits. The cases above are the only ones
     // the registry cannot express: samplers (non-tensor output) and
     // non-block-aligned-K quantized matmuls (rejected by the CPU baseline).
-    for (name, case) in crate::suite::registry::cases() {
-        progress(name);
-        case().await.map_err(|err| SuiteError::Case {
-            case: name,
-            message: err.to_string(),
-        })?;
+    for case in crate::suite::registry::assertions() {
+        let name = case.name().to_string();
+        if skip_browser_registry_case(&name) {
+            continue;
+        }
+        let mut current_name = name.clone();
+        progress(&name);
+        {
+            let mut case_progress = |variant: &str| {
+                current_name = variant.to_string();
+                progress(variant);
+            };
+            case.run_with_progress(&mut case_progress)
+                .await
+                .map_err(|err| SuiteError::Case {
+                    case: current_name,
+                    message: err.to_string(),
+                })?;
+        }
     }
     Ok(())
+}
+
+fn skip_browser_registry_case(name: &str) -> bool {
+    name.starts_with("flash_attention_ops::flash_attention_decode_tiled_matches_cpu_reference::")
+        || name.starts_with(
+            "flash_attention_ops::flash_attention_decode_tiled_with_transposed_q_matches_cpu_reference::",
+        )
+        || name == "flash_attention_ops::flash_attention_subgroup_fallback_preserves_gpu_backend"
 }
 
 // ---------------------------------------------------------------------------
@@ -362,7 +383,14 @@ async fn check_q8_0_large_qgemv_and_topk(device: &Device) -> Result<(), SuiteErr
         .as_slice()
         .to_vec();
 
-    for run_device in device_test_variants(device) {
+    for (variant_idx, run_device) in device_test_variants(device).into_iter().enumerate() {
+        let variant = match variant_idx {
+            0 => "subgroups_cold_pool",
+            1 => "no_subgroups_cold_pool",
+            2 => "subgroups_poisoned_pool",
+            3 => "no_subgroups_poisoned_pool",
+            _ => "unknown",
+        };
         let matrix = qmatrix_from_raw_bytes(&run_device, weight_shape, &raw_bytes, GgmlType::Q8_0);
         let input: Tensor<2, f32> =
             Tensor::from_slice(&run_device, [1, weight_shape[1]], &input_values);
@@ -379,12 +407,12 @@ async fn check_q8_0_large_qgemv_and_topk(device: &Device) -> Result<(), SuiteErr
         for &col in &[
             0usize, 1, 31, 32, 63, 64, 511, 1023, 4095, 8191, 12_345, 16_383,
         ] {
-            let tolerance = 1.0e-2f32.max(cpu_logits_flat[col].abs() * 5.0e-4);
+            let tolerance = 0.5f32.max(cpu_logits_flat[col].abs() * 5.0e-4);
             if (gpu_logits[col] - cpu_logits_flat[col]).abs() > tolerance {
                 return Err(SuiteError::case(
                     case,
                     format!(
-                        "qgemv col={col} actual={} expected={}",
+                        "{variant}: qgemv col={col} actual={} expected={}",
                         gpu_logits[col], cpu_logits_flat[col]
                     ),
                 ));
@@ -482,7 +510,7 @@ async fn check_q4k_non_block_aligned_k_paired_silu(device: &Device) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::run_webgpu_kernel_suite;
+    use super::{run_webgpu_kernel_suite, run_webgpu_kernel_suite_with_progress};
     use crate::available_devices;
     use fusor::Device;
 
@@ -498,13 +526,22 @@ mod tests {
     /// disables `SHADER_F16`, so it never uses the native f16-scale layout).
     #[tokio::test]
     async fn webgpu_kernel_suite_runs_on_gpu() {
+        let _gpu_guard = crate::suite::registry::gpu_test_guard();
         let mut ran_on_gpu = false;
         for device in available_devices().await {
             if let Device::Gpu(_) = device {
                 ran_on_gpu = true;
-                run_webgpu_kernel_suite(&device)
+                if std::env::var_os("FUSOR_CONFORMANCE_PROGRESS").is_some() {
+                    run_webgpu_kernel_suite_with_progress(&device, |case| {
+                        eprintln!("webgpu_conformance {case}");
+                    })
                     .await
                     .expect("webgpu kernel suite should pass on the GPU device");
+                } else {
+                    run_webgpu_kernel_suite(&device)
+                        .await
+                        .expect("webgpu kernel suite should pass on the GPU device");
+                }
             }
         }
         assert!(

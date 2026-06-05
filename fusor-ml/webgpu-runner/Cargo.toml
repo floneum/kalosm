@@ -1,0 +1,18 @@
+[package]
+name = "fusor-webgpu-runner"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+dioxus = { version = "0.7", default-features = false, features = ["minimal", "web", "asset", "document"] }
+dioxus-icons = { version = "0.1.0", default-features = false }
+dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version = "0.0.1", default-features = false, features = ["web"] }
+dioxus-router = { version = "0.7", default-features = false, features = ["html"] }
+fusor = { path = "../fusor", features = ["graphvis"] }
+fusor-conformance = { path = "../conformance", features = ["burn-bench"] }
+web-time = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }

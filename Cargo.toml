@@ -40,6 +40,7 @@ members = [
     "fusor-ml/tile-ir",
     "fusor-ml/tile-ir-kernels",
     "fusor-ml/tile-ir-runtime",
+    "fusor-ml/webgpu-runner",
 ]
 
 [workspace.dependencies]

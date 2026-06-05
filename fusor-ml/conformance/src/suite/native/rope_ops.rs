@@ -2,7 +2,7 @@
 
 use crate::common::{reshape4, rope_interleaved_4d, rope_normal_4d};
 use fusor::{Device, RopeCache, Tensor, ToVec1, base_inverse_frequency};
-use fusor_conformance::{CaseResult, FuzzGenerator, GenerateFromDevice, approx_compare, available_devices, ensure_eq};
+use fusor_conformance::{AssertionCases, FuzzGenerator, approx_compare, exact_value_compare};
 use rand::distr::Uniform;
 
 fn rope_tables(
@@ -146,88 +146,117 @@ fn cache_expected_output(
 }
 
 macro_rules! assert_rope_matches_reference {
-    ($fuzz:expr, $cos:expr, $sin:expr, $reference:expr, $op:expr) => {
-        fusor_conformance::assert({
-            let cos = $cos.clone();
-            let sin = $sin.clone();
-            move |x: Tensor<4, f32>| {
-                let cos = cos.clone();
-                let sin = sin.clone();
-                async move { rope_reference_tensor(x, cos, sin, $reference).await }
-            }
-        })
-        .arg($fuzz.clone())
-        .equal_to({
-            let cos = $cos.clone();
-            let sin = $sin.clone();
-            move |x: Tensor<4, f32>| {
-                let cos = cos.clone();
-                let sin = sin.clone();
-                async move { apply_rope_op(x, cos, sin, $op) }
-            }
-        })
-        .compare_with(approx_compare::<4, f32>(1e-4))
-        .runs(3)
-        .await?;
+    ($assertions:expr, $name:expr, $fuzz:expr, $cos:expr, $sin:expr, $reference:expr, $op:expr) => {
+        $assertions.push(
+            fusor_conformance::assert({
+                let cos = $cos.clone();
+                let sin = $sin.clone();
+                move |x: Tensor<4, f32>| {
+                    let cos = cos.clone();
+                    let sin = sin.clone();
+                    async move { rope_reference_tensor(x, cos, sin, $reference).await }
+                }
+            })
+            .arg($fuzz.clone())
+            .equal_to({
+                let cos = $cos.clone();
+                let sin = $sin.clone();
+                move |x: Tensor<4, f32>| {
+                    let cos = cos.clone();
+                    let sin = sin.clone();
+                    async move { apply_rope_op(x, cos, sin, $op) }
+                }
+            })
+            .compare_with(approx_compare::<4, f32>(1e-4))
+            .runs(3)
+            .into_case($name),
+        );
     };
 }
 
 macro_rules! assert_rope_ops_match {
-    ($fuzz:expr, $cos:expr, $sin:expr, $actual:expr, $expected:expr) => {
-        fusor_conformance::assert({
-            let cos = $cos.clone();
-            let sin = $sin.clone();
-            move |x: Tensor<4, f32>| {
-                let cos = cos.clone();
-                let sin = sin.clone();
-                async move { apply_rope_op(x, cos, sin, $actual) }
-            }
-        })
-        .arg($fuzz.clone())
-        .equal_to({
-            let cos = $cos.clone();
-            let sin = $sin.clone();
-            move |x: Tensor<4, f32>| {
-                let cos = cos.clone();
-                let sin = sin.clone();
-                async move { apply_rope_op(x, cos, sin, $expected) }
-            }
-        })
-        .compare_with(approx_compare::<4, f32>(1e-4))
-        .runs(3)
-        .await?;
+    ($assertions:expr, $name:expr, $fuzz:expr, $cos:expr, $sin:expr, $actual:expr, $expected:expr) => {
+        $assertions.push(
+            fusor_conformance::assert({
+                let cos = $cos.clone();
+                let sin = $sin.clone();
+                move |x: Tensor<4, f32>| {
+                    let cos = cos.clone();
+                    let sin = sin.clone();
+                    async move { apply_rope_op(x, cos, sin, $actual) }
+                }
+            })
+            .arg($fuzz.clone())
+            .equal_to({
+                let cos = $cos.clone();
+                let sin = $sin.clone();
+                move |x: Tensor<4, f32>| {
+                    let cos = cos.clone();
+                    let sin = sin.clone();
+                    async move { apply_rope_op(x, cos, sin, $expected) }
+                }
+            })
+            .compare_with(approx_compare::<4, f32>(1e-4))
+            .runs(3)
+            .into_case($name),
+        );
     };
 }
 
 macro_rules! assert_cache_path_matches_direct_rope {
-    ($gen_q:expr, $gen_k:expr, $cos:expr, $sin:expr, $forward:expr, $output:expr, $expected:expr) => {
-        for device in available_devices().await {
-            let q = $gen_q.clone().generate(&device, 0);
-            let k = $gen_k.clone().generate(&device, 0);
-            let actual = cache_forward_output(
-                q.clone(),
-                k.clone(),
-                $cos.clone(),
-                $sin.clone(),
-                $forward,
-                $output,
-            );
-            let expected =
-                cache_expected_output(q, k, $cos.clone(), $sin.clone(), $output, $expected);
-            fusor_conformance::approx_eq(&actual, &expected, 1e-4)
-                .await?;
-        }
+    ($assertions:expr, $name:expr, $gen_q:expr, $gen_k:expr, $cos:expr, $sin:expr, $forward:expr, $output:expr, $expected:expr) => {
+        $assertions.push(
+            fusor_conformance::assert({
+                let cos = $cos.clone();
+                let sin = $sin.clone();
+                move |q: Tensor<4, f32>, k: Tensor<4, f32>| {
+                    let cos = cos.clone();
+                    let sin = sin.clone();
+                    async move { cache_forward_output(q, k, cos, sin, $forward, $output) }
+                }
+            })
+            .arg($gen_q.clone())
+            .arg($gen_k.clone())
+            .equal_to({
+                let cos = $cos.clone();
+                let sin = $sin.clone();
+                move |q: Tensor<4, f32>, k: Tensor<4, f32>| {
+                    let cos = cos.clone();
+                    let sin = sin.clone();
+                    async move { cache_expected_output(q, k, cos, sin, $output, $expected) }
+                }
+            })
+            .compare_with(approx_compare::<4, f32>(1e-4))
+            .runs(1)
+            .into_case($name),
+        );
     };
 }
 
-pub async fn rope_and_cache_paths_match_reference_variants() -> CaseResult {
+pub fn rope_and_cache_paths_match_reference_variants() -> AssertionCases {
+    let mut assertions = AssertionCases::new();
     let expected = vec![
         1.0,
         1.0 / 10_000.0f32.powf(2.0 / 8.0),
         1.0 / 10_000.0f32.powf(4.0 / 8.0),
         1.0 / 10_000.0f32.powf(6.0 / 8.0),
     ];
-    ensure_eq!(base_inverse_frequency(8, 10_000.0), expected);
+    assertions.push(
+        fusor_conformance::assert(async |_device: Device| base_inverse_frequency(8, 10_000.0))
+            .arg(|device: &Device| device.clone())
+            .equal_to({
+                let expected = expected.clone();
+                move |_device: Device| {
+                    let expected = expected.clone();
+                    async move { expected }
+                }
+            })
+            .compare_with(exact_value_compare())
+            .runs(1)
+            .into_case(
+                "rope_ops::rope_and_cache_paths_match_reference_variants::base_inverse_frequency",
+            ),
+    );
 
     let cos = cos_vec();
     let sin = sin_vec();
@@ -236,6 +265,8 @@ pub async fn rope_and_cache_paths_match_reference_variants() -> CaseResult {
         .with_distribution(Uniform::new(-6.0, 6.0).unwrap());
 
     assert_rope_matches_reference!(
+        assertions,
+        "rope_ops::rope_and_cache_paths_match_reference_variants::normal_reference",
         fuzz_input,
         cos,
         sin,
@@ -243,6 +274,8 @@ pub async fn rope_and_cache_paths_match_reference_variants() -> CaseResult {
         RopeTensorOp::Normal
     );
     assert_rope_matches_reference!(
+        assertions,
+        "rope_ops::rope_and_cache_paths_match_reference_variants::interleaved_reference",
         fuzz_input,
         cos,
         sin,
@@ -250,6 +283,8 @@ pub async fn rope_and_cache_paths_match_reference_variants() -> CaseResult {
         RopeTensorOp::Interleaved
     );
     assert_rope_ops_match!(
+        assertions,
+        "rope_ops::rope_and_cache_paths_match_reference_variants::normal_fused",
         fuzz_input,
         cos,
         sin,
@@ -257,6 +292,8 @@ pub async fn rope_and_cache_paths_match_reference_variants() -> CaseResult {
         RopeTensorOp::Normal
     );
     assert_rope_ops_match!(
+        assertions,
+        "rope_ops::rope_and_cache_paths_match_reference_variants::interleaved_fused",
         fuzz_input,
         cos,
         sin,
@@ -284,6 +321,8 @@ pub async fn rope_and_cache_paths_match_reference_variants() -> CaseResult {
         .with_distribution(Uniform::new(-6.0, 6.0).unwrap());
 
     assert_cache_path_matches_direct_rope!(
+        assertions,
+        "rope_ops::rope_and_cache_paths_match_reference_variants::cache_normal_query",
         gen_q,
         gen_k,
         cache_cos,
@@ -293,6 +332,8 @@ pub async fn rope_and_cache_paths_match_reference_variants() -> CaseResult {
         RopeTensorOp::NormalFused
     );
     assert_cache_path_matches_direct_rope!(
+        assertions,
+        "rope_ops::rope_and_cache_paths_match_reference_variants::cache_normal_key",
         gen_q,
         gen_k,
         cache_cos,
@@ -302,6 +343,8 @@ pub async fn rope_and_cache_paths_match_reference_variants() -> CaseResult {
         RopeTensorOp::NormalFused
     );
     assert_cache_path_matches_direct_rope!(
+        assertions,
+        "rope_ops::rope_and_cache_paths_match_reference_variants::cache_interleaved_query",
         gen_q,
         gen_k,
         cache_cos,
@@ -311,6 +354,8 @@ pub async fn rope_and_cache_paths_match_reference_variants() -> CaseResult {
         RopeTensorOp::InterleavedFused
     );
     assert_cache_path_matches_direct_rope!(
+        assertions,
+        "rope_ops::rope_and_cache_paths_match_reference_variants::cache_interleaved_key",
         gen_q,
         gen_k,
         cache_cos,
@@ -328,6 +373,8 @@ pub async fn rope_and_cache_paths_match_reference_variants() -> CaseResult {
         .with_distribution(Uniform::new(-6.0, 6.0).unwrap());
 
     assert_cache_path_matches_direct_rope!(
+        assertions,
+        "rope_ops::rope_and_cache_paths_match_reference_variants::cache_gqa_normal_query",
         gen_q_gqa,
         gen_k_gqa,
         cache_cos,
@@ -337,6 +384,8 @@ pub async fn rope_and_cache_paths_match_reference_variants() -> CaseResult {
         RopeTensorOp::NormalFused
     );
     assert_cache_path_matches_direct_rope!(
+        assertions,
+        "rope_ops::rope_and_cache_paths_match_reference_variants::cache_gqa_interleaved_key",
         gen_q_gqa,
         gen_k_gqa,
         cache_cos,
@@ -346,39 +395,45 @@ pub async fn rope_and_cache_paths_match_reference_variants() -> CaseResult {
         RopeTensorOp::InterleavedFused
     );
 
-    fusor_conformance::assert(async |device: Device| {
-        RopeCache::new(4, 3, 10_000.0, &device)
-            .unwrap()
-            .cos()
-            .clone()
-    })
-    .arg(|device: &Device| device.clone())
-    .equal_to({
-        let expected_cos = rope_tables(4, 3, 10_000.0).0;
-        move |device: Device| {
-            let expected_cos = expected_cos.clone();
-            async move { Tensor::new(&device, &expected_cos) }
-        }
-    })
-    .compare_with(approx_compare::<2, f32>(1e-6))
-    .await?;
+    assertions.push(
+        fusor_conformance::assert(async |device: Device| {
+            RopeCache::new(4, 3, 10_000.0, &device)
+                .unwrap()
+                .cos()
+                .clone()
+        })
+        .arg(|device: &Device| device.clone())
+        .equal_to({
+            let expected_cos = rope_tables(4, 3, 10_000.0).0;
+            move |device: Device| {
+                let expected_cos = expected_cos.clone();
+                async move { Tensor::new(&device, &expected_cos) }
+            }
+        })
+        .compare_with(approx_compare::<2, f32>(1e-6))
+        .runs(1)
+        .into_case("rope_ops::rope_and_cache_paths_match_reference_variants::cache_cos"),
+    );
 
-    fusor_conformance::assert(async |device: Device| {
-        RopeCache::new(4, 3, 10_000.0, &device)
-            .unwrap()
-            .sin()
-            .clone()
-    })
-    .arg(|device: &Device| device.clone())
-    .equal_to({
-        let expected_sin = rope_tables(4, 3, 10_000.0).1;
-        move |device: Device| {
-            let expected_sin = expected_sin.clone();
-            async move { Tensor::new(&device, &expected_sin) }
-        }
-    })
-    .compare_with(approx_compare::<2, f32>(1e-6))
-    .await?;
+    assertions.push(
+        fusor_conformance::assert(async |device: Device| {
+            RopeCache::new(4, 3, 10_000.0, &device)
+                .unwrap()
+                .sin()
+                .clone()
+        })
+        .arg(|device: &Device| device.clone())
+        .equal_to({
+            let expected_sin = rope_tables(4, 3, 10_000.0).1;
+            move |device: Device| {
+                let expected_sin = expected_sin.clone();
+                async move { Tensor::new(&device, &expected_sin) }
+            }
+        })
+        .compare_with(approx_compare::<2, f32>(1e-6))
+        .runs(1)
+        .into_case("rope_ops::rope_and_cache_paths_match_reference_variants::cache_sin"),
+    );
 
-    Ok(())
+    assertions
 }

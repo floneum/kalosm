@@ -2,10 +2,7 @@ use std::sync::Arc;
 
 use wgpu::{CommandEncoder, ComputePass, PipelineCompilationOptions};
 
-use crate::cache::{
-    CachedDirectBindGroup, CachedKernel, DirectDynamicBindGroupKey, DirectStorage3BindGroupKey,
-    KernelCache,
-};
+use crate::cache::{CachedDirectBindGroup, CachedKernel, DirectDynamicBindGroupKey, KernelCache};
 
 #[derive(Clone, Debug)]
 pub struct DirectKernelBinding {
@@ -138,38 +135,25 @@ impl DirectKernel {
                     return None;
                 }
                 let bind_group_layout = cache.direct_three_buffer_bind_group_layout();
-                let bind_group_key = DirectStorage3BindGroupKey::new(input, weight, output);
-                let bind_group = cache
-                    .direct_three_buffer_bind_group_cache
-                    .write()
-                    .get_or_insert(bind_group_key, || {
-                        let bind_entries = [
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: input.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: weight.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: output.as_entire_binding(),
-                            },
-                        ];
-                        let bind_group =
-                            cache.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some(&self.name),
-                                layout: &bind_group_layout,
-                                entries: &bind_entries,
-                            });
-                        CachedDirectBindGroup::new(
-                            bind_group,
-                            vec![input.clone(), weight.clone(), output.clone()],
-                        )
-                    })
-                    .bind_group
-                    .clone();
+                let bind_entries = [
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: input.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: weight.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output.as_entire_binding(),
+                    },
+                ];
+                let bind_group = cache.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&self.name),
+                    layout: &bind_group_layout,
+                    entries: &bind_entries,
+                });
                 Some(PreparedDirectDispatch {
                     steps: vec![PreparedDirectDispatchStep {
                         pipeline: pipeline.clone(),
@@ -211,38 +195,47 @@ impl DirectKernel {
                     })
                     .clone();
 
-                let bind_group_key = DirectDynamicBindGroupKey::new(
-                    bindings
-                        .iter()
-                        .map(|b| (b.binding, b.read_only, b.buffer.clone())),
-                );
-                let bind_group = cache
-                    .direct_dynamic_bind_group_cache
-                    .write()
-                    .get_or_insert(bind_group_key, || {
-                        let bind_entries = bindings
-                            .iter()
-                            .map(|b| wgpu::BindGroupEntry {
-                                binding: b.binding,
-                                resource: b.buffer.as_entire_binding(),
-                            })
-                            .collect::<Vec<_>>();
-                        let bind_group =
-                            cache.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some(&self.name),
-                                layout: &bind_group_layout,
-                                entries: &bind_entries,
-                            });
-                        CachedDirectBindGroup::new(
-                            bind_group,
-                            bindings
-                                .iter()
-                                .map(|binding| binding.buffer.clone())
-                                .collect(),
-                        )
+                let bind_entries = bindings
+                    .iter()
+                    .map(|b| wgpu::BindGroupEntry {
+                        binding: b.binding,
+                        resource: b.buffer.as_entire_binding(),
                     })
-                    .bind_group
-                    .clone();
+                    .collect::<Vec<_>>();
+                let has_writable_binding = bindings.iter().any(|binding| !binding.read_only);
+                let bind_group = if has_writable_binding {
+                    cache.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&self.name),
+                        layout: &bind_group_layout,
+                        entries: &bind_entries,
+                    })
+                } else {
+                    let bind_group_key = DirectDynamicBindGroupKey::new(
+                        bindings
+                            .iter()
+                            .map(|b| (b.binding, b.read_only, b.buffer.clone())),
+                    );
+                    cache
+                        .direct_dynamic_bind_group_cache
+                        .write()
+                        .get_or_insert(bind_group_key, || {
+                            let bind_group =
+                                cache.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: Some(&self.name),
+                                    layout: &bind_group_layout,
+                                    entries: &bind_entries,
+                                });
+                            CachedDirectBindGroup::new(
+                                bind_group,
+                                bindings
+                                    .iter()
+                                    .map(|binding| binding.buffer.clone())
+                                    .collect(),
+                            )
+                        })
+                        .bind_group
+                        .clone()
+                };
 
                 let pipeline_layout = cached
                     .dynamic_pipeline_layout

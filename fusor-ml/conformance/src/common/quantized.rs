@@ -6,7 +6,7 @@ use fusor::{
     BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, Device, GgmlType, GgufBlock,
     QMatrix, QuantizedTensor, Tensor, fusion::Concrete,
 };
-use fusor_conformance::{FuzzGenerator, approx_compare};
+use fusor_conformance::{AssertionCase, FuzzGenerator, approx_compare};
 use rand::distr::Uniform;
 
 #[derive(Clone)]
@@ -89,13 +89,13 @@ pub fn q_mat_mul_input_fuzz(
         .with_distribution(distribution)
 }
 
-pub async fn assert_dequantize_matches_host_reference(
+pub fn assert_dequantize_matches_host_reference(
     ty: GgmlType,
     weight_shape: [usize; 2],
     raw_bytes: Vec<u8>,
     dequantized: Vec<Vec<f32>>,
     dequantize_tol: f32,
-) -> fusor_conformance::CaseResult {
+) -> AssertionCase {
     fusor_conformance::assert(move |device: Device| {
         let raw_bytes = raw_bytes.clone();
         async move { qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, ty).dequantize::<2>() }
@@ -106,8 +106,9 @@ pub async fn assert_dequantize_matches_host_reference(
         async move { Tensor::new(&device, &dequantized) }
     })
     .compare_with(approx_compare::<2, f32>(dequantize_tol))
-    .await
-    .map_err(Into::into)
+    .into_case(format!(
+        "quantized::dequantize::{ty:?}_{weight_shape:?}"
+    ))
 }
 
 /// Fuzz configuration for input rows in `assert_q_mat_mul_matches_host_reference`.
@@ -116,10 +117,10 @@ pub struct QMatMulFuzz {
     pub distribution: Uniform<f32>,
 }
 
-pub async fn assert_q_mat_mul_matches_host_reference(
+pub fn assert_q_mat_mul_matches_host_reference(
     fixture: &QuantizedFixture,
     fuzz: QMatMulFuzz,
-) -> fusor_conformance::CaseResult {
+) -> AssertionCase {
     use fusor::ToVec2;
 
     let ty = fixture.ty;
@@ -156,8 +157,9 @@ pub async fn assert_q_mat_mul_matches_host_reference(
     })
     .compare_with(approx_compare::<2, f32>(q_mat_mul_tol))
     .runs(3)
-    .await
-    .map_err(Into::into)
+    .into_case(format!(
+        "quantized::q_mat_mul::{ty:?}_{weight_shape:?}_rows{input_row_count}"
+    ))
 }
 
 pub fn deterministic_input(shape: &[usize], seed: u32) -> Vec<f32> {

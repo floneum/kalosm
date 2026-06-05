@@ -25,6 +25,7 @@ pub use resize::ShapeWithOneHole;
 
 mod composite;
 mod compute_graph;
+mod conv;
 pub use compute_graph::NodeIndex;
 mod device;
 mod element_wise;

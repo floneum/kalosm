@@ -381,9 +381,6 @@ pub fn top_k_merge<B>(
     let output_values = kb.write(ElementType::F32, output_values);
     let phase = kb.program();
     let chunk_positions = phase.alloc_workgroup_array(ScalarElement::U32, meta.chunks);
-    let scratch_values = phase.alloc_workgroup_array(ScalarElement::F32, TOP_K_BLOCK as u32);
-    let scratch_ids = phase.alloc_workgroup_array(ScalarElement::U32, TOP_K_BLOCK as u32);
-    let scratch_chunks = phase.alloc_workgroup_array(ScalarElement::U32, TOP_K_BLOCK as u32);
 
     phase.program_grid(TOP_K_BLOCK as u32, [1, 1, 1], |program| {
         let lane = program.lane();
@@ -392,10 +389,6 @@ pub fn top_k_merge<B>(
         let local_best_value = program.private(ElementType::F32);
         let local_best_id = program.private(ElementType::U32);
         let local_best_chunk = program.private(ElementType::U32);
-        let reduce_step = program.private(ElementType::U32);
-        let selected_value_local = program.private(ElementType::F32);
-        let selected_id_local = program.private(ElementType::U32);
-        let selected_chunk_local = program.private(ElementType::U32);
 
         program.store_local(&scan_chunk, program.index(lane.clone()));
         program.loop_forever(|program| {
@@ -417,120 +410,72 @@ pub fn top_k_merge<B>(
         });
         program.workgroup_barrier();
 
-        program.store_local(&rank, Tile::literal(TileLiteral::U32(0)));
-        program.loop_forever(|program| {
-            let rank_value = program.load_local(&rank);
-            program.break_if(
-                rank_value
-                    .clone()
-                    .ge(Tile::literal(TileLiteral::U32(meta.k))),
-            );
-            program.store_local(
-                &local_best_value,
-                Tile::literal(TileLiteral::f32(NEG_MAX_F32)),
-            );
-            program.store_local(&local_best_id, Tile::literal(TileLiteral::U32(u32::MAX)));
-            program.store_local(&local_best_chunk, Tile::literal(TileLiteral::U32(u32::MAX)));
-            program.store_local(&scan_chunk, program.index(lane.clone()));
-
+        let first_lane = program
+            .index(lane.clone())
+            .eq(Tile::literal(TileLiteral::U32(0)));
+        program.if_then(first_lane, |program| {
+            program.store_local(&rank, Tile::literal(TileLiteral::U32(0)));
             program.loop_forever(|program| {
-                let chunk = program.load_local(&scan_chunk);
+                let rank_value = program.load_local(&rank);
                 program.break_if(
-                    chunk
+                    rank_value
                         .clone()
-                        .ge(Tile::literal(TileLiteral::U32(meta.chunks))),
+                        .ge(Tile::literal(TileLiteral::U32(meta.k))),
                 );
-                let position = program.load_workgroup(&chunk_positions, chunk.clone());
-                let in_chunk = position
-                    .clone()
-                    .lt(Tile::literal(TileLiteral::U32(meta.chunk_len)));
-                program.if_then(in_chunk, |program| {
-                    let index = chunk.clone() * Tile::literal(TileLiteral::U32(meta.chunk_stride))
-                        + position.clone();
-                    let id = program.load(
-                        input_ids.at(index.clone()),
-                        Mask::all(),
-                        TileLiteral::U32(u32::MAX),
-                    );
-                    let value = program.load(
-                        input_values.at(index),
-                        Mask::all(),
-                        TileLiteral::f32(NEG_MAX_F32),
-                    );
-                    let valid = id
-                        .clone()
-                        .lt(Tile::literal(TileLiteral::U32(meta.input_len)))
-                        .and(is_finite(value.clone()));
-                    let best_value = program.load_local(&local_best_value);
-                    let best_id = program.load_local(&local_best_id);
-                    let better = better_candidate(value.clone(), id.clone(), best_value, best_id);
-                    program.if_then(valid.and(better), |program| {
-                        program.store_local(&local_best_value, value);
-                        program.store_local(&local_best_id, id);
-                        program.store_local(&local_best_chunk, chunk.clone());
-                    });
-                });
-                let chunk = program.load_local(&scan_chunk);
                 program.store_local(
-                    &scan_chunk,
-                    chunk + Tile::literal(TileLiteral::U32(TOP_K_BLOCK as u32)),
+                    &local_best_value,
+                    Tile::literal(TileLiteral::f32(NEG_MAX_F32)),
                 );
-            });
+                program.store_local(&local_best_id, Tile::literal(TileLiteral::U32(u32::MAX)));
+                program.store_local(&local_best_chunk, Tile::literal(TileLiteral::U32(u32::MAX)));
+                program.store_local(&scan_chunk, Tile::literal(TileLiteral::U32(0)));
 
-            let best_value = program.load_local(&local_best_value);
-            let best_id = program.load_local(&local_best_id);
-            let best_chunk = program.load_local(&local_best_chunk);
-            program.store_workgroup(&scratch_values, lane.clone(), best_value);
-            program.store_workgroup(&scratch_ids, lane.clone(), best_id);
-            program.store_workgroup(&scratch_chunks, lane.clone(), best_chunk);
-            program.workgroup_barrier();
-
-            program.store_local(
-                &reduce_step,
-                Tile::literal(TileLiteral::U32(TOP_K_BLOCK as u32 / 2)),
-            );
-            program.loop_forever(|program| {
-                let step = program.load_local(&reduce_step);
-                program.break_if(step.clone().eq(Tile::literal(TileLiteral::U32(0))));
-                let participates = program.index(lane.clone()).lt(step.clone());
-                program.if_then(participates, |program| {
-                    let other_index = program.index(lane.clone()) + step.clone();
-                    let other_value = program.load_workgroup(&scratch_values, other_index.clone());
-                    let other_id = program.load_workgroup(&scratch_ids, other_index.clone());
-                    let other_chunk = program.load_workgroup(&scratch_chunks, other_index);
-                    let current_value = program.load_workgroup(&scratch_values, lane.clone());
-                    let current_id = program.load_workgroup(&scratch_ids, lane.clone());
-                    let better = better_candidate(
-                        other_value.clone(),
-                        other_id.clone(),
-                        current_value,
-                        current_id,
+                program.loop_forever(|program| {
+                    let chunk = program.load_local(&scan_chunk);
+                    program.break_if(
+                        chunk
+                            .clone()
+                            .ge(Tile::literal(TileLiteral::U32(meta.chunks))),
                     );
-                    program.if_then(better, |program| {
-                        program.store_workgroup(&scratch_values, lane.clone(), other_value.clone());
-                        program.store_workgroup(&scratch_ids, lane.clone(), other_id.clone());
-                        program.store_workgroup(&scratch_chunks, lane.clone(), other_chunk.clone());
+                    let position = program.load_workgroup(&chunk_positions, chunk.clone());
+                    let in_chunk = position
+                        .clone()
+                        .lt(Tile::literal(TileLiteral::U32(meta.chunk_len)));
+                    program.if_then(in_chunk, |program| {
+                        let index = chunk.clone()
+                            * Tile::literal(TileLiteral::U32(meta.chunk_stride))
+                            + position.clone();
+                        let id = program.load(
+                            input_ids.at(index.clone()),
+                            Mask::all(),
+                            TileLiteral::U32(u32::MAX),
+                        );
+                        let value = program.load(
+                            input_values.at(index),
+                            Mask::all(),
+                            TileLiteral::f32(NEG_MAX_F32),
+                        );
+                        let valid = id
+                            .clone()
+                            .lt(Tile::literal(TileLiteral::U32(meta.input_len)))
+                            .and(is_finite(value.clone()));
+                        let best_value = program.load_local(&local_best_value);
+                        let best_id = program.load_local(&local_best_id);
+                        let better =
+                            better_candidate(value.clone(), id.clone(), best_value, best_id);
+                        program.if_then(valid.and(better), |program| {
+                            program.store_local(&local_best_value, value);
+                            program.store_local(&local_best_id, id);
+                            program.store_local(&local_best_chunk, chunk.clone());
+                        });
                     });
+                    let chunk = program.load_local(&scan_chunk);
+                    program.store_local(&scan_chunk, chunk + Tile::literal(TileLiteral::U32(1)));
                 });
-                program.workgroup_barrier();
-                let step = program.load_local(&reduce_step);
-                program.store_local(&reduce_step, step / Tile::literal(TileLiteral::U32(2)));
-            });
 
-            let first_lane = program
-                .index(lane.clone())
-                .eq(Tile::literal(TileLiteral::U32(0)));
-            program.if_then(first_lane, |program| {
-                let selected_value = program.load_workgroup(&scratch_values, 0);
-                let selected_id = program.load_workgroup(&scratch_ids, 0);
-                let selected_chunk = program.load_workgroup(&scratch_chunks, 0);
-                program.store_local(&selected_value_local, selected_value);
-                program.store_local(&selected_id_local, selected_id);
-                program.store_local(&selected_chunk_local, selected_chunk);
-
-                let selected_value = program.load_local(&selected_value_local);
-                let selected_id = program.load_local(&selected_id_local);
-                let selected_chunk = program.load_local(&selected_chunk_local);
+                let selected_value = program.load_local(&local_best_value);
+                let selected_id = program.load_local(&local_best_id);
+                let selected_chunk = program.load_local(&local_best_chunk);
                 let rank_value = program.load_local(&rank);
                 program.store(
                     output_values.at(rank_value.clone()),
@@ -549,11 +494,10 @@ pub fn top_k_merge<B>(
                         position + Tile::literal(TileLiteral::U32(1)),
                     );
                 });
-            });
-            program.workgroup_barrier();
 
-            let rank_value = program.load_local(&rank);
-            program.store_local(&rank, rank_value + Tile::literal(TileLiteral::U32(1)));
+                let rank_value = program.load_local(&rank);
+                program.store_local(&rank, rank_value + Tile::literal(TileLiteral::U32(1)));
+            });
         });
     });
     Some(())

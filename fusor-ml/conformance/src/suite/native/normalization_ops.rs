@@ -2,7 +2,7 @@
 
 use crate::common::{layer_norm_last_dim_3d, rms_norm_last_dim_3d, softmax_last_dim_2d};
 use fusor::{Device, Tensor};
-use fusor_conformance::{CaseResult, FuzzGenerator, approx_compare};
+use fusor_conformance::{AssertionCase, AssertionCases, FuzzGenerator, approx_compare};
 use rand::distr::Uniform;
 
 fn softmax_axis0_2d(input: &[Vec<f32>]) -> Vec<Vec<f32>> {
@@ -54,21 +54,27 @@ fn norm_bias(feature_count: usize) -> Vec<f32> {
         .collect()
 }
 
-pub async fn softmax_and_normalization_match_reference_paths() -> CaseResult {
+pub fn softmax_and_normalization_match_reference_paths() -> AssertionCases {
+    let mut assertions = AssertionCases::new();
+
     // Softmax with fuzzed input
     let gen_softmax = FuzzGenerator::<2, f32>::new([16..=45, 16..=45])
         .with_seed(400)
         .with_distribution(Uniform::new(-4.0, 4.0).unwrap());
 
     // softmax vs host reference
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax::<1>(1))
-        .arg(gen_softmax.clone())
-        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-            Tensor::new(&device, &softmax_last_dim_2d(&v))
-        })
-        .compare_with(approx_compare::<2, f32>(1e-5))
-        .runs(3)
-        .await?;
+    assertions.push(
+        fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax::<1>(1))
+            .arg(gen_softmax.clone())
+            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+                Tensor::new(&device, &softmax_last_dim_2d(&v))
+            })
+            .compare_with(approx_compare::<2, f32>(1e-5))
+            .runs(3)
+            .into_case(
+                "normalization_ops::softmax_and_normalization_match_reference_paths::softmax",
+            ),
+    );
 
     // RMS norm with fuzzed input
     let gen_norm = FuzzGenerator::<3, f32>::new([2..=3, 16..=17, 255..=257])
@@ -76,96 +82,107 @@ pub async fn softmax_and_normalization_match_reference_paths() -> CaseResult {
         .with_distribution(Uniform::new(-4.0, 4.0).unwrap());
 
     // rms_norm vs host reference
-    fusor_conformance::assert(async |x: Tensor<3, f32>| {
-        let device = x.device();
-        let feature_count = x.shape()[2];
-        let weight_data = norm_weight(feature_count);
-        let weight: Tensor<3, f32> =
-            Tensor::from_slice(&device, [1, 1, feature_count], &weight_data)
-                .broadcast_as(x.shape())
-                .to_concrete();
-        x.rms_norm::<2, _>(&weight, 1e-5)
-    })
-    .arg(gen_norm.clone())
-    .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-        let feature_count = v[0][0].len();
-        let weight_data = norm_weight(feature_count);
-        Tensor::new(&device, &rms_norm_last_dim_3d(&v, &weight_data, 1e-5))
-    })
-    .compare_with(approx_compare::<3, f32>(1e-4))
-    .runs(3)
-    .await?;
+    assertions.push(
+        fusor_conformance::assert(async |x: Tensor<3, f32>| {
+            let device = x.device();
+            let feature_count = x.shape()[2];
+            let weight_data = norm_weight(feature_count);
+            let weight: Tensor<3, f32> =
+                Tensor::from_slice(&device, [1, 1, feature_count], &weight_data)
+                    .broadcast_as(x.shape())
+                    .to_concrete();
+            x.rms_norm::<2, _>(&weight, 1e-5)
+        })
+        .arg(gen_norm.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+            let feature_count = v[0][0].len();
+            let weight_data = norm_weight(feature_count);
+            Tensor::new(&device, &rms_norm_last_dim_3d(&v, &weight_data, 1e-5))
+        })
+        .compare_with(approx_compare::<3, f32>(1e-4))
+        .runs(3)
+        .into_case("normalization_ops::softmax_and_normalization_match_reference_paths::rms_norm"),
+    );
 
     // layer_norm vs host reference
-    fusor_conformance::assert(async |x: Tensor<3, f32>| {
-        let device = x.device();
-        let feature_count = x.shape()[2];
-        let weight_data = norm_weight(feature_count);
-        let bias_data = norm_bias(feature_count);
-        let weight: Tensor<3, f32> =
-            Tensor::from_slice(&device, [1, 1, feature_count], &weight_data)
-                .broadcast_as(x.shape())
-                .to_concrete();
-        let bias: Tensor<3, f32> = Tensor::from_slice(&device, [1, 1, feature_count], &bias_data)
-            .broadcast_as(x.shape())
-            .to_concrete();
-        x.layer_norm::<2, _, _>(&weight, Some(&bias), 1e-5, true)
-    })
-    .arg(gen_norm.clone())
-    .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-        let feature_count = v[0][0].len();
-        let weight_data = norm_weight(feature_count);
-        let bias_data = norm_bias(feature_count);
-        Tensor::new(
-            &device,
-            &layer_norm_last_dim_3d(&v, &weight_data, &bias_data, 1e-5),
-        )
-    })
-    .compare_with(approx_compare::<3, f32>(1e-4))
-    .runs(3)
-    .await?;
+    assertions.push(
+        fusor_conformance::assert(async |x: Tensor<3, f32>| {
+            let device = x.device();
+            let feature_count = x.shape()[2];
+            let weight_data = norm_weight(feature_count);
+            let bias_data = norm_bias(feature_count);
+            let weight: Tensor<3, f32> =
+                Tensor::from_slice(&device, [1, 1, feature_count], &weight_data)
+                    .broadcast_as(x.shape())
+                    .to_concrete();
+            let bias: Tensor<3, f32> =
+                Tensor::from_slice(&device, [1, 1, feature_count], &bias_data)
+                    .broadcast_as(x.shape())
+                    .to_concrete();
+            x.layer_norm::<2, _, _>(&weight, Some(&bias), 1e-5, true)
+        })
+        .arg(gen_norm.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+            let feature_count = v[0][0].len();
+            let weight_data = norm_weight(feature_count);
+            let bias_data = norm_bias(feature_count);
+            Tensor::new(
+                &device,
+                &layer_norm_last_dim_3d(&v, &weight_data, &bias_data, 1e-5),
+            )
+        })
+        .compare_with(approx_compare::<3, f32>(1e-4))
+        .runs(3)
+        .into_case(
+            "normalization_ops::softmax_and_normalization_match_reference_paths::layer_norm",
+        ),
+    );
 
     // rms_norm_fused (with bias) vs rms_norm + bias
-    fusor_conformance::assert(async |x: Tensor<3, f32>| {
-        let device = x.device();
-        let feature_count = x.shape()[2];
-        let weight_data = norm_weight(feature_count);
-        let bias_data = norm_bias(feature_count);
-        let weight = Tensor::from_slice(&device, [feature_count], &weight_data);
-        let bias = Tensor::from_slice(&device, [feature_count], &bias_data);
-        x.rms_norm_fused::<1, 2>(&weight, Some(&bias), 1e-5)
-    })
-    .arg(gen_norm.clone())
-    .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-        let feature_count = v[0][0].len();
-        let weight_data = norm_weight(feature_count);
-        let bias_data = norm_bias(feature_count);
-        let rms = rms_norm_last_dim_3d(&v, &weight_data, 1e-5);
-        let out: Vec<Vec<Vec<f32>>> = rms
-            .into_iter()
-            .map(|matrix| {
-                matrix
-                    .into_iter()
-                    .map(|row| {
-                        row.into_iter()
-                            .zip(bias_data.iter().copied())
-                            .map(|(v, b)| v + b)
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
-        Tensor::new(&device, &out)
-    })
-    .compare_with(approx_compare::<3, f32>(1e-4))
-    .runs(3)
-    .await?;
+    assertions.push(
+        fusor_conformance::assert(async |x: Tensor<3, f32>| {
+            let device = x.device();
+            let feature_count = x.shape()[2];
+            let weight_data = norm_weight(feature_count);
+            let bias_data = norm_bias(feature_count);
+            let weight = Tensor::from_slice(&device, [feature_count], &weight_data);
+            let bias = Tensor::from_slice(&device, [feature_count], &bias_data);
+            x.rms_norm_fused::<1, 2>(&weight, Some(&bias), 1e-5)
+        })
+        .arg(gen_norm.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+            let feature_count = v[0][0].len();
+            let weight_data = norm_weight(feature_count);
+            let bias_data = norm_bias(feature_count);
+            let rms = rms_norm_last_dim_3d(&v, &weight_data, 1e-5);
+            let out: Vec<Vec<Vec<f32>>> = rms
+                .into_iter()
+                .map(|matrix| {
+                    matrix
+                        .into_iter()
+                        .map(|row| {
+                            row.into_iter()
+                                .zip(bias_data.iter().copied())
+                                .map(|(v, b)| v + b)
+                                .collect()
+                        })
+                        .collect()
+                })
+                .collect();
+            Tensor::new(&device, &out)
+        })
+        .compare_with(approx_compare::<3, f32>(1e-4))
+        .runs(3)
+        .into_case(
+            "normalization_ops::softmax_and_normalization_match_reference_paths::rms_norm_fused",
+        ),
+    );
 
     // rms_norm_residual_fused vs host reference on input + residual
     let gen_residual = FuzzGenerator::<3, f32>::new([2..=3, 16..=17, 255..=257])
         .with_seed(411)
         .with_distribution(Uniform::new(-2.0, 2.0).unwrap());
-    fusor_conformance::assert(async |x: Tensor<3, f32>, residual: Tensor<3, f32>| {
+    assertions.push(fusor_conformance::assert(async |x: Tensor<3, f32>, residual: Tensor<3, f32>| {
         let device = x.device();
         let feature_count = x.shape()[2];
         let weight_data = norm_weight(feature_count);
@@ -218,10 +235,10 @@ pub async fn softmax_and_normalization_match_reference_paths() -> CaseResult {
     )
     .compare_with(approx_compare::<3, f32>(1e-4))
     .runs(3)
-    .await?;
+    .into_case("normalization_ops::softmax_and_normalization_match_reference_paths::rms_norm_residual_fused"));
 
     // rms_norm_fused_no_bias vs rms_norm reference
-    fusor_conformance::assert(async |x: Tensor<3, f32>| {
+    assertions.push(fusor_conformance::assert(async |x: Tensor<3, f32>| {
         let device = x.device();
         let feature_count = x.shape()[2];
         let weight_data = norm_weight(feature_count);
@@ -236,48 +253,57 @@ pub async fn softmax_and_normalization_match_reference_paths() -> CaseResult {
     })
     .compare_with(approx_compare::<3, f32>(1e-4))
     .runs(3)
-    .await?;
-    Ok(())
+    .into_case("normalization_ops::softmax_and_normalization_match_reference_paths::rms_norm_fused_no_bias"));
+
+    assertions
 }
 
-pub async fn softmax_slow_variants_match_reference() -> CaseResult {
+pub fn softmax_slow_variants_match_reference() -> AssertionCases {
     let gen_2d = FuzzGenerator::<2, f32>::new([16..=45, 16..=45])
         .with_seed(420)
         .with_distribution(Uniform::new(-4.0, 4.0).unwrap());
+    let mut assertions = AssertionCases::new();
 
     // softmax_slow on the last axis vs host reference
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow::<1>(1))
-        .arg(gen_2d.clone())
-        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-            Tensor::new(&device, &softmax_last_dim_2d(&v))
-        })
-        .compare_with(approx_compare::<2, f32>(1e-5))
-        .runs(3)
-        .await?;
+    assertions.push(
+        fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow::<1>(1))
+            .arg(gen_2d.clone())
+            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+                Tensor::new(&device, &softmax_last_dim_2d(&v))
+            })
+            .compare_with(approx_compare::<2, f32>(1e-5))
+            .runs(3)
+            .into_case("normalization_ops::softmax_slow_variants_match_reference::last_axis"),
+    );
 
     // softmax_slow_last_dim vs host reference
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow_last_dim::<1>())
-        .arg(gen_2d.clone())
-        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-            Tensor::new(&device, &softmax_last_dim_2d(&v))
-        })
-        .compare_with(approx_compare::<2, f32>(1e-5))
-        .runs(3)
-        .await?;
+    assertions.push(
+        fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow_last_dim::<1>())
+            .arg(gen_2d.clone())
+            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+                Tensor::new(&device, &softmax_last_dim_2d(&v))
+            })
+            .compare_with(approx_compare::<2, f32>(1e-5))
+            .runs(3)
+            .into_case("normalization_ops::softmax_slow_variants_match_reference::last_dim"),
+    );
 
     // softmax_slow on axis 0 (column-wise) — non-last-dim path
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow::<1>(0))
-        .arg(gen_2d)
-        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-            Tensor::new(&device, &softmax_axis0_2d(&v))
-        })
-        .compare_with(approx_compare::<2, f32>(1e-5))
-        .runs(3)
-        .await?;
-    Ok(())
+    assertions.push(
+        fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow::<1>(0))
+            .arg(gen_2d)
+            .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+                Tensor::new(&device, &softmax_axis0_2d(&v))
+            })
+            .compare_with(approx_compare::<2, f32>(1e-5))
+            .runs(3)
+            .into_case("normalization_ops::softmax_slow_variants_match_reference::axis0"),
+    );
+
+    assertions
 }
 
-pub async fn softmax_middle_axis_rank3_matches_reference() -> CaseResult {
+pub fn softmax_middle_axis_rank3_matches_reference() -> AssertionCase {
     // Softmax on the middle dimension of a rank-3 tensor. Existing tests cover
     // only the last-dim path; this exercises the generic-axis softmax kernel.
     let gen_mid = FuzzGenerator::<3, f32>::new([2..=3, 16..=24, 16..=24])
@@ -291,11 +317,10 @@ pub async fn softmax_middle_axis_rank3_matches_reference() -> CaseResult {
         })
         .compare_with(approx_compare::<3, f32>(1e-5))
         .runs(3)
-        .await?;
-    Ok(())
+        .into_case("normalization_ops::softmax_middle_axis_rank3_matches_reference")
 }
 
-pub async fn softmax_direct_boundary_lengths_match_reference() -> CaseResult {
+pub fn softmax_direct_boundary_lengths_match_reference() -> AssertionCases {
     let cases = [
         [3usize, 1usize],
         [2, 127],
@@ -308,42 +333,77 @@ pub async fn softmax_direct_boundary_lengths_match_reference() -> CaseResult {
         [2, 4096],
     ];
 
-    for device in fusor_conformance::available_devices().await {
-        for [rows, cols] in cases {
-            let values = (0..rows * cols)
-                .map(|i| ((i % 37) as f32 - 18.0) * 0.17)
-                .collect::<Vec<_>>();
-            let input = Tensor::from_slice(&device, [rows, cols], &values);
-            let expected_rows = crate::common::reshape2(&values, [rows, cols]);
-            let expected = Tensor::new(&device, &softmax_last_dim_2d(&expected_rows));
-            crate::common::assert_approx_tensors(input.softmax::<1>(1), expected, 1e-5).await?;
-        }
+    let mut assertions = AssertionCases::new();
+    for [rows, cols] in cases {
+        let values = (0..rows * cols)
+            .map(|i| ((i % 37) as f32 - 18.0) * 0.17)
+            .collect::<Vec<_>>();
+        assertions.push(fusor_conformance::assert(async |input: Tensor<2, f32>| input.softmax::<1>(1))
+            .arg({
+                let values = values.clone();
+                move |device: &Device| Tensor::from_slice(device, [rows, cols], &values)
+            })
+            .equal_to(move |input: Tensor<2, f32>| {
+                let values = values.clone();
+                async move {
+                    let expected_rows = crate::common::reshape2(&values, [rows, cols]);
+                    Tensor::new(&input.device(), &softmax_last_dim_2d(&expected_rows))
+                }
+            })
+            .compare_with(approx_compare::<2, f32>(1e-5))
+            .runs(1)
+            .into_case(format!(
+                "normalization_ops::softmax_direct_boundary_lengths_match_reference::{rows}x{cols}"
+            )));
     }
-    Ok(())
+    assertions
 }
 
-pub async fn softmax_direct_transposed_and_middle_axis_match_reference() -> CaseResult {
-    for device in fusor_conformance::available_devices().await {
-        let rows = 9usize;
-        let cols = 257usize;
-        let values = (0..rows * cols)
-            .map(|i| ((i % 53) as f32 - 26.0) * 0.11)
-            .collect::<Vec<_>>();
-        let base = Tensor::from_slice(&device, [rows, cols], &values);
-        let input = base.transpose(0, 1);
-        let expected_input =
-            crate::common::transpose2(&crate::common::reshape2(&values, [rows, cols]));
-        let expected = Tensor::new(&device, &softmax_last_dim_2d(&expected_input));
-        crate::common::assert_approx_tensors(input.softmax::<1>(1), expected, 1e-5).await?;
+pub fn softmax_direct_transposed_and_middle_axis_match_reference() -> AssertionCases {
+    let mut assertions = AssertionCases::new();
+    let rows = 9usize;
+    let cols = 257usize;
+    let values = (0..rows * cols)
+        .map(|i| ((i % 53) as f32 - 26.0) * 0.11)
+        .collect::<Vec<_>>();
+    assertions.push(fusor_conformance::assert(async |base: Tensor<2, f32>| {
+        base.transpose(0, 1).softmax::<1>(1)
+    })
+    .arg({
+        let values = values.clone();
+        move |device: &Device| Tensor::from_slice(device, [rows, cols], &values)
+    })
+    .equal_to(move |input: Tensor<2, f32>| {
+        let values = values.clone();
+        async move {
+            let expected_input =
+                crate::common::transpose2(&crate::common::reshape2(&values, [rows, cols]));
+            Tensor::new(&input.device(), &softmax_last_dim_2d(&expected_input))
+        }
+    })
+    .compare_with(approx_compare::<2, f32>(1e-5))
+    .runs(1)
+    .into_case("normalization_ops::softmax_direct_transposed_and_middle_axis_match_reference::transposed_2d"));
 
-        let shape = [2usize, 513usize, 3usize];
-        let values = (0..shape.iter().product::<usize>())
-            .map(|i| ((i % 41) as f32 - 20.0) * 0.13)
-            .collect::<Vec<_>>();
-        let input = Tensor::from_slice(&device, shape, &values);
-        let expected_input = crate::common::reshape3(&values, shape);
-        let expected = Tensor::new(&device, &softmax_middle_axis_3d(&expected_input));
-        crate::common::assert_approx_tensors(input.softmax::<2>(1), expected, 1e-5).await?;
-    }
-    Ok(())
+    let shape = [2usize, 513usize, 3usize];
+    let values = (0..shape.iter().product::<usize>())
+        .map(|i| ((i % 41) as f32 - 20.0) * 0.13)
+        .collect::<Vec<_>>();
+    assertions.push(fusor_conformance::assert(async |input: Tensor<3, f32>| input.softmax::<2>(1))
+        .arg({
+            let values = values.clone();
+            move |device: &Device| Tensor::from_slice(device, shape, &values)
+        })
+        .equal_to(move |input: Tensor<3, f32>| {
+            let values = values.clone();
+            async move {
+                let expected_input = crate::common::reshape3(&values, shape);
+                Tensor::new(&input.device(), &softmax_middle_axis_3d(&expected_input))
+            }
+        })
+        .compare_with(approx_compare::<3, f32>(1e-5))
+        .runs(1)
+        .into_case("normalization_ops::softmax_direct_transposed_and_middle_axis_match_reference::middle_axis_3d"));
+
+    assertions
 }

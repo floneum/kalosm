@@ -833,6 +833,36 @@ where
     }
 }
 
+impl<'a, M, Constraints, Sampler> IntoFuture for ChatResponseBuilder<'a, M, Constraints, Sampler>
+where
+    Constraints: ModelConstraints + WasmNotSendSync + Unpin + 'static,
+    Sampler: WasmNotSend + Unpin + 'static,
+    M: StructuredChatModel<Constraints, Sampler> + WasmNotSendSync + Clone + Unpin + 'static,
+    M::ChatSession: Clone + WasmNotSendSync + Unpin + 'static,
+    Constraints::Output: WasmNotSend + 'static,
+{
+    type Output = Result<Constraints::Output, M::Error>;
+    type IntoFuture = BoxedIntoFuture<'a, Self::Output>;
+
+    fn into_future(mut self) -> Self::IntoFuture {
+        self.ensure_structured_task_started();
+
+        Box::pin(async move {
+            self.task.into_inner().unwrap().into_inner().unwrap().await;
+            let result = self.result.take().unwrap().await.unwrap();
+            match result {
+                Ok((session, boxed)) => {
+                    self.chat_session.session = Some(Ok(session));
+                    Ok(*(boxed as Box<dyn Any>)
+                        .downcast::<Constraints::Output>()
+                        .unwrap())
+                }
+                Err(err) => Err(err),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -945,35 +975,5 @@ mod tests {
             .await;
 
         assert_eq!(tokens, vec!["structured"]);
-    }
-}
-
-impl<'a, M, Constraints, Sampler> IntoFuture for ChatResponseBuilder<'a, M, Constraints, Sampler>
-where
-    Constraints: ModelConstraints + WasmNotSendSync + Unpin + 'static,
-    Sampler: WasmNotSend + Unpin + 'static,
-    M: StructuredChatModel<Constraints, Sampler> + WasmNotSendSync + Clone + Unpin + 'static,
-    M::ChatSession: Clone + WasmNotSendSync + Unpin + 'static,
-    Constraints::Output: WasmNotSend + 'static,
-{
-    type Output = Result<Constraints::Output, M::Error>;
-    type IntoFuture = BoxedIntoFuture<'a, Self::Output>;
-
-    fn into_future(mut self) -> Self::IntoFuture {
-        self.ensure_structured_task_started();
-
-        Box::pin(async move {
-            self.task.into_inner().unwrap().into_inner().unwrap().await;
-            let result = self.result.take().unwrap().await.unwrap();
-            match result {
-                Ok((session, boxed)) => {
-                    self.chat_session.session = Some(Ok(session));
-                    Ok(*(boxed as Box<dyn Any>)
-                        .downcast::<Constraints::Output>()
-                        .unwrap())
-                }
-                Err(err) => Err(err),
-            }
-        })
     }
 }

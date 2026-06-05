@@ -1,7 +1,9 @@
 //! Rank/empty-tensor conformance cases.
 
-use fusor::Tensor;
-use fusor_conformance::{CaseResult, approx_eq, approx_or_relative_eq, available_devices, ensure_eq, exact_eq};
+use fusor::{Device, Tensor};
+use fusor_conformance::{
+    AssertionCase, AssertionCases, approx_compare, approx_or_relative_compare, exact_compare,
+};
 
 fn deterministic_data(total: usize, seed: u32) -> Vec<f32> {
     (0..total)
@@ -101,102 +103,124 @@ fn rms_norm_fused_4d(input: &[f32], shape: [usize; 4], weight: &[f32], eps: f32)
     out
 }
 
-pub async fn rank4_sum_per_axis_matches_reference() -> CaseResult {
+pub fn rank4_sum_per_axis_matches_reference() -> AssertionCases {
     const SHAPE: [usize; 4] = [2, 3, 4, 5];
     let data = deterministic_data(SHAPE.iter().product(), 600);
+    let mut assertions = AssertionCases::new();
 
     for axis in 0..4 {
         let (expected_flat, out_shape) = sum_axis_4d(&data, SHAPE, axis);
-        for device in available_devices().await {
-            let input: Tensor<4, f32> = Tensor::from_slice(&device, SHAPE, &data);
-            let actual: Tensor<3, f32> = match axis {
-                0 => input.sum::<3>(0),
-                1 => input.sum::<3>(1),
-                2 => input.sum::<3>(2),
-                _ => input.sum::<3>(3),
-            };
-            let actual = actual.to_concrete();
-            let expected: Tensor<3, f32> = Tensor::from_slice(&device, out_shape, &expected_flat);
-            approx_eq(&actual, &expected, 1e-4).await?;
-        }
+        let input_data = data.clone();
+        assertions.push(
+            fusor_conformance::assert(move |input: Tensor<4, f32>| async move {
+                let actual: Tensor<3, f32> = match axis {
+                    0 => input.sum::<3>(0),
+                    1 => input.sum::<3>(1),
+                    2 => input.sum::<3>(2),
+                    _ => input.sum::<3>(3),
+                };
+                actual.to_concrete()
+            })
+            .arg(move |device: &Device| Tensor::from_slice(device, SHAPE, &input_data))
+            .equal_to(move |input: Tensor<4, f32>| {
+                let expected_flat = expected_flat.clone();
+                async move { Tensor::from_slice(&input.device(), out_shape, &expected_flat) }
+            })
+            .compare_with(approx_compare::<3, f32>(1e-4))
+            .runs(1)
+            .into_case(format!(
+                "rank_and_empty::rank4_sum_per_axis_matches_reference::axis{axis}"
+            )),
+        );
     }
-    Ok(())
+    assertions
 }
 
-pub async fn rank4_mean_axis0_matches_reference() -> CaseResult {
+pub fn rank4_mean_axis0_matches_reference() -> AssertionCase {
     const SHAPE: [usize; 4] = [3, 2, 4, 5];
     let data = deterministic_data(SHAPE.iter().product(), 601);
     let (sum_flat, out_shape) = sum_axis_4d(&data, SHAPE, 0);
     let divisor = SHAPE[0] as f32;
     let expected_flat: Vec<f32> = sum_flat.iter().map(|v| v / divisor).collect();
 
-    for device in available_devices().await {
-        let input: Tensor<4, f32> = Tensor::from_slice(&device, SHAPE, &data);
-        let actual = input.mean::<3>(0).to_concrete();
-        let expected: Tensor<3, f32> = Tensor::from_slice(&device, out_shape, &expected_flat);
-        approx_eq(&actual, &expected, 1e-4).await?;
-    }
-    Ok(())
+    fusor_conformance::assert(async |input: Tensor<4, f32>| input.mean::<3>(0).to_concrete())
+        .arg(move |device: &Device| Tensor::from_slice(device, SHAPE, &data))
+        .equal_to(move |input: Tensor<4, f32>| {
+            let expected_flat = expected_flat.clone();
+            async move { Tensor::from_slice(&input.device(), out_shape, &expected_flat) }
+        })
+        .compare_with(approx_compare::<3, f32>(1e-4))
+        .runs(1)
+        .into_case("rank_and_empty::rank4_mean_axis0_matches_reference")
 }
 
-pub async fn rank4_softmax_last_dim_matches_reference() -> CaseResult {
+pub fn rank4_softmax_last_dim_matches_reference() -> AssertionCase {
     const SHAPE: [usize; 4] = [2, 2, 3, 8];
     let data = deterministic_data(SHAPE.iter().product(), 602);
     let expected_flat = softmax_last_dim_4d(&data, SHAPE);
 
-    for device in available_devices().await {
-        let input: Tensor<4, f32> = Tensor::from_slice(&device, SHAPE, &data);
-        let actual = input.softmax_last_dim::<3>().to_concrete();
-        let expected: Tensor<4, f32> = Tensor::from_slice(&device, SHAPE, &expected_flat);
-        approx_eq(&actual, &expected, 1e-5).await?;
-    }
-    Ok(())
+    fusor_conformance::assert(async |input: Tensor<4, f32>| {
+        input.softmax_last_dim::<3>().to_concrete()
+    })
+    .arg(move |device: &Device| Tensor::from_slice(device, SHAPE, &data))
+    .equal_to(move |input: Tensor<4, f32>| {
+        let expected_flat = expected_flat.clone();
+        async move { Tensor::from_slice(&input.device(), SHAPE, &expected_flat) }
+    })
+    .compare_with(approx_compare::<4, f32>(1e-5))
+    .runs(1)
+    .into_case("rank_and_empty::rank4_softmax_last_dim_matches_reference")
 }
 
-pub async fn rank4_rms_norm_fused_matches_reference() -> CaseResult {
+pub fn rank4_rms_norm_fused_matches_reference() -> AssertionCase {
     const SHAPE: [usize; 4] = [2, 2, 3, 16];
     let data = deterministic_data(SHAPE.iter().product(), 603);
     let weight: Vec<f32> = (0..SHAPE[3]).map(|i| 1.0 + (i % 5) as f32 * 0.25).collect();
     let expected_flat = rms_norm_fused_4d(&data, SHAPE, &weight, 1e-5);
 
-    for device in available_devices().await {
-        let input: Tensor<4, f32> = Tensor::from_slice(&device, SHAPE, &data);
-        let w: Tensor<1, f32> = Tensor::from_slice(&device, [SHAPE[3]], &weight);
-        let actual = input.rms_norm_fused::<1, 3>(&w, None, 1e-5).to_concrete();
-        let expected: Tensor<4, f32> = Tensor::from_slice(&device, SHAPE, &expected_flat);
-        approx_or_relative_eq(&actual, &expected, 1e-4, 1e-4)
-            .await?;
-    }
-    Ok(())
+    fusor_conformance::assert(move |input: Tensor<4, f32>| {
+        let weight = weight.clone();
+        async move {
+            let w: Tensor<1, f32> = Tensor::from_slice(&input.device(), [SHAPE[3]], &weight);
+            input.rms_norm_fused::<1, 3>(&w, None, 1e-5).to_concrete()
+        }
+    })
+    .arg(move |device: &Device| Tensor::from_slice(device, SHAPE, &data))
+    .equal_to(move |input: Tensor<4, f32>| {
+        let expected_flat = expected_flat.clone();
+        async move { Tensor::from_slice(&input.device(), SHAPE, &expected_flat) }
+    })
+    .compare_with(approx_or_relative_compare::<4>(1e-4, 1e-4))
+    .runs(1)
+    .into_case("rank_and_empty::rank4_rms_norm_fused_matches_reference")
 }
 
-pub async fn empty_tensor_elementwise_add_returns_empty() -> CaseResult {
+pub fn empty_tensor_elementwise_add_returns_empty() -> AssertionCase {
     // 0-sized leading dim — elementwise op must be well-defined on empty inputs.
-    for device in available_devices().await {
+    fusor_conformance::assert(async |device: Device| {
         let a: Tensor<2, f32> = Tensor::zeros(&device, [0, 6]);
         let b: Tensor<2, f32> = Tensor::zeros(&device, [0, 6]);
-        let out = a.add_::<2, 2, _>(&b).to_concrete();
-        ensure_eq!(out.shape(), [0, 6]);
-        let expected: Tensor<2, f32> = Tensor::zeros(&device, [0, 6]);
-        exact_eq(&out, &expected).await?;
-    }
-    Ok(())
+        a.add_::<2, 2, _>(&b).to_concrete()
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(async |device: Device| Tensor::<2, f32>::zeros(&device, [0, 6]))
+    .compare_with(exact_compare::<2, f32>())
+    .runs(1)
+    .into_case("rank_and_empty::empty_tensor_elementwise_add_returns_empty")
 }
 
-pub async fn empty_tensor_sum_along_zero_axis_returns_identity() -> CaseResult {
+pub fn empty_tensor_sum_along_zero_axis_returns_identity() -> AssertionCase {
     // Reducing over a 0-sized axis: sum-identity is 0, so each output element
     // must be exactly 0 on both backends.
-    for device in available_devices().await {
-        let input: Tensor<2, f32> = Tensor::zeros(&device, [0, 4]);
-        let out = input.sum::<1>(0).to_concrete();
-        ensure_eq!(out.shape(), [4]);
-        let expected: Tensor<1, f32> = Tensor::zeros(&device, [4]);
-        exact_eq(&out, &expected).await?;
-    }
-    Ok(())
+    fusor_conformance::assert(async |input: Tensor<2, f32>| input.sum::<1>(0).to_concrete())
+        .arg(|device: &Device| Tensor::<2, f32>::zeros(device, [0, 4]))
+        .equal_to(async |input: Tensor<2, f32>| Tensor::<1, f32>::zeros(&input.device(), [4]))
+        .compare_with(exact_compare::<1, f32>())
+        .runs(1)
+        .into_case("rank_and_empty::empty_tensor_sum_along_zero_axis_returns_identity")
 }
 
-pub async fn rank4_max_min_match_reference() -> CaseResult {
+pub fn rank4_max_min_match_reference() -> AssertionCases {
     const SHAPE: [usize; 4] = [2, 3, 2, 4];
     let data = deterministic_data(SHAPE.iter().product(), 604);
     // Reduce along last axis; compute reference via flat indexing.
@@ -217,15 +241,34 @@ pub async fn rank4_max_min_match_reference() -> CaseResult {
         }
     }
 
-    for device in available_devices().await {
-        let input: Tensor<4, f32> = Tensor::from_slice(&device, SHAPE, &data);
-        let max_actual = input.max::<3>(3).to_concrete();
-        let max_expected: Tensor<3, f32> = Tensor::from_slice(&device, out_shape, &max_ref);
-        approx_eq(&max_actual, &max_expected, 1e-6).await?;
+    let mut assertions = AssertionCases::new();
 
-        let min_actual = input.min::<3>(3).to_concrete();
-        let min_expected: Tensor<3, f32> = Tensor::from_slice(&device, out_shape, &min_ref);
-        approx_eq(&min_actual, &min_expected, 1e-6).await?;
-    }
-    Ok(())
+    assertions.push(
+        fusor_conformance::assert(async |input: Tensor<4, f32>| input.max::<3>(3).to_concrete())
+            .arg({
+                let data = data.clone();
+                move |device: &Device| Tensor::from_slice(device, SHAPE, &data)
+            })
+            .equal_to(move |input: Tensor<4, f32>| {
+                let max_ref = max_ref.clone();
+                async move { Tensor::from_slice(&input.device(), out_shape, &max_ref) }
+            })
+            .compare_with(approx_compare::<3, f32>(1e-6))
+            .runs(1)
+            .into_case("rank_and_empty::rank4_max_min_match_reference::max"),
+    );
+
+    assertions.push(
+        fusor_conformance::assert(async |input: Tensor<4, f32>| input.min::<3>(3).to_concrete())
+            .arg(move |device: &Device| Tensor::from_slice(device, SHAPE, &data))
+            .equal_to(move |input: Tensor<4, f32>| {
+                let min_ref = min_ref.clone();
+                async move { Tensor::from_slice(&input.device(), out_shape, &min_ref) }
+            })
+            .compare_with(approx_compare::<3, f32>(1e-6))
+            .runs(1)
+            .into_case("rank_and_empty::rank4_max_min_match_reference::min"),
+    );
+
+    assertions
 }

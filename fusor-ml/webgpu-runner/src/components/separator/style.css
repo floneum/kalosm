@@ -1,0 +1,13 @@
+.dx-separator {
+  background-color: var(--light, var(--primary-color-6)) var(--dark, var(--primary-color-7));
+}
+
+.dx-separator[data-orientation="horizontal"] {
+  width: 100%;
+  height: 1px;
+}
+
+.dx-separator[data-orientation="vertical"] {
+  width: 1px;
+  height: 100%;
+}

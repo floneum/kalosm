@@ -12,8 +12,8 @@ mod dispatch;
 
 pub use buffer_pool::BufferPool;
 pub use cache::{
-    CachedKernel, DirectDynamicBindGroupKey, DirectStorage3BindGroupKey, KernelCache,
-    KernelCacheKey, KernelVariantKey, ModuleCache, module_cache,
+    CachedKernel, DirectDynamicBindGroupKey, KernelCache, KernelCacheKey, KernelVariantKey,
+    ModuleCache, module_cache,
 };
 pub use direct_kernel::{DirectKernel, DirectKernelBinding, PreparedDirectDispatch};
 pub use dispatch::{

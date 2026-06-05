@@ -204,11 +204,7 @@ impl MatMulOperation {
         } else {
             None
         };
-        // The shared-tile kernel uses `div_ceil` for tile counts and
-        // bounds-checks both A/B loads and Y stores, so it is correct for any
-        // M/N/K. The register-tile path is only worth the fixed-overhead win
-        // for shapes too small to amortize the workgroup-memory tile.
-        let use_shared_tile = m >= 32 && n >= 32 && k >= 8;
+        let matmul_tile = select_matmul_tile(shape, device.limits().max_compute_workgroup_size_x);
         let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
         let datatype = self.datatype;
         let ir = tile_ir::tile::build(move |phase| {
@@ -230,7 +226,7 @@ impl MatMulOperation {
                 y_view.clone(),
                 coop_variant,
                 variant,
-                use_shared_tile,
+                matmul_tile,
                 shape,
                 &epilogues,
                 max_wg_per_dim,
@@ -247,7 +243,7 @@ impl MatMulOperation {
         ];
         let variant = kernel_backend::KernelVariantKey::with_payload::<MatmulTileDirectKernelVariant>(
             |state| {
-                use_shared_tile.hash(state);
+                matmul_tile.hash(state);
                 variant.hash(state);
                 coop_variant.hash(state);
                 coop_kind.hash(state);
@@ -256,17 +252,22 @@ impl MatMulOperation {
         );
         let cache_key = self.kernel_cache_key_with_dispatch(variant, None, dispatch_size, &inputs);
 
-        kernel_backend::dynamic_kernel_from_ir(
+        let name = self.name();
+        let pipeline = kernel_backend::three_buffer_pipeline_from_ir(
             device.kernel_cache(),
-            self.name(),
+            &name,
             cache_key,
             || Some(ir),
-            [
+        )?;
+        Some(
+            kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
+                name,
+                pipeline,
                 input_a.buffer().clone(),
                 input_b.buffer().clone(),
                 output.buffer().clone(),
-            ],
-            dispatch_size,
+                dispatch_size,
+            ),
         )
     }
 }
@@ -423,6 +424,50 @@ impl Operation for MatMulOperation {
     }
 }
 
+fn select_matmul_tile(
+    shape: tile_ir_kernels::DenseMatmulShape,
+    max_workgroup_size_x: u32,
+) -> Option<tile_ir_kernels::DenseMatmulTile> {
+    if shape.m < 32 || shape.n < 32 || shape.k < 8 {
+        return None;
+    }
+
+    let candidates = [tile_ir_kernels::DenseMatmulTile::new(32, 32, 8, 4, 4, 64)];
+
+    candidates
+        .into_iter()
+        .filter_map(|tile| {
+            if tile.lanes > max_workgroup_size_x || shape.m < tile.bm || shape.n < tile.bn {
+                return None;
+            }
+
+            let tiles_m = shape.m.div_ceil(tile.bm);
+            let tiles_n = shape.n.div_ceil(tile.bn);
+            let workgroups = shape.batch * tiles_m * tiles_n;
+            let actual_outputs = shape.batch * shape.m * shape.n;
+            let covered_outputs = workgroups * tile.bm * tile.bn;
+            let tile_utilization_ok = actual_outputs * 4 >= covered_outputs * 3;
+            if !tile_utilization_ok {
+                return None;
+            }
+
+            // Larger workgroups reduce input rereads, but avoid collapsing small
+            // unbatched matmuls down to only a handful of 256-thread groups.
+            if (tile.lanes >= 256 && workgroups < 32)
+                || (tile.lanes >= 128 && shape.batch == 1 && workgroups < 32)
+                || (tile.lanes >= 128 && shape.batch > 1 && workgroups < 8)
+            {
+                return None;
+            }
+
+            let staged_inputs_per_k_tile = workgroups * tile.bk * (tile.bm + tile.bn);
+            let score = (staged_inputs_per_k_tile, tile.lanes);
+            Some((score, tile))
+        })
+        .min_by_key(|(score, _)| *score)
+        .map(|(_, tile)| tile)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_direct_tile_matmul(
     phase: &mut tile_ir::tile::Program,
@@ -432,7 +477,7 @@ fn dispatch_direct_tile_matmul(
     y_view: DirectMatrixLayout,
     coop_variant: Option<CoopTile>,
     variant: DirectTileMatmulVariant,
-    use_shared_tile: bool,
+    matmul_tile: Option<tile_ir_kernels::DenseMatmulTile>,
     shape: tile_ir_kernels::DenseMatmulShape,
     epilogues: &tile_ir_kernels::DenseMatmulEpilogues<'_>,
     max_wg_per_dim: u32,
@@ -471,7 +516,7 @@ fn dispatch_direct_tile_matmul(
             max_wg_per_dim,
         ),
         DirectTileMatmulVariant::MatMul => {
-            if use_shared_tile {
+            if let Some(tile) = matmul_tile {
                 tile_ir_kernels::batched_matmul_with_epilogues(
                     phase,
                     &a,
@@ -480,6 +525,7 @@ fn dispatch_direct_tile_matmul(
                     shape,
                     epilogues,
                     max_wg_per_dim,
+                    tile,
                 )
             } else {
                 tile_ir_kernels::batched_matmul_register_with_epilogues(
@@ -493,5 +539,58 @@ fn dispatch_direct_tile_matmul(
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batched_full_tiles_use_shared_tile() {
+        assert_eq!(
+            select_matmul_tile(
+                tile_ir_kernels::DenseMatmulShape {
+                    batch: 8,
+                    m: 64,
+                    k: 96,
+                    n: 64,
+                },
+                256,
+            ),
+            Some(tile_ir_kernels::DenseMatmulTile::new(32, 32, 8, 4, 4, 64)),
+        );
+    }
+
+    #[test]
+    fn partial_large_tiles_need_reasonable_utilization() {
+        assert_eq!(
+            select_matmul_tile(
+                tile_ir_kernels::DenseMatmulShape {
+                    batch: 2,
+                    m: 65,
+                    k: 96,
+                    n: 65,
+                },
+                256,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn small_unbatched_matmul_keeps_parallelism() {
+        assert_eq!(
+            select_matmul_tile(
+                tile_ir_kernels::DenseMatmulShape {
+                    batch: 1,
+                    m: 64,
+                    k: 96,
+                    n: 64,
+                },
+                256,
+            ),
+            Some(tile_ir_kernels::DenseMatmulTile::new(32, 32, 8, 4, 4, 64)),
+        );
     }
 }
