@@ -228,6 +228,7 @@ pub(super) fn select_direct_tile_matmul_variant(m: u32, k: u32, n: u32) -> Direc
             KernelDeviceCaps {
                 subgroups_supported: false,
                 cooperative_matrix: CooperativeMatrixCaps::default(),
+                is_cpu_adapter: false,
                 min_subgroup_size: 0,
                 max_subgroup_size: 0,
                 max_compute_invocations_per_workgroup: 0,

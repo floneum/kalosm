@@ -156,12 +156,25 @@ fn qmatmul_path_is_single_row_qgemv(path: QMatmulPath) -> bool {
     matches!(path, QMatmulPath::SingleRow | QMatmulPath::Q5SmallSingleRow)
 }
 
+#[cfg(test)]
 fn qmatmul_path_requires_coop(path: QMatmulPath) -> bool {
     !qmatmul_path_is_single_row_qgemv(path)
 }
 
+fn qgemv_fixed_subgroup_32_supported(caps: KernelDeviceCaps) -> bool {
+    caps.subgroups_supported
+        && !caps.is_cpu_adapter
+        && (caps.min_subgroup_size == 32 && caps.max_subgroup_size == 32
+            || caps.backend == wgpu::Backend::Metal
+                && caps.min_subgroup_size <= 32
+                && caps.max_subgroup_size >= 32)
+}
+
 fn qmatmul_direct_path_supported(path: QMatmulPath, caps: KernelDeviceCaps) -> bool {
-    caps.subgroups_supported && (!qmatmul_path_requires_coop(path) || qmatmul_coop_supported(caps))
+    if qmatmul_path_is_single_row_qgemv(path) {
+        return qgemv_fixed_subgroup_32_supported(caps);
+    }
+    qmatmul_coop_supported(caps)
 }
 
 fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> {

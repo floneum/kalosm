@@ -32,6 +32,23 @@ mod selection_tests {
         }
     }
 
+    fn cpu_adapter_caps(high_tile_limits: bool) -> KernelDeviceCaps {
+        KernelDeviceCaps {
+            is_cpu_adapter: true,
+            cooperative_matrix: CooperativeMatrixCaps::default(),
+            ..caps(high_tile_limits)
+        }
+    }
+
+    fn variable_subgroup_caps(high_tile_limits: bool) -> KernelDeviceCaps {
+        KernelDeviceCaps {
+            cooperative_matrix: CooperativeMatrixCaps::default(),
+            min_subgroup_size: 8,
+            max_subgroup_size: 32,
+            ..caps(high_tile_limits)
+        }
+    }
+
     fn ctx(format: tile_ir::GgmlQuantFormat, y_supports_coop: bool) -> QMatmulDirectCtx {
         QMatmulDirectCtx {
             format,
@@ -123,13 +140,14 @@ mod selection_tests {
     }
 
     #[test]
-    fn single_row_direct_path_does_not_require_coop_matrix() {
+    fn single_row_direct_path_requires_trusted_subgroups_not_coop_matrix() {
         assert!(!qmatmul_path_requires_coop(QMatmulPath::SingleRow));
         assert!(!qmatmul_path_requires_coop(QMatmulPath::Q5SmallSingleRow));
         assert!(qmatmul_path_requires_coop(QMatmulPath::Tile {
             tile: QCoopTile::new(64, 64),
             cached: false,
         }));
+        assert!(qgemv_fixed_subgroup_32_supported(no_coop_caps(false)));
         assert!(qmatmul_direct_path_supported(
             QMatmulPath::SingleRow,
             no_coop_caps(false)
@@ -141,6 +159,18 @@ mod selection_tests {
         assert!(!qmatmul_direct_path_supported(
             QMatmulPath::Q5SmallSingleRow,
             no_subgroup_caps(false)
+        ));
+        assert!(!qgemv_fixed_subgroup_32_supported(cpu_adapter_caps(false)));
+        assert!(!qmatmul_direct_path_supported(
+            QMatmulPath::SingleRow,
+            cpu_adapter_caps(false)
+        ));
+        assert!(!qgemv_fixed_subgroup_32_supported(variable_subgroup_caps(
+            false
+        )));
+        assert!(!qmatmul_direct_path_supported(
+            QMatmulPath::SingleRow,
+            variable_subgroup_caps(false)
         ));
 
         let selector = qmatmul_direct_selector();
