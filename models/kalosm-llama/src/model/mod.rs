@@ -58,7 +58,7 @@ fn record_decode_trace(path: &'static str, decode_eligible: bool, kernels: usize
     total_samples.sort_unstable();
     let p50 = percentile_duration(&total_samples, 50);
     let p95 = percentile_duration(&total_samples, 95);
-    eprintln!(
+    tracing::info!(
         "decode_trace_summary samples={} path={path} decode_eligible={decode_eligible} kernels={kernels} total={total:?} p50={p50:?} p95={p95:?}",
         total_samples.len()
     );
@@ -662,7 +662,7 @@ where
             .try_sample_mirostat2_token_q_mat(model.output_matrix(), &mut sampler, &[], params)
             .await;
         if let Some(start) = start {
-            eprintln!(
+            tracing::info!(
                 "prewarm_fused_logits_sampling elapsed={:?}",
                 start.elapsed()
             );
@@ -676,8 +676,8 @@ where
         let device = builder.get_device().await;
         if decode_trace_enabled() {
             match &device {
-                Device::Cpu => eprintln!("llama_device=cpu"),
-                Device::Gpu(gpu) => eprintln!(
+                Device::Cpu => tracing::info!("llama_device=cpu"),
+                Device::Gpu(gpu) => tracing::info!(
                     "llama_device=gpu adapter={:?}",
                     gpu.wgpu_adapter().get_info(),
                 ),

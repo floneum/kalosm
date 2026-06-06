@@ -534,7 +534,7 @@ mod tests {
                 ran_on_gpu = true;
                 if std::env::var_os("FUSOR_CONFORMANCE_PROGRESS").is_some() {
                     run_webgpu_kernel_suite_with_progress(&device, |case| {
-                        eprintln!("webgpu_conformance {case}");
+                        tracing::info!("webgpu_conformance {case}");
                     })
                     .await
                     .expect("webgpu kernel suite should pass on the GPU device");

@@ -71,9 +71,9 @@ fn hash_qmatmul_dispatch_layouts(
 }
 
 /// Build a qmatmul-direct cache key in either the operation-bound or
-/// module-only path. Both arms wrap the same `KernelVariantKey<M>(payload)`;
-/// the unbound arm additionally hashes `outer` into the module key.
-fn qmatmul_direct_module_key<M: 'static>(
+/// standalone path. Both arms wrap the same `KernelVariantKey<M>(payload)`;
+/// the unbound arm additionally hashes `outer` into the key.
+fn qmatmul_direct_cache_key<M: 'static>(
     payload_hash: impl Fn(&mut FxHasher),
     outer_hash: impl Fn(&mut FxHasher),
     dispatch_size: [u32; 3],
@@ -120,7 +120,6 @@ enum QMatmulPath {
     Tile { tile: CoopTile, cached: bool },
 }
 
-struct QMatmulDirectFastKernelVariant;
 struct QMatmulDirectEpilogueKernelVariant;
 
 const QMATMUL_DIRECT_KERNEL_GENERATION: u64 = 0x514D_4154_4D49_5832;

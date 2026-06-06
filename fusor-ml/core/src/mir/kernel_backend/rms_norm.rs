@@ -1,8 +1,4 @@
-use std::{
-    any::Any,
-    hash::Hash,
-    sync::{Arc, OnceLock},
-};
+use std::{any::Any, hash::Hash, sync::Arc};
 
 use crate::{
     DataTypeEnum, Layout,
@@ -39,12 +35,6 @@ use rustc_hash::FxHasher;
 // matmul also uses 512 for the same reason) and is still wide enough
 // to feed a 128-block subgroup-reduce on Apple Silicon / NVIDIA.
 const BLOCK: usize = 512;
-const RMS_NORM_MODULE_CACHE_SIZE: usize = 128;
-
-fn rms_norm_module_cache() -> &'static kernel_backend::ModuleCache {
-    static CACHE: OnceLock<kernel_backend::ModuleCache> = OnceLock::new();
-    CACHE.get_or_init(|| kernel_backend::module_cache(RMS_NORM_MODULE_CACHE_SIZE))
-}
 
 fn collect_rms_buffers(
     input: &TensorData,
@@ -317,7 +307,7 @@ impl Operation for RmsNormOperation {
             kernel_backend::KernelVariantKey::with_payload::<RmsNormDirectKernelVariant>(|state| {
                 variant.hash(state);
             });
-        let module_key = self.kernel_module_key_with_dispatch(
+        let cache_key = self.kernel_cache_key_with_dispatch(
             cache_variant,
             Some(workgroup_shape),
             dispatch_size,
@@ -332,13 +322,10 @@ impl Operation for RmsNormOperation {
         if let Some(meta) = vec4_meta {
             let has_residual = residual.is_some();
             let has_bias = bias.is_some();
-            kernel_backend::dynamic_kernel_from_hashed_ir(
+            kernel_backend::dynamic_kernel_from_ir(
                 graph.device().kernel_cache(),
-                rms_norm_module_cache(),
                 kernel_label,
-                module_key,
-                buffers,
-                dispatch_size,
+                cache_key,
                 move || {
                     let vec_layout = tile_ir::Layout::strided(
                         tile_ir::MemoryLevel::Storage,
@@ -389,16 +376,15 @@ impl Operation for RmsNormOperation {
                     )?;
                     Some(kb.finish().0)
                 },
+                buffers,
+                dispatch_size,
             )
         } else {
             let post_chain = self.post_element_wise.clone();
-            kernel_backend::dynamic_kernel_from_hashed_ir(
+            kernel_backend::dynamic_kernel_from_ir(
                 graph.device().kernel_cache(),
-                rms_norm_module_cache(),
                 kernel_label,
-                module_key,
-                buffers,
-                dispatch_size,
+                cache_key,
                 || {
                     build_rms_norm_tile_ir(RmsNormTileIrParams {
                         input_view,
@@ -411,6 +397,8 @@ impl Operation for RmsNormOperation {
                         storage_datatype,
                     })
                 },
+                buffers,
+                dispatch_size,
             )
         }
     }

@@ -4687,6 +4687,7 @@ dependencies = [
  "pollster",
  "rand 0.9.4",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4713,6 +4714,7 @@ dependencies = [
  "rand 0.9.4",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "web-time",
 ]
 
@@ -4739,7 +4741,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber 0.3.23",
- "web-sys",
  "web-time",
  "wgpu",
 ]
@@ -4806,7 +4807,7 @@ dependencies = [
  "lru 0.14.0",
  "parking_lot",
  "rustc-hash 2.1.2",
- "web-sys",
+ "tracing",
  "wgpu",
 ]
 
@@ -6409,6 +6410,7 @@ dependencies = [
  "serde",
  "surrealdb",
  "tokio",
+ "tracing",
  "tracing-subscriber 0.2.25",
 ]
 

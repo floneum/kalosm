@@ -55,19 +55,14 @@ impl PendingGpuSampledToken {
     pub async fn read_token(self) -> Result<Option<u32>, wgpu::BufferAsyncError> {
         // Diagnostic: time the wait for GPU completion + token readback (the
         // per-token sync the pending decode path stalls on). On wasm this is
-        // always on and logged to the browser console; native gates on the
-        // FUSOR_TRACE_* env vars.
+        // always on; native gates on the FUSOR_TRACE_* env vars.
         let trace = cfg!(target_arch = "wasm32")
             || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
             || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
         let await_start = trace.then(web_time::Instant::now);
         self.receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
         if let Some(start) = await_start {
-            let msg = format!("sampler_trace pending_await elapsed={:?}", start.elapsed());
-            #[cfg(target_arch = "wasm32")]
-            web_sys::console::log_1(&msg.into());
-            #[cfg(not(target_arch = "wasm32"))]
-            eprintln!("{msg}");
+            tracing::info!("sampler_trace pending_await elapsed={:?}", start.elapsed());
         }
 
         let view = self.download.slice(..).get_mapped_range();

@@ -104,10 +104,7 @@ fn adapter_preference_rank(adapter: &wgpu::Adapter) -> u8 {
 }
 
 fn log_gpu_diagnostic(message: String) {
-    #[cfg(target_arch = "wasm32")]
-    web_sys::console::error_1(&message.into());
-    #[cfg(not(target_arch = "wasm32"))]
-    eprintln!("{message}");
+    tracing::error!("{message}");
 }
 
 fn install_device_diagnostics(device: &wgpu::Device) {
@@ -272,17 +269,14 @@ impl Device {
         #[cfg(target_arch = "wasm32")]
         {
             let info = adapter.get_info();
-            web_sys::console::log_1(
-                &format!(
-                    "fusor: adapter subgroups={} subgroup_min={} subgroup_max={} shader_f16={} backend={:?} name={:?} (note: the wasm build never requests wgpu::Features::SUBGROUP, so subgroups_supported() stays false regardless of adapter support)",
-                    adapter_features.contains(wgpu::Features::SUBGROUP),
-                    info.subgroup_min_size,
-                    info.subgroup_max_size,
-                    adapter_features.contains(wgpu::Features::SHADER_F16),
-                    info.backend,
-                    info.name,
-                )
-                .into(),
+            tracing::info!(
+                "fusor: adapter subgroups={} subgroup_min={} subgroup_max={} shader_f16={} backend={:?} name={:?} (note: the wasm build never requests wgpu::Features::SUBGROUP, so subgroups_supported() stays false regardless of adapter support)",
+                adapter_features.contains(wgpu::Features::SUBGROUP),
+                info.subgroup_min_size,
+                info.subgroup_max_size,
+                adapter_features.contains(wgpu::Features::SHADER_F16),
+                info.backend,
+                info.name,
             );
         }
         let mut required_features = wgpu::Features::empty();
@@ -299,7 +293,7 @@ impl Device {
                     required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
                 }
             } else {
-                eprintln!(
+                tracing::warn!(
                     "FUSOR_TRACE_GPU_KERNELS requested, but adapter does not support timestamp queries"
                 );
             }
@@ -329,8 +323,10 @@ impl Device {
         if std::env::var_os("FUSOR_TRACE_GPU_KERNELS").is_some()
             && !cooperative_matrix_properties.is_empty()
         {
-            eprintln!("Fusor cooperative matrix properties: {cooperative_matrix_properties:?}");
-            eprintln!("Fusor cooperative matrix caps: {cooperative_matrix_caps:?}");
+            tracing::info!(
+                "Fusor cooperative matrix properties: {cooperative_matrix_properties:?}"
+            );
+            tracing::info!("Fusor cooperative matrix caps: {cooperative_matrix_caps:?}");
         }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {

@@ -71,10 +71,12 @@ fn print_samples(label: &str, samples: &[Duration]) {
     let median = sorted[sorted.len() / 2];
     let min = sorted[0];
     let max = sorted[sorted.len() - 1];
-    eprintln!("{label}: median={median:?} min={min:?} max={max:?} samples={samples:?}");
+    tracing::info!("{label}: median={median:?} min={min:?} max={max:?} samples={samples:?}");
 }
 
 fn main() {
+    let _ = tracing_subscriber::fmt::try_init();
+
     pollster::block_on(async {
         let repeats = std::env::args()
             .nth(1)
@@ -82,7 +84,7 @@ fn main() {
             .unwrap_or(20);
 
         let device = Device::new().await.unwrap();
-        eprintln!("device={:?}", device.wgpu_adapter().get_info());
+        tracing::info!("device={:?}", device.wgpu_adapter().get_info());
 
         let data = vec![vec![1.0f32; 100]; 100];
         let tensor = Tensor::new(&device, &data);

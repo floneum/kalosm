@@ -285,12 +285,10 @@ mod tests {
     use std::{mem::size_of, sync::Arc};
 
     use fusor_gguf::{BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, GgufBlock};
+    use fusor_tile_ir_runtime::DirectKernelBinding;
 
     use super::*;
-    use crate::{
-        compute_graph::ComputeGraphInner, mir::kernel_backend::DirectKernelBinding,
-        mir::workgroup_shape::WorkgroupShape,
-    };
+    use crate::{compute_graph::ComputeGraphInner, mir::workgroup_shape::WorkgroupShape};
 
     fn push_f16(bytes: &mut Vec<u8>, value: f32) {
         bytes.extend_from_slice(&half::f16::from_f32(value).to_le_bytes());

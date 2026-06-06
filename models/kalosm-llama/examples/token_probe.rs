@@ -10,6 +10,8 @@ const WARMUP_TOKENS: usize = 8;
 const DEFAULT_GPU_SAMPLE_TOP_K: &str = "1";
 
 fn main() {
+    let _ = tracing_subscriber::fmt::try_init();
+
     pollster::block_on(async {
         fn progress(_: ModelLoadingProgress) {}
 
@@ -46,7 +48,7 @@ async fn run_probe(model: &Llama, label: &str, tokens_to_generate: usize, print_
         first_token_at.get_or_insert(now);
         last_token_at = Some(now);
         if print_tokens {
-            eprintln!(
+            tracing::info!(
                 "{label} token {tokens:02}: step={:?} total={:?} text={token:?}",
                 now.duration_since(last),
                 now.duration_since(total_start)
@@ -63,7 +65,7 @@ async fn run_probe(model: &Llama, label: &str, tokens_to_generate: usize, print_
         } else {
             0.0
         };
-        eprintln!(
+        tracing::info!(
             "{label} decode: {measured_tokens} tokens in {:.3}s = {tps:.2} t/s",
             elapsed.as_secs_f64()
         );

@@ -48,7 +48,7 @@ where
         let build_start = trace_enabled.then(Instant::now);
         let logits = model.forward(tokens, images, device, cache);
         if let Some(start) = build_start {
-            eprintln!(
+            tracing::info!(
                 "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",
                 start.elapsed()
             );
@@ -63,13 +63,15 @@ where
                 let resolve_start = Some(Instant::now());
                 kernels = gpu_logits.count_kernels_to_resolve();
                 if let Some(start) = resolve_start {
-                    eprintln!(
+                    tracing::info!(
                         "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
                         start.elapsed()
                     );
                 }
             } else {
-                eprintln!("forward_logits_on_cpu path={path} decode_eligible={decode_eligible}");
+                tracing::info!(
+                    "forward_logits_on_cpu path={path} decode_eligible={decode_eligible}"
+                );
             }
         }
 
@@ -117,7 +119,7 @@ where
             let download_start = trace.step_start();
             let logits = logits.as_slice().await?;
             if let Some(start) = download_start {
-                eprintln!(
+                tracing::info!(
                     "forward_download path={} decode_eligible={} elapsed={:?}",
                     trace.path,
                     trace.decode_eligible,
@@ -186,7 +188,7 @@ where
                     .collect()
             };
             if let Some(start) = download_start {
-                eprintln!(
+                tracing::info!(
                     "forward_top_k_download path={} decode_eligible={} k={top_k} elapsed={:?}",
                     trace.path,
                     trace.decode_eligible,
@@ -279,7 +281,7 @@ where
                 }
             };
             if let Some(start) = download_start {
-                eprintln!(
+                tracing::info!(
                     "forward_sample_token_download path={} decode_eligible={} k={} elapsed={:?}",
                     trace.path,
                     trace.decode_eligible,
@@ -435,7 +437,7 @@ where
         let build_start = trace.then(Instant::now);
         let hidden = model.forward_last_hidden_f32(tokens, images, device, cache);
         if let Some(start) = build_start {
-            eprintln!(
+            tracing::info!(
                 "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",
                 start.elapsed()
             );
@@ -452,7 +454,7 @@ where
                 let resolve_start = Some(Instant::now());
                 kernels = gpu_hidden.count_kernels_to_resolve();
                 if let Some(start) = resolve_start {
-                    eprintln!(
+                    tracing::info!(
                         "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
                         start.elapsed()
                     );
@@ -487,7 +489,7 @@ where
                 LlamaModelError::SamplerError("fused logits sampler refused slow fallback".into())
             })?;
             if let Some(start) = sample_start {
-                eprintln!(
+                tracing::info!(
                     "forward_sample_token_download path={path} decode_eligible={decode_eligible} fused_logits=1 k={} elapsed={:?}",
                     top_k,
                     start.elapsed()

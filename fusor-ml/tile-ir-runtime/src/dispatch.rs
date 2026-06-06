@@ -3,7 +3,7 @@ use std::sync::Arc;
 use fusor_tile_ir as tile_ir;
 use wgpu::naga::{AddressSpace, StorageAccess};
 
-use crate::cache::{CachedKernel, KernelCache, KernelCacheKey, ModuleCache};
+use crate::cache::{CachedKernel, KernelCache, KernelCacheKey};
 use crate::direct_kernel::{DirectKernel, DirectKernelBinding};
 
 /// Get the cached entry for `key`, or lower `build_ir` and insert it.
@@ -17,26 +17,6 @@ fn cached_kernel(
     }
     let kernel = Arc::new(build_ir()?.lower_to_naga().ok()?);
     Some(cache.get_or_insert_kernel(key, || kernel))
-}
-
-/// Static lowered-kernel-cache front for [`cached_kernel`]: hot kernel families
-/// short-circuit through their per-family LRU before touching the device-wide
-/// cache.
-pub fn cached_hashed_naga(
-    module_cache: &'static ModuleCache,
-    key: KernelCacheKey,
-    build_kernel: impl FnOnce() -> Option<Arc<tile_ir::NagaKernel>>,
-) -> Option<Arc<tile_ir::NagaKernel>> {
-    if let Some(kernel) = module_cache.write().get(&key) {
-        return Some(kernel.clone());
-    }
-    let kernel = build_kernel()?;
-    Some(
-        module_cache
-            .write()
-            .get_or_insert(key, || kernel.clone())
-            .clone(),
-    )
 }
 
 /// Build a `DirectKernel` whose binding list is derived from the kernel's
@@ -58,31 +38,6 @@ pub fn dynamic_kernel_from_ir(
     let bindings = bindings_from_naga(cached.kernel.module(), buffers)?;
     Some(DirectKernel::from_cached(
         name,
-        cached,
-        bindings,
-        dispatch_size,
-    ))
-}
-
-/// Two-tier variant of [`dynamic_kernel_from_ir`]: the static `module_cache`
-/// short-circuits compilation; misses fall through to the device-wide cache
-/// and finally to `build_ir`.
-pub fn dynamic_kernel_from_hashed_ir(
-    cache: &KernelCache,
-    module_cache: &'static ModuleCache,
-    label: &str,
-    module_key: KernelCacheKey,
-    buffers: impl IntoIterator<Item = Arc<wgpu::Buffer>>,
-    dispatch_size: [u32; 3],
-    build_ir: impl FnOnce() -> Option<tile_ir::KernelIr>,
-) -> Option<DirectKernel> {
-    let kernel = cached_hashed_naga(module_cache, module_key, || {
-        Some(Arc::new(build_ir()?.lower_to_naga().ok()?))
-    })?;
-    let bindings = bindings_from_naga(kernel.module(), buffers)?;
-    let cached = cache.get_or_insert_kernel(module_key, || kernel);
-    Some(DirectKernel::from_cached(
-        label,
         cached,
         bindings,
         dispatch_size,
@@ -169,15 +124,6 @@ pub fn three_buffer_pipeline_from_ir(
     build_ir: impl FnOnce() -> Option<tile_ir::KernelIr>,
 ) -> Option<wgpu::ComputePipeline> {
     let cached = cached_kernel(cache, cache_key, build_ir)?;
-    Some(prepare_three_buffer_pipeline(cache, name, &cached))
-}
-
-pub fn three_buffer_pipeline_from_cached_module(
-    cache: &KernelCache,
-    name: &str,
-    cache_key: KernelCacheKey,
-) -> Option<wgpu::ComputePipeline> {
-    let cached = cache.kernels.write().get(&cache_key).cloned()?;
     Some(prepare_three_buffer_pipeline(cache, name, &cached))
 }
 

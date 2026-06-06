@@ -58,7 +58,7 @@ impl Resolver {
                 host_profile.optimize += start.elapsed();
             }
             if host_trace && skip_large_graph_optimize {
-                eprintln!(
+                tracing::info!(
                     "resolve_host_profile optimize_large_graph node_count={} limit={optimize_limit} skipped_decode={skip_decode_optimize}",
                     self.execution_graph.node_count(),
                 );
@@ -459,11 +459,11 @@ impl Resolver {
         if trace {
             let mut categories = dispatch_categories.into_iter().collect::<Vec<_>>();
             categories.sort_by(|a, b| a.0.cmp(&b.0));
-            eprintln!("resolve_dispatch_categories {categories:?}");
+            tracing::info!("resolve_dispatch_categories {categories:?}");
             if trace_names {
                 let mut names = dispatch_names.into_iter().collect::<Vec<_>>();
                 names.sort_by(|a, b| a.0.cmp(&b.0));
-                eprintln!("resolve_dispatch_names {names:?}");
+                tracing::info!("resolve_dispatch_names {names:?}");
             }
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -515,7 +515,7 @@ impl Resolver {
                 Some((query_set, query_buffer, readback_buffer, raw_query_size))
             } else {
                 if profile_gpu_kernels {
-                    eprintln!(
+                    tracing::warn!(
                         "resolve_gpu_kernel_profile unavailable timestamp_features={:?} kernels={}",
                         device.features(),
                         total_kernels
@@ -656,10 +656,10 @@ impl Resolver {
                         readback_buffer.unmap();
                     }
                     Ok(Err(error)) => {
-                        eprintln!("resolve_gpu_kernel_profile map_failed {error:?}");
+                        tracing::warn!("resolve_gpu_kernel_profile map_failed {error:?}");
                     }
                     Err(error) => {
-                        eprintln!("resolve_gpu_kernel_profile map_channel_failed {error:?}");
+                        tracing::warn!("resolve_gpu_kernel_profile map_channel_failed {error:?}");
                     }
                 }
                 if let Some(start) = profile_readback_start {

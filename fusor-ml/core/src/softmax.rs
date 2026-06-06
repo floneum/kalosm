@@ -1,4 +1,4 @@
-use std::{any::Any, hash::Hash, sync::OnceLock};
+use std::{any::Any, hash::Hash};
 
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
@@ -20,12 +20,6 @@ use crate::{
 };
 
 const SOFTMAX_BLOCKS: [u32; 3] = [128, 512, 1024];
-const SOFTMAX_MODULE_CACHE_SIZE: usize = 128;
-
-fn softmax_module_cache() -> &'static kernel_backend::ModuleCache {
-    static CACHE: OnceLock<kernel_backend::ModuleCache> = OnceLock::new();
-    CACHE.get_or_init(|| kernel_backend::module_cache(SOFTMAX_MODULE_CACHE_SIZE))
-}
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum SoftmaxKernelVariant {
@@ -178,17 +172,14 @@ impl SoftmaxOperation {
                 self.datatype.hash(state);
             });
         let inputs = vec![input.clone().into(), output.clone().into()];
-        let key = self.kernel_module_key_with_dispatch(variant, None, dispatch_size, &inputs);
+        let key = self.kernel_cache_key_with_dispatch(variant, None, dispatch_size, &inputs);
         let buffers = vec![input.buffer().clone(), output.buffer().clone()];
         let layout = tile_ir_kernels::linear_storage_layout();
 
-        kernel_backend::dynamic_kernel_from_hashed_ir(
+        kernel_backend::dynamic_kernel_from_ir(
             device.kernel_cache(),
-            softmax_module_cache(),
             "softmax",
             key,
-            buffers,
-            dispatch_size,
             move || {
                 let mut kb = tile_ir::KernelBuilder::<()>::new();
                 let input_ref = tile_ir::KernelTensorRef::new((), layout.clone());
@@ -196,6 +187,8 @@ impl SoftmaxOperation {
                 tile_ir_kernels::softmax(&mut kb, element, input_ref, output_ref, meta)?;
                 Some(kb.finish().0)
             },
+            buffers,
+            dispatch_size,
         )
     }
 
@@ -228,7 +221,7 @@ impl SoftmaxOperation {
                 meta.split_blocks.hash(state);
                 self.datatype.hash(state);
             });
-        let partial_key = self.kernel_module_key_with_dispatch(
+        let partial_key = self.kernel_cache_key_with_dispatch(
             partial_variant,
             None,
             partial_dispatch_size,
@@ -237,13 +230,10 @@ impl SoftmaxOperation {
         let partial_buffers = vec![input.buffer().clone(), scratch.clone()];
         let partial_layout = layout.clone();
         let partial_meta = meta.clone();
-        let partial = kernel_backend::dynamic_kernel_from_hashed_ir(
+        let partial = kernel_backend::dynamic_kernel_from_ir(
             device.kernel_cache(),
-            softmax_module_cache(),
             "softmax_partials",
             partial_key,
-            partial_buffers,
-            partial_dispatch_size,
             move || {
                 let mut kb = tile_ir::KernelBuilder::<()>::new();
                 let input_ref = tile_ir::KernelTensorRef::new((), partial_layout.clone());
@@ -257,6 +247,8 @@ impl SoftmaxOperation {
                 )?;
                 Some(kb.finish().0)
             },
+            partial_buffers,
+            partial_dispatch_size,
         )?;
 
         let reduce_variant =
@@ -265,7 +257,7 @@ impl SoftmaxOperation {
                 meta.block.hash(state);
                 meta.split_blocks.hash(state);
             });
-        let reduce_key = self.kernel_module_key_with_dispatch(
+        let reduce_key = self.kernel_cache_key_with_dispatch(
             reduce_variant,
             None,
             reduce_dispatch_size,
@@ -275,13 +267,10 @@ impl SoftmaxOperation {
         let reduce_layout = layout.clone();
         let mut reduce_meta = meta.clone();
         reduce_meta.dispatch_size = reduce_dispatch_size;
-        let reduce = kernel_backend::dynamic_kernel_from_hashed_ir(
+        let reduce = kernel_backend::dynamic_kernel_from_ir(
             device.kernel_cache(),
-            softmax_module_cache(),
             "softmax_reduce",
             reduce_key,
-            reduce_buffers,
-            reduce_dispatch_size,
             move || {
                 let mut kb = tile_ir::KernelBuilder::<()>::new();
                 let scratch_ref = tile_ir::KernelTensorRef::new((), reduce_layout.clone());
@@ -294,6 +283,8 @@ impl SoftmaxOperation {
                 )?;
                 Some(kb.finish().0)
             },
+            reduce_buffers,
+            reduce_dispatch_size,
         )?;
 
         let write_variant =
@@ -303,7 +294,7 @@ impl SoftmaxOperation {
                 meta.split_blocks.hash(state);
                 self.datatype.hash(state);
             });
-        let write_key = self.kernel_module_key_with_dispatch(
+        let write_key = self.kernel_cache_key_with_dispatch(
             write_variant,
             None,
             partial_dispatch_size,
@@ -315,13 +306,10 @@ impl SoftmaxOperation {
             output.buffer().clone(),
         ];
         let write_layout = layout.clone();
-        let write = kernel_backend::dynamic_kernel_from_hashed_ir(
+        let write = kernel_backend::dynamic_kernel_from_ir(
             device.kernel_cache(),
-            softmax_module_cache(),
             "softmax_write",
             write_key,
-            write_buffers,
-            partial_dispatch_size,
             move || {
                 let mut kb = tile_ir::KernelBuilder::<()>::new();
                 let input_ref = tile_ir::KernelTensorRef::new((), write_layout.clone());
@@ -337,6 +325,8 @@ impl SoftmaxOperation {
                 )?;
                 Some(kb.finish().0)
             },
+            write_buffers,
+            partial_dispatch_size,
         )?;
 
         Some(DirectKernel::sequence(

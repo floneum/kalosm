@@ -82,7 +82,7 @@ where
         let after_norm = self.norm1.forward_generic(&xs_3d);
         flush(&after_norm);
         if trace {
-            eprintln!("    norm1: {:.2?}", t0.elapsed());
+            tracing::info!("    norm1: {:.2?}", t0.elapsed());
         }
         let t1 = Instant::now();
         let after_attention = self
@@ -90,7 +90,7 @@ where
             .forward(&after_norm, cu_seqlens, rope_cache, cache)?;
         flush(&after_attention);
         if trace {
-            eprintln!("    attn:  {:.2?}", t1.elapsed());
+            tracing::info!("    attn:  {:.2?}", t1.elapsed());
         }
 
         // Work in f32 for tensor addition
@@ -100,20 +100,20 @@ where
         let xs_3d: Tensor<3, F> = (xs_3d_f32 + after_attention_f32).cast();
         flush(&xs_3d);
         if trace {
-            eprintln!("    res1:  {:.2?}", t2.elapsed());
+            tracing::info!("    res1:  {:.2?}", t2.elapsed());
         }
 
         let t3 = Instant::now();
         let after_norm2 = self.norm2.forward_generic(&xs_3d);
         flush(&after_norm2);
         if trace {
-            eprintln!("    norm2: {:.2?}", t3.elapsed());
+            tracing::info!("    norm2: {:.2?}", t3.elapsed());
         }
         let t4 = Instant::now();
         let mlp_out = self.mlp.forward(&after_norm2);
         flush(&mlp_out);
         if trace {
-            eprintln!("    mlp:   {:.2?}", t4.elapsed());
+            tracing::info!("    mlp:   {:.2?}", t4.elapsed());
         }
 
         // Work in f32 for tensor addition
@@ -123,7 +123,7 @@ where
         let out: Tensor<3, F> = (xs_3d_f32 + mlp_out_f32).cast();
         flush(&out);
         if trace {
-            eprintln!("    res2:  {:.2?}", t5.elapsed());
+            tracing::info!("    res2:  {:.2?}", t5.elapsed());
         }
 
         Ok(out.squeeze(0).to_concrete())
@@ -214,7 +214,7 @@ where
                 let qkv: Tensor<3, f32> = qkv.forward_generic(xs).cast();
                 if trace_attn {
                     qkv.as_gpu().map(|g| g.materialize_sync());
-                    eprintln!("      qkv:   {:.2?}", t_qkv.elapsed());
+                    tracing::info!("      qkv:   {:.2?}", t_qkv.elapsed());
                 }
                 let q = qkv
                     .narrow(2, 0, self.embed_dim)
@@ -248,7 +248,7 @@ where
                     .to_concrete();
                 if trace_attn {
                     v.as_gpu().map(|g| g.materialize_sync());
-                    eprintln!("      qkv:   {:.2?} (split)", t_qkv.elapsed());
+                    tracing::info!("      qkv:   {:.2?} (split)", t_qkv.elapsed());
                 }
                 (q, k, v)
             }
@@ -273,7 +273,7 @@ where
         let t_after_rope = Instant::now();
         if trace_attn {
             value_states.as_gpu().map(|g| g.materialize_sync());
-            eprintln!(
+            tracing::info!(
                 "      rope:  {:.2?} (incl. q/k/v split + transpose)",
                 t_qkv.elapsed()
             );
@@ -287,7 +287,7 @@ where
         };
 
         if trace_attn {
-            eprintln!("      mask:  {:.2?}", t_after_rope.elapsed());
+            tracing::info!("      mask:  {:.2?}", t_after_rope.elapsed());
         }
 
         // The attention pattern is block-diagonal per `cu_seqlens`. The dense
@@ -363,7 +363,7 @@ where
         let output: Tensor<3, F> = self.proj.forward_generic(&attn_output.cast());
         if trace_attn {
             output.as_gpu().map(|g| g.materialize_sync());
-            eprintln!("      flash+proj: {:.2?}", t_flash.elapsed());
+            tracing::info!("      flash+proj: {:.2?}", t_flash.elapsed());
         }
 
         Ok(output)

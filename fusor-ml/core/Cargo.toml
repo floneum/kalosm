@@ -40,7 +40,6 @@ wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["webgpu"] }
-web-sys = { version = "0.3", features = ["console"] }
 
 [features]
 default = []

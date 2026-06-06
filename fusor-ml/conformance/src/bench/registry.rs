@@ -72,7 +72,7 @@ macro_rules! registry {
                 match Device::gpu().await {
                     Ok(device) => Some(device),
                     Err(err) => {
-                        eprintln!("skipping WebGPU benchmark smoke test: {err}");
+                        tracing::warn!("skipping WebGPU benchmark smoke test: {err}");
                         None
                     }
                 }
@@ -99,7 +99,7 @@ macro_rules! registry {
                     .await
                     .unwrap();
                     for report in reports {
-                        eprintln!(
+                        tracing::info!(
                             "{}: mean={:.3} ms median={:.3} ms stddev={:.3} ms samples={} iterations/sample={}",
                             report.name,
                             report.mean_ms,
@@ -164,7 +164,7 @@ mod burn_generated_tests {
         match Device::gpu().await {
             Ok(device) => Some(device),
             Err(err) => {
-                eprintln!("skipping Burn benchmark smoke test: {err}");
+                tracing::warn!("skipping Burn benchmark smoke test: {err}");
                 None
             }
         }
@@ -189,7 +189,7 @@ mod burn_generated_tests {
                     .await
                     .unwrap();
                     for report in reports {
-                        eprintln!(
+                        tracing::info!(
                             "{}: mean={:.3} ms median={:.3} ms stddev={:.3} ms samples={} iterations/sample={}",
                             report.name,
                             report.mean_ms,

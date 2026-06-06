@@ -48,7 +48,7 @@ pub(crate) fn debug_check_nan_f32<const R: usize>(
             }
         }
         if nan > 0 || pos_inf > 0 || neg_inf > 0 {
-            eprintln!(
+            tracing::warn!(
                 "trace_nan layer={layer} label={label} index_pos={index_pos} shape={:?} nan={nan} (first_nan_indices={:?}) +inf={pos_inf} -inf={neg_inf} max_abs={max_abs}",
                 t.shape(),
                 &sample_vals[..sample_idx]
@@ -944,9 +944,10 @@ where
             seq_len > 1 || std::env::var_os("KALOSM_TRACE_FORWARD_TIMING").is_some();
         if trace_forward_timing {
             if let Some(encode_elapsed) = encode_elapsed {
-                eprintln!(
+                tracing::info!(
                     "[timing] encode_tokens (incl. vision): {:.2?} seq_len={}",
-                    encode_elapsed, seq_len
+                    encode_elapsed,
+                    seq_len
                 );
             }
         }
@@ -1039,7 +1040,7 @@ where
             }
         }
         if trace_forward_timing {
-            eprintln!("[timing] text layer loop: {:.2?}", t_text_layers.elapsed());
+            tracing::info!("[timing] text layer loop: {:.2?}", t_text_layers.elapsed());
         }
         let x = self.norm.forward_generic(&layer_in);
         let x = x.i((.., seq_len - 1, ..));

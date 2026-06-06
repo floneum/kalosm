@@ -22,8 +22,7 @@ use super::{
     FlashAttentionDirectKernelVariant, FlashAttentionKernelVariant, FlashAttentionOperation,
     FlashDecodeSmallMeta, FlashDecodeSmallTensors, TensorMeta, build_flash_decode_small_meta,
     dispatch_streaming_flash_attention, dispatch_streaming_tiled_flash_attention,
-    flash_attention_module_cache, flash_streaming_tiled_eligible, select_flash_attention_variant,
-    streaming_dispatch_size,
+    flash_streaming_tiled_eligible, select_flash_attention_variant, streaming_dispatch_size,
 };
 
 fn flash_decode_cache_variant(
@@ -52,14 +51,14 @@ fn hash_flash_decode_dims(
     dims.head_dim.hash(state);
 }
 
-pub(super) fn flash_decode_module_key(
+pub(super) fn flash_decode_cache_key(
     workgroup_shape: Option<&WorkgroupShape>,
     dispatch_size: [u32; 3],
     input_dtype: DataTypeEnum,
     scale: f32,
     meta: &FlashDecodeSmallMeta,
 ) -> kernel_backend::KernelCacheKey {
-    flash_decode_module_key_for_variant(
+    flash_decode_cache_key_for_variant(
         FlashAttentionKernelVariant::DecodeSmall,
         workgroup_shape,
         dispatch_size,
@@ -69,7 +68,7 @@ pub(super) fn flash_decode_module_key(
     )
 }
 
-fn flash_decode_module_key_for_variant(
+fn flash_decode_cache_key_for_variant(
     decode_variant: FlashAttentionKernelVariant,
     workgroup_shape: Option<&WorkgroupShape>,
     dispatch_size: [u32; 3],
@@ -81,7 +80,7 @@ fn flash_decode_module_key_for_variant(
     kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
         // Decode kernels take the active KV length from a params buffer. Do
         // not hash `active_kv_len`, or every generated token would miss the
-        // module cache even though the IR is otherwise bucketed by block size.
+        // kernel cache even though the IR is otherwise bucketed by block size.
         2u64.hash(state);
         variant.hash(state);
         TypeId::of::<FlashAttentionOperation>().hash(state);
@@ -345,7 +344,7 @@ impl Operation for FlashAttentionOperation {
             let reduce_dispatch = [rows, 1, 1];
             let layout = tile_ir_kernels::linear_storage_layout();
 
-            let partial_key = flash_decode_module_key_for_variant(
+            let partial_key = flash_decode_cache_key_for_variant(
                 FlashAttentionKernelVariant::DecodeSplitPartials,
                 Some(workgroup_shape),
                 partial_dispatch,
@@ -361,13 +360,10 @@ impl Operation for FlashAttentionOperation {
                 params_buffer,
             ];
             let partial_layout = layout.clone();
-            let partial_kernel = kernel_backend::dynamic_kernel_from_hashed_ir(
+            let partial_kernel = kernel_backend::dynamic_kernel_from_ir(
                 device.kernel_cache(),
-                flash_attention_module_cache(),
                 "flash_attention_decode_split_partials",
                 partial_key,
-                partial_buffers,
-                partial_dispatch,
                 move || {
                     let mut kb = tile_ir::KernelBuilder::<()>::new();
                     let q_ref = tile_ir::KernelTensorRef::new((), partial_layout.clone());
@@ -386,9 +382,11 @@ impl Operation for FlashAttentionOperation {
                     )?;
                     Some(kb.finish().0)
                 },
+                partial_buffers,
+                partial_dispatch,
             )?;
 
-            let reduce_key = flash_decode_module_key_for_variant(
+            let reduce_key = flash_decode_cache_key_for_variant(
                 FlashAttentionKernelVariant::DecodeSplitReduce,
                 Some(workgroup_shape),
                 reduce_dispatch,
@@ -398,13 +396,10 @@ impl Operation for FlashAttentionOperation {
             );
             let reduce_buffers = vec![scratch_buffer, output.buffer().clone()];
             let reduce_layout = layout.clone();
-            let reduce_kernel = kernel_backend::dynamic_kernel_from_hashed_ir(
+            let reduce_kernel = kernel_backend::dynamic_kernel_from_ir(
                 device.kernel_cache(),
-                flash_attention_module_cache(),
                 "flash_attention_decode_split_reduce",
                 reduce_key,
-                reduce_buffers,
-                reduce_dispatch,
                 move || {
                     let mut kb = tile_ir::KernelBuilder::<()>::new();
                     let scratch_ref = tile_ir::KernelTensorRef::new((), reduce_layout.clone());
@@ -417,6 +412,8 @@ impl Operation for FlashAttentionOperation {
                     )?;
                     Some(kb.finish().0)
                 },
+                reduce_buffers,
+                reduce_dispatch,
             )?;
 
             return Some(kernel_backend::DirectKernel::sequence(
@@ -434,8 +431,8 @@ impl Operation for FlashAttentionOperation {
             }
             FlashAttentionKernelVariant::DecodeSplitReduce => "flash_attention_decode_split_reduce",
         };
-        let module_key = if let Some(meta) = decode_meta.as_ref() {
-            flash_decode_module_key(
+        let cache_key = if let Some(meta) = decode_meta.as_ref() {
+            flash_decode_cache_key(
                 Some(workgroup_shape),
                 dispatch_size,
                 input_dtype,
@@ -450,7 +447,7 @@ impl Operation for FlashAttentionOperation {
                 self.scale.to_bits().hash(state);
                 self.causal.hash(state);
             });
-            self.kernel_module_key_with_dispatch(
+            self.kernel_cache_key_with_dispatch(
                 cache_variant,
                 Some(workgroup_shape),
                 dispatch_size,
@@ -495,13 +492,10 @@ impl Operation for FlashAttentionOperation {
             buffers.push(params_buffer);
         }
 
-        kernel_backend::dynamic_kernel_from_hashed_ir(
+        kernel_backend::dynamic_kernel_from_ir(
             device.kernel_cache(),
-            flash_attention_module_cache(),
             kernel_label,
-            module_key,
-            buffers,
-            dispatch_size,
+            cache_key,
             move || {
                 let mut kb = tile_ir::KernelBuilder::<()>::new();
                 let q_ref = tile_ir::KernelTensorRef::new((), layout.clone());
@@ -568,6 +562,8 @@ impl Operation for FlashAttentionOperation {
                 }?;
                 Some(kb.finish().0)
             },
+            buffers,
+            dispatch_size,
         )
     }
 

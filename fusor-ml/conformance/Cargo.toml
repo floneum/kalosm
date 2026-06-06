@@ -13,6 +13,7 @@ thiserror.workspace = true
 bytemuck = "1.14"
 web-time = { workspace = true }
 burn = { version = "0.21.0", default-features = false, features = ["std", "webgpu", "fusion"], optional = true }
+tracing = "0.1.41"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

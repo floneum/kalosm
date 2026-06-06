@@ -270,14 +270,12 @@ impl DecodePlanCache {
         let trace =
             cfg!(target_arch = "wasm32") || std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some();
         if trace && (slots.hits != 0 || slots.misses != 0) {
-            let msg = format!(
+            tracing::info!(
                 "decode_plan_cache op_count={} hit={} miss={}",
-                slots.op_count, slots.hits, slots.misses
+                slots.op_count,
+                slots.hits,
+                slots.misses
             );
-            #[cfg(target_arch = "wasm32")]
-            web_sys::console::log_1(&msg.into());
-            #[cfg(not(target_arch = "wasm32"))]
-            eprintln!("{msg}");
         }
         self.by_op_count.lock().insert(slots.op_count, slots.slots);
     }

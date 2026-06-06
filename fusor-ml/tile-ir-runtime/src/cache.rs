@@ -90,18 +90,6 @@ impl CachedKernel {
     }
 }
 
-/// Static, per-kernel-family LRU of lowered kernels. Used by hot
-/// kernels (flash attention, rms norm, …) to short-circuit before the
-/// device-wide [`KernelCache`].
-pub type ModuleCache = RwLock<LruCache<KernelCacheKey, Arc<NagaKernel>, FxBuildHasher>>;
-
-pub fn module_cache(capacity: usize) -> ModuleCache {
-    RwLock::new(LruCache::with_hasher(
-        NonZeroUsize::new(capacity).expect("module cache capacity must be non-zero"),
-        Default::default(),
-    ))
-}
-
 #[derive(Debug)]
 pub(crate) struct CachedDirectBindGroup {
     pub(crate) bind_group: wgpu::BindGroup,
