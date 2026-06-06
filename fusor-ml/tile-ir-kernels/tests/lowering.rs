@@ -7,10 +7,10 @@ use fusor_tile_ir_kernels::{
     linear_storage_layout, qdequantize, qgemv_with_epilogue, qgemv_workgroup_f16_with_epilogue,
     qgemv_workgroup_with_epilogue, qmatmul_with_epilogue, qmatmul_workgroup_f16_with_epilogues,
     qmatmul_workgroup_with_epilogues, quantized_matrix, rms_norm_vec4, try_batched_coop_matmul,
-    DenseCoopMatmulTile, DenseMatmulEpilogues, DenseMatmulShape, DenseMatmulTensors,
-    DenseMatmulTile, FlashAttentionDims, FlashAttentionMeta, FlashAttentionTensors,
-    QmatmulEpilogues, RmsNormVec4, RmsNormVec4Meta, SubgroupConfig, TensorMeta, UnaryEpilogue,
-    UnaryEpilogueWithExtras,
+    DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulEpilogues, DenseMatmulShape,
+    DenseMatmulTensors, DenseMatmulTile, FlashAttentionDims, FlashAttentionMeta,
+    FlashAttentionTensors, QmatmulEpilogues, RmsNormVec4, RmsNormVec4Meta, SubgroupConfig,
+    TensorMeta, UnaryEpilogue, UnaryEpilogueWithExtras,
 };
 
 fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
@@ -20,6 +20,10 @@ fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
 
 fn subgroup_token() -> fusor_tile_ir::SubgroupToken {
     fusor_tile_ir::SubgroupToken::new_unchecked()
+}
+
+fn subgroup_config(size: u32) -> SubgroupConfig {
+    SubgroupConfig::fixed(subgroup_token(), size)
 }
 
 fn coop_token() -> fusor_tile_ir::CoopMatrixToken {
@@ -115,8 +119,7 @@ fn qgemv_ir(format: GgmlQuantFormat, rows: u32, cols: u32) -> fusor_tile_ir::Ker
             &b,
             &y,
             1,
-            subgroup_token(),
-            SubgroupConfig::fixed(32),
+            subgroup_config(32),
             Option::<&UnaryEpilogue>::None,
         );
     })
@@ -164,9 +167,8 @@ fn scalar_qmatmul_lowers() {
             &b,
             &y,
             &QmatmulEpilogues::empty(),
-            subgroup_token(),
             coop_token(),
-            SubgroupConfig::fixed(32),
+            subgroup_config(32),
             8,
             4,
             8,
@@ -187,9 +189,8 @@ fn cooperative_qmatmul_lowers() {
             &b,
             &y,
             &QmatmulEpilogues::empty(),
-            subgroup_token(),
             coop_token(),
-            SubgroupConfig::fixed(32),
+            subgroup_config(32),
             64,
             64,
             32,
@@ -264,8 +265,7 @@ fn batched_dense_f32_gemv_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
-            subgroup_token(),
-            SubgroupConfig::fixed(32),
+            subgroup_config(32),
         );
     });
     lower_or_fail(&ir, "batched dense f32 gemv");
@@ -337,8 +337,7 @@ fn batched_dense_f16_gemv_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
-            subgroup_token(),
-            SubgroupConfig::fixed(32),
+            subgroup_config(32),
         );
     });
     lower_or_fail(&ir, "batched dense f16 gemv");
@@ -375,13 +374,14 @@ fn cooperative_dense_f32_matmul_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
-            subgroup_token(),
-            coop_token(),
-            SubgroupConfig::fixed(32),
-            DenseCoopMatmulTile {
-                bm: 64,
-                bn: 64,
-                bk: 16,
+            DenseCoopMatmulConfig {
+                coop: coop_token(),
+                subgroups: subgroup_config(32),
+                tile: DenseCoopMatmulTile {
+                    bm: 64,
+                    bn: 64,
+                    bk: 16,
+                },
             },
         ));
     });
@@ -419,13 +419,14 @@ fn cooperative_dense_f16_matmul_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
-            subgroup_token(),
-            coop_token(),
-            SubgroupConfig::fixed(32),
-            DenseCoopMatmulTile {
-                bm: 64,
-                bn: 64,
-                bk: 16,
+            DenseCoopMatmulConfig {
+                coop: coop_token(),
+                subgroups: subgroup_config(32),
+                tile: DenseCoopMatmulTile {
+                    bm: 64,
+                    bn: 64,
+                    bk: 16,
+                },
             },
         ));
     });
@@ -463,13 +464,14 @@ fn cooperative_dense_f32_matmul_128x128_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
-            subgroup_token(),
-            coop_token(),
-            SubgroupConfig::fixed(32),
-            DenseCoopMatmulTile {
-                bm: 128,
-                bn: 128,
-                bk: 16,
+            DenseCoopMatmulConfig {
+                coop: coop_token(),
+                subgroups: subgroup_config(32),
+                tile: DenseCoopMatmulTile {
+                    bm: 128,
+                    bn: 128,
+                    bk: 16,
+                },
             },
         ));
     });
@@ -507,13 +509,14 @@ fn cooperative_dense_f32_matmul_128x64_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
-            subgroup_token(),
-            coop_token(),
-            SubgroupConfig::fixed(32),
-            DenseCoopMatmulTile {
-                bm: 128,
-                bn: 64,
-                bk: 16,
+            DenseCoopMatmulConfig {
+                coop: coop_token(),
+                subgroups: subgroup_config(32),
+                tile: DenseCoopMatmulTile {
+                    bm: 128,
+                    bn: 64,
+                    bk: 16,
+                },
             },
         ));
     });
@@ -553,13 +556,14 @@ fn cooperative_dense_f32_matmul_128x256_npass_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
-            subgroup_token(),
-            coop_token(),
-            SubgroupConfig::fixed(32),
-            DenseCoopMatmulTile {
-                bm: 128,
-                bn: 256,
-                bk: 16,
+            DenseCoopMatmulConfig {
+                coop: coop_token(),
+                subgroups: subgroup_config(32),
+                tile: DenseCoopMatmulTile {
+                    bm: 128,
+                    bn: 256,
+                    bk: 16,
+                },
             },
         ));
     });
@@ -624,9 +628,8 @@ fn qmatmul_epilogue_fallback_ir(post: Option<&UnaryEpilogue>) -> fusor_tile_ir::
             &b,
             &y,
             &epilogues,
-            subgroup_token(),
             coop_token(),
-            SubgroupConfig::fixed(32),
+            subgroup_config(32),
             64,
             64,
             32,

@@ -24,8 +24,8 @@ pub use flash::{
 pub use helpers::AccumCast;
 pub use matmul::{
     batched_gemv_with_epilogues, batched_matmul_register_with_epilogues,
-    batched_matmul_with_epilogues, try_batched_coop_matmul, DenseCoopMatmulTile, DenseMatmulShape,
-    DenseMatmulTensors, DenseMatmulTile,
+    batched_matmul_with_epilogues, try_batched_coop_matmul, DenseCoopMatmulConfig,
+    DenseCoopMatmulTile, DenseMatmulShape, DenseMatmulTensors, DenseMatmulTile,
 };
 pub use mirostat::{mirostat2, standard_sampler, Mirostat2, StandardSampler};
 pub use qdequantize::qdequantize;

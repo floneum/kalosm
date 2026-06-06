@@ -82,6 +82,14 @@ pub struct DenseCoopMatmulTile {
     pub bk: u32,
 }
 
+/// Capability and tile selection for a cooperative dense matmul attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseCoopMatmulConfig {
+    pub coop: CoopMatrixToken,
+    pub subgroups: SubgroupConfig,
+    pub tile: DenseCoopMatmulTile,
+}
+
 #[derive(Clone, Copy)]
 struct CoopTileEntry {
     tile: DenseCoopMatmulTile,
@@ -128,7 +136,6 @@ pub fn batched_gemv_with_epilogues(
     shape: DenseMatmulShape,
     epilogues: &DenseMatmulEpilogues<'_>,
     max_workgroups_per_dimension: u32,
-    subgroup: SubgroupToken,
     subgroups: SubgroupConfig,
 ) {
     // Runtime subgroup width × rows per workgroup = logical row coverage.
@@ -136,6 +143,7 @@ pub fn batched_gemv_with_epilogues(
     const ROWS_PER_WORKGROUP: u32 = 4;
     const VALUES_PER_LANE: u32 = 8;
     let block = subgroups.block_for_subgroups(ROWS_PER_WORKGROUP);
+    let subgroup = subgroups.token();
     let rows_per_workgroup = ROWS_PER_WORKGROUP;
     let values_per_lane = VALUES_PER_LANE;
     assert_eq!(shape.n, 1, "batched_gemv expects a single RHS column");
@@ -509,12 +517,15 @@ pub fn try_batched_coop_matmul(
     shape: DenseMatmulShape,
     epilogues: &DenseMatmulEpilogues<'_>,
     max_workgroups_per_dimension: u32,
-    subgroup: SubgroupToken,
-    coop: CoopMatrixToken,
-    subgroups: SubgroupConfig,
-    tile: DenseCoopMatmulTile,
+    config: DenseCoopMatmulConfig,
 ) -> bool {
     let DenseMatmulTensors { a, b, y } = tensors;
+    let DenseCoopMatmulConfig {
+        coop,
+        subgroups,
+        tile,
+    } = config;
+    let subgroup = subgroups.token();
     let DenseCoopMatmulTile { bm, bn, bk } = tile;
     if !subgroups.is_fixed()
         || epilogues.pre_a.is_some()

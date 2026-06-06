@@ -3,6 +3,10 @@ use fusor_tile_ir::{
 };
 use fusor_tile_ir_kernels as tile_ir_kernels;
 
+fn subgroup_config(size: u32) -> tile_ir_kernels::SubgroupConfig {
+    tile_ir_kernels::SubgroupConfig::fixed(fusor_tile_ir::SubgroupToken::new_unchecked(), size)
+}
+
 fn fused_bias_gelu_residual_ir(rows: u32, cols: u32) -> KernelIr {
     const BLOCK: usize = 128;
     assert!(cols <= BLOCK as u32, "example emits one tile per row");
@@ -101,9 +105,8 @@ fn qmatmul_ir(format: GgmlQuantFormat, m: u32, n: u32, k: u32) -> KernelIr {
             &b,
             &y,
             &tile_ir_kernels::QmatmulEpilogues::empty(),
-            fusor_tile_ir::SubgroupToken::new_unchecked(),
             fusor_tile_ir::CoopMatrixToken::new_unchecked(),
-            tile_ir_kernels::SubgroupConfig::fixed(32),
+            subgroup_config(32),
             8,
             4,
             8,
@@ -124,8 +127,7 @@ fn qgemv_ir(format: GgmlQuantFormat, n: u32, k: u32) -> KernelIr {
             &b,
             &y,
             1,
-            fusor_tile_ir::SubgroupToken::new_unchecked(),
-            tile_ir_kernels::SubgroupConfig::fixed(32),
+            subgroup_config(32),
             Option::<&tile_ir_kernels::UnaryEpilogue>::None,
         );
     })
@@ -148,8 +150,7 @@ fn qgemv_with_silu_epilogue_ir(format: GgmlQuantFormat, n: u32, k: u32) -> Kerne
             &b,
             &y,
             1,
-            fusor_tile_ir::SubgroupToken::new_unchecked(),
-            tile_ir_kernels::SubgroupConfig::fixed(32),
+            subgroup_config(32),
             Some(&silu),
         );
     })

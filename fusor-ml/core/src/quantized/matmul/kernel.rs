@@ -5,9 +5,9 @@ use super::*;
 #[derive(Clone, Copy)]
 enum QmatmulDirectTokens {
     Workgroup,
-    Qgemv(tile_ir::SubgroupToken),
+    Qgemv(tile_ir_kernels::SubgroupConfig),
     Coop {
-        subgroup: tile_ir::SubgroupToken,
+        subgroup: tile_ir_kernels::SubgroupConfig,
         coop: tile_ir::CoopMatrixToken,
     },
 }
@@ -90,10 +90,10 @@ impl QMatMulOperation {
         let direct_tokens = match variant {
             QMatmulPath::Workgroup => QmatmulDirectTokens::Workgroup,
             QMatmulPath::Q5SmallSingleRow | QMatmulPath::SingleRow => {
-                QmatmulDirectTokens::Qgemv(device.subgroup_token()?)
+                QmatmulDirectTokens::Qgemv(device.subgroup_config()?)
             }
             QMatmulPath::Q8Wide(_) | QMatmulPath::Tile { .. } => QmatmulDirectTokens::Coop {
-                subgroup: device.subgroup_token()?,
+                subgroup: device.subgroup_config()?,
                 coop: device.coop_token(CooperativeMatrixKind::F32F32M8N8K8)?,
             },
         };
@@ -509,16 +509,12 @@ impl QMatMulOperation {
                 }
                 return;
             }
-            let subgroup_config = tile_ir_kernels::SubgroupConfig::new(
-                subgroup_size_range[0],
-                subgroup_size_range[1],
-            );
             // Map the selected variant to its cooperative tile dimensions.
             // The first two single-row variants short-circuit to
             // qgemv; the rest share the qmatmul_with_epilogue entry point.
             let tile = match variant {
                 QMatmulPath::Q5SmallSingleRow | QMatmulPath::SingleRow => {
-                    let QmatmulDirectTokens::Qgemv(subgroup_token) = direct_tokens else {
+                    let QmatmulDirectTokens::Qgemv(subgroups) = direct_tokens else {
                         unreachable!("single-row qmatmul variant requires subgroup token");
                     };
                     tile_ir_kernels::qgemv_with_epilogue(
@@ -527,8 +523,7 @@ impl QMatMulOperation {
                         &b,
                         &y,
                         qmatmul_workgroups_x,
-                        subgroup_token,
-                        subgroup_config,
+                        subgroups,
                         &epilogues,
                     );
                     return;
@@ -537,24 +532,14 @@ impl QMatMulOperation {
                 QMatmulPath::Q8Wide(tile) | QMatmulPath::Tile { tile, .. } => tile,
             };
             let QmatmulDirectTokens::Coop {
-                subgroup: subgroup_token,
+                subgroup: subgroups,
                 coop: coop_token,
             } = direct_tokens
             else {
                 unreachable!("direct qmatmul tile variant requires cooperative-matrix tokens");
             };
             tile_ir_kernels::qmatmul_with_epilogue(
-                phase,
-                &a,
-                &b,
-                &y,
-                &epilogues,
-                subgroup_token,
-                coop_token,
-                subgroup_config,
-                tile.bm,
-                tile.bn,
-                tile.bk,
+                phase, &a, &b, &y, &epilogues, coop_token, subgroups, tile.bm, tile.bn, tile.bk,
             );
         });
         let dispatch_size = ir.grid;

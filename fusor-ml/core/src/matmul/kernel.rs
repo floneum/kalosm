@@ -35,21 +35,14 @@ fn device_supported<T>(value: Option<T>) -> Result<T, kernel_backend::DeviceNotS
 }
 
 #[derive(Clone, Copy)]
-struct DenseSubgroupTokens {
-    token: tile_ir::SubgroupToken,
-    config: tile_ir_kernels::SubgroupConfig,
-}
-
-#[derive(Clone, Copy)]
 struct DenseCoopTokens {
-    subgroup: tile_ir::SubgroupToken,
     config: tile_ir_kernels::SubgroupConfig,
     coop: tile_ir::CoopMatrixToken,
 }
 
 #[derive(Clone, Copy)]
 enum DirectTileMatmulRoute {
-    Gemv(DenseSubgroupTokens),
+    Gemv(tile_ir_kernels::SubgroupConfig),
     MatMul { coop: Option<DenseCoopTokens> },
 }
 
@@ -178,15 +171,8 @@ impl MatMulOperation {
 
         // GEMV reduces through subgroup operations. Use the matmul route
         // unless the device exposes a subgroup path we trust.
-        let subgroup_tokens = device.subgroup_token().map(|token| DenseSubgroupTokens {
-            token,
-            config: tile_ir_kernels::SubgroupConfig::new(
-                device.min_subgroup_size(),
-                device.max_subgroup_size(),
-            ),
-        });
-        let subgroup_config_for_key = subgroup_tokens.map(|tokens| tokens.config);
-        let route_variant = if subgroup_tokens.is_some() {
+        let subgroup_config = device.subgroup_config();
+        let route_variant = if subgroup_config.is_some() {
             select_direct_tile_matmul_variant(m, k, n)
         } else {
             DirectTileMatmulVariant::MatMul
@@ -195,20 +181,17 @@ impl MatMulOperation {
             MatMulParams::CoopMatMul(params) => Some(params.kind()),
             _ => None,
         };
-        let route = match (route_variant, subgroup_tokens) {
-            (DirectTileMatmulVariant::Gemv, Some(subgroup)) => {
-                DirectTileMatmulRoute::Gemv(subgroup)
-            }
+        let route = match (route_variant, subgroup_config) {
+            (DirectTileMatmulVariant::Gemv, Some(config)) => DirectTileMatmulRoute::Gemv(config),
             (DirectTileMatmulVariant::Gemv, None) => DirectTileMatmulRoute::MatMul { coop: None },
-            (DirectTileMatmulVariant::MatMul, subgroup) => {
-                let coop = subgroup.and_then(|subgroup| {
-                    if !subgroup.config.is_fixed() {
+            (DirectTileMatmulVariant::MatMul, config) => {
+                let coop = config.and_then(|config| {
+                    if !config.is_fixed() {
                         return None;
                     }
                     let kind = coop_kind?;
                     Some(DenseCoopTokens {
-                        subgroup: subgroup.token,
-                        config: subgroup.config,
+                        config,
                         coop: device.coop_token(kind)?,
                     })
                 });
@@ -319,7 +302,7 @@ impl MatMulOperation {
                 variant.hash(state);
                 coop_variant.hash(state);
                 coop_kind.hash(state);
-                subgroup_config_for_key.hash(state);
+                subgroup_config.hash(state);
                 epilogue_identity.hash(state);
             },
         );
@@ -573,13 +556,14 @@ fn dispatch_direct_tile_matmul(
             shape,
             epilogues,
             max_wg_per_dim,
-            tokens.subgroup,
-            tokens.coop,
-            tokens.config,
-            tile_ir_kernels::DenseCoopMatmulTile {
-                bm: tile.bm,
-                bn: tile.bn,
-                bk: tile.bk,
+            tile_ir_kernels::DenseCoopMatmulConfig {
+                coop: tokens.coop,
+                subgroups: tokens.config,
+                tile: tile_ir_kernels::DenseCoopMatmulTile {
+                    bm: tile.bm,
+                    bn: tile.bn,
+                    bk: tile.bk,
+                },
             },
         )
     {
@@ -594,8 +578,7 @@ fn dispatch_direct_tile_matmul(
             shape,
             epilogues,
             max_wg_per_dim,
-            tokens.token,
-            tokens.config,
+            tokens,
         ),
         DirectTileMatmulRoute::MatMul { .. } => {
             if let Some(tile) = matmul_tile {

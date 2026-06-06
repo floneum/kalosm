@@ -4,6 +4,7 @@ use std::{
 };
 
 use fusor_tile_ir::{CoopMatrixToken, SubgroupToken};
+use fusor_tile_ir_kernels::SubgroupConfig;
 use fusor_tile_ir_runtime::{BufferPool, KernelCache};
 use wgpu::{BackendOptions, Dx12BackendOptions};
 
@@ -384,6 +385,14 @@ impl Device {
         Some(SubgroupToken::new_unchecked())
     }
 
+    pub(crate) fn subgroup_config(&self) -> Option<SubgroupConfig> {
+        Some(SubgroupConfig::new(
+            self.subgroup_token()?,
+            self.min_subgroup_size(),
+            self.max_subgroup_size(),
+        ))
+    }
+
     pub fn min_subgroup_size(&self) -> u32 {
         self.inner.adapter.get_info().subgroup_min_size
     }
@@ -497,6 +506,34 @@ impl Device {
 #[cfg(test)]
 mod dirty_buffer_tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn probe_subgroup_sizes() {
+        pollster::FutureExt::block_on(async {
+            let Ok(device) = Device::new().await else {
+                eprintln!("PROBE: no device");
+                return;
+            };
+            let info = device.inner.adapter.get_info();
+            let min = device.min_subgroup_size();
+            let max = device.max_subgroup_size();
+            eprintln!(
+                "PROBE backend={:?} name={:?} subgroups_supported={} min={} max={} fixed_width={:?}",
+                info.backend,
+                info.name,
+                device.subgroups_supported(),
+                min,
+                max,
+                device.fixed_width_subgroup_size(),
+            );
+            eprintln!(
+                "PROBE q4k_lanes8_ok={} q6k_lanes16_ok={}",
+                min >= 8 && min % 8 == 0 && max % 8 == 0,
+                min >= 16 && min % 16 == 0 && max % 16 == 0,
+            );
+        });
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]

@@ -12,12 +12,13 @@
 //! does not apply; that layout stays on the generic perf path.
 
 use fusor_tile_ir::tile::{range, Program, Storage, Tile, TileBlock};
-use fusor_tile_ir::{ElementType, GgmlQuantFormat, QuantizedMatrix, SubgroupToken};
+use fusor_tile_ir::{ElementType, GgmlQuantFormat};
 
 use crate::dispatch::{QgemvShape, SubgroupConfig};
 use crate::grid::{
     qgemv_grid, qgemv_program_scope, store_qgemv_sums_with_epilogue, QgemvStoreTarget,
 };
+use crate::kernels::qgemv::QgemvTensors;
 use crate::types::{matrix_shape, QmatmulEpilogues};
 
 /// Q6K word offset of the super-block scale `d` (an f32 word for the f32-scale
@@ -80,18 +81,16 @@ pub(crate) fn load_q6k_ggml_activations(
 /// chunk decodes one super-block's `d` and four sub-block scales once and
 /// consumes a strided 16-element region. Only valid with an empty pre-epilogue
 /// and the word-aligned f32-scale [`GgmlQuantFormat::Q6K`] layout.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn qgemv_q6k_ggml(
     program: &mut Program,
-    a: &Storage,
-    b: &QuantizedMatrix,
-    y: &Storage,
+    tensors: QgemvTensors<'_>,
     workgroups_x: u32,
-    subgroup: SubgroupToken,
     subgroups: SubgroupConfig,
     epilogues: &QmatmulEpilogues<'_>,
     shape: QgemvShape,
 ) {
+    let QgemvTensors { a, b, y } = tensors;
+    let subgroup = subgroups.token();
     let block = subgroups.block_for_subgroups(shape.subgroups);
     let dispatch_subgroups = shape.subgroups;
     let cols_per_subgroup = shape.cols_per_subgroup;
@@ -320,6 +319,10 @@ mod tests {
         }
     }
 
+    fn subgroup_config(size: u32) -> SubgroupConfig {
+        SubgroupConfig::fixed(fusor_tile_ir::SubgroupToken::new_unchecked(), size)
+    }
+
     fn build_and_lower(rows: u32, cols: u32, shape: QgemvShape) {
         let ir = tile::build(|program| {
             let a = program.storage_read(ElementType::F32, Shape::new([1, rows]));
@@ -328,11 +331,13 @@ mod tests {
             let epilogues = QmatmulEpilogues::default();
             qgemv_q6k_ggml(
                 program,
-                &a,
-                &b,
-                &y,
+                QgemvTensors {
+                    a: &a,
+                    b: &b,
+                    y: &y,
+                },
                 1,
-                SubgroupConfig::fixed(32),
+                subgroup_config(32),
                 &epilogues,
                 shape,
             );

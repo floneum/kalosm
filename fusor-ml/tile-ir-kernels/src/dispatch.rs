@@ -20,7 +20,7 @@
 //!   - `FUSOR_Q6K_LARGE_TILE` (rows<=4096, cols>=8192)
 //!   - `FUSOR_Q6K_TALL_TILE`  (rows>4096,  cols<=4096)
 
-use fusor_tile_ir::GgmlQuantFormat;
+use fusor_tile_ir::{GgmlQuantFormat, SubgroupToken};
 
 // ===== qgemv shapes (Q4K and Q6K ggml paths) =====
 
@@ -130,19 +130,28 @@ impl QgemvShape {
 /// max is only used for the fixed workgroup allocation passed to WGSL.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SubgroupConfig {
+    token: SubgroupToken,
     min_size: u32,
     max_size: u32,
 }
 
 impl SubgroupConfig {
-    pub const fn new(min_size: u32, max_size: u32) -> Self {
+    pub const fn new(token: SubgroupToken, min_size: u32, max_size: u32) -> Self {
         assert!(min_size > 0, "subgroup min size must be non-zero");
         assert!(max_size >= min_size, "subgroup size range must be ordered");
-        Self { min_size, max_size }
+        Self {
+            token,
+            min_size,
+            max_size,
+        }
     }
 
-    pub const fn fixed(size: u32) -> Self {
-        Self::new(size, size)
+    pub const fn fixed(token: SubgroupToken, size: u32) -> Self {
+        Self::new(token, size, size)
+    }
+
+    pub const fn token(self) -> SubgroupToken {
+        self.token
     }
 
     pub const fn min_size(self) -> u32 {

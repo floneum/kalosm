@@ -112,6 +112,7 @@ impl CoopMatrixToken {
     }
 
     /// Cooperatively load an A-role fragment from a workgroup tile.
+    #[allow(clippy::too_many_arguments)]
     pub fn coop_load_a(
         self,
         program: &TileBlock<'_>,
@@ -126,6 +127,7 @@ impl CoopMatrixToken {
     }
 
     /// Cooperatively load a B-role fragment from a workgroup tile.
+    #[allow(clippy::too_many_arguments)]
     pub fn coop_load_b(
         self,
         program: &TileBlock<'_>,

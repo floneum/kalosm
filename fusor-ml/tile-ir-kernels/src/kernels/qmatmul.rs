@@ -1,9 +1,7 @@
 //! Quantized matrix multiply program kernels.
 
 use fusor_tile_ir::tile::{range, Program, Storage};
-use fusor_tile_ir::{
-    CoopMatrixToken, QuantizedMatrix, ScalarElement, SubgroupToken, WorkgroupAxis,
-};
+use fusor_tile_ir::{CoopMatrixToken, QuantizedMatrix, ScalarElement, WorkgroupAxis};
 
 use crate::{
     dispatch::SubgroupConfig,
@@ -30,15 +28,15 @@ use crate::{
 ///     let a = program.storage_read(ElementType::F32, Shape::new([8, 256]));
 ///     let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 16);
 ///     let y = program.storage_write(ElementType::F32, Shape::new([8, 16]));
+///     let subgroup = fusor_tile_ir::SubgroupToken::new_unchecked();
 ///     qmatmul_with_epilogue(
 ///         program,
 ///         &a,
 ///         &b,
 ///         &y,
 ///         &QmatmulEpilogues::empty(),
-///         fusor_tile_ir::SubgroupToken::new_unchecked(),
 ///         fusor_tile_ir::CoopMatrixToken::new_unchecked(),
-///         fusor_tile_ir_kernels::SubgroupConfig::fixed(32),
+///         fusor_tile_ir_kernels::SubgroupConfig::fixed(subgroup, 32),
 ///         64,
 ///         64,
 ///         32,
@@ -53,7 +51,6 @@ pub fn qmatmul_with_epilogue(
     b: &QuantizedMatrix,
     y: &Storage,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
-    subgroup: SubgroupToken,
     coop: CoopMatrixToken,
     subgroups: SubgroupConfig,
     bm: u32,
@@ -71,11 +68,9 @@ pub fn qmatmul_with_epilogue(
     assert_eq!(b.cols, y_n, "qmatmul output column count must match B");
 
     if m == 1 {
-        super::qgemv::qgemv_with_epilogue(program, a, b, y, 1, subgroup, subgroups, epilogues);
+        super::qgemv::qgemv_with_epilogue(program, a, b, y, 1, subgroups, epilogues);
     } else {
-        qmatmul_tile_with_epilogue(
-            program, a, b, y, epilogues, subgroup, coop, subgroups, bm, bn, bk,
-        );
+        qmatmul_tile_with_epilogue(program, a, b, y, epilogues, coop, subgroups, bm, bn, bk);
     }
 }
 
@@ -93,7 +88,6 @@ pub(crate) fn qmatmul_tile_with_epilogue(
     b: &QuantizedMatrix,
     y: &Storage,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
-    subgroup: SubgroupToken,
     coop: CoopMatrixToken,
     subgroups: SubgroupConfig,
     bm: u32,
@@ -121,7 +115,6 @@ pub(crate) fn qmatmul_tile_with_epilogue(
             b,
             epilogues.post_acc_init_col_vector,
             y,
-            subgroup,
             coop,
             subgroups,
             bm,
@@ -199,7 +192,6 @@ pub(crate) fn qmatmul_try_coop(
     b: &QuantizedMatrix,
     acc_init: Option<&Storage>,
     y: &Storage,
-    subgroup: SubgroupToken,
     coop: CoopMatrixToken,
     subgroups: SubgroupConfig,
     bm: u32,
@@ -224,8 +216,7 @@ pub(crate) fn qmatmul_try_coop(
         return false;
     }
     qmatmul_coop(
-        program, a, b, acc_init, y, subgroup, coop, bm, bn, table_bk, row_groups, col_groups,
-        subgroups,
+        program, a, b, acc_init, y, coop, bm, bn, table_bk, row_groups, col_groups, subgroups,
     );
     true
 }
@@ -245,7 +236,6 @@ pub(crate) fn qmatmul_coop(
     b: &QuantizedMatrix,
     acc_init: Option<&Storage>,
     y: &Storage,
-    subgroup: SubgroupToken,
     coop: CoopMatrixToken,
     bm: u32,
     bn: u32,
@@ -257,6 +247,7 @@ pub(crate) fn qmatmul_coop(
     const COOP_DIM: u32 = 8;
     const SUBGROUP_ROWS: u32 = 32;
     const SUBGROUP_COLS: u32 = 32;
+    let subgroup = subgroups.token();
     let block = subgroups.block_for_subgroups(row_groups * col_groups);
     debug_assert_eq!(row_groups * SUBGROUP_ROWS, bm);
     debug_assert_eq!(col_groups * SUBGROUP_COLS, bn);

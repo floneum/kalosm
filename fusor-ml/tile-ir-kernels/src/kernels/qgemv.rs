@@ -18,7 +18,7 @@
 //! not `(format, dims)`-derivable, so it is not pushed into the lowerer.
 
 use fusor_tile_ir::tile::{range, Mask, Program, Storage, Tile, TileBlock};
-use fusor_tile_ir::{GgmlQuantFormat, QuantizedMatrix, SubgroupToken, TileLiteral};
+use fusor_tile_ir::{GgmlQuantFormat, QuantizedMatrix, TileLiteral};
 
 use crate::dispatch::{
     q4k_default_large, q4k_default_mid, q4k_default_tall, q4k_large_override, q4k_mid_override,
@@ -65,10 +65,10 @@ impl<'a> IntoQgemvEpilogues<'a> for &'a QmatmulEpilogues<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct QgemvTensors<'a> {
-    a: &'a Storage,
-    b: &'a QuantizedMatrix,
-    y: &'a Storage,
+pub(crate) struct QgemvTensors<'a> {
+    pub(crate) a: &'a Storage,
+    pub(crate) b: &'a QuantizedMatrix,
+    pub(crate) y: &'a Storage,
 }
 
 fn qgemv_shape(subgroups: u32, cols_per_subgroup: u32) -> QgemvShape {
@@ -91,14 +91,14 @@ fn qgemv_shape(subgroups: u32, cols_per_subgroup: u32) -> QgemvShape {
 ///     let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, 256]));
 ///     let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 128);
 ///     let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, 128]));
+///     let subgroup = fusor_tile_ir::SubgroupToken::new_unchecked();
 ///     qgemv_with_epilogue(
 ///         program,
 ///         &a,
 ///         &b,
 ///         &y,
 ///         1,
-///         fusor_tile_ir::SubgroupToken::new_unchecked(),
-///         fusor_tile_ir_kernels::SubgroupConfig::fixed(32),
+///         fusor_tile_ir_kernels::SubgroupConfig::fixed(subgroup, 32),
 ///         Option::<&UnaryEpilogue>::None,
 ///     );
 /// });
@@ -110,21 +110,11 @@ pub fn qgemv_with_epilogue<'a>(
     b: &QuantizedMatrix,
     y: &Storage,
     workgroups_x: u32,
-    subgroup: SubgroupToken,
     subgroups: SubgroupConfig,
     epilogues: impl IntoQgemvEpilogues<'a>,
 ) {
     let epilogues = epilogues.into_qgemv_epilogues();
-    qgemv_tile_with_epilogue(
-        program,
-        a,
-        b,
-        y,
-        workgroups_x,
-        subgroup,
-        subgroups,
-        &epilogues,
-    );
+    qgemv_tile_with_epilogue(program, a, b, y, workgroups_x, subgroups, &epilogues);
 }
 
 /// Format-dispatched qgemv body with optional pre/post unary epilogues.
@@ -142,7 +132,6 @@ pub(crate) fn qgemv_tile_with_epilogue(
     b: &QuantizedMatrix,
     y: &Storage,
     workgroups_x: u32,
-    subgroup: SubgroupToken,
     subgroups: SubgroupConfig,
     ep: &QmatmulEpilogues<'_>,
 ) {
@@ -158,7 +147,6 @@ pub(crate) fn qgemv_tile_with_epilogue(
                     program,
                     tensors,
                     workgroups_x,
-                    subgroup,
                     subgroups,
                     ep,
                     qgemv_shape(4, 8),
@@ -169,7 +157,6 @@ pub(crate) fn qgemv_tile_with_epilogue(
                 program,
                 tensors,
                 workgroups_x,
-                subgroup,
                 subgroups,
                 ep,
                 qgemv_shape(4, 4),
@@ -180,7 +167,6 @@ pub(crate) fn qgemv_tile_with_epilogue(
             program,
             tensors,
             workgroups_x,
-            subgroup,
             subgroups,
             ep,
             qgemv_shape(4, 4),
@@ -209,22 +195,13 @@ pub(crate) fn qgemv_tile_with_epilogue(
                 && qgemv_pre_epilogue_is_empty(ep)
                 && subgroups.supports_lanes_per_item(8)
             {
-                return qgemv_q4k_ggml(
-                    program,
-                    tensors,
-                    workgroups_x,
-                    subgroup,
-                    subgroups,
-                    ep,
-                    shape,
-                );
+                return qgemv_q4k_ggml(program, tensors, workgroups_x, subgroups, ep, shape);
             }
             let values_per_lane = if shape.cols_per_subgroup == 8 { 8 } else { 16 };
             qgemv_perf_with_epilogue(
                 program,
                 tensors,
                 workgroups_x,
-                subgroup,
                 subgroups,
                 ep,
                 shape,
@@ -235,7 +212,6 @@ pub(crate) fn qgemv_tile_with_epilogue(
             program,
             tensors,
             workgroups_x,
-            subgroup,
             subgroups,
             ep,
             qgemv_shape(2, 4),
@@ -249,7 +225,6 @@ pub(crate) fn qgemv_tile_with_epilogue(
             program,
             tensors,
             workgroups_x,
-            subgroup,
             subgroups,
             ep,
             qgemv_shape(2, 4),
@@ -259,7 +234,6 @@ pub(crate) fn qgemv_tile_with_epilogue(
             program,
             tensors,
             workgroups_x,
-            subgroup,
             subgroups,
             ep,
             qgemv_shape(2, 2),
@@ -269,7 +243,6 @@ pub(crate) fn qgemv_tile_with_epilogue(
             program,
             tensors,
             workgroups_x,
-            subgroup,
             subgroups,
             ep,
             qgemv_shape(2, 1),
@@ -282,7 +255,6 @@ pub(crate) fn qgemv_tile_with_epilogue(
                     program,
                     tensors,
                     workgroups_x,
-                    subgroup,
                     subgroups,
                     ep,
                     shape,
@@ -295,7 +267,6 @@ pub(crate) fn qgemv_tile_with_epilogue(
                     program,
                     tensors,
                     workgroups_x,
-                    subgroup,
                     subgroups,
                     ep,
                     shape,
@@ -319,23 +290,12 @@ pub(crate) fn qgemv_tile_with_epilogue(
                 && qgemv_pre_epilogue_is_empty(ep)
                 && subgroups.supports_lanes_per_item(16)
             {
-                return qgemv_q6k_ggml(
-                    program,
-                    a,
-                    b,
-                    y,
-                    workgroups_x,
-                    subgroup,
-                    subgroups,
-                    ep,
-                    shape,
-                );
+                return qgemv_q6k_ggml(program, tensors, workgroups_x, subgroups, ep, shape);
             }
             qgemv_perf_with_epilogue(
                 program,
                 tensors,
                 workgroups_x,
-                subgroup,
                 subgroups,
                 ep,
                 shape,
@@ -400,13 +360,13 @@ fn qgemv_perf_with_epilogue(
     program: &mut Program,
     tensors: QgemvTensors<'_>,
     workgroups_x: u32,
-    subgroup: SubgroupToken,
     subgroups: SubgroupConfig,
     epilogues: &QmatmulEpilogues<'_>,
     shape: QgemvShape,
     values_per_lane: u32,
 ) {
     let QgemvTensors { a, b, y } = tensors;
+    let subgroup = subgroups.token();
     let block = subgroups.block_for_subgroups(shape.subgroups);
     let dispatch_subgroups = shape.subgroups;
     let cols_per_subgroup = shape.cols_per_subgroup;
@@ -584,12 +544,12 @@ fn qgemv_q4k_ggml(
     program: &mut Program,
     tensors: QgemvTensors<'_>,
     workgroups_x: u32,
-    subgroup: SubgroupToken,
     subgroups: SubgroupConfig,
     epilogues: &QmatmulEpilogues<'_>,
     shape: QgemvShape,
 ) {
     let QgemvTensors { a, b, y } = tensors;
+    let subgroup = subgroups.token();
     let block = subgroups.block_for_subgroups(shape.subgroups);
     let dispatch_subgroups = shape.subgroups;
     let cols_per_subgroup = shape.cols_per_subgroup;
