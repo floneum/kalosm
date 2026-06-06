@@ -21,11 +21,18 @@
 //! Disable with `FUSOR_DISABLE_DECODE_PLAN_CACHE` (native only; `var_os` is
 //! always `None` on wasm, so the cache is always on for the web build).
 
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::{
+    hash::{Hash, Hasher},
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
+use lru::LruCache;
 use parking_lot::Mutex;
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::{FxBuildHasher, FxHasher};
 
 use crate::mir::inputs::MirValue;
 use crate::mir::kernel_backend::{
@@ -36,6 +43,9 @@ use crate::mir::workgroup_shape::WorkgroupShape;
 use crate::tensor::TensorData;
 
 struct DecodePlanCacheKernelVariant;
+const DECODE_PLAN_CACHE_SIZE: usize = 4096;
+
+type DecodePlanCacheKey = (KernelCacheKey, u64);
 
 pub(crate) fn structural_kernel_key(
     operation: &dyn Operation,
@@ -68,19 +78,11 @@ enum BufSource {
 /// A memoized build result for a single operation: the kernel templates plus,
 /// for each kernel, where to source its buffers from on a replay.
 struct CachedOpPlan {
-    kernel_key: KernelCacheKey,
-    alias_fp: u64,
     kernels: Vec<(DirectKernelTemplate, Vec<BufSource>)>,
 }
 
 impl CachedOpPlan {
-    fn record(
-        kernel_key: KernelCacheKey,
-        alias_fp: u64,
-        built: &[DirectKernel],
-        inputs: &[MirValue],
-        output: &TensorData,
-    ) -> Self {
+    fn record(built: &[DirectKernel], inputs: &[MirValue], output: &TensorData) -> Self {
         let output_buf = output.buffer();
         let kernels = built
             .iter()
@@ -93,15 +95,7 @@ impl CachedOpPlan {
                 (kernel.to_template(), sources)
             })
             .collect();
-        Self {
-            kernel_key,
-            alias_fp,
-            kernels,
-        }
-    }
-
-    fn matches(&self, kernel_key: KernelCacheKey, alias_fp: u64) -> bool {
-        self.kernel_key == kernel_key && self.alias_fp == alias_fp
+        Self { kernels }
     }
 
     fn rebind(&self, inputs: &[MirValue], output: &TensorData) -> Vec<DirectKernel> {
@@ -176,54 +170,13 @@ fn alias_class<'a>(seen: &mut Vec<&'a Arc<wgpu::Buffer>>, buffer: &'a Arc<wgpu::
     }
 }
 
-/// The per-resolve view of the cache: the slots for the current graph size,
-/// taken out of the shared map so the resolve loop can read/write them without
-/// locking on every op. Returned to the cache via [`DecodePlanCache::put`].
-pub(crate) struct OpPlanSlots {
-    op_count: usize,
-    slots: Vec<Option<CachedOpPlan>>,
-    hits: u32,
-    misses: u32,
-}
-
-impl OpPlanSlots {
-    /// Return the kernels for operation `index`, reusing the cached build if the
-    /// op is structurally unchanged, otherwise invoking `build` and caching the
-    /// result. `kernel_key` must uniquely describe the generated kernel IR for
-    /// the current operation, including every input and output layout/format.
-    pub(crate) fn resolve_op(
-        &mut self,
-        index: usize,
-        kernel_key: KernelCacheKey,
-        inputs: &[MirValue],
-        output: &TensorData,
-        build: impl FnOnce() -> Vec<DirectKernel>,
-    ) -> Vec<DirectKernel> {
-        let alias_fp = fingerprint_aliases(inputs, output);
-
-        if let Some(Some(plan)) = self.slots.get(index)
-            && plan.matches(kernel_key, alias_fp)
-        {
-            self.hits += 1;
-            return plan.rebind(inputs, output);
-        }
-
-        self.misses += 1;
-        let built = build();
-        if index < self.slots.len() {
-            self.slots[index] = Some(CachedOpPlan::record(
-                kernel_key, alias_fp, &built, inputs, output,
-            ));
-        }
-        built
-    }
-}
-
-/// Persistent, device-wide cache of decode plans, keyed by graph size so that
-/// distinct graphs (prefill / decode / sampler) never evict one another.
+/// Persistent, device-wide cache of decode plans, keyed by the structural
+/// kernel key plus the current input/output aliasing pattern.
 pub(crate) struct DecodePlanCache {
     enabled: bool,
-    by_op_count: Mutex<FxHashMap<usize, Vec<Option<CachedOpPlan>>>>,
+    plans: Mutex<LruCache<DecodePlanCacheKey, CachedOpPlan, FxBuildHasher>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl std::fmt::Debug for DecodePlanCache {
@@ -238,7 +191,13 @@ impl DecodePlanCache {
     pub(crate) fn new() -> Self {
         Self {
             enabled: std::env::var_os("FUSOR_DISABLE_DECODE_PLAN_CACHE").is_none(),
-            by_op_count: Mutex::new(FxHashMap::default()),
+            plans: Mutex::new(LruCache::with_hasher(
+                NonZeroUsize::new(DECODE_PLAN_CACHE_SIZE)
+                    .expect("decode plan cache size must be non-zero"),
+                Default::default(),
+            )),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
@@ -246,38 +205,43 @@ impl DecodePlanCache {
         self.enabled
     }
 
-    /// Take the slot vector for a graph of `op_count` operations, sized exactly
-    /// to `op_count` (padding with empty slots / truncating as needed).
-    pub(crate) fn take(&self, op_count: usize) -> OpPlanSlots {
-        let mut slots = self
-            .by_op_count
-            .lock()
-            .remove(&op_count)
-            .unwrap_or_default();
-        slots.resize_with(op_count, || None);
-        OpPlanSlots {
-            op_count,
-            slots,
-            hits: 0,
-            misses: 0,
-        }
-    }
+    /// Return kernels for a structurally unchanged operation by rebinding a
+    /// cached template to the current token's buffers. On miss, build and cache
+    /// a new bufferless plan.
+    pub(crate) fn resolve_op(
+        &self,
+        kernel_key: KernelCacheKey,
+        inputs: &[MirValue],
+        output: &TensorData,
+        build: impl FnOnce() -> Vec<DirectKernel>,
+    ) -> Vec<DirectKernel> {
+        let alias_fp = fingerprint_aliases(inputs, output);
+        let cache_key = (kernel_key, alias_fp);
 
-    /// Return slots taken via [`take`](Self::take) to the shared cache.
-    pub(crate) fn put(&self, slots: OpPlanSlots) {
-        // Mirror the resolve host-trace gate (always on for wasm, env-gated on
-        // native) so the cache hit rate shows up alongside `resolve_host_profile`.
-        let trace =
-            cfg!(target_arch = "wasm32") || std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some();
-        if trace && (slots.hits != 0 || slots.misses != 0) {
-            tracing::info!(
-                "decode_plan_cache op_count={} hit={} miss={}",
-                slots.op_count,
-                slots.hits,
-                slots.misses
-            );
+        {
+            let mut plans = self.plans.lock();
+            if let Some(plan) = plans.get(&cache_key) {
+                let hit_total = self.hits.fetch_add(1, Ordering::Relaxed) + 1;
+                trace_cache_event(hit_total, self.misses.load(Ordering::Relaxed));
+                return plan.rebind(inputs, output);
+            }
         }
-        self.by_op_count.lock().insert(slots.op_count, slots.slots);
+
+        let miss_total = self.misses.fetch_add(1, Ordering::Relaxed) + 1;
+        trace_cache_event(self.hits.load(Ordering::Relaxed), miss_total);
+        let built = build();
+        self.plans
+            .lock()
+            .put(cache_key, CachedOpPlan::record(&built, inputs, output));
+        built
+    }
+}
+
+fn trace_cache_event(hits: u64, misses: u64) {
+    // Mirror the resolve host-trace gate (always on for wasm, env-gated on
+    // native) so the cache hit rate shows up alongside `resolve_host_profile`.
+    if cfg!(target_arch = "wasm32") || std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some() {
+        tracing::info!("decode_plan_cache hit={hits} miss={misses}");
     }
 }
 

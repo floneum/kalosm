@@ -146,8 +146,7 @@ impl Resolver {
         // Decode plan cache: reuse the per-op `build_kernel` analysis across
         // structurally-identical decode tokens, rebinding only the buffers.
         let plan_cache_enabled = device.decode_plan_cache().enabled();
-        let mut plan_slots = device.decode_plan_cache().take(queued_operation_count);
-        for (op_index, (node, queued_operation)) in queued_operations.into_iter().enumerate() {
+        for (node, queued_operation) in queued_operations {
             let operation_category = host_category_trace
                 .then(|| {
                     graph
@@ -258,8 +257,7 @@ impl Resolver {
                     let kernels = if plan_cache_enabled {
                         let kernel_key =
                             structural_kernel_key(qmatmul.as_ref(), &new_inputs, &workgroup_shape);
-                        plan_slots.resolve_op(
-                            op_index,
+                        device.decode_plan_cache().resolve_op(
                             kernel_key,
                             &new_inputs,
                             &resolved,
@@ -379,8 +377,7 @@ impl Resolver {
                 let kernels = if plan_cache_enabled {
                     let kernel_key =
                         structural_kernel_key(operation.as_ref(), &new_inputs, &workgroup_shape);
-                    plan_slots.resolve_op(
-                        op_index,
+                    device.decode_plan_cache().resolve_op(
                         kernel_key,
                         &new_inputs,
                         &resolved,
@@ -450,7 +447,6 @@ impl Resolver {
                 }
             };
         }
-        device.decode_plan_cache().put(plan_slots);
 
         let total_kernels = commands
             .iter()
