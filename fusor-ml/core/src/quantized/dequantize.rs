@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
@@ -111,6 +113,14 @@ impl DequantizeOperation {
 }
 
 impl Operation for DequantizeOperation {
+    fn hash_kernel_fields(&self, state: &mut rustc_hash::FxHasher) {
+        self.matrix.datatype().hash(state);
+        self.matrix.storage_layout().hash(state);
+        self.matrix.shape().hash(state);
+        self.datatype.hash(state);
+        self.post_dequantize.hash(state);
+    }
+
     fn workgroup_shape_constraints(
         &self,
         _device: &Device,

@@ -70,7 +70,7 @@ impl PendingGpuSampledToken {
             eprintln!("{msg}");
         }
 
-        let view = self.download.slice(..).get_mapped_range().unwrap();
+        let view = self.download.slice(..).get_mapped_range();
         let word_size = std::mem::size_of::<u32>();
         let status = view
             .get(..word_size)

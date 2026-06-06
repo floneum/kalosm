@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
@@ -185,6 +187,14 @@ fn u32_index_layout(layout: &crate::Layout) -> Option<(u32, tile_ir::Layout)> {
 }
 
 impl Operation for QEmbeddingOperation {
+    fn hash_kernel_fields(&self, state: &mut rustc_hash::FxHasher) {
+        self.matrix.datatype().hash(state);
+        self.matrix.storage_layout().hash(state);
+        self.matrix.shape().hash(state);
+        self.out_shape.hash(state);
+        self.datatype.hash(state);
+    }
+
     fn workgroup_shape_constraints(&self, _device: &Device) -> WorkgroupShapeConstraints {
         let mut constraints = WorkgroupShapeConstraints::new();
         constraints.add_constraint(0, Constraint::equals(BLOCK as u32));

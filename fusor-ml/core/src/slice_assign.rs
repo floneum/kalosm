@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{hash::Hash, ops::Range};
 
 use crate::{
     DataTypeEnum, TILE_SIZE, Tensor, TensorData,
@@ -132,6 +132,12 @@ impl SliceAssignOperation {
 }
 
 impl Operation for SliceAssignOperation {
+    fn hash_kernel_fields(&self, state: &mut rustc_hash::FxHasher) {
+        self.slices.hash(state);
+        self.input_shape.hash(state);
+        self.in_place.hash(state);
+    }
+
     fn workgroup_shape_constraints(&self, device: &crate::Device) -> WorkgroupShapeConstraints {
         titled_map_workgroup_size_constraints(&self.operation_shape(), device)
     }

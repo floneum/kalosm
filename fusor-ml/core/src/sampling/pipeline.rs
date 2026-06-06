@@ -129,7 +129,7 @@ pub(crate) async fn qmat_mirostat2_sample_token_to_host(
         #[cfg(not(target_arch = "wasm32"))]
         device.poll_wait();
         let _ = rx.await;
-        let view = hidden_dl.slice(..).get_mapped_range().unwrap();
+        let view = hidden_dl.slice(..).get_mapped_range();
         let hidden_vec: Vec<f32> = bytemuck::cast_slice(&view).to_vec();
         drop(view);
         hidden_dl.unmap();
@@ -970,7 +970,7 @@ async fn sample_processed_standard_logits_to_host(
             );
         }
 
-        let view = download.slice(..).get_mapped_range().unwrap();
+        let view = download.slice(..).get_mapped_range();
         let word_size = std::mem::size_of::<u32>();
         let status = view
             .get(..word_size)
@@ -1125,7 +1125,7 @@ async fn sample_processed_logits_to_host(
             eprintln!("sampler_trace map_wait elapsed={:?}", start.elapsed());
         }
 
-        let view = download.slice(..).get_mapped_range().unwrap();
+        let view = download.slice(..).get_mapped_range();
         let word_size = std::mem::size_of::<u32>();
         let status = view
             .get(..word_size)
@@ -1184,9 +1184,9 @@ async fn sample_processed_logits_to_host(
                     let _ = id_rx.await;
                     let _ = val_rx.await;
                     let _ = log_rx.await;
-                    let ids_view = ids_dl.slice(..).get_mapped_range().unwrap();
-                    let vals_view = values_dl.slice(..).get_mapped_range().unwrap();
-                    let logits_view = logits_dl.slice(..).get_mapped_range().unwrap();
+                    let ids_view = ids_dl.slice(..).get_mapped_range();
+                    let vals_view = values_dl.slice(..).get_mapped_range();
+                    let logits_view = logits_dl.slice(..).get_mapped_range();
                     let ids_vec: Vec<u32> = bytemuck::cast_slice(&ids_view).to_vec();
                     let vals_vec: Vec<f32> = bytemuck::cast_slice(&vals_view).to_vec();
                     let logits_vec: Vec<f32> = bytemuck::cast_slice(&logits_view).to_vec();

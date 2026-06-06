@@ -43,6 +43,9 @@ members = [
     "fusor-ml/webgpu-runner",
 ]
 
+[patch.crates-io]
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now" }
+
 [workspace.dependencies]
 kalosm = { path = "./interfaces/kalosm", version = "0.4.0", default-features = false }
 kalosm-sample = { path = "./interfaces/kalosm-sample", version = "0.4.0" }

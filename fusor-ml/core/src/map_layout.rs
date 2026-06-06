@@ -49,6 +49,8 @@ impl MapLayoutOperation {
 }
 
 impl Operation for MapLayoutOperation {
+    fn hash_kernel_fields(&self, _state: &mut rustc_hash::FxHasher) {}
+
     fn workgroup_shape_constraints(
         &self,
         _: &crate::Device,

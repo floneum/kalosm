@@ -39,7 +39,7 @@ pub(crate) trait Operation: Debug + 'static {
     /// The concrete operation type is added by `kernel_module_key_with_dispatch`;
     /// implementations only hash fields not represented by MIR inputs,
     /// dispatch, or workgroup shape.
-    fn hash_kernel_fields(&self, _state: &mut FxHasher) {}
+    fn hash_kernel_fields(&self, state: &mut FxHasher);
 
     fn kernel_module_key_with_dispatch(
         &self,

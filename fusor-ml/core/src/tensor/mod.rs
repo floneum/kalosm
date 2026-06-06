@@ -384,7 +384,7 @@ impl Tensor {
         receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
 
         // Get the mapped view
-        let view = download.slice(..).get_mapped_range().unwrap();
+        let view = download.slice(..).get_mapped_range();
         Ok(TensorSlice::new(
             MappedBuffer { view },
             tensor.layout().clone(),

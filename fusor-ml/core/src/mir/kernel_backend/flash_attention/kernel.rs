@@ -107,6 +107,16 @@ fn flash_decode_module_key_for_variant(
 }
 
 impl Operation for FlashAttentionOperation {
+    fn hash_kernel_fields(&self, state: &mut rustc_hash::FxHasher) {
+        self.out_shape.hash(state);
+        self.q_shape.hash(state);
+        self.k_shape.hash(state);
+        self.mask.is_some().hash(state);
+        self.scale.to_bits().hash(state);
+        self.input_dtype.hash(state);
+        self.causal.hash(state);
+    }
+
     fn workgroup_shape_constraints(&self, _device: &crate::Device) -> WorkgroupShapeConstraints {
         let mut constraints = WorkgroupShapeConstraints::new();
         constraints.add_constraint(0, Constraint::Equals(1));

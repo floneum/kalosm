@@ -640,7 +640,7 @@ impl Resolver {
                 device.poll_wait();
                 match receiver.recv() {
                     Ok(Ok(())) => {
-                        let view = slice.get_mapped_range().unwrap();
+                        let view = slice.get_mapped_range();
                         let timestamps = bytemuck::cast_slice::<u8, u64>(&view);
                         print_gpu_kernel_profile(
                             &dispatch_metadata,

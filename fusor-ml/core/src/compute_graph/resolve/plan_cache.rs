@@ -141,10 +141,10 @@ fn classify_buffer(
         return BufSource::Output;
     }
     for (i, input) in inputs.iter().enumerate() {
-        if let Some(input_buf) = mir_buffer(input) {
-            if Arc::ptr_eq(buffer, input_buf) {
-                return BufSource::Input(i);
-            }
+        if let Some(input_buf) = mir_buffer(input)
+            && Arc::ptr_eq(buffer, input_buf)
+        {
+            return BufSource::Input(i);
         }
     }
     BufSource::Const(buffer.clone())
@@ -201,11 +201,11 @@ impl OpPlanSlots {
     ) -> Vec<DirectKernel> {
         let alias_fp = fingerprint_aliases(inputs, output);
 
-        if let Some(Some(plan)) = self.slots.get(index) {
-            if plan.matches(kernel_key, alias_fp) {
-                self.hits += 1;
-                return plan.rebind(inputs, output);
-            }
+        if let Some(Some(plan)) = self.slots.get(index)
+            && plan.matches(kernel_key, alias_fp)
+        {
+            self.hits += 1;
+            return plan.rebind(inputs, output);
         }
 
         self.misses += 1;
@@ -285,6 +285,8 @@ impl DecodePlanCache {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
     use crate::{Device, QMatrix, Tensor};
     use fusor_gguf::GgmlType;
 
@@ -341,6 +343,19 @@ mod tests {
         let a = Tensor::new::<f32, 2, _>(device, &[[1.0f32, 2.0, 3.0, 4.0]]);
         let b = Tensor::new::<f32, 2, _>(device, &[[0.5f32, -1.0, 2.0, -0.25]]);
         read_rows(&(&a * &b)).await
+    }
+
+    async fn run_slice_assign(device: &Device, slices: [Range<usize>; 2]) -> Vec<f32> {
+        let base = Tensor::new::<f32, 2, _>(
+            device,
+            &[
+                [0.0f32, 0.0, 0.0, 0.0],
+                [0.0f32, 0.0, 0.0, 0.0],
+                [0.0f32, 0.0, 0.0, 0.0],
+            ],
+        );
+        let value = Tensor::new::<f32, 2, _>(device, &[[1.0f32, 2.0], [3.0, 4.0]]);
+        read_rows(&base.slice_assign(slices, &value)).await
     }
 
     // Exercises the `Sequence` kernel arm (scratch + reduce + write passes) with
@@ -442,6 +457,32 @@ mod tests {
 
             assert_close(&mul, &golden_mul, "generic op key: multiply after add");
             assert!(mul != add, "generic op key: multiply must not replay add");
+        });
+    }
+
+    #[test]
+    fn decode_plan_cache_distinguishes_same_shape_slice_assign_ranges() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let Ok(golden) = Device::new().await else {
+                return;
+            };
+
+            let first = run_slice_assign(&device, [0..2, 0..2]).await;
+            let second = run_slice_assign(&device, [1..3, 1..3]).await;
+            let golden_second = run_slice_assign(&golden, [1..3, 1..3]).await;
+
+            assert_close(
+                &second,
+                &golden_second,
+                "slice_assign key: shifted range after top-left range",
+            );
+            assert!(
+                second != first,
+                "slice_assign key: shifted range must not replay top-left range"
+            );
         });
     }
 }

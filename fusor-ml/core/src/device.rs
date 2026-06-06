@@ -78,7 +78,6 @@ async fn select_adapter(
                 power_preference,
                 force_fallback_adapter: false,
                 compatible_surface: None,
-                apply_limit_buckets: false,
             })
             .await
         {
@@ -646,7 +645,7 @@ mod dirty_buffer_tests {
                 }
             }
 
-            let view = buffer.slice(..).get_mapped_range().unwrap();
+            let view = buffer.slice(..).get_mapped_range();
             assert_eq!(&*view, &[1, 2, 3, 4]);
             drop(view);
             buffer.unmap();
@@ -692,7 +691,7 @@ mod dirty_buffer_tests {
                 });
             device.poll_wait();
             receiver.await.unwrap().unwrap();
-            let view = download.slice(..).get_mapped_range().unwrap();
+            let view = download.slice(..).get_mapped_range();
             let bytes: &[u8] = &view;
             let poison = bytes.iter().filter(|b| **b == 0xCD).count();
             assert_eq!(
