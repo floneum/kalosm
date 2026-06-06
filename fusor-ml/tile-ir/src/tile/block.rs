@@ -337,7 +337,7 @@ impl TileBlock<'_> {
     }
 
     /// Unstructured loop with a data-dependent exit. Use `break_loop` /
-    /// `break_if` inside to exit. Retained verbatim (ARBOR_DESIGN.md §5).
+    /// `break_if` inside to exit.
     pub fn loop_forever(&mut self, body: impl FnOnce(&mut Self)) {
         self.stmt_stack.push(Vec::new());
         body(self);
@@ -367,7 +367,7 @@ impl TileBlock<'_> {
     }
 
     /// Counted loop over `0..count` with no carried accumulators. The body
-    /// receives the loop index. Replaces the old `while_true`.
+    /// receives the loop index.
     pub fn loop_range(&mut self, count: u32, body: impl FnOnce(&mut Self, Tile)) {
         assert!(count > 0, "loop_range count must be non-zero");
         let index = self.program.alloc_local(ElementType::U32);

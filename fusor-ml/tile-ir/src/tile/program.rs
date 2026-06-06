@@ -13,10 +13,9 @@ use crate::ir::{
 /// tile program body. Most callers construct one through
 /// [`build`](crate::tile::build).
 ///
-/// Runtime-typed (ARBOR_DESIGN.md §2): storage / tile / local declarations carry
-/// an [`ElementType`] as data, not a marker type. The five old `next_*` counters
-/// collapse to one `next_binding` — tiles and locals are `Rc`-identified, so the
-/// only externally-meaningful name left is the buffer binding slot.
+/// Storage, tile, and local declarations carry an [`ElementType`] as data.
+/// Tiles and locals are `Rc`-identified, so the only externally meaningful
+/// name is the buffer binding slot.
 pub struct Program {
     pub(crate) ir: KernelIr,
     /// Builder-only counter for fresh buffer binding slots. Lives here (not on
@@ -150,10 +149,8 @@ impl Program {
     /// Emit a tile-program body over a dispatch grid with a runtime `block`
     /// (workgroup invocation) count.
     ///
-    /// `block` is a runtime `u32`, not a const generic (ARBOR_DESIGN.md §5): the
-    /// lowerer bakes it as a shader-compile-time `@workgroup_size`, so the
-    /// emitted Naga and the kernel cache key are unchanged versus the old
-    /// `program_grid::<BLOCK>`.
+    /// The lowerer bakes `block` as a shader-compile-time `@workgroup_size`,
+    /// so it participates in the emitted Naga and kernel cache key.
     pub fn program_grid(
         &mut self,
         block: u32,

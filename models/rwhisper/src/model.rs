@@ -359,7 +359,8 @@ impl Decoder {
                         attention_output.as_deref_mut(),
                     )?;
 
-                    // The quantized model caches tokens so we can remove any old tokens
+                    // The quantized model caches tokens, so the queued tokens
+                    // have been consumed.
                     queued_tokens.clear();
                     result
                 }

@@ -41,11 +41,8 @@ mod selection_tests {
         }
     }
 
-    fn ctx(format: tile_ir::GgmlQuantFormat, y_supports_coop: bool) -> QMatmulDirectCtx {
-        QMatmulDirectCtx {
-            format,
-            y_supports_coop,
-        }
+    fn ctx(format: tile_ir::GgmlQuantFormat) -> QMatmulDirectCtx {
+        QMatmulDirectCtx { format }
     }
 
     const fn qtile(bm: u32, bn: u32) -> CoopTile {
@@ -59,13 +56,13 @@ mod selection_tests {
         let cases = [
             (
                 QMatmulPath::Q5SmallSingleRow,
-                ctx(tile_ir::GgmlQuantFormat::Q5_0, false),
+                ctx(tile_ir::GgmlQuantFormat::Q5_0),
                 caps(false),
             ),
-            (QMatmulPath::SingleRow, ctx(q4, false), caps(false)),
+            (QMatmulPath::SingleRow, ctx(q4), caps(false)),
             (
                 QMatmulPath::Q8Wide(qtile(64, 128)),
-                ctx(tile_ir::GgmlQuantFormat::Q8_0, true),
+                ctx(tile_ir::GgmlQuantFormat::Q8_0),
                 caps(true),
             ),
             (
@@ -73,7 +70,7 @@ mod selection_tests {
                     tile: qtile(128, 128),
                     cached: false,
                 },
-                ctx(q4, true),
+                ctx(q4),
                 caps(true),
             ),
             (
@@ -81,7 +78,7 @@ mod selection_tests {
                     tile: qtile(128, 64),
                     cached: false,
                 },
-                ctx(q4, true),
+                ctx(q4),
                 caps(false),
             ),
             (
@@ -89,7 +86,7 @@ mod selection_tests {
                     tile: qtile(64, 128),
                     cached: false,
                 },
-                ctx(q4, true),
+                ctx(q4),
                 caps(false),
             ),
             (
@@ -97,7 +94,7 @@ mod selection_tests {
                     tile: qtile(64, 64),
                     cached: true,
                 },
-                ctx(q4, true),
+                ctx(q4),
                 caps(false),
             ),
             (
@@ -105,10 +102,10 @@ mod selection_tests {
                     tile: qtile(64, 64),
                     cached: false,
                 },
-                ctx(q4, true),
+                ctx(q4),
                 caps(false),
             ),
-            (QMatmulPath::Workgroup, ctx(q4, false), no_coop_caps(false)),
+            (QMatmulPath::Workgroup, ctx(q4), no_coop_caps(false)),
         ];
         assert_selector_generates(&selector, cases);
     }
@@ -119,8 +116,15 @@ mod selection_tests {
         let shape = KernelShape::new([128, 4096, 5120]);
         let q4k = tile_ir::GgmlQuantFormat::Q4K;
         assert_eq!(
-            selector.select(shape, &ctx(q4k, true), no_coop_caps(true)),
+            selector.select(shape, &ctx(q4k), no_coop_caps(true)),
             Some(QMatmulPath::Workgroup)
+        );
+        assert_eq!(
+            selector.select(shape, &ctx(q4k), caps(true)),
+            Some(QMatmulPath::Tile {
+                tile: qtile(128, 128),
+                cached: false
+            })
         );
         assert!(!qmatmul_coop_supported(no_coop_caps(true)));
         assert_eq!(
@@ -157,7 +161,7 @@ mod selection_tests {
         assert_eq!(
             selector.select(
                 KernelShape::new([1, 4096, 8192]),
-                &ctx(tile_ir::GgmlQuantFormat::Q4K, false),
+                &ctx(tile_ir::GgmlQuantFormat::Q4K),
                 caps,
             ),
             Some(QMatmulPath::SingleRow)
@@ -165,7 +169,7 @@ mod selection_tests {
         assert_eq!(
             selector.select(
                 KernelShape::new([1, 4096, 8192]),
-                &ctx(tile_ir::GgmlQuantFormat::Q4K, false),
+                &ctx(tile_ir::GgmlQuantFormat::Q4K),
                 no_subgroup_caps(false),
             ),
             Some(QMatmulPath::Workgroup)
@@ -256,7 +260,7 @@ mod selection_tests {
         let k = 4096;
         let n = 4096;
         let supported = |caps, max_workgroups| {
-            let variant = select_qmatmul_direct_variant(format, m, k, n, false, caps);
+            let variant = select_qmatmul_direct_variant(format, m, k, n, caps);
             qmatmul_custom_accumulator_offsets_supported(
                 format,
                 variant,

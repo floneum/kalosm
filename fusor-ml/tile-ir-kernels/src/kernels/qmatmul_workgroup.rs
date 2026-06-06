@@ -11,17 +11,15 @@
 //! `workgroup_barrier()`. They're cooperative across the workgroup, never
 //! the subgroup.
 //!
-//! Runtime-typed (ARBOR_DESIGN.md §2): the storage / staging element types
-//! travel as [`ScalarElement`] data through [`AccumCast`] rather than Rust
-//! marker generics. The bodies share three building blocks:
+//! Storage and staging element types travel as [`ScalarElement`] data through
+//! [`AccumCast`]. The bodies share three building blocks:
 //! - [`stage_storage_tile_with_pre`] — cooperative per-lane staging of a dense
 //!   source into a workgroup tile, applying the optional pre-activation
 //!   epilogue per element. Used for A in both kernels.
 //! - [`TileBlock::fill_tile_quantized`] — per-lane dequantize-into-workgroup-
-//!   tile for B (lowers to the same `Stmt::FillTile` quant copy as the old
-//!   `copy_quant_to_tile`, and is **not** coop-forcing — preserving the
-//!   lavapipe invariant that this kernel requests neither `SUBGROUP` nor
-//!   `COOPERATIVE_MATRIX`).
+//!   tile for B. This path is not coop-forcing, preserving the lavapipe
+//!   invariant that this kernel requests neither `SUBGROUP` nor
+//!   `COOPERATIVE_MATRIX`.
 //! - [`accumulate_register_tile_from_workgroup`] — per-lane register
 //!   accumulation reading both staged tiles. Parameterized over the register
 //!   tile shape (`tm`, `tn`), so the matmul body uses 4x4 and the gemv body

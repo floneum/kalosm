@@ -297,8 +297,8 @@ fn assert_flash_attention_case(
 /// Exercises the decode-small direct kernel. Cases up to 1024 use a single
 /// workgroup; longer cases use the split partial/reduce path.
 ///
-/// Earlier Qwen-3B coverage kept the 569-token shape because that was the
-/// first observed race in the old 128-wide tiled path.
+/// The 569-token shape covers a previously observed race in the 128-wide tiled
+/// path.
 ///
 /// Each shape is run multiple times because earlier decode failures were
 /// non-deterministic workgroup-memory races.
@@ -306,7 +306,7 @@ pub fn flash_attention_decode_tiled_matches_cpu_reference() -> AssertionCases {
     // (num_heads, num_kv_heads, kv_seq_len)
     // Shapes specifically chosen to stress decode block boundaries and the
     // tiled flash_decode_small_block path. head_dim=128 forces the decode-small
-    // kernel; kv_seq_len spans the old 128-wide tiled failure cases and values
+    // kernel; kv_seq_len spans 128-wide tiled failure cases and values
     // beyond the largest 1024-wide block.
     let shapes = [
         (16, 2, 129),  // just past one full tile
@@ -667,7 +667,7 @@ pub fn flash_attention_with_kv_cache_matches_cpu_reference_on_varied_shapes() ->
     .into_iter()
     .map(|case| {
         // No-op mask exercises the KV-cache path through the QKMask code with
-        // an all-zero mask, mirroring the pre-migration test.
+        // an all-zero mask.
         let mask = vec![0.0f32; case.q_seq_len * case.kv_seq_len];
         let shape = [case.q_seq_len, case.kv_seq_len];
         assert_flash_attention_case(

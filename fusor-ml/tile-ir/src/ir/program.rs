@@ -4,10 +4,9 @@ use crate::{LowerError, NagaKernel};
 /// A typed kernel IR emitted by the tile builder.
 ///
 /// The IR is a self-contained tree: declarations are `Rc`-owned at their use
-/// sites, so there are no `*Id` newtypes (see ARBOR_DESIGN.md §3). Buffers are
-/// also retained in declaration order so runtime binding lists produced by
-/// [`crate::KernelBuilder`] stay aligned even when a declared storage is
-/// optimized out of the body.
+/// sites. Buffers are also retained in declaration order so runtime binding
+/// lists produced by [`crate::KernelBuilder`] stay aligned even when a declared
+/// storage is optimized out of the body.
 #[derive(Clone, Debug)]
 pub struct KernelIr {
     /// Storage declarations in builder declaration order.
@@ -115,10 +114,8 @@ pub enum Stmt {
         reject: Vec<Stmt>,
     },
     /// One loop node, two forms:
-    /// - `count: Some(..)` => counted (subsumes the old `Fold` +
-    ///   `FoldAccumulator` + `while_true`), iterating `0..count` into `index`.
-    /// - `count: None` => unstructured (subsumes `loop_forever`); body may
-    ///   contain `Break`/`Return`.
+    /// - `count: Some(..)` => counted, iterating `0..count` into `index`.
+    /// - `count: None` => unstructured; body may contain `Break`/`Return`.
     Loop {
         /// Iteration count, or `None` for an unstructured loop.
         count: Option<Expr>,

@@ -233,8 +233,8 @@ pub struct QmatmulEpilogues<'a> {
     pub post_accumulator_offsets: &'a [u32],
     /// Optional rank-1 vector that is added to the accumulator before the
     /// cooperative store. This is a lowering choice for expressions whose
-    /// post-op can be represented as `acc + column_vector`. Runtime-typed
-    /// (ARBOR_DESIGN.md §2): the rank/element travel in the `Storage` view.
+    /// post-op can be represented as `acc + column_vector`; the rank and
+    /// element type are carried by the `Storage` view.
     pub post_acc_init_col_vector: Option<&'a Storage>,
 }
 

@@ -138,10 +138,10 @@ impl NaryOperation {
 }
 
 /// Map a [`DataTypeEnum`] to the runtime tile-ir element type. Used to carry
-/// the element type of a `ValueTile`/`Storage2` now that the tile-ir API is
-/// runtime-typed (ARBOR_DESIGN.md §2): the `Tile`/`Storage` values are
-/// non-generic and the element travels in the IR, so the `ValueTile`/`Storage2`
-/// tag exists only to drive the cast/load/store routing below.
+/// the element type of a `ValueTile`/`Storage2`. The `Tile`/`Storage` values
+/// are non-generic and the element travels in the IR, so the
+/// `ValueTile`/`Storage2` tag exists only to drive the cast/load/store routing
+/// below.
 pub(crate) fn datatype_element(datatype: DataTypeEnum) -> tile_ir::ElementType {
     match datatype {
         DataTypeEnum::F32 => tile_ir::ElementType::F32,

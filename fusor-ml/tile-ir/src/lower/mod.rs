@@ -110,8 +110,8 @@ impl std::error::Error for LowerError {}
 
 /// Demand-allocated private scratch local kinds. Locals are interned lazily by
 /// `(ScratchKind, ElementType, depth)`; each distinct key allocates exactly one
-/// `LocalVariable`, preserving the local count (which only drops, never grows)
-/// from the old eagerly-allocated `ScratchLocals`.
+/// `LocalVariable`, so scratch allocation only creates locals that are actually
+/// used.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub(super) enum ScratchKind {
     /// The counted/unstructured loop index (`u32`).

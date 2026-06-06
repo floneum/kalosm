@@ -19,10 +19,10 @@ impl<'a> Lowerer<'a> {
             width: 2,
         };
 
-        // The prelude types are created in the same fixed order the old lowerer
-        // used so the module's type arena is byte-identical. The interner is
-        // then pre-populated with them; coop-matrix and array types are added on
-        // demand below the `Expr -> Handle` boundary.
+        // The prelude types are created in a fixed order so the module's type
+        // arena is deterministic. The interner is then pre-populated with them;
+        // coop-matrix and array types are added on demand below the
+        // `Expr -> Handle` boundary.
         let mut types: FxHashMap<ElementType, Handle<Type>> = FxHashMap::default();
 
         let f32_ty = Self::scalar_type(&mut module, Scalar::F32);
@@ -66,9 +66,9 @@ impl<'a> Lowerer<'a> {
             types.insert(ElementType::vector(ScalarElement::F16, 4), f16_vec4_ty);
         }
 
-        // Cooperative-matrix types are created up front (same arena position as
-        // the old `create_coop_matrix_types`): walk the program locals in
-        // first-use order and intern each distinct coop element exactly once.
+        // Cooperative-matrix types are created up front: walk the program
+        // locals in first-use order and intern each distinct coop element
+        // exactly once.
         for local in &analysis.locals {
             let element = local.element;
             if matches!(element, ElementType::CoopMatrix { .. }) && !types.contains_key(&element) {
@@ -194,10 +194,9 @@ impl<'a> Lowerer<'a> {
             arguments,
             ..Function::default()
         };
-        // Private tiles and program locals are appended first (matching the old
-        // declaration-order prefix); scratch is demand-allocated into the same
-        // arena during body lowering. The arena is moved into the function once
-        // lowering is done.
+        // Private tiles and program locals are appended before scratch, which
+        // is demand-allocated into the same arena during body lowering. The
+        // arena is moved into the function once lowering is done.
         self.create_private_locals()?;
         self.create_program_private_locals()?;
 
@@ -244,14 +243,10 @@ impl<'a> Lowerer<'a> {
     }
 
     fn create_storage_globals(&mut self) -> Result<(), LowerError> {
-        // Buffers are emitted in declaration order; the IR is a tree, so the
-        // canonical order is the analysis-discovered set. The builder assigns
-        // `binding` incrementally at creation time, so declaration order *is*
-        // ascending `binding` order — sort by it to reproduce the old
-        // declaration-order arena exactly, independent of which kernel happens
-        // to touch which buffer first (first-use order diverges from creation
-        // order for e.g. multi-iteration qgemv folds whose loop body reads `a`
-        // but whose accumulator update reads the weights `b`).
+        // Buffers are emitted in declaration order. The builder assigns
+        // `binding` incrementally at creation time, so sorting by binding keeps
+        // the global-variable arena independent of which kernel touches which
+        // buffer first.
         let mut buffers = self.collect_buffers();
         buffers.sort_by_key(|buffer| buffer.binding);
         for buffer in &buffers {

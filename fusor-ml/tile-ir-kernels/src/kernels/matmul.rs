@@ -65,8 +65,8 @@ impl DenseMatmulTile {
 
 /// Direct storage bindings for dense matrix multiplication kernels.
 ///
-/// Runtime-typed (ARBOR_DESIGN.md §2): the storage element travels in each
-/// [`Storage`] view, so this bundle is no longer generic over a marker type.
+/// The storage element travels in each [`Storage`] view, so this bundle is not
+/// generic over element type.
 #[derive(Clone, Copy)]
 pub struct DenseMatmulTensors<'a> {
     pub a: &'a Storage,
@@ -108,9 +108,7 @@ impl CoopTileEntry {
 /// The accumulator element for every dense matmul kernel is F32. The storage
 /// element (F32 or F16) travels in the [`Storage`] view; the runtime
 /// [`AccumCast`] inserts the F16↔F32 cast pair on load/store and is the
-/// identity for F32 storage — so the F32 path stays byte-identical to the
-/// former F32-only body and the F16 path subsumes the former
-/// `*_f16_accum_f32_*` variants.
+/// identity for F32 storage.
 fn accum_cast(storage: ScalarElement) -> AccumCast {
     AccumCast::new(storage, ScalarElement::F32)
 }
@@ -121,8 +119,7 @@ fn accum_cast(storage: ScalarElement) -> AccumCast {
 /// The storage element (F32 or F16) is recovered at runtime from the bound
 /// [`Storage`] views; accumulation is in F32 via the [`AccumCast`], which
 /// inserts the F16→F32 cast on load and F32→F16 cast on store. F32 storage has
-/// identity casts and matches the original F32-only body bit-for-bit; F16
-/// storage subsumes the former `batched_gemv_f16_accum_f32_with_epilogues`.
+/// identity casts.
 ///
 /// Each subgroup computes one output row. Lanes cooperatively walk K in
 /// `VALUES_PER_LANE` chunks and then reduce the partial sums inside the
@@ -230,9 +227,7 @@ pub fn batched_gemv_with_epilogues(
 
 /// Batched dense matmul over flattened direct views. The storage element
 /// (F32 or F16) is recovered at runtime from the bound [`Storage`] views;
-/// accumulation is in F32 via the [`AccumCast`]. F32 storage matches the
-/// original F32-only body; F16 storage subsumes the former
-/// `batched_matmul_f16_accum_f32_with_epilogues`.
+/// accumulation is in F32 via the [`AccumCast`].
 /// A is `[batch * m, k]`, B is `[batch * k, n]`, Y is `[batch * m, n]`.
 pub fn batched_matmul_with_epilogues(
     program: &mut Program,
@@ -351,12 +346,9 @@ pub fn batched_matmul_with_epilogues(
                 }
                 program.workgroup_barrier();
 
-                // Byte-identical to the original `loop_fold_n(Sum, …)` shape:
-                // each chunk starts from a fresh `0.0` base (NOT the carried
-                // accumulator), is bound to a local, and the carry-add wraps
-                // the bound value as `acc + chunk` — exactly the `Add(LoadLocal
-                // (acc), chunk)` the old fold framework emitted (ARBOR_DESIGN.md
-                // §7: the new `fold` body returns the full update expression).
+                // Each chunk starts from a fresh `0.0` base, is bound to a
+                // local, and is added to the carried accumulator after the
+                // per-chunk dot is complete.
                 let chunk_sums: Vec<_> = (0..outs as u32)
                     .map(|idx| {
                         let r = idx / tn;
@@ -407,8 +399,7 @@ pub fn batched_matmul_with_epilogues(
 /// Batched dense matmul fallback for partial tiles. This keeps the 4x4
 /// register tile but reads directly from storage so skinny/edge shapes avoid
 /// workgroup-tile corner cases. The storage element (F32 or F16) is recovered
-/// at runtime from the bound [`Storage`] views with F32 accumulation; subsumes
-/// the former `*_f16_accum_f32_register_*` variant.
+/// at runtime from the bound [`Storage`] views with F32 accumulation.
 pub fn batched_matmul_register_with_epilogues(
     program: &mut Program,
     a: &Storage,
@@ -678,10 +669,8 @@ pub fn try_batched_coop_matmul(
 }
 
 /// Stage one `BK`-tile of A and B into `a_tile`/`b_tile`, barrier, then run the
-/// `kk` MMA sweep into the accumulator grid. Folds the three structurally
-/// identical staged-load→barrier→MMA bodies (single-buffer, K-pair half 0/1,
-/// odd-K epilogue) into one (ARBOR_DESIGN.md §7). The caller decides the
-/// trailing barrier — the K-pair shape elides it between halves.
+/// `kk` MMA sweep into the accumulator grid. The caller decides the trailing
+/// barrier; the K-pair shape elides it between halves.
 #[allow(clippy::too_many_arguments)]
 fn coop_stage_and_mma(
     program: &mut TileBlock<'_>,

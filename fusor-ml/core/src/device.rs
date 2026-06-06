@@ -393,12 +393,27 @@ impl Device {
         ))
     }
 
+    /// Apple-silicon GPUs always execute 32-wide SIMD-groups, but wgpu/Metal
+    /// advertises the conservative MSL range (`min` 4, `max` 64) because the
+    /// exact width is only resolved at pipeline reflection time. Reporting that
+    /// range makes the subgroup-size-aware kernels treat the device as having a
+    /// variable subgroup width, which disables the qgemv ggml fast path
+    /// (`supports_lanes_per_item`) and the cooperative-matrix tiles
+    /// (`is_fixed`). Pinning the true fixed width of 32 keeps those fast routes
+    /// available.
+    fn apple_fixed_subgroup_size(&self) -> Option<u32> {
+        let info = self.inner.adapter.get_info();
+        (info.backend == wgpu::Backend::Metal && info.name.starts_with("Apple")).then_some(32)
+    }
+
     pub fn min_subgroup_size(&self) -> u32 {
-        self.inner.adapter.get_info().subgroup_min_size
+        self.apple_fixed_subgroup_size()
+            .unwrap_or_else(|| self.inner.adapter.get_info().subgroup_min_size)
     }
 
     pub fn max_subgroup_size(&self) -> u32 {
-        self.inner.adapter.get_info().subgroup_max_size
+        self.apple_fixed_subgroup_size()
+            .unwrap_or_else(|| self.inner.adapter.get_info().subgroup_max_size)
     }
 
     pub(crate) fn backend(&self) -> wgpu::Backend {
@@ -506,34 +521,6 @@ impl Device {
 #[cfg(test)]
 mod dirty_buffer_tests {
     use super::*;
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn probe_subgroup_sizes() {
-        pollster::FutureExt::block_on(async {
-            let Ok(device) = Device::new().await else {
-                eprintln!("PROBE: no device");
-                return;
-            };
-            let info = device.inner.adapter.get_info();
-            let min = device.min_subgroup_size();
-            let max = device.max_subgroup_size();
-            eprintln!(
-                "PROBE backend={:?} name={:?} subgroups_supported={} min={} max={} fixed_width={:?}",
-                info.backend,
-                info.name,
-                device.subgroups_supported(),
-                min,
-                max,
-                device.fixed_width_subgroup_size(),
-            );
-            eprintln!(
-                "PROBE q4k_lanes8_ok={} q6k_lanes16_ok={}",
-                min >= 8 && min % 8 == 0 && max % 8 == 0,
-                min >= 16 && min % 16 == 0 && max % 16 == 0,
-            );
-        });
-    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]

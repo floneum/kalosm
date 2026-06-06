@@ -7,8 +7,8 @@ use super::{
 };
 
 /// The per-workgroup softmax statistics produced by [`workgroup_softmax_block`].
-/// Runtime-typed (ARBOR_DESIGN.md §2): every tile carries its `ElementType` as
-/// data — these are all F32 accumulators.
+/// Every tile carries its `ElementType` as data; these values are all F32
+/// accumulators.
 #[derive(Clone)]
 pub(super) struct WorkgroupSoftmaxBlock {
     pub max: Tile,
@@ -25,13 +25,8 @@ fn neg_max_fill(element: ElementType) -> TileLiteral {
     }
 }
 
-/// The runtime block dispatch (ARBOR_DESIGN.md §5): the old `softmax`/
-/// `softmax_partials`/`softmax_reduce`/`softmax_write` each had a 4-way
-/// `match meta.block { 128 | 512 | 1024 => ..::<BLOCK>, _ => None }`. The block
-/// is now a runtime `u32`, so the only thing the match guarded — rejecting
-/// unsupported sizes before `program_grid` asserts on them — survives as this
-/// predicate. `program_grid` bakes `block` into `@workgroup_size`, so the
-/// emitted Naga and cache key are identical to the monomorphized version.
+/// Accept the block sizes supported by the softmax kernels before
+/// `program_grid` bakes `block` into `@workgroup_size`.
 fn supported_block(block: u32) -> bool {
     matches!(block, 128 | 512 | 1024)
 }

@@ -3,9 +3,8 @@ use fusor_tile_ir::{CoopMatrixToken, ElementType, ScalarElement, TileLiteral};
 
 use crate::types::QmatmulExtra;
 
-/// Storage-side conversion to/from an accumulator element type. Runtime-typed
-/// (ARBOR_DESIGN.md §2): the storage and accumulator elements are
-/// [`ScalarElement`] data, not Rust marker types. The `F32 -> F32` /
+/// Storage-side conversion to/from an accumulator element type. The storage and
+/// accumulator elements are [`ScalarElement`] data. The `F32 -> F32` /
 /// `F16 -> F16` cases are identity; the `F16 -> F32` case inserts the cast
 /// pair that lets F16 storage be loaded into F32 accumulators and stored back.
 /// Used by the unified `batched_matmul_with_epilogues` / `batched_gemv_*`
@@ -270,11 +269,10 @@ const COOP_DIM: u32 = 8;
 
 /// Allocate a `rows x cols` grid of cooperative accumulators, initializing each
 /// cell from `init`. The init closure receives `(program, grid_row, grid_col)`
-/// and returns the coop-`C` value to seed the accumulator — `coop_zero(..)` for
+/// and returns the coop-`C` value to seed the accumulator: `coop_zero(..)` for
 /// the zero-init case, or a `coop_load_c_broadcast(..)` fragment for the
-/// preloaded-C case. Folds the old `zero_coop_acc_grid` + `coop_set_c_grid` into
-/// one shape (ARBOR_DESIGN.md §4: accumulators are mutable locals seeded through
-/// `store_local_coop`).
+/// preloaded-C case. Each accumulator is a mutable local seeded through
+/// `store_local_coop`.
 pub(super) fn coop_acc_grid<Init>(
     program: &mut TileBlock<'_>,
     coop: CoopMatrixToken,
@@ -316,9 +314,8 @@ pub(super) fn zero_coop_acc_grid(
 
 /// Allocate a `rows x cols` grid of cooperative accumulators seeded from a
 /// rank-1 column vector: every accumulator in grid-column `c` is initialized
-/// from the C-role broadcast fragment at `col_base + c * 8`. Folds the old
-/// `zero_coop_acc_grid` + `coop_load_c_broadcast_fragments` + `coop_set_c_grid`
-/// trio into one call (ARBOR_DESIGN.md §4) — the qmatmul "preloaded C" path.
+/// from the C-role broadcast fragment at `col_base + c * 8`. This is the
+/// qmatmul preloaded-C path.
 pub(super) fn coop_acc_grid_set_c(
     program: &mut TileBlock<'_>,
     coop: CoopMatrixToken,
@@ -415,8 +412,7 @@ pub(super) fn coop_load_c_broadcast_fragments(
 
 /// MMA every `a_frag` × `b_frag` pair into the matching accumulator. Each cell
 /// emits `store_local_coop(acc, coop_mma(a, b, load_local_coop(acc)))`, which
-/// the lowerer threads through the coop acc-value SSA memo
-/// (ARBOR_DESIGN.md §6).
+/// the lowerer threads through the coop acc-value SSA memo.
 pub(super) fn coop_mma_grid(
     program: &mut TileBlock<'_>,
     coop: CoopMatrixToken,

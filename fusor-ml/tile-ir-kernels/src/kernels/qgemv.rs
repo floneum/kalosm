@@ -1,9 +1,7 @@
 //! Quantized GEMV program kernels.
 //!
-//! Runtime-typed port: the const-generic markers (`Storage<F32, 2>` /
-//! `Tile<U32>` / `program_grid::<BLOCK>`) are gone — every handle carries its
-//! [`fusor_tile_ir::ElementType`] / dims as data and the workgroup `block` is a
-//! runtime `u32`.
+//! Storage, tile, and workgroup handles carry their
+//! [`fusor_tile_ir::ElementType`], dimensions, and block sizes as runtime data.
 //!
 //! The over-fused multi-format `QuantizedDot` op surface (the
 //! `q{4,6}k_block` GGML fused dots) was removed from the IR. The composable
@@ -310,15 +308,13 @@ pub(crate) fn qgemv_tile_with_epilogue(
 /// so the selection stays in the kernel rather than the lowerer.
 ///
 /// `F32Vec` and `BlockThenDot4` both dequantize the block to f32 and compose
-/// [`dot4_sum`] (the over-fused `f32_activations_vec` builder lowered
-/// identically to dequant+dot4, so they are folded together). `Q8Vec` is the
-/// irreducible Q8 DP4a path — it keeps the weights quantized and emits
-/// `Dot4I8Packed` via [`quantized_dot_q8`](TileBlock::quantized_dot_q8), which
-/// `Dequantize` + `dot4_sum` cannot express.
+/// [`dot4_sum`]. `Q8Vec` is the irreducible Q8 DP4a path: it keeps the weights
+/// quantized and emits `Dot4I8Packed` via
+/// [`quantized_dot_q8`](TileBlock::quantized_dot_q8), which `Dequantize` +
+/// `dot4_sum` cannot express.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum QgemvDot {
-    /// Dequantize the block and dot against the f32 activation vector (folds
-    /// into `BlockThenDot4` — byte-identical lowering).
+    /// Dequantize the block and dot against the f32 activation vector.
     F32Vec,
     /// Q8 DP4a dot against int8-packed activations, weights kept quantized.
     Q8Vec,
@@ -672,8 +668,7 @@ fn qgemv_q4k_ggml(
 /// DP4a dot ([`quantized_dot_q8`](TileBlock::quantized_dot_q8)) — the fast path
 /// that `Dequantize` + [`dot4_sum`] cannot express. The `F32Vec` and
 /// `BlockThenDot4` paths both dequantize the block to f32 and compose
-/// [`dot4_sum`]: `f32_activations_vec` lowered identically to dequant+dot4, so
-/// folding them together is byte-identical (verified by the qgemv goldens).
+/// [`dot4_sum`].
 #[allow(clippy::too_many_arguments)]
 fn qgemv_dot_part(
     program: &mut TileBlock<'_>,

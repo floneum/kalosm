@@ -184,7 +184,7 @@ const QMATMUL_COOP_TILE_TABLE: &[(u32, u32, u32, u32, u32)] = &[
 /// `acc_init` is the optional rank-1 column vector seeding the accumulator
 /// before the K-loop (the "preloaded C" path). The `block` workgroup size is a
 /// runtime `u32` threaded straight into `qmatmul_coop` — no const-generic
-/// monomorphization, no `match block` fan-out (ARBOR_DESIGN.md §5, Appendix A).
+/// monomorphization and no `match block` fan-out.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qmatmul_try_coop(
     program: &mut Program,
@@ -225,10 +225,8 @@ pub(crate) fn qmatmul_try_coop(
 /// tile via an interleaved `ROW_GROUPS x COL_GROUPS` grid of subgroups, each
 /// holding `(32*32)/(8*8)` = 16 cooperative-matrix accumulators.
 ///
-/// `acc_init` folds into the accumulator's initial value (Appendix A.2): when
-/// `Some`, each accumulator is seeded with the broadcast C-role fragment from
-/// the column vector instead of zero — replacing the separate
-/// `coop_load_c_broadcast` + `coop_set_c` pass of the old `*_acc_init` body.
+/// When `acc_init` is `Some`, each accumulator is seeded with the broadcast
+/// C-role fragment from the column vector instead of zero.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qmatmul_coop(
     program: &mut Program,

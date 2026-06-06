@@ -25,8 +25,8 @@ fn sequential_resolve_reuses_shared_ancestor() {
 
         // Sequential resolve(a) then resolve(b) sharing intermediate `x`. We drop
         // the user-facing `x` handle so its node is only kept alive by the
-        // descendants — exactly the case where the old freeing predicate would
-        // throw the buffer away and force `b.resolve()` to recompute.
+        // descendants; this must not throw the buffer away and force
+        // `b.resolve()` to recompute.
         let (a_kernels, b_kernels) = {
             let x = build_matmul_intermediate(&device);
             let a = x.sin();
@@ -128,9 +128,8 @@ fn deep_lazy_chain_frees_intermediates_during_resolve() {
         };
 
         // Build a multi-branch lazy graph N layers deep, holding only the
-        // final tensor. This mimics the qwen-vision blow-up pattern
-        // (each layer multiplies node count via fan-out and recombination)
-        // the `FLUSH_EVERY = 4` workaround used to handle.
+        // final tensor. This mimics the qwen-vision blow-up pattern, where each
+        // layer multiplies node count via fan-out and recombination.
         const STEPS: usize = 4;
         let mut h = build_intermediate(&device);
         for _ in 0..STEPS {

@@ -2,9 +2,8 @@
 //! when the kernels split landed. `tile-ir`'s grid.rs still owns the generic
 //! `tile::build` entry point.
 //!
-//! Runtime-typed (ARBOR_DESIGN.md §2): the const-generic markers
-//! (`Tile<U32>` / `Storage<F32, 2>` / `compose_vector::<F32, 4>`) are gone —
-//! values carry their [`ScalarElement`] as data.
+//! Tile and storage values carry their [`ScalarElement`] at runtime, so grid
+//! helpers stay generic over element choices without Rust marker types.
 
 use fusor_tile_ir::tile::{Mask, Storage, Tile, TileBlock};
 use fusor_tile_ir::{ScalarElement, SubgroupToken, TileLiteral, WorkgroupAxis};

@@ -43,7 +43,7 @@ pub const fn flash_tiled_outputs_per_workgroup(subgroup_size: u32) -> u32 {
 /// Build a streaming flash-attention kernel for F32 or F16 tensors.
 ///
 /// `element` is the runtime storage element (F32 or F16); the accumulator math
-/// is always F32 (ARBOR_DESIGN.md §2 — element is data, not a marker type).
+/// is always F32.
 ///
 /// `subgroup_size` must match the runtime hardware subgroup width on the
 /// target device — the kernel layout assigns one subgroup per output dim and

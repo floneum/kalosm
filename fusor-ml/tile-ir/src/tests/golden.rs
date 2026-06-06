@@ -10,9 +10,9 @@
 //! It compares the **types arena, global_variables and the function expression
 //! arena + body statement tree** — i.e. everything the builder shapes — but
 //! canonicalizes the `local_variables` arena and `LocalVariable([n])` handle
-//! numbering. Per ARBOR_DESIGN.md §9(1) (the gap-7/13 note) the demand-scratch
-//! lowerer is permitted to renumber/reorder locals; the gate must compare
-//! structure and expression-arena order, not byte-identical local handles.
+//! numbering. Demand-allocated scratch locals may be numbered differently, so
+//! the gate compares structure and expression-arena order rather than local
+//! handles.
 
 use std::path::PathBuf;
 
@@ -27,7 +27,7 @@ fn golden_dir() -> PathBuf {
 
 /// Strip the `local_variables: { .. }` arena block and rewrite every
 /// `LocalVariable([n])` reference to a sentinel, so the comparison is
-/// insensitive to the documented local renumbering (§9(1)).
+/// insensitive to local-variable numbering.
 fn canonicalize_locals(serialized: &str) -> String {
     let no_local_refs = regex_replace_local_variable_refs(serialized);
     strip_local_variables_block(&no_local_refs)
@@ -83,8 +83,8 @@ fn check_golden_structural(name: &str, ir: &KernelIr) {
     assert_eq!(
         canonicalize_locals(&expected),
         canonicalize_locals(&serialized),
-        "golden module structure for `{name}` changed (ARBOR_DESIGN §9(1) \
-         structural oracle, locals canonicalized); snapshot: {}",
+        "golden module structure for `{name}` changed \
+         (locals canonicalized); snapshot: {}",
         path.display()
     );
 }

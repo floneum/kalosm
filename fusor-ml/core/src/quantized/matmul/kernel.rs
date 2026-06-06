@@ -83,7 +83,7 @@ impl QMatMulOperation {
         let subgroup_size_range = [caps.min_subgroup_size, caps.max_subgroup_size];
         let max_workgroups = effective_qmatmul_max_workgroups_per_dimension(&limits);
         let y_supports_coop = tile_ir_kernels::cooperative_store_layout_supported(&y_view.layout);
-        let mut variant = select_qmatmul_direct_variant(format, m, k, n, y_supports_coop, caps);
+        let mut variant = select_qmatmul_direct_variant(format, m, k, n, caps);
         if f16_storage {
             variant = QMatmulPath::Workgroup;
         }

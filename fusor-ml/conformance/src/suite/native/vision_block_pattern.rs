@@ -9,11 +9,10 @@
 //! the same fusion+resolve interaction the qwen vision encoder hits — without
 //! depending on GGUF weights or a real model load.
 //!
-//! Pre-fix this graph used to need a manual `materialize_sync` flush every
-//! 4 blocks (qwen.rs `FLUSH_EVERY = 4`) because the resolver's freeing
-//! predicate kept every intermediate alive while the held final tensor stayed
-//! uncached. The new `alive_uncached` counter + per-step propagation in
-//! `set_cached_result` makes the single end-of-loop resolve handle it.
+//! This graph exercises the case where a held final tensor stays uncached while
+//! many intermediate branches are eligible for release. The `alive_uncached`
+//! counter and per-step propagation in `set_cached_result` let a single
+//! end-of-loop resolve handle it.
 use fusor::Tensor;
 use fusor_conformance::available_devices;
 
@@ -97,8 +96,8 @@ async fn run_blocks(device: &fusor::Device, flush_every: Option<usize>) -> Vec<f
         let mlp_out = mlp_act.mat_mul(&mlp_down_w);
         xs = (&xs_after_attn + &mlp_out).to_concrete();
 
-        // Optionally simulate the old qwen.rs FLUSH_EVERY workaround by
-        // materializing the running tensor every N blocks.
+        // Optionally materialize the running tensor every N blocks for timing
+        // comparisons.
         if let Some(n) = flush_every
             && (block + 1) % n == 0
             && let Some(g) = xs.as_gpu()
@@ -122,9 +121,9 @@ pub async fn vision_block_pattern_resolves_without_periodic_flush() {
 }
 
 /// Compare wall-clock of the same vision-block graph with no periodic flush
-/// vs. with the old qwen.rs `FLUSH_EVERY = 4` workaround. Doesn't assert a
-/// ratio (CI noise) — just prints both numbers so a human can sanity-check
-/// that dropping the flush isn't a regression.
+/// vs. periodic materialization. Doesn't assert a ratio (CI noise) — just
+/// prints both numbers so a human can sanity-check that dropping the flush
+/// isn't a regression.
 pub async fn vision_block_pattern_flush_vs_no_flush_timing() {
     if std::env::var_os("FUSOR_FLUSH_TIMING").is_none() {
         // Off by default — only run when explicitly requested, since

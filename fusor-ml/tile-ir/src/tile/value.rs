@@ -5,9 +5,8 @@ use crate::ir::{
     TileBinaryOp, TileCompareOp, TileLiteral, TileUnaryOp,
 };
 
-/// A rank-1-per-lane tile value. Runtime-typed (ARBOR_DESIGN.md §2): the
-/// element type travels in the IR (`Expr::element()`), not in a Rust marker
-/// type. `Clone` is an `Rc` bump on the inner `Expr`.
+/// A rank-1-per-lane tile value. The element type travels in the IR
+/// (`Expr::element()`). `Clone` is an `Rc` bump on the inner `Expr`.
 #[derive(Clone)]
 pub struct Tile {
     pub(super) expr: Expr,
@@ -437,10 +436,9 @@ impl Address {
         // A dense storage load produces the buffer's element type verbatim: a
         // load from a vector buffer is a vector value, a scalar buffer a scalar.
         let element = self.view.buffer.element;
-        // For a vector buffer the masked-out fill must itself be a vector, so
-        // compose the scalar fill literal across all lanes (the old builder did
-        // this inline). The lowerer's `cast_tile_value` does a scalar cast, not
-        // a splat, so the fill has to arrive pre-composed.
+        // For a vector buffer the masked-out fill must itself be a vector. The
+        // lowerer's `cast_tile_value` does a scalar cast, not a splat, so the
+        // fill has to arrive pre-composed.
         let fill = match element {
             ElementType::Vector { scalar, lanes } => {
                 let scalar_element = scalar.element();

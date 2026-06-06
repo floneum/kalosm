@@ -258,7 +258,7 @@ impl Resolver {
         let mut used_indices = Vec::new();
         Self::collect_used_inputs(&expr, &mut seen_indices, &mut used_indices);
 
-        // Build mapping: old index -> new index, and collect only used inputs
+        // Build the input-index remap, collecting only used inputs.
         let mut new_inputs = Vec::new();
         let mut old_to_new = FxHashMap::default();
 
@@ -479,8 +479,7 @@ impl Resolver {
         self.execution_graph[node_idx].variant =
             ComputeGraphNodeVariant::GraphOp(Arc::new(new_rms.clone()));
 
-        // Re-wire dependency edges: the new RmsNorm node consumes whatever the
-        // old one consumed (input, residual?, weight, bias?).
+        // Re-wire dependency edges to the fused RmsNorm inputs.
         let mut deps = vec![new_rms.input];
         if let Some(residual) = new_rms.residual {
             deps.push(residual);

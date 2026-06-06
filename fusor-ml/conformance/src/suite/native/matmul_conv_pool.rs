@@ -11,11 +11,11 @@ use rand::distr::Uniform;
 pub fn matmul_match_host_reference() -> AssertionCase {
     // Sweep the inner `K` (128/256) and output `N` (64/256) dimensions so a
     // single producer covers both the medium `[256, 128] @ [128, 64]` case and
-    // the large `[256, 256] @ [256, 256]` tiled-kernel path (folding in the old
-    // `matmul_large_fuzzed`). `M` is a true `Fixed` (it consumes no RNG draw),
-    // which keeps the shared `K` dimension the *first* sampled choice in both
-    // operands — both generators share the same shape seed, so that draw lands
-    // on the same index and the matmul stays dimension-consistent every run.
+    // the large `[256, 256] @ [256, 256]` tiled-kernel path. `M` is a true
+    // `Fixed` (it consumes no RNG draw), which keeps the shared `K` dimension
+    // the *first* sampled choice in both operands — both generators share the
+    // same shape seed, so that draw lands on the same index and the matmul
+    // stays dimension-consistent every run.
     let gen_lhs = with_shape_specs(
         FuzzGenerator::<2, f32>::new([256, 128])
             .with_seed(300)

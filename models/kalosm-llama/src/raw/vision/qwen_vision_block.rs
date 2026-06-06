@@ -132,11 +132,9 @@ where
 
 struct VisionAttention<F: FloatDataType + SimdElement> {
     /// Fused Q/K/V projection: a single Linear whose weight is the row-wise
-    /// concatenation of the per-tensor q/k/v weights. The previous code
-    /// dispatched 3 separate matmuls per layer (96 dispatches across 32
-    /// vision blocks); one fused matmul of triple output width does the same
-    /// arithmetic with a third the dispatch count, and the wider N better
-    /// saturates the shared-memory tile reuse.
+    /// concatenation of the per-tensor q/k/v weights. One fused matmul of
+    /// triple output width computes all three projections with a lower dispatch
+    /// count, and the wider N better saturates shared-memory tile reuse.
     qkv: VisionQkv<F>,
     proj: Linear<F>,
     head_count: usize,

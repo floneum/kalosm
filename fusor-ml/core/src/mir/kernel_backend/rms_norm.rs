@@ -644,10 +644,8 @@ fn build_rms_norm_tile_ir_typed(
             },
         );
 
-        // Runtime-typed accumulate-split (ARBOR_DESIGN.md §2): values are loaded
-        // in their storage element type and accumulated in f32. The cast is a
-        // no-op (no IR node) when the storage element is already f32, matching
-        // the old `AccumCast::into_accum` identity for F32.
+        // Values are loaded in their storage element type and accumulated in
+        // f32. The cast is a no-op when the storage element is already f32.
         let into_accum = |value: tile_ir::tile::Tile| -> tile_ir::tile::Tile {
             if element == tile_ir::ElementType::F32 {
                 value
@@ -730,7 +728,6 @@ fn build_rms_norm_tile_ir_typed(
 }
 
 /// The storage-typed zero used as the masked-out fill for rms-norm loads.
-/// Mirrors the old `AccumCast::ZERO_STORAGE` constant.
 fn rms_norm_zero_fill(element: tile_ir::ElementType) -> tile_ir::TileLiteral {
     match element {
         tile_ir::ElementType::F16 => tile_ir::TileLiteral::F16(0),
