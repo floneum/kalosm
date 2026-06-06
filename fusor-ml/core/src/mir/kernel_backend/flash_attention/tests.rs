@@ -6,7 +6,7 @@ use crate::{
 };
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-const TEST_HEAD_DIM: usize = DECODE_HEAD_DIM as usize;
+const TEST_HEAD_DIM: usize = 128;
 
 fn caps(max_compute_invocations_per_workgroup: u32) -> KernelDeviceCaps {
     KernelDeviceCaps {
@@ -30,12 +30,16 @@ fn decode_dims(kv_seq_len: u32) -> FlashAttentionDims {
         num_kv_heads: 8,
         q_seq_len: 1,
         kv_seq_len,
-        head_dim: DECODE_HEAD_DIM,
+        head_dim: TEST_HEAD_DIM as u32,
     }
 }
 
 fn decode_shape(kv_seq_len: usize) -> KernelShape<6> {
-    KernelShape::new([1, 32, 8, 1, kv_seq_len, DECODE_HEAD_DIM as usize])
+    KernelShape::new([1, 32, 8, 1, kv_seq_len, TEST_HEAD_DIM])
+}
+
+fn decode_shape_with_head_dim(kv_seq_len: usize, head_dim: usize) -> KernelShape<6> {
+    KernelShape::new([1, 32, 8, 1, kv_seq_len, head_dim])
 }
 
 fn gpu_test_guard() -> MutexGuard<'static, ()> {
@@ -48,33 +52,46 @@ fn gpu_test_guard() -> MutexGuard<'static, ()> {
 #[test]
 fn decode_block_choice_uses_smallest_covering_supported_block() {
     assert_eq!(
-        choose_decode_block(64, caps(DECODE_LARGE_BLOCK)),
+        choose_decode_block(64, TEST_HEAD_DIM as u32, caps(DECODE_LARGE_BLOCK)),
         Some(DECODE_SMALL_BLOCK)
     );
     assert_eq!(
-        choose_decode_block(200, caps(DECODE_LARGE_BLOCK)),
+        choose_decode_block(200, TEST_HEAD_DIM as u32, caps(DECODE_LARGE_BLOCK)),
         Some(DECODE_MID_BLOCK)
     );
     assert_eq!(
-        choose_decode_block(600, caps(DECODE_LARGE_BLOCK)),
+        choose_decode_block(600, TEST_HEAD_DIM as u32, caps(DECODE_LARGE_BLOCK)),
         Some(DECODE_LARGE_BLOCK)
     );
     assert_eq!(
-        choose_decode_block(600, caps(DECODE_MEDIUM_BLOCK)),
+        choose_decode_block(600, TEST_HEAD_DIM as u32, caps(DECODE_MEDIUM_BLOCK)),
         Some(DECODE_MEDIUM_BLOCK)
     );
     assert_eq!(
-        choose_decode_block(DECODE_LARGE_BLOCK + 1, caps(DECODE_LARGE_BLOCK)),
+        choose_decode_block(
+            DECODE_LARGE_BLOCK + 1,
+            TEST_HEAD_DIM as u32,
+            caps(DECODE_LARGE_BLOCK)
+        ),
         Some(DECODE_MID_BLOCK)
     );
     assert_eq!(
-        choose_decode_block(DECODE_SMALL_BLOCK, caps(DECODE_SMALL_BLOCK - 1)),
+        choose_decode_block(
+            DECODE_SMALL_BLOCK,
+            TEST_HEAD_DIM as u32,
+            caps(DECODE_SMALL_BLOCK - 1)
+        ),
         None
+    );
+    assert_eq!(
+        choose_decode_block(64, 64, caps(DECODE_LARGE_BLOCK)),
+        Some(DECODE_SMALL_BLOCK)
     );
 
     assert_eq!(
         choose_decode_block(
             200,
+            TEST_HEAD_DIM as u32,
             KernelDeviceCaps {
                 backend: wgpu::Backend::Metal,
                 ..caps(DECODE_LARGE_BLOCK)
@@ -145,7 +162,7 @@ fn decode_module_key_uses_bucketed_kv_len() {
     assert_eq!(key, next_token_key);
 
     let mut different_stride_meta = meta;
-    different_stride_meta.k_strides[1] += DECODE_HEAD_DIM;
+    different_stride_meta.k_strides[1] += TEST_HEAD_DIM as u32;
     let different_stride_key = kernel::flash_decode_module_key(
         Some(&workgroup_shape),
         dispatch_size,
@@ -215,6 +232,14 @@ fn flash_attention_selector_selects_decode_block_buckets() {
         Some(FlashAttentionSelectedVariant::DecodeSmall(DECODE_MID_BLOCK))
     );
     assert_eq!(
+        selector.select(
+            decode_shape_with_head_dim(200, 64),
+            &decode_ctx,
+            caps(DECODE_LARGE_BLOCK)
+        ),
+        Some(FlashAttentionSelectedVariant::DecodeSmall(DECODE_MID_BLOCK))
+    );
+    assert_eq!(
         selector.select(decode_shape(600), &decode_ctx, caps(DECODE_LARGE_BLOCK)),
         Some(FlashAttentionSelectedVariant::DecodeSmall(
             DECODE_LARGE_BLOCK
@@ -241,6 +266,34 @@ fn flash_attention_selector_selects_decode_block_buckets() {
     assert_eq!(
         selector.select(decode_shape(200), &masked_ctx, caps(DECODE_LARGE_BLOCK)),
         Some(FlashAttentionSelectedVariant::Streaming)
+    );
+}
+
+#[test]
+fn decode_direct_candidate_does_not_require_subgroups() {
+    let q_shape = [1, 32, 1, 64];
+    let k_shape = [1, 8, MIN_DECODE_KV_SEQ, 64];
+    assert!(flash_decode_direct_candidate(
+        &q_shape,
+        &k_shape,
+        false,
+        false,
+        DataTypeEnum::F32,
+    ));
+
+    let caps_without_subgroups = KernelDeviceCaps {
+        subgroups_supported: false,
+        min_subgroup_size: 0,
+        max_subgroup_size: 0,
+        ..caps(DECODE_LARGE_BLOCK)
+    };
+    assert_eq!(
+        select_flash_attention_variant(
+            decode_dims(MIN_DECODE_KV_SEQ as u32),
+            false,
+            caps_without_subgroups
+        ),
+        FlashAttentionSelectedVariant::DecodeSmall(DECODE_SMALL_BLOCK),
     );
 }
 
@@ -486,7 +539,9 @@ fn decode_gqa_non_tiled_large_blocks_match_cpu_reference() {
         // On devices that support the larger workgroups, 200 uses the 512
         // block and 600 uses the 1024 block.
         for (kv_len, expected_block) in [(200usize, DECODE_MID_BLOCK), (600, DECODE_LARGE_BLOCK)] {
-            if choose_decode_block(kv_len as u32, caps) != Some(expected_block) {
+            if choose_decode_block(kv_len as u32, TEST_HEAD_DIM as u32, caps)
+                != Some(expected_block)
+            {
                 continue;
             }
             let q_data = decode_q_gqa(num_heads);

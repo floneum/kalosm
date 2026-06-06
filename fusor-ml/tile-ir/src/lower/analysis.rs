@@ -35,6 +35,16 @@ pub(super) struct Capabilities {
     pub num_subgroups: bool,
 }
 
+impl Capabilities {
+    pub(super) fn uses_subgroups(self) -> bool {
+        self.uses_subgroup_reduce
+            || self.subgroup_id
+            || self.subgroup_lane
+            || self.subgroup_size
+            || self.num_subgroups
+    }
+}
+
 impl Analysis {
     pub(super) fn run(ir: &KernelIr) -> Self {
         let mut analysis = Analysis::default();

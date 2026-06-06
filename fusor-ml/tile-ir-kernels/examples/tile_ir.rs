@@ -101,8 +101,12 @@ fn qmatmul_ir(format: GgmlQuantFormat, m: u32, n: u32, k: u32) -> KernelIr {
             &b,
             &y,
             &tile_ir_kernels::QmatmulEpilogues::empty(),
+            fusor_tile_ir::SubgroupToken::new_unchecked(),
+            fusor_tile_ir::CoopMatrixToken::new_unchecked(),
+            tile_ir_kernels::SubgroupConfig::fixed(32),
             8,
             4,
+            8,
         );
     })
 }
@@ -120,6 +124,8 @@ fn qgemv_ir(format: GgmlQuantFormat, n: u32, k: u32) -> KernelIr {
             &b,
             &y,
             1,
+            fusor_tile_ir::SubgroupToken::new_unchecked(),
+            tile_ir_kernels::SubgroupConfig::fixed(32),
             Option::<&tile_ir_kernels::UnaryEpilogue>::None,
         );
     })
@@ -136,7 +142,16 @@ fn qgemv_with_silu_epilogue_ir(format: GgmlQuantFormat, n: u32, k: u32) -> Kerne
         // the quantized dot product, then injects this epilogue before the
         // store so activation fusion does not need a second dispatch.
         let silu = tile_ir_kernels::UnaryEpilogue::new("silu", |value| value.silu());
-        tile_ir_kernels::qgemv_with_epilogue(phase, &a, &b, &y, 1, Some(&silu));
+        tile_ir_kernels::qgemv_with_epilogue(
+            phase,
+            &a,
+            &b,
+            &y,
+            1,
+            fusor_tile_ir::SubgroupToken::new_unchecked(),
+            tile_ir_kernels::SubgroupConfig::fixed(32),
+            Some(&silu),
+        );
     })
 }
 

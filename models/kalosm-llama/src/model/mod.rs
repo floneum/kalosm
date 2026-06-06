@@ -9,7 +9,7 @@ use crate::LlamaConfigJson;
 use fusor::{
     AddOp, CastTensor, CastTo, Device, FloatDataType, FloatOps, MatmulImpl, Mirostat2Sampler,
     Mirostat2SamplerParams, MulOp, ShardedVarBuilder, SimdBinaryOp, SimdElement, SimdReduceOp,
-    SumOp, WasmNotSend, WasmNotSync,
+    StandardSamplerParams, SumOp, WasmNotSend, WasmNotSync,
 };
 use fusor_gguf::GgufMetadata;
 use fusor_gguf::GgufValue;
@@ -22,9 +22,9 @@ use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use web_time::{Duration, Instant};
 
-use crate::sampler::{CpuMirostat2Sampler, Logit, Logits};
+use crate::sampler::{CpuSampler, Logit, Logits};
 use crate::{GpuSamplerConfig, InferenceSettings, LlamaImage, LlamaSourceError};
 
 mod forward;
@@ -96,6 +96,12 @@ fn gpu_fused_logits_prewarm_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn gpu_run_ahead_enabled() -> bool {
+    std::env::var_os("KALOSM_LLAMA_GPU_RUN_AHEAD")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
 fn decode_trace_enabled() -> bool {
     std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
         || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
@@ -103,16 +109,20 @@ fn decode_trace_enabled() -> bool {
 }
 
 fn gpu_sample_top_k(config: &GpuSamplerConfig) -> usize {
+    let default_top_k = match config.sampling_strategy {
+        kalosm_language_model::SamplingStrategy::Mirostat2 => 16,
+        kalosm_language_model::SamplingStrategy::Standard => 64,
+    };
     std::env::var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K")
         .ok()
         .and_then(|value| value.parse().ok())
         .or(config.top_k)
-        .unwrap_or(16)
+        .unwrap_or(default_top_k)
         .max(1)
 }
 
-struct LlamaGpuSamplerState {
-    sampler: Mirostat2Sampler,
+pub(crate) struct LlamaGpuSamplerState {
+    mirostat: Option<Mirostat2Sampler>,
     config: GpuSamplerConfig,
     rng: rand::rngs::StdRng,
 }
@@ -123,14 +133,20 @@ impl LlamaGpuSamplerState {
         let rng = seed
             .map(rand::rngs::StdRng::seed_from_u64)
             .unwrap_or_else(rand::rngs::StdRng::from_os_rng);
+        let mirostat = match config.sampling_strategy {
+            kalosm_language_model::SamplingStrategy::Mirostat2 => {
+                Some(Mirostat2Sampler::new(gpu_device, config.mu))
+            }
+            kalosm_language_model::SamplingStrategy::Standard => None,
+        };
         Some(Self {
-            sampler: Mirostat2Sampler::new(gpu_device, config.mu),
+            mirostat,
             config,
             rng,
         })
     }
 
-    fn params(&mut self, top_k: usize) -> Mirostat2SamplerParams {
+    fn mirostat_params(&mut self, top_k: usize) -> Mirostat2SamplerParams {
         Mirostat2SamplerParams {
             top_k,
             temperature: self.config.temperature,
@@ -141,10 +157,67 @@ impl LlamaGpuSamplerState {
         }
     }
 
+    fn standard_params(&mut self, top_k: usize) -> StandardSamplerParams {
+        let top_p = if self.config.temperature <= 0.0 {
+            0.0
+        } else {
+            self.config.top_p.unwrap_or(1.0)
+        };
+        StandardSamplerParams {
+            top_k,
+            temperature: self.config.temperature,
+            repetition_penalty: self.config.repetition_penalty,
+            top_p,
+            min_p: self.config.min_p.unwrap_or(0.0),
+            random: self.rng.random::<f32>(),
+        }
+    }
+
     fn previous_tokens(&self, text_stream: &TokenOutputStream) -> Vec<u32> {
         let tokens = text_stream.tokens();
         let len = tokens.len().min(self.config.repetition_penalty_range);
         tokens[tokens.len().saturating_sub(len)..].to_vec()
+    }
+
+    fn previous_tokens_for_gpu_tail(&self, previous_tokens: Vec<u32>) -> (Vec<u32>, bool) {
+        trim_previous_tokens_for_gpu_tail(previous_tokens, self.config.repetition_penalty_range)
+    }
+}
+
+fn trim_previous_tokens_for_gpu_tail(
+    mut previous_tokens: Vec<u32>,
+    repetition_penalty_range: usize,
+) -> (Vec<u32>, bool) {
+    let host_len = repetition_penalty_range.saturating_sub(1);
+    if previous_tokens.len() > host_len {
+        let keep_from = previous_tokens.len() - host_len;
+        previous_tokens = previous_tokens.split_off(keep_from);
+    }
+    (previous_tokens, repetition_penalty_range > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim_previous_tokens_for_gpu_tail;
+
+    #[test]
+    fn gpu_tail_history_preserves_repetition_window() {
+        assert_eq!(
+            trim_previous_tokens_for_gpu_tail(vec![1, 2, 3, 4], 0),
+            (vec![], false)
+        );
+        assert_eq!(
+            trim_previous_tokens_for_gpu_tail(vec![1, 2, 3, 4], 1),
+            (vec![], true)
+        );
+        assert_eq!(
+            trim_previous_tokens_for_gpu_tail(vec![1, 2, 3, 4], 3),
+            (vec![3, 4], true)
+        );
+        assert_eq!(
+            trim_previous_tokens_for_gpu_tail(vec![1, 2], 5),
+            (vec![1, 2], true)
+        );
     }
 }
 
@@ -152,13 +225,13 @@ struct ForwardTrace {
     enabled: bool,
     decode_eligible: bool,
     path: &'static str,
-    token_start: Option<std::time::Instant>,
+    token_start: Option<Instant>,
     kernels: usize,
 }
 
 impl ForwardTrace {
-    fn step_start(&self) -> Option<std::time::Instant> {
-        self.enabled.then(std::time::Instant::now)
+    fn step_start(&self) -> Option<Instant> {
+        self.enabled.then(Instant::now)
     }
 
     fn record(&self) {
@@ -344,7 +417,7 @@ where
         }
 
         let trace = decode_trace_enabled();
-        let start = trace.then(std::time::Instant::now);
+        let start = trace.then(Instant::now);
         let hidden_values = vec![0.0f32; shape[1]];
         let hidden: fusor::Tensor<1, f32> =
             fusor::Tensor::from_slice(device, [shape[1]], &hidden_values);
@@ -599,11 +672,16 @@ where
                         let eos: u32 = eos.try_into().map_err(|_| LlamaSourceError::NoTokenizer)?;
                         let eos = &tokens[eos as usize];
 
-                        let bos = source
+                        // Some models (e.g. Qwen) don't use a BOS token and ship the GGUF
+                        // file without `tokenizer.ggml.bos_token_id`. Treat it as optional
+                        // rather than failing to load the embedded tokenizer entirely.
+                        let bos: Option<&str> = source
                             .get("tokenizer.ggml.bos_token_id")
-                            .map_err(|_| LlamaSourceError::NoTokenizer)?;
-                        let bos: u32 = bos.try_into().map_err(|_| LlamaSourceError::NoTokenizer)?;
-                        let bos = &tokens[bos as usize];
+                            .ok()
+                            .and_then(|v| {
+                                let id: u32 = v.try_into().ok()?;
+                                Some(&*tokens[id as usize])
+                            });
 
                         config
                             .build(vocab, types, merges, bos, eos)

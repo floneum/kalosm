@@ -31,3 +31,7 @@ impl<T: std::marker::Send + std::marker::Sync> WasmNotSendSync for T {}
 /// A future that is not `Send` on wasm32 targets, but is on other targets.
 pub trait FutureWasmNotSend: Future + WasmNotSend {}
 impl<T: Future + WasmNotSend> FutureWasmNotSend for T {}
+
+/// An [`Any`](std::any::Any) value that is not `Send` on wasm32 targets, but is on other targets.
+pub trait AnyWasmNotSend: std::any::Any + WasmNotSend {}
+impl<T: std::any::Any + WasmNotSend> AnyWasmNotSend for T {}

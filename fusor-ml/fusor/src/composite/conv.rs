@@ -123,6 +123,22 @@ where
             "Weight in_channels must match input in_channels"
         );
 
+        if WEIGHT_RANK == 2 + DIFF
+            && R2 == R + DIFF
+            && let (Tensor::Gpu(input), Tensor::Gpu(weight)) = (self, weight)
+            && (bias.is_none() || matches!(bias, Some(Tensor::Gpu(_))))
+        {
+            let bias = bias.and_then(|bias| match bias {
+                Tensor::Gpu(bias) => Some(bias),
+                Tensor::Cpu(_) => None,
+            });
+            if let Some(output) =
+                input.try_conv_nd_direct::<WEIGHT_RANK, DIFF>(weight, bias, padding, strides)
+            {
+                return Tensor::Gpu(output);
+            }
+        }
+
         // Step 1: Apply padding to the spatial dimensions (last DIFF dimensions)
         let padded = if padding.iter().any(|&p| p > 0) {
             let mut result = self.clone();

@@ -94,6 +94,9 @@ impl SoftmaxOperation {
         if axis >= shape.len() || shape.contains(&0) {
             return None;
         }
+        if axis + 1 != shape.len() {
+            return None;
+        }
         if !matches!(datatype, DataTypeEnum::F32 | DataTypeEnum::F16) {
             return None;
         }

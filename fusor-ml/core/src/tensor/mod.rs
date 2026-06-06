@@ -11,6 +11,7 @@ use crate::{
     Device, FlashAttentionInputs, FlashAttentionOperation, MatMulOperation, MatMulParams,
     ReduceFunction, ReduceOperation,
     compute_graph::NodeIndex,
+    conv::ConvNdOperation,
     map_layout::MapLayoutOperation,
     nary_wise::{NaryExpr, NaryFunction, NaryOp, NaryOperation, NaryScalar},
     quantized::QMatrix,
@@ -213,9 +214,25 @@ impl Tensor {
             }
         }
         let pair_len = other.shape()[0] / 2;
+        let projected = self.q_mat_mul(other);
+        let mut output_shape = projected.shape().to_vec();
+        *output_shape
+            .last_mut()
+            .expect("q_mat_mul output must have a last dimension") = pair_len;
+
         let dtype = DataTypeEnum::F32;
-        let gate = NaryExpr::input(0, 1);
-        let up = NaryExpr::input(1, 1);
+        let output_rank = output_shape.len();
+        let gate_indices = (0..output_rank).map(NaryExpr::DimIndex).collect::<Vec<_>>();
+        let mut up_indices = gate_indices.clone();
+        let last_idx = output_rank - 1;
+        up_indices[last_idx] = NaryExpr::add(
+            NaryExpr::DimIndex(last_idx),
+            NaryExpr::scalar(NaryScalar::U32(pair_len as u32)),
+            DataTypeEnum::U32,
+        );
+
+        let gate = NaryExpr::indexed_input(0, gate_indices);
+        let up = NaryExpr::indexed_input(0, up_indices);
         let neg_gate = NaryExpr::Op {
             children: vec![gate.clone()],
             function: NaryFunction::unary(Some("neg".to_string()), NaryOp::Neg, dtype, dtype),
@@ -224,7 +241,7 @@ impl Tensor {
             children: vec![neg_gate],
             function: NaryFunction::unary(Some("exp".to_string()), NaryOp::Exp, dtype, dtype),
         };
-        let one_plus_exp = NaryExpr::Op {
+        let denominator = NaryExpr::Op {
             children: vec![exp_neg_gate],
             function: NaryFunction::unary(
                 Some("add_const".to_string()),
@@ -234,7 +251,7 @@ impl Tensor {
             ),
         };
         let silu = NaryExpr::Op {
-            children: vec![gate, one_plus_exp],
+            children: vec![gate, denominator],
             function: NaryFunction::binary(
                 Some("div".to_string()),
                 NaryOp::Div,
@@ -243,35 +260,15 @@ impl Tensor {
                 dtype,
             ),
         };
-        let expression = NaryExpr::Op {
-            children: vec![silu, up],
-            function: NaryFunction::binary(
-                Some("mul".to_string()),
-                NaryOp::Mul,
-                dtype,
-                dtype,
-                dtype,
-            ),
+        let expression = NaryExpr::mul(silu, up, dtype);
+        let nary = NaryOperation {
+            inputs: vec![projected.data.key],
+            expression,
+            shape: output_shape.into_boxed_slice(),
+            output_datatype: dtype,
         };
-        let epilogue =
-            fusor_tile_ir_kernels::PairedEpilogue::with_extras("silu_mul", 0, move |tiles| {
-                let inputs = [
-                    (tiles[0].clone(), DataTypeEnum::F32),
-                    (tiles[1].clone(), DataTypeEnum::F32),
-                ];
-                crate::nary_direct::eval_nary_expr_on_tiles(&expression, &inputs).0
-            });
-        let operation = QMatMulOperation::new_paired(
-            DataTypeEnum::F32,
-            self.shape(),
-            self.data.key,
-            other.clone(),
-            pair_len,
-            epilogue,
-            Vec::new(),
-        );
 
-        Self::from_parts(self.data.q_mat_mul(operation))
+        Self::from_parts(projected.data.nary(nary))
     }
 }
 
@@ -306,6 +303,19 @@ impl Tensor {
             "Data length must match shape"
         );
         Tensor::new_inner(device, data.iter(), shape)
+    }
+
+    /// Allocate a concrete tensor backing for `shape` without uploading
+    /// initialized host data.
+    ///
+    /// Callers must overwrite any region before reading it. This is intended
+    /// for cache backing allocations where only assigned slices become visible.
+    pub fn uninit<D: DataType>(device: &Device, shape: impl AsRef<[usize]>) -> Self {
+        Self::from_parts(LazyTensorData::new(TensorData::new_for_shape(
+            device,
+            shape.as_ref(),
+            D::DATA_TYPE,
+        )))
     }
 
     pub fn splat<D: DataType>(device: &Device, value: D, shape: impl AsRef<[usize]>) -> Self {
@@ -440,6 +450,8 @@ impl Tensor {
         let (data, count) = self.data.materialize();
         #[cfg(not(target_arch = "wasm32"))]
         data.device().poll_wait();
+        #[cfg(target_arch = "wasm32")]
+        drop(data);
         count
     }
 
@@ -467,7 +479,7 @@ impl Tensor {
     }
 
     pub fn debug_assert_real(self) -> Self {
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
         {
             use pollster::FutureExt as _;
             if self.rank() == 1 {
@@ -648,6 +660,45 @@ impl Tensor {
         Some(Self::from_parts(self.data.rms_norm(operation)))
     }
 
+    #[doc(hidden)]
+    pub fn try_conv_nd_direct(
+        &self,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        padding: &[usize],
+        strides: &[usize],
+    ) -> Option<Self> {
+        if self.datatype() != weight.datatype()
+            || bias.is_some_and(|bias| bias.datatype() != self.datatype())
+        {
+            return None;
+        }
+        let operation = ConvNdOperation::new(
+            crate::conv::ConvNdNodes {
+                input: self.data.key,
+                weight: weight.data.key,
+                bias: bias.map(|bias| bias.data.key),
+            },
+            crate::conv::ConvNdShapeSpec {
+                input_shape: self.shape(),
+                weight_shape: weight.shape(),
+                bias_shape: bias.map(|bias| bias.shape()),
+                padding,
+                strides,
+            },
+            self.datatype(),
+            self.device(),
+        )?;
+        let device = self.device().clone();
+        let info = TensorInfo::new(operation.output_shape().into(), self.datatype());
+        let key = device
+            .compute_graph()
+            .create_graph_op(std::sync::Arc::new(operation));
+        Some(Self::from_parts(LazyTensorData::from_parts(
+            device, info, key,
+        )))
+    }
+
     pub(crate) fn try_rms_norm_residual_direct(
         &self,
         residual: &Self,
@@ -708,21 +759,41 @@ impl Tensor {
         if causal && mask.is_some() {
             return None;
         }
-        // The streaming flash attention kernel emits a separate
-        // monomorphization per hardware subgroup width and relies on
-        // `subgroup_reduce_*`, so it can only target devices where we know the
-        // effective subgroup width.
-        self.data.device.fixed_width_subgroup_size()?;
         let q_shape = self.shape();
         let k_shape = k.shape();
-        const MIN_DECODE_KV_SEQ: usize = 32;
-        let is_decode_candidate = q_shape[2] == 1
-            && q_shape[3] == 128
+        let is_decode_shape = q_shape[2] == 1
+            && q_shape[3] > 0
             && mask.is_none()
             && !causal
             && self.datatype() == DataTypeEnum::F32;
-        if is_decode_candidate && k_shape[2] < MIN_DECODE_KV_SEQ {
+        if is_decode_shape
+            && k_shape[2] < crate::mir::kernel_backend::flash_attention::MIN_DECODE_KV_SEQ
+        {
             return None;
+        }
+        let is_decode_candidate =
+            crate::mir::kernel_backend::flash_attention::flash_decode_direct_candidate(
+                q_shape,
+                k_shape,
+                mask.is_some(),
+                causal,
+                self.datatype(),
+            );
+        // Browser WebGPU backends have been observed to hang/crash on the
+        // split decode workgroup kernel. The composite fallback still runs on
+        // GPU and is the reliable browser path for q_seq_len == 1.
+        #[cfg(target_arch = "wasm32")]
+        if is_decode_candidate {
+            return None;
+        }
+        // The streaming flash attention kernels emit a separate
+        // monomorphization per hardware subgroup width and rely on
+        // `subgroup_reduce_*`, so they can only target devices where we know
+        // the effective subgroup width. Decode-small uses workgroup reductions
+        // and should not be blocked by browser adapters that support subgroups
+        // but report a subgroup-width range.
+        if !is_decode_candidate {
+            self.data.device.fixed_width_subgroup_size()?;
         }
         let v_shape = v.shape();
         if q_shape[0] != k_shape[0]

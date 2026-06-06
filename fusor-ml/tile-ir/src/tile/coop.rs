@@ -11,7 +11,12 @@ impl TileBlock<'_> {
     /// - zero: `store_local_coop(acc, coop_zero(..))`
     /// - set:  `store_local_coop(acc, coop_load_c_broadcast(..))`
     /// - mma:  `store_local_coop(acc, coop_mma(a, b, load_local_coop(acc)))`
-    pub fn alloc_coop_acc(&mut self, scalar: ScalarElement, rows: u32, cols: u32) -> CoopAcc {
+    pub(crate) fn alloc_coop_acc(
+        &mut self,
+        scalar: ScalarElement,
+        rows: u32,
+        cols: u32,
+    ) -> CoopAcc {
         assert!(
             rows == 8 || rows == 16,
             "cooperative-matrix rows must be 8 or 16"
@@ -24,13 +29,13 @@ impl TileBlock<'_> {
     }
 
     /// Load the current SSA value of a coop accumulator.
-    pub fn load_local_coop(&self, acc: &CoopAcc) -> Tile {
+    pub(crate) fn load_local_coop(&self, acc: &CoopAcc) -> Tile {
         load_coop_acc(acc)
     }
 
     /// Store a coop value into an accumulator. The lowerer chains MMA stores
     /// through the acc-value SSA memo (1 Load + N MMA + 1 Store per iteration).
-    pub fn store_local_coop(&mut self, acc: &CoopAcc, value: Tile) {
+    pub(crate) fn store_local_coop(&mut self, acc: &CoopAcc, value: Tile) {
         self.push_stmt(Stmt::StoreLocal {
             dst: acc.decl().clone(),
             value: value.into_expr(),
@@ -44,7 +49,7 @@ impl TileBlock<'_> {
     /// it introduces no spurious decls, and the lowerer lowers a cast to a
     /// cooperative-matrix type as `Expression::ZeroValue` (there is no real
     /// scalar→fragment cast).
-    pub fn coop_zero(&self, scalar: ScalarElement, rows: u32, cols: u32) -> Tile {
+    pub(crate) fn coop_zero(&self, scalar: ScalarElement, rows: u32, cols: u32) -> Tile {
         let coop = ElementType::coop_matrix(scalar, CoopMatrixRole::C, rows, cols);
         Tile::new(
             ExprKind::Cast {
@@ -59,7 +64,7 @@ impl TileBlock<'_> {
     }
 
     /// Cooperatively load an A-role fragment from a region of a workgroup tile.
-    pub fn coop_load_a(
+    pub(crate) fn coop_load_a(
         &self,
         tile: &WorkgroupTile,
         row: impl Into<Tile>,
@@ -72,7 +77,7 @@ impl TileBlock<'_> {
     }
 
     /// Cooperatively load a B-role fragment from a region of a workgroup tile.
-    pub fn coop_load_b(
+    pub(crate) fn coop_load_b(
         &self,
         tile: &WorkgroupTile,
         row: impl Into<Tile>,
@@ -115,7 +120,7 @@ impl TileBlock<'_> {
 
     /// Cooperatively load a C-role fragment from a rank-1 storage vector,
     /// broadcasting the selected columns across all fragment rows.
-    pub fn coop_load_c_broadcast(
+    pub(crate) fn coop_load_c_broadcast(
         &self,
         src: &Storage,
         col: impl Into<Tile>,
@@ -142,7 +147,7 @@ impl TileBlock<'_> {
 
     /// `a * b + c` over cooperative fragments — value-producing. Compose with
     /// `store_local_coop(acc, coop_mma(a, b, load_local_coop(acc)))`.
-    pub fn coop_mma(&self, a: Tile, b: Tile, c: Tile) -> Tile {
+    pub(crate) fn coop_mma(&self, a: Tile, b: Tile, c: Tile) -> Tile {
         let ty = c.element();
         Tile::new(
             ExprKind::CoopMma {
@@ -156,7 +161,7 @@ impl TileBlock<'_> {
 
     /// Cooperatively store an accumulator to `dst` at `(row, col)`. A distinct
     /// collective primitive — never a per-lane store.
-    pub fn coop_store(
+    pub(crate) fn coop_store(
         &mut self,
         acc: &CoopAcc,
         dst: &Storage,

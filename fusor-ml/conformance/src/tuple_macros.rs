@@ -1,15 +1,19 @@
 use std::pin::Pin;
 
-use fusor::{DataType, Device, SimdElement, Tensor};
+use fusor::{DataType, Device, SimdElement, Tensor, WasmNotSend};
+
+/// A future that is `Send` on non-wasm32 targets, but is not required to be on wasm32.
+#[doc(hidden)]
+pub trait FutureWasmNotSend: std::future::Future + WasmNotSend {}
+impl<T: std::future::Future + WasmNotSend> FutureWasmNotSend for T {}
+
+pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn FutureWasmNotSend<Output = T> + 'a>>;
 
 #[doc(hidden)]
 pub trait AsyncFnMutTuple<Args> {
     type Output;
 
-    fn call_mut<'a>(
-        &'a mut self,
-        args: Args,
-    ) -> Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+    fn call_mut<'a>(&'a mut self, args: Args) -> BoxFuture<'a, Self::Output>;
 }
 
 macro_rules! impl_fn_mut_tuple {
@@ -17,11 +21,11 @@ macro_rules! impl_fn_mut_tuple {
         impl<Fn, U, Fut, $($type),*> AsyncFnMutTuple<($($type,)*)> for Fn
         where
             Fn: FnMut($($type,)*) -> Fut,
-            Fut: std::future::Future<Output = U> + Send + 'static,
+            Fut: std::future::Future<Output = U> + WasmNotSend + 'static,
         {
             type Output = U;
             #[allow(non_snake_case)]
-            fn call_mut<'a>(&'a mut self, ($($type,)*): ($($type,)*)) -> Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>> {
+            fn call_mut<'a>(&'a mut self, ($($type,)*): ($($type,)*)) -> BoxFuture<'a, Self::Output> {
                 Box::pin((self)($($type,)*))
             }
         }
@@ -40,6 +44,7 @@ impl_fn_mut_tuple!(A, B, C, D, E, F);
 pub trait GenTuple {
     type Output;
     fn generate(&mut self, device: &Device, run: usize) -> Self::Output;
+    fn run_label(&self, run: usize) -> String;
 }
 
 macro_rules! impl_gen_tuple {
@@ -60,6 +65,25 @@ macro_rules! impl_gen_tuple {
                     )*
                 )
             }
+
+            #[allow(non_snake_case)]
+            fn run_label(&self, run: usize) -> String {
+                let ($($type,)*) = self;
+                let mut fragments = Vec::new();
+                $(
+                    if let Some(fragment) = $type.run_label_fragment(run) {
+                        if !fragments.contains(&fragment) {
+                            fragments.push(fragment);
+                        }
+                    }
+                )*
+
+                if fragments.is_empty() {
+                    format!("run{run}")
+                } else {
+                    format!("sample{run}_{}", fragments.join("_"))
+                }
+            }
         }
     };
 }
@@ -75,7 +99,7 @@ impl_gen_tuple!(A -> AOut, B -> BOut, C -> COut, D -> DOut, E -> EOut, F -> FOut
 pub trait ResolveTensorTuple {
     type Output;
 
-    fn resolve(self) -> impl Future<Output = Result<Self::Output, fusor::Error>> + Send + 'static;
+    fn resolve(self) -> BoxFuture<'static, Result<Self::Output, fusor::Error>>;
 
     fn extract_device(&self) -> Device;
 }
@@ -91,13 +115,15 @@ macro_rules! impl_resolve_tensor_tuple {
             type Output = ($(<fusor_types::TensorSlice<$rank, $type, fusor::EitherMappedBuffer> as fusor::ToVec>::Output,)*);
 
             #[allow(non_snake_case)]
-            async fn resolve(self) -> Result<Self::Output, fusor::Error> {
+            fn resolve(self) -> BoxFuture<'static, Result<Self::Output, fusor::Error>> {
+                Box::pin(async move {
                 let ($($type,)*) = self;
                 Ok((
                     $(
                         fusor::ToVec::to_vec(&$type.as_slice().await?),
                     )*
                 ))
+                })
             }
 
             fn extract_device(&self) -> Device {

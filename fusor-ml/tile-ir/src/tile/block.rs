@@ -25,16 +25,20 @@ impl TileBlock<'_> {
         Tile::builtin(Builtin::ProgramId(axis))
     }
     /// `@builtin(subgroup_id)`.
-    pub fn subgroup_id(&self) -> Tile {
+    pub(crate) fn subgroup_id(&self) -> Tile {
         Tile::builtin(Builtin::SubgroupId)
     }
     /// `@builtin(subgroup_invocation_id)`.
-    pub fn subgroup_lane(&self) -> Tile {
+    pub(crate) fn subgroup_lane(&self) -> Tile {
         Tile::builtin(Builtin::SubgroupLane)
     }
     /// `@builtin(subgroup_size)`.
-    pub fn subgroup_size(&self) -> Tile {
+    pub(crate) fn subgroup_size(&self) -> Tile {
         Tile::builtin(Builtin::SubgroupSize)
+    }
+    /// `@builtin(num_subgroups)`.
+    pub(crate) fn num_subgroups(&self) -> Tile {
+        Tile::builtin(Builtin::NumSubgroups)
     }
     /// `@builtin(local_invocation_index)` — flat lane within the workgroup.
     pub fn lane(&self) -> Tile {

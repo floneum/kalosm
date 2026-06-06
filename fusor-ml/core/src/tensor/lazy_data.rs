@@ -56,7 +56,9 @@ impl LazyTensorData {
 
     pub(crate) fn nary(&self, nary: NaryOperation) -> Self {
         let device = self.device.clone();
-        let info = self.info.clone();
+        let mut info = self.info.clone();
+        info.shape = nary.shape.clone();
+        info.datatype = nary.output_datatype;
         let key = device.compute_graph().create_nary(nary);
 
         Self::from_parts(device, info, key)
@@ -197,6 +199,17 @@ impl LazyTensorData {
     pub(crate) fn materialize(&self) -> (TensorData, usize) {
         let result = self.device.compute_graph().resolve(self.key);
         (result.data, result.total_kernels)
+    }
+
+    pub(crate) fn materialize_with_tail<T>(
+        &self,
+        tail: impl FnOnce(&TensorData, &mut wgpu::CommandEncoder) -> T,
+    ) -> (TensorData, usize, T) {
+        let (result, tail_result) = self
+            .device
+            .compute_graph()
+            .resolve_with_tail(self.key, tail);
+        (result.data, result.total_kernels, tail_result)
     }
 
     #[cfg(feature = "graphvis")]

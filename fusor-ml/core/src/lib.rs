@@ -5,7 +5,6 @@
 pub use device::*;
 pub use element_wise::CastTensor;
 pub use fusor_gguf::GgufReadError;
-pub use fusor_tile_ir_kernels::PairedEpilogue;
 pub use fusor_types::{
     Layout, SlidingWindow, StrideSpec, TILE_SIZE, TensorSlice, slice_shape, slice_strides,
 };
@@ -26,6 +25,7 @@ pub use resize::ShapeWithOneHole;
 
 mod composite;
 mod compute_graph;
+mod conv;
 pub use compute_graph::NodeIndex;
 mod device;
 mod element_wise;
@@ -53,7 +53,10 @@ mod slice_assign;
 mod softmax;
 mod tensor;
 mod top_k;
-pub use top_k::{GpuMirostat2Sampler, GpuMirostat2SamplerParams};
+pub use top_k::{
+    GpuMirostat2Sampler, GpuMirostat2SamplerParams, GpuStandardSamplerParams,
+    PendingGpuSampledToken,
+};
 mod visit_tiled;
 
 #[derive(thiserror::Error, Debug)]

@@ -6,8 +6,20 @@ publish = false
 
 [dependencies]
 fusor = { path = "../fusor", features = ["graphvis"] }
-tokio = { version = "1", features = ["full"] }
-rand = { workspace = true }
+rand = { version = "0.9", default-features = false, features = ["std", "std_rng"] }
 half = "2.4"
 fusor-types = { path = "../types" }
 thiserror.workspace = true
+bytemuck = "1.14"
+web-time = { workspace = true }
+burn = { version = "0.21.0", default-features = false, features = ["std", "webgpu", "fusion"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[features]
+burn-bench = ["dep:burn"]

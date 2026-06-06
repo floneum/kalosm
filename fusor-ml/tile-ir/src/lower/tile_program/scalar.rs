@@ -1,6 +1,8 @@
 use super::*;
 use crate::ir::ReduceKind;
 
+const WGSL_SAFE_F32_MAX: f32 = 3.40282e38;
+
 struct LoopReduceValue<'a> {
     value: &'a Expr,
     iterations: u32,
@@ -124,6 +126,17 @@ impl<'a> Lowerer<'a> {
 
         let lane = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
         let lane_ptr = self.tile_dynamic_pointer(expressions, scratch_tile, lane, body)?;
+        // Barrier *before* seeding the scratch: when this reduction reuses
+        // workgroup memory that a previous reduction/staging in the same kernel
+        // already touched (e.g. fused decode kernels), a lane could otherwise
+        // overwrite `scratch[lane]` while another lane is still reading the
+        // prior value, producing a non-deterministic reduction. Without
+        // subgroups every reduction goes through this path, so the hazard only
+        // shows up on devices that disable subgroups (the web build).
+        body.push(
+            Statement::ControlBarrier(Barrier::WORK_GROUP),
+            Span::default(),
+        );
         body.push(
             Statement::Store {
                 pointer: lane_ptr,
@@ -274,8 +287,8 @@ impl<'a> Lowerer<'a> {
         let (f32_value, f16_value, u32_value, bool_value) = match op {
             TileReduceOp::Sum => (0.0_f32, 0.0_f32, 0_u32, false),
             TileReduceOp::Product => (1.0_f32, 1.0_f32, 1_u32, true),
-            TileReduceOp::Max => (f32::MIN, -65504.0, 0_u32, false),
-            TileReduceOp::Min => (f32::MAX, 65504.0, u32::MAX, true),
+            TileReduceOp::Max => (-WGSL_SAFE_F32_MAX, -65504.0, 0_u32, false),
+            TileReduceOp::Min => (WGSL_SAFE_F32_MAX, 65504.0, u32::MAX, true),
         };
         match element {
             ElementType::F32 => Expression::Literal(Literal::F32(f32_value)),

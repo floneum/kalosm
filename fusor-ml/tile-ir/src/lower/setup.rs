@@ -107,6 +107,10 @@ impl<'a> Lowerer<'a> {
             workgroup_invocations,
             workgroup_size,
             caps,
+            subgroup_id_arg: None,
+            subgroup_invocation_id_arg: None,
+            subgroup_size_arg: None,
+            num_subgroups_arg: None,
             buffer_decls: analysis.buffers,
             tile_decls: analysis.tiles,
             local_decls: analysis.locals,
@@ -171,8 +175,16 @@ impl<'a> Lowerer<'a> {
             (self.caps.subgroup_size, BuiltIn::SubgroupSize),
             (self.caps.num_subgroups, BuiltIn::NumSubgroups),
         ];
-        for (used, builtin) in optional_subgroup_args {
+        for (index, (used, builtin)) in optional_subgroup_args.into_iter().enumerate() {
             if used {
+                let arg = arguments.len() as u32;
+                match index {
+                    0 => self.subgroup_id_arg = Some(arg),
+                    1 => self.subgroup_invocation_id_arg = Some(arg),
+                    2 => self.subgroup_size_arg = Some(arg),
+                    3 => self.num_subgroups_arg = Some(arg),
+                    _ => unreachable!(),
+                }
                 arguments.push(builtin_arg(self.u32_ty, builtin));
             }
         }
@@ -213,7 +225,8 @@ impl<'a> Lowerer<'a> {
         if self.caps.native_f16_scales || self.caps.unpacks_f16 {
             capabilities |= naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32;
         }
-        if self.caps.uses_subgroup_reduce || self.caps.subgroup_id {
+        let uses_subgroups = self.caps.uses_subgroups();
+        if uses_subgroups {
             capabilities |= naga::valid::Capabilities::SUBGROUP;
         }
         if self.caps.uses_coop {
@@ -226,6 +239,7 @@ impl<'a> Lowerer<'a> {
         Ok(NagaKernel {
             module: self.module,
             info,
+            wgsl_extensions: WgslExtensions::new(uses_subgroups),
         })
     }
 
@@ -256,6 +270,7 @@ impl<'a> Lowerer<'a> {
                     }),
                     ty,
                     init: None,
+                    memory_decorations: naga::MemoryDecorations::empty(),
                 },
                 Span::default(),
             );
@@ -280,6 +295,7 @@ impl<'a> Lowerer<'a> {
                     binding: None,
                     ty,
                     init: None,
+                    memory_decorations: naga::MemoryDecorations::empty(),
                 },
                 Span::default(),
             );

@@ -368,8 +368,7 @@ impl Resolver {
             && first.in_shape == second.in_shape
             && first.out_shape == second.out_shape
             && first.pre_element_wise_expr == second.pre_element_wise_expr
-            && first.paired.is_none()
-            && second.paired.is_none()
+            && first.post_accumulator_offsets == second.post_accumulator_offsets
     }
 
     pub(super) fn qmatmul_output_expr(
@@ -378,9 +377,10 @@ impl Resolver {
         rank: usize,
     ) -> Option<NaryExpr> {
         if let Some(epilogue) = &qmatmul.post_element_wise_expr {
-            let mut mapping = Vec::with_capacity(1 + epilogue.extras.len());
-            mapping.push(0);
-            mapping.extend((0..epilogue.extras.len()).map(|i| extras.len() + 1 + i));
+            let value_arity = qmatmul.post_accumulator_offsets.len().max(1);
+            let mut mapping = Vec::with_capacity(value_arity + epilogue.extras.len());
+            mapping.extend(0..value_arity);
+            mapping.extend((0..epilogue.extras.len()).map(|i| extras.len() + value_arity + i));
             extras.extend(epilogue.extras.iter().copied());
             Some(epilogue.expression.remap_inputs(&mapping))
         } else {

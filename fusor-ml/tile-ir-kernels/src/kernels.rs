@@ -6,7 +6,7 @@ mod matmul;
 mod mirostat;
 mod qdequantize;
 mod qgemv;
-mod qgemv_paired_q4k;
+mod qgemv_q4k_ggml;
 mod qgemv_q6k;
 mod qmatmul;
 mod qmatmul_workgroup;
@@ -25,14 +25,11 @@ pub use helpers::AccumCast;
 pub use matmul::{
     batched_gemv_with_epilogues, batched_matmul_register_with_epilogues,
     batched_matmul_with_epilogues, try_batched_coop_matmul, DenseCoopMatmulTile, DenseMatmulShape,
-    DenseMatmulTensors,
+    DenseMatmulTensors, DenseMatmulTile,
 };
-pub use mirostat::{mirostat2, Mirostat2};
+pub use mirostat::{mirostat2, standard_sampler, Mirostat2, StandardSampler};
 pub use qdequantize::qdequantize;
 pub use qgemv::{qgemv_with_epilogue, IntoQgemvEpilogues};
-pub use qgemv_paired_q4k::{
-    qgemv_q4k_paired, qgemv_q4k_paired_dispatch, Q4KPairedGgml, Q4KPairedShape,
-};
 pub use qmatmul::qmatmul_with_epilogue;
 pub use qmatmul_workgroup::{
     qgemv_workgroup_f16_with_epilogue, qgemv_workgroup_storage_f16_with_epilogue,

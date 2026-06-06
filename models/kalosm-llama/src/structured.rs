@@ -10,7 +10,7 @@ use kalosm_sample::{LiteralParser, ParseStatus, Parser, ParserExt};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::model::LlamaModelError;
-use crate::sampler::{CpuMirostat2Sampler, Logit, Logits};
+use crate::sampler::{CpuSampler, Logit, Logits};
 use crate::token_stream::TokenOutputStream;
 use crate::{LlamaModel, LlamaSession};
 
@@ -21,7 +21,7 @@ pub(crate) async fn generate_structured<F, P: Parser>(
     session: &mut LlamaSession<F>,
     parser: P,
     parser_state: P::PartialState,
-    mut sampler: CpuMirostat2Sampler,
+    mut sampler: CpuSampler,
     mut on_token: impl FnMut(String) -> Result<(), LlamaModelError>,
     top_k: Option<usize>,
 ) -> Result<P::Output, LlamaModelError>

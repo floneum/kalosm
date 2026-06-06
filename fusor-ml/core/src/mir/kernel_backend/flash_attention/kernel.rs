@@ -18,12 +18,12 @@ use crate::{
 };
 
 use super::{
-    DECODE_HEAD_DIM, DECODE_SMALL_BLOCK, FLASH_STREAMING_SUBGROUP_SIZES,
-    FLASH_STREAMING_TILED_Q_BLOCK, FlashAttentionDirectKernelVariant, FlashAttentionKernelVariant,
-    FlashAttentionOperation, FlashDecodeSmallMeta, FlashDecodeSmallTensors, TensorMeta,
-    build_flash_decode_small_meta, dispatch_streaming_flash_attention,
-    dispatch_streaming_tiled_flash_attention, flash_attention_module_cache,
-    flash_streaming_tiled_eligible, select_flash_attention_variant, streaming_dispatch_size,
+    DECODE_SMALL_BLOCK, FLASH_STREAMING_SUBGROUP_SIZES, FLASH_STREAMING_TILED_Q_BLOCK,
+    FlashAttentionDirectKernelVariant, FlashAttentionKernelVariant, FlashAttentionOperation,
+    FlashDecodeSmallMeta, FlashDecodeSmallTensors, TensorMeta, build_flash_decode_small_meta,
+    dispatch_streaming_flash_attention, dispatch_streaming_tiled_flash_attention,
+    flash_attention_module_cache, flash_streaming_tiled_eligible, select_flash_attention_variant,
+    streaming_dispatch_size,
 };
 
 fn flash_decode_cache_variant(
@@ -169,13 +169,6 @@ impl Operation for FlashAttentionOperation {
         let output = inputs.get(output_index)?.as_tensor()?.clone();
         let device = graph.device();
 
-        // Streaming kernel: pick the effective hardware subgroup size and
-        // dispatch a monomorphization tiled to match.
-        let streaming_subgroup_size = device.fixed_width_subgroup_size()?;
-        if !FLASH_STREAMING_SUBGROUP_SIZES.contains(&streaming_subgroup_size) {
-            return None;
-        }
-
         let input_dtype = self.input_dtype;
         if !matches!(input_dtype, DataTypeEnum::F32 | DataTypeEnum::F16) {
             return None;
@@ -230,7 +223,7 @@ impl Operation for FlashAttentionOperation {
             input_dtype == DataTypeEnum::F32 && selected_variant.decode_block().is_some();
         let decode_candidate = mask_meta.is_none()
             && dims.q_seq_len == 1
-            && dims.head_dim == DECODE_HEAD_DIM
+            && dims.head_dim > 0
             && input_dtype == DataTypeEnum::F32;
         assert!(
             !decode_candidate || selected_variant.decode_block().is_some(),
@@ -260,20 +253,38 @@ impl Operation for FlashAttentionOperation {
         };
         let variant = if decode_eligible {
             selected_variant.kernel_variant()
-        } else if flash_streaming_tiled_eligible(dims) {
-            FlashAttentionKernelVariant::StreamingTiled
         } else {
-            FlashAttentionKernelVariant::Streaming
+            // Decode-small uses workgroup reductions only. The streaming
+            // kernels partition lanes by the hardware subgroup width, so
+            // construct those variants only with a trusted fixed subgroup.
+            let subgroup = device.subgroup_token()?;
+            let subgroup_size = device.fixed_width_subgroup_size()?;
+            if !FLASH_STREAMING_SUBGROUP_SIZES.contains(&subgroup_size) {
+                return None;
+            }
+            if flash_streaming_tiled_eligible(dims) {
+                FlashAttentionKernelVariant::StreamingTiled {
+                    subgroup,
+                    subgroup_size,
+                }
+            } else {
+                FlashAttentionKernelVariant::Streaming {
+                    subgroup,
+                    subgroup_size,
+                }
+            }
         };
         let dispatch_size = match variant {
-            FlashAttentionKernelVariant::Streaming => streaming_dispatch_size(
-                dims,
-                tile_ir_kernels::flash_outputs_per_workgroup(streaming_subgroup_size),
-            ),
-            FlashAttentionKernelVariant::StreamingTiled => {
+            FlashAttentionKernelVariant::Streaming { subgroup_size, .. } => {
+                streaming_dispatch_size(
+                    dims,
+                    tile_ir_kernels::flash_outputs_per_workgroup(subgroup_size),
+                )
+            }
+            FlashAttentionKernelVariant::StreamingTiled { subgroup_size, .. } => {
                 tile_ir_kernels::flash_tiled_dispatch_size(
                     dims,
-                    tile_ir_kernels::flash_tiled_outputs_per_workgroup(streaming_subgroup_size),
+                    tile_ir_kernels::flash_tiled_outputs_per_workgroup(subgroup_size),
                     FLASH_STREAMING_TILED_Q_BLOCK,
                 )
             }
@@ -303,7 +314,7 @@ impl Operation for FlashAttentionOperation {
                 .checked_mul(meta.dims.num_heads)
                 .expect("flash split decode row overflow");
             let scratch_elements =
-                rows as u64 * meta.split_blocks as u64 * (DECODE_HEAD_DIM as u64 + 2);
+                rows as u64 * meta.split_blocks as u64 * (meta.dims.head_dim as u64 + 2);
             let scratch_buffer = device.create_buffer(
                 scratch_elements * std::mem::size_of::<f32>() as u64,
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
@@ -405,8 +416,8 @@ impl Operation for FlashAttentionOperation {
         }
 
         let kernel_label = match variant {
-            FlashAttentionKernelVariant::Streaming => "flash_attention",
-            FlashAttentionKernelVariant::StreamingTiled => "flash_attention_tiled",
+            FlashAttentionKernelVariant::Streaming { .. } => "flash_attention",
+            FlashAttentionKernelVariant::StreamingTiled { .. } => "flash_attention_tiled",
             FlashAttentionKernelVariant::DecodeSmall => "flash_attention_decode",
             FlashAttentionKernelVariant::DecodeSplitPartials => {
                 "flash_attention_decode_split_partials"
@@ -427,7 +438,6 @@ impl Operation for FlashAttentionOperation {
             >(|state| {
                 variant.hash(state);
                 self.scale.to_bits().hash(state);
-                streaming_subgroup_size.hash(state);
                 self.causal.hash(state);
             });
             self.kernel_module_key_with_dispatch(
@@ -509,20 +519,10 @@ impl Operation for FlashAttentionOperation {
                         causal,
                     };
                     match variant {
-                        FlashAttentionKernelVariant::StreamingTiled => {
-                            dispatch_streaming_tiled_flash_attention(
-                                &mut kb,
-                                q_ref,
-                                k_ref,
-                                v_ref,
-                                mask_ref,
-                                output_ref,
-                                stream_meta,
-                                input_dtype,
-                                streaming_subgroup_size,
-                            )
-                        }
-                        _ => dispatch_streaming_flash_attention(
+                        FlashAttentionKernelVariant::StreamingTiled {
+                            subgroup,
+                            subgroup_size,
+                        } => dispatch_streaming_tiled_flash_attention(
                             &mut kb,
                             q_ref,
                             k_ref,
@@ -531,8 +531,29 @@ impl Operation for FlashAttentionOperation {
                             output_ref,
                             stream_meta,
                             input_dtype,
-                            streaming_subgroup_size,
+                            subgroup,
+                            subgroup_size,
                         ),
+                        FlashAttentionKernelVariant::Streaming {
+                            subgroup,
+                            subgroup_size,
+                        } => dispatch_streaming_flash_attention(
+                            &mut kb,
+                            q_ref,
+                            k_ref,
+                            v_ref,
+                            mask_ref,
+                            output_ref,
+                            stream_meta,
+                            input_dtype,
+                            subgroup,
+                            subgroup_size,
+                        ),
+                        FlashAttentionKernelVariant::DecodeSmall
+                        | FlashAttentionKernelVariant::DecodeSplitPartials
+                        | FlashAttentionKernelVariant::DecodeSplitReduce => {
+                            unreachable!("decode variants are handled before streaming IR build")
+                        }
                     }
                 }?;
                 Some(kb.finish().0)

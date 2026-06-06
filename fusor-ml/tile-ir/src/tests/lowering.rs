@@ -5,6 +5,10 @@ fn f32() -> ElementType {
     ScalarElement::F32.element()
 }
 
+fn u32() -> ElementType {
+    ScalarElement::U32.element()
+}
+
 #[test]
 fn op_enum_is_source_tile_program_only() {
     let ir = tile::build(|phase| {
@@ -33,7 +37,7 @@ fn tile_source_softmax_lowers_to_naga() {
             let row = program.program_id(WorkgroupAxis::Y);
             let col = program.lane();
             let mask = col.lt(COLS);
-            let values = program.load(x.at((&row, &col)), mask.clone(), f32::MIN);
+            let values = program.load(x.at((&row, &col)), mask.clone(), -3.40282e38);
             let max = program.reduce_max(values.clone());
             let exp = (values - max).exp();
             let sum = program.reduce_sum(exp.clone());
@@ -41,7 +45,50 @@ fn tile_source_softmax_lowers_to_naga() {
         });
     });
 
-    lower_or_fail(&ir, "tile softmax");
+    let lowered = lower_or_fail(&ir, "tile softmax");
+    let mut wgsl = String::new();
+    let mut writer =
+        naga::back::wgsl::Writer::new(&mut wgsl, naga::back::wgsl::WriterFlags::empty());
+    writer
+        .write(lowered.module(), lowered.info())
+        .expect("WGSL serialization should succeed");
+    naga::front::wgsl::parse_str(&wgsl).expect("WGSL should parse after serialization");
+}
+
+#[test]
+fn subgroup_reduce_records_wgsl_extension_requirement() {
+    let ir = tile::build(|phase| {
+        let subgroup = crate::SubgroupToken::new_unchecked();
+        let x = phase.storage_read(f32(), Shape::new([32]));
+        let y = phase.storage_write(f32(), Shape::new([32]));
+        phase.program_grid(32, [1, 1, 1], |program| {
+            let lane = program.lane();
+            let mask = lane.clone().lt(32u32);
+            let value = program.load(x.at(lane.clone()), mask.clone(), 0.0);
+            let max = subgroup.subgroup_reduce_max(program, value);
+            program.store(y.at(lane), max, mask);
+        });
+    });
+
+    let lowered = lower_or_fail(&ir, "subgroup reduce");
+    assert!(lowered.wgsl_extensions().subgroups());
+    assert_eq!(lowered.wgsl_extension_prelude(), "enable subgroups;\n\n");
+}
+
+#[test]
+fn subgroup_builtins_use_subgroup_capability_and_wgsl_extension() {
+    let ir = tile::build(|phase| {
+        let subgroup = crate::SubgroupToken::new_unchecked();
+        let y = phase.storage_write(u32(), Shape::new([32]));
+        phase.program_grid(32, [1, 1, 1], |program| {
+            let lane = program.lane();
+            let value = subgroup.subgroup_lane(program) + subgroup.subgroup_size(program);
+            program.store(y.at(lane), value, true);
+        });
+    });
+
+    let lowered = lower_or_fail(&ir, "subgroup builtins");
+    assert!(lowered.wgsl_extensions().subgroups());
 }
 
 #[test]
@@ -200,10 +247,11 @@ fn typed_coop_accumulator_records_scalar_role_and_shape() {
     // the StoreLocal reaching it carries that element type. The IR is a tree, so
     // we inspect the emitted body directly (there is no `locals()` side-table).
     let ir = tile::build(|phase| {
+        let coop = crate::CoopMatrixToken::new_unchecked();
         phase.program_grid(32, [1, 1, 1], |program| {
-            let acc = program.alloc_coop_acc(ScalarElement::F32, 8, 8);
-            let zero = program.coop_zero(ScalarElement::F32, 8, 8);
-            program.store_local_coop(&acc, zero);
+            let acc = coop.alloc_coop_acc(program, ScalarElement::F32, 8, 8);
+            let zero = coop.coop_zero(program, ScalarElement::F32, 8, 8);
+            coop.store_local_coop(program, &acc, zero);
         });
     });
 

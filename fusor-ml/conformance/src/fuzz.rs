@@ -211,8 +211,8 @@ impl<const R: usize, T: SimdElement + DataType> FuzzGenerator<R, T> {
         let shape = self.sample_shape(&mut shape_rng);
         let mut rng = rand::rngs::StdRng::seed_from_u64(self.value_seed_for_run(run));
         let base = random_tensor(device, shape, &mut rng, &*self.distribution);
-        // Vary layout based on run index: even runs stay contiguous, odd runs
-        // get a non-contiguous layout so operations are tested with both.
+        // Vary layout based on run index so operations see contiguous,
+        // transposed-stride, and sliced-offset inputs.
         let strategy = run % 3;
         match strategy {
             0 => base,
@@ -286,6 +286,25 @@ fn make_sliced<const R: usize, T: SimdElement + DataType + Default>(
     padded.narrow(pad_dim, pad, shape[pad_dim]).to_concrete()
 }
 
+/// Replace a generator's shape specs with a wider sweep (e.g. `Choices`/`Range`)
+/// without rebuilding it, so a consolidated case can fuzz small + large shapes in
+/// one assertion. The value distribution, seeds, and sampler are preserved.
+///
+/// Lives here because `FuzzGenerator::shape_specs` is private.
+///
+/// ```ignore
+/// let gen = with_shape_specs(FuzzGenerator::<2, f32>::new([45, 45]), [[45, 256], [45, 256]]);
+/// // sweep small and large in one case:
+/// assert(op).arg(gen).equal_to(/* ... */).runs(6);
+/// ```
+pub fn with_shape_specs<const R: usize, T: SimdElement + DataType>(
+    mut generator: FuzzGenerator<R, T>,
+    shapes: impl IntoFuzzShape<R>,
+) -> FuzzGenerator<R, T> {
+    generator.shape_specs = shapes.into_shape_specs();
+    generator
+}
+
 impl<const R: usize> FuzzGenerator<R, f32> {
     pub fn with_positive(mut self) -> Self {
         self.distribution =
@@ -298,6 +317,10 @@ impl<const R: usize> FuzzGenerator<R, f32> {
 pub trait GenerateFromDevice {
     type Output;
     fn generate(&mut self, device: &Device, run: usize) -> Self::Output;
+
+    fn run_label_fragment(&self, _run: usize) -> Option<&'static str> {
+        None
+    }
 }
 
 impl<F, O> GenerateFromDevice for F
@@ -314,6 +337,14 @@ impl<const R: usize, T: SimdElement + DataType> GenerateFromDevice for FuzzGener
     type Output = Tensor<R, T>;
     fn generate(&mut self, device: &Device, run: usize) -> Self::Output {
         self.generate_for_run(device, run)
+    }
+
+    fn run_label_fragment(&self, run: usize) -> Option<&'static str> {
+        Some(match run % 3 {
+            0 => "contiguous",
+            1 => "transposed",
+            _ => "sliced",
+        })
     }
 }
 
@@ -372,5 +403,27 @@ mod api_tests {
         for run in 0..24 {
             assert_eq!(first.shape_for_run(run), second.shape_for_run(run));
         }
+    }
+
+    #[test]
+    fn fuzz_generator_reports_layout_run_labels() {
+        let generator = FuzzGenerator::<2, f32>::new([2, 2]);
+
+        assert_eq!(
+            crate::GenerateFromDevice::run_label_fragment(&generator, 0),
+            Some("contiguous")
+        );
+        assert_eq!(
+            crate::GenerateFromDevice::run_label_fragment(&generator, 1),
+            Some("transposed")
+        );
+        assert_eq!(
+            crate::GenerateFromDevice::run_label_fragment(&generator, 2),
+            Some("sliced")
+        );
+        assert_eq!(
+            crate::GenerateFromDevice::run_label_fragment(&generator, 3),
+            Some("contiguous")
+        );
     }
 }

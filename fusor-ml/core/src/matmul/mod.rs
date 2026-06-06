@@ -12,6 +12,7 @@ pub mod sgemv;
 mod sgemv_params;
 mod variants;
 
+pub(crate) use variants::CoopTile;
 use variants::select_dense_matmul_params;
 
 pub fn get_optimal_params(m: usize, n: usize, k: usize, device: &Device) -> MatMulParams {
@@ -231,60 +232,62 @@ mod selection_tests {
 
     #[test]
     fn direct_tile_coop_selector_prefers_largest_supported_tile() {
+        let select =
+            |m, k, n, max_workgroup_size_x| CoopTile::select(m, k, n, max_workgroup_size_x, 32);
         // 4096³ (square) hits Tile128x512 — it has fewer barriers than
         // Tile256x256 because it's double-buffered.
         assert_eq!(
-            CoopTile::select(4096, 4096, 4096, 512),
+            select(4096, 4096, 4096, 512),
             Some(CoopTile::new(128, 512, 16))
         );
         // Shapes where N is divisible by 256 but not 512 — with enough
         // tiles — fall to Tile256x256 single-buffer.
         assert_eq!(
-            CoopTile::select(8192, 1024, 4352, 512),
+            select(8192, 1024, 4352, 512),
             Some(CoopTile::new(256, 256, 16))
         );
         // N=512 doesn't divide 256 on the M side... actually wait, 4096 % 256 == 0.
         // For shapes where N is divisible by 512 but M isn't by 256, fall to
         // Tile128x512.
         assert_eq!(
-            CoopTile::select(384, 1024, 1024, 512),
+            select(384, 1024, 1024, 512),
             Some(CoopTile::new(128, 64, 16))
         );
         // 1024³ doesn't have enough tiles for Tile128x512 OR Tile128x256;
         // falls back to Tile128x64 for better parallelism.
         assert_eq!(
-            CoopTile::select(1024, 1024, 1024, 512),
+            select(1024, 1024, 1024, 512),
             Some(CoopTile::new(128, 64, 16))
         );
         // 8192x256 has tiles_for(128, 256) = 64*1 = 64 — below the threshold,
         // so it falls to Tile128x64.
         assert_eq!(
-            CoopTile::select(8192, 1024, 256, 256),
+            select(8192, 1024, 256, 256),
             Some(CoopTile::new(128, 64, 16))
         );
         // M=4096, N=1024 gives tiles_for(128, 256) = 32*4 = 128. Below 256.
         // Falls to Tile128x64.
         assert_eq!(
-            CoopTile::select(4096, 1024, 1024, 256),
+            select(4096, 1024, 1024, 256),
             Some(CoopTile::new(128, 64, 16))
         );
         // M=8192, N=512 gives tiles_for(128, 256) = 64*2 = 128 (still <256),
         // so falls to Tile128x64. To hit Tile128x256 we need a wider shape:
         // 8192x1024 → 64*4 = 256 ✓.
         assert_eq!(
-            CoopTile::select(8192, 1024, 1024, 256),
+            select(8192, 1024, 1024, 256),
             Some(CoopTile::new(128, 256, 16))
         );
         // N=128 doesn't divide 256 so Tile128x256/Tile128x512 are out; falls
         // back to Tile128x64.
         assert_eq!(
-            CoopTile::select(1024, 1024, 128, 256),
+            select(1024, 1024, 128, 256),
             Some(CoopTile::new(128, 64, 16))
         );
         assert_eq!(
-            CoopTile::select(1024, 1024, 1024, 128),
+            select(1024, 1024, 1024, 128),
             Some(CoopTile::new(64, 64, 16))
         );
-        assert_eq!(CoopTile::select(1000, 1024, 1024, 512), None);
+        assert_eq!(select(1000, 1024, 1024, 512), None);
     }
 }

@@ -42,6 +42,11 @@ impl<T: DataType + SimdElement + Default> Linear<T> {
         self.weight.shape()[0]
     }
 
+    /// Get the quantized weight matrix.
+    pub fn weight(&self) -> &QMatrix {
+        &self.weight
+    }
+
     /// Cast the Linear layer to a different data type
     pub fn cast<U: DataType + SimdElement + Default>(self) -> Linear<U>
     where

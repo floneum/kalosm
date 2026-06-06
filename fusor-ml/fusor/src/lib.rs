@@ -78,6 +78,7 @@ pub use crate::gpu::{
 
 pub use crate::gpu::{
     GpuMirostat2Sampler as Mirostat2Sampler, GpuMirostat2SamplerParams as Mirostat2SamplerParams,
+    GpuSampledToken, GpuStandardSamplerParams as StandardSamplerParams,
 };
 
 /// Runtime dispatch wrapper - holds either CPU or GPU version of an operation/tensor type.
@@ -381,6 +382,20 @@ where
         }
     }
 
+    /// Resolve any pending work for this tensor without downloading it.
+    pub async fn materialize(&self)
+    where
+        B: TensorBacking<R>,
+        D: SimdElement + DataType,
+    {
+        match self {
+            Tensor::Cpu(t) => {
+                let _ = t.to_concrete();
+            }
+            Tensor::Gpu(t) => t.materialize().await,
+        }
+    }
+
     /// Returns the shape of the tensor.
     pub fn shape(&self) -> [usize; R]
     where
@@ -458,6 +473,26 @@ where
         }
     }
 
+    pub async fn sample_standard_token(
+        &self,
+        previous_tokens: &[u32],
+        params: StandardSamplerParams,
+    ) -> Result<u32, Error> {
+        match self {
+            Tensor::Cpu(_) => {
+                let top = self.top_k_pairs(params.top_k).await?;
+                Ok(top
+                    .first()
+                    .map(|(token_id, _)| *token_id)
+                    .unwrap_or_default())
+            }
+            Tensor::Gpu(t) => t
+                .sample_standard_token(previous_tokens, params)
+                .await
+                .map_err(Error::Gpu),
+        }
+    }
+
     pub async fn try_sample_mirostat2_token_q_mat(
         &self,
         weights: &crate::QMatrix,
@@ -469,6 +504,63 @@ where
             (Tensor::Gpu(t), crate::QMatrix::Gpu(weights)) => t
                 .try_sample_mirostat2_token_q_mat(weights, sampler, previous_tokens, params)
                 .await
+                .map_err(Error::Gpu),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn try_sample_mirostat2_token_q_mat_pending(
+        &self,
+        weights: &crate::QMatrix,
+        sampler: &mut Mirostat2Sampler,
+        previous_tokens: &[u32],
+        previous_gpu_token: Option<&GpuSampledToken>,
+        params: Mirostat2SamplerParams,
+    ) -> Result<Option<GpuSampledToken>, Error> {
+        match (self, weights) {
+            (Tensor::Gpu(t), crate::QMatrix::Gpu(weights)) => t
+                .try_sample_mirostat2_token_q_mat_pending(
+                    weights,
+                    sampler,
+                    previous_tokens,
+                    previous_gpu_token,
+                    params,
+                )
+                .map_err(Error::Gpu),
+            _ => Ok(None),
+        }
+    }
+
+    pub async fn try_sample_standard_token_q_mat(
+        &self,
+        weights: &crate::QMatrix,
+        previous_tokens: &[u32],
+        params: StandardSamplerParams,
+    ) -> Result<Option<u32>, Error> {
+        match (self, weights) {
+            (Tensor::Gpu(t), crate::QMatrix::Gpu(weights)) => t
+                .try_sample_standard_token_q_mat(weights, previous_tokens, params)
+                .await
+                .map_err(Error::Gpu),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn try_sample_standard_token_q_mat_pending(
+        &self,
+        weights: &crate::QMatrix,
+        previous_tokens: &[u32],
+        previous_gpu_token: Option<&GpuSampledToken>,
+        params: StandardSamplerParams,
+    ) -> Result<Option<GpuSampledToken>, Error> {
+        match (self, weights) {
+            (Tensor::Gpu(t), crate::QMatrix::Gpu(weights)) => t
+                .try_sample_standard_token_q_mat_pending(
+                    weights,
+                    previous_tokens,
+                    previous_gpu_token,
+                    params,
+                )
                 .map_err(Error::Gpu),
             _ => Ok(None),
         }
@@ -1077,8 +1169,6 @@ where
     /// * If R < 2 (matrix multiplication requires at least 2 dimensions)
     /// * If weights is not 2D
     pub fn q_mat_mul(&self, weights: &crate::QMatrix) -> Tensor<R, f32> {
-        use crate::QMatrix;
-
         assert_eq!(
             weights.shape().len(),
             2,
@@ -1150,8 +1240,6 @@ where
     }
 
     pub fn q_mat_mul_paired_silu_product(&self, weights: &crate::QMatrix) -> Tensor<R, f32> {
-        use crate::QMatrix;
-
         assert_eq!(
             weights.shape().len(),
             2,
@@ -1163,24 +1251,15 @@ where
             "q_mat_mul_paired_silu_product requires an even output dimension"
         );
 
-        match (self, weights) {
-            (Tensor::Gpu(lhs), QMatrix::Gpu(rhs))
-                if weights.ggml_type() == fusor_gguf::GgmlType::Q4K =>
-            {
-                Tensor::Gpu(lhs.q_mat_mul_paired_silu_product(rhs))
-            }
-            _ => {
-                let pair_len = weights.shape()[0] / 2;
-                let projected = self.q_mat_mul(weights);
-                let gate = projected
-                    .narrow(crate::D::Minus1, 0, pair_len)
-                    .to_concrete();
-                let up = projected
-                    .narrow(crate::D::Minus1, pair_len, pair_len)
-                    .to_concrete();
-                (gate.silu() * up).to_concrete()
-            }
-        }
+        let pair_len = weights.shape()[0] / 2;
+        let projected = self.q_mat_mul(weights);
+        let gate = projected
+            .narrow(crate::D::Minus1, 0, pair_len)
+            .to_concrete();
+        let up = projected
+            .narrow(crate::D::Minus1, pair_len, pair_len)
+            .to_concrete();
+        (gate.silu() * up).to_concrete()
     }
 
     pub fn q_mat_mul_add2<B1, B2>(

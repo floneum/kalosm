@@ -39,8 +39,9 @@ pub use ir::{
     WorkgroupAxis,
 };
 pub use kernel_builder::{KernelBuilder, KernelTensorRef};
-pub use lower::{LowerError, NagaKernel};
+pub use lower::{LowerError, NagaKernel, WgslExtensions};
 pub use quantized::{GgmlQuantFormat, QuantizedMatrix};
+pub use tile::{CoopMatrixToken, SubgroupToken};
 
 #[cfg(test)]
 mod tests;

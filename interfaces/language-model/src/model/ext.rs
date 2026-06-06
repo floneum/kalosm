@@ -1,9 +1,9 @@
 use futures_channel::mpsc::UnboundedReceiver;
 use futures_channel::oneshot::Receiver;
-use futures_util::Future;
 use futures_util::FutureExt;
 use futures_util::Stream;
 use futures_util::StreamExt;
+use kalosm_model_types::{AnyWasmNotSend, FutureWasmNotSend};
 use std::any::Any;
 #[cfg(not(target_arch = "wasm32"))]
 use std::error::Error;
@@ -15,21 +15,13 @@ use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::task::Poll;
 
-// On wasm32, futures don't need to be Send, and Box<dyn Any> doesn't need Send
-#[cfg(not(target_arch = "wasm32"))]
-type BoxedTaskFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
-#[cfg(target_arch = "wasm32")]
-type BoxedTaskFuture = Pin<Box<dyn Future<Output = ()>>>;
+// On wasm32, futures don't need to be Send, and Box<dyn Any> doesn't need Send. The
+// `WasmNot*` marker traits encode that, so these aliases don't need to be cfg-split.
+type BoxedTaskFuture = Pin<Box<dyn FutureWasmNotSend<Output = ()>>>;
 
-#[cfg(not(target_arch = "wasm32"))]
-type BoxedAny = Box<dyn Any + Send>;
-#[cfg(target_arch = "wasm32")]
-type BoxedAny = Box<dyn Any>;
+type BoxedAny = Box<dyn AnyWasmNotSend>;
 
-#[cfg(not(target_arch = "wasm32"))]
-type BoxedIntoFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-#[cfg(target_arch = "wasm32")]
-type BoxedIntoFuture<T> = Pin<Box<dyn Future<Output = T>>>;
+type BoxedIntoFuture<T> = Pin<Box<dyn FutureWasmNotSend<Output = T>>>;
 
 use crate::GenerationParameters;
 use crate::MessageContent;
@@ -375,7 +367,7 @@ where
                 self.task.into_inner().unwrap().into_inner().unwrap().await;
             }
             let result = self.result.take().unwrap().await.unwrap();
-            result.map(|boxed| *boxed.downcast::<String>().unwrap())
+            result.map(|boxed| *(boxed as Box<dyn Any>).downcast::<String>().unwrap())
         })
     }
 }
@@ -483,7 +475,11 @@ where
                 self.task.into_inner().unwrap().into_inner().unwrap().await;
             }
             let result = self.result.take().unwrap().await.unwrap();
-            result.map(|boxed| *boxed.downcast::<Constraints::Output>().unwrap())
+            result.map(|boxed| {
+                *(boxed as Box<dyn Any>)
+                    .downcast::<Constraints::Output>()
+                    .unwrap()
+            })
         })
     }
 }

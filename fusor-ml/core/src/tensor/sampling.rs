@@ -11,15 +11,69 @@ impl Tensor {
     ) -> Result<Option<u32>, wgpu::BufferAsyncError> {
         self.assert_rank::<1>();
         self.assert_datatype::<f32>();
-        let (input, _) = self.data.materialize();
-        crate::top_k::qmat_mirostat2_sample_token_to_host(
-            &input,
+        crate::top_k::qmat_mirostat2_sample_lazy_token_to_host(
+            &self.data,
             matrix,
             sampler,
             previous_tokens,
             params,
         )
         .await
+    }
+
+    pub fn try_sample_mirostat2_token_q_mat_pending(
+        &self,
+        matrix: &QMatrix,
+        sampler: &mut crate::top_k::GpuMirostat2Sampler,
+        previous_tokens: &[u32],
+        previous_gpu_token: Option<&Tensor>,
+        params: crate::top_k::GpuMirostat2SamplerParams,
+    ) -> Option<crate::top_k::PendingGpuSampledToken> {
+        self.assert_rank::<1>();
+        self.assert_datatype::<f32>();
+        crate::top_k::qmat_mirostat2_sample_lazy_token_pending(
+            &self.data,
+            matrix,
+            sampler,
+            previous_tokens,
+            previous_gpu_token,
+            params,
+        )
+    }
+
+    pub async fn try_sample_standard_token_q_mat(
+        &self,
+        matrix: &QMatrix,
+        previous_tokens: &[u32],
+        params: crate::top_k::GpuStandardSamplerParams,
+    ) -> Result<Option<u32>, wgpu::BufferAsyncError> {
+        self.assert_rank::<1>();
+        self.assert_datatype::<f32>();
+        crate::top_k::qmat_standard_sample_lazy_token_to_host(
+            &self.data,
+            matrix,
+            previous_tokens,
+            params,
+        )
+        .await
+    }
+
+    pub fn try_sample_standard_token_q_mat_pending(
+        &self,
+        matrix: &QMatrix,
+        previous_tokens: &[u32],
+        previous_gpu_token: Option<&Tensor>,
+        params: crate::top_k::GpuStandardSamplerParams,
+    ) -> Option<crate::top_k::PendingGpuSampledToken> {
+        self.assert_rank::<1>();
+        self.assert_datatype::<f32>();
+        crate::top_k::qmat_standard_sample_lazy_token_pending(
+            &self.data,
+            matrix,
+            previous_tokens,
+            previous_gpu_token,
+            params,
+        )
     }
 
     pub async fn sample_mirostat2_token(
@@ -34,6 +88,24 @@ impl Tensor {
         if let Some(token) =
             crate::top_k::mirostat2_sample_token_to_host(&input, sampler, previous_tokens, params)
                 .await?
+        {
+            return Ok(token);
+        }
+
+        let (ids, _) = self.top_k_pairs(params.top_k).await?;
+        Ok(ids.first().copied().unwrap_or_default())
+    }
+
+    pub async fn sample_standard_token(
+        &self,
+        previous_tokens: &[u32],
+        params: crate::top_k::GpuStandardSamplerParams,
+    ) -> Result<u32, wgpu::BufferAsyncError> {
+        self.assert_rank::<1>();
+        self.assert_datatype::<f32>();
+        let (input, _) = self.data.materialize();
+        if let Some(token) =
+            crate::top_k::standard_sample_token_to_host(&input, previous_tokens, params).await?
         {
             return Ok(token);
         }

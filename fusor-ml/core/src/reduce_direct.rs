@@ -118,91 +118,185 @@ pub(crate) fn build_reduce_direct_kernel(
                 }
             };
 
-            kb.program()
-                .program_grid(BLOCK as u32, dispatch_size, |program| {
-                    let lane = program.lane();
-                    let group = linear_group(program, dispatch_size);
-                    let flat = group * BLOCK as u32 + lane.clone();
-                    let in_bounds = flat.lt(total_outputs);
-                    let dims = output_dims_from_flat_usize(flat.clone(), &output_shape);
-                    let base = layout_index(&input_meta_body, &dims);
-                    let value_at =
-                        |program: &mut tile_ir::tile::TileBlock<'_>,
-                         loop_index: tile_ir::tile::Tile| {
-                            let value_index = base.clone() + loop_index * reduce_stride;
-                            let value = input_storage.load(program, value_index, in_bounds.clone());
-                            let (value, value_ty) = apply_unary_function_chain(
-                                value.into_f32(),
-                                input_meta_body.datatype,
-                                &pre_chain,
-                            )
-                            .expect("validated reduce pre_element_wise chain");
-                            ValueTile::F32(value)
-                                .cast_to(value_ty)
-                                .cast_to(reduce_dtype)
+            let cooperative =
+                crate::reduce::use_cooperative_reduce(total_outputs, reduce_size, BLOCK as u32);
+            if cooperative {
+                let chunks = reduce_size.div_ceil(BLOCK as u32);
+                kb.program()
+                    .program_grid(BLOCK as u32, dispatch_size, |program| {
+                        let lane = program.lane();
+                        let output_flat = linear_group(program, dispatch_size);
+                        let in_bounds = output_flat.lt(total_outputs);
+                        let dims = output_dims_from_flat_usize(output_flat.clone(), &output_shape);
+                        let base = layout_index(&input_meta_body, &dims);
+                        let reduce_binary = reduce_op.binary();
+
+                        let value_at =
+                            |program: &mut tile_ir::tile::TileBlock<'_>,
+                             reduce_index: tile_ir::tile::Tile,
+                             active: tile_ir::tile::Mask| {
+                                let value_index = base.clone() + reduce_index * reduce_stride;
+                                let value =
+                                    input_storage.load(program, value_index, active.clone());
+                                let (value, value_ty) = apply_unary_function_chain(
+                                    value.into_f32(),
+                                    input_meta_body.datatype,
+                                    &pre_chain,
+                                )
+                                .expect("validated reduce pre_element_wise chain");
+                                let value = ValueTile::F32(value)
+                                    .cast_to(value_ty)
+                                    .cast_to(reduce_dtype);
+                                let identity = tile_ir::tile::Tile::literal(tile_literal_for(
+                                    initial,
+                                    reduce_dtype,
+                                ));
+                                match reduce_dtype {
+                                    DataTypeEnum::F32 => tile_ir::tile::Tile::select(
+                                        active,
+                                        value.into_f32(),
+                                        identity,
+                                    ),
+                                    DataTypeEnum::F16 => tile_ir::tile::Tile::select(
+                                        active,
+                                        value.into_f16(),
+                                        identity,
+                                    ),
+                                    DataTypeEnum::U32 => tile_ir::tile::Tile::select(
+                                        active,
+                                        value.into_u32(),
+                                        identity,
+                                    ),
+                                }
+                            };
+
+                        let initial_acc =
+                            tile_ir::tile::Tile::literal(tile_literal_for(initial, reduce_dtype));
+                        let [partial] = program.fold(
+                            tile_ir::tile::range(chunks),
+                            [initial_acc],
+                            |program, loop_index, [acc]| {
+                                let reduce_index = loop_index * BLOCK as u32 + lane.clone();
+                                let active = in_bounds.clone().and(reduce_index.lt(reduce_size));
+                                [
+                                    acc.binary(
+                                        reduce_binary,
+                                        value_at(program, reduce_index, active),
+                                    ),
+                                ]
+                            },
+                        );
+                        let reduced = program.group_reduce(reduce_op, BLOCK as u32, partial);
+
+                        let reduced = match reduce_dtype {
+                            DataTypeEnum::F32 => ValueTile::F32(reduced),
+                            DataTypeEnum::F16 => ValueTile::F16(reduced),
+                            DataTypeEnum::U32 => ValueTile::U32(reduced),
+                        };
+                        let (reduced, reduced_ty) = apply_unary_function_chain(
+                            reduced.into_f32(),
+                            reduce_dtype,
+                            &post_chain,
+                        )
+                        .expect("validated reduce post_element_wise chain");
+                        let reduced = ValueTile::F32(reduced)
+                            .cast_to(reduced_ty)
+                            .cast_to(output_meta_body.datatype);
+                        let output_index = layout_index(&output_meta_body, &dims);
+                        let store_mask = in_bounds.and(lane.eq(0u32));
+                        output_storage.store(program, output_index, reduced, store_mask);
+                    });
+            } else {
+                kb.program()
+                    .program_grid(BLOCK as u32, dispatch_size, |program| {
+                        let lane = program.lane();
+                        let group = linear_group(program, dispatch_size);
+                        let flat = group * BLOCK as u32 + lane.clone();
+                        let in_bounds = flat.lt(total_outputs);
+                        let dims = output_dims_from_flat_usize(flat.clone(), &output_shape);
+                        let base = layout_index(&input_meta_body, &dims);
+                        let value_at =
+                            |program: &mut tile_ir::tile::TileBlock<'_>,
+                             loop_index: tile_ir::tile::Tile| {
+                                let value_index = base.clone() + loop_index * reduce_stride;
+                                let value =
+                                    input_storage.load(program, value_index, in_bounds.clone());
+                                let (value, value_ty) = apply_unary_function_chain(
+                                    value.into_f32(),
+                                    input_meta_body.datatype,
+                                    &pre_chain,
+                                )
+                                .expect("validated reduce pre_element_wise chain");
+                                ValueTile::F32(value)
+                                    .cast_to(value_ty)
+                                    .cast_to(reduce_dtype)
+                            };
+
+                        let reduce_binary = reduce_op.binary();
+                        let reduced = match reduce_dtype {
+                            DataTypeEnum::F32 => {
+                                let [acc] = program.fold(
+                                    tile_ir::tile::range(reduce_size),
+                                    [tile_ir::tile::Tile::literal(tile_literal_for(
+                                        initial,
+                                        DataTypeEnum::F32,
+                                    ))],
+                                    |program, loop_index, [acc]| {
+                                        [acc.binary(
+                                            reduce_binary,
+                                            value_at(program, loop_index).into_f32(),
+                                        )]
+                                    },
+                                );
+                                ValueTile::F32(acc)
+                            }
+                            DataTypeEnum::F16 => {
+                                let [acc] = program.fold(
+                                    tile_ir::tile::range(reduce_size),
+                                    [tile_ir::tile::Tile::literal(tile_literal_for(
+                                        initial,
+                                        DataTypeEnum::F16,
+                                    ))],
+                                    |program, loop_index, [acc]| {
+                                        [acc.binary(
+                                            reduce_binary,
+                                            value_at(program, loop_index).into_f16(),
+                                        )]
+                                    },
+                                );
+                                ValueTile::F16(acc)
+                            }
+                            DataTypeEnum::U32 => {
+                                let [acc] = program.fold(
+                                    tile_ir::tile::range(reduce_size),
+                                    [tile_ir::tile::Tile::literal(tile_literal_for(
+                                        initial,
+                                        DataTypeEnum::U32,
+                                    ))],
+                                    |program, loop_index, [acc]| {
+                                        [acc.binary(
+                                            reduce_binary,
+                                            value_at(program, loop_index).into_u32(),
+                                        )]
+                                    },
+                                );
+                                ValueTile::U32(acc)
+                            }
                         };
 
-                    let reduce_binary = reduce_op.binary();
-                    let reduced = match reduce_dtype {
-                        DataTypeEnum::F32 => {
-                            let [acc] = program.fold(
-                                tile_ir::tile::range(reduce_size),
-                                [tile_ir::tile::Tile::literal(tile_literal_for(
-                                    initial,
-                                    DataTypeEnum::F32,
-                                ))],
-                                |program, loop_index, [acc]| {
-                                    [acc.binary(
-                                        reduce_binary,
-                                        value_at(program, loop_index).into_f32(),
-                                    )]
-                                },
-                            );
-                            ValueTile::F32(acc)
-                        }
-                        DataTypeEnum::F16 => {
-                            let [acc] = program.fold(
-                                tile_ir::tile::range(reduce_size),
-                                [tile_ir::tile::Tile::literal(tile_literal_for(
-                                    initial,
-                                    DataTypeEnum::F16,
-                                ))],
-                                |program, loop_index, [acc]| {
-                                    [acc.binary(
-                                        reduce_binary,
-                                        value_at(program, loop_index).into_f16(),
-                                    )]
-                                },
-                            );
-                            ValueTile::F16(acc)
-                        }
-                        DataTypeEnum::U32 => {
-                            let [acc] = program.fold(
-                                tile_ir::tile::range(reduce_size),
-                                [tile_ir::tile::Tile::literal(tile_literal_for(
-                                    initial,
-                                    DataTypeEnum::U32,
-                                ))],
-                                |program, loop_index, [acc]| {
-                                    [acc.binary(
-                                        reduce_binary,
-                                        value_at(program, loop_index).into_u32(),
-                                    )]
-                                },
-                            );
-                            ValueTile::U32(acc)
-                        }
-                    };
-
-                    let (reduced, reduced_ty) =
-                        apply_unary_function_chain(reduced.into_f32(), reduce_dtype, &post_chain)
-                            .expect("validated reduce post_element_wise chain");
-                    let reduced = ValueTile::F32(reduced)
-                        .cast_to(reduced_ty)
-                        .cast_to(output_meta_body.datatype);
-                    let output_index = layout_index(&output_meta_body, &dims);
-                    output_storage.store(program, output_index, reduced, in_bounds);
-                });
+                        let (reduced, reduced_ty) = apply_unary_function_chain(
+                            reduced.into_f32(),
+                            reduce_dtype,
+                            &post_chain,
+                        )
+                        .expect("validated reduce post_element_wise chain");
+                        let reduced = ValueTile::F32(reduced)
+                            .cast_to(reduced_ty)
+                            .cast_to(output_meta_body.datatype);
+                        let output_index = layout_index(&output_meta_body, &dims);
+                        output_storage.store(program, output_index, reduced, in_bounds);
+                    });
+            }
             Some(())
         },
     )

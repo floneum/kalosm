@@ -4,18 +4,26 @@ use fusor_tile_ir::{
 };
 use fusor_tile_ir_kernels::{
     batched_gemv_with_epilogues, batched_matmul_with_epilogues, flash_attention,
-    linear_storage_layout, qdequantize, qgemv_q4k_paired, qgemv_with_epilogue,
-    qgemv_workgroup_f16_with_epilogue, qgemv_workgroup_with_epilogue, qmatmul_with_epilogue,
-    qmatmul_workgroup_f16_with_epilogues, qmatmul_workgroup_with_epilogues, quantized_matrix,
-    rms_norm_vec4, try_batched_coop_matmul, DenseCoopMatmulTile, DenseMatmulEpilogues,
-    DenseMatmulShape, DenseMatmulTensors, FlashAttentionDims, FlashAttentionMeta,
-    FlashAttentionTensors, PairedEpilogue, Q4KPairedGgml, QmatmulEpilogues, RmsNormVec4,
-    RmsNormVec4Meta, TensorMeta, UnaryEpilogue,
+    linear_storage_layout, qdequantize, qgemv_with_epilogue, qgemv_workgroup_f16_with_epilogue,
+    qgemv_workgroup_with_epilogue, qmatmul_with_epilogue, qmatmul_workgroup_f16_with_epilogues,
+    qmatmul_workgroup_with_epilogues, quantized_matrix, rms_norm_vec4, try_batched_coop_matmul,
+    DenseCoopMatmulTile, DenseMatmulEpilogues, DenseMatmulShape, DenseMatmulTensors,
+    DenseMatmulTile, FlashAttentionDims, FlashAttentionMeta, FlashAttentionTensors,
+    QmatmulEpilogues, RmsNormVec4, RmsNormVec4Meta, SubgroupConfig, TensorMeta, UnaryEpilogue,
+    UnaryEpilogueWithExtras,
 };
 
 fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
     ir.lower_to_naga()
         .unwrap_or_else(|error| panic!("{label} lowering failed: {error}"))
+}
+
+fn subgroup_token() -> fusor_tile_ir::SubgroupToken {
+    fusor_tile_ir::SubgroupToken::new_unchecked()
+}
+
+fn coop_token() -> fusor_tile_ir::CoopMatrixToken {
+    fusor_tile_ir::CoopMatrixToken::new_unchecked()
 }
 
 #[test]
@@ -50,6 +58,7 @@ fn streaming_flash_attention_regression_shape_lowers_to_naga() {
             dispatch_size: [16, 1536, 1],
             causal: false,
         },
+        subgroup_token(),
         32,
     )
     .expect("streaming flash attention should build");
@@ -100,7 +109,16 @@ fn qgemv_ir(format: GgmlQuantFormat, rows: u32, cols: u32) -> fusor_tile_ir::Ker
         let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, rows]));
         let b = quantized_matrix(program, format, rows, cols);
         let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, cols]));
-        qgemv_with_epilogue(program, &a, &b, &y, 1, Option::<&UnaryEpilogue>::None);
+        qgemv_with_epilogue(
+            program,
+            &a,
+            &b,
+            &y,
+            1,
+            subgroup_token(),
+            SubgroupConfig::fixed(32),
+            Option::<&UnaryEpilogue>::None,
+        );
     })
 }
 
@@ -135,68 +153,24 @@ fn q6k_ggml_qgemv_lowers() {
 }
 
 #[test]
-fn q4k_paired_epilogue_lowers() {
-    let ir = tile::build(|program| {
-        let rows = 4096;
-        let pair_cols = 4096;
-        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, rows]));
-        let b = quantized_matrix(program, GgmlQuantFormat::Q4K, rows, pair_cols * 2);
-        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, pair_cols]));
-        let epilogue =
-            PairedEpilogue::with_extras("mul", 0, |tiles| tiles[0].clone() * tiles[1].clone());
-        qgemv_q4k_paired(
-            program,
-            Q4KPairedGgml {
-                a: &a,
-                b: &b,
-                y: &y,
-                pair_cols,
-                m_rows: 1,
-                workgroups_x: 1,
-                shape: fusor_tile_ir_kernels::Q4KPairedShape::new(8, 2, 256),
-                epilogue: &epilogue,
-                extras: &[],
-            },
-        );
-    });
-    lower_or_fail(&ir, "q4k paired qgemv");
-}
-
-#[test]
-fn q4k_native_paired_epilogue_lowers() {
-    let ir = tile::build(|program| {
-        let rows = 4096;
-        let pair_cols = 4096;
-        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, rows]));
-        let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, rows, pair_cols * 2);
-        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, pair_cols]));
-        let epilogue =
-            PairedEpilogue::with_extras("mul", 0, |tiles| tiles[0].clone() * tiles[1].clone());
-        qgemv_q4k_paired(
-            program,
-            Q4KPairedGgml {
-                a: &a,
-                b: &b,
-                y: &y,
-                pair_cols,
-                m_rows: 1,
-                workgroups_x: 1,
-                shape: fusor_tile_ir_kernels::Q4KPairedShape::new(8, 2, 256),
-                epilogue: &epilogue,
-                extras: &[],
-            },
-        );
-    });
-    lower_or_fail(&ir, "q4k native paired qgemv");
-}
-
-#[test]
 fn scalar_qmatmul_lowers() {
     let ir = tile::build(|program| {
         let a = program.storage_read(ScalarElement::F32.element(), Shape::new([8, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 16);
         let y = program.storage_write(ScalarElement::F32.element(), Shape::new([8, 16]));
-        qmatmul_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 8, 4);
+        qmatmul_with_epilogue(
+            program,
+            &a,
+            &b,
+            &y,
+            &QmatmulEpilogues::empty(),
+            subgroup_token(),
+            coop_token(),
+            SubgroupConfig::fixed(32),
+            8,
+            4,
+            8,
+        );
     });
     lower_or_fail(&ir, "scalar qmatmul");
 }
@@ -207,7 +181,19 @@ fn cooperative_qmatmul_lowers() {
         let a = program.storage_read(ScalarElement::F32.element(), Shape::new([64, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 64);
         let y = program.storage_write(ScalarElement::F32.element(), Shape::new([64, 64]));
-        qmatmul_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 64, 64);
+        qmatmul_with_epilogue(
+            program,
+            &a,
+            &b,
+            &y,
+            &QmatmulEpilogues::empty(),
+            subgroup_token(),
+            coop_token(),
+            SubgroupConfig::fixed(32),
+            64,
+            64,
+            32,
+        );
     });
     lower_or_fail(&ir, "cooperative qmatmul");
 }
@@ -235,12 +221,15 @@ fn batched_dense_f32_matmul_lowers() {
         );
         batched_matmul_with_epilogues(
             program,
-            &a,
-            &b,
-            &y,
+            DenseMatmulTensors {
+                a: &a,
+                b: &b,
+                y: &y,
+            },
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            DenseMatmulTile::new(32, 32, 8, 4, 4, 64),
         );
     });
     lower_or_fail(&ir, "batched dense f32 matmul");
@@ -275,6 +264,8 @@ fn batched_dense_f32_gemv_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            subgroup_token(),
+            SubgroupConfig::fixed(32),
         );
     });
     lower_or_fail(&ir, "batched dense f32 gemv");
@@ -303,12 +294,15 @@ fn batched_dense_f16_matmul_lowers() {
         );
         batched_matmul_with_epilogues(
             program,
-            &a,
-            &b,
-            &y,
+            DenseMatmulTensors {
+                a: &a,
+                b: &b,
+                y: &y,
+            },
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            DenseMatmulTile::new(32, 32, 8, 4, 4, 64),
         );
     });
     lower_or_fail(&ir, "batched dense f16 matmul");
@@ -343,6 +337,8 @@ fn batched_dense_f16_gemv_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            subgroup_token(),
+            SubgroupConfig::fixed(32),
         );
     });
     lower_or_fail(&ir, "batched dense f16 gemv");
@@ -379,6 +375,9 @@ fn cooperative_dense_f32_matmul_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            subgroup_token(),
+            coop_token(),
+            SubgroupConfig::fixed(32),
             DenseCoopMatmulTile {
                 bm: 64,
                 bn: 64,
@@ -420,6 +419,9 @@ fn cooperative_dense_f16_matmul_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            subgroup_token(),
+            coop_token(),
+            SubgroupConfig::fixed(32),
             DenseCoopMatmulTile {
                 bm: 64,
                 bn: 64,
@@ -461,6 +463,9 @@ fn cooperative_dense_f32_matmul_128x128_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            subgroup_token(),
+            coop_token(),
+            SubgroupConfig::fixed(32),
             DenseCoopMatmulTile {
                 bm: 128,
                 bn: 128,
@@ -502,6 +507,9 @@ fn cooperative_dense_f32_matmul_128x64_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            subgroup_token(),
+            coop_token(),
+            SubgroupConfig::fixed(32),
             DenseCoopMatmulTile {
                 bm: 128,
                 bn: 64,
@@ -545,6 +553,9 @@ fn cooperative_dense_f32_matmul_128x256_npass_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            subgroup_token(),
+            coop_token(),
+            SubgroupConfig::fixed(32),
             DenseCoopMatmulTile {
                 bm: 128,
                 bn: 256,
@@ -604,9 +615,22 @@ fn qmatmul_epilogue_fallback_ir(post: Option<&UnaryEpilogue>) -> fusor_tile_ir::
             post,
             post_with_extras: None,
             post_extra_inputs: &[],
+            post_accumulator_offsets: &[],
             post_acc_init_col_vector: None,
         };
-        qmatmul_with_epilogue(program, &a, &b, &y, &epilogues, 64, 64);
+        qmatmul_with_epilogue(
+            program,
+            &a,
+            &b,
+            &y,
+            &epilogues,
+            subgroup_token(),
+            coop_token(),
+            SubgroupConfig::fixed(32),
+            64,
+            64,
+            32,
+        );
     })
 }
 
@@ -721,6 +745,30 @@ fn q4k_native_workgroup_qgemv_lowers_without_subgroups() {
     assert!(
         !module_uses_subgroup(lowered.module()),
         "native workgroup qgemv emitted subgroup ops"
+    );
+}
+
+#[test]
+fn workgroup_qgemv_accumulator_offsets_lower_without_subgroups() {
+    let post = UnaryEpilogueWithExtras::new_with_value_arity("paired_product", 2, 0, |values| {
+        values[0].clone() * values[1].clone()
+    });
+    let offsets = [0, 64];
+    let epilogues = QmatmulEpilogues {
+        post_with_extras: Some(&post),
+        post_accumulator_offsets: &offsets,
+        ..QmatmulEpilogues::empty()
+    };
+    let ir = tile::build(|program| {
+        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, 256]));
+        let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 128);
+        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, 64]));
+        qgemv_workgroup_with_epilogue(program, &a, &b, &y, &epilogues, 65_535);
+    });
+    let lowered = lower_or_fail(&ir, "workgroup qgemv accumulator offsets");
+    assert!(
+        !module_uses_subgroup(lowered.module()),
+        "workgroup qgemv accumulator offsets emitted subgroup ops"
     );
 }
 

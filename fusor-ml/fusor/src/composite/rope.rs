@@ -288,6 +288,15 @@ impl RopeCache {
         start_pos: usize,
     ) -> (Tensor<4, f32>, Tensor<4, f32>) {
         let [_b_sz, _n_head, seq_len, _n_embd] = q.shape();
+        if let (Tensor::Gpu(q), Tensor::Gpu(k), Tensor::Gpu(cos), Tensor::Gpu(sin)) =
+            (q, k, &self.cos, &self.sin)
+        {
+            let position =
+                crate::gpu::Tensor::<1, u32>::from_slice(q.device(), [1], &[start_pos as u32]);
+            let (q, k) = q.rope_normal_pair_fused_with_position(k, cos, sin, &position);
+            return (Tensor::Gpu(q), Tensor::Gpu(k));
+        }
+
         let cos = self.cos.narrow(0, start_pos, seq_len).to_concrete();
         let sin = self.sin.narrow(0, start_pos, seq_len).to_concrete();
 
@@ -304,6 +313,15 @@ impl RopeCache {
         start_pos: usize,
     ) -> (Tensor<4, f32>, Tensor<4, f32>) {
         let [_b_sz, _n_head, seq_len, _n_embd] = q.shape();
+        if let (Tensor::Gpu(q), Tensor::Gpu(k), Tensor::Gpu(cos), Tensor::Gpu(sin)) =
+            (q, k, &self.cos, &self.sin)
+        {
+            let position =
+                crate::gpu::Tensor::<1, u32>::from_slice(q.device(), [1], &[start_pos as u32]);
+            let (q, k) = q.rope_pair_fused_with_position(k, cos, sin, &position);
+            return (Tensor::Gpu(q), Tensor::Gpu(k));
+        }
+
         let cos = self.cos.narrow(0, start_pos, seq_len).to_concrete();
         let sin = self.sin.narrow(0, start_pos, seq_len).to_concrete();
 

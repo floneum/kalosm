@@ -7,16 +7,20 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use fusor_tile_ir::NagaKernel;
 use lru::LruCache;
 use parking_lot::RwLock;
 use rustc_hash::{FxBuildHasher, FxHasher};
 use wgpu::{BindGroupLayout, PipelineLayout};
 
-const BIND_GROUP_LAYOUT_CACHE_SIZE: usize = 256;
-const PIPELINE_LAYOUT_CACHE_SIZE: usize = 256;
-const KERNEL_CACHE_SIZE: usize = 128;
-const DIRECT_STORAGE3_BIND_GROUP_CACHE_SIZE: usize = 4096;
+#[cfg(not(target_arch = "wasm32"))]
+const KERNEL_CACHE_SIZE: usize = 4096;
+#[cfg(target_arch = "wasm32")]
+const KERNEL_CACHE_SIZE: usize = 512;
+#[cfg(not(target_arch = "wasm32"))]
 const DIRECT_DYNAMIC_BIND_GROUP_CACHE_SIZE: usize = 4096;
+#[cfg(target_arch = "wasm32")]
+const DIRECT_DYNAMIC_BIND_GROUP_CACHE_SIZE: usize = 512;
 
 /// Content-addressed key used to dedupe compiled kernel modules, shader
 /// modules, and pipelines across dispatches of the same kernel.
@@ -65,52 +69,37 @@ impl KernelVariantKey {
 /// compute pipeline. One entry per [`KernelCacheKey`] in [`KernelCache`].
 #[derive(Debug)]
 pub struct CachedKernel {
-    pub(crate) naga: Arc<wgpu::naga::Module>,
+    pub(crate) kernel: Arc<NagaKernel>,
     pub(crate) shader: OnceLock<wgpu::ShaderModule>,
+    pub(crate) dynamic_bind_group_layout: OnceLock<wgpu::BindGroupLayout>,
+    pub(crate) dynamic_pipeline_layout: OnceLock<wgpu::PipelineLayout>,
     pub(crate) pipeline: OnceLock<wgpu::ComputePipeline>,
+    pub(crate) storage3_pipeline: OnceLock<wgpu::ComputePipeline>,
 }
 
 impl CachedKernel {
-    pub(crate) fn new(naga: Arc<wgpu::naga::Module>) -> Self {
+    pub(crate) fn new(kernel: Arc<NagaKernel>) -> Self {
         Self {
-            naga,
+            kernel,
             shader: OnceLock::new(),
+            dynamic_bind_group_layout: OnceLock::new(),
+            dynamic_pipeline_layout: OnceLock::new(),
             pipeline: OnceLock::new(),
+            storage3_pipeline: OnceLock::new(),
         }
     }
 }
 
-/// Static, per-kernel-family LRU of lowered naga modules. Used by hot
+/// Static, per-kernel-family LRU of lowered kernels. Used by hot
 /// kernels (flash attention, rms norm, …) to short-circuit before the
 /// device-wide [`KernelCache`].
-pub type ModuleCache = RwLock<LruCache<KernelCacheKey, Arc<wgpu::naga::Module>, FxBuildHasher>>;
+pub type ModuleCache = RwLock<LruCache<KernelCacheKey, Arc<NagaKernel>, FxBuildHasher>>;
 
 pub fn module_cache(capacity: usize) -> ModuleCache {
     RwLock::new(LruCache::with_hasher(
         NonZeroUsize::new(capacity).expect("module cache capacity must be non-zero"),
         Default::default(),
     ))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DirectStorage3BindGroupKey {
-    input: usize,
-    weight: usize,
-    output: usize,
-}
-
-impl DirectStorage3BindGroupKey {
-    pub fn new(
-        input: &Arc<wgpu::Buffer>,
-        weight: &Arc<wgpu::Buffer>,
-        output: &Arc<wgpu::Buffer>,
-    ) -> Self {
-        Self {
-            input: Arc::as_ptr(input) as usize,
-            weight: Arc::as_ptr(weight) as usize,
-            output: Arc::as_ptr(output) as usize,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -161,21 +150,15 @@ impl DirectDynamicBindGroupKey {
 
 /// Per-device caches for everything needed to compile and dispatch a kernel:
 /// bind-group layouts, pipeline layouts, the unified kernel cache (naga →
-/// shader → pipeline), bind groups for both the dynamic and 3-buffer paths,
-/// and the wgpu on-disk pipeline cache.
+/// shader → pipeline), read-only dynamic bind groups, and the wgpu on-disk
+/// pipeline cache.
 pub struct KernelCache {
     pub(crate) device: Arc<wgpu::Device>,
     pub(crate) wgpu_cache: Option<wgpu::PipelineCache>,
     cache_file: Option<PathBuf>,
-    pub(crate) bind_group_layout_cache:
-        RwLock<LruCache<Vec<wgpu::BindGroupLayoutEntry>, BindGroupLayout, FxBuildHasher>>,
-    pub(crate) pipeline_layout_cache:
-        RwLock<LruCache<BindGroupLayout, PipelineLayout, FxBuildHasher>>,
     pub(crate) kernels: RwLock<LruCache<KernelCacheKey, Arc<CachedKernel>, FxBuildHasher>>,
     pub(crate) direct_dynamic_bind_group_cache:
         RwLock<LruCache<DirectDynamicBindGroupKey, CachedDirectBindGroup, FxBuildHasher>>,
-    pub(crate) direct_three_buffer_bind_group_cache:
-        RwLock<LruCache<DirectStorage3BindGroupKey, CachedDirectBindGroup, FxBuildHasher>>,
     direct_three_buffer_bind_group_layout: OnceLock<BindGroupLayout>,
     direct_three_buffer_pipeline_layout: OnceLock<PipelineLayout>,
 }
@@ -219,11 +202,8 @@ impl KernelCache {
             device,
             wgpu_cache,
             cache_file,
-            bind_group_layout_cache: make_lru(BIND_GROUP_LAYOUT_CACHE_SIZE),
-            pipeline_layout_cache: make_lru(PIPELINE_LAYOUT_CACHE_SIZE),
             kernels: make_lru(KERNEL_CACHE_SIZE),
             direct_dynamic_bind_group_cache: make_lru(DIRECT_DYNAMIC_BIND_GROUP_CACHE_SIZE),
-            direct_three_buffer_bind_group_cache: make_lru(DIRECT_STORAGE3_BIND_GROUP_CACHE_SIZE),
             direct_three_buffer_bind_group_layout: OnceLock::new(),
             direct_three_buffer_pipeline_layout: OnceLock::new(),
         }
@@ -290,13 +270,13 @@ impl KernelCache {
             .clone()
     }
 
-    pub fn create_naga_shader_module(&self, module: wgpu::naga::Module) -> wgpu::ShaderModule {
+    pub fn create_naga_shader_module(&self, kernel: &NagaKernel) -> wgpu::ShaderModule {
         // SAFETY: all kernels avoid out-of-bounds memory access and unbounded loops.
         unsafe {
             self.device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor {
                     label: Some("Fusor ML Shader Module"),
-                    source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
+                    source: shader_source(kernel),
                 },
                 wgpu::ShaderRuntimeChecks::unchecked(),
             )
@@ -307,19 +287,37 @@ impl KernelCache {
     pub fn get_or_insert_kernel(
         &self,
         key: KernelCacheKey,
-        naga: impl FnOnce() -> Arc<wgpu::naga::Module>,
+        kernel: impl FnOnce() -> Arc<NagaKernel>,
     ) -> Arc<CachedKernel> {
         self.kernels
             .write()
-            .get_or_insert(key, || Arc::new(CachedKernel::new(naga())))
+            .get_or_insert(key, || Arc::new(CachedKernel::new(kernel())))
             .clone()
     }
 
     pub(crate) fn shader_for<'a>(&self, cached: &'a Arc<CachedKernel>) -> &'a wgpu::ShaderModule {
         cached
             .shader
-            .get_or_init(|| self.create_naga_shader_module(cached.naga.as_ref().clone()))
+            .get_or_init(|| self.create_naga_shader_module(cached.kernel.as_ref()))
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn shader_source(kernel: &NagaKernel) -> wgpu::ShaderSource<'static> {
+    wgpu::ShaderSource::Naga(Cow::Owned(kernel.module().clone()))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn shader_source(kernel: &NagaKernel) -> wgpu::ShaderSource<'static> {
+    let mut wgsl = String::from(kernel.wgsl_extension_prelude());
+    let serialized = wgpu::naga::back::wgsl::write_string(
+        kernel.module(),
+        kernel.info(),
+        wgpu::naga::back::wgsl::WriterFlags::empty(),
+    )
+    .expect("validated Naga kernel should serialize to WGSL");
+    wgsl.push_str(&serialized);
+    wgpu::ShaderSource::Wgsl(Cow::Owned(wgsl))
 }
 
 impl Drop for KernelCache {

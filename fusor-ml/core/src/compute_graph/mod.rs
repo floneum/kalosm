@@ -152,6 +152,51 @@ impl ComputeGraph {
         data
     }
 
+    pub(crate) fn resolve_with_tail<T>(
+        &self,
+        key: NodeIndex,
+        tail: impl FnOnce(&TensorData, &mut wgpu::CommandEncoder) -> T,
+    ) -> (ResolverResult, T) {
+        if let Some(data) = {
+            let inner = self.inner.read();
+            inner.get_cached_result(key).cloned()
+        } {
+            let device = data.device().clone();
+            let mut command_encoder =
+                device
+                    .wgpu_device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Resolver Tail Encoder"),
+                    });
+            let tail_result = tail(&data, &mut command_encoder);
+            device.wgpu_queue().submit(Some(command_encoder.finish()));
+            device.reset_initialized_buffers();
+            return (
+                ResolverResult {
+                    data,
+                    total_kernels: 0,
+                },
+                tail_result,
+            );
+        }
+
+        let (data, removed, tail_result) = {
+            let mut inner = self.inner.write();
+            let mut removed = Vec::new();
+            let mut resolver = Resolver::new(&mut inner, key);
+            let (data, tail_result) = resolver.run_with_tail(&mut inner, &mut removed, tail);
+            inner.try_auto_flush(&mut removed);
+            #[cfg(feature = "extra_assertions")]
+            {
+                inner.verify_integrity()
+            }
+            (data, removed, tail_result)
+        };
+        drop(removed);
+
+        (data, tail_result)
+    }
+
     #[cfg(feature = "graphvis")]
     pub(crate) fn graphvis(&self, root: NodeIndex) -> Graph {
         self.with_mut(|inner| inner.graphvis(root))
@@ -312,11 +357,6 @@ impl ComputeGraphNodeVariant {
                 }
                 if let Some(epilogue) = &op.post_element_wise_expr {
                     for extra in &epilogue.extras {
-                        f(*extra);
-                    }
-                }
-                if let Some(paired) = &op.paired {
-                    for extra in &paired.extras {
                         f(*extra);
                     }
                 }

@@ -6,6 +6,16 @@ impl Resolver {
         graph: &mut ComputeGraphInner,
         _removed: &mut Vec<ComputeGraphNode>,
     ) -> ResolverResult {
+        let (result, ()) = self.run_with_tail(graph, _removed, |_, _| ());
+        result
+    }
+
+    pub(crate) fn run_with_tail<T>(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        _removed: &mut Vec<ComputeGraphNode>,
+        tail: impl FnOnce(&TensorData, &mut wgpu::CommandEncoder) -> T,
+    ) -> (ResolverResult, T) {
         let host_trace = std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some();
         let host_category_trace = std::env::var_os("FUSOR_TRACE_RESOLVE_HOST_CATEGORIES").is_some();
         let host_total_start = host_trace.then(Instant::now);
@@ -252,6 +262,7 @@ impl Resolver {
                         if let Some(dispatch) =
                             direct_kernel.prepare_dispatch(device.kernel_cache())
                         {
+                            let name = direct_kernel.name().to_string();
                             if let Some(start) = start {
                                 let elapsed = start.elapsed();
                                 host_profile.prepare_dispatch += elapsed;
@@ -262,8 +273,7 @@ impl Resolver {
                                         .prepare_dispatch += elapsed;
                                 }
                             }
-                            let (name, category) = if collect_dispatch_metadata {
-                                let name = qmatmul.name();
+                            let category = collect_dispatch_metadata.then(|| {
                                 let category = dispatch_category(&name);
                                 if trace {
                                     *dispatch_categories.entry(category.clone()).or_default() += 1;
@@ -271,10 +281,8 @@ impl Resolver {
                                         *dispatch_names.entry(name.clone()).or_default() += 1;
                                     }
                                 }
-                                (Some(name), Some(category))
-                            } else {
-                                (None, None)
-                            };
+                                category
+                            });
                             commands.push(CommandRecord::Dispatch(DispatchRecord {
                                 dispatch,
                                 name,
@@ -354,6 +362,7 @@ impl Resolver {
                 }
                 let start = host_trace.then(Instant::now);
                 if let Some(dispatch) = direct_kernel.prepare_dispatch(device.kernel_cache()) {
+                    let name = direct_kernel.name().to_string();
                     if let Some(start) = start {
                         let elapsed = start.elapsed();
                         host_profile.prepare_dispatch += elapsed;
@@ -364,8 +373,7 @@ impl Resolver {
                                 .prepare_dispatch += elapsed;
                         }
                     }
-                    let (name, category) = if collect_dispatch_metadata {
-                        let name = operation.name();
+                    let category = collect_dispatch_metadata.then(|| {
                         let category = dispatch_category(&name);
                         if trace {
                             *dispatch_categories.entry(category.clone()).or_default() += 1;
@@ -373,10 +381,8 @@ impl Resolver {
                                 *dispatch_names.entry(name.clone()).or_default() += 1;
                             }
                         }
-                        (Some(name), Some(category))
-                    } else {
-                        (None, None)
-                    };
+                        category
+                    });
                     commands.push(CommandRecord::Dispatch(DispatchRecord {
                         dispatch,
                         name,
@@ -419,11 +425,12 @@ impl Resolver {
                 eprintln!("resolve_dispatch_names {names:?}");
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
         let dispatch_metadata = commands
             .iter()
             .filter_map(|command| match command {
                 CommandRecord::Dispatch(record) => Some(DispatchMetadata {
-                    name: record.name.clone(),
+                    name: profile_gpu_kernels.then(|| record.name.clone()),
                     category: record.category.clone(),
                 }),
                 CommandRecord::CopyBuffer(_) => None,
@@ -503,7 +510,7 @@ impl Resolver {
                             if let CommandRecord::Dispatch(record) = &commands[command_index] {
                                 let mut pass = command_encoder.begin_compute_pass(
                                     &wgpu::ComputePassDescriptor {
-                                        label: Some("Resolver Direct Kernel"),
+                                        label: Some(record.name.as_str()),
                                         timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
                                             query_set,
                                             beginning_of_pass_write_index: Some(
@@ -538,7 +545,9 @@ impl Resolver {
                             if let Some((query_set, _, _, _)) = &query_resources {
                                 pass.write_timestamp(query_set, (dispatch_index * 2) as u32);
                             }
+                            pass.push_debug_group(&record.name);
                             record.dispatch.run(&mut pass);
+                            pass.pop_debug_group();
                             if let Some((query_set, _, _, _)) = &query_resources {
                                 pass.write_timestamp(query_set, (dispatch_index * 2 + 1) as u32);
                             }
@@ -567,63 +576,71 @@ impl Resolver {
             }
         }
 
+        let data = graph
+            .get_result(self.targets[0])
+            .expect("Target result not cached");
+        let tail_result = tail(&data, &mut command_encoder);
+
         // Submit any remaining commands.
         let submit_start = host_trace.then(Instant::now);
         device.wgpu_queue().submit(Some(command_encoder.finish()));
         if let Some(start) = submit_start {
             host_profile.submit += start.elapsed();
         }
-        if let Some((_, _, readback_buffer, raw_query_size)) = &query_resources {
-            let profile_readback_start = host_trace.then(Instant::now);
-            let slice = readback_buffer.slice(..*raw_query_size);
-            let (sender, receiver) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |result| {
-                let _ = sender.send(result);
-            });
-            device.poll_wait();
-            match receiver.recv() {
-                Ok(Ok(())) => {
-                    let view = slice.get_mapped_range();
-                    let timestamps = bytemuck::cast_slice::<u8, u64>(&view);
-                    print_gpu_kernel_profile(
-                        &dispatch_metadata,
-                        timestamps,
-                        device.wgpu_queue().get_timestamp_period() as f64,
-                        if profile_inside_pass_timestamps {
-                            "inside_pass"
-                        } else {
-                            "pass_boundary"
-                        },
-                    );
-                    drop(view);
-                    readback_buffer.unmap();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some((_, _, readback_buffer, raw_query_size)) = &query_resources {
+                let profile_readback_start = host_trace.then(Instant::now);
+                let slice = readback_buffer.slice(..*raw_query_size);
+                let (sender, receiver) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = sender.send(result);
+                });
+                device.poll_wait();
+                match receiver.recv() {
+                    Ok(Ok(())) => {
+                        let view = slice.get_mapped_range();
+                        let timestamps = bytemuck::cast_slice::<u8, u64>(&view);
+                        print_gpu_kernel_profile(
+                            &dispatch_metadata,
+                            timestamps,
+                            device.wgpu_queue().get_timestamp_period() as f64,
+                            if profile_inside_pass_timestamps {
+                                "inside_pass"
+                            } else {
+                                "pass_boundary"
+                            },
+                        );
+                        drop(view);
+                        readback_buffer.unmap();
+                    }
+                    Ok(Err(error)) => {
+                        eprintln!("resolve_gpu_kernel_profile map_failed {error:?}");
+                    }
+                    Err(error) => {
+                        eprintln!("resolve_gpu_kernel_profile map_channel_failed {error:?}");
+                    }
                 }
-                Ok(Err(error)) => {
-                    eprintln!("resolve_gpu_kernel_profile map_failed {error:?}");
+                if let Some(start) = profile_readback_start {
+                    host_profile.profile_readback += start.elapsed();
                 }
-                Err(error) => {
-                    eprintln!("resolve_gpu_kernel_profile map_channel_failed {error:?}");
-                }
-            }
-            if let Some(start) = profile_readback_start {
-                host_profile.profile_readback += start.elapsed();
             }
         }
         device.reset_initialized_buffers();
 
-        let data = graph
-            .get_result(self.targets[0])
-            .expect("Target result not cached");
         if let Some(start) = host_total_start {
             host_profile.print(start.elapsed(), queued_operation_count, total_kernels);
             if host_category_trace {
                 print_host_category_profile(host_category_profile);
             }
         }
-        ResolverResult {
-            data,
-            total_kernels,
-        }
+        (
+            ResolverResult {
+                data,
+                total_kernels,
+            },
+            tail_result,
+        )
     }
 }
 

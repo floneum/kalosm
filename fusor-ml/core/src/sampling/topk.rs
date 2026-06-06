@@ -4,5 +4,6 @@ pub(crate) use crate::mir::kernel_backend::sampling_topk::{
 };
 
 pub(super) use crate::mir::kernel_backend::sampling_topk::{
+    ProcessorSettings, chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder,
     chunk_top_k_pair_data_with_processors_with_encoder, top_k_exactness_flag_data_with_encoder,
 };

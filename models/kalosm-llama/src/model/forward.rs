@@ -44,8 +44,8 @@ where
         } else {
             fallback_path
         };
-        let token_start = trace_enabled.then(std::time::Instant::now);
-        let build_start = trace_enabled.then(std::time::Instant::now);
+        let token_start = trace_enabled.then(Instant::now);
+        let build_start = trace_enabled.then(Instant::now);
         let logits = model.forward(tokens, images, device, cache);
         if let Some(start) = build_start {
             eprintln!(
@@ -58,17 +58,19 @@ where
         let logits: fusor::Tensor<1, f32> = logits.cast();
         let len = logits.shape()[0];
         let mut kernels = 0;
-        if let Some(gpu_logits) = logits.as_gpu() {
-            let resolve_start = trace_enabled.then(std::time::Instant::now);
-            kernels = gpu_logits.count_kernels_to_resolve();
-            if let Some(start) = resolve_start {
-                eprintln!(
-                    "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
-                    start.elapsed()
-                );
+        if trace_enabled {
+            if let Some(gpu_logits) = logits.as_gpu() {
+                let resolve_start = Some(Instant::now());
+                kernels = gpu_logits.count_kernels_to_resolve();
+                if let Some(start) = resolve_start {
+                    eprintln!(
+                        "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
+                        start.elapsed()
+                    );
+                }
+            } else {
+                eprintln!("forward_logits_on_cpu path={path} decode_eligible={decode_eligible}");
             }
-        } else if trace_enabled {
-            eprintln!("forward_logits_on_cpu path={path} decode_eligible={decode_eligible}");
         }
 
         Ok(PreparedForwardLogits {
@@ -199,9 +201,9 @@ where
 
     pub(crate) fn forward_sample_token<'a>(
         ctx: ForwardInputs<'_, F>,
-        sampler: &'a mut fusor::Mirostat2Sampler,
+        sampler: &'a mut LlamaGpuSamplerState,
         previous_tokens: Vec<u32>,
-        params: fusor::Mirostat2SamplerParams,
+        top_k: usize,
     ) -> Pin<
         Box<dyn kalosm_model_types::FutureWasmNotSend<Output = Result<u32, LlamaModelError>> + 'a>,
     > {
@@ -237,7 +239,7 @@ where
                 },
                 sampler,
                 previous_tokens,
-                params,
+                top_k,
             );
         }
 
@@ -259,15 +261,29 @@ where
         let PreparedForwardLogits { logits, trace, .. } = prepared;
         Box::pin(async move {
             let download_start = trace.step_start();
-            let token_id = logits
-                .sample_mirostat2_token(sampler, &previous_tokens, params)
-                .await?;
+            let token_id = match sampler.config.sampling_strategy {
+                kalosm_language_model::SamplingStrategy::Mirostat2 => {
+                    let params = sampler.mirostat_params(top_k);
+                    let mirostat = sampler.mirostat.as_mut().ok_or_else(|| {
+                        LlamaModelError::SamplerError("missing Mirostat GPU sampler".into())
+                    })?;
+                    logits
+                        .sample_mirostat2_token(mirostat, &previous_tokens, params)
+                        .await?
+                }
+                kalosm_language_model::SamplingStrategy::Standard => {
+                    let params = sampler.standard_params(top_k);
+                    logits
+                        .sample_standard_token(&previous_tokens, params)
+                        .await?
+                }
+            };
             if let Some(start) = download_start {
                 eprintln!(
                     "forward_sample_token_download path={} decode_eligible={} k={} elapsed={:?}",
                     trace.path,
                     trace.decode_eligible,
-                    params.top_k,
+                    top_k,
                     start.elapsed(),
                 );
             }
@@ -277,11 +293,124 @@ where
         })
     }
 
+    pub(crate) fn forward_sample_token_pending(
+        ctx: ForwardInputs<'_, F>,
+        sampler: &mut LlamaGpuSamplerState,
+        previous_tokens: Vec<u32>,
+        top_k: usize,
+    ) -> Result<Option<fusor::GpuSampledToken>, LlamaModelError> {
+        let ForwardInputs {
+            model,
+            device,
+            tokens,
+            images,
+            cache,
+            tokenizer,
+        } = ctx;
+        #[cfg(not(debug_assertions))]
+        let _ = tokenizer;
+        if tokens.is_empty() {
+            return Err(LlamaModelError::EmptyInput);
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            tracing::trace!(
+                "Running model with tokens: {:?}",
+                tokenizer.decode(tokens, false)
+            );
+        }
+
+        if !gpu_fused_logits_sampling_enabled() {
+            return Ok(None);
+        }
+
+        Self::forward_sample_token_pending_from_hidden(
+            model.forward_last_hidden_f32(tokens, images, device, cache)?,
+            model,
+            sampler,
+            previous_tokens,
+            None,
+            top_k,
+        )
+    }
+
+    pub(crate) fn forward_sample_token_from_gpu_token_pending(
+        model: &Model<F>,
+        device: &Device,
+        token: &fusor::GpuSampledToken,
+        cache: &mut LlamaCache,
+        sampler: &mut LlamaGpuSamplerState,
+        previous_tokens: Vec<u32>,
+        top_k: usize,
+    ) -> Result<Option<(fusor::GpuSampledToken, usize)>, LlamaModelError> {
+        if !gpu_fused_logits_sampling_enabled() {
+            return Ok(None);
+        }
+
+        let token_tensor = token.token_tensor();
+        let (hidden, cache_slot) =
+            model.forward_last_hidden_f32_gpu_token(&token_tensor, device, cache)?;
+        let (previous_tokens, include_gpu_tail) =
+            sampler.previous_tokens_for_gpu_tail(previous_tokens);
+        let Some(sampled) = Self::forward_sample_token_pending_from_hidden(
+            hidden,
+            model,
+            sampler,
+            previous_tokens,
+            include_gpu_tail.then_some(token),
+            top_k,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((sampled, cache_slot)))
+    }
+
+    fn forward_sample_token_pending_from_hidden(
+        hidden: fusor::Tensor<2, f32>,
+        model: &Model<F>,
+        sampler: &mut LlamaGpuSamplerState,
+        previous_tokens: Vec<u32>,
+        previous_gpu_token: Option<&fusor::GpuSampledToken>,
+        top_k: usize,
+    ) -> Result<Option<fusor::GpuSampledToken>, LlamaModelError> {
+        let hidden = hidden.squeeze(0).to_concrete();
+        match sampler.config.sampling_strategy {
+            kalosm_language_model::SamplingStrategy::Mirostat2 => {
+                let params = sampler.mirostat_params(top_k);
+                let mirostat = sampler.mirostat.as_mut().ok_or_else(|| {
+                    LlamaModelError::SamplerError("missing Mirostat GPU sampler".into())
+                })?;
+                hidden
+                    .try_sample_mirostat2_token_q_mat_pending(
+                        model.output_matrix(),
+                        mirostat,
+                        &previous_tokens,
+                        previous_gpu_token,
+                        params,
+                    )
+                    .map_err(LlamaModelError::from)
+            }
+            kalosm_language_model::SamplingStrategy::Standard => {
+                let params = sampler.standard_params(top_k);
+                hidden
+                    .try_sample_standard_token_q_mat_pending(
+                        model.output_matrix(),
+                        &previous_tokens,
+                        previous_gpu_token,
+                        params,
+                    )
+                    .map_err(LlamaModelError::from)
+            }
+        }
+    }
+
     fn forward_sample_token_fused_logits<'a>(
         ctx: ForwardInputs<'_, F>,
-        sampler: &'a mut fusor::Mirostat2Sampler,
+        sampler: &'a mut LlamaGpuSamplerState,
         previous_tokens: Vec<u32>,
-        params: fusor::Mirostat2SamplerParams,
+        top_k: usize,
     ) -> Pin<
         Box<dyn kalosm_model_types::FutureWasmNotSend<Output = Result<u32, LlamaModelError>> + 'a>,
     > {
@@ -302,8 +431,8 @@ where
         } else {
             "graph_fallback_fused_sample_token"
         };
-        let token_start = trace.then(std::time::Instant::now);
-        let build_start = trace.then(std::time::Instant::now);
+        let token_start = trace.then(Instant::now);
+        let build_start = trace.then(Instant::now);
         let hidden = model.forward_last_hidden_f32(tokens, images, device, cache);
         if let Some(start) = build_start {
             eprintln!(
@@ -318,33 +447,49 @@ where
         let hidden = hidden.squeeze(0).to_concrete();
         let output_matrix = model.output_matrix().clone();
         let mut kernels = 0;
-        if let Some(gpu_hidden) = hidden.as_gpu() {
-            let resolve_start = trace.then(std::time::Instant::now);
-            kernels = gpu_hidden.count_kernels_to_resolve();
-            if let Some(start) = resolve_start {
-                eprintln!(
-                    "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
-                    start.elapsed()
-                );
+        if trace {
+            if let Some(gpu_hidden) = hidden.as_gpu() {
+                let resolve_start = Some(Instant::now());
+                kernels = gpu_hidden.count_kernels_to_resolve();
+                if let Some(start) = resolve_start {
+                    eprintln!(
+                        "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
+                        start.elapsed()
+                    );
+                }
             }
         }
         Box::pin(async move {
-            let sample_start = trace.then(std::time::Instant::now);
-            let token_id = match hidden
-                .try_sample_mirostat2_token_q_mat(&output_matrix, sampler, &previous_tokens, params)
-                .await?
-            {
-                Some(token_id) => token_id,
-                None => {
-                    return Err(LlamaModelError::SamplerError(
-                        "fused logits sampler refused slow fallback".into(),
-                    ));
+            let sample_start = trace.then(Instant::now);
+            let token_id = match sampler.config.sampling_strategy {
+                kalosm_language_model::SamplingStrategy::Mirostat2 => {
+                    let params = sampler.mirostat_params(top_k);
+                    let mirostat = sampler.mirostat.as_mut().ok_or_else(|| {
+                        LlamaModelError::SamplerError("missing Mirostat GPU sampler".into())
+                    })?;
+                    hidden
+                        .try_sample_mirostat2_token_q_mat(
+                            &output_matrix,
+                            mirostat,
+                            &previous_tokens,
+                            params,
+                        )
+                        .await?
                 }
-            };
+                kalosm_language_model::SamplingStrategy::Standard => {
+                    let params = sampler.standard_params(top_k);
+                    hidden
+                        .try_sample_standard_token_q_mat(&output_matrix, &previous_tokens, params)
+                        .await?
+                }
+            }
+            .ok_or_else(|| {
+                LlamaModelError::SamplerError("fused logits sampler refused slow fallback".into())
+            })?;
             if let Some(start) = sample_start {
                 eprintln!(
                     "forward_sample_token_download path={path} decode_eligible={decode_eligible} fused_logits=1 k={} elapsed={:?}",
-                    params.top_k,
+                    top_k,
                     start.elapsed()
                 );
             }

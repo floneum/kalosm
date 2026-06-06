@@ -40,6 +40,7 @@ members = [
     "fusor-ml/tile-ir",
     "fusor-ml/tile-ir-kernels",
     "fusor-ml/tile-ir-runtime",
+    "fusor-ml/webgpu-runner",
 ]
 
 [workspace.dependencies]
@@ -73,6 +74,7 @@ rand = "0.9"
 criterion = { version = "0.8", features = ["async_futures"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 futures-channel = { version = "0.3.31", default-features = false, features = ["std"] }
+web-time = "1.1.0"
 
 [dependencies]
 anyhow = { workspace = true, optional = true }

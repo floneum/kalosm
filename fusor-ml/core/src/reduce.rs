@@ -87,7 +87,17 @@ impl Operation for ReduceOperation {
     ) -> [u32; 3] {
         let output_tensor: TensorData = inputs[1].as_tensor().unwrap().clone();
         let total_outputs = output_tensor.layout().shape().iter().product::<usize>() as u32;
-        let total_workgroups = total_outputs.div_ceil(workgroup_shape.x());
+        let reduce_size = match inputs.get(2) {
+            Some(MirValue::Integer(value)) => *value,
+            _ => 1,
+        };
+        let serial_workgroups = total_outputs.div_ceil(workgroup_shape.x());
+        let total_workgroups =
+            if use_cooperative_reduce(total_outputs, reduce_size, workgroup_shape.x()) {
+                total_outputs
+            } else {
+                serial_workgroups
+            };
 
         distribute_workgroups(
             total_workgroups,
@@ -165,6 +175,11 @@ impl Operation for ReduceOperation {
     fn name(&self) -> String {
         format!("reduce_{}", self.function.name())
     }
+}
+
+pub(crate) fn use_cooperative_reduce(total_outputs: u32, reduce_size: u32, block: u32) -> bool {
+    let serial_workgroups = total_outputs.div_ceil(block);
+    reduce_size >= block && serial_workgroups <= 4
 }
 
 #[derive(Clone, Debug, Hash)]

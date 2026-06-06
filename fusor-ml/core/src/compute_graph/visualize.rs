@@ -57,16 +57,7 @@ impl GraphVisPass {
     ) {
         let input = self.identities.get(&operation.input).unwrap();
         let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
-        let label = operation
-            .paired
-            .as_ref()
-            .map(|p| p.epilogue.label())
-            .unwrap_or("");
-        let header = if label.is_empty() {
-            format!("qmatmul ({}) #{:?}", output_layout, key)
-        } else {
-            format!("qmatmul_{label} ({}) #{:?}", output_layout, key)
-        };
+        let header = format!("qmatmul ({}) #{:?}", output_layout, key);
         let id = Identity::quoted(header);
         self.statements.push(Stmt::Node {
             id: id.clone(),

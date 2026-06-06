@@ -261,13 +261,7 @@ impl Resolver {
             // 1. Fuse naries together (combine expression trees)
             // 2. Try to fuse resulting nary into specialized ops (reduce, matmul, etc.)
             let start = profile_enabled.then(Instant::now);
-            // Keep the large-graph fast path to nary fusion by default. The
-            // paired qmatmul rewrite still runs in the full optimizer for
-            // small graphs, but applying it in the decode-sized fast path can
-            // corrupt Llama 3.1 chat output.
-            let changed = self.try_fuse_naries(graph, node_idx)
-                || (std::env::var_os("FUSOR_RESOLVE_LARGE_GRAPH_PAIRED_QMATMUL").is_some()
-                    && self.try_fuse_paired_qmatmul(graph, node_idx));
+            let changed = self.try_fuse_naries(graph, node_idx);
             if let Some(start) = start {
                 profile.fuse_naries_count += 1;
                 profile.fuse_naries += start.elapsed();
@@ -294,18 +288,6 @@ impl Resolver {
                 if let Some(start) = start {
                     profile.fuse_matmul_count += 1;
                     profile.fuse_matmul += start.elapsed();
-                }
-                changed
-            };
-
-            let changed = if changed {
-                true
-            } else {
-                let start = profile_enabled.then(Instant::now);
-                let changed = has_qmatmul && self.try_fuse_paired_qmatmul(graph, node_idx);
-                if let Some(start) = start {
-                    profile.fuse_paired_qmatmul_count += 1;
-                    profile.fuse_paired_qmatmul += start.elapsed();
                 }
                 changed
             };
@@ -394,10 +376,8 @@ impl Resolver {
                 .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
                 .collect::<Vec<_>>();
             let mut changed = self.try_fuse_naries(graph, node_idx);
-            if std::env::var_os("FUSOR_RESOLVE_LARGE_GRAPH_PAIRED_QMATMUL").is_some()
-                && self.execution_graph.contains_node(node_idx)
-            {
-                changed = self.try_fuse_paired_qmatmul(graph, node_idx) || changed;
+            if !changed && self.execution_graph.contains_node(node_idx) {
+                changed = self.try_fuse_into_matmul(graph, node_idx, true);
             }
 
             if changed {
@@ -425,7 +405,22 @@ impl Resolver {
         let ComputeGraphNodeVariant::Nary(nary) = &self.execution_graph[node_idx].variant else {
             return false;
         };
-        nary.shape.last().copied().unwrap_or_default() >= 1024
+        if nary.shape.last().copied().unwrap_or_default() >= LARGE_GRAPH_NARY_FUSION_MIN_LAST_DIM {
+            return true;
+        }
+
+        nary.inputs.iter().any(|&input| {
+            let (base_inner, _) = self
+                .walk_map_layout_chain(input)
+                .unwrap_or((input, Vec::new()));
+            self.get_input_node_in_exec_graph(base_inner)
+                .is_some_and(|exec_idx| {
+                    matches!(
+                        self.execution_graph[exec_idx].variant,
+                        ComputeGraphNodeVariant::QMatMul(_)
+                    )
+                })
+        })
     }
 
     pub(super) fn is_single_token_qmatmul_graph(&self) -> bool {

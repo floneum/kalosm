@@ -71,6 +71,7 @@ pub(super) fn qmat_logits_data_with_encoder(
         crate::quantized::matmul::DirectKernelChains {
             pre_expr: None,
             post_expr: None,
+            post_accumulator_offsets: &[],
         },
         None,
     )?;

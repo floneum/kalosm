@@ -87,18 +87,19 @@ fn build_nary_direct_kernel_with_output_index(
         dispatch_size,
         inputs,
     );
-    let naga = kernel_backend::cached_hashed_naga(nary_direct_module_cache(), module_key, || {
-        let ir = if small_dispatch {
-            build_nary_tile_ir::<SMALL_BLOCK>(operation, &tensors, output_index, dispatch_size)?
-        } else {
-            build_nary_tile_ir::<BLOCK>(operation, &tensors, output_index, dispatch_size)?
-        };
-        Some(Arc::new(ir.lower_to_naga().ok()?.module().clone()))
-    })?;
+    let kernel =
+        kernel_backend::cached_hashed_naga(nary_direct_module_cache(), module_key, || {
+            let ir = if small_dispatch {
+                build_nary_tile_ir::<SMALL_BLOCK>(operation, &tensors, output_index, dispatch_size)?
+            } else {
+                build_nary_tile_ir::<BLOCK>(operation, &tensors, output_index, dispatch_size)?
+            };
+            Some(Arc::new(ir.lower_to_naga().ok()?))
+        })?;
     let cached = graph
         .device()
         .kernel_cache()
-        .get_or_insert_kernel(module_key, || naga);
+        .get_or_insert_kernel(module_key, || kernel);
 
     let bindings = tensors
         .iter()
@@ -664,18 +665,6 @@ fn emit_function(function: &NaryFunction, values: &mut [(ValueTile, DataTypeEnum
     }
 }
 
-pub(crate) fn eval_nary_expr_on_tiles(
-    expr: &NaryExpr,
-    inputs: &[(tile_ir::tile::Tile, DataTypeEnum)],
-) -> (tile_ir::tile::Tile, DataTypeEnum) {
-    let inputs = inputs
-        .iter()
-        .map(|(tile, dtype)| (ValueTile::F32(tile.clone()).cast_to(*dtype), *dtype))
-        .collect::<Vec<_>>();
-    let (value, dtype) = eval_nary_expr_on_value_tiles(expr, &inputs);
-    (value.into_f32(), dtype)
-}
-
 fn eval_nary_expr_on_value_tiles(
     expr: &NaryExpr,
     inputs: &[(ValueTile, DataTypeEnum)],
@@ -746,6 +735,27 @@ pub(crate) fn apply_single_input_elementwise_expr(
     let value = ValueTile::F32(value).cast_to(value_ty);
     let mut inputs = Vec::with_capacity(1 + extras.len());
     inputs.push((value, value_ty));
+    inputs.extend_from_slice(extras);
+    let (value, actual_ty) = eval_nary_expr_on_value_tiles(expr, &inputs);
+    if actual_ty != output_ty {
+        return None;
+    }
+    Some((value.into_f32(), actual_ty))
+}
+
+pub(crate) fn apply_multi_input_elementwise_expr(
+    values: &[(tile_ir::tile::Tile, DataTypeEnum)],
+    expr: &NaryExpr,
+    output_ty: DataTypeEnum,
+    extras: &[(ValueTile, DataTypeEnum)],
+) -> Option<(tile_ir::tile::Tile, DataTypeEnum)> {
+    let mut inputs = Vec::with_capacity(values.len() + extras.len());
+    inputs.extend(
+        values
+            .iter()
+            .cloned()
+            .map(|(value, ty)| (ValueTile::F32(value).cast_to(ty), ty)),
+    );
     inputs.extend_from_slice(extras);
     let (value, actual_ty) = eval_nary_expr_on_value_tiles(expr, &inputs);
     if actual_ty != output_ty {

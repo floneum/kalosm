@@ -1,16 +1,24 @@
 use std::{
     fmt::Debug,
     sync::{Arc, OnceLock},
-    time::{Duration, Instant},
 };
 
+use fusor_tile_ir::{CoopMatrixToken, SubgroupToken};
 use fusor_tile_ir_runtime::{BufferPool, KernelCache};
 use wgpu::{BackendOptions, Dx12BackendOptions};
 
-use crate::{compute_graph::ComputeGraph, kernel_selection::CooperativeMatrixCaps};
+use crate::{
+    compute_graph::ComputeGraph,
+    kernel_selection::{CooperativeMatrixCaps, CooperativeMatrixKind},
+};
 
+#[cfg(not(target_arch = "wasm32"))]
+use web_time::{Duration, Instant};
+
+#[cfg(not(target_arch = "wasm32"))]
 const GPU_POLL_SPIN_BUDGET: Duration = Duration::from_millis(2);
 
+#[cfg(not(target_arch = "wasm32"))]
 fn poll_until_queue_empty(device: &wgpu::Device) -> Result<wgpu::PollStatus, wgpu::PollError> {
     let start = Instant::now();
     loop {
@@ -90,8 +98,7 @@ fn adapter_preference_rank(adapter: &wgpu::Adapter) -> u8 {
         wgpu::DeviceType::DiscreteGpu => 0,
         wgpu::DeviceType::IntegratedGpu => 1,
         wgpu::DeviceType::VirtualGpu => 2,
-        wgpu::DeviceType::Other => 3,
-        wgpu::DeviceType::Cpu => 4,
+        _ => 3,
     }
 }
 
@@ -103,6 +110,14 @@ struct DeviceInner {
     buffer_pool: BufferPool,
     cooperative_matrix_caps: CooperativeMatrixCaps,
     compute_graph: OnceLock<ComputeGraph>,
+    /// When set, this device reports `subgroups_supported() == false` so kernel
+    /// selection picks the no-subgroup fallbacks. A property of the device, so
+    /// it survives the `WeakDevice` upgrade kernel selection goes through.
+    disable_subgroups: bool,
+    /// When set, kernel-output/scratch buffers allocated on this device are
+    /// pre-filled with a poison pattern instead of left zeroed, reproducing the
+    /// app's reused buffer pool. A property of the device for the same reason.
+    poison_allocations: bool,
 }
 
 impl Debug for DeviceInner {
@@ -136,6 +151,58 @@ pub struct Device {
 }
 
 impl Device {
+    /// Construct a sibling device that shares the same wgpu device, queue and
+    /// adapter but carries its own flags, kernel cache, buffer pool and compute
+    /// graph. Used to derive the no-subgroup / poisoned-allocation test devices
+    /// without re-initializing the GPU.
+    fn derive(&self, disable_subgroups: bool, poison_allocations: bool) -> Self {
+        let src = &self.inner;
+        let device = src.device.clone();
+        let queue = src.queue.clone();
+        let adapter = src.adapter.clone();
+        let kernel_cache = KernelCache::new(device.clone(), &adapter);
+        let buffer_pool = BufferPool::new(device.clone(), queue.clone());
+        let inner = Arc::new(DeviceInner {
+            device,
+            adapter,
+            queue,
+            kernel_cache,
+            buffer_pool,
+            cooperative_matrix_caps: src.cooperative_matrix_caps,
+            compute_graph: OnceLock::new(),
+            disable_subgroups,
+            poison_allocations,
+        });
+        let device = Device {
+            inner: inner.clone(),
+        };
+        inner
+            .compute_graph
+            .set(ComputeGraph::new(&device))
+            .ok()
+            .expect("compute_graph should only be set once");
+        Device { inner }
+    }
+
+    /// Return a sibling device that reports no subgroup support, so the
+    /// no-subgroup kernel fallbacks (the only path the web build takes) are
+    /// exercised. Shares the underlying wgpu device with `self`.
+    pub fn without_subgroups(&self) -> Self {
+        self.derive(true, self.inner.poison_allocations)
+    }
+
+    /// Return a sibling device whose tensor allocations poison kernel-output
+    /// buffers before use, reproducing the app's reused buffer pool. Shares the
+    /// underlying wgpu device with `self`.
+    pub fn with_poisoned_allocations(&self) -> Self {
+        self.derive(self.inner.disable_subgroups, true)
+    }
+
+    /// Whether tensor allocations on this device are poisoned.
+    pub fn poisons_allocations(&self) -> bool {
+        self.inner.poison_allocations
+    }
+
     pub async fn new() -> Result<Self, crate::Error> {
         let dx_compiler = wgpu::Dx12Compiler::from_env().unwrap_or_default();
         let backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
@@ -148,11 +215,12 @@ impl Device {
                 },
                 ..Default::default()
             },
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = select_adapter(&instance, backends).await?;
         let adapter_features = adapter.features();
         let mut required_features = wgpu::Features::empty();
+        #[cfg(not(target_arch = "wasm32"))]
         if adapter_features.contains(wgpu::Features::SUBGROUP) {
             required_features |= wgpu::Features::SUBGROUP;
         }
@@ -171,12 +239,18 @@ impl Device {
                 );
             }
         }
-        let mut experimental_features = wgpu::ExperimentalFeatures::default();
-        if adapter_features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
-            required_features |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
-            // SAFETY: cooperative matrix is an experimental feature that requires opting in
-            experimental_features = unsafe { wgpu::ExperimentalFeatures::enabled() };
-        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let experimental_features = {
+            let mut features = wgpu::ExperimentalFeatures::default();
+            if adapter_features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+                required_features |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
+                // SAFETY: cooperative matrix is an experimental feature that requires opting in
+                features = unsafe { wgpu::ExperimentalFeatures::enabled() };
+            }
+            features
+        };
+        #[cfg(target_arch = "wasm32")]
+        let experimental_features = wgpu::ExperimentalFeatures::default();
         let cooperative_matrix_properties =
             if required_features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
                 adapter.cooperative_matrix_properties()
@@ -209,6 +283,14 @@ impl Device {
         let kernel_cache = KernelCache::new(device.clone(), &adapter);
         let buffer_pool = BufferPool::new(device.clone(), queue.clone());
 
+        // `FUSOR_DISABLE_SUBGROUPS` / `FUSOR_DIRTY_BUFFERS` are construction-time
+        // defaults for the device flags, so a plain `Device::gpu()` from a repro
+        // binary reproduces the web path without code changes. Tests instead
+        // derive `without_subgroups()` / `with_poisoned_allocations()` sibling
+        // devices explicitly. `var_os` is always `None` on wasm.
+        let disable_subgroups = std::env::var_os("FUSOR_DISABLE_SUBGROUPS").is_some();
+        let poison_allocations = std::env::var_os("FUSOR_DIRTY_BUFFERS").is_some();
+
         let inner = Arc::new(DeviceInner {
             device,
             adapter,
@@ -217,6 +299,8 @@ impl Device {
             buffer_pool,
             cooperative_matrix_caps,
             compute_graph: OnceLock::new(),
+            disable_subgroups,
+            poison_allocations,
         });
 
         let device = Device {
@@ -234,18 +318,20 @@ impl Device {
 
         #[cfg(not(target_arch = "wasm32"))]
         std::thread::spawn({
-            let weak_inner = Arc::downgrade(&device.inner);
+            let weak_device = Arc::downgrade(&device.inner.device);
             move || loop {
-                let Some(inner) = weak_inner.upgrade() else {
+                let Some(device) = weak_device.upgrade() else {
                     break;
                 };
-                let result = poll_until_queue_empty(&inner.device);
-                drop(inner);
+                let result = device.poll(wgpu::PollType::Poll);
+                drop(device);
                 let Ok(status) = result else {
                     break;
                 };
-                if status == wgpu::PollStatus::QueueEmpty {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                if status.is_queue_empty() {
+                    std::thread::sleep(Duration::from_millis(1));
+                } else {
+                    std::thread::yield_now();
                 }
             }
         });
@@ -275,17 +361,27 @@ impl Device {
         storage_bindings.min(bind_group_bindings).saturating_sub(1)
     }
 
-    #[doc(hidden)]
-    pub fn is_cpu_adapter(&self) -> bool {
-        self.inner.adapter.get_info().device_type == wgpu::DeviceType::Cpu
-    }
-
     pub fn features(&self) -> wgpu::Features {
         self.inner.device.features()
     }
 
     pub fn subgroups_supported(&self) -> bool {
+        // A device constructed via `without_subgroups()` (or built with
+        // `FUSOR_DISABLE_SUBGROUPS` set) reports no subgroups, so kernel
+        // selection picks the no-subgroup fallbacks. Browser builds also take
+        // this path because they never request `wgpu::Features::SUBGROUP`.
+        if self.inner.disable_subgroups {
+            return false;
+        }
         self.features().contains(wgpu::Features::SUBGROUP)
+    }
+
+    pub fn subgroup_token(&self) -> Option<SubgroupToken> {
+        if !self.subgroups_supported() {
+            return None;
+        }
+
+        Some(SubgroupToken::new_unchecked())
     }
 
     pub fn min_subgroup_size(&self) -> u32 {
@@ -311,12 +407,6 @@ impl Device {
             return Some(min);
         }
 
-        // Apple GPUs execute subgroup operations with 32-wide SIMD groups even
-        // though wgpu reports the broader Metal range.
-        if self.backend() == wgpu::Backend::Metal && min <= 32 && max >= 32 {
-            return Some(32);
-        }
-
         None
     }
 
@@ -326,6 +416,14 @@ impl Device {
 
     pub(crate) fn cooperative_matrix_caps(&self) -> CooperativeMatrixCaps {
         self.inner.cooperative_matrix_caps
+    }
+
+    pub(crate) fn coop_token(&self, kind: CooperativeMatrixKind) -> Option<CoopMatrixToken> {
+        if !self.cooperative_matrix_caps().supports(kind) {
+            return None;
+        }
+
+        Some(CoopMatrixToken::new_unchecked())
     }
 
     pub fn wgpu_adapter(&self) -> &wgpu::Adapter {
@@ -346,6 +444,11 @@ impl Device {
 
     /// Block until all submitted GPU work has completed.
     pub fn poll_wait(&self) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         poll_until_queue_empty(&self.inner.device).expect("Failed to poll GPU device");
     }
 
@@ -358,9 +461,12 @@ impl Device {
         self.inner.buffer_pool.reset_initialized_buffers();
     }
 
-    /// Get or create a buffer of the specified size.
+    /// Get or create a buffer of the specified size. Poisoned first when this
+    /// handle was built with [`Device::with_poisoned_allocations`].
     pub fn create_buffer(&self, size: u64, usage: wgpu::BufferUsages) -> Arc<wgpu::Buffer> {
-        self.inner.buffer_pool.create_buffer(size, usage)
+        self.inner
+            .buffer_pool
+            .create_buffer(size, usage, self.inner.poison_allocations)
     }
 
     /// Get or create a buffer of the specified size.
@@ -385,5 +491,117 @@ impl Device {
             .compute_graph
             .get()
             .expect("compute_graph should be initialized")
+    }
+}
+
+#[cfg(test)]
+mod dirty_buffer_tests {
+    use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn derived_device_keeps_native_poller_alive() {
+        pollster::FutureExt::block_on(async {
+            let Ok(derived) = Device::new().await.map(|device| device.without_subgroups()) else {
+                return;
+            };
+
+            let buffer = derived
+                .wgpu_device()
+                .create_buffer(&wgpu::BufferDescriptor {
+                    size: 4,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                    label: Some("derived poller readback"),
+                });
+            derived.wgpu_queue().write_buffer(&buffer, 0, &[1, 2, 3, 4]);
+            let encoder = derived
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            derived.wgpu_queue().submit(Some(encoder.finish()));
+
+            let (sender, receiver) = std::sync::mpsc::channel();
+            buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = sender.send(result);
+                });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match receiver.try_recv() {
+                    Ok(result) => {
+                        result.unwrap();
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        panic!("derived device map_async did not complete before timeout");
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("derived device map_async callback sender dropped");
+                    }
+                }
+            }
+
+            let view = buffer.slice(..).get_mapped_range();
+            assert_eq!(&*view, &[1, 2, 3, 4]);
+            drop(view);
+            buffer.unmap();
+        });
+    }
+
+    /// Positive control: a buffer handed out by a poisoned-allocation handle
+    /// must read back as the poison byte, proving the poison actually lands on
+    /// this backend (and is not silently zero-initialized away).
+    #[test]
+    fn dirty_mode_poisons_freshly_allocated_buffers() {
+        pollster::FutureExt::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+
+            let dirty_device = device.with_poisoned_allocations();
+            let size = 256u64;
+            let buffer = dirty_device.create_buffer(
+                size,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            );
+
+            let download = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+                label: None,
+            });
+            let mut encoder = device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            encoder.copy_buffer_to_buffer(&buffer, 0, &download, 0, size);
+            device.wgpu_queue().submit(Some(encoder.finish()));
+
+            let (sender, receiver) = futures_channel::oneshot::channel();
+            download
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = sender.send(result);
+                });
+            device.poll_wait();
+            receiver.await.unwrap().unwrap();
+            let view = download.slice(..).get_mapped_range();
+            let bytes: &[u8] = &view;
+            let poison = bytes.iter().filter(|b| **b == 0xCD).count();
+            assert_eq!(
+                poison,
+                bytes.len(),
+                "expected all {} bytes to be poison 0xCD, got {poison}; first bytes={:?}",
+                bytes.len(),
+                &bytes[..bytes.len().min(16)]
+            );
+        });
     }
 }

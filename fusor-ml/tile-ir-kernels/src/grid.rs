@@ -7,43 +7,34 @@
 //! values carry their [`ScalarElement`] as data.
 
 use fusor_tile_ir::tile::{Mask, Storage, Tile, TileBlock};
-use fusor_tile_ir::{ScalarElement, TileLiteral, WorkgroupAxis};
+use fusor_tile_ir::{ScalarElement, SubgroupToken, TileLiteral, WorkgroupAxis};
 
 #[derive(Clone, Copy)]
 pub(crate) struct QgemvGrid {
-    pub(crate) cols_per_workgroup: u32,
     pub(crate) workgroups_x: u32,
     pub(crate) dispatch_y: u32,
     pub(crate) n_cols: u32,
-    pub(crate) full_cols: bool,
 }
 
 pub(crate) fn qgemv_grid(
-    subgroups: u32,
+    dispatch_subgroups: u32,
     cols_per_subgroup: u32,
     n_cols: u32,
     requested_workgroups_x: u32,
 ) -> QgemvGrid {
-    let cols_per_workgroup = subgroups * cols_per_subgroup;
+    let cols_per_workgroup = dispatch_subgroups * cols_per_subgroup;
     let total_workgroups = n_cols.div_ceil(cols_per_workgroup);
     let workgroups_x = requested_workgroups_x.min(total_workgroups.max(1));
     QgemvGrid {
-        cols_per_workgroup,
         workgroups_x,
         dispatch_y: total_workgroups.div_ceil(workgroups_x),
         n_cols,
-        full_cols: n_cols.is_multiple_of(cols_per_workgroup),
     }
 }
 
 impl QgemvGrid {
-    pub(crate) fn mask(self, full_iterations: bool, in_bounds: Mask, col: &Tile) -> Mask {
-        match (full_iterations, self.full_cols) {
-            (true, true) => Mask::all(),
-            (true, false) => col.lt(self.n_cols),
-            (false, true) => in_bounds,
-            (false, false) => in_bounds.and(col.lt(self.n_cols)),
-        }
+    pub(crate) fn mask(self, in_bounds: Mask, col: &Tile) -> Mask {
+        in_bounds.and(col.lt(self.n_cols))
     }
 }
 
@@ -54,10 +45,10 @@ pub(crate) struct QgemvProgramScope {
 }
 
 pub(crate) struct QgemvStoreTarget<'a> {
+    pub(crate) subgroup: SubgroupToken,
     pub(crate) y: &'a Storage,
     pub(crate) col0: Tile,
     pub(crate) lane: Tile,
-    pub(crate) full_cols: bool,
     pub(crate) n_cols: u32,
     pub(crate) epilogues: &'a crate::types::QmatmulEpilogues<'a>,
 }
@@ -66,14 +57,15 @@ pub(crate) fn qgemv_program_scope(
     program: &TileBlock<'_>,
     grid: QgemvGrid,
     cols_per_subgroup: u32,
+    subgroup: SubgroupToken,
 ) -> QgemvProgramScope {
     let workgroup = program.program_id(WorkgroupAxis::X)
         + program.program_id(WorkgroupAxis::Y) * grid.workgroups_x;
-    let col_group_base = workgroup * grid.cols_per_workgroup;
-    let subgroup_col_base = program.subgroup_id() * cols_per_subgroup;
+    let col_group_base = workgroup * subgroup.num_subgroups(program) * cols_per_subgroup;
+    let subgroup_col_base = subgroup.subgroup_id(program) * cols_per_subgroup;
     QgemvProgramScope {
         col0: col_group_base + subgroup_col_base,
-        lane: program.subgroup_lane(),
+        lane: subgroup.subgroup_lane(program),
     }
 }
 
@@ -86,9 +78,44 @@ pub(crate) fn store_qgemv_sums_with_epilogue(
     sums: Vec<Tile>,
     target: QgemvStoreTarget<'_>,
 ) {
-    for (offset, sum) in sums.into_iter().enumerate() {
+    if target.epilogues.post_accumulator_offsets.is_empty() {
+        for (offset, sum) in sums.into_iter().enumerate() {
+            let col = target.col0.clone() + offset as u32;
+            let reduced = target.subgroup.subgroup_reduce_sum(program, sum);
+            let extras = target
+                .epilogues
+                .post_extra_inputs
+                .iter()
+                .map(|extra| match extra {
+                    crate::types::QmatmulExtra::Column(vector) => {
+                        program.load(vector.at(&col), col.lt(target.n_cols), 0.0)
+                    }
+                    crate::types::QmatmulExtra::Pointwise(tensor) => {
+                        let row = Tile::literal(TileLiteral::U32(0));
+                        program.load(tensor.at((row, &col)), col.lt(target.n_cols), 0.0)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let value =
+                crate::types::apply_qmatmul_post_epilogue(target.epilogues, reduced, extras);
+            let mask = target.lane.eq(0u32).and(col.lt(target.n_cols));
+            program.store(target.y.at((0u32, col)), value, mask);
+        }
+        return;
+    }
+
+    let value_arity = target.epilogues.post_value_arity();
+    assert!(
+        sums.len().is_multiple_of(value_arity),
+        "qgemv sums must be grouped by output column"
+    );
+    for (offset, sums) in sums.chunks(value_arity).enumerate() {
         let col = target.col0.clone() + offset as u32;
-        let reduced = program.subgroup_reduce_sum(sum);
+        let reduced = sums
+            .iter()
+            .cloned()
+            .map(|sum| target.subgroup.subgroup_reduce_sum(program, sum))
+            .collect::<Vec<_>>();
         let extras = target
             .epilogues
             .post_extra_inputs
@@ -103,11 +130,9 @@ pub(crate) fn store_qgemv_sums_with_epilogue(
                 }
             })
             .collect::<Vec<_>>();
-        let value = crate::types::apply_qmatmul_post_epilogue(target.epilogues, reduced, extras);
-        let mut mask = target.lane.eq(0u32);
-        if !target.full_cols {
-            mask = mask.and(col.lt(target.n_cols));
-        }
+        let value =
+            crate::types::apply_qmatmul_post_epilogue_values(target.epilogues, reduced, extras);
+        let mask = target.lane.eq(0u32).and(col.lt(target.n_cols));
         program.store(target.y.at((0u32, col)), value, mask);
     }
 }

@@ -68,6 +68,84 @@ impl Resolver {
                 else {
                     continue;
                 };
+                if map_chain.is_empty()
+                    && !self.check_cached(graph, input_inner)
+                    && qmatmul_op.post_element_wise_expr.is_none()
+                    && qmatmul_op.in_shape[..qmatmul_op.in_shape.len() - 1]
+                        .iter()
+                        .product::<usize>()
+                        == 1
+                    && let Some((expression, accumulator_offsets, extras)) = self
+                        .try_extract_indexed_qmatmul_post_expr(
+                            graph,
+                            nary,
+                            candidate_input_idx,
+                            &qmatmul_op.out_shape,
+                        )
+                {
+                    let Some(input_datatype) = nary
+                        .expression
+                        .elementwise_input_datatype(candidate_input_idx)
+                    else {
+                        continue;
+                    };
+                    if input_datatype != crate::DataTypeEnum::F32
+                        || nary.output_datatype != crate::DataTypeEnum::F32
+                    {
+                        continue;
+                    }
+                    if !qmatmul_op.supports_indexed_post_accumulator_offsets(
+                        &graph.device(),
+                        &nary.shape,
+                        &accumulator_offsets,
+                    ) {
+                        continue;
+                    }
+
+                    let post_element_wise_expr = ElementwiseEpilogue {
+                        expression,
+                        extras: extras.clone(),
+                        input_datatype,
+                        output_datatype: nary.output_datatype,
+                    };
+
+                    let mut new_q = qmatmul_op.clone();
+                    new_q.out_shape = nary.shape.clone();
+                    new_q.post_element_wise_expr = Some(post_element_wise_expr);
+                    new_q.post_accumulator_offsets = accumulator_offsets.into_boxed_slice();
+
+                    self.execution_graph[node_idx].variant =
+                        ComputeGraphNodeVariant::QMatMul(new_q.clone());
+
+                    let deps = Self::qmatmul_dependencies(&new_q);
+                    for input in &nary.inputs {
+                        if deps.contains(input) {
+                            continue;
+                        }
+                        if let Some(input_exec) = self.get_input_node_in_exec_graph(*input)
+                            && let Some(edge) = self.execution_graph.find_edge(input_exec, node_idx)
+                        {
+                            self.execution_graph.remove_edge(edge);
+                        }
+                    }
+                    for dep in &deps {
+                        if let Some(idx) = self.get_input_node_in_exec_graph(*dep)
+                            && self.execution_graph.find_edge(idx, node_idx).is_none()
+                        {
+                            self.execution_graph.add_edge(idx, node_idx, ());
+                        }
+                    }
+                    self.add_physical_dependencies(graph, node_idx, &deps);
+                    for input in &nary.inputs {
+                        if deps.contains(input) {
+                            continue;
+                        }
+                        if let Some(input_exec) = self.get_input_node_in_exec_graph(*input) {
+                            self.remove_node_if_dead(input_exec);
+                        }
+                    }
+                    return true;
+                }
                 let mapped_layout = Self::apply_map_layout_chain(
                     &Layout::contiguous(&qmatmul_op.out_shape),
                     &map_chain,
@@ -164,8 +242,10 @@ impl Resolver {
 
                 self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::QMatMul(new_q);
 
-                let input_inner_of_qmatmul = qmatmul_op.input;
-                let mut deps = vec![input_inner_of_qmatmul];
+                let mut deps = vec![qmatmul_op.input];
+                if let Some(pre) = &qmatmul_op.pre_element_wise_expr {
+                    deps.extend(pre.extras.iter().copied());
+                }
                 deps.extend(deps_extras.iter().copied());
                 for input in &nary.inputs {
                     if deps.contains(input) {
@@ -423,5 +503,247 @@ impl Resolver {
         }
 
         false
+    }
+
+    fn qmatmul_dependencies(qmatmul: &QMatMulOperation) -> Vec<NodeIndex> {
+        let mut deps = vec![qmatmul.input];
+        if let Some(pre) = &qmatmul.pre_element_wise_expr {
+            deps.extend(pre.extras.iter().copied());
+        }
+        if let Some(post) = &qmatmul.post_element_wise_expr {
+            deps.extend(post.extras.iter().copied());
+        }
+        deps
+    }
+
+    fn try_extract_indexed_qmatmul_post_expr(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        nary: &NaryOperation,
+        qmatmul_input_idx: usize,
+        qmatmul_out_shape: &[usize],
+    ) -> Option<(NaryExpr, Vec<u32>, Vec<NodeIndex>)> {
+        if nary.output_datatype != crate::DataTypeEnum::F32
+            || nary.shape.len() != qmatmul_out_shape.len()
+            || nary.shape.as_ref() == qmatmul_out_shape
+        {
+            return None;
+        }
+        let output_cols = nary.shape.last().copied()? as u32;
+        let matrix_cols = qmatmul_out_shape.last().copied()? as u32;
+        if output_cols >= matrix_cols {
+            return None;
+        }
+
+        let temp_input_base = nary.inputs.len();
+        let mut accumulator_offsets = Vec::new();
+        let mut accumulator_map = FxHashMap::default();
+        let expression = Self::replace_indexed_qmatmul_accumulators(
+            &nary.expression,
+            qmatmul_input_idx,
+            nary.shape.len(),
+            output_cols,
+            matrix_cols,
+            temp_input_base,
+            &mut accumulator_offsets,
+            &mut accumulator_map,
+        )?;
+        if accumulator_offsets.len() < 2 {
+            return None;
+        }
+
+        let mut replacements = vec![None; nary.inputs.len()];
+        let mut extras = Vec::new();
+        for (input_idx, &input) in nary.inputs.iter().enumerate() {
+            if input_idx == qmatmul_input_idx || !nary.expression.uses_input(input_idx) {
+                continue;
+            }
+            if nary.expression.uses_custom_indexing_for_input(input_idx) {
+                return None;
+            }
+            let extra = self.try_normalize_qmatmul_post_extra(graph, input, &nary.shape)?;
+            replacements[input_idx] = Some(NaryExpr::input(
+                accumulator_offsets.len() + extras.len(),
+                nary.shape.len(),
+            ));
+            extras.push(extra);
+        }
+
+        let expression = Self::replace_inputs_in_expr(&expression, &replacements)?;
+        let expression = Self::remap_temp_accumulator_inputs(
+            &expression,
+            temp_input_base,
+            accumulator_offsets.len(),
+        );
+        Some((expression, accumulator_offsets, extras))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replace_indexed_qmatmul_accumulators(
+        expr: &NaryExpr,
+        qmatmul_input_idx: usize,
+        output_rank: usize,
+        output_cols: u32,
+        matrix_cols: u32,
+        temp_input_base: usize,
+        accumulator_offsets: &mut Vec<u32>,
+        accumulator_map: &mut FxHashMap<u32, usize>,
+    ) -> Option<NaryExpr> {
+        match expr {
+            NaryExpr::Op { children, function } => Some(NaryExpr::Op {
+                children: children
+                    .iter()
+                    .map(|child| {
+                        Self::replace_indexed_qmatmul_accumulators(
+                            child,
+                            qmatmul_input_idx,
+                            output_rank,
+                            output_cols,
+                            matrix_cols,
+                            temp_input_base,
+                            accumulator_offsets,
+                            accumulator_map,
+                        )
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                function: function.clone(),
+            }),
+            NaryExpr::IndexedInput { input_idx, indices } if *input_idx == qmatmul_input_idx => {
+                let offset = Self::extract_qmatmul_last_dim_offset(indices, output_rank)?;
+                if output_cols
+                    .checked_add(offset)
+                    .is_none_or(|cols| cols > matrix_cols)
+                {
+                    return None;
+                }
+                let value_idx = if let Some(value_idx) = accumulator_map.get(&offset) {
+                    *value_idx
+                } else {
+                    let value_idx = accumulator_offsets.len();
+                    accumulator_offsets.push(offset);
+                    accumulator_map.insert(offset, value_idx);
+                    value_idx
+                };
+                Some(NaryExpr::input(temp_input_base + value_idx, output_rank))
+            }
+            NaryExpr::IndexedInput { input_idx, indices } => Some(NaryExpr::IndexedInput {
+                input_idx: *input_idx,
+                indices: indices
+                    .iter()
+                    .map(|index| {
+                        Self::replace_indexed_qmatmul_accumulators(
+                            index,
+                            qmatmul_input_idx,
+                            output_rank,
+                            output_cols,
+                            matrix_cols,
+                            temp_input_base,
+                            accumulator_offsets,
+                            accumulator_map,
+                        )
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            }),
+            NaryExpr::DimIndex(dim) => Some(NaryExpr::DimIndex(*dim)),
+            NaryExpr::Scalar(value) => Some(NaryExpr::Scalar(*value)),
+        }
+    }
+
+    fn extract_qmatmul_last_dim_offset(indices: &[NaryExpr], output_rank: usize) -> Option<u32> {
+        if indices.len() != output_rank {
+            return None;
+        }
+        for (dim, index) in indices[..output_rank - 1].iter().enumerate() {
+            if !matches!(index, NaryExpr::DimIndex(index_dim) if *index_dim == dim) {
+                return None;
+            }
+        }
+        Self::extract_dim_plus_u32_offset(&indices[output_rank - 1], output_rank - 1)
+    }
+
+    fn extract_dim_plus_u32_offset(expr: &NaryExpr, dim: usize) -> Option<u32> {
+        match expr {
+            NaryExpr::DimIndex(index_dim) if *index_dim == dim => Some(0),
+            NaryExpr::Op { children, function }
+                if function.op == NaryOp::Add && children.len() == 2 =>
+            {
+                Self::extract_dim_plus_u32_offset_pair(&children[0], &children[1], dim).or_else(
+                    || Self::extract_dim_plus_u32_offset_pair(&children[1], &children[0], dim),
+                )
+            }
+            NaryExpr::Op { children, function }
+                if matches!(function.op, NaryOp::AddConst(NaryScalar::U32(_)))
+                    && children.len() == 1 =>
+            {
+                let NaryOp::AddConst(NaryScalar::U32(offset)) = function.op else {
+                    unreachable!();
+                };
+                matches!(&children[0], NaryExpr::DimIndex(index_dim) if *index_dim == dim)
+                    .then_some(offset)
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_dim_plus_u32_offset_pair(
+        dim_expr: &NaryExpr,
+        offset_expr: &NaryExpr,
+        dim: usize,
+    ) -> Option<u32> {
+        let NaryExpr::DimIndex(index_dim) = dim_expr else {
+            return None;
+        };
+        if *index_dim != dim {
+            return None;
+        }
+        let NaryExpr::Scalar(NaryScalar::U32(offset)) = offset_expr else {
+            return None;
+        };
+        Some(*offset)
+    }
+
+    fn remap_temp_accumulator_inputs(
+        expr: &NaryExpr,
+        temp_input_base: usize,
+        accumulator_count: usize,
+    ) -> NaryExpr {
+        match expr {
+            NaryExpr::Op { children, function } => NaryExpr::Op {
+                children: children
+                    .iter()
+                    .map(|child| {
+                        Self::remap_temp_accumulator_inputs(
+                            child,
+                            temp_input_base,
+                            accumulator_count,
+                        )
+                    })
+                    .collect(),
+                function: function.clone(),
+            },
+            NaryExpr::IndexedInput { input_idx, indices } => {
+                let input_idx =
+                    if (temp_input_base..temp_input_base + accumulator_count).contains(input_idx) {
+                        input_idx - temp_input_base
+                    } else {
+                        *input_idx
+                    };
+                NaryExpr::IndexedInput {
+                    input_idx,
+                    indices: indices
+                        .iter()
+                        .map(|index| {
+                            Self::remap_temp_accumulator_inputs(
+                                index,
+                                temp_input_base,
+                                accumulator_count,
+                            )
+                        })
+                        .collect(),
+                }
+            }
+            NaryExpr::DimIndex(dim) => NaryExpr::DimIndex(*dim),
+            NaryExpr::Scalar(value) => NaryExpr::Scalar(*value),
+        }
     }
 }

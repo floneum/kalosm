@@ -274,7 +274,6 @@ pub fn softmax_reduce<B>(
     let global = kb.write(ElementType::F32, global);
     let phase = kb.program();
     let block = meta.block;
-    let reduce = phase.alloc_workgroup_array(ScalarElement::F32, block);
 
     phase.program_grid(block, meta.dispatch_size, |program| {
         let lane = program.lane();
@@ -282,60 +281,35 @@ pub fn softmax_reduce<B>(
         let row_valid = row.clone().lt(u32_tile(meta.rows));
         let partial_row_base = program.bind(row.clone() * u32_tile(meta.split_blocks * 2));
 
-        let mut local_max = Tile::literal(TileLiteral::f32(NEG_MAX_F32));
-        for split_base in (0..meta.split_blocks).step_by(block as usize) {
-            let split = u32_tile(split_base) + lane.clone();
-            let valid = row_valid
-                .clone()
-                .and(split.clone().lt(u32_tile(meta.split_blocks)));
-            let block_max = program.load(
-                scratch.at(partial_row_base.clone() + split * u32_tile(2) + u32_tile(1)),
-                valid,
-                TileLiteral::f32(NEG_MAX_F32),
-            );
-            local_max = local_max.max(block_max);
-        }
-        program.store_workgroup(&reduce, lane.clone(), local_max);
-        program.workgroup_barrier();
-        reduce_workgroup(program, &reduce, lane.clone(), |lhs, rhs| lhs.max(rhs));
-
-        let max_local = program.private(ElementType::F32);
-        let max_score = program.load_workgroup(&reduce, 0u32);
-        program.store_local(&max_local, max_score);
-        let max_score = program.load_local(&max_local);
-
-        program.workgroup_barrier();
-        let mut local_denom = Tile::literal(TileLiteral::f32(0.0));
-        for split_base in (0..meta.split_blocks).step_by(block as usize) {
-            let split = u32_tile(split_base) + lane.clone();
-            let valid = row_valid
-                .clone()
-                .and(split.clone().lt(u32_tile(meta.split_blocks)));
-            let block_base = partial_row_base.clone() + split * u32_tile(2);
-            let block_denom = program.load(
-                scratch.at(block_base.clone()),
-                valid.clone(),
-                TileLiteral::f32(0.0),
-            );
-            let block_max = program.load(
-                scratch.at(block_base + u32_tile(1)),
-                valid,
-                TileLiteral::f32(NEG_MAX_F32),
-            );
-            local_denom =
-                local_denom + block_denom * softmax_partial_scale(block_max, max_score.clone());
-        }
-        program.store_workgroup(&reduce, lane.clone(), local_denom);
-        program.workgroup_barrier();
-        reduce_workgroup(program, &reduce, lane.clone(), |lhs, rhs| lhs + rhs);
-
-        let global_base = program.bind(row * u32_tile(2));
         program.if_then(row_valid.and(lane.eq(u32_tile(0))), |program| {
-            program.store(
-                global.at(global_base.clone()),
-                program.load_workgroup(&reduce, 0u32),
-                Mask::all(),
-            );
+            let mut max_score = Tile::literal(TileLiteral::f32(NEG_MAX_F32));
+            for split in 0..meta.split_blocks {
+                let block_max = program.load(
+                    scratch.at(partial_row_base.clone() + u32_tile(split * 2 + 1)),
+                    Mask::all(),
+                    TileLiteral::f32(NEG_MAX_F32),
+                );
+                max_score = max_score.max(block_max);
+            }
+
+            let mut denom = Tile::literal(TileLiteral::f32(0.0));
+            for split in 0..meta.split_blocks {
+                let block_base = partial_row_base.clone() + u32_tile(split * 2);
+                let block_denom = program.load(
+                    scratch.at(block_base.clone()),
+                    Mask::all(),
+                    TileLiteral::f32(0.0),
+                );
+                let block_max = program.load(
+                    scratch.at(block_base + u32_tile(1)),
+                    Mask::all(),
+                    TileLiteral::f32(NEG_MAX_F32),
+                );
+                denom = denom + block_denom * softmax_partial_scale(block_max, max_score.clone());
+            }
+
+            let global_base = program.bind(row * u32_tile(2));
+            program.store(global.at(global_base.clone()), denom, Mask::all());
             program.store(global.at(global_base + u32_tile(1)), max_score, Mask::all());
         });
     });
