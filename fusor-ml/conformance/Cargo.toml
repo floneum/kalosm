@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 fusor = { path = "../fusor", features = ["graphvis"] }
-rand = { version = "0.9", default-features = false, features = ["std", "std_rng"] }
+rand = { version = "0.10", default-features = false, features = ["std", "std_rng"] }
 half = "2.4"
 fusor-types = { path = "../types" }
 thiserror.workspace = true

@@ -70,7 +70,7 @@ tokenizers = { version = "0.21.0", default-features = false }
 thiserror = "2.0.7"
 anyhow = "1.0.94"
 image = "0.25"
-rand = "0.9"
+rand = "0.10"
 criterion = { version = "0.8", features = ["async_futures"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 futures-channel = { version = "0.3.31", default-features = false, features = ["std"] }
