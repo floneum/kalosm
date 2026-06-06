@@ -1,6 +1,6 @@
 use fusor_tile_ir::{
     tile::{range, Mask, PrivateLocal, Storage, Tile, TileBlock, WorkgroupTile},
-    ElementType, ScalarElement, TileLiteral, WorkgroupAxis,
+    ElementType, ScalarElement, SubgroupToken, TileLiteral, WorkgroupAxis,
 };
 
 use super::helpers::{index_n, reduce_workgroup, supports_float, u32_tile, zero_fill, NEG_MAX_F32};
@@ -59,6 +59,7 @@ pub fn flash_attention<B>(
     element: ElementType,
     tensors: FlashAttentionTensors<B>,
     meta: FlashAttentionMeta,
+    subgroup: SubgroupToken,
     subgroup_size: u32,
 ) -> Option<()> {
     let FlashAttentionTensors {
@@ -203,13 +204,15 @@ pub fn flash_attention<B>(
                     });
 
                     let score = program.bind(program.load_local(&score_local));
-                    let block_max = program.bind(program.subgroup_reduce_max(score.clone()));
+                    let block_max =
+                        program.bind(subgroup.subgroup_reduce_max(program, score.clone()));
                     let old_m = program.bind(m_state);
                     let new_m = program.bind(old_m.clone().max(block_max.clone()));
                     let raw_exp = (score.clone() - new_m.clone()).exp();
                     let exp_score =
                         program.bind(Tile::select(kv_valid.clone(), raw_exp, f32_tile(0.0)));
-                    let block_sum = program.bind(program.subgroup_reduce_sum(exp_score.clone()));
+                    let block_sum =
+                        program.bind(subgroup.subgroup_reduce_sum(program, exp_score.clone()));
 
                     program.store_local(&weighted_local, f32_tile(0.0));
                     let valid_value = kv_valid.clone().and(out_valid.clone());
@@ -230,7 +233,7 @@ pub fn flash_attention<B>(
                         program.store_local(&weighted_local, exp_score.clone() * v_value);
                     });
                     let weighted = program.load_local(&weighted_local);
-                    let block_out = program.bind(program.subgroup_reduce_sum(weighted));
+                    let block_out = program.bind(subgroup.subgroup_reduce_sum(program, weighted));
 
                     let old_m_scale = program.bind((old_m.clone() - new_m.clone()).exp());
                     let new_s = s_state * old_m_scale.clone() + block_sum;
@@ -285,6 +288,7 @@ pub fn flash_attention_tiled<B>(
     element: ElementType,
     tensors: FlashAttentionTensors<B>,
     meta: FlashAttentionMeta,
+    subgroup: SubgroupToken,
     subgroup_size: u32,
     q_block: u32,
 ) -> Option<()> {
@@ -617,13 +621,15 @@ pub fn flash_attention_tiled<B>(
                     });
 
                     let score = program.bind(program.load_local(&score_local));
-                    let block_max = program.bind(program.subgroup_reduce_max(score.clone()));
+                    let block_max =
+                        program.bind(subgroup.subgroup_reduce_max(program, score.clone()));
                     let old_m = program.bind(program.load_local(&m_locals[q_offset as usize]));
                     let new_m = program.bind(old_m.clone().max(block_max.clone()));
                     let raw_exp = (score.clone() - new_m.clone()).exp();
                     let exp_score =
                         program.bind(Tile::select(kv_valid.clone(), raw_exp, f32_tile(0.0)));
-                    let block_sum = program.bind(program.subgroup_reduce_sum(exp_score.clone()));
+                    let block_sum =
+                        program.bind(subgroup.subgroup_reduce_sum(program, exp_score.clone()));
 
                     let old_m_scale = program.bind((old_m.clone() - new_m.clone()).exp());
                     let old_s = program.load_local(&s_locals[q_offset as usize]);
@@ -639,7 +645,8 @@ pub fn flash_attention_tiled<B>(
                             exp_score.clone() * v_cached,
                             f32_tile(0.0),
                         );
-                        let block_out = program.bind(program.subgroup_reduce_sum(weighted));
+                        let block_out =
+                            program.bind(subgroup.subgroup_reduce_sum(program, weighted));
                         let o_idx = (q_offset * TILED_OUTS_PER_SUBGROUP + out_offset) as usize;
                         let old_o = program.load_local(&o_locals[o_idx]);
                         let new_o = old_o * old_m_scale.clone() + block_out;

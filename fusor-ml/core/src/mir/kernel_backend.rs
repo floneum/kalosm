@@ -5,6 +5,19 @@ pub(crate) use fusor_tile_ir_runtime::{
     three_buffer_pipeline_from_cached_module, three_buffer_pipeline_from_ir,
 };
 
+/// Marker returned by device-specific direct-kernel builders when the current
+/// device cannot support the required IR capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeviceNotSupported;
+
+impl std::fmt::Display for DeviceNotSupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("device does not support this kernel variant")
+    }
+}
+
+impl std::error::Error for DeviceNotSupported {}
+
 pub(crate) mod flash_attention;
 pub(crate) mod mirostat;
 pub(crate) mod rms_norm;

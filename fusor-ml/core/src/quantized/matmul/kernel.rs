@@ -2,6 +2,16 @@ use std::hash::{Hash, Hasher};
 
 use super::*;
 
+#[derive(Clone, Copy)]
+enum QmatmulDirectTokens {
+    Workgroup,
+    Qgemv(tile_ir::SubgroupToken),
+    Coop {
+        subgroup: tile_ir::SubgroupToken,
+        coop: tile_ir::CoopMatrixToken,
+    },
+}
+
 impl QMatMulOperation {
     /// Build a direct quantized-matmul kernel for the supplied tensors.
     /// `pre_chain`/`post_chain` are pre- and post-element-wise unary chains
@@ -73,9 +83,21 @@ impl QMatMulOperation {
         let subgroup_size_range = [caps.min_subgroup_size, caps.max_subgroup_size];
         let max_workgroups = effective_qmatmul_max_workgroups_per_dimension(&limits);
         let y_supports_coop = tile_ir_kernels::cooperative_store_layout_supported(&y_view.layout);
-        let variant = select_qmatmul_direct_variant(format, m, k, n, y_supports_coop, caps);
-        let use_workgroup_qmatmul =
-            !qmatmul_direct_path_supported(variant, format, k, n, caps) || f16_storage;
+        let mut variant = select_qmatmul_direct_variant(format, m, k, n, y_supports_coop, caps);
+        if f16_storage {
+            variant = QMatmulPath::Workgroup;
+        }
+        let direct_tokens = match variant {
+            QMatmulPath::Workgroup => QmatmulDirectTokens::Workgroup,
+            QMatmulPath::Q5SmallSingleRow | QMatmulPath::SingleRow => {
+                QmatmulDirectTokens::Qgemv(device.subgroup_token()?)
+            }
+            QMatmulPath::Q8Wide(_) | QMatmulPath::Tile { .. } => QmatmulDirectTokens::Coop {
+                subgroup: device.subgroup_token()?,
+                coop: device.coop_token(CooperativeMatrixKind::F32F32M8N8K8)?,
+            },
+        };
+        let use_workgroup_qmatmul = matches!(direct_tokens, QmatmulDirectTokens::Workgroup);
         if has_custom_accumulator_offsets {
             if !qmatmul_custom_accumulator_offsets_supported(
                 format,
@@ -85,7 +107,6 @@ impl QMatMulOperation {
                 n,
                 matrix_n,
                 max_accumulator_offset,
-                caps,
                 max_workgroups,
             ) {
                 return None;
@@ -262,6 +283,7 @@ impl QMatMulOperation {
                     cached: false,
                     tile,
                 } if tile == CoopTile::new(64, 64, QMATMUL_COOP_BK) => None,
+                QMatmulPath::Workgroup => None,
                 QMatmulPath::Q8Wide(tile) | QMatmulPath::Tile { tile, .. } => {
                     Some([n / tile.bn, m / tile.bm, 1])
                 }
@@ -496,18 +518,30 @@ impl QMatMulOperation {
             // qgemv; the rest share the qmatmul_with_epilogue entry point.
             let tile = match variant {
                 QMatmulPath::Q5SmallSingleRow | QMatmulPath::SingleRow => {
+                    let QmatmulDirectTokens::Qgemv(subgroup_token) = direct_tokens else {
+                        unreachable!("single-row qmatmul variant requires subgroup token");
+                    };
                     tile_ir_kernels::qgemv_with_epilogue(
                         phase,
                         &a,
                         &b,
                         &y,
                         qmatmul_workgroups_x,
+                        subgroup_token,
                         subgroup_config,
                         &epilogues,
                     );
                     return;
                 }
+                QMatmulPath::Workgroup => unreachable!("workgroup qmatmul returned above"),
                 QMatmulPath::Q8Wide(tile) | QMatmulPath::Tile { tile, .. } => tile,
+            };
+            let QmatmulDirectTokens::Coop {
+                subgroup: subgroup_token,
+                coop: coop_token,
+            } = direct_tokens
+            else {
+                unreachable!("direct qmatmul tile variant requires cooperative-matrix tokens");
             };
             tile_ir_kernels::qmatmul_with_epilogue(
                 phase,
@@ -515,6 +549,8 @@ impl QMatMulOperation {
                 &b,
                 &y,
                 &epilogues,
+                subgroup_token,
+                coop_token,
                 subgroup_config,
                 tile.bm,
                 tile.bn,

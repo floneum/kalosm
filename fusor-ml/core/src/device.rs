@@ -3,10 +3,14 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use fusor_tile_ir::{CoopMatrixToken, SubgroupToken};
 use fusor_tile_ir_runtime::{BufferPool, KernelCache};
 use wgpu::{BackendOptions, Dx12BackendOptions};
 
-use crate::{compute_graph::ComputeGraph, kernel_selection::CooperativeMatrixCaps};
+use crate::{
+    compute_graph::ComputeGraph,
+    kernel_selection::{CooperativeMatrixCaps, CooperativeMatrixKind},
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 use web_time::{Duration, Instant};
@@ -372,6 +376,14 @@ impl Device {
         self.features().contains(wgpu::Features::SUBGROUP)
     }
 
+    pub fn subgroup_token(&self) -> Option<SubgroupToken> {
+        if !self.subgroups_supported() {
+            return None;
+        }
+
+        Some(SubgroupToken::new_unchecked())
+    }
+
     pub fn min_subgroup_size(&self) -> u32 {
         self.inner.adapter.get_info().subgroup_min_size
     }
@@ -404,6 +416,14 @@ impl Device {
 
     pub(crate) fn cooperative_matrix_caps(&self) -> CooperativeMatrixCaps {
         self.inner.cooperative_matrix_caps
+    }
+
+    pub(crate) fn coop_token(&self, kind: CooperativeMatrixKind) -> Option<CoopMatrixToken> {
+        if !self.cooperative_matrix_caps().supports(kind) {
+            return None;
+        }
+
+        Some(CoopMatrixToken::new_unchecked())
     }
 
     pub fn wgpu_adapter(&self) -> &wgpu::Adapter {

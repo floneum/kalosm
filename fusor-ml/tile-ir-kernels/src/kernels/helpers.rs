@@ -1,5 +1,5 @@
 use fusor_tile_ir::tile::{CoopAcc, Storage, Tile, TileBlock, WorkgroupTile};
-use fusor_tile_ir::{ElementType, ScalarElement, TileLiteral};
+use fusor_tile_ir::{CoopMatrixToken, ElementType, ScalarElement, TileLiteral};
 
 use crate::types::QmatmulExtra;
 
@@ -277,21 +277,22 @@ const COOP_DIM: u32 = 8;
 /// `store_local_coop`).
 pub(super) fn coop_acc_grid<Init>(
     program: &mut TileBlock<'_>,
+    coop: CoopMatrixToken,
     scalar: ScalarElement,
     rows: u32,
     cols: u32,
     mut init: Init,
 ) -> Vec<Vec<CoopAcc>>
 where
-    Init: FnMut(&mut TileBlock<'_>, u32, u32) -> Tile,
+    Init: FnMut(&mut TileBlock<'_>, CoopMatrixToken, u32, u32) -> Tile,
 {
     (0..rows)
         .map(|r| {
             (0..cols)
                 .map(|c| {
-                    let acc = program.alloc_coop_acc(scalar, COOP_DIM, COOP_DIM);
-                    let seed = init(program, r, c);
-                    program.store_local_coop(&acc, seed);
+                    let acc = coop.alloc_coop_acc(program, scalar, COOP_DIM, COOP_DIM);
+                    let seed = init(program, coop, r, c);
+                    coop.store_local_coop(program, &acc, seed);
                     acc
                 })
                 .collect()
@@ -303,12 +304,13 @@ where
 /// accumulators. Shared between dense and quantized cooperative matmul.
 pub(super) fn zero_coop_acc_grid(
     program: &mut TileBlock<'_>,
+    coop: CoopMatrixToken,
     scalar: ScalarElement,
     rows: u32,
     cols: u32,
 ) -> Vec<Vec<CoopAcc>> {
-    coop_acc_grid(program, scalar, rows, cols, |program, _, _| {
-        program.coop_zero(scalar, COOP_DIM, COOP_DIM)
+    coop_acc_grid(program, coop, scalar, rows, cols, |program, coop, _, _| {
+        coop.coop_zero(program, scalar, COOP_DIM, COOP_DIM)
     })
 }
 
@@ -319,21 +321,28 @@ pub(super) fn zero_coop_acc_grid(
 /// trio into one call (ARBOR_DESIGN.md §4) — the qmatmul "preloaded C" path.
 pub(super) fn coop_acc_grid_set_c(
     program: &mut TileBlock<'_>,
+    coop: CoopMatrixToken,
     vector: &Storage,
     col_base: &Tile,
     scalar: ScalarElement,
     rows: u32,
     cols: u32,
 ) -> Vec<Vec<CoopAcc>> {
-    let c_frags = coop_load_c_broadcast_fragments(program, vector, col_base, cols, scalar);
-    coop_acc_grid(program, scalar, rows, cols, |_program, _r, c| {
-        c_frags[c as usize].clone()
-    })
+    let c_frags = coop_load_c_broadcast_fragments(program, coop, vector, col_base, cols, scalar);
+    coop_acc_grid(
+        program,
+        coop,
+        scalar,
+        rows,
+        cols,
+        |_program, _coop, _r, c| c_frags[c as usize].clone(),
+    )
 }
 
 /// Cooperatively load `rows` A-role 8x8 fragments from a workgroup tile.
 pub(super) fn coop_load_a_fragments(
     program: &TileBlock<'_>,
+    coop: CoopMatrixToken,
     tile: &WorkgroupTile,
     sg_row_base: &Tile,
     kk: u32,
@@ -342,7 +351,8 @@ pub(super) fn coop_load_a_fragments(
 ) -> Vec<Tile> {
     (0..rows)
         .map(|r| {
-            program.coop_load_a(
+            coop.coop_load_a(
+                program,
                 tile,
                 sg_row_base.clone() + r * COOP_DIM,
                 kk * COOP_DIM,
@@ -357,6 +367,7 @@ pub(super) fn coop_load_a_fragments(
 /// Cooperatively load `cols` B-role 8x8 fragments from a workgroup tile.
 pub(super) fn coop_load_b_fragments(
     program: &TileBlock<'_>,
+    coop: CoopMatrixToken,
     tile: &WorkgroupTile,
     sg_col_base: &Tile,
     kk: u32,
@@ -365,7 +376,8 @@ pub(super) fn coop_load_b_fragments(
 ) -> Vec<Tile> {
     (0..cols)
         .map(|c| {
-            program.coop_load_b(
+            coop.coop_load_b(
+                program,
                 tile,
                 kk * COOP_DIM,
                 sg_col_base.clone() + c * COOP_DIM,
@@ -381,6 +393,7 @@ pub(super) fn coop_load_b_fragments(
 /// broadcasting each 8-column slice across the fragment rows.
 pub(super) fn coop_load_c_broadcast_fragments(
     program: &TileBlock<'_>,
+    coop: CoopMatrixToken,
     vector: &Storage,
     col_base: &Tile,
     cols: u32,
@@ -388,7 +401,8 @@ pub(super) fn coop_load_c_broadcast_fragments(
 ) -> Vec<Tile> {
     (0..cols)
         .map(|c| {
-            program.coop_load_c_broadcast(
+            coop.coop_load_c_broadcast(
+                program,
                 vector,
                 col_base.clone() + c * COOP_DIM,
                 scalar,
@@ -405,6 +419,7 @@ pub(super) fn coop_load_c_broadcast_fragments(
 /// (ARBOR_DESIGN.md §6).
 pub(super) fn coop_mma_grid(
     program: &mut TileBlock<'_>,
+    coop: CoopMatrixToken,
     accs: &[Vec<CoopAcc>],
     a_frags: &[Tile],
     b_frags: &[Tile],
@@ -412,9 +427,9 @@ pub(super) fn coop_mma_grid(
     for (r, a) in a_frags.iter().enumerate() {
         for (c, b) in b_frags.iter().enumerate() {
             let acc = &accs[r][c];
-            let c_value = program.load_local_coop(acc);
-            let mma = program.coop_mma(a.clone(), b.clone(), c_value);
-            program.store_local_coop(acc, mma);
+            let c_value = coop.load_local_coop(program, acc);
+            let mma = coop.coop_mma(program, a.clone(), b.clone(), c_value);
+            coop.store_local_coop(program, acc, mma);
         }
     }
 }
@@ -455,6 +470,7 @@ pub(super) fn load_qmatmul_extra(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn coop_store_acc_grid(
     program: &mut TileBlock<'_>,
+    coop: CoopMatrixToken,
     accs: &[Vec<CoopAcc>],
     y: &Storage,
     y_batch_base: Option<&Tile>,
@@ -471,7 +487,7 @@ pub(super) fn coop_store_acc_grid(
                 None => local_row,
             };
             let col = col_base.clone() + sg_col_base.clone() + c as u32 * COOP_DIM;
-            program.coop_store(acc, y, row, col);
+            coop.coop_store(program, acc, y, row, col);
         }
     }
 }

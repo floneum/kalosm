@@ -7,7 +7,7 @@ use crate::ir::{
 };
 
 macro_rules! tile_reduce_entrypoints {
-    ($(($reduce:ident, $loop_reduce:ident, $group_reduce:ident, $subgroup_reduce:ident, $op:ident)),+ $(,)?) => {
+    ($(($reduce:ident, $loop_reduce:ident, $group_reduce:ident, $op:ident)),+ $(,)?) => {
         $(
             /// Cross-lane reduction across the whole workgroup.
             pub fn $reduce(&mut self, value: Tile) -> Tile {
@@ -24,37 +24,15 @@ macro_rules! tile_reduce_entrypoints {
             pub fn $group_reduce(&mut self, group_size: u32, value: Tile) -> Tile {
                 self.group_reduce(TileReduceOp::$op, group_size, value)
             }
-            /// Reduction across one subgroup.
-            pub fn $subgroup_reduce(&self, value: Tile) -> Tile {
-                self.subgroup_reduce(TileReduceOp::$op, value)
-            }
         )+
     };
 }
 
 impl TileBlock<'_> {
     tile_reduce_entrypoints!(
-        (
-            reduce_sum,
-            loop_reduce_sum,
-            group_reduce_sum,
-            subgroup_reduce_sum,
-            Sum
-        ),
-        (
-            reduce_max,
-            loop_reduce_max,
-            group_reduce_max,
-            subgroup_reduce_max,
-            Max
-        ),
-        (
-            reduce_min,
-            loop_reduce_min,
-            group_reduce_min,
-            subgroup_reduce_min,
-            Min
-        ),
+        (reduce_sum, loop_reduce_sum, group_reduce_sum, Sum),
+        (reduce_max, loop_reduce_max, group_reduce_max, Max),
+        (reduce_min, loop_reduce_min, group_reduce_min, Min),
     );
 
     /// Pairwise tree-sum of a set of values into a single value (no cross-lane
@@ -160,7 +138,7 @@ impl TileBlock<'_> {
 
     // ---- internals -------------------------------------------------------
 
-    fn subgroup_reduce(&self, op: TileReduceOp, value: Tile) -> Tile {
+    pub(crate) fn subgroup_reduce(&self, op: TileReduceOp, value: Tile) -> Tile {
         let ty = value.element();
         Tile::new(
             ExprKind::Reduce {

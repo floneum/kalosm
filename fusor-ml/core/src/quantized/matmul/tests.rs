@@ -105,9 +105,10 @@ mod selection_tests {
                     tile: qtile(64, 64),
                     cached: false,
                 },
-                ctx(q4, false),
+                ctx(q4, true),
                 caps(false),
             ),
+            (QMatmulPath::Workgroup, ctx(q4, false), no_coop_caps(false)),
         ];
         assert_selector_generates(&selector, cases);
     }
@@ -119,10 +120,7 @@ mod selection_tests {
         let q4k = tile_ir::GgmlQuantFormat::Q4K;
         assert_eq!(
             selector.select(shape, &ctx(q4k, true), no_coop_caps(true)),
-            Some(QMatmulPath::Tile {
-                tile: qtile(64, 64),
-                cached: false
-            })
+            Some(QMatmulPath::Workgroup)
         );
         assert!(!qmatmul_coop_supported(no_coop_caps(true)));
         assert_eq!(
@@ -141,32 +139,16 @@ mod selection_tests {
         let k = 4096;
         let n = 8192;
         let qgemv_supported = |caps| qgemv_subgroup_supported(format, k, n, caps);
-        let direct_supported = |path, caps| qmatmul_direct_path_supported(path, format, k, n, caps);
 
         assert!(!qmatmul_path_requires_coop(QMatmulPath::SingleRow));
         assert!(!qmatmul_path_requires_coop(QMatmulPath::Q5SmallSingleRow));
+        assert!(!qmatmul_path_requires_coop(QMatmulPath::Workgroup));
         assert!(qmatmul_path_requires_coop(QMatmulPath::Tile {
             tile: qtile(64, 64),
             cached: false,
         }));
         assert!(qgemv_supported(no_coop_caps(false)));
-        assert!(direct_supported(
-            QMatmulPath::SingleRow,
-            no_coop_caps(false)
-        ));
-        assert!(!direct_supported(
-            QMatmulPath::SingleRow,
-            no_subgroup_caps(false)
-        ));
-        assert!(!direct_supported(
-            QMatmulPath::Q5SmallSingleRow,
-            no_subgroup_caps(false)
-        ));
         assert!(qgemv_supported(variable_subgroup_caps(false)));
-        assert!(direct_supported(
-            QMatmulPath::SingleRow,
-            variable_subgroup_caps(false)
-        ));
 
         let selector = qmatmul_direct_selector();
         let caps = no_coop_caps(false);
@@ -179,6 +161,14 @@ mod selection_tests {
                 caps,
             ),
             Some(QMatmulPath::SingleRow)
+        );
+        assert_eq!(
+            selector.select(
+                KernelShape::new([1, 4096, 8192]),
+                &ctx(tile_ir::GgmlQuantFormat::Q4K, false),
+                no_subgroup_caps(false),
+            ),
+            Some(QMatmulPath::Workgroup)
         );
     }
 
@@ -265,8 +255,8 @@ mod selection_tests {
         let m = 1;
         let k = 4096;
         let n = 4096;
-        let variant = select_qmatmul_direct_variant(format, m, k, n, false, caps(false));
         let supported = |caps, max_workgroups| {
+            let variant = select_qmatmul_direct_variant(format, m, k, n, false, caps);
             qmatmul_custom_accumulator_offsets_supported(
                 format,
                 variant,
@@ -275,7 +265,6 @@ mod selection_tests {
                 n,
                 n * 2,
                 n,
-                caps,
                 max_workgroups,
             )
         };

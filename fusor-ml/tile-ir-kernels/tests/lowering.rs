@@ -18,6 +18,14 @@ fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
         .unwrap_or_else(|error| panic!("{label} lowering failed: {error}"))
 }
 
+fn subgroup_token() -> fusor_tile_ir::SubgroupToken {
+    fusor_tile_ir::SubgroupToken::new_unchecked()
+}
+
+fn coop_token() -> fusor_tile_ir::CoopMatrixToken {
+    fusor_tile_ir::CoopMatrixToken::new_unchecked()
+}
+
 #[test]
 fn streaming_flash_attention_regression_shape_lowers_to_naga() {
     let layout = linear_storage_layout();
@@ -50,6 +58,7 @@ fn streaming_flash_attention_regression_shape_lowers_to_naga() {
             dispatch_size: [16, 1536, 1],
             causal: false,
         },
+        subgroup_token(),
         32,
     )
     .expect("streaming flash attention should build");
@@ -106,6 +115,7 @@ fn qgemv_ir(format: GgmlQuantFormat, rows: u32, cols: u32) -> fusor_tile_ir::Ker
             &b,
             &y,
             1,
+            subgroup_token(),
             SubgroupConfig::fixed(32),
             Option::<&UnaryEpilogue>::None,
         );
@@ -154,6 +164,8 @@ fn scalar_qmatmul_lowers() {
             &b,
             &y,
             &QmatmulEpilogues::empty(),
+            subgroup_token(),
+            coop_token(),
             SubgroupConfig::fixed(32),
             8,
             4,
@@ -175,6 +187,8 @@ fn cooperative_qmatmul_lowers() {
             &b,
             &y,
             &QmatmulEpilogues::empty(),
+            subgroup_token(),
+            coop_token(),
             SubgroupConfig::fixed(32),
             64,
             64,
@@ -250,6 +264,7 @@ fn batched_dense_f32_gemv_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            subgroup_token(),
             SubgroupConfig::fixed(32),
         );
     });
@@ -322,6 +337,7 @@ fn batched_dense_f16_gemv_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            subgroup_token(),
             SubgroupConfig::fixed(32),
         );
     });
@@ -359,6 +375,8 @@ fn cooperative_dense_f32_matmul_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            subgroup_token(),
+            coop_token(),
             SubgroupConfig::fixed(32),
             DenseCoopMatmulTile {
                 bm: 64,
@@ -401,6 +419,8 @@ fn cooperative_dense_f16_matmul_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            subgroup_token(),
+            coop_token(),
             SubgroupConfig::fixed(32),
             DenseCoopMatmulTile {
                 bm: 64,
@@ -443,6 +463,8 @@ fn cooperative_dense_f32_matmul_128x128_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            subgroup_token(),
+            coop_token(),
             SubgroupConfig::fixed(32),
             DenseCoopMatmulTile {
                 bm: 128,
@@ -485,6 +507,8 @@ fn cooperative_dense_f32_matmul_128x64_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            subgroup_token(),
+            coop_token(),
             SubgroupConfig::fixed(32),
             DenseCoopMatmulTile {
                 bm: 128,
@@ -529,6 +553,8 @@ fn cooperative_dense_f32_matmul_128x256_npass_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            subgroup_token(),
+            coop_token(),
             SubgroupConfig::fixed(32),
             DenseCoopMatmulTile {
                 bm: 128,
@@ -598,6 +624,8 @@ fn qmatmul_epilogue_fallback_ir(post: Option<&UnaryEpilogue>) -> fusor_tile_ir::
             &b,
             &y,
             &epilogues,
+            subgroup_token(),
+            coop_token(),
             SubgroupConfig::fixed(32),
             64,
             64,

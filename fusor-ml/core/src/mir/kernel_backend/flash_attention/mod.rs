@@ -44,6 +44,7 @@ fn dispatch_streaming_flash_attention(
     output: tile_ir::KernelTensorRef<()>,
     meta: tile_ir_kernels::FlashAttentionMeta,
     input_dtype: DataTypeEnum,
+    subgroup: tile_ir::SubgroupToken,
     subgroup_size: u32,
 ) -> Option<()> {
     let element = match input_dtype {
@@ -62,6 +63,7 @@ fn dispatch_streaming_flash_attention(
             output,
         },
         meta,
+        subgroup,
         subgroup_size,
     )
 }
@@ -76,6 +78,7 @@ fn dispatch_streaming_tiled_flash_attention(
     output: tile_ir::KernelTensorRef<()>,
     meta: tile_ir_kernels::FlashAttentionMeta,
     input_dtype: DataTypeEnum,
+    subgroup: tile_ir::SubgroupToken,
     subgroup_size: u32,
 ) -> Option<()> {
     let element = match input_dtype {
@@ -94,6 +97,7 @@ fn dispatch_streaming_tiled_flash_attention(
             output,
         },
         meta,
+        subgroup,
         subgroup_size,
         FLASH_STREAMING_TILED_Q_BLOCK,
     )
@@ -141,8 +145,14 @@ fn streaming_dispatch_size(dims: FlashAttentionDims, outputs_per_workgroup: u32)
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum FlashAttentionKernelVariant {
-    Streaming,
-    StreamingTiled,
+    Streaming {
+        subgroup: tile_ir::SubgroupToken,
+        subgroup_size: u32,
+    },
+    StreamingTiled {
+        subgroup: tile_ir::SubgroupToken,
+        subgroup_size: u32,
+    },
     DecodeSmall,
     DecodeSplitPartials,
     DecodeSplitReduce,
@@ -190,7 +200,9 @@ enum FlashAttentionSelectedVariant {
 impl FlashAttentionSelectedVariant {
     fn kernel_variant(self) -> FlashAttentionKernelVariant {
         match self {
-            Self::Streaming => FlashAttentionKernelVariant::Streaming,
+            Self::Streaming => {
+                unreachable!("streaming variants are constructed with device subgroup tokens")
+            }
             Self::DecodeSmall(_) => FlashAttentionKernelVariant::DecodeSmall,
         }
     }

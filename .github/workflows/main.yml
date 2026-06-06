@@ -79,12 +79,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          # `shared-key` makes every Linux job in this PR share one cache
-          # slot, so once `check` warms the deps `test` / `clippy` /
-          # `docs` all hit it. `cache-all-crates` includes registry
-          # sources (~hundreds of MB) but means dep-only churn doesn't
-          # blow the entire cache.
-          shared-key: "linux-stable"
+          # Cache is split by compile mode. `cargo check` / `clippy` only
+          # emit metadata (.rmeta); `cargo test` / `test --doc` need
+          # codegen (.rlib). They must NOT share a slot: the fast check
+          # job always wins the per-key save race and stores a
+          # metadata-only cache, so the test/doc jobs restore a "full
+          # match" that contains none of the .rlib artifacts they need
+          # and rebuild every dependency from scratch (~700 crates, 30
+          # min). Keep the check-mode jobs (`check`, `clippy`) on their
+          # own key. `cache-all-crates` includes registry sources
+          # (~hundreds of MB) but means dep-only churn doesn't blow the
+          # entire cache.
+          shared-key: "linux-check"
           cache-all-crates: "true"
           # Only push cache from main, so PR-only caches don't churn the
           # 10GB-per-repo Actions cache budget.
@@ -117,7 +123,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "linux-stable"
+          # Codegen-mode cache slot, separate from the check-mode jobs so
+          # the restored cache holds the .rlib artifacts `cargo test`
+          # needs. See the `check` job for why the modes can't share.
+          shared-key: "linux-build"
           cache-all-crates: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Configure lavapipe
@@ -178,7 +187,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "linux-stable"
+          # Codegen-mode cache slot shared with `test` (both build
+          # .rlib artifacts), kept apart from the check-mode jobs.
+          shared-key: "linux-build"
           cache-all-crates: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --doc --workspace --features kalosm/language,kalosm/llama,kalosm/bert,kalosm/structured,kalosm/fs-documents,kalosm/sound,kalosm/sound-denoise,kalosm/sound-source,kalosm/sound-voice-detection,kalosm/vision,kalosm/remote,kalosm/scrape,kalosm/surrealdb-local
@@ -209,7 +220,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "linux-stable"
+          # Check-mode cache slot shared with `check` (metadata only).
+          shared-key: "linux-check"
           cache-all-crates: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --examples --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape -- -D warnings

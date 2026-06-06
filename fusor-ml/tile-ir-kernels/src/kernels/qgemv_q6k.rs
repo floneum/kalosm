@@ -12,7 +12,7 @@
 //! does not apply; that layout stays on the generic perf path.
 
 use fusor_tile_ir::tile::{range, Program, Storage, Tile, TileBlock};
-use fusor_tile_ir::{ElementType, GgmlQuantFormat, QuantizedMatrix};
+use fusor_tile_ir::{ElementType, GgmlQuantFormat, QuantizedMatrix, SubgroupToken};
 
 use crate::dispatch::{QgemvShape, SubgroupConfig};
 use crate::grid::{
@@ -87,6 +87,7 @@ pub(crate) fn qgemv_q6k_ggml(
     b: &QuantizedMatrix,
     y: &Storage,
     workgroups_x: u32,
+    subgroup: SubgroupToken,
     subgroups: SubgroupConfig,
     epilogues: &QmatmulEpilogues<'_>,
     shape: QgemvShape,
@@ -114,11 +115,11 @@ pub(crate) fn qgemv_q6k_ggml(
     let row = Tile::u32(0);
 
     program.program_grid(block, [grid.workgroups_x, grid.dispatch_y, 1], |program| {
-        let scope = qgemv_program_scope(program, grid, cols_per_subgroup);
+        let scope = qgemv_program_scope(program, grid, cols_per_subgroup, subgroup);
         let col0 = scope.col0;
         let lane = scope.lane;
         let q6k_lane = q6k_lane_decomposition(&lane);
-        let blocks_per_pass = program.subgroup_size() / 16u32;
+        let blocks_per_pass = subgroup.subgroup_size(program) / 16u32;
         let block_iterations =
             (Tile::u32(block_count) + blocks_per_pass.clone() - 1u32) / blocks_per_pass.clone();
 
@@ -194,6 +195,7 @@ pub(crate) fn qgemv_q6k_ggml(
             sums,
             QgemvStoreTarget {
                 y,
+                subgroup,
                 col0,
                 lane,
                 n_cols: grid.n_cols,

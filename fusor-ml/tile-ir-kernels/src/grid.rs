@@ -7,7 +7,7 @@
 //! values carry their [`ScalarElement`] as data.
 
 use fusor_tile_ir::tile::{Mask, Storage, Tile, TileBlock};
-use fusor_tile_ir::{ScalarElement, TileLiteral, WorkgroupAxis};
+use fusor_tile_ir::{ScalarElement, SubgroupToken, TileLiteral, WorkgroupAxis};
 
 #[derive(Clone, Copy)]
 pub(crate) struct QgemvGrid {
@@ -45,6 +45,7 @@ pub(crate) struct QgemvProgramScope {
 }
 
 pub(crate) struct QgemvStoreTarget<'a> {
+    pub(crate) subgroup: SubgroupToken,
     pub(crate) y: &'a Storage,
     pub(crate) col0: Tile,
     pub(crate) lane: Tile,
@@ -56,14 +57,15 @@ pub(crate) fn qgemv_program_scope(
     program: &TileBlock<'_>,
     grid: QgemvGrid,
     cols_per_subgroup: u32,
+    subgroup: SubgroupToken,
 ) -> QgemvProgramScope {
     let workgroup = program.program_id(WorkgroupAxis::X)
         + program.program_id(WorkgroupAxis::Y) * grid.workgroups_x;
-    let col_group_base = workgroup * program.num_subgroups() * cols_per_subgroup;
-    let subgroup_col_base = program.subgroup_id() * cols_per_subgroup;
+    let col_group_base = workgroup * subgroup.num_subgroups(program) * cols_per_subgroup;
+    let subgroup_col_base = subgroup.subgroup_id(program) * cols_per_subgroup;
     QgemvProgramScope {
         col0: col_group_base + subgroup_col_base,
-        lane: program.subgroup_lane(),
+        lane: subgroup.subgroup_lane(program),
     }
 }
 
@@ -79,7 +81,7 @@ pub(crate) fn store_qgemv_sums_with_epilogue(
     if target.epilogues.post_accumulator_offsets.is_empty() {
         for (offset, sum) in sums.into_iter().enumerate() {
             let col = target.col0.clone() + offset as u32;
-            let reduced = program.subgroup_reduce_sum(sum);
+            let reduced = target.subgroup.subgroup_reduce_sum(program, sum);
             let extras = target
                 .epilogues
                 .post_extra_inputs
@@ -112,7 +114,7 @@ pub(crate) fn store_qgemv_sums_with_epilogue(
         let reduced = sums
             .iter()
             .cloned()
-            .map(|sum| program.subgroup_reduce_sum(sum))
+            .map(|sum| target.subgroup.subgroup_reduce_sum(program, sum))
             .collect::<Vec<_>>();
         let extras = target
             .epilogues

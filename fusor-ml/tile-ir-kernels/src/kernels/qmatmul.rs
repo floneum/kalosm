@@ -1,7 +1,9 @@
 //! Quantized matrix multiply program kernels.
 
 use fusor_tile_ir::tile::{range, Program, Storage};
-use fusor_tile_ir::{QuantizedMatrix, ScalarElement, WorkgroupAxis};
+use fusor_tile_ir::{
+    CoopMatrixToken, QuantizedMatrix, ScalarElement, SubgroupToken, WorkgroupAxis,
+};
 
 use crate::{
     dispatch::SubgroupConfig,
@@ -34,6 +36,8 @@ use crate::{
 ///         &b,
 ///         &y,
 ///         &QmatmulEpilogues::empty(),
+///         fusor_tile_ir::SubgroupToken::new_unchecked(),
+///         fusor_tile_ir::CoopMatrixToken::new_unchecked(),
 ///         fusor_tile_ir_kernels::SubgroupConfig::fixed(32),
 ///         64,
 ///         64,
@@ -49,6 +53,8 @@ pub fn qmatmul_with_epilogue(
     b: &QuantizedMatrix,
     y: &Storage,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
+    subgroup: SubgroupToken,
+    coop: CoopMatrixToken,
     subgroups: SubgroupConfig,
     bm: u32,
     bn: u32,
@@ -65,9 +71,11 @@ pub fn qmatmul_with_epilogue(
     assert_eq!(b.cols, y_n, "qmatmul output column count must match B");
 
     if m == 1 {
-        super::qgemv::qgemv_with_epilogue(program, a, b, y, 1, subgroups, epilogues);
+        super::qgemv::qgemv_with_epilogue(program, a, b, y, 1, subgroup, subgroups, epilogues);
     } else {
-        qmatmul_tile_with_epilogue(program, a, b, y, epilogues, subgroups, bm, bn, bk);
+        qmatmul_tile_with_epilogue(
+            program, a, b, y, epilogues, subgroup, coop, subgroups, bm, bn, bk,
+        );
     }
 }
 
@@ -85,6 +93,8 @@ pub(crate) fn qmatmul_tile_with_epilogue(
     b: &QuantizedMatrix,
     y: &Storage,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
+    subgroup: SubgroupToken,
+    coop: CoopMatrixToken,
     subgroups: SubgroupConfig,
     bm: u32,
     bn: u32,
@@ -111,6 +121,8 @@ pub(crate) fn qmatmul_tile_with_epilogue(
             b,
             epilogues.post_acc_init_col_vector,
             y,
+            subgroup,
+            coop,
             subgroups,
             bm,
             bn,
@@ -187,6 +199,8 @@ pub(crate) fn qmatmul_try_coop(
     b: &QuantizedMatrix,
     acc_init: Option<&Storage>,
     y: &Storage,
+    subgroup: SubgroupToken,
+    coop: CoopMatrixToken,
     subgroups: SubgroupConfig,
     bm: u32,
     bn: u32,
@@ -210,7 +224,8 @@ pub(crate) fn qmatmul_try_coop(
         return false;
     }
     qmatmul_coop(
-        program, a, b, acc_init, y, bm, bn, table_bk, row_groups, col_groups, subgroups,
+        program, a, b, acc_init, y, subgroup, coop, bm, bn, table_bk, row_groups, col_groups,
+        subgroups,
     );
     true
 }
@@ -230,6 +245,8 @@ pub(crate) fn qmatmul_coop(
     b: &QuantizedMatrix,
     acc_init: Option<&Storage>,
     y: &Storage,
+    subgroup: SubgroupToken,
+    coop: CoopMatrixToken,
     bm: u32,
     bn: u32,
     bk: u32,
@@ -260,7 +277,7 @@ pub(crate) fn qmatmul_coop(
     program.program_grid(block, [n_grid_x, n_grid_y, 1], |program| {
         let row_base = program.program_id(WorkgroupAxis::Y) * bm;
         let col_base = program.program_id(WorkgroupAxis::X) * bn;
-        let subgroup_id = program.subgroup_id();
+        let subgroup_id = subgroup.subgroup_id(program);
         let sg_row = subgroup_id.clone() / col_groups;
         let sg_col = subgroup_id % col_groups;
         let sg_row_base = sg_row * SUBGROUP_ROWS;
@@ -269,15 +286,19 @@ pub(crate) fn qmatmul_coop(
         let accs = match acc_init {
             None => coop_acc_grid(
                 program,
+                coop,
                 ScalarElement::F32,
                 TILE_ROWS_PER_SG,
                 TILE_COLS_PER_SG,
-                |program, _, _| program.coop_zero(ScalarElement::F32, COOP_DIM, COOP_DIM),
+                |program, coop, _, _| {
+                    coop.coop_zero(program, ScalarElement::F32, COOP_DIM, COOP_DIM)
+                },
             ),
             Some(init) => {
                 let acc_init_col_base = col_base.clone() + sg_col_base.clone();
                 coop_acc_grid_set_c(
                     program,
+                    coop,
                     init,
                     &acc_init_col_base,
                     ScalarElement::F32,
@@ -297,6 +318,7 @@ pub(crate) fn qmatmul_coop(
             for kk in 0..kk_steps {
                 let a_frags = coop_load_a_fragments(
                     program,
+                    coop,
                     &a_tile,
                     &sg_row_base,
                     kk,
@@ -305,19 +327,21 @@ pub(crate) fn qmatmul_coop(
                 );
                 let b_frags = coop_load_b_fragments(
                     program,
+                    coop,
                     &b_tile,
                     &sg_col_base,
                     kk,
                     TILE_COLS_PER_SG,
                     ScalarElement::F32,
                 );
-                coop_mma_grid(program, &accs, &a_frags, &b_frags);
+                coop_mma_grid(program, coop, &accs, &a_frags, &b_frags);
             }
             program.workgroup_barrier();
         });
 
         coop_store_acc_grid(
             program,
+            coop,
             &accs,
             y,
             None,
