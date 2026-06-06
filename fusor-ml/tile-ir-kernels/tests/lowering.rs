@@ -108,7 +108,12 @@ fn rms_norm_vec4_minimal_lowers() {
     lower_or_fail(&ir, "rms_norm_vec4");
 }
 
-fn qgemv_ir(format: GgmlQuantFormat, rows: u32, cols: u32) -> fusor_tile_ir::KernelIr {
+fn qgemv_ir_with_subgroup_size(
+    format: GgmlQuantFormat,
+    rows: u32,
+    cols: u32,
+    subgroup_size: u32,
+) -> fusor_tile_ir::KernelIr {
     tile::build(|program| {
         let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, rows]));
         let b = quantized_matrix(program, format, rows, cols);
@@ -119,10 +124,14 @@ fn qgemv_ir(format: GgmlQuantFormat, rows: u32, cols: u32) -> fusor_tile_ir::Ker
             &b,
             &y,
             1,
-            subgroup_config(32),
+            subgroup_config(subgroup_size),
             Option::<&UnaryEpilogue>::None,
         );
     })
+}
+
+fn qgemv_ir(format: GgmlQuantFormat, rows: u32, cols: u32) -> fusor_tile_ir::KernelIr {
+    qgemv_ir_with_subgroup_size(format, rows, cols, 32)
 }
 
 #[test]
@@ -135,6 +144,18 @@ fn generic_q8_qgemv_lowers() {
 fn q4k_ggml_qgemv_lowers() {
     let ir = qgemv_ir(GgmlQuantFormat::Q4K, 4096, 8192);
     lower_or_fail(&ir, "q4k ggml qgemv");
+}
+
+#[test]
+fn q4k_ggml_qgemv_tail_columns_lower() {
+    let ir = qgemv_ir(GgmlQuantFormat::Q4K, 4096, 8193);
+    lower_or_fail(&ir, "q4k ggml qgemv tail columns");
+}
+
+#[test]
+fn q4k_ggml_qgemv_tail_columns_lower_with_64_lane_subgroups() {
+    let ir = qgemv_ir_with_subgroup_size(GgmlQuantFormat::Q4K, 4096, 8193, 64);
+    lower_or_fail(&ir, "q4k ggml qgemv tail columns subgroup64");
 }
 
 #[test]

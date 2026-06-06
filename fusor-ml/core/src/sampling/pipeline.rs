@@ -4,6 +4,16 @@ use crate::{
     tensor::{DataTypeEnum, LazyTensorData, TensorData},
 };
 use web_time::Instant;
+
+// Diagnostic: the std `eprintln!` used for the `sampler_trace` timing below is
+// invisible on wasm, so on the web target route those lines to the browser
+// console instead. Native keeps the real `eprintln!`.
+#[cfg(target_arch = "wasm32")]
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        web_sys::console::log_1(&format!($($arg)*).into());
+    }};
+}
 use wgpu::CommandEncoder;
 
 use super::{
@@ -69,7 +79,8 @@ pub(crate) async fn qmat_mirostat2_sample_token_to_host(
                 label: Some("qmat_mirostat2_sample_token_to_host encoder"),
             });
 
-    let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+    let trace = cfg!(target_arch = "wasm32")
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
     let qmat_start = trace.then(Instant::now);
     let Some(logits) = qmat_logits_data_with_encoder(hidden, matrix, &mut encoder) else {
@@ -118,7 +129,7 @@ pub(crate) async fn qmat_mirostat2_sample_token_to_host(
         #[cfg(not(target_arch = "wasm32"))]
         device.poll_wait();
         let _ = rx.await;
-        let view = hidden_dl.slice(..).get_mapped_range();
+        let view = hidden_dl.slice(..).get_mapped_range().unwrap();
         let hidden_vec: Vec<f32> = bytemuck::cast_slice(&view).to_vec();
         drop(view);
         hidden_dl.unmap();
@@ -183,7 +194,8 @@ pub(crate) async fn qmat_mirostat2_sample_lazy_token_to_host(
         return Ok(None);
     }
 
-    let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+    let trace = cfg!(target_arch = "wasm32")
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
     let qmat_start = trace.then(Instant::now);
     let (materialized_hidden, _, logits) = hidden.materialize_with_tail(|hidden_data, encoder| {
@@ -253,7 +265,8 @@ pub(crate) async fn qmat_standard_sample_lazy_token_to_host(
         return Ok(None);
     }
 
-    let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+    let trace = cfg!(target_arch = "wasm32")
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
     let qmat_start = trace.then(Instant::now);
     let (materialized_hidden, _, logits) = hidden.materialize_with_tail(|hidden_data, encoder| {
@@ -356,7 +369,8 @@ pub(crate) fn qmat_mirostat2_sample_lazy_token_pending(
         return None;
     }
 
-    let qmat_start = (std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+    let qmat_start = (cfg!(target_arch = "wasm32")
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some())
     .then(Instant::now);
     let (materialized_hidden, _) = hidden.materialize();
@@ -406,7 +420,8 @@ pub(crate) fn qmat_standard_sample_lazy_token_pending(
         return None;
     }
 
-    let qmat_start = (std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+    let qmat_start = (cfg!(target_arch = "wasm32")
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some())
     .then(Instant::now);
     let (materialized_hidden, _) = hidden.materialize();
@@ -552,7 +567,7 @@ fn sample_processed_logits_pending(
             chunks,
             input_len,
             candidate_count,
-            trace: false,
+            trace: cfg!(target_arch = "wasm32"),
             encoder_label: "mirostat2_sample_token_pending encoder",
         },
         &mut initial_encoder,
@@ -863,7 +878,7 @@ fn sample_processed_standard_logits_pending(
             chunks,
             input_len,
             candidate_count,
-            trace: false,
+            trace: cfg!(target_arch = "wasm32"),
             encoder_label: "standard_sample_token_pending encoder",
         },
         &mut initial_encoder,
@@ -895,7 +910,8 @@ async fn sample_processed_standard_logits_to_host(
 
     let chunks = input_len.div_ceil(TOP_K_CHUNK);
     let mut candidate_count = initial_sampler_candidate_count(top_k, chunks);
-    let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+    let trace = cfg!(target_arch = "wasm32")
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
     let mut attempt = 0usize;
     loop {
@@ -954,7 +970,7 @@ async fn sample_processed_standard_logits_to_host(
             );
         }
 
-        let view = download.slice(..).get_mapped_range();
+        let view = download.slice(..).get_mapped_range().unwrap();
         let word_size = std::mem::size_of::<u32>();
         let status = view
             .get(..word_size)
@@ -1023,7 +1039,8 @@ async fn sample_processed_logits_to_host(
 
     let chunks = input_len.div_ceil(TOP_K_CHUNK);
     let mut candidate_count = initial_sampler_candidate_count(top_k, chunks);
-    let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+    let trace = cfg!(target_arch = "wasm32")
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
     let debug_dump = std::env::var_os("FUSOR_DEBUG_SAMPLER").is_some();
     let mut attempt = 0usize;
@@ -1108,7 +1125,7 @@ async fn sample_processed_logits_to_host(
             eprintln!("sampler_trace map_wait elapsed={:?}", start.elapsed());
         }
 
-        let view = download.slice(..).get_mapped_range();
+        let view = download.slice(..).get_mapped_range().unwrap();
         let word_size = std::mem::size_of::<u32>();
         let status = view
             .get(..word_size)
@@ -1167,9 +1184,9 @@ async fn sample_processed_logits_to_host(
                     let _ = id_rx.await;
                     let _ = val_rx.await;
                     let _ = log_rx.await;
-                    let ids_view = ids_dl.slice(..).get_mapped_range();
-                    let vals_view = values_dl.slice(..).get_mapped_range();
-                    let logits_view = logits_dl.slice(..).get_mapped_range();
+                    let ids_view = ids_dl.slice(..).get_mapped_range().unwrap();
+                    let vals_view = values_dl.slice(..).get_mapped_range().unwrap();
+                    let logits_view = logits_dl.slice(..).get_mapped_range().unwrap();
                     let ids_vec: Vec<u32> = bytemuck::cast_slice(&ids_view).to_vec();
                     let vals_vec: Vec<f32> = bytemuck::cast_slice(&vals_view).to_vec();
                     let logits_vec: Vec<f32> = bytemuck::cast_slice(&logits_view).to_vec();

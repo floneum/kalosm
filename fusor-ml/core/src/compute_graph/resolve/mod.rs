@@ -2,6 +2,16 @@ use std::{collections::VecDeque, str::FromStr, sync::Arc};
 
 use web_time::{Duration, Instant};
 
+// Diagnostic: route the resolve host-profile `eprintln!`s (the build/encode/
+// submit breakdown) to the browser console on wasm, where std eprintln is
+// invisible. Native keeps the real eprintln!.
+#[cfg(target_arch = "wasm32")]
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        web_sys::console::log_1(&format!($($arg)*).into());
+    }};
+}
+
 use crate::{
     DataTypeEnum, Layout,
     compute_graph::layout_pass::LayoutPass,
@@ -21,7 +31,10 @@ use super::{ComputeGraphInner, ComputeGraphNode, ComputeGraphNodeVariant, NodeIn
 mod execution;
 mod fusion_basic;
 mod fusion_matmul;
+mod plan_cache;
 mod run;
+
+pub(crate) use plan_cache::{DecodePlanCache, structural_kernel_key};
 
 pub(crate) struct ResolverResult {
     pub(crate) data: TensorData,

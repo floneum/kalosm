@@ -599,7 +599,32 @@ impl QMatMulOperation {
     }
 }
 
+fn hash_qmatmul_epilogue(state: &mut FxHasher, epilogue: &Option<ElementwiseEpilogue>) {
+    match epilogue {
+        Some(epilogue) => {
+            true.hash(state);
+            epilogue.expression.hash(state);
+            epilogue.extras.len().hash(state);
+            epilogue.input_datatype.hash(state);
+            epilogue.output_datatype.hash(state);
+        }
+        None => false.hash(state),
+    }
+}
+
 impl Operation for QMatMulOperation {
+    fn hash_kernel_fields(&self, state: &mut FxHasher) {
+        self.input_datatype.hash(state);
+        self.in_shape.hash(state);
+        self.out_shape.hash(state);
+        self.matrix.datatype().hash(state);
+        self.matrix.storage_layout().hash(state);
+        self.matrix.shape().hash(state);
+        hash_qmatmul_epilogue(state, &self.pre_element_wise_expr);
+        hash_qmatmul_epilogue(state, &self.post_element_wise_expr);
+        self.post_accumulator_offsets.hash(state);
+    }
+
     fn workgroup_shape_constraints(
         &self,
         _device: &Device,

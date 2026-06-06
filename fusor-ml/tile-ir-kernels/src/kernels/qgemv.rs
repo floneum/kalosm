@@ -608,6 +608,8 @@ fn qgemv_q4k_ggml(
                                 &block_idx,
                                 &matrix_col,
                                 &q4k_lane,
+                                grid.mask(in_bounds.clone(), &output_col)
+                                    .and(matrix_col.lt(b.cols)),
                                 &acts,
                             )
                         })
@@ -639,6 +641,7 @@ fn qgemv_q4k_ggml(
                                 &block_idx,
                                 &col,
                                 &q4k_lane,
+                                grid.mask(in_bounds.clone(), &col),
                                 &acts,
                             )
                         })

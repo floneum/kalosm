@@ -1,6 +1,6 @@
 pub(crate) use fusor_tile_ir_runtime::{
-    DirectKernel, DirectKernelBinding, KernelCacheKey, KernelVariantKey, ModuleCache,
-    PreparedDirectDispatch, cached_hashed_naga, dynamic_kernel_from_hashed_ir,
+    DirectKernel, DirectKernelBinding, DirectKernelTemplate, KernelCacheKey, KernelVariantKey,
+    ModuleCache, PreparedDirectDispatch, cached_hashed_naga, dynamic_kernel_from_hashed_ir,
     dynamic_kernel_from_ir, module_cache, run_direct_kernel, run_kernel,
     three_buffer_pipeline_from_cached_module, three_buffer_pipeline_from_ir,
 };

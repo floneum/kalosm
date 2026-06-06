@@ -271,6 +271,7 @@ impl KernelCache {
     }
 
     pub fn create_naga_shader_module(&self, kernel: &NagaKernel) -> wgpu::ShaderModule {
+        crate::note_compile("shader");
         // SAFETY: all kernels avoid out-of-bounds memory access and unbounded loops.
         unsafe {
             self.device.create_shader_module_trusted(

@@ -22,7 +22,7 @@ pub mod layers;
 pub mod quantized;
 mod varbuilder;
 
-pub use varbuilder::{ShardedVarBuilder, VarBuilder};
+pub use varbuilder::{AsyncReadRange, AsyncShardedVarBuilder, ShardedVarBuilder, VarBuilder};
 
 pub use quantized::{CpuF32Tensor, QMatrix};
 

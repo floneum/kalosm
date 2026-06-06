@@ -384,7 +384,7 @@ impl Tensor {
         receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
 
         // Get the mapped view
-        let view = download.slice(..).get_mapped_range();
+        let view = download.slice(..).get_mapped_range().unwrap();
         Ok(TensorSlice::new(
             MappedBuffer { view },
             tensor.layout().clone(),
@@ -779,13 +779,10 @@ impl Tensor {
                 causal,
                 self.datatype(),
             );
-        // Browser WebGPU backends have been observed to hang/crash on the
-        // split decode workgroup kernel. The composite fallback still runs on
-        // GPU and is the reliable browser path for q_seq_len == 1.
-        #[cfg(target_arch = "wasm32")]
-        if is_decode_candidate {
-            return None;
-        }
+        // Decode (q_seq_len == 1) now uses the fused flash-attention decode
+        // kernel on wasm as well. The browser path was previously disabled here
+        // over WebGPU hang/crash reports on the split decode workgroup kernel;
+        // re-enabled to measure whether that's still an issue.
         // The streaming flash attention kernels emit a separate
         // monomorphization per hardware subgroup width and rely on
         // `subgroup_reduce_*`, so they can only target devices where we know

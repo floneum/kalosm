@@ -284,7 +284,7 @@ mod selection_tests {
 mod tests {
     use std::{mem::size_of, sync::Arc};
 
-    use fusor_gguf::{BlockQ4_0, BlockQ4K, BlockQ5K, BlockQ6K, BlockQ8_0, GgufBlock};
+    use fusor_gguf::{BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, GgufBlock};
 
     use super::*;
     use crate::{
@@ -477,6 +477,34 @@ mod tests {
         });
     }
 
+    fn patterned_q8_0_bytes(shape: [usize; 2]) -> Vec<u8> {
+        let block_count = shape.iter().product::<usize>() / BlockQ8_0::BLOCK_SIZE;
+        let mut bytes = Vec::with_capacity(block_count * size_of::<BlockQ8_0>());
+        for block in 0..block_count {
+            push_f16(&mut bytes, 0.01);
+            for i in 0..BlockQ8_0::WEIGHTS_SIZE {
+                let value = (((block * 5 + i * 3) % 64) as i32 - 32) as i8;
+                bytes.push(value as u8);
+            }
+        }
+        bytes
+    }
+
+    fn patterned_q5_0_bytes(shape: [usize; 2]) -> Vec<u8> {
+        let block_count = shape.iter().product::<usize>() / BlockQ5_0::BLOCK_SIZE;
+        let mut bytes = Vec::with_capacity(block_count * size_of::<BlockQ5_0>());
+        for block in 0..block_count {
+            push_f16(&mut bytes, 0.01);
+            for i in 0..BlockQ5_0::WEIGHTS_HIGH_BITS_SIZE {
+                bytes.push(((block * 7 + i * 13) & 0xFF) as u8);
+            }
+            for i in 0..BlockQ5_0::WEIGHTS_LOW_BITS_SIZE {
+                bytes.push(packed_nibble_byte(block + i, block * 2 + i + 1));
+            }
+        }
+        bytes
+    }
+
     #[test]
     fn q4k_native_dequantize_matches_patterned_blocks() {
         pollster::block_on(async {
@@ -541,6 +569,289 @@ mod tests {
 
             assert_eq!(result.shape(), &[1, weight_shape[0] / 2]);
             assert!(result.as_slice().iter().all(|value| value.is_finite()));
+        });
+    }
+
+    #[test]
+    fn q4k_large_single_row_qgemv_handles_tail_columns_with_subgroups() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            if !device.subgroups_supported() {
+                return;
+            }
+
+            let weight_shape = [8193usize, 4096usize];
+            let blocks_per_row = weight_shape[1] / BlockQ4K::BLOCK_SIZE;
+            let raw_bytes = patterned_q4k_bytes(weight_shape);
+            let matrix =
+                QMatrix::from_parts(&device, &raw_bytes, weight_shape.into(), GgmlType::Q4K)
+                    .unwrap();
+            let blocks: &[BlockQ4K] = bytemuck::cast_slice(&raw_bytes);
+            let input_values = (0..weight_shape[1])
+                .map(|index| {
+                    let bucket = (index.wrapping_mul(37).wrapping_add(11)) % 101;
+                    (bucket as f32 - 50.0) * 0.0025
+                })
+                .collect::<Vec<_>>();
+            let input = Tensor::from_slice::<f32>(&device, [1, weight_shape[1]], &input_values);
+
+            let result = input.q_mat_mul(&matrix).as_slice::<2, f32>().await.unwrap();
+
+            assert_eq!(result.shape(), &[1, weight_shape[0]]);
+            for col in [0usize, 1, 63, 64, 511, 1024, 8191, 8192] {
+                let expected = (0..blocks_per_row)
+                    .map(|block_col| {
+                        let block = &blocks[col * blocks_per_row + block_col];
+                        let weights = block.dequantize();
+                        weights
+                            .as_ref()
+                            .iter()
+                            .enumerate()
+                            .map(|(offset, weight)| {
+                                input_values[block_col * BlockQ4K::BLOCK_SIZE + offset] * *weight
+                            })
+                            .sum::<f32>()
+                    })
+                    .sum::<f32>();
+                let actual = result[[0, col]];
+                assert!(
+                    (actual - expected).abs() <= 1e-2_f32.max(expected.abs() * 1.0e-4),
+                    "col={col} actual={actual} expected={expected}"
+                );
+            }
+        });
+    }
+
+    // Regression test for native decode gibberish: the single-row (m=1, decode)
+    // subgroup qgemv must agree with the no-subgroup path, which is the
+    // reference web/native-without-subgroups run and is known-correct. A
+    // divergence here is exactly the per-token logit corruption that turns
+    // generation into token-salad. Covers each quantized format the model uses,
+    // at a Llama-ish projection shape.
+    // Isolates whether the cooperative-matrix bug is quantized-specific (the
+    // dequantizing tile fill) or general to the coop matmul codegen: a plain
+    // dense f32 matmul at coop-eligible dims must also agree between the
+    // subgroup (coop) and no-subgroup paths. If THIS diverges, the bug is the
+    // cooperative-matrix path itself (independent of quantization).
+    #[test]
+    fn dense_coop_matmul_subgroup_matches_no_subgroup() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            if !device.subgroups_supported() {
+                return;
+            }
+            let no_sg = device.without_subgroups();
+
+            let (m, k, n) = (128usize, 256usize, 128usize);
+            let a = (0..m * k)
+                .map(|i| ((i.wrapping_mul(31).wrapping_add(7)) % 97) as f32 * 0.003 - 0.14)
+                .collect::<Vec<_>>();
+            let b = (0..k * n)
+                .map(|i| ((i.wrapping_mul(53).wrapping_add(3)) % 89) as f32 * 0.004 - 0.17)
+                .collect::<Vec<_>>();
+
+            let out_sg = {
+                let a_t = Tensor::from_slice::<f32>(&device, [m, k], &a);
+                let b_t = Tensor::from_slice::<f32>(&device, [k, n], &b);
+                let s = a_t.mat_mul(&b_t).as_slice::<2, f32>().await.unwrap();
+                (0..m)
+                    .flat_map(|r| (0..n).map(move |c| (r, c)))
+                    .map(|(r, c)| s[[r, c]])
+                    .collect::<Vec<_>>()
+            };
+            let out_no = {
+                let a_t = Tensor::from_slice::<f32>(&no_sg, [m, k], &a);
+                let b_t = Tensor::from_slice::<f32>(&no_sg, [k, n], &b);
+                let s = a_t.mat_mul(&b_t).as_slice::<2, f32>().await.unwrap();
+                (0..m)
+                    .flat_map(|r| (0..n).map(move |c| (r, c)))
+                    .map(|(r, c)| s[[r, c]])
+                    .collect::<Vec<_>>()
+            };
+
+            let mut worst = 0.0f32;
+            let mut wi = 0usize;
+            let (mut wa, mut wb) = (0.0f32, 0.0f32);
+            for (i, (x, y)) in out_sg.iter().zip(&out_no).enumerate() {
+                let err = (x - y).abs();
+                if err > worst {
+                    worst = err;
+                    wi = i;
+                    wa = *x;
+                    wb = *y;
+                }
+            }
+            assert!(
+                worst <= 1.0e-3 + wb.abs() * 1.0e-3,
+                "dense coop matmul diverges from no-subgroup at {wi}: subgroup={wa} no_subgroup={wb} abs_err={worst}"
+            );
+        });
+    }
+
+    #[test]
+    fn single_row_qgemv_subgroup_matches_no_subgroup() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            if !device.subgroups_supported() {
+                return;
+            }
+            let no_sg = device.without_subgroups();
+
+            // (name, [n, k], bytes, format). The large-block K-quants (q4k/q6k)
+            // are exercised at the ffn k=4096 regime; the small-block formats
+            // (q8_0/q5_0) at the k=896 projection regime the model actually uses
+            // for its attention/mlp projections (896 is not a multiple of 256, so
+            // those weights can only be block-32 formats).
+            let cases: [(&str, [usize; 2], Vec<u8>, GgmlType); 5] = [
+                (
+                    "q4k",
+                    [896, 4096],
+                    patterned_q4k_bytes([896, 4096]),
+                    GgmlType::Q4K,
+                ),
+                (
+                    "q6k",
+                    [896, 4096],
+                    patterned_q6k_bytes([896, 4096]),
+                    GgmlType::Q6K,
+                ),
+                (
+                    "q8_0",
+                    [896, 896],
+                    patterned_q8_0_bytes([896, 896]),
+                    GgmlType::Q8_0,
+                ),
+                (
+                    "q5_0",
+                    [896, 896],
+                    patterned_q5_0_bytes([896, 896]),
+                    GgmlType::Q5_0,
+                ),
+                // lm-head / tied-embedding shape: huge n, q5_0, k=hidden. Produces
+                // the logits every token, so a wrong subgroup qgemv here is exactly
+                // "wrong token sampled => gibberish".
+                (
+                    "q5_0_lmhead",
+                    [151936, 896],
+                    patterned_q5_0_bytes([151936, 896]),
+                    GgmlType::Q5_0,
+                ),
+            ];
+
+            async fn row(t: Tensor) -> Vec<f32> {
+                let slice = t.as_slice::<2, f32>().await.unwrap();
+                let cols = slice.shape()[1];
+                (0..cols).map(|col| slice[[0, col]]).collect()
+            }
+            async fn rows(t: Tensor) -> Vec<f32> {
+                let slice = t.as_slice::<2, f32>().await.unwrap();
+                let shape = slice.shape();
+                let (m, cols) = (shape[0], shape[1]);
+                let mut out = Vec::with_capacity(m * cols);
+                for r in 0..m {
+                    for c in 0..cols {
+                        out.push(slice[[r, c]]);
+                    }
+                }
+                out
+            }
+            // The two paths use different reduction kernels, so allow FP rounding
+            // slack; gibberish (a stale/miscompiled subgroup kernel) is orders of
+            // magnitude larger.
+            fn assert_match(name: &str, op: &str, sg: &[f32], no: &[f32]) {
+                assert_eq!(sg.len(), no.len(), "{name}/{op}: length mismatch");
+                let mut worst = 0.0f32;
+                let (mut wc, mut wa, mut wb) = (0usize, 0.0f32, 0.0f32);
+                for (col, (a, b)) in sg.iter().zip(no).enumerate() {
+                    let err = (a - b).abs();
+                    if err > worst {
+                        worst = err;
+                        wc = col;
+                        wa = *a;
+                        wb = *b;
+                    }
+                }
+                assert!(
+                    worst <= 1.0e-2 + wb.abs() * 1.0e-2,
+                    "{name}/{op}: subgroup qgemv diverges from no-subgroup at col {wc}: \
+                     subgroup={wa} no_subgroup={wb} abs_err={worst}"
+                );
+            }
+
+            for (name, weight_shape, raw_bytes, ty) in cases {
+                let [n, k] = weight_shape;
+                let input_values = (0..k)
+                    .map(|index| {
+                        let bucket = (index.wrapping_mul(37).wrapping_add(11)) % 101;
+                        (bucket as f32 - 50.0) * 0.0025
+                    })
+                    .collect::<Vec<_>>();
+                let extra = (0..n)
+                    .map(|i| (i % 13) as f32 * 0.01 - 0.06)
+                    .collect::<Vec<_>>();
+                let mat_sg =
+                    QMatrix::from_parts(&device, &raw_bytes, weight_shape.into(), ty).unwrap();
+                let mat_no =
+                    QMatrix::from_parts(&no_sg, &raw_bytes, weight_shape.into(), ty).unwrap();
+                let in_sg = Tensor::from_slice::<f32>(&device, [1, k], &input_values);
+                let in_no = Tensor::from_slice::<f32>(&no_sg, [1, k], &input_values);
+
+                // Plain qgemv.
+                assert_match(
+                    name,
+                    "plain",
+                    &row(in_sg.q_mat_mul(&mat_sg)).await,
+                    &row(in_no.q_mat_mul(&mat_no)).await,
+                );
+
+                // Fused paired-silu-product epilogue (the MLP gate/up matmul) —
+                // the dominant matmul in decode and the one the previous fast
+                // cache could not key.
+                assert_match(
+                    name,
+                    "silu_product",
+                    &row(in_sg.q_mat_mul_paired_silu_product(&mat_sg)).await,
+                    &row(in_no.q_mat_mul_paired_silu_product(&mat_no)).await,
+                );
+
+                // Fused add2 epilogue (residual add after a projection).
+                let first_sg = Tensor::from_slice::<f32>(&device, [1, n], &extra);
+                let second_sg = Tensor::from_slice::<f32>(&device, [1, n], &extra);
+                let first_no = Tensor::from_slice::<f32>(&no_sg, [1, n], &extra);
+                let second_no = Tensor::from_slice::<f32>(&no_sg, [1, n], &extra);
+                assert_match(
+                    name,
+                    "add2",
+                    &row(in_sg.q_mat_mul_add2(&mat_sg, &first_sg, &second_sg)).await,
+                    &row(in_no.q_mat_mul_add2(&mat_no, &first_no, &second_no)).await,
+                );
+
+                // Multi-row (prefill) regime: the prompt is processed at m>1 with
+                // a different (tile/coop) subgroup kernel than decode's qgemv. A
+                // wrong prefill matmul poisons the KV cache, so every later decode
+                // token reads bad context and produces gibberish.
+                let m = 16usize;
+                let multi = (0..m * k)
+                    .map(|i| {
+                        let bucket = (i.wrapping_mul(53).wrapping_add(7)) % 97;
+                        (bucket as f32 - 48.0) * 0.0021
+                    })
+                    .collect::<Vec<_>>();
+                let multi_sg = Tensor::from_slice::<f32>(&device, [m, k], &multi);
+                let multi_no = Tensor::from_slice::<f32>(&no_sg, [m, k], &multi);
+                assert_match(
+                    name,
+                    "plain_multirow",
+                    &rows(multi_sg.q_mat_mul(&mat_sg)).await,
+                    &rows(multi_no.q_mat_mul(&mat_no)).await,
+                );
+            }
         });
     }
 

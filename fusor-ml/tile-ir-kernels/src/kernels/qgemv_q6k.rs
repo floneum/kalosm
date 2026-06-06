@@ -11,7 +11,7 @@
 //! stride is not word-aligned, so the raw-word-load addressing this kernel uses
 //! does not apply; that layout stays on the generic perf path.
 
-use fusor_tile_ir::tile::{range, Program, Storage, Tile, TileBlock};
+use fusor_tile_ir::tile::{range, Mask, Program, Storage, Tile, TileBlock};
 use fusor_tile_ir::{ElementType, GgmlQuantFormat};
 
 use crate::dispatch::{QgemvShape, SubgroupConfig};
@@ -151,6 +151,8 @@ pub(crate) fn qgemv_q6k_ggml(
                                 &block_idx,
                                 &matrix_col,
                                 &q6k_lane,
+                                grid.mask(in_bounds.clone(), &output_col)
+                                    .and(matrix_col.lt(b.cols)),
                                 &acts,
                             )
                         })
@@ -181,6 +183,7 @@ pub(crate) fn qgemv_q6k_ggml(
                                 &block_idx,
                                 &col,
                                 &q6k_lane,
+                                grid.mask(in_bounds.clone(), &col),
                                 &acts,
                             )
                         })
@@ -231,14 +234,15 @@ pub(crate) fn q6k_ggml_dot_tiles(
     block: &Tile,
     col: &Tile,
     lane: &Q6KLane,
+    mask: Mask,
     acts: &Q6KGgmlActs,
 ) -> Tile {
     let base = (col.clone() * blocks_per_col + block.clone()) * block_words;
-    // Weights/scales are read unconditionally (constant-true mask) so each lowers
-    // to a direct pointer load. Out-of-bounds K is zeroed via the masked
-    // activations; out-of-bounds columns are discarded by the store mask.
+    // The final workgroup can cover tail columns that are never stored. Keep the
+    // packed-weight reads masked too, because robust buffer access still has to
+    // evaluate the load address.
     let load = |program: &mut TileBlock<'_>, offset: Tile| -> Tile {
-        program.load(qwords.at(base.clone() + offset), Tile::all(), 0u32)
+        program.load(qwords.at(base.clone() + offset), mask.clone(), 0u32)
     };
 
     // Super-block scale `d` (f32-scale layout): one f32 word at word 52.

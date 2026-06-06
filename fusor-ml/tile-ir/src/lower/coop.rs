@@ -181,7 +181,7 @@ impl<'a> Lowerer<'a> {
                         data: CooperativeData {
                             pointer: ptr,
                             stride,
-                            row_major: false,
+                            row_major: true,
                         },
                     },
                 ))
@@ -842,9 +842,9 @@ impl<'a> Lowerer<'a> {
         }
         let strides = layout.affine_strides();
         if strides[1] == 1 {
-            Ok((strides[0], false))
+            Ok((strides[0], true))
         } else if strides[0] == 1 {
-            Ok((strides[1], true))
+            Ok((strides[1], false))
         } else {
             Err(LowerError::UnsupportedOperation(
                 "cooperative store requires row-major or column-major output strides",

@@ -543,7 +543,6 @@ mod tests {
             GgmlType::Q8_0,
             GgmlType::Q4K,
             GgmlType::Q5K,
-            GgmlType::Q6K,
         ] {
             assert_eq!(
                 qmatrix_storage_layout_for_parts_with_env(ty, true, None),
@@ -554,6 +553,14 @@ mod tests {
                 QMatrixStorageLayout::GpuF32Scales
             );
         }
+        assert_eq!(
+            qmatrix_storage_layout_for_parts_with_env(GgmlType::Q6K, true, None),
+            QMatrixStorageLayout::GpuF32Scales
+        );
+        assert_eq!(
+            qmatrix_storage_layout_for_parts_with_env(GgmlType::Q6K, false, None),
+            QMatrixStorageLayout::GpuF32Scales
+        );
     }
 
     #[test]
