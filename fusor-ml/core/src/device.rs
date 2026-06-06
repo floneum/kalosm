@@ -94,8 +94,7 @@ fn adapter_preference_rank(adapter: &wgpu::Adapter) -> u8 {
         wgpu::DeviceType::DiscreteGpu => 0,
         wgpu::DeviceType::IntegratedGpu => 1,
         wgpu::DeviceType::VirtualGpu => 2,
-        wgpu::DeviceType::Other => 3,
-        wgpu::DeviceType::Cpu => 4,
+        _ => 3,
     }
 }
 
@@ -358,11 +357,6 @@ impl Device {
         storage_bindings.min(bind_group_bindings).saturating_sub(1)
     }
 
-    #[doc(hidden)]
-    pub fn is_cpu_adapter(&self) -> bool {
-        self.inner.adapter.get_info().device_type == wgpu::DeviceType::Cpu
-    }
-
     pub fn features(&self) -> wgpu::Features {
         self.inner.device.features()
     }
@@ -399,12 +393,6 @@ impl Device {
         let max = self.max_subgroup_size();
         if min == max && matches!(min, 4 | 8 | 16 | 32 | 64) {
             return Some(min);
-        }
-
-        // Apple GPUs execute subgroup operations with 32-wide SIMD groups even
-        // though wgpu reports the broader Metal range.
-        if self.backend() == wgpu::Backend::Metal && min <= 32 && max >= 32 {
-            return Some(32);
         }
 
         None

@@ -70,10 +70,12 @@ impl QMatMulOperation {
         }
         let limits = device.limits();
         let caps = KernelDeviceCaps::from_device(device);
+        let subgroup_size_range = [caps.min_subgroup_size, caps.max_subgroup_size];
         let max_workgroups = effective_qmatmul_max_workgroups_per_dimension(&limits);
         let y_supports_coop = tile_ir_kernels::cooperative_store_layout_supported(&y_view.layout);
         let variant = select_qmatmul_direct_variant(format, m, k, n, y_supports_coop, caps);
-        let use_workgroup_qmatmul = !qmatmul_direct_path_supported(variant, caps) || f16_storage;
+        let use_workgroup_qmatmul =
+            !qmatmul_direct_path_supported(variant, format, k, n, caps) || f16_storage;
         if has_custom_accumulator_offsets {
             if !qmatmul_custom_accumulator_offsets_supported(
                 format,
@@ -259,7 +261,7 @@ impl QMatMulOperation {
                 QMatmulPath::Tile {
                     cached: false,
                     tile,
-                } if tile == QCoopTile::new(64, 64) => None,
+                } if tile == CoopTile::new(64, 64, QMATMUL_COOP_BK) => None,
                 QMatmulPath::Q8Wide(tile) | QMatmulPath::Tile { tile, .. } => {
                     Some([n / tile.bn, m / tile.bm, 1])
                 }
@@ -283,6 +285,7 @@ impl QMatMulOperation {
                 matrix.datatype(),
                 matrix.storage_layout(),
                 crate::quantized::QMatMulShape { m, k, n: matrix_n },
+                subgroup_size_range,
                 dispatch_size,
                 input.layout(),
                 output.layout(),
@@ -300,11 +303,13 @@ impl QMatMulOperation {
             let cache_key = qmatmul_direct_module_key::<QMatmulDirectFastKernelVariant>(
                 |state| {
                     variant.hash(state);
+                    subgroup_size_range.hash(state);
                     QMATMUL_DIRECT_KERNEL_GENERATION.hash(state);
                 },
                 |state| {
                     QMATMUL_DIRECT_KERNEL_GENERATION.hash(state);
                     hash_qmatmul_shape(state, format, m, k, matrix_n);
+                    subgroup_size_range.hash(state);
                     hash_qmatmul_dispatch_layouts(
                         state,
                         dispatch_size,
@@ -482,10 +487,13 @@ impl QMatMulOperation {
                 }
                 return;
             }
-            // Map the selected variant to its (BM, BN) cooperative tile
-            // dimensions. The first two single-row variants short-circuit to
+            let subgroup_config = tile_ir_kernels::SubgroupConfig::new(
+                subgroup_size_range[0],
+                subgroup_size_range[1],
+            );
+            // Map the selected variant to its cooperative tile dimensions.
+            // The first two single-row variants short-circuit to
             // qgemv; the rest share the qmatmul_with_epilogue entry point.
-            // (BK is pinned to 32 inside the coop dispatcher.)
             let tile = match variant {
                 QMatmulPath::Q5SmallSingleRow | QMatmulPath::SingleRow => {
                     tile_ir_kernels::qgemv_with_epilogue(
@@ -494,13 +502,24 @@ impl QMatMulOperation {
                         &b,
                         &y,
                         qmatmul_workgroups_x,
+                        subgroup_config,
                         &epilogues,
                     );
                     return;
                 }
                 QMatmulPath::Q8Wide(tile) | QMatmulPath::Tile { tile, .. } => tile,
             };
-            tile_ir_kernels::qmatmul_with_epilogue(phase, &a, &b, &y, &epilogues, tile.bm, tile.bn);
+            tile_ir_kernels::qmatmul_with_epilogue(
+                phase,
+                &a,
+                &b,
+                &y,
+                &epilogues,
+                subgroup_config,
+                tile.bm,
+                tile.bn,
+                tile.bk,
+            );
         });
         let dispatch_size = ir.grid;
         if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
@@ -511,6 +530,7 @@ impl QMatMulOperation {
             matrix.storage_layout(),
             crate::quantized::QMatMulShape { m, k, n: matrix_n },
             epilogue_identity,
+            subgroup_size_range,
             dispatch_size,
             input.layout(),
             output.layout(),
@@ -519,12 +539,14 @@ impl QMatMulOperation {
             |state| {
                 variant.hash(state);
                 epilogue_identity.hash(state);
+                subgroup_size_range.hash(state);
                 QMATMUL_DIRECT_KERNEL_GENERATION.hash(state);
             },
             |state| {
                 QMATMUL_DIRECT_KERNEL_GENERATION.hash(state);
                 hash_qmatmul_shape(state, format, m, k, matrix_n);
                 epilogue_identity.hash(state);
+                subgroup_size_range.hash(state);
                 hash_qmatmul_dispatch_layouts(
                     state,
                     dispatch_size,

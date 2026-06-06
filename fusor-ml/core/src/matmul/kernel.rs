@@ -137,7 +137,13 @@ impl MatMulOperation {
         // The Gemv and shared-tile MatMul variants reduce through subgroup
         // operations. Use the register-tiled kernel unless the device exposes
         // a subgroup path we trust.
-        let variant = if device.subgroups_supported() {
+        let subgroup_config = device.subgroups_supported().then(|| {
+            tile_ir_kernels::SubgroupConfig::new(
+                device.min_subgroup_size(),
+                device.max_subgroup_size(),
+            )
+        });
+        let variant = if subgroup_config.is_some() {
             select_direct_tile_matmul_variant(m, k, n)
         } else {
             DirectTileMatmulVariant::MatMul
@@ -196,11 +202,18 @@ impl MatMulOperation {
             coop_kind.is_some_and(|kind| device.cooperative_matrix_caps().supports(kind));
         let use_coop = coop_kind.is_some()
             && coop_property_supported
-            && device.subgroups_supported()
-            && device.max_subgroup_size() >= 32
-            && device.min_subgroup_size() <= 32;
+            && subgroup_config.is_some_and(|config| config.is_fixed());
         let coop_variant = if use_coop {
-            CoopTile::select(m, k, n, device.limits().max_compute_workgroup_size_x)
+            CoopTile::select(
+                m,
+                k,
+                n,
+                device
+                    .limits()
+                    .max_compute_workgroup_size_x
+                    .min(device.limits().max_compute_invocations_per_workgroup),
+                device.max_subgroup_size(),
+            )
         } else {
             None
         };
@@ -230,6 +243,7 @@ impl MatMulOperation {
                 shape,
                 &epilogues,
                 max_wg_per_dim,
+                subgroup_config,
             );
         });
         let dispatch_size = ir.grid;
@@ -247,6 +261,7 @@ impl MatMulOperation {
                 variant.hash(state);
                 coop_variant.hash(state);
                 coop_kind.hash(state);
+                subgroup_config.hash(state);
                 epilogue_identity.hash(state);
             },
         );
@@ -481,11 +496,12 @@ fn dispatch_direct_tile_matmul(
     shape: tile_ir_kernels::DenseMatmulShape,
     epilogues: &tile_ir_kernels::DenseMatmulEpilogues<'_>,
     max_wg_per_dim: u32,
+    subgroups: Option<tile_ir_kernels::SubgroupConfig>,
 ) {
     let a = tile_storage_read_with_direct_layout_typed(phase, element, a_view);
     let b = tile_storage_read_with_direct_layout_typed(phase, element, b_view);
     let y = tile_storage_write_with_direct_layout_typed(phase, element, y_view);
-    if let Some(tile) = coop_variant
+    if let (Some(tile), Some(subgroups)) = (coop_variant, subgroups)
         && tile_ir_kernels::try_batched_coop_matmul(
             phase,
             tile_ir_kernels::DenseMatmulTensors {
@@ -496,6 +512,7 @@ fn dispatch_direct_tile_matmul(
             shape,
             epilogues,
             max_wg_per_dim,
+            subgroups,
             tile_ir_kernels::DenseCoopMatmulTile {
                 bm: tile.bm,
                 bn: tile.bn,
@@ -514,6 +531,7 @@ fn dispatch_direct_tile_matmul(
             shape,
             epilogues,
             max_wg_per_dim,
+            subgroups.expect("GEMV direct tile variant requires subgroup support"),
         ),
         DirectTileMatmulVariant::MatMul => {
             if let Some(tile) = matmul_tile {

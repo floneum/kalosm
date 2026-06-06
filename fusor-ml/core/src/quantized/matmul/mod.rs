@@ -7,7 +7,7 @@ use crate::{
         Axis, CooperativeMatrixKind, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq,
         multiple_of, range,
     },
-    matmul::MatMulOperation,
+    matmul::{CoopTile, MatMulOperation},
     mir::{
         inputs::MirValue,
         kernel_backend,
@@ -98,27 +98,14 @@ const QMAT_M: Axis<0> = Axis;
 const QMAT_K: Axis<1> = Axis;
 const QMAT_N: Axis<2> = Axis;
 
-/// (BM, BN) tile dimensions for a cooperative-matrix qmatmul tile. BK is
-/// pinned to 32 (cooperative-matrix MMA shape: 8x8x8 along K, 4 lanes per
-/// subgroup) so it isn't carried in the struct.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct QCoopTile {
-    pub bm: u32,
-    pub bn: u32,
-}
-
-impl QCoopTile {
-    pub(super) const fn new(bm: u32, bn: u32) -> Self {
-        Self { bm, bn }
-    }
-}
+const QMATMUL_COOP_BK: u32 = 32;
 
 /// Chosen kernel path for a direct quantized matmul.
 ///
 /// - [`SingleRow`](Self::SingleRow) / [`Q5SmallSingleRow`](Self::Q5SmallSingleRow):
-///   single-row qgemv specializations; the [`QCoopTile`] payload is not used.
+///   single-row qgemv specializations; the [`CoopTile`] payload is not used.
 /// - [`Q8Wide`](Self::Q8Wide): Q8_0-specific tile path that shares the IR of
-///   [`Tile`](Self::Tile) `{tile=(64, 128)}` but lives in its own cache slot
+///   [`Tile`](Self::Tile) `{tile=(64, 128, 32)}` but lives in its own cache slot
 ///   (selector rule gates on Q8_0 + N>=8192 + 32 KB workgroup storage).
 /// - [`Tile`](Self::Tile) `{cached: true}` uses the precomputed
 ///   `[n/64, m/64, 1]` dispatch + storage3 cached-pipeline fast path
@@ -128,15 +115,14 @@ impl QCoopTile {
 enum QMatmulPath {
     SingleRow,
     Q5SmallSingleRow,
-    Q8Wide(QCoopTile),
-    Tile { tile: QCoopTile, cached: bool },
+    Q8Wide(CoopTile),
+    Tile { tile: CoopTile, cached: bool },
 }
 
 struct QMatmulDirectFastKernelVariant;
 struct QMatmulDirectEpilogueKernelVariant;
 
 const QMATMUL_DIRECT_KERNEL_GENERATION: u64 = 0x514D_4154_4D49_5832;
-
 #[derive(Clone, Copy, Debug)]
 struct QMatmulDirectCtx {
     format: tile_ir::GgmlQuantFormat,
@@ -144,12 +130,11 @@ struct QMatmulDirectCtx {
 }
 
 fn qmatmul_coop_supported(caps: KernelDeviceCaps) -> bool {
-    caps.subgroups_supported
-        && caps.min_subgroup_size <= 32
-        && caps.max_subgroup_size >= 32
+    fixed_subgroup_runtime_supported(caps)
         && caps
             .cooperative_matrix
             .supports(CooperativeMatrixKind::F32F32M8N8K8)
+        && subgroup_workgroup_size_supported(caps, 2)
 }
 
 fn qmatmul_path_is_single_row_qgemv(path: QMatmulPath) -> bool {
@@ -161,27 +146,66 @@ fn qmatmul_path_requires_coop(path: QMatmulPath) -> bool {
     !qmatmul_path_is_single_row_qgemv(path)
 }
 
-fn qgemv_fixed_subgroup_32_supported(caps: KernelDeviceCaps) -> bool {
+fn subgroup_runtime_supported(caps: KernelDeviceCaps) -> bool {
     caps.subgroups_supported
-        && !caps.is_cpu_adapter
-        && (caps.min_subgroup_size == 32 && caps.max_subgroup_size == 32
-            || caps.backend == wgpu::Backend::Metal
-                && caps.min_subgroup_size <= 32
-                && caps.max_subgroup_size >= 32)
+        && caps.min_subgroup_size > 0
+        && caps.max_subgroup_size >= caps.min_subgroup_size
 }
 
-fn qmatmul_direct_path_supported(path: QMatmulPath, caps: KernelDeviceCaps) -> bool {
-    if qmatmul_path_is_single_row_qgemv(path) {
-        return qgemv_fixed_subgroup_32_supported(caps);
-    }
+fn fixed_subgroup_runtime_supported(caps: KernelDeviceCaps) -> bool {
+    subgroup_runtime_supported(caps) && caps.min_subgroup_size == caps.max_subgroup_size
+}
+
+fn subgroup_workgroup_size_supported(caps: KernelDeviceCaps, subgroups: u32) -> bool {
+    subgroups
+        .checked_mul(caps.max_subgroup_size)
+        .is_some_and(|block| {
+            block <= caps.max_compute_invocations_per_workgroup
+                && block <= caps.max_compute_workgroup_size_x
+        })
+}
+
+fn qgemv_subgroup_supported(
+    format: tile_ir::GgmlQuantFormat,
+    k: u32,
+    n: u32,
+    caps: KernelDeviceCaps,
+) -> bool {
+    let subgroups = tile_ir_kernels::qgemv_subgroups_per_workgroup_for_shape(format, k, n);
+    subgroup_runtime_supported(caps) && subgroup_workgroup_size_supported(caps, subgroups)
+}
+
+fn qmatmul_coop_tile_subgroup_groups(tile: CoopTile) -> u32 {
+    (tile.bm / 32) * (tile.bn / 32)
+}
+
+fn qmatmul_coop_tile_supported(tile: CoopTile, caps: KernelDeviceCaps) -> bool {
     qmatmul_coop_supported(caps)
+        && subgroup_workgroup_size_supported(caps, qmatmul_coop_tile_subgroup_groups(tile))
+}
+
+fn qmatmul_direct_path_supported(
+    path: QMatmulPath,
+    format: tile_ir::GgmlQuantFormat,
+    k: u32,
+    n: u32,
+    caps: KernelDeviceCaps,
+) -> bool {
+    match path {
+        QMatmulPath::SingleRow | QMatmulPath::Q5SmallSingleRow => {
+            qgemv_subgroup_supported(format, k, n, caps)
+        }
+        QMatmulPath::Q8Wide(tile) | QMatmulPath::Tile { tile, .. } => {
+            qmatmul_coop_tile_supported(tile, caps)
+        }
+    }
 }
 
 fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> {
     /// Helper to build a `Tile` variant with a given tile + cached flag.
     const fn tile(bm: u32, bn: u32, cached: bool) -> QMatmulPath {
         QMatmulPath::Tile {
-            tile: QCoopTile::new(bm, bn),
+            tile: CoopTile::new(bm, bn, QMATMUL_COOP_BK),
             cached,
         }
     }
@@ -196,16 +220,16 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> 
         )
         .rule(QMatmulPath::SingleRow, ShapeRule::new().axis(QMAT_M, eq(1)))
         .rule(
-            QMatmulPath::Q8Wide(QCoopTile::new(64, 128)),
+            QMatmulPath::Q8Wide(CoopTile::new(64, 128, QMATMUL_COOP_BK)),
             ShapeRule::new()
                 .axis(QMAT_M, multiple_of(64))
                 .axis(QMAT_K, range(0..=1024))
                 .axis(QMAT_N, multiple_of(128))
                 .when(|shape: KernelShape<3>, ctx: &QMatmulDirectCtx, caps| {
+                    let tile = CoopTile::new(64, 128, QMATMUL_COOP_BK);
                     ctx.format.is_q8_0_family()
-                        && qmatmul_coop_rule_supported(shape, ctx, caps)
+                        && qmatmul_coop_rule_supported(shape, ctx, caps, tile)
                         && shape[QMAT_N] >= 8192
-                        && caps.max_compute_invocations_per_workgroup >= 512
                         && caps.max_compute_workgroup_storage_size >= 32 * 1024
                 }),
         )
@@ -216,9 +240,12 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> 
                 .axis(QMAT_K, multiple_of(32))
                 .axis(QMAT_N, multiple_of(128))
                 .when(|shape, ctx, caps| {
-                    qmatmul_coop_rule_supported(shape, ctx, caps)
-                        && caps.max_compute_invocations_per_workgroup >= 512
-                        && caps.max_compute_workgroup_storage_size >= 32 * 1024
+                    qmatmul_coop_rule_supported(
+                        shape,
+                        ctx,
+                        caps,
+                        CoopTile::new(128, 128, QMATMUL_COOP_BK),
+                    ) && caps.max_compute_workgroup_storage_size >= 32 * 1024
                 }),
         )
         .rule(
@@ -227,7 +254,14 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> 
                 .axis(QMAT_M, multiple_of(128))
                 .axis(QMAT_K, multiple_of(32))
                 .axis(QMAT_N, multiple_of(64))
-                .when(qmatmul_coop_rule_supported),
+                .when(|shape, ctx, caps| {
+                    qmatmul_coop_rule_supported(
+                        shape,
+                        ctx,
+                        caps,
+                        CoopTile::new(128, 64, QMATMUL_COOP_BK),
+                    )
+                }),
         )
         .rule(
             tile(64, 128, false),
@@ -235,7 +269,14 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> 
                 .axis(QMAT_M, multiple_of(64))
                 .axis(QMAT_K, multiple_of(32))
                 .axis(QMAT_N, multiple_of(128))
-                .when(qmatmul_coop_rule_supported),
+                .when(|shape, ctx, caps| {
+                    qmatmul_coop_rule_supported(
+                        shape,
+                        ctx,
+                        caps,
+                        CoopTile::new(64, 128, QMATMUL_COOP_BK),
+                    )
+                }),
         )
         .rule(
             tile(64, 64, true), // Tile64x64Cached
@@ -245,7 +286,13 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> 
                 .axis(QMAT_N, multiple_of(64))
                 .when(
                     |shape: KernelShape<3>, ctx: &QMatmulDirectCtx, caps: KernelDeviceCaps| {
-                        !ctx.format.is_q4k_family() && qmatmul_coop_rule_supported(shape, ctx, caps)
+                        !ctx.format.is_q4k_family()
+                            && qmatmul_coop_rule_supported(
+                                shape,
+                                ctx,
+                                caps,
+                                CoopTile::new(64, 64, QMATMUL_COOP_BK),
+                            )
                     },
                 ),
         )
@@ -257,7 +304,13 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> 
                 .axis(QMAT_N, multiple_of(32))
                 .when(
                     |shape: KernelShape<3>, ctx: &QMatmulDirectCtx, caps: KernelDeviceCaps| {
-                        ctx.format.is_q4k_family() && qmatmul_coop_rule_supported(shape, ctx, caps)
+                        ctx.format.is_q4k_family()
+                            && qmatmul_coop_rule_supported(
+                                shape,
+                                ctx,
+                                caps,
+                                CoopTile::new(64, 32, QMATMUL_COOP_BK),
+                            )
                     },
                 ),
         )
@@ -268,8 +321,9 @@ fn qmatmul_coop_rule_supported(
     shape: KernelShape<3>,
     ctx: &QMatmulDirectCtx,
     caps: KernelDeviceCaps,
+    tile: CoopTile,
 ) -> bool {
-    qmatmul_coop_supported(caps) && ctx.y_supports_coop && shape[QMAT_M] > 1
+    qmatmul_coop_tile_supported(tile, caps) && ctx.y_supports_coop && shape[QMAT_M] > 1
 }
 
 fn select_qmatmul_direct_variant(
@@ -543,13 +597,16 @@ fn qmatmul_variant_supports_coop_acc_init(
     n: u32,
     y_supports_coop: bool,
 ) -> bool {
-    if !y_supports_coop || m <= 1 || !k.is_multiple_of(32) {
+    if !y_supports_coop || m <= 1 {
         return false;
     }
     let tile = match variant {
         QMatmulPath::Q8Wide(tile) | QMatmulPath::Tile { tile, .. } => tile,
         QMatmulPath::Q5SmallSingleRow | QMatmulPath::SingleRow => return false,
     };
+    if !k.is_multiple_of(tile.bk) {
+        return false;
+    }
     m.is_multiple_of(tile.bm) && n.is_multiple_of(tile.bn)
 }
 
@@ -578,7 +635,7 @@ fn qmatmul_custom_accumulator_offsets_supported(
 ) -> bool {
     qmatmul_custom_accumulator_offsets_cover_output(m, n, matrix_n, max_accumulator_offset)
         && qmatmul_path_is_single_row_qgemv(variant)
-        && qmatmul_direct_path_supported(variant, caps)
+        && qmatmul_direct_path_supported(variant, format, k, n, caps)
         && qmatmul_qgemv_dispatch_supported(format, k, n, max_workgroups_per_dimension)
 }
 

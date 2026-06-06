@@ -4,6 +4,7 @@ use fusor_tile_ir::tile::{range, CoopAcc, Program, Storage, Tile, TileBlock};
 use fusor_tile_ir::{ScalarElement, TileLiteral, WorkgroupAxis};
 
 use crate::{
+    dispatch::SubgroupConfig,
     grid::dot4_sum,
     kernels::helpers::{
         coop_load_a_fragments, coop_load_b_fragments, coop_mma_grid, coop_store_acc_grid,
@@ -87,8 +88,13 @@ struct CoopTileEntry {
     row_groups: u32,
     col_groups: u32,
     n_passes: u32,
-    block: u32,
     single_buffered: bool,
+}
+
+impl CoopTileEntry {
+    const fn block(self, subgroups: SubgroupConfig) -> u32 {
+        subgroups.block_for_subgroups(self.row_groups * self.col_groups)
+    }
 }
 
 /// The accumulator element for every dense matmul kernel is F32. The storage
@@ -113,6 +119,7 @@ fn accum_cast(storage: ScalarElement) -> AccumCast {
 /// Each subgroup computes one output row. Lanes cooperatively walk K in
 /// `VALUES_PER_LANE` chunks and then reduce the partial sums inside the
 /// subgroup, avoiding the scalar-lane behavior of the generic edge matmul.
+#[allow(clippy::too_many_arguments)]
 pub fn batched_gemv_with_epilogues(
     program: &mut Program,
     a: &Storage,
@@ -121,13 +128,13 @@ pub fn batched_gemv_with_epilogues(
     shape: DenseMatmulShape,
     epilogues: &DenseMatmulEpilogues<'_>,
     max_workgroups_per_dimension: u32,
+    subgroups: SubgroupConfig,
 ) {
-    // Subgroup width × rows per workgroup = workgroup BLOCK (32 × 4 = 128).
+    // Runtime subgroup width × rows per workgroup = logical row coverage.
     // Each lane folds VALUES_PER_LANE elements of K via dot4.
-    const SUBGROUP_SIZE: u32 = 32;
     const ROWS_PER_WORKGROUP: u32 = 4;
     const VALUES_PER_LANE: u32 = 8;
-    const BLOCK: u32 = ROWS_PER_WORKGROUP * SUBGROUP_SIZE;
+    let block = subgroups.block_for_subgroups(ROWS_PER_WORKGROUP);
     let rows_per_workgroup = ROWS_PER_WORKGROUP;
     let values_per_lane = VALUES_PER_LANE;
     assert_eq!(shape.n, 1, "batched_gemv expects a single RHS column");
@@ -147,10 +154,8 @@ pub fn batched_gemv_with_epilogues(
     let row_groups = shape.m.div_ceil(rows_per_workgroup);
     let total_groups = shape.batch * row_groups;
     let grid = dispatch_grid_1d(total_groups, max_workgroups_per_dimension);
-    let k_per_iter = SUBGROUP_SIZE * values_per_lane;
-    let k_iterations = shape.k.div_ceil(k_per_iter);
 
-    program.program_grid(BLOCK, grid, |program| {
+    program.program_grid(block, grid, |program| {
         let group_id = program.program_id(WorkgroupAxis::X)
             + program.program_id(WorkgroupAxis::Y) * grid[0]
             + program.program_id(WorkgroupAxis::Z) * grid[0] * grid[1];
@@ -159,6 +164,9 @@ pub fn batched_gemv_with_epilogues(
         let row_group = group_id % row_groups;
         let row = row_group * rows_per_workgroup + program.subgroup_id();
         let lane = program.subgroup_lane();
+        let k_per_iter = program.subgroup_size() * values_per_lane;
+        let k_iterations = (Tile::literal(TileLiteral::U32(shape.k)) + k_per_iter.clone() - 1u32)
+            / k_per_iter.clone();
         let row_in_bounds = group_active.clone().and(row.clone().lt(shape.m));
         let a_batch_base = batch_tile.clone() * shape.m;
         let b_batch_base = batch_tile.clone() * shape.k;
@@ -168,7 +176,7 @@ pub fn batched_gemv_with_epilogues(
             range(k_iterations),
             [Tile::literal(TileLiteral::f32(0.0))],
             |program, loop_index, [acc]| {
-                let k_base = loop_index * k_per_iter + lane.clone() * values_per_lane;
+                let k_base = loop_index * k_per_iter.clone() + lane.clone() * values_per_lane;
                 let a_values: Vec<Tile> = (0..values_per_lane)
                     .map(|i| {
                         let k_index = k_base.clone() + i;
@@ -500,11 +508,13 @@ pub fn try_batched_coop_matmul(
     shape: DenseMatmulShape,
     epilogues: &DenseMatmulEpilogues<'_>,
     max_workgroups_per_dimension: u32,
+    subgroups: SubgroupConfig,
     tile: DenseCoopMatmulTile,
 ) -> bool {
     let DenseMatmulTensors { a, b, y } = tensors;
     let DenseCoopMatmulTile { bm, bn, bk } = tile;
-    if epilogues.pre_a.is_some()
+    if !subgroups.is_fixed()
+        || epilogues.pre_a.is_some()
         || epilogues.pre_b.is_some()
         || epilogues.post.is_some()
         || !shape.m.is_multiple_of(bm)
@@ -527,7 +537,7 @@ pub fn try_batched_coop_matmul(
     // 256×K A tile would exceed the limit when doubled; its single-buffer
     // overhead is amortized by halving global A reads vs (128, 512, 16).
     //
-    // Schema: (bm, bn, bk, row_groups, col_groups, n_passes, block, single_buffered).
+    // Schema: (bm, bn, bk, row_groups, col_groups, n_passes, single_buffered).
     const COOP_TILE_TABLE: &[CoopTileEntry] = &[
         CoopTileEntry {
             tile: DenseCoopMatmulTile {
@@ -538,7 +548,6 @@ pub fn try_batched_coop_matmul(
             row_groups: 8,
             col_groups: 1,
             n_passes: 8,
-            block: 256,
             single_buffered: true,
         },
         CoopTileEntry {
@@ -550,7 +559,6 @@ pub fn try_batched_coop_matmul(
             row_groups: 4,
             col_groups: 2,
             n_passes: 8,
-            block: 256,
             single_buffered: false,
         },
         CoopTileEntry {
@@ -562,7 +570,6 @@ pub fn try_batched_coop_matmul(
             row_groups: 4,
             col_groups: 2,
             n_passes: 4,
-            block: 256,
             single_buffered: false,
         },
         CoopTileEntry {
@@ -574,7 +581,6 @@ pub fn try_batched_coop_matmul(
             row_groups: 4,
             col_groups: 4,
             n_passes: 2,
-            block: 512,
             single_buffered: false,
         },
         CoopTileEntry {
@@ -586,7 +592,6 @@ pub fn try_batched_coop_matmul(
             row_groups: 4,
             col_groups: 2,
             n_passes: 1,
-            block: 256,
             single_buffered: false,
         },
         CoopTileEntry {
@@ -598,7 +603,6 @@ pub fn try_batched_coop_matmul(
             row_groups: 2,
             col_groups: 4,
             n_passes: 2,
-            block: 256,
             single_buffered: false,
         },
         CoopTileEntry {
@@ -610,21 +614,13 @@ pub fn try_batched_coop_matmul(
             row_groups: 2,
             col_groups: 2,
             n_passes: 1,
-            block: 128,
             single_buffered: false,
         },
     ];
     let Some(entry) = COOP_TILE_TABLE.iter().find(|entry| entry.tile == tile) else {
         return false;
     };
-    // Runtime block (ARBOR_DESIGN.md §5): the workgroup size is a value baked
-    // by the lowerer, so the old `match block { 128 => ::<128>, … }` monomorph
-    // dispatch collapses into a single runtime call.
-    assert!(
-        matches!(entry.block, 128 | 256 | 512),
-        "unsupported coop matmul BLOCK {}",
-        entry.block
-    );
+    let block = entry.block(subgroups);
     if entry.single_buffered {
         batched_coop_matmul_perf_single(
             program,
@@ -633,13 +629,14 @@ pub fn try_batched_coop_matmul(
             y,
             shape,
             max_workgroups_per_dimension,
-            entry.block,
+            block,
             bm,
             bn,
             bk,
             entry.row_groups,
             entry.col_groups,
             entry.n_passes,
+            subgroups,
         );
     } else {
         batched_coop_matmul_perf(
@@ -649,13 +646,14 @@ pub fn try_batched_coop_matmul(
             y,
             shape,
             max_workgroups_per_dimension,
-            entry.block,
+            block,
             bm,
             bn,
             bk,
             entry.row_groups,
             entry.col_groups,
             entry.n_passes,
+            subgroups,
         );
     }
     true
@@ -775,9 +773,9 @@ fn batched_coop_matmul_perf_single(
     row_groups: u32,
     col_groups: u32,
     n_passes: u32,
+    subgroups: SubgroupConfig,
 ) {
     const COOP_DIM: u32 = 8;
-    const SUBGROUP_SIZE: u32 = 32;
     debug_assert!(n_passes >= 1);
     debug_assert_eq!(bn % n_passes, 0);
     let bn_pass: u32 = bn / n_passes;
@@ -787,7 +785,10 @@ fn batched_coop_matmul_perf_single(
     debug_assert_eq!(bn_pass % col_groups, 0);
     debug_assert_eq!(subgroup_rows % COOP_DIM, 0);
     debug_assert_eq!(subgroup_cols_per_pass % COOP_DIM, 0);
-    debug_assert_eq!(row_groups * col_groups * SUBGROUP_SIZE, block);
+    debug_assert_eq!(
+        subgroups.block_for_subgroups(row_groups * col_groups),
+        block
+    );
     let tile_rows_per_sg: u32 = subgroup_rows / COOP_DIM;
     let tile_cols_per_sg: u32 = subgroup_cols_per_pass / COOP_DIM;
 
@@ -892,9 +893,9 @@ fn batched_coop_matmul_perf(
     row_groups: u32,
     col_groups: u32,
     n_passes: u32,
+    subgroups: SubgroupConfig,
 ) {
     const COOP_DIM: u32 = 8;
-    const SUBGROUP_SIZE: u32 = 32;
     debug_assert!(n_passes >= 1, "n_passes must be at least 1");
     debug_assert_eq!(bn % n_passes, 0, "bn must be divisible by n_passes");
     let bn_pass: u32 = bn / n_passes;
@@ -904,7 +905,10 @@ fn batched_coop_matmul_perf(
     debug_assert_eq!(bn_pass % col_groups, 0);
     debug_assert_eq!(subgroup_rows % COOP_DIM, 0);
     debug_assert_eq!(subgroup_cols_per_pass % COOP_DIM, 0);
-    debug_assert_eq!(row_groups * col_groups * SUBGROUP_SIZE, block);
+    debug_assert_eq!(
+        subgroups.block_for_subgroups(row_groups * col_groups),
+        block
+    );
     let tile_rows_per_sg: u32 = subgroup_rows / COOP_DIM;
     let tile_cols_per_sg: u32 = subgroup_cols_per_pass / COOP_DIM;
 

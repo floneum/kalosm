@@ -93,16 +93,11 @@ pub(super) fn coop_gemm_params_from_caps(
     caps: KernelDeviceCaps,
     coop_kinds: &[CooperativeMatrixKind],
 ) -> Option<coop_gemm::CoopGemmParams> {
-    // Apple's coopMatrix instructions execute on 32-thread SIMD groups even
-    // when the device's wgpu-reported subgroup-size range straddles 32 (M-series
-    // reports min=4, max=64). Match `floneum/main`: gate only on the
-    // cooperative-matrix and subgroup capabilities plus workgroup size.
     if !caps.subgroups_supported
         || !coop_kinds
             .iter()
             .any(|kind| caps.cooperative_matrix.supports(*kind))
-        || caps.max_subgroup_size < 32
-        || caps.min_subgroup_size > 32
+        || caps.min_subgroup_size != caps.max_subgroup_size
         || caps.max_compute_workgroup_size_x < 64
     {
         return None;
@@ -151,15 +146,34 @@ pub(super) enum DirectTileMatmulVariant {
 /// fits the shape); the kernel layer uses the tuple to look up the matching
 /// ROW_GROUPS/COL_GROUPS/N_PASSES/BLOCK in its internal table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct CoopTile {
-    pub(super) bm: u32,
-    pub(super) bn: u32,
-    pub(super) bk: u32,
+pub(crate) struct CoopTile {
+    pub(crate) bm: u32,
+    pub(crate) bn: u32,
+    pub(crate) bk: u32,
 }
 
 impl CoopTile {
-    pub(super) const fn new(bm: u32, bn: u32, bk: u32) -> Self {
+    pub(crate) const fn new(bm: u32, bn: u32, bk: u32) -> Self {
         Self { bm, bn, bk }
+    }
+
+    const fn subgroup_groups(self) -> u32 {
+        match (self.bm, self.bn, self.bk) {
+            (256, 256, 16) => 8,
+            (128, 512, 16) => 8,
+            (128, 256, 16) => 8,
+            (128, 128, 16) => 16,
+            (128, 64, 16) => 8,
+            (64, 128, 16) => 8,
+            (64, 64, 16) => 4,
+            _ => 0,
+        }
+    }
+
+    fn workgroup_size_supported(self, max_workgroup_size_x: u32, max_subgroup_size: u32) -> bool {
+        self.subgroup_groups()
+            .checked_mul(max_subgroup_size)
+            .is_some_and(|block| block <= max_workgroup_size_x)
     }
 
     /// Pick a cooperative-matrix tile for the given (m, k, n) shape, returning
@@ -168,7 +182,13 @@ impl CoopTile {
     /// (256, 256, 16) entry runs single-buffered in the inner perf kernel.
     /// Heuristic: bigger tiles only fire when (M/BM)*(N/BN) clears a minimum
     /// tile count so there's enough work for the GPU.
-    pub(super) fn select(m: u32, k: u32, n: u32, max_workgroup_size_x: u32) -> Option<Self> {
+    pub(super) fn select(
+        m: u32,
+        k: u32,
+        n: u32,
+        max_workgroup_size_x: u32,
+        max_subgroup_size: u32,
+    ) -> Option<Self> {
         let tiles_for = |bm: u32, bn: u32| -> u32 { (m / bm) * (n / bn) };
         if !k.is_multiple_of(16) {
             return None;
@@ -179,33 +199,42 @@ impl CoopTile {
         if m.is_multiple_of(256)
             && n.is_multiple_of(256)
             && !n.is_multiple_of(512)
-            && max_workgroup_size_x >= 256
             && tiles_for(256, 256) >= 256
         {
-            return Some(Self::new(256, 256, 16));
+            let tile = Self::new(256, 256, 16);
+            if tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
+                return Some(tile);
+            }
         }
-        if m.is_multiple_of(128)
-            && n.is_multiple_of(512)
-            && max_workgroup_size_x >= 256
-            && tiles_for(128, 512) >= 256
-        {
-            return Some(Self::new(128, 512, 16));
+        if m.is_multiple_of(128) && n.is_multiple_of(512) && tiles_for(128, 512) >= 256 {
+            let tile = Self::new(128, 512, 16);
+            if tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
+                return Some(tile);
+            }
         }
-        if m.is_multiple_of(128)
-            && n.is_multiple_of(256)
-            && max_workgroup_size_x >= 256
-            && tiles_for(128, 256) >= 256
-        {
-            return Some(Self::new(128, 256, 16));
+        if m.is_multiple_of(128) && n.is_multiple_of(256) && tiles_for(128, 256) >= 256 {
+            let tile = Self::new(128, 256, 16);
+            if tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
+                return Some(tile);
+            }
         }
-        if m.is_multiple_of(128) && n.is_multiple_of(64) && max_workgroup_size_x >= 256 {
-            return Some(Self::new(128, 64, 16));
+        if m.is_multiple_of(128) && n.is_multiple_of(64) {
+            let tile = Self::new(128, 64, 16);
+            if tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
+                return Some(tile);
+            }
         }
-        if m.is_multiple_of(64) && n.is_multiple_of(128) && max_workgroup_size_x >= 256 {
-            return Some(Self::new(64, 128, 16));
+        if m.is_multiple_of(64) && n.is_multiple_of(128) {
+            let tile = Self::new(64, 128, 16);
+            if tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
+                return Some(tile);
+            }
         }
-        if m.is_multiple_of(64) && n.is_multiple_of(64) && max_workgroup_size_x >= 128 {
-            return Some(Self::new(64, 64, 16));
+        if m.is_multiple_of(64) && n.is_multiple_of(64) {
+            let tile = Self::new(64, 64, 16);
+            if tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
+                return Some(tile);
+            }
         }
         None
     }
@@ -228,7 +257,6 @@ pub(super) fn select_direct_tile_matmul_variant(m: u32, k: u32, n: u32) -> Direc
             KernelDeviceCaps {
                 subgroups_supported: false,
                 cooperative_matrix: CooperativeMatrixCaps::default(),
-                is_cpu_adapter: false,
                 min_subgroup_size: 0,
                 max_subgroup_size: 0,
                 max_compute_invocations_per_workgroup: 0,

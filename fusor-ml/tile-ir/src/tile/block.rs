@@ -36,6 +36,10 @@ impl TileBlock<'_> {
     pub fn subgroup_size(&self) -> Tile {
         Tile::builtin(Builtin::SubgroupSize)
     }
+    /// `@builtin(num_subgroups)`.
+    pub fn num_subgroups(&self) -> Tile {
+        Tile::builtin(Builtin::NumSubgroups)
+    }
     /// `@builtin(local_invocation_index)` — flat lane within the workgroup.
     pub fn lane(&self) -> Tile {
         Tile::builtin(Builtin::Lane)

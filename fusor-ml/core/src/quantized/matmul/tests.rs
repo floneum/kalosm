@@ -32,14 +32,6 @@ mod selection_tests {
         }
     }
 
-    fn cpu_adapter_caps(high_tile_limits: bool) -> KernelDeviceCaps {
-        KernelDeviceCaps {
-            is_cpu_adapter: true,
-            cooperative_matrix: CooperativeMatrixCaps::default(),
-            ..caps(high_tile_limits)
-        }
-    }
-
     fn variable_subgroup_caps(high_tile_limits: bool) -> KernelDeviceCaps {
         KernelDeviceCaps {
             cooperative_matrix: CooperativeMatrixCaps::default(),
@@ -56,6 +48,10 @@ mod selection_tests {
         }
     }
 
+    const fn qtile(bm: u32, bn: u32) -> CoopTile {
+        CoopTile::new(bm, bn, QMATMUL_COOP_BK)
+    }
+
     #[test]
     fn qmatmul_direct_selector_generates_each_variant() {
         let selector = qmatmul_direct_selector();
@@ -68,13 +64,13 @@ mod selection_tests {
             ),
             (QMatmulPath::SingleRow, ctx(q4, false), caps(false)),
             (
-                QMatmulPath::Q8Wide(QCoopTile::new(64, 128)),
+                QMatmulPath::Q8Wide(qtile(64, 128)),
                 ctx(tile_ir::GgmlQuantFormat::Q8_0, true),
                 caps(true),
             ),
             (
                 QMatmulPath::Tile {
-                    tile: QCoopTile::new(128, 128),
+                    tile: qtile(128, 128),
                     cached: false,
                 },
                 ctx(q4, true),
@@ -82,7 +78,7 @@ mod selection_tests {
             ),
             (
                 QMatmulPath::Tile {
-                    tile: QCoopTile::new(128, 64),
+                    tile: qtile(128, 64),
                     cached: false,
                 },
                 ctx(q4, true),
@@ -90,7 +86,7 @@ mod selection_tests {
             ),
             (
                 QMatmulPath::Tile {
-                    tile: QCoopTile::new(64, 128),
+                    tile: qtile(64, 128),
                     cached: false,
                 },
                 ctx(q4, true),
@@ -98,7 +94,7 @@ mod selection_tests {
             ),
             (
                 QMatmulPath::Tile {
-                    tile: QCoopTile::new(64, 64),
+                    tile: qtile(64, 64),
                     cached: true,
                 },
                 ctx(q4, true),
@@ -106,7 +102,7 @@ mod selection_tests {
             ),
             (
                 QMatmulPath::Tile {
-                    tile: QCoopTile::new(64, 64),
+                    tile: qtile(64, 64),
                     cached: false,
                 },
                 ctx(q4, false),
@@ -124,7 +120,7 @@ mod selection_tests {
         assert_eq!(
             selector.select(shape, &ctx(q4k, true), no_coop_caps(true)),
             Some(QMatmulPath::Tile {
-                tile: QCoopTile::new(64, 64),
+                tile: qtile(64, 64),
                 cached: false
             })
         );
@@ -140,35 +136,34 @@ mod selection_tests {
     }
 
     #[test]
-    fn single_row_direct_path_requires_trusted_subgroups_not_coop_matrix() {
+    fn single_row_direct_path_requires_trusted_runtime_subgroups_not_coop_matrix() {
+        let format = tile_ir::GgmlQuantFormat::Q4K;
+        let k = 4096;
+        let n = 8192;
+        let qgemv_supported = |caps| qgemv_subgroup_supported(format, k, n, caps);
+        let direct_supported = |path, caps| qmatmul_direct_path_supported(path, format, k, n, caps);
+
         assert!(!qmatmul_path_requires_coop(QMatmulPath::SingleRow));
         assert!(!qmatmul_path_requires_coop(QMatmulPath::Q5SmallSingleRow));
         assert!(qmatmul_path_requires_coop(QMatmulPath::Tile {
-            tile: QCoopTile::new(64, 64),
+            tile: qtile(64, 64),
             cached: false,
         }));
-        assert!(qgemv_fixed_subgroup_32_supported(no_coop_caps(false)));
-        assert!(qmatmul_direct_path_supported(
+        assert!(qgemv_supported(no_coop_caps(false)));
+        assert!(direct_supported(
             QMatmulPath::SingleRow,
             no_coop_caps(false)
         ));
-        assert!(!qmatmul_direct_path_supported(
+        assert!(!direct_supported(
             QMatmulPath::SingleRow,
             no_subgroup_caps(false)
         ));
-        assert!(!qmatmul_direct_path_supported(
+        assert!(!direct_supported(
             QMatmulPath::Q5SmallSingleRow,
             no_subgroup_caps(false)
         ));
-        assert!(!qgemv_fixed_subgroup_32_supported(cpu_adapter_caps(false)));
-        assert!(!qmatmul_direct_path_supported(
-            QMatmulPath::SingleRow,
-            cpu_adapter_caps(false)
-        ));
-        assert!(!qgemv_fixed_subgroup_32_supported(variable_subgroup_caps(
-            false
-        )));
-        assert!(!qmatmul_direct_path_supported(
+        assert!(qgemv_supported(variable_subgroup_caps(false)));
+        assert!(direct_supported(
             QMatmulPath::SingleRow,
             variable_subgroup_caps(false)
         ));
@@ -191,7 +186,7 @@ mod selection_tests {
     fn coop_acc_init_only_claims_shapes_the_coop_path_will_take() {
         assert!(qmatmul_variant_supports_coop_acc_init(
             QMatmulPath::Tile {
-                tile: QCoopTile::new(64, 128),
+                tile: qtile(64, 128),
                 cached: false
             },
             64,
@@ -201,7 +196,7 @@ mod selection_tests {
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
             QMatmulPath::Tile {
-                tile: QCoopTile::new(64, 128),
+                tile: qtile(64, 128),
                 cached: false
             },
             63,
@@ -211,7 +206,7 @@ mod selection_tests {
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
             QMatmulPath::Tile {
-                tile: QCoopTile::new(64, 64),
+                tile: qtile(64, 64),
                 cached: false
             },
             2,
@@ -221,7 +216,7 @@ mod selection_tests {
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
             QMatmulPath::Tile {
-                tile: QCoopTile::new(64, 128),
+                tile: qtile(64, 128),
                 cached: false
             },
             64,
@@ -231,7 +226,7 @@ mod selection_tests {
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
             QMatmulPath::Tile {
-                tile: QCoopTile::new(64, 128),
+                tile: qtile(64, 128),
                 cached: false
             },
             64,

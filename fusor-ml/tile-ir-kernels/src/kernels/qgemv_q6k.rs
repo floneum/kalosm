@@ -3,11 +3,8 @@
 //! Mirrors [`crate::kernels::qgemv::qgemv_q4k_ggml`] exactly, but for the Q6K
 //! 256-element super-block layout: `d` (one f32 scale), 128 bytes of low 4-bit
 //! weights (`ql`), 64 bytes of high 2-bit weights (`qh`), then 16 signed 8-bit
-//! sub-block scales. A 32-lane subgroup covers 2 super-blocks per pass
-//! (`ix = lane % 2`); the 16 lanes assigned to a super-block each decode the
-//! per-super-block `d` once and the four sub-block scales for their 16-element
-//! region, instead of re-decoding that metadata for every 8/16-element chunk
-//! the generic `quantized_dot_f32` path takes.
+//! sub-block scales. Each super-block is split across 16 subgroup lanes; wider
+//! subgroups cover proportionally more super-blocks per pass.
 //!
 //! Only the f32-scale [`GgmlQuantFormat::Q6K`] layout is handled here. The
 //! f16-native [`GgmlQuantFormat::Q6KNative`] block is 210 bytes — its block
@@ -17,7 +14,7 @@
 use fusor_tile_ir::tile::{range, Program, Storage, Tile, TileBlock};
 use fusor_tile_ir::{ElementType, GgmlQuantFormat, QuantizedMatrix};
 
-use crate::dispatch::QgemvShape;
+use crate::dispatch::{QgemvShape, SubgroupConfig};
 use crate::grid::{
     qgemv_grid, qgemv_program_scope, store_qgemv_sums_with_epilogue, QgemvStoreTarget,
 };
@@ -31,8 +28,8 @@ const Q6K_QH_WORD_BASE: u32 = 32;
 /// Q6K word offset of the first scale word: `ql` + `qh` = 192 bytes.
 const Q6K_SCALE_WORD_BASE: u32 = 48;
 
-/// Q6K subgroup-lane decomposition. A 32-lane subgroup covers 2 super-blocks per
-/// pass: `ix = lane % 2` selects the super-block, `tid = lane / 2` (0..15)
+/// Q6K subgroup-lane decomposition. Every 16-lane chunk covers one super-block:
+/// `ix = lane / 16` selects the super-block within this pass, `tid = lane % 16`
 /// addresses one 16-element region inside it — `ip = tid / 8` selects the
 /// 128-element half and `il = tid % 8` the group of 4 (`l0 = il * 4`).
 pub(crate) struct Q6KLane {
@@ -43,8 +40,8 @@ pub(crate) struct Q6KLane {
 }
 
 pub(crate) fn q6k_lane_decomposition(lane: &Tile) -> Q6KLane {
-    let tid = lane.clone() / 2u32;
-    let ix = lane.clone() % 2u32;
+    let ix = lane.clone() / 16u32;
+    let tid = lane.clone() % 16u32;
     let ip = tid.clone() / 8u32;
     let il = tid % 8u32;
     let l0 = il.clone() * 4u32;
@@ -79,33 +76,35 @@ pub(crate) fn load_q6k_ggml_activations(
 }
 
 /// Non-paired Q6K qgemv built on the ggml super-block-amortized decode — the
-/// Q6K analogue of [`crate::kernels::qgemv::qgemv_q4k_ggml`]. A 32-lane subgroup
-/// covers 2 super-blocks per pass (`ix = lane % 2`); each of the 16 lanes per
-/// super-block decodes `d` and its four sub-block scales once and consumes a
-/// strided 16-element region. Only valid with an empty pre-epilogue and the
-/// word-aligned f32-scale [`GgmlQuantFormat::Q6K`] layout.
+/// Q6K analogue of [`crate::kernels::qgemv::qgemv_q4k_ggml`]. Each 16-lane
+/// chunk decodes one super-block's `d` and four sub-block scales once and
+/// consumes a strided 16-element region. Only valid with an empty pre-epilogue
+/// and the word-aligned f32-scale [`GgmlQuantFormat::Q6K`] layout.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn qgemv_q6k_ggml(
     program: &mut Program,
     a: &Storage,
     b: &QuantizedMatrix,
     y: &Storage,
     workgroups_x: u32,
+    subgroups: SubgroupConfig,
     epilogues: &QmatmulEpilogues<'_>,
     shape: QgemvShape,
 ) {
-    const SUBGROUP_SIZE: u32 = 32;
-    let block = shape.block;
-    let subgroups = shape.subgroups;
+    let block = subgroups.block_for_subgroups(shape.subgroups);
+    let dispatch_subgroups = shape.subgroups;
     let cols_per_subgroup = shape.cols_per_subgroup;
-    debug_assert_eq!(subgroups * SUBGROUP_SIZE, block);
+    debug_assert!(subgroups.supports_lanes_per_item(16));
     debug_assert_eq!(b.format, GgmlQuantFormat::Q6K);
     let output_cols = epilogues.post_output_cols(b.cols);
-    let grid = qgemv_grid(subgroups, cols_per_subgroup, output_cols, workgroups_x);
+    let grid = qgemv_grid(
+        dispatch_subgroups,
+        cols_per_subgroup,
+        output_cols,
+        workgroups_x,
+    );
     let [_, k] = matrix_shape(a.layout());
     let block_count = k.div_ceil(256);
-    // 2 super-blocks per subgroup pass (`ix = lane % 2`).
-    let block_iterations = block_count.div_ceil(2);
-    let full_block_iterations = block_count.is_multiple_of(2);
     let blocks_per_col = b.rows / b.format.block_elements();
     let block_words = b.format.block_words();
     let qwords = Storage::from_view(b.data.clone());
@@ -119,6 +118,9 @@ pub(crate) fn qgemv_q6k_ggml(
         let col0 = scope.col0;
         let lane = scope.lane;
         let q6k_lane = q6k_lane_decomposition(&lane);
+        let blocks_per_pass = program.subgroup_size() / 16u32;
+        let block_iterations =
+            (Tile::u32(block_count) + blocks_per_pass.clone() - 1u32) / blocks_per_pass.clone();
 
         let sums: Vec<Tile> = if let Some(post_accumulator_offsets) = &post_accumulator_offsets {
             let value_arity = post_accumulator_offsets.len();
@@ -126,12 +128,8 @@ pub(crate) fn qgemv_q6k_ggml(
                 range(block_iterations),
                 vec![Tile::f32(0.0); cols_usize * value_arity],
                 |program, loop_index, accs| {
-                    let block_idx = loop_index * 2u32 + q6k_lane.ix.clone();
-                    let in_bounds = if full_block_iterations {
-                        Tile::bool(true)
-                    } else {
-                        block_idx.clone().lt(block_count)
-                    };
+                    let block_idx = loop_index * blocks_per_pass.clone() + q6k_lane.ix.clone();
+                    let in_bounds = block_idx.clone().lt(block_count);
                     let vector_base = block_idx.clone() * 256u32
                         + q6k_lane.ip.clone() * 128u32
                         + q6k_lane.l0.clone();
@@ -164,12 +162,8 @@ pub(crate) fn qgemv_q6k_ggml(
                 range(block_iterations),
                 vec![Tile::f32(0.0); cols_usize],
                 |program, loop_index, accs| {
-                    let block_idx = loop_index * 2u32 + q6k_lane.ix.clone();
-                    let in_bounds = if full_block_iterations {
-                        Tile::bool(true)
-                    } else {
-                        block_idx.clone().lt(block_count)
-                    };
+                    let block_idx = loop_index * blocks_per_pass.clone() + q6k_lane.ix.clone();
+                    let in_bounds = block_idx.clone().lt(block_count);
                     let vector_base = block_idx.clone() * 256u32
                         + q6k_lane.ip.clone() * 128u32
                         + q6k_lane.l0.clone();
@@ -202,7 +196,6 @@ pub(crate) fn qgemv_q6k_ggml(
                 y,
                 col0,
                 lane,
-                full_cols: grid.full_cols,
                 n_cols: grid.n_cols,
                 epilogues,
             },
@@ -318,11 +311,10 @@ mod tests {
     use crate::types::QmatmulEpilogues;
     use fusor_tile_ir::{tile, Shape};
 
-    fn qgemv_shape(block: u32, subgroups: u32, cols_per_subgroup: u32) -> QgemvShape {
+    fn qgemv_shape(subgroups: u32, cols_per_subgroup: u32) -> QgemvShape {
         QgemvShape {
             subgroups,
             cols_per_subgroup,
-            block,
         }
     }
 
@@ -332,7 +324,16 @@ mod tests {
             let b = quantized_matrix(program, GgmlQuantFormat::Q6K, rows, cols);
             let y = program.storage_write(ElementType::F32, Shape::new([1, cols]));
             let epilogues = QmatmulEpilogues::default();
-            qgemv_q6k_ggml(program, &a, &b, &y, 1, &epilogues, shape);
+            qgemv_q6k_ggml(
+                program,
+                &a,
+                &b,
+                &y,
+                1,
+                SubgroupConfig::fixed(32),
+                &epilogues,
+                shape,
+            );
         });
         // Lowering to Naga validates the IR structure end to end.
         ir.lower_to_naga()
@@ -343,19 +344,19 @@ mod tests {
     fn lowers_small_shape() {
         // Two super-blocks, single column: exercises the partial-iteration mask
         // (block_count = 2 is a multiple of 2, so full iterations here).
-        build_and_lower(512, 4, qgemv_shape(256, 8, 4));
+        build_and_lower(512, 4, qgemv_shape(8, 4));
     }
 
     #[test]
     fn lowers_partial_block_iteration() {
         // block_count = 3 (768/256) is not a multiple of 2: exercises the
         // partial-block-iteration bounds mask.
-        build_and_lower(768, 4, qgemv_shape(128, 4, 4));
+        build_and_lower(768, 4, qgemv_shape(4, 4));
     }
 
     #[test]
     fn lowers_llama_decode_shape() {
         // The regression target: 4096x14336 Q6K decode matmul.
-        build_and_lower(4096, 14336, qgemv_shape(256, 8, 4));
+        build_and_lower(4096, 14336, qgemv_shape(8, 4));
     }
 }

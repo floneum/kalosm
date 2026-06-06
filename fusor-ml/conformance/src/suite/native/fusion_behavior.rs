@@ -63,6 +63,19 @@ fn binding_limit_sum_data(shape: [usize; 2], num_tensors: usize) -> Vec<f32> {
     out
 }
 
+fn nary_binding_limit_stress_input_count(device: &Device) -> Option<usize> {
+    let gpu = device.as_gpu()?;
+    let num_tensors = gpu
+        .nary_direct_input_binding_budget()
+        .saturating_add(1)
+        .max(2);
+
+    // Some software adapters report descriptor limits high enough that a
+    // limit-plus-one conformance case would be impractically large. Keep the
+    // guard on the budget itself instead of the adapter type.
+    (num_tensors <= 128).then_some(num_tensors)
+}
+
 fn condition_data(shape: [usize; 2]) -> Vec<f32> {
     let total = shape[0] * shape[1];
     (0..total)
@@ -314,16 +327,9 @@ pub fn gpu_nary_fusion_respects_binding_limit() -> AssertionCases {
     let mut assertions = AssertionCases::new();
     assertions.push(
         fusor_conformance::assert(move |device: Device| async move {
-            let Some(gpu) = device.as_gpu() else {
+            let Some(num_tensors) = nary_binding_limit_stress_input_count(&device) else {
                 return Tensor::from_slice(&device, shape, &matrix_data(shape, 0.0));
             };
-            if gpu.is_cpu_adapter() {
-                return Tensor::from_slice(&device, shape, &matrix_data(shape, 0.0));
-            }
-            let num_tensors = gpu
-                .nary_direct_input_binding_budget()
-                .saturating_add(1)
-                .max(2);
             let tensors: Vec<Tensor<2, f32>> = (0..num_tensors)
                 .map(|i| Tensor::from_slice(&device, shape, &matrix_data(shape, i as f32 * 0.3)))
                 .collect();
@@ -334,15 +340,7 @@ pub fn gpu_nary_fusion_respects_binding_limit() -> AssertionCases {
         })
         .arg(|device: &Device| device.clone())
         .equal_to(move |device: Device| async move {
-            let num_tensors = device
-                .as_gpu()
-                .filter(|gpu| !gpu.is_cpu_adapter())
-                .map(|gpu| {
-                    gpu.nary_direct_input_binding_budget()
-                        .saturating_add(1)
-                        .max(2)
-                })
-                .unwrap_or(1);
+            let num_tensors = nary_binding_limit_stress_input_count(&device).unwrap_or(1);
             Tensor::from_slice(&device, shape, &binding_limit_sum_data(shape, num_tensors))
         })
         .compare_with(approx_compare::<2, f32>(5e-6))
@@ -354,18 +352,9 @@ pub fn gpu_nary_fusion_respects_binding_limit() -> AssertionCases {
     assertions.push(assert_gpu_kernel_property(
         "fusion_behavior::gpu_nary_fusion_respects_binding_limit::kernels",
         move |device| {
-            let Some(gpu) = device.as_gpu() else {
+            let Some(num_tensors) = nary_binding_limit_stress_input_count(&device) else {
                 return true;
             };
-            // Software adapters can report descriptor limits too high to build a
-            // practical limit-plus-one stress case.
-            if gpu.is_cpu_adapter() {
-                return true;
-            }
-            let num_tensors = gpu
-                .nary_direct_input_binding_budget()
-                .saturating_add(1)
-                .max(2);
             let tensors: Vec<Tensor<2, f32>> = (0..num_tensors)
                 .map(|i| Tensor::from_slice(&device, shape, &matrix_data(shape, i as f32 * 0.3)))
                 .collect();

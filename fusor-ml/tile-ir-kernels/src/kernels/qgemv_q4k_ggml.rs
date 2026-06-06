@@ -1,9 +1,9 @@
 use fusor_tile_ir::tile::{Storage, Tile, TileBlock};
 use fusor_tile_ir::{ElementType, ScalarElement};
 
-/// Q4K subgroup-lane decomposition: `ix = lane / 8` selects one of the 4
-/// super-blocks for this pass; `(iq, ir) = ((lane % 8) / 4, lane % 4)` addresses
-/// the lane's 8-byte sub-region within that block.
+/// Q4K subgroup-lane decomposition: `ix = lane / 8` selects the super-block
+/// within this runtime subgroup pass; `(iq, ir) = ((lane % 8) / 4, lane % 4)`
+/// addresses the lane's 8-byte sub-region within that block.
 pub(crate) struct Q4KLane {
     pub(crate) ix: Tile,
     pub(crate) iq: Tile,

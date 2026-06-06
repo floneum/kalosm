@@ -143,7 +143,6 @@ const fn axis_index<const I: usize>(_axis: Axis<I>) -> usize {
 pub struct KernelDeviceCaps {
     pub subgroups_supported: bool,
     pub cooperative_matrix: CooperativeMatrixCaps,
-    pub is_cpu_adapter: bool,
     pub min_subgroup_size: u32,
     pub max_subgroup_size: u32,
     pub max_compute_invocations_per_workgroup: u32,
@@ -158,7 +157,6 @@ impl KernelDeviceCaps {
         Self {
             subgroups_supported: device.subgroups_supported(),
             cooperative_matrix: device.cooperative_matrix_caps(),
-            is_cpu_adapter: device.is_cpu_adapter(),
             min_subgroup_size: device.min_subgroup_size(),
             max_subgroup_size: device.max_subgroup_size(),
             max_compute_invocations_per_workgroup: limits.max_compute_invocations_per_workgroup,
@@ -176,7 +174,6 @@ impl KernelDeviceCaps {
         Self {
             subgroups_supported: true,
             cooperative_matrix: CooperativeMatrixCaps::test_dense_8x8(),
-            is_cpu_adapter: false,
             min_subgroup_size: 32,
             max_subgroup_size: 32,
             max_compute_invocations_per_workgroup: 1024,
