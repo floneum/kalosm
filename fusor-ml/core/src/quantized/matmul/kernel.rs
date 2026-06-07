@@ -322,46 +322,6 @@ impl QMatMulOperation {
             ) {
                 return Some(kernel);
             }
-            let cache_key = qmatmul_direct_module_key::<QMatmulDirectFastKernelVariant>(
-                |state| {
-                    variant.hash(state);
-                    subgroup_size_range.hash(state);
-                    QMATMUL_DIRECT_KERNEL_GENERATION.hash(state);
-                },
-                |state| {
-                    QMATMUL_DIRECT_KERNEL_GENERATION.hash(state);
-                    hash_qmatmul_shape(state, format, m, k, matrix_n);
-                    subgroup_size_range.hash(state);
-                    hash_qmatmul_dispatch_layouts(
-                        state,
-                        dispatch_size,
-                        input.layout(),
-                        output.layout(),
-                    );
-                },
-                dispatch_size,
-                None,
-            );
-            if let Some(pipeline) = kernel_backend::three_buffer_pipeline_from_cached_module(
-                device.kernel_cache(),
-                &kernel_name,
-                cache_key,
-            ) {
-                matrix
-                    .direct_pipeline_cache()
-                    .write()
-                    .get_or_insert(pipeline_key, || pipeline.clone());
-                return Some(
-                    kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
-                        kernel_name.clone(),
-                        pipeline,
-                        input.buffer().clone(),
-                        matrix.buffer().clone(),
-                        output.buffer().clone(),
-                        dispatch_size,
-                    ),
-                );
-            }
         }
         let pre_with_extras_for_ir = pre_epilogue_with_extras.clone();
         let post_with_extras_for_ir = post_epilogue_with_extras.clone();
@@ -556,7 +516,7 @@ impl QMatMulOperation {
             input.layout(),
             output.layout(),
         );
-        let cache_key = qmatmul_direct_module_key::<QMatmulDirectEpilogueKernelVariant>(
+        let cache_key = qmatmul_direct_cache_key::<QMatmulDirectEpilogueKernelVariant>(
             |state| {
                 variant.hash(state);
                 epilogue_identity.hash(state);
@@ -599,7 +559,32 @@ impl QMatMulOperation {
     }
 }
 
+fn hash_qmatmul_epilogue(state: &mut FxHasher, epilogue: &Option<ElementwiseEpilogue>) {
+    match epilogue {
+        Some(epilogue) => {
+            true.hash(state);
+            epilogue.expression.hash(state);
+            epilogue.extras.len().hash(state);
+            epilogue.input_datatype.hash(state);
+            epilogue.output_datatype.hash(state);
+        }
+        None => false.hash(state),
+    }
+}
+
 impl Operation for QMatMulOperation {
+    fn hash_kernel_fields(&self, state: &mut FxHasher) {
+        self.input_datatype.hash(state);
+        self.in_shape.hash(state);
+        self.out_shape.hash(state);
+        self.matrix.datatype().hash(state);
+        self.matrix.storage_layout().hash(state);
+        self.matrix.shape().hash(state);
+        hash_qmatmul_epilogue(state, &self.pre_element_wise_expr);
+        hash_qmatmul_epilogue(state, &self.post_element_wise_expr);
+        self.post_accumulator_offsets.hash(state);
+    }
+
     fn workgroup_shape_constraints(
         &self,
         _device: &Device,

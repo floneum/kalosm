@@ -276,7 +276,11 @@ fn llama_shape_dense_sampled_columns_case() -> AssertionCase {
             Tensor::from_slice(&device, [sample_count], &expected)
         }
     })
-    .compare_with(approx_or_relative_compare::<1>(2.0, 1e-4))
+    // This case multiplies SiLU(gate) by up after two independent 4096-term
+    // q4k reductions. Subgroup and no-subgroup paths use different reduction
+    // trees, so the final product needs a little more relative slack than a
+    // single qmatmul output.
+    .compare_with(approx_or_relative_compare::<1>(2.0, 2e-4))
     .baseline_on_test_device()
     .devices_async(gpu_devices())
     .runs(1)

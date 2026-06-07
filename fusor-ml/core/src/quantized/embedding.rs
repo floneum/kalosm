@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
@@ -157,11 +159,13 @@ fn u32_layout_2d(layout: &crate::Layout) -> Option<(u32, tile_ir::Layout)> {
     if shape.len() != 2 || strides.len() != 2 {
         return None;
     }
+    let rows = u32::try_from(shape[0]).ok()?.max(1);
+    let cols = u32::try_from(shape[1]).ok()?.max(1);
     Some((
         offset,
         tile_ir::Layout::strided(
             tile_ir::MemoryLevel::Storage,
-            tile_ir::Shape::new([shape[0].try_into().ok()?, shape[1].try_into().ok()?]),
+            tile_ir::Shape::new([rows, cols]),
             &[strides[0].try_into().ok()?, strides[1].try_into().ok()?],
         ),
     ))
@@ -174,17 +178,26 @@ fn u32_index_layout(layout: &crate::Layout) -> Option<(u32, tile_ir::Layout)> {
     if shape.len() != 1 || strides.len() != 1 {
         return None;
     }
+    let len = u32::try_from(shape[0]).ok()?.max(1);
     Some((
         offset,
         tile_ir::Layout::strided(
             tile_ir::MemoryLevel::Storage,
-            tile_ir::Shape::new([1, shape[0].try_into().ok()?]),
+            tile_ir::Shape::new([1, len]),
             &[0, strides[0].try_into().ok()?],
         ),
     ))
 }
 
 impl Operation for QEmbeddingOperation {
+    fn hash_kernel_fields(&self, state: &mut rustc_hash::FxHasher) {
+        self.matrix.datatype().hash(state);
+        self.matrix.storage_layout().hash(state);
+        self.matrix.shape().hash(state);
+        self.out_shape.hash(state);
+        self.datatype.hash(state);
+    }
+
     fn workgroup_shape_constraints(&self, _device: &Device) -> WorkgroupShapeConstraints {
         let mut constraints = WorkgroupShapeConstraints::new();
         constraints.add_constraint(0, Constraint::equals(BLOCK as u32));

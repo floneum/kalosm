@@ -125,7 +125,7 @@ fn decode_small_meta_buckets_dynamic_kv_len() {
 }
 
 #[test]
-fn decode_module_key_uses_bucketed_kv_len() {
+fn decode_cache_key_uses_bucketed_kv_len() {
     let meta = build_flash_decode_small_meta(
         decode_dims(DECODE_SMALL_BLOCK + 1),
         1.0,
@@ -144,14 +144,14 @@ fn decode_module_key_uses_bucketed_kv_len() {
 
     let workgroup_shape = WorkgroupShape::new(1, 1, 1);
     let dispatch_size = [meta.dims.batch * meta.dims.num_heads, 1, 1];
-    let key = kernel::flash_decode_module_key(
+    let key = kernel::flash_decode_cache_key(
         Some(&workgroup_shape),
         dispatch_size,
         DataTypeEnum::F32,
         1.0,
         &meta,
     );
-    let next_token_key = kernel::flash_decode_module_key(
+    let next_token_key = kernel::flash_decode_cache_key(
         Some(&workgroup_shape),
         dispatch_size,
         DataTypeEnum::F32,
@@ -163,7 +163,7 @@ fn decode_module_key_uses_bucketed_kv_len() {
 
     let mut different_stride_meta = meta;
     different_stride_meta.k_strides[1] += TEST_HEAD_DIM as u32;
-    let different_stride_key = kernel::flash_decode_module_key(
+    let different_stride_key = kernel::flash_decode_cache_key(
         Some(&workgroup_shape),
         dispatch_size,
         DataTypeEnum::F32,

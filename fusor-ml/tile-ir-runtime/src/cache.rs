@@ -13,6 +13,8 @@ use parking_lot::RwLock;
 use rustc_hash::{FxBuildHasher, FxHasher};
 use wgpu::{BindGroupLayout, PipelineLayout};
 
+use crate::DirectPlanCache;
+
 #[cfg(not(target_arch = "wasm32"))]
 const KERNEL_CACHE_SIZE: usize = 4096;
 #[cfg(target_arch = "wasm32")]
@@ -90,18 +92,6 @@ impl CachedKernel {
     }
 }
 
-/// Static, per-kernel-family LRU of lowered kernels. Used by hot
-/// kernels (flash attention, rms norm, …) to short-circuit before the
-/// device-wide [`KernelCache`].
-pub type ModuleCache = RwLock<LruCache<KernelCacheKey, Arc<NagaKernel>, FxBuildHasher>>;
-
-pub fn module_cache(capacity: usize) -> ModuleCache {
-    RwLock::new(LruCache::with_hasher(
-        NonZeroUsize::new(capacity).expect("module cache capacity must be non-zero"),
-        Default::default(),
-    ))
-}
-
 #[derive(Debug)]
 pub(crate) struct CachedDirectBindGroup {
     pub(crate) bind_group: wgpu::BindGroup,
@@ -159,6 +149,7 @@ pub struct KernelCache {
     pub(crate) kernels: RwLock<LruCache<KernelCacheKey, Arc<CachedKernel>, FxBuildHasher>>,
     pub(crate) direct_dynamic_bind_group_cache:
         RwLock<LruCache<DirectDynamicBindGroupKey, CachedDirectBindGroup, FxBuildHasher>>,
+    direct_plan_cache: DirectPlanCache,
     direct_three_buffer_bind_group_layout: OnceLock<BindGroupLayout>,
     direct_three_buffer_pipeline_layout: OnceLock<PipelineLayout>,
 }
@@ -204,6 +195,7 @@ impl KernelCache {
             cache_file,
             kernels: make_lru(KERNEL_CACHE_SIZE),
             direct_dynamic_bind_group_cache: make_lru(DIRECT_DYNAMIC_BIND_GROUP_CACHE_SIZE),
+            direct_plan_cache: DirectPlanCache::new(),
             direct_three_buffer_bind_group_layout: OnceLock::new(),
             direct_three_buffer_pipeline_layout: OnceLock::new(),
         }
@@ -211,6 +203,10 @@ impl KernelCache {
 
     pub fn wgpu_device(&self) -> &Arc<wgpu::Device> {
         &self.device
+    }
+
+    pub fn direct_plan_cache(&self) -> &DirectPlanCache {
+        &self.direct_plan_cache
     }
 
     pub fn direct_three_buffer_bind_group_layout(&self) -> BindGroupLayout {
@@ -271,6 +267,7 @@ impl KernelCache {
     }
 
     pub fn create_naga_shader_module(&self, kernel: &NagaKernel) -> wgpu::ShaderModule {
+        crate::note_compile("shader");
         // SAFETY: all kernels avoid out-of-bounds memory access and unbounded loops.
         unsafe {
             self.device.create_shader_module_trusted(

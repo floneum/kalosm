@@ -3,7 +3,7 @@
 //! This module provides a VarBuilder that wraps fusor-core's VarBuilder
 //! and creates unified `fusor::QMatrix` tensors that can run on either CPU or GPU.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, future::Future, pin::Pin, sync::Arc};
 
 use crate::{Device, QMatrix};
 pub use fusor_gguf::{GgufMetadata, GgufReadError, GgufValue};
@@ -207,6 +207,73 @@ impl<R: std::io::Read + std::io::Seek> ShardedVarBuilder<R> {
                 let mut bytes = vec![0u8; byte_size];
                 r.read_exact(&mut bytes)
                     .map_err(|e| crate::Error::VarBuilder(format!("Failed to read: {}", e)))?;
+
+                return QMatrix::from_raw_bytes(device, shape, &bytes, ggml_type).map_err(|e| {
+                    crate::Error::VarBuilder(format!("Failed to create QMatrix: {}", e))
+                });
+            }
+        }
+        Err(crate::Error::VarBuilder(format!(
+            "Key '{}' not found in GGUF metadata",
+            name
+        )))
+    }
+}
+
+/// Async byte-range access used by browser-backed model files.
+pub trait AsyncReadRange {
+    fn read_range<'a>(
+        &'a mut self,
+        offset: u64,
+        len: usize,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + 'a>>;
+}
+
+/// Sharded VarBuilder for loading tensors from async range-readable GGUF files.
+///
+/// This is intended for browser storage such as OPFS where holding the complete
+/// model bytes in wasm memory is unnecessarily expensive.
+pub struct AsyncShardedVarBuilder<R> {
+    contents: Vec<(GgufMetadata, R)>,
+}
+
+impl<R: AsyncReadRange> AsyncShardedVarBuilder<R> {
+    /// Create a new async sharded VarBuilder from GGUF metadata and range readers.
+    pub fn new(contents: Vec<(GgufMetadata, R)>) -> Self {
+        Self { contents }
+    }
+
+    /// Get a metadata value by key from any shard.
+    pub fn get(&self, name: &str) -> crate::Result<&GgufValue> {
+        for (content, _) in &self.contents {
+            if let Some(value) = content.get_value(name) {
+                return Ok(value);
+            }
+        }
+        Err(crate::Error::VarBuilder(format!(
+            "Key '{}' not found in GGUF metadata",
+            name
+        )))
+    }
+
+    /// Load a tensor from any shard to the specified device.
+    pub async fn tensor(&mut self, name: &str, device: &Device) -> crate::Result<QMatrix> {
+        for (content, reader) in &mut self.contents {
+            if let Some(tensor_info) = content.tensor_infos.get(name) {
+                let offset = content.tensor_data_offset + tensor_info.offset;
+                let ggml_type = tensor_info.ty;
+                let shape: Box<[usize]> = tensor_info
+                    .shape
+                    .iter()
+                    .map(|&d| d as usize)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+
+                let num_elements: usize = shape.iter().product();
+                let byte_size = tensor_byte_size(ggml_type, num_elements);
+                let bytes = reader.read_range(offset, byte_size).await.map_err(|e| {
+                    crate::Error::VarBuilder(format!("Failed to read tensor data: {}", e))
+                })?;
 
                 return QMatrix::from_raw_bytes(device, shape, &bytes, ggml_type).map_err(|e| {
                     crate::Error::VarBuilder(format!("Failed to create QMatrix: {}", e))

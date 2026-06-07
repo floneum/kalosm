@@ -198,6 +198,12 @@ pub(crate) fn qmatmul_try_coop(
     bn: u32,
     bk: u32,
 ) -> bool {
+    if std::env::var_os("FUSOR_DIAG_DISABLE_COOP").is_some() {
+        return false;
+    }
+    if b.format.is_q4k_family() || b.format.is_q6k_family() {
+        return false;
+    }
     if !subgroups.is_fixed() {
         return false;
     }

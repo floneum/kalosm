@@ -10,6 +10,8 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 fn main() {
+    let _ = tracing_subscriber::fmt::try_init();
+
     pollster::block_on(async {
         let warmup = env_usize("KALOSM_DECODE_BENCH_WARMUP", 8);
         let measured = env_usize("KALOSM_DECODE_BENCH_TOKENS", 64);
@@ -25,7 +27,7 @@ fn main() {
         let mut stream = model.complete(&prompt).take(warmup + measured);
         for _ in 0..warmup {
             if stream.next().await.is_none() {
-                eprintln!("stream ended during warmup");
+                tracing::warn!("stream ended during warmup");
                 return;
             }
         }

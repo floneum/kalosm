@@ -263,3 +263,77 @@ fn typed_coop_accumulator_records_scalar_role_and_shape() {
         ElementType::coop_matrix(ScalarElement::F32, CoopMatrixRole::C, 8, 8)
     );
 }
+
+#[test]
+fn cooperative_load_store_layout_flags_use_transposed_internal_layout() {
+    fn collect_coop_store_row_major(block: &naga::Block, out: &mut Vec<bool>) {
+        for stmt in block.iter() {
+            match stmt {
+                naga::Statement::CooperativeStore { data, .. } => out.push(data.row_major),
+                naga::Statement::Block(inner) => collect_coop_store_row_major(inner, out),
+                naga::Statement::If { accept, reject, .. } => {
+                    collect_coop_store_row_major(accept, out);
+                    collect_coop_store_row_major(reject, out);
+                }
+                naga::Statement::Switch { cases, .. } => {
+                    for case in cases {
+                        collect_coop_store_row_major(&case.body, out);
+                    }
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    collect_coop_store_row_major(body, out);
+                    collect_coop_store_row_major(continuing, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn lowered_coop_layout_flags(output_layout: Layout) -> (Vec<bool>, Vec<bool>) {
+        let ir = tile::build(|phase| {
+            let coop = crate::CoopMatrixToken::new_unchecked();
+            let y = phase.storage_write_with_layout(f32(), output_layout);
+            let a_tile = phase.alloc_workgroup_tile(ScalarElement::F32, 8, 8);
+            let b_tile = phase.alloc_workgroup_tile(ScalarElement::F32, 8, 8);
+            phase.program_grid(32, [1, 1, 1], |program| {
+                let acc = coop.alloc_coop_acc(program, ScalarElement::F32, 8, 8);
+                let zero = coop.coop_zero(program, ScalarElement::F32, 8, 8);
+                coop.store_local_coop(program, &acc, zero);
+
+                let a = coop.coop_load_a(program, &a_tile, 0u32, 0u32, ScalarElement::F32, 8, 8);
+                let b = coop.coop_load_b(program, &b_tile, 0u32, 0u32, ScalarElement::F32, 8, 8);
+                let c = coop.load_local_coop(program, &acc);
+                let mma = coop.coop_mma(program, a, b, c);
+                coop.store_local_coop(program, &acc, mma);
+                coop.coop_store(program, &acc, &y, 0u32, 0u32);
+            });
+        });
+
+        let lowered = lower_or_fail(&ir, "coop layout flags");
+        let function = &lowered.module().entry_points[0].function;
+        let load_flags = function
+            .expressions
+            .iter()
+            .filter_map(|(_, expr)| match expr {
+                naga::Expression::CooperativeLoad { data, .. } => Some(data.row_major),
+                _ => None,
+            })
+            .collect();
+        let mut store_flags = Vec::new();
+        collect_coop_store_row_major(&function.body, &mut store_flags);
+        (load_flags, store_flags)
+    }
+
+    let row_major = Layout::contiguous(MemoryLevel::Storage, Shape::new([8, 8]));
+    let col_major = Layout::strided(MemoryLevel::Storage, Shape::new([8, 8]), &[1, 8]);
+
+    let (loads, stores) = lowered_coop_layout_flags(row_major);
+    assert_eq!(loads, [false, false]);
+    assert_eq!(stores, [false]);
+
+    let (loads, stores) = lowered_coop_layout_flags(col_major);
+    assert_eq!(loads, [false, false]);
+    assert_eq!(stores, [true]);
+}

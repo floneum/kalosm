@@ -1,4 +1,4 @@
-use fusor_tile_ir::tile::{Storage, Tile, TileBlock};
+use fusor_tile_ir::tile::{Mask, Storage, Tile, TileBlock};
 use fusor_tile_ir::{ElementType, ScalarElement};
 
 /// Q4K subgroup-lane decomposition: `ix = lane / 8` selects the super-block
@@ -70,11 +70,12 @@ pub(crate) fn q4k_ggml_dot_tiles(
     block: &Tile,
     col: &Tile,
     lane: &Q4KLane,
+    mask: Mask,
     acts: &Q4KGgmlActs,
 ) -> Tile {
     let base = (col.clone() * blocks_per_col + block.clone()) * block_words;
     let load = |program: &mut TileBlock<'_>, offset: Tile| -> Tile {
-        program.load(qwords.at(base.clone() + offset), Tile::all(), 0u32)
+        program.load(qwords.at(base.clone() + offset), mask.clone(), 0u32)
     };
 
     let (scale0, data_base) = if native { (1u32, 4u32) } else { (2u32, 5u32) };

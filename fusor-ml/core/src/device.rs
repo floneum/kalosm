@@ -103,9 +103,48 @@ fn adapter_preference_rank(adapter: &wgpu::Adapter) -> u8 {
     }
 }
 
+fn log_gpu_diagnostic(message: String) {
+    tracing::error!("{message}");
+}
+
+fn install_device_diagnostics(device: &wgpu::Device) {
+    device.set_device_lost_callback(|reason, message| {
+        log_gpu_diagnostic(format!(
+            "fusor: WebGPU device lost reason={reason:?} message={message:?}"
+        ));
+    });
+
+    device.on_uncaptured_error(Arc::new(|error| {
+        let message = match &error {
+            wgpu::Error::OutOfMemory { source } => {
+                format!("fusor: uncaptured WebGPU out-of-memory error: {source}")
+            }
+            wgpu::Error::Validation {
+                description,
+                source,
+            } => {
+                format!("fusor: uncaptured WebGPU validation error: {description}; source={source}")
+            }
+            wgpu::Error::Internal {
+                description,
+                source,
+            } => {
+                format!("fusor: uncaptured WebGPU internal error: {description}; source={source}")
+            }
+        };
+        log_gpu_diagnostic(message);
+    }));
+}
+
 struct DeviceInner {
     device: Arc<wgpu::Device>,
     adapter: wgpu::Adapter,
+    /// Cached `adapter.get_info()` / `adapter.limits()`. These are constant for
+    /// the device's lifetime; re-querying them per kernel build (every op, every
+    /// token) is pure overhead — and on wasm each `get_info()` is a JS round-trip
+    /// that allocates an `AdapterInfo`.
+    adapter_info: wgpu::AdapterInfo,
+    limits: wgpu::Limits,
     queue: Arc<wgpu::Queue>,
     kernel_cache: KernelCache,
     buffer_pool: BufferPool,
@@ -166,6 +205,8 @@ impl Device {
         let inner = Arc::new(DeviceInner {
             device,
             adapter,
+            adapter_info: src.adapter_info.clone(),
+            limits: src.limits.clone(),
             queue,
             kernel_cache,
             buffer_pool,
@@ -220,8 +261,20 @@ impl Device {
         });
         let adapter = select_adapter(&instance, backends).await?;
         let adapter_features = adapter.features();
+        #[cfg(target_arch = "wasm32")]
+        {
+            let info = adapter.get_info();
+            tracing::info!(
+                "fusor: adapter subgroups={} subgroup_min={} subgroup_max={} shader_f16={} backend={:?} name={:?} (note: the wasm build never requests wgpu::Features::SUBGROUP, so subgroups_supported() stays false regardless of adapter support)",
+                adapter_features.contains(wgpu::Features::SUBGROUP),
+                info.subgroup_min_size,
+                info.subgroup_max_size,
+                adapter_features.contains(wgpu::Features::SHADER_F16),
+                info.backend,
+                info.name,
+            );
+        }
         let mut required_features = wgpu::Features::empty();
-        #[cfg(not(target_arch = "wasm32"))]
         if adapter_features.contains(wgpu::Features::SUBGROUP) {
             required_features |= wgpu::Features::SUBGROUP;
         }
@@ -235,7 +288,7 @@ impl Device {
                     required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
                 }
             } else {
-                eprintln!(
+                tracing::warn!(
                     "FUSOR_TRACE_GPU_KERNELS requested, but adapter does not support timestamp queries"
                 );
             }
@@ -265,8 +318,10 @@ impl Device {
         if std::env::var_os("FUSOR_TRACE_GPU_KERNELS").is_some()
             && !cooperative_matrix_properties.is_empty()
         {
-            eprintln!("Fusor cooperative matrix properties: {cooperative_matrix_properties:?}");
-            eprintln!("Fusor cooperative matrix caps: {cooperative_matrix_caps:?}");
+            tracing::info!(
+                "Fusor cooperative matrix properties: {cooperative_matrix_properties:?}"
+            );
+            tracing::info!("Fusor cooperative matrix caps: {cooperative_matrix_caps:?}");
         }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -277,6 +332,8 @@ impl Device {
                 ..Default::default()
             })
             .await?;
+
+        install_device_diagnostics(&device);
 
         let device = Arc::new(device);
         let queue = Arc::new(queue);
@@ -292,9 +349,13 @@ impl Device {
         let disable_subgroups = std::env::var_os("FUSOR_DISABLE_SUBGROUPS").is_some();
         let poison_allocations = std::env::var_os("FUSOR_DIRTY_BUFFERS").is_some();
 
+        let adapter_info = adapter.get_info();
+        let limits = adapter.limits();
         let inner = Arc::new(DeviceInner {
             device,
             adapter,
+            adapter_info,
+            limits,
             queue,
             kernel_cache,
             buffer_pool,
@@ -348,7 +409,7 @@ impl Device {
     }
 
     pub fn limits(&self) -> wgpu::Limits {
-        self.inner.adapter.limits()
+        self.inner.limits.clone()
     }
 
     #[doc(hidden)]
@@ -402,22 +463,22 @@ impl Device {
     /// (`is_fixed`). Pinning the true fixed width of 32 keeps those fast routes
     /// available.
     fn apple_fixed_subgroup_size(&self) -> Option<u32> {
-        let info = self.inner.adapter.get_info();
+        let info = &self.inner.adapter_info;
         (info.backend == wgpu::Backend::Metal && info.name.starts_with("Apple")).then_some(32)
     }
 
     pub fn min_subgroup_size(&self) -> u32 {
         self.apple_fixed_subgroup_size()
-            .unwrap_or_else(|| self.inner.adapter.get_info().subgroup_min_size)
+            .unwrap_or(self.inner.adapter_info.subgroup_min_size)
     }
 
     pub fn max_subgroup_size(&self) -> u32 {
         self.apple_fixed_subgroup_size()
-            .unwrap_or_else(|| self.inner.adapter.get_info().subgroup_max_size)
+            .unwrap_or(self.inner.adapter_info.subgroup_max_size)
     }
 
     pub(crate) fn backend(&self) -> wgpu::Backend {
-        self.inner.adapter.get_info().backend
+        self.inner.adapter_info.backend
     }
 
     pub fn fixed_width_subgroup_size(&self) -> Option<u32> {

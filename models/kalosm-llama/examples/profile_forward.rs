@@ -7,7 +7,7 @@ where
 {
     for _ in 0..warmup {
         if stream.next().await.is_none() {
-            eprintln!("stream ended during warmup");
+            tracing::warn!("stream ended during warmup");
             return;
         }
     }
@@ -69,6 +69,8 @@ fn source() -> LlamaSource {
 }
 
 fn main() {
+    let _ = tracing_subscriber::fmt::try_init();
+
     pollster::block_on(async {
         let warmup = env_usize("KALOSM_PROFILE_LLAMA_WARMUP", 4);
         let measured = env_usize("KALOSM_PROFILE_LLAMA_TOKENS", 16);

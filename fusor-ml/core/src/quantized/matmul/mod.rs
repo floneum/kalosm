@@ -71,9 +71,9 @@ fn hash_qmatmul_dispatch_layouts(
 }
 
 /// Build a qmatmul-direct cache key in either the operation-bound or
-/// module-only path. Both arms wrap the same `KernelVariantKey<M>(payload)`;
-/// the unbound arm additionally hashes `outer` into the module key.
-fn qmatmul_direct_module_key<M: 'static>(
+/// standalone path. Both arms wrap the same `KernelVariantKey<M>(payload)`;
+/// the unbound arm additionally hashes `outer` into the key.
+fn qmatmul_direct_cache_key<M: 'static>(
     payload_hash: impl Fn(&mut FxHasher),
     outer_hash: impl Fn(&mut FxHasher),
     dispatch_size: [u32; 3],
@@ -120,7 +120,6 @@ enum QMatmulPath {
     Tile { tile: CoopTile, cached: bool },
 }
 
-struct QMatmulDirectFastKernelVariant;
 struct QMatmulDirectEpilogueKernelVariant;
 
 const QMATMUL_DIRECT_KERNEL_GENERATION: u64 = 0x514D_4154_4D49_5832;
@@ -798,13 +797,9 @@ fn split_workgroups_2d(
     total_workgroups: u32,
     max_workgroups_per_dimension: u32,
 ) -> Option<[u32; 2]> {
-    if total_workgroups == 0 {
-        return Some([1, 1]);
-    }
-
     let max_workgroups_per_dimension = max_workgroups_per_dimension.max(1);
     let x = total_workgroups.min(max_workgroups_per_dimension);
-    let y = total_workgroups.div_ceil(x);
+    let y = total_workgroups.div_ceil(x.max(1)).max(1);
     (y <= max_workgroups_per_dimension).then_some([x, y])
 }
 

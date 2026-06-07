@@ -70,7 +70,7 @@ impl Device {
                     || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
                     || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some()
                 {
-                    eprintln!("fusor_device_auto_gpu_error={err}");
+                    tracing::warn!("fusor_device_auto_gpu_error={err}");
                 }
                 Device::Cpu
             }

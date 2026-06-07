@@ -126,6 +126,19 @@ impl Cache {
         source: &FileSource,
         progress: &mut impl FnMut(FileLoadingProgress),
     ) -> Result<Vec<u8>, CacheError> {
+        self.get_opfs_file(source, progress).await?.read_all().await
+    }
+
+    /// WASM: Get an OPFS file handle using persistent caching.
+    ///
+    /// This validates or downloads the cache entry, then returns a range-readable
+    /// handle without reading the whole file into wasm memory.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn get_opfs_file(
+        &self,
+        source: &FileSource,
+        progress: &mut impl FnMut(FileLoadingProgress),
+    ) -> Result<crate::opfs::OpfsFile, CacheError> {
         use crate::opfs::{
             close_writable_stream, seek_writable_stream, write_chunk_to_stream, OpfsCache,
         };
@@ -171,14 +184,13 @@ impl Cache {
                 if let Some(expected) = expected_size {
                     if local_size == expected {
                         // Cache hit - file is complete
-                        let bytes = opfs.read_file(&cache_dir, &safe_file).await?;
                         progress(FileLoadingProgress {
                             progress: local_size,
                             cached_size: local_size,
                             size: local_size,
                             start_time: None,
                         });
-                        return Ok(bytes);
+                        return opfs.open_file(&cache_dir, &safe_file).await;
                     } else if local_size > expected {
                         // File is corrupted (larger than expected), delete and start fresh
                         let _ = opfs.delete_file(&cache_dir, &safe_file).await;
@@ -208,14 +220,13 @@ impl Cache {
                 // Handle 416 Range Not Satisfiable
                 if status == StatusCode::RANGE_NOT_SATISFIABLE {
                     if local_size > 0 {
-                        let bytes = opfs.read_file(&cache_dir, &safe_file).await?;
                         progress(FileLoadingProgress {
                             progress: local_size,
                             cached_size: local_size,
                             size: local_size,
                             start_time: None,
                         });
-                        return Ok(bytes);
+                        return opfs.open_file(&cache_dir, &safe_file).await;
                     }
                     // local_size is 0 but we got 416 - something is wrong, restart fresh
                     response = client
@@ -259,33 +270,11 @@ impl Cache {
 
                     // Already complete
                     if actual_start == size {
-                        return opfs.read_file(&cache_dir, &safe_file).await;
+                        return opfs.open_file(&cache_dir, &safe_file).await;
                     }
                 }
 
-                // 7. If resuming, try to read existing data first
-                let mut all_bytes = if resuming && actual_start > 0 {
-                    match opfs.read_file(&cache_dir, &safe_file).await {
-                        Ok(existing) => existing,
-                        Err(e) => {
-                            // Can't read existing file - delete it and return error
-                            // The next call will start fresh
-                            tracing::warn!(
-                                "[OPFS] Can't read existing file for resume: {}, deleting",
-                                e
-                            );
-                            let _ = opfs.delete_file(&cache_dir, &safe_file).await;
-                            return Err(CacheError::OpfsError(format!(
-                                "Failed to read partial download for resume: {}. File deleted, please retry.",
-                                e
-                            )));
-                        }
-                    }
-                } else {
-                    Vec::new()
-                };
-
-                // 8. Create writable stream and download
+                // 7. Create writable stream and download
                 let mut writable = opfs
                     .create_writable(&cache_dir, &safe_file, resuming)
                     .await?;
@@ -304,7 +293,6 @@ impl Cache {
                 while let Some(chunk_result) = stream.next().await {
                     let chunk = chunk_result?;
                     write_chunk_to_stream(&writable, &chunk).await?;
-                    all_bytes.extend_from_slice(&chunk);
 
                     current_progress += chunk.len() as u64;
                     bytes_since_flush += chunk.len() as u64;
@@ -329,7 +317,7 @@ impl Cache {
 
                 close_writable_stream(&writable).await?;
 
-                Ok(all_bytes)
+                opfs.open_file(&cache_dir, &safe_file).await
             }
             FileSource::Local(_) => Err(CacheError::Io(std::io::Error::other(
                 "Local file access not supported on WASM",

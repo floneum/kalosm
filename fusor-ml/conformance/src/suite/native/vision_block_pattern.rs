@@ -157,7 +157,7 @@ pub async fn vision_block_pattern_flush_vs_no_flush_timing() {
             flush_total += t.elapsed();
         }
 
-        eprintln!(
+        tracing::info!(
             "device={device:?} blocks={BLOCKS} iters={ITERS}: no_flush_avg={:.2?} flush_every_4_avg={:.2?}",
             no_flush_total / ITERS as u32,
             flush_total / ITERS as u32,

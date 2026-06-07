@@ -43,6 +43,9 @@ members = [
     "fusor-ml/webgpu-runner",
 ]
 
+[patch.crates-io]
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now" }
+
 [workspace.dependencies]
 kalosm = { path = "./interfaces/kalosm", version = "0.4.0", default-features = false }
 kalosm-sample = { path = "./interfaces/kalosm-sample", version = "0.4.0" }
@@ -90,6 +93,7 @@ pollster = "0.4"
 serde = { version = "1.0.163", features = ["derive"], optional = true }
 surrealdb = { version = "2.4.0", default-features = false, optional = true }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"], optional = true }
+tracing = { version = "0.1.40", optional = true }
 tracing-subscriber = { version = "0.2", optional = true }
 
 [features]
@@ -154,7 +158,7 @@ tokio = [
     "kalosm/tokio",
     "kalosm-language?/tokio",
 ]
-tracing-subscriber = ["dep:tracing-subscriber"]
+tracing-subscriber = ["dep:tracing-subscriber", "dep:tracing"]
 
 [[example]]
 name = "axum"
@@ -372,7 +376,7 @@ required-features = [
 [[example]]
 name = "vision"
 path = "interfaces/kalosm/examples/vision.rs"
-required-features = ["llama-vision", "tracing-subscriber"]
+required-features = ["llama-vision", "tokio", "tracing-subscriber"]
 
 [profile.dist]
 inherits = "release"

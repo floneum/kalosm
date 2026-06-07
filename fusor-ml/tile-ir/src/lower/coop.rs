@@ -181,6 +181,10 @@ impl<'a> Lowerer<'a> {
                         data: CooperativeData {
                             pointer: ptr,
                             stride,
+                            // Metal's simdgroup matrix orientation makes
+                            // row-major A/B fragments multiply as B * A.
+                            // Keep Fusor's logical A * B by holding coop
+                            // fragments transposed internally.
                             row_major: false,
                         },
                     },
@@ -206,7 +210,9 @@ impl<'a> Lowerer<'a> {
                         data: CooperativeData {
                             pointer: ptr,
                             stride,
-                            row_major: true,
+                            // C-broadcast participates in the same transposed
+                            // accumulator representation as A/B fragments.
+                            row_major: false,
                         },
                     },
                 ))
@@ -799,7 +805,9 @@ impl<'a> Lowerer<'a> {
                 data: CooperativeData {
                     pointer: storage_ptr,
                     stride,
-                    row_major,
+                    // Accumulators are transposed internally; invert the
+                    // destination layout flag to write logical row/col order.
+                    row_major: !row_major,
                 },
             },
             Span::default(),
@@ -842,9 +850,9 @@ impl<'a> Lowerer<'a> {
         }
         let strides = layout.affine_strides();
         if strides[1] == 1 {
-            Ok((strides[0], false))
+            Ok((strides[0], true))
         } else if strides[0] == 1 {
-            Ok((strides[1], true))
+            Ok((strides[1], false))
         } else {
             Err(LowerError::UnsupportedOperation(
                 "cooperative store requires row-major or column-major output strides",

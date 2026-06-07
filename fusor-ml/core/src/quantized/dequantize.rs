@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
@@ -111,6 +113,14 @@ impl DequantizeOperation {
 }
 
 impl Operation for DequantizeOperation {
+    fn hash_kernel_fields(&self, state: &mut rustc_hash::FxHasher) {
+        self.matrix.datatype().hash(state);
+        self.matrix.storage_layout().hash(state);
+        self.matrix.shape().hash(state);
+        self.datatype.hash(state);
+        self.post_dequantize.hash(state);
+    }
+
     fn workgroup_shape_constraints(
         &self,
         _device: &Device,
@@ -190,7 +200,7 @@ impl Operation for DequantizeOperation {
             .max_compute_workgroups_per_dimension
             .max(1);
         let dispatch_x = workgroups.min(max_workgroups);
-        let dispatch_y = workgroups.div_ceil(dispatch_x);
+        let dispatch_y = workgroups.div_ceil(dispatch_x.max(1)).max(1);
         if dispatch_y > max_workgroups {
             return None;
         }
@@ -204,7 +214,7 @@ impl Operation for DequantizeOperation {
         let output_buffer = output.buffer().clone();
         let output_layout = tile_ir::Layout::contiguous(
             tile_ir::MemoryLevel::Storage,
-            tile_ir::Shape::new([total]),
+            tile_ir::Shape::new([total.max(1)]),
         );
         let output_datatype = self.datatype;
         kernel_backend::run_kernel(

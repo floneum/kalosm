@@ -68,7 +68,12 @@ where
             (Tensor::Gpu(q), Tensor::Gpu(k_gpu), Tensor::Gpu(v_gpu))
                 if !matches!(mask, Some((_, MaskKind::BatchKeyMask))) =>
             {
-                if !q.device().subgroups_supported() {
+                // Decode (q_seq_len == 1) runs the DecodeSmall attention kernel,
+                // which uses workgroup reductions and needs no subgroups, so it
+                // works on browser adapters that report no subgroup support. Only
+                // the prefill/streaming kernels require subgroups — keep the
+                // fallback for those (q_seq_len > 1).
+                if !q.device().subgroups_supported() && self.shape()[2] != 1 {
                     #[cfg(target_arch = "wasm32")]
                     {
                         return self.flash_attention_composite_impl(k, v, scale, mask);

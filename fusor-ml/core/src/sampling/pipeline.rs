@@ -4,6 +4,7 @@ use crate::{
     tensor::{DataTypeEnum, LazyTensorData, TensorData},
 };
 use web_time::Instant;
+
 use wgpu::CommandEncoder;
 
 use super::{
@@ -69,14 +70,15 @@ pub(crate) async fn qmat_mirostat2_sample_token_to_host(
                 label: Some("qmat_mirostat2_sample_token_to_host encoder"),
             });
 
-    let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+    let trace = cfg!(target_arch = "wasm32")
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
     let qmat_start = trace.then(Instant::now);
     let Some(logits) = qmat_logits_data_with_encoder(hidden, matrix, &mut encoder) else {
         return Ok(None);
     };
     if let Some(start) = qmat_start {
-        eprintln!(
+        tracing::info!(
             "sampler_trace qmat_logits_setup elapsed={:?}",
             start.elapsed()
         );
@@ -146,7 +148,7 @@ pub(crate) async fn qmat_mirostat2_sample_token_to_host(
                 }
             }
         }
-        eprintln!(
+        tracing::warn!(
             "sampler_debug HIDDEN len={} nan={} +inf={} -inf={} finite={} min={} max={} first8={:?}",
             hidden_vec.len(),
             nan,
@@ -183,14 +185,15 @@ pub(crate) async fn qmat_mirostat2_sample_lazy_token_to_host(
         return Ok(None);
     }
 
-    let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+    let trace = cfg!(target_arch = "wasm32")
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
     let qmat_start = trace.then(Instant::now);
     let (materialized_hidden, _, logits) = hidden.materialize_with_tail(|hidden_data, encoder| {
         qmat_logits_data_with_encoder(hidden_data, matrix, encoder)
     });
     if let Some(start) = qmat_start {
-        eprintln!(
+        tracing::info!(
             "sampler_trace qmat_logits_tail elapsed={:?}",
             start.elapsed()
         );
@@ -253,14 +256,15 @@ pub(crate) async fn qmat_standard_sample_lazy_token_to_host(
         return Ok(None);
     }
 
-    let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+    let trace = cfg!(target_arch = "wasm32")
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
     let qmat_start = trace.then(Instant::now);
     let (materialized_hidden, _, logits) = hidden.materialize_with_tail(|hidden_data, encoder| {
         qmat_logits_data_with_encoder(hidden_data, matrix, encoder)
     });
     if let Some(start) = qmat_start {
-        eprintln!(
+        tracing::info!(
             "sampler_trace qmat_standard_logits_tail elapsed={:?}",
             start.elapsed()
         );
@@ -356,12 +360,13 @@ pub(crate) fn qmat_mirostat2_sample_lazy_token_pending(
         return None;
     }
 
-    let qmat_start = (std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+    let qmat_start = (cfg!(target_arch = "wasm32")
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some())
     .then(Instant::now);
     let (materialized_hidden, _) = hidden.materialize();
     if let Some(start) = qmat_start {
-        eprintln!(
+        tracing::info!(
             "sampler_trace hidden_materialize_pending elapsed={:?}",
             start.elapsed()
         );
@@ -406,12 +411,13 @@ pub(crate) fn qmat_standard_sample_lazy_token_pending(
         return None;
     }
 
-    let qmat_start = (std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+    let qmat_start = (cfg!(target_arch = "wasm32")
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some())
     .then(Instant::now);
     let (materialized_hidden, _) = hidden.materialize();
     if let Some(start) = qmat_start {
-        eprintln!(
+        tracing::info!(
             "sampler_trace standard_hidden_materialize_pending elapsed={:?}",
             start.elapsed()
         );
@@ -552,7 +558,7 @@ fn sample_processed_logits_pending(
             chunks,
             input_len,
             candidate_count,
-            trace: false,
+            trace: cfg!(target_arch = "wasm32"),
             encoder_label: "mirostat2_sample_token_pending encoder",
         },
         &mut initial_encoder,
@@ -659,7 +665,7 @@ fn build_sample_attempt(
         }
     };
     if let Some(start) = topk_start {
-        eprintln!("sampler_trace topk_setup elapsed={:?}", start.elapsed());
+        tracing::info!("sampler_trace topk_setup elapsed={:?}", start.elapsed());
     }
 
     let merge_start = config.trace.then(Instant::now);
@@ -676,7 +682,7 @@ fn build_sample_attempt(
         Some(&mut encoder),
     )?;
     if let Some(start) = merge_start {
-        eprintln!("sampler_trace merge_setup elapsed={:?}", start.elapsed());
+        tracing::info!("sampler_trace merge_setup elapsed={:?}", start.elapsed());
     }
 
     let exactness_start = config.trace.then(Instant::now);
@@ -695,7 +701,7 @@ fn build_sample_attempt(
             None
         };
     if let Some(start) = exactness_start {
-        eprintln!(
+        tracing::info!(
             "sampler_trace exactness_setup elapsed={:?}",
             start.elapsed()
         );
@@ -711,7 +717,7 @@ fn build_sample_attempt(
         Some(&mut encoder),
     )?;
     if let Some(start) = sample_start {
-        eprintln!("sampler_trace sample_setup elapsed={:?}", start.elapsed());
+        tracing::info!("sampler_trace sample_setup elapsed={:?}", start.elapsed());
     }
 
     Some((output, ids, values, encoder))
@@ -764,7 +770,7 @@ fn build_standard_sample_attempt(
         }
     };
     if let Some(start) = topk_start {
-        eprintln!(
+        tracing::info!(
             "sampler_trace standard_topk_setup elapsed={:?}",
             start.elapsed()
         );
@@ -784,7 +790,7 @@ fn build_standard_sample_attempt(
         Some(&mut encoder),
     )?;
     if let Some(start) = merge_start {
-        eprintln!(
+        tracing::info!(
             "sampler_trace standard_merge_setup elapsed={:?}",
             start.elapsed()
         );
@@ -806,7 +812,7 @@ fn build_standard_sample_attempt(
             None
         };
     if let Some(start) = exactness_start {
-        eprintln!(
+        tracing::info!(
             "sampler_trace standard_exactness_setup elapsed={:?}",
             start.elapsed()
         );
@@ -821,7 +827,7 @@ fn build_standard_sample_attempt(
         Some(&mut encoder),
     )?;
     if let Some(start) = sample_start {
-        eprintln!(
+        tracing::info!(
             "sampler_trace standard_sample_setup elapsed={:?}",
             start.elapsed()
         );
@@ -863,7 +869,7 @@ fn sample_processed_standard_logits_pending(
             chunks,
             input_len,
             candidate_count,
-            trace: false,
+            trace: cfg!(target_arch = "wasm32"),
             encoder_label: "standard_sample_token_pending encoder",
         },
         &mut initial_encoder,
@@ -895,7 +901,8 @@ async fn sample_processed_standard_logits_to_host(
 
     let chunks = input_len.div_ceil(TOP_K_CHUNK);
     let mut candidate_count = initial_sampler_candidate_count(top_k, chunks);
-    let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+    let trace = cfg!(target_arch = "wasm32")
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
     let mut attempt = 0usize;
     loop {
@@ -931,7 +938,7 @@ async fn sample_processed_standard_logits_to_host(
         let submit_start = trace.then(Instant::now);
         device.wgpu_queue().submit(Some(encoder.finish()));
         if let Some(start) = submit_start {
-            eprintln!(
+            tracing::info!(
                 "sampler_trace standard_submit elapsed={:?}",
                 start.elapsed()
             );
@@ -948,7 +955,7 @@ async fn sample_processed_standard_logits_to_host(
         device.poll_wait();
         receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
         if let Some(start) = map_start {
-            eprintln!(
+            tracing::info!(
                 "sampler_trace standard_map_wait elapsed={:?}",
                 start.elapsed()
             );
@@ -972,7 +979,7 @@ async fn sample_processed_standard_logits_to_host(
         match status {
             GPU_SAMPLE_STATUS_SAMPLED => {
                 if trace {
-                    eprintln!(
+                    tracing::info!(
                         "sampler_trace standard_sampled attempt={attempt} top_k={top_k} chunks={chunks} candidate_count={candidate_count} token={token}"
                     );
                 }
@@ -980,14 +987,14 @@ async fn sample_processed_standard_logits_to_host(
             }
             GPU_SAMPLE_STATUS_RETRY_NEEDED => {
                 if trace {
-                    eprintln!(
+                    tracing::info!(
                         "sampler_trace standard_retry attempt={attempt} top_k={top_k} chunks={chunks} candidate_count={candidate_count}"
                     );
                 }
             }
             _ => {
                 if trace {
-                    eprintln!(
+                    tracing::warn!(
                         "sampler_trace standard_invalid attempt={attempt} top_k={top_k} chunks={chunks} candidate_count={candidate_count} status={status}"
                     );
                 }
@@ -1023,7 +1030,8 @@ async fn sample_processed_logits_to_host(
 
     let chunks = input_len.div_ceil(TOP_K_CHUNK);
     let mut candidate_count = initial_sampler_candidate_count(top_k, chunks);
-    let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+    let trace = cfg!(target_arch = "wasm32")
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
     let debug_dump = std::env::var_os("FUSOR_DEBUG_SAMPLER").is_some();
     let mut attempt = 0usize;
@@ -1091,7 +1099,7 @@ async fn sample_processed_logits_to_host(
         let submit_start = trace.then(Instant::now);
         device.wgpu_queue().submit(Some(encoder.finish()));
         if let Some(start) = submit_start {
-            eprintln!("sampler_trace submit elapsed={:?}", start.elapsed());
+            tracing::info!("sampler_trace submit elapsed={:?}", start.elapsed());
         }
 
         let map_start = trace.then(Instant::now);
@@ -1105,7 +1113,7 @@ async fn sample_processed_logits_to_host(
         device.poll_wait();
         receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
         if let Some(start) = map_start {
-            eprintln!("sampler_trace map_wait elapsed={:?}", start.elapsed());
+            tracing::info!("sampler_trace map_wait elapsed={:?}", start.elapsed());
         }
 
         let view = download.slice(..).get_mapped_range();
@@ -1126,7 +1134,7 @@ async fn sample_processed_logits_to_host(
         match status {
             GPU_SAMPLE_STATUS_SAMPLED => {
                 if trace {
-                    eprintln!(
+                    tracing::info!(
                         "sampler_trace sampled attempt={attempt} top_k={top_k} chunks={chunks} candidate_count={candidate_count} token={token}"
                     );
                 }
@@ -1134,14 +1142,14 @@ async fn sample_processed_logits_to_host(
             }
             GPU_SAMPLE_STATUS_RETRY_NEEDED => {
                 if trace {
-                    eprintln!(
+                    tracing::info!(
                         "sampler_trace retry attempt={attempt} top_k={top_k} chunks={chunks} candidate_count={candidate_count}"
                     );
                 }
             }
             _ => {
                 if trace {
-                    eprintln!(
+                    tracing::warn!(
                         "sampler_trace invalid attempt={attempt} top_k={top_k} chunks={chunks} candidate_count={candidate_count} status={status}"
                     );
                 }
@@ -1205,7 +1213,7 @@ async fn sample_processed_logits_to_host(
                             }
                         }
                     }
-                    eprintln!(
+                    tracing::warn!(
                         "sampler_debug INVALID ids={:?} values={:?} logits_len={} nan={} +inf={} -inf={} finite={} min={} max={} argmax={} first8={:?} previous_tokens_last={:?}",
                         ids_vec,
                         vals_vec,

@@ -1,4 +1,8 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use web_time::{Duration, Instant};
 
 #[cfg(feature = "vision")]
@@ -44,7 +48,7 @@ pub(crate) fn debug_check_nan_f32<const R: usize>(
             }
         }
         if nan > 0 || pos_inf > 0 || neg_inf > 0 {
-            eprintln!(
+            tracing::warn!(
                 "trace_nan layer={layer} label={label} index_pos={index_pos} shape={:?} nan={nan} (first_nan_indices={:?}) +inf={pos_inf} -inf={neg_inf} max_abs={max_abs}",
                 t.shape(),
                 &sample_vals[..sample_idx]
@@ -83,6 +87,7 @@ use fusor::{
     AddOp, CastTensor, CastTo, FloatDataType, FloatOps, MatmulImpl, MulOp, SimdBinaryOp,
     SimdElement, SimdReduceOp, SumOp,
 };
+use fusor::{AsyncReadRange, AsyncShardedVarBuilder};
 use fusor::{Device, Result, Tensor};
 use fusor_gguf::GgufMetadata;
 use fusor_gguf::GgufValue;
@@ -185,14 +190,103 @@ pub(crate) struct EncodedTokens<F: FloatDataType + SimdElement> {
     pos_ids: Option<Tensor<2, F>>,
 }
 
+pub(crate) trait LlamaVarSource {
+    fn get(&self, name: &str) -> Result<&GgufValue>;
+
+    fn tensor<'a>(
+        &'a mut self,
+        name: &'a str,
+        device: &'a Device,
+    ) -> Pin<Box<dyn Future<Output = Result<QMatrix>> + 'a>>;
+}
+
+impl<R: std::io::Read + std::io::Seek> LlamaVarSource for ShardedVarBuilder<R> {
+    fn get(&self, name: &str) -> Result<&GgufValue> {
+        ShardedVarBuilder::get(self, name)
+    }
+
+    fn tensor<'a>(
+        &'a mut self,
+        name: &'a str,
+        device: &'a Device,
+    ) -> Pin<Box<dyn Future<Output = Result<QMatrix>> + 'a>> {
+        Box::pin(std::future::ready(ShardedVarBuilder::tensor(
+            self, name, device,
+        )))
+    }
+}
+
+impl<R: AsyncReadRange> LlamaVarSource for AsyncShardedVarBuilder<R> {
+    fn get(&self, name: &str) -> Result<&GgufValue> {
+        AsyncShardedVarBuilder::get(self, name)
+    }
+
+    fn tensor<'a>(
+        &'a mut self,
+        name: &'a str,
+        device: &'a Device,
+    ) -> Pin<Box<dyn Future<Output = Result<QMatrix>> + 'a>> {
+        Box::pin(AsyncShardedVarBuilder::tensor(self, name, device))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn block_on_ready<F: Future>(future: F) -> F::Output {
+    fn clone(_: *const ()) -> RawWaker {
+        noop_raw_waker()
+    }
+
+    fn wake(_: *const ()) {}
+
+    fn noop_raw_waker() -> RawWaker {
+        RawWaker::new(
+            std::ptr::null(),
+            &RawWakerVTable::new(clone, wake, wake, wake),
+        )
+    }
+
+    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(output) => output,
+        Poll::Pending => panic!("synchronous GGUF model loading unexpectedly yielded"),
+    }
+}
+
 impl<F: FloatDataType + SimdElement + FloatOps + MatmulImpl> Model<F>
 where
     MulOp: SimdBinaryOp<F>,
     AddOp: SimdBinaryOp<F>,
     SumOp: SimdReduceOp<F>,
 {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
         source: &mut ShardedVarBuilder<R>,
+        vision_ct: Option<GgufMetadata>,
+        vision_bytes: Option<Vec<u8>>,
+        device: &Device,
+        override_stop_token_string: Option<String>,
+        override_chat_template: Option<String>,
+        rope_scaling: Option<RopeScalingConfig>,
+    ) -> std::result::Result<Self, LlamaSourceError>
+    where
+        f32: CastTensor<F> + CastTo<F>,
+        F: CastTensor<f32> + CastTo<f32>,
+    {
+        block_on_ready(Self::from_var_source(
+            source,
+            vision_ct,
+            vision_bytes,
+            device,
+            override_stop_token_string,
+            override_chat_template,
+            rope_scaling,
+        ))
+    }
+
+    pub(crate) async fn from_var_source<S: LlamaVarSource>(
+        source: &mut S,
         vision_ct: Option<GgufMetadata>,
         vision_bytes: Option<Vec<u8>>,
         device: &Device,
@@ -322,6 +416,7 @@ where
 
         let rope_freq_weight: Option<Tensor<1, F>> = source
             .tensor("rope_freqs.weight", device)
+            .await
             .ok()
             .map(&dequantize_1d);
 
@@ -375,40 +470,55 @@ where
             })
             .transpose()?;
 
-        let tok_embeddings_q = source.tensor("token_embd.weight", device)?;
+        let tok_embeddings_q = source.tensor("token_embd.weight", device).await?;
         let tok_embedding_scale =
             (&*architecture == "gemma3").then(|| (embedding_length as f32).sqrt());
         let tok_embeddings = Embedding::new(tok_embeddings_q.clone());
 
-        let norm = source.tensor("output_norm.weight", device)?;
+        let norm = source.tensor("output_norm.weight", device).await?;
         let norm = decode_norm(norm, rms_norm_eps)?;
-        let output = source.tensor("output.weight", device).unwrap_or_else(|_| {
-            // If there is no output layer, assume the word embeddings are tied to the output
-            tok_embeddings_q.clone()
-        });
+        let output = match source.tensor("output.weight", device).await {
+            Ok(output) => output,
+            Err(_) => {
+                // If there is no output layer, assume the word embeddings are tied to the output
+                tok_embeddings_q.clone()
+            }
+        };
         let mut layers = Vec::with_capacity(block_count);
         let interleaved_rope = architecture.as_ref() != "qwen2"
             && architecture.as_ref() != "qwen3"
             && architecture.as_ref() != "gemma3";
         for layer_idx in 0..block_count {
             let prefix = format!("blk.{layer_idx}");
-            let attention_variant = if let Ok(attention_qkv) =
-                source.tensor(&format!("{prefix}.attn_qkv.weight"), device)
+            let attention_variant = if let Ok(attention_qkv) = source
+                .tensor(&format!("{prefix}.attn_qkv.weight"), device)
+                .await
             {
                 AttentionVariant::Grouped(GroupedAttention {
                     attention_qkv,
                     interleaved_rope,
                 })
             } else {
-                let q = source.tensor(&format!("{prefix}.attn_q.weight"), device)?;
-                let k = source.tensor(&format!("{prefix}.attn_k.weight"), device)?;
-                let v = source.tensor(&format!("{prefix}.attn_v.weight"), device)?;
+                let q = source
+                    .tensor(&format!("{prefix}.attn_q.weight"), device)
+                    .await?;
+                let k = source
+                    .tensor(&format!("{prefix}.attn_k.weight"), device)
+                    .await?;
+                let v = source
+                    .tensor(&format!("{prefix}.attn_v.weight"), device)
+                    .await?;
                 let qkv = QMatrix::concat_rows(&[&q, &k, &v]);
-                let bias = if let (Ok(bias_q), Ok(bias_k), Ok(bias_v)) = (
-                    source.tensor(&format!("{prefix}.attn_q.bias"), device),
-                    source.tensor(&format!("{prefix}.attn_k.bias"), device),
-                    source.tensor(&format!("{prefix}.attn_v.bias"), device),
-                ) {
+                let bias_q = source
+                    .tensor(&format!("{prefix}.attn_q.bias"), device)
+                    .await;
+                let bias_k = source
+                    .tensor(&format!("{prefix}.attn_k.bias"), device)
+                    .await;
+                let bias_v = source
+                    .tensor(&format!("{prefix}.attn_v.bias"), device)
+                    .await;
+                let bias = if let (Ok(bias_q), Ok(bias_k), Ok(bias_v)) = (bias_q, bias_k, bias_v) {
                     Some(AttentionBias::new(
                         dequantize_1d(bias_q),
                         dequantize_1d(bias_k),
@@ -419,9 +529,11 @@ where
                 };
                 let q_norm = source
                     .tensor(&format!("{prefix}.attn_q_norm.weight"), device)
+                    .await
                     .ok();
                 let k_norm = source
                     .tensor(&format!("{prefix}.attn_k_norm.weight"), device)
+                    .await
                     .ok();
                 let separate = SeparateAttention {
                     attention_wq: q,
@@ -439,15 +551,21 @@ where
                 };
                 AttentionVariant::Separate(Box::new(separate))
             };
-            let attention_wo = source.tensor(&format!("{prefix}.attn_output.weight"), device)?;
+            let attention_wo = source
+                .tensor(&format!("{prefix}.attn_output.weight"), device)
+                .await?;
             // Try to read from the up, down and gate weights
-            let feed_forward_variant = if let Ok(ffn_gate) =
-                source.tensor(&format!("{prefix}.ffn_gate.weight"), device)
+            let feed_forward_variant = if let Ok(ffn_gate) = source
+                .tensor(&format!("{prefix}.ffn_gate.weight"), device)
+                .await
             {
                 let feed_forward_w1 = ffn_gate;
-                let feed_forward_w2 =
-                    source.tensor(&format!("{prefix}.ffn_down.weight"), device)?;
-                let feed_forward_w3 = source.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
+                let feed_forward_w2 = source
+                    .tensor(&format!("{prefix}.ffn_down.weight"), device)
+                    .await?;
+                let feed_forward_w3 = source
+                    .tensor(&format!("{prefix}.ffn_up.weight"), device)
+                    .await?;
                 FeedForwardVariant::Llama(Box::new(LlamaFeedForward::new(
                     feed_forward_w1,
                     feed_forward_w2,
@@ -455,9 +573,13 @@ where
                 )))
             } else {
                 // Otherwise, try to read from the up, and down weights
-                let up = source.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
+                let up = source
+                    .tensor(&format!("{prefix}.ffn_up.weight"), device)
+                    .await?;
                 // Transpose the down tensor
-                let down = source.tensor(&format!("{prefix}.ffn_down.weight"), device)?;
+                let down = source
+                    .tensor(&format!("{prefix}.ffn_down.weight"), device)
+                    .await?;
                 let feed_forward_length = source.get(".feed_forward_length")?.to_u32()? as usize;
 
                 FeedForwardVariant::Phi(PhiFeedForward {
@@ -466,13 +588,19 @@ where
                     feed_forward_length,
                 })
             };
-            let attention_norm = source.tensor(&format!("{prefix}.attn_norm.weight"), device)?;
+            let attention_norm = source
+                .tensor(&format!("{prefix}.attn_norm.weight"), device)
+                .await?;
             let post_attention_norm = source
                 .tensor(&format!("{prefix}.post_attention_norm.weight"), device)
+                .await
                 .ok();
-            let ffn_norm = source.tensor(&format!("{prefix}.ffn_norm.weight"), device)?;
+            let ffn_norm = source
+                .tensor(&format!("{prefix}.ffn_norm.weight"), device)
+                .await?;
             let ffn_post_norm = source
                 .tensor(&format!("{prefix}.post_ffw_norm.weight"), device)
+                .await
                 .ok();
 
             let mut layer_sliding_window_size = None;
@@ -816,9 +944,10 @@ where
             seq_len > 1 || std::env::var_os("KALOSM_TRACE_FORWARD_TIMING").is_some();
         if trace_forward_timing {
             if let Some(encode_elapsed) = encode_elapsed {
-                eprintln!(
+                tracing::info!(
                     "[timing] encode_tokens (incl. vision): {:.2?} seq_len={}",
-                    encode_elapsed, seq_len
+                    encode_elapsed,
+                    seq_len
                 );
             }
         }
@@ -911,7 +1040,7 @@ where
             }
         }
         if trace_forward_timing {
-            eprintln!("[timing] text layer loop: {:.2?}", t_text_layers.elapsed());
+            tracing::info!("[timing] text layer loop: {:.2?}", t_text_layers.elapsed());
         }
         let x = self.norm.forward_generic(&layer_in);
         let x = x.i((.., seq_len - 1, ..));

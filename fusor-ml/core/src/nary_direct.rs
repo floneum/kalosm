@@ -1,11 +1,11 @@
-use std::{hash::Hash, sync::Arc, sync::OnceLock};
+use std::hash::Hash;
 
 use fusor_tile_ir as tile_ir;
 
 use crate::{
     mir::{
         inputs::MirValue,
-        kernel_backend::{self, DirectKernel, DirectKernelBinding},
+        kernel_backend::{self, DirectKernel},
         operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
@@ -15,14 +15,8 @@ use crate::{
 
 const BLOCK: usize = 256;
 const SMALL_BLOCK: usize = 1;
-const NARY_DIRECT_MODULE_CACHE_SIZE: usize = 1024;
 
 struct NaryDirectKernelVariant;
-
-fn nary_direct_module_cache() -> &'static kernel_backend::ModuleCache {
-    static CACHE: OnceLock<kernel_backend::ModuleCache> = OnceLock::new();
-    CACHE.get_or_init(|| kernel_backend::module_cache(NARY_DIRECT_MODULE_CACHE_SIZE))
-}
 
 pub(crate) fn build_nary_direct_kernel(
     operation: &NaryOperation,
@@ -81,48 +75,35 @@ fn build_nary_direct_kernel_with_output_index(
         kernel_backend::KernelVariantKey::with_payload::<NaryDirectKernelVariant>(|state| {
             output_index.hash(state);
         });
-    let module_key = operation.kernel_module_key_with_dispatch(
+    let cache_key = operation.kernel_cache_key_with_dispatch(
         variant,
         Some(workgroup_shape),
         dispatch_size,
         inputs,
     );
-    let kernel =
-        kernel_backend::cached_hashed_naga(nary_direct_module_cache(), module_key, || {
-            let ir = if small_dispatch {
-                build_nary_tile_ir::<SMALL_BLOCK>(operation, &tensors, output_index, dispatch_size)?
-            } else {
-                build_nary_tile_ir::<BLOCK>(operation, &tensors, output_index, dispatch_size)?
-            };
-            Some(Arc::new(ir.lower_to_naga().ok()?))
-        })?;
-    let cached = graph
-        .device()
-        .kernel_cache()
-        .get_or_insert_kernel(module_key, || kernel);
-
-    let bindings = tensors
-        .iter()
-        .enumerate()
-        .map(|(binding, tensor)| DirectKernelBinding {
-            binding: binding as u32,
-            buffer: tensor.buffer().clone(),
-            read_only: binding != output_index,
-        })
-        .collect();
-
     let name = if std::env::var_os("FUSOR_TRACE_DECODE_NAMES").is_some() {
         operation.name()
     } else {
         format!("nary_direct_out_{output_index}")
     };
-
-    Some(DirectKernel::from_cached(
+    let buffers = tensors
+        .iter()
+        .map(|tensor| tensor.buffer().clone())
+        .collect::<Vec<_>>();
+    kernel_backend::dynamic_kernel_from_ir(
+        graph.device().kernel_cache(),
         name,
-        cached,
-        bindings,
+        cache_key,
+        move || {
+            if small_dispatch {
+                build_nary_tile_ir::<SMALL_BLOCK>(operation, &tensors, output_index, dispatch_size)
+            } else {
+                build_nary_tile_ir::<BLOCK>(operation, &tensors, output_index, dispatch_size)
+            }
+        },
+        buffers,
         dispatch_size,
-    ))
+    )
 }
 
 fn total_elements(shape: &[usize]) -> Option<u32> {

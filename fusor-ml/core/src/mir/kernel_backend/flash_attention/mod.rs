@@ -1,5 +1,3 @@
-use std::sync::OnceLock;
-
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
 
@@ -9,7 +7,6 @@ use crate::{
     kernel_selection::{
         Axis, DimConstraint, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, range,
     },
-    mir::kernel_backend,
     tensor::TensorData,
 };
 
@@ -22,17 +19,11 @@ const DECODE_MID_BLOCK: u32 = 256;
 const DECODE_MEDIUM_BLOCK: u32 = 512;
 const DECODE_LARGE_BLOCK: u32 = 1024;
 pub(crate) const MIN_DECODE_KV_SEQ: usize = 32;
-const FLASH_ATTENTION_MODULE_CACHE_SIZE: usize = 128;
 /// Hardware subgroup sizes the streaming flash kernel emits IR for. The
 /// kernel layout assumes one subgroup per output dim and uses subgroup
 /// reductions across a `SIZE`-wide KV chunk, so the runtime subgroup width
 /// must match one of these exactly.
 const FLASH_STREAMING_SUBGROUP_SIZES: &[u32] = &[4, 8, 16, 32, 64];
-
-fn flash_attention_module_cache() -> &'static kernel_backend::ModuleCache {
-    static CACHE: OnceLock<kernel_backend::ModuleCache> = OnceLock::new();
-    CACHE.get_or_init(|| kernel_backend::module_cache(FLASH_ATTENTION_MODULE_CACHE_SIZE))
-}
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_streaming_flash_attention(

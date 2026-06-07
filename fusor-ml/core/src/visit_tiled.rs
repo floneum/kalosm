@@ -81,14 +81,11 @@ pub(crate) fn titled_map_workgroup_size_constraints(
 }
 
 pub(crate) fn distribute_workgroups(total_workgroups: u32, max_per_dim: u32) -> [u32; 3] {
-    if total_workgroups == 0 {
-        return [1, 1, 1];
-    }
-
+    let max_per_dim = max_per_dim.max(1);
     let x = total_workgroups.min(max_per_dim);
-    let remaining = total_workgroups.div_ceil(x);
-    let y = remaining.min(max_per_dim);
-    let z = total_workgroups.div_ceil(x * y).max(1);
+    let remaining = total_workgroups.div_ceil(x.max(1));
+    let y = remaining.min(max_per_dim).max(1);
+    let z = total_workgroups.div_ceil(x.max(1) * y).max(1);
 
     [x, y, z]
 }

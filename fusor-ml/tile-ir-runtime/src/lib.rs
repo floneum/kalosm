@@ -9,14 +9,28 @@ mod buffer_pool;
 mod cache;
 mod direct_kernel;
 mod dispatch;
+mod plan_cache;
 
 pub use buffer_pool::BufferPool;
 pub use cache::{
     CachedKernel, DirectDynamicBindGroupKey, KernelCache, KernelCacheKey, KernelVariantKey,
-    ModuleCache, module_cache,
 };
-pub use direct_kernel::{DirectKernel, DirectKernelBinding, PreparedDirectDispatch};
+pub use direct_kernel::{
+    DirectKernel, DirectKernelBinding, DirectKernelTemplate, PreparedDirectDispatch,
+};
 pub use dispatch::{
-    cached_hashed_naga, dynamic_kernel_from_hashed_ir, dynamic_kernel_from_ir, run_direct_kernel,
-    run_kernel, three_buffer_pipeline_from_cached_module, three_buffer_pipeline_from_ir,
+    dynamic_kernel_from_ir, run_direct_kernel, run_kernel, three_buffer_pipeline_from_ir,
 };
+pub use plan_cache::DirectPlanCache;
+
+/// Diagnostic: total shader-module / compute-pipeline compilations performed at
+/// runtime. Each WGSL shader-module and pipeline creation bumps this counter.
+/// It is logged when `FUSOR_TRACE_PIPELINE_COMPILES` is set.
+static COMPILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn note_compile(what: &str) {
+    let n = COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if std::env::var_os("FUSOR_TRACE_PIPELINE_COMPILES").is_some() {
+        tracing::info!("fusor_compile #{n} {what}");
+    }
+}

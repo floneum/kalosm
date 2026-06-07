@@ -15,18 +15,18 @@ bytemuck = "1.25.0"
 half = "2.4.1"
 
 [dev-dependencies]
-naga = "29.0.3"
+naga = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now" }
 pollster = "0.4.0"
-wgpu = { version = "29.0.3", default-features = false, features = ["std", "naga-ir"] }
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["std", "naga-ir"] }
 
 [target.'cfg(target_vendor = "apple")'.dev-dependencies]
-wgpu = { version = "29.0.3", default-features = false, features = ["metal"] }
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["metal"] }
 
 [target.'cfg(windows)'.dev-dependencies]
-wgpu = { version = "29.0.3", default-features = false, features = ["dx12"] }
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["dx12"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dev-dependencies]
-wgpu = { version = "29.0.3", default-features = false, features = ["vulkan"] }
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["vulkan"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-wgpu = { version = "29.0.3", default-features = false, features = ["webgpu"] }
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["webgpu"] }

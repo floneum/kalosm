@@ -21,7 +21,10 @@ use super::{ComputeGraphInner, ComputeGraphNode, ComputeGraphNodeVariant, NodeIn
 mod execution;
 mod fusion_basic;
 mod fusion_matmul;
+mod plan_cache;
 mod run;
+
+pub(crate) use plan_cache::structural_kernel_key;
 
 pub(crate) struct ResolverResult {
     pub(crate) data: TensorData,
@@ -139,7 +142,7 @@ struct OptimizeProfile {
 
 impl OptimizeProfile {
     fn print(&self) {
-        eprintln!(
+        tracing::info!(
             "resolve_optimize_profile iterations={} changed={} \
 fuse_naries_count={} fuse_naries={:?} \
 fuse_reduce_count={} fuse_reduce={:?} \
@@ -171,7 +174,7 @@ fn optimize_node_limit() -> usize {
 
 impl ResolveHostProfile {
     fn print(&self, total: Duration, queued_ops: usize, kernels: usize) {
-        eprintln!(
+        tracing::info!(
             "resolve_host_profile queued_ops={queued_ops} kernels={kernels} total={total:?} \
 build_execution_graph={:?} optimize={:?} toposort={:?} queue_lowering={:?} \
 consumer_count={:?} encoder_create={:?} map_layout={:?} inputs={:?} output={:?} \
@@ -214,7 +217,7 @@ fn print_host_category_profile(profile: FxHashMap<&'static str, ResolveHostCateg
         })
         .collect::<Vec<_>>();
     profile.sort_by_key(|entry| std::cmp::Reverse(entry.5));
-    eprintln!("resolve_host_category_profile {profile:?}");
+    tracing::info!("resolve_host_category_profile {profile:?}");
 }
 
 fn node_category(variant: &ComputeGraphNodeVariant) -> &'static str {
@@ -320,7 +323,7 @@ fn print_gpu_kernel_profile(
     names.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     names.truncate(32);
 
-    eprintln!(
+    tracing::info!(
         "resolve_gpu_kernel_profile mode={} kernels={} accounted_ms={:.3} span_ms={:.3} timestamp_period_ns={:.3}",
         timestamp_mode,
         records.len(),
@@ -328,8 +331,8 @@ fn print_gpu_kernel_profile(
         span_ns / 1_000_000.0,
         timestamp_period_ns
     );
-    eprintln!("resolve_gpu_kernel_categories {categories:?}");
-    eprintln!("resolve_gpu_kernel_top_names {names:?}");
+    tracing::info!("resolve_gpu_kernel_categories {categories:?}");
+    tracing::info!("resolve_gpu_kernel_top_names {names:?}");
 }
 
 pub(crate) struct Resolver {

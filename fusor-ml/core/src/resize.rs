@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 use crate::{
     DataTypeEnum, Layout, TILE_SIZE, Tensor, TensorData,
     compute_graph::NodeIndex,
@@ -162,6 +164,12 @@ fn is_row_major_contiguous(layout: &Layout) -> bool {
 }
 
 impl Operation for ResizeOperation {
+    fn hash_kernel_fields(&self, state: &mut rustc_hash::FxHasher) {
+        self.current_shape.hash(state);
+        self.new_shape.hash(state);
+        self.fill_shape.hash(state);
+    }
+
     fn workgroup_shape_constraints(
         &self,
         _: &crate::Device,
