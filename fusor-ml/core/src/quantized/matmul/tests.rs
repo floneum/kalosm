@@ -539,38 +539,6 @@ mod tests {
     }
 
     #[test]
-    fn q4k_paired_silu_single_row_no_subgroup_resolves() {
-        pollster::block_on(async {
-            let Ok(device) = Device::new().await else {
-                return;
-            };
-            let device = device.without_subgroups();
-
-            let weight_shape = [64usize, 512usize];
-            let raw_bytes = patterned_q4k_bytes(weight_shape);
-            let matrix =
-                QMatrix::from_parts(&device, &raw_bytes, weight_shape.into(), GgmlType::Q4K)
-                    .unwrap();
-            let input_values = (0..weight_shape[1])
-                .map(|index| {
-                    let bucket = (index.wrapping_mul(29).wrapping_add(5)) % 61;
-                    (bucket as f32 - 30.0) * 0.001
-                })
-                .collect::<Vec<_>>();
-            let input = Tensor::from_slice::<f32>(&device, [1, weight_shape[1]], &input_values);
-
-            let result = input
-                .q_mat_mul_paired_silu_product(&matrix)
-                .as_slice::<2, f32>()
-                .await
-                .unwrap();
-
-            assert_eq!(result.shape(), &[1, weight_shape[0] / 2]);
-            assert!(result.as_slice().iter().all(|value| value.is_finite()));
-        });
-    }
-
-    #[test]
     fn q4k_large_single_row_qgemv_handles_tail_columns_with_subgroups() {
         pollster::block_on(async {
             let Ok(device) = Device::new().await else {
@@ -760,7 +728,7 @@ mod tests {
 
                         let acc = coop_token.alloc_coop_acc(program, ScalarElement::F32, 8, 8);
                         let zero = coop_token.coop_zero(program, ScalarElement::F32, 8, 8);
-                        coop_token.store_local_coop(program, &acc, zero);
+                        coop_token.coop_store_local(program, &acc, zero);
                         let a_frag = coop_token.coop_load_a(
                             program,
                             &a_tile,
@@ -779,9 +747,9 @@ mod tests {
                             8,
                             8,
                         );
-                        let c_value = coop_token.load_local_coop(program, &acc);
+                        let c_value = coop_token.coop_load_local(program, &acc);
                         let mma = coop_token.coop_mma(program, a_frag, b_frag, c_value);
-                        coop_token.store_local_coop(program, &acc, mma);
+                        coop_token.coop_store_local(program, &acc, mma);
                         coop_token.coop_store(program, &acc, &y_storage, 0u32, 0u32);
                     });
                     Some(())
@@ -935,15 +903,12 @@ mod tests {
             }
 
             for (name, weight_shape, raw_bytes, ty) in cases {
-                let [n, k] = weight_shape;
+                let [_, k] = weight_shape;
                 let input_values = (0..k)
                     .map(|index| {
                         let bucket = (index.wrapping_mul(37).wrapping_add(11)) % 101;
                         (bucket as f32 - 50.0) * 0.0025
                     })
-                    .collect::<Vec<_>>();
-                let extra = (0..n)
-                    .map(|i| (i % 13) as f32 * 0.01 - 0.06)
                     .collect::<Vec<_>>();
                 let mat_sg =
                     QMatrix::from_parts(&device, &raw_bytes, weight_shape.into(), ty).unwrap();
@@ -958,28 +923,6 @@ mod tests {
                     "plain",
                     &row(in_sg.q_mat_mul(&mat_sg)).await,
                     &row(in_no.q_mat_mul(&mat_no)).await,
-                );
-
-                // Fused paired-silu-product epilogue (the MLP gate/up matmul) —
-                // the dominant matmul in decode and the one the previous fast
-                // cache could not key.
-                assert_match(
-                    name,
-                    "silu_product",
-                    &row(in_sg.q_mat_mul_paired_silu_product(&mat_sg)).await,
-                    &row(in_no.q_mat_mul_paired_silu_product(&mat_no)).await,
-                );
-
-                // Fused add2 epilogue (residual add after a projection).
-                let first_sg = Tensor::from_slice::<f32>(&device, [1, n], &extra);
-                let second_sg = Tensor::from_slice::<f32>(&device, [1, n], &extra);
-                let first_no = Tensor::from_slice::<f32>(&no_sg, [1, n], &extra);
-                let second_no = Tensor::from_slice::<f32>(&no_sg, [1, n], &extra);
-                assert_match(
-                    name,
-                    "add2",
-                    &row(in_sg.q_mat_mul_add2(&mat_sg, &first_sg, &second_sg)).await,
-                    &row(in_no.q_mat_mul_add2(&mat_no, &first_no, &second_no)).await,
                 );
 
                 // Multi-row (prefill) regime: the prompt is processed at m>1 with

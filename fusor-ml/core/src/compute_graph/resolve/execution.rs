@@ -309,36 +309,33 @@ impl Resolver {
                 // Re-add the current node to worklist if it still exists
                 if self.execution_graph.contains_node(node_idx)
                     && self.is_optimization_candidate(node_idx)
-                    && !in_worklist.contains(&node_idx)
+                    && in_worklist.insert(node_idx)
                 {
                     worklist.push_back(node_idx);
-                    in_worklist.insert(node_idx);
                 }
 
-                // Re-add consumers that might be affected by this change.
-                for consumer in consumers {
-                    if self.execution_graph.contains_node(consumer)
-                        && self.is_optimization_candidate(consumer)
-                        && !in_worklist.contains(&consumer)
-                    {
-                        worklist.push_back(consumer);
-                        in_worklist.insert(consumer);
-                    }
-                }
-
-                // Also add new consumers that may have been created.
+                // Re-add downstream fusion candidates that might now be fusible
+                // — both the consumers captured before this rewrite and any it
+                // created — descending through view nodes (e.g. the MapLayout
+                // broadcast `add_` inserts) that sit between a changed node and
+                // the next candidate.
+                self.enqueue_downstream_candidates(
+                    consumers,
+                    Self::is_optimization_candidate,
+                    &mut worklist,
+                    &mut in_worklist,
+                );
                 if self.execution_graph.contains_node(node_idx) {
-                    for consumer in self
+                    let new_consumers: Vec<_> = self
                         .execution_graph
                         .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
-                    {
-                        if self.is_optimization_candidate(consumer)
-                            && !in_worklist.contains(&consumer)
-                        {
-                            worklist.push_back(consumer);
-                            in_worklist.insert(consumer);
-                        }
-                    }
+                        .collect();
+                    self.enqueue_downstream_candidates(
+                        new_consumers,
+                        Self::is_optimization_candidate,
+                        &mut worklist,
+                        &mut in_worklist,
+                    );
                 }
             }
         }
@@ -383,20 +380,51 @@ impl Resolver {
             if changed {
                 if self.execution_graph.contains_node(node_idx)
                     && self.is_large_graph_nary_candidate(node_idx)
-                    && !in_worklist.contains(&node_idx)
+                    && in_worklist.insert(node_idx)
                 {
                     worklist.push_back(node_idx);
-                    in_worklist.insert(node_idx);
                 }
-                for consumer in consumers {
-                    if self.execution_graph.contains_node(consumer)
-                        && self.is_large_graph_nary_candidate(consumer)
-                        && !in_worklist.contains(&consumer)
-                    {
-                        worklist.push_back(consumer);
-                        in_worklist.insert(consumer);
-                    }
+                self.enqueue_downstream_candidates(
+                    consumers,
+                    Self::is_large_graph_nary_candidate,
+                    &mut worklist,
+                    &mut in_worklist,
+                );
+            }
+        }
+    }
+
+    /// Re-enqueue downstream fusion candidates reachable from `seeds`,
+    /// descending through `MapLayout` view nodes. A rewrite (e.g. fusing an
+    /// `add` into a qmatmul epilogue) can make a candidate that sits *behind* a
+    /// broadcast/narrow view newly fusible; those views are not optimization
+    /// candidates themselves, so a plain direct-consumer scan would never reach
+    /// the candidate past them.
+    fn enqueue_downstream_candidates(
+        &self,
+        seeds: impl IntoIterator<Item = ExecutionNodeIndex>,
+        is_candidate: impl Fn(&Self, ExecutionNodeIndex) -> bool,
+        worklist: &mut VecDeque<ExecutionNodeIndex>,
+        in_worklist: &mut FxHashSet<ExecutionNodeIndex>,
+    ) {
+        let mut stack: Vec<ExecutionNodeIndex> = seeds.into_iter().collect();
+        let mut visited = FxHashSet::default();
+        while let Some(node) = stack.pop() {
+            if !self.execution_graph.contains_node(node) || !visited.insert(node) {
+                continue;
+            }
+            if is_candidate(self, node) {
+                if in_worklist.insert(node) {
+                    worklist.push_back(node);
                 }
+            } else if matches!(
+                self.execution_graph[node].variant,
+                ComputeGraphNodeVariant::MapLayout(_)
+            ) {
+                stack.extend(
+                    self.execution_graph
+                        .neighbors_directed(node, petgraph::Direction::Outgoing),
+                );
             }
         }
     }

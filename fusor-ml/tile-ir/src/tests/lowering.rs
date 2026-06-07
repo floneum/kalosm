@@ -22,7 +22,7 @@ fn op_enum_is_source_tile_program_only() {
         });
     });
 
-    let _ = ir.body();
+    assert!(!ir.body.is_empty());
 }
 
 #[test]
@@ -71,7 +71,6 @@ fn subgroup_reduce_records_wgsl_extension_requirement() {
     });
 
     let lowered = lower_or_fail(&ir, "subgroup reduce");
-    assert!(lowered.wgsl_extensions().subgroups());
     assert_eq!(lowered.wgsl_extension_prelude(), "enable subgroups;\n\n");
 }
 
@@ -88,7 +87,7 @@ fn subgroup_builtins_use_subgroup_capability_and_wgsl_extension() {
     });
 
     let lowered = lower_or_fail(&ir, "subgroup builtins");
-    assert!(lowered.wgsl_extensions().subgroups());
+    assert_eq!(lowered.wgsl_extension_prelude(), "enable subgroups;\n\n");
 }
 
 #[test]
@@ -251,11 +250,11 @@ fn typed_coop_accumulator_records_scalar_role_and_shape() {
         phase.program_grid(32, [1, 1, 1], |program| {
             let acc = coop.alloc_coop_acc(program, ScalarElement::F32, 8, 8);
             let zero = coop.coop_zero(program, ScalarElement::F32, 8, 8);
-            coop.store_local_coop(program, &acc, zero);
+            coop.coop_store_local(program, &acc, zero);
         });
     });
 
-    let Some(crate::Stmt::StoreLocal { dst, .. }) = ir.body().first() else {
+    let Some(crate::ir::Stmt::StoreLocal { dst, .. }) = ir.body.first() else {
         panic!("expected a coop StoreLocal as the first statement");
     };
     assert_eq!(
@@ -294,19 +293,19 @@ fn cooperative_load_store_layout_flags_use_transposed_internal_layout() {
     fn lowered_coop_layout_flags(output_layout: Layout) -> (Vec<bool>, Vec<bool>) {
         let ir = tile::build(|phase| {
             let coop = crate::CoopMatrixToken::new_unchecked();
-            let y = phase.storage_write_with_layout(f32(), output_layout);
+            let y = phase.storage_write_with_layout_offset(f32(), output_layout, 0);
             let a_tile = phase.alloc_workgroup_tile(ScalarElement::F32, 8, 8);
             let b_tile = phase.alloc_workgroup_tile(ScalarElement::F32, 8, 8);
             phase.program_grid(32, [1, 1, 1], |program| {
                 let acc = coop.alloc_coop_acc(program, ScalarElement::F32, 8, 8);
                 let zero = coop.coop_zero(program, ScalarElement::F32, 8, 8);
-                coop.store_local_coop(program, &acc, zero);
+                coop.coop_store_local(program, &acc, zero);
 
                 let a = coop.coop_load_a(program, &a_tile, 0u32, 0u32, ScalarElement::F32, 8, 8);
                 let b = coop.coop_load_b(program, &b_tile, 0u32, 0u32, ScalarElement::F32, 8, 8);
-                let c = coop.load_local_coop(program, &acc);
+                let c = coop.coop_load_local(program, &acc);
                 let mma = coop.coop_mma(program, a, b, c);
-                coop.store_local_coop(program, &acc, mma);
+                coop.coop_store_local(program, &acc, mma);
                 coop.coop_store(program, &acc, &y, 0u32, 0u32);
             });
         });

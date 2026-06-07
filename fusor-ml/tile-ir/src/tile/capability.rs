@@ -41,7 +41,12 @@ impl SubgroupToken {
     }
 
     /// Reduction across one subgroup.
-    pub fn subgroup_reduce(self, program: &TileBlock<'_>, op: TileReduceOp, value: Tile) -> Tile {
+    pub(crate) fn subgroup_reduce(
+        self,
+        program: &TileBlock<'_>,
+        op: TileReduceOp,
+        value: Tile,
+    ) -> Tile {
         program.subgroup_reduce(op, value)
     }
 
@@ -53,11 +58,6 @@ impl SubgroupToken {
     /// Max reduction across one subgroup.
     pub fn subgroup_reduce_max(self, program: &TileBlock<'_>, value: Tile) -> Tile {
         self.subgroup_reduce(program, TileReduceOp::Max, value)
-    }
-
-    /// Min reduction across one subgroup.
-    pub fn subgroup_reduce_min(self, program: &TileBlock<'_>, value: Tile) -> Tile {
-        self.subgroup_reduce(program, TileReduceOp::Min, value)
     }
 }
 
@@ -91,13 +91,13 @@ impl CoopMatrixToken {
     }
 
     /// Load the current SSA value of a coop accumulator.
-    pub fn load_local_coop(self, program: &TileBlock<'_>, acc: &CoopAcc) -> Tile {
-        program.load_local_coop(acc)
+    pub fn coop_load_local(self, program: &TileBlock<'_>, acc: &CoopAcc) -> Tile {
+        program.coop_load_local(acc)
     }
 
     /// Store a coop value into an accumulator.
-    pub fn store_local_coop(self, program: &mut TileBlock<'_>, acc: &CoopAcc, value: Tile) {
-        program.store_local_coop(acc, value);
+    pub fn coop_store_local(self, program: &mut TileBlock<'_>, acc: &CoopAcc, value: Tile) {
+        program.coop_store_local(acc, value);
     }
 
     /// A zeroed coop-`C` accumulator value.

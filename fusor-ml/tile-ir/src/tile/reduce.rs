@@ -1,9 +1,9 @@
 use super::block::load_local_expr;
-use super::value::FoldIter;
+use super::value::{zero_expr, FoldIter};
 use super::{Tile, TileBlock};
 use crate::ir::{
-    Accumulator, ElementType, Expr, ExprKind, Layout, MemoryLevel, ReduceKind, ScalarElement,
-    Shape, TileBinaryOp, TileLiteral, TileReduceOp,
+    Accumulator, ElementType, Expr, ExprKind, Layout, MemoryLevel, ReduceKind, Shape, TileBinaryOp,
+    TileReduceOp,
 };
 
 macro_rules! tile_reduce_entrypoints {
@@ -218,34 +218,4 @@ impl FoldIter {
     pub(super) fn count_expr(self) -> Expr {
         *self.count
     }
-}
-
-fn zero_expr(element: ElementType) -> Expr {
-    let kind = match element {
-        ElementType::F32 => ExprKind::Literal(TileLiteral::f32(0.0)),
-        ElementType::F16 => ExprKind::Literal(TileLiteral::F16(0)),
-        ElementType::U32 => ExprKind::Literal(TileLiteral::U32(0)),
-        ElementType::Bool => ExprKind::Literal(TileLiteral::Bool(false)),
-        ElementType::Vector { scalar, lanes } => {
-            let literal = match scalar {
-                ScalarElement::F32 => TileLiteral::f32(0.0),
-                ScalarElement::F16 => TileLiteral::F16(0),
-                ScalarElement::U32 => TileLiteral::U32(0),
-                ScalarElement::Bool => TileLiteral::Bool(false),
-            };
-            let parts = (0..lanes)
-                .map(|_| Expr::new(ExprKind::Literal(literal), scalar.element()))
-                .collect();
-            return Expr::new(
-                ExprKind::Vec {
-                    scalar,
-                    lanes,
-                    parts,
-                },
-                element,
-            );
-        }
-        ElementType::CoopMatrix { .. } => panic!("cannot zero a cooperative-matrix value"),
-    };
-    Expr::new(kind, element)
 }

@@ -95,21 +95,21 @@ pub(crate) fn q4k_ggml_dot_tiles(
         )
     };
 
-    let scale_shift = lane.iq.clone().shift_left(4u32);
-    let sc0 = load(program, Tile::u32(scale0)).shift_right(scale_shift.clone());
-    let sc1 = load(program, Tile::u32(scale0 + 1)).shift_right(scale_shift.clone());
-    let sc2 = load(program, Tile::u32(scale0 + 2)).shift_right(scale_shift);
+    let scale_shift = lane.iq.clone() << 4u32;
+    let sc0 = load(program, Tile::u32(scale0)) >> scale_shift.clone();
+    let sc1 = load(program, Tile::u32(scale0 + 1)) >> scale_shift.clone();
+    let sc2 = load(program, Tile::u32(scale0 + 2)) >> scale_shift;
     let first_two = sc0.clone() & 0x3f3fu32;
     let second_two = sc1.clone() & 0x3f3fu32;
     let third_low = sc2.clone() & 0x0f0fu32;
-    let third_high = (sc0 & 0xc0c0u32).shift_right(2u32);
+    let third_high = (sc0 & 0xc0c0u32) >> 2u32;
     let third_two = third_low | third_high;
-    let fourth_low = sc2.shift_right(4u32) & 0x0f0fu32;
-    let fourth_high = (sc1 & 0xc0c0u32).shift_right(2u32);
+    let fourth_low = (sc2 >> 4u32) & 0x0f0fu32;
+    let fourth_high = (sc1 & 0xc0c0u32) >> 2u32;
     let fourth_two = fourth_low | fourth_high;
 
     let u8_f32 = |x: &Tile, byte: u32| -> Tile {
-        (x.clone().shift_right(byte * 8) & 0xffu32).cast(ElementType::F32)
+        ((x.clone() >> (byte * 8)) & 0xffu32).cast(ElementType::F32)
     };
     let odd = [
         u8_f32(&first_two, 0),
@@ -124,7 +124,7 @@ pub(crate) fn q4k_ggml_dot_tiles(
         u8_f32(&fourth_two, 1),
     ];
 
-    let data_offset = lane.iq.clone().shift_left(3u32) + lane.ir.clone().shift_left(1u32);
+    let data_offset = (lane.iq.clone() << 3u32) + (lane.ir.clone() << 1u32);
     let mut first_sums: [Tile; 4] = std::array::from_fn(|_| Tile::f32(0.0));
     let mut second_sums: [Tile; 4] = std::array::from_fn(|_| Tile::f32(0.0));
     for j in 0..2u32 {
@@ -158,7 +158,7 @@ pub(crate) fn q4k_ggml_dot_tiles(
 }
 
 fn accumulate_q4k_word(word: &Tile, acts: &[Tile], act_base: usize, sums: &mut [Tile; 4]) {
-    let high_word = word.clone().shift_right(16u32);
+    let high_word = word.clone() >> 16u32;
     for (source, base) in [(word.clone(), act_base), (high_word, act_base + 2)] {
         sums[0] = sums[0].clone()
             + acts[base].clone() * (source.clone() & 0x000fu32).cast(ElementType::F32);

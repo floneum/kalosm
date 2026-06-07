@@ -38,7 +38,7 @@ impl Program {
     }
 
     /// Consume the builder and return the constructed [`KernelIr`].
-    pub fn into_ir(self) -> KernelIr {
+    pub(crate) fn into_ir(self) -> KernelIr {
         self.ir
     }
 }
@@ -70,16 +70,6 @@ impl Program {
             0,
             BufferAccess::ReadWrite,
         )
-    }
-
-    /// Declare a read-only storage view with an explicit layout.
-    pub fn storage_read_with_layout(&mut self, element: ElementType, layout: Layout) -> Storage {
-        self.storage_with_layout_and_access(element, layout, 0, BufferAccess::Read)
-    }
-
-    /// Declare a read-write storage view with an explicit layout.
-    pub fn storage_write_with_layout(&mut self, element: ElementType, layout: Layout) -> Storage {
-        self.storage_with_layout_and_access(element, layout, 0, BufferAccess::ReadWrite)
     }
 
     /// Declare a read-only storage view with an explicit layout and element

@@ -250,9 +250,7 @@ pub(super) fn reduce_workgroup(
 ) {
     let mut stride = program.block_size() / 2;
     while stride > 0 {
-        let participates = program
-            .index(lane.clone())
-            .lt(Tile::literal(TileLiteral::U32(stride)));
+        let participates = lane.clone().lt(Tile::literal(TileLiteral::U32(stride)));
         program.if_then(participates, |program| {
             let lhs = program.load_workgroup(scratch, lane.clone());
             let rhs_index = lane.clone() + stride;
@@ -272,7 +270,7 @@ const COOP_DIM: u32 = 8;
 /// and returns the coop-`C` value to seed the accumulator: `coop_zero(..)` for
 /// the zero-init case, or a `coop_load_c_broadcast(..)` fragment for the
 /// preloaded-C case. Each accumulator is a mutable local seeded through
-/// `store_local_coop`.
+/// `coop_store_local`.
 pub(super) fn coop_acc_grid<Init>(
     program: &mut TileBlock<'_>,
     coop: CoopMatrixToken,
@@ -290,7 +288,7 @@ where
                 .map(|c| {
                     let acc = coop.alloc_coop_acc(program, scalar, COOP_DIM, COOP_DIM);
                     let seed = init(program, coop, r, c);
-                    coop.store_local_coop(program, &acc, seed);
+                    coop.coop_store_local(program, &acc, seed);
                     acc
                 })
                 .collect()
@@ -411,7 +409,7 @@ pub(super) fn coop_load_c_broadcast_fragments(
 }
 
 /// MMA every `a_frag` × `b_frag` pair into the matching accumulator. Each cell
-/// emits `store_local_coop(acc, coop_mma(a, b, load_local_coop(acc)))`, which
+/// emits `coop_store_local(acc, coop_mma(a, b, coop_load_local(acc)))`, which
 /// the lowerer threads through the coop acc-value SSA memo.
 pub(super) fn coop_mma_grid(
     program: &mut TileBlock<'_>,
@@ -423,9 +421,9 @@ pub(super) fn coop_mma_grid(
     for (r, a) in a_frags.iter().enumerate() {
         for (c, b) in b_frags.iter().enumerate() {
             let acc = &accs[r][c];
-            let c_value = coop.load_local_coop(program, acc);
+            let c_value = coop.coop_load_local(program, acc);
             let mma = coop.coop_mma(program, a.clone(), b.clone(), c_value);
-            coop.store_local_coop(program, acc, mma);
+            coop.coop_store_local(program, acc, mma);
         }
     }
 }
