@@ -499,7 +499,9 @@ async fn check_q4k_non_block_aligned_k_paired_silu(device: &Device) -> Result<()
         let gate_up = QMatrix::concat_rows(&[&gate, &up])
             .ok_or_else(|| SuiteError::case(case, "Q4K concat_rows returned None"))?;
         let projected = input.q_mat_mul(&gate_up);
-        let gate_states = projected.narrow(fusor::D::Minus1, 0, intermediate).to_concrete();
+        let gate_states = projected
+            .narrow(fusor::D::Minus1, 0, intermediate)
+            .to_concrete();
         let up_states = projected
             .narrow(fusor::D::Minus1, intermediate, intermediate)
             .to_concrete();

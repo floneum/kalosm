@@ -562,7 +562,12 @@ impl Resolver {
         }
 
         let Some((expression, accumulator_offsets, extras)) = self
-            .try_extract_mapped_qmatmul_post_expr(graph, nary, qmatmul_inner, &qmatmul_op.out_shape)
+            .try_extract_mapped_qmatmul_post_expr(
+                graph,
+                nary,
+                qmatmul_inner,
+                &qmatmul_op.out_shape,
+            )
         else {
             return false;
         };
@@ -654,8 +659,7 @@ impl Resolver {
                 .unwrap_or((nary_input, Vec::new()));
             if base_inner == qmatmul_inner {
                 let view = Self::apply_map_layout_chain(&qmatmul_out_layout, &chain);
-                let offset =
-                    Self::qmatmul_last_dim_view_offset(&view, &nary.shape, matrix_cols)?;
+                let offset = Self::qmatmul_last_dim_view_offset(&view, &nary.shape, matrix_cols)?;
                 let value_idx = *accumulator_map.entry(offset).or_insert_with(|| {
                     let idx = accumulator_offsets.len();
                     accumulator_offsets.push(offset);
@@ -686,8 +690,7 @@ impl Resolver {
                     replacements[input_idx] = Some(NaryExpr::input(value_idx, rank));
                 }
                 Some(MappedInput::Extra(pos)) => {
-                    replacements[input_idx] =
-                        Some(NaryExpr::input(accumulator_count + pos, rank));
+                    replacements[input_idx] = Some(NaryExpr::input(accumulator_count + pos, rank));
                 }
                 None => {}
             }
