@@ -16,7 +16,8 @@ use fusor_tile_ir::{ElementType, GgmlQuantFormat};
 
 use crate::dispatch::{QgemvShape, SubgroupConfig};
 use crate::grid::{
-    qgemv_grid, qgemv_program_scope, store_qgemv_sums_with_epilogue, QgemvStoreTarget,
+    qgemv_grid, qgemv_has_no_packed_load_tails, qgemv_program_scope,
+    store_qgemv_sums_with_epilogue, QgemvStoreTarget,
 };
 use crate::kernels::qgemv::QgemvTensors;
 use crate::types::{matrix_shape, QmatmulEpilogues};
@@ -112,6 +113,8 @@ pub(crate) fn qgemv_q6k_ggml(
     let post_accumulator_offsets = (!epilogues.post_accumulator_offsets.is_empty())
         .then(|| epilogues.post_accumulator_offsets().to_vec());
     let row = Tile::u32(0);
+    let packed_loads_always_in_bounds =
+        qgemv_has_no_packed_load_tails(grid, shape, block_count, subgroups, 16);
 
     program.program_grid(block, [grid.workgroups_x, grid.dispatch_y, 1], |program| {
         let scope = qgemv_program_scope(program, grid, cols_per_subgroup, subgroup);
@@ -143,6 +146,12 @@ pub(crate) fn qgemv_q6k_ggml(
                             let output_col = col0.clone() + c as u32;
                             let matrix_col =
                                 output_col.clone() + post_accumulator_offsets[value_idx];
+                            let packed_load_mask = if packed_loads_always_in_bounds {
+                                Tile::all()
+                            } else {
+                                grid.mask(in_bounds.clone(), &output_col)
+                                    .and(matrix_col.lt(b.cols))
+                            };
                             acc + q6k_ggml_dot_tiles(
                                 program,
                                 &qwords,
@@ -151,8 +160,7 @@ pub(crate) fn qgemv_q6k_ggml(
                                 &block_idx,
                                 &matrix_col,
                                 &q6k_lane,
-                                grid.mask(in_bounds.clone(), &output_col)
-                                    .and(matrix_col.lt(b.cols)),
+                                packed_load_mask,
                                 &acts,
                             )
                         })
@@ -175,6 +183,11 @@ pub(crate) fn qgemv_q6k_ggml(
                         .enumerate()
                         .map(|(c, acc)| {
                             let col = col0.clone() + c as u32;
+                            let packed_load_mask = if packed_loads_always_in_bounds {
+                                Tile::all()
+                            } else {
+                                grid.mask(in_bounds.clone(), &col)
+                            };
                             acc + q6k_ggml_dot_tiles(
                                 program,
                                 &qwords,
@@ -183,7 +196,7 @@ pub(crate) fn qgemv_q6k_ggml(
                                 &block_idx,
                                 &col,
                                 &q6k_lane,
-                                grid.mask(in_bounds.clone(), &col),
+                                packed_load_mask,
                                 &acts,
                             )
                         })

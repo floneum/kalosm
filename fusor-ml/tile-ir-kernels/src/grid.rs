@@ -8,6 +8,8 @@
 use fusor_tile_ir::tile::{Mask, Storage, Tile, TileBlock};
 use fusor_tile_ir::{ScalarElement, SubgroupToken, TileLiteral, WorkgroupAxis};
 
+use crate::dispatch::{QgemvShape, SubgroupConfig};
+
 #[derive(Clone, Copy)]
 pub(crate) struct QgemvGrid {
     pub(crate) workgroups_x: u32,
@@ -35,6 +37,31 @@ impl QgemvGrid {
     pub(crate) fn mask(self, in_bounds: Mask, col: &Tile) -> Mask {
         in_bounds.and(col.lt(self.n_cols))
     }
+}
+
+pub(crate) fn qgemv_has_no_packed_load_tails(
+    grid: QgemvGrid,
+    shape: QgemvShape,
+    block_count: u32,
+    subgroups: SubgroupConfig,
+    lanes_per_item: u32,
+) -> bool {
+    if lanes_per_item == 0 || !subgroups.is_fixed() {
+        return false;
+    }
+
+    let blocks_per_pass = subgroups.max_size() / lanes_per_item;
+    if blocks_per_pass == 0 || !block_count.is_multiple_of(blocks_per_pass) {
+        return false;
+    }
+
+    let cols_per_workgroup = shape.cols_per_workgroup();
+    if cols_per_workgroup == 0 || !grid.n_cols.is_multiple_of(cols_per_workgroup) {
+        return false;
+    }
+
+    let total_workgroups = grid.n_cols / cols_per_workgroup;
+    total_workgroups.is_multiple_of(grid.workgroups_x.max(1))
 }
 
 #[derive(Clone)]
@@ -153,4 +180,83 @@ pub(crate) fn dot4_sum(program: &TileBlock<'_>, a: &[Tile], b: &[Tile]) -> Tile 
         });
     }
     sum.expect("values >= 4")
+}
+
+#[cfg(test)]
+mod tests {
+    use fusor_tile_ir::SubgroupToken;
+
+    use super::*;
+
+    fn fixed_subgroups(size: u32) -> SubgroupConfig {
+        SubgroupConfig::fixed(SubgroupToken::new_unchecked(), size)
+    }
+
+    #[test]
+    fn packed_load_tail_detector_accepts_aligned_8b_q4k_shape() {
+        let shape = QgemvShape {
+            subgroups: 8,
+            cols_per_subgroup: 4,
+        };
+        let grid = qgemv_grid(shape.subgroups, shape.cols_per_subgroup, 14_336, 448);
+
+        assert!(qgemv_has_no_packed_load_tails(
+            grid,
+            shape,
+            16,
+            fixed_subgroups(32),
+            8,
+        ));
+    }
+
+    #[test]
+    fn packed_load_tail_detector_rejects_column_tail() {
+        let shape = QgemvShape {
+            subgroups: 8,
+            cols_per_subgroup: 4,
+        };
+        let grid = qgemv_grid(shape.subgroups, shape.cols_per_subgroup, 14_337, 449);
+
+        assert!(!qgemv_has_no_packed_load_tails(
+            grid,
+            shape,
+            16,
+            fixed_subgroups(32),
+            8,
+        ));
+    }
+
+    #[test]
+    fn packed_load_tail_detector_rejects_block_tail() {
+        let shape = QgemvShape {
+            subgroups: 8,
+            cols_per_subgroup: 4,
+        };
+        let grid = qgemv_grid(shape.subgroups, shape.cols_per_subgroup, 14_336, 448);
+
+        assert!(!qgemv_has_no_packed_load_tails(
+            grid,
+            shape,
+            17,
+            fixed_subgroups(32),
+            8,
+        ));
+    }
+
+    #[test]
+    fn packed_load_tail_detector_rejects_dispatch_split_tail() {
+        let shape = QgemvShape {
+            subgroups: 8,
+            cols_per_subgroup: 4,
+        };
+        let grid = qgemv_grid(shape.subgroups, shape.cols_per_subgroup, 65_536, 1_000);
+
+        assert!(!qgemv_has_no_packed_load_tails(
+            grid,
+            shape,
+            16,
+            fixed_subgroups(32),
+            8,
+        ));
+    }
 }
