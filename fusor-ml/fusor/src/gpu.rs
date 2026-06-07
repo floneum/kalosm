@@ -525,19 +525,6 @@ impl<const R: usize> Tensor<R, f32> {
     pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
         Self::from_core(self.inner.q_mat_mul(other))
     }
-
-    #[inline]
-    pub fn q_mat_mul_add2(&self, other: &QMatrix, first: &Self, second: &Self) -> Self {
-        Self::from_core(
-            self.inner
-                .q_mat_mul_add2(other, first.as_core(), second.as_core()),
-        )
-    }
-
-    #[inline]
-    pub fn q_mat_mul_paired_silu_product(&self, other: &QMatrix) -> Self {
-        Self::from_core(self.inner.q_mat_mul_paired_silu_product(other))
-    }
 }
 
 impl<const R: usize> Tensor<R, half::f16> {

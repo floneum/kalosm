@@ -1079,7 +1079,13 @@ async fn run_webgpu_case(
             );
             materialize_inputs(&[&input]).await;
             let samples = time_samples(config, || {
-                let output = input.q_mat_mul_paired_silu_product(&matrix);
+                let pair_len = weight_shape[0] / 2;
+                let projected = input.q_mat_mul(&matrix);
+                let gate = projected.narrow(fusor::D::Minus1, 0, pair_len).to_concrete();
+                let up = projected
+                    .narrow(fusor::D::Minus1, pair_len, pair_len)
+                    .to_concrete();
+                let output = (gate.silu() * up).to_concrete();
                 async move {
                     output.materialize().await;
                     Ok(())

@@ -50,8 +50,15 @@ impl Resolver {
         // extra inputs whose layouts match the output visitation shape.
         if allow_qmatmul_elementwise_fusion
             && let ComputeGraphNodeVariant::Nary(nary) = &node_variant
-            && nary.inputs.len() <= 4
         {
+            // Split/gate expressions built from `narrow` views of a qmatmul
+            // output (e.g. SwiGLU's gate/up halves) reach the qmatmul through
+            // MapLayout chains with distinct last-dimension column offsets.
+            // Absorb them into the accumulator-offset post epilogue before the
+            // per-input scan below.
+            if self.try_fuse_qmatmul_narrow_accumulators(graph, node_idx, nary) {
+                return true;
+            }
             for (candidate_input_idx, &input_inner) in nary.inputs.iter().enumerate() {
                 if self.get_input_node_in_exec_graph(input_inner).is_none() {
                     continue;
@@ -114,36 +121,11 @@ impl Resolver {
                     new_q.post_element_wise_expr = Some(post_element_wise_expr);
                     new_q.post_accumulator_offsets = accumulator_offsets.into_boxed_slice();
 
-                    self.execution_graph[node_idx].variant =
-                        ComputeGraphNodeVariant::QMatMul(new_q.clone());
+                    if !new_q.fits_binding_budget(&graph.device()) {
+                        continue;
+                    }
 
-                    let deps = Self::qmatmul_dependencies(&new_q);
-                    for input in &nary.inputs {
-                        if deps.contains(input) {
-                            continue;
-                        }
-                        if let Some(input_exec) = self.get_input_node_in_exec_graph(*input)
-                            && let Some(edge) = self.execution_graph.find_edge(input_exec, node_idx)
-                        {
-                            self.execution_graph.remove_edge(edge);
-                        }
-                    }
-                    for dep in &deps {
-                        if let Some(idx) = self.get_input_node_in_exec_graph(*dep)
-                            && self.execution_graph.find_edge(idx, node_idx).is_none()
-                        {
-                            self.execution_graph.add_edge(idx, node_idx, ());
-                        }
-                    }
-                    self.add_physical_dependencies(graph, node_idx, &deps);
-                    for input in &nary.inputs {
-                        if deps.contains(input) {
-                            continue;
-                        }
-                        if let Some(input_exec) = self.get_input_node_in_exec_graph(*input) {
-                            self.remove_node_if_dead(input_exec);
-                        }
-                    }
+                    self.commit_qmatmul_post_fusion(graph, node_idx, &nary.inputs, new_q);
                     return true;
                 }
                 let mapped_layout = Self::apply_map_layout_chain(
@@ -237,42 +219,13 @@ impl Resolver {
                 };
 
                 let mut new_q = qmatmul_op.clone();
-                let deps_extras = post_element_wise_expr.extras.clone();
                 new_q.post_element_wise_expr = Some(post_element_wise_expr);
 
-                self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::QMatMul(new_q);
+                if !new_q.fits_binding_budget(&graph.device()) {
+                    continue;
+                }
 
-                let mut deps = vec![qmatmul_op.input];
-                if let Some(pre) = &qmatmul_op.pre_element_wise_expr {
-                    deps.extend(pre.extras.iter().copied());
-                }
-                deps.extend(deps_extras.iter().copied());
-                for input in &nary.inputs {
-                    if deps.contains(input) {
-                        continue;
-                    }
-                    if let Some(input_exec) = self.get_input_node_in_exec_graph(*input)
-                        && let Some(edge) = self.execution_graph.find_edge(input_exec, node_idx)
-                    {
-                        self.execution_graph.remove_edge(edge);
-                    }
-                }
-                for dep in &deps {
-                    if let Some(idx) = self.get_input_node_in_exec_graph(*dep)
-                        && self.execution_graph.find_edge(idx, node_idx).is_none()
-                    {
-                        self.execution_graph.add_edge(idx, node_idx, ());
-                    }
-                }
-                self.add_physical_dependencies(graph, node_idx, &deps);
-                for input in &nary.inputs {
-                    if deps.contains(input) {
-                        continue;
-                    }
-                    if let Some(input_exec) = self.get_input_node_in_exec_graph(*input) {
-                        self.remove_node_if_dead(input_exec);
-                    }
-                }
+                self.commit_qmatmul_post_fusion(graph, node_idx, &nary.inputs, new_q);
                 return true;
             }
         }
@@ -302,9 +255,6 @@ impl Resolver {
             else {
                 return false;
             };
-            if nary.inputs.len() > 4 {
-                return false;
-            }
             let mapped_layout =
                 Self::apply_map_layout_chain(&Layout::contiguous(&nary.shape), &nary_map_chain);
             if mapped_layout != Layout::contiguous(&qmatmul_op.in_shape) {
@@ -413,6 +363,10 @@ impl Resolver {
                 new_q.input = primary_inner;
                 new_q.pre_element_wise_expr = Some(pre_element_wise_expr);
 
+                if !new_q.fits_binding_budget(&graph.device()) {
+                    continue;
+                }
+
                 if let Some(edge) = self.execution_graph.find_edge(input_exec, node_idx) {
                     self.execution_graph.remove_edge(edge);
                 }
@@ -514,6 +468,255 @@ impl Resolver {
             deps.extend(post.extras.iter().copied());
         }
         deps
+    }
+
+    /// Replace the n-ary node at `node_idx` with a fused qmatmul `new_q`,
+    /// rewiring the execution-graph edges: drop the edges from the original
+    /// n-ary inputs that the fused operation no longer reads, add edges from
+    /// every dependency (activation input + epilogue extras), and prune any
+    /// inputs that became dead. Shared by every qmatmul post-epilogue path.
+    fn commit_qmatmul_post_fusion(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        node_idx: ExecutionNodeIndex,
+        nary_inputs: &[NodeIndex],
+        new_q: Box<QMatMulOperation>,
+    ) {
+        let deps = Self::qmatmul_dependencies(&new_q);
+        self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::QMatMul(new_q);
+
+        for input in nary_inputs {
+            if deps.contains(input) {
+                continue;
+            }
+            if let Some(input_exec) = self.get_input_node_in_exec_graph(*input)
+                && let Some(edge) = self.execution_graph.find_edge(input_exec, node_idx)
+            {
+                self.execution_graph.remove_edge(edge);
+            }
+        }
+        for dep in &deps {
+            if let Some(idx) = self.get_input_node_in_exec_graph(*dep)
+                && self.execution_graph.find_edge(idx, node_idx).is_none()
+            {
+                self.execution_graph.add_edge(idx, node_idx, ());
+            }
+        }
+        self.add_physical_dependencies(graph, node_idx, &deps);
+        for input in nary_inputs {
+            if deps.contains(input) {
+                continue;
+            }
+            if let Some(input_exec) = self.get_input_node_in_exec_graph(*input) {
+                self.remove_node_if_dead(input_exec);
+            }
+        }
+    }
+
+    /// Absorb a split/gate n-ary whose inputs are `narrow` (MapLayout) views of
+    /// a single-row qmatmul output into that qmatmul's accumulator-offset post
+    /// epilogue. Each distinct last-dimension column offset (e.g. the gate half
+    /// at 0 and the up half at `pair_len`) becomes one accumulator value, so a
+    /// SwiGLU-style `silu(gate) * up` resolves to a single dynamic qmatmul
+    /// kernel where the backend supports it. Returns `false` (leaving the nodes
+    /// untouched) when the pattern, dtype, layout, accumulator offsets, or
+    /// binding budget are unsupported.
+    fn try_fuse_qmatmul_narrow_accumulators(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        node_idx: ExecutionNodeIndex,
+        nary: &NaryOperation,
+    ) -> bool {
+        if nary.output_datatype != crate::DataTypeEnum::F32 {
+            return false;
+        }
+
+        // Find the qmatmul reached through a narrow MapLayout view. A direct
+        // (chain-less) reference is the indexed-input form handled below.
+        let mut base = None;
+        for &input in &nary.inputs {
+            let (base_inner, chain) = self
+                .walk_map_layout_chain(input)
+                .unwrap_or((input, Vec::new()));
+            if chain.is_empty() {
+                continue;
+            }
+            let Some(exec) = self.get_input_node_in_exec_graph(base_inner) else {
+                continue;
+            };
+            if let ComputeGraphNodeVariant::QMatMul(op) = &self.execution_graph[exec].variant {
+                // A qmatmul that already carries a post epilogue isn't a clean
+                // accumulator-offset base; leave it to the general scan.
+                if op.post_element_wise_expr.is_some() {
+                    continue;
+                }
+                base = Some((base_inner, op.clone()));
+                break;
+            }
+        }
+        let Some((qmatmul_inner, qmatmul_op)) = base else {
+            return false;
+        };
+        if self.check_cached(graph, qmatmul_inner) {
+            return false;
+        }
+
+        let Some((expression, accumulator_offsets, extras)) = self
+            .try_extract_mapped_qmatmul_post_expr(graph, nary, qmatmul_inner, &qmatmul_op.out_shape)
+        else {
+            return false;
+        };
+
+        if !qmatmul_op.supports_indexed_post_accumulator_offsets(
+            &graph.device(),
+            &nary.shape,
+            &accumulator_offsets,
+        ) {
+            return false;
+        }
+
+        let post_element_wise_expr = ElementwiseEpilogue {
+            expression,
+            extras,
+            input_datatype: crate::DataTypeEnum::F32,
+            output_datatype: nary.output_datatype,
+        };
+
+        let mut new_q = qmatmul_op;
+        new_q.out_shape = nary.shape.clone();
+        new_q.post_element_wise_expr = Some(post_element_wise_expr);
+        new_q.post_accumulator_offsets = accumulator_offsets.into_boxed_slice();
+
+        if !new_q.fits_binding_budget(&graph.device()) {
+            return false;
+        }
+
+        self.commit_qmatmul_post_fusion(graph, node_idx, &nary.inputs, new_q);
+        true
+    }
+
+    /// Build the post epilogue expression, accumulator column offsets, and
+    /// extra-tensor dependencies for an n-ary whose inputs are last-dimension
+    /// `narrow` views of `qmatmul_inner`. Inputs that view the qmatmul become
+    /// accumulator values (indices `0..offsets.len()`, deduplicated by column
+    /// offset); every other input becomes a normalized extra tensor (indices
+    /// after the accumulators). Returns `None` when an input isn't a clean
+    /// last-dimension narrow, uses custom indexing, or can't be normalized.
+    fn try_extract_mapped_qmatmul_post_expr(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        nary: &NaryOperation,
+        qmatmul_inner: NodeIndex,
+        qmatmul_out_shape: &[usize],
+    ) -> Option<(NaryExpr, Vec<u32>, Vec<NodeIndex>)> {
+        if nary.shape.len() != qmatmul_out_shape.len() {
+            return None;
+        }
+        // The accumulator-offset epilogue is only lowered by the single-row
+        // qgemv path, so every leading dimension must collapse to one row.
+        if qmatmul_out_shape[..qmatmul_out_shape.len() - 1]
+            .iter()
+            .product::<usize>()
+            != 1
+        {
+            return None;
+        }
+        let output_cols = nary.shape.last().copied()? as u32;
+        let matrix_cols = qmatmul_out_shape.last().copied()? as u32;
+        // A full-width (or wider) output isn't a split; the general scan owns
+        // that case.
+        if output_cols >= matrix_cols {
+            return None;
+        }
+
+        let qmatmul_out_layout = Layout::contiguous(qmatmul_out_shape);
+        let rank = nary.shape.len();
+
+        enum MappedInput {
+            Accumulator(usize),
+            Extra(usize),
+        }
+
+        let mut accumulator_offsets = Vec::new();
+        let mut accumulator_map = FxHashMap::default();
+        let mut extras = Vec::new();
+        let mut mapped = Vec::with_capacity(nary.inputs.len());
+        for (input_idx, &nary_input) in nary.inputs.iter().enumerate() {
+            if !nary.expression.uses_input(input_idx) {
+                mapped.push(None);
+                continue;
+            }
+            if nary.expression.uses_custom_indexing_for_input(input_idx) {
+                return None;
+            }
+            let (base_inner, chain) = self
+                .walk_map_layout_chain(nary_input)
+                .unwrap_or((nary_input, Vec::new()));
+            if base_inner == qmatmul_inner {
+                let view = Self::apply_map_layout_chain(&qmatmul_out_layout, &chain);
+                let offset =
+                    Self::qmatmul_last_dim_view_offset(&view, &nary.shape, matrix_cols)?;
+                let value_idx = *accumulator_map.entry(offset).or_insert_with(|| {
+                    let idx = accumulator_offsets.len();
+                    accumulator_offsets.push(offset);
+                    idx
+                });
+                mapped.push(Some(MappedInput::Accumulator(value_idx)));
+            } else {
+                let extra =
+                    self.try_normalize_qmatmul_post_extra(graph, nary_input, &nary.shape)?;
+                let pos = extras.len();
+                extras.push(extra);
+                mapped.push(Some(MappedInput::Extra(pos)));
+            }
+        }
+
+        // Two distinct column offsets are the smallest split worth folding into
+        // the accumulator-offset path; a single offset is either the default
+        // full-width store or a partial column the qgemv path can't cover.
+        if accumulator_offsets.len() < 2 {
+            return None;
+        }
+
+        let accumulator_count = accumulator_offsets.len();
+        let mut replacements = vec![None; nary.inputs.len()];
+        for (input_idx, kind) in mapped.into_iter().enumerate() {
+            match kind {
+                Some(MappedInput::Accumulator(value_idx)) => {
+                    replacements[input_idx] = Some(NaryExpr::input(value_idx, rank));
+                }
+                Some(MappedInput::Extra(pos)) => {
+                    replacements[input_idx] =
+                        Some(NaryExpr::input(accumulator_count + pos, rank));
+                }
+                None => {}
+            }
+        }
+
+        let expression = Self::replace_inputs_in_expr(&nary.expression, &replacements)?;
+        Some((expression, accumulator_offsets, extras))
+    }
+
+    /// If `view` is a contiguous last-dimension narrow of a single-row qmatmul
+    /// output whose shape matches `output_shape`, return its column offset.
+    /// Returns `None` for any non-narrow / strided / out-of-range view.
+    fn qmatmul_last_dim_view_offset(
+        view: &Layout,
+        output_shape: &[usize],
+        matrix_cols: u32,
+    ) -> Option<u32> {
+        if view.shape() != output_shape {
+            return None;
+        }
+        if view.strides().last().copied() != Some(1) {
+            return None;
+        }
+        let offset = u32::try_from(view.offset()).ok()?;
+        let output_cols = *output_shape.last()? as u32;
+        if offset.checked_add(output_cols)? > matrix_cols {
+            return None;
+        }
+        Some(offset)
     }
 
     fn try_extract_indexed_qmatmul_post_expr(

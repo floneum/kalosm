@@ -4,7 +4,7 @@ use crate::common::quantized::{
     concrete_to_rows, q_mat_mul_input_fuzz, q4k_raw_bytes, qmatrix_from_raw_bytes,
 };
 use crate::common::{matmul2, transpose2};
-use fusor::{BlockQ4K, Device, GgmlType, GgufBlock, QMatrix, QuantizedTensor, Tensor, ToVec2};
+use fusor::{BlockQ4K, Device, GgmlType, GgufBlock, QuantizedTensor, Tensor, ToVec2};
 use fusor_conformance::{
     AssertionCase, AssertionCases, approx_compare, approx_or_relative_compare, available_devices,
     cases_from_rows,
@@ -69,15 +69,15 @@ pub fn q4k_dynamic_paired_helper_swiglu_matches_cpu_reference_for_decode_row() -
         let raw_bytes = raw_bytes.clone();
         let input_data = input_data.clone();
         async move {
+            use fusor::D;
             let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
             let input: Tensor<3, f32> = Tensor::from_slice(&device, input_shape, &input_data);
-            match (&input, &weights) {
-                (Tensor::Gpu(input), QMatrix::Gpu(weights)) => {
-                    Tensor::<3, f32>::Gpu(input.q_mat_mul_paired_silu_product(weights))
-                        .to_concrete()
-                }
-                _ => Tensor::new(&device, &vec![vec![vec![0.0; pair_len]; input_shape[1]]]),
-            }
+            let projected = input.q_mat_mul(&weights);
+            let gate = projected.narrow(D::Minus1, 0, pair_len).to_concrete();
+            let up = projected
+                .narrow(D::Minus1, pair_len, pair_len)
+                .to_concrete();
+            (gate.silu() * up).to_concrete()
         }
     })
     .arg(|device: &Device| device.clone())

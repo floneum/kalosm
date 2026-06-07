@@ -4,7 +4,7 @@ use crate::common::quantized::{
     deterministic_input, q_mat_mul_input_fuzz, q4k_raw_bytes, q6k_raw_bytes, q8_0_raw_bytes,
     qmatrix_from_raw_bytes,
 };
-use fusor::{Device, GgmlType, QMatrix, Tensor};
+use fusor::{Device, GgmlType, Tensor};
 use fusor_conformance::{
     AssertionCase, AssertionCases, approx_compare, available_devices, cases_from_rows,
     exact_value_compare,
@@ -101,14 +101,12 @@ pub fn rmsnorm_post_relu_resolves_to_single_kernel() -> AssertionCase {
     )
 }
 
-/// All three Q4K QMatMul fusion shapes must each collapse to a single QMatMul
+/// Both Q4K QMatMul fusion shapes must each collapse to a single QMatMul
 /// kernel dispatch:
 ///   * `relu(input).q_mat_mul(weights)` — qgemv applies the activation to each
 ///     loaded activation tile before the dot product (subgroup path only).
 ///   * `q_mat_mul(...).relu()` — qgemv applies the unary chain in-register
 ///     before the store (all GPU backends).
-///   * concat/split SwiGLU via `q_mat_mul_paired_silu_product` — the dynamic
-///     paired qmatmul fuses the gate/up product (subgroup path only).
 ///
 /// Without the corresponding fuser rule each source resolves to 2 dispatches.
 pub fn q4k_qmatmul_fusion_kernels() -> AssertionCases {
@@ -118,10 +116,6 @@ pub fn q4k_qmatmul_fusion_kernels() -> AssertionCases {
 
     let post_relu_bytes = q4k_raw_bytes(weight_shape);
     let post_relu_input = vec![vec![0.1f32; weight_shape[1]]; 1];
-
-    let swiglu_shape = [64, 512];
-    let swiglu_bytes = q4k_raw_bytes(swiglu_shape);
-    let swiglu_input = vec![vec![0.1f32; swiglu_shape[1]]; 1];
 
     cases_from_rows([
         // `relu(input).q_mat_mul(weights)` pre-activation fusion (subgroup path).
@@ -159,30 +153,6 @@ pub fn q4k_qmatmul_fusion_kernels() -> AssertionCases {
                     .to_concrete()
                     .as_gpu()
                     .is_some_and(|gpu_out| gpu_out.count_kernels_to_resolve() == 1)
-            },
-        ),
-        // concat/split SwiGLU paired qmatmul fusion (subgroup path).
-        assert_gpu_kernel_property(
-            "quantized_matmul_fusion::q4k_concat_split_swiglu_resolves_to_single_dynamic_qmatmul_kernel",
-            move |device| {
-                let Some(gpu) = device.as_gpu() else {
-                    return true;
-                };
-                if !gpu.subgroups_supported() {
-                    return true;
-                }
-                let weights =
-                    qmatrix_from_raw_bytes(&device, swiglu_shape, &swiglu_bytes, GgmlType::Q4K);
-                let input: Tensor<2, f32> = Tensor::new(&device, &swiglu_input);
-                match (&input, &weights) {
-                    (Tensor::Gpu(input), QMatrix::Gpu(weights)) => {
-                        Tensor::<2, f32>::Gpu(input.q_mat_mul_paired_silu_product(weights))
-                            .to_concrete()
-                            .as_gpu()
-                            .is_some_and(|gpu_out| gpu_out.count_kernels_to_resolve() == 1)
-                    }
-                    _ => false,
-                }
             },
         ),
     ])

@@ -492,6 +492,34 @@ impl QMatMulOperation {
             effective_qmatmul_max_workgroups_per_dimension(&device.limits()),
         )
     }
+
+    /// Number of distinct storage-buffer bindings this operation needs:
+    /// activation input, the quantized matrix, every pre/post epilogue extra,
+    /// and the output. Mirrors the binding layout produced by
+    /// [`QMatMulOperation::inputs`].
+    pub(crate) fn binding_count(&self) -> usize {
+        let pre = self
+            .pre_element_wise_expr
+            .as_ref()
+            .map_or(0, |epilogue| epilogue.extras.len());
+        let post = self
+            .post_element_wise_expr
+            .as_ref()
+            .map_or(0, |epilogue| epilogue.extras.len());
+        // input + matrix + extras + output
+        3 + pre + post
+    }
+
+    /// Whether the fused operation's bindings fit within the device's
+    /// per-shader storage-buffer budget. Fusing an epilogue that would exceed
+    /// the budget is infeasible, so the resolver must leave it as separate
+    /// kernels.
+    pub(crate) fn fits_binding_budget(&self, device: &Device) -> bool {
+        let limits = device.limits();
+        let budget = (limits.max_storage_buffers_per_shader_stage as usize)
+            .min(limits.max_bindings_per_bind_group as usize);
+        self.binding_count() <= budget
+    }
 }
 
 pub(crate) struct DirectKernelTensors<'a> {
@@ -847,12 +875,6 @@ fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32,
     4 // was Default4
 }
 
-/// Public re-export of [`qmatmul_m_pad_target`] for crate-internal callers
-/// outside this module (e.g. the fused `q_mat_mul_*` helpers on `Tensor`).
-pub(crate) fn qmatmul_m_pad_target_pub(device: &Device, m: usize, n: usize) -> Option<usize> {
-    qmatmul_m_pad_target_for_caps(m, n, KernelDeviceCaps::from_device(device))
-}
-
 fn qmatmul_m_pad_target_for_caps(m: usize, n: usize, caps: KernelDeviceCaps) -> Option<usize> {
     if !qmatmul_coop_supported(caps) {
         return None;
@@ -899,7 +921,9 @@ impl Tensor {
         let m_axis = self.rank() - 2;
         let m = in_shape[m_axis];
         let n = other.shape()[0];
-        let Some(padded_m) = qmatmul_m_pad_target_pub(self.device(), m, n) else {
+        let Some(padded_m) =
+            qmatmul_m_pad_target_for_caps(m, n, KernelDeviceCaps::from_device(self.device()))
+        else {
             return self.add_q_mat_mul(other);
         };
 

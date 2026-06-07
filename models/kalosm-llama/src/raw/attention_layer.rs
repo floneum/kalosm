@@ -165,7 +165,11 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
         }
 
         let up_result = self.activation(x);
-        let up = up_result.q_mat_mul_add2(&self.down, first, second);
+        // Residual adds authored in natural graph form: the resolver folds both
+        // `add`s into the qmatmul post epilogue (one dispatch on decode).
+        let projected = up_result.q_mat_mul(&self.down);
+        let with_first = (&projected + first).to_concrete();
+        let up = (&with_first + second).to_concrete();
         Some(up.cast())
     }
 
@@ -179,7 +183,16 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
 
         match &self.gate_up {
             Some(gate_up) if self.gate_bias.is_none() && self.up_bias.is_none() => {
-                x_f32.q_mat_mul_paired_silu_product(gate_up)
+                // SwiGLU split/gate authored in natural graph form: the resolver
+                // folds `silu(gate) * up` over the two narrow halves into the
+                // qmatmul accumulator-offset epilogue (one dispatch on decode).
+                let pair_len = gate_up.shape()[0] / 2;
+                let projected = x_f32.q_mat_mul(gate_up);
+                let gate = projected.narrow(D::Minus1, 0, pair_len).to_concrete();
+                let up = projected
+                    .narrow(D::Minus1, pair_len, pair_len)
+                    .to_concrete();
+                (gate.silu() * up).to_concrete()
             }
             Some(gate_up) => {
                 let gate_width = self.gate.shape()[0];

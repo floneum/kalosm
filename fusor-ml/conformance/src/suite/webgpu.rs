@@ -498,7 +498,12 @@ async fn check_q4k_non_block_aligned_k_paired_silu(device: &Device) -> Result<()
         );
         let gate_up = QMatrix::concat_rows(&[&gate, &up])
             .ok_or_else(|| SuiteError::case(case, "Q4K concat_rows returned None"))?;
-        let actual = input.q_mat_mul_paired_silu_product(&gate_up);
+        let projected = input.q_mat_mul(&gate_up);
+        let gate_states = projected.narrow(fusor::D::Minus1, 0, intermediate).to_concrete();
+        let up_states = projected
+            .narrow(fusor::D::Minus1, intermediate, intermediate)
+            .to_concrete();
+        let actual = (gate_states.silu() * up_states).to_concrete();
         let expected: Tensor<3, f32> =
             Tensor::from_slice(&run_device, output_shape, &expected_values);
         approx_eq(&actual, &expected, 5.0)
