@@ -143,9 +143,7 @@ impl Resolver {
         let mut commands = Vec::<CommandRecord>::with_capacity(queued_operations.len());
         let mut dispatch_categories = FxHashMap::<String, usize>::default();
         let mut dispatch_names = FxHashMap::<String, usize>::default();
-        // Decode plan cache: reuse the per-op `build_kernel` analysis across
-        // structurally-identical decode tokens, rebinding only the buffers.
-        let plan_cache_enabled = device.decode_plan_cache().enabled();
+        let plan_cache_enabled = device.kernel_cache().direct_plan_cache().enabled();
         for (node, queued_operation) in queued_operations {
             let operation_category = host_category_trace
                 .then(|| {
@@ -257,10 +255,10 @@ impl Resolver {
                     let kernels = if plan_cache_enabled {
                         let kernel_key =
                             structural_kernel_key(qmatmul.as_ref(), &new_inputs, &workgroup_shape);
-                        device.decode_plan_cache().resolve_op(
+                        resolve_cached_direct_plan(
+                            device.kernel_cache().direct_plan_cache(),
                             kernel_key,
-                            &new_inputs,
-                            &resolved,
+                            direct_plan_binding_buffers(&new_inputs),
                             build_kernels,
                         )
                     } else {
@@ -377,10 +375,10 @@ impl Resolver {
                 let kernels = if plan_cache_enabled {
                     let kernel_key =
                         structural_kernel_key(operation.as_ref(), &new_inputs, &workgroup_shape);
-                    device.decode_plan_cache().resolve_op(
+                    resolve_cached_direct_plan(
+                        device.kernel_cache().direct_plan_cache(),
                         kernel_key,
-                        &new_inputs,
-                        &resolved,
+                        direct_plan_binding_buffers(&new_inputs),
                         build_kernels,
                     )
                 } else {
@@ -679,6 +677,35 @@ impl Resolver {
             tail_result,
         )
     }
+}
+
+fn resolve_cached_direct_plan(
+    plan_cache: &fusor_tile_ir_runtime::DirectPlanCache,
+    cache_key: crate::mir::kernel_backend::KernelCacheKey,
+    binding_buffers: Vec<Vec<std::sync::Arc<wgpu::Buffer>>>,
+    build: impl FnOnce() -> Vec<crate::mir::kernel_backend::DirectKernel>,
+) -> Vec<crate::mir::kernel_backend::DirectKernel> {
+    let binding_slices = binding_buffers
+        .iter()
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    plan_cache
+        .try_get_or_insert_many(cache_key, &binding_slices, || {
+            Ok::<_, std::convert::Infallible>(build())
+        })
+        .expect("infallible direct plan cache build failed")
+}
+
+fn direct_plan_binding_buffers(inputs: &[MirValue]) -> Vec<Vec<std::sync::Arc<wgpu::Buffer>>> {
+    let buffers = inputs
+        .iter()
+        .filter_map(|input| match input {
+            MirValue::Tensor(tensor) => Some(tensor.buffer().clone()),
+            MirValue::QMatrix(matrix) => Some(matrix.buffer().clone()),
+            MirValue::Integer(_) | MirValue::Float(_) => None,
+        })
+        .collect();
+    vec![buffers]
 }
 
 fn dispatches_per_pass(total_kernels: usize) -> usize {

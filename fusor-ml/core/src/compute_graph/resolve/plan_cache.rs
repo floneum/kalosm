@@ -1,51 +1,11 @@
-//! Decode plan cache.
-//!
-//! During autoregressive decode, every token resolves a structurally identical
-//! compute graph: the same operations, in the same toposorted order, with the
-//! same shapes (only the KV-cache-dependent attention ops and the live buffer
-//! handles change token-to-token). Yet `build_kernel` re-runs the full per-op
-//! analysis — kernel-variant selection, workgroup solving, epilogue hashing,
-//! tile-IR lowering checks — every token, even though the compiled pipelines
-//! are already cached. On the web build that analysis dominates the per-token
-//! host cost (~10ms of a ~16ms token).
-//!
-//! This cache memoizes bufferless [`DirectKernelTemplate`]s per operation and,
-//! on a structurally-matching token, rebinds only the buffers (which is cheap)
-//! instead of rebuilding the kernels. It is correctness-safe by construction:
-//! the cache key carries the operation's structural kernel key (op type,
-//! kernel fields, dispatch, workgroup, and every input/output layout/format), so
-//! any structural change is a miss (full rebuild). Buffers are *always*
-//! re-derived from the current token's inputs/output, so a cached template never
-//! carries a stale activation buffer.
-//!
-//! Disable with `FUSOR_DISABLE_DECODE_PLAN_CACHE` (native only; `var_os` is
-//! always `None` on wasm, so the cache is always on for the web build).
-
-use std::{
-    hash::{Hash, Hasher},
-    num::NonZeroUsize,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
-
-use lru::LruCache;
-use parking_lot::Mutex;
-use rustc_hash::{FxBuildHasher, FxHasher};
+//! Structural plan-cache keys for resolved operations.
 
 use crate::mir::inputs::MirValue;
-use crate::mir::kernel_backend::{
-    DirectKernel, DirectKernelTemplate, KernelCacheKey, KernelVariantKey,
-};
+use crate::mir::kernel_backend::{KernelCacheKey, KernelVariantKey};
 use crate::mir::operation::Operation;
 use crate::mir::workgroup_shape::WorkgroupShape;
-use crate::tensor::TensorData;
 
-struct DecodePlanCacheKernelVariant;
-const DECODE_PLAN_CACHE_SIZE: usize = 4096;
-
-type DecodePlanCacheKey = (KernelCacheKey, u64);
+struct DirectPlanCacheKernelVariant;
 
 pub(crate) fn structural_kernel_key(
     operation: &dyn Operation,
@@ -54,195 +14,11 @@ pub(crate) fn structural_kernel_key(
 ) -> KernelCacheKey {
     let dispatch_size = operation.dispatch_size(workgroup, inputs);
     operation.kernel_cache_key_with_dispatch(
-        KernelVariantKey::of::<DecodePlanCacheKernelVariant>(),
+        KernelVariantKey::of::<DirectPlanCacheKernelVariant>(),
         Some(workgroup),
         dispatch_size,
         inputs,
     )
-}
-
-/// Where one of a kernel's bound buffers comes from on each decode token.
-enum BufSource {
-    /// The operation's output buffer (freshly allocated every token).
-    Output,
-    /// The buffer of `inputs[i]` (a graph tensor or a quantized matrix).
-    Input(usize),
-    /// A buffer that is neither an input nor the output — a model weight or a
-    /// scratch buffer allocated during the build. Stable across tokens, so we
-    /// hold the `Arc` and reuse it. (Reuse is safe: submits execute in queue
-    /// order, so a scratch buffer is never read by token N while token N+1
-    /// writes it.)
-    Const(Arc<wgpu::Buffer>),
-}
-
-/// A memoized build result for a single operation: the kernel templates plus,
-/// for each kernel, where to source its buffers from on a replay.
-struct CachedOpPlan {
-    kernels: Vec<(DirectKernelTemplate, Vec<BufSource>)>,
-}
-
-impl CachedOpPlan {
-    fn record(built: &[DirectKernel], inputs: &[MirValue], output: &TensorData) -> Self {
-        let output_buf = output.buffer();
-        let kernels = built
-            .iter()
-            .map(|kernel| {
-                let sources = kernel
-                    .binding_buffers()
-                    .iter()
-                    .map(|buffer| classify_buffer(buffer, inputs, output_buf))
-                    .collect();
-                (kernel.to_template(), sources)
-            })
-            .collect();
-        Self { kernels }
-    }
-
-    fn rebind(&self, inputs: &[MirValue], output: &TensorData) -> Vec<DirectKernel> {
-        self.kernels
-            .iter()
-            .map(|(template, sources)| {
-                let new_buffers = sources
-                    .iter()
-                    .map(|source| match source {
-                        BufSource::Output => output.buffer().clone(),
-                        BufSource::Input(i) => mir_buffer(&inputs[*i])
-                            .expect("cached Input source must resolve to a buffer")
-                            .clone(),
-                        BufSource::Const(buffer) => buffer.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                template.bind_buffers(&new_buffers)
-            })
-            .collect()
-    }
-}
-
-fn mir_buffer(value: &MirValue) -> Option<&Arc<wgpu::Buffer>> {
-    match value {
-        MirValue::Tensor(tensor) => Some(tensor.buffer()),
-        MirValue::QMatrix(matrix) => Some(matrix.buffer()),
-        MirValue::Integer(_) | MirValue::Float(_) => None,
-    }
-}
-
-fn classify_buffer(
-    buffer: &Arc<wgpu::Buffer>,
-    inputs: &[MirValue],
-    output_buf: &Arc<wgpu::Buffer>,
-) -> BufSource {
-    if Arc::ptr_eq(buffer, output_buf) {
-        return BufSource::Output;
-    }
-    for (i, input) in inputs.iter().enumerate() {
-        if let Some(input_buf) = mir_buffer(input)
-            && Arc::ptr_eq(buffer, input_buf)
-        {
-            return BufSource::Input(i);
-        }
-    }
-    BufSource::Const(buffer.clone())
-}
-
-fn fingerprint_aliases(inputs: &[MirValue], output: &TensorData) -> u64 {
-    let mut hasher = FxHasher::default();
-    1u8.hash(&mut hasher);
-    inputs.len().hash(&mut hasher);
-    let mut seen = Vec::new();
-    for input in inputs {
-        let class = mir_buffer(input).map(|buffer| alias_class(&mut seen, buffer));
-        class.hash(&mut hasher);
-    }
-    alias_class(&mut seen, output.buffer()).hash(&mut hasher);
-    hasher.finish()
-}
-
-fn alias_class<'a>(seen: &mut Vec<&'a Arc<wgpu::Buffer>>, buffer: &'a Arc<wgpu::Buffer>) -> usize {
-    if let Some(index) = seen
-        .iter()
-        .position(|candidate| Arc::ptr_eq(*candidate, buffer))
-    {
-        index
-    } else {
-        let index = seen.len();
-        seen.push(buffer);
-        index
-    }
-}
-
-/// Persistent, device-wide cache of decode plans, keyed by the structural
-/// kernel key plus the current input/output aliasing pattern.
-pub(crate) struct DecodePlanCache {
-    enabled: bool,
-    plans: Mutex<LruCache<DecodePlanCacheKey, CachedOpPlan, FxBuildHasher>>,
-    hits: AtomicU64,
-    misses: AtomicU64,
-}
-
-impl std::fmt::Debug for DecodePlanCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DecodePlanCache")
-            .field("enabled", &self.enabled)
-            .finish()
-    }
-}
-
-impl DecodePlanCache {
-    pub(crate) fn new() -> Self {
-        Self {
-            enabled: std::env::var_os("FUSOR_DISABLE_DECODE_PLAN_CACHE").is_none(),
-            plans: Mutex::new(LruCache::with_hasher(
-                NonZeroUsize::new(DECODE_PLAN_CACHE_SIZE)
-                    .expect("decode plan cache size must be non-zero"),
-                Default::default(),
-            )),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-        }
-    }
-
-    pub(crate) fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    /// Return kernels for a structurally unchanged operation by rebinding a
-    /// cached template to the current token's buffers. On miss, build and cache
-    /// a new bufferless plan.
-    pub(crate) fn resolve_op(
-        &self,
-        kernel_key: KernelCacheKey,
-        inputs: &[MirValue],
-        output: &TensorData,
-        build: impl FnOnce() -> Vec<DirectKernel>,
-    ) -> Vec<DirectKernel> {
-        let alias_fp = fingerprint_aliases(inputs, output);
-        let cache_key = (kernel_key, alias_fp);
-
-        {
-            let mut plans = self.plans.lock();
-            if let Some(plan) = plans.get(&cache_key) {
-                let hit_total = self.hits.fetch_add(1, Ordering::Relaxed) + 1;
-                trace_cache_event(hit_total, self.misses.load(Ordering::Relaxed));
-                return plan.rebind(inputs, output);
-            }
-        }
-
-        let miss_total = self.misses.fetch_add(1, Ordering::Relaxed) + 1;
-        trace_cache_event(self.hits.load(Ordering::Relaxed), miss_total);
-        let built = build();
-        self.plans
-            .lock()
-            .put(cache_key, CachedOpPlan::record(&built, inputs, output));
-        built
-    }
-}
-
-fn trace_cache_event(hits: u64, misses: u64) {
-    // Mirror the resolve host-trace gate (always on for wasm, env-gated on
-    // native) so the cache hit rate shows up alongside `resolve_host_profile`.
-    if cfg!(target_arch = "wasm32") || std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some() {
-        tracing::info!("decode_plan_cache hit={hits} miss={misses}");
-    }
 }
 
 #[cfg(test)]
@@ -301,6 +77,11 @@ mod tests {
         read_rows(&(&a + &b)).await
     }
 
+    async fn run_pairwise_self_add(device: &Device) -> Vec<f32> {
+        let a = Tensor::new::<f32, 2, _>(device, &[[1.0f32, 2.0, 3.0, 4.0]]);
+        read_rows(&(&a + &a)).await
+    }
+
     async fn run_pairwise_mul(device: &Device) -> Vec<f32> {
         let a = Tensor::new::<f32, 2, _>(device, &[[1.0f32, 2.0, 3.0, 4.0]]);
         let b = Tensor::new::<f32, 2, _>(device, &[[0.5f32, -1.0, 2.0, -0.25]]);
@@ -320,9 +101,10 @@ mod tests {
         read_rows(&base.slice_assign(slices, &value)).await
     }
 
-    // Exercises the `Sequence` kernel arm (scratch + reduce + write passes) with
-    // its scratch buffer reused across tokens: a large softmax takes the split
-    // path. `seed` makes the input (and output) input-dependent.
+    // Exercises the `Sequence` kernel arm (scratch + reduce + write passes). A
+    // large softmax takes the split path; candidate direct-plan bindings are not
+    // inserted because scratch bindings are allocated inside the build.
+    // `seed` makes the input (and output) input-dependent.
     async fn run_softmax(device: &Device, seed: f32) -> Vec<f32> {
         let data: Vec<f32> = (0..4096)
             .map(|i| ((i as f32) * 0.001 + seed).sin())
@@ -354,7 +136,7 @@ mod tests {
     // reference. Covers both build arms, including the fused-epilogue qmatmul the
     // old fast cache could not key.
     #[test]
-    fn decode_plan_cache_rebind_matches_fresh_build() {
+    fn direct_plan_cache_rebind_matches_fresh_build() {
         pollster::block_on(async {
             let Ok(device) = Device::new().await else {
                 return;
@@ -389,22 +171,22 @@ mod tests {
             assert_close(&hit_u, &golden_u, "nary: rebind with new buffers");
             assert!(hit_u != hit_v, "nary: different inputs must differ");
 
-            // --- Sequence arm (split softmax with a reused scratch buffer) ---
+            // --- Sequence arm (split softmax, not direct-plan cached yet) ---
             let miss_v = run_softmax(&device, 0.0).await;
-            let hit_v = run_softmax(&device, 0.0).await;
+            let repeat_v = run_softmax(&device, 0.0).await;
             assert_eq!(
-                miss_v, hit_v,
-                "softmax: rebind must byte-match the cold build"
+                miss_v, repeat_v,
+                "softmax: repeat build must byte-match the cold build"
             );
-            let hit_u = run_softmax(&device, 0.7).await;
+            let next_u = run_softmax(&device, 0.7).await;
             let golden_u = run_softmax(&golden, 0.7).await;
-            assert_close(&hit_u, &golden_u, "softmax: rebind with new buffers");
-            assert!(hit_u != hit_v, "softmax: different inputs must differ");
+            assert_close(&next_u, &golden_u, "softmax: rebuild with new buffers");
+            assert!(next_u != repeat_v, "softmax: different inputs must differ");
         });
     }
 
     #[test]
-    fn decode_plan_cache_distinguishes_same_shape_generic_ops() {
+    fn direct_plan_cache_distinguishes_same_shape_generic_ops() {
         pollster::block_on(async {
             let Ok(device) = Device::new().await else {
                 return;
@@ -423,7 +205,33 @@ mod tests {
     }
 
     #[test]
-    fn decode_plan_cache_distinguishes_same_shape_slice_assign_ranges() {
+    fn direct_plan_cache_rebinds_repeated_binding_slots_positionally() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let Ok(golden) = Device::new().await else {
+                return;
+            };
+
+            let alias_add = run_pairwise_self_add(&device).await;
+            let distinct_add = run_pairwise_add(&device).await;
+            let golden_distinct_add = run_pairwise_add(&golden).await;
+
+            assert_close(
+                &distinct_add,
+                &golden_distinct_add,
+                "repeated binding slots: distinct add after self add",
+            );
+            assert!(
+                distinct_add != alias_add,
+                "repeated binding slots: distinct add must not reuse the repeated buffer"
+            );
+        });
+    }
+
+    #[test]
+    fn direct_plan_cache_distinguishes_same_shape_slice_assign_ranges() {
         pollster::block_on(async {
             let Ok(device) = Device::new().await else {
                 return;

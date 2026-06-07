@@ -9,7 +9,7 @@ use fusor_tile_ir_runtime::{BufferPool, KernelCache};
 use wgpu::{BackendOptions, Dx12BackendOptions};
 
 use crate::{
-    compute_graph::{ComputeGraph, DecodePlanCache},
+    compute_graph::ComputeGraph,
     kernel_selection::{CooperativeMatrixCaps, CooperativeMatrixKind},
 };
 
@@ -148,10 +148,6 @@ struct DeviceInner {
     queue: Arc<wgpu::Queue>,
     kernel_cache: KernelCache,
     buffer_pool: BufferPool,
-    /// Memoizes per-op `build_kernel` results across structurally-identical
-    /// decode tokens (see [`DecodePlanCache`]). The dominant per-token host
-    /// cost on the web build.
-    decode_plan_cache: DecodePlanCache,
     cooperative_matrix_caps: CooperativeMatrixCaps,
     compute_graph: OnceLock<ComputeGraph>,
     /// When set, this device reports `subgroups_supported() == false` so kernel
@@ -214,7 +210,6 @@ impl Device {
             queue,
             kernel_cache,
             buffer_pool,
-            decode_plan_cache: DecodePlanCache::new(),
             cooperative_matrix_caps: src.cooperative_matrix_caps,
             compute_graph: OnceLock::new(),
             disable_subgroups,
@@ -364,7 +359,6 @@ impl Device {
             queue,
             kernel_cache,
             buffer_pool,
-            decode_plan_cache: DecodePlanCache::new(),
             cooperative_matrix_caps,
             compute_graph: OnceLock::new(),
             disable_subgroups,
@@ -545,10 +539,6 @@ impl Device {
 
     pub(crate) fn kernel_cache(&self) -> &KernelCache {
         &self.inner.kernel_cache
-    }
-
-    pub(crate) fn decode_plan_cache(&self) -> &DecodePlanCache {
-        &self.inner.decode_plan_cache
     }
 
     /// Reset the initialized flag on all cached buffers.

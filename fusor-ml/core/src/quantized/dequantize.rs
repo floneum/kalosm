@@ -200,7 +200,7 @@ impl Operation for DequantizeOperation {
             .max_compute_workgroups_per_dimension
             .max(1);
         let dispatch_x = workgroups.min(max_workgroups);
-        let dispatch_y = workgroups.div_ceil(dispatch_x);
+        let dispatch_y = workgroups.div_ceil(dispatch_x.max(1)).max(1);
         if dispatch_y > max_workgroups {
             return None;
         }
@@ -214,7 +214,7 @@ impl Operation for DequantizeOperation {
         let output_buffer = output.buffer().clone();
         let output_layout = tile_ir::Layout::contiguous(
             tile_ir::MemoryLevel::Storage,
-            tile_ir::Shape::new([total]),
+            tile_ir::Shape::new([total.max(1)]),
         );
         let output_datatype = self.datatype;
         kernel_backend::run_kernel(

@@ -3,7 +3,6 @@ use std::{any::Any, sync::Arc};
 use parking_lot::RwLock;
 pub use petgraph::graph::NodeIndex;
 use petgraph::prelude::StableGraph;
-pub(crate) use resolve::DecodePlanCache;
 use resolve::Resolver;
 use rustc_hash::FxHashMap;
 #[cfg(feature = "graphvis")]

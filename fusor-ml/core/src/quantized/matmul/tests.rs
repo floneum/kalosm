@@ -691,6 +691,158 @@ mod tests {
     }
 
     #[test]
+    fn primitive_f32_coop_mma_matches_logical_a_times_b() {
+        use std::hash::Hash;
+
+        use crate::kernel_selection::CooperativeMatrixKind;
+        use crate::mir::kernel_backend;
+        use fusor_tile_ir::{
+            ElementType, KernelTensorRef, Layout, MemoryLevel, ScalarElement, Shape,
+        };
+
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let Some(coop_token) = device.coop_token(CooperativeMatrixKind::F32F32M8N8K8) else {
+                return;
+            };
+
+            const DIM: usize = 8;
+            let a = (0..DIM * DIM)
+                .map(|i| ((i.wrapping_mul(31).wrapping_add(7)) % 97) as f32 * 0.003 - 0.14)
+                .collect::<Vec<_>>();
+            let b = (0..DIM * DIM)
+                .map(|i| ((i.wrapping_mul(53).wrapping_add(3)) % 89) as f32 * 0.004 - 0.17)
+                .collect::<Vec<_>>();
+            let a_buffer = device.create_buffer_init(
+                bytemuck::cast_slice(&a),
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            );
+            let b_buffer = device.create_buffer_init(
+                bytemuck::cast_slice(&b),
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            );
+            let y_buffer = device.create_buffer(
+                (DIM * DIM * size_of::<f32>()) as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            );
+            let layout =
+                Layout::contiguous(MemoryLevel::Storage, Shape::new([DIM as u32, DIM as u32]));
+            let cache_key = kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
+                "primitive_f32_coop_mma_matches_logical_a_times_b".hash(state);
+            });
+            let kernel = kernel_backend::run_kernel(
+                device.kernel_cache(),
+                "primitive_f32_coop_mma_matches_logical_a_times_b",
+                cache_key,
+                [1, 1, 1],
+                |kb| {
+                    let a_storage = kb.read(
+                        ElementType::F32,
+                        KernelTensorRef::new(a_buffer.clone(), layout.clone()),
+                    );
+                    let b_storage = kb.read(
+                        ElementType::F32,
+                        KernelTensorRef::new(b_buffer.clone(), layout.clone()),
+                    );
+                    let y_storage = kb.write(
+                        ElementType::F32,
+                        KernelTensorRef::new(y_buffer.clone(), layout),
+                    );
+                    let program = kb.program();
+                    let a_tile = program.alloc_workgroup_tile(ScalarElement::F32, 8, 8);
+                    let b_tile = program.alloc_workgroup_tile(ScalarElement::F32, 8, 8);
+                    program.program_grid(32, [1, 1, 1], |program| {
+                        program.fill_tile(&a_tile, &a_storage, 0u32, 0u32);
+                        program.fill_tile(&b_tile, &b_storage, 0u32, 0u32);
+                        program.workgroup_barrier();
+
+                        let acc = coop_token.alloc_coop_acc(program, ScalarElement::F32, 8, 8);
+                        let zero = coop_token.coop_zero(program, ScalarElement::F32, 8, 8);
+                        coop_token.store_local_coop(program, &acc, zero);
+                        let a_frag = coop_token.coop_load_a(
+                            program,
+                            &a_tile,
+                            0u32,
+                            0u32,
+                            ScalarElement::F32,
+                            8,
+                            8,
+                        );
+                        let b_frag = coop_token.coop_load_b(
+                            program,
+                            &b_tile,
+                            0u32,
+                            0u32,
+                            ScalarElement::F32,
+                            8,
+                            8,
+                        );
+                        let c_value = coop_token.load_local_coop(program, &acc);
+                        let mma = coop_token.coop_mma(program, a_frag, b_frag, c_value);
+                        coop_token.store_local_coop(program, &acc, mma);
+                        coop_token.coop_store(program, &acc, &y_storage, 0u32, 0u32);
+                    });
+                    Some(())
+                },
+            )
+            .expect("kernel should build");
+
+            let output_bytes = (DIM * DIM * size_of::<f32>()) as u64;
+            let download = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("primitive f32 coop mma download"),
+                size: output_bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            kernel.run(device.kernel_cache(), &mut encoder);
+            encoder.copy_buffer_to_buffer(&y_buffer, 0, &download, 0, output_bytes);
+            device.wgpu_queue().submit(Some(encoder.finish()));
+
+            let (sender, receiver) = std::sync::mpsc::channel();
+            download
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = sender.send(result);
+                });
+            device.poll_wait();
+            receiver.recv().unwrap().unwrap();
+            let view = download.slice(..).get_mapped_range();
+            let actual = bytemuck::cast_slice::<u8, f32>(&view).to_vec();
+            drop(view);
+            download.unmap();
+
+            let mut expected = [0.0f32; DIM * DIM];
+            for r in 0..DIM {
+                for c in 0..DIM {
+                    expected[r * DIM + c] =
+                        (0..DIM).map(|kk| a[r * DIM + kk] * b[kk * DIM + c]).sum();
+                }
+            }
+
+            let mut worst = 0.0f32;
+            let mut wi = 0usize;
+            for (i, (x, y)) in actual.iter().zip(expected.iter()).enumerate() {
+                let err = (x - y).abs();
+                if err > worst {
+                    worst = err;
+                    wi = i;
+                }
+            }
+            assert!(
+                worst < 1e-4,
+                "primitive f32 coop MMA mismatch at {wi}: actual={} expected={} worst={worst} actual={actual:?} expected={expected:?}",
+                actual[wi],
+                expected[wi]
+            );
+        });
+    }
+
+    #[test]
     fn single_row_qgemv_subgroup_matches_no_subgroup() {
         pollster::block_on(async {
             let Ok(device) = Device::new().await else {

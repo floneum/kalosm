@@ -24,7 +24,7 @@ mod fusion_matmul;
 mod plan_cache;
 mod run;
 
-pub(crate) use plan_cache::{DecodePlanCache, structural_kernel_key};
+pub(crate) use plan_cache::structural_kernel_key;
 
 pub(crate) struct ResolverResult {
     pub(crate) data: TensorData,

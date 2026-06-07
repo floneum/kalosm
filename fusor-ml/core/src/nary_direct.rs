@@ -65,9 +65,6 @@ fn build_nary_direct_kernel_with_output_index(
     }
 
     let total_elements = total_elements(&operation.shape)?;
-    if total_elements == 0 {
-        return Some(DirectKernel::sequence("nary_direct_empty", Vec::new()));
-    }
     let small_dispatch = total_elements < BLOCK as u32;
     let dispatch_size = if small_dispatch {
         [total_elements, 1, 1]

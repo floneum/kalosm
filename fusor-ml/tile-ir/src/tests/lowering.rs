@@ -265,7 +265,7 @@ fn typed_coop_accumulator_records_scalar_role_and_shape() {
 }
 
 #[test]
-fn cooperative_load_store_layout_flags_match_affine_layouts() {
+fn cooperative_load_store_layout_flags_use_transposed_internal_layout() {
     fn collect_coop_store_row_major(block: &naga::Block, out: &mut Vec<bool>) {
         for stmt in block.iter() {
             match stmt {
@@ -330,10 +330,10 @@ fn cooperative_load_store_layout_flags_match_affine_layouts() {
     let col_major = Layout::strided(MemoryLevel::Storage, Shape::new([8, 8]), &[1, 8]);
 
     let (loads, stores) = lowered_coop_layout_flags(row_major);
-    assert_eq!(loads, [true, true]);
-    assert_eq!(stores, [true]);
+    assert_eq!(loads, [false, false]);
+    assert_eq!(stores, [false]);
 
     let (loads, stores) = lowered_coop_layout_flags(col_major);
-    assert_eq!(loads, [true, true]);
-    assert_eq!(stores, [false]);
+    assert_eq!(loads, [false, false]);
+    assert_eq!(stores, [true]);
 }

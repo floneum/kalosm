@@ -188,10 +188,6 @@ impl DirectKernel {
                 weight,
                 output,
             } => {
-                let [x, y, z] = self.dispatch_size;
-                if x * y * z == 0 {
-                    return None;
-                }
                 let bind_group_layout = cache.direct_three_buffer_bind_group_layout();
                 let bind_entries = [
                     wgpu::BindGroupEntry {
@@ -222,10 +218,6 @@ impl DirectKernel {
                 })
             }
             DirectKernelKind::Dynamic { cached, bindings } => {
-                let [x, y, z] = self.dispatch_size;
-                if x * y * z == 0 {
-                    return None;
-                }
                 let bind_group_layout = cached
                     .dynamic_bind_group_layout
                     .get_or_init(|| {
@@ -382,9 +374,9 @@ impl DirectKernel {
     }
 
     /// The buffers this kernel binds, in the canonical order used internally by
-    /// `prepare_dispatch` (and mirrored by `rebind_buffers`). Used by the decode
-    /// plan cache to record where each binding's buffer comes from so the kernel
-    /// can be replayed across tokens with fresh buffers.
+    /// `prepare_dispatch` (and mirrored by `rebind_buffers`). Used by plan
+    /// caches to record where each binding's buffer comes from so the kernel can
+    /// be replayed with fresh per-resolve binding buffers.
     pub fn binding_buffers(&self) -> Vec<Arc<wgpu::Buffer>> {
         let mut out = Vec::new();
         self.collect_buffers(&mut out);
@@ -417,9 +409,9 @@ impl DirectKernel {
     /// Clone this kernel, replacing its bound buffers positionally with `new`
     /// (which must have exactly `binding_buffers().len()` entries in the same
     /// order). The compiled pipeline / cached analysis is preserved; only the
-    /// buffers (i.e. the bind-group inputs) change. This lets the decode plan
-    /// cache reuse a kernel built on a previous token while swapping in the
-    /// current token's input/output buffers.
+    /// buffers (i.e. the bind-group resources) change. This lets a plan cache
+    /// reuse a kernel built during a previous resolve while swapping in the
+    /// current replay buffers.
     pub fn rebind_buffers(&self, new: &[Arc<wgpu::Buffer>]) -> Self {
         let mut cursor = 0;
         let kernel = self.rebind_from(new, &mut cursor);
@@ -551,6 +543,9 @@ impl PreparedDirectDispatch {
             return;
         };
         let [x, y, z] = step.dispatch_size;
+        if step.dispatch_size.contains(&0) {
+            return;
+        }
         pass.set_pipeline(&step.pipeline);
         pass.set_bind_group(0, &step.bind_group, &[]);
         pass.dispatch_workgroups(x, y, z);

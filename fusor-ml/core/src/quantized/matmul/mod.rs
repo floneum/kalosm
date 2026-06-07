@@ -797,13 +797,9 @@ fn split_workgroups_2d(
     total_workgroups: u32,
     max_workgroups_per_dimension: u32,
 ) -> Option<[u32; 2]> {
-    if total_workgroups == 0 {
-        return Some([1, 1]);
-    }
-
     let max_workgroups_per_dimension = max_workgroups_per_dimension.max(1);
     let x = total_workgroups.min(max_workgroups_per_dimension);
-    let y = total_workgroups.div_ceil(x);
+    let y = total_workgroups.div_ceil(x.max(1)).max(1);
     (y <= max_workgroups_per_dimension).then_some([x, y])
 }
 
