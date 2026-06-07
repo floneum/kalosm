@@ -146,9 +146,7 @@ pub fn mirostat2<B>(kb: &mut fusor_tile_ir::KernelBuilder<B>, spec: Mirostat2<B>
             let flag = program.load(exactness_flag.at(0), Mask::all(), TileLiteral::U32(0));
             let retry = flag.eq(Tile::literal(TileLiteral::U32(0)));
             program.if_then(retry, |program| {
-                let first_lane = program
-                    .index(lane.clone())
-                    .eq(Tile::literal(TileLiteral::U32(0)));
+                let first_lane = lane.clone().eq(Tile::literal(TileLiteral::U32(0)));
                 program.if_then(first_lane, |program| {
                     store_sample_result(
                         program,
@@ -164,9 +162,7 @@ pub fn mirostat2<B>(kb: &mut fusor_tile_ir::KernelBuilder<B>, spec: Mirostat2<B>
         let top_id = mirostat_top_id(program, &ids, meta, Tile::literal(TileLiteral::U32(0)));
         let invalid = top_id.eq(Tile::literal(TileLiteral::U32(u32::MAX)));
         program.if_then(invalid, |program| {
-            let first_lane = program
-                .index(lane.clone())
-                .eq(Tile::literal(TileLiteral::U32(0)));
+            let first_lane = lane.clone().eq(Tile::literal(TileLiteral::U32(0)));
             program.if_then(first_lane, |program| {
                 store_sample_result(
                     program,
@@ -181,7 +177,7 @@ pub fn mirostat2<B>(kb: &mut fusor_tile_ir::KernelBuilder<B>, spec: Mirostat2<B>
         let max_value =
             mirostat_top_value(program, &values, meta, Tile::literal(TileLiteral::U32(0)));
         program.store_local(&local_sum, Tile::literal(TileLiteral::f32(0.0)));
-        program.store_local(&index, program.index(lane.clone()));
+        program.store_local(&index, lane.clone());
         program.loop_forever(|program| {
             let index_value = program.load_local(&index);
             program.break_if(
@@ -206,9 +202,7 @@ pub fn mirostat2<B>(kb: &mut fusor_tile_ir::KernelBuilder<B>, spec: Mirostat2<B>
 
         reduce_workgroup(program, &scratch, lane.clone(), |lhs, rhs| lhs + rhs);
 
-        let first_lane = program
-            .index(lane.clone())
-            .eq(Tile::literal(TileLiteral::U32(0)));
+        let first_lane = lane.clone().eq(Tile::literal(TileLiteral::U32(0)));
         program.if_else(
             first_lane,
             |program| {
@@ -395,9 +389,7 @@ pub fn standard_sampler<B>(
             let flag = program.load(exactness_flag.at(0), Mask::all(), TileLiteral::U32(0));
             let retry = flag.eq(Tile::literal(TileLiteral::U32(0)));
             program.if_then(retry, |program| {
-                let first_lane = program
-                    .index(lane.clone())
-                    .eq(Tile::literal(TileLiteral::U32(0)));
+                let first_lane = lane.clone().eq(Tile::literal(TileLiteral::U32(0)));
                 program.if_then(first_lane, |program| {
                     store_sample_result(
                         program,
@@ -413,9 +405,7 @@ pub fn standard_sampler<B>(
         let top_id = mirostat_top_id(program, &ids, meta, Tile::literal(TileLiteral::U32(0)));
         let invalid = top_id.eq(Tile::literal(TileLiteral::U32(u32::MAX)));
         program.if_then(invalid, |program| {
-            let first_lane = program
-                .index(lane.clone())
-                .eq(Tile::literal(TileLiteral::U32(0)));
+            let first_lane = lane.clone().eq(Tile::literal(TileLiteral::U32(0)));
             program.if_then(first_lane, |program| {
                 store_sample_result(
                     program,
@@ -431,7 +421,7 @@ pub fn standard_sampler<B>(
             mirostat_top_value(program, &values, meta, Tile::literal(TileLiteral::U32(0)));
         let min_p = load_param_f32(program, &params, 2);
         program.store_local(&local_sum, Tile::literal(TileLiteral::f32(0.0)));
-        program.store_local(&index, program.index(lane.clone()));
+        program.store_local(&index, lane.clone());
         program.loop_forever(|program| {
             let index_value = program.load_local(&index);
             program.break_if(
@@ -459,9 +449,7 @@ pub fn standard_sampler<B>(
 
         reduce_workgroup(program, &scratch, lane.clone(), |lhs, rhs| lhs + rhs);
 
-        let first_lane = program
-            .index(lane.clone())
-            .eq(Tile::literal(TileLiteral::U32(0)));
+        let first_lane = lane.clone().eq(Tile::literal(TileLiteral::U32(0)));
         program.if_else(
             first_lane,
             |program| {

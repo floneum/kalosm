@@ -760,7 +760,7 @@ mod tests {
 
                         let acc = coop_token.alloc_coop_acc(program, ScalarElement::F32, 8, 8);
                         let zero = coop_token.coop_zero(program, ScalarElement::F32, 8, 8);
-                        coop_token.store_local_coop(program, &acc, zero);
+                        coop_token.coop_store_local(program, &acc, zero);
                         let a_frag = coop_token.coop_load_a(
                             program,
                             &a_tile,
@@ -779,9 +779,9 @@ mod tests {
                             8,
                             8,
                         );
-                        let c_value = coop_token.load_local_coop(program, &acc);
+                        let c_value = coop_token.coop_load_local(program, &acc);
                         let mma = coop_token.coop_mma(program, a_frag, b_frag, c_value);
-                        coop_token.store_local_coop(program, &acc, mma);
+                        coop_token.coop_store_local(program, &acc, mma);
                         coop_token.coop_store(program, &acc, &y_storage, 0u32, 0u32);
                     });
                     Some(())

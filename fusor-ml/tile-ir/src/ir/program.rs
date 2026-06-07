@@ -16,7 +16,7 @@ pub struct KernelIr {
     /// Workgroup invocation count.
     pub block: u32,
     /// Program statements.
-    pub body: Vec<Stmt>,
+    pub(crate) body: Vec<Stmt>,
 }
 
 impl Default for KernelIr {
@@ -31,11 +31,6 @@ impl Default for KernelIr {
 }
 
 impl KernelIr {
-    /// The statements that form the kernel body.
-    pub fn body(&self) -> &[Stmt] {
-        &self.body
-    }
-
     /// Lower this IR into a validated Naga module.
     pub fn lower_to_naga(&self) -> Result<NagaKernel, LowerError> {
         crate::lower::lower_to_naga(self)

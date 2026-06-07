@@ -7,10 +7,10 @@ use crate::ir::{Addr, CoopMatrixRole, CoopSrc, ElementType, Expr, ExprKind, Scal
 impl TileBlock<'_> {
     /// Allocate a cooperative-matrix accumulator local (role `C`). Coop
     /// accumulators are mutable private locals; zero/set/mma are composed
-    /// through [`store_local_coop`](Self::store_local_coop):
-    /// - zero: `store_local_coop(acc, coop_zero(..))`
-    /// - set:  `store_local_coop(acc, coop_load_c_broadcast(..))`
-    /// - mma:  `store_local_coop(acc, coop_mma(a, b, load_local_coop(acc)))`
+    /// through [`coop_store_local`](Self::coop_store_local):
+    /// - zero: `coop_store_local(acc, coop_zero(..))`
+    /// - set:  `coop_store_local(acc, coop_load_c_broadcast(..))`
+    /// - mma:  `coop_store_local(acc, coop_mma(a, b, coop_load_local(acc)))`
     pub(crate) fn alloc_coop_acc(
         &mut self,
         scalar: ScalarElement,
@@ -29,13 +29,13 @@ impl TileBlock<'_> {
     }
 
     /// Load the current SSA value of a coop accumulator.
-    pub(crate) fn load_local_coop(&self, acc: &CoopAcc) -> Tile {
+    pub(crate) fn coop_load_local(&self, acc: &CoopAcc) -> Tile {
         load_coop_acc(acc)
     }
 
     /// Store a coop value into an accumulator. The lowerer chains MMA stores
     /// through the acc-value SSA memo (1 Load + N MMA + 1 Store per iteration).
-    pub(crate) fn store_local_coop(&mut self, acc: &CoopAcc, value: Tile) {
+    pub(crate) fn coop_store_local(&mut self, acc: &CoopAcc, value: Tile) {
         self.push_stmt(Stmt::StoreLocal {
             dst: acc.decl().clone(),
             value: value.into_expr(),
@@ -43,7 +43,7 @@ impl TileBlock<'_> {
     }
 
     /// A zeroed coop-`C` accumulator value. Composed via
-    /// `store_local_coop(acc, coop_zero(..))` for the zero-init case.
+    /// `coop_store_local(acc, coop_zero(..))` for the zero-init case.
     ///
     /// Shaped as a `Cast` of an f32 zero literal to the coop-`C` element type:
     /// it introduces no spurious decls, and the lowerer lowers a cast to a
@@ -146,7 +146,7 @@ impl TileBlock<'_> {
     }
 
     /// `a * b + c` over cooperative fragments — value-producing. Compose with
-    /// `store_local_coop(acc, coop_mma(a, b, load_local_coop(acc)))`.
+    /// `coop_store_local(acc, coop_mma(a, b, coop_load_local(acc)))`.
     pub(crate) fn coop_mma(&self, a: Tile, b: Tile, c: Tile) -> Tile {
         let ty = c.element();
         Tile::new(

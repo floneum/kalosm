@@ -1,6 +1,6 @@
 //! Quantized matrix multiply program kernels.
 
-use fusor_tile_ir::tile::{range, Program, Storage};
+use fusor_tile_ir::tile::{range, Program, Storage, Tile};
 use fusor_tile_ir::{CoopMatrixToken, QuantizedMatrix, ScalarElement, WorkgroupAxis};
 
 use crate::{
@@ -139,7 +139,7 @@ pub(crate) fn qmatmul_tile_with_epilogue(
             let col = program.program_id(WorkgroupAxis::X) * SCALAR_BN + col_lane;
             let [partial] = program.fold(
                 range(k_iterations),
-                [program.f32(0.0)],
+                [Tile::f32(0.0)],
                 |program, loop_index, [acc]| {
                     let k_index = loop_index * SCALAR_BK + k_lane.clone();
                     let mask = row.lt(m).and(col.lt(b.cols)).and(k_index.lt(k));

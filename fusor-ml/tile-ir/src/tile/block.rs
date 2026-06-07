@@ -1,4 +1,4 @@
-use super::value::{boxed_index, zero_fill, Address, CoopAcc, PrivateLocal, WorkgroupTile};
+use super::value::{boxed_index, zero_expr, Address, CoopAcc, PrivateLocal, WorkgroupTile};
 use super::{Mask, Program, Storage, Tile};
 use crate::ir::{
     Accumulator, Builtin, ElementType, Expr, ExprKind, Local, ScalarElement, Source, Stmt,
@@ -52,29 +52,6 @@ impl TileBlock<'_> {
     /// Workgroup invocation count (`block`).
     pub fn block_size(&self) -> u32 {
         self.block
-    }
-
-    // ---- literals --------------------------------------------------------
-
-    /// A typed scalar literal.
-    pub fn literal(&self, value: impl Into<TileLiteral>) -> Tile {
-        Tile::literal(value)
-    }
-    /// An f32 literal.
-    pub fn f32(&self, value: f32) -> Tile {
-        Tile::f32(value)
-    }
-    /// A u32 literal.
-    pub fn u32(&self, value: u32) -> Tile {
-        Tile::u32(value)
-    }
-    /// A bool literal.
-    pub fn bool(&self, value: bool) -> Tile {
-        Tile::bool(value)
-    }
-    /// Coerce any index-like value into a `u32`-typed tile.
-    pub fn index(&self, value: impl Into<Tile>) -> Tile {
-        value.into()
     }
 
     // ---- loads / stores --------------------------------------------------
@@ -213,7 +190,7 @@ impl TileBlock<'_> {
                     col: boxed_index(col),
                 },
                 mask: Box::new(Tile::all().into_expr()),
-                fill: Box::new(zero_fill(scalar_of(src.element()))),
+                fill: Box::new(zero_expr(scalar_of(src.element()).element())),
             },
             scalar_of(src.element()).element(),
         );

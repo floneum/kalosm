@@ -1,4 +1,7 @@
 use super::*;
+// Raw IR node types are no longer re-exported at the crate root; tests build IR
+// trees directly, so pull them from the internal module.
+use crate::ir::*;
 
 mod golden;
 mod layout;

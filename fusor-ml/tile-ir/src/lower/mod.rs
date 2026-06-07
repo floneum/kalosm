@@ -46,11 +46,6 @@ impl NagaKernel {
         &self.info
     }
 
-    /// WGSL extensions required when this kernel is serialized to WGSL.
-    pub fn wgsl_extensions(&self) -> WgslExtensions {
-        self.wgsl_extensions
-    }
-
     /// Extension directives to prepend before Naga's WGSL output.
     pub fn wgsl_extension_prelude(&self) -> &'static str {
         self.wgsl_extensions.prelude()
@@ -66,11 +61,6 @@ pub struct WgslExtensions {
 impl WgslExtensions {
     pub(crate) fn new(subgroups: bool) -> Self {
         Self { subgroups }
-    }
-
-    /// Whether this kernel needs `enable subgroups;` in WGSL.
-    pub fn subgroups(self) -> bool {
-        self.subgroups
     }
 
     /// Text that must appear before Naga's serialized WGSL declarations.

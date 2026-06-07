@@ -32,14 +32,16 @@ mod quantized;
 pub mod tile;
 
 pub use ir::{
-    Accumulator, Addr, AxisGroup, Buffer, BufferAccess, BufferDecl, Builtin, CoopMatrixRole,
-    CoopSrc, ElementType, Expr, ExprKind, F32Bits, KernelIr, Layout, Local, LocalDecl, MemoryLevel,
-    MultiFlattenMap, Node, ReduceKind, ScalarElement, Shape, Source, Stmt, StorageView, SubAxis,
-    Tile, TileBinaryOp, TileCompareOp, TileDecl, TileLiteral, TileReduceOp, TileUnaryOp,
-    WorkgroupAxis,
+    AxisGroup, Buffer, BufferAccess, BufferDecl, CoopMatrixRole, ElementType, F32Bits, KernelIr,
+    Layout, MemoryLevel, MultiFlattenMap, ScalarElement, Shape, StorageView, SubAxis, TileBinaryOp,
+    TileCompareOp, TileLiteral, TileReduceOp, TileUnaryOp, WorkgroupAxis,
 };
+// Raw IR node tree (Accumulator, Addr, Builtin, CoopSrc, Expr, ExprKind, Local,
+// LocalDecl, Node, ReduceKind, Source, Stmt, Tile, TileDecl) is intentionally not
+// re-exported: consumers only build via `tile`/`KernelBuilder` and lower to an
+// opaque `NagaKernel`. Internal code names these through `crate::ir::*`.
 pub use kernel_builder::{KernelBuilder, KernelTensorRef};
-pub use lower::{LowerError, NagaKernel, WgslExtensions};
+pub use lower::{LowerError, NagaKernel};
 pub use quantized::{GgmlQuantFormat, QuantizedMatrix};
 pub use tile::{CoopMatrixToken, SubgroupToken};
 

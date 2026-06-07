@@ -57,13 +57,8 @@ impl MultiFlattenMap {
     }
 
     /// Build a row-major contiguous affine map for `shape`.
-    pub fn row_major_for(shape: &Shape) -> Self {
+    pub(crate) fn row_major_for(shape: &Shape) -> Self {
         Self::affine(shape, &row_major_strides(shape))
-    }
-
-    /// Build a column-major contiguous affine map for `shape`.
-    pub fn col_major_for(shape: &Shape) -> Self {
-        Self::affine(shape, &col_major_strides(shape))
     }
 
     /// Number of logical axes.
@@ -97,7 +92,7 @@ impl MultiFlattenMap {
     }
 
     /// True if this affine map is column-major contiguous for `shape`.
-    pub fn is_col_major(&self, shape: &Shape) -> bool {
+    pub(crate) fn is_col_major(&self, shape: &Shape) -> bool {
         self.is_affine() && self.affine_strides() == col_major_strides(shape)
     }
 
@@ -158,7 +153,11 @@ impl Layout {
     /// Construct a row-major affine layout with `inner_pad` extra elements of
     /// stride between consecutive inner rows. Used by workgroup-tile
     /// allocations that need bank-conflict avoidance on the inner axis.
-    pub fn row_major_padded(memory_level: MemoryLevel, shape: Shape, inner_pad: u32) -> Self {
+    pub(crate) fn row_major_padded(
+        memory_level: MemoryLevel,
+        shape: Shape,
+        inner_pad: u32,
+    ) -> Self {
         if inner_pad == 0 {
             return Self::contiguous(memory_level, shape);
         }
@@ -223,7 +222,7 @@ impl Layout {
 
     /// Number of elements required to back this layout, including padding
     /// implied by non-contiguous strides. Computed over every sub-axis.
-    pub fn allocation_element_count(&self) -> NonZeroU32 {
+    pub(crate) fn allocation_element_count(&self) -> NonZeroU32 {
         let last_index = self
             .indexing
             .groups
@@ -251,11 +250,6 @@ impl Layout {
     /// True if this layout is row-major contiguous.
     pub fn is_row_major(&self) -> bool {
         self.indexing.is_row_major(&self.shape)
-    }
-
-    /// True if this layout is column-major contiguous.
-    pub fn is_col_major(&self) -> bool {
-        self.indexing.is_col_major(&self.shape)
     }
 
     /// True if this layout is row-major or column-major contiguous.
