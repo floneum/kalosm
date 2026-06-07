@@ -43,6 +43,12 @@ impl std::fmt::Debug for DirectPlanCache {
     }
 }
 
+impl Default for DirectPlanCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DirectPlanCache {
     pub fn new() -> Self {
         Self {
