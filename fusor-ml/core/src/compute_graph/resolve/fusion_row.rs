@@ -16,7 +16,7 @@ use petgraph::algo::toposort;
 
 use crate::{
     nary_wise::NaryFunction,
-    row_program::{RowOutput, RowPhase, RowProgramOperation, RowReduce},
+    row_program::{RowOutput, RowProgramOperation, RowReduce, RowStep},
 };
 
 use super::cluster_match::{keepdim_broadcast_layout, layout_matches, unary_elementwise};
@@ -488,20 +488,23 @@ impl Resolver {
         }
 
         let external_count = builder.externals.len();
-        let phases: Vec<RowPhase> = builder
+        let mut steps: Vec<RowStep> = builder
             .phases
             .into_iter()
             .map(|(_, mut phase)| {
                 phase.expression = finalize_slots(&phase.expression, external_count);
-                RowPhase::Reduce(phase)
+                RowStep::Reduce(phase)
             })
             .collect();
+        steps.push(RowStep::Output(RowOutput::Map(finalize_slots(
+            &output_expr,
+            external_count,
+        ))));
         let operation = RowProgramOperation {
             inputs: builder.externals.clone(),
             shape: builder.shape,
             axis,
-            phases,
-            output: RowOutput::Map(finalize_slots(&output_expr, external_count)),
+            steps,
             output_datatype: root.output_datatype,
             dynamic_axis: None,
         };
@@ -511,7 +514,7 @@ impl Resolver {
                 "row_fusion: committed root {:?} shape {:?} phases {} externals {}",
                 self.execution_graph[root_idx].inner_idx,
                 operation.shape,
-                operation.phases.len(),
+                operation.phase_count(),
                 externals.len()
             );
         }

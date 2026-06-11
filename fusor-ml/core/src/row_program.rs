@@ -77,19 +77,6 @@ pub(crate) struct RowFold {
 }
 
 #[derive(Debug, Clone, Hash)]
-pub(crate) enum RowPhase {
-    /// Fold over the row axis into a per-row scalar slot.
-    Reduce(RowReduce),
-    /// A staged per-element value: evaluated once at each axis position,
-    /// with one lane pinned per position (the axis must fit the workgroup).
-    Element {
-        expression: NaryExpr,
-        fold: Option<RowFold>,
-        datatype: DataTypeEnum,
-    },
-}
-
-#[derive(Debug, Clone, Hash)]
 pub(crate) enum RowOutput {
     /// One output element per index-space position; output shape == `shape`.
     Map(NaryExpr),
@@ -121,15 +108,32 @@ pub(crate) struct DynamicAxis {
     pub(crate) axis_bound_dim: Option<usize>,
 }
 
+/// One ordered row-program step. All non-output steps produce slots for later
+/// expressions; the final step must be [`RowStep::Output`] and defines the
+/// tensor write contract.
+#[derive(Debug, Clone, Hash)]
+pub(crate) enum RowStep {
+    /// Fold over the row axis into a per-row scalar slot.
+    Reduce(RowReduce),
+    /// A staged per-element value: evaluated once at each axis position,
+    /// with one lane pinned per position (the axis must fit the workgroup).
+    Element {
+        expression: NaryExpr,
+        fold: Option<RowFold>,
+        datatype: DataTypeEnum,
+    },
+    Output(RowOutput),
+}
+
 /// The algebraic shape the online-streaming lowering requires: a staged
-/// score element, a max phase over a scaled score `e`, an exp-sum phase
+/// score element, a max step over a scaled score `e`, an exp-sum step
 /// shifted by that max, a staged probability element, and a linear combine.
 /// The exp shift is what licenses streaming — rescaling the running sum and
 /// accumulators by `exp(M_old − M_new)` keeps them exact across tiles.
 struct OnlineSoftmax<'a> {
-    /// Element phase: the raw per-position score (slot `n`).
+    /// Element step: the raw per-position score (slot `n`).
     score: (&'a NaryExpr, &'a Option<RowFold>),
-    /// The scaled/masked score expression `e` over slot `n` (max phase body).
+    /// The scaled/masked score expression `e` over slot `n` (max step body).
     scaled: &'a NaryExpr,
     max_identity: NaryScalar,
     /// The per-position weight in `combine = p · weight`.
@@ -161,28 +165,27 @@ fn binary_op_children<'a>(expr: &'a NaryExpr, op: &NaryOp) -> Option<(&'a NaryEx
     }
 }
 
-/// Match the four-phase online-softmax shape (see [`OnlineSoftmax`]). The
+/// Match the terminal-output online-softmax shape (see [`OnlineSoftmax`]). The
 /// attention constructor builds exactly this; the lowering re-derives it so
-/// the phase expressions stay the single source of truth.
-fn match_online_softmax<'a>(
-    phases: &'a [RowPhase],
-    output: &'a RowOutput,
-    input_count: usize,
-) -> Option<OnlineSoftmax<'a>> {
+/// the step expressions stay the single source of truth.
+fn match_online_softmax<'a>(steps: &'a [RowStep], input_count: usize) -> Option<OnlineSoftmax<'a>> {
     let [
-        RowPhase::Element {
+        RowStep::Element {
             expression: score,
             fold: score_fold,
             ..
         },
-        RowPhase::Reduce(max_phase),
-        RowPhase::Reduce(sum_phase),
-        RowPhase::Element {
+        RowStep::Reduce(max_phase),
+        RowStep::Reduce(sum_phase),
+        RowStep::Element {
             expression: prob,
             fold: None,
             ..
         },
-    ] = phases
+        RowStep::Output(RowOutput::Reduce {
+            combine, function, ..
+        }),
+    ] = steps
     else {
         return None;
     };
@@ -208,12 +211,6 @@ fn match_online_softmax<'a>(
         return None;
     }
     // combine: p · weight, summed
-    let RowOutput::Reduce {
-        combine, function, ..
-    } = output
-    else {
-        return None;
-    };
     if function.op != ReduceOp::Sum {
         return None;
     }
@@ -241,24 +238,38 @@ fn match_online_softmax<'a>(
 }
 
 /// Slot convention for every expression in the program: indices below
-/// `inputs.len()` are tensor reads; index `inputs.len() + p` is phase `p`'s
-/// value (a per-row scalar for reduce phases, a per-element value for
-/// element phases).
+/// `inputs.len()` are tensor reads; index `inputs.len() + p` is step `p`'s
+/// value for non-output steps (a per-row scalar for reduce steps, a
+/// per-element value for element steps). The final output step never produces
+/// a reusable slot.
 #[derive(Debug, Clone)]
 pub(crate) struct RowProgramOperation {
     pub(crate) inputs: Vec<NodeIndex>,
     /// The full row-parallel index space (including the axis).
     pub(crate) shape: Box<[usize]>,
     pub(crate) axis: usize,
-    pub(crate) phases: Vec<RowPhase>,
-    pub(crate) output: RowOutput,
+    pub(crate) steps: Vec<RowStep>,
     pub(crate) output_datatype: DataTypeEnum,
     /// `Some` exactly when the program pins one lane per axis position
-    /// (element phases / reducing output); `None` for chunked map programs.
+    /// (element steps / reducing output); `None` for chunked map programs.
     pub(crate) dynamic_axis: Option<DynamicAxis>,
 }
 
 impl RowProgramOperation {
+    fn output_step(&self) -> &RowOutput {
+        match self.steps.last() {
+            Some(RowStep::Output(output)) => output,
+            _ => panic!("row program must end with an output step"),
+        }
+    }
+
+    fn phase_steps(&self) -> &[RowStep] {
+        match self.steps.last() {
+            Some(RowStep::Output(_)) => &self.steps[..self.steps.len() - 1],
+            _ => panic!("row program must end with an output step"),
+        }
+    }
+
     pub(crate) fn rows(&self) -> usize {
         self.shape
             .iter()
@@ -276,7 +287,7 @@ impl RowProgramOperation {
     }
 
     pub(crate) fn out_shape(&self) -> Vec<usize> {
-        match &self.output {
+        match self.output_step() {
             RowOutput::Map(_) => self.shape.to_vec(),
             RowOutput::Reduce { free_dim, .. } => {
                 let mut shape = self.row_shape();
@@ -284,6 +295,10 @@ impl RowProgramOperation {
                 shape
             }
         }
+    }
+
+    pub(crate) fn phase_count(&self) -> usize {
+        self.phase_steps().len()
     }
 
     fn block(&self, device: &crate::Device) -> u32 {
@@ -315,8 +330,7 @@ impl Operation for RowProgramOperation {
             }
         }
         self.axis.hash(state);
-        self.phases.hash(state);
-        self.output.hash(state);
+        self.steps.hash(state);
         self.output_datatype.hash(state);
     }
 
@@ -381,8 +395,8 @@ impl Operation for RowProgramOperation {
 
     fn name(&self) -> String {
         format!(
-            "row_program_{}p_{}",
-            self.phases.len(),
+            "row_program_{}s_{}",
+            self.steps.len(),
             self.shape
                 .iter()
                 .map(|x| x.to_string())
@@ -513,7 +527,9 @@ fn build_row_program_kernel(
     // the online body over one tile, writing its unnormalized accumulator
     // and softmax statistics to scratch; a combine kernel folds the spans
     // with the online monoid.
-    let free_dim_out = match &operation.output {
+    let output_kind = operation.output_step().clone();
+    let phase_steps = operation.phase_steps().to_vec();
+    let free_dim_out = match &output_kind {
         RowOutput::Reduce { free_dim, .. } => Some(*free_dim),
         RowOutput::Map(_) => None,
     };
@@ -540,8 +556,6 @@ fn build_row_program_kernel(
         .dynamic_axis
         .as_ref()
         .and_then(|dynamic| dynamic.axis_bound_dim);
-    let phases = operation.phases.clone();
-    let output_kind = operation.output.clone();
     let output_dtype = output.datatype();
     let output_value = MaybeQData::Tensor(output);
     let params_value = params.map(MaybeQData::Tensor);
@@ -557,8 +571,8 @@ fn build_row_program_kernel(
             DataTypeEnum::F32,
         ))
     });
-    let online_max_identity = match phases.get(1) {
-        Some(RowPhase::Reduce(reduce)) => Some(reduce.function.initial_value),
+    let online_max_identity = match phase_steps.get(1) {
+        Some(RowStep::Reduce(reduce)) => Some(reduce.function.initial_value),
         _ => None,
     };
     let combine = if splits > 1 {
@@ -680,11 +694,11 @@ fn build_row_program_kernel(
             let phase_handle = kb.program();
             // Element-phase values the reducing output reads across lanes are
             // staged through workgroup memory (the probs of decode attention).
-            let staged: Vec<Option<WorkgroupTile>> = phases
+            let staged: Vec<Option<WorkgroupTile>> = phase_steps
                 .iter()
                 .enumerate()
                 .map(|(p, phase)| match (&output_kind, phase) {
-                    (RowOutput::Reduce { combine, .. }, RowPhase::Element { .. })
+                    (RowOutput::Reduce { combine, .. }, RowStep::Element { .. })
                         if combine.uses_input(input_count + p) =>
                     {
                         Some(phase_handle.alloc_workgroup_array(ScalarElement::F32, block))
@@ -738,7 +752,9 @@ fn build_row_program_kernel(
                     let RowOutput::Reduce { free_dim, .. } = &output_kind else {
                         unreachable!("dynamic-axis row programs have a reducing output")
                     };
-                    let online = match_online_softmax(&phases, &output_kind, input_count)
+                    let mut online_steps = phase_steps.clone();
+                    online_steps.push(RowStep::Output(output_kind.clone()));
+                    let online = match_online_softmax(&online_steps, input_count)
                         .expect("dynamic-axis row programs are built in online-softmax shape");
                     let probs = staged[3]
                         .as_ref()
@@ -973,8 +989,8 @@ fn build_row_program_kernel(
                 // are recomputed per phase — the same trade every multi-pass
                 // normalization kernel makes.
                 let chunks = k.div_ceil(block);
-                for phase in &phases {
-                    let RowPhase::Reduce(reduce) = phase else {
+                for phase in &phase_steps {
+                    let RowStep::Reduce(reduce) = phase else {
                         unreachable!("element phases require a dynamic-axis row program")
                     };
                     let phase_dtype = reduce.function.datatype();
@@ -1207,8 +1223,8 @@ pub(crate) fn attention_row_program(
         inputs: graph_inputs,
         shape: [batch, num_heads, q_seq_len, kv_len].into(),
         axis: 3,
-        phases: vec![
-            RowPhase::Element {
+        steps: vec![
+            RowStep::Element {
                 expression: binary(NaryOp::Mul, q_read, k_read),
                 fold: Some(RowFold {
                     len: head_dim,
@@ -1216,27 +1232,27 @@ pub(crate) fn attention_row_program(
                 }),
                 datatype: f32,
             },
-            RowPhase::Reduce(RowReduce {
+            RowStep::Reduce(RowReduce {
                 expression: scaled_score(),
                 function: max_fn(f32),
                 post_chain: UnaryFunctionChain::empty(f32),
             }),
-            RowPhase::Reduce(RowReduce {
+            RowStep::Reduce(RowReduce {
                 expression: shifted_exp(),
                 function: sum_fn(f32),
                 post_chain: UnaryFunctionChain::empty(f32),
             }),
-            RowPhase::Element {
+            RowStep::Element {
                 expression: binary(NaryOp::Div, shifted_exp(), slot(2)),
                 fold: None,
                 datatype: f32,
             },
+            RowStep::Output(RowOutput::Reduce {
+                combine: binary(NaryOp::Mul, slot(3), v_read),
+                function: sum_fn(f32),
+                free_dim: head_dim,
+            }),
         ],
-        output: RowOutput::Reduce {
-            combine: binary(NaryOp::Mul, slot(3), v_read),
-            function: sum_fn(f32),
-            free_dim: head_dim,
-        },
         output_datatype: input_dtype,
         dynamic_axis: Some(DynamicAxis {
             block,
