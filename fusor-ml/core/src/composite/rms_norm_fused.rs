@@ -1,6 +1,12 @@
 use crate::{DataTypeEnum, Tensor};
 
 impl Tensor {
+    /// RMS norm, expressed as its composed form:
+    /// `x / sqrt(mean(x²) + eps) * weight (+ bias)`, computed in f32 with
+    /// casts at the edges for f16 tensors. The resolver recognizes the
+    /// canonical cluster and routes it to the fused RMS norm kernel;
+    /// ineligible configurations lower through the generic elementwise +
+    /// reduce path (the same math).
     pub fn rms_norm_fused(&self, weight: &Tensor, bias: Option<&Tensor>, eps: f32) -> Self {
         let original_datatype = self.datatype();
         assert!(
@@ -10,9 +16,6 @@ impl Tensor {
         assert_eq!(weight.datatype(), original_datatype);
         if let Some(bias) = bias {
             assert_eq!(bias.datatype(), original_datatype);
-        }
-        if let Some(output) = self.try_rms_norm_direct(weight, bias, eps) {
-            return output;
         }
 
         let hidden_size = *self.shape().last().unwrap() as f32;
@@ -47,10 +50,6 @@ impl Tensor {
         bias: Option<&Tensor>,
         eps: f32,
     ) -> Self {
-        if let Some(output) = self.try_rms_norm_residual_direct(residual, weight, bias, eps) {
-            return output;
-        }
-
         (self.clone() + residual.clone()).rms_norm_fused(weight, bias, eps)
     }
 }

@@ -499,23 +499,3 @@ pub(super) fn scalar_of(element: ElementType) -> ScalarElement {
         ElementType::CoopMatrix { scalar, .. } => scalar,
     }
 }
-
-/// Zero literal for a float `element` (F32 or F16). Panics on other types —
-/// callers (flash / softmax) only ever stage F32 and F16.
-pub(super) fn zero_fill(element: ElementType) -> TileLiteral {
-    match scalar_of(element) {
-        ScalarElement::F32 => TileLiteral::f32(0.0),
-        ScalarElement::F16 => TileLiteral::F16(0),
-        _ => panic!("only F32 and F16 element types are supported"),
-    }
-}
-
-/// Whether `element`'s scalar is a float (F32 or F16).
-pub(super) fn supports_float(element: ElementType) -> bool {
-    matches!(scalar_of(element), ScalarElement::F32 | ScalarElement::F16)
-}
-
-/// A `u32` literal tile.
-pub(super) fn u32_tile(value: u32) -> Tile {
-    Tile::literal(TileLiteral::U32(value))
-}

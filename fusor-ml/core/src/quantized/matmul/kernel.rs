@@ -740,6 +740,12 @@ impl Operation for QMatMulOperation {
             }
         }
         if matches!(matrix.datatype(), GgmlType::F32 | GgmlType::F16) {
+            // The dense kernel has no epilogue slots; declining here routes
+            // fused epilogues to the dequantize+dense fallback, which applies
+            // them as separate elementwise kernels.
+            if self.pre_element_wise_expr.is_some() || self.post_element_wise_expr.is_some() {
+                return None;
+            }
             return self.build_dense_direct_kernel(graph, input, matrix, output);
         }
         Self::direct_kernel_for_tensors(

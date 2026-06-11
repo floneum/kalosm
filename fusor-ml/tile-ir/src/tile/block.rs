@@ -70,6 +70,12 @@ impl TileBlock<'_> {
 
     /// Masked dequantizing load of one f32 value from a quantized matrix at a
     /// `(row, col)` coordinate.
+    /// Dequantize one element of a block-quantized matrix.
+    ///
+    /// Addressing follows the matrix's flat block order, where
+    /// [`QuantizedMatrix::rows`] is the *length* of one dense row: `row` is
+    /// the position along that contiguous axis and `col` selects which row
+    /// (`flat = col * matrix.rows + row`).
     pub fn load_quantized(
         &self,
         matrix: &QuantizedMatrix,

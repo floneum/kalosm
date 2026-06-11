@@ -218,8 +218,8 @@ impl RopeFusedOperation {
         self.shape.len()
     }
 
-    fn to_nary(&self) -> crate::nary_wise::NaryOperation {
-        crate::nary_wise::NaryOperation {
+    fn to_nary(&self) -> crate::nary_wise::ElementwiseOperation {
+        crate::nary_wise::ElementwiseOperation {
             inputs: vec![self.input, self.cos, self.sin],
             expression: self.build_expr(),
             shape: self.shape.clone(),
@@ -410,12 +410,12 @@ fn build_sign_condition(dim_last: NaryExpr, head_dim: usize, mode: RopeMode) -> 
 }
 
 impl RopePairFusedOperation {
-    fn to_nary(&self) -> crate::nary_wise::NaryOperation {
+    fn to_nary(&self) -> crate::nary_wise::ElementwiseOperation {
         let mut inputs = vec![self.q, self.k, self.cos, self.sin];
         if let Some(position) = self.position {
             inputs.push(position);
         }
-        crate::nary_wise::NaryOperation {
+        crate::nary_wise::ElementwiseOperation {
             inputs,
             expression: self.build_expr(),
             shape: vec![self.total_elements].into_boxed_slice(),

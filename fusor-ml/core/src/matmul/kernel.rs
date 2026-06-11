@@ -11,48 +11,22 @@ use crate::{
         kernel_backend::{self, DirectKernel},
         operation::Operation,
         tile_direct::{
-            DirectMatrixLayout, flatten_matrix_layout, tile_storage_read_with_direct_layout_typed,
+            flatten_matrix_layout, tile_storage_read_with_direct_layout_typed,
             tile_storage_write_with_direct_layout_typed,
         },
     },
-    nary_direct::apply_unary_function_chain,
-    nary_wise::UnaryFunctionChain,
+    nary_wise::{NaryExpr, NaryFunction, NaryOp, NaryScalar, UnaryFunctionChain},
+    reduce::{ReduceFunction, ReduceOp, ReduceOperation},
     tensor::{DataTypeEnum, TensorData},
 };
 
 use super::{
-    MatMulOperation, MatMulParams, coop_gemm, direct, sgemm, sgemv,
-    variants::{
-        CoopTile, DirectTileMatmulVariant, dense_coop_kinds_from_datatype,
-        select_dense_matmul_params, select_direct_tile_matmul_variant,
-    },
+    MatMulOperation, MatMulParams, coop_gemm, sgemm, sgemv,
+    variants::{CoopTile, dense_coop_kinds_from_datatype, select_dense_matmul_params},
 };
-
-struct MatmulTileDirectKernelVariant;
 
 fn device_supported<T>(value: Option<T>) -> Result<T, kernel_backend::DeviceNotSupported> {
     value.ok_or(kernel_backend::DeviceNotSupported)
-}
-
-#[derive(Clone, Copy)]
-struct DenseCoopTokens {
-    config: tile_ir_kernels::SubgroupConfig,
-    coop: tile_ir::CoopMatrixToken,
-}
-
-#[derive(Clone, Copy)]
-enum DirectTileMatmulRoute {
-    Gemv(tile_ir_kernels::SubgroupConfig),
-    MatMul { coop: Option<DenseCoopTokens> },
-}
-
-impl DirectTileMatmulRoute {
-    fn variant(self) -> DirectTileMatmulVariant {
-        match self {
-            Self::Gemv(_) => DirectTileMatmulVariant::Gemv,
-            Self::MatMul { .. } => DirectTileMatmulVariant::MatMul,
-        }
-    }
 }
 
 impl MatMulOperation {
@@ -124,11 +98,104 @@ impl MatMulOperation {
         self.out_shape.len() as u32
     }
 
-    fn can_use_direct_tile_matmul(&self) -> bool {
+    fn can_use_hardware_matmul(&self) -> bool {
         matches!(self.datatype, DataTypeEnum::F32 | DataTypeEnum::F16)
     }
 
-    fn build_direct_tile_matmul(
+    /// The contraction in its composed map-reduce form: a multiply over the
+    /// `[batch.., m, n, k]` index space summed along `k`, with the fused
+    /// pre/post chains inlined and accumulation upgraded to f32 (matching
+    /// the dedicated kernels' accumulator). Routes that aren't
+    /// hardware-specialized lower through this — the same generic tiled
+    /// reduce any composed contraction gets.
+    fn as_fused_reduce(&self) -> ReduceOperation {
+        let rank = self.first_shape.len();
+        let batch = rank - 2;
+        let (m_dim, n_dim, k_dim) = (batch, batch + 1, batch + 2);
+        let mut index_space: Vec<usize> = self.first_shape[..batch].to_vec();
+        index_space.extend([
+            self.first_shape[batch],
+            self.second_shape[batch + 1],
+            self.first_shape[batch + 1],
+        ]);
+
+        let apply_chain = |mut expr: NaryExpr, chain: &UnaryFunctionChain| {
+            for function in &chain.functions {
+                expr = NaryExpr::Op {
+                    children: vec![expr],
+                    function: function.clone(),
+                };
+            }
+            expr
+        };
+        let cast_to = |expr: NaryExpr, from: DataTypeEnum, to: DataTypeEnum| {
+            if from == to {
+                expr
+            } else {
+                NaryExpr::Op {
+                    children: vec![expr],
+                    function: NaryFunction::unary(Some("cast".to_string()), NaryOp::Cast, from, to),
+                }
+            }
+        };
+
+        let a_indices: Vec<NaryExpr> = (0..batch)
+            .chain([m_dim, k_dim])
+            .map(NaryExpr::DimIndex)
+            .collect();
+        let b_indices: Vec<NaryExpr> = (0..batch)
+            .chain([k_dim, n_dim])
+            .map(NaryExpr::DimIndex)
+            .collect();
+
+        let acc_dtype = match self.pre_element_wise[0].out_datatype() {
+            DataTypeEnum::U32 => DataTypeEnum::U32,
+            DataTypeEnum::F32 | DataTypeEnum::F16 => DataTypeEnum::F32,
+        };
+        let a = apply_chain(
+            NaryExpr::indexed_input(0, a_indices),
+            &self.pre_element_wise[0],
+        );
+        let a = cast_to(a, self.pre_element_wise[0].out_datatype(), acc_dtype);
+        let b = apply_chain(
+            NaryExpr::indexed_input(1, b_indices),
+            &self.pre_element_wise[1],
+        );
+        let b = cast_to(b, self.pre_element_wise[1].out_datatype(), acc_dtype);
+        let expression = NaryExpr::mul(a, b, acc_dtype);
+
+        let initial_value = match acc_dtype {
+            DataTypeEnum::U32 => NaryScalar::U32(0),
+            _ => NaryScalar::F32(0.0),
+        };
+        let result_dtype = self.post_element_wise.input_datatype();
+        let mut post_functions = Vec::new();
+        if acc_dtype != result_dtype {
+            post_functions.push(NaryFunction::unary(
+                Some("cast".to_string()),
+                NaryOp::Cast,
+                acc_dtype,
+                result_dtype,
+            ));
+        }
+        post_functions.extend(self.post_element_wise.functions.iter().cloned());
+
+        ReduceOperation {
+            inputs: vec![self.first, self.second],
+            expression,
+            shape: index_space.into(),
+            function: ReduceFunction {
+                name: Some("sum".to_string()),
+                op: ReduceOp::Sum,
+                initial_value,
+                datatype: acc_dtype,
+            },
+            post_element_wise: UnaryFunctionChain::new(post_functions, acc_dtype),
+            axis: k_dim,
+        }
+    }
+
+    fn build_hardware_matmul(
         &self,
         device: &Device,
         input_a: &TensorData,
@@ -169,124 +236,75 @@ impl MatMulOperation {
         }
         let shape = tile_ir_kernels::DenseMatmulShape { batch, m, k, n };
 
-        // GEMV reduces through subgroup operations. Use the matmul route
-        // unless the device exposes a subgroup path we trust.
-        let subgroup_config = device.subgroup_config();
-        let route_variant = if subgroup_config.is_some() {
-            select_direct_tile_matmul_variant(m, k, n)
-        } else {
-            DirectTileMatmulVariant::MatMul
+        // Only the cooperative-matrix route stays hand-specialized; gemv
+        // shapes lower through the generic subgroup-per-output reduce, and
+        // fused chains lower through the generic tiled reduce.
+        if !self.pre_element_wise[0].functions.is_empty()
+            || !self.pre_element_wise[1].functions.is_empty()
+            || !self.post_element_wise.functions.is_empty()
+        {
+            return Err(kernel_backend::DeviceNotSupported);
+        }
+        let subgroup_config = device_supported(device.subgroup_config())?;
+        if !subgroup_config.is_fixed() {
+            return Err(kernel_backend::DeviceNotSupported);
+        }
+        let MatMulParams::CoopMatMul(params) = &self.parameters else {
+            return Err(kernel_backend::DeviceNotSupported);
         };
-        let coop_kind = match &self.parameters {
-            MatMulParams::CoopMatMul(params) => Some(params.kind()),
-            _ => None,
-        };
-        let route = match (route_variant, subgroup_config) {
-            (DirectTileMatmulVariant::Gemv, Some(config)) => DirectTileMatmulRoute::Gemv(config),
-            (DirectTileMatmulVariant::Gemv, None) => DirectTileMatmulRoute::MatMul { coop: None },
-            (DirectTileMatmulVariant::MatMul, config) => {
-                let coop = config.and_then(|config| {
-                    if !config.is_fixed() {
-                        return None;
-                    }
-                    let kind = coop_kind?;
-                    Some(DenseCoopTokens {
-                        config,
-                        coop: device.coop_token(kind)?,
-                    })
-                });
-                DirectTileMatmulRoute::MatMul { coop }
-            }
-        };
-        let variant = route.variant();
-        let coop_variant = if let DirectTileMatmulRoute::MatMul { coop: Some(coop) } = route {
-            CoopTile::select(
-                m,
-                k,
-                n,
-                device
-                    .limits()
-                    .max_compute_workgroup_size_x
-                    .min(device.limits().max_compute_invocations_per_workgroup),
-                coop.config.max_size(),
-            )
-        } else {
-            None
-        };
-        let pre_a = self.pre_element_wise[0]
-            .functions
-            .is_empty()
-            .then_some(())
-            .is_none()
-            .then(|| {
-                let chain = self.pre_element_wise[0].clone();
-                let datatype = chain.input_datatype();
-                tile_ir_kernels::UnaryEpilogue::new("matmul_pre_a_chain", move |tile| {
-                    apply_unary_function_chain(tile, datatype, &chain)
-                        .expect("pre-chain validated at fuse time")
-                        .0
-                })
-            });
-        let pre_b = self.pre_element_wise[1]
-            .functions
-            .is_empty()
-            .then_some(())
-            .is_none()
-            .then(|| {
-                let chain = self.pre_element_wise[1].clone();
-                let datatype = chain.input_datatype();
-                tile_ir_kernels::UnaryEpilogue::new("matmul_pre_b_chain", move |tile| {
-                    apply_unary_function_chain(tile, datatype, &chain)
-                        .expect("pre-chain validated at fuse time")
-                        .0
-                })
-            });
-        let post = self
-            .post_element_wise
-            .functions
-            .is_empty()
-            .then_some(())
-            .is_none()
-            .then(|| {
-                let chain = self.post_element_wise.clone();
-                let datatype = chain.input_datatype();
-                tile_ir_kernels::UnaryEpilogue::new("matmul_post_chain", move |tile| {
-                    apply_unary_function_chain(tile, datatype, &chain)
-                        .expect("post-chain validated at fuse time")
-                        .0
-                })
-            });
-        let epilogue_identity = pre_a.as_ref().map(|e| e.identity()).unwrap_or(0)
-            ^ pre_b.as_ref().map(|e| e.identity()).unwrap_or(0)
-            ^ post.as_ref().map(|e| e.identity()).unwrap_or(0);
-        let matmul_tile = select_matmul_tile(shape, device.limits().max_compute_workgroup_size_x);
+        let kind = params.kind();
+        let coop = device_supported(device.coop_token(kind))?;
+        let tile = device_supported(CoopTile::select(
+            m,
+            k,
+            n,
+            device
+                .limits()
+                .max_compute_workgroup_size_x
+                .min(device.limits().max_compute_invocations_per_workgroup),
+            subgroup_config.max_size(),
+        ))?;
+
         let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
         let datatype = self.datatype;
-        let ir = tile_ir::tile::build(move |phase| {
-            let epilogues = tile_ir_kernels::DenseMatmulEpilogues {
-                pre_a: pre_a.as_ref(),
-                pre_b: pre_b.as_ref(),
-                post: post.as_ref(),
-            };
+        let used = std::cell::Cell::new(false);
+        let ir = tile_ir::tile::build(|phase| {
             let element = match datatype {
                 DataTypeEnum::F32 => tile_ir::ElementType::F32,
                 DataTypeEnum::F16 => tile_ir::ElementType::F16,
-                _ => unreachable!("direct tile matmul only supports f32/f16"),
+                _ => unreachable!("hardware matmul only supports f32/f16"),
             };
-            dispatch_direct_tile_matmul(
+            let a = tile_storage_read_with_direct_layout_typed(phase, element, a_view.clone());
+            let b = tile_storage_read_with_direct_layout_typed(phase, element, b_view.clone());
+            let y = tile_storage_write_with_direct_layout_typed(phase, element, y_view.clone());
+            used.set(tile_ir_kernels::try_batched_coop_matmul(
                 phase,
-                element,
-                a_view.clone(),
-                b_view.clone(),
-                y_view.clone(),
-                coop_variant,
-                route,
-                matmul_tile,
+                tile_ir_kernels::DenseMatmulTensors {
+                    a: &a,
+                    b: &b,
+                    y: &y,
+                },
                 shape,
-                &epilogues,
+                &tile_ir_kernels::DenseMatmulEpilogues {
+                    pre_a: None,
+                    pre_b: None,
+                    post: None,
+                },
                 max_wg_per_dim,
-            );
+                tile_ir_kernels::DenseCoopMatmulConfig {
+                    coop,
+                    subgroups: subgroup_config,
+                    tile: tile_ir_kernels::DenseCoopMatmulTile {
+                        bm: tile.bm,
+                        bn: tile.bn,
+                        bk: tile.bk,
+                    },
+                },
+            ));
         });
+        if !used.get() {
+            return Err(kernel_backend::DeviceNotSupported);
+        }
         let dispatch_size = ir.grid;
         if dispatch_size.iter().any(|dim| *dim > max_wg_per_dim) {
             return Err(kernel_backend::DeviceNotSupported);
@@ -296,16 +314,11 @@ impl MatMulOperation {
             input_b.clone().into(),
             output.clone().into(),
         ];
-        let variant = kernel_backend::KernelVariantKey::with_payload::<MatmulTileDirectKernelVariant>(
-            |state| {
-                matmul_tile.hash(state);
-                variant.hash(state);
-                coop_variant.hash(state);
-                coop_kind.hash(state);
+        let variant =
+            kernel_backend::KernelVariantKey::with_payload::<HardwareMatmulVariant>(|state| {
+                tile.hash(state);
                 subgroup_config.hash(state);
-                epilogue_identity.hash(state);
-            },
-        );
+            });
         let cache_key = self.kernel_cache_key_with_dispatch(variant, None, dispatch_size, &inputs);
 
         let name = self.name();
@@ -328,6 +341,8 @@ impl MatMulOperation {
         )
     }
 }
+
+struct HardwareMatmulVariant;
 
 impl Operation for MatMulOperation {
     fn hash_kernel_fields(&self, state: &mut FxHasher) {
@@ -440,20 +455,29 @@ impl Operation for MatMulOperation {
         let input_a = input_a.as_tensor()?;
         let input_b = input_b.as_tensor()?;
         let output = output.as_tensor()?;
-        let direct_tile_kernel = if self.can_use_direct_tile_matmul()
+        if self.can_use_hardware_matmul()
             && input_a.datatype() == self.datatype
             && input_b.datatype() == self.datatype
             && output.datatype() == self.datatype
             && (self.datatype != DataTypeEnum::F16 || graph.device().f16_supported())
+            && let Ok(kernel) =
+                self.build_hardware_matmul(&graph.device(), input_a, input_b, output)
         {
-            self.build_direct_tile_matmul(&graph.device(), input_a, input_b, output)
-                .ok()
-        } else {
-            None
-        };
-        direct_tile_kernel.or_else(|| {
-            direct::build_serial_matmul_direct_kernel(self, graph, workgroup_shape, inputs)
-        })
+            return Some(kernel);
+        }
+        // Everything else is the composed contraction's own lowering: the
+        // generic tiled (or serial) fused reduce, identical to what any
+        // unrecognized contraction gets.
+        let reduce = self.as_fused_reduce();
+        crate::reduce_tiled::build_reduce_tiled_kernel(&reduce, graph, workgroup_shape, inputs)
+            .or_else(|| {
+                crate::reduce_direct::build_reduce_direct_kernel(
+                    &reduce,
+                    graph,
+                    workgroup_shape,
+                    inputs,
+                )
+            })
     }
 
     fn output(
@@ -480,184 +504,5 @@ impl Operation for MatMulOperation {
                 .collect::<Vec<_>>()
                 .join("x")
         )
-    }
-}
-
-fn select_matmul_tile(
-    shape: tile_ir_kernels::DenseMatmulShape,
-    max_workgroup_size_x: u32,
-) -> Option<tile_ir_kernels::DenseMatmulTile> {
-    if shape.m < 32 || shape.n < 32 || shape.k < 8 {
-        return None;
-    }
-
-    let candidates = [tile_ir_kernels::DenseMatmulTile::new(32, 32, 8, 4, 4, 64)];
-
-    candidates
-        .into_iter()
-        .filter_map(|tile| {
-            if tile.lanes > max_workgroup_size_x || shape.m < tile.bm || shape.n < tile.bn {
-                return None;
-            }
-
-            let tiles_m = shape.m.div_ceil(tile.bm);
-            let tiles_n = shape.n.div_ceil(tile.bn);
-            let workgroups = shape.batch * tiles_m * tiles_n;
-            let actual_outputs = shape.batch * shape.m * shape.n;
-            let covered_outputs = workgroups * tile.bm * tile.bn;
-            let tile_utilization_ok = actual_outputs * 4 >= covered_outputs * 3;
-            if !tile_utilization_ok {
-                return None;
-            }
-
-            // Larger workgroups reduce input rereads, but avoid collapsing small
-            // unbatched matmuls down to only a handful of 256-thread groups.
-            if (tile.lanes >= 256 && workgroups < 32)
-                || (tile.lanes >= 128 && shape.batch == 1 && workgroups < 32)
-                || (tile.lanes >= 128 && shape.batch > 1 && workgroups < 8)
-            {
-                return None;
-            }
-
-            let staged_inputs_per_k_tile = workgroups * tile.bk * (tile.bm + tile.bn);
-            let score = (staged_inputs_per_k_tile, tile.lanes);
-            Some((score, tile))
-        })
-        .min_by_key(|(score, _)| *score)
-        .map(|(_, tile)| tile)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn dispatch_direct_tile_matmul(
-    phase: &mut tile_ir::tile::Program,
-    element: tile_ir::ElementType,
-    a_view: DirectMatrixLayout,
-    b_view: DirectMatrixLayout,
-    y_view: DirectMatrixLayout,
-    coop_variant: Option<CoopTile>,
-    route: DirectTileMatmulRoute,
-    matmul_tile: Option<tile_ir_kernels::DenseMatmulTile>,
-    shape: tile_ir_kernels::DenseMatmulShape,
-    epilogues: &tile_ir_kernels::DenseMatmulEpilogues<'_>,
-    max_wg_per_dim: u32,
-) {
-    let a = tile_storage_read_with_direct_layout_typed(phase, element, a_view);
-    let b = tile_storage_read_with_direct_layout_typed(phase, element, b_view);
-    let y = tile_storage_write_with_direct_layout_typed(phase, element, y_view);
-    if let (Some(tile), DirectTileMatmulRoute::MatMul { coop: Some(tokens) }) =
-        (coop_variant, route)
-        && tile_ir_kernels::try_batched_coop_matmul(
-            phase,
-            tile_ir_kernels::DenseMatmulTensors {
-                a: &a,
-                b: &b,
-                y: &y,
-            },
-            shape,
-            epilogues,
-            max_wg_per_dim,
-            tile_ir_kernels::DenseCoopMatmulConfig {
-                coop: tokens.coop,
-                subgroups: tokens.config,
-                tile: tile_ir_kernels::DenseCoopMatmulTile {
-                    bm: tile.bm,
-                    bn: tile.bn,
-                    bk: tile.bk,
-                },
-            },
-        )
-    {
-        return;
-    }
-    match route {
-        DirectTileMatmulRoute::Gemv(tokens) => tile_ir_kernels::batched_gemv_with_epilogues(
-            phase,
-            &a,
-            &b,
-            &y,
-            shape,
-            epilogues,
-            max_wg_per_dim,
-            tokens,
-        ),
-        DirectTileMatmulRoute::MatMul { .. } => {
-            if let Some(tile) = matmul_tile {
-                tile_ir_kernels::batched_matmul_with_epilogues(
-                    phase,
-                    tile_ir_kernels::DenseMatmulTensors {
-                        a: &a,
-                        b: &b,
-                        y: &y,
-                    },
-                    shape,
-                    epilogues,
-                    max_wg_per_dim,
-                    tile,
-                )
-            } else {
-                tile_ir_kernels::batched_matmul_register_with_epilogues(
-                    phase,
-                    &a,
-                    &b,
-                    &y,
-                    shape,
-                    epilogues,
-                    max_wg_per_dim,
-                )
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn batched_full_tiles_use_shared_tile() {
-        assert_eq!(
-            select_matmul_tile(
-                tile_ir_kernels::DenseMatmulShape {
-                    batch: 8,
-                    m: 64,
-                    k: 96,
-                    n: 64,
-                },
-                256,
-            ),
-            Some(tile_ir_kernels::DenseMatmulTile::new(32, 32, 8, 4, 4, 64)),
-        );
-    }
-
-    #[test]
-    fn partial_large_tiles_need_reasonable_utilization() {
-        assert_eq!(
-            select_matmul_tile(
-                tile_ir_kernels::DenseMatmulShape {
-                    batch: 2,
-                    m: 65,
-                    k: 96,
-                    n: 65,
-                },
-                256,
-            ),
-            None,
-        );
-    }
-
-    #[test]
-    fn small_unbatched_matmul_keeps_parallelism() {
-        assert_eq!(
-            select_matmul_tile(
-                tile_ir_kernels::DenseMatmulShape {
-                    batch: 1,
-                    m: 64,
-                    k: 96,
-                    n: 64,
-                },
-                256,
-            ),
-            Some(tile_ir_kernels::DenseMatmulTile::new(32, 32, 8, 4, 4, 64)),
-        );
     }
 }

@@ -1,46 +1,57 @@
-use crate::{DataTypeEnum, StrideSpec, Tensor};
+use crate::{
+    DataTypeEnum, Layout, Tensor,
+    nary_wise::{ElementwiseOperation, NaryExpr, NaryFunction, NaryOp, NaryScalar},
+    view::ViewOperation,
+};
 
 impl Tensor {
-    /// Causal flash attention: the kernel applies a strict lower-triangular
-    /// causal mask internally, skipping the upper-triangle Q·K work entirely.
-    /// `q_seq_len` must equal `kv_seq_len` (prefill self-attention); other
-    /// shapes fall back to [`flash_attention`] with an explicit mask.
-    pub fn flash_attention_causal(&self, k: &Self, v: &Self, scale: f32) -> Self {
-        self.assert_rank::<4>();
-        if let Some(output) = self.try_flash_attention_direct_causal(k, v, scale) {
-            return output;
-        }
-        // Fallback: materialize a causal mask and re-enter the masked path.
-        let q_shape = self.shape();
-        let seq_len = q_shape[2];
-        match self.datatype() {
-            DataTypeEnum::F32 => {
-                let mut data = vec![0.0f32; seq_len * seq_len];
-                for i in 0..seq_len {
-                    for j in (i + 1)..seq_len {
-                        data[i * seq_len + j] = f32::NEG_INFINITY;
-                    }
-                }
-                let mask = Tensor::from_slice::<f32>(self.device(), [seq_len, seq_len], &data);
-                self.flash_attention(k, v, scale, Some(&mask))
-            }
-            DataTypeEnum::F16 => {
-                let mut data = vec![half::f16::from_f32(0.0); seq_len * seq_len];
-                let neg_inf = half::f16::from_f32(f32::NEG_INFINITY);
-                for i in 0..seq_len {
-                    for j in (i + 1)..seq_len {
-                        data[i * seq_len + j] = neg_inf;
-                    }
-                }
-                let mask =
-                    Tensor::from_slice::<half::f16>(self.device(), [seq_len, seq_len], &data);
-                self.flash_attention(k, v, scale, Some(&mask))
-            }
-            DataTypeEnum::U32 => panic!("flash_attention requires f32/f16 tensors"),
-        }
+    /// A view layered directly on this tensor's node, without collapsing
+    /// into any underlying view chain. Composed-attention clusters use these
+    /// so recognition can peel the exact GQA-expand / transpose / mask
+    /// layouts back to the original q/k/v/mask nodes.
+    fn attached_view(&self, layout: Layout) -> Tensor {
+        Tensor::from_parts(self.data().view(ViewOperation::fully_defined(
+            self.key(),
+            layout,
+            self.shape(),
+            self.datatype(),
+        )))
     }
 
+    /// Causal flash attention in its composed form: scores at kv positions
+    /// beyond the query position are replaced with `-inf` via an
+    /// index-comparison select (`kv_pos <= q_pos`), so causality is pure
+    /// index arithmetic — no mask tensor. The resolver recognizes the
+    /// cluster and routes it to the attention row program, whose axis bound
+    /// skips the masked upper-triangle tiles entirely.
+    pub fn flash_attention_causal(&self, k: &Self, v: &Self, scale: f32) -> Self {
+        assert_eq!(
+            self.shape()[2],
+            k.shape()[2],
+            "causal flash attention requires q_seq_len == kv_seq_len \
+             (self-attention prefill); use an explicit mask otherwise"
+        );
+        self.compose_attention(k, v, scale, None, true)
+    }
+
+    /// Scaled dot-product attention in its composed form:
+    /// `softmax(q · kᵀ · scale [+ mask]) · v`, with K/V expanded across query
+    /// heads for grouped-query attention. The resolver recognizes the
+    /// canonical cluster and routes it to the fused attention row program;
+    /// ineligible shapes lower through the recognized matmul + softmax
+    /// kernels (the same math).
     pub fn flash_attention(&self, k: &Self, v: &Self, scale: f32, mask: Option<&Tensor>) -> Self {
+        self.compose_attention(k, v, scale, mask, false)
+    }
+
+    fn compose_attention(
+        &self,
+        k: &Self,
+        v: &Self,
+        scale: f32,
+        mask: Option<&Tensor>,
+        causal: bool,
+    ) -> Self {
         self.assert_rank::<4>();
         k.assert_rank::<4>();
         v.assert_rank::<4>();
@@ -49,9 +60,6 @@ impl Tensor {
         if let Some(mask) = mask {
             mask.assert_rank::<2>();
             assert_eq!(self.datatype(), mask.datatype());
-        }
-        if let Some(output) = self.try_flash_attention_direct(k, v, scale, mask) {
-            return output;
         }
 
         let q_shape = self.shape();
@@ -72,32 +80,68 @@ impl Tensor {
         );
 
         let groups = num_heads / num_kv_heads;
-        let (k_expanded, v_expanded) = if groups > 1 {
-            let k_expanded = k
-                .reshape([batch, num_kv_heads, 1, kv_seq_len, head_dim])
-                .broadcast_as([batch, num_kv_heads, groups, kv_seq_len, head_dim])
-                .reshape([batch, num_heads, kv_seq_len, head_dim]);
-            let v_expanded = v
-                .reshape([batch, num_kv_heads, 1, kv_seq_len, head_dim])
-                .broadcast_as([batch, num_kv_heads, groups, kv_seq_len, head_dim])
-                .reshape([batch, num_heads, kv_seq_len, head_dim]);
-            (k_expanded, v_expanded)
-        } else {
-            (k.clone(), v.clone())
+        let expanded_shape = [batch, num_heads, kv_seq_len, head_dim];
+        let expand = |tensor: &Tensor| -> Tensor {
+            if groups == 1 {
+                return tensor.clone();
+            }
+            // Two attached views: a stride-0 broadcast across the group dim,
+            // then a flat reinterpret down to rank 4.
+            let grouped = tensor.attached_view(Layout::from_parts(
+                0,
+                [batch, num_kv_heads, groups, kv_seq_len, head_dim].into(),
+                [
+                    num_kv_heads * kv_seq_len * head_dim,
+                    kv_seq_len * head_dim,
+                    0,
+                    head_dim,
+                    1,
+                ]
+                .into(),
+            ));
+            grouped.attached_view(Layout::contiguous(&expanded_shape))
         };
+        let (k_expanded, v_expanded) = (expand(k), expand(v));
 
-        let k_t = k_expanded.restride([
-            StrideSpec::dim(0, batch),
-            StrideSpec::dim(1, num_heads),
-            StrideSpec::dim(3, head_dim),
-            StrideSpec::dim(2, kv_seq_len),
-        ]);
+        let k_t = k_expanded.attached_view(Layout::contiguous(&expanded_shape).transpose(2, 3));
         let scores = match self.datatype() {
             DataTypeEnum::F32 => self.mat_mul(&k_t) * scale,
             DataTypeEnum::F16 => self.mat_mul(&k_t) * half::f16::from_f32(scale),
             DataTypeEnum::U32 => panic!("flash_attention requires f32/f16 tensors"),
         };
-        let scores = if let Some(mask) = mask {
+        let scores = if causal {
+            // Keep kv positions at or before the query position; everything
+            // later contributes exp(-inf) = 0 to the softmax.
+            let condition = NaryExpr::Op {
+                children: vec![NaryExpr::DimIndex(3), NaryExpr::DimIndex(2)],
+                function: NaryFunction::binary(
+                    Some("causal_bound".to_string()),
+                    NaryOp::LessEqual,
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                ),
+            };
+            let datatype = self.datatype();
+            let neg_inf = match datatype {
+                DataTypeEnum::F32 => NaryScalar::F32(f32::NEG_INFINITY),
+                DataTypeEnum::F16 => NaryScalar::F16(half::f16::NEG_INFINITY),
+                DataTypeEnum::U32 => unreachable!("attention requires f32/f16"),
+            };
+            let expression = NaryExpr::select(
+                condition,
+                NaryExpr::input(0, 4),
+                NaryExpr::scalar(neg_inf),
+                DataTypeEnum::U32,
+                datatype,
+            );
+            Tensor::from_parts(scores.data().nary(ElementwiseOperation {
+                inputs: vec![scores.key()],
+                expression,
+                shape: [batch, num_heads, q_seq_len, kv_seq_len].into(),
+                output_datatype: datatype,
+            }))
+        } else if let Some(mask) = mask {
             let mask_shape = mask.shape();
             assert_eq!(
                 mask_shape,
@@ -107,10 +151,12 @@ impl Tensor {
                 q_seq_len,
                 kv_seq_len
             );
-            scores
-                + mask
-                    .reshape([1, 1, q_seq_len, kv_seq_len])
-                    .broadcast_as([batch, num_heads, q_seq_len, kv_seq_len])
+            let mask_view = mask.attached_view(Layout::from_parts(
+                0,
+                [batch, num_heads, q_seq_len, kv_seq_len].into(),
+                [0, 0, kv_seq_len, 1].into(),
+            ));
+            scores + mask_view
         } else {
             scores
         };

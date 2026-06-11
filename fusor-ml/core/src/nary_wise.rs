@@ -82,6 +82,10 @@ pub(crate) enum NaryOp {
     Abs,
     ApproximateExp,
     LessApproximateExp,
+    /// Binary `a <= b` comparison producing 1/0 in the output type. Used for
+    /// index-dependent masking (e.g. composed causal attention compares the
+    /// kv position against the query position).
+    LessEqual,
     AddConst(NaryScalar),
     SubConst(NaryScalar),
     RSubConst(NaryScalar),
@@ -195,7 +199,7 @@ impl UnaryFunctionChain {
     }
 }
 
-/// Result of extracting a unary function chain from an NaryOperation.
+/// Result of extracting a unary function chain from an ElementwiseOperation.
 /// Used by the resolver to fuse unary ops into reduce/matmul/dequantize.
 pub(crate) struct ExtractedUnaryChain {
     pub(crate) value: crate::compute_graph::NodeIndex,
@@ -459,7 +463,7 @@ impl NaryExpr {
 /// N-ary operation combining multiple inputs with arbitrary operations.
 /// Can fuse chains of element-wise and pair-wise operations into a single kernel.
 #[derive(Clone, Debug)]
-pub(crate) struct NaryOperation {
+pub(crate) struct ElementwiseOperation {
     /// Input tensors (leaves of expression tree)
     pub(crate) inputs: Vec<NodeIndex>,
     /// Expression tree describing computation (includes all operations)
@@ -468,8 +472,8 @@ pub(crate) struct NaryOperation {
     pub(crate) output_datatype: DataTypeEnum,
 }
 
-impl NaryOperation {
-    /// Attempt to extract a unary function chain from this NaryOperation.
+impl ElementwiseOperation {
+    /// Attempt to extract a unary function chain from this ElementwiseOperation.
     /// This will only succeed if there is only a single input to the operation.
     pub(crate) fn try_extract_unary_chain(&self) -> Option<ExtractedUnaryChain> {
         if self.inputs.len() != 1 {
@@ -477,7 +481,7 @@ impl NaryOperation {
         }
 
         let mut functions = Vec::new();
-        if !Self::collect_unary_chain(&self.expression, &mut functions)? {
+        if !Self::collect_unary_chain(&self.expression, &mut functions, self.shape.len())? {
             return None;
         }
         if functions.is_empty() {
@@ -502,16 +506,28 @@ impl NaryOperation {
         })
     }
 
-    fn collect_unary_chain(expr: &NaryExpr, functions: &mut Vec<NaryFunction>) -> Option<bool> {
+    fn collect_unary_chain(
+        expr: &NaryExpr,
+        functions: &mut Vec<NaryFunction>,
+        rank: usize,
+    ) -> Option<bool> {
         match expr {
             NaryExpr::IndexedInput { input_idx, indices } => {
-                Some(*input_idx == 0 && NaryExpr::is_elementwise_indices(indices))
+                // The index list must cover the full output rank: a shorter
+                // prefix (e.g. a folded keepdim view reading a lower-rank
+                // input) is still pointwise but not shape-preserving, so it
+                // must not be treated as a fusible unary chain.
+                Some(
+                    *input_idx == 0
+                        && indices.len() == rank
+                        && NaryExpr::is_elementwise_indices(indices),
+                )
             }
             NaryExpr::Op { children, function } => {
                 if children.len() != 1 || function.input_types.len() != 1 {
                     return None;
                 }
-                if !Self::collect_unary_chain(&children[0], functions)? {
+                if !Self::collect_unary_chain(&children[0], functions, rank)? {
                     return Some(false);
                 }
                 functions.push(function.clone());
@@ -522,7 +538,7 @@ impl NaryOperation {
     }
 }
 
-impl Operation for NaryOperation {
+impl Operation for ElementwiseOperation {
     fn hash_kernel_fields(&self, state: &mut FxHasher) {
         self.expression.hash(state);
         self.shape.hash(state);

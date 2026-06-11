@@ -1,8 +1,7 @@
 use crate::{
     Device,
     kernel_selection::{
-        Axis, CooperativeMatrixCaps, CooperativeMatrixKind, KernelDeviceCaps, KernelShape,
-        ShapeRule, ShapeSelector, eq, range,
+        Axis, CooperativeMatrixKind, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, range,
     },
     matmul::sgemm_params::gemm_parameters,
     matmul::sgemv_params::gemv_parameters,
@@ -135,12 +134,6 @@ pub(super) fn select_coop_kind(
         .expect("coop selector called with no supported cooperative matrix kind")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum DirectTileMatmulVariant {
-    Gemv,
-    MatMul,
-}
-
 /// (BM, BN, BK) tile dimensions for a cooperative-matrix matmul tile. The
 /// `select` helper below returns `Option<CoopTile>` (`None` = no coop variant
 /// fits the shape); the kernel layer uses the tuple to look up the matching
@@ -238,32 +231,4 @@ impl CoopTile {
         }
         None
     }
-}
-
-pub(super) fn direct_tile_matmul_selector() -> ShapeSelector<3, (), DirectTileMatmulVariant> {
-    ShapeSelector::new()
-        .rule(
-            DirectTileMatmulVariant::Gemv,
-            ShapeRule::new().axis(DENSE_N, eq(1)),
-        )
-        .rule(DirectTileMatmulVariant::MatMul, ShapeRule::new())
-}
-
-pub(super) fn select_direct_tile_matmul_variant(m: u32, k: u32, n: u32) -> DirectTileMatmulVariant {
-    direct_tile_matmul_selector()
-        .select(
-            KernelShape::new([m as usize, k as usize, n as usize]),
-            &(),
-            KernelDeviceCaps {
-                subgroups_supported: false,
-                cooperative_matrix: CooperativeMatrixCaps::default(),
-                min_subgroup_size: 0,
-                max_subgroup_size: 0,
-                max_compute_invocations_per_workgroup: 0,
-                max_compute_workgroup_storage_size: 0,
-                max_compute_workgroup_size_x: 0,
-                backend: wgpu::Backend::Noop,
-            },
-        )
-        .expect("direct tile matmul selector has a catch-all rule")
 }

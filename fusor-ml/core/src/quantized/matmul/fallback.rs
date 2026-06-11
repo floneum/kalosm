@@ -78,7 +78,7 @@ impl QMatMulOperation {
             graph,
             &dense_matmul
                 .workgroup_shape_constraints(&device)
-                .solve(device.max_subgroup_size())?,
+                .solve(device.max_subgroup_size(), &device.limits())?,
             &[
                 input.clone().into(),
                 dense_weight_t.into(),
@@ -109,7 +109,7 @@ impl QMatMulOperation {
         let dequantize_inputs = vec![matrix.clone().into(), dense_weight.clone().into()];
         let dequantize_workgroup = dequantize
             .workgroup_shape_constraints(&graph.device())
-            .solve(graph.device().max_subgroup_size())?;
+            .solve(graph.device().max_subgroup_size(), &graph.device().limits())?;
         let dequantize_kernel =
             dequantize.build_direct_kernel(graph, &dequantize_workgroup, &dequantize_inputs)?;
         let dense_matrix = QMatrix {
@@ -133,7 +133,7 @@ impl QMatMulOperation {
         shape: &[usize],
         output_datatype: DataTypeEnum,
     ) -> Option<DirectKernel> {
-        let operation = NaryOperation {
+        let operation = ElementwiseOperation {
             inputs: (0..inputs.len()).map(NodeIndex::new).collect(),
             expression,
             shape: shape.into(),
@@ -146,7 +146,7 @@ impl QMatMulOperation {
         mir_inputs.push(output.clone().into());
         let workgroup_shape = operation
             .workgroup_shape_constraints(&graph.device())
-            .solve(graph.device().max_subgroup_size())?;
+            .solve(graph.device().max_subgroup_size(), &graph.device().limits())?;
         operation.build_direct_kernel(graph, &workgroup_shape, &mir_inputs)
     }
 

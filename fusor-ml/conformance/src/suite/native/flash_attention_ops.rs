@@ -304,10 +304,9 @@ fn assert_flash_attention_case(
 /// non-deterministic workgroup-memory races.
 pub fn flash_attention_decode_tiled_matches_cpu_reference() -> AssertionCases {
     // (num_heads, num_kv_heads, kv_seq_len)
-    // Shapes specifically chosen to stress decode block boundaries and the
-    // tiled flash_decode_small_block path. head_dim=128 forces the decode-small
-    // kernel; kv_seq_len spans 128-wide tiled failure cases and values
-    // beyond the largest 1024-wide block.
+    // Shapes specifically chosen to stress decode tile boundaries in the
+    // attention row program: kv_seq_len spans ragged single tiles and
+    // values beyond one workgroup bucket (the split lowering).
     let shapes = [
         (16, 2, 129),  // just past one full tile
         (16, 2, 192),  // mid-second tile
@@ -349,10 +348,9 @@ pub fn flash_attention_decode_tiled_matches_cpu_reference() -> AssertionCases {
 
 /// Same as the tiled test above, but builds Q with non-canonical strides
 /// (reshape + transpose) — matching how the real attention path produces Q
-/// in `models/kalosm-llama/src/raw/attention_layer.rs`. The kernel reads Q
-/// via `index_n(meta.q_offset, meta.q_strides, ...)`, so different strides
-/// hit different memory addresses and exercise different control flow paths
-/// inside `flash_decode_small_block`.
+/// in `models/kalosm-llama/src/raw/attention_layer.rs`. The row program
+/// reads Q through its layout strides, so different strides hit different
+/// memory addresses.
 pub fn flash_attention_decode_tiled_with_transposed_q_matches_cpu_reference() -> AssertionCases {
     let shapes = [(16, 2, 129), (16, 2, 257), (16, 2, 384), (16, 2, 569)];
 

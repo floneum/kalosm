@@ -21,7 +21,7 @@ use crate::{
         workgroup_shape::{Constraint, WorkgroupShapeConstraints},
     },
     nary_direct::{apply_multi_input_elementwise_expr, apply_single_input_elementwise_expr},
-    nary_wise::{NaryExpr, NaryOp, NaryOperation},
+    nary_wise::{ElementwiseOperation, NaryExpr, NaryOp},
 };
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;

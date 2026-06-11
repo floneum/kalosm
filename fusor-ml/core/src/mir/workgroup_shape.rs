@@ -1,4 +1,5 @@
-// The shape of the workgroup. [x, y, z] where their product is <= 256.
+// The shape of the workgroup. [x, y, z] where their product is bounded by
+// the device's workgroup limits.
 //
 // Kernels can be fused if their workgroup shape can be coerced. Coercion can happen if
 // the biggest linearized workgroup shape is a multiple of all smaller workgroup shapes.
@@ -7,8 +8,6 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use rustc_hash::FxBuildHasher;
 use std::{num::NonZeroUsize, sync::OnceLock};
-
-const MAX_WORKGROUP_SIZE: u32 = 256;
 
 #[derive(Debug, Clone, Copy)]
 pub struct WorkgroupShape {
@@ -26,10 +25,6 @@ impl WorkgroupShape {
         assert!(
             x > 0 && y > 0 && z > 0,
             "Workgroup shape dimensions must be greater than zero"
-        );
-        assert!(
-            x * y * z <= 256,
-            "Workgroup shape dimensions must be less than or equal to 256"
         );
         Self { shape: [x, y, z] }
     }
@@ -88,24 +83,38 @@ impl WorkgroupShapeConstraints {
         })
     }
 
-    fn possible(&self) -> impl Iterator<Item = WorkgroupShape> {
-        possible_workgroup_shapes().filter(move |shape| self.is_valid(shape))
+    fn possible(&self, limits: &wgpu::Limits) -> impl Iterator<Item = WorkgroupShape> {
+        possible_workgroup_shapes(limits).filter(move |shape| self.is_valid(shape))
     }
 
-    pub(crate) fn solve(&self, max_subgroup_size: u32) -> Option<WorkgroupShape> {
-        static CACHE: OnceLock<
-            RwLock<LruCache<WorkgroupShapeConstraints, Option<WorkgroupShape>, FxBuildHasher>>,
-        > = OnceLock::new();
+    pub(crate) fn solve(
+        &self,
+        max_subgroup_size: u32,
+        limits: &wgpu::Limits,
+    ) -> Option<WorkgroupShape> {
+        type CacheKey = (WorkgroupShapeConstraints, u32, [u32; 4]);
+        static CACHE: OnceLock<RwLock<LruCache<CacheKey, Option<WorkgroupShape>, FxBuildHasher>>> =
+            OnceLock::new();
         let cache = CACHE.get_or_init(|| {
             RwLock::new(LruCache::with_hasher(
                 const { NonZeroUsize::new(2048).unwrap() },
                 Default::default(),
             ))
         });
+        let key = (
+            self.clone(),
+            max_subgroup_size,
+            [
+                limits.max_compute_workgroup_size_x,
+                limits.max_compute_workgroup_size_y,
+                limits.max_compute_workgroup_size_z,
+                limits.max_compute_invocations_per_workgroup,
+            ],
+        );
         let mut write = cache.write();
-        *write.get_or_insert_ref(self, || {
+        *write.get_or_insert_ref(&key, || {
             // Find the smallest valid shape that matches the max subgroup size
-            self.possible().min_by_key(|shape| {
+            self.possible(limits).min_by_key(|shape| {
                 let linearized = shape.linearized();
                 (linearized as i64)
                     + if max_subgroup_size == 0 || shape.x() % max_subgroup_size == 0 {
@@ -118,10 +127,16 @@ impl WorkgroupShapeConstraints {
     }
 }
 
-fn possible_workgroup_shapes() -> impl Iterator<Item = WorkgroupShape> {
-    (1..=MAX_WORKGROUP_SIZE).flat_map(move |x| {
-        (1..=(MAX_WORKGROUP_SIZE / x)).flat_map(move |y| {
-            (1..=(MAX_WORKGROUP_SIZE / (x * y))).map(move |z| WorkgroupShape::new(x, y, z))
+/// Every workgroup shape the device can run: each dimension within its
+/// per-axis limit and the product within the invocation limit.
+fn possible_workgroup_shapes(limits: &wgpu::Limits) -> impl Iterator<Item = WorkgroupShape> {
+    let total = limits.max_compute_invocations_per_workgroup;
+    let max_x = limits.max_compute_workgroup_size_x.min(total);
+    let max_y = limits.max_compute_workgroup_size_y.min(total);
+    let max_z = limits.max_compute_workgroup_size_z.min(total);
+    (1..=max_x).flat_map(move |x| {
+        (1..=max_y.min(total / x)).flat_map(move |y| {
+            (1..=max_z.min(total / (x * y))).map(move |z| WorkgroupShape::new(x, y, z))
         })
     })
 }
@@ -165,23 +180,35 @@ mod tests {
 
     const TEST_MAX_SUBGROUP_SIZE: u32 = 64;
 
+    fn test_limits(size: u32) -> wgpu::Limits {
+        wgpu::Limits {
+            max_compute_workgroup_size_x: size,
+            max_compute_workgroup_size_y: size,
+            max_compute_workgroup_size_z: size,
+            max_compute_invocations_per_workgroup: size,
+            ..wgpu::Limits::default()
+        }
+    }
+
     #[test]
     fn test_all_possible_workgroup_shapes() {
-        assert_eq!(possible_workgroup_shapes().count(), 5136);
+        assert_eq!(possible_workgroup_shapes(&test_limits(256)).count(), 5136);
+        assert_eq!(possible_workgroup_shapes(&test_limits(1024)).count(), 30343);
     }
 
     #[test]
     fn test_workgroup_shape_constraints() {
+        let limits = test_limits(256);
         let mut constraints = WorkgroupShapeConstraints::new();
         constraints.add_constraint(0, Constraint::Equals(4));
         constraints.add_constraint(1, Constraint::LessThan(3));
 
-        for shape in constraints.possible() {
+        for shape in constraints.possible(&limits) {
             assert_eq!(shape.shape()[0], 4);
             assert!(shape.shape()[1] < 3);
         }
 
-        let valid_shape = constraints.solve(TEST_MAX_SUBGROUP_SIZE).unwrap();
+        let valid_shape = constraints.solve(TEST_MAX_SUBGROUP_SIZE, &limits).unwrap();
         assert_eq!(valid_shape.shape(), [4, 1, 1]);
         assert_eq!(valid_shape.linearized(), 4);
     }

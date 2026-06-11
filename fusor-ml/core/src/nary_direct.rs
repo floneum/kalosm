@@ -9,8 +9,12 @@ use crate::{
         operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
-    nary_wise::{NaryExpr, NaryFunction, NaryOp, NaryOperation, NaryScalar, UnaryFunctionChain},
+    nary_wise::{
+        ElementwiseOperation, NaryExpr, NaryFunction, NaryOp, NaryScalar, UnaryFunctionChain,
+    },
+    quantized::QMatrix,
     tensor::{DataTypeEnum, TensorData},
+    visit_tiled::MaybeQData,
 };
 
 const BLOCK: usize = 256;
@@ -19,7 +23,7 @@ const SMALL_BLOCK: usize = 1;
 struct NaryDirectKernelVariant;
 
 pub(crate) fn build_nary_direct_kernel(
-    operation: &NaryOperation,
+    operation: &ElementwiseOperation,
     graph: &crate::compute_graph::ComputeGraphInner,
     workgroup_shape: &WorkgroupShape,
     inputs: &[MirValue],
@@ -28,7 +32,7 @@ pub(crate) fn build_nary_direct_kernel(
 }
 
 pub(crate) fn build_nary_direct_kernel_to_output(
-    operation: &NaryOperation,
+    operation: &ElementwiseOperation,
     graph: &crate::compute_graph::ComputeGraphInner,
     workgroup_shape: &WorkgroupShape,
     inputs: &[MirValue],
@@ -44,29 +48,52 @@ pub(crate) fn build_nary_direct_kernel_to_output(
 }
 
 fn build_nary_direct_kernel_with_output_index(
-    operation: &NaryOperation,
+    operation: &ElementwiseOperation,
     graph: &crate::compute_graph::ComputeGraphInner,
     workgroup_shape: &WorkgroupShape,
     inputs: &[MirValue],
     forced_output_index: Option<usize>,
 ) -> Option<DirectKernel> {
     let output_index = forced_output_index.or_else(|| operation.output_tensor_index(inputs))?;
-    let tensors = inputs
+    let values = inputs
         .iter()
-        .map(|input| input.as_tensor().cloned())
+        .map(|input| MaybeQData::try_from(input.clone()).ok())
         .collect::<Option<Vec<_>>>()?;
-    tensors.get(output_index)?;
+    let MaybeQData::Tensor(_) = values.get(output_index)? else {
+        return None;
+    };
 
-    if tensors
-        .iter()
-        .any(|tensor| tensor.datatype() == DataTypeEnum::F16 && !graph.device().f16_supported())
-    {
+    if values.iter().any(|value| {
+        let datatype = match value {
+            MaybeQData::Tensor(tensor) => tensor.datatype(),
+            MaybeQData::QMatrix(matrix) => match matrix.datatype() {
+                fusor_gguf::GgmlType::F16 => DataTypeEnum::F16,
+                _ => return false,
+            },
+        };
+        datatype == DataTypeEnum::F16 && !graph.device().f16_supported()
+    }) {
         return None;
     }
 
     let total_elements = total_elements(&operation.shape)?;
+    let plan = plan_nary_tiling(operation, &graph.device(), &values, output_index);
+    if let Some(plan) = &plan
+        && std::env::var_os("FUSOR_TRACE_REDUCE_TILED").is_some()
+    {
+        eprintln!(
+            "nary_tiled dim={} invariant={:?} threads={} shape={:?}",
+            plan.dim, plan.invariant, plan.total_threads, operation.shape,
+        );
+    }
     let small_dispatch = total_elements < BLOCK as u32;
-    let dispatch_size = if small_dispatch {
+    let dispatch_size = if let Some(plan) = &plan {
+        let max_per_dim = graph.device().limits().max_compute_workgroups_per_dimension;
+        crate::visit_tiled::distribute_workgroups(
+            plan.total_threads.div_ceil(BLOCK as u32),
+            max_per_dim,
+        )
+    } else if small_dispatch {
         [total_elements, 1, 1]
     } else {
         operation.dispatch_size(workgroup_shape, inputs)
@@ -74,6 +101,10 @@ fn build_nary_direct_kernel_with_output_index(
     let variant =
         kernel_backend::KernelVariantKey::with_payload::<NaryDirectKernelVariant>(|state| {
             output_index.hash(state);
+            if let Some(plan) = &plan {
+                plan.dim.hash(state);
+                plan.invariant.hash(state);
+            }
         });
     let cache_key = operation.kernel_cache_key_with_dispatch(
         variant,
@@ -86,24 +117,209 @@ fn build_nary_direct_kernel_with_output_index(
     } else {
         format!("nary_direct_out_{output_index}")
     };
-    let buffers = tensors
-        .iter()
-        .map(|tensor| tensor.buffer().clone())
-        .collect::<Vec<_>>();
-    kernel_backend::dynamic_kernel_from_ir(
+    kernel_backend::run_kernel(
         graph.device().kernel_cache(),
         name,
         cache_key,
-        move || {
-            if small_dispatch {
-                build_nary_tile_ir::<SMALL_BLOCK>(operation, &tensors, output_index, dispatch_size)
+        dispatch_size,
+        |kb| {
+            if let Some(plan) = &plan {
+                build_nary_tiled_ir(operation, &values, output_index, plan, dispatch_size, kb)
+            } else if small_dispatch {
+                build_nary_tile_ir::<SMALL_BLOCK>(
+                    operation,
+                    &values,
+                    output_index,
+                    dispatch_size,
+                    kb,
+                )
             } else {
-                build_nary_tile_ir::<BLOCK>(operation, &tensors, output_index, dispatch_size)
+                build_nary_tile_ir::<BLOCK>(operation, &values, output_index, dispatch_size, kb)
             }
         },
-        buffers,
-        dispatch_size,
     )
+}
+
+/// Outputs per thread along the tiled dim of a reuse-tiled elementwise
+/// kernel.
+const NARY_TM: u32 = 4;
+/// Floor on post-tiling thread count: trading threads for register reuse
+/// must leave the device saturated.
+const MIN_TILED_THREADS: u32 = 65536;
+
+/// A register-reuse tiling for an elementwise kernel: each thread covers
+/// `NARY_TM` outputs along `dim`, loading the inputs that are invariant
+/// along `dim` once instead of per output.
+struct NaryTilePlan {
+    dim: usize,
+    /// Per input: invariant along `dim` (its loads hoist out of the run).
+    invariant: Vec<bool>,
+    /// Per input: index-space dim read by each input dimension.
+    dims: Vec<Vec<usize>>,
+    /// The output shape with `dim` divided by `NARY_TM`.
+    thread_shape: Vec<usize>,
+    total_threads: u32,
+}
+
+/// Tile only when the hoisted loads buy real bandwidth: the invariant
+/// inputs must exceed the device's cache-residency threshold (cache-resident
+/// re-reads are free, and the tiling costs thread-level parallelism), the
+/// tiled dim must not be the innermost output dim (thread-local runs there
+/// break inter-thread store coalescing), and enough threads must remain.
+fn plan_nary_tiling(
+    operation: &ElementwiseOperation,
+    device: &crate::Device,
+    values: &[MaybeQData],
+    output_index: usize,
+) -> Option<NaryTilePlan> {
+    let input_count = operation.inputs.len();
+    let rank = operation.shape.len();
+    if rank < 2 || output_index != input_count || values.len() != input_count + 1 {
+        return None;
+    }
+    // Quantized inputs decode through a dedicated load path the value-tile
+    // evaluator can't hoist.
+    if values[..input_count]
+        .iter()
+        .any(|value| matches!(value, MaybeQData::QMatrix(_)))
+    {
+        return None;
+    }
+    let metas: Vec<TensorMeta> = values[..input_count]
+        .iter()
+        .map(|value| match value {
+            MaybeQData::Tensor(tensor) => TensorMeta::new(tensor),
+            MaybeQData::QMatrix(_) => None,
+        })
+        .collect::<Option<_>>()?;
+    let access =
+        crate::access_analysis::InputAccesses::collect(&operation.expression, input_count, &metas)?;
+
+    let mut best: Option<(u64, usize)> = None;
+    for dim in 0..rank.saturating_sub(1) {
+        if operation.shape[dim] < NARY_TM as usize {
+            continue;
+        }
+        let invariant_bytes: u64 = (0..input_count)
+            .filter(|&i| !access.depends_on(i, dim))
+            .map(|i| crate::reduce_tiled::input_allocation_bytes(&metas[i], &values[i]))
+            .sum();
+        if invariant_bytes < device.last_level_cache_bytes() {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(best_bytes, _)| invariant_bytes > *best_bytes)
+        {
+            best = Some((invariant_bytes, dim));
+        }
+    }
+    let (_, dim) = best?;
+    let invariant: Vec<bool> = (0..input_count)
+        .map(|i| !access.depends_on(i, dim))
+        .collect();
+
+    let mut thread_shape = operation.shape.to_vec();
+    thread_shape[dim] = thread_shape[dim].div_ceil(NARY_TM as usize);
+    let total_threads = total_elements(&thread_shape)?;
+    if total_threads < MIN_TILED_THREADS {
+        return None;
+    }
+    Some(NaryTilePlan {
+        dim,
+        invariant,
+        dims: access.dims,
+        thread_shape,
+        total_threads,
+    })
+}
+
+fn build_nary_tiled_ir(
+    operation: &ElementwiseOperation,
+    values: &[MaybeQData],
+    output_index: usize,
+    plan: &NaryTilePlan,
+    dispatch_size: [u32; 3],
+    kb: &mut tile_ir::KernelBuilder<std::sync::Arc<wgpu::Buffer>>,
+) -> Option<()> {
+    let mut storages = Vec::with_capacity(values.len());
+    let mut metas = Vec::with_capacity(values.len());
+    for (binding, value) in values.iter().enumerate() {
+        let (storage, meta) = declare_value(kb, value, binding == output_index)?;
+        storages.push(storage);
+        metas.push(meta);
+    }
+    let extent = operation.shape[plan.dim] as u32;
+    let total_threads = plan.total_threads;
+    let input_count = operation.inputs.len();
+
+    let input_coords = |coords: &[tile_ir::tile::Tile], i: usize| -> Vec<tile_ir::tile::Tile> {
+        plan.dims[i].iter().map(|&d| coords[d].clone()).collect()
+    };
+
+    kb.program()
+        .program_grid(BLOCK as u32, dispatch_size, |program| {
+            let lane = program.lane();
+            let group = linear_group(program, dispatch_size);
+            let flat = group * BLOCK as u32 + lane;
+            let in_bounds = flat.clone().lt(total_threads);
+            let mut coords = output_dims_from_flat(flat, &plan.thread_shape);
+            let base = program.bind(coords[plan.dim].clone() * NARY_TM);
+
+            // Invariant loads hoist out of the per-output run; the base
+            // coordinate is always in range for an in-bounds thread.
+            coords[plan.dim] = base.clone();
+            let hoisted: Vec<Option<(ValueTile, DataTypeEnum)>> = (0..input_count)
+                .map(|i| {
+                    if !plan.invariant[i] {
+                        return None;
+                    }
+                    let index = layout_index(&metas[i], &input_coords(&coords, i));
+                    let loaded = storages[i].load(program, index, in_bounds.clone());
+                    let native = match loaded {
+                        ValueTile::F32(v) | ValueTile::F16(v) | ValueTile::U32(v) => v,
+                        ValueTile::Bool(_) => unreachable!("tensor inputs are f32/f16/u32"),
+                    };
+                    Some((
+                        value_tile_of(metas[i].datatype, program.bind(native)),
+                        metas[i].datatype,
+                    ))
+                })
+                .collect();
+
+            for j in 0..NARY_TM {
+                let coord = base.clone() + j;
+                let in_bounds_j = in_bounds.clone().and(coord.clone().lt(extent));
+                coords[plan.dim] = coord;
+                let slot_values: Vec<(ValueTile, DataTypeEnum)> = (0..input_count)
+                    .map(|i| match &hoisted[i] {
+                        Some(value) => value.clone(),
+                        None => {
+                            let index = layout_index(&metas[i], &input_coords(&coords, i));
+                            (
+                                storages[i].load(program, index, in_bounds_j.clone()),
+                                metas[i].datatype,
+                            )
+                        }
+                    })
+                    .collect();
+                let (value, value_ty) =
+                    eval_nary_expr_on_value_tiles(&operation.expression, &slot_values);
+                let value = value.cast_to(operation.output_datatype);
+                debug_assert_eq!(value_ty, operation.output_datatype);
+                let output_index_value = layout_index(&metas[output_index], &coords);
+                storages[output_index].store(program, output_index_value, value, in_bounds_j);
+            }
+        });
+    Some(())
+}
+
+fn value_tile_of(datatype: DataTypeEnum, value: tile_ir::tile::Tile) -> ValueTile {
+    match datatype {
+        DataTypeEnum::F32 => ValueTile::F32(value),
+        DataTypeEnum::F16 => ValueTile::F16(value),
+        DataTypeEnum::U32 => ValueTile::U32(value),
+    }
 }
 
 fn total_elements(shape: &[usize]) -> Option<u32> {
@@ -112,7 +328,7 @@ fn total_elements(shape: &[usize]) -> Option<u32> {
         .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))
 }
 
-impl NaryOperation {
+impl ElementwiseOperation {
     pub(crate) fn output_tensor_index(&self, inputs: &[MirValue]) -> Option<usize> {
         inputs.len().checked_sub(1)
     }
@@ -247,6 +463,10 @@ pub(crate) enum Storage2 {
     F32(tile_ir::tile::Storage),
     F16(tile_ir::tile::Storage),
     U32(tile_ir::tile::Storage),
+    /// A block-quantized matrix loaded per element (block decode in the
+    /// lowerer). Loads through [`eval_nary_expr`]'s dedicated path — `load`
+    /// on this variant is unreachable.
+    Quantized(tile_ir::QuantizedMatrix),
 }
 
 impl Storage2 {
@@ -274,6 +494,9 @@ impl Storage2 {
                 mask,
                 zero_literal(DataTypeEnum::U32),
             )),
+            Self::Quantized(_) => {
+                unreachable!("quantized inputs load through the row/col path")
+            }
         }
     }
 
@@ -300,52 +523,93 @@ impl Storage2 {
                     program.store(storage.at((0u32, index)), value, mask);
                 }
             }
+            Self::Quantized(_) => {
+                unreachable!("quantized matrices are read-only inputs")
+            }
         }
     }
 }
 
-pub(crate) fn declare_storage(
-    phase: &mut tile_ir::tile::Program,
-    meta: &TensorMeta,
+/// Declare one n-ary input or output as a kernel binding: dense tensors and
+/// dense-storage matrices as flat strided reads/writes, block-quantized
+/// matrices through the format-aware quantized binding.
+pub(crate) fn declare_value(
+    kb: &mut tile_ir::KernelBuilder<std::sync::Arc<wgpu::Buffer>>,
+    value: &MaybeQData,
     write: bool,
-) -> Storage2 {
-    let layout = tile_ir::Layout::strided(
-        tile_ir::MemoryLevel::Storage,
-        tile_ir::Shape::new([1, meta.allocation_len]),
-        &[0, 1],
-    );
-    let element = datatype_element(meta.datatype);
-    let storage = if write {
-        phase.storage_write_with_layout_offset(element, layout, 0)
-    } else {
-        phase.storage_read_with_layout_offset(element, layout, 0)
+) -> Option<(Storage2, TensorMeta)> {
+    let declare_dense = |kb: &mut tile_ir::KernelBuilder<std::sync::Arc<wgpu::Buffer>>,
+                         buffer: std::sync::Arc<wgpu::Buffer>,
+                         meta: &TensorMeta| {
+        let tensor = tile_ir::KernelTensorRef::new(buffer, flat_layout(meta.allocation_len));
+        let element = datatype_element(meta.datatype);
+        let storage = if write {
+            kb.write(element, tensor)
+        } else {
+            kb.read(element, tensor)
+        };
+        match meta.datatype {
+            DataTypeEnum::F32 => Storage2::F32(storage),
+            DataTypeEnum::F16 => Storage2::F16(storage),
+            DataTypeEnum::U32 => Storage2::U32(storage),
+        }
     };
-    match meta.datatype {
-        DataTypeEnum::F32 => Storage2::F32(storage),
-        DataTypeEnum::F16 => Storage2::F16(storage),
-        DataTypeEnum::U32 => Storage2::U32(storage),
+    match value {
+        MaybeQData::Tensor(tensor) => {
+            let meta = TensorMeta::new(tensor)?;
+            let storage = declare_dense(kb, tensor.buffer().clone(), &meta);
+            Some((storage, meta))
+        }
+        MaybeQData::QMatrix(matrix) => {
+            if write {
+                return None;
+            }
+            let meta = TensorMeta::for_matrix(matrix)?;
+            match crate::quantized::dequantize::quant_format(matrix) {
+                Some(format) => {
+                    // `QuantizedMatrix::rows` is the dense row *length* (the
+                    // contiguous K axis); `cols` counts the rows.
+                    let row_len = *matrix.shape().last()? as u32;
+                    let row_count = matrix.shape()[..matrix.shape().len() - 1]
+                        .iter()
+                        .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
+                    let storage = fusor_tile_ir_kernels::quantized_matrix_for(
+                        kb,
+                        matrix.buffer().clone(),
+                        format,
+                        row_len,
+                        row_count,
+                    );
+                    Some((Storage2::Quantized(storage), meta))
+                }
+                // Dense f16/f32 storage reads like a plain row-major tensor.
+                None => {
+                    let storage = declare_dense(kb, matrix.buffer().clone(), &meta);
+                    Some((storage, meta))
+                }
+            }
+        }
     }
 }
 
 fn build_nary_tile_ir<const BLOCK_SIZE: usize>(
-    operation: &NaryOperation,
-    tensors: &[TensorData],
+    operation: &ElementwiseOperation,
+    values: &[MaybeQData],
     output_index: usize,
     dispatch_size: [u32; 3],
-) -> Option<tile_ir::KernelIr> {
+    kb: &mut tile_ir::KernelBuilder<std::sync::Arc<wgpu::Buffer>>,
+) -> Option<()> {
     let total_elements = total_elements(&operation.shape)?;
-    let tensor_metas = tensors
-        .iter()
-        .map(TensorMeta::new)
-        .collect::<Option<Vec<_>>>()?;
+    let mut storages = Vec::with_capacity(values.len());
+    let mut tensor_metas = Vec::with_capacity(values.len());
+    for (binding, value) in values.iter().enumerate() {
+        let (storage, meta) = declare_value(kb, value, binding == output_index)?;
+        storages.push(storage);
+        tensor_metas.push(meta);
+    }
 
-    Some(tile_ir::tile::build(move |phase| {
-        let storages = tensor_metas
-            .iter()
-            .enumerate()
-            .map(|(binding, meta)| declare_storage(phase, meta, binding == output_index))
-            .collect::<Vec<_>>();
-
+    {
+        let phase = kb.program();
         phase.program_grid(BLOCK_SIZE as u32, dispatch_size, |program| {
             let lane = program.lane();
             let group = linear_group(program, dispatch_size);
@@ -359,25 +623,31 @@ fn build_nary_tile_ir<const BLOCK_SIZE: usize>(
                 &storages,
                 &tensor_metas,
                 in_bounds.clone(),
+                &[],
             );
             let value = value.cast_to(operation.output_datatype);
             debug_assert_eq!(value_ty, operation.output_datatype);
             let output_index_value = layout_index(&tensor_metas[output_index], &dims);
             storages[output_index].store(program, output_index_value, value, in_bounds);
         });
-    }))
+    }
+    Some(())
 }
 
-fn eval_nary_expr(
+/// Evaluate an expression at one coordinate. Slot indices beyond the bound
+/// storages resolve from `extras` — per-row scalars a surrounding kernel has
+/// already computed (row-program phases).
+pub(crate) fn eval_nary_expr(
     program: &mut tile_ir::tile::TileBlock<'_>,
     expr: &NaryExpr,
     dims: &[tile_ir::tile::Tile],
     storages: &[Storage2],
     metas: &[TensorMeta],
     mask: tile_ir::tile::Mask,
+    extras: &[(ValueTile, DataTypeEnum)],
 ) -> (ValueTile, DataTypeEnum) {
     if let Some(value) =
-        eval_associative_binary_tree(program, expr, dims, storages, metas, mask.clone())
+        eval_associative_binary_tree(program, expr, dims, storages, metas, mask.clone(), extras)
     {
         return value;
     }
@@ -389,25 +659,39 @@ fn eval_nary_expr(
                 .zip(&function.input_types)
                 .map(|(child, expected)| {
                     let (value, ty) =
-                        eval_nary_expr(program, child, dims, storages, metas, mask.clone());
+                        eval_nary_expr(program, child, dims, storages, metas, mask.clone(), extras);
                     (value.cast_to(*expected), ty)
                 })
                 .collect::<Vec<_>>();
             (emit_function(function, &mut values), function.output_type)
         }
         NaryExpr::IndexedInput { input_idx, indices } => {
+            if *input_idx >= storages.len() {
+                return extras[*input_idx - storages.len()].clone();
+            }
             let meta = &metas[*input_idx];
             let coords = indices
                 .iter()
                 .map(|index| {
                     let (value, _) =
-                        eval_nary_expr(program, index, dims, storages, metas, mask.clone());
+                        eval_nary_expr(program, index, dims, storages, metas, mask.clone(), extras);
                     match value.cast_to(DataTypeEnum::U32) {
                         ValueTile::U32(value) => value,
                         _ => unreachable!(),
                     }
                 })
                 .collect::<Vec<_>>();
+            if let Storage2::Quantized(matrix) = &storages[*input_idx] {
+                // Block-quantized loads address by (position within the row,
+                // which row): the position is the last coordinate, and the
+                // row is the row-major flattening of every leading
+                // coordinate (the meta carries those strides with a 0 in the
+                // final slot).
+                let along_row = coords.last().cloned().unwrap_or_else(|| tile_u32(0));
+                let which_row = layout_index(meta, &coords);
+                let value = program.load_quantized(matrix, along_row, which_row, mask, 0.0);
+                return (ValueTile::F32(value), DataTypeEnum::F32);
+            }
             let index = layout_index(meta, &coords);
             let value = storages[*input_idx].load(program, index, mask);
             (value, meta.datatype)
@@ -417,6 +701,7 @@ fn eval_nary_expr(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eval_associative_binary_tree(
     program: &mut tile_ir::tile::TileBlock<'_>,
     expr: &NaryExpr,
@@ -424,14 +709,15 @@ fn eval_associative_binary_tree(
     storages: &[Storage2],
     metas: &[TensorMeta],
     mask: tile_ir::tile::Mask,
+    extras: &[(ValueTile, DataTypeEnum)],
 ) -> Option<(ValueTile, DataTypeEnum)> {
     let (op, datatype, terms) = flatten_associative_binary_terms(expr)?;
     let mut terms = terms.into_iter();
     let first = terms.next()?;
-    let (value, _) = eval_nary_expr(program, first, dims, storages, metas, mask.clone());
+    let (value, _) = eval_nary_expr(program, first, dims, storages, metas, mask.clone(), extras);
     let mut value = value.cast_to(datatype);
     for term in terms {
-        let (rhs, _) = eval_nary_expr(program, term, dims, storages, metas, mask.clone());
+        let (rhs, _) = eval_nary_expr(program, term, dims, storages, metas, mask.clone(), extras);
         value = value.binary(op, rhs.cast_to(datatype));
     }
 
@@ -572,6 +858,11 @@ fn emit_function(function: &NaryFunction, values: &mut [(ValueTile, DataTypeEnum
         NaryOp::Acosh => values[0].0.clone().unary(tile_ir::TileUnaryOp::Acosh),
         NaryOp::Atanh => values[0].0.clone().unary(tile_ir::TileUnaryOp::Atanh),
         NaryOp::Abs => values[0].0.clone().unary(tile_ir::TileUnaryOp::Abs),
+        NaryOp::LessEqual => values[0].0.clone().compare(
+            tile_ir::TileCompareOp::Le,
+            values[1].0.clone(),
+            function.output_type,
+        ),
         NaryOp::AddConst(scalar) => values[0].0.clone().binary(
             tile_ir::TileBinaryOp::Add,
             tile_literal(scalar).cast_to(values[0].1),
@@ -646,7 +937,7 @@ fn emit_function(function: &NaryFunction, values: &mut [(ValueTile, DataTypeEnum
     }
 }
 
-fn eval_nary_expr_on_value_tiles(
+pub(crate) fn eval_nary_expr_on_value_tiles(
     expr: &NaryExpr,
     inputs: &[(ValueTile, DataTypeEnum)],
 ) -> (ValueTile, DataTypeEnum) {
@@ -853,6 +1144,51 @@ pub(crate) struct TensorMeta {
 }
 
 impl TensorMeta {
+    /// Metadata for a quantized-or-dense matrix input. Quantized matrices
+    /// load by (row, col), so the strides flatten the leading dims row-major
+    /// and zero out the final (column) slot; dense-storage matrices read as
+    /// plain row-major tensors of their storage element type.
+    pub(crate) fn for_matrix(matrix: &QMatrix) -> Option<Self> {
+        let shape: Vec<u32> = matrix
+            .shape()
+            .iter()
+            .copied()
+            .map(u32::try_from)
+            .collect::<Result<_, _>>()
+            .ok()?;
+        let allocation_len = shape
+            .iter()
+            .try_fold(1u32, |acc, dim| acc.checked_mul(*dim))?;
+        let quantized = crate::quantized::dequantize::quant_format(matrix).is_some();
+        let datatype = if quantized {
+            DataTypeEnum::F32
+        } else {
+            match matrix.datatype() {
+                fusor_gguf::GgmlType::F32 => DataTypeEnum::F32,
+                fusor_gguf::GgmlType::F16 => DataTypeEnum::F16,
+                _ => return None,
+            }
+        };
+        let mut strides = vec![0u32; shape.len()];
+        let mut acc = 1u32;
+        let stride_dims = if quantized {
+            shape.len().saturating_sub(1)
+        } else {
+            shape.len()
+        };
+        for dim in (0..stride_dims).rev() {
+            strides[dim] = acc;
+            acc = acc.checked_mul(shape[dim])?;
+        }
+        Some(Self {
+            datatype,
+            shape,
+            strides,
+            offset: 0,
+            allocation_len,
+        })
+    }
+
     pub(crate) fn new(tensor: &TensorData) -> Option<Self> {
         Some(Self {
             datatype: tensor.datatype(),

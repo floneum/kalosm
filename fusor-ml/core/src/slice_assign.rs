@@ -9,7 +9,7 @@ use crate::{
         operation::Operation,
         workgroup_shape::{WorkgroupShape, WorkgroupShapeConstraints},
     },
-    nary_wise::{NaryExpr, NaryOp, NaryOperation, NaryScalar},
+    nary_wise::{ElementwiseOperation, NaryExpr, NaryOp, NaryScalar},
     visit_tiled::{titled_map_dispatch_size, titled_map_workgroup_size_constraints},
 };
 
@@ -22,22 +22,67 @@ pub(crate) struct SliceAssignOperation {
     pub(crate) in_place: bool,
 }
 
-impl SliceAssignOperation {
-    pub fn new(
-        input: NodeIndex,
-        value: NodeIndex,
-        slices: Box<[Range<usize>]>,
-        input_shape: Box<[usize]>,
-    ) -> Self {
-        Self {
-            input,
-            value,
-            slices,
-            input_shape,
-            in_place: false,
-        }
+/// The composed slice-assign body: per output coordinate, read the assigned
+/// value inside the slice region and the original input outside it. Inputs:
+/// 0 = the original tensor, 1 = the assigned value.
+pub(crate) fn slice_assign_expression(slices: &[Range<usize>], datatype: DataTypeEnum) -> NaryExpr {
+    let rank = slices.len();
+    let mut condition = NaryExpr::scalar(NaryScalar::U32(1));
+    for (dim, slice) in slices.iter().enumerate() {
+        let dim_index = NaryExpr::DimIndex(dim);
+        let ge_start = NaryExpr::unary_op(
+            dim_index.clone(),
+            "ge_start",
+            NaryOp::GreaterEqualConst(NaryScalar::U32(slice.start as u32)),
+            DataTypeEnum::U32,
+            DataTypeEnum::U32,
+        );
+        let lt_end = NaryExpr::unary_op(
+            dim_index,
+            "lt_end",
+            NaryOp::LessConst(NaryScalar::U32(slice.end as u32)),
+            DataTypeEnum::U32,
+            DataTypeEnum::U32,
+        );
+        condition = NaryExpr::mul(condition, ge_start, DataTypeEnum::U32);
+        condition = NaryExpr::mul(condition, lt_end, DataTypeEnum::U32);
     }
 
+    let value_indices = slices
+        .iter()
+        .enumerate()
+        .map(|(dim, slice)| {
+            let shifted_index = if slice.start == 0 {
+                NaryExpr::DimIndex(dim)
+            } else {
+                NaryExpr::unary_op(
+                    NaryExpr::DimIndex(dim),
+                    "slice_offset",
+                    NaryOp::SubConst(NaryScalar::U32(slice.start as u32)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                )
+            };
+            NaryExpr::select(
+                condition.clone(),
+                shifted_index,
+                NaryExpr::scalar(NaryScalar::U32(0)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            )
+        })
+        .collect();
+
+    NaryExpr::select(
+        condition,
+        NaryExpr::indexed_input(1, value_indices),
+        NaryExpr::input(0, rank),
+        DataTypeEnum::U32,
+        datatype,
+    )
+}
+
+impl SliceAssignOperation {
     pub fn new_in_place(
         input: NodeIndex,
         value: NodeIndex,
@@ -72,62 +117,7 @@ impl SliceAssignOperation {
         if self.in_place {
             return NaryExpr::input(0, self.slices.len());
         }
-
-        let rank = self.slices.len();
-        let mut condition = NaryExpr::scalar(NaryScalar::U32(1));
-        for (dim, slice) in self.slices.iter().enumerate() {
-            let dim_index = NaryExpr::DimIndex(dim);
-            let ge_start = NaryExpr::unary_op(
-                dim_index.clone(),
-                "ge_start",
-                NaryOp::GreaterEqualConst(NaryScalar::U32(slice.start as u32)),
-                DataTypeEnum::U32,
-                DataTypeEnum::U32,
-            );
-            let lt_end = NaryExpr::unary_op(
-                dim_index,
-                "lt_end",
-                NaryOp::LessConst(NaryScalar::U32(slice.end as u32)),
-                DataTypeEnum::U32,
-                DataTypeEnum::U32,
-            );
-            condition = NaryExpr::mul(condition, ge_start, DataTypeEnum::U32);
-            condition = NaryExpr::mul(condition, lt_end, DataTypeEnum::U32);
-        }
-
-        let value_indices = self
-            .slices
-            .iter()
-            .enumerate()
-            .map(|(dim, slice)| {
-                let shifted_index = if slice.start == 0 {
-                    NaryExpr::DimIndex(dim)
-                } else {
-                    NaryExpr::unary_op(
-                        NaryExpr::DimIndex(dim),
-                        "slice_offset",
-                        NaryOp::SubConst(NaryScalar::U32(slice.start as u32)),
-                        DataTypeEnum::U32,
-                        DataTypeEnum::U32,
-                    )
-                };
-                NaryExpr::select(
-                    condition.clone(),
-                    shifted_index,
-                    NaryExpr::scalar(NaryScalar::U32(0)),
-                    DataTypeEnum::U32,
-                    DataTypeEnum::U32,
-                )
-            })
-            .collect();
-
-        NaryExpr::select(
-            condition,
-            NaryExpr::indexed_input(1, value_indices),
-            NaryExpr::input(0, rank),
-            DataTypeEnum::U32,
-            datatype,
-        )
+        slice_assign_expression(&self.slices, datatype)
     }
 }
 
@@ -187,7 +177,7 @@ impl Operation for SliceAssignOperation {
     ) -> Option<DirectKernel> {
         if self.in_place {
             let value = inputs[1].as_tensor()?;
-            let operation = NaryOperation {
+            let operation = ElementwiseOperation {
                 inputs: vec![self.value],
                 expression: self.expression(value.datatype()),
                 shape: value.layout().shape().into(),
@@ -203,7 +193,7 @@ impl Operation for SliceAssignOperation {
         }
 
         let input = inputs[0].as_tensor()?;
-        let operation = NaryOperation {
+        let operation = ElementwiseOperation {
             inputs: vec![self.input, self.value],
             expression: self.expression(input.datatype()),
             shape: self.input_shape.clone(),

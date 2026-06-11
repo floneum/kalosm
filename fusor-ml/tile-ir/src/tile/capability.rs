@@ -40,13 +40,8 @@ impl SubgroupToken {
         program.num_subgroups()
     }
 
-    /// Reduction across one subgroup.
-    pub(crate) fn subgroup_reduce(
-        self,
-        program: &TileBlock<'_>,
-        op: TileReduceOp,
-        value: Tile,
-    ) -> Tile {
+    /// Reduction across one subgroup with an explicit operator.
+    pub fn subgroup_reduce(self, program: &TileBlock<'_>, op: TileReduceOp, value: Tile) -> Tile {
         program.subgroup_reduce(op, value)
     }
 

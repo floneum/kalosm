@@ -21,21 +21,18 @@ pub use tabbycat;
 pub use wgpu::{WasmNotSend, WasmNotSendSync, WasmNotSync};
 
 pub use matmul::*;
-pub use resize::ShapeWithOneHole;
+pub use view::ShapeWithOneHole;
 
+mod access_analysis;
 mod composite;
 mod compute_graph;
-mod conv;
 pub use compute_graph::NodeIndex;
 mod device;
 mod element_wise;
-mod flash_attention;
-pub(crate) use flash_attention::{FlashAttentionInputs, FlashAttentionOperation};
 mod index_select;
 #[doc(hidden)]
 pub mod kernel_selection;
 mod layout;
-mod map_layout;
 pub mod matmul;
 mod mir;
 mod nary_direct;
@@ -45,14 +42,13 @@ mod quantized;
 mod rank;
 mod reduce;
 mod reduce_direct;
-mod rms_norm;
-pub(crate) use rms_norm::RmsNormOperation;
-mod resize;
+mod reduce_tiled;
+mod row_program;
 mod sampling;
 mod slice_assign;
-mod softmax;
 mod tensor;
 mod top_k;
+mod view;
 pub use top_k::{
     GpuMirostat2Sampler, GpuMirostat2SamplerParams, GpuStandardSamplerParams,
     PendingGpuSampledToken,

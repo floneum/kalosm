@@ -86,12 +86,12 @@ impl Resolver {
             for idx in sorted_nodes {
                 let node = &self.execution_graph[idx];
                 // Handle Tensor caching explicitly here
-                if let ComputeGraphNodeVariant::Tensor(data) = &node.variant {
+                if let ExecutionVariant::Tensor(data) = &node.variant {
                     graph.set_cached_result(node.inner_idx, data.clone());
                     continue;
                 }
 
-                if let Some(op) = self.lower_node(node) {
+                if let Some(op) = self.lower_node(idx, node) {
                     queued_operations.push((node.inner_idx, op));
                 }
             }
@@ -151,22 +151,25 @@ impl Resolver {
                         .nodes
                         .nodes
                         .node_weight(node)
-                        .map(|node| node_category(&node.variant))
+                        .map(|node| node_category_inner(&node.variant))
                 })
                 .flatten();
-            // Map layout isn't really a kernel. Resolve it immediately
-            let map_layout = if let Some(node_data) = graph.nodes.nodes.node_weight(node) {
+            // A view that composes with its input's buffer layout isn't a
+            // kernel. Resolve it immediately as a zero-cost buffer view;
+            // anything else (fill regions, non-composable reshapes) falls
+            // through to the gather kernel below.
+            let view_result = if let Some(node_data) = graph.nodes.nodes.node_weight(node) {
                 match &node_data.variant {
-                    ComputeGraphNodeVariant::MapLayout(map_layout) => Some(map_layout.clone()),
-                    ComputeGraphNodeVariant::Resize(resize) => resize.lower(graph),
+                    ComputeGraphNodeVariant::View(view) => graph
+                        .get_cached_result(view.input)
+                        .and_then(|input| view.try_map_tensor(input)),
                     _ => None,
                 }
             } else {
                 None
             };
-            if let Some(map_layout) = map_layout {
+            if let Some(result) = view_result {
                 let start = host_trace.then(Instant::now);
-                let result = map_layout.run(graph);
                 // Cache the result
                 graph.set_cached_result(node, result);
                 // Map-layout nodes are resolved immediately — release any
@@ -184,8 +187,7 @@ impl Resolver {
                 }
             } else {
                 let slice_copy = graph.nodes.nodes.node_weight(node).and_then(|node_data| {
-                    let ComputeGraphNodeVariant::SliceAssign(slice_assign) = &node_data.variant
-                    else {
+                    let ComputeGraphNodeVariant::Assign(slice_assign) = &node_data.variant else {
                         return None;
                     };
                     Self::try_prepare_in_place_slice_assign_copy(graph, slice_assign)
@@ -232,7 +234,9 @@ impl Resolver {
 
                     let start = host_trace.then(Instant::now);
                     let constraints = qmatmul.workgroup_shape_constraints(&device);
-                    let workgroup_shape = constraints.solve(max_subgroup_size).unwrap_or_else(|| {
+                    let workgroup_shape = constraints
+                        .solve(max_subgroup_size, &device.limits())
+                        .unwrap_or_else(|| {
                         panic!(
                             "Failed to find a valid qmatmul workgroup shape for constraints {constraints:?}"
                         )
@@ -349,9 +353,13 @@ impl Resolver {
 
                 let start = host_trace.then(Instant::now);
                 let constraints = operation.workgroup_shape_constraints(&device);
-                let workgroup_shape = constraints.solve(max_subgroup_size).unwrap_or_else(|| {
-                    panic!("Failed to find a valid workgroup shape for constraints {constraints:?}")
-                });
+                let workgroup_shape = constraints
+                    .solve(max_subgroup_size, &device.limits())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Failed to find a valid workgroup shape for constraints {constraints:?}"
+                        )
+                    });
                 if let Some(start) = start {
                     let elapsed = start.elapsed();
                     host_profile.workgroup += elapsed;

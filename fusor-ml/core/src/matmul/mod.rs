@@ -4,7 +4,6 @@ use crate::{
 };
 
 pub mod coop_gemm;
-mod direct;
 mod kernel;
 pub mod sgemm;
 mod sgemm_params;
@@ -40,22 +39,98 @@ pub(crate) struct MatMulOperation {
 }
 
 impl Tensor {
+    /// Matrix multiply, expressed as its composed form: a broadcast multiply
+    /// over the `[batch.., M, N, K]` index space summed along `K`. The
+    /// resolver recognizes the canonical cluster and routes it to the
+    /// specialized matmul kernels; anything that composes differently lowers
+    /// through the generic elementwise + reduce path.
     pub fn mat_mul(&self, other: &Self) -> Self {
+        use crate::nary_wise::{ElementwiseOperation, NaryExpr};
+
         assert_eq!(self.datatype(), other.datatype());
-        self.add_mat_mul(other, None)
+        let a_shape = self.shape();
+        let b_shape = other.shape();
+        let rank = a_shape.len();
+        assert_eq!(
+            rank,
+            b_shape.len(),
+            "mat_mul requires equal ranks: {a_shape:?} x {b_shape:?}"
+        );
+        assert!(rank >= 2, "mat_mul requires rank >= 2: {a_shape:?}");
+        let batch = rank - 2;
+        assert_eq!(
+            a_shape[..batch],
+            b_shape[..batch],
+            "mat_mul batch dimensions must match: {a_shape:?} x {b_shape:?}"
+        );
+        assert_eq!(
+            a_shape[rank - 1],
+            b_shape[rank - 2],
+            "mat_mul contraction dimensions must match: {a_shape:?} x {b_shape:?}"
+        );
+
+        let (m, k, n) = (a_shape[batch], a_shape[batch + 1], b_shape[batch + 1]);
+        let mut index_space: Vec<usize> = a_shape[..batch].to_vec();
+        index_space.extend([m, n, k]);
+        let (m_dim, n_dim, k_dim) = (batch, batch + 1, batch + 2);
+
+        let a_indices: Vec<NaryExpr> = (0..batch)
+            .chain([m_dim, k_dim])
+            .map(NaryExpr::DimIndex)
+            .collect();
+        let b_indices: Vec<NaryExpr> = (0..batch)
+            .chain([k_dim, n_dim])
+            .map(NaryExpr::DimIndex)
+            .collect();
+
+        let datatype = self.datatype();
+        let product = Tensor::from_parts(self.data.nary(ElementwiseOperation {
+            inputs: vec![self.key(), other.key()],
+            expression: NaryExpr::mul(
+                NaryExpr::indexed_input(0, a_indices),
+                NaryExpr::indexed_input(1, b_indices),
+                datatype,
+            ),
+            shape: index_space.into(),
+            output_datatype: datatype,
+        }));
+        product.sum(k_dim)
     }
 
+    /// Matrix multiply with explicit kernel parameters: a tuning/benchmark
+    /// API. The parameters cannot round-trip through the composed graph, so
+    /// the operation builds directly against materialized inputs and
+    /// executes eagerly, returning a fresh leaf tensor.
     pub fn mat_mul_with_parameters(&self, other: &Self, parameters: MatMulParams) -> Self {
         assert_eq!(self.datatype(), other.datatype());
-        self.add_mat_mul(other, Some(parameters))
+        self.data.materialize();
+        other.data.materialize();
+        let operation = MatMulOperation::new(
+            self.datatype(),
+            self.key(),
+            other.key(),
+            self.shape(),
+            other.shape(),
+            Some(parameters),
+            self.device(),
+        );
+        let output = self
+            .device()
+            .compute_graph()
+            .execute_eager(&operation)
+            .unwrap_or_else(|| {
+                panic!(
+                    "mat_mul_with_parameters could not build a kernel for the requested parameters"
+                )
+            });
+        Tensor::from(output)
     }
 }
 
 #[cfg(test)]
 mod selection_tests {
     use super::variants::{
-        CoopTile, DenseMatmulCtx, DenseMatmulVariant, DirectTileMatmulVariant,
-        dense_matmul_selector, direct_tile_matmul_selector, select_coop_kind,
+        CoopTile, DenseMatmulCtx, DenseMatmulVariant, dense_matmul_selector, select_coop_kind,
     };
     use crate::kernel_selection::{
         CooperativeMatrixCaps, CooperativeMatrixKind, DeterministicShapeRng, KernelDeviceCaps,
@@ -202,32 +277,6 @@ mod selection_tests {
             selector.select(shape, &f32_ctx, only_mixed_f16_property),
             Some(DenseMatmulVariant::MatMul)
         );
-    }
-
-    #[test]
-    fn direct_tile_selector_generates_each_variant() {
-        let selector = direct_tile_matmul_selector();
-        let caps = KernelDeviceCaps {
-            subgroups_supported: false,
-            cooperative_matrix: CooperativeMatrixCaps::default(),
-            min_subgroup_size: 0,
-            max_subgroup_size: 0,
-            max_compute_invocations_per_workgroup: 0,
-            max_compute_workgroup_storage_size: 0,
-            max_compute_workgroup_size_x: 0,
-            backend: wgpu::Backend::Noop,
-        };
-        let mut rng = DeterministicShapeRng::default();
-
-        for variant in [
-            DirectTileMatmulVariant::Gemv,
-            DirectTileMatmulVariant::MatMul,
-        ] {
-            let shape = selector
-                .generate_for(variant, &(), caps, &mut rng)
-                .expect("variant should generate");
-            assert_eq!(selector.select(shape, &(), caps), Some(variant));
-        }
     }
 
     #[test]
