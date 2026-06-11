@@ -21,18 +21,15 @@ use crate::{
         workgroup_shape::{Constraint, WorkgroupShapeConstraints},
     },
     nary_direct::{apply_multi_input_elementwise_expr, apply_single_input_elementwise_expr},
-    nary_wise::{ElementwiseOperation, NaryExpr, NaryOp},
+    nary_wise::{NaryExpr, NaryOp},
 };
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
 use rustc_hash::FxHasher;
 
-use super::{
-    QMatMulDirectPipelineKey, QMatrix, QMatrixStorageLayout, dequantize::DequantizeOperation,
-};
+use super::{QMatMulDirectPipelineKey, QMatrix, QMatrixStorageLayout};
 
-mod fallback;
 mod kernel;
 #[cfg(test)]
 mod tests;
@@ -343,6 +340,10 @@ fn select_qmatmul_direct_variant(
 }
 
 fn matmul_m_size(shape: &[usize]) -> u32 {
+    // Rank-1 activations are a single matrix row.
+    if shape.len() < 2 {
+        return 1;
+    }
     shape[shape.len() - 2] as u32
 }
 
@@ -350,12 +351,34 @@ fn qmatmul_operation_inputs(
     input: NodeIndex,
     matrix: &QMatrix,
     out_shape: &[usize],
+    m_pad: Option<usize>,
     nodes: &crate::compute_graph::ComputeGraphInner,
 ) -> Vec<MirValue> {
     let input = nodes.get_result(input).unwrap();
     let q_matrix = matrix.clone();
     let device = input.device();
-    let output_tensor = TensorData::new_for_shape(device, out_shape, input.datatype());
+    let output_tensor = match m_pad {
+        // M-padded lowering writes `padded_m` rows: allocate the padded
+        // buffer but expose it cropped to the real `M` (the trailing rows
+        // are slack the kernel scribbles into).
+        Some(padded_m) => {
+            let m_axis = out_shape.len() - 2;
+            let mut padded_shape = out_shape.to_vec();
+            padded_shape[m_axis] = padded_m;
+            let padded = TensorData::new_for_shape(device, &padded_shape, input.datatype());
+            TensorData::new_from_parts(
+                device,
+                padded.buffer().clone(),
+                Layout::from_parts(
+                    0,
+                    out_shape.into(),
+                    Layout::continuous_strides(&padded_shape),
+                ),
+                input.datatype(),
+            )
+        }
+        None => TensorData::new_for_shape(device, out_shape, input.datatype()),
+    };
     vec![input.into(), q_matrix.into(), output_tensor.into()]
 }
 
@@ -442,6 +465,44 @@ impl QMatMulOperation {
 
     fn m_size(&self) -> u32 {
         matmul_m_size(&self.in_shape)
+    }
+
+    /// The padded `M` this operation's lowering will use, when M-padding
+    /// applies: the activation is copied into a zero-padded scratch tensor so
+    /// the selector can pick a coop tile variant, and the output buffer is
+    /// over-allocated to hold the padded rows (exposed cropped to the real
+    /// `M`). Epilogue-carrying operations never pad — the padded views don't
+    /// carry epilogue extras, so fusion declines those ops instead (see
+    /// [`Self::supports_elementwise_epilogue_fusion`]).
+    pub(crate) fn m_pad_target(&self, caps: KernelDeviceCaps) -> Option<usize> {
+        if self.pre_element_wise_expr.is_some()
+            || self.post_element_wise_expr.is_some()
+            || !self.post_accumulator_offsets.is_empty()
+        {
+            return None;
+        }
+        if self.in_shape.len() < 2 {
+            return None;
+        }
+        let m = self.in_shape[self.in_shape.len() - 2];
+        let n = self.out_shape[self.out_shape.len() - 1];
+        qmatmul_m_pad_target_for_caps(m, n, caps)
+    }
+
+    /// Whether the resolver may fold a general element-wise expression into
+    /// this operation's pre/post epilogue. Dense-storage (F32/F16) matrices
+    /// lower through the epilogue-less dense kernel, and an operation whose
+    /// lowering will M-pad keeps element-wise work as separate kernels.
+    pub(crate) fn supports_elementwise_epilogue_fusion(&self, device: &Device) -> bool {
+        if qmatrix_direct_quant_format(&self.matrix).is_none() {
+            return false;
+        }
+        if self.in_shape.len() < 2 {
+            return true;
+        }
+        let m = self.in_shape[self.in_shape.len() - 2];
+        let n = self.out_shape[self.out_shape.len() - 1];
+        qmatmul_m_pad_target_for_caps(m, n, KernelDeviceCaps::from_device(device)).is_none()
     }
 
     fn n_size(&self) -> u32 {
@@ -536,10 +597,6 @@ pub(crate) enum QMatMulKernelPlan {
 }
 
 impl QMatMulKernelPlan {
-    fn from_kernels(kernels: Vec<DirectKernel>) -> Option<Self> {
-        (!kernels.is_empty()).then_some(Self::Kernels(kernels))
-    }
-
     pub(crate) fn dispatch_count(&self) -> usize {
         match self {
             Self::EmptyOutput => 0,
@@ -913,44 +970,9 @@ impl Tensor {
             DataTypeEnum::F16 | DataTypeEnum::F32 => {}
             DataTypeEnum::U32 => panic!("q_mat_mul requires f32/f16 tensors"),
         }
-
-        if self.rank() < 2 {
-            return self.add_q_mat_mul(other);
-        }
-        let in_shape = self.shape();
-        let m_axis = self.rank() - 2;
-        let m = in_shape[m_axis];
-        let n = other.shape()[0];
-        let Some(padded_m) =
-            qmatmul_m_pad_target_for_caps(m, n, KernelDeviceCaps::from_device(self.device()))
-        else {
-            return self.add_q_mat_mul(other);
-        };
-
-        // Build padded input shape: replace the M dim with padded_m.
-        let mut padded_shape = in_shape.to_vec();
-        padded_shape[m_axis] = padded_m;
-
-        // Resize writes zeros outside the copied region so the trailing
-        // `padded_m - m` rows contribute nothing to the dot product.
-        let padded_input = self.resize(padded_shape);
-
-        // Run the aligned matmul.
-        let padded_out = padded_input.add_q_mat_mul(other);
-
-        // Narrow the output back to the caller's M along dim R-2 via
-        // a restride view. All other dims are full-size, so this is a
-        // pure layout change (no copy).
-        let out_shape = padded_out.shape();
-        let specs: Vec<crate::StrideSpec> = (0..padded_out.rank())
-            .map(|i| {
-                if i == m_axis {
-                    crate::StrideSpec::dim(i, m)
-                } else {
-                    crate::StrideSpec::dim(i, out_shape[i])
-                }
-            })
-            .collect();
-        padded_out.restride(specs)
+        // M-padding for the coop tile variants is a lowering decision: the
+        // recognized operation pads its own activation scratch and output
+        // slack (see `QMatMulOperation::m_pad_target`).
+        self.add_q_mat_mul(other)
     }
 }

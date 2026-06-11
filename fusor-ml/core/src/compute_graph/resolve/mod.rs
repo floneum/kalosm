@@ -34,6 +34,7 @@ mod fusion_row;
 mod plan_cache;
 mod recognize;
 mod recognize_attention;
+mod recognize_cat;
 mod run;
 
 pub(crate) use plan_cache::structural_kernel_key;

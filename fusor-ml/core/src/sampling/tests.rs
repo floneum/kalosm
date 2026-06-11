@@ -3,13 +3,14 @@ use std::mem::size_of;
 use crate::{DataTypeEnum, Device, Tensor, TensorData, quantized::QMatrix};
 use fusor_gguf::{BlockQ4_0, GgmlType};
 
+use crate::mir::kernel_backend::sampling_topk::chunk_top_k_pair_data_with_processors_with_encoder;
+
 use super::{
     GPU_SAMPLE_STATUS_RETRY_NEEDED, GPU_SAMPLE_STATUS_SAMPLED, GpuMirostat2Sampler,
-    GpuMirostat2SamplerParams, GpuStandardSamplerParams,
-    mirostat::sample_from_sorted_top_k_data_with_encoder,
-    mirostat2_sample_token_to_host,
+    GpuMirostat2SamplerParams, GpuSamplerRequest, GpuStandardSamplerParams,
+    mirostat::sample_from_sorted_top_k_data_with_encoder, sample_token_to_host,
     standard_sampler::sample_from_sorted_top_k_data_with_encoder as sample_standard_from_sorted_top_k_data_with_encoder,
-    topk::{ProcessorSettings, chunk_top_k_pair_data_with_processors_with_encoder},
+    topk::ProcessorSettings,
 };
 
 #[test]
@@ -459,9 +460,17 @@ fn mirostat2_sampler_uses_exact_top_k_when_candidates_cluster() {
         );
 
         let mut sampler = GpuMirostat2Sampler::new(&device, mu);
-        let token = mirostat2_sample_token_to_host(&data, &mut sampler, &[], params)
-            .await
-            .unwrap();
+        let logits = Tensor::from(data);
+        let token = sample_token_to_host(
+            &logits.data,
+            GpuSamplerRequest::Mirostat2 {
+                sampler: &mut sampler,
+                params,
+            },
+            &[],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(token, Some(expected));
     });
@@ -558,7 +567,7 @@ fn top_k_pairs_large_vocab_merge_path_matches_cpu_sorted_order() {
 }
 
 #[test]
-fn qmat_mirostat2_sample_token_uses_direct_sampler_path() {
+fn qmat_logits_sample_token_through_graph() {
     pollster::block_on(async {
         let device = Device::new().await.unwrap();
         let hidden = Tensor::new(&device, vec![1.0f32; 32].as_slice());
@@ -577,10 +586,17 @@ fn qmat_mirostat2_sample_token_uses_direct_sampler_path() {
             random: 0.0,
         };
 
-        let token = hidden
-            .try_sample_mirostat2_token_q_mat(&matrix, &mut sampler, &[], params)
-            .await
-            .unwrap();
+        let logits = hidden.q_mat_mul(&matrix);
+        let token = sample_token_to_host(
+            &logits.data,
+            GpuSamplerRequest::Mirostat2 {
+                sampler: &mut sampler,
+                params,
+            },
+            &[],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(token, Some(7));
     });

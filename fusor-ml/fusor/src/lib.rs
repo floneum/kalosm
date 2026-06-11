@@ -493,34 +493,16 @@ where
         }
     }
 
-    pub async fn try_sample_mirostat2_token_q_mat(
+    pub fn sample_mirostat2_token_pending(
         &self,
-        weights: &crate::QMatrix,
-        sampler: &mut Mirostat2Sampler,
-        previous_tokens: &[u32],
-        params: Mirostat2SamplerParams,
-    ) -> Result<Option<u32>, Error> {
-        match (self, weights) {
-            (Tensor::Gpu(t), crate::QMatrix::Gpu(weights)) => t
-                .try_sample_mirostat2_token_q_mat(weights, sampler, previous_tokens, params)
-                .await
-                .map_err(Error::Gpu),
-            _ => Ok(None),
-        }
-    }
-
-    pub fn try_sample_mirostat2_token_q_mat_pending(
-        &self,
-        weights: &crate::QMatrix,
         sampler: &mut Mirostat2Sampler,
         previous_tokens: &[u32],
         previous_gpu_token: Option<&GpuSampledToken>,
         params: Mirostat2SamplerParams,
     ) -> Result<Option<GpuSampledToken>, Error> {
-        match (self, weights) {
-            (Tensor::Gpu(t), crate::QMatrix::Gpu(weights)) => t
-                .try_sample_mirostat2_token_q_mat_pending(
-                    weights,
+        match self {
+            Tensor::Gpu(t) => t
+                .sample_mirostat2_token_pending(
                     sampler,
                     previous_tokens,
                     previous_gpu_token,
@@ -531,36 +513,15 @@ where
         }
     }
 
-    pub async fn try_sample_standard_token_q_mat(
+    pub fn sample_standard_token_pending(
         &self,
-        weights: &crate::QMatrix,
-        previous_tokens: &[u32],
-        params: StandardSamplerParams,
-    ) -> Result<Option<u32>, Error> {
-        match (self, weights) {
-            (Tensor::Gpu(t), crate::QMatrix::Gpu(weights)) => t
-                .try_sample_standard_token_q_mat(weights, previous_tokens, params)
-                .await
-                .map_err(Error::Gpu),
-            _ => Ok(None),
-        }
-    }
-
-    pub fn try_sample_standard_token_q_mat_pending(
-        &self,
-        weights: &crate::QMatrix,
         previous_tokens: &[u32],
         previous_gpu_token: Option<&GpuSampledToken>,
         params: StandardSamplerParams,
     ) -> Result<Option<GpuSampledToken>, Error> {
-        match (self, weights) {
-            (Tensor::Gpu(t), crate::QMatrix::Gpu(weights)) => t
-                .try_sample_standard_token_q_mat_pending(
-                    weights,
-                    previous_tokens,
-                    previous_gpu_token,
-                    params,
-                )
+        match self {
+            Tensor::Gpu(t) => t
+                .sample_standard_token_pending(previous_tokens, previous_gpu_token, params)
                 .map_err(Error::Gpu),
             _ => Ok(None),
         }
@@ -1175,6 +1136,28 @@ where
             "q_mat_mul requires 2D weight tensor, got {}D",
             weights.shape().len()
         );
+
+        // A rank-1 activation is a single matrix row. The GPU graph lowers
+        // quantized formats natively; the CPU and dense F16/F32 paths only
+        // handle rank >= 2, so route them through a [1, K] view.
+        if R == 1 {
+            let gpu_native = matches!((self, weights), (Tensor::Gpu(_), QMatrix::Gpu(_)))
+                && !matches!(
+                    weights.ggml_type(),
+                    fusor_gguf::GgmlType::F16 | fusor_gguf::GgmlType::F32
+                );
+            if !gpu_native {
+                let k = self.shape()[0];
+                let n = weights.shape()[0];
+                let out_shape: [usize; R] = std::array::from_fn(|_| n);
+                return self
+                    .reshape([1, k])
+                    .to_concrete()
+                    .q_mat_mul(weights)
+                    .reshape(out_shape)
+                    .to_concrete();
+            }
+        }
 
         match (self, weights) {
             // CPU path - dispatch based on block type

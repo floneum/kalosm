@@ -72,11 +72,19 @@ impl ComputeGraph {
         self.with_mut(|inner| inner.execute_eager(operation))
     }
 
-    /// Clone the view at `key` if that node is a view. Used to collapse view
-    /// chains at construction time.
+    /// Clone the view at `key` if that node is an unresolved view. Used to
+    /// collapse view chains at construction time. Cached views are excluded:
+    /// a resolved view no longer keeps its base alive, so the base node may
+    /// already be culled from the graph — and a new view over the cached
+    /// buffer is a zero-cost map anyway, while composing past it would force
+    /// a recompute from the (possibly released) base.
     pub(crate) fn get_view(&self, key: NodeIndex) -> Option<ViewOperation> {
         let inner = self.inner.read();
-        match &inner.nodes.nodes.node_weight(key)?.variant {
+        let node = inner.nodes.nodes.node_weight(key)?;
+        if node.cached.is_some() {
+            return None;
+        }
+        match &node.variant {
             ComputeGraphNodeVariant::View(op) => Some(op.clone()),
             _ => None,
         }
@@ -726,15 +734,21 @@ impl ComputeGraphInner {
             }
         }
 
-        // Check that all dependencies of non-cached nodes exist
+        // Check that all dependencies of non-cached nodes that could still
+        // resolve exist. A dead uncached node (no references and no alive
+        // descendants — e.g. an intermediate whose buffer was released after
+        // its handle dropped) is unreachable by any future resolve: resolves
+        // start from a live handle, and everything alive transitively keeps
+        // its dependencies' `live_descendant_count` positive. Its
+        // dependencies may therefore be legitimately removed from under it.
         for key in self.nodes.nodes.node_indices() {
-            let is_cached = self
+            let resolvable = self
                 .nodes
                 .nodes
                 .node_weight(key)
-                .map(|n| n.cached.is_some())
+                .map(|n| n.cached.is_none() && n.should_keep_cached())
                 .unwrap_or(false);
-            if is_cached {
+            if !resolvable {
                 continue;
             }
             self.visit_dependencies(key, &mut |dependency| {

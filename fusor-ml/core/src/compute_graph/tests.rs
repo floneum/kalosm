@@ -1,4 +1,4 @@
-use crate::{Device, Tensor};
+use crate::{Device, StrideSpec, Tensor};
 
 // Build a small intermediate that requires a real kernel (not a Tensor input).
 // `x` materializes via `(input * 2.0) + 1.0`, which fuses to a single nary.
@@ -198,6 +198,220 @@ fn auto_flush_resolves_pending_siblings() {
                 device.compute_graph().is_cached_for_test(out.key()),
                 "output should be cached after auto-flush",
             );
+        }
+    });
+}
+
+// --- split + op + cat lowering (resolve/recognize_cat.rs) ---
+
+/// Narrow a 2D tensor along a dimension as a view.
+fn narrow2(tensor: &Tensor, dim: usize, start: usize, length: usize) -> Tensor {
+    let shape = tensor.shape();
+    let specs: Vec<StrideSpec> = (0..2)
+        .map(|i| {
+            if i == dim {
+                StrideSpec::dim(i, length).with_offset(start)
+            } else {
+                StrideSpec::dim(i, shape[i])
+            }
+        })
+        .collect();
+    tensor.restride(specs)
+}
+
+fn cat_test_input(device: &Device) -> (Tensor, Vec<Vec<f32>>) {
+    let rows: Vec<Vec<f32>> = (0..4)
+        .map(|r| (0..8).map(|c| (r * 8 + c) as f32 * 0.1).collect())
+        .collect();
+    (Tensor::new::<f32, 2, _>(device, &rows), rows)
+}
+
+#[test]
+fn cat_of_same_op_collapses_to_op_on_whole_tensor() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let (x, rows) = cat_test_input(&device);
+
+        let first = narrow2(&x, 1, 0, 4).sin();
+        let second = narrow2(&x, 1, 4, 4).sin();
+        let dest = Tensor::splat(&device, 0.0f32, [4, 8]);
+        let out = dest
+            .slice_assign([0..4, 0..4], &first)
+            .slice_assign([0..4, 4..8], &second);
+
+        let (_, kernels) = out.data.materialize();
+        assert_eq!(
+            kernels, 1,
+            "same op over chunks tiling the tensor should collapse to one kernel"
+        );
+
+        let result = out.as_slice::<2, f32>().await.unwrap();
+        for (r, row) in rows.iter().enumerate() {
+            for (c, &value) in row.iter().enumerate() {
+                assert!(
+                    (result[[r, c]] - value.sin()).abs() < 1e-5,
+                    "mismatch at [{r}, {c}]"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn cat_of_different_ops_fuses_to_single_select_kernel() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let (x, rows) = cat_test_input(&device);
+
+        let first = narrow2(&x, 1, 0, 4).sin();
+        let second = narrow2(&x, 1, 4, 4).cos();
+        let dest = Tensor::splat(&device, 0.0f32, [4, 8]);
+        let out = dest
+            .slice_assign([0..4, 0..4], &first)
+            .slice_assign([0..4, 4..8], &second);
+
+        let (_, kernels) = out.data.materialize();
+        assert_eq!(kernels, 1, "branch ops should lift into the select arms");
+
+        let result = out.as_slice::<2, f32>().await.unwrap();
+        for (r, row) in rows.iter().enumerate() {
+            for (c, &value) in row.iter().enumerate() {
+                let expected = if c < 4 { value.sin() } else { value.cos() };
+                assert!(
+                    (result[[r, c]] - expected).abs() < 1e-5,
+                    "mismatch at [{r}, {c}]"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn reordered_cat_with_op_fuses_to_single_kernel() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let (x, rows) = cat_test_input(&device);
+
+        // rotate_half: cat([-x2, x1], last_dim)
+        let negated_second = &narrow2(&x, 1, 4, 4) * -1.0;
+        let first = narrow2(&x, 1, 0, 4);
+        let dest = Tensor::splat(&device, 0.0f32, [4, 8]);
+        let out = dest
+            .slice_assign([0..4, 0..4], &negated_second)
+            .slice_assign([0..4, 4..8], &first);
+
+        let (_, kernels) = out.data.materialize();
+        assert_eq!(kernels, 1, "reordered cat should still fuse to one kernel");
+
+        let result = out.as_slice::<2, f32>().await.unwrap();
+        for (r, row) in rows.iter().enumerate() {
+            for c in 0..8 {
+                let expected = if c < 4 { -row[c + 4] } else { row[c - 4] };
+                assert!(
+                    (result[[r, c]] - expected).abs() < 1e-5,
+                    "mismatch at [{r}, {c}]"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn partial_slice_assign_keeps_destination_outside_region() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let (x, rows) = cat_test_input(&device);
+
+        // Only cover the left half: the right half must keep the splat value.
+        let first = narrow2(&x, 1, 0, 4).sin();
+        let dest = Tensor::splat(&device, 7.0f32, [4, 8]);
+        let out = dest.slice_assign([0..4, 0..4], &first);
+
+        let (_, kernels) = out.data.materialize();
+        assert_eq!(kernels, 1);
+
+        let result = out.as_slice::<2, f32>().await.unwrap();
+        for (r, row) in rows.iter().enumerate() {
+            for c in 0..8 {
+                let expected = if c < 4 { row[c].sin() } else { 7.0 };
+                assert!(
+                    (result[[r, c]] - expected).abs() < 1e-5,
+                    "mismatch at [{r}, {c}]"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn three_way_chunk_cat_collapses() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let rows: Vec<Vec<f32>> = (0..6)
+            .map(|r| (0..4).map(|c| (r * 4 + c) as f32 * 0.1).collect())
+            .collect();
+        let x = Tensor::new::<f32, 2, _>(&device, &rows);
+
+        let dest = Tensor::splat(&device, 0.0f32, [6, 4]);
+        let mut out = dest;
+        for chunk in 0..3 {
+            let start = chunk * 2;
+            let part = &narrow2(&x, 0, start, 2) * 2.0;
+            out = out.slice_assign([start..start + 2, 0..4], &part);
+        }
+
+        let (_, kernels) = out.data.materialize();
+        assert_eq!(kernels, 1, "3-way same-op chunk cat should collapse");
+
+        let result = out.as_slice::<2, f32>().await.unwrap();
+        for (r, row) in rows.iter().enumerate() {
+            for (c, &value) in row.iter().enumerate() {
+                assert!(
+                    (result[[r, c]] - value * 2.0).abs() < 1e-5,
+                    "mismatch at [{r}, {c}]"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn deep_branch_chains_collapse_through_cat() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let (x, rows) = cat_test_input(&device);
+
+        // Multi-node branches: ((narrow * 2) + 1).sin() on each half.
+        let branch = |start: usize| ((&narrow2(&x, 1, start, 4) * 2.0) + 1.0).sin();
+        let dest = Tensor::splat(&device, 0.0f32, [4, 8]);
+        let out = dest
+            .slice_assign([0..4, 0..4], &branch(0))
+            .slice_assign([0..4, 4..8], &branch(4));
+
+        let (_, kernels) = out.data.materialize();
+        assert_eq!(kernels, 1, "whole branch chains should inline and collapse");
+
+        let result = out.as_slice::<2, f32>().await.unwrap();
+        for (r, row) in rows.iter().enumerate() {
+            for (c, &value) in row.iter().enumerate() {
+                let expected = (value * 2.0 + 1.0).sin();
+                assert!(
+                    (result[[r, c]] - expected).abs() < 1e-5,
+                    "mismatch at [{r}, {c}]"
+                );
+            }
         }
     });
 }

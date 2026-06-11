@@ -200,6 +200,7 @@ impl Resolver {
                 if self.check_cached(graph, input_inner)
                     || input_datatype != crate::DataTypeEnum::F32
                     || nary.output_datatype != crate::DataTypeEnum::F32
+                    || !qmatmul_op.supports_elementwise_epilogue_fusion(&graph.device())
                 {
                     continue;
                 }
@@ -238,6 +239,7 @@ impl Resolver {
                 .iter()
                 .product::<usize>()
                 == 1
+            && qmatmul_op.supports_elementwise_epilogue_fusion(&graph.device())
             && !self.check_cached(graph, qmatmul_op.input)
             && let Some(input_exec) = self.get_input_node_in_exec_graph(qmatmul_op.input)
         {

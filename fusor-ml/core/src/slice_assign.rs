@@ -1,7 +1,7 @@
 use std::{hash::Hash, ops::Range};
 
 use crate::{
-    DataTypeEnum, TILE_SIZE, Tensor, TensorData,
+    DataTypeEnum, TILE_SIZE, Tensor,
     compute_graph::{ComputeGraphInner, NodeIndex},
     mir::{
         inputs::MirValue,
@@ -13,20 +13,20 @@ use crate::{
     visit_tiled::{titled_map_dispatch_size, titled_map_workgroup_size_constraints},
 };
 
+/// The in-place region write of the graph vocabulary: dispatch over the
+/// slice region only, writing the value into the input's buffer. The
+/// out-of-place form has no operation — `Tensor::slice_assign` composes it
+/// as a plain elementwise select (see [`slice_assign_expression`]).
 #[derive(Clone, Debug)]
 pub(crate) struct SliceAssignOperation {
     pub(crate) input: NodeIndex,
     pub(crate) value: NodeIndex,
     pub(crate) slices: Box<[Range<usize>]>,
-    pub(crate) input_shape: Box<[usize]>,
-    pub(crate) in_place: bool,
 }
 
-/// The composed slice-assign body: per output coordinate, read the assigned
-/// value inside the slice region and the original input outside it. Inputs:
-/// 0 = the original tensor, 1 = the assigned value.
-pub(crate) fn slice_assign_expression(slices: &[Range<usize>], datatype: DataTypeEnum) -> NaryExpr {
-    let rank = slices.len();
+/// The region predicate of a slice assign: 1 when every output coordinate
+/// lies inside its slice range, 0 otherwise.
+pub(crate) fn slice_region_condition(slices: &[Range<usize>]) -> NaryExpr {
     let mut condition = NaryExpr::scalar(NaryScalar::U32(1));
     for (dim, slice) in slices.iter().enumerate() {
         let dim_index = NaryExpr::DimIndex(dim);
@@ -47,6 +47,15 @@ pub(crate) fn slice_assign_expression(slices: &[Range<usize>], datatype: DataTyp
         condition = NaryExpr::mul(condition, ge_start, DataTypeEnum::U32);
         condition = NaryExpr::mul(condition, lt_end, DataTypeEnum::U32);
     }
+    condition
+}
+
+/// The composed slice-assign body: per output coordinate, read the assigned
+/// value inside the slice region and the original input outside it. Inputs:
+/// 0 = the original tensor, 1 = the assigned value.
+pub(crate) fn slice_assign_expression(slices: &[Range<usize>], datatype: DataTypeEnum) -> NaryExpr {
+    let rank = slices.len();
+    let condition = slice_region_condition(slices);
 
     let value_indices = slices
         .iter()
@@ -83,18 +92,11 @@ pub(crate) fn slice_assign_expression(slices: &[Range<usize>], datatype: DataTyp
 }
 
 impl SliceAssignOperation {
-    pub fn new_in_place(
-        input: NodeIndex,
-        value: NodeIndex,
-        slices: Box<[Range<usize>]>,
-        input_shape: Box<[usize]>,
-    ) -> Self {
+    pub fn new_in_place(input: NodeIndex, value: NodeIndex, slices: Box<[Range<usize>]>) -> Self {
         Self {
             input,
             value,
             slices,
-            input_shape,
-            in_place: true,
         }
     }
 
@@ -104,32 +106,15 @@ impl SliceAssignOperation {
             .map(|slice| slice.end - slice.start)
             .collect()
     }
-
-    fn operation_shape(&self) -> Box<[usize]> {
-        if self.in_place {
-            self.value_shape()
-        } else {
-            self.input_shape.clone()
-        }
-    }
-
-    fn expression(&self, datatype: DataTypeEnum) -> NaryExpr {
-        if self.in_place {
-            return NaryExpr::input(0, self.slices.len());
-        }
-        slice_assign_expression(&self.slices, datatype)
-    }
 }
 
 impl Operation for SliceAssignOperation {
     fn hash_kernel_fields(&self, state: &mut rustc_hash::FxHasher) {
         self.slices.hash(state);
-        self.input_shape.hash(state);
-        self.in_place.hash(state);
     }
 
     fn workgroup_shape_constraints(&self, device: &crate::Device) -> WorkgroupShapeConstraints {
-        titled_map_workgroup_size_constraints(&self.operation_shape(), device)
+        titled_map_workgroup_size_constraints(&self.value_shape(), device)
     }
 
     fn dispatch_size(&self, workgroup_shape: &WorkgroupShape, inputs: &[MirValue]) -> [u32; 3] {
@@ -142,7 +127,7 @@ impl Operation for SliceAssignOperation {
         titled_map_dispatch_size(
             TILE_SIZE,
             *workgroup_shape,
-            &self.operation_shape(),
+            &self.value_shape(),
             max_per_dim,
         )
     }
@@ -156,16 +141,7 @@ impl Operation for SliceAssignOperation {
         // Pass the ORIGINAL input tensor (not sliced) and the value tensor
         let input = nodes.get_cached_result(self.input).unwrap();
         let value = nodes.get_cached_result(self.value).unwrap();
-
-        if self.in_place {
-            let output = input.slice(&self.slices);
-            return vec![input.clone().into(), value.clone().into(), output.into()];
-        }
-
-        // Create output buffer with the same shape as input
-        let output =
-            TensorData::new_for_shape(input.device(), input.layout().shape(), input.datatype());
-
+        let output = input.slice(&self.slices);
         vec![input.clone().into(), value.clone().into(), output.into()]
     }
 
@@ -175,46 +151,26 @@ impl Operation for SliceAssignOperation {
         workgroup_shape: &WorkgroupShape,
         inputs: &[MirValue],
     ) -> Option<DirectKernel> {
-        if self.in_place {
-            let value = inputs[1].as_tensor()?;
-            let operation = ElementwiseOperation {
-                inputs: vec![self.value],
-                expression: self.expression(value.datatype()),
-                shape: value.layout().shape().into(),
-                output_datatype: value.datatype(),
-            };
-            return crate::nary_direct::build_nary_direct_kernel_to_output(
-                &operation,
-                graph,
-                workgroup_shape,
-                &[inputs[1].clone(), inputs[2].clone()],
-                1,
-            );
-        }
-
-        let input = inputs[0].as_tensor()?;
+        // A copy kernel over the slice region: read the value, write into
+        // the sliced view of the input's buffer.
+        let value = inputs[1].as_tensor()?;
         let operation = ElementwiseOperation {
-            inputs: vec![self.input, self.value],
-            expression: self.expression(input.datatype()),
-            shape: self.input_shape.clone(),
-            output_datatype: input.datatype(),
+            inputs: vec![self.value],
+            expression: NaryExpr::input(0, self.slices.len()),
+            shape: value.layout().shape().into(),
+            output_datatype: value.datatype(),
         };
         crate::nary_direct::build_nary_direct_kernel_to_output(
             &operation,
             graph,
             workgroup_shape,
-            inputs,
-            2,
+            &[inputs[1].clone(), inputs[2].clone()],
+            1,
         )
     }
 
     fn output(&self, _nodes: &ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
-        if self.in_place {
-            return inputs[0].clone();
-        }
-
-        // Return the output tensor (last input)
-        inputs[2].clone()
+        inputs[0].clone()
     }
 
     fn name(&self) -> String {

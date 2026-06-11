@@ -417,13 +417,7 @@ impl Tensor {
         slices: impl Into<Box<[Range<usize>]>>,
         value: &Self,
     ) -> Self {
-        let input_shape: Box<[usize]> = self.shape().to_vec().into_boxed_slice();
-        let op = SliceAssignOperation::new_in_place(
-            self.data.key,
-            value.data.key,
-            slices.into(),
-            input_shape,
-        );
+        let op = SliceAssignOperation::new_in_place(self.data.key, value.data.key, slices.into());
         Self::from_parts(self.data.slice_assign(op))
     }
 

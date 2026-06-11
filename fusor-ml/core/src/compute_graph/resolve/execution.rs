@@ -11,11 +11,19 @@ impl Resolver {
             op.visit_dependencies(&mut |dep| {
                 if let Some(count) = remaining_consumers.get_mut(&dep) {
                     *count = count.saturating_sub(1);
-                    if *count == 0 && !targets.contains(&dep) && !graph.has_live_reference(dep) {
+                    if *count == 0
+                        && !targets.contains(&dep)
+                        && !graph.has_live_lazy_descendant(dep)
+                    {
                         // All consumers within this execution have been
                         // processed and no user-held lazy tensor still
                         // transitively depends on `dep` — free the cached
-                        // buffer.
+                        // buffer. The descendant check must include
+                        // `live_descendant_count`, not just direct
+                        // references: clearing `cached` on a node that still
+                        // has an alive-uncached descendant flips it back to
+                        // alive-uncached without propagating the transition,
+                        // undercounting every ancestor's descendant counter.
                         if let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
                             node.cached = None;
                         }
@@ -59,9 +67,6 @@ impl Resolver {
         graph: &ComputeGraphInner,
         operation: &crate::slice_assign::SliceAssignOperation,
     ) -> Option<(TensorData, Vec<CopyBufferRecord>)> {
-        if !operation.in_place {
-            return None;
-        }
         let input = graph.get_cached_result(operation.input)?;
         let value = graph.get_cached_result(operation.value)?;
         if input.datatype() != value.datatype() || operation.slices.len() != input.layout().rank() {
@@ -244,6 +249,7 @@ impl Resolver {
         self.recognize_embeddings(graph);
         self.recognize_attention(graph);
         self.fuse_row_programs(graph);
+        self.recognize_assign_chains(graph);
         // The current rewrite rules can only start from Nary nodes (nary
         // fusion, post-op reduce/matmul fusion) or MatMul nodes (pre-op
         // unary fusion). Avoid scanning every QMatMul/attention node in
@@ -376,6 +382,7 @@ impl Resolver {
         self.recognize_embeddings(graph);
         self.recognize_attention(graph);
         self.fuse_row_programs(graph);
+        self.recognize_assign_chains(graph);
         let has_qmatmul = self.execution_graph.node_indices().any(|node| {
             matches!(
                 self.execution_graph[node].variant,

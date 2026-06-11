@@ -153,7 +153,7 @@ impl ViewOperation {
     }
 }
 
-fn zero_scalar(datatype: DataTypeEnum) -> NaryScalar {
+pub(crate) fn zero_scalar(datatype: DataTypeEnum) -> NaryScalar {
     match datatype {
         DataTypeEnum::F32 => NaryScalar::F32(0.0),
         DataTypeEnum::F16 => NaryScalar::F16(half::f16::from_f32(0.0)),
