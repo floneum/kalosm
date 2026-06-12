@@ -235,8 +235,10 @@ impl CoopTile {
         // Selections whose padding inflates the output by more than a
         // quarter stay on the generic path — that bound also keeps
         // gemv-shaped contractions (tiny M or N) off the tile kernels.
+        // Candidates stick to geometries the aligned rules already reach
+        // (the (128, 128) table entry was never selectable and miscomputes).
         let mut best: Option<(u64, Self)> = None;
-        for (bm, bn) in [(128, 128), (128, 64), (64, 128), (64, 64)] {
+        for (bm, bn) in [(128, 64), (64, 128), (64, 64)] {
             let tile = Self::new(bm, bn, 16);
             if !tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
                 continue;

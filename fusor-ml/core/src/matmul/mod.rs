@@ -452,7 +452,7 @@ mod selection_tests {
         // preference order breaks the tie toward the biggest tile).
         assert_eq!(
             select(1000, 1024, 1024, 512),
-            Some(CoopTile::new(128, 128, 16))
+            Some(CoopTile::new(128, 64, 16))
         );
         // Tiny N inflates every candidate's padding past the waste bound:
         // gemv-shaped contractions stay on the generic path.

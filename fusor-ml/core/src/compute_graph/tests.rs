@@ -461,6 +461,9 @@ fn conv_im2col_matmul_runs_without_gather() {
         for (b, c, h, w, n, kh, kw, implicit) in [
             (2usize, 8usize, 16usize, 16usize, 16usize, 3usize, 3usize, false),
             (2, 64, 34, 34, 128, 3, 3, coop_viable),
+            // Coop-tile-unaligned M (1089 divides nothing): the masked-edge
+            // kernel with a padded output, still one dispatch.
+            (1, 128, 35, 35, 128, 3, 3, coop_viable),
         ] {
             let (oh, ow) = (h - kh + 1, w - kw + 1);
             let (m, k) = (b * oh * ow, c * kh * kw);
