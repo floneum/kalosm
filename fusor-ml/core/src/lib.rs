@@ -41,8 +41,6 @@ mod pair_wise;
 mod quantized;
 mod rank;
 mod reduce;
-mod reduce_direct;
-mod reduce_tiled;
 mod row_program;
 mod sampling;
 mod slice_assign;

@@ -164,12 +164,14 @@ impl Resolver {
         if !out.pre_element_wise[0].functions.is_empty()
             || !out.pre_element_wise[1].functions.is_empty()
             || !out.post_element_wise.functions.is_empty()
+            || !out.a.is_plain()
+            || !out.b.is_plain()
         {
             return None;
         }
         let probs_inner = out.first;
         let v_eff_inner = out.second;
-        let v_eff_shape = out.second_shape.clone();
+        let v_eff_shape = out.b.shape.clone();
         let datatype = out.datatype;
 
         // probs = softmax(scores) along the last axis of a rank-4 space —
@@ -256,11 +258,13 @@ impl Resolver {
         if !qk.pre_element_wise[0].functions.is_empty()
             || !qk.pre_element_wise[1].functions.is_empty()
             || !qk.post_element_wise.functions.is_empty()
+            || !qk.a.is_plain()
+            || !qk.b.is_plain()
         {
             return None;
         }
         let q = qk.first;
-        let q_shape = qk.first_shape.to_vec();
+        let q_shape = qk.a.shape.to_vec();
         let kt_inner = qk.second;
         if q_shape.len() != 4
             || q_shape[..3] != [batch, num_heads, q_seq_len]

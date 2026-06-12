@@ -39,8 +39,7 @@ use crate::{
         linear_group, output_dims_from_flat, tile_u32,
     },
     nary_wise::{NaryExpr, NaryFunction, NaryOp, NaryScalar, UnaryFunctionChain},
-    reduce::{ReduceFunction, ReduceOp, max_fn, sum_fn},
-    reduce_direct::{tile_literal_for, tile_reduce_op},
+    reduce::{ReduceFunction, ReduceOp, ReduceOperation, max_fn, sum_fn},
     tensor::{DataTypeEnum, TensorData},
     visit_tiled::{MaybeQData, distribute_workgroups},
 };
@@ -80,6 +79,8 @@ pub(crate) struct RowFold {
 pub(crate) enum RowOutput {
     /// One output element per index-space position; output shape == `shape`.
     Map(NaryExpr),
+    /// One output element per row; output shape == row dims.
+    Scalar(NaryExpr),
     /// Fold the axis once more with one free output dimension appended to
     /// the row shape: `combine` sees the free coordinate as `DimIndex(rank)`
     /// and element-phase slots at the folded axis position. Output shape =
@@ -256,6 +257,25 @@ pub(crate) struct RowProgramOperation {
 }
 
 impl RowProgramOperation {
+    pub(crate) fn from_reduce(reduce: &ReduceOperation) -> Self {
+        let scalar_slot = slot_expr(reduce.inputs.len(), 0);
+        Self {
+            inputs: reduce.inputs.clone(),
+            shape: reduce.shape.clone(),
+            axis: reduce.axis,
+            steps: vec![
+                RowStep::Reduce(RowReduce {
+                    expression: reduce.expression.clone(),
+                    function: reduce.function.clone(),
+                    post_chain: reduce.post_element_wise.clone(),
+                }),
+                RowStep::Output(RowOutput::Scalar(scalar_slot)),
+            ],
+            output_datatype: reduce.out_datatype(),
+            dynamic_axis: None,
+        }
+    }
+
     fn output_step(&self) -> &RowOutput {
         match self.steps.last() {
             Some(RowStep::Output(output)) => output,
@@ -289,6 +309,7 @@ impl RowProgramOperation {
     pub(crate) fn out_shape(&self) -> Vec<usize> {
         match self.output_step() {
             RowOutput::Map(_) => self.shape.to_vec(),
+            RowOutput::Scalar(_) => self.row_shape(),
             RowOutput::Reduce { free_dim, .. } => {
                 let mut shape = self.row_shape();
                 shape.push(*free_dim);
@@ -306,6 +327,25 @@ impl RowProgramOperation {
             Some(dynamic) => dynamic.block,
             None => device.limits().max_compute_workgroup_size_x.min(BLOCK),
         }
+    }
+
+    fn uses_custom_indexing_for_input(&self, input_idx: usize) -> bool {
+        let output_uses_custom_indexing = match self.output_step() {
+            RowOutput::Map(expr) | RowOutput::Scalar(expr) => {
+                expr.uses_custom_indexing_for_input(input_idx)
+            }
+            RowOutput::Reduce { combine, .. } => combine.uses_custom_indexing_for_input(input_idx),
+        };
+        output_uses_custom_indexing
+            || self.phase_steps().iter().any(|step| match step {
+                RowStep::Reduce(reduce) => {
+                    reduce.expression.uses_custom_indexing_for_input(input_idx)
+                }
+                RowStep::Element { expression, .. } => {
+                    expression.uses_custom_indexing_for_input(input_idx)
+                }
+                RowStep::Output(_) => false,
+            })
     }
 }
 
@@ -363,7 +403,17 @@ impl Operation for RowProgramOperation {
         let mut mir_inputs: Vec<MirValue> = self
             .inputs
             .iter()
-            .map(|idx| nodes.get_result_or_qmatrix(*idx).unwrap().into())
+            .enumerate()
+            .map(|(i, idx)| {
+                // Custom-indexed inputs need dense tensor addressing; the
+                // quantized matrix path only supports plain row/col reads.
+                if self.uses_custom_indexing_for_input(i)
+                    && let Some(cached) = nodes.get_result(*idx)
+                {
+                    return cached.into();
+                }
+                nodes.get_result_or_qmatrix(*idx).unwrap().into()
+            })
             .collect();
         let device = match &mir_inputs[0] {
             MirValue::Tensor(tensor) => tensor.device().clone(),
@@ -484,6 +534,39 @@ fn f32_literal(value: f32) -> Tile {
     Tile::literal(tile_ir::TileLiteral::f32(value))
 }
 
+fn tile_literal_for(value: NaryScalar, target: DataTypeEnum) -> tile_ir::TileLiteral {
+    match target {
+        DataTypeEnum::F32 => match value {
+            NaryScalar::F32(value) => tile_ir::TileLiteral::f32(value),
+            NaryScalar::F16(value) => tile_ir::TileLiteral::f32(value.to_f32()),
+            NaryScalar::U32(value) => tile_ir::TileLiteral::f32(value as f32),
+        },
+        DataTypeEnum::F16 => match value {
+            NaryScalar::F32(value) => {
+                tile_ir::TileLiteral::F16(half::f16::from_f32(value).to_bits())
+            }
+            NaryScalar::F16(value) => tile_ir::TileLiteral::F16(value.to_bits()),
+            NaryScalar::U32(value) => {
+                tile_ir::TileLiteral::F16(half::f16::from_f32(value as f32).to_bits())
+            }
+        },
+        DataTypeEnum::U32 => match value {
+            NaryScalar::F32(value) => tile_ir::TileLiteral::U32(value as u32),
+            NaryScalar::F16(value) => tile_ir::TileLiteral::U32(value.to_f32() as u32),
+            NaryScalar::U32(value) => tile_ir::TileLiteral::U32(value),
+        },
+    }
+}
+
+fn tile_reduce_op(op: ReduceOp) -> tile_ir::TileReduceOp {
+    match op {
+        ReduceOp::Sum => tile_ir::TileReduceOp::Sum,
+        ReduceOp::Product => tile_ir::TileReduceOp::Product,
+        ReduceOp::Max => tile_ir::TileReduceOp::Max,
+        ReduceOp::Min => tile_ir::TileReduceOp::Min,
+    }
+}
+
 fn build_row_program_kernel(
     operation: &RowProgramOperation,
     graph: &crate::compute_graph::ComputeGraphInner,
@@ -531,7 +614,7 @@ fn build_row_program_kernel(
     let phase_steps = operation.phase_steps().to_vec();
     let free_dim_out = match &output_kind {
         RowOutput::Reduce { free_dim, .. } => Some(*free_dim),
-        RowOutput::Map(_) => None,
+        RowOutput::Map(_) | RowOutput::Scalar(_) => None,
     };
     let tiles = k.div_ceil(block);
     let splits: u32 = match free_dim_out {
@@ -1029,26 +1112,46 @@ fn build_row_program_kernel(
                     slots.push((scalar, combined_ty));
                 }
 
-                let RowOutput::Map(output_expr) = &output_kind else {
-                    unreachable!("reducing output requires a dynamic-axis row program")
-                };
-                program.loop_range(chunks, |program, chunk| {
-                    let k_index = chunk * block + lane.clone();
-                    let active = in_bounds.clone().and(k_index.clone().lt(k));
-                    let coords = full_coords(k_index);
-                    let (value, _) = eval_nary_expr(
-                        program,
-                        output_expr,
-                        &coords,
-                        &storages,
-                        &metas,
-                        active.clone(),
-                        &slots,
-                    );
-                    let value = value.cast_to(output_dtype);
-                    let output_index = layout_index(&output_meta, &coords);
-                    output_storage.store(program, output_index, value, active);
-                });
+                match &output_kind {
+                    RowOutput::Map(output_expr) => {
+                        program.loop_range(chunks, |program, chunk| {
+                            let k_index = chunk * block + lane.clone();
+                            let active = in_bounds.clone().and(k_index.clone().lt(k));
+                            let coords = full_coords(k_index);
+                            let (value, _) = eval_nary_expr(
+                                program,
+                                output_expr,
+                                &coords,
+                                &storages,
+                                &metas,
+                                active.clone(),
+                                &slots,
+                            );
+                            let value = value.cast_to(output_dtype);
+                            let output_index = layout_index(&output_meta, &coords);
+                            output_storage.store(program, output_index, value, active);
+                        });
+                    }
+                    RowOutput::Scalar(output_expr) => {
+                        let active = in_bounds.and(lane.eq(0u32));
+                        let coords = full_coords(tile_u32(0));
+                        let (value, _) = eval_nary_expr(
+                            program,
+                            output_expr,
+                            &coords,
+                            &storages,
+                            &metas,
+                            active.clone(),
+                            &slots,
+                        );
+                        let value = value.cast_to(output_dtype);
+                        let output_index = layout_index(&output_meta, &row_dims);
+                        output_storage.store(program, output_index, value, active);
+                    }
+                    RowOutput::Reduce { .. } => {
+                        unreachable!("reducing output requires a dynamic-axis row program")
+                    }
+                }
             });
             Some(())
         },

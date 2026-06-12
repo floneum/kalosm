@@ -16,7 +16,13 @@ impl Resolver {
                 && let Some(input_exec_idx) = self.get_input_node_in_exec_graph(input_inner)
             {
                 let input_variant = self.execution_graph[input_exec_idx].variant.clone();
-                if let ExecutionVariant::MatMul(matmul_op) = input_variant {
+                // An un-flattened operand was chosen for the coop kernel,
+                // which hosts no element-wise chains: fusing one here would
+                // demote the matmul to the generic divmod-per-load reduce.
+                if let ExecutionVariant::MatMul(matmul_op) = input_variant
+                    && matmul_op.a.is_plain()
+                    && matmul_op.b.is_plain()
+                {
                     let mut new_matmul = matmul_op.clone();
                     let mut existing_post = new_matmul.post_element_wise.functions.clone();
                     existing_post.extend(el_op.functions.functions.iter().cloned());
@@ -384,8 +390,13 @@ impl Resolver {
             }
         }
 
-        // Pre-op: fuse elementwise before matmul inputs
-        if let ExecutionVariant::MatMul(matmul_op) = &node_variant {
+        // Pre-op: fuse elementwise before matmul inputs. Skipped for
+        // un-flattened operands: pre chains would demote the matmul off the
+        // coop kernel they were chosen for.
+        if let ExecutionVariant::MatMul(matmul_op) = &node_variant
+            && matmul_op.a.is_plain()
+            && matmul_op.b.is_plain()
+        {
             let mut new_matmul = matmul_op.clone();
             let mut changed = false;
 

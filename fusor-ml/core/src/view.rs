@@ -363,7 +363,10 @@ pub(crate) fn affine_dim_indices(
     )
 }
 
-fn row_major_indices_from_flat(flat: NaryExpr, shape: &[usize]) -> Option<Vec<NaryExpr>> {
+pub(crate) fn row_major_indices_from_flat(
+    flat: NaryExpr,
+    shape: &[usize],
+) -> Option<Vec<NaryExpr>> {
     let mut indices = Vec::with_capacity(shape.len());
     for axis in 0..shape.len() {
         let divisor = shape[axis + 1..]

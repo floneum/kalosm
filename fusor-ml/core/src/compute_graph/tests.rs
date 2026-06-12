@@ -385,6 +385,94 @@ fn three_way_chunk_cat_collapses() {
     });
 }
 
+// --- implicit-GEMM conv (resolve/recognize.rs unflatten) ---
+
+/// Conv's im2col composition: a sliding-window restride whose rank-2 flatten
+/// regroups dims across overlapping strides, feeding the composed matmul.
+/// When the contraction will reach the cooperative-matrix kernel, the
+/// recognizer reads it through the un-flattened windows and the whole conv
+/// is exactly one dispatch — no gather materializing the im2col matrix.
+/// Shapes bound for the generic reduce keep the gather (measured faster
+/// there), so the coop-unaligned case asserts two dispatches.
+#[test]
+fn conv_im2col_matmul_runs_without_gather() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let coop_viable = device
+            .coop_token(crate::kernel_selection::CooperativeMatrixKind::F32F32M8N8K8)
+            .is_some()
+            && device
+                .subgroup_config()
+                .is_some_and(|config| config.is_fixed());
+
+        for (b, c, h, w, n, kh, kw, implicit) in [
+            (2usize, 8usize, 16usize, 16usize, 16usize, 3usize, 3usize, false),
+            (2, 64, 34, 34, 128, 3, 3, coop_viable),
+        ] {
+            let (oh, ow) = (h - kh + 1, w - kw + 1);
+            let (m, k) = (b * oh * ow, c * kh * kw);
+            let input_host: Vec<f32> = (0..b * c * h * w).map(|i| (i % 13) as f32 * 0.1).collect();
+            let weight_host: Vec<f32> = (0..n * k).map(|i| (i % 7) as f32 * 0.01).collect();
+            let input = Tensor::from_slice(&device, [b, c, h, w], &input_host);
+            let weight = Tensor::from_slice(&device, [n, k], &weight_host);
+
+            // The window views drop at the end of the block, like a conv
+            // layer's locals dropping before anything materializes.
+            let out = {
+                // sliding_window_view + window permutation in one restride:
+                // dims [b, oh, ow, c, kh, kw] over the (B, C, H, W) buffer.
+                let windows = input.restride([
+                    StrideSpec::dim(0, b),
+                    StrideSpec::dim_with(2, oh, 1),
+                    StrideSpec::dim_with(3, ow, 1),
+                    StrideSpec::dim(1, c),
+                    StrideSpec::dim(2, kh),
+                    StrideSpec::dim(3, kw),
+                ]);
+                let a = windows.reshape([m, k]);
+                // Weight read through a transposed [K, N] view, like conv's
+                // weight.t().
+                let b_mat = weight.restride([StrideSpec::dim(1, k), StrideSpec::dim(0, n)]);
+                a.mat_mul(&b_mat)
+            };
+            let (_, kernels) = out.data.materialize();
+            let expected = if implicit { 1 } else { 2 };
+            assert_eq!(
+                kernels, expected,
+                "conv should be {expected} dispatch(es) (got {kernels})",
+            );
+
+            let result = out.as_slice::<2, f32>().await.unwrap();
+            // Spot-check a strided sample against the host reference (the
+            // full reference is O(M·N·K) in a debug build).
+            for mi in (0..m).step_by(37) {
+                let (bi, rest) = (mi / (oh * ow), mi % (oh * ow));
+                let (ohi, owi) = (rest / ow, rest % ow);
+                for ni in (0..n).step_by(13) {
+                    let mut acc = 0f32;
+                    for ci in 0..c {
+                        for khi in 0..kh {
+                            for kwi in 0..kw {
+                                let iv =
+                                    input_host[((bi * c + ci) * h + ohi + khi) * w + owi + kwi];
+                                let wv = weight_host[ni * k + (ci * kh + khi) * kw + kwi];
+                                acc += iv * wv;
+                            }
+                        }
+                    }
+                    let got = result[[mi, ni]];
+                    assert!(
+                        (got - acc).abs() < 1e-3 * acc.abs().max(1.0),
+                        "mismatch at [{mi}, {ni}]: got {got}, expected {acc}",
+                    );
+                }
+            }
+        }
+    });
+}
+
 #[test]
 fn deep_branch_chains_collapse_through_cat() {
     pollster::block_on(async {

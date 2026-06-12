@@ -272,7 +272,9 @@ impl Resolver {
             );
             return true;
         }
-        if let Some((operation, inputs)) = contraction.to_mat_mul(&graph.device()) {
+        if let Some((mut operation, _)) = contraction.to_mat_mul(&graph.device()) {
+            self.try_unflatten_matmul_input(graph, &mut operation);
+            let inputs = [operation.first, operation.second];
             self.commit_recognized(
                 graph,
                 node_idx,
@@ -282,6 +284,86 @@ impl Resolver {
             return true;
         }
         false
+    }
+
+    /// Read a recognized matmul's A operand through its un-flattened
+    /// producer. Conv's im2col flatten regroups a windowed view's dims
+    /// across overlapping strides, which no single strided layout can
+    /// express: the reshape becomes a chained view that would materialize
+    /// through the gather fallback. When the flat `[M, K]` operand is
+    /// exactly such a reinterpret, point the matmul at the producer and let
+    /// the kernels divmod the flat coordinates back apart per load — an
+    /// implicit GEMM with no gather dispatch.
+    fn try_unflatten_matmul_input(
+        &mut self,
+        graph: &ComputeGraphInner,
+        operation: &mut crate::MatMulOperation,
+    ) {
+        if !operation.a.is_plain() || operation.a.batch_dims != 0 {
+            return;
+        }
+        // Only the cooperative-matrix kernel reads an un-flattened operand
+        // faster than gather-then-matmul: its tile staging amortizes the
+        // per-load coordinate decomposition. The generic reduce re-derives
+        // coordinates for every load and measures slower than the gather at
+        // every meaningful size, so anything bound for it keeps the
+        // materialized matrix.
+        if !operation.hardware_matmul_statically_viable(&graph.device()) {
+            return;
+        }
+        let (m, k) = (operation.a.rows(), operation.a.cols());
+        // An already-materialized (or externally held) operand is cheaper to
+        // read flat than to re-derive coordinates for.
+        if self.check_cached(graph, operation.first) || graph.has_live_reference(operation.first) {
+            return;
+        }
+        let Some(node) = graph.nodes.nodes.node_weight(operation.first) else {
+            return;
+        };
+        let ComputeGraphNodeVariant::View(view) = &node.variant else {
+            return;
+        };
+        if !view.is_fully_defined()
+            || !view.layout.is_contiguous()
+            || view.layout.offset() != 0
+            || view.layout.shape() != [m, k]
+        {
+            return;
+        }
+        let inner_shape = &view.input_shape;
+        // The producer's dims must split cleanly into an `M` prefix and a
+        // `K` suffix for the per-side flat-coordinate decomposition.
+        let mut product = 1usize;
+        let mut k_start = inner_shape.len();
+        while k_start > 0 && product < k {
+            k_start -= 1;
+            let Some(next) = product.checked_mul(inner_shape[k_start]) else {
+                return;
+            };
+            product = next;
+        }
+        if product != k
+            || k_start == 0
+            || k_start == inner_shape.len()
+            || inner_shape[..k_start].iter().product::<usize>() != m
+        {
+            return;
+        }
+        // The kernels decompose with u32 arithmetic; validate both sides
+        // here so the lowering can rely on it.
+        let probe = NaryExpr::DimIndex(0);
+        if crate::view::row_major_indices_from_flat(probe.clone(), &inner_shape[..k_start])
+            .is_none()
+            || crate::view::row_major_indices_from_flat(probe, &inner_shape[k_start..]).is_none()
+        {
+            return;
+        }
+        operation.first = view.input;
+        operation.a = crate::matmul::MatrixOperand {
+            shape: inner_shape.clone(),
+            batch_dims: 0,
+            row_dims: k_start,
+        };
     }
 
     /// Sweep elementwise nodes for quantized embedding gathers.

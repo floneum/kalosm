@@ -25,13 +25,92 @@ pub enum MatMulParams {
     CoopMatMul(coop_gemm::CoopGemmParams),
 }
 
+/// One matmul operand's dim grouping: the producer node's logical dims
+/// split into `batch_dims` leading batch dims, `row_dims` row dims, and
+/// column dims for the rest. The row and column groups flatten to the two
+/// matrix axes. A plain `[batch.., rows, cols]` operand has one dim per
+/// group; conv's im2col operand keeps the windowed view's dims, and the
+/// kernels divmod the flat matrix coordinates back apart per load.
+#[derive(Debug, Clone, Hash)]
+pub(crate) struct MatrixOperand {
+    pub(crate) shape: Box<[usize]>,
+    pub(crate) batch_dims: usize,
+    pub(crate) row_dims: usize,
+}
+
+impl MatrixOperand {
+    pub(crate) fn plain(shape: &[usize]) -> Self {
+        assert!(shape.len() >= 2, "matrix operands are at least rank 2");
+        Self {
+            shape: shape.into(),
+            batch_dims: shape.len() - 2,
+            row_dims: 1,
+        }
+    }
+
+    /// One dim per group: the operand's shape is the logical matmul shape.
+    pub(crate) fn is_plain(&self) -> bool {
+        self.row_dims == 1 && self.batch_dims + 2 == self.shape.len()
+    }
+
+    pub(crate) fn batch_shape(&self) -> &[usize] {
+        &self.shape[..self.batch_dims]
+    }
+
+    pub(crate) fn row_shape(&self) -> &[usize] {
+        &self.shape[self.batch_dims..self.batch_dims + self.row_dims]
+    }
+
+    pub(crate) fn col_shape(&self) -> &[usize] {
+        &self.shape[self.batch_dims + self.row_dims..]
+    }
+
+    pub(crate) fn rows(&self) -> usize {
+        self.row_shape().iter().product()
+    }
+
+    pub(crate) fn cols(&self) -> usize {
+        self.col_shape().iter().product()
+    }
+
+    /// Leading dim count flattening to the 2-D matrix row axis (batch
+    /// included): the split for [`flatten_matrix_layout_split`].
+    ///
+    /// [`flatten_matrix_layout_split`]: crate::mir::tile_direct::flatten_matrix_layout_split
+    pub(crate) fn split(&self) -> usize {
+        self.batch_dims + self.row_dims
+    }
+
+    /// Index expressions reading the operand at the contraction coordinates:
+    /// batch dims index through, and the flat row/column coordinates
+    /// decompose over the row/column groups (the identity for single-dim
+    /// groups, so plain operands load with bare `DimIndex` coordinates).
+    pub(crate) fn index_expressions(
+        &self,
+        row_dim: usize,
+        col_dim: usize,
+    ) -> Vec<crate::nary_wise::NaryExpr> {
+        use crate::nary_wise::NaryExpr;
+        let mut indices: Vec<NaryExpr> = (0..self.batch_dims).map(NaryExpr::DimIndex).collect();
+        indices.extend(
+            crate::view::row_major_indices_from_flat(NaryExpr::DimIndex(row_dim), self.row_shape())
+                .expect("operand dims fit u32"),
+        );
+        indices.extend(
+            crate::view::row_major_indices_from_flat(NaryExpr::DimIndex(col_dim), self.col_shape())
+                .expect("operand dims fit u32"),
+        );
+        indices
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct MatMulOperation {
     pub(crate) datatype: DataTypeEnum,
     pub(crate) first: NodeIndex,
     pub(crate) second: NodeIndex,
-    pub(crate) first_shape: Box<[usize]>,
-    pub(crate) second_shape: Box<[usize]>,
+    pub(crate) a: MatrixOperand,
+    pub(crate) b: MatrixOperand,
     pub(crate) out_shape: Box<[usize]>,
     pub(crate) pre_element_wise: [UnaryFunctionChain; 2],
     pub(crate) post_element_wise: UnaryFunctionChain,

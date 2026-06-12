@@ -11,7 +11,8 @@ use crate::{
         kernel_backend::{self, DirectKernel},
         operation::Operation,
         tile_direct::{
-            flatten_matrix_layout, tile_storage_read_with_direct_layout_typed,
+            flatten_matrix_layout, flatten_matrix_layout_split,
+            tile_storage_read_with_direct_layout_typed,
             tile_storage_write_with_direct_layout_typed,
         },
     },
@@ -21,7 +22,7 @@ use crate::{
 };
 
 use super::{
-    MatMulOperation, MatMulParams, coop_gemm, sgemm, sgemv,
+    MatMulOperation, MatMulParams, MatrixOperand, coop_gemm, sgemm, sgemv,
     variants::{CoopTile, dense_coop_kinds_from_datatype, select_dense_matmul_params},
 };
 
@@ -81,8 +82,8 @@ impl MatMulOperation {
         Self {
             first,
             second,
-            first_shape: first_shape.into(),
-            second_shape: second_shape.into(),
+            a: MatrixOperand::plain(first_shape),
+            b: MatrixOperand::plain(second_shape),
             out_shape: out_shape.into(),
             datatype,
             pre_element_wise: [
@@ -92,10 +93,6 @@ impl MatMulOperation {
             post_element_wise: UnaryFunctionChain::empty(datatype),
             parameters,
         }
-    }
-
-    pub fn rank(&self) -> u32 {
-        self.out_shape.len() as u32
     }
 
     fn can_use_hardware_matmul(&self) -> bool {
@@ -109,15 +106,10 @@ impl MatMulOperation {
     /// hardware-specialized lower through this — the same generic tiled
     /// reduce any composed contraction gets.
     fn as_fused_reduce(&self) -> ReduceOperation {
-        let rank = self.first_shape.len();
-        let batch = rank - 2;
+        let batch = self.a.batch_dims;
         let (m_dim, n_dim, k_dim) = (batch, batch + 1, batch + 2);
-        let mut index_space: Vec<usize> = self.first_shape[..batch].to_vec();
-        index_space.extend([
-            self.first_shape[batch],
-            self.second_shape[batch + 1],
-            self.first_shape[batch + 1],
-        ]);
+        let mut index_space: Vec<usize> = self.a.batch_shape().to_vec();
+        index_space.extend([self.a.rows(), self.b.cols(), self.a.cols()]);
 
         let apply_chain = |mut expr: NaryExpr, chain: &UnaryFunctionChain| {
             for function in &chain.functions {
@@ -139,14 +131,8 @@ impl MatMulOperation {
             }
         };
 
-        let a_indices: Vec<NaryExpr> = (0..batch)
-            .chain([m_dim, k_dim])
-            .map(NaryExpr::DimIndex)
-            .collect();
-        let b_indices: Vec<NaryExpr> = (0..batch)
-            .chain([k_dim, n_dim])
-            .map(NaryExpr::DimIndex)
-            .collect();
+        let a_indices = self.a.index_expressions(m_dim, k_dim);
+        let b_indices = self.b.index_expressions(k_dim, n_dim);
 
         let acc_dtype = match self.pre_element_wise[0].out_datatype() {
             DataTypeEnum::U32 => DataTypeEnum::U32,
@@ -195,6 +181,73 @@ impl MatMulOperation {
         }
     }
 
+    /// The static half of [`Self::build_hardware_matmul`]'s gates: whether
+    /// this contraction will reach the cooperative-matrix kernel on this
+    /// device. The resolver uses it to decide if reading an operand through
+    /// its un-flattened producer is profitable — the coop kernel's tile
+    /// staging amortizes the per-load coordinate decomposition, while the
+    /// generic reduce re-derives it for every load and loses to a one-time
+    /// gather.
+    pub(crate) fn hardware_matmul_statically_viable(&self, device: &Device) -> bool {
+        if !self.can_use_hardware_matmul()
+            || (self.datatype == DataTypeEnum::F16 && !device.f16_supported())
+            || !self.pre_element_wise[0].functions.is_empty()
+            || !self.pre_element_wise[1].functions.is_empty()
+            || !self.post_element_wise.functions.is_empty()
+        {
+            return false;
+        }
+        let MatMulParams::CoopMatMul(params) = &self.parameters else {
+            return false;
+        };
+        if device.coop_token(params.kind()).is_none()
+            || !device
+                .subgroup_config()
+                .is_some_and(|config| config.is_fixed())
+        {
+            return false;
+        }
+        let (Ok(m), Ok(k), Ok(n)): (Result<u32, _>, Result<u32, _>, Result<u32, _>) = (
+            self.a.rows().try_into(),
+            self.a.cols().try_into(),
+            self.b.cols().try_into(),
+        ) else {
+            return false;
+        };
+        let Some(batch) = self
+            .a
+            .batch_shape()
+            .iter()
+            .try_fold(1u32, |acc, &dim| acc.checked_mul(u32::try_from(dim).ok()?))
+        else {
+            return false;
+        };
+        let limits = device.limits();
+        let Some(tile) = CoopTile::select(
+            m,
+            k,
+            n,
+            limits
+                .max_compute_workgroup_size_x
+                .min(limits.max_compute_invocations_per_workgroup),
+            device
+                .subgroup_config()
+                .expect("checked above")
+                .max_size(),
+        ) else {
+            return false;
+        };
+        // `CoopTile::select` guarantees the divisibility the kernel needs;
+        // only the dispatch-grid bound remains.
+        let Some(total_tiles) = (m / tile.bm)
+            .checked_mul(n / tile.bn)
+            .and_then(|tiles| tiles.checked_mul(batch))
+        else {
+            return false;
+        };
+        total_tiles <= limits.max_compute_workgroups_per_dimension
+    }
+
     fn build_hardware_matmul(
         &self,
         device: &Device,
@@ -202,22 +255,34 @@ impl MatMulOperation {
         input_b: &TensorData,
         output: &TensorData,
     ) -> Result<DirectKernel, kernel_backend::DeviceNotSupported> {
-        let a_view = device_supported(flatten_matrix_layout(input_a.layout()))?;
-        let b_view = device_supported(flatten_matrix_layout(input_b.layout()))?;
+        let a_view = device_supported(flatten_matrix_layout_split(
+            input_a.layout(),
+            self.a.split(),
+        ))?;
+        let b_view = device_supported(flatten_matrix_layout_split(
+            input_b.layout(),
+            self.b.split(),
+        ))?;
         let y_view = device_supported(flatten_matrix_layout(output.layout()))?;
 
-        let rank = self.first_shape.len();
-        let m: u32 = self.first_shape[rank - 2]
+        let m: u32 = self
+            .a
+            .rows()
             .try_into()
             .map_err(|_| kernel_backend::DeviceNotSupported)?;
-        let k: u32 = self.first_shape[rank - 1]
+        let k: u32 = self
+            .a
+            .cols()
             .try_into()
             .map_err(|_| kernel_backend::DeviceNotSupported)?;
-        let n: u32 = self.second_shape[rank - 1]
+        let n: u32 = self
+            .b
+            .cols()
             .try_into()
             .map_err(|_| kernel_backend::DeviceNotSupported)?;
         let batch: u32 = device_supported(
-            self.first_shape[..rank - 2]
+            self.a
+                .batch_shape()
                 .iter()
                 .try_fold(1usize, |acc, dim| acc.checked_mul(*dim)),
         )?
@@ -347,8 +412,8 @@ struct HardwareMatmulVariant;
 impl Operation for MatMulOperation {
     fn hash_kernel_fields(&self, state: &mut FxHasher) {
         self.datatype.hash(state);
-        self.first_shape.hash(state);
-        self.second_shape.hash(state);
+        self.a.hash(state);
+        self.b.hash(state);
         self.out_shape.hash(state);
         self.pre_element_wise.hash(state);
         self.post_element_wise.hash(state);
@@ -377,18 +442,15 @@ impl Operation for MatMulOperation {
         workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
         inputs: &[crate::mir::inputs::MirValue],
     ) -> [u32; 3] {
-        let [input_a, input_b, _output] = inputs else {
+        let [input_a, _input_b, _output] = inputs else {
             panic!("MatMulOperation requires 3 inputs");
         };
+        // The logical contraction shape: an un-flattened operand's runtime
+        // layout has a different rank, so the runtime layouts can't be used.
         let input_a = input_a.as_tensor().unwrap();
-        let input_b = input_b.as_tensor().unwrap();
-        let a_shape = input_a.layout().shape();
-        let b_shape = input_b.layout().shape();
-        let last_dim = self.rank() as usize - 1;
-        let last_dim_size = b_shape[last_dim];
-        let second_to_last_dim = self.rank() as usize - 2;
-        let second_to_last_dim_size = a_shape[second_to_last_dim];
-        let batch_size = a_shape.iter().rev().skip(2).product::<usize>();
+        let last_dim_size = self.b.cols();
+        let second_to_last_dim_size = self.a.rows();
+        let batch_size = self.a.batch_shape().iter().product::<usize>();
 
         match &self.parameters {
             MatMulParams::Vector(sgemv_params) => sgemv::dispatch_size(
@@ -430,16 +492,12 @@ impl Operation for MatMulOperation {
     ) -> Vec<crate::mir::inputs::MirValue> {
         let a = nodes.get_result(self.first).unwrap();
         let b = nodes.get_result(self.second).unwrap();
-        let last_dim = self.rank() as usize - 1;
-        let second_to_last_dim = self.rank() as usize - 2;
         let device = a.device();
-        let a_shape = a.layout().shape();
-        let b_shape = b.layout().shape();
-        let mut out_shape = a_shape.to_vec();
-        out_shape[second_to_last_dim] = a_shape[second_to_last_dim];
-        out_shape[last_dim] = b_shape[last_dim];
-        let output_tensor =
-            TensorData::new_for_shape(device, &out_shape, self.post_element_wise.out_datatype());
+        let output_tensor = TensorData::new_for_shape(
+            device,
+            &self.out_shape,
+            self.post_element_wise.out_datatype(),
+        );
         vec![a.into(), b.into(), output_tensor.into()]
     }
 
@@ -469,15 +527,11 @@ impl Operation for MatMulOperation {
         // generic tiled (or serial) fused reduce, identical to what any
         // unrecognized contraction gets.
         let reduce = self.as_fused_reduce();
-        crate::reduce_tiled::build_reduce_tiled_kernel(&reduce, graph, workgroup_shape, inputs)
-            .or_else(|| {
-                crate::reduce_direct::build_reduce_direct_kernel(
-                    &reduce,
-                    graph,
-                    workgroup_shape,
-                    inputs,
-                )
-            })
+        crate::row_program::RowProgramOperation::from_reduce(&reduce).build_direct_kernel(
+            graph,
+            workgroup_shape,
+            inputs,
+        )
     }
 
     fn output(
@@ -493,12 +547,14 @@ impl Operation for MatMulOperation {
         format!(
             "matmul_{}_{}_by_{}",
             self.datatype,
-            self.first_shape
+            self.a
+                .shape
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
                 .join("x"),
-            self.second_shape
+            self.b
+                .shape
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()

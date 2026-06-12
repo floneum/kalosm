@@ -202,7 +202,7 @@ fn plan_nary_tiling(
         }
         let invariant_bytes: u64 = (0..input_count)
             .filter(|&i| !access.depends_on(i, dim))
-            .map(|i| crate::reduce_tiled::input_allocation_bytes(&metas[i], &values[i]))
+            .map(|i| input_allocation_bytes(&metas[i], &values[i]))
             .sum();
         if invariant_bytes < device.last_level_cache_bytes() {
             continue;
@@ -378,20 +378,6 @@ impl ValueTile {
     pub(crate) fn into_f32(self) -> tile_ir::tile::Tile {
         match self.cast_to(DataTypeEnum::F32) {
             Self::F32(v) => v,
-            _ => unreachable!(),
-        }
-    }
-
-    pub(crate) fn into_f16(self) -> tile_ir::tile::Tile {
-        match self.cast_to(DataTypeEnum::F16) {
-            Self::F16(v) => v,
-            _ => unreachable!(),
-        }
-    }
-
-    pub(crate) fn into_u32(self) -> tile_ir::tile::Tile {
-        match self.cast_to(DataTypeEnum::U32) {
-            Self::U32(v) => v,
             _ => unreachable!(),
         }
     }
@@ -1141,6 +1127,17 @@ pub(crate) struct TensorMeta {
     pub(crate) strides: Vec<u32>,
     pub(crate) offset: u32,
     pub(crate) allocation_len: u32,
+}
+
+pub(crate) fn input_allocation_bytes(meta: &TensorMeta, value: &MaybeQData) -> u64 {
+    let element_bytes = match value {
+        MaybeQData::Tensor(tensor) => match tensor.datatype() {
+            DataTypeEnum::F16 => 2,
+            DataTypeEnum::F32 | DataTypeEnum::U32 => 4,
+        },
+        MaybeQData::QMatrix(_) => 4,
+    };
+    meta.allocation_len as u64 * element_bytes
 }
 
 impl TensorMeta {

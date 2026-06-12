@@ -90,10 +90,6 @@ impl ReduceOperation {
             .filter_map(|(i, x)| (i != self.axis).then_some(*x))
             .collect()
     }
-
-    pub(crate) fn reduce_size(&self) -> usize {
-        self.shape[self.axis]
-    }
 }
 
 impl Operation for ReduceOperation {
@@ -119,22 +115,13 @@ impl Operation for ReduceOperation {
 
     fn dispatch_size(
         &self,
-        workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
+        _workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
         inputs: &[MirValue],
     ) -> [u32; 3] {
         let output_tensor: TensorData = inputs.last().unwrap().as_tensor().unwrap().clone();
-        let total_outputs = output_tensor.layout().shape().iter().product::<usize>() as u32;
-        let reduce_size = self.reduce_size() as u32;
-        let serial_workgroups = total_outputs.div_ceil(workgroup_shape.x());
-        let total_workgroups =
-            if use_cooperative_reduce(total_outputs, reduce_size, workgroup_shape.x()) {
-                total_outputs
-            } else {
-                serial_workgroups
-            };
-
+        let rows = output_tensor.layout().shape().iter().product::<usize>() as u32;
         distribute_workgroups(
-            total_workgroups,
+            rows,
             output_tensor
                 .device()
                 .limits()
@@ -182,15 +169,11 @@ impl Operation for ReduceOperation {
         workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
         inputs: &[MirValue],
     ) -> Option<DirectKernel> {
-        crate::reduce_tiled::build_reduce_tiled_kernel(self, graph, workgroup_shape, inputs)
-            .or_else(|| {
-                crate::reduce_direct::build_reduce_direct_kernel(
-                    self,
-                    graph,
-                    workgroup_shape,
-                    inputs,
-                )
-            })
+        crate::row_program::RowProgramOperation::from_reduce(self).build_direct_kernel(
+            graph,
+            workgroup_shape,
+            inputs,
+        )
     }
 
     fn output(&self, _: &crate::compute_graph::ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
@@ -205,11 +188,6 @@ impl Operation for ReduceOperation {
             format!("reduce_{}_fused", self.function.name())
         }
     }
-}
-
-pub(crate) fn use_cooperative_reduce(total_outputs: u32, reduce_size: u32, block: u32) -> bool {
-    let serial_workgroups = total_outputs.div_ceil(block);
-    reduce_size >= block && serial_workgroups <= 4
 }
 
 #[derive(Clone, Debug, Hash)]
