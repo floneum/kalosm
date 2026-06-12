@@ -1,5 +1,5 @@
 use crate::{
-    Device, Tensor, compute_graph::NodeIndex, kernel_selection::CooperativeMatrixKind,
+    Device, Layout, Tensor, compute_graph::NodeIndex, kernel_selection::CooperativeMatrixKind,
     nary_wise::UnaryFunctionChain, tensor::DataTypeEnum,
 };
 
@@ -25,17 +25,38 @@ pub enum MatMulParams {
     CoopMatMul(coop_gemm::CoopGemmParams),
 }
 
-/// One matmul operand's dim grouping: the producer node's logical dims
-/// split into `batch_dims` leading batch dims, `row_dims` row dims, and
-/// column dims for the rest. The row and column groups flatten to the two
-/// matrix axes. A plain `[batch.., rows, cols]` operand has one dim per
-/// group; conv's im2col operand keeps the windowed view's dims, and the
-/// kernels divmod the flat matrix coordinates back apart per load.
+/// An affine relayout between an operand's dims and its node's logical
+/// space: conv's sliding windows. The kernels concretize it lazily — the
+/// coop path composes it with the node's runtime buffer layout, the generic
+/// reduce substitutes it into the load coordinates.
+#[derive(Debug, Clone)]
+pub(crate) struct OperandBaseMap {
+    pub(crate) layout: Layout,
+    pub(crate) base_shape: Box<[usize]>,
+}
+
+impl std::hash::Hash for OperandBaseMap {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.layout.offset().hash(state);
+        self.layout.shape().hash(state);
+        self.layout.strides().hash(state);
+        self.base_shape.hash(state);
+    }
+}
+
+/// One matmul operand's dim grouping: the operand's dims split into
+/// `batch_dims` leading batch dims, `row_dims` row dims, and column dims
+/// for the rest. The row and column groups flatten to the two matrix axes.
+/// A plain `[batch.., rows, cols]` operand has one dim per group; conv's
+/// im2col operand keeps the windowed view's dims (mapped onto the node by
+/// `base_map`), and the kernels divmod the flat matrix coordinates back
+/// apart per load.
 #[derive(Debug, Clone, Hash)]
 pub(crate) struct MatrixOperand {
     pub(crate) shape: Box<[usize]>,
     pub(crate) batch_dims: usize,
     pub(crate) row_dims: usize,
+    pub(crate) base_map: Option<OperandBaseMap>,
 }
 
 impl MatrixOperand {
@@ -45,12 +66,14 @@ impl MatrixOperand {
             shape: shape.into(),
             batch_dims: shape.len() - 2,
             row_dims: 1,
+            base_map: None,
         }
     }
 
-    /// One dim per group: the operand's shape is the logical matmul shape.
+    /// One dim per group, reading the node's own dims directly: the
+    /// operand's shape is the logical matmul shape.
     pub(crate) fn is_plain(&self) -> bool {
-        self.row_dims == 1 && self.batch_dims + 2 == self.shape.len()
+        self.row_dims == 1 && self.batch_dims + 2 == self.shape.len() && self.base_map.is_none()
     }
 
     pub(crate) fn batch_shape(&self) -> &[usize] {
@@ -82,9 +105,10 @@ impl MatrixOperand {
     }
 
     /// Index expressions reading the operand at the contraction coordinates:
-    /// batch dims index through, and the flat row/column coordinates
-    /// decompose over the row/column groups (the identity for single-dim
-    /// groups, so plain operands load with bare `DimIndex` coordinates).
+    /// batch dims index through, the flat row/column coordinates decompose
+    /// over the row/column groups (the identity for single-dim groups, so
+    /// plain operands load with bare `DimIndex` coordinates), and the
+    /// operand coordinates map through `base_map` to the node's own dims.
     pub(crate) fn index_expressions(
         &self,
         row_dim: usize,
@@ -100,7 +124,14 @@ impl MatrixOperand {
             crate::view::row_major_indices_from_flat(NaryExpr::DimIndex(col_dim), self.col_shape())
                 .expect("operand dims fit u32"),
         );
-        indices
+        match &self.base_map {
+            None => indices,
+            Some(map) => crate::view::affine_dim_indices(&map.layout, &map.base_shape)
+                .expect("validated when the resolver attached the base map")
+                .iter()
+                .map(|index| index.to_expr(&indices))
+                .collect(),
+        }
     }
 }
 
@@ -416,6 +447,15 @@ mod selection_tests {
             select(1024, 1024, 1024, 128),
             Some(CoopTile::new(64, 64, 16))
         );
-        assert_eq!(select(1000, 1024, 1024, 512), None);
+        // M=1000 divides nothing: the masked-edge fallback picks the tile
+        // with the least padded work (all candidates pad M to 1024; the
+        // preference order breaks the tie toward the biggest tile).
+        assert_eq!(
+            select(1000, 1024, 1024, 512),
+            Some(CoopTile::new(128, 128, 16))
+        );
+        // Tiny N inflates every candidate's padding past the waste bound:
+        // gemv-shaped contractions stay on the generic path.
+        assert_eq!(select(1000, 1024, 16, 512), None);
     }
 }

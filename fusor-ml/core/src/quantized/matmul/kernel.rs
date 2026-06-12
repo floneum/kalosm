@@ -70,14 +70,16 @@ impl QMatMulOperation {
         let scratch = TensorData::new_for_shape(&device, &padded_in_shape, input.datatype());
         let pad_copy = crate::view::ViewOperation {
             input: self.input,
-            layout: Layout::from_parts(
-                0,
-                padded_in_shape.into(),
-                Layout::continuous_strides(in_shape),
-            ),
-            input_shape: in_shape.into(),
-            defined: in_shape.into(),
-            fill: crate::view::zero_scalar(input.datatype()),
+            stages: vec![crate::view::ViewStage {
+                layout: Layout::from_parts(
+                    0,
+                    padded_in_shape.into(),
+                    Layout::continuous_strides(in_shape),
+                ),
+                input_shape: in_shape.into(),
+                defined: in_shape.into(),
+                fill: crate::view::zero_scalar(input.datatype()),
+            }],
             datatype: input.datatype(),
         };
         let pad_workgroup = pad_copy

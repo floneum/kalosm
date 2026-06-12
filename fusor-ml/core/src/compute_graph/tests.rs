@@ -385,6 +385,57 @@ fn three_way_chunk_cat_collapses() {
     });
 }
 
+/// A staged (divmod) view feeding a single-read elementwise folds into the
+/// consumer's loads: one dispatch, no gather. The same composition used to
+/// cost a gather plus the elementwise.
+#[test]
+fn staged_view_folds_into_single_read_elementwise() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        let (b, c, h, w) = (2usize, 4usize, 8usize, 8usize);
+        let (kh, kw) = (3usize, 3usize);
+        let (oh, ow) = (h - kh + 1, w - kw + 1);
+        let (m, k) = (b * oh * ow, c * kh * kw);
+        let input_host: Vec<f32> = (0..b * c * h * w).map(|i| (i % 13) as f32 * 0.1).collect();
+        let input = Tensor::from_slice(&device, [b, c, h, w], &input_host);
+
+        let out = {
+            let windows = input.restride([
+                StrideSpec::dim(0, b),
+                StrideSpec::dim_with(2, oh, 1),
+                StrideSpec::dim_with(3, ow, 1),
+                StrideSpec::dim(1, c),
+                StrideSpec::dim(2, kh),
+                StrideSpec::dim(3, kw),
+            ]);
+            &windows.reshape([m, k]) + 1.0
+        };
+        let (_, kernels) = out.data.materialize();
+        assert_eq!(
+            kernels, 1,
+            "the staged view should fold into the elementwise (got {kernels} dispatches)",
+        );
+
+        let result = out.as_slice::<2, f32>().await.unwrap();
+        for mi in 0..m {
+            let (bi, rest) = (mi / (oh * ow), mi % (oh * ow));
+            let (ohi, owi) = (rest / ow, rest % ow);
+            for ki in 0..k {
+                let (ci, rest) = (ki / (kh * kw), ki % (kh * kw));
+                let (khi, kwi) = (rest / kw, rest % kw);
+                let expected = input_host[((bi * c + ci) * h + ohi + khi) * w + owi + kwi] + 1.0;
+                assert!(
+                    (result[[mi, ki]] - expected).abs() < 1e-6,
+                    "mismatch at [{mi}, {ki}]",
+                );
+            }
+        }
+    });
+}
+
 // --- implicit-GEMM conv (resolve/recognize.rs unflatten) ---
 
 /// Conv's im2col composition: a sliding-window restride whose rank-2 flatten

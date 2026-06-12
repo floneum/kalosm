@@ -64,12 +64,17 @@ impl LayoutPass {
             self.queue.push_back(key);
             return;
         };
-        // A fully-defined view that composes with the input's layout stays a
-        // zero-cost buffer view; anything else materializes contiguously
-        // through the gather fallback.
+        // A fully-defined view whose stages compose with the input's layout
+        // stays a zero-cost buffer view; anything else materializes
+        // contiguously through the gather fallback.
         let new_layout = operation
             .is_fully_defined()
-            .then(|| crate::view::compose_layouts(&operation.layout, input_layout.layout()))
+            .then(|| {
+                operation.stages.iter().try_fold(
+                    input_layout.layout().clone(),
+                    |composed, stage| crate::view::compose_layouts(&stage.layout, &composed),
+                )
+            })
             .flatten()
             .unwrap_or_else(|| Layout::contiguous(operation.shape()));
         self.output_layout.insert(

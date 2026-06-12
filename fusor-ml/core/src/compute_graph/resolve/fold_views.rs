@@ -1,17 +1,21 @@
-use crate::view::{AffineIndex, ViewOperation, affine_dim_indices};
+use crate::view::ViewOperation;
 
 use super::*;
 
 impl Resolver {
     /// Fold view inputs of an n-ary node directly into its expression: each
-    /// `IndexedInput` through the view becomes an `IndexedInput` of the
-    /// view's base node with the view's coordinate mapping applied (and a
-    /// bounds-select around partially-defined views). This removes the view
-    /// node from between the producer and consumer, so the n-ary fusion
-    /// passes see through layout changes instead of stopping at them.
+    /// `IndexedInput` through the view becomes a load of the view's base
+    /// node with the view's coordinate map applied (and a bounds-select
+    /// around partially-defined stages). This removes the view node from
+    /// between the producer and consumer, so the n-ary fusion passes see
+    /// through layout changes instead of stopping at them.
     ///
-    /// Only affine views fold (no divmod in the rewritten indices); anything
-    /// else stays a view node and materializes through the gather fallback.
+    /// Affine maps always fold — they rewrite to plain index arithmetic.
+    /// Maps that need delinearization (divmod address arithmetic, from a
+    /// reshape regrouping non-mergeable strides) re-derive coordinates on
+    /// every load, so they only fold where each element is loaded once; a
+    /// load re-read across unindexed dims (a contraction operand) keeps the
+    /// view node and materializes through the gather fallback instead.
     pub(super) fn try_fold_view_inputs(
         &mut self,
         graph: &mut ComputeGraphInner,
@@ -39,11 +43,17 @@ impl Resolver {
             let ExecutionVariant::View(view) = &self.execution_graph[input_exec].variant else {
                 continue;
             };
-            let Some(affine) = affine_dim_indices(&view.layout, &view.input_shape) else {
+            let needs_delinearize = view.stages.iter().any(|stage| {
+                crate::view::affine_dim_indices(&stage.layout, &stage.input_shape).is_none()
+            });
+            if needs_delinearize && input_reread_factor(&expression, &nary.shape, slot) > 1 {
+                continue;
+            }
+            let view = view.clone();
+            let Some(rewritten) = Self::rewrite_view_input(&expression, slot, &view) else {
                 continue;
             };
-            let view = view.clone();
-            expression = Self::rewrite_view_input(&expression, slot, &view, &affine);
+            expression = rewritten;
             inputs[slot] = view.input;
             folded.push((input_exec, view.input));
         }
@@ -80,89 +90,93 @@ impl Resolver {
         true
     }
 
-    /// Rewrite every access to input `target_idx` through `view`'s coordinate
-    /// mapping. The original index expressions (the view's output
-    /// coordinates) feed the affine per-base-dimension indices; partially
-    /// defined views wrap the load in `select(in_bounds, load, fill)` with
-    /// the load coordinates clamped in-bounds (both select branches
-    /// evaluate).
+    /// Rewrite every access to input `target_idx` through `view`'s
+    /// coordinate map: the original index expressions (the view's output
+    /// coordinates) walk down the stage stack to base coordinates, with
+    /// fill selects and in-bounds clamps where stages are partially defined
+    /// (both select branches evaluate).
     fn rewrite_view_input(
         expr: &NaryExpr,
         target_idx: usize,
         view: &ViewOperation,
-        affine: &[AffineIndex],
-    ) -> NaryExpr {
-        match expr {
+    ) -> Option<NaryExpr> {
+        Some(match expr {
             NaryExpr::Op { children, function } => NaryExpr::Op {
                 children: children
                     .iter()
-                    .map(|child| Self::rewrite_view_input(child, target_idx, view, affine))
-                    .collect(),
+                    .map(|child| Self::rewrite_view_input(child, target_idx, view))
+                    .collect::<Option<Vec<_>>>()?,
                 function: function.clone(),
             },
             NaryExpr::IndexedInput { input_idx, indices } => {
                 let indices: Vec<NaryExpr> = indices
                     .iter()
-                    .map(|index| Self::rewrite_view_input(index, target_idx, view, affine))
-                    .collect();
+                    .map(|index| Self::rewrite_view_input(index, target_idx, view))
+                    .collect::<Option<Vec<_>>>()?;
                 if *input_idx != target_idx {
-                    return NaryExpr::IndexedInput {
+                    NaryExpr::IndexedInput {
                         input_idx: *input_idx,
                         indices,
-                    };
-                }
-
-                let fully_defined = view.is_fully_defined();
-                let base_indices = affine
-                    .iter()
-                    .zip(&*view.input_shape)
-                    .map(|(index, &extent)| {
-                        let index = index.to_expr(&indices);
-                        if fully_defined || extent == 0 {
-                            index
-                        } else {
-                            NaryExpr::unary_op(
-                                index,
-                                "clamp_dim",
-                                NaryOp::MinConst(NaryScalar::U32(extent as u32 - 1)),
-                                DataTypeEnum::U32,
-                                DataTypeEnum::U32,
-                            )
-                        }
-                    })
-                    .collect();
-                let loaded = NaryExpr::IndexedInput {
-                    input_idx: *input_idx,
-                    indices: base_indices,
-                };
-                if fully_defined {
-                    return loaded;
-                }
-
-                let mut condition = NaryExpr::scalar(NaryScalar::U32(1));
-                for (dim, (&defined, &size)) in view.defined.iter().zip(view.shape()).enumerate() {
-                    if defined >= size {
-                        continue;
                     }
-                    let lt_defined = NaryExpr::unary_op(
-                        indices[dim].clone(),
-                        "lt_defined",
-                        NaryOp::LessConst(NaryScalar::U32(defined as u32)),
-                        DataTypeEnum::U32,
-                        DataTypeEnum::U32,
-                    );
-                    condition = NaryExpr::mul(condition, lt_defined, DataTypeEnum::U32);
+                } else {
+                    view.value_expression(*input_idx, &indices)?.0
                 }
-                NaryExpr::select(
-                    condition,
-                    loaded,
-                    NaryExpr::scalar(view.fill),
-                    DataTypeEnum::U32,
-                    view.datatype,
-                )
             }
             NaryExpr::DimIndex(dim) => NaryExpr::DimIndex(*dim),
             NaryExpr::Scalar(value) => NaryExpr::Scalar(*value),
+        })
+    }
+}
+
+/// The worst re-read factor across this slot's loads: the product of
+/// index-space dims a load's coordinates never reference — each such dim
+/// re-reads the same element once per step.
+fn input_reread_factor(expr: &NaryExpr, shape: &[usize], slot: usize) -> usize {
+    fn collect_dims(expr: &NaryExpr, referenced: &mut [bool]) {
+        match expr {
+            NaryExpr::Op { children, .. } => {
+                for child in children {
+                    collect_dims(child, referenced);
+                }
+            }
+            NaryExpr::IndexedInput { indices, .. } => {
+                for index in indices {
+                    collect_dims(index, referenced);
+                }
+            }
+            NaryExpr::DimIndex(dim) => referenced[*dim] = true,
+            NaryExpr::Scalar(_) => {}
         }
     }
+    fn visit_loads(expr: &NaryExpr, shape: &[usize], slot: usize, worst: &mut usize) {
+        match expr {
+            NaryExpr::Op { children, .. } => {
+                for child in children {
+                    visit_loads(child, shape, slot, worst);
+                }
+            }
+            NaryExpr::IndexedInput { input_idx, indices } => {
+                for index in indices {
+                    visit_loads(index, shape, slot, worst);
+                }
+                if *input_idx == slot {
+                    let mut referenced = vec![false; shape.len()];
+                    for index in indices {
+                        collect_dims(index, &mut referenced);
+                    }
+                    let factor: usize = shape
+                        .iter()
+                        .zip(&referenced)
+                        .filter(|(_, referenced)| !**referenced)
+                        .map(|(size, _)| *size)
+                        .product();
+                    *worst = (*worst).max(factor);
+                }
+            }
+            NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => {}
+        }
+    }
+    let mut worst = 1;
+    visit_loads(expr, shape, slot, &mut worst);
+    worst
 }

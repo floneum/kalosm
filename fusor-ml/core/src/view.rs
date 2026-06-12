@@ -15,47 +15,29 @@ use crate::{
 
 const BLOCKSIZE: u32 = 256;
 
-/// A zero-dispatch view of a node's logical value space.
+/// One stage of a view: a quasi-affine relayout of the space below it.
 ///
-/// `layout` maps output coordinates to flat indices in the input's logical
-/// row-major value space (`flat = offset + Σ coord_i * strides[i]`). Because
-/// it indexes the *logical* space — not a concrete buffer — every producer's
-/// output is contiguous by definition, so restride, transpose, broadcast,
-/// slice, reshape, and resize are all plain stride arithmetic here.
-///
-/// `defined` is a prefix box of `layout.shape()`: coordinates with
-/// `coord_i < defined[i]` for every axis read input data; anything outside
-/// reads `fill`. A fully-defined view (`defined == shape`) is a pure
-/// relayout; a partially-defined view is a clip + pad (resize).
+/// `layout` maps the stage's output coordinates to flat indices in the
+/// row-major space of `input_shape` (the stage below, or the input node's
+/// logical value space). `defined` is a prefix box of `layout.shape()`:
+/// coordinates with `coord_i < defined[i]` for every axis read data;
+/// anything outside reads `fill`.
 #[derive(Clone, Debug)]
-pub(crate) struct ViewOperation {
-    pub(crate) input: NodeIndex,
+pub(crate) struct ViewStage {
     pub(crate) layout: Layout,
-    /// Logical shape of the input node's value space — the space `layout`
-    /// indexes into. Used to recover per-dimension input coordinates when the
-    /// view cannot stay a flat index (gather fallback) and to bounds-check.
     pub(crate) input_shape: Box<[usize]>,
     pub(crate) defined: Box<[usize]>,
     pub(crate) fill: NaryScalar,
-    pub(crate) datatype: DataTypeEnum,
 }
 
-impl ViewOperation {
-    /// A fully-defined view: pure relayout of the input's logical space.
-    pub(crate) fn fully_defined(
-        input: NodeIndex,
-        layout: Layout,
-        input_shape: impl Into<Box<[usize]>>,
-        datatype: DataTypeEnum,
-    ) -> Self {
+impl ViewStage {
+    pub(crate) fn fully_defined(layout: Layout, input_shape: impl Into<Box<[usize]>>) -> Self {
         let defined = layout.shape().into();
         Self {
-            input,
             layout,
             input_shape: input_shape.into(),
             defined,
-            fill: zero_scalar(datatype),
-            datatype,
+            fill: NaryScalar::U32(0),
         }
     }
 
@@ -67,15 +49,159 @@ impl ViewOperation {
         self.layout.shape()
     }
 
+    /// Coordinate expressions of the space below, given this stage's output
+    /// coordinate expressions: the divmod-free affine per-dim form when one
+    /// exists, otherwise the flat index delinearized over `input_shape`.
+    /// Returns the coordinates and whether delinearization was needed.
+    /// Coordinates are clamped in-bounds when `clamp` is set (callers set it
+    /// for partially-defined stages, where out-of-box coordinates still
+    /// evaluate the data branch of the fill select).
+    pub(crate) fn coords_below(
+        &self,
+        out: &[NaryExpr],
+        clamp: bool,
+    ) -> Option<(Vec<NaryExpr>, bool)> {
+        let (coords, delinearized) =
+            match affine_dim_indices(&self.layout, &self.input_shape) {
+                Some(affine) => (
+                    affine.iter().map(|index| index.to_expr(out)).collect(),
+                    false,
+                ),
+                None => {
+                    let flat = flat_index_expression(&self.layout, out)?;
+                    (row_major_indices_from_flat(flat, &self.input_shape)?, true)
+                }
+            };
+        if !clamp {
+            return Some((coords, delinearized));
+        }
+        let clamped = coords
+            .into_iter()
+            .zip(&*self.input_shape)
+            .map(|(index, &extent)| {
+                if extent == 0 {
+                    index
+                } else {
+                    NaryExpr::unary_op(
+                        index,
+                        "clamp_dim",
+                        NaryOp::MinConst(NaryScalar::U32(extent as u32 - 1)),
+                        DataTypeEnum::U32,
+                        DataTypeEnum::U32,
+                    )
+                }
+            })
+            .collect();
+        Some((clamped, delinearized))
+    }
+
+    /// `Some(condition)` over this stage's output coordinate expressions when
+    /// partially defined; `None` for a pure relayout.
+    pub(crate) fn bounds_condition(&self, out: &[NaryExpr]) -> Option<NaryExpr> {
+        if self.is_fully_defined() {
+            return None;
+        }
+        let mut condition = NaryExpr::scalar(NaryScalar::U32(1));
+        for (dim, (&defined, &size)) in self.defined.iter().zip(self.layout.shape()).enumerate() {
+            if defined >= size {
+                continue;
+            }
+            let lt_defined = NaryExpr::unary_op(
+                out[dim].clone(),
+                "lt_defined",
+                NaryOp::LessConst(NaryScalar::U32(defined as u32)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            );
+            condition = NaryExpr::mul(condition, lt_defined, DataTypeEnum::U32);
+        }
+        Some(condition)
+    }
+}
+
+/// A zero-dispatch view of a node's logical value space, as a stack of
+/// quasi-affine stages.
+///
+/// `stages[0]` indexes the input node's logical row-major value space;
+/// each later stage indexes the output space of the stage below it. Most
+/// relayouts merge into the top stage at construction; a stage boundary
+/// remains only where the composition is not expressible as one strided
+/// layout (a reshape regrouping elements across non-mergeable strides) or
+/// where a fill region intervenes. The compiler chooses how a consumer
+/// concretizes the map: a zero-cost buffer view when the stack collapses
+/// over the buffer's layout, index expressions folded into the consumer's
+/// loads, or a gather dispatch materializing the result.
+///
+/// `input` is never itself a view node: view-over-view always collapses
+/// into one node at construction.
+#[derive(Clone, Debug)]
+pub(crate) struct ViewOperation {
+    pub(crate) input: NodeIndex,
+    /// Innermost first; never empty.
+    pub(crate) stages: Vec<ViewStage>,
+    pub(crate) datatype: DataTypeEnum,
+}
+
+impl ViewOperation {
+    /// A fully-defined single-stage view: pure relayout of the input's
+    /// logical space.
+    pub(crate) fn fully_defined(
+        input: NodeIndex,
+        layout: Layout,
+        input_shape: impl Into<Box<[usize]>>,
+        datatype: DataTypeEnum,
+    ) -> Self {
+        Self {
+            input,
+            stages: vec![ViewStage::fully_defined(layout, input_shape)],
+            datatype,
+        }
+    }
+
+    pub(crate) fn is_fully_defined(&self) -> bool {
+        self.stages.iter().all(ViewStage::is_fully_defined)
+    }
+
+    pub(crate) fn shape(&self) -> &[usize] {
+        self.stages.last().expect("views have stages").shape()
+    }
+
+    /// The single stage, when this view is one relayout deep. Pattern
+    /// matchers that need a specific affine layout use this and bail on
+    /// staged views.
+    pub(crate) fn plain(&self) -> Option<&ViewStage> {
+        match self.stages.as_slice() {
+            [stage] => Some(stage),
+            _ => None,
+        }
+    }
+
+    /// Collapse the stack into one strided layout over the input's logical
+    /// space, when every stage is fully defined and the compositions hold.
+    pub(crate) fn composed_layout(&self) -> Option<Layout> {
+        if !self.is_fully_defined() {
+            return None;
+        }
+        let mut stages = self.stages.iter();
+        let mut layout = stages.next()?.layout.clone();
+        for stage in stages {
+            layout = compose_layouts(&stage.layout, &layout)?;
+        }
+        Some(layout)
+    }
+
     /// Resolve as a zero-cost view over the input's concrete buffer, if the
-    /// view's logical layout composes with the buffer's layout as a single
-    /// strided layout. Partially-defined views never qualify — their fill
-    /// region has no backing memory.
+    /// stack composes with the buffer's layout as a single strided layout.
+    /// Partially-defined views never qualify — their fill region has no
+    /// backing memory.
     pub(crate) fn try_map_tensor(&self, input: &TensorData) -> Option<TensorData> {
         if !self.is_fully_defined() {
             return None;
         }
-        let composed = compose_layouts(&self.layout, input.layout())?;
+        let mut composed = input.layout().clone();
+        for stage in &self.stages {
+            composed = compose_layouts(&stage.layout, &composed)?;
+        }
         Some(TensorData::new_from_parts(
             input.device(),
             input.buffer().clone(),
@@ -84,73 +210,80 @@ impl ViewOperation {
         ))
     }
 
-    /// The gather expression materializing this view: per output coordinate,
-    /// load the input at the mapped logical coordinates, or `fill` outside
-    /// the defined box.
-    fn copy_expression(&self) -> Option<NaryExpr> {
-        let flat = self.flat_logical_expression()?;
-        let indices = row_major_indices_from_flat(flat, &self.input_shape)?;
-        let copied = NaryExpr::indexed_input(0, indices);
-        if self.is_fully_defined() {
-            return Some(copied);
-        }
-        Some(NaryExpr::select(
-            self.in_defined_bounds_expression(),
-            copied,
-            NaryExpr::scalar(self.fill),
-            DataTypeEnum::U32,
-            self.datatype,
-        ))
-    }
-
-    /// `offset + Σ DimIndex(d) * strides[d]` as a u32 expression.
-    fn flat_logical_expression(&self) -> Option<NaryExpr> {
-        let mut flat = NaryExpr::scalar(NaryScalar::U32(self.layout.offset().try_into().ok()?));
-        for (axis, (&stride, &dim)) in self
-            .layout
-            .strides()
-            .iter()
-            .zip(self.layout.shape())
-            .enumerate()
-        {
-            if stride == 0 || dim == 1 {
-                continue;
+    /// The value of this view at the given output coordinate expressions, as
+    /// a load of input `input_slot` walked through every stage (with fill
+    /// selects where stages are partially defined). Returns the expression
+    /// and whether any stage needed delinearization (divmod address
+    /// arithmetic) — the signal consumers use to decide whether folding this
+    /// view into their loads beats materializing it.
+    pub(crate) fn value_expression(
+        &self,
+        input_slot: usize,
+        out: &[NaryExpr],
+    ) -> Option<(NaryExpr, bool)> {
+        let mut coords: Vec<NaryExpr> = out.to_vec();
+        // (condition, fill) per partially-defined stage, outermost first.
+        let mut fills: Vec<(NaryExpr, NaryScalar)> = Vec::new();
+        let mut delinearized = false;
+        for stage in self.stages.iter().rev() {
+            if let Some(condition) = stage.bounds_condition(&coords) {
+                fills.push((condition, stage.fill));
             }
-            let stride: u32 = stride.try_into().ok()?;
-            let dim_index = NaryExpr::DimIndex(axis);
-            let term = if stride == 1 {
-                dim_index
-            } else {
-                NaryExpr::unary_op(
-                    dim_index,
-                    "mul_const",
-                    NaryOp::MulConst(NaryScalar::U32(stride)),
-                    DataTypeEnum::U32,
-                    DataTypeEnum::U32,
-                )
-            };
-            flat = NaryExpr::add(flat, term, DataTypeEnum::U32);
+            let (below, stage_delinearized) =
+                stage.coords_below(&coords, !stage.is_fully_defined())?;
+            delinearized |= stage_delinearized;
+            coords = below;
         }
-        Some(flat)
-    }
-
-    fn in_defined_bounds_expression(&self) -> NaryExpr {
-        let mut condition = NaryExpr::scalar(NaryScalar::U32(1));
-        for (dim, (&defined, &size)) in self.defined.iter().zip(self.layout.shape()).enumerate() {
-            if defined >= size {
-                continue;
-            }
-            let lt_defined = NaryExpr::unary_op(
-                NaryExpr::DimIndex(dim),
-                "lt_defined",
-                NaryOp::LessConst(NaryScalar::U32(defined as u32)),
+        let mut value = NaryExpr::IndexedInput {
+            input_idx: input_slot,
+            indices: coords,
+        };
+        // Innermost select wraps first so each stage's fill masks everything
+        // below it.
+        for (condition, fill) in fills.into_iter().rev() {
+            value = NaryExpr::select(
+                condition,
+                value,
+                NaryExpr::scalar(fill),
                 DataTypeEnum::U32,
-                DataTypeEnum::U32,
+                self.datatype,
             );
-            condition = NaryExpr::mul(condition, lt_defined, DataTypeEnum::U32);
         }
-        condition
+        Some((value, delinearized))
     }
+
+    /// The gather expression materializing this view: per output coordinate,
+    /// load the input at the mapped coordinates, or fill outside the defined
+    /// boxes.
+    fn copy_expression(&self) -> Option<NaryExpr> {
+        let out: Vec<NaryExpr> = (0..self.shape().len()).map(NaryExpr::DimIndex).collect();
+        Some(self.value_expression(0, &out)?.0)
+    }
+}
+
+/// `offset + Σ coords[d] * strides[d]` as a u32 expression.
+fn flat_index_expression(layout: &Layout, coords: &[NaryExpr]) -> Option<NaryExpr> {
+    let mut flat = NaryExpr::scalar(NaryScalar::U32(layout.offset().try_into().ok()?));
+    for (axis, (&stride, &dim)) in layout.strides().iter().zip(layout.shape()).enumerate() {
+        if stride == 0 || dim == 1 {
+            continue;
+        }
+        let stride: u32 = stride.try_into().ok()?;
+        let coord = coords[axis].clone();
+        let term = if stride == 1 {
+            coord
+        } else {
+            NaryExpr::unary_op(
+                coord,
+                "mul_const",
+                NaryOp::MulConst(NaryScalar::U32(stride)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            )
+        };
+        flat = NaryExpr::add(flat, term, DataTypeEnum::U32);
+    }
+    Some(flat)
 }
 
 pub(crate) fn zero_scalar(datatype: DataTypeEnum) -> NaryScalar {
@@ -403,12 +536,15 @@ pub(crate) fn row_major_indices_from_flat(
 
 impl Operation for ViewOperation {
     fn hash_kernel_fields(&self, state: &mut rustc_hash::FxHasher) {
-        self.layout.offset().hash(state);
-        self.layout.shape().hash(state);
-        self.layout.strides().hash(state);
-        self.input_shape.hash(state);
-        self.defined.hash(state);
-        self.fill.hash(state);
+        self.stages.len().hash(state);
+        for stage in &self.stages {
+            stage.layout.offset().hash(state);
+            stage.layout.shape().hash(state);
+            stage.layout.strides().hash(state);
+            stage.input_shape.hash(state);
+            stage.defined.hash(state);
+            stage.fill.hash(state);
+        }
     }
 
     fn workgroup_shape_constraints(&self, _: &crate::Device) -> WorkgroupShapeConstraints {
@@ -438,8 +574,7 @@ impl Operation for ViewOperation {
 
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
         let input = nodes.get_cached_result(self.input).unwrap().clone();
-        let output =
-            TensorData::new_for_shape(input.device(), self.layout.shape(), input.datatype());
+        let output = TensorData::new_for_shape(input.device(), self.shape(), input.datatype());
         vec![input.into(), output.into()]
     }
 
@@ -456,7 +591,7 @@ impl Operation for ViewOperation {
         let operation = ElementwiseOperation {
             inputs: vec![self.input],
             expression: self.copy_expression()?,
-            shape: self.layout.shape().into(),
+            shape: self.shape().into(),
             output_datatype: self.datatype,
         };
         crate::nary_direct::build_nary_direct_kernel_to_output(
@@ -471,8 +606,7 @@ impl Operation for ViewOperation {
     fn name(&self) -> String {
         format!(
             "view_{}",
-            self.layout
-                .shape()
+            self.shape()
                 .iter()
                 .map(|x| x.to_string())
                 .collect::<Vec<_>>()
@@ -482,35 +616,80 @@ impl Operation for ViewOperation {
 }
 
 impl Tensor {
-    /// The view spec to layer a new view on top of this tensor: composes with
-    /// an existing fully-defined view (so chains collapse at construction) or
-    /// starts from this tensor's logical space.
-    fn view_base(&self) -> (NodeIndex, Layout, Box<[usize]>) {
-        if let Some(view) = self.device().compute_graph().get_view(self.key())
-            && view.is_fully_defined()
-        {
-            return (view.input, view.layout.clone(), view.input_shape.clone());
+    /// The stage stack to extend when layering a new view on this tensor:
+    /// the existing view's parts when this tensor is an unresolved view, or
+    /// an empty stack over this tensor's own logical space.
+    fn view_parts(&self) -> (NodeIndex, Vec<ViewStage>) {
+        match self.device().compute_graph().get_view(self.key()) {
+            Some(view) => (view.input, view.stages),
+            None => (self.key(), Vec::new()),
         }
-        (
-            self.key(),
-            Layout::contiguous(self.shape()),
-            self.shape().into(),
-        )
     }
 
     fn add_view_op(&self, op: ViewOperation) -> Tensor {
         Tensor::from_parts(self.data.view(op))
     }
 
+    /// Layer `stage` — a relayout of this tensor's current output space —
+    /// onto the stack: merged into the top stage when the composition stays
+    /// one strided layout over a pure relayout, pushed as a new stage
+    /// otherwise. Either way the result is a single view node over the
+    /// non-view base.
+    fn add_view_stage(&self, stage: ViewStage) -> Tensor {
+        let (input, mut stages) = self.view_parts();
+        let stage = match stages.last_mut() {
+            Some(top) if top.is_fully_defined() => {
+                match compose_layouts(&stage.layout, &top.layout) {
+                    Some(composed) => {
+                        top.layout = composed;
+                        top.defined = stage.defined;
+                        top.fill = stage.fill;
+                        None
+                    }
+                    None => Some(stage),
+                }
+            }
+            _ => Some(stage),
+        };
+        if let Some(stage) = stage {
+            stages.push(stage);
+        }
+        self.add_view_op(ViewOperation {
+            input,
+            stages,
+            datatype: self.datatype(),
+        })
+    }
+
     pub fn restride(&self, specs: impl Into<Box<[crate::StrideSpec]>>) -> Tensor {
         let specs = specs.into();
-        let (input, base, input_shape) = self.view_base();
-        self.add_view_op(ViewOperation::fully_defined(
+        let (input, mut stages) = self.view_parts();
+        match stages.last_mut() {
+            // Restride is direct stride arithmetic on the top stage — the
+            // composition is infallible, no merge check needed.
+            Some(top) if top.is_fully_defined() => {
+                top.layout = top.layout.restride(&specs);
+                top.defined = top.layout.shape().into();
+            }
+            Some(top) => {
+                let below: Box<[usize]> = top.shape().into();
+                stages.push(ViewStage::fully_defined(
+                    Layout::contiguous(&below).restride(&specs),
+                    below,
+                ));
+            }
+            None => {
+                stages.push(ViewStage::fully_defined(
+                    Layout::contiguous(self.shape()).restride(&specs),
+                    self.shape(),
+                ));
+            }
+        }
+        self.add_view_op(ViewOperation {
             input,
-            base.restride(&specs),
-            input_shape,
-            self.datatype(),
-        ))
+            stages,
+            datatype: self.datatype(),
+        })
     }
 
     /// Replace the tensor's layout with `new_layout` over its logical value
@@ -531,18 +710,7 @@ impl Tensor {
             "restride_layout out of bounds: layout reaches element {max_index} \
              but the input has only {numel} elements"
         );
-        let (input, base, input_shape) = self.view_base();
-        let layout = compose_layouts(&new_layout, &base).unwrap_or_else(|| {
-            panic!(
-                "restride_layout could not compose {new_layout:?} with the existing view {base:?}"
-            )
-        });
-        self.add_view_op(ViewOperation::fully_defined(
-            input,
-            layout,
-            input_shape,
-            self.datatype(),
-        ))
+        self.add_view_stage(ViewStage::fully_defined(new_layout, self.shape()))
     }
 
     pub fn broadcast_as(&self, out_shape: impl AsRef<[usize]>) -> Tensor {
@@ -613,20 +781,11 @@ impl Tensor {
             self.shape(),
             new_shape
         );
+        // When the reshape regroups elements across non-mergeable strides
+        // the reinterpret stays its own stage; otherwise it merges into the
+        // top stage.
         let reinterpret = Layout::contiguous(new_shape);
-        let (input, base, input_shape) = self.view_base();
-        let op = match compose_layouts(&reinterpret, &base) {
-            Some(layout) => {
-                ViewOperation::fully_defined(input, layout, input_shape, self.datatype())
-            }
-            // The reshape regroups elements across the view's non-contiguous
-            // strides: keep it as a flat reinterpret of this tensor's own
-            // logical space (a chained view).
-            None => {
-                ViewOperation::fully_defined(self.key(), reinterpret, self.shape(), self.datatype())
-            }
-        };
-        self.add_view_op(op)
+        self.add_view_stage(ViewStage::fully_defined(reinterpret, self.shape()))
     }
 
     /// Resize to `new_shape`, clipping or zero-padding each axis: coordinates
@@ -649,26 +808,12 @@ impl Tensor {
         // Within the defined box the old row-major strides address the input
         // exactly; outside it the load is masked to `fill`.
         let resize = Layout::from_parts(0, new_shape.into(), Layout::continuous_strides(old_shape));
-        let (input, base, input_shape) = self.view_base();
-        let op = match compose_layouts(&resize, &base) {
-            Some(layout) => ViewOperation {
-                input,
-                layout,
-                input_shape,
-                defined,
-                fill: zero_scalar(self.datatype()),
-                datatype: self.datatype(),
-            },
-            None => ViewOperation {
-                input: self.key(),
-                layout: resize,
-                input_shape: old_shape.into(),
-                defined,
-                fill: zero_scalar(self.datatype()),
-                datatype: self.datatype(),
-            },
-        };
-        self.add_view_op(op)
+        self.add_view_stage(ViewStage {
+            layout: resize,
+            input_shape: old_shape.into(),
+            defined,
+            fill: zero_scalar(self.datatype()),
+        })
     }
 
     pub fn flatten_last_n(&self, from_end: usize) -> Tensor {

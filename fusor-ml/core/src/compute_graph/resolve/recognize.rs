@@ -289,10 +289,11 @@ impl Resolver {
     /// Read a recognized matmul's A operand through its un-flattened
     /// producer. Conv's im2col flatten regroups a windowed view's dims
     /// across overlapping strides, which no single strided layout can
-    /// express: the reshape becomes a chained view that would materialize
+    /// express: the view keeps a stage boundary and would materialize
     /// through the gather fallback. When the flat `[M, K]` operand is
-    /// exactly such a reinterpret, point the matmul at the producer and let
-    /// the kernels divmod the flat coordinates back apart per load — an
+    /// exactly such a reinterpret over an affine stage, point the matmul at
+    /// the producer, carry the affine stage as the operand's base map, and
+    /// let the kernels divmod the flat coordinates back apart per load — an
     /// implicit GEMM with no gather dispatch.
     fn try_unflatten_matmul_input(
         &mut self,
@@ -323,46 +324,60 @@ impl Resolver {
         let ComputeGraphNodeVariant::View(view) = &node.variant else {
             return;
         };
-        if !view.is_fully_defined()
-            || !view.layout.is_contiguous()
-            || view.layout.offset() != 0
-            || view.layout.shape() != [m, k]
+        // The stack must be an affine relayout under a flat [M, K]
+        // reinterpret, both pure relayouts (no fill regions).
+        let [windowed, flat] = view.stages.as_slice() else {
+            return;
+        };
+        if !windowed.is_fully_defined()
+            || !flat.is_fully_defined()
+            || !flat.layout.is_contiguous()
+            || flat.layout.offset() != 0
+            || flat.layout.shape() != [m, k]
         {
             return;
         }
-        let inner_shape = &view.input_shape;
+        // The kernels substitute the windowed map as affine per-dim index
+        // arithmetic; validate it here so the lowering can rely on it.
+        if crate::view::affine_dim_indices(&windowed.layout, &windowed.input_shape).is_none() {
+            return;
+        }
+        let operand_shape = windowed.shape();
         // The producer's dims must split cleanly into an `M` prefix and a
         // `K` suffix for the per-side flat-coordinate decomposition.
         let mut product = 1usize;
-        let mut k_start = inner_shape.len();
+        let mut k_start = operand_shape.len();
         while k_start > 0 && product < k {
             k_start -= 1;
-            let Some(next) = product.checked_mul(inner_shape[k_start]) else {
+            let Some(next) = product.checked_mul(operand_shape[k_start]) else {
                 return;
             };
             product = next;
         }
         if product != k
             || k_start == 0
-            || k_start == inner_shape.len()
-            || inner_shape[..k_start].iter().product::<usize>() != m
+            || k_start == operand_shape.len()
+            || operand_shape[..k_start].iter().product::<usize>() != m
         {
             return;
         }
-        // The kernels decompose with u32 arithmetic; validate both sides
-        // here so the lowering can rely on it.
+        // The flat row/column coordinates decompose with u32 arithmetic.
         let probe = NaryExpr::DimIndex(0);
-        if crate::view::row_major_indices_from_flat(probe.clone(), &inner_shape[..k_start])
+        if crate::view::row_major_indices_from_flat(probe.clone(), &operand_shape[..k_start])
             .is_none()
-            || crate::view::row_major_indices_from_flat(probe, &inner_shape[k_start..]).is_none()
+            || crate::view::row_major_indices_from_flat(probe, &operand_shape[k_start..]).is_none()
         {
             return;
         }
         operation.first = view.input;
         operation.a = crate::matmul::MatrixOperand {
-            shape: inner_shape.clone(),
+            shape: operand_shape.into(),
             batch_dims: 0,
             row_dims: k_start,
+            base_map: Some(crate::matmul::OperandBaseMap {
+                layout: windowed.layout.clone(),
+                base_shape: windowed.input_shape.clone(),
+            }),
         };
     }
 

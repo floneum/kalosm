@@ -358,13 +358,15 @@ impl Resolver {
                 let ExecutionVariant::View(view) = &self.execution_graph[exec].variant else {
                     break;
                 };
-                if !view.is_fully_defined() || !within.is_none_or(|allowed| allowed.contains(&node))
-                {
+                if !within.is_none_or(|allowed| allowed.contains(&node)) {
                     break 'scalar;
                 }
+                let Some(collapsed) = view.composed_layout() else {
+                    break 'scalar;
+                };
                 layout = Some(match &layout {
-                    None => view.layout.clone(),
-                    Some(outer) => match crate::view::compose_layouts(outer, &view.layout) {
+                    None => collapsed,
+                    Some(outer) => match crate::view::compose_layouts(outer, &collapsed) {
                         Some(layout) => layout,
                         None => break 'scalar,
                     },
@@ -610,12 +612,10 @@ impl Resolver {
             let ExecutionVariant::View(view) = &self.execution_graph[exec].variant else {
                 break;
             };
-            if !view.is_fully_defined() {
-                return None;
-            }
+            let collapsed = view.composed_layout()?;
             layout = Some(match &layout {
-                None => view.layout.clone(),
-                Some(outer) => crate::view::compose_layouts(outer, &view.layout)?,
+                None => collapsed,
+                Some(outer) => crate::view::compose_layouts(outer, &collapsed)?,
             });
             views.push(node);
             node = view.input;

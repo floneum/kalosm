@@ -87,18 +87,20 @@ pub fn try_batched_coop_matmul(
     } = config;
     let subgroup = subgroups.token();
     let DenseCoopMatmulTile { bm, bn, bk } = tile;
+    // Shapes need not divide the tile geometry: edge tiles fill zero past
+    // the logical extents, and the caller provides `y` with its rows padded
+    // to `ceil(m / bm) * bm` per batch and its columns to `ceil(n / bn) * bn`
+    // (the stores cover whole tiles; the pad region holds garbage the
+    // logical view never reads).
     if !subgroups.is_fixed()
         || epilogues.pre_a.is_some()
         || epilogues.pre_b.is_some()
         || epilogues.post.is_some()
-        || !shape.m.is_multiple_of(bm)
-        || !shape.n.is_multiple_of(bn)
-        || !shape.k.is_multiple_of(bk)
         || !cooperative_store_layout_supported(y.layout())
     {
         return false;
     }
-    let total_tiles = shape.batch * (shape.m / bm) * (shape.n / bn);
+    let total_tiles = shape.batch * shape.m.div_ceil(bm) * shape.n.div_ceil(bn);
     if total_tiles > max_workgroups_per_dimension {
         return false;
     }
@@ -255,6 +257,8 @@ fn coop_stage_and_mma(
     k_base: &Tile,
     sg_row_base: &Tile,
     sg_col_base_in_pass: &Tile,
+    a_bounds: &[Option<Tile>; 2],
+    b_bounds: &[Option<Tile>; 2],
     accs: &[Vec<CoopAcc>],
     tile_rows_per_sg: u32,
     tile_cols_per_sg: u32,
@@ -262,12 +266,19 @@ fn coop_stage_and_mma(
     coop_dim: u32,
     scalar: ScalarElement,
 ) {
-    program.fill_tile(a_tile, a, a_batch_base.clone() + row_base.clone(), k_base);
-    program.fill_tile(
+    program.fill_tile_bounded(
+        a_tile,
+        a,
+        a_batch_base.clone() + row_base.clone(),
+        k_base,
+        a_bounds.clone(),
+    );
+    program.fill_tile_bounded(
         b_tile,
         b,
         b_batch_base.clone() + k_base.clone(),
         pass_col_base,
+        b_bounds.clone(),
     );
     program.workgroup_barrier();
 
@@ -383,10 +394,14 @@ fn batched_coop_matmul_perf_single(
 
     let scalar = scalar_of(a.element());
 
-    let tiles_m = shape.m / bm;
-    let tiles_n = shape.n / bn;
+    let tiles_m = shape.m.div_ceil(bm);
+    let tiles_n = shape.n.div_ceil(bn);
     let total_tiles = shape.batch * tiles_m * tiles_n;
-    let k_iterations = shape.k / bk;
+    let k_iterations = shape.k.div_ceil(bk);
+    // The y rows are padded to whole tiles per batch (the caller allocates
+    // the pad region); A/B are logical and edge tiles fill zero past the
+    // extents.
+    let m_padded = tiles_m * bm;
 
     let a_tile = program.alloc_workgroup_tile_padded(scalar, bm, bk, 1);
     let b_tile = program.alloc_workgroup_tile_padded(scalar, bk, bn_pass, 1);
@@ -404,7 +419,15 @@ fn batched_coop_matmul_perf_single(
         let col_base = n_tile * bn;
         let a_batch_base = batch.clone() * shape.m;
         let b_batch_base = batch.clone() * shape.k;
-        let y_batch_base = batch * shape.m;
+        let y_batch_base = batch * m_padded;
+        let a_bounds: [Option<Tile>; 2] = [
+            (!shape.m.is_multiple_of(bm)).then(|| a_batch_base.clone() + shape.m),
+            (!shape.k.is_multiple_of(bk)).then(|| Tile::literal(TileLiteral::U32(shape.k))),
+        ];
+        let b_bounds: [Option<Tile>; 2] = [
+            (!shape.k.is_multiple_of(bk)).then(|| b_batch_base.clone() + shape.k),
+            (!shape.n.is_multiple_of(bn)).then(|| Tile::literal(TileLiteral::U32(shape.n))),
+        ];
 
         let subgroup_id = subgroup.subgroup_id(program);
         let sg_row = subgroup_id.clone() / col_groups;
@@ -443,6 +466,8 @@ fn batched_coop_matmul_perf_single(
                         &k_base,
                         &sg_row_base,
                         &sg_col_base_in_pass,
+                        &a_bounds,
+                        &b_bounds,
                         accs,
                         tile_rows_per_sg,
                         tile_cols_per_sg,
@@ -507,12 +532,16 @@ fn batched_coop_matmul_perf(
 
     let scalar = scalar_of(a.element());
 
-    let tiles_m = shape.m / bm;
-    let tiles_n = shape.n / bn;
+    let tiles_m = shape.m.div_ceil(bm);
+    let tiles_n = shape.n.div_ceil(bn);
     let total_tiles = shape.batch * tiles_m * tiles_n;
-    let k_iterations = shape.k / bk;
+    let k_iterations = shape.k.div_ceil(bk);
     let k_pairs = k_iterations / 2;
     let k_remainder = k_iterations % 2;
+    // The y rows are padded to whole tiles per batch (the caller allocates
+    // the pad region); A/B are logical and edge tiles fill zero past the
+    // extents.
+    let m_padded = tiles_m * bm;
 
     // +1 inner padding on workgroup tiles avoids Apple shared-memory bank
     // conflicts on the inner stride (matches `stride_a = block_k + 1` in
@@ -536,7 +565,15 @@ fn batched_coop_matmul_perf(
         let col_base = n_tile * bn;
         let a_batch_base = batch.clone() * shape.m;
         let b_batch_base = batch.clone() * shape.k;
-        let y_batch_base = batch * shape.m;
+        let y_batch_base = batch * m_padded;
+        let a_bounds: [Option<Tile>; 2] = [
+            (!shape.m.is_multiple_of(bm)).then(|| a_batch_base.clone() + shape.m),
+            (!shape.k.is_multiple_of(bk)).then(|| Tile::literal(TileLiteral::U32(shape.k))),
+        ];
+        let b_bounds: [Option<Tile>; 2] = [
+            (!shape.k.is_multiple_of(bk)).then(|| b_batch_base.clone() + shape.k),
+            (!shape.n.is_multiple_of(bn)).then(|| Tile::literal(TileLiteral::U32(shape.n))),
+        ];
 
         let subgroup_id = subgroup.subgroup_id(program);
         let sg_row = subgroup_id.clone() / col_groups;
@@ -584,6 +621,8 @@ fn batched_coop_matmul_perf(
                             &k_base_0,
                             &sg_row_base,
                             &sg_col_base_in_pass,
+                            &a_bounds,
+                            &b_bounds,
                             accs,
                             tile_rows_per_sg,
                             tile_cols_per_sg,
@@ -606,6 +645,8 @@ fn batched_coop_matmul_perf(
                             &k_base_1,
                             &sg_row_base,
                             &sg_col_base_in_pass,
+                            &a_bounds,
+                            &b_bounds,
                             accs,
                             tile_rows_per_sg,
                             tile_cols_per_sg,
@@ -637,6 +678,8 @@ fn batched_coop_matmul_perf(
                         &k_base_epi,
                         &sg_row_base,
                         &sg_col_base_in_pass,
+                        &a_bounds,
+                        &b_bounds,
                         accs,
                         tile_rows_per_sg,
                         tile_cols_per_sg,

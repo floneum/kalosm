@@ -183,7 +183,7 @@ impl CoopTile {
         max_subgroup_size: u32,
     ) -> Option<Self> {
         let tiles_for = |bm: u32, bn: u32| -> u32 { (m / bm) * (n / bn) };
-        if !k.is_multiple_of(16) {
+        if m == 0 || n == 0 || k == 0 {
             return None;
         }
         // Tile256x256 single-buffer has lower memory traffic (sqrt-min) but
@@ -229,6 +229,26 @@ impl CoopTile {
                 return Some(tile);
             }
         }
-        None
+
+        // Shapes that divide no tile run with masked edge tiles: pick the
+        // candidate minimizing padded work, in preference order on ties.
+        // Selections whose padding inflates the output by more than a
+        // quarter stay on the generic path — that bound also keeps
+        // gemv-shaped contractions (tiny M or N) off the tile kernels.
+        let mut best: Option<(u64, Self)> = None;
+        for (bm, bn) in [(128, 128), (128, 64), (64, 128), (64, 64)] {
+            let tile = Self::new(bm, bn, 16);
+            if !tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
+                continue;
+            }
+            let padded = u64::from(m.div_ceil(bm) * bm) * u64::from(n.div_ceil(bn) * bn);
+            if padded * 4 > u64::from(m) * u64::from(n) * 5 {
+                continue;
+            }
+            if best.is_none_or(|(best_padded, _)| padded < best_padded) {
+                best = Some((padded, tile));
+            }
+        }
+        best.map(|(_, tile)| tile)
     }
 }

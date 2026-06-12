@@ -538,12 +538,15 @@ impl Resolver {
         self.node_mapping.get(&inner_input).copied()
     }
 
-    /// Walk through fully-defined view nodes from `inner` down to the first
-    /// non-view node, composing the view layouts. Returns the base node and
-    /// the composed view layout over the base's logical value space; the
-    /// layout is `None` when `inner` is not a view (identity). Views that
-    /// don't compose (or carry a fill region) act as chain breaks: the walk
-    /// stops without seeing through them.
+    /// Walk through view nodes from `inner` down to the first non-view
+    /// node, composing each view's collapsed stage stack. Public tensor ops
+    /// collapse into single view nodes at construction, but composed
+    /// clusters (attention's attached GQA/transpose views) still layer view
+    /// nodes deliberately. Returns the base node and the composed layout
+    /// over the base's logical value space; the layout is `None` when
+    /// `inner` is not a view (identity). Views that don't collapse or
+    /// compose (or carry a fill region) act as chain breaks: the walk stops
+    /// without seeing through them.
     pub(super) fn walk_view_chain(&self, mut inner: NodeIndex) -> (NodeIndex, Option<Layout>) {
         let mut composed: Option<Layout> = None;
         loop {
@@ -553,12 +556,12 @@ impl Resolver {
             let ExecutionVariant::View(view) = &self.execution_graph[exec].variant else {
                 return (inner, composed);
             };
-            if !view.is_fully_defined() {
+            let Some(collapsed) = view.composed_layout() else {
                 return (inner, composed);
-            }
+            };
             let next = match &composed {
-                None => view.layout.clone(),
-                Some(outer) => match crate::view::compose_layouts(outer, &view.layout) {
+                None => collapsed,
+                Some(outer) => match crate::view::compose_layouts(outer, &collapsed) {
                     Some(layout) => layout,
                     None => return (inner, composed),
                 },

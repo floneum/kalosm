@@ -551,7 +551,7 @@ impl Resolver {
         let ExecutionVariant::View(view) = &self.execution_graph[exec].variant else {
             return None;
         };
-        if !view.is_fully_defined() || view.shape().len() != link.slices.len() {
+        if view.shape().len() != link.slices.len() {
             return None;
         }
         for (extent, slice) in view.shape().iter().zip(&*link.slices) {
@@ -559,10 +559,12 @@ impl Resolver {
                 return None;
             }
         }
-        let affine = affine_dim_indices(&view.layout, &view.input_shape)?;
+        let base_shape = &view.stages[0].input_shape;
+        let collapsed = view.composed_layout()?;
+        let affine = affine_dim_indices(&collapsed, base_shape)?;
 
         let mut shifted = Vec::with_capacity(affine.len());
-        for (index, &extent) in affine.iter().zip(&*view.input_shape) {
+        for (index, &extent) in affine.iter().zip(&**base_shape) {
             let mut constant = index.constant as i64;
             let mut max_offset = 0i64;
             for &(dim, coefficient) in &index.terms {

@@ -213,18 +213,20 @@ impl Resolver {
                 let Some(view) = self.inner_view(mask_side) else {
                     continue;
                 };
+                let Some(stage) = view.plain().filter(|stage| stage.is_fully_defined()) else {
+                    continue;
+                };
                 let expected =
                     Layout::from_parts(0, shape.clone().into(), [0, 0, kv_seq_len, 1].into());
-                if !view.is_fully_defined()
-                    || !layout_matches(Some(&view.layout), &expected)
-                    || view.input_shape.as_ref() != [q_seq_len, kv_seq_len]
+                if !layout_matches(Some(&stage.layout), &expected)
+                    || stage.input_shape.as_ref() != [q_seq_len, kv_seq_len]
                 {
                     continue;
                 }
                 if !self.exclusively_consumed(graph, mask_side, 1) {
                     continue;
                 }
-                matched_mask = Some((scaled_side, view.input, view.input_shape.to_vec()));
+                matched_mask = Some((scaled_side, view.input, stage.input_shape.to_vec()));
                 break;
             }
             let (scaled_side, mask_base, base_shape) = matched_mask?;
@@ -277,10 +279,10 @@ impl Resolver {
 
         // kᵀ: a transpose view attached to the (possibly GQA-expanded) k.
         let kt = self.inner_view(kt_inner)?;
+        let kt_stage = kt.plain().filter(|stage| stage.is_fully_defined())?;
         let expected_kt = Layout::contiguous(&expanded_shape).transpose(2, 3);
-        if !kt.is_fully_defined()
-            || !layout_matches(Some(&kt.layout), &expected_kt)
-            || kt.input_shape.as_ref() != expanded_shape
+        if !layout_matches(Some(&kt_stage.layout), &expected_kt)
+            || kt_stage.input_shape.as_ref() != expanded_shape
             || !self.exclusively_consumed(graph, kt_inner, 1)
         {
             return None;
@@ -328,12 +330,17 @@ impl Resolver {
         let [batch, num_heads, kv_seq_len, head_dim] = *expanded_shape;
         let unexpanded = Some((inner, expanded_shape.to_vec()));
 
-        let Some(reinterpret) = self.inner_view(inner) else {
+        let Some(reinterpret_view) = self.inner_view(inner) else {
+            return unexpanded;
+        };
+        let Some(reinterpret) = reinterpret_view
+            .plain()
+            .filter(|stage| stage.is_fully_defined())
+        else {
             return unexpanded;
         };
         // The flat reinterpret: contiguous rank-4 over a rank-5 grouped space.
-        if !reinterpret.is_fully_defined()
-            || reinterpret.input_shape.len() != 5
+        if reinterpret.input_shape.len() != 5
             || !layout_matches(
                 Some(&reinterpret.layout),
                 &Layout::contiguous(expanded_shape),
@@ -352,7 +359,13 @@ impl Resolver {
         {
             return unexpanded;
         }
-        let Some(broadcast) = self.inner_view(reinterpret.input) else {
+        let Some(broadcast_view) = self.inner_view(reinterpret_view.input) else {
+            return unexpanded;
+        };
+        let Some(broadcast) = broadcast_view
+            .plain()
+            .filter(|stage| stage.is_fully_defined())
+        else {
             return unexpanded;
         };
         let expected_broadcast = Layout::from_parts(
@@ -360,14 +373,13 @@ impl Resolver {
             [b, num_kv_heads, groups, s, d].into(),
             [num_kv_heads * s * d, s * d, 0, d, 1].into(),
         );
-        if !broadcast.is_fully_defined()
-            || !layout_matches(Some(&broadcast.layout), &expected_broadcast)
+        if !layout_matches(Some(&broadcast.layout), &expected_broadcast)
             || broadcast.input_shape.as_ref() != [b, num_kv_heads, s, d]
             || !self.exclusively_consumed(graph, inner, 1)
-            || !self.exclusively_consumed(graph, reinterpret.input, 1)
+            || !self.exclusively_consumed(graph, reinterpret_view.input, 1)
         {
             return unexpanded;
         }
-        Some((broadcast.input, vec![b, num_kv_heads, s, d]))
+        Some((broadcast_view.input, vec![b, num_kv_heads, s, d]))
     }
 }

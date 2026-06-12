@@ -117,9 +117,12 @@ impl Analysis {
                 self.visit_expr(index);
                 self.visit_expr(value);
             }
-            Stmt::FillTile { dst, value } => {
+            Stmt::FillTile { dst, value, bounds } => {
                 self.note_tile(dst);
                 self.visit_expr(value);
+                for bound in bounds.iter().flatten() {
+                    self.visit_expr(bound);
+                }
             }
             Stmt::CoopStore { acc, dst, addr } => {
                 self.caps.uses_coop = true;

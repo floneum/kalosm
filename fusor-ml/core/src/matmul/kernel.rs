@@ -11,8 +11,7 @@ use crate::{
         kernel_backend::{self, DirectKernel},
         operation::Operation,
         tile_direct::{
-            flatten_matrix_layout, flatten_matrix_layout_split,
-            tile_storage_read_with_direct_layout_typed,
+            flatten_matrix_layout_split, tile_storage_read_with_direct_layout_typed,
             tile_storage_write_with_direct_layout_typed,
         },
     },
@@ -189,63 +188,75 @@ impl MatMulOperation {
     /// generic reduce re-derives it for every load and loses to a one-time
     /// gather.
     pub(crate) fn hardware_matmul_statically_viable(&self, device: &Device) -> bool {
+        self.coop_tile(device).is_some()
+    }
+
+    /// The tile geometry the cooperative-matrix kernel would run with on
+    /// this device, `None` when any static gate fails and the contraction is
+    /// bound for the generic path. Shapes need not divide the tile: edge
+    /// tiles mask their fills and the output allocation pads to whole tiles.
+    pub(crate) fn coop_tile(&self, device: &Device) -> Option<CoopTile> {
         if !self.can_use_hardware_matmul()
             || (self.datatype == DataTypeEnum::F16 && !device.f16_supported())
             || !self.pre_element_wise[0].functions.is_empty()
             || !self.pre_element_wise[1].functions.is_empty()
             || !self.post_element_wise.functions.is_empty()
         {
-            return false;
+            return None;
         }
         let MatMulParams::CoopMatMul(params) = &self.parameters else {
-            return false;
+            return None;
         };
-        if device.coop_token(params.kind()).is_none()
-            || !device
-                .subgroup_config()
-                .is_some_and(|config| config.is_fixed())
-        {
-            return false;
+        device.coop_token(params.kind())?;
+        let subgroup_config = device.subgroup_config()?;
+        if !subgroup_config.is_fixed() {
+            return None;
         }
-        let (Ok(m), Ok(k), Ok(n)): (Result<u32, _>, Result<u32, _>, Result<u32, _>) = (
-            self.a.rows().try_into(),
-            self.a.cols().try_into(),
-            self.b.cols().try_into(),
-        ) else {
-            return false;
-        };
-        let Some(batch) = self
+        let (m, k, n): (u32, u32, u32) = (
+            self.a.rows().try_into().ok()?,
+            self.a.cols().try_into().ok()?,
+            self.b.cols().try_into().ok()?,
+        );
+        let batch = self
             .a
             .batch_shape()
             .iter()
-            .try_fold(1u32, |acc, &dim| acc.checked_mul(u32::try_from(dim).ok()?))
-        else {
-            return false;
-        };
+            .try_fold(1u32, |acc, &dim| acc.checked_mul(u32::try_from(dim).ok()?))?;
         let limits = device.limits();
-        let Some(tile) = CoopTile::select(
+        let tile = CoopTile::select(
             m,
             k,
             n,
             limits
                 .max_compute_workgroup_size_x
                 .min(limits.max_compute_invocations_per_workgroup),
-            device
-                .subgroup_config()
-                .expect("checked above")
-                .max_size(),
-        ) else {
-            return false;
-        };
-        // `CoopTile::select` guarantees the divisibility the kernel needs;
-        // only the dispatch-grid bound remains.
-        let Some(total_tiles) = (m / tile.bm)
-            .checked_mul(n / tile.bn)
-            .and_then(|tiles| tiles.checked_mul(batch))
-        else {
-            return false;
-        };
-        total_tiles <= limits.max_compute_workgroups_per_dimension
+            subgroup_config.max_size(),
+        )?;
+        let total_tiles = m
+            .div_ceil(tile.bm)
+            .checked_mul(n.div_ceil(tile.bn))
+            .and_then(|tiles| tiles.checked_mul(batch))?;
+        (total_tiles <= limits.max_compute_workgroups_per_dimension).then_some(tile)
+    }
+
+    /// Row-major strides of the logical output over its padded backing:
+    /// rows step `n_padded`, each batch block spans `m_padded * n_padded`.
+    fn padded_out_strides(
+        out_shape: &[usize],
+        m_padded: usize,
+        n_padded: usize,
+    ) -> Box<[usize]> {
+        let rank = out_shape.len();
+        let mut strides = vec![0usize; rank];
+        strides[rank - 1] = 1;
+        strides[rank - 2] = n_padded;
+        if rank >= 3 {
+            strides[rank - 3] = m_padded * n_padded;
+            for axis in (0..rank - 3).rev() {
+                strides[axis] = strides[axis + 1] * out_shape[axis + 1];
+            }
+        }
+        strides.into()
     }
 
     fn build_hardware_matmul(
@@ -255,15 +266,20 @@ impl MatMulOperation {
         input_b: &TensorData,
         output: &TensorData,
     ) -> Result<DirectKernel, kernel_backend::DeviceNotSupported> {
-        let a_view = device_supported(flatten_matrix_layout_split(
-            input_a.layout(),
-            self.a.split(),
-        ))?;
-        let b_view = device_supported(flatten_matrix_layout_split(
-            input_b.layout(),
-            self.b.split(),
-        ))?;
-        let y_view = device_supported(flatten_matrix_layout(output.layout()))?;
+        // Operands with a base map read their producer through it: compose
+        // with the runtime buffer layout, then flatten with the operand's
+        // dim grouping.
+        let operand_layout =
+            |operand: &MatrixOperand, input: &TensorData| -> Option<crate::Layout> {
+                match &operand.base_map {
+                    Some(map) => crate::view::compose_layouts(&map.layout, input.layout()),
+                    None => Some(input.layout().clone()),
+                }
+            };
+        let a_layout = device_supported(operand_layout(&self.a, input_a))?;
+        let b_layout = device_supported(operand_layout(&self.b, input_b))?;
+        let a_view = device_supported(flatten_matrix_layout_split(&a_layout, self.a.split()))?;
+        let b_view = device_supported(flatten_matrix_layout_split(&b_layout, self.b.split()))?;
 
         let m: u32 = self
             .a
@@ -290,12 +306,7 @@ impl MatMulOperation {
         .map_err(|_| kernel_backend::DeviceNotSupported)?;
         let batch_m = device_supported(batch.checked_mul(m))?;
         let batch_k = device_supported(batch.checked_mul(k))?;
-        if a_view.rows != batch_m
-            || a_view.cols != k
-            || b_view.rows != batch_k
-            || b_view.cols != n
-            || y_view.rows != batch_m
-            || y_view.cols != n
+        if a_view.rows != batch_m || a_view.cols != k || b_view.rows != batch_k || b_view.cols != n
         {
             return Err(kernel_backend::DeviceNotSupported);
         }
@@ -304,31 +315,49 @@ impl MatMulOperation {
         // Only the cooperative-matrix route stays hand-specialized; gemv
         // shapes lower through the generic subgroup-per-output reduce, and
         // fused chains lower through the generic tiled reduce.
-        if !self.pre_element_wise[0].functions.is_empty()
-            || !self.pre_element_wise[1].functions.is_empty()
-            || !self.post_element_wise.functions.is_empty()
-        {
-            return Err(kernel_backend::DeviceNotSupported);
-        }
+        let tile = device_supported(self.coop_tile(device))?;
         let subgroup_config = device_supported(device.subgroup_config())?;
-        if !subgroup_config.is_fixed() {
-            return Err(kernel_backend::DeviceNotSupported);
-        }
         let MatMulParams::CoopMatMul(params) = &self.parameters else {
             return Err(kernel_backend::DeviceNotSupported);
         };
-        let kind = params.kind();
-        let coop = device_supported(device.coop_token(kind))?;
-        let tile = device_supported(CoopTile::select(
-            m,
-            k,
-            n,
-            device
-                .limits()
-                .max_compute_workgroup_size_x
-                .min(device.limits().max_compute_invocations_per_workgroup),
-            subgroup_config.max_size(),
-        ))?;
+        let coop = device_supported(device.coop_token(params.kind()))?;
+
+        // The store covers whole tiles, so `y` is the padded matrix: rows
+        // padded to `ceil(m / bm) * bm` per batch and columns to
+        // `ceil(n / bn) * bn`, allocated by `inputs()` with the logical
+        // output viewing it. Verify the output really has that geometry —
+        // a mismatch (the allocation predicted a different tile) falls back
+        // to the generic path, which writes through the logical layout.
+        let m_padded = m.div_ceil(tile.bm) * tile.bm;
+        let n_padded = n.div_ceil(tile.bn) * tile.bn;
+        let expected_strides = Self::padded_out_strides(
+            &self.out_shape,
+            m_padded as usize,
+            n_padded as usize,
+        );
+        let padded_elements = device_supported(
+            (batch as usize)
+                .checked_mul(m_padded as usize)
+                .and_then(|rows| rows.checked_mul(n_padded as usize)),
+        )?;
+        let padded_bytes = padded_elements as u64 * self.datatype.element_size() as u64;
+        if output.layout().offset() != 0
+            || output.layout().strides() != &*expected_strides
+            || padded_bytes > output.buffer().size()
+        {
+            return Err(kernel_backend::DeviceNotSupported);
+        }
+        let batch_m_padded = device_supported(batch.checked_mul(m_padded))?;
+        let y_view = crate::mir::tile_direct::DirectMatrixLayout {
+            rows: batch_m_padded,
+            cols: n_padded,
+            offset: 0,
+            layout: tile_ir::Layout::strided(
+                tile_ir::MemoryLevel::Storage,
+                tile_ir::Shape::new([batch_m_padded, n_padded]),
+                &[n_padded, 1],
+            ),
+        };
 
         let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
         let datatype = self.datatype;
@@ -493,11 +522,38 @@ impl Operation for MatMulOperation {
         let a = nodes.get_result(self.first).unwrap();
         let b = nodes.get_result(self.second).unwrap();
         let device = a.device();
-        let output_tensor = TensorData::new_for_shape(
-            device,
-            &self.out_shape,
-            self.post_element_wise.out_datatype(),
-        );
+        let datatype = self.post_element_wise.out_datatype();
+        // The coop kernel stores whole tiles: pad the backing to tile
+        // multiples and view the logical shape over it (consumers never
+        // read the pad region). Shapes that already divide the tile — and
+        // anything bound for the generic path — allocate exactly.
+        let (m, n) = (self.a.rows(), self.b.cols());
+        let padded = self.coop_tile(&device).and_then(|tile| {
+            let m_padded = m.div_ceil(tile.bm as usize) * tile.bm as usize;
+            let n_padded = n.div_ceil(tile.bn as usize) * tile.bn as usize;
+            (m_padded != m || n_padded != n).then_some((m_padded, n_padded))
+        });
+        let output_tensor = match padded {
+            Some((m_padded, n_padded)) => {
+                let batch: usize = self.a.batch_shape().iter().product();
+                let backing = TensorData::new_for_shape(
+                    &device,
+                    &[batch, m_padded, n_padded],
+                    datatype,
+                );
+                TensorData::new_from_parts(
+                    &device,
+                    backing.buffer().clone(),
+                    crate::Layout::from_parts(
+                        0,
+                        self.out_shape.clone(),
+                        Self::padded_out_strides(&self.out_shape, m_padded, n_padded),
+                    ),
+                    datatype,
+                )
+            }
+            None => TensorData::new_for_shape(&device, &self.out_shape, datatype),
+        };
         vec![a.into(), b.into(), output_tensor.into()]
     }
 

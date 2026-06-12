@@ -86,6 +86,23 @@ impl MultiFlattenMap {
             .collect()
     }
 
+    /// The length of contiguous (unit-stride) storage runs as this logical
+    /// axis's coordinate increments — the coalescing measure for choosing
+    /// which axis lanes should advance along. Walks the axis's sub-axes from
+    /// the innermost out, extending the run while each sub-axis continues
+    /// the previous one's span; 1 when the innermost sub-axis is not
+    /// unit-stride.
+    pub fn axis_unit_run(&self, axis: usize) -> u32 {
+        let mut run = 1u32;
+        for sub_axis in self.groups[axis].sub_axes.iter().rev() {
+            if sub_axis.stride != run {
+                break;
+            }
+            run = run.saturating_mul(sub_axis.extent);
+        }
+        run
+    }
+
     /// True if this affine map is row-major contiguous for `shape`.
     pub fn is_row_major(&self, shape: &Shape) -> bool {
         self.is_affine() && self.affine_strides() == row_major_strides(shape)
