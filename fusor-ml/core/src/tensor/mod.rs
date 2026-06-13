@@ -8,16 +8,10 @@ use tabbycat::Graph;
 use wgpu::COPY_BUFFER_ALIGNMENT;
 
 use crate::{
-    Device, FlashAttentionInputs, FlashAttentionOperation, MatMulOperation, MatMulParams,
-    ReduceFunction, ReduceOperation,
+    Device, ReduceFunction, ReduceOperation,
     compute_graph::NodeIndex,
-    conv::ConvNdOperation,
-    map_layout::MapLayoutOperation,
-    nary_wise::{NaryExpr, NaryFunction, NaryOperation},
+    nary_wise::{ElementwiseOperation, NaryExpr, NaryFunction},
     quantized::QMatrix,
-    quantized::matmul::QMatMulOperation,
-    resize::ResizeOperation,
-    rms_norm::RmsNormOperation,
     slice_assign::SliceAssignOperation,
 };
 
@@ -324,7 +318,7 @@ impl Tensor {
             let mut info = self.data.info.clone();
             info.datatype = function.output_type;
             let rank = self.shape().len();
-            let nary = NaryOperation {
+            let nary = ElementwiseOperation {
                 inputs: vec![self.data.key],
                 expression: NaryExpr::Op {
                     children: vec![NaryExpr::input(0, rank), NaryExpr::input(0, rank)],
@@ -344,40 +338,77 @@ impl Tensor {
         )
     }
 
-    pub(crate) fn add_mat_mul(&self, other: &Self, parameters: Option<MatMulParams>) -> Self {
-        let operation = MatMulOperation::new(
-            self.datatype(),
-            self.data.key,
-            other.data.key,
-            self.shape(),
-            other.shape(),
-            parameters,
-            &self.data.device,
+    /// Quantized matrix multiply in its composed form: the activation
+    /// `[.., K]` and the dequantized matrix `[N, K]` multiply over the
+    /// `[.., N, K]` index space and sum along `K`. The resolver recognizes
+    /// the canonical cluster and routes it to the quantized matmul kernels.
+    pub(crate) fn add_q_mat_mul(&self, other: &QMatrix) -> Self {
+        let in_shape = self.shape();
+        let rank = in_shape.len();
+        assert!(rank >= 1, "q_mat_mul requires rank >= 1");
+        assert_eq!(
+            in_shape[rank - 1],
+            other.shape()[1],
+            "q_mat_mul contraction dimensions must match: {in_shape:?} x {:?}",
+            other.shape()
         );
 
-        Self::from_parts(self.data.mat_mul(operation))
+        let datatype = self.datatype();
+        let device = self.device().clone();
+        let matrix_key = device.compute_graph().dequantize(other.clone(), datatype);
+        let matrix = Tensor::from_parts(LazyTensorData::from_parts(
+            device,
+            TensorInfo::new(other.shape().into(), datatype),
+            matrix_key,
+        ));
+
+        let n = other.shape()[0];
+        // Index space [.., N, K]: K stays last so the reduce axis is the
+        // final dimension.
+        let mut index_space = in_shape.to_vec();
+        index_space.insert(rank - 1, n);
+        let (n_dim, k_dim) = (rank - 1, rank);
+
+        let activation_indices: Vec<NaryExpr> = (0..rank - 1)
+            .chain(std::iter::once(k_dim))
+            .map(NaryExpr::DimIndex)
+            .collect();
+        let matrix_indices: Vec<NaryExpr> = [n_dim, k_dim].map(NaryExpr::DimIndex).to_vec();
+
+        let product = Tensor::from_parts(self.data.nary(ElementwiseOperation {
+            inputs: vec![self.key(), matrix.key()],
+            expression: NaryExpr::mul(
+                NaryExpr::indexed_input(0, activation_indices),
+                NaryExpr::indexed_input(1, matrix_indices),
+                datatype,
+            ),
+            shape: index_space.into(),
+            output_datatype: datatype,
+        }));
+        product.sum(k_dim)
     }
 
-    pub(crate) fn add_q_mat_mul(&self, other: &QMatrix) -> Self {
-        let operation =
-            QMatMulOperation::new(self.datatype(), self.shape(), self.data.key, other.clone());
-
-        Self::from_parts(self.data.q_mat_mul(operation))
-    }
-
-    pub(crate) fn add_resize(&self, op: ResizeOperation) -> Tensor {
-        Tensor::from_parts(self.data.resize(op))
-    }
-
+    /// Slice assignment in its composed form: per output coordinate, read
+    /// the assigned value inside the slice region and this tensor outside
+    /// it. A plain elementwise op — no specialized kernel.
     pub(crate) fn add_slice_assign(
         &self,
         other: &Self,
         slices: impl Into<Box<[Range<usize>]>>,
     ) -> Self {
-        let input_shape: Box<[usize]> = self.shape().to_vec().into_boxed_slice();
-        let op =
-            SliceAssignOperation::new(self.data.key, other.data.key, slices.into(), input_shape);
-        Self::from_parts(self.data.slice_assign(op))
+        let slices: Box<[Range<usize>]> = slices.into();
+        assert_eq!(
+            slices.len(),
+            self.rank(),
+            "slice_assign requires one range per dimension"
+        );
+        let expression = crate::slice_assign::slice_assign_expression(&slices, self.datatype());
+        Self::from_parts(self.data.nary(ElementwiseOperation {
+            inputs: vec![self.data.key, other.data.key],
+            expression,
+            shape: self.shape().into(),
+            output_datatype: self.datatype(),
+        }))
     }
 
     #[doc(hidden)]
@@ -386,13 +417,7 @@ impl Tensor {
         slices: impl Into<Box<[Range<usize>]>>,
         value: &Self,
     ) -> Self {
-        let input_shape: Box<[usize]> = self.shape().to_vec().into_boxed_slice();
-        let op = SliceAssignOperation::new_in_place(
-            self.data.key,
-            value.data.key,
-            slices.into(),
-            input_shape,
-        );
+        let op = SliceAssignOperation::new_in_place(self.data.key, value.data.key, slices.into());
         Self::from_parts(self.data.slice_assign(op))
     }
 
@@ -403,10 +428,6 @@ impl Tensor {
             dim,
             self.shape(),
         )))
-    }
-
-    pub(crate) fn add_map_layout(&self, op: MapLayoutOperation) -> Tensor {
-        Tensor::from_parts(self.data.map_layout(op))
     }
 
     /// Return the compute-graph node index for this tensor.
@@ -441,219 +462,6 @@ impl Tensor {
 
     pub fn datatype(&self) -> DataTypeEnum {
         self.data.info.datatype()
-    }
-
-    pub(crate) fn try_rms_norm_direct(
-        &self,
-        weight: &Tensor,
-        bias: Option<&Tensor>,
-        eps: f32,
-    ) -> Option<Self> {
-        if !matches!(self.datatype(), DataTypeEnum::F32 | DataTypeEnum::F16)
-            || self.datatype() != weight.datatype()
-            || bias.is_some_and(|bias| bias.datatype() != self.datatype())
-            || (self.datatype() == DataTypeEnum::F16 && !self.device().f16_supported())
-        {
-            return None;
-        }
-        let operation = RmsNormOperation::new(
-            self.data.key,
-            weight.data.key,
-            bias.map(|bias| bias.data.key),
-            self.shape(),
-            eps,
-        );
-        Some(Self::from_parts(self.data.rms_norm(operation)))
-    }
-
-    #[doc(hidden)]
-    pub fn try_conv_nd_direct(
-        &self,
-        weight: &Tensor,
-        bias: Option<&Tensor>,
-        padding: &[usize],
-        strides: &[usize],
-    ) -> Option<Self> {
-        if self.datatype() != weight.datatype()
-            || bias.is_some_and(|bias| bias.datatype() != self.datatype())
-        {
-            return None;
-        }
-        let operation = ConvNdOperation::new(
-            crate::conv::ConvNdNodes {
-                input: self.data.key,
-                weight: weight.data.key,
-                bias: bias.map(|bias| bias.data.key),
-            },
-            crate::conv::ConvNdShapeSpec {
-                input_shape: self.shape(),
-                weight_shape: weight.shape(),
-                bias_shape: bias.map(|bias| bias.shape()),
-                padding,
-                strides,
-            },
-            self.datatype(),
-            self.device(),
-        )?;
-        let device = self.device().clone();
-        let info = TensorInfo::new(operation.output_shape().into(), self.datatype());
-        let key = device
-            .compute_graph()
-            .create_graph_op(std::sync::Arc::new(operation));
-        Some(Self::from_parts(LazyTensorData::from_parts(
-            device, info, key,
-        )))
-    }
-
-    pub(crate) fn try_rms_norm_residual_direct(
-        &self,
-        residual: &Self,
-        weight: &Tensor,
-        bias: Option<&Tensor>,
-        eps: f32,
-    ) -> Option<Self> {
-        if !matches!(self.datatype(), DataTypeEnum::F32 | DataTypeEnum::F16)
-            || self.shape() != residual.shape()
-            || residual.datatype() != self.datatype()
-            || weight.datatype() != self.datatype()
-            || bias.is_some_and(|bias| bias.datatype() != self.datatype())
-            || (self.datatype() == DataTypeEnum::F16 && !self.device().f16_supported())
-        {
-            return None;
-        }
-        let operation = RmsNormOperation::new_with_residual(
-            self.data.key,
-            residual.data.key,
-            weight.data.key,
-            bias.map(|bias| bias.data.key),
-            self.shape(),
-            eps,
-        );
-        Some(Self::from_parts(self.data.rms_norm(operation)))
-    }
-
-    pub(crate) fn try_flash_attention_direct(
-        &self,
-        k: &Self,
-        v: &Self,
-        scale: f32,
-        mask: Option<&Tensor>,
-    ) -> Option<Self> {
-        self.try_flash_attention_direct_inner(k, v, scale, mask, false)
-    }
-
-    pub(crate) fn try_flash_attention_direct_causal(
-        &self,
-        k: &Self,
-        v: &Self,
-        scale: f32,
-    ) -> Option<Self> {
-        self.try_flash_attention_direct_inner(k, v, scale, None, true)
-    }
-
-    fn try_flash_attention_direct_inner(
-        &self,
-        k: &Self,
-        v: &Self,
-        scale: f32,
-        mask: Option<&Tensor>,
-        causal: bool,
-    ) -> Option<Self> {
-        if self.rank() != 4 || !matches!(self.datatype(), DataTypeEnum::F32 | DataTypeEnum::F16) {
-            return None;
-        }
-        if causal && mask.is_some() {
-            return None;
-        }
-        let q_shape = self.shape();
-        let k_shape = k.shape();
-        let is_decode_shape = q_shape[2] == 1
-            && q_shape[3] > 0
-            && mask.is_none()
-            && !causal
-            && self.datatype() == DataTypeEnum::F32;
-        if is_decode_shape
-            && k_shape[2] < crate::mir::kernel_backend::flash_attention::MIN_DECODE_KV_SEQ
-        {
-            return None;
-        }
-        let is_decode_candidate =
-            crate::mir::kernel_backend::flash_attention::flash_decode_direct_candidate(
-                q_shape,
-                k_shape,
-                mask.is_some(),
-                causal,
-                self.datatype(),
-            );
-        // Decode (q_seq_len == 1) now uses the fused flash-attention decode
-        // kernel on wasm as well. The browser path was previously disabled here
-        // over WebGPU hang/crash reports on the split decode workgroup kernel;
-        // re-enabled to measure whether that's still an issue.
-        // The streaming flash attention kernels emit a separate
-        // monomorphization per hardware subgroup width and rely on
-        // `subgroup_reduce_*`, so they can only target devices where we know
-        // the effective subgroup width. Decode-small uses workgroup reductions
-        // and should not be blocked by browser adapters that support subgroups
-        // but report a subgroup-width range.
-        if !is_decode_candidate {
-            self.data.device.fixed_width_subgroup_size()?;
-        }
-        let v_shape = v.shape();
-        if q_shape[0] != k_shape[0]
-            || q_shape[0] != v_shape[0]
-            || k_shape[1] != v_shape[1]
-            || k_shape[2] != v_shape[2]
-            || q_shape[3] != k_shape[3]
-            || q_shape[3] != v_shape[3]
-            || q_shape[0] == 0
-            || q_shape[1] == 0
-            || q_shape[2] == 0
-            || k_shape[1] == 0
-            || !q_shape[1].is_multiple_of(k_shape[1])
-            || q_shape[3] == 0
-            || k_shape[2] == 0
-        {
-            return None;
-        }
-        if let Some(mask) = mask
-            && mask.shape() != [q_shape[2], k_shape[2]]
-        {
-            return None;
-        }
-        if causal && q_shape[2] != k_shape[2] {
-            // Causal optimisation only kicks in for self-attention prefill
-            // where q_seq_len == kv_seq_len. Other shapes (e.g. cached decode)
-            // fall back to the masked path.
-            return None;
-        }
-        let batch = u32::try_from(q_shape[0]).ok()?;
-        let num_heads = u32::try_from(q_shape[1]).ok()?;
-        let q_seq_len = u32::try_from(q_shape[2]).ok()?;
-        let head_dim = u32::try_from(q_shape[3]).ok()?;
-        let row_dispatch = batch.checked_mul(num_heads)?.checked_mul(q_seq_len)?;
-        let x_dispatch = head_dim.div_ceil(8);
-        let max_dispatch = self
-            .data
-            .device
-            .limits()
-            .max_compute_workgroups_per_dimension;
-        if x_dispatch > max_dispatch || row_dispatch > max_dispatch {
-            return None;
-        }
-
-        let operation = FlashAttentionOperation::new(FlashAttentionInputs {
-            q: self.data.key,
-            k: k.data.key,
-            v: v.data.key,
-            mask: mask.map(|mask| mask.data.key),
-            q_shape,
-            k_shape,
-            v_shape,
-            scale,
-            input_dtype: self.datatype(),
-            causal,
-        });
-        Some(Self::from_parts(self.data.flash_attention(operation)))
     }
 
     pub fn device(&self) -> &Device {

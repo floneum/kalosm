@@ -1,6 +1,5 @@
 use crate::{
     Layout, Tensor,
-    quantized::QMatrix,
     tensor::{DataTypeEnum, LazyTensorData, TensorData},
 };
 use web_time::Instant;
@@ -10,506 +9,403 @@ use wgpu::CommandEncoder;
 use super::{
     GPU_SAMPLE_RESULT_WORDS, GPU_SAMPLE_STATUS_INVALID, GPU_SAMPLE_STATUS_RETRY_NEEDED,
     GPU_SAMPLE_STATUS_SAMPLED, GpuMirostat2Sampler, GpuMirostat2SamplerParams,
-    GpuStandardSamplerParams, PendingGpuSampledToken, TOP_K_CHUNK,
+    GpuStandardSamplerParams, PendingGpuSampledToken, TOP_K_CHUNK, min_top_k_candidates_per_chunk,
     mirostat::sample_from_sorted_top_k_data_with_encoder,
-    qmat_topk::{
-        initial_sampler_candidate_count, next_sampler_candidate_count,
-        qmat_logits_data_with_encoder, sampler_output_per_chunk,
-    },
     standard_sampler::sample_from_sorted_top_k_data_with_encoder as sample_standard_from_sorted_top_k_data_with_encoder,
     topk::{
         ProcessorSettings, chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder,
-        chunk_top_k_pair_data_with_processors_with_encoder,
         merge_sorted_chunk_top_k_pair_data_with_encoder, top_k_exactness_flag_data_with_encoder,
     },
 };
 
-pub(crate) async fn mirostat2_sample_token_to_host(
-    input: &TensorData,
-    sampler: &mut GpuMirostat2Sampler,
-    previous_tokens: &[u32],
-    params: GpuMirostat2SamplerParams,
-) -> Result<Option<u32>, wgpu::BufferAsyncError> {
-    sample_processed_logits_to_host(
-        input,
-        sampler,
-        previous_tokens,
-        params,
-        None,
-        "mirostat2 sampled token download",
-    )
-    .await
+/// Which sampler kernel terminates the top-k tail, along with its parameters.
+/// The chunked top-k, merge, and exactness stages are shared between kinds.
+pub(crate) enum GpuSamplerRequest<'a> {
+    Mirostat2 {
+        sampler: &'a mut GpuMirostat2Sampler,
+        params: GpuMirostat2SamplerParams,
+    },
+    Standard {
+        params: GpuStandardSamplerParams,
+    },
 }
 
-pub(crate) async fn qmat_mirostat2_sample_token_to_host(
-    hidden: &TensorData,
-    matrix: &QMatrix,
-    sampler: &mut GpuMirostat2Sampler,
-    previous_tokens: &[u32],
-    params: GpuMirostat2SamplerParams,
-) -> Result<Option<u32>, wgpu::BufferAsyncError> {
-    if hidden.datatype() != DataTypeEnum::F32 || hidden.layout().rank() != 1 {
-        return Ok(None);
-    }
-    let hidden_len = hidden.layout().shape()[0];
-    let [vocab_len, hidden_matrix_len] = matrix.shape() else {
-        return Ok(None);
-    };
-    if hidden_len != *hidden_matrix_len || *vocab_len == 0 {
-        return Ok(None);
-    }
-    if !hidden.device().is_same_device(matrix.device()) {
-        return Ok(None);
+impl GpuSamplerRequest<'_> {
+    fn top_k(&self) -> usize {
+        match self {
+            Self::Mirostat2 { params, .. } => params.top_k,
+            Self::Standard { params } => params.top_k,
+        }
     }
 
-    let device = hidden.device();
-    let mut encoder =
-        device
-            .wgpu_device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("qmat_mirostat2_sample_token_to_host encoder"),
-            });
+    fn processor_settings(&self) -> ProcessorSettings {
+        match self {
+            Self::Mirostat2 { params, .. } => ProcessorSettings {
+                temperature: params.temperature,
+                repetition_penalty: params.repetition_penalty,
+            },
+            Self::Standard { params } => ProcessorSettings {
+                temperature: params.temperature,
+                repetition_penalty: params.repetition_penalty,
+            },
+        }
+    }
 
-    let trace = cfg!(target_arch = "wasm32")
+    fn encode_sample(
+        &mut self,
+        ids: &TensorData,
+        values: &TensorData,
+        exactness_flag: Option<&TensorData>,
+        encoder: &mut CommandEncoder,
+    ) -> Option<TensorData> {
+        match self {
+            Self::Mirostat2 { sampler, params } => sample_from_sorted_top_k_data_with_encoder(
+                ids,
+                values,
+                sampler,
+                *params,
+                exactness_flag,
+                Some(encoder),
+            ),
+            Self::Standard { params } => sample_standard_from_sorted_top_k_data_with_encoder(
+                ids,
+                values,
+                *params,
+                exactness_flag,
+                Some(encoder),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SampleAttemptDims {
+    top_k: usize,
+    candidate_count: usize,
+    chunks: usize,
+    input_len: usize,
+}
+
+fn initial_sampler_candidate_count(top_k: usize, chunks: usize) -> usize {
+    top_k
+        .div_ceil(chunks)
+        .max(min_top_k_candidates_per_chunk())
+        .min(top_k)
+        .min(TOP_K_CHUNK)
+}
+
+fn sampler_output_per_chunk(candidate_count: usize) -> usize {
+    if candidate_count >= TOP_K_CHUNK {
+        TOP_K_CHUNK
+    } else {
+        candidate_count + 1
+    }
+}
+
+fn next_sampler_candidate_count(candidate_count: usize, top_k: usize) -> usize {
+    candidate_count
+        .saturating_mul(2)
+        .min(top_k)
+        .min(TOP_K_CHUNK)
+}
+
+fn sampler_trace_enabled() -> bool {
+    cfg!(target_arch = "wasm32")
         || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-        || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
-    let qmat_start = trace.then(Instant::now);
-    let Some(logits) = qmat_logits_data_with_encoder(hidden, matrix, &mut encoder) else {
-        return Ok(None);
-    };
-    if let Some(start) = qmat_start {
-        tracing::info!(
-            "sampler_trace qmat_logits_setup elapsed={:?}",
-            start.elapsed()
-        );
-    }
+        || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some()
+}
 
-    let hidden_dump_buffer = if std::env::var_os("FUSOR_DEBUG_SAMPLER").is_some() {
-        let hidden_bytes = (std::mem::size_of::<f32>() * hidden_len) as u64;
-        let hidden_dl = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
-            size: hidden_bytes,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-            label: Some("debug sampler hidden download"),
-        });
-        encoder.copy_buffer_to_buffer(hidden.buffer(), 0, &hidden_dl, 0, hidden_bytes);
-        Some(hidden_dl)
+/// Encode one full sampling attempt — processed chunk top-k, merge,
+/// optional exactness proof, and the sampler kernel — into `encoder`.
+/// Returns the `[status, token]` output along with the sorted top-k
+/// ids/values (kept for `FUSOR_DEBUG_SAMPLER` dumps).
+///
+/// This runs inside the resolver tail while the graph lock is held, so it
+/// must only touch raw buffers — no compute-graph access.
+fn encode_sample_attempt(
+    logits: &TensorData,
+    previous_tokens: &[u32],
+    previous_gpu_token: Option<&TensorData>,
+    request: &mut GpuSamplerRequest<'_>,
+    dims: SampleAttemptDims,
+    encoder: &mut CommandEncoder,
+) -> Option<(TensorData, TensorData, TensorData)> {
+    let output_per_chunk = sampler_output_per_chunk(dims.candidate_count);
+    let (chunk_ids, chunk_values) =
+        chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder(
+            logits,
+            previous_tokens,
+            previous_gpu_token,
+            request.processor_settings(),
+            dims.candidate_count,
+            output_per_chunk,
+            Some(encoder),
+        )?;
+
+    let (ids, values) = merge_sorted_chunk_top_k_pair_data_with_encoder(
+        &chunk_ids,
+        &chunk_values,
+        crate::sampling::topk::MergeSortedChunkTopKParams {
+            chunks: dims.chunks,
+            chunk_len: dims.candidate_count,
+            chunk_stride: output_per_chunk,
+            input_len: dims.input_len,
+            k: dims.top_k,
+        },
+        Some(encoder),
+    )?;
+
+    let exactness_flag = if dims.candidate_count < dims.top_k && dims.candidate_count < TOP_K_CHUNK
+    {
+        Some(top_k_exactness_flag_data_with_encoder(
+            &values,
+            &chunk_values,
+            dims.chunks,
+            dims.candidate_count,
+            output_per_chunk,
+            dims.top_k,
+            Some(encoder),
+        )?)
     } else {
         None
     };
 
-    let result = sample_processed_logits_to_host(
-        &logits,
-        sampler,
-        previous_tokens,
-        params,
-        Some(encoder),
-        "qmat mirostat2 sampled token download",
-    )
-    .await?;
+    let output = request.encode_sample(&ids, &values, exactness_flag.as_ref(), encoder)?;
+    Some((output, ids, values))
+}
 
-    if result.is_none()
-        && let Some(hidden_dl) = hidden_dump_buffer
-    {
-        let (tx, rx) = futures_channel::oneshot::channel();
-        hidden_dl
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |r| {
-                _ = tx.send(r);
-            });
-        #[cfg(not(target_arch = "wasm32"))]
-        device.poll_wait();
-        let _ = rx.await;
-        let view = hidden_dl.slice(..).get_mapped_range();
-        let hidden_vec: Vec<f32> = bytemuck::cast_slice(&view).to_vec();
-        drop(view);
-        hidden_dl.unmap();
+fn encode_token_download(
+    output: &TensorData,
+    encoder: &mut CommandEncoder,
+    label: &'static str,
+) -> wgpu::Buffer {
+    let device = output.device();
+    let download_size = (std::mem::size_of::<u32>() * GPU_SAMPLE_RESULT_WORDS) as u64;
+    let download = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+        size: download_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+        label: Some(label),
+    });
+    encoder.copy_buffer_to_buffer(output.buffer(), 0, &download, 0, download_size);
+    download
+}
 
-        let mut nan = 0usize;
-        let mut pos_inf = 0usize;
-        let mut neg_inf = 0usize;
-        let mut finite = 0usize;
-        let mut min_h = f32::INFINITY;
-        let mut max_h = f32::NEG_INFINITY;
-        for &v in &hidden_vec {
-            if v.is_nan() {
-                nan += 1;
-            } else if v == f32::INFINITY {
-                pos_inf += 1;
-            } else if v == f32::NEG_INFINITY {
-                neg_inf += 1;
-            } else {
-                finite += 1;
-                if v < min_h {
-                    min_h = v;
+async fn read_sample_result(
+    device: &crate::Device,
+    download: wgpu::Buffer,
+    trace: bool,
+) -> Result<(u32, u32), wgpu::BufferAsyncError> {
+    #[cfg(target_arch = "wasm32")]
+    let _ = device;
+    let map_start = trace.then(Instant::now);
+    let (sender, receiver) = futures_channel::oneshot::channel();
+    download
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            _ = sender.send(result);
+        });
+    #[cfg(not(target_arch = "wasm32"))]
+    device.poll_wait();
+    receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
+    if let Some(start) = map_start {
+        tracing::info!("sampler_trace map_wait elapsed={:?}", start.elapsed());
+    }
+
+    let view = download.slice(..).get_mapped_range();
+    let word_size = std::mem::size_of::<u32>();
+    let status = view
+        .get(..word_size)
+        .map(bytemuck::from_bytes::<u32>)
+        .copied()
+        .unwrap_or(GPU_SAMPLE_STATUS_INVALID);
+    let token = view
+        .get(word_size..word_size * GPU_SAMPLE_RESULT_WORDS)
+        .map(bytemuck::from_bytes::<u32>)
+        .copied()
+        .unwrap_or_default();
+    drop(view);
+    download.unmap();
+    Ok((status, token))
+}
+
+/// Sample a token from a lazy 1-D logits tensor, downloading the result.
+///
+/// The first attempt's kernels ride the resolver's command encoder, so the
+/// graph that produces the logits (including a recognized lm_head qgemv) and
+/// the sampling tail land in a single submission. Retries with escalated
+/// candidate counts re-encode over the already-materialized logits.
+pub(crate) async fn sample_token_to_host(
+    logits: &LazyTensorData,
+    mut request: GpuSamplerRequest<'_>,
+    previous_tokens: &[u32],
+) -> Result<Option<u32>, wgpu::BufferAsyncError> {
+    if logits.info.datatype() != DataTypeEnum::F32 || logits.info.rank() != 1 {
+        return Ok(None);
+    }
+    let input_len = logits.info.shape()[0];
+    let top_k = request.top_k().min(input_len);
+    if top_k == 0 {
+        return Ok(None);
+    }
+
+    let chunks = input_len.div_ceil(TOP_K_CHUNK);
+    let mut candidate_count = initial_sampler_candidate_count(top_k, chunks);
+    let trace = sampler_trace_enabled();
+    let debug_dump = std::env::var_os("FUSOR_DEBUG_SAMPLER").is_some();
+
+    let (logits_data, _, mut attempt) = logits.materialize_with_tail(|logits_data, encoder| {
+        let attempt = encode_sample_attempt(
+            logits_data,
+            previous_tokens,
+            None,
+            &mut request,
+            SampleAttemptDims {
+                top_k,
+                candidate_count,
+                chunks,
+                input_len,
+            },
+            encoder,
+        )?;
+        let download = encode_token_download(&attempt.0, encoder, "sampled token download");
+        Some((attempt, download))
+    });
+    let device = logits_data.device().clone();
+
+    let mut attempt_index = 0usize;
+    loop {
+        attempt_index += 1;
+        let Some(((_, ids, values), download)) = attempt else {
+            return Ok(None);
+        };
+        let (status, token) = read_sample_result(&device, download, trace).await?;
+        match status {
+            GPU_SAMPLE_STATUS_SAMPLED => {
+                if trace {
+                    tracing::info!(
+                        "sampler_trace sampled attempt={attempt_index} top_k={top_k} chunks={chunks} candidate_count={candidate_count} token={token}"
+                    );
                 }
-                if v > max_h {
-                    max_h = v;
+                return Ok(Some(token));
+            }
+            GPU_SAMPLE_STATUS_RETRY_NEEDED => {
+                if trace {
+                    tracing::info!(
+                        "sampler_trace retry attempt={attempt_index} top_k={top_k} chunks={chunks} candidate_count={candidate_count}"
+                    );
                 }
             }
+            _ => {
+                if trace {
+                    tracing::warn!(
+                        "sampler_trace invalid attempt={attempt_index} top_k={top_k} chunks={chunks} candidate_count={candidate_count} status={status}"
+                    );
+                }
+                if debug_dump {
+                    debug_dump_invalid_sample(&logits_data, &ids, &values, previous_tokens).await;
+                }
+                return Ok(None);
+            }
         }
-        tracing::warn!(
-            "sampler_debug HIDDEN len={} nan={} +inf={} -inf={} finite={} min={} max={} first8={:?}",
-            hidden_vec.len(),
-            nan,
-            pos_inf,
-            neg_inf,
-            finite,
-            min_h,
-            max_h,
-            hidden_vec.iter().take(8).collect::<Vec<_>>()
-        );
-    }
 
-    Ok(result)
-}
+        let next = next_sampler_candidate_count(candidate_count, top_k);
+        if next == candidate_count {
+            return Ok(None);
+        }
+        candidate_count = next;
 
-pub(crate) async fn qmat_mirostat2_sample_lazy_token_to_host(
-    hidden: &LazyTensorData,
-    matrix: &QMatrix,
-    sampler: &mut GpuMirostat2Sampler,
-    previous_tokens: &[u32],
-    params: GpuMirostat2SamplerParams,
-) -> Result<Option<u32>, wgpu::BufferAsyncError> {
-    if hidden.info.datatype() != DataTypeEnum::F32 || hidden.info.rank() != 1 {
-        return Ok(None);
-    }
-    let hidden_len = hidden.info.shape()[0];
-    let [vocab_len, hidden_matrix_len] = matrix.shape() else {
-        return Ok(None);
-    };
-    if hidden_len != *hidden_matrix_len || *vocab_len == 0 {
-        return Ok(None);
-    }
-    if !hidden.device.is_same_device(matrix.device()) {
-        return Ok(None);
-    }
-
-    let trace = cfg!(target_arch = "wasm32")
-        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-        || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
-    let qmat_start = trace.then(Instant::now);
-    let (materialized_hidden, _, logits) = hidden.materialize_with_tail(|hidden_data, encoder| {
-        qmat_logits_data_with_encoder(hidden_data, matrix, encoder)
-    });
-    if let Some(start) = qmat_start {
-        tracing::info!(
-            "sampler_trace qmat_logits_tail elapsed={:?}",
-            start.elapsed()
-        );
-    }
-
-    let Some(logits) = logits else {
-        return qmat_mirostat2_sample_token_to_host(
-            &materialized_hidden,
-            matrix,
-            sampler,
+        let mut encoder =
+            device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("sampler retry encoder"),
+                });
+        attempt = encode_sample_attempt(
+            &logits_data,
             previous_tokens,
-            params,
+            None,
+            &mut request,
+            SampleAttemptDims {
+                top_k,
+                candidate_count,
+                chunks,
+                input_len,
+            },
+            &mut encoder,
         )
-        .await;
-    };
-
-    sample_processed_logits_to_host(
-        &logits,
-        sampler,
-        previous_tokens,
-        params,
-        None,
-        "qmat mirostat2 sampled token download",
-    )
-    .await
+        .map(|attempt| {
+            let download =
+                encode_token_download(&attempt.0, &mut encoder, "sampled token download");
+            (attempt, download)
+        });
+        device.wgpu_queue().submit(Some(encoder.finish()));
+    }
 }
 
-pub(crate) async fn standard_sample_token_to_host(
-    input: &TensorData,
-    previous_tokens: &[u32],
-    params: GpuStandardSamplerParams,
-) -> Result<Option<u32>, wgpu::BufferAsyncError> {
-    sample_processed_standard_logits_to_host(
-        input,
-        previous_tokens,
-        params,
-        None,
-        "standard sampled token download",
-    )
-    .await
-}
-
-pub(crate) async fn qmat_standard_sample_lazy_token_to_host(
-    hidden: &LazyTensorData,
-    matrix: &QMatrix,
-    previous_tokens: &[u32],
-    params: GpuStandardSamplerParams,
-) -> Result<Option<u32>, wgpu::BufferAsyncError> {
-    if hidden.info.datatype() != DataTypeEnum::F32 || hidden.info.rank() != 1 {
-        return Ok(None);
-    }
-    let hidden_len = hidden.info.shape()[0];
-    let [vocab_len, hidden_matrix_len] = matrix.shape() else {
-        return Ok(None);
-    };
-    if hidden_len != *hidden_matrix_len || *vocab_len == 0 {
-        return Ok(None);
-    }
-    if !hidden.device.is_same_device(matrix.device()) {
-        return Ok(None);
-    }
-
-    let trace = cfg!(target_arch = "wasm32")
-        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-        || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
-    let qmat_start = trace.then(Instant::now);
-    let (materialized_hidden, _, logits) = hidden.materialize_with_tail(|hidden_data, encoder| {
-        qmat_logits_data_with_encoder(hidden_data, matrix, encoder)
-    });
-    if let Some(start) = qmat_start {
-        tracing::info!(
-            "sampler_trace qmat_standard_logits_tail elapsed={:?}",
-            start.elapsed()
-        );
-    }
-
-    let Some(logits) = logits else {
-        return qmat_standard_sample_token_to_host(
-            &materialized_hidden,
-            matrix,
-            previous_tokens,
-            params,
-        )
-        .await;
-    };
-
-    sample_processed_standard_logits_to_host(
-        &logits,
-        previous_tokens,
-        params,
-        None,
-        "qmat standard sampled token download",
-    )
-    .await
-}
-
-async fn qmat_standard_sample_token_to_host(
-    hidden: &TensorData,
-    matrix: &QMatrix,
-    previous_tokens: &[u32],
-    params: GpuStandardSamplerParams,
-) -> Result<Option<u32>, wgpu::BufferAsyncError> {
-    if hidden.datatype() != DataTypeEnum::F32 || hidden.layout().rank() != 1 {
-        return Ok(None);
-    }
-    let hidden_len = hidden.layout().shape()[0];
-    let [vocab_len, hidden_matrix_len] = matrix.shape() else {
-        return Ok(None);
-    };
-    if hidden_len != *hidden_matrix_len || *vocab_len == 0 {
-        return Ok(None);
-    }
-    if !hidden.device().is_same_device(matrix.device()) {
-        return Ok(None);
-    }
-
-    let device = hidden.device();
-    let mut encoder =
-        device
-            .wgpu_device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("qmat_standard_sample_token_to_host encoder"),
-            });
-    let Some(logits) = qmat_logits_data_with_encoder(hidden, matrix, &mut encoder) else {
-        return Ok(None);
-    };
-    sample_processed_standard_logits_to_host(
-        &logits,
-        previous_tokens,
-        params,
-        Some(encoder),
-        "qmat standard sampled token download",
-    )
-    .await
-}
-
-pub(crate) fn qmat_mirostat2_sample_lazy_token_pending(
-    hidden: &LazyTensorData,
-    matrix: &QMatrix,
-    sampler: &mut GpuMirostat2Sampler,
+/// Sample a token from a lazy 1-D logits tensor without waiting for the
+/// result. The whole tail — including the optional copy of the previously
+/// sampled GPU token into the repetition-penalty window — is appended to the
+/// resolver's submission, and the token stays on the GPU as a 1-element
+/// tensor for the next decode step.
+pub(crate) fn sample_token_pending(
+    logits: &LazyTensorData,
+    mut request: GpuSamplerRequest<'_>,
     previous_tokens: &[u32],
     previous_gpu_token: Option<&Tensor>,
-    params: GpuMirostat2SamplerParams,
 ) -> Option<PendingGpuSampledToken> {
-    if hidden.info.datatype() != DataTypeEnum::F32 || hidden.info.rank() != 1 {
+    if logits.info.datatype() != DataTypeEnum::F32 || logits.info.rank() != 1 {
         return None;
     }
-    let hidden_len = hidden.info.shape()[0];
-    let [vocab_len, hidden_matrix_len] = matrix.shape() else {
-        return None;
-    };
-    if hidden_len != *hidden_matrix_len || *vocab_len == 0 {
-        return None;
-    }
-    if !hidden.device.is_same_device(matrix.device()) {
+    let input_len = logits.info.shape()[0];
+    let top_k = request.top_k().min(input_len);
+    if top_k == 0 || top_k > TOP_K_CHUNK {
         return None;
     }
 
     let previous_gpu_token = previous_gpu_token.and_then(materialize_gpu_previous_token);
     if previous_gpu_token
         .as_ref()
-        .is_some_and(|token| !hidden.device.is_same_device(token.device()))
+        .is_some_and(|token| !logits.device.is_same_device(token.device()))
     {
         return None;
     }
 
-    let qmat_start = (cfg!(target_arch = "wasm32")
-        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-        || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some())
-    .then(Instant::now);
-    let (materialized_hidden, _) = hidden.materialize();
-    if let Some(start) = qmat_start {
-        tracing::info!(
-            "sampler_trace hidden_materialize_pending elapsed={:?}",
-            start.elapsed()
-        );
-    }
-
-    qmat_mirostat2_sample_token_pending(
-        &materialized_hidden,
-        matrix,
-        sampler,
-        previous_tokens,
-        previous_gpu_token.as_ref(),
-        params,
-    )
-}
-
-pub(crate) fn qmat_standard_sample_lazy_token_pending(
-    hidden: &LazyTensorData,
-    matrix: &QMatrix,
-    previous_tokens: &[u32],
-    previous_gpu_token: Option<&Tensor>,
-    params: GpuStandardSamplerParams,
-) -> Option<PendingGpuSampledToken> {
-    if hidden.info.datatype() != DataTypeEnum::F32 || hidden.info.rank() != 1 {
-        return None;
-    }
-    let hidden_len = hidden.info.shape()[0];
-    let [vocab_len, hidden_matrix_len] = matrix.shape() else {
-        return None;
+    let dims = SampleAttemptDims {
+        top_k,
+        candidate_count: top_k,
+        chunks: input_len.div_ceil(TOP_K_CHUNK),
+        input_len,
     };
-    if hidden_len != *hidden_matrix_len || *vocab_len == 0 {
-        return None;
-    }
-    if !hidden.device.is_same_device(matrix.device()) {
-        return None;
-    }
+    let (_, _, tail) = logits.materialize_with_tail(|logits_data, encoder| {
+        let attempt = encode_sample_attempt(
+            logits_data,
+            previous_tokens,
+            previous_gpu_token.as_ref(),
+            &mut request,
+            dims,
+            encoder,
+        )?;
+        let download = encode_token_download(&attempt.0, encoder, "pending sampled token download");
+        Some((attempt.0, download))
+    });
+    let (output, download) = tail?;
 
-    let previous_gpu_token = previous_gpu_token.and_then(materialize_gpu_previous_token);
-    if previous_gpu_token
-        .as_ref()
-        .is_some_and(|token| !hidden.device.is_same_device(token.device()))
-    {
-        return None;
-    }
+    let (sender, receiver) = futures_channel::oneshot::channel();
+    download
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            _ = sender.send(result);
+        });
 
-    let qmat_start = (cfg!(target_arch = "wasm32")
-        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-        || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some())
-    .then(Instant::now);
-    let (materialized_hidden, _) = hidden.materialize();
-    if let Some(start) = qmat_start {
-        tracing::info!(
-            "sampler_trace standard_hidden_materialize_pending elapsed={:?}",
-            start.elapsed()
-        );
-    }
-
-    qmat_standard_sample_token_pending(
-        &materialized_hidden,
-        matrix,
-        previous_tokens,
-        previous_gpu_token.as_ref(),
-        params,
-    )
-}
-
-fn qmat_mirostat2_sample_token_pending(
-    hidden: &TensorData,
-    matrix: &QMatrix,
-    sampler: &mut GpuMirostat2Sampler,
-    previous_tokens: &[u32],
-    previous_gpu_token: Option<&TensorData>,
-    params: GpuMirostat2SamplerParams,
-) -> Option<PendingGpuSampledToken> {
-    if hidden.datatype() != DataTypeEnum::F32 || hidden.layout().rank() != 1 {
-        return None;
-    }
-    let hidden_len = hidden.layout().shape()[0];
-    let [vocab_len, hidden_matrix_len] = matrix.shape() else {
-        return None;
-    };
-    if hidden_len != *hidden_matrix_len || *vocab_len == 0 {
-        return None;
-    }
-    if !hidden.device().is_same_device(matrix.device()) {
-        return None;
-    }
-
-    let device = hidden.device();
-    let mut encoder =
-        device
-            .wgpu_device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("qmat_mirostat2_sample_token_pending encoder"),
-            });
-    let logits = qmat_logits_data_with_encoder(hidden, matrix, &mut encoder)?;
-    sample_processed_logits_pending(
-        &logits,
-        sampler,
-        previous_tokens,
-        previous_gpu_token,
-        params,
-        Some(encoder),
-        "qmat mirostat2 pending sampled token download",
-    )
-}
-
-fn qmat_standard_sample_token_pending(
-    hidden: &TensorData,
-    matrix: &QMatrix,
-    previous_tokens: &[u32],
-    previous_gpu_token: Option<&TensorData>,
-    params: GpuStandardSamplerParams,
-) -> Option<PendingGpuSampledToken> {
-    if hidden.datatype() != DataTypeEnum::F32 || hidden.layout().rank() != 1 {
-        return None;
-    }
-    let hidden_len = hidden.layout().shape()[0];
-    let [vocab_len, hidden_matrix_len] = matrix.shape() else {
-        return None;
-    };
-    if hidden_len != *hidden_matrix_len || *vocab_len == 0 {
-        return None;
-    }
-    if !hidden.device().is_same_device(matrix.device()) {
-        return None;
-    }
-
-    let device = hidden.device();
-    let mut encoder =
-        device
-            .wgpu_device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("qmat_standard_sample_token_pending encoder"),
-            });
-    let logits = qmat_logits_data_with_encoder(hidden, matrix, &mut encoder)?;
-    sample_processed_standard_logits_pending(
-        &logits,
-        previous_tokens,
-        previous_gpu_token,
-        params,
-        Some(encoder),
-        "qmat standard pending sampled token download",
-    )
+    // The token lives at word 1 of the `[status, token]` output buffer.
+    let token = Tensor::from(TensorData::new_from_parts(
+        output.device(),
+        output.buffer().clone(),
+        Layout::from_parts(1, Box::new([1]), Box::new([1])),
+        DataTypeEnum::U32,
+    ));
+    Some(PendingGpuSampledToken::new(token, download, receiver))
 }
 
 fn materialize_gpu_previous_token(token: &Tensor) -> Option<TensorData> {
@@ -523,720 +419,61 @@ fn materialize_gpu_previous_token(token: &Tensor) -> Option<TensorData> {
     Some(data)
 }
 
-fn sample_processed_logits_pending(
-    input: &TensorData,
-    sampler: &mut GpuMirostat2Sampler,
+async fn debug_dump_invalid_sample(
+    logits: &TensorData,
+    ids: &TensorData,
+    values: &TensorData,
     previous_tokens: &[u32],
-    previous_gpu_token: Option<&TensorData>,
-    params: GpuMirostat2SamplerParams,
-    mut initial_encoder: Option<CommandEncoder>,
-    download_label: &'static str,
-) -> Option<PendingGpuSampledToken> {
-    if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
-        return None;
-    }
-
-    let input_len = input.layout().shape()[0];
-    let top_k = params.top_k.min(input_len);
-    if top_k == 0 {
-        return None;
-    }
-
-    let chunks = input_len.div_ceil(TOP_K_CHUNK);
-    if top_k > TOP_K_CHUNK {
-        return None;
-    }
-    let candidate_count = top_k;
-    let (output, _, _, encoder) = build_sample_attempt(
-        input,
-        sampler,
-        previous_tokens,
-        PreviousTokenSource::GpuTail(previous_gpu_token),
-        params,
-        SampleAttemptConfig {
-            top_k,
-            chunks,
-            input_len,
-            candidate_count,
-            trace: cfg!(target_arch = "wasm32"),
-            encoder_label: "mirostat2_sample_token_pending encoder",
-        },
-        &mut initial_encoder,
-    )?;
-
-    Some(submit_pending_sample_output(
-        &output,
-        encoder,
-        download_label,
-    ))
-}
-
-fn submit_pending_sample_output(
-    output: &TensorData,
-    mut encoder: CommandEncoder,
-    download_label: &'static str,
-) -> PendingGpuSampledToken {
-    let device = output.device();
-    let download_size = (std::mem::size_of::<u32>() * GPU_SAMPLE_RESULT_WORDS) as u64;
-    let download = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
-        size: download_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-        label: Some(download_label),
-    });
-    encoder.copy_buffer_to_buffer(output.buffer(), 0, &download, 0, download_size);
-    device.wgpu_queue().submit(Some(encoder.finish()));
-
-    let (sender, receiver) = futures_channel::oneshot::channel();
-    download
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, move |result| {
-            _ = sender.send(result);
-        });
-
-    let token = Tensor::from(TensorData::new_from_parts(
-        device,
-        output.buffer().clone(),
-        Layout::from_parts(1, Box::new([1]), Box::new([1])),
-        DataTypeEnum::U32,
-    ));
-    PendingGpuSampledToken::new(token, download, receiver)
-}
-
-enum PreviousTokenSource<'a> {
-    HostOnly,
-    GpuTail(Option<&'a TensorData>),
-}
-
-struct SampleAttemptConfig {
-    top_k: usize,
-    chunks: usize,
-    input_len: usize,
-    candidate_count: usize,
-    trace: bool,
-    encoder_label: &'static str,
-}
-
-fn build_sample_attempt(
-    input: &TensorData,
-    sampler: &mut GpuMirostat2Sampler,
-    previous_tokens: &[u32],
-    previous_token_source: PreviousTokenSource<'_>,
-    params: GpuMirostat2SamplerParams,
-    config: SampleAttemptConfig,
-    initial_encoder: &mut Option<CommandEncoder>,
-) -> Option<(TensorData, TensorData, TensorData, CommandEncoder)> {
-    let device = input.device();
-    let mut encoder = initial_encoder.take().unwrap_or_else(|| {
-        device
-            .wgpu_device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some(config.encoder_label),
-            })
-    });
-
-    let output_per_chunk = sampler_output_per_chunk(config.candidate_count);
-    let topk_start = config.trace.then(Instant::now);
-    let (chunk_ids, chunk_values) = match previous_token_source {
-        PreviousTokenSource::HostOnly => chunk_top_k_pair_data_with_processors_with_encoder(
-            input,
-            previous_tokens,
-            ProcessorSettings {
-                temperature: params.temperature,
-                repetition_penalty: params.repetition_penalty,
-            },
-            config.candidate_count,
-            output_per_chunk,
-            Some(&mut encoder),
-        )?,
-        PreviousTokenSource::GpuTail(previous_gpu_token) => {
-            chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder(
-                input,
-                previous_tokens,
-                previous_gpu_token,
-                ProcessorSettings {
-                    temperature: params.temperature,
-                    repetition_penalty: params.repetition_penalty,
-                },
-                config.candidate_count,
-                output_per_chunk,
-                Some(&mut encoder),
-            )?
-        }
+) {
+    let Ok(ids_slice) = Tensor::as_slice_from_tensor_data::<1, u32>(ids).await else {
+        return;
     };
-    if let Some(start) = topk_start {
-        tracing::info!("sampler_trace topk_setup elapsed={:?}", start.elapsed());
-    }
-
-    let merge_start = config.trace.then(Instant::now);
-    let (ids, values) = merge_sorted_chunk_top_k_pair_data_with_encoder(
-        &chunk_ids,
-        &chunk_values,
-        crate::sampling::topk::MergeSortedChunkTopKParams {
-            chunks: config.chunks,
-            chunk_len: config.candidate_count,
-            chunk_stride: output_per_chunk,
-            input_len: config.input_len,
-            k: config.top_k,
-        },
-        Some(&mut encoder),
-    )?;
-    if let Some(start) = merge_start {
-        tracing::info!("sampler_trace merge_setup elapsed={:?}", start.elapsed());
-    }
-
-    let exactness_start = config.trace.then(Instant::now);
-    let exactness_flag =
-        if config.candidate_count < config.top_k && config.candidate_count < TOP_K_CHUNK {
-            Some(top_k_exactness_flag_data_with_encoder(
-                &values,
-                &chunk_values,
-                config.chunks,
-                config.candidate_count,
-                output_per_chunk,
-                config.top_k,
-                Some(&mut encoder),
-            )?)
-        } else {
-            None
-        };
-    if let Some(start) = exactness_start {
-        tracing::info!(
-            "sampler_trace exactness_setup elapsed={:?}",
-            start.elapsed()
-        );
-    }
-
-    let sample_start = config.trace.then(Instant::now);
-    let output = sample_from_sorted_top_k_data_with_encoder(
-        &ids,
-        &values,
-        sampler,
-        params,
-        exactness_flag.as_ref(),
-        Some(&mut encoder),
-    )?;
-    if let Some(start) = sample_start {
-        tracing::info!("sampler_trace sample_setup elapsed={:?}", start.elapsed());
-    }
-
-    Some((output, ids, values, encoder))
-}
-
-fn build_standard_sample_attempt(
-    input: &TensorData,
-    previous_tokens: &[u32],
-    previous_token_source: PreviousTokenSource<'_>,
-    params: GpuStandardSamplerParams,
-    config: SampleAttemptConfig,
-    initial_encoder: &mut Option<CommandEncoder>,
-) -> Option<(TensorData, CommandEncoder)> {
-    let device = input.device();
-    let mut encoder = initial_encoder.take().unwrap_or_else(|| {
-        device
-            .wgpu_device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some(config.encoder_label),
-            })
-    });
-
-    let output_per_chunk = sampler_output_per_chunk(config.candidate_count);
-    let topk_start = config.trace.then(Instant::now);
-    let (chunk_ids, chunk_values) = match previous_token_source {
-        PreviousTokenSource::HostOnly => chunk_top_k_pair_data_with_processors_with_encoder(
-            input,
-            previous_tokens,
-            ProcessorSettings {
-                temperature: params.temperature,
-                repetition_penalty: params.repetition_penalty,
-            },
-            config.candidate_count,
-            output_per_chunk,
-            Some(&mut encoder),
-        )?,
-        PreviousTokenSource::GpuTail(previous_gpu_token) => {
-            chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder(
-                input,
-                previous_tokens,
-                previous_gpu_token,
-                ProcessorSettings {
-                    temperature: params.temperature,
-                    repetition_penalty: params.repetition_penalty,
-                },
-                config.candidate_count,
-                output_per_chunk,
-                Some(&mut encoder),
-            )?
-        }
+    let Ok(values_slice) = Tensor::as_slice_from_tensor_data::<1, f32>(values).await else {
+        return;
     };
-    if let Some(start) = topk_start {
-        tracing::info!(
-            "sampler_trace standard_topk_setup elapsed={:?}",
-            start.elapsed()
-        );
-    }
+    let Ok(logits_slice) = Tensor::as_slice_from_tensor_data::<1, f32>(logits).await else {
+        return;
+    };
+    let logits_vec = logits_slice.as_slice();
 
-    let merge_start = config.trace.then(Instant::now);
-    let (ids, values) = merge_sorted_chunk_top_k_pair_data_with_encoder(
-        &chunk_ids,
-        &chunk_values,
-        crate::sampling::topk::MergeSortedChunkTopKParams {
-            chunks: config.chunks,
-            chunk_len: config.candidate_count,
-            chunk_stride: output_per_chunk,
-            input_len: config.input_len,
-            k: config.top_k,
-        },
-        Some(&mut encoder),
-    )?;
-    if let Some(start) = merge_start {
-        tracing::info!(
-            "sampler_trace standard_merge_setup elapsed={:?}",
-            start.elapsed()
-        );
-    }
-
-    let exactness_start = config.trace.then(Instant::now);
-    let exactness_flag =
-        if config.candidate_count < config.top_k && config.candidate_count < TOP_K_CHUNK {
-            Some(top_k_exactness_flag_data_with_encoder(
-                &values,
-                &chunk_values,
-                config.chunks,
-                config.candidate_count,
-                output_per_chunk,
-                config.top_k,
-                Some(&mut encoder),
-            )?)
+    let mut nan_count = 0usize;
+    let mut inf_pos = 0usize;
+    let mut inf_neg = 0usize;
+    let mut finite_count = 0usize;
+    let mut min_f = f32::INFINITY;
+    let mut max_f = f32::NEG_INFINITY;
+    let mut argmax = 0usize;
+    for (i, &v) in logits_vec.iter().enumerate() {
+        if v.is_nan() {
+            nan_count += 1;
+        } else if v == f32::INFINITY {
+            inf_pos += 1;
+        } else if v == f32::NEG_INFINITY {
+            inf_neg += 1;
         } else {
-            None
-        };
-    if let Some(start) = exactness_start {
-        tracing::info!(
-            "sampler_trace standard_exactness_setup elapsed={:?}",
-            start.elapsed()
-        );
-    }
-
-    let sample_start = config.trace.then(Instant::now);
-    let output = sample_standard_from_sorted_top_k_data_with_encoder(
-        &ids,
-        &values,
-        params,
-        exactness_flag.as_ref(),
-        Some(&mut encoder),
-    )?;
-    if let Some(start) = sample_start {
-        tracing::info!(
-            "sampler_trace standard_sample_setup elapsed={:?}",
-            start.elapsed()
-        );
-    }
-
-    Some((output, encoder))
-}
-
-fn sample_processed_standard_logits_pending(
-    input: &TensorData,
-    previous_tokens: &[u32],
-    previous_gpu_token: Option<&TensorData>,
-    params: GpuStandardSamplerParams,
-    mut initial_encoder: Option<CommandEncoder>,
-    download_label: &'static str,
-) -> Option<PendingGpuSampledToken> {
-    if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
-        return None;
-    }
-
-    let input_len = input.layout().shape()[0];
-    let top_k = params.top_k.min(input_len);
-    if top_k == 0 {
-        return None;
-    }
-
-    let chunks = input_len.div_ceil(TOP_K_CHUNK);
-    if top_k > TOP_K_CHUNK {
-        return None;
-    }
-    let candidate_count = top_k;
-    let (output, encoder) = build_standard_sample_attempt(
-        input,
-        previous_tokens,
-        PreviousTokenSource::GpuTail(previous_gpu_token),
-        params,
-        SampleAttemptConfig {
-            top_k,
-            chunks,
-            input_len,
-            candidate_count,
-            trace: cfg!(target_arch = "wasm32"),
-            encoder_label: "standard_sample_token_pending encoder",
-        },
-        &mut initial_encoder,
-    )?;
-
-    Some(submit_pending_sample_output(
-        &output,
-        encoder,
-        download_label,
-    ))
-}
-
-async fn sample_processed_standard_logits_to_host(
-    input: &TensorData,
-    previous_tokens: &[u32],
-    params: GpuStandardSamplerParams,
-    mut initial_encoder: Option<CommandEncoder>,
-    download_label: &'static str,
-) -> Result<Option<u32>, wgpu::BufferAsyncError> {
-    if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
-        return Ok(None);
-    }
-
-    let input_len = input.layout().shape()[0];
-    let top_k = params.top_k.min(input_len);
-    if top_k == 0 {
-        return Ok(None);
-    }
-
-    let chunks = input_len.div_ceil(TOP_K_CHUNK);
-    let mut candidate_count = initial_sampler_candidate_count(top_k, chunks);
-    let trace = cfg!(target_arch = "wasm32")
-        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-        || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
-    let mut attempt = 0usize;
-    loop {
-        attempt += 1;
-        let device = input.device();
-        let Some((output, mut encoder)) = build_standard_sample_attempt(
-            input,
-            previous_tokens,
-            PreviousTokenSource::HostOnly,
-            params,
-            SampleAttemptConfig {
-                top_k,
-                chunks,
-                input_len,
-                candidate_count,
-                trace,
-                encoder_label: "standard_sample_token_to_host encoder",
-            },
-            &mut initial_encoder,
-        ) else {
-            return Ok(None);
-        };
-
-        let download_size = (std::mem::size_of::<u32>() * GPU_SAMPLE_RESULT_WORDS) as u64;
-        let download = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
-            size: download_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-            label: Some(download_label),
-        });
-        encoder.copy_buffer_to_buffer(output.buffer(), 0, &download, 0, download_size);
-
-        let submit_start = trace.then(Instant::now);
-        device.wgpu_queue().submit(Some(encoder.finish()));
-        if let Some(start) = submit_start {
-            tracing::info!(
-                "sampler_trace standard_submit elapsed={:?}",
-                start.elapsed()
-            );
-        }
-
-        let map_start = trace.then(Instant::now);
-        let (sender, receiver) = futures_channel::oneshot::channel();
-        download
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                _ = sender.send(result);
-            });
-        #[cfg(not(target_arch = "wasm32"))]
-        device.poll_wait();
-        receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
-        if let Some(start) = map_start {
-            tracing::info!(
-                "sampler_trace standard_map_wait elapsed={:?}",
-                start.elapsed()
-            );
-        }
-
-        let view = download.slice(..).get_mapped_range();
-        let word_size = std::mem::size_of::<u32>();
-        let status = view
-            .get(..word_size)
-            .map(bytemuck::from_bytes::<u32>)
-            .copied()
-            .unwrap_or(GPU_SAMPLE_STATUS_INVALID);
-        let token = view
-            .get(word_size..word_size * GPU_SAMPLE_RESULT_WORDS)
-            .map(bytemuck::from_bytes::<u32>)
-            .copied()
-            .unwrap_or_default();
-        drop(view);
-        download.unmap();
-
-        match status {
-            GPU_SAMPLE_STATUS_SAMPLED => {
-                if trace {
-                    tracing::info!(
-                        "sampler_trace standard_sampled attempt={attempt} top_k={top_k} chunks={chunks} candidate_count={candidate_count} token={token}"
-                    );
-                }
-                return Ok(Some(token));
+            finite_count += 1;
+            if v < min_f {
+                min_f = v;
             }
-            GPU_SAMPLE_STATUS_RETRY_NEEDED => {
-                if trace {
-                    tracing::info!(
-                        "sampler_trace standard_retry attempt={attempt} top_k={top_k} chunks={chunks} candidate_count={candidate_count}"
-                    );
-                }
-            }
-            _ => {
-                if trace {
-                    tracing::warn!(
-                        "sampler_trace standard_invalid attempt={attempt} top_k={top_k} chunks={chunks} candidate_count={candidate_count} status={status}"
-                    );
-                }
-                return Ok(None);
+            if v > max_f {
+                max_f = v;
+                argmax = i;
             }
         }
-
-        let next = next_sampler_candidate_count(candidate_count, top_k);
-        if next == candidate_count {
-            return Ok(None);
-        }
-        candidate_count = next;
     }
-}
-
-async fn sample_processed_logits_to_host(
-    input: &TensorData,
-    sampler: &mut GpuMirostat2Sampler,
-    previous_tokens: &[u32],
-    params: GpuMirostat2SamplerParams,
-    mut initial_encoder: Option<CommandEncoder>,
-    download_label: &'static str,
-) -> Result<Option<u32>, wgpu::BufferAsyncError> {
-    if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
-        return Ok(None);
-    }
-
-    let input_len = input.layout().shape()[0];
-    let top_k = params.top_k.min(input_len);
-    if top_k == 0 {
-        return Ok(None);
-    }
-
-    let chunks = input_len.div_ceil(TOP_K_CHUNK);
-    let mut candidate_count = initial_sampler_candidate_count(top_k, chunks);
-    let trace = cfg!(target_arch = "wasm32")
-        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-        || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
-    let debug_dump = std::env::var_os("FUSOR_DEBUG_SAMPLER").is_some();
-    let mut attempt = 0usize;
-    loop {
-        attempt += 1;
-        let device = input.device();
-        let Some((output, ids, values, mut encoder)) = build_sample_attempt(
-            input,
-            sampler,
-            previous_tokens,
-            PreviousTokenSource::HostOnly,
-            params,
-            SampleAttemptConfig {
-                top_k,
-                chunks,
-                input_len,
-                candidate_count,
-                trace,
-                encoder_label: "mirostat2_sample_token_to_host encoder",
-            },
-            &mut initial_encoder,
-        ) else {
-            return Ok(None);
-        };
-
-        let download_size = (std::mem::size_of::<u32>() * GPU_SAMPLE_RESULT_WORDS) as u64;
-        let download = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
-            size: download_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-            label: Some(download_label),
-        });
-        encoder.copy_buffer_to_buffer(output.buffer(), 0, &download, 0, download_size);
-
-        let debug_buffers = if debug_dump {
-            let ids_bytes = (std::mem::size_of::<u32>() * top_k) as u64;
-            let values_bytes = (std::mem::size_of::<f32>() * top_k) as u64;
-            let logits_bytes = (std::mem::size_of::<f32>() * input_len) as u64;
-            let ids_dl = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
-                size: ids_bytes,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-                label: Some("debug sampler ids download"),
-            });
-            let values_dl = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
-                size: values_bytes,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-                label: Some("debug sampler values download"),
-            });
-            let logits_dl = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
-                size: logits_bytes,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-                label: Some("debug sampler logits download"),
-            });
-            encoder.copy_buffer_to_buffer(ids.buffer(), 0, &ids_dl, 0, ids_bytes);
-            encoder.copy_buffer_to_buffer(values.buffer(), 0, &values_dl, 0, values_bytes);
-            encoder.copy_buffer_to_buffer(input.buffer(), 0, &logits_dl, 0, logits_bytes);
-            Some((ids_dl, values_dl, logits_dl))
-        } else {
-            None
-        };
-
-        let submit_start = trace.then(Instant::now);
-        device.wgpu_queue().submit(Some(encoder.finish()));
-        if let Some(start) = submit_start {
-            tracing::info!("sampler_trace submit elapsed={:?}", start.elapsed());
-        }
-
-        let map_start = trace.then(Instant::now);
-        let (sender, receiver) = futures_channel::oneshot::channel();
-        download
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                _ = sender.send(result);
-            });
-        #[cfg(not(target_arch = "wasm32"))]
-        device.poll_wait();
-        receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
-        if let Some(start) = map_start {
-            tracing::info!("sampler_trace map_wait elapsed={:?}", start.elapsed());
-        }
-
-        let view = download.slice(..).get_mapped_range();
-        let word_size = std::mem::size_of::<u32>();
-        let status = view
-            .get(..word_size)
-            .map(bytemuck::from_bytes::<u32>)
-            .copied()
-            .unwrap_or(GPU_SAMPLE_STATUS_INVALID);
-        let token = view
-            .get(word_size..word_size * GPU_SAMPLE_RESULT_WORDS)
-            .map(bytemuck::from_bytes::<u32>)
-            .copied()
-            .unwrap_or_default();
-        drop(view);
-        download.unmap();
-
-        match status {
-            GPU_SAMPLE_STATUS_SAMPLED => {
-                if trace {
-                    tracing::info!(
-                        "sampler_trace sampled attempt={attempt} top_k={top_k} chunks={chunks} candidate_count={candidate_count} token={token}"
-                    );
-                }
-                return Ok(Some(token));
-            }
-            GPU_SAMPLE_STATUS_RETRY_NEEDED => {
-                if trace {
-                    tracing::info!(
-                        "sampler_trace retry attempt={attempt} top_k={top_k} chunks={chunks} candidate_count={candidate_count}"
-                    );
-                }
-            }
-            _ => {
-                if trace {
-                    tracing::warn!(
-                        "sampler_trace invalid attempt={attempt} top_k={top_k} chunks={chunks} candidate_count={candidate_count} status={status}"
-                    );
-                }
-                if let Some((ids_dl, values_dl, logits_dl)) = debug_buffers {
-                    let (id_tx, id_rx) = futures_channel::oneshot::channel();
-                    ids_dl.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                        _ = id_tx.send(r);
-                    });
-                    let (val_tx, val_rx) = futures_channel::oneshot::channel();
-                    values_dl
-                        .slice(..)
-                        .map_async(wgpu::MapMode::Read, move |r| {
-                            _ = val_tx.send(r);
-                        });
-                    let (log_tx, log_rx) = futures_channel::oneshot::channel();
-                    logits_dl
-                        .slice(..)
-                        .map_async(wgpu::MapMode::Read, move |r| {
-                            _ = log_tx.send(r);
-                        });
-                    #[cfg(not(target_arch = "wasm32"))]
-                    device.poll_wait();
-                    let _ = id_rx.await;
-                    let _ = val_rx.await;
-                    let _ = log_rx.await;
-                    let ids_view = ids_dl.slice(..).get_mapped_range();
-                    let vals_view = values_dl.slice(..).get_mapped_range();
-                    let logits_view = logits_dl.slice(..).get_mapped_range();
-                    let ids_vec: Vec<u32> = bytemuck::cast_slice(&ids_view).to_vec();
-                    let vals_vec: Vec<f32> = bytemuck::cast_slice(&vals_view).to_vec();
-                    let logits_vec: Vec<f32> = bytemuck::cast_slice(&logits_view).to_vec();
-                    drop(ids_view);
-                    drop(vals_view);
-                    drop(logits_view);
-                    ids_dl.unmap();
-                    values_dl.unmap();
-                    logits_dl.unmap();
-
-                    let mut nan_count = 0usize;
-                    let mut inf_pos = 0usize;
-                    let mut inf_neg = 0usize;
-                    let mut finite_count = 0usize;
-                    let mut min_f = f32::INFINITY;
-                    let mut max_f = f32::NEG_INFINITY;
-                    let mut argmax = 0usize;
-                    for (i, &v) in logits_vec.iter().enumerate() {
-                        if v.is_nan() {
-                            nan_count += 1;
-                        } else if v == f32::INFINITY {
-                            inf_pos += 1;
-                        } else if v == f32::NEG_INFINITY {
-                            inf_neg += 1;
-                        } else {
-                            finite_count += 1;
-                            if v < min_f {
-                                min_f = v;
-                            }
-                            if v > max_f {
-                                max_f = v;
-                                argmax = i;
-                            }
-                        }
-                    }
-                    tracing::warn!(
-                        "sampler_debug INVALID ids={:?} values={:?} logits_len={} nan={} +inf={} -inf={} finite={} min={} max={} argmax={} first8={:?} previous_tokens_last={:?}",
-                        ids_vec,
-                        vals_vec,
-                        logits_vec.len(),
-                        nan_count,
-                        inf_pos,
-                        inf_neg,
-                        finite_count,
-                        min_f,
-                        max_f,
-                        argmax,
-                        logits_vec.iter().take(8).collect::<Vec<_>>(),
-                        previous_tokens.iter().rev().take(8).collect::<Vec<_>>()
-                    );
-                }
-                return Ok(None);
-            }
-        }
-
-        let next = next_sampler_candidate_count(candidate_count, top_k);
-        if next == candidate_count {
-            return Ok(None);
-        }
-        candidate_count = next;
-    }
+    tracing::warn!(
+        "sampler_debug INVALID ids={:?} values={:?} logits_len={} nan={} +inf={} -inf={} finite={} min={} max={} argmax={} first8={:?} previous_tokens_last={:?}",
+        ids_slice.as_slice(),
+        values_slice.as_slice(),
+        logits_vec.len(),
+        nan_count,
+        inf_pos,
+        inf_neg,
+        finite_count,
+        min_f,
+        max_f,
+        argmax,
+        logits_vec.iter().take(8).collect::<Vec<_>>(),
+        previous_tokens.iter().rev().take(8).collect::<Vec<_>>()
+    );
 }

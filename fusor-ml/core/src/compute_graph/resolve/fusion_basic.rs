@@ -8,7 +8,7 @@ impl Resolver {
     ) -> bool {
         let node_variant = self.execution_graph[node_idx].variant.clone();
 
-        let ComputeGraphNodeVariant::Nary(nary) = node_variant else {
+        let ExecutionVariant::Elementwise(nary) = node_variant else {
             return false;
         };
 
@@ -30,7 +30,21 @@ impl Resolver {
             if !self.execution_graph.contains_node(input_exec) {
                 continue;
             }
-            let ComputeGraphNodeVariant::Nary(input_nary) =
+            // Inlining duplicates the producer's work unless this node is its
+            // only consumer: the producer still materializes for everyone
+            // else (e.g. the residual stream feeds every later layer — fusing
+            // it forward would re-sum the whole prefix per layer). A user-held
+            // reference alone doesn't block fusion — only another consumer in
+            // this resolve does.
+            if self
+                .execution_graph
+                .neighbors_directed(input_exec, petgraph::Direction::Outgoing)
+                .count()
+                != 1
+            {
+                continue;
+            }
+            let ExecutionVariant::Elementwise(input_nary) =
                 &self.execution_graph[input_exec].variant
             else {
                 continue;
@@ -86,14 +100,14 @@ impl Resolver {
         // Deduplicate and remove unused inputs
         let (final_inputs, final_expression) = Self::deduplicate_inputs(all_inputs, expression);
 
-        let new_nary = NaryOperation {
+        let new_nary = ElementwiseOperation {
             inputs: final_inputs.clone(),
             expression: final_expression,
             shape: nary.shape.clone(),
             output_datatype: nary.output_datatype,
         };
 
-        self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::Nary(new_nary.clone());
+        self.execution_graph[node_idx].variant = ExecutionVariant::Elementwise(new_nary.clone());
 
         // Update graph edges
         for (input_exec, new_inputs) in fused_execs {
@@ -390,11 +404,9 @@ impl Resolver {
 
     /// Try to extract a unary function chain from a node variant.
     /// Only Nary ops with a single input and element-wise access can be converted.
-    pub(super) fn try_get_unary_chain(
-        variant: &ComputeGraphNodeVariant,
-    ) -> Option<ExtractedUnaryChain> {
+    pub(super) fn try_get_unary_chain(variant: &ExecutionVariant) -> Option<ExtractedUnaryChain> {
         match variant {
-            ComputeGraphNodeVariant::Nary(nary) => nary.try_extract_unary_chain(),
+            ExecutionVariant::Elementwise(nary) => nary.try_extract_unary_chain(),
             _ => None,
         }
     }
@@ -420,7 +432,7 @@ impl Resolver {
         };
 
         let input_variant = self.execution_graph[input_exec_idx].variant.clone();
-        let ComputeGraphNodeVariant::Reduce(reduce_op) = input_variant else {
+        let ExecutionVariant::Reduce(reduce_op) = input_variant else {
             return false;
         };
 
@@ -430,76 +442,133 @@ impl Resolver {
         new_reduce.post_element_wise =
             UnaryFunctionChain::new(existing_post, reduce_op.post_element_wise.input_datatype());
 
-        self.execution_graph[node_idx].variant =
-            ComputeGraphNodeVariant::Reduce(new_reduce.clone());
+        self.execution_graph[node_idx].variant = ExecutionVariant::Reduce(new_reduce.clone());
 
-        let reduce_input_inner = reduce_op.value;
-        if let Some(reduce_input_exec) = self.get_input_node_in_exec_graph(reduce_input_inner) {
-            self.execution_graph
-                .add_edge(reduce_input_exec, node_idx, ());
+        for &reduce_input_inner in &reduce_op.inputs {
+            if let Some(reduce_input_exec) = self.get_input_node_in_exec_graph(reduce_input_inner) {
+                self.execution_graph
+                    .add_edge(reduce_input_exec, node_idx, ());
+            }
         }
 
         if let Some(edge) = self.execution_graph.find_edge(input_exec_idx, node_idx) {
             self.execution_graph.remove_edge(edge);
         }
-        self.add_physical_dependencies(graph, node_idx, &[reduce_input_inner]);
+        self.add_physical_dependencies(graph, node_idx, &reduce_op.inputs);
         self.remove_node_if_dead(input_exec_idx);
         true
     }
 
-    pub(super) fn try_fuse_into_rmsnorm(
+    /// Inline elementwise producers into a reduce's fused expression: the
+    /// reduce evaluates the producer at every index-space coordinate, so a
+    /// producer consumed only by this reduce never needs to materialize.
+    /// Composed contractions that recognition did not claim collapse to a
+    /// single map-reduce kernel here, where the tiled lowering can stage
+    /// their reused inputs through workgroup memory.
+    pub(super) fn try_fuse_producer_into_reduce(
         &mut self,
         graph: &mut ComputeGraphInner,
         node_idx: ExecutionNodeIndex,
     ) -> bool {
-        let ComputeGraphNodeVariant::Nary(_) = &self.execution_graph[node_idx].variant else {
+        let ExecutionVariant::Reduce(reduce) = self.execution_graph[node_idx].variant.clone()
+        else {
             return false;
         };
-        let node_variant = self.execution_graph[node_idx].variant.clone();
-        let Some(el_op) = Self::try_get_unary_chain(&node_variant) else {
-            return false;
-        };
-        let input_inner = el_op.value;
-        if self.check_cached(graph, input_inner) {
-            return false;
-        }
-        let Some(input_exec_idx) = self.get_input_node_in_exec_graph(input_inner) else {
-            return false;
-        };
-        let input_variant = self.execution_graph[input_exec_idx].variant.clone();
-        let Some(rms_op) = as_rms_norm(&input_variant) else {
-            return false;
-        };
-        let mut new_rms = rms_op.clone();
-        let mut existing = new_rms.post_element_wise.functions.clone();
-        existing.extend(el_op.functions.functions.iter().cloned());
-        new_rms.post_element_wise =
-            UnaryFunctionChain::new(existing, rms_op.post_element_wise.input_datatype());
 
-        self.execution_graph[node_idx].variant =
-            ComputeGraphNodeVariant::GraphOp(Arc::new(new_rms.clone()));
+        let mut expression = reduce.expression.clone();
+        let mut all_inputs = reduce.inputs.clone();
+        let mut fused_execs = Vec::new();
+        let max_fused_inputs = graph.device().nary_direct_input_binding_budget();
 
-        // Re-wire dependency edges to the fused RmsNorm inputs.
-        let mut deps = vec![new_rms.input];
-        if let Some(residual) = new_rms.residual {
-            deps.push(residual);
-        }
-        deps.push(new_rms.weight);
-        if let Some(bias) = new_rms.bias {
-            deps.push(bias);
-        }
-        for &dep in &deps {
-            if let Some(idx) = self.get_input_node_in_exec_graph(dep)
-                && self.execution_graph.find_edge(idx, node_idx).is_none()
+        for &input_inner in reduce.inputs.iter() {
+            if self.check_cached(graph, input_inner) {
+                continue;
+            }
+            let Some(input_exec) = self.get_input_node_in_exec_graph(input_inner) else {
+                continue;
+            };
+            if !self.execution_graph.contains_node(input_exec) {
+                continue;
+            }
+            // Same sole-consumer rule as nary fusion: inlining a shared
+            // producer would re-evaluate it for every other consumer.
+            if self
+                .execution_graph
+                .neighbors_directed(input_exec, petgraph::Direction::Outgoing)
+                .count()
+                != 1
             {
-                self.execution_graph.add_edge(idx, node_idx, ());
+                continue;
+            }
+            let ExecutionVariant::Elementwise(input_nary) =
+                &self.execution_graph[input_exec].variant
+            else {
+                continue;
+            };
+            // The reduce evaluates this input across the full index space;
+            // a producer with any other shape reads out of range.
+            if input_nary.shape != reduce.shape {
+                continue;
+            }
+
+            let offset = all_inputs.len();
+            let inlined = Self::offset_input_indices(&input_nary.expression, offset);
+            let target_slots: Vec<usize> = all_inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, value)| (*value == input_inner).then_some(slot))
+                .collect();
+            let mut new_expression = expression.clone();
+            let mut success = true;
+            for slot in target_slots {
+                let (next, s) = Self::substitute_input_in_expr(&new_expression, slot, &inlined);
+                new_expression = next;
+                success &= s;
+            }
+
+            if success {
+                let unique_inputs: FxHashSet<_> = all_inputs
+                    .iter()
+                    .chain(input_nary.inputs.iter())
+                    .copied()
+                    .collect();
+                if unique_inputs.len() > max_fused_inputs {
+                    continue;
+                }
+
+                expression = new_expression;
+                all_inputs.extend(input_nary.inputs.iter().copied());
+                fused_execs.push((input_exec, input_nary.inputs.clone()));
             }
         }
-        if let Some(edge) = self.execution_graph.find_edge(input_exec_idx, node_idx) {
-            self.execution_graph.remove_edge(edge);
+
+        if fused_execs.is_empty() {
+            return false;
         }
-        self.add_physical_dependencies(graph, node_idx, &deps);
-        self.remove_node_if_dead(input_exec_idx);
+
+        let (final_inputs, final_expression) = Self::deduplicate_inputs(all_inputs, expression);
+
+        let mut new_reduce = reduce.clone();
+        new_reduce.inputs = final_inputs;
+        new_reduce.expression = final_expression;
+        let new_inputs = new_reduce.inputs.clone();
+        self.execution_graph[node_idx].variant = ExecutionVariant::Reduce(new_reduce);
+
+        for (input_exec, producer_inputs) in fused_execs {
+            if let Some(edge) = self.execution_graph.find_edge(input_exec, node_idx) {
+                self.execution_graph.remove_edge(edge);
+            }
+            for &new_input in &producer_inputs {
+                if let Some(exec) = self.get_input_node_in_exec_graph(new_input)
+                    && self.execution_graph.find_edge(exec, node_idx).is_none()
+                {
+                    self.execution_graph.add_edge(exec, node_idx, ());
+                }
+            }
+            self.remove_node_if_dead(input_exec);
+        }
+
+        self.add_physical_dependencies(graph, node_idx, &new_inputs);
         true
     }
 }

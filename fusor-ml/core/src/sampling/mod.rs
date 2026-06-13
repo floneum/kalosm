@@ -3,18 +3,13 @@ use crate::{Device, Tensor, tensor::TensorData};
 mod mirostat;
 mod pipeline;
 pub(crate) mod processors;
-mod qmat_topk;
 mod standard_sampler;
 mod topk;
 
 #[cfg(test)]
 mod tests;
 
-pub(crate) use pipeline::{
-    mirostat2_sample_token_to_host, qmat_mirostat2_sample_lazy_token_pending,
-    qmat_mirostat2_sample_lazy_token_to_host, qmat_standard_sample_lazy_token_pending,
-    qmat_standard_sample_lazy_token_to_host, standard_sample_token_to_host,
-};
+pub(crate) use pipeline::{GpuSamplerRequest, sample_token_pending, sample_token_to_host};
 pub(crate) use topk::{
     MergeSortedChunkTopKParams, chunk_top_k_pair_data_with_encoder,
     merge_sorted_chunk_top_k_pair_data_with_encoder,

@@ -1,6 +1,6 @@
 use crate::{
     Tensor,
-    nary_wise::{NaryExpr, NaryOperation},
+    nary_wise::{ElementwiseOperation, NaryExpr},
 };
 
 /// Compute the output shape for an index_select operation.
@@ -28,7 +28,7 @@ impl Tensor {
         indexes.assert_datatype::<u32>();
         assert!(dimension < self.rank());
         let output_shape = index_select_output_shape(dimension, self.shape(), indexes.shape());
-        let nary = NaryOperation {
+        let nary = ElementwiseOperation {
             inputs: vec![self.key(), indexes.key()],
             expression: NaryExpr::index_select(self.rank(), dimension),
             shape: output_shape.clone(),

@@ -659,7 +659,8 @@ where
         };
 
         let _ = hidden
-            .try_sample_mirostat2_token_q_mat(model.output_matrix(), &mut sampler, &[], params)
+            .q_mat_mul(model.output_matrix())
+            .sample_mirostat2_token(&mut sampler, &[], params)
             .await;
         if let Some(start) = start {
             tracing::info!(

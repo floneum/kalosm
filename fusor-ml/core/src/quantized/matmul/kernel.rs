@@ -13,6 +13,185 @@ enum QmatmulDirectTokens {
 }
 
 impl QMatMulOperation {
+    /// Lower this operation to its kernel plan. Recognition and epilogue
+    /// fusion only build operations the direct paths can lower (see
+    /// `supports_elementwise_epilogue_fusion`), so a `None` from every path
+    /// here is an invariant violation, not a recoverable state.
+    pub(crate) fn build_direct_kernels(
+        &self,
+        graph: &crate::compute_graph::ComputeGraphInner,
+        workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
+        inputs: &[MirValue],
+    ) -> Result<QMatMulKernelPlan, QMatMulLoweringError> {
+        if inputs
+            .last()
+            .and_then(MirValue::as_tensor)
+            .is_some_and(|output| output.layout().shape().contains(&0))
+        {
+            return Ok(QMatMulKernelPlan::EmptyOutput);
+        }
+
+        if let Some(kernels) = self.build_m_padded_kernels(graph, inputs) {
+            return Ok(QMatMulKernelPlan::Kernels(kernels));
+        }
+        if let Some(kernel) = self.build_direct_kernel(graph, workgroup_shape, inputs) {
+            return Ok(QMatMulKernelPlan::Kernels(vec![kernel]));
+        }
+        Err(QMatMulLoweringError::new(self.name()))
+    }
+
+    /// Lower an M-padded matmul: copy the activation into a zero-padded
+    /// scratch tensor (the same kernel a `resize` view lowers to) and run the
+    /// matmul over the padded views. The output buffer's slack rows were
+    /// allocated by `qmatmul_operation_inputs`, which makes the same
+    /// `m_pad_target` decision.
+    fn build_m_padded_kernels(
+        &self,
+        graph: &crate::compute_graph::ComputeGraphInner,
+        inputs: &[MirValue],
+    ) -> Option<Vec<DirectKernel>> {
+        let device = graph.device();
+        let padded_m = self.m_pad_target(KernelDeviceCaps::from_device(&device))?;
+        // A pad target implies no epilogues: inputs are [input, matrix, output].
+        let [input, MirValue::QMatrix(matrix), output] = inputs else {
+            return None;
+        };
+        let input = input.as_tensor()?;
+        let output = output.as_tensor()?;
+        let in_shape = input.layout().shape();
+        let out_shape = output.layout().shape();
+        if in_shape.len() < 2 || out_shape.len() != in_shape.len() {
+            return None;
+        }
+        let m_axis = in_shape.len() - 2;
+
+        let mut padded_in_shape = in_shape.to_vec();
+        padded_in_shape[m_axis] = padded_m;
+        let scratch = TensorData::new_for_shape(&device, &padded_in_shape, input.datatype());
+        let pad_copy = crate::view::ViewOperation {
+            input: self.input,
+            stages: vec![crate::view::ViewStage {
+                layout: Layout::from_parts(
+                    0,
+                    padded_in_shape.into(),
+                    Layout::continuous_strides(in_shape),
+                ),
+                input_shape: in_shape.into(),
+                defined: in_shape.into(),
+                fill: crate::view::zero_scalar(input.datatype()),
+            }],
+            datatype: input.datatype(),
+        };
+        let pad_workgroup = pad_copy
+            .workgroup_shape_constraints(&device)
+            .solve(device.max_subgroup_size(), &device.limits())?;
+        let pad_inputs = [input.clone().into(), scratch.clone().into()];
+        let pad_kernel = pad_copy.build_direct_kernel(graph, &pad_workgroup, &pad_inputs)?;
+
+        let mut padded_out_shape = out_shape.to_vec();
+        padded_out_shape[m_axis] = padded_m;
+        let padded_out_layout = Layout::contiguous(&padded_out_shape);
+        let padded_bytes =
+            padded_out_shape.iter().product::<usize>() * output.datatype().element_size();
+        if output.layout().offset() != 0 || (padded_bytes as u64) > output.buffer().size() {
+            return None;
+        }
+        let padded_output = TensorData::new_from_parts(
+            &device,
+            output.buffer().clone(),
+            padded_out_layout,
+            output.datatype(),
+        );
+
+        let matmul = if matches!(matrix.datatype(), GgmlType::F32 | GgmlType::F16) {
+            self.build_dense_direct_kernel(graph, &scratch, matrix, &padded_output)?
+        } else {
+            Self::direct_kernel_for_tensors(
+                &device,
+                DirectKernelTensors {
+                    input: &scratch,
+                    matrix,
+                    pre_extra_tensors: &[],
+                    post_extra_tensors: &[],
+                    output: &padded_output,
+                },
+                self.name(),
+                DirectKernelChains {
+                    pre_expr: None,
+                    post_expr: None,
+                    post_accumulator_offsets: &[],
+                },
+                Some((self, inputs)),
+            )?
+        };
+        Some(vec![pad_kernel, matmul])
+    }
+
+    /// F32/F16 ggml storage is dense values: read the matrix buffer as a
+    /// transposed dense weight and run a regular matmul kernel.
+    fn build_dense_direct_kernel(
+        &self,
+        graph: &crate::compute_graph::ComputeGraphInner,
+        input: &TensorData,
+        matrix: &QMatrix,
+        output: &TensorData,
+    ) -> Option<DirectKernel> {
+        let [n, k] = matrix.shape() else {
+            return None;
+        };
+        let (n, k) = (*n, *k);
+        let input_shape = input.layout().shape();
+        let rank = input_shape.len();
+        if rank < 2 {
+            return None;
+        }
+        let mut dense_shape = input_shape.to_vec();
+        dense_shape[rank - 2] = k;
+        dense_shape[rank - 1] = n;
+        let mut dense_strides = vec![0; rank];
+        dense_strides[rank - 2] = 1;
+        dense_strides[rank - 1] = k;
+        let matrix_datatype = match matrix.datatype() {
+            GgmlType::F32 => DataTypeEnum::F32,
+            GgmlType::F16 => DataTypeEnum::F16,
+            _ => return None,
+        };
+        if input.datatype() != matrix_datatype || output.datatype() != matrix_datatype {
+            return None;
+        }
+        let dense_weight_t = TensorData::new_from_parts(
+            matrix.device(),
+            matrix.buffer().clone(),
+            Layout::from_parts(
+                0,
+                dense_shape.into_boxed_slice(),
+                dense_strides.into_boxed_slice(),
+            ),
+            matrix_datatype,
+        );
+        let device = graph.device();
+        let dense_matmul = MatMulOperation::new(
+            matrix_datatype,
+            self.input,
+            self.input,
+            input.layout().shape(),
+            dense_weight_t.layout().shape(),
+            None,
+            &device,
+        );
+        dense_matmul.build_direct_kernel(
+            graph,
+            &dense_matmul
+                .workgroup_shape_constraints(&device)
+                .solve(device.max_subgroup_size(), &device.limits())?,
+            &[
+                input.clone().into(),
+                dense_weight_t.into(),
+                output.clone().into(),
+            ],
+        )
+    }
+
     /// Build a direct quantized-matmul kernel for the supplied tensors.
     /// `pre_chain`/`post_chain` are pre- and post-element-wise unary chains
     /// to fuse into the kernel; pass `None` to skip. `operation_key` ties the
@@ -638,7 +817,9 @@ impl Operation for QMatMulOperation {
     }
 
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
-        let base = qmatmul_operation_inputs(self.input, &self.matrix, &self.out_shape, nodes);
+        let m_pad = self.m_pad_target(KernelDeviceCaps::from_device(&nodes.device()));
+        let base =
+            qmatmul_operation_inputs(self.input, &self.matrix, &self.out_shape, m_pad, nodes);
         let pre_extras = self
             .pre_element_wise_expr
             .as_ref()
@@ -676,6 +857,38 @@ impl Operation for QMatMulOperation {
             return None;
         };
         let output = inputs.last()?.as_tensor()?;
+        // A rank-1 activation is a single matrix row: lower it through the
+        // same [1, K] -> [1, N] views the rank-2 path uses.
+        let input_row;
+        let output_row;
+        let (input, output) = if input.layout().rank() == 1 && output.layout().rank() == 1 {
+            let in_len = input.layout().shape()[0];
+            let out_len = output.layout().shape()[0];
+            let out_stride = output.layout().strides()[0];
+            input_row = TensorData::new_from_parts(
+                input.device(),
+                input.buffer().clone(),
+                Layout::from_parts(
+                    input.layout().offset(),
+                    Box::new([1, in_len]),
+                    Box::new([0, input.layout().strides()[0]]),
+                ),
+                input.datatype(),
+            );
+            output_row = TensorData::new_from_parts(
+                output.device(),
+                output.buffer().clone(),
+                Layout::from_parts(
+                    output.layout().offset(),
+                    Box::new([1, out_len]),
+                    Box::new([out_len * out_stride, out_stride]),
+                ),
+                output.datatype(),
+            );
+            (&input_row, &output_row)
+        } else {
+            (input, output)
+        };
         let pre_extra_count = self
             .pre_element_wise_expr
             .as_ref()
@@ -740,6 +953,12 @@ impl Operation for QMatMulOperation {
             }
         }
         if matches!(matrix.datatype(), GgmlType::F32 | GgmlType::F16) {
+            // The dense kernel has no epilogue slots; fusion never attaches
+            // epilogues to dense-storage operations (see
+            // `supports_elementwise_epilogue_fusion`).
+            if self.pre_element_wise_expr.is_some() || self.post_element_wise_expr.is_some() {
+                return None;
+            }
             return self.build_dense_direct_kernel(graph, input, matrix, output);
         }
         Self::direct_kernel_for_tensors(

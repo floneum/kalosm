@@ -16,7 +16,13 @@ impl Resolver {
                 && let Some(input_exec_idx) = self.get_input_node_in_exec_graph(input_inner)
             {
                 let input_variant = self.execution_graph[input_exec_idx].variant.clone();
-                if let ComputeGraphNodeVariant::MatMul(matmul_op) = input_variant {
+                // An un-flattened operand was chosen for the coop kernel,
+                // which hosts no element-wise chains: fusing one here would
+                // demote the matmul to the generic divmod-per-load reduce.
+                if let ExecutionVariant::MatMul(matmul_op) = input_variant
+                    && matmul_op.a.is_plain()
+                    && matmul_op.b.is_plain()
+                {
                     let mut new_matmul = matmul_op.clone();
                     let mut existing_post = new_matmul.post_element_wise.functions.clone();
                     existing_post.extend(el_op.functions.functions.iter().cloned());
@@ -26,7 +32,7 @@ impl Resolver {
                     );
 
                     self.execution_graph[node_idx].variant =
-                        ComputeGraphNodeVariant::MatMul(new_matmul.clone());
+                        ExecutionVariant::MatMul(new_matmul.clone());
 
                     let (first_inner, second_inner) = (matmul_op.first, matmul_op.second);
                     if let Some(idx) = self.get_input_node_in_exec_graph(first_inner) {
@@ -49,7 +55,7 @@ impl Resolver {
         // qmatmul. This handles composite expressions like GELU and ordered
         // extra inputs whose layouts match the output visitation shape.
         if allow_qmatmul_elementwise_fusion
-            && let ComputeGraphNodeVariant::Nary(nary) = &node_variant
+            && let ExecutionVariant::Elementwise(nary) = &node_variant
         {
             // Split/gate expressions built from `narrow` views of a qmatmul
             // output (e.g. SwiGLU's gate/up halves) reach the qmatmul through
@@ -63,19 +69,17 @@ impl Resolver {
                 if self.get_input_node_in_exec_graph(input_inner).is_none() {
                     continue;
                 }
-                let (qmatmul_inner, map_chain) = self
-                    .walk_map_layout_chain(input_inner)
-                    .unwrap_or((input_inner, Vec::new()));
+                let (qmatmul_inner, map_chain) = self.walk_view_chain(input_inner);
                 let Some(qmatmul_exec_idx) = self.get_input_node_in_exec_graph(qmatmul_inner)
                 else {
                     continue;
                 };
-                let ComputeGraphNodeVariant::QMatMul(qmatmul_op) =
+                let ExecutionVariant::QMatMul(qmatmul_op) =
                     self.execution_graph[qmatmul_exec_idx].variant.clone()
                 else {
                     continue;
                 };
-                if map_chain.is_empty()
+                if map_chain.is_none()
                     && !self.check_cached(graph, input_inner)
                     && qmatmul_op.post_element_wise_expr.is_none()
                     && qmatmul_op.in_shape[..qmatmul_op.in_shape.len() - 1]
@@ -128,10 +132,11 @@ impl Resolver {
                     self.commit_qmatmul_post_fusion(graph, node_idx, &nary.inputs, new_q);
                     return true;
                 }
-                let mapped_layout = Self::apply_map_layout_chain(
-                    &Layout::contiguous(&qmatmul_op.out_shape),
-                    &map_chain,
-                );
+                let Some(mapped_layout) =
+                    Self::apply_view_chain(&Layout::contiguous(&qmatmul_op.out_shape), &map_chain)
+                else {
+                    continue;
+                };
                 if mapped_layout != Layout::contiguous(&nary.shape) {
                     continue;
                 }
@@ -152,23 +157,21 @@ impl Resolver {
                 let mut replacements = vec![None; nary.inputs.len()];
                 let mut valid_expression = true;
                 for (input_idx, &nary_input) in nary.inputs.iter().enumerate() {
-                    let (base_inner, chain) = self
-                        .walk_map_layout_chain(nary_input)
-                        .unwrap_or((nary_input, Vec::new()));
+                    let (base_inner, chain) = self.walk_view_chain(nary_input);
                     let base_qmatmul =
                         self.get_input_node_in_exec_graph(base_inner)
                             .and_then(|exec| match &self.execution_graph[exec].variant {
-                                ComputeGraphNodeVariant::QMatMul(op) => Some(op.clone()),
+                                ExecutionVariant::QMatMul(op) => Some(op.clone()),
                                 _ => None,
                             });
                     if let Some(base_qmatmul) = base_qmatmul
                         && Self::qmatmul_same_base(&qmatmul_op, &base_qmatmul)
                     {
-                        let alias_layout = Self::apply_map_layout_chain(
+                        let alias_layout = Self::apply_view_chain(
                             &Layout::contiguous(&base_qmatmul.out_shape),
                             &chain,
                         );
-                        if alias_layout == Layout::contiguous(&nary.shape)
+                        if alias_layout == Some(Layout::contiguous(&nary.shape))
                             && !nary.expression.uses_custom_indexing_for_input(input_idx)
                         {
                             replacements[input_idx] = Self::qmatmul_output_expr(
@@ -203,6 +206,7 @@ impl Resolver {
                 if self.check_cached(graph, input_inner)
                     || input_datatype != crate::DataTypeEnum::F32
                     || nary.output_datatype != crate::DataTypeEnum::F32
+                    || !qmatmul_op.supports_elementwise_epilogue_fusion(&graph.device())
                 {
                     continue;
                 }
@@ -236,28 +240,27 @@ impl Resolver {
         // tile, so expensive expressions like GELU would be recomputed many
         // times. Keep those chains materialized once instead.
         if allow_qmatmul_elementwise_fusion
-            && let ComputeGraphNodeVariant::QMatMul(qmatmul_op) = &node_variant
+            && let ExecutionVariant::QMatMul(qmatmul_op) = &node_variant
             && qmatmul_op.in_shape[..qmatmul_op.in_shape.len() - 1]
                 .iter()
                 .product::<usize>()
                 == 1
+            && qmatmul_op.supports_elementwise_epilogue_fusion(&graph.device())
             && !self.check_cached(graph, qmatmul_op.input)
             && let Some(input_exec) = self.get_input_node_in_exec_graph(qmatmul_op.input)
         {
-            let (nary_inner, nary_map_chain) = self
-                .walk_map_layout_chain(qmatmul_op.input)
-                .unwrap_or((qmatmul_op.input, Vec::new()));
+            let (nary_inner, nary_map_chain) = self.walk_view_chain(qmatmul_op.input);
             let Some(nary_exec) = self.get_input_node_in_exec_graph(nary_inner) else {
                 return false;
             };
-            let ComputeGraphNodeVariant::Nary(nary) =
+            let ExecutionVariant::Elementwise(nary) =
                 self.execution_graph[nary_exec].variant.clone()
             else {
                 return false;
             };
             let mapped_layout =
-                Self::apply_map_layout_chain(&Layout::contiguous(&nary.shape), &nary_map_chain);
-            if mapped_layout != Layout::contiguous(&qmatmul_op.in_shape) {
+                Self::apply_view_chain(&Layout::contiguous(&nary.shape), &nary_map_chain);
+            if mapped_layout != Some(Layout::contiguous(&qmatmul_op.in_shape)) {
                 return false;
             }
 
@@ -281,14 +284,15 @@ impl Resolver {
                     continue;
                 }
 
-                let (primary_inner, primary_chain) = self
-                    .walk_map_layout_chain(primary_input)
-                    .unwrap_or((primary_input, Vec::new()));
+                let (primary_inner, primary_chain) = self.walk_view_chain(primary_input);
                 let Some(primary_info) = self.infer_layout_cached(graph, primary_inner) else {
                     continue;
                 };
-                let primary_layout =
-                    Self::apply_map_layout_chain(primary_info.layout(), &primary_chain);
+                let Some(primary_layout) =
+                    Self::apply_view_chain(primary_info.layout(), &primary_chain)
+                else {
+                    continue;
+                };
                 if primary_layout != Layout::contiguous(&nary.shape) {
                     continue;
                 }
@@ -297,13 +301,10 @@ impl Resolver {
                 let mut extras = Vec::new();
                 let mut valid_expression = true;
                 for (input_idx, &nary_input) in nary.inputs.iter().enumerate() {
-                    let (base_inner, chain) = self
-                        .walk_map_layout_chain(nary_input)
-                        .unwrap_or((nary_input, Vec::new()));
+                    let (base_inner, chain) = self.walk_view_chain(nary_input);
                     if base_inner == primary_inner {
-                        let alias_layout =
-                            Self::apply_map_layout_chain(primary_info.layout(), &chain);
-                        if alias_layout == Layout::contiguous(&nary.shape)
+                        let alias_layout = Self::apply_view_chain(primary_info.layout(), &chain);
+                        if alias_layout == Some(Layout::contiguous(&nary.shape))
                             && !nary.expression.uses_custom_indexing_for_input(input_idx)
                         {
                             mapping[input_idx] = 0;
@@ -380,8 +381,7 @@ impl Resolver {
                         self.execution_graph.add_edge(idx, node_idx, ());
                     }
                 }
-                self.execution_graph[node_idx].variant =
-                    ComputeGraphNodeVariant::QMatMul(new_q.clone());
+                self.execution_graph[node_idx].variant = ExecutionVariant::QMatMul(new_q.clone());
                 self.remove_node_if_dead(input_exec);
                 let mut deps = vec![new_q.input];
                 deps.extend(deps_extras);
@@ -390,8 +390,13 @@ impl Resolver {
             }
         }
 
-        // Pre-op: fuse elementwise before matmul inputs
-        if let ComputeGraphNodeVariant::MatMul(matmul_op) = &node_variant {
+        // Pre-op: fuse elementwise before matmul inputs. Skipped for
+        // un-flattened operands: pre chains would demote the matmul off the
+        // coop kernel they were chosen for.
+        if let ExecutionVariant::MatMul(matmul_op) = &node_variant
+            && matmul_op.a.is_plain()
+            && matmul_op.b.is_plain()
+        {
             let mut new_matmul = matmul_op.clone();
             let mut changed = false;
 
@@ -425,7 +430,7 @@ impl Resolver {
 
             if changed {
                 self.execution_graph[node_idx].variant =
-                    ComputeGraphNodeVariant::MatMul(new_matmul.clone());
+                    ExecutionVariant::MatMul(new_matmul.clone());
 
                 if new_matmul.first != matmul_op.first {
                     let old = self.get_input_node_in_exec_graph(matmul_op.first).unwrap();
@@ -483,7 +488,7 @@ impl Resolver {
         new_q: Box<QMatMulOperation>,
     ) {
         let deps = Self::qmatmul_dependencies(&new_q);
-        self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::QMatMul(new_q);
+        self.execution_graph[node_idx].variant = ExecutionVariant::QMatMul(new_q);
 
         for input in nary_inputs {
             if deps.contains(input) {
@@ -525,7 +530,7 @@ impl Resolver {
         &mut self,
         graph: &mut ComputeGraphInner,
         node_idx: ExecutionNodeIndex,
-        nary: &NaryOperation,
+        nary: &ElementwiseOperation,
     ) -> bool {
         if nary.output_datatype != crate::DataTypeEnum::F32 {
             return false;
@@ -535,16 +540,14 @@ impl Resolver {
         // (chain-less) reference is the indexed-input form handled below.
         let mut base = None;
         for &input in &nary.inputs {
-            let (base_inner, chain) = self
-                .walk_map_layout_chain(input)
-                .unwrap_or((input, Vec::new()));
-            if chain.is_empty() {
+            let (base_inner, chain) = self.walk_view_chain(input);
+            if chain.is_none() {
                 continue;
             }
             let Some(exec) = self.get_input_node_in_exec_graph(base_inner) else {
                 continue;
             };
-            if let ComputeGraphNodeVariant::QMatMul(op) = &self.execution_graph[exec].variant {
+            if let ExecutionVariant::QMatMul(op) = &self.execution_graph[exec].variant {
                 // A qmatmul that already carries a post epilogue isn't a clean
                 // accumulator-offset base; leave it to the general scan.
                 if op.post_element_wise_expr.is_some() {
@@ -610,7 +613,7 @@ impl Resolver {
     fn try_extract_mapped_qmatmul_post_expr(
         &mut self,
         graph: &mut ComputeGraphInner,
-        nary: &NaryOperation,
+        nary: &ElementwiseOperation,
         qmatmul_inner: NodeIndex,
         qmatmul_out_shape: &[usize],
     ) -> Option<(NaryExpr, Vec<u32>, Vec<NodeIndex>)> {
@@ -654,11 +657,9 @@ impl Resolver {
             if nary.expression.uses_custom_indexing_for_input(input_idx) {
                 return None;
             }
-            let (base_inner, chain) = self
-                .walk_map_layout_chain(nary_input)
-                .unwrap_or((nary_input, Vec::new()));
+            let (base_inner, chain) = self.walk_view_chain(nary_input);
             if base_inner == qmatmul_inner {
-                let view = Self::apply_map_layout_chain(&qmatmul_out_layout, &chain);
+                let view = Self::apply_view_chain(&qmatmul_out_layout, &chain)?;
                 let offset = Self::qmatmul_last_dim_view_offset(&view, &nary.shape, matrix_cols)?;
                 let value_idx = *accumulator_map.entry(offset).or_insert_with(|| {
                     let idx = accumulator_offsets.len();
@@ -725,7 +726,7 @@ impl Resolver {
     fn try_extract_indexed_qmatmul_post_expr(
         &mut self,
         graph: &mut ComputeGraphInner,
-        nary: &NaryOperation,
+        nary: &ElementwiseOperation,
         qmatmul_input_idx: usize,
         qmatmul_out_shape: &[usize],
     ) -> Option<(NaryExpr, Vec<u32>, Vec<NodeIndex>)> {

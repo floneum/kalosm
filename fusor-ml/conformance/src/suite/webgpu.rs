@@ -338,8 +338,8 @@ async fn check_q4k_fused_sampler(device: &Device) -> Result<(), SuiteError> {
         let gpu_device = gpu.device().clone();
         let mut sampler = Mirostat2Sampler::new(&gpu_device, 10.0);
         let token = hidden
-            .try_sample_mirostat2_token_q_mat(
-                &matrix,
+            .q_mat_mul(&matrix)
+            .sample_mirostat2_token(
                 &mut sampler,
                 &[],
                 Mirostat2SamplerParams {
@@ -352,8 +352,7 @@ async fn check_q4k_fused_sampler(device: &Device) -> Result<(), SuiteError> {
                 },
             )
             .await
-            .map_err(|err| SuiteError::case(case, err))?
-            .ok_or_else(|| SuiteError::case(case, "fused sampler returned None"))?;
+            .map_err(|err| SuiteError::case(case, err))?;
         if token >= weight_shape[0] as u32 {
             return Err(SuiteError::case(
                 case,

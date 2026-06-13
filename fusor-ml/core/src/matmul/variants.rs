@@ -1,8 +1,7 @@
 use crate::{
     Device,
     kernel_selection::{
-        Axis, CooperativeMatrixCaps, CooperativeMatrixKind, KernelDeviceCaps, KernelShape,
-        ShapeRule, ShapeSelector, eq, range,
+        Axis, CooperativeMatrixKind, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, range,
     },
     matmul::sgemm_params::gemm_parameters,
     matmul::sgemv_params::gemv_parameters,
@@ -135,12 +134,6 @@ pub(super) fn select_coop_kind(
         .expect("coop selector called with no supported cooperative matrix kind")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum DirectTileMatmulVariant {
-    Gemv,
-    MatMul,
-}
-
 /// (BM, BN, BK) tile dimensions for a cooperative-matrix matmul tile. The
 /// `select` helper below returns `Option<CoopTile>` (`None` = no coop variant
 /// fits the shape); the kernel layer uses the tuple to look up the matching
@@ -190,7 +183,7 @@ impl CoopTile {
         max_subgroup_size: u32,
     ) -> Option<Self> {
         let tiles_for = |bm: u32, bn: u32| -> u32 { (m / bm) * (n / bn) };
-        if !k.is_multiple_of(16) {
+        if m == 0 || n == 0 || k == 0 {
             return None;
         }
         // Tile256x256 single-buffer has lower memory traffic (sqrt-min) but
@@ -236,34 +229,28 @@ impl CoopTile {
                 return Some(tile);
             }
         }
-        None
+
+        // Shapes that divide no tile run with masked edge tiles: pick the
+        // candidate minimizing padded work, in preference order on ties.
+        // Selections whose padding inflates the output by more than a
+        // quarter stay on the generic path — that bound also keeps
+        // gemv-shaped contractions (tiny M or N) off the tile kernels.
+        // Candidates stick to geometries the aligned rules already reach
+        // (the (128, 128) table entry was never selectable and miscomputes).
+        let mut best: Option<(u64, Self)> = None;
+        for (bm, bn) in [(128, 64), (64, 128), (64, 64)] {
+            let tile = Self::new(bm, bn, 16);
+            if !tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
+                continue;
+            }
+            let padded = u64::from(m.div_ceil(bm) * bm) * u64::from(n.div_ceil(bn) * bn);
+            if padded * 4 > u64::from(m) * u64::from(n) * 5 {
+                continue;
+            }
+            if best.is_none_or(|(best_padded, _)| padded < best_padded) {
+                best = Some((padded, tile));
+            }
+        }
+        best.map(|(_, tile)| tile)
     }
-}
-
-pub(super) fn direct_tile_matmul_selector() -> ShapeSelector<3, (), DirectTileMatmulVariant> {
-    ShapeSelector::new()
-        .rule(
-            DirectTileMatmulVariant::Gemv,
-            ShapeRule::new().axis(DENSE_N, eq(1)),
-        )
-        .rule(DirectTileMatmulVariant::MatMul, ShapeRule::new())
-}
-
-pub(super) fn select_direct_tile_matmul_variant(m: u32, k: u32, n: u32) -> DirectTileMatmulVariant {
-    direct_tile_matmul_selector()
-        .select(
-            KernelShape::new([m as usize, k as usize, n as usize]),
-            &(),
-            KernelDeviceCaps {
-                subgroups_supported: false,
-                cooperative_matrix: CooperativeMatrixCaps::default(),
-                min_subgroup_size: 0,
-                max_subgroup_size: 0,
-                max_compute_invocations_per_workgroup: 0,
-                max_compute_workgroup_storage_size: 0,
-                max_compute_workgroup_size_x: 0,
-                backend: wgpu::Backend::Noop,
-            },
-        )
-        .expect("direct tile matmul selector has a catch-all rule")
 }

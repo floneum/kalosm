@@ -16,8 +16,6 @@ impl std::fmt::Display for DeviceNotSupported {
 
 impl std::error::Error for DeviceNotSupported {}
 
-pub(crate) mod flash_attention;
 pub(crate) mod mirostat;
-pub(crate) mod rms_norm;
 pub(crate) mod sampling_topk;
 pub(crate) mod standard_sampler;

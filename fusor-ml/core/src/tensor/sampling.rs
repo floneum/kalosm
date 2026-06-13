@@ -1,81 +1,7 @@
 use super::{DataTypeEnum, Tensor, TensorData};
-use crate::quantized::QMatrix;
+use crate::top_k::GpuSamplerRequest;
 
 impl Tensor {
-    pub async fn try_sample_mirostat2_token_q_mat(
-        &self,
-        matrix: &QMatrix,
-        sampler: &mut crate::top_k::GpuMirostat2Sampler,
-        previous_tokens: &[u32],
-        params: crate::top_k::GpuMirostat2SamplerParams,
-    ) -> Result<Option<u32>, wgpu::BufferAsyncError> {
-        self.assert_rank::<1>();
-        self.assert_datatype::<f32>();
-        crate::top_k::qmat_mirostat2_sample_lazy_token_to_host(
-            &self.data,
-            matrix,
-            sampler,
-            previous_tokens,
-            params,
-        )
-        .await
-    }
-
-    pub fn try_sample_mirostat2_token_q_mat_pending(
-        &self,
-        matrix: &QMatrix,
-        sampler: &mut crate::top_k::GpuMirostat2Sampler,
-        previous_tokens: &[u32],
-        previous_gpu_token: Option<&Tensor>,
-        params: crate::top_k::GpuMirostat2SamplerParams,
-    ) -> Option<crate::top_k::PendingGpuSampledToken> {
-        self.assert_rank::<1>();
-        self.assert_datatype::<f32>();
-        crate::top_k::qmat_mirostat2_sample_lazy_token_pending(
-            &self.data,
-            matrix,
-            sampler,
-            previous_tokens,
-            previous_gpu_token,
-            params,
-        )
-    }
-
-    pub async fn try_sample_standard_token_q_mat(
-        &self,
-        matrix: &QMatrix,
-        previous_tokens: &[u32],
-        params: crate::top_k::GpuStandardSamplerParams,
-    ) -> Result<Option<u32>, wgpu::BufferAsyncError> {
-        self.assert_rank::<1>();
-        self.assert_datatype::<f32>();
-        crate::top_k::qmat_standard_sample_lazy_token_to_host(
-            &self.data,
-            matrix,
-            previous_tokens,
-            params,
-        )
-        .await
-    }
-
-    pub fn try_sample_standard_token_q_mat_pending(
-        &self,
-        matrix: &QMatrix,
-        previous_tokens: &[u32],
-        previous_gpu_token: Option<&Tensor>,
-        params: crate::top_k::GpuStandardSamplerParams,
-    ) -> Option<crate::top_k::PendingGpuSampledToken> {
-        self.assert_rank::<1>();
-        self.assert_datatype::<f32>();
-        crate::top_k::qmat_standard_sample_lazy_token_pending(
-            &self.data,
-            matrix,
-            previous_tokens,
-            previous_gpu_token,
-            params,
-        )
-    }
-
     pub async fn sample_mirostat2_token(
         &self,
         sampler: &mut crate::top_k::GpuMirostat2Sampler,
@@ -84,10 +10,12 @@ impl Tensor {
     ) -> Result<u32, wgpu::BufferAsyncError> {
         self.assert_rank::<1>();
         self.assert_datatype::<f32>();
-        let (input, _) = self.data.materialize();
-        if let Some(token) =
-            crate::top_k::mirostat2_sample_token_to_host(&input, sampler, previous_tokens, params)
-                .await?
+        if let Some(token) = crate::top_k::sample_token_to_host(
+            &self.data,
+            GpuSamplerRequest::Mirostat2 { sampler, params },
+            previous_tokens,
+        )
+        .await?
         {
             return Ok(token);
         }
@@ -103,15 +31,51 @@ impl Tensor {
     ) -> Result<u32, wgpu::BufferAsyncError> {
         self.assert_rank::<1>();
         self.assert_datatype::<f32>();
-        let (input, _) = self.data.materialize();
-        if let Some(token) =
-            crate::top_k::standard_sample_token_to_host(&input, previous_tokens, params).await?
+        if let Some(token) = crate::top_k::sample_token_to_host(
+            &self.data,
+            GpuSamplerRequest::Standard { params },
+            previous_tokens,
+        )
+        .await?
         {
             return Ok(token);
         }
 
         let (ids, _) = self.top_k_pairs(params.top_k).await?;
         Ok(ids.first().copied().unwrap_or_default())
+    }
+
+    pub fn sample_mirostat2_token_pending(
+        &self,
+        sampler: &mut crate::top_k::GpuMirostat2Sampler,
+        previous_tokens: &[u32],
+        previous_gpu_token: Option<&Tensor>,
+        params: crate::top_k::GpuMirostat2SamplerParams,
+    ) -> Option<crate::top_k::PendingGpuSampledToken> {
+        self.assert_rank::<1>();
+        self.assert_datatype::<f32>();
+        crate::top_k::sample_token_pending(
+            &self.data,
+            GpuSamplerRequest::Mirostat2 { sampler, params },
+            previous_tokens,
+            previous_gpu_token,
+        )
+    }
+
+    pub fn sample_standard_token_pending(
+        &self,
+        previous_tokens: &[u32],
+        previous_gpu_token: Option<&Tensor>,
+        params: crate::top_k::GpuStandardSamplerParams,
+    ) -> Option<crate::top_k::PendingGpuSampledToken> {
+        self.assert_rank::<1>();
+        self.assert_datatype::<f32>();
+        crate::top_k::sample_token_pending(
+            &self.data,
+            GpuSamplerRequest::Standard { params },
+            previous_tokens,
+            previous_gpu_token,
+        )
     }
 
     pub async fn top_k_pairs(
@@ -122,12 +86,12 @@ impl Tensor {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        let (input, _) = self.data.materialize();
-        if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
+        if self.datatype() != DataTypeEnum::F32 || self.rank() != 1 {
+            let (input, _) = self.data.materialize();
             return cpu_top_k_pairs_from_tensor_data(&input, k).await;
         }
 
-        let input_len = input.layout().shape()[0];
+        let input_len = self.shape()[0];
         let k = k.min(input_len);
         if k == 0 {
             return Ok((Vec::new(), Vec::new()));
@@ -140,67 +104,34 @@ impl Tensor {
             .min(k)
             .min(crate::top_k::TOP_K_CHUNK);
 
+        // The first attempt's chunk + merge kernels ride the resolver's
+        // encoder, so the graph producing the logits and the top-k selection
+        // land in one submission. Retries with escalated candidate counts
+        // re-encode over the materialized input.
+        let (input, _, mut attempt) = self.data.materialize_with_tail(|input, encoder| {
+            encode_top_k_attempt(input, k, input_len, chunks, candidate_count, encoder)
+        });
+
         loop {
-            let output_per_chunk = if candidate_count >= crate::top_k::TOP_K_CHUNK {
-                crate::top_k::TOP_K_CHUNK
-            } else {
-                candidate_count + 1
-            };
-            let mut encoder = input.device().wgpu_device().create_command_encoder(
-                &wgpu::CommandEncoderDescriptor {
-                    label: Some("top_k_pairs encoder"),
-                },
-            );
-            let Some((ids, values)) = crate::top_k::chunk_top_k_pair_data_with_encoder(
-                &input,
-                candidate_count,
-                output_per_chunk,
-                Some(&mut encoder),
-            ) else {
-                return cpu_top_k_pairs_from_tensor_data(&input, k).await;
-            };
-            if candidate_count >= crate::top_k::TOP_K_CHUNK {
-                let Some((ids, values)) =
-                    crate::top_k::merge_sorted_chunk_top_k_pair_data_with_encoder(
-                        &ids,
-                        &values,
-                        crate::top_k::MergeSortedChunkTopKParams {
-                            chunks,
-                            chunk_len: crate::top_k::TOP_K_CHUNK,
-                            chunk_stride: crate::top_k::TOP_K_CHUNK,
-                            input_len,
-                            k,
-                        },
-                        Some(&mut encoder),
-                    )
-                else {
-                    return cpu_top_k_pairs_from_tensor_data(&input, k).await;
-                };
-                input.device().wgpu_queue().submit(Some(encoder.finish()));
-                let ids = Tensor::as_slice_from_tensor_data::<1, u32>(&ids).await?;
-                let values = Tensor::as_slice_from_tensor_data::<1, f32>(&values).await?;
-                return Ok((ids.as_slice().to_vec(), values.as_slice().to_vec()));
-            }
-            let Some((merged_ids, merged_values)) =
-                crate::top_k::merge_sorted_chunk_top_k_pair_data_with_encoder(
-                    &ids,
-                    &values,
-                    crate::top_k::MergeSortedChunkTopKParams {
-                        chunks,
-                        chunk_len: candidate_count,
-                        chunk_stride: output_per_chunk,
-                        input_len,
-                        k,
-                    },
-                    Some(&mut encoder),
-                )
+            let Some(TopKAttempt {
+                chunk_ids,
+                chunk_values,
+                merged_ids,
+                merged_values,
+                exhaustive,
+            }) = attempt
             else {
                 return cpu_top_k_pairs_from_tensor_data(&input, k).await;
             };
-            input.device().wgpu_queue().submit(Some(encoder.finish()));
+            if exhaustive {
+                let ids = Tensor::as_slice_from_tensor_data::<1, u32>(&merged_ids).await?;
+                let values = Tensor::as_slice_from_tensor_data::<1, f32>(&merged_values).await?;
+                return Ok((ids.as_slice().to_vec(), values.as_slice().to_vec()));
+            }
+            let output_per_chunk = candidate_count + 1;
             let merged_ids = Tensor::as_slice_from_tensor_data::<1, u32>(&merged_ids).await?;
             let merged_values = Tensor::as_slice_from_tensor_data::<1, f32>(&merged_values).await?;
-            let chunk_values = Tensor::as_slice_from_tensor_data::<1, f32>(&values).await?;
+            let chunk_values = Tensor::as_slice_from_tensor_data::<1, f32>(&chunk_values).await?;
             let exact = top_k_chunk_bounds_prove_exact(
                 merged_values.as_slice(),
                 chunk_values.as_slice(),
@@ -216,7 +147,7 @@ impl Tensor {
                 ));
             }
 
-            let ids = Tensor::as_slice_from_tensor_data::<1, u32>(&ids).await?;
+            let ids = Tensor::as_slice_from_tensor_data::<1, u32>(&chunk_ids).await?;
             if let Some(top) = top_k_from_chunk_candidates(
                 ids.as_slice(),
                 chunk_values.as_slice(),
@@ -233,8 +164,76 @@ impl Tensor {
                 return cpu_top_k_pairs_from_tensor_data(&input, k).await;
             }
             candidate_count = (candidate_count * 2).min(crate::top_k::TOP_K_CHUNK);
+
+            let mut encoder = input.device().wgpu_device().create_command_encoder(
+                &wgpu::CommandEncoderDescriptor {
+                    label: Some("top_k_pairs retry encoder"),
+                },
+            );
+            attempt =
+                encode_top_k_attempt(&input, k, input_len, chunks, candidate_count, &mut encoder);
+            input.device().wgpu_queue().submit(Some(encoder.finish()));
         }
     }
+}
+
+struct TopKAttempt {
+    chunk_ids: TensorData,
+    chunk_values: TensorData,
+    merged_ids: TensorData,
+    merged_values: TensorData,
+    /// Every chunk contributed all of its elements: the merge result is the
+    /// exact top-k with no host-side exactness check needed.
+    exhaustive: bool,
+}
+
+/// Encode one chunked top-k + merge attempt into `encoder`. Runs inside the
+/// resolver tail while the graph lock is held, so it must only touch raw
+/// buffers — no compute-graph access.
+fn encode_top_k_attempt(
+    input: &TensorData,
+    k: usize,
+    input_len: usize,
+    chunks: usize,
+    candidate_count: usize,
+    encoder: &mut wgpu::CommandEncoder,
+) -> Option<TopKAttempt> {
+    let exhaustive = candidate_count >= crate::top_k::TOP_K_CHUNK;
+    let output_per_chunk = if exhaustive {
+        crate::top_k::TOP_K_CHUNK
+    } else {
+        candidate_count + 1
+    };
+    let (chunk_ids, chunk_values) = crate::top_k::chunk_top_k_pair_data_with_encoder(
+        input,
+        candidate_count,
+        output_per_chunk,
+        Some(encoder),
+    )?;
+    let (merged_ids, merged_values) =
+        crate::top_k::merge_sorted_chunk_top_k_pair_data_with_encoder(
+            &chunk_ids,
+            &chunk_values,
+            crate::top_k::MergeSortedChunkTopKParams {
+                chunks,
+                chunk_len: if exhaustive {
+                    crate::top_k::TOP_K_CHUNK
+                } else {
+                    candidate_count
+                },
+                chunk_stride: output_per_chunk,
+                input_len,
+                k,
+            },
+            Some(encoder),
+        )?;
+    Some(TopKAttempt {
+        chunk_ids,
+        chunk_values,
+        merged_ids,
+        merged_values,
+        exhaustive,
+    })
 }
 
 fn top_k_chunk_bounds_prove_exact(

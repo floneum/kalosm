@@ -3,8 +3,9 @@ use std::hash::Hash;
 use rustc_hash::FxHasher;
 
 use crate::{
-    Layout, Tensor,
+    Tensor,
     compute_graph::NodeIndex,
+    nary_wise::NaryExpr,
     tensor::{DataTypeEnum, TensorData},
 };
 use crate::{
@@ -34,21 +35,34 @@ fn unsqueeze_dim(tensor: &Tensor, dim_idx: usize) -> Tensor {
     tensor.reshape(new_shape)
 }
 
+/// A reduction over one axis of an index space, with a fused n-ary producer.
+///
+/// `expression` is evaluated at every coordinate of `shape` (the full
+/// pre-reduce index space, including the reduced `axis`) and folded with
+/// `function` along `axis`. A plain tensor reduction is the trivial producer
+/// `input(0, rank)`; the resolver widens it by inlining upstream elementwise
+/// expressions, so composed map-reduce clusters (contractions included) lower
+/// as a single kernel without materializing the intermediate.
 #[derive(Debug, Clone)]
 pub(crate) struct ReduceOperation {
-    pub(crate) value: NodeIndex,
-    pub(crate) pre_element_wise: UnaryFunctionChain,
+    /// Producer inputs referenced by `expression`.
+    pub(crate) inputs: Vec<NodeIndex>,
+    /// Fused producer over the full index space `shape`.
+    pub(crate) expression: NaryExpr,
+    /// The full pre-reduce index space, including the reduced axis.
+    pub(crate) shape: Box<[usize]>,
     pub(crate) function: ReduceFunction,
     pub(crate) post_element_wise: UnaryFunctionChain,
     pub(crate) axis: usize,
 }
 
 impl ReduceOperation {
-    pub fn new(value: NodeIndex, function: ReduceFunction, axis: usize, _shape: &[usize]) -> Self {
+    pub fn new(value: NodeIndex, function: ReduceFunction, axis: usize, shape: &[usize]) -> Self {
         let datatype = function.datatype();
         Self {
-            value,
-            pre_element_wise: UnaryFunctionChain::empty(datatype),
+            inputs: vec![value],
+            expression: NaryExpr::input(0, shape.len()),
+            shape: shape.into(),
             function,
             post_element_wise: UnaryFunctionChain::empty(datatype),
             axis,
@@ -58,11 +72,30 @@ impl ReduceOperation {
     pub fn out_datatype(&self) -> DataTypeEnum {
         self.post_element_wise.out_datatype()
     }
+
+    /// The single input of a trivial (un-fused) reduction: the producer is
+    /// still the bare `input(0, rank)` the tensor API emitted. Recognition
+    /// runs before fusion, so the canonical clusters it matches always take
+    /// this form.
+    pub(crate) fn plain_input(&self) -> Option<NodeIndex> {
+        (self.inputs.len() == 1 && self.expression == NaryExpr::input(0, self.shape.len()))
+            .then(|| self.inputs[0])
+    }
+
+    /// The output shape: the index space with the reduced axis removed.
+    pub(crate) fn out_shape(&self) -> Vec<usize> {
+        self.shape
+            .iter()
+            .enumerate()
+            .filter_map(|(i, x)| (i != self.axis).then_some(*x))
+            .collect()
+    }
 }
 
 impl Operation for ReduceOperation {
     fn hash_kernel_fields(&self, state: &mut FxHasher) {
-        self.pre_element_wise.hash(state);
+        self.expression.hash(state);
+        self.shape.hash(state);
         self.function.hash(state);
         self.post_element_wise.hash(state);
         self.axis.hash(state);
@@ -82,25 +115,13 @@ impl Operation for ReduceOperation {
 
     fn dispatch_size(
         &self,
-        workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
+        _workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
         inputs: &[MirValue],
     ) -> [u32; 3] {
-        let output_tensor: TensorData = inputs[1].as_tensor().unwrap().clone();
-        let total_outputs = output_tensor.layout().shape().iter().product::<usize>() as u32;
-        let reduce_size = match inputs.get(2) {
-            Some(MirValue::Integer(value)) => *value,
-            _ => 1,
-        };
-        let serial_workgroups = total_outputs.div_ceil(workgroup_shape.x());
-        let total_workgroups =
-            if use_cooperative_reduce(total_outputs, reduce_size, workgroup_shape.x()) {
-                total_outputs
-            } else {
-                serial_workgroups
-            };
-
+        let output_tensor: TensorData = inputs.last().unwrap().as_tensor().unwrap().clone();
+        let rows = output_tensor.layout().shape().iter().product::<usize>() as u32;
         distribute_workgroups(
-            total_workgroups,
+            rows,
             output_tensor
                 .device()
                 .limits()
@@ -109,53 +130,37 @@ impl Operation for ReduceOperation {
     }
 
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
-        f(self.value);
+        for input in &self.inputs {
+            f(*input);
+        }
     }
 
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
-        let dim = self.axis;
-        let tensor = nodes.get_cached_result(self.value).unwrap();
-        assert_eq!(self.pre_element_wise.input_datatype(), tensor.datatype());
-        let layout = tensor.layout();
-        let shape = layout.shape();
-        let new_tensor_shape = shape
+        let mut mir_inputs: Vec<MirValue> = self
+            .inputs
             .iter()
             .enumerate()
-            .filter_map(|(i, x)| (i != dim).then_some(*x))
-            .collect::<Vec<_>>();
-        let output_type = self.out_datatype();
-        let output_tensor =
-            TensorData::new_for_shape(tensor.device(), &new_tensor_shape, output_type);
+            .map(|(i, idx)| {
+                // Custom-indexed inputs need the dense (dequantized) tensor;
+                // block-quantized data only supports the plain row/col path.
+                if self.expression.uses_custom_indexing_for_input(i)
+                    && let Some(cached) = nodes.get_result(*idx)
+                {
+                    return cached.into();
+                }
+                nodes.get_result_or_qmatrix(*idx).unwrap().into()
+            })
+            .collect();
 
-        let trimmed_tensor_layout = Layout::from_parts(
-            tensor.layout().offset(),
-            tensor
-                .layout()
-                .shape()
-                .iter()
-                .enumerate()
-                .filter_map(|(i, x)| (i != dim).then_some(*x))
-                .collect(),
-            tensor
-                .layout()
-                .strides()
-                .iter()
-                .enumerate()
-                .filter_map(|(i, x)| (i != dim).then_some(*x))
-                .collect(),
-        );
-        let trimmed_tensor = TensorData::new_from_parts(
-            tensor.device(),
-            tensor.buffer().clone(),
-            trimmed_tensor_layout,
-            tensor.datatype(),
-        );
-        vec![
-            MirValue::Tensor(trimmed_tensor.clone()),
-            MirValue::Tensor(output_tensor.clone()),
-            MirValue::Integer(tensor.layout().shape()[dim] as u32),
-            MirValue::Integer(tensor.layout().strides()[dim] as u32),
-        ]
+        let device = match &mir_inputs[0] {
+            MirValue::Tensor(tensor) => tensor.device().clone(),
+            MirValue::QMatrix(matrix) => matrix.device().clone(),
+            _ => unreachable!("reduce inputs are tensors or quantized matrices"),
+        };
+        let output_tensor =
+            TensorData::new_for_shape(&device, &self.out_shape(), self.out_datatype());
+        mir_inputs.push(output_tensor.into());
+        mir_inputs
     }
 
     fn build_direct_kernel(
@@ -164,22 +169,25 @@ impl Operation for ReduceOperation {
         workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
         inputs: &[MirValue],
     ) -> Option<DirectKernel> {
-        crate::reduce_direct::build_reduce_direct_kernel(self, graph, workgroup_shape, inputs)
+        crate::row_program::RowProgramOperation::from_reduce(self).build_direct_kernel(
+            graph,
+            workgroup_shape,
+            inputs,
+        )
     }
 
     fn output(&self, _: &crate::compute_graph::ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
-        let output_tensor: TensorData = inputs[1].as_tensor().unwrap().clone();
+        let output_tensor: TensorData = inputs.last().unwrap().as_tensor().unwrap().clone();
         output_tensor.into()
     }
 
     fn name(&self) -> String {
-        format!("reduce_{}", self.function.name())
+        if self.plain_input().is_some() {
+            format!("reduce_{}", self.function.name())
+        } else {
+            format!("reduce_{}_fused", self.function.name())
+        }
     }
-}
-
-pub(crate) fn use_cooperative_reduce(total_outputs: u32, reduce_size: u32, block: u32) -> bool {
-    let serial_workgroups = total_outputs.div_ceil(block);
-    reduce_size >= block && serial_workgroups <= 4
 }
 
 #[derive(Clone, Debug, Hash)]
@@ -233,7 +241,7 @@ impl Tensor {
     }
 }
 
-fn sum_fn(datatype: DataTypeEnum) -> ReduceFunction {
+pub(crate) fn sum_fn(datatype: DataTypeEnum) -> ReduceFunction {
     ReduceFunction::new(ReduceOp::Sum, zero_for_dtype(datatype), datatype).with_name("sum")
 }
 
@@ -248,7 +256,7 @@ impl Tensor {
     }
 }
 
-fn max_fn(datatype: DataTypeEnum) -> ReduceFunction {
+pub(crate) fn max_fn(datatype: DataTypeEnum) -> ReduceFunction {
     ReduceFunction::new(ReduceOp::Max, min_scalar_for_dtype(datatype), datatype).with_name("max")
 }
 

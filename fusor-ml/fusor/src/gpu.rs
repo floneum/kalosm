@@ -270,28 +270,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     }
 
     #[inline]
-    pub(crate) fn try_conv_nd_direct<const WEIGHT_RANK: usize, const DIFF: usize>(
-        &self,
-        weight: &Tensor<WEIGHT_RANK, D>,
-        bias: Option<&Tensor<1, D>>,
-        padding: [usize; DIFF],
-        strides: [usize; DIFF],
-    ) -> Option<Self> {
-        if R != 2 + DIFF || WEIGHT_RANK != 2 + DIFF {
-            return None;
-        }
-
-        self.inner
-            .try_conv_nd_direct(
-                weight.as_core(),
-                bias.map(|bias| bias.as_core()),
-                &padding,
-                &strides,
-            )
-            .map(Tensor::from_core)
-    }
-
-    #[inline]
     pub fn sum<const O: usize>(&self, dim: impl Dim<R>) -> Tensor<O, D> {
         Tensor::from_core(self.inner.sum(dim.resolve()))
     }
@@ -587,23 +565,8 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
 
 impl Tensor<1, f32> {
     #[inline]
-    pub async fn try_sample_mirostat2_token_q_mat(
+    pub fn sample_mirostat2_token_pending(
         &self,
-        matrix: &QMatrix,
-        sampler: &mut GpuMirostat2Sampler,
-        previous_tokens: &[u32],
-        params: GpuMirostat2SamplerParams,
-    ) -> Result<Option<u32>> {
-        self.inner
-            .try_sample_mirostat2_token_q_mat(matrix, sampler, previous_tokens, params)
-            .await
-            .map_err(Error::from)
-    }
-
-    #[inline]
-    pub fn try_sample_mirostat2_token_q_mat_pending(
-        &self,
-        matrix: &QMatrix,
         sampler: &mut GpuMirostat2Sampler,
         previous_tokens: &[u32],
         previous_gpu_token: Option<&GpuSampledToken>,
@@ -611,8 +574,7 @@ impl Tensor<1, f32> {
     ) -> Result<Option<GpuSampledToken>> {
         Ok(self
             .inner
-            .try_sample_mirostat2_token_q_mat_pending(
-                matrix,
+            .sample_mirostat2_token_pending(
                 sampler,
                 previous_tokens,
                 previous_gpu_token.map(|token| token.as_core_token()),
@@ -622,30 +584,15 @@ impl Tensor<1, f32> {
     }
 
     #[inline]
-    pub async fn try_sample_standard_token_q_mat(
+    pub fn sample_standard_token_pending(
         &self,
-        matrix: &QMatrix,
-        previous_tokens: &[u32],
-        params: GpuStandardSamplerParams,
-    ) -> Result<Option<u32>> {
-        self.inner
-            .try_sample_standard_token_q_mat(matrix, previous_tokens, params)
-            .await
-            .map_err(Error::from)
-    }
-
-    #[inline]
-    pub fn try_sample_standard_token_q_mat_pending(
-        &self,
-        matrix: &QMatrix,
         previous_tokens: &[u32],
         previous_gpu_token: Option<&GpuSampledToken>,
         params: GpuStandardSamplerParams,
     ) -> Result<Option<GpuSampledToken>> {
         Ok(self
             .inner
-            .try_sample_standard_token_q_mat_pending(
-                matrix,
+            .sample_standard_token_pending(
                 previous_tokens,
                 previous_gpu_token.map(|token| token.as_core_token()),
                 params,

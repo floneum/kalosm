@@ -70,6 +70,12 @@ impl TileBlock<'_> {
 
     /// Masked dequantizing load of one f32 value from a quantized matrix at a
     /// `(row, col)` coordinate.
+    /// Dequantize one element of a block-quantized matrix.
+    ///
+    /// Addressing follows the matrix's flat block order, where
+    /// [`QuantizedMatrix::rows`] is the *length* of one dense row: `row` is
+    /// the position along that contiguous axis and `col` selects which row
+    /// (`flat = col * matrix.rows + row`).
     pub fn load_quantized(
         &self,
         matrix: &QuantizedMatrix,
@@ -182,6 +188,22 @@ impl TileBlock<'_> {
         row: impl Into<Tile>,
         col: impl Into<Tile>,
     ) {
+        self.fill_tile_bounded(dst, src, row, col, [None, None]);
+    }
+
+    /// [`Self::fill_tile`] with optional exclusive global (row, col) limits:
+    /// elements at or beyond a limit fill zero instead of reading storage.
+    /// Edge tiles of a matmul whose shape doesn't divide the tile geometry
+    /// pass the logical extents here; `None` per axis keeps the unguarded
+    /// fast path.
+    pub fn fill_tile_bounded(
+        &mut self,
+        dst: &WorkgroupTile,
+        src: &Storage,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
+        bounds: [Option<Tile>; 2],
+    ) {
         let value = Expr::new(
             ExprKind::Load {
                 src: Source::Storage(src.view().clone()),
@@ -197,6 +219,7 @@ impl TileBlock<'_> {
         self.push_stmt(Stmt::FillTile {
             dst: dst.decl().clone(),
             value,
+            bounds: bounds.map(|bound| bound.map(Tile::into_expr)),
         });
     }
 
@@ -227,6 +250,7 @@ impl TileBlock<'_> {
         self.push_stmt(Stmt::FillTile {
             dst: dst.decl().clone(),
             value,
+            bounds: [None, None],
         });
     }
 

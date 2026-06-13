@@ -1,16 +1,10 @@
-use fusor_tile_ir::{
-    tile, ElementType, F32Bits, GgmlQuantFormat, KernelBuilder, KernelTensorRef, Layout,
-    MemoryLevel, NagaKernel, ScalarElement, Shape,
-};
+use fusor_tile_ir::{tile, GgmlQuantFormat, NagaKernel, ScalarElement, Shape};
 use fusor_tile_ir_kernels::{
-    batched_gemv_with_epilogues, batched_matmul_with_epilogues, flash_attention,
-    linear_storage_layout, qdequantize, qgemv_with_epilogue, qgemv_workgroup_f16_with_epilogue,
-    qgemv_workgroup_with_epilogue, qmatmul_with_epilogue, qmatmul_workgroup_f16_with_epilogues,
-    qmatmul_workgroup_with_epilogues, quantized_matrix, rms_norm_vec4, try_batched_coop_matmul,
-    DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulEpilogues, DenseMatmulShape,
-    DenseMatmulTensors, DenseMatmulTile, FlashAttentionDims, FlashAttentionMeta,
-    FlashAttentionTensors, QmatmulEpilogues, RmsNormVec4, RmsNormVec4Meta, SubgroupConfig,
-    TensorMeta, UnaryEpilogue, UnaryEpilogueWithExtras,
+    qgemv_with_epilogue, qgemv_workgroup_f16_with_epilogue, qgemv_workgroup_with_epilogue,
+    qmatmul_with_epilogue, qmatmul_workgroup_f16_with_epilogues, qmatmul_workgroup_with_epilogues,
+    quantized_matrix, try_batched_coop_matmul, DenseCoopMatmulConfig, DenseCoopMatmulTile,
+    DenseMatmulEpilogues, DenseMatmulShape, DenseMatmulTensors, QmatmulEpilogues, SubgroupConfig,
+    UnaryEpilogue, UnaryEpilogueWithExtras,
 };
 
 fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
@@ -28,84 +22,6 @@ fn subgroup_config(size: u32) -> SubgroupConfig {
 
 fn coop_token() -> fusor_tile_ir::CoopMatrixToken {
     fusor_tile_ir::CoopMatrixToken::new_unchecked()
-}
-
-#[test]
-fn streaming_flash_attention_regression_shape_lowers_to_naga() {
-    let layout = linear_storage_layout();
-    let mut kb = KernelBuilder::<()>::new();
-    flash_attention::<()>(
-        &mut kb,
-        ScalarElement::F32.element(),
-        FlashAttentionTensors {
-            q: KernelTensorRef::new((), layout.clone()),
-            k: KernelTensorRef::new((), layout.clone()),
-            v: KernelTensorRef::new((), layout.clone()),
-            mask: None,
-            output: KernelTensorRef::new((), layout),
-        },
-        FlashAttentionMeta {
-            dims: FlashAttentionDims {
-                batch: 1,
-                num_heads: 32,
-                num_kv_heads: 8,
-                q_seq_len: 48,
-                kv_seq_len: 48,
-                head_dim: 128,
-            },
-            scale: F32Bits::new(1.0 / 128.0f32.sqrt()),
-            q_meta: TensorMeta::new(vec![196_608, 6_144, 128, 1], 0),
-            k_meta: TensorMeta::new(vec![49_152, 6_144, 128, 1], 0),
-            v_meta: TensorMeta::new(vec![49_152, 6_144, 128, 1], 0),
-            mask_meta: None,
-            output_meta: TensorMeta::new(vec![196_608, 6_144, 128, 1], 0),
-            dispatch_size: [16, 1536, 1],
-            causal: false,
-        },
-        subgroup_token(),
-        32,
-    )
-    .expect("streaming flash attention should build");
-    let (ir, _) = kb.finish();
-
-    lower_or_fail(&ir, "streaming flash attention");
-}
-
-#[test]
-fn rms_norm_vec4_minimal_lowers() {
-    let layout = Layout::strided(MemoryLevel::Storage, Shape::new([1]), &[1]);
-    let mut kb = KernelBuilder::<()>::new();
-    let input = KernelTensorRef::with_offset((), layout.clone(), 0);
-    let weight = KernelTensorRef::with_offset((), layout.clone(), 0);
-    let output = KernelTensorRef::with_offset((), layout.clone(), 0);
-    let meta = RmsNormVec4Meta {
-        cols: 4,
-        cols_vec: 1,
-        eps: F32Bits::new(1e-5),
-        input_offset_vec: 0,
-        input_row_stride_vec: 1,
-        residual_offset_vec: None,
-        residual_row_stride_vec: 0,
-        weight_offset_vec: 0,
-        bias_offset_vec: None,
-        output_offset_vec: 0,
-        output_row_stride_vec: 1,
-    };
-    rms_norm_vec4(
-        &mut kb,
-        RmsNormVec4 {
-            input,
-            residual: None,
-            weight,
-            bias: None,
-            output,
-            meta,
-            rows: 1,
-        },
-    )
-    .unwrap();
-    let (ir, _) = kb.finish();
-    lower_or_fail(&ir, "rms_norm_vec4");
 }
 
 fn qgemv_ir_with_subgroup_size(
@@ -218,150 +134,6 @@ fn cooperative_qmatmul_lowers() {
         );
     });
     lower_or_fail(&ir, "cooperative qmatmul");
-}
-
-#[test]
-fn batched_dense_f32_matmul_lowers() {
-    let ir = tile::build(|program| {
-        let shape = DenseMatmulShape {
-            batch: 3,
-            m: 8,
-            k: 256,
-            n: 4,
-        };
-        let a = program.storage_read(
-            ScalarElement::F32.element(),
-            Shape::new([shape.batch * shape.m, shape.k]),
-        );
-        let b = program.storage_read(
-            ScalarElement::F32.element(),
-            Shape::new([shape.batch * shape.k, shape.n]),
-        );
-        let y = program.storage_write(
-            ScalarElement::F32.element(),
-            Shape::new([shape.batch * shape.m, shape.n]),
-        );
-        batched_matmul_with_epilogues(
-            program,
-            DenseMatmulTensors {
-                a: &a,
-                b: &b,
-                y: &y,
-            },
-            shape,
-            &DenseMatmulEpilogues::empty(),
-            65_535,
-            DenseMatmulTile::new(32, 32, 8, 4, 4, 64),
-        );
-    });
-    lower_or_fail(&ir, "batched dense f32 matmul");
-}
-
-#[test]
-fn batched_dense_f32_gemv_lowers() {
-    let ir = tile::build(|program| {
-        let shape = DenseMatmulShape {
-            batch: 3,
-            m: 5,
-            k: 256,
-            n: 1,
-        };
-        let a = program.storage_read(
-            ScalarElement::F32.element(),
-            Shape::new([shape.batch * shape.m, shape.k]),
-        );
-        let b = program.storage_read(
-            ScalarElement::F32.element(),
-            Shape::new([shape.batch * shape.k, shape.n]),
-        );
-        let y = program.storage_write(
-            ScalarElement::F32.element(),
-            Shape::new([shape.batch * shape.m, shape.n]),
-        );
-        batched_gemv_with_epilogues(
-            program,
-            &a,
-            &b,
-            &y,
-            shape,
-            &DenseMatmulEpilogues::empty(),
-            65_535,
-            subgroup_config(32),
-        );
-    });
-    lower_or_fail(&ir, "batched dense f32 gemv");
-}
-
-#[test]
-fn batched_dense_f16_matmul_lowers() {
-    let ir = tile::build(|program| {
-        let shape = DenseMatmulShape {
-            batch: 2,
-            m: 8,
-            k: 128,
-            n: 4,
-        };
-        let a = program.storage_read(
-            ScalarElement::F16.element(),
-            Shape::new([shape.batch * shape.m, shape.k]),
-        );
-        let b = program.storage_read(
-            ScalarElement::F16.element(),
-            Shape::new([shape.batch * shape.k, shape.n]),
-        );
-        let y = program.storage_write(
-            ScalarElement::F16.element(),
-            Shape::new([shape.batch * shape.m, shape.n]),
-        );
-        batched_matmul_with_epilogues(
-            program,
-            DenseMatmulTensors {
-                a: &a,
-                b: &b,
-                y: &y,
-            },
-            shape,
-            &DenseMatmulEpilogues::empty(),
-            65_535,
-            DenseMatmulTile::new(32, 32, 8, 4, 4, 64),
-        );
-    });
-    lower_or_fail(&ir, "batched dense f16 matmul");
-}
-
-#[test]
-fn batched_dense_f16_gemv_lowers() {
-    let ir = tile::build(|program| {
-        let shape = DenseMatmulShape {
-            batch: 2,
-            m: 5,
-            k: 128,
-            n: 1,
-        };
-        let a = program.storage_read(
-            ScalarElement::F16.element(),
-            Shape::new([shape.batch * shape.m, shape.k]),
-        );
-        let b = program.storage_read(
-            ScalarElement::F16.element(),
-            Shape::new([shape.batch * shape.k, shape.n]),
-        );
-        let y = program.storage_write(
-            ScalarElement::F16.element(),
-            Shape::new([shape.batch * shape.m, shape.n]),
-        );
-        batched_gemv_with_epilogues(
-            program,
-            &a,
-            &b,
-            &y,
-            shape,
-            &DenseMatmulEpilogues::empty(),
-            65_535,
-            subgroup_config(32),
-        );
-    });
-    lower_or_fail(&ir, "batched dense f16 gemv");
 }
 
 #[test]
@@ -589,36 +361,6 @@ fn cooperative_dense_f32_matmul_128x256_npass_lowers() {
         ));
     });
     lower_or_fail(&ir, "cooperative dense f32 128x256 N_PASSES=4 matmul");
-}
-
-#[test]
-fn qdequantize_lowers() {
-    let ir = tile::build(|program| {
-        let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 4);
-        let y = program.storage_write(ElementType::F32, Shape::new([1024]));
-        qdequantize(program, &b, &y, 1);
-    });
-    lower_or_fail(&ir, "qdequantize");
-}
-
-#[test]
-fn q4k_native_qdequantize_lowers() {
-    let ir = tile::build(|program| {
-        let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 4);
-        let y = program.storage_write(ElementType::F32, Shape::new([1024]));
-        qdequantize(program, &b, &y, 1);
-    });
-    lower_or_fail(&ir, "q4k native qdequantize");
-}
-
-#[test]
-fn qdequantize_f16_output_lowers() {
-    let ir = tile::build(|program| {
-        let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 4);
-        let y = program.storage_write(ElementType::F16, Shape::new([1024]));
-        qdequantize(program, &b, &y, 1);
-    });
-    lower_or_fail(&ir, "qdequantize f16 output");
 }
 
 /// Regression for the fallback branch in `qmatmul_tile_with_epilogue`. When

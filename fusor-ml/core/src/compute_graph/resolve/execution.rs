@@ -11,11 +11,19 @@ impl Resolver {
             op.visit_dependencies(&mut |dep| {
                 if let Some(count) = remaining_consumers.get_mut(&dep) {
                     *count = count.saturating_sub(1);
-                    if *count == 0 && !targets.contains(&dep) && !graph.has_live_reference(dep) {
+                    if *count == 0
+                        && !targets.contains(&dep)
+                        && !graph.has_live_lazy_descendant(dep)
+                    {
                         // All consumers within this execution have been
                         // processed and no user-held lazy tensor still
                         // transitively depends on `dep` — free the cached
-                        // buffer.
+                        // buffer. The descendant check must include
+                        // `live_descendant_count`, not just direct
+                        // references: clearing `cached` on a node that still
+                        // has an alive-uncached descendant flips it back to
+                        // alive-uncached without propagating the transition,
+                        // undercounting every ancestor's descendant counter.
                         if let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
                             node.cached = None;
                         }
@@ -59,9 +67,6 @@ impl Resolver {
         graph: &ComputeGraphInner,
         operation: &crate::slice_assign::SliceAssignOperation,
     ) -> Option<(TensorData, Vec<CopyBufferRecord>)> {
-        if !operation.in_place {
-            return None;
-        }
         let input = graph.get_cached_result(operation.input)?;
         let value = graph.get_cached_result(operation.value)?;
         if input.datatype() != value.datatype() || operation.slices.len() != input.layout().rank() {
@@ -148,7 +153,7 @@ impl Resolver {
         // Add to execution graph
         let exec_idx = self.execution_graph.add_node(ExecutionNode {
             inner_idx: node,
-            variant: variant.clone(),
+            variant: variant.clone().into(),
         });
         self.node_mapping.insert(node, exec_idx);
 
@@ -167,39 +172,68 @@ impl Resolver {
         Some(exec_idx)
     }
 
-    pub(super) fn lower_node(&self, node: &ExecutionNode) -> Option<QueuedOperation> {
+    pub(super) fn lower_node(
+        &self,
+        exec_idx: ExecutionNodeIndex,
+        node: &ExecutionNode,
+    ) -> Option<QueuedOperation> {
         match &node.variant {
-            ComputeGraphNodeVariant::Nary(op) => {
+            ExecutionVariant::Elementwise(op) => {
                 Some(QueuedOperation::Generic(Arc::new(op.clone())))
             }
-            ComputeGraphNodeVariant::MatMul(op) => {
+            ExecutionVariant::MatMul(op) => Some(QueuedOperation::Generic(Arc::new(op.clone()))),
+            ExecutionVariant::Reduce(op) => Some(QueuedOperation::Generic(Arc::new(op.clone()))),
+            ExecutionVariant::GraphOp(op) => Some(QueuedOperation::Generic(op.clone())),
+            ExecutionVariant::View(op) => Some(QueuedOperation::Generic(Arc::new(op.clone()))),
+            ExecutionVariant::Assign(op) => Some(QueuedOperation::Generic(Arc::new(op.clone()))),
+            ExecutionVariant::QEmbedding(op) => {
                 Some(QueuedOperation::Generic(Arc::new(op.clone())))
             }
-            ComputeGraphNodeVariant::Reduce(op) => {
+            ExecutionVariant::QMatMul(op) => Some(QueuedOperation::QMatMul(op.clone())),
+            ExecutionVariant::QMatrix(op) => {
+                // Skip materializing the dense tensor when every consumer
+                // reads the block-quantized data directly (fused reduces and
+                // elementwise expressions decode per element; qmatmul and
+                // embedding kernels decode per block).
+                if self.qmatrix_consumed_raw(exec_idx, node.inner_idx) {
+                    return None;
+                }
                 Some(QueuedOperation::Generic(Arc::new(op.clone())))
             }
-            ComputeGraphNodeVariant::FlashAttention(op) => {
-                Some(QueuedOperation::Generic(Arc::new(op.clone())))
-            }
-            ComputeGraphNodeVariant::GraphOp(op) => Some(QueuedOperation::Generic(op.clone())),
-            ComputeGraphNodeVariant::MapLayout(op) => {
-                Some(QueuedOperation::Generic(Arc::new(op.clone())))
-            }
-            ComputeGraphNodeVariant::Resize(op) => {
-                Some(QueuedOperation::Generic(Arc::new(op.clone())))
-            }
-            ComputeGraphNodeVariant::SliceAssign(op) => {
-                Some(QueuedOperation::Generic(Arc::new(op.clone())))
-            }
-            ComputeGraphNodeVariant::QEmbedding(op) => {
-                Some(QueuedOperation::Generic(Arc::new(op.clone())))
-            }
-            ComputeGraphNodeVariant::QMatMul(op) => Some(QueuedOperation::QMatMul(op.clone())),
-            ComputeGraphNodeVariant::Dequantize(op) => {
-                Some(QueuedOperation::Generic(Arc::new(op.clone())))
-            }
-            ComputeGraphNodeVariant::Tensor(_) => None, // Handled in execution loop
+            ExecutionVariant::Tensor(_) => None, // Handled in execution loop
         }
+    }
+
+    /// Whether every consumer of a quantized-matrix node reads the raw
+    /// blocks (region ops decode per block; expression reads decode per
+    /// element) rather than needing the dense tensor. Only custom-indexed
+    /// expression reads require the dense form.
+    fn qmatrix_consumed_raw(&self, exec_idx: ExecutionNodeIndex, inner: NodeIndex) -> bool {
+        let mut any = false;
+        for consumer in self
+            .execution_graph
+            .neighbors_directed(exec_idx, petgraph::Direction::Outgoing)
+        {
+            any = true;
+            let raw = match &self.execution_graph[consumer].variant {
+                ExecutionVariant::QMatMul(_) | ExecutionVariant::QEmbedding(_) => true,
+                ExecutionVariant::Elementwise(nary) => {
+                    !nary.inputs.iter().enumerate().any(|(slot, &input)| {
+                        input == inner && nary.expression.uses_custom_indexing_for_input(slot)
+                    })
+                }
+                ExecutionVariant::Reduce(reduce) => {
+                    !reduce.inputs.iter().enumerate().any(|(slot, &input)| {
+                        input == inner && reduce.expression.uses_custom_indexing_for_input(slot)
+                    })
+                }
+                _ => false,
+            };
+            if !raw {
+                return false;
+            }
+        }
+        any
     }
 
     // --- Rewrite Engine ---
@@ -207,32 +241,37 @@ impl Resolver {
     pub(super) fn optimize(&mut self, graph: &mut ComputeGraphInner) {
         let profile_enabled = std::env::var_os("FUSOR_TRACE_OPTIMIZE").is_some();
         let mut profile = OptimizeProfile::default();
+        // Rebuild composed contraction / normalization clusters into their
+        // specialized operations first, while they are still in the exact
+        // canonical form the API emitted (before view folding or fusion
+        // disturbs them).
+        self.recognize_contractions(graph);
+        self.recognize_embeddings(graph);
+        self.recognize_attention(graph);
+        self.fuse_row_programs(graph);
+        self.recognize_assign_chains(graph);
         // The current rewrite rules can only start from Nary nodes (nary
         // fusion, post-op reduce/matmul fusion) or MatMul nodes (pre-op
-        // unary fusion). Avoid scanning every QMatMul/RMS/attention node in
+        // unary fusion). Avoid scanning every QMatMul/attention node in
         // decode graphs with hundreds of kernels.
         let has_reduce = self.execution_graph.node_indices().any(|node| {
             matches!(
                 self.execution_graph[node].variant,
-                ComputeGraphNodeVariant::Reduce(_)
+                ExecutionVariant::Reduce(_)
             )
         });
         let has_matmul = self.execution_graph.node_indices().any(|node| {
             matches!(
                 self.execution_graph[node].variant,
-                ComputeGraphNodeVariant::MatMul(_)
+                ExecutionVariant::MatMul(_)
             )
         });
         let has_qmatmul = self.execution_graph.node_indices().any(|node| {
             matches!(
                 self.execution_graph[node].variant,
-                ComputeGraphNodeVariant::QMatMul(_)
+                ExecutionVariant::QMatMul(_)
             )
         });
-        let has_rmsnorm = self
-            .execution_graph
-            .node_indices()
-            .any(|node| as_rms_norm(&self.execution_graph[node].variant).is_some());
         let allow_qmatmul_elementwise_fusion = self.execution_graph.node_count()
             <= DEFAULT_OPTIMIZE_NODE_LIMIT
             || std::env::var_os("FUSOR_RESOLVE_QMATMUL_ELEMENTWISE_FUSION").is_some();
@@ -258,10 +297,14 @@ impl Resolver {
                 .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
                 .collect();
 
-            // 1. Fuse naries together (combine expression trees)
-            // 2. Try to fuse resulting nary into specialized ops (reduce, matmul, etc.)
+            // 1. Fold view inputs into the nary body so fusion sees through
+            //    layout changes
+            // 2. Fuse naries together (combine expression trees)
+            // 3. Try to fuse resulting nary into specialized ops (reduce, matmul, etc.)
+            let changed = self.try_fold_view_inputs(graph, node_idx);
+
             let start = profile_enabled.then(Instant::now);
-            let changed = self.try_fuse_naries(graph, node_idx);
+            let changed = changed | self.try_fuse_naries(graph, node_idx);
             if let Some(start) = start {
                 profile.fuse_naries_count += 1;
                 profile.fuse_naries += start.elapsed();
@@ -271,7 +314,9 @@ impl Resolver {
                 true
             } else {
                 let start = profile_enabled.then(Instant::now);
-                let changed = has_reduce && self.try_fuse_into_reduce(graph, node_idx);
+                let changed = has_reduce
+                    && (self.try_fuse_into_reduce(graph, node_idx)
+                        || self.try_fuse_producer_into_reduce(graph, node_idx));
                 if let Some(start) = start {
                     profile.fuse_reduce_count += 1;
                     profile.fuse_reduce += start.elapsed();
@@ -288,18 +333,6 @@ impl Resolver {
                 if let Some(start) = start {
                     profile.fuse_matmul_count += 1;
                     profile.fuse_matmul += start.elapsed();
-                }
-                changed
-            };
-
-            let changed = if changed {
-                true
-            } else {
-                let start = profile_enabled.then(Instant::now);
-                let changed = has_rmsnorm && self.try_fuse_into_rmsnorm(graph, node_idx);
-                if let Some(start) = start {
-                    profile.fuse_rmsnorm_count += 1;
-                    profile.fuse_rmsnorm += start.elapsed();
                 }
                 changed
             };
@@ -345,10 +378,15 @@ impl Resolver {
     }
 
     pub(super) fn optimize_large_graph(&mut self, graph: &mut ComputeGraphInner) {
+        self.recognize_contractions(graph);
+        self.recognize_embeddings(graph);
+        self.recognize_attention(graph);
+        self.fuse_row_programs(graph);
+        self.recognize_assign_chains(graph);
         let has_qmatmul = self.execution_graph.node_indices().any(|node| {
             matches!(
                 self.execution_graph[node].variant,
-                ComputeGraphNodeVariant::QMatMul(_)
+                ExecutionVariant::QMatMul(_)
             )
         });
         if !has_qmatmul {
@@ -372,7 +410,8 @@ impl Resolver {
                 .execution_graph
                 .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
                 .collect::<Vec<_>>();
-            let mut changed = self.try_fuse_naries(graph, node_idx);
+            let mut changed = self.try_fold_view_inputs(graph, node_idx);
+            changed |= self.try_fuse_naries(graph, node_idx);
             if !changed && self.execution_graph.contains_node(node_idx) {
                 changed = self.try_fuse_into_matmul(graph, node_idx, true);
             }
@@ -419,7 +458,7 @@ impl Resolver {
                 }
             } else if matches!(
                 self.execution_graph[node].variant,
-                ComputeGraphNodeVariant::MapLayout(_)
+                ExecutionVariant::View(_)
             ) {
                 stack.extend(
                     self.execution_graph
@@ -430,7 +469,7 @@ impl Resolver {
     }
 
     pub(super) fn is_large_graph_nary_candidate(&self, node_idx: ExecutionNodeIndex) -> bool {
-        let ComputeGraphNodeVariant::Nary(nary) = &self.execution_graph[node_idx].variant else {
+        let ExecutionVariant::Elementwise(nary) = &self.execution_graph[node_idx].variant else {
             return false;
         };
         if nary.shape.last().copied().unwrap_or_default() >= LARGE_GRAPH_NARY_FUSION_MIN_LAST_DIM {
@@ -438,14 +477,12 @@ impl Resolver {
         }
 
         nary.inputs.iter().any(|&input| {
-            let (base_inner, _) = self
-                .walk_map_layout_chain(input)
-                .unwrap_or((input, Vec::new()));
+            let (base_inner, _) = self.walk_view_chain(input);
             self.get_input_node_in_exec_graph(base_inner)
                 .is_some_and(|exec_idx| {
                     matches!(
                         self.execution_graph[exec_idx].variant,
-                        ComputeGraphNodeVariant::QMatMul(_)
+                        ExecutionVariant::QMatMul(_)
                     )
                 })
         })
@@ -455,8 +492,7 @@ impl Resolver {
         let mut qmatmul_count = 0usize;
         let mut single_token_count = 0usize;
         for node in self.execution_graph.node_indices() {
-            let ComputeGraphNodeVariant::QMatMul(qmatmul) = &self.execution_graph[node].variant
-            else {
+            let ExecutionVariant::QMatMul(qmatmul) = &self.execution_graph[node].variant else {
                 continue;
             };
             qmatmul_count += 1;
@@ -475,10 +511,11 @@ impl Resolver {
     pub(super) fn is_optimization_candidate(&self, node_idx: ExecutionNodeIndex) -> bool {
         matches!(
             self.execution_graph[node_idx].variant,
-            ComputeGraphNodeVariant::Nary(_)
-                | ComputeGraphNodeVariant::MatMul(_)
-                | ComputeGraphNodeVariant::QMatMul(_)
-        ) || as_rms_norm(&self.execution_graph[node_idx].variant).is_some()
+            ExecutionVariant::Elementwise(_)
+                | ExecutionVariant::MatMul(_)
+                | ExecutionVariant::QMatMul(_)
+                | ExecutionVariant::Reduce(_)
+        )
     }
 
     // Helpers
@@ -501,46 +538,47 @@ impl Resolver {
         self.node_mapping.get(&inner_input).copied()
     }
 
-    pub(super) fn walk_map_layout_chain(
-        &self,
-        mut inner: NodeIndex,
-    ) -> Option<(NodeIndex, Vec<crate::map_layout::MapLayoutOperation>)> {
-        let mut chain = Vec::new();
+    /// Walk through view nodes from `inner` down to the first non-view
+    /// node, composing each view's collapsed stage stack. Public tensor ops
+    /// collapse into single view nodes at construction, but composed
+    /// clusters (attention's attached GQA/transpose views) still layer view
+    /// nodes deliberately. Returns the base node and the composed layout
+    /// over the base's logical value space; the layout is `None` when
+    /// `inner` is not a view (identity). Views that don't collapse or
+    /// compose (or carry a fill region) act as chain breaks: the walk stops
+    /// without seeing through them.
+    pub(super) fn walk_view_chain(&self, mut inner: NodeIndex) -> (NodeIndex, Option<Layout>) {
+        let mut composed: Option<Layout> = None;
         loop {
             let Some(exec) = self.get_input_node_in_exec_graph(inner) else {
-                if chain.is_empty() {
-                    return None;
-                }
-                chain.reverse();
-                return Some((inner, chain));
+                return (inner, composed);
             };
-            let ComputeGraphNodeVariant::MapLayout(map) =
-                self.execution_graph[exec].variant.clone()
-            else {
-                chain.reverse();
-                return Some((inner, chain));
+            let ExecutionVariant::View(view) = &self.execution_graph[exec].variant else {
+                return (inner, composed);
             };
-            inner = map.input;
-            chain.push(map);
+            let Some(collapsed) = view.composed_layout() else {
+                return (inner, composed);
+            };
+            let next = match &composed {
+                None => collapsed,
+                Some(outer) => match crate::view::compose_layouts(outer, &collapsed) {
+                    Some(layout) => layout,
+                    None => return (inner, composed),
+                },
+            };
+            composed = Some(next);
+            inner = view.input;
         }
     }
 
-    pub(super) fn apply_map_layout_chain(
-        base: &Layout,
-        chain: &[crate::map_layout::MapLayoutOperation],
-    ) -> Layout {
-        chain
-            .iter()
-            .fold(base.clone(), |layout, map| map.map_layout(&layout))
-    }
-
-    pub(super) fn infer_layout(
-        graph: &ComputeGraphInner,
-        inner_idx: NodeIndex,
-    ) -> Option<crate::TensorLayoutInfo> {
-        let mut pass = LayoutPass::default();
-        pass.visit(graph, inner_idx);
-        pass.output_layout.remove(&inner_idx)
+    /// The layout a (possibly chained-view) node presents over its base
+    /// node's value space when the base materializes at `base_layout`.
+    /// `None` when the view does not compose with that layout.
+    pub(super) fn apply_view_chain(base_layout: &Layout, chain: &Option<Layout>) -> Option<Layout> {
+        match chain {
+            None => Some(base_layout.clone()),
+            Some(view) => crate::view::compose_layouts(view, base_layout),
+        }
     }
 
     pub(super) fn infer_layout_cached(
@@ -548,12 +586,8 @@ impl Resolver {
         graph: &ComputeGraphInner,
         inner_idx: NodeIndex,
     ) -> Option<crate::TensorLayoutInfo> {
-        if let Some(layout) = self.layout_cache.get(&inner_idx) {
-            return layout.clone();
-        }
-        let layout = Self::infer_layout(graph, inner_idx);
-        self.layout_cache.insert(inner_idx, layout.clone());
-        layout
+        self.layout_pass.visit(graph, inner_idx);
+        self.layout_pass.output_layout.get(&inner_idx).cloned()
     }
 
     pub(super) fn try_normalize_qmatmul_post_extra(
@@ -580,9 +614,7 @@ impl Resolver {
             return Some(extra_inner);
         }
 
-        let (base_inner, _) = self
-            .walk_map_layout_chain(extra_inner)
-            .unwrap_or((extra_inner, Vec::new()));
+        let (base_inner, _) = self.walk_view_chain(extra_inner);
         let base_info = self.infer_layout_cached(graph, base_inner)?;
         let base_layout = base_info.layout();
         if base_info.datatype() == DataTypeEnum::F32

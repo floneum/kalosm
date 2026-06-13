@@ -423,6 +423,29 @@ impl Device {
         storage_bindings.min(bind_group_bindings).saturating_sub(1)
     }
 
+    /// A conservative estimate of the device's last-level cache. Data reused
+    /// below this size is treated as cache-resident — re-reading it costs no
+    /// bandwidth — so the reuse-driven tilings (which trade thread-level
+    /// parallelism for explicit reuse) only engage above it. wgpu exposes no
+    /// cache size, so this is a floor per device class; override with
+    /// `FUSOR_LAST_LEVEL_CACHE_BYTES` when tuning a specific part.
+    pub fn last_level_cache_bytes(&self) -> u64 {
+        if let Ok(value) = std::env::var("FUSOR_LAST_LEVEL_CACHE_BYTES")
+            && let Ok(parsed) = value.parse::<u64>()
+        {
+            return parsed;
+        }
+        let info = &self.inner.adapter_info;
+        // Apple-silicon system-level cache starts at 8 MiB on the base M1
+        // and only grows with tier; other GPU classes floor lower (older
+        // discrete L2s are 2-4 MiB, integrated parts share CPU cache).
+        if info.backend == wgpu::Backend::Metal && info.name.starts_with("Apple") {
+            8 << 20
+        } else {
+            4 << 20
+        }
+    }
+
     pub fn features(&self) -> wgpu::Features {
         self.inner.device.features()
     }

@@ -88,6 +88,11 @@ pub enum Stmt {
         dst: Tile,
         /// Per-element source value (typically a masked `Load`).
         value: Expr,
+        /// Exclusive global (row, col) limits: elements at or beyond a limit
+        /// load zero instead of touching storage. `None` per axis when the
+        /// tile is known in-bounds along it (the common aligned case, which
+        /// lowers without any guard).
+        bounds: [Option<Expr>; 2],
     },
     /// Cooperatively store an accumulator to a global storage view. A distinct
     /// subgroup-collective primitive — never lowered as a per-lane `Store`.

@@ -38,7 +38,9 @@ impl<'a> Lowerer<'a> {
                 body.push(Statement::Store { pointer, value }, Span::default());
                 Ok(())
             }
-            Stmt::FillTile { dst, value } => self.lower_fill_tile(expressions, body, dst, value),
+            Stmt::FillTile { dst, value, bounds } => {
+                self.lower_fill_tile(expressions, body, dst, value, bounds)
+            }
             Stmt::CoopStore { acc, dst, addr } => {
                 self.lower_store_coop_acc(expressions, body, acc, dst, addr)
             }
@@ -311,6 +313,7 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         dst: &Tile,
         value: &Expr,
+        bounds: &[Option<Expr>; 2],
     ) -> Result<(), LowerError> {
         let ExprKind::Load {
             src,
@@ -330,9 +333,14 @@ impl<'a> Lowerer<'a> {
         };
         match src {
             Source::Storage(view) => {
-                self.lower_copy_to_tile(expressions, body, dst, view, row, col, mask, fill)
+                self.lower_copy_to_tile(expressions, body, dst, view, row, col, bounds, mask, fill)
             }
             Source::Quantized(matrix) => {
+                if bounds.iter().any(Option::is_some) {
+                    return Err(LowerError::UnsupportedOperation(
+                        "bounded fills are not supported for quantized sources",
+                    ));
+                }
                 self.lower_copy_quant_to_tile(expressions, body, dst, matrix, row, col)
             }
         }
@@ -347,6 +355,7 @@ impl<'a> Lowerer<'a> {
         src: &StorageView,
         row_offset: &Expr,
         col_offset: &Expr,
+        bounds: &[Option<Expr>; 2],
         _mask: &Expr,
         _fill: &Expr,
     ) -> Result<(), LowerError> {
@@ -356,9 +365,30 @@ impl<'a> Lowerer<'a> {
         let local = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
         let row_base = self.lower_expr(expressions, body, row_offset)?;
         let col_base = self.lower_expr(expressions, body, col_offset)?;
+        let bounded = bounds.iter().any(Option::is_some);
+
+        // The source layout drives the lane enumeration: lanes advance along
+        // the axis whose unit-stride storage runs they can follow, so a
+        // transposed matrix visits column-fastest down its unit-stride rows
+        // instead of scattering every lane across row strides. Divmod maps
+        // (im2col windows) keep the column order: their column-fastest
+        // blocks are compact in memory (a few cache lines per simdgroup),
+        // and Apple coalesces at line granularity — visiting along the long
+        // row runs measured slower by spreading each pass over the whole
+        // window footprint.
+        let cols_fastest = {
+            let indexing = src.layout.indexing();
+            !indexing.is_affine()
+                || indexing.rank() != 2
+                || indexing.axis_unit_run(1) >= indexing.axis_unit_run(0)
+        };
 
         const VEC: u32 = 4;
-        if cols.is_multiple_of(VEC) && Self::storage_has_unit_inner_stride(&src.layout) {
+        if !bounded
+            && cols_fastest
+            && cols.is_multiple_of(VEC)
+            && Self::storage_axis_unit_stride(&src.layout, 1)
+        {
             let groups_per_row = cols / VEC;
             let total_groups =
                 rows.checked_mul(groups_per_row)
@@ -445,16 +475,120 @@ impl<'a> Lowerer<'a> {
             );
         }
 
+        // Vectorized fast path down unit-stride rows (a transposed source):
+        // each lane loads four row-consecutive elements of one column.
+        if !bounded
+            && !cols_fastest
+            && rows.is_multiple_of(VEC)
+            && Self::storage_axis_unit_stride(&src.layout, 0)
+        {
+            let groups_per_col = rows / VEC;
+            let total_groups =
+                cols.checked_mul(groups_per_col)
+                    .ok_or(LowerError::UnsupportedOperation(
+                        "workgroup tile size overflow",
+                    ))?;
+            return self.lower_copy_passes(
+                expressions,
+                body,
+                local,
+                total_groups,
+                |expressions, flat| {
+                    let mut accept = Block::new();
+                    let local_col = self.div_literal_u32_emitted(
+                        expressions,
+                        flat,
+                        groups_per_col,
+                        &mut accept,
+                    );
+                    let local_row_group = self.mod_literal_u32_emitted(
+                        expressions,
+                        flat,
+                        groups_per_col,
+                        &mut accept,
+                    );
+                    let local_row_base = self.mul_literal_u32_emitted(
+                        expressions,
+                        local_row_group,
+                        VEC,
+                        &mut accept,
+                    );
+                    let global_row_base =
+                        self.add(expressions, &mut accept, row_base, local_row_base);
+                    let global_col = self.add(expressions, &mut accept, col_base, local_col);
+                    let storage_index_base = self.storage_index_from_coords(
+                        expressions,
+                        src,
+                        &[global_row_base, global_col],
+                        &mut accept,
+                    )?;
+                    let tile_index_base = self.tile_matrix_index_inline(
+                        expressions,
+                        &mut accept,
+                        local_row_base,
+                        local_col,
+                        stride,
+                    );
+                    let mut values = [None; VEC as usize];
+                    for i in 0..VEC {
+                        let storage_index = self.add_literal_u32_emitted(
+                            expressions,
+                            storage_index_base,
+                            i,
+                            &mut accept,
+                        );
+                        let storage_ptr = self.storage_dynamic_pointer(
+                            expressions,
+                            src,
+                            storage_index,
+                            &mut accept,
+                        )?;
+                        values[i as usize] =
+                            Some(Self::emit_load(expressions, &mut accept, storage_ptr));
+                    }
+                    for i in 0..VEC {
+                        let tile_index = self.add_literal_u32_emitted(
+                            expressions,
+                            tile_index_base,
+                            i * stride,
+                            &mut accept,
+                        );
+                        let tile_ptr =
+                            self.tile_dynamic_pointer(expressions, dst, tile_index, &mut accept)?;
+                        accept.push(
+                            Statement::Store {
+                                pointer: tile_ptr,
+                                value: values[i as usize].expect("loaded above"),
+                            },
+                            Span::default(),
+                        );
+                    }
+                    Ok(accept)
+                },
+            );
+        }
+
         let total = rows
             .checked_mul(cols)
             .ok_or(LowerError::UnsupportedOperation(
                 "workgroup tile size overflow",
             ))?;
         let lane_layout = CopyLaneLayout {
+            rows,
             cols,
             stride,
             row_base,
             col_base,
+            cols_fastest,
+        };
+
+        let row_limit = match &bounds[0] {
+            Some(bound) => Some(self.lower_expr(expressions, body, bound)?),
+            None => None,
+        };
+        let col_limit = match &bounds[1] {
+            Some(bound) => Some(self.lower_expr(expressions, body, bound)?),
+            None => None,
         };
 
         self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
@@ -470,33 +604,101 @@ impl<'a> Lowerer<'a> {
                 dst,
                 lane_layout,
             )?;
-            let storage_index = self.storage_index_from_coords(
-                expressions,
-                src,
-                &[global_row, global_col],
-                &mut accept,
-            )?;
-            let storage_ptr =
-                self.storage_dynamic_pointer(expressions, src, storage_index, &mut accept)?;
-            let value = Self::emit_load(expressions, &mut accept, storage_ptr);
-            accept.push(
-                Statement::Store {
-                    pointer: tile_ptr,
-                    value,
-                },
-                Span::default(),
-            );
+            // Edge tiles: elements past a bound store zero without touching
+            // storage, so partial M/N/K tails stay garbage-free for the MMA.
+            let mut in_bounds: Option<Handle<Expression>> = None;
+            for (coord, limit) in [(global_row, row_limit), (global_col, col_limit)] {
+                let Some(limit) = limit else { continue };
+                let check = self.bin(expressions, &mut accept, BinaryOperator::Less, coord, limit);
+                in_bounds = Some(match in_bounds {
+                    None => check,
+                    Some(previous) => self.bin(
+                        expressions,
+                        &mut accept,
+                        BinaryOperator::LogicalAnd,
+                        previous,
+                        check,
+                    ),
+                });
+            }
+            match in_bounds {
+                None => {
+                    let storage_index = self.storage_index_from_coords(
+                        expressions,
+                        src,
+                        &[global_row, global_col],
+                        &mut accept,
+                    )?;
+                    let storage_ptr =
+                        self.storage_dynamic_pointer(expressions, src, storage_index, &mut accept)?;
+                    let value = Self::emit_load(expressions, &mut accept, storage_ptr);
+                    accept.push(
+                        Statement::Store {
+                            pointer: tile_ptr,
+                            value,
+                        },
+                        Span::default(),
+                    );
+                }
+                Some(in_bounds) => {
+                    let mut in_bounds_body = Block::new();
+                    let storage_index = self.storage_index_from_coords(
+                        expressions,
+                        src,
+                        &[global_row, global_col],
+                        &mut in_bounds_body,
+                    )?;
+                    let storage_ptr = self.storage_dynamic_pointer(
+                        expressions,
+                        src,
+                        storage_index,
+                        &mut in_bounds_body,
+                    )?;
+                    let value = Self::emit_load(expressions, &mut in_bounds_body, storage_ptr);
+                    in_bounds_body.push(
+                        Statement::Store {
+                            pointer: tile_ptr,
+                            value,
+                        },
+                        Span::default(),
+                    );
+
+                    let zero_f32 = self.f32(expressions, 0.0);
+                    let mut out_of_bounds_body = Block::new();
+                    let zero = self.cast_tile_value(
+                        expressions,
+                        &mut out_of_bounds_body,
+                        zero_f32,
+                        ElementType::F32,
+                        dst.element,
+                    );
+                    out_of_bounds_body.push(
+                        Statement::Store {
+                            pointer: tile_ptr,
+                            value: zero,
+                        },
+                        Span::default(),
+                    );
+                    accept.push(
+                        Statement::If {
+                            condition: in_bounds,
+                            accept: in_bounds_body,
+                            reject: out_of_bounds_body,
+                        },
+                        Span::default(),
+                    );
+                }
+            }
             Ok(accept)
         })
     }
 
-    /// True if the storage view's innermost axis is contiguous (stride 1).
-    fn storage_has_unit_inner_stride(layout: &Layout) -> bool {
+    /// True if the storage view is affine with a unit stride along `axis`.
+    fn storage_axis_unit_stride(layout: &Layout, axis: usize) -> bool {
         if !layout.is_affine() {
             return false;
         }
-        let strides = layout.affine_strides();
-        strides.last().copied() == Some(1)
+        layout.affine_strides().get(axis).copied() == Some(1)
     }
 
     fn lower_copy_quant_to_tile(
@@ -678,11 +880,15 @@ impl<'a> Lowerer<'a> {
         }
 
         let total = rows * cols;
+        // Quantized matrices store row-major blocks; lanes keep the column
+        // order.
         let lane_layout = CopyLaneLayout {
+            rows,
             cols,
             stride,
             row_base,
             col_base,
+            cols_fastest: true,
         };
         self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
             let mut accept = Block::new();
@@ -881,13 +1087,25 @@ impl<'a> Lowerer<'a> {
         layout: CopyLaneLayout,
     ) -> Result<CopyLaneCoords, LowerError> {
         let CopyLaneLayout {
+            rows,
             cols,
             stride,
             row_base,
             col_base,
+            cols_fastest,
         } = layout;
-        let local_row = self.div_literal_u32_emitted(expressions, flat, cols, body);
-        let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, body);
+        // Lanes advance along the axis the source layout coalesces best.
+        let (local_row, local_col) = if cols_fastest {
+            (
+                self.div_literal_u32_emitted(expressions, flat, cols, body),
+                self.mod_literal_u32_emitted(expressions, flat, cols, body),
+            )
+        } else {
+            (
+                self.mod_literal_u32_emitted(expressions, flat, rows, body),
+                self.div_literal_u32_emitted(expressions, flat, rows, body),
+            )
+        };
         let global_row = self.add(expressions, body, row_base, local_row);
         let global_col = self.add(expressions, body, col_base, local_col);
         let tile_index =
@@ -917,8 +1135,11 @@ struct CopyLaneCoords {
 
 #[derive(Clone, Copy)]
 struct CopyLaneLayout {
+    rows: u32,
     cols: u32,
     stride: u32,
     row_base: Handle<Expression>,
     col_base: Handle<Expression>,
+    /// Lane enumeration order, chosen from the source layout's unit runs.
+    cols_fastest: bool,
 }

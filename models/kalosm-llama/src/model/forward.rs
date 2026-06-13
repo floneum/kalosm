@@ -377,16 +377,18 @@ where
         previous_gpu_token: Option<&fusor::GpuSampledToken>,
         top_k: usize,
     ) -> Result<Option<fusor::GpuSampledToken>, LlamaModelError> {
-        let hidden = hidden.squeeze(0).to_concrete();
+        let logits = hidden
+            .squeeze(0)
+            .to_concrete()
+            .q_mat_mul(model.output_matrix());
         match sampler.config.sampling_strategy {
             kalosm_language_model::SamplingStrategy::Mirostat2 => {
                 let params = sampler.mirostat_params(top_k);
                 let mirostat = sampler.mirostat.as_mut().ok_or_else(|| {
                     LlamaModelError::SamplerError("missing Mirostat GPU sampler".into())
                 })?;
-                hidden
-                    .try_sample_mirostat2_token_q_mat_pending(
-                        model.output_matrix(),
+                logits
+                    .sample_mirostat2_token_pending(
                         mirostat,
                         &previous_tokens,
                         previous_gpu_token,
@@ -396,13 +398,8 @@ where
             }
             kalosm_language_model::SamplingStrategy::Standard => {
                 let params = sampler.standard_params(top_k);
-                hidden
-                    .try_sample_standard_token_q_mat_pending(
-                        model.output_matrix(),
-                        &previous_tokens,
-                        previous_gpu_token,
-                        params,
-                    )
+                logits
+                    .sample_standard_token_pending(&previous_tokens, previous_gpu_token, params)
                     .map_err(LlamaModelError::from)
             }
         }
@@ -446,13 +443,15 @@ where
             Ok(hidden) => hidden,
             Err(err) => return Box::pin(async move { Err(err.into()) }),
         };
-        let hidden = hidden.squeeze(0).to_concrete();
-        let output_matrix = model.output_matrix().clone();
+        let logits = hidden
+            .squeeze(0)
+            .to_concrete()
+            .q_mat_mul(model.output_matrix());
         let mut kernels = 0;
         if trace {
-            if let Some(gpu_hidden) = hidden.as_gpu() {
+            if let Some(gpu_logits) = logits.as_gpu() {
                 let resolve_start = Some(Instant::now());
-                kernels = gpu_hidden.count_kernels_to_resolve();
+                kernels = gpu_logits.count_kernels_to_resolve();
                 if let Some(start) = resolve_start {
                     tracing::info!(
                         "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
@@ -469,25 +468,17 @@ where
                     let mirostat = sampler.mirostat.as_mut().ok_or_else(|| {
                         LlamaModelError::SamplerError("missing Mirostat GPU sampler".into())
                     })?;
-                    hidden
-                        .try_sample_mirostat2_token_q_mat(
-                            &output_matrix,
-                            mirostat,
-                            &previous_tokens,
-                            params,
-                        )
+                    logits
+                        .sample_mirostat2_token(mirostat, &previous_tokens, params)
                         .await?
                 }
                 kalosm_language_model::SamplingStrategy::Standard => {
                     let params = sampler.standard_params(top_k);
-                    hidden
-                        .try_sample_standard_token_q_mat(&output_matrix, &previous_tokens, params)
+                    logits
+                        .sample_standard_token(&previous_tokens, params)
                         .await?
                 }
-            }
-            .ok_or_else(|| {
-                LlamaModelError::SamplerError("fused logits sampler refused slow fallback".into())
-            })?;
+            };
             if let Some(start) = sample_start {
                 tracing::info!(
                     "forward_sample_token_download path={path} decode_eligible={decode_eligible} fused_logits=1 k={} elapsed={:?}",
