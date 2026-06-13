@@ -61,17 +61,16 @@ impl ViewStage {
         out: &[NaryExpr],
         clamp: bool,
     ) -> Option<(Vec<NaryExpr>, bool)> {
-        let (coords, delinearized) =
-            match affine_dim_indices(&self.layout, &self.input_shape) {
-                Some(affine) => (
-                    affine.iter().map(|index| index.to_expr(out)).collect(),
-                    false,
-                ),
-                None => {
-                    let flat = flat_index_expression(&self.layout, out)?;
-                    (row_major_indices_from_flat(flat, &self.input_shape)?, true)
-                }
-            };
+        let (coords, delinearized) = match affine_dim_indices(&self.layout, &self.input_shape) {
+            Some(affine) => (
+                affine.iter().map(|index| index.to_expr(out)).collect(),
+                false,
+            ),
+            None => {
+                let flat = flat_index_expression(&self.layout, out)?;
+                (row_major_indices_from_flat(flat, &self.input_shape)?, true)
+            }
+        };
         if !clamp {
             return Some((coords, delinearized));
         }

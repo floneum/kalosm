@@ -70,10 +70,12 @@ impl LayoutPass {
         let new_layout = operation
             .is_fully_defined()
             .then(|| {
-                operation.stages.iter().try_fold(
-                    input_layout.layout().clone(),
-                    |composed, stage| crate::view::compose_layouts(&stage.layout, &composed),
-                )
+                operation
+                    .stages
+                    .iter()
+                    .try_fold(input_layout.layout().clone(), |composed, stage| {
+                        crate::view::compose_layouts(&stage.layout, &composed)
+                    })
             })
             .flatten()
             .unwrap_or_else(|| Layout::contiguous(operation.shape()));

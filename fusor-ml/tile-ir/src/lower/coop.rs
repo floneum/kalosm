@@ -332,17 +332,9 @@ impl<'a> Lowerer<'a> {
             ));
         };
         match src {
-            Source::Storage(view) => self.lower_copy_to_tile(
-                expressions,
-                body,
-                dst,
-                view,
-                row,
-                col,
-                bounds,
-                mask,
-                fill,
-            ),
+            Source::Storage(view) => {
+                self.lower_copy_to_tile(expressions, body, dst, view, row, col, bounds, mask, fill)
+            }
             Source::Quantized(matrix) => {
                 if bounds.iter().any(Option::is_some) {
                     return Err(LowerError::UnsupportedOperation(
@@ -617,13 +609,7 @@ impl<'a> Lowerer<'a> {
             let mut in_bounds: Option<Handle<Expression>> = None;
             for (coord, limit) in [(global_row, row_limit), (global_col, col_limit)] {
                 let Some(limit) = limit else { continue };
-                let check = self.bin(
-                    expressions,
-                    &mut accept,
-                    BinaryOperator::Less,
-                    coord,
-                    limit,
-                );
+                let check = self.bin(expressions, &mut accept, BinaryOperator::Less, coord, limit);
                 in_bounds = Some(match in_bounds {
                     None => check,
                     Some(previous) => self.bin(
@@ -643,12 +629,8 @@ impl<'a> Lowerer<'a> {
                         &[global_row, global_col],
                         &mut accept,
                     )?;
-                    let storage_ptr = self.storage_dynamic_pointer(
-                        expressions,
-                        src,
-                        storage_index,
-                        &mut accept,
-                    )?;
+                    let storage_ptr =
+                        self.storage_dynamic_pointer(expressions, src, storage_index, &mut accept)?;
                     let value = Self::emit_load(expressions, &mut accept, storage_ptr);
                     accept.push(
                         Statement::Store {

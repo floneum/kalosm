@@ -17,27 +17,34 @@ use super::time_samples;
 
 type BurnTensor<const R: usize> = Tensor<Wgpu, R>;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", windows))]
 static BURN_WGPU_RUNTIME_INITIALIZED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", windows))]
 pub(crate) async fn initialized_device() -> WgpuDevice {
     use core::sync::atomic::Ordering;
 
     use burn::backend::wgpu::{RuntimeOptions, graphics, init_setup_async};
+
+    #[cfg(target_arch = "wasm32")]
+    type Api = graphics::WebGpu;
+    // Cubecl's auto selection requests Vulkan on Windows, which is missing on
+    // GPU-less runners; DX12 always has at least the WARP software adapter.
+    #[cfg(windows)]
+    type Api = graphics::Dx12;
 
     let device = WgpuDevice::default();
     if BURN_WGPU_RUNTIME_INITIALIZED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        init_setup_async::<graphics::WebGpu>(&device, RuntimeOptions::default()).await;
+        init_setup_async::<Api>(&device, RuntimeOptions::default()).await;
     }
     device
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", windows)))]
 pub(crate) async fn initialized_device() -> WgpuDevice {
     WgpuDevice::default()
 }

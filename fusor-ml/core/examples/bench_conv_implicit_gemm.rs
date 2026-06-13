@@ -179,8 +179,12 @@ fn bench_case(device: &Device, case: &ConvCase) {
     let (i_mean, i_p50, i_min) = stats(&implicit);
 
     println!("{name}: conv {b}x{c}x{h}x{w} k{kh}x{kw} -> matmul {m}x{k} @ {k}x{n}");
-    println!("  gather+matmul ({gather_kernels} dispatches): mean {g_mean:.3} ms, p50 {g_p50:.3} ms, min {g_min:.3} ms");
-    println!("  implicit-GEMM ({implicit_kernels} dispatches): mean {i_mean:.3} ms, p50 {i_p50:.3} ms, min {i_min:.3} ms");
+    println!(
+        "  gather+matmul ({gather_kernels} dispatches): mean {g_mean:.3} ms, p50 {g_p50:.3} ms, min {g_min:.3} ms"
+    );
+    println!(
+        "  implicit-GEMM ({implicit_kernels} dispatches): mean {i_mean:.3} ms, p50 {i_p50:.3} ms, min {i_min:.3} ms"
+    );
     println!("  speedup (p50): {:.2}x", g_p50 / i_p50);
     println!();
 }

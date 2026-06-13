@@ -241,11 +241,7 @@ impl MatMulOperation {
 
     /// Row-major strides of the logical output over its padded backing:
     /// rows step `n_padded`, each batch block spans `m_padded * n_padded`.
-    fn padded_out_strides(
-        out_shape: &[usize],
-        m_padded: usize,
-        n_padded: usize,
-    ) -> Box<[usize]> {
+    fn padded_out_strides(out_shape: &[usize], m_padded: usize, n_padded: usize) -> Box<[usize]> {
         let rank = out_shape.len();
         let mut strides = vec![0usize; rank];
         strides[rank - 1] = 1;
@@ -330,11 +326,8 @@ impl MatMulOperation {
         // to the generic path, which writes through the logical layout.
         let m_padded = m.div_ceil(tile.bm) * tile.bm;
         let n_padded = n.div_ceil(tile.bn) * tile.bn;
-        let expected_strides = Self::padded_out_strides(
-            &self.out_shape,
-            m_padded as usize,
-            n_padded as usize,
-        );
+        let expected_strides =
+            Self::padded_out_strides(&self.out_shape, m_padded as usize, n_padded as usize);
         let padded_elements = device_supported(
             (batch as usize)
                 .checked_mul(m_padded as usize)
@@ -528,7 +521,7 @@ impl Operation for MatMulOperation {
         // read the pad region). Shapes that already divide the tile — and
         // anything bound for the generic path — allocate exactly.
         let (m, n) = (self.a.rows(), self.b.cols());
-        let padded = self.coop_tile(&device).and_then(|tile| {
+        let padded = self.coop_tile(device).and_then(|tile| {
             let m_padded = m.div_ceil(tile.bm as usize) * tile.bm as usize;
             let n_padded = n.div_ceil(tile.bn as usize) * tile.bn as usize;
             (m_padded != m || n_padded != n).then_some((m_padded, n_padded))
@@ -536,13 +529,10 @@ impl Operation for MatMulOperation {
         let output_tensor = match padded {
             Some((m_padded, n_padded)) => {
                 let batch: usize = self.a.batch_shape().iter().product();
-                let backing = TensorData::new_for_shape(
-                    &device,
-                    &[batch, m_padded, n_padded],
-                    datatype,
-                );
+                let backing =
+                    TensorData::new_for_shape(device, &[batch, m_padded, n_padded], datatype);
                 TensorData::new_from_parts(
-                    &device,
+                    device,
                     backing.buffer().clone(),
                     crate::Layout::from_parts(
                         0,
@@ -552,7 +542,7 @@ impl Operation for MatMulOperation {
                     datatype,
                 )
             }
-            None => TensorData::new_for_shape(&device, &self.out_shape, datatype),
+            None => TensorData::new_for_shape(device, &self.out_shape, datatype),
         };
         vec![a.into(), b.into(), output_tensor.into()]
     }
