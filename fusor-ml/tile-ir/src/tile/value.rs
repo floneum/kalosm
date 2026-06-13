@@ -242,14 +242,6 @@ impl Tile {
     pub fn all() -> Mask {
         Self::bool(true)
     }
-    /// Logical and.
-    pub fn and(self, rhs: impl Into<Tile>) -> Self {
-        self.binary(TileBinaryOp::LogicalAnd, rhs.into())
-    }
-    /// Logical or.
-    pub fn or(self, rhs: impl Into<Tile>) -> Self {
-        self.binary(TileBinaryOp::LogicalOr, rhs.into())
-    }
 }
 
 // ---- conversions into Tile ----
@@ -309,13 +301,44 @@ macro_rules! impl_tile_binary {
     };
 }
 
+macro_rules! impl_tile_mask_or_bitwise {
+    ($trait:ident, $method:ident, $logical:expr, $bitwise:expr) => {
+        impl<Rhs> $trait<Rhs> for Tile
+        where
+            Rhs: Into<Tile>,
+        {
+            type Output = Tile;
+            fn $method(self, rhs: Rhs) -> Self::Output {
+                let rhs = rhs.into();
+                let lhs_element = self.element();
+                let rhs_element = rhs.element();
+                let op = if lhs_element == ElementType::Bool || rhs_element == ElementType::Bool {
+                    assert!(
+                        lhs_element == ElementType::Bool && rhs_element == ElementType::Bool,
+                        "boolean tile operators require both operands to be Bool",
+                    );
+                    $logical
+                } else {
+                    $bitwise
+                };
+                self.binary(op, rhs)
+            }
+        }
+    };
+}
+
 impl_tile_binary!(Add, add, TileBinaryOp::Add);
 impl_tile_binary!(Sub, sub, TileBinaryOp::Sub);
 impl_tile_binary!(Mul, mul, TileBinaryOp::Mul);
 impl_tile_binary!(Div, div, TileBinaryOp::Div);
 impl_tile_binary!(Rem, rem, TileBinaryOp::Rem);
-impl_tile_binary!(BitAnd, bitand, TileBinaryOp::BitAnd);
-impl_tile_binary!(BitOr, bitor, TileBinaryOp::BitOr);
+impl_tile_mask_or_bitwise!(
+    BitAnd,
+    bitand,
+    TileBinaryOp::LogicalAnd,
+    TileBinaryOp::BitAnd
+);
+impl_tile_mask_or_bitwise!(BitOr, bitor, TileBinaryOp::LogicalOr, TileBinaryOp::BitOr);
 impl_tile_binary!(BitXor, bitxor, TileBinaryOp::BitXor);
 impl_tile_binary!(Shl, shl, TileBinaryOp::Shl);
 impl_tile_binary!(Shr, shr, TileBinaryOp::Shr);

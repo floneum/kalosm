@@ -2,22 +2,18 @@ use fusor_tile_ir::{Layout, MemoryLevel, Shape};
 
 mod helpers;
 mod matmul;
-mod mirostat;
 mod qgemv;
 mod qgemv_q4k_ggml;
 mod qgemv_q6k;
 mod qmatmul;
 mod qmatmul_workgroup;
 mod quantized_matrix;
-mod top_k;
-mod types;
 
 pub use helpers::AccumCast;
 pub use matmul::{
     try_batched_coop_matmul, DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulShape,
     DenseMatmulTensors,
 };
-pub use mirostat::{mirostat2, standard_sampler, Mirostat2, StandardSampler};
 pub use qgemv::{qgemv_with_epilogue, IntoQgemvEpilogues};
 pub use qmatmul::qmatmul_with_epilogue;
 pub use qmatmul_workgroup::{
@@ -26,8 +22,6 @@ pub use qmatmul_workgroup::{
     qmatmul_workgroup_storage_f16_with_epilogues, qmatmul_workgroup_with_epilogues,
 };
 pub use quantized_matrix::{quantized_matrix, quantized_matrix_for};
-pub use top_k::{top_k_chunk, top_k_exactness, top_k_merge};
-pub use types::{MergeTopKMeta, Mirostat2Meta, TensorMeta, TopKChunkMeta, TopKExactnessMeta};
 
 /// The default rank-1 unit-stride layout used by tile-ir's pre-built kernels
 /// for tensors whose offset/stride is encoded in the `Meta` struct itself.

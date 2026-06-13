@@ -93,11 +93,10 @@ fn stage_storage_tile_with_pre(
         let global_row = row_base.clone() + local_row.clone();
         let global_col = col_base.clone() + local_col.clone();
         let within_tile = flat.clone().lt(tile_elements);
-        let in_bounds = tile_active
-            .clone()
-            .and(within_tile.clone())
-            .and(global_row.clone().lt(src_rows))
-            .and(global_col.clone().lt(src_cols));
+        let in_bounds = tile_active.clone()
+            & within_tile.clone()
+            & global_row.clone().lt(src_rows)
+            & global_col.clone().lt(src_cols);
         let loaded = program.load(
             src.at((global_row.clone(), &global_col)),
             in_bounds.clone(),
@@ -347,10 +346,7 @@ fn qmatmul_workgroup_with_epilogues_impl(
                 .collect::<Vec<_>>();
             let value = apply_qmatmul_post_epilogue(epilogues, sum, extras);
             let value = stor_cast.from_accum(value);
-            let mask = tile_active
-                .clone()
-                .and(row.clone().lt(m))
-                .and(col.clone().lt(n));
+            let mask = tile_active.clone() & row.clone().lt(m) & col.clone().lt(n);
             program.store(y.at((row, col)), value, mask);
         }
     });
@@ -545,7 +541,7 @@ fn qgemv_workgroup_with_epilogue_impl(
                 apply_qmatmul_post_epilogue_values(epilogues, values.to_vec(), extras)
             };
             let value = stor_cast.from_accum(value);
-            let mask = tile_active.clone().and(col.clone().lt(n));
+            let mask = tile_active.clone() & col.clone().lt(n);
             program.store(y.at((0u32, col)), value, mask);
         }
     });

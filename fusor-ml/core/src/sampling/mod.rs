@@ -3,6 +3,7 @@ use crate::{Device, Tensor, tensor::TensorData};
 mod mirostat;
 mod pipeline;
 pub(crate) mod processors;
+pub(crate) mod row_kernels;
 mod standard_sampler;
 mod topk;
 

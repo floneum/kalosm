@@ -35,7 +35,7 @@ pub(crate) fn qgemv_grid(
 
 impl QgemvGrid {
     pub(crate) fn mask(self, in_bounds: Mask, col: &Tile) -> Mask {
-        in_bounds.and(col.lt(self.n_cols))
+        in_bounds & col.lt(self.n_cols)
     }
 }
 
@@ -124,7 +124,7 @@ pub(crate) fn store_qgemv_sums_with_epilogue(
                 .collect::<Vec<_>>();
             let value =
                 crate::types::apply_qmatmul_post_epilogue(target.epilogues, reduced, extras);
-            let mask = target.lane.eq(0u32).and(col.lt(target.n_cols));
+            let mask = target.lane.eq(0u32) & col.lt(target.n_cols);
             program.store(target.y.at((0u32, col)), value, mask);
         }
         return;
@@ -158,7 +158,7 @@ pub(crate) fn store_qgemv_sums_with_epilogue(
             .collect::<Vec<_>>();
         let value =
             crate::types::apply_qmatmul_post_epilogue_values(target.epilogues, reduced, extras);
-        let mask = target.lane.eq(0u32).and(col.lt(target.n_cols));
+        let mask = target.lane.eq(0u32) & col.lt(target.n_cols);
         program.store(target.y.at((0u32, col)), value, mask);
     }
 }

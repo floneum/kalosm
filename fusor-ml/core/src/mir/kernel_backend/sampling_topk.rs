@@ -1,7 +1,5 @@
 use std::hash::Hash;
 
-use fusor_tile_ir_kernels as tile_ir_kernels;
-
 use crate::{
     mir::kernel_backend,
     sampling::{
@@ -10,6 +8,7 @@ use crate::{
             fixed_previous_tokens_data, fixed_previous_tokens_data_with_gpu_tail,
             processor_params_data,
         },
+        row_kernels,
     },
     tensor::{DataTypeEnum, TensorData},
 };
@@ -64,7 +63,7 @@ pub(crate) fn top_k_exactness_flag_data_with_encoder(
 
     let device = top_values.device();
     let flag = TensorData::new_for_shape(device, &[1], DataTypeEnum::U32);
-    let meta = tile_ir_kernels::TopKExactnessMeta {
+    let meta = row_kernels::TopKExactnessMeta {
         chunks: chunks.try_into().ok()?,
         candidate_count: candidate_count.try_into().ok()?,
         output_per_chunk: output_per_chunk.try_into().ok()?,
@@ -94,7 +93,7 @@ pub(crate) fn top_k_exactness_flag_data_with_encoder(
         cache_key,
         [1, 1, 1],
         |kb| {
-            tile_ir_kernels::top_k_exactness(
+            row_kernels::top_k_exactness(
                 kb,
                 top_values.as_kernel_tensor_ref(),
                 chunk_values.as_kernel_tensor_ref(),
@@ -257,7 +256,7 @@ fn chunk_top_k_pair_data_inner_with_encoder(
         cache_key,
         [chunks.try_into().ok()?, 1, 1],
         |kb| {
-            tile_ir_kernels::top_k_chunk(
+            row_kernels::top_k_chunk(
                 kb,
                 input.as_kernel_tensor_ref(),
                 ids.as_kernel_tensor_ref(),
@@ -268,7 +267,7 @@ fn chunk_top_k_pair_data_inner_with_encoder(
                         params.as_kernel_tensor_ref(),
                     )
                 }),
-                tile_ir_kernels::TopKChunkMeta {
+                row_kernels::TopKChunkMeta {
                     input_len: input_len.try_into().ok()?,
                     output_per_chunk: output_per_chunk.try_into().ok()?,
                     input_offset: input_offset.try_into().ok()?,
@@ -360,13 +359,13 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
         cache_key,
         [1, 1, 1],
         |kb| {
-            tile_ir_kernels::top_k_merge(
+            row_kernels::top_k_merge(
                 kb,
                 input_ids.as_kernel_tensor_ref(),
                 input_values.as_kernel_tensor_ref(),
                 ids.as_kernel_tensor_ref(),
                 values.as_kernel_tensor_ref(),
-                tile_ir_kernels::MergeTopKMeta {
+                row_kernels::MergeTopKMeta {
                     chunks: chunks.try_into().ok()?,
                     chunk_len: chunk_len.try_into().ok()?,
                     chunk_stride: chunk_stride.try_into().ok()?,
