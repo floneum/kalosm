@@ -158,8 +158,6 @@ pub struct GlinerRelExConfig {
     pub hidden_size: usize,
     /// Entity detection threshold
     pub entity_threshold: f32,
-    /// Adjacency filtering threshold
-    pub adjacency_threshold: f32,
     /// Relation classification threshold
     pub relation_threshold: f32,
     /// Special token IDs
@@ -172,7 +170,6 @@ impl Default for GlinerRelExConfig {
             max_width: 12,
             hidden_size: 768,
             entity_threshold: 0.4,
-            adjacency_threshold: 0.55,
             relation_threshold: 0.8,
             special_tokens: SpecialTokenIds::default(),
         }
@@ -198,12 +195,6 @@ impl GlinerRelExBuilder {
     /// Set the entity threshold.
     pub fn with_entity_threshold(mut self, threshold: f32) -> Self {
         self.config.entity_threshold = threshold;
-        self
-    }
-
-    /// Set the adjacency threshold.
-    pub fn with_adjacency_threshold(mut self, threshold: f32) -> Self {
-        self.config.adjacency_threshold = threshold;
         self
     }
 
@@ -362,10 +353,12 @@ impl GlinerRelEx {
             Tokenizer::from_bytes(&tokenizer_bytes).map_err(GlinerLoadingError::LoadTokenizer)?;
         // Resolve special tokens from the tokenizer so we pick up the right IDs
         // regardless of variant (multi uses 250102/250103/250104, base/large
-        // use 128001/128002/128003). Falls back to the user-supplied IDs.
+        // use 128001/128002/128003). Standard tokens fall back to the supplied
+        // IDs; the `<<ENT>>`/`<<REL>>`/`<<SEP>>` markers are required and error
+        // out if absent (rather than emitting wrong-vocab IDs).
         let mut effective_config = config;
         effective_config.special_tokens =
-            SpecialTokenIds::from_tokenizer(&tokenizer, effective_config.special_tokens);
+            SpecialTokenIds::from_tokenizer(&tokenizer, effective_config.special_tokens)?;
         let relex_tokenizer =
             RelExTokenizer::with_special_tokens(tokenizer, effective_config.special_tokens.clone());
         let config = effective_config;
@@ -956,12 +949,19 @@ impl GlinerRelEx {
             .reshape([batch_size * seq_len, hidden_size])
             .to_concrete();
 
+        // Each gathered position must stay within its row's `seq_len`, otherwise
+        // the flat `index_select` would read into a neighbouring sequence. Padded
+        // slots use position 0 (masked downstream).
         let mut offset_indices = Vec::with_capacity(batch_size * max_positions);
         for (batch_idx, positions) in positions_per_batch.iter().enumerate() {
             let offset = (batch_idx * seq_len) as u32;
             for pos_idx in 0..max_positions {
-                let pos = positions.get(pos_idx).copied().unwrap_or(0) as u32;
-                offset_indices.push(pos + offset);
+                let pos = positions.get(pos_idx).copied().unwrap_or(0);
+                debug_assert!(
+                    pos < seq_len,
+                    "gather position {pos} out of range for seq_len {seq_len} (batch {batch_idx})"
+                );
+                offset_indices.push(pos as u32 + offset);
             }
         }
 

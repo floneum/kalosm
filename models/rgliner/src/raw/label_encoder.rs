@@ -1,5 +1,6 @@
 //! Label encoder using sentence transformers.
 
+use fusor::layers::Linear;
 use fusor::{Device, Result, Tensor, VarBuilder};
 use kalosm_language_model::Embedding;
 use rbert::{Bert, BertSource, Pooling};
@@ -9,98 +10,45 @@ use crate::error::GlinerError;
 
 /// Projection FFN for aligning label embeddings to text encoder dimension.
 ///
-/// Architecture: Linear(hidden, hidden*4) -> ReLU -> Linear(hidden*4, hidden)
-/// This matches the Python create_projection_layer() function in GLiNER.
+/// Architecture: Linear(hidden, hidden*4) -> ReLU -> Linear(hidden*4, hidden).
+/// This matches the Python `create_projection_layer()` function in GLiNER.
+/// Both layers reuse [`fusor::layers::Linear`], which handles the `[out, in]`
+/// weight layout, bias, and (de)quantization the same way as the model's other
+/// heads — no manual transpose or whole-weight dequantization.
 pub struct ProjectionFFN {
-    weight1: Tensor<2, f32>,
-    bias1: Tensor<1, f32>,
-    weight2: Tensor<2, f32>,
-    bias2: Tensor<1, f32>,
+    fc1: Linear<f32>,
+    fc2: Linear<f32>,
 }
 
 impl ProjectionFFN {
-    /// Load projection FFN from weights with proper transposition.
+    /// Load projection FFN, trying the known weight-name conventions.
     pub fn load(device: &Device, vb: &mut VarBuilder<'_>) -> Result<Self> {
-        // Try different naming conventions
-        let (weight1, bias1) =
-            Self::load_layer(device, vb, &["label_fnn.0", "label_ffn.0", "label_proj.0"])?;
-        let (weight2, bias2) =
-            Self::load_layer(device, vb, &["label_fnn.2", "label_ffn.2", "label_proj.2"])?;
-
-        Ok(Self {
-            weight1,
-            bias1,
-            weight2,
-            bias2,
-        })
+        let fc1 = Self::load_layer(device, vb, &["label_fnn.0", "label_ffn.0", "label_proj.0"])?;
+        let fc2 = Self::load_layer(device, vb, &["label_fnn.2", "label_ffn.2", "label_proj.2"])?;
+        Ok(Self { fc1, fc2 })
     }
 
-    fn load_layer(
-        device: &Device,
-        vb: &mut VarBuilder,
-        prefixes: &[&str],
-    ) -> Result<(Tensor<2, f32>, Tensor<1, f32>)> {
+    fn load_layer(device: &Device, vb: &mut VarBuilder, prefixes: &[&str]) -> Result<Linear<f32>> {
         for prefix in prefixes {
-            let mut layer_vb = vb.pp(prefix);
-            if let Ok(weight_q) = layer_vb.get("weight", device) {
-                let weight: Tensor<2, f32> = weight_q.dequantize();
-
-                // PyTorch nn.Linear stores weights as [out_features, in_features]
-                // GGUF stores the same way. Fusor loads as-is.
-                // For x @ W where x is [B, in], we need W to be [in, out]
-                // So we transpose [out, in] -> [in, out]
-                let weight_t = weight.t().to_concrete();
-
-                if let Ok(bias_q) = layer_vb.get("bias", device) {
-                    let bias: Tensor<1, f32> = bias_q.dequantize();
-                    return Ok((weight_t, bias));
-                }
+            if let Ok(linear) = Linear::load(device, &mut vb.pp(prefix)) {
+                return Ok(linear);
             }
         }
         Err(fusor::Error::msg(format!(
-            "Could not load projection layer with prefixes {:?}",
-            prefixes
+            "Could not load projection layer with prefixes {prefixes:?}"
         )))
     }
 
     /// Get output dimension.
     pub fn out_features(&self) -> usize {
-        // After transpose, weight2 is [in=1536, out=384], so output dim is shape[1]
-        self.weight2.shape()[1]
+        self.fc2.out_features()
     }
 
-    /// Forward pass through projection.
-    /// Computes: ReLU(x @ W1 + b1) @ W2 + b2
+    /// Forward pass through projection: `ReLU(x @ W1.T + b1) @ W2.T + b2`.
+    /// (Python GLiNER uses ReLU, not GELU.)
     pub fn forward(&self, x: &Tensor<2, f32>) -> Tensor<2, f32> {
-        // Layer 1: x @ W1 + b1
-        // x is [num_labels, 384], W1 is [384, 1536] after transpose
-        // So x @ W1 = [num_labels, 384] @ [384, 1536] = [num_labels, 1536]
-        let h1 = x.mat_mul(&self.weight1);
-
-        let [num_labels, hidden_dim] = h1.shape();
-        let bias1_broadcast: Tensor<2, f32> = self
-            .bias1
-            .unsqueeze(0)
-            .to_concrete()
-            .broadcast_as([num_labels, hidden_dim])
-            .to_concrete();
-        let h1_biased = (h1 + bias1_broadcast).to_concrete();
-
-        // ReLU activation (Python GLiNER uses ReLU, not GELU)
-        let h1_relu = h1_biased.relu();
-
-        // Layer 2: h @ W2 + b2
-        // h is [num_labels, 1536], W2 is [1536, 384] after transpose
-        // So h @ W2 = [num_labels, 1536] @ [1536, 384] = [num_labels, 384]
-        let out = h1_relu.mat_mul(&self.weight2);
-        let [num_labels2, out_dim] = out.shape();
-        let bias2_broadcast: Tensor<2, f32> = self
-            .bias2
-            .unsqueeze(0)
-            .to_concrete()
-            .broadcast_as([num_labels2, out_dim])
-            .to_concrete();
-        (out + bias2_broadcast).to_concrete()
+        let h1 = self.fc1.forward_2d(x).relu();
+        self.fc2.forward_2d(&h1)
     }
 }
 

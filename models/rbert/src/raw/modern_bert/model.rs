@@ -15,7 +15,14 @@ pub struct ModernBertModel {
     embedding_norm: LayerNorm<1, f32>,
     layers: Vec<ModernBertLayer>,
     final_norm: LayerNorm<1, f32>,
-    rope_cache: RopeCache,
+    /// RoPE cache for global-attention layers.
+    global_rope: RopeCache,
+    /// RoPE cache for local (sliding-window) layers. Identical to `global_rope`
+    /// when the model uses a single frequency.
+    local_rope: RopeCache,
+    /// Half-window for local layers (`local_attention / 2`); `None` disables
+    /// windowing, in which case every layer attends globally.
+    local_window: Option<usize>,
     pub(crate) device: Device,
     config: ModernBertConfig,
     span: tracing::Span,
@@ -32,13 +39,21 @@ impl ModernBertModel {
         // Load embedding norm (applied before first layer)
         let embedding_norm = LayerNorm::load(device, &mut vb.pp("embd_norm"), config.norm_eps)?;
 
-        // Create RoPE cache
-        let rope_cache = RopeCache::new(
+        // Create RoPE caches. Global and local layers may use different bases;
+        // when the model has a single base the two caches are identical.
+        let global_rope = RopeCache::new(
             config.head_dimension,
             config.context_length,
             config.rope_theta,
             device,
         )?;
+        let local_rope = RopeCache::new(
+            config.head_dimension,
+            config.context_length,
+            config.local_rope_theta,
+            device,
+        )?;
+        let local_window = (config.local_attention > 0).then(|| config.local_attention / 2);
 
         // Load transformer layers
         let mut layers = Vec::with_capacity(config.num_layers);
@@ -63,11 +78,26 @@ impl ModernBertModel {
             embedding_norm,
             layers,
             final_norm,
-            rope_cache,
+            global_rope,
+            local_rope,
+            local_window,
             device: device.clone(),
             config,
             span: tracing::span!(tracing::Level::TRACE, "modern-bert"),
         })
+    }
+
+    /// Resolve the RoPE cache and sliding-window for layer `idx`. A layer is
+    /// global when `idx % global_attn_every_n_layers == 0` (so the default of 1
+    /// makes every layer global); local layers use the local RoPE base and the
+    /// `local_window` half-width.
+    fn layer_attention(&self, idx: usize) -> (&RopeCache, Option<usize>) {
+        let is_global = idx % self.config.global_attn_every_n_layers == 0;
+        if is_global {
+            (&self.global_rope, None)
+        } else {
+            (&self.local_rope, self.local_window)
+        }
     }
 
     /// Forward pass through the model.
@@ -85,9 +115,11 @@ impl ModernBertModel {
         // Apply embedding norm (serves as pre-norm for layer 0)
         let mut hidden_states = self.embedding_norm.forward(&hidden_states);
 
-        // Pass through transformer layers
-        for layer in &self.layers {
-            hidden_states = layer.forward(&hidden_states, &self.rope_cache, attention_mask);
+        // Pass through transformer layers, routing each to its global/local
+        // RoPE cache and (for local layers) sliding-window.
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let (rope, window) = self.layer_attention(idx);
+            hidden_states = layer.forward(&hidden_states, rope, window, attention_mask);
         }
 
         // Apply final layer norm
@@ -123,8 +155,9 @@ impl ModernBertModel {
         let mut hidden_states = self.embedding_norm.forward(&hidden_states);
         states.push(hidden_states.clone());
 
-        for layer in &self.layers {
-            hidden_states = layer.forward(&hidden_states, &self.rope_cache, attention_mask);
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let (rope, window) = self.layer_attention(idx);
+            hidden_states = layer.forward(&hidden_states, rope, window, attention_mask);
             states.push(hidden_states.clone());
         }
 

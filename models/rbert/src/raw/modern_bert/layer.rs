@@ -12,7 +12,7 @@ use super::feed_forward::GeGluFeedForward;
 /// the embedding norm serves that purpose. This is handled by making attention_norm
 /// optional and passing in the pre-normalized input for layer 0.
 pub struct ModernBertLayer {
-    /// Pre-attention RMSNorm (None for layer 0, which uses embedding norm)
+    /// Pre-attention LayerNorm (None for layer 0, which uses embedding norm)
     attention_norm: Option<LayerNorm<1, f32>>,
     attention: ModernBertAttention,
     ffn_norm: LayerNorm<1, f32>,
@@ -53,6 +53,7 @@ impl ModernBertLayer {
         &self,
         hidden_states: &Tensor<3, f32>,
         rope_cache: &RopeCache,
+        window: Option<usize>,
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Tensor<3, f32> {
         // Pre-norm + attention + residual
@@ -65,7 +66,7 @@ impl ModernBertLayer {
         };
         let hidden_states = self
             .attention
-            .forward(&hidden_states, rope_cache, attention_mask);
+            .forward(&hidden_states, rope_cache, window, attention_mask);
         let hidden_states = residual.add_(&hidden_states);
 
         // Pre-norm + FFN + residual

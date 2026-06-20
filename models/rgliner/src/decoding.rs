@@ -253,3 +253,103 @@ impl Default for Decoder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEXT: &str = "Barack Obama visited Hawaii";
+    // word -> (start_char, end_char): Barack, Obama, visited, Hawaii
+    fn word_offsets() -> Vec<(usize, usize)> {
+        vec![(0, 6), (7, 12), (13, 20), (21, 27)]
+    }
+
+    /// Flatten `(span_idx, label_idx, score)` triples into the row-major
+    /// `[num_spans * num_labels]` score buffer `decode` expects.
+    fn scores(num_spans: usize, num_labels: usize, entries: &[(usize, usize, f32)]) -> Vec<f32> {
+        let mut s = vec![0.0; num_spans * num_labels];
+        for &(span, label, score) in entries {
+            s[span * num_labels + label] = score;
+        }
+        s
+    }
+
+    #[test]
+    fn flat_suppresses_overlapping_lower_scoring_span() {
+        // span 0 = "Barack Obama" (words 0..=1), span 1 = "Barack" (0..=0),
+        // span 2 = "Hawaii" (3..=3). Labels: 0=person, 1=location.
+        let span_indices = [(0, 1), (0, 0), (3, 3)];
+        let labels = ["person", "location"];
+        let s = scores(
+            3,
+            2,
+            &[
+                (0, 0, 0.9), // "Barack Obama" / person
+                (1, 0, 0.6), // "Barack" / person  (overlaps span 0)
+                (2, 1, 0.8), // "Hawaii" / location
+            ],
+        );
+
+        let entities = Decoder::new(0.5, DecodingMode::Flat)
+            .decode(&s, 3, 2, &span_indices, &word_offsets(), &labels, TEXT);
+
+        // span 1 shares word 0 with the higher-scoring span 0 -> suppressed.
+        assert_eq!(entities.len(), 2);
+        assert_eq!(entities[0].text, "Barack Obama");
+        assert_eq!(entities[0].label, "person");
+        assert_eq!((entities[0].start_char, entities[0].end_char), (0, 12));
+        assert_eq!(entities[1].text, "Hawaii");
+        assert_eq!(entities[1].label, "location");
+        assert_eq!((entities[1].start_char, entities[1].end_char), (21, 27));
+    }
+
+    #[test]
+    fn nested_keeps_contained_span_but_drops_partial_overlap() {
+        // span 0 = (0..=1), span 1 = (0..=0) fully contained in span 0,
+        // span 2 = (1..=2) partially overlaps span 0.
+        let span_indices = [(0, 1), (0, 0), (1, 2)];
+        let labels = ["person"];
+        let s = scores(
+            3,
+            1,
+            &[(0, 0, 0.9), (1, 0, 0.7), (2, 0, 0.6)],
+        );
+
+        let entities = Decoder::new(0.5, DecodingMode::Nested)
+            .decode(&s, 3, 1, &span_indices, &word_offsets(), &labels, TEXT);
+
+        // Contained span (0..=0) is allowed; partial overlap (1..=2) is not.
+        assert_eq!(entities.len(), 2);
+        let spans: Vec<(usize, usize)> =
+            entities.iter().map(|e| (e.start_word, e.end_word)).collect();
+        assert!(spans.contains(&(0, 1)));
+        assert!(spans.contains(&(0, 0)));
+        assert!(!spans.contains(&(1, 2)));
+    }
+
+    #[test]
+    fn scores_below_threshold_are_dropped() {
+        let span_indices = [(0, 0)];
+        let labels = ["person"];
+        let s = scores(1, 1, &[(0, 0, 0.49)]);
+        let entities = Decoder::new(0.5, DecodingMode::Flat)
+            .decode(&s, 1, 1, &span_indices, &word_offsets(), &labels, TEXT);
+        assert!(entities.is_empty());
+    }
+
+    #[test]
+    fn is_partial_overlap_predicate() {
+        let d = Decoder::default();
+        // Disjoint.
+        assert!(!d.is_partial_overlap(0, 1, 2, 3));
+        // Adjacent ranges sharing word 1, neither containing the other -> partial.
+        assert!(d.is_partial_overlap(0, 1, 1, 2));
+        // Containment is not "partial".
+        assert!(!d.is_partial_overlap(0, 3, 1, 2));
+        assert!(!d.is_partial_overlap(1, 2, 0, 3));
+        // Genuine partial overlap.
+        assert!(d.is_partial_overlap(0, 2, 1, 3));
+        // Identical spans -> containment, not partial.
+        assert!(!d.is_partial_overlap(1, 2, 1, 2));
+    }
+}

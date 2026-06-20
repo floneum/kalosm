@@ -269,7 +269,13 @@ def convert_gliner_to_gguf(
     intermediate_size = encoder_config.get("intermediate_size", 576)
     vocab_size = encoder_config.get("vocab_size", 50368)
     context_length = encoder_config.get("max_position_embeddings", 8192)
-    rope_theta = encoder_config.get("local_rope_theta", 160000.0)
+    # ModernBERT/Ettin alternate full-global attention every Nth layer with
+    # sliding-window local attention on the rest, and the two layer types may use
+    # different RoPE bases. Defaults match ModernBERT-base.
+    global_rope_theta = encoder_config.get("global_rope_theta", 160000.0)
+    local_rope_theta = encoder_config.get("local_rope_theta", global_rope_theta)
+    global_attn_every_n_layers = encoder_config.get("global_attn_every_n_layers", 3)
+    local_attention = encoder_config.get("local_attention", 128)
 
     # Standard GGUF metadata (without architecture prefix - the loader adds it)
     writer.add_metadata("gliner.attention.head_count", num_heads)
@@ -278,7 +284,12 @@ def convert_gliner_to_gguf(
     writer.add_metadata("gliner.embedding_length", hidden_size)
     writer.add_metadata("gliner.feed_forward_length", intermediate_size)
     writer.add_metadata("gliner.context_length", context_length)
-    writer.add_metadata("gliner.rope.freq_base", float(rope_theta))
+    writer.add_metadata("gliner.rope.freq_base", float(global_rope_theta))
+    writer.add_metadata("gliner.rope.local_freq_base", float(local_rope_theta))
+    writer.add_metadata(
+        "gliner.attention.global_attn_every_n_layers", global_attn_every_n_layers
+    )
+    writer.add_metadata("gliner.attention.local_attention", local_attention)
     writer.add_metadata("gliner.attention.layer_norm_rms_epsilon", 1e-5)
     writer.add_metadata("gliner.vocab_size", vocab_size)
 

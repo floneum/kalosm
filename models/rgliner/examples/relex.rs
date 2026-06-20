@@ -45,10 +45,6 @@ struct Args {
     /// Minimum confidence for relation classification.
     #[arg(long, default_value_t = 0.5)]
     relation_threshold: f32,
-
-    /// Maximum adjacency score to keep an entity pair.
-    #[arg(long, default_value_t = 0.5)]
-    adjacency_threshold: f32,
 }
 
 fn resolve_model_path(arg: Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -105,7 +101,6 @@ async fn main() -> anyhow::Result<()> {
         .with_source(source)
         .with_entity_threshold(args.entity_threshold)
         .with_relation_threshold(args.relation_threshold)
-        .with_adjacency_threshold(args.adjacency_threshold)
         .build()
         .await?;
 

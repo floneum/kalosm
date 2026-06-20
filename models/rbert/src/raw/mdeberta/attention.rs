@@ -25,12 +25,12 @@ pub struct GatherIndices {
 
 /// Relative position embeddings for disentangled attention.
 pub struct RelativePositionEmbedding {
-    /// Relative position embedding table [2*max_pos, hidden_size]
+    /// Relative position embedding table `[2 * position_buckets, hidden_size]`
+    /// (e.g. `[512, 768]` for DeBERTa-v3-base). Its row count is the single
+    /// source of truth for the bucketing geometry in `compute_gather_indices`.
     embeddings: Tensor<2, f32>,
     /// LayerNorm applied to embeddings (norm_rel_ebd = "layer_norm" in DeBERTa)
     layer_norm: Option<LayerNorm<1, f32>>,
-    /// Maximum relative positions (e.g., 256)
-    max_relative_positions: usize,
 }
 
 impl RelativePositionEmbedding {
@@ -39,7 +39,6 @@ impl RelativePositionEmbedding {
         device: &Device,
         vb: &mut VarBuilder,
         layer_norm: Option<LayerNorm<1, f32>>,
-        max_relative_positions: usize,
     ) -> Result<Self> {
         let weight = vb.get("weight", device)?;
         let embeddings_raw: Tensor<2, f32> = weight.dequantize();
@@ -55,7 +54,6 @@ impl RelativePositionEmbedding {
         Ok(Self {
             embeddings,
             layer_norm,
-            max_relative_positions,
         })
     }
 
@@ -86,7 +84,7 @@ impl RelativePositionEmbedding {
         }
     }
 
-    /// Number of entries (`2 * max_relative_positions`) in the relative
+    /// Number of entries (`2 * position_buckets`) in the relative
     /// position embedding table — this is the per-head "position dimension" of
     /// the `c2p_all` / `p2c_all` attention scores before gathering.
     pub fn num_positions(&self) -> usize {
@@ -112,10 +110,18 @@ impl RelativePositionEmbedding {
         device: &Device,
     ) -> GatherIndices {
         let num_pos = self.num_positions();
-        let bucket_size = self.max_relative_positions as i32;
-        let max_position = 2 * bucket_size;
-        let att_span = bucket_size;
-        let num_positions_i = (2 * att_span) as i32;
+        // Derive the bucketing geometry from the embedding table itself rather
+        // than from `*.max_relative_positions` metadata. The table has
+        // `2 * position_buckets` rows, so `att_span` (HF `pos_ebd_size`, the
+        // number of buckets per side) is exactly half its height and the max
+        // relative distance spans the full table. Some GGUFs store
+        // `max_relative_positions` as the bucket count (256) and others as the
+        // full span (512); deriving from the table keeps every gathered index
+        // within `[0, num_pos)` regardless of how the converter wrote it.
+        let att_span = (num_pos / 2) as i32;
+        let bucket_size = att_span;
+        let max_position = num_pos as i32;
+        let num_positions_i = num_pos as i32;
 
         // Raw relative-position indices, [seq_len, seq_len].
         let mut rel = vec![0u32; seq_len * seq_len];

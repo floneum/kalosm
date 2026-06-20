@@ -89,8 +89,19 @@ impl WordTokenizer {
     }
 
     /// Resolve the tokenizer's padding ID.
+    ///
+    /// Prefer the tokenizer's configured padding params, then the conventional
+    /// pad token names (`[PAD]` for BERT/DeBERTa, `<pad>` for others), falling
+    /// back to `0` only as a last resort. Hardcoding `[PAD]` would pick the wrong
+    /// id for encoders (e.g. some ettin/ModernBERT vocabs) that name it `<pad>`.
     pub fn pad_id(&self) -> u32 {
-        self.tokenizer.token_to_id("[PAD]").unwrap_or(0)
+        if let Some(padding) = self.tokenizer.get_padding() {
+            return padding.pad_id;
+        }
+        self.tokenizer
+            .token_to_id("[PAD]")
+            .or_else(|| self.tokenizer.token_to_id("<pad>"))
+            .unwrap_or(0)
     }
 }
 
@@ -256,9 +267,6 @@ pub fn first_subtoken_pooling(
         }
     }
 
-    // Create index tensor [batch_size * max_words]
-    let _indices = Tensor::new(device, &all_indices);
-
     // Reshape token_embeddings to [batch_size * seq_len, hidden_dim] for gathering
     let seq_len = shape[1];
     let token_embeddings_concrete = token_embeddings.to_concrete();
@@ -266,12 +274,18 @@ pub fn first_subtoken_pooling(
         .reshape([batch_size * seq_len, hidden_dim])
         .to_concrete();
 
-    // For each batch, we need to offset the indices by batch_idx * seq_len
+    // Offset each word's first-token index into the flattened [batch*seq, hidden]
+    // tensor. Every first-token index must land within its row's `seq_len`;
+    // otherwise the gather would read into a neighbouring sequence's tokens.
     let mut offset_indices: Vec<u32> = Vec::with_capacity(batch_size * max_words);
     for batch_idx in 0..batch_size {
         let offset = (batch_idx * seq_len) as u32;
         for word_idx in 0..max_words {
             let idx = all_indices[batch_idx * max_words + word_idx];
+            debug_assert!(
+                (idx as usize) < seq_len,
+                "first-token index {idx} out of range for seq_len {seq_len} (batch {batch_idx}, word {word_idx})"
+            );
             offset_indices.push(idx + offset);
         }
     }
@@ -295,7 +309,51 @@ pub fn first_subtoken_pooling(
 
 #[cfg(test)]
 mod tests {
-    use super::split_words;
+    use super::{split_words, token_packed_ranges};
+    use tokenizers::Tokenizer;
+
+    /// A WordLevel tokenizer where every word encodes to exactly one token (its
+    /// id, or `[UNK]`). That makes per-word token counts equal 1, which is
+    /// enough to exercise the windowing math deterministically.
+    fn simple_tokenizer() -> Tokenizer {
+        let json = r#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"[UNK]":0},"unk_token":"[UNK]"}}"#;
+        Tokenizer::from_bytes(json.as_bytes()).expect("valid tokenizer json")
+    }
+
+    #[test]
+    fn token_packed_ranges_cover_input_with_overlap() {
+        let tok = simple_tokenizer();
+        // 10 one-token words; budget 4 forces multiple overlapping windows.
+        let text = "a b c d e f g h i j";
+        let ranges = token_packed_ranges(&tok, text, 4, 1).unwrap();
+
+        assert!(ranges.len() > 1, "expected multiple windows, got {ranges:?}");
+        // Full coverage: first window starts at the beginning, last reaches the end.
+        assert_eq!(ranges.first().unwrap().start, 0);
+        assert_eq!(ranges.last().unwrap().end, text.len());
+        // Each window advances and overlaps its predecessor (no gaps, no stalls).
+        for pair in ranges.windows(2) {
+            assert!(pair[1].start > pair[0].start, "windows must advance: {ranges:?}");
+            assert!(
+                pair[1].start < pair[0].end,
+                "adjacent windows must overlap: {ranges:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_packed_ranges_single_window_within_budget() {
+        let tok = simple_tokenizer();
+        let text = "a b c";
+        let ranges = token_packed_ranges(&tok, text, 16, 2).unwrap();
+        assert_eq!(ranges, vec![0..text.len()]);
+    }
+
+    #[test]
+    fn token_packed_ranges_empty_text() {
+        let tok = simple_tokenizer();
+        assert!(token_packed_ranges(&tok, "   ", 8, 1).unwrap().is_empty());
+    }
 
     #[test]
     fn split_words_matches_gliner_word_regex() {

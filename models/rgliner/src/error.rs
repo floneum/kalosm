@@ -23,6 +23,13 @@ pub enum GlinerLoadingError {
     /// Config file not found.
     #[error("Config file not found")]
     ConfigNotFound,
+    /// A required GLiNER-RelEx special token is absent from the tokenizer.
+    #[error(
+        "Tokenizer is missing required GLiNER-RelEx special token(s): {0}. The model's embedded \
+         tokenizer is for the wrong variant or is corrupt — re-run the conversion script or supply \
+         a matching tokenizer via `GlinerRelExSource::with_tokenizer`."
+    )]
+    MissingSpecialToken(String),
     /// Label encoder loading error.
     #[error("Failed to load label encoder: {0}")]
     LabelEncoder(#[from] rbert::BertLoadingError),
@@ -37,9 +44,6 @@ pub enum GlinerError {
     /// An error that can occur when tokenizing text.
     #[error("Tokenization error: {0}")]
     Tokenizer(tokenizers::Error),
-    /// A tokenization error with a string message.
-    #[error("Tokenization error: {0}")]
-    TokenizationError(String),
     /// An error that can occur with the label encoder.
     #[error("Label encoder error: {0}")]
     LabelEncoder(#[from] rbert::BertError),

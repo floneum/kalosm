@@ -21,8 +21,20 @@ pub struct ModernBertConfig {
     pub intermediate_size: usize,
     /// Maximum context length.
     pub context_length: usize,
-    /// RoPE base frequency.
+    /// RoPE base frequency used by global-attention layers.
     pub rope_theta: f32,
+    /// RoPE base frequency used by local (sliding-window) layers. Equal to
+    /// `rope_theta` when the model uses a single frequency.
+    pub local_rope_theta: f32,
+    /// Every Nth layer (`layer_idx % N == 0`) uses full global attention; the
+    /// rest use sliding-window local attention. `1` means every layer is global
+    /// (the default when the GGUF predates this metadata), which reproduces the
+    /// original all-global behaviour.
+    pub global_attn_every_n_layers: usize,
+    /// Sliding-window size for local-attention layers (ModernBERT `local_attention`,
+    /// e.g. 128). A query attends to keys within `local_attention / 2` positions.
+    /// `0` disables windowing entirely.
+    pub local_attention: usize,
     /// LayerNorm epsilon.
     pub norm_eps: f32,
 }
@@ -45,6 +57,14 @@ impl ModernBertConfig {
             load_u32_or(vb, ".feed_forward_length", (hidden_size * 4) as u32) as usize;
         let context_length = load_u32_or(vb, ".context_length", 8192) as usize;
         let rope_theta = load_f32_or(vb, ".rope.freq_base", 10000.0);
+        // Local layers may use a distinct RoPE base; absent (older GGUFs) it
+        // falls back to the global base so behaviour is unchanged.
+        let local_rope_theta = load_f32_or(vb, ".rope.local_freq_base", rope_theta);
+        // Default 1 (every layer global) preserves the original behaviour for
+        // GGUFs converted before this metadata existed.
+        let global_attn_every_n_layers =
+            load_u32_or(vb, ".attention.global_attn_every_n_layers", 1).max(1) as usize;
+        let local_attention = load_u32_or(vb, ".attention.local_attention", 0) as usize;
         let norm_eps = load_f32_or(vb, ".attention.layer_norm_rms_epsilon", 1e-6);
 
         // Use attention.key_length for head dimension; fall back to
@@ -65,6 +85,9 @@ impl ModernBertConfig {
             intermediate_size,
             context_length,
             rope_theta,
+            local_rope_theta,
+            global_attn_every_n_layers,
+            local_attention,
             norm_eps,
         })
     }

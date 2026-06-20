@@ -61,11 +61,17 @@ impl GlinerSource {
             }
         }
 
-        let entries = std::fs::read_dir(&snapshots_dir).ok()?;
-        for entry in entries.flatten() {
-            let candidate = entry.path().join(file);
-            if candidate.exists() {
-                return Some(candidate);
+        // Last resort: when the caller did not pin a revision (`main`), accept any
+        // snapshot directory that contains the file. We deliberately skip this for
+        // a pinned revision — returning an arbitrary snapshot in filesystem order
+        // would silently serve the wrong revision's weights.
+        if revision == "main" {
+            let entries = std::fs::read_dir(&snapshots_dir).ok()?;
+            for entry in entries.flatten() {
+                let candidate = entry.path().join(file);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
             }
         }
 

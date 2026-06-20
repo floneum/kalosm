@@ -144,6 +144,20 @@ fn test_chunking() {
     assert_eq!(string[chunks[2].clone()].trim(), "jumps over the");
     assert_eq!(string[chunks[3].clone()].trim(), "the lazy dog.");
 
+    let chunks = ChunkStrategy::Words {
+        word_count: 3,
+        overlap: 2,
+    };
+    let chunks = chunks.chunk_str(string);
+    assert_eq!(chunks.len(), 7);
+    assert_eq!(string[chunks[0].clone()].trim(), "The quick brown");
+    assert_eq!(string[chunks[1].clone()].trim(), "quick brown fox");
+    assert_eq!(string[chunks[2].clone()].trim(), "brown fox jumps");
+    assert_eq!(string[chunks[3].clone()].trim(), "fox jumps over");
+    assert_eq!(string[chunks[4].clone()].trim(), "jumps over the");
+    assert_eq!(string[chunks[5].clone()].trim(), "over the lazy");
+    assert_eq!(string[chunks[6].clone()].trim(), "the lazy dog.");
+
     let chunks = ChunkStrategy::Sentence {
         sentence_count: 2,
         overlap: 1,
@@ -151,4 +165,36 @@ fn test_chunking() {
     let string = "first sentence. second sentence. third sentence. fourth sentence.";
     let chunks = chunks.chunk_str(string);
     assert_eq!(chunks.len(), 3);
+    assert_eq!(
+        string[chunks[0].clone()].trim(),
+        "first sentence. second sentence."
+    );
+    assert_eq!(
+        string[chunks[1].clone()].trim(),
+        "second sentence. third sentence."
+    );
+    assert_eq!(
+        string[chunks[2].clone()].trim(),
+        "third sentence. fourth sentence."
+    );
+
+    let chunks = ChunkStrategy::Paragraph {
+        paragraph_count: 3,
+        overlap: 1,
+    };
+    let string = "first paragraph\n\nsecond paragraph\n\nthird paragraph\n\nfourth paragraph";
+    let chunks = chunks.chunk_str(string);
+    assert_eq!(chunks.len(), 3);
+    assert_eq!(
+        string[chunks[0].clone()].trim(),
+        "first paragraph\n\nsecond paragraph"
+    );
+    assert_eq!(
+        string[chunks[1].clone()].trim(),
+        "second paragraph\n\nthird paragraph"
+    );
+    assert_eq!(
+        string[chunks[2].clone()].trim(),
+        "third paragraph\n\nfourth paragraph"
+    );
 }

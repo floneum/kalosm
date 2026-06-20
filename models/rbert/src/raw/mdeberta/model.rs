@@ -35,6 +35,19 @@ impl MDebertaModel {
     pub fn load(device: &Device, vb: &mut VarBuilder) -> Result<Self> {
         let config = MDebertaConfig::from_gguf(vb)?;
 
+        // The disentangled attention reuses the content Q/K projections for the
+        // position embeddings (the `share_att_key=true` path, which all DeBERTa-v3
+        // / mDeBERTa-v3 checkpoints use). A `share_att_key=false` model ships
+        // separate `pos_q_proj` / `pos_key_proj` weights that we neither load nor
+        // apply, so fail loudly rather than silently producing wrong scores.
+        if !config.share_att_key {
+            return Err(fusor::Error::msg(
+                "mDeBERTa with share_att_key=false is not supported: disentangled \
+                 attention here reuses the content Q/K projections for position \
+                 embeddings and does not load separate pos_q_proj/pos_key_proj weights.",
+            ));
+        }
+
         let token_embeddings = Embedding::load(device, &mut vb.pp("token_embd"))?;
         let embedding_norm = LayerNorm::load(device, &mut vb.pp("embd_norm"), config.norm_eps)?;
 
@@ -45,7 +58,6 @@ impl MDebertaModel {
             device,
             &mut vb.pp("rel_pos_embd"),
             rel_pos_norm,
-            config.max_relative_positions,
         )?;
 
         let mut layers = Vec::with_capacity(config.num_layers);

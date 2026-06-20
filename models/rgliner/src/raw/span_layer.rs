@@ -98,9 +98,8 @@ impl SpanLayer {
         spans: &[(usize, usize)],
         device: &Device,
     ) -> Tensor<2, f32> {
-        let (batched, counts) =
+        let (batched, _counts) =
             self.forward_for_spans_batched(word_embeddings, &[spans.to_vec()], device);
-        let _count = counts.first().copied().unwrap_or(0);
         batched
     }
 
@@ -125,7 +124,9 @@ impl SpanLayer {
         let span_counts: Vec<usize> = spans_per_batch.iter().map(Vec::len).collect();
         let total_spans: usize = span_counts.iter().sum();
         if total_spans == 0 {
-            return (Tensor::zeros(device, [1, hidden_dim]), span_counts);
+            // No spans: return an empty (0-row) tensor so the row count matches
+            // the all-zero `span_counts`, consistent with the non-empty path.
+            return (Tensor::zeros(device, [0, hidden_dim]), span_counts);
         }
 
         let start_rep = self
