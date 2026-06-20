@@ -214,6 +214,40 @@ pub const DEFAULT_ROPE_FREQUENCY: f32 = 1_000_000.;
 pub const GEMMA_DEFAULT_SLIDING_WINDOW_TYPE: usize = 6;
 pub const GEMMA_DEFAULT_ROPE_FREQUENCY_SLIDING: f32 = 10_000.;
 
+/// Build the additive attention-mask values (`0.0` allowed, `-inf` blocked)
+/// for a `[seq_len, index_pos + seq_len]` score matrix.
+///
+/// Tokens are causal by default. Any query/key position that falls inside the
+/// same entry of `non_causal_token_ranges` may attend to its peers regardless
+/// of ordering (this is how image-token blocks attend bidirectionally), and an
+/// optional sliding `window` blocks keys older than `window` positions.
+fn non_causal_mask_data(
+    seq_len: usize,
+    index_pos: usize,
+    sliding_window_size: Option<usize>,
+    non_causal_token_ranges: &[Range<usize>],
+) -> Vec<f32> {
+    let cols = index_pos + seq_len;
+    let mut mask_data = vec![0.0_f32; seq_len * cols];
+    for row in 0..seq_len {
+        let global_row = index_pos + row;
+        for col in 0..cols {
+            let same_non_causal_range = col >= index_pos
+                && non_causal_token_ranges
+                    .iter()
+                    .any(|range| range.contains(&row) && range.contains(&(col - index_pos)));
+            let future = col > global_row && !same_non_causal_range;
+            let outside_window = sliding_window_size
+                .map(|window| col + window <= global_row)
+                .unwrap_or(false);
+            if future || outside_window {
+                mask_data[row * cols + col] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    mask_data
+}
+
 /// The configuration of a Llama model.
 pub struct LlamaConfig<F: FloatDataType + SimdElement = f32> {
     pub(crate) rope_freq_weight: Option<Tensor<1, F>>,
@@ -1483,7 +1517,8 @@ where
             seq_len,
             index_pos,
             pos_ids: None,
-            non_causal_token_ranges: vec![0..seq_len],
+            // The whole image chunk attends bidirectionally.
+            non_causal_token_ranges: std::iter::once(0..seq_len).collect(),
         };
         self.forward_last_hidden_from_embeddings(encoded, device, cache, Some(t_encode.elapsed()))
     }
@@ -1641,23 +1676,12 @@ where
         }
 
         let cols = index_pos + seq_len;
-        let mut mask_data = vec![0.0_f32; seq_len * cols];
-        for row in 0..seq_len {
-            let global_row = index_pos + row;
-            for col in 0..cols {
-                let same_non_causal_range = col >= index_pos
-                    && non_causal_token_ranges
-                        .iter()
-                        .any(|range| range.contains(&row) && range.contains(&(col - index_pos)));
-                let future = col > global_row && !same_non_causal_range;
-                let outside_window = sliding_window_size
-                    .map(|window| col + window <= global_row)
-                    .unwrap_or(false);
-                if future || outside_window {
-                    mask_data[row * cols + col] = f32::NEG_INFINITY;
-                }
-            }
-        }
+        let mask_data = non_causal_mask_data(
+            seq_len,
+            index_pos,
+            sliding_window_size,
+            non_causal_token_ranges,
+        );
         let mask: Tensor<2, f32> = Tensor::new(device, mask_data.as_slice())
             .reshape([seq_len, cols])
             .to_concrete();
