@@ -39,7 +39,6 @@ members = [
     "fusor-ml/conformance",
     "fusor-ml/fusor",
     "fusor-ml/types",
-    "demos/rgliner-web",
     "fusor-ml/tile-ir",
     "fusor-ml/tile-ir-kernels",
     "fusor-ml/tile-ir-runtime",

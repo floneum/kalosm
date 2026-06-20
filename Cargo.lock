@@ -2116,16 +2116,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "console_error_panic_hook"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
-dependencies = [
- "cfg-if",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "const-random"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6454,7 +6444,7 @@ dependencies = [
  "kalosm-sample",
  "kalosm-streams",
  "lopdf",
- "pulldown-cmark 0.9.6",
+ "pulldown-cmark",
  "rand 0.8.6",
  "rbert",
  "readability",
@@ -8653,17 +8643,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pulldown-cmark"
-version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
-dependencies = [
- "bitflags 2.13.0",
- "memchr",
- "unicase",
-]
-
-[[package]]
 name = "pulp"
 version = "0.22.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9412,22 +9391,6 @@ dependencies = [
  "tokenizers 0.21.4",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "rgliner-web"
-version = "0.1.0"
-dependencies = [
- "console_error_panic_hook",
- "dioxus",
- "dioxus-primitives",
- "getrandom 0.3.4",
- "gloo-timers",
- "pulldown-cmark 0.13.4",
- "rgliner",
- "tracing",
- "tracing-wasm",
- "wasm-bindgen-futures",
 ]
 
 [[package]]
