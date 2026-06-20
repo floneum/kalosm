@@ -219,7 +219,7 @@ impl Decoder {
                 if model.config().suppress_tokens.contains(&i) {
                     crate::WhisperDType::NEG_INFINITY
                 } else {
-                    crate::WhisperDType::from(0.0)
+                    crate::WhisperDType::from(0.0_f32)
                 }
             })
             .collect();
@@ -359,7 +359,8 @@ impl Decoder {
                         attention_output.as_deref_mut(),
                     )?;
 
-                    // The quantized model caches tokens so we can remove any old tokens
+                    // The quantized model caches tokens, so the queued tokens
+                    // have been consumed.
                     queued_tokens.clear();
                     result
                 }
@@ -747,14 +748,14 @@ impl Decoder {
         let len = logits_slice.shape()[0];
         let mut logits = (0..len).map(|i| logits_slice[[i]]).collect::<Vec<_>>();
 
-        logits[self.no_timestamps_token as usize] = crate::WhisperDType::from(0.0);
-        logits[self.sot_token as usize] = crate::WhisperDType::from(0.0);
-        logits[self.transcribe_token as usize] = crate::WhisperDType::from(0.0);
-        logits[self.translate_token as usize] = crate::WhisperDType::from(0.0);
+        logits[self.no_timestamps_token as usize] = crate::WhisperDType::from(0.0_f32);
+        logits[self.sot_token as usize] = crate::WhisperDType::from(0.0_f32);
+        logits[self.transcribe_token as usize] = crate::WhisperDType::from(0.0_f32);
+        logits[self.translate_token as usize] = crate::WhisperDType::from(0.0_f32);
 
         if no_timestamps {
             for i in self.timestamp_token_range.clone() {
-                logits[i as usize] = crate::WhisperDType::from(0.0);
+                logits[i as usize] = crate::WhisperDType::from(0.0_f32);
             }
             return Ok(logits);
         }
@@ -771,14 +772,14 @@ impl Decoder {
             // If the last two tokens were timestamps, then the new token cannot be a timestamp
             (true, true) => {
                 for i in self.special_tokens() {
-                    logits[i as usize] = crate::WhisperDType::from(0.0);
+                    logits[i as usize] = crate::WhisperDType::from(0.0_f32);
                 }
             }
             // If the last token was a timestamp and the penultimate token was not, then the new token must be a timestamp
             (false, true) => {
                 for (i, logit) in logits.iter_mut().enumerate() {
                     if !self.is_timestamp_or_eot(i as u32) {
-                        *logit = crate::WhisperDType::from(0.0);
+                        *logit = crate::WhisperDType::from(0.0_f32);
                     }
                 }
             }
@@ -800,13 +801,13 @@ impl Decoder {
 
         for (i, logit) in logits.iter_mut().enumerate() {
             if self.timestamp_token_range.contains(&(i as u32)) && i < timestamp_last as usize {
-                *logit = crate::WhisperDType::from(0.0);
+                *logit = crate::WhisperDType::from(0.0_f32);
             }
         }
 
         // If the sum of the probability over timestamps is more than any other individual token, sample a timestamp
-        let mut timestamp_sum_prob = crate::WhisperDType::from(0.0);
-        let mut max_text_token_prob = crate::WhisperDType::from(0.0);
+        let mut timestamp_sum_prob = crate::WhisperDType::from(0.0_f32);
+        let mut max_text_token_prob = crate::WhisperDType::from(0.0_f32);
         for (i, logit) in logits.iter().enumerate() {
             if self.is_timestamp_or_eot(i as u32) {
                 timestamp_sum_prob += logit;
@@ -818,7 +819,7 @@ impl Decoder {
         if timestamp_sum_prob > max_text_token_prob {
             for (i, logit) in logits.iter_mut().enumerate() {
                 if !self.is_timestamp_or_eot(i as u32) {
-                    *logit = crate::WhisperDType::from(0.0);
+                    *logit = crate::WhisperDType::from(0.0_f32);
                 }
             }
         }

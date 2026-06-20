@@ -1,0 +1,220 @@
+.dx-button {
+  display: inline-flex;
+  box-sizing: border-box;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 0.5rem;
+  cursor: default;
+  font-family: inherit;
+  font-size: 0.875rem;
+  font-weight: 500;
+  gap: 0.5rem;
+  line-height: 1.25rem;
+  outline: none;
+  transition-duration: 150ms;
+  transition-property: all;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  white-space: nowrap;
+}
+
+.dx-button svg {
+  flex-shrink: 0;
+  pointer-events: none;
+}
+
+.dx-button svg:not([class*="size-"]) {
+  width: 1rem;
+  height: 1rem;
+}
+
+.dx-button[data-size="xs"] {
+  height: 1.5rem;
+  padding: 0 0.5rem;
+  border-radius: 0.5rem;
+  font-size: 0.75rem;
+  gap: 0.25rem;
+  line-height: 1rem;
+}
+
+.dx-button[data-size="xs"]:has(> svg) {
+  padding-inline: 0.375rem;
+}
+
+.dx-button[data-size="xs"] svg:not([class*="size-"]) {
+  width: 0.75rem;
+  height: 0.75rem;
+}
+
+.dx-button[data-size="sm"] {
+  height: 2rem;
+  padding: 0 0.75rem;
+  border-radius: 0.5rem;
+  gap: 0.375rem;
+}
+
+.dx-button[data-size="sm"]:has(> svg) {
+  padding-inline: 0.625rem;
+}
+
+.dx-button[data-size="default"] {
+  height: 2.25rem;
+  padding: 0.5rem 1rem;
+}
+
+.dx-button[data-size="default"]:has(> svg) {
+  padding-inline: 0.75rem;
+}
+
+.dx-button[data-size="lg"] {
+  height: 2.5rem;
+  padding: 0 1.5rem;
+  border-radius: 0.5rem;
+}
+
+.dx-button[data-size="lg"]:has(> svg) {
+  padding-inline: 1rem;
+}
+
+.dx-button[data-size="icon"] {
+  width: 2.25rem;
+  height: 2.25rem;
+}
+
+.dx-button[data-size="icon"] svg:not([class*="size-"]) {
+  width: 1rem;
+  height: 1rem;
+}
+
+.dx-button[data-size="icon-xs"] {
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 0.5rem;
+}
+
+.dx-button[data-size="icon-xs"] svg:not([class*="size-"]) {
+  width: 0.75rem;
+  height: 0.75rem;
+}
+
+.dx-button[data-size="icon-sm"] {
+  width: 2rem;
+  height: 2rem;
+}
+
+.dx-button[data-size="icon-sm"] svg:not([class*="size-"]) {
+  width: 1rem;
+  height: 1rem;
+}
+
+.dx-button[data-size="icon-lg"] {
+  width: 2.5rem;
+  height: 2.5rem;
+}
+
+.dx-button[data-size="icon-lg"] svg:not([class*="size-"]) {
+  width: 1rem;
+  height: 1rem;
+}
+
+.dx-button:disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.dx-button[data-style="primary"] {
+  background-color: var(--secondary-color-2);
+  color: var(--primary-color);
+}
+
+.dx-button[data-style="primary"]:not(:disabled):hover {
+  background-color: color-mix(
+    in oklab,
+    var(--secondary-color-2) 90%,
+    transparent
+  );
+}
+
+.dx-button[data-style="secondary"] {
+  background-color: var(--primary-color-5);
+  color: var(--secondary-color-1);
+}
+
+.dx-button[data-style="secondary"]:not(:disabled):hover {
+  background-color: color-mix(in oklab, var(--primary-color-5) 80%, transparent);
+}
+
+.dx-button[data-style="ghost"] {
+  background-color: transparent;
+  color: var(--secondary-color-4);
+}
+
+.dx-button[data-style="ghost"]:not(:disabled):hover {
+  background-color: var(--light, var(--primary-color-5))
+    var(--dark, color-mix(in oklab, var(--primary-color-5) 50%, transparent));
+  color: var(--secondary-color-1);
+}
+
+.dx-button[data-style="outline"] {
+  border: 1px solid var(--light, var(--primary-color-6))
+    var(--dark, var(--primary-color-7));
+  background-color: var(--light, var(--primary-color))
+    var(--dark, color-mix(in oklab, var(--primary-color-7) 30%, transparent));
+  box-shadow: 0 1px 2px 0 rgb(0 0 0 / 5%);
+  color: var(--secondary-color-4);
+}
+
+.dx-button[data-style="outline"]:not(:disabled):hover {
+  background-color: var(--light, var(--primary-color-5))
+    var(--dark, color-mix(in oklab, var(--primary-color-7) 50%, transparent));
+  color: var(--secondary-color-1);
+}
+
+.dx-button[data-style="destructive"] {
+  background-color: var(--light, var(--primary-error-color))
+    var(--dark, color-mix(in oklab, var(--primary-error-color) 60%, transparent));
+  color: var(--contrast-error-color);
+}
+
+.dx-button[data-style="destructive"]:not(:disabled):hover {
+  background-color: color-mix(
+    in oklab,
+    var(--primary-error-color) 90%,
+    transparent
+  );
+}
+
+.dx-button[data-style="destructive"]:focus-visible {
+  box-shadow: 0 0 0 3px
+    var(--light, color-mix(in oklab, var(--primary-error-color) 20%, transparent))
+    var(--dark, color-mix(in oklab, var(--primary-error-color) 40%, transparent));
+}
+
+.dx-button[data-style="link"] {
+  background-color: transparent;
+  color: var(--secondary-color-2);
+  text-decoration: none;
+  text-underline-offset: 0.25rem;
+}
+
+.dx-button[data-style="link"]:not(:disabled):hover {
+  text-decoration: underline;
+}
+
+.dx-button:focus-visible {
+  border-color: var(--focused-border-color);
+  box-shadow: 0 0 0 3px
+    color-mix(in oklab, var(--focused-border-color) 50%, transparent);
+}
+
+.dx-button[aria-invalid="true"] {
+  border-color: var(--primary-error-color);
+}
+
+.dx-button[aria-invalid="true"]:focus-visible {
+  box-shadow: 0 0 0 3px
+    var(--light, color-mix(in oklab, var(--primary-error-color) 20%, transparent))
+    var(--dark, color-mix(in oklab, var(--primary-error-color) 40%, transparent));
+}

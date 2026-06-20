@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-dioxus = { version = "=0.7.2", features = ["web"] }
+dioxus = { version = "0.7", features = ["web"] }
 rgliner = { path = "../../models/rgliner" }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 tracing = "0.1"

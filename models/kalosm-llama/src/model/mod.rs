@@ -1,18 +1,23 @@
 use crate::gguf_tokenizer::get_pre_tokenizer;
 use crate::raw::cache::LlamaCache;
-use crate::raw::Model;
+use crate::raw::{LlamaVarSource, Model, RopeScalingConfig};
 use crate::token_stream::TokenOutputStream;
 use crate::token_stream::TokenOutputStreamError;
 use crate::tokenizer::{LlamaTokenizer, LlamaTokenizerError};
 #[cfg(feature = "hf-config-json")]
 use crate::LlamaConfigJson;
+#[cfg(not(target_arch = "wasm32"))]
+use fusor::ShardedVarBuilder;
 use fusor::{
     AddOp, CastTensor, CastTo, Device, FloatDataType, FloatOps, MatmulImpl, Mirostat2Sampler,
-    Mirostat2SamplerParams, MulOp, ShardedVarBuilder, SimdBinaryOp, SimdElement, SimdReduceOp,
+    Mirostat2SamplerParams, MulOp, SimdBinaryOp, SimdElement, SimdReduceOp, StandardSamplerParams,
     SumOp, WasmNotSend, WasmNotSync,
 };
-use fusor_gguf::GgufMetadata;
-use fusor_gguf::GgufValue;
+#[cfg(target_arch = "wasm32")]
+use fusor::{AsyncReadRange, AsyncShardedVarBuilder};
+#[cfg(target_arch = "wasm32")]
+use fusor_gguf::GgufReadError;
+use fusor_gguf::{GgufMetadata, GgufValue};
 #[cfg(feature = "vision")]
 use kalosm_language_model::ImageFetchError;
 use kalosm_model_types::ModelLoadingProgress;
@@ -20,11 +25,13 @@ use rand::{Rng, SeedableRng};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
+#[cfg(target_arch = "wasm32")]
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use web_time::{Duration, Instant};
 
-use crate::sampler::{CpuMirostat2Sampler, Logit, Logits};
+use crate::sampler::{CpuSampler, Logit, Logits};
 use crate::{GpuSamplerConfig, InferenceSettings, LlamaImage, LlamaSourceError};
 
 mod forward;
@@ -51,7 +58,7 @@ fn record_decode_trace(path: &'static str, decode_eligible: bool, kernels: usize
     total_samples.sort_unstable();
     let p50 = percentile_duration(&total_samples, 50);
     let p95 = percentile_duration(&total_samples, 95);
-    eprintln!(
+    tracing::info!(
         "decode_trace_summary samples={} path={path} decode_eligible={decode_eligible} kernels={kernels} total={total:?} p50={p50:?} p95={p95:?}",
         total_samples.len()
     );
@@ -96,6 +103,12 @@ fn gpu_fused_logits_prewarm_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn gpu_run_ahead_enabled() -> bool {
+    std::env::var_os("KALOSM_LLAMA_GPU_RUN_AHEAD")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
 fn decode_trace_enabled() -> bool {
     std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
         || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
@@ -103,16 +116,240 @@ fn decode_trace_enabled() -> bool {
 }
 
 fn gpu_sample_top_k(config: &GpuSamplerConfig) -> usize {
+    let default_top_k = match config.sampling_strategy {
+        kalosm_language_model::SamplingStrategy::Mirostat2 => 16,
+        kalosm_language_model::SamplingStrategy::Standard => 64,
+    };
     std::env::var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K")
         .ok()
         .and_then(|value| value.parse().ok())
         .or(config.top_k)
-        .unwrap_or(16)
+        .unwrap_or(default_top_k)
         .max(1)
 }
 
-struct LlamaGpuSamplerState {
-    sampler: Mirostat2Sampler,
+fn parse_external_tokenizer(
+    tokenizer_source: Option<Vec<u8>>,
+) -> Result<Option<LlamaTokenizer>, LlamaSourceError> {
+    #[cfg(feature = "hf-tokenizer-json")]
+    {
+        match tokenizer_source {
+            Some(tokenizer_source) => {
+                let tokenizer = LlamaTokenizer::from_hf_bytes(tokenizer_source)
+                    .map_err(|err| LlamaSourceError::Tokenizer(Box::new(err)))?;
+                Ok(Some(tokenizer))
+            }
+            None => Ok(None),
+        }
+    }
+    #[cfg(not(feature = "hf-tokenizer-json"))]
+    {
+        let _ = tokenizer_source;
+        Ok(None)
+    }
+}
+
+fn parse_external_config(
+    config_bytes: Option<Vec<u8>>,
+) -> Result<Option<RopeScalingConfig>, LlamaSourceError> {
+    #[cfg(feature = "hf-config-json")]
+    {
+        match config_bytes {
+            Some(config_bytes) => {
+                let config: LlamaConfigJson =
+                    serde_json::from_slice(&config_bytes).map_err(LlamaSourceError::Config)?;
+                Ok(config.rope_scaling)
+            }
+            None => Ok(None),
+        }
+    }
+    #[cfg(not(feature = "hf-config-json"))]
+    {
+        let _ = config_bytes;
+        Ok(None)
+    }
+}
+
+fn tokenizer_from_gguf_source<S: LlamaVarSource>(
+    source: &S,
+) -> Result<LlamaTokenizer, LlamaSourceError> {
+    let tokenizer_model: Box<str> = source
+        .get("tokenizer.ggml.model")
+        .map_err(|_| LlamaSourceError::NoTokenizer)?
+        .clone()
+        .try_into()
+        .map_err(|_| LlamaSourceError::NoTokenizer)?;
+    if &*tokenizer_model != "gpt2" {
+        return Err(LlamaSourceError::NoTokenizer);
+    }
+    let pre: Box<str> = source
+        .get("tokenizer.ggml.pre")
+        .map_err(|_| LlamaSourceError::NoTokenizer)?
+        .clone()
+        .try_into()
+        .map_err(|_| LlamaSourceError::NoTokenizer)?;
+    let add_bos_token = source
+        .get("tokenizer.ggml.add_bos_token")
+        .ok()
+        .cloned()
+        .and_then(|v| v.try_into().ok());
+    let config = get_pre_tokenizer(&pre, add_bos_token);
+
+    let token_values: Box<[GgufValue]> = source
+        .get("tokenizer.ggml.tokens")
+        .map_err(|_| LlamaSourceError::NoTokenizer)?
+        .clone()
+        .try_into()
+        .map_err(|_| LlamaSourceError::NoTokenizer)?;
+    let tokens: Result<Vec<_>, _> = token_values.iter().map(|v| v.clone().try_into()).collect();
+    let tokens: Vec<Box<str>> = tokens.map_err(|_| LlamaSourceError::NoTokenizer)?;
+    let token_type_values: Box<[GgufValue]> = source
+        .get("tokenizer.ggml.token_type")
+        .map_err(|_| LlamaSourceError::NoTokenizer)?
+        .clone()
+        .try_into()
+        .map_err(|_| LlamaSourceError::NoTokenizer)?;
+    let types: Result<Vec<_>, _> = token_type_values
+        .iter()
+        .map(|v| v.to_u8().map_err(|_| LlamaSourceError::NoTokenizer))
+        .collect();
+    let types = types.map_err(|_| LlamaSourceError::NoTokenizer)?;
+    let vocab: HashMap<_, _> = tokens
+        .iter()
+        .enumerate()
+        .map(|(id, v)| (v.to_string(), id as u32))
+        .collect();
+    let merges: Box<[GgufValue]> = source
+        .get("tokenizer.ggml.merges")
+        .map_err(|_| LlamaSourceError::NoTokenizer)?
+        .clone()
+        .try_into()
+        .map_err(|_| LlamaSourceError::NoTokenizer)?;
+    let merges: Result<Vec<_>, _> = merges
+        .iter()
+        .map(|v| {
+            let as_str: Box<str> = v
+                .clone()
+                .try_into()
+                .map_err(|_| LlamaSourceError::NoTokenizer)?;
+            as_str
+                .split_once(' ')
+                .ok_or(LlamaSourceError::NoTokenizer)
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+        })
+        .collect();
+    let merges = merges.map_err(|_| LlamaSourceError::NoTokenizer)?;
+
+    let eos = source
+        .get("tokenizer.ggml.eos_token_id")
+        .map_err(|_| LlamaSourceError::NoTokenizer)?;
+    let eos: u32 = eos.try_into().map_err(|_| LlamaSourceError::NoTokenizer)?;
+    let eos = &tokens[eos as usize];
+
+    // Some models (e.g. Qwen) don't use a BOS token and ship the GGUF
+    // file without `tokenizer.ggml.bos_token_id`. Treat it as optional
+    // rather than failing to load the embedded tokenizer entirely.
+    let bos: Option<&str> = source
+        .get("tokenizer.ggml.bos_token_id")
+        .ok()
+        .and_then(|v| {
+            let id: u32 = v.try_into().ok()?;
+            Some(&*tokens[id as usize])
+        });
+
+    config
+        .build(vocab, types, merges, bos, eos)
+        .map(LlamaTokenizer::from_gguf)
+        .map_err(|err| LlamaSourceError::Tokenizer(Box::new(err)))
+}
+
+#[cfg(target_arch = "wasm32")]
+enum ModelRangeReader {
+    Opfs(kalosm_common::OpfsFile),
+    Bytes(Vec<u8>),
+}
+
+#[cfg(target_arch = "wasm32")]
+impl AsyncReadRange for ModelRangeReader {
+    fn read_range<'a>(
+        &'a mut self,
+        offset: u64,
+        len: usize,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + 'a>> {
+        Box::pin(async move {
+            match self {
+                Self::Opfs(file) => file
+                    .read_range(offset, len)
+                    .await
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string())),
+                Self::Bytes(bytes) => {
+                    let start = usize::try_from(offset).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "range offset does not fit in usize",
+                        )
+                    })?;
+                    let end = start.checked_add(len).ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "range length overflows usize",
+                        )
+                    })?;
+                    if end > bytes.len() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "range exceeds in-memory model bytes",
+                        ));
+                    }
+                    Ok(bytes[start..end].to_vec())
+                }
+            }
+        })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+enum WasmModelSource {
+    Opfs(Vec<kalosm_common::OpfsFile>),
+    Bytes(Vec<Vec<u8>>),
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn read_opfs_gguf_metadata(
+    file: &kalosm_common::OpfsFile,
+) -> Result<GgufMetadata, LlamaSourceError> {
+    const INITIAL_METADATA_READ: usize = 1024 * 1024;
+    const MAX_METADATA_READ: usize = 256 * 1024 * 1024;
+
+    let file_size = usize::try_from(file.size()).map_err(|_| {
+        LlamaSourceError::Model(kalosm_common::CacheError::OpfsError(
+            "Model file is too large for this wasm target".to_string(),
+        ))
+    })?;
+
+    let mut read_len = INITIAL_METADATA_READ.min(file_size);
+    loop {
+        let bytes = file.read_range(0, read_len).await?;
+        let mut cursor = std::io::Cursor::new(&bytes);
+        match GgufMetadata::read(&mut cursor) {
+            Ok(metadata) => return Ok(metadata),
+            Err(GgufReadError::Io(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof
+                    && read_len < file_size
+                    && read_len < MAX_METADATA_READ =>
+            {
+                read_len = read_len
+                    .saturating_mul(2)
+                    .min(file_size)
+                    .min(MAX_METADATA_READ);
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+pub(crate) struct LlamaGpuSamplerState {
+    mirostat: Option<Mirostat2Sampler>,
     config: GpuSamplerConfig,
     rng: rand::rngs::StdRng,
 }
@@ -123,14 +360,20 @@ impl LlamaGpuSamplerState {
         let rng = seed
             .map(rand::rngs::StdRng::seed_from_u64)
             .unwrap_or_else(rand::rngs::StdRng::from_os_rng);
+        let mirostat = match config.sampling_strategy {
+            kalosm_language_model::SamplingStrategy::Mirostat2 => {
+                Some(Mirostat2Sampler::new(gpu_device, config.mu))
+            }
+            kalosm_language_model::SamplingStrategy::Standard => None,
+        };
         Some(Self {
-            sampler: Mirostat2Sampler::new(gpu_device, config.mu),
+            mirostat,
             config,
             rng,
         })
     }
 
-    fn params(&mut self, top_k: usize) -> Mirostat2SamplerParams {
+    fn mirostat_params(&mut self, top_k: usize) -> Mirostat2SamplerParams {
         Mirostat2SamplerParams {
             top_k,
             temperature: self.config.temperature,
@@ -141,10 +384,67 @@ impl LlamaGpuSamplerState {
         }
     }
 
+    fn standard_params(&mut self, top_k: usize) -> StandardSamplerParams {
+        let top_p = if self.config.temperature <= 0.0 {
+            0.0
+        } else {
+            self.config.top_p.unwrap_or(1.0)
+        };
+        StandardSamplerParams {
+            top_k,
+            temperature: self.config.temperature,
+            repetition_penalty: self.config.repetition_penalty,
+            top_p,
+            min_p: self.config.min_p.unwrap_or(0.0),
+            random: self.rng.random::<f32>(),
+        }
+    }
+
     fn previous_tokens(&self, text_stream: &TokenOutputStream) -> Vec<u32> {
         let tokens = text_stream.tokens();
         let len = tokens.len().min(self.config.repetition_penalty_range);
         tokens[tokens.len().saturating_sub(len)..].to_vec()
+    }
+
+    fn previous_tokens_for_gpu_tail(&self, previous_tokens: Vec<u32>) -> (Vec<u32>, bool) {
+        trim_previous_tokens_for_gpu_tail(previous_tokens, self.config.repetition_penalty_range)
+    }
+}
+
+fn trim_previous_tokens_for_gpu_tail(
+    mut previous_tokens: Vec<u32>,
+    repetition_penalty_range: usize,
+) -> (Vec<u32>, bool) {
+    let host_len = repetition_penalty_range.saturating_sub(1);
+    if previous_tokens.len() > host_len {
+        let keep_from = previous_tokens.len() - host_len;
+        previous_tokens = previous_tokens.split_off(keep_from);
+    }
+    (previous_tokens, repetition_penalty_range > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim_previous_tokens_for_gpu_tail;
+
+    #[test]
+    fn gpu_tail_history_preserves_repetition_window() {
+        assert_eq!(
+            trim_previous_tokens_for_gpu_tail(vec![1, 2, 3, 4], 0),
+            (vec![], false)
+        );
+        assert_eq!(
+            trim_previous_tokens_for_gpu_tail(vec![1, 2, 3, 4], 1),
+            (vec![], true)
+        );
+        assert_eq!(
+            trim_previous_tokens_for_gpu_tail(vec![1, 2, 3, 4], 3),
+            (vec![3, 4], true)
+        );
+        assert_eq!(
+            trim_previous_tokens_for_gpu_tail(vec![1, 2], 5),
+            (vec![1, 2], true)
+        );
     }
 }
 
@@ -152,13 +452,13 @@ struct ForwardTrace {
     enabled: bool,
     decode_eligible: bool,
     path: &'static str,
-    token_start: Option<std::time::Instant>,
+    token_start: Option<Instant>,
     kernels: usize,
 }
 
 impl ForwardTrace {
-    fn step_start(&self) -> Option<std::time::Instant> {
-        self.enabled.then(std::time::Instant::now)
+    fn step_start(&self) -> Option<Instant> {
+        self.enabled.then(Instant::now)
     }
 
     fn record(&self) {
@@ -344,7 +644,7 @@ where
         }
 
         let trace = decode_trace_enabled();
-        let start = trace.then(std::time::Instant::now);
+        let start = trace.then(Instant::now);
         let hidden_values = vec![0.0f32; shape[1]];
         let hidden: fusor::Tensor<1, f32> =
             fusor::Tensor::from_slice(device, [shape[1]], &hidden_values);
@@ -359,10 +659,11 @@ where
         };
 
         let _ = hidden
-            .try_sample_mirostat2_token_q_mat(model.output_matrix(), &mut sampler, &[], params)
+            .q_mat_mul(model.output_matrix())
+            .sample_mirostat2_token(&mut sampler, &[], params)
             .await;
         if let Some(start) = start {
-            eprintln!(
+            tracing::info!(
                 "prewarm_fused_logits_sampling elapsed={:?}",
                 start.elapsed()
             );
@@ -376,8 +677,8 @@ where
         let device = builder.get_device().await;
         if decode_trace_enabled() {
             match &device {
-                Device::Cpu => eprintln!("llama_device=cpu"),
-                Device::Gpu(gpu) => eprintln!(
+                Device::Cpu => tracing::info!("llama_device=cpu"),
+                Device::Gpu(gpu) => tracing::info!(
                     "llama_device=gpu adapter={:?}",
                     gpu.wgpu_adapter().get_info(),
                 ),
@@ -456,48 +757,98 @@ where
 
         let source = format!("Model ({})", builder.source.model[0]);
         let mut create_progress = ModelLoadingProgress::downloading_progress(source);
+        #[cfg(target_arch = "wasm32")]
+        let model_source = match builder
+            .source
+            .model_opfs_files(|progress| handler(create_progress(progress)))
+            .await
+        {
+            Ok(files) => WasmModelSource::Opfs(files),
+            Err(err) => {
+                tracing::warn!("OPFS model loading failed, falling back to in-memory: {err}");
+                WasmModelSource::Bytes(
+                    builder
+                        .source
+                        .model_bytes(|progress| handler(create_progress(progress)))
+                        .await?,
+                )
+            }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
         let model_bytes = builder
             .source
             .model(|progress| handler(create_progress(progress)))
             .await?;
 
-        // Then actually load the model and tokenizer. This is expensive, so we do it in a blocking task
-        let load_model = {
+        let override_stop_token_string = builder.source.override_stop_token_string.clone();
+        let override_chat_template = builder.source.override_chat_template.clone();
+
+        #[cfg(target_arch = "wasm32")]
+        let (model, tokenizer) = {
+            let files_with_metadata = match model_source {
+                WasmModelSource::Opfs(model_files) => {
+                    if model_files.is_empty() {
+                        return Err(LlamaSourceError::InvalidGguf);
+                    }
+                    let mut files_with_metadata = Vec::new();
+                    for file in model_files {
+                        let metadata = read_opfs_gguf_metadata(&file).await?;
+                        files_with_metadata.push((metadata, ModelRangeReader::Opfs(file)));
+                    }
+                    files_with_metadata
+                }
+                WasmModelSource::Bytes(model_bytes) => {
+                    if model_bytes.is_empty() {
+                        return Err(LlamaSourceError::InvalidGguf);
+                    }
+                    let mut files_with_metadata = Vec::new();
+                    for bytes in model_bytes {
+                        let metadata = {
+                            let mut cursor = std::io::Cursor::new(&bytes);
+                            GgufMetadata::read(&mut cursor)?
+                        };
+                        files_with_metadata.push((metadata, ModelRangeReader::Bytes(bytes)));
+                    }
+                    files_with_metadata
+                }
+            };
+
+            let mut source = AsyncShardedVarBuilder::new(files_with_metadata);
+
+            let (vision_ct, vision_bytes) = match vision_model_bytes {
+                Some(bytes) => {
+                    let mut cursor = std::io::Cursor::new(&bytes);
+                    let metadata = GgufMetadata::read(&mut cursor)?;
+                    (Some(metadata), Some(bytes))
+                }
+                None => (None, None),
+            };
+
+            let tokenizer = match parse_external_tokenizer(tokenizer_source)? {
+                Some(tokenizer) => tokenizer,
+                None => tokenizer_from_gguf_source(&source)?,
+            };
+            let config = parse_external_config(config_bytes)?;
+            let model = Model::from_var_source(
+                &mut source,
+                vision_ct,
+                vision_bytes,
+                &device,
+                override_stop_token_string,
+                override_chat_template,
+                config,
+            )
+            .await?;
+
+            (model, tokenizer)
+        };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let (model, tokenizer) = {
             let device = device.clone();
-            move || -> Result<(Model<F>, LlamaTokenizer), LlamaSourceError> {
-                #[cfg(feature = "hf-tokenizer-json")]
-                let tokenizer = match tokenizer_source {
-                    Some(tokenizer_source) => {
-                        let tokenizer = LlamaTokenizer::from_hf_bytes(tokenizer_source)
-                            .map_err(|err| LlamaSourceError::Tokenizer(Box::new(err)))?;
-                        Some(tokenizer)
-                    }
-                    None => None,
-                };
-                #[cfg(not(feature = "hf-tokenizer-json"))]
-                let tokenizer: Option<LlamaTokenizer> = {
-                    let _ = tokenizer_source;
-                    None
-                };
-
-                #[cfg(feature = "hf-config-json")]
-                let config = match config_bytes {
-                    Some(config_bytes) => {
-                        let config: LlamaConfigJson = serde_json::from_slice(&config_bytes)
-                            .map_err(LlamaSourceError::Config)?;
-                        config.rope_scaling
-                    }
-                    None => None,
-                };
-                #[cfg(not(feature = "hf-config-json"))]
-                let config = {
-                    let _ = config_bytes;
-                    None
-                };
-
-                let override_stop_token_string = builder.source.override_stop_token_string;
-                let override_chat_template = builder.source.override_chat_template;
-
+            let load_model = move || -> Result<(Model<F>, LlamaTokenizer), LlamaSourceError> {
+                let tokenizer = parse_external_tokenizer(tokenizer_source)?;
+                let config = parse_external_config(config_bytes)?;
                 if model_bytes.is_empty() {
                     return Err(LlamaSourceError::InvalidGguf);
                 }
@@ -523,93 +874,7 @@ where
 
                 let tokenizer = match tokenizer {
                     Some(tokenizer) => tokenizer,
-                    None => {
-                        let tokenizer_model: Box<str> = source
-                            .get("tokenizer.ggml.model")
-                            .map_err(|_| LlamaSourceError::NoTokenizer)?
-                            .clone()
-                            .try_into()
-                            .map_err(|_| LlamaSourceError::NoTokenizer)?;
-                        if &*tokenizer_model != "gpt2" {
-                            return Err(LlamaSourceError::NoTokenizer);
-                        }
-                        let pre: Box<str> = source
-                            .get("tokenizer.ggml.pre")
-                            .map_err(|_| LlamaSourceError::NoTokenizer)?
-                            .clone()
-                            .try_into()
-                            .map_err(|_| LlamaSourceError::NoTokenizer)?;
-                        let add_bos_token = source
-                            .get("tokenizer.ggml.add_bos_token")
-                            .ok()
-                            .cloned()
-                            .and_then(|v| v.try_into().ok());
-                        let config = get_pre_tokenizer(&pre, add_bos_token);
-
-                        let token_values: Box<[GgufValue]> = source
-                            .get("tokenizer.ggml.tokens")
-                            .map_err(|_| LlamaSourceError::NoTokenizer)?
-                            .clone()
-                            .try_into()
-                            .map_err(|_| LlamaSourceError::NoTokenizer)?;
-                        let tokens: Result<Vec<_>, _> =
-                            token_values.iter().map(|v| v.clone().try_into()).collect();
-                        let tokens: Vec<Box<str>> =
-                            tokens.map_err(|_| LlamaSourceError::NoTokenizer)?;
-                        let token_type_values: Box<[GgufValue]> = source
-                            .get("tokenizer.ggml.token_type")
-                            .map_err(|_| LlamaSourceError::NoTokenizer)?
-                            .clone()
-                            .try_into()
-                            .map_err(|_| LlamaSourceError::NoTokenizer)?;
-                        let types: Result<Vec<_>, _> = token_type_values
-                            .iter()
-                            .map(|v| v.to_u8().map_err(|_| LlamaSourceError::NoTokenizer))
-                            .collect();
-                        let types = types.map_err(|_| LlamaSourceError::NoTokenizer)?;
-                        let vocab: HashMap<_, _> = tokens
-                            .iter()
-                            .enumerate()
-                            .map(|(id, v)| (v.to_string(), id as u32))
-                            .collect();
-                        let merges: Box<[GgufValue]> = source
-                            .get("tokenizer.ggml.merges")
-                            .map_err(|_| LlamaSourceError::NoTokenizer)?
-                            .clone()
-                            .try_into()
-                            .map_err(|_| LlamaSourceError::NoTokenizer)?;
-                        let merges: Result<Vec<_>, _> = merges
-                            .iter()
-                            .map(|v| {
-                                let as_str: Box<str> = v
-                                    .clone()
-                                    .try_into()
-                                    .map_err(|_| LlamaSourceError::NoTokenizer)?;
-                                as_str
-                                    .split_once(' ')
-                                    .ok_or(LlamaSourceError::NoTokenizer)
-                                    .map(|(a, b)| (a.to_string(), b.to_string()))
-                            })
-                            .collect();
-                        let merges = merges.map_err(|_| LlamaSourceError::NoTokenizer)?;
-
-                        let eos = source
-                            .get("tokenizer.ggml.eos_token_id")
-                            .map_err(|_| LlamaSourceError::NoTokenizer)?;
-                        let eos: u32 = eos.try_into().map_err(|_| LlamaSourceError::NoTokenizer)?;
-                        let eos = &tokens[eos as usize];
-
-                        let bos = source
-                            .get("tokenizer.ggml.bos_token_id")
-                            .map_err(|_| LlamaSourceError::NoTokenizer)?;
-                        let bos: u32 = bos.try_into().map_err(|_| LlamaSourceError::NoTokenizer)?;
-                        let bos = &tokens[bos as usize];
-
-                        config
-                            .build(vocab, types, merges, bos, eos)
-                            .map(LlamaTokenizer::from_gguf)
-                            .map_err(|err| LlamaSourceError::Tokenizer(Box::new(err)))?
-                    }
+                    None => tokenizer_from_gguf_source(&source)?,
                 };
                 let model = Model::from_gguf(
                     &mut source,
@@ -621,10 +886,10 @@ where
                     config,
                 )?;
                 Ok((model, tokenizer))
-            }
-        };
+            };
 
-        let (model, tokenizer) = load_model()?;
+            load_model()?
+        };
         Self::prewarm_fused_logits_sampling(&model, &device).await;
 
         Ok(Self {

@@ -231,6 +231,7 @@ impl LlamaSource {
         self
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn model(
         &self,
         #[cfg_attr(target_arch = "wasm32", allow(unused_mut))] mut progress: impl FnMut(
@@ -263,6 +264,30 @@ impl LlamaSource {
             {
                 model_bytes.push(self.cache.get_bytes(file, &mut progress).await?);
             }
+        }
+        Ok(model_bytes)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn model_opfs_files(
+        &self,
+        mut progress: impl FnMut(FileLoadingProgress),
+    ) -> Result<Vec<kalosm_common::OpfsFile>, LlamaSourceError> {
+        let mut files = Vec::new();
+        for file in &self.model {
+            files.push(self.cache.get_opfs_file(file, &mut progress).await?);
+        }
+        Ok(files)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn model_bytes(
+        &self,
+        mut progress: impl FnMut(FileLoadingProgress),
+    ) -> Result<Vec<Vec<u8>>, LlamaSourceError> {
+        let mut model_bytes = Vec::new();
+        for file in &self.model {
+            model_bytes.push(self.cache.get_bytes(file, &mut progress).await?);
         }
         Ok(model_bytes)
     }

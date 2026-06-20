@@ -148,6 +148,22 @@ impl Display for ItemMismatchError {
     }
 }
 
+#[derive(Error, Debug)]
+#[error("Value mismatch: expected {expected}, got {actual}")]
+pub struct ValueMismatchError {
+    expected: String,
+    actual: String,
+}
+
+impl ValueMismatchError {
+    fn new(expected: impl Debug, actual: impl Debug) -> Self {
+        Self {
+            expected: format!("{expected:?}"),
+            actual: format!("{actual:?}"),
+        }
+    }
+}
+
 /// Boxed future returned by a comparator: `&'a U, &'a U -> Result<(), E>`.
 /// Aliased so the comparator type signatures stay readable.
 pub type CompareFut<'a, E> = Pin<Box<dyn std::future::Future<Output = Result<(), E>> + 'a>>;
@@ -238,4 +254,20 @@ pub fn approx_or_relative_compare<const R: usize>(
 ) -> impl for<'a> Fn(&'a Tensor<R, f32>, &'a Tensor<R, f32>) -> CompareFut<'a, ItemMismatchError> + Clone
 {
     move |a, b| Box::pin(approx_or_relative_eq(a, b, abs_tol, rel_tol))
+}
+
+pub fn exact_value_compare<T>()
+-> impl for<'a> Fn(&'a T, &'a T) -> CompareFut<'a, ValueMismatchError> + Clone
+where
+    T: Debug + PartialEq,
+{
+    |a, b| {
+        Box::pin(async move {
+            if a == b {
+                Ok(())
+            } else {
+                Err(ValueMismatchError::new(a, b))
+            }
+        })
+    }
 }

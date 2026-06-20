@@ -27,7 +27,7 @@ impl Tensor {
     /// The returned tensors are layout views into one concatenated allocation. This keeps the
     /// decode graph to one RoPE kernel per layer while preserving separate q/k tensor shapes.
     pub fn rope_pair_fused(&self, k: &Tensor, cos: &Tensor, sin: &Tensor) -> (Tensor, Tensor) {
-        self.rope_pair_fused_impl(k, cos, sin, RopeMode::Interleaved)
+        self.rope_pair_fused_impl(k, cos, sin, None, RopeMode::Interleaved)
     }
 
     /// Apply fused normal RoPE to query and key tensors in one kernel.
@@ -40,7 +40,31 @@ impl Tensor {
         cos: &Tensor,
         sin: &Tensor,
     ) -> (Tensor, Tensor) {
-        self.rope_pair_fused_impl(k, cos, sin, RopeMode::Normal)
+        self.rope_pair_fused_impl(k, cos, sin, None, RopeMode::Normal)
+    }
+
+    /// Apply fused interleaved RoPE to query and key tensors in one kernel,
+    /// indexing full cos/sin tables with a runtime position scalar.
+    pub fn rope_pair_fused_with_position(
+        &self,
+        k: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        position: &Tensor,
+    ) -> (Tensor, Tensor) {
+        self.rope_pair_fused_impl(k, cos, sin, Some(position), RopeMode::Interleaved)
+    }
+
+    /// Apply fused normal RoPE to query and key tensors in one kernel,
+    /// indexing full cos/sin tables with a runtime position scalar.
+    pub fn rope_normal_pair_fused_with_position(
+        &self,
+        k: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        position: &Tensor,
+    ) -> (Tensor, Tensor) {
+        self.rope_pair_fused_impl(k, cos, sin, Some(position), RopeMode::Normal)
     }
 
     fn rope_fused_impl(&self, cos: &Tensor, sin: &Tensor, mode: RopeMode) -> Tensor {
@@ -70,12 +94,18 @@ impl Tensor {
         k: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        position: Option<&Tensor>,
         mode: RopeMode,
     ) -> (Tensor, Tensor) {
         self.assert_rank::<4>();
         k.assert_rank::<4>();
         cos.assert_rank::<2>();
         sin.assert_rank::<2>();
+        if let Some(position) = position {
+            position.assert_rank::<1>();
+            assert_eq!(position.datatype(), DataTypeEnum::U32);
+            assert_eq!(position.shape(), &[1]);
+        }
         assert_eq!(self.datatype(), k.datatype());
         assert_eq!(self.datatype(), cos.datatype());
         assert_eq!(self.datatype(), sin.datatype());
@@ -113,6 +143,7 @@ impl Tensor {
             k: k.key(),
             cos: cos.key(),
             sin: sin.key(),
+            position: position.map(|position| position.key()),
             datatype: self.datatype(),
             q_shape,
             k_shape,
@@ -172,6 +203,7 @@ struct RopePairFusedOperation {
     k: NodeIndex,
     cos: NodeIndex,
     sin: NodeIndex,
+    position: Option<NodeIndex>,
     datatype: DataTypeEnum,
     q_shape: [usize; 4],
     k_shape: [usize; 4],
@@ -186,8 +218,8 @@ impl RopeFusedOperation {
         self.shape.len()
     }
 
-    fn to_nary(&self) -> crate::nary_wise::NaryOperation {
-        crate::nary_wise::NaryOperation {
+    fn to_nary(&self) -> crate::nary_wise::ElementwiseOperation {
+        crate::nary_wise::ElementwiseOperation {
             inputs: vec![self.input, self.cos, self.sin],
             expression: self.build_expr(),
             shape: self.shape.clone(),
@@ -378,9 +410,13 @@ fn build_sign_condition(dim_last: NaryExpr, head_dim: usize, mode: RopeMode) -> 
 }
 
 impl RopePairFusedOperation {
-    fn to_nary(&self) -> crate::nary_wise::NaryOperation {
-        crate::nary_wise::NaryOperation {
-            inputs: vec![self.q, self.k, self.cos, self.sin],
+    fn to_nary(&self) -> crate::nary_wise::ElementwiseOperation {
+        let mut inputs = vec![self.q, self.k, self.cos, self.sin];
+        if let Some(position) = self.position {
+            inputs.push(position);
+        }
+        crate::nary_wise::ElementwiseOperation {
+            inputs,
             expression: self.build_expr(),
             shape: vec![self.total_elements].into_boxed_slice(),
             output_datatype: self.datatype,
@@ -414,7 +450,15 @@ impl RopePairFusedOperation {
         let head_dim = shape[3];
         let indices = row_major_indices_from_flat(flat.clone(), &shape);
         let input_val = NaryExpr::indexed_input(input_idx, indices.clone());
-        let dim_seq = indices[2].clone();
+        let dim_seq = if self.position.is_some() {
+            NaryExpr::add(
+                NaryExpr::indexed_input(4, vec![NaryExpr::scalar(NaryScalar::U32(0))]),
+                indices[2].clone(),
+                DataTypeEnum::U32,
+            )
+        } else {
+            indices[2].clone()
+        };
         let dim_last = indices[3].clone();
 
         let cos_sin_indices = build_cos_sin_indices(dim_seq, dim_last.clone(), head_dim, self.mode);

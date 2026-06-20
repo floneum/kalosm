@@ -12,6 +12,7 @@ wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default
 lru = { version = "0.14.0", default-features = false }
 parking_lot = "0.12.3"
 rustc-hash = "2.1.1"
+tracing = "0.1.41"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["metal"] }
@@ -21,3 +22,6 @@ wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["vulkan"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["webgpu", "wgsl"] }

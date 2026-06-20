@@ -220,6 +220,9 @@ Module {
             ),
             ty: [18],
             init: None,
+            memory_decorations: MemoryDecorations(
+                0x0,
+            ),
         },
         [1]: GlobalVariable {
             name: None,
@@ -236,6 +239,9 @@ Module {
             ),
             ty: [18],
             init: None,
+            memory_decorations: MemoryDecorations(
+                0x0,
+            ),
         },
         [2]: GlobalVariable {
             name: None,
@@ -243,6 +249,9 @@ Module {
             binding: None,
             ty: [19],
             init: None,
+            memory_decorations: MemoryDecorations(
+                0x0,
+            ),
         },
     },
     global_expressions: {},
@@ -284,92 +293,7 @@ Module {
                 local_variables: {
                     [0]: LocalVariable {
                         name: None,
-                        ty: [0],
-                        init: None,
-                    },
-                    [1]: LocalVariable {
-                        name: None,
                         ty: [6],
-                        init: None,
-                    },
-                    [2]: LocalVariable {
-                        name: None,
-                        ty: [10],
-                        init: None,
-                    },
-                    [3]: LocalVariable {
-                        name: None,
-                        ty: [12],
-                        init: None,
-                    },
-                    [4]: LocalVariable {
-                        name: None,
-                        ty: [1],
-                        init: None,
-                    },
-                    [5]: LocalVariable {
-                        name: None,
-                        ty: [2],
-                        init: None,
-                    },
-                    [6]: LocalVariable {
-                        name: None,
-                        ty: [3],
-                        init: None,
-                    },
-                    [7]: LocalVariable {
-                        name: None,
-                        ty: [7],
-                        init: None,
-                    },
-                    [8]: LocalVariable {
-                        name: None,
-                        ty: [8],
-                        init: None,
-                    },
-                    [9]: LocalVariable {
-                        name: None,
-                        ty: [9],
-                        init: None,
-                    },
-                    [10]: LocalVariable {
-                        name: None,
-                        ty: [11],
-                        init: None,
-                    },
-                    [11]: LocalVariable {
-                        name: None,
-                        ty: [13],
-                        init: None,
-                    },
-                    [12]: LocalVariable {
-                        name: None,
-                        ty: [14],
-                        init: None,
-                    },
-                    [13]: LocalVariable {
-                        name: None,
-                        ty: [15],
-                        init: None,
-                    },
-                    [14]: LocalVariable {
-                        name: None,
-                        ty: [16],
-                        init: None,
-                    },
-                    [15]: LocalVariable {
-                        name: None,
-                        ty: [17],
-                        init: None,
-                    },
-                    [16]: LocalVariable {
-                        name: None,
-                        ty: [10],
-                        init: None,
-                    },
-                    [17]: LocalVariable {
-                        name: None,
-                        ty: [4],
                         init: None,
                     },
                 },
@@ -380,7 +304,7 @@ Module {
                         ),
                     ),
                     [1]: LocalVariable(
-                        [1],
+                        [0],
                     ),
                     [2]: FunctionArgument(
                         0,

@@ -19,10 +19,10 @@ impl<'a> Lowerer<'a> {
             width: 2,
         };
 
-        // The prelude types are created in the same fixed order the old lowerer
-        // used so the module's type arena is byte-identical. The interner is
-        // then pre-populated with them; coop-matrix and array types are added on
-        // demand below the `Expr -> Handle` boundary.
+        // The prelude types are created in a fixed order so the module's type
+        // arena is deterministic. The interner is then pre-populated with them;
+        // coop-matrix and array types are added on demand below the
+        // `Expr -> Handle` boundary.
         let mut types: FxHashMap<ElementType, Handle<Type>> = FxHashMap::default();
 
         let f32_ty = Self::scalar_type(&mut module, Scalar::F32);
@@ -66,9 +66,9 @@ impl<'a> Lowerer<'a> {
             types.insert(ElementType::vector(ScalarElement::F16, 4), f16_vec4_ty);
         }
 
-        // Cooperative-matrix types are created up front (same arena position as
-        // the old `create_coop_matrix_types`): walk the program locals in
-        // first-use order and intern each distinct coop element exactly once.
+        // Cooperative-matrix types are created up front: walk the program
+        // locals in first-use order and intern each distinct coop element
+        // exactly once.
         for local in &analysis.locals {
             let element = local.element;
             if matches!(element, ElementType::CoopMatrix { .. }) && !types.contains_key(&element) {
@@ -107,6 +107,10 @@ impl<'a> Lowerer<'a> {
             workgroup_invocations,
             workgroup_size,
             caps,
+            subgroup_id_arg: None,
+            subgroup_invocation_id_arg: None,
+            subgroup_size_arg: None,
+            num_subgroups_arg: None,
             buffer_decls: analysis.buffers,
             tile_decls: analysis.tiles,
             local_decls: analysis.locals,
@@ -171,8 +175,16 @@ impl<'a> Lowerer<'a> {
             (self.caps.subgroup_size, BuiltIn::SubgroupSize),
             (self.caps.num_subgroups, BuiltIn::NumSubgroups),
         ];
-        for (used, builtin) in optional_subgroup_args {
+        for (index, (used, builtin)) in optional_subgroup_args.into_iter().enumerate() {
             if used {
+                let arg = arguments.len() as u32;
+                match index {
+                    0 => self.subgroup_id_arg = Some(arg),
+                    1 => self.subgroup_invocation_id_arg = Some(arg),
+                    2 => self.subgroup_size_arg = Some(arg),
+                    3 => self.num_subgroups_arg = Some(arg),
+                    _ => unreachable!(),
+                }
                 arguments.push(builtin_arg(self.u32_ty, builtin));
             }
         }
@@ -182,10 +194,9 @@ impl<'a> Lowerer<'a> {
             arguments,
             ..Function::default()
         };
-        // Private tiles and program locals are appended first (matching the old
-        // declaration-order prefix); scratch is demand-allocated into the same
-        // arena during body lowering. The arena is moved into the function once
-        // lowering is done.
+        // Private tiles and program locals are appended before scratch, which
+        // is demand-allocated into the same arena during body lowering. The
+        // arena is moved into the function once lowering is done.
         self.create_private_locals()?;
         self.create_program_private_locals()?;
 
@@ -213,7 +224,8 @@ impl<'a> Lowerer<'a> {
         if self.caps.native_f16_scales || self.caps.unpacks_f16 {
             capabilities |= naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32;
         }
-        if self.caps.uses_subgroup_reduce || self.caps.subgroup_id {
+        let uses_subgroups = self.caps.uses_subgroups();
+        if uses_subgroups {
             capabilities |= naga::valid::Capabilities::SUBGROUP;
         }
         if self.caps.uses_coop {
@@ -226,18 +238,15 @@ impl<'a> Lowerer<'a> {
         Ok(NagaKernel {
             module: self.module,
             info,
+            wgsl_extensions: WgslExtensions::new(uses_subgroups),
         })
     }
 
     fn create_storage_globals(&mut self) -> Result<(), LowerError> {
-        // Buffers are emitted in declaration order; the IR is a tree, so the
-        // canonical order is the analysis-discovered set. The builder assigns
-        // `binding` incrementally at creation time, so declaration order *is*
-        // ascending `binding` order — sort by it to reproduce the old
-        // declaration-order arena exactly, independent of which kernel happens
-        // to touch which buffer first (first-use order diverges from creation
-        // order for e.g. multi-iteration qgemv folds whose loop body reads `a`
-        // but whose accumulator update reads the weights `b`).
+        // Buffers are emitted in declaration order. The builder assigns
+        // `binding` incrementally at creation time, so sorting by binding keeps
+        // the global-variable arena independent of which kernel touches which
+        // buffer first.
         let mut buffers = self.collect_buffers();
         buffers.sort_by_key(|buffer| buffer.binding);
         for buffer in &buffers {
@@ -256,6 +265,7 @@ impl<'a> Lowerer<'a> {
                     }),
                     ty,
                     init: None,
+                    memory_decorations: naga::MemoryDecorations::empty(),
                 },
                 Span::default(),
             );
@@ -280,6 +290,7 @@ impl<'a> Lowerer<'a> {
                     binding: None,
                     ty,
                     init: None,
+                    memory_decorations: naga::MemoryDecorations::empty(),
                 },
                 Span::default(),
             );

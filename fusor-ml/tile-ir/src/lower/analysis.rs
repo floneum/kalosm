@@ -35,6 +35,16 @@ pub(super) struct Capabilities {
     pub num_subgroups: bool,
 }
 
+impl Capabilities {
+    pub(super) fn uses_subgroups(self) -> bool {
+        self.uses_subgroup_reduce
+            || self.subgroup_id
+            || self.subgroup_lane
+            || self.subgroup_size
+            || self.num_subgroups
+    }
+}
+
 impl Analysis {
     pub(super) fn run(ir: &KernelIr) -> Self {
         let mut analysis = Analysis::default();
@@ -107,9 +117,12 @@ impl Analysis {
                 self.visit_expr(index);
                 self.visit_expr(value);
             }
-            Stmt::FillTile { dst, value } => {
+            Stmt::FillTile { dst, value, bounds } => {
                 self.note_tile(dst);
                 self.visit_expr(value);
+                for bound in bounds.iter().flatten() {
+                    self.visit_expr(bound);
+                }
             }
             Stmt::CoopStore { acc, dst, addr } => {
                 self.caps.uses_coop = true;

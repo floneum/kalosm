@@ -11,6 +11,9 @@ keywords = ["llm", "llama", "mistral", "agents", "nlp"]
 [features]
 loading-progress-bar = []
 
+[dependencies]
+web-time.workspace = true
+
 [dev-dependencies]
 kalosm = { workspace = true, features = [
     "language",

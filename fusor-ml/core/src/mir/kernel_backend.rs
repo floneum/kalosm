@@ -1,11 +1,21 @@
 pub(crate) use fusor_tile_ir_runtime::{
-    DirectKernel, DirectKernelBinding, KernelCacheKey, KernelVariantKey, ModuleCache,
-    PreparedDirectDispatch, cached_hashed_naga, dynamic_kernel_from_hashed_ir,
-    dynamic_kernel_from_ir, module_cache, run_direct_kernel, run_kernel,
-    three_buffer_pipeline_from_cached_module, three_buffer_pipeline_from_ir,
+    DirectKernel, KernelCacheKey, KernelVariantKey, PreparedDirectDispatch, dynamic_kernel_from_ir,
+    run_direct_kernel, run_kernel, three_buffer_pipeline_from_ir,
 };
 
-pub(crate) mod flash_attention;
+/// Marker returned by device-specific direct-kernel builders when the current
+/// device cannot support the required IR capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeviceNotSupported;
+
+impl std::fmt::Display for DeviceNotSupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("device does not support this kernel variant")
+    }
+}
+
+impl std::error::Error for DeviceNotSupported {}
+
 pub(crate) mod mirostat;
-pub(crate) mod rms_norm;
 pub(crate) mod sampling_topk;
+pub(crate) mod standard_sampler;

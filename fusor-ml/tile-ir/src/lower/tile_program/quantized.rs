@@ -89,9 +89,7 @@ impl<'a> Lowerer<'a> {
     /// activations are materialised once (and Q8-packed once, outside the column
     /// mask), then the masked column emits the format-specific fused dot:
     /// `QuantActivation::F32` decodes the weights to f32 (Q8_0/Q6K dot8, Q4K
-    /// dot8/16/32), `Q8` keeps them quantized and emits `Dot4I8Packed`. Mirrors
-    /// the pre-refactor `QuantizedDot { activations: F32(_)|Q8(_), k: Base(_) }`
-    /// lowering so the emitted Naga is byte-identical.
+    /// dot8/16/32), `Q8` keeps them quantized and emits `Dot4I8Packed`.
     pub(in crate::lower) fn lower_quantized_dot(
         &self,
         expressions: &mut Arena<Expression>,

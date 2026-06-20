@@ -11,17 +11,15 @@
 //! `workgroup_barrier()`. They're cooperative across the workgroup, never
 //! the subgroup.
 //!
-//! Runtime-typed (ARBOR_DESIGN.md §2): the storage / staging element types
-//! travel as [`ScalarElement`] data through [`AccumCast`] rather than Rust
-//! marker generics. The bodies share three building blocks:
+//! Storage and staging element types travel as [`ScalarElement`] data through
+//! [`AccumCast`]. The bodies share three building blocks:
 //! - [`stage_storage_tile_with_pre`] — cooperative per-lane staging of a dense
 //!   source into a workgroup tile, applying the optional pre-activation
 //!   epilogue per element. Used for A in both kernels.
 //! - [`TileBlock::fill_tile_quantized`] — per-lane dequantize-into-workgroup-
-//!   tile for B (lowers to the same `Stmt::FillTile` quant copy as the old
-//!   `copy_quant_to_tile`, and is **not** coop-forcing — preserving the
-//!   lavapipe invariant that this kernel requests neither `SUBGROUP` nor
-//!   `COOPERATIVE_MATRIX`).
+//!   tile for B. This path is not coop-forcing, preserving the lavapipe
+//!   invariant that this kernel requests neither `SUBGROUP` nor
+//!   `COOPERATIVE_MATRIX`.
 //! - [`accumulate_register_tile_from_workgroup`] — per-lane register
 //!   accumulation reading both staged tiles. Parameterized over the register
 //!   tile shape (`tm`, `tn`), so the matmul body uses 4x4 and the gemv body
@@ -32,7 +30,8 @@ use fusor_tile_ir::{QuantizedMatrix, ScalarElement, TileLiteral, WorkgroupAxis};
 
 use crate::kernels::helpers::{dispatch_grid_1d, load_qmatmul_extra, scalar_of, AccumCast};
 use crate::types::{
-    apply_qmatmul_post_epilogue, apply_qmatmul_pre_epilogue, matrix_shape, QmatmulEpilogues,
+    apply_qmatmul_post_epilogue, apply_qmatmul_post_epilogue_values, apply_qmatmul_pre_epilogue,
+    matrix_shape, QmatmulEpilogues,
 };
 
 const QMATMUL_LANES: u32 = 64;
@@ -442,7 +441,7 @@ fn qgemv_workgroup_with_epilogue_impl(
     let staging_cast = AccumCast::new(staging_element, ScalarElement::F32);
 
     let [m, k] = matrix_shape(&a.view().layout);
-    let n = b.cols;
+    let n = epilogues.post_output_cols(b.cols);
     assert_eq!(m, 1, "qgemv_workgroup expects a single input row");
     assert_eq!(k, b.rows, "qgemv K dimensions must match");
     let [y_m, y_n] = matrix_shape(&y.view().layout);
@@ -471,11 +470,11 @@ fn qgemv_workgroup_with_epilogue_impl(
         let row_base = Tile::literal(TileLiteral::U32(0));
         let col_base = n_tile_base.clone() + lane_col.clone() * QGEMV_TN;
 
-        let init: [Tile; QGEMV_TN as usize] =
-            std::array::from_fn(|_| Tile::literal(TileLiteral::f32(0.0)));
-        let sums = program.fold(
+        let post_accumulator_offsets = epilogues.post_accumulator_offsets().to_vec();
+        let post_value_arity = post_accumulator_offsets.len();
+        let sums = program.fold_vec(
             fusor_tile_ir::tile::range(k_tiles),
-            init,
+            vec![Tile::literal(TileLiteral::f32(0.0)); QGEMV_TN as usize * post_value_arity],
             |program, k_tile, accs| {
                 let k_base = k_tile * bk;
                 stage_storage_tile_with_pre(
@@ -494,39 +493,45 @@ fn qgemv_workgroup_with_epilogue_impl(
                     bk,
                     QGEMV_LANES,
                 );
-                program.fill_tile_quantized(&b_tile, &b_clone, k_base, n_tile_base.clone());
-                program.workgroup_barrier();
+                let mut next = accs;
+                for (value_idx, offset) in post_accumulator_offsets.iter().copied().enumerate() {
+                    program.fill_tile_quantized(
+                        &b_tile,
+                        &b_clone,
+                        k_base.clone(),
+                        n_tile_base.clone() + offset,
+                    );
+                    program.workgroup_barrier();
 
-                let chunk_vec = accumulate_register_tile_from_workgroup(
-                    program,
-                    RegisterTileWorkgroups {
-                        a: &a_tile,
-                        b: &b_tile,
-                    },
-                    &staging_cast,
-                    RegisterTileLane {
-                        row: &lane_row,
-                        col: &lane_col,
-                    },
-                    RegisterTileShape {
-                        bn: BN,
-                        bk,
-                        tm: 1,
-                        tn: QGEMV_TN,
-                    },
-                );
-                let mut chunk_iter = chunk_vec.into_iter();
-                let next: [Tile; QGEMV_TN as usize] = std::array::from_fn(|idx| {
-                    let chunk =
-                        program.bind(chunk_iter.next().expect("register tile size matches"));
-                    accs[idx].clone() + chunk
-                });
-                program.workgroup_barrier();
+                    let chunk_vec = accumulate_register_tile_from_workgroup(
+                        program,
+                        RegisterTileWorkgroups {
+                            a: &a_tile,
+                            b: &b_tile,
+                        },
+                        &staging_cast,
+                        RegisterTileLane {
+                            row: &lane_row,
+                            col: &lane_col,
+                        },
+                        RegisterTileShape {
+                            bn: BN,
+                            bk,
+                            tm: 1,
+                            tn: QGEMV_TN,
+                        },
+                    );
+                    for (idx, chunk) in chunk_vec.into_iter().enumerate() {
+                        let accum_idx = idx * post_value_arity + value_idx;
+                        next[accum_idx] = next[accum_idx].clone() + program.bind(chunk);
+                    }
+                    program.workgroup_barrier();
+                }
                 next
             },
         );
 
-        for (idx, sum) in sums.into_iter().enumerate() {
+        for (idx, values) in sums.chunks(post_value_arity).enumerate() {
             let row = Tile::literal(TileLiteral::U32(0));
             let col = col_base.clone() + idx as u32;
             let extras = epilogues
@@ -534,7 +539,11 @@ fn qgemv_workgroup_with_epilogue_impl(
                 .iter()
                 .map(|extra| load_qmatmul_extra(program, extra, &row, &col, n))
                 .collect::<Vec<_>>();
-            let value = apply_qmatmul_post_epilogue(epilogues, sum, extras);
+            let value = if values.len() == 1 {
+                apply_qmatmul_post_epilogue(epilogues, values[0].clone(), extras)
+            } else {
+                apply_qmatmul_post_epilogue_values(epilogues, values.to_vec(), extras)
+            };
             let value = stor_cast.from_accum(value);
             let mask = tile_active.clone().and(col.clone().lt(n));
             program.store(y.at((0u32, col)), value, mask);

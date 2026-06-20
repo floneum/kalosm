@@ -4,9 +4,8 @@
 //! [`Program::program_grid`] call receives a [`TileBlock`] whose expressions
 //! describe one logical lane in the workgroup.
 //!
-//! Runtime-typed (ARBOR_DESIGN.md §2): handles carry an [`ElementType`] as
-//! data, not a Rust marker type, and `program_grid` takes the workgroup
-//! `block` size as a runtime `u32`.
+//! Handles carry an [`ElementType`] as data, and `program_grid` takes the
+//! workgroup `block` size as a runtime `u32`.
 //!
 //! [`ElementType`]: crate::ElementType
 //!
@@ -27,6 +26,7 @@
 //! ```
 
 mod block;
+mod capability;
 mod coop;
 mod grid;
 mod program;
@@ -36,6 +36,7 @@ mod storage;
 mod value;
 
 pub use block::TileBlock;
+pub use capability::{CoopMatrixToken, SubgroupToken};
 pub use grid::build;
 pub use program::Program;
 pub use storage::{Storage, StorageIndex};

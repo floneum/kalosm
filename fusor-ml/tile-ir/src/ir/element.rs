@@ -1,10 +1,9 @@
 //! Runtime element types.
 //!
-//! tile-ir is runtime-typed (see ARBOR_DESIGN.md §2): element types are *data*
-//! carried on `Node.ty`, not Rust marker types or const generics. The typed
-//! frontend (`fusor`) owns compile-time element/shape/rank correctness; this
-//! module only models the runtime element enums and the cooperative-matrix
-//! role (also data, not typestate).
+//! tile-ir carries element types as runtime data on `Node.ty`, not Rust marker
+//! types or const generics. The typed frontend (`fusor`) owns compile-time
+//! element/shape/rank correctness; this module only models the runtime element
+//! enums and the cooperative-matrix role.
 
 /// Scalar elements that can back scalar, vector, and cooperative-matrix IR
 /// values.
@@ -34,9 +33,8 @@ impl ScalarElement {
 
 /// Cooperative-matrix role encoded in an [`ElementType::CoopMatrix`].
 ///
-/// A data enum (not typestate): it collapses the old `CoopOperandRole` +
-/// `CoopRole` chain. Making `{8, 16}` shapes unrepresentable is `fusor`'s job,
-/// not tile-ir's (see ARBOR_DESIGN.md §2/§3).
+/// A data enum, not typestate. Making invalid cooperative-matrix shapes
+/// unrepresentable is `fusor`'s job, not tile-ir's.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CoopMatrixRole {
     /// Left-hand MMA operand.

@@ -1,61 +1,22 @@
+use std::hash::Hash;
+
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
-use fusor_tile_ir_kernels as tile_ir_kernels;
 
+use crate::compute_graph::NodeIndex;
 use crate::mir::inputs::MirValue;
 use crate::mir::operation::Operation;
 use crate::{
     CastTensor, DataType, DataTypeEnum, Device, Layout, LazyTensorData, Tensor, TensorData,
     TensorInfo,
     mir::{
-        kernel_backend,
         kernel_backend::DirectKernel,
         workgroup_shape::{Constraint, WorkgroupShapeConstraints},
     },
-    nary_wise::UnaryFunctionChain,
+    nary_wise::{ElementwiseOperation, NaryExpr, NaryFunction, UnaryFunctionChain},
 };
 
 use super::{QMatrix, QMatrixStorageLayout};
-
-struct DequantizeDirectKernelVariant;
-
-struct QDequantizeKernelParams {
-    matrix_buffer: std::sync::Arc<wgpu::Buffer>,
-    output_buffer: std::sync::Arc<wgpu::Buffer>,
-    output_layout: tile_ir::Layout,
-    output_element: tile_ir::ElementType,
-    format: tile_ir::GgmlQuantFormat,
-    k: u32,
-    n: u32,
-    dispatch_x: u32,
-}
-
-fn emit_qdequantize_kernel(
-    kb: &mut tile_ir::KernelBuilder<std::sync::Arc<wgpu::Buffer>>,
-    params: QDequantizeKernelParams,
-) -> Option<()> {
-    let q = tile_ir_kernels::quantized_matrix_for(
-        kb,
-        params.matrix_buffer,
-        params.format,
-        params.k,
-        params.n,
-    );
-    let y = kb.write(
-        params.output_element,
-        tile_ir::KernelTensorRef::new(params.output_buffer, params.output_layout),
-    );
-    tile_ir_kernels::qdequantize(kb.program(), &q, &y, params.dispatch_x);
-    Some(())
-}
-
-fn datatype_element(datatype: DataTypeEnum) -> Option<tile_ir::ElementType> {
-    Some(match datatype {
-        DataTypeEnum::F32 => tile_ir::ElementType::F32,
-        DataTypeEnum::F16 => tile_ir::ElementType::F16,
-        DataTypeEnum::U32 => return None,
-    })
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct DequantizeOperation {
@@ -72,45 +33,55 @@ impl DequantizeOperation {
             post_dequantize: UnaryFunctionChain::empty(datatype),
         }
     }
+}
 
-    fn direct_quant_format(&self) -> Option<tile_ir::GgmlQuantFormat> {
-        Some(match self.matrix.datatype {
-            GgmlType::Q4_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
-                tile_ir::GgmlQuantFormat::Q4_0Native
-            }
-            GgmlType::Q4_0 => tile_ir::GgmlQuantFormat::Q4_0,
-            GgmlType::Q4_1 => tile_ir::GgmlQuantFormat::Q4_1,
-            GgmlType::Q5_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
-                tile_ir::GgmlQuantFormat::Q5_0Native
-            }
-            GgmlType::Q5_0 => tile_ir::GgmlQuantFormat::Q5_0,
-            GgmlType::Q5_1 => tile_ir::GgmlQuantFormat::Q5_1,
-            GgmlType::Q8_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
-                tile_ir::GgmlQuantFormat::Q8_0Native
-            }
-            GgmlType::Q8_0 => tile_ir::GgmlQuantFormat::Q8_0,
-            GgmlType::Q8_1 => tile_ir::GgmlQuantFormat::Q8_1,
-            GgmlType::Q2K => tile_ir::GgmlQuantFormat::Q2K,
-            GgmlType::Q3K => tile_ir::GgmlQuantFormat::Q3K,
-            GgmlType::Q4K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
-                tile_ir::GgmlQuantFormat::Q4KNative
-            }
-            GgmlType::Q4K => tile_ir::GgmlQuantFormat::Q4K,
-            GgmlType::Q5K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
-                tile_ir::GgmlQuantFormat::Q5KNative
-            }
-            GgmlType::Q5K => tile_ir::GgmlQuantFormat::Q5K,
-            GgmlType::Q6K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
-                tile_ir::GgmlQuantFormat::Q6KNative
-            }
-            GgmlType::Q6K => tile_ir::GgmlQuantFormat::Q6K,
-            GgmlType::Q8K => tile_ir::GgmlQuantFormat::Q8K,
-            GgmlType::F16 | GgmlType::F32 => return None,
-        })
-    }
+/// The tile-ir quantization format for a matrix, accounting for its storage
+/// layout. `None` for dense f16/f32 storage.
+pub(crate) fn quant_format(matrix: &QMatrix) -> Option<tile_ir::GgmlQuantFormat> {
+    Some(match matrix.datatype {
+        GgmlType::Q4_0 if matrix.storage_layout() == QMatrixStorageLayout::Native => {
+            tile_ir::GgmlQuantFormat::Q4_0Native
+        }
+        GgmlType::Q4_0 => tile_ir::GgmlQuantFormat::Q4_0,
+        GgmlType::Q4_1 => tile_ir::GgmlQuantFormat::Q4_1,
+        GgmlType::Q5_0 if matrix.storage_layout() == QMatrixStorageLayout::Native => {
+            tile_ir::GgmlQuantFormat::Q5_0Native
+        }
+        GgmlType::Q5_0 => tile_ir::GgmlQuantFormat::Q5_0,
+        GgmlType::Q5_1 => tile_ir::GgmlQuantFormat::Q5_1,
+        GgmlType::Q8_0 if matrix.storage_layout() == QMatrixStorageLayout::Native => {
+            tile_ir::GgmlQuantFormat::Q8_0Native
+        }
+        GgmlType::Q8_0 => tile_ir::GgmlQuantFormat::Q8_0,
+        GgmlType::Q8_1 => tile_ir::GgmlQuantFormat::Q8_1,
+        GgmlType::Q2K => tile_ir::GgmlQuantFormat::Q2K,
+        GgmlType::Q3K => tile_ir::GgmlQuantFormat::Q3K,
+        GgmlType::Q4K if matrix.storage_layout() == QMatrixStorageLayout::Native => {
+            tile_ir::GgmlQuantFormat::Q4KNative
+        }
+        GgmlType::Q4K => tile_ir::GgmlQuantFormat::Q4K,
+        GgmlType::Q5K if matrix.storage_layout() == QMatrixStorageLayout::Native => {
+            tile_ir::GgmlQuantFormat::Q5KNative
+        }
+        GgmlType::Q5K => tile_ir::GgmlQuantFormat::Q5K,
+        GgmlType::Q6K if matrix.storage_layout() == QMatrixStorageLayout::Native => {
+            tile_ir::GgmlQuantFormat::Q6KNative
+        }
+        GgmlType::Q6K => tile_ir::GgmlQuantFormat::Q6K,
+        GgmlType::Q8K => tile_ir::GgmlQuantFormat::Q8K,
+        GgmlType::F16 | GgmlType::F32 => return None,
+    })
 }
 
 impl Operation for DequantizeOperation {
+    fn hash_kernel_fields(&self, state: &mut rustc_hash::FxHasher) {
+        self.matrix.datatype().hash(state);
+        self.matrix.storage_layout().hash(state);
+        self.matrix.shape().hash(state);
+        self.datatype.hash(state);
+        self.post_dequantize.hash(state);
+    }
+
     fn workgroup_shape_constraints(
         &self,
         _device: &Device,
@@ -153,82 +124,54 @@ impl Operation for DequantizeOperation {
     fn build_direct_kernel(
         &self,
         graph: &crate::compute_graph::ComputeGraphInner,
-        _workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
+        workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
         inputs: &[MirValue],
     ) -> Option<DirectKernel> {
-        if !matches!(self.datatype, DataTypeEnum::F32 | DataTypeEnum::F16)
-            || !self.post_dequantize.functions.is_empty()
-            || (self.datatype == DataTypeEnum::F16 && !graph.device().f16_supported())
+        // Dequantization is the identity expression over one block-quantized
+        // input: the generic n-ary kernel decodes per element through the
+        // format-aware load, and any fused chain rides along.
+        let rank = self.matrix.shape.len();
+        let mut expression = NaryExpr::input(0, rank);
+        let mut current = DataTypeEnum::F32;
+        if self.post_dequantize.input_datatype() != current
+            || self.post_dequantize.out_datatype() != self.datatype
         {
-            return None;
+            expression = NaryExpr::Op {
+                children: vec![expression],
+                function: NaryFunction::unary(
+                    Some("cast".to_string()),
+                    crate::nary_wise::NaryOp::Cast,
+                    current,
+                    self.post_dequantize.input_datatype(),
+                ),
+            };
+            current = self.post_dequantize.input_datatype();
         }
-        let [matrix, output] = inputs else {
-            return None;
+        for function in &self.post_dequantize.functions {
+            expression = NaryExpr::Op {
+                children: vec![expression],
+                function: function.clone(),
+            };
+            current = function.output_type;
+        }
+        if current != self.datatype {
+            expression = NaryExpr::Op {
+                children: vec![expression],
+                function: NaryFunction::unary(
+                    Some("cast".to_string()),
+                    crate::nary_wise::NaryOp::Cast,
+                    current,
+                    self.datatype,
+                ),
+            };
+        }
+        let synthesized = ElementwiseOperation {
+            inputs: vec![NodeIndex::new(0)],
+            expression,
+            shape: self.matrix.shape.clone(),
+            output_datatype: self.datatype,
         };
-        let MirValue::QMatrix(matrix) = matrix else {
-            return None;
-        };
-        let output = output.as_tensor()?;
-        if output.datatype() != self.datatype {
-            return None;
-        }
-
-        let format = self.direct_quant_format()?;
-        let k = *self.matrix.shape.last()? as u32;
-        let n: u32 = self
-            .matrix
-            .shape
-            .iter()
-            .rev()
-            .skip(1)
-            .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
-        let total = k.checked_mul(n)?;
-        let workgroups = total.div_ceil(256);
-        let max_workgroups = graph
-            .device()
-            .limits()
-            .max_compute_workgroups_per_dimension
-            .max(1);
-        let dispatch_x = workgroups.min(max_workgroups);
-        let dispatch_y = workgroups.div_ceil(dispatch_x);
-        if dispatch_y > max_workgroups {
-            return None;
-        }
-        let cache_key = self.kernel_cache_key_with_dispatch(
-            kernel_backend::KernelVariantKey::of::<DequantizeDirectKernelVariant>(),
-            Some(_workgroup_shape),
-            [dispatch_x, dispatch_y, 1],
-            inputs,
-        );
-        let matrix_buffer = matrix.buffer().clone();
-        let output_buffer = output.buffer().clone();
-        let output_layout = tile_ir::Layout::contiguous(
-            tile_ir::MemoryLevel::Storage,
-            tile_ir::Shape::new([total]),
-        );
-        let output_datatype = self.datatype;
-        kernel_backend::run_kernel(
-            graph.device().kernel_cache(),
-            self.name(),
-            cache_key,
-            [dispatch_x, dispatch_y, 1],
-            move |kb| {
-                emit_qdequantize_kernel(
-                    kb,
-                    QDequantizeKernelParams {
-                        matrix_buffer,
-                        output_buffer,
-                        output_layout,
-                        output_element: datatype_element(output_datatype)?,
-                        format,
-                        k,
-                        n,
-                        dispatch_x,
-                    },
-                )?;
-                Some(())
-            },
-        )
+        crate::nary_direct::build_nary_direct_kernel(&synthesized, graph, workgroup_shape, inputs)
     }
 
     fn name(&self) -> String {

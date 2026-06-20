@@ -43,7 +43,11 @@ members = [
     "fusor-ml/tile-ir",
     "fusor-ml/tile-ir-kernels",
     "fusor-ml/tile-ir-runtime",
+    "fusor-ml/webgpu-runner",
 ]
+
+[patch.crates-io]
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now" }
 
 [workspace.dependencies]
 kalosm = { path = "./interfaces/kalosm", version = "0.4.0", default-features = false }
@@ -78,6 +82,7 @@ rand = "0.9"
 criterion = { version = "0.8", features = ["async_futures"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 futures-channel = { version = "0.3.31", default-features = false, features = ["std"] }
+web-time = "1.1.0"
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
@@ -93,6 +98,7 @@ pollster = "0.4"
 serde = { version = "1.0.163", features = ["derive"], optional = true }
 surrealdb = { version = "2.4.0", default-features = false, optional = true }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"], optional = true }
+tracing = { version = "0.1.40", optional = true }
 tracing-subscriber = { version = "0.2", optional = true }
 
 [features]
@@ -157,7 +163,7 @@ tokio = [
     "kalosm/tokio",
     "kalosm-language?/tokio",
 ]
-tracing-subscriber = ["dep:tracing-subscriber"]
+tracing-subscriber = ["dep:tracing-subscriber", "dep:tracing"]
 
 [[example]]
 name = "axum"
@@ -375,7 +381,7 @@ required-features = [
 [[example]]
 name = "vision"
 path = "interfaces/kalosm/examples/vision.rs"
-required-features = ["llama-vision", "tracing-subscriber"]
+required-features = ["llama-vision", "tokio", "tracing-subscriber"]
 
 [profile.dist]
 inherits = "release"

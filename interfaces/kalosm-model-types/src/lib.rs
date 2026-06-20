@@ -1,6 +1,7 @@
 //! Common types for Kalosm models
 
 use std::{fmt::Display, path::PathBuf};
+use web_time::{Duration, Instant};
 
 mod builder;
 pub use builder::ModelBuilder;
@@ -27,7 +28,7 @@ pub enum ModelLoadingProgress {
 #[derive(Clone, Debug)]
 pub struct FileLoadingProgress {
     /// The time stamp the download started. This is None on wasm
-    pub start_time: Option<std::time::Instant>,
+    pub start_time: Option<Instant>,
     /// The size of the cached part of the download in bytes
     pub cached_size: u64,
     /// The size of the download in bytes
@@ -40,7 +41,7 @@ pub struct FileLoadingProgress {
 #[derive(Default)]
 struct LoadingIndicator {
     downloads: std::collections::HashMap<String, FileLoadingProgress>,
-    last_render: Option<std::time::Instant>,
+    last_render: Option<Instant>,
     rendered_line: bool,
     last_loading_percent: Option<u32>,
 }
@@ -62,9 +63,9 @@ impl LoadingIndicator {
     }
 
     fn should_render(&mut self) -> bool {
-        const MIN_RENDER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+        const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(100);
 
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let should_render = match self.last_render {
             Some(last_render) => now.duration_since(last_render) >= MIN_RENDER_INTERVAL,
             None => true,
@@ -140,11 +141,7 @@ fn percent(progress: u64, size: u64) -> f64 {
 }
 
 #[cfg(feature = "loading-progress-bar")]
-fn bytes_per_second(
-    progress: u64,
-    cached_size: u64,
-    start_time: std::time::Instant,
-) -> Option<u64> {
+fn bytes_per_second(progress: u64, cached_size: u64, start_time: Instant) -> Option<u64> {
     let elapsed = start_time.elapsed().as_secs_f64();
     if elapsed <= f64::EPSILON {
         None
@@ -158,15 +155,13 @@ fn estimate_time_remaining(
     progress: u64,
     cached_size: u64,
     size: u64,
-    start_time: std::time::Instant,
-) -> Option<std::time::Duration> {
+    start_time: Instant,
+) -> Option<Duration> {
     let bytes_per_second = bytes_per_second(progress, cached_size, start_time)?;
     if bytes_per_second == 0 || progress >= size {
         None
     } else {
-        Some(std::time::Duration::from_secs(
-            (size - progress) / bytes_per_second,
-        ))
+        Some(Duration::from_secs((size - progress) / bytes_per_second))
     }
 }
 
@@ -192,7 +187,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 #[cfg(feature = "loading-progress-bar")]
-fn format_duration(duration: std::time::Duration) -> String {
+fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
     let hours = seconds / 3600;
     let minutes = (seconds % 3600) / 60;
@@ -240,7 +235,7 @@ impl ModelLoadingProgress {
     }
 
     /// Try to estimate the time remaining for a download
-    pub fn estimate_time_remaining(&self) -> Option<std::time::Duration> {
+    pub fn estimate_time_remaining(&self) -> Option<Duration> {
         match self {
             Self::Downloading {
                 progress: FileLoadingProgress { start_time, .. },
@@ -249,7 +244,7 @@ impl ModelLoadingProgress {
                 let elapsed = start_time.as_ref()?.elapsed();
                 let progress = self.progress();
                 let remaining = (1. - progress) * elapsed.as_secs_f32();
-                Some(std::time::Duration::from_secs_f32(remaining))
+                Some(Duration::from_secs_f32(remaining))
             }
             _ => None,
         }

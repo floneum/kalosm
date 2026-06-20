@@ -1,10 +1,9 @@
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 pub use petgraph::graph::NodeIndex;
 use petgraph::prelude::StableGraph;
 use resolve::Resolver;
-use rustc_hash::FxHashMap;
 #[cfg(feature = "graphvis")]
 use tabbycat::Graph;
 
@@ -17,18 +16,15 @@ mod tests;
 mod visualize;
 
 use crate::{
-    DataTypeEnum, Device, FlashAttentionOperation, MatMulOperation, QMatrix, ReduceOperation,
-    RmsNormOperation,
+    DataTypeEnum, Device, QMatrix, ReduceOperation,
     compute_graph::resolve::ResolverResult,
     dequantize::DequantizeOperation,
-    map_layout::MapLayoutOperation,
     mir::{inputs::MirValue, operation::Operation},
-    nary_wise::NaryOperation,
-    quantized::embedding::QEmbeddingOperation,
+    nary_wise::ElementwiseOperation,
     quantized::matmul::QMatMulOperation,
-    resize::ResizeOperation,
     slice_assign::SliceAssignOperation,
-    tensor::{TensorData, TensorLayoutInfo},
+    tensor::TensorData,
+    view::ViewOperation,
     visit_tiled::MaybeQData,
 };
 
@@ -57,48 +53,45 @@ impl ComputeGraph {
         self.with_mut(|inner| inner.create_node(node))
     }
 
-    pub(crate) fn create_nary(&self, op: NaryOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::Nary(op))
-    }
-
-    pub(crate) fn create_mat_mul(&self, op: MatMulOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::MatMul(op))
-    }
-
-    pub(crate) fn create_q_mat_mul(&self, op: QMatMulOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::QMatMul(Box::new(op)))
-    }
-
-    pub(crate) fn create_q_embedding(&self, op: QEmbeddingOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::QEmbedding(op))
+    pub(crate) fn create_nary(&self, op: ElementwiseOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::Elementwise(op))
     }
 
     pub(crate) fn create_reduce(&self, op: ReduceOperation) -> NodeIndex {
         self.create_node(ComputeGraphNodeVariant::Reduce(op))
     }
 
-    pub(crate) fn create_graph_op(&self, op: Arc<dyn GraphOperation>) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::GraphOp(op))
+    pub(crate) fn create_view(&self, op: ViewOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::View(op))
     }
 
-    pub(crate) fn create_rms_norm(&self, op: RmsNormOperation) -> NodeIndex {
-        self.create_graph_op(Arc::new(op))
+    /// Build and submit one operation immediately against already-cached
+    /// inputs, bypassing the graph. Used by tuning APIs whose kernel
+    /// parameters cannot round-trip through the composed vocabulary.
+    pub(crate) fn execute_eager(&self, operation: &dyn Operation) -> Option<TensorData> {
+        self.with_mut(|inner| inner.execute_eager(operation))
     }
 
-    pub(crate) fn create_flash_attention(&self, op: FlashAttentionOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::FlashAttention(op))
-    }
-
-    pub(crate) fn create_map_layout(&self, op: MapLayoutOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::MapLayout(op))
-    }
-
-    pub(crate) fn create_resize(&self, op: ResizeOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::Resize(op))
+    /// Clone the view at `key` if that node is an unresolved view. Used to
+    /// collapse view chains at construction time. Cached views are excluded:
+    /// a resolved view no longer keeps its base alive, so the base node may
+    /// already be culled from the graph — and a new view over the cached
+    /// buffer is a zero-cost map anyway, while composing past it would force
+    /// a recompute from the (possibly released) base.
+    pub(crate) fn get_view(&self, key: NodeIndex) -> Option<ViewOperation> {
+        let inner = self.inner.read();
+        let node = inner.nodes.nodes.node_weight(key)?;
+        if node.cached.is_some() {
+            return None;
+        }
+        match &node.variant {
+            ComputeGraphNodeVariant::View(op) => Some(op.clone()),
+            _ => None,
+        }
     }
 
     pub(crate) fn create_slice_assign(&self, op: SliceAssignOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::SliceAssign(op))
+        self.create_node(ComputeGraphNodeVariant::Assign(op))
     }
 
     pub(crate) fn create_tensor(&self, op: TensorData) -> NodeIndex {
@@ -106,9 +99,9 @@ impl ComputeGraph {
     }
 
     pub(crate) fn dequantize(&self, matrix: QMatrix, ty: DataTypeEnum) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::Dequantize(
-            DequantizeOperation::new(matrix, ty),
-        ))
+        self.create_node(ComputeGraphNodeVariant::QMatrix(DequantizeOperation::new(
+            matrix, ty,
+        )))
     }
 
     pub(crate) fn resolve(&self, key: NodeIndex) -> ResolverResult {
@@ -150,6 +143,51 @@ impl ComputeGraph {
         drop(removed);
 
         data
+    }
+
+    pub(crate) fn resolve_with_tail<T>(
+        &self,
+        key: NodeIndex,
+        tail: impl FnOnce(&TensorData, &mut wgpu::CommandEncoder) -> T,
+    ) -> (ResolverResult, T) {
+        if let Some(data) = {
+            let inner = self.inner.read();
+            inner.get_cached_result(key).cloned()
+        } {
+            let device = data.device().clone();
+            let mut command_encoder =
+                device
+                    .wgpu_device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Resolver Tail Encoder"),
+                    });
+            let tail_result = tail(&data, &mut command_encoder);
+            device.wgpu_queue().submit(Some(command_encoder.finish()));
+            device.reset_initialized_buffers();
+            return (
+                ResolverResult {
+                    data,
+                    total_kernels: 0,
+                },
+                tail_result,
+            );
+        }
+
+        let (data, removed, tail_result) = {
+            let mut inner = self.inner.write();
+            let mut removed = Vec::new();
+            let mut resolver = Resolver::new(&mut inner, key);
+            let (data, tail_result) = resolver.run_with_tail(&mut inner, &mut removed, tail);
+            inner.try_auto_flush(&mut removed);
+            #[cfg(feature = "extra_assertions")]
+            {
+                inner.verify_integrity()
+            }
+            (data, removed, tail_result)
+        };
+        drop(removed);
+
+        (data, tail_result)
     }
 
     #[cfg(feature = "graphvis")]
@@ -265,75 +303,44 @@ impl ComputeGraphNode {
 }
 
 pub(crate) trait GraphOperation: Operation + Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-
     fn category(&self) -> &'static str;
-
-    fn output_layout(
-        &self,
-        input_layouts: &FxHashMap<NodeIndex, TensorLayoutInfo>,
-    ) -> Option<TensorLayoutInfo>;
 }
 
+/// The graph vocabulary. Exactly three core operations — elementwise
+/// visitation, reduction, and zero-dispatch views — over tensor and
+/// quantized-matrix leaves, plus the in-place region write (pure data
+/// movement, no compute dispatch). Everything else (matmul, attention,
+/// normalization, embedding...) is a composition of these that the resolver
+/// recognizes into fused execution regions.
 #[derive(Clone, Debug)]
 pub(crate) enum ComputeGraphNodeVariant {
-    Nary(NaryOperation),
-    SliceAssign(SliceAssignOperation),
-    Resize(ResizeOperation),
-    MapLayout(MapLayoutOperation),
-    Dequantize(DequantizeOperation),
-    QEmbedding(QEmbeddingOperation),
-    MatMul(MatMulOperation),
-    QMatMul(Box<QMatMulOperation>),
     Tensor(TensorData),
+    QMatrix(DequantizeOperation),
+    Elementwise(ElementwiseOperation),
     Reduce(ReduceOperation),
-    FlashAttention(FlashAttentionOperation),
-    GraphOp(Arc<dyn GraphOperation>),
+    View(ViewOperation),
+    Assign(SliceAssignOperation),
 }
 
 impl ComputeGraphNodeVariant {
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
         match &self {
-            ComputeGraphNodeVariant::Nary(op) => {
+            ComputeGraphNodeVariant::Elementwise(op) => {
                 for input in &op.inputs {
                     f(*input);
                 }
             }
-            ComputeGraphNodeVariant::MatMul(op) => {
-                f(op.first);
-                f(op.second);
-            }
-            ComputeGraphNodeVariant::QMatMul(op) => {
-                f(op.input);
-                if let Some(epilogue) = &op.pre_element_wise_expr {
-                    for extra in &epilogue.extras {
-                        f(*extra);
-                    }
-                }
-                if let Some(epilogue) = &op.post_element_wise_expr {
-                    for extra in &epilogue.extras {
-                        f(*extra);
-                    }
-                }
-                if let Some(paired) = &op.paired {
-                    for extra in &paired.extras {
-                        f(*extra);
-                    }
+            ComputeGraphNodeVariant::Reduce(op) => {
+                for input in &op.inputs {
+                    f(*input);
                 }
             }
-            ComputeGraphNodeVariant::QEmbedding(op) => {
-                f(op.indexes);
-            }
-            ComputeGraphNodeVariant::Reduce(op) => f(op.value),
-            ComputeGraphNodeVariant::FlashAttention(op) => op.visit_dependencies(f),
-            ComputeGraphNodeVariant::GraphOp(op) => op.visit_dependencies(f),
-            ComputeGraphNodeVariant::MapLayout(op) => f(op.input),
-            ComputeGraphNodeVariant::Resize(op) => f(op.input),
-            ComputeGraphNodeVariant::SliceAssign(op) => {
+            ComputeGraphNodeVariant::View(op) => f(op.input),
+            ComputeGraphNodeVariant::Assign(op) => {
                 f(op.input);
                 f(op.value);
             }
-            ComputeGraphNodeVariant::Dequantize(_) => {}
+            ComputeGraphNodeVariant::QMatrix(_) => {}
             ComputeGraphNodeVariant::Tensor(_) => {}
         }
     }
@@ -566,11 +573,31 @@ impl ComputeGraphInner {
         Some((output, total_kernels))
     }
 
-    fn try_resolve_direct_qmatmul(&mut self, key: NodeIndex) -> Option<ResolverResult> {
-        let operation = match self.nodes.nodes.node_weight(key)?.variant.clone() {
-            ComputeGraphNodeVariant::QMatMul(operation) => operation,
-            _ => return None,
+    fn execute_eager(&mut self, operation: &dyn Operation) -> Option<TensorData> {
+        let device = self.device();
+        let inputs = operation.inputs(self);
+        let workgroup_shape = operation
+            .workgroup_shape_constraints(&device)
+            .solve(device.max_subgroup_size(), &device.limits())?;
+        let kernel = operation.build_direct_kernel(self, &workgroup_shape, &inputs)?;
+        let MirValue::Tensor(output) = operation.output(self, &inputs) else {
+            return None;
         };
+
+        let mut command_encoder =
+            device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Eager Operation Encoder"),
+                });
+        kernel.run(device.kernel_cache(), &mut command_encoder);
+        device.wgpu_queue().submit(Some(command_encoder.finish()));
+        device.reset_initialized_buffers();
+        Some(output)
+    }
+
+    fn try_resolve_direct_qmatmul(&mut self, key: NodeIndex) -> Option<ResolverResult> {
+        let operation = self.match_direct_qmatmul(key)?;
         let (output, total_kernels) = self.try_submit_direct_qmatmul(&operation)?;
         self.set_cached_result(key, output.clone());
         Some(ResolverResult {
@@ -636,7 +663,7 @@ impl ComputeGraphInner {
             return Some(cached.clone().into());
         }
         match &node.variant {
-            ComputeGraphNodeVariant::Dequantize(op) => Some(op.matrix.clone().into()),
+            ComputeGraphNodeVariant::QMatrix(op) => Some(op.matrix.clone().into()),
             ComputeGraphNodeVariant::Tensor(op) => Some(op.clone().into()),
             _ => None,
         }
@@ -715,15 +742,21 @@ impl ComputeGraphInner {
             }
         }
 
-        // Check that all dependencies of non-cached nodes exist
+        // Check that all dependencies of non-cached nodes that could still
+        // resolve exist. A dead uncached node (no references and no alive
+        // descendants — e.g. an intermediate whose buffer was released after
+        // its handle dropped) is unreachable by any future resolve: resolves
+        // start from a live handle, and everything alive transitively keeps
+        // its dependencies' `live_descendant_count` positive. Its
+        // dependencies may therefore be legitimately removed from under it.
         for key in self.nodes.nodes.node_indices() {
-            let is_cached = self
+            let resolvable = self
                 .nodes
                 .nodes
                 .node_weight(key)
-                .map(|n| n.cached.is_some())
+                .map(|n| n.cached.is_none() && n.should_keep_cached())
                 .unwrap_or(false);
-            if is_cached {
+            if !resolvable {
                 continue;
             }
             self.visit_dependencies(key, &mut |dependency| {

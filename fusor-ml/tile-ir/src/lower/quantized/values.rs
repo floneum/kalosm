@@ -9,11 +9,9 @@ impl<'a> Lowerer<'a> {
         col: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        let block_elems = matrix.format.block_elements();
         let block_words = matrix.format.block_words();
-        let block = self.div_literal_u32_emitted(expressions, k, block_elems, body);
-        let q = self.and_lit(expressions, body, k, block_elems - 1);
-        let base = self.quantized_block_base(expressions, matrix, block, col, block_words, body);
+        let (base, q) =
+            self.quantized_flat_block_base_and_q(expressions, matrix, k, col, block_words, body);
         let value = if let Some(spec) = AffineDequantSpec::for_format(matrix.format) {
             self.dequant_affine(expressions, matrix, base, q, spec, body)?
         } else {
@@ -113,12 +111,10 @@ impl<'a> Lowerer<'a> {
         col: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Q8_0BlockParts, LowerError> {
-        let block = self.div_literal_u32_emitted(expressions, k_base, 32, body);
-        let q = self.and_lit(expressions, body, k_base, 31);
-        let base = self.quantized_block_base(
+        let (base, q) = self.quantized_flat_block_base_and_q(
             expressions,
             matrix,
-            block,
+            k_base,
             col,
             matrix.format.block_words(),
             body,
@@ -181,12 +177,10 @@ impl<'a> Lowerer<'a> {
             ));
         }
 
-        let block = self.div_literal_u32_emitted(expressions, k_base, 256, body);
-        let q_base = self.and_lit(expressions, body, k_base, 255);
-        let base = self.quantized_block_base(
+        let (base, q_base) = self.quantized_flat_block_base_and_q(
             expressions,
             matrix,
-            block,
+            k_base,
             col,
             matrix.format.block_words(),
             body,
@@ -249,12 +243,10 @@ impl<'a> Lowerer<'a> {
             ));
         }
 
-        let block = self.div_literal_u32_emitted(expressions, k_base, 32, body);
-        let q_base = self.and_lit(expressions, body, k_base, 31);
-        let base = self.quantized_block_base(
+        let (base, q_base) = self.quantized_flat_block_base_and_q(
             expressions,
             matrix,
-            block,
+            k_base,
             col,
             matrix.format.block_words(),
             body,
@@ -331,12 +323,10 @@ impl<'a> Lowerer<'a> {
         col: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Q6KBlockParts, LowerError> {
-        let block = self.div_literal_u32_emitted(expressions, k_base, 256, body);
-        let q_base = self.and_lit(expressions, body, k_base, 255);
-        let base = self.quantized_block_base(
+        let (base, q_base) = self.quantized_flat_block_base_and_q(
             expressions,
             matrix,
-            block,
+            k_base,
             col,
             matrix.format.block_words(),
             body,

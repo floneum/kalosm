@@ -1,43 +1,57 @@
-use std::{
-    collections::VecDeque,
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, str::FromStr, sync::Arc};
+
+use web_time::{Duration, Instant};
 
 use crate::{
     DataTypeEnum, Layout,
     compute_graph::layout_pass::LayoutPass,
     mir::{inputs::MirValue, kernel_backend::PreparedDirectDispatch, operation::Operation},
-    nary_direct::eval_nary_expr_on_tiles,
-    nary_wise::{ExtractedUnaryChain, NaryExpr, NaryOperation, UnaryFunctionChain},
+    nary_wise::{
+        ElementwiseOperation, ExtractedUnaryChain, NaryExpr, NaryOp, NaryScalar, UnaryFunctionChain,
+    },
     quantized::matmul::{ElementwiseEpilogue, QMatMulOperation},
     tensor::TensorData,
 };
-use fusor_gguf::GgmlType;
 use petgraph::algo::toposort;
 use petgraph::stable_graph::StableGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{ComputeGraphInner, ComputeGraphNode, ComputeGraphNodeVariant, NodeIndex};
+use super::{
+    ComputeGraphInner, ComputeGraphNode, ComputeGraphNodeVariant, GraphOperation, NodeIndex,
+};
+use crate::{
+    MatMulOperation, ReduceOperation, dequantize::DequantizeOperation,
+    quantized::embedding::QEmbeddingOperation, slice_assign::SliceAssignOperation,
+    view::ViewOperation,
+};
 
+mod cluster_match;
 mod execution;
+mod fold_views;
 mod fusion_basic;
 mod fusion_matmul;
-mod fusion_paired;
+mod fusion_row;
+mod plan_cache;
+mod recognize;
+mod recognize_attention;
+mod recognize_cat;
 mod run;
+
+pub(crate) use plan_cache::structural_kernel_key;
 
 pub(crate) struct ResolverResult {
     pub(crate) data: TensorData,
     pub(crate) total_kernels: usize,
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 struct DispatchRecord {
     dispatch: PreparedDirectDispatch,
-    name: Option<String>,
+    name: String,
     category: Option<String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct DispatchMetadata {
     name: Option<String>,
     category: Option<String>,
@@ -77,6 +91,7 @@ impl QueuedOperation {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 struct KernelProfileAggregate {
     count: usize,
@@ -84,6 +99,7 @@ struct KernelProfileAggregate {
     max_ns: f64,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl KernelProfileAggregate {
     fn record(&mut self, ns: f64) {
         self.count += 1;
@@ -133,21 +149,15 @@ struct OptimizeProfile {
     fuse_reduce: Duration,
     fuse_matmul_count: usize,
     fuse_matmul: Duration,
-    fuse_paired_qmatmul_count: usize,
-    fuse_paired_qmatmul: Duration,
-    fuse_rmsnorm_count: usize,
-    fuse_rmsnorm: Duration,
 }
 
 impl OptimizeProfile {
     fn print(&self) {
-        eprintln!(
+        tracing::info!(
             "resolve_optimize_profile iterations={} changed={} \
 fuse_naries_count={} fuse_naries={:?} \
 fuse_reduce_count={} fuse_reduce={:?} \
-fuse_matmul_count={} fuse_matmul={:?} \
-fuse_paired_qmatmul_count={} fuse_paired_qmatmul={:?} \
-fuse_rmsnorm_count={} fuse_rmsnorm={:?}",
+fuse_matmul_count={} fuse_matmul={:?}",
             self.iterations,
             self.changed,
             self.fuse_naries_count,
@@ -156,15 +166,12 @@ fuse_rmsnorm_count={} fuse_rmsnorm={:?}",
             self.fuse_reduce,
             self.fuse_matmul_count,
             self.fuse_matmul,
-            self.fuse_paired_qmatmul_count,
-            self.fuse_paired_qmatmul,
-            self.fuse_rmsnorm_count,
-            self.fuse_rmsnorm,
         );
     }
 }
 
 const DEFAULT_OPTIMIZE_NODE_LIMIT: usize = 512;
+const LARGE_GRAPH_NARY_FUSION_MIN_LAST_DIM: usize = 512;
 
 fn optimize_node_limit() -> usize {
     std::env::var("FUSOR_RESOLVE_OPTIMIZE_MAX_NODES")
@@ -175,7 +182,7 @@ fn optimize_node_limit() -> usize {
 
 impl ResolveHostProfile {
     fn print(&self, total: Duration, queued_ops: usize, kernels: usize) {
-        eprintln!(
+        tracing::info!(
             "resolve_host_profile queued_ops={queued_ops} kernels={kernels} total={total:?} \
 build_execution_graph={:?} optimize={:?} toposort={:?} queue_lowering={:?} \
 consumer_count={:?} encoder_create={:?} map_layout={:?} inputs={:?} output={:?} \
@@ -218,43 +225,72 @@ fn print_host_category_profile(profile: FxHashMap<&'static str, ResolveHostCateg
         })
         .collect::<Vec<_>>();
     profile.sort_by_key(|entry| std::cmp::Reverse(entry.5));
-    eprintln!("resolve_host_category_profile {profile:?}");
+    tracing::info!("resolve_host_category_profile {profile:?}");
 }
 
-fn node_category(variant: &ComputeGraphNodeVariant) -> &'static str {
+fn node_category_inner(variant: &ComputeGraphNodeVariant) -> &'static str {
     match variant {
-        ComputeGraphNodeVariant::Nary(_) => "nary",
-        ComputeGraphNodeVariant::SliceAssign(_) => "slice_assign",
-        ComputeGraphNodeVariant::Resize(_) => "resize",
-        ComputeGraphNodeVariant::MapLayout(_) => "map_layout",
-        ComputeGraphNodeVariant::Dequantize(_) => "dequantize",
-        ComputeGraphNodeVariant::QEmbedding(_) => "q_embedding",
-        ComputeGraphNodeVariant::MatMul(_) => "matmul",
-        ComputeGraphNodeVariant::QMatMul(op) => {
-            if op.paired.is_some() {
-                "q_mat_paired"
-            } else {
-                "q_matmul"
-            }
-        }
         ComputeGraphNodeVariant::Tensor(_) => "tensor",
+        ComputeGraphNodeVariant::QMatrix(_) => "q_matrix",
+        ComputeGraphNodeVariant::Elementwise(_) => "elementwise",
         ComputeGraphNodeVariant::Reduce(_) => "reduce",
-        ComputeGraphNodeVariant::FlashAttention(_) => "flash_attention",
-        ComputeGraphNodeVariant::GraphOp(op) => op.category(),
+        ComputeGraphNodeVariant::View(_) => "view",
+        ComputeGraphNodeVariant::Assign(_) => "assign",
     }
 }
 
-fn as_rms_norm(variant: &ComputeGraphNodeVariant) -> Option<&crate::RmsNormOperation> {
-    let ComputeGraphNodeVariant::GraphOp(op) = variant else {
-        return None;
-    };
-    op.as_any().downcast_ref::<crate::RmsNormOperation>()
+#[allow(dead_code, reason = "execution-side category labeling for profiling")]
+fn node_category(variant: &ExecutionVariant) -> &'static str {
+    match variant {
+        ExecutionVariant::Elementwise(_) => "nary",
+        ExecutionVariant::Assign(_) => "slice_assign",
+        ExecutionVariant::View(_) => "view",
+        ExecutionVariant::QMatrix(_) => "dequantize",
+        ExecutionVariant::QEmbedding(_) => "q_embedding",
+        ExecutionVariant::MatMul(_) => "matmul",
+        ExecutionVariant::QMatMul(_) => "q_matmul",
+        ExecutionVariant::Tensor(_) => "tensor",
+        ExecutionVariant::Reduce(_) => "reduce",
+        ExecutionVariant::GraphOp(op) => op.category(),
+    }
+}
+
+/// What an execution-graph node lowers to. The graph vocabulary (the first
+/// six variants) enters verbatim; the region variants exist only here —
+/// recognition rebuilds them from composed clusters, and fusion enriches
+/// them with epilogues.
+#[derive(Debug, Clone)]
+pub(crate) enum ExecutionVariant {
+    Tensor(crate::tensor::TensorData),
+    QMatrix(DequantizeOperation),
+    Elementwise(ElementwiseOperation),
+    Reduce(ReduceOperation),
+    View(ViewOperation),
+    Assign(SliceAssignOperation),
+    // Recognized regions.
+    MatMul(MatMulOperation),
+    QMatMul(Box<QMatMulOperation>),
+    QEmbedding(QEmbeddingOperation),
+    GraphOp(Arc<dyn GraphOperation>),
+}
+
+impl From<ComputeGraphNodeVariant> for ExecutionVariant {
+    fn from(variant: ComputeGraphNodeVariant) -> Self {
+        match variant {
+            ComputeGraphNodeVariant::Tensor(op) => Self::Tensor(op),
+            ComputeGraphNodeVariant::QMatrix(op) => Self::QMatrix(op),
+            ComputeGraphNodeVariant::Elementwise(op) => Self::Elementwise(op),
+            ComputeGraphNodeVariant::Reduce(op) => Self::Reduce(op),
+            ComputeGraphNodeVariant::View(op) => Self::View(op),
+            ComputeGraphNodeVariant::Assign(op) => Self::Assign(op),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 struct ExecutionNode {
     inner_idx: NodeIndex,
-    variant: ComputeGraphNodeVariant,
+    variant: ExecutionVariant,
 }
 
 type ExecutionGraph = StableGraph<ExecutionNode, ()>;
@@ -269,6 +305,7 @@ fn padded_query_buffer_size(size: u64) -> u64 {
     ((size + align_mask) & !align_mask).max(wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn print_gpu_kernel_profile(
     records: &[DispatchMetadata],
     timestamps: &[u64],
@@ -329,7 +366,7 @@ fn print_gpu_kernel_profile(
     names.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     names.truncate(32);
 
-    eprintln!(
+    tracing::info!(
         "resolve_gpu_kernel_profile mode={} kernels={} accounted_ms={:.3} span_ms={:.3} timestamp_period_ns={:.3}",
         timestamp_mode,
         records.len(),
@@ -337,14 +374,18 @@ fn print_gpu_kernel_profile(
         span_ns / 1_000_000.0,
         timestamp_period_ns
     );
-    eprintln!("resolve_gpu_kernel_categories {categories:?}");
-    eprintln!("resolve_gpu_kernel_top_names {names:?}");
+    tracing::info!("resolve_gpu_kernel_categories {categories:?}");
+    tracing::info!("resolve_gpu_kernel_top_names {names:?}");
 }
 
 pub(crate) struct Resolver {
     execution_graph: ExecutionGraph,
     node_mapping: FxHashMap<NodeIndex, ExecutionNodeIndex>,
-    layout_cache: FxHashMap<NodeIndex, Option<crate::TensorLayoutInfo>>,
+    // Persistent memoized layout inference: the inner graph's node variants
+    // are immutable during optimization (rewrites only touch the execution
+    // graph and dependency edges), so layouts computed once stay valid for
+    // the whole resolve.
+    layout_pass: LayoutPass,
     targets: Vec<NodeIndex>,
     resolved_set: FxHashSet<NodeIndex>,
 }
@@ -372,7 +413,7 @@ impl Resolver {
             targets,
             execution_graph: Default::default(),
             node_mapping: Default::default(),
-            layout_cache: Default::default(),
+            layout_pass: Default::default(),
             resolved_set,
         }
     }

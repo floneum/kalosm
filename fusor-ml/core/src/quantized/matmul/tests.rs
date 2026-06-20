@@ -24,11 +24,29 @@ mod selection_tests {
         }
     }
 
-    fn ctx(format: tile_ir::GgmlQuantFormat, y_supports_coop: bool) -> QMatmulDirectCtx {
-        QMatmulDirectCtx {
-            format,
-            y_supports_coop,
+    fn no_subgroup_caps(high_tile_limits: bool) -> KernelDeviceCaps {
+        KernelDeviceCaps {
+            subgroups_supported: false,
+            cooperative_matrix: CooperativeMatrixCaps::default(),
+            ..caps(high_tile_limits)
         }
+    }
+
+    fn variable_subgroup_caps(high_tile_limits: bool) -> KernelDeviceCaps {
+        KernelDeviceCaps {
+            cooperative_matrix: CooperativeMatrixCaps::default(),
+            min_subgroup_size: 8,
+            max_subgroup_size: 32,
+            ..caps(high_tile_limits)
+        }
+    }
+
+    fn ctx(format: tile_ir::GgmlQuantFormat) -> QMatmulDirectCtx {
+        QMatmulDirectCtx { format }
+    }
+
+    const fn qtile(bm: u32, bn: u32) -> CoopTile {
+        CoopTile::new(bm, bn, QMATMUL_COOP_BK)
     }
 
     #[test]
@@ -38,55 +56,56 @@ mod selection_tests {
         let cases = [
             (
                 QMatmulPath::Q5SmallSingleRow,
-                ctx(tile_ir::GgmlQuantFormat::Q5_0, false),
+                ctx(tile_ir::GgmlQuantFormat::Q5_0),
                 caps(false),
             ),
-            (QMatmulPath::SingleRow, ctx(q4, false), caps(false)),
+            (QMatmulPath::SingleRow, ctx(q4), caps(false)),
             (
-                QMatmulPath::Q8Wide(QCoopTile::new(64, 128)),
-                ctx(tile_ir::GgmlQuantFormat::Q8_0, true),
+                QMatmulPath::Q8Wide(qtile(64, 128)),
+                ctx(tile_ir::GgmlQuantFormat::Q8_0),
                 caps(true),
             ),
             (
                 QMatmulPath::Tile {
-                    tile: QCoopTile::new(128, 128),
+                    tile: qtile(128, 128),
                     cached: false,
                 },
-                ctx(q4, true),
+                ctx(q4),
                 caps(true),
             ),
             (
                 QMatmulPath::Tile {
-                    tile: QCoopTile::new(128, 64),
+                    tile: qtile(128, 64),
                     cached: false,
                 },
-                ctx(q4, true),
+                ctx(q4),
                 caps(false),
             ),
             (
                 QMatmulPath::Tile {
-                    tile: QCoopTile::new(64, 128),
+                    tile: qtile(64, 128),
                     cached: false,
                 },
-                ctx(q4, true),
+                ctx(q4),
                 caps(false),
             ),
             (
                 QMatmulPath::Tile {
-                    tile: QCoopTile::new(64, 64),
+                    tile: qtile(64, 64),
                     cached: true,
                 },
-                ctx(q4, true),
+                ctx(q4),
                 caps(false),
             ),
             (
                 QMatmulPath::Tile {
-                    tile: QCoopTile::new(64, 64),
+                    tile: qtile(64, 64),
                     cached: false,
                 },
-                ctx(q4, false),
+                ctx(q4),
                 caps(false),
             ),
+            (QMatmulPath::Workgroup, ctx(q4), no_coop_caps(false)),
         ];
         assert_selector_generates(&selector, cases);
     }
@@ -97,9 +116,13 @@ mod selection_tests {
         let shape = KernelShape::new([128, 4096, 5120]);
         let q4k = tile_ir::GgmlQuantFormat::Q4K;
         assert_eq!(
-            selector.select(shape, &ctx(q4k, true), no_coop_caps(true)),
+            selector.select(shape, &ctx(q4k), no_coop_caps(true)),
+            Some(QMatmulPath::Workgroup)
+        );
+        assert_eq!(
+            selector.select(shape, &ctx(q4k), caps(true)),
             Some(QMatmulPath::Tile {
-                tile: QCoopTile::new(64, 64),
+                tile: qtile(128, 128),
                 cached: false
             })
         );
@@ -115,10 +138,49 @@ mod selection_tests {
     }
 
     #[test]
+    fn single_row_direct_path_requires_trusted_runtime_subgroups_not_coop_matrix() {
+        let format = tile_ir::GgmlQuantFormat::Q4K;
+        let k = 4096;
+        let n = 8192;
+        let qgemv_supported = |caps| qgemv_subgroup_supported(format, k, n, caps);
+
+        assert!(!qmatmul_path_requires_coop(QMatmulPath::SingleRow));
+        assert!(!qmatmul_path_requires_coop(QMatmulPath::Q5SmallSingleRow));
+        assert!(!qmatmul_path_requires_coop(QMatmulPath::Workgroup));
+        assert!(qmatmul_path_requires_coop(QMatmulPath::Tile {
+            tile: qtile(64, 64),
+            cached: false,
+        }));
+        assert!(qgemv_supported(no_coop_caps(false)));
+        assert!(qgemv_supported(variable_subgroup_caps(false)));
+
+        let selector = qmatmul_direct_selector();
+        let caps = no_coop_caps(false);
+        assert!(caps.subgroups_supported);
+        assert!(!qmatmul_coop_supported(caps));
+        assert_eq!(
+            selector.select(
+                KernelShape::new([1, 4096, 8192]),
+                &ctx(tile_ir::GgmlQuantFormat::Q4K),
+                caps,
+            ),
+            Some(QMatmulPath::SingleRow)
+        );
+        assert_eq!(
+            selector.select(
+                KernelShape::new([1, 4096, 8192]),
+                &ctx(tile_ir::GgmlQuantFormat::Q4K),
+                no_subgroup_caps(false),
+            ),
+            Some(QMatmulPath::Workgroup)
+        );
+    }
+
+    #[test]
     fn coop_acc_init_only_claims_shapes_the_coop_path_will_take() {
         assert!(qmatmul_variant_supports_coop_acc_init(
             QMatmulPath::Tile {
-                tile: QCoopTile::new(64, 128),
+                tile: qtile(64, 128),
                 cached: false
             },
             64,
@@ -128,7 +190,7 @@ mod selection_tests {
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
             QMatmulPath::Tile {
-                tile: QCoopTile::new(64, 128),
+                tile: qtile(64, 128),
                 cached: false
             },
             63,
@@ -138,7 +200,7 @@ mod selection_tests {
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
             QMatmulPath::Tile {
-                tile: QCoopTile::new(64, 64),
+                tile: qtile(64, 64),
                 cached: false
             },
             2,
@@ -148,7 +210,7 @@ mod selection_tests {
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
             QMatmulPath::Tile {
-                tile: QCoopTile::new(64, 128),
+                tile: qtile(64, 128),
                 cached: false
             },
             64,
@@ -158,7 +220,7 @@ mod selection_tests {
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
             QMatmulPath::Tile {
-                tile: QCoopTile::new(64, 128),
+                tile: qtile(64, 128),
                 cached: false
             },
             64,
@@ -167,6 +229,54 @@ mod selection_tests {
             false,
         ));
     }
+
+    #[test]
+    fn custom_accumulator_offsets_must_cover_output_width() {
+        assert!(qmatmul_custom_accumulator_offsets_cover_output(1, 9, 10, 1));
+        assert!(qmatmul_custom_accumulator_offsets_cover_output(
+            1, 10, 10, 0
+        ));
+        assert!(!qmatmul_custom_accumulator_offsets_cover_output(
+            1, 5, 10, 1
+        ));
+        assert!(!qmatmul_custom_accumulator_offsets_cover_output(
+            1, 10, 10, 1
+        ));
+        assert!(!qmatmul_custom_accumulator_offsets_cover_output(
+            1,
+            u32::MAX,
+            10,
+            1
+        ));
+        assert!(!qmatmul_custom_accumulator_offsets_cover_output(
+            2, 9, 10, 1
+        ));
+    }
+
+    #[test]
+    fn indexed_post_accumulator_offsets_require_subgroup_direct_qgemv_support() {
+        let format = tile_ir::GgmlQuantFormat::Q4KNative;
+        let m = 1;
+        let k = 4096;
+        let n = 4096;
+        let supported = |caps, max_workgroups| {
+            let variant = select_qmatmul_direct_variant(format, m, k, n, caps);
+            qmatmul_custom_accumulator_offsets_supported(
+                format,
+                variant,
+                m,
+                k,
+                n,
+                n * 2,
+                n,
+                max_workgroups,
+            )
+        };
+
+        assert!(supported(caps(false), 65_535));
+        assert!(!supported(no_subgroup_caps(false), 65_535));
+        assert!(!supported(caps(false), 1));
+    }
 }
 
 #[cfg(test)]
@@ -174,13 +284,11 @@ mod selection_tests {
 mod tests {
     use std::{mem::size_of, sync::Arc};
 
-    use fusor_gguf::{BlockQ4_0, BlockQ4K, BlockQ5K, BlockQ6K, BlockQ8_0, GgufBlock};
+    use fusor_gguf::{BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, GgufBlock};
+    use fusor_tile_ir_runtime::DirectKernelBinding;
 
     use super::*;
-    use crate::{
-        compute_graph::ComputeGraphInner, mir::kernel_backend::DirectKernelBinding,
-        mir::workgroup_shape::WorkgroupShape,
-    };
+    use crate::{compute_graph::ComputeGraphInner, mir::workgroup_shape::WorkgroupShape};
 
     fn push_f16(bytes: &mut Vec<u8>, value: f32) {
         bytes.extend_from_slice(&half::f16::from_f32(value).to_le_bytes());
@@ -275,7 +383,7 @@ mod tests {
                 out_shape: Box::new([1, weight_shape[0]]),
                 pre_element_wise_expr: None,
                 post_element_wise_expr: None,
-                paired: None,
+                post_accumulator_offsets: Box::new([]),
             };
             let kernel = operation
                 .build_direct_kernel(
@@ -326,7 +434,7 @@ mod tests {
                 out_shape: output_shape.into(),
                 pre_element_wise_expr: None,
                 post_element_wise_expr: None,
-                paired: None,
+                post_accumulator_offsets: Box::new([]),
             };
 
             operation
@@ -367,6 +475,34 @@ mod tests {
         });
     }
 
+    fn patterned_q8_0_bytes(shape: [usize; 2]) -> Vec<u8> {
+        let block_count = shape.iter().product::<usize>() / BlockQ8_0::BLOCK_SIZE;
+        let mut bytes = Vec::with_capacity(block_count * size_of::<BlockQ8_0>());
+        for block in 0..block_count {
+            push_f16(&mut bytes, 0.01);
+            for i in 0..BlockQ8_0::WEIGHTS_SIZE {
+                let value = (((block * 5 + i * 3) % 64) as i32 - 32) as i8;
+                bytes.push(value as u8);
+            }
+        }
+        bytes
+    }
+
+    fn patterned_q5_0_bytes(shape: [usize; 2]) -> Vec<u8> {
+        let block_count = shape.iter().product::<usize>() / BlockQ5_0::BLOCK_SIZE;
+        let mut bytes = Vec::with_capacity(block_count * size_of::<BlockQ5_0>());
+        for block in 0..block_count {
+            push_f16(&mut bytes, 0.01);
+            for i in 0..BlockQ5_0::WEIGHTS_HIGH_BITS_SIZE {
+                bytes.push(((block * 7 + i * 13) & 0xFF) as u8);
+            }
+            for i in 0..BlockQ5_0::WEIGHTS_LOW_BITS_SIZE {
+                bytes.push(packed_nibble_byte(block + i, block * 2 + i + 1));
+            }
+        }
+        bytes
+    }
+
     #[test]
     fn q4k_native_dequantize_matches_patterned_blocks() {
         pollster::block_on(async {
@@ -398,6 +534,416 @@ mod tests {
                         "row={row} offset={offset} actual={actual} expected={expected}"
                     );
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn q4k_large_single_row_qgemv_handles_tail_columns_with_subgroups() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            if !device.subgroups_supported() {
+                return;
+            }
+
+            let weight_shape = [8193usize, 4096usize];
+            let blocks_per_row = weight_shape[1] / BlockQ4K::BLOCK_SIZE;
+            let raw_bytes = patterned_q4k_bytes(weight_shape);
+            let matrix =
+                QMatrix::from_parts(&device, &raw_bytes, weight_shape.into(), GgmlType::Q4K)
+                    .unwrap();
+            let blocks: &[BlockQ4K] = bytemuck::cast_slice(&raw_bytes);
+            let input_values = (0..weight_shape[1])
+                .map(|index| {
+                    let bucket = (index.wrapping_mul(37).wrapping_add(11)) % 101;
+                    (bucket as f32 - 50.0) * 0.0025
+                })
+                .collect::<Vec<_>>();
+            let input = Tensor::from_slice::<f32>(&device, [1, weight_shape[1]], &input_values);
+
+            let result = input.q_mat_mul(&matrix).as_slice::<2, f32>().await.unwrap();
+
+            assert_eq!(result.shape(), &[1, weight_shape[0]]);
+            for col in [0usize, 1, 63, 64, 511, 1024, 8191, 8192] {
+                let expected = (0..blocks_per_row)
+                    .map(|block_col| {
+                        let block = &blocks[col * blocks_per_row + block_col];
+                        let weights = block.dequantize();
+                        weights
+                            .as_ref()
+                            .iter()
+                            .enumerate()
+                            .map(|(offset, weight)| {
+                                input_values[block_col * BlockQ4K::BLOCK_SIZE + offset] * *weight
+                            })
+                            .sum::<f32>()
+                    })
+                    .sum::<f32>();
+                let actual = result[[0, col]];
+                assert!(
+                    (actual - expected).abs() <= 1e-2_f32.max(expected.abs() * 1.0e-4),
+                    "col={col} actual={actual} expected={expected}"
+                );
+            }
+        });
+    }
+
+    // Regression test for native decode gibberish: the single-row (m=1, decode)
+    // subgroup qgemv must agree with the no-subgroup path, which is the
+    // reference web/native-without-subgroups run and is known-correct. A
+    // divergence here is exactly the per-token logit corruption that turns
+    // generation into token-salad. Covers each quantized format the model uses,
+    // at a Llama-ish projection shape.
+    // Isolates whether the cooperative-matrix bug is quantized-specific (the
+    // dequantizing tile fill) or general to the coop matmul codegen: a plain
+    // dense f32 matmul at coop-eligible dims must also agree between the
+    // subgroup (coop) and no-subgroup paths. If THIS diverges, the bug is the
+    // cooperative-matrix path itself (independent of quantization).
+    #[test]
+    fn dense_coop_matmul_subgroup_matches_no_subgroup() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            if !device.subgroups_supported() {
+                return;
+            }
+            let no_sg = device.without_subgroups();
+
+            let (m, k, n) = (128usize, 256usize, 128usize);
+            let a = (0..m * k)
+                .map(|i| ((i.wrapping_mul(31).wrapping_add(7)) % 97) as f32 * 0.003 - 0.14)
+                .collect::<Vec<_>>();
+            let b = (0..k * n)
+                .map(|i| ((i.wrapping_mul(53).wrapping_add(3)) % 89) as f32 * 0.004 - 0.17)
+                .collect::<Vec<_>>();
+
+            let out_sg = {
+                let a_t = Tensor::from_slice::<f32>(&device, [m, k], &a);
+                let b_t = Tensor::from_slice::<f32>(&device, [k, n], &b);
+                let s = a_t.mat_mul(&b_t).as_slice::<2, f32>().await.unwrap();
+                (0..m)
+                    .flat_map(|r| (0..n).map(move |c| (r, c)))
+                    .map(|(r, c)| s[[r, c]])
+                    .collect::<Vec<_>>()
+            };
+            let out_no = {
+                let a_t = Tensor::from_slice::<f32>(&no_sg, [m, k], &a);
+                let b_t = Tensor::from_slice::<f32>(&no_sg, [k, n], &b);
+                let s = a_t.mat_mul(&b_t).as_slice::<2, f32>().await.unwrap();
+                (0..m)
+                    .flat_map(|r| (0..n).map(move |c| (r, c)))
+                    .map(|(r, c)| s[[r, c]])
+                    .collect::<Vec<_>>()
+            };
+
+            let mut worst = 0.0f32;
+            let mut wi = 0usize;
+            let (mut wa, mut wb) = (0.0f32, 0.0f32);
+            for (i, (x, y)) in out_sg.iter().zip(&out_no).enumerate() {
+                let err = (x - y).abs();
+                if err > worst {
+                    worst = err;
+                    wi = i;
+                    wa = *x;
+                    wb = *y;
+                }
+            }
+            assert!(
+                worst <= 1.0e-3 + wb.abs() * 1.0e-3,
+                "dense coop matmul diverges from no-subgroup at {wi}: subgroup={wa} no_subgroup={wb} abs_err={worst}"
+            );
+        });
+    }
+
+    #[test]
+    fn primitive_f32_coop_mma_matches_logical_a_times_b() {
+        use std::hash::Hash;
+
+        use crate::kernel_selection::CooperativeMatrixKind;
+        use crate::mir::kernel_backend;
+        use fusor_tile_ir::{
+            ElementType, KernelTensorRef, Layout, MemoryLevel, ScalarElement, Shape,
+        };
+
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let Some(coop_token) = device.coop_token(CooperativeMatrixKind::F32F32M8N8K8) else {
+                return;
+            };
+
+            const DIM: usize = 8;
+            let a = (0..DIM * DIM)
+                .map(|i| ((i.wrapping_mul(31).wrapping_add(7)) % 97) as f32 * 0.003 - 0.14)
+                .collect::<Vec<_>>();
+            let b = (0..DIM * DIM)
+                .map(|i| ((i.wrapping_mul(53).wrapping_add(3)) % 89) as f32 * 0.004 - 0.17)
+                .collect::<Vec<_>>();
+            let a_buffer = device.create_buffer_init(
+                bytemuck::cast_slice(&a),
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            );
+            let b_buffer = device.create_buffer_init(
+                bytemuck::cast_slice(&b),
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            );
+            let y_buffer = device.create_buffer(
+                (DIM * DIM * size_of::<f32>()) as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            );
+            let layout =
+                Layout::contiguous(MemoryLevel::Storage, Shape::new([DIM as u32, DIM as u32]));
+            let cache_key = kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
+                "primitive_f32_coop_mma_matches_logical_a_times_b".hash(state);
+            });
+            let kernel = kernel_backend::run_kernel(
+                device.kernel_cache(),
+                "primitive_f32_coop_mma_matches_logical_a_times_b",
+                cache_key,
+                [1, 1, 1],
+                |kb| {
+                    let a_storage = kb.read(
+                        ElementType::F32,
+                        KernelTensorRef::new(a_buffer.clone(), layout.clone()),
+                    );
+                    let b_storage = kb.read(
+                        ElementType::F32,
+                        KernelTensorRef::new(b_buffer.clone(), layout.clone()),
+                    );
+                    let y_storage = kb.write(
+                        ElementType::F32,
+                        KernelTensorRef::new(y_buffer.clone(), layout),
+                    );
+                    let program = kb.program();
+                    let a_tile = program.alloc_workgroup_tile(ScalarElement::F32, 8, 8);
+                    let b_tile = program.alloc_workgroup_tile(ScalarElement::F32, 8, 8);
+                    program.program_grid(32, [1, 1, 1], |program| {
+                        program.fill_tile(&a_tile, &a_storage, 0u32, 0u32);
+                        program.fill_tile(&b_tile, &b_storage, 0u32, 0u32);
+                        program.workgroup_barrier();
+
+                        let acc = coop_token.alloc_coop_acc(program, ScalarElement::F32, 8, 8);
+                        let zero = coop_token.coop_zero(program, ScalarElement::F32, 8, 8);
+                        coop_token.coop_store_local(program, &acc, zero);
+                        let a_frag = coop_token.coop_load_a(
+                            program,
+                            &a_tile,
+                            0u32,
+                            0u32,
+                            ScalarElement::F32,
+                            8,
+                            8,
+                        );
+                        let b_frag = coop_token.coop_load_b(
+                            program,
+                            &b_tile,
+                            0u32,
+                            0u32,
+                            ScalarElement::F32,
+                            8,
+                            8,
+                        );
+                        let c_value = coop_token.coop_load_local(program, &acc);
+                        let mma = coop_token.coop_mma(program, a_frag, b_frag, c_value);
+                        coop_token.coop_store_local(program, &acc, mma);
+                        coop_token.coop_store(program, &acc, &y_storage, 0u32, 0u32);
+                    });
+                    Some(())
+                },
+            )
+            .expect("kernel should build");
+
+            let output_bytes = (DIM * DIM * size_of::<f32>()) as u64;
+            let download = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("primitive f32 coop mma download"),
+                size: output_bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            kernel.run(device.kernel_cache(), &mut encoder);
+            encoder.copy_buffer_to_buffer(&y_buffer, 0, &download, 0, output_bytes);
+            device.wgpu_queue().submit(Some(encoder.finish()));
+
+            let (sender, receiver) = std::sync::mpsc::channel();
+            download
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = sender.send(result);
+                });
+            device.poll_wait();
+            receiver.recv().unwrap().unwrap();
+            let view = download.slice(..).get_mapped_range();
+            let actual = bytemuck::cast_slice::<u8, f32>(&view).to_vec();
+            drop(view);
+            download.unmap();
+
+            let mut expected = [0.0f32; DIM * DIM];
+            for r in 0..DIM {
+                for c in 0..DIM {
+                    expected[r * DIM + c] =
+                        (0..DIM).map(|kk| a[r * DIM + kk] * b[kk * DIM + c]).sum();
+                }
+            }
+
+            let mut worst = 0.0f32;
+            let mut wi = 0usize;
+            for (i, (x, y)) in actual.iter().zip(expected.iter()).enumerate() {
+                let err = (x - y).abs();
+                if err > worst {
+                    worst = err;
+                    wi = i;
+                }
+            }
+            assert!(
+                worst < 1e-4,
+                "primitive f32 coop MMA mismatch at {wi}: actual={} expected={} worst={worst} actual={actual:?} expected={expected:?}",
+                actual[wi],
+                expected[wi]
+            );
+        });
+    }
+
+    #[test]
+    fn single_row_qgemv_subgroup_matches_no_subgroup() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            if !device.subgroups_supported() {
+                return;
+            }
+            let no_sg = device.without_subgroups();
+
+            // (name, [n, k], bytes, format). The large-block K-quants (q4k/q6k)
+            // are exercised at the ffn k=4096 regime; the small-block formats
+            // (q8_0/q5_0) at the k=896 projection regime the model actually uses
+            // for its attention/mlp projections (896 is not a multiple of 256, so
+            // those weights can only be block-32 formats).
+            let cases: [(&str, [usize; 2], Vec<u8>, GgmlType); 5] = [
+                (
+                    "q4k",
+                    [896, 4096],
+                    patterned_q4k_bytes([896, 4096]),
+                    GgmlType::Q4K,
+                ),
+                (
+                    "q6k",
+                    [896, 4096],
+                    patterned_q6k_bytes([896, 4096]),
+                    GgmlType::Q6K,
+                ),
+                (
+                    "q8_0",
+                    [896, 896],
+                    patterned_q8_0_bytes([896, 896]),
+                    GgmlType::Q8_0,
+                ),
+                (
+                    "q5_0",
+                    [896, 896],
+                    patterned_q5_0_bytes([896, 896]),
+                    GgmlType::Q5_0,
+                ),
+                // lm-head / tied-embedding shape: huge n, q5_0, k=hidden. Produces
+                // the logits every token, so a wrong subgroup qgemv here is exactly
+                // "wrong token sampled => gibberish".
+                (
+                    "q5_0_lmhead",
+                    [151936, 896],
+                    patterned_q5_0_bytes([151936, 896]),
+                    GgmlType::Q5_0,
+                ),
+            ];
+
+            async fn row(t: Tensor) -> Vec<f32> {
+                let slice = t.as_slice::<2, f32>().await.unwrap();
+                let cols = slice.shape()[1];
+                (0..cols).map(|col| slice[[0, col]]).collect()
+            }
+            async fn rows(t: Tensor) -> Vec<f32> {
+                let slice = t.as_slice::<2, f32>().await.unwrap();
+                let shape = slice.shape();
+                let (m, cols) = (shape[0], shape[1]);
+                let mut out = Vec::with_capacity(m * cols);
+                for r in 0..m {
+                    for c in 0..cols {
+                        out.push(slice[[r, c]]);
+                    }
+                }
+                out
+            }
+            // The two paths use different reduction kernels, so allow FP rounding
+            // slack; gibberish (a stale/miscompiled subgroup kernel) is orders of
+            // magnitude larger.
+            fn assert_match(name: &str, op: &str, sg: &[f32], no: &[f32]) {
+                assert_eq!(sg.len(), no.len(), "{name}/{op}: length mismatch");
+                let mut worst = 0.0f32;
+                let (mut wc, mut wa, mut wb) = (0usize, 0.0f32, 0.0f32);
+                for (col, (a, b)) in sg.iter().zip(no).enumerate() {
+                    let err = (a - b).abs();
+                    if err > worst {
+                        worst = err;
+                        wc = col;
+                        wa = *a;
+                        wb = *b;
+                    }
+                }
+                assert!(
+                    worst <= 1.0e-2 + wb.abs() * 1.0e-2,
+                    "{name}/{op}: subgroup qgemv diverges from no-subgroup at col {wc}: \
+                     subgroup={wa} no_subgroup={wb} abs_err={worst}"
+                );
+            }
+
+            for (name, weight_shape, raw_bytes, ty) in cases {
+                let [_, k] = weight_shape;
+                let input_values = (0..k)
+                    .map(|index| {
+                        let bucket = (index.wrapping_mul(37).wrapping_add(11)) % 101;
+                        (bucket as f32 - 50.0) * 0.0025
+                    })
+                    .collect::<Vec<_>>();
+                let mat_sg =
+                    QMatrix::from_parts(&device, &raw_bytes, weight_shape.into(), ty).unwrap();
+                let mat_no =
+                    QMatrix::from_parts(&no_sg, &raw_bytes, weight_shape.into(), ty).unwrap();
+                let in_sg = Tensor::from_slice::<f32>(&device, [1, k], &input_values);
+                let in_no = Tensor::from_slice::<f32>(&no_sg, [1, k], &input_values);
+
+                // Plain qgemv.
+                assert_match(
+                    name,
+                    "plain",
+                    &row(in_sg.q_mat_mul(&mat_sg)).await,
+                    &row(in_no.q_mat_mul(&mat_no)).await,
+                );
+
+                // Multi-row (prefill) regime: the prompt is processed at m>1 with
+                // a different (tile/coop) subgroup kernel than decode's qgemv. A
+                // wrong prefill matmul poisons the KV cache, so every later decode
+                // token reads bad context and produces gibberish.
+                let m = 16usize;
+                let multi = (0..m * k)
+                    .map(|i| {
+                        let bucket = (i.wrapping_mul(53).wrapping_add(7)) % 97;
+                        (bucket as f32 - 48.0) * 0.0021
+                    })
+                    .collect::<Vec<_>>();
+                let multi_sg = Tensor::from_slice::<f32>(&device, [m, k], &multi);
+                let multi_no = Tensor::from_slice::<f32>(&no_sg, [m, k], &multi);
+                assert_match(
+                    name,
+                    "plain_multirow",
+                    &rows(multi_sg.q_mat_mul(&mat_sg)).await,
+                    &rows(multi_no.q_mat_mul(&mat_no)).await,
+                );
             }
         });
     }

@@ -10,7 +10,7 @@ async fn main() {
         .build()
         .await
         .unwrap();
-    eprintln!("[timing] model load: {:.2?}", t_load_start.elapsed());
+    tracing::info!("[timing] model load: {:.2?}", t_load_start.elapsed());
 
     let mut chat = model.chat();
     let max_tokens = std::env::var("KALOSM_VISION_MAX_TOKENS")
@@ -41,7 +41,7 @@ async fn main() {
     while let Some(token) = response.next().await {
         if first_token_at.is_none() {
             first_token_at = Some(t_prefill.elapsed());
-            eprintln!(
+            tracing::info!(
                 "[timing] first token (prefill): {:.2?}",
                 first_token_at.unwrap()
             );
@@ -62,8 +62,12 @@ async fn main() {
     } else {
         0.0
     };
-    eprintln!(
+    tracing::info!(
         "[timing] total: {:.2?} | prefill: {:.2?} | decode: {:.2?} ({} tok, {:.1} tok/s)",
-        total, prefill, decode, decode_tokens, toks_per_sec
+        total,
+        prefill,
+        decode,
+        decode_tokens,
+        toks_per_sec
     );
 }

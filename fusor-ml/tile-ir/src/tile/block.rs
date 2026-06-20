@@ -1,4 +1,4 @@
-use super::value::{boxed_index, zero_fill, Address, CoopAcc, PrivateLocal, WorkgroupTile};
+use super::value::{boxed_index, zero_expr, Address, CoopAcc, PrivateLocal, WorkgroupTile};
 use super::{Mask, Program, Storage, Tile};
 use crate::ir::{
     Accumulator, Builtin, ElementType, Expr, ExprKind, Local, ScalarElement, Source, Stmt,
@@ -25,16 +25,20 @@ impl TileBlock<'_> {
         Tile::builtin(Builtin::ProgramId(axis))
     }
     /// `@builtin(subgroup_id)`.
-    pub fn subgroup_id(&self) -> Tile {
+    pub(crate) fn subgroup_id(&self) -> Tile {
         Tile::builtin(Builtin::SubgroupId)
     }
     /// `@builtin(subgroup_invocation_id)`.
-    pub fn subgroup_lane(&self) -> Tile {
+    pub(crate) fn subgroup_lane(&self) -> Tile {
         Tile::builtin(Builtin::SubgroupLane)
     }
     /// `@builtin(subgroup_size)`.
-    pub fn subgroup_size(&self) -> Tile {
+    pub(crate) fn subgroup_size(&self) -> Tile {
         Tile::builtin(Builtin::SubgroupSize)
+    }
+    /// `@builtin(num_subgroups)`.
+    pub(crate) fn num_subgroups(&self) -> Tile {
+        Tile::builtin(Builtin::NumSubgroups)
     }
     /// `@builtin(local_invocation_index)` — flat lane within the workgroup.
     pub fn lane(&self) -> Tile {
@@ -48,29 +52,6 @@ impl TileBlock<'_> {
     /// Workgroup invocation count (`block`).
     pub fn block_size(&self) -> u32 {
         self.block
-    }
-
-    // ---- literals --------------------------------------------------------
-
-    /// A typed scalar literal.
-    pub fn literal(&self, value: impl Into<TileLiteral>) -> Tile {
-        Tile::literal(value)
-    }
-    /// An f32 literal.
-    pub fn f32(&self, value: f32) -> Tile {
-        Tile::f32(value)
-    }
-    /// A u32 literal.
-    pub fn u32(&self, value: u32) -> Tile {
-        Tile::u32(value)
-    }
-    /// A bool literal.
-    pub fn bool(&self, value: bool) -> Tile {
-        Tile::bool(value)
-    }
-    /// Coerce any index-like value into a `u32`-typed tile.
-    pub fn index(&self, value: impl Into<Tile>) -> Tile {
-        value.into()
     }
 
     // ---- loads / stores --------------------------------------------------
@@ -89,6 +70,12 @@ impl TileBlock<'_> {
 
     /// Masked dequantizing load of one f32 value from a quantized matrix at a
     /// `(row, col)` coordinate.
+    /// Dequantize one element of a block-quantized matrix.
+    ///
+    /// Addressing follows the matrix's flat block order, where
+    /// [`QuantizedMatrix::rows`] is the *length* of one dense row: `row` is
+    /// the position along that contiguous axis and `col` selects which row
+    /// (`flat = col * matrix.rows + row`).
     pub fn load_quantized(
         &self,
         matrix: &QuantizedMatrix,
@@ -201,6 +188,22 @@ impl TileBlock<'_> {
         row: impl Into<Tile>,
         col: impl Into<Tile>,
     ) {
+        self.fill_tile_bounded(dst, src, row, col, [None, None]);
+    }
+
+    /// [`Self::fill_tile`] with optional exclusive global (row, col) limits:
+    /// elements at or beyond a limit fill zero instead of reading storage.
+    /// Edge tiles of a matmul whose shape doesn't divide the tile geometry
+    /// pass the logical extents here; `None` per axis keeps the unguarded
+    /// fast path.
+    pub fn fill_tile_bounded(
+        &mut self,
+        dst: &WorkgroupTile,
+        src: &Storage,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
+        bounds: [Option<Tile>; 2],
+    ) {
         let value = Expr::new(
             ExprKind::Load {
                 src: Source::Storage(src.view().clone()),
@@ -209,13 +212,14 @@ impl TileBlock<'_> {
                     col: boxed_index(col),
                 },
                 mask: Box::new(Tile::all().into_expr()),
-                fill: Box::new(zero_fill(scalar_of(src.element()))),
+                fill: Box::new(zero_expr(scalar_of(src.element()).element())),
             },
             scalar_of(src.element()).element(),
         );
         self.push_stmt(Stmt::FillTile {
             dst: dst.decl().clone(),
             value,
+            bounds: bounds.map(|bound| bound.map(Tile::into_expr)),
         });
     }
 
@@ -246,6 +250,7 @@ impl TileBlock<'_> {
         self.push_stmt(Stmt::FillTile {
             dst: dst.decl().clone(),
             value,
+            bounds: [None, None],
         });
     }
 
@@ -333,7 +338,7 @@ impl TileBlock<'_> {
     }
 
     /// Unstructured loop with a data-dependent exit. Use `break_loop` /
-    /// `break_if` inside to exit. Retained verbatim (ARBOR_DESIGN.md §5).
+    /// `break_if` inside to exit.
     pub fn loop_forever(&mut self, body: impl FnOnce(&mut Self)) {
         self.stmt_stack.push(Vec::new());
         body(self);
@@ -363,7 +368,7 @@ impl TileBlock<'_> {
     }
 
     /// Counted loop over `0..count` with no carried accumulators. The body
-    /// receives the loop index. Replaces the old `while_true`.
+    /// receives the loop index.
     pub fn loop_range(&mut self, count: u32, body: impl FnOnce(&mut Self, Tile)) {
         assert!(count > 0, "loop_range count must be non-zero");
         let index = self.program.alloc_local(ElementType::U32);

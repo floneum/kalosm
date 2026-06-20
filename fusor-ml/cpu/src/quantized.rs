@@ -248,7 +248,9 @@ impl<const R: usize> ConcreteTensor<f32, R> {
         B::Dequantized: AsRef<[f32]>,
         B::ActivationBlock: Pod + Send + Sync,
     {
-        const { assert!(R >= 2, "q_mat_mul requires at least 2 dimensions") };
+        // Runtime (not const) so rank-generic callers can guard rank-1
+        // themselves without this monomorphization failing.
+        assert!(R >= 2, "q_mat_mul requires at least 2 dimensions");
 
         let rhs_shape = rhs.element_shape();
         assert_eq!(

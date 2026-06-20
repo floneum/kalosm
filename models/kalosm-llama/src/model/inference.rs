@@ -37,10 +37,145 @@ where
 
         if gpu_token_sampling_enabled() && stop_on.is_none() {
             if let Some(mut gpu_sampler) = LlamaGpuSamplerState::new(&self.device, sampler, seed) {
+                let top_k = gpu_sample_top_k(&gpu_sampler.config);
+                if gpu_run_ahead_enabled()
+                    && images.is_empty()
+                    && self.model.supports_gpu_token_run_ahead()
+                {
+                    let next_token = {
+                        let previous_tokens = gpu_sampler.previous_tokens(&text_stream);
+                        let mut session_lock = session
+                            .cache
+                            .write()
+                            .map_err(|err| LlamaModelError::Session(err.to_string()))?;
+                        Self::forward_sample_token_pending(
+                            ForwardInputs {
+                                model: &self.model,
+                                device: &self.device,
+                                tokens: &tokens,
+                                images: &images,
+                                cache: Some(&mut session_lock),
+                                tokenizer: &self.tokenizer,
+                            },
+                            &mut gpu_sampler,
+                            previous_tokens,
+                            top_k,
+                        )?
+                    };
+
+                    if let Some(mut next_token) = next_token {
+                        let stop_token = self.model.config.stop_token;
+                        let mut tokens_generated = 0;
+                        while !finished.is_canceled() && tokens_generated < max_tokens {
+                            let scheduled_next = if tokens_generated + 1 < max_tokens {
+                                let previous_tokens = gpu_sampler.previous_tokens(&text_stream);
+                                let mut speculative_cache = session
+                                    .cache
+                                    .read()
+                                    .map_err(|err| LlamaModelError::Session(err.to_string()))?
+                                    .clone();
+                                if speculative_cache.tokens.len() < self.model.config.context_length
+                                {
+                                    Self::forward_sample_token_from_gpu_token_pending(
+                                        &self.model,
+                                        &self.device,
+                                        &next_token,
+                                        &mut speculative_cache,
+                                        &mut gpu_sampler,
+                                        previous_tokens,
+                                        top_k,
+                                    )?
+                                    .map(|(next, cache_slot)| (next, speculative_cache, cache_slot))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            let new_token = next_token
+                                .read_token()
+                                .await
+                                .map_err(|err| LlamaModelError::Fusor(fusor::Error::Gpu(err)))?
+                                .ok_or_else(|| {
+                                    LlamaModelError::SamplerError(
+                                        "pending GPU sampler refused slow fallback".into(),
+                                    )
+                                })?;
+                            if new_token == stop_token {
+                                tracing::trace!("Stopping on stop token");
+                                break;
+                            }
+
+                            tokens_generated += 1;
+                            if let Some(new_text) = text_stream
+                                .next_token(new_token)
+                                .map_err(LlamaModelError::TokenOutputStreamError)?
+                            {
+                                on_token(new_text)?;
+                            }
+
+                            if let Some((scheduled_token, mut speculative_cache, cache_slot)) =
+                                scheduled_next
+                            {
+                                if let Some(slot) = speculative_cache.tokens.get_mut(cache_slot) {
+                                    *slot = new_token;
+                                }
+                                *session
+                                    .cache
+                                    .write()
+                                    .map_err(|err| LlamaModelError::Session(err.to_string()))? =
+                                    speculative_cache;
+                                next_token = scheduled_token;
+                            } else if !finished.is_canceled() && tokens_generated < max_tokens {
+                                let previous_tokens = gpu_sampler.previous_tokens(&text_stream);
+                                let mut session_lock = session
+                                    .cache
+                                    .write()
+                                    .map_err(|err| LlamaModelError::Session(err.to_string()))?;
+                                match Self::forward_sample_token_pending(
+                                    ForwardInputs {
+                                        model: &self.model,
+                                        device: &self.device,
+                                        tokens: &[new_token],
+                                        images: &[],
+                                        cache: Some(&mut session_lock),
+                                        tokenizer: &self.tokenizer,
+                                    },
+                                    &mut gpu_sampler,
+                                    previous_tokens,
+                                    top_k,
+                                )? {
+                                    Some(sampled) => next_token = sampled,
+                                    None => break,
+                                }
+                            } else {
+                                break;
+                            }
+
+                            {
+                                use std::sync::atomic::{AtomicBool, Ordering};
+                                let yielded = AtomicBool::new(false);
+                                std::future::poll_fn(|cx| {
+                                    if yielded.load(Ordering::Relaxed) {
+                                        std::task::Poll::Ready(())
+                                    } else {
+                                        yielded.store(true, Ordering::Relaxed);
+                                        cx.waker().wake_by_ref();
+                                        std::task::Poll::Pending
+                                    }
+                                })
+                                .await;
+                            }
+                        }
+
+                        return Ok(());
+                    }
+                }
+
                 let mut next_token = {
                     let top_k = gpu_sample_top_k(&gpu_sampler.config);
                     let previous_tokens = gpu_sampler.previous_tokens(&text_stream);
-                    let params = gpu_sampler.params(top_k);
                     let mut session_lock = session
                         .cache
                         .write()
@@ -54,9 +189,9 @@ where
                             cache: Some(&mut session_lock),
                             tokenizer: &self.tokenizer,
                         },
-                        &mut gpu_sampler.sampler,
+                        &mut gpu_sampler,
                         previous_tokens,
-                        params,
+                        top_k,
                     )
                 }
                 .await?;
@@ -84,7 +219,6 @@ where
                     next_token = {
                         let top_k = gpu_sample_top_k(&gpu_sampler.config);
                         let previous_tokens = gpu_sampler.previous_tokens(&text_stream);
-                        let params = gpu_sampler.params(top_k);
                         let mut session_lock = session
                             .cache
                             .write()
@@ -98,9 +232,9 @@ where
                                 cache: Some(&mut session_lock),
                                 tokenizer: &self.tokenizer,
                             },
-                            &mut gpu_sampler.sampler,
+                            &mut gpu_sampler,
                             previous_tokens,
-                            params,
+                            top_k,
                         )
                     }
                     .await?;
@@ -125,7 +259,7 @@ where
             }
         }
 
-        let mut cpu_sampler = CpuMirostat2Sampler::new(sampler, seed);
+        let mut cpu_sampler = CpuSampler::new(sampler, seed);
         let sample_top_k = gpu_sample_top_k(&sampler);
         let logit_probs = {
             let mut session_lock = session

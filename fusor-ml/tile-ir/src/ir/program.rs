@@ -4,10 +4,9 @@ use crate::{LowerError, NagaKernel};
 /// A typed kernel IR emitted by the tile builder.
 ///
 /// The IR is a self-contained tree: declarations are `Rc`-owned at their use
-/// sites, so there are no `*Id` newtypes (see ARBOR_DESIGN.md §3). Buffers are
-/// also retained in declaration order so runtime binding lists produced by
-/// [`crate::KernelBuilder`] stay aligned even when a declared storage is
-/// optimized out of the body.
+/// sites. Buffers are also retained in declaration order so runtime binding
+/// lists produced by [`crate::KernelBuilder`] stay aligned even when a declared
+/// storage is optimized out of the body.
 #[derive(Clone, Debug)]
 pub struct KernelIr {
     /// Storage declarations in builder declaration order.
@@ -17,7 +16,7 @@ pub struct KernelIr {
     /// Workgroup invocation count.
     pub block: u32,
     /// Program statements.
-    pub body: Vec<Stmt>,
+    pub(crate) body: Vec<Stmt>,
 }
 
 impl Default for KernelIr {
@@ -32,11 +31,6 @@ impl Default for KernelIr {
 }
 
 impl KernelIr {
-    /// The statements that form the kernel body.
-    pub fn body(&self) -> &[Stmt] {
-        &self.body
-    }
-
     /// Lower this IR into a validated Naga module.
     pub fn lower_to_naga(&self) -> Result<NagaKernel, LowerError> {
         crate::lower::lower_to_naga(self)
@@ -94,6 +88,11 @@ pub enum Stmt {
         dst: Tile,
         /// Per-element source value (typically a masked `Load`).
         value: Expr,
+        /// Exclusive global (row, col) limits: elements at or beyond a limit
+        /// load zero instead of touching storage. `None` per axis when the
+        /// tile is known in-bounds along it (the common aligned case, which
+        /// lowers without any guard).
+        bounds: [Option<Expr>; 2],
     },
     /// Cooperatively store an accumulator to a global storage view. A distinct
     /// subgroup-collective primitive — never lowered as a per-lane `Store`.
@@ -115,10 +114,8 @@ pub enum Stmt {
         reject: Vec<Stmt>,
     },
     /// One loop node, two forms:
-    /// - `count: Some(..)` => counted (subsumes the old `Fold` +
-    ///   `FoldAccumulator` + `while_true`), iterating `0..count` into `index`.
-    /// - `count: None` => unstructured (subsumes `loop_forever`); body may
-    ///   contain `Break`/`Return`.
+    /// - `count: Some(..)` => counted, iterating `0..count` into `index`.
+    /// - `count: None` => unstructured; body may contain `Break`/`Return`.
     Loop {
         /// Iteration count, or `None` for an unstructured loop.
         count: Option<Expr>,

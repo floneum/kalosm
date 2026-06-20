@@ -22,7 +22,7 @@ pub mod layers;
 pub mod quantized;
 mod varbuilder;
 
-pub use varbuilder::{ShardedVarBuilder, VarBuilder};
+pub use varbuilder::{AsyncReadRange, AsyncShardedVarBuilder, ShardedVarBuilder, VarBuilder};
 
 pub use quantized::{CpuF32Tensor, QMatrix};
 
@@ -78,6 +78,7 @@ pub use crate::gpu::{
 
 pub use crate::gpu::{
     GpuMirostat2Sampler as Mirostat2Sampler, GpuMirostat2SamplerParams as Mirostat2SamplerParams,
+    GpuSampledToken, GpuStandardSamplerParams as StandardSamplerParams,
 };
 
 /// Runtime dispatch wrapper - holds either CPU or GPU version of an operation/tensor type.
@@ -491,17 +492,55 @@ where
         }
     }
 
-    pub async fn try_sample_mirostat2_token_q_mat(
+    pub async fn sample_standard_token(
         &self,
-        weights: &crate::QMatrix,
+        previous_tokens: &[u32],
+        params: StandardSamplerParams,
+    ) -> Result<u32, Error> {
+        match self {
+            Tensor::Cpu(_) => {
+                let top = self.top_k_pairs(params.top_k).await?;
+                Ok(top
+                    .first()
+                    .map(|(token_id, _)| *token_id)
+                    .unwrap_or_default())
+            }
+            Tensor::Gpu(t) => t
+                .sample_standard_token(previous_tokens, params)
+                .await
+                .map_err(Error::Gpu),
+        }
+    }
+
+    pub fn sample_mirostat2_token_pending(
+        &self,
         sampler: &mut Mirostat2Sampler,
         previous_tokens: &[u32],
+        previous_gpu_token: Option<&GpuSampledToken>,
         params: Mirostat2SamplerParams,
-    ) -> Result<Option<u32>, Error> {
-        match (self, weights) {
-            (Tensor::Gpu(t), crate::QMatrix::Gpu(weights)) => t
-                .try_sample_mirostat2_token_q_mat(weights, sampler, previous_tokens, params)
-                .await
+    ) -> Result<Option<GpuSampledToken>, Error> {
+        match self {
+            Tensor::Gpu(t) => t
+                .sample_mirostat2_token_pending(
+                    sampler,
+                    previous_tokens,
+                    previous_gpu_token,
+                    params,
+                )
+                .map_err(Error::Gpu),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn sample_standard_token_pending(
+        &self,
+        previous_tokens: &[u32],
+        previous_gpu_token: Option<&GpuSampledToken>,
+        params: StandardSamplerParams,
+    ) -> Result<Option<GpuSampledToken>, Error> {
+        match self {
+            Tensor::Gpu(t) => t
+                .sample_standard_token_pending(previous_tokens, previous_gpu_token, params)
                 .map_err(Error::Gpu),
             _ => Ok(None),
         }
@@ -1110,14 +1149,34 @@ where
     /// * If R < 2 (matrix multiplication requires at least 2 dimensions)
     /// * If weights is not 2D
     pub fn q_mat_mul(&self, weights: &crate::QMatrix) -> Tensor<R, f32> {
-        use crate::QMatrix;
-
         assert_eq!(
             weights.shape().len(),
             2,
             "q_mat_mul requires 2D weight tensor, got {}D",
             weights.shape().len()
         );
+
+        // A rank-1 activation is a single matrix row. The GPU graph lowers
+        // quantized formats natively; the CPU and dense F16/F32 paths only
+        // handle rank >= 2, so route them through a [1, K] view.
+        if R == 1 {
+            let gpu_native = matches!((self, weights), (Tensor::Gpu(_), QMatrix::Gpu(_)))
+                && !matches!(
+                    weights.ggml_type(),
+                    fusor_gguf::GgmlType::F16 | fusor_gguf::GgmlType::F32
+                );
+            if !gpu_native {
+                let k = self.shape()[0];
+                let n = weights.shape()[0];
+                let out_shape: [usize; R] = std::array::from_fn(|_| n);
+                return self
+                    .reshape([1, k])
+                    .to_concrete()
+                    .q_mat_mul(weights)
+                    .reshape(out_shape)
+                    .to_concrete();
+            }
+        }
 
         match (self, weights) {
             // CPU path - dispatch based on block type
@@ -1179,92 +1238,6 @@ where
 
             // Mixed - panic
             _ => panic!("Cannot mix CPU and GPU tensors in q_mat_mul"),
-        }
-    }
-
-    pub fn q_mat_mul_paired_silu_product(&self, weights: &crate::QMatrix) -> Tensor<R, f32> {
-        use crate::QMatrix;
-
-        assert_eq!(
-            weights.shape().len(),
-            2,
-            "q_mat_mul_paired_silu_product requires 2D weight tensor, got {}D",
-            weights.shape().len()
-        );
-        assert!(
-            weights.shape()[0].is_multiple_of(2),
-            "q_mat_mul_paired_silu_product requires an even output dimension"
-        );
-
-        match (self, weights) {
-            (Tensor::Gpu(lhs), QMatrix::Gpu(rhs))
-                if weights.ggml_type() == fusor_gguf::GgmlType::Q4K =>
-            {
-                Tensor::Gpu(lhs.q_mat_mul_paired_silu_product(rhs))
-            }
-            _ => {
-                let pair_len = weights.shape()[0] / 2;
-                let projected = self.q_mat_mul(weights);
-                let gate = projected
-                    .narrow(crate::D::Minus1, 0, pair_len)
-                    .to_concrete();
-                let up = projected
-                    .narrow(crate::D::Minus1, pair_len, pair_len)
-                    .to_concrete();
-                (gate.silu() * up).to_concrete()
-            }
-        }
-    }
-
-    pub fn q_mat_mul_add2<B1, B2>(
-        &self,
-        weights: &crate::QMatrix,
-        first: &Tensor<R, f32, B1>,
-        second: &Tensor<R, f32, B2>,
-    ) -> Tensor<R, f32>
-    where
-        B1: TensorBacking<R, Elem = f32>,
-        B2: TensorBacking<R, Elem = f32>,
-    {
-        use crate::QMatrix;
-
-        assert_eq!(
-            weights.shape().len(),
-            2,
-            "q_mat_mul_add2 requires 2D weight tensor, got {}D",
-            weights.shape().len()
-        );
-
-        let output_shape: [usize; R] = std::array::from_fn(|i| {
-            if i + 1 == R {
-                weights.shape()[0]
-            } else {
-                self.shape()[i]
-            }
-        });
-        assert_eq!(
-            first.shape(),
-            output_shape,
-            "first residual shape must match q_mat_mul output shape"
-        );
-        assert_eq!(
-            second.shape(),
-            output_shape,
-            "second residual shape must match q_mat_mul output shape"
-        );
-
-        match (self, weights, first, second) {
-            (Tensor::Gpu(lhs), QMatrix::Gpu(rhs), Tensor::Gpu(first), Tensor::Gpu(second))
-                if weights.ggml_type() != fusor_gguf::GgmlType::F16
-                    && weights.ggml_type() != fusor_gguf::GgmlType::F32 =>
-            {
-                Tensor::Gpu(lhs.q_mat_mul_add2(rhs, first, second))
-            }
-            _ => {
-                let projected = self.q_mat_mul(weights);
-                let with_first = (&projected + first).to_concrete();
-                (&with_first + second).to_concrete()
-            }
         }
     }
 }

@@ -253,10 +253,9 @@ fn App() -> Element {
                 }
                 div { class: "picker",
                     Select::<ModelChoice> {
-                        placeholder: "choose a model",
                         default_value: current_choice,
                         on_value_change: on_choice_change,
-                        SelectTrigger { aria_label: "Model", SelectValue {} }
+                        SelectTrigger { aria_label: "Model", SelectValue { placeholder: "choose a model" } }
                         SelectList { aria_label: "Models",
                             for (i, c) in ModelChoice::all().iter().copied().enumerate() {
                                 SelectOption::<ModelChoice> {

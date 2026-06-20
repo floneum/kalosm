@@ -20,10 +20,6 @@ use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 
 const LOCAL_INVOCATION_INDEX_ARG: u32 = 0;
 const WORKGROUP_ID_ARG: u32 = 1;
-const SUBGROUP_ID_ARG: u32 = 2;
-const SUBGROUP_INVOCATION_ID_ARG: u32 = 3;
-const SUBGROUP_SIZE_ARG: u32 = 4;
-const NUM_SUBGROUPS_ARG: u32 = 5;
 const DEFAULT_WORKGROUP_INVOCATIONS: u32 = 256;
 const DEFAULT_WORKGROUP_SIZE: [u32; 3] = [16, 16, 1];
 
@@ -32,9 +28,11 @@ pub(crate) fn lower_to_naga(ir: &KernelIr) -> Result<NagaKernel, LowerError> {
 }
 
 /// A validated Naga lowering result.
+#[derive(Debug)]
 pub struct NagaKernel {
     module: Module,
     info: naga::valid::ModuleInfo,
+    wgsl_extensions: WgslExtensions,
 }
 
 impl NagaKernel {
@@ -46,6 +44,32 @@ impl NagaKernel {
     /// Naga validation metadata for the generated module.
     pub fn info(&self) -> &naga::valid::ModuleInfo {
         &self.info
+    }
+
+    /// Extension directives to prepend before Naga's WGSL output.
+    pub fn wgsl_extension_prelude(&self) -> &'static str {
+        self.wgsl_extensions.prelude()
+    }
+}
+
+/// WGSL extension directives required by a lowered kernel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct WgslExtensions {
+    subgroups: bool,
+}
+
+impl WgslExtensions {
+    pub(crate) fn new(subgroups: bool) -> Self {
+        Self { subgroups }
+    }
+
+    /// Text that must appear before Naga's serialized WGSL declarations.
+    pub fn prelude(self) -> &'static str {
+        if self.subgroups {
+            "enable subgroups;\n\n"
+        } else {
+            ""
+        }
     }
 }
 
@@ -76,8 +100,8 @@ impl std::error::Error for LowerError {}
 
 /// Demand-allocated private scratch local kinds. Locals are interned lazily by
 /// `(ScratchKind, ElementType, depth)`; each distinct key allocates exactly one
-/// `LocalVariable`, preserving the local count (which only drops, never grows)
-/// from the old eagerly-allocated `ScratchLocals`.
+/// `LocalVariable`, so scratch allocation only creates locals that are actually
+/// used.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub(super) enum ScratchKind {
     /// The counted/unstructured loop index (`u32`).
@@ -151,6 +175,10 @@ struct Lowerer<'a> {
     workgroup_invocations: u32,
     workgroup_size: [u32; 3],
     caps: analysis::Capabilities,
+    subgroup_id_arg: Option<u32>,
+    subgroup_invocation_id_arg: Option<u32>,
+    subgroup_size_arg: Option<u32>,
+    num_subgroups_arg: Option<u32>,
     /// First-use-ordered declarations from the one analysis walk, emitted as the
     /// global/local arenas (buffers sorted by binding at global-creation time).
     buffer_decls: Vec<Buffer>,

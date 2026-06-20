@@ -4,6 +4,7 @@ use fusor::{
     CastTensor, CastTo, Device, FloatDataType, QMatrix, SimdElement, StrideSpec, Tensor,
     VarBuilder,
 };
+use web_time::Instant;
 
 use fusor::RopeCache;
 
@@ -77,52 +78,52 @@ where
         };
         let xs_3d = xs.unsqueeze(0).to_concrete(); // [1, seq, dim]
         flush(&xs_3d);
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let after_norm = self.norm1.forward_generic(&xs_3d);
         flush(&after_norm);
         if trace {
-            eprintln!("    norm1: {:.2?}", t0.elapsed());
+            tracing::info!("    norm1: {:.2?}", t0.elapsed());
         }
-        let t1 = std::time::Instant::now();
+        let t1 = Instant::now();
         let after_attention = self
             .attn
             .forward(&after_norm, cu_seqlens, rope_cache, cache)?;
         flush(&after_attention);
         if trace {
-            eprintln!("    attn:  {:.2?}", t1.elapsed());
+            tracing::info!("    attn:  {:.2?}", t1.elapsed());
         }
 
         // Work in f32 for tensor addition
         let xs_3d_f32: Tensor<3, f32> = xs_3d.cast();
         let after_attention_f32: Tensor<3, f32> = after_attention.cast();
-        let t2 = std::time::Instant::now();
+        let t2 = Instant::now();
         let xs_3d: Tensor<3, F> = (xs_3d_f32 + after_attention_f32).cast();
         flush(&xs_3d);
         if trace {
-            eprintln!("    res1:  {:.2?}", t2.elapsed());
+            tracing::info!("    res1:  {:.2?}", t2.elapsed());
         }
 
-        let t3 = std::time::Instant::now();
+        let t3 = Instant::now();
         let after_norm2 = self.norm2.forward_generic(&xs_3d);
         flush(&after_norm2);
         if trace {
-            eprintln!("    norm2: {:.2?}", t3.elapsed());
+            tracing::info!("    norm2: {:.2?}", t3.elapsed());
         }
-        let t4 = std::time::Instant::now();
+        let t4 = Instant::now();
         let mlp_out = self.mlp.forward(&after_norm2);
         flush(&mlp_out);
         if trace {
-            eprintln!("    mlp:   {:.2?}", t4.elapsed());
+            tracing::info!("    mlp:   {:.2?}", t4.elapsed());
         }
 
         // Work in f32 for tensor addition
         let xs_3d_f32: Tensor<3, f32> = xs_3d.cast();
         let mlp_out_f32: Tensor<3, f32> = mlp_out.cast();
-        let t5 = std::time::Instant::now();
+        let t5 = Instant::now();
         let out: Tensor<3, F> = (xs_3d_f32 + mlp_out_f32).cast();
         flush(&out);
         if trace {
-            eprintln!("    res2:  {:.2?}", t5.elapsed());
+            tracing::info!("    res2:  {:.2?}", t5.elapsed());
         }
 
         Ok(out.squeeze(0).to_concrete())
@@ -131,11 +132,9 @@ where
 
 struct VisionAttention<F: FloatDataType + SimdElement> {
     /// Fused Q/K/V projection: a single Linear whose weight is the row-wise
-    /// concatenation of the per-tensor q/k/v weights. The previous code
-    /// dispatched 3 separate matmuls per layer (96 dispatches across 32
-    /// vision blocks); one fused matmul of triple output width does the same
-    /// arithmetic with a third the dispatch count, and the wider N better
-    /// saturates the shared-memory tile reuse.
+    /// concatenation of the per-tensor q/k/v weights. One fused matmul of
+    /// triple output width computes all three projections with a lower dispatch
+    /// count, and the wider N better saturates shared-memory tile reuse.
     qkv: VisionQkv<F>,
     proj: Linear<F>,
     head_count: usize,
@@ -205,7 +204,7 @@ where
     ) -> fusor::Result<Tensor<3, F>> {
         let trace_attn = std::env::var_os("KALOSM_TRACE_ATTN").is_some();
         let [bsz, seq_len, _] = xs.shape();
-        let t_qkv = std::time::Instant::now();
+        let t_qkv = Instant::now();
 
         // One fused qkv matmul (output is [1, seq, 3 * embed_dim]); narrow
         // out the q/k/v slices as views — narrow is a layout-only op so we
@@ -215,7 +214,7 @@ where
                 let qkv: Tensor<3, f32> = qkv.forward_generic(xs).cast();
                 if trace_attn {
                     qkv.as_gpu().map(|g| g.materialize_sync());
-                    eprintln!("      qkv:   {:.2?}", t_qkv.elapsed());
+                    tracing::info!("      qkv:   {:.2?}", t_qkv.elapsed());
                 }
                 let q = qkv
                     .narrow(2, 0, self.embed_dim)
@@ -249,7 +248,7 @@ where
                     .to_concrete();
                 if trace_attn {
                     v.as_gpu().map(|g| g.materialize_sync());
-                    eprintln!("      qkv:   {:.2?} (split)", t_qkv.elapsed());
+                    tracing::info!("      qkv:   {:.2?} (split)", t_qkv.elapsed());
                 }
                 (q, k, v)
             }
@@ -271,10 +270,10 @@ where
         // V's slices (later, per window) to start from a contiguous tensor;
         // narrowing a transpose-view produces another non-contiguous view.
         let value_states = v.transpose(0, 1).unsqueeze(0).to_concrete();
-        let t_after_rope = std::time::Instant::now();
+        let t_after_rope = Instant::now();
         if trace_attn {
             value_states.as_gpu().map(|g| g.materialize_sync());
-            eprintln!(
+            tracing::info!(
                 "      rope:  {:.2?} (incl. q/k/v split + transpose)",
                 t_qkv.elapsed()
             );
@@ -288,7 +287,7 @@ where
         };
 
         if trace_attn {
-            eprintln!("      mask:  {:.2?}", t_after_rope.elapsed());
+            tracing::info!("      mask:  {:.2?}", t_after_rope.elapsed());
         }
 
         // The attention pattern is block-diagonal per `cu_seqlens`. The dense
@@ -299,7 +298,7 @@ where
         // block-diagonal mask intended, but at window² scale (~64²) rather
         // than seq² (1944²). Full-attention layers (cu_seqlens=[0, seq])
         // skip the slicing and just run one regular flash call.
-        let t_flash = std::time::Instant::now();
+        let t_flash = Instant::now();
         let query_f32 = query_states;
         let key_f32 = key_states_f32;
         let value_f32 = value_states_f32;
@@ -364,7 +363,7 @@ where
         let output: Tensor<3, F> = self.proj.forward_generic(&attn_output.cast());
         if trace_attn {
             output.as_gpu().map(|g| g.materialize_sync());
-            eprintln!("      flash+proj: {:.2?}", t_flash.elapsed());
+            tracing::info!("      flash+proj: {:.2?}", t_flash.elapsed());
         }
 
         Ok(output)

@@ -36,12 +36,12 @@ pub(crate) trait Operation: Debug + 'static {
 
     /// Hash structural operation fields that affect generated kernel IR.
     ///
-    /// The concrete operation type is added by `kernel_module_key_with_dispatch`;
+    /// The concrete operation type is added by `kernel_cache_key_with_dispatch`;
     /// implementations only hash fields not represented by MIR inputs,
     /// dispatch, or workgroup shape.
-    fn hash_kernel_fields(&self, _state: &mut FxHasher) {}
+    fn hash_kernel_fields(&self, state: &mut FxHasher);
 
-    fn kernel_module_key_with_dispatch(
+    fn kernel_cache_key_with_dispatch(
         &self,
         variant: kernel_backend::KernelVariantKey,
         workgroup_shape: Option<&WorkgroupShape>,
@@ -64,16 +64,6 @@ pub(crate) trait Operation: Debug + 'static {
                 hash_mir_value(hasher, input);
             }
         })
-    }
-
-    fn kernel_cache_key_with_dispatch(
-        &self,
-        variant: kernel_backend::KernelVariantKey,
-        workgroup_shape: Option<&WorkgroupShape>,
-        dispatch_size: [u32; 3],
-        inputs: &[MirValue],
-    ) -> kernel_backend::KernelCacheKey {
-        self.kernel_module_key_with_dispatch(variant, workgroup_shape, dispatch_size, inputs)
     }
 }
 
