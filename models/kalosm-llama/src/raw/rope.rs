@@ -60,15 +60,21 @@ where
     F: CastTo<f32> + CastTensor<f32>,
     f32: CastTo<F> + CastTensor<F>,
 {
-    pub fn new(config: &LlamaConfig<F>, rope_theta: f32, device: &Device) -> fusor::Result<Self> {
+    pub fn new_with_head_dimension(
+        config: &LlamaConfig<F>,
+        head_dimension: usize,
+        rope_freq_weight: Option<&Tensor<1, F>>,
+        rope_theta: f32,
+        device: &Device,
+    ) -> fusor::Result<Self> {
         if let Some(mrope_sections) = &config.mrope_sections {
             let cache = QwenVLRopeCache::new(config, rope_theta, mrope_sections, device)?;
             Ok(Self::QwenVL(cache))
         } else {
             let inverse_frequency: Tensor<2, F> = create_inverse_frequency(
                 config.rope_scaling.as_ref(),
-                config.rope_freq_weight.as_ref(),
-                config.head_dimension,
+                rope_freq_weight,
+                head_dimension,
                 rope_theta,
                 device,
             );

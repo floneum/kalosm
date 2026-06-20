@@ -911,8 +911,9 @@ fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32,
     if format.is_q6k_family() && n <= 4096 && k > 4096 {
         return 4; // was Q6KLargeNarrow4
     }
-    // Q8_0 wide.
-    if format.is_q8_0_family() && k <= 1024 && n >= 8192 {
+    // Q8_0 wide. Keep this aligned with qgemv_tile_with_epilogue, which
+    // switches Q8_0/Q8_0Native to 4x8 output columns for wide outputs.
+    if format.is_q8_0_family() && n >= 8192 {
         return 32; // was Q8WideAccelerated32
     }
     // FormatAccelerated: Q5_0 mid (K,N both 2048..=4096), Q4K/Q6K general,
@@ -929,7 +930,10 @@ fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32,
     if format.is_q5_0_family() && k <= 1024 && n <= 4096 {
         return 8; // was Q5Small8
     }
-    4 // was Default4
+    // The shader-side qgemv shape table is the source of truth for generic
+    // formats. Returning a smaller value here over-dispatches masked columns,
+    // and every extra workgroup still pays the full K-loop cost.
+    tile_ir_kernels::qgemv_cols_per_workgroup_for_shape(format, k, n)
 }
 
 fn qmatmul_m_pad_target_for_caps(m: usize, n: usize, caps: KernelDeviceCaps) -> Option<usize> {

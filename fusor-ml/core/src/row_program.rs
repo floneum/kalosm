@@ -46,11 +46,6 @@ use crate::{
 
 const BLOCK: u32 = 256;
 
-/// Below this many rows a long axis is split across workgroups (one tile
-/// each) with a combine kernel folding the spans — decode has too few rows
-/// to fill the device with one workgroup per row.
-const SPLIT_ROWS_TARGET: u32 = 256;
-
 /// Workgroup buckets for dynamic-axis row programs, smallest first. The
 /// kernel monomorphizes per bucket; the active axis length rides in the
 /// params input.
@@ -606,10 +601,12 @@ fn build_row_program_kernel(
     let block = workgroup_shape.x();
     let lanes_own_axis = operation.dynamic_axis.is_some();
 
-    // Long axes with few rows fan out across workgroups: each split runs
-    // the online body over one tile, writing its unnormalized accumulator
-    // and softmax statistics to scratch; a combine kernel folds the spans
-    // with the online monoid.
+    // Long reducing outputs fan out across workgroups: each split owns one
+    // axis tile, writes its unnormalized accumulator and softmax statistics
+    // to scratch, then a combine kernel folds the spans with the online
+    // monoid. This avoids the single-workgroup multi-tile loop for attention
+    // prefill, which is both slower to fill the GPU and less robust at Gemma's
+    // unscaled vision-attention logits.
     let output_kind = operation.output_step().clone();
     let phase_steps = operation.phase_steps().to_vec();
     let free_dim_out = match &output_kind {
@@ -619,11 +616,7 @@ fn build_row_program_kernel(
     let tiles = k.div_ceil(block);
     let splits: u32 = match free_dim_out {
         Some(free)
-            if lanes_own_axis
-                && rows < SPLIT_ROWS_TARGET
-                && tiles > 1
-                && tiles <= block
-                && (free as u32 + 2) <= block =>
+            if lanes_own_axis && tiles > 1 && tiles <= block && (free as u32 + 2) <= block =>
         {
             tiles
         }

@@ -42,6 +42,10 @@ pub const fn qgemv_cols_per_workgroup(format: GgmlQuantFormat) -> u32 {
 /// This includes the Q4K/Q6K GGML specializations whose column grouping
 /// depends on both K (`rows`) and N (`cols`).
 pub fn qgemv_cols_per_workgroup_for_shape(format: GgmlQuantFormat, rows: u32, cols: u32) -> u32 {
+    if matches!(format, GgmlQuantFormat::Q4_0 | GgmlQuantFormat::Q4_0Native) {
+        return q4_0_override(q4_0_default(rows, cols)).cols_per_workgroup();
+    }
+
     if is_q4k_family(format) && rows <= 4096 && (4096..8192).contains(&cols) {
         return q4k_mid_override(q4k_default_mid(rows, cols)).cols_per_workgroup();
     }
@@ -95,12 +99,15 @@ pub(crate) const fn qgemv_subgroups_per_workgroup(format: GgmlQuantFormat) -> u3
 }
 
 /// Shape-aware subgroup count used by the qgemv dispatch policy.
-pub const fn qgemv_subgroups_per_workgroup_for_shape(
+pub fn qgemv_subgroups_per_workgroup_for_shape(
     format: GgmlQuantFormat,
     rows: u32,
-    _cols: u32,
+    cols: u32,
 ) -> u32 {
     match format {
+        GgmlQuantFormat::Q4_0 | GgmlQuantFormat::Q4_0Native => {
+            q4_0_override(q4_0_default(rows, cols)).subgroups
+        }
         format if format.is_q6k_family() && rows > 4096 => 8,
         _ => qgemv_subgroups_per_workgroup(format),
     }
@@ -235,6 +242,20 @@ const STANDARD_8_TILES: &[(&str, QgemvShape)] = &[
     ("ggml_8x4", QgemvShape::new(8, 4)),
 ];
 
+const Q4_0_TILES: &[(&str, QgemvShape)] = &[
+    ("ggml_1x4", QgemvShape::new(1, 4)),
+    ("ggml_1x8", QgemvShape::new(1, 8)),
+    ("ggml_2x2", QgemvShape::new(2, 2)),
+    ("ggml_2x4", QgemvShape::new(2, 4)),
+    ("ggml_2x8", QgemvShape::new(2, 8)),
+    ("ggml_4x2", QgemvShape::new(4, 2)),
+    ("ggml_4x4", QgemvShape::new(4, 4)),
+    ("ggml_4x8", QgemvShape::new(4, 8)),
+    ("ggml_8x1", QgemvShape::new(8, 1)),
+    ("ggml_8x2", QgemvShape::new(8, 2)),
+    ("ggml_8x4", QgemvShape::new(8, 4)),
+];
+
 fn env_tile_override(var: &str, table: &[(&str, QgemvShape)], default: QgemvShape) -> QgemvShape {
     let Ok(value) = std::env::var(var) else {
         return default;
@@ -248,6 +269,23 @@ fn env_tile_override(var: &str, table: &[(&str, QgemvShape)], default: QgemvShap
 
 pub(crate) fn q4k_mid_override(default: QgemvShape) -> QgemvShape {
     env_tile_override("FUSOR_Q4K_MID_TILE", Q4K_MID_TILES, default)
+}
+
+pub(crate) const fn q4_0_default(_rows: u32, _cols: u32) -> QgemvShape {
+    QgemvShape::new(4, 4)
+}
+
+pub(crate) fn q4_0_override(default: QgemvShape) -> QgemvShape {
+    env_tile_override("FUSOR_Q4_0_TILE", Q4_0_TILES, default)
+}
+
+pub(crate) fn q4_0_values_per_lane(default: u32) -> u32 {
+    match std::env::var("FUSOR_Q4_0_VALUES_PER_LANE").ok().as_deref() {
+        Some("8") => 8,
+        Some("16") => 16,
+        Some("32") => 32,
+        _ => default,
+    }
 }
 
 // ----- Q4K large (rows<=4096, cols>=8192) -----

@@ -56,6 +56,7 @@ pub(crate) struct LlamaConfigJson {
 pub struct LlamaSource {
     pub(crate) model: Vec<FileSource>,
     pub(crate) vision_model: Option<FileSource>,
+    pub(crate) mtp_model: Option<FileSource>,
     pub(crate) tokenizer: Option<FileSource>,
     pub(crate) config: Option<FileSource>,
     pub(crate) group_query_attention: u8,
@@ -125,6 +126,7 @@ impl LlamaSource {
             override_stop_token_string: None,
             override_chat_template: None,
             vision_model: None,
+            mtp_model: None,
         }
     }
 
@@ -139,6 +141,7 @@ impl LlamaSource {
             override_stop_token_string: None,
             override_chat_template: None,
             vision_model: None,
+            mtp_model: None,
         }
     }
 
@@ -219,6 +222,13 @@ impl LlamaSource {
     /// Set the clip model to use for vision encoding. This is used for Qwen-2.5 VL models to enable vision.
     pub fn with_vision_model(mut self, model: FileSource) -> Self {
         self.vision_model = Some(model);
+
+        self
+    }
+
+    /// Set the Gemma4 MTP assistant model to use for opt-in speculative decoding.
+    pub fn with_mtp_model(mut self, model: FileSource) -> Self {
+        self.mtp_model = Some(model);
 
         self
     }
@@ -974,6 +984,23 @@ impl LlamaSource {
             "tokenizer.json".to_string(),
         ))
         .with_override_stop_token_string("<end_of_turn>")
+    }
+
+    /// A preset for Unsloth's Gemma 4 E2B instruction QAT GGUF.
+    ///
+    /// Note: The gemma model series does not support system prompts.
+    pub fn gemma_4_e2b_it_qat_chat() -> Self {
+        Self::new(FileSource::huggingface(
+            "unsloth/gemma-4-E2B-it-qat-GGUF".to_string(),
+            "main".to_string(),
+            "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf".to_string(),
+        ))
+        .with_mtp_model(FileSource::huggingface(
+            "unsloth/gemma-4-E2B-it-qat-GGUF".to_string(),
+            "main".to_string(),
+            "MTP/gemma-4-E2B-it-Q4_0-MTP.gguf".to_string(),
+        ))
+        .with_override_stop_token_string("<turn|>")
     }
 
     /// A preset for qwen 2.5 3b VL chat in f16 precision

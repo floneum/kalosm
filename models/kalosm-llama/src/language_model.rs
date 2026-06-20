@@ -54,7 +54,12 @@ where
             .tokenizer
             .as_ref()
             .is_some_and(|tokenizer| !cache.exists(tokenizer));
-        model_missing || tokenizer_missing
+        let mtp_missing = self
+            .source
+            .mtp_model
+            .as_ref()
+            .is_some_and(|mtp| !cache.exists(mtp));
+        model_missing || tokenizer_missing || mtp_missing
     }
 }
 
@@ -118,6 +123,13 @@ where
             }
             Vec::new()
         };
+        if std::env::var_os("KALOSM_TRACE_PROMPT").is_some() {
+            eprintln!(
+                "[stream_text] prompt_len={} image_count={}",
+                text.len(),
+                images.len()
+            );
+        }
         self.inner
             .sender
             .unbounded_send(Task::UnstructuredGeneration(UnstructuredGenerationTask::<

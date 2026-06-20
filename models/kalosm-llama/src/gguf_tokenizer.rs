@@ -21,6 +21,7 @@ enum PreTokenizerType {
     Default,
     Exaone,
     Falcon,
+    Gemma4,
     Gpt2,
     Gpt3Finnish,
     Jais,
@@ -69,6 +70,7 @@ impl PreTokenizerType {
                 "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
                 "[0-9][0-9][0-9]",
             ],
+            Self::Gemma4 => &["[^\\n]+|[\\n]+"],
             Self::Starcoder
             | Self::Refact
             | Self::CommandR
@@ -261,6 +263,8 @@ fn sanitize_regex(regex: &str) -> String {
 #[derive(Clone, Copy)]
 pub(crate) struct GGUFPreTokenizerConfig {
     add_bos: bool,
+    byte_level: bool,
+    escape_whitespaces: bool,
     ignore_merges: bool,
     ty: PreTokenizerType,
 }
@@ -298,7 +302,11 @@ impl GGUFPreTokenizerConfig {
         let merges = merges
             .into_iter()
             .map(|(left, right)| format!("{left} {right}"));
-        let bpe = FastBpe::from_vocab_and_merges(vocab, merges, self.ignore_merges)?;
+        let bpe = if self.byte_level {
+            FastBpe::from_vocab_and_merges(vocab, merges, self.ignore_merges)?
+        } else {
+            FastBpe::from_raw_utf8_vocab_and_merges(vocab, merges, self.ignore_merges)?
+        };
         let pre_tokenizer = PreTokenizer::new(self.ty)?;
 
         Ok(GgufTokenizer {
@@ -308,6 +316,7 @@ impl GGUFPreTokenizerConfig {
             special_token_matches,
             bos_token,
             add_bos: self.add_bos,
+            escape_whitespaces: self.escape_whitespaces,
         })
     }
 }
@@ -316,6 +325,8 @@ impl Default for GGUFPreTokenizerConfig {
     fn default() -> Self {
         Self {
             add_bos: true,
+            byte_level: true,
+            escape_whitespaces: false,
             ignore_merges: false,
             ty: PreTokenizerType::Default,
         }
@@ -330,6 +341,7 @@ pub(crate) struct GgufTokenizer {
     special_token_matches: Vec<Vec<(Vec<u8>, u32)>>,
     bos_token: Option<u32>,
     add_bos: bool,
+    escape_whitespaces: bool,
 }
 
 impl GgufTokenizer {
@@ -394,7 +406,12 @@ impl GgufTokenizer {
                 bytes.extend_from_slice(token_bytes);
             }
         }
-        String::from_utf8_lossy(&bytes).into_owned()
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if self.escape_whitespaces {
+            text.replace('▁', " ")
+        } else {
+            text
+        }
     }
 
     pub(crate) fn is_special_token(&self, token: u32) -> bool {
@@ -418,6 +435,14 @@ impl GgufTokenizer {
             pre_tokenizer,
             tokenization,
         } = buffers;
+
+        let normalized;
+        let text = if self.escape_whitespaces {
+            normalized = text.replace(' ', "▁");
+            normalized.as_str()
+        } else {
+            text
+        };
 
         self.pre_tokenizer.split_into_ranges(text, pre_tokenizer);
         for piece in pre_tokenizer.pieces.iter().copied() {
@@ -460,6 +485,14 @@ pub(crate) fn get_pre_tokenizer(
             ignore_merges: true,
             add_bos: true,
             ty: PreTokenizerType::Llama3,
+            ..Default::default()
+        },
+        "gemma4" => GGUFPreTokenizerConfig {
+            add_bos: true,
+            byte_level: false,
+            escape_whitespaces: true,
+            ty: PreTokenizerType::Gemma4,
+            ..Default::default()
         },
         "deepseek-llm" => GGUFPreTokenizerConfig {
             ty: PreTokenizerType::DeepseekLlm,
@@ -534,6 +567,7 @@ pub(crate) fn get_pre_tokenizer(
             ignore_merges: true,
             add_bos: true,
             ty: PreTokenizerType::Tekken,
+            ..Default::default()
         },
         "smollm" => GGUFPreTokenizerConfig {
             ty: PreTokenizerType::Smollm,
@@ -569,7 +603,7 @@ pub(crate) fn get_pre_tokenizer(
     };
 
     if let Some(add_bos) = add_bos {
-        tokenizer.add_bos = add_bos;
+        tokenizer.add_bos = add_bos || pre_tokenizer_type == "gemma4";
     }
 
     tokenizer

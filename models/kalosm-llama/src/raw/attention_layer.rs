@@ -16,6 +16,12 @@ pub enum FeedForwardVariant<F: FloatDataType + SimdElement = f32> {
     Phi(PhiFeedForward),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedForwardActivation {
+    Silu,
+    Gelu,
+}
+
 impl<F: FloatDataType + SimdElement + Default> FeedForwardVariant<F>
 where
     F: CastTo<f32> + CastTensor<f32>,
@@ -83,6 +89,7 @@ impl PhiFeedForward {
 }
 
 pub struct LlamaFeedForward<F: FloatDataType + SimdElement = f32> {
+    activation: FeedForwardActivation,
     gate: QMatrix,
     gate_up: Option<QMatrix>,
     gate_bias: Option<Tensor<1, F>>,
@@ -93,9 +100,15 @@ pub struct LlamaFeedForward<F: FloatDataType + SimdElement = f32> {
 }
 
 impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
-    pub(crate) fn new(gate: QMatrix, down: QMatrix, up: QMatrix) -> Self {
+    pub(crate) fn new_with_activation(
+        gate: QMatrix,
+        down: QMatrix,
+        up: QMatrix,
+        activation: FeedForwardActivation,
+    ) -> Self {
         let gate_up = QMatrix::concat_rows(&[&gate, &up]);
         Self {
+            activation,
             gate,
             gate_up,
             down,
@@ -117,6 +130,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
     ) -> Self {
         let gate_up = QMatrix::concat_rows(&[&gate, &up]);
         Self {
+            activation: FeedForwardActivation::Silu,
             gate,
             gate_up,
             gate_bias,
@@ -192,7 +206,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
                 let up = projected
                     .narrow(D::Minus1, pair_len, pair_len)
                     .to_concrete();
-                (gate.silu() * up).to_concrete()
+                (self.activate(gate) * up).to_concrete()
             }
             Some(gate_up) => {
                 let gate_width = self.gate.shape()[0];
@@ -215,7 +229,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
                     up_states = up_states.add_(&bias_f32);
                 }
 
-                (gate_states.silu() * up_states).to_concrete()
+                (self.activate(gate_states) * up_states).to_concrete()
             }
             None => {
                 let mut w1 = x_f32.q_mat_mul(&self.gate);
@@ -223,7 +237,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
                     let bias_f32: Tensor<1, f32> = bias.cast();
                     w1 = w1.add_(&bias_f32);
                 }
-                let w1 = w1.silu();
+                let w1 = self.activate(w1);
 
                 let mut w3 = x_f32.q_mat_mul(&self.up);
                 if let Some(ref bias) = self.up_bias {
@@ -233,6 +247,13 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
 
                 (w1 * w3).to_concrete()
             }
+        }
+    }
+
+    fn activate(&self, x: Tensor<3, f32>) -> Tensor<3, f32> {
+        match self.activation {
+            FeedForwardActivation::Silu => x.silu(),
+            FeedForwardActivation::Gelu => x.gelu(),
         }
     }
 }
@@ -265,9 +286,10 @@ pub struct SeparateAttention<F: FloatDataType + SimdElement = f32> {
     pub attention_wq: QMatrix,
     pub attention_qkv: Option<QMatrix>,
     pub attention_q_norm: Option<RmsNorm<1, F>>,
-    pub attention_wk: QMatrix,
+    pub attention_wk: Option<QMatrix>,
     pub attention_k_norm: Option<RmsNorm<1, F>>,
-    pub attention_wv: QMatrix,
+    pub attention_wv: Option<QMatrix>,
+    pub attention_v_norm: Option<RmsNorm<1, F>>,
     pub bias: Option<AttentionBias<F>>,
     pub interleaved_rope: bool,
 }
@@ -343,11 +365,16 @@ where
                     .narrow(D::Minus1, query_width + key_width, value_width)
                     .to_concrete();
 
-                value_states
+                let value_states: Tensor<4, F> = value_states
                     .reshape([b_sz, seq_len, num_key_value_heads, head_dim])
                     .transpose(1, 2)
                     .to_concrete()
-                    .cast()
+                    .cast();
+                if let Some(norm) = &self.attention_v_norm {
+                    norm.forward_generic_4d(&value_states)
+                } else {
+                    value_states
+                }
             };
 
             let (query_states, key_states) = rope_cache.forward(
@@ -381,7 +408,11 @@ where
             }
         };
         let key_states: Tensor<4, F> = {
-            let mut key_states = hidden_f32.q_mat_mul(&self.attention_wk);
+            let attention_wk = self
+                .attention_wk
+                .as_ref()
+                .expect("separate attention without K weights must use a shared KV cache");
+            let mut key_states = hidden_f32.q_mat_mul(attention_wk);
 
             if let Some(bias) = &self.bias {
                 let bias_f32: Tensor<1, f32> = bias.bias_k.cast();
@@ -401,18 +432,27 @@ where
             }
         };
         let value_states: Tensor<4, F> = {
-            let mut value_states = hidden_f32.q_mat_mul(&self.attention_wv);
+            let attention_wv = self
+                .attention_wv
+                .as_ref()
+                .expect("separate attention without V weights must use a shared KV cache");
+            let mut value_states = hidden_f32.q_mat_mul(attention_wv);
 
             if let Some(bias) = &self.bias {
                 let bias_f32: Tensor<1, f32> = bias.bias_v.cast();
                 value_states = value_states.add_(&bias_f32);
             }
 
-            value_states
+            let value_states: Tensor<4, F> = value_states
                 .reshape([b_sz, seq_len, num_key_value_heads, head_dim])
                 .transpose(1, 2)
                 .to_concrete()
-                .cast()
+                .cast();
+            if let Some(norm) = &self.attention_v_norm {
+                norm.forward_generic_4d(&value_states)
+            } else {
+                value_states
+            }
         };
 
         let (query_states, key_states) = rope_cache.forward(
@@ -423,6 +463,68 @@ where
             self.interleaved_rope,
         );
         (query_states, key_states, value_states)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_query<B>(
+        &self,
+        num_heads: usize,
+        head_dim: usize,
+        hidden_states: &Tensor<3, F, B>,
+        rope_cache: &RopeImplementation<F>,
+        start_pos: usize,
+        pos_ids: Option<&Tensor<2, F>>,
+    ) -> Tensor<4, F>
+    where
+        B: Fusion<3, F>,
+    {
+        let [b_sz, seq_len, _] = hidden_states.shape();
+        let hidden_f32 = hidden_states.cast::<f32>();
+
+        let query_states: Tensor<4, F> = if let Some(attention_qkv) = &self.attention_qkv {
+            let query_width = num_heads * head_dim;
+            let mut qkv = hidden_f32.q_mat_mul(attention_qkv);
+            if let Some(bias) = &self.bias {
+                let bias_f32: Tensor<1, f32> = bias.bias_qkv.cast();
+                qkv = qkv.add_(&bias_f32);
+            }
+            let query_states = qkv.narrow(D::Minus1, 0, query_width).to_concrete();
+            let query = query_states
+                .reshape([b_sz, seq_len, num_heads, head_dim])
+                .transpose(1, 2)
+                .to_concrete();
+            let query: Tensor<4, F> = query.cast();
+            if let Some(norm) = &self.attention_q_norm {
+                norm.forward_generic_4d(&query)
+            } else {
+                query
+            }
+        } else {
+            let mut query_states = hidden_f32.q_mat_mul(&self.attention_wq);
+            if let Some(bias) = &self.bias {
+                let bias_f32: Tensor<1, f32> = bias.bias_q.cast();
+                query_states = query_states.add_(&bias_f32);
+            }
+            let query = query_states
+                .reshape([b_sz, seq_len, num_heads, head_dim])
+                .transpose(1, 2)
+                .to_concrete();
+            let query: Tensor<4, F> = query.cast();
+            if let Some(norm) = &self.attention_q_norm {
+                norm.forward_generic_4d(&query)
+            } else {
+                query
+            }
+        };
+
+        let (query_states, _) = rope_cache.forward(
+            &query_states,
+            &query_states,
+            start_pos,
+            pos_ids,
+            self.interleaved_rope,
+        );
+        query_states
     }
 }
 
@@ -504,6 +606,12 @@ pub struct LlamaAttention<F: FloatDataType + SimdElement = f32> {
     pub hidden_size: usize,
     pub rope_cache: RopeImplementation<F>,
     pub(crate) sliding_window_size: Option<usize>,
+    pub(crate) attention_scale: f32,
+    pub(crate) shared_kv_layer: Option<usize>,
+    pub(crate) per_layer_inp_gate: Option<QMatrix>,
+    pub(crate) per_layer_proj: Option<QMatrix>,
+    pub(crate) per_layer_post_norm: Option<RmsNorm<1, F>>,
+    pub(crate) layer_output_scale: Option<Tensor<1, F>>,
 }
 
 impl<F: FloatDataType + SimdElement + Default> LlamaAttention<F>
@@ -511,6 +619,29 @@ where
     F: CastTo<f32> + CastTensor<f32>,
     f32: CastTo<F> + CastTensor<F>,
 {
+    fn logical_kv_len(&self, start_pos: usize, q_len: usize) -> usize {
+        let len = start_pos + q_len;
+        self.sliding_window_size
+            .map(|window| len.min(window))
+            .unwrap_or(len)
+    }
+
+    fn narrow_kv_to_logical_len(
+        &self,
+        key_states: Tensor<4, f32>,
+        value_states: Tensor<4, f32>,
+        logical_kv_len: usize,
+    ) -> (Tensor<4, f32>, Tensor<4, f32>) {
+        if key_states.shape()[2] <= logical_kv_len {
+            return (key_states, value_states);
+        }
+
+        (
+            key_states.narrow(2, 0, logical_kv_len).to_concrete(),
+            value_states.narrow(2, 0, logical_kv_len).to_concrete(),
+        )
+    }
+
     pub(crate) fn forward<B>(
         &self,
         hidden_states: &Tensor<3, F, B>,
@@ -558,6 +689,11 @@ where
             None => (key_f32, value_f32),
             Some(cache) => cache.append(&query_f32.device(), &key_f32, &value_f32),
         };
+        let (key_f32, value_f32) = self.narrow_kv_to_logical_len(
+            key_f32,
+            value_f32,
+            self.logical_kv_len(start_pos, q_len),
+        );
 
         forward_attention_qkv_f32(
             &query_f32,
@@ -565,10 +701,56 @@ where
             &value_f32,
             &self.attention_wo,
             attention_mask,
-            head_dim,
             b_sz,
             q_len,
             hidden_size,
+            self.attention_scale,
+        )
+    }
+
+    pub(crate) fn forward_with_shared_kv<B>(
+        &self,
+        hidden_states: &Tensor<3, F, B>,
+        attention_mask: Option<&AttentionMask<f32>>,
+        start_pos: usize,
+        pos_ids: Option<&Tensor<2, F>>,
+        key_states: &Tensor<4, f32>,
+        value_states: &Tensor<4, f32>,
+    ) -> Tensor<3, F>
+    where
+        B: Fusion<3, F>,
+    {
+        let [b_sz, q_len, _] = hidden_states.shape();
+        let query_states = match self.attention_variant {
+            AttentionVariant::Separate(ref attention) => attention.forward_query(
+                self.n_head,
+                self.head_dim,
+                hidden_states,
+                &self.rope_cache,
+                start_pos,
+                pos_ids,
+            ),
+            AttentionVariant::Grouped(_) => {
+                panic!("grouped attention cannot reuse a shared KV cache")
+            }
+        };
+        let query_f32: Tensor<4, f32> = query_states.cast();
+        let (key_states, value_states) = self.narrow_kv_to_logical_len(
+            key_states.clone(),
+            value_states.clone(),
+            self.logical_kv_len(start_pos, q_len),
+        );
+
+        forward_attention_qkv_f32(
+            &query_f32,
+            &key_states,
+            &value_states,
+            &self.attention_wo,
+            attention_mask,
+            b_sz,
+            q_len,
+            self.hidden_size,
+            self.attention_scale,
         )
     }
 
@@ -624,15 +806,23 @@ where
             None => (key_f32, value_f32),
             Some(cache) => cache.append(&query_f32.device(), &key_f32, &value_f32),
         };
+        let (key_f32, value_f32) = self.narrow_kv_to_logical_len(
+            key_f32,
+            value_f32,
+            self.logical_kv_len(start_pos, q_len),
+        );
 
         crate::raw::debug_check_nan_f32(&key_f32, layer_idx, "K_cache_view", start_pos);
         crate::raw::debug_check_nan_f32(&value_f32, layer_idx, "V_cache_view", start_pos);
 
-        let scale = 1. / (head_dim as f64).sqrt();
+        let scale = self.attention_scale;
+        let padded_attention_mask =
+            attention_mask.and_then(|m| pad_attention_mask_to_kv_len(m, key_f32.shape()[2]));
+        let attention_mask = padded_attention_mask.as_ref().or(attention_mask);
         let attn_raw = query_f32.flash_attention(
             &key_f32,
             &value_f32,
-            scale as f32,
+            scale,
             attention_mask.map(|m| {
                 let kind = if m.is_strict_causal() {
                     fusor::MaskKind::Causal
@@ -653,6 +843,28 @@ where
     }
 }
 
+fn pad_attention_mask_to_kv_len(
+    attention_mask: &AttentionMask<f32>,
+    kv_seq_len: usize,
+) -> Option<AttentionMask<f32>> {
+    let mask = attention_mask.mask();
+    let [rows, cols] = mask.shape();
+    if cols == kv_seq_len {
+        return None;
+    }
+
+    if cols > kv_seq_len {
+        return Some(AttentionMask::new(
+            mask.narrow(1, 0, kv_seq_len).to_concrete(),
+        ));
+    }
+
+    let padded = Tensor::full(&mask.device(), [rows, kv_seq_len], f32::NEG_INFINITY);
+    Some(AttentionMask::new(
+        padded.slice_assign([0..rows, 0..cols], mask),
+    ))
+}
+
 /// Forward attention QKV computation in f32 for SIMD compatibility.
 /// All intermediate computation happens in f32, with the final result cast back to F.
 #[allow(clippy::too_many_arguments)]
@@ -662,20 +874,22 @@ pub(crate) fn forward_attention_qkv_f32<F>(
     value_states: &Tensor<4, f32>,
     attention_wo: &Linear<F>,
     attention_mask: Option<&AttentionMask<f32>>,
-    head_dim: usize,
     b_sz: usize,
     q_len: usize,
     hidden_size: usize,
+    attention_scale: f32,
 ) -> Tensor<3, F>
 where
     F: FloatDataType + SimdElement + Default + CastTo<f32> + CastTensor<f32>,
     f32: CastTo<F> + CastTensor<F>,
 {
-    let scale = 1. / (head_dim as f64).sqrt();
+    let padded_attention_mask =
+        attention_mask.and_then(|m| pad_attention_mask_to_kv_len(m, key_states.shape()[2]));
+    let attention_mask = padded_attention_mask.as_ref().or(attention_mask);
     let attn_output = query_states.flash_attention(
         key_states,
         value_states,
-        scale as f32,
+        attention_scale,
         attention_mask.map(|m| {
             let kind = if m.is_strict_causal() {
                 fusor::MaskKind::Causal

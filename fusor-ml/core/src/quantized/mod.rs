@@ -255,21 +255,26 @@ fn qmatrix_storage_layout_for_parts_with_env(
     // the raw-word ggml qgemv dot (`qgemv_q6k_ggml`) cannot address. The
     // f32-scale layout is 212 bytes (word-aligned) and feeds that amortized
     // decode; the +2 bytes/block (~0.9%) is paid back many times over by the
-    // faster kernel. Q4K/Q5K keep their native f16-scale layout (their native
-    // blocks are word-aligned, and native f16 scales read less memory).
+    // faster kernel.
     if ty == GgmlType::Q6K {
         return QMatrixStorageLayout::GpuF32Scales;
     }
-    if matches!(
-        ty,
-        GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K
-    ) && native_half_scale_storage_enabled(shader_f16_supported, env_override)
+    // The small 32-element block formats save only two bytes/block with native
+    // f16 scales, but native Q4_0/Q5_0/Q8_0 blocks are byte-addressed. Decode is
+    // much faster with word-aligned f32-scale storage on Apple GPUs.
+    if matches!(ty, GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0) {
+        if env_override.is_some()
+            && native_half_scale_storage_enabled(shader_f16_supported, env_override)
+        {
+            QMatrixStorageLayout::Native
+        } else {
+            QMatrixStorageLayout::GpuF32Scales
+        }
+    } else if matches!(ty, GgmlType::Q4K | GgmlType::Q5K)
+        && native_half_scale_storage_enabled(shader_f16_supported, env_override)
     {
         QMatrixStorageLayout::Native
-    } else if matches!(
-        ty,
-        GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K
-    ) {
+    } else if matches!(ty, GgmlType::Q4K | GgmlType::Q5K) {
         QMatrixStorageLayout::GpuF32Scales
     } else {
         QMatrixStorageLayout::Native
@@ -536,14 +541,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_capable_quant_storage_defaults_to_native_when_shader_f16_is_supported() {
-        for ty in [
-            GgmlType::Q4_0,
-            GgmlType::Q5_0,
-            GgmlType::Q8_0,
-            GgmlType::Q4K,
-            GgmlType::Q5K,
-        ] {
+    fn small_block_quant_storage_defaults_to_f32_scales() {
+        for ty in [GgmlType::Q4_0, GgmlType::Q5_0, GgmlType::Q8_0] {
+            assert_eq!(
+                qmatrix_storage_layout_for_parts_with_env(ty, true, None),
+                QMatrixStorageLayout::GpuF32Scales
+            );
+            assert_eq!(
+                qmatrix_storage_layout_for_parts_with_env(ty, false, None),
+                QMatrixStorageLayout::GpuF32Scales
+            );
+        }
+    }
+
+    #[test]
+    fn k_quant_storage_defaults_to_native_when_shader_f16_is_supported() {
+        for ty in [GgmlType::Q4K, GgmlType::Q5K] {
             assert_eq!(
                 qmatrix_storage_layout_for_parts_with_env(ty, true, None),
                 QMatrixStorageLayout::Native
@@ -564,7 +577,15 @@ mod tests {
     }
 
     #[test]
-    fn q4k_storage_env_can_force_native_or_f32_expanded() {
+    fn quant_storage_env_can_force_native_or_f32_expanded() {
+        assert_eq!(
+            qmatrix_storage_layout_for_parts_with_env(GgmlType::Q4_0, true, Some("1")),
+            QMatrixStorageLayout::Native
+        );
+        assert_eq!(
+            qmatrix_storage_layout_for_parts_with_env(GgmlType::Q4_0, true, Some("0")),
+            QMatrixStorageLayout::GpuF32Scales
+        );
         assert_eq!(
             qmatrix_storage_layout_for_parts_with_env(GgmlType::Q4K, false, Some("1")),
             QMatrixStorageLayout::Native

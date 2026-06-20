@@ -103,6 +103,82 @@ impl<'a> Lowerer<'a> {
         Ok(self.mul(expressions, body, sum, parts.scale))
     }
 
+    pub(in crate::lower) fn q4_0_f32_dot(
+        &self,
+        expressions: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        k_base: Handle<Expression>,
+        col: Handle<Expression>,
+        a: &[Handle<Expression>],
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if !matrix.format.is_q4_0_family() || !matches!(a.len(), 8 | 16 | 32) {
+            return Err(LowerError::UnsupportedOperation(
+                "q4_0 f32 dot requires a Q4_0 format and 8, 16, or 32 activation values",
+            ));
+        }
+
+        let (base, q_base) = self.quantized_flat_block_base_and_q(
+            expressions,
+            matrix,
+            k_base,
+            col,
+            matrix.format.block_words(),
+            body,
+        );
+        let scale = self.load_affine_scale_f32(expressions, matrix, base, 0, body)?;
+        let data_offset = self.q4_0_data_byte_offset(matrix.format)?;
+        let q_local = self.and_lit(expressions, body, q_base, 15);
+        let high = self.cmp_lit(expressions, body, BinaryOperator::GreaterEqual, q_base, 16);
+        let word_count = if a.len() == 32 { 4 } else { a.len() / 4 };
+        let mut words = Vec::with_capacity(word_count);
+        for word_index in 0..word_count {
+            let byte_offset = self.add_lit(
+                expressions,
+                body,
+                q_local,
+                data_offset + (word_index * 4) as u32,
+            );
+            words.push(self.load_word_at_block_dynamic_byte_offset(
+                expressions,
+                matrix,
+                base,
+                byte_offset,
+                body,
+            )?);
+        }
+
+        let mut quants = Vec::with_capacity(a.len());
+        for lane in 0..a.len() {
+            let byte_lane = self.u32(expressions, (lane % 4) as u32);
+            let word = if a.len() == 32 {
+                words[(lane % 16) / 4]
+            } else {
+                words[lane / 4]
+            };
+            let byte = self.byte_at(expressions, body, word, byte_lane);
+            let low = self.and_lit(expressions, body, byte, 0x0f);
+            let high4 = self.shr_lit(expressions, body, byte, 4);
+            let quant = if a.len() == 32 {
+                if lane >= 16 {
+                    high4
+                } else {
+                    low
+                }
+            } else {
+                self.select(expressions, body, high, high4, low)
+            };
+            quants.push(quant);
+        }
+
+        let weighted_sum = self.dot_quant_vec4_chunks(expressions, body, a, &quants);
+        let activation_sum = self.sum_values(expressions, body, a);
+        let center = self.f32(expressions, 8.0);
+        let center_term = self.mul(expressions, body, activation_sum, center);
+        let centered = self.sub(expressions, body, weighted_sum, center_term);
+        Ok(self.mul(expressions, body, centered, scale))
+    }
+
     pub(in crate::lower) fn q8_0_block_parts8(
         &self,
         expressions: &mut Arena<Expression>,

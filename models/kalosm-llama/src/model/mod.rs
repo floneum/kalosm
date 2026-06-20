@@ -1,6 +1,6 @@
 use crate::gguf_tokenizer::get_pre_tokenizer;
 use crate::raw::cache::LlamaCache;
-use crate::raw::{LlamaVarSource, Model, RopeScalingConfig};
+use crate::raw::{Gemma4MtpAssistant, LlamaVarSource, Model, RopeScalingConfig};
 use crate::token_stream::TokenOutputStream;
 use crate::token_stream::TokenOutputStreamError;
 use crate::tokenizer::{LlamaTokenizer, LlamaTokenizerError};
@@ -109,6 +109,42 @@ fn gpu_run_ahead_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn mtp_speculative_enabled() -> bool {
+    std::env::var_os("KALOSM_LLAMA_MTP")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
+fn mtp_draft_limit(default: usize) -> usize {
+    std::env::var("KALOSM_LLAMA_MTP_DRAFT_N")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+        .max(1)
+}
+
+fn mtp_auto_fallback_enabled() -> bool {
+    std::env::var_os("KALOSM_LLAMA_MTP_AUTO_FALLBACK")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
+fn mtp_fallback_probe_drafts() -> usize {
+    std::env::var("KALOSM_LLAMA_MTP_FALLBACK_PROBE_DRAFTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn mtp_fallback_min_accept_percent() -> usize {
+    std::env::var("KALOSM_LLAMA_MTP_FALLBACK_MIN_ACCEPT_PERCENT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(60)
+        .min(100)
+}
+
 fn decode_trace_enabled() -> bool {
     std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
         || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
@@ -116,16 +152,22 @@ fn decode_trace_enabled() -> bool {
 }
 
 fn gpu_sample_top_k(config: &GpuSamplerConfig) -> usize {
+    if let Some(top_k) = std::env::var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        return top_k.max(1);
+    }
+    if config.sampling_strategy == kalosm_language_model::SamplingStrategy::Standard
+        && config.temperature <= 0.0
+    {
+        return 1;
+    }
     let default_top_k = match config.sampling_strategy {
         kalosm_language_model::SamplingStrategy::Mirostat2 => 16,
         kalosm_language_model::SamplingStrategy::Standard => 64,
     };
-    std::env::var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .or(config.top_k)
-        .unwrap_or(default_top_k)
-        .max(1)
+    config.top_k.unwrap_or(default_top_k).max(1)
 }
 
 fn parse_external_tokenizer(
@@ -179,15 +221,17 @@ fn tokenizer_from_gguf_source<S: LlamaVarSource>(
         .clone()
         .try_into()
         .map_err(|_| LlamaSourceError::NoTokenizer)?;
-    if &*tokenizer_model != "gpt2" {
+    if !matches!(&*tokenizer_model, "gpt2" | "gemma4") {
         return Err(LlamaSourceError::NoTokenizer);
     }
     let pre: Box<str> = source
         .get("tokenizer.ggml.pre")
+        .ok()
+        .cloned()
+        .map(|v| v.try_into())
+        .transpose()
         .map_err(|_| LlamaSourceError::NoTokenizer)?
-        .clone()
-        .try_into()
-        .map_err(|_| LlamaSourceError::NoTokenizer)?;
+        .unwrap_or_else(|| tokenizer_model.clone());
     let add_bos_token = source
         .get("tokenizer.ggml.add_bos_token")
         .ok()
@@ -425,7 +469,35 @@ fn trim_previous_tokens_for_gpu_tail(
 
 #[cfg(test)]
 mod tests {
-    use super::trim_previous_tokens_for_gpu_tail;
+    use super::{gpu_sample_top_k, trim_previous_tokens_for_gpu_tail};
+    use crate::GpuSamplerConfig;
+    use kalosm_language_model::SamplingStrategy;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_gpu_sample_top_k_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let prior = std::env::var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K").ok();
+        // SAFETY: these tests serialize access to this process-wide env var.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K", value),
+                None => std::env::remove_var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K"),
+            }
+        }
+        let result = f();
+        unsafe {
+            match prior {
+                Some(value) => std::env::set_var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K", value),
+                None => std::env::remove_var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K"),
+            }
+        }
+        result
+    }
 
     #[test]
     fn gpu_tail_history_preserves_repetition_window() {
@@ -445,6 +517,31 @@ mod tests {
             trim_previous_tokens_for_gpu_tail(vec![1, 2], 5),
             (vec![1, 2], true)
         );
+    }
+
+    #[test]
+    fn greedy_standard_gpu_sampling_uses_top_one() {
+        let mut config = GpuSamplerConfig::new(0.0, 5.0, 0.1, 10.0, 1.0, 64, Some(64));
+        config.sampling_strategy = SamplingStrategy::Standard;
+        with_gpu_sample_top_k_env(None, || {
+            assert_eq!(gpu_sample_top_k(&config), 1);
+        });
+
+        config.temperature = 0.8;
+        with_gpu_sample_top_k_env(None, || {
+            assert_eq!(gpu_sample_top_k(&config), 64);
+        });
+        with_gpu_sample_top_k_env(Some("8"), || {
+            assert_eq!(gpu_sample_top_k(&config), 8);
+        });
+    }
+
+    #[test]
+    fn greedy_top_k_keeps_mirostat_default() {
+        let config = GpuSamplerConfig::new(0.0, 5.0, 0.1, 10.0, 1.0, 64, None);
+        with_gpu_sample_top_k_env(None, || {
+            assert_eq!(gpu_sample_top_k(&config), 16);
+        });
     }
 }
 
@@ -610,6 +707,7 @@ impl From<image::ImageError> for LlamaModelError {
 /// The inner, synchronous Llama model.
 pub(crate) struct LlamaModel<F: FloatDataType + SimdElement = f32> {
     pub(crate) model: Model<F>,
+    pub(crate) mtp: Option<Gemma4MtpAssistant<F>>,
     pub(crate) device: Device,
     pub(crate) tokenizer: Arc<LlamaTokenizer>,
 }
@@ -755,6 +853,29 @@ where
             None
         };
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let mtp_model_bytes = match &builder.source.mtp_model {
+            Some(mtp_model) => {
+                let mtp_model_source = format!("MTP Model ({mtp_model})");
+                let mut create_progress =
+                    ModelLoadingProgress::downloading_progress(mtp_model_source);
+                let mtp_model_bytes = builder
+                    .source
+                    .cache
+                    .get_bytes(mtp_model, |progress| handler(create_progress(progress)))
+                    .await?;
+                Some(mtp_model_bytes)
+            }
+            None => None,
+        };
+        #[cfg(target_arch = "wasm32")]
+        let mtp_model_bytes: Option<Vec<u8>> = {
+            if builder.source.mtp_model.is_some() {
+                tracing::warn!("Gemma4 MTP speculative decoding is not loaded on wasm targets");
+            }
+            None
+        };
+
         let source = format!("Model ({})", builder.source.model[0]);
         let mut create_progress = ModelLoadingProgress::downloading_progress(source);
         #[cfg(target_arch = "wasm32")]
@@ -784,7 +905,7 @@ where
         let override_chat_template = builder.source.override_chat_template.clone();
 
         #[cfg(target_arch = "wasm32")]
-        let (model, tokenizer) = {
+        let (model, tokenizer, mtp) = {
             let files_with_metadata = match model_source {
                 WasmModelSource::Opfs(model_files) => {
                     if model_files.is_empty() {
@@ -840,13 +961,14 @@ where
             )
             .await?;
 
-            (model, tokenizer)
+            (model, tokenizer, None)
         };
 
         #[cfg(not(target_arch = "wasm32"))]
-        let (model, tokenizer) = {
+        let (model, tokenizer, mtp) = {
             let device = device.clone();
-            let load_model = move || -> Result<(Model<F>, LlamaTokenizer), LlamaSourceError> {
+            let load_model =
+                move || -> Result<(Model<F>, LlamaTokenizer, Option<Gemma4MtpAssistant<F>>), LlamaSourceError> {
                 let tokenizer = parse_external_tokenizer(tokenizer_source)?;
                 let config = parse_external_config(config_bytes)?;
                 if model_bytes.is_empty() {
@@ -885,7 +1007,16 @@ where
                     override_chat_template,
                     config,
                 )?;
-                Ok((model, tokenizer))
+                let mtp = match mtp_model_bytes {
+                    Some(bytes) => {
+                        let mut cursor = std::io::Cursor::new(bytes);
+                        let metadata = GgufMetadata::read(&mut cursor)?;
+                        let mut mtp_source = ShardedVarBuilder::new(vec![(metadata, cursor)]);
+                        Some(Gemma4MtpAssistant::from_gguf(&mut mtp_source, &device)?)
+                    }
+                    None => None,
+                };
+                Ok((model, tokenizer, mtp))
             };
 
             load_model()?
@@ -894,6 +1025,7 @@ where
 
         Ok(Self {
             model,
+            mtp,
             tokenizer: Arc::new(tokenizer),
             device,
         })

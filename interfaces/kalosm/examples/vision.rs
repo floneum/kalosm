@@ -6,7 +6,7 @@ async fn main() {
     tracing_subscriber::fmt::init();
     let t_load_start = Instant::now();
     let model = Llama::builder()
-        .with_source(LlamaSource::qwen_2_5_3b_vl_chat_q4())
+        .with_source(LlamaSource::gemma_4_e2b_it_qat_chat())
         .build()
         .await
         .unwrap();

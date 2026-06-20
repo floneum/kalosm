@@ -111,6 +111,10 @@ impl GgmlQuantFormat {
         matches!(self, Self::Q4K | Self::Q4KNative)
     }
 
+    pub const fn is_q4_0_family(self) -> bool {
+        matches!(self, Self::Q4_0 | Self::Q4_0Native)
+    }
+
     pub const fn is_q8_0_family(self) -> bool {
         matches!(self, Self::Q8_0 | Self::Q8_0Native)
     }
