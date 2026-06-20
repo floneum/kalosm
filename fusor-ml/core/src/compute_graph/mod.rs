@@ -696,14 +696,6 @@ impl ComputeGraphInner {
             .and_then(|n| n.cached.as_ref())
     }
 
-    pub(crate) fn debug_node_state(&self, key: NodeIndex) -> String {
-        self.nodes
-            .nodes
-            .node_weight(key)
-            .map(|n| format!("variant={:?} cached={}", n.variant, n.cached.is_some()))
-            .unwrap_or_else(|| "missing".to_string())
-    }
-
     pub(crate) fn has_live_reference(&self, key: NodeIndex) -> bool {
         self.nodes
             .nodes

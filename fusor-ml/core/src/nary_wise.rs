@@ -586,13 +586,7 @@ impl Operation for ElementwiseOperation {
                     }
                 }
                 // Otherwise use the normal path which may return QMatrix for Dequantize nodes
-                nodes.get_result_or_qmatrix(*idx).unwrap_or_else(|| {
-                    let node_debug = nodes.debug_node_state(*idx);
-                    panic!(
-                        "nary input {i} missing for node {:?}: {node_debug}",
-                        idx
-                    );
-                }).into()
+                nodes.get_result_or_qmatrix(*idx).unwrap().into()
             })
             .collect();
 

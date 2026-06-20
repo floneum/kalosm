@@ -66,10 +66,6 @@ impl MatMulOperation {
         let last_dim = first_shape.len() - 1;
         let second_to_last_dim = first_shape.len() - 2;
         let mut out_shape = first_shape.to_vec();
-        // Handle broadcasting for batch dimensions
-        for i in 0..second_to_last_dim {
-            out_shape[i] = std::cmp::max(first_shape[i], second_shape[i]);
-        }
         out_shape[second_to_last_dim] = first_shape[second_to_last_dim];
         out_shape[last_dim] = second_shape[last_dim];
         assert_eq!(first_shape[last_dim], second_shape[second_to_last_dim]);
@@ -79,7 +75,7 @@ impl MatMulOperation {
                 .rev()
                 .skip(2)
                 .zip(second_shape.iter().rev().skip(2))
-                .all(|(a, b)| *a == *b || *a == 1 || *b == 1)
+                .all(|(a, b)| a == b)
         );
 
         Self {

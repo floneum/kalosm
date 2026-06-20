@@ -246,9 +246,6 @@ impl Device {
     }
 
     pub async fn new() -> Result<Self, crate::Error> {
-        let disable_shader_f16 = std::env::var_os("FUSOR_DISABLE_SHADER_F16")
-            .map(|value| value != "0")
-            .unwrap_or(false);
         let dx_compiler = wgpu::Dx12Compiler::from_env().unwrap_or_default();
         let backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -281,7 +278,7 @@ impl Device {
         if adapter_features.contains(wgpu::Features::SUBGROUP) {
             required_features |= wgpu::Features::SUBGROUP;
         }
-        if !disable_shader_f16 && adapter_features.contains(wgpu::Features::SHADER_F16) {
+        if adapter_features.contains(wgpu::Features::SHADER_F16) {
             required_features |= wgpu::Features::SHADER_F16;
         }
         if std::env::var_os("FUSOR_TRACE_GPU_KERNELS").is_some() {

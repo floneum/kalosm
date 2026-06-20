@@ -151,13 +151,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
         self.inner.materialize()
     }
 
-    /// Resolve this tensor into a new concrete tensor backed by the resolved
-    /// output buffer, so later ops do not keep extending the original lazy graph.
-    #[inline]
-    pub fn materialized(&self) -> Self {
-        Self::from_core(self.inner.materialized())
-    }
-
     #[inline]
     pub fn count_kernels_to_resolve(&self) -> usize {
         self.inner.count_kernels_to_resolve()

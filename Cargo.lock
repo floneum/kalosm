@@ -6512,7 +6512,6 @@ dependencies = [
  "kalosm-sample",
  "kalosm-streams",
  "kalosm-tokenizer",
- "memmap2",
  "minijinja",
  "minijinja-contrib",
  "pollster",
