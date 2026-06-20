@@ -88,36 +88,39 @@ impl GlinerSource {
         Self::huggingface_or_cached("Demonthos/gliner-gguf", "main", file)
     }
 
+    /// Build a bi-encoder v2.0 preset. `name` is the variant slug shared by the
+    /// Demonthos GGUF filenames and the `knowledgator/gliner-bi-{name}-v2.0`
+    /// repo; `label_encoder_model` is the sentence-transformer it pairs with.
+    fn bi_encoder_v2(name: &str, label_encoder_model: &str) -> Self {
+        let st = |file: &str| {
+            FileSource::huggingface(label_encoder_model.to_string(), "main".to_string(), file.to_string())
+        };
+        let knowledgator = |file: &str| {
+            FileSource::huggingface(
+                format!("knowledgator/gliner-bi-{name}-v2.0"),
+                "main".to_string(),
+                file.to_string(),
+            )
+        };
+        Self {
+            model: Self::demonthos_gguf(&format!("gliner-bi-{name}-v2.0-Q4_K.gguf")),
+            label_encoder: Self::demonthos_gguf(&format!(
+                "gliner-bi-{name}-v2.0-Q4_K-label-encoder.gguf"
+            )),
+            label_encoder_config: st("config.json"),
+            label_encoder_tokenizer: st("tokenizer.json"),
+            tokenizer: knowledgator("tokenizer.json"),
+            config: knowledgator("gliner_config.json"),
+        }
+    }
+
     /// GLiNER bi-encoder v2.0 Edge variant (60M parameters, Q4_K).
     ///
     /// The smallest and fastest variant, using:
     /// - Text encoder: ettin-encoder-32m
     /// - Label encoder: all-MiniLM-L6-v2
     pub fn edge() -> Self {
-        Self {
-            model: Self::demonthos_gguf("gliner-bi-edge-v2.0-Q4_K.gguf"),
-            label_encoder: Self::demonthos_gguf("gliner-bi-edge-v2.0-Q4_K-label-encoder.gguf"),
-            label_encoder_config: FileSource::huggingface(
-                "sentence-transformers/all-MiniLM-L6-v2".to_string(),
-                "main".to_string(),
-                "config.json".to_string(),
-            ),
-            label_encoder_tokenizer: FileSource::huggingface(
-                "sentence-transformers/all-MiniLM-L6-v2".to_string(),
-                "main".to_string(),
-                "tokenizer.json".to_string(),
-            ),
-            tokenizer: FileSource::huggingface(
-                "knowledgator/gliner-bi-edge-v2.0".to_string(),
-                "main".to_string(),
-                "tokenizer.json".to_string(),
-            ),
-            config: FileSource::huggingface(
-                "knowledgator/gliner-bi-edge-v2.0".to_string(),
-                "main".to_string(),
-                "gliner_config.json".to_string(),
-            ),
-        }
+        Self::bi_encoder_v2("edge", "sentence-transformers/all-MiniLM-L6-v2")
     }
 
     /// GLiNER bi-encoder v2.0 Small variant (108M parameters, Q4_K).
@@ -126,30 +129,7 @@ impl GlinerSource {
     /// - Text encoder: ettin-encoder-68m
     /// - Label encoder: all-MiniLM-L12-v2
     pub fn small() -> Self {
-        Self {
-            model: Self::demonthos_gguf("gliner-bi-small-v2.0-Q4_K.gguf"),
-            label_encoder: Self::demonthos_gguf("gliner-bi-small-v2.0-Q4_K-label-encoder.gguf"),
-            label_encoder_config: FileSource::huggingface(
-                "sentence-transformers/all-MiniLM-L12-v2".to_string(),
-                "main".to_string(),
-                "config.json".to_string(),
-            ),
-            label_encoder_tokenizer: FileSource::huggingface(
-                "sentence-transformers/all-MiniLM-L12-v2".to_string(),
-                "main".to_string(),
-                "tokenizer.json".to_string(),
-            ),
-            tokenizer: FileSource::huggingface(
-                "knowledgator/gliner-bi-small-v2.0".to_string(),
-                "main".to_string(),
-                "tokenizer.json".to_string(),
-            ),
-            config: FileSource::huggingface(
-                "knowledgator/gliner-bi-small-v2.0".to_string(),
-                "main".to_string(),
-                "gliner_config.json".to_string(),
-            ),
-        }
+        Self::bi_encoder_v2("small", "sentence-transformers/all-MiniLM-L12-v2")
     }
 
     /// GLiNER bi-encoder v2.0 Base variant (194M parameters, Q4_K).
@@ -158,30 +138,7 @@ impl GlinerSource {
     /// - Text encoder: ettin-encoder-150m
     /// - Label encoder: bge-small-en-v1.5
     pub fn base() -> Self {
-        Self {
-            model: Self::demonthos_gguf("gliner-bi-base-v2.0-Q4_K.gguf"),
-            label_encoder: Self::demonthos_gguf("gliner-bi-base-v2.0-Q4_K-label-encoder.gguf"),
-            label_encoder_config: FileSource::huggingface(
-                "BAAI/bge-small-en-v1.5".to_string(),
-                "main".to_string(),
-                "config.json".to_string(),
-            ),
-            label_encoder_tokenizer: FileSource::huggingface(
-                "BAAI/bge-small-en-v1.5".to_string(),
-                "main".to_string(),
-                "tokenizer.json".to_string(),
-            ),
-            tokenizer: FileSource::huggingface(
-                "knowledgator/gliner-bi-base-v2.0".to_string(),
-                "main".to_string(),
-                "tokenizer.json".to_string(),
-            ),
-            config: FileSource::huggingface(
-                "knowledgator/gliner-bi-base-v2.0".to_string(),
-                "main".to_string(),
-                "gliner_config.json".to_string(),
-            ),
-        }
+        Self::bi_encoder_v2("base", "BAAI/bge-small-en-v1.5")
     }
 
     /// GLiNER bi-encoder v2.0 Large variant (530M parameters, Q4_K).
@@ -190,30 +147,7 @@ impl GlinerSource {
     /// - Text encoder: ettin-encoder-400m
     /// - Label encoder: bge-base-en-v1.5
     pub fn large() -> Self {
-        Self {
-            model: Self::demonthos_gguf("gliner-bi-large-v2.0-Q4_K.gguf"),
-            label_encoder: Self::demonthos_gguf("gliner-bi-large-v2.0-Q4_K-label-encoder.gguf"),
-            label_encoder_config: FileSource::huggingface(
-                "BAAI/bge-base-en-v1.5".to_string(),
-                "main".to_string(),
-                "config.json".to_string(),
-            ),
-            label_encoder_tokenizer: FileSource::huggingface(
-                "BAAI/bge-base-en-v1.5".to_string(),
-                "main".to_string(),
-                "tokenizer.json".to_string(),
-            ),
-            tokenizer: FileSource::huggingface(
-                "knowledgator/gliner-bi-large-v2.0".to_string(),
-                "main".to_string(),
-                "tokenizer.json".to_string(),
-            ),
-            config: FileSource::huggingface(
-                "knowledgator/gliner-bi-large-v2.0".to_string(),
-                "main".to_string(),
-                "gliner_config.json".to_string(),
-            ),
-        }
+        Self::bi_encoder_v2("large", "BAAI/bge-base-en-v1.5")
     }
 
     /// Create a custom source with specific file locations.

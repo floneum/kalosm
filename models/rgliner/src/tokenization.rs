@@ -44,7 +44,7 @@ impl WordTokenizer {
     /// Tokenize text and track word boundaries.
     pub fn tokenize(&self, text: &str) -> Result<TokenizedText, GlinerError> {
         let split_words = split_words(text);
-        let words: Vec<String> = split_words.iter().map(|(word, _)| word.clone()).collect();
+        let words: Vec<String> = split_words.iter().map(|(word, _)| word.to_string()).collect();
         let word_offsets: Vec<(usize, usize)> =
             split_words.iter().map(|(_, offsets)| *offsets).collect();
 
@@ -113,7 +113,7 @@ pub(crate) fn token_packed_ranges(
     let mut word_token_counts = Vec::with_capacity(words.len());
     for (w, _) in &words {
         let enc = tokenizer
-            .encode(w.clone(), false)
+            .encode(*w, false)
             .map_err(GlinerError::Tokenizer)?;
         word_token_counts.push(enc.get_ids().len().max(1));
     }
@@ -145,7 +145,11 @@ pub(crate) fn token_packed_ranges(
     Ok(ranges)
 }
 
-fn split_words(text: &str) -> Vec<(String, (usize, usize))> {
+/// Split text into words with byte offsets, matching Python GLiNER's
+/// `WhitespaceTokenSplitter` regex `\w+(?:[-_]\w+)*|\S`. `\w` is Unicode-aware
+/// (`char::is_alphanumeric`), so this is correct for the multilingual models.
+/// Shared by both the bi-encoder and RelEx tokenizers.
+pub(crate) fn split_words(text: &str) -> Vec<(&str, (usize, usize))> {
     let mut words = Vec::new();
     let mut chars = text.char_indices().peekable();
 
@@ -189,13 +193,13 @@ fn split_words(text: &str) -> Vec<(String, (usize, usize))> {
                 break;
             }
 
-            words.push((text[start..end].to_string(), (start, end)));
+            words.push((&text[start..end], (start, end)));
             continue;
         }
 
         chars.next();
         let end = start + ch.len_utf8();
-        words.push((text[start..end].to_string(), (start, end)));
+        words.push((&text[start..end], (start, end)));
     }
 
     words
@@ -300,9 +304,9 @@ mod tests {
         assert_eq!(
             words,
             vec![
-                ("all-MiniLM_L6-v2".to_string(), (0, 16)),
-                ("rocks".to_string(), (17, 22)),
-                (".".to_string(), (22, 23)),
+                ("all-MiniLM_L6-v2", (0, 16)),
+                ("rocks", (17, 22)),
+                (".", (22, 23)),
             ]
         );
     }
@@ -314,12 +318,12 @@ mod tests {
         assert_eq!(
             words,
             vec![
-                ("Apple".to_string(), (0, 5)),
-                ("Inc".to_string(), (6, 9)),
-                (".".to_string(), (9, 10)),
-                ("was".to_string(), (11, 14)),
-                ("founded".to_string(), (15, 22)),
-                (".".to_string(), (22, 23)),
+                ("Apple", (0, 5)),
+                ("Inc", (6, 9)),
+                (".", (9, 10)),
+                ("was", (11, 14)),
+                ("founded", (15, 22)),
+                (".", (22, 23)),
             ]
         );
     }

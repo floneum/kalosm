@@ -43,13 +43,4 @@ impl TextEncoder {
             hidden
         }
     }
-
-    #[cfg(test)]
-    pub fn debug_hidden_states(
-        &self,
-        input_ids: &Tensor<2, u32>,
-        attention_mask: Option<&Tensor<2, u32>>,
-    ) -> Vec<Tensor<3, f32>> {
-        self.model.debug_hidden_states(input_ids, attention_mask)
-    }
 }

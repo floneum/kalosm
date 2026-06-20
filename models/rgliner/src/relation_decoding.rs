@@ -174,45 +174,6 @@ impl RelationDecoder {
         pairs
     }
 
-    /// Pool entity span embeddings by mean pooling.
-    ///
-    /// # Arguments
-    /// * `text_embeddings` - Text token embeddings [num_words, hidden_size]
-    /// * `entity` - Entity with word indices
-    ///
-    /// # Returns
-    /// Mean-pooled embedding for the entity span
-    pub fn pool_entity_embedding(
-        text_embeddings: &[f32],
-        hidden_size: usize,
-        entity: &Entity,
-    ) -> Vec<f32> {
-        let start = entity.start_word;
-        let end = entity.end_word;
-        let num_words = end - start + 1;
-
-        if num_words == 0 {
-            return vec![0.0; hidden_size];
-        }
-
-        let mut pooled = vec![0.0f32; hidden_size];
-
-        for word_idx in start..=end {
-            let offset = word_idx * hidden_size;
-            for h in 0..hidden_size {
-                if offset + h < text_embeddings.len() {
-                    pooled[h] += text_embeddings[offset + h];
-                }
-            }
-        }
-
-        // Divide by number of words for mean pooling
-        for h in 0..hidden_size {
-            pooled[h] /= num_words as f32;
-        }
-
-        pooled
-    }
 }
 
 impl Default for RelationDecoder {

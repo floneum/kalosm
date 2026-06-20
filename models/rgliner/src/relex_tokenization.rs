@@ -160,7 +160,7 @@ impl RelExTokenizer {
         token_ids.push(self.special_tokens.inner_sep_id);
 
         // Encode text with word-level tracking: each word is tokenized separately
-        let words = self.split_words(text);
+        let words = crate::tokenization::split_words(text);
         for (word, (start_char, end_char)) in words {
             text_positions.push(token_ids.len());
             word_offsets.push((start_char, end_char));
@@ -203,73 +203,6 @@ impl RelExTokenizer {
             .collect()
     }
 
-    /// Split text into words with character offsets.
-    ///
-    /// Matches Python GLiNER's `WhitespaceTokenSplitter` regex:
-    /// `\w+(?:[-_]\w+)*|\S`
-    ///
-    /// This yields:
-    /// - Runs of word characters (alphanumeric/underscore), with hyphens/underscores
-    ///   joining word-like groups (e.g. "foo-bar", "x_1")
-    /// - OR any single non-whitespace character (punctuation as its own token)
-    fn split_words<'a>(&self, text: &'a str) -> Vec<(&'a str, (usize, usize))> {
-        let mut words = Vec::new();
-        let bytes = text.as_bytes();
-        let n = bytes.len();
-        let mut i = 0;
-
-        // Helpers operating on byte indices. Text is ASCII-safe for typical inputs;
-        // for non-ASCII, is_word_char treats each UTF-8 byte - safe approximation that
-        // matches what Python's \w would do for ASCII-only text.
-        let is_word_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
-        let is_whitespace = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r');
-
-        while i < n {
-            let c = bytes[i];
-            if is_whitespace(c) {
-                i += 1;
-                continue;
-            }
-            if is_word_char(c) {
-                // Match \w+(?:[-_]\w+)*
-                let start = i;
-                while i < n && is_word_char(bytes[i]) {
-                    i += 1;
-                }
-                // Try to extend with (-|_)\w+ groups (greedy)
-                loop {
-                    if i + 1 < n
-                        && (bytes[i] == b'-' || bytes[i] == b'_')
-                        && is_word_char(bytes[i + 1])
-                    {
-                        i += 1;
-                        while i < n && is_word_char(bytes[i]) {
-                            i += 1;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                let end = i;
-                words.push((&text[start..end], (start, end)));
-            } else {
-                // \S - single non-whitespace character (byte here; for ASCII this is fine)
-                // Advance by one UTF-8 codepoint
-                let char_len = std::str::from_utf8(&bytes[i..i.saturating_add(4).min(n)])
-                    .ok()
-                    .and_then(|s| s.chars().next())
-                    .map(|c| c.len_utf8())
-                    .unwrap_or(1);
-                let start = i;
-                let end = i + char_len;
-                words.push((&text[start..end], (start, end)));
-                i = end;
-            }
-        }
-
-        words
-    }
-
     /// Get the underlying tokenizer.
     pub fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
@@ -278,39 +211,5 @@ impl RelExTokenizer {
     /// Get special token IDs.
     pub fn special_tokens(&self) -> &SpecialTokenIds {
         &self.special_tokens
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    /// Helper function to test word splitting logic without needing a tokenizer.
-    fn split_words(text: &str) -> Vec<(&str, (usize, usize))> {
-        let mut words = Vec::new();
-        let mut char_idx = 0;
-
-        for word in text.split_whitespace() {
-            if let Some(pos) = text[char_idx..].find(word) {
-                let start = char_idx + pos;
-                let end = start + word.len();
-                words.push((word, (start, end)));
-                char_idx = end;
-            }
-        }
-
-        words
-    }
-
-    #[test]
-    fn test_split_words() {
-        let text = "Apple Inc. was founded by Steve Jobs.";
-        let words = split_words(text);
-
-        assert_eq!(words.len(), 7);
-        assert_eq!(words[0].0, "Apple");
-        assert_eq!(words[0].1, (0, 5));
-        assert_eq!(words[1].0, "Inc.");
-        assert_eq!(words[1].1, (6, 10));
-        assert_eq!(words[5].0, "Steve");
-        assert_eq!(words[6].0, "Jobs.");
     }
 }

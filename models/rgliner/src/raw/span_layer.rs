@@ -22,13 +22,11 @@ pub struct SpanLayer {
     /// Output projection: [2 * hidden_dim] -> [hidden_dim]
     out_fc1: Linear<f32>,
     out_fc2: Linear<f32>,
-    /// Maximum span width
-    max_width: usize,
 }
 
 impl SpanLayer {
     /// Load span layer from GGUF weights.
-    pub fn load(device: &Device, vb: &mut VarBuilder, max_width: usize) -> Result<Self> {
+    pub fn load(device: &Device, vb: &mut VarBuilder) -> Result<Self> {
         // Try different weight naming conventions
         let start_fc1 = Linear::load(device, &mut vb.pp("span.start_fc1")).or_else(|_| {
             Linear::load(
@@ -76,80 +74,7 @@ impl SpanLayer {
             end_fc2,
             out_fc1,
             out_fc2,
-            max_width,
         })
-    }
-
-    /// Enumerate all valid spans up to max_width.
-    ///
-    /// Returns Vec of (start_word, end_word) pairs.
-    pub fn enumerate_spans(&self, num_words: usize) -> Vec<(usize, usize)> {
-        let mut spans = Vec::new();
-        for start in 0..num_words {
-            for width in 1..=self.max_width.min(num_words - start) {
-                let end = start + width - 1;
-                spans.push((start, end));
-            }
-        }
-        spans
-    }
-
-    /// Generate span representations from word embeddings.
-    ///
-    /// # Arguments
-    /// * `word_embeddings` - Word embeddings [batch, num_words, hidden_dim]
-    /// * `device` - Device for output tensors
-    ///
-    /// # Returns
-    /// * Span embeddings [batch, num_spans, hidden_dim]
-    /// * Span indices (start_word, end_word) for each span
-    pub fn forward(
-        &self,
-        word_embeddings: &Tensor<3, f32>,
-        device: &Device,
-    ) -> (Tensor<3, f32>, Vec<(usize, usize)>) {
-        let shape = word_embeddings.shape();
-        let batch_size = shape[0];
-        let num_words = shape[1];
-        let hidden_dim = shape[2];
-
-        // Enumerate all valid spans
-        let span_indices = self.enumerate_spans(num_words);
-        let num_spans = span_indices.len();
-
-        if num_spans == 0 {
-            // Return empty tensor if no spans
-            let empty = Tensor::zeros(device, [batch_size, 1, hidden_dim]);
-            return (empty, vec![(0, 0)]);
-        }
-
-        // Build start and end embeddings for all spans
-        let (start_emb, end_emb) =
-            self.gather_span_embeddings(word_embeddings, &span_indices, device);
-
-        // Project start embeddings: [batch, num_spans, hidden_dim]
-        // create_projection_layer uses: Linear -> ReLU -> Dropout -> Linear
-        let start_projected = self
-            .start_fc2
-            .forward(&self.start_fc1.forward(&start_emb).relu());
-
-        // Project end embeddings: [batch, num_spans, hidden_dim]
-        let end_projected = self.end_fc2.forward(&self.end_fc1.forward(&end_emb).relu());
-
-        // Concatenate: [batch, num_spans, 2 * hidden_dim]
-        // Python does: cat([start, end]).relu() before out_project
-        let combined = Tensor::cat(
-            [start_projected.to_concrete(), end_projected.to_concrete()],
-            2,
-        )
-        .relu();
-
-        // Output projection: [batch, num_spans, hidden_dim]
-        let span_embeddings = self
-            .out_fc2
-            .forward(&self.out_fc1.forward(&combined).relu());
-
-        (span_embeddings, span_indices)
     }
 
     /// Compute span representations for specific (start, end) word positions.
@@ -248,60 +173,4 @@ impl SpanLayer {
         (out, span_counts)
     }
 
-    fn gather_span_embeddings(
-        &self,
-        word_embeddings: &Tensor<3, f32>,
-        span_indices: &[(usize, usize)],
-        device: &Device,
-    ) -> (Tensor<3, f32>, Tensor<3, f32>) {
-        let shape = word_embeddings.shape();
-        let batch_size = shape[0];
-        let num_words = shape[1];
-        let hidden_dim = shape[2];
-        let num_spans = span_indices.len();
-
-        // Create index tensors for gathering
-        let start_indices: Vec<u32> = span_indices.iter().map(|(s, _)| *s as u32).collect();
-        let end_indices: Vec<u32> = span_indices.iter().map(|(_, e)| *e as u32).collect();
-
-        // Flatten word_embeddings to [batch * num_words, hidden_dim]
-        let word_embeddings_concrete = word_embeddings.to_concrete();
-        let flat_embeddings = word_embeddings_concrete
-            .reshape([batch_size * num_words, hidden_dim])
-            .to_concrete();
-
-        // Build offset indices for batch processing
-        let mut start_offset_indices: Vec<u32> = Vec::with_capacity(batch_size * num_spans);
-        let mut end_offset_indices: Vec<u32> = Vec::with_capacity(batch_size * num_spans);
-
-        for batch_idx in 0..batch_size {
-            let offset = (batch_idx * num_words) as u32;
-            for &start in &start_indices {
-                start_offset_indices.push(start + offset);
-            }
-        }
-        for batch_idx in 0..batch_size {
-            let offset = (batch_idx * num_words) as u32;
-            for &end in &end_indices {
-                end_offset_indices.push(end + offset);
-            }
-        }
-
-        let start_idx_tensor = Tensor::new(device, &start_offset_indices);
-        let end_idx_tensor = Tensor::new(device, &end_offset_indices);
-
-        // Gather start and end embeddings
-        let start_emb = flat_embeddings.index_select(0, &start_idx_tensor);
-        let end_emb = flat_embeddings.index_select(0, &end_idx_tensor);
-
-        // Reshape to [batch, num_spans, hidden_dim]
-        let start_emb = start_emb
-            .reshape([batch_size, num_spans, hidden_dim])
-            .to_concrete();
-        let end_emb = end_emb
-            .reshape([batch_size, num_spans, hidden_dim])
-            .to_concrete();
-
-        (start_emb, end_emb)
-    }
 }
