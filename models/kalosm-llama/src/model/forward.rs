@@ -46,7 +46,7 @@ where
         };
         let token_start = trace_enabled.then(Instant::now);
         let build_start = trace_enabled.then(Instant::now);
-        let logits = if !images.is_empty() && model.should_chunk_multimodal_prompt(device) {
+        let logits = if !images.is_empty() && model.should_chunk_multimodal_prompt() {
             model.forward_chunked_multimodal(tokens, images, device, cache)
         } else {
             model.forward(tokens, images, device, cache)
@@ -234,7 +234,7 @@ where
         }
 
         if gpu_fused_logits_sampling_enabled()
-            && (images.is_empty() || !model.should_chunk_multimodal_prompt(device))
+            && (images.is_empty() || !model.should_chunk_multimodal_prompt())
         {
             return Self::forward_sample_token_fused_logits(
                 ForwardInputs {
@@ -333,7 +333,7 @@ where
             return Ok(None);
         }
 
-        if !images.is_empty() && model.should_chunk_multimodal_prompt(device) {
+        if !images.is_empty() && model.should_chunk_multimodal_prompt() {
             let logits = model.forward_chunked_multimodal(tokens, images, device, cache)?;
             let logits: fusor::Tensor<1, f32> = logits.squeeze(0).cast();
             return Self::forward_sample_token_pending_from_logits(

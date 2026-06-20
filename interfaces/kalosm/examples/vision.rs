@@ -5,11 +5,21 @@ use std::time::Instant;
 async fn main() {
     tracing_subscriber::fmt::init();
     let t_load_start = Instant::now();
-    let model = Llama::builder()
-        .with_source(LlamaSource::gemma_4_e2b_it_qat_chat())
-        .build()
-        .await
-        .unwrap();
+    let mut builder = Llama::builder().with_source(
+        LlamaSource::gemma_4_e2b_it_qat_chat().with_vision_model(FileSource::HuggingFace {
+            model_id: "unsloth/gemma-4-E2B-it-qat-GGUF".into(),
+            revision: "main".into(),
+            file: "mmproj-F16.gguf".into(),
+        }),
+    );
+    builder = if std::env::var_os("KALOSM_VISION_CPU").is_some() {
+        builder.with_device(Device::Cpu)
+    } else {
+        builder.with_device(Device::gpu().await.expect(
+            "The vision example requires a GPU by default; set KALOSM_VISION_CPU=1 to run the slow CPU path.",
+        ))
+    };
+    let model = builder.build().await.unwrap();
     tracing::info!("[timing] model load: {:.2?}", t_load_start.elapsed());
 
     let mut chat = model.chat();
@@ -23,18 +33,22 @@ async fn main() {
     } else if let Ok(path) = std::env::var("KALOSM_VISION_IMAGE") {
         MediaSource::file(path).unwrap()
     } else {
-        MediaSource::url("https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg")
+        MediaSource::bytes(include_bytes!("landscape.jpg").as_slice())
     };
-    let mut response = chat(&(
-        MediaChunk::new(image_source, MediaType::Image),
-        "Describe this image.",
-    ));
+    let mut sampler = GenerationParameters::new()
+        .with_standard_sampler()
+        .with_temperature(0.0);
     if let Some(seed) = std::env::var("KALOSM_VISION_SEED")
         .ok()
         .and_then(|seed| seed.parse::<u64>().ok())
     {
-        response = response.with_sampler(GenerationParameters::new().with_seed(seed));
+        sampler = sampler.with_seed(seed);
     }
+    let mut response = chat(&(
+        MediaChunk::new(image_source, MediaType::Image),
+        "Describe this image.",
+    ))
+    .with_sampler(sampler);
     let mut first_token_at: Option<std::time::Duration> = None;
     let mut token_count = 0u64;
     let t_prefill = Instant::now();

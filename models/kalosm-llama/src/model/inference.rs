@@ -46,6 +46,7 @@ where
         }
 
         if mtp_speculative_enabled()
+            && images.is_empty()
             && stop_on.is_none()
             && sampler.sampling_strategy == kalosm_language_model::SamplingStrategy::Standard
             && sampler.temperature <= 0.0

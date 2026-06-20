@@ -1039,6 +1039,10 @@ where
                     images.push(image);
                     grid_thw.push(thw)
                 }
+            } else if !raw_images.is_empty() {
+                return Err(fusor::Error::msg(
+                    "Media inputs require a loaded vision encoder.",
+                ));
             }
 
             // Add image padding tokens for any placeholders in the prompt.
@@ -1251,7 +1255,7 @@ where
         Ok(result_f32.cast())
     }
 
-    pub(crate) fn should_chunk_multimodal_prompt(&self, device: &Device) -> bool {
+    pub(crate) fn should_chunk_multimodal_prompt(&self) -> bool {
         if std::env::var_os("KALOSM_LLAMA_DISABLE_MULTIMODAL_CHUNK").is_some() {
             return false;
         }
@@ -1260,16 +1264,13 @@ where
         }
         #[cfg(feature = "vision")]
         {
-            device.is_gpu()
-                && matches!(
-                    self.vision_encoder,
-                    Some(vision::VisionTransformer::Gemma(_))
-                )
-                && self.config.image_pad_token.is_some()
+            matches!(
+                self.vision_encoder,
+                Some(vision::VisionTransformer::Gemma(_))
+            ) && self.config.image_pad_token.is_some()
         }
         #[cfg(not(feature = "vision"))]
         {
-            let _ = device;
             false
         }
     }
