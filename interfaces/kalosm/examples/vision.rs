@@ -6,11 +6,7 @@ async fn main() {
     tracing_subscriber::fmt::init();
     let t_load_start = Instant::now();
     let mut builder = Llama::builder().with_source(
-        LlamaSource::gemma_4_e2b_it_qat_chat().with_vision_model(FileSource::HuggingFace {
-            model_id: "unsloth/gemma-4-E2B-it-qat-GGUF".into(),
-            revision: "main".into(),
-            file: "mmproj-F16.gguf".into(),
-        }),
+        LlamaSource::gemma_4_e2b_it_qat_chat(),
     );
     builder = if std::env::var_os("KALOSM_VISION_CPU").is_some() {
         builder.with_device(Device::Cpu)
@@ -26,7 +22,7 @@ async fn main() {
     let max_tokens = std::env::var("KALOSM_VISION_MAX_TOKENS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(64);
+        .unwrap_or(1024);
     let t_total = Instant::now();
     let image_source = if let Ok(url) = std::env::var("KALOSM_VISION_URL") {
         MediaSource::url(url)
@@ -62,6 +58,7 @@ async fn main() {
         }
         token_count += 1;
         print!("{}", token);
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
         if token_count >= max_tokens {
             break;
         }

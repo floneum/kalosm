@@ -1000,6 +1000,11 @@ impl LlamaSource {
             "main".to_string(),
             "MTP/gemma-4-E2B-it-Q4_0-MTP.gguf".to_string(),
         ))
+        .with_vision_model(FileSource::huggingface(
+            "unsloth/gemma-4-E2B-it-qat-GGUF".to_string(),
+            "main".to_string(),
+            "mmproj-F16.gguf".to_string(),
+        ))
         .with_override_stop_token_string("<turn|>")
     }
 
