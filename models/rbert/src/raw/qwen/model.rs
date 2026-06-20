@@ -1,7 +1,10 @@
-use fusor::layers::{Embedding, RmsNorm};
-use fusor::{Device, Result, RopeCache, Tensor, VarBuilder};
+use fusor::layers::{Embedding, Linear, RmsNorm};
+use fusor::{
+    AttentionVariant, Device, FeedForwardVariant, LlamaFeedForward, Norm, Result, RopeCache,
+    SeparateAttention, Tensor, TransformerBlock, VarBuilder,
+};
 
-use super::layer::QwenLayer;
+use super::super::utils::attention_mask_to_bias;
 
 /// Configuration for QwenEmbeddingModel loaded from GGUF metadata
 #[derive(Debug, Clone)]
@@ -85,12 +88,66 @@ impl QwenConfig {
     }
 }
 
+/// Build one Qwen encoder block as a shared [`TransformerBlock`]: separate
+/// Q/K/V projections with optional q/k norm, RoPE, pre-norm RMSNorm, and a
+/// SwiGLU feed-forward.
+fn load_qwen_block(
+    device: &Device,
+    vb: &mut VarBuilder,
+    config: &QwenConfig,
+    rope_cache: &RopeCache,
+) -> Result<TransformerBlock<f32, RopeCache>> {
+    let eps = config.rms_norm_eps;
+
+    let wq = vb.get("attn_q.weight", device)?;
+    let wk = vb.get("attn_k.weight", device)?;
+    let wv = vb.get("attn_v.weight", device)?;
+    let wo = vb.get("attn_output.weight", device)?;
+
+    // Optional Q/K normalization (some Qwen models have this).
+    let q_norm = RmsNorm::load(device, &mut vb.pp("attn_q_norm"), eps).ok();
+    let k_norm = RmsNorm::load(device, &mut vb.pp("attn_k_norm"), eps).ok();
+
+    let attention_norm = RmsNorm::load(device, &mut vb.pp("attn_norm"), eps)?;
+    let ffn_norm = RmsNorm::load(device, &mut vb.pp("ffn_norm"), eps)?;
+
+    let gate = vb.get("ffn_gate.weight", device)?;
+    let up = vb.get("ffn_up.weight", device)?;
+    let down = vb.get("ffn_down.weight", device)?;
+
+    Ok(TransformerBlock {
+        attention_variant: AttentionVariant::Separate(Box::new(SeparateAttention {
+            attention_wq: wq,
+            attention_qkv: None,
+            attention_q_norm: q_norm,
+            attention_wk: wk,
+            attention_k_norm: k_norm,
+            attention_wv: wv,
+            bias: None,
+            interleaved_rope: false,
+        })),
+        attention_wo: Linear::new(wo, None),
+        attention_norm: Some(Norm::Rms(attention_norm)),
+        post_attention_norm: None,
+        feed_forward_variant: FeedForwardVariant::Llama(Box::new(LlamaFeedForward::new(
+            gate, down, up,
+        ))),
+        ffn_norm: Norm::Rms(ffn_norm),
+        post_ffn_norm: None,
+        n_head: config.num_heads,
+        n_kv_head: config.num_kv_heads,
+        head_dim: config.head_dimension,
+        hidden_size: config.hidden_size,
+        rope_cache: rope_cache.clone(),
+        sliding_window_size: None,
+    })
+}
+
 /// Qwen embedding model (encoder-only for embeddings)
 pub struct QwenEmbeddingModel {
     token_embeddings: Embedding<f32>,
-    layers: Vec<QwenLayer>,
+    layers: Vec<TransformerBlock<f32, RopeCache>>,
     final_norm: RmsNorm<1, f32>,
-    rope_cache: RopeCache,
     pub(crate) device: Device,
     config: QwenConfig,
 }
@@ -103,7 +160,7 @@ impl QwenEmbeddingModel {
         // Load token embeddings
         let token_embeddings = Embedding::load(device, &mut vb.pp("token_embd"))?;
 
-        // Create RoPE cache
+        // Create RoPE cache (shared across every layer)
         let rope_cache = RopeCache::new(
             config.head_dimension,
             config.context_length,
@@ -114,13 +171,11 @@ impl QwenEmbeddingModel {
         // Load transformer layers
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
-            let layer = QwenLayer::load(
+            let layer = load_qwen_block(
                 device,
                 &mut vb.pp(format!("blk.{i}")),
-                config.num_heads,
-                config.num_kv_heads,
-                config.head_dimension,
-                config.rms_norm_eps,
+                &config,
+                &rope_cache,
             )?;
             layers.push(layer);
         }
@@ -132,7 +187,6 @@ impl QwenEmbeddingModel {
             token_embeddings,
             layers,
             final_norm,
-            rope_cache,
             device: device.clone(),
             config,
         })
@@ -149,9 +203,12 @@ impl QwenEmbeddingModel {
         // Get token embeddings
         let mut hidden_states = self.token_embeddings.forward(input_ids);
 
-        // Pass through transformer layers
+        // Convert the padding mask to an additive bias once, then reuse it for
+        // every layer (each block applies it as a BatchKey mask).
+        let mask_bias = attention_mask.map(attention_mask_to_bias);
+
         for layer in &self.layers {
-            hidden_states = layer.forward(&hidden_states, &self.rope_cache, attention_mask);
+            hidden_states = layer.forward_block(&hidden_states, mask_bias.as_ref());
         }
 
         // Apply final layer norm

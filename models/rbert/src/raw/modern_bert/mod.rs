@@ -6,10 +6,12 @@
 //! - Pre-normalization with LayerNorm
 //! - GeGLU activation in FFN
 //! - No token type IDs
+//!
+//! Each layer is the shared [`fusor::TransformerBlock`] (fused QKV + RoPE +
+//! pre-norm LayerNorm + GeGLU); the sliding-window local attention lives in
+//! [`layer`] alongside the block.
 
-mod attention;
 mod config;
-mod feed_forward;
 mod layer;
 mod model;
 
