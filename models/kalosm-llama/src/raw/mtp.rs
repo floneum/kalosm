@@ -286,6 +286,9 @@ where
                 hidden_size: layer_attention_width,
                 rope_cache,
                 sliding_window_size: layer_sliding_window_size,
+                // Unit scale: like the Gemma 4 target model, the assistant's
+                // query pre-attention scaling is baked into its `attn_q_norm`
+                // weights (see `Model::from_gguf`).
                 attention_scale: 1.0,
                 shared_kv_layer: None,
                 per_layer_inp_gate: None,

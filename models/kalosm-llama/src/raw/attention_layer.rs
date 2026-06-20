@@ -482,6 +482,11 @@ where
         let hidden_f32 = hidden_states.cast::<f32>();
 
         let query_states: Tensor<4, F> = if let Some(attention_qkv) = &self.attention_qkv {
+            // Shared-KV callers only need Q, but a fused QKV weight forces us to
+            // project K/V as well and discard them. No current shared-KV model
+            // (Gemma 4 or the MTP assistant) uses a fused QKV weight, so this
+            // branch is effectively unreachable today; if a future one does, it
+            // pays a ~3x projection here and should grow a Q-only weight slice.
             let query_width = num_heads * head_dim;
             let mut qkv = hidden_f32.q_mat_mul(attention_qkv);
             if let Some(bias) = &self.bias {

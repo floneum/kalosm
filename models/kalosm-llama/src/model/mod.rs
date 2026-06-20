@@ -158,6 +158,10 @@ fn gpu_sample_top_k(config: &GpuSamplerConfig) -> usize {
     {
         return top_k.max(1);
     }
+    // Greedy standard sampling (temperature <= 0) is argmax, so a top-1 cut is
+    // both exact and cheaper. This intentionally ignores any configured `top_k`,
+    // which has no effect once the distribution collapses to its max; the
+    // `KALOSM_LLAMA_GPU_SAMPLE_TOP_K` override above still wins if set.
     if config.sampling_strategy == kalosm_language_model::SamplingStrategy::Standard
         && config.temperature <= 0.0
     {

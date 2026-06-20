@@ -1,5 +1,22 @@
 use super::*;
 
+/// Yield once to the async runtime so long generation loops stay cooperative
+/// between GPU dispatches without spinning the executor.
+async fn yield_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let yielded = AtomicBool::new(false);
+    std::future::poll_fn(|cx| {
+        if yielded.load(Ordering::Relaxed) {
+            std::task::Poll::Ready(())
+        } else {
+            yielded.store(true, Ordering::Relaxed);
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+}
+
 impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl> LlamaModel<F>
 where
     F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
@@ -8,6 +25,21 @@ where
     AddOp: SimdBinaryOp<F>,
     SumOp: SimdReduceOp<F>,
 {
+    /// Emit a `[sampled_token]` trace line when `KALOSM_TRACE_SAMPLED_TOKEN` is
+    /// set. No-op (beyond an env lookup) otherwise.
+    fn trace_sampled_token(&self, index: impl std::fmt::Display, token: u32, stop_tokens: &[u32]) {
+        if std::env::var_os("KALOSM_TRACE_SAMPLED_TOKEN").is_none() {
+            return;
+        }
+        let decoded = self
+            .tokenizer
+            .decode(&[token], false)
+            .unwrap_or_else(|err| format!("<decode error: {err}>"));
+        eprintln!(
+            "[sampled_token] index={index} id={token} text={decoded:?} stop_tokens={stop_tokens:?}"
+        );
+    }
+
     pub(crate) async fn _infer(
         &mut self,
         settings: InferenceSettings<F>,
@@ -133,15 +165,7 @@ where
                                         "pending GPU sampler refused slow fallback".into(),
                                     )
                                 })?;
-                            if std::env::var_os("KALOSM_TRACE_SAMPLED_TOKEN").is_some() {
-                                let decoded = self
-                                    .tokenizer
-                                    .decode(&[new_token], false)
-                                    .unwrap_or_else(|err| format!("<decode error: {err}>"));
-                                eprintln!(
-                                    "[sampled_token] index={tokens_generated} id={new_token} text={decoded:?} stop_tokens={stop_tokens:?}"
-                                );
-                            }
+                            self.trace_sampled_token(tokens_generated, new_token, stop_tokens);
                             if stop_tokens.contains(&new_token) {
                                 tracing::trace!("Stopping on stop token");
                                 break;
@@ -193,20 +217,7 @@ where
                                 break;
                             }
 
-                            {
-                                use std::sync::atomic::{AtomicBool, Ordering};
-                                let yielded = AtomicBool::new(false);
-                                std::future::poll_fn(|cx| {
-                                    if yielded.load(Ordering::Relaxed) {
-                                        std::task::Poll::Ready(())
-                                    } else {
-                                        yielded.store(true, Ordering::Relaxed);
-                                        cx.waker().wake_by_ref();
-                                        std::task::Poll::Pending
-                                    }
-                                })
-                                .await;
-                            }
+                            yield_once().await;
                         }
 
                         return Ok(());
@@ -240,15 +251,7 @@ where
                 let mut tokens_generated = 0;
                 while !finished.is_canceled() && tokens_generated < max_tokens {
                     let new_token = next_token;
-                    if std::env::var_os("KALOSM_TRACE_SAMPLED_TOKEN").is_some() {
-                        let decoded = self
-                            .tokenizer
-                            .decode(&[new_token], false)
-                            .unwrap_or_else(|err| format!("<decode error: {err}>"));
-                        eprintln!(
-                            "[sampled_token] index={tokens_generated} id={new_token} text={decoded:?} stop_tokens={stop_tokens:?}"
-                        );
-                    }
+                    self.trace_sampled_token(tokens_generated, new_token, stop_tokens);
                     if stop_tokens.contains(&new_token) {
                         tracing::trace!("Stopping on stop token");
                         break;
@@ -288,20 +291,7 @@ where
                     }
                     .await?;
 
-                    {
-                        use std::sync::atomic::{AtomicBool, Ordering};
-                        let yielded = AtomicBool::new(false);
-                        std::future::poll_fn(|cx| {
-                            if yielded.load(Ordering::Relaxed) {
-                                std::task::Poll::Ready(())
-                            } else {
-                                yielded.store(true, Ordering::Relaxed);
-                                cx.waker().wake_by_ref();
-                                std::task::Poll::Pending
-                            }
-                        })
-                        .await;
-                    }
+                    yield_once().await;
                 }
 
                 return Ok(());
@@ -338,15 +328,7 @@ where
             let new_token = text_stream
                 .sample_token(&mut cpu_sampler, logits, stop_on.as_deref(), sample_top_k)
                 .map_err(LlamaModelError::TokenOutputStreamError)?;
-            if std::env::var_os("KALOSM_TRACE_SAMPLED_TOKEN").is_some() {
-                let decoded = self
-                    .tokenizer
-                    .decode(&[new_token], false)
-                    .unwrap_or_else(|err| format!("<decode error: {err}>"));
-                eprintln!(
-                    "[sampled_token] index={tokens_generated} id={new_token} text={decoded:?} stop_tokens={stop_tokens:?}"
-                );
-            }
+            self.trace_sampled_token(tokens_generated, new_token, stop_tokens);
             if stop_tokens.contains(&new_token) {
                 tracing::trace!("Stopping on stop token");
                 break;
@@ -427,20 +409,7 @@ where
             .await?;
             logits = logits_from_sorted_top_k(logit_probs);
             // Yield control to allow the stream to deliver tokens
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                let yielded = AtomicBool::new(false);
-                std::future::poll_fn(|cx| {
-                    if yielded.load(Ordering::Relaxed) {
-                        std::task::Poll::Ready(())
-                    } else {
-                        yielded.store(true, Ordering::Relaxed);
-                        cx.waker().wake_by_ref();
-                        std::task::Poll::Pending
-                    }
-                })
-                .await;
-            }
+            yield_once().await;
         }
 
         // Flush the queued text
@@ -500,15 +469,7 @@ where
         let mut accepted_total = 0usize;
         while !finished.is_canceled() && tokens_generated < max_tokens as usize {
             let new_token = next_token;
-            if std::env::var_os("KALOSM_TRACE_SAMPLED_TOKEN").is_some() {
-                let decoded = self
-                    .tokenizer
-                    .decode(&[new_token], false)
-                    .unwrap_or_else(|err| format!("<decode error: {err}>"));
-                eprintln!(
-                    "[sampled_token] index={tokens_generated} id={new_token} text={decoded:?} stop_tokens={stop_tokens:?}"
-                );
-            }
+            self.trace_sampled_token(tokens_generated, new_token, stop_tokens);
             if stop_tokens.contains(&new_token) {
                 tracing::trace!("Stopping on stop token");
                 break;
@@ -645,20 +606,7 @@ where
                     .await;
             }
 
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                let yielded = AtomicBool::new(false);
-                std::future::poll_fn(|cx| {
-                    if yielded.load(Ordering::Relaxed) {
-                        std::task::Poll::Ready(())
-                    } else {
-                        yielded.store(true, Ordering::Relaxed);
-                        cx.waker().wake_by_ref();
-                        std::task::Poll::Pending
-                    }
-                })
-                .await;
-            }
+            yield_once().await;
         }
         if std::env::var_os("KALOSM_TRACE_MTP").is_some() {
             tracing::info!("mtp_summary drafted={drafted_total} accepted={accepted_total}");
@@ -681,15 +629,7 @@ where
         let top_k = gpu_sample_top_k(&gpu_sampler.config);
         while !finished.is_canceled() && tokens_generated < max_tokens as usize {
             let new_token = next_token;
-            if std::env::var_os("KALOSM_TRACE_SAMPLED_TOKEN").is_some() {
-                let decoded = self
-                    .tokenizer
-                    .decode(&[new_token], false)
-                    .unwrap_or_else(|err| format!("<decode error: {err}>"));
-                eprintln!(
-                    "[sampled_token] index={tokens_generated} id={new_token} text={decoded:?} stop_tokens={stop_tokens:?}"
-                );
-            }
+            self.trace_sampled_token(tokens_generated, new_token, stop_tokens);
             if stop_tokens.contains(&new_token) {
                 tracing::trace!("Stopping on stop token");
                 break;
@@ -761,20 +701,7 @@ where
             }
             .await?;
 
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                let yielded = AtomicBool::new(false);
-                std::future::poll_fn(|cx| {
-                    if yielded.load(Ordering::Relaxed) {
-                        std::task::Poll::Ready(())
-                    } else {
-                        yielded.store(true, Ordering::Relaxed);
-                        cx.waker().wake_by_ref();
-                        std::task::Poll::Pending
-                    }
-                })
-                .await;
-            }
+            yield_once().await;
         }
         Ok(())
     }
@@ -827,15 +754,7 @@ where
                         "pending GPU sampler refused slow fallback".into(),
                     )
                 })?;
-            if std::env::var_os("KALOSM_TRACE_SAMPLED_TOKEN").is_some() {
-                let decoded = self
-                    .tokenizer
-                    .decode(&[new_token], false)
-                    .unwrap_or_else(|err| format!("<decode error: {err}>"));
-                eprintln!(
-                    "[sampled_token] index={tokens_generated} id={new_token} text={decoded:?} stop_tokens={stop_tokens:?}"
-                );
-            }
+            self.trace_sampled_token(tokens_generated, new_token, stop_tokens);
             if stop_tokens.contains(&new_token) {
                 tracing::trace!("Stopping on stop token");
                 break;
@@ -887,20 +806,7 @@ where
                 break;
             }
 
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                let yielded = AtomicBool::new(false);
-                std::future::poll_fn(|cx| {
-                    if yielded.load(Ordering::Relaxed) {
-                        std::task::Poll::Ready(())
-                    } else {
-                        yielded.store(true, Ordering::Relaxed);
-                        cx.waker().wake_by_ref();
-                        std::task::Poll::Pending
-                    }
-                })
-                .await;
-            }
+            yield_once().await;
         }
         Ok(())
     }

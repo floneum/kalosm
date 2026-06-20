@@ -130,9 +130,6 @@ pub(crate) fn debug_check_nan_f32<const R: usize>(
 ) {
 }
 
-#[cfg(not(feature = "vision"))]
-pub(crate) fn debug_tensor_stats_f32<const R: usize>(_: &fusor::Tensor<R, f32>, _: &str) {}
-
 #[cfg(not(target_arch = "wasm32"))]
 fn resolve_intermediate_hidden_f32(tensor: &fusor::Tensor<2, f32>) {
     let marker = tensor.clone().mul_scalar(1.0).to_concrete();
@@ -191,7 +188,7 @@ use fusor::layers::RmsNorm;
 use fusor::QMatrix;
 use fusor::ShardedVarBuilder;
 use fusor::{
-    AddOp, CastTensor, CastTo, FloatDataType, FloatOps, MatmulImpl, MulOp, SimdBinaryOp,
+    AddOp, CastTensor, CastTo, FloatDataType, FloatOps, Fusion, MatmulImpl, MulOp, SimdBinaryOp,
     SimdElement, SimdReduceOp, SumOp,
 };
 use fusor::{AsyncReadRange, AsyncShardedVarBuilder};
@@ -965,6 +962,10 @@ where
                 .await
                 .ok()
                 .map(&dequantize_1d);
+            // Gemma 4 folds the query pre-attention scaling into the exported
+            // `attn_q_norm` weights, so the softmax logits are already scaled and
+            // flash-attention must run with a unit scale. Every other supported
+            // architecture applies the usual 1/sqrt(head_dim) here.
             let attention_scale = if is_gemma4 {
                 1.0
             } else {
@@ -1049,6 +1050,73 @@ where
         {
             true
         }
+    }
+
+    /// Compute the Gemma "per-layer input" embeddings that are blended into each
+    /// decoder layer (the `inp_gate`/`proj`/`post_norm` path). Returns `None`
+    /// for models without per-layer embeddings.
+    ///
+    /// `per_layer_token_ids` is invoked lazily, so models without per-layer
+    /// embeddings never pay for building the token id tensor. It yields the
+    /// `[batch, positions]` ids used for the per-layer token lookup, with
+    /// image/control tokens already zeroed by the caller. A single position is
+    /// broadcast across the whole sequence (image chunks share one zeroed
+    /// per-layer token).
+    fn compute_per_layer_inputs<B>(
+        &self,
+        embeddings_f32: &Tensor<3, f32>,
+        per_layer_token_ids: impl FnOnce() -> Tensor<2, u32, B>,
+    ) -> Option<Tensor<4, F>>
+    where
+        B: Fusion<2, u32>,
+    {
+        let (
+            per_layer_tok_embeddings,
+            per_layer_model_proj,
+            per_layer_proj_norm,
+            per_layer_embedding_length,
+        ) = match (
+            &self.per_layer_tok_embeddings,
+            &self.per_layer_model_proj,
+            &self.per_layer_proj_norm,
+            self.config.per_layer_embedding_length,
+        ) {
+            (Some(embeddings), Some(model_proj), Some(proj_norm), Some(length)) => {
+                (embeddings, model_proj, proj_norm, length)
+            }
+            _ => return None,
+        };
+
+        let [batch, seq, embedding_dim] = embeddings_f32.shape();
+        let n_layer = self.config.n_layer;
+        let per_layer_token_ids = per_layer_token_ids();
+        let positions = per_layer_token_ids.shape()[1];
+
+        let token_inputs = per_layer_tok_embeddings.forward::<2, 3, _>(&per_layer_token_ids)
+            * (per_layer_embedding_length as f32).sqrt();
+        let token_inputs =
+            token_inputs.reshape([batch, positions, n_layer, per_layer_embedding_length]);
+        let token_inputs: Tensor<4, f32> = if positions == seq {
+            token_inputs.to_concrete()
+        } else {
+            token_inputs
+                .broadcast_as([batch, seq, n_layer, per_layer_embedding_length])
+                .to_concrete()
+        };
+
+        let projected_inputs = embeddings_f32.q_mat_mul(per_layer_model_proj)
+            * (1.0 / (embedding_dim as f32).sqrt());
+        let projected_inputs = projected_inputs
+            .reshape([batch, seq, n_layer, per_layer_embedding_length])
+            .to_concrete();
+        let projected_inputs: Tensor<4, F> =
+            per_layer_proj_norm.forward_generic_4d(&projected_inputs.cast());
+
+        Some(
+            ((projected_inputs.cast::<f32>() + token_inputs) * (1.0 / 2.0_f32.sqrt()))
+                .to_concrete()
+                .cast(),
+        )
     }
 
     pub fn encode_tokens(
@@ -1186,20 +1254,9 @@ where
             }
         }
 
-        let per_layer_inputs = if let (
-            Some(per_layer_tok_embeddings),
-            Some(per_layer_model_proj),
-            Some(per_layer_proj_norm),
-            Some(per_layer_embedding_length),
-        ) = (
-            &self.per_layer_tok_embeddings,
-            &self.per_layer_model_proj,
-            &self.per_layer_proj_norm,
-            self.config.per_layer_embedding_length,
-        ) {
-            let [batch, seq, embedding_dim] = embeddings_f32.shape();
+        let per_layer_inputs = self.compute_per_layer_inputs(&embeddings_f32, || {
             #[cfg(feature = "vision")]
-            let per_layer_x_base = {
+            {
                 let mut per_layer_tokens = tokens.clone();
                 for range in &image_token_ranges {
                     per_layer_tokens[range.clone()].fill(0);
@@ -1218,33 +1275,13 @@ where
                         }
                     }
                 }
-                Tensor::new(device, per_layer_tokens.as_slice())
-            };
-            #[cfg(feature = "vision")]
-            let per_layer_x = per_layer_x_base.unsqueeze(0);
+                Tensor::from_slice(device, [1, per_layer_tokens.len()], per_layer_tokens.as_slice())
+            }
             #[cfg(not(feature = "vision"))]
-            let per_layer_x = x.clone();
-            let token_inputs = per_layer_tok_embeddings.forward::<2, 3, _>(&per_layer_x)
-                * (per_layer_embedding_length as f32).sqrt();
-            let token_inputs = token_inputs
-                .reshape([batch, seq, self.config.n_layer, per_layer_embedding_length])
-                .to_concrete();
-
-            let projected_inputs = embeddings_f32.q_mat_mul(per_layer_model_proj)
-                * (1.0 / (embedding_dim as f32).sqrt());
-            let projected_inputs = projected_inputs
-                .reshape([batch, seq, self.config.n_layer, per_layer_embedding_length])
-                .to_concrete();
-            let projected_inputs: Tensor<4, F> =
-                per_layer_proj_norm.forward_generic_4d(&projected_inputs.cast());
-            Some(
-                ((projected_inputs.cast::<f32>() + token_inputs) * (1.0 / 2.0_f32.sqrt()))
-                    .to_concrete()
-                    .cast(),
-            )
-        } else {
-            None
-        };
+            {
+                x.clone()
+            }
+        });
         let embeddings: Tensor<3, F> = embeddings_f32.cast();
 
         Ok(EncodedTokens {
@@ -1484,43 +1521,10 @@ where
                 .extend(std::iter::repeat_n(image_pad_token, seq_len));
         }
 
-        let per_layer_inputs = if let (
-            Some(per_layer_tok_embeddings),
-            Some(per_layer_model_proj),
-            Some(per_layer_proj_norm),
-            Some(per_layer_embedding_length),
-        ) = (
-            &self.per_layer_tok_embeddings,
-            &self.per_layer_model_proj,
-            &self.per_layer_proj_norm,
-            self.config.per_layer_embedding_length,
-        ) {
-            let [batch, seq, embedding_dim] = embeddings_f32.shape();
-            let per_layer_tokens = [0u32];
-            let per_layer_x_base = Tensor::new(device, per_layer_tokens.as_slice());
-            let per_layer_x = per_layer_x_base.unsqueeze(0);
-            let token_inputs = per_layer_tok_embeddings.forward::<2, 3, _>(&per_layer_x)
-                * (per_layer_embedding_length as f32).sqrt();
-            let token_inputs = token_inputs
-                .reshape([batch, 1, self.config.n_layer, per_layer_embedding_length])
-                .broadcast_as([batch, seq, self.config.n_layer, per_layer_embedding_length])
-                .to_concrete();
-
-            let projected_inputs = embeddings_f32.q_mat_mul(per_layer_model_proj)
-                * (1.0 / (embedding_dim as f32).sqrt());
-            let projected_inputs = projected_inputs
-                .reshape([batch, seq, self.config.n_layer, per_layer_embedding_length])
-                .to_concrete();
-            let projected_inputs: Tensor<4, F> =
-                per_layer_proj_norm.forward_generic_4d(&projected_inputs.cast());
-            Some(
-                ((projected_inputs.cast::<f32>() + token_inputs) * (1.0 / 2.0_f32.sqrt()))
-                    .to_concrete()
-                    .cast(),
-            )
-        } else {
-            None
-        };
+        // Image chunks carry no text tokens, so every position shares a single
+        // zeroed per-layer token that the helper broadcasts across the chunk.
+        let per_layer_inputs = self
+            .compute_per_layer_inputs(&embeddings_f32, || Tensor::from_slice(device, [1, 1], &[0u32]));
 
         let encoded = EncodedTokens {
             embeddings: embeddings_f32.cast(),
@@ -1622,39 +1626,7 @@ where
         if let Some(scale) = self.tok_embedding_scale {
             embeddings_f32 = (embeddings_f32 * scale).to_concrete();
         }
-        let per_layer_inputs = if let (
-            Some(per_layer_tok_embeddings),
-            Some(per_layer_model_proj),
-            Some(per_layer_proj_norm),
-            Some(per_layer_embedding_length),
-        ) = (
-            &self.per_layer_tok_embeddings,
-            &self.per_layer_model_proj,
-            &self.per_layer_proj_norm,
-            self.config.per_layer_embedding_length,
-        ) {
-            let [batch, seq, embedding_dim] = embeddings_f32.shape();
-            let token_inputs = per_layer_tok_embeddings.forward::<2, 3, _>(&x)
-                * (per_layer_embedding_length as f32).sqrt();
-            let token_inputs = token_inputs
-                .reshape([batch, seq, self.config.n_layer, per_layer_embedding_length])
-                .to_concrete();
-
-            let projected_inputs = embeddings_f32.q_mat_mul(per_layer_model_proj)
-                * (1.0 / (embedding_dim as f32).sqrt());
-            let projected_inputs = projected_inputs
-                .reshape([batch, seq, self.config.n_layer, per_layer_embedding_length])
-                .to_concrete();
-            let projected_inputs: Tensor<4, F> =
-                per_layer_proj_norm.forward_generic_4d(&projected_inputs.cast());
-            Some(
-                ((projected_inputs.cast::<f32>() + token_inputs) * (1.0 / 2.0_f32.sqrt()))
-                    .to_concrete()
-                    .cast(),
-            )
-        } else {
-            None
-        };
+        let per_layer_inputs = self.compute_per_layer_inputs(&embeddings_f32, || x.clone());
         let embeddings: Tensor<3, F> = embeddings_f32.cast();
         let encoded = EncodedTokens {
             embeddings,
