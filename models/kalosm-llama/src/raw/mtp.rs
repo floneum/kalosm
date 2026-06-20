@@ -392,9 +392,8 @@ where
         }
 
         let normed = self.norm.forward_generic(&layer_in);
-        let logits: Tensor<1, f32> = normed
-            .cast::<f32>()
-            .q_mat_mul(&self.output)
+        let logits: Tensor<1, f32> = target
+            .apply_final_logit_softcap(normed.cast::<f32>().q_mat_mul(&self.output))
             .squeeze(0)
             .squeeze(0)
             .to_concrete();

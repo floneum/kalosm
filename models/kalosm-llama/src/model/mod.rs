@@ -756,8 +756,8 @@ where
             random: 0.5,
         };
 
-        let _ = hidden
-            .q_mat_mul(model.output_matrix())
+        let _ = model
+            .logits_from_hidden_f32(hidden)
             .sample_mirostat2_token(&mut sampler, &[], params)
             .await;
         if let Some(start) = start {

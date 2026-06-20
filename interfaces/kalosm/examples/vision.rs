@@ -5,9 +5,7 @@ use std::time::Instant;
 async fn main() {
     tracing_subscriber::fmt::init();
     let t_load_start = Instant::now();
-    let mut builder = Llama::builder().with_source(
-        LlamaSource::gemma_4_e2b_it_qat_chat(),
-    );
+    let mut builder = Llama::builder().with_source(LlamaSource::gemma_4_e2b_it_qat_chat());
     builder = if std::env::var_os("KALOSM_VISION_CPU").is_some() {
         builder.with_device(Device::Cpu)
     } else {

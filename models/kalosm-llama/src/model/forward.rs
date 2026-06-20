@@ -426,10 +426,7 @@ where
         previous_gpu_token: Option<&fusor::GpuSampledToken>,
         top_k: usize,
     ) -> Result<Option<fusor::GpuSampledToken>, LlamaModelError> {
-        let logits = hidden
-            .squeeze(0)
-            .to_concrete()
-            .q_mat_mul(model.output_matrix());
+        let logits = model.logits_from_hidden_f32(hidden.squeeze(0).to_concrete());
         Self::forward_sample_token_pending_from_logits(
             logits,
             sampler,
@@ -477,10 +474,7 @@ where
             Ok(hidden) => hidden,
             Err(err) => return Box::pin(async move { Err(err.into()) }),
         };
-        let logits = hidden
-            .squeeze(0)
-            .to_concrete()
-            .q_mat_mul(model.output_matrix());
+        let logits = model.logits_from_hidden_f32(hidden.squeeze(0).to_concrete());
         let mut kernels = 0;
         if trace {
             if let Some(gpu_logits) = logits.as_gpu() {

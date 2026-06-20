@@ -1279,14 +1279,25 @@ where
     where
         f32: CastTo<F> + CastTensor<F>,
     {
-        let mut result_f32 = x_f32.q_mat_mul(&self.output);
+        Ok(self.logits_from_hidden_f32(x_f32).cast())
+    }
+
+    pub(crate) fn logits_from_hidden_f32<const R: usize>(
+        &self,
+        x_f32: Tensor<R, f32>,
+    ) -> Tensor<R, f32> {
+        self.apply_final_logit_softcap(x_f32.q_mat_mul(&self.output))
+    }
+
+    pub(crate) fn apply_final_logit_softcap<const R: usize>(
+        &self,
+        logits: Tensor<R, f32>,
+    ) -> Tensor<R, f32> {
         if let Some(softcap) = self.config.final_logit_softcapping {
-            result_f32 = result_f32
-                .mul_scalar(1.0 / softcap)
-                .tanh()
-                .mul_scalar(softcap);
+            logits.mul_scalar(1.0 / softcap).tanh().mul_scalar(softcap)
+        } else {
+            logits
         }
-        Ok(result_f32.cast())
     }
 
     pub(crate) fn should_chunk_multimodal_prompt(&self) -> bool {
@@ -1576,10 +1587,7 @@ where
         )?;
         let normed = self.norm.forward_generic(&pre_norm.hidden);
         let h_nextn: Tensor<2, f32> = normed.clone().cast::<f32>().squeeze(0).to_concrete();
-        let mut logits = normed.cast::<f32>().q_mat_mul(&self.output);
-        if let Some(softcap) = self.config.final_logit_softcapping {
-            logits = logits.mul_scalar(1.0 / softcap).tanh().mul_scalar(softcap);
-        }
+        let logits = self.logits_from_hidden_f32(normed.cast::<f32>());
         let logits: Tensor<2, f32> = logits.squeeze(0).to_concrete();
         Ok(TargetBatchOutput { logits, h_nextn })
     }

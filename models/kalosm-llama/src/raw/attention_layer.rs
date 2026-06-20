@@ -854,8 +854,9 @@ fn pad_attention_mask_to_kv_len(
     }
 
     if cols > kv_seq_len {
+        let start_col = cols - kv_seq_len;
         return Some(AttentionMask::new(
-            mask.narrow(1, 0, kv_seq_len).to_concrete(),
+            mask.narrow(1, start_col, kv_seq_len).to_concrete(),
         ));
     }
 

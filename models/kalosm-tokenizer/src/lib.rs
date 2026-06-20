@@ -372,6 +372,12 @@ impl FastBpe {
         right: u32,
         new_token: u32,
     ) -> Result<(), TokenizerError> {
+        if self.raw_utf8_initial_tokens {
+            self.encode_raw_utf8_chars_into(input, out)?;
+            apply_single_merge(out, left, right, new_token);
+            return Ok(());
+        }
+
         if self.all_bytes_present {
             self.encode_bytes_and_apply_single_merge_unchecked(input, out, left, right, new_token);
             Ok(())
@@ -772,6 +778,25 @@ fn apply_greedy_merges(merges: &FxHashMap<PairKey, MergeRule>, tokens: &mut Vec<
         tokens[index] = new_token;
         tokens.remove(index + 1);
     }
+}
+
+fn apply_single_merge(tokens: &mut Vec<u32>, left: u32, right: u32, new_token: u32) {
+    let len = tokens.len();
+    let mut read = 0;
+    let mut write = 0;
+
+    while read < len {
+        if read + 1 < len && tokens[read] == left && tokens[read + 1] == right {
+            tokens[write] = new_token;
+            read += 2;
+        } else {
+            tokens[write] = tokens[read];
+            read += 1;
+        }
+        write += 1;
+    }
+
+    tokens.truncate(write);
 }
 
 fn rebuild_merge_candidates(
@@ -1648,6 +1673,32 @@ mod tests {
         assert_eq!(tokenizer.tokenize(" é".as_bytes()).unwrap(), vec![0, 3]);
         assert_eq!(tokenizer.token_bytes(0), Some(b" ".as_slice()));
         assert_eq!(tokenizer.token_bytes(3), Some("é".as_bytes()));
+    }
+
+    #[test]
+    fn raw_utf8_single_merge_fast_path_keeps_direct_char_tokens() {
+        let vocab = [
+            ("<0x20>", 0),
+            ("<0xC3>", 1),
+            ("<0xA9>", 2),
+            ("é", 3),
+            ("a", 4),
+            ("b", 5),
+            ("ab", 6),
+        ]
+        .into_iter()
+        .map(|(token, id)| (token.to_owned(), id));
+        let tokenizer =
+            FastBpe::from_raw_utf8_vocab_and_merges(vocab, ["a b".to_owned()], false).unwrap();
+
+        assert_eq!(
+            tokenizer.tokenize(" éab".as_bytes()).unwrap(),
+            vec![0, 3, 6]
+        );
+        assert_eq!(
+            tokenizer.tokenize(" éab".as_bytes()).unwrap(),
+            tokenizer.tokenize_reference(" éab".as_bytes()).unwrap()
+        );
     }
 
     #[test]
