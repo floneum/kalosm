@@ -533,7 +533,17 @@ impl Resolver {
             let encode_start = host_trace.then(Instant::now);
             let mut dispatch_index = 0usize;
             let mut command_index = 0usize;
-            let dispatches_per_pass = dispatches_per_pass(total_kernels);
+            // Bound the cumulative workgroups recorded into a single compute pass by
+            // the device's real per-dimension workgroup limit. Each
+            // `begin_compute_pass` is a GPU command-encoder; recording too many
+            // passes into one command buffer loses the device on Metal (a
+            // long-sequence encoder + BiLSTM resolves to ~2200 dispatches, and one
+            // pass per dispatch — the old policy for large graphs — meant ~2200
+            // passes, which faults; the same dispatches grouped into a handful of
+            // passes run fine). Grouping by a GPU-reported workgroup budget keeps
+            // the pass count at roughly `total_workgroups / limit`: a few dozen for
+            // the largest graphs, one for decode/prefill — no arbitrary threshold.
+            let pass_workgroup_budget = pass_workgroup_budget(&device);
             while command_index < commands.len() {
                 match &commands[command_index] {
                     CommandRecord::CopyBuffer(copy) => {
@@ -577,14 +587,20 @@ impl Resolver {
                                 label: Some("Resolver Direct Kernels"),
                                 timestamp_writes: None,
                             });
-                        let mut pass_dispatches = 0usize;
+                        let mut pass_workgroups = 0u64;
                         while command_index < commands.len() {
-                            if pass_dispatches >= dispatches_per_pass {
-                                break;
-                            }
                             let CommandRecord::Dispatch(record) = &commands[command_index] else {
                                 break;
                             };
+                            let dispatch_workgroups = record.dispatch.workgroup_count();
+                            // Always record at least one dispatch per pass; otherwise
+                            // close the pass before its cumulative workgroups would
+                            // exceed the device budget.
+                            if pass_workgroups > 0
+                                && pass_workgroups + dispatch_workgroups > pass_workgroup_budget
+                            {
+                                break;
+                            }
                             if let Some((query_set, _, _, _)) = &query_resources {
                                 pass.write_timestamp(query_set, (dispatch_index * 2) as u32);
                             }
@@ -596,7 +612,7 @@ impl Resolver {
                             }
                             dispatch_index += 1;
                             command_index += 1;
-                            pass_dispatches += 1;
+                            pass_workgroups += dispatch_workgroups;
                         }
                     }
                 }
@@ -716,13 +732,18 @@ fn direct_plan_binding_buffers(inputs: &[MirValue]) -> Vec<Vec<std::sync::Arc<wg
     vec![buffers]
 }
 
-fn dispatches_per_pass(total_kernels: usize) -> usize {
-    if let Ok(value) = std::env::var("FUSOR_RESOLVE_DISPATCHES_PER_PASS")
-        && let Ok(parsed) = value.parse::<usize>()
+/// Maximum cumulative workgroups recorded into a single compute pass during a
+/// resolve. Defaults to the device's reported `max_compute_workgroups_per_dimension`
+/// so the number of compute passes per command buffer stays at roughly
+/// `total_workgroups / limit` — bounded by what the GPU itself declares it can
+/// dispatch in one go, rather than an arbitrary constant. Tunable via
+/// `FUSOR_RESOLVE_WORKGROUPS_PER_PASS` (`0`/unset uses the device limit).
+fn pass_workgroup_budget(device: &crate::Device) -> u64 {
+    if let Ok(value) = std::env::var("FUSOR_RESOLVE_WORKGROUPS_PER_PASS")
+        && let Ok(parsed) = value.parse::<u64>()
         && parsed > 0
     {
         return parsed;
     }
-
-    if total_kernels >= 1024 { 1 } else { usize::MAX }
+    u64::from(device.limits().max_compute_workgroups_per_dimension).max(1)
 }
