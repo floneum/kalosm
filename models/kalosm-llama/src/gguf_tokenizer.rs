@@ -191,6 +191,17 @@ impl PreTokenizer {
             std::mem::swap(&mut buffers.pieces, &mut buffers.next);
         }
     }
+
+    #[cfg(all(test, feature = "hf-tokenizer-json"))]
+    fn split(&self, text: &str) -> Vec<String> {
+        let mut buffers = PreTokenizationBuffers::default();
+        self.split_into_ranges(text, &mut buffers);
+        buffers
+            .pieces
+            .iter()
+            .map(|range| range.as_str(text).to_string())
+            .collect()
+    }
 }
 
 fn split_piece(split_regex: &SplitRegex, text: &str, range: TextRange, out: &mut Vec<TextRange>) {
@@ -833,10 +844,7 @@ mod tests {
         unreachable!("all bytes are covered by the byte-level alphabet")
     }
 
-    fn legacy_splits<'a>(
-        pre_tokenizer: &Sequence,
-        text: &'a str,
-    ) -> tokenizers::Result<Vec<String>> {
+    fn legacy_splits(pre_tokenizer: &Sequence, text: &str) -> tokenizers::Result<Vec<String>> {
         let mut pretokenized = PreTokenizedString::from(text);
         pre_tokenizer.pre_tokenize(&mut pretokenized)?;
         Ok(pretokenized

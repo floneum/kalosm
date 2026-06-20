@@ -68,7 +68,6 @@ impl Decoder {
     pub fn decode(
         &self,
         scores: &[f32],
-        num_spans: usize,
         num_labels: usize,
         span_indices: &[(usize, usize)],
         word_offsets: &[(usize, usize)],
@@ -78,6 +77,7 @@ impl Decoder {
         // Collect all predictions above threshold
         let mut candidates: Vec<(usize, usize, f32)> = Vec::new(); // (span_idx, label_idx, score)
 
+        let num_spans = span_indices.len();
         for span_idx in 0..num_spans {
             for label_idx in 0..num_labels {
                 let score = scores[span_idx * num_labels + label_idx];
@@ -127,7 +127,7 @@ impl Decoder {
                     }
                 }
 
-                if let Some(entity) = self.create_entity(
+                if let Some(entity) = Self::create_entity(
                     start_word,
                     end_word,
                     label_idx,
@@ -171,7 +171,7 @@ impl Decoder {
             if !has_partial_overlap && !selected.contains(&key) {
                 selected.push(key);
 
-                if let Some(entity) = self.create_entity(
+                if let Some(entity) = Self::create_entity(
                     start_word,
                     end_word,
                     label_idx,
@@ -210,7 +210,6 @@ impl Decoder {
     }
 
     fn create_entity(
-        &self,
         start_word: usize,
         end_word: usize,
         label_idx: usize,
@@ -292,7 +291,6 @@ mod tests {
 
         let entities = Decoder::new(0.5, DecodingMode::Flat).decode(
             &s,
-            3,
             2,
             &span_indices,
             &word_offsets(),
@@ -320,7 +318,6 @@ mod tests {
 
         let entities = Decoder::new(0.5, DecodingMode::Nested).decode(
             &s,
-            3,
             1,
             &span_indices,
             &word_offsets(),
@@ -346,7 +343,6 @@ mod tests {
         let s = scores(1, 1, &[(0, 0, 0.49)]);
         let entities = Decoder::new(0.5, DecodingMode::Flat).decode(
             &s,
-            1,
             1,
             &span_indices,
             &word_offsets(),

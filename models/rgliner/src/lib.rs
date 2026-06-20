@@ -519,7 +519,6 @@ impl Gliner {
             let next_offset = score_offset + span_count * num_labels;
             let entities = self.decoder.decode(
                 &scores_data[score_offset..next_offset],
-                span_count,
                 num_labels,
                 &spans_per_batch[batch_idx],
                 &tokenized.word_offsets,

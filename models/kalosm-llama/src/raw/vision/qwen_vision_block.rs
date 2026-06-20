@@ -73,7 +73,9 @@ where
         let trace = std::env::var_os("KALOSM_TRACE_VBLOCK").is_some();
         let flush = |t: &Tensor<3, F>| {
             if trace {
-                t.as_gpu().map(|g| g.materialize_sync());
+                if let Some(g) = t.as_gpu() {
+                    g.materialize_sync();
+                }
             }
         };
         let xs_3d = xs.unsqueeze(0).to_concrete(); // [1, seq, dim]
@@ -143,11 +145,11 @@ struct VisionAttention<F: FloatDataType + SimdElement> {
 }
 
 enum VisionQkv<F: SimdElement> {
-    Fused(Linear<F>),
+    Fused(Box<Linear<F>>),
     Split {
-        q: Linear<F>,
-        k: Linear<F>,
-        v: Linear<F>,
+        q: Box<Linear<F>>,
+        k: Box<Linear<F>>,
+        v: Box<Linear<F>>,
     },
 }
 
@@ -173,12 +175,12 @@ where
         let v_b: Tensor<1, F> = vb.get("attn_v.bias", device)?.dequantize().cast();
         let qkv = if let Some(qkv_weight) = QMatrix::concat_rows(&[&q_w, &k_w, &v_w]) {
             let qkv_bias: Tensor<1, F> = fusor::cat([q_b, k_b, v_b], 0).to_concrete();
-            VisionQkv::Fused(Linear::new(qkv_weight, Some(qkv_bias)))
+            VisionQkv::Fused(Box::new(Linear::new(qkv_weight, Some(qkv_bias))))
         } else {
             VisionQkv::Split {
-                q: Linear::new(q_w, Some(q_b)),
-                k: Linear::new(k_w, Some(k_b)),
-                v: Linear::new(v_w, Some(v_b)),
+                q: Box::new(Linear::new(q_w, Some(q_b))),
+                k: Box::new(Linear::new(k_w, Some(k_b))),
+                v: Box::new(Linear::new(v_w, Some(v_b))),
             }
         };
         let proj = Linear::new(
@@ -213,7 +215,9 @@ where
             VisionQkv::Fused(qkv) => {
                 let qkv: Tensor<3, f32> = qkv.forward_generic(xs).cast();
                 if trace_attn {
-                    qkv.as_gpu().map(|g| g.materialize_sync());
+                    if let Some(g) = qkv.as_gpu() {
+                        g.materialize_sync();
+                    }
                     tracing::info!("      qkv:   {:.2?}", t_qkv.elapsed());
                 }
                 let q = qkv
@@ -247,7 +251,9 @@ where
                     .reshape([seq_len, self.head_count, self.head_dim])
                     .to_concrete();
                 if trace_attn {
-                    v.as_gpu().map(|g| g.materialize_sync());
+                    if let Some(g) = v.as_gpu() {
+                        g.materialize_sync();
+                    }
                     tracing::info!("      qkv:   {:.2?} (split)", t_qkv.elapsed());
                 }
                 (q, k, v)
@@ -272,7 +278,9 @@ where
         let value_states = v.transpose(0, 1).unsqueeze(0).to_concrete();
         let t_after_rope = Instant::now();
         if trace_attn {
-            value_states.as_gpu().map(|g| g.materialize_sync());
+            if let Some(g) = value_states.as_gpu() {
+                g.materialize_sync();
+            }
             tracing::info!(
                 "      rope:  {:.2?} (incl. q/k/v split + transpose)",
                 t_qkv.elapsed()
@@ -362,7 +370,9 @@ where
         let attn_output = attn_output.reshape([bsz, seq_len, self.embed_dim]);
         let output: Tensor<3, F> = self.proj.forward_generic(&attn_output.cast());
         if trace_attn {
-            output.as_gpu().map(|g| g.materialize_sync());
+            if let Some(g) = output.as_gpu() {
+                g.materialize_sync();
+            }
             tracing::info!("      flash+proj: {:.2?}", t_flash.elapsed());
         }
 

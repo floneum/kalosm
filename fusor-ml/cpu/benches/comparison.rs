@@ -1,6 +1,7 @@
 use candle_core::{Device, Tensor as CandleTensor};
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fusor_cpu::__private::TypedTensor;
+use std::hint::black_box;
 
 const SIZES: &[usize] = &[64, 256];
 

@@ -9,22 +9,24 @@ pub struct LlamaTokenizer {
 
 #[derive(Clone)]
 enum LlamaTokenizerInner {
-    Gguf(GgufTokenizer),
+    Gguf(Box<GgufTokenizer>),
     #[cfg(feature = "hf-tokenizer-json")]
-    HuggingFace(tokenizers::Tokenizer),
+    HuggingFace(Box<tokenizers::Tokenizer>),
 }
 
 impl LlamaTokenizer {
     pub(crate) fn from_gguf(tokenizer: GgufTokenizer) -> Self {
         Self {
-            inner: LlamaTokenizerInner::Gguf(tokenizer),
+            inner: LlamaTokenizerInner::Gguf(Box::new(tokenizer)),
         }
     }
 
     #[cfg(feature = "hf-tokenizer-json")]
     pub(crate) fn from_hf_bytes(bytes: Vec<u8>) -> Result<Self, LlamaTokenizerError> {
         Ok(Self {
-            inner: LlamaTokenizerInner::HuggingFace(tokenizers::Tokenizer::from_bytes(bytes)?),
+            inner: LlamaTokenizerInner::HuggingFace(Box::new(tokenizers::Tokenizer::from_bytes(
+                bytes,
+            )?)),
         })
     }
 

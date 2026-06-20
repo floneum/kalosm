@@ -170,9 +170,9 @@ pub enum Pooling {
 /// An embedding model that can be either BERT or Qwen
 pub enum EmbeddingModel {
     /// A BERT-style embedding model
-    Bert(BertModel),
+    Bert(Box<BertModel>),
     /// A Qwen-style embedding model
-    Qwen(QwenEmbeddingModel),
+    Qwen(Box<QwenEmbeddingModel>),
 }
 
 impl EmbeddingModel {
@@ -347,7 +347,7 @@ impl Bert {
             Some("qwen3") | Some("qwen2") => {
                 // Load Qwen embedding model
                 let qwen_model = QwenEmbeddingModel::load(&device, &mut vb)?;
-                EmbeddingModel::Qwen(qwen_model)
+                EmbeddingModel::Qwen(Box::new(qwen_model))
             }
             _ => {
                 // Load BERT model (default)
@@ -355,7 +355,7 @@ impl Bert {
                 let config: Config =
                     serde_json::from_slice(&config_bytes).map_err(BertLoadingError::LoadConfig)?;
                 let bert_model = BertModel::load(&device, &mut vb, &config)?;
-                EmbeddingModel::Bert(bert_model)
+                EmbeddingModel::Bert(Box::new(bert_model))
             }
         };
 

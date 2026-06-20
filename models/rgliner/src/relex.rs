@@ -651,13 +651,13 @@ impl GlinerRelEx {
         let mut relations = Vec::new();
         for (pair_idx, &(head_idx, tail_idx)) in candidate_pairs.iter().enumerate() {
             let base = pair_idx * n_rels;
-            for rel_idx in 0..n_rels {
+            for (rel_idx, relation_label) in relation_labels.iter().enumerate() {
                 let prob = rel_scores_slice.as_slice()[base + rel_idx];
                 if prob > threshold {
                     relations.push(Relation {
                         head: entities[head_idx].clone(),
                         tail: entities[tail_idx].clone(),
-                        relation: relation_labels[rel_idx].to_string(),
+                        relation: (*relation_label).to_string(),
                         score: prob,
                     });
                 }

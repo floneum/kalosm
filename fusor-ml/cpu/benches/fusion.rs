@@ -5,8 +5,9 @@
 //! memory multiple times (once per operation).
 
 use candle_core::{Device, Tensor as CandleTensor};
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fusor_cpu::__private::{ConcreteTensor, TypedTensor};
+use std::hint::black_box;
 
 /// Benchmark fused operations (single memory pass) vs separate operations (multiple passes)
 fn bench_fusion(c: &mut Criterion) {
