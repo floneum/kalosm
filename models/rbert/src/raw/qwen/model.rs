@@ -171,12 +171,8 @@ impl QwenEmbeddingModel {
         // Load transformer layers
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
-            let layer = load_qwen_block(
-                device,
-                &mut vb.pp(format!("blk.{i}")),
-                &config,
-                &rope_cache,
-            )?;
+            let layer =
+                load_qwen_block(device, &mut vb.pp(format!("blk.{i}")), &config, &rope_cache)?;
             layers.push(layer);
         }
 

@@ -27,7 +27,7 @@ pub(crate) use shape::broadcast_shapes;
 pub use shape::{arange, arange_step, cat, stack};
 pub use to_vec::{ToVec, ToVec1, ToVec2, ToVec3};
 pub use transformer::{
-    forward_attention_qkv_f32, AttentionBias, AttentionVariant, FeedForwardVariant,
-    GatedActivation, GroupedAttention, LlamaFeedForward, Norm, PhiFeedForward, RopeLike,
-    SeparateAttention, TransformerBlock,
+    AttentionBias, AttentionVariant, FeedForwardVariant, GatedActivation, GroupedAttention,
+    LlamaFeedForward, Norm, PhiFeedForward, RopeLike, SeparateAttention, TransformerBlock,
+    forward_attention_qkv_f32,
 };

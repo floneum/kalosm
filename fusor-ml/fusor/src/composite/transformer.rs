@@ -22,14 +22,14 @@
 //! Encoders use [`TransformerBlock::forward_block`], which runs the full
 //! pre-norm block in one call.
 
+use crate::D;
+use crate::MaskKind;
+use crate::QMatrix;
+use crate::RopeCache;
+use crate::Tensor;
 use crate::cache::AttentionMask;
 use crate::cache::KvCache;
 use crate::layers::{LayerNorm, Linear, RmsNorm};
-use crate::MaskKind;
-use crate::RopeCache;
-use crate::Tensor;
-use crate::D;
-use crate::QMatrix;
 use crate::{CastTensor, CastTo, FloatDataType, Fusion, SimdElement};
 
 /// Abstracts a rotary-position-embedding cache so [`TransformerBlock`] does not
@@ -580,8 +580,13 @@ where
                     .cast()
             };
 
-            let (query_states, key_states) =
-                rope.apply(&query_states, &key_states, start_pos, pos_ids, self.interleaved_rope);
+            let (query_states, key_states) = rope.apply(
+                &query_states,
+                &key_states,
+                start_pos,
+                pos_ids,
+                self.interleaved_rope,
+            );
             return (query_states, key_states, value_states);
         }
 
@@ -640,8 +645,13 @@ where
                 .cast()
         };
 
-        let (query_states, key_states) =
-            rope.apply(&query_states, &key_states, start_pos, pos_ids, self.interleaved_rope);
+        let (query_states, key_states) = rope.apply(
+            &query_states,
+            &key_states,
+            start_pos,
+            pos_ids,
+            self.interleaved_rope,
+        );
         (query_states, key_states, value_states)
     }
 }
@@ -702,8 +712,13 @@ impl GroupedAttention {
             .to_concrete()
             .cast();
 
-        let (query_states, key_states) =
-            rope.apply(&query_states, &key_states, start_pos, pos_ids, self.interleaved_rope);
+        let (query_states, key_states) = rope.apply(
+            &query_states,
+            &key_states,
+            start_pos,
+            pos_ids,
+            self.interleaved_rope,
+        );
 
         (query_states, key_states, value_states)
     }

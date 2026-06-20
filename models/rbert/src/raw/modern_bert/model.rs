@@ -45,7 +45,7 @@ impl ModernBertModel {
             config.local_rope_theta,
             device,
         )?;
-        let local_window = (config.local_attention > 0).then(|| config.local_attention / 2);
+        let local_window = (config.local_attention > 0).then_some(config.local_attention / 2);
 
         // Load transformer layers, routing each to its global/local RoPE cache
         // and (for local layers) sliding-window. A layer is global when

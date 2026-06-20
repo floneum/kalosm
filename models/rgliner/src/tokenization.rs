@@ -57,11 +57,7 @@ impl WordTokenizer {
             .map_err(GlinerError::Tokenizer)?;
 
         let token_ids = encoding.get_ids().to_vec();
-        let attention_mask = encoding
-            .get_attention_mask()
-            .iter()
-            .map(|&x| x as u32)
-            .collect();
+        let attention_mask = encoding.get_attention_mask().iter().map(|&x| x).collect();
 
         // Build token-to-word mapping to find the first token for each word.
         let num_words = word_offsets.len();

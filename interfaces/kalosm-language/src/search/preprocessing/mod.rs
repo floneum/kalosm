@@ -22,8 +22,8 @@ pub use kalosm_chunking::{ChunkStrategy, DefaultSentenceChunker, SentenceChunker
 mod chunking;
 mod task;
 pub use task::*;
-mod sentence;
 mod semantic;
+mod sentence;
 pub use semantic::*;
 mod html;
 pub use html::*;

@@ -290,8 +290,15 @@ mod tests {
             ],
         );
 
-        let entities = Decoder::new(0.5, DecodingMode::Flat)
-            .decode(&s, 3, 2, &span_indices, &word_offsets(), &labels, TEXT);
+        let entities = Decoder::new(0.5, DecodingMode::Flat).decode(
+            &s,
+            3,
+            2,
+            &span_indices,
+            &word_offsets(),
+            &labels,
+            TEXT,
+        );
 
         // span 1 shares word 0 with the higher-scoring span 0 -> suppressed.
         assert_eq!(entities.len(), 2);
@@ -309,19 +316,24 @@ mod tests {
         // span 2 = (1..=2) partially overlaps span 0.
         let span_indices = [(0, 1), (0, 0), (1, 2)];
         let labels = ["person"];
-        let s = scores(
+        let s = scores(3, 1, &[(0, 0, 0.9), (1, 0, 0.7), (2, 0, 0.6)]);
+
+        let entities = Decoder::new(0.5, DecodingMode::Nested).decode(
+            &s,
             3,
             1,
-            &[(0, 0, 0.9), (1, 0, 0.7), (2, 0, 0.6)],
+            &span_indices,
+            &word_offsets(),
+            &labels,
+            TEXT,
         );
-
-        let entities = Decoder::new(0.5, DecodingMode::Nested)
-            .decode(&s, 3, 1, &span_indices, &word_offsets(), &labels, TEXT);
 
         // Contained span (0..=0) is allowed; partial overlap (1..=2) is not.
         assert_eq!(entities.len(), 2);
-        let spans: Vec<(usize, usize)> =
-            entities.iter().map(|e| (e.start_word, e.end_word)).collect();
+        let spans: Vec<(usize, usize)> = entities
+            .iter()
+            .map(|e| (e.start_word, e.end_word))
+            .collect();
         assert!(spans.contains(&(0, 1)));
         assert!(spans.contains(&(0, 0)));
         assert!(!spans.contains(&(1, 2)));
@@ -332,8 +344,15 @@ mod tests {
         let span_indices = [(0, 0)];
         let labels = ["person"];
         let s = scores(1, 1, &[(0, 0, 0.49)]);
-        let entities = Decoder::new(0.5, DecodingMode::Flat)
-            .decode(&s, 1, 1, &span_indices, &word_offsets(), &labels, TEXT);
+        let entities = Decoder::new(0.5, DecodingMode::Flat).decode(
+            &s,
+            1,
+            1,
+            &span_indices,
+            &word_offsets(),
+            &labels,
+            TEXT,
+        );
         assert!(entities.is_empty());
     }
 

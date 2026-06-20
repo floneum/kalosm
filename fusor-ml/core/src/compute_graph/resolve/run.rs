@@ -540,10 +540,11 @@ impl Resolver {
             // long-sequence encoder + BiLSTM resolves to ~2200 dispatches, and one
             // pass per dispatch — the old policy for large graphs — meant ~2200
             // passes, which faults; the same dispatches grouped into a handful of
-            // passes run fine). Grouping by a GPU-reported workgroup budget keeps
-            // the pass count at roughly `total_workgroups / limit`: a few dozen for
-            // the largest graphs, one for decode/prefill — no arbitrary threshold.
-            let pass_workgroup_budget = pass_workgroup_budget(&device);
+            // passes run fine). Grouping by the device-reported workgroup limit
+            // keeps the pass count at roughly `total_workgroups / limit`: a few
+            // dozen for the largest graphs, one for decode/prefill — no threshold.
+            let pass_workgroup_budget =
+                u64::from(device.limits().max_compute_workgroups_per_dimension);
             while command_index < commands.len() {
                 match &commands[command_index] {
                     CommandRecord::CopyBuffer(copy) => {
@@ -730,20 +731,4 @@ fn direct_plan_binding_buffers(inputs: &[MirValue]) -> Vec<Vec<std::sync::Arc<wg
         })
         .collect();
     vec![buffers]
-}
-
-/// Maximum cumulative workgroups recorded into a single compute pass during a
-/// resolve. Defaults to the device's reported `max_compute_workgroups_per_dimension`
-/// so the number of compute passes per command buffer stays at roughly
-/// `total_workgroups / limit` — bounded by what the GPU itself declares it can
-/// dispatch in one go, rather than an arbitrary constant. Tunable via
-/// `FUSOR_RESOLVE_WORKGROUPS_PER_PASS` (`0`/unset uses the device limit).
-fn pass_workgroup_budget(device: &crate::Device) -> u64 {
-    if let Ok(value) = std::env::var("FUSOR_RESOLVE_WORKGROUPS_PER_PASS")
-        && let Ok(parsed) = value.parse::<u64>()
-        && parsed > 0
-    {
-        return parsed;
-    }
-    u64::from(device.limits().max_compute_workgroups_per_dimension).max(1)
 }
