@@ -351,6 +351,38 @@ impl TileBlock<'_> {
         });
     }
 
+    /// Fold one carried state value through an unstructured loop.
+    ///
+    /// `done` is checked at the top of each iteration. `body` emits one loop
+    /// iteration and returns the next state value. The body may still call
+    /// [`break_loop`](Self::break_loop) for early exits.
+    pub fn fold_state<R>(
+        &mut self,
+        initial: impl Into<Tile>,
+        done: impl FnOnce(&mut Self, Tile) -> Mask,
+        body: impl FnOnce(&mut Self, Tile) -> R,
+    ) -> Tile
+    where
+        R: Into<Tile>,
+    {
+        let initial = initial.into();
+        let element = initial.element();
+        let state = self.program.alloc_local(element);
+        self.store_local(&state, initial);
+        self.loop_forever(|program| {
+            let value = program.load_local(&state);
+            let done = done(program, value.clone());
+            program.break_if(done);
+            let next = body(program, value).into();
+            assert!(
+                next.element() == element,
+                "fold_state body must return the same element type as the initial state",
+            );
+            program.store_local(&state, next);
+        });
+        self.load_local(&state)
+    }
+
     /// Break out of the innermost loop.
     pub fn break_loop(&mut self) {
         self.push_stmt(Stmt::Break);

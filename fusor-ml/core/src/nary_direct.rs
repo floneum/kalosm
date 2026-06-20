@@ -289,7 +289,7 @@ fn build_nary_tiled_ir(
 
             for j in 0..NARY_TM {
                 let coord = base.clone() + j;
-                let in_bounds_j = in_bounds.clone().and(coord.clone().lt(extent));
+                let in_bounds_j = in_bounds.clone() & coord.clone().lt(extent);
                 coords[plan.dim] = coord;
                 let slot_values: Vec<(ValueTile, DataTypeEnum)> = (0..input_count)
                     .map(|i| match &hoisted[i] {

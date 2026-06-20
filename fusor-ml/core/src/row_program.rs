@@ -36,12 +36,12 @@ use crate::{
     },
     nary_direct::{
         ValueTile, apply_unary_function_chain, declare_value, eval_nary_expr, layout_index,
-        linear_group, output_dims_from_flat, tile_u32,
+        output_dims_from_flat, tile_u32,
     },
     nary_wise::{NaryExpr, NaryFunction, NaryOp, NaryScalar, UnaryFunctionChain},
     reduce::{ReduceFunction, ReduceOp, ReduceOperation, max_fn, sum_fn},
     tensor::{DataTypeEnum, TensorData},
-    visit_tiled::{MaybeQData, distribute_workgroups},
+    visit_tiled::MaybeQData,
 };
 
 const BLOCK: u32 = 256;
@@ -623,7 +623,12 @@ fn build_row_program_kernel(
         _ => 1,
     };
     let max_dispatch_dim = graph.device().limits().max_compute_workgroups_per_dimension;
-    let dispatch_size = distribute_workgroups(rows * splits, max_dispatch_dim);
+    let dispatch_spec = crate::row_dispatch::RowDispatchSpec::distributed(
+        rows.saturating_mul(splits),
+        block,
+        max_dispatch_dim,
+    );
+    let dispatch_size = dispatch_spec.dispatch_size;
     let cache_key =
         row_program_cache_key(operation, workgroup_shape, dispatch_size, inputs, 1, splits);
 
@@ -655,7 +660,9 @@ fn build_row_program_kernel(
         let scratch_b = scratch_value.clone().expect("split scratch");
         let output_b = output_value.clone();
         let row_shape_b = row_shape.clone();
-        let dispatch_b = distribute_workgroups(rows, max_dispatch_dim);
+        let dispatch_spec_b =
+            crate::row_dispatch::RowDispatchSpec::distributed(rows, block, max_dispatch_dim);
+        let dispatch_b = dispatch_spec_b.dispatch_size;
         let free = free_dim_out.expect("split row programs reduce") as u32;
         let max_identity_scalar =
             online_max_identity.expect("split row programs carry a max phase");
@@ -669,74 +676,86 @@ fn build_row_program_kernel(
             move |kb| {
                 let (scratch_storage, scratch_meta) = declare_value(kb, &scratch_b, false)?;
                 let (output_storage, output_meta) = declare_value(kb, &output_b, true)?;
-                kb.program().program_grid(block, dispatch_b, |program| {
-                    let lane = program.lane();
-                    let row_flat = linear_group(program, dispatch_b);
-                    let in_bounds = row_flat.clone().lt(rows);
-                    let row_dims = output_dims_from_flat(row_flat.clone(), &row_shape_b);
-                    let max_identity =
-                        Tile::literal(tile_literal_for(max_identity_scalar, DataTypeEnum::F32));
+                crate::row_dispatch::emit_row_grid(
+                    kb.program(),
+                    dispatch_spec_b,
+                    |program, ctx| {
+                        let lane = ctx.lane;
+                        let row_flat = ctx.row;
+                        let in_bounds = ctx.active;
+                        let row_dims = output_dims_from_flat(row_flat.clone(), &row_shape_b);
+                        let max_identity =
+                            Tile::literal(tile_literal_for(max_identity_scalar, DataTypeEnum::F32));
 
-                    // Lane = one span: fold the spans' maxima and rescaled
-                    // sums into the row's softmax statistics.
-                    let j_active = in_bounds.clone().and(lane.clone().lt(splits));
-                    let m_index = layout_index(
-                        &scratch_meta,
-                        &[row_flat.clone(), lane.clone(), tile_u32(free + 1)],
-                    );
-                    let m_j = program.bind(raw_tile(scratch_storage.load(
-                        program,
-                        m_index,
-                        j_active.clone(),
-                    )));
-                    let masked_m = Tile::select(j_active.clone(), m_j.clone(), max_identity);
-                    let global_max =
-                        program.group_reduce(tile_reduce_op(ReduceOp::Max), block, masked_m);
-                    let global_max = program.bind(global_max);
-                    let l_index = layout_index(
-                        &scratch_meta,
-                        &[row_flat.clone(), lane.clone(), tile_u32(free)],
-                    );
-                    let l_j = raw_tile(scratch_storage.load(program, l_index, j_active.clone()));
-                    let weighted = Tile::select(
-                        j_active,
-                        l_j * (m_j - global_max.clone()).exp(),
-                        f32_literal(0.0),
-                    );
-                    let denom =
-                        program.group_reduce(tile_reduce_op(ReduceOp::Sum), block, weighted);
-                    let denom = program.bind(denom);
-
-                    // Lane = one free-dim position: rescale and fold the
-                    // spans' accumulators.
-                    let acc = program.private(ElementType::F32);
-                    program.store_local(&acc, f32_literal(0.0));
-                    let out_active = in_bounds.and(lane.clone().lt(free));
-                    program.if_then(out_active, |program| {
-                        program.loop_range(splits, |program, j| {
-                            let m_index = layout_index(
-                                &scratch_meta,
-                                &[row_flat.clone(), j.clone(), tile_u32(free + 1)],
-                            );
-                            let m = raw_tile(scratch_storage.load(program, m_index, Mask::all()));
-                            let o_index =
-                                layout_index(&scratch_meta, &[row_flat.clone(), j, lane.clone()]);
-                            let o = raw_tile(scratch_storage.load(program, o_index, Mask::all()));
-                            let current = program.load_local(&acc);
-                            program.store_local(&acc, current + o * (m - global_max.clone()).exp());
-                        });
-                        let value = program.load_local(&acc) / denom.clone();
-                        let mut out_coords = row_dims.clone();
-                        out_coords.push(lane.clone());
-                        let output_index = layout_index(&output_meta, &out_coords);
-                        output_storage.store(
-                            program,
-                            output_index,
-                            ValueTile::F32(value).cast_to(output_dtype),
-                            Mask::all(),
+                        // Lane = one span: fold the spans' maxima and rescaled
+                        // sums into the row's softmax statistics.
+                        let j_active = in_bounds.clone() & lane.clone().lt(splits);
+                        let m_index = layout_index(
+                            &scratch_meta,
+                            &[row_flat.clone(), lane.clone(), tile_u32(free + 1)],
                         );
-                    });
-                });
+                        let m_j = program.bind(raw_tile(scratch_storage.load(
+                            program,
+                            m_index,
+                            j_active.clone(),
+                        )));
+                        let masked_m = Tile::select(j_active.clone(), m_j.clone(), max_identity);
+                        let global_max =
+                            program.group_reduce(tile_reduce_op(ReduceOp::Max), block, masked_m);
+                        let global_max = program.bind(global_max);
+                        let l_index = layout_index(
+                            &scratch_meta,
+                            &[row_flat.clone(), lane.clone(), tile_u32(free)],
+                        );
+                        let l_j =
+                            raw_tile(scratch_storage.load(program, l_index, j_active.clone()));
+                        let weighted = Tile::select(
+                            j_active,
+                            l_j * (m_j - global_max.clone()).exp(),
+                            f32_literal(0.0),
+                        );
+                        let denom =
+                            program.group_reduce(tile_reduce_op(ReduceOp::Sum), block, weighted);
+                        let denom = program.bind(denom);
+
+                        // Lane = one free-dim position: rescale and fold the
+                        // spans' accumulators.
+                        let acc = program.private(ElementType::F32);
+                        program.store_local(&acc, f32_literal(0.0));
+                        let out_active = in_bounds & lane.clone().lt(free);
+                        program.if_then(out_active, |program| {
+                            program.loop_range(splits, |program, j| {
+                                let m_index = layout_index(
+                                    &scratch_meta,
+                                    &[row_flat.clone(), j.clone(), tile_u32(free + 1)],
+                                );
+                                let m =
+                                    raw_tile(scratch_storage.load(program, m_index, Mask::all()));
+                                let o_index = layout_index(
+                                    &scratch_meta,
+                                    &[row_flat.clone(), j, lane.clone()],
+                                );
+                                let o =
+                                    raw_tile(scratch_storage.load(program, o_index, Mask::all()));
+                                let current = program.load_local(&acc);
+                                program.store_local(
+                                    &acc,
+                                    current + o * (m - global_max.clone()).exp(),
+                                );
+                            });
+                            let value = program.load_local(&acc) / denom.clone();
+                            let mut out_coords = row_dims.clone();
+                            out_coords.push(lane.clone());
+                            let output_index = layout_index(&output_meta, &out_coords);
+                            output_storage.store(
+                                program,
+                                output_index,
+                                ValueTile::F32(value).cast_to(output_dtype),
+                                Mask::all(),
+                            );
+                        });
+                    },
+                );
                 Some(())
             },
         )?;
@@ -783,9 +802,9 @@ fn build_row_program_kernel(
                 })
                 .collect();
 
-            phase_handle.program_grid(block, dispatch_size, |program| {
-                let lane = program.lane();
-                let wg_flat = linear_group(program, dispatch_size);
+            crate::row_dispatch::emit_row_grid(phase_handle, dispatch_spec, |program, ctx| {
+                let lane = ctx.lane;
+                let wg_flat = ctx.row;
                 let (row_flat, split_idx) = if splits > 1 {
                     (
                         program.bind(wg_flat.clone() / splits),
@@ -873,13 +892,13 @@ fn build_row_program_kernel(
                     program.store_local(&running_sum, f32_literal(0.0));
                     program.store_local(&acc, f32_literal(0.0));
                     program.store_local(&tile_base, span_start);
-                    let out_active = in_bounds.clone().and(lane.clone().lt(free));
+                    let out_active = in_bounds.clone() & lane.clone().lt(free);
 
                     program.loop_forever(|program| {
                         let base = program.load_local(&tile_base);
                         program.break_if(base.clone().ge(span_end.clone()));
                         let kv = program.bind(base.clone() + lane.clone());
-                        let kv_active = in_bounds.clone().and(kv.clone().lt(effective_len.clone()));
+                        let kv_active = in_bounds.clone() & kv.clone().lt(effective_len.clone());
                         let coords = full_coords(kv);
 
                         // Per-position score, optionally an inline fold (the
@@ -985,9 +1004,7 @@ fn build_row_program_kernel(
                                 let j = program.load_local(&item);
                                 let kv_j = program.bind(base.clone() + j.clone());
                                 program.break_if(
-                                    j.clone()
-                                        .ge(block)
-                                        .or(kv_j.clone().ge(effective_len.clone())),
+                                    j.clone().ge(block) | kv_j.clone().ge(effective_len.clone()),
                                 );
                                 let prob_j = program.load_workgroup(probs, j.clone());
                                 let mut weight_coords = full_coords(kv_j);
@@ -1024,10 +1041,9 @@ fn build_row_program_kernel(
                             output_storage.store(program, index, value, Mask::all());
                         });
                         let stat_active = |offset: u32| {
-                            in_bounds
-                                .clone()
-                                .and(lane.clone().ge(free + offset))
-                                .and(lane.clone().lt(free + offset + 1))
+                            in_bounds.clone()
+                                & lane.clone().ge(free + offset)
+                                & lane.clone().lt(free + offset + 1)
                         };
                         program.if_then(stat_active(0), |program| {
                             let index = layout_index(
@@ -1079,7 +1095,7 @@ fn build_row_program_kernel(
                         [identity()],
                         |program, chunk, [acc]| {
                             let k_index = chunk * block + lane.clone();
-                            let active = in_bounds.clone().and(k_index.clone().lt(k));
+                            let active = in_bounds.clone() & k_index.clone().lt(k);
                             let coords = full_coords(k_index);
                             let (value, _) = eval_nary_expr(
                                 program,
@@ -1109,7 +1125,7 @@ fn build_row_program_kernel(
                     RowOutput::Map(output_expr) => {
                         program.loop_range(chunks, |program, chunk| {
                             let k_index = chunk * block + lane.clone();
-                            let active = in_bounds.clone().and(k_index.clone().lt(k));
+                            let active = in_bounds.clone() & k_index.clone().lt(k);
                             let coords = full_coords(k_index);
                             let (value, _) = eval_nary_expr(
                                 program,
@@ -1126,7 +1142,7 @@ fn build_row_program_kernel(
                         });
                     }
                     RowOutput::Scalar(output_expr) => {
-                        let active = in_bounds.and(lane.eq(0u32));
+                        let active = in_bounds & lane.eq(0u32);
                         let coords = full_coords(tile_u32(0));
                         let (value, _) = eval_nary_expr(
                             program,
