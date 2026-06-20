@@ -599,12 +599,16 @@ fn sum_prefix_weights(
     program.load_local(&sum)
 }
 
-fn weighted_pick(
-    program: &mut TileBlock<'_>,
-    ids: &Storage,
-    values: &Storage,
+struct WeightedPickInputs<'a> {
+    ids: &'a Storage,
+    values: &'a Storage,
     meta: SamplerMeta,
     max_value: Tile,
+}
+
+fn weighted_pick(
+    program: &mut TileBlock<'_>,
+    inputs: WeightedPickInputs<'_>,
     cutoff: Tile,
     total: Tile,
     random: Tile,
@@ -614,8 +618,14 @@ fn weighted_pick(
     let selected_probability = program.private(ElementType::F32);
     let threshold = random * total.clone();
 
-    let first_token = sampler_top_id(program, ids, meta, u32t(0));
-    let first_weight = sampler_top_weight(program, values, meta, max_value.clone(), u32t(0));
+    let first_token = sampler_top_id(program, inputs.ids, inputs.meta, u32t(0));
+    let first_weight = sampler_top_weight(
+        program,
+        inputs.values,
+        inputs.meta,
+        inputs.max_value.clone(),
+        u32t(0),
+    );
     program.store_local(&selected, first_token);
     program.store_local(&selected_probability, first_weight / total.clone());
     program.store_local(&cumulative, f32t(0.0));
@@ -623,12 +633,17 @@ fn weighted_pick(
         u32t(0),
         |_, index| index.ge(cutoff),
         |program, index| {
-            let weight =
-                sampler_top_weight(program, values, meta, max_value.clone(), index.clone());
+            let weight = sampler_top_weight(
+                program,
+                inputs.values,
+                inputs.meta,
+                inputs.max_value.clone(),
+                index.clone(),
+            );
             let cumulative_value = program.load_local(&cumulative) + weight.clone();
             let picked = cumulative_value.clone().ge(threshold.clone());
             program.if_then(picked, |program| {
-                let token = sampler_top_id(program, ids, meta, index.clone());
+                let token = sampler_top_id(program, inputs.ids, inputs.meta, index.clone());
                 program.store_local(&selected, token);
                 program.store_local(&selected_probability, weight / total.clone());
                 program.break_loop();
@@ -742,10 +757,12 @@ pub(crate) fn mirostat2<B>(kb: &mut KernelBuilder<B>, spec: Mirostat2<B>) -> Opt
                     let random = load_param_f32(program, &params, 2);
                     let (token, probability) = weighted_pick(
                         program,
-                        &ids,
-                        &values,
-                        meta,
-                        max_value.clone(),
+                        WeightedPickInputs {
+                            ids: &ids,
+                            values: &values,
+                            meta,
+                            max_value: max_value.clone(),
+                        },
                         cutoff_value,
                         cutoff_sum_value,
                         random,
@@ -880,10 +897,12 @@ pub(crate) fn standard_sampler<B>(
                     let random = load_param_f32(program, &params, 0);
                     let (token, _) = weighted_pick(
                         program,
-                        &ids,
-                        &values,
-                        meta,
-                        max_value.clone(),
+                        WeightedPickInputs {
+                            ids: &ids,
+                            values: &values,
+                            meta,
+                            max_value: max_value.clone(),
+                        },
                         cutoff_value,
                         cutoff_sum_value,
                         random,
