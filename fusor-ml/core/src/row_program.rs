@@ -41,7 +41,7 @@ use crate::{
     nary_wise::{NaryExpr, NaryFunction, NaryOp, NaryScalar, UnaryFunctionChain},
     reduce::{ReduceFunction, ReduceOp, ReduceOperation, max_fn, sum_fn},
     tensor::{DataTypeEnum, TensorData},
-    visit_tiled::MaybeQData,
+    visit_tiled::{MaybeQData, distribute_workgroups},
 };
 
 const BLOCK: u32 = 256;
