@@ -87,7 +87,7 @@ impl RelativePositionEmbedding {
     /// Number of entries (`2 * position_buckets`) in the relative
     /// position embedding table — this is the per-head "position dimension" of
     /// the `c2p_all` / `p2c_all` attention scores before gathering.
-    pub fn num_positions(&self) -> usize {
+    fn num_positions(&self) -> usize {
         self.embeddings.shape()[0]
     }
 
@@ -340,33 +340,4 @@ fn gather_by_flat_index(
         .index_select(0, flat_idx)
         .reshape([b, h, s, s])
         .to_concrete()
-}
-
-/// Shared relative position embedding layer (used across all layers in DeBERTa).
-pub struct DisentangledSelfAttention {
-    attention: MDebertaAttention,
-}
-
-impl DisentangledSelfAttention {
-    pub fn load(
-        device: &Device,
-        vb: &mut VarBuilder,
-        num_heads: usize,
-        head_dim: usize,
-    ) -> Result<Self> {
-        let attention = MDebertaAttention::load(device, vb, num_heads, head_dim)?;
-        Ok(Self { attention })
-    }
-
-    /// Forward with precomputed gather indices and relative embedding table.
-    pub fn forward_with_rel(
-        &self,
-        hidden_states: &Tensor<3, f32>,
-        rel_pos_emb: &Tensor<2, f32>,
-        gather_idx: &GatherIndices,
-        attention_bias: Option<&Tensor<4, f32>>,
-    ) -> Tensor<3, f32> {
-        self.attention
-            .forward_with_indices(hidden_states, rel_pos_emb, gather_idx, attention_bias)
-    }
 }

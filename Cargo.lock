@@ -9377,19 +9377,15 @@ dependencies = [
  "anyhow",
  "clap 4.6.1",
  "fusor",
- "fusor-core",
- "fusor-gguf",
  "kalosm-common",
  "kalosm-language-model",
  "kalosm-model-types",
- "pollster",
  "rbert",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
  "tokio",
- "tracing",
 ]
 
 [[package]]

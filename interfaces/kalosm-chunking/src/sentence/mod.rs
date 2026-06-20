@@ -7,13 +7,6 @@ use std::str::FromStr;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DefaultSentenceChunker;
 
-impl DefaultSentenceChunker {
-    /// Split a string into sentence byte ranges.
-    pub fn split_sentences(&self, string: &str) -> Vec<std::ops::Range<usize>> {
-        SentenceChunker::default().split_sentences(string)
-    }
-}
-
 /// A sentence splitter backed by [SRX](https://www.unicode.org/uli/pas/srx/srx20.html) rules.
 ///
 /// Uses the [srx](https://crates.io/crates/srx) crate to parse and apply the rules.
@@ -47,11 +40,6 @@ impl SentenceChunker {
 
         let rules = self.srx.language_rules(language);
         rules.split_ranges(string)
-    }
-
-    /// Access the parsed SRX rules. Primarily useful to external `Chunker` trait implementations.
-    pub fn srx(&self) -> &SRX {
-        &self.srx
     }
 }
 

@@ -77,32 +77,6 @@ impl SpanLayer {
         })
     }
 
-    /// Compute span representations for specific (start, end) word positions.
-    ///
-    /// Matches Python TokenMarker forward:
-    /// 1. project_start(h) -> start_rep
-    /// 2. project_end(h) -> end_rep
-    /// 3. gather at span positions
-    /// 4. cat + relu
-    /// 5. out_project
-    ///
-    /// # Arguments
-    /// * `word_embeddings` - Word embeddings [batch=1, num_words, hidden]
-    /// * `spans` - List of (start_word, end_word) pairs
-    ///
-    /// # Returns
-    /// Span embeddings [num_spans, hidden]
-    pub fn forward_for_spans(
-        &self,
-        word_embeddings: &Tensor<3, f32>,
-        spans: &[(usize, usize)],
-        device: &Device,
-    ) -> Tensor<2, f32> {
-        let (batched, _counts) =
-            self.forward_for_spans_batched(word_embeddings, &[spans.to_vec()], device);
-        batched
-    }
-
     /// Compute span representations for a batch of per-item span lists.
     ///
     /// Returns:
@@ -173,5 +147,4 @@ impl SpanLayer {
 
         (out, span_counts)
     }
-
 }

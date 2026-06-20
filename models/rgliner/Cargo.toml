@@ -10,20 +10,16 @@ keywords = ["ai", "ner", "nlp", "gliner", "transformers"]
 
 [dependencies]
 fusor = { workspace = true, default-features = false }
-fusor-core = { workspace = true }
-fusor-gguf = { workspace = true }
 tokenizers = { workspace = true, features = ["fancy-regex"] }
 thiserror.workspace = true
 rbert = { workspace = true }
 
-tracing = "0.1.37"
 serde_json = "1.0.106"
 serde = { version = "1", features = ["derive"] }
 
 kalosm-common = { workspace = true }
 kalosm-model-types.workspace = true
 kalosm-language-model.workspace = true
-pollster = "0.4.0"
 
 [dev-dependencies]
 anyhow.workspace = true

@@ -3,7 +3,7 @@
 use fusor::layers::LayerNorm;
 use fusor::{Device, Result, Tensor, VarBuilder};
 
-use super::attention::{DisentangledSelfAttention, GatherIndices};
+use super::attention::{GatherIndices, MDebertaAttention};
 use super::feed_forward::MDebertaFeedForward;
 
 /// A single mDeBERTa transformer layer.
@@ -14,7 +14,7 @@ use super::feed_forward::MDebertaFeedForward;
 /// 3. Feed-forward network
 /// 4. Add & LayerNorm
 pub struct MDebertaLayer {
-    attention: DisentangledSelfAttention,
+    attention: MDebertaAttention,
     attention_norm: LayerNorm<1, f32>,
     feed_forward: MDebertaFeedForward,
     output_norm: LayerNorm<1, f32>,
@@ -29,7 +29,7 @@ impl MDebertaLayer {
         eps: f32,
     ) -> Result<Self> {
         let attention =
-            DisentangledSelfAttention::load(device, &mut vb.pp("attention"), num_heads, head_dim)?;
+            MDebertaAttention::load(device, &mut vb.pp("attention"), num_heads, head_dim)?;
         let attention_norm = LayerNorm::load(device, &mut vb.pp("attention_norm"), eps)?;
         let feed_forward = MDebertaFeedForward::load(device, &mut vb.pp("ffn"))?;
         let output_norm = LayerNorm::load(device, &mut vb.pp("output_norm"), eps)?;
@@ -57,9 +57,12 @@ impl MDebertaLayer {
         attention_bias: Option<&Tensor<4, f32>>,
     ) -> Tensor<3, f32> {
         // Self-attention + residual + norm
-        let attn_output =
-            self.attention
-                .forward_with_rel(hidden_states, rel_pos_emb, gather_idx, attention_bias);
+        let attn_output = self.attention.forward_with_indices(
+            hidden_states,
+            rel_pos_emb,
+            gather_idx,
+            attention_bias,
+        );
         let hidden_states = self
             .attention_norm
             .forward(&hidden_states.add_(&attn_output));

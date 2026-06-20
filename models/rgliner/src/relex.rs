@@ -272,10 +272,6 @@ pub struct GlinerRelEx {
     config: GlinerRelExConfig,
 }
 
-async fn default_device() -> Device {
-    Device::gpu().await.unwrap_or_else(|_| Device::cpu())
-}
-
 impl GlinerRelEx {
     /// Create a new builder.
     pub fn builder() -> GlinerRelExBuilder {
@@ -306,7 +302,7 @@ impl GlinerRelEx {
         // Initialize device
         let device = match device {
             Some(d) => d,
-            None => default_device().await,
+            None => crate::default_device().await,
         };
 
         // Load model components from GGUF
@@ -413,7 +409,9 @@ impl GlinerRelEx {
         entity_labels: &[&str],
         relation_labels: &[&str],
     ) -> Result<(Vec<Entity>, Vec<Relation>), GlinerError> {
-        let mut results = self.extract_batch(&[text], entity_labels, relation_labels).await?;
+        let mut results = self
+            .extract_batch(&[text], entity_labels, relation_labels)
+            .await?;
         Ok(results.pop().unwrap_or_default())
     }
 
@@ -438,13 +436,11 @@ impl GlinerRelEx {
             .iter()
             .map(|item| item.text_positions.clone())
             .collect();
-        let word_encoder_embs =
-            self.gather_at_positions_batched(&encoder_output, &text_positions);
+        let word_encoder_embs = self.gather_at_positions_batched(&encoder_output, &text_positions);
         let word_lengths: Vec<usize> = tokenized.iter().map(|item| item.num_words).collect();
         let text_embs = self
             .bilstm
-            .forward_with_lengths(&word_encoder_embs, &word_lengths)
-            .await;
+            .forward_with_lengths(&word_encoder_embs, &word_lengths);
 
         let ent_positions: Vec<Vec<usize>> = tokenized
             .iter()
@@ -490,15 +486,9 @@ impl GlinerRelEx {
             } else {
                 let text_embs_item: Tensor<3, f32> =
                     text_embs.narrow(0, batch_idx, 1).to_concrete();
-                let rel_embs_item: Tensor<3, f32> =
-                    rel_embs.narrow(0, batch_idx, 1).to_concrete();
-                self.decode_relations(
-                    &text_embs_item,
-                    &rel_embs_item,
-                    &entities,
-                    relation_labels,
-                )
-                .await?
+                let rel_embs_item: Tensor<3, f32> = rel_embs.narrow(0, batch_idx, 1).to_concrete();
+                self.decode_relations(&text_embs_item, &rel_embs_item, &entities, relation_labels)
+                    .await?
             };
             results.push((entities, relations));
         }
@@ -560,22 +550,7 @@ impl GlinerRelEx {
             }
         }
 
-        all_entities.sort_by(|a, b| {
-            a.start_char
-                .cmp(&b.start_char)
-                .then_with(|| a.end_char.cmp(&b.end_char))
-                .then_with(|| a.label.cmp(&b.label))
-        });
-        all_entities.dedup_by(|b, a| {
-            if a.start_char == b.start_char && a.end_char == b.end_char && a.label == b.label {
-                if b.score > a.score {
-                    a.score = b.score;
-                }
-                true
-            } else {
-                false
-            }
-        });
+        crate::merge_entities(&mut all_entities);
 
         all_relations.sort_by(|a, b| {
             a.head
@@ -607,31 +582,15 @@ impl GlinerRelEx {
         &self,
         tokenized: &[RelExTokenizedInput],
     ) -> (Tensor<2, u32>, Tensor<2, u32>) {
-        let batch_size = tokenized.len();
-        let max_seq_len = tokenized
+        let sequences: Vec<(&[u32], &[u32])> = tokenized
             .iter()
-            .map(|item| item.token_ids.len())
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        let pad_id = self.tokenizer.special_tokens().pad_id;
-
-        let mut token_ids = vec![pad_id; batch_size * max_seq_len];
-        let mut attention_mask = vec![0u32; batch_size * max_seq_len];
-        for (batch_idx, item) in tokenized.iter().enumerate() {
-            let offset = batch_idx * max_seq_len;
-            let len = item.token_ids.len();
-            token_ids[offset..offset + len].copy_from_slice(&item.token_ids);
-            attention_mask[offset..offset + len].copy_from_slice(&item.attention_mask);
-        }
-
-        let token_ids = Tensor::new(&self.device, &token_ids)
-            .reshape([batch_size, max_seq_len])
-            .to_concrete();
-        let attention_mask = Tensor::new(&self.device, &attention_mask)
-            .reshape([batch_size, max_seq_len])
-            .to_concrete();
-        (token_ids, attention_mask)
+            .map(|t| (t.token_ids.as_slice(), t.attention_mask.as_slice()))
+            .collect();
+        crate::tokenization::pad_and_stack_inputs(
+            &self.device,
+            &sequences,
+            self.tokenizer.special_tokens().pad_id,
+        )
     }
 
     async fn decode_relations(
@@ -649,9 +608,9 @@ impl GlinerRelEx {
             .iter()
             .map(|e| (e.start_word, e.end_word))
             .collect();
-        let span_reps = self
-            .span_layer
-            .forward_for_spans(text_embs, &entity_spans, &self.device);
+        let (span_reps, _) =
+            self.span_layer
+                .forward_for_spans_batched(text_embs, &[entity_spans], &self.device);
 
         let num_entities = entities.len();
         let hidden_size = self.config.hidden_size;
@@ -685,7 +644,7 @@ impl GlinerRelEx {
 
         let rel_embs_squeezed: Tensor<2, f32> = rel_embs.squeeze(0).to_concrete();
         let rel_scores = pair_embs.mat_mul(&rel_embs_squeezed.transpose(0, 1));
-        let rel_scores_slice = rel_scores.clone().as_slice().await?;
+        let rel_scores_slice = rel_scores.sigmoid().as_slice().await?;
         let n_rels = relation_labels.len();
         let threshold = self.config.relation_threshold;
 
@@ -693,8 +652,7 @@ impl GlinerRelEx {
         for (pair_idx, &(head_idx, tail_idx)) in candidate_pairs.iter().enumerate() {
             let base = pair_idx * n_rels;
             for rel_idx in 0..n_rels {
-                let raw = rel_scores_slice.as_slice()[base + rel_idx];
-                let prob = 1.0 / (1.0 + (-raw).exp());
+                let prob = rel_scores_slice.as_slice()[base + rel_idx];
                 if prob > threshold {
                     relations.push(Relation {
                         head: entities[head_idx].clone(),
@@ -724,15 +682,7 @@ impl GlinerRelEx {
     ) -> Result<Vec<Vec<Entity>>, GlinerError> {
         let spans_per_batch: Vec<Vec<(usize, usize)>> = tokenized
             .iter()
-            .map(|item| {
-                let mut spans = Vec::new();
-                for start in 0..item.num_words {
-                    for width in 1..=self.config.max_width.min(item.num_words - start) {
-                        spans.push((start, start + width - 1));
-                    }
-                }
-                spans
-            })
+            .map(|item| crate::tokenization::enumerate_spans(item.num_words, self.config.max_width))
             .collect();
 
         let (flat_span_reps, span_counts) =
@@ -828,14 +778,13 @@ impl GlinerRelEx {
 
         let label_rep_t: Tensor<2, f32> = ent_embs_2d.transpose(0, 1).to_concrete();
         let logits = span_reps.mat_mul(&label_rep_t);
-        let logits_data = logits.clone().as_slice().await?;
+        let logits_data = logits.sigmoid().as_slice().await?;
         let logits_slice = logits_data.as_slice();
 
         let mut candidates: Vec<(usize, usize, usize, f32)> = Vec::new();
         for (span_idx, &(s, e)) in spans.iter().enumerate() {
             for l in 0..n_labels {
-                let raw = logits_slice[span_idx * n_labels + l];
-                let prob = 1.0 / (1.0 + (-raw).exp());
+                let prob = logits_slice[span_idx * n_labels + l];
                 if prob >= threshold {
                     candidates.push((s, e, l, prob));
                 }
@@ -932,53 +881,11 @@ impl GlinerRelEx {
         hidden_states: &Tensor<3, f32>,
         positions_per_batch: &[Vec<usize>],
     ) -> Tensor<3, f32> {
-        let [batch_size, seq_len, hidden_size] = hidden_states.shape();
-        assert_eq!(
-            batch_size,
-            positions_per_batch.len(),
-            "positions_per_batch must match batch size"
-        );
-
-        let max_positions = positions_per_batch.iter().map(Vec::len).max().unwrap_or(0);
-        if max_positions == 0 {
-            return Tensor::zeros(&self.device, [batch_size, 1, hidden_size]);
-        }
-
-        let hidden_flat = hidden_states
-            .to_concrete()
-            .reshape([batch_size * seq_len, hidden_size])
-            .to_concrete();
-
-        // Each gathered position must stay within its row's `seq_len`, otherwise
-        // the flat `index_select` would read into a neighbouring sequence. Padded
-        // slots use position 0 (masked downstream).
-        let mut offset_indices = Vec::with_capacity(batch_size * max_positions);
-        for (batch_idx, positions) in positions_per_batch.iter().enumerate() {
-            let offset = (batch_idx * seq_len) as u32;
-            for pos_idx in 0..max_positions {
-                let pos = positions.get(pos_idx).copied().unwrap_or(0);
-                debug_assert!(
-                    pos < seq_len,
-                    "gather position {pos} out of range for seq_len {seq_len} (batch {batch_idx})"
-                );
-                offset_indices.push(pos as u32 + offset);
-            }
-        }
-
-        let offset_indices = Tensor::new(&self.device, &offset_indices);
-        hidden_flat
-            .index_select(0, &offset_indices)
-            .reshape([batch_size, max_positions, hidden_size])
-            .to_concrete()
+        crate::tokenization::gather_positions(hidden_states, positions_per_batch, &self.device)
     }
 
     /// Get the device.
     pub fn device(&self) -> &Device {
         &self.device
-    }
-
-    /// Get the configuration.
-    pub fn config(&self) -> &GlinerRelExConfig {
-        &self.config
     }
 }

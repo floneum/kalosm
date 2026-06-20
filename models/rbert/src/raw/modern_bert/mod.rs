@@ -13,5 +13,4 @@ mod feed_forward;
 mod layer;
 mod model;
 
-pub use config::ModernBertConfig;
 pub use model::ModernBertModel;

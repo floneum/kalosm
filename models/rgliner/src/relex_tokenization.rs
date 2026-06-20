@@ -115,14 +115,6 @@ pub struct RelExTokenizer {
 }
 
 impl RelExTokenizer {
-    /// Create a new RelEx tokenizer.
-    pub fn new(tokenizer: Tokenizer) -> Self {
-        Self {
-            tokenizer: Arc::new(tokenizer),
-            special_tokens: SpecialTokenIds::default(),
-        }
-    }
-
     /// Create with custom special token IDs.
     pub fn with_special_tokens(tokenizer: Tokenizer, special_tokens: SpecialTokenIds) -> Self {
         Self {
@@ -223,7 +215,8 @@ impl RelExTokenizer {
         entity_labels: &[&str],
         relation_labels: &[&str],
     ) -> Result<Vec<RelExTokenizedInput>, GlinerError> {
-        texts.iter()
+        texts
+            .iter()
             .map(|text| self.tokenize(text, entity_labels, relation_labels))
             .collect()
     }

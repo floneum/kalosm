@@ -39,7 +39,6 @@ impl ModernBertAttention {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
-        _eps: f32,
     ) -> Result<Self> {
         // Fused QKV weight
         let wqkv = vb.get("attn_qkv.weight", device)?;

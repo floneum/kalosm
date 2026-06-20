@@ -11,18 +11,12 @@ pub enum GlinerLoadingError {
     /// An error that can occur when trying to load the model.
     #[error("Failed to load model: {0}")]
     LoadModel(#[from] fusor::Error),
-    /// An IO error.
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
     /// An error that can occur when trying to load the tokenizer.
     #[error("Failed to load tokenizer: {0}")]
     LoadTokenizer(tokenizers::Error),
     /// An error that can occur when trying to load the config.
     #[error("Failed to load config: {0}")]
     LoadConfig(serde_json::Error),
-    /// Config file not found.
-    #[error("Config file not found")]
-    ConfigNotFound,
     /// A required GLiNER-RelEx special token is absent from the tokenizer.
     #[error(
         "Tokenizer is missing required GLiNER-RelEx special token(s): {0}. The model's embedded \

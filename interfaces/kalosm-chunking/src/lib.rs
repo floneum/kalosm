@@ -12,6 +12,8 @@ pub mod sentence;
 pub use sentence::{DefaultSentenceChunker, SentenceChunker};
 
 /// A strategy for chunking a document into smaller pieces.
+///
+/// This is used to split a document into smaller pieces to generate embeddings for each piece.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ChunkStrategy {
     /// Split the document into paragraphs.

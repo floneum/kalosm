@@ -9,5 +9,4 @@ mod feed_forward;
 mod layer;
 mod model;
 
-pub use config::MDebertaConfig;
 pub use model::MDebertaModel;

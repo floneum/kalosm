@@ -72,7 +72,7 @@ impl BiLstm {
     ///
     /// Padded timesteps are masked out so shorter sequences in a batch do not
     /// corrupt the backward direction state.
-    pub async fn forward_with_lengths(
+    pub fn forward_with_lengths(
         &self,
         input: &Tensor<3, f32>,
         lengths: &[usize],
@@ -103,7 +103,6 @@ impl BiLstm {
             .reshape([batch, seq_len, 2 * self.hidden_size])
             .to_concrete()
     }
-
 }
 
 /// Run one direction of the LSTM. Sequential over time; every timestep's gate
@@ -143,8 +142,9 @@ fn run_direction(
                 &lengths
                     .iter()
                     .flat_map(|&length| {
-                        (0..seq_len)
-                            .flat_map(move |t| std::iter::repeat_n(if t < length { 1.0 } else { 0.0 }, hidden_size))
+                        (0..seq_len).flat_map(move |t| {
+                            std::iter::repeat_n(if t < length { 1.0 } else { 0.0 }, hidden_size)
+                        })
                     })
                     .collect::<Vec<_>>(),
             )
@@ -167,8 +167,7 @@ fn run_direction(
 
         // gates_pre = x_t @ W_ih^T + h @ W_hh^T + bias, shape [batch, 4*hidden]
         let gates_pre: Tensor<2, f32> =
-            (x_gates_t + h.mat_mul(&dir.w_hh_t) + bias_broadcast.clone())
-                .to_concrete();
+            (x_gates_t + h.mat_mul(&dir.w_hh_t) + bias_broadcast.clone()).to_concrete();
 
         let i_raw: Tensor<2, f32> = gates_pre.narrow(1, 0, hidden_size).to_concrete();
         let f_raw: Tensor<2, f32> = gates_pre.narrow(1, hidden_size, hidden_size).to_concrete();
@@ -179,10 +178,10 @@ fn run_direction(
             .narrow(1, 3 * hidden_size, hidden_size)
             .to_concrete();
 
-        let i_gate = sigmoid_2d(&i_raw);
-        let f_gate = sigmoid_2d(&f_raw);
+        let i_gate = i_raw.sigmoid();
+        let f_gate = f_raw.sigmoid();
         let g_gate = g_raw.tanh();
-        let o_gate = sigmoid_2d(&o_raw);
+        let o_gate = o_raw.sigmoid();
 
         let next_c = (f_gate * c.clone() + i_gate * g_gate).to_concrete();
         let next_h = (o_gate * next_c.clone().tanh()).to_concrete();
@@ -217,11 +216,4 @@ fn run_direction(
         let zeros: Tensor<3, f32> = Tensor::zeros(device, [batch, seq_len, hidden_size]);
         mask.where_cond(&outputs, &zeros).to_concrete()
     }
-}
-
-/// sigmoid via `0.5 * (tanh(x / 2) + 1)` — avoids needing scalar-left division
-/// or a `recip` primitive, and keeps the computation on-device.
-fn sigmoid_2d(x: &Tensor<2, f32>) -> Tensor<2, f32> {
-    let half = (x.clone() * 0.5f32).to_concrete();
-    ((half.tanh() + 1.0f32) * 0.5f32).to_concrete()
 }

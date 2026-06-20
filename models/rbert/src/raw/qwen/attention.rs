@@ -87,23 +87,9 @@ impl QwenSelfAttention {
         let hidden_size = self.num_heads * self.head_dim;
         let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-        // Convert attention mask for flash attention if provided
-        // The mask should be [b_sz, seq_len] where 1 = valid, 0 = pad
-        // Flash attention expects None for no mask, or a mask tensor
-        // Note: We use a large negative value instead of NEG_INFINITY because
-        // the GPU shader path does not support inf literals. -10000 is enough to effectively
-        // zero out masked positions after softmax.
-        const MASK_NEG_VALUE: f32 = -10000.0;
-        let mask: Option<Tensor<2, f32>> = attention_mask.map(|m| {
-            // Convert u32 mask to f32
-            // 1 (valid) -> 0.0, 0 (pad) -> large negative value
-            let mask_f32: Tensor<2, f32> = m.cast();
-            // Create ones by adding 1 to zeros
-            let zeros = mask_f32.zeros_like();
-            let ones = (zeros + 1.0f32).to_concrete();
-            // (1 - mask) * large_neg gives: valid=0, pad=large_neg
-            ((ones - mask_f32) * MASK_NEG_VALUE).to_concrete()
-        });
+        // Mask padded keys with a large negative bias (shared helper, identical to
+        // the BERT/ModernBERT attention paths).
+        let mask = attention_mask.map(super::super::utils::attention_mask_to_bias);
 
         let attn_output = query_states.flash_attention(
             &key_states,

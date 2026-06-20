@@ -66,43 +66,6 @@ impl BertSelfAttention {
         let context_layer = context_layer.transpose(1, 2).to_concrete();
         context_layer.flatten_last_n::<1, _>()
     }
-
-    pub(crate) fn debug_forward(
-        &self,
-        hidden_states: &Tensor<3, f32>,
-        attention_mask: Option<&Tensor<2, u32>>,
-    ) -> (
-        Tensor<4, f32>,
-        Tensor<4, f32>,
-        Tensor<4, f32>,
-        Tensor<3, f32>,
-    ) {
-        let _enter = self.span.enter();
-        let query_layer = self.query.forward(hidden_states);
-        let key_layer = self.key.forward(hidden_states);
-        let value_layer = self.value.forward(hidden_states);
-
-        let query_layer = self.transpose_for_scores(&query_layer);
-        let key_layer = self.transpose_for_scores(&key_layer);
-        let value_layer = self.transpose_for_scores(&value_layer);
-
-        let scale = 1.0 / (self.attention_head_size as f32).sqrt();
-        let mask = attention_mask.map(super::utils::attention_mask_to_bias);
-
-        let context_layer = {
-            let _enter_sm = self.span_softmax.enter();
-            query_layer.flash_attention(
-                &key_layer,
-                &value_layer,
-                scale,
-                mask.as_ref().map(|m| (m, fusor::MaskKind::BatchKeyMask)),
-            )
-        };
-        let context_layer = context_layer.transpose(1, 2).to_concrete();
-        let context_layer = context_layer.flatten_last_n::<1, _>();
-
-        (query_layer, key_layer, value_layer, context_layer)
-    }
 }
 
 // attention_probs before matmul: Tensor[dims 3, 12, 13, 13; f32]

@@ -13,12 +13,8 @@ pub struct ModernBertConfig {
     pub num_kv_heads: usize,
     /// Number of transformer layers.
     pub num_layers: usize,
-    /// Hidden size (embedding dimension).
-    pub hidden_size: usize,
     /// Dimension per attention head.
     pub head_dimension: usize,
-    /// Intermediate size for FFN.
-    pub intermediate_size: usize,
     /// Maximum context length.
     pub context_length: usize,
     /// RoPE base frequency used by global-attention layers.
@@ -53,8 +49,6 @@ impl ModernBertConfig {
             )));
         }
 
-        let intermediate_size =
-            load_u32_or(vb, ".feed_forward_length", (hidden_size * 4) as u32) as usize;
         let context_length = load_u32_or(vb, ".context_length", 8192) as usize;
         let rope_theta = load_f32_or(vb, ".rope.freq_base", 10000.0);
         // Local layers may use a distinct RoPE base; absent (older GGUFs) it
@@ -80,9 +74,7 @@ impl ModernBertConfig {
             num_heads,
             num_kv_heads,
             num_layers,
-            hidden_size,
             head_dimension,
-            intermediate_size,
             context_length,
             rope_theta,
             local_rope_theta,

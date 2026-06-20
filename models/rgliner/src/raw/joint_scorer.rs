@@ -12,12 +12,8 @@ use fusor::{Device, Result, Tensor, VarBuilder};
 /// 1. Project label embeddings: proj_label(label_embs) -> [n_labels, proj_dim]
 /// 2. Concatenate token embeddings (hidden) with projected labels (proj_dim)
 /// 3. MLP: concat(token, proj_label) -> fc1 -> GELU -> fc2 -> scores
-///
-/// Note: proj_token exists in weights but the actual forward pass concatenates
-/// raw token embeddings with projected labels for the MLP input.
 pub struct JointScorer {
-    #[allow(dead_code)]
-    proj_token: Linear<f32>, // Not used in main scoring path
+    proj_token: Linear<f32>,
     proj_label: Linear<f32>,
     out_fc1: Linear<f32>,
     out_fc2: Linear<f32>,
@@ -89,10 +85,8 @@ impl JointScorer {
             .unsqueeze(2)
             .broadcast_as(target)
             .to_concrete();
-        let lab_first_4d: Tensor<4, f32> = labels_first
-            .unsqueeze(1)
-            .broadcast_as(target)
-            .to_concrete();
+        let lab_first_4d: Tensor<4, f32> =
+            labels_first.unsqueeze(1).broadcast_as(target).to_concrete();
         let lab_second_4d: Tensor<4, f32> = labels_second
             .unsqueeze(1)
             .broadcast_as(target)
@@ -128,12 +122,7 @@ impl JointScorer {
         token_embs: &Tensor<3, f32>,
         label_embs: &Tensor<3, f32>,
     ) -> Tensor<4, f32> {
-        let logits = self.forward(token_embs, label_embs);
-        // sigmoid(x) = 0.5 * (tanh(x / 2) + 1); stays on-device and avoids needing
-        // scalar-left division or a `recip` primitive.
-        let half_logits: Tensor<4, f32> = (logits * 0.5f32).to_concrete();
-        let tanh = half_logits.tanh();
-        ((tanh + 1.0f32) * 0.5f32).to_concrete()
+        self.forward(token_embs, label_embs).sigmoid()
     }
 }
 

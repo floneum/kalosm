@@ -99,7 +99,11 @@ impl GlinerSource {
     /// repo; `label_encoder_model` is the sentence-transformer it pairs with.
     fn bi_encoder_v2(name: &str, label_encoder_model: &str) -> Self {
         let st = |file: &str| {
-            FileSource::huggingface(label_encoder_model.to_string(), "main".to_string(), file.to_string())
+            FileSource::huggingface(
+                label_encoder_model.to_string(),
+                "main".to_string(),
+                file.to_string(),
+            )
         };
         let knowledgator = |file: &str| {
             FileSource::huggingface(
@@ -129,15 +133,6 @@ impl GlinerSource {
         Self::bi_encoder_v2("edge", "sentence-transformers/all-MiniLM-L6-v2")
     }
 
-    /// GLiNER bi-encoder v2.0 Small variant (108M parameters, Q4_K).
-    ///
-    /// Good balance of speed and accuracy, using:
-    /// - Text encoder: ettin-encoder-68m
-    /// - Label encoder: all-MiniLM-L12-v2
-    pub fn small() -> Self {
-        Self::bi_encoder_v2("small", "sentence-transformers/all-MiniLM-L12-v2")
-    }
-
     /// GLiNER bi-encoder v2.0 Base variant (194M parameters, Q4_K).
     ///
     /// Default variant with good accuracy, using:
@@ -145,15 +140,6 @@ impl GlinerSource {
     /// - Label encoder: bge-small-en-v1.5
     pub fn base() -> Self {
         Self::bi_encoder_v2("base", "BAAI/bge-small-en-v1.5")
-    }
-
-    /// GLiNER bi-encoder v2.0 Large variant (530M parameters, Q4_K).
-    ///
-    /// Highest accuracy variant, using:
-    /// - Text encoder: ettin-encoder-400m
-    /// - Label encoder: bge-base-en-v1.5
-    pub fn large() -> Self {
-        Self::bi_encoder_v2("large", "BAAI/bge-base-en-v1.5")
     }
 
     /// Create a custom source with specific file locations.

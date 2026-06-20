@@ -23,7 +23,6 @@ pub struct ModernBertModel {
     /// Half-window for local layers (`local_attention / 2`); `None` disables
     /// windowing, in which case every layer attends globally.
     local_window: Option<usize>,
-    pub(crate) device: Device,
     config: ModernBertConfig,
     span: tracing::Span,
 }
@@ -81,7 +80,6 @@ impl ModernBertModel {
             global_rope,
             local_rope,
             local_window,
-            device: device.clone(),
             config,
             span: tracing::span!(tracing::Level::TRACE, "modern-bert"),
         })
@@ -124,44 +122,5 @@ impl ModernBertModel {
 
         // Apply final layer norm
         self.final_norm.forward(&hidden_states)
-    }
-
-    /// Get the maximum sequence length.
-    pub fn max_seq_len(&self) -> usize {
-        self.config.context_length
-    }
-
-    /// Get the embedding dimension.
-    pub fn embedding_dim(&self) -> usize {
-        self.config.hidden_size
-    }
-
-    /// Get the device.
-    pub fn device(&self) -> &Device {
-        &self.device
-    }
-
-    /// Return the hidden state after each layer (for debugging / regression tests).
-    #[doc(hidden)]
-    pub fn debug_hidden_states(
-        &self,
-        input_ids: &Tensor<2, u32>,
-        attention_mask: Option<&Tensor<2, u32>>,
-    ) -> Vec<Tensor<3, f32>> {
-        let _enter = self.span.enter();
-        let mut states = Vec::with_capacity(self.layers.len() + 2);
-
-        let hidden_states = self.token_embeddings.forward(input_ids);
-        let mut hidden_states = self.embedding_norm.forward(&hidden_states);
-        states.push(hidden_states.clone());
-
-        for (idx, layer) in self.layers.iter().enumerate() {
-            let (rope, window) = self.layer_attention(idx);
-            hidden_states = layer.forward(&hidden_states, rope, window, attention_mask);
-            states.push(hidden_states.clone());
-        }
-
-        states.push(self.final_norm.forward(&hidden_states));
-        states
     }
 }

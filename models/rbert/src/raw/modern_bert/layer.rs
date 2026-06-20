@@ -36,8 +36,7 @@ impl ModernBertLayer {
             None
         };
 
-        let attention =
-            ModernBertAttention::load(device, vb, num_heads, num_kv_heads, head_dim, eps)?;
+        let attention = ModernBertAttention::load(device, vb, num_heads, num_kv_heads, head_dim)?;
         let ffn_norm = LayerNorm::load(device, &mut vb.pp("ffn_norm"), eps)?;
         let feed_forward = GeGluFeedForward::load(device, vb)?;
 
@@ -64,9 +63,9 @@ impl ModernBertLayer {
         } else {
             hidden_states.clone()
         };
-        let hidden_states = self
-            .attention
-            .forward(&hidden_states, rope_cache, window, attention_mask);
+        let hidden_states =
+            self.attention
+                .forward(&hidden_states, rope_cache, window, attention_mask);
         let hidden_states = residual.add_(&hidden_states);
 
         // Pre-norm + FFN + residual

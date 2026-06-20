@@ -87,12 +87,11 @@ mod tokenization;
 pub use config::GlinerConfig;
 pub use decoding::{Decoder, DecodingMode, Entity};
 pub use error::{GlinerError, GlinerLoadingError};
-pub use rbert::raw::{ModernBertConfig, ModernBertModel};
 pub use source::GlinerSource;
 
 /// Deduplicate entities appearing in more than one overlapping chunk, keeping the
 /// highest-scoring occurrence and sorting by span position.
-fn merge_entities(entities: &mut Vec<Entity>) {
+pub(crate) fn merge_entities(entities: &mut Vec<Entity>) {
     entities.sort_by(|a, b| {
         a.start_char
             .cmp(&b.start_char)
@@ -111,7 +110,6 @@ fn merge_entities(entities: &mut Vec<Entity>) {
     });
 }
 
-
 use fusor::{Device, Tensor, VarBuilder};
 use kalosm_common::Cache;
 use kalosm_model_types::{FileSource, ModelLoadingProgress};
@@ -122,7 +120,7 @@ use tokenizers::Tokenizer;
 use crate::raw::{CachedLabels, LabelEncoder, SpanLayer, TextEncoder};
 use crate::tokenization::{first_subtoken_pooling, TokenizedText, WordTokenizer};
 
-async fn default_device() -> Device {
+pub(crate) async fn default_device() -> Device {
     Device::gpu().await.unwrap_or_else(|_| Device::cpu())
 }
 
@@ -137,7 +135,9 @@ pub(crate) async fn download_bytes(
     let mut create_progress =
         ModelLoadingProgress::downloading_progress(format!("{label} ({source})"));
     Ok(cache
-        .get_bytes(source, |progress| progress_handler(create_progress(progress)))
+        .get_bytes(source, |progress| {
+            progress_handler(create_progress(progress))
+        })
         .await?)
 }
 
@@ -254,8 +254,13 @@ impl Gliner {
             GlinerConfig::from_json(&config_bytes).map_err(GlinerLoadingError::LoadConfig)?;
 
         // Download tokenizer
-        let tokenizer_bytes =
-            download_bytes(&cache, &source.tokenizer, "Tokenizer", &mut progress_handler).await?;
+        let tokenizer_bytes = download_bytes(
+            &cache,
+            &source.tokenizer,
+            "Tokenizer",
+            &mut progress_handler,
+        )
+        .await?;
         let tokenizer =
             Tokenizer::from_bytes(&tokenizer_bytes).map_err(GlinerLoadingError::LoadTokenizer)?;
         let word_tokenizer = WordTokenizer::new(tokenizer, config.should_add_special_tokens());
@@ -264,9 +269,13 @@ impl Gliner {
         // the label encoder is reloaded from cache via BertSource below).
         let model_bytes =
             download_bytes(&cache, &source.model, "Text Encoder", &mut progress_handler).await?;
-        let _label_bytes =
-            download_bytes(&cache, &source.label_encoder, "Label Encoder", &mut progress_handler)
-                .await?;
+        let _label_bytes = download_bytes(
+            &cache,
+            &source.label_encoder,
+            "Label Encoder",
+            &mut progress_handler,
+        )
+        .await?;
 
         // Initialize device
         let device = match device {
@@ -319,10 +328,7 @@ impl Gliner {
         // `materialized()` severs the lazy encoder graph into a standalone
         // buffer; `to_concrete()` would only clone the lazy GPU tensor and
         // re-run the encoder on every reuse.
-        let label_embeddings = self
-            .label_encoder
-            .encode_labels(labels)
-            .await?;
+        let label_embeddings = self.label_encoder.encode_labels(labels).await?;
         self.cached_labels = Some(CachedLabels::new(
             labels.iter().map(|s| s.to_string()).collect(),
             label_embeddings,
@@ -475,8 +481,7 @@ impl Gliner {
         // Python's bi-encoder span model pools transformer token embeddings
         // directly to words; the checkpoint still contains LSTM weights, but
         // that path is not used in BaseBiEncoderModel.get_representations().
-        let (word_embeddings, _word_mask) =
-            first_subtoken_pooling(&token_embeddings, &tokenized, &self.device);
+        let word_embeddings = first_subtoken_pooling(&token_embeddings, &tokenized, &self.device);
 
         let spans_per_batch: Vec<Vec<(usize, usize)>> = tokenized
             .iter()
@@ -489,18 +494,16 @@ impl Gliner {
             return Ok(vec![Vec::new(); texts.len()]);
         }
 
-        let (flat_span_embeddings, _) =
-            self.span_layer
-                .forward_for_spans_batched(&word_embeddings, &spans_per_batch, &self.device);
+        let (flat_span_embeddings, _) = self.span_layer.forward_for_spans_batched(
+            &word_embeddings,
+            &spans_per_batch,
+            &self.device,
+        );
 
         let labels_t = label_embeddings.t();
         let flat_scores = flat_span_embeddings.mat_mul(&labels_t);
-        let tensor_slice = flat_scores.as_slice().await?;
-        let scores_data: Vec<f32> = tensor_slice
-            .as_slice()
-            .iter()
-            .map(|&x| 1.0 / (1.0 + (-x).exp())) // sigmoid
-            .collect();
+        let tensor_slice = flat_scores.sigmoid().as_slice().await?;
+        let scores_data: Vec<f32> = tensor_slice.as_slice().to_vec();
 
         let num_labels = label_embeddings.shape()[0];
         let mut results = Vec::with_capacity(texts.len());
@@ -530,44 +533,19 @@ impl Gliner {
         Ok(results)
     }
 
-    fn build_batched_inputs(&self, tokenized: &[TokenizedText]) -> (Tensor<2, u32>, Tensor<2, u32>) {
-        let batch_size = tokenized.len();
-        let max_seq_len = tokenized
+    fn build_batched_inputs(
+        &self,
+        tokenized: &[TokenizedText],
+    ) -> (Tensor<2, u32>, Tensor<2, u32>) {
+        let sequences: Vec<(&[u32], &[u32])> = tokenized
             .iter()
-            .map(|tokenized| tokenized.token_ids.len())
-            .max()
-            .unwrap_or(1);
-        let pad_id = self.tokenizer.pad_id();
-
-        let mut token_ids = vec![pad_id; batch_size * max_seq_len];
-        let mut attention_mask = vec![0u32; batch_size * max_seq_len];
-
-        for (batch_idx, item) in tokenized.iter().enumerate() {
-            let offset = batch_idx * max_seq_len;
-            let len = item.token_ids.len();
-            token_ids[offset..offset + len].copy_from_slice(&item.token_ids);
-            attention_mask[offset..offset + len].copy_from_slice(&item.attention_mask);
-        }
-
-        (
-            Tensor::new(&self.device, &token_ids)
-                .reshape([batch_size, max_seq_len])
-                .to_concrete(),
-            Tensor::new(&self.device, &attention_mask)
-                .reshape([batch_size, max_seq_len])
-                .to_concrete(),
-        )
+            .map(|t| (t.token_ids.as_slice(), t.attention_mask.as_slice()))
+            .collect();
+        crate::tokenization::pad_and_stack_inputs(&self.device, &sequences, self.tokenizer.pad_id())
     }
 
     fn enumerate_spans(&self, num_words: usize) -> Vec<(usize, usize)> {
-        let mut spans = Vec::new();
-        for start in 0..num_words {
-            let max_width = self.max_width.min(num_words - start);
-            for width in 1..=max_width {
-                spans.push((start, start + width - 1));
-            }
-        }
-        spans
+        crate::tokenization::enumerate_spans(num_words, self.max_width)
     }
 
     /// Get the maximum span width.

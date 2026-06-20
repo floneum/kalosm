@@ -25,8 +25,8 @@ pub struct MDebertaModel {
     output_proj: Option<Linear<f32>>,
     /// Device
     device: Device,
-    /// Configuration
-    config: MDebertaConfig,
+    /// Number of attention heads (the only config value needed at inference).
+    num_heads: usize,
     span: tracing::Span,
 }
 
@@ -83,7 +83,7 @@ impl MDebertaModel {
             layers,
             output_proj,
             device: device.clone(),
-            config,
+            num_heads: config.num_heads,
             span: tracing::span!(tracing::Level::TRACE, "mdeberta"),
         })
     }
@@ -111,7 +111,7 @@ impl MDebertaModel {
         // Compute the flat gather indices once per forward; every layer shares them.
         let gather_idx = self.rel_pos_embedding.compute_gather_indices(
             b_sz,
-            self.config.num_heads,
+            self.num_heads,
             seq_len,
             &self.device,
         );
@@ -122,13 +122,12 @@ impl MDebertaModel {
         });
 
         for layer in &self.layers {
-            hidden_states =
-                layer.forward_with_rel(
-                    &hidden_states,
-                    &rel_pos_emb,
-                    &gather_idx,
-                    attention_bias.as_ref(),
-                );
+            hidden_states = layer.forward_with_rel(
+                &hidden_states,
+                &rel_pos_emb,
+                &gather_idx,
+                attention_bias.as_ref(),
+            );
         }
 
         if let Some(ref proj) = self.output_proj {
@@ -136,62 +135,5 @@ impl MDebertaModel {
         }
 
         hidden_states
-    }
-
-    #[doc(hidden)]
-    pub fn debug_after_embedding_norm(&self, input_ids: &Tensor<2, u32>) -> Tensor<3, f32> {
-        let hidden_states = self.token_embeddings.forward(input_ids);
-        self.embedding_norm.forward(&hidden_states)
-    }
-
-    #[doc(hidden)]
-    pub fn debug_first_layer_output(
-        &self,
-        hidden_states: &Tensor<3, f32>,
-        attention_mask: Option<&Tensor<2, u32>>,
-    ) -> Tensor<3, f32> {
-        let [b_sz, seq_len, _] = hidden_states.shape();
-        let gather_idx = self.rel_pos_embedding.compute_gather_indices(
-            b_sz,
-            self.config.num_heads,
-            seq_len,
-            &self.device,
-        );
-        let rel_pos_emb = self.rel_pos_embedding.get_embeddings();
-        let attention_bias = attention_mask.map(|mask| {
-            let mask_bias = super::super::utils::attention_mask_to_bias(mask);
-            mask_bias.unsqueeze(1).unsqueeze(1).to_concrete()
-        });
-        self.layers[0].forward_with_rel(
-            hidden_states,
-            &rel_pos_emb,
-            &gather_idx,
-            attention_bias.as_ref(),
-        )
-    }
-
-    /// Get the embedding dimension.
-    pub fn embedding_dim(&self) -> usize {
-        self.config.hidden_size
-    }
-
-    /// Get the maximum sequence length.
-    pub fn max_seq_len(&self) -> usize {
-        self.config.context_length
-    }
-
-    /// Get the vocabulary size.
-    pub fn vocab_size(&self) -> usize {
-        self.config.vocab_size
-    }
-
-    /// Get the device.
-    pub fn device(&self) -> &Device {
-        &self.device
-    }
-
-    /// Get the configuration.
-    pub fn config(&self) -> &MDebertaConfig {
-        &self.config
     }
 }

@@ -44,7 +44,10 @@ impl WordTokenizer {
     /// Tokenize text and track word boundaries.
     pub fn tokenize(&self, text: &str) -> Result<TokenizedText, GlinerError> {
         let split_words = split_words(text);
-        let words: Vec<String> = split_words.iter().map(|(word, _)| word.to_string()).collect();
+        let words: Vec<String> = split_words
+            .iter()
+            .map(|(word, _)| word.to_string())
+            .collect();
         let word_offsets: Vec<(usize, usize)> =
             split_words.iter().map(|(_, offsets)| *offsets).collect();
 
@@ -229,82 +232,109 @@ fn is_word_char(ch: char) -> bool {
 ///
 /// # Returns
 /// * Word embeddings [batch, max_words, hidden_dim]
-/// * Word mask [batch, max_words] - 1 for valid words, 0 for padding
 pub fn first_subtoken_pooling(
     token_embeddings: &Tensor<3, f32>,
     tokenized: &[TokenizedText],
     device: &Device,
-) -> (Tensor<3, f32>, Tensor<2, u32>) {
-    let shape = token_embeddings.shape();
-    let batch_size = shape[0];
-    let hidden_dim = shape[2];
+) -> Tensor<3, f32> {
+    let positions: Vec<Vec<usize>> = tokenized
+        .iter()
+        .map(|t| t.word_first_token[..t.num_words].to_vec())
+        .collect();
+    gather_positions(token_embeddings, &positions, device)
+}
 
-    // Find max words across batch
-    let max_words = tokenized.iter().map(|t| t.num_words).max().unwrap_or(0);
-
-    if max_words == 0 {
-        // Return empty tensors if no words
-        let word_emb = Tensor::zeros(device, [batch_size, 1, hidden_dim]);
-        let word_mask = Tensor::zeros(device, [batch_size, 1]);
-        return (word_emb, word_mask);
-    }
-
-    // Build gather indices for each batch item
-    // For each batch, we need to gather word_first_token[w] for each word w
-    let mut all_indices: Vec<u32> = Vec::with_capacity(batch_size * max_words);
-    let mut mask_data: Vec<u32> = Vec::with_capacity(batch_size * max_words);
-
-    for t in tokenized {
-        for word_idx in 0..max_words {
-            if word_idx < t.num_words {
-                all_indices.push(t.word_first_token[word_idx] as u32);
-                mask_data.push(1);
-            } else {
-                // Padding - use index 0 (will be masked out)
-                all_indices.push(0);
-                mask_data.push(0);
-            }
+/// Enumerate every `(start_word, end_word)` span (inclusive) up to `max_width`
+/// words wide within a `num_words`-word sequence.
+pub(crate) fn enumerate_spans(num_words: usize, max_width: usize) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for start in 0..num_words {
+        let width_limit = max_width.min(num_words - start);
+        for width in 1..=width_limit {
+            spans.push((start, start + width - 1));
         }
     }
+    spans
+}
 
-    // Reshape token_embeddings to [batch_size * seq_len, hidden_dim] for gathering
-    let seq_len = shape[1];
-    let token_embeddings_concrete = token_embeddings.to_concrete();
-    let flat_embeddings = token_embeddings_concrete
-        .reshape([batch_size * seq_len, hidden_dim])
+/// Pad a batch of `(token_ids, attention_mask)` sequences to the longest length
+/// and stack them into `[batch, max_seq_len]` tensors.
+pub(crate) fn pad_and_stack_inputs(
+    device: &Device,
+    sequences: &[(&[u32], &[u32])],
+    pad_id: u32,
+) -> (Tensor<2, u32>, Tensor<2, u32>) {
+    let batch_size = sequences.len();
+    let max_seq_len = sequences
+        .iter()
+        .map(|(ids, _)| ids.len())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    let mut token_ids = vec![pad_id; batch_size * max_seq_len];
+    let mut attention_mask = vec![0u32; batch_size * max_seq_len];
+    for (batch_idx, (ids, mask)) in sequences.iter().enumerate() {
+        let offset = batch_idx * max_seq_len;
+        let len = ids.len();
+        token_ids[offset..offset + len].copy_from_slice(ids);
+        attention_mask[offset..offset + len].copy_from_slice(mask);
+    }
+
+    let token_ids = Tensor::new(device, &token_ids)
+        .reshape([batch_size, max_seq_len])
+        .to_concrete();
+    let attention_mask = Tensor::new(device, &attention_mask)
+        .reshape([batch_size, max_seq_len])
+        .to_concrete();
+    (token_ids, attention_mask)
+}
+
+/// Gather hidden states at the given positions for each batch item, padding
+/// shorter position lists with index 0. Returns `[batch, max_positions, hidden]`.
+pub(crate) fn gather_positions(
+    hidden_states: &Tensor<3, f32>,
+    positions_per_batch: &[Vec<usize>],
+    device: &Device,
+) -> Tensor<3, f32> {
+    let [batch_size, seq_len, hidden_size] = hidden_states.shape();
+    assert_eq!(
+        batch_size,
+        positions_per_batch.len(),
+        "positions_per_batch must match batch size"
+    );
+
+    let max_positions = positions_per_batch.iter().map(Vec::len).max().unwrap_or(0);
+    if max_positions == 0 {
+        return Tensor::zeros(device, [batch_size, 1, hidden_size]);
+    }
+
+    let hidden_flat = hidden_states
+        .to_concrete()
+        .reshape([batch_size * seq_len, hidden_size])
         .to_concrete();
 
-    // Offset each word's first-token index into the flattened [batch*seq, hidden]
-    // tensor. Every first-token index must land within its row's `seq_len`;
-    // otherwise the gather would read into a neighbouring sequence's tokens.
-    let mut offset_indices: Vec<u32> = Vec::with_capacity(batch_size * max_words);
-    for batch_idx in 0..batch_size {
+    // Each gathered position must stay within its row's `seq_len`, otherwise the
+    // flat `index_select` would read into a neighbouring sequence. Padded slots
+    // use position 0 (masked downstream).
+    let mut offset_indices = Vec::with_capacity(batch_size * max_positions);
+    for (batch_idx, positions) in positions_per_batch.iter().enumerate() {
         let offset = (batch_idx * seq_len) as u32;
-        for word_idx in 0..max_words {
-            let idx = all_indices[batch_idx * max_words + word_idx];
+        for pos_idx in 0..max_positions {
+            let pos = positions.get(pos_idx).copied().unwrap_or(0);
             debug_assert!(
-                (idx as usize) < seq_len,
-                "first-token index {idx} out of range for seq_len {seq_len} (batch {batch_idx}, word {word_idx})"
+                pos < seq_len,
+                "gather position {pos} out of range for seq_len {seq_len} (batch {batch_idx})"
             );
-            offset_indices.push(idx + offset);
+            offset_indices.push(pos as u32 + offset);
         }
     }
-    let offset_indices_tensor = Tensor::new(device, &offset_indices);
 
-    // Gather word embeddings
-    let gathered = flat_embeddings.index_select(0, &offset_indices_tensor);
-
-    // Reshape to [batch_size, max_words, hidden_dim]
-    let word_embeddings = gathered
-        .reshape([batch_size, max_words, hidden_dim])
-        .to_concrete();
-
-    // Create word mask
-    let word_mask = Tensor::new(device, &mask_data)
-        .reshape([batch_size, max_words])
-        .to_concrete();
-
-    (word_embeddings, word_mask)
+    let offset_indices = Tensor::new(device, &offset_indices);
+    hidden_flat
+        .index_select(0, &offset_indices)
+        .reshape([batch_size, max_positions, hidden_size])
+        .to_concrete()
 }
 
 #[cfg(test)]
@@ -327,13 +357,19 @@ mod tests {
         let text = "a b c d e f g h i j";
         let ranges = token_packed_ranges(&tok, text, 4, 1).unwrap();
 
-        assert!(ranges.len() > 1, "expected multiple windows, got {ranges:?}");
+        assert!(
+            ranges.len() > 1,
+            "expected multiple windows, got {ranges:?}"
+        );
         // Full coverage: first window starts at the beginning, last reaches the end.
         assert_eq!(ranges.first().unwrap().start, 0);
         assert_eq!(ranges.last().unwrap().end, text.len());
         // Each window advances and overlaps its predecessor (no gaps, no stalls).
         for pair in ranges.windows(2) {
-            assert!(pair[1].start > pair[0].start, "windows must advance: {ranges:?}");
+            assert!(
+                pair[1].start > pair[0].start,
+                "windows must advance: {ranges:?}"
+            );
             assert!(
                 pair[1].start < pair[0].end,
                 "adjacent windows must overlap: {ranges:?}"
