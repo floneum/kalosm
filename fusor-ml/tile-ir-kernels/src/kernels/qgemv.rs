@@ -605,8 +605,7 @@ fn qgemv_q4k_ggml(
                             let packed_load_mask = if packed_loads_always_in_bounds {
                                 Tile::all()
                             } else {
-                                grid.mask(in_bounds.clone(), &output_col)
-                                    .and(matrix_col.lt(b.cols))
+                                grid.mask(in_bounds.clone(), &output_col) & matrix_col.lt(b.cols)
                             };
                             acc + q4k_ggml_dot_tiles(
                                 program,

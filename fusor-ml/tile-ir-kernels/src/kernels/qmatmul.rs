@@ -142,7 +142,7 @@ pub(crate) fn qmatmul_tile_with_epilogue(
                 [Tile::f32(0.0)],
                 |program, loop_index, [acc]| {
                     let k_index = loop_index * SCALAR_BK + k_lane.clone();
-                    let mask = row.lt(m).and(col.lt(b.cols)).and(k_index.lt(k));
+                    let mask = row.lt(m) & col.lt(b.cols) & k_index.lt(k);
                     let loaded = program.load(a.at((&row, &k_index)), mask.clone(), 0.0);
                     let pre_extras = epilogues
                         .pre_extra_inputs
@@ -161,7 +161,7 @@ pub(crate) fn qmatmul_tile_with_epilogue(
                 .map(|extra| load_qmatmul_extra(program, extra, &row, &col, b.cols))
                 .collect::<Vec<_>>();
             let sum = apply_qmatmul_post_epilogue(epilogues, reduced, extras);
-            let store_mask = k_lane.eq(0).and(row.lt(m)).and(col.lt(b.cols));
+            let store_mask = k_lane.eq(0) & row.lt(m) & col.lt(b.cols);
             program.store(y.at((row, col)), sum, store_mask);
         },
     );
