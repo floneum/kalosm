@@ -322,8 +322,7 @@ impl Gliner {
         let label_embeddings = self
             .label_encoder
             .encode_labels(labels)
-            .await?
-            .materialized();
+            .await?;
         self.cached_labels = Some(CachedLabels::new(
             labels.iter().map(|s| s.to_string()).collect(),
             label_embeddings,
@@ -446,7 +445,7 @@ impl Gliner {
             // does not re-run the label encoder. `to_concrete()` only clones the
             // lazy GPU tensor, which would drag the whole encoder into every
             // subsequent extract.
-            let embeddings = self.label_encoder.encode_labels(labels).await?.materialized();
+            let embeddings = self.label_encoder.encode_labels(labels).await?;
             self.cached_labels = Some(CachedLabels::new(
                 labels.iter().map(|s| s.to_string()).collect(),
                 embeddings.clone(),

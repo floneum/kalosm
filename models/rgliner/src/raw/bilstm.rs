@@ -198,8 +198,6 @@ fn run_direction(
             c = next_c;
             h = next_h;
         }
-        h = h.materialized();
-        c = c.materialized();
 
         let output_t = h.clone().unsqueeze(1).to_concrete();
         outputs = outputs.slice_assign([0..batch, t..(t + 1), 0..hidden_size], &output_t);
