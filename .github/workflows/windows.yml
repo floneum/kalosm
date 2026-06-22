@@ -75,7 +75,7 @@ jobs:
         run: git config --global core.autocrlf false
 
       - name: checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # `dtolnay/rust-toolchain` is a single-step toolchain install that
       # uses the GitHub Actions toolchain cache; much faster than the
