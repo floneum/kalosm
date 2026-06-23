@@ -107,7 +107,7 @@ kalosm = { workspace = true, features = [
     "language",
     "surrealdb",
 ], default-features = true }
-surrealdb = { version = "2.1.4", features = ["kv-surrealkv"] }
+surrealdb = { version = "3.1.5", features = ["kv-surrealkv"] }
 
 [package.metadata.docs.rs]
 # Features to pass to Cargo (default: [])
