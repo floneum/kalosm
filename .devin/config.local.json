@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Exec(git status)",
+      "Exec(gh pr)",
+      "Exec(gh run)",
+      "Exec(cargo fmt)",
+      "Exec(git diff)",
+      "Exec(cargo clippy)"
+    ]
+  }
+}

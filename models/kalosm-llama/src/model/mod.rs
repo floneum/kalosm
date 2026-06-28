@@ -971,6 +971,7 @@ where
         #[cfg(not(target_arch = "wasm32"))]
         let (model, tokenizer, mtp) = {
             let device = device.clone();
+            #[allow(clippy::type_complexity)]
             let load_model =
                 move || -> Result<(Model<F>, LlamaTokenizer, Option<Gemma4MtpAssistant<F>>), LlamaSourceError> {
                 let tokenizer = parse_external_tokenizer(tokenizer_source)?;

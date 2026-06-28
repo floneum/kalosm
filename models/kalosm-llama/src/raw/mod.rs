@@ -1104,8 +1104,8 @@ where
                 .to_concrete()
         };
 
-        let projected_inputs = embeddings_f32.q_mat_mul(per_layer_model_proj)
-            * (1.0 / (embedding_dim as f32).sqrt());
+        let projected_inputs =
+            embeddings_f32.q_mat_mul(per_layer_model_proj) * (1.0 / (embedding_dim as f32).sqrt());
         let projected_inputs = projected_inputs
             .reshape([batch, seq, n_layer, per_layer_embedding_length])
             .to_concrete();
@@ -1275,7 +1275,11 @@ where
                         }
                     }
                 }
-                Tensor::from_slice(device, [1, per_layer_tokens.len()], per_layer_tokens.as_slice())
+                Tensor::from_slice(
+                    device,
+                    [1, per_layer_tokens.len()],
+                    per_layer_tokens.as_slice(),
+                )
             }
             #[cfg(not(feature = "vision"))]
             {
@@ -1416,12 +1420,8 @@ where
         if segment_start < tokens.len() || !text_prefix.is_empty() {
             let mut text_tokens = text_prefix;
             text_tokens.extend_from_slice(&tokens[segment_start..]);
-            last_logits = self.forward_text_chunk_for_multimodal(
-                &text_tokens,
-                device,
-                cache.as_deref_mut(),
-                true,
-            )?;
+            last_logits =
+                self.forward_text_chunk_for_multimodal(&text_tokens, device, cache, true)?;
         }
 
         last_logits.ok_or_else(|| fusor::Error::msg("No tokens to forward"))
@@ -1523,8 +1523,9 @@ where
 
         // Image chunks carry no text tokens, so every position shares a single
         // zeroed per-layer token that the helper broadcasts across the chunk.
-        let per_layer_inputs = self
-            .compute_per_layer_inputs(&embeddings_f32, || Tensor::from_slice(device, [1, 1], &[0u32]));
+        let per_layer_inputs = self.compute_per_layer_inputs(&embeddings_f32, || {
+            Tensor::from_slice(device, [1, 1], &[0u32])
+        });
 
         let encoded = EncodedTokens {
             embeddings: embeddings_f32.cast(),

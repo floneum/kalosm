@@ -422,6 +422,7 @@ where
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn infer_mtp_speculative(
         &self,
         prompt_tokens: &[u32],
@@ -614,6 +615,7 @@ where
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn infer_target_only_from_pending(
         &self,
         mut next_token: u32,
@@ -706,6 +708,7 @@ where
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn infer_target_only_from_gpu_pending(
         &self,
         mut next_token: fusor::GpuSampledToken,
