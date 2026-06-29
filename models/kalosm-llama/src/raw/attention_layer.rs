@@ -642,8 +642,20 @@ where
         }
 
         (
-            key_states.narrow(2, 0, logical_kv_len).to_concrete(),
-            value_states.narrow(2, 0, logical_kv_len).to_concrete(),
+            key_states
+                .narrow(
+                    2,
+                    kv_narrow_start(key_states.shape()[2], logical_kv_len),
+                    logical_kv_len,
+                )
+                .to_concrete(),
+            value_states
+                .narrow(
+                    2,
+                    kv_narrow_start(value_states.shape()[2], logical_kv_len),
+                    logical_kv_len,
+                )
+                .to_concrete(),
         )
     }
 
@@ -848,6 +860,10 @@ where
     }
 }
 
+fn kv_narrow_start(kv_seq_len: usize, logical_kv_len: usize) -> usize {
+    kv_seq_len.saturating_sub(logical_kv_len)
+}
+
 fn pad_attention_mask_to_kv_len(
     attention_mask: &AttentionMask<f32>,
     kv_seq_len: usize,
@@ -911,4 +927,43 @@ where
     let attn_output = attn_output.reshape([b_sz, q_len, hidden_size]);
 
     attention_wo.forward_generic(&attn_output.cast())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sliding_window_prefill_kv_slice_keeps_newest_entries() {
+        let kv_seq_len = 8;
+        let logical_kv_len = 4;
+
+        assert_eq!(
+            kv_narrow_start(kv_seq_len, logical_kv_len),
+            kv_seq_len - logical_kv_len,
+            "sliding-window prefill must keep the newest KV entries"
+        );
+    }
+
+    #[test]
+    fn sliding_window_prefill_mask_crop_targets_newest_columns() {
+        let device = fusor::Device::Cpu;
+        let mask = AttentionMask::new(
+            Tensor::from_slice(
+                &device,
+                [1, 8],
+                &[-7.0f32, -6.0, -5.0, -4.0, -3.0, -2.0, -1.0, 0.0],
+            )
+            .to_concrete(),
+        );
+
+        let cropped = pad_attention_mask_to_kv_len(&mask, 4).expect("mask should be cropped");
+        let values = pollster::block_on(cropped.mask().as_slice()).unwrap();
+
+        assert_eq!(
+            values.as_slice(),
+            &[-3.0, -2.0, -1.0, 0.0],
+            "attention mask cropping keeps the newest columns, so KV slicing must match it"
+        );
+    }
 }

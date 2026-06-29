@@ -503,6 +503,7 @@ where
                 session_lock.tokens.len()
             };
             for _ in 0..draft_limit {
+                let draft_position = mtp_draft_position(draft_position, draft_tokens.len());
                 let step = {
                     let session_lock = session
                         .cache
@@ -896,5 +897,28 @@ where
     ) -> Result<u32, LlamaModelError> {
         let row_logits: fusor::Tensor<1, f32> = logits.i((row, ..)).to_concrete();
         Self::sample_standard_logits(row_logits, sampler, previous_tokens, top_k).await
+    }
+}
+
+fn mtp_draft_position(base_position: usize, draft_offset: usize) -> usize {
+    base_position + draft_offset
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_token_mtp_draft_positions_advance_by_draft_offset() {
+        let base_position = 10;
+        let positions: Vec<_> = (0..3)
+            .map(|draft_offset| mtp_draft_position(base_position, draft_offset))
+            .collect();
+
+        assert_eq!(
+            positions,
+            vec![10, 11, 12],
+            "each MTP draft token must be evaluated at its future position"
+        );
     }
 }

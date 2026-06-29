@@ -133,10 +133,10 @@ where
     pub(crate) fn preprocess_image(
         &self,
         image: &image::DynamicImage,
-        _min_pixels: Option<u32>,
-        _max_pixels: Option<u32>,
+        min_pixels: Option<u32>,
+        max_pixels: Option<u32>,
     ) -> Result<(Tensor<2, f32>, [u32; 3])> {
-        let (target_width, target_height) = self.target_image_size(image);
+        let (target_width, target_height) = self.target_image_size(image, min_pixels, max_pixels);
         let resized = image.resize_exact(
             target_width as u32,
             target_height as u32,
@@ -216,10 +216,14 @@ where
             .to_concrete())
     }
 
-    fn target_image_size(&self, image: &image::DynamicImage) -> (usize, usize) {
+    fn target_image_size(
+        &self,
+        image: &image::DynamicImage,
+        min_pixels: Option<u32>,
+        max_pixels: Option<u32>,
+    ) -> (usize, usize) {
         let align = self.patch_size * self.merge_size;
-        let min_pixels = 40 * align * align;
-        let max_pixels = 280 * align * align;
+        let (min_pixels, max_pixels) = gemma_image_pixel_bounds(align, min_pixels, max_pixels);
         smart_resize(
             image.width() as usize,
             image.height() as usize,
@@ -333,6 +337,21 @@ where
             .to_concrete();
         Ok(pooled)
     }
+}
+
+fn gemma_image_pixel_bounds(
+    align: usize,
+    min_pixels: Option<u32>,
+    max_pixels: Option<u32>,
+) -> (usize, usize) {
+    (
+        min_pixels
+            .map(|pixels| pixels as usize)
+            .unwrap_or(40 * align * align),
+        max_pixels
+            .map(|pixels| pixels as usize)
+            .unwrap_or(280 * align * align),
+    )
 }
 
 struct GemmaVisionPatchEmbed<F: FloatDataType + SimdElement> {
@@ -714,6 +733,28 @@ fn smart_resize(
     }
 
     (target_w, target_h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemma_image_pixel_bounds_honor_media_hints() {
+        let align = 8;
+        let requested_min = 10 * align * align;
+        let requested_max = 20 * align * align;
+
+        assert_eq!(
+            gemma_image_pixel_bounds(
+                align,
+                Some(requested_min as u32),
+                Some(requested_max as u32)
+            ),
+            (requested_min, requested_max),
+            "Gemma preprocessing must honor caller-provided MediaHints image budgets"
+        );
+    }
 }
 
 fn metadata_f32_array(metadata: &GgufMetadata, key: &str) -> Option<Vec<f32>> {
