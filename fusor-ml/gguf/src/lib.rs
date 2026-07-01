@@ -2491,6 +2491,7 @@ async fn tiny_llama() -> impl std::io::Read + std::io::Seek {
 
 #[cfg(test)]
 #[tokio::test]
+#[ignore = "downloads an external GGUF model from Hugging Face"]
 async fn test_round_trip_tiny_llama() {
     use std::{
         collections::HashMap,

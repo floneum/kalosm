@@ -8,9 +8,63 @@ use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    File, FileSystemCreateWritableOptions, FileSystemDirectoryHandle, FileSystemFileHandle,
+    Blob, File, FileSystemCreateWritableOptions, FileSystemDirectoryHandle, FileSystemFileHandle,
     FileSystemGetDirectoryOptions, FileSystemGetFileOptions, FileSystemWritableFileStream,
 };
+
+const OPFS_READ_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+
+/// A cached OPFS file that can be read in byte ranges without materializing the
+/// whole file in wasm memory.
+#[derive(Clone)]
+pub struct OpfsFile {
+    file_handle: FileSystemFileHandle,
+    name: String,
+    size: u64,
+}
+
+impl OpfsFile {
+    /// The current size of the file when this handle was opened.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Read the whole file into wasm memory.
+    pub async fn read_all(&self) -> Result<Vec<u8>, CacheError> {
+        let size = usize::try_from(self.size).map_err(|_| {
+            CacheError::OpfsError(format!(
+                "File '{}' is too large to read into wasm memory",
+                self.name
+            ))
+        })?;
+        self.read_range(0, size).await
+    }
+
+    /// Read a byte range from the file into wasm memory.
+    pub async fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>, CacheError> {
+        let end = offset.checked_add(len as u64).ok_or_else(|| {
+            CacheError::OpfsError(format!(
+                "Requested range for '{}' overflows: {} + {}",
+                self.name, offset, len
+            ))
+        })?;
+        if end > self.size {
+            return Err(CacheError::OpfsError(format!(
+                "Requested range {}..{} exceeds file '{}' size {}",
+                offset, end, self.name, self.size
+            )));
+        }
+
+        let file: File = JsFuture::from(self.file_handle.get_file())
+            .await
+            .map_err(|e| {
+                CacheError::OpfsError(format!("Failed to get file '{}': {:?}", self.name, e))
+            })?
+            .unchecked_into();
+
+        read_blob_range_to_vec_chunked(file.unchecked_ref(), &self.name, offset, end).await
+    }
+}
 
 /// Sanitize a name for OPFS compatibility
 ///
@@ -144,6 +198,15 @@ impl OpfsCache {
         dir: &FileSystemDirectoryHandle,
         name: &str,
     ) -> Result<Vec<u8>, CacheError> {
+        self.open_file(dir, name).await?.read_all().await
+    }
+
+    /// Open a file for range reads.
+    pub async fn open_file(
+        &self,
+        dir: &FileSystemDirectoryHandle,
+        name: &str,
+    ) -> Result<OpfsFile, CacheError> {
         let options = FileSystemGetFileOptions::new();
         options.set_create(false);
 
@@ -160,12 +223,19 @@ impl OpfsCache {
             .map_err(|e| CacheError::OpfsError(format!("Failed to get file '{}': {:?}", name, e)))?
             .unchecked_into();
 
-        let array_buffer = JsFuture::from(file.array_buffer()).await.map_err(|e| {
-            CacheError::OpfsError(format!("Failed to read file '{}': {:?}", name, e))
-        })?;
+        let size = file.size();
+        if !size.is_finite() || size < 0.0 {
+            return Err(CacheError::OpfsError(format!(
+                "Invalid size for file '{}': {}",
+                name, size
+            )));
+        }
 
-        let uint8_array = Uint8Array::new(&array_buffer);
-        Ok(uint8_array.to_vec())
+        Ok(OpfsFile {
+            file_handle,
+            name: name.to_string(),
+            size: size as u64,
+        })
     }
 
     /// Create a writable stream for a file (for streaming writes)
@@ -218,6 +288,53 @@ impl OpfsCache {
 
         Ok(())
     }
+}
+
+async fn read_blob_range_to_vec_chunked(
+    blob: &Blob,
+    name: &str,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, CacheError> {
+    let len = end.checked_sub(start).ok_or_else(|| {
+        CacheError::OpfsError(format!(
+            "Invalid range for file '{}': {}..{}",
+            name, start, end
+        ))
+    })?;
+    let len = usize::try_from(len).map_err(|_| {
+        CacheError::OpfsError(format!(
+            "Range for file '{}' is too large to read into wasm memory",
+            name
+        ))
+    })?;
+
+    let mut bytes = Vec::with_capacity(len);
+    let mut offset = start;
+    while offset < end {
+        let chunk_end = (offset + OPFS_READ_CHUNK_SIZE as u64).min(end);
+        let chunk = blob
+            .slice_with_f64_and_f64(offset as f64, chunk_end as f64)
+            .map_err(|e| {
+                CacheError::OpfsError(format!(
+                    "Failed to slice file '{}' at bytes {}..{}: {:?}",
+                    name, offset, chunk_end, e
+                ))
+            })?;
+        let array_buffer = JsFuture::from(chunk.array_buffer()).await.map_err(|e| {
+            CacheError::OpfsError(format!(
+                "Failed to read file '{}' at bytes {}..{}: {:?}",
+                name, offset, chunk_end, e
+            ))
+        })?;
+        let chunk = Uint8Array::new(&array_buffer);
+        let start = bytes.len();
+        bytes.resize(start + chunk.length() as usize, 0);
+        chunk.copy_to(&mut bytes[start..]);
+        offset = chunk_end;
+    }
+
+    Ok(bytes)
 }
 
 /// Seek to a position in an OPFS writable stream

@@ -3,136 +3,12 @@ use std::sync::Arc;
 use fusor_tile_ir::tile::{Storage, Tile};
 use fusor_tile_ir::{Layout, TileLiteral};
 
-type PairedEpilogueBuilder = dyn Fn(&[Tile]) -> Tile + Send + Sync;
 type UnaryEpilogueBuilder = dyn Fn(Tile) -> Tile + Send + Sync;
 type UnaryEpilogueWithExtrasBuilder = dyn Fn(&[Tile]) -> Tile + Send + Sync;
 
-/// Paired matmul epilogue. The matmul produces concatenated `[gate; up]`
-/// columns; the kernel reduces each pair separately and applies this epilogue
-/// before storing a single output column per pair.
-///
-/// Constructed exclusively by the resolver's paired-fusion rule when it
-/// detects a `q_mat_mul → narrow → … → mul(narrow)` subgraph; the closure
-/// re-emits the captured `NaryExpr` at the tile-IR level. Pipelines are
-/// cached by the structural hash of the produced Expr tree.
-///
-/// ```
-/// use fusor_tile_ir_kernels::PairedEpilogue;
-///
-/// let epilogue =
-///     PairedEpilogue::with_extras("mul", 0, |tiles| tiles[0].clone() * tiles[1].clone());
-/// assert_eq!(epilogue.arity(), 2);
-/// ```
-#[derive(Clone)]
-pub struct PairedEpilogue {
-    label: &'static str,
-    identity: u64,
-    /// Arity of the closure: `2 + extras`. Always `>= 2` — slot 0 is the gate
-    /// tile, slot 1 is the up tile, slots 2.. are per-column broadcast tiles
-    /// loaded by the kernel from the corresponding entries in
-    /// `extra_inputs`.
-    arity: usize,
-    // The closure receives a slice of `arity` block-agnostic tile expressions.
-    build: Arc<PairedEpilogueBuilder>,
-}
-
-impl PairedEpilogue {
-    /// Build a paired epilogue with `extras_arity` additional per-column
-    /// inputs beyond `(gate, up)`. The closure receives a slice of
-    /// `2 + extras_arity` tiles; slot 0 is gate, slot 1 is up, slots
-    /// `2..2+extras_arity` are the per-column extras in the order the
-    /// resolver collected them.
-    pub fn with_extras<F>(label: &'static str, extras_arity: usize, build: F) -> Self
-    where
-        F: Fn(&[Tile]) -> Tile + Send + Sync + 'static,
-    {
-        let arity = 2 + extras_arity;
-        // Probe the closure with `arity` distinguishable placeholder tiles so
-        // commutative differences (`gate * up` vs `up * gate`) and distinct
-        // extras yield distinct structural hashes.
-        let probes: Vec<Tile> = (0..arity)
-            .map(|i| {
-                let bits = 0xDEAD_0000u32 ^ (i as u32).wrapping_mul(0x9E37_79B9);
-                Tile::literal(TileLiteral::f32(f32::from_bits(bits)))
-            })
-            .collect();
-        let identity = build(&probes).signature_hash();
-        Self {
-            label,
-            identity,
-            arity,
-            build: Arc::new(build),
-        }
-    }
-
-    /// Number of input tiles this epilogue takes (always `>= 2`).
-    pub fn arity(&self) -> usize {
-        self.arity
-    }
-
-    /// Number of per-column extra inputs (arity - 2). The qgemv kernel must
-    /// load exactly this many extras into the slice passed to the closure.
-    pub fn extras_count(&self) -> usize {
-        self.arity - 2
-    }
-
-    /// Build the per-output tile expression for this epilogue. The kernel
-    /// must pass exactly `extras_count()` extra tiles; passing the wrong
-    /// number is a programming error caught by `debug_assert`.
-    pub fn apply(&self, gate: Tile, up: Tile, extras: &[Tile]) -> Tile {
-        debug_assert_eq!(
-            extras.len(),
-            self.extras_count(),
-            "paired epilogue extras count mismatch"
-        );
-        let mut tiles: Vec<Tile> = Vec::with_capacity(self.arity);
-        tiles.push(gate);
-        tiles.push(up);
-        for extra in extras {
-            tiles.push(extra.clone());
-        }
-        (self.build)(&tiles)
-    }
-
-    /// Stable structural hash of the produced Tile-IR Expr tree. Mix into
-    /// pipeline cache keys so distinct epilogues do not alias.
-    pub fn identity(&self) -> u64 {
-        self.identity
-    }
-
-    /// Human-readable label for graph visualization and kernel names.
-    pub fn label(&self) -> &'static str {
-        self.label
-    }
-}
-
-impl std::fmt::Debug for PairedEpilogue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PairedEpilogue")
-            .field("label", &self.label)
-            .field("identity", &format_args!("{:#018x}", self.identity))
-            .finish()
-    }
-}
-
-impl PartialEq for PairedEpilogue {
-    fn eq(&self, other: &Self) -> bool {
-        self.identity == other.identity
-    }
-}
-
-impl Eq for PairedEpilogue {}
-
-impl std::hash::Hash for PairedEpilogue {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.identity.hash(state);
-    }
-}
-
 /// Single-input tile-IR epilogue, applied between a kernel's per-output
 /// reduction and the final store. Used by post-element-wise fusion on
-/// `q_mat_mul` / `rms_norm` / etc. Mirrors [`PairedEpilogue`] but for the
-/// one-output case (`act(value) -> out` rather than `act(gate, up) -> out`).
+/// `q_mat_mul` / `rms_norm` / etc.
 ///
 /// Pass `None` to the kernels when no epilogue is needed (zero overhead — the
 /// kernels' store paths short-circuit on `None`). Construct one via
@@ -210,6 +86,7 @@ impl std::hash::Hash for UnaryEpilogue {
 #[derive(Clone)]
 pub struct UnaryEpilogueWithExtras {
     label: &'static str,
+    value_arity: usize,
     extras_arity: usize,
     identity: u64,
     build: Arc<UnaryEpilogueWithExtrasBuilder>,
@@ -220,8 +97,25 @@ impl UnaryEpilogueWithExtras {
     where
         F: Fn(&[Tile]) -> Tile + Send + Sync + 'static,
     {
-        let mut values = Vec::with_capacity(1 + extras_arity);
-        values.push(Tile::literal(TileLiteral::f32(f32::from_bits(0x5EED_CA7E))));
+        Self::new_with_value_arity(label, 1, extras_arity, build)
+    }
+
+    pub fn new_with_value_arity<F>(
+        label: &'static str,
+        value_arity: usize,
+        extras_arity: usize,
+        build: F,
+    ) -> Self
+    where
+        F: Fn(&[Tile]) -> Tile + Send + Sync + 'static,
+    {
+        assert!(value_arity > 0, "epilogue must consume at least one value");
+        let mut values = Vec::with_capacity(value_arity + extras_arity);
+        values.extend((0..value_arity).map(|idx| {
+            Tile::literal(TileLiteral::f32(f32::from_bits(
+                0x5EED_CA7Eu32.wrapping_add(idx as u32),
+            )))
+        }));
         values.extend((0..extras_arity).map(|idx| {
             Tile::literal(TileLiteral::f32(f32::from_bits(
                 0x51A7_0000u32.wrapping_add(idx as u32),
@@ -230,6 +124,7 @@ impl UnaryEpilogueWithExtras {
         let identity = build(&values).signature_hash();
         Self {
             label,
+            value_arity,
             extras_arity,
             identity,
             build: Arc::new(build),
@@ -237,7 +132,7 @@ impl UnaryEpilogueWithExtras {
     }
 
     pub fn apply(&self, values: &[Tile]) -> Tile {
-        assert_eq!(values.len(), 1 + self.extras_arity);
+        assert_eq!(values.len(), self.value_arity + self.extras_arity);
         (self.build)(values)
     }
 
@@ -251,6 +146,10 @@ impl UnaryEpilogueWithExtras {
 
     pub fn extras_arity(&self) -> usize {
         self.extras_arity
+    }
+
+    pub fn value_arity(&self) -> usize {
+        self.value_arity
     }
 }
 
@@ -269,13 +168,21 @@ pub(crate) fn apply_epilogue_with_extras(
     tile: Tile,
     extras: Vec<Tile>,
 ) -> Tile {
+    apply_epilogue_values_with_extras(epilogue, vec![tile], extras)
+}
+
+pub(crate) fn apply_epilogue_values_with_extras(
+    epilogue: Option<&UnaryEpilogueWithExtras>,
+    values: Vec<Tile>,
+    extras: Vec<Tile>,
+) -> Tile {
     if let Some(epilogue) = epilogue {
-        let mut values = Vec::with_capacity(1 + extras.len());
-        values.push(tile);
+        let mut values = values;
         values.extend(extras);
         epilogue.apply(&values)
     } else {
-        tile
+        assert_eq!(values.len(), 1);
+        values.into_iter().next().expect("single value")
     }
 }
 
@@ -319,10 +226,15 @@ pub struct QmatmulEpilogues<'a> {
     /// Ordered extra inputs passed after the reduced output tile to
     /// `post_with_extras`.
     pub post_extra_inputs: &'a [QmatmulExtra<'a>],
+    /// Matrix-column offsets for accumulator values passed to the post
+    /// epilogue. Empty means the default single accumulator at output column
+    /// `j`. Non-empty values make qgemv compute `acc(j + offset)` for each
+    /// offset and pass those accumulators before `post_extra_inputs`.
+    pub post_accumulator_offsets: &'a [u32],
     /// Optional rank-1 vector that is added to the accumulator before the
     /// cooperative store. This is a lowering choice for expressions whose
-    /// post-op can be represented as `acc + column_vector`. Runtime-typed
-    /// (ARBOR_DESIGN.md §2): the rank/element travel in the `Storage` view.
+    /// post-op can be represented as `acc + column_vector`; the rank and
+    /// element type are carried by the `Storage` view.
     pub post_acc_init_col_vector: Option<&'a Storage>,
 }
 
@@ -349,6 +261,7 @@ impl<'a> QmatmulEpilogues<'a> {
             post: Some(post),
             post_with_extras: None,
             post_extra_inputs: &[],
+            post_accumulator_offsets: &[],
             post_acc_init_col_vector: None,
         }
     }
@@ -362,8 +275,32 @@ impl<'a> QmatmulEpilogues<'a> {
             post: None,
             post_with_extras: None,
             post_extra_inputs: &[],
+            post_accumulator_offsets: &[],
             post_acc_init_col_vector: None,
         }
+    }
+
+    pub fn post_accumulator_offsets(&self) -> &[u32] {
+        const DEFAULT: &[u32] = &[0];
+        if self.post_accumulator_offsets.is_empty() {
+            DEFAULT
+        } else {
+            self.post_accumulator_offsets
+        }
+    }
+
+    pub fn post_value_arity(&self) -> usize {
+        self.post_accumulator_offsets().len()
+    }
+
+    pub fn post_output_cols(&self, matrix_cols: u32) -> u32 {
+        let max_offset = self
+            .post_accumulator_offsets()
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        matrix_cols.saturating_sub(max_offset)
     }
 }
 
@@ -384,10 +321,22 @@ pub(crate) fn apply_qmatmul_post_epilogue(
     tile: Tile,
     extras: Vec<Tile>,
 ) -> Tile {
+    apply_qmatmul_post_epilogue_values(epilogues, vec![tile], extras)
+}
+
+pub(crate) fn apply_qmatmul_post_epilogue_values(
+    epilogues: &QmatmulEpilogues<'_>,
+    values: Vec<Tile>,
+    extras: Vec<Tile>,
+) -> Tile {
     if epilogues.post_with_extras.is_some() {
-        apply_epilogue_with_extras(epilogues.post_with_extras, tile, extras)
+        apply_epilogue_values_with_extras(epilogues.post_with_extras, values, extras)
     } else {
-        apply_optional_epilogue(epilogues.post, tile)
+        assert_eq!(values.len(), 1);
+        apply_optional_epilogue(
+            epilogues.post,
+            values.into_iter().next().expect("single value"),
+        )
     }
 }
 
@@ -399,7 +348,7 @@ pub(crate) fn matrix_shape(layout: &Layout) -> [u32; 2] {
     ]
 }
 
-pub(crate) fn cooperative_store_layout_supported(layout: &Layout) -> bool {
+pub fn cooperative_store_layout_supported(layout: &Layout) -> bool {
     if !layout.is_affine() || layout.shape().rank() != 2 {
         return false;
     }

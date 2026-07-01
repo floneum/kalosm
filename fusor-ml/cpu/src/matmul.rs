@@ -227,12 +227,12 @@ pub fn batched_matmul<T: SimdElement + MatmulImpl, const R: usize>(
     lhs: &ConcreteTensor<T, R>,
     rhs: &ConcreteTensor<T, R>,
 ) -> ConcreteTensor<T, R> {
-    const {
-        assert!(
-            R >= 2,
-            "Matrix multiplication requires at least 2 dimensions"
-        )
-    };
+    // Runtime (not const) so rank-generic callers can guard rank-1 themselves
+    // without this monomorphization failing.
+    assert!(
+        R >= 2,
+        "Matrix multiplication requires at least 2 dimensions"
+    );
 
     let lhs_shape = lhs.layout().shape();
     let rhs_shape = rhs.layout().shape();

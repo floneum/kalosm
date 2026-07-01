@@ -11,8 +11,21 @@ use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
 use wgpu::{BufferUsages, COPY_BUFFER_ALIGNMENT};
 
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_FREE_BUFFERS_PER_BUCKET: usize = 4;
+#[cfg(target_arch = "wasm32")]
+const MAX_FREE_BUFFERS_PER_BUCKET: usize = 1;
+#[cfg(not(target_arch = "wasm32"))]
 const BUFFER_ALLOCATION_CACHE_SIZE: usize = 128;
+#[cfg(target_arch = "wasm32")]
+const BUFFER_ALLOCATION_CACHE_SIZE: usize = 32;
+
+/// Byte written into freshly handed-out (non-initialized) buffers when a tensor
+/// is allocated on a poisoned device (see `Device::with_poisoned_allocations`).
+/// Picked to be clearly non-zero in both f32 (`0xCDCDCDCD` ≈ -4.3e8) and integer
+/// interpretations so any kernel that reads a region it did not write surfaces
+/// an obviously wrong value.
+const DIRTY_FILL_BYTE: u8 = 0xCD;
 
 fn padded_copy_size(size: u64) -> u64 {
     let align_mask = COPY_BUFFER_ALIGNMENT - 1;
@@ -120,6 +133,9 @@ impl BufferPool {
         let items = cache.get_mut(&(size, usage))?;
         items.iter_mut().find_map(|a| {
             if Arc::strong_count(&a.buffer) == 1 {
+                if !to_initilize && a.initialized() {
+                    return None;
+                }
                 if to_initilize {
                     if a.initialized() {
                         return None;
@@ -138,13 +154,15 @@ impl BufferPool {
         size: u64,
         usage: wgpu::BufferUsages,
         to_initilize: bool,
+        poison: bool,
     ) -> Arc<wgpu::Buffer> {
         if to_initilize {
             self.initialized_buffers_dirty
                 .store(true, Ordering::Release);
             self.initialized_buffer_keys.lock().push((size, usage));
         }
-        self.get_cached_buffer(size, usage, to_initilize)
+        let buffer = self
+            .get_cached_buffer(size, usage, to_initilize)
             .unwrap_or_else(|| {
                 let new_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Tensor Buffer"),
@@ -163,24 +181,55 @@ impl BufferPool {
                     prune_cached_buffers(buffers);
                 }
                 buffer
-            })
+            });
+        // Buffers created with init data are fully overwritten by the caller, so
+        // only the to-be-written-by-a-kernel buffers need poisoning to surface
+        // zero-initialization assumptions.
+        if poison && !to_initilize {
+            self.poison_buffer(&buffer, usage);
+        }
+        buffer
     }
 
-    /// Get or create a buffer of the specified size.
-    pub fn create_buffer(&self, size: u64, usage: wgpu::BufferUsages) -> Arc<wgpu::Buffer> {
-        self.create_buffer_inner(size, usage, false)
+    /// Overwrite a buffer with [`DIRTY_FILL_BYTE`] so a later kernel that reads
+    /// an unwritten region sees poison instead of zeros. Only storage buffers
+    /// that can be a copy destination are poisoned; readback/staging buffers
+    /// are left alone.
+    fn poison_buffer(&self, buffer: &wgpu::Buffer, usage: wgpu::BufferUsages) {
+        if !usage.contains(BufferUsages::STORAGE) || !usage.contains(BufferUsages::COPY_DST) {
+            return;
+        }
+        if let Some(len) = NonZeroU64::new(buffer.size())
+            && let Some(mut write) = self.queue.write_buffer_with(buffer, 0, len)
+        {
+            write.slice(..).fill(DIRTY_FILL_BYTE);
+        }
     }
 
-    /// Get or create a buffer initialized with the supplied bytes.
+    /// Get or create a buffer of the specified size. When `poison` is set, the
+    /// (kernel-written) buffer is pre-filled with [`DIRTY_FILL_BYTE`] so any
+    /// kernel that relies on zero-initialized output storage is surfaced — this
+    /// is driven by the allocating device (`Device::with_poisoned_allocations`).
+    pub fn create_buffer(
+        &self,
+        size: u64,
+        usage: wgpu::BufferUsages,
+        poison: bool,
+    ) -> Arc<wgpu::Buffer> {
+        self.create_buffer_inner(size, usage, false, poison)
+    }
+
+    /// Get or create a buffer initialized with the supplied bytes. Init buffers
+    /// are fully overwritten here, so they are never poisoned.
     pub fn create_buffer_init(&self, data: &[u8], usage: wgpu::BufferUsages) -> Arc<wgpu::Buffer> {
         let padded_len = padded_copy_size(data.len() as u64);
-        let buffer = self.create_buffer_inner(padded_len, usage, true);
+        let buffer = self.create_buffer_inner(padded_len, usage, true, false);
         let mut write = self
             .queue
             .write_buffer_with(&buffer, 0, NonZeroU64::new(padded_len).unwrap())
             .expect("failed to map buffer for writing");
-        write[..data.len()].copy_from_slice(data);
-        write[data.len()..].fill(0);
+        write.slice(..data.len()).copy_from_slice(data);
+        write.slice(data.len()..).fill(0);
         buffer
     }
 
@@ -193,12 +242,13 @@ impl BufferPool {
     ) -> Arc<wgpu::Buffer> {
         let mut iter = data.into_iter();
         let padded_len = padded_copy_size(len);
-        let buffer = self.create_buffer_inner(padded_len, usage, true);
+        let buffer = self.create_buffer_inner(padded_len, usage, true, false);
         if let Some(len) = NonZeroU64::new(buffer.size()) {
             if let Some(mut write) = self.queue.write_buffer_with(&buffer, 0, len) {
-                for byte in write.iter_mut() {
-                    *byte = iter.next().unwrap_or(0);
-                }
+                let write_len = write.len();
+                write
+                    .slice(..)
+                    .write_iter((0..write_len).map(|_| iter.next().unwrap_or(0)));
             } else {
                 panic!("Failed to map buffer for writing");
             }

@@ -5,6 +5,10 @@ fn f32() -> ElementType {
     ScalarElement::F32.element()
 }
 
+fn u32() -> ElementType {
+    ScalarElement::U32.element()
+}
+
 #[test]
 fn op_enum_is_source_tile_program_only() {
     let ir = tile::build(|phase| {
@@ -18,7 +22,7 @@ fn op_enum_is_source_tile_program_only() {
         });
     });
 
-    let _ = ir.body();
+    assert!(!ir.body.is_empty());
 }
 
 #[test]
@@ -33,7 +37,7 @@ fn tile_source_softmax_lowers_to_naga() {
             let row = program.program_id(WorkgroupAxis::Y);
             let col = program.lane();
             let mask = col.lt(COLS);
-            let values = program.load(x.at((&row, &col)), mask.clone(), f32::MIN);
+            let values = program.load(x.at((&row, &col)), mask.clone(), -3.40282e38);
             let max = program.reduce_max(values.clone());
             let exp = (values - max).exp();
             let sum = program.reduce_sum(exp.clone());
@@ -41,7 +45,49 @@ fn tile_source_softmax_lowers_to_naga() {
         });
     });
 
-    lower_or_fail(&ir, "tile softmax");
+    let lowered = lower_or_fail(&ir, "tile softmax");
+    let mut wgsl = String::new();
+    let mut writer =
+        naga::back::wgsl::Writer::new(&mut wgsl, naga::back::wgsl::WriterFlags::empty());
+    writer
+        .write(lowered.module(), lowered.info())
+        .expect("WGSL serialization should succeed");
+    naga::front::wgsl::parse_str(&wgsl).expect("WGSL should parse after serialization");
+}
+
+#[test]
+fn subgroup_reduce_records_wgsl_extension_requirement() {
+    let ir = tile::build(|phase| {
+        let subgroup = crate::SubgroupToken::new_unchecked();
+        let x = phase.storage_read(f32(), Shape::new([32]));
+        let y = phase.storage_write(f32(), Shape::new([32]));
+        phase.program_grid(32, [1, 1, 1], |program| {
+            let lane = program.lane();
+            let mask = lane.clone().lt(32u32);
+            let value = program.load(x.at(lane.clone()), mask.clone(), 0.0);
+            let max = subgroup.subgroup_reduce_max(program, value);
+            program.store(y.at(lane), max, mask);
+        });
+    });
+
+    let lowered = lower_or_fail(&ir, "subgroup reduce");
+    assert_eq!(lowered.wgsl_extension_prelude(), "enable subgroups;\n\n");
+}
+
+#[test]
+fn subgroup_builtins_use_subgroup_capability_and_wgsl_extension() {
+    let ir = tile::build(|phase| {
+        let subgroup = crate::SubgroupToken::new_unchecked();
+        let y = phase.storage_write(u32(), Shape::new([32]));
+        phase.program_grid(32, [1, 1, 1], |program| {
+            let lane = program.lane();
+            let value = subgroup.subgroup_lane(program) + subgroup.subgroup_size(program);
+            program.store(y.at(lane), value, true);
+        });
+    });
+
+    let lowered = lower_or_fail(&ir, "subgroup builtins");
+    assert_eq!(lowered.wgsl_extension_prelude(), "enable subgroups;\n\n");
 }
 
 #[test]
@@ -200,18 +246,93 @@ fn typed_coop_accumulator_records_scalar_role_and_shape() {
     // the StoreLocal reaching it carries that element type. The IR is a tree, so
     // we inspect the emitted body directly (there is no `locals()` side-table).
     let ir = tile::build(|phase| {
+        let coop = crate::CoopMatrixToken::new_unchecked();
         phase.program_grid(32, [1, 1, 1], |program| {
-            let acc = program.alloc_coop_acc(ScalarElement::F32, 8, 8);
-            let zero = program.coop_zero(ScalarElement::F32, 8, 8);
-            program.store_local_coop(&acc, zero);
+            let acc = coop.alloc_coop_acc(program, ScalarElement::F32, 8, 8);
+            let zero = coop.coop_zero(program, ScalarElement::F32, 8, 8);
+            coop.coop_store_local(program, &acc, zero);
         });
     });
 
-    let Some(crate::Stmt::StoreLocal { dst, .. }) = ir.body().first() else {
+    let Some(crate::ir::Stmt::StoreLocal { dst, .. }) = ir.body.first() else {
         panic!("expected a coop StoreLocal as the first statement");
     };
     assert_eq!(
         dst.element,
         ElementType::coop_matrix(ScalarElement::F32, CoopMatrixRole::C, 8, 8)
     );
+}
+
+#[test]
+fn cooperative_load_store_layout_flags_use_transposed_internal_layout() {
+    fn collect_coop_store_row_major(block: &naga::Block, out: &mut Vec<bool>) {
+        for stmt in block.iter() {
+            match stmt {
+                naga::Statement::CooperativeStore { data, .. } => out.push(data.row_major),
+                naga::Statement::Block(inner) => collect_coop_store_row_major(inner, out),
+                naga::Statement::If { accept, reject, .. } => {
+                    collect_coop_store_row_major(accept, out);
+                    collect_coop_store_row_major(reject, out);
+                }
+                naga::Statement::Switch { cases, .. } => {
+                    for case in cases {
+                        collect_coop_store_row_major(&case.body, out);
+                    }
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    collect_coop_store_row_major(body, out);
+                    collect_coop_store_row_major(continuing, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn lowered_coop_layout_flags(output_layout: Layout) -> (Vec<bool>, Vec<bool>) {
+        let ir = tile::build(|phase| {
+            let coop = crate::CoopMatrixToken::new_unchecked();
+            let y = phase.storage_write_with_layout_offset(f32(), output_layout, 0);
+            let a_tile = phase.alloc_workgroup_tile(ScalarElement::F32, 8, 8);
+            let b_tile = phase.alloc_workgroup_tile(ScalarElement::F32, 8, 8);
+            phase.program_grid(32, [1, 1, 1], |program| {
+                let acc = coop.alloc_coop_acc(program, ScalarElement::F32, 8, 8);
+                let zero = coop.coop_zero(program, ScalarElement::F32, 8, 8);
+                coop.coop_store_local(program, &acc, zero);
+
+                let a = coop.coop_load_a(program, &a_tile, 0u32, 0u32, ScalarElement::F32, 8, 8);
+                let b = coop.coop_load_b(program, &b_tile, 0u32, 0u32, ScalarElement::F32, 8, 8);
+                let c = coop.coop_load_local(program, &acc);
+                let mma = coop.coop_mma(program, a, b, c);
+                coop.coop_store_local(program, &acc, mma);
+                coop.coop_store(program, &acc, &y, 0u32, 0u32);
+            });
+        });
+
+        let lowered = lower_or_fail(&ir, "coop layout flags");
+        let function = &lowered.module().entry_points[0].function;
+        let load_flags = function
+            .expressions
+            .iter()
+            .filter_map(|(_, expr)| match expr {
+                naga::Expression::CooperativeLoad { data, .. } => Some(data.row_major),
+                _ => None,
+            })
+            .collect();
+        let mut store_flags = Vec::new();
+        collect_coop_store_row_major(&function.body, &mut store_flags);
+        (load_flags, store_flags)
+    }
+
+    let row_major = Layout::contiguous(MemoryLevel::Storage, Shape::new([8, 8]));
+    let col_major = Layout::strided(MemoryLevel::Storage, Shape::new([8, 8]), &[1, 8]);
+
+    let (loads, stores) = lowered_coop_layout_flags(row_major);
+    assert_eq!(loads, [false, false]);
+    assert_eq!(stores, [false]);
+
+    let (loads, stores) = lowered_coop_layout_flags(col_major);
+    assert_eq!(loads, [false, false]);
+    assert_eq!(stores, [true]);
 }

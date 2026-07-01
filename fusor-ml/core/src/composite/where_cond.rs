@@ -1,6 +1,6 @@
 use crate::{
     Tensor,
-    nary_wise::{NaryExpr, NaryOperation},
+    nary_wise::{ElementwiseOperation, NaryExpr},
 };
 
 impl Tensor {
@@ -10,7 +10,7 @@ impl Tensor {
         assert_eq!(self.shape(), on_true.shape());
         let shape: Box<[usize]> = self.shape().into();
         let rank = shape.len();
-        let nary = NaryOperation {
+        let nary = ElementwiseOperation {
             inputs: vec![self.key(), on_true.key(), on_false.key()],
             expression: NaryExpr::select(
                 NaryExpr::input(0, rank),

@@ -2,14 +2,11 @@
 use tabbycat::Graph;
 
 use crate::{
-    Device, FlashAttentionOperation, Layout, MatMulOperation, ReduceOperation,
+    Device, ReduceOperation,
     compute_graph::NodeIndex,
-    map_layout::MapLayoutOperation,
-    nary_wise::{NaryExpr, NaryFunction, NaryOperation},
-    quantized::matmul::QMatMulOperation,
-    resize::ResizeOperation,
-    rms_norm::RmsNormOperation,
+    nary_wise::{ElementwiseOperation, NaryExpr, NaryFunction},
     slice_assign::SliceAssignOperation,
+    view::ViewOperation,
 };
 
 use super::{TensorData, TensorInfo};
@@ -54,9 +51,11 @@ impl LazyTensorData {
         Self { device, info, key }
     }
 
-    pub(crate) fn nary(&self, nary: NaryOperation) -> Self {
+    pub(crate) fn nary(&self, nary: ElementwiseOperation) -> Self {
         let device = self.device.clone();
-        let info = self.info.clone();
+        let mut info = self.info.clone();
+        info.shape = nary.shape.clone();
+        info.datatype = nary.output_datatype;
         let key = device.compute_graph().create_nary(nary);
 
         Self::from_parts(device, info, key)
@@ -67,7 +66,7 @@ impl LazyTensorData {
         let mut info = self.info.clone();
         info.datatype = function.output_type;
         let rank = info.rank();
-        let nary = NaryOperation {
+        let nary = ElementwiseOperation {
             inputs: vec![self.key],
             expression: NaryExpr::Op {
                 children: vec![NaryExpr::input(0, rank)],
@@ -91,7 +90,7 @@ impl LazyTensorData {
         let mut info = self.info.clone();
         info.datatype = function.output_type;
         let rank = shape.len();
-        let nary = NaryOperation {
+        let nary = ElementwiseOperation {
             inputs: vec![self.key, other_key],
             expression: NaryExpr::Op {
                 children: vec![NaryExpr::input(0, rank), NaryExpr::input(1, rank)],
@@ -101,24 +100,6 @@ impl LazyTensorData {
             output_datatype: info.datatype,
         };
         let key = device.compute_graph().create_nary(nary);
-
-        Self::from_parts(device, info, key)
-    }
-
-    pub(crate) fn mat_mul(&self, function: MatMulOperation) -> Self {
-        let device = self.device.clone();
-        let mut info = self.info.clone();
-        info.shape = function.out_shape.clone();
-        let key = device.compute_graph().create_mat_mul(function);
-
-        Self::from_parts(device, info, key)
-    }
-
-    pub(crate) fn q_mat_mul(&self, function: QMatMulOperation) -> Self {
-        let device = self.device.clone();
-        let mut info = self.info.clone();
-        info.shape = function.out_shape.clone();
-        let key = device.compute_graph().create_q_mat_mul(function);
 
         Self::from_parts(device, info, key)
     }
@@ -150,38 +131,10 @@ impl LazyTensorData {
         Self::from_parts(device, info, key)
     }
 
-    pub(crate) fn rms_norm(&self, function: RmsNormOperation) -> Self {
+    pub(crate) fn view(&self, op: ViewOperation) -> Self {
         let device = self.device.clone();
-        let info = self.info.clone();
-        let key = device.compute_graph().create_rms_norm(function);
-
-        Self::from_parts(device, info, key)
-    }
-
-    pub(crate) fn flash_attention(&self, function: FlashAttentionOperation) -> Self {
-        let device = self.device.clone();
-        let mut info = self.info.clone();
-        info.shape = function.out_shape.clone();
-        let key = device.compute_graph().create_flash_attention(function);
-
-        Self::from_parts(device, info, key)
-    }
-
-    pub(crate) fn map_layout(&self, op: MapLayoutOperation) -> Self {
-        let device = self.device.clone();
-        // Compute output shape by applying the layout transformation to a temporary layout
-        let temp_layout = Layout::contiguous(self.info.shape());
-        let new_layout = op.map_layout(&temp_layout);
-        let info = TensorInfo::new(new_layout.shape().into(), self.info.datatype());
-        let key = device.compute_graph().create_map_layout(op);
-
-        Self::from_parts(device, info, key)
-    }
-
-    pub(crate) fn resize(&self, op: ResizeOperation) -> Self {
-        let device = self.device.clone();
-        let info = TensorInfo::new(op.new_shape.clone(), self.info.datatype());
-        let key = device.compute_graph().create_resize(op);
+        let info = TensorInfo::new(op.shape().into(), op.datatype);
+        let key = device.compute_graph().create_view(op);
 
         Self::from_parts(device, info, key)
     }
@@ -197,6 +150,17 @@ impl LazyTensorData {
     pub(crate) fn materialize(&self) -> (TensorData, usize) {
         let result = self.device.compute_graph().resolve(self.key);
         (result.data, result.total_kernels)
+    }
+
+    pub(crate) fn materialize_with_tail<T>(
+        &self,
+        tail: impl FnOnce(&TensorData, &mut wgpu::CommandEncoder) -> T,
+    ) -> (TensorData, usize, T) {
+        let (result, tail_result) = self
+            .device
+            .compute_graph()
+            .resolve_with_tail(self.key, tail);
+        (result.data, result.total_kernels, tail_result)
     }
 
     #[cfg(feature = "graphvis")]

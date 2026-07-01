@@ -203,10 +203,15 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
     ) -> Result<Q4KQuantBlock<N>, LowerError> {
         debug_assert_eq!(WORDS * 4, N);
-        let block = self.div_literal_u32_emitted(expressions, k_base, 256, body);
-        let q_base = self.and_lit(expressions, body, k_base, 255);
-        let parts =
-            self.q4k_block_parts_from_block(expressions, matrix, block, q_base, col, body)?;
+        let (base, q_base) = self.quantized_flat_block_base_and_q(
+            expressions,
+            matrix,
+            k_base,
+            col,
+            matrix.format.block_words(),
+            body,
+        );
+        let parts = self.q4k_block_parts_from_base(expressions, matrix, base, q_base, body)?;
         let (words, nibble_shift) =
             self.q4k_quant_words::<WORDS>(expressions, matrix, &parts, whole_group_pair, body)?;
 
@@ -224,23 +229,14 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    pub(in crate::lower) fn q4k_block_parts_from_block(
+    pub(in crate::lower) fn q4k_block_parts_from_base(
         &self,
         expressions: &mut Arena<Expression>,
         matrix: &QuantizedMatrix,
-        block: Handle<Expression>,
+        base: Handle<Expression>,
         q_base: Handle<Expression>,
-        col: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Q4KBlockParts, LowerError> {
-        let base = self.quantized_block_base(
-            expressions,
-            matrix,
-            block,
-            col,
-            matrix.format.block_words(),
-            body,
-        );
         let (d, dmin) = self.load_k_d_dmin(expressions, matrix, base, body)?;
         let group = self.shr_lit(expressions, body, q_base, 5);
         let (scale_byte, min_byte) =

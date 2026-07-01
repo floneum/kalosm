@@ -1,6 +1,32 @@
 use kalosm_llama::prelude::*;
 use kalosm_model_types::ModelLoadingProgress;
 
+async fn measure_stream<S>(mut stream: S, warmup: usize, measured: usize)
+where
+    S: futures_util::Stream<Item = String> + Unpin,
+{
+    for _ in 0..warmup {
+        if stream.next().await.is_none() {
+            tracing::warn!("stream ended during warmup");
+            return;
+        }
+    }
+
+    let start = std::time::Instant::now();
+    let mut tokens = 0usize;
+    while tokens < measured {
+        if stream.next().await.is_none() {
+            break;
+        }
+        tokens += 1;
+    }
+    let elapsed = start.elapsed();
+    let per_token_ms = elapsed.as_secs_f64() * 1_000.0 / tokens.max(1) as f64;
+    println!(
+        "llama_forward_profile tokens={tokens} elapsed={elapsed:?} per_token_ms={per_token_ms:.3}"
+    );
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -9,6 +35,10 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 fn source() -> LlamaSource {
+    if let Ok(path) = std::env::var("KALOSM_PROFILE_LLAMA_LOCAL_PATH") {
+        return LlamaSource::new(FileSource::local(path.into()));
+    }
+
     if let (Ok(model_id), Ok(file)) = (
         std::env::var("KALOSM_PROFILE_LLAMA_HF_REPO"),
         std::env::var("KALOSM_PROFILE_LLAMA_HF_FILE"),
@@ -19,10 +49,17 @@ fn source() -> LlamaSource {
     }
 
     match std::env::var("KALOSM_PROFILE_LLAMA_SOURCE").as_deref() {
+        Ok("default-chat") => LlamaSource::llama_3_1_8b_chat(),
         Ok("llama-8b") => LlamaSource::llama_8b(),
         Ok("llama-8b-chat") => LlamaSource::llama_8b_chat(),
         Ok("llama-3.1-8b-chat") => LlamaSource::llama_3_1_8b_chat(),
         Ok("tiny-llama") => LlamaSource::tiny_llama_1_1b_chat(),
+        Ok("qwen2.5-0.5b") => LlamaSource::qwen_2_5_0_5b_instruct(),
+        Ok("qwen2.5-1.5b") => LlamaSource::qwen_2_5_1_5b_instruct(),
+        Ok("qwen3-0.6b") => LlamaSource::qwen_3_0_6b_instruct(),
+        Ok("gemma3-270m") => LlamaSource::gemma_3_270m_chat(),
+        Ok("gemma3-1b") => LlamaSource::gemma_3_1b_chat(),
+        Ok("gemma3-4b") => LlamaSource::gemma_3_4b_chat(),
         _ => LlamaSource::new(FileSource::huggingface(
             "unsloth/SmolLM2-135M-Instruct-GGUF",
             "main",
@@ -32,6 +69,8 @@ fn source() -> LlamaSource {
 }
 
 fn main() {
+    let _ = tracing_subscriber::fmt::try_init();
+
     pollster::block_on(async {
         let warmup = env_usize("KALOSM_PROFILE_LLAMA_WARMUP", 4);
         let measured = env_usize("KALOSM_PROFILE_LLAMA_TOKENS", 16);
@@ -43,6 +82,18 @@ fn main() {
             .build_with_loading_handler(|_: ModelLoadingProgress| {})
             .await
             .unwrap();
+
+        let prerun = env_usize("KALOSM_PROFILE_LLAMA_PRERUN", 0);
+        if prerun > 0 {
+            let prerun_prompt = std::env::var("KALOSM_PROFILE_LLAMA_PRERUN_PROMPT")
+                .unwrap_or_else(|_| "Warm up the model with a short answer.".into());
+            let prerun_sampler = GenerationParameters::default().with_max_length(prerun as u32);
+            let prerun_stream = model
+                .complete(&prerun_prompt)
+                .with_sampler(prerun_sampler)
+                .take(prerun);
+            measure_stream(prerun_stream, 0, prerun).await;
+        }
 
         let prompt_tokens = model
             .tokenizer()
@@ -62,29 +113,22 @@ fn main() {
             Some(top_k) => sampler.with_top_k(top_k),
             None => sampler,
         };
-        let mut stream = model
-            .complete(&prompt)
-            .with_sampler(sampler)
-            .take(warmup + measured);
-        for _ in 0..warmup {
-            if stream.next().await.is_none() {
-                eprintln!("stream ended during warmup");
-                return;
+        let repeats = env_usize("KALOSM_PROFILE_LLAMA_REPEATS", 1);
+        for _ in 0..repeats {
+            if std::env::var_os("KALOSM_PROFILE_LLAMA_CHAT").is_some() {
+                let mut chat = model.chat();
+                let stream = chat
+                    .add_message(prompt.clone())
+                    .with_sampler(sampler.clone())
+                    .take(warmup + measured);
+                measure_stream(stream, warmup, measured).await;
+            } else {
+                let stream = model
+                    .complete(&prompt)
+                    .with_sampler(sampler.clone())
+                    .take(warmup + measured);
+                measure_stream(stream, warmup, measured).await;
             }
         }
-
-        let start = std::time::Instant::now();
-        let mut tokens = 0usize;
-        while tokens < measured {
-            if stream.next().await.is_none() {
-                break;
-            }
-            tokens += 1;
-        }
-        let elapsed = start.elapsed();
-        let per_token_ms = elapsed.as_secs_f64() * 1_000.0 / tokens.max(1) as f64;
-        println!(
-            "llama_forward_profile tokens={tokens} elapsed={elapsed:?} per_token_ms={per_token_ms:.3}"
-        );
     });
 }

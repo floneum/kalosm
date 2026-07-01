@@ -1,12 +1,14 @@
 use std::hash::Hash;
 
-use fusor_tile_ir_kernels as tile_ir_kernels;
-
 use crate::{
     mir::kernel_backend,
     sampling::{
         TOP_K_BLOCK, TOP_K_CHUNK,
-        processors::{fixed_previous_tokens_data, processor_params_data},
+        processors::{
+            fixed_previous_tokens_data, fixed_previous_tokens_data_with_gpu_tail,
+            processor_params_data,
+        },
+        row_kernels,
     },
     tensor::{DataTypeEnum, TensorData},
 };
@@ -61,7 +63,7 @@ pub(crate) fn top_k_exactness_flag_data_with_encoder(
 
     let device = top_values.device();
     let flag = TensorData::new_for_shape(device, &[1], DataTypeEnum::U32);
-    let meta = tile_ir_kernels::TopKExactnessMeta {
+    let meta = row_kernels::TopKExactnessMeta {
         chunks: chunks.try_into().ok()?,
         candidate_count: candidate_count.try_into().ok()?,
         output_per_chunk: output_per_chunk.try_into().ok()?,
@@ -91,7 +93,7 @@ pub(crate) fn top_k_exactness_flag_data_with_encoder(
         cache_key,
         [1, 1, 1],
         |kb| {
-            tile_ir_kernels::top_k_exactness(
+            row_kernels::top_k_exactness(
                 kb,
                 top_values.as_kernel_tensor_ref(),
                 chunk_values.as_kernel_tensor_ref(),
@@ -127,24 +129,88 @@ pub(crate) fn chunk_top_k_pair_data_with_encoder(
     )
 }
 
+/// Logit-processor settings (temperature scaling and repetition penalty)
+/// applied before the top-k reduction.
+#[derive(Clone, Copy)]
+pub(crate) struct ProcessorSettings {
+    pub temperature: f32,
+    pub repetition_penalty: f32,
+}
+
 pub(crate) fn chunk_top_k_pair_data_with_processors_with_encoder(
     input: &TensorData,
     previous_tokens: &[u32],
-    temperature: f32,
-    repetition_penalty: f32,
+    settings: ProcessorSettings,
     candidate_count: usize,
     output_per_chunk: usize,
     encoder: Option<&mut CommandEncoder>,
 ) -> Option<(TensorData, TensorData)> {
     let device = input.device();
     let (previous_tokens, previous_len) = fixed_previous_tokens_data(device, previous_tokens);
-    let params = processor_params_data(device, temperature, repetition_penalty, previous_len);
+    let params = processor_params_data(
+        device,
+        settings.temperature,
+        settings.repetition_penalty,
+        previous_len,
+    );
     chunk_top_k_pair_data_inner_with_encoder(
         input,
         candidate_count,
         output_per_chunk,
         Some((&previous_tokens, &params)),
         encoder,
+    )
+}
+
+pub(crate) fn chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder(
+    input: &TensorData,
+    previous_tokens: &[u32],
+    gpu_tail: Option<&TensorData>,
+    settings: ProcessorSettings,
+    candidate_count: usize,
+    output_per_chunk: usize,
+    encoder: Option<&mut CommandEncoder>,
+) -> Option<(TensorData, TensorData)> {
+    let Some(gpu_tail) = gpu_tail else {
+        return chunk_top_k_pair_data_with_processors_with_encoder(
+            input,
+            previous_tokens,
+            settings,
+            candidate_count,
+            output_per_chunk,
+            encoder,
+        );
+    };
+    if gpu_tail.datatype() != DataTypeEnum::U32
+        || gpu_tail.layout().rank() != 1
+        || gpu_tail
+            .layout()
+            .shape()
+            .first()
+            .copied()
+            .unwrap_or_default()
+            == 0
+        || !input.device().is_same_device(gpu_tail.device())
+    {
+        return None;
+    }
+
+    let device = input.device();
+    let encoder = encoder?;
+    let (previous_tokens, previous_len) =
+        fixed_previous_tokens_data_with_gpu_tail(device, previous_tokens, gpu_tail, encoder);
+    let params = processor_params_data(
+        device,
+        settings.temperature,
+        settings.repetition_penalty,
+        previous_len,
+    );
+    chunk_top_k_pair_data_inner_with_encoder(
+        input,
+        candidate_count,
+        output_per_chunk,
+        Some((&previous_tokens, &params)),
+        Some(encoder),
     )
 }
 
@@ -190,7 +256,7 @@ fn chunk_top_k_pair_data_inner_with_encoder(
         cache_key,
         [chunks.try_into().ok()?, 1, 1],
         |kb| {
-            tile_ir_kernels::top_k_chunk(
+            row_kernels::top_k_chunk(
                 kb,
                 input.as_kernel_tensor_ref(),
                 ids.as_kernel_tensor_ref(),
@@ -201,7 +267,7 @@ fn chunk_top_k_pair_data_inner_with_encoder(
                         params.as_kernel_tensor_ref(),
                     )
                 }),
-                tile_ir_kernels::TopKChunkMeta {
+                row_kernels::TopKChunkMeta {
                     input_len: input_len.try_into().ok()?,
                     output_per_chunk: output_per_chunk.try_into().ok()?,
                     input_offset: input_offset.try_into().ok()?,
@@ -293,13 +359,13 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
         cache_key,
         [1, 1, 1],
         |kb| {
-            tile_ir_kernels::top_k_merge(
+            row_kernels::top_k_merge(
                 kb,
                 input_ids.as_kernel_tensor_ref(),
                 input_values.as_kernel_tensor_ref(),
                 ids.as_kernel_tensor_ref(),
                 values.as_kernel_tensor_ref(),
-                tile_ir_kernels::MergeTopKMeta {
+                row_kernels::MergeTopKMeta {
                     chunks: chunks.try_into().ok()?,
                     chunk_len: chunk_len.try_into().ok()?,
                     chunk_stride: chunk_stride.try_into().ok()?,

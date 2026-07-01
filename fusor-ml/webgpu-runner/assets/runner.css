@@ -1,0 +1,672 @@
+/* Fusor WebGPU Runner Lab — layout styling layered on the dioxus-components
+ * design system. Component surfaces (buttons, cards, badges, progress,
+ * separators) come from `dx-components` css modules; the tokens
+ * (`--primary-color-*`, `--secondary-color-*`, the `--dark`/`--light` switch)
+ * come from `dx-components-theme.css`. This file only styles the page shell,
+ * navigation, metrics, and the test/benchmark log surfaces. */
+@import url("https://fonts.googleapis.com/css2?family=Geist:wght@100..900&family=Geist+Mono:wght@400;500;700&display=swap");
+
+:root {
+  color-scheme: light dark;
+
+  --radius-card: 1rem;
+  --radius-md: 0.75rem;
+  --radius-sm: 0.5rem;
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 6%);
+
+  /* Semantic status pairs reusing the theme's light/dark switch. */
+  --ok-bg: var(--dark, #06251b) var(--light, #ecfdf5);
+  --ok-text: var(--dark, #6ee7b7) var(--light, #047857);
+  --ok-border: var(--dark, #114a37) var(--light, #a7f3d0);
+
+  --run-bg: var(--dark, #0c1f3a) var(--light, #eff6ff);
+  --run-text: var(--dark, #93c5fd) var(--light, #1d4ed8);
+  --run-border: var(--dark, #1e3a63) var(--light, #bfdbfe);
+
+  --err-bg: var(--dark, #3a1213) var(--light, #fef2f2);
+  --err-text: var(--dark, #fca5a5) var(--light, #b91c1c);
+  --err-border: var(--dark, #5c1d20) var(--light, #fecaca);
+
+  --card-surface: var(--dark, #141313) var(--light, #fff);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  min-height: 100dvh;
+  background: var(--primary-color-1);
+  color: var(--secondary-color-4);
+  font-family: Geist, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-optical-sizing: auto;
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button,
+a {
+  font: inherit;
+}
+
+/* ---------- Shell + navigation ---------- */
+
+.shell {
+  min-height: 100dvh;
+  padding: 32px 24px 72px;
+}
+
+.workspace {
+  max-width: 1200px;
+  margin: 0 auto;
+  display: grid;
+  gap: 20px;
+}
+
+.sitebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 2px 2px 20px;
+  border-bottom: 1px solid var(--primary-color-6);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  background: linear-gradient(150deg, #f08a4b 0%, #dd7230 48%, #eb5160 100%);
+  color: #fff;
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 17px;
+  font-weight: 600;
+  box-shadow:
+    var(--shadow-sm),
+    inset 0 1px 0 rgb(255 255 255 / 25%);
+}
+
+.brand-text {
+  display: grid;
+  gap: 2px;
+}
+
+.eyebrow {
+  margin: 0;
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--secondary-color-5);
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+  color: var(--secondary-color-1);
+}
+
+.route-tabs {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: var(--radius-sm);
+  background: var(--dark, var(--primary-color-5)) var(--light, var(--primary-color-3));
+}
+
+.nav-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 30px;
+  padding: 0 14px;
+  border-radius: calc(var(--radius-sm) - 4px);
+  color: var(--secondary-color-5);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+  transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.nav-link:hover {
+  color: var(--secondary-color-3);
+}
+
+.nav-link:focus-visible {
+  outline: 2px solid var(--focused-border-color);
+  outline-offset: 2px;
+}
+
+.nav-link.active {
+  background: var(--dark, #232323) var(--light, #fff);
+  color: var(--secondary-color-1);
+  box-shadow: var(--light, 0 1px 2px rgb(0 0 0 / 18%)) var(--dark, none);
+}
+
+/* ---------- Page header ---------- */
+
+.topbar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 4px 2px 0;
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.topbar h2 {
+  margin: 4px 0 0;
+  font-size: 25px;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  text-wrap: balance;
+  color: var(--secondary-color-1);
+}
+
+/* ---------- Summary card ---------- */
+
+.summary-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.summary-body {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.metrics {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+}
+
+.metric {
+  padding: 2px 18px;
+  border-left: 1px solid var(--primary-color-6);
+}
+
+.metric:first-child {
+  padding-left: 2px;
+  border-left: none;
+}
+
+.metric-value {
+  display: block;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--secondary-color-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.metric-label {
+  display: block;
+  margin-top: 3px;
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--secondary-color-5);
+}
+
+/* ---------- Log + benchmark panels ---------- */
+
+.log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.current-case {
+  color: var(--secondary-color-5);
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.steps,
+.bench-table {
+  scrollbar-width: thin;
+  scrollbar-color: var(--primary-color-6) transparent;
+}
+
+.steps {
+  max-height: min(64vh, 720px);
+  overflow: auto;
+}
+
+.step {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 11px 24px;
+  border-bottom: 1px solid var(--primary-color-6);
+  transition: background-color 120ms ease;
+}
+
+.step:last-child {
+  border-bottom: none;
+}
+
+.step:hover {
+  background: var(--primary-color-3);
+}
+
+.step-name {
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  color: var(--secondary-color-3);
+}
+
+.bench-table {
+  overflow: auto;
+}
+
+.bench-row {
+  display: grid;
+  grid-template-columns:
+    minmax(220px, 1fr) repeat(6, minmax(72px, max-content))
+    minmax(80px, auto);
+  gap: 14px;
+  align-items: center;
+  padding: 11px 24px;
+  border-bottom: 1px solid var(--primary-color-6);
+  transition: background-color 120ms ease;
+}
+
+.bench-row:last-child {
+  border-bottom: none;
+}
+
+.bench-row:not(.bench-head):hover {
+  background: var(--primary-color-3);
+}
+
+.benchmark-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.benchmark-link:hover .step-name {
+  color: var(--secondary-color-1);
+}
+
+.bench-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--card-surface);
+  color: var(--secondary-color-5);
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+}
+
+.bench-case {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.bench-detail {
+  color: var(--secondary-color-5);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.bench-number {
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 12px;
+  text-align: right;
+  white-space: nowrap;
+  color: var(--secondary-color-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.cmp-faster {
+  color: var(--ok-text);
+}
+
+.cmp-slower {
+  color: var(--err-text);
+}
+
+/* ---------- Sweep chart ---------- */
+
+.chart-panel {
+  overflow: hidden;
+}
+
+.chart-legend {
+  display: flex;
+  justify-content: flex-end;
+  gap: 16px;
+  padding: 12px 24px 0;
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--secondary-color-5);
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.legend-item::before {
+  content: "";
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+
+.legend-item.burn::before {
+  background: #e0a93a;
+}
+
+.legend-item.webgpu::before {
+  background: #40b8a6;
+}
+
+.bar-chart {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+  align-items: end;
+  gap: 18px;
+  min-height: 300px;
+  padding: 22px 24px 20px;
+  border-bottom: 1px solid var(--primary-color-6);
+}
+
+.chart-group {
+  min-width: 0;
+  display: grid;
+  grid-template-rows: 230px auto;
+  gap: 10px;
+}
+
+.chart-bars {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(18px, 38px));
+  justify-content: center;
+  align-items: end;
+  gap: 8px;
+  padding: 0 6px;
+  border-bottom: 1px solid var(--primary-color-6);
+}
+
+.chart-bar {
+  position: relative;
+  min-height: 0;
+  border-radius: 5px 5px 0 0;
+  transition: height 220ms ease;
+}
+
+.chart-bar.burn {
+  background: linear-gradient(180deg, #f3c969, #a86912);
+}
+
+.chart-bar.webgpu {
+  background: linear-gradient(180deg, #64d6c4, #168574);
+}
+
+.chart-value {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%) rotate(-18deg);
+  color: var(--secondary-color-5);
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 10px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.chart-label {
+  min-height: 30px;
+  color: var(--secondary-color-4);
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.25;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.sweep-table {
+  overflow: auto;
+}
+
+.sweep-row {
+  display: grid;
+  grid-template-columns:
+    minmax(180px, 1fr) repeat(4, minmax(76px, max-content))
+    minmax(86px, auto);
+  gap: 14px;
+  align-items: center;
+  padding: 11px 24px;
+  border-bottom: 1px solid var(--primary-color-6);
+}
+
+.sweep-row:last-child {
+  border-bottom: none;
+}
+
+.sweep-row:not(.sweep-head):hover {
+  background: var(--primary-color-3);
+}
+
+.sweep-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--card-surface);
+  color: var(--secondary-color-5);
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+}
+
+/* ---------- Status badges (themed dx Badge) ---------- */
+/* `!important` intentionally overrides the dx-components Badge variant colors
+ * with semantic status colors, regardless of stylesheet injection order. */
+
+.status-badge {
+  gap: 5px;
+  min-height: 20px;
+  height: auto;
+  padding: 2px 9px !important;
+  border-radius: 999px !important;
+  font-family: "Geist Mono", ui-monospace, monospace !important;
+  font-size: 10px !important;
+  font-weight: 500 !important;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  box-shadow: none !important;
+}
+
+.status-badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.status-badge.idle {
+  background: var(--primary-color-5) !important;
+  color: var(--secondary-color-5) !important;
+  border-color: var(--primary-color-6) !important;
+}
+
+.status-badge.running {
+  background: var(--run-bg) !important;
+  color: var(--run-text) !important;
+  border-color: var(--run-border) !important;
+}
+
+.status-badge.passed {
+  background: var(--ok-bg) !important;
+  color: var(--ok-text) !important;
+  border-color: var(--ok-border) !important;
+}
+
+.status-badge.failed {
+  background: var(--err-bg) !important;
+  color: var(--err-text) !important;
+  border-color: var(--err-border) !important;
+}
+
+.status-badge.running::before {
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.4;
+  }
+}
+
+/* ---------- Misc ---------- */
+
+.empty {
+  padding: 56px 24px;
+  color: var(--secondary-color-5);
+  text-align: center;
+  font-size: 14px;
+}
+
+.route-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.route-actions .nav-link {
+  height: 36px;
+  padding: 0 16px;
+  border: 1px solid var(--primary-color-6);
+  background: var(--primary-color);
+}
+
+.route-actions .nav-link:hover {
+  background: var(--primary-color-5);
+  color: var(--secondary-color-1);
+}
+
+@media (max-width: 760px) {
+  .shell {
+    padding: 20px 14px 56px;
+  }
+
+  .sitebar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 14px;
+  }
+
+  .route-tabs {
+    align-self: flex-start;
+  }
+
+  .topbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .topbar-actions {
+    justify-content: space-between;
+  }
+
+  .summary-head {
+    flex-wrap: wrap;
+  }
+
+  .metrics {
+    grid-auto-flow: row;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    column-gap: 18px;
+  }
+
+  .metric {
+    padding: 12px 0 0;
+    border-left: none;
+    border-top: 1px solid var(--primary-color-6);
+  }
+
+  .metric:first-child,
+  .metric:nth-child(2) {
+    padding-top: 0;
+    border-top: none;
+  }
+
+  .current-case {
+    text-align: left;
+  }
+
+  .bench-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .sweep-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .bench-head {
+    display: none;
+  }
+
+  .sweep-head {
+    display: none;
+  }
+
+  .bench-number {
+    text-align: left;
+  }
+
+  .bar-chart {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

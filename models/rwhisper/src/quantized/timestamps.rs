@@ -122,7 +122,7 @@ fn dynamic_time_warp(
             (0..m + 1)
                 .map(|j| {
                     if i == 0 && j == 0 {
-                        crate::WhisperDType::from(0.0)
+                        crate::WhisperDType::from(0.0_f32)
                     } else {
                         crate::WhisperDType::INFINITY
                     }
@@ -145,7 +145,7 @@ fn dynamic_time_warp(
         })
         .collect::<Box<[_]>>();
 
-    cost[0][0] = crate::WhisperDType::from(0.0);
+    cost[0][0] = crate::WhisperDType::from(0.0_f32);
     for j in 1..m + 1 {
         for i in 1..n + 1 {
             let down_left = cost[i - 1][j - 1];

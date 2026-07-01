@@ -3,6 +3,7 @@
 // KALOSM_LLAMA_GPU_SAMPLE_TOKEN=1 \
 // KALOSM_LLAMA_GPU_FUSED_LOGITS=1 \
 // KALOSM_LLAMA_GPU_SAMPLE_TOP_K=128 \
+// KALOSM_LLAMA_SAMPLER=standard \
 // cargo run -p kalosm --example chat --features llama --release
 use kalosm::language::*;
 use std::io::{BufWriter, Write};
@@ -12,19 +13,16 @@ use std::time::Instant;
 fn main() {
     pollster::block_on(async {
         let model = Llama::new_chat().await.unwrap();
-        let system_prompt = "The assistant will act like a pirate";
+        let system_prompt = prompt_input("system prompt: ").unwrap();
 
-        let mut warmup_chat = model.chat().with_system_prompt(system_prompt);
-        let warmup_sampler = GenerationParameters::new().with_max_length(4);
-        let _ = warmup_chat(&"hi".to_string())
-            .with_sampler(warmup_sampler)
-            .collect::<Vec<_>>()
-            .await;
-
-        let mut chat = model.chat().with_system_prompt(system_prompt);
+        let mut chat = model.chat();
+        if !system_prompt.trim().is_empty() {
+            chat = chat.with_system_prompt(&system_prompt);
+        }
+        let sampler = chat_sampler();
 
         loop {
-            let mut response = chat(&prompt_input("\n> ").unwrap());
+            let mut response = chat(&prompt_input("\n> ").unwrap()).with_sampler(sampler.clone());
             let stdout = std::io::stdout();
             let mut stdout = BufWriter::with_capacity(8192, stdout.lock());
             let mut last_flush = Instant::now();
@@ -58,4 +56,14 @@ fn main() {
             }
         }
     });
+}
+
+fn chat_sampler() -> GenerationParameters {
+    match std::env::var("KALOSM_LLAMA_SAMPLER") {
+        Ok(value) if value.eq_ignore_ascii_case("standard") => GenerationParameters::new()
+            .with_standard_sampler()
+            .with_top_k(128)
+            .with_top_p(0.95),
+        _ => GenerationParameters::new(),
+    }
 }

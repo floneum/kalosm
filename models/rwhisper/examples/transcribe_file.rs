@@ -2,16 +2,18 @@ use kalosm::sound::*;
 use rodio::Decoder;
 
 fn main() -> Result<(), anyhow::Error> {
+    let _ = tracing_subscriber::fmt::try_init();
+
     pollster::block_on(async {
-        eprintln!("Starting transcription...");
+        tracing::info!("Starting transcription...");
 
         // Create a new large whisper model
-        eprintln!("Building model...");
+        tracing::info!("Building model...");
         let model = WhisperBuilder::default()
             .with_source(WhisperSource::tiny_en())
             .build()
             .await?;
-        eprintln!("Model built successfully");
+        tracing::info!("Model built successfully");
 
         // Load audio from a file
         let contents = std::fs::read("./models/rwhisper/examples/samples_jfk.wav").unwrap();
@@ -22,22 +24,22 @@ fn main() -> Result<(), anyhow::Error> {
         let rate = audio.sample_rate() as f32;
 
         // Transcribe the source audio into text
-        eprintln!("Starting transcription...");
+        tracing::info!("Starting transcription...");
         let mut text = model.transcribe(audio);
 
-        eprintln!("Waiting for segments...");
+        tracing::info!("Waiting for segments...");
         let mut segment_count = 0;
         // As the model transcribes the audio, print the text to the console
         while let Some(segment) = text.next().await {
             segment_count += 1;
             let chunks: Vec<_> = segment.chunks().collect();
-            eprintln!(
+            tracing::info!(
                 "Received segment {}: {} chunks",
                 segment_count,
                 chunks.len()
             );
             for chunk in chunks {
-                eprintln!("Chunk: {:?}", chunk);
+                tracing::info!("Chunk: {:?}", chunk);
                 print!("{chunk}");
                 // Play the audio chunk
                 if let Some(timestamp) = chunk.timestamp() {
@@ -55,7 +57,7 @@ fn main() -> Result<(), anyhow::Error> {
             }
         }
 
-        eprintln!("Transcription complete. Total segments: {}", segment_count);
+        tracing::info!("Transcription complete. Total segments: {}", segment_count);
         Ok(())
     })
 }

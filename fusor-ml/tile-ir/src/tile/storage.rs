@@ -5,8 +5,7 @@ use crate::ir::{Addr, ElementType, Layout, Shape, StorageView};
 /// Runtime-typed handle to a storage buffer view declared on a
 /// [`Program`](super::Program).
 ///
-/// The element type and logical rank are runtime data carried by the view (see
-/// ARBOR_DESIGN.md §2) — there are no `Numeric`/const-`R` type parameters. Use
+/// The element type and logical rank are runtime data carried by the view. Use
 /// [`Storage::view`] to inspect the underlying [`StorageView`].
 #[derive(Clone)]
 pub struct Storage {

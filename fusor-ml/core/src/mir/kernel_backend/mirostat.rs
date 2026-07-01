@@ -1,12 +1,11 @@
 use std::hash::Hash;
 
-use fusor_tile_ir_kernels as tile_ir_kernels;
-
 use crate::{
     Device,
     mir::kernel_backend,
     sampling::{
         GPU_SAMPLE_RESULT_WORDS, GpuMirostat2Sampler, GpuMirostat2SamplerParams, TOP_K_BLOCK,
+        row_kernels,
     },
     tensor::{DataTypeEnum, TensorData},
 };
@@ -34,7 +33,7 @@ fn mirostat2_params_data(device: &Device, params: GpuMirostat2SamplerParams) -> 
         bytemuck::bytes_of(&params),
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
     );
-    TensorData::new_from_buffer(device, buffer, &[1], DataTypeEnum::U32)
+    TensorData::new_from_buffer(device, buffer, &[4], DataTypeEnum::F32)
 }
 
 pub(crate) fn sample_from_sorted_top_k_data_with_encoder(
@@ -71,7 +70,7 @@ pub(crate) fn sample_from_sorted_top_k_data_with_encoder(
     let params = mirostat2_params_data(device, params);
     let has_exactness_flag = exactness_flag.is_some();
     let output = TensorData::new_for_shape(device, &[GPU_SAMPLE_RESULT_WORDS], DataTypeEnum::U32);
-    let meta = tile_ir_kernels::Mirostat2Meta {
+    let meta = row_kernels::SamplerMeta {
         top_k: top_k.try_into().ok()?,
         ids_offset: ids.layout().offset().try_into().ok()?,
         ids_stride: ids.layout().strides()[0].try_into().ok()?,
@@ -97,9 +96,9 @@ pub(crate) fn sample_from_sorted_top_k_data_with_encoder(
         cache_key,
         [1, 1, 1],
         |kb| {
-            tile_ir_kernels::mirostat2(
+            row_kernels::mirostat2(
                 kb,
-                tile_ir_kernels::Mirostat2 {
+                row_kernels::Mirostat2 {
                     ids: ids.as_kernel_tensor_ref(),
                     values: values.as_kernel_tensor_ref(),
                     state: sampler.state.as_kernel_tensor_ref(),

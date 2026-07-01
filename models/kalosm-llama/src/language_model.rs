@@ -15,7 +15,7 @@ use std::future::Future;
 
 use crate::model::LlamaModelError;
 #[cfg(feature = "structured")]
-use crate::sampler::CpuMirostat2Sampler;
+use crate::sampler::CpuSampler;
 #[cfg(feature = "structured")]
 use crate::structured::generate_structured;
 pub use crate::Llama;
@@ -208,10 +208,8 @@ where
         async move {
             let (tx, rx) = futures_channel::oneshot::channel();
             let seed = sampler.seed();
-            let sampler = CpuMirostat2Sampler::new(
-                GpuSamplerConfig::from_generation_parameters(&sampler),
-                seed,
-            );
+            let sampler =
+                CpuSampler::new(GpuSamplerConfig::from_generation_parameters(&sampler), seed);
             let on_token = Box::new(on_token);
             #[cfg(feature = "vision")]
             let resolved_message = text.resolve_media_sources().await?;

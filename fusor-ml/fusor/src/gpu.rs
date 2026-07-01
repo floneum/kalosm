@@ -7,11 +7,38 @@ use std::{
 
 pub use fusor_core::{
     CastTensor, DataType, DataTypeEnum, Device, Dim, Error, FloatDataType, GgufReadError,
-    GpuMirostat2Sampler, GpuMirostat2SamplerParams, Layout, MappedBuffer, MatMulParams, NodeIndex,
-    QMatrix, Result, ShapeWithOneHole, StrideSpec, TensorSlice, WasmNotSend, WasmNotSync,
+    GpuMirostat2Sampler, GpuMirostat2SamplerParams, GpuStandardSamplerParams, Layout, MappedBuffer,
+    MatMulParams, NodeIndex, PendingGpuSampledToken as CorePendingGpuSampledToken, QMatrix, Result,
+    ShapeWithOneHole, StrideSpec, TensorSlice, WasmNotSend, WasmNotSync,
 };
 
 type CoreTensor = fusor_core::Tensor;
+
+pub struct GpuSampledToken {
+    inner: CorePendingGpuSampledToken,
+}
+
+impl GpuSampledToken {
+    #[inline]
+    pub(crate) fn from_core(inner: CorePendingGpuSampledToken) -> Self {
+        Self { inner }
+    }
+
+    #[inline]
+    pub(crate) fn as_core_token(&self) -> &CoreTensor {
+        self.inner.token_tensor()
+    }
+
+    #[inline]
+    pub fn token_tensor(&self) -> crate::Tensor<1, u32> {
+        crate::Tensor::Gpu(Tensor::from_core(self.inner.token_tensor().clone()))
+    }
+
+    #[inline]
+    pub async fn read_token(self) -> Result<Option<u32>> {
+        self.inner.read_token().await.map_err(Error::from)
+    }
+}
 
 /// Typed facade tensor for GPU values.
 ///
@@ -97,6 +124,11 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     #[inline]
     pub fn from_slice(device: &Device, shape: [usize; R], data: &[D]) -> Self {
         Self::from_core(CoreTensor::from_slice::<D>(device, shape, data))
+    }
+
+    #[inline]
+    pub(crate) fn uninit(device: &Device, shape: [usize; R]) -> Self {
+        Self::from_core(CoreTensor::uninit::<D>(device, shape))
     }
 
     #[inline]
@@ -471,19 +503,6 @@ impl<const R: usize> Tensor<R, f32> {
     pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
         Self::from_core(self.inner.q_mat_mul(other))
     }
-
-    #[inline]
-    pub fn q_mat_mul_add2(&self, other: &QMatrix, first: &Self, second: &Self) -> Self {
-        Self::from_core(
-            self.inner
-                .q_mat_mul_add2(other, first.as_core(), second.as_core()),
-        )
-    }
-
-    #[inline]
-    pub fn q_mat_mul_paired_silu_product(&self, other: &QMatrix) -> Self {
-        Self::from_core(self.inner.q_mat_mul_paired_silu_product(other))
-    }
 }
 
 impl<const R: usize> Tensor<R, half::f16> {
@@ -546,17 +565,39 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
 
 impl Tensor<1, f32> {
     #[inline]
-    pub async fn try_sample_mirostat2_token_q_mat(
+    pub fn sample_mirostat2_token_pending(
         &self,
-        matrix: &QMatrix,
         sampler: &mut GpuMirostat2Sampler,
         previous_tokens: &[u32],
+        previous_gpu_token: Option<&GpuSampledToken>,
         params: GpuMirostat2SamplerParams,
-    ) -> Result<Option<u32>> {
-        self.inner
-            .try_sample_mirostat2_token_q_mat(matrix, sampler, previous_tokens, params)
-            .await
-            .map_err(Error::from)
+    ) -> Result<Option<GpuSampledToken>> {
+        Ok(self
+            .inner
+            .sample_mirostat2_token_pending(
+                sampler,
+                previous_tokens,
+                previous_gpu_token.map(|token| token.as_core_token()),
+                params,
+            )
+            .map(GpuSampledToken::from_core))
+    }
+
+    #[inline]
+    pub fn sample_standard_token_pending(
+        &self,
+        previous_tokens: &[u32],
+        previous_gpu_token: Option<&GpuSampledToken>,
+        params: GpuStandardSamplerParams,
+    ) -> Result<Option<GpuSampledToken>> {
+        Ok(self
+            .inner
+            .sample_standard_token_pending(
+                previous_tokens,
+                previous_gpu_token.map(|token| token.as_core_token()),
+                params,
+            )
+            .map(GpuSampledToken::from_core))
     }
 
     #[inline]
@@ -568,6 +609,18 @@ impl Tensor<1, f32> {
     ) -> Result<u32> {
         self.inner
             .sample_mirostat2_token(sampler, previous_tokens, params)
+            .await
+            .map_err(Error::from)
+    }
+
+    #[inline]
+    pub async fn sample_standard_token(
+        &self,
+        previous_tokens: &[u32],
+        params: GpuStandardSamplerParams,
+    ) -> Result<u32> {
+        self.inner
+            .sample_standard_token(previous_tokens, params)
             .await
             .map_err(Error::from)
     }
@@ -629,6 +682,23 @@ impl<D: DataType> Tensor<4, D> {
     }
 
     #[inline]
+    pub fn rope_pair_fused_with_position(
+        &self,
+        k: &Self,
+        cos: &Tensor<2, D>,
+        sin: &Tensor<2, D>,
+        position: &Tensor<1, u32>,
+    ) -> (Self, Self) {
+        let (q, k) = self.inner.rope_pair_fused_with_position(
+            k.as_core(),
+            cos.as_core(),
+            sin.as_core(),
+            position.as_core(),
+        );
+        (Self::from_core(q), Self::from_core(k))
+    }
+
+    #[inline]
     pub fn rope_normal_pair_fused(
         &self,
         k: &Self,
@@ -638,6 +708,23 @@ impl<D: DataType> Tensor<4, D> {
         let (q, k) = self
             .inner
             .rope_normal_pair_fused(k.as_core(), cos.as_core(), sin.as_core());
+        (Self::from_core(q), Self::from_core(k))
+    }
+
+    #[inline]
+    pub fn rope_normal_pair_fused_with_position(
+        &self,
+        k: &Self,
+        cos: &Tensor<2, D>,
+        sin: &Tensor<2, D>,
+        position: &Tensor<1, u32>,
+    ) -> (Self, Self) {
+        let (q, k) = self.inner.rope_normal_pair_fused_with_position(
+            k.as_core(),
+            cos.as_core(),
+            sin.as_core(),
+            position.as_core(),
+        );
         (Self::from_core(q), Self::from_core(k))
     }
 }

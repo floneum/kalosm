@@ -65,31 +65,43 @@ where
         match (self, k, v) {
             // GPU path - use the optimized fused kernel (QKMask/Causal only)
             #[cfg(feature = "gpu")]
-            (Tensor::Gpu(q), Tensor::Gpu(k), Tensor::Gpu(v))
+            (Tensor::Gpu(q), Tensor::Gpu(k_gpu), Tensor::Gpu(v_gpu))
                 if !matches!(mask, Some((_, MaskKind::BatchKeyMask))) =>
             {
-                if !q.device().subgroups_supported() {
-                    let cpu_q = tensor4_to_cpu(q);
-                    let cpu_k = tensor4_to_cpu(k);
-                    let cpu_v = tensor4_to_cpu(v);
-                    let cpu_mask = mask.map(|(m, kind)| {
-                        let Tensor::Gpu(mask) = m else {
-                            panic!("Mask must be on the same device as other tensors");
-                        };
-                        (tensor2_to_cpu(mask), kind)
-                    });
-                    let cpu_mask_ref = cpu_mask.as_ref().map(|(mask, kind)| (mask, *kind));
-                    let cpu_output = cpu_q.flash_attention(&cpu_k, &cpu_v, scale, cpu_mask_ref);
-                    return tensor4_to_gpu(cpu_output, q.device());
+                // Decode (q_seq_len == 1) runs the DecodeSmall attention kernel,
+                // which uses workgroup reductions and needs no subgroups, so it
+                // works on browser adapters that report no subgroup support. Only
+                // the prefill/streaming kernels require subgroups — keep the
+                // fallback for those (q_seq_len > 1).
+                if !q.device().subgroups_supported() && self.shape()[2] != 1 {
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        return self.flash_attention_composite_impl(k, v, scale, mask);
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let cpu_q = tensor4_to_cpu(q);
+                        let cpu_k = tensor4_to_cpu(k_gpu);
+                        let cpu_v = tensor4_to_cpu(v_gpu);
+                        let cpu_mask = mask.map(|(m, kind)| {
+                            let Tensor::Gpu(mask) = m else {
+                                panic!("Mask must be on the same device as other tensors");
+                            };
+                            (tensor2_to_cpu(mask), kind)
+                        });
+                        let cpu_mask_ref = cpu_mask.as_ref().map(|(mask, kind)| (mask, *kind));
+                        let cpu_output = cpu_q.flash_attention(&cpu_k, &cpu_v, scale, cpu_mask_ref);
+                        return tensor4_to_gpu(cpu_output, q.device());
+                    }
                 }
                 if matches!(mask, Some((_, MaskKind::Causal))) {
-                    return Tensor::Gpu(q.flash_attention_causal(k, v, scale));
+                    return Tensor::Gpu(q.flash_attention_causal(k_gpu, v_gpu, scale));
                 }
                 let gpu_mask = mask.map(|(m, _kind)| match m {
                     Tensor::Gpu(mask) => mask,
                     _ => panic!("Mask must be on the same device as other tensors"),
                 });
-                Tensor::Gpu(q.flash_attention(k, v, scale, gpu_mask))
+                Tensor::Gpu(q.flash_attention(k_gpu, v_gpu, scale, gpu_mask))
             }
             // CPU path and GPU+BatchKeyMask fallback - use composite operations via Tensor methods
             _ => self.flash_attention_composite_impl(k, v, scale, mask),
@@ -224,7 +236,7 @@ where
     }
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 fn tensor4_to_cpu<D>(tensor: &crate::gpu::Tensor<4, D>) -> Tensor<4, D>
 where
     D: SimdElement + DataType + Copy,
@@ -244,7 +256,7 @@ where
     Tensor::Cpu(crate::cpu::TypedTensor::from_slice(shape, &values))
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 fn tensor4_to_gpu<D>(tensor: Tensor<4, D>, device: &crate::gpu::Device) -> Tensor<4, D>
 where
     D: SimdElement + DataType + Copy,
@@ -267,7 +279,7 @@ where
     Tensor::Gpu(crate::gpu::Tensor::from_slice(device, shape, &values))
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 fn tensor2_to_cpu<D>(tensor: &crate::gpu::Tensor<2, D>) -> Tensor<2, D>
 where
     D: SimdElement + DataType + Copy,

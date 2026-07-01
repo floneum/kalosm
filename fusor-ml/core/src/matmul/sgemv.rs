@@ -9,9 +9,13 @@ pub(crate) fn dispatch_size(
     params: &SgemvParams,
 ) -> [u32; 3] {
     let total = m.div_ceil(params.chunk_size) * n * batch_size;
+    let max_workgroups_per_dimension = max_workgroups_per_dimension.max(1);
     let x = total.min(max_workgroups_per_dimension);
-    let y = total.div_ceil(x).min(max_workgroups_per_dimension);
-    let z = total.div_ceil(x * y);
+    let y = total
+        .div_ceil(x.max(1))
+        .min(max_workgroups_per_dimension)
+        .max(1);
+    let z = total.div_ceil(x.max(1) * y);
     [x, y, z]
 }
 

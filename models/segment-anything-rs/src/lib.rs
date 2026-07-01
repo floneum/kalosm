@@ -151,7 +151,7 @@ impl SegmentAnythingInferenceSettings {
     ///
     /// Coordinates are normalized to `[0, 1]` (0.5 is the middle of the image).
     /// Renamed from `add_goal_point` in 0.5 to flag the absolute-to-normalized
-    /// coordinate switch - old pixel-based callers should divide by image size.
+    /// coordinate switch; pixel-based callers should divide by image size.
     pub fn add_goal_point_normalized(mut self, x: impl Into<f64>, y: impl Into<f64>) -> Self {
         self.goal_points.push((x.into(), y.into()));
         self

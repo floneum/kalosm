@@ -5,6 +5,8 @@ use std::ops::Range;
 use crate::gpu::{DataType, StrideSpec};
 use crate::{Device, SimdElement, Tensor, cat};
 
+const GPU_CACHE_MIN_ALLOC_SEQ_LEN: usize = 256;
+
 /// A growable tensor cache.
 /// This cache manages tensor data with exponentially larger allocations as the sequence length increases.
 ///
@@ -127,9 +129,7 @@ where
             return;
         }
 
-        let new_allocated = required_seq_len
-            .next_power_of_two()
-            .min(self.max_sequence_len);
+        let new_allocated = gpu_allocation_seq_len(required_seq_len, self.max_sequence_len);
 
         let padded = if self.current_seq_len > 0
             && let Some(old) = self.backing.as_ref()
@@ -147,9 +147,10 @@ where
             let zeros = Tensor::zeros(device, pad_shape);
             cat([valid, zeros], self.concat_dim)
         } else {
-            // First allocation: build a real contiguous zero buffer. `zeros`
-            // (a stride-0 splat) cannot be used as an in-place target directly;
-            // `from_slice` produces a genuinely allocated buffer.
+            // First allocation: build a real contiguous backing buffer. `zeros`
+            // (a stride-0 splat) cannot be used as an in-place target directly.
+            // The valid slice is overwritten before it is exposed, so this does
+            // not need a CPU-filled zero upload.
             let shape: [usize; R] = std::array::from_fn(|i| {
                 if i == self.concat_dim {
                     new_allocated
@@ -157,9 +158,10 @@ where
                     v_shape[i]
                 }
             });
-            let len: usize = shape.iter().product();
-            let zeros = vec![D::default(); len];
-            Tensor::from_slice(device, shape, &zeros)
+            let Device::Gpu(gpu_device) = device else {
+                unreachable!("append_gpu only runs on GPU tensors");
+            };
+            Tensor::Gpu(crate::gpu::Tensor::uninit(gpu_device, shape))
         };
 
         self.backing = Some(padded);
@@ -296,5 +298,37 @@ where
     /// Get the current sequence length
     pub fn current_seq_len(&self) -> usize {
         self.current_seq_len
+    }
+}
+
+fn gpu_allocation_seq_len(required_seq_len: usize, max_sequence_len: usize) -> usize {
+    debug_assert!(required_seq_len <= max_sequence_len);
+
+    let min_alloc = GPU_CACHE_MIN_ALLOC_SEQ_LEN.min(max_sequence_len);
+    required_seq_len
+        .next_power_of_two()
+        .max(min_alloc)
+        .min(max_sequence_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GPU_CACHE_MIN_ALLOC_SEQ_LEN, gpu_allocation_seq_len};
+
+    #[test]
+    fn gpu_allocation_skips_small_decode_growth_cliffs() {
+        assert_eq!(GPU_CACHE_MIN_ALLOC_SEQ_LEN, 256);
+        assert_eq!(gpu_allocation_seq_len(1, 4096), 256);
+        assert_eq!(gpu_allocation_seq_len(64, 4096), 256);
+        assert_eq!(gpu_allocation_seq_len(65, 4096), 256);
+        assert_eq!(gpu_allocation_seq_len(256, 4096), 256);
+        assert_eq!(gpu_allocation_seq_len(257, 4096), 512);
+    }
+
+    #[test]
+    fn gpu_allocation_respects_short_contexts() {
+        assert_eq!(gpu_allocation_seq_len(1, 96), 96);
+        assert_eq!(gpu_allocation_seq_len(65, 96), 96);
+        assert_eq!(gpu_allocation_seq_len(96, 96), 96);
     }
 }

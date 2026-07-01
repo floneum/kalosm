@@ -82,6 +82,10 @@ pub(crate) enum NaryOp {
     Abs,
     ApproximateExp,
     LessApproximateExp,
+    /// Binary `a <= b` comparison producing 1/0 in the output type. Used for
+    /// index-dependent masking (e.g. composed causal attention compares the
+    /// kv position against the query position).
+    LessEqual,
     AddConst(NaryScalar),
     SubConst(NaryScalar),
     RSubConst(NaryScalar),
@@ -195,7 +199,7 @@ impl UnaryFunctionChain {
     }
 }
 
-/// Result of extracting a unary function chain from an NaryOperation.
+/// Result of extracting a unary function chain from an ElementwiseOperation.
 /// Used by the resolver to fuse unary ops into reduce/matmul/dequantize.
 pub(crate) struct ExtractedUnaryChain {
     pub(crate) value: crate::compute_graph::NodeIndex,
@@ -459,7 +463,7 @@ impl NaryExpr {
 /// N-ary operation combining multiple inputs with arbitrary operations.
 /// Can fuse chains of element-wise and pair-wise operations into a single kernel.
 #[derive(Clone, Debug)]
-pub(crate) struct NaryOperation {
+pub(crate) struct ElementwiseOperation {
     /// Input tensors (leaves of expression tree)
     pub(crate) inputs: Vec<NodeIndex>,
     /// Expression tree describing computation (includes all operations)
@@ -468,8 +472,8 @@ pub(crate) struct NaryOperation {
     pub(crate) output_datatype: DataTypeEnum,
 }
 
-impl NaryOperation {
-    /// Attempt to extract a unary function chain from this NaryOperation.
+impl ElementwiseOperation {
+    /// Attempt to extract a unary function chain from this ElementwiseOperation.
     /// This will only succeed if there is only a single input to the operation.
     pub(crate) fn try_extract_unary_chain(&self) -> Option<ExtractedUnaryChain> {
         if self.inputs.len() != 1 {
@@ -477,7 +481,7 @@ impl NaryOperation {
         }
 
         let mut functions = Vec::new();
-        if !Self::collect_unary_chain(&self.expression, &mut functions)? {
+        if !Self::collect_unary_chain(&self.expression, &mut functions, self.shape.len())? {
             return None;
         }
         if functions.is_empty() {
@@ -502,16 +506,28 @@ impl NaryOperation {
         })
     }
 
-    fn collect_unary_chain(expr: &NaryExpr, functions: &mut Vec<NaryFunction>) -> Option<bool> {
+    fn collect_unary_chain(
+        expr: &NaryExpr,
+        functions: &mut Vec<NaryFunction>,
+        rank: usize,
+    ) -> Option<bool> {
         match expr {
             NaryExpr::IndexedInput { input_idx, indices } => {
-                Some(*input_idx == 0 && NaryExpr::is_elementwise_indices(indices))
+                // The index list must cover the full output rank: a shorter
+                // prefix (e.g. a folded keepdim view reading a lower-rank
+                // input) is still pointwise but not shape-preserving, so it
+                // must not be treated as a fusible unary chain.
+                Some(
+                    *input_idx == 0
+                        && indices.len() == rank
+                        && NaryExpr::is_elementwise_indices(indices),
+                )
             }
             NaryExpr::Op { children, function } => {
                 if children.len() != 1 || function.input_types.len() != 1 {
                     return None;
                 }
-                if !Self::collect_unary_chain(&children[0], functions)? {
+                if !Self::collect_unary_chain(&children[0], functions, rank)? {
                     return Some(false);
                 }
                 functions.push(function.clone());
@@ -520,100 +536,9 @@ impl NaryOperation {
             NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => None,
         }
     }
-
-    /// Recognize a tile-IR-evaluatable expression over a paired-split pattern:
-    /// two of the inputs are the gate/up halves of a `q_mat_mul` output, and
-    /// any remaining inputs are per-column broadcast tensors (e.g. bias
-    /// vectors) accessed as `IndexedInput(k, [DimIndex(last_axis)])`. The
-    /// resolver uses this to auto-detect both the no-bias and biased FFN
-    /// patterns and synthesize a `PairedEpilogue` that captures the whole
-    /// expression.
-    pub(crate) fn try_extract_paired_split(&self) -> Option<ExtractedPairedSplit> {
-        if self.inputs.len() < 2 {
-            return None;
-        }
-        let output_rank = self.shape.len();
-        if !Self::expr_is_paired_evaluatable(&self.expression, output_rank) {
-            return None;
-        }
-        let mut input_seen = vec![false; self.inputs.len()];
-        Self::collect_input_usage_n(&self.expression, &mut input_seen, output_rank)?;
-        Some(ExtractedPairedSplit {
-            inputs: self.inputs.clone(),
-            inputs_seen: input_seen,
-            expression: self.expression.clone(),
-        })
-    }
-
-    /// An expression is paired-evaluatable when every input access is either
-    /// fully element-wise (matmul-view inputs: gate/up) or a single
-    /// `DimIndex(output_rank - 1)` access into a 1D broadcast tensor
-    /// (per-column extras: bias vectors). Other structures (DimIndex outside
-    /// IndexedInput leaves, non-trivial index arithmetic) block fusion.
-    fn expr_is_paired_evaluatable(expr: &NaryExpr, output_rank: usize) -> bool {
-        match expr {
-            NaryExpr::Op { children, .. } => children
-                .iter()
-                .all(|c| Self::expr_is_paired_evaluatable(c, output_rank)),
-            NaryExpr::IndexedInput { indices, .. } => {
-                NaryExpr::is_elementwise_indices(indices)
-                    || Self::is_last_dim_broadcast(indices, output_rank)
-            }
-            NaryExpr::Scalar(_) => true,
-            NaryExpr::DimIndex(_) => false,
-        }
-    }
-
-    /// `indices` describes a 1D-broadcast access whose only index is the
-    /// output's last-dim coordinate (e.g. `bias[col]` where `col` is the
-    /// kernel's output column). Bias vectors hit this branch.
-    fn is_last_dim_broadcast(indices: &[NaryExpr], output_rank: usize) -> bool {
-        if output_rank == 0 || indices.len() != 1 {
-            return false;
-        }
-        matches!(&indices[0], NaryExpr::DimIndex(d) if *d == output_rank - 1)
-    }
-
-    fn collect_input_usage_n(expr: &NaryExpr, seen: &mut [bool], output_rank: usize) -> Option<()> {
-        match expr {
-            NaryExpr::Op { children, .. } => {
-                for child in children {
-                    Self::collect_input_usage_n(child, seen, output_rank)?;
-                }
-                Some(())
-            }
-            NaryExpr::IndexedInput { input_idx, indices } => {
-                if *input_idx >= seen.len() {
-                    return None;
-                }
-                if !NaryExpr::is_elementwise_indices(indices)
-                    && !Self::is_last_dim_broadcast(indices, output_rank)
-                {
-                    return None;
-                }
-                seen[*input_idx] = true;
-                Some(())
-            }
-            NaryExpr::Scalar(_) => Some(()),
-            NaryExpr::DimIndex(_) => None,
-        }
-    }
 }
 
-/// Result of extracting a paired-split FFN pattern from an NaryOperation. The
-/// expression is preserved verbatim — the resolver re-emits it at the tile-IR
-/// level inside the qgemv kernel, substituting the actual `gate` / `up` /
-/// `extras...` tile values for each `IndexedInput` leaf.
-pub(crate) struct ExtractedPairedSplit {
-    pub(crate) inputs: Vec<NodeIndex>,
-    /// `inputs_seen[i]` is `true` if the captured expression references
-    /// `IndexedInput(i, ...)` anywhere. The resolver requires all inputs to
-    /// be used (unused inputs would point at dead graph nodes).
-    pub(crate) inputs_seen: Vec<bool>,
-    pub(crate) expression: NaryExpr,
-}
-
-impl Operation for NaryOperation {
+impl Operation for ElementwiseOperation {
     fn hash_kernel_fields(&self, state: &mut FxHasher) {
         self.expression.hash(state);
         self.shape.hash(state);

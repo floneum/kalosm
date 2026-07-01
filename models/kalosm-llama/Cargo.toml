@@ -30,6 +30,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1.0.139", optional = true }
 futures-util = { workspace = true }
 futures-channel = { workspace = true }
+web-time.workspace = true
 pollster = { version = "0.4", optional = true }
 regex = "1"
 tokenizers = { workspace = true, features = ["fancy-regex"], optional = true }
@@ -37,7 +38,7 @@ tokenizers = { workspace = true, features = ["fancy-regex"], optional = true }
 image = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.3", features = ["wasm_js"], optional = true }
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
 ahash = "0.8.12"
@@ -61,7 +62,7 @@ chat-template-json = ["minijinja/json"]
 hf-config-json = ["dep:serde_json"]
 vision = ["dep:image", "dep:pollster", "kalosm-language-model/media"]
 structured = ["dep:kalosm-sample", "kalosm-language-model/structured", "dep:rayon"]
-hf-tokenizer-json = ["dep:tokenizers", "dep:getrandom"]
+hf-tokenizer-json = ["dep:tokenizers"]
 
 [[example]]
 name = "structured"

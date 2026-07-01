@@ -40,9 +40,15 @@ impl Device {
 
     /// Create a new GPU device, blocking until ready.
     pub fn gpu_blocking() -> Result<Self, Error> {
-        #[cfg(feature = "gpu")]
+        #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
         {
             pollster::block_on(Self::gpu())
+        }
+        #[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+        {
+            Err(Error::msg(
+                "blocking GPU initialization is not supported on wasm; use Device::gpu().await",
+            ))
         }
         #[cfg(not(feature = "gpu"))]
         {
@@ -64,7 +70,7 @@ impl Device {
                     || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
                     || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some()
                 {
-                    eprintln!("fusor_device_auto_gpu_error={err}");
+                    tracing::warn!("fusor_device_auto_gpu_error={err}");
                 }
                 Device::Cpu
             }
@@ -89,6 +95,25 @@ impl Device {
         match self {
             Device::Gpu(d) => Some(d),
             _ => None,
+        }
+    }
+
+    /// Return a handle to the same device that reports no subgroup support, so
+    /// the no-subgroup kernel fallbacks (the browser's only path) are exercised.
+    /// A no-op for the CPU device.
+    pub fn without_subgroups(&self) -> Self {
+        match self {
+            Device::Cpu => Device::Cpu,
+            Device::Gpu(d) => Device::Gpu(d.without_subgroups()),
+        }
+    }
+
+    /// Return a handle whose tensor allocations poison kernel-output buffers,
+    /// reproducing the app's reused buffer pool. A no-op for the CPU device.
+    pub fn with_poisoned_allocations(&self) -> Self {
+        match self {
+            Device::Cpu => Device::Cpu,
+            Device::Gpu(d) => Device::Gpu(d.with_poisoned_allocations()),
         }
     }
 }

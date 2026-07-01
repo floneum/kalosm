@@ -1,9 +1,10 @@
 //! Quantized matrix multiply program kernels.
 
-use fusor_tile_ir::tile::{range, Program, Storage};
-use fusor_tile_ir::{QuantizedMatrix, ScalarElement, WorkgroupAxis};
+use fusor_tile_ir::tile::{range, Program, Storage, Tile};
+use fusor_tile_ir::{CoopMatrixToken, QuantizedMatrix, ScalarElement, WorkgroupAxis};
 
 use crate::{
+    dispatch::SubgroupConfig,
     kernels::helpers::{
         coop_acc_grid, coop_acc_grid_set_c, coop_load_a_fragments, coop_load_b_fragments,
         coop_mma_grid, coop_store_acc_grid, load_qmatmul_extra,
@@ -27,20 +28,39 @@ use crate::{
 ///     let a = program.storage_read(ElementType::F32, Shape::new([8, 256]));
 ///     let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 16);
 ///     let y = program.storage_write(ElementType::F32, Shape::new([8, 16]));
-///     qmatmul_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 64, 64);
+///     let subgroup = fusor_tile_ir::SubgroupToken::new_unchecked();
+///     qmatmul_with_epilogue(
+///         program,
+///         &a,
+///         &b,
+///         &y,
+///         &QmatmulEpilogues::empty(),
+///         fusor_tile_ir::CoopMatrixToken::new_unchecked(),
+///         fusor_tile_ir_kernels::SubgroupConfig::fixed(subgroup, 32),
+///         64,
+///         64,
+///         32,
+///     );
 /// });
 /// # let _ = ir;
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub fn qmatmul_with_epilogue(
     program: &mut Program,
     a: &Storage,
     b: &QuantizedMatrix,
     y: &Storage,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
+    coop: CoopMatrixToken,
+    subgroups: SubgroupConfig,
     bm: u32,
     bn: u32,
+    bk: u32,
 ) {
-    assert!(bm > 0 && bn > 0, "qmatmul tile shape must be non-zero");
+    assert!(
+        bm > 0 && bn > 0 && bk > 0,
+        "qmatmul tile shape must be non-zero"
+    );
     let [m, k] = matrix_shape(a.layout());
     let [y_m, y_n] = matrix_shape(y.layout());
     assert_eq!(k, b.rows, "qmatmul K dimensions must match");
@@ -48,9 +68,9 @@ pub fn qmatmul_with_epilogue(
     assert_eq!(b.cols, y_n, "qmatmul output column count must match B");
 
     if m == 1 {
-        super::qgemv::qgemv_with_epilogue(program, a, b, y, 1, epilogues);
+        super::qgemv::qgemv_with_epilogue(program, a, b, y, 1, subgroups, epilogues);
     } else {
-        qmatmul_tile_with_epilogue(program, a, b, y, epilogues, bm, bn);
+        qmatmul_tile_with_epilogue(program, a, b, y, epilogues, coop, subgroups, bm, bn, bk);
     }
 }
 
@@ -58,31 +78,49 @@ pub fn qmatmul_with_epilogue(
 /// so downstream crates can reproduce or replace the variant-selection layer
 /// above (`qmatmul_options_with_epilogue` / `qmatmul_with_epilogue`).
 ///
-/// The (bm, bn) argument only drives the cooperative fast-path selection.
+/// The (bm, bn, bk) argument only drives the cooperative fast-path selection.
 /// If coop is unsupported or epilogues are non-empty, falls back to a fixed
 /// 8x4x8 scalar tile that's small enough to always fit `LANES=256`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn qmatmul_tile_with_epilogue(
     program: &mut Program,
     a: &Storage,
     b: &QuantizedMatrix,
     y: &Storage,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
+    coop: CoopMatrixToken,
+    subgroups: SubgroupConfig,
     bm: u32,
     bn: u32,
+    bk: u32,
 ) {
     const LANES: u32 = 256;
     // Scalar fallback tile (8 * 4 * 8 == 256 == LANES).
     const SCALAR_BM: u32 = 8;
     const SCALAR_BN: u32 = 4;
     const SCALAR_BK: u32 = 8;
-    assert!(bm > 0 && bn > 0, "qmatmul tile shape must be non-zero");
+    assert!(
+        bm > 0 && bn > 0 && bk > 0,
+        "qmatmul tile shape must be non-zero"
+    );
     let [m, k] = matrix_shape(a.layout());
 
     if epilogues.pre.is_none()
         && epilogues.pre_with_extras.is_none()
         && epilogues.post.is_none()
         && epilogues.post_with_extras.is_none()
-        && qmatmul_try_coop(program, a, b, epilogues.post_acc_init_col_vector, y, bm, bn)
+        && qmatmul_try_coop(
+            program,
+            a,
+            b,
+            epilogues.post_acc_init_col_vector,
+            y,
+            coop,
+            subgroups,
+            bm,
+            bn,
+            bk,
+        )
     {
         return;
     }
@@ -101,10 +139,10 @@ pub(crate) fn qmatmul_tile_with_epilogue(
             let col = program.program_id(WorkgroupAxis::X) * SCALAR_BN + col_lane;
             let [partial] = program.fold(
                 range(k_iterations),
-                [program.f32(0.0)],
+                [Tile::f32(0.0)],
                 |program, loop_index, [acc]| {
                     let k_index = loop_index * SCALAR_BK + k_lane.clone();
-                    let mask = row.lt(m).and(col.lt(b.cols)).and(k_index.lt(k));
+                    let mask = row.lt(m) & col.lt(b.cols) & k_index.lt(k);
                     let loaded = program.load(a.at((&row, &k_index)), mask.clone(), 0.0);
                     let pre_extras = epilogues
                         .pre_extra_inputs
@@ -123,7 +161,7 @@ pub(crate) fn qmatmul_tile_with_epilogue(
                 .map(|extra| load_qmatmul_extra(program, extra, &row, &col, b.cols))
                 .collect::<Vec<_>>();
             let sum = apply_qmatmul_post_epilogue(epilogues, reduced, extras);
-            let store_mask = k_lane.eq(0).and(row.lt(m)).and(col.lt(b.cols));
+            let store_mask = k_lane.eq(0) & row.lt(m) & col.lt(b.cols);
             program.store(y.at((row, col)), sum, store_mask);
         },
     );
@@ -132,47 +170,59 @@ pub(crate) fn qmatmul_tile_with_epilogue(
 /// Emit the cooperative-matrix qmatmul body when the requested tile shape
 /// matches a supported fast tile geometry. All branches instantiate the same
 /// runtime body; only the tile dimensions differ.
-/// `(bm, bn, bk, row_groups, col_groups, block)` for the supported coop-matrix
-/// tile geometries. BK is pinned to 32 by the cooperative-matrix MMA shape
-/// (8x8x8 along K, 4 lanes per subgroup).
-const QMATMUL_COOP_TILE_TABLE: &[(u32, u32, u32, u32, u32, u32)] = &[
-    (64, 32, 32, 2, 1, 64),
-    (64, 64, 32, 2, 2, 128),
-    (64, 128, 32, 2, 4, 256),
-    (128, 64, 32, 4, 2, 256),
-    (128, 128, 32, 4, 4, 512),
+/// `(bm, bn, bk, row_groups, col_groups)` for the supported coop-matrix
+/// tile geometries. Current quantized fast tiles all use BK=32.
+const QMATMUL_COOP_TILE_TABLE: &[(u32, u32, u32, u32, u32)] = &[
+    (64, 32, 32, 2, 1),
+    (64, 64, 32, 2, 2),
+    (64, 128, 32, 2, 4),
+    (128, 64, 32, 4, 2),
+    (128, 128, 32, 4, 4),
 ];
 
-/// Try the cooperative-matrix fast path for the requested `(bm, bn)` tile.
+/// Try the cooperative-matrix fast path for the requested `(bm, bn, bk)` tile.
 /// `acc_init` is the optional rank-1 column vector seeding the accumulator
 /// before the K-loop (the "preloaded C" path). The `block` workgroup size is a
 /// runtime `u32` threaded straight into `qmatmul_coop` — no const-generic
-/// monomorphization, no `match block` fan-out (ARBOR_DESIGN.md §5, Appendix A).
+/// monomorphization and no `match block` fan-out.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn qmatmul_try_coop(
     program: &mut Program,
     a: &Storage,
     b: &QuantizedMatrix,
     acc_init: Option<&Storage>,
     y: &Storage,
+    coop: CoopMatrixToken,
+    subgroups: SubgroupConfig,
     bm: u32,
     bn: u32,
+    bk: u32,
 ) -> bool {
-    let Some(&(_, _, bk, row_groups, col_groups, block)) = QMATMUL_COOP_TILE_TABLE
+    if std::env::var_os("FUSOR_DIAG_DISABLE_COOP").is_some() {
+        return false;
+    }
+    if b.format.is_q4k_family() || b.format.is_q6k_family() {
+        return false;
+    }
+    if !subgroups.is_fixed() {
+        return false;
+    }
+    let Some(&(_, _, table_bk, row_groups, col_groups)) = QMATMUL_COOP_TILE_TABLE
         .iter()
-        .find(|&&(m, n, ..)| (m, n) == (bm, bn))
+        .find(|&&(m, n, candidate_bk, ..)| (m, n, candidate_bk) == (bm, bn, bk))
     else {
         return false;
     };
     let [m, k] = matrix_shape(a.layout());
     if !m.is_multiple_of(bm)
         || !b.cols.is_multiple_of(bn)
-        || !k.is_multiple_of(bk)
+        || !k.is_multiple_of(table_bk)
         || !cooperative_store_layout_supported(y.layout())
     {
         return false;
     }
     qmatmul_coop(
-        program, a, b, acc_init, y, bm, bn, bk, row_groups, col_groups, block,
+        program, a, b, acc_init, y, coop, bm, bn, table_bk, row_groups, col_groups, subgroups,
     );
     true
 }
@@ -180,12 +230,9 @@ pub(crate) fn qmatmul_try_coop(
 /// Cooperative-matrix qmatmul body. Each workgroup produces one BMxBN output
 /// tile via an interleaved `ROW_GROUPS x COL_GROUPS` grid of subgroups, each
 /// holding `(32*32)/(8*8)` = 16 cooperative-matrix accumulators.
-/// `block == ROW_GROUPS * COL_GROUPS * 32`.
 ///
-/// `acc_init` folds into the accumulator's initial value (Appendix A.2): when
-/// `Some`, each accumulator is seeded with the broadcast C-role fragment from
-/// the column vector instead of zero — replacing the separate
-/// `coop_load_c_broadcast` + `coop_set_c` pass of the old `*_acc_init` body.
+/// When `acc_init` is `Some`, each accumulator is seeded with the broadcast
+/// C-role fragment from the column vector instead of zero.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qmatmul_coop(
     program: &mut Program,
@@ -193,20 +240,21 @@ pub(crate) fn qmatmul_coop(
     b: &QuantizedMatrix,
     acc_init: Option<&Storage>,
     y: &Storage,
+    coop: CoopMatrixToken,
     bm: u32,
     bn: u32,
     bk: u32,
     row_groups: u32,
     col_groups: u32,
-    block: u32,
+    subgroups: SubgroupConfig,
 ) {
     const COOP_DIM: u32 = 8;
-    const SUBGROUP_SIZE: u32 = 32;
     const SUBGROUP_ROWS: u32 = 32;
     const SUBGROUP_COLS: u32 = 32;
+    let subgroup = subgroups.token();
+    let block = subgroups.block_for_subgroups(row_groups * col_groups);
     debug_assert_eq!(row_groups * SUBGROUP_ROWS, bm);
     debug_assert_eq!(col_groups * SUBGROUP_COLS, bn);
-    debug_assert_eq!(row_groups * col_groups * SUBGROUP_SIZE, block);
 
     let [m, k] = matrix_shape(a.layout());
     let n = b.cols;
@@ -224,7 +272,7 @@ pub(crate) fn qmatmul_coop(
     program.program_grid(block, [n_grid_x, n_grid_y, 1], |program| {
         let row_base = program.program_id(WorkgroupAxis::Y) * bm;
         let col_base = program.program_id(WorkgroupAxis::X) * bn;
-        let subgroup_id = program.subgroup_id();
+        let subgroup_id = subgroup.subgroup_id(program);
         let sg_row = subgroup_id.clone() / col_groups;
         let sg_col = subgroup_id % col_groups;
         let sg_row_base = sg_row * SUBGROUP_ROWS;
@@ -233,15 +281,19 @@ pub(crate) fn qmatmul_coop(
         let accs = match acc_init {
             None => coop_acc_grid(
                 program,
+                coop,
                 ScalarElement::F32,
                 TILE_ROWS_PER_SG,
                 TILE_COLS_PER_SG,
-                |program, _, _| program.coop_zero(ScalarElement::F32, COOP_DIM, COOP_DIM),
+                |program, coop, _, _| {
+                    coop.coop_zero(program, ScalarElement::F32, COOP_DIM, COOP_DIM)
+                },
             ),
             Some(init) => {
                 let acc_init_col_base = col_base.clone() + sg_col_base.clone();
                 coop_acc_grid_set_c(
                     program,
+                    coop,
                     init,
                     &acc_init_col_base,
                     ScalarElement::F32,
@@ -261,6 +313,7 @@ pub(crate) fn qmatmul_coop(
             for kk in 0..kk_steps {
                 let a_frags = coop_load_a_fragments(
                     program,
+                    coop,
                     &a_tile,
                     &sg_row_base,
                     kk,
@@ -269,19 +322,21 @@ pub(crate) fn qmatmul_coop(
                 );
                 let b_frags = coop_load_b_fragments(
                     program,
+                    coop,
                     &b_tile,
                     &sg_col_base,
                     kk,
                     TILE_COLS_PER_SG,
                     ScalarElement::F32,
                 );
-                coop_mma_grid(program, &accs, &a_frags, &b_frags);
+                coop_mma_grid(program, coop, &accs, &a_frags, &b_frags);
             }
             program.workgroup_barrier();
         });
 
         coop_store_acc_grid(
             program,
+            coop,
             &accs,
             y,
             None,

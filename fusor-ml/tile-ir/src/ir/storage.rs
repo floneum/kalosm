@@ -13,9 +13,8 @@ pub enum BufferAccess {
 }
 
 /// A storage buffer declaration. Owned by the nodes that name it via an
-/// [`Rc`]; `binding` is the single externally-meaningful name (see
-/// ARBOR_DESIGN.md §3). A declaration *is* its identity — there is no
-/// `BufferId`; sharing is `Rc` identity (`Rc::as_ptr`).
+/// [`Rc`]; `binding` is the single externally meaningful name. A declaration
+/// is its identity; sharing is `Rc` identity (`Rc::as_ptr`).
 #[derive(Debug)]
 pub struct BufferDecl {
     /// Binding slot — the one externally-meaningful name.

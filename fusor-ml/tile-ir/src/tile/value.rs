@@ -1,13 +1,12 @@
-use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Rem, Sub};
+use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Rem, Shl, Shr, Sub};
 
 use crate::ir::{
     Builtin, ElementType, Expr, ExprKind, Local, ScalarElement, StorageView, Tile as TileDeclRc,
     TileBinaryOp, TileCompareOp, TileLiteral, TileUnaryOp,
 };
 
-/// A rank-1-per-lane tile value. Runtime-typed (ARBOR_DESIGN.md §2): the
-/// element type travels in the IR (`Expr::element()`), not in a Rust marker
-/// type. `Clone` is an `Rc` bump on the inner `Expr`.
+/// A rank-1-per-lane tile value. The element type travels in the IR
+/// (`Expr::element()`). `Clone` is an `Rc` bump on the inner `Expr`.
 #[derive(Clone)]
 pub struct Tile {
     pub(super) expr: Expr,
@@ -31,13 +30,8 @@ impl Tile {
         self.expr.element()
     }
 
-    /// Borrow the underlying IR expression.
-    pub fn expr(&self) -> &Expr {
-        &self.expr
-    }
-
     /// Consume and return the underlying IR expression.
-    pub fn into_expr(self) -> Expr {
+    pub(crate) fn into_expr(self) -> Expr {
         self.expr
     }
 
@@ -72,15 +66,10 @@ impl Tile {
         Self::new(ExprKind::Builtin(builtin), ElementType::U32)
     }
 
-    /// The structural hash powering `signature_hash` / the kernel cache key.
-    /// O(1) — read from the cached bottom-up hash on the node.
-    pub fn structural_hash(&self) -> u64 {
-        self.expr.structural_hash()
-    }
-
-    /// Alias retained for the cache-key call sites that named it `signature_hash`.
+    /// Structural hash of the underlying expression — powers the kernel cache
+    /// key. O(1): reads the cached bottom-up hash on the node.
     pub fn signature_hash(&self) -> u64 {
-        self.structural_hash()
+        self.expr.structural_hash()
     }
 
     /// Apply a unary op, preserving the operand element type.
@@ -206,7 +195,7 @@ impl Tile {
         self.unary(TileUnaryOp::InverseSqrt)
     }
     /// Arithmetic negation.
-    pub fn neg_unary(self) -> Self {
+    pub(crate) fn neg_unary(self) -> Self {
         self.unary(TileUnaryOp::Neg)
     }
     /// Sigmoid `1 / (1 + exp(-x))`.
@@ -236,19 +225,7 @@ impl Tile {
         Self::select(condition, self, zero)
     }
 
-    // ---- u32 bit ops ----
-    /// Bitwise or.
-    pub fn bit_or(self, rhs: impl Into<Tile>) -> Self {
-        self.binary(TileBinaryOp::BitOr, rhs.into())
-    }
-    /// Logical shift right (for u32 lanes).
-    pub fn shift_right(self, rhs: impl Into<Tile>) -> Self {
-        self.binary(TileBinaryOp::Shr, rhs.into())
-    }
-    /// Shift left (for u32 lanes).
-    pub fn shift_left(self, rhs: impl Into<Tile>) -> Self {
-        self.binary(TileBinaryOp::Shl, rhs.into())
-    }
+    // u32 bit ops are the `&` `|` `^` `<<` `>>` operators (see impls below).
     /// Unpack a `u32` lane holding two packed f16 values into a `vec2<f32>`
     /// (lane 0 = low half, lane 1 = high half).
     pub fn unpack2x16float(self) -> Self {
@@ -261,17 +238,9 @@ impl Tile {
         )
     }
     // ---- bool ops ----
-    /// A statically-true mask (`Bool(true)`).
+    /// A statically-true mask (`Bool(true)`) — i.e. all lanes active.
     pub fn all() -> Mask {
         Self::bool(true)
-    }
-    /// Logical and.
-    pub fn and(self, rhs: impl Into<Tile>) -> Self {
-        self.binary(TileBinaryOp::LogicalAnd, rhs.into())
-    }
-    /// Logical or.
-    pub fn or(self, rhs: impl Into<Tile>) -> Self {
-        self.binary(TileBinaryOp::LogicalOr, rhs.into())
     }
 }
 
@@ -298,22 +267,6 @@ impl From<u32> for Tile {
 impl From<&u32> for Tile {
     fn from(value: &u32) -> Self {
         Self::u32(*value)
-    }
-}
-
-impl From<i32> for Tile {
-    fn from(value: i32) -> Self {
-        assert!(
-            value >= 0,
-            "negative integer literal cannot become a u32 tile"
-        );
-        Self::u32(value as u32)
-    }
-}
-
-impl From<usize> for Tile {
-    fn from(value: usize) -> Self {
-        Self::u32(value as u32)
     }
 }
 
@@ -348,14 +301,47 @@ macro_rules! impl_tile_binary {
     };
 }
 
+macro_rules! impl_tile_mask_or_bitwise {
+    ($trait:ident, $method:ident, $logical:expr, $bitwise:expr) => {
+        impl<Rhs> $trait<Rhs> for Tile
+        where
+            Rhs: Into<Tile>,
+        {
+            type Output = Tile;
+            fn $method(self, rhs: Rhs) -> Self::Output {
+                let rhs = rhs.into();
+                let lhs_element = self.element();
+                let rhs_element = rhs.element();
+                let op = if lhs_element == ElementType::Bool || rhs_element == ElementType::Bool {
+                    assert!(
+                        lhs_element == ElementType::Bool && rhs_element == ElementType::Bool,
+                        "boolean tile operators require both operands to be Bool",
+                    );
+                    $logical
+                } else {
+                    $bitwise
+                };
+                self.binary(op, rhs)
+            }
+        }
+    };
+}
+
 impl_tile_binary!(Add, add, TileBinaryOp::Add);
 impl_tile_binary!(Sub, sub, TileBinaryOp::Sub);
 impl_tile_binary!(Mul, mul, TileBinaryOp::Mul);
 impl_tile_binary!(Div, div, TileBinaryOp::Div);
 impl_tile_binary!(Rem, rem, TileBinaryOp::Rem);
-impl_tile_binary!(BitAnd, bitand, TileBinaryOp::BitAnd);
-impl_tile_binary!(BitOr, bitor, TileBinaryOp::BitOr);
+impl_tile_mask_or_bitwise!(
+    BitAnd,
+    bitand,
+    TileBinaryOp::LogicalAnd,
+    TileBinaryOp::BitAnd
+);
+impl_tile_mask_or_bitwise!(BitOr, bitor, TileBinaryOp::LogicalOr, TileBinaryOp::BitOr);
 impl_tile_binary!(BitXor, bitxor, TileBinaryOp::BitXor);
+impl_tile_binary!(Shl, shl, TileBinaryOp::Shl);
+impl_tile_binary!(Shr, shr, TileBinaryOp::Shr);
 
 /// A private per-invocation local, runtime-typed. Holds the `Rc<LocalDecl>`;
 /// `clone` is an `Rc` bump.
@@ -437,10 +423,9 @@ impl Address {
         // A dense storage load produces the buffer's element type verbatim: a
         // load from a vector buffer is a vector value, a scalar buffer a scalar.
         let element = self.view.buffer.element;
-        // For a vector buffer the masked-out fill must itself be a vector, so
-        // compose the scalar fill literal across all lanes (the old builder did
-        // this inline). The lowerer's `cast_tile_value` does a scalar cast, not
-        // a splat, so the fill has to arrive pre-composed.
+        // For a vector buffer the masked-out fill must itself be a vector. The
+        // lowerer's `cast_tile_value` does a scalar cast, not a splat, so the
+        // fill has to arrive pre-composed.
         let fill = match element {
             ElementType::Vector { scalar, lanes } => {
                 let scalar_element = scalar.element();
@@ -487,13 +472,27 @@ impl Address {
     }
 }
 
-/// Default fill expression for a given scalar element (the zero of that type).
-pub(super) fn zero_fill(element: ScalarElement) -> Expr {
-    let literal = match element {
-        ScalarElement::F32 => TileLiteral::f32(0.0),
-        ScalarElement::F16 => TileLiteral::F16(0),
-        ScalarElement::U32 => TileLiteral::U32(0),
-        ScalarElement::Bool => TileLiteral::Bool(false),
+/// The zero value of `element` as an IR expression: a typed zero literal, or a
+/// vector of zero literals for a vector element.
+pub(super) fn zero_expr(element: ElementType) -> Expr {
+    let kind = match element {
+        ElementType::F32 => ExprKind::Literal(TileLiteral::f32(0.0)),
+        ElementType::F16 => ExprKind::Literal(TileLiteral::F16(0)),
+        ElementType::U32 => ExprKind::Literal(TileLiteral::U32(0)),
+        ElementType::Bool => ExprKind::Literal(TileLiteral::Bool(false)),
+        ElementType::Vector { scalar, lanes } => {
+            let part = zero_expr(scalar.element());
+            let parts = (0..lanes).map(|_| part.clone()).collect();
+            return Expr::new(
+                ExprKind::Vec {
+                    scalar,
+                    lanes,
+                    parts,
+                },
+                element,
+            );
+        }
+        ElementType::CoopMatrix { .. } => panic!("cannot zero a cooperative-matrix value"),
     };
-    Expr::new(ExprKind::Literal(literal), element.element())
+    Expr::new(kind, element)
 }

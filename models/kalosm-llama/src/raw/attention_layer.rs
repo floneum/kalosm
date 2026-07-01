@@ -165,7 +165,11 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
         }
 
         let up_result = self.activation(x);
-        let up = up_result.q_mat_mul_add2(&self.down, first, second);
+        // Residual adds authored in natural graph form: the resolver folds both
+        // `add`s into the qmatmul post epilogue (one dispatch on decode).
+        let projected = up_result.q_mat_mul(&self.down);
+        let with_first = (&projected + first).to_concrete();
+        let up = (&with_first + second).to_concrete();
         Some(up.cast())
     }
 
@@ -179,7 +183,16 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
 
         match &self.gate_up {
             Some(gate_up) if self.gate_bias.is_none() && self.up_bias.is_none() => {
-                x_f32.q_mat_mul_paired_silu_product(gate_up)
+                // SwiGLU split/gate authored in natural graph form: the resolver
+                // folds `silu(gate) * up` over the two narrow halves into the
+                // qmatmul accumulator-offset epilogue (one dispatch on decode).
+                let pair_len = gate_up.shape()[0] / 2;
+                let projected = x_f32.q_mat_mul(gate_up);
+                let gate = projected.narrow(D::Minus1, 0, pair_len).to_concrete();
+                let up = projected
+                    .narrow(D::Minus1, pair_len, pair_len)
+                    .to_concrete();
+                (gate.silu() * up).to_concrete()
             }
             Some(gate_up) => {
                 let gate_width = self.gate.shape()[0];
@@ -233,14 +246,17 @@ pub struct AttentionBias<F: FloatDataType + SimdElement = f32> {
     bias_q: Tensor<1, F>,
     bias_k: Tensor<1, F>,
     bias_v: Tensor<1, F>,
+    bias_qkv: Tensor<1, F>,
 }
 
-impl<F: FloatDataType + SimdElement> AttentionBias<F> {
+impl<F: FloatDataType + SimdElement + Default> AttentionBias<F> {
     pub fn new(q: Tensor<1, F>, k: Tensor<1, F>, v: Tensor<1, F>) -> Self {
+        let bias_qkv = fusor::cat([q.clone(), k.clone(), v.clone()], 0).to_concrete();
         Self {
             bias_q: q,
             bias_k: k,
             bias_v: v,
+            bias_qkv,
         }
     }
 }
@@ -284,15 +300,14 @@ where
             let query_width = num_heads * head_dim;
             let key_width = num_key_value_heads * head_dim;
             let value_width = key_width;
-            let qkv = hidden_f32.q_mat_mul(attention_qkv);
+            let mut qkv = hidden_f32.q_mat_mul(attention_qkv);
+            if let Some(bias) = &self.bias {
+                let bias_f32: Tensor<1, f32> = bias.bias_qkv.cast();
+                qkv = qkv.add_(&bias_f32);
+            }
 
             let query_states: Tensor<4, F> = {
-                let mut query_states = qkv.narrow(D::Minus1, 0, query_width).to_concrete();
-
-                if let Some(bias) = &self.bias {
-                    let bias_f32: Tensor<1, f32> = bias.bias_q.cast();
-                    query_states = query_states.add_(&bias_f32);
-                }
+                let query_states = qkv.narrow(D::Minus1, 0, query_width).to_concrete();
 
                 let query = query_states
                     .reshape([b_sz, seq_len, num_heads, head_dim])
@@ -308,12 +323,7 @@ where
             };
 
             let key_states: Tensor<4, F> = {
-                let mut key_states = qkv.narrow(D::Minus1, query_width, key_width).to_concrete();
-
-                if let Some(bias) = &self.bias {
-                    let bias_f32: Tensor<1, f32> = bias.bias_k.cast();
-                    key_states = key_states.add_(&bias_f32);
-                }
+                let key_states = qkv.narrow(D::Minus1, query_width, key_width).to_concrete();
 
                 let key = key_states
                     .reshape([b_sz, seq_len, num_key_value_heads, head_dim])
@@ -329,14 +339,9 @@ where
             };
 
             let value_states: Tensor<4, F> = {
-                let mut value_states = qkv
+                let value_states = qkv
                     .narrow(D::Minus1, query_width + key_width, value_width)
                     .to_concrete();
-
-                if let Some(bias) = &self.bias {
-                    let bias_f32: Tensor<1, f32> = bias.bias_v.cast();
-                    value_states = value_states.add_(&bias_f32);
-                }
 
                 value_states
                     .reshape([b_sz, seq_len, num_key_value_heads, head_dim])

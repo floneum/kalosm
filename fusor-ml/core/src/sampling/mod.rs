@@ -1,15 +1,16 @@
-use crate::{Device, tensor::TensorData};
+use crate::{Device, Tensor, tensor::TensorData};
 
 mod mirostat;
 mod pipeline;
 pub(crate) mod processors;
-mod qmat_topk;
+pub(crate) mod row_kernels;
+mod standard_sampler;
 mod topk;
 
 #[cfg(test)]
 mod tests;
 
-pub(crate) use pipeline::{mirostat2_sample_token_to_host, qmat_mirostat2_sample_token_to_host};
+pub(crate) use pipeline::{GpuSamplerRequest, sample_token_pending, sample_token_to_host};
 pub(crate) use topk::{
     MergeSortedChunkTopKParams, chunk_top_k_pair_data_with_encoder,
     merge_sorted_chunk_top_k_pair_data_with_encoder,
@@ -23,6 +24,64 @@ pub(crate) const GPU_SAMPLE_RESULT_WORDS: usize = 2;
 pub(crate) const GPU_SAMPLE_STATUS_RETRY_NEEDED: u32 = 0;
 pub(crate) const GPU_SAMPLE_STATUS_SAMPLED: u32 = 1;
 pub(crate) const GPU_SAMPLE_STATUS_INVALID: u32 = 2;
+
+pub struct PendingGpuSampledToken {
+    token: Tensor,
+    download: wgpu::Buffer,
+    receiver: futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+impl PendingGpuSampledToken {
+    pub(crate) fn new(
+        token: Tensor,
+        download: wgpu::Buffer,
+        receiver: futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    ) -> Self {
+        Self {
+            token,
+            download,
+            receiver,
+        }
+    }
+
+    pub fn token_tensor(&self) -> &Tensor {
+        &self.token
+    }
+
+    pub async fn read_token(self) -> Result<Option<u32>, wgpu::BufferAsyncError> {
+        // Diagnostic: time the wait for GPU completion + token readback (the
+        // per-token sync the pending decode path stalls on). On wasm this is
+        // always on; native gates on the FUSOR_TRACE_* env vars.
+        let trace = cfg!(target_arch = "wasm32")
+            || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+            || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
+        let await_start = trace.then(web_time::Instant::now);
+        self.receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
+        if let Some(start) = await_start {
+            tracing::info!("sampler_trace pending_await elapsed={:?}", start.elapsed());
+        }
+
+        let view = self.download.slice(..).get_mapped_range();
+        let word_size = std::mem::size_of::<u32>();
+        let status = view
+            .get(..word_size)
+            .map(bytemuck::from_bytes::<u32>)
+            .copied()
+            .unwrap_or(GPU_SAMPLE_STATUS_INVALID);
+        let token = view
+            .get(word_size..word_size * GPU_SAMPLE_RESULT_WORDS)
+            .map(bytemuck::from_bytes::<u32>)
+            .copied()
+            .unwrap_or_default();
+        drop(view);
+        self.download.unmap();
+
+        match status {
+            GPU_SAMPLE_STATUS_SAMPLED => Ok(Some(token)),
+            _ => Ok(None),
+        }
+    }
+}
 
 pub(crate) fn min_top_k_candidates_per_chunk() -> usize {
     std::env::var("FUSOR_TOP_K_MIN_CANDIDATES_PER_CHUNK")
@@ -40,6 +99,16 @@ pub struct GpuMirostat2SamplerParams {
     pub repetition_penalty: f32,
     pub tau: f32,
     pub eta: f32,
+    pub random: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GpuStandardSamplerParams {
+    pub top_k: usize,
+    pub temperature: f32,
+    pub repetition_penalty: f32,
+    pub top_p: f32,
+    pub min_p: f32,
     pub random: f32,
 }
 

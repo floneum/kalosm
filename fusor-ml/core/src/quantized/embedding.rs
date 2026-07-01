@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
@@ -157,11 +159,13 @@ fn u32_layout_2d(layout: &crate::Layout) -> Option<(u32, tile_ir::Layout)> {
     if shape.len() != 2 || strides.len() != 2 {
         return None;
     }
+    let rows = u32::try_from(shape[0]).ok()?.max(1);
+    let cols = u32::try_from(shape[1]).ok()?.max(1);
     Some((
         offset,
         tile_ir::Layout::strided(
             tile_ir::MemoryLevel::Storage,
-            tile_ir::Shape::new([shape[0].try_into().ok()?, shape[1].try_into().ok()?]),
+            tile_ir::Shape::new([rows, cols]),
             &[strides[0].try_into().ok()?, strides[1].try_into().ok()?],
         ),
     ))
@@ -174,17 +178,26 @@ fn u32_index_layout(layout: &crate::Layout) -> Option<(u32, tile_ir::Layout)> {
     if shape.len() != 1 || strides.len() != 1 {
         return None;
     }
+    let len = u32::try_from(shape[0]).ok()?.max(1);
     Some((
         offset,
         tile_ir::Layout::strided(
             tile_ir::MemoryLevel::Storage,
-            tile_ir::Shape::new([1, shape[0].try_into().ok()?]),
+            tile_ir::Shape::new([1, len]),
             &[0, strides[0].try_into().ok()?],
         ),
     ))
 }
 
 impl Operation for QEmbeddingOperation {
+    fn hash_kernel_fields(&self, state: &mut rustc_hash::FxHasher) {
+        self.matrix.datatype().hash(state);
+        self.matrix.storage_layout().hash(state);
+        self.matrix.shape().hash(state);
+        self.out_shape.hash(state);
+        self.datatype.hash(state);
+    }
+
     fn workgroup_shape_constraints(&self, _device: &Device) -> WorkgroupShapeConstraints {
         let mut constraints = WorkgroupShapeConstraints::new();
         constraints.add_constraint(0, Constraint::equals(BLOCK as u32));
@@ -315,7 +328,13 @@ impl QMatrix {
         self.index_select_rows_to(indexes, DataTypeEnum::F32)
     }
 
+    /// Row gather in its composed form: an elementwise read of the quantized
+    /// table at `[indexes[i], j]`. The resolver recognizes the canonical
+    /// cluster and routes it to the block-amortized embedding kernel for
+    /// quantized tables; dense-storage tables read directly.
     pub fn index_select_rows_to(&self, indexes: &Tensor, datatype: DataTypeEnum) -> Tensor {
+        use crate::nary_wise::{ElementwiseOperation, NaryExpr, NaryFunction, NaryOp};
+
         indexes.assert_rank::<1>();
         indexes.assert_datatype::<u32>();
         assert_eq!(
@@ -324,25 +343,51 @@ impl QMatrix {
             "quantized row index_select requires a 2D table, got {}D",
             self.shape.len()
         );
-        if matches!(self.datatype, GgmlType::F32 | GgmlType::F16) {
-            let dense = if datatype == DataTypeEnum::F16 {
-                self.dequantize::<half::f16>()
-            } else {
-                self.dequantize::<f32>()
-            };
-            return dense.index_select(0, indexes).cast_to(datatype);
-        }
         let index_count = indexes.shape()[0];
+        let hidden = self.shape[1];
         let device = self.device.clone();
         let datatype = if datatype == DataTypeEnum::F16 && !self.device.f16_supported() {
             DataTypeEnum::F32
         } else {
             datatype
         };
-        let operation =
-            QEmbeddingOperation::new(indexes.key(), index_count, self.clone(), datatype);
-        let info = TensorInfo::new(operation.out_shape.clone(), datatype);
-        let key = device.compute_graph().create_q_embedding(operation);
+
+        // Quantized loads decode to f32; dense-storage tables read at their
+        // storage type. Cast to the requested type when they differ.
+        let loaded_datatype = match self.datatype {
+            GgmlType::F16 => DataTypeEnum::F16,
+            _ => DataTypeEnum::F32,
+        };
+        let row = NaryExpr::indexed_input(1, vec![NaryExpr::DimIndex(0)]);
+        let gather = NaryExpr::indexed_input(0, vec![row, NaryExpr::DimIndex(1)]);
+        let body = if loaded_datatype == datatype {
+            gather
+        } else {
+            NaryExpr::Op {
+                children: vec![gather],
+                function: NaryFunction::unary(
+                    Some("cast".to_string()),
+                    NaryOp::Cast,
+                    loaded_datatype,
+                    datatype,
+                ),
+            }
+        };
+
+        let matrix_key = device.compute_graph().dequantize(self.clone(), datatype);
+        let matrix = Tensor::from_parts(LazyTensorData::from_parts(
+            device.clone(),
+            TensorInfo::new(self.shape.clone(), datatype),
+            matrix_key,
+        ));
+        let operation = ElementwiseOperation {
+            inputs: vec![matrix.key(), indexes.key()],
+            expression: body,
+            shape: [index_count, hidden].into(),
+            output_datatype: datatype,
+        };
+        let info = TensorInfo::new(operation.shape.clone(), datatype);
+        let key = device.compute_graph().create_nary(operation);
         Tensor::from_parts(LazyTensorData::from_parts(device, info, key))
     }
 }

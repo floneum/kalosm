@@ -2,10 +2,7 @@ use std::sync::Arc;
 
 use wgpu::{CommandEncoder, ComputePass, PipelineCompilationOptions};
 
-use crate::cache::{
-    CachedDirectBindGroup, CachedKernel, DirectDynamicBindGroupKey, DirectStorage3BindGroupKey,
-    KernelCache,
-};
+use crate::cache::{CachedDirectBindGroup, CachedKernel, DirectDynamicBindGroupKey, KernelCache};
 
 #[derive(Clone, Debug)]
 pub struct DirectKernelBinding {
@@ -14,7 +11,7 @@ pub struct DirectKernelBinding {
     pub read_only: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum DirectKernelKind {
     /// Generic path: bindings are derived from the kernel's lowered storage
     /// declarations; the pipeline is built lazily from the cached shader on
@@ -37,11 +34,41 @@ enum DirectKernelKind {
     Sequence(Vec<DirectKernel>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DirectKernel {
     name: String,
     dispatch_size: [u32; 3],
     kind: DirectKernelKind,
+}
+
+#[derive(Debug, Clone)]
+struct DirectKernelTemplateBinding {
+    binding: u32,
+    read_only: bool,
+}
+
+#[derive(Debug, Clone)]
+enum DirectKernelTemplateKind {
+    Dynamic {
+        cached: Arc<CachedKernel>,
+        bindings: Vec<DirectKernelTemplateBinding>,
+    },
+    Storage3 {
+        pipeline: wgpu::ComputePipeline,
+    },
+    Sequence(Vec<DirectKernelTemplate>),
+}
+
+/// A direct-kernel template with all bound buffers stripped out.
+///
+/// This preserves the lowered shader/pipeline metadata needed to rebuild a
+/// dispatchable [`DirectKernel`] while avoiding retention of per-run input and
+/// output buffers.
+#[derive(Debug, Clone)]
+pub struct DirectKernelTemplate {
+    name: String,
+    dispatch_size: [u32; 3],
+    kind: DirectKernelTemplateKind,
 }
 
 pub struct PreparedDirectDispatch {
@@ -97,6 +124,38 @@ impl DirectKernel {
         }
     }
 
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Clone this kernel's dispatch metadata without retaining any currently
+    /// bound buffers.
+    pub fn to_template(&self) -> DirectKernelTemplate {
+        let kind = match &self.kind {
+            DirectKernelKind::Dynamic { cached, bindings } => DirectKernelTemplateKind::Dynamic {
+                cached: cached.clone(),
+                bindings: bindings
+                    .iter()
+                    .map(|binding| DirectKernelTemplateBinding {
+                        binding: binding.binding,
+                        read_only: binding.read_only,
+                    })
+                    .collect(),
+            },
+            DirectKernelKind::Storage3 { pipeline, .. } => DirectKernelTemplateKind::Storage3 {
+                pipeline: pipeline.clone(),
+            },
+            DirectKernelKind::Sequence(kernels) => DirectKernelTemplateKind::Sequence(
+                kernels.iter().map(DirectKernel::to_template).collect(),
+            ),
+        };
+        DirectKernelTemplate {
+            name: self.name.clone(),
+            dispatch_size: self.dispatch_size,
+            kind,
+        }
+    }
+
     pub fn run(&self, cache: &KernelCache, command_encoder: &mut CommandEncoder) {
         let Some(dispatch) = self.prepare_dispatch(cache) else {
             return;
@@ -129,43 +188,26 @@ impl DirectKernel {
                 weight,
                 output,
             } => {
-                let [x, y, z] = self.dispatch_size;
-                if x * y * z == 0 {
-                    return None;
-                }
                 let bind_group_layout = cache.direct_three_buffer_bind_group_layout();
-                let bind_group_key = DirectStorage3BindGroupKey::new(input, weight, output);
-                let bind_group = cache
-                    .direct_three_buffer_bind_group_cache
-                    .write()
-                    .get_or_insert(bind_group_key, || {
-                        let bind_entries = [
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: input.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: weight.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: output.as_entire_binding(),
-                            },
-                        ];
-                        let bind_group =
-                            cache.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some(&self.name),
-                                layout: &bind_group_layout,
-                                entries: &bind_entries,
-                            });
-                        CachedDirectBindGroup::new(
-                            bind_group,
-                            vec![input.clone(), weight.clone(), output.clone()],
-                        )
-                    })
-                    .bind_group
-                    .clone();
+                let bind_entries = [
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: input.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: weight.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output.as_entire_binding(),
+                    },
+                ];
+                let bind_group = cache.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&self.name),
+                    layout: &bind_group_layout,
+                    entries: &bind_entries,
+                });
                 Some(PreparedDirectDispatch {
                     steps: vec![PreparedDirectDispatchStep {
                         pipeline: pipeline.clone(),
@@ -176,30 +218,24 @@ impl DirectKernel {
                 })
             }
             DirectKernelKind::Dynamic { cached, bindings } => {
-                let [x, y, z] = self.dispatch_size;
-                if x * y * z == 0 {
-                    return None;
-                }
-                let layout_entries = bindings
-                    .iter()
-                    .map(|binding| wgpu::BindGroupLayoutEntry {
-                        binding: binding.binding,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage {
-                                read_only: binding.read_only,
-                            },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    })
-                    .collect::<Vec<_>>();
-
-                let bind_group_layout = cache
-                    .bind_group_layout_cache
-                    .write()
-                    .get_or_insert_ref(&layout_entries, || {
+                let bind_group_layout = cached
+                    .dynamic_bind_group_layout
+                    .get_or_init(|| {
+                        let layout_entries = bindings
+                            .iter()
+                            .map(|binding| wgpu::BindGroupLayoutEntry {
+                                binding: binding.binding,
+                                visibility: wgpu::ShaderStages::COMPUTE,
+                                ty: wgpu::BindingType::Buffer {
+                                    ty: wgpu::BufferBindingType::Storage {
+                                        read_only: binding.read_only,
+                                    },
+                                    has_dynamic_offset: false,
+                                    min_binding_size: None,
+                                },
+                                count: None,
+                            })
+                            .collect::<Vec<_>>();
                         cache
                             .device
                             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -209,43 +245,51 @@ impl DirectKernel {
                     })
                     .clone();
 
-                let bind_group_key = DirectDynamicBindGroupKey::new(
-                    bindings
-                        .iter()
-                        .map(|b| (b.binding, b.read_only, b.buffer.clone())),
-                );
-                let bind_group = cache
-                    .direct_dynamic_bind_group_cache
-                    .write()
-                    .get_or_insert(bind_group_key, || {
-                        let bind_entries = bindings
-                            .iter()
-                            .map(|b| wgpu::BindGroupEntry {
-                                binding: b.binding,
-                                resource: b.buffer.as_entire_binding(),
-                            })
-                            .collect::<Vec<_>>();
-                        let bind_group =
-                            cache.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some(&self.name),
-                                layout: &bind_group_layout,
-                                entries: &bind_entries,
-                            });
-                        CachedDirectBindGroup::new(
-                            bind_group,
-                            bindings
-                                .iter()
-                                .map(|binding| binding.buffer.clone())
-                                .collect(),
-                        )
+                let bind_entries = bindings
+                    .iter()
+                    .map(|b| wgpu::BindGroupEntry {
+                        binding: b.binding,
+                        resource: b.buffer.as_entire_binding(),
                     })
-                    .bind_group
-                    .clone();
+                    .collect::<Vec<_>>();
+                let has_writable_binding = bindings.iter().any(|binding| !binding.read_only);
+                let bind_group = if has_writable_binding {
+                    cache.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&self.name),
+                        layout: &bind_group_layout,
+                        entries: &bind_entries,
+                    })
+                } else {
+                    let bind_group_key = DirectDynamicBindGroupKey::new(
+                        bindings
+                            .iter()
+                            .map(|b| (b.binding, b.read_only, b.buffer.clone())),
+                    );
+                    cache
+                        .direct_dynamic_bind_group_cache
+                        .write()
+                        .get_or_insert(bind_group_key, || {
+                            let bind_group =
+                                cache.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: Some(&self.name),
+                                    layout: &bind_group_layout,
+                                    entries: &bind_entries,
+                                });
+                            CachedDirectBindGroup::new(
+                                bind_group,
+                                bindings
+                                    .iter()
+                                    .map(|binding| binding.buffer.clone())
+                                    .collect(),
+                            )
+                        })
+                        .bind_group
+                        .clone()
+                };
 
-                let pipeline_layout = cache
-                    .pipeline_layout_cache
-                    .write()
-                    .get_or_insert_ref(&bind_group_layout, || {
+                let pipeline_layout = cached
+                    .dynamic_pipeline_layout
+                    .get_or_init(|| {
                         cache
                             .device
                             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -260,6 +304,12 @@ impl DirectKernel {
                 let pipeline = cached
                     .pipeline
                     .get_or_init(|| {
+                        crate::note_compile(&format!(
+                            "pipeline name={} dispatch={:?} bindings={}",
+                            self.name,
+                            self.dispatch_size,
+                            bindings.len()
+                        ));
                         cache
                             .device
                             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -322,6 +372,165 @@ impl DirectKernel {
                 .collect(),
         }
     }
+
+    /// The buffers this kernel binds, in the canonical order used internally by
+    /// `prepare_dispatch` (and mirrored by `rebind_buffers`). Used by plan
+    /// caches to record where each binding's buffer comes from so the kernel can
+    /// be replayed with fresh per-resolve binding buffers.
+    pub fn binding_buffers(&self) -> Vec<Arc<wgpu::Buffer>> {
+        let mut out = Vec::new();
+        self.collect_buffers(&mut out);
+        out
+    }
+
+    fn collect_buffers(&self, out: &mut Vec<Arc<wgpu::Buffer>>) {
+        match &self.kind {
+            DirectKernelKind::Dynamic { bindings, .. } => {
+                out.extend(bindings.iter().map(|binding| binding.buffer.clone()));
+            }
+            DirectKernelKind::Storage3 {
+                input,
+                weight,
+                output,
+                ..
+            } => {
+                out.push(input.clone());
+                out.push(weight.clone());
+                out.push(output.clone());
+            }
+            DirectKernelKind::Sequence(kernels) => {
+                for kernel in kernels {
+                    kernel.collect_buffers(out);
+                }
+            }
+        }
+    }
+
+    /// Clone this kernel, replacing its bound buffers positionally with `new`
+    /// (which must have exactly `binding_buffers().len()` entries in the same
+    /// order). The compiled pipeline / cached analysis is preserved; only the
+    /// buffers (i.e. the bind-group resources) change. This lets a plan cache
+    /// reuse a kernel built during a previous resolve while swapping in the
+    /// current replay buffers.
+    pub fn rebind_buffers(&self, new: &[Arc<wgpu::Buffer>]) -> Self {
+        let mut cursor = 0;
+        let kernel = self.rebind_from(new, &mut cursor);
+        debug_assert_eq!(
+            cursor,
+            new.len(),
+            "rebind_buffers received {} buffers for a kernel binding {cursor}",
+            new.len()
+        );
+        kernel
+    }
+
+    fn rebind_from(&self, new: &[Arc<wgpu::Buffer>], cursor: &mut usize) -> Self {
+        let kind = match &self.kind {
+            DirectKernelKind::Dynamic { cached, bindings } => {
+                let bindings = bindings
+                    .iter()
+                    .map(|binding| {
+                        let buffer = new[*cursor].clone();
+                        *cursor += 1;
+                        DirectKernelBinding {
+                            binding: binding.binding,
+                            buffer,
+                            read_only: binding.read_only,
+                        }
+                    })
+                    .collect();
+                DirectKernelKind::Dynamic {
+                    cached: cached.clone(),
+                    bindings,
+                }
+            }
+            DirectKernelKind::Storage3 { pipeline, .. } => {
+                let input = new[*cursor].clone();
+                let weight = new[*cursor + 1].clone();
+                let output = new[*cursor + 2].clone();
+                *cursor += 3;
+                DirectKernelKind::Storage3 {
+                    pipeline: pipeline.clone(),
+                    input,
+                    weight,
+                    output,
+                }
+            }
+            DirectKernelKind::Sequence(kernels) => DirectKernelKind::Sequence(
+                kernels
+                    .iter()
+                    .map(|kernel| kernel.rebind_from(new, cursor))
+                    .collect(),
+            ),
+        };
+        Self {
+            name: self.name.clone(),
+            dispatch_size: self.dispatch_size,
+            kind,
+        }
+    }
+}
+
+impl DirectKernelTemplate {
+    /// Build a dispatchable [`DirectKernel`] by binding buffers positionally in
+    /// the same order returned by [`DirectKernel::binding_buffers`].
+    pub fn bind_buffers(&self, new: &[Arc<wgpu::Buffer>]) -> DirectKernel {
+        let mut cursor = 0;
+        let kernel = self.bind_from(new, &mut cursor);
+        debug_assert_eq!(
+            cursor,
+            new.len(),
+            "bind_buffers received {} buffers for a template binding {cursor}",
+            new.len()
+        );
+        kernel
+    }
+
+    fn bind_from(&self, new: &[Arc<wgpu::Buffer>], cursor: &mut usize) -> DirectKernel {
+        let kind = match &self.kind {
+            DirectKernelTemplateKind::Dynamic { cached, bindings } => {
+                let bindings = bindings
+                    .iter()
+                    .map(|binding| {
+                        let buffer = new[*cursor].clone();
+                        *cursor += 1;
+                        DirectKernelBinding {
+                            binding: binding.binding,
+                            buffer,
+                            read_only: binding.read_only,
+                        }
+                    })
+                    .collect();
+                DirectKernelKind::Dynamic {
+                    cached: cached.clone(),
+                    bindings,
+                }
+            }
+            DirectKernelTemplateKind::Storage3 { pipeline } => {
+                let input = new[*cursor].clone();
+                let weight = new[*cursor + 1].clone();
+                let output = new[*cursor + 2].clone();
+                *cursor += 3;
+                DirectKernelKind::Storage3 {
+                    pipeline: pipeline.clone(),
+                    input,
+                    weight,
+                    output,
+                }
+            }
+            DirectKernelTemplateKind::Sequence(kernels) => DirectKernelKind::Sequence(
+                kernels
+                    .iter()
+                    .map(|kernel| kernel.bind_from(new, cursor))
+                    .collect(),
+            ),
+        };
+        DirectKernel {
+            name: self.name.clone(),
+            dispatch_size: self.dispatch_size,
+            kind,
+        }
+    }
 }
 
 impl PreparedDirectDispatch {
@@ -334,6 +543,9 @@ impl PreparedDirectDispatch {
             return;
         };
         let [x, y, z] = step.dispatch_size;
+        if step.dispatch_size.contains(&0) {
+            return;
+        }
         pass.set_pipeline(&step.pipeline);
         pass.set_bind_group(0, &step.bind_group, &[]);
         pass.dispatch_workgroups(x, y, z);

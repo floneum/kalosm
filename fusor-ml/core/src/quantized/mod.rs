@@ -26,6 +26,7 @@ pub(crate) struct QMatMulDirectPipelineKey {
     // Zero for plain qmatmul; non-zero values disambiguate kernels whose
     // bindings/dispatch are otherwise identical.
     epilogue_identity: u64,
+    subgroup_size_range: [u32; 2],
     dispatch_size: [u32; 3],
     input_layout: QMatMulDirectLayoutKey,
     output_layout: QMatMulDirectLayoutKey,
@@ -43,6 +44,7 @@ impl QMatMulDirectPipelineKey {
         format: GgmlType,
         storage_layout: QMatrixStorageLayout,
         shape: QMatMulShape,
+        subgroup_size_range: [u32; 2],
         dispatch_size: [u32; 3],
         input_layout: &Layout,
         output_layout: &Layout,
@@ -52,17 +54,20 @@ impl QMatMulDirectPipelineKey {
             storage_layout,
             shape,
             0,
+            subgroup_size_range,
             dispatch_size,
             input_layout,
             output_layout,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_epilogue(
         format: GgmlType,
         storage_layout: QMatrixStorageLayout,
         shape: QMatMulShape,
         epilogue_identity: u64,
+        subgroup_size_range: [u32; 2],
         dispatch_size: [u32; 3],
         input_layout: &Layout,
         output_layout: &Layout,
@@ -75,6 +80,7 @@ impl QMatMulDirectPipelineKey {
             k,
             n,
             epilogue_identity,
+            subgroup_size_range,
             dispatch_size,
             input_layout: QMatMulDirectLayoutKey::new(input_layout),
             output_layout: QMatMulDirectLayoutKey::new(output_layout),
@@ -224,6 +230,11 @@ fn qmatrix_storage_layout_for_parts(
     ty: GgmlType,
     shader_f16_supported: bool,
 ) -> QMatrixStorageLayout {
+    #[cfg(target_arch = "wasm32")]
+    let shader_f16_supported = {
+        let _ = shader_f16_supported;
+        false
+    };
     qmatrix_storage_layout_for_parts_with_env(
         ty,
         shader_f16_supported,
@@ -532,7 +543,6 @@ mod tests {
             GgmlType::Q8_0,
             GgmlType::Q4K,
             GgmlType::Q5K,
-            GgmlType::Q6K,
         ] {
             assert_eq!(
                 qmatrix_storage_layout_for_parts_with_env(ty, true, None),
@@ -543,6 +553,14 @@ mod tests {
                 QMatrixStorageLayout::GpuF32Scales
             );
         }
+        assert_eq!(
+            qmatrix_storage_layout_for_parts_with_env(GgmlType::Q6K, true, None),
+            QMatrixStorageLayout::GpuF32Scales
+        );
+        assert_eq!(
+            qmatrix_storage_layout_for_parts_with_env(GgmlType::Q6K, false, None),
+            QMatrixStorageLayout::GpuF32Scales
+        );
     }
 
     #[test]
