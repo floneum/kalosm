@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 bytemuck = "1.23.2"
 dotenvy = "0.15.7"
-fusor.workspace = true
+fusor = { workspace = true, features = ["cpu", "gpu"] }
 fusor-gguf.workspace = true
 fusor-train.workspace = true
 half = "2.7.1"

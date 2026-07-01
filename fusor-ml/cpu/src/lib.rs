@@ -56,8 +56,8 @@ pub(crate) use map_layout::MapLayout;
 pub(crate) use pairwise::{Add, Div, Mul, Rem, Sub};
 #[allow(unused_imports)]
 pub(crate) use quantized::{Dequantize, QuantizedTensor};
-#[allow(unused_imports)]
-pub(crate) use rank::{
+// Public: typed rank arithmetic consumed by fusor::autograd.
+pub use rank::{
     LargerRank, LargerRankInner, LastRank, LastRankInner, MaxRank, MaxRankInner, NextRank,
     NextRankInner, SmallerRank, SmallerRankInner,
 };
@@ -108,21 +108,21 @@ impl Deref for CpuMappedBuffer {
 // Internal operation traits and markers.
 #[allow(unused_imports)]
 pub(crate) use cast::CastTo;
-#[allow(unused_imports)]
-pub(crate) use comparison::{Eq, EqOp, Gt, GtOp, Gte, GteOp, Lt, LtOp, Lte, LteOp, Ne, NeOp};
+// Public: comparison op markers (EqOp) consumed by fusor::autograd.
+pub use comparison::{Eq, EqOp, Gt, GtOp, Gte, GteOp, Lt, LtOp, Lte, LteOp, Ne, NeOp};
 #[allow(unused_imports)]
 pub(crate) use conditional::IsNonZero;
-#[allow(unused_imports)]
-pub(crate) use elementwise::{
+// Public: elementwise op markers + SimdUnaryOp consumed by fusor::autograd.
+pub use elementwise::{
     AbsOp, AcosOp, AcoshOp, AsinOp, AsinhOp, AtanOp, AtanhOp, CosOp, CoshOp, Exp2Op, ExpOp, Log2Op,
     LogOp, NegOp, SimdUnaryOp, SinOp, SinhOp, SqrtOp, TanOp, TanhOp,
 };
 #[allow(unused_imports)]
 pub(crate) use matmul::MatmulImpl;
-#[allow(unused_imports)]
-pub(crate) use pairwise::{AddOp, DivOp, MulOp, RemOp, SimdBinaryOp, SubOp};
-#[allow(unused_imports)]
-pub(crate) use reduce::{
+// Public: pairwise op markers + SimdBinaryOp consumed by fusor::autograd.
+pub use pairwise::{AddOp, DivOp, MulOp, RemOp, SimdBinaryOp, SubOp};
+// Public: reduce op markers + SimdReduceOp consumed by fusor::autograd.
+pub use reduce::{
     MaxOp, MinOp, ProdOp, SimdReduceOp, SumOp, layer_norm_last_dim_fused, softmax_last_dim_fused,
 };
 

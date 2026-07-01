@@ -12,6 +12,7 @@
 compile_error!("fusor requires at least one backend feature: `cpu` or `gpu`.");
 
 pub mod cache;
+pub mod autograd;
 mod composite;
 mod cpu;
 mod device;

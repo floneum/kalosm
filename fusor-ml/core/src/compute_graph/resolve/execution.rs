@@ -581,6 +581,10 @@ impl Resolver {
         if !self.execution_graph.contains_node(node_idx) {
             return;
         }
+        let inner_idx = self.execution_graph[node_idx].inner_idx;
+        if self.targets.contains(&inner_idx) {
+            return;
+        }
         if self
             .execution_graph
             .neighbors_directed(node_idx, petgraph::Direction::Outgoing)

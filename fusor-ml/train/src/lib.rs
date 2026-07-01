@@ -86,18 +86,6 @@ impl<const R: usize> AdamMoments<R> {
             v: RawTensor::zeros(device, shape),
         }
     }
-
-    /// Collect GPU compute-graph node keys from the moment tensors (m, v).
-    /// This is used by the batch resolver to pre-resolve all optimizer state
-    /// tensors in a single pass, reducing peak GPU memory.
-    pub fn collect_gpu_keys(&self, keys: &mut Vec<fusor::NodeIndex>) {
-        if let Some(key) = self.m.gpu_key() {
-            keys.push(key);
-        }
-        if let Some(key) = self.v.gpu_key() {
-            keys.push(key);
-        }
-    }
 }
 
 fn detach_persistent<const R: usize>(tensor: RawTensor<R, f32>) -> RawTensor<R, f32> {

@@ -949,7 +949,7 @@ impl<const R: usize> Tensor<R> {
 
     pub fn flatten_last_n<const FROM_END: usize, const OUT: usize>(&self) -> Tensor<OUT>
     where
-        fusor_core::Tensor<R, f32>: fusor_core::SmallerRank<FROM_END, OUT, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::SmallerRank<FROM_END, OUT, f32>,
     {
         let shape = self.shape();
         let new_shape: [usize; OUT] = std::array::from_fn(|i| {
@@ -966,7 +966,7 @@ impl<const R: usize> Tensor<R> {
 
     pub fn flatten_first_n<const FROM_START: usize, const OUT: usize>(&self) -> Tensor<OUT>
     where
-        fusor_core::Tensor<R, f32>: fusor_core::SmallerRank<FROM_START, OUT, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::SmallerRank<FROM_START, OUT, f32>,
     {
         let shape = self.shape();
         let new_shape: [usize; OUT] = std::array::from_fn(|i| {
@@ -1112,7 +1112,7 @@ impl<const R: usize> Tensor<R> {
         axes: [usize; DIFF],
     ) -> Tensor<OUT>
     where
-        fusor_core::Tensor<R, f32>: fusor_core::SmallerRank<DIFF, OUT, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::SmallerRank<DIFF, OUT, f32>,
     {
         let shape = self.shape();
         for &axis in &axes {
@@ -1139,7 +1139,7 @@ impl<const R: usize> Tensor<R> {
         axes: [usize; DIFF],
     ) -> Tensor<OUT>
     where
-        fusor_core::Tensor<R, f32>: fusor_core::LargerRank<DIFF, OUT, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, OUT, f32>,
     {
         let shape = self.shape();
         let mut sorted_axes = axes;
@@ -1447,7 +1447,7 @@ impl<const R: usize> Tensor<R> {
     fn sum_keepdim_any<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
         let input_shape = self.shape();
@@ -1466,7 +1466,7 @@ impl<const R: usize> Tensor<R> {
     fn max_keepdim_any<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::MaxOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
@@ -1491,7 +1491,7 @@ impl<const R: usize> Tensor<R> {
     fn min_keepdim_any<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::MinOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
@@ -1516,7 +1516,7 @@ impl<const R: usize> Tensor<R> {
     fn mean_keepdim_any<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
         self.sum_keepdim_any::<OUT_RANK>(axis)
@@ -1526,7 +1526,7 @@ impl<const R: usize> Tensor<R> {
     fn product_keepdim_any<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::ProdOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::EqOp: fusor_cpu::SimdBinaryOp<f32>,
@@ -1567,7 +1567,7 @@ impl<const R: usize> Tensor<R> {
     fn var_keepdim_any<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
         let mean = self.mean_keepdim_any::<OUT_RANK>(axis);
@@ -1578,7 +1578,7 @@ impl<const R: usize> Tensor<R> {
     fn softmax_composite<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::MaxOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
@@ -1600,7 +1600,7 @@ impl<const R: usize> Tensor<R> {
     ) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
         let std = self
@@ -1625,7 +1625,7 @@ impl<const R: usize> Tensor<R> {
     ) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
         let centered = {
@@ -1650,10 +1650,10 @@ impl<const R: usize> Tensor<R> {
     ) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LargerRank<R2, DIFF, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LargerRank<DIFF, R2, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
         crate::ConcreteTensor<f32, R2>: fusor_cpu::LargerRank<R3, 1, f32>,
-        fusor_core::Tensor<R2, f32>: fusor_core::LargerRank<1, R3, f32>,
-        fusor_core::Tensor<R3, f32>: fusor_core::SmallerRank<DIFF, O, f32>,
+        crate::gpu::Tensor<R2, f32>: crate::gpu::LargerRank<1, R3, f32>,
+        crate::gpu::Tensor<R3, f32>: crate::gpu::SmallerRank<DIFF, O, f32>,
     {
         let pools: [crate::composite::pool::PoolSize; DIFF] = pools.map(|pool| pool.into());
         let axis_start = R - DIFF;
@@ -1690,13 +1690,13 @@ impl<const R: usize> Tensor<R> {
     ) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LargerRank<R2, DIFF, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LargerRank<DIFF, R2, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
         crate::ConcreteTensor<f32, R2>: fusor_cpu::LargerRank<R3, 1, f32>,
-        fusor_core::Tensor<R2, f32>: fusor_core::LargerRank<1, R3, f32>,
-        fusor_core::Tensor<R3, f32>: fusor_core::SmallerRank<DIFF, O, f32>,
+        crate::gpu::Tensor<R2, f32>: crate::gpu::LargerRank<1, R3, f32>,
+        crate::gpu::Tensor<R3, f32>: crate::gpu::SmallerRank<DIFF, O, f32>,
         crate::ConcreteTensor<f32, O>: fusor_cpu::LastRank<R, f32>,
-        fusor_core::Tensor<O, f32>:
-            fusor_core::LastRank<R, f32> + fusor_core::SmallerRank<1, R, f32>,
+        crate::gpu::Tensor<O, f32>:
+            crate::gpu::LastRank<R, f32> + crate::gpu::SmallerRank<1, R, f32>,
         fusor_cpu::MaxOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
@@ -1709,13 +1709,13 @@ impl<const R: usize> Tensor<R> {
     ) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LargerRank<R2, DIFF, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LargerRank<DIFF, R2, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
         crate::ConcreteTensor<f32, R2>: fusor_cpu::LargerRank<R3, 1, f32>,
-        fusor_core::Tensor<R2, f32>: fusor_core::LargerRank<1, R3, f32>,
-        fusor_core::Tensor<R3, f32>: fusor_core::SmallerRank<DIFF, O, f32>,
+        crate::gpu::Tensor<R2, f32>: crate::gpu::LargerRank<1, R3, f32>,
+        crate::gpu::Tensor<R3, f32>: crate::gpu::SmallerRank<DIFF, O, f32>,
         crate::ConcreteTensor<f32, O>: fusor_cpu::LastRank<R, f32>,
-        fusor_core::Tensor<O, f32>:
-            fusor_core::LastRank<R, f32> + fusor_core::SmallerRank<1, R, f32>,
+        crate::gpu::Tensor<O, f32>:
+            crate::gpu::LastRank<R, f32> + crate::gpu::SmallerRank<1, R, f32>,
         fusor_cpu::MinOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
@@ -1748,7 +1748,7 @@ impl<const R: usize> Tensor<R> {
     pub fn stack<const OUT: usize>(tensors: impl IntoIterator<Item = Self>, dim: usize) -> Tensor<OUT>
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LargerRank<OUT, 1, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LargerRank<1, OUT, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<1, OUT, f32>,
     {
         let tensors: Vec<Self> = tensors.into_iter().collect();
         assert!(!tensors.is_empty(), "stack requires at least one tensor");
@@ -1807,7 +1807,7 @@ impl<const R: usize> Tensor<R> {
     pub fn max_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::MaxOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
@@ -1817,8 +1817,8 @@ impl<const R: usize> Tensor<R> {
     pub fn max<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<OUT_RANK>
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>:
-            fusor_core::LastRank<OUT_RANK, f32> + fusor_core::SmallerRank<1, OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>:
+            crate::gpu::LastRank<OUT_RANK, f32> + crate::gpu::SmallerRank<1, OUT_RANK, f32>,
         fusor_cpu::MaxOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
@@ -1829,7 +1829,7 @@ impl<const R: usize> Tensor<R> {
     pub fn min_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::MinOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
@@ -1839,8 +1839,8 @@ impl<const R: usize> Tensor<R> {
     pub fn min<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<OUT_RANK>
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>:
-            fusor_core::LastRank<OUT_RANK, f32> + fusor_core::SmallerRank<1, OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>:
+            crate::gpu::LastRank<OUT_RANK, f32> + crate::gpu::SmallerRank<1, OUT_RANK, f32>,
         fusor_cpu::MinOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
@@ -1851,7 +1851,7 @@ impl<const R: usize> Tensor<R> {
     pub fn mean_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
         self.mean_keepdim_any::<OUT_RANK>(axis)
@@ -1860,8 +1860,8 @@ impl<const R: usize> Tensor<R> {
     pub fn mean<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<OUT_RANK>
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>:
-            fusor_core::LastRank<OUT_RANK, f32> + fusor_core::SmallerRank<1, OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>:
+            crate::gpu::LastRank<OUT_RANK, f32> + crate::gpu::SmallerRank<1, OUT_RANK, f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
         self.mean_keepdim_any::<OUT_RANK>(axis)
@@ -1871,8 +1871,8 @@ impl<const R: usize> Tensor<R> {
     pub fn product<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<OUT_RANK>
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>:
-            fusor_core::LastRank<OUT_RANK, f32> + fusor_core::SmallerRank<1, OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>:
+            crate::gpu::LastRank<OUT_RANK, f32> + crate::gpu::SmallerRank<1, OUT_RANK, f32>,
         fusor_cpu::ProdOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::EqOp: fusor_cpu::SimdBinaryOp<f32>,
@@ -1884,7 +1884,7 @@ impl<const R: usize> Tensor<R> {
     pub fn product_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::ProdOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::EqOp: fusor_cpu::SimdBinaryOp<f32>,
@@ -1895,8 +1895,8 @@ impl<const R: usize> Tensor<R> {
     pub fn var<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<OUT_RANK>
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>:
-            fusor_core::LastRank<OUT_RANK, f32> + fusor_core::SmallerRank<1, OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>:
+            crate::gpu::LastRank<OUT_RANK, f32> + crate::gpu::SmallerRank<1, OUT_RANK, f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
         self.var_keepdim_any::<OUT_RANK>(axis)
@@ -1906,7 +1906,7 @@ impl<const R: usize> Tensor<R> {
     pub fn var_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
         self.var_keepdim_any::<OUT_RANK>(axis)
@@ -1915,7 +1915,7 @@ impl<const R: usize> Tensor<R> {
     pub fn softmax<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::MaxOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
@@ -1925,7 +1925,7 @@ impl<const R: usize> Tensor<R> {
     pub fn softmax_slow<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::MaxOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
@@ -1935,7 +1935,7 @@ impl<const R: usize> Tensor<R> {
     pub fn softmax_last_dim<const OUT_RANK: usize>(&self) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::MaxOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
@@ -1945,7 +1945,7 @@ impl<const R: usize> Tensor<R> {
     pub fn softmax_slow_last_dim<const OUT_RANK: usize>(&self) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::MaxOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
@@ -1955,10 +1955,10 @@ impl<const R: usize> Tensor<R> {
     pub fn softmax_last_dim_fused<const OUT_RANK: usize>(&self) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         fusor_cpu::MaxOp: fusor_cpu::SimdReduceOp<f32>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRankInner,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRankInner,
     {
         let value = self
             .value
@@ -1977,15 +1977,15 @@ impl<const R: usize> Tensor<R> {
     ) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
-        <fusor_core::Tensor<R, f32> as fusor_core::LastRankInner>::LastRank:
-            fusor_core::NextRankInner<NextRank = fusor_core::Tensor<R, f32>>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, f32> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, f32>>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
         crate::MulOp: fusor_cpu::SimdBinaryOp<f32>,
         crate::DivOp: fusor_cpu::SimdBinaryOp<f32>,
         crate::AddOp: fusor_cpu::SimdBinaryOp<f32>,
         crate::SqrtOp: fusor_cpu::SimdUnaryOp<f32>,
-        (fusor_core::Tensor<R, f32>, fusor_core::Tensor<1, f32>): fusor_core::MaxRank<R, f32>,
+        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<1, f32>): crate::gpu::MaxRank<R, f32>,
     {
         let value = self.value.rms_norm_fused::<1, OUT_RANK>(
             &weight.value,
@@ -2016,15 +2016,15 @@ impl<const R: usize> Tensor<R> {
     ) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
-        <fusor_core::Tensor<R, f32> as fusor_core::LastRankInner>::LastRank:
-            fusor_core::NextRankInner<NextRank = fusor_core::Tensor<R, f32>>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, f32> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, f32>>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
         crate::MulOp: fusor_cpu::SimdBinaryOp<f32>,
         crate::DivOp: fusor_cpu::SimdBinaryOp<f32>,
         crate::AddOp: fusor_cpu::SimdBinaryOp<f32>,
         crate::SqrtOp: fusor_cpu::SimdUnaryOp<f32>,
-        (fusor_core::Tensor<R, f32>, fusor_core::Tensor<1, f32>): fusor_core::MaxRank<R, f32>,
+        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<1, f32>): crate::gpu::MaxRank<R, f32>,
     {
         self.rms_norm_fused::<OUT_RANK>(weight, None, eps)
     }
@@ -2037,9 +2037,9 @@ impl<const R: usize> Tensor<R> {
     ) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
-        <fusor_core::Tensor<R, f32> as fusor_core::LastRankInner>::LastRank:
-            fusor_core::NextRankInner<NextRank = fusor_core::Tensor<R, f32>>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, f32> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, f32>>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
         crate::AddOp: fusor_cpu::SimdBinaryOp<f32>,
         crate::SubOp: fusor_cpu::SimdBinaryOp<f32>,
@@ -2913,7 +2913,9 @@ impl Tensor<4> {
         let masked_scores = if let Some((mask, kind)) = mask {
             let mask_tensor = Tensor::constant_from_raw(&self.graph(), mask.clone());
             let mask_4d = match kind {
-                MaskKind::QKMask => {
+                // Causal falls back to QKMask semantics here: the provided mask is the
+                // [seq_len, seq_len] (== [q_seq_len, kv_seq_len]) additive causal mask.
+                MaskKind::QKMask | MaskKind::Causal => {
                     assert_eq!(mask_tensor.shape(), [q_seq_len, kv_seq_len]);
                     mask_tensor.reshape([1, 1, q_seq_len, kv_seq_len])
                 }
@@ -3319,7 +3321,7 @@ fn reduction_extrema_keepdim_grad<const R: usize, const OUT_RANK: usize>(
 ) -> RawTensor<R, f32>
 where
     crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
-    fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+    crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
     fusor_cpu::EqOp: fusor_cpu::SimdBinaryOp<f32>,
     fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
 {

@@ -86,13 +86,18 @@ impl RuntimeConfig {
     }
 
     pub fn try_load() -> Result<Self, String> {
+        // The `.env` is an optional, machine-local override (it's gitignored). When it's
+        // absent, fall back to real environment variables and the built-in defaults below;
+        // only surface an error if a `.env` that does exist fails to parse.
         let env_path = env_path();
-        dotenvy::from_path(&env_path).map_err(|error| {
-            format!(
-                "failed to load nanochat config from {}: {error}",
-                env_path.display()
-            )
-        })?;
+        if env_path.exists() {
+            dotenvy::from_path(&env_path).map_err(|error| {
+                format!(
+                    "failed to load nanochat config from {}: {error}",
+                    env_path.display()
+                )
+            })?;
+        }
 
         let batch_size = try_read_env("NANOCHAT_BATCH_SIZE", 12)?;
         let n_head = try_read_env("NANOCHAT_N_HEAD", 4)?;

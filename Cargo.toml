@@ -37,23 +37,13 @@ members = [
     "fusor-ml/feather-pipeline",
     "fusor-ml/conformance",
     "fusor-ml/fusor",
+    "fusor-ml/train",
     "fusor-ml/types",
+    "fusor-ml/nanochat",
+    "fusor-ml/nanochat-app",
     "fusor-ml/tile-ir",
     "fusor-ml/tile-ir-kernels",
     "fusor-ml/tile-ir-runtime",
-    # TODO(merge main->backprop): the training stack below is built on backprop's
-    # pre-unification fusor API (fusor::autograd, fusor_core::Tensor, Device::resolve_batch,
-    # MaskKind/ToVec1/ToVec2). main unified the CPU/GPU fusor API, so these need re-porting
-    # before they compile. Source is preserved in-tree; re-add to members once ported.
-    # "fusor-ml/train",
-    # "fusor-ml/nanochat",
-    # "fusor-ml/nanochat-app",
-]
-exclude = [
-    # See members TODO above: needs re-porting to main's unified fusor API before re-inclusion.
-    "fusor-ml/train",
-    "fusor-ml/nanochat",
-    "fusor-ml/nanochat-app",
 ]
 
 [workspace.dependencies]

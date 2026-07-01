@@ -67,7 +67,9 @@ impl Resolver {
 
         // Pass 4: Execution
         // Extract operations in order.
+        let first_target = self.targets[0];
         let target_set: FxHashSet<NodeIndex> = self.targets.iter().copied().collect();
+        let mut first_target_data = None;
         let mut queued_operations = Vec::with_capacity(sorted_nodes.len());
 
         {
@@ -76,7 +78,11 @@ impl Resolver {
                 let node = &self.execution_graph[idx];
                 // Handle Tensor caching explicitly here
                 if let ComputeGraphNodeVariant::Tensor(data) = &node.variant {
-                    graph.set_cached_result(node.inner_idx, data.clone());
+                    let data = data.clone();
+                    if node.inner_idx == first_target {
+                        first_target_data = Some(data.clone());
+                    }
+                    graph.set_cached_result(node.inner_idx, data);
                     continue;
                 }
 
@@ -155,6 +161,9 @@ impl Resolver {
             if let Some(map_layout) = map_layout {
                 let start = host_trace.then(Instant::now);
                 let result = map_layout.run(graph);
+                if node == first_target {
+                    first_target_data = Some(result.clone());
+                }
                 // Cache the result
                 graph.set_cached_result(node, result);
                 // Map-layout nodes are resolved immediately — release any
@@ -179,6 +188,9 @@ impl Resolver {
                     Self::try_prepare_in_place_slice_assign_copy(graph, slice_assign)
                 });
                 if let Some((output, copies)) = slice_copy {
+                    if node == first_target {
+                        first_target_data = Some(output.clone());
+                    }
                     graph.set_cached_result(node, output);
                     commands.extend(copies.into_iter().map(CommandRecord::CopyBuffer));
                     let start = host_trace.then(Instant::now);
@@ -209,6 +221,9 @@ impl Resolver {
                     let MirValue::Tensor(resolved) = result else {
                         panic!("QMatMul output value is not a tensor");
                     };
+                    if node == first_target {
+                        first_target_data = Some(resolved.clone());
+                    }
                     graph.set_cached_result(node, resolved);
                     if let Some(start) = start {
                         let elapsed = start.elapsed();
@@ -313,6 +328,9 @@ impl Resolver {
                 let MirValue::Tensor(resolved) = result else {
                     panic!("Kernel input value is not a tensor");
                 };
+                if node == first_target {
+                    first_target_data = Some(resolved.clone());
+                }
                 graph.set_cached_result(node, resolved);
                 if let Some(start) = start {
                     let elapsed = start.elapsed();
@@ -484,7 +502,24 @@ impl Resolver {
             let mut dispatch_index = 0usize;
             let mut command_index = 0usize;
             let dispatches_per_pass = dispatches_per_pass(total_kernels);
+            let dispatches_per_submit = dispatches_per_submit(total_kernels, device.backend());
+            let wait_after_chunk_submit = device.backend() == wgpu::Backend::Metal;
+            let mut dispatches_in_submit = 0usize;
+            let mut encoder_has_commands = false;
             while command_index < commands.len() {
+                if encoder_has_commands && dispatches_in_submit >= dispatches_per_submit {
+                    let next_encoder = resolver_command_encoder(&device);
+                    let ready_encoder = std::mem::replace(&mut command_encoder, next_encoder);
+                    submit_resolver_encoder(
+                        &device,
+                        ready_encoder,
+                        wait_after_chunk_submit,
+                        host_trace,
+                        &mut host_profile,
+                    );
+                    encoder_has_commands = false;
+                    dispatches_in_submit = 0;
+                }
                 match &commands[command_index] {
                     CommandRecord::CopyBuffer(copy) => {
                         command_encoder.copy_buffer_to_buffer(
@@ -494,6 +529,7 @@ impl Resolver {
                             copy.destination_offset,
                             copy.size,
                         );
+                        encoder_has_commands = true;
                         command_index += 1;
                     }
                     CommandRecord::Dispatch(_) => {
@@ -518,6 +554,8 @@ impl Resolver {
                                 record.dispatch.run(&mut pass);
                             }
                             dispatch_index += 1;
+                            dispatches_in_submit += 1;
+                            encoder_has_commands = true;
                             command_index += 1;
                             continue;
                         }
@@ -532,6 +570,9 @@ impl Resolver {
                             if pass_dispatches >= dispatches_per_pass {
                                 break;
                             }
+                            if dispatches_in_submit >= dispatches_per_submit {
+                                break;
+                            }
                             let CommandRecord::Dispatch(record) = &commands[command_index] else {
                                 break;
                             };
@@ -543,8 +584,10 @@ impl Resolver {
                                 pass.write_timestamp(query_set, (dispatch_index * 2 + 1) as u32);
                             }
                             dispatch_index += 1;
+                            dispatches_in_submit += 1;
                             command_index += 1;
                             pass_dispatches += 1;
+                            encoder_has_commands = true;
                         }
                     }
                 }
@@ -561,17 +604,21 @@ impl Resolver {
                     0,
                     *raw_query_size,
                 );
+                encoder_has_commands = true;
             }
             if let Some(start) = encode_start {
                 host_profile.encode += start.elapsed();
             }
-        }
 
-        // Submit any remaining commands.
-        let submit_start = host_trace.then(Instant::now);
-        device.wgpu_queue().submit(Some(command_encoder.finish()));
-        if let Some(start) = submit_start {
-            host_profile.submit += start.elapsed();
+            if encoder_has_commands {
+                submit_resolver_encoder(
+                    &device,
+                    command_encoder,
+                    false,
+                    host_trace,
+                    &mut host_profile,
+                );
+            }
         }
         if let Some((_, _, readback_buffer, raw_query_size)) = &query_resources {
             let profile_readback_start = host_trace.then(Instant::now);
@@ -611,9 +658,24 @@ impl Resolver {
         }
         device.reset_initialized_buffers();
 
-        let data = graph
-            .get_result(self.targets[0])
-            .expect("Target result not cached");
+        let produced_first_target = first_target_data.is_some();
+        let data = match first_target_data.or_else(|| graph.get_result(first_target)) {
+            Some(data) => data,
+            None => {
+                let target_state = graph.nodes.nodes.node_weight(first_target).map(|node| {
+                    (
+                        node_category(&node.variant),
+                        node.reference_count,
+                        node.live_descendant_count,
+                        node.cached.is_some(),
+                    )
+                });
+                panic!(
+                    "Target result not cached target={first_target:?} produced_first_target={produced_first_target} target_state={target_state:?} execution_nodes={} queued_operations={queued_operation_count} kernels={total_kernels}",
+                    self.execution_graph.node_count(),
+                );
+            }
+        };
         if let Some(start) = host_total_start {
             host_profile.print(start.elapsed(), queued_operation_count, total_kernels);
             if host_category_trace {
@@ -636,4 +698,44 @@ fn dispatches_per_pass(total_kernels: usize) -> usize {
     }
 
     if total_kernels >= 1024 { 1 } else { usize::MAX }
+}
+
+fn dispatches_per_submit(total_kernels: usize, backend: wgpu::Backend) -> usize {
+    if let Ok(value) = std::env::var("FUSOR_RESOLVE_DISPATCHES_PER_SUBMIT")
+        && let Ok(parsed) = value.parse::<usize>()
+        && parsed > 0
+    {
+        return parsed;
+    }
+
+    if backend == wgpu::Backend::Metal && total_kernels > 8 {
+        8
+    } else {
+        usize::MAX
+    }
+}
+
+fn resolver_command_encoder(device: &crate::Device) -> wgpu::CommandEncoder {
+    device
+        .wgpu_device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Resolver Encoder"),
+        })
+}
+
+fn submit_resolver_encoder(
+    device: &crate::Device,
+    command_encoder: wgpu::CommandEncoder,
+    wait: bool,
+    host_trace: bool,
+    host_profile: &mut ResolveHostProfile,
+) {
+    let submit_start = host_trace.then(Instant::now);
+    device.wgpu_queue().submit(Some(command_encoder.finish()));
+    if wait {
+        device.poll_wait();
+    }
+    if let Some(start) = submit_start {
+        host_profile.submit += start.elapsed();
+    }
 }

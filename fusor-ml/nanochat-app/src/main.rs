@@ -339,7 +339,14 @@ fn InteractivePad(
                 match load_tokenizer(&runtime) {
                     Ok(loaded_tokenizer) => tokenizer.set(Some(loaded_tokenizer)),
                     Err(error) => {
-                        sketch_status.set(error);
+                        // No trained checkpoint yet: the board only needs a
+                        // tokenizer to turn strokes into tokens, so fall back to a
+                        // fresh one and keep drawing enabled. Live predictions stay
+                        // off (there is no model to load) until a checkpoint exists.
+                        tokenizer.set(Some(StrokeTokenizer::new()));
+                        sketch_status.set(format!(
+                            "Drawing enabled — no trained checkpoint loaded, so live predictions are off ({error})."
+                        ));
                         return;
                     }
                 }

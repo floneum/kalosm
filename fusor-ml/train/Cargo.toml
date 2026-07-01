@@ -7,4 +7,4 @@ license = "MIT/Apache-2.0"
 description = "Training utilities and optimizers for fusor models"
 
 [dependencies]
-fusor.workspace = true
+fusor = { workspace = true, features = ["cpu", "gpu"] }
