@@ -543,7 +543,13 @@ impl Tensor<1> {
         graph.leaf(crate::arange(device, start, end))
     }
 
-    pub fn arange_step(graph: &Graph, device: &Device, start: f32, end: f32, step: f32) -> Tensor<1> {
+    pub fn arange_step(
+        graph: &Graph,
+        device: &Device,
+        start: f32,
+        end: f32,
+        step: f32,
+    ) -> Tensor<1> {
         graph.leaf(crate::arange_step(device, start, end, step))
     }
 }

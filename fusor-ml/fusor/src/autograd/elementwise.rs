@@ -75,14 +75,20 @@ impl<const R: usize> Tensor<R> {
     }
 
     pub fn pow(&self, rhs: &Self) -> Self {
-        self.binary_op(rhs, self.value.pow(&rhs.value).to_concrete(), |grad, lhs, rhs| {
-            let rhs_minus_one = rhs.sub_scalar(1.0).to_concrete();
-            let lhs_power = lhs.pow(&rhs_minus_one).to_concrete();
-            let lhs_grad = ((grad.clone() * rhs.clone()).to_concrete() * lhs_power).to_concrete();
-            let rhs_grad = ((grad * lhs.pow(&rhs).to_concrete()).to_concrete() * lhs.log().to_concrete())
+        self.binary_op(
+            rhs,
+            self.value.pow(&rhs.value).to_concrete(),
+            |grad, lhs, rhs| {
+                let rhs_minus_one = rhs.sub_scalar(1.0).to_concrete();
+                let lhs_power = lhs.pow(&rhs_minus_one).to_concrete();
+                let lhs_grad =
+                    ((grad.clone() * rhs.clone()).to_concrete() * lhs_power).to_concrete();
+                let rhs_grad = ((grad * lhs.pow(&rhs).to_concrete()).to_concrete()
+                    * lhs.log().to_concrete())
                 .to_concrete();
-            vec![lhs_grad, rhs_grad]
-        })
+                vec![lhs_grad, rhs_grad]
+            },
+        )
     }
 
     pub fn pow_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2>) -> Tensor<R3> {
@@ -95,10 +101,16 @@ impl<const R: usize> Tensor<R> {
 
     pub fn pow_elementwise(&self, exponent: f32) -> Self {
         let input = self.value.clone();
-        self.unary_from_value(self.value.pow_elementwise(exponent).to_concrete(), move |grad, _| {
-            let power = input.pow_elementwise(exponent - 1.0).to_concrete();
-            (grad * power).to_concrete().mul_scalar(exponent).to_concrete()
-        })
+        self.unary_from_value(
+            self.value.pow_elementwise(exponent).to_concrete(),
+            move |grad, _| {
+                let power = input.pow_elementwise(exponent - 1.0).to_concrete();
+                (grad * power)
+                    .to_concrete()
+                    .mul_scalar(exponent)
+                    .to_concrete()
+            },
+        )
     }
 
     pub fn pow_scalar(&self, exponent: f32) -> Self {
@@ -145,7 +157,8 @@ impl<const R: usize> Tensor<R> {
         self.unary_from_value(self.value.abs().to_concrete(), move |grad, _| {
             let positive = input.mt(0.0).to_concrete();
             let negative = input.lt(0.0).to_concrete();
-            ((grad.clone() * positive).to_concrete() - (grad * negative).to_concrete()).to_concrete()
+            ((grad.clone() * positive).to_concrete() - (grad * negative).to_concrete())
+                .to_concrete()
         })
     }
 
@@ -171,9 +184,10 @@ impl<const R: usize> Tensor<R> {
     }
 
     pub fn approximate_exp(&self) -> Self {
-        self.unary_from_value(self.value.approximate_exp().to_concrete(), move |grad, out| {
-            (grad * out).to_concrete()
-        })
+        self.unary_from_value(
+            self.value.approximate_exp().to_concrete(),
+            move |grad, out| (grad * out).to_concrete(),
+        )
     }
 
     pub fn asin(&self) -> Self {
@@ -235,20 +249,27 @@ impl<const R: usize> Tensor<R> {
 
     pub fn exp2(&self) -> Self {
         self.unary_from_value(self.value.exp2().to_concrete(), move |grad, out| {
-            (grad * out).to_concrete().mul_scalar(std::f32::consts::LN_2).to_concrete()
+            (grad * out)
+                .to_concrete()
+                .mul_scalar(std::f32::consts::LN_2)
+                .to_concrete()
         })
     }
 
     pub fn less_approximate_exp(&self) -> Self {
-        self.unary_from_value(self.value.less_approximate_exp().to_concrete(), move |grad, out| {
-            (grad * out).to_concrete()
-        })
+        self.unary_from_value(
+            self.value.less_approximate_exp().to_concrete(),
+            move |grad, out| (grad * out).to_concrete(),
+        )
     }
 
     pub fn log2(&self) -> Self {
         let input = self.value.clone();
         self.unary_from_value(self.value.log2().to_concrete(), move |grad, _| {
-            (grad / input.clone()).to_concrete().div_scalar(std::f32::consts::LN_2).to_concrete()
+            (grad / input.clone())
+                .to_concrete()
+                .div_scalar(std::f32::consts::LN_2)
+                .to_concrete()
         })
     }
 
@@ -316,12 +337,16 @@ impl<const R: usize> Tensor<R> {
 
     pub fn eq_tensor(&self, rhs: &Self) -> Self {
         assert_same_graph(self, rhs);
-        self.binary_op(rhs, self.value.eq_tensor(&rhs.value).to_concrete(), move |_, lhs, rhs| {
-            vec![
-                RawTensor::zeros(&lhs.device(), lhs.shape()),
-                RawTensor::zeros(&rhs.device(), rhs.shape()),
-            ]
-        })
+        self.binary_op(
+            rhs,
+            self.value.eq_tensor(&rhs.value).to_concrete(),
+            move |_, lhs, rhs| {
+                vec![
+                    RawTensor::zeros(&lhs.device(), lhs.shape()),
+                    RawTensor::zeros(&rhs.device(), rhs.shape()),
+                ]
+            },
+        )
     }
 
     pub fn gt_scalar(&self, rhs: f32) -> Self {
@@ -332,12 +357,16 @@ impl<const R: usize> Tensor<R> {
 
     pub fn gt_tensor(&self, rhs: &Self) -> Self {
         assert_same_graph(self, rhs);
-        self.binary_op(rhs, self.value.gt_tensor(&rhs.value).to_concrete(), move |_, lhs, rhs| {
-            vec![
-                RawTensor::zeros(&lhs.device(), lhs.shape()),
-                RawTensor::zeros(&rhs.device(), rhs.shape()),
-            ]
-        })
+        self.binary_op(
+            rhs,
+            self.value.gt_tensor(&rhs.value).to_concrete(),
+            move |_, lhs, rhs| {
+                vec![
+                    RawTensor::zeros(&lhs.device(), lhs.shape()),
+                    RawTensor::zeros(&rhs.device(), rhs.shape()),
+                ]
+            },
+        )
     }
 
     pub fn gte_scalar(&self, rhs: f32) -> Self {
@@ -348,12 +377,16 @@ impl<const R: usize> Tensor<R> {
 
     pub fn gte_tensor(&self, rhs: &Self) -> Self {
         assert_same_graph(self, rhs);
-        self.binary_op(rhs, self.value.gte_tensor(&rhs.value).to_concrete(), move |_, lhs, rhs| {
-            vec![
-                RawTensor::zeros(&lhs.device(), lhs.shape()),
-                RawTensor::zeros(&rhs.device(), rhs.shape()),
-            ]
-        })
+        self.binary_op(
+            rhs,
+            self.value.gte_tensor(&rhs.value).to_concrete(),
+            move |_, lhs, rhs| {
+                vec![
+                    RawTensor::zeros(&lhs.device(), lhs.shape()),
+                    RawTensor::zeros(&rhs.device(), rhs.shape()),
+                ]
+            },
+        )
     }
 
     pub fn lt(&self, rhs: f32) -> Self {
@@ -368,12 +401,16 @@ impl<const R: usize> Tensor<R> {
 
     pub fn lt_tensor(&self, rhs: &Self) -> Self {
         assert_same_graph(self, rhs);
-        self.binary_op(rhs, self.value.lt_tensor(&rhs.value).to_concrete(), move |_, lhs, rhs| {
-            vec![
-                RawTensor::zeros(&lhs.device(), lhs.shape()),
-                RawTensor::zeros(&rhs.device(), rhs.shape()),
-            ]
-        })
+        self.binary_op(
+            rhs,
+            self.value.lt_tensor(&rhs.value).to_concrete(),
+            move |_, lhs, rhs| {
+                vec![
+                    RawTensor::zeros(&lhs.device(), lhs.shape()),
+                    RawTensor::zeros(&rhs.device(), rhs.shape()),
+                ]
+            },
+        )
     }
 
     pub fn lte(&self, rhs: f32) -> Self {
@@ -388,19 +425,24 @@ impl<const R: usize> Tensor<R> {
 
     pub fn lte_tensor(&self, rhs: &Self) -> Self {
         assert_same_graph(self, rhs);
-        self.binary_op(rhs, self.value.lte_tensor(&rhs.value).to_concrete(), move |_, lhs, rhs| {
-            vec![
-                RawTensor::zeros(&lhs.device(), lhs.shape()),
-                RawTensor::zeros(&rhs.device(), rhs.shape()),
-            ]
-        })
+        self.binary_op(
+            rhs,
+            self.value.lte_tensor(&rhs.value).to_concrete(),
+            move |_, lhs, rhs| {
+                vec![
+                    RawTensor::zeros(&lhs.device(), lhs.shape()),
+                    RawTensor::zeros(&rhs.device(), rhs.shape()),
+                ]
+            },
+        )
     }
 
     pub fn max_elementwise(&self, rhs: f32) -> Self {
         let input = self.value.clone();
-        self.unary_from_value(self.value.max_elementwise(rhs).to_concrete(), move |grad, _| {
-            (grad * input.mt(rhs).to_concrete()).to_concrete()
-        })
+        self.unary_from_value(
+            self.value.max_elementwise(rhs).to_concrete(),
+            move |grad, _| (grad * input.mt(rhs).to_concrete()).to_concrete(),
+        )
     }
 
     pub fn max_scalar(&self, rhs: f32) -> Self {
@@ -409,9 +451,10 @@ impl<const R: usize> Tensor<R> {
 
     pub fn min_elementwise(&self, rhs: f32) -> Self {
         let input = self.value.clone();
-        self.unary_from_value(self.value.min_elementwise(rhs).to_concrete(), move |grad, _| {
-            (grad * input.lt(rhs).to_concrete()).to_concrete()
-        })
+        self.unary_from_value(
+            self.value.min_elementwise(rhs).to_concrete(),
+            move |grad, _| (grad * input.lt(rhs).to_concrete()).to_concrete(),
+        )
     }
 
     pub fn min_scalar(&self, rhs: f32) -> Self {
@@ -438,12 +481,16 @@ impl<const R: usize> Tensor<R> {
 
     pub fn ne_tensor(&self, rhs: &Self) -> Self {
         assert_same_graph(self, rhs);
-        self.binary_op(rhs, self.value.ne_tensor(&rhs.value).to_concrete(), move |_, lhs, rhs| {
-            vec![
-                RawTensor::zeros(&lhs.device(), lhs.shape()),
-                RawTensor::zeros(&rhs.device(), rhs.shape()),
-            ]
-        })
+        self.binary_op(
+            rhs,
+            self.value.ne_tensor(&rhs.value).to_concrete(),
+            move |_, lhs, rhs| {
+                vec![
+                    RawTensor::zeros(&lhs.device(), lhs.shape()),
+                    RawTensor::zeros(&rhs.device(), rhs.shape()),
+                ]
+            },
+        )
     }
 
     pub fn silu(&self) -> Self {
@@ -479,7 +526,10 @@ impl<const R: usize> Tensor<R> {
         assert_same_graph(self, on_true);
         assert_same_graph(self, on_false);
 
-        let value = self.value.where_cond(&on_true.value, &on_false.value).to_concrete();
+        let value = self
+            .value
+            .where_cond(&on_true.value, &on_false.value)
+            .to_concrete();
         let condition_id = self.handle.id;
         let true_id = on_true.handle.id;
         let false_id = on_false.handle.id;

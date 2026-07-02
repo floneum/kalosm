@@ -273,15 +273,10 @@ impl Tensor<4> {
         let graph = self.graph();
         let device = self.device();
         let zeros = Tensor::zeros(&graph, &device, [batch, heads, sequence_length, half, 2]);
-        let combined = zeros.slice_assign(
-            [0..batch, 0..heads, 0..sequence_length, 0..half, 0..1],
-            &y0,
-        );
+        let combined =
+            zeros.slice_assign([0..batch, 0..heads, 0..sequence_length, 0..half, 0..1], &y0);
         combined
-            .slice_assign(
-                [0..batch, 0..heads, 0..sequence_length, 0..half, 1..2],
-                &y1,
-            )
+            .slice_assign([0..batch, 0..heads, 0..sequence_length, 0..half, 1..2], &y1)
             .flatten_last_n::<1, 4>()
     }
 
@@ -320,12 +315,7 @@ impl Tensor<4> {
         scale: f32,
         mask: Option<(&RawTensor<2, f32>, MaskKind)>,
     ) -> Tensor<4> {
-        let value = self.value.flash_attention(
-            &k.value,
-            &v.value,
-            scale,
-            mask,
-        );
+        let value = self.value.flash_attention(&k.value, &v.value, scale, mask);
         let mask_value = mask.map(|(mask, kind)| (mask.clone(), kind));
         self.replay_ternary(k, v, "flash_attention", value, move |q, k, v| {
             q.flash_attention_composite(&k, &v, scale, mask_value.as_ref())

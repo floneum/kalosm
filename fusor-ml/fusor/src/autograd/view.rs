@@ -192,7 +192,11 @@ impl<const R: usize> Tensor<R> {
             let zeros = RawTensor::zeros(&gradient.device(), input_shape);
             Ok(vec![BackwardTarget {
                 node: input_id,
-                gradient: Box::new(zeros.slice_assign(copy_slices.clone(), &patch).to_concrete()),
+                gradient: Box::new(
+                    zeros
+                        .slice_assign(copy_slices.clone(), &patch)
+                        .to_concrete(),
+                ),
             }])
         });
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
@@ -207,9 +211,12 @@ impl<const R: usize> Tensor<R> {
             let gradient = downcast_tensor::<OUT>(&*gradient, "restride")?;
             let reduced = reduce_restride_gradient(&gradient, &specs, [0; R], input_shape)
                 .unwrap_or_else(|| {
-                    scatter_restride_gradient(&gradient, output_shape, input_shape, |output_index| {
-                        restride_input_index(specs, output_index)
-                    })
+                    scatter_restride_gradient(
+                        &gradient,
+                        output_shape,
+                        input_shape,
+                        |output_index| restride_input_index(specs, output_index),
+                    )
                 });
             Ok(vec![BackwardTarget {
                 node: input_id,
@@ -233,10 +240,15 @@ impl<const R: usize> Tensor<R> {
                     reduce_restride_gradient(&gradient, &specs, offsets, input_shape)
                 })
                 .unwrap_or_else(|| {
-                    scatter_restride_gradient(&gradient, output_shape, input_shape, |output_index| {
-                        let linear = new_layout.linear_index(&output_index);
-                        contiguous_index_from_linear::<R>(linear, &input_strides)
-                    })
+                    scatter_restride_gradient(
+                        &gradient,
+                        output_shape,
+                        input_shape,
+                        |output_index| {
+                            let linear = new_layout.linear_index(&output_index);
+                            contiguous_index_from_linear::<R>(linear, &input_strides)
+                        },
+                    )
                 });
             Ok(vec![BackwardTarget {
                 node: input_id,
@@ -255,7 +267,11 @@ impl<const R: usize> Tensor<R> {
     {
         let shape = self.shape();
         for &axis in &axes {
-            assert_eq!(shape[axis], 1, "Squeeze dimension {} must have size 1", axis);
+            assert_eq!(
+                shape[axis], 1,
+                "Squeeze dimension {} must have size 1",
+                axis
+            );
         }
         let mut sorted_axes = axes;
         sorted_axes.sort_unstable();
@@ -301,7 +317,10 @@ impl<const R: usize> Tensor<R> {
     pub fn slice_assign(&self, slices: [Range<usize>; R], value: &Self) -> Self {
         assert_same_graph(self, value);
 
-        let output = self.value.slice_assign(slices.clone(), &value.value).to_concrete();
+        let output = self
+            .value
+            .slice_assign(slices.clone(), &value.value)
+            .to_concrete();
         let input_id = self.handle.id;
         let value_id = value.handle.id;
         let slice_shape = slices
@@ -328,7 +347,10 @@ impl<const R: usize> Tensor<R> {
         )
     }
 
-    pub fn stack<const OUT: usize>(tensors: impl IntoIterator<Item = Self>, dim: usize) -> Tensor<OUT>
+    pub fn stack<const OUT: usize>(
+        tensors: impl IntoIterator<Item = Self>,
+        dim: usize,
+    ) -> Tensor<OUT>
     where
         crate::ConcreteTensor<f32, R>: crate::cpu::LargerRank<OUT, 1, f32>,
         crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<1, OUT, f32>,
@@ -345,7 +367,11 @@ impl<const R: usize> Tensor<R> {
                     Arc::ptr_eq(&graph, &tensor.handle.graph),
                     "cannot mix autograd tensors from different graphs"
                 );
-                assert_eq!(tensor.shape(), input_shape, "stack requires matching shapes");
+                assert_eq!(
+                    tensor.shape(),
+                    input_shape,
+                    "stack requires matching shapes"
+                );
                 tensor.value.unsqueeze_dims::<1, OUT>([dim]).to_concrete()
             })
             .collect::<Vec<_>>();

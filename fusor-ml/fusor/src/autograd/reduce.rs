@@ -107,12 +107,14 @@ impl<const R: usize> Tensor<R> {
                 .product_keepdim::<OUT_RANK>(axis)
                 .broadcast_as(input_shape)
                 .to_concrete();
-            let no_zero_grad = (upstream.clone() * (product_non_zero.clone() / safe_input).to_concrete())
-                .to_concrete();
+            let no_zero_grad = (upstream.clone()
+                * (product_non_zero.clone() / safe_input).to_concrete())
+            .to_concrete();
             let single_zero_grad = zero_mask
                 .where_cond(&(upstream * product_non_zero).to_concrete(), &zeros)
                 .to_concrete();
-            let gradient = ((no_zero_grad * zero_count_broadcast.eq(0.0).to_concrete()).to_concrete()
+            let gradient = ((no_zero_grad * zero_count_broadcast.eq(0.0).to_concrete())
+                .to_concrete()
                 + (single_zero_grad * zero_count_broadcast.eq(1.0).to_concrete()).to_concrete())
             .to_concrete();
             Ok(vec![BackwardTarget {
