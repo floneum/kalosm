@@ -78,9 +78,7 @@ impl Resolver {
 
         // Pass 4: Execution
         // Extract operations in order.
-        let first_target = self.targets[0];
         let target_set: FxHashSet<NodeIndex> = self.targets.iter().copied().collect();
-        let mut first_target_data = None;
         let mut queued_operations = Vec::with_capacity(sorted_nodes.len());
 
         {
@@ -89,11 +87,7 @@ impl Resolver {
                 let node = &self.execution_graph[idx];
                 // Handle Tensor caching explicitly here
                 if let ExecutionVariant::Tensor(data) = &node.variant {
-                    let data = data.clone();
-                    if node.inner_idx == first_target {
-                        first_target_data = Some(data.clone());
-                    }
-                    graph.set_cached_result(node.inner_idx, data);
+                    graph.set_cached_result(node.inner_idx, data.clone());
                     continue;
                 }
 
@@ -176,9 +170,6 @@ impl Resolver {
             };
             if let Some(result) = view_result {
                 let start = host_trace.then(Instant::now);
-                if node == first_target {
-                    first_target_data = Some(result.clone());
-                }
                 // Cache the result
                 graph.set_cached_result(node, result);
                 // Map-layout nodes are resolved immediately — release any
@@ -202,9 +193,6 @@ impl Resolver {
                     Self::try_prepare_in_place_slice_assign_copy(graph, slice_assign)
                 });
                 if let Some((output, copies)) = slice_copy {
-                    if node == first_target {
-                        first_target_data = Some(output.clone());
-                    }
                     graph.set_cached_result(node, output);
                     commands.extend(copies.into_iter().map(CommandRecord::CopyBuffer));
                     let start = host_trace.then(Instant::now);
@@ -235,10 +223,7 @@ impl Resolver {
                     let MirValue::Tensor(resolved) = result else {
                         panic!("QMatMul output value is not a tensor");
                     };
-                    if node == first_target {
-                        first_target_data = Some(resolved.clone());
-                    }
-                    graph.set_cached_result(node, resolved);
+                    graph.set_cached_result(node, resolved.clone());
                     if let Some(start) = start {
                         let elapsed = start.elapsed();
                         host_profile.output += elapsed;
@@ -357,10 +342,7 @@ impl Resolver {
                 let MirValue::Tensor(resolved) = result else {
                     panic!("Kernel input value is not a tensor");
                 };
-                if node == first_target {
-                    first_target_data = Some(resolved.clone());
-                }
-                graph.set_cached_result(node, resolved);
+                graph.set_cached_result(node, resolved.clone());
                 if let Some(start) = start {
                     let elapsed = start.elapsed();
                     host_profile.output += elapsed;
@@ -662,24 +644,9 @@ impl Resolver {
             }
         }
 
-        let produced_first_target = first_target_data.is_some();
-        let data = match first_target_data.or_else(|| graph.get_result(first_target)) {
-            Some(data) => data,
-            None => {
-                let target_state = graph.nodes.nodes.node_weight(first_target).map(|node| {
-                    (
-                        node_category_inner(&node.variant),
-                        node.reference_count,
-                        node.live_descendant_count,
-                        node.cached.is_some(),
-                    )
-                });
-                panic!(
-                    "Target result not cached target={first_target:?} produced_first_target={produced_first_target} target_state={target_state:?} execution_nodes={} queued_operations={queued_operation_count} kernels={total_kernels}",
-                    self.execution_graph.node_count(),
-                );
-            }
-        };
+        let data = graph
+            .get_result(self.targets[0])
+            .expect("Target result not cached");
         let tail_result = tail(&data, &mut command_encoder);
 
         // Submit any remaining commands.
@@ -795,8 +762,10 @@ fn dispatches_per_submit(total_kernels: usize, backend: wgpu::Backend) -> usize 
         return parsed;
     }
 
-    if backend == wgpu::Backend::Metal && total_kernels > 8 {
-        8
+    // Chunked submits exist to bound in-flight memory on giant training
+    // graphs; small inference graphs must stay a single submit.
+    if backend == wgpu::Backend::Metal && total_kernels >= 1024 {
+        256
     } else {
         usize::MAX
     }
