@@ -622,12 +622,7 @@ impl<const R: usize> Tensor<R> {
     }
 
     pub fn relu(&self) -> Self {
-        let output = self.value.max_scalar(0.0).to_concrete();
-        self.unary_from_value(output.clone(), move |grad, out| {
-            let zeros = RawTensor::zeros(&out.device(), out.shape());
-            let ones = RawTensor::splat(&out.device(), 1.0, out.shape());
-            (grad * out.where_cond(&ones, &zeros)).to_concrete()
-        })
+        self.max_elementwise(0.0)
     }
 
     pub fn clamp(&self, min: f32, max: f32) -> Self {
@@ -1187,35 +1182,6 @@ impl<const R: usize> Tensor<R> {
             vec![self.handle.clone(), value.handle.clone()],
             Some(backward),
         )
-    }
-
-    fn pad_axis(&self, axis: usize, padding: usize) -> Self {
-        if padding == 0 {
-            return self.clone();
-        }
-
-        let input_shape = self.shape();
-        let mut output_shape = input_shape;
-        output_shape[axis] += padding * 2;
-        let slices: [Range<usize>; R] = std::array::from_fn(|dim| {
-            if dim == axis {
-                padding..padding + input_shape[dim]
-            } else {
-                0..input_shape[dim]
-            }
-        });
-        let value = RawTensor::zeros(&self.device(), output_shape)
-            .slice_assign(slices.clone(), &self.value)
-            .to_concrete();
-        let input_id = self.handle.id;
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<R>(&*gradient, "pad_axis")?;
-            Ok(vec![BackwardTarget {
-                node: input_id,
-                gradient: Box::new(gradient.slice(slices.clone()).to_concrete()),
-            }])
-        });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     fn unary_from_value(
@@ -1922,16 +1888,6 @@ impl<const R: usize> Tensor<R> {
         self.softmax_composite::<OUT_RANK>(axis)
     }
 
-    pub fn softmax_slow<const OUT_RANK: usize>(&self, axis: usize) -> Self
-    where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<f32>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
-    {
-        self.softmax::<OUT_RANK>(axis)
-    }
-
     pub fn softmax_last_dim<const OUT_RANK: usize>(&self) -> Self
     where
         crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
@@ -1940,16 +1896,6 @@ impl<const R: usize> Tensor<R> {
         crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
     {
         self.softmax::<OUT_RANK>(R - 1)
-    }
-
-    pub fn softmax_slow_last_dim<const OUT_RANK: usize>(&self) -> Self
-    where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<f32>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
-    {
-        self.softmax_last_dim::<OUT_RANK>()
     }
 
     pub fn softmax_last_dim_fused<const OUT_RANK: usize>(&self) -> Self
@@ -2097,71 +2043,21 @@ impl Tensor<1> {
     }
 
     pub fn unsqueeze(&self, dim: usize) -> Tensor<2> {
-        let value = self.value.unsqueeze(dim).to_concrete();
-        let input_id = self.handle.id;
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<2>(&*gradient, "unsqueeze")?;
-            Ok(vec![BackwardTarget {
-                node: input_id,
-                gradient: Box::new(gradient.squeeze(dim).to_concrete()),
-            }])
-        });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.unsqueeze_dims::<1, 2>([dim])
     }
 }
 
 impl Tensor<2> {
     pub fn mat_mul(&self, rhs: &Tensor<2>) -> Tensor<2> {
-        assert_same_graph(self, rhs);
-        let value = self.value.mat_mul(&rhs.value);
-        let lhs_id = self.handle.id;
-        let rhs_id = rhs.handle.id;
-        let lhs_value = self.value.clone();
-        let rhs_value = rhs.value.clone();
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<2>(&*gradient, "mat_mul")?;
-            Ok(vec![
-                BackwardTarget {
-                    node: lhs_id,
-                    gradient: Box::new(gradient.clone().mat_mul(&rhs_value.transpose(0, 1))),
-                },
-                BackwardTarget {
-                    node: rhs_id,
-                    gradient: Box::new(lhs_value.transpose(0, 1).mat_mul(&gradient)),
-                },
-            ])
-        });
-        self.from_op(
-            value,
-            vec![self.handle.clone(), rhs.handle.clone()],
-            Some(backward),
-        )
+        self.mat_mul_internal(rhs)
     }
 
     pub fn squeeze(&self, dim: usize) -> Tensor<1> {
-        let value = self.value.squeeze(dim).to_concrete();
-        let input_id = self.handle.id;
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<1>(&*gradient, "squeeze")?;
-            Ok(vec![BackwardTarget {
-                node: input_id,
-                gradient: Box::new(gradient.unsqueeze(dim).to_concrete()),
-            }])
-        });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.squeeze_dims::<1, 1>([dim])
     }
 
     pub fn unsqueeze(&self, dim: usize) -> Tensor<3> {
-        let value = self.value.unsqueeze(dim).to_concrete();
-        let input_id = self.handle.id;
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<3>(&*gradient, "unsqueeze")?;
-            Ok(vec![BackwardTarget {
-                node: input_id,
-                gradient: Box::new(gradient.squeeze(dim).to_concrete()),
-            }])
-        });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.unsqueeze_dims::<1, 3>([dim])
     }
 
     pub fn sum(&self, axis: usize) -> Tensor<1> {
@@ -2184,43 +2080,15 @@ impl Tensor<2> {
     }
 
     pub fn sum_keepdim(&self, axis: usize) -> Tensor<2> {
-        let input_shape = self.shape();
-        let value = self.value.sum_keepdim::<1>(axis).to_concrete();
-        let input_id = self.handle.id;
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<2>(&*gradient, "sum_keepdim")?;
-            Ok(vec![BackwardTarget {
-                node: input_id,
-                gradient: Box::new(gradient.broadcast_as(input_shape).to_concrete()),
-            }])
-        });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.sum_keepdim_any::<1>(axis)
     }
 
     pub fn layer_norm(&self, weight: &Tensor<1>, bias: Option<&Tensor<1>>, eps: f32) -> Tensor<2> {
-        let centered = {
-            let mean = self.sum_keepdim(1).div_scalar(self.shape()[1] as f32);
-            self.sub(&mean.broadcast_as(self.shape()))
-        };
-        let variance = centered
-            .sqr()
-            .sum_keepdim(1)
-            .div_scalar(self.shape()[1] as f32);
-        let std = variance.add_scalar(eps).sqrt();
-        let normalized = centered.div(&std.broadcast_as(self.shape()));
-        let scaled = normalized.mul(&weight.broadcast_as(self.shape()));
-        if let Some(bias) = bias {
-            scaled.add(&bias.broadcast_as(self.shape()))
-        } else {
-            scaled
-        }
+        self.layer_norm_composite::<1>(weight, bias, eps)
     }
 
     pub fn rms_norm(&self, weight: &Tensor<1>, eps: f32) -> Tensor<2> {
-        let variance = self.sqr().sum_keepdim(1).div_scalar(self.shape()[1] as f32);
-        let std = variance.add_scalar(eps).sqrt();
-        let normalized = self.div(&std.broadcast_as(self.shape()));
-        normalized.mul(&weight.broadcast_as(self.shape()))
+        self.rms_norm_composite::<1>(weight, None, eps)
     }
 
     pub fn index_select(&self, dimension: usize, indices: &RawTensor<1, u32>) -> Tensor<2> {
@@ -2370,66 +2238,12 @@ impl Tensor<2> {
 }
 
 impl Tensor<3> {
-    pub fn sliding_window_view(&self, window: SlidingWindow) -> Tensor<4> {
-        assert_eq!(
-            window.axis, 2,
-            "autograd sliding_window_view for Tensor<3> currently supports axis=2"
-        );
-        let input_shape = self.shape();
-        let value = self.value.sliding_window_view([window]).to_concrete();
-        let input_id = self.handle.id;
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<4>(&*gradient, "sliding_window_view")?;
-            Ok(vec![BackwardTarget {
-                node: input_id,
-                gradient: Box::new(sliding_window_view_backward_3(
-                    &gradient,
-                    input_shape,
-                    window,
-                )),
-            }])
-        });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
-    }
-
     pub fn mat_mul(&self, rhs: &Tensor<3>) -> Tensor<3> {
-        assert_same_graph(self, rhs);
-        let value = self.value.mat_mul(&rhs.value);
-        let lhs_id = self.handle.id;
-        let rhs_id = rhs.handle.id;
-        let lhs_value = self.value.clone();
-        let rhs_value = rhs.value.clone();
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<3>(&*gradient, "mat_mul")?;
-            Ok(vec![
-                BackwardTarget {
-                    node: lhs_id,
-                    gradient: Box::new(gradient.clone().mat_mul(&rhs_value.transpose(1, 2))),
-                },
-                BackwardTarget {
-                    node: rhs_id,
-                    gradient: Box::new(lhs_value.transpose(1, 2).mat_mul(&gradient)),
-                },
-            ])
-        });
-        self.from_op(
-            value,
-            vec![self.handle.clone(), rhs.handle.clone()],
-            Some(backward),
-        )
+        self.mat_mul_internal(rhs)
     }
 
     pub fn squeeze(&self, dim: usize) -> Tensor<2> {
-        let value = self.value.squeeze(dim).to_concrete();
-        let input_id = self.handle.id;
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<2>(&*gradient, "squeeze")?;
-            Ok(vec![BackwardTarget {
-                node: input_id,
-                gradient: Box::new(gradient.unsqueeze(dim).to_concrete()),
-            }])
-        });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.squeeze_dims::<1, 2>([dim])
     }
 
     pub fn sum(&self, axis: usize) -> Tensor<2> {
@@ -2452,17 +2266,7 @@ impl Tensor<3> {
     }
 
     pub fn sum_keepdim(&self, axis: usize) -> Tensor<3> {
-        let input_shape = self.shape();
-        let value = self.value.sum_keepdim::<2>(axis).to_concrete();
-        let input_id = self.handle.id;
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<3>(&*gradient, "sum_keepdim")?;
-            Ok(vec![BackwardTarget {
-                node: input_id,
-                gradient: Box::new(gradient.broadcast_as(input_shape).to_concrete()),
-            }])
-        });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.sum_keepdim_any::<2>(axis)
     }
 
     pub fn cat(tensors: Vec<Tensor<3>>, dim: usize) -> Tensor<3> {
@@ -2531,72 +2335,11 @@ impl Tensor<3> {
     }
 
     pub fn layer_norm(&self, weight: &Tensor<1>, bias: Option<&Tensor<1>>, eps: f32) -> Tensor<3> {
-        let centered = {
-            let mean = self.sum_keepdim(2).div_scalar(self.shape()[2] as f32);
-            self.sub(&mean.broadcast_as(self.shape()))
-        };
-        let variance = centered
-            .sqr()
-            .sum_keepdim(2)
-            .div_scalar(self.shape()[2] as f32);
-        let std = variance.add_scalar(eps).sqrt();
-        let normalized = centered.div(&std.broadcast_as(self.shape()));
-        let scaled = normalized.mul(&weight.broadcast_as(self.shape()));
-        if let Some(bias) = bias {
-            scaled.add(&bias.broadcast_as(self.shape()))
-        } else {
-            scaled
-        }
+        self.layer_norm_composite::<2>(weight, bias, eps)
     }
 
     pub fn rms_norm(&self, weight: &Tensor<1>, eps: f32) -> Tensor<3> {
-        let variance = self.sqr().sum_keepdim(2).div_scalar(self.shape()[2] as f32);
-        let std = variance.add_scalar(eps).sqrt();
-        let normalized = self.div(&std.broadcast_as(self.shape()));
-        normalized.mul(&weight.broadcast_as(self.shape()))
-    }
-
-    pub fn conv(
-        &self,
-        weight: &Tensor<3>,
-        bias: Option<&Tensor<1>>,
-        padding: [usize; 1],
-        strides: [usize; 1],
-    ) -> Tensor<3> {
-        assert_same_graph(self, weight);
-        if let Some(bias) = bias {
-            assert_same_graph(self, bias);
-        }
-
-        let input_shape = self.shape();
-        let weight_shape = weight.shape();
-        let batch = input_shape[0];
-        let in_channels = input_shape[1];
-        let out_channels = weight_shape[0];
-        let kernel_size = weight_shape[2];
-
-        let padded = self.pad_axis(2, padding[0]);
-        let out_len = (input_shape[2] + 2 * padding[0] - kernel_size) / strides[0] + 1;
-        let windows = padded.sliding_window_view(SlidingWindow::new(2, kernel_size, strides[0]));
-        let windows_flat = windows
-            .permute(conv_window_permutation::<4, 1>())
-            .reshape([batch * out_len, in_channels * kernel_size]);
-        let weight_t = weight
-            .reshape([out_channels, in_channels * kernel_size])
-            .transpose(0, 1);
-        let output = windows_flat.mat_mul(&weight_t);
-        let mut output_final = output
-            .reshape([batch, out_len, out_channels])
-            .permute(conv_output_permutation::<3, 1>())
-            .reshape([batch, out_channels, out_len]);
-        if let Some(bias) = bias {
-            output_final = output_final.add(&bias.reshape([1, out_channels, 1]).broadcast_as([
-                batch,
-                out_channels,
-                out_len,
-            ]));
-        }
-        output_final
+        self.rms_norm_composite::<2>(weight, None, eps)
     }
 }
 
@@ -2743,120 +2486,15 @@ impl Tensor<4> {
     }
 
     pub fn sum_keepdim(&self, axis: usize) -> Tensor<4> {
-        let input_shape = self.shape();
-        let value = self.value.sum_keepdim::<3>(axis).to_concrete();
-        let input_id = self.handle.id;
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<4>(&*gradient, "sum_keepdim")?;
-            Ok(vec![BackwardTarget {
-                node: input_id,
-                gradient: Box::new(gradient.broadcast_as(input_shape).to_concrete()),
-            }])
-        });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.sum_keepdim_any::<3>(axis)
     }
 
     pub fn layer_norm(&self, weight: &Tensor<1>, bias: Option<&Tensor<1>>, eps: f32) -> Tensor<4> {
-        let centered = {
-            let mean = self.sum_keepdim(3).div_scalar(self.shape()[3] as f32);
-            self.sub(&mean.broadcast_as(self.shape()))
-        };
-        let variance = centered
-            .sqr()
-            .sum_keepdim(3)
-            .div_scalar(self.shape()[3] as f32);
-        let std = variance.add_scalar(eps).sqrt();
-        let normalized = centered.div(&std.broadcast_as(self.shape()));
-        let scaled = normalized.mul(&weight.broadcast_as(self.shape()));
-        if let Some(bias) = bias {
-            scaled.add(&bias.broadcast_as(self.shape()))
-        } else {
-            scaled
-        }
+        self.layer_norm_composite::<3>(weight, bias, eps)
     }
 
     pub fn rms_norm(&self, weight: &Tensor<1>, eps: f32) -> Tensor<4> {
-        let variance = self.sqr().sum_keepdim(3).div_scalar(self.shape()[3] as f32);
-        let std = variance.add_scalar(eps).sqrt();
-        let normalized = self.div(&std.broadcast_as(self.shape()));
-        normalized.mul(&weight.broadcast_as(self.shape()))
-    }
-
-    pub fn sliding_window_view(&self, windows: [SlidingWindow; 2]) -> Tensor<6> {
-        assert_eq!(
-            windows[0].axis, 2,
-            "autograd sliding_window_view for Tensor<4> currently supports axis=2 for the first window"
-        );
-        assert_eq!(
-            windows[1].axis, 3,
-            "autograd sliding_window_view for Tensor<4> currently supports axis=3 for the second window"
-        );
-        let input_shape = self.shape();
-        let value = self.value.sliding_window_view(windows).to_concrete();
-        let input_id = self.handle.id;
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<6>(&*gradient, "sliding_window_view")?;
-            Ok(vec![BackwardTarget {
-                node: input_id,
-                gradient: Box::new(sliding_window_view_backward_4(
-                    &gradient,
-                    input_shape,
-                    windows,
-                )),
-            }])
-        });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
-    }
-
-    pub fn conv(
-        &self,
-        weight: &Tensor<4>,
-        bias: Option<&Tensor<1>>,
-        padding: [usize; 2],
-        strides: [usize; 2],
-    ) -> Tensor<4> {
-        assert_same_graph(self, weight);
-        if let Some(bias) = bias {
-            assert_same_graph(self, bias);
-        }
-
-        let input_shape = self.shape();
-        let weight_shape = weight.shape();
-        let batch = input_shape[0];
-        let in_channels = input_shape[1];
-        let out_channels = weight_shape[0];
-        let kernel_h = weight_shape[2];
-        let kernel_w = weight_shape[3];
-        let out_h = (input_shape[2] + 2 * padding[0] - kernel_h) / strides[0] + 1;
-        let out_w = (input_shape[3] + 2 * padding[1] - kernel_w) / strides[1] + 1;
-        let out_spatial = out_h * out_w;
-        let kernel_size = kernel_h * kernel_w;
-
-        let padded = self.pad_axis(2, padding[0]).pad_axis(3, padding[1]);
-        let windows = padded.sliding_window_view([
-            SlidingWindow::new(2, kernel_h, strides[0]),
-            SlidingWindow::new(3, kernel_w, strides[1]),
-        ]);
-        let windows_flat = windows
-            .permute(conv_window_permutation::<6, 2>())
-            .reshape([batch * out_spatial, in_channels * kernel_size]);
-        let weight_t = weight
-            .reshape([out_channels, in_channels * kernel_size])
-            .transpose(0, 1);
-        let output = windows_flat.mat_mul(&weight_t);
-        let mut output_final = output
-            .reshape([batch, out_h, out_w, out_channels])
-            .permute(conv_output_permutation::<4, 2>())
-            .reshape([batch, out_channels, out_h, out_w]);
-        if let Some(bias) = bias {
-            output_final = output_final.add(&bias.reshape([1, out_channels, 1, 1]).broadcast_as([
-                batch,
-                out_channels,
-                out_h,
-                out_w,
-            ]));
-        }
-        output_final
+        self.rms_norm_composite::<3>(weight, None, eps)
     }
 
     fn flash_attention_composite(
@@ -3124,32 +2762,6 @@ fn assert_same_graph<const R: usize, const R2: usize>(lhs: &Tensor<R>, rhs: &Ten
     );
 }
 
-fn conv_window_permutation<const R2: usize, const DIFF: usize>() -> [usize; R2] {
-    std::array::from_fn(|index| {
-        if index == 0 {
-            0
-        } else if index <= DIFF {
-            index + 1
-        } else if index == DIFF + 1 {
-            1
-        } else {
-            index
-        }
-    })
-}
-
-fn conv_output_permutation<const R: usize, const DIFF: usize>() -> [usize; R] {
-    std::array::from_fn(|index| {
-        if index == 0 {
-            0
-        } else if index == 1 {
-            DIFF + 1
-        } else {
-            index - 1
-        }
-    })
-}
-
 fn for_each_index<const R: usize>(limits: [usize; R], mut visitor: impl FnMut([usize; R])) {
     if limits.contains(&0) {
         return;
@@ -3196,78 +2808,6 @@ fn contiguous_index_from_linear<const R: usize>(
         linear %= strides[axis];
     }
     input_index
-}
-
-fn sliding_window_view_backward_3(
-    gradient: &RawTensor<4, f32>,
-    input_shape: [usize; 3],
-    window: SlidingWindow,
-) -> RawTensor<3, f32> {
-    let mut input_gradient = RawTensor::zeros(&gradient.device(), input_shape);
-    let out_len = gradient.shape()[2];
-    for out_index in 0..out_len {
-        let start = out_index * window.step;
-        let patch = gradient
-            .slice([
-                0..gradient.shape()[0],
-                0..gradient.shape()[1],
-                out_index..out_index + 1,
-                0..window.window_size,
-            ])
-            .reshape([input_shape[0], input_shape[1], window.window_size])
-            .to_concrete();
-        let target = [
-            0..input_shape[0],
-            0..input_shape[1],
-            start..start + window.window_size,
-        ];
-        let current = input_gradient.slice(target.clone()).to_concrete();
-        let updated = (current + patch).to_concrete();
-        input_gradient = input_gradient.slice_assign(target, &updated).to_concrete();
-    }
-    input_gradient
-}
-
-fn sliding_window_view_backward_4(
-    gradient: &RawTensor<6, f32>,
-    input_shape: [usize; 4],
-    windows: [SlidingWindow; 2],
-) -> RawTensor<4, f32> {
-    let mut input_gradient = RawTensor::zeros(&gradient.device(), input_shape);
-    let out_h = gradient.shape()[2];
-    let out_w = gradient.shape()[3];
-    for y in 0..out_h {
-        for x in 0..out_w {
-            let start_y = y * windows[0].step;
-            let start_x = x * windows[1].step;
-            let patch = gradient
-                .slice([
-                    0..gradient.shape()[0],
-                    0..gradient.shape()[1],
-                    y..y + 1,
-                    x..x + 1,
-                    0..windows[0].window_size,
-                    0..windows[1].window_size,
-                ])
-                .reshape([
-                    input_shape[0],
-                    input_shape[1],
-                    windows[0].window_size,
-                    windows[1].window_size,
-                ])
-                .to_concrete();
-            let target = [
-                0..input_shape[0],
-                0..input_shape[1],
-                start_y..start_y + windows[0].window_size,
-                start_x..start_x + windows[1].window_size,
-            ];
-            let current = input_gradient.slice(target.clone()).to_concrete();
-            let updated = (current + patch).to_concrete();
-            input_gradient = input_gradient.slice_assign(target, &updated).to_concrete();
-        }
-    }
-    input_gradient
 }
 
 fn reduce_broadcast_gradient<const IN: usize, const OUT: usize>(
@@ -5137,110 +4677,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_backward_softmax_slow_matches_softmax_cpu() {
-        let device = Device::cpu();
-
-        let slow_graph = Graph::new();
-        let slow_input: Tensor<2> =
-            Tensor::new(&slow_graph, &device, &[[1.0f32, 2.0], [3.0, 4.0]]);
-        let slow_weights: Tensor<2> =
-            Tensor::new(&slow_graph, &device, &[[0.5f32, 1.5], [2.5, 3.5]]);
-        let slow_output = slow_input.softmax_slow::<1>(1);
-        let slow_values = slow_output.raw().clone().as_slice().await.unwrap().to_vec2();
-        let slow_loss = slow_output.mul(&slow_weights).flatten_all().sum();
-        let slow_gradients = slow_loss.backward().unwrap();
-        let slow_dinput = slow_gradients
-            .get(&slow_input)
-            .unwrap()
-            .as_slice()
-            .await
-            .unwrap()
-            .to_vec2();
-
-        let regular_graph = Graph::new();
-        let regular_input: Tensor<2> =
-            Tensor::new(&regular_graph, &device, &[[1.0f32, 2.0], [3.0, 4.0]]);
-        let regular_weights: Tensor<2> =
-            Tensor::new(&regular_graph, &device, &[[0.5f32, 1.5], [2.5, 3.5]]);
-        let regular_output = regular_input.softmax::<1>(1);
-        let regular_values = regular_output.raw().clone().as_slice().await.unwrap().to_vec2();
-        let regular_loss = regular_output.mul(&regular_weights).flatten_all().sum();
-        let regular_gradients = regular_loss.backward().unwrap();
-        let regular_dinput = regular_gradients
-            .get(&regular_input)
-            .unwrap()
-            .as_slice()
-            .await
-            .unwrap()
-            .to_vec2();
-
-        assert_close(slow_values[0][0], regular_values[0][0]);
-        assert_close(slow_values[0][1], regular_values[0][1]);
-        assert_close(slow_values[1][0], regular_values[1][0]);
-        assert_close(slow_values[1][1], regular_values[1][1]);
-        assert_close(slow_dinput[0][0], regular_dinput[0][0]);
-        assert_close(slow_dinput[0][1], regular_dinput[0][1]);
-        assert_close(slow_dinput[1][0], regular_dinput[1][0]);
-        assert_close(slow_dinput[1][1], regular_dinput[1][1]);
-    }
-
-    #[tokio::test]
-    async fn test_backward_softmax_slow_last_dim_matches_softmax_last_dim_cpu() {
-        let device = Device::cpu();
-
-        let slow_graph = Graph::new();
-        let slow_input: Tensor<3> = Tensor::new(
-            &slow_graph,
-            &device,
-            &[[[1.0f32, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]],
-        );
-        let slow_weights: Tensor<3> = Tensor::new(
-            &slow_graph,
-            &device,
-            &[[[0.5f32, 1.5], [2.5, 3.5]], [[4.5, 5.5], [6.5, 7.5]]],
-        );
-        let slow_output = slow_input.softmax_slow_last_dim::<2>();
-        let slow_values = slow_output.raw().clone().as_slice().await.unwrap();
-        let slow_loss = slow_output.mul(&slow_weights).flatten_all().sum();
-        let slow_gradients = slow_loss.backward().unwrap();
-        let slow_dinput = slow_gradients.get(&slow_input).unwrap().as_slice().await.unwrap();
-
-        let regular_graph = Graph::new();
-        let regular_input: Tensor<3> = Tensor::new(
-            &regular_graph,
-            &device,
-            &[[[1.0f32, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]],
-        );
-        let regular_weights: Tensor<3> = Tensor::new(
-            &regular_graph,
-            &device,
-            &[[[0.5f32, 1.5], [2.5, 3.5]], [[4.5, 5.5], [6.5, 7.5]]],
-        );
-        let regular_output = regular_input.softmax_last_dim::<2>();
-        let regular_values = regular_output.raw().clone().as_slice().await.unwrap();
-        let regular_loss = regular_output.mul(&regular_weights).flatten_all().sum();
-        let regular_gradients = regular_loss.backward().unwrap();
-        let regular_dinput = regular_gradients
-            .get(&regular_input)
-            .unwrap()
-            .as_slice()
-            .await
-            .unwrap();
-
-        for batch in 0..2 {
-            for row in 0..2 {
-                for col in 0..2 {
-                    assert_close(slow_values[[batch, row, col]], regular_values[[batch, row, col]]);
-                    assert_close(
-                        slow_dinput[[batch, row, col]],
-                        regular_dinput[[batch, row, col]],
-                    );
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn test_backward_matmul_cpu() {
         let graph = Graph::new();
         let device = Device::cpu();
@@ -5772,107 +5208,6 @@ mod tests {
         assert_close(dvalues[1][0], 1.0);
         assert_close(dvalues[1][1], 0.0);
         assert_close(dvalues[1][2], 0.0);
-    }
-
-    #[tokio::test]
-    async fn test_backward_conv_1d_weights_and_bias_cpu() {
-        let graph = Graph::new();
-        let device = Device::cpu();
-
-        let input = Tensor::constant_from_raw(
-            &graph,
-            RawTensor::from_slice(&device, [1, 1, 4], &[1.0f32, 2.0, 3.0, 4.0]),
-        );
-        let weight: Tensor<3> = Tensor::new(&graph, &device, &[[[0.5f32, -1.0]]]);
-        let bias: Tensor<1> = Tensor::new(&graph, &device, &[0.25f32]);
-
-        let loss = input
-            .conv(&weight, Some(&bias), [0], [1])
-            .sum(2)
-            .sum(1)
-            .sum();
-        let gradients = loss.backward().unwrap();
-
-        let dweight = pollster::block_on(gradients.get(&weight).unwrap().reshape([2]).as_slice())
-            .unwrap()
-            .to_vec1();
-        let dbias = gradients
-            .get(&bias)
-            .unwrap()
-            .as_slice()
-            .await
-            .unwrap()
-            .to_vec1();
-
-        assert_close(dweight[0], 6.0);
-        assert_close(dweight[1], 9.0);
-        assert_close(dbias[0], 3.0);
-    }
-
-    #[tokio::test]
-    async fn test_backward_conv_1d_input_cpu() {
-        let graph = Graph::new();
-        let device = Device::cpu();
-
-        let input: Tensor<3> = Tensor::new(&graph, &device, &[[[1.0f32, 2.0, 3.0, 4.0]]]);
-        let weight = Tensor::constant_from_raw(
-            &graph,
-            RawTensor::from_slice(&device, [1, 1, 3], &[1.0f32, 1.0, 1.0]),
-        );
-
-        let loss = input.conv(&weight, None, [1], [1]).sum(2).sum(1).sum();
-        let gradients = loss.backward().unwrap();
-        let dinput = pollster::block_on(gradients.get(&input).unwrap().reshape([4]).as_slice())
-            .unwrap()
-            .to_vec1();
-
-        assert_close(dinput[0], 2.0);
-        assert_close(dinput[1], 3.0);
-        assert_close(dinput[2], 3.0);
-        assert_close(dinput[3], 2.0);
-    }
-
-    #[tokio::test]
-    async fn test_backward_conv_2d_weights_bias_and_input_cpu() {
-        let graph = Graph::new();
-        let device = Device::cpu();
-
-        let input: Tensor<4> = Tensor::new(
-            &graph,
-            &device,
-            &[[[[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]]],
-        );
-        let weight: Tensor<4> = Tensor::new(&graph, &device, &[[[[1.0f32, 1.0], [1.0, 1.0]]]]);
-        let bias: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
-
-        let loss = input
-            .conv(&weight, Some(&bias), [0, 0], [1, 1])
-            .reshape([4])
-            .sum();
-        let gradients = loss.backward().unwrap();
-
-        let dinput: RawTensor<4, f32> = gradients.get(&input).unwrap();
-        let dinput = dinput.reshape([3, 3]).as_slice().await.unwrap().to_vec2();
-        let dweight: RawTensor<4, f32> = gradients.get(&weight).unwrap();
-        let dweight = dweight.reshape([2, 2]).as_slice().await.unwrap().to_vec2();
-        let dbias: RawTensor<1, f32> = gradients.get(&bias).unwrap();
-        let dbias = dbias.as_slice().await.unwrap().to_vec1();
-
-        assert_close(dinput[0][0], 1.0);
-        assert_close(dinput[0][1], 2.0);
-        assert_close(dinput[0][2], 1.0);
-        assert_close(dinput[1][0], 2.0);
-        assert_close(dinput[1][1], 4.0);
-        assert_close(dinput[1][2], 2.0);
-        assert_close(dinput[2][0], 1.0);
-        assert_close(dinput[2][1], 2.0);
-        assert_close(dinput[2][2], 1.0);
-
-        assert_close(dweight[0][0], 12.0);
-        assert_close(dweight[0][1], 16.0);
-        assert_close(dweight[1][0], 24.0);
-        assert_close(dweight[1][1], 28.0);
-        assert_close(dbias[0], 4.0);
     }
 
     #[tokio::test]
