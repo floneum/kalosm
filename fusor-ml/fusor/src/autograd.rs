@@ -5,10 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::{
-    Device, Dim, Error, Layout, MaskKind, Result, Tensor as RawTensor, ToVec1, ToVec2,
-    layers::Embedding,
-};
+use crate::{Device, Dim, Error, Layout, MaskKind, Result, Tensor as RawTensor, layers::Embedding};
 use fusor_types::{SlidingWindow, StrideSpec};
 
 type NodeId = usize;
@@ -1689,22 +1686,29 @@ impl<const R: usize> Tensor<R> {
     pub fn q_mat_mul(&self, weights: &crate::QMatrix) -> Self {
         assert!(R >= 2, "q_mat_mul requires rank >= 2");
         let value = self.value.q_mat_mul(weights).to_concrete();
-        let dequantized: RawTensor<2, f32> = weights.dequantize();
-        let n = weights.shape()[0];
-        let k = weights.shape()[1];
-        let batch_dims = R - 2;
-        let weight_shape: [usize; R] = std::array::from_fn(|i| {
-            if i < batch_dims {
-                1
-            } else if i == batch_dims {
-                k
-            } else {
-                n
-            }
-        });
-        let weight = dequantized.transpose(0, 1).reshape(weight_shape).to_concrete();
+        if !self.requires_grad() {
+            return self.from_op(value, vec![self.handle.clone()], None);
+        }
+        let weights = weights.clone();
         self.replay_unary("q_mat_mul", value, move |input| {
-            let weight = Tensor::constant_from_raw(&input.graph(), weight.clone());
+            let n = weights.shape()[0];
+            let k = weights.shape()[1];
+            let batch_dims = R - 2;
+            let weight_shape: [usize; R] = std::array::from_fn(|i| {
+                if i < batch_dims {
+                    1
+                } else if i == batch_dims {
+                    k
+                } else {
+                    n
+                }
+            });
+            let dequantized: RawTensor<2, f32> = weights.dequantize();
+            let weight = dequantized
+                .transpose(0, 1)
+                .reshape(weight_shape)
+                .to_concrete();
+            let weight = Tensor::constant_from_raw(&input.graph(), weight);
             input.mat_mul_internal(&weight)
         })
     }
@@ -2093,55 +2097,20 @@ impl Tensor<2> {
         let input_shape = self.shape();
         assert!(dimension < 2, "index_select dimension out of bounds");
 
-        let index_values = pollster::block_on(indices.clone().as_slice())
-            .unwrap()
-            .to_vec1();
-        for &index in &index_values {
-            assert!(
-                (index as usize) < input_shape[dimension],
-                "index_select index {index} out of bounds for dimension size {}",
-                input_shape[dimension]
-            );
-        }
-
         let value = self.value.index_select(dimension, indices).to_concrete();
         let input_id = self.handle.id;
-        let device = self.device();
-        let output_shape = value.shape();
-        let index_values = index_values.clone();
+        let indices = indices.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = downcast_tensor::<2>(&*gradient, "index_select")?;
-            let gradient_values = pollster::block_on(
-                gradient
-                    .clone()
-                    .reshape([output_shape.iter().product()])
-                    .as_slice(),
-            )?
-            .to_vec1();
-
-            let mut input_gradient = vec![0.0f32; input_shape.iter().product()];
-            let input_strides = Layout::continuous_strides(&input_shape);
-            let output_strides = Layout::continuous_strides(&output_shape);
-
-            for (linear_index, value) in gradient_values.into_iter().enumerate() {
-                let mut remainder = linear_index;
-                let mut input_linear_index = 0;
-                for axis in 0..2 {
-                    let coordinate = remainder / output_strides[axis];
-                    remainder %= output_strides[axis];
-                    let input_coordinate = if axis == dimension {
-                        index_values[coordinate] as usize
-                    } else {
-                        coordinate
-                    };
-                    input_linear_index += input_coordinate * input_strides[axis];
-                }
-                input_gradient[input_linear_index] += value;
-            }
-
+            let one_hot = one_hot_matrix(&indices, input_shape[dimension]);
+            let input_gradient = if dimension == 0 {
+                one_hot.transpose(0, 1).mat_mul(&gradient)
+            } else {
+                gradient.mat_mul(&one_hot)
+            };
             Ok(vec![BackwardTarget {
                 node: input_id,
-                gradient: Box::new(RawTensor::from_slice(&device, input_shape, &input_gradient)),
+                gradient: Box::new(input_gradient),
             }])
         });
         self.from_op(value, vec![self.handle.clone()], Some(backward))
@@ -2156,36 +2125,23 @@ impl Tensor<2> {
         );
         let width = shape[1];
         let device = self.device();
-        let index_values = pollster::block_on(indices.clone().as_slice())
-            .unwrap()
-            .to_vec1();
-        let linear_indices = index_values
-            .iter()
-            .enumerate()
-            .map(|(row, &column)| {
-                assert!(
-                    (column as usize) < width,
-                    "gather_last index {} out of bounds for width {}",
-                    column,
-                    width
-                );
-                (row * width + column as usize) as u32
-            })
+        let row_offsets = (0..shape[0])
+            .map(|row| (row * width) as u32)
             .collect::<Vec<_>>();
-        let linear_indices_tensor = RawTensor::from_slice(&device, [shape[0]], &linear_indices);
+        let row_offsets: RawTensor<1, u32> =
+            RawTensor::from_slice(&device, [shape[0]], &row_offsets);
+        let linear_indices = (row_offsets + indices.clone()).to_concrete();
         let flat = self.value.reshape([shape[0] * width]).to_concrete();
-        let value = flat.index_select(0, &linear_indices_tensor).to_concrete();
+        let value = flat.index_select(0, &linear_indices).to_concrete();
         let input_id = self.handle.id;
+        let indices = indices.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = downcast_tensor::<1>(&*gradient, "gather_last")?;
-            let gradient_values = pollster::block_on(gradient.clone().as_slice())?.to_vec1();
-            let mut input_gradient = vec![0.0f32; shape[0] * width];
-            for (row, &linear_index) in linear_indices.iter().enumerate() {
-                input_gradient[linear_index as usize] += gradient_values[row];
-            }
+            let one_hot = one_hot_matrix(&indices, width);
+            let input_gradient: RawTensor<2, f32> = one_hot.mul_(&gradient.reshape([shape[0], 1]));
             Ok(vec![BackwardTarget {
                 node: input_id,
-                gradient: Box::new(RawTensor::from_slice(&device, shape, &input_gradient)),
+                gradient: Box::new(input_gradient),
             }])
         });
         self.from_op(value, vec![self.handle.clone()], Some(backward))
@@ -2196,39 +2152,17 @@ impl Tensor<2> {
             Embedding::new_from_tensor(self.value.clone()).forward(indices);
         let table_id = self.handle.id;
         let table_shape = self.shape();
-        let device = self.device();
         let indices = indices.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = downcast_tensor::<3>(&*gradient, "embedding")?;
-            let index_values = pollster::block_on(indices.clone().as_slice())?.to_vec2();
             let grad_shape = gradient.shape();
-            let grad_flat = gradient.reshape([grad_shape[0] * grad_shape[1], grad_shape[2]]);
-
-            let mut rows_by_token = HashMap::<u32, Vec<u32>>::new();
-            for (batch, row) in index_values.iter().enumerate() {
-                for (position, &token) in row.iter().enumerate() {
-                    let flat_row = (batch * grad_shape[1] + position) as u32;
-                    rows_by_token.entry(token).or_default().push(flat_row);
-                }
-            }
-
-            let mut embedding_gradient = RawTensor::zeros(&device, table_shape);
-            for (token, rows) in rows_by_token {
-                let row_indices = RawTensor::from_slice(&device, [rows.len()], &rows);
-                let token_gradient = grad_flat
-                    .index_select(0, &row_indices)
-                    .sum::<1>(0)
-                    .unsqueeze::<2>(0)
-                    .to_concrete();
-                embedding_gradient = embedding_gradient.slice_assign(
-                    [token as usize..token as usize + 1, 0..table_shape[1]],
-                    &token_gradient,
-                );
-            }
-
+            let rows = grad_shape[0] * grad_shape[1];
+            let grad_flat = gradient.reshape([rows, grad_shape[2]]).to_concrete();
+            let flat_indices = indices.reshape([rows]).to_concrete();
+            let one_hot = one_hot_matrix(&flat_indices, table_shape[0]);
             Ok(vec![BackwardTarget {
                 node: table_id,
-                gradient: Box::new(embedding_gradient),
+                gradient: Box::new(one_hot.transpose(0, 1).mat_mul(&grad_flat)),
             }])
         });
         self.from_op(value, vec![self.handle.clone()], Some(backward))
@@ -2740,6 +2674,20 @@ fn accumulate_gradient(
         }
     }
     Ok(())
+}
+
+/// Build a `[indices.len(), size]` f32 matrix with 1.0 at `[row, indices[row]]`
+/// so scatter-adds stay on-device as matmuls/products against it; duplicate
+/// indices accumulate through the contraction.
+fn one_hot_matrix(indices: &RawTensor<1, u32>, size: usize) -> RawTensor<2, f32> {
+    let device = indices.device();
+    let rows = indices.shape()[0];
+    let positions = (0..size)
+        .map(|position| position as f32)
+        .collect::<Vec<_>>();
+    let positions: RawTensor<2, f32> = RawTensor::from_slice(&device, [1, size], &positions);
+    let indices = indices.cast::<f32>().reshape([rows, 1]).to_concrete();
+    indices.sub_(&positions).eq(0.0)
 }
 
 fn downcast_tensor<const R: usize>(
