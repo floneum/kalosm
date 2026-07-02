@@ -3462,3 +3462,105 @@ fn test_gpu_gradients_can_detach() {
         "detached w gradient should not retain backward compute graph",
     );
 }
+
+/// End-to-end training: a 2-16-2 MLP learns XOR over an 8x8 grid of 2D
+/// points with softmax cross-entropy and full-batch SGD. Exercises the
+/// whole tape (matmul, broadcast bias, relu, softmax, gather, log,
+/// reduce) plus the detach/update loop across many resolves per device.
+#[tokio::test]
+async fn test_train_xor_classifier() {
+    const SAMPLES: usize = 64;
+    const HIDDEN: usize = 16;
+    const STEPS: usize = 500;
+    const LEARNING_RATE: f32 = 1.0;
+
+    let mut features = Vec::with_capacity(SAMPLES * 2);
+    let mut labels = Vec::with_capacity(SAMPLES);
+    for row in 0..8 {
+        for column in 0..8 {
+            let x = -0.875 + 0.25 * row as f32;
+            let y = -0.875 + 0.25 * column as f32;
+            features.extend([x, y]);
+            labels.push(u32::from((x > 0.0) != (y > 0.0)));
+        }
+    }
+
+    let mut state = 42u64;
+    let mut next_uniform = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as f32 / (1u64 << 32) as f32 - 0.5
+    };
+    let w1_init: Vec<f32> = (0..2 * HIDDEN).map(|_| next_uniform()).collect();
+    let w2_init: Vec<f32> = (0..HIDDEN * 2).map(|_| next_uniform() * 0.5).collect();
+
+    for (device, name) in test_devices().await.into_iter().zip(["cpu", "gpu"]) {
+        let inputs = RawTensor::from_slice(&device, [SAMPLES, 2], &features);
+        let targets = RawTensor::from_slice(&device, [SAMPLES], &labels);
+
+        let mut w1 = RawTensor::from_slice(&device, [2, HIDDEN], &w1_init);
+        let mut b1 = RawTensor::zeros(&device, [HIDDEN]);
+        let mut w2 = RawTensor::from_slice(&device, [HIDDEN, 2], &w2_init);
+        let mut b2 = RawTensor::zeros(&device, [2]);
+
+        let mut final_loss = f32::INFINITY;
+        for step in 0..STEPS {
+            let graph = Graph::new();
+            let x = Tensor::constant_from_raw(&graph, inputs.clone());
+            let w1_t = Tensor::from_raw(&graph, w1.clone());
+            let b1_t = Tensor::from_raw(&graph, b1.clone());
+            let w2_t = Tensor::from_raw(&graph, w2.clone());
+            let b2_t = Tensor::from_raw(&graph, b2.clone());
+
+            let hidden = b1_t.add_::<2, 2>(&x.mat_mul(&w1_t)).relu();
+            let logits = b2_t.add_::<2, 2>(&hidden.mat_mul(&w2_t));
+            // Numerically stable cross-entropy: log softmax via log-sum-exp
+            // so a saturated class cannot underflow to log(0).
+            let shifted = logits.sub_::<2, 2>(&logits.max_keepdim::<1>(1));
+            let log_sum_exp = shifted.exp().sum_keepdim(1).log();
+            let label_log_probs = shifted.sub_::<2, 2>(&log_sum_exp).gather_last(&targets);
+            let loss: Tensor<0> = label_log_probs.sum().mul_scalar(-1.0 / SAMPLES as f32);
+
+            let loss_value = flatten(loss.raw().clone()).await[0];
+            let gradients = loss.backward().unwrap().into_detached();
+            let dw1 = gradients.get(&w1_t).unwrap();
+            let db1 = gradients.get(&b1_t).unwrap();
+            let dw2 = gradients.get(&w2_t).unwrap();
+            let db2 = gradients.get(&b2_t).unwrap();
+
+            w1 = (w1 - dw1 * LEARNING_RATE).to_concrete();
+            b1 = (b1 - db1 * LEARNING_RATE).to_concrete();
+            w2 = (w2 - dw2 * LEARNING_RATE).to_concrete();
+            b2 = (b2 - db2 * LEARNING_RATE).to_concrete();
+
+            final_loss = loss_value;
+            if step % 100 == 0 {
+                eprintln!("[{name}] step {step}: loss {loss_value:.4}");
+            }
+        }
+        eprintln!("[{name}] final loss {final_loss:.4}");
+
+        let graph = Graph::new();
+        let x = Tensor::constant_from_raw(&graph, inputs.clone());
+        let w1_t = Tensor::constant_from_raw(&graph, w1.clone());
+        let b1_t = Tensor::constant_from_raw(&graph, b1.clone());
+        let w2_t = Tensor::constant_from_raw(&graph, w2.clone());
+        let b2_t = Tensor::constant_from_raw(&graph, b2.clone());
+        let hidden = b1_t.add_::<2, 2>(&x.mat_mul(&w1_t)).relu();
+        let logits = b2_t.add_::<2, 2>(&hidden.mat_mul(&w2_t));
+        let logits = logits.raw().clone().as_slice().await.unwrap().to_vec2();
+        let correct = logits
+            .iter()
+            .zip(&labels)
+            .filter(|(row, label)| u32::from(row[1] > row[0]) == **label)
+            .count();
+        eprintln!("[{name}] accuracy {correct}/{SAMPLES}");
+
+        assert!(
+            final_loss < 0.1,
+            "training did not converge: final loss {final_loss}",
+        );
+        assert_eq!(correct, SAMPLES, "classifier misclassified training points");
+    }
+}
