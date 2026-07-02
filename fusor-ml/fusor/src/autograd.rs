@@ -271,7 +271,20 @@ impl<const R: usize> Tensor<R> {
                 .downcast_ref::<RawTensor<R, f32>>()
                 .ok_or_else(|| Error::msg("gradient rank mismatch in custom backward"))?
                 .clone();
-            backwards(gradient)
+            let targets = backwards(gradient)?;
+            // The scheduler only unlocks a parent once every child sends it a
+            // gradient, so a missing target would silently starve that
+            // parent's whole subgraph.
+            for parent in &parent_handles {
+                if parent.graph.requires_grad(parent.id)
+                    && !targets.iter().any(|target| target.node == parent.id)
+                {
+                    return Err(Error::msg(
+                        "custom backward omitted a gradient for a parent that requires grad",
+                    ));
+                }
+            }
+            Ok(targets)
         });
         self.handle.graph.replace_node(
             self.handle.id,
@@ -3123,6 +3136,54 @@ mod tests {
             .to_vec1()
     }
 
+    async fn finite_difference_gradient<const R: usize, F>(
+        device: &Device,
+        shape: [usize; R],
+        data: &[f32],
+        loss: &F,
+    ) -> Vec<f32>
+    where
+        F: Fn(&Graph, Tensor<R>) -> Tensor<0>,
+    {
+        let epsilon = 1e-2f32;
+        let mut numeric = Vec::with_capacity(data.len());
+        for index in 0..data.len() {
+            let mut perturbed = data.to_vec();
+            perturbed[index] = data[index] + epsilon;
+            let graph = Graph::new();
+            let plus = loss(&graph, Tensor::from_slice(&graph, device, shape, &perturbed));
+            let plus = plus.raw().to_scalar().await.unwrap();
+            perturbed[index] = data[index] - epsilon;
+            let graph = Graph::new();
+            let minus = loss(&graph, Tensor::from_slice(&graph, device, shape, &perturbed));
+            let minus = minus.raw().to_scalar().await.unwrap();
+            numeric.push((plus - minus) / (2.0 * epsilon));
+        }
+        numeric
+    }
+
+    async fn assert_gradient_matches_finite_difference<const R: usize, F>(
+        device: &Device,
+        shape: [usize; R],
+        data: &[f32],
+        loss: F,
+    ) where
+        F: Fn(&Graph, Tensor<R>) -> Tensor<0>,
+    {
+        let graph = Graph::new();
+        let input = Tensor::from_slice(&graph, device, shape, data);
+        let gradients = loss(&graph, input.clone()).backward().unwrap();
+        let analytic = flatten(gradients.get(&input).unwrap()).await;
+        let numeric = finite_difference_gradient(device, shape, data, &loss).await;
+        assert_eq!(analytic.len(), numeric.len(), "gradient lengths differ");
+        for (index, (analytic, numeric)) in analytic.iter().zip(numeric.iter()).enumerate() {
+            assert!(
+                (analytic - numeric).abs() < 1e-2 + 1e-2 * numeric.abs(),
+                "gradient mismatch at index {index}: analytic {analytic}, finite difference {numeric}",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_backward_squared_sum_cpu() {
         let graph = Graph::new();
@@ -3150,12 +3211,29 @@ mod tests {
         let device = Device::cpu();
         let x: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, -2.0, 0.5]);
 
-        let values = x.silu().raw().clone().as_slice().await.unwrap().to_vec1();
+        let output = x.silu();
+        let values = output.raw().clone().as_slice().await.unwrap().to_vec1();
 
         let expected = [1.0f32, -2.0, 0.5].map(|v| v / (1.0 + (-v).exp()));
         for (value, expected) in values.iter().zip(expected) {
             assert_close(*value, expected);
         }
+
+        let gradients = output.sum().backward().unwrap();
+        let dx = gradients.get(&x).unwrap().as_slice().await.unwrap().to_vec1();
+
+        let expected_grads = [1.0f32, -2.0, 0.5].map(|v| {
+            let sigmoid = 1.0 / (1.0 + (-v).exp());
+            sigmoid * (1.0 + v * (1.0 - sigmoid))
+        });
+        for (value, expected) in dx.iter().zip(expected_grads) {
+            assert_close(*value, expected);
+        }
+
+        assert_gradient_matches_finite_difference(&device, [3], &[1.0, -2.0, 0.5], |_, x| {
+            x.silu().sum()
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -3164,7 +3242,8 @@ mod tests {
         let device = Device::cpu();
         let x: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, -2.0, 0.5]);
 
-        let values = x.gelu().raw().clone().as_slice().await.unwrap().to_vec1();
+        let output = x.gelu();
+        let values = output.raw().clone().as_slice().await.unwrap().to_vec1();
 
         let expected = [1.0f32, -2.0, 0.5].map(|v| {
             0.5 * v
@@ -3173,6 +3252,25 @@ mod tests {
         for (value, expected) in values.iter().zip(expected) {
             assert_close(*value, expected);
         }
+
+        let gradients = output.sum().backward().unwrap();
+        let dx = gradients.get(&x).unwrap().as_slice().await.unwrap().to_vec1();
+
+        let expected_grads = [1.0f32, -2.0, 0.5].map(|v| {
+            let scale = (2.0 / std::f32::consts::PI).sqrt();
+            let inner = scale * (v + 0.044_715 * v.powi(3));
+            let tanh = inner.tanh();
+            let dinner = scale * (1.0 + 3.0 * 0.044_715 * v * v);
+            0.5 * (1.0 + tanh) + 0.5 * v * (1.0 - tanh * tanh) * dinner
+        });
+        for (value, expected) in dx.iter().zip(expected_grads) {
+            assert_close(*value, expected);
+        }
+
+        assert_gradient_matches_finite_difference(&device, [3], &[1.0, -2.0, 0.5], |_, x| {
+            x.gelu().sum()
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -5333,14 +5431,8 @@ mod tests {
             RawTensor::from_slice(&device, [3], &[1.0f32, 1.0, 1.0]),
         );
 
-        let output = input
-            .rms_norm(&weight, 1e-5)
-            .raw()
-            .clone()
-            .as_slice()
-            .await
-            .unwrap()
-            .to_vec2();
+        let output = input.rms_norm(&weight, 1e-5);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
 
         let expected = [[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]].map(|row| {
             let mean_sq = row.iter().map(|value| value * value).sum::<f32>() / row.len() as f32;
@@ -5348,11 +5440,50 @@ mod tests {
             row.map(|value| value * scale)
         });
 
-        for (actual_row, expected_row) in output.iter().zip(expected.iter()) {
+        for (actual_row, expected_row) in output_values.iter().zip(expected.iter()) {
             for (actual, expected) in actual_row.iter().zip(expected_row.iter()) {
                 assert_close(*actual, *expected);
             }
         }
+
+        let gradients = output.sum(1).sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec2();
+
+        // d/dx_j sum_k x_k * (mean(x^2) + eps)^-1/2
+        //     = 1/rms - x_j * sum(x) / (n * rms^3)
+        let expected_grads = [[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]].map(|row| {
+            let n = row.len() as f32;
+            let mean_sq = row.iter().map(|value| value * value).sum::<f32>() / n;
+            let rms = (mean_sq + 1e-5).sqrt();
+            let sum = row.iter().sum::<f32>();
+            row.map(|value| 1.0 / rms - value * sum / (n * rms.powi(3)))
+        });
+        for (actual_row, expected_row) in dinput.iter().zip(expected_grads.iter()) {
+            for (actual, expected) in actual_row.iter().zip(expected_row.iter()) {
+                assert_close(*actual, *expected);
+            }
+        }
+
+        let fd_device = device.clone();
+        assert_gradient_matches_finite_difference(
+            &device,
+            [2, 3],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            move |graph, x| {
+                let weight = Tensor::constant_from_raw(
+                    graph,
+                    RawTensor::from_slice(&fd_device, [3], &[1.0f32, 1.0, 1.0]),
+                );
+                x.rms_norm(&weight, 1e-5).sum(1).sum()
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -5592,6 +5723,399 @@ mod tests {
         assert_slice_close(&fused_dq, &composite_dq);
         assert_slice_close(&fused_dk, &composite_dk);
         assert_slice_close(&fused_dv, &composite_dv);
+    }
+
+    #[tokio::test]
+    async fn test_backward_mat_mul_rank3_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let lhs_data = (1..=24).map(|n| n as f32).collect::<Vec<_>>();
+        let rhs_data = (1..=40).map(|n| n as f32).collect::<Vec<_>>();
+        let lhs: Tensor<3> = Tensor::from_slice(&graph, &device, [2, 3, 4], &lhs_data);
+        let rhs: Tensor<3> = Tensor::from_slice(&graph, &device, [2, 4, 5], &rhs_data);
+
+        let output = lhs.mat_mul(&rhs);
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dlhs = flatten(gradients.get(&lhs).unwrap()).await;
+        let drhs = flatten(gradients.get(&rhs).unwrap()).await;
+
+        assert_eq!(output_values.shape(), &[2, 3, 5]);
+        assert_close(output_values[[0, 0, 0]], 110.0);
+        assert_close(output_values[[1, 2, 4]], 2950.0);
+
+        // with an all-ones seed, dlhs[b, i, k] = sum_j rhs[b, k, j] and
+        // drhs[b, k, j] = sum_i lhs[b, i, k]
+        for b in 0..2 {
+            for i in 0..3 {
+                for k in 0..4 {
+                    let expected = (0..5).map(|j| rhs_data[b * 20 + k * 5 + j]).sum::<f32>();
+                    assert_close(dlhs[b * 12 + i * 4 + k], expected);
+                }
+            }
+            for k in 0..4 {
+                for j in 0..5 {
+                    let expected = (0..3).map(|i| lhs_data[b * 12 + i * 4 + k]).sum::<f32>();
+                    assert_close(drhs[b * 20 + k * 5 + j], expected);
+                }
+            }
+        }
+
+        let lhs_small = lhs_data.iter().map(|value| value * 0.05).collect::<Vec<_>>();
+        let rhs_small = rhs_data.iter().map(|value| value * 0.03).collect::<Vec<_>>();
+        let fd_device = device.clone();
+        let fd_rhs = rhs_small.clone();
+        assert_gradient_matches_finite_difference(
+            &device,
+            [2, 3, 4],
+            &lhs_small,
+            move |graph, lhs| {
+                let rhs = Tensor::constant_from_raw(
+                    graph,
+                    RawTensor::from_slice(&fd_device, [2, 4, 5], &fd_rhs),
+                );
+                lhs.mat_mul(&rhs).sqr().flatten_all().sum()
+            },
+        )
+        .await;
+        let fd_device = device.clone();
+        let fd_lhs = lhs_small.clone();
+        assert_gradient_matches_finite_difference(
+            &device,
+            [2, 4, 5],
+            &rhs_small,
+            move |graph, rhs| {
+                let lhs = Tensor::constant_from_raw(
+                    graph,
+                    RawTensor::from_slice(&fd_device, [2, 3, 4], &fd_lhs),
+                );
+                lhs.mat_mul(&rhs).sqr().flatten_all().sum()
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_backward_cat_dim0_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let first_data = (1..=6).map(|n| n as f32).collect::<Vec<_>>();
+        let second_data = (7..=18).map(|n| n as f32).collect::<Vec<_>>();
+        let first: Tensor<3> = Tensor::from_slice(&graph, &device, [1, 2, 3], &first_data);
+        let second: Tensor<3> = Tensor::from_slice(&graph, &device, [2, 2, 3], &second_data);
+
+        let output = Tensor::cat(vec![first.clone(), second.clone()], 0);
+        let output_values = flatten(output.raw().clone()).await;
+        let seed_data = (0..18).map(|n| n as f32 + 10.0).collect::<Vec<_>>();
+        let seed = RawTensor::from_slice(&device, [3, 2, 3], &seed_data);
+        let gradients = output.backward_with(seed).unwrap();
+        let dfirst = flatten(gradients.get(&first).unwrap()).await;
+        let dsecond = flatten(gradients.get(&second).unwrap()).await;
+
+        assert_eq!(output.shape(), [3, 2, 3]);
+        assert_eq!(output_values, (1..=18).map(|n| n as f32).collect::<Vec<_>>());
+        assert_eq!(dfirst, seed_data[..6].to_vec());
+        assert_eq!(dsecond, seed_data[6..].to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_backward_cat_dim1_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let first_data = (1..=6).map(|n| n as f32).collect::<Vec<_>>();
+        let second_data = (10..=21).map(|n| n as f32).collect::<Vec<_>>();
+        let first: Tensor<3> = Tensor::from_slice(&graph, &device, [2, 1, 3], &first_data);
+        let second: Tensor<3> = Tensor::from_slice(&graph, &device, [2, 2, 3], &second_data);
+
+        let output = Tensor::cat(vec![first.clone(), second.clone()], 1);
+        let output_values = flatten(output.raw().clone()).await;
+        let seed_data = (0..18).map(|n| n as f32 + 10.0).collect::<Vec<_>>();
+        let seed = RawTensor::from_slice(&device, [2, 3, 3], &seed_data);
+        let gradients = output.backward_with(seed).unwrap();
+        let dfirst = flatten(gradients.get(&first).unwrap()).await;
+        let dsecond = flatten(gradients.get(&second).unwrap()).await;
+
+        assert_eq!(output.shape(), [2, 3, 3]);
+        assert_eq!(
+            output_values,
+            vec![
+                1.0, 2.0, 3.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 4.0, 5.0, 6.0, 16.0, 17.0,
+                18.0, 19.0, 20.0, 21.0
+            ]
+        );
+
+        let mut expected_dfirst = Vec::new();
+        let mut expected_dsecond = Vec::new();
+        for i in 0..2 {
+            for j in 0..3 {
+                for k in 0..3 {
+                    let value = seed_data[i * 9 + j * 3 + k];
+                    if j < 1 {
+                        expected_dfirst.push(value);
+                    } else {
+                        expected_dsecond.push(value);
+                    }
+                }
+            }
+        }
+        assert_eq!(dfirst, expected_dfirst);
+        assert_eq!(dsecond, expected_dsecond);
+
+        let first_small = first_data.iter().map(|value| value * 0.1).collect::<Vec<_>>();
+        let second_small = second_data.iter().map(|value| value * 0.1).collect::<Vec<_>>();
+        let fd_device = device.clone();
+        let fd_second = second_small.clone();
+        assert_gradient_matches_finite_difference(
+            &device,
+            [2, 1, 3],
+            &first_small,
+            move |graph, first| {
+                let second = Tensor::constant_from_raw(
+                    graph,
+                    RawTensor::from_slice(&fd_device, [2, 2, 3], &fd_second),
+                );
+                Tensor::cat(vec![first, second], 1).sqr().flatten_all().sum()
+            },
+        )
+        .await;
+        let fd_device = device.clone();
+        let fd_first = first_small.clone();
+        assert_gradient_matches_finite_difference(
+            &device,
+            [2, 2, 3],
+            &second_small,
+            move |graph, second| {
+                let first = Tensor::constant_from_raw(
+                    graph,
+                    RawTensor::from_slice(&fd_device, [2, 1, 3], &fd_first),
+                );
+                Tensor::cat(vec![first, second], 1).sqr().flatten_all().sum()
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_backward_cat_dim2_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let first_data = (1..=4).map(|n| n as f32).collect::<Vec<_>>();
+        let second_data = (5..=12).map(|n| n as f32).collect::<Vec<_>>();
+        let first: Tensor<3> = Tensor::from_slice(&graph, &device, [2, 2, 1], &first_data);
+        let second: Tensor<3> = Tensor::from_slice(&graph, &device, [2, 2, 2], &second_data);
+
+        let output = Tensor::cat(vec![first.clone(), second.clone()], 2);
+        let output_values = flatten(output.raw().clone()).await;
+        let seed_data = (0..12).map(|n| n as f32 + 10.0).collect::<Vec<_>>();
+        let seed = RawTensor::from_slice(&device, [2, 2, 3], &seed_data);
+        let gradients = output.backward_with(seed).unwrap();
+        let dfirst = flatten(gradients.get(&first).unwrap()).await;
+        let dsecond = flatten(gradients.get(&second).unwrap()).await;
+
+        assert_eq!(output.shape(), [2, 2, 3]);
+        assert_eq!(
+            output_values,
+            vec![1.0, 5.0, 6.0, 2.0, 7.0, 8.0, 3.0, 9.0, 10.0, 4.0, 11.0, 12.0]
+        );
+
+        let mut expected_dfirst = Vec::new();
+        let mut expected_dsecond = Vec::new();
+        for i in 0..2 {
+            for j in 0..2 {
+                for k in 0..3 {
+                    let value = seed_data[i * 6 + j * 3 + k];
+                    if k < 1 {
+                        expected_dfirst.push(value);
+                    } else {
+                        expected_dsecond.push(value);
+                    }
+                }
+            }
+        }
+        assert_eq!(dfirst, expected_dfirst);
+        assert_eq!(dsecond, expected_dsecond);
+
+        let first_small = first_data.iter().map(|value| value * 0.1).collect::<Vec<_>>();
+        let second_small = second_data.iter().map(|value| value * 0.1).collect::<Vec<_>>();
+        let fd_device = device.clone();
+        let fd_second = second_small.clone();
+        assert_gradient_matches_finite_difference(
+            &device,
+            [2, 2, 1],
+            &first_small,
+            move |graph, first| {
+                let second = Tensor::constant_from_raw(
+                    graph,
+                    RawTensor::from_slice(&fd_device, [2, 2, 2], &fd_second),
+                );
+                Tensor::cat(vec![first, second], 2).sqr().flatten_all().sum()
+            },
+        )
+        .await;
+        let fd_device = device.clone();
+        let fd_first = first_small.clone();
+        assert_gradient_matches_finite_difference(
+            &device,
+            [2, 2, 2],
+            &second_small,
+            move |graph, second| {
+                let first = Tensor::constant_from_raw(
+                    graph,
+                    RawTensor::from_slice(&fd_device, [2, 2, 1], &fd_first),
+                );
+                Tensor::cat(vec![first, second], 2).sqr().flatten_all().sum()
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_backward_log_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32, 1.5, 2.5]);
+
+        let output = input.log();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients.get(&input).unwrap().as_slice().await.unwrap().to_vec1();
+
+        for (value, input) in output_values.iter().zip([0.5f32, 1.5, 2.5]) {
+            assert_close(*value, input.ln());
+        }
+        for (value, input) in dinput.iter().zip([0.5f32, 1.5, 2.5]) {
+            assert_close(*value, 1.0 / input);
+        }
+
+        assert_gradient_matches_finite_difference(&device, [3], &[0.5, 1.5, 2.5], |_, x| {
+            x.log().sum()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_backward_neg_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.5f32, -2.0, 0.5]);
+
+        let output = input.neg();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients.get(&input).unwrap().as_slice().await.unwrap().to_vec1();
+
+        assert_eq!(output_values, vec![-1.5, 2.0, -0.5]);
+        assert_eq!(dinput, vec![-1.0, -1.0, -1.0]);
+
+        assert_gradient_matches_finite_difference(&device, [3], &[1.5, -2.0, 0.5], |_, x| {
+            x.neg().sum()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_backward_exp_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[0.0f32, 0.5, -1.0]);
+
+        let output = input.exp();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients.get(&input).unwrap().as_slice().await.unwrap().to_vec1();
+
+        for (value, input) in output_values.iter().zip([0.0f32, 0.5, -1.0]) {
+            assert_close(*value, input.exp());
+        }
+        for (value, input) in dinput.iter().zip([0.0f32, 0.5, -1.0]) {
+            assert_close(*value, input.exp());
+        }
+
+        assert_gradient_matches_finite_difference(&device, [3], &[0.0, 0.5, -1.0], |_, x| {
+            x.exp().sum()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_backward_log_sum_exp_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<2> = Tensor::new(&graph, &device, &[[0.0f32, 0.5, 1.0], [1.0, -1.0, 0.0]]);
+
+        let output = input.exp().sum_keepdim(1).log();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let gradients = output.reshape([2]).sum().backward().unwrap();
+        let dinput = gradients.get(&input).unwrap().as_slice().await.unwrap().to_vec2();
+
+        // d/dx_j log(sum_k exp(x_k)) = softmax(x)_j
+        let rows = [[0.0f32, 0.5, 1.0], [1.0, -1.0, 0.0]];
+        for (row_index, row) in rows.iter().enumerate() {
+            let sum_exp = row.iter().map(|value| value.exp()).sum::<f32>();
+            assert_close(output_values[row_index][0], sum_exp.ln());
+            for (column, value) in row.iter().enumerate() {
+                assert_close(dinput[row_index][column], value.exp() / sum_exp);
+            }
+        }
+
+        assert_gradient_matches_finite_difference(
+            &device,
+            [2, 3],
+            &[0.0, 0.5, 1.0, 1.0, -1.0, 0.0],
+            |_, x| x.exp().sum_keepdim(1).log().reshape([2]).sum(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_backward_with_backwards_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let x: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
+        let y: Tensor<1> = Tensor::new(&graph, &device, &[4.0f32, 5.0, 6.0]);
+
+        let x_target = x.clone();
+        let y_target = y.clone();
+        let output = x.add(&y).with_backwards([x.parent(), y.parent()], move |grad| {
+            Ok(vec![
+                BackwardTarget::wrt(&x_target, grad.clone().mul_scalar(2.0).to_concrete()),
+                BackwardTarget::wrt(&y_target, grad.mul_scalar(-3.0).to_concrete()),
+            ])
+        });
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dx = gradients.get(&x).unwrap().as_slice().await.unwrap().to_vec1();
+        let dy = gradients.get(&y).unwrap().as_slice().await.unwrap().to_vec1();
+
+        assert_eq!(output_values, vec![5.0, 7.0, 9.0]);
+        // the custom rule replaces add's backward, so the gradients are the
+        // custom 2x/-3x rather than add's 1/1
+        assert_eq!(dx, vec![2.0, 2.0, 2.0]);
+        assert_eq!(dy, vec![-3.0, -3.0, -3.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_with_backwards_missing_parent_errors_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let x: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
+        let y: Tensor<1> = Tensor::new(&graph, &device, &[4.0f32, 5.0, 6.0]);
+
+        let x_target = x.clone();
+        let output = x.add(&y).with_backwards([x.parent(), y.parent()], move |grad| {
+            Ok(vec![BackwardTarget::wrt(&x_target, grad)])
+        });
+
+        // The scheduler waits on a gradient from every child edge, so a custom
+        // rule that skips a live parent must fail loudly instead of silently
+        // dropping every gradient upstream of it.
+        let Err(error) = output.sum().backward() else {
+            panic!("backward succeeded despite an omitted parent gradient");
+        };
+        assert!(
+            error.to_string().contains("omitted a gradient"),
+            "expected missing-parent error, got: {error}",
+        );
     }
 
     #[tokio::test]
