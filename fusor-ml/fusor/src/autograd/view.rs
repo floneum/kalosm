@@ -17,7 +17,7 @@ impl<const R: usize> Tensor<R> {
                 gradient: Box::new(gradient.reshape(input_shape).to_concrete()),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn transpose(&self, dim0: usize, dim1: usize) -> Self {
@@ -30,7 +30,7 @@ impl<const R: usize> Tensor<R> {
                 gradient: Box::new(gradient.transpose(dim0, dim1).to_concrete()),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn permute(&self, axes: [usize; R]) -> Self {
@@ -47,7 +47,7 @@ impl<const R: usize> Tensor<R> {
                 gradient: Box::new(gradient.permute(inverse).to_concrete()),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn slice(&self, slices: [Range<usize>; R]) -> Self {
@@ -62,7 +62,7 @@ impl<const R: usize> Tensor<R> {
                 gradient: Box::new(zeros.slice_assign(slices.clone(), &gradient).to_concrete()),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn broadcast_as<const OUT: usize>(&self, shape: [usize; OUT]) -> Tensor<OUT> {
@@ -77,7 +77,7 @@ impl<const R: usize> Tensor<R> {
                 gradient: reduced,
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn expand<const OUT: usize>(&self, shape: [usize; OUT]) -> Tensor<OUT> {
@@ -177,7 +177,7 @@ impl<const R: usize> Tensor<R> {
                 gradient: Box::new(flat.reshape(input_shape).to_concrete()),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn resize(&self, new_shape: [usize; R]) -> Self {
@@ -195,7 +195,7 @@ impl<const R: usize> Tensor<R> {
                 gradient: Box::new(zeros.slice_assign(copy_slices.clone(), &patch).to_concrete()),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn restride<const OUT: usize>(&self, specs: [StrideSpec; OUT]) -> Tensor<OUT> {
@@ -216,7 +216,7 @@ impl<const R: usize> Tensor<R> {
                 gradient: Box::new(reduced),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn restride_layout<const OUT: usize>(&self, new_layout: Layout) -> Tensor<OUT> {
@@ -243,7 +243,7 @@ impl<const R: usize> Tensor<R> {
                 gradient: Box::new(reduced),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn squeeze_dims<const DIFF: usize, const OUT: usize>(
@@ -321,7 +321,7 @@ impl<const R: usize> Tensor<R> {
                 },
             ])
         });
-        self.from_op(
+        self.emit_op(
             output,
             vec![self.handle.clone(), value.handle.clone()],
             Some(backward),

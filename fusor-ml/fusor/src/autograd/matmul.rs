@@ -23,7 +23,7 @@ impl<const R: usize> Tensor<R> {
                 },
             ])
         });
-        self.from_op(
+        self.emit_op(
             value,
             vec![self.handle.clone(), rhs.handle.clone()],
             Some(backward),
@@ -43,7 +43,7 @@ impl<const R: usize> Tensor<R> {
         assert!(R >= 2, "q_mat_mul requires rank >= 2");
         let value = self.value.q_mat_mul(weights).to_concrete();
         if !self.requires_grad() {
-            return self.from_op(value, vec![self.handle.clone()], None);
+            return self.emit_op(value, vec![self.handle.clone()], None);
         }
         let weights = weights.clone();
         self.replay_unary("q_mat_mul", value, move |input| {

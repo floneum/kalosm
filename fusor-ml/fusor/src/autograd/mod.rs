@@ -320,7 +320,7 @@ impl<const R: usize> Tensor<R> {
         self.handle.graph.backward(self.handle.id, Box::new(seed))
     }
 
-    fn from_op<const OUT: usize>(
+    fn emit_op<const OUT: usize>(
         &self,
         value: RawTensor<OUT, f32>,
         parents: Vec<NodeHandle>,
@@ -363,7 +363,7 @@ impl<const R: usize> Tensor<R> {
                 gradient: Box::new(backward(gradient, output.clone()).to_concrete()),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     fn binary_op(
@@ -399,7 +399,7 @@ impl<const R: usize> Tensor<R> {
                 },
             ])
         });
-        self.from_op(
+        self.emit_op(
             value,
             vec![self.handle.clone(), rhs.handle.clone()],
             Some(backward),
@@ -428,7 +428,7 @@ impl<const R: usize> Tensor<R> {
                 gradient: Box::new(input_gradient),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     fn replay_binary<const R2: usize, const OUT: usize>(
@@ -467,7 +467,7 @@ impl<const R: usize> Tensor<R> {
                 },
             ])
         });
-        self.from_op(
+        self.emit_op(
             value,
             vec![self.handle.clone(), rhs.handle.clone()],
             Some(backward),
@@ -526,7 +526,7 @@ impl<const R: usize> Tensor<R> {
                 },
             ])
         });
-        self.from_op(
+        self.emit_op(
             value,
             vec![
                 self.handle.clone(),

@@ -505,7 +505,7 @@ impl<const R: usize> Tensor<R> {
                 },
             ])
         });
-        self.from_op(
+        self.emit_op(
             value,
             vec![
                 self.handle.clone(),

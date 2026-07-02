@@ -324,7 +324,7 @@ impl Tensor<4> {
             &k.value,
             &v.value,
             scale,
-            mask.map(|(mask, kind)| (mask, kind)),
+            mask,
         );
         let mask_value = mask.map(|(mask, kind)| (mask.clone(), kind));
         self.replay_ternary(k, v, "flash_attention", value, move |q, k, v| {

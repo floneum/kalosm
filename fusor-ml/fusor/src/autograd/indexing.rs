@@ -23,7 +23,7 @@ impl Tensor<2> {
                 gradient: Box::new(input_gradient),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn gather_last(&self, indices: &RawTensor<1, u32>) -> Tensor<1> {
@@ -54,7 +54,7 @@ impl Tensor<2> {
                 gradient: Box::new(input_gradient),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn embedding(&self, indices: &RawTensor<2, u32>) -> Tensor<3> {
@@ -75,7 +75,7 @@ impl Tensor<2> {
                 gradient: Box::new(one_hot.transpose(0, 1).mat_mul(&grad_flat)),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 }
 

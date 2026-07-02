@@ -19,7 +19,7 @@ impl<const R: usize> Tensor<R> {
                 gradient: Box::new(gradient.broadcast_as(input_shape).to_concrete()),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub(super) fn max_keepdim_any<const OUT_RANK: usize>(&self, axis: usize) -> Self
@@ -44,7 +44,7 @@ impl<const R: usize> Tensor<R> {
                 )),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     fn min_keepdim_any<const OUT_RANK: usize>(&self, axis: usize) -> Self
@@ -69,7 +69,7 @@ impl<const R: usize> Tensor<R> {
                 )),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub(super) fn mean_keepdim_any<const OUT_RANK: usize>(&self, axis: usize) -> Self
@@ -120,7 +120,7 @@ impl<const R: usize> Tensor<R> {
                 gradient: Box::new(gradient),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     fn var_keepdim_any<const OUT_RANK: usize>(&self, axis: usize) -> Self
@@ -334,7 +334,7 @@ impl Tensor<1> {
                 gradient: Box::new(gradient.broadcast_as(input_shape).to_concrete()),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 }
 
@@ -355,7 +355,7 @@ impl Tensor<2> {
                 ),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn sum_keepdim(&self, axis: usize) -> Tensor<2> {
@@ -380,7 +380,7 @@ impl Tensor<3> {
                 ),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn sum_keepdim(&self, axis: usize) -> Tensor<3> {
@@ -405,7 +405,7 @@ impl Tensor<4> {
                 ),
             }])
         });
-        self.from_op(value, vec![self.handle.clone()], Some(backward))
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn sum_keepdim(&self, axis: usize) -> Tensor<4> {
