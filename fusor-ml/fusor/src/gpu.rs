@@ -335,6 +335,36 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     }
 
     #[inline]
+    pub fn eq_tensor<D2: DataType>(&self, other: &Self) -> Tensor<R, D2> {
+        Tensor::from_core(self.inner.eq_tensor::<D2>(other.as_core()))
+    }
+
+    #[inline]
+    pub fn ne_tensor<D2: DataType>(&self, other: &Self) -> Tensor<R, D2> {
+        Tensor::from_core(self.inner.ne_tensor::<D2>(other.as_core()))
+    }
+
+    #[inline]
+    pub fn lt_tensor<D2: DataType>(&self, other: &Self) -> Tensor<R, D2> {
+        Tensor::from_core(self.inner.lt_tensor::<D2>(other.as_core()))
+    }
+
+    #[inline]
+    pub fn lte_tensor<D2: DataType>(&self, other: &Self) -> Tensor<R, D2> {
+        Tensor::from_core(self.inner.lte_tensor::<D2>(other.as_core()))
+    }
+
+    #[inline]
+    pub fn gt_tensor<D2: DataType>(&self, other: &Self) -> Tensor<R, D2> {
+        Tensor::from_core(self.inner.gt_tensor::<D2>(other.as_core()))
+    }
+
+    #[inline]
+    pub fn gte_tensor<D2: DataType>(&self, other: &Self) -> Tensor<R, D2> {
+        Tensor::from_core(self.inner.gte_tensor::<D2>(other.as_core()))
+    }
+
+    #[inline]
     pub fn cast<D2>(&self) -> Tensor<R, D2>
     where
         D: CastTensor<D2>,

@@ -11,8 +11,8 @@
 #[cfg(not(any(feature = "cpu", feature = "gpu")))]
 compile_error!("fusor requires at least one backend feature: `cpu` or `gpu`.");
 
-pub mod cache;
 pub mod autograd;
+pub mod cache;
 mod composite;
 mod cpu;
 mod device;

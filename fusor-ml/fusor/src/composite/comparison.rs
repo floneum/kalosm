@@ -27,7 +27,7 @@ macro_rules! scalar_cmp {
     };
 }
 
-/// Emit a tensor-tensor comparison method that runs on CPU only.
+/// Emit a tensor-tensor comparison method that dispatches CPU/GPU.
 macro_rules! tensor_cmp {
     ($(#[$meta:meta])* $method:ident, $op:ident, $cpu_method:ident) => {
         $(#[$meta])*
@@ -36,7 +36,11 @@ macro_rules! tensor_cmp {
             B2: Fusion<R, D>,
             $op: SimdBinaryOp<D>,
         {
-            self.dispatch_cpu_only_pair(rhs, |a, b| a.as_ref().$cpu_method(b.as_ref()).to_concrete())
+            self.dispatch_pair_concrete(
+                rhs,
+                |a, b| a.as_ref().$cpu_method(b.as_ref()).to_concrete(),
+                |a, b| a.$method(b),
+            )
         }
     };
 }
@@ -63,7 +67,6 @@ where
         /// Element-wise equality comparison between two tensors.
         ///
         /// Returns 1.0 where elements are equal, 0.0 otherwise.
-        /// Note: GPU comparison is only available for CPU tensors at this time.
         eq_tensor, EqOp, eq
     );
 
@@ -71,7 +74,6 @@ where
         /// Element-wise inequality comparison between two tensors.
         ///
         /// Returns 1.0 where elements are not equal, 0.0 otherwise.
-        /// Note: GPU comparison is only available for CPU tensors at this time.
         ne_tensor, NeOp, ne
     );
 
@@ -79,7 +81,6 @@ where
         /// Element-wise less-than comparison between two tensors.
         ///
         /// Returns 1.0 where self < rhs, 0.0 otherwise.
-        /// Note: GPU comparison is only available for CPU tensors at this time.
         lt_tensor, LtOp, lt
     );
 
@@ -87,7 +88,6 @@ where
         /// Element-wise less-than-or-equal comparison between two tensors.
         ///
         /// Returns 1.0 where self <= rhs, 0.0 otherwise.
-        /// Note: GPU comparison is only available for CPU tensors at this time.
         lte_tensor, LteOp, lte
     );
 
@@ -95,7 +95,6 @@ where
         /// Element-wise greater-than comparison between two tensors.
         ///
         /// Returns 1.0 where self > rhs, 0.0 otherwise.
-        /// Note: GPU comparison is only available for CPU tensors at this time.
         gt_tensor, GtOp, gt
     );
 
@@ -103,7 +102,6 @@ where
         /// Element-wise greater-than-or-equal comparison between two tensors.
         ///
         /// Returns 1.0 where self >= rhs, 0.0 otherwise.
-        /// Note: GPU comparison is only available for CPU tensors at this time.
         gte_tensor, GteOp, gte
     );
 

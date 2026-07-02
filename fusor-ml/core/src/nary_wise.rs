@@ -86,6 +86,16 @@ pub(crate) enum NaryOp {
     /// index-dependent masking (e.g. composed causal attention compares the
     /// kv position against the query position).
     LessEqual,
+    /// Binary `a < b` comparison producing 1/0 in the output type.
+    Less,
+    /// Binary `a == b` comparison producing 1/0 in the output type.
+    Equal,
+    /// Binary `a != b` comparison producing 1/0 in the output type.
+    NotEqual,
+    /// Binary `a > b` comparison producing 1/0 in the output type.
+    Greater,
+    /// Binary `a >= b` comparison producing 1/0 in the output type.
+    GreaterEqual,
     AddConst(NaryScalar),
     SubConst(NaryScalar),
     RSubConst(NaryScalar),

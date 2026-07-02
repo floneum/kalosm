@@ -849,6 +849,31 @@ fn emit_function(function: &NaryFunction, values: &mut [(ValueTile, DataTypeEnum
             values[1].0.clone(),
             function.output_type,
         ),
+        NaryOp::Less => values[0].0.clone().compare(
+            tile_ir::TileCompareOp::Lt,
+            values[1].0.clone(),
+            function.output_type,
+        ),
+        NaryOp::Equal => values[0].0.clone().compare(
+            tile_ir::TileCompareOp::Eq,
+            values[1].0.clone(),
+            function.output_type,
+        ),
+        NaryOp::NotEqual => values[0].0.clone().compare(
+            tile_ir::TileCompareOp::Ne,
+            values[1].0.clone(),
+            function.output_type,
+        ),
+        NaryOp::Greater => values[0].0.clone().compare(
+            tile_ir::TileCompareOp::Gt,
+            values[1].0.clone(),
+            function.output_type,
+        ),
+        NaryOp::GreaterEqual => values[0].0.clone().compare(
+            tile_ir::TileCompareOp::Ge,
+            values[1].0.clone(),
+            function.output_type,
+        ),
         NaryOp::AddConst(scalar) => values[0].0.clone().binary(
             tile_ir::TileBinaryOp::Add,
             tile_literal(scalar).cast_to(values[0].1),
