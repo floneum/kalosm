@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use crate::{Dim, Layout};
-use fusor_types::StrideSpec;
+use fusor_types::{SlidingWindow, StrideSpec};
 
 use super::*;
 
@@ -314,6 +314,72 @@ impl<const R: usize> Tensor<R> {
         self.restride(specs)
     }
 
+    pub fn squeeze<const OUT: usize>(&self, dim: usize) -> Tensor<OUT>
+    where
+        crate::gpu::Tensor<R, f32>: crate::gpu::SmallerRank<1, OUT, f32>,
+    {
+        self.squeeze_dims::<1, OUT>([dim])
+    }
+
+    pub fn unsqueeze<const OUT: usize>(&self, dim: usize) -> Tensor<OUT>
+    where
+        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<1, OUT, f32>,
+    {
+        self.unsqueeze_dims::<1, OUT>([dim])
+    }
+
+    pub fn sliding_window_view<const DIFF: usize, const R2: usize>(
+        &self,
+        windows: [SlidingWindow; DIFF],
+    ) -> Tensor<R2>
+    where
+        crate::ConcreteTensor<f32, R>: crate::cpu::LargerRank<R2, DIFF, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
+    {
+        let shape = self.shape();
+        let mut sorted_windows = windows;
+        sorted_windows.sort_by_key(|window| window.axis);
+        let specs: [StrideSpec; R2] = std::array::from_fn(|out_i| {
+            if out_i < R {
+                if let Some(window) = sorted_windows.iter().find(|window| window.axis == out_i) {
+                    let positions = (shape[out_i] - window.window_size) / window.step + 1;
+                    StrideSpec::dim_with(out_i, positions, window.step)
+                } else {
+                    StrideSpec::dim(out_i, shape[out_i])
+                }
+            } else {
+                let window = &sorted_windows[out_i - R];
+                StrideSpec::dim(window.axis, window.window_size)
+            }
+        });
+        self.restride(specs)
+    }
+
+    pub fn pad_axis(&self, axis: usize, padding: usize) -> Self {
+        self.pad_with_zeros(axis, padding, padding)
+    }
+
+    pub fn pad_with_zeros(&self, axis: usize, left: usize, right: usize) -> Self {
+        if left == 0 && right == 0 {
+            return self.clone();
+        }
+        let shape = self.shape();
+        let mut padded_shape = shape;
+        padded_shape[axis] += left + right;
+        let padded = Self::constant_from_raw(
+            &self.graph(),
+            RawTensor::zeros(&self.device(), padded_shape),
+        );
+        let slices: [Range<usize>; R] = std::array::from_fn(|dim| {
+            if dim == axis {
+                left..left + shape[axis]
+            } else {
+                0..shape[dim]
+            }
+        });
+        padded.slice_assign(slices, self)
+    }
+
     pub fn slice_assign(&self, slices: [Range<usize>; R], value: &Self) -> Self {
         assert_same_graph(self, value);
 
@@ -412,30 +478,7 @@ impl<const R: usize> Tensor<R> {
             handle: NodeHandle { graph, id },
         }
     }
-}
-
-impl Tensor<1> {
-    pub fn unsqueeze(&self, dim: usize) -> Tensor<2> {
-        self.unsqueeze_dims::<1, 2>([dim])
-    }
-}
-
-impl Tensor<2> {
-    pub fn squeeze(&self, dim: usize) -> Tensor<1> {
-        self.squeeze_dims::<1, 1>([dim])
-    }
-
-    pub fn unsqueeze(&self, dim: usize) -> Tensor<3> {
-        self.unsqueeze_dims::<1, 3>([dim])
-    }
-}
-
-impl Tensor<3> {
-    pub fn squeeze(&self, dim: usize) -> Tensor<2> {
-        self.squeeze_dims::<1, 2>([dim])
-    }
-
-    pub fn cat(tensors: Vec<Tensor<3>>, dim: usize) -> Tensor<3> {
+    pub fn cat(tensors: Vec<Self>, dim: usize) -> Self {
         assert!(!tensors.is_empty(), "cat requires at least one tensor");
         let graph = tensors[0].handle.graph.clone();
         let raw = tensors
@@ -458,31 +501,19 @@ impl Tensor<3> {
             })
             .collect::<Vec<_>>();
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<3>(&*gradient, "cat")?;
+            let gradient = downcast_tensor::<R>(&*gradient, "cat")?;
             let mut targets = Vec::with_capacity(parent_ids.len());
             for (&parent_id, slice) in parent_ids.iter().zip(slices.iter()) {
-                let grad_slice = match dim {
-                    0 => gradient.slice([
-                        slice.clone(),
-                        0..gradient.shape()[1],
-                        0..gradient.shape()[2],
-                    ]),
-                    1 => gradient.slice([
-                        0..gradient.shape()[0],
-                        slice.clone(),
-                        0..gradient.shape()[2],
-                    ]),
-                    2 => gradient.slice([
-                        0..gradient.shape()[0],
-                        0..gradient.shape()[1],
-                        slice.clone(),
-                    ]),
-                    _ => panic!("invalid cat dim"),
-                }
-                .to_concrete();
+                let ranges: [Range<usize>; R] = std::array::from_fn(|axis| {
+                    if axis == dim {
+                        slice.clone()
+                    } else {
+                        0..gradient.shape()[axis]
+                    }
+                });
                 targets.push(BackwardTarget {
                     node: parent_id,
-                    gradient: Box::new(grad_slice),
+                    gradient: Box::new(gradient.slice(ranges).to_concrete()),
                 });
             }
             Ok(targets)

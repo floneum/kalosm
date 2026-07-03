@@ -22,6 +22,33 @@ impl<const R: usize> Tensor<R> {
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
+    pub(super) fn sum_any<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<OUT_RANK>
+    where
+        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+    {
+        let input_shape = self.shape();
+        let value = self.value.sum::<OUT_RANK>(axis).to_concrete();
+        let input_id = self.handle.id;
+        let mut keepdim_shape = input_shape;
+        keepdim_shape[axis] = 1;
+        let backward: BackwardRule = Arc::new(move |gradient| {
+            let gradient = downcast_tensor::<OUT_RANK>(&*gradient, "sum")?;
+            Ok(vec![BackwardTarget {
+                node: input_id,
+                gradient: Box::new(
+                    gradient
+                        .reshape(keepdim_shape)
+                        .to_concrete()
+                        .broadcast_as(input_shape)
+                        .to_concrete(),
+                ),
+            }])
+        });
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
+    }
+
     pub(super) fn max_keepdim_any<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
@@ -338,82 +365,27 @@ impl Tensor<1> {
         });
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
-}
 
-impl Tensor<2> {
-    pub fn sum(&self, axis: usize) -> Tensor<1> {
-        let input_shape = self.shape();
-        let value = self.value.sum::<1>(axis).to_concrete();
-        let input_id = self.handle.id;
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<1>(&*gradient, "sum")?;
-            Ok(vec![BackwardTarget {
-                node: input_id,
-                gradient: Box::new(
-                    gradient
-                        .unsqueeze(axis)
-                        .broadcast_as(input_shape)
-                        .to_concrete(),
-                ),
-            }])
-        });
-        self.emit_op(value, vec![self.handle.clone()], Some(backward))
-    }
-
-    pub fn sum_keepdim(&self, axis: usize) -> Tensor<2> {
-        self.sum_keepdim_any::<1>(axis)
+    pub fn sum_keepdim(&self, axis: usize) -> Tensor<1> {
+        self.sum_keepdim_any::<0>(axis)
     }
 }
 
-impl Tensor<3> {
-    pub fn sum(&self, axis: usize) -> Tensor<2> {
-        let input_shape = self.shape();
-        let value = self.value.sum::<2>(axis).to_concrete();
-        let input_id = self.handle.id;
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<2>(&*gradient, "sum")?;
-            Ok(vec![BackwardTarget {
-                node: input_id,
-                gradient: Box::new(
-                    gradient
-                        .unsqueeze(axis)
-                        .broadcast_as(input_shape)
-                        .to_concrete(),
-                ),
-            }])
-        });
-        self.emit_op(value, vec![self.handle.clone()], Some(backward))
-    }
+macro_rules! sum_wrappers {
+    ($($rank:literal => $out:literal),* $(,)?) => {$(
+        impl Tensor<$rank> {
+            pub fn sum(&self, axis: usize) -> Tensor<$out> {
+                self.sum_any::<$out>(axis)
+            }
 
-    pub fn sum_keepdim(&self, axis: usize) -> Tensor<3> {
-        self.sum_keepdim_any::<2>(axis)
-    }
+            pub fn sum_keepdim(&self, axis: usize) -> Tensor<$rank> {
+                self.sum_keepdim_any::<$out>(axis)
+            }
+        }
+    )*};
 }
 
-impl Tensor<4> {
-    pub fn sum(&self, axis: usize) -> Tensor<3> {
-        let input_shape = self.shape();
-        let value = self.value.sum::<3>(axis).to_concrete();
-        let input_id = self.handle.id;
-        let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<3>(&*gradient, "sum")?;
-            Ok(vec![BackwardTarget {
-                node: input_id,
-                gradient: Box::new(
-                    gradient
-                        .unsqueeze(axis)
-                        .broadcast_as(input_shape)
-                        .to_concrete(),
-                ),
-            }])
-        });
-        self.emit_op(value, vec![self.handle.clone()], Some(backward))
-    }
-
-    pub fn sum_keepdim(&self, axis: usize) -> Tensor<4> {
-        self.sum_keepdim_any::<3>(axis)
-    }
-}
+sum_wrappers!(2 => 1, 3 => 2, 4 => 3, 5 => 4, 6 => 5, 7 => 6, 8 => 7, 9 => 8, 10 => 9);
 
 fn reduction_extrema_keepdim_grad<const R: usize, const OUT_RANK: usize>(
     input: RawTensor<R, f32>,

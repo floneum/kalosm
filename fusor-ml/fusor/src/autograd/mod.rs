@@ -9,6 +9,7 @@ use crate::{Device, Error, Result, Tensor as RawTensor};
 mod composite;
 mod elementwise;
 mod indexing;
+pub mod layers;
 mod matmul;
 mod reduce;
 mod view;
@@ -183,6 +184,10 @@ impl<const R: usize> Tensor<R> {
         graph.leaf(RawTensor::zeros(device, shape))
     }
 
+    pub fn ones(graph: &Graph, device: &Device, shape: [usize; R]) -> Self {
+        Self::splat(graph, device, 1.0, shape)
+    }
+
     pub fn splat(graph: &Graph, device: &Device, value: f32, shape: [usize; R]) -> Self {
         graph.leaf(RawTensor::splat(device, value, shape))
     }
@@ -193,6 +198,10 @@ impl<const R: usize> Tensor<R> {
 
     pub fn zeros_like(&self) -> Self {
         Self::zeros(&self.graph(), &self.device(), self.shape())
+    }
+
+    pub fn ones_like(&self) -> Self {
+        Self::ones(&self.graph(), &self.device(), self.shape())
     }
 
     pub fn raw(&self) -> &RawTensor<R, f32> {
@@ -470,6 +479,75 @@ impl<const R: usize> Tensor<R> {
         self.emit_op(
             value,
             vec![self.handle.clone(), rhs.handle.clone()],
+            Some(backward),
+        )
+    }
+
+    fn replay_quaternary<const R2: usize, const R3: usize, const R4: usize, const OUT: usize>(
+        &self,
+        second: &Tensor<R2>,
+        third: &Tensor<R3>,
+        fourth: &Tensor<R4>,
+        context: &'static str,
+        value: RawTensor<OUT, f32>,
+        replay: impl Fn(Tensor<R>, Tensor<R2>, Tensor<R3>, Tensor<R4>) -> Tensor<OUT> + BackwardClosure,
+    ) -> Tensor<OUT> {
+        assert_same_graph(self, second);
+        assert_same_graph(self, third);
+        assert_same_graph(self, fourth);
+        let ids = [
+            self.handle.id,
+            second.handle.id,
+            third.handle.id,
+            fourth.handle.id,
+        ];
+        let first_value = self.value.clone();
+        let second_value = second.value.clone();
+        let third_value = third.value.clone();
+        let fourth_value = fourth.value.clone();
+        let backward: BackwardRule = Arc::new(move |gradient| {
+            let gradient = downcast_tensor::<OUT>(&*gradient, context)?;
+            let graph = Graph::new();
+            let replay_first = Tensor::from_raw(&graph, first_value.clone());
+            let replay_second = Tensor::from_raw(&graph, second_value.clone());
+            let replay_third = Tensor::from_raw(&graph, third_value.clone());
+            let replay_fourth = Tensor::from_raw(&graph, fourth_value.clone());
+            let replay_output = replay(
+                replay_first.clone(),
+                replay_second.clone(),
+                replay_third.clone(),
+                replay_fourth.clone(),
+            );
+            let gradients = replay_output.backward_with(gradient)?;
+            let missing =
+                || Error::msg(format!("missing replay gradient in {context}"));
+            Ok(vec![
+                BackwardTarget {
+                    node: ids[0],
+                    gradient: Box::new(gradients.get(&replay_first).ok_or_else(missing)?),
+                },
+                BackwardTarget {
+                    node: ids[1],
+                    gradient: Box::new(gradients.get(&replay_second).ok_or_else(missing)?),
+                },
+                BackwardTarget {
+                    node: ids[2],
+                    gradient: Box::new(gradients.get(&replay_third).ok_or_else(missing)?),
+                },
+                BackwardTarget {
+                    node: ids[3],
+                    gradient: Box::new(gradients.get(&replay_fourth).ok_or_else(missing)?),
+                },
+            ])
+        });
+        self.emit_op(
+            value,
+            vec![
+                self.handle.clone(),
+                second.handle.clone(),
+                third.handle.clone(),
+                fourth.handle.clone(),
+            ],
             Some(backward),
         )
     }

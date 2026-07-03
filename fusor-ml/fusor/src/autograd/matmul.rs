@@ -30,6 +30,10 @@ impl<const R: usize> Tensor<R> {
         )
     }
 
+    pub fn mat_mul(&self, rhs: &Self) -> Self {
+        self.mat_mul_internal(rhs)
+    }
+
     pub fn matmul(&self, rhs: &Self) -> Self {
         self.mat_mul_internal(rhs)
     }
@@ -40,7 +44,12 @@ impl<const R: usize> Tensor<R> {
     }
 
     pub fn q_mat_mul(&self, weights: &crate::QMatrix) -> Self {
-        assert!(R >= 2, "q_mat_mul requires rank >= 2");
+        if R == 1 {
+            let k = self.shape()[0];
+            let n = weights.shape()[0];
+            let out_shape: [usize; R] = std::array::from_fn(|_| n);
+            return self.reshape([1, k]).q_mat_mul(weights).reshape(out_shape);
+        }
         let value = self.value.q_mat_mul(weights).to_concrete();
         if !self.requires_grad() {
             return self.emit_op(value, vec![self.handle.clone()], None);
@@ -67,17 +76,5 @@ impl<const R: usize> Tensor<R> {
             let weight = Tensor::constant_from_raw(&input.graph(), weight);
             input.mat_mul_internal(&weight)
         })
-    }
-}
-
-impl Tensor<2> {
-    pub fn mat_mul(&self, rhs: &Tensor<2>) -> Tensor<2> {
-        self.mat_mul_internal(rhs)
-    }
-}
-
-impl Tensor<3> {
-    pub fn mat_mul(&self, rhs: &Tensor<3>) -> Tensor<3> {
-        self.mat_mul_internal(rhs)
     }
 }

@@ -1,69 +1,35 @@
-//! Conv1d layer implementation.
+//! Trainable Conv1d layer implementation.
 
-use crate::fusion::Concrete;
-use crate::{DataType, FloatDataType, FloatOps, MatmulImpl, SimdElement, Tensor};
+use super::super::{Graph, Tensor};
 
-/// Configuration for Conv1d layer.
-#[derive(Debug, Clone, Copy)]
-pub struct Conv1dConfig {
-    pub padding: usize,
-    pub stride: usize,
-    pub groups: usize,
-    pub dilation: usize,
-}
+pub use crate::layers::Conv1dConfig;
 
-impl Default for Conv1dConfig {
-    fn default() -> Self {
-        Self {
-            padding: 0,
-            stride: 1,
-            groups: 1,
-            dilation: 1,
-        }
-    }
-}
-
-/// 1D Convolution layer.
+/// 1D Convolution layer with trainable parameters.
 ///
 /// Applies a 1D convolution over an input signal.
 /// Input shape: (batch, in_channels, length)
 /// Output shape: (batch, out_channels, out_length)
 /// where out_length = (length + 2*padding - kernel_size) / stride + 1
-pub struct Conv1d<D: SimdElement> {
-    weight: Tensor<3, D, Concrete<D, 3>>, // (out_channels, in_channels, kernel_size)
-    bias: Option<Tensor<1, D, Concrete<D, 1>>>, // (out_channels,)
+pub struct Conv1d {
+    weight: Tensor<3>,
+    bias: Option<Tensor<1>>,
     config: Conv1dConfig,
     in_channels: usize,
     out_channels: usize,
     kernel_size: usize,
 }
 
-impl<D> Conv1d<D>
-where
-    D: SimdElement
-        + DataType
-        + FloatDataType
-        + FloatOps
-        + Default
-        + MatmulImpl
-        + std::ops::Mul<Output = D>
-        + std::ops::Add<Output = D>,
-{
+impl Conv1d {
     /// Create a new Conv1d layer with given weights and configuration.
     ///
     /// Weight shape: (out_channels, in_channels, kernel_size)
     /// Bias shape: (out_channels,)
-    pub fn new(
-        weight: Tensor<3, D, Concrete<D, 3>>,
-        bias: Option<Tensor<1, D, Concrete<D, 1>>>,
-        config: Conv1dConfig,
-    ) -> Self {
+    pub fn new(weight: Tensor<3>, bias: Option<Tensor<1>>, config: Conv1dConfig) -> Self {
         let shape = weight.shape();
         let out_channels = shape[0];
         let in_channels = shape[1];
         let kernel_size = shape[2];
 
-        // Validate configuration
         assert_eq!(config.groups, 1, "Only groups=1 is currently supported");
         assert_eq!(config.dilation, 1, "Only dilation=1 is currently supported");
 
@@ -85,22 +51,36 @@ where
         }
     }
 
+    /// Import an inference layer's parameters as trainable graph leaves.
+    pub fn from_inference(graph: &Graph, layer: &crate::layers::Conv1d<f32>) -> Self {
+        Self::new(
+            graph.leaf(layer.weight().clone()),
+            layer.bias().map(|bias| graph.leaf(bias.clone())),
+            *layer.config(),
+        )
+    }
+
     /// Forward pass.
     ///
     /// Input shape: (batch, in_channels, length)
     /// Output shape: (batch, out_channels, out_length)
-    pub fn forward(&self, input: &Tensor<3, D, Concrete<D, 3>>) -> Tensor<3, D, Concrete<D, 3>>
-    where
-        crate::MulOp: crate::SimdBinaryOp<D>,
-        crate::AddOp: crate::SimdBinaryOp<D>,
-        crate::SumOp: crate::SimdReduceOp<D>,
-    {
+    pub fn forward(&self, input: &Tensor<3>) -> Tensor<3> {
         input.conv(
             &self.weight,
             self.bias.as_ref(),
             [self.config.padding],
             [self.config.stride],
         )
+    }
+
+    /// Get the weight tensor.
+    pub fn weight(&self) -> &Tensor<3> {
+        &self.weight
+    }
+
+    /// Get the bias tensor.
+    pub fn bias(&self) -> Option<&Tensor<1>> {
+        self.bias.as_ref()
     }
 
     /// Get the configuration.
@@ -122,14 +102,5 @@ where
     pub fn kernel_size(&self) -> usize {
         self.kernel_size
     }
-
-    /// Get the weight tensor.
-    pub fn weight(&self) -> &Tensor<3, D, Concrete<D, 3>> {
-        &self.weight
-    }
-
-    /// Get the bias tensor if present.
-    pub fn bias(&self) -> Option<&Tensor<1, D, Concrete<D, 1>>> {
-        self.bias.as_ref()
-    }
 }
+

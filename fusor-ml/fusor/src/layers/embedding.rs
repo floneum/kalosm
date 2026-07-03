@@ -115,6 +115,11 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
             .expect("dense embeddings unavailable for this embedding table")
     }
 
+    /// Get the dense embedding table, if this layer holds one.
+    pub fn dense_embeddings(&self) -> Option<&Tensor<2, T>> {
+        self.embeddings.as_ref()
+    }
+
     /// Get the number of embeddings.
     pub fn num_embeddings(&self) -> usize {
         self.num_embeddings

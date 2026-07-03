@@ -1,4 +1,5 @@
 use crate::MaskKind;
+use fusor_types::SlidingWindow;
 
 use super::*;
 
@@ -20,10 +21,10 @@ impl<const R: usize> Tensor<R> {
         exp_values.div(&normalization)
     }
 
-    fn rms_norm_composite<const OUT_RANK: usize>(
+    fn rms_norm_composite<const W: usize, const OUT_RANK: usize>(
         &self,
-        weight: &Tensor<1>,
-        bias: Option<&Tensor<1>>,
+        weight: &Tensor<W>,
+        bias: Option<&Tensor<W>>,
         eps: f32,
     ) -> Self
     where
@@ -31,34 +32,26 @@ impl<const R: usize> Tensor<R> {
         crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
     {
-        let std = self
-            .sqr()
-            .mean_keepdim_any::<OUT_RANK>(R - 1)
-            .add_scalar(eps)
-            .sqrt();
-        let normalized = self.div(&std.broadcast_as(self.shape()));
-        let scaled = normalized.mul(&weight.broadcast_as(self.shape()));
-        if let Some(bias) = bias {
-            scaled.add(&bias.broadcast_as(self.shape()))
-        } else {
-            scaled
-        }
+        self.layer_norm_composite::<W, OUT_RANK>(weight, bias, eps, false)
     }
 
-    fn layer_norm_composite<const OUT_RANK: usize>(
+    fn layer_norm_composite<const W: usize, const OUT_RANK: usize>(
         &self,
-        weight: &Tensor<1>,
-        bias: Option<&Tensor<1>>,
+        weight: &Tensor<W>,
+        bias: Option<&Tensor<W>>,
         eps: f32,
+        remove_mean: bool,
     ) -> Self
     where
         crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
         crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
         crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
     {
-        let centered = {
+        let centered = if remove_mean {
             let mean = self.mean_keepdim_any::<OUT_RANK>(R - 1);
             self.sub(&mean.broadcast_as(self.shape()))
+        } else {
+            self.clone()
         };
         let variance = centered.sqr().mean_keepdim_any::<OUT_RANK>(R - 1);
         let std = variance.add_scalar(eps).sqrt();
@@ -91,6 +84,50 @@ impl<const R: usize> Tensor<R> {
         self.softmax::<OUT_RANK>(R - 1)
     }
 
+    pub fn softmax_slow<const OUT_RANK: usize>(&self, axis: usize) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
+        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<f32>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+    {
+        self.softmax::<OUT_RANK>(axis)
+    }
+
+    pub fn softmax_slow_last_dim<const OUT_RANK: usize>(&self) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
+        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<f32>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+    {
+        self.softmax_slow::<OUT_RANK>(R - 1)
+    }
+
+    pub fn layer_norm<const OUT_RANK: usize>(
+        &self,
+        weight: &Tensor<R>,
+        bias: Option<&Tensor<R>>,
+        eps: f32,
+        remove_mean: bool,
+    ) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+    {
+        self.layer_norm_composite::<R, OUT_RANK>(weight, bias, eps, remove_mean)
+    }
+
+    pub fn rms_norm<const OUT_RANK: usize>(&self, weight: &Tensor<R>, eps: f32) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+    {
+        self.rms_norm_composite::<R, OUT_RANK>(weight, None, eps)
+    }
+
     pub fn softmax_last_dim_fused<const OUT_RANK: usize>(&self) -> Self
     where
         crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
@@ -108,10 +145,10 @@ impl<const R: usize> Tensor<R> {
         })
     }
 
-    pub fn rms_norm_fused<const OUT_RANK: usize>(
+    pub fn rms_norm_fused<const W: usize, const OUT_RANK: usize>(
         &self,
-        weight: &Tensor<1>,
-        bias: Option<&Tensor<1>>,
+        weight: &Tensor<W>,
+        bias: Option<&Tensor<W>>,
         eps: f32,
     ) -> Self
     where
@@ -124,9 +161,9 @@ impl<const R: usize> Tensor<R> {
         crate::DivOp: crate::cpu::SimdBinaryOp<f32>,
         crate::AddOp: crate::cpu::SimdBinaryOp<f32>,
         crate::SqrtOp: crate::cpu::SimdUnaryOp<f32>,
-        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<1, f32>): crate::gpu::MaxRank<R, f32>,
+        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<W, f32>): crate::gpu::MaxRank<R, f32>,
     {
-        let value = self.value.rms_norm_fused::<1, OUT_RANK>(
+        let value = self.value.rms_norm_fused::<W, OUT_RANK>(
             &weight.value,
             bias.as_ref().map(|bias| &bias.value),
             eps,
@@ -138,19 +175,19 @@ impl<const R: usize> Tensor<R> {
                 "rms_norm_fused",
                 value,
                 move |input, weight, bias| {
-                    input.rms_norm_composite::<OUT_RANK>(&weight, Some(&bias), eps)
+                    input.rms_norm_composite::<W, OUT_RANK>(&weight, Some(&bias), eps)
                 },
             )
         } else {
             self.replay_binary(weight, "rms_norm_fused", value, move |input, weight| {
-                input.rms_norm_composite::<OUT_RANK>(&weight, None, eps)
+                input.rms_norm_composite::<W, OUT_RANK>(&weight, None, eps)
             })
         }
     }
 
-    pub fn rms_norm_fused_no_bias<const OUT_RANK: usize>(
+    pub fn rms_norm_fused_no_bias<const W: usize, const OUT_RANK: usize>(
         &self,
-        weight: &Tensor<1>,
+        weight: &Tensor<W>,
         eps: f32,
     ) -> Self
     where
@@ -163,15 +200,67 @@ impl<const R: usize> Tensor<R> {
         crate::DivOp: crate::cpu::SimdBinaryOp<f32>,
         crate::AddOp: crate::cpu::SimdBinaryOp<f32>,
         crate::SqrtOp: crate::cpu::SimdUnaryOp<f32>,
-        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<1, f32>): crate::gpu::MaxRank<R, f32>,
+        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<W, f32>): crate::gpu::MaxRank<R, f32>,
     {
-        self.rms_norm_fused::<OUT_RANK>(weight, None, eps)
+        self.rms_norm_fused::<W, OUT_RANK>(weight, None, eps)
     }
 
-    pub fn layer_norm_last_dim_fused<const OUT_RANK: usize>(
+    pub fn rms_norm_residual_fused<const W: usize, const OUT_RANK: usize>(
         &self,
-        weight: &Tensor<1>,
-        bias: Option<&Tensor<1>>,
+        residual: &Self,
+        weight: &Tensor<W>,
+        bias: Option<&Tensor<W>>,
+        eps: f32,
+    ) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, f32> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, f32>>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+        crate::MulOp: crate::cpu::SimdBinaryOp<f32>,
+        crate::DivOp: crate::cpu::SimdBinaryOp<f32>,
+        crate::AddOp: crate::cpu::SimdBinaryOp<f32>,
+        crate::SqrtOp: crate::cpu::SimdUnaryOp<f32>,
+        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<W, f32>): crate::gpu::MaxRank<R, f32>,
+    {
+        let value = self.value.rms_norm_residual_fused::<W, OUT_RANK, _>(
+            &residual.value,
+            &weight.value,
+            bias.as_ref().map(|bias| &bias.value),
+            eps,
+        );
+        match bias {
+            None => self.replay_ternary(
+                residual,
+                weight,
+                "rms_norm_residual_fused",
+                value,
+                move |input, residual, weight| {
+                    input
+                        .add(&residual)
+                        .rms_norm_composite::<W, OUT_RANK>(&weight, None, eps)
+                },
+            ),
+            Some(bias) => self.replay_quaternary(
+                residual,
+                weight,
+                bias,
+                "rms_norm_residual_fused",
+                value,
+                move |input, residual, weight, bias| {
+                    input
+                        .add(&residual)
+                        .rms_norm_composite::<W, OUT_RANK>(&weight, Some(&bias), eps)
+                },
+            ),
+        }
+    }
+
+    pub fn layer_norm_last_dim_fused<const OUT_RANK: usize, const W: usize>(
+        &self,
+        weight: &Tensor<W>,
+        bias: Option<&Tensor<W>>,
         eps: f32,
     ) -> Self
     where
@@ -186,11 +275,13 @@ impl<const R: usize> Tensor<R> {
         crate::DivOp: crate::cpu::SimdBinaryOp<f32>,
         crate::SqrtOp: crate::cpu::SimdUnaryOp<f32>,
     {
-        let value = self.value.layer_norm_last_dim_fused::<OUT_RANK, 1, _, _>(
+        let value = self.value.layer_norm_last_dim_fused::<OUT_RANK, W, _, _>(
             &weight.value,
             bias.as_ref().map(|bias| &bias.value),
             eps,
         );
+        let mut param_shape = [1usize; R];
+        param_shape[R - 1] = self.shape()[R - 1];
         if let Some(bias) = bias {
             self.replay_ternary(
                 weight,
@@ -198,7 +289,12 @@ impl<const R: usize> Tensor<R> {
                 "layer_norm_last_dim_fused",
                 value,
                 move |input, weight, bias| {
-                    input.layer_norm_composite::<OUT_RANK>(&weight, Some(&bias), eps)
+                    input.layer_norm_composite::<R, OUT_RANK>(
+                        &weight.reshape(param_shape),
+                        Some(&bias.reshape(param_shape)),
+                        eps,
+                        true,
+                    )
                 },
             )
         } else {
@@ -206,29 +302,284 @@ impl<const R: usize> Tensor<R> {
                 weight,
                 "layer_norm_last_dim_fused",
                 value,
-                move |input, weight| input.layer_norm_composite::<OUT_RANK>(&weight, None, eps),
+                move |input, weight| {
+                    input.layer_norm_composite::<R, OUT_RANK>(
+                        &weight.reshape(param_shape),
+                        None,
+                        eps,
+                        true,
+                    )
+                },
             )
         }
     }
-}
 
-impl Tensor<2> {
-    pub fn layer_norm(&self, weight: &Tensor<1>, bias: Option<&Tensor<1>>, eps: f32) -> Tensor<2> {
-        self.layer_norm_composite::<1>(weight, bias, eps)
+    fn pad_spatial<const DIFF: usize>(&self, padding: [usize; DIFF]) -> Self {
+        let mut padded = self.clone();
+        for (i, padding) in padding.into_iter().enumerate() {
+            padded = padded.pad_axis(R - DIFF + i, padding);
+        }
+        padded
     }
 
-    pub fn rms_norm(&self, weight: &Tensor<1>, eps: f32) -> Tensor<2> {
-        self.rms_norm_composite::<1>(weight, None, eps)
+    fn conv_output_shape<const DIFF: usize>(
+        input_shape: [usize; R],
+        out_channels: usize,
+        kernel: [usize; DIFF],
+        padding: [usize; DIFF],
+        strides: [usize; DIFF],
+    ) -> [usize; R] {
+        let spatial_start = R - DIFF;
+        let mut output_shape = input_shape;
+        output_shape[1] = out_channels;
+        for i in 0..DIFF {
+            let padded_len = input_shape[spatial_start + i] + 2 * padding[i];
+            output_shape[spatial_start + i] = (padded_len - kernel[i]) / strides[i] + 1;
+        }
+        output_shape
     }
-}
 
-impl Tensor<3> {
-    pub fn layer_norm(&self, weight: &Tensor<1>, bias: Option<&Tensor<1>>, eps: f32) -> Tensor<3> {
-        self.layer_norm_composite::<2>(weight, bias, eps)
+    /// Pad + sliding-window view + flatten to one matmul row per output
+    /// location: `(batch * out_spatial, in_channels * kernel_size)`.
+    fn conv_windows_flat<const DIFF: usize, const R2: usize>(
+        &self,
+        kernel: [usize; DIFF],
+        padding: [usize; DIFF],
+        strides: [usize; DIFF],
+    ) -> Tensor<2>
+    where
+        crate::ConcreteTensor<f32, R>: crate::cpu::LargerRank<R2, DIFF, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
+    {
+        let input_shape = self.shape();
+        let spatial_start = R - DIFF;
+        let output_shape = Self::conv_output_shape(input_shape, 0, kernel, padding, strides);
+        let windows: [SlidingWindow; DIFF] = std::array::from_fn(|i| {
+            SlidingWindow::new(spatial_start + i, kernel[i], strides[i])
+        });
+        let windows: Tensor<R2> = self.pad_spatial(padding).sliding_window_view(windows);
+        let permutation: [usize; R2] = std::array::from_fn(|index| {
+            if index == 0 {
+                0
+            } else if index <= DIFF {
+                index + 1
+            } else if index == DIFF + 1 {
+                1
+            } else {
+                index
+            }
+        });
+        let out_spatial_size: usize = output_shape[spatial_start..].iter().product();
+        let kernel_size: usize = kernel.iter().product();
+        windows.permute(permutation).reshape([
+            input_shape[0] * out_spatial_size,
+            input_shape[1] * kernel_size,
+        ])
     }
 
-    pub fn rms_norm(&self, weight: &Tensor<1>, eps: f32) -> Tensor<3> {
-        self.rms_norm_composite::<2>(weight, None, eps)
+    /// Reshape the `(batch * out_spatial, out_channels)` matmul output back to
+    /// `(batch, out_channels, ...out_spatial)` and add the broadcast bias.
+    fn conv_reassemble<const DIFF: usize>(
+        output: Tensor<2>,
+        bias: Option<&Tensor<1>>,
+        output_shape: [usize; R],
+    ) -> Self {
+        let out_channels = output_shape[1];
+        let output: Tensor<R> = output.reshape(std::array::from_fn(|axis| {
+            if axis == 0 {
+                output_shape[0]
+            } else if axis <= DIFF {
+                output_shape[axis + 1]
+            } else {
+                out_channels
+            }
+        }));
+        let permutation: [usize; R] = std::array::from_fn(|index| {
+            if index == 0 {
+                0
+            } else if index == 1 {
+                DIFF + 1
+            } else {
+                index - 1
+            }
+        });
+        let output = output.permute(permutation);
+        if let Some(bias) = bias {
+            let bias_shape: [usize; R] =
+                std::array::from_fn(|axis| if axis == 1 { out_channels } else { 1 });
+            output.add(&bias.reshape(bias_shape).broadcast_as(output_shape))
+        } else {
+            output
+        }
+    }
+
+    fn conv_composite<const WEIGHT_RANK: usize, const DIFF: usize, const R2: usize>(
+        &self,
+        weight: &Tensor<WEIGHT_RANK>,
+        bias: Option<&Tensor<1>>,
+        padding: [usize; DIFF],
+        strides: [usize; DIFF],
+    ) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: crate::cpu::LargerRank<R2, DIFF, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
+    {
+        assert_eq!(
+            R,
+            2 + DIFF,
+            "Conv expects (batch, channels, ...spatial) format where R = 2 + DIFF"
+        );
+        let input_shape = self.shape();
+        let weight_shape = weight.shape();
+        let spatial_start = R - DIFF;
+        let in_channels = input_shape[1];
+        let out_channels = weight_shape[0];
+        assert_eq!(
+            weight_shape[1], in_channels,
+            "Weight in_channels must match input in_channels"
+        );
+
+        let kernel: [usize; DIFF] = std::array::from_fn(|i| weight_shape[spatial_start + i]);
+        let kernel_size: usize = kernel.iter().product();
+        let windows_flat = self.conv_windows_flat::<DIFF, R2>(kernel, padding, strides);
+        let weight_t = weight
+            .reshape([out_channels, in_channels * kernel_size])
+            .transpose(0, 1);
+        let output = windows_flat.mat_mul_internal(&weight_t);
+
+        let output_shape =
+            Self::conv_output_shape(input_shape, out_channels, kernel, padding, strides);
+        Self::conv_reassemble::<DIFF>(output, bias, output_shape)
+    }
+
+    pub fn conv<const WEIGHT_RANK: usize, const DIFF: usize, const R2: usize>(
+        &self,
+        weight: &Tensor<WEIGHT_RANK>,
+        bias: Option<&Tensor<1>>,
+        padding: [usize; DIFF],
+        strides: [usize; DIFF],
+    ) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: crate::cpu::LargerRank<R2, DIFF, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
+    {
+        let value = self.value.conv::<WEIGHT_RANK, DIFF, R2>(
+            &weight.value,
+            bias.map(|bias| &bias.value),
+            padding,
+            strides,
+        );
+        match bias {
+            None => self.replay_binary(weight, "conv", value, move |input, weight| {
+                input.conv_composite::<WEIGHT_RANK, DIFF, R2>(&weight, None, padding, strides)
+            }),
+            Some(bias) => self.replay_ternary(
+                weight,
+                bias,
+                "conv",
+                value,
+                move |input, weight, bias| {
+                    input.conv_composite::<WEIGHT_RANK, DIFF, R2>(
+                        &weight,
+                        Some(&bias),
+                        padding,
+                        strides,
+                    )
+                },
+            ),
+        }
+    }
+
+    fn grouped_conv_composite<const WEIGHT_RANK: usize, const DIFF: usize, const R2: usize>(
+        &self,
+        weight: &Tensor<WEIGHT_RANK>,
+        bias: Option<&Tensor<1>>,
+        padding: [usize; DIFF],
+        strides: [usize; DIFF],
+        groups: usize,
+    ) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: crate::cpu::LargerRank<R2, DIFF, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
+    {
+        assert_eq!(R, 2 + DIFF);
+        let input_shape = self.shape();
+        let weight_shape = weight.shape();
+        let spatial_start = R - DIFF;
+        let batch = input_shape[0];
+        let in_channels = input_shape[1];
+        let out_channels = weight_shape[0];
+        assert_eq!(in_channels % groups, 0);
+        assert_eq!(out_channels % groups, 0);
+        let in_ch_per_group = in_channels / groups;
+        let out_ch_per_group = out_channels / groups;
+        assert_eq!(weight_shape[1], in_ch_per_group);
+
+        let kernel: [usize; DIFF] = std::array::from_fn(|i| weight_shape[spatial_start + i]);
+        let kernel_size: usize = kernel.iter().product();
+        let output_shape =
+            Self::conv_output_shape(input_shape, out_channels, kernel, padding, strides);
+        let out_spatial_size: usize = output_shape[spatial_start..].iter().product();
+
+        let windows_grouped = self
+            .conv_windows_flat::<DIFF, R2>(kernel, padding, strides)
+            .reshape([
+                batch * out_spatial_size,
+                groups,
+                in_ch_per_group * kernel_size,
+            ])
+            .transpose(0, 1);
+        let weight_grouped_t = weight
+            .reshape([groups, out_ch_per_group, in_ch_per_group * kernel_size])
+            .transpose(1, 2);
+        let output = windows_grouped
+            .mat_mul_internal(&weight_grouped_t)
+            .transpose(0, 1)
+            .reshape([batch * out_spatial_size, out_channels]);
+        Self::conv_reassemble::<DIFF>(output, bias, output_shape)
+    }
+
+    pub fn grouped_conv<const WEIGHT_RANK: usize, const DIFF: usize, const R2: usize>(
+        &self,
+        weight: &Tensor<WEIGHT_RANK>,
+        bias: Option<&Tensor<1>>,
+        padding: [usize; DIFF],
+        strides: [usize; DIFF],
+        groups: usize,
+    ) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: crate::cpu::LargerRank<R2, DIFF, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
+    {
+        let value = self.value.grouped_conv::<WEIGHT_RANK, DIFF, R2>(
+            &weight.value,
+            bias.map(|bias| &bias.value),
+            padding,
+            strides,
+            groups,
+        );
+        match bias {
+            None => self.replay_binary(weight, "grouped_conv", value, move |input, weight| {
+                input.grouped_conv_composite::<WEIGHT_RANK, DIFF, R2>(
+                    &weight, None, padding, strides, groups,
+                )
+            }),
+            Some(bias) => self.replay_ternary(
+                weight,
+                bias,
+                "grouped_conv",
+                value,
+                move |input, weight, bias| {
+                    input.grouped_conv_composite::<WEIGHT_RANK, DIFF, R2>(
+                        &weight,
+                        Some(&bias),
+                        padding,
+                        strides,
+                        groups,
+                    )
+                },
+            ),
+        }
     }
 }
 
@@ -260,11 +611,11 @@ impl Tensor<4> {
         let cos = cos
             .narrow(0, 0, sequence_length)
             .reshape([sequence_length, half, 1])
-            .broadcast_as([batch, 1, sequence_length, half, 1]);
+            .broadcast_as([batch, heads, sequence_length, half, 1]);
         let sin = sin
             .narrow(0, 0, sequence_length)
             .reshape([sequence_length, half, 1])
-            .broadcast_as([batch, 1, sequence_length, half, 1]);
+            .broadcast_as([batch, heads, sequence_length, half, 1]);
         let x = self.reshape([batch, heads, sequence_length, half, 2]);
         let x0 = x.narrow(4, 0, 1);
         let x1 = x.narrow(4, 1, 1);
@@ -345,12 +696,103 @@ impl Tensor<4> {
         })
     }
 
-    pub fn layer_norm(&self, weight: &Tensor<1>, bias: Option<&Tensor<1>>, eps: f32) -> Tensor<4> {
-        self.layer_norm_composite::<3>(weight, bias, eps)
+    pub fn rope_pair_fused(
+        &self,
+        k: &Self,
+        cos: &Tensor<2>,
+        sin: &Tensor<2>,
+    ) -> (Tensor<4>, Tensor<4>) {
+        let (q_value, k_value) = self.value.rope_pair_fused(&k.value, &cos.value, &sin.value);
+        (
+            self.replay_ternary(
+                cos,
+                sin,
+                "rope_pair_fused",
+                q_value.to_concrete(),
+                |input, cos, sin| input.rope_interleaved_composite(&cos, &sin),
+            ),
+            k.replay_ternary(
+                cos,
+                sin,
+                "rope_pair_fused",
+                k_value.to_concrete(),
+                |input, cos, sin| input.rope_interleaved_composite(&cos, &sin),
+            ),
+        )
     }
 
-    pub fn rms_norm(&self, weight: &Tensor<1>, eps: f32) -> Tensor<4> {
-        self.rms_norm_composite::<3>(weight, None, eps)
+    pub fn rope_normal_pair_fused(
+        &self,
+        k: &Self,
+        cos: &Tensor<2>,
+        sin: &Tensor<2>,
+    ) -> (Tensor<4>, Tensor<4>) {
+        let (q_value, k_value) = self
+            .value
+            .rope_normal_pair_fused(&k.value, &cos.value, &sin.value);
+        (
+            self.replay_ternary(
+                cos,
+                sin,
+                "rope_normal_pair_fused",
+                q_value.to_concrete(),
+                |input, cos, sin| input.rope(&cos, &sin),
+            ),
+            k.replay_ternary(
+                cos,
+                sin,
+                "rope_normal_pair_fused",
+                k_value.to_concrete(),
+                |input, cos, sin| input.rope(&cos, &sin),
+            ),
+        )
+    }
+
+    fn rope_cache_tables(
+        &self,
+        cache: &crate::RopeCache,
+        start_pos: usize,
+    ) -> (Tensor<2>, Tensor<2>) {
+        let seq_len = self.shape()[2];
+        let graph = self.graph();
+        let table = |table: RawTensor<2, f32>| {
+            Tensor::constant_from_raw(&graph, table.narrow(0, start_pos, seq_len).to_concrete())
+        };
+        (table(cache.cos().clone()), table(cache.sin().clone()))
+    }
+
+    /// Autograd companion of [`crate::RopeCache::forward`]: applies normal
+    /// RoPE to `self` (q) and `k` from the cache's tables at `start_pos`.
+    pub fn rope_cache_forward(
+        &self,
+        k: &Self,
+        cache: &crate::RopeCache,
+        start_pos: usize,
+    ) -> (Tensor<4>, Tensor<4>) {
+        let (cos, sin) = self.rope_cache_tables(cache, start_pos);
+        self.rope_normal_pair_fused(k, &cos, &sin)
+    }
+
+    /// Autograd companion of [`crate::RopeCache::forward_interleaved`].
+    pub fn rope_cache_forward_interleaved(
+        &self,
+        k: &Self,
+        cache: &crate::RopeCache,
+        start_pos: usize,
+    ) -> (Tensor<4>, Tensor<4>) {
+        let (cos, sin) = self.rope_cache_tables(cache, start_pos);
+        self.rope_pair_fused(k, &cos, &sin)
+    }
+
+    pub fn upsample_nearest2d(&self, scale_h: usize, scale_w: usize) -> Tensor<4> {
+        let value = self.value.upsample_nearest2d(scale_h, scale_w);
+        self.replay_unary("upsample_nearest2d", value, move |input| {
+            let [b, c, h, w] = input.shape();
+            input
+                .reshape([b, c, h, 1, w, 1])
+                .broadcast_as([b, c, h, scale_h, w, scale_w])
+                .reshape([b, c, h * scale_h, w * scale_w])
+        })
     }
 
     pub(super) fn flash_attention_composite(

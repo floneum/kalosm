@@ -48,7 +48,7 @@ impl From<usize> for IndexOp {
 }
 
 impl IndexOp {
-    fn to_range(&self, dim_size: usize) -> Range<usize> {
+    pub(crate) fn to_range(&self, dim_size: usize) -> Range<usize> {
         match self {
             IndexOp::Full => 0..dim_size,
             IndexOp::Range(r) => r.clone(),
@@ -58,7 +58,7 @@ impl IndexOp {
         }
     }
 
-    fn removes_dim(&self) -> bool {
+    pub(crate) fn removes_dim(&self) -> bool {
         matches!(self, IndexOp::Index(_))
     }
 }
@@ -88,7 +88,7 @@ where
     }
 }
 
-fn removed_dim<const R: usize>(removes: [bool; R]) -> usize {
+pub(crate) fn removed_dim<const R: usize>(removes: [bool; R]) -> usize {
     let num_removes = removes.iter().filter(|&&removed| removed).count();
     assert!(
         num_removes == 1,

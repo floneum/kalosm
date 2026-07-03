@@ -312,6 +312,10 @@ impl<const R: usize> Tensor<R> {
         self.value.cast()
     }
 
+    pub fn to_concrete(&self) -> Self {
+        self.unary_from_value(self.value.to_concrete(), move |grad, _| grad)
+    }
+
     pub fn relu(&self) -> Self {
         self.max_elementwise(0.0)
     }
@@ -493,6 +497,10 @@ impl<const R: usize> Tensor<R> {
         )
     }
 
+    pub fn sigmoid(&self) -> Self {
+        self.mul_scalar(-1.0).exp().add_scalar(1.0).pow_scalar(-1.0)
+    }
+
     pub fn silu(&self) -> Self {
         let denom = self.mul_scalar(-1.0).exp().add_scalar(1.0);
         self.div(&denom)
@@ -580,3 +588,86 @@ impl<const R: usize> Tensor<R> {
         })
     }
 }
+
+macro_rules! impl_autograd_pairwise_op {
+    ($trait:ident, $method:ident) => {
+        impl<const R: usize> std::ops::$trait<Tensor<R>> for Tensor<R> {
+            type Output = Tensor<R>;
+
+            fn $method(self, rhs: Tensor<R>) -> Tensor<R> {
+                Tensor::$method(&self, &rhs)
+            }
+        }
+
+        impl<const R: usize> std::ops::$trait<&Tensor<R>> for Tensor<R> {
+            type Output = Tensor<R>;
+
+            fn $method(self, rhs: &Tensor<R>) -> Tensor<R> {
+                Tensor::$method(&self, rhs)
+            }
+        }
+
+        impl<const R: usize> std::ops::$trait<Tensor<R>> for &Tensor<R> {
+            type Output = Tensor<R>;
+
+            fn $method(self, rhs: Tensor<R>) -> Tensor<R> {
+                Tensor::$method(self, &rhs)
+            }
+        }
+
+        impl<const R: usize> std::ops::$trait<&Tensor<R>> for &Tensor<R> {
+            type Output = Tensor<R>;
+
+            fn $method(self, rhs: &Tensor<R>) -> Tensor<R> {
+                Tensor::$method(self, rhs)
+            }
+        }
+    };
+}
+
+impl_autograd_pairwise_op!(Add, add);
+impl_autograd_pairwise_op!(Sub, sub);
+impl_autograd_pairwise_op!(Mul, mul);
+impl_autograd_pairwise_op!(Div, div);
+
+macro_rules! impl_autograd_scalar_op {
+    ($trait:ident, $method:ident, $scalar_method:ident) => {
+        impl<const R: usize> std::ops::$trait<f32> for Tensor<R> {
+            type Output = Tensor<R>;
+
+            fn $method(self, rhs: f32) -> Tensor<R> {
+                Tensor::$scalar_method(&self, rhs)
+            }
+        }
+
+        impl<const R: usize> std::ops::$trait<f32> for &Tensor<R> {
+            type Output = Tensor<R>;
+
+            fn $method(self, rhs: f32) -> Tensor<R> {
+                Tensor::$scalar_method(self, rhs)
+            }
+        }
+    };
+}
+
+impl_autograd_scalar_op!(Mul, mul, mul_scalar);
+impl_autograd_scalar_op!(Add, add, add_scalar);
+impl_autograd_scalar_op!(Sub, sub, sub_scalar);
+impl_autograd_scalar_op!(Div, div, div_scalar);
+
+impl<const R: usize> std::ops::Neg for Tensor<R> {
+    type Output = Tensor<R>;
+
+    fn neg(self) -> Tensor<R> {
+        Tensor::neg(&self)
+    }
+}
+
+impl<const R: usize> std::ops::Neg for &Tensor<R> {
+    type Output = Tensor<R>;
+
+    fn neg(self) -> Tensor<R> {
+        Tensor::neg(self)
+    }
+}
+

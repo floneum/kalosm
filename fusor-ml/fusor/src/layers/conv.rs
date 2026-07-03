@@ -98,6 +98,16 @@ where
     pub fn out_channels(&self) -> usize {
         self.out_channels
     }
+
+    /// Get the weight tensor.
+    pub fn weight(&self) -> &Tensor<RANK, D, Concrete<D, RANK>> {
+        &self.weight
+    }
+
+    /// Get the bias tensor if present.
+    pub fn bias(&self) -> Option<&Tensor<1, D, Concrete<D, 1>>> {
+        self.bias.as_ref()
+    }
 }
 
 impl<const SPATIAL: usize, const RANK: usize, D> ConvNd<SPATIAL, RANK, D>
