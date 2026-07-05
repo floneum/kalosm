@@ -19,9 +19,13 @@ impl Resolver {
                 // An un-flattened operand was chosen for the coop kernel,
                 // which hosts no element-wise chains: fusing one here would
                 // demote the matmul to the generic divmod-per-load reduce.
+                // The same demotion applies to any coop-viable matmul: the
+                // coop kernel refuses element-wise chains, so folding one in
+                // trades a cheap standalone n-ary for the generic fallback.
                 if let ExecutionVariant::MatMul(matmul_op) = input_variant
                     && matmul_op.a.is_plain()
                     && matmul_op.b.is_plain()
+                    && !matmul_op.hardware_matmul_statically_viable(&graph.device())
                 {
                     let mut new_matmul = matmul_op.clone();
                     let mut existing_post = new_matmul.post_element_wise.functions.clone();
@@ -392,10 +396,12 @@ impl Resolver {
 
         // Pre-op: fuse elementwise before matmul inputs. Skipped for
         // un-flattened operands: pre chains would demote the matmul off the
-        // coop kernel they were chosen for.
+        // coop kernel they were chosen for. Likewise skipped for any
+        // coop-viable matmul, which hosts no element-wise chains.
         if let ExecutionVariant::MatMul(matmul_op) = &node_variant
             && matmul_op.a.is_plain()
             && matmul_op.b.is_plain()
+            && !matmul_op.hardware_matmul_statically_viable(&graph.device())
         {
             let mut new_matmul = matmul_op.clone();
             let mut changed = false;

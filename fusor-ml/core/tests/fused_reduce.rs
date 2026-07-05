@@ -292,3 +292,110 @@ fn contraction_with_k_independent_factor_fuses() {
         }
     });
 }
+
+#[test]
+fn reshaped_elementwise_producer_folds_into_reduce() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        // The broadcast-gradient pattern: an elementwise product reshaped
+        // flat and then summed. The reshape view folds into the reduce and
+        // the producer inlines through the composed index expressions, so
+        // the whole chain is one dispatch.
+        let (b, s, h) = (4usize, 8usize, 16usize);
+        let x_values = pattern(b * s * h, 0.13);
+        let y_values = pattern(b * s * h, 0.29);
+        let x = Tensor::from_slice(&device, [b, s, h], &x_values);
+        let y = Tensor::from_slice(&device, [b, s, h], &y_values);
+
+        let out = (&x * &y).reshape([b * s, h]).sum(0);
+        assert_eq!(
+            out.count_kernels_to_resolve(),
+            1,
+            "reshape + sum over an exclusive producer must fuse"
+        );
+
+        let slice = out.as_slice::<1, f32>().await.unwrap();
+        for col in 0..h {
+            let expected: f32 = (0..b * s)
+                .map(|row| x_values[row * h + col] * y_values[row * h + col])
+                .sum();
+            let actual = slice[[col]];
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "[{col}]: got {actual}, expected {expected}"
+            );
+        }
+    });
+}
+
+#[test]
+fn unary_chain_across_keepdim_view_fuses_into_reduce() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        // `sum_keepdim(x, 1) / k` applies the division at the keepdim'd
+        // `[m, 1]` shape, behind the unsqueeze view. The chain rewrites into
+        // a reduce of its own (indices substituted into the row dims, the
+        // axis appended) instead of a separate scalar dispatch.
+        let (m, k) = (64usize, 48usize);
+        let x_values = pattern(m * k, 0.23);
+        let x = Tensor::from_slice(&device, [m, k], &x_values);
+
+        let mean = &x.sum_keepdim(1) / (k as f32);
+        assert_eq!(
+            mean.count_kernels_to_resolve(),
+            1,
+            "post-keepdim unary chain must fold into the reduce"
+        );
+
+        let slice = mean.as_slice::<2, f32>().await.unwrap();
+        for row in [0usize, 17, m - 1] {
+            let expected: f32 = (0..k).map(|col| x_values[row * k + col]).sum::<f32>() / k as f32;
+            let actual = slice[[row, 0]];
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "[{row}]: got {actual}, expected {expected}"
+            );
+        }
+    });
+}
+
+#[test]
+fn unit_axis_reduce_collapses_into_consumer() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        // Reducing a size-1 axis is the identity: the node collapses to an
+        // elementwise gather and inlines into its (binary) consumer, which a
+        // reduce post chain could never absorb.
+        let (m, k) = (32usize, 24usize);
+        let x_values = pattern(m * k, 0.11);
+        let y_values = pattern(m * k, 0.31);
+        let x = Tensor::from_slice(&device, [1, m, k], &x_values);
+        let y = Tensor::from_slice(&device, [m, k], &y_values);
+
+        let out = &x.sum(0) + &y;
+        assert_eq!(
+            out.count_kernels_to_resolve(),
+            1,
+            "size-1-axis reduce must collapse into the consumer"
+        );
+
+        let slice = out.as_slice::<2, f32>().await.unwrap();
+        for (row, col) in [(0usize, 0usize), (13, 7), (m - 1, k - 1)] {
+            let expected = x_values[row * k + col] + y_values[row * k + col];
+            let actual = slice[[row, col]];
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "[{row}, {col}]: got {actual}, expected {expected}"
+            );
+        }
+    });
+}

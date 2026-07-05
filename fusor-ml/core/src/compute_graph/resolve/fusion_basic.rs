@@ -1,3 +1,5 @@
+use crate::nary_wise::NaryFunction;
+
 use super::*;
 
 impl Resolver {
@@ -5,6 +7,7 @@ impl Resolver {
         &mut self,
         graph: &mut ComputeGraphInner,
         node_idx: ExecutionNodeIndex,
+        allow_indexed_inline: bool,
     ) -> bool {
         let node_variant = self.execution_graph[node_idx].variant.clone();
 
@@ -49,7 +52,6 @@ impl Resolver {
             else {
                 continue;
             };
-
             // Inline: offset input nary's indices to append after current inputs.
             let offset = all_inputs.len();
             let inlined = Self::offset_input_indices(&input_nary.expression, offset);
@@ -66,10 +68,36 @@ impl Resolver {
                 .collect();
             let mut new_expression = expression.clone();
             let mut success = true;
-            for slot in target_slots {
-                let (next, s) = Self::substitute_input_in_expr(&new_expression, slot, &inlined);
+            for slot in &target_slots {
+                let (next, s) = Self::substitute_input_in_expr(&new_expression, *slot, &inlined);
                 new_expression = next;
                 success &= s;
+            }
+            // Custom-indexed reads (a folded reshape/transpose between the
+            // producer and this node) fail plain substitution; on dense
+            // graphs, compose the producer expression with the index list
+            // instead — but only where each producer element is read once,
+            // so the inlined expression is never re-evaluated.
+            if !success
+                && allow_indexed_inline
+                && target_slots.iter().all(|&slot| {
+                    super::fold_views::input_reread_factor(&expression, &nary.shape, slot) == 1
+                })
+            {
+                let mut composed = expression.clone();
+                success = true;
+                for slot in &target_slots {
+                    match Self::substitute_input_composed(&composed, *slot, &inlined) {
+                        Some(next) => composed = next,
+                        None => {
+                            success = false;
+                            break;
+                        }
+                    }
+                }
+                if success {
+                    new_expression = composed;
+                }
             }
 
             // Only fuse if substitution was successful
@@ -260,6 +288,76 @@ impl Resolver {
             NaryExpr::DimIndex(dim) => (NaryExpr::DimIndex(*dim), true),
             NaryExpr::Scalar(value) => (NaryExpr::Scalar(*value), true),
         }
+    }
+
+    /// Substitute every read of input `target_idx` — elementwise *or*
+    /// custom-indexed — with `replacement` evaluated at the read's index
+    /// expressions. Where [`Self::substitute_input_in_expr`] declines
+    /// custom-indexed reads unless the replacement is a bare input, this
+    /// composes the replacement expression with the index list instead:
+    /// `input_t[i0, i1]` becomes `replacement` with `DimIndex(d)` rewritten
+    /// to `i_d`. Returns `None` when the composition is impossible (an index
+    /// list shorter than the replacement's rank).
+    pub(super) fn substitute_input_composed(
+        expr: &NaryExpr,
+        target_idx: usize,
+        replacement: &NaryExpr,
+    ) -> Option<NaryExpr> {
+        Some(match expr {
+            NaryExpr::Op { children, function } => NaryExpr::Op {
+                children: children
+                    .iter()
+                    .map(|child| Self::substitute_input_composed(child, target_idx, replacement))
+                    .collect::<Option<Vec<_>>>()?,
+                function: function.clone(),
+            },
+            NaryExpr::IndexedInput { input_idx, indices } => {
+                let indices: Vec<NaryExpr> = indices
+                    .iter()
+                    .map(|index| Self::substitute_input_composed(index, target_idx, replacement))
+                    .collect::<Option<Vec<_>>>()?;
+                if *input_idx == target_idx {
+                    Self::compose_expr_with_indices(replacement, &indices)?
+                } else {
+                    NaryExpr::IndexedInput {
+                        input_idx: *input_idx,
+                        indices,
+                    }
+                }
+            }
+            NaryExpr::DimIndex(dim) => NaryExpr::DimIndex(*dim),
+            NaryExpr::Scalar(value) => NaryExpr::Scalar(*value),
+        })
+    }
+
+    /// Evaluate `expr` (written in its own index space) at the coordinates
+    /// given by `indices`: every `DimIndex(d)` becomes `indices[d]`. `None`
+    /// when `expr` references a dimension `indices` does not provide.
+    pub(super) fn compose_expr_with_indices(
+        expr: &NaryExpr,
+        indices: &[NaryExpr],
+    ) -> Option<NaryExpr> {
+        Some(match expr {
+            NaryExpr::Op { children, function } => NaryExpr::Op {
+                children: children
+                    .iter()
+                    .map(|child| Self::compose_expr_with_indices(child, indices))
+                    .collect::<Option<Vec<_>>>()?,
+                function: function.clone(),
+            },
+            NaryExpr::IndexedInput {
+                input_idx,
+                indices: inner,
+            } => NaryExpr::IndexedInput {
+                input_idx: *input_idx,
+                indices: inner
+                    .iter()
+                    .map(|index| Self::compose_expr_with_indices(index, indices))
+                    .collect::<Option<Vec<_>>>()?,
+            },
+            NaryExpr::DimIndex(dim) => indices.get(*dim)?.clone(),
+            NaryExpr::Scalar(value) => NaryExpr::Scalar(*value),
+        })
     }
 
     /// Remove unused inputs and deduplicate, returning new inputs and remapped expression.
@@ -459,6 +557,235 @@ impl Resolver {
         true
     }
 
+    /// Collapse a reduce over a size-1 axis into an elementwise operation
+    /// that folds the single element with the initial value — `f(init, x)`,
+    /// exactly what the reduce lowering computes for a one-element row (the
+    /// float min/max initial values are finite pseudo-identities, so the
+    /// fold is kept rather than dropped to stay bitwise-equal). Backward
+    /// tapes emit these from `reduce_broadcast_gradient` when a broadcast
+    /// axis has extent 1 (weight gradients reshaped through a leading unit
+    /// dim). As an elementwise node it then inlines into its consumers via
+    /// normal n-ary fusion. Dense (QMatMul-free) graphs only.
+    pub(super) fn try_collapse_unit_reduce(
+        &mut self,
+        _graph: &mut ComputeGraphInner,
+        node_idx: ExecutionNodeIndex,
+    ) -> bool {
+        let ExecutionVariant::Reduce(reduce) = &self.execution_graph[node_idx].variant else {
+            return false;
+        };
+        if reduce.shape[reduce.axis] != 1
+            // Conservative dtype guard: the reduce lowering casts the folded
+            // value to the accumulator dtype before the post chain; keep the
+            // rewrite to the homogeneous case where no cast can occur.
+            || !reduce.post_element_wise.functions.is_empty()
+            || reduce.function.datatype() != reduce.out_datatype()
+        {
+            return false;
+        }
+        let reduce = reduce.clone();
+
+        // Evaluate the producer expression at the single axis coordinate.
+        let mut mapping = Vec::with_capacity(reduce.shape.len());
+        let mut out_pos = 0;
+        for dim in 0..reduce.shape.len() {
+            if dim == reduce.axis {
+                mapping.push(NaryExpr::Scalar(crate::nary_wise::NaryScalar::U32(0)));
+            } else {
+                mapping.push(NaryExpr::DimIndex(out_pos));
+                out_pos += 1;
+            }
+        }
+        let Some(expression) = Self::compose_expr_with_indices(&reduce.expression, &mapping) else {
+            return false;
+        };
+
+        // Value-exactness: the reduce lowering seeds the accumulator with
+        // `initial_value` and folds `f(init, x)` even for a single element,
+        // and the float min/max identities are finite pseudo-identities
+        // (±3.40282e38 / ±65504) — so `f(init, x)` is NOT `x` at the edges
+        // (min of +inf clamps, sum of -0.0 is +0.0). Replay the exact fold
+        // as a const elementwise op (same TileBinaryOp the reduce fold
+        // uses), keeping the collapsed node bitwise-identical to the
+        // unfused reduce.
+        use crate::reduce::ReduceOp;
+        let init = reduce.function.initial_value;
+        let fold_op = match reduce.function.op {
+            ReduceOp::Sum => NaryOp::AddConst(init),
+            ReduceOp::Product => NaryOp::MulConst(init),
+            ReduceOp::Max => NaryOp::MaxConst(init),
+            ReduceOp::Min => NaryOp::MinConst(init),
+        };
+        let dtype = reduce.function.datatype();
+        let expression = NaryExpr::Op {
+            children: vec![expression],
+            function: NaryFunction::unary(
+                Some(format!("unit_{}", reduce.function.name())),
+                fold_op,
+                dtype,
+                dtype,
+            ),
+        };
+
+        let new_nary = ElementwiseOperation {
+            inputs: reduce.inputs.clone(),
+            expression,
+            shape: reduce.out_shape().into(),
+            output_datatype: reduce.out_datatype(),
+        };
+        // Dependencies are unchanged: same inputs, same edges.
+        self.execution_graph[node_idx].variant = ExecutionVariant::Elementwise(new_nary);
+        true
+    }
+
+    /// Rewrite `unary_chain(reduce_out[indices])` — a unary chain over a
+    /// single custom-indexed read of a reduction (the shape left behind by a
+    /// folded `sum_keepdim` unsqueeze or reshape view) — into a reduce of
+    /// its own: the read's index expressions substitute into the reduction's
+    /// row dimensions, the reduced axis becomes a fresh trailing dimension,
+    /// and the chain folds into the post chain. Each output element
+    /// recomputes its row independently, so correctness never depends on the
+    /// index mapping being a bijection; the numel guard keeps the total fold
+    /// work equal to the original reduce. Dense (QMatMul-free) graphs only.
+    pub(super) fn try_fuse_unary_into_reduce_indexed(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        node_idx: ExecutionNodeIndex,
+    ) -> bool {
+        let ExecutionVariant::Elementwise(nary) = self.execution_graph[node_idx].variant.clone()
+        else {
+            return false;
+        };
+        if nary.inputs.len() != 1 {
+            return false;
+        }
+        let Some((functions, indices)) = Self::extract_unary_chain_indexed(&nary) else {
+            return false;
+        };
+        let input_inner = nary.inputs[0];
+        if self.check_cached(graph, input_inner) {
+            return false;
+        }
+        let Some(input_exec) = self.get_input_node_in_exec_graph(input_inner) else {
+            return false;
+        };
+        let ExecutionVariant::Reduce(reduce) = self.execution_graph[input_exec].variant.clone()
+        else {
+            return false;
+        };
+        // No sole-consumer requirement: when several unary chains read the
+        // same reduction, rewriting each one strands the source reduce with
+        // no consumers, so it dies and the dispatch count still shrinks by
+        // one; the duplicated fold work is bounded by the numel guard below.
+        // One row recomputed per output element: equal numel keeps the fold
+        // work identical to the original reduce (a broadcast-shaped read
+        // would multiply it).
+        let rows: usize = reduce
+            .shape
+            .iter()
+            .enumerate()
+            .filter_map(|(dim, &size)| (dim != reduce.axis).then_some(size))
+            .product();
+        if nary.shape.iter().product::<usize>() != rows || indices.len() + 1 != reduce.shape.len() {
+            return false;
+        }
+        // The appended chain must consume exactly the reduce's output dtype.
+        let mut current = reduce.out_datatype();
+        for function in &functions {
+            if function.input_types.as_slice() != [current] {
+                return false;
+            }
+            current = function.output_type;
+        }
+        if current != nary.output_datatype {
+            return false;
+        }
+
+        // Remap the reduce expression into the node's index space: row dims
+        // take the read's index expressions, the reduced axis becomes the
+        // fresh trailing dimension.
+        let node_rank = nary.shape.len();
+        let mut mapping = Vec::with_capacity(reduce.shape.len());
+        let mut out_pos = 0;
+        for dim in 0..reduce.shape.len() {
+            if dim == reduce.axis {
+                mapping.push(NaryExpr::DimIndex(node_rank));
+            } else {
+                mapping.push(indices[out_pos].clone());
+                out_pos += 1;
+            }
+        }
+        let Some(expression) = Self::compose_expr_with_indices(&reduce.expression, &mapping) else {
+            return false;
+        };
+
+        let mut shape: Vec<usize> = nary.shape.to_vec();
+        shape.push(reduce.shape[reduce.axis]);
+        let mut post = reduce.post_element_wise.functions.clone();
+        post.extend(functions);
+        let new_reduce = crate::reduce::ReduceOperation {
+            inputs: reduce.inputs.clone(),
+            expression,
+            shape: shape.into(),
+            function: reduce.function.clone(),
+            post_element_wise: UnaryFunctionChain::new(
+                post,
+                reduce.post_element_wise.input_datatype(),
+            ),
+            axis: node_rank,
+        };
+        self.execution_graph[node_idx].variant = ExecutionVariant::Reduce(new_reduce);
+
+        for &reduce_input in &reduce.inputs {
+            if let Some(exec) = self.get_input_node_in_exec_graph(reduce_input)
+                && self.execution_graph.find_edge(exec, node_idx).is_none()
+            {
+                self.execution_graph.add_edge(exec, node_idx, ());
+            }
+        }
+        if let Some(edge) = self.execution_graph.find_edge(input_exec, node_idx) {
+            self.execution_graph.remove_edge(edge);
+        }
+        self.add_physical_dependencies(graph, node_idx, &reduce.inputs);
+        self.remove_node_if_dead(input_exec);
+        true
+    }
+
+    /// Extract a (possibly empty) unary function chain over exactly one
+    /// read of input 0 with arbitrary index expressions, innermost function
+    /// first. The index expressions must not read any input themselves.
+    fn extract_unary_chain_indexed(
+        nary: &ElementwiseOperation,
+    ) -> Option<(Vec<NaryFunction>, Vec<NaryExpr>)> {
+        fn contains_input(expr: &NaryExpr) -> bool {
+            match expr {
+                NaryExpr::Op { children, .. } => children.iter().any(contains_input),
+                NaryExpr::IndexedInput { .. } => true,
+                NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => false,
+            }
+        }
+        let mut functions = Vec::new();
+        let mut expr = &nary.expression;
+        loop {
+            match expr {
+                NaryExpr::Op { children, function }
+                    if children.len() == 1 && function.input_types.len() == 1 =>
+                {
+                    functions.push(function.clone());
+                    expr = &children[0];
+                }
+                NaryExpr::IndexedInput {
+                    input_idx: 0,
+                    indices,
+                } if !indices.iter().any(contains_input) => {
+                    functions.reverse();
+                    return Some((functions, indices.clone()));
+                }
+                _ => return None,
+            }
+        }
+    }
+
     /// Inline elementwise producers into a reduce's fused expression: the
     /// reduce evaluates the producer at every index-space coordinate, so a
     /// producer consumed only by this reduce never needs to materialize.
@@ -469,6 +796,7 @@ impl Resolver {
         &mut self,
         graph: &mut ComputeGraphInner,
         node_idx: ExecutionNodeIndex,
+        allow_indexed_inline: bool,
     ) -> bool {
         let ExecutionVariant::Reduce(reduce) = self.execution_graph[node_idx].variant.clone()
         else {
@@ -506,24 +834,57 @@ impl Resolver {
                 continue;
             };
             // The reduce evaluates this input across the full index space;
-            // a producer with any other shape reads out of range.
-            if input_nary.shape != reduce.shape {
+            // a producer with any other shape reads out of range — unless
+            // every read goes through custom index expressions (folded
+            // views/gathers, dense graphs only), which define the mapping
+            // into the producer's own index space and carry their own
+            // bounds selects.
+            if input_nary.shape != reduce.shape && !allow_indexed_inline {
                 continue;
             }
 
-            let offset = all_inputs.len();
-            let inlined = Self::offset_input_indices(&input_nary.expression, offset);
             let target_slots: Vec<usize> = all_inputs
                 .iter()
                 .enumerate()
                 .filter_map(|(slot, value)| (*value == input_inner).then_some(slot))
                 .collect();
+
+            let offset = all_inputs.len();
+            let inlined = Self::offset_input_indices(&input_nary.expression, offset);
             let mut new_expression = expression.clone();
-            let mut success = true;
-            for slot in target_slots {
-                let (next, s) = Self::substitute_input_in_expr(&new_expression, slot, &inlined);
-                new_expression = next;
-                success &= s;
+            let mut success = input_nary.shape == reduce.shape;
+            if success {
+                for slot in &target_slots {
+                    let (next, s) =
+                        Self::substitute_input_in_expr(&new_expression, *slot, &inlined);
+                    new_expression = next;
+                    success &= s;
+                }
+            }
+            // Custom-indexed reads fail plain substitution; compose the
+            // producer expression with the index list instead, where each
+            // producer element is read once (the inlined expression is
+            // never re-evaluated).
+            if !success
+                && allow_indexed_inline
+                && target_slots.iter().all(|&slot| {
+                    super::fold_views::input_reread_factor(&expression, &reduce.shape, slot) == 1
+                })
+            {
+                let mut composed = expression.clone();
+                success = true;
+                for slot in &target_slots {
+                    match Self::substitute_input_composed(&composed, *slot, &inlined) {
+                        Some(next) => composed = next,
+                        None => {
+                            success = false;
+                            break;
+                        }
+                    }
+                }
+                if success {
+                    new_expression = composed;
+                }
             }
 
             if success {

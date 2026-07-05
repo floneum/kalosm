@@ -629,9 +629,28 @@ fn build_row_program_kernel(
         }
         _ => 1,
     };
+    // Small-axis chunked programs pack several rows per workgroup: lanes
+    // split into `block / k_group` contiguous groups of `k_group` lanes,
+    // each group owning one row, reduced with per-group workgroup
+    // reductions. Without packing a k=64 reduce runs one row per 256-lane
+    // workgroup with 75% of the lanes idle (and a k=1 bias-grad sum runs
+    // one workgroup per output scalar).
+    let k_group: u32 = if lanes_own_axis || splits > 1 {
+        block
+    } else {
+        let group = k.next_power_of_two().min(block).max(1);
+        if block.is_multiple_of(group) {
+            group
+        } else {
+            block
+        }
+    };
+    let rows_per_workgroup = block / k_group;
+    let dispatch_rows = rows.div_ceil(rows_per_workgroup);
+
     let max_dispatch_dim = graph.device().limits().max_compute_workgroups_per_dimension;
     let dispatch_spec = crate::row_dispatch::RowDispatchSpec::distributed(
-        rows.saturating_mul(splits),
+        dispatch_rows.saturating_mul(splits),
         block,
         max_dispatch_dim,
     );
@@ -810,15 +829,25 @@ fn build_row_program_kernel(
                 .collect();
 
             crate::row_dispatch::emit_row_grid(phase_handle, dispatch_spec, |program, ctx| {
-                let lane = ctx.lane;
                 let wg_flat = ctx.row;
-                let (row_flat, split_idx) = if splits > 1 {
+                // With packing, `lane` becomes the position inside the row's
+                // `k_group`-wide lane group; every later axis index and the
+                // scalar-store lane test use it unchanged.
+                let (row_flat, split_idx, lane) = if rows_per_workgroup > 1 {
+                    (
+                        program
+                            .bind(wg_flat * rows_per_workgroup + ctx.lane.clone() / k_group),
+                        tile_u32(0),
+                        program.bind(ctx.lane % k_group),
+                    )
+                } else if splits > 1 {
                     (
                         program.bind(wg_flat.clone() / splits),
                         program.bind(wg_flat % splits),
+                        ctx.lane,
                     )
                 } else {
-                    (wg_flat, tile_u32(0))
+                    (wg_flat, tile_u32(0), ctx.lane)
                 };
                 let in_bounds = row_flat.clone().lt(rows);
                 let row_dims = output_dims_from_flat(row_flat.clone(), &row_shape);
@@ -1118,9 +1147,12 @@ fn build_row_program_kernel(
                             [acc.binary(reduce_op.binary(), masked)]
                         },
                     );
-                    // The workgroup reduction broadcasts: every lane reads the
-                    // combined value, so later phases can use it directly.
-                    let combined = program.group_reduce(reduce_op, block, partial);
+                    // The per-group workgroup reduction broadcasts: every lane
+                    // in the row's `k_group`-wide lane group reads the combined
+                    // value, so later phases can use it directly. With one row
+                    // per workgroup `k_group == block` and this is the full
+                    // workgroup reduction.
+                    let combined = program.group_reduce(reduce_op, k_group, partial);
                     let (combined, combined_ty) =
                         apply_unary_function_chain(combined, phase_dtype, &reduce.post_chain)
                             .expect("validated row program post chain");

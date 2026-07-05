@@ -1,6 +1,6 @@
 pub(crate) use fusor_tile_ir_runtime::{
-    DirectKernel, KernelCacheKey, KernelVariantKey, PreparedDirectDispatch, dynamic_kernel_from_ir,
-    run_direct_kernel, run_kernel, three_buffer_pipeline_from_ir,
+    DirectKernel, DirectKernelTemplate, KernelCacheKey, KernelVariantKey, PreparedDirectDispatch,
+    dynamic_kernel_from_ir, run_direct_kernel, run_kernel, three_buffer_pipeline_from_ir,
 };
 
 /// Marker returned by device-specific direct-kernel builders when the current

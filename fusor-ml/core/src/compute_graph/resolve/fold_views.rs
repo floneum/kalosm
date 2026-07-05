@@ -90,6 +90,84 @@ impl Resolver {
         true
     }
 
+    /// Like [`Self::try_fold_view_inputs`] but for reduce nodes: fold view
+    /// inputs directly into the reduce's fused producer expression. Backward
+    /// tapes are full of `reshape -> sum` chains (broadcast-gradient
+    /// reductions) where the view hides the elementwise producer from
+    /// `try_fuse_producer_into_reduce`; folding the view exposes it. Only
+    /// called on dense (QMatMul-free) graphs.
+    pub(super) fn try_fold_view_inputs_into_reduce(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        node_idx: ExecutionNodeIndex,
+    ) -> bool {
+        let ExecutionVariant::Reduce(reduce) = self.execution_graph[node_idx].variant.clone()
+        else {
+            return false;
+        };
+
+        let mut expression = reduce.expression.clone();
+        let mut inputs = reduce.inputs.clone();
+        let mut folded = Vec::new();
+
+        for (slot, input_inner) in reduce.inputs.iter().copied().enumerate() {
+            if self.check_cached(graph, input_inner) {
+                continue;
+            }
+            let Some(input_exec) = self.get_input_node_in_exec_graph(input_inner) else {
+                continue;
+            };
+            if !self.execution_graph.contains_node(input_exec) {
+                continue;
+            }
+            let ExecutionVariant::View(view) = &self.execution_graph[input_exec].variant else {
+                continue;
+            };
+            let needs_delinearize = view.stages.iter().any(|stage| {
+                crate::view::affine_dim_indices(&stage.layout, &stage.input_shape).is_none()
+            });
+            if needs_delinearize && input_reread_factor(&expression, &reduce.shape, slot) > 1 {
+                continue;
+            }
+            let view = view.clone();
+            let Some(rewritten) = Self::rewrite_view_input(&expression, slot, &view) else {
+                continue;
+            };
+            expression = rewritten;
+            inputs[slot] = view.input;
+            folded.push((input_exec, view.input));
+        }
+        if folded.is_empty() {
+            return false;
+        }
+
+        let (final_inputs, final_expression) = Self::deduplicate_inputs(inputs, expression);
+        let mut new_reduce = reduce.clone();
+        new_reduce.inputs = final_inputs;
+        new_reduce.expression = final_expression;
+        let new_inputs = new_reduce.inputs.clone();
+        self.execution_graph[node_idx].variant = ExecutionVariant::Reduce(new_reduce);
+
+        for (view_exec, base_inner) in &folded {
+            if let Some(edge) = self.execution_graph.find_edge(*view_exec, node_idx) {
+                self.execution_graph.remove_edge(edge);
+            }
+            if let Some(base_exec) = self.get_input_node_in_exec_graph(*base_inner)
+                && self
+                    .execution_graph
+                    .find_edge(base_exec, node_idx)
+                    .is_none()
+            {
+                self.execution_graph.add_edge(base_exec, node_idx, ());
+            }
+        }
+        self.add_physical_dependencies(graph, node_idx, &new_inputs);
+        for (view_exec, _) in folded {
+            self.remove_node_if_dead(view_exec);
+        }
+        true
+    }
+
     /// Rewrite every access to input `target_idx` through `view`'s
     /// coordinate map: the original index expressions (the view's output
     /// coordinates) walk down the stage stack to base coordinates, with
@@ -131,7 +209,7 @@ impl Resolver {
 /// The worst re-read factor across this slot's loads: the product of
 /// index-space dims a load's coordinates never reference — each such dim
 /// re-reads the same element once per step.
-fn input_reread_factor(expr: &NaryExpr, shape: &[usize], slot: usize) -> usize {
+pub(super) fn input_reread_factor(expr: &NaryExpr, shape: &[usize], slot: usize) -> usize {
     fn collect_dims(expr: &NaryExpr, referenced: &mut [bool]) {
         match expr {
             NaryExpr::Op { children, .. } => {

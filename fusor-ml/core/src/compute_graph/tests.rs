@@ -459,8 +459,10 @@ fn conv_im2col_matmul_runs_without_gather() {
                 .is_some_and(|config| config.is_fixed());
 
         for (b, c, h, w, n, kh, kw, implicit) in [
+            // N=16 output channels reach the coop kernel through the
+            // small-side (64, 16) tile, so the implicit-GEMM read fires.
             (
-                2usize, 8usize, 16usize, 16usize, 16usize, 3usize, 3usize, false,
+                2usize, 8usize, 16usize, 16usize, 16usize, 3usize, 3usize, coop_viable,
             ),
             (2, 64, 34, 34, 128, 3, 3, coop_viable),
             // Coop-tile-unaligned M (1089 divides nothing): the masked-edge

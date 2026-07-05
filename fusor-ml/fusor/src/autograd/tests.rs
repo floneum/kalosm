@@ -6260,19 +6260,19 @@ async fn test_autograd_layer_rms_norm_from_inference() {
 }
 
 #[tokio::test]
-async fn test_autograd_layer_conv1d_forward_parity() {
+async fn test_autograd_layer_conv_nd_1d_forward_parity() {
     for device in test_devices().await {
         let w_data: Vec<f32> = (0..12).map(|i| (i as f32 * 0.37).cos()).collect();
         let b_data = [0.3f32, -0.7];
         let x_data: Vec<f32> = (0..15).map(|i| (i as f32 * 0.61).sin()).collect();
-        let config = crate::layers::Conv1dConfig {
-            padding: 1,
-            stride: 2,
-            ..Default::default()
+        let config = crate::layers::ConvNdConfig {
+            padding: [1],
+            stride: [2],
+            groups: 1,
         };
 
         let graph = Graph::new();
-        let layer = layers::Conv1d::new(
+        let layer = layers::ConvNd::<1, 3>::new(
             Tensor::from_slice(&graph, &device, [2, 3, 2], &w_data),
             Some(Tensor::from_slice(&graph, &device, [2], &b_data)),
             config,
@@ -6280,7 +6280,7 @@ async fn test_autograd_layer_conv1d_forward_parity() {
         let x: Tensor<3> = Tensor::from_slice(&graph, &device, [1, 3, 5], &x_data);
         let output = layer.forward(&x);
 
-        let raw_layer = crate::layers::Conv1d::new(
+        let raw_layer = crate::layers::ConvNd::<1, 3, f32>::new(
             RawTensor::from_slice(&device, [2, 3, 2], &w_data),
             Some(RawTensor::from_slice(&device, [2], &b_data)),
             config,
@@ -6292,25 +6292,24 @@ async fn test_autograd_layer_conv1d_forward_parity() {
         );
         assert_eq!(layer.in_channels(), 3);
         assert_eq!(layer.out_channels(), 2);
-        assert_eq!(layer.kernel_size(), 2);
-        assert_eq!(layer.config().stride, 2);
+        assert_eq!(layer.config().stride, [2]);
     }
 }
 
 #[tokio::test]
-async fn test_autograd_layer_conv1d_parameter_gradients() {
+async fn test_autograd_layer_conv_nd_1d_parameter_gradients() {
     for device in test_devices().await {
         let w_data: Vec<f32> = (0..12).map(|i| (i as f32 * 0.37).cos()).collect();
         let b_data = [0.3f32, -0.7];
         let x_data: Vec<f32> = (0..15).map(|i| (i as f32 * 0.61).sin()).collect();
-        let config = crate::layers::Conv1dConfig {
-            padding: 1,
-            stride: 2,
-            ..Default::default()
+        let config = crate::layers::ConvNdConfig {
+            padding: [1],
+            stride: [2],
+            groups: 1,
         };
 
         let graph = Graph::new();
-        let layer = layers::Conv1d::new(
+        let layer = layers::ConvNd::<1, 3>::new(
             Tensor::from_slice(&graph, &device, [2, 3, 2], &w_data),
             Some(Tensor::from_slice(&graph, &device, [2], &b_data)),
             config,
@@ -6331,7 +6330,7 @@ async fn test_autograd_layer_conv1d_parameter_gradients() {
             [2, 3, 2],
             &w_data,
             move |graph, w| {
-                let layer = layers::Conv1d::new(
+                let layer = layers::ConvNd::<1, 3>::new(
                     w,
                     Some(Tensor::constant_from_raw(
                         graph,
@@ -6355,7 +6354,7 @@ async fn test_autograd_layer_conv1d_parameter_gradients() {
         let x_fd = x_data.clone();
         let w_fd = w_data.clone();
         assert_gradient_matches_finite_difference(&device, [2], &b_data, move |graph, b| {
-            let layer = layers::Conv1d::new(
+            let layer = layers::ConvNd::<1, 3>::new(
                 Tensor::constant_from_raw(
                     graph,
                     RawTensor::from_slice(&fd_device, [2, 3, 2], &w_fd),
@@ -6373,55 +6372,6 @@ async fn test_autograd_layer_conv1d_parameter_gradients() {
                 .sum()
         })
         .await;
-    }
-}
-
-#[tokio::test]
-async fn test_autograd_layer_conv1d_from_inference() {
-    for device in test_devices().await {
-        let w_data: Vec<f32> = (0..12).map(|i| (i as f32 * 0.37).cos()).collect();
-        let b_data = [0.3f32, -0.7];
-        let x_data: Vec<f32> = (0..15).map(|i| (i as f32 * 0.61).sin()).collect();
-        let config = crate::layers::Conv1dConfig {
-            padding: 2,
-            stride: 2,
-            ..Default::default()
-        };
-        let raw_layer = crate::layers::Conv1d::new(
-            RawTensor::from_slice(&device, [2, 3, 2], &w_data),
-            Some(RawTensor::from_slice(&device, [2], &b_data)),
-            config,
-        );
-
-        let graph = Graph::new();
-        let layer = layers::Conv1d::from_inference(&graph, &raw_layer);
-        assert_slice_close(&flatten(layer.weight().raw().clone()).await, &w_data);
-        assert_slice_close(
-            &flatten(layer.bias().unwrap().raw().clone()).await,
-            &b_data,
-        );
-
-        let x: Tensor<3> = Tensor::from_slice(&graph, &device, [1, 3, 5], &x_data);
-        let output = layer.forward(&x);
-        let expected = raw_layer.forward(&RawTensor::from_slice(&device, [1, 3, 5], &x_data));
-        assert_slice_close(
-            &flatten(output.raw().clone()).await,
-            &flatten(expected).await,
-        );
-
-        let raw_no_bias = crate::layers::Conv1d::new(
-            RawTensor::from_slice(&device, [2, 3, 2], &w_data),
-            None,
-            crate::layers::Conv1dConfig::default(),
-        );
-        let layer = layers::Conv1d::from_inference(&graph, &raw_no_bias);
-        assert!(layer.bias().is_none());
-        let output = layer.forward(&x);
-        let expected = raw_no_bias.forward(&RawTensor::from_slice(&device, [1, 3, 5], &x_data));
-        assert_slice_close(
-            &flatten(output.raw().clone()).await,
-            &flatten(expected).await,
-        );
     }
 }
 

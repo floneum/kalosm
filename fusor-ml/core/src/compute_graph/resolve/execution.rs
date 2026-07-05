@@ -248,7 +248,21 @@ impl Resolver {
         self.recognize_contractions(graph);
         self.recognize_embeddings(graph);
         self.recognize_attention(graph);
-        self.fuse_row_programs(graph);
+        // The qmatmul scan runs after recognition (which can mint QMatMul
+        // nodes) and before row fusion (which never creates or removes
+        // them), so the dense gate below is structural and stable.
+        let has_qmatmul = self.execution_graph.node_indices().any(|node| {
+            matches!(
+                self.execution_graph[node].variant,
+                ExecutionVariant::QMatMul(_)
+            )
+        });
+        let dense = Self::dense_reduce_fusion_enabled(has_qmatmul);
+        // Interleaved-view absorption moves scalar chains (a division after
+        // `sum_keepdim`) into row-program post chains, which can shift
+        // results by an ulp; it is reserved for the large-graph training
+        // path so small graphs keep bitwise-identical numerics.
+        self.fuse_row_programs(graph, false);
         self.recognize_assign_chains(graph);
         // The current rewrite rules can only start from Nary nodes (nary
         // fusion, post-op reduce/matmul fusion) or MatMul nodes (pre-op
@@ -264,12 +278,6 @@ impl Resolver {
             matches!(
                 self.execution_graph[node].variant,
                 ExecutionVariant::MatMul(_)
-            )
-        });
-        let has_qmatmul = self.execution_graph.node_indices().any(|node| {
-            matches!(
-                self.execution_graph[node].variant,
-                ExecutionVariant::QMatMul(_)
             )
         });
         let allow_qmatmul_elementwise_fusion = self.execution_graph.node_count()
@@ -304,7 +312,7 @@ impl Resolver {
             let changed = self.try_fold_view_inputs(graph, node_idx);
 
             let start = profile_enabled.then(Instant::now);
-            let changed = changed | self.try_fuse_naries(graph, node_idx);
+            let changed = changed | self.try_fuse_naries(graph, node_idx, dense);
             if let Some(start) = start {
                 profile.fuse_naries_count += 1;
                 profile.fuse_naries += start.elapsed();
@@ -315,8 +323,11 @@ impl Resolver {
             } else {
                 let start = profile_enabled.then(Instant::now);
                 let changed = has_reduce
-                    && (self.try_fuse_into_reduce(graph, node_idx)
-                        || self.try_fuse_producer_into_reduce(graph, node_idx));
+                    && ((dense && self.try_collapse_unit_reduce(graph, node_idx))
+                        || (dense && self.try_fold_view_inputs_into_reduce(graph, node_idx))
+                        || self.try_fuse_into_reduce(graph, node_idx)
+                        || (dense && self.try_fuse_unary_into_reduce_indexed(graph, node_idx))
+                        || self.try_fuse_producer_into_reduce(graph, node_idx, dense));
                 if let Some(start) = start {
                     profile.fuse_reduce_count += 1;
                     profile.fuse_reduce += start.elapsed();
@@ -381,22 +392,42 @@ impl Resolver {
         self.recognize_contractions(graph);
         self.recognize_embeddings(graph);
         self.recognize_attention(graph);
-        self.fuse_row_programs(graph);
-        self.recognize_assign_chains(graph);
+        // The qmatmul scan runs after recognition (which can mint QMatMul
+        // nodes) and before row fusion (which never creates or removes
+        // them), so the dense gate below is structural and stable.
         let has_qmatmul = self.execution_graph.node_indices().any(|node| {
             matches!(
                 self.execution_graph[node].variant,
                 ExecutionVariant::QMatMul(_)
             )
         });
-        if !has_qmatmul {
-            return;
-        }
+        let dense = Self::dense_reduce_fusion_enabled(has_qmatmul);
+        self.fuse_row_programs(graph, dense);
+        self.recognize_assign_chains(graph);
+        // Quantized decode graphs keep the tuned qmatmul-anchored candidate
+        // gate. Dense graphs (f32 training tapes) have no qmatmul anchor, so
+        // that gate would skip every node and leave each elementwise op as
+        // its own dispatch; fuse every elementwise chain instead, and fold
+        // reduce producers/views too. The reduce scan runs only in the dense
+        // branch so decode resolves pay exactly the same work as before.
+        let (is_candidate, has_reduce): (fn(&Self, ExecutionNodeIndex) -> bool, bool) =
+            if has_qmatmul {
+                (Self::is_large_graph_nary_candidate, false)
+            } else {
+                let has_reduce = dense
+                    && self.execution_graph.node_indices().any(|node| {
+                        matches!(
+                            self.execution_graph[node].variant,
+                            ExecutionVariant::Reduce(_)
+                        )
+                    });
+                (Self::is_dense_graph_candidate, has_reduce)
+            };
 
         let mut worklist = self
             .execution_graph
             .node_indices()
-            .filter(|&node| self.is_large_graph_nary_candidate(node))
+            .filter(|&node| is_candidate(self, node))
             .collect::<VecDeque<_>>();
         let mut in_worklist = worklist.iter().copied().collect::<FxHashSet<_>>();
 
@@ -411,21 +442,28 @@ impl Resolver {
                 .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
                 .collect::<Vec<_>>();
             let mut changed = self.try_fold_view_inputs(graph, node_idx);
-            changed |= self.try_fuse_naries(graph, node_idx);
+            changed |= self.try_fuse_naries(graph, node_idx, dense);
+            if !changed && has_reduce && self.execution_graph.contains_node(node_idx) {
+                changed = self.try_collapse_unit_reduce(graph, node_idx)
+                    || self.try_fold_view_inputs_into_reduce(graph, node_idx)
+                    || self.try_fuse_into_reduce(graph, node_idx)
+                    || self.try_fuse_unary_into_reduce_indexed(graph, node_idx)
+                    || self.try_fuse_producer_into_reduce(graph, node_idx, true);
+            }
             if !changed && self.execution_graph.contains_node(node_idx) {
                 changed = self.try_fuse_into_matmul(graph, node_idx, true);
             }
 
             if changed {
                 if self.execution_graph.contains_node(node_idx)
-                    && self.is_large_graph_nary_candidate(node_idx)
+                    && is_candidate(self, node_idx)
                     && in_worklist.insert(node_idx)
                 {
                     worklist.push_back(node_idx);
                 }
                 self.enqueue_downstream_candidates(
                     consumers,
-                    Self::is_large_graph_nary_candidate,
+                    is_candidate,
                     &mut worklist,
                     &mut in_worklist,
                 );
@@ -466,6 +504,23 @@ impl Resolver {
                 );
             }
         }
+    }
+
+    /// Dense (QMatMul-free) graphs also anchor rewrites on reduces so their
+    /// producers and views can fold in.
+    pub(super) fn is_dense_graph_candidate(&self, node_idx: ExecutionNodeIndex) -> bool {
+        matches!(
+            self.execution_graph[node_idx].variant,
+            ExecutionVariant::Elementwise(_) | ExecutionVariant::Reduce(_)
+        )
+    }
+
+    /// Whether the dense-graph reduce-fusion rules may run: never for
+    /// graphs containing QMatMul (decode behavior is frozen), and gated by
+    /// a kill-switch env var that is also hashed into the flush-replay
+    /// fingerprint.
+    pub(super) fn dense_reduce_fusion_enabled(has_qmatmul: bool) -> bool {
+        !has_qmatmul && std::env::var_os("FUSOR_RESOLVE_DISABLE_DENSE_REDUCE_FUSION").is_none()
     }
 
     pub(super) fn is_large_graph_nary_candidate(&self, node_idx: ExecutionNodeIndex) -> bool {
@@ -528,6 +583,11 @@ impl Resolver {
         let inner_idx = self.execution_graph[node_idx].inner_idx;
         for &input in inputs {
             graph.add_dependency_edge(input, inner_idx);
+            if let Some(recorder) = &self.recorder {
+                // These edges are persistent inner-graph side effects of the
+                // optimizer; a replayed plan must re-add them, so record them.
+                recorder.borrow_mut().record_physical_edge(input, inner_idx);
+            }
         }
     }
 

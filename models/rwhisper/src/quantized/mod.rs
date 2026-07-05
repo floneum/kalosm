@@ -4,7 +4,7 @@ use std::{num::NonZeroUsize, sync::Arc};
 
 use fusor::{
     cache::{AttentionMask, KvCache, MaskCache, TensorCache},
-    layers::{Conv1d, Conv1dConfig, Embedding, LayerNorm, Linear},
+    layers::{ConvNd, ConvNdConfig, Embedding, LayerNorm, Linear},
     Device, Error, Result, Tensor, VarBuilder,
 };
 use timestamps::extract_timestamps;
@@ -14,13 +14,13 @@ use crate::config::Config;
 pub(crate) mod timestamps;
 
 fn conv1d(
-    config: Conv1dConfig,
+    config: ConvNdConfig<1>,
     device: &Device,
     vb: &mut VarBuilder,
     in_channels: usize,
     out_channels: usize,
     kernel_size: usize,
-) -> Result<Conv1d<crate::WhisperDType>> {
+) -> Result<ConvNd<1, 3, crate::WhisperDType>> {
     let weight_q = vb.get("weight", device)?;
     let weight_shape = weight_q.shape();
 
@@ -51,7 +51,7 @@ fn conv1d(
             bias_2d.squeeze(1).to_concrete()
         }
     };
-    Ok(Conv1d::new(weight, Some(bias), config))
+    Ok(ConvNd::new(weight, Some(bias), config))
 }
 
 struct MultiHeadAttentionCache {
@@ -310,8 +310,8 @@ fn sinusoids(length: usize, channels: usize, device: &Device) -> Tensor<2, crate
 
 // https://github.com/openai/whisper/blob/f572f2161ba831bae131364c3bffdead7af6d210/whisper/model.py#L143
 pub struct AudioEncoder {
-    conv1: Conv1d<crate::WhisperDType>,
-    conv2: Conv1d<crate::WhisperDType>,
+    conv1: ConvNd<1, 3, crate::WhisperDType>,
+    conv2: ConvNd<1, 3, crate::WhisperDType>,
     positional_embedding: Tensor<2, crate::WhisperDType>,
     blocks: Vec<ResidualAttentionBlock>,
     ln_post: LayerNorm<1, crate::WhisperDType>,
@@ -328,17 +328,15 @@ impl AudioEncoder {
         let n_state = cfg.d_model;
         let n_head = cfg.encoder_attention_heads;
         let n_ctx = cfg.max_source_positions;
-        let cfg1 = Conv1dConfig {
-            padding: 1,
-            stride: 1,
+        let cfg1 = ConvNdConfig {
+            padding: [1],
+            stride: [1],
             groups: 1,
-            dilation: 1,
         };
-        let cfg2 = Conv1dConfig {
-            padding: 1,
-            stride: 2,
+        let cfg2 = ConvNdConfig {
+            padding: [1],
+            stride: [2],
             groups: 1,
-            dilation: 1,
         };
         let n_mels = cfg.num_mel_bins;
         let conv1 = conv1d(cfg1, device, &mut vb.pp("conv1"), n_mels, n_state, 3)?;

@@ -4674,6 +4674,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "criterion 0.8.2",
+ "flate2",
  "fusor-core",
  "fusor-cpu",
  "fusor-gguf",
@@ -4688,6 +4689,8 @@ dependencies = [
  "rand 0.9.4",
  "tokio",
  "tracing",
+ "tracing-subscriber 0.3.23",
+ "ureq 3.3.0",
 ]
 
 [[package]]

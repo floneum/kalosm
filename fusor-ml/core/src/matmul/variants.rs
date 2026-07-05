@@ -159,6 +159,8 @@ impl CoopTile {
             (128, 64, 16) => 8,
             (64, 128, 16) => 8,
             (64, 64, 16) => 4,
+            (64, 16, 16) => 4,
+            (16, 64, 16) => 4,
             _ => 0,
         }
     }
@@ -176,6 +178,20 @@ impl CoopTile {
     /// Heuristic: bigger tiles only fire when (M/BM)*(N/BN) clears a minimum
     /// tile count so there's enough work for the GPU.
     pub(super) fn select(
+        m: u32,
+        k: u32,
+        n: u32,
+        max_workgroup_size_x: u32,
+        max_subgroup_size: u32,
+    ) -> Option<Self> {
+        Self::select_primary(m, k, n, max_workgroup_size_x, max_subgroup_size)
+            .or_else(|| Self::select_small_side(m, k, n, max_workgroup_size_x, max_subgroup_size))
+    }
+
+    /// The primary tile ladder: every selection that predates the small-side
+    /// tiles goes through here unchanged, so shapes that already reached the
+    /// coop kernel keep the exact same tile.
+    fn select_primary(
         m: u32,
         k: u32,
         n: u32,
@@ -239,6 +255,50 @@ impl CoopTile {
         // (the (128, 128) table entry was never selectable and miscomputes).
         let mut best: Option<(u64, Self)> = None;
         for (bm, bn) in [(128, 64), (64, 128), (64, 64)] {
+            let tile = Self::new(bm, bn, 16);
+            if !tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
+                continue;
+            }
+            let padded = u64::from(m.div_ceil(bm) * bm) * u64::from(n.div_ceil(bn) * bn);
+            if padded * 4 > u64::from(m) * u64::from(n) * 5 {
+                continue;
+            }
+            if best.is_none_or(|(best_padded, _)| padded < best_padded) {
+                best = Some((padded, tile));
+            }
+        }
+        best.map(|(_, tile)| tile)
+    }
+
+    /// Second-chance selection for contractions with a 16-wide (or 16-padded)
+    /// M or N side — batched attention contractions like `P@V` (n = head_dim)
+    /// and `Qᵀ@dS` (m = head_dim), and narrow-vocab lm_head shapes. Runs only
+    /// after [`Self::select_primary`] declines, so no shape that reaches the
+    /// coop kernel today changes tile. The masked-edge candidates keep the
+    /// primary ladder's bound: padding may inflate the output by at most a
+    /// quarter, which still keeps gemv-shaped contractions (M and N both
+    /// tiny) on the generic path.
+    fn select_small_side(
+        m: u32,
+        k: u32,
+        n: u32,
+        max_workgroup_size_x: u32,
+        max_subgroup_size: u32,
+    ) -> Option<Self> {
+        const SMALL_SIDE_TILES: [(u32, u32); 2] = [(64, 16), (16, 64)];
+        if m == 0 || n == 0 || k == 0 {
+            return None;
+        }
+        for (bm, bn) in SMALL_SIDE_TILES {
+            if m.is_multiple_of(bm) && n.is_multiple_of(bn) {
+                let tile = Self::new(bm, bn, 16);
+                if tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
+                    return Some(tile);
+                }
+            }
+        }
+        let mut best: Option<(u64, Self)> = None;
+        for (bm, bn) in SMALL_SIDE_TILES {
             let tile = Self::new(bm, bn, 16);
             if !tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
                 continue;

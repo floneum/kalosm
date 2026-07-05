@@ -40,6 +40,13 @@ struct ClusterBuilder<'a> {
     full_exprs: FxHashMap<NodeIndex, NaryExpr>,
     /// The closed absorbable set: nodes outside it read as externals.
     allowed: &'a FxHashSet<NodeIndex>,
+    /// Large dense graphs only: accept pure views *between* the unary
+    /// chain and the reduce (the `sum_keepdim` unsqueeze under
+    /// `div_scalar`/`sqrt` in layer norm) by composing them into the
+    /// running layout. Moving a scalar chain into a row-program post chain
+    /// can shift results by an ulp, so small graphs keep the exact
+    /// pre-existing lowering.
+    allow_interleaved_views: bool,
 }
 
 struct BuilderSnapshot {
@@ -72,6 +79,29 @@ impl ClusterBuilder<'_> {
         } else {
             self.externals.push(inner);
             self.externals.len() - 1
+        }
+    }
+
+    /// Member insertion. On the large dense path (`allow_interleaved_views`)
+    /// this is idempotent: the same node can be reached through several
+    /// operand walks (a shared view, or one reduction read through two
+    /// different unary chains), and duplicate entries would trip the
+    /// member/exec count check at commit and abort the whole cluster.
+    ///
+    /// On every other path — which includes every QMatMul (decode) graph —
+    /// duplicates are pushed as-is so the commit check aborts exactly as it
+    /// historically did: dedup silently admits clusters the frozen decode
+    /// path used to reject, changing its kernel counts and reduce numerics.
+    fn add_member(&mut self, node: NodeIndex) {
+        if self.allow_interleaved_views && self.members.contains(&node) {
+            return;
+        }
+        self.members.push(node);
+    }
+
+    fn add_members(&mut self, nodes: impl IntoIterator<Item = NodeIndex>) {
+        for node in nodes {
+            self.add_member(node);
         }
     }
 }
@@ -148,7 +178,11 @@ impl Resolver {
     /// broadcast into some elementwise consumer, and the root is the last
     /// single-consumer elementwise below it — so graphs full of elementwise
     /// chains with no reductions (most of a decode graph) cost nothing.
-    pub(super) fn fuse_row_programs(&mut self, graph: &mut ComputeGraphInner) {
+    pub(super) fn fuse_row_programs(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        interleaved_views: bool,
+    ) {
         let reduces: Vec<ExecutionNodeIndex> = self
             .execution_graph
             .node_indices()
@@ -197,7 +231,7 @@ impl Resolver {
             if !self.execution_graph.contains_node(root) {
                 continue;
             }
-            self.try_fuse_row_program(graph, root);
+            self.try_fuse_row_program(graph, root, interleaved_views);
         }
     }
 
@@ -259,6 +293,7 @@ impl Resolver {
         &mut self,
         graph: &mut ComputeGraphInner,
         root_idx: ExecutionNodeIndex,
+        interleaved_views: bool,
     ) -> bool {
         let ExecutionVariant::Elementwise(root) = self.execution_graph[root_idx].variant.clone()
         else {
@@ -272,7 +307,7 @@ impl Resolver {
         // outside the set — what remains can fuse without anything
         // escaping. Dropped nodes read as external inputs and materialize
         // once, exactly as they must.
-        let mut allowed = self.collect_row_cluster(graph, root_idx, &root, None);
+        let mut allowed = self.collect_row_cluster(graph, root_idx, &root, None, interleaved_views);
         loop {
             let allowed_execs: FxHashSet<ExecutionNodeIndex> = allowed
                 .iter()
@@ -300,12 +335,13 @@ impl Resolver {
             }
             // Re-walk: regions only reachable through a dropped node fall
             // out of the set too.
-            allowed = self.collect_row_cluster(graph, root_idx, &root, Some(&allowed));
+            allowed =
+                self.collect_row_cluster(graph, root_idx, &root, Some(&allowed), interleaved_views);
         }
         if allowed.is_empty() {
             return false;
         }
-        self.build_row_cluster(graph, root_idx, &root, &allowed)
+        self.build_row_cluster(graph, root_idx, &root, &allowed, interleaved_views)
     }
 
     /// Collect the nodes the absorption walk could claim: full-shape
@@ -318,15 +354,25 @@ impl Resolver {
         _root_idx: ExecutionNodeIndex,
         root: &ElementwiseOperation,
         within: Option<&FxHashSet<NodeIndex>>,
+        interleaved_views: bool,
     ) -> FxHashSet<NodeIndex> {
         let mut out = FxHashSet::default();
         let mut axis = None;
         for &input in &root.inputs {
-            self.collect_operand(graph, &root.shape, &mut axis, input, within, &mut out);
+            self.collect_operand(
+                graph,
+                &root.shape,
+                &mut axis,
+                input,
+                within,
+                &mut out,
+                interleaved_views,
+            );
         }
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collect_operand(
         &self,
         graph: &ComputeGraphInner,
@@ -335,6 +381,7 @@ impl Resolver {
         inner: NodeIndex,
         within: Option<&FxHashSet<NodeIndex>>,
         out: &mut FxHashSet<NodeIndex>,
+        interleaved_views: bool,
     ) {
         let eligible = |node: NodeIndex| {
             within.is_none_or(|allowed| allowed.contains(&node)) && !out.contains(&node)
@@ -374,7 +421,7 @@ impl Resolver {
                 nodes.push(node);
                 node = view.input;
             }
-            let Some(layout) = layout else {
+            let Some(mut layout) = layout else {
                 break 'scalar;
             };
             let reduce = loop {
@@ -396,6 +443,23 @@ impl Resolver {
                         let (_, input) = unary_elementwise(nary).unwrap();
                         node = input;
                     }
+                    // A pure view *between* unary chain links (the
+                    // `sum_keepdim` unsqueeze under `div_scalar`/`sqrt` in
+                    // layer norm) composes into the running layout; unaries
+                    // are pointwise, so their position relative to pure
+                    // layout stages cannot change per-row values. Dense
+                    // graphs only.
+                    ExecutionVariant::View(view) if interleaved_views => {
+                        let Some(collapsed) = view.composed_layout() else {
+                            break 'scalar;
+                        };
+                        layout = match crate::view::compose_layouts(&layout, &collapsed) {
+                            Some(layout) => layout,
+                            None => break 'scalar,
+                        };
+                        nodes.push(node);
+                        node = view.input;
+                    }
                     _ => break 'scalar,
                 }
             };
@@ -411,7 +475,7 @@ impl Resolver {
             *axis = Some(reduce.axis);
             out.extend(nodes);
             out.insert(node);
-            self.collect_operand(graph, shape, axis, value, within, out);
+            self.collect_operand(graph, shape, axis, value, within, out, interleaved_views);
             return;
         }
 
@@ -431,7 +495,7 @@ impl Resolver {
         let inputs = nary.inputs.clone();
         out.insert(inner);
         for input in inputs {
-            self.collect_operand(graph, shape, axis, input, within, out);
+            self.collect_operand(graph, shape, axis, input, within, out, interleaved_views);
         }
     }
 
@@ -441,6 +505,7 @@ impl Resolver {
         root_idx: ExecutionNodeIndex,
         root: &ElementwiseOperation,
         allowed: &FxHashSet<NodeIndex>,
+        interleaved_views: bool,
     ) -> bool {
         let mut builder = ClusterBuilder {
             shape: root.shape.clone(),
@@ -450,6 +515,7 @@ impl Resolver {
             members: Vec::new(),
             full_exprs: FxHashMap::default(),
             allowed,
+            allow_interleaved_views: interleaved_views,
         };
         let mut rewrites = Vec::with_capacity(root.inputs.len());
         for &input in &root.inputs {
@@ -588,7 +654,7 @@ impl Resolver {
             rewrites.push(self.absorb_operand(graph, builder, input)?);
         }
         let expr = rewrite_slots(&nary.expression, &rewrites)?;
-        builder.members.push(inner);
+        builder.add_member(inner);
         builder.full_exprs.insert(inner, expr.clone());
         Some(expr)
     }
@@ -624,7 +690,13 @@ impl Resolver {
 
         // An optional unary chain on the reduced value (mean scaling, eps,
         // rsqrt...) folds into the phase's post chain, innermost first.
+        // Pure views interleaved with the chain (the `sum_keepdim`
+        // unsqueeze) compose into the layout; they are tracked separately
+        // from `chain_nodes` so phase deduplication stays keyed on real
+        // chain nodes.
+        let mut layout = layout;
         let mut chain_nodes = Vec::new();
+        let mut sandwich_views = Vec::new();
         let mut chain: Vec<NaryFunction> = Vec::new();
         let reduce = loop {
             if self.check_cached(graph, node) {
@@ -638,6 +710,12 @@ impl Resolver {
                     chain.push(function);
                     chain_nodes.push(node);
                     node = input;
+                }
+                ExecutionVariant::View(view) if builder.allow_interleaved_views => {
+                    let collapsed = view.composed_layout()?;
+                    layout = crate::view::compose_layouts(&layout, &collapsed)?;
+                    sandwich_views.push(node);
+                    node = view.input;
                 }
                 _ => return None,
             }
@@ -669,7 +747,8 @@ impl Resolver {
             .iter()
             .position(|(base, _)| *base == chain_nodes.first().copied().unwrap_or(node))
         {
-            builder.members.extend(views);
+            builder.add_members(views);
+            builder.add_members(sandwich_views);
             return Some(scalar_ref(phase, builder.shape.len()));
         }
 
@@ -685,9 +764,10 @@ impl Resolver {
         );
 
         let phase_key = chain_nodes.first().copied().unwrap_or(node);
-        builder.members.extend(views);
-        builder.members.extend(chain_nodes);
-        builder.members.push(node);
+        builder.add_members(views);
+        builder.add_members(sandwich_views);
+        builder.add_members(chain_nodes);
+        builder.add_member(node);
         let phase_index = builder.phases.len();
         builder.phases.push((
             phase_key,

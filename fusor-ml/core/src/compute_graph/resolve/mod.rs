@@ -27,6 +27,7 @@ use crate::{
 
 mod cluster_match;
 mod execution;
+pub(crate) mod flush_replay;
 mod fold_views;
 mod fusion_basic;
 mod fusion_matmul;
@@ -388,6 +389,12 @@ pub(crate) struct Resolver {
     layout_pass: LayoutPass,
     targets: Vec<NodeIndex>,
     resolved_set: FxHashSet<NodeIndex>,
+    // Flush-plan recorder, armed only by `new_batch_with_recording` (called
+    // exclusively from `flush_all_pending` for QMatMul-free graphs). `None`
+    // on every other resolve path, so decode resolves never record.
+    // `RefCell` because some hook sites (`add_physical_dependencies`) only
+    // hold `&self`.
+    recorder: Option<std::cell::RefCell<flush_replay::PlanRecorder>>,
 }
 
 impl Resolver {
@@ -415,6 +422,27 @@ impl Resolver {
             node_mapping: Default::default(),
             layout_pass: Default::default(),
             resolved_set,
+            recorder: None,
         }
+    }
+
+    /// A batch resolver that additionally records a replayable
+    /// [`flush_replay::FlushPlan`] of everything it resolves.
+    pub(crate) fn new_batch_with_recording(
+        graph: &mut ComputeGraphInner,
+        targets: Vec<NodeIndex>,
+        fingerprint: flush_replay::FlushFingerprint,
+    ) -> Self {
+        let recorder = flush_replay::PlanRecorder::new(graph, &targets, fingerprint);
+        let mut resolver = Self::new_batch(graph, targets);
+        resolver.recorder = Some(std::cell::RefCell::new(recorder));
+        resolver
+    }
+
+    /// The recorded plan, if recording was armed and never poisoned.
+    pub(crate) fn take_recorded_plan(&mut self) -> Option<flush_replay::FlushPlan> {
+        self.recorder
+            .take()
+            .and_then(|recorder| recorder.into_inner().finish())
     }
 }

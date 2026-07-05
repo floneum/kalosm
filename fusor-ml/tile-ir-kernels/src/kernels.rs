@@ -11,8 +11,8 @@ mod quantized_matrix;
 
 pub use helpers::AccumCast;
 pub use matmul::{
-    try_batched_coop_matmul, DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulShape,
-    DenseMatmulTensors,
+    split_k_combine, try_batched_coop_matmul, try_batched_coop_matmul_split_k,
+    DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulShape, DenseMatmulTensors,
 };
 pub use qgemv::{qgemv_with_epilogue, IntoQgemvEpilogues};
 pub use qmatmul::qmatmul_with_epilogue;

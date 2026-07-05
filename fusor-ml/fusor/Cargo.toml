@@ -31,6 +31,9 @@ futures = "0.3.31"
 fusor-core = { path = "../core" }
 fusor-gguf = { path = "../gguf" }
 ndarray = "0.16.1"
+ureq = { version = "3.2.0", default-features = false, features = ["rustls"] }
+flate2 = "1.0.35"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lib]
 bench = false

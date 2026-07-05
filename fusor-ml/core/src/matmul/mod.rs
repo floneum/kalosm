@@ -454,8 +454,34 @@ mod selection_tests {
             select(1000, 1024, 1024, 512),
             Some(CoopTile::new(128, 64, 16))
         );
-        // Tiny N inflates every candidate's padding past the waste bound:
-        // gemv-shaped contractions stay on the generic path.
-        assert_eq!(select(1000, 1024, 16, 512), None);
+        // N=16 shapes route to the small-side (64, 16) tile (M pads
+        // 1000 → 1024, well inside the bound).
+        assert_eq!(select(1000, 1024, 16, 512), Some(CoopTile::new(64, 16, 16)));
+        // True gemv shapes (one axis tiny beyond what padding allows) stay
+        // on the generic path.
+        assert_eq!(select(1000, 1024, 1, 512), None);
+        assert_eq!(select(1, 1024, 1000, 512), None);
+    }
+
+    #[test]
+    fn small_side_tiles_select_only_after_primary_declines() {
+        let select =
+            |m, k, n, max_workgroup_size_x| CoopTile::select(m, k, n, max_workgroup_size_x, 32);
+        // Aligned small-side shapes: the attention head_dim family.
+        assert_eq!(select(64, 64, 16, 512), Some(CoopTile::new(64, 16, 16)));
+        assert_eq!(select(16, 64, 64, 512), Some(CoopTile::new(16, 64, 16)));
+        assert_eq!(select(128, 64, 16, 512), Some(CoopTile::new(64, 16, 16)));
+        // Masked-edge small-side shapes: the vocab-65 lm_head family.
+        assert_eq!(select(2048, 64, 65, 512), Some(CoopTile::new(64, 16, 16)));
+        assert_eq!(select(64, 2048, 65, 512), Some(CoopTile::new(64, 16, 16)));
+        assert_eq!(select(65, 2048, 64, 512), Some(CoopTile::new(16, 64, 16)));
+        // Padding above a quarter of the output still declines: both-tiny
+        // contractions stay generic.
+        assert_eq!(select(16, 64, 16, 512), None);
+        assert_eq!(select(17, 64, 17, 512), None);
+        // Shapes the primary ladder already served keep their exact tile.
+        assert_eq!(select(64, 64, 64, 512), Some(CoopTile::new(64, 64, 16)));
+        assert_eq!(select(64, 512, 112, 512), Some(CoopTile::new(64, 128, 16)));
+        assert_eq!(select(128, 1024, 64, 512), Some(CoopTile::new(128, 64, 16)));
     }
 }

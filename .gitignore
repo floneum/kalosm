@@ -23,3 +23,4 @@ rust-analyzer
 /.claude
 **/.claude/
 profiles
+/fusor-ml/fusor/examples/data

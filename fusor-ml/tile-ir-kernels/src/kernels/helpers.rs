@@ -69,7 +69,7 @@ impl AccumCast {
     }
 }
 
-fn zero_literal(element: ScalarElement) -> TileLiteral {
+pub(super) fn zero_literal(element: ScalarElement) -> TileLiteral {
     match element {
         ScalarElement::F32 => TileLiteral::f32(0.0),
         ScalarElement::F16 => TileLiteral::F16(0),

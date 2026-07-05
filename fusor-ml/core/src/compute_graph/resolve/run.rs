@@ -87,6 +87,11 @@ impl Resolver {
                 let node = &self.execution_graph[idx];
                 // Handle Tensor caching explicitly here
                 if let ExecutionVariant::Tensor(data) = &node.variant {
+                    if let Some(recorder) = &self.recorder {
+                        recorder
+                            .borrow_mut()
+                            .record_tensor_leaf(node.inner_idx, data);
+                    }
                     graph.set_cached_result(node.inner_idx, data.clone());
                     continue;
                 }
@@ -170,6 +175,13 @@ impl Resolver {
             };
             if let Some(result) = view_result {
                 let start = host_trace.then(Instant::now);
+                if let Some(recorder) = &self.recorder {
+                    let mut deps = Vec::new();
+                    graph.visit_dependencies(node, &mut |dep| deps.push(dep));
+                    recorder
+                        .borrow_mut()
+                        .record_view_alias(node, &result, &deps);
+                }
                 // Cache the result
                 graph.set_cached_result(node, result);
                 // Map-layout nodes are resolved immediately — release any
@@ -193,6 +205,11 @@ impl Resolver {
                     Self::try_prepare_in_place_slice_assign_copy(graph, slice_assign)
                 });
                 if let Some((output, copies)) = slice_copy {
+                    if let Some(recorder) = &self.recorder {
+                        recorder
+                            .borrow_mut()
+                            .record_copy_assign(node, &output, &queued_operation);
+                    }
                     graph.set_cached_result(node, output);
                     commands.extend(copies.into_iter().map(CommandRecord::CopyBuffer));
                     let start = host_trace.then(Instant::now);
@@ -218,6 +235,12 @@ impl Resolver {
                     }
                 }
                 if let QueuedOperation::QMatMul(qmatmul) = &queued_operation {
+                    if let Some(recorder) = &self.recorder {
+                        // Quantized matmuls are never part of a flush plan
+                        // (decode graphs are excluded before recording arms;
+                        // this is belt-and-braces).
+                        recorder.borrow_mut().poison();
+                    }
                     let start = host_trace.then(Instant::now);
                     let result = qmatmul.output(graph, &new_inputs);
                     let MirValue::Tensor(resolved) = result else {
@@ -400,6 +423,14 @@ impl Resolver {
                         profile.count += kernels.len();
                         profile.build_kernel += elapsed;
                     }
+                }
+                if let Some(recorder) = &self.recorder {
+                    recorder.borrow_mut().record_dispatch(
+                        node,
+                        &kernels,
+                        &resolved,
+                        &queued_operation,
+                    );
                 }
                 for direct_kernel in kernels {
                     let start = host_trace.then(Instant::now);
@@ -743,7 +774,7 @@ fn direct_plan_binding_buffers(inputs: &[MirValue]) -> Vec<Vec<std::sync::Arc<wg
     vec![buffers]
 }
 
-fn dispatches_per_pass(total_kernels: usize) -> usize {
+pub(super) fn dispatches_per_pass(total_kernels: usize) -> usize {
     if let Ok(value) = std::env::var("FUSOR_RESOLVE_DISPATCHES_PER_PASS")
         && let Ok(parsed) = value.parse::<usize>()
         && parsed > 0
@@ -754,7 +785,7 @@ fn dispatches_per_pass(total_kernels: usize) -> usize {
     if total_kernels >= 1024 { 1 } else { usize::MAX }
 }
 
-fn dispatches_per_submit(total_kernels: usize, backend: wgpu::Backend) -> usize {
+pub(super) fn dispatches_per_submit(total_kernels: usize, backend: wgpu::Backend) -> usize {
     if let Ok(value) = std::env::var("FUSOR_RESOLVE_DISPATCHES_PER_SUBMIT")
         && let Ok(parsed) = value.parse::<usize>()
         && parsed > 0

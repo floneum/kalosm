@@ -2,7 +2,7 @@
 
 use fusor::{
     Device, Tensor,
-    layers::{Conv1d, Conv1dConfig, Embedding, LayerNorm, RmsNorm},
+    layers::{ConvNd, ConvNdConfig, Embedding, LayerNorm, RmsNorm},
 };
 use fusor_conformance::{
     AssertionCase, AssertionCases, approx_compare, exact_compare, exact_value_compare,
@@ -37,10 +37,10 @@ fn assert_conv1d_case(case: ConvCase) -> AssertionCase {
         -0.35,
     );
     let bias_data = case.with_bias.then(|| layer_data(case.out_channels, 0.1));
-    let config = Conv1dConfig {
-        padding: case.padding,
-        stride: case.stride,
-        ..Default::default()
+    let config = ConvNdConfig {
+        padding: [case.padding],
+        stride: [case.stride],
+        groups: 1,
     };
 
     fusor_conformance::assert(move |device: Device| {
@@ -61,7 +61,7 @@ fn assert_conv1d_case(case: ConvCase) -> AssertionCase {
             let bias = bias_data
                 .as_ref()
                 .map(|data| Tensor::from_slice(&device, [case.out_channels], data));
-            Conv1d::new(weight, bias, config)
+            ConvNd::new(weight, bias, config)
                 .forward(&input)
                 .to_concrete()
         }
@@ -399,22 +399,22 @@ pub fn conv1d_properties_match_configuration() -> AssertionCases {
                         [out_channels, in_channels, kernel_size],
                         &vec![0.0f32; out_channels * in_channels * kernel_size],
                     );
-                    let conv = Conv1d::new(
+                    let conv = ConvNd::new(
                         weight,
                         None,
-                        Conv1dConfig {
-                            padding,
-                            stride,
-                            ..Default::default()
+                        ConvNdConfig {
+                            padding: [padding],
+                            stride: [stride],
+                            groups: 1,
                         },
                     );
 
                     (
                         conv.in_channels(),
                         conv.out_channels(),
-                        conv.kernel_size(),
-                        conv.config().padding,
-                        conv.config().stride,
+                        conv.weight().shape()[2],
+                        conv.config().padding[0],
+                        conv.config().stride[0],
                     )
                 })
                 .arg(|device: &Device| device.clone())

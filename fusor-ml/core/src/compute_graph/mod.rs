@@ -4,8 +4,12 @@ use parking_lot::RwLock;
 pub use petgraph::graph::NodeIndex;
 use petgraph::prelude::StableGraph;
 use resolve::Resolver;
+use resolve::flush_replay::{self, FlushPlanEntry};
+use rustc_hash::FxHashMap;
 #[cfg(feature = "graphvis")]
 use tabbycat::Graph;
+
+pub(crate) use resolve::flush_replay::FlushPlanCache;
 
 mod layout_pass;
 mod queue;
@@ -102,6 +106,22 @@ impl ComputeGraph {
         self.create_node(ComputeGraphNodeVariant::QMatrix(DequantizeOperation::new(
             matrix, ty,
         )))
+    }
+
+    /// Resolve every pending lazy output now, submitting the work to the
+    /// GPU without waiting for it or downloading anything. Keeps the pending
+    /// graph small in iteration-heavy workloads like training loops.
+    pub(crate) fn flush(&self) {
+        let mut removed = Vec::new();
+        {
+            let mut inner = self.inner.write();
+            inner.flush_all_pending(&mut removed);
+            #[cfg(feature = "extra_assertions")]
+            {
+                inner.verify_integrity()
+            }
+        }
+        drop(removed);
     }
 
     pub(crate) fn resolve(&self, key: NodeIndex) -> ResolverResult {
@@ -354,6 +374,20 @@ pub(crate) struct ComputeGraphInner {
     // where the user would otherwise need to sprinkle explicit `resolve()`
     // calls. 0 disables.
     flush_threshold: usize,
+    // Number of `QMatrix` nodes currently in the graph. O(1) structural gate
+    // for the flush-plan replay path: quantized decode/vision graphs must see
+    // zero behavior change, so a flush on a graph containing any QMatrix pays
+    // exactly one integer compare and takes the full-resolve path.
+    qmatrix_node_count: usize,
+    // Incremental pending-sink set: every node with `reference_count > 0 &&
+    // cached.is_none()`, tagged with a monotonically increasing insertion
+    // sequence number. Replaces the O(all-nodes) scan in `flush_all_pending`
+    // and makes sink enumeration deterministic in tape-construction order
+    // (StableGraph recycles indices, so `node_indices()` order is not stable
+    // across isomorphic steps) — which is what lets flush fingerprints of
+    // isomorphic steps collide.
+    pending_sinks: FxHashMap<NodeIndex, u64>,
+    pending_seq: u64,
 }
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 8192;
@@ -371,6 +405,9 @@ impl ComputeGraphInner {
             device: device.downgrade(),
             nodes: ComputeGraphNodes::default(),
             flush_threshold: read_flush_threshold(),
+            qmatrix_node_count: 0,
+            pending_sinks: FxHashMap::default(),
+            pending_seq: 0,
         }
     }
 
@@ -380,6 +417,9 @@ impl ComputeGraphInner {
             device,
             nodes: ComputeGraphNodes::default(),
             flush_threshold: 0,
+            qmatrix_node_count: 0,
+            pending_sinks: FxHashMap::default(),
+            pending_seq: 0,
         }
     }
 
@@ -396,20 +436,77 @@ impl ComputeGraphInner {
         if self.nodes.nodes.node_count() < self.flush_threshold {
             return;
         }
-        let pending: Vec<NodeIndex> = self
-            .nodes
-            .nodes
-            .node_indices()
-            .filter(|&k| {
-                let Some(n) = self.nodes.nodes.node_weight(k) else {
-                    return false;
-                };
-                n.reference_count > 0 && n.cached.is_none()
+        self.flush_all_pending(removed);
+    }
+
+    /// Materialize every pending lazy output in a single batched resolve.
+    ///
+    /// For QMatMul-free graphs (dense training tapes), consecutive flushes of
+    /// structurally identical pending subgraphs go through the flush-plan
+    /// replay cache: the first sighting of a fingerprint marks it seen, the
+    /// second records the full resolve into a replayable plan, and later
+    /// sightings replay it — skipping the execution-graph build, optimizer,
+    /// lowering and kernel building entirely.
+    fn flush_all_pending(&mut self, removed: &mut Vec<ComputeGraphNode>) {
+        // Enumerate pending sinks in insertion (tape-construction) order so
+        // fingerprints of isomorphic steps are deterministic. Frozen decode
+        // path: QMatMul graphs keep the historical `node_indices()` ascending
+        // enumeration exactly — insertion order diverges from index order
+        // once StableGraph recycles indices, and target order drives the
+        // per-target DFS, optimizer sweep order, and toposort tie-breaks.
+        let mut pending: Vec<(u64, NodeIndex)> = self
+            .pending_sinks
+            .iter()
+            .filter(|&(&key, _)| {
+                self.nodes
+                    .nodes
+                    .node_weight(key)
+                    .map(|n| n.reference_count > 0 && n.cached.is_none())
+                    .unwrap_or(false)
             })
+            .map(|(&key, &seq)| (seq, key))
             .collect();
+        if self.qmatrix_node_count > 0 {
+            pending.sort_unstable_by_key(|&(_, key)| key);
+        } else {
+            pending.sort_unstable();
+        }
+        let pending: Vec<NodeIndex> = pending.into_iter().map(|(_, key)| key).collect();
         if pending.is_empty() {
             return;
         }
+
+        // Decode safety: any graph containing a quantized matrix skips the
+        // replay machinery after exactly one integer compare.
+        if self.qmatrix_node_count == 0
+            && flush_replay::replay_enabled()
+            && let Some(fingerprint) = flush_replay::fingerprint_pending(self, &pending)
+        {
+            let device = self.device();
+            let cache = device.flush_plan_cache();
+            match cache.get(&fingerprint.key) {
+                Some(FlushPlanEntry::Recorded(plan)) => {
+                    if flush_replay::try_replay_flush(self, &device, &plan, &fingerprint) {
+                        cache.note_replay();
+                        return;
+                    }
+                    // Upfront validation failed (fingerprint collision or
+                    // graph drift): fall through to a full resolve.
+                }
+                Some(FlushPlanEntry::Seen) => {
+                    let key = fingerprint.key;
+                    let mut resolver =
+                        Resolver::new_batch_with_recording(self, pending, fingerprint);
+                    let _ = resolver.run(self, removed);
+                    if let Some(plan) = resolver.take_recorded_plan() {
+                        cache.insert(key, FlushPlanEntry::Recorded(Arc::new(plan)));
+                    }
+                    return;
+                }
+                None => cache.insert(fingerprint.key, FlushPlanEntry::Seen),
+            }
+        }
+
         let mut resolver = Resolver::new_batch(self, pending);
         let _ = resolver.run(self, removed);
     }
@@ -423,25 +520,41 @@ impl ComputeGraphInner {
     }
 
     fn create_node(&mut self, node: ComputeGraphNodeVariant) -> NodeIndex {
+        let is_qmatrix = matches!(node, ComputeGraphNodeVariant::QMatrix(_));
         let node = self.nodes.nodes.add_node(ComputeGraphNode {
             variant: node,
             reference_count: 1,
             live_descendant_count: 0,
             cached: None,
         });
+        if is_qmatrix {
+            self.qmatrix_node_count += 1;
+        }
+        // New node has `reference_count = 1` and no cached result: pending.
+        self.mark_pending(node);
         // New node has `reference_count = 1`, so it is alive. Adding edges
         // below propagates that liveness up to each dependency.
         self.add_dependency_edges(node);
         node
     }
 
+    /// Track `key` in the pending-sink set (referenced and uncached).
+    fn mark_pending(&mut self, key: NodeIndex) {
+        let seq = self.pending_seq;
+        self.pending_seq += 1;
+        self.pending_sinks.entry(key).or_insert(seq);
+    }
+
     fn add_reference(&mut self, key: NodeIndex) {
-        let transitioned_alive = {
+        let (transitioned_alive, now_pending) = {
             let node = self.nodes.nodes.node_weight_mut(key).unwrap();
             let prev_alive = node.alive_uncached();
             node.reference_count += 1;
-            !prev_alive && node.alive_uncached()
+            (!prev_alive && node.alive_uncached(), node.cached.is_none())
         };
+        if now_pending {
+            self.mark_pending(key);
+        }
         if transitioned_alive {
             self.propagate_alive_change(key, true);
         }
@@ -607,12 +720,18 @@ impl ComputeGraphInner {
     }
 
     fn remove_reference(&mut self, key: NodeIndex, removed: &mut Vec<ComputeGraphNode>) {
-        let transitioned_dead = {
+        let (transitioned_dead, still_referenced) = {
             let node = self.nodes.nodes.node_weight_mut(key).unwrap();
             let prev_alive = node.alive_uncached();
             node.reference_count = node.reference_count.saturating_sub(1);
-            prev_alive && !node.alive_uncached()
+            (
+                prev_alive && !node.alive_uncached(),
+                node.reference_count > 0,
+            )
         };
+        if !still_referenced {
+            self.pending_sinks.remove(&key);
+        }
         if transitioned_dead {
             self.propagate_alive_change(key, false);
         }
@@ -653,6 +772,13 @@ impl ComputeGraphInner {
     fn remove_key(&mut self, key: NodeIndex, removed: &mut Vec<ComputeGraphNode>) {
         // Remove the node from the graph (this also removes all edges)
         if let Some(node) = self.nodes.nodes.remove_node(key) {
+            if matches!(node.variant, ComputeGraphNodeVariant::QMatrix(_)) {
+                self.qmatrix_node_count = self.qmatrix_node_count.saturating_sub(1);
+            }
+            // A removable node has `reference_count == 0`, so it should
+            // already be out of the pending set; defensive removal keeps the
+            // set exact even if that invariant ever slips.
+            self.pending_sinks.remove(&key);
             removed.push(node);
         }
     }
@@ -674,6 +800,8 @@ impl ComputeGraphInner {
     }
 
     pub(crate) fn set_cached_result(&mut self, key: NodeIndex, data: TensorData) {
+        // A cached node is no longer a pending sink.
+        self.pending_sinks.remove(&key);
         // Setting `cached` flips `alive_uncached` false: a cached node no
         // longer needs to be recomputed, so its parents can free their own
         // cached buffers once no other uncached descendant remains. Propagate
@@ -787,5 +915,46 @@ impl ComputeGraphInner {
                 "live_descendant_count mismatch at {key:?}: expected {expected}, got {actual}"
             );
         }
+
+        // Check that the incremental pending-sink set exactly matches the
+        // predicate it caches (`reference_count > 0 && cached.is_none()`).
+        for key in self.nodes.nodes.node_indices() {
+            let pending = self
+                .nodes
+                .nodes
+                .node_weight(key)
+                .map(|n| n.reference_count > 0 && n.cached.is_none())
+                .unwrap_or(false);
+            assert_eq!(
+                self.pending_sinks.contains_key(&key),
+                pending,
+                "pending_sinks mismatch at {key:?}: expected pending={pending}"
+            );
+        }
+        for key in self.pending_sinks.keys() {
+            assert!(
+                self.nodes.nodes.contains_node(*key),
+                "pending_sinks contains removed node {key:?}"
+            );
+        }
+
+        // Check that the O(1) qmatrix counter matches a full scan.
+        let qmatrix_nodes = self
+            .nodes
+            .nodes
+            .node_indices()
+            .filter(|&key| {
+                self.nodes
+                    .nodes
+                    .node_weight(key)
+                    .map(|n| matches!(n.variant, ComputeGraphNodeVariant::QMatrix(_)))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            self.qmatrix_node_count, qmatrix_nodes,
+            "qmatrix_node_count mismatch: counter {}, scan {qmatrix_nodes}",
+            self.qmatrix_node_count
+        );
     }
 }

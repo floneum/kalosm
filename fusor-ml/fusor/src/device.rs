@@ -56,6 +56,18 @@ impl Device {
         }
     }
 
+    /// Resolve every pending lazy tensor now, submitting the work to the GPU
+    /// without waiting for it or downloading anything. Call at iteration
+    /// boundaries in training-style loops to keep the pending graph bounded
+    /// while the GPU runs ahead of the host. No-op on CPU, where lazy
+    /// expressions are evaluated when they are consumed.
+    pub fn flush(&self) {
+        match self {
+            Device::Cpu => {}
+            Device::Gpu(device) => device.flush(),
+        }
+    }
+
     /// Create a device, preferring GPU if available, otherwise falling back to CPU.
     pub async fn auto() -> Self {
         #[cfg(not(feature = "gpu"))]

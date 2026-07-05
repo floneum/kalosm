@@ -148,6 +148,10 @@ struct DeviceInner {
     queue: Arc<wgpu::Queue>,
     kernel_cache: KernelCache,
     buffer_pool: BufferPool,
+    /// Two-touch cache of recorded flush plans for dense (QMatMul-free)
+    /// graphs, replayed by `flush_all_pending`. Lives here beside the kernel
+    /// cache so it is reachable under the compute-graph write lock.
+    flush_plan_cache: crate::compute_graph::FlushPlanCache,
     cooperative_matrix_caps: CooperativeMatrixCaps,
     compute_graph: OnceLock<ComputeGraph>,
     /// When set, this device reports `subgroups_supported() == false` so kernel
@@ -210,6 +214,7 @@ impl Device {
             queue,
             kernel_cache,
             buffer_pool,
+            flush_plan_cache: Default::default(),
             cooperative_matrix_caps: src.cooperative_matrix_caps,
             compute_graph: OnceLock::new(),
             disable_subgroups,
@@ -359,6 +364,7 @@ impl Device {
             queue,
             kernel_cache,
             buffer_pool,
+            flush_plan_cache: Default::default(),
             cooperative_matrix_caps,
             compute_graph: OnceLock::new(),
             disable_subgroups,
@@ -564,6 +570,10 @@ impl Device {
         &self.inner.kernel_cache
     }
 
+    pub(crate) fn flush_plan_cache(&self) -> &crate::compute_graph::FlushPlanCache {
+        &self.inner.flush_plan_cache
+    }
+
     /// Reset the initialized flag on all cached buffers.
     pub fn reset_initialized_buffers(&self) {
         self.inner.buffer_pool.reset_initialized_buffers();
@@ -599,6 +609,17 @@ impl Device {
             .compute_graph
             .get()
             .expect("compute_graph should be initialized")
+    }
+
+    /// Resolve every pending lazy tensor now, submitting the work to the GPU
+    /// without waiting for it or downloading anything. Call at iteration
+    /// boundaries in training-style loops: it keeps the pending graph (and
+    /// per-resolve optimizer cost) bounded while leaving the GPU free to run
+    /// ahead of the host.
+    pub fn flush(&self) {
+        if let Some(graph) = self.inner.compute_graph.get() {
+            graph.flush();
+        }
     }
 }
 

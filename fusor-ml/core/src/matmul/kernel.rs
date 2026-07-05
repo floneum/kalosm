@@ -354,6 +354,33 @@ impl MatMulOperation {
 
         let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
         let datatype = self.datatype;
+
+        // Starved tile grids with a long contraction split K across
+        // workgroups: partials land in scratch slices of the over-allocated
+        // output buffer and a combine kernel folds them (sum-reorder-only
+        // numerics). A weight-gradient shape like 64×2048×64 otherwise runs
+        // as a single workgroup.
+        if let Some(splits) = self.split_k_factor(&tile)
+            && let Some(kernel) = self.build_split_k_matmul(
+                device,
+                input_a,
+                input_b,
+                output,
+                &a_view,
+                &b_view,
+                &y_view,
+                shape,
+                tile,
+                subgroup_config,
+                coop,
+                batch_m_padded,
+                n_padded,
+                splits,
+            )
+        {
+            return Ok(kernel);
+        }
+
         let used = std::cell::Cell::new(false);
         let ir = tile_ir::tile::build(|phase| {
             let element = match datatype {
@@ -427,9 +454,217 @@ impl MatMulOperation {
             ),
         )
     }
+
+    /// The split factor for coop matmuls whose tile grid starves the GPU
+    /// (few output tiles against a long contraction), `None` when the shape
+    /// runs the single-pass kernel. Consulted by both [`Self::inputs`]
+    /// (which over-allocates the output backing with one scratch slice per
+    /// split) and [`Self::build_hardware_matmul`], so allocation and kernel
+    /// selection agree by construction.
+    fn split_k_factor(&self, tile: &CoopTile) -> Option<u32> {
+        const SPLIT_K_MAX_TILES: u32 = if std::option_env!("FUSOR_NO_SPLITK").is_some() { 0 } else { 24 };
+        const SPLIT_K_MIN_K: u32 = 512;
+        const SPLIT_K_SPLITS: u32 = 16;
+        let m: u32 = self.a.rows().try_into().ok()?;
+        let n: u32 = self.b.cols().try_into().ok()?;
+        let k: u32 = self.a.cols().try_into().ok()?;
+        let batch = self
+            .a
+            .batch_shape()
+            .iter()
+            .try_fold(1u32, |acc, &dim| acc.checked_mul(u32::try_from(dim).ok()?))?;
+        let total_tiles = m
+            .div_ceil(tile.bm)
+            .checked_mul(n.div_ceil(tile.bn))?
+            .checked_mul(batch)?;
+        if total_tiles >= SPLIT_K_MAX_TILES || k < SPLIT_K_MIN_K {
+            return None;
+        }
+        let splits = SPLIT_K_SPLITS.min(k.div_ceil(tile.bk));
+        (splits >= 2).then_some(splits)
+    }
+
+    /// Split-K route for coop matmuls whose tile grid starves the GPU: the
+    /// partials kernel runs `splits × total_tiles` workgroups, each covering
+    /// one K-span with the standard coop tile loop and storing an
+    /// unnormalized partial into one scratch slice of the over-allocated
+    /// output buffer (slices `1..=splits`, allocated by [`Self::inputs`]);
+    /// a combine kernel sums the slices into the padded output at slice 0.
+    /// Keeping the scratch inside the output allocation means every bound
+    /// buffer stays slot-attributable, so flush-plan recording keeps
+    /// working. Numerics differ from the single-pass kernel only in
+    /// summation order. Returns `None` (single-pass coop path proceeds)
+    /// when the geometry, allocation, or device declines.
+    #[allow(clippy::too_many_arguments)]
+    fn build_split_k_matmul(
+        &self,
+        device: &Device,
+        input_a: &TensorData,
+        input_b: &TensorData,
+        output: &TensorData,
+        a_view: &crate::mir::tile_direct::DirectMatrixLayout,
+        b_view: &crate::mir::tile_direct::DirectMatrixLayout,
+        y_view: &crate::mir::tile_direct::DirectMatrixLayout,
+        shape: tile_ir_kernels::DenseMatmulShape,
+        tile: CoopTile,
+        subgroup_config: fusor_tile_ir_kernels::SubgroupConfig,
+        coop: tile_ir::CoopMatrixToken,
+        batch_m_padded: u32,
+        n_padded: u32,
+        splits: u32,
+    ) -> Option<DirectKernel> {
+        let slice_elements = batch_m_padded.checked_mul(n_padded)?;
+        let total_elements = slice_elements.checked_mul(splits.checked_add(1)?)?;
+        let required_bytes = total_elements as u64 * self.datatype.element_size() as u64;
+        // The output allocation must carry the scratch slices; an exact
+        // allocation (a plan built before the split decision, or an aliased
+        // buffer) falls back to the single-pass kernel.
+        if output.buffer().size() < required_bytes {
+            return None;
+        }
+        let scratch_rows = splits.checked_mul(batch_m_padded)?;
+        let scratch_view = crate::mir::tile_direct::DirectMatrixLayout {
+            rows: scratch_rows,
+            cols: n_padded,
+            offset: slice_elements,
+            layout: tile_ir::Layout::strided(
+                tile_ir::MemoryLevel::Storage,
+                tile_ir::Shape::new([scratch_rows, n_padded]),
+                &[n_padded, 1],
+            ),
+        };
+        let element = match self.datatype {
+            DataTypeEnum::F32 => tile_ir::ElementType::F32,
+            DataTypeEnum::F16 => tile_ir::ElementType::F16,
+            _ => return None,
+        };
+        let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
+
+        let used = std::cell::Cell::new(false);
+        let ir = tile_ir::tile::build(|phase| {
+            let a = tile_storage_read_with_direct_layout_typed(phase, element, a_view.clone());
+            let b = tile_storage_read_with_direct_layout_typed(phase, element, b_view.clone());
+            let y =
+                tile_storage_write_with_direct_layout_typed(phase, element, scratch_view.clone());
+            used.set(tile_ir_kernels::try_batched_coop_matmul_split_k(
+                phase,
+                tile_ir_kernels::DenseMatmulTensors {
+                    a: &a,
+                    b: &b,
+                    y: &y,
+                },
+                shape,
+                splits,
+                max_wg_per_dim,
+                tile_ir_kernels::DenseCoopMatmulConfig {
+                    coop,
+                    subgroups: subgroup_config,
+                    tile: tile_ir_kernels::DenseCoopMatmulTile {
+                        bm: tile.bm,
+                        bn: tile.bn,
+                        bk: tile.bk,
+                    },
+                },
+            ));
+        });
+        if !used.get() {
+            return None;
+        }
+        let dispatch_size = ir.grid;
+        if dispatch_size.iter().any(|dim| *dim > max_wg_per_dim) {
+            return None;
+        }
+        let inputs = [
+            input_a.clone().into(),
+            input_b.clone().into(),
+            output.clone().into(),
+        ];
+        let variant =
+            kernel_backend::KernelVariantKey::with_payload::<SplitKMatmulVariant>(|state| {
+                tile.hash(state);
+                subgroup_config.hash(state);
+                splits.hash(state);
+                1u64.hash(state);
+            });
+        let cache_key = self.kernel_cache_key_with_dispatch(variant, None, dispatch_size, &inputs);
+        let name = self.name();
+        let pipeline = kernel_backend::three_buffer_pipeline_from_ir(
+            device.kernel_cache(),
+            &name,
+            cache_key,
+            || Some(ir),
+        )?;
+        let partials = kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
+            name.clone(),
+            pipeline,
+            input_a.buffer().clone(),
+            input_b.buffer().clone(),
+            output.buffer().clone(),
+            dispatch_size,
+        );
+
+        // One read-write view over all `1 + splits` slices: the combine
+        // reads the partial slices and stores slice 0, through a single
+        // binding of the shared buffer.
+        debug_assert_eq!(y_view.offset, 0);
+        debug_assert_eq!(
+            y_view.rows, batch_m_padded,
+            "split-K expects the padded output view"
+        );
+        let all_rows = scratch_rows + batch_m_padded;
+        let combine_view = crate::mir::tile_direct::DirectMatrixLayout {
+            rows: all_rows,
+            cols: n_padded,
+            offset: 0,
+            layout: tile_ir::Layout::strided(
+                tile_ir::MemoryLevel::Storage,
+                tile_ir::Shape::new([all_rows, n_padded]),
+                &[n_padded, 1],
+            ),
+        };
+        let combine_ir = tile_ir::tile::build(|phase| {
+            let y =
+                tile_storage_write_with_direct_layout_typed(phase, element, combine_view.clone());
+            tile_ir_kernels::split_k_combine(
+                phase,
+                &y,
+                batch_m_padded,
+                n_padded,
+                splits,
+                max_wg_per_dim,
+            );
+        });
+        let combine_dispatch = combine_ir.grid;
+        if combine_dispatch.iter().any(|dim| *dim > max_wg_per_dim) {
+            return None;
+        }
+        let combine_variant =
+            kernel_backend::KernelVariantKey::with_payload::<SplitKMatmulVariant>(|state| {
+                tile.hash(state);
+                subgroup_config.hash(state);
+                splits.hash(state);
+                2u64.hash(state);
+            });
+        let combine_key =
+            self.kernel_cache_key_with_dispatch(combine_variant, None, combine_dispatch, &inputs);
+        let combine = kernel_backend::dynamic_kernel_from_ir(
+            device.kernel_cache(),
+            format!("{name}_split_combine"),
+            combine_key,
+            || Some(combine_ir),
+            [output.buffer().clone()],
+            combine_dispatch,
+        )?;
+
+        Some(kernel_backend::DirectKernel::sequence(
+            name,
+            vec![partials, combine],
+        ))
+    }
 }
 
 struct HardwareMatmulVariant;
+struct SplitKMatmulVariant;
 
 impl Operation for MatMulOperation {
     fn hash_kernel_fields(&self, state: &mut FxHasher) {
@@ -518,19 +753,29 @@ impl Operation for MatMulOperation {
         let datatype = self.post_element_wise.out_datatype();
         // The coop kernel stores whole tiles: pad the backing to tile
         // multiples and view the logical shape over it (consumers never
-        // read the pad region). Shapes that already divide the tile — and
-        // anything bound for the generic path — allocate exactly.
+        // read the pad region). Split-K shapes over-allocate one extra
+        // padded slice per split for the partials scratch (slice 0 is the
+        // output; the combine kernel folds slices 1..=splits into it).
+        // Shapes that already divide the tile — and anything bound for the
+        // generic path — allocate exactly.
         let (m, n) = (self.a.rows(), self.b.cols());
         let padded = self.coop_tile(device).and_then(|tile| {
             let m_padded = m.div_ceil(tile.bm as usize) * tile.bm as usize;
             let n_padded = n.div_ceil(tile.bn as usize) * tile.bn as usize;
-            (m_padded != m || n_padded != n).then_some((m_padded, n_padded))
+            let slices = self
+                .split_k_factor(&tile)
+                .map(|splits| splits as usize + 1)
+                .unwrap_or(1);
+            (slices > 1 || m_padded != m || n_padded != n).then_some((m_padded, n_padded, slices))
         });
         let output_tensor = match padded {
-            Some((m_padded, n_padded)) => {
+            Some((m_padded, n_padded, slices)) => {
                 let batch: usize = self.a.batch_shape().iter().product();
-                let backing =
-                    TensorData::new_for_shape(device, &[batch, m_padded, n_padded], datatype);
+                let backing = TensorData::new_for_shape(
+                    device,
+                    &[slices * batch, m_padded, n_padded],
+                    datatype,
+                );
                 TensorData::new_from_parts(
                     device,
                     backing.buffer().clone(),
