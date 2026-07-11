@@ -8,33 +8,33 @@ use super::*;
 impl<const R: usize> Tensor<R> {
     pub fn reshape<const OUT: usize>(&self, shape: [usize; OUT]) -> Tensor<OUT> {
         let input_shape = self.shape();
-        let value = self.value.reshape(shape).to_concrete();
+        let value = self.value.reshape(shape).into_concrete();
         let input_id = self.handle.id;
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = downcast_tensor::<OUT>(&*gradient, "reshape")?;
             Ok(vec![BackwardTarget {
                 node: input_id,
-                gradient: Box::new(gradient.reshape(input_shape).to_concrete()),
+                gradient: Box::new(gradient.reshape(input_shape).into_concrete()),
             }])
         });
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn transpose(&self, dim0: usize, dim1: usize) -> Self {
-        let value = self.value.transpose(dim0, dim1).to_concrete();
+        let value = self.value.transpose(dim0, dim1).into_concrete();
         let input_id = self.handle.id;
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = downcast_tensor::<R>(&*gradient, "transpose")?;
             Ok(vec![BackwardTarget {
                 node: input_id,
-                gradient: Box::new(gradient.transpose(dim0, dim1).to_concrete()),
+                gradient: Box::new(gradient.transpose(dim0, dim1).into_concrete()),
             }])
         });
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn permute(&self, axes: [usize; R]) -> Self {
-        let value = self.value.permute(axes).to_concrete();
+        let value = self.value.permute(axes).into_concrete();
         let input_id = self.handle.id;
         let mut inverse = [0usize; R];
         for (index, axis) in axes.iter().copied().enumerate() {
@@ -44,7 +44,7 @@ impl<const R: usize> Tensor<R> {
             let gradient = downcast_tensor::<R>(&*gradient, "permute")?;
             Ok(vec![BackwardTarget {
                 node: input_id,
-                gradient: Box::new(gradient.permute(inverse).to_concrete()),
+                gradient: Box::new(gradient.permute(inverse).into_concrete()),
             }])
         });
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
@@ -52,14 +52,14 @@ impl<const R: usize> Tensor<R> {
 
     pub fn slice(&self, slices: [Range<usize>; R]) -> Self {
         let input_shape = self.shape();
-        let value = self.value.slice(slices.clone()).to_concrete();
+        let value = self.value.slice(slices.clone()).into_concrete();
         let input_id = self.handle.id;
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = downcast_tensor::<R>(&*gradient, "slice")?;
             let zeros = RawTensor::zeros(&gradient.device(), input_shape);
             Ok(vec![BackwardTarget {
                 node: input_id,
-                gradient: Box::new(zeros.slice_assign(slices.clone(), &gradient).to_concrete()),
+                gradient: Box::new(zeros.slice_assign(slices.clone(), &gradient).into_concrete()),
             }])
         });
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
@@ -67,7 +67,7 @@ impl<const R: usize> Tensor<R> {
 
     pub fn broadcast_as<const OUT: usize>(&self, shape: [usize; OUT]) -> Tensor<OUT> {
         let input_shape = self.shape();
-        let value = self.value.broadcast_as(shape).to_concrete();
+        let value = self.value.broadcast_as(shape).into_concrete();
         let input_id = self.handle.id;
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = downcast_tensor::<OUT>(&*gradient, "broadcast_as")?;
@@ -151,12 +151,12 @@ impl<const R: usize> Tensor<R> {
 
     pub fn repeat(&self, repeats: [usize; R]) -> Self {
         let input_shape = self.shape();
-        let value = self.value.repeat(repeats).to_concrete();
+        let value = self.value.repeat(repeats).into_concrete();
         let input_id = self.handle.id;
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = downcast_tensor::<R>(&*gradient, "repeat")?;
             let total: usize = gradient.shape().iter().product();
-            let mut flat = gradient.reshape([total]).to_concrete();
+            let mut flat = gradient.reshape([total]).into_concrete();
             for axis in (0..R).rev() {
                 if repeats[axis] == 1 {
                     continue;
@@ -167,14 +167,14 @@ impl<const R: usize> Tensor<R> {
                 let after: usize = input_shape[axis + 1..].iter().product();
                 flat = flat
                     .reshape([before, repeats[axis], input_shape[axis], after])
-                    .to_concrete()
+                    .into_concrete()
                     .sum::<3>(1)
                     .reshape([before * input_shape[axis] * after])
-                    .to_concrete();
+                    .into_concrete();
             }
             Ok(vec![BackwardTarget {
                 node: input_id,
-                gradient: Box::new(flat.reshape(input_shape).to_concrete()),
+                gradient: Box::new(flat.reshape(input_shape).into_concrete()),
             }])
         });
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
@@ -182,20 +182,20 @@ impl<const R: usize> Tensor<R> {
 
     pub fn resize(&self, new_shape: [usize; R]) -> Self {
         let input_shape = self.shape();
-        let value = self.value.resize(new_shape).to_concrete();
+        let value = self.value.resize(new_shape).into_concrete();
         let input_id = self.handle.id;
         let copy_shape = std::array::from_fn(|axis| input_shape[axis].min(new_shape[axis]));
         let copy_slices = copy_shape.map(|size| 0..size);
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = downcast_tensor::<R>(&*gradient, "resize")?;
-            let patch = gradient.slice(copy_slices.clone()).to_concrete();
+            let patch = gradient.slice(copy_slices.clone()).into_concrete();
             let zeros = RawTensor::zeros(&gradient.device(), input_shape);
             Ok(vec![BackwardTarget {
                 node: input_id,
                 gradient: Box::new(
                     zeros
                         .slice_assign(copy_slices.clone(), &patch)
-                        .to_concrete(),
+                        .into_concrete(),
                 ),
             }])
         });
@@ -204,7 +204,7 @@ impl<const R: usize> Tensor<R> {
 
     pub fn restride<const OUT: usize>(&self, specs: [StrideSpec; OUT]) -> Tensor<OUT> {
         let input_shape = self.shape();
-        let value = self.value.restride(specs).to_concrete();
+        let value = self.value.restride(specs).into_concrete();
         let input_id = self.handle.id;
         let output_shape: [usize; OUT] = specs.map(|spec| spec.size);
         let backward: BackwardRule = Arc::new(move |gradient| {
@@ -229,7 +229,7 @@ impl<const R: usize> Tensor<R> {
     pub fn restride_layout<const OUT: usize>(&self, new_layout: Layout) -> Tensor<OUT> {
         assert_eq!(new_layout.rank(), OUT, "restride_layout rank mismatch");
         let input_shape = self.shape();
-        let value = self.value.restride_layout(new_layout.clone()).to_concrete();
+        let value = self.value.restride_layout(new_layout.clone()).into_concrete();
         let input_id = self.handle.id;
         let output_shape: [usize; OUT] = std::array::from_fn(|axis| new_layout.shape()[axis]);
         let input_strides = Layout::continuous_strides(&input_shape);
@@ -386,7 +386,7 @@ impl<const R: usize> Tensor<R> {
         let output = self
             .value
             .slice_assign(slices.clone(), &value.value)
-            .to_concrete();
+            .into_concrete();
         let input_id = self.handle.id;
         let value_id = value.handle.id;
         let slice_shape = slices
@@ -398,11 +398,11 @@ impl<const R: usize> Tensor<R> {
             Ok(vec![
                 BackwardTarget {
                     node: input_id,
-                    gradient: Box::new(gradient.slice_assign(slices.clone(), &zeros).to_concrete()),
+                    gradient: Box::new(gradient.slice_assign(slices.clone(), &zeros).into_concrete()),
                 },
                 BackwardTarget {
                     node: value_id,
-                    gradient: Box::new(gradient.slice(slices.clone()).to_concrete()),
+                    gradient: Box::new(gradient.slice(slices.clone()).into_concrete()),
                 },
             ])
         });
@@ -438,7 +438,7 @@ impl<const R: usize> Tensor<R> {
                     input_shape,
                     "stack requires matching shapes"
                 );
-                tensor.value.unsqueeze_dims::<1, OUT>([dim]).to_concrete()
+                tensor.value.unsqueeze_dims::<1, OUT>([dim]).into_concrete()
             })
             .collect::<Vec<_>>();
         let value = RawTensor::cat(raw, dim);
@@ -458,7 +458,7 @@ impl<const R: usize> Tensor<R> {
                         0..gradient.shape()[axis]
                     }
                 });
-                let grad = gradient.slice(slices).reshape(input_shape).to_concrete();
+                let grad = gradient.slice(slices).reshape(input_shape).into_concrete();
                 targets.push(BackwardTarget {
                     node: parent_id,
                     gradient: Box::new(grad),
@@ -513,7 +513,7 @@ impl<const R: usize> Tensor<R> {
                 });
                 targets.push(BackwardTarget {
                     node: parent_id,
-                    gradient: Box::new(gradient.slice(ranges).to_concrete()),
+                    gradient: Box::new(gradient.slice(ranges).into_concrete()),
                 });
             }
             Ok(targets)
@@ -688,12 +688,12 @@ fn reduce_restride_gradient<const IN: usize, const OUT: usize>(
             .as_slice()
             .try_into()
             .expect("every output axis appears in the permutation once");
-        gradient.permute(permutation).to_concrete()
+        gradient.permute(permutation).into_concrete()
     };
 
     let mut flat = canonical
         .reshape([output_shape.iter().product()])
-        .to_concrete();
+        .into_concrete();
     let mut after = 1usize;
     for dim in (0..IN).rev() {
         let size = input_shape[dim];
@@ -713,7 +713,7 @@ fn reduce_restride_gradient<const IN: usize, const OUT: usize>(
         }
         after *= size;
     }
-    Some(flat.reshape(input_shape).to_concrete())
+    Some(flat.reshape(input_shape).into_concrete())
 }
 
 /// Scatter-add one folded axis of the gradient with padded views and a
@@ -734,17 +734,17 @@ fn fold_restride_axis(
     let fold_len = (positions - 1) * step + window;
     let block = flat
         .reshape([before, positions, window, after])
-        .to_concrete();
+        .into_concrete();
     let folded: RawTensor<3, f32> = if positions == 1 {
-        block.reshape([before, window, after]).to_concrete()
+        block.reshape([before, window, after]).into_concrete()
     } else if step >= window {
         // Injective: interleave the windows with zeros and trim the overhang.
         block
             .pad_with_zeros(2, 0, step - window)
             .reshape([before, positions * step, after])
-            .to_concrete()
+            .into_concrete()
             .narrow(1usize, 0, fold_len)
-            .to_concrete()
+            .into_concrete()
     } else {
         // Overlapping: reverse the window axis (`u = window - 1 - w`),
         // right-pad each window row to `step * window` elements and left-pad
@@ -758,7 +758,7 @@ fn fold_restride_axis(
             .index_select(2, &indices)
             .pad_with_zeros(2, 0, (step - 1) * window)
             .reshape([before, positions * step * window, after])
-            .to_concrete()
+            .into_concrete()
             .pad_with_zeros(1, (window - 1) * window, window * (window - step))
             .restride([
                 StrideSpec::dim(0, before),
@@ -766,13 +766,13 @@ fn fold_restride_axis(
                 StrideSpec::dim_with(1, window, window + 1),
                 StrideSpec::dim(2, after),
             ])
-            .to_concrete()
+            .into_concrete()
             .sum::<3>(2)
     };
     folded
         .pad_with_zeros(1, offset, size - offset - fold_len)
         .reshape([before * size * after])
-        .to_concrete()
+        .into_concrete()
 }
 
 /// Express a layout over a contiguous input as per-output-axis stride specs
@@ -830,12 +830,12 @@ fn scatter_restride_gradient<const IN: usize, const OUT: usize>(
         let input_index = input_index(output_index);
         let output_slices: [Range<usize>; OUT] =
             std::array::from_fn(|axis| output_index[axis]..output_index[axis] + 1);
-        let patch = gradient.slice(output_slices).reshape([1; IN]).to_concrete();
+        let patch = gradient.slice(output_slices).reshape([1; IN]).into_concrete();
         let target: [Range<usize>; IN] =
             std::array::from_fn(|axis| input_index[axis]..input_index[axis] + 1);
-        let current = input_gradient.slice(target.clone()).to_concrete();
-        let updated = (current + patch).to_concrete();
-        input_gradient = input_gradient.slice_assign(target, &updated).to_concrete();
+        let current = input_gradient.slice(target.clone()).into_concrete();
+        let updated = (current + patch).into_concrete();
+        input_gradient = input_gradient.slice_assign(target, &updated).into_concrete();
     });
     input_gradient
 }
@@ -862,14 +862,14 @@ fn reduce_broadcast_gradient<const IN: usize, const OUT: usize>(
         if IN == OUT {
             return Ok(Box::new(gradient));
         }
-        return Ok(Box::new(gradient.reshape(input_shape).to_concrete()));
+        return Ok(Box::new(gradient.reshape(input_shape).into_concrete()));
     }
 
     // Sum the axes the forward broadcast expanded, one compiled reduce per axis.
     let mut remaining = output_shape;
     let mut flat = gradient
         .reshape([output_shape.iter().product()])
-        .to_concrete();
+        .into_concrete();
     for axis in 0..OUT {
         if aligned_input_shape[axis] != 1 || remaining[axis] == 1 {
             continue;
@@ -878,11 +878,11 @@ fn reduce_broadcast_gradient<const IN: usize, const OUT: usize>(
         let after: usize = remaining[axis + 1..].iter().product();
         flat = flat
             .reshape([before, remaining[axis], after])
-            .to_concrete()
+            .into_concrete()
             .sum::<2>(1)
             .reshape([before * after])
-            .to_concrete();
+            .into_concrete();
         remaining[axis] = 1;
     }
-    Ok(Box::new(flat.reshape(input_shape).to_concrete()))
+    Ok(Box::new(flat.reshape(input_shape).into_concrete()))
 }

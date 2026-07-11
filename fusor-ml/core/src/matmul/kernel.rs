@@ -753,9 +753,9 @@ struct MergedMatmulVariant;
 /// merge into one dispatch only when every field matches, which makes the
 /// guarded segment bodies identical up to their storage bindings (same
 /// logical shape, tile geometry, workgroup size, split factor, and element
-/// type). Only dense-large-graph matmuls (`dense_codegen`) that will take
-/// the cooperative-matrix route produce a key, so quantized decode graphs
-/// and small graphs never reach the merged lowering.
+/// type and codegen profile). Only matmuls that will take the
+/// cooperative-matrix route produce a key; the resolver keeps quantized
+/// graphs out of the horizontal merger.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct MatmulMergeKey {
     m: u32,
@@ -765,6 +765,7 @@ pub(crate) struct MatmulMergeKey {
     tile: CoopTile,
     splits: Option<u32>,
     datatype: DataTypeEnum,
+    dense_codegen: bool,
 }
 
 impl MatmulMergeKey {
@@ -777,10 +778,10 @@ impl MatmulMergeKey {
 impl MatMulOperation {
     /// See [`MatmulMergeKey`]. `None` = not horizontally mergeable.
     pub(crate) fn merge_profile(&self, device: &Device) -> Option<MatmulMergeKey> {
-        if !self.dense_codegen {
+        let tile = self.coop_tile(device)?;
+        if !tile.supports_horizontal_merge() {
             return None;
         }
-        let tile = self.coop_tile(device)?;
         let m: u32 = self.a.rows().try_into().ok()?;
         let k: u32 = self.a.cols().try_into().ok()?;
         let n: u32 = self.b.cols().try_into().ok()?;
@@ -797,6 +798,7 @@ impl MatMulOperation {
             tile,
             splits: self.split_k_factor(&tile),
             datatype: self.datatype,
+            dense_codegen: self.dense_codegen,
         })
     }
 }
@@ -873,10 +875,11 @@ pub(crate) fn build_merged_matmul_kernel(
         decline!("profile_mismatch");
     }
     let splits = first.split_k_factor(&tile);
-    if segments
-        .iter()
-        .any(|op| op.split_k_factor(&tile) != splits || op.datatype != first.datatype)
-    {
+    if segments.iter().any(|op| {
+        op.split_k_factor(&tile) != splits
+            || op.datatype != first.datatype
+            || op.dense_codegen != first.dense_codegen
+    }) {
         decline!("splits_mismatch");
     }
 
@@ -1094,6 +1097,7 @@ impl Operation for MatMulOperation {
         self.pre_element_wise.hash(state);
         self.post_element_wise.hash(state);
         self.parameters.hash(state);
+        self.dense_codegen.hash(state);
     }
 
     fn workgroup_shape_constraints(

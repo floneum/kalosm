@@ -1,5 +1,8 @@
 use crate::{
     Layout, Tensor,
+    mir::kernel_backend::standard_sampler::{
+        sample_categorical_logits_data_with_encoder, supports_unfiltered_categorical,
+    },
     tensor::{DataTypeEnum, LazyTensorData, TensorData},
 };
 use web_time::Instant;
@@ -86,6 +89,11 @@ struct SampleAttemptDims {
     input_len: usize,
 }
 
+struct EncodedSampleAttempt {
+    output: TensorData,
+    debug_top_k: Option<(TensorData, TensorData)>,
+}
+
 fn initial_sampler_candidate_count(top_k: usize, chunks: usize) -> usize {
     top_k
         .div_ceil(chunks)
@@ -115,10 +123,9 @@ fn sampler_trace_enabled() -> bool {
         || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some()
 }
 
-/// Encode one full sampling attempt — processed chunk top-k, merge,
-/// optional exactness proof, and the sampler kernel — into `encoder`.
-/// Returns the `[status, token]` output along with the sorted top-k
-/// ids/values (kept for `FUSOR_DEBUG_SAMPLER` dumps).
+/// Encode one full sampling attempt into `encoder`. Complete, unfiltered
+/// Standard requests over one workgroup take a direct categorical kernel;
+/// every other request retains the processed chunk-top-k pipeline.
 ///
 /// This runs inside the resolver tail while the graph lock is held, so it
 /// must only touch raw buffers — no compute-graph access.
@@ -129,7 +136,20 @@ fn encode_sample_attempt(
     request: &mut GpuSamplerRequest<'_>,
     dims: SampleAttemptDims,
     encoder: &mut CommandEncoder,
-) -> Option<(TensorData, TensorData, TensorData)> {
+) -> Option<EncodedSampleAttempt> {
+    if previous_tokens.is_empty()
+        && previous_gpu_token.is_none()
+        && let GpuSamplerRequest::Standard { params } = request
+        && supports_unfiltered_categorical(dims.input_len, *params)
+        && let Some(output) =
+            sample_categorical_logits_data_with_encoder(logits, *params, Some(encoder))
+    {
+        return Some(EncodedSampleAttempt {
+            output,
+            debug_top_k: None,
+        });
+    }
+
     let output_per_chunk = sampler_output_per_chunk(dims.candidate_count);
     let (chunk_ids, chunk_values) =
         chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder(
@@ -171,7 +191,10 @@ fn encode_sample_attempt(
     };
 
     let output = request.encode_sample(&ids, &values, exactness_flag.as_ref(), encoder)?;
-    Some((output, ids, values))
+    Some(EncodedSampleAttempt {
+        output,
+        debug_top_k: Some((ids, values)),
+    })
 }
 
 fn encode_token_download(
@@ -268,7 +291,7 @@ pub(crate) async fn sample_token_to_host(
             },
             encoder,
         )?;
-        let download = encode_token_download(&attempt.0, encoder, "sampled token download");
+        let download = encode_token_download(&attempt.output, encoder, "sampled token download");
         Some((attempt, download))
     });
     let device = logits_data.device().clone();
@@ -276,9 +299,10 @@ pub(crate) async fn sample_token_to_host(
     let mut attempt_index = 0usize;
     loop {
         attempt_index += 1;
-        let Some(((_, ids, values), download)) = attempt else {
+        let Some((attempt_data, download)) = attempt else {
             return Ok(None);
         };
+        let debug_top_k = attempt_data.debug_top_k;
         let (status, token) = read_sample_result(&device, download, trace).await?;
         match status {
             GPU_SAMPLE_STATUS_SAMPLED => {
@@ -302,7 +326,7 @@ pub(crate) async fn sample_token_to_host(
                         "sampler_trace invalid attempt={attempt_index} top_k={top_k} chunks={chunks} candidate_count={candidate_count} status={status}"
                     );
                 }
-                if debug_dump {
+                if debug_dump && let Some((ids, values)) = debug_top_k {
                     debug_dump_invalid_sample(&logits_data, &ids, &values, previous_tokens).await;
                 }
                 return Ok(None);
@@ -336,7 +360,7 @@ pub(crate) async fn sample_token_to_host(
         )
         .map(|attempt| {
             let download =
-                encode_token_download(&attempt.0, &mut encoder, "sampled token download");
+                encode_token_download(&attempt.output, &mut encoder, "sampled token download");
             (attempt, download)
         });
         device.wgpu_queue().submit(Some(encoder.finish()));
@@ -386,8 +410,9 @@ pub(crate) fn sample_token_pending(
             dims,
             encoder,
         )?;
-        let download = encode_token_download(&attempt.0, encoder, "pending sampled token download");
-        Some((attempt.0, download))
+        let download =
+            encode_token_download(&attempt.output, encoder, "pending sampled token download");
+        Some((attempt.output, download))
     });
     let (output, download) = tail?;
 

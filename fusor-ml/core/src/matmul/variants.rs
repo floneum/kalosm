@@ -165,6 +165,14 @@ impl CoopTile {
         }
     }
 
+    /// The merged kernel shares one double-buffered workgroup-tile pair
+    /// across guarded segments. The 256x256 standalone profile is deliberately
+    /// single-buffered because a second pair would exceed the workgroup-memory
+    /// budget, so it must remain a standalone dispatch.
+    pub(super) const fn supports_horizontal_merge(self) -> bool {
+        !matches!((self.bm, self.bn, self.bk), (256, 256, 16))
+    }
+
     fn workgroup_size_supported(self, max_workgroup_size_x: u32, max_subgroup_size: u32) -> bool {
         self.subgroup_groups()
             .checked_mul(max_subgroup_size)

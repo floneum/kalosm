@@ -8,7 +8,7 @@ use tabbycat::Graph;
 use wgpu::COPY_BUFFER_ALIGNMENT;
 
 use crate::{
-    Device, ReduceFunction, ReduceOperation,
+    Device, Layout, ReduceFunction, ReduceOperation,
     compute_graph::NodeIndex,
     nary_wise::{ElementwiseOperation, NaryExpr, NaryFunction},
     quantized::QMatrix,
@@ -102,7 +102,9 @@ impl Tensor {
             shape.iter().product::<usize>(),
             "Data length must match shape"
         );
-        Tensor::new_inner(device, data.iter(), shape)
+        Self::from_parts(LazyTensorData::new(TensorData::new_from_slice(
+            device, data, shape,
+        )))
     }
 
     /// Allocate a concrete tensor backing for `shape` without uploading
@@ -150,28 +152,55 @@ impl Tensor {
     pub(crate) async fn as_slice_from_tensor_data<const R: usize, D: DataType>(
         tensor: &TensorData,
     ) -> Result<TensorSlice<R, D, MappedBuffer>, wgpu::BufferAsyncError> {
+        let device = tensor.device.wgpu_device();
+        let queue = tensor.device.wgpu_queue();
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let download = Self::enqueue_download::<R, D>(tensor, &mut encoder);
+        queue.submit(Some(encoder.finish()));
+        Self::map_download(tensor, download).await
+    }
+
+    fn enqueue_download<const R: usize, D: DataType>(
+        tensor: &TensorData,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> (wgpu::Buffer, Layout) {
         assert_eq!(tensor.datatype(), D::DATA_TYPE);
         assert_eq!(tensor.layout().shape().len(), R);
         let buffer = tensor.buffer();
         let device = tensor.device.wgpu_device();
-        let queue = tensor.device.wgpu_queue();
-        let size = buffer.size();
-
-        // Create a staging buffer for reading
+        let layout = tensor.layout();
+        let element_size = tensor.datatype().element_size() as u64;
+        let source_offset = layout.offset() as u64 * element_size;
+        let compact_size = padded_tensor_size(layout.num_elements() as u64 * element_size);
+        let dense_strides = Layout::continuous_strides(layout.shape());
+        let can_copy_compact = layout.strides() == dense_strides.as_ref()
+            && source_offset.is_multiple_of(COPY_BUFFER_ALIGNMENT)
+            && source_offset + compact_size <= buffer.size();
+        let (source_offset, size, download_layout) = if can_copy_compact {
+            (
+                source_offset,
+                compact_size,
+                Layout::contiguous(layout.shape()),
+            )
+        } else {
+            (0, buffer.size(), layout.clone())
+        };
         let download = device.create_buffer(&wgpu::BufferDescriptor {
             size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
             label: None,
         });
+        encoder.copy_buffer_to_buffer(buffer, source_offset, &download, 0, size);
+        (download, download_layout)
+    }
 
-        // Copy data to staging buffer
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.copy_buffer_to_buffer(buffer, 0, &download, 0, size);
-        queue.submit(Some(encoder.finish()));
-
-        // Map the staging buffer using map_async which correctly uses WasmNotSend
+    async fn map_download<const R: usize, D: DataType>(
+        tensor: &TensorData,
+        download: (wgpu::Buffer, Layout),
+    ) -> Result<TensorSlice<R, D, MappedBuffer>, wgpu::BufferAsyncError> {
+        let (download, layout) = download;
         let (sender, receiver) = futures_channel::oneshot::channel();
         download
             .slice(..)
@@ -185,10 +214,7 @@ impl Tensor {
 
         // Get the mapped view
         let view = download.slice(..).get_mapped_range();
-        Ok(TensorSlice::new(
-            MappedBuffer { view },
-            tensor.layout().clone(),
-        ))
+        Ok(TensorSlice::new(MappedBuffer { view }, layout))
     }
 
     /// Synchronously dispatch and wait for GPU completion using device.poll().
@@ -262,12 +288,14 @@ impl Tensor {
         self.assert_datatype::<D>();
         #[cfg(not(target_arch = "wasm32"))]
         let start_time = std::time::Instant::now();
-        let (tensor, _) = self.data.materialize();
+        let (tensor, _, download) = self
+            .data
+            .materialize_with_tail(Self::enqueue_download::<R, D>);
         #[cfg(not(target_arch = "wasm32"))]
         tracing::trace!("Materialized tensor in {:?}", start_time.elapsed());
         #[cfg(not(target_arch = "wasm32"))]
         let start_time = std::time::Instant::now();
-        let out = Self::as_slice_from_tensor_data(&tensor).await;
+        let out = Self::map_download(&tensor, download).await;
         #[cfg(not(target_arch = "wasm32"))]
         tracing::trace!("Downloaded tensor in {:?}", start_time.elapsed());
         out

@@ -4,14 +4,28 @@ use crate::{DataTypeEnum, Device, Tensor, TensorData, quantized::QMatrix};
 use fusor_gguf::{BlockQ4_0, GgmlType};
 
 use crate::mir::kernel_backend::sampling_topk::chunk_top_k_pair_data_with_processors_with_encoder;
+use crate::mir::kernel_backend::standard_sampler::{
+    sample_categorical_logits_data_with_encoder, supports_unfiltered_categorical,
+};
 
 use super::{
-    GPU_SAMPLE_STATUS_RETRY_NEEDED, GPU_SAMPLE_STATUS_SAMPLED, GpuMirostat2Sampler,
-    GpuMirostat2SamplerParams, GpuSamplerRequest, GpuStandardSamplerParams,
+    GPU_SAMPLE_STATUS_INVALID, GPU_SAMPLE_STATUS_RETRY_NEEDED, GPU_SAMPLE_STATUS_SAMPLED,
+    GpuMirostat2Sampler, GpuMirostat2SamplerParams, GpuSamplerRequest, GpuStandardSamplerParams,
     mirostat::sample_from_sorted_top_k_data_with_encoder, sample_token_to_host,
     standard_sampler::sample_from_sorted_top_k_data_with_encoder as sample_standard_from_sorted_top_k_data_with_encoder,
     topk::ProcessorSettings,
 };
+
+fn unfiltered_params(input_len: usize, temperature: f32, random: f32) -> GpuStandardSamplerParams {
+    GpuStandardSamplerParams {
+        top_k: input_len,
+        temperature,
+        repetition_penalty: 1.0,
+        top_p: 1.0,
+        min_p: 0.0,
+        random,
+    }
+}
 
 #[test]
 fn top_k_pairs_match_cpu_sorted_order() {
@@ -132,6 +146,176 @@ fn processed_chunk_top_k_applies_temperature_and_repetition_penalty() {
             .zip(logits.as_slice().iter().copied())
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    });
+}
+
+#[test]
+fn unfiltered_categorical_fast_path_eligibility_is_strict() {
+    let eligible = unfiltered_params(65, 0.8, 0.25);
+    assert!(supports_unfiltered_categorical(65, eligible));
+
+    let mut filtered = eligible;
+    filtered.top_k = 64;
+    assert!(!supports_unfiltered_categorical(65, filtered));
+    filtered = eligible;
+    filtered.top_p = 0.99;
+    assert!(!supports_unfiltered_categorical(65, filtered));
+    filtered = eligible;
+    filtered.min_p = 0.01;
+    assert!(!supports_unfiltered_categorical(65, filtered));
+    filtered = eligible;
+    filtered.temperature = f32::NAN;
+    assert!(!supports_unfiltered_categorical(65, filtered));
+    filtered = eligible;
+    filtered.random = f32::NAN;
+    assert!(!supports_unfiltered_categorical(65, filtered));
+    assert!(!supports_unfiltered_categorical(0, eligible));
+    assert!(!supports_unfiltered_categorical(257, eligible));
+}
+
+#[test]
+fn backend_unfiltered_categorical_matches_generic_boundaries() {
+    pollster::block_on(async {
+        let device = Device::new().await.unwrap().with_poisoned_allocations();
+        let logits = vec![0.0; 65];
+        let data = TensorData::new_from_buffer(
+            &device,
+            device.create_buffer_init(
+                bytemuck::cast_slice(&logits),
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            ),
+            &[logits.len()],
+            DataTypeEnum::F32,
+        );
+        let generic_logits = Tensor::new(&device, logits.as_slice());
+        let first_boundary = 1.0f32 / logits.len() as f32;
+        let after_first_boundary = f32::from_bits(first_boundary.to_bits() + 1);
+        let last_boundary = 64.0f32 / logits.len() as f32;
+        for random in [
+            0.0,
+            first_boundary,
+            after_first_boundary,
+            0.5,
+            last_boundary,
+            0.999_999,
+        ] {
+            let params = unfiltered_params(logits.len(), 0.8, random);
+            let expected = generic_logits
+                .sample_standard_token(&[u32::MAX], params)
+                .await
+                .unwrap();
+            let output = sample_categorical_logits_data_with_encoder(&data, params, None).unwrap();
+            let result = Tensor::from(output).as_slice::<1, u32>().await.unwrap();
+            assert_eq!(result.as_slice()[0], GPU_SAMPLE_STATUS_SAMPLED);
+            assert_eq!(
+                result.as_slice()[1],
+                expected,
+                "categorical boundary mismatch for random={random}"
+            );
+            if random == 0.0 {
+                assert_eq!(expected, 64, "ties must prefer the larger token id");
+            }
+        }
+    });
+}
+
+#[test]
+fn unfiltered_categorical_matches_generic_seeded_order() {
+    pollster::block_on(async {
+        let device = Device::new().await.unwrap().with_poisoned_allocations();
+        let logits = [0.0, 2.0, 2.0, -1.0, 2.0, f32::NAN, 1.0];
+        let tensor = Tensor::new(&device, logits.as_slice());
+
+        for random in [0.0, 0.2, 0.5, 0.9, 0.999_999] {
+            let params = unfiltered_params(logits.len(), 0.8, random);
+            let fast = tensor.sample_standard_token(&[], params).await.unwrap();
+            // A non-matching previous token forces the generic processed-top-k
+            // route without changing any processed logits.
+            let generic = tensor
+                .sample_standard_token(&[u32::MAX], params)
+                .await
+                .unwrap();
+            assert_eq!(fast, generic, "seeded sampler mismatch for random={random}");
+            if random == 0.0 {
+                assert_eq!(fast, 4, "ties must prefer the larger token id");
+            }
+        }
+    });
+}
+
+#[test]
+fn backend_unfiltered_categorical_handles_temperature_and_invalid_logits() {
+    pollster::block_on(async {
+        let device = Device::new().await.unwrap();
+        let logits = [f32::NAN, -3.0, 0.25, 2.0, f32::INFINITY, -1.0, 1.5];
+        let data = TensorData::new_from_buffer(
+            &device,
+            device.create_buffer_init(
+                bytemuck::cast_slice(&logits),
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            ),
+            &[logits.len()],
+            DataTypeEnum::F32,
+        );
+        let generic_logits = Tensor::new(&device, logits.as_slice());
+        for (temperature, random) in [(0.5, 0.2), (0.5, 0.8), (2.0, 0.6)] {
+            let params = unfiltered_params(logits.len(), temperature, random);
+            let expected = generic_logits
+                .sample_standard_token(&[u32::MAX], params)
+                .await
+                .unwrap();
+            let output = sample_categorical_logits_data_with_encoder(&data, params, None).unwrap();
+            let result = Tensor::from(output).as_slice::<1, u32>().await.unwrap();
+            assert_eq!(
+                result.as_slice(),
+                &[GPU_SAMPLE_STATUS_SAMPLED, expected],
+                "categorical mismatch for temperature={temperature} random={random}"
+            );
+        }
+
+        let invalid_logits = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        let invalid = TensorData::new_from_buffer(
+            &device,
+            device.create_buffer_init(
+                bytemuck::cast_slice(&invalid_logits),
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            ),
+            &[invalid_logits.len()],
+            DataTypeEnum::F32,
+        );
+        let output = sample_categorical_logits_data_with_encoder(
+            &invalid,
+            unfiltered_params(invalid_logits.len(), 1.0, 0.5),
+            None,
+        )
+        .unwrap();
+        let result = Tensor::from(output).as_slice::<1, u32>().await.unwrap();
+        assert_eq!(result.as_slice(), &[GPU_SAMPLE_STATUS_INVALID, 0]);
+    });
+}
+
+#[test]
+fn pending_unfiltered_categorical_exposes_the_sampled_gpu_token() {
+    pollster::block_on(async {
+        let device = Device::new().await.unwrap().with_poisoned_allocations();
+        let logits = vec![0.0; 65];
+        let params = unfiltered_params(logits.len(), 0.8, 0.0);
+        let expected = 64;
+        let tensor = Tensor::new(&device, logits.as_slice()).sin();
+
+        let pending = tensor
+            .sample_standard_token_pending(&[], None, params)
+            .expect("full-vocabulary categorical sampling should stay pending");
+        let dependent = pending.token_tensor() + 7u32;
+        let dependent = dependent.as_slice::<1, u32>().await.unwrap();
+        assert_eq!(dependent.as_slice(), &[expected + 7]);
+        assert_eq!(pending.read_token().await.unwrap(), Some(expected));
     });
 }
 

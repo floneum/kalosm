@@ -369,7 +369,7 @@ impl<const R: usize> Tensor<R> {
             let gradient = downcast_tensor::<R>(&*gradient, "unary")?;
             Ok(vec![BackwardTarget {
                 node: input_id,
-                gradient: Box::new(backward(gradient, output.clone()).to_concrete()),
+                gradient: Box::new(backward(gradient, output.clone()).into_concrete()),
             }])
         });
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
@@ -400,11 +400,11 @@ impl<const R: usize> Tensor<R> {
             Ok(vec![
                 BackwardTarget {
                     node: lhs_id,
-                    gradient: Box::new(gradients[0].clone().to_concrete()),
+                    gradient: Box::new(gradients[0].clone().into_concrete()),
                 },
                 BackwardTarget {
                     node: rhs_id,
-                    gradient: Box::new(gradients[1].clone().to_concrete()),
+                    gradient: Box::new(gradients[1].clone().into_concrete()),
                 },
             ])
         });
@@ -783,7 +783,7 @@ impl<const R: usize> AnyTensorValue for RawTensor<R, f32> {
             .as_any()
             .downcast_ref::<RawTensor<R, f32>>()
             .ok_or_else(|| Error::msg("gradient rank mismatch while accumulating"))?;
-        Ok(Box::new((self.clone() + other.clone()).to_concrete()))
+        Ok(Box::new((self.clone() + other.clone()).into_concrete()))
     }
 }
 

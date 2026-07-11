@@ -18,6 +18,15 @@ struct StandardSamplerParams {
 }
 
 struct StandardSamplerSortedTopKKernelVariant;
+struct UnfilteredCategoricalSamplerKernelVariant;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct CategoricalSamplerParams {
+    random: f32,
+    temperature: f32,
+    _padding: [f32; 2],
+}
 
 fn normalized_probability(value: f32, default: f32) -> f32 {
     if value.is_finite() {
@@ -39,6 +48,95 @@ fn standard_sampler_params_data(device: &Device, params: GpuStandardSamplerParam
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
     );
     TensorData::new_from_buffer(device, buffer, &[4], DataTypeEnum::F32)
+}
+
+pub(crate) fn supports_unfiltered_categorical(
+    input_len: usize,
+    params: GpuStandardSamplerParams,
+) -> bool {
+    input_len > 0
+        && input_len <= TOP_K_BLOCK as usize
+        && params.top_k >= input_len
+        && normalized_probability(params.top_p, 1.0) == 1.0
+        && normalized_probability(params.min_p, 0.0) == 0.0
+        && params.temperature.is_finite()
+        && params.random.is_finite()
+}
+
+fn categorical_sampler_params_data(
+    device: &Device,
+    params: GpuStandardSamplerParams,
+) -> TensorData {
+    let params = CategoricalSamplerParams {
+        random: params.random.clamp(0.0, 0.999_999_94),
+        temperature: params.temperature,
+        _padding: [0.0; 2],
+    };
+    let buffer = device.create_buffer_init(
+        bytemuck::bytes_of(&params),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+    );
+    TensorData::new_from_buffer(device, buffer, &[4], DataTypeEnum::F32)
+}
+
+pub(crate) fn sample_categorical_logits_data_with_encoder(
+    logits: &TensorData,
+    params: GpuStandardSamplerParams,
+    encoder: Option<&mut CommandEncoder>,
+) -> Option<TensorData> {
+    if logits.datatype() != DataTypeEnum::F32 || logits.layout().rank() != 1 {
+        return None;
+    }
+    let input_len = logits.layout().shape()[0];
+    if !supports_unfiltered_categorical(input_len, params) {
+        return None;
+    }
+
+    let device = logits.device();
+    let params_data = categorical_sampler_params_data(device, params);
+    let output = TensorData::new_for_shape(device, &[GPU_SAMPLE_RESULT_WORDS], DataTypeEnum::U32);
+    let block = u32::try_from(input_len.next_power_of_two()).ok()?;
+    let meta = row_kernels::CategoricalSamplerMeta {
+        input_len: input_len.try_into().ok()?,
+        input_offset: logits.layout().offset().try_into().ok()?,
+        input_stride: logits.layout().strides()[0].try_into().ok()?,
+        block,
+    };
+    let cache_key = kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
+        kernel_backend::KernelVariantKey::of::<UnfilteredCategoricalSamplerKernelVariant>()
+            .hash(state);
+        input_len.hash(state);
+        block.hash(state);
+        logits.layout().offset().hash(state);
+        logits.layout().shape().hash(state);
+        logits.layout().strides().hash(state);
+    });
+    let kernel = kernel_backend::run_kernel(
+        device.kernel_cache(),
+        "sample_categorical_logits_f32",
+        cache_key,
+        [1, 1, 1],
+        |kb| {
+            row_kernels::categorical_sampler(
+                kb,
+                row_kernels::CategoricalSampler {
+                    logits: logits.as_kernel_tensor_ref(),
+                    params: params_data.as_kernel_tensor_ref(),
+                    output: output.as_kernel_tensor_ref(),
+                    meta,
+                },
+            )
+        },
+    )?;
+
+    kernel_backend::run_direct_kernel(
+        device.kernel_cache(),
+        device.wgpu_queue(),
+        "sample_categorical_logits_f32 encoder",
+        &kernel,
+        encoder,
+    );
+    Some(output)
 }
 
 pub(crate) fn sample_from_sorted_top_k_data_with_encoder(

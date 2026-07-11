@@ -4,6 +4,8 @@ use crate::mir::inputs::MirValue;
 use crate::mir::kernel_backend::{KernelCacheKey, KernelVariantKey};
 use crate::mir::operation::Operation;
 use crate::mir::workgroup_shape::WorkgroupShape;
+use rustc_hash::FxHasher;
+use std::hash::Hash;
 
 struct DirectPlanCacheKernelVariant;
 
@@ -13,12 +15,21 @@ pub(crate) fn structural_kernel_key(
     workgroup: &WorkgroupShape,
 ) -> KernelCacheKey {
     let dispatch_size = operation.dispatch_size(workgroup, inputs);
-    operation.kernel_cache_key_with_dispatch(
+    let operation_key = operation.kernel_cache_key_with_dispatch(
         KernelVariantKey::of::<DirectPlanCacheKernelVariant>(),
         Some(workgroup),
         dispatch_size,
         inputs,
-    )
+    );
+    KernelCacheKey::from_hash_inputs(|state| {
+        operation_key.hash(state);
+        hash_plan_environment(state);
+    })
+}
+
+/// Process-level settings that change which direct-kernel plan is selected.
+pub(super) fn hash_plan_environment(state: &mut FxHasher) {
+    std::env::var_os("FUSOR_LAST_LEVEL_CACHE_BYTES").hash(state);
 }
 
 #[cfg(test)]

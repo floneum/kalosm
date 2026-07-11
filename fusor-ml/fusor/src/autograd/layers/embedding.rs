@@ -32,7 +32,7 @@ impl Embedding {
     pub fn from_inference(graph: &Graph, layer: &crate::layers::Embedding<f32>) -> Self {
         let table = match layer.dense_embeddings() {
             Some(dense) => dense.clone(),
-            None => layer.embeddings_quantized().dequantize().to_concrete(),
+            None => layer.embeddings_quantized().dequantize().into_concrete(),
         };
         Self::new_from_tensor(graph.leaf(table))
     }

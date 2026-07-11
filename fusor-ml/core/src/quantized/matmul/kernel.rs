@@ -13,33 +13,6 @@ enum QmatmulDirectTokens {
 }
 
 impl QMatMulOperation {
-    /// Lower this operation to its kernel plan. Recognition and epilogue
-    /// fusion only build operations the direct paths can lower (see
-    /// `supports_elementwise_epilogue_fusion`), so a `None` from every path
-    /// here is an invariant violation, not a recoverable state.
-    pub(crate) fn build_direct_kernels(
-        &self,
-        graph: &crate::compute_graph::ComputeGraphInner,
-        workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
-        inputs: &[MirValue],
-    ) -> Result<QMatMulKernelPlan, QMatMulLoweringError> {
-        if inputs
-            .last()
-            .and_then(MirValue::as_tensor)
-            .is_some_and(|output| output.layout().shape().contains(&0))
-        {
-            return Ok(QMatMulKernelPlan::EmptyOutput);
-        }
-
-        if let Some(kernels) = self.build_m_padded_kernels(graph, inputs) {
-            return Ok(QMatMulKernelPlan::Kernels(kernels));
-        }
-        if let Some(kernel) = self.build_direct_kernel(graph, workgroup_shape, inputs) {
-            return Ok(QMatMulKernelPlan::Kernels(vec![kernel]));
-        }
-        Err(QMatMulLoweringError::new(self.name()))
-    }
-
     /// Lower an M-padded matmul: copy the activation into a zero-padded
     /// scratch tensor (the same kernel a `resize` view lowers to) and run the
     /// matmul over the padded views. The output buffer's slack rows were
@@ -752,6 +725,32 @@ fn hash_qmatmul_epilogue(state: &mut FxHasher, epilogue: &Option<ElementwiseEpil
 }
 
 impl Operation for QMatMulOperation {
+    /// Recognition and epilogue fusion only build operations the direct
+    /// paths can lower (see `supports_elementwise_epilogue_fusion`), so a
+    /// failure from every path is an invariant violation.
+    fn build_direct_kernel_plan(
+        &self,
+        graph: &crate::compute_graph::ComputeGraphInner,
+        workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
+        inputs: &[MirValue],
+    ) -> Result<DirectKernelPlan, DirectKernelLoweringError> {
+        if inputs
+            .last()
+            .and_then(MirValue::as_tensor)
+            .is_some_and(|output| output.layout().shape().contains(&0))
+        {
+            return Ok(DirectKernelPlan::empty());
+        }
+
+        if let Some(kernels) = self.build_m_padded_kernels(graph, inputs) {
+            return Ok(DirectKernelPlan::many(kernels));
+        }
+        if let Some(kernel) = self.build_direct_kernel(graph, workgroup_shape, inputs) {
+            return Ok(DirectKernelPlan::single(kernel));
+        }
+        Err(DirectKernelLoweringError::new(self.name()))
+    }
+
     fn hash_kernel_fields(&self, state: &mut FxHasher) {
         self.input_datatype.hash(state);
         self.in_shape.hash(state);

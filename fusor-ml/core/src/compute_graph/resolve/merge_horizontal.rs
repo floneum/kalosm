@@ -10,11 +10,10 @@
 //! each guarded by a uniform linear-workgroup-id range compare.
 //!
 //! Safety and gating:
-//! - The pass only runs when `optimize_large_graph` took the dense branch
-//!   (`has_qmatmul == false`, > 512 nodes) and the
-//!   `FUSOR_DISABLE_HORIZONTAL_FUSION` kill switch is unset, so quantized
-//!   decode graphs and small dense conformance graphs take byte-identical
-//!   paths by construction.
+//! - QMatMul-free standard graphs expose only cooperative matmuls to the
+//!   pass, preserving their existing split-K and bounds codegen. The large
+//!   dense profile additionally exposes row and elementwise operations.
+//!   `FUSOR_DISABLE_HORIZONTAL_FUSION` disables both scopes.
 //! - Grouping is dependency-sound by a wave discipline: an operation joins
 //!   the open wave of its category only if it does not (transitively) depend
 //!   on any open-wave member of any category; a dependency on an open wave
@@ -24,7 +23,6 @@
 //!   buffer), so flush-replay slot attribution stays 1 buffer <-> 1 slot.
 
 use super::*;
-use crate::mir::kernel_backend::DirectKernel;
 use crate::mir::operation::hash_mir_value;
 use crate::row_program::RowProgramOperation;
 
@@ -92,7 +90,10 @@ enum SegOp {
     Region(crate::region::ElementwiseRegionOperation),
     /// Carries the profile key so the flush can partition the wave into
     /// same-profile dispatches.
-    MatMul(crate::matmul::MatMulOperation, crate::matmul::MatmulMergeKey),
+    MatMul(
+        Box<crate::matmul::MatMulOperation>,
+        crate::matmul::MatmulMergeKey,
+    ),
 }
 
 impl SegOp {
@@ -126,6 +127,7 @@ const MATMUL_SEGMENT_BINDINGS: usize = 3;
 
 pub(super) struct HorizontalMerger {
     enabled: bool,
+    merge_dense_ops: bool,
     device: crate::Device,
     /// Max total storage bindings per merged dispatch.
     budget: usize,
@@ -152,9 +154,10 @@ pub(super) struct HorizontalMerger {
 }
 
 impl HorizontalMerger {
-    pub(super) fn new(enabled: bool, device: &crate::Device) -> Self {
+    pub(super) fn new(enabled: bool, merge_dense_ops: bool, device: &crate::Device) -> Self {
         Self {
             enabled,
+            merge_dense_ops,
             device: device.clone(),
             // Total storage bindings per merged dispatch. The nary budget is
             // inputs-only (it assumes one extra output binding); merged
@@ -184,36 +187,36 @@ impl HorizontalMerger {
 
     fn categorize(&self, node: &ExecutionNode) -> Option<SegOp> {
         match &node.variant {
-            // Regions have no standalone lowering; the merger always hosts
-            // them (a lone region becomes a single-segment merged dispatch).
-            // No element cap: multi-output regions have no tiled fallback.
-            ExecutionVariant::Region(op) => Some(SegOp::Region(op.clone())),
-            ExecutionVariant::Elementwise(op) => {
+            // Regions already have a valid single-region queue lowering. The
+            // merger may combine independent regions; there is no element cap
+            // because multi-output regions have no tiled fallback.
+            ExecutionVariant::Region(op) if self.merge_dense_ops => Some(SegOp::Region(op.clone())),
+            ExecutionVariant::Elementwise(op) if self.merge_dense_ops => {
                 let elements: usize = op.shape.iter().product();
-                (elements < MAX_MERGED_NARY_ELEMENTS && op.inputs.len() + 1 < self.budget)
-                    .then(|| {
+                (elements < MAX_MERGED_NARY_ELEMENTS && op.inputs.len() + 1 < self.budget).then(
+                    || {
                         SegOp::Region(crate::region::ElementwiseRegionOperation::from_nary(
                             op.clone(),
                             node.inner_idx,
                         ))
-                    })
+                    },
+                )
             }
-            ExecutionVariant::Reduce(op) => {
+            ExecutionVariant::Reduce(op) if self.merge_dense_ops => {
                 let mut row = RowProgramOperation::from_reduce(op);
-                // The merger only runs on the dense large-graph branch, so
-                // its hosted row programs always take the tuned codegen.
+                // Raw reduces reach this arm only in the dense profile, so
+                // hosted row programs take the tuned codegen.
                 row.dense_codegen = true;
                 self.row_candidate(row)
             }
-            ExecutionVariant::GraphOp(op) => {
+            ExecutionVariant::GraphOp(op) if self.merge_dense_ops => {
                 let row = op.as_row_program()?.clone();
                 self.row_candidate(row)
             }
             ExecutionVariant::MatMul(op) => {
-                // Only dense-tuned matmuls bound for the cooperative-matrix
-                // kernel produce a profile; everything else (quantized
-                // graphs never run this pass, generic-path contractions,
-                // epilogue-fused matmuls) lowers standalone.
+                // Only matmuls bound for the cooperative-matrix kernel
+                // produce a profile; generic-path contractions and
+                // epilogue-fused matmuls lower standalone.
                 if std::env::var_os("FUSOR_TRACE_MATMUL_MERGE").is_some() {
                     eprintln!(
                         "matmul_merge_candidate name={} dense={} profile={:?}",
@@ -223,7 +226,7 @@ impl HorizontalMerger {
                     );
                 }
                 let key = op.merge_profile(&self.device)?;
-                Some(SegOp::MatMul(op.clone(), key))
+                Some(SegOp::MatMul(Box::new(op.clone()), key))
             }
             _ => None,
         }
@@ -313,8 +316,8 @@ impl HorizontalMerger {
                 // Dependencies on other open waves become flush-order
                 // constraints (that wave's merged dispatch is emitted before
                 // ours) unless that would create a cycle.
-                for other in 0..CATEGORY_COUNT {
-                    if other != cat && dep[other] == self.open_gen[other] {
+                for (other, &generation) in dep.iter().enumerate() {
+                    if other != cat && generation == self.open_gen[other] {
                         if self.reaches(cat, other) {
                             self.flush(other, out);
                         } else {
@@ -338,9 +341,8 @@ impl HorizontalMerger {
                 // wave's merged dispatch, so its input is cached in time.
                 if matches!(node.variant, ExecutionVariant::View(_))
                     && !open.is_empty()
-                    && lowered.is_some()
+                    && let Some(op) = lowered
                 {
-                    let op = lowered.expect("checked above");
                     // Attach to the wave every other open dependency is
                     // ordered before; bail to flushing if none dominates.
                     if let Some(&last) = open
@@ -401,8 +403,8 @@ impl HorizontalMerger {
         if wave.len() == 1 {
             let (node, seg) = wave.into_iter().next().expect("length checked");
             let op: QueuedOperation = match seg {
-                SegOp::Row(op) => QueuedOperation::Generic(Arc::new(op)),
-                SegOp::MatMul(op, _) => QueuedOperation::Generic(Arc::new(op)),
+                SegOp::Row(op) => QueuedOperation::Operation(Arc::new(op)),
+                SegOp::MatMul(op, _) => QueuedOperation::Operation(Arc::new(*op)),
                 // A lone one-statement region lowers through the standalone
                 // elementwise path (which keeps the register-reuse tiled
                 // plan); genuine multi-output regions have no standalone
@@ -412,7 +414,7 @@ impl HorizontalMerger {
                         let nary = op
                             .into_nary()
                             .expect("single-statement regions always emit their output");
-                        QueuedOperation::Generic(Arc::new(nary))
+                        QueuedOperation::Operation(Arc::new(nary))
                     } else {
                         QueuedOperation::Merged(MergedSegments::Region(vec![(node, op)]))
                     }
@@ -435,17 +437,20 @@ impl HorizontalMerger {
                     unreachable!("wave category mismatch");
                 };
                 match groups.iter_mut().find(|(existing, _)| *existing == key) {
-                    Some((_, group)) => group.push((node, op)),
-                    None => groups.push((key, vec![(node, op)])),
+                    Some((_, group)) => group.push((node, *op)),
+                    None => groups.push((key, vec![(node, *op)])),
                 }
             }
             for (key, group) in groups {
                 if std::env::var_os("FUSOR_TRACE_MATMUL_MERGE").is_some() {
-                    eprintln!("matmul_merge_flush cat={cat} size={} key={key:?}", group.len());
+                    eprintln!(
+                        "matmul_merge_flush cat={cat} size={} key={key:?}",
+                        group.len()
+                    );
                 }
                 if group.len() == 1 {
                     let (node, op) = group.into_iter().next().expect("length checked");
-                    out.push((node, QueuedOperation::Generic(Arc::new(op))));
+                    out.push((node, QueuedOperation::Operation(Arc::new(op))));
                 } else {
                     let merged = MergedSegments::MatMul(group);
                     out.push((merged.representative(), QueuedOperation::Merged(merged)));
@@ -477,802 +482,6 @@ impl HorizontalMerger {
     }
 }
 
-impl MergedSegments {
-    /// Segment (node, op) views in queue order.
-    fn segment_ops(&self) -> Vec<(NodeIndex, &dyn Operation)> {
-        match self {
-            Self::Row(segments) => segments
-                .iter()
-                .map(|(node, op)| (*node, op as &dyn Operation))
-                .collect(),
-            Self::MatMul(segments) => segments
-                .iter()
-                .map(|(node, op)| (*node, op as &dyn Operation))
-                .collect(),
-            Self::Region(_) => {
-                unreachable!("region segments are gathered without the Operation trait")
-            }
-        }
-    }
-}
-
-/// One entry of the dense three-phase queue, preserving queue order.
-enum DenseStep {
-    View {
-        node: NodeIndex,
-        result: TensorData,
-        deps: Vec<NodeIndex>,
-    },
-    CopyAssign {
-        node: NodeIndex,
-        copies: Vec<CopyBufferRecord>,
-        op: QueuedOperation,
-    },
-    Work(usize),
-}
-
-enum DenseWorkKind {
-    Generic {
-        inputs: Vec<MirValue>,
-        workgroup_shape: crate::mir::workgroup_shape::WorkgroupShape,
-        resolved: TensorData,
-        /// Node whose dead buffer this output claimed, if any.
-        claimed_from: Option<NodeIndex>,
-    },
-    Merged {
-        segment_inputs: Vec<Vec<MirValue>>,
-        /// One entry per segment output, in segment/statement order (regions
-        /// contribute several outputs per segment), with the node whose dead
-        /// buffer the output claimed, if any.
-        outputs: Vec<(NodeIndex, TensorData, Option<NodeIndex>)>,
-    },
-}
-
-struct DenseWork {
-    node: NodeIndex,
-    op: QueuedOperation,
-    kind: DenseWorkKind,
-    built: std::sync::Mutex<Option<DenseBuilt>>,
-}
-
-struct DenseBuilt {
-    kernels: Vec<DirectKernel>,
-    prepared: Vec<Option<(PreparedDirectDispatch, String)>>,
-    /// False when a merged builder declined and the kernels are per-segment
-    /// fallbacks (which a flush plan cannot express).
-    merged_ok: bool,
-}
-
-/// A structural plan-cache key for one horizontally merged dispatch: the
-/// wave discriminant plus every segment's own structural kernel key (or the
-/// region's kernel fields), so isomorphic waves across resolves and
-/// processes share one plan.
-fn merged_plan_cache_key(
-    merged: &MergedSegments,
-    segment_inputs: &[Vec<MirValue>],
-) -> crate::mir::kernel_backend::KernelCacheKey {
-    struct MergedPlanKernelVariant;
-    crate::mir::kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
-        use std::hash::Hash;
-        crate::mir::kernel_backend::KernelVariantKey::of::<MergedPlanKernelVariant>().hash(state);
-        std::mem::discriminant(merged).hash(state);
-        segment_inputs.len().hash(state);
-        match merged {
-            MergedSegments::Region(segments) => {
-                for ((_, op), inputs) in segments.iter().zip(segment_inputs) {
-                    op.hash_kernel_fields(state);
-                    inputs.len().hash(state);
-                    for input in inputs {
-                        crate::mir::operation::hash_mir_value(state, input);
-                    }
-                }
-            }
-            _ => {
-                for ((_, op), inputs) in merged.segment_ops().iter().zip(segment_inputs) {
-                    op.kernel_cache_key_with_dispatch(
-                        crate::mir::kernel_backend::KernelVariantKey::of::<MergedPlanKernelVariant>(),
-                        None,
-                        [0; 3],
-                        inputs,
-                    )
-                    .hash(state);
-                }
-            }
-        }
-    })
-}
-
-fn build_dense_work(
-    work: &DenseWork,
-    graph: &ComputeGraphInner,
-    device: &crate::Device,
-    plan_cache_enabled: bool,
-) -> DenseBuilt {
-    let build_timer = std::time::Instant::now();
-    let (kernels, merged_ok) = match (&work.op, &work.kind) {
-        (
-            QueuedOperation::QMatMul(qmatmul),
-            DenseWorkKind::Generic {
-                inputs,
-                workgroup_shape,
-                ..
-            },
-        ) => {
-            let build_kernels = || {
-                qmatmul
-                    .build_direct_kernels(graph, workgroup_shape, inputs)
-                    .unwrap_or_else(|error| panic!("{error}"))
-                    .into_kernels()
-            };
-            let kernels = if plan_cache_enabled {
-                let kernel_key = structural_kernel_key(qmatmul.as_ref(), inputs, workgroup_shape);
-                super::run::resolve_cached_direct_plan(
-                    device.kernel_cache(),
-                    kernel_key,
-                    super::run::direct_plan_binding_buffers(inputs),
-                    build_kernels,
-                )
-            } else {
-                build_kernels()
-            };
-            (kernels, true)
-        }
-        (QueuedOperation::Generic(operation), DenseWorkKind::Generic { inputs, workgroup_shape, .. }) => {
-            let build_kernels = || {
-                vec![
-                    operation
-                        .build_direct_kernel(graph, workgroup_shape, inputs)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "operation did not provide a direct kernel: {}",
-                                operation.name()
-                            )
-                        }),
-                ]
-            };
-            let kernels = if plan_cache_enabled {
-                let kernel_key =
-                    structural_kernel_key(operation.as_ref(), inputs, workgroup_shape);
-                super::run::resolve_cached_direct_plan(
-                    device.kernel_cache(),
-                    kernel_key,
-                    super::run::direct_plan_binding_buffers(inputs),
-                    build_kernels,
-                )
-            } else {
-                build_kernels()
-            };
-            (kernels, true)
-        }
-        (QueuedOperation::Merged(merged), DenseWorkKind::Merged { segment_inputs, .. }) => {
-            // Merged kernels go through the same plan cache as single ops:
-            // buffers are presented flattened in segment order, and the
-            // insert path verifies that order matches the kernel's true
-            // binding order (folded or deduplicated plans silently skip).
-            let expected: Vec<std::sync::Arc<wgpu::Buffer>> = segment_inputs
-                .iter()
-                .flatten()
-                .filter_map(|value| match value {
-                    MirValue::Tensor(tensor) => Some(tensor.buffer().clone()),
-                    MirValue::QMatrix(matrix) => Some(matrix.buffer().clone()),
-                    MirValue::Integer(_) | MirValue::Float(_) => None,
-                })
-                .collect();
-            let plan_key =
-                plan_cache_enabled.then(|| merged_plan_cache_key(merged, segment_inputs));
-            if let Some(key) = plan_key
-                && let Some(kernels) = device
-                    .kernel_cache()
-                    .direct_plan_cache()
-                    .get_many(device.kernel_cache(), key, &[&expected])
-            {
-                return finish_dense_build(build_timer, kernels, true, device);
-            }
-            let built = match merged {
-                MergedSegments::Row(segments) => {
-                    crate::row_program::build_merged_row_program_kernel(
-                        graph,
-                        &segments.iter().map(|(_, op)| op.clone()).collect::<Vec<_>>(),
-                        segment_inputs,
-                    )
-                }
-                MergedSegments::MatMul(segments) => crate::matmul::build_merged_matmul_kernel(
-                    graph,
-                    &segments.iter().map(|(_, op)| op.clone()).collect::<Vec<_>>(),
-                    segment_inputs,
-                ),
-                MergedSegments::Region(segments) => {
-                    crate::nary_direct::build_merged_region_kernel(
-                        graph,
-                        &segments.iter().map(|(_, op)| op.clone()).collect::<Vec<_>>(),
-                        segment_inputs,
-                    )
-                }
-            };
-            match built {
-                Some(kernel) => {
-                    if let Some(key) = plan_key {
-                        device.kernel_cache().direct_plan_cache().insert_many(
-                            key,
-                            std::slice::from_ref(&kernel),
-                            &[&expected],
-                        );
-                    }
-                    (vec![kernel], true)
-                }
-                None if matches!(merged, MergedSegments::Region(_)) => {
-                    // Region fallback: one standalone region kernel per
-                    // segment. Correct but not plan-expressible; poisoned in
-                    // phase 3.
-                    let MergedSegments::Region(segments) = merged else {
-                        unreachable!("matched above");
-                    };
-                    let kernels = segments
-                        .iter()
-                        .zip(segment_inputs)
-                        .map(|((_, op), inputs)| {
-                            crate::nary_direct::build_merged_region_kernel(
-                                graph,
-                                std::slice::from_ref(op),
-                                std::slice::from_ref(inputs),
-                            )
-                            .unwrap_or_else(|| {
-                                panic!("region fallback did not provide a kernel: {}", op.name())
-                            })
-                        })
-                        .collect();
-                    (kernels, false)
-                }
-                None => {
-                    // Fallback: per-segment kernels. Correct but not
-                    // plan-expressible; the recording is poisoned in phase 3.
-                    let max_subgroup_size = device.max_subgroup_size();
-                    let kernels = merged
-                        .segment_ops()
-                        .into_iter()
-                        .zip(segment_inputs)
-                        .map(|((_, op), inputs)| {
-                            let constraints = op.workgroup_shape_constraints(device);
-                            let workgroup_shape = constraints
-                                .solve(max_subgroup_size, &device.limits())
-                                .unwrap_or_else(|| {
-                                    panic!("failed to solve workgroup shape for merged fallback")
-                                });
-                            op.build_direct_kernel(graph, &workgroup_shape, inputs)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "merged fallback segment did not provide a kernel: {}",
-                                        op.name()
-                                    )
-                                })
-                        })
-                        .collect();
-                    (kernels, false)
-                }
-            }
-        }
-        _ => unreachable!("dense work kind matches its queued operation"),
-    };
-    finish_dense_build(build_timer, kernels, merged_ok, device)
-}
-
-/// Prepare dispatches (which also compiles shaders and pipelines, here on
-/// the parallel build workers) and assemble the phase-2 result.
-fn finish_dense_build(
-    build_timer: std::time::Instant,
-    kernels: Vec<crate::mir::kernel_backend::DirectKernel>,
-    merged_ok: bool,
-    device: &crate::Device,
-) -> DenseBuilt {
-    let prepared = kernels
-        .iter()
-        .map(|kernel| {
-            kernel
-                .prepare_dispatch(device.kernel_cache())
-                .map(|dispatch| (dispatch, kernel.name().to_string()))
-        })
-        .collect();
-    if std::env::var_os("FUSOR_TRACE_BUILD_TIMES").is_some() {
-        let total = build_timer.elapsed();
-        if total.as_millis() >= 2 {
-            eprintln!(
-                "build_time total={total:?} first={}",
-                kernels.first().map(|k| k.name()).unwrap_or("")
-            );
-        }
-    }
-    DenseBuilt {
-        kernels,
-        prepared,
-        merged_ok,
-    }
-}
-
-impl Resolver {
-    /// Three-phase queue execution for dense large graphs: serial input
-    /// gathering and output caching (queue order), parallel kernel building
-    /// and dispatch preparation, then serial recording, encoding, and
-    /// release accounting in exactly the original queue order.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn run_dense_queue(
-        &self,
-        graph: &mut ComputeGraphInner,
-        device: &crate::Device,
-        max_subgroup_size: u32,
-        queued_operations: Vec<(NodeIndex, QueuedOperation)>,
-        remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
-        target_set: &FxHashSet<NodeIndex>,
-        ledger: &mut super::alloc_reuse::BufferLedger,
-        plan_cache_enabled: bool,
-        commands: &mut Vec<CommandRecord>,
-        host_profile: &mut ResolveHostProfile,
-        host_trace: bool,
-        on_dispatch_name: &mut dyn FnMut(&str) -> Option<String>,
-    ) {
-        // Phase 1: gather inputs, allocate outputs, cache results.
-        let gather_start = host_trace.then(Instant::now);
-        let mut steps = Vec::with_capacity(queued_operations.len());
-        let mut work: Vec<DenseWork> = Vec::new();
-        for (node, queued_operation) in queued_operations {
-            let view_result = if let Some(node_data) = graph.nodes.nodes.node_weight(node) {
-                match &node_data.variant {
-                    ComputeGraphNodeVariant::View(view) => graph
-                        .get_cached_result(view.input)
-                        .and_then(|input| view.try_map_tensor(input)),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            if let Some(result) = view_result {
-                let mut deps = Vec::new();
-                graph.visit_dependencies(node, &mut |dep| deps.push(dep));
-                graph.set_cached_result(node, result.clone());
-                ledger.note_transient(result.buffer());
-                ledger.consume(graph, &deps, target_set);
-                steps.push(DenseStep::View { node, result, deps });
-                continue;
-            }
-            let slice_copy = graph.nodes.nodes.node_weight(node).and_then(|node_data| {
-                let ComputeGraphNodeVariant::Assign(slice_assign) = &node_data.variant else {
-                    return None;
-                };
-                Self::try_prepare_in_place_slice_assign_copy(graph, slice_assign)
-            });
-            if let Some((output, copies)) = slice_copy {
-                graph.set_cached_result(node, output.clone());
-                ledger.note_transient(output.buffer());
-                for copy in &copies {
-                    ledger.note_transient(&copy.source);
-                    ledger.note_transient(&copy.destination);
-                }
-                let mut deps = Vec::new();
-                queued_operation.visit_dependencies(&mut |dep| deps.push(dep));
-                ledger.consume(graph, &deps, target_set);
-                steps.push(DenseStep::CopyAssign {
-                    node,
-                    copies,
-                    op: queued_operation,
-                });
-                continue;
-            }
-            match &queued_operation {
-                QueuedOperation::Generic(_) | QueuedOperation::QMatMul(_) => {
-                    let (mut inputs, output_value) = match &queued_operation {
-                        QueuedOperation::Generic(operation) => {
-                            let inputs = operation.inputs(graph);
-                            let output = operation.output(graph, &inputs);
-                            (inputs, output)
-                        }
-                        QueuedOperation::QMatMul(qmatmul) => {
-                            let inputs = qmatmul.inputs(graph);
-                            let output = qmatmul.output(graph, &inputs);
-                            (inputs, output)
-                        }
-                        QueuedOperation::Merged(_) => unreachable!("matched above"),
-                    };
-                    let MirValue::Tensor(mut resolved) = output_value else {
-                        panic!("Kernel input value is not a tensor");
-                    };
-                    // Cache the output before the death accounting: a
-                    // source is only releasable once every alive-uncached
-                    // descendant (this very operation) is cached.
-                    graph.set_cached_result(node, resolved.clone());
-                    let mut deps = Vec::new();
-                    queued_operation.visit_dependencies(&mut |dep| deps.push(dep));
-                    ledger.consume(graph, &deps, target_set);
-                    let mut claimed_from = None;
-                    if ledger.enabled() {
-                        let out_ptr = Arc::as_ptr(resolved.buffer()) as usize;
-                        let forbidden: FxHashSet<usize> = inputs
-                            .iter()
-                            .filter_map(|value| match value {
-                                MirValue::Tensor(tensor) => {
-                                    let ptr = Arc::as_ptr(tensor.buffer()) as usize;
-                                    (ptr != out_ptr).then_some(ptr)
-                                }
-                                _ => None,
-                            })
-                            .collect();
-                        if let Some(swapped) = ledger.try_claim(node, &resolved, &forbidden) {
-                            for value in inputs.iter_mut() {
-                                if let MirValue::Tensor(tensor) = value
-                                    && Arc::as_ptr(tensor.buffer()) as usize == out_ptr
-                                {
-                                    *value = swapped.clone().into();
-                                }
-                            }
-                            resolved = swapped;
-                            claimed_from = ledger.chosen_source(node);
-                            graph.set_cached_result(node, resolved.clone());
-                        }
-                    }
-                    ledger.note_alloc(&resolved);
-                    for value in &inputs {
-                        if let MirValue::Tensor(tensor) = value {
-                            ledger.note_transient(tensor.buffer());
-                        }
-                    }
-                    ledger.note_transient(resolved.buffer());
-                    let constraints = match &queued_operation {
-                        QueuedOperation::Generic(operation) => {
-                            operation.workgroup_shape_constraints(device)
-                        }
-                        QueuedOperation::QMatMul(qmatmul) => {
-                            qmatmul.workgroup_shape_constraints(device)
-                        }
-                        QueuedOperation::Merged(_) => unreachable!("matched above"),
-                    };
-                    let workgroup_shape = constraints
-                        .solve(max_subgroup_size, &device.limits())
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "Failed to find a valid workgroup shape for constraints {constraints:?}"
-                            )
-                        });
-                    steps.push(DenseStep::Work(work.len()));
-                    work.push(DenseWork {
-                        node,
-                        op: queued_operation,
-                        kind: DenseWorkKind::Generic {
-                            inputs,
-                            workgroup_shape,
-                            resolved,
-                            claimed_from,
-                        },
-                        built: std::sync::Mutex::new(None),
-                    });
-                }
-                QueuedOperation::Merged(merged) => {
-                    let mut segment_inputs: Vec<Vec<MirValue>> = Vec::new();
-                    let mut outputs: Vec<(NodeIndex, TensorData, Option<NodeIndex>)> = Vec::new();
-                    if let MergedSegments::Region(segments) = merged {
-                        let device = graph.device();
-                        // A segment may write an output over one of its own
-                        // input buffers only when no other segment of this
-                        // dispatch binds that buffer (concurrent workgroups)
-                        // — count cached-buffer pointers across the whole
-                        // dispatch and require the source to be unique.
-                        let mut dispatch_ptr_uses: FxHashMap<usize, u32> = FxHashMap::default();
-                        for (_, op) in segments {
-                            for idx in &op.inputs {
-                                if let Some(cached) = graph.get_cached_result(*idx) {
-                                    *dispatch_ptr_uses
-                                        .entry(Arc::as_ptr(cached.buffer()) as usize)
-                                        .or_insert(0) += 1;
-                                }
-                            }
-                        }
-                        // Segments share one unsynchronized dispatch, so a
-                        // scratch claim must avoid every segment's reads, not
-                        // just the claiming segment's own.
-                        let dispatch_reads: FxHashSet<usize> =
-                            dispatch_ptr_uses.keys().copied().collect();
-                        for (_, op) in segments {
-                            let values: Vec<MirValue> = op
-                                .inputs
-                                .iter()
-                                .map(|idx| {
-                                    graph
-                                        .get_result(*idx)
-                                        .expect("region inputs resolve before the region")
-                                        .into()
-                                })
-                                .collect();
-                            // Register the gathered input clones before any
-                            // claim so the reference accounting that guards
-                            // in-place claims sees them.
-                            for value in &values {
-                                if let MirValue::Tensor(tensor) = value {
-                                    ledger.note_transient(tensor.buffer());
-                                }
-                            }
-                            let mut values = values;
-                            let reads = op.input_read_summary();
-                            let mut slot_claimed = vec![false; op.inputs.len()];
-                            // Cache every output before the death accounting:
-                            // sources are only releasable once this region
-                            // (their last alive-uncached descendant) counts
-                            // as cached.
-                            let mut fresh_outputs = Vec::new();
-                            for statement in &op.statements {
-                                let Some(out_node) = statement.output else {
-                                    continue;
-                                };
-                                let output = TensorData::new_for_shape(
-                                    &device,
-                                    &op.shape,
-                                    statement.datatype,
-                                );
-                                graph.set_cached_result(out_node, output.clone());
-                                fresh_outputs.push(output);
-                            }
-                            {
-                                let mut deps = Vec::new();
-                                op.visit_dependencies(&mut |dep| deps.push(dep));
-                                ledger.consume(graph, &deps, target_set);
-                            }
-                            let mut fresh_outputs = fresh_outputs.into_iter();
-                            for (position, statement) in op.statements.iter().enumerate() {
-                                let Some(out_node) = statement.output else {
-                                    continue;
-                                };
-                                let mut output =
-                                    fresh_outputs.next().expect("one fresh output per statement");
-                                let mut claimed_from = None;
-                                // Write in place over an input this statement
-                                // is the last reader of: per-thread the load
-                                // precedes the store and threads own disjoint
-                                // elements, so identity reads stay exact.
-                                for (slot, source) in op.inputs.iter().enumerate() {
-                                    if slot_claimed[slot]
-                                        || !reads[slot].identity_only
-                                        || reads[slot].last_reader != Some(position)
-                                    {
-                                        continue;
-                                    }
-                                    let unique = graph
-                                        .get_cached_result(*source)
-                                        .map(|cached| Arc::as_ptr(cached.buffer()) as usize)
-                                        .and_then(|ptr| dispatch_ptr_uses.get(&ptr))
-                                        == Some(&1);
-                                    if !unique {
-                                        continue;
-                                    }
-                                    if let Some(swapped) = ledger.try_claim_in_place(
-                                        out_node, &output, *source, graph, target_set,
-                                    ) {
-                                        output = swapped;
-                                        claimed_from = Some(*source);
-                                        slot_claimed[slot] = true;
-                                        break;
-                                    }
-                                }
-                                if claimed_from.is_none()
-                                    && let Some(swapped) =
-                                        ledger.try_claim(out_node, &output, &dispatch_reads)
-                                {
-                                    output = swapped;
-                                    claimed_from = ledger.chosen_source(out_node);
-                                }
-                                if claimed_from.is_some() {
-                                    graph.set_cached_result(out_node, output.clone());
-                                }
-                                ledger.note_alloc(&output);
-                                ledger.note_transient(output.buffer());
-                                values.push(output.clone().into());
-                                outputs.push((out_node, output, claimed_from));
-                            }
-                            segment_inputs.push(values);
-                        }
-                    } else {
-                        for (seg_node, op) in merged.segment_ops() {
-                            let inputs = op.inputs(graph);
-                            let MirValue::Tensor(output) = op.output(graph, &inputs) else {
-                                panic!("merged segment output is not a tensor");
-                            };
-                            graph.set_cached_result(seg_node, output.clone());
-                            ledger.note_alloc(&output);
-                            for value in &inputs {
-                                if let MirValue::Tensor(tensor) = value {
-                                    ledger.note_transient(tensor.buffer());
-                                }
-                            }
-                            ledger.note_transient(output.buffer());
-                            outputs.push((seg_node, output, None));
-                            segment_inputs.push(inputs);
-                        }
-                        let mut deps = Vec::new();
-                        queued_operation.visit_dependencies(&mut |dep| deps.push(dep));
-                        ledger.consume(graph, &deps, target_set);
-                    }
-                    steps.push(DenseStep::Work(work.len()));
-                    work.push(DenseWork {
-                        node,
-                        op: queued_operation,
-                        kind: DenseWorkKind::Merged {
-                            segment_inputs,
-                            outputs,
-                        },
-                        built: std::sync::Mutex::new(None),
-                    });
-                }
-            }
-        }
-        // Allocation is complete: releases past this point free buffers no
-        // claim can use anymore.
-        ledger.freeze();
-        if let Some(start) = gather_start {
-            host_profile.inputs += start.elapsed();
-        }
-
-        // Phase 2: build kernels and prepare dispatches in parallel. Builds
-        // are pure functions of (operation, layouts, buffers); the shared
-        // kernel caches are internally synchronized.
-        let build_start = host_trace.then(Instant::now);
-        #[cfg(target_arch = "wasm32")]
-        for item in &work {
-            *item.built.lock().unwrap() =
-                Some(build_dense_work(item, graph, device, plan_cache_enabled));
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let workers = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(work.len())
-                .max(1);
-            // Tiny queues build serially: thread spawns cost more than the
-            // handful of (usually plan-cached) kernel builds they would
-            // parallelize.
-            if workers <= 1 || work.len() < 16 {
-                for item in &work {
-                    *item.built.lock().unwrap() =
-                        Some(build_dense_work(item, graph, device, plan_cache_enabled));
-                }
-            } else {
-                let next = std::sync::atomic::AtomicUsize::new(0);
-                let graph_ref: &ComputeGraphInner = graph;
-                std::thread::scope(|scope| {
-                    for _ in 0..workers {
-                        scope.spawn(|| {
-                            loop {
-                                let index =
-                                    next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let Some(item) = work.get(index) else { break };
-                                let built = build_dense_work(
-                                    item,
-                                    graph_ref,
-                                    device,
-                                    plan_cache_enabled,
-                                );
-                                *item.built.lock().unwrap() = Some(built);
-                            }
-                        });
-                    }
-                });
-            }
-        }
-        if let Some(start) = build_start {
-            host_profile.build_kernel += start.elapsed();
-        }
-
-        // Phase 3: record, encode, and release in queue order.
-        let encode_start = host_trace.then(Instant::now);
-        for step in steps {
-            match step {
-                DenseStep::View { node, result, deps } => {
-                    if let Some(recorder) = &self.recorder {
-                        recorder.borrow_mut().record_view_alias(node, &result, &deps);
-                    }
-                    Self::release_dead_intermediates_from_graph(
-                        graph,
-                        &[node],
-                        remaining_consumers,
-                        target_set,
-                        ledger,
-                    );
-                }
-                DenseStep::CopyAssign { node, copies, op } => {
-                    if let Some(recorder) = &self.recorder {
-                        let output = graph
-                            .get_cached_result(node)
-                            .expect("copy-assign output cached in phase 1")
-                            .clone();
-                        recorder.borrow_mut().record_copy_assign(node, &output, &op);
-                    }
-                    commands.extend(copies.into_iter().map(CommandRecord::CopyBuffer));
-                    Self::release_dead_intermediates(
-                        graph,
-                        &[&op],
-                        remaining_consumers,
-                        target_set,
-                        ledger,
-                    );
-                }
-                DenseStep::Work(index) => {
-                    let item = &work[index];
-                    let built = item
-                        .built
-                        .lock()
-                        .unwrap()
-                        .take()
-                        .expect("dense work built in phase 2");
-                    if let Some(recorder) = &self.recorder {
-                        match (&item.op, &item.kind) {
-                            (
-                                QueuedOperation::Generic(_),
-                                DenseWorkKind::Generic {
-                                    resolved,
-                                    claimed_from,
-                                    ..
-                                },
-                            ) => {
-                                recorder.borrow_mut().record_dispatch(
-                                    item.node,
-                                    &built.kernels,
-                                    resolved,
-                                    &item.op,
-                                    *claimed_from,
-                                );
-                            }
-                            (
-                                QueuedOperation::Merged(merged),
-                                DenseWorkKind::Merged { outputs, .. },
-                            ) => {
-                                if built.merged_ok {
-                                    let node_outputs: Vec<(
-                                        NodeIndex,
-                                        &TensorData,
-                                        Option<NodeIndex>,
-                                    )> = outputs
-                                        .iter()
-                                        .map(|(node, output, claimed)| (*node, output, *claimed))
-                                        .collect();
-                                    recorder.borrow_mut().record_merged_dispatch(
-                                        &node_outputs,
-                                        &built.kernels,
-                                        merged,
-                                    );
-                                } else {
-                                    recorder.borrow_mut().poison();
-                                }
-                            }
-                            (QueuedOperation::QMatMul(_), _) => {
-                                // Quantized matmuls are never part of a flush
-                                // plan (decode graphs are excluded before
-                                // recording arms; this is belt-and-braces).
-                                recorder.borrow_mut().poison();
-                            }
-                            _ => unreachable!("dense work kind matches its queued operation"),
-                        }
-                    }
-                    for prepared in built.prepared {
-                        if let Some((dispatch, name)) = prepared {
-                            let category = on_dispatch_name(&name);
-                            commands.push(CommandRecord::Dispatch(DispatchRecord {
-                                dispatch,
-                                name,
-                                category,
-                            }));
-                        }
-                    }
-                    Self::release_dead_intermediates(
-                        graph,
-                        &[&item.op],
-                        remaining_consumers,
-                        target_set,
-                        ledger,
-                    );
-                }
-            }
-        }
-        if let Some(start) = encode_start {
-            host_profile.prepare_dispatch += start.elapsed();
-        }
-    }
-}
-
 /// Hash one merged dispatch's cache-key material: every segment's kernel
 /// fields plus every MIR input value layout.
 pub(crate) fn hash_merged_segments<O: Operation>(
@@ -1288,5 +497,65 @@ pub(crate) fn hash_merged_segments<O: Operation>(
         for input in inputs {
             hash_mir_value(state, input);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::kernel_selection::CooperativeMatrixKind;
+    use crate::{Device, Tensor};
+
+    #[test]
+    fn standard_graph_merges_independent_qkv_matmuls() {
+        pollster::block_on(async {
+            const D: usize = 64;
+
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let coop_viable = device
+                .coop_token(CooperativeMatrixKind::F32F32M8N8K8)
+                .is_some()
+                && device
+                    .subgroup_config()
+                    .is_some_and(|config| config.is_fixed());
+            if !coop_viable {
+                return;
+            }
+
+            let input_values = (0..D * D)
+                .map(|index| (index % 17) as f32 * 0.125 - 1.0)
+                .collect::<Vec<_>>();
+            let diagonal = |scale: f32| {
+                (0..D * D)
+                    .map(|index| {
+                        let row = index / D;
+                        let column = index % D;
+                        if row == column { scale } else { 0.0 }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let input = Tensor::from_slice(&device, [D, D], &input_values);
+            let q = input.mat_mul(&Tensor::from_slice(&device, [D, D], &diagonal(1.0)));
+            let k = input.mat_mul(&Tensor::from_slice(&device, [D, D], &diagonal(2.0)));
+            let v = input.mat_mul(&Tensor::from_slice(&device, [D, D], &diagonal(-0.5)));
+            let output = &(&q + &k) + &v;
+
+            assert_eq!(
+                output.count_kernels_to_resolve(),
+                2,
+                "Q/K/V should share one matmul dispatch followed by one nary dispatch",
+            );
+            let values = output.as_slice::<2, f32>().await.unwrap();
+            for row in 0..D {
+                for column in 0..D {
+                    let expected = input_values[row * D + column] * 2.5;
+                    assert!(
+                        (values[[row, column]] - expected).abs() < 1e-4,
+                        "mismatch at [{row}, {column}]",
+                    );
+                }
+            }
+        });
     }
 }

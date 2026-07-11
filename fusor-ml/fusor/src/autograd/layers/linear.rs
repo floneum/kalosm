@@ -21,7 +21,7 @@ impl Linear {
 
     /// Import an inference layer as trainable graph leaves, dequantizing the weight to f32.
     pub fn from_inference(graph: &Graph, layer: &crate::layers::Linear<f32>) -> Self {
-        let weight = graph.leaf(layer.weight().dequantize::<2>().to_concrete());
+        let weight = graph.leaf(layer.weight().dequantize::<2>().into_concrete());
         let bias = layer.bias().map(|bias| graph.leaf(bias.clone()));
         Self { weight, bias }
     }

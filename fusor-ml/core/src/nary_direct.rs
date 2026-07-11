@@ -150,17 +150,27 @@ struct MergedRegionKernelVariant;
 fn cross_segment_alias_classes<'a>(
     segments: impl Iterator<Item = &'a [MaybeQData]>,
 ) -> Vec<usize> {
-    let mut ptrs: Vec<usize> = Vec::new();
+    // Sharing equality must match the declare-time dedup exactly: same
+    // buffer, same datatype, same layout.
+    let mut seen: Vec<(usize, Option<(DataTypeEnum, crate::Layout)>)> = Vec::new();
     let mut classes = Vec::new();
     for segment in segments {
         for value in segment {
-            let ptr = match value {
-                MaybeQData::Tensor(tensor) => std::sync::Arc::as_ptr(tensor.buffer()) as usize,
-                MaybeQData::QMatrix(matrix) => std::sync::Arc::as_ptr(matrix.buffer()) as usize,
+            let key = match value {
+                MaybeQData::Tensor(tensor) => (
+                    std::sync::Arc::as_ptr(tensor.buffer()) as usize,
+                    Some((tensor.datatype(), tensor.layout().clone())),
+                ),
+                MaybeQData::QMatrix(matrix) => {
+                    (std::sync::Arc::as_ptr(matrix.buffer()) as usize, None)
+                }
             };
-            let class = ptrs.iter().position(|&p| p == ptr).unwrap_or(ptrs.len());
+            let class = seen
+                .iter()
+                .position(|entry| *entry == key)
+                .unwrap_or(seen.len());
             classes.push(class);
-            ptrs.push(ptr);
+            seen.push(key);
         }
     }
     classes
@@ -297,7 +307,8 @@ pub(crate) fn build_merged_region_kernel(
             // tensor read by every optimizer segment) bind once: wgpu
             // rejects one buffer bound at several slots of a dispatch, and
             // one binding is cheaper anyway.
-            let mut shared_reads: Vec<(usize, DataTypeEnum, Storage2, TensorMeta)> = Vec::new();
+            let mut shared_reads: Vec<(usize, DataTypeEnum, crate::Layout, Storage2, TensorMeta)> =
+                Vec::new();
             for (op, segment) in segments.iter().zip(&prepared) {
                 let input_count = op.inputs.len();
                 let folded_inputs: rustc_hash::FxHashSet<usize> =
@@ -318,16 +329,26 @@ pub(crate) fn build_merged_region_kernel(
                     {
                         let ptr = std::sync::Arc::as_ptr(tensor.buffer()) as usize;
                         let datatype = tensor.datatype();
-                        if let Some((_, _, storage, meta)) = shared_reads
-                            .iter()
-                            .find(|(p, d, _, _)| *p == ptr && *d == datatype)
+                        // Only reads through the identical view share a
+                        // binding: the same buffer read through different
+                        // layouts needs its own metadata.
+                        if let Some((.., storage, meta)) =
+                            shared_reads.iter().find(|(p, d, layout, _, _)| {
+                                *p == ptr && *d == datatype && layout == tensor.layout()
+                            })
                         {
                             storages.push(storage.clone());
                             metas.push(meta.clone());
                             continue;
                         }
                         let (storage, meta) = declare_value(kb, value, false)?;
-                        shared_reads.push((ptr, datatype, storage.clone(), meta.clone()));
+                        shared_reads.push((
+                            ptr,
+                            datatype,
+                            tensor.layout().clone(),
+                            storage.clone(),
+                            meta.clone(),
+                        ));
                         storages.push(storage);
                         metas.push(meta);
                         continue;

@@ -383,6 +383,21 @@ where
         }
     }
 
+    /// Materialize the tensor while consuming its current handle.
+    ///
+    /// This is equivalent to [`Tensor::to_concrete`], but avoids creating a
+    /// redundant GPU graph alias when the caller no longer needs `self`.
+    pub fn into_concrete(self) -> Tensor<R, D>
+    where
+        B: TensorBacking<R>,
+        D: SimdElement,
+    {
+        match self {
+            Tensor::Cpu(t) => Tensor::Cpu(t.to_concrete()),
+            Tensor::Gpu(t) => Tensor::Gpu(t),
+        }
+    }
+
     /// Resolve any pending work for this tensor without downloading it.
     pub async fn materialize(&self)
     where

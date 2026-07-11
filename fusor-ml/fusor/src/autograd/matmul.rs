@@ -81,7 +81,7 @@ impl<const R: usize> Tensor<R> {
             let out_shape: [usize; R] = std::array::from_fn(|_| n);
             return self.reshape([1, k]).q_mat_mul(weights).reshape(out_shape);
         }
-        let value = self.value.q_mat_mul(weights).to_concrete();
+        let value = self.value.q_mat_mul(weights).into_concrete();
         if !self.requires_grad() {
             return self.emit_op(value, vec![self.handle.clone()], None);
         }
@@ -103,7 +103,7 @@ impl<const R: usize> Tensor<R> {
             let weight = dequantized
                 .transpose(0, 1)
                 .reshape(weight_shape)
-                .to_concrete();
+                .into_concrete();
             let weight = Tensor::constant_from_raw(&input.graph(), weight);
             input.mat_mul_internal(&weight)
         })

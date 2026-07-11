@@ -1,4 +1,4 @@
-use std::{fmt, hash::Hash};
+use std::hash::Hash;
 
 use crate::{
     DataTypeEnum, Device, Layout, Tensor, TensorData,
@@ -12,7 +12,7 @@ use crate::{
         inputs::MirValue,
         kernel_backend,
         kernel_backend::DirectKernel,
-        operation::Operation,
+        operation::{DirectKernelLoweringError, DirectKernelPlan, Operation},
         tile_direct::{
             flatten_matrix_layout, tile_storage_read_with_direct_layout,
             tile_storage_read_with_direct_layout_typed, tile_storage_write_with_direct_layout,
@@ -589,48 +589,6 @@ pub(crate) struct DirectKernelTensors<'a> {
     pub pre_extra_tensors: &'a [&'a TensorData],
     pub post_extra_tensors: &'a [&'a TensorData],
     pub output: &'a TensorData,
-}
-
-pub(crate) enum QMatMulKernelPlan {
-    EmptyOutput,
-    Kernels(Vec<DirectKernel>),
-}
-
-impl QMatMulKernelPlan {
-    pub(crate) fn dispatch_count(&self) -> usize {
-        match self {
-            Self::EmptyOutput => 0,
-            Self::Kernels(kernels) => kernels.len(),
-        }
-    }
-
-    pub(crate) fn into_kernels(self) -> Vec<DirectKernel> {
-        match self {
-            Self::EmptyOutput => Vec::new(),
-            Self::Kernels(kernels) => kernels,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct QMatMulLoweringError {
-    operation: String,
-}
-
-impl QMatMulLoweringError {
-    fn new(operation: String) -> Self {
-        Self { operation }
-    }
-}
-
-impl fmt::Display for QMatMulLoweringError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "QMatMul lowering produced no kernel plan for {}",
-            self.operation
-        )
-    }
 }
 
 pub(crate) struct DirectKernelChains<'a> {

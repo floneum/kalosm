@@ -9,7 +9,7 @@ impl<const R: usize> Tensor<R> {
         let input_shape = self.shape();
         assert!(dimension < R, "index_select dimension out of bounds");
 
-        let value = self.value.index_select(dimension, indices).to_concrete();
+        let value = self.value.index_select(dimension, indices).into_concrete();
         let input_id = self.handle.id;
         let indices = indices.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
@@ -21,7 +21,7 @@ impl<const R: usize> Tensor<R> {
             let moved = if dimension == 0 {
                 gradient
             } else {
-                gradient.transpose(0, dimension).to_concrete()
+                gradient.transpose(0, dimension).into_concrete()
             };
             let moved_shape = moved.shape();
             let rest = moved_shape[1..].iter().product::<usize>();
@@ -31,9 +31,9 @@ impl<const R: usize> Tensor<R> {
             unmoved_shape[0] = input_shape[dimension];
             let scattered = scattered.reshape(unmoved_shape);
             let input_gradient = if dimension == 0 {
-                scattered.to_concrete()
+                scattered.into_concrete()
             } else {
-                scattered.to_concrete().transpose(0, dimension).to_concrete()
+                scattered.into_concrete().transpose(0, dimension).into_concrete()
             };
             Ok(vec![BackwardTarget {
                 node: input_id,
@@ -78,9 +78,9 @@ impl Tensor<2> {
             .collect::<Vec<_>>();
         let row_offsets: RawTensor<1, u32> =
             RawTensor::from_slice(&device, [shape[0]], &row_offsets);
-        let linear_indices = (row_offsets + indices.clone()).to_concrete();
-        let flat = self.value.reshape([shape[0] * width]).to_concrete();
-        let value = flat.index_select(0, &linear_indices).to_concrete();
+        let linear_indices = (row_offsets + indices.clone()).into_concrete();
+        let flat = self.value.reshape([shape[0] * width]).into_concrete();
+        let value = flat.index_select(0, &linear_indices).into_concrete();
         let input_id = self.handle.id;
         let indices = indices.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
@@ -115,18 +115,18 @@ impl Tensor<2> {
         // logits directly.
         let max = logits.max_keepdim::<1>(1);
         let shifted_exp = (&logits - &max.broadcast_as([rows, width]))
-            .to_concrete()
+            .into_concrete()
             .exp()
-            .to_concrete();
-        let lse_total = (shifted_exp.sum_keepdim::<1>(1).to_concrete().log().to_concrete() + max)
-            .to_concrete();
+            .into_concrete();
+        let lse_total = (shifted_exp.sum_keepdim::<1>(1).into_concrete().log().into_concrete() + max)
+            .into_concrete();
         let row_offsets: Vec<u32> = (0..rows).map(|row| (row * width) as u32).collect();
         let row_offsets: RawTensor<1, u32> = RawTensor::from_slice(&device, [rows], &row_offsets);
-        let linear = (row_offsets + targets.clone()).to_concrete();
-        let flat = logits.reshape([rows * width]).to_concrete();
-        let picked = flat.index_select(0, &linear).to_concrete();
-        let per_row = (lse_total.reshape([rows]).to_concrete() - picked).to_concrete();
-        let value = (per_row.sum::<0>(0) * (1.0 / rows as f32)).to_concrete();
+        let linear = (row_offsets + targets.clone()).into_concrete();
+        let flat = logits.reshape([rows * width]).into_concrete();
+        let picked = flat.index_select(0, &linear).into_concrete();
+        let per_row = (lse_total.reshape([rows]).into_concrete() - picked).into_concrete();
+        let value = (per_row.sum::<0>(0) * (1.0 / rows as f32)).into_concrete();
 
         let input_id = self.handle.id;
         let logits_value = self.value.clone();
@@ -135,9 +135,9 @@ impl Tensor<2> {
             let grad = downcast_tensor::<0>(&*gradient, "softmax_cross_entropy")?;
             let probs = logits_value.softmax_last_dim::<1>();
             let one_hot = one_hot_matrix(&targets, width);
-            let scale = (grad.reshape([1, 1]).to_concrete() * (1.0 / rows as f32)).to_concrete();
-            let diff = (probs - one_hot).to_concrete();
-            let dlogits = (&diff * &scale.broadcast_as([rows, width])).to_concrete();
+            let scale = (grad.reshape([1, 1]).into_concrete() * (1.0 / rows as f32)).into_concrete();
+            let diff = (probs - one_hot).into_concrete();
+            let dlogits = (&diff * &scale.broadcast_as([rows, width])).into_concrete();
             Ok(vec![BackwardTarget {
                 node: input_id,
                 gradient: Box::new(dlogits),
@@ -149,7 +149,7 @@ impl Tensor<2> {
     pub fn embedding(&self, indices: &RawTensor<2, u32>) -> Tensor<3> {
         let [rows, columns] = indices.shape();
         let width = self.shape()[1];
-        let flat_indices = indices.clone().reshape([rows * columns]).to_concrete();
+        let flat_indices = indices.clone().reshape([rows * columns]).into_concrete();
         self.index_select(0, &flat_indices)
             .reshape([rows, columns, width])
     }
@@ -193,6 +193,6 @@ fn one_hot_matrix(indices: &RawTensor<1, u32>, size: usize) -> RawTensor<2, f32>
         .map(|position| position as f32)
         .collect::<Vec<_>>();
     let positions: RawTensor<2, f32> = RawTensor::from_slice(&device, [1, size], &positions);
-    let indices = indices.cast::<f32>().reshape([rows, 1]).to_concrete();
+    let indices = indices.cast::<f32>().reshape([rows, 1]).into_concrete();
     indices.sub_(&positions).eq(0.0)
 }

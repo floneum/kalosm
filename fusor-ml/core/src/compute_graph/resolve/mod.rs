@@ -1,3 +1,11 @@
+//! One materialization pipeline for the lazy compute graph.
+//!
+//! A resolve builds the temporary execution graph, recognizes specialized
+//! operations, runs one policy-driven rewrite fixpoint, lowers nodes into an
+//! operation queue, builds complete kernel plans, and encodes the resulting
+//! command records. Flush replay skips deterministic planning but rejoins the
+//! same command-record encoder.
+
 use std::{collections::VecDeque, str::FromStr, sync::Arc};
 
 use web_time::{Duration, Instant};
@@ -36,6 +44,7 @@ mod fusion_region;
 mod fusion_row;
 pub(crate) mod merge_horizontal;
 mod plan_cache;
+mod queue_executor;
 mod recognize;
 mod recognize_attention;
 mod recognize_cat;
@@ -75,22 +84,19 @@ enum CommandRecord {
 }
 
 enum QueuedOperation {
-    Generic(Arc<dyn Operation>),
-    QMatMul(Box<QMatMulOperation>),
-    /// Independent same-category operations merged into one dispatch (dense
-    /// training graphs only; see `merge_horizontal`).
+    Operation(Arc<dyn Operation>),
+    /// Independent compatible operations merged into one dispatch (see
+    /// `merge_horizontal`).
     Merged(merge_horizontal::MergedSegments),
 }
 
 impl QueuedOperation {
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
         match self {
-            Self::Generic(operation) => operation.visit_dependencies(f),
-            Self::QMatMul(operation) => operation.visit_dependencies(f),
+            Self::Operation(operation) => operation.visit_dependencies(f),
             Self::Merged(merged) => merged.visit_dependencies(f),
         }
     }
-
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -131,6 +137,8 @@ struct ResolveHostProfile {
     profile_readback: Duration,
 }
 
+const LARGE_GRAPH_NARY_FUSION_MIN_LAST_DIM: usize = 512;
+
 #[derive(Default)]
 struct OptimizeProfile {
     iterations: usize,
@@ -163,7 +171,6 @@ fuse_matmul_count={} fuse_matmul={:?}",
 }
 
 const DEFAULT_OPTIMIZE_NODE_LIMIT: usize = 512;
-const LARGE_GRAPH_NARY_FUSION_MIN_LAST_DIM: usize = 512;
 
 fn optimize_node_limit() -> usize {
     std::env::var("FUSOR_RESOLVE_OPTIMIZE_MAX_NODES")
@@ -338,15 +345,16 @@ pub(crate) struct Resolver {
     layout_pass: LayoutPass,
     targets: Vec<NodeIndex>,
     resolved_set: FxHashSet<NodeIndex>,
-    // Flush-plan recorder, armed only by `new_batch_with_recording` (called
-    // exclusively from `flush_all_pending` for QMatMul-free graphs). `None`
-    // on every other resolve path, so decode resolves never record.
+    // Materialization-plan recorder, armed only on the second sighting of an
+    // isomorphic QMatMul-free target set. `None` on first-seen and quantized
+    // resolve paths, so decode resolves never record.
     // `RefCell` because some hook sites (`add_physical_dependencies`) only
     // hold `&self`.
     recorder: Option<std::cell::RefCell<flush_replay::PlanRecorder>>,
-    // Set by `optimize_large_graph`'s dense branch only: large QMatMul-free
-    // graphs may merge independent same-category ops into one dispatch.
+    // QMatMul-free graphs may merge independent cooperative matmuls. The
+    // large dense profile additionally merges row and elementwise work.
     horizontal_merge: bool,
+    horizontal_merge_dense_ops: bool,
 }
 
 impl Resolver {
@@ -376,6 +384,7 @@ impl Resolver {
             resolved_set,
             recorder: None,
             horizontal_merge: false,
+            horizontal_merge_dense_ops: false,
         }
     }
 

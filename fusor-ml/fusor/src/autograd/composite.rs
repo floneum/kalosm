@@ -143,15 +143,15 @@ impl<const R: usize> Tensor<R> {
         let value = self
             .value
             .softmax_last_dim_fused::<OUT_RANK>()
-            .to_concrete();
+            .into_concrete();
         // Analytic softmax backward: dS = P * (dP - rowsum(dP * P)).
         // The product inside the row sum is written inline so the reduce
         // absorbs it, and the output is a single P * (dP - s) expression.
         self.unary_from_value(value, move |grad, probs| {
             let shape = probs.shape();
-            let row_sum = (&probs * &grad).to_concrete().sum_keepdim::<OUT_RANK>(R - 1);
-            let shifted = (&grad - &row_sum.broadcast_as(shape)).to_concrete();
-            (&probs * &shifted).to_concrete()
+            let row_sum = (&probs * &grad).into_concrete().sum_keepdim::<OUT_RANK>(R - 1);
+            let shifted = (&grad - &row_sum.broadcast_as(shape)).into_concrete();
+            (&probs * &shifted).into_concrete()
         })
     }
 
@@ -310,25 +310,25 @@ impl<const R: usize> Tensor<R> {
 
             let x = input_value.to_concrete();
             let mean = x.mean_keepdim::<OUT_RANK>(R - 1);
-            let centered = (&x - &mean.broadcast_as(shape)).to_concrete();
-            let var = centered.sqr().to_concrete().mean_keepdim::<OUT_RANK>(R - 1);
-            let std = var.add_scalar(eps).sqrt().to_concrete();
-            let xhat = (&centered / &std.broadcast_as(shape)).to_concrete();
+            let centered = (&x - &mean.broadcast_as(shape)).into_concrete();
+            let var = centered.sqr().into_concrete().mean_keepdim::<OUT_RANK>(R - 1);
+            let std = var.add_scalar(eps).sqrt().into_concrete();
+            let xhat = (&centered / &std.broadcast_as(shape)).into_concrete();
 
-            let weight_row = weight_value.reshape(param_shape).to_concrete();
-            let dxhat = (&dy * &weight_row.broadcast_as(shape)).to_concrete();
+            let weight_row = weight_value.reshape(param_shape).into_concrete();
+            let dxhat = (&dy * &weight_row.broadcast_as(shape)).into_concrete();
             let m1 = dxhat.mean_keepdim::<OUT_RANK>(R - 1);
-            let dxhat_xhat = (&dxhat * &xhat).to_concrete();
+            let dxhat_xhat = (&dxhat * &xhat).into_concrete();
             let m2 = dxhat_xhat.mean_keepdim::<OUT_RANK>(R - 1);
-            let recentered = (&dxhat - &m1.broadcast_as(shape)).to_concrete();
-            let projected = (&xhat * &m2.broadcast_as(shape)).to_concrete();
-            let dx_num = (recentered - projected).to_concrete();
-            let dx = (&dx_num / &std.broadcast_as(shape)).to_concrete();
+            let recentered = (&dxhat - &m1.broadcast_as(shape)).into_concrete();
+            let projected = (&xhat * &m2.broadcast_as(shape)).into_concrete();
+            let dx_num = (recentered - projected).into_concrete();
+            let dx = (&dx_num / &std.broadcast_as(shape)).into_concrete();
 
-            let dy_flat = dy.reshape([rows, n]).to_concrete();
-            let xhat_flat = xhat.reshape([rows, n]).to_concrete();
-            let dw_flat = (&dy_flat * &xhat_flat).to_concrete().sum::<1>(0);
-            let dw = dw_flat.reshape(weight_shape).to_concrete();
+            let dy_flat = dy.reshape([rows, n]).into_concrete();
+            let xhat_flat = xhat.reshape([rows, n]).into_concrete();
+            let dw_flat = (&dy_flat * &xhat_flat).into_concrete().sum::<1>(0);
+            let dw = dw_flat.reshape(weight_shape).into_concrete();
 
             let mut targets = vec![
                 BackwardTarget {
@@ -341,7 +341,7 @@ impl<const R: usize> Tensor<R> {
                 },
             ];
             if let Some(bias_id) = bias_id {
-                let db = dy_flat.sum::<1>(0).reshape(weight_shape).to_concrete();
+                let db = dy_flat.sum::<1>(0).reshape(weight_shape).into_concrete();
                 targets.push(BackwardTarget {
                     node: bias_id,
                     gradient: Box::new(db),
@@ -719,7 +719,7 @@ impl Tensor<4> {
         assert_same_graph(self, cos);
         assert_same_graph(self, sin);
 
-        let value = self.value.rope_fused(&cos.value, &sin.value).to_concrete();
+        let value = self.value.rope_fused(&cos.value, &sin.value).into_concrete();
         self.replay_ternary(cos, sin, "rope_fused", value, |input, cos, sin| {
             input.rope_interleaved_composite(&cos, &sin)
         })
@@ -732,7 +732,7 @@ impl Tensor<4> {
         let value = self
             .value
             .rope_normal_fused(&cos.value, &sin.value)
-            .to_concrete();
+            .into_concrete();
         self.replay_ternary(cos, sin, "rope_normal_fused", value, |input, cos, sin| {
             input.rope(&cos, &sin)
         })
@@ -750,14 +750,14 @@ impl Tensor<4> {
                 cos,
                 sin,
                 "rope_pair_fused",
-                q_value.to_concrete(),
+                q_value.into_concrete(),
                 |input, cos, sin| input.rope_interleaved_composite(&cos, &sin),
             ),
             k.replay_ternary(
                 cos,
                 sin,
                 "rope_pair_fused",
-                k_value.to_concrete(),
+                k_value.into_concrete(),
                 |input, cos, sin| input.rope_interleaved_composite(&cos, &sin),
             ),
         )
@@ -777,14 +777,14 @@ impl Tensor<4> {
                 cos,
                 sin,
                 "rope_normal_pair_fused",
-                q_value.to_concrete(),
+                q_value.into_concrete(),
                 |input, cos, sin| input.rope(&cos, &sin),
             ),
             k.replay_ternary(
                 cos,
                 sin,
                 "rope_normal_pair_fused",
-                k_value.to_concrete(),
+                k_value.into_concrete(),
                 |input, cos, sin| input.rope(&cos, &sin),
             ),
         )
@@ -798,7 +798,7 @@ impl Tensor<4> {
         let seq_len = self.shape()[2];
         let graph = self.graph();
         let table = |table: RawTensor<2, f32>| {
-            Tensor::constant_from_raw(&graph, table.narrow(0, start_pos, seq_len).to_concrete())
+            Tensor::constant_from_raw(&graph, table.narrow(0, start_pos, seq_len).into_concrete())
         };
         (table(cache.cos().clone()), table(cache.sin().clone()))
     }

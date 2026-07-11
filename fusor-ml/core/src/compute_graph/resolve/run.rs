@@ -39,25 +39,26 @@ impl Resolver {
         {
             let start = host_trace.then(Instant::now);
             let optimize_limit = optimize_node_limit();
-            let skip_large_graph_optimize =
-                optimize_limit != 0 && self.execution_graph.node_count() > optimize_limit;
-            let skip_decode_optimize = skip_large_graph_optimize
-                && self.is_single_token_qmatmul_graph()
-                && std::env::var_os("FUSOR_RESOLVE_OPTIMIZE_DECODE_GRAPHS").is_none();
-            if std::env::var_os("FUSOR_RESOLVE_SKIP_OPTIMIZE").is_none() {
-                if skip_large_graph_optimize {
-                    self.optimize_large_graph(graph);
-                } else {
-                    self.optimize(graph);
-                }
-            }
+            let node_count = self.execution_graph.node_count();
+            let large_graph_profile = optimize_limit != 0 && node_count > optimize_limit;
+            let policy = super::execution::OptimizePolicy::select(
+                node_count,
+                optimize_limit,
+                std::env::var_os("FUSOR_RESOLVE_OPTIMIZE_DECODE_GRAPHS").is_some(),
+            );
+            let fixpoint_ran = if std::env::var_os("FUSOR_RESOLVE_SKIP_OPTIMIZE").is_none() {
+                Some(self.optimize(graph, policy))
+            } else {
+                None
+            };
             if let Some(start) = start {
                 host_profile.optimize += start.elapsed();
             }
-            if host_trace && skip_large_graph_optimize {
+            if host_trace && large_graph_profile {
                 tracing::info!(
-                    "resolve_host_profile optimize_large_graph node_count={} limit={optimize_limit} skipped_decode={skip_decode_optimize}",
-                    self.execution_graph.node_count(),
+                    "resolve_host_profile optimizer_policy={} node_count={node_count} limit={optimize_limit} skipped_decode_fixpoint={}",
+                    policy.label(),
+                    fixpoint_ran == Some(false),
                 );
             }
         }
@@ -80,8 +81,11 @@ impl Resolver {
 
         {
             let start = host_trace.then(Instant::now);
-            let mut merger =
-                merge_horizontal::HorizontalMerger::new(self.horizontal_merge, &device);
+            let mut merger = merge_horizontal::HorizontalMerger::new(
+                self.horizontal_merge,
+                self.horizontal_merge_dense_ops,
+                &device,
+            );
             for idx in sorted_nodes {
                 let node = &self.execution_graph[idx];
                 // Handle Tensor caching explicitly here
@@ -150,38 +154,38 @@ impl Resolver {
         let plan_cache_enabled = device.kernel_cache().direct_plan_cache().enabled();
         // Every graph takes the three-phase queue runner: serial input
         // gathering, parallel kernel building, serial recording/encoding.
-        // Horizontal merging stays gated on the dense large-graph optimizer,
-        // so small and decode graphs get the parallel builds with
-        // byte-identical standalone kernels.
-        let mut ledger =
-            super::alloc_reuse::BufferLedger::new(&device, Some(&remaining_consumers));
+        // Standard dense graphs may merge compatible matmuls; row and region
+        // merging stays gated on the dense large-graph optimizer. Quantized
+        // decode graphs retain their standalone kernels.
+        let mut ledger = super::alloc_reuse::BufferLedger::new(&device, Some(&remaining_consumers));
         if let Some(recorder) = &self.recorder {
             ledger.register_recorder_pins(recorder.borrow().pinned_ptrs());
         }
-        self.run_dense_queue(
-                graph,
-                &device,
-                max_subgroup_size,
-                queued_operations,
-                &mut remaining_consumers,
-                &target_set,
-                &mut ledger,
-                plan_cache_enabled,
-                &mut commands,
-                &mut host_profile,
-                host_trace,
-                &mut |name: &str| {
-                    collect_dispatch_metadata.then(|| {
-                        let category = dispatch_category(name);
-                        if trace {
-                            *dispatch_categories.entry(category.clone()).or_default() += 1;
-                            if trace_names {
-                                *dispatch_names.entry(name.to_string()).or_default() += 1;
-                            }
+        Self::execute_queue(
+            self.recorder.as_ref(),
+            graph,
+            &device,
+            max_subgroup_size,
+            queued_operations,
+            &mut remaining_consumers,
+            &target_set,
+            &mut ledger,
+            plan_cache_enabled,
+            &mut commands,
+            &mut host_profile,
+            host_trace,
+            &mut |name: &str| {
+                collect_dispatch_metadata.then(|| {
+                    let category = dispatch_category(name);
+                    if trace {
+                        *dispatch_categories.entry(category.clone()).or_default() += 1;
+                        if trace_names {
+                            *dispatch_names.entry(name.to_string()).or_default() += 1;
                         }
-                        category
-                    })
-                },
+                    }
+                    category
+                })
+            },
         );
         let total_kernels = commands
             .iter()
@@ -260,97 +264,121 @@ impl Resolver {
 
         if !commands.is_empty() {
             let encode_start = host_trace.then(Instant::now);
-            let mut dispatch_index = 0usize;
-            let mut command_index = 0usize;
-            let dispatches_per_pass = dispatches_per_pass(total_kernels);
-            let dispatches_per_submit = dispatches_per_submit(total_kernels, device.backend());
-            let wait_after_chunk_submit = device.backend() == wgpu::Backend::Metal;
-            let mut dispatches_in_submit = 0usize;
-            let mut encoder_has_commands = false;
-            while command_index < commands.len() {
-                if encoder_has_commands && dispatches_in_submit >= dispatches_per_submit {
-                    let next_encoder = resolver_command_encoder(&device);
-                    let ready_encoder = std::mem::replace(&mut command_encoder, next_encoder);
-                    submit_resolver_encoder(
-                        &device,
-                        ready_encoder,
-                        wait_after_chunk_submit,
-                        host_trace,
-                        &mut host_profile,
-                    );
-                    encoder_has_commands = false;
-                    dispatches_in_submit = 0;
-                }
-                match &commands[command_index] {
-                    CommandRecord::CopyBuffer(copy) => {
-                        command_encoder.copy_buffer_to_buffer(
-                            &copy.source,
-                            copy.source_offset,
-                            &copy.destination,
-                            copy.destination_offset,
-                            copy.size,
+            if query_resources.is_none() {
+                command_encoder = super::queue_executor::encode_command_records(
+                    &device,
+                    &commands,
+                    total_kernels,
+                    command_encoder,
+                    |encoder, wait| {
+                        submit_resolver_encoder(
+                            &device,
+                            encoder,
+                            wait,
+                            host_trace,
+                            &mut host_profile,
                         );
-                        encoder_has_commands = true;
-                        command_index += 1;
+                    },
+                );
+            } else {
+                let mut dispatch_index = 0usize;
+                let mut command_index = 0usize;
+                let dispatches_per_pass = dispatches_per_pass(total_kernels);
+                let dispatches_per_submit = dispatches_per_submit(total_kernels, device.backend());
+                let wait_after_chunk_submit = device.backend() == wgpu::Backend::Metal;
+                let mut dispatches_in_submit = 0usize;
+                let mut encoder_has_commands = false;
+                while command_index < commands.len() {
+                    if encoder_has_commands && dispatches_in_submit >= dispatches_per_submit {
+                        let next_encoder = resolver_command_encoder(&device);
+                        let ready_encoder = std::mem::replace(&mut command_encoder, next_encoder);
+                        submit_resolver_encoder(
+                            &device,
+                            ready_encoder,
+                            wait_after_chunk_submit,
+                            host_trace,
+                            &mut host_profile,
+                        );
+                        encoder_has_commands = false;
+                        dispatches_in_submit = 0;
                     }
-                    CommandRecord::Dispatch(_) => {
-                        if let Some((query_set, _, _, _)) = &query_resources
-                            && !profile_inside_pass_timestamps
-                        {
-                            if let CommandRecord::Dispatch(record) = &commands[command_index] {
-                                let mut pass = command_encoder.begin_compute_pass(
-                                    &wgpu::ComputePassDescriptor {
-                                        label: Some(record.name.as_str()),
-                                        timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
-                                            query_set,
-                                            beginning_of_pass_write_index: Some(
-                                                (dispatch_index * 2) as u32,
-                                            ),
-                                            end_of_pass_write_index: Some(
-                                                (dispatch_index * 2 + 1) as u32,
-                                            ),
-                                        }),
-                                    },
-                                );
-                                record.dispatch.run(&mut pass);
-                            }
-                            dispatch_index += 1;
-                            dispatches_in_submit += 1;
+                    match &commands[command_index] {
+                        CommandRecord::CopyBuffer(copy) => {
+                            command_encoder.copy_buffer_to_buffer(
+                                &copy.source,
+                                copy.source_offset,
+                                &copy.destination,
+                                copy.destination_offset,
+                                copy.size,
+                            );
                             encoder_has_commands = true;
                             command_index += 1;
-                            continue;
                         }
+                        CommandRecord::Dispatch(_) => {
+                            if let Some((query_set, _, _, _)) = &query_resources
+                                && !profile_inside_pass_timestamps
+                            {
+                                if let CommandRecord::Dispatch(record) = &commands[command_index] {
+                                    let mut pass = command_encoder.begin_compute_pass(
+                                        &wgpu::ComputePassDescriptor {
+                                            label: Some(record.name.as_str()),
+                                            timestamp_writes: Some(
+                                                wgpu::ComputePassTimestampWrites {
+                                                    query_set,
+                                                    beginning_of_pass_write_index: Some(
+                                                        (dispatch_index * 2) as u32,
+                                                    ),
+                                                    end_of_pass_write_index: Some(
+                                                        (dispatch_index * 2 + 1) as u32,
+                                                    ),
+                                                },
+                                            ),
+                                        },
+                                    );
+                                    record.dispatch.run(&mut pass);
+                                }
+                                dispatch_index += 1;
+                                dispatches_in_submit += 1;
+                                encoder_has_commands = true;
+                                command_index += 1;
+                                continue;
+                            }
 
-                        let mut pass =
-                            command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                label: Some("Resolver Direct Kernels"),
-                                timestamp_writes: None,
-                            });
-                        let mut pass_dispatches = 0usize;
-                        while command_index < commands.len() {
-                            if pass_dispatches >= dispatches_per_pass {
-                                break;
+                            let mut pass =
+                                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                    label: Some("Resolver Direct Kernels"),
+                                    timestamp_writes: None,
+                                });
+                            let mut pass_dispatches = 0usize;
+                            while command_index < commands.len() {
+                                if pass_dispatches >= dispatches_per_pass {
+                                    break;
+                                }
+                                if dispatches_in_submit >= dispatches_per_submit {
+                                    break;
+                                }
+                                let CommandRecord::Dispatch(record) = &commands[command_index]
+                                else {
+                                    break;
+                                };
+                                if let Some((query_set, _, _, _)) = &query_resources {
+                                    pass.write_timestamp(query_set, (dispatch_index * 2) as u32);
+                                }
+                                pass.push_debug_group(&record.name);
+                                record.dispatch.run(&mut pass);
+                                pass.pop_debug_group();
+                                if let Some((query_set, _, _, _)) = &query_resources {
+                                    pass.write_timestamp(
+                                        query_set,
+                                        (dispatch_index * 2 + 1) as u32,
+                                    );
+                                }
+                                dispatch_index += 1;
+                                dispatches_in_submit += 1;
+                                command_index += 1;
+                                pass_dispatches += 1;
+                                encoder_has_commands = true;
                             }
-                            if dispatches_in_submit >= dispatches_per_submit {
-                                break;
-                            }
-                            let CommandRecord::Dispatch(record) = &commands[command_index] else {
-                                break;
-                            };
-                            if let Some((query_set, _, _, _)) = &query_resources {
-                                pass.write_timestamp(query_set, (dispatch_index * 2) as u32);
-                            }
-                            pass.push_debug_group(&record.name);
-                            record.dispatch.run(&mut pass);
-                            pass.pop_debug_group();
-                            if let Some((query_set, _, _, _)) = &query_resources {
-                                pass.write_timestamp(query_set, (dispatch_index * 2 + 1) as u32);
-                            }
-                            dispatch_index += 1;
-                            dispatches_in_submit += 1;
-                            command_index += 1;
-                            pass_dispatches += 1;
-                            encoder_has_commands = true;
                         }
                     }
                 }

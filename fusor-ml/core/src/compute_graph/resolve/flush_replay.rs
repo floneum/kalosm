@@ -1,14 +1,15 @@
-//! Whole-flush plan replay for dense (QMatMul-free) graphs.
+//! Reusable materialization-plan replay for dense (QMatMul-free) graphs.
 //!
-//! Training loops flush an isomorphic tape every step: the same operations,
-//! shapes, and expressions over fresh graph nodes and fresh input buffers.
+//! Training loops flush an isomorphic tape every step, while iterative dense
+//! inference repeatedly resolves one isomorphic output graph. Both present
+//! the same operations, shapes, and expressions over fresh nodes and buffers.
 //! The full resolver pipeline (execution-graph build, recognition + fusion,
 //! toposort, lowering, consumer counting, per-op input gathering, workgroup
 //! solving, and kernel building) is fully deterministic given that structure,
 //! so its outcome can be recorded once and replayed on later steps.
 //!
-//! A replayed flush skips every deterministic pass and only re-runs the
-//! intrinsically per-step work: output-buffer allocation, positional buffer
+//! A replayed materialization skips every deterministic pass and only re-runs
+//! the intrinsically per-step work: output-buffer allocation, positional buffer
 //! rebinding ([`DirectKernelTemplate::bind_buffers`]), bind-group creation,
 //! command encoding, and liveness bookkeeping.
 //!
@@ -47,7 +48,6 @@ use parking_lot::Mutex;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHasher};
 use web_time::Instant;
 
-use super::run::{dispatches_per_pass, dispatches_per_submit};
 use super::{
     CommandRecord, ComputeGraphInner, ComputeGraphNodeVariant, DispatchRecord, NodeIndex,
     QueuedOperation, Resolver,
@@ -59,7 +59,7 @@ use crate::{DataTypeEnum, Device, Layout};
 
 /// Bump when anything about the recorded plan layout or the fingerprint
 /// recipe changes, so stale entries can never be replayed.
-const REPLAY_RECIPE_VERSION: u64 = 5;
+const REPLAY_RECIPE_VERSION: u64 = 6;
 
 const FLUSH_PLAN_CACHE_SIZE: usize = 8;
 
@@ -73,6 +73,21 @@ pub(crate) enum FlushPlanEntry {
     /// second occurrence so one-shot workloads never pay plan construction.
     Seen,
     Recorded(Arc<FlushPlan>),
+}
+
+/// The reusable-plan decision for one materialization boundary. Both batched
+/// flushes and ordinary single-target resolves enter through this gate so an
+/// isomorphic graph has one cache lifecycle: see it, record it, then replay.
+pub(crate) enum ReplayAction {
+    Resolve,
+    Record {
+        key: FlushPlanKey,
+        fingerprint: FlushFingerprint,
+    },
+    Replay {
+        plan: Arc<FlushPlan>,
+        fingerprint: FlushFingerprint,
+    },
 }
 
 /// Per-device two-touch LRU of flush plans. Lives on `DeviceInner` beside the
@@ -141,11 +156,61 @@ pub(crate) fn replay_enabled() -> bool {
         .all(|var| std::env::var_os(var).is_none())
 }
 
+/// Choose whether `targets` need a full resolve, should record, or can replay.
+///
+/// This performs the QMatrix gate before fingerprinting so quantized decode
+/// retains its historical direct/general resolve paths. A failed replay
+/// validation is non-mutating and falls back to a normal resolve.
+pub(crate) fn prepare_replay(graph: &mut ComputeGraphInner, targets: &[NodeIndex]) -> ReplayAction {
+    if graph.qmatrix_node_count != 0 || !replay_enabled() {
+        return ReplayAction::Resolve;
+    }
+    let Some(fingerprint) = fingerprint_pending(graph, targets) else {
+        return ReplayAction::Resolve;
+    };
+    // A single-target resolve can run while another live output depends on
+    // part of the same graph. That outside descendant affects allocation
+    // claims but is intentionally absent from this target's fingerprint.
+    // Replay only closed materialization boundaries: every live uncached
+    // handle must belong to the fingerprinted dependency closure.
+    if graph.pending_sinks.iter().any(|(&node, _)| {
+        graph
+            .nodes
+            .nodes
+            .node_weight(node)
+            .is_some_and(|data| data.reference_count > 0 && data.cached.is_none())
+            && !fingerprint.pos_of.contains_key(&node)
+    }) {
+        return ReplayAction::Resolve;
+    }
+
+    let device = graph.device();
+    let cache = device.flush_plan_cache();
+    match cache.get(&fingerprint.key) {
+        Some(FlushPlanEntry::Recorded(plan)) => {
+            if validate_replay(graph, &device, &plan, &fingerprint) {
+                ReplayAction::Replay { plan, fingerprint }
+            } else {
+                ReplayAction::Resolve
+            }
+        }
+        Some(FlushPlanEntry::Seen) => ReplayAction::Record {
+            key: fingerprint.key,
+            fingerprint,
+        },
+        None => {
+            cache.insert(fingerprint.key, FlushPlanEntry::Seen);
+            ReplayAction::Resolve
+        }
+    }
+}
+
 /// Env vars that change what the resolver produces. Their values join the
 /// fingerprint so plans recorded under different settings can never collide.
 fn hash_env_snapshot(state: &mut FxHasher) {
     const KEYED_ENVS: &[&str] = &[
         "FUSOR_RESOLVE_SKIP_OPTIMIZE",
+        "FUSOR_RESOLVE_SKIP_ASSIGN_CHAINS",
         "FUSOR_RESOLVE_OPTIMIZE_MAX_NODES",
         "FUSOR_RESOLVE_QMATMUL_ELEMENTWISE_FUSION",
         "FUSOR_RESOLVE_OPTIMIZE_DECODE_GRAPHS",
@@ -154,6 +219,7 @@ fn hash_env_snapshot(state: &mut FxHasher) {
         "FUSOR_DISABLE_HORIZONTAL_FUSION",
         "FUSOR_DISABLE_REGION_FUSION",
         "FUSOR_DISABLE_ALLOC_REUSE",
+        "FUSOR_LAST_LEVEL_CACHE_BYTES",
     ];
     for var in KEYED_ENVS {
         match std::env::var(var) {
@@ -284,7 +350,9 @@ fn fingerprint_visit(
         // collide with a plan whose claims assumed the buffer was dead.
         state.boundary.push(true);
         state.hasher.write_u64(0xB0);
-        state.hasher.write_u64((node_data.reference_count > 0) as u64);
+        state
+            .hasher
+            .write_u64((node_data.reference_count > 0) as u64);
         state.hasher.write_u64(local_hash(|h| {
             cached.datatype().hash(h);
             hash_layout(h, cached.layout());
@@ -338,7 +406,7 @@ fn fingerprint_visit(
     Some(pos)
 }
 
-/// The recorded outcome of one full flush resolve. Strictly bufferless and
+/// The recorded outcome of one materialization. Strictly bufferless and
 /// `NodeIndex`-free; every cross-step reference is a fingerprint slot
 /// position.
 pub(crate) struct FlushPlan {
@@ -402,9 +470,9 @@ enum OutputSource {
     Alias { slot: u32 },
 }
 
-/// Records one full flush resolve into a [`FlushPlan`]. Armed only by
-/// `flush_all_pending` on the second sighting of a fingerprint; every hook is
-/// a no-op once poisoned. Any structure the plan format cannot express
+/// Records one materialization into a [`FlushPlan`]. Armed on the second
+/// sighting of a fingerprint; every hook is a no-op once poisoned. Any
+/// structure the plan format cannot express
 /// (unknown scratch buffers, quantized matmuls) poisons the recording — the
 /// resolve completes normally and no plan is stored.
 pub(crate) struct PlanRecorder {
@@ -526,7 +594,9 @@ impl PlanRecorder {
 
     /// Raw pointers of every buffer this recorder holds a strong clone of.
     pub(super) fn pinned_ptrs(&self) -> impl Iterator<Item = usize> + '_ {
-        self.pinned.iter().map(|buffer| Arc::as_ptr(buffer) as usize)
+        self.pinned
+            .iter()
+            .map(|buffer| Arc::as_ptr(buffer) as usize)
     }
 
     fn pos(&mut self, node: NodeIndex) -> Option<u32> {
@@ -754,8 +824,8 @@ impl PlanRecorder {
 /// Replay a recorded plan against the current step's isomorphic graph.
 /// Returns `false` (without having mutated anything) if upfront validation
 /// fails; the caller then falls back to a full resolve.
-pub(crate) fn try_replay_flush(
-    graph: &mut ComputeGraphInner,
+fn validate_replay(
+    graph: &ComputeGraphInner,
     device: &Device,
     plan: &FlushPlan,
     fingerprint: &FlushFingerprint,
@@ -774,13 +844,13 @@ pub(crate) fn try_replay_flush(
         if node.cached.is_some() {
             return false;
         }
-        match (&node.variant, kind) {
-            (ComputeGraphNodeVariant::Tensor(_), 0) => true,
-            (ComputeGraphNodeVariant::View(_), 1) => true,
-            (ComputeGraphNodeVariant::Assign(_), 2) => true,
-            (_, 3) => true,
-            _ => false,
-        }
+        matches!(
+            (&node.variant, kind),
+            (ComputeGraphNodeVariant::Tensor(_), 0)
+                | (ComputeGraphNodeVariant::View(_), 1)
+                | (ComputeGraphNodeVariant::Assign(_), 2)
+                | (_, 3)
+        )
     };
     // An alias output overwrites its source slot's buffer. A source
     // produced by an earlier plan step is exclusively owned by this replay.
@@ -849,7 +919,21 @@ pub(crate) fn try_replay_flush(
             return false;
         }
     }
+    true
+}
 
+/// Execute an already validated plan and append `tail` to its final command
+/// encoder before submission. Validation and execution are split so callers
+/// retain ownership of an `FnOnce` tail when a plan miss must fall back to the
+/// full resolver.
+pub(crate) fn execute_replay_with_tail<T>(
+    graph: &mut ComputeGraphInner,
+    plan: &FlushPlan,
+    fingerprint: &FlushFingerprint,
+    tail: impl FnOnce(&TensorData, &mut wgpu::CommandEncoder) -> T,
+) -> (super::ResolverResult, T) {
+    let slots = &fingerprint.slots;
+    let device = graph.device();
     let host_trace = std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some();
     let start = host_trace.then(Instant::now);
 
@@ -953,7 +1037,7 @@ pub(crate) fn try_replay_flush(
                     OutputSource::Fresh { buffer_size, usage } => {
                         let buffer = device.create_buffer(*buffer_size, *usage);
                         TensorData::new_from_parts(
-                            device,
+                            &device,
                             buffer,
                             output.layout.clone(),
                             output.datatype,
@@ -964,7 +1048,7 @@ pub(crate) fn try_replay_flush(
                             .clone()
                             .expect("flush replay: alias output slot has no buffer");
                         TensorData::new_from_parts(
-                            device,
+                            &device,
                             buffer,
                             output.layout.clone(),
                             output.datatype,
@@ -1009,7 +1093,7 @@ pub(crate) fn try_replay_flush(
                             .expect("flush replay: alias output slot has no buffer"),
                     };
                     let output_data = TensorData::new_from_parts(
-                        device,
+                        &device,
                         buffer,
                         output.layout.clone(),
                         output.datatype,
@@ -1045,8 +1129,15 @@ pub(crate) fn try_replay_flush(
         .iter()
         .filter(|command| matches!(command, CommandRecord::Dispatch(_)))
         .count();
-    encode_and_submit(device, &commands, total_kernels);
+    let mut command_encoder = encode_commands(&device, &commands, total_kernels);
+    let target = slots[plan.target_positions[0] as usize];
+    let data = graph
+        .get_result(target)
+        .expect("flush replay: target result not cached");
+    let tail_result = tail(&data, &mut command_encoder);
+    device.wgpu_queue().submit(Some(command_encoder.finish()));
     device.reset_initialized_buffers();
+    device.flush_plan_cache().note_replay();
 
     if let Some(start) = start {
         tracing::info!(
@@ -1055,7 +1146,13 @@ pub(crate) fn try_replay_flush(
             start.elapsed(),
         );
     }
-    true
+    (
+        super::ResolverResult {
+            data,
+            total_kernels,
+        },
+        tail_result,
+    )
 }
 
 fn step_consumed(step: &PlanStep) -> &[u32] {
@@ -1099,70 +1196,27 @@ fn release_consumed(
 /// Encode and submit the replayed command stream with the same pass/submit
 /// chunking policy as the full resolver (single pass + single submit below
 /// 1024 kernels; chunked with Metal waits above).
-fn encode_and_submit(device: &Device, commands: &[CommandRecord], total_kernels: usize) {
-    let mut command_encoder =
+fn encode_commands(
+    device: &Device,
+    commands: &[CommandRecord],
+    total_kernels: usize,
+) -> wgpu::CommandEncoder {
+    let command_encoder =
         device
             .wgpu_device()
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Resolver Encoder"),
             });
-    let per_pass = dispatches_per_pass(total_kernels);
-    let per_submit = dispatches_per_submit(total_kernels, device.backend());
-    let wait_after_chunk_submit = device.backend() == wgpu::Backend::Metal;
-    let mut command_index = 0usize;
-    let mut dispatches_in_submit = 0usize;
-    let mut encoder_has_commands = false;
-    while command_index < commands.len() {
-        if encoder_has_commands && dispatches_in_submit >= per_submit {
-            let next_encoder =
-                device
-                    .wgpu_device()
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("Resolver Encoder"),
-                    });
-            let ready_encoder = std::mem::replace(&mut command_encoder, next_encoder);
-            device.wgpu_queue().submit(Some(ready_encoder.finish()));
-            if wait_after_chunk_submit {
+    super::queue_executor::encode_command_records(
+        device,
+        commands,
+        total_kernels,
+        command_encoder,
+        |encoder, wait| {
+            device.wgpu_queue().submit(Some(encoder.finish()));
+            if wait {
                 device.poll_wait();
             }
-            encoder_has_commands = false;
-            dispatches_in_submit = 0;
-        }
-        match &commands[command_index] {
-            CommandRecord::CopyBuffer(copy) => {
-                command_encoder.copy_buffer_to_buffer(
-                    &copy.source,
-                    copy.source_offset,
-                    &copy.destination,
-                    copy.destination_offset,
-                    copy.size,
-                );
-                encoder_has_commands = true;
-                command_index += 1;
-            }
-            CommandRecord::Dispatch(_) => {
-                let mut pass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Resolver Direct Kernels"),
-                    timestamp_writes: None,
-                });
-                let mut pass_dispatches = 0usize;
-                while command_index < commands.len() {
-                    if pass_dispatches >= per_pass || dispatches_in_submit >= per_submit {
-                        break;
-                    }
-                    let CommandRecord::Dispatch(record) = &commands[command_index] else {
-                        break;
-                    };
-                    pass.push_debug_group(&record.name);
-                    record.dispatch.run(&mut pass);
-                    pass.pop_debug_group();
-                    dispatches_in_submit += 1;
-                    command_index += 1;
-                    pass_dispatches += 1;
-                    encoder_has_commands = true;
-                }
-            }
-        }
-    }
-    device.wgpu_queue().submit(Some(command_encoder.finish()));
+        },
+    )
 }

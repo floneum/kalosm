@@ -1,0 +1,978 @@
+//! Execution of the resolver's lowered operation queue.
+//!
+//! The executor owns serial input gathering and output allocation, parallel
+//! kernel-plan building, then ordered recording and command preparation. It
+//! is used by every resolved graph; horizontal merging only changes individual
+//! queue entries.
+
+use super::merge_horizontal::MergedSegments;
+use super::*;
+use crate::mir::kernel_backend::DirectKernel;
+
+impl MergedSegments {
+    /// Segment (node, op) views in queue order.
+    fn segment_ops(&self) -> Vec<(NodeIndex, &dyn Operation)> {
+        match self {
+            Self::Row(segments) => segments
+                .iter()
+                .map(|(node, op)| (*node, op as &dyn Operation))
+                .collect(),
+            Self::MatMul(segments) => segments
+                .iter()
+                .map(|(node, op)| (*node, op as &dyn Operation))
+                .collect(),
+            Self::Region(_) => {
+                unreachable!("region segments are gathered without the Operation trait")
+            }
+        }
+    }
+}
+
+/// One entry of the three-phase queue, preserving queue order.
+enum QueueStep {
+    View {
+        node: NodeIndex,
+        result: TensorData,
+        deps: Vec<NodeIndex>,
+    },
+    CopyAssign {
+        node: NodeIndex,
+        copies: Vec<CopyBufferRecord>,
+        op: QueuedOperation,
+    },
+    Work(usize),
+}
+
+enum QueueWorkKind {
+    Operation {
+        inputs: Vec<MirValue>,
+        workgroup_shape: crate::mir::workgroup_shape::WorkgroupShape,
+        resolved: TensorData,
+        /// Node whose dead buffer this output claimed, if any.
+        claimed_from: Option<NodeIndex>,
+    },
+    Merged {
+        segment_inputs: Vec<Vec<MirValue>>,
+        /// One entry per segment output, in segment/statement order (regions
+        /// contribute several outputs per segment), with the node whose dead
+        /// buffer the output claimed, if any.
+        outputs: Vec<(NodeIndex, TensorData, Option<NodeIndex>)>,
+    },
+}
+
+struct QueueWork {
+    node: NodeIndex,
+    op: QueuedOperation,
+    kind: QueueWorkKind,
+    built: std::sync::Mutex<Option<BuiltWork>>,
+}
+
+struct BuiltWork {
+    kernels: Vec<DirectKernel>,
+    prepared: Vec<Option<(PreparedDirectDispatch, String)>>,
+    /// False when a merged builder declined and the kernels are per-segment
+    /// fallbacks (which a flush plan cannot express).
+    merged_ok: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const MIN_PARALLEL_BUILD_QUEUE: usize = 16;
+#[cfg(not(target_arch = "wasm32"))]
+const MIN_PARALLEL_BUILD_REMAINDER: usize = 4;
+#[cfg(not(target_arch = "wasm32"))]
+const COLD_BUILD_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(1);
+
+#[cfg(not(target_arch = "wasm32"))]
+fn should_parallelize_build_remainder(
+    worker_count: usize,
+    remaining: usize,
+    probe_elapsed: std::time::Duration,
+) -> bool {
+    worker_count > 1
+        && remaining >= MIN_PARALLEL_BUILD_REMAINDER
+        && probe_elapsed >= COLD_BUILD_THRESHOLD
+}
+
+/// A structural plan-cache key for one horizontally merged dispatch: the
+/// wave discriminant plus every segment's own structural kernel key (or the
+/// region's kernel fields), so isomorphic waves across resolves and
+/// processes share one plan.
+fn merged_plan_cache_key(
+    merged: &MergedSegments,
+    segment_inputs: &[Vec<MirValue>],
+) -> crate::mir::kernel_backend::KernelCacheKey {
+    struct MergedPlanKernelVariant;
+    crate::mir::kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
+        use std::hash::Hash;
+        super::plan_cache::hash_plan_environment(state);
+        crate::mir::kernel_backend::KernelVariantKey::of::<MergedPlanKernelVariant>().hash(state);
+        std::mem::discriminant(merged).hash(state);
+        segment_inputs.len().hash(state);
+        match merged {
+            MergedSegments::Region(segments) => {
+                for ((_, op), inputs) in segments.iter().zip(segment_inputs) {
+                    op.hash_kernel_fields(state);
+                    inputs.len().hash(state);
+                    for input in inputs {
+                        crate::mir::operation::hash_mir_value(state, input);
+                    }
+                }
+            }
+            _ => {
+                for ((_, op), inputs) in merged.segment_ops().iter().zip(segment_inputs) {
+                    op.kernel_cache_key_with_dispatch(
+                        crate::mir::kernel_backend::KernelVariantKey::of::<MergedPlanKernelVariant>(
+                        ),
+                        None,
+                        [0; 3],
+                        inputs,
+                    )
+                    .hash(state);
+                }
+            }
+        }
+    })
+}
+
+fn build_queue_work(
+    work: &QueueWork,
+    graph: &ComputeGraphInner,
+    device: &crate::Device,
+    plan_cache_enabled: bool,
+) -> BuiltWork {
+    let build_timer = std::time::Instant::now();
+    let (kernels, merged_ok) = match (&work.op, &work.kind) {
+        (
+            QueuedOperation::Operation(operation),
+            QueueWorkKind::Operation {
+                inputs,
+                workgroup_shape,
+                ..
+            },
+        ) => {
+            let build_kernels = || {
+                operation
+                    .build_direct_kernel_plan(graph, workgroup_shape, inputs)
+                    .unwrap_or_else(|error| panic!("{error}"))
+                    .into_kernels()
+            };
+            let kernels = if plan_cache_enabled {
+                let kernel_key = structural_kernel_key(operation.as_ref(), inputs, workgroup_shape);
+                super::run::resolve_cached_direct_plan(
+                    device.kernel_cache(),
+                    kernel_key,
+                    super::run::direct_plan_binding_buffers(inputs),
+                    build_kernels,
+                )
+            } else {
+                build_kernels()
+            };
+            (kernels, true)
+        }
+        (QueuedOperation::Merged(merged), QueueWorkKind::Merged { segment_inputs, .. }) => {
+            // Merged kernels go through the same plan cache as single ops:
+            // buffers are presented flattened in segment order, and the
+            // insert path verifies that order matches the kernel's true
+            // binding order (folded or deduplicated plans silently skip).
+            let expected: Vec<std::sync::Arc<wgpu::Buffer>> = segment_inputs
+                .iter()
+                .flatten()
+                .filter_map(|value| match value {
+                    MirValue::Tensor(tensor) => Some(tensor.buffer().clone()),
+                    MirValue::QMatrix(matrix) => Some(matrix.buffer().clone()),
+                    MirValue::Integer(_) | MirValue::Float(_) => None,
+                })
+                .collect();
+            let plan_key =
+                plan_cache_enabled.then(|| merged_plan_cache_key(merged, segment_inputs));
+            if let Some(key) = plan_key
+                && let Some(kernels) = device.kernel_cache().direct_plan_cache().get_many(
+                    device.kernel_cache(),
+                    key,
+                    &[&expected],
+                )
+            {
+                return finish_queue_build(build_timer, kernels, true, device);
+            }
+            let built = match merged {
+                MergedSegments::Row(segments) => {
+                    crate::row_program::build_merged_row_program_kernel(
+                        graph,
+                        &segments
+                            .iter()
+                            .map(|(_, op)| op.clone())
+                            .collect::<Vec<_>>(),
+                        segment_inputs,
+                    )
+                }
+                MergedSegments::MatMul(segments) => crate::matmul::build_merged_matmul_kernel(
+                    graph,
+                    &segments
+                        .iter()
+                        .map(|(_, op)| op.clone())
+                        .collect::<Vec<_>>(),
+                    segment_inputs,
+                ),
+                MergedSegments::Region(segments) => crate::nary_direct::build_merged_region_kernel(
+                    graph,
+                    &segments
+                        .iter()
+                        .map(|(_, op)| op.clone())
+                        .collect::<Vec<_>>(),
+                    segment_inputs,
+                ),
+            };
+            match built {
+                Some(kernel) => {
+                    if let Some(key) = plan_key {
+                        device.kernel_cache().direct_plan_cache().insert_many(
+                            key,
+                            std::slice::from_ref(&kernel),
+                            &[&expected],
+                        );
+                    }
+                    (vec![kernel], true)
+                }
+                None if matches!(merged, MergedSegments::Region(_)) => {
+                    // Region fallback: one standalone region kernel per
+                    // segment. Correct but not plan-expressible; poisoned in
+                    // phase 3.
+                    let MergedSegments::Region(segments) = merged else {
+                        unreachable!("matched above");
+                    };
+                    let kernels = segments
+                        .iter()
+                        .zip(segment_inputs)
+                        .map(|((_, op), inputs)| {
+                            crate::nary_direct::build_merged_region_kernel(
+                                graph,
+                                std::slice::from_ref(op),
+                                std::slice::from_ref(inputs),
+                            )
+                            .unwrap_or_else(|| {
+                                panic!("region fallback did not provide a kernel: {}", op.name())
+                            })
+                        })
+                        .collect();
+                    (kernels, false)
+                }
+                None => {
+                    // Fallback: per-segment kernels. Correct but not
+                    // plan-expressible; the recording is poisoned in phase 3.
+                    let max_subgroup_size = device.max_subgroup_size();
+                    let kernels = merged
+                        .segment_ops()
+                        .into_iter()
+                        .zip(segment_inputs)
+                        .flat_map(|((_, op), inputs)| {
+                            let constraints = op.workgroup_shape_constraints(device);
+                            let workgroup_shape = constraints
+                                .solve(max_subgroup_size, &device.limits())
+                                .unwrap_or_else(|| {
+                                    panic!("failed to solve workgroup shape for merged fallback")
+                                });
+                            op.build_direct_kernel_plan(graph, &workgroup_shape, inputs)
+                                .unwrap_or_else(|error| panic!("{error}"))
+                                .into_kernels()
+                        })
+                        .collect();
+                    (kernels, false)
+                }
+            }
+        }
+        _ => unreachable!("queue work kind matches its queued operation"),
+    };
+    finish_queue_build(build_timer, kernels, merged_ok, device)
+}
+
+/// Prepare dispatches (which also compiles shaders and pipelines, here on
+/// the parallel build workers) and assemble the phase-2 result.
+fn finish_queue_build(
+    build_timer: std::time::Instant,
+    kernels: Vec<crate::mir::kernel_backend::DirectKernel>,
+    merged_ok: bool,
+    device: &crate::Device,
+) -> BuiltWork {
+    let prepared = kernels
+        .iter()
+        .map(|kernel| {
+            kernel
+                .prepare_dispatch(device.kernel_cache())
+                .map(|dispatch| (dispatch, kernel.name().to_string()))
+        })
+        .collect();
+    if std::env::var_os("FUSOR_TRACE_BUILD_TIMES").is_some() {
+        let total = build_timer.elapsed();
+        if total.as_millis() >= 2 {
+            eprintln!(
+                "build_time total={total:?} first={}",
+                kernels.first().map(|k| k.name()).unwrap_or("")
+            );
+        }
+    }
+    BuiltWork {
+        kernels,
+        prepared,
+        merged_ok,
+    }
+}
+
+impl Resolver {
+    /// Three-phase queue execution for all resolved graphs: serial input
+    /// gathering and output caching (queue order), parallel kernel building
+    /// and dispatch preparation, then serial recording, encoding, and
+    /// release accounting in exactly the original queue order.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn execute_queue(
+        recorder: Option<&std::cell::RefCell<flush_replay::PlanRecorder>>,
+        graph: &mut ComputeGraphInner,
+        device: &crate::Device,
+        max_subgroup_size: u32,
+        queued_operations: Vec<(NodeIndex, QueuedOperation)>,
+        remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
+        target_set: &FxHashSet<NodeIndex>,
+        ledger: &mut super::alloc_reuse::BufferLedger,
+        plan_cache_enabled: bool,
+        commands: &mut Vec<CommandRecord>,
+        host_profile: &mut ResolveHostProfile,
+        host_trace: bool,
+        on_dispatch_name: &mut dyn FnMut(&str) -> Option<String>,
+    ) {
+        // Phase 1: gather inputs, allocate outputs, cache results.
+        let gather_start = host_trace.then(Instant::now);
+        let mut steps = Vec::with_capacity(queued_operations.len());
+        let mut work: Vec<QueueWork> = Vec::new();
+        for (node, queued_operation) in queued_operations {
+            let view_result = if let Some(node_data) = graph.nodes.nodes.node_weight(node) {
+                match &node_data.variant {
+                    ComputeGraphNodeVariant::View(view) => graph
+                        .get_cached_result(view.input)
+                        .and_then(|input| view.try_map_tensor(input)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(result) = view_result {
+                let mut deps = Vec::new();
+                graph.visit_dependencies(node, &mut |dep| deps.push(dep));
+                graph.set_cached_result(node, result.clone());
+                ledger.note_transient(result.buffer());
+                ledger.consume(graph, &deps, target_set);
+                steps.push(QueueStep::View { node, result, deps });
+                continue;
+            }
+            let slice_copy = graph.nodes.nodes.node_weight(node).and_then(|node_data| {
+                let ComputeGraphNodeVariant::Assign(slice_assign) = &node_data.variant else {
+                    return None;
+                };
+                Self::try_prepare_in_place_slice_assign_copy(graph, slice_assign)
+            });
+            if let Some((output, copies)) = slice_copy {
+                graph.set_cached_result(node, output.clone());
+                ledger.note_transient(output.buffer());
+                for copy in &copies {
+                    ledger.note_transient(&copy.source);
+                    ledger.note_transient(&copy.destination);
+                }
+                let mut deps = Vec::new();
+                queued_operation.visit_dependencies(&mut |dep| deps.push(dep));
+                ledger.consume(graph, &deps, target_set);
+                steps.push(QueueStep::CopyAssign {
+                    node,
+                    copies,
+                    op: queued_operation,
+                });
+                continue;
+            }
+            match &queued_operation {
+                QueuedOperation::Operation(operation) => {
+                    let mut inputs = operation.inputs(graph);
+                    let output_value = operation.output(graph, &inputs);
+                    let MirValue::Tensor(mut resolved) = output_value else {
+                        panic!("Kernel input value is not a tensor");
+                    };
+                    // Cache the output before the death accounting: a
+                    // source is only releasable once every alive-uncached
+                    // descendant (this very operation) is cached.
+                    graph.set_cached_result(node, resolved.clone());
+                    let mut deps = Vec::new();
+                    queued_operation.visit_dependencies(&mut |dep| deps.push(dep));
+                    ledger.consume(graph, &deps, target_set);
+                    let mut claimed_from = None;
+                    if ledger.enabled() {
+                        let out_ptr = Arc::as_ptr(resolved.buffer()) as usize;
+                        let forbidden: FxHashSet<usize> = inputs
+                            .iter()
+                            .filter_map(|value| match value {
+                                MirValue::Tensor(tensor) => {
+                                    let ptr = Arc::as_ptr(tensor.buffer()) as usize;
+                                    (ptr != out_ptr).then_some(ptr)
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if let Some(swapped) = ledger.try_claim(node, &resolved, &forbidden) {
+                            for value in inputs.iter_mut() {
+                                if let MirValue::Tensor(tensor) = value
+                                    && Arc::as_ptr(tensor.buffer()) as usize == out_ptr
+                                {
+                                    *value = swapped.clone().into();
+                                }
+                            }
+                            resolved = swapped;
+                            claimed_from = ledger.chosen_source(node);
+                            graph.set_cached_result(node, resolved.clone());
+                        }
+                    }
+                    ledger.note_alloc(&resolved);
+                    for value in &inputs {
+                        if let MirValue::Tensor(tensor) = value {
+                            ledger.note_transient(tensor.buffer());
+                        }
+                    }
+                    ledger.note_transient(resolved.buffer());
+                    let constraints = operation.workgroup_shape_constraints(device);
+                    let workgroup_shape = constraints
+                        .solve(max_subgroup_size, &device.limits())
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Failed to find a valid workgroup shape for constraints {constraints:?}"
+                            )
+                        });
+                    steps.push(QueueStep::Work(work.len()));
+                    work.push(QueueWork {
+                        node,
+                        op: queued_operation,
+                        kind: QueueWorkKind::Operation {
+                            inputs,
+                            workgroup_shape,
+                            resolved,
+                            claimed_from,
+                        },
+                        built: std::sync::Mutex::new(None),
+                    });
+                }
+                QueuedOperation::Merged(merged) => {
+                    let mut segment_inputs: Vec<Vec<MirValue>> = Vec::new();
+                    let mut outputs: Vec<(NodeIndex, TensorData, Option<NodeIndex>)> = Vec::new();
+                    if let MergedSegments::Region(segments) = merged {
+                        let device = graph.device();
+                        // A segment may write an output over one of its own
+                        // input buffers only when no other segment of this
+                        // dispatch binds that buffer (concurrent workgroups)
+                        // — count cached-buffer pointers across the whole
+                        // dispatch and require the source to be unique.
+                        let mut dispatch_ptr_uses: FxHashMap<usize, u32> = FxHashMap::default();
+                        for (_, op) in segments {
+                            for idx in &op.inputs {
+                                if let Some(cached) = graph.get_cached_result(*idx) {
+                                    *dispatch_ptr_uses
+                                        .entry(Arc::as_ptr(cached.buffer()) as usize)
+                                        .or_insert(0) += 1;
+                                }
+                            }
+                        }
+                        // Segments share one unsynchronized dispatch, so a
+                        // scratch claim must avoid every segment's reads, not
+                        // just the claiming segment's own.
+                        let dispatch_reads: FxHashSet<usize> =
+                            dispatch_ptr_uses.keys().copied().collect();
+                        for (_, op) in segments {
+                            let values: Vec<MirValue> = op
+                                .inputs
+                                .iter()
+                                .map(|idx| {
+                                    graph
+                                        .get_result(*idx)
+                                        .expect("region inputs resolve before the region")
+                                        .into()
+                                })
+                                .collect();
+                            // Register the gathered input clones before any
+                            // claim so the reference accounting that guards
+                            // in-place claims sees them.
+                            for value in &values {
+                                if let MirValue::Tensor(tensor) = value {
+                                    ledger.note_transient(tensor.buffer());
+                                }
+                            }
+                            let mut values = values;
+                            let reads = op.input_read_summary();
+                            let mut slot_claimed = vec![false; op.inputs.len()];
+                            // Cache every output before the death accounting:
+                            // sources are only releasable once this region
+                            // (their last alive-uncached descendant) counts
+                            // as cached.
+                            let mut fresh_outputs = Vec::new();
+                            for statement in &op.statements {
+                                let Some(out_node) = statement.output else {
+                                    continue;
+                                };
+                                let output = TensorData::new_for_shape(
+                                    &device,
+                                    &op.shape,
+                                    statement.datatype,
+                                );
+                                graph.set_cached_result(out_node, output.clone());
+                                fresh_outputs.push(output);
+                            }
+                            {
+                                let mut deps = Vec::new();
+                                op.visit_dependencies(&mut |dep| deps.push(dep));
+                                ledger.consume(graph, &deps, target_set);
+                            }
+                            let mut fresh_outputs = fresh_outputs.into_iter();
+                            for (position, statement) in op.statements.iter().enumerate() {
+                                let Some(out_node) = statement.output else {
+                                    continue;
+                                };
+                                let mut output = fresh_outputs
+                                    .next()
+                                    .expect("one fresh output per statement");
+                                let mut claimed_from = None;
+                                // Write in place over an input this statement
+                                // is the last reader of: per-thread the load
+                                // precedes the store and threads own disjoint
+                                // elements, so identity reads stay exact.
+                                for (slot, source) in op.inputs.iter().enumerate() {
+                                    if slot_claimed[slot]
+                                        || !reads[slot].identity_only
+                                        || reads[slot].last_reader != Some(position)
+                                    {
+                                        continue;
+                                    }
+                                    let unique = graph
+                                        .get_cached_result(*source)
+                                        .map(|cached| Arc::as_ptr(cached.buffer()) as usize)
+                                        .and_then(|ptr| dispatch_ptr_uses.get(&ptr))
+                                        == Some(&1);
+                                    if !unique {
+                                        continue;
+                                    }
+                                    if let Some(swapped) = ledger.try_claim_in_place(
+                                        out_node, &output, *source, graph, target_set,
+                                    ) {
+                                        output = swapped;
+                                        claimed_from = Some(*source);
+                                        slot_claimed[slot] = true;
+                                        break;
+                                    }
+                                }
+                                if claimed_from.is_none()
+                                    && let Some(swapped) =
+                                        ledger.try_claim(out_node, &output, &dispatch_reads)
+                                {
+                                    output = swapped;
+                                    claimed_from = ledger.chosen_source(out_node);
+                                }
+                                if claimed_from.is_some() {
+                                    graph.set_cached_result(out_node, output.clone());
+                                }
+                                ledger.note_alloc(&output);
+                                ledger.note_transient(output.buffer());
+                                values.push(output.clone().into());
+                                outputs.push((out_node, output, claimed_from));
+                            }
+                            segment_inputs.push(values);
+                        }
+                    } else {
+                        for (seg_node, op) in merged.segment_ops() {
+                            let inputs = op.inputs(graph);
+                            let MirValue::Tensor(output) = op.output(graph, &inputs) else {
+                                panic!("merged segment output is not a tensor");
+                            };
+                            graph.set_cached_result(seg_node, output.clone());
+                            ledger.note_alloc(&output);
+                            for value in &inputs {
+                                if let MirValue::Tensor(tensor) = value {
+                                    ledger.note_transient(tensor.buffer());
+                                }
+                            }
+                            ledger.note_transient(output.buffer());
+                            outputs.push((seg_node, output, None));
+                            segment_inputs.push(inputs);
+                        }
+                        let mut deps = Vec::new();
+                        queued_operation.visit_dependencies(&mut |dep| deps.push(dep));
+                        ledger.consume(graph, &deps, target_set);
+                    }
+                    steps.push(QueueStep::Work(work.len()));
+                    work.push(QueueWork {
+                        node,
+                        op: queued_operation,
+                        kind: QueueWorkKind::Merged {
+                            segment_inputs,
+                            outputs,
+                        },
+                        built: std::sync::Mutex::new(None),
+                    });
+                }
+            }
+        }
+        // Allocation is complete: releases past this point free buffers no
+        // claim can use anymore.
+        ledger.freeze();
+        if let Some(start) = gather_start {
+            host_profile.inputs += start.elapsed();
+        }
+
+        // Phase 2: build kernels and prepare dispatches. Builds are pure
+        // functions of (operation, layouts, buffers); the shared kernel
+        // caches are internally synchronized.
+        let build_start = host_trace.then(Instant::now);
+        #[cfg(target_arch = "wasm32")]
+        for item in &work {
+            *item.built.lock().unwrap() =
+                Some(build_queue_work(item, graph, device, plan_cache_enabled));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(work.len())
+                .max(1);
+            // Tiny queues build serially. Larger queues probe on the caller
+            // thread until a build is measurably cold. A warm plan-cache hit
+            // costs much less than creating a fresh worker cohort, while the
+            // first shader/pipeline miss still moves the remaining cold work
+            // onto parallel workers.
+            if workers <= 1 || work.len() < MIN_PARALLEL_BUILD_QUEUE {
+                for item in &work {
+                    *item.built.lock().unwrap() =
+                        Some(build_queue_work(item, graph, device, plan_cache_enabled));
+                }
+            } else {
+                let mut next_index = 0;
+                while let Some(item) = work.get(next_index) {
+                    let probe_start = std::time::Instant::now();
+                    *item.built.lock().unwrap() =
+                        Some(build_queue_work(item, graph, device, plan_cache_enabled));
+                    next_index += 1;
+                    if should_parallelize_build_remainder(
+                        workers,
+                        work.len() - next_index,
+                        probe_start.elapsed(),
+                    ) {
+                        break;
+                    }
+                }
+
+                if next_index < work.len() {
+                    let remaining_workers = workers.min(work.len() - next_index);
+                    let next = std::sync::atomic::AtomicUsize::new(next_index);
+                    let graph_ref: &ComputeGraphInner = graph;
+                    std::thread::scope(|scope| {
+                        for _ in 0..remaining_workers {
+                            scope.spawn(|| {
+                                loop {
+                                    let index =
+                                        next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let Some(item) = work.get(index) else { break };
+                                    let built = build_queue_work(
+                                        item,
+                                        graph_ref,
+                                        device,
+                                        plan_cache_enabled,
+                                    );
+                                    *item.built.lock().unwrap() = Some(built);
+                                }
+                            });
+                        }
+                    });
+                }
+            }
+        }
+        if let Some(start) = build_start {
+            host_profile.build_kernel += start.elapsed();
+        }
+
+        // Phase 3: record, encode, and release in queue order.
+        let encode_start = host_trace.then(Instant::now);
+        for step in steps {
+            match step {
+                QueueStep::View { node, result, deps } => {
+                    if let Some(recorder) = recorder {
+                        recorder
+                            .borrow_mut()
+                            .record_view_alias(node, &result, &deps);
+                    }
+                    Self::release_dead_intermediates_from_graph(
+                        graph,
+                        &[node],
+                        remaining_consumers,
+                        target_set,
+                        ledger,
+                    );
+                }
+                QueueStep::CopyAssign { node, copies, op } => {
+                    if let Some(recorder) = recorder {
+                        let output = graph
+                            .get_cached_result(node)
+                            .expect("copy-assign output cached in phase 1")
+                            .clone();
+                        recorder.borrow_mut().record_copy_assign(node, &output, &op);
+                    }
+                    commands.extend(copies.into_iter().map(CommandRecord::CopyBuffer));
+                    Self::release_dead_intermediates(
+                        graph,
+                        &[&op],
+                        remaining_consumers,
+                        target_set,
+                        ledger,
+                    );
+                }
+                QueueStep::Work(index) => {
+                    let item = &work[index];
+                    let built = item
+                        .built
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("queue work built in phase 2");
+                    if let Some(recorder) = recorder {
+                        match (&item.op, &item.kind) {
+                            (
+                                QueuedOperation::Operation(_),
+                                QueueWorkKind::Operation {
+                                    resolved,
+                                    claimed_from,
+                                    ..
+                                },
+                            ) => {
+                                recorder.borrow_mut().record_dispatch(
+                                    item.node,
+                                    &built.kernels,
+                                    resolved,
+                                    &item.op,
+                                    *claimed_from,
+                                );
+                            }
+                            (
+                                QueuedOperation::Merged(merged),
+                                QueueWorkKind::Merged { outputs, .. },
+                            ) => {
+                                if built.merged_ok {
+                                    let node_outputs: Vec<(
+                                        NodeIndex,
+                                        &TensorData,
+                                        Option<NodeIndex>,
+                                    )> = outputs
+                                        .iter()
+                                        .map(|(node, output, claimed)| (*node, output, *claimed))
+                                        .collect();
+                                    recorder.borrow_mut().record_merged_dispatch(
+                                        &node_outputs,
+                                        &built.kernels,
+                                        merged,
+                                    );
+                                } else {
+                                    recorder.borrow_mut().poison();
+                                }
+                            }
+                            _ => unreachable!("queue work kind matches its queued operation"),
+                        }
+                    }
+                    for (dispatch, name) in built.prepared.into_iter().flatten() {
+                        let category = on_dispatch_name(&name);
+                        commands.push(CommandRecord::Dispatch(DispatchRecord {
+                            dispatch,
+                            name,
+                            category,
+                        }));
+                    }
+                    Self::release_dead_intermediates(
+                        graph,
+                        &[&item.op],
+                        remaining_consumers,
+                        target_set,
+                        ledger,
+                    );
+                }
+            }
+        }
+        if let Some(start) = encode_start {
+            host_profile.prepare_dispatch += start.elapsed();
+        }
+    }
+
+    /// Execute one already-recognized operation without rebuilding or
+    /// optimizing an execution graph. The fast path still crosses the same
+    /// queue, plan cache, allocation/liveness, and command-record seams as a
+    /// full resolve.
+    pub(crate) fn encode_direct_operation(
+        graph: &mut ComputeGraphInner,
+        target: NodeIndex,
+        operation: Arc<dyn Operation>,
+    ) -> (crate::Device, ResolverResult, wgpu::CommandEncoder) {
+        let device = graph.device();
+        let mut remaining_consumers = FxHashMap::default();
+        operation.visit_dependencies(&mut |dependency| {
+            *remaining_consumers.entry(dependency).or_insert(0) += 1;
+        });
+        let target_set = std::iter::once(target).collect::<FxHashSet<_>>();
+        let mut ledger = super::alloc_reuse::BufferLedger::new(&device, Some(&remaining_consumers));
+        let mut commands = Vec::new();
+        let mut host_profile = ResolveHostProfile::default();
+        Self::execute_queue(
+            None,
+            graph,
+            &device,
+            device.max_subgroup_size(),
+            vec![(target, QueuedOperation::Operation(operation))],
+            &mut remaining_consumers,
+            &target_set,
+            &mut ledger,
+            device.kernel_cache().direct_plan_cache().enabled(),
+            &mut commands,
+            &mut host_profile,
+            false,
+            &mut |_| None,
+        );
+
+        let total_kernels = commands
+            .iter()
+            .filter(|command| matches!(command, CommandRecord::Dispatch(_)))
+            .count();
+        let command_encoder =
+            device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Resolver Direct Encoder"),
+                });
+        let command_encoder = encode_command_records(
+            &device,
+            &commands,
+            total_kernels,
+            command_encoder,
+            |encoder, wait| {
+                device.wgpu_queue().submit(Some(encoder.finish()));
+                if wait {
+                    device.poll_wait();
+                }
+            },
+        );
+        let data = graph
+            .get_result(target)
+            .expect("direct operation target result not cached");
+        (
+            device,
+            ResolverResult {
+                data,
+                total_kernels,
+            },
+            command_encoder,
+        )
+    }
+}
+
+/// Encode a command stream with the resolver's pass and submit chunking.
+///
+/// Intermediate chunks are handed to `submit_chunk`; the final encoder is
+/// returned so the caller can append tail work before its synchronization
+/// boundary and final submit.
+pub(super) fn encode_command_records(
+    device: &crate::Device,
+    commands: &[CommandRecord],
+    total_kernels: usize,
+    mut command_encoder: wgpu::CommandEncoder,
+    mut submit_chunk: impl FnMut(wgpu::CommandEncoder, bool),
+) -> wgpu::CommandEncoder {
+    let dispatches_per_pass = super::run::dispatches_per_pass(total_kernels);
+    let dispatches_per_submit = super::run::dispatches_per_submit(total_kernels, device.backend());
+    let wait_after_chunk_submit = device.backend() == wgpu::Backend::Metal;
+    let mut command_index = 0usize;
+    let mut dispatches_in_submit = 0usize;
+    let mut encoder_has_commands = false;
+
+    while command_index < commands.len() {
+        if encoder_has_commands && dispatches_in_submit >= dispatches_per_submit {
+            let next_encoder =
+                device
+                    .wgpu_device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Resolver Encoder"),
+                    });
+            let ready_encoder = std::mem::replace(&mut command_encoder, next_encoder);
+            submit_chunk(ready_encoder, wait_after_chunk_submit);
+            encoder_has_commands = false;
+            dispatches_in_submit = 0;
+        }
+
+        match &commands[command_index] {
+            CommandRecord::CopyBuffer(copy) => {
+                command_encoder.copy_buffer_to_buffer(
+                    &copy.source,
+                    copy.source_offset,
+                    &copy.destination,
+                    copy.destination_offset,
+                    copy.size,
+                );
+                encoder_has_commands = true;
+                command_index += 1;
+            }
+            CommandRecord::Dispatch(_) => {
+                let mut pass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Resolver Direct Kernels"),
+                    timestamp_writes: None,
+                });
+                let mut pass_dispatches = 0usize;
+                while command_index < commands.len()
+                    && pass_dispatches < dispatches_per_pass
+                    && dispatches_in_submit < dispatches_per_submit
+                {
+                    let CommandRecord::Dispatch(record) = &commands[command_index] else {
+                        break;
+                    };
+                    pass.push_debug_group(&record.name);
+                    record.dispatch.run(&mut pass);
+                    pass.pop_debug_group();
+                    dispatches_in_submit += 1;
+                    command_index += 1;
+                    pass_dispatches += 1;
+                    encoder_has_commands = true;
+                }
+            }
+        }
+    }
+
+    command_encoder
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warm_build_probe_keeps_queue_serial() {
+        assert!(!should_parallelize_build_remainder(
+            8,
+            32,
+            COLD_BUILD_THRESHOLD - std::time::Duration::from_nanos(1),
+        ));
+    }
+
+    #[test]
+    fn cold_build_probe_parallelizes_useful_remainder() {
+        assert!(should_parallelize_build_remainder(
+            8,
+            MIN_PARALLEL_BUILD_REMAINDER,
+            COLD_BUILD_THRESHOLD,
+        ));
+    }
+
+    #[test]
+    fn cold_build_probe_does_not_spawn_for_tiny_remainder() {
+        assert!(!should_parallelize_build_remainder(
+            8,
+            MIN_PARALLEL_BUILD_REMAINDER - 1,
+            COLD_BUILD_THRESHOLD,
+        ));
+        assert!(!should_parallelize_build_remainder(
+            1,
+            32,
+            COLD_BUILD_THRESHOLD,
+        ));
+    }
+}

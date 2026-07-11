@@ -359,5 +359,6 @@ fn device_capability_fingerprint(device: &wgpu::Device) -> u64 {
     std::env::var_os("FUSOR_DISABLE_SUBGROUPS")
         .is_some()
         .hash(&mut hasher);
+    std::env::var_os("FUSOR_LAST_LEVEL_CACHE_BYTES").hash(&mut hasher);
     hasher.finish()
 }

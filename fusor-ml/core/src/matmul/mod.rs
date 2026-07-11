@@ -407,11 +407,22 @@ mod selection_tests {
             select(4096, 4096, 4096, 512),
             Some(CoopTile::new(128, 512, 16))
         );
+        assert!(
+            select(4096, 4096, 4096, 512)
+                .unwrap()
+                .supports_horizontal_merge(),
+        );
         // Shapes where N is divisible by 256 but not 512 — with enough
         // tiles — fall to Tile256x256 single-buffer.
         assert_eq!(
             select(8192, 1024, 4352, 512),
             Some(CoopTile::new(256, 256, 16))
+        );
+        assert!(
+            !select(8192, 1024, 4352, 512)
+                .unwrap()
+                .supports_horizontal_merge(),
+            "single-buffered 256x256 tiles must remain standalone",
         );
         // N=512 doesn't divide 256 on the M side... actually wait, 4096 % 256 == 0.
         // For shapes where N is divisible by 512 but M isn't by 256, fall to

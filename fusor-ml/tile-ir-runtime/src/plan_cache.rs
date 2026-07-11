@@ -26,7 +26,7 @@ const DIRECT_PLAN_CACHE_SIZE: usize = 512;
 /// buffers in the exact order returned by [`DirectKernel::binding_buffers`].
 pub struct DirectPlanCache {
     enabled: bool,
-    plans: Mutex<LruCache<KernelCacheKey, Vec<CachedDirectKernelPlan>, FxBuildHasher>>,
+    plans: Mutex<LruCache<KernelCacheKey, Arc<[CachedDirectKernelPlan]>, FxBuildHasher>>,
     /// Persistent plan store, attached once the device capability
     /// fingerprint is known.
     disk: std::sync::OnceLock<Option<crate::disk_cache::DiskPlanCache>>,
@@ -136,15 +136,12 @@ impl DirectPlanCache {
         if !self.enabled {
             return None;
         }
+        if let Some(plan) = self.memory_plan(key)
+            && binding_shape_matches(&plan, binding_buffers)
         {
-            let mut plans = self.plans.lock();
-            if let Some(plan) = plans.get(&key)
-                && binding_shape_matches(plan, binding_buffers)
-            {
-                let hit_total = self.hits.fetch_add(1, Ordering::Relaxed) + 1;
-                trace_cache_event(hit_total, self.misses.load(Ordering::Relaxed));
-                return Some(bind_plan(plan, binding_buffers));
-            }
+            let hit_total = self.hits.fetch_add(1, Ordering::Relaxed) + 1;
+            trace_cache_event(hit_total, self.misses.load(Ordering::Relaxed));
+            return Some(bind_plan(&plan, binding_buffers));
         }
 
         if let Some(disk) = self.disk.get().and_then(Option::as_ref)
@@ -153,7 +150,7 @@ impl DirectPlanCache {
             && binding_shape_matches(&plan, binding_buffers)
         {
             let bound = bind_plan(&plan, binding_buffers);
-            self.plans.lock().put(key, plan);
+            self.plans.lock().put(key, plan.into());
             let disk_total = self.disk_hits.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::debug!("direct_plan_disk_hit total={disk_total}");
             return Some(bound);
@@ -162,6 +159,12 @@ impl DirectPlanCache {
         let miss_total = self.misses.fetch_add(1, Ordering::Relaxed) + 1;
         trace_cache_event(self.hits.load(Ordering::Relaxed), miss_total);
         None
+    }
+
+    /// Clone the immutable plan snapshot while touching its LRU entry, then
+    /// release the cache lock before validating or binding caller buffers.
+    fn memory_plan(&self, key: KernelCacheKey) -> Option<Arc<[CachedDirectKernelPlan]>> {
+        self.plans.lock().get(&key).cloned()
     }
 
     /// Record a built plan when its true binding order matches the caller's
@@ -184,7 +187,7 @@ impl DirectPlanCache {
         {
             disk.store(file);
         }
-        self.plans.lock().put(key, plan);
+        self.plans.lock().put(key, plan.into());
     }
 }
 
@@ -313,23 +316,54 @@ fn binding_shape_matches(
             .all(|(plan, buffers)| alias_pattern_matches(&plan.alias_class, buffers))
 }
 
-fn binding_buffers_match(kernels: &[DirectKernel], expected: &[&[Arc<wgpu::Buffer>]]) -> bool {
-    if kernels.len() != expected.len() {
-        return false;
-    }
-
-    kernels.iter().zip(expected).all(|(kernel, expected)| {
-        let actual = kernel.binding_buffers();
-        actual.len() == expected.len()
-            && actual
-                .iter()
-                .zip(*expected)
-                .all(|(actual, expected)| Arc::ptr_eq(actual, expected))
-    })
-}
-
 fn trace_cache_event(hits: u64, misses: u64) {
     if cfg!(target_arch = "wasm32") || std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some() {
         tracing::info!("direct_plan_cache hit={hits} miss={misses}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cache(capacity: usize) -> DirectPlanCache {
+        DirectPlanCache {
+            enabled: true,
+            plans: Mutex::new(LruCache::with_hasher(
+                NonZeroUsize::new(capacity).unwrap(),
+                Default::default(),
+            )),
+            disk: std::sync::OnceLock::new(),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            disk_hits: AtomicU64::new(0),
+        }
+    }
+
+    fn empty_plan() -> Arc<[CachedDirectKernelPlan]> {
+        Arc::from(Vec::new())
+    }
+
+    #[test]
+    fn memory_plan_releases_lock_and_touches_lru() {
+        let cache = test_cache(2);
+        let first = KernelCacheKey::from_parts([1, 1]);
+        let second = KernelCacheKey::from_parts([2, 2]);
+        let third = KernelCacheKey::from_parts([3, 3]);
+        {
+            let mut plans = cache.plans.lock();
+            plans.put(first, empty_plan());
+            plans.put(second, empty_plan());
+        }
+
+        let first_snapshot = cache.memory_plan(first).unwrap();
+        assert!(cache.plans.try_lock().is_some());
+
+        cache.plans.lock().put(third, empty_plan());
+        let plans = cache.plans.lock();
+        assert!(plans.peek(&first).is_some());
+        assert!(plans.peek(&second).is_none());
+        assert!(plans.peek(&third).is_some());
+        assert!(first_snapshot.is_empty());
     }
 }

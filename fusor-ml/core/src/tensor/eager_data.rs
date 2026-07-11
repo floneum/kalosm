@@ -123,6 +123,21 @@ impl TensorData {
         Self::new_from_buffer(device, buffer, shape, D::DATA_TYPE)
     }
 
+    pub(crate) fn new_from_slice<D: DataType>(
+        device: &Device,
+        data: &[D],
+        shape: &[usize],
+    ) -> Self {
+        let buffer = device.create_buffer_init(
+            bytemuck::cast_slice(data),
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+
+        Self::new_from_buffer(device, buffer, shape, D::DATA_TYPE)
+    }
+
     pub fn slice(&self, ranges: &[Range<usize>]) -> Self {
         let layout = self.info.layout.slice(ranges);
         Self {

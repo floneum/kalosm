@@ -11,13 +11,13 @@
 //! cargo run --release --example transformer
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::Read;
 use std::path::PathBuf;
 
 use fusor::autograd::layers::{Embedding, LayerNorm, Linear};
 use fusor::autograd::{Graph, Tensor};
-use fusor::{Device, Tensor as RawTensor, ToVec1, ToVec2};
+use fusor::{Device, StandardSamplerParams, Tensor as RawTensor, ToVec1, cat};
 
 const CONTEXT: usize = 64;
 const BATCH_SIZE: usize = 32;
@@ -34,6 +34,7 @@ const EPSILON: f32 = 1e-8;
 const LAYER_NORM_EPS: f32 = 1e-5;
 const MASK_VALUE: f32 = -1e9;
 const TEMPERATURE: f32 = 0.8;
+const GENERATION_RUN_AHEAD: usize = 32;
 
 const DATA_URL: &str =
     "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
@@ -55,7 +56,9 @@ impl RunConfig {
             steps: STEPS,
             min_steps_per_second: None,
             skip_eval: false,
-            progress_every: 100,
+            // Loss readbacks synchronize the GPU, so keep the fast path free
+            // of intermediate barriers unless progress is explicitly enabled.
+            progress_every: 0,
             trace_host: false,
             trace_resolve: false,
             trace_names: false,
@@ -75,8 +78,9 @@ impl RunConfig {
                 "--skip-eval" => config.skip_eval = true,
                 "--progress-every" => {
                     let value = args.next().expect("--progress-every requires a value");
-                    config.progress_every =
-                        value.parse().expect("--progress-every must be a non-negative integer");
+                    config.progress_every = value
+                        .parse()
+                        .expect("--progress-every must be a non-negative integer");
                 }
                 "--trace-host" => config.trace_host = true,
                 "--trace-resolve" => config.trace_resolve = true,
@@ -461,17 +465,17 @@ fn adam_step<const R: usize>(
     let elements = shape.iter().product();
     let gradient = gradient.reshape([elements]);
     state.momentum =
-        (state.momentum.clone() * BETA1 + gradient.clone() * (1.0 - BETA1)).to_concrete();
-    state.variance =
-        (state.variance.clone() * BETA2 + (gradient.clone() * gradient) * (1.0 - BETA2))
-            .to_concrete();
+        (state.momentum.clone() * BETA1 + gradient.clone() * (1.0 - BETA1)).into_concrete();
+    state.variance = (state.variance.clone() * BETA2
+        + (gradient.clone() * gradient) * (1.0 - BETA2))
+        .into_concrete();
     let update: RawTensor<1, f32> = state
         .momentum
         .mul_(lr)
-        .div_(&state.variance.sqrt().add_scalar(EPSILON).to_concrete());
+        .div_(&state.variance.sqrt().add_scalar(EPSILON).into_concrete());
     *param = (param.clone().reshape([elements]) - update)
         .reshape(shape)
-        .to_concrete();
+        .into_concrete();
 }
 
 /// Pick `batch_size` random windows and return (inputs, next-char targets),
@@ -508,10 +512,7 @@ fn sample(logits: &[f32], rng: &mut Lcg) -> u32 {
     (weights.len() - 1) as u32
 }
 
-/// Autoregressively extend `tokens` by `length` sampled characters. The
-/// prompt must be at least CONTEXT tokens so every forward pass sees the
-/// same shapes and reuses the same compiled kernels.
-async fn generate(
+async fn generate_synchronized(
     device: &Device,
     params: &Params,
     mut tokens: Vec<u32>,
@@ -530,17 +531,110 @@ async fn generate(
         let mask = Tensor::constant_from_raw(&graph, mask.clone());
         let logits = model.forward(&input, &positions, &mask);
         let vocab_size = logits.shape()[2];
-        let rows = logits
+        let last_logits = logits
             .raw()
             .clone()
-            .reshape([CONTEXT, vocab_size])
-            .as_slice()
-            .await
-            .unwrap()
-            .to_vec2();
-        tokens.push(sample(&rows[CONTEXT - 1], rng));
+            .narrow(1, CONTEXT - 1, 1)
+            .reshape([vocab_size])
+            .into_concrete();
+        drop(logits);
+        let last_logits = last_logits.as_slice().await.unwrap().to_vec1();
+        tokens.push(sample(&last_logits, rng));
     }
     tokens
+}
+
+/// Keep a bounded window of autoregressive steps in flight using GPU-resident
+/// sampled tokens. Queue ordering preserves the sliding-window dependency;
+/// host readbacks are only needed to assemble the final output text.
+async fn generate_gpu_run_ahead(
+    device: &Device,
+    params: &Params,
+    mut tokens: Vec<u32>,
+    length: usize,
+    rng: &mut Lcg,
+) -> Option<Vec<u32>> {
+    assert!(tokens.len() >= CONTEXT, "prompt shorter than CONTEXT");
+    let positions: Vec<u32> = (0..CONTEXT as u32).collect();
+    let positions = RawTensor::from_slice(device, [CONTEXT], &positions);
+    let mask = causal_mask(device, CONTEXT);
+    let prompt = RawTensor::from_slice(device, [1, CONTEXT], &tokens[tokens.len() - CONTEXT..]);
+    let mut input = prompt;
+    let mut pending_tokens = VecDeque::with_capacity(GENERATION_RUN_AHEAD + 1);
+
+    for _ in 0..length {
+        let graph = Graph::new();
+        let model = Gpt::new(&graph, params, false);
+        let mask = Tensor::constant_from_raw(&graph, mask.clone());
+        let logits = model.forward(&input, &positions, &mask);
+        let vocab_size = logits.shape()[2];
+        let last_logits = logits
+            .raw()
+            .clone()
+            .narrow(1, CONTEXT - 1, 1)
+            .reshape([vocab_size])
+            .into_concrete();
+        drop(logits);
+
+        let pending = last_logits
+            .sample_standard_token_pending(
+                &[],
+                None,
+                StandardSamplerParams {
+                    top_k: vocab_size,
+                    temperature: TEMPERATURE,
+                    repetition_penalty: 1.0,
+                    top_p: 1.0,
+                    min_p: 0.0,
+                    random: rng.next_f32(),
+                },
+            )
+            .ok()??;
+        let next = pending.token_tensor().reshape([1, 1]).into_concrete();
+        let retained = input.narrow(1, 1, CONTEXT - 1).into_concrete();
+        input = cat([retained, next], 1);
+        pending_tokens.push_back(pending);
+        if pending_tokens.len() > GENERATION_RUN_AHEAD {
+            let token = pending_tokens
+                .pop_front()
+                .expect("pending token queue cannot be empty")
+                .read_token()
+                .await
+                .ok()??;
+            tokens.push(token);
+        }
+    }
+    while let Some(pending) = pending_tokens.pop_front() {
+        let token = pending.read_token().await.ok()??;
+        tokens.push(token);
+    }
+    Some(tokens)
+}
+
+/// Autoregressively extend `tokens` by `length` sampled characters. The
+/// prompt must be at least CONTEXT tokens so every forward pass sees the
+/// same shapes and reuses the same compiled kernels.
+async fn generate(
+    device: &Device,
+    params: &Params,
+    tokens: Vec<u32>,
+    length: usize,
+    rng: &mut Lcg,
+) -> Vec<u32> {
+    match device {
+        Device::Gpu(_) => {
+            let rng_state = rng.0;
+            if let Some(generated) =
+                generate_gpu_run_ahead(device, params, tokens.clone(), length, rng).await
+            {
+                generated
+            } else {
+                rng.0 = rng_state;
+                generate_synchronized(device, params, tokens, length, rng).await
+            }
+        }
+        Device::Cpu => generate_synchronized(device, params, tokens, length, rng).await,
+    }
 }
 
 #[tokio::main]
@@ -554,9 +648,7 @@ async fn main() {
                 "fusor_core::compute_graph::resolve=info,fusor_tile_ir_runtime::plan_cache=warn",
             )
         };
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
     let text = fetch_text();
     // Character-level vocabulary over the corpus bytes (the text is ASCII).
@@ -649,19 +741,29 @@ async fn main() {
             let (leaves1, leaves2) = model.leaves();
             let (tensors1, tensors2) = params.tensors_mut();
             for ((param, state), leaf) in tensors1.into_iter().zip(&mut adam1).zip(leaves1) {
-                adam_step(param, state, gradients.get(leaf).expect("missing gradient"), &lr);
+                adam_step(
+                    param,
+                    state,
+                    gradients.get(leaf).expect("missing gradient"),
+                    &lr,
+                );
             }
             for ((param, state), leaf) in tensors2.into_iter().zip(&mut adam2).zip(leaves2) {
-                adam_step(param, state, gradients.get(leaf).expect("missing gradient"), &lr);
+                adam_step(
+                    param,
+                    state,
+                    gradients.get(leaf).expect("missing gradient"),
+                    &lr,
+                );
             }
 
             if config.progress_every != 0
-                && (step % config.progress_every == 0 || step + 1 == config.steps)
+                && ((step + 1).is_multiple_of(config.progress_every) || step + 1 == config.steps)
             {
                 // Reading the loss synchronizes with the GPU; only do it when
                 // printing progress.
                 let loss_value = to_scalar(loss.raw().clone()).await;
-                println!("step {step}/{}: loss {loss_value:.4}", config.steps);
+                println!("step {}/{}: loss {loss_value:.4}", step + 1, config.steps);
             }
         }
 
@@ -692,19 +794,19 @@ async fn main() {
 
     // Validation loss over held-out batches.
     const VAL_BATCHES: usize = 10;
-    let mut total = 0.0;
-    for _ in 0..VAL_BATCHES {
-        let (inputs, targets) = sample_batch(val_tokens, &mut rng, BATCH_SIZE);
-        let inputs = RawTensor::from_slice(&device, [BATCH_SIZE, CONTEXT], &inputs);
-        let targets = RawTensor::from_slice(&device, [BATCH_SIZE * CONTEXT], &targets);
+    const VAL_BATCH_SIZE: usize = VAL_BATCHES * BATCH_SIZE;
+    let validation_loss = {
+        let (inputs, targets) = sample_batch(val_tokens, &mut rng, VAL_BATCH_SIZE);
+        let inputs = RawTensor::from_slice(&device, [VAL_BATCH_SIZE, CONTEXT], &inputs);
+        let targets = RawTensor::from_slice(&device, [VAL_BATCH_SIZE * CONTEXT], &targets);
         let graph = Graph::new();
         let model = Gpt::new(&graph, &params, false);
         let mask = Tensor::constant_from_raw(&graph, mask.clone());
         let logits = model.forward(&inputs, &positions, &mask);
-        let flat_logits = logits.reshape([BATCH_SIZE * CONTEXT, vocab.len()]);
-        total += to_scalar(cross_entropy(&flat_logits, &targets).raw().clone()).await;
-    }
-    println!("validation loss: {:.4}", total / VAL_BATCHES as f32);
+        let flat_logits = logits.reshape([VAL_BATCH_SIZE * CONTEXT, vocab.len()]);
+        to_scalar(cross_entropy(&flat_logits, &targets).raw().clone()).await
+    };
+    println!("validation loss: {validation_loss:.4}");
 
     // Prompt with the tail of the corpus so the window is always full.
     let prompt = tokens[tokens.len() - CONTEXT..].to_vec();

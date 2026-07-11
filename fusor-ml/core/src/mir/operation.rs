@@ -14,6 +14,65 @@ use super::{
     workgroup_shape::{WorkgroupShape, WorkgroupShapeConstraints},
 };
 
+/// The complete direct-kernel lowering for one operation.
+///
+/// Most operations produce exactly one kernel. Some valid operations produce
+/// no dispatch for an empty output, while others require an ordered sequence
+/// of kernels. Keeping those cases in the operation interface lets executors
+/// treat every operation uniformly.
+pub(crate) struct DirectKernelPlan {
+    kernels: Vec<DirectKernel>,
+}
+
+impl DirectKernelPlan {
+    pub(crate) fn empty() -> Self {
+        Self {
+            kernels: Vec::new(),
+        }
+    }
+
+    pub(crate) fn single(kernel: DirectKernel) -> Self {
+        Self {
+            kernels: vec![kernel],
+        }
+    }
+
+    pub(crate) fn many(kernels: Vec<DirectKernel>) -> Self {
+        Self { kernels }
+    }
+
+    pub(crate) fn dispatch_count(&self) -> usize {
+        self.kernels.len()
+    }
+
+    pub(crate) fn into_kernels(self) -> Vec<DirectKernel> {
+        self.kernels
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DirectKernelLoweringError {
+    operation: String,
+}
+
+impl DirectKernelLoweringError {
+    pub(crate) fn new(operation: String) -> Self {
+        Self { operation }
+    }
+}
+
+impl std::fmt::Display for DirectKernelLoweringError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "operation did not provide a direct kernel plan: {}",
+            self.operation
+        )
+    }
+}
+
+impl std::error::Error for DirectKernelLoweringError {}
+
 pub(crate) trait Operation: Debug + Send + Sync + 'static {
     fn workgroup_shape_constraints(&self, device: &Device) -> WorkgroupShapeConstraints;
 
@@ -31,6 +90,21 @@ pub(crate) trait Operation: Debug + Send + Sync + 'static {
         workgroup_shape: &WorkgroupShape,
         inputs: &[MirValue],
     ) -> Option<DirectKernel>;
+
+    /// Lower this operation to its complete zero-, one-, or many-kernel plan.
+    /// Operations with a singular lowering only implement
+    /// [`Self::build_direct_kernel`]; multi-dispatch and empty-output
+    /// operations override this method.
+    fn build_direct_kernel_plan(
+        &self,
+        nodes: &ComputeGraphInner,
+        workgroup_shape: &WorkgroupShape,
+        inputs: &[MirValue],
+    ) -> Result<DirectKernelPlan, DirectKernelLoweringError> {
+        self.build_direct_kernel(nodes, workgroup_shape, inputs)
+            .map(DirectKernelPlan::single)
+            .ok_or_else(|| DirectKernelLoweringError::new(self.name()))
+    }
 
     fn name(&self) -> String;
 

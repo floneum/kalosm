@@ -4,7 +4,7 @@ use parking_lot::RwLock;
 pub use petgraph::graph::NodeIndex;
 use petgraph::prelude::StableGraph;
 use resolve::Resolver;
-use resolve::flush_replay::{self, FlushPlanEntry};
+use resolve::flush_replay::{self, FlushPlanEntry, ReplayAction};
 use rustc_hash::FxHashMap;
 #[cfg(feature = "graphvis")]
 use tabbycat::Graph;
@@ -25,7 +25,6 @@ use crate::{
     dequantize::DequantizeOperation,
     mir::{inputs::MirValue, operation::Operation},
     nary_wise::ElementwiseOperation,
-    quantized::matmul::QMatMulOperation,
     slice_assign::SliceAssignOperation,
     tensor::TensorData,
     view::ViewOperation,
@@ -135,23 +134,28 @@ impl ComputeGraph {
             };
         }
 
-        if let Some(data) = {
+        let (direct, removed) = {
             let mut inner = self.inner.write();
+            let mut removed = Vec::new();
             let data = inner.try_resolve_direct_qmatmul(key);
+            if data.is_some() {
+                inner.try_auto_flush(&mut removed);
+            }
             #[cfg(feature = "extra_assertions")]
             {
                 inner.verify_integrity()
             }
-            data
-        } {
+            (data, removed)
+        };
+        drop(removed);
+        if let Some(data) = direct {
             return data;
         }
 
         let (data, removed) = {
             let mut inner = self.inner.write();
             let mut removed = Vec::new();
-            let mut resolver = Resolver::new(&mut inner, key);
-            let data = resolver.run(&mut inner, &mut removed);
+            let (data, ()) = inner.resolve_target_with_replay(key, &mut removed, |_, _| ());
             inner.try_auto_flush(&mut removed);
             #[cfg(feature = "extra_assertions")]
             {
@@ -193,11 +197,41 @@ impl ComputeGraph {
             );
         }
 
+        let mut tail = Some(tail);
+        let (direct, removed) = {
+            let mut inner = self.inner.write();
+            let mut removed = Vec::new();
+            let direct = inner.try_encode_direct_qmatmul(key).map(
+                |(device, result, mut command_encoder)| {
+                    let tail_result = tail.take().expect("resolver tail is consumed exactly once")(
+                        &result.data,
+                        &mut command_encoder,
+                    );
+                    device.wgpu_queue().submit(Some(command_encoder.finish()));
+                    device.reset_initialized_buffers();
+                    inner.try_auto_flush(&mut removed);
+                    (result, tail_result)
+                },
+            );
+            #[cfg(feature = "extra_assertions")]
+            {
+                inner.verify_integrity()
+            }
+            (direct, removed)
+        };
+        drop(removed);
+        if let Some(direct) = direct {
+            return direct;
+        }
+
         let (data, removed, tail_result) = {
             let mut inner = self.inner.write();
             let mut removed = Vec::new();
-            let mut resolver = Resolver::new(&mut inner, key);
-            let (data, tail_result) = resolver.run_with_tail(&mut inner, &mut removed, tail);
+            let (data, tail_result) = inner.resolve_target_with_replay(
+                key,
+                &mut removed,
+                tail.expect("direct QMatMul did not consume the resolver tail"),
+            );
             inner.try_auto_flush(&mut removed);
             #[cfg(feature = "extra_assertions")]
             {
@@ -323,7 +357,6 @@ impl ComputeGraphNode {
 }
 
 pub(crate) trait GraphOperation: Operation + Send + Sync {
-
     /// The concrete row program behind this graph op, if it is one — lets
     /// the horizontal merge pass recover fused row programs without a
     /// blanket `Any` downcast.
@@ -482,39 +515,59 @@ impl ComputeGraphInner {
             return;
         }
 
-        // Decode safety: any graph containing a quantized matrix skips the
-        // replay machinery after exactly one integer compare.
-        if self.qmatrix_node_count == 0
-            && flush_replay::replay_enabled()
-            && let Some(fingerprint) = flush_replay::fingerprint_pending(self, &pending)
-        {
-            let device = self.device();
-            let cache = device.flush_plan_cache();
-            match cache.get(&fingerprint.key) {
-                Some(FlushPlanEntry::Recorded(plan)) => {
-                    if flush_replay::try_replay_flush(self, &device, &plan, &fingerprint) {
-                        cache.note_replay();
-                        return;
-                    }
-                    // Upfront validation failed (fingerprint collision or
-                    // graph drift): fall through to a full resolve.
-                }
-                Some(FlushPlanEntry::Seen) => {
-                    let key = fingerprint.key;
-                    let mut resolver =
-                        Resolver::new_batch_with_recording(self, pending, fingerprint);
-                    let _ = resolver.run(self, removed);
-                    if let Some(plan) = resolver.take_recorded_plan() {
-                        cache.insert(key, FlushPlanEntry::Recorded(Arc::new(plan)));
-                    }
-                    return;
-                }
-                None => cache.insert(fingerprint.key, FlushPlanEntry::Seen),
+        match flush_replay::prepare_replay(self, &pending) {
+            ReplayAction::Replay { plan, fingerprint } => {
+                let _ =
+                    flush_replay::execute_replay_with_tail(self, &plan, &fingerprint, |_, _| ());
+                return;
             }
+            ReplayAction::Record { key, fingerprint } => {
+                let mut resolver = Resolver::new_batch_with_recording(self, pending, fingerprint);
+                let _ = resolver.run(self, removed);
+                if let Some(plan) = resolver.take_recorded_plan() {
+                    self.device()
+                        .flush_plan_cache()
+                        .insert(key, FlushPlanEntry::Recorded(Arc::new(plan)));
+                }
+                return;
+            }
+            ReplayAction::Resolve => {}
         }
 
         let mut resolver = Resolver::new_batch(self, pending);
         let _ = resolver.run(self, removed);
+    }
+
+    /// Resolve one target, recording or replaying the same bufferless plan
+    /// format used by batched flushes. This is the hot materialization path
+    /// for repeated isomorphic inference graphs such as `as_slice()` during
+    /// autoregressive generation.
+    fn resolve_target_with_replay<T>(
+        &mut self,
+        target: NodeIndex,
+        removed: &mut Vec<ComputeGraphNode>,
+        tail: impl FnOnce(&TensorData, &mut wgpu::CommandEncoder) -> T,
+    ) -> (ResolverResult, T) {
+        match flush_replay::prepare_replay(self, &[target]) {
+            ReplayAction::Replay { plan, fingerprint } => {
+                flush_replay::execute_replay_with_tail(self, &plan, &fingerprint, tail)
+            }
+            ReplayAction::Record { key, fingerprint } => {
+                let mut resolver =
+                    Resolver::new_batch_with_recording(self, vec![target], fingerprint);
+                let result = resolver.run_with_tail(self, removed, tail);
+                if let Some(plan) = resolver.take_recorded_plan() {
+                    self.device()
+                        .flush_plan_cache()
+                        .insert(key, FlushPlanEntry::Recorded(Arc::new(plan)));
+                }
+                result
+            }
+            ReplayAction::Resolve => {
+                let mut resolver = Resolver::new(self, target);
+                resolver.run_with_tail(self, removed, tail)
+            }
+        }
     }
 
     /// Upgrade the weak device reference to a strong one.
@@ -658,38 +711,17 @@ impl ComputeGraphInner {
         Some(())
     }
 
-    fn try_submit_direct_qmatmul(
+    fn try_encode_direct_qmatmul(
         &mut self,
-        operation: &QMatMulOperation,
-    ) -> Option<(TensorData, usize)> {
+        key: NodeIndex,
+    ) -> Option<(Device, ResolverResult, wgpu::CommandEncoder)> {
+        let operation = self.match_direct_qmatmul(key)?;
         self.ensure_tensor_cached(operation.input)?;
-
-        let device = self.device();
-        let workgroup_shape = crate::mir::workgroup_shape::WorkgroupShape::new(1, 1, 1);
-        let inputs = operation.inputs(self);
-        let direct_kernel_plan = operation
-            .build_direct_kernels(self, &workgroup_shape, &inputs)
-            .ok()?;
-        let MirValue::Tensor(output) = operation.output(self, &inputs) else {
-            return None;
-        };
-
-        let mut command_encoder =
-            device
-                .wgpu_device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("QMatMul Direct Encoder"),
-                });
-        let total_kernels = direct_kernel_plan.dispatch_count();
-        for direct_kernel in direct_kernel_plan.into_kernels() {
-            direct_kernel.run(device.kernel_cache(), &mut command_encoder);
-        }
-        if total_kernels > 0 {
-            device.wgpu_queue().submit(Some(command_encoder.finish()));
-            device.reset_initialized_buffers();
-        }
-
-        Some((output, total_kernels))
+        Some(Resolver::encode_direct_operation(
+            self,
+            key,
+            Arc::new(operation),
+        ))
     }
 
     fn execute_eager(&mut self, operation: &dyn Operation) -> Option<TensorData> {
@@ -698,7 +730,9 @@ impl ComputeGraphInner {
         let workgroup_shape = operation
             .workgroup_shape_constraints(&device)
             .solve(device.max_subgroup_size(), &device.limits())?;
-        let kernel = operation.build_direct_kernel(self, &workgroup_shape, &inputs)?;
+        let kernel_plan = operation
+            .build_direct_kernel_plan(self, &workgroup_shape, &inputs)
+            .ok()?;
         let MirValue::Tensor(output) = operation.output(self, &inputs) else {
             return None;
         };
@@ -709,20 +743,24 @@ impl ComputeGraphInner {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Eager Operation Encoder"),
                 });
-        kernel.run(device.kernel_cache(), &mut command_encoder);
-        device.wgpu_queue().submit(Some(command_encoder.finish()));
-        device.reset_initialized_buffers();
+        let total_kernels = kernel_plan.dispatch_count();
+        for kernel in kernel_plan.into_kernels() {
+            kernel.run(device.kernel_cache(), &mut command_encoder);
+        }
+        if total_kernels > 0 {
+            device.wgpu_queue().submit(Some(command_encoder.finish()));
+            device.reset_initialized_buffers();
+        }
         Some(output)
     }
 
     fn try_resolve_direct_qmatmul(&mut self, key: NodeIndex) -> Option<ResolverResult> {
-        let operation = self.match_direct_qmatmul(key)?;
-        let (output, total_kernels) = self.try_submit_direct_qmatmul(&operation)?;
-        self.set_cached_result(key, output.clone());
-        Some(ResolverResult {
-            data: output,
-            total_kernels,
-        })
+        let (device, result, command_encoder) = self.try_encode_direct_qmatmul(key)?;
+        if result.total_kernels > 0 {
+            device.wgpu_queue().submit(Some(command_encoder.finish()));
+            device.reset_initialized_buffers();
+        }
+        Some(result)
     }
 
     fn remove_reference(&mut self, key: NodeIndex, removed: &mut Vec<ComputeGraphNode>) {

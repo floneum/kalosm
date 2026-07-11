@@ -30,7 +30,7 @@ impl Resolver {
             // user-held node) materializes regardless, so inlining it here
             // would duplicate its compute. Region formation fuses it with
             // its consumers instead, emitting it as a region output.
-            if self.horizontal_merge
+            if self.horizontal_merge_dense_ops
                 && graph
                     .nodes
                     .nodes

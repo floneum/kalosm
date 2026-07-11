@@ -56,6 +56,14 @@ pub(crate) struct SamplerMeta {
     pub(crate) has_exactness_flag: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CategoricalSamplerMeta {
+    pub(crate) input_len: u32,
+    pub(crate) input_offset: u32,
+    pub(crate) input_stride: u32,
+    pub(crate) block: u32,
+}
+
 fn u32t(value: u32) -> Tile {
     Tile::u32(value)
 }
@@ -513,6 +521,208 @@ fn load_param_f32(program: &TileBlock<'_>, params: &Storage, index: u32) -> Tile
 fn store_sample_result(program: &mut TileBlock<'_>, output: &Storage, status: u32, token: Tile) {
     program.store(output.at(0), u32t(status), Mask::all());
     program.store(output.at(1), token, Mask::all());
+}
+
+pub(crate) struct CategoricalSampler<B> {
+    pub(crate) logits: KernelTensorRef<B>,
+    pub(crate) params: KernelTensorRef<B>,
+    pub(crate) output: KernelTensorRef<B>,
+    pub(crate) meta: CategoricalSamplerMeta,
+}
+
+/// Sample directly from one complete, unfiltered logits row. This avoids the
+/// separate chunk-sort, merge, and sampler dispatches used by the general
+/// top-k path. The in-workgroup sort preserves that path's sampling order:
+/// processed logit descending, with token id descending for ties.
+pub(crate) fn categorical_sampler<B>(
+    kb: &mut KernelBuilder<B>,
+    spec: CategoricalSampler<B>,
+) -> Option<()> {
+    let CategoricalSampler {
+        logits,
+        params,
+        output,
+        meta,
+    } = spec;
+    if meta.input_len == 0
+        || meta.block == 0
+        || !meta.block.is_power_of_two()
+        || meta.input_len > meta.block
+        || meta.block > TOP_K_BLOCK
+    {
+        return None;
+    }
+
+    let logits = kb.read(ElementType::F32, logits);
+    let params = kb.read(ElementType::F32, params);
+    let output = kb.write(ElementType::U32, output);
+    let phase = kb.program();
+    let scratch_values = phase.alloc_workgroup_array(ScalarElement::F32, meta.block);
+    let scratch_ids = phase.alloc_workgroup_array(ScalarElement::U32, meta.block);
+    let weights = phase.alloc_workgroup_array(ScalarElement::F32, meta.block);
+
+    emit_row_grid(
+        phase,
+        RowDispatchSpec::single(meta.block),
+        |program, ctx| {
+            let lane = ctx.lane;
+            let sort_current_value = program.private(ElementType::F32);
+            let sort_current_id = program.private(ElementType::U32);
+            let sort_partner_value = program.private(ElementType::F32);
+            let sort_partner_id = program.private(ElementType::U32);
+            let active = lane.clone().lt(u32t(meta.input_len));
+            let input_index = index1(meta.input_offset, meta.input_stride, lane.clone());
+            let raw = program.load(
+                logits.at(input_index),
+                active.clone(),
+                TileLiteral::f32(NEG_MAX_F32),
+            );
+            let scaled = program.private(ElementType::F32);
+            program.store_local(&scaled, raw.clone());
+            let temperature = load_param_f32(program, &params, 1);
+            program.if_then(temperature.clone().ne(f32t(0.0)), |program| {
+                program.store_local(&scaled, raw.clone() / temperature.clone());
+            });
+            let scaled = program.load_local(&scaled);
+            let valid = active & is_finite(raw) & is_finite(scaled.clone());
+            let value = Tile::select(valid.clone(), scaled, f32t(NEG_MAX_F32));
+            let id = Tile::select(valid, lane.clone(), u32t(u32::MAX));
+            program.store_workgroup(&scratch_values, lane.clone(), value);
+            program.store_workgroup(&scratch_ids, lane.clone(), id);
+            program.workgroup_barrier();
+
+            let mut size = 2;
+            while size <= meta.block {
+                let mut stride = size / 2;
+                while stride > 0 {
+                    let partner = lane.clone() ^ stride;
+                    let lower_lane = (lane.clone() & stride).eq(u32t(0));
+                    program.if_then(lower_lane, |program| {
+                        let current_value = program.load_workgroup(&scratch_values, lane.clone());
+                        let current_id = program.load_workgroup(&scratch_ids, lane.clone());
+                        let partner_value =
+                            program.load_workgroup(&scratch_values, partner.clone());
+                        let partner_id = program.load_workgroup(&scratch_ids, partner.clone());
+                        program.store_local(&sort_current_value, current_value);
+                        program.store_local(&sort_current_id, current_id);
+                        program.store_local(&sort_partner_value, partner_value);
+                        program.store_local(&sort_partner_id, partner_id);
+
+                        let current_value = program.load_local(&sort_current_value);
+                        let current_id = program.load_local(&sort_current_id);
+                        let partner_value = program.load_local(&sort_partner_value);
+                        let partner_id = program.load_local(&sort_partner_id);
+                        let descending = (lane.clone() & size).eq(u32t(0));
+                        let partner_better = better_candidate(
+                            partner_value.clone(),
+                            partner_id.clone(),
+                            current_value.clone(),
+                            current_id.clone(),
+                        );
+                        let current_better = better_candidate(
+                            current_value.clone(),
+                            current_id.clone(),
+                            partner_value.clone(),
+                            partner_id.clone(),
+                        );
+                        let ascending = descending.clone().eq(Tile::bool(false));
+                        let should_swap =
+                            (descending & partner_better) | (ascending & current_better);
+                        program.if_then(should_swap, |program| {
+                            let current_value = program.load_local(&sort_current_value);
+                            let current_id = program.load_local(&sort_current_id);
+                            let partner_value = program.load_local(&sort_partner_value);
+                            let partner_id = program.load_local(&sort_partner_id);
+                            program.store_workgroup(
+                                &scratch_values,
+                                lane.clone(),
+                                partner_value.clone(),
+                            );
+                            program.store_workgroup(&scratch_ids, lane.clone(), partner_id.clone());
+                            program.store_workgroup(
+                                &scratch_values,
+                                partner.clone(),
+                                current_value.clone(),
+                            );
+                            program.store_workgroup(&scratch_ids, partner, current_id);
+                        });
+                    });
+                    program.workgroup_barrier();
+                    stride /= 2;
+                }
+                size *= 2;
+            }
+
+            let max_value = program.load_workgroup(&scratch_values, u32t(0));
+            let sorted_value = program.load_workgroup(&scratch_values, lane.clone());
+            let sorted_id = program.load_workgroup(&scratch_ids, lane.clone());
+            let valid = sorted_id.ne(u32t(u32::MAX));
+            let weight = Tile::select(
+                valid,
+                (sorted_value - max_value).unary(TileUnaryOp::Exp),
+                f32t(0.0),
+            );
+            program.store_workgroup(&weights, lane.clone(), weight.clone());
+            program.workgroup_barrier();
+            let total = program.reduce_sum(weight);
+            let total = program.bind(total);
+
+            program.if_then(first_lane(&lane), |program| {
+                let first_id = program.load_workgroup(&scratch_ids, u32t(0));
+                let total_invalid = is_finite(total.clone()).eq(Tile::bool(false))
+                    | total.clone().le(f32t(0.0))
+                    | first_id.clone().eq(u32t(u32::MAX));
+                program.if_then(total_invalid, |program| {
+                    store_sample_result(program, &output, GPU_SAMPLE_STATUS_INVALID, u32t(0));
+                    program.return_();
+                });
+
+                let random = load_param_f32(program, &params, 0);
+                let cutoff = program.private(ElementType::U32);
+                let cutoff_sum = program.private(ElementType::F32);
+                program.store_local(&cutoff, u32t(meta.input_len));
+                program.store_local(&cutoff_sum, f32t(0.0));
+                program.fold_state(
+                    u32t(0),
+                    |_, index| index.ge(u32t(meta.input_len)),
+                    |program, index| {
+                        let weight = program.load_workgroup(&weights, index.clone());
+                        let next = program.load_local(&cutoff_sum) + weight;
+                        program.store_local(&cutoff_sum, next.clone());
+                        program.if_then(next.ge(total.clone()), |program| {
+                            program.store_local(&cutoff, index.clone() + u32t(1));
+                            program.break_loop();
+                        });
+                        index + u32t(1)
+                    },
+                );
+                let cutoff_sum = program.load_local(&cutoff_sum).max(f32t(1.0e-20));
+                let threshold = random * cutoff_sum;
+                let cumulative = program.private(ElementType::F32);
+                let selected = program.private(ElementType::U32);
+                program.store_local(&cumulative, f32t(0.0));
+                program.store_local(&selected, first_id);
+                program.fold_state(
+                    u32t(0),
+                    |program, index| index.ge(program.load_local(&cutoff)),
+                    |program, index| {
+                        let weight = program.load_workgroup(&weights, index.clone());
+                        let next = program.load_local(&cumulative) + weight.clone();
+                        program.if_then(next.clone().ge(threshold.clone()), |program| {
+                            let id = program.load_workgroup(&scratch_ids, index.clone());
+                            program.store_local(&selected, id);
+                            program.break_loop();
+                        });
+                        program.store_local(&cumulative, next);
+                        index + u32t(1)
+                    },
+                );
+                let selected = program.load_local(&selected);
+                store_sample_result(program, &output, GPU_SAMPLE_STATUS_SAMPLED, selected);
+            });
+        },
+    );
+    Some(())
 }
 
 fn emit_sampler_guards(

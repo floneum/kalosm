@@ -10,13 +10,13 @@ impl<const R: usize> Tensor<R> {
         crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
     {
         let input_shape = self.shape();
-        let value = self.value.sum_keepdim::<OUT_RANK>(axis).to_concrete();
+        let value = self.value.sum_keepdim::<OUT_RANK>(axis).into_concrete();
         let input_id = self.handle.id;
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = downcast_tensor::<R>(&*gradient, "sum_keepdim")?;
             Ok(vec![BackwardTarget {
                 node: input_id,
-                gradient: Box::new(gradient.broadcast_as(input_shape).to_concrete()),
+                gradient: Box::new(gradient.broadcast_as(input_shape).into_concrete()),
             }])
         });
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
@@ -29,7 +29,7 @@ impl<const R: usize> Tensor<R> {
         crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
     {
         let input_shape = self.shape();
-        let value = self.value.sum::<OUT_RANK>(axis).to_concrete();
+        let value = self.value.sum::<OUT_RANK>(axis).into_concrete();
         let input_id = self.handle.id;
         let mut keepdim_shape = input_shape;
         keepdim_shape[axis] = 1;
@@ -40,9 +40,9 @@ impl<const R: usize> Tensor<R> {
                 gradient: Box::new(
                     gradient
                         .reshape(keepdim_shape)
-                        .to_concrete()
+                        .into_concrete()
                         .broadcast_as(input_shape)
-                        .to_concrete(),
+                        .into_concrete(),
                 ),
             }])
         });
@@ -57,7 +57,7 @@ impl<const R: usize> Tensor<R> {
         crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
     {
         let input = self.value.clone();
-        let value = input.max_keepdim::<OUT_RANK>(axis).to_concrete();
+        let value = input.max_keepdim::<OUT_RANK>(axis).into_concrete();
         let input_id = self.handle.id;
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = downcast_tensor::<R>(&*gradient, "max_keepdim")?;
@@ -82,7 +82,7 @@ impl<const R: usize> Tensor<R> {
         crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
     {
         let input = self.value.clone();
-        let value = input.min_keepdim::<OUT_RANK>(axis).to_concrete();
+        let value = input.min_keepdim::<OUT_RANK>(axis).into_concrete();
         let input_id = self.handle.id;
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = downcast_tensor::<R>(&*gradient, "min_keepdim")?;
@@ -119,31 +119,31 @@ impl<const R: usize> Tensor<R> {
     {
         let input = self.value.clone();
         let input_shape = self.shape();
-        let value = input.product_keepdim::<OUT_RANK>(axis).to_concrete();
+        let value = input.product_keepdim::<OUT_RANK>(axis).into_concrete();
         let input_id = self.handle.id;
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = downcast_tensor::<R>(&*gradient, "product_keepdim")?;
-            let upstream = gradient.broadcast_as(input_shape).to_concrete();
+            let upstream = gradient.broadcast_as(input_shape).into_concrete();
             let zeros = RawTensor::zeros(&input.device(), input_shape);
             let ones = RawTensor::splat(&input.device(), 1.0, input_shape);
-            let zero_mask = input.eq(0.0).to_concrete();
-            let safe_input = zero_mask.where_cond(&ones, &input).to_concrete();
-            let zero_count = zero_mask.sum_keepdim::<OUT_RANK>(axis).to_concrete();
-            let zero_count_broadcast = zero_count.broadcast_as(input_shape).to_concrete();
+            let zero_mask = input.eq(0.0).into_concrete();
+            let safe_input = zero_mask.where_cond(&ones, &input).into_concrete();
+            let zero_count = zero_mask.sum_keepdim::<OUT_RANK>(axis).into_concrete();
+            let zero_count_broadcast = zero_count.broadcast_as(input_shape).into_concrete();
             let product_non_zero = safe_input
                 .product_keepdim::<OUT_RANK>(axis)
                 .broadcast_as(input_shape)
-                .to_concrete();
+                .into_concrete();
             let no_zero_grad = (upstream.clone()
-                * (product_non_zero.clone() / safe_input).to_concrete())
-            .to_concrete();
+                * (product_non_zero.clone() / safe_input).into_concrete())
+            .into_concrete();
             let single_zero_grad = zero_mask
-                .where_cond(&(upstream * product_non_zero).to_concrete(), &zeros)
-                .to_concrete();
-            let gradient = ((no_zero_grad * zero_count_broadcast.eq(0.0).to_concrete())
-                .to_concrete()
-                + (single_zero_grad * zero_count_broadcast.eq(1.0).to_concrete()).to_concrete())
-            .to_concrete();
+                .where_cond(&(upstream * product_non_zero).into_concrete(), &zeros)
+                .into_concrete();
+            let gradient = ((no_zero_grad * zero_count_broadcast.eq(0.0).into_concrete())
+                .into_concrete()
+                + (single_zero_grad * zero_count_broadcast.eq(1.0).into_concrete()).into_concrete())
+            .into_concrete();
             Ok(vec![BackwardTarget {
                 node: input_id,
                 gradient: Box::new(gradient),
@@ -360,7 +360,7 @@ impl Tensor<1> {
             let gradient = downcast_tensor::<0>(&*gradient, "sum")?;
             Ok(vec![BackwardTarget {
                 node: input_id,
-                gradient: Box::new(gradient.broadcast_as(input_shape).to_concrete()),
+                gradient: Box::new(gradient.broadcast_as(input_shape).into_concrete()),
             }])
         });
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
@@ -405,15 +405,15 @@ where
     } else {
         input.min_keepdim::<OUT_RANK>(axis)
     }
-    .to_concrete();
-    let extrema_broadcast = extrema.broadcast_as(input_shape).to_concrete();
+    .into_concrete();
+    let extrema_broadcast = extrema.broadcast_as(input_shape).into_concrete();
     let mask = (input - extrema_broadcast)
-        .to_concrete()
+        .into_concrete()
         .eq(0.0)
-        .to_concrete();
+        .into_concrete();
     let tie_count = mask
         .sum_keepdim::<OUT_RANK>(axis)
         .broadcast_as(input_shape)
-        .to_concrete();
-    ((mask * gradient.broadcast_as(input_shape)).to_concrete() / tie_count).to_concrete()
+        .into_concrete();
+    ((mask * gradient.broadcast_as(input_shape)).into_concrete() / tie_count).into_concrete()
 }

@@ -1,4 +1,5 @@
 use crate::{Device, StrideSpec, Tensor};
+use fusor_gguf::GgmlType;
 
 // Build a small intermediate that requires a real kernel (not a Tensor input).
 // `x` materializes via `(input * 2.0) + 1.0`, which fuses to a single nary.
@@ -202,6 +203,93 @@ fn auto_flush_resolves_pending_siblings() {
     });
 }
 
+#[test]
+fn direct_qmatmul_triggers_auto_flush() {
+    pollster::block_on(async {
+        const N: usize = 4;
+        const K: usize = 8;
+
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        let siblings: Vec<_> = (0..3).map(|_| build_intermediate(&device).sin()).collect();
+        let weight_bytes: Vec<u8> = (0..N * K)
+            .map(|i| 0.1 + i as f32 * 0.05)
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let weight = crate::QMatrix::from_parts(
+            &device,
+            &weight_bytes,
+            vec![N, K].into_boxed_slice(),
+            GgmlType::F32,
+        )
+        .unwrap();
+        let direct =
+            Tensor::new::<f32, 2, _>(&device, &[[1.0f32, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0]])
+                .q_mat_mul(&weight);
+
+        device.compute_graph().set_flush_threshold(1);
+        let (_, kernels) = direct.data.materialize();
+        assert!(kernels > 0, "direct QMatMul dispatched no kernels");
+
+        for sibling in siblings {
+            assert!(
+                device.compute_graph().is_cached_for_test(sibling.key()),
+                "direct QMatMul should auto-flush pending sibling outputs",
+            );
+        }
+    });
+}
+
+#[test]
+fn direct_qmatmul_releases_a_dead_cached_activation() {
+    pollster::block_on(async {
+        const N: usize = 64;
+        const K: usize = 4;
+
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let activation = build_intermediate(&device);
+        let activation_key = activation.key();
+        let _ = activation.data.materialize();
+        assert!(device.compute_graph().is_cached_for_test(activation_key));
+
+        let weight_bytes = (0..N * K)
+            .map(|i| 0.1 + i as f32 * 0.05)
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let weight = crate::QMatrix::from_parts(
+            &device,
+            &weight_bytes,
+            vec![N, K].into_boxed_slice(),
+            GgmlType::F32,
+        )
+        .unwrap();
+        let output = activation.q_mat_mul(&weight);
+        drop(activation);
+
+        let (_, kernels) = output.data.materialize();
+        assert!(
+            (1..=2).contains(&kernels),
+            "QMatMul should use a singular or M-padded two-kernel plan",
+        );
+        assert!(
+            !device.compute_graph().is_cached_for_test(activation_key),
+            "the direct queue should release its dead cached activation",
+        );
+
+        let values = output.as_slice::<2, f32>().await.unwrap();
+        let expected = [3.0f32, 5.0, 7.0, 9.0]
+            .iter()
+            .enumerate()
+            .map(|(k, value)| value * (0.1 + k as f32 * 0.05))
+            .sum::<f32>();
+        assert!((values[[0, 0]] - expected).abs() < 1e-4);
+    });
+}
+
 // --- split + op + cat lowering (resolve/recognize_cat.rs) ---
 
 /// Narrow a 2D tensor along a dimension as a view.
@@ -217,6 +305,23 @@ fn narrow2(tensor: &Tensor, dim: usize, start: usize, length: usize) -> Tensor {
         })
         .collect();
     tensor.restride(specs)
+}
+
+#[test]
+fn dense_offset_view_downloads_the_compact_range() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let input_values = (0..32).map(|value| value as f32).collect::<Vec<_>>();
+        let input = Tensor::from_slice(&device, [4, 8], &input_values);
+        let row = narrow2(&input, 0, 2, 1);
+
+        let downloaded = row.as_slice::<2, f32>().await.unwrap();
+        for column in 0..8 {
+            assert_eq!(downloaded[[0, column]], (16 + column) as f32);
+        }
+    });
 }
 
 fn cat_test_input(device: &Device) -> (Tensor, Vec<Vec<f32>>) {
@@ -462,7 +567,14 @@ fn conv_im2col_matmul_runs_without_gather() {
             // N=16 output channels reach the coop kernel through the
             // small-side (64, 16) tile, so the implicit-GEMM read fires.
             (
-                2usize, 8usize, 16usize, 16usize, 16usize, 3usize, 3usize, coop_viable,
+                2usize,
+                8usize,
+                16usize,
+                16usize,
+                16usize,
+                3usize,
+                3usize,
+                coop_viable,
             ),
             (2, 64, 34, 34, 128, 3, 3, coop_viable),
             // Coop-tile-unaligned M (1089 divides nothing): the masked-edge
@@ -579,11 +691,15 @@ fn natural_form_updates_replay_and_claim_in_place() {
 
         let mut previous_ptrs: Option<[usize; 3]> = None;
         let mut stable_iterations = 0;
+        let (mut expected_m, mut expected_v, mut expected_p) = (0.5f32, 0.25f32, 1.0f32);
         for iteration in 0..5 {
             let g = Tensor::new::<f32, 1, _>(&device, &vec![0.01f32; N]);
             let m2 = &(&m + 0.1f32) + &g;
             let v2 = &(&v + 0.2f32) + &g;
             let p2 = &(&p - 0.001f32) - &(&m2 + &v2);
+            expected_m = (expected_m + 0.1) + 0.01;
+            expected_v = (expected_v + 0.2) + 0.01;
+            expected_p = expected_p - 0.001 - (expected_m + expected_v);
             m = m2;
             v = v2;
             p = p2;
@@ -602,10 +718,8 @@ fn natural_form_updates_replay_and_claim_in_place() {
                 let (data, _) = tensor.data.materialize();
                 std::sync::Arc::as_ptr(data.buffer()) as usize
             });
-            if iteration >= 2 {
-                if previous_ptrs == Some(ptrs) {
-                    stable_iterations += 1;
-                }
+            if iteration >= 2 && previous_ptrs == Some(ptrs) {
+                stable_iterations += 1;
             }
             previous_ptrs = Some(ptrs);
         }
@@ -624,5 +738,179 @@ fn natural_form_updates_replay_and_claim_in_place() {
             cache.replay_count() >= 1,
             "no flush replay fired across isomorphic steps"
         );
+
+        let m_values = m.as_slice::<1, f32>().await.unwrap();
+        let v_values = v.as_slice::<1, f32>().await.unwrap();
+        let p_values = p.as_slice::<1, f32>().await.unwrap();
+        for i in 0..N {
+            assert!(
+                (m_values[[i]] - expected_m).abs() < 1e-5,
+                "replayed m update is wrong at {i}: got {}, expected {expected_m}",
+                m_values[[i]],
+            );
+            assert!(
+                (v_values[[i]] - expected_v).abs() < 1e-5,
+                "replayed v update is wrong at {i}: got {}, expected {expected_v}",
+                v_values[[i]],
+            );
+            assert!(
+                (p_values[[i]] - expected_p).abs() < 1e-4,
+                "replayed p update is wrong at {i}: got {}, expected {expected_p}",
+                p_values[[i]],
+            );
+        }
+    });
+}
+
+/// Repeated ordinary materialization (the path used by `as_slice`) should
+/// share the same reusable-plan lifecycle as batched flushes. Varying input
+/// contents verifies that replay rebinds the current graph's buffers instead
+/// of retaining data from the recording iteration.
+#[test]
+fn single_target_materialization_records_and_replays() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let records_before = device.flush_plan_cache().record_count();
+        let replays_before = device.flush_plan_cache().replay_count();
+
+        for iteration in 0..4 {
+            let input_values = (0..64)
+                .map(|index| iteration as f32 + index as f32 * 0.25)
+                .collect::<Vec<_>>();
+            let input = Tensor::new::<f32, 1, _>(&device, &input_values);
+            let output = (&input * 2.0f32) + 1.0f32;
+            let values = output.as_slice::<1, f32>().await.unwrap();
+            for (index, &input_value) in input_values.iter().enumerate() {
+                assert_eq!(values[[index]], input_value * 2.0 + 1.0);
+            }
+            drop(values);
+            drop(output);
+            drop(input);
+            assert_eq!(
+                device.compute_graph().node_count(),
+                0,
+                "single-target replay retained graph nodes after iteration {iteration}",
+            );
+        }
+
+        assert!(
+            device.flush_plan_cache().record_count() > records_before,
+            "single-target materialization did not record a reusable plan",
+        );
+        assert!(
+            device.flush_plan_cache().replay_count() > replays_before,
+            "single-target materialization did not replay its recorded plan",
+        );
+
+        // The same target structure is not replay-safe while a live sibling
+        // outside its dependency closure still needs the input. Its liveness
+        // can change allocation claims without changing the target hash.
+        let input_values = (0..64).map(|index| index as f32).collect::<Vec<_>>();
+        let input = Tensor::new::<f32, 1, _>(&device, &input_values);
+        let target = (&input * 2.0f32) + 1.0f32;
+        let sibling = (&input * 3.0f32) + 7.0f32;
+        let replays_before_sibling = device.flush_plan_cache().replay_count();
+        let target_values = target.as_slice::<1, f32>().await.unwrap();
+        assert_eq!(
+            device.flush_plan_cache().replay_count(),
+            replays_before_sibling,
+            "single-target replay ignored a live output outside its closure",
+        );
+        drop(target_values);
+        let sibling_values = sibling.as_slice::<1, f32>().await.unwrap();
+        for (index, &input_value) in input_values.iter().enumerate() {
+            assert_eq!(sibling_values[[index]], input_value * 3.0 + 7.0);
+        }
+    });
+}
+
+/// Ordinary and encoder-tail materialization share the bare-QMatMul direct
+/// path. Wrapping QMatMul in an identity elementwise op forces the general
+/// resolver; all three paths must compute the same result.
+#[test]
+fn qmatmul_materialization_paths_match() {
+    pollster::block_on(async {
+        const N: usize = 4;
+        const K: usize = 8;
+
+        let Ok(direct_device) = Device::new().await else {
+            return;
+        };
+        let Ok(general_device) = Device::new().await else {
+            return;
+        };
+        let Ok(tail_device) = Device::new().await else {
+            return;
+        };
+
+        let weights: Vec<f32> = (0..N * K).map(|i| 0.1 + i as f32 * 0.05).collect();
+        let weight_bytes: Vec<u8> = weights
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let make_weight = |device: &Device| {
+            crate::QMatrix::from_parts(
+                device,
+                &weight_bytes,
+                vec![N, K].into_boxed_slice(),
+                GgmlType::F32,
+            )
+            .unwrap()
+        };
+        let input = [1.0f32, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0];
+
+        let direct = Tensor::new::<f32, 2, _>(&direct_device, &[input])
+            .q_mat_mul(&make_weight(&direct_device));
+        let (_, direct_kernels) = direct.data.materialize();
+        assert!(direct_kernels > 0, "direct QMatMul dispatched no kernels");
+
+        let direct_tail =
+            Tensor::new::<f32, 2, _>(&tail_device, &[input]).q_mat_mul(&make_weight(&tail_device));
+        let (_, tail_kernels, ()) = direct_tail.data.materialize_with_tail(|_, _| ());
+        assert!(
+            tail_kernels > 0,
+            "encoder-tail direct QMatMul dispatched no kernels"
+        );
+
+        let qmatmul = Tensor::new::<f32, 2, _>(&general_device, &[input])
+            .q_mat_mul(&make_weight(&general_device));
+        let general = &qmatmul + 0.0f32;
+        let (_, general_kernels, ()) = general.data.materialize_with_tail(|_, _| ());
+        assert!(
+            general_kernels > 0,
+            "general-resolver QMatMul dispatched no kernels"
+        );
+
+        let direct_values = direct.as_slice::<2, f32>().await.unwrap();
+        let tail_values = direct_tail.as_slice::<2, f32>().await.unwrap();
+        let general_values = general.as_slice::<2, f32>().await.unwrap();
+        for column in 0..N {
+            let expected = (0..K)
+                .map(|k| input[k] * weights[column * K + k])
+                .sum::<f32>();
+            let direct_value = direct_values[[0, column]];
+            let tail_value = tail_values[[0, column]];
+            let general_value = general_values[[0, column]];
+            let tolerance = 1e-4 * expected.abs().max(1.0);
+            assert!(
+                (direct_value - expected).abs() <= tolerance,
+                "direct QMatMul mismatch at {column}: got {direct_value}, expected {expected}",
+            );
+            assert!(
+                (tail_value - expected).abs() <= tolerance,
+                "encoder-tail QMatMul mismatch at {column}: got {tail_value}, expected {expected}",
+            );
+            assert!(
+                (general_value - expected).abs() <= tolerance,
+                "general QMatMul mismatch at {column}: got {general_value}, expected {expected}",
+            );
+            assert!(
+                (direct_value - tail_value).abs() <= tolerance
+                    && (direct_value - general_value).abs() <= tolerance,
+                "QMatMul paths differ at {column}: direct {direct_value}, tail {tail_value}, general {general_value}",
+            );
+        }
     });
 }
