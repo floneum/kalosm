@@ -109,6 +109,7 @@ impl LayoutPass {
         );
     }
 
+
     fn visit_tensor(&mut self, key: NodeIndex, operation: &crate::tensor::TensorData) {
         let info = operation.info();
         self.output_layout.insert(key, info.clone());

@@ -575,6 +575,7 @@ impl Resolver {
             steps,
             output_datatype: root.output_datatype,
             dynamic_axis: None,
+            dense_codegen: false,
         };
         let externals = builder.externals;
         if trace {

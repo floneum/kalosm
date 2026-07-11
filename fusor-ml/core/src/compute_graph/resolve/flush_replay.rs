@@ -59,7 +59,7 @@ use crate::{DataTypeEnum, Device, Layout};
 
 /// Bump when anything about the recorded plan layout or the fingerprint
 /// recipe changes, so stale entries can never be replayed.
-const REPLAY_RECIPE_VERSION: u64 = 1;
+const REPLAY_RECIPE_VERSION: u64 = 5;
 
 const FLUSH_PLAN_CACHE_SIZE: usize = 8;
 
@@ -151,6 +151,9 @@ fn hash_env_snapshot(state: &mut FxHasher) {
         "FUSOR_RESOLVE_OPTIMIZE_DECODE_GRAPHS",
         "FUSOR_DISABLE_DECODE_PLAN_CACHE",
         "FUSOR_RESOLVE_DISABLE_DENSE_REDUCE_FUSION",
+        "FUSOR_DISABLE_HORIZONTAL_FUSION",
+        "FUSOR_DISABLE_REGION_FUSION",
+        "FUSOR_DISABLE_ALLOC_REUSE",
     ];
     for var in KEYED_ENVS {
         match std::env::var(var) {
@@ -275,9 +278,13 @@ fn fingerprint_visit(
     if let Some(cached) = &node_data.cached {
         // Cached boundary leaf: opaque. The buffer contents are per-step
         // data; only the layout contract the recorded kernels were compiled
-        // against must match.
+        // against must match. The liveness bit is part of the structure too:
+        // allocation-reuse claims depend on whether the user still holds a
+        // handle to the boundary tensor, so "user kept a handle" must never
+        // collide with a plan whose claims assumed the buffer was dead.
         state.boundary.push(true);
         state.hasher.write_u64(0xB0);
+        state.hasher.write_u64((node_data.reference_count > 0) as u64);
         state.hasher.write_u64(local_hash(|h| {
             cached.datatype().hash(h);
             hash_layout(h, cached.layout());
@@ -360,6 +367,14 @@ enum PlanStep {
         output: OutputSpec,
         /// Dependency positions (with multiplicity, in `visit_dependencies`
         /// order) to feed the release accounting after this step.
+        consumed: Box<[u32]>,
+    },
+    /// One horizontally merged dispatch caching several segments' outputs.
+    /// Every output is a freshly allocated buffer (never an alias), so slot
+    /// attribution stays 1 buffer <-> 1 slot.
+    MergedDispatch {
+        outputs: Box<[(u32, OutputSpec)]>,
+        kernels: Box<[PlanKernel]>,
         consumed: Box<[u32]>,
     },
 }
@@ -473,15 +488,52 @@ impl PlanRecorder {
             && prev != pos
             && !structural
         {
-            self.poisoned = true;
+            self.poison();
         }
+    }
+
+    /// Classify one output buffer as Fresh or a resolver-chosen Alias.
+    /// Returns `None` (and poisons) on any disagreement between pointer
+    /// provenance and the resolver's claim ledger.
+    /// Classify one output buffer as Fresh or a resolver-chosen Alias.
+    /// The provenance slot (the buffer's last structural writer) is the
+    /// replay-faithful alias target: several fingerprint slots can share one
+    /// buffer (a producer and its views), so the claim ledger's source node
+    /// attests that the reuse was deliberately chosen while provenance names
+    /// the slot whose replay buffer is this buffer. A provenance hit without
+    /// a chosen claim is accidental buffer sharing between distinct slots
+    /// (replaying it would bind one slot's data where another slot's is
+    /// expected), and a claim without a hit is an accounting inconsistency —
+    /// both poison the plan.
+    fn classify_output_source(
+        &mut self,
+        output_ptr: usize,
+        output: &TensorData,
+        claimed_from: Option<NodeIndex>,
+    ) -> Option<OutputSource> {
+        match (self.provenance.get(&output_ptr).copied(), claimed_from) {
+            (Some(slot), Some(_)) => Some(OutputSource::Alias { slot }),
+            (None, None) => Some(OutputSource::Fresh {
+                buffer_size: output.buffer().size(),
+                usage: output.buffer().usage(),
+            }),
+            _ => {
+                self.poison();
+                None
+            }
+        }
+    }
+
+    /// Raw pointers of every buffer this recorder holds a strong clone of.
+    pub(super) fn pinned_ptrs(&self) -> impl Iterator<Item = usize> + '_ {
+        self.pinned.iter().map(|buffer| Arc::as_ptr(buffer) as usize)
     }
 
     fn pos(&mut self, node: NodeIndex) -> Option<u32> {
         match self.pos_of.get(&node) {
             Some(&pos) => Some(pos),
             None => {
-                self.poisoned = true;
+                self.poison();
                 None
             }
         }
@@ -565,23 +617,23 @@ impl PlanRecorder {
         kernels: &[DirectKernel],
         output: &TensorData,
         op: &QueuedOperation,
+        claimed_from: Option<NodeIndex>,
     ) {
         if self.poisoned {
             return;
         }
         let Some(pos) = self.pos(node) else { return };
 
-        // Alias-vs-Fresh classification is exact: `pinned` keeps every
-        // tracked pointer alive, so a provenance hit can only be a genuine
-        // in-place output over a live slot buffer, never a pool-recycled
-        // pointer of a released one.
+        // Alias-vs-Fresh classification requires BOTH the pointer-provenance
+        // hit AND the resolver's explicit claim to agree on the source slot:
+        // a provenance hit without a chosen claim is accidental buffer
+        // sharing between distinct slots (replaying it would bind one slot's
+        // data where another slot's is expected — poison), and a claim
+        // without a hit is an accounting inconsistency (poison). `pinned` keeps every
+        // tracked pointer alive, so hits are never pool-recycled coincidences.
         let output_ptr = Arc::as_ptr(output.buffer()) as usize;
-        let source = match self.provenance.get(&output_ptr) {
-            Some(&slot) => OutputSource::Alias { slot },
-            None => OutputSource::Fresh {
-                buffer_size: output.buffer().size(),
-                usage: output.buffer().usage(),
-            },
+        let Some(source) = self.classify_output_source(output_ptr, output, claimed_from) else {
+            return;
         };
         let output_spec = OutputSpec {
             layout: output.layout().clone(),
@@ -601,7 +653,7 @@ impl PlanRecorder {
                 let Some(&slot) = self.provenance.get(&(Arc::as_ptr(buffer) as usize)) else {
                     // Build-internal scratch buffer (e.g. split row-program
                     // sequences): the plan cannot re-create it.
-                    self.poisoned = true;
+                    self.poison();
                     return;
                 };
                 bindings.push(slot);
@@ -621,6 +673,67 @@ impl PlanRecorder {
             pos,
             kernels: plan_kernels.into(),
             output: output_spec,
+            consumed,
+        });
+    }
+
+    /// Record one horizontally merged dispatch. Every segment output must be
+    /// a fresh buffer: a provenance hit means the output aliases an existing
+    /// slot, which the merged replay arm cannot re-create — poison.
+    pub(super) fn record_merged_dispatch(
+        &mut self,
+        segment_outputs: &[(NodeIndex, &TensorData, Option<NodeIndex>)],
+        kernels: &[DirectKernel],
+        op: &super::merge_horizontal::MergedSegments,
+    ) {
+        if self.poisoned {
+            return;
+        }
+        let mut outputs = Vec::with_capacity(segment_outputs.len());
+        for (node, output, claimed_from) in segment_outputs {
+            let Some(pos) = self.pos(*node) else { return };
+            let output_ptr = Arc::as_ptr(output.buffer()) as usize;
+            let Some(source) = self.classify_output_source(output_ptr, output, *claimed_from)
+            else {
+                return;
+            };
+            outputs.push((
+                pos,
+                OutputSpec {
+                    layout: output.layout().clone(),
+                    datatype: output.datatype(),
+                    source,
+                },
+            ));
+            // Structural: the merged replay arm re-creates this slot (fresh
+            // allocation or the recorded alias).
+            self.attribute_buffer(output.buffer(), pos, true);
+        }
+        let mut plan_kernels = Vec::with_capacity(kernels.len());
+        for kernel in kernels {
+            let buffers = kernel.binding_buffers();
+            let mut bindings = Vec::with_capacity(buffers.len());
+            for buffer in &buffers {
+                let Some(&slot) = self.provenance.get(&(Arc::as_ptr(buffer) as usize)) else {
+                    self.poison();
+                    return;
+                };
+                bindings.push(slot);
+            }
+            plan_kernels.push(PlanKernel {
+                template: kernel.to_template(),
+                bindings: bindings.into(),
+            });
+        }
+
+        let mut deps = Vec::new();
+        op.visit_dependencies(&mut |dep| deps.push(dep));
+        let Some(consumed) = self.consumed_positions(&deps) else {
+            return;
+        };
+        self.steps.push(PlanStep::MergedDispatch {
+            outputs: outputs.into(),
+            kernels: plan_kernels.into(),
             consumed,
         });
     }
@@ -654,27 +767,80 @@ pub(crate) fn try_replay_flush(
     // Upfront validation, before any mutation: every step's slot must hold
     // the node kind the plan expects and must not be cached yet, and every
     // boundary must be cached. After this point the plan cannot fail.
-    for step in &plan.steps {
-        let (pos, kind) = match step {
-            PlanStep::TensorLeaf { pos } => (*pos, 0u8),
-            PlanStep::ViewAlias { pos, .. } => (*pos, 1),
-            PlanStep::CopyAssign { pos, .. } => (*pos, 2),
-            PlanStep::Dispatch { pos, .. } => (*pos, 3),
-        };
+    let check_slot = |pos: u32, kind: u8| -> bool {
         let Some(node) = graph.nodes.nodes.node_weight(slots[pos as usize]) else {
             return false;
         };
         if node.cached.is_some() {
             return false;
         }
-        let kind_matches = match (&node.variant, kind) {
+        match (&node.variant, kind) {
             (ComputeGraphNodeVariant::Tensor(_), 0) => true,
             (ComputeGraphNodeVariant::View(_), 1) => true,
             (ComputeGraphNodeVariant::Assign(_), 2) => true,
             (_, 3) => true,
             _ => false,
+        }
+    };
+    // An alias output overwrites its source slot's buffer. A source
+    // produced by an earlier plan step is exclusively owned by this replay.
+    // A boundary source (cached before the flush) is legal only when its
+    // liveness matches the recording: the fingerprint pins the node-level
+    // bits (reference count, descendants), and the strong count check below
+    // catches non-graph holders (an in-flight download, a raw clone) — any
+    // mismatch falls back to a full resolve, which re-decides the claims.
+    let mut produced = vec![false; slots.len()];
+    for step in &plan.steps {
+        let alias_ok = |spec: &OutputSpec, produced: &[bool]| match spec.source {
+            OutputSource::Alias { slot } => {
+                if produced[slot as usize] {
+                    return true;
+                }
+                let Some(node) = graph.nodes.nodes.node_weight(slots[slot as usize]) else {
+                    return false;
+                };
+                let Some(cached) = &node.cached else {
+                    return false;
+                };
+                let buffer = cached.buffer();
+                let expected = 1 + u32::from(device.buffer_pool_is_tracked(
+                    buffer.size(),
+                    buffer.usage(),
+                    buffer,
+                ));
+                Arc::strong_count(buffer) as u32 == expected
+            }
+            OutputSource::Fresh { .. } => true,
         };
-        if !kind_matches {
+        let ok = match step {
+            PlanStep::TensorLeaf { pos } => {
+                produced[*pos as usize] = true;
+                check_slot(*pos, 0)
+            }
+            PlanStep::ViewAlias { pos, .. } => {
+                produced[*pos as usize] = true;
+                check_slot(*pos, 1)
+            }
+            PlanStep::CopyAssign { pos, .. } => {
+                produced[*pos as usize] = true;
+                check_slot(*pos, 2)
+            }
+            PlanStep::Dispatch { pos, output, .. } => {
+                let ok = check_slot(*pos, 3) && alias_ok(output, &produced);
+                produced[*pos as usize] = true;
+                ok
+            }
+            PlanStep::MergedDispatch { outputs, .. } => {
+                let ok = outputs
+                    .iter()
+                    .all(|(pos, spec)| check_slot(*pos, 3) && alias_ok(spec, &produced));
+                for (pos, _) in outputs.iter() {
+                    produced[*pos as usize] = true;
+                }
+                ok
+            }
+        };
+        if !ok {
             return false;
         }
     }
@@ -828,6 +994,50 @@ pub(crate) fn try_replay_flush(
                 graph.set_cached_result(idx, output_data);
                 release_consumed(graph, slots, &mut counts, &is_target, consumed);
             }
+            PlanStep::MergedDispatch {
+                outputs,
+                kernels,
+                consumed,
+            } => {
+                for (pos, output) in outputs.iter() {
+                    let buffer = match &output.source {
+                        OutputSource::Fresh { buffer_size, usage } => {
+                            device.create_buffer(*buffer_size, *usage)
+                        }
+                        OutputSource::Alias { slot } => slot_buffers[*slot as usize]
+                            .clone()
+                            .expect("flush replay: alias output slot has no buffer"),
+                    };
+                    let output_data = TensorData::new_from_parts(
+                        device,
+                        buffer,
+                        output.layout.clone(),
+                        output.datatype,
+                    );
+                    slot_buffers[*pos as usize] = Some(output_data.buffer().clone());
+                    graph.set_cached_result(slots[*pos as usize], output_data);
+                }
+                for kernel in kernels.iter() {
+                    let buffers = kernel
+                        .bindings
+                        .iter()
+                        .map(|&slot| {
+                            slot_buffers[slot as usize]
+                                .clone()
+                                .expect("flush replay: binding slot has no buffer")
+                        })
+                        .collect::<Vec<_>>();
+                    let bound = kernel.template.bind_buffers(&buffers);
+                    if let Some(dispatch) = bound.prepare_dispatch(kernel_cache) {
+                        commands.push(CommandRecord::Dispatch(DispatchRecord {
+                            dispatch,
+                            name: bound.name().to_string(),
+                            category: None,
+                        }));
+                    }
+                }
+                release_consumed(graph, slots, &mut counts, &is_target, consumed);
+            }
         }
     }
 
@@ -853,7 +1063,8 @@ fn step_consumed(step: &PlanStep) -> &[u32] {
         PlanStep::TensorLeaf { .. } => &[],
         PlanStep::ViewAlias { consumed, .. }
         | PlanStep::CopyAssign { consumed, .. }
-        | PlanStep::Dispatch { consumed, .. } => consumed,
+        | PlanStep::Dispatch { consumed, .. }
+        | PlanStep::MergedDispatch { consumed, .. } => consumed,
     }
 }
 

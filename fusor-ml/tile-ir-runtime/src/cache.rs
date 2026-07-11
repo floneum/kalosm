@@ -30,6 +30,14 @@ const DIRECT_DYNAMIC_BIND_GROUP_CACHE_SIZE: usize = 512;
 pub struct KernelCacheKey([u64; 2]);
 
 impl KernelCacheKey {
+    pub(crate) fn parts(&self) -> [u64; 2] {
+        self.0
+    }
+
+    pub(crate) fn from_parts(parts: [u64; 2]) -> Self {
+        Self(parts)
+    }
+
     pub fn from_hash_inputs(hash_inputs: impl Fn(&mut FxHasher)) -> Self {
         Self(std::array::from_fn(|salt| {
             let mut hasher = FxHasher::default();
@@ -189,13 +197,16 @@ impl KernelCache {
             (None, None)
         };
 
+        let direct_plan_cache = DirectPlanCache::new();
+        direct_plan_cache.attach_disk(device_capability_fingerprint(&device));
+
         Self {
             device,
             wgpu_cache,
             cache_file,
             kernels: make_lru(KERNEL_CACHE_SIZE),
             direct_dynamic_bind_group_cache: make_lru(DIRECT_DYNAMIC_BIND_GROUP_CACHE_SIZE),
-            direct_plan_cache: DirectPlanCache::new(),
+            direct_plan_cache,
             direct_three_buffer_bind_group_layout: OnceLock::new(),
             direct_three_buffer_pipeline_layout: OnceLock::new(),
         }
@@ -328,4 +339,25 @@ impl Drop for KernelCache {
             let _ = std::fs::rename(&temp_file, cache_file);
         }
     }
+}
+
+/// Everything device-side that steers kernel codegen: feature bits, the
+/// limits the lowerer consults, and the codegen-altering environment
+/// switches. Persistent plans are salted by this so a capability change can
+/// never replay a mismatched kernel.
+fn device_capability_fingerprint(device: &wgpu::Device) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = FxHasher::default();
+    format!("{:?}", device.features()).hash(&mut hasher);
+    let limits = device.limits();
+    limits.max_compute_workgroup_size_x.hash(&mut hasher);
+    limits.max_compute_workgroup_size_y.hash(&mut hasher);
+    limits.max_compute_workgroup_size_z.hash(&mut hasher);
+    limits.max_compute_invocations_per_workgroup.hash(&mut hasher);
+    limits.max_compute_workgroups_per_dimension.hash(&mut hasher);
+    limits.max_storage_buffers_per_shader_stage.hash(&mut hasher);
+    std::env::var_os("FUSOR_DISABLE_SUBGROUPS")
+        .is_some()
+        .hash(&mut hasher);
+    hasher.finish()
 }

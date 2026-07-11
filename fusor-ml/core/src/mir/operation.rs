@@ -14,7 +14,7 @@ use super::{
     workgroup_shape::{WorkgroupShape, WorkgroupShapeConstraints},
 };
 
-pub(crate) trait Operation: Debug + 'static {
+pub(crate) trait Operation: Debug + Send + Sync + 'static {
     fn workgroup_shape_constraints(&self, device: &Device) -> WorkgroupShapeConstraints;
 
     fn dispatch_size(&self, workgroup_shape: &WorkgroupShape, inputs: &[MirValue]) -> [u32; 3];
@@ -67,7 +67,7 @@ pub(crate) trait Operation: Debug + 'static {
     }
 }
 
-fn hash_mir_value(state: &mut FxHasher, value: &MirValue) {
+pub(crate) fn hash_mir_value(state: &mut FxHasher, value: &MirValue) {
     std::mem::discriminant(value).hash(state);
     match value {
         MirValue::QMatrix(matrix) => {

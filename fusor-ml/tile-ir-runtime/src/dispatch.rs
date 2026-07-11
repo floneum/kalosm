@@ -15,7 +15,13 @@ fn cached_kernel(
     if let Some(cached) = cache.kernels.write().get(&key) {
         return Some(cached.clone());
     }
-    let kernel = Arc::new(build_ir()?.lower_to_naga().ok()?);
+    let lowered = build_ir()?.lower_to_naga();
+    if std::env::var_os("FUSOR_TRACE_MATMUL_MERGE").is_some()
+        && let Err(error) = &lowered
+    {
+        eprintln!("tile_ir_lower_error: {error:?}");
+    }
+    let kernel = Arc::new(lowered.ok()?);
     Some(cache.get_or_insert_kernel(key, || kernel))
 }
 
@@ -90,7 +96,7 @@ pub fn run_direct_kernel(
 
 /// Build a compute pipeline using the singleton 3-buffer pipeline layout
 /// for an already-cached kernel. The shader is shared with the dynamic path.
-fn prepare_three_buffer_pipeline(
+pub(crate) fn prepare_three_buffer_pipeline(
     cache: &KernelCache,
     name: &str,
     cached: &Arc<CachedKernel>,
@@ -122,9 +128,10 @@ pub fn three_buffer_pipeline_from_ir(
     name: &str,
     cache_key: KernelCacheKey,
     build_ir: impl FnOnce() -> Option<tile_ir::KernelIr>,
-) -> Option<wgpu::ComputePipeline> {
+) -> Option<(wgpu::ComputePipeline, Arc<CachedKernel>)> {
     let cached = cached_kernel(cache, cache_key, build_ir)?;
-    Some(prepare_three_buffer_pipeline(cache, name, &cached))
+    let pipeline = prepare_three_buffer_pipeline(cache, name, &cached);
+    Some((pipeline, cached))
 }
 
 /// Read each storage `GlobalVariable` from the Naga module in `(group, binding)`
@@ -151,6 +158,13 @@ fn bindings_from_naga(
 
     let buffers: Vec<Arc<wgpu::Buffer>> = buffers.into_iter().collect();
     if buffers.len() != storages.len() {
+        if std::env::var_os("FUSOR_TRACE_MATMUL_MERGE").is_some() {
+            eprintln!(
+                "bindings_from_naga mismatch: buffers={} storages={}",
+                buffers.len(),
+                storages.len()
+            );
+        }
         return None;
     }
     Some(

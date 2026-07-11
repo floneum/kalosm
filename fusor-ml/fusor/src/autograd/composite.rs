@@ -71,6 +71,10 @@ impl<const R: usize> Tensor<R> {
         crate::cpu::MaxOp: crate::cpu::SimdReduceOp<f32>,
         crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
     {
+        if axis == R - 1 {
+            // Fused forward with composite replay backward: fewer kernels, same math.
+            return self.softmax_last_dim_fused::<OUT_RANK>();
+        }
         self.softmax_composite::<OUT_RANK>(axis)
     }
 
@@ -140,8 +144,14 @@ impl<const R: usize> Tensor<R> {
             .value
             .softmax_last_dim_fused::<OUT_RANK>()
             .to_concrete();
-        self.replay_unary("softmax_last_dim_fused", value, |input| {
-            input.softmax_last_dim::<OUT_RANK>()
+        // Analytic softmax backward: dS = P * (dP - rowsum(dP * P)).
+        // The product inside the row sum is written inline so the reduce
+        // absorbs it, and the output is a single P * (dP - s) expression.
+        self.unary_from_value(value, move |grad, probs| {
+            let shape = probs.shape();
+            let row_sum = (&probs * &grad).to_concrete().sum_keepdim::<OUT_RANK>(R - 1);
+            let shifted = (&grad - &row_sum.broadcast_as(shape)).to_concrete();
+            (&probs * &shifted).to_concrete()
         })
     }
 
@@ -282,36 +292,68 @@ impl<const R: usize> Tensor<R> {
         );
         let mut param_shape = [1usize; R];
         param_shape[R - 1] = self.shape()[R - 1];
+
+        let input_id = self.handle.id;
+        let weight_id = weight.handle.id;
+        let bias_id = bias.map(|bias| bias.handle.id);
+        let input_value = self.value.clone();
+        let weight_value = weight.value.clone();
+        let weight_shape = weight.value.shape();
+        // Analytic layer-norm backward. Row statistics are recomputed here
+        // instead of saved from the forward pass so the forward chain stays
+        // exclusively consumed (and therefore fusable into one row program).
+        let backward: BackwardRule = Arc::new(move |gradient| {
+            let dy = downcast_tensor::<R>(&*gradient, "layer_norm_last_dim_fused")?;
+            let shape = input_value.shape();
+            let n = shape[R - 1];
+            let rows: usize = shape.iter().take(R - 1).product();
+
+            let x = input_value.to_concrete();
+            let mean = x.mean_keepdim::<OUT_RANK>(R - 1);
+            let centered = (&x - &mean.broadcast_as(shape)).to_concrete();
+            let var = centered.sqr().to_concrete().mean_keepdim::<OUT_RANK>(R - 1);
+            let std = var.add_scalar(eps).sqrt().to_concrete();
+            let xhat = (&centered / &std.broadcast_as(shape)).to_concrete();
+
+            let weight_row = weight_value.reshape(param_shape).to_concrete();
+            let dxhat = (&dy * &weight_row.broadcast_as(shape)).to_concrete();
+            let m1 = dxhat.mean_keepdim::<OUT_RANK>(R - 1);
+            let dxhat_xhat = (&dxhat * &xhat).to_concrete();
+            let m2 = dxhat_xhat.mean_keepdim::<OUT_RANK>(R - 1);
+            let recentered = (&dxhat - &m1.broadcast_as(shape)).to_concrete();
+            let projected = (&xhat * &m2.broadcast_as(shape)).to_concrete();
+            let dx_num = (recentered - projected).to_concrete();
+            let dx = (&dx_num / &std.broadcast_as(shape)).to_concrete();
+
+            let dy_flat = dy.reshape([rows, n]).to_concrete();
+            let xhat_flat = xhat.reshape([rows, n]).to_concrete();
+            let dw_flat = (&dy_flat * &xhat_flat).to_concrete().sum::<1>(0);
+            let dw = dw_flat.reshape(weight_shape).to_concrete();
+
+            let mut targets = vec![
+                BackwardTarget {
+                    node: input_id,
+                    gradient: Box::new(dx),
+                },
+                BackwardTarget {
+                    node: weight_id,
+                    gradient: Box::new(dw),
+                },
+            ];
+            if let Some(bias_id) = bias_id {
+                let db = dy_flat.sum::<1>(0).reshape(weight_shape).to_concrete();
+                targets.push(BackwardTarget {
+                    node: bias_id,
+                    gradient: Box::new(db),
+                });
+            }
+            Ok(targets)
+        });
+        let mut parents = vec![self.handle.clone(), weight.handle.clone()];
         if let Some(bias) = bias {
-            self.replay_ternary(
-                weight,
-                bias,
-                "layer_norm_last_dim_fused",
-                value,
-                move |input, weight, bias| {
-                    input.layer_norm_composite::<R, OUT_RANK>(
-                        &weight.reshape(param_shape),
-                        Some(&bias.reshape(param_shape)),
-                        eps,
-                        true,
-                    )
-                },
-            )
-        } else {
-            self.replay_binary(
-                weight,
-                "layer_norm_last_dim_fused",
-                value,
-                move |input, weight| {
-                    input.layer_norm_composite::<R, OUT_RANK>(
-                        &weight.reshape(param_shape),
-                        None,
-                        eps,
-                        true,
-                    )
-                },
-            )
+            parents.push(bias.handle.clone());
         }
+        self.emit_op(value, parents, Some(backward))
     }
 
     fn pad_spatial<const DIFF: usize>(&self, padding: [usize; DIFF]) -> Self {

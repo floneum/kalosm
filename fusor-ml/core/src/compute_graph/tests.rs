@@ -561,3 +561,68 @@ fn deep_branch_chains_collapse_through_cat() {
         }
     });
 }
+
+/// Natural-form state updates (dependency-chained elementwise triples whose
+/// intermediates are all user-held, the shape an optimizer step takes) must
+/// (a) settle into fixed physical buffers via in-place allocation claims and
+/// (b) record and replay their flush plan on isomorphic steps.
+#[test]
+fn natural_form_updates_replay_and_claim_in_place() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        const N: usize = 64;
+        let mut m = Tensor::new::<f32, 1, _>(&device, &vec![0.5f32; N]);
+        let mut v = Tensor::new::<f32, 1, _>(&device, &vec![0.25f32; N]);
+        let mut p = Tensor::new::<f32, 1, _>(&device, &vec![1.0f32; N]);
+
+        let mut previous_ptrs: Option<[usize; 3]> = None;
+        let mut stable_iterations = 0;
+        for iteration in 0..5 {
+            let g = Tensor::new::<f32, 1, _>(&device, &vec![0.01f32; N]);
+            let m2 = &(&m + 0.1f32) + &g;
+            let v2 = &(&v + 0.2f32) + &g;
+            let p2 = &(&p - 0.001f32) - &(&m2 + &v2);
+            m = m2;
+            v = v2;
+            p = p2;
+            // Push the resolve over the large-graph threshold so region
+            // formation and horizontal merging run.
+            let fillers: Vec<Tensor> = (0..300)
+                .map(|_| {
+                    let x = Tensor::new::<f32, 1, _>(&device, &vec![1.0f32; 8]);
+                    &(&x + 1.0f32) + 1.0f32
+                })
+                .collect();
+            device.flush();
+            drop(fillers);
+
+            let ptrs = [&m, &v, &p].map(|tensor| {
+                let (data, _) = tensor.data.materialize();
+                std::sync::Arc::as_ptr(data.buffer()) as usize
+            });
+            if iteration >= 2 {
+                if previous_ptrs == Some(ptrs) {
+                    stable_iterations += 1;
+                }
+            }
+            previous_ptrs = Some(ptrs);
+        }
+        assert!(
+            stable_iterations >= 1,
+            "state buffers never settled in place: updates should claim their \
+             dead sources' buffers on isomorphic steps"
+        );
+
+        let cache = device.flush_plan_cache();
+        assert!(
+            cache.record_count() >= 1,
+            "no flush plan was recorded across isomorphic steps"
+        );
+        assert!(
+            cache.replay_count() >= 1,
+            "no flush replay fired across isomorphic steps"
+        );
+    });
+}

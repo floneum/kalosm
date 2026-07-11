@@ -6,6 +6,7 @@ impl Resolver {
         produced_ops: &[&QueuedOperation],
         remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
         targets: &FxHashSet<NodeIndex>,
+        ledger: &mut super::alloc_reuse::BufferLedger,
     ) {
         for op in produced_ops {
             op.visit_dependencies(&mut |dep| {
@@ -15,6 +16,9 @@ impl Resolver {
                         && !targets.contains(&dep)
                         && !graph.has_live_lazy_descendant(dep)
                     {
+                        if let Some(cached) = graph.get_cached_result(dep) {
+                            ledger.note_released(dep, cached);
+                        }
                         // All consumers within this execution have been
                         // processed and no user-held lazy tensor still
                         // transitively depends on `dep` — free the cached
@@ -42,6 +46,7 @@ impl Resolver {
         produced_nodes: &[NodeIndex],
         remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
         targets: &FxHashSet<NodeIndex>,
+        ledger: &mut super::alloc_reuse::BufferLedger,
     ) {
         for &produced in produced_nodes {
             let mut deps = Vec::new();
@@ -54,9 +59,13 @@ impl Resolver {
                     if *count == 0
                         && !targets.contains(&dep)
                         && !graph.has_live_lazy_descendant(dep)
-                        && let Some(node) = graph.nodes.nodes.node_weight_mut(dep)
                     {
-                        node.cached = None;
+                        if let Some(cached) = graph.get_cached_result(dep) {
+                            ledger.note_released(dep, cached);
+                        }
+                        if let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
+                            node.cached = None;
+                        }
                     }
                 }
             }
@@ -188,6 +197,12 @@ impl Resolver {
             ExecutionVariant::Assign(op) => Some(QueuedOperation::Generic(Arc::new(op.clone()))),
             ExecutionVariant::QEmbedding(op) => {
                 Some(QueuedOperation::Generic(Arc::new(op.clone())))
+            }
+            ExecutionVariant::Region(_) => {
+                // Regions lower exclusively through the horizontal merger:
+                // they only form on the dense branch where it is enabled,
+                // and `categorize` claims them there.
+                None
             }
             ExecutionVariant::QMatMul(op) => Some(QueuedOperation::QMatMul(op.clone())),
             ExecutionVariant::QMatrix(op) => {
@@ -402,6 +417,10 @@ impl Resolver {
             )
         });
         let dense = Self::dense_reduce_fusion_enabled(has_qmatmul);
+        // Horizontal merging is a dense-large-graph-only behavior: quantized
+        // decode graphs and small conformance graphs never reach this branch.
+        self.horizontal_merge =
+            dense && std::env::var_os("FUSOR_DISABLE_HORIZONTAL_FUSION").is_none();
         self.fuse_row_programs(graph, dense);
         self.recognize_assign_chains(graph);
         // Quantized decode graphs keep the tuned qmatmul-anchored candidate
@@ -467,6 +486,45 @@ impl Resolver {
                     &mut worklist,
                     &mut in_worklist,
                 );
+            }
+        }
+
+        // Dense-large-graph kernel tuning is opted into per operation, after
+        // every rewrite has settled: matmuls get the wider divisor-aligned
+        // split-K fan-out (with elided K bounds), row programs get axis-sized
+        // workgroups, subgroup whole-block reductions, and staged reads.
+        // Quantized graphs (`has_qmatmul`) and small graphs (which never
+        // reach `optimize_large_graph`) leave the flags unset, so their
+        // kernels are byte-identical to the committed lowering.
+        if dense {
+            // Region formation generalizes the sole-consumer nary gate: it
+            // fuses externally-live producers into multi-output regions. It
+            // must only run when the merger will host the resulting nodes
+            // (regions have no standalone lowering).
+            if self.horizontal_merge {
+                self.form_elementwise_regions(graph);
+            }
+            self.mark_dense_codegen();
+        }
+    }
+
+    /// Set `dense_codegen` on every matmul and row-program operation in the
+    /// execution graph (see `optimize_large_graph`'s dense branch).
+    fn mark_dense_codegen(&mut self) {
+        let nodes: Vec<ExecutionNodeIndex> = self.execution_graph.node_indices().collect();
+        for node in nodes {
+            match &mut self.execution_graph[node].variant {
+                ExecutionVariant::MatMul(op) => op.dense_codegen = true,
+                ExecutionVariant::GraphOp(op) => {
+                    if let Some(row) = op.as_row_program()
+                        && !row.dense_codegen
+                    {
+                        let mut row = row.clone();
+                        row.dense_codegen = true;
+                        *op = std::sync::Arc::new(row);
+                    }
+                }
+                _ => {}
             }
         }
     }

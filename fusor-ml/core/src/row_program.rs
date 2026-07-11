@@ -46,6 +46,10 @@ use crate::{
 
 const BLOCK: u32 = 256;
 
+/// Smallest workgroup for static-axis chunked-map programs. Axes shorter
+/// than this pack several rows per workgroup (`k_group` lane groups).
+const MIN_STATIC_BLOCK: u32 = 64;
+
 /// Below this many rows a long axis is split across workgroups (one tile
 /// each) with a combine kernel folding the spans — decode has too few rows
 /// to fill the device with one workgroup per row.
@@ -254,6 +258,13 @@ pub(crate) struct RowProgramOperation {
     /// `Some` exactly when the program pins one lane per axis position
     /// (element steps / reducing output); `None` for chunked map programs.
     pub(crate) dynamic_axis: Option<DynamicAxis>,
+    /// Dense-large-graph codegen tuning: axis-sized workgroups, subgroup
+    /// whole-block reductions, and staged single-chunk reads. Set only by
+    /// `optimize_large_graph`'s dense branch (and the dense-only horizontal
+    /// merger), so quantized decode graphs and small (conformance-golden)
+    /// graphs keep the exact committed codegen. Hashed into the kernel
+    /// cache key.
+    pub(crate) dense_codegen: bool,
 }
 
 impl RowProgramOperation {
@@ -273,6 +284,7 @@ impl RowProgramOperation {
             ],
             output_datatype: reduce.out_datatype(),
             dynamic_axis: None,
+            dense_codegen: false,
         }
     }
 
@@ -325,8 +337,39 @@ impl RowProgramOperation {
     fn block(&self, device: &crate::Device) -> u32 {
         match &self.dynamic_axis {
             Some(dynamic) => dynamic.block,
-            None => device.limits().max_compute_workgroup_size_x.min(BLOCK),
+            None => {
+                let max_block = device.limits().max_compute_workgroup_size_x.min(BLOCK);
+                if !self.dense_codegen {
+                    // Committed sizing for decode and small (golden-covered)
+                    // graphs: one full-width workgroup.
+                    return max_block;
+                }
+                // Dense-graph tuning: size the workgroup to the axis: a k=64
+                // softmax runs 64-lane workgroups whose whole-block reduction
+                // is subgroup-accelerated, instead of packing four rows into
+                // a 256-lane workgroup whose per-row reduction walks the
+                // shared-memory tree one barrier per level.
+                let k = u32::try_from(self.shape[self.axis]).unwrap_or(max_block);
+                k.max(1)
+                    .next_power_of_two()
+                    .clamp(MIN_STATIC_BLOCK.min(max_block), max_block)
+            }
         }
+    }
+
+    /// Whether this program is a plain chunked-map program the horizontal
+    /// merge pass can host: static axis, reduce-only phases, and a map or
+    /// per-row-scalar output (no free-dim reduce, no staged elements).
+    pub(crate) fn mergeable_chunked_map(&self) -> bool {
+        self.dynamic_axis.is_none()
+            && self
+                .phase_steps()
+                .iter()
+                .all(|step| matches!(step, RowStep::Reduce(_)))
+            && matches!(
+                self.output_step(),
+                RowOutput::Map(_) | RowOutput::Scalar(_)
+            )
     }
 
     fn uses_custom_indexing_for_input(&self, input_idx: usize) -> bool {
@@ -372,6 +415,7 @@ impl Operation for RowProgramOperation {
         self.axis.hash(state);
         self.steps.hash(state);
         self.output_datatype.hash(state);
+        self.dense_codegen.hash(state);
     }
 
     fn workgroup_shape_constraints(&self, device: &crate::Device) -> WorkgroupShapeConstraints {
@@ -457,8 +501,8 @@ impl Operation for RowProgramOperation {
 }
 
 impl GraphOperation for RowProgramOperation {
-    fn category(&self) -> &'static str {
-        "row_program"
+    fn as_row_program(&self) -> Option<&RowProgramOperation> {
+        Some(self)
     }
 }
 
@@ -530,6 +574,158 @@ fn raw_tile(value: ValueTile) -> Tile {
     }
 }
 
+/// A chunked map program whose axis fits one chunk evaluates every phase and
+/// the output at the same coordinates, so each distinct tensor read can be
+/// loaded once per lane and kept in a register across the phases instead of
+/// being re-read from storage per phase (softmax otherwise reads its input
+/// once for the max, again for the exp sum, and a third time for the output).
+struct StagedReads {
+    /// The original `IndexedInput` leaves, evaluated once each, in order.
+    probes: Vec<NaryExpr>,
+    /// Phase reduce expressions rewritten over the staged probe slots
+    /// (`0..probes.len()`); phase slots follow at `probes.len() + p`.
+    phases: Vec<NaryExpr>,
+    /// The output expression, rewritten the same way.
+    output: NaryExpr,
+}
+
+/// Whether `expr` references any phase slot (directly or through an index
+/// expression). Reads whose indices depend on a slot cannot be staged before
+/// the phases run.
+fn uses_any_slot(expr: &NaryExpr, input_count: usize) -> bool {
+    match expr {
+        NaryExpr::Op { children, .. } => {
+            children.iter().any(|child| uses_any_slot(child, input_count))
+        }
+        NaryExpr::IndexedInput { input_idx, indices } => {
+            *input_idx >= input_count
+                || indices.iter().any(|index| uses_any_slot(index, input_count))
+        }
+        NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => false,
+    }
+}
+
+/// Collect the distinct tensor-read leaves of `expr` into `probes`,
+/// returning `false` when a read cannot be staged.
+fn collect_probe_reads(expr: &NaryExpr, input_count: usize, probes: &mut Vec<NaryExpr>) -> bool {
+    match expr {
+        NaryExpr::Op { children, .. } => children
+            .iter()
+            .all(|child| collect_probe_reads(child, input_count, probes)),
+        NaryExpr::IndexedInput { input_idx, indices } => {
+            if *input_idx >= input_count {
+                // A phase-slot reference: stays a slot in the rewrite.
+                return indices.is_empty();
+            }
+            if indices
+                .iter()
+                .any(|index| uses_any_slot(index, input_count))
+            {
+                return false;
+            }
+            if !probes.iter().any(|probe| probe == expr) {
+                probes.push(expr.clone());
+            }
+            true
+        }
+        NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => true,
+    }
+}
+
+/// Rewrite `expr` over the staged slot space: tensor-read leaves become bare
+/// slot references `0..probes.len()`; phase slots shift up by `probes.len()`.
+fn rewrite_staged(expr: &NaryExpr, input_count: usize, probes: &[NaryExpr]) -> NaryExpr {
+    match expr {
+        NaryExpr::Op { children, function } => NaryExpr::Op {
+            children: children
+                .iter()
+                .map(|child| rewrite_staged(child, input_count, probes))
+                .collect(),
+            function: function.clone(),
+        },
+        NaryExpr::IndexedInput { input_idx, .. } if *input_idx >= input_count => {
+            NaryExpr::IndexedInput {
+                input_idx: probes.len() + (input_idx - input_count),
+                indices: vec![],
+            }
+        }
+        leaf @ NaryExpr::IndexedInput { .. } => {
+            let slot = probes
+                .iter()
+                .position(|probe| probe == leaf)
+                .expect("every stageable tensor read was collected");
+            NaryExpr::IndexedInput {
+                input_idx: slot,
+                indices: vec![],
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// Build the staged rewrite for a single-chunk program: `None` when any read
+/// resists staging (slot-dependent indices, non-reduce phases, reducing
+/// outputs) or there is nothing to stage.
+fn stage_single_chunk_reads(
+    phase_steps: &[RowStep],
+    output: &RowOutput,
+    input_count: usize,
+) -> Option<StagedReads> {
+    let mut phase_sources = Vec::with_capacity(phase_steps.len());
+    for step in phase_steps {
+        let RowStep::Reduce(reduce) = step else {
+            return None;
+        };
+        phase_sources.push(&reduce.expression);
+    }
+    let output_expr = match output {
+        RowOutput::Map(expr) | RowOutput::Scalar(expr) => expr,
+        RowOutput::Reduce { .. } => return None,
+    };
+    let mut probes = Vec::new();
+    for expr in phase_sources.iter().copied().chain([output_expr]) {
+        if !collect_probe_reads(expr, input_count, &mut probes) {
+            return None;
+        }
+    }
+    if probes.is_empty() {
+        return None;
+    }
+    Some(StagedReads {
+        phases: phase_sources
+            .iter()
+            .map(|expr| rewrite_staged(expr, input_count, &probes))
+            .collect(),
+        output: rewrite_staged(output_expr, input_count, &probes),
+        probes,
+    })
+}
+
+/// Evaluate every probe once at `coords` and bind the values to registers.
+fn stage_probe_values(
+    program: &mut tile_ir::tile::TileBlock<'_>,
+    probes: &[NaryExpr],
+    coords: &[Tile],
+    storages: &[crate::nary_direct::Storage2],
+    metas: &[crate::nary_direct::TensorMeta],
+    active: Mask,
+) -> Vec<(ValueTile, DataTypeEnum)> {
+    probes
+        .iter()
+        .map(|probe| {
+            let (value, ty) =
+                eval_nary_expr(program, probe, coords, storages, metas, active.clone(), &[]);
+            let bound = match value {
+                ValueTile::F32(tile) => ValueTile::F32(program.bind(tile)),
+                ValueTile::F16(tile) => ValueTile::F16(program.bind(tile)),
+                ValueTile::U32(tile) => ValueTile::U32(program.bind(tile)),
+                ValueTile::Bool(mask) => ValueTile::Bool(mask),
+            };
+            (bound, ty)
+        })
+        .collect()
+}
+
 fn f32_literal(value: f32) -> Tile {
     Tile::literal(tile_ir::TileLiteral::f32(value))
 }
@@ -564,6 +760,49 @@ fn tile_reduce_op(op: ReduceOp) -> tile_ir::TileReduceOp {
         ReduceOp::Product => tile_ir::TileReduceOp::Product,
         ReduceOp::Max => tile_ir::TileReduceOp::Max,
         ReduceOp::Min => tile_ir::TileReduceOp::Min,
+    }
+}
+
+/// The fixed-subgroup proof used to accelerate whole-workgroup reductions:
+/// `(token, subgroup width)` when the device reports one subgroup size.
+type FixedSubgroups = Option<(tile_ir::tile::SubgroupToken, u32)>;
+
+fn fixed_subgroups(device: &crate::Device) -> FixedSubgroups {
+    device
+        .subgroup_config()
+        .filter(|config| config.is_fixed())
+        .map(|config| (config.token(), config.max_size()))
+}
+
+/// The per-row-group reduction: subgroup-accelerated when the group spans
+/// the whole workgroup on a fixed-subgroup device, the shared-memory tree
+/// otherwise. A 1-wide group is the lane's own value (the k=1 bias-grad
+/// sum), skipping the scratch round-trip entirely. Both accelerations are
+/// dense-large-graph tuning (`dense` mirrors
+/// [`RowProgramOperation::dense_codegen`]); with `dense` unset the emitted
+/// reduction is the committed shared-memory tree, unconditionally.
+fn emit_group_reduce(
+    program: &mut tile_ir::tile::TileBlock<'_>,
+    dense: bool,
+    subgroups: FixedSubgroups,
+    op: tile_ir::TileReduceOp,
+    group_size: u32,
+    block: u32,
+    value: Tile,
+) -> Tile {
+    if !dense {
+        return program.group_reduce(op, group_size, value);
+    }
+    if group_size == 1 {
+        return program.bind(value);
+    }
+    match subgroups {
+        Some((token, subgroup_size))
+            if group_size == block && block.is_multiple_of(subgroup_size) =>
+        {
+            token.workgroup_reduce(program, op, subgroup_size, value)
+        }
+        _ => program.group_reduce(op, group_size, value),
     }
 }
 
@@ -659,6 +898,17 @@ fn build_row_program_kernel(
         row_program_cache_key(operation, workgroup_shape, dispatch_size, inputs, 1, splits);
 
     let input_count = operation.inputs.len();
+    // Dense-large-graph codegen tuning gate: with `dense_codegen` unset
+    // (decode and small golden-covered graphs) every `emit_group_reduce`
+    // walks the committed shared-memory tree and reads are never staged.
+    let dense = operation.dense_codegen;
+    let subgroups = fixed_subgroups(&graph.device());
+    // Single-chunk chunked-map programs stage each distinct tensor read once
+    // per lane and evaluate every phase (and the output) from the registers
+    // instead of re-reading storage per phase.
+    let staged_reads = (dense && !lanes_own_axis && k.div_ceil(block) == 1)
+        .then(|| stage_single_chunk_reads(&phase_steps, &output_kind, input_count))
+        .flatten();
     let axis_bound_dim = operation
         .dynamic_axis
         .as_ref()
@@ -726,8 +976,15 @@ fn build_row_program_kernel(
                             j_active.clone(),
                         )));
                         let masked_m = Tile::select(j_active.clone(), m_j.clone(), max_identity);
-                        let global_max =
-                            program.group_reduce(tile_reduce_op(ReduceOp::Max), block, masked_m);
+                        let global_max = emit_group_reduce(
+                            program,
+                            dense,
+                            subgroups,
+                            tile_reduce_op(ReduceOp::Max),
+                            block,
+                            block,
+                            masked_m,
+                        );
                         let global_max = program.bind(global_max);
                         let l_index = layout_index(
                             &scratch_meta,
@@ -740,8 +997,15 @@ fn build_row_program_kernel(
                             l_j * (m_j - global_max.clone()).exp(),
                             f32_literal(0.0),
                         );
-                        let denom =
-                            program.group_reduce(tile_reduce_op(ReduceOp::Sum), block, weighted);
+                        let denom = emit_group_reduce(
+                            program,
+                            dense,
+                            subgroups,
+                            tile_reduce_op(ReduceOp::Sum),
+                            block,
+                            block,
+                            weighted,
+                        );
                         let denom = program.bind(denom);
 
                         // Lane = one free-dim position: rescale and fold the
@@ -1004,8 +1268,12 @@ fn build_row_program_kernel(
                             raw_tile(scaled.cast_to(DataTypeEnum::F32)),
                             max_identity(),
                         ));
-                        let tile_max = program.group_reduce(
+                        let tile_max = emit_group_reduce(
+                            program,
+                            dense,
+                            subgroups,
                             tile_reduce_op(ReduceOp::Max),
+                            block,
                             block,
                             scaled.clone(),
                         );
@@ -1019,8 +1287,12 @@ fn build_row_program_kernel(
                             (scaled - new_max).exp(),
                             f32_literal(0.0),
                         ));
-                        let tile_sum = program.group_reduce(
+                        let tile_sum = emit_group_reduce(
+                            program,
+                            dense,
+                            subgroups,
                             tile_reduce_op(ReduceOp::Sum),
+                            block,
                             block,
                             prob.clone(),
                         );
@@ -1113,11 +1385,18 @@ fn build_row_program_kernel(
                 }
 
                 // Chunked map program: lanes stride the axis for each phase's
-                // fold; full-shape intermediates referenced by several phases
-                // are recomputed per phase — the same trade every multi-pass
+                // fold. Single-chunk programs stage each distinct tensor read
+                // in a register up front (`staged_reads`); longer axes
+                // re-evaluate per phase — the same trade every multi-pass
                 // normalization kernel makes.
                 let chunks = k.div_ceil(block);
-                for phase in &phase_steps {
+                let staged_values = staged_reads.as_ref().map(|staged| {
+                    let k_index = lane.clone();
+                    let active = in_bounds.clone() & k_index.clone().lt(k);
+                    let coords = full_coords(k_index);
+                    stage_probe_values(program, &staged.probes, &coords, &storages, &metas, active)
+                });
+                for (phase_index, phase) in phase_steps.iter().enumerate() {
                     let RowStep::Reduce(reduce) = phase else {
                         unreachable!("element phases require a dynamic-axis row program")
                     };
@@ -1133,15 +1412,30 @@ fn build_row_program_kernel(
                             let k_index = chunk * block + lane.clone();
                             let active = in_bounds.clone() & k_index.clone().lt(k);
                             let coords = full_coords(k_index);
-                            let (value, _) = eval_nary_expr(
-                                program,
-                                &reduce.expression,
-                                &coords,
-                                &storages,
-                                &metas,
-                                active.clone(),
-                                &slots,
-                            );
+                            let (value, _) = match (&staged_reads, &staged_values) {
+                                (Some(staged), Some(staged_values)) => {
+                                    let mut extras = staged_values.clone();
+                                    extras.extend(slots.iter().cloned());
+                                    eval_nary_expr(
+                                        program,
+                                        &staged.phases[phase_index],
+                                        &coords,
+                                        &[],
+                                        &[],
+                                        active.clone(),
+                                        &extras,
+                                    )
+                                }
+                                _ => eval_nary_expr(
+                                    program,
+                                    &reduce.expression,
+                                    &coords,
+                                    &storages,
+                                    &metas,
+                                    active.clone(),
+                                    &slots,
+                                ),
+                            };
                             let value = raw_tile(value.cast_to(phase_dtype));
                             let masked = Tile::select(active, value, identity());
                             [acc.binary(reduce_op.binary(), masked)]
@@ -1152,7 +1446,8 @@ fn build_row_program_kernel(
                     // value, so later phases can use it directly. With one row
                     // per workgroup `k_group == block` and this is the full
                     // workgroup reduction.
-                    let combined = program.group_reduce(reduce_op, k_group, partial);
+                    let combined =
+                        emit_group_reduce(program, dense, subgroups, reduce_op, k_group, block, partial);
                     let (combined, combined_ty) =
                         apply_unary_function_chain(combined, phase_dtype, &reduce.post_chain)
                             .expect("validated row program post chain");
@@ -1160,21 +1455,40 @@ fn build_row_program_kernel(
                     slots.push((scalar, combined_ty));
                 }
 
+                let eval_output = |program: &mut tile_ir::tile::TileBlock<'_>,
+                                   output_expr: &NaryExpr,
+                                   coords: &[Tile],
+                                   active: Mask,
+                                   slots: &[(ValueTile, DataTypeEnum)]|
+                 -> ValueTile {
+                    let (value, _) = match (&staged_reads, &staged_values) {
+                        (Some(staged), Some(staged_values)) => {
+                            let mut extras = staged_values.clone();
+                            extras.extend(slots.iter().cloned());
+                            eval_nary_expr(
+                                program,
+                                &staged.output,
+                                coords,
+                                &[],
+                                &[],
+                                active,
+                                &extras,
+                            )
+                        }
+                        _ => eval_nary_expr(
+                            program, output_expr, coords, &storages, &metas, active, slots,
+                        ),
+                    };
+                    value
+                };
                 match &output_kind {
                     RowOutput::Map(output_expr) => {
                         program.loop_range(chunks, |program, chunk| {
                             let k_index = chunk * block + lane.clone();
                             let active = in_bounds.clone() & k_index.clone().lt(k);
                             let coords = full_coords(k_index);
-                            let (value, _) = eval_nary_expr(
-                                program,
-                                output_expr,
-                                &coords,
-                                &storages,
-                                &metas,
-                                active.clone(),
-                                &slots,
-                            );
+                            let value =
+                                eval_output(program, output_expr, &coords, active.clone(), &slots);
                             let value = value.cast_to(output_dtype);
                             let output_index = layout_index(&output_meta, &coords);
                             output_storage.store(program, output_index, value, active);
@@ -1183,15 +1497,8 @@ fn build_row_program_kernel(
                     RowOutput::Scalar(output_expr) => {
                         let active = in_bounds & lane.eq(0u32);
                         let coords = full_coords(tile_u32(0));
-                        let (value, _) = eval_nary_expr(
-                            program,
-                            output_expr,
-                            &coords,
-                            &storages,
-                            &metas,
-                            active.clone(),
-                            &slots,
-                        );
+                        let value =
+                            eval_output(program, output_expr, &coords, active.clone(), &slots);
                         let value = value.cast_to(output_dtype);
                         let output_index = layout_index(&output_meta, &row_dims);
                         output_storage.store(program, output_index, value, active);
@@ -1212,6 +1519,363 @@ fn build_row_program_kernel(
         )),
         None => Some(partials),
     }
+}
+
+struct MergedRowProgramKernelVariant;
+
+/// One kernel executing several independent chunked-map row programs: each
+/// segment owns a contiguous range of workgroups guarded by a uniform
+/// linear-workgroup-id range compare. The guard condition depends only on
+/// the workgroup id, so the per-segment workgroup reductions stay in
+/// workgroup-uniform control flow. Callers gate segments through
+/// [`RowProgramOperation::mergeable_chunked_map`] and bound total bindings.
+pub(crate) fn build_merged_row_program_kernel(
+    graph: &crate::compute_graph::ComputeGraphInner,
+    segments: &[RowProgramOperation],
+    segment_inputs: &[Vec<MirValue>],
+) -> Option<DirectKernel> {
+    use std::hash::Hash;
+    let device = graph.device();
+    let max_per_dim = device.limits().max_compute_workgroups_per_dimension;
+    // Size the shared workgroup to the longest segment axis (matching the
+    // unmerged `RowProgramOperation::block`): a merge of k=64 softmax
+    // segments runs 64-lane workgroups whose whole-block reductions are
+    // subgroup-accelerated instead of walking the shared-memory tree.
+    let max_block = device.limits().max_compute_workgroup_size_x.min(BLOCK);
+    let block = segments
+        .iter()
+        .map(|op| {
+            u32::try_from(op.shape[op.axis])
+                .unwrap_or(max_block)
+                .max(1)
+                .next_power_of_two()
+                .clamp(MIN_STATIC_BLOCK.min(max_block), max_block)
+        })
+        .max()?;
+
+    struct Segment {
+        values: Vec<MaybeQData>,
+        output: MaybeQData,
+        rows: u32,
+        k: u32,
+        k_group: u32,
+        rows_per_workgroup: u32,
+        row_shape: Vec<usize>,
+        base: u32,
+        groups: u32,
+    }
+    let mut prepared = Vec::with_capacity(segments.len());
+    let mut total_groups = 0u32;
+    for (op, inputs) in segments.iter().zip(segment_inputs) {
+        if !op.mergeable_chunked_map() {
+            return None;
+        }
+        let (output, producers) = inputs.split_last()?;
+        let output = output.as_tensor()?.clone();
+        let values = producers
+            .iter()
+            .map(|input| MaybeQData::try_from(input.clone()).ok())
+            .collect::<Option<Vec<_>>>()?;
+        if values
+            .iter()
+            .any(|value| matches!(value, MaybeQData::QMatrix(_)))
+        {
+            return None;
+        }
+        if !device.f16_supported()
+            && (output.datatype() == DataTypeEnum::F16
+                || values.iter().any(|value| matches!(value, MaybeQData::Tensor(tensor)
+                    if tensor.datatype() == DataTypeEnum::F16)))
+        {
+            return None;
+        }
+        let rows: u32 = op.rows().try_into().ok()?;
+        let k: u32 = op.shape[op.axis].try_into().ok()?;
+        let k_group = {
+            let group = k.next_power_of_two().min(block).max(1);
+            if block.is_multiple_of(group) {
+                group
+            } else {
+                block
+            }
+        };
+        let rows_per_workgroup = block / k_group;
+        let groups = rows.div_ceil(rows_per_workgroup);
+        prepared.push(Segment {
+            values,
+            output: MaybeQData::Tensor(output),
+            rows,
+            k,
+            k_group,
+            rows_per_workgroup,
+            row_shape: op.row_shape(),
+            base: total_groups,
+            groups,
+        });
+        total_groups = total_groups.checked_add(groups)?;
+    }
+
+    let dispatch_size = distribute_workgroups(total_groups, max_per_dim);
+    let subgroups = fixed_subgroups(&device);
+    // Single-chunk segments stage each distinct tensor read once per lane
+    // (see `stage_single_chunk_reads`); the rewrite is deterministic from
+    // the segment's steps, so it stays out of the cache key.
+    let staged_segments: Vec<Option<StagedReads>> = segments
+        .iter()
+        .zip(&prepared)
+        .map(|(op, segment)| {
+            (segment.k.div_ceil(block) == 1)
+                .then(|| {
+                    stage_single_chunk_reads(
+                        op.phase_steps(),
+                        op.output_step(),
+                        op.inputs.len(),
+                    )
+                })
+                .flatten()
+        })
+        .collect();
+    let cache_key = kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
+        kernel_backend::KernelVariantKey::of::<MergedRowProgramKernelVariant>().hash(state);
+        dispatch_size.hash(state);
+        block.hash(state);
+        crate::compute_graph::resolve::merge_horizontal::hash_merged_segments(
+            state,
+            segments,
+            segment_inputs,
+        );
+    });
+    let name = if std::env::var_os("FUSOR_TRACE_DECODE_NAMES").is_some() {
+        format!(
+            "merged_row_program[{}]",
+            segments
+                .iter()
+                .map(|op| op.name())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    } else {
+        format!("merged_row_program_x{}", segments.len())
+    };
+
+    kernel_backend::run_kernel(
+        device.kernel_cache(),
+        name,
+        cache_key,
+        dispatch_size,
+        move |kb| {
+            let mut declared = Vec::with_capacity(prepared.len());
+            for segment in &prepared {
+                let mut storages = Vec::with_capacity(segment.values.len());
+                let mut metas = Vec::with_capacity(segment.values.len());
+                for value in &segment.values {
+                    let (storage, meta) = declare_value(kb, value, false)?;
+                    storages.push(storage);
+                    metas.push(meta);
+                }
+                let output = declare_value(kb, &segment.output, true)?;
+                declared.push((storages, metas, output));
+            }
+
+            kb.program().program_grid(block, dispatch_size, |program| {
+                let full_lane = program.lane();
+                let group = program.bind(crate::nary_direct::linear_group(
+                    program,
+                    dispatch_size,
+                ));
+                for ((op, staged_reads), (segment, (storages, metas, output))) in segments
+                    .iter()
+                    .zip(&staged_segments)
+                    .zip(prepared.iter().zip(&declared))
+                {
+                    let in_segment = group.clone().ge(segment.base)
+                        & group.clone().lt(segment.base + segment.groups);
+                    program.if_then(in_segment, |program| {
+                        let (output_storage, output_meta) = output;
+                        let wg_local = program.bind(group.clone() - segment.base);
+                        let (row_flat, lane) = if segment.rows_per_workgroup > 1 {
+                            (
+                                program.bind(
+                                    wg_local.clone() * segment.rows_per_workgroup
+                                        + full_lane.clone() / segment.k_group,
+                                ),
+                                program.bind(full_lane.clone() % segment.k_group),
+                            )
+                        } else {
+                            (wg_local, full_lane.clone())
+                        };
+                        let in_bounds = row_flat.clone().lt(segment.rows);
+                        let row_dims =
+                            output_dims_from_flat(row_flat.clone(), &segment.row_shape);
+                        let axis = op.axis;
+                        let rank = op.shape.len();
+                        let full_coords = |k_index: Tile| -> Vec<Tile> {
+                            let mut coords = Vec::with_capacity(rank);
+                            let mut row_dim = 0;
+                            for dim in 0..rank {
+                                if dim == axis {
+                                    coords.push(k_index.clone());
+                                } else {
+                                    coords.push(row_dims[row_dim].clone());
+                                    row_dim += 1;
+                                }
+                            }
+                            coords
+                        };
+
+                        let k = segment.k;
+                        let chunks = k.div_ceil(block);
+                        let staged_values = staged_reads.as_ref().map(|staged| {
+                            let k_index = lane.clone();
+                            let active = in_bounds.clone() & k_index.clone().lt(k);
+                            let coords = full_coords(k_index);
+                            stage_probe_values(
+                                program,
+                                &staged.probes,
+                                &coords,
+                                storages,
+                                metas,
+                                active,
+                            )
+                        });
+                        let mut slots: Vec<(ValueTile, DataTypeEnum)> = Vec::new();
+                        for (phase_index, phase) in op.phase_steps().iter().enumerate() {
+                            let RowStep::Reduce(reduce) = phase else {
+                                unreachable!("merged row programs are reduce-phase only")
+                            };
+                            let phase_dtype = reduce.function.datatype();
+                            let identity = || {
+                                Tile::literal(tile_literal_for(
+                                    reduce.function.initial_value,
+                                    phase_dtype,
+                                ))
+                            };
+                            let reduce_op = tile_reduce_op(reduce.function.op);
+                            let [partial] = program.fold(
+                                tile_ir::tile::range(chunks),
+                                [identity()],
+                                |program, chunk, [acc]| {
+                                    let k_index = chunk * block + lane.clone();
+                                    let active = in_bounds.clone() & k_index.clone().lt(k);
+                                    let coords = full_coords(k_index);
+                                    let (value, _) = match (&staged_reads, &staged_values) {
+                                        (Some(staged), Some(staged_values)) => {
+                                            let mut extras = staged_values.clone();
+                                            extras.extend(slots.iter().cloned());
+                                            eval_nary_expr(
+                                                program,
+                                                &staged.phases[phase_index],
+                                                &coords,
+                                                &[],
+                                                &[],
+                                                active.clone(),
+                                                &extras,
+                                            )
+                                        }
+                                        _ => eval_nary_expr(
+                                            program,
+                                            &reduce.expression,
+                                            &coords,
+                                            storages,
+                                            metas,
+                                            active.clone(),
+                                            &slots,
+                                        ),
+                                    };
+                                    let value = raw_tile(value.cast_to(phase_dtype));
+                                    let masked = Tile::select(active, value, identity());
+                                    [acc.binary(reduce_op.binary(), masked)]
+                                },
+                            );
+                            let combined = emit_group_reduce(
+                                program,
+                                true,
+                                subgroups,
+                                reduce_op,
+                                segment.k_group,
+                                block,
+                                partial,
+                            );
+                            let (combined, combined_ty) = apply_unary_function_chain(
+                                combined,
+                                phase_dtype,
+                                &reduce.post_chain,
+                            )
+                            .expect("validated row program post chain");
+                            let scalar =
+                                ValueTile::F32(program.bind(combined)).cast_to(combined_ty);
+                            slots.push((scalar, combined_ty));
+                        }
+
+                        let output_dtype = op.output_datatype;
+                        let eval_output = |program: &mut tile_ir::tile::TileBlock<'_>,
+                                           output_expr: &NaryExpr,
+                                           coords: &[Tile],
+                                           active: Mask,
+                                           slots: &[(ValueTile, DataTypeEnum)]|
+                         -> ValueTile {
+                            let (value, _) = match (&staged_reads, &staged_values) {
+                                (Some(staged), Some(staged_values)) => {
+                                    let mut extras = staged_values.clone();
+                                    extras.extend(slots.iter().cloned());
+                                    eval_nary_expr(
+                                        program,
+                                        &staged.output,
+                                        coords,
+                                        &[],
+                                        &[],
+                                        active,
+                                        &extras,
+                                    )
+                                }
+                                _ => eval_nary_expr(
+                                    program, output_expr, coords, storages, metas, active, slots,
+                                ),
+                            };
+                            value
+                        };
+                        match op.output_step() {
+                            RowOutput::Map(output_expr) => {
+                                program.loop_range(chunks, |program, chunk| {
+                                    let k_index = chunk * block + lane.clone();
+                                    let active = in_bounds.clone() & k_index.clone().lt(k);
+                                    let coords = full_coords(k_index);
+                                    let value = eval_output(
+                                        program,
+                                        output_expr,
+                                        &coords,
+                                        active.clone(),
+                                        &slots,
+                                    );
+                                    let value = value.cast_to(output_dtype);
+                                    let output_index = layout_index(output_meta, &coords);
+                                    output_storage.store(program, output_index, value, active);
+                                });
+                            }
+                            RowOutput::Scalar(output_expr) => {
+                                let active = in_bounds.clone() & lane.clone().eq(0u32);
+                                let coords = full_coords(tile_u32(0));
+                                let value = eval_output(
+                                    program,
+                                    output_expr,
+                                    &coords,
+                                    active.clone(),
+                                    &slots,
+                                );
+                                let value = value.cast_to(output_dtype);
+                                let output_index = layout_index(output_meta, &row_dims);
+                                output_storage.store(program, output_index, value, active);
+                            }
+                            RowOutput::Reduce { .. } => {
+                                unreachable!("merged row programs never have a reducing output")
+                            }
+                        }
+                    });
+                }
+            });
+            Some(())
+        },
+    )
 }
 
 /// Scaled dot-product attention as a row program over the KV axis: an
@@ -1410,5 +2074,6 @@ pub(crate) fn attention_row_program(
             input_axis_dims,
             axis_bound_dim: causal.then_some(2),
         }),
+        dense_codegen: false,
     })
 }

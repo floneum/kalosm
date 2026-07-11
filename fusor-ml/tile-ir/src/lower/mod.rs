@@ -36,6 +36,29 @@ pub struct NagaKernel {
 }
 
 impl NagaKernel {
+    /// Rebuild a kernel from a deserialized module, revalidating it with
+    /// every capability the lowerer can emit (a superset of the original
+    /// validation is safe: capabilities only gate what a module may use).
+    pub fn from_module(module: Module, subgroups: bool) -> Result<Self, LowerError> {
+        let capabilities = naga::valid::Capabilities::SHADER_FLOAT16
+            | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
+            | naga::valid::Capabilities::SUBGROUP
+            | naga::valid::Capabilities::COOPERATIVE_MATRIX;
+        let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
+            .validate(&module)
+            .map_err(|error| LowerError::Validation(format!("{error:#?}")))?;
+        Ok(Self {
+            module,
+            info,
+            wgsl_extensions: WgslExtensions::new(subgroups),
+        })
+    }
+
+    /// Whether this kernel requires the subgroup WGSL extension.
+    pub fn subgroups(&self) -> bool {
+        self.wgsl_extensions.subgroups
+    }
+
     /// The generated Naga module.
     pub fn module(&self) -> &Module {
         &self.module

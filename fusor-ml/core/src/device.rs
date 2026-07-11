@@ -579,6 +579,25 @@ impl Device {
         self.inner.buffer_pool.reset_initialized_buffers();
     }
 
+    /// Snapshot the cumulative buffer-pool allocation counters (buffers
+    /// requested / buffers freshly created). Diff two snapshots to measure
+    /// allocations over a window.
+    pub fn buffer_pool_counters(&self) -> fusor_tile_ir_runtime::BufferPoolCounters {
+        self.inner.buffer_pool.counters()
+    }
+
+    /// Whether the buffer pool holds its own tracked clone of `buffer` in the
+    /// `(size, usage)` bucket. Used by liveness accounting to enumerate the
+    /// pool as an expected strong-reference holder.
+    pub(crate) fn buffer_pool_is_tracked(
+        &self,
+        size: u64,
+        usage: wgpu::BufferUsages,
+        buffer: &Arc<wgpu::Buffer>,
+    ) -> bool {
+        self.inner.buffer_pool.is_tracked(size, usage, buffer)
+    }
+
     /// Get or create a buffer of the specified size. Poisoned first when this
     /// handle was built with [`Device::with_poisoned_allocations`].
     pub fn create_buffer(&self, size: u64, usage: wgpu::BufferUsages) -> Arc<wgpu::Buffer> {
@@ -679,6 +698,61 @@ mod dirty_buffer_tests {
             assert_eq!(&*view, &[1, 2, 3, 4]);
             drop(view);
             buffer.unmap();
+        });
+    }
+
+    /// The pool tracks every buffer it hands out (holding its own strong
+    /// clone), reports it via `is_tracked` under the exact `(size, usage)`
+    /// key only, and the allocation counters distinguish fresh creations
+    /// from pool-cache hits.
+    #[test]
+    fn buffer_pool_tracking_and_counters() {
+        pollster::FutureExt::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+
+            let usage = wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST;
+            let size = 512u64;
+
+            let before = device.buffer_pool_counters();
+            let buffer = device.create_buffer(size, usage);
+            let after = device.buffer_pool_counters();
+            assert_eq!(after.requested, before.requested + 1);
+            assert_eq!(after.created, before.created + 1);
+
+            // Tracked under its exact (size, usage) key, and the pool's own
+            // clone means a freshly handed-out buffer has strong_count >= 2.
+            assert!(device.buffer_pool_is_tracked(size, usage, &buffer));
+            assert!(Arc::strong_count(&buffer) >= 2);
+            // Not tracked under a different size or usage.
+            assert!(!device.buffer_pool_is_tracked(size * 2, usage, &buffer));
+            assert!(!device.buffer_pool_is_tracked(
+                size,
+                wgpu::BufferUsages::STORAGE,
+                &buffer
+            ));
+            // A foreign buffer (same size/usage, allocated outside the pool)
+            // is not tracked.
+            let foreign = Arc::new(device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("foreign"),
+                size,
+                usage,
+                mapped_at_creation: false,
+            }));
+            assert!(!device.buffer_pool_is_tracked(size, usage, &foreign));
+
+            // Dropping the handle frees the pooled buffer; the next request
+            // of the same shape is a cache hit, not a fresh creation.
+            drop(buffer);
+            let mid = device.buffer_pool_counters();
+            let reused = device.create_buffer(size, usage);
+            let end = device.buffer_pool_counters();
+            assert_eq!(end.requested, mid.requested + 1);
+            assert_eq!(end.created, mid.created);
+            assert!(device.buffer_pool_is_tracked(size, usage, &reused));
         });
     }
 

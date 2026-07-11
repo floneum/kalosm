@@ -13,6 +13,9 @@ lru = { version = "0.14.0", default-features = false }
 parking_lot = "0.12.3"
 rustc-hash = "2.1.1"
 tracing = "0.1.41"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+naga = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["serialize", "deserialize"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["metal"] }

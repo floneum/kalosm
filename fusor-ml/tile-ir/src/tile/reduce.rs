@@ -169,6 +169,52 @@ impl TileBlock<'_> {
         )
     }
 
+    /// Whole-workgroup reduction built from subgroup collectives: one
+    /// per-subgroup reduce, the per-subgroup partials staged through a
+    /// `num_subgroups`-sized workgroup array, and a serial fold of the
+    /// partials on every lane. Two barriers total, versus one per tree level
+    /// in [`Self::group_reduce`]. The caller owns the device gating (fixed
+    /// `subgroup_size` dividing the workgroup size) via `SubgroupToken`.
+    pub(crate) fn workgroup_reduce_via_subgroups(
+        &mut self,
+        op: TileReduceOp,
+        subgroup_size: u32,
+        value: Tile,
+    ) -> Tile {
+        let block = self.block_size();
+        assert!(
+            subgroup_size > 0 && block.is_multiple_of(subgroup_size),
+            "workgroup_reduce_via_subgroups requires a fixed subgroup size dividing the block"
+        );
+        let element = value.element();
+        let partial = self.subgroup_reduce(op, value);
+        let num_subgroups = block / subgroup_size;
+        if num_subgroups == 1 {
+            return self.bind(partial);
+        }
+        let partial = self.bind(partial);
+        let scratch = self.program.alloc_tile(
+            element,
+            Layout::contiguous(MemoryLevel::Workgroup, Shape::new([num_subgroups])),
+        );
+        // Barrier before seeding the scratch: a previous reduction through
+        // the same call site (a reduce inside a loop) may still have lanes
+        // reading the prior partials.
+        self.workgroup_barrier();
+        let subgroup_lane = self.subgroup_lane();
+        let subgroup_id = self.subgroup_id();
+        self.if_then(subgroup_lane.eq(0u32), |program| {
+            program.store_workgroup(&scratch, subgroup_id, partial);
+        });
+        self.workgroup_barrier();
+        let mut combined = self.load_workgroup(&scratch, 0u32);
+        for index in 1..num_subgroups {
+            let next = self.load_workgroup(&scratch, index);
+            combined = combined.binary(op.binary(), next);
+        }
+        self.bind(combined)
+    }
+
     fn reduce(&mut self, op: TileReduceOp, value: Tile) -> Tile {
         let block = self.block_size();
         self.group_reduce(op, block, value)

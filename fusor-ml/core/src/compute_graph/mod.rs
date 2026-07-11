@@ -13,7 +13,7 @@ pub(crate) use resolve::flush_replay::FlushPlanCache;
 
 mod layout_pass;
 mod queue;
-mod resolve;
+pub(crate) mod resolve;
 #[cfg(test)]
 mod tests;
 #[cfg(feature = "graphvis")]
@@ -323,7 +323,13 @@ impl ComputeGraphNode {
 }
 
 pub(crate) trait GraphOperation: Operation + Send + Sync {
-    fn category(&self) -> &'static str;
+
+    /// The concrete row program behind this graph op, if it is one — lets
+    /// the horizontal merge pass recover fused row programs without a
+    /// blanket `Any` downcast.
+    fn as_row_program(&self) -> Option<&crate::row_program::RowProgramOperation> {
+        None
+    }
 }
 
 /// The graph vocabulary. Exactly three core operations — elementwise

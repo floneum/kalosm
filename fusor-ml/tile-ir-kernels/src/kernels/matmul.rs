@@ -279,6 +279,10 @@ fn coop_tile_entry(tile: DenseCoopMatmulTile) -> Option<&'static CoopTileEntry> 
 ///
 /// Returns false when the tile geometry is unsupported (unknown or
 /// single-buffered table entries) or the grid exceeds the dispatch limit.
+///
+/// `elide_aligned_k_bounds` opts into skipping the K bounds checks when the
+/// spans partition K exactly (dense-large-graph tuning; callers that must
+/// keep the committed codegen pass `false`, keeping every K bound live).
 pub fn try_batched_coop_matmul_split_k(
     program: &mut Program,
     tensors: DenseMatmulTensors<'_>,
@@ -286,6 +290,7 @@ pub fn try_batched_coop_matmul_split_k(
     splits: u32,
     max_workgroups_per_dimension: u32,
     config: DenseCoopMatmulConfig,
+    elide_aligned_k_bounds: bool,
 ) -> bool {
     const COOP_DIM: u32 = 8;
     let DenseMatmulTensors { a, b, y } = tensors;
@@ -350,14 +355,20 @@ pub fn try_batched_coop_matmul_split_k(
         // Split-major scratch rows: slice `split` holds one full padded
         // [batch · m_padded, n_padded] partial.
         let y_batch_base = (split.clone() * shape.batch + batch) * m_padded;
-        // The K bounds are always live: the last split's span may run past
-        // the logical K extent, and those tiles must fill zero.
+        // The K bound is live only when a span can overrun the logical K
+        // extent (K not dividing the tile, or the spans not covering K
+        // exactly). Aligned spans may skip it (opt-in) — a live bound forces
+        // the tile fills onto the scalar per-element path and off the vec4
+        // staging fast path.
+        let k_spans_aligned = elide_aligned_k_bounds
+            && shape.k.is_multiple_of(bk)
+            && k_iterations.is_multiple_of(splits);
         let a_bounds: [Option<Tile>; 2] = [
             (!shape.m.is_multiple_of(bm)).then(|| a_batch_base.clone() + shape.m),
-            Some(Tile::literal(TileLiteral::U32(shape.k))),
+            (!k_spans_aligned).then(|| Tile::literal(TileLiteral::U32(shape.k))),
         ];
         let b_bounds: [Option<Tile>; 2] = [
-            Some(b_batch_base.clone() + shape.k),
+            (!k_spans_aligned).then(|| b_batch_base.clone() + shape.k),
             (!shape.n.is_multiple_of(bn)).then(|| Tile::literal(TileLiteral::U32(shape.n))),
         ];
 
@@ -416,6 +427,361 @@ pub fn try_batched_coop_matmul_split_k(
         );
     });
     true
+}
+
+/// One kernel running several independent same-shape cooperative-matrix
+/// matmuls: each segment owns a contiguous range of workgroups guarded by a
+/// uniform linear-workgroup-id range compare (the same discipline as the
+/// merged n-ary and row-program kernels), and runs the standard coop tile
+/// body over its own `a`/`b`/`y` bindings. All segments share one logical
+/// `shape`, tile geometry, and split factor, so the guarded bodies differ
+/// only in their storage bindings and the workgroup tiles are allocated
+/// once and reused by every branch (the guards are workgroup-uniform).
+///
+/// `splits == 1` runs each segment as the single-pass double-buffered body
+/// (numerics identical to [`try_batched_coop_matmul`]); `splits >= 2` runs
+/// each segment as the split-K partials body (numerics identical to
+/// [`try_batched_coop_matmul_split_k`]) — the caller must follow with
+/// [`merged_split_k_combine`] over the same segment order.
+///
+/// Returns false when the tile geometry is unsupported or the grid exceeds
+/// the dispatch limit; callers then fall back to per-segment kernels.
+#[allow(clippy::too_many_arguments)]
+pub fn try_merged_coop_matmul(
+    program: &mut Program,
+    segments: &[DenseMatmulTensors<'_>],
+    shape: DenseMatmulShape,
+    splits: u32,
+    max_workgroups_per_dimension: u32,
+    config: DenseCoopMatmulConfig,
+    elide_aligned_k_bounds: bool,
+) -> bool {
+    const COOP_DIM: u32 = 8;
+    let DenseCoopMatmulConfig {
+        coop,
+        subgroups,
+        tile,
+    } = config;
+    let subgroup = subgroups.token();
+    let DenseCoopMatmulTile { bm, bn, bk } = tile;
+    if segments.is_empty() || !subgroups.is_fixed() {
+        return false;
+    }
+    if segments
+        .iter()
+        .any(|segment| !cooperative_store_layout_supported(segment.y.layout()))
+    {
+        return false;
+    }
+    let Some(entry) = coop_tile_entry(tile) else {
+        return false;
+    };
+    // Merged bodies stay double-buffer-table only, like the split path.
+    if entry.single_buffered {
+        return false;
+    }
+    let tiles_m = shape.m.div_ceil(bm);
+    let tiles_n = shape.n.div_ceil(bn);
+    let total_tiles = shape.batch * tiles_m * tiles_n;
+    let Some(per_segment) = splits.max(1).checked_mul(total_tiles) else {
+        return false;
+    };
+    let Some(total_workgroups) = per_segment.checked_mul(segments.len() as u32) else {
+        return false;
+    };
+    if total_workgroups > max_workgroups_per_dimension {
+        return false;
+    }
+
+    let block = entry.block(subgroups);
+    let bn_pass: u32 = bn / entry.n_passes;
+    let subgroup_rows: u32 = bm / entry.row_groups;
+    let subgroup_cols_per_pass: u32 = bn_pass / entry.col_groups;
+    let tile_rows_per_sg: u32 = subgroup_rows / COOP_DIM;
+    let tile_cols_per_sg: u32 = subgroup_cols_per_pass / COOP_DIM;
+    let scalar = scalar_of(segments[0].a.element());
+
+    let k_iterations = shape.k.div_ceil(bk);
+    let m_padded = tiles_m * bm;
+    let split_k = splits >= 2;
+    let span_iters = k_iterations.div_ceil(splits.max(1));
+    let k_pairs = k_iterations / 2;
+    let k_remainder = k_iterations % 2;
+
+    // Shared workgroup tiles: every guarded branch has the same geometry.
+    // The split path stages single-buffered; the single-pass path double-
+    // buffers with a second pair (matching the standalone kernels).
+    let a_tile_0 = program.alloc_workgroup_tile_padded(scalar, bm, bk, 1);
+    let b_tile_0 = program.alloc_workgroup_tile_padded(scalar, bk, bn_pass, 1);
+    let (a_tile_1, b_tile_1) = if split_k {
+        (None, None)
+    } else {
+        (
+            Some(program.alloc_workgroup_tile_padded(scalar, bm, bk, 1)),
+            Some(program.alloc_workgroup_tile_padded(scalar, bk, bn_pass, 1)),
+        )
+    };
+
+    let grid = dispatch_grid_1d(total_workgroups, max_workgroups_per_dimension);
+    program.program_grid(block, grid, |program| {
+        // Keep the flat workgroup id a raw builtin expression: `bind` routes
+        // through a function-space local, whose loads naga's uniformity
+        // analysis marks non-uniform — and the segment guards below must be
+        // uniform control flow for the coop ops (and barriers) inside.
+        let wg_id = program.program_id(WorkgroupAxis::X)
+            + program.program_id(WorkgroupAxis::Y) * grid[0]
+            + program.program_id(WorkgroupAxis::Z) * grid[0] * grid[1];
+        for (index, segment) in segments.iter().enumerate() {
+            let DenseMatmulTensors { a, b, y } = *segment;
+            let base = index as u32 * per_segment;
+            let in_segment =
+                wg_id.clone().ge(base) & wg_id.clone().lt(base + per_segment);
+            program.if_then(in_segment, |program| {
+                let local = program.bind(wg_id.clone() - base);
+                let (split, tile_id) = if split_k {
+                    (
+                        Some(program.bind(local.clone() / total_tiles)),
+                        local % total_tiles,
+                    )
+                } else {
+                    (None, local)
+                };
+                let batch = tile_id.clone() / (tiles_m * tiles_n);
+                let local_tile = tile_id % (tiles_m * tiles_n);
+                let m_tile = local_tile.clone() / tiles_n;
+                let n_tile = local_tile % tiles_n;
+                let row_base = m_tile * bm;
+                let col_base = n_tile * bn;
+                let a_batch_base = batch.clone() * shape.m;
+                let b_batch_base = batch.clone() * shape.k;
+                // Split partials land at split-major scratch rows; the
+                // single-pass output lands at the padded batch rows.
+                let y_batch_base = match &split {
+                    Some(split) => (split.clone() * shape.batch + batch) * m_padded,
+                    None => batch * m_padded,
+                };
+                // Bounds mirror the standalone kernels exactly: the split
+                // path may elide aligned K bounds (vec4 staging fast path),
+                // the single-pass path keeps K live only for ragged K.
+                let k_spans_aligned = split_k
+                    && elide_aligned_k_bounds
+                    && shape.k.is_multiple_of(bk)
+                    && k_iterations.is_multiple_of(splits);
+                let k_bound_live = if split_k {
+                    !k_spans_aligned
+                } else {
+                    !shape.k.is_multiple_of(bk)
+                };
+                let a_bounds: [Option<Tile>; 2] = [
+                    (!shape.m.is_multiple_of(bm)).then(|| a_batch_base.clone() + shape.m),
+                    k_bound_live.then(|| Tile::literal(TileLiteral::U32(shape.k))),
+                ];
+                let b_bounds: [Option<Tile>; 2] = [
+                    k_bound_live.then(|| b_batch_base.clone() + shape.k),
+                    (!shape.n.is_multiple_of(bn)).then(|| Tile::literal(TileLiteral::U32(shape.n))),
+                ];
+
+                let subgroup_id = subgroup.subgroup_id(program);
+                let sg_row = subgroup_id.clone() / entry.col_groups;
+                let sg_col = subgroup_id % entry.col_groups;
+                let sg_row_base = sg_row * subgroup_rows;
+                let sg_col_base_in_pass = sg_col * subgroup_cols_per_pass;
+
+                let span_base = split.map(|split| program.bind(split * span_iters));
+                coop_perf_pass_loop(
+                    program,
+                    coop,
+                    scalar,
+                    entry.n_passes,
+                    bn_pass,
+                    tile_rows_per_sg,
+                    tile_cols_per_sg,
+                    y,
+                    &y_batch_base,
+                    &row_base,
+                    &col_base,
+                    &sg_row_base,
+                    &sg_col_base_in_pass,
+                    |program, pass_col_base, accs| {
+                        if let Some(span_base) = &span_base {
+                            // Split-K span: single-buffered staging over this
+                            // split's contiguous K-tile range.
+                            program.loop_range(span_iters, |program, iter_idx| {
+                                let k_base = (span_base.clone() + iter_idx) * bk;
+                                coop_stage_and_mma(
+                                    program,
+                                    coop,
+                                    a,
+                                    b,
+                                    &a_tile_0,
+                                    &b_tile_0,
+                                    &a_batch_base,
+                                    &b_batch_base,
+                                    &row_base,
+                                    pass_col_base,
+                                    &k_base,
+                                    &sg_row_base,
+                                    &sg_col_base_in_pass,
+                                    &a_bounds,
+                                    &b_bounds,
+                                    accs,
+                                    tile_rows_per_sg,
+                                    tile_cols_per_sg,
+                                    bk,
+                                    COOP_DIM,
+                                    scalar,
+                                );
+                                program.workgroup_barrier();
+                            });
+                            return;
+                        }
+                        // Single-pass: the double-buffered K-pair loop of the
+                        // standalone kernel.
+                        let (a_tile_1, b_tile_1) = (
+                            a_tile_1.as_ref().expect("allocated for single-pass"),
+                            b_tile_1.as_ref().expect("allocated for single-pass"),
+                        );
+                        if k_pairs > 0 {
+                            program.loop_range(k_pairs, |program, pair_idx| {
+                                let k_base_0 = pair_idx.clone() * (2 * bk);
+                                let k_base_1 = pair_idx * (2 * bk) + bk;
+                                coop_stage_and_mma(
+                                    program,
+                                    coop,
+                                    a,
+                                    b,
+                                    &a_tile_0,
+                                    &b_tile_0,
+                                    &a_batch_base,
+                                    &b_batch_base,
+                                    &row_base,
+                                    pass_col_base,
+                                    &k_base_0,
+                                    &sg_row_base,
+                                    &sg_col_base_in_pass,
+                                    &a_bounds,
+                                    &b_bounds,
+                                    accs,
+                                    tile_rows_per_sg,
+                                    tile_cols_per_sg,
+                                    bk,
+                                    COOP_DIM,
+                                    scalar,
+                                );
+                                coop_stage_and_mma(
+                                    program,
+                                    coop,
+                                    a,
+                                    b,
+                                    a_tile_1,
+                                    b_tile_1,
+                                    &a_batch_base,
+                                    &b_batch_base,
+                                    &row_base,
+                                    pass_col_base,
+                                    &k_base_1,
+                                    &sg_row_base,
+                                    &sg_col_base_in_pass,
+                                    &a_bounds,
+                                    &b_bounds,
+                                    accs,
+                                    tile_rows_per_sg,
+                                    tile_cols_per_sg,
+                                    bk,
+                                    COOP_DIM,
+                                    scalar,
+                                );
+                            });
+                        }
+                        if k_remainder == 1 {
+                            let k_base_epi =
+                                Tile::literal(TileLiteral::U32((k_iterations - 1) * bk));
+                            coop_stage_and_mma(
+                                program,
+                                coop,
+                                a,
+                                b,
+                                &a_tile_0,
+                                &b_tile_0,
+                                &a_batch_base,
+                                &b_batch_base,
+                                &row_base,
+                                pass_col_base,
+                                &k_base_epi,
+                                &sg_row_base,
+                                &sg_col_base_in_pass,
+                                &a_bounds,
+                                &b_bounds,
+                                accs,
+                                tile_rows_per_sg,
+                                tile_cols_per_sg,
+                                bk,
+                                COOP_DIM,
+                                scalar,
+                            );
+                            program.workgroup_barrier();
+                        }
+                    },
+                );
+            });
+        }
+    });
+    true
+}
+
+/// The merged counterpart of [`split_k_combine`]: one kernel folding the
+/// split-K partials of several same-shape segments, each `y` a read-write
+/// view of that segment's whole `(1 + splits)`-slice buffer, each segment
+/// guarded by its linear-workgroup-id range in the same segment order as
+/// [`try_merged_coop_matmul`].
+pub fn merged_split_k_combine(
+    program: &mut Program,
+    ys: &[&Storage],
+    rows: u32,
+    cols: u32,
+    splits: u32,
+    max_workgroups_per_dimension: u32,
+) {
+    const BLOCK: u32 = 256;
+    let total = rows * cols;
+    let per_segment = total.div_ceil(BLOCK);
+    let total_workgroups = per_segment * ys.len() as u32;
+    let scalar = scalar_of(ys[0].element());
+    let zero = zero_literal(scalar);
+    let grid = dispatch_grid_1d(total_workgroups, max_workgroups_per_dimension);
+    program.program_grid(BLOCK, grid, |program| {
+        let wg_id = program.bind(
+            program.program_id(WorkgroupAxis::X)
+                + program.program_id(WorkgroupAxis::Y) * grid[0]
+                + program.program_id(WorkgroupAxis::Z) * grid[0] * grid[1],
+        );
+        for (index, y) in ys.iter().enumerate() {
+            let base = index as u32 * per_segment;
+            let in_segment =
+                wg_id.clone().ge(base) & wg_id.clone().lt(base + per_segment);
+            program.if_then(in_segment, |program| {
+                let local = wg_id.clone() - base;
+                let index = program.bind(local * BLOCK + program.lane());
+                let active = index.clone().lt(total);
+                let row = program.bind(index.clone() / cols);
+                let col = program.bind(index % cols);
+                let mut acc = program.load(
+                    y.at((row.clone() + rows, col.clone())),
+                    active.clone(),
+                    zero,
+                );
+                for split in 2..=splits {
+                    acc = acc
+                        + program.load(
+                            y.at((row.clone() + split * rows, col.clone())),
+                            active.clone(),
+                            zero,
+                        );
+                }
+                program.store(y.at((row, col)), acc, active);
+            });
+        }
+    });
 }
 
 /// Fold the split-K partials into the output. `y` is one read-write view of

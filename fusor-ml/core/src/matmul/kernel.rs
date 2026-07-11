@@ -29,6 +29,18 @@ fn device_supported<T>(value: Option<T>) -> Result<T, kernel_backend::DeviceNotS
     value.ok_or(kernel_backend::DeviceNotSupported)
 }
 
+/// The validated views and geometry of one cooperative-matrix matmul
+/// lowering (see [`MatMulOperation::hardware_matmul_prep`]).
+struct HardwareMatmulPrep {
+    a_view: crate::mir::tile_direct::DirectMatrixLayout,
+    b_view: crate::mir::tile_direct::DirectMatrixLayout,
+    y_view: crate::mir::tile_direct::DirectMatrixLayout,
+    shape: tile_ir_kernels::DenseMatmulShape,
+    tile: CoopTile,
+    batch_m_padded: u32,
+    n_padded: u32,
+}
+
 impl MatMulOperation {
     pub fn new(
         datatype: DataTypeEnum,
@@ -91,6 +103,7 @@ impl MatMulOperation {
             ],
             post_element_wise: UnaryFunctionChain::empty(datatype),
             parameters,
+            dense_codegen: false,
         }
     }
 
@@ -255,13 +268,19 @@ impl MatMulOperation {
         strides.into()
     }
 
-    fn build_hardware_matmul(
+    /// The shared head of the cooperative-matrix lowering: flatten the
+    /// operand layouts, validate the contraction geometry, pick the tile,
+    /// and verify the output allocation carries the tile-padded backing.
+    /// Used by both the standalone [`Self::build_hardware_matmul`] and the
+    /// horizontally merged builder ([`build_merged_matmul_kernel`]), so the
+    /// two agree on every gate by construction.
+    fn hardware_matmul_prep(
         &self,
         device: &Device,
         input_a: &TensorData,
         input_b: &TensorData,
         output: &TensorData,
-    ) -> Result<DirectKernel, kernel_backend::DeviceNotSupported> {
+    ) -> Result<HardwareMatmulPrep, kernel_backend::DeviceNotSupported> {
         // Operands with a base map read their producer through it: compose
         // with the runtime buffer layout, then flatten with the operand's
         // dim grouping.
@@ -312,11 +331,6 @@ impl MatMulOperation {
         // shapes lower through the generic subgroup-per-output reduce, and
         // fused chains lower through the generic tiled reduce.
         let tile = device_supported(self.coop_tile(device))?;
-        let subgroup_config = device_supported(device.subgroup_config())?;
-        let MatMulParams::CoopMatMul(params) = &self.parameters else {
-            return Err(kernel_backend::DeviceNotSupported);
-        };
-        let coop = device_supported(device.coop_token(params.kind()))?;
 
         // The store covers whole tiles, so `y` is the padded matrix: rows
         // padded to `ceil(m / bm) * bm` per batch and columns to
@@ -351,6 +365,38 @@ impl MatMulOperation {
                 &[n_padded, 1],
             ),
         };
+        Ok(HardwareMatmulPrep {
+            a_view,
+            b_view,
+            y_view,
+            shape,
+            tile,
+            batch_m_padded,
+            n_padded,
+        })
+    }
+
+    fn build_hardware_matmul(
+        &self,
+        device: &Device,
+        input_a: &TensorData,
+        input_b: &TensorData,
+        output: &TensorData,
+    ) -> Result<DirectKernel, kernel_backend::DeviceNotSupported> {
+        let HardwareMatmulPrep {
+            a_view,
+            b_view,
+            y_view,
+            shape,
+            tile,
+            batch_m_padded,
+            n_padded,
+        } = self.hardware_matmul_prep(device, input_a, input_b, output)?;
+        let subgroup_config = device_supported(device.subgroup_config())?;
+        let MatMulParams::CoopMatMul(params) = &self.parameters else {
+            return Err(kernel_backend::DeviceNotSupported);
+        };
+        let coop = device_supported(device.coop_token(params.kind()))?;
 
         let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
         let datatype = self.datatype;
@@ -436,7 +482,7 @@ impl MatMulOperation {
         let cache_key = self.kernel_cache_key_with_dispatch(variant, None, dispatch_size, &inputs);
 
         let name = self.name();
-        let pipeline = kernel_backend::three_buffer_pipeline_from_ir(
+        let (pipeline, cached) = kernel_backend::three_buffer_pipeline_from_ir(
             device.kernel_cache(),
             &name,
             cache_key,
@@ -447,6 +493,7 @@ impl MatMulOperation {
             kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
                 name,
                 pipeline,
+                Some(cached),
                 input_a.buffer().clone(),
                 input_b.buffer().clone(),
                 output.buffer().clone(),
@@ -462,9 +509,22 @@ impl MatMulOperation {
     /// split) and [`Self::build_hardware_matmul`], so allocation and kernel
     /// selection agree by construction.
     fn split_k_factor(&self, tile: &CoopTile) -> Option<u32> {
-        const SPLIT_K_MAX_TILES: u32 = if std::option_env!("FUSOR_NO_SPLITK").is_some() { 0 } else { 24 };
+        const SPLIT_K_MAX_TILES: u32 = if std::option_env!("FUSOR_NO_SPLITK").is_some() {
+            0
+        } else {
+            24
+        };
         const SPLIT_K_MIN_K: u32 = 512;
+        // Committed fan-out, kept exactly for quantized-pipeline and small
+        // graphs (`dense_codegen` unset).
         const SPLIT_K_SPLITS: u32 = 16;
+        // Dense-large-graph tuning: enough splits to cover the GPU from a
+        // starved tile grid; K-spans that divide the K-tile count keep the
+        // kernel's staging on the unbounded vec4 fast path (measured ~3x on
+        // the 64×2048×64 weight-gradient shape), so prefer the largest
+        // divisor at or under the target and fall back to the raw target
+        // only when the K-tile count has no useful divisor.
+        const DENSE_SPLIT_K_SPLITS: u32 = 32;
         let m: u32 = self.a.rows().try_into().ok()?;
         let n: u32 = self.b.cols().try_into().ok()?;
         let k: u32 = self.a.cols().try_into().ok()?;
@@ -478,9 +538,24 @@ impl MatMulOperation {
             .checked_mul(n.div_ceil(tile.bn))?
             .checked_mul(batch)?;
         if total_tiles >= SPLIT_K_MAX_TILES || k < SPLIT_K_MIN_K {
+            if std::env::var_os("FUSOR_TRACE_SPLITK").is_some() {
+                eprintln!(
+                    "splitk_gate name={} tiles={total_tiles} k={k}",
+                    self.name()
+                );
+            }
             return None;
         }
-        let splits = SPLIT_K_SPLITS.min(k.div_ceil(tile.bk));
+        let k_iterations = k.div_ceil(tile.bk);
+        let splits = if self.dense_codegen {
+            let target = DENSE_SPLIT_K_SPLITS.min(k_iterations);
+            (2..=target)
+                .rev()
+                .find(|candidate| k_iterations.is_multiple_of(*candidate))
+                .unwrap_or(target)
+        } else {
+            SPLIT_K_SPLITS.min(k_iterations)
+        };
         (splits >= 2).then_some(splits)
     }
 
@@ -565,9 +640,13 @@ impl MatMulOperation {
                         bk: tile.bk,
                     },
                 },
+                self.dense_codegen,
             ));
         });
         if !used.get() {
+            if std::env::var_os("FUSOR_TRACE_SPLITK").is_some() {
+                eprintln!("splitk_declined_by_kernel name={}", self.name());
+            }
             return None;
         }
         let dispatch_size = ir.grid;
@@ -584,11 +663,12 @@ impl MatMulOperation {
                 tile.hash(state);
                 subgroup_config.hash(state);
                 splits.hash(state);
+                self.dense_codegen.hash(state);
                 1u64.hash(state);
             });
         let cache_key = self.kernel_cache_key_with_dispatch(variant, None, dispatch_size, &inputs);
         let name = self.name();
-        let pipeline = kernel_backend::three_buffer_pipeline_from_ir(
+        let (pipeline, cached) = kernel_backend::three_buffer_pipeline_from_ir(
             device.kernel_cache(),
             &name,
             cache_key,
@@ -597,6 +677,7 @@ impl MatMulOperation {
         let partials = kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
             name.clone(),
             pipeline,
+            Some(cached),
             input_a.buffer().clone(),
             input_b.buffer().clone(),
             output.buffer().clone(),
@@ -643,6 +724,7 @@ impl MatMulOperation {
                 tile.hash(state);
                 subgroup_config.hash(state);
                 splits.hash(state);
+                self.dense_codegen.hash(state);
                 2u64.hash(state);
             });
         let combine_key =
@@ -665,6 +747,343 @@ impl MatMulOperation {
 
 struct HardwareMatmulVariant;
 struct SplitKMatmulVariant;
+struct MergedMatmulVariant;
+
+/// The horizontal-merge compatibility key of a dense matmul: two matmuls
+/// merge into one dispatch only when every field matches, which makes the
+/// guarded segment bodies identical up to their storage bindings (same
+/// logical shape, tile geometry, workgroup size, split factor, and element
+/// type). Only dense-large-graph matmuls (`dense_codegen`) that will take
+/// the cooperative-matrix route produce a key, so quantized decode graphs
+/// and small graphs never reach the merged lowering.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct MatmulMergeKey {
+    m: u32,
+    k: u32,
+    n: u32,
+    batch: u32,
+    tile: CoopTile,
+    splits: Option<u32>,
+    datatype: DataTypeEnum,
+}
+
+impl MatmulMergeKey {
+    /// The shared split-K factor, `None` for single-pass profiles.
+    pub(crate) fn splits(&self) -> Option<u32> {
+        self.splits
+    }
+}
+
+impl MatMulOperation {
+    /// See [`MatmulMergeKey`]. `None` = not horizontally mergeable.
+    pub(crate) fn merge_profile(&self, device: &Device) -> Option<MatmulMergeKey> {
+        if !self.dense_codegen {
+            return None;
+        }
+        let tile = self.coop_tile(device)?;
+        let m: u32 = self.a.rows().try_into().ok()?;
+        let k: u32 = self.a.cols().try_into().ok()?;
+        let n: u32 = self.b.cols().try_into().ok()?;
+        let batch: u32 = self
+            .a
+            .batch_shape()
+            .iter()
+            .try_fold(1u32, |acc, &dim| acc.checked_mul(u32::try_from(dim).ok()?))?;
+        Some(MatmulMergeKey {
+            m,
+            k,
+            n,
+            batch,
+            tile,
+            splits: self.split_k_factor(&tile),
+            datatype: self.datatype,
+        })
+    }
+}
+
+/// One kernel running several independent same-profile dense matmuls (see
+/// [`MatmulMergeKey`]): the guarded-segment counterpart of the standalone
+/// cooperative-matrix lowering, emitted through
+/// [`tile_ir_kernels::try_merged_coop_matmul`]. Split-K profiles produce a
+/// two-dispatch sequence — all segments' partials in one kernel, then all
+/// combines in another — with each segment's scratch carved out of its own
+/// over-allocated output (slot-attributable for flush-plan recording, like
+/// the standalone split-K route).
+///
+/// Returns `None` when any segment fails the hardware gates (the caller
+/// falls back to per-segment kernels and poisons the recording).
+pub(crate) fn build_merged_matmul_kernel(
+    graph: &crate::compute_graph::ComputeGraphInner,
+    segments: &[MatMulOperation],
+    segment_inputs: &[Vec<crate::mir::inputs::MirValue>],
+) -> Option<DirectKernel> {
+    macro_rules! decline {
+        ($reason:expr) => {{
+            if std::env::var_os("FUSOR_TRACE_MATMUL_MERGE").is_some() {
+                eprintln!("matmul_merge_decline reason={}", $reason);
+            }
+            return None;
+        }};
+    }
+    let device = graph.device();
+    let first = segments.first()?;
+    let mut tensors = Vec::with_capacity(segments.len());
+    for (op, inputs) in segments.iter().zip(segment_inputs) {
+        let [input_a, input_b, output] = inputs.as_slice() else {
+            decline!("input_arity");
+        };
+        let (Some(input_a), Some(input_b), Some(output)) =
+            (input_a.as_tensor(), input_b.as_tensor(), output.as_tensor())
+        else {
+            decline!("input_tensors");
+        };
+        if !op.can_use_hardware_matmul()
+            || input_a.datatype() != op.datatype
+            || input_b.datatype() != op.datatype
+            || output.datatype() != op.datatype
+            || (op.datatype == DataTypeEnum::F16 && !device.f16_supported())
+        {
+            decline!("datatype_gate");
+        }
+        tensors.push((input_a, input_b, output));
+    }
+
+    let mut preps = Vec::with_capacity(segments.len());
+    for (op, (input_a, input_b, output)) in segments.iter().zip(&tensors) {
+        let Ok(prep) = op.hardware_matmul_prep(&device, input_a, input_b, output) else {
+            decline!(format!("prep {}", op.name()));
+        };
+        preps.push(prep);
+    }
+    let tile = preps[0].tile;
+    let shape = preps[0].shape;
+    let batch_m_padded = preps[0].batch_m_padded;
+    let n_padded = preps[0].n_padded;
+    // The merge key guarantees profile equality; re-verify structurally so a
+    // drifted caller can never emit mismatched guarded bodies.
+    if preps.iter().any(|prep| {
+        prep.tile != tile
+            || prep.shape.batch != shape.batch
+            || prep.shape.m != shape.m
+            || prep.shape.k != shape.k
+            || prep.shape.n != shape.n
+            || prep.batch_m_padded != batch_m_padded
+            || prep.n_padded != n_padded
+    }) {
+        decline!("profile_mismatch");
+    }
+    let splits = first.split_k_factor(&tile);
+    if segments
+        .iter()
+        .any(|op| op.split_k_factor(&tile) != splits || op.datatype != first.datatype)
+    {
+        decline!("splits_mismatch");
+    }
+
+    let Some(subgroup_config) = device.subgroup_config() else {
+        decline!("subgroups");
+    };
+    let MatMulParams::CoopMatMul(params) = &first.parameters else {
+        decline!("params");
+    };
+    let Some(coop) = device.coop_token(params.kind()) else {
+        decline!("coop_token");
+    };
+    let element = match first.datatype {
+        DataTypeEnum::F32 => tile_ir::ElementType::F32,
+        DataTypeEnum::F16 => tile_ir::ElementType::F16,
+        _ => decline!("element"),
+    };
+    let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
+    let config = tile_ir_kernels::DenseCoopMatmulConfig {
+        coop,
+        subgroups: subgroup_config,
+        tile: tile_ir_kernels::DenseCoopMatmulTile {
+            bm: tile.bm,
+            bn: tile.bn,
+            bk: tile.bk,
+        },
+    };
+
+    // Split-K segments store partials into scratch slices of their own
+    // output allocation; verify every allocation carries the slices.
+    let slice_elements = batch_m_padded.checked_mul(n_padded)?;
+    if let Some(splits) = splits {
+        let total_elements = slice_elements.checked_mul(splits.checked_add(1)?)?;
+        let required_bytes = total_elements as u64 * first.datatype.element_size() as u64;
+        if tensors
+            .iter()
+            .any(|(_, _, output)| output.buffer().size() < required_bytes)
+        {
+            decline!("scratch_capacity");
+        }
+    }
+
+    let name = if std::env::var_os("FUSOR_TRACE_DECODE_NAMES").is_some() {
+        format!(
+            "merged_matmul[{}]",
+            segments
+                .iter()
+                .map(|op| op.name())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    } else {
+        format!("merged_matmul_x{}", segments.len())
+    };
+
+    let used = std::cell::Cell::new(false);
+    let splits_or_one = splits.unwrap_or(1);
+    let elide_aligned_k_bounds = first.dense_codegen;
+    let ir = tile_ir::tile::build(|phase| {
+        let mut storages = Vec::with_capacity(segments.len());
+        for prep in &preps {
+            let a = tile_storage_read_with_direct_layout_typed(phase, element, prep.a_view.clone());
+            let b = tile_storage_read_with_direct_layout_typed(phase, element, prep.b_view.clone());
+            let y_view = match splits {
+                // Partials land in the scratch slices (`1..=splits`).
+                Some(splits) => crate::mir::tile_direct::DirectMatrixLayout {
+                    rows: splits * batch_m_padded,
+                    cols: n_padded,
+                    offset: slice_elements,
+                    layout: tile_ir::Layout::strided(
+                        tile_ir::MemoryLevel::Storage,
+                        tile_ir::Shape::new([splits * batch_m_padded, n_padded]),
+                        &[n_padded, 1],
+                    ),
+                },
+                None => prep.y_view.clone(),
+            };
+            let y = tile_storage_write_with_direct_layout_typed(phase, element, y_view);
+            storages.push((a, b, y));
+        }
+        let segment_tensors: Vec<tile_ir_kernels::DenseMatmulTensors> = storages
+            .iter()
+            .map(|(a, b, y)| tile_ir_kernels::DenseMatmulTensors { a, b, y })
+            .collect();
+        used.set(tile_ir_kernels::try_merged_coop_matmul(
+            phase,
+            &segment_tensors,
+            shape,
+            splits_or_one,
+            max_wg_per_dim,
+            config,
+            elide_aligned_k_bounds,
+        ));
+    });
+    if !used.get() {
+        decline!("tile_ir_declined");
+    }
+    let dispatch_size = ir.grid;
+    if dispatch_size.iter().any(|dim| *dim > max_wg_per_dim) {
+        return None;
+    }
+    let cache_key = kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
+        kernel_backend::KernelVariantKey::of::<MergedMatmulVariant>().hash(state);
+        dispatch_size.hash(state);
+        tile.hash(state);
+        subgroup_config.hash(state);
+        splits.hash(state);
+        1u64.hash(state);
+        crate::compute_graph::resolve::merge_horizontal::hash_merged_segments(
+            state,
+            segments,
+            segment_inputs,
+        );
+    });
+    let buffers: Vec<std::sync::Arc<wgpu::Buffer>> = tensors
+        .iter()
+        .flat_map(|(input_a, input_b, output)| {
+            [
+                input_a.buffer().clone(),
+                input_b.buffer().clone(),
+                output.buffer().clone(),
+            ]
+        })
+        .collect();
+    let Some(main) = kernel_backend::dynamic_kernel_from_ir(
+        device.kernel_cache(),
+        name.clone(),
+        cache_key,
+        move || Some(ir),
+        buffers,
+        dispatch_size,
+    ) else {
+        decline!("pipeline");
+    };
+    let Some(splits) = splits else {
+        return Some(main);
+    };
+
+    // The merged combine: every segment's `(1 + splits)`-slice buffer bound
+    // once read-write, folded by guarded ranges in the same segment order.
+    let all_rows = (splits + 1) * batch_m_padded;
+    let combine_ir = tile_ir::tile::build(|phase| {
+        let storages: Vec<tile_ir::tile::Storage> = preps
+            .iter()
+            .map(|_| {
+                tile_storage_write_with_direct_layout_typed(
+                    phase,
+                    element,
+                    crate::mir::tile_direct::DirectMatrixLayout {
+                        rows: all_rows,
+                        cols: n_padded,
+                        offset: 0,
+                        layout: tile_ir::Layout::strided(
+                            tile_ir::MemoryLevel::Storage,
+                            tile_ir::Shape::new([all_rows, n_padded]),
+                            &[n_padded, 1],
+                        ),
+                    },
+                )
+            })
+            .collect();
+        let ys: Vec<&tile_ir::tile::Storage> = storages.iter().collect();
+        tile_ir_kernels::merged_split_k_combine(
+            phase,
+            &ys,
+            batch_m_padded,
+            n_padded,
+            splits,
+            max_wg_per_dim,
+        );
+    });
+    let combine_dispatch = combine_ir.grid;
+    if combine_dispatch.iter().any(|dim| *dim > max_wg_per_dim) {
+        return None;
+    }
+    let combine_key = kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
+        kernel_backend::KernelVariantKey::of::<MergedMatmulVariant>().hash(state);
+        combine_dispatch.hash(state);
+        tile.hash(state);
+        subgroup_config.hash(state);
+        splits.hash(state);
+        2u64.hash(state);
+        crate::compute_graph::resolve::merge_horizontal::hash_merged_segments(
+            state,
+            segments,
+            segment_inputs,
+        );
+    });
+    let combine_buffers: Vec<std::sync::Arc<wgpu::Buffer>> = tensors
+        .iter()
+        .map(|(_, _, output)| output.buffer().clone())
+        .collect();
+    let Some(combine) = kernel_backend::dynamic_kernel_from_ir(
+        device.kernel_cache(),
+        format!("{name}_split_combine"),
+        combine_key,
+        move || Some(combine_ir),
+        combine_buffers,
+        combine_dispatch,
+    ) else {
+        decline!("combine_pipeline");
+    };
+    Some(kernel_backend::DirectKernel::sequence(
+        name,
+        vec![main, combine],
+    ))
+}
 
 impl Operation for MatMulOperation {
     fn hash_kernel_fields(&self, state: &mut FxHasher) {

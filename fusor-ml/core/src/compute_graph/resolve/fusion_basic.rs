@@ -26,6 +26,19 @@ impl Resolver {
             if self.check_cached(graph, input_inner) {
                 continue;
             }
+            // Dense branch: an externally live producer (pending sink /
+            // user-held node) materializes regardless, so inlining it here
+            // would duplicate its compute. Region formation fuses it with
+            // its consumers instead, emitting it as a region output.
+            if self.horizontal_merge
+                && graph
+                    .nodes
+                    .nodes
+                    .node_weight(input_inner)
+                    .is_some_and(|node| node.reference_count > 0)
+            {
+                continue;
+            }
             let Some(input_exec) = self.get_input_node_in_exec_graph(input_inner) else {
                 continue;
             };

@@ -25,6 +25,10 @@ enum DirectKernelKind {
     /// quantized matrix) so dispatch skips the kernel-cache LRU entirely.
     Storage3 {
         pipeline: wgpu::ComputePipeline,
+        /// The lowered kernel behind the pipeline, when the construction
+        /// site still had it (the per-matrix decode pipeline cache keeps
+        /// only the pipeline). Plans need it to persist across processes.
+        cached: Option<Arc<CachedKernel>>,
         input: Arc<wgpu::Buffer>,
         weight: Arc<wgpu::Buffer>,
         output: Arc<wgpu::Buffer>,
@@ -55,6 +59,7 @@ enum DirectKernelTemplateKind {
     },
     Storage3 {
         pipeline: wgpu::ComputePipeline,
+        cached: Option<Arc<CachedKernel>>,
     },
     Sequence(Vec<DirectKernelTemplate>),
 }
@@ -69,6 +74,95 @@ pub struct DirectKernelTemplate {
     name: String,
     dispatch_size: [u32; 3],
     kind: DirectKernelTemplateKind,
+}
+
+impl DirectKernelTemplate {
+    /// The serializable form of this template, or `None` for kernels whose
+    /// pipeline cannot be rebuilt from a module alone.
+    pub(crate) fn to_disk(&self) -> Option<crate::disk_cache::DiskTemplate> {
+        let kind = match &self.kind {
+            DirectKernelTemplateKind::Dynamic { cached, bindings } => {
+                crate::disk_cache::DiskTemplateKind::Dynamic {
+                    module: cached.kernel.module().clone(),
+                    subgroups: cached.kernel.subgroups(),
+                    bindings: bindings
+                        .iter()
+                        .map(|binding| (binding.binding, binding.read_only))
+                        .collect(),
+                }
+            }
+            DirectKernelTemplateKind::Storage3 { cached, .. } => {
+                let cached = cached.as_ref()?;
+                crate::disk_cache::DiskTemplateKind::Storage3 {
+                    module: cached.kernel.module().clone(),
+                    subgroups: cached.kernel.subgroups(),
+                }
+            }
+            DirectKernelTemplateKind::Sequence(templates) => {
+                crate::disk_cache::DiskTemplateKind::Sequence(
+                    templates
+                        .iter()
+                        .map(|template| template.to_disk())
+                        .collect::<Option<Vec<_>>>()?,
+                )
+            }
+        };
+        Some(crate::disk_cache::DiskTemplate {
+            name: self.name.clone(),
+            dispatch_size: self.dispatch_size,
+            kind,
+        })
+    }
+
+    /// Rebuild a template from its serialized form; `None` (a cache miss)
+    /// when the stored module no longer validates.
+    pub(crate) fn from_disk(
+        disk: crate::disk_cache::DiskTemplate,
+        cache: &KernelCache,
+    ) -> Option<Self> {
+        let kind = match disk.kind {
+            crate::disk_cache::DiskTemplateKind::Dynamic {
+                module,
+                subgroups,
+                bindings,
+            } => {
+                let kernel = fusor_tile_ir::NagaKernel::from_module(module, subgroups).ok()?;
+                DirectKernelTemplateKind::Dynamic {
+                    cached: Arc::new(CachedKernel::new(Arc::new(kernel))),
+                    bindings: bindings
+                        .into_iter()
+                        .map(|(binding, read_only)| DirectKernelTemplateBinding {
+                            binding,
+                            read_only,
+                        })
+                        .collect(),
+                }
+            }
+            crate::disk_cache::DiskTemplateKind::Storage3 { module, subgroups } => {
+                let kernel = fusor_tile_ir::NagaKernel::from_module(module, subgroups).ok()?;
+                let cached = Arc::new(CachedKernel::new(Arc::new(kernel)));
+                let pipeline =
+                    crate::dispatch::prepare_three_buffer_pipeline(cache, &disk.name, &cached);
+                DirectKernelTemplateKind::Storage3 {
+                    pipeline,
+                    cached: Some(cached),
+                }
+            }
+            crate::disk_cache::DiskTemplateKind::Sequence(templates) => {
+                DirectKernelTemplateKind::Sequence(
+                    templates
+                        .into_iter()
+                        .map(|template| Self::from_disk(template, cache))
+                        .collect::<Option<Vec<_>>>()?,
+                )
+            }
+        };
+        Some(Self {
+            name: disk.name,
+            dispatch_size: disk.dispatch_size,
+            kind,
+        })
+    }
 }
 
 pub struct PreparedDirectDispatch {
@@ -99,6 +193,7 @@ impl DirectKernel {
     pub fn from_prepared_three_buffer_pipeline(
         name: impl Into<String>,
         pipeline: wgpu::ComputePipeline,
+        cached: Option<Arc<CachedKernel>>,
         input: Arc<wgpu::Buffer>,
         weight: Arc<wgpu::Buffer>,
         output: Arc<wgpu::Buffer>,
@@ -108,6 +203,7 @@ impl DirectKernel {
             name: name.into(),
             dispatch_size,
             kind: DirectKernelKind::Storage3 {
+                cached,
                 pipeline,
                 input,
                 weight,
@@ -142,8 +238,11 @@ impl DirectKernel {
                     })
                     .collect(),
             },
-            DirectKernelKind::Storage3 { pipeline, .. } => DirectKernelTemplateKind::Storage3 {
+            DirectKernelKind::Storage3 {
+                pipeline, cached, ..
+            } => DirectKernelTemplateKind::Storage3 {
                 pipeline: pipeline.clone(),
+                cached: cached.clone(),
             },
             DirectKernelKind::Sequence(kernels) => DirectKernelTemplateKind::Sequence(
                 kernels.iter().map(DirectKernel::to_template).collect(),
@@ -187,6 +286,7 @@ impl DirectKernel {
                 input,
                 weight,
                 output,
+                cached: _,
             } => {
                 let bind_group_layout = cache.direct_three_buffer_bind_group_layout();
                 let bind_entries = [
@@ -218,32 +318,8 @@ impl DirectKernel {
                 })
             }
             DirectKernelKind::Dynamic { cached, bindings } => {
-                let bind_group_layout = cached
-                    .dynamic_bind_group_layout
-                    .get_or_init(|| {
-                        let layout_entries = bindings
-                            .iter()
-                            .map(|binding| wgpu::BindGroupLayoutEntry {
-                                binding: binding.binding,
-                                visibility: wgpu::ShaderStages::COMPUTE,
-                                ty: wgpu::BindingType::Buffer {
-                                    ty: wgpu::BufferBindingType::Storage {
-                                        read_only: binding.read_only,
-                                    },
-                                    has_dynamic_offset: false,
-                                    min_binding_size: None,
-                                },
-                                count: None,
-                            })
-                            .collect::<Vec<_>>();
-                        cache
-                            .device
-                            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                                label: Some(&self.name),
-                                entries: &layout_entries,
-                            })
-                    })
-                    .clone();
+                let (bind_group_layout, pipeline) =
+                    self.dynamic_pipeline(cache, cached, bindings);
 
                 let bind_entries = bindings
                     .iter()
@@ -287,7 +363,58 @@ impl DirectKernel {
                         .clone()
                 };
 
-                let pipeline_layout = cached
+                Some(PreparedDirectDispatch {
+                    steps: vec![PreparedDirectDispatchStep {
+                        pipeline,
+                        bind_group,
+                        dispatch_size: self.dispatch_size,
+                    }],
+                    _buffers: bindings
+                        .iter()
+                        .map(|binding| binding.buffer.clone())
+                        .collect(),
+                })
+            }
+        }
+    }
+
+    /// The buffer-independent compiled artifacts of a dynamic kernel:
+    /// bind-group layout and compute pipeline (plus the shader module and
+    /// pipeline layout behind them). Everything sits behind per-kernel
+    /// once-cells, so this is thread-safe and idempotent.
+    fn dynamic_pipeline(
+        &self,
+        cache: &KernelCache,
+        cached: &Arc<CachedKernel>,
+        bindings: &[DirectKernelBinding],
+    ) -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
+                let bind_group_layout = cached
+                    .dynamic_bind_group_layout
+                    .get_or_init(|| {
+                        let layout_entries = bindings
+                            .iter()
+                            .map(|binding| wgpu::BindGroupLayoutEntry {
+                                binding: binding.binding,
+                                visibility: wgpu::ShaderStages::COMPUTE,
+                                ty: wgpu::BindingType::Buffer {
+                                    ty: wgpu::BufferBindingType::Storage {
+                                        read_only: binding.read_only,
+                                    },
+                                    has_dynamic_offset: false,
+                                    min_binding_size: None,
+                                },
+                                count: None,
+                            })
+                            .collect::<Vec<_>>();
+                        cache
+                            .device
+                            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                                label: Some(&self.name),
+                                entries: &layout_entries,
+                            })
+                    })
+                    .clone();
+        let pipeline_layout = cached
                     .dynamic_pipeline_layout
                     .get_or_init(|| {
                         cache
@@ -325,20 +452,7 @@ impl DirectKernel {
                             })
                     })
                     .clone();
-
-                Some(PreparedDirectDispatch {
-                    steps: vec![PreparedDirectDispatchStep {
-                        pipeline,
-                        bind_group,
-                        dispatch_size: self.dispatch_size,
-                    }],
-                    _buffers: bindings
-                        .iter()
-                        .map(|binding| binding.buffer.clone())
-                        .collect(),
-                })
-            }
-        }
+        (bind_group_layout, pipeline)
     }
 
     pub fn bindings_for_test(&self) -> Vec<DirectKernelBinding> {
@@ -444,13 +558,16 @@ impl DirectKernel {
                     bindings,
                 }
             }
-            DirectKernelKind::Storage3 { pipeline, .. } => {
+            DirectKernelKind::Storage3 {
+                pipeline, cached, ..
+            } => {
                 let input = new[*cursor].clone();
                 let weight = new[*cursor + 1].clone();
                 let output = new[*cursor + 2].clone();
                 *cursor += 3;
                 DirectKernelKind::Storage3 {
                     pipeline: pipeline.clone(),
+                    cached: cached.clone(),
                     input,
                     weight,
                     output,
@@ -506,13 +623,14 @@ impl DirectKernelTemplate {
                     bindings,
                 }
             }
-            DirectKernelTemplateKind::Storage3 { pipeline } => {
+            DirectKernelTemplateKind::Storage3 { pipeline, cached } => {
                 let input = new[*cursor].clone();
                 let weight = new[*cursor + 1].clone();
                 let output = new[*cursor + 2].clone();
                 *cursor += 3;
                 DirectKernelKind::Storage3 {
                     pipeline: pipeline.clone(),
+                    cached: cached.clone(),
                     input,
                     weight,
                     output,

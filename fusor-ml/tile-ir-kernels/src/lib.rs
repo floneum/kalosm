@@ -18,9 +18,10 @@ pub use kernels::{
     qgemv_workgroup_storage_f16_with_epilogue, qgemv_workgroup_with_epilogue,
     qmatmul_with_epilogue, qmatmul_workgroup_f16_with_epilogues,
     qmatmul_workgroup_storage_f16_with_epilogues, qmatmul_workgroup_with_epilogues,
-    quantized_matrix, quantized_matrix_for, split_k_combine, try_batched_coop_matmul,
-    try_batched_coop_matmul_split_k, AccumCast, DenseCoopMatmulConfig, DenseCoopMatmulTile,
-    DenseMatmulShape, DenseMatmulTensors, IntoQgemvEpilogues,
+    merged_split_k_combine, quantized_matrix, quantized_matrix_for, split_k_combine,
+    try_batched_coop_matmul, try_batched_coop_matmul_split_k, try_merged_coop_matmul,
+    AccumCast, DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulShape,
+    DenseMatmulTensors, IntoQgemvEpilogues,
 };
 pub use types::{
     cooperative_store_layout_supported, DenseMatmulEpilogues, QmatmulEpilogues, QmatmulExtra,

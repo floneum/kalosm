@@ -18,11 +18,8 @@ impl Resolver {
     ) -> (ResolverResult, T) {
         let host_trace =
             cfg!(target_arch = "wasm32") || std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some();
-        let host_category_trace = std::env::var_os("FUSOR_TRACE_RESOLVE_HOST_CATEGORIES").is_some();
         let host_total_start = host_trace.then(Instant::now);
         let mut host_profile = ResolveHostProfile::default();
-        let mut host_category_profile =
-            FxHashMap::<&'static str, ResolveHostCategoryProfile>::default();
         let device = graph.device();
         let max_subgroup_size = device.max_subgroup_size();
 
@@ -83,6 +80,8 @@ impl Resolver {
 
         {
             let start = host_trace.then(Instant::now);
+            let mut merger =
+                merge_horizontal::HorizontalMerger::new(self.horizontal_merge, &device);
             for idx in sorted_nodes {
                 let node = &self.execution_graph[idx];
                 // Handle Tensor caching explicitly here
@@ -96,10 +95,10 @@ impl Resolver {
                     continue;
                 }
 
-                if let Some(op) = self.lower_node(idx, node) {
-                    queued_operations.push((node.inner_idx, op));
-                }
+                let lowered = self.lower_node(idx, node);
+                merger.push(node, lowered, &mut queued_operations);
             }
+            merger.finish(&mut queued_operations);
             if let Some(start) = start {
                 host_profile.queue_lowering += start.elapsed();
             }
@@ -149,342 +148,41 @@ impl Resolver {
         let mut dispatch_categories = FxHashMap::<String, usize>::default();
         let mut dispatch_names = FxHashMap::<String, usize>::default();
         let plan_cache_enabled = device.kernel_cache().direct_plan_cache().enabled();
-        for (node, queued_operation) in queued_operations {
-            let operation_category = host_category_trace
-                .then(|| {
-                    graph
-                        .nodes
-                        .nodes
-                        .node_weight(node)
-                        .map(|node| node_category_inner(&node.variant))
-                })
-                .flatten();
-            // A view that composes with its input's buffer layout isn't a
-            // kernel. Resolve it immediately as a zero-cost buffer view;
-            // anything else (fill regions, non-composable reshapes) falls
-            // through to the gather kernel below.
-            let view_result = if let Some(node_data) = graph.nodes.nodes.node_weight(node) {
-                match &node_data.variant {
-                    ComputeGraphNodeVariant::View(view) => graph
-                        .get_cached_result(view.input)
-                        .and_then(|input| view.try_map_tensor(input)),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            if let Some(result) = view_result {
-                let start = host_trace.then(Instant::now);
-                if let Some(recorder) = &self.recorder {
-                    let mut deps = Vec::new();
-                    graph.visit_dependencies(node, &mut |dep| deps.push(dep));
-                    recorder
-                        .borrow_mut()
-                        .record_view_alias(node, &result, &deps);
-                }
-                // Cache the result
-                graph.set_cached_result(node, result);
-                // Map-layout nodes are resolved immediately — release any
-                // input buffers that are no longer needed.
-                // Use graph.visit_dependencies for map_layout since they
-                // are not lowered to Operations.
-                Self::release_dead_intermediates_from_graph(
-                    graph,
-                    &[node],
-                    &mut remaining_consumers,
-                    &target_set,
-                );
-                if let Some(start) = start {
-                    host_profile.map_layout += start.elapsed();
-                }
-            } else {
-                let slice_copy = graph.nodes.nodes.node_weight(node).and_then(|node_data| {
-                    let ComputeGraphNodeVariant::Assign(slice_assign) = &node_data.variant else {
-                        return None;
-                    };
-                    Self::try_prepare_in_place_slice_assign_copy(graph, slice_assign)
-                });
-                if let Some((output, copies)) = slice_copy {
-                    if let Some(recorder) = &self.recorder {
-                        recorder
-                            .borrow_mut()
-                            .record_copy_assign(node, &output, &queued_operation);
-                    }
-                    graph.set_cached_result(node, output);
-                    commands.extend(copies.into_iter().map(CommandRecord::CopyBuffer));
-                    let start = host_trace.then(Instant::now);
-                    Self::release_dead_intermediates(
-                        graph,
-                        &[&queued_operation],
-                        &mut remaining_consumers,
-                        &target_set,
-                    );
-                    if let Some(start) = start {
-                        host_profile.release += start.elapsed();
-                    }
-                    continue;
-                }
-
-                let start = host_trace.then(Instant::now);
-                let new_inputs = queued_operation.inputs(graph);
-                if let Some(start) = start {
-                    let elapsed = start.elapsed();
-                    host_profile.inputs += elapsed;
-                    if let Some(category) = operation_category {
-                        host_category_profile.entry(category).or_default().inputs += elapsed;
-                    }
-                }
-                if let QueuedOperation::QMatMul(qmatmul) = &queued_operation {
-                    if let Some(recorder) = &self.recorder {
-                        // Quantized matmuls are never part of a flush plan
-                        // (decode graphs are excluded before recording arms;
-                        // this is belt-and-braces).
-                        recorder.borrow_mut().poison();
-                    }
-                    let start = host_trace.then(Instant::now);
-                    let result = qmatmul.output(graph, &new_inputs);
-                    let MirValue::Tensor(resolved) = result else {
-                        panic!("QMatMul output value is not a tensor");
-                    };
-                    graph.set_cached_result(node, resolved.clone());
-                    if let Some(start) = start {
-                        let elapsed = start.elapsed();
-                        host_profile.output += elapsed;
-                        if let Some(category) = operation_category {
-                            host_category_profile.entry(category).or_default().output += elapsed;
-                        }
-                    }
-
-                    let start = host_trace.then(Instant::now);
-                    let constraints = qmatmul.workgroup_shape_constraints(&device);
-                    let workgroup_shape = constraints
-                        .solve(max_subgroup_size, &device.limits())
-                        .unwrap_or_else(|| {
-                        panic!(
-                            "Failed to find a valid qmatmul workgroup shape for constraints {constraints:?}"
-                        )
-                    });
-                    if let Some(start) = start {
-                        let elapsed = start.elapsed();
-                        host_profile.workgroup += elapsed;
-                        if let Some(category) = operation_category {
-                            host_category_profile.entry(category).or_default().workgroup += elapsed;
-                        }
-                    }
-
-                    let start = host_trace.then(Instant::now);
-                    let build_kernels = || {
-                        qmatmul
-                            .build_direct_kernels(graph, &workgroup_shape, &new_inputs)
-                            .unwrap_or_else(|error| panic!("{error}"))
-                            .into_kernels()
-                    };
-                    let kernels = if plan_cache_enabled {
-                        let kernel_key =
-                            structural_kernel_key(qmatmul.as_ref(), &new_inputs, &workgroup_shape);
-                        resolve_cached_direct_plan(
-                            device.kernel_cache().direct_plan_cache(),
-                            kernel_key,
-                            direct_plan_binding_buffers(&new_inputs),
-                            build_kernels,
-                        )
-                    } else {
-                        build_kernels()
-                    };
-                    if let Some(start) = start {
-                        let elapsed = start.elapsed();
-                        host_profile.build_kernel += elapsed;
-                        if let Some(category) = operation_category {
-                            let profile = host_category_profile.entry(category).or_default();
-                            profile.count += kernels.len();
-                            profile.build_kernel += elapsed;
-                        }
-                    }
-
-                    for direct_kernel in kernels {
-                        let start = host_trace.then(Instant::now);
-                        if let Some(dispatch) =
-                            direct_kernel.prepare_dispatch(device.kernel_cache())
-                        {
-                            let name = direct_kernel.name().to_string();
-                            if let Some(start) = start {
-                                let elapsed = start.elapsed();
-                                host_profile.prepare_dispatch += elapsed;
-                                if let Some(category) = operation_category {
-                                    host_category_profile
-                                        .entry(category)
-                                        .or_default()
-                                        .prepare_dispatch += elapsed;
-                                }
-                            }
-                            let category = collect_dispatch_metadata.then(|| {
-                                let category = dispatch_category(&name);
-                                if trace {
-                                    *dispatch_categories.entry(category.clone()).or_default() += 1;
-                                    if trace_names {
-                                        *dispatch_names.entry(name.clone()).or_default() += 1;
-                                    }
-                                }
-                                category
-                            });
-                            commands.push(CommandRecord::Dispatch(DispatchRecord {
-                                dispatch,
-                                name,
-                                category,
-                            }));
-                        } else if let Some(start) = start {
-                            let elapsed = start.elapsed();
-                            host_profile.prepare_dispatch += elapsed;
-                            if let Some(category) = operation_category {
-                                host_category_profile
-                                    .entry(category)
-                                    .or_default()
-                                    .prepare_dispatch += elapsed;
-                            }
-                        }
-                    }
-
-                    let start = host_trace.then(Instant::now);
-                    Self::release_dead_intermediates(
-                        graph,
-                        &[&queued_operation],
-                        &mut remaining_consumers,
-                        &target_set,
-                    );
-                    if let Some(start) = start {
-                        host_profile.release += start.elapsed();
-                    }
-                    continue;
-                }
-
-                let QueuedOperation::Generic(operation) = &queued_operation else {
-                    unreachable!("qmatmul resolver arm returned above");
-                };
-                let start = host_trace.then(Instant::now);
-                let result = operation.output(graph, &new_inputs);
-                let MirValue::Tensor(resolved) = result else {
-                    panic!("Kernel input value is not a tensor");
-                };
-                graph.set_cached_result(node, resolved.clone());
-                if let Some(start) = start {
-                    let elapsed = start.elapsed();
-                    host_profile.output += elapsed;
-                    if let Some(category) = operation_category {
-                        host_category_profile.entry(category).or_default().output += elapsed;
-                    }
-                }
-
-                let start = host_trace.then(Instant::now);
-                let constraints = operation.workgroup_shape_constraints(&device);
-                let workgroup_shape = constraints
-                    .solve(max_subgroup_size, &device.limits())
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Failed to find a valid workgroup shape for constraints {constraints:?}"
-                        )
-                    });
-                if let Some(start) = start {
-                    let elapsed = start.elapsed();
-                    host_profile.workgroup += elapsed;
-                    if let Some(category) = operation_category {
-                        host_category_profile.entry(category).or_default().workgroup += elapsed;
-                    }
-                }
-                let start = host_trace.then(Instant::now);
-                let build_kernels = || {
-                    vec![
-                        operation
-                            .build_direct_kernel(graph, &workgroup_shape, &new_inputs)
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "operation did not provide a direct kernel: {}",
-                                    operation.name()
-                                )
-                            }),
-                    ]
-                };
-                let kernels = if plan_cache_enabled {
-                    let kernel_key =
-                        structural_kernel_key(operation.as_ref(), &new_inputs, &workgroup_shape);
-                    resolve_cached_direct_plan(
-                        device.kernel_cache().direct_plan_cache(),
-                        kernel_key,
-                        direct_plan_binding_buffers(&new_inputs),
-                        build_kernels,
-                    )
-                } else {
-                    build_kernels()
-                };
-                if let Some(start) = start {
-                    let elapsed = start.elapsed();
-                    host_profile.build_kernel += elapsed;
-                    if let Some(category) = operation_category {
-                        let profile = host_category_profile.entry(category).or_default();
-                        profile.count += kernels.len();
-                        profile.build_kernel += elapsed;
-                    }
-                }
-                if let Some(recorder) = &self.recorder {
-                    recorder.borrow_mut().record_dispatch(
-                        node,
-                        &kernels,
-                        &resolved,
-                        &queued_operation,
-                    );
-                }
-                for direct_kernel in kernels {
-                    let start = host_trace.then(Instant::now);
-                    if let Some(dispatch) = direct_kernel.prepare_dispatch(device.kernel_cache()) {
-                        let name = direct_kernel.name().to_string();
-                        if let Some(start) = start {
-                            let elapsed = start.elapsed();
-                            host_profile.prepare_dispatch += elapsed;
-                            if let Some(category) = operation_category {
-                                host_category_profile
-                                    .entry(category)
-                                    .or_default()
-                                    .prepare_dispatch += elapsed;
-                            }
-                        }
-                        let category = collect_dispatch_metadata.then(|| {
-                            let category = dispatch_category(&name);
-                            if trace {
-                                *dispatch_categories.entry(category.clone()).or_default() += 1;
-                                if trace_names {
-                                    *dispatch_names.entry(name.clone()).or_default() += 1;
-                                }
-                            }
-                            category
-                        });
-                        commands.push(CommandRecord::Dispatch(DispatchRecord {
-                            dispatch,
-                            name,
-                            category,
-                        }));
-                    } else if let Some(start) = start {
-                        let elapsed = start.elapsed();
-                        host_profile.prepare_dispatch += elapsed;
-                        if let Some(category) = operation_category {
-                            host_category_profile
-                                .entry(category)
-                                .or_default()
-                                .prepare_dispatch += elapsed;
-                        }
-                    }
-                }
-                let start = host_trace.then(Instant::now);
-                Self::release_dead_intermediates(
-                    graph,
-                    &[&queued_operation],
-                    &mut remaining_consumers,
-                    &target_set,
-                );
-                if let Some(start) = start {
-                    host_profile.release += start.elapsed();
-                }
-            };
+        // Every graph takes the three-phase queue runner: serial input
+        // gathering, parallel kernel building, serial recording/encoding.
+        // Horizontal merging stays gated on the dense large-graph optimizer,
+        // so small and decode graphs get the parallel builds with
+        // byte-identical standalone kernels.
+        let mut ledger =
+            super::alloc_reuse::BufferLedger::new(&device, Some(&remaining_consumers));
+        if let Some(recorder) = &self.recorder {
+            ledger.register_recorder_pins(recorder.borrow().pinned_ptrs());
         }
-
+        self.run_dense_queue(
+                graph,
+                &device,
+                max_subgroup_size,
+                queued_operations,
+                &mut remaining_consumers,
+                &target_set,
+                &mut ledger,
+                plan_cache_enabled,
+                &mut commands,
+                &mut host_profile,
+                host_trace,
+                &mut |name: &str| {
+                    collect_dispatch_metadata.then(|| {
+                        let category = dispatch_category(name);
+                        if trace {
+                            *dispatch_categories.entry(category.clone()).or_default() += 1;
+                            if trace_names {
+                                *dispatch_names.entry(name.to_string()).or_default() += 1;
+                            }
+                        }
+                        category
+                    })
+                },
+        );
         let total_kernels = commands
             .iter()
             .filter(|command| matches!(command, CommandRecord::Dispatch(_)))
@@ -731,9 +429,6 @@ impl Resolver {
 
         if let Some(start) = host_total_start {
             host_profile.print(start.elapsed(), queued_operation_count, total_kernels);
-            if host_category_trace {
-                print_host_category_profile(host_category_profile);
-            }
         }
         (
             ResolverResult {
@@ -745,8 +440,8 @@ impl Resolver {
     }
 }
 
-fn resolve_cached_direct_plan(
-    plan_cache: &fusor_tile_ir_runtime::DirectPlanCache,
+pub(super) fn resolve_cached_direct_plan(
+    kernel_cache: &fusor_tile_ir_runtime::KernelCache,
     cache_key: crate::mir::kernel_backend::KernelCacheKey,
     binding_buffers: Vec<Vec<std::sync::Arc<wgpu::Buffer>>>,
     build: impl FnOnce() -> Vec<crate::mir::kernel_backend::DirectKernel>,
@@ -755,14 +450,17 @@ fn resolve_cached_direct_plan(
         .iter()
         .map(Vec::as_slice)
         .collect::<Vec<_>>();
-    plan_cache
-        .try_get_or_insert_many(cache_key, &binding_slices, || {
+    kernel_cache
+        .direct_plan_cache()
+        .try_get_or_insert_many(kernel_cache, cache_key, &binding_slices, || {
             Ok::<_, std::convert::Infallible>(build())
         })
         .expect("infallible direct plan cache build failed")
 }
 
-fn direct_plan_binding_buffers(inputs: &[MirValue]) -> Vec<Vec<std::sync::Arc<wgpu::Buffer>>> {
+pub(super) fn direct_plan_binding_buffers(
+    inputs: &[MirValue],
+) -> Vec<Vec<std::sync::Arc<wgpu::Buffer>>> {
     let buffers = inputs
         .iter()
         .filter_map(|input| match input {

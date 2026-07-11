@@ -38,6 +38,60 @@ const TEMPERATURE: f32 = 0.8;
 const DATA_URL: &str =
     "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
 
+#[derive(Clone, Copy)]
+struct RunConfig {
+    steps: usize,
+    min_steps_per_second: Option<f64>,
+    skip_eval: bool,
+    progress_every: usize,
+    trace_host: bool,
+    trace_resolve: bool,
+    trace_names: bool,
+}
+
+impl RunConfig {
+    fn from_args() -> Self {
+        let mut config = Self {
+            steps: STEPS,
+            min_steps_per_second: None,
+            skip_eval: false,
+            progress_every: 100,
+            trace_host: false,
+            trace_resolve: false,
+            trace_names: false,
+        };
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--steps" => {
+                    let value = args.next().expect("--steps requires a value");
+                    config.steps = value.parse().expect("--steps must be a positive integer");
+                }
+                "--min-steps-per-sec" | "--min-steps-per-second" => {
+                    let value = args.next().expect("--min-steps-per-sec requires a value");
+                    config.min_steps_per_second =
+                        Some(value.parse().expect("--min-steps-per-sec must be a number"));
+                }
+                "--skip-eval" => config.skip_eval = true,
+                "--progress-every" => {
+                    let value = args.next().expect("--progress-every requires a value");
+                    config.progress_every =
+                        value.parse().expect("--progress-every must be a non-negative integer");
+                }
+                "--trace-host" => config.trace_host = true,
+                "--trace-resolve" => config.trace_resolve = true,
+                "--trace-names" => {
+                    config.trace_resolve = true;
+                    config.trace_names = true;
+                }
+                _ => panic!("unknown argument: {arg}"),
+            }
+        }
+        assert!(config.steps > 0, "--steps must be greater than zero");
+        config
+    }
+}
+
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/data")
 }
@@ -371,11 +425,7 @@ fn causal_mask(device: &Device, seq: usize) -> RawTensor<2, f32> {
 /// Numerically stable softmax cross-entropy averaged over all positions:
 /// log softmax via log-sum-exp so a saturated class cannot underflow.
 fn cross_entropy(logits: &Tensor<2>, targets: &RawTensor<1, u32>) -> Tensor<0> {
-    let batch = logits.shape()[0];
-    let shifted = logits.sub_::<2, 2>(&logits.max_keepdim::<1>(1));
-    let log_sum_exp = shifted.exp().sum_keepdim(1).log();
-    let label_log_probs = shifted.sub_::<2, 2>(&log_sum_exp).gather_last(targets);
-    label_log_probs.sum().mul_scalar(-1.0 / batch as f32)
+    logits.softmax_cross_entropy(targets)
 }
 
 /// First and second moment estimates for one parameter tensor, stored flat
@@ -387,9 +437,10 @@ struct AdamState {
 
 impl AdamState {
     fn zeros(device: &Device, elements: usize) -> Self {
+        let zeros = vec![0.0; elements];
         Self {
-            momentum: RawTensor::zeros(device, [elements]),
-            variance: RawTensor::zeros(device, [elements]),
+            momentum: RawTensor::from_slice(device, [elements], &zeros),
+            variance: RawTensor::from_slice(device, [elements], &zeros),
         }
     }
 }
@@ -418,7 +469,9 @@ fn adam_step<const R: usize>(
         .momentum
         .mul_(lr)
         .div_(&state.variance.sqrt().add_scalar(EPSILON).to_concrete());
-    *param = (param.clone() - update.reshape(shape)).to_concrete();
+    *param = (param.clone().reshape([elements]) - update)
+        .reshape(shape)
+        .to_concrete();
 }
 
 /// Pick `batch_size` random windows and return (inputs, next-char targets),
@@ -492,9 +545,17 @@ async fn generate(
 
 #[tokio::main]
 async fn main() {
-    if std::env::var_os("RUST_LOG").is_some() {
+    let config = RunConfig::from_args();
+    if std::env::var_os("RUST_LOG").is_some() || config.trace_host || config.trace_resolve {
+        let env_filter = if std::env::var_os("RUST_LOG").is_some() {
+            tracing_subscriber::EnvFilter::from_default_env()
+        } else {
+            tracing_subscriber::EnvFilter::new(
+                "fusor_core::compute_graph::resolve=info,fusor_tile_ir_runtime::plan_cache=warn",
+            )
+        };
         tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_env_filter(env_filter)
             .init();
     }
     let text = fetch_text();
@@ -523,6 +584,20 @@ async fn main() {
             Device::cpu()
         }
     };
+    if config.trace_host || config.trace_resolve {
+        // SAFETY: this example sets resolver trace flags before building any
+        // training graph; the flags are read by Fusor during subsequent
+        // single-threaded graph resolution.
+        unsafe {
+            std::env::set_var("FUSOR_TRACE_RESOLVE_HOST", "1");
+            if config.trace_resolve {
+                std::env::set_var("FUSOR_TRACE_RESOLVE", "1");
+            }
+            if config.trace_names {
+                std::env::set_var("FUSOR_TRACE_DECODE_NAMES", "1");
+            }
+        }
+    }
 
     let mut params = Params::new(&device, vocab.len());
     let (mut adam1, mut adam2) = {
@@ -545,57 +620,75 @@ async fn main() {
 
     let mut rng = Lcg(7);
     let start = std::time::Instant::now();
-    for step in 0..STEPS {
-        let (inputs, targets) = sample_batch(train_tokens, &mut rng, BATCH_SIZE);
-        let inputs = RawTensor::from_slice(&device, [BATCH_SIZE, CONTEXT], &inputs);
-        let targets = RawTensor::from_slice(&device, [BATCH_SIZE * CONTEXT], &targets);
+    for step in 0..config.steps {
+        {
+            let (inputs, targets) = sample_batch(train_tokens, &mut rng, BATCH_SIZE);
+            let inputs = RawTensor::from_slice(&device, [BATCH_SIZE, CONTEXT], &inputs);
+            let targets = RawTensor::from_slice(&device, [BATCH_SIZE * CONTEXT], &targets);
 
-        let graph = Graph::new();
-        let model = Gpt::new(&graph, &params, true);
-        let mask = Tensor::constant_from_raw(&graph, mask.clone());
-        let logits = model.forward(&inputs, &positions, &mask);
-        let flat_logits = logits.reshape([BATCH_SIZE * CONTEXT, vocab.len()]);
-        let loss = cross_entropy(&flat_logits, &targets);
+            let graph = Graph::new();
+            let model = Gpt::new(&graph, &params, true);
+            let mask = Tensor::constant_from_raw(&graph, mask.clone());
+            let logits = model.forward(&inputs, &positions, &mask);
+            let flat_logits = logits.reshape([BATCH_SIZE * CONTEXT, vocab.len()]);
+            let loss = cross_entropy(&flat_logits, &targets);
 
-        // Gradients stay lazy: no per-step readback. The whole step
-        // (forward, backward, and the optimizer updates below) is submitted
-        // to the GPU by the flush at the bottom of the loop.
-        let gradients = loss.backward().unwrap();
+            // Gradients stay lazy: no per-step readback. The whole step
+            // (forward, backward, and the optimizer updates below) is submitted
+            // to the GPU by the flush after step-local temporaries are dropped.
+            let gradients = loss.backward().unwrap();
 
-        // Adam with warmup and bias correction folded into the learning rate.
-        let t = step as i32 + 1;
-        let warmup = (STEPS / 10).max(1);
-        let lr_value = LEARNING_RATE
-            * ((step + 1) as f32 / warmup as f32).min(1.0)
-            * (1.0 - BETA2.powi(t)).sqrt()
-            / (1.0 - BETA1.powi(t));
-        let lr = RawTensor::from_slice(&device, [1], &[lr_value]);
-        let (leaves1, leaves2) = model.leaves();
-        let (tensors1, tensors2) = params.tensors_mut();
-        for ((param, state), leaf) in tensors1.into_iter().zip(&mut adam1).zip(leaves1) {
-            adam_step(param, state, gradients.get(leaf).expect("missing gradient"), &lr);
+            // Adam with warmup and bias correction folded into the learning rate.
+            let t = step as i32 + 1;
+            let warmup = (config.steps / 10).max(1);
+            let lr_value = LEARNING_RATE
+                * ((step + 1) as f32 / warmup as f32).min(1.0)
+                * (1.0 - BETA2.powi(t)).sqrt()
+                / (1.0 - BETA1.powi(t));
+            let lr = RawTensor::from_slice(&device, [1], &[lr_value]);
+            let (leaves1, leaves2) = model.leaves();
+            let (tensors1, tensors2) = params.tensors_mut();
+            for ((param, state), leaf) in tensors1.into_iter().zip(&mut adam1).zip(leaves1) {
+                adam_step(param, state, gradients.get(leaf).expect("missing gradient"), &lr);
+            }
+            for ((param, state), leaf) in tensors2.into_iter().zip(&mut adam2).zip(leaves2) {
+                adam_step(param, state, gradients.get(leaf).expect("missing gradient"), &lr);
+            }
+
+            if config.progress_every != 0
+                && (step % config.progress_every == 0 || step + 1 == config.steps)
+            {
+                // Reading the loss synchronizes with the GPU; only do it when
+                // printing progress.
+                let loss_value = to_scalar(loss.raw().clone()).await;
+                println!("step {step}/{}: loss {loss_value:.4}", config.steps);
+            }
         }
-        for ((param, state), leaf) in tensors2.into_iter().zip(&mut adam2).zip(leaves2) {
-            adam_step(param, state, gradients.get(leaf).expect("missing gradient"), &lr);
-        }
 
-        if step % 100 == 0 || step + 1 == STEPS {
-            // Reading the loss synchronizes with the GPU; only do it when
-            // printing progress.
-            let loss_value = to_scalar(loss.raw().clone()).await;
-            println!("step {step}/{STEPS}: loss {loss_value:.4}");
-        } else {
-            // Submit the step's work without waiting for the GPU: keeps the
-            // pending graph bounded while the host races ahead.
-            device.flush();
-        }
+        // Submit the parameter updates after step-local forward/backward
+        // handles have dropped, so the flush target set excludes dead
+        // temporaries such as loss, logits, and gradient views.
+        device.flush();
     }
     let elapsed = start.elapsed();
+    let steps_per_second = config.steps as f64 / elapsed.as_secs_f64();
     println!(
-        "trained {STEPS} steps ({} tokens) in {elapsed:.2?} ({:.1} steps/s)",
-        STEPS * BATCH_SIZE * CONTEXT,
-        STEPS as f64 / elapsed.as_secs_f64(),
+        "trained {} steps ({} tokens) in {elapsed:.2?} ({steps_per_second:.1} steps/s)",
+        config.steps,
+        config.steps * BATCH_SIZE * CONTEXT,
     );
+
+    if let Some(min_steps_per_second) = config.min_steps_per_second
+        && steps_per_second < min_steps_per_second
+    {
+        panic!(
+            "transformer throughput {steps_per_second:.1} steps/s below required {min_steps_per_second:.1}"
+        );
+    }
+
+    if config.skip_eval {
+        return;
+    }
 
     // Validation loss over held-out batches.
     const VAL_BATCHES: usize = 10;

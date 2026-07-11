@@ -799,6 +799,7 @@ fn cached_qmatmul_direct_kernel(
         kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
             kernel_name.to_owned(),
             pipeline,
+            None,
             input.buffer().clone(),
             matrix.buffer().clone(),
             output.buffer().clone(),
@@ -855,7 +856,7 @@ fn qmatmul_direct_kernel_from_ir(
     ) {
         return Some(kernel);
     }
-    let pipeline = kernel_backend::three_buffer_pipeline_from_ir(
+    let (pipeline, cached) = kernel_backend::three_buffer_pipeline_from_ir(
         device.kernel_cache(),
         &kernel_name,
         cache_key,
@@ -870,6 +871,7 @@ fn qmatmul_direct_kernel_from_ir(
         kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
             kernel_name,
             pipeline,
+            Some(cached),
             input.buffer().clone(),
             matrix.buffer().clone(),
             output.buffer().clone(),

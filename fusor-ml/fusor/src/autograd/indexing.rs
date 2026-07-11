@@ -95,6 +95,57 @@ impl Tensor<2> {
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
+    /// Numerically stable softmax cross-entropy against integer class
+    /// targets, averaged over rows: `mean_i(LSE(x_i) - x_i[t_i])` with the
+    /// log-sum-exp max-shifted. The backward is analytic —
+    /// `dlogits = (softmax(x) - onehot(t)) * grad / rows` — so the whole
+    /// loss runs in a handful of fused kernels instead of a taped chain.
+    pub fn softmax_cross_entropy(&self, targets: &RawTensor<1, u32>) -> Tensor<0> {
+        let [rows, width] = self.shape();
+        assert_eq!(
+            targets.shape()[0],
+            rows,
+            "softmax_cross_entropy expects one target per row"
+        );
+        let device = self.value.device();
+        let logits = self.value.clone();
+
+        // Forward: the shifted exp-sum chain is exclusively consumed, so it
+        // fuses into one row program; the label logits gather reads the raw
+        // logits directly.
+        let max = logits.max_keepdim::<1>(1);
+        let shifted_exp = (&logits - &max.broadcast_as([rows, width]))
+            .to_concrete()
+            .exp()
+            .to_concrete();
+        let lse_total = (shifted_exp.sum_keepdim::<1>(1).to_concrete().log().to_concrete() + max)
+            .to_concrete();
+        let row_offsets: Vec<u32> = (0..rows).map(|row| (row * width) as u32).collect();
+        let row_offsets: RawTensor<1, u32> = RawTensor::from_slice(&device, [rows], &row_offsets);
+        let linear = (row_offsets + targets.clone()).to_concrete();
+        let flat = logits.reshape([rows * width]).to_concrete();
+        let picked = flat.index_select(0, &linear).to_concrete();
+        let per_row = (lse_total.reshape([rows]).to_concrete() - picked).to_concrete();
+        let value = (per_row.sum::<0>(0) * (1.0 / rows as f32)).to_concrete();
+
+        let input_id = self.handle.id;
+        let logits_value = self.value.clone();
+        let targets = targets.clone();
+        let backward: BackwardRule = Arc::new(move |gradient| {
+            let grad = downcast_tensor::<0>(&*gradient, "softmax_cross_entropy")?;
+            let probs = logits_value.softmax_last_dim::<1>();
+            let one_hot = one_hot_matrix(&targets, width);
+            let scale = (grad.reshape([1, 1]).to_concrete() * (1.0 / rows as f32)).to_concrete();
+            let diff = (probs - one_hot).to_concrete();
+            let dlogits = (&diff * &scale.broadcast_as([rows, width])).to_concrete();
+            Ok(vec![BackwardTarget {
+                node: input_id,
+                gradient: Box::new(dlogits),
+            }])
+        });
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
+    }
+
     pub fn embedding(&self, indices: &RawTensor<2, u32>) -> Tensor<3> {
         let [rows, columns] = indices.shape();
         let width = self.shape()[1];

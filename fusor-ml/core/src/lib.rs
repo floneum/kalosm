@@ -41,6 +41,7 @@ mod pair_wise;
 mod quantized;
 mod rank;
 mod reduce;
+mod region;
 mod row_dispatch;
 mod row_program;
 mod sampling;

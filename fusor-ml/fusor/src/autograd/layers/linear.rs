@@ -62,7 +62,7 @@ impl Linear {
     /// Input shape: (batch, in_features)
     /// Output shape: (batch, out_features)
     pub fn forward_2d(&self, input: &Tensor<2>) -> Tensor<2> {
-        let output = input.mat_mul(&self.weight.t());
+        let output = input.mat_mul_transposed_rhs(&self.weight);
         if let Some(bias) = &self.bias {
             output.add_(bias)
         } else {

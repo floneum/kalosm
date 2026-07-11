@@ -11,6 +11,7 @@ pub mod sgemv;
 mod sgemv_params;
 mod variants;
 
+pub(crate) use kernel::{MatmulMergeKey, build_merged_matmul_kernel};
 pub(crate) use variants::CoopTile;
 use variants::select_dense_matmul_params;
 
@@ -146,6 +147,13 @@ pub(crate) struct MatMulOperation {
     pub(crate) pre_element_wise: [UnaryFunctionChain; 2],
     pub(crate) post_element_wise: UnaryFunctionChain,
     pub(crate) parameters: MatMulParams,
+    /// Dense-large-graph kernel tuning: wider split-K fan-out with
+    /// divisor-aligned spans and elided K bounds. Set only by
+    /// `optimize_large_graph`'s dense branch, so quantized-pipeline graphs
+    /// (decode f32 attention matmuls included) and small (conformance-
+    /// golden) graphs keep the exact committed split-K behavior. Hashed
+    /// into the split-K kernel cache key.
+    pub(crate) dense_codegen: bool,
 }
 
 impl Tensor {
@@ -483,5 +491,88 @@ mod selection_tests {
         assert_eq!(select(64, 64, 64, 512), Some(CoopTile::new(64, 64, 16)));
         assert_eq!(select(64, 512, 112, 512), Some(CoopTile::new(64, 128, 16)));
         assert_eq!(select(128, 1024, 64, 512), Some(CoopTile::new(128, 64, 16)));
+    }
+}
+
+#[cfg(test)]
+mod dense_split_k_tests {
+    //! GPU gates for the dense-large-graph split-K tuning
+    //! (`MatMulOperation::dense_codegen`): the wider divisor-aligned
+    //! fan-out and the elided-K-bounds kernel are unreachable from the
+    //! public tensor API (the flag is set only by `optimize_large_graph`'s
+    //! dense branch), so these tests set the flag directly and execute the
+    //! operation eagerly. `tests/small_tile_matmul.rs` covers the committed
+    //! (flag-unset) split-K behavior through the public API.
+
+    use super::MatMulOperation;
+    use crate::{Device, Tensor};
+
+    fn check_dense_split_k(m: usize, k: usize, n: usize) {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let values = |len: usize, freq: f32| -> Vec<f32> {
+                (0..len).map(|i| ((i as f32) * freq).sin()).collect()
+            };
+            let a_data = values(m * k, 0.13);
+            let b_data = values(k * n, 0.07);
+            let a = Tensor::from_slice(&device, [m, k], &a_data);
+            let b = Tensor::from_slice(&device, [k, n], &b_data);
+            a.data.materialize();
+            b.data.materialize();
+            let mut operation = MatMulOperation::new(
+                crate::DataTypeEnum::F32,
+                a.key(),
+                b.key(),
+                &[m, k],
+                &[k, n],
+                None,
+                &device,
+            );
+            operation.dense_codegen = true;
+            let Some(output) = device.compute_graph().execute_eager(&operation) else {
+                // Devices without cooperative matrices run the generic path;
+                // nothing dense-specific to gate there.
+                return;
+            };
+            let out: Tensor = Tensor::from(output);
+            let actual = out.as_slice::<2, f32>().await.unwrap();
+            for mi in 0..m {
+                for ni in 0..n {
+                    let mut acc = 0.0f64;
+                    for ki in 0..k {
+                        acc += a_data[mi * k + ki] as f64 * b_data[ki * n + ni] as f64;
+                    }
+                    let want = acc as f32;
+                    let got = actual[[mi, ni]];
+                    assert!(
+                        (got - want).abs() < 2e-3 + want.abs() * 1e-3,
+                        "m={m} k={k} n={n} [{mi}, {ni}]: got {got}, expected {want}"
+                    );
+                }
+            }
+        });
+    }
+
+    // The 64×2048×64 weight-gradient shape: K-tiles divide the fan-out, so
+    // the spans partition K exactly and the K bounds are elided (the vec4
+    // staging fast path).
+    #[test]
+    fn dense_split_k_elided_bounds() {
+        check_dense_split_k(64, 2048, 64);
+    }
+
+    // Ragged K (1000): no useful divisor alignment, the last span overruns
+    // the logical K extent and the bounds stay live under the dense flag.
+    #[test]
+    fn dense_split_k_ragged_k() {
+        check_dense_split_k(64, 1000, 64);
+    }
+
+    // Barely past the split gate (k = 520): short trailing spans idle.
+    #[test]
+    fn dense_split_k_short_spans() {
+        check_dense_split_k(64, 520, 64);
     }
 }

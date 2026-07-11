@@ -7,11 +7,12 @@
 
 mod buffer_pool;
 mod cache;
+mod disk_cache;
 mod direct_kernel;
 mod dispatch;
 mod plan_cache;
 
-pub use buffer_pool::BufferPool;
+pub use buffer_pool::{BufferPool, BufferPoolCounters};
 pub use cache::{
     CachedKernel, DirectDynamicBindGroupKey, KernelCache, KernelCacheKey, KernelVariantKey,
 };

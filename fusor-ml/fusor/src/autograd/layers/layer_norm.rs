@@ -62,12 +62,8 @@ impl LayerNorm<1> {
     ///
     /// Normalizes over the last dimension (features).
     pub fn forward(&self, input: &Tensor<3>) -> Tensor<3> {
-        let weight_broadcast = self.weight.broadcast_as(input.shape());
-        let bias_broadcast = self
-            .bias
-            .as_ref()
-            .map(|bias| bias.broadcast_as(input.shape()));
-        input.layer_norm::<2>(&weight_broadcast, bias_broadcast.as_ref(), self.eps, true)
+        // Route through the fused last-dim kernel (composite replay backward).
+        self.forward_fused(input)
     }
 
     /// Forward pass through the fused last-dim kernel (3D input).

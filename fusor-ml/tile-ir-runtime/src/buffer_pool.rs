@@ -2,7 +2,7 @@ use std::{
     num::NonZeroU64,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -69,6 +69,16 @@ fn prune_cached_buffers(buffers: &mut Vec<CachedBuffer>) {
     });
 }
 
+/// Cumulative allocation statistics for a [`BufferPool`]. `requested` counts
+/// every buffer handed out; `created` counts only the ones that missed the
+/// pool cache and hit the wgpu allocator. Snapshot before/after a step and
+/// diff to measure allocations per step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BufferPoolCounters {
+    pub requested: u64,
+    pub created: u64,
+}
+
 /// Per-device buffer pool keyed by `(size, usage)`. Reuses freed buffer
 /// storage so common tensor allocations skip the wgpu allocator.
 pub struct BufferPool {
@@ -78,6 +88,8 @@ pub struct BufferPool {
         RwLock<LruCache<(u64, BufferUsages), Vec<CachedBuffer>, FxBuildHasher>>,
     initialized_buffers_dirty: AtomicBool,
     initialized_buffer_keys: Mutex<Vec<(u64, BufferUsages)>>,
+    buffers_requested: AtomicU64,
+    buffers_created: AtomicU64,
 }
 
 impl std::fmt::Debug for BufferPool {
@@ -98,7 +110,29 @@ impl BufferPool {
             buffer_allocation_cache,
             initialized_buffers_dirty: AtomicBool::new(false),
             initialized_buffer_keys: Mutex::new(Vec::new()),
+            buffers_requested: AtomicU64::new(0),
+            buffers_created: AtomicU64::new(0),
         }
+    }
+
+    /// Snapshot the cumulative allocation counters.
+    pub fn counters(&self) -> BufferPoolCounters {
+        BufferPoolCounters {
+            requested: self.buffers_requested.load(Ordering::Relaxed),
+            created: self.buffers_created.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Whether `buffer` is one of the pool's tracked buffers in the
+    /// `(size, usage)` bucket — i.e. the pool holds its own strong clone of
+    /// it. Liveness accounting (allocation-reuse ledger) uses this to
+    /// enumerate the pool as an expected `Arc` holder. Read-only: does not
+    /// touch LRU order.
+    pub fn is_tracked(&self, size: u64, usage: BufferUsages, buffer: &Arc<wgpu::Buffer>) -> bool {
+        let cache = self.buffer_allocation_cache.read();
+        cache
+            .peek(&(size, usage))
+            .is_some_and(|buffers| buffers.iter().any(|c| Arc::ptr_eq(&c.buffer, buffer)))
     }
 
     /// Reset the initialized flag on all cached buffers.
@@ -161,9 +195,11 @@ impl BufferPool {
                 .store(true, Ordering::Release);
             self.initialized_buffer_keys.lock().push((size, usage));
         }
+        self.buffers_requested.fetch_add(1, Ordering::Relaxed);
         let buffer = self
             .get_cached_buffer(size, usage, to_initilize)
             .unwrap_or_else(|| {
+                self.buffers_created.fetch_add(1, Ordering::Relaxed);
                 let new_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Tensor Buffer"),
                     size,

@@ -140,6 +140,260 @@ fn build_nary_direct_kernel_with_output_index(
     )
 }
 
+struct MergedRegionKernelVariant;
+
+/// Bind a value tile into a register so later statements can reuse it
+/// without re-evaluating. Statement values are cast to a storable dtype
+/// before binding, so `Bool` never reaches here.
+/// For every tensor value across all segments (flattened), the index of its
+/// first occurrence — the cross-segment binding-sharing pattern.
+fn cross_segment_alias_classes<'a>(
+    segments: impl Iterator<Item = &'a [MaybeQData]>,
+) -> Vec<usize> {
+    let mut ptrs: Vec<usize> = Vec::new();
+    let mut classes = Vec::new();
+    for segment in segments {
+        for value in segment {
+            let ptr = match value {
+                MaybeQData::Tensor(tensor) => std::sync::Arc::as_ptr(tensor.buffer()) as usize,
+                MaybeQData::QMatrix(matrix) => std::sync::Arc::as_ptr(matrix.buffer()) as usize,
+            };
+            let class = ptrs.iter().position(|&p| p == ptr).unwrap_or(ptrs.len());
+            classes.push(class);
+            ptrs.push(ptr);
+        }
+    }
+    classes
+}
+
+fn bind_value_tile(
+    program: &mut tile_ir::tile::TileBlock<'_>,
+    value: ValueTile,
+) -> ValueTile {
+    match value {
+        ValueTile::F32(tile) => ValueTile::F32(program.bind(tile)),
+        ValueTile::F16(tile) => ValueTile::F16(program.bind(tile)),
+        ValueTile::U32(tile) => ValueTile::U32(program.bind(tile)),
+        ValueTile::Bool(_) => unreachable!("region statements are cast to storable dtypes"),
+    }
+}
+
+/// One kernel executing several independent multi-output regions: like
+/// [`build_merged_nary_kernel`], each segment owns a contiguous range of
+/// workgroups behind a uniform guard, but a segment's body is a statement
+/// chain — statement values stay in registers (the `extras` slots of
+/// [`eval_nary_expr`]) and every externally-live statement stores to its own
+/// output binding. Segment values are inputs-then-outputs.
+pub(crate) fn build_merged_region_kernel(
+    graph: &crate::compute_graph::ComputeGraphInner,
+    segments: &[crate::region::ElementwiseRegionOperation],
+    segment_inputs: &[Vec<MirValue>],
+) -> Option<DirectKernel> {
+    let device = graph.device();
+    let max_per_dim = device.limits().max_compute_workgroups_per_dimension;
+
+    struct Segment {
+        values: Vec<MaybeQData>,
+        /// Per output (relative index): the input slot whose buffer the
+        /// output writes in place, bound once as read-write.
+        fold: Vec<Option<usize>>,
+        elements: u32,
+        base: u32,
+        groups: u32,
+    }
+    let mut prepared = Vec::with_capacity(segments.len());
+    let mut total_groups = 0u32;
+    for (op, inputs) in segments.iter().zip(segment_inputs) {
+        let values = inputs
+            .iter()
+            .map(|input| MaybeQData::try_from(input.clone()).ok())
+            .collect::<Option<Vec<_>>>()?;
+        if values
+            .iter()
+            .any(|value| matches!(value, MaybeQData::QMatrix(_)))
+        {
+            return None;
+        }
+        if values.iter().any(|value| {
+            matches!(value, MaybeQData::Tensor(tensor)
+                if tensor.datatype() == DataTypeEnum::F16 && !device.f16_supported())
+        }) {
+            return None;
+        }
+        debug_assert_eq!(values.len(), op.inputs.len() + op.output_count());
+        let input_count = op.inputs.len();
+        let buffer_of = |value: &MaybeQData| match value {
+            MaybeQData::Tensor(tensor) => {
+                Some(std::sync::Arc::as_ptr(tensor.buffer()) as usize)
+            }
+            _ => None,
+        };
+        // An output sharing an input's buffer must bind it exactly once,
+        // read-write: wgpu rejects one buffer bound read-only and read-write
+        // in the same dispatch.
+        let fold: Vec<Option<usize>> = values[input_count..]
+            .iter()
+            .map(|output| {
+                let output_ptr = buffer_of(output)?;
+                values[..input_count]
+                    .iter()
+                    .position(|input| buffer_of(input) == Some(output_ptr))
+            })
+            .collect();
+        let elements = total_elements(&op.shape)?;
+        let groups = elements.div_ceil(BLOCK as u32);
+        prepared.push(Segment {
+            values,
+            fold,
+            elements,
+            base: total_groups,
+            groups,
+        });
+        total_groups = total_groups.checked_add(groups)?;
+    }
+
+    let dispatch_size = crate::visit_tiled::distribute_workgroups(total_groups, max_per_dim);
+    let cache_key = kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
+        kernel_backend::KernelVariantKey::of::<MergedRegionKernelVariant>().hash(state);
+        dispatch_size.hash(state);
+        segments.len().hash(state);
+        for ((op, inputs), segment) in segments.iter().zip(segment_inputs).zip(&prepared) {
+            op.hash_kernel_fields(state);
+            segment.fold.hash(state);
+            inputs.len().hash(state);
+            for input in inputs {
+                crate::mir::operation::hash_mir_value(state, input);
+            }
+        }
+        // Shared read-only inputs bind once across segments; the sharing
+        // pattern changes the generated bindings, so it keys the kernel.
+        for class in
+            cross_segment_alias_classes(prepared.iter().map(|segment| segment.values.as_slice()))
+        {
+            class.hash(state);
+        }
+    });
+    let name = if std::env::var_os("FUSOR_TRACE_DECODE_NAMES").is_some() {
+        format!(
+            "merged_region[{}]",
+            segments
+                .iter()
+                .map(|op| op.name())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    } else {
+        format!("merged_region_x{}", segments.len())
+    };
+
+    kernel_backend::run_kernel(
+        device.kernel_cache(),
+        name,
+        cache_key,
+        dispatch_size,
+        move |kb| {
+            let mut declared = Vec::with_capacity(prepared.len());
+            // Read-only inputs shared across segments (a learning-rate
+            // tensor read by every optimizer segment) bind once: wgpu
+            // rejects one buffer bound at several slots of a dispatch, and
+            // one binding is cheaper anyway.
+            let mut shared_reads: Vec<(usize, DataTypeEnum, Storage2, TensorMeta)> = Vec::new();
+            for (op, segment) in segments.iter().zip(&prepared) {
+                let input_count = op.inputs.len();
+                let folded_inputs: rustc_hash::FxHashSet<usize> =
+                    segment.fold.iter().flatten().copied().collect();
+                let mut storages: Vec<Storage2> = Vec::with_capacity(segment.values.len());
+                let mut metas: Vec<TensorMeta> = Vec::with_capacity(segment.values.len());
+                for (binding, value) in segment.values.iter().enumerate() {
+                    if binding >= input_count
+                        && let Some(source) = segment.fold[binding - input_count]
+                    {
+                        storages.push(storages[source].clone());
+                        metas.push(metas[source].clone());
+                        continue;
+                    }
+                    let write = binding >= input_count || folded_inputs.contains(&binding);
+                    if !write
+                        && let MaybeQData::Tensor(tensor) = value
+                    {
+                        let ptr = std::sync::Arc::as_ptr(tensor.buffer()) as usize;
+                        let datatype = tensor.datatype();
+                        if let Some((_, _, storage, meta)) = shared_reads
+                            .iter()
+                            .find(|(p, d, _, _)| *p == ptr && *d == datatype)
+                        {
+                            storages.push(storage.clone());
+                            metas.push(meta.clone());
+                            continue;
+                        }
+                        let (storage, meta) = declare_value(kb, value, false)?;
+                        shared_reads.push((ptr, datatype, storage.clone(), meta.clone()));
+                        storages.push(storage);
+                        metas.push(meta);
+                        continue;
+                    }
+                    let (storage, meta) = declare_value(kb, value, write)?;
+                    storages.push(storage);
+                    metas.push(meta);
+                }
+                declared.push((storages, metas));
+            }
+
+            kb.program()
+                .program_grid(BLOCK as u32, dispatch_size, |program| {
+                    let lane = program.lane();
+                    let group = program.bind(linear_group(program, dispatch_size));
+                    for (op, (segment, (storages, metas))) in
+                        segments.iter().zip(prepared.iter().zip(&declared))
+                    {
+                        let in_segment = group.clone().ge(segment.base)
+                            & group.clone().lt(segment.base + segment.groups);
+                        program.if_then(in_segment, |program| {
+                            let flat =
+                                (group.clone() - segment.base) * BLOCK as u32 + lane.clone();
+                            let in_bounds = flat.clone().lt(segment.elements);
+                            let dims = output_dims_from_flat(flat, &op.shape);
+                            let input_count = op.inputs.len();
+                            let (input_storages, output_storages) =
+                                storages.split_at(input_count);
+                            let (input_metas, output_metas) = metas.split_at(input_count);
+                            let mut extras: Vec<(ValueTile, DataTypeEnum)> = Vec::new();
+                            let mut out_idx = 0usize;
+                            for statement in &op.statements {
+                                let (value, _) = eval_nary_expr(
+                                    program,
+                                    &statement.expression,
+                                    &dims,
+                                    input_storages,
+                                    input_metas,
+                                    in_bounds.clone(),
+                                    &extras,
+                                );
+                                let value = bind_value_tile(
+                                    program,
+                                    value.cast_to(statement.datatype),
+                                );
+                                if statement.output.is_some() {
+                                    let index =
+                                        layout_index(&output_metas[out_idx], &dims);
+                                    output_storages[out_idx].store(
+                                        program,
+                                        index,
+                                        value.clone(),
+                                        in_bounds.clone(),
+                                    );
+                                    out_idx += 1;
+                                }
+                                extras.push((value, statement.datatype));
+                            }
+                        });
+                    }
+                });
+            Some(())
+        },
+    )
+}
+
 /// Outputs per thread along the tiled dim of a reuse-tiled elementwise
 /// kernel.
 const NARY_TM: u32 = 4;
@@ -445,6 +699,7 @@ fn bool_as_u32(value: tile_ir::tile::Mask) -> tile_ir::tile::Tile {
     tile_ir::tile::Tile::select(value, 1u32.into(), 0u32.into())
 }
 
+#[derive(Clone)]
 pub(crate) enum Storage2 {
     F32(tile_ir::tile::Storage),
     F16(tile_ir::tile::Storage),

@@ -25,13 +25,16 @@ use crate::{
     view::ViewOperation,
 };
 
+mod alloc_reuse;
 mod cluster_match;
 mod execution;
 pub(crate) mod flush_replay;
 mod fold_views;
 mod fusion_basic;
 mod fusion_matmul;
+mod fusion_region;
 mod fusion_row;
+pub(crate) mod merge_horizontal;
 mod plan_cache;
 mod recognize;
 mod recognize_attention;
@@ -74,6 +77,9 @@ enum CommandRecord {
 enum QueuedOperation {
     Generic(Arc<dyn Operation>),
     QMatMul(Box<QMatMulOperation>),
+    /// Independent same-category operations merged into one dispatch (dense
+    /// training graphs only; see `merge_horizontal`).
+    Merged(merge_horizontal::MergedSegments),
 }
 
 impl QueuedOperation {
@@ -81,15 +87,10 @@ impl QueuedOperation {
         match self {
             Self::Generic(operation) => operation.visit_dependencies(f),
             Self::QMatMul(operation) => operation.visit_dependencies(f),
+            Self::Merged(merged) => merged.visit_dependencies(f),
         }
     }
 
-    fn inputs(&self, graph: &ComputeGraphInner) -> Vec<MirValue> {
-        match self {
-            Self::Generic(operation) => operation.inputs(graph),
-            Self::QMatMul(operation) => operation.inputs(graph),
-        }
-    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -128,16 +129,6 @@ struct ResolveHostProfile {
     encode: Duration,
     submit: Duration,
     profile_readback: Duration,
-}
-
-#[derive(Default)]
-struct ResolveHostCategoryProfile {
-    count: usize,
-    inputs: Duration,
-    output: Duration,
-    workgroup: Duration,
-    build_kernel: Duration,
-    prepare_dispatch: Duration,
 }
 
 #[derive(Default)]
@@ -210,52 +201,7 @@ timestamp_setup={:?} encode={:?} submit={:?} profile_readback={:?}",
     }
 }
 
-fn print_host_category_profile(profile: FxHashMap<&'static str, ResolveHostCategoryProfile>) {
-    let mut profile = profile
-        .into_iter()
-        .map(|(category, profile)| {
-            (
-                category,
-                profile.count,
-                profile.inputs,
-                profile.output,
-                profile.workgroup,
-                profile.build_kernel,
-                profile.prepare_dispatch,
-            )
-        })
-        .collect::<Vec<_>>();
-    profile.sort_by_key(|entry| std::cmp::Reverse(entry.5));
-    tracing::info!("resolve_host_category_profile {profile:?}");
-}
-
-fn node_category_inner(variant: &ComputeGraphNodeVariant) -> &'static str {
-    match variant {
-        ComputeGraphNodeVariant::Tensor(_) => "tensor",
-        ComputeGraphNodeVariant::QMatrix(_) => "q_matrix",
-        ComputeGraphNodeVariant::Elementwise(_) => "elementwise",
-        ComputeGraphNodeVariant::Reduce(_) => "reduce",
-        ComputeGraphNodeVariant::View(_) => "view",
-        ComputeGraphNodeVariant::Assign(_) => "assign",
-    }
-}
-
 #[allow(dead_code, reason = "execution-side category labeling for profiling")]
-fn node_category(variant: &ExecutionVariant) -> &'static str {
-    match variant {
-        ExecutionVariant::Elementwise(_) => "nary",
-        ExecutionVariant::Assign(_) => "slice_assign",
-        ExecutionVariant::View(_) => "view",
-        ExecutionVariant::QMatrix(_) => "dequantize",
-        ExecutionVariant::QEmbedding(_) => "q_embedding",
-        ExecutionVariant::MatMul(_) => "matmul",
-        ExecutionVariant::QMatMul(_) => "q_matmul",
-        ExecutionVariant::Tensor(_) => "tensor",
-        ExecutionVariant::Reduce(_) => "reduce",
-        ExecutionVariant::GraphOp(op) => op.category(),
-    }
-}
-
 /// What an execution-graph node lowers to. The graph vocabulary (the first
 /// six variants) enters verbatim; the region variants exist only here —
 /// recognition rebuilds them from composed clusters, and fusion enriches
@@ -268,6 +214,9 @@ pub(crate) enum ExecutionVariant {
     Reduce(ReduceOperation),
     View(ViewOperation),
     Assign(SliceAssignOperation),
+    /// Multi-output elementwise region formed by `fusion_region` on the
+    /// dense branch; never present in the inner graph.
+    Region(crate::region::ElementwiseRegionOperation),
     // Recognized regions.
     MatMul(MatMulOperation),
     QMatMul(Box<QMatMulOperation>),
@@ -395,6 +344,9 @@ pub(crate) struct Resolver {
     // `RefCell` because some hook sites (`add_physical_dependencies`) only
     // hold `&self`.
     recorder: Option<std::cell::RefCell<flush_replay::PlanRecorder>>,
+    // Set by `optimize_large_graph`'s dense branch only: large QMatMul-free
+    // graphs may merge independent same-category ops into one dispatch.
+    horizontal_merge: bool,
 }
 
 impl Resolver {
@@ -423,6 +375,7 @@ impl Resolver {
             layout_pass: Default::default(),
             resolved_set,
             recorder: None,
+            horizontal_merge: false,
         }
     }
 

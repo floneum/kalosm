@@ -54,6 +54,22 @@ impl SubgroupToken {
     pub fn subgroup_reduce_max(self, program: &TileBlock<'_>, value: Tile) -> Tile {
         self.subgroup_reduce(program, TileReduceOp::Max, value)
     }
+
+    /// Whole-workgroup reduction accelerated with subgroup collectives: a
+    /// per-subgroup reduce, partials staged through workgroup memory, and a
+    /// serial fold — two barriers total versus one per tree level in
+    /// [`TileBlock::group_reduce`]. `subgroup_size` must be the device's
+    /// fixed subgroup width and divide the workgroup size; every lane
+    /// receives the combined value.
+    pub fn workgroup_reduce(
+        self,
+        program: &mut TileBlock<'_>,
+        op: TileReduceOp,
+        subgroup_size: u32,
+        value: Tile,
+    ) -> Tile {
+        program.workgroup_reduce_via_subgroups(op, subgroup_size, value)
+    }
 }
 
 /// Capability token for tile-IR cooperative-matrix operations.

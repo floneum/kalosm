@@ -4806,10 +4806,13 @@ dependencies = [
 name = "fusor-tile-ir-runtime"
 version = "0.1.0"
 dependencies = [
+ "bincode 1.3.3",
  "fusor-tile-ir",
  "lru 0.14.0",
+ "naga",
  "parking_lot",
  "rustc-hash 2.1.2",
+ "serde",
  "tracing",
  "wgpu",
 ]
@@ -7359,6 +7362,7 @@ dependencies = [
  "num-traits",
  "once_cell",
  "rustc-hash 1.1.0",
+ "serde",
  "spirv",
  "thiserror 2.0.18",
  "unicode-ident",

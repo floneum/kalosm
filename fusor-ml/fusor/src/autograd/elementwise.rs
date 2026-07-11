@@ -507,12 +507,32 @@ impl<const R: usize> Tensor<R> {
     }
 
     pub fn gelu(&self) -> Self {
-        let cubic = self.sqr().mul(self);
-        let inner = self
-            .add(&cubic.mul_scalar(0.044_715))
-            .mul_scalar((2.0 / std::f32::consts::PI).sqrt());
-        let gate = inner.tanh().add_scalar(1.0);
-        self.mul(&gate).mul_scalar(0.5)
+        // Fused forward (single elementwise chain) with an analytic backward:
+        // gelu'(x) = 0.5 * (1 + t) + 0.5 * x * (1 - t^2) * c * (1 + 3 * 0.044715 * x^2)
+        // where t = tanh(c * (x + 0.044715 * x^3)) and c = sqrt(2 / pi).
+        let value = self.value.gelu();
+        let input_value = self.value.clone();
+        let input_id = self.handle.id;
+        let backward: BackwardRule = Arc::new(move |gradient| {
+            let grad = downcast_tensor::<R>(&*gradient, "gelu")?;
+            let coeff = (2.0f32 / std::f32::consts::PI).sqrt();
+            let x = input_value.to_concrete();
+            let x_sq = x.sqr().to_concrete();
+            let inner_factor = (&x_sq * 0.044_715f32 + 1.0f32).to_concrete();
+            let inner = ((&x * &inner_factor).to_concrete() * coeff).to_concrete();
+            let t = inner.tanh().to_concrete();
+            let sech_sq = (t.sqr() * -1.0f32 + 1.0f32).to_concrete();
+            let du = ((&x_sq * (3.0f32 * 0.044_715f32) + 1.0f32).to_concrete() * coeff)
+                .to_concrete();
+            let tail = ((&x * &sech_sq).to_concrete() * du).to_concrete();
+            let dgelu = (((t + 1.0f32).to_concrete() + tail).to_concrete() * 0.5f32)
+                .to_concrete();
+            Ok(vec![BackwardTarget {
+                node: input_id,
+                gradient: Box::new((&grad * &dgelu).to_concrete()),
+            }])
+        });
+        self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
     pub fn tanh(&self) -> Self {
