@@ -4,7 +4,7 @@
 //! character-level vocabulary, then trains a 2-layer pre-norm transformer
 //! (learned positional embeddings, 4-head causal self-attention, gelu MLP)
 //! with softmax cross-entropy and Adam, rebuilding the tape each step.
-//! Finishes by reporting validation loss and sampling text from the model.
+//! Reports train/test next-token accuracy while training, then samples text.
 //!
 //! Run with:
 //! ```sh
@@ -19,10 +19,10 @@ use fusor::autograd::layers::{Embedding, LayerNorm, Linear};
 use fusor::autograd::{Graph, Tensor};
 use fusor::{Device, StandardSamplerParams, Tensor as RawTensor, ToVec1, cat};
 
-const CONTEXT: usize = 64;
-const BATCH_SIZE: usize = 32;
-const DIM: usize = 64;
-const HEADS: usize = 4;
+const CONTEXT: usize = 256;
+const BATCH_SIZE: usize = 64;
+const DIM: usize = 384;
+const HEADS: usize = 6;
 const HEAD_DIM: usize = DIM / HEADS;
 const MLP_DIM: usize = 4 * DIM;
 const LAYERS: usize = 2;
@@ -35,6 +35,7 @@ const LAYER_NORM_EPS: f32 = 1e-5;
 const MASK_VALUE: f32 = -1e9;
 const TEMPERATURE: f32 = 0.8;
 const GENERATION_RUN_AHEAD: usize = 32;
+const PROGRESS_EVERY: usize = 25;
 
 const DATA_URL: &str =
     "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
@@ -56,9 +57,7 @@ impl RunConfig {
             steps: STEPS,
             min_steps_per_second: None,
             skip_eval: false,
-            // Loss readbacks synchronize the GPU, so keep the fast path free
-            // of intermediate barriers unless progress is explicitly enabled.
-            progress_every: 0,
+            progress_every: PROGRESS_EVERY,
             trace_host: false,
             trace_resolve: false,
             trace_names: false,
@@ -432,6 +431,14 @@ fn cross_entropy(logits: &Tensor<2>, targets: &RawTensor<1, u32>) -> Tensor<0> {
     logits.softmax_cross_entropy(targets)
 }
 
+fn correct_predictions(logits: &Tensor<2>, targets: &RawTensor<1, u32>) -> Tensor<0> {
+    assert_eq!(logits.shape()[0], targets.shape()[0]);
+    logits
+        .gather_last(targets)
+        .eq_tensor(&logits.max::<1>(1))
+        .sum()
+}
+
 /// First and second moment estimates for one parameter tensor, stored flat
 /// so the update math is rank-independent.
 struct AdamState {
@@ -491,8 +498,46 @@ fn sample_batch(tokens: &[u32], rng: &mut Lcg, batch_size: usize) -> (Vec<u32>, 
     (inputs, targets)
 }
 
-async fn to_scalar(value: RawTensor<0, f32>) -> f32 {
-    value.reshape([1]).as_slice().await.unwrap().to_vec1()[0]
+async fn read_metrics(
+    loss: RawTensor<0, f32>,
+    correct: RawTensor<0, f32>,
+    tokens: usize,
+) -> (f32, f32) {
+    let metrics = cat([loss.reshape([1]), correct.reshape([1])], 0)
+        .as_slice()
+        .await
+        .unwrap()
+        .to_vec1();
+    (metrics[0], metrics[1] / tokens as f32)
+}
+
+async fn evaluate_batch(
+    device: &Device,
+    params: &Params,
+    inputs: &[u32],
+    targets: &[u32],
+    positions: &RawTensor<1, u32>,
+    mask: &RawTensor<2, f32>,
+    vocab_size: usize,
+) -> (f32, f32) {
+    assert_eq!(inputs.len(), targets.len());
+    assert!(inputs.len().is_multiple_of(CONTEXT));
+    let batch_size = inputs.len() / CONTEXT;
+    let inputs = RawTensor::from_slice(device, [batch_size, CONTEXT], inputs);
+    let targets = RawTensor::from_slice(device, [targets.len()], targets);
+    let graph = Graph::new();
+    let model = Gpt::new(&graph, params, false);
+    let mask = Tensor::constant_from_raw(&graph, mask.clone());
+    let logits = model.forward(&inputs, positions, &mask);
+    let flat_logits = logits.reshape([batch_size * CONTEXT, vocab_size]);
+    let loss = cross_entropy(&flat_logits, &targets);
+    let correct = correct_predictions(&flat_logits, &targets);
+    read_metrics(
+        loss.raw().clone(),
+        correct.raw().clone(),
+        targets.shape()[0],
+    )
+    .await
 }
 
 /// Sample a token id from logits with temperature.
@@ -660,13 +705,13 @@ async fn main() {
         .collect();
     let tokens: Vec<u32> = text.bytes().map(|byte| index_of[&byte]).collect();
     let split = tokens.len() * 9 / 10;
-    let (train_tokens, val_tokens) = tokens.split_at(split);
+    let (train_tokens, test_tokens) = tokens.split_at(split);
     println!(
-        "corpus: {} chars, vocab {}, {} train / {} validation",
+        "corpus: {} chars, vocab {}, {} train / {} test",
         tokens.len(),
         vocab.len(),
         train_tokens.len(),
-        val_tokens.len()
+        test_tokens.len()
     );
 
     let device = match Device::gpu().await {
@@ -709,11 +754,17 @@ async fn main() {
     let positions: Vec<u32> = (0..CONTEXT as u32).collect();
     let positions = RawTensor::from_slice(&device, [CONTEXT], &positions);
     let mask = causal_mask(&device, CONTEXT);
+    let (progress_test_inputs, progress_test_targets) = {
+        let mut test_rng = Lcg(0x5eed);
+        sample_batch(test_tokens, &mut test_rng, BATCH_SIZE)
+    };
 
     let mut rng = Lcg(7);
     let start = std::time::Instant::now();
     for step in 0..config.steps {
-        {
+        let report_progress = config.progress_every != 0
+            && ((step + 1).is_multiple_of(config.progress_every) || step + 1 == config.steps);
+        let progress = {
             let (inputs, targets) = sample_batch(train_tokens, &mut rng, BATCH_SIZE);
             let inputs = RawTensor::from_slice(&device, [BATCH_SIZE, CONTEXT], &inputs);
             let targets = RawTensor::from_slice(&device, [BATCH_SIZE * CONTEXT], &targets);
@@ -724,6 +775,10 @@ async fn main() {
             let logits = model.forward(&inputs, &positions, &mask);
             let flat_logits = logits.reshape([BATCH_SIZE * CONTEXT, vocab.len()]);
             let loss = cross_entropy(&flat_logits, &targets);
+            let progress = report_progress.then(|| {
+                let correct = correct_predictions(&flat_logits, &targets);
+                (loss.raw().clone(), correct.raw().clone())
+            });
 
             // Gradients stay lazy: no per-step readback. The whole step
             // (forward, backward, and the optimizer updates below) is submitted
@@ -757,20 +812,34 @@ async fn main() {
                 );
             }
 
-            if config.progress_every != 0
-                && ((step + 1).is_multiple_of(config.progress_every) || step + 1 == config.steps)
-            {
-                // Reading the loss synchronizes with the GPU; only do it when
-                // printing progress.
-                let loss_value = to_scalar(loss.raw().clone()).await;
-                println!("step {}/{}: loss {loss_value:.4}", step + 1, config.steps);
-            }
-        }
+            progress
+        };
 
-        // Submit the parameter updates after step-local forward/backward
-        // handles have dropped, so the flush target set excludes dead
-        // temporaries such as loss, logits, and gradient views.
+        // Submit parameter updates after step-local forward/backward handles
+        // have dropped. Reporting steps intentionally retain two scalar metric
+        // targets; ordinary steps exclude loss, logits, and gradient views.
         device.flush();
+
+        if let Some((loss, correct)) = progress {
+            let (loss, train_accuracy) = read_metrics(loss, correct, BATCH_SIZE * CONTEXT).await;
+            let (_, test_accuracy) = evaluate_batch(
+                &device,
+                &params,
+                &progress_test_inputs,
+                &progress_test_targets,
+                &positions,
+                &mask,
+                vocab.len(),
+            )
+            .await;
+            println!(
+                "step {}/{}: loss {loss:.4} | train accuracy {:.2}% | test accuracy {:.2}%",
+                step + 1,
+                config.steps,
+                train_accuracy * 100.0,
+                test_accuracy * 100.0,
+            );
+        }
     }
     let elapsed = start.elapsed();
     let steps_per_second = config.steps as f64 / elapsed.as_secs_f64();
@@ -792,21 +861,24 @@ async fn main() {
         return;
     }
 
-    // Validation loss over held-out batches.
-    const VAL_BATCHES: usize = 10;
-    const VAL_BATCH_SIZE: usize = VAL_BATCHES * BATCH_SIZE;
-    let validation_loss = {
-        let (inputs, targets) = sample_batch(val_tokens, &mut rng, VAL_BATCH_SIZE);
-        let inputs = RawTensor::from_slice(&device, [VAL_BATCH_SIZE, CONTEXT], &inputs);
-        let targets = RawTensor::from_slice(&device, [VAL_BATCH_SIZE * CONTEXT], &targets);
-        let graph = Graph::new();
-        let model = Gpt::new(&graph, &params, false);
-        let mask = Tensor::constant_from_raw(&graph, mask.clone());
-        let logits = model.forward(&inputs, &positions, &mask);
-        let flat_logits = logits.reshape([VAL_BATCH_SIZE * CONTEXT, vocab.len()]);
-        to_scalar(cross_entropy(&flat_logits, &targets).raw().clone()).await
-    };
-    println!("validation loss: {validation_loss:.4}");
+    // Final metrics over a larger held-out sample.
+    const TEST_BATCHES: usize = 10;
+    const TEST_BATCH_SIZE: usize = TEST_BATCHES * BATCH_SIZE;
+    let (test_inputs, test_targets) = sample_batch(test_tokens, &mut rng, TEST_BATCH_SIZE);
+    let (test_loss, test_accuracy) = evaluate_batch(
+        &device,
+        &params,
+        &test_inputs,
+        &test_targets,
+        &positions,
+        &mask,
+        vocab.len(),
+    )
+    .await;
+    println!(
+        "test loss: {test_loss:.4} | test accuracy {:.2}%",
+        test_accuracy * 100.0
+    );
 
     // Prompt with the tail of the corpus so the window is always full.
     let prompt = tokens[tokens.len() - CONTEXT..].to_vec();

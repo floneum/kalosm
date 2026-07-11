@@ -155,13 +155,16 @@ impl ElementwiseRegionOperation {
             NaryExpr::IndexedInput { input_idx, indices } => {
                 if *input_idx < input_count {
                     let entry = &mut summary[*input_idx];
-                    entry.last_reader = Some(entry.last_reader.map_or(position, |last| last.max(position)));
+                    entry.last_reader = Some(
+                        entry
+                            .last_reader
+                            .map_or(position, |last| last.max(position)),
+                    );
                     let identity = !in_index
                         && indices.len() == rank
-                        && indices
-                            .iter()
-                            .enumerate()
-                            .all(|(dim, index)| matches!(index, NaryExpr::DimIndex(d) if *d == dim));
+                        && indices.iter().enumerate().all(
+                            |(dim, index)| matches!(index, NaryExpr::DimIndex(d) if *d == dim),
+                        );
                     if !identity {
                         entry.identity_only = false;
                     }

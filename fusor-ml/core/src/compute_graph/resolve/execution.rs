@@ -37,7 +37,7 @@ impl OptimizePolicy {
         matches!(self, Self::LargeGraph { .. })
     }
 
-    fn runs_rewrite_fixpoint(self, is_single_token_decode: bool) -> bool {
+    fn runs_stage2_fusion(self, is_single_token_decode: bool) -> bool {
         match self {
             Self::Standard => true,
             Self::LargeGraph {
@@ -45,40 +45,6 @@ impl OptimizePolicy {
             } => optimize_decode_graphs || !is_single_token_decode,
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum CandidateProfile {
-    General,
-    Dense,
-    LargeQuantized,
-}
-
-impl CandidateProfile {
-    fn matches(self, resolver: &Resolver, node: ExecutionNodeIndex) -> bool {
-        match self {
-            Self::General => resolver.is_optimization_candidate(node),
-            Self::Dense => resolver.is_dense_graph_candidate(node),
-            Self::LargeQuantized => resolver.is_large_graph_nary_candidate(node),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum ReduceFusionProfile {
-    Disabled,
-    Conservative,
-    Dense,
-}
-
-#[derive(Clone, Copy)]
-struct RewriteProfile {
-    candidates: CandidateProfile,
-    reduce_fusion: ReduceFusionProfile,
-    try_matmul_fusion: bool,
-    allow_qmatmul_elementwise_fusion: bool,
-    enable_dense_codegen: bool,
-    enqueue_new_consumers: bool,
 }
 
 impl Resolver {
@@ -338,16 +304,12 @@ impl Resolver {
         graph: &mut ComputeGraphInner,
         policy: OptimizePolicy,
     ) -> bool {
-        let profile_enabled = std::env::var_os("FUSOR_TRACE_OPTIMIZE").is_some();
-        let mut timing = OptimizeProfile::default();
         // Rebuild composed contraction / normalization clusters into their
         // specialized operations first, while they are still in the exact
         // canonical form the API emitted (before view folding or fusion
         // disturbs them). This phase is unconditional: decode classification
         // is only reliable after recognition has minted QMatMul nodes.
-        self.recognize_contractions(graph);
-        self.recognize_embeddings(graph);
-        self.recognize_attention(graph);
+        self.recognize_via_egraph(graph);
         // The qmatmul scan runs after recognition (which can mint QMatMul
         // nodes) and before row fusion (which never creates or removes
         // them), so the dense gate below is structural and stable.
@@ -389,51 +351,53 @@ impl Resolver {
                 ExecutionVariant::MatMul(_)
             )
         });
-        let rewrite = match policy {
-            OptimizePolicy::Standard => RewriteProfile {
-                candidates: CandidateProfile::General,
+        use super::egraph::{CandidateKind, ReduceFusion, Stage2Profile};
+        let profile = match policy {
+            OptimizePolicy::Standard => Stage2Profile {
+                candidates: CandidateKind::General,
                 reduce_fusion: if !has_reduce {
-                    ReduceFusionProfile::Disabled
+                    ReduceFusion::Disabled
                 } else if dense {
-                    ReduceFusionProfile::Dense
+                    ReduceFusion::Dense
                 } else {
-                    ReduceFusionProfile::Conservative
+                    ReduceFusion::Conservative
                 },
                 try_matmul_fusion: has_matmul || has_qmatmul,
                 allow_qmatmul_elementwise_fusion: self.execution_graph.node_count()
                     <= STANDARD_QMATMUL_FUSION_NODE_LIMIT
                     || std::env::var_os("FUSOR_RESOLVE_QMATMUL_ELEMENTWISE_FUSION").is_some(),
+                dense,
+                skip_externally_live: self.horizontal_merge_dense_ops,
                 enable_dense_codegen: false,
-                enqueue_new_consumers: true,
             },
-            OptimizePolicy::LargeGraph { .. } if has_qmatmul => RewriteProfile {
-                candidates: CandidateProfile::LargeQuantized,
-                reduce_fusion: ReduceFusionProfile::Disabled,
+            OptimizePolicy::LargeGraph { .. } if has_qmatmul => Stage2Profile {
+                candidates: CandidateKind::LargeQuantized,
+                reduce_fusion: ReduceFusion::Disabled,
                 try_matmul_fusion: true,
                 allow_qmatmul_elementwise_fusion: true,
+                dense,
+                skip_externally_live: self.horizontal_merge_dense_ops,
                 enable_dense_codegen: false,
-                enqueue_new_consumers: false,
             },
-            OptimizePolicy::LargeGraph { .. } => RewriteProfile {
-                candidates: CandidateProfile::Dense,
+            OptimizePolicy::LargeGraph { .. } => Stage2Profile {
+                candidates: CandidateKind::Dense,
                 reduce_fusion: if dense && has_reduce {
-                    ReduceFusionProfile::Dense
+                    ReduceFusion::Dense
                 } else {
-                    ReduceFusionProfile::Disabled
+                    ReduceFusion::Disabled
                 },
-                // The previous large-graph driver attempted matmul fusion for
-                // every candidate, even when its initial scan found no matmul.
                 try_matmul_fusion: true,
                 allow_qmatmul_elementwise_fusion: true,
+                dense,
+                skip_externally_live: self.horizontal_merge_dense_ops,
                 enable_dense_codegen: dense,
-                enqueue_new_consumers: false,
             },
         };
 
         let is_single_token_decode = has_qmatmul && self.is_single_token_qmatmul_graph();
-        let run_fixpoint = policy.runs_rewrite_fixpoint(is_single_token_decode);
+        let run_fixpoint = policy.runs_stage2_fusion(is_single_token_decode);
         if run_fixpoint {
-            self.run_rewrite_fixpoint(graph, rewrite, dense, profile_enabled, &mut timing);
+            self.fuse_via_egraph(graph, profile.clone());
         }
 
         // Dense large-graph kernel tuning is opted into per operation, after
@@ -442,7 +406,7 @@ impl Resolver {
         // workgroups, subgroup whole-block reductions, and staged reads.
         // Quantized graphs (`has_qmatmul`) leave the flags unset, so decode
         // kernels are byte-identical to the committed lowering.
-        if rewrite.enable_dense_codegen {
+        if profile.enable_dense_codegen {
             // Region formation generalizes the sole-consumer nary gate: it
             // fuses externally-live producers into multi-output regions.
             // Regions lower independently; horizontal merging may combine
@@ -450,127 +414,7 @@ impl Resolver {
             self.form_elementwise_regions(graph);
             self.mark_dense_codegen();
         }
-        if profile_enabled {
-            timing.print();
-        }
         run_fixpoint
-    }
-
-    fn run_rewrite_fixpoint(
-        &mut self,
-        graph: &mut ComputeGraphInner,
-        rewrite: RewriteProfile,
-        dense: bool,
-        profile_enabled: bool,
-        timing: &mut OptimizeProfile,
-    ) {
-        let mut worklist = self
-            .execution_graph
-            .node_indices()
-            .filter(|&node| rewrite.candidates.matches(self, node))
-            .collect::<VecDeque<_>>();
-        let mut in_worklist = worklist.iter().copied().collect::<FxHashSet<_>>();
-
-        while let Some(node_idx) = worklist.pop_front() {
-            timing.iterations += 1;
-            in_worklist.remove(&node_idx);
-            if !self.execution_graph.contains_node(node_idx) {
-                continue;
-            }
-
-            // Edges are dependency -> consumer, and only downstream nodes can
-            // become newly fusible from these rewrites.
-            let consumers = self
-                .execution_graph
-                .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
-                .collect::<Vec<_>>();
-
-            // Fold views, fuse naries, then try specialized reduce/matmul
-            // fusion in that order. View folding and nary fusion deliberately
-            // both run during an iteration.
-            let mut changed = self.try_fold_view_inputs(graph, node_idx);
-            let start = profile_enabled.then(Instant::now);
-            changed |= self.try_fuse_naries(graph, node_idx, dense);
-            if let Some(start) = start {
-                timing.fuse_naries_count += 1;
-                timing.fuse_naries += start.elapsed();
-            }
-
-            if !changed && self.execution_graph.contains_node(node_idx) {
-                let start = profile_enabled.then(Instant::now);
-                changed = self.try_fuse_reduce(graph, node_idx, rewrite.reduce_fusion);
-                if let Some(start) = start {
-                    timing.fuse_reduce_count += 1;
-                    timing.fuse_reduce += start.elapsed();
-                }
-            }
-
-            if !changed && self.execution_graph.contains_node(node_idx) {
-                let start = profile_enabled.then(Instant::now);
-                changed = rewrite.try_matmul_fusion
-                    && self.try_fuse_into_matmul(
-                        graph,
-                        node_idx,
-                        rewrite.allow_qmatmul_elementwise_fusion,
-                    );
-                if let Some(start) = start {
-                    timing.fuse_matmul_count += 1;
-                    timing.fuse_matmul += start.elapsed();
-                }
-            }
-
-            if !changed {
-                continue;
-            }
-            timing.changed += 1;
-
-            if self.execution_graph.contains_node(node_idx)
-                && rewrite.candidates.matches(self, node_idx)
-                && in_worklist.insert(node_idx)
-            {
-                worklist.push_back(node_idx);
-            }
-            self.enqueue_downstream_candidates(
-                consumers,
-                rewrite.candidates,
-                &mut worklist,
-                &mut in_worklist,
-            );
-            if rewrite.enqueue_new_consumers && self.execution_graph.contains_node(node_idx) {
-                let new_consumers = self
-                    .execution_graph
-                    .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
-                    .collect::<Vec<_>>();
-                self.enqueue_downstream_candidates(
-                    new_consumers,
-                    rewrite.candidates,
-                    &mut worklist,
-                    &mut in_worklist,
-                );
-            }
-        }
-    }
-
-    fn try_fuse_reduce(
-        &mut self,
-        graph: &mut ComputeGraphInner,
-        node_idx: ExecutionNodeIndex,
-        profile: ReduceFusionProfile,
-    ) -> bool {
-        match profile {
-            ReduceFusionProfile::Disabled => false,
-            ReduceFusionProfile::Conservative => {
-                self.try_fuse_into_reduce(graph, node_idx)
-                    || self.try_fuse_producer_into_reduce(graph, node_idx, false)
-            }
-            ReduceFusionProfile::Dense => {
-                self.try_collapse_unit_reduce(graph, node_idx)
-                    || self.try_fold_view_inputs_into_reduce(graph, node_idx)
-                    || self.try_fuse_into_reduce(graph, node_idx)
-                    || self.try_fuse_unary_into_reduce_indexed(graph, node_idx)
-                    || self.try_fuse_producer_into_reduce(graph, node_idx, true)
-            }
-        }
     }
 
     /// Set `dense_codegen` on every matmul and row-program operation in the
@@ -594,76 +438,12 @@ impl Resolver {
         }
     }
 
-    /// Re-enqueue downstream fusion candidates reachable from `seeds`,
-    /// descending through `MapLayout` view nodes. A rewrite (e.g. fusing an
-    /// `add` into a qmatmul epilogue) can make a candidate that sits *behind* a
-    /// broadcast/narrow view newly fusible; those views are not optimization
-    /// candidates themselves, so a plain direct-consumer scan would never reach
-    /// the candidate past them.
-    fn enqueue_downstream_candidates(
-        &self,
-        seeds: impl IntoIterator<Item = ExecutionNodeIndex>,
-        candidates: CandidateProfile,
-        worklist: &mut VecDeque<ExecutionNodeIndex>,
-        in_worklist: &mut FxHashSet<ExecutionNodeIndex>,
-    ) {
-        let mut stack: Vec<ExecutionNodeIndex> = seeds.into_iter().collect();
-        let mut visited = FxHashSet::default();
-        while let Some(node) = stack.pop() {
-            if !self.execution_graph.contains_node(node) || !visited.insert(node) {
-                continue;
-            }
-            if candidates.matches(self, node) {
-                if in_worklist.insert(node) {
-                    worklist.push_back(node);
-                }
-            } else if matches!(
-                self.execution_graph[node].variant,
-                ExecutionVariant::View(_)
-            ) {
-                stack.extend(
-                    self.execution_graph
-                        .neighbors_directed(node, petgraph::Direction::Outgoing),
-                );
-            }
-        }
-    }
-
-    /// Dense (QMatMul-free) graphs also anchor rewrites on reduces so their
-    /// producers and views can fold in.
-    fn is_dense_graph_candidate(&self, node_idx: ExecutionNodeIndex) -> bool {
-        matches!(
-            self.execution_graph[node_idx].variant,
-            ExecutionVariant::Elementwise(_) | ExecutionVariant::Reduce(_)
-        )
-    }
-
     /// Whether the dense-graph reduce-fusion rules may run: never for
     /// graphs containing QMatMul (decode behavior is frozen), and gated by
     /// a kill-switch env var that is also hashed into the flush-replay
     /// fingerprint.
     pub(super) fn dense_reduce_fusion_enabled(has_qmatmul: bool) -> bool {
         !has_qmatmul && std::env::var_os("FUSOR_RESOLVE_DISABLE_DENSE_REDUCE_FUSION").is_none()
-    }
-
-    pub(super) fn is_large_graph_nary_candidate(&self, node_idx: ExecutionNodeIndex) -> bool {
-        let ExecutionVariant::Elementwise(nary) = &self.execution_graph[node_idx].variant else {
-            return false;
-        };
-        if nary.shape.last().copied().unwrap_or_default() >= LARGE_GRAPH_NARY_FUSION_MIN_LAST_DIM {
-            return true;
-        }
-
-        nary.inputs.iter().any(|&input| {
-            let (base_inner, _) = self.walk_view_chain(input);
-            self.get_input_node_in_exec_graph(base_inner)
-                .is_some_and(|exec_idx| {
-                    matches!(
-                        self.execution_graph[exec_idx].variant,
-                        ExecutionVariant::QMatMul(_)
-                    )
-                })
-        })
     }
 
     fn is_single_token_qmatmul_graph(&self) -> bool {
@@ -684,16 +464,6 @@ impl Resolver {
             }
         }
         qmatmul_count >= 16 && single_token_count * 4 >= qmatmul_count * 3
-    }
-
-    fn is_optimization_candidate(&self, node_idx: ExecutionNodeIndex) -> bool {
-        matches!(
-            self.execution_graph[node_idx].variant,
-            ExecutionVariant::Elementwise(_)
-                | ExecutionVariant::MatMul(_)
-                | ExecutionVariant::QMatMul(_)
-                | ExecutionVariant::Reduce(_)
-        )
     }
 
     // Helpers
@@ -764,53 +534,6 @@ impl Resolver {
         }
     }
 
-    pub(super) fn infer_layout_cached(
-        &mut self,
-        graph: &ComputeGraphInner,
-        inner_idx: NodeIndex,
-    ) -> Option<crate::TensorLayoutInfo> {
-        self.layout_pass.visit(graph, inner_idx);
-        self.layout_pass.output_layout.get(&inner_idx).cloned()
-    }
-
-    pub(super) fn try_normalize_qmatmul_post_extra(
-        &mut self,
-        graph: &ComputeGraphInner,
-        extra_inner: NodeIndex,
-        output_shape: &[usize],
-    ) -> Option<NodeIndex> {
-        let last_dim = *output_shape.last()?;
-        let extra_info = self.infer_layout_cached(graph, extra_inner)?;
-        if extra_info.datatype() != DataTypeEnum::F32 || extra_info.layout().shape() != output_shape
-        {
-            return None;
-        }
-
-        let layout = extra_info.layout();
-        let is_column_broadcast = layout.offset() == 0
-            && layout.strides().last().copied() == Some(1)
-            && layout.shape().last().copied() == Some(last_dim)
-            && layout.strides()[..layout.strides().len().saturating_sub(1)]
-                .iter()
-                .all(|stride| *stride == 0);
-        if !is_column_broadcast {
-            return Some(extra_inner);
-        }
-
-        let (base_inner, _) = self.walk_view_chain(extra_inner);
-        let base_info = self.infer_layout_cached(graph, base_inner)?;
-        let base_layout = base_info.layout();
-        if base_info.datatype() == DataTypeEnum::F32
-            && base_layout.shape() == [last_dim]
-            && base_layout.is_contiguous()
-            && base_layout.offset() == 0
-        {
-            Some(base_inner)
-        } else {
-            Some(extra_inner)
-        }
-    }
-
     pub(super) fn check_cached(&self, graph: &ComputeGraphInner, inner_idx: NodeIndex) -> bool {
         graph.get_cached_result(inner_idx).is_some()
     }
@@ -862,13 +585,13 @@ mod optimizer_policy_tests {
     #[test]
     fn only_large_decode_policy_can_skip_the_rewrite_fixpoint() {
         let standard = OptimizePolicy::select(10, 512, false);
-        assert!(standard.runs_rewrite_fixpoint(true));
+        assert!(standard.runs_stage2_fusion(true));
 
         let large = OptimizePolicy::select(513, 512, false);
-        assert!(!large.runs_rewrite_fixpoint(true));
-        assert!(large.runs_rewrite_fixpoint(false));
+        assert!(!large.runs_stage2_fusion(true));
+        assert!(large.runs_stage2_fusion(false));
 
         let opted_in = OptimizePolicy::select(513, 512, true);
-        assert!(opted_in.runs_rewrite_fixpoint(true));
+        assert!(opted_in.runs_stage2_fusion(true));
     }
 }

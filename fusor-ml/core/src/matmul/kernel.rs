@@ -539,10 +539,7 @@ impl MatMulOperation {
             .checked_mul(batch)?;
         if total_tiles >= SPLIT_K_MAX_TILES || k < SPLIT_K_MIN_K {
             if std::env::var_os("FUSOR_TRACE_SPLITK").is_some() {
-                eprintln!(
-                    "splitk_gate name={} tiles={total_tiles} k={k}",
-                    self.name()
-                );
+                eprintln!("splitk_gate name={} tiles={total_tiles} k={k}", self.name());
             }
             return None;
         }

@@ -44,8 +44,7 @@ impl Resolver {
             if claimed.contains(&sink) || !self.execution_graph.contains_node(sink) {
                 continue;
             }
-            let ExecutionVariant::Elementwise(sink_op) = &self.execution_graph[sink].variant
-            else {
+            let ExecutionVariant::Elementwise(sink_op) = &self.execution_graph[sink].variant else {
                 continue;
             };
             if self.check_cached(graph, self.execution_graph[sink].inner_idx) {
@@ -57,13 +56,8 @@ impl Resolver {
             let mut member_set: FxHashSet<ExecutionNodeIndex> = FxHashSet::default();
             member_set.insert(sink);
             loop {
-                let candidate = self.find_absorbable_producer(
-                    graph,
-                    &member_set,
-                    &claimed,
-                    &shape,
-                    budget,
-                );
+                let candidate =
+                    self.find_absorbable_producer(graph, &member_set, &claimed, &shape, budget);
                 match candidate {
                     Some(producer) if member_set.len() < REGION_MAX_STATEMENTS => {
                         member_set.insert(producer);
@@ -134,9 +128,7 @@ impl Resolver {
                         .iter()
                         .enumerate()
                         .filter(|(_, input)| **input == producer_inner)
-                        .all(|(slot, _)| {
-                            !reader_op.expression.uses_custom_indexing_for_input(slot)
-                        })
+                        .all(|(slot, _)| !reader_op.expression.uses_custom_indexing_for_input(slot))
                 });
                 if !read_elementwise {
                     continue;
@@ -261,16 +253,24 @@ impl Resolver {
                     .nodes
                     .node_weight(member_inner)
                     .is_some_and(|node| node.reference_count > 0);
-            statements.push((op.expression, op.output_datatype, slot_map, member_inner, live));
+            statements.push((
+                op.expression,
+                op.output_datatype,
+                slot_map,
+                member_inner,
+                live,
+            ));
         }
         let input_count = inputs.len();
         let statements: Vec<RegionStatement> = statements
             .into_iter()
-            .map(|(expression, datatype, slot_map, member_inner, live)| RegionStatement {
-                expression: Self::remap_region_expr(&expression, &slot_map, input_count),
-                datatype,
-                output: live.then_some(member_inner),
-            })
+            .map(
+                |(expression, datatype, slot_map, member_inner, live)| RegionStatement {
+                    expression: Self::remap_region_expr(&expression, &slot_map, input_count),
+                    datatype,
+                    output: live.then_some(member_inner),
+                },
+            )
             .collect();
 
         let op = ElementwiseRegionOperation {
@@ -314,11 +314,7 @@ impl Resolver {
     /// their (recursively remapped) index expressions; register reads drop
     /// their identity indices (guaranteed by the absorption gate) and point
     /// past the input slots into the statement `extras`.
-    fn remap_region_expr(
-        expr: &NaryExpr,
-        slot_map: &[RegionSlot],
-        input_count: usize,
-    ) -> NaryExpr {
+    fn remap_region_expr(expr: &NaryExpr, slot_map: &[RegionSlot], input_count: usize) -> NaryExpr {
         match expr {
             NaryExpr::Op { children, function } => NaryExpr::Op {
                 children: children

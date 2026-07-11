@@ -729,11 +729,7 @@ mod dirty_buffer_tests {
             assert!(Arc::strong_count(&buffer) >= 2);
             // Not tracked under a different size or usage.
             assert!(!device.buffer_pool_is_tracked(size * 2, usage, &buffer));
-            assert!(!device.buffer_pool_is_tracked(
-                size,
-                wgpu::BufferUsages::STORAGE,
-                &buffer
-            ));
+            assert!(!device.buffer_pool_is_tracked(size, wgpu::BufferUsages::STORAGE, &buffer));
             // A foreign buffer (same size/usage, allocated outside the pool)
             // is not tracked.
             let foreign = Arc::new(device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {

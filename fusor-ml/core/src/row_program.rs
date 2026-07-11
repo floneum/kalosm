@@ -366,10 +366,7 @@ impl RowProgramOperation {
                 .phase_steps()
                 .iter()
                 .all(|step| matches!(step, RowStep::Reduce(_)))
-            && matches!(
-                self.output_step(),
-                RowOutput::Map(_) | RowOutput::Scalar(_)
-            )
+            && matches!(self.output_step(), RowOutput::Map(_) | RowOutput::Scalar(_))
     }
 
     fn uses_custom_indexing_for_input(&self, input_idx: usize) -> bool {
@@ -594,12 +591,14 @@ struct StagedReads {
 /// the phases run.
 fn uses_any_slot(expr: &NaryExpr, input_count: usize) -> bool {
     match expr {
-        NaryExpr::Op { children, .. } => {
-            children.iter().any(|child| uses_any_slot(child, input_count))
-        }
+        NaryExpr::Op { children, .. } => children
+            .iter()
+            .any(|child| uses_any_slot(child, input_count)),
         NaryExpr::IndexedInput { input_idx, indices } => {
             *input_idx >= input_count
-                || indices.iter().any(|index| uses_any_slot(index, input_count))
+                || indices
+                    .iter()
+                    .any(|index| uses_any_slot(index, input_count))
         }
         NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => false,
     }
@@ -1099,8 +1098,7 @@ fn build_row_program_kernel(
                 // scalar-store lane test use it unchanged.
                 let (row_flat, split_idx, lane) = if rows_per_workgroup > 1 {
                     (
-                        program
-                            .bind(wg_flat * rows_per_workgroup + ctx.lane.clone() / k_group),
+                        program.bind(wg_flat * rows_per_workgroup + ctx.lane.clone() / k_group),
                         tile_u32(0),
                         program.bind(ctx.lane % k_group),
                     )
@@ -1446,8 +1444,9 @@ fn build_row_program_kernel(
                     // value, so later phases can use it directly. With one row
                     // per workgroup `k_group == block` and this is the full
                     // workgroup reduction.
-                    let combined =
-                        emit_group_reduce(program, dense, subgroups, reduce_op, k_group, block, partial);
+                    let combined = emit_group_reduce(
+                        program, dense, subgroups, reduce_op, k_group, block, partial,
+                    );
                     let (combined, combined_ty) =
                         apply_unary_function_chain(combined, phase_dtype, &reduce.post_chain)
                             .expect("validated row program post chain");
@@ -1476,7 +1475,13 @@ fn build_row_program_kernel(
                             )
                         }
                         _ => eval_nary_expr(
-                            program, output_expr, coords, &storages, &metas, active, slots,
+                            program,
+                            output_expr,
+                            coords,
+                            &storages,
+                            &metas,
+                            active,
+                            slots,
                         ),
                     };
                     value
@@ -1584,8 +1589,10 @@ pub(crate) fn build_merged_row_program_kernel(
         }
         if !device.f16_supported()
             && (output.datatype() == DataTypeEnum::F16
-                || values.iter().any(|value| matches!(value, MaybeQData::Tensor(tensor)
-                    if tensor.datatype() == DataTypeEnum::F16)))
+                || values.iter().any(|value| {
+                    matches!(value, MaybeQData::Tensor(tensor)
+                    if tensor.datatype() == DataTypeEnum::F16)
+                }))
         {
             return None;
         }
@@ -1626,11 +1633,7 @@ pub(crate) fn build_merged_row_program_kernel(
         .map(|(op, segment)| {
             (segment.k.div_ceil(block) == 1)
                 .then(|| {
-                    stage_single_chunk_reads(
-                        op.phase_steps(),
-                        op.output_step(),
-                        op.inputs.len(),
-                    )
+                    stage_single_chunk_reads(op.phase_steps(), op.output_step(), op.inputs.len())
                 })
                 .flatten()
         })
@@ -1679,10 +1682,7 @@ pub(crate) fn build_merged_row_program_kernel(
 
             kb.program().program_grid(block, dispatch_size, |program| {
                 let full_lane = program.lane();
-                let group = program.bind(crate::nary_direct::linear_group(
-                    program,
-                    dispatch_size,
-                ));
+                let group = program.bind(crate::nary_direct::linear_group(program, dispatch_size));
                 for ((op, staged_reads), (segment, (storages, metas, output))) in segments
                     .iter()
                     .zip(&staged_segments)
@@ -1705,8 +1705,7 @@ pub(crate) fn build_merged_row_program_kernel(
                             (wg_local, full_lane.clone())
                         };
                         let in_bounds = row_flat.clone().lt(segment.rows);
-                        let row_dims =
-                            output_dims_from_flat(row_flat.clone(), &segment.row_shape);
+                        let row_dims = output_dims_from_flat(row_flat.clone(), &segment.row_shape);
                         let axis = op.axis;
                         let rank = op.shape.len();
                         let full_coords = |k_index: Tile| -> Vec<Tile> {
@@ -1829,7 +1828,13 @@ pub(crate) fn build_merged_row_program_kernel(
                                     )
                                 }
                                 _ => eval_nary_expr(
-                                    program, output_expr, coords, storages, metas, active, slots,
+                                    program,
+                                    output_expr,
+                                    coords,
+                                    storages,
+                                    metas,
+                                    active,
+                                    slots,
                                 ),
                             };
                             value

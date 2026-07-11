@@ -147,9 +147,7 @@ struct MergedRegionKernelVariant;
 /// before binding, so `Bool` never reaches here.
 /// For every tensor value across all segments (flattened), the index of its
 /// first occurrence — the cross-segment binding-sharing pattern.
-fn cross_segment_alias_classes<'a>(
-    segments: impl Iterator<Item = &'a [MaybeQData]>,
-) -> Vec<usize> {
+fn cross_segment_alias_classes<'a>(segments: impl Iterator<Item = &'a [MaybeQData]>) -> Vec<usize> {
     // Sharing equality must match the declare-time dedup exactly: same
     // buffer, same datatype, same layout.
     let mut seen: Vec<(usize, Option<(DataTypeEnum, crate::Layout)>)> = Vec::new();
@@ -176,10 +174,7 @@ fn cross_segment_alias_classes<'a>(
     classes
 }
 
-fn bind_value_tile(
-    program: &mut tile_ir::tile::TileBlock<'_>,
-    value: ValueTile,
-) -> ValueTile {
+fn bind_value_tile(program: &mut tile_ir::tile::TileBlock<'_>, value: ValueTile) -> ValueTile {
     match value {
         ValueTile::F32(tile) => ValueTile::F32(program.bind(tile)),
         ValueTile::F16(tile) => ValueTile::F16(program.bind(tile)),
@@ -233,9 +228,7 @@ pub(crate) fn build_merged_region_kernel(
         debug_assert_eq!(values.len(), op.inputs.len() + op.output_count());
         let input_count = op.inputs.len();
         let buffer_of = |value: &MaybeQData| match value {
-            MaybeQData::Tensor(tensor) => {
-                Some(std::sync::Arc::as_ptr(tensor.buffer()) as usize)
-            }
+            MaybeQData::Tensor(tensor) => Some(std::sync::Arc::as_ptr(tensor.buffer()) as usize),
             _ => None,
         };
         // An output sharing an input's buffer must bind it exactly once,
@@ -324,9 +317,7 @@ pub(crate) fn build_merged_region_kernel(
                         continue;
                     }
                     let write = binding >= input_count || folded_inputs.contains(&binding);
-                    if !write
-                        && let MaybeQData::Tensor(tensor) = value
-                    {
+                    if !write && let MaybeQData::Tensor(tensor) = value {
                         let ptr = std::sync::Arc::as_ptr(tensor.buffer()) as usize;
                         let datatype = tensor.datatype();
                         // Only reads through the identical view share a
@@ -370,13 +361,11 @@ pub(crate) fn build_merged_region_kernel(
                         let in_segment = group.clone().ge(segment.base)
                             & group.clone().lt(segment.base + segment.groups);
                         program.if_then(in_segment, |program| {
-                            let flat =
-                                (group.clone() - segment.base) * BLOCK as u32 + lane.clone();
+                            let flat = (group.clone() - segment.base) * BLOCK as u32 + lane.clone();
                             let in_bounds = flat.clone().lt(segment.elements);
                             let dims = output_dims_from_flat(flat, &op.shape);
                             let input_count = op.inputs.len();
-                            let (input_storages, output_storages) =
-                                storages.split_at(input_count);
+                            let (input_storages, output_storages) = storages.split_at(input_count);
                             let (input_metas, output_metas) = metas.split_at(input_count);
                             let mut extras: Vec<(ValueTile, DataTypeEnum)> = Vec::new();
                             let mut out_idx = 0usize;
@@ -390,13 +379,10 @@ pub(crate) fn build_merged_region_kernel(
                                     in_bounds.clone(),
                                     &extras,
                                 );
-                                let value = bind_value_tile(
-                                    program,
-                                    value.cast_to(statement.datatype),
-                                );
+                                let value =
+                                    bind_value_tile(program, value.cast_to(statement.datatype));
                                 if statement.output.is_some() {
-                                    let index =
-                                        layout_index(&output_metas[out_idx], &dims);
+                                    let index = layout_index(&output_metas[out_idx], &dims);
                                     output_storages[out_idx].store(
                                         program,
                                         index,

@@ -1,12 +1,13 @@
-//! Pattern recognition over the composed 3-op graph.
+//! Contraction matchers over the composed 3-op graph.
 //!
 //! The tensor API expresses contractions as `Elementwise(Mul) + Reduce(Sum)`
 //! over a shared index space (see `Tensor::mat_mul` / `Tensor::q_mat_mul`).
-//! This pass runs before view folding and n-ary fusion, while the composed
-//! cluster is still in the exact canonical form the API emitted, and rebuilds
-//! the specialized operation so the existing kernel paths (and their epilogue
-//! fusion) take over. Anything it does not recognize lowers through the
-//! generic elementwise + reduce kernels — slower, but correct.
+//! The matchers and builders here serve two callers: the equality-saturation
+//! recognition rules (`egraph::rules_recognize`, which match against the
+//! ingested identity forms — the exact canonical shapes the API emitted) and
+//! the single-target inner-graph fast path (`match_direct_qmatmul`).
+//! Anything they do not recognize lowers through the generic elementwise +
+//! reduce kernels — slower, but correct.
 
 use crate::{
     MatMulOperation, ReduceOperation, dequantize::DequantizeOperation,
@@ -206,86 +207,6 @@ impl ComputeGraphInner {
 }
 
 impl Resolver {
-    /// Recognize composed contraction clusters in the execution graph and
-    /// rebuild them as `MatMul` / `QMatMul` nodes. Runs as a linear sweep
-    /// before any other rewrite, while the clusters are still in the exact
-    /// form the API emitted.
-    pub(super) fn recognize_contractions(&mut self, graph: &mut ComputeGraphInner) {
-        let reduces: Vec<ExecutionNodeIndex> = self
-            .execution_graph
-            .node_indices()
-            .filter(|&node| {
-                matches!(
-                    self.execution_graph[node].variant,
-                    ExecutionVariant::Reduce(_)
-                )
-            })
-            .collect();
-        for node in reduces {
-            self.try_recognize_contraction(graph, node);
-        }
-    }
-
-    fn try_recognize_contraction(
-        &mut self,
-        graph: &mut ComputeGraphInner,
-        node_idx: ExecutionNodeIndex,
-    ) -> bool {
-        let ExecutionVariant::Reduce(reduce) = &self.execution_graph[node_idx].variant else {
-            return false;
-        };
-        let Some(value) = reduce.plain_input() else {
-            return false;
-        };
-        if self.check_cached(graph, value) || graph.has_live_reference(value) {
-            return false;
-        }
-        let Some(nary_exec) = self.get_input_node_in_exec_graph(value) else {
-            return false;
-        };
-        let ExecutionVariant::Elementwise(nary) = &self.execution_graph[nary_exec].variant else {
-            return false;
-        };
-        // The multiply must exist solely for this reduce: consumed elsewhere
-        // it has to materialize anyway.
-        if self
-            .execution_graph
-            .neighbors_directed(nary_exec, petgraph::Direction::Outgoing)
-            .count()
-            != 1
-        {
-            return false;
-        }
-        let Some(contraction) = match_contraction(reduce, nary) else {
-            return false;
-        };
-
-        let _ = nary_exec;
-        if let Some((operation, activation)) =
-            contraction.to_q_mat_mul(|key| graph.dequantize_variant(key))
-        {
-            self.commit_recognized(
-                graph,
-                node_idx,
-                &[activation],
-                ExecutionVariant::QMatMul(Box::new(operation)),
-            );
-            return true;
-        }
-        if let Some((mut operation, _)) = contraction.to_mat_mul(&graph.device()) {
-            self.try_unflatten_matmul_input(graph, &mut operation);
-            let inputs = [operation.first, operation.second];
-            self.commit_recognized(
-                graph,
-                node_idx,
-                &inputs,
-                ExecutionVariant::MatMul(operation),
-            );
-            return true;
-        }
-        false
-    }
-
     /// Read a recognized matmul's A operand through its un-flattened
     /// producer. Conv's im2col flatten regroups a windowed view's dims
     /// across overlapping strides, which no single strided layout can
@@ -295,8 +216,8 @@ impl Resolver {
     /// the producer, carry the affine stage as the operand's base map, and
     /// let the kernels divmod the flat coordinates back apart per load — an
     /// implicit GEMM with no gather dispatch.
-    fn try_unflatten_matmul_input(
-        &mut self,
+    pub(super) fn try_unflatten_matmul_input(
+        &self,
         graph: &ComputeGraphInner,
         operation: &mut crate::MatMulOperation,
     ) {
@@ -379,97 +300,6 @@ impl Resolver {
                 base_shape: windowed.input_shape.clone(),
             }),
         };
-    }
-
-    /// Sweep elementwise nodes for quantized embedding gathers.
-    pub(super) fn recognize_embeddings(&mut self, graph: &mut ComputeGraphInner) {
-        let candidates: Vec<ExecutionNodeIndex> = self
-            .execution_graph
-            .node_indices()
-            .filter(|&node| {
-                matches!(
-                    self.execution_graph[node].variant,
-                    ExecutionVariant::Elementwise(_)
-                )
-            })
-            .collect();
-        for node in candidates {
-            if !self.execution_graph.contains_node(node) {
-                continue;
-            }
-            self.try_recognize_q_embedding(graph, node);
-        }
-    }
-
-    /// Quantized row gather: `Elementwise([table, idx], table[idx[i], j])`
-    /// over a `[count, hidden]` space (see `QMatrix::index_select_rows_to`).
-    /// Rebuilds the block-amortized embedding kernel; dense-storage tables
-    /// stay on the generic elementwise path, which reads them directly.
-    pub(super) fn try_recognize_q_embedding(
-        &mut self,
-        graph: &mut ComputeGraphInner,
-        node_idx: ExecutionNodeIndex,
-    ) -> bool {
-        let ExecutionVariant::Elementwise(nary) = &self.execution_graph[node_idx].variant else {
-            return false;
-        };
-        if nary.inputs.len() != 2 || nary.shape.len() != 2 {
-            return false;
-        }
-        // Peel the optional cast from the load type to the requested type.
-        let gather = match &nary.expression {
-            NaryExpr::Op { children, function }
-                if function.op == crate::nary_wise::NaryOp::Cast && children.len() == 1 =>
-            {
-                &children[0]
-            }
-            expr => expr,
-        };
-        let NaryExpr::IndexedInput {
-            input_idx: 0,
-            indices,
-        } = gather
-        else {
-            return false;
-        };
-        let [row, NaryExpr::DimIndex(1)] = indices.as_slice() else {
-            return false;
-        };
-        let NaryExpr::IndexedInput {
-            input_idx: 1,
-            indices: row_indices,
-        } = row
-        else {
-            return false;
-        };
-        if row_indices.as_slice() != [NaryExpr::DimIndex(0)] {
-            return false;
-        }
-
-        let Some(dequantize) = graph.dequantize_variant(nary.inputs[0]) else {
-            return false;
-        };
-        if crate::quantized::dequantize::quant_format(&dequantize.matrix).is_none() {
-            return false;
-        }
-        if dequantize.matrix.shape().len() != 2 || dequantize.matrix.shape()[1] != nary.shape[1] {
-            return false;
-        }
-
-        let indexes = nary.inputs[1];
-        let operation = crate::quantized::embedding::QEmbeddingOperation::new(
-            indexes,
-            nary.shape[0],
-            dequantize.matrix.clone(),
-            nary.output_datatype,
-        );
-        self.commit_recognized(
-            graph,
-            node_idx,
-            &[indexes],
-            ExecutionVariant::QEmbedding(operation),
-        );
-        true
     }
 
     /// Replace a recognized cluster's root with the rebuilt operation: drop

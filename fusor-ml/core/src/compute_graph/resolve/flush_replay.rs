@@ -59,7 +59,9 @@ use crate::{DataTypeEnum, Device, Layout};
 
 /// Bump when anything about the recorded plan layout or the fingerprint
 /// recipe changes, so stale entries can never be replayed.
-const REPLAY_RECIPE_VERSION: u64 = 6;
+/// v7: equality-saturation optimizer — recorded physical-edge sets shrink to
+/// final-inputs-only and the optimizer output is produced by extraction.
+const REPLAY_RECIPE_VERSION: u64 = 7;
 
 const FLUSH_PLAN_CACHE_SIZE: usize = 8;
 
@@ -148,7 +150,6 @@ pub(crate) fn replay_enabled() -> bool {
         "FUSOR_TRACE_RESOLVE",
         "FUSOR_TRACE_DECODE_NAMES",
         "FUSOR_TRACE_RESOLVE_HOST_CATEGORIES",
-        "FUSOR_TRACE_OPTIMIZE",
         "FUSOR_TRACE_ROW_FUSION",
     ];
     DISABLING_ENVS

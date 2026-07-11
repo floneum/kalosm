@@ -115,6 +115,7 @@ impl ComputeGraph {
         {
             let mut inner = self.inner.write();
             inner.flush_all_pending(&mut removed);
+            inner.prune_deferred_dead(&mut removed);
             #[cfg(feature = "extra_assertions")]
             {
                 inner.verify_integrity()
@@ -141,6 +142,7 @@ impl ComputeGraph {
             if data.is_some() {
                 inner.try_auto_flush(&mut removed);
             }
+            inner.prune_deferred_dead(&mut removed);
             #[cfg(feature = "extra_assertions")]
             {
                 inner.verify_integrity()
@@ -157,6 +159,7 @@ impl ComputeGraph {
             let mut removed = Vec::new();
             let (data, ()) = inner.resolve_target_with_replay(key, &mut removed, |_, _| ());
             inner.try_auto_flush(&mut removed);
+            inner.prune_deferred_dead(&mut removed);
             #[cfg(feature = "extra_assertions")]
             {
                 inner.verify_integrity()
@@ -213,6 +216,7 @@ impl ComputeGraph {
                     (result, tail_result)
                 },
             );
+            inner.prune_deferred_dead(&mut removed);
             #[cfg(feature = "extra_assertions")]
             {
                 inner.verify_integrity()
@@ -233,6 +237,7 @@ impl ComputeGraph {
                 tail.expect("direct QMatMul did not consume the resolver tail"),
             );
             inner.try_auto_flush(&mut removed);
+            inner.prune_deferred_dead(&mut removed);
             #[cfg(feature = "extra_assertions")]
             {
                 inner.verify_integrity()
@@ -258,6 +263,7 @@ impl ComputeGraph {
             let mut inner = self.inner.write();
             let mut removed = Vec::new();
             inner.remove_reference(key, &mut removed);
+            inner.prune_deferred_dead(&mut removed);
             #[cfg(feature = "extra_assertions")]
             {
                 inner.verify_integrity()
@@ -427,6 +433,14 @@ pub(crate) struct ComputeGraphInner {
     // isomorphic steps collide.
     pending_sinks: FxHashMap<NodeIndex, u64>,
     pending_seq: u64,
+    // Nodes whose `should_keep_cached()` flipped false during a resolve
+    // (their last alive descendant was cached). They cannot be removed at
+    // that point — the in-flight execution still reads their buffers by
+    // index — so removal is deferred to `prune_deferred_dead` at the end of
+    // the public operation. Without this, every cached-over node lingers as
+    // a permanent husk: `check_life` only runs on reference drops, and a
+    // dead node's references are already gone.
+    deferred_dead: Vec<NodeIndex>,
 }
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 8192;
@@ -447,6 +461,7 @@ impl ComputeGraphInner {
             qmatrix_node_count: 0,
             pending_sinks: FxHashMap::default(),
             pending_seq: 0,
+            deferred_dead: Vec::new(),
         }
     }
 
@@ -459,6 +474,7 @@ impl ComputeGraphInner {
             qmatrix_node_count: 0,
             pending_sinks: FxHashMap::default(),
             pending_seq: 0,
+            deferred_dead: Vec::new(),
         }
     }
 
@@ -669,11 +685,12 @@ impl ComputeGraphInner {
                 .neighbors_directed(child, petgraph::Direction::Incoming)
                 .collect();
             for parent in parents {
-                let parent_transitioned = {
+                let (parent_transitioned, parent_now_dead) = {
                     let Some(parent_node) = self.nodes.nodes.node_weight_mut(parent) else {
                         continue;
                     };
                     let prev_parent_alive = parent_node.alive_uncached();
+                    let prev_parent_kept = parent_node.should_keep_cached();
                     if now_alive {
                         parent_node.live_descendant_count = parent_node
                             .live_descendant_count
@@ -683,8 +700,21 @@ impl ComputeGraphInner {
                         parent_node.live_descendant_count =
                             parent_node.live_descendant_count.saturating_sub(1);
                     }
-                    prev_parent_alive != parent_node.alive_uncached()
+                    (
+                        prev_parent_alive != parent_node.alive_uncached(),
+                        prev_parent_kept && !parent_node.should_keep_cached(),
+                    )
                 };
+                // A parent whose last live descendant just went away is now
+                // unreachable by any future resolve and must eventually be
+                // removed. `check_life` cannot run here — during a resolve
+                // the execution graph still reads this node — so record it
+                // for `prune_deferred_dead`. Note this also catches CACHED
+                // parents, which never flip `alive_uncached` and so are
+                // invisible to the transition propagation below.
+                if parent_now_dead {
+                    self.deferred_dead.push(parent);
+                }
                 if parent_transitioned {
                     stack.push(parent);
                 }
@@ -783,33 +813,45 @@ impl ComputeGraphInner {
     }
 
     fn check_life(&mut self, key: NodeIndex, removed: &mut Vec<ComputeGraphNode>) {
-        // The node is needed iff it has external references OR some
-        // uncached live descendant. `live_descendant_count` is maintained
-        // eagerly, so this is O(1).
-        match self
-            .nodes
-            .nodes
-            .node_weight(key)
-            .map(|n| n.should_keep_cached())
-        {
-            Some(true) | None => return,
-            Some(false) => {}
+        // Iterative worklist, NOT recursion: teardown cascades one frame per
+        // node, and dropping the last handle to a long-lived chain (e.g. an
+        // optimizer moment at the end of a training run) must not overflow
+        // the stack.
+        let mut worklist = vec![key];
+        while let Some(key) = worklist.pop() {
+            // The node is needed iff it has external references OR some
+            // uncached live descendant. `live_descendant_count` is maintained
+            // eagerly, so this is O(1).
+            match self
+                .nodes
+                .nodes
+                .node_weight(key)
+                .map(|n| n.should_keep_cached())
+            {
+                Some(true) | None => continue,
+                Some(false) => {}
+            }
+
+            // Not needed — remove it. Per the invariant above, the node's
+            // `alive_uncached` was already false (cached.is_some() or
+            // ref==luc==0), so its contribution to each parent's
+            // `live_descendant_count` is already 0; no further bookkeeping is
+            // needed when the edges go away with the node.
+            self.visit_dependencies(key, &mut |dependency| {
+                worklist.push(dependency);
+            });
+            self.remove_key(key, removed);
         }
+    }
 
-        let mut dependencies = Vec::new();
-        self.visit_dependencies(key, &mut |dependency| {
-            dependencies.push(dependency);
-        });
-
-        // Not needed — remove it. Per the invariant above, the node's
-        // `alive_uncached` was already false (cached.is_some() or
-        // ref==luc==0), so its contribution to each parent's
-        // `live_descendant_count` is already 0; no further bookkeeping is
-        // needed when the edges go away with the node.
-        self.remove_key(key, removed);
-
-        for dependency in dependencies {
-            self.check_life(dependency, removed);
+    /// Remove nodes whose liveness died inside a resolve (recorded in
+    /// `deferred_dead` by `propagate_alive_change`). Runs at the end of the
+    /// public graph operations, once the execution that was still reading
+    /// those nodes' buffers has been submitted. Entries removed by an earlier
+    /// cascade are skipped by `check_life`'s existence check.
+    fn prune_deferred_dead(&mut self, removed: &mut Vec<ComputeGraphNode>) {
+        while let Some(key) = self.deferred_dead.pop() {
+            self.check_life(key, removed);
         }
     }
 
@@ -850,12 +892,18 @@ impl ComputeGraphInner {
         // longer needs to be recomputed, so its parents can free their own
         // cached buffers once no other uncached descendant remains. Propagate
         // the transition so ancestor counters reflect the new state.
-        let transitioned_dead = {
+        let (transitioned_dead, now_dead) = {
             let node = self.nodes.nodes.node_weight_mut(key).unwrap();
             let prev_alive = node.alive_uncached();
             node.cached = Some(data);
-            prev_alive && !node.alive_uncached()
+            (
+                prev_alive && !node.alive_uncached(),
+                !node.should_keep_cached(),
+            )
         };
+        if now_dead {
+            self.deferred_dead.push(key);
+        }
         if transitioned_dead {
             self.propagate_alive_change(key, false);
         }
@@ -896,6 +944,24 @@ impl ComputeGraphInner {
 
     #[cfg(feature = "extra_assertions")]
     fn verify_integrity(&self) {
+        // Dead nodes (no references, no live uncached descendant) are pruned
+        // eagerly — by the `check_life` cascade on reference drops and by
+        // `prune_deferred_dead` after resolves — so none may survive past the
+        // end of a public operation. A node lingering here is a husk: it
+        // would accumulate once per training step and make final teardown
+        // O(steps).
+        assert!(
+            self.deferred_dead.is_empty(),
+            "deferred dead set not drained"
+        );
+        for key in self.nodes.nodes.node_indices() {
+            let node = self.nodes.nodes.node_weight(key).unwrap();
+            assert!(
+                node.should_keep_cached(),
+                "dead node {key:?} survived pruning"
+            );
+        }
+
         // Check that all edges point to existing nodes
         for key in self.nodes.nodes.node_indices() {
             for neighbor in self.nodes.nodes.neighbors(key) {

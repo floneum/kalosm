@@ -1,23 +1,21 @@
 //! One materialization pipeline for the lazy compute graph.
 //!
 //! A resolve builds the temporary execution graph, recognizes specialized
-//! operations, runs one policy-driven rewrite fixpoint, lowers nodes into an
+//! operations and applies policy-driven fusion through the
+//! equality-saturation optimizer (see [`egraph`]), lowers nodes into an
 //! operation queue, builds complete kernel plans, and encodes the resulting
 //! command records. Flush replay skips deterministic planning but rejoins the
 //! same command-record encoder.
 
-use std::{collections::VecDeque, str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc};
 
 use web_time::{Duration, Instant};
 
 use crate::{
     DataTypeEnum, Layout,
-    compute_graph::layout_pass::LayoutPass,
     mir::{inputs::MirValue, kernel_backend::PreparedDirectDispatch, operation::Operation},
-    nary_wise::{
-        ElementwiseOperation, ExtractedUnaryChain, NaryExpr, NaryOp, NaryScalar, UnaryFunctionChain,
-    },
-    quantized::matmul::{ElementwiseEpilogue, QMatMulOperation},
+    nary_wise::{ElementwiseOperation, ExtractedUnaryChain, NaryExpr, NaryOp, NaryScalar},
+    quantized::matmul::QMatMulOperation,
     tensor::TensorData,
 };
 use petgraph::algo::toposort;
@@ -35,6 +33,7 @@ use crate::{
 
 mod alloc_reuse;
 mod cluster_match;
+mod egraph;
 mod execution;
 pub(crate) mod flush_replay;
 mod fold_views;
@@ -138,37 +137,6 @@ struct ResolveHostProfile {
 }
 
 const LARGE_GRAPH_NARY_FUSION_MIN_LAST_DIM: usize = 512;
-
-#[derive(Default)]
-struct OptimizeProfile {
-    iterations: usize,
-    changed: usize,
-    fuse_naries_count: usize,
-    fuse_naries: Duration,
-    fuse_reduce_count: usize,
-    fuse_reduce: Duration,
-    fuse_matmul_count: usize,
-    fuse_matmul: Duration,
-}
-
-impl OptimizeProfile {
-    fn print(&self) {
-        tracing::info!(
-            "resolve_optimize_profile iterations={} changed={} \
-fuse_naries_count={} fuse_naries={:?} \
-fuse_reduce_count={} fuse_reduce={:?} \
-fuse_matmul_count={} fuse_matmul={:?}",
-            self.iterations,
-            self.changed,
-            self.fuse_naries_count,
-            self.fuse_naries,
-            self.fuse_reduce_count,
-            self.fuse_reduce,
-            self.fuse_matmul_count,
-            self.fuse_matmul,
-        );
-    }
-}
 
 const DEFAULT_OPTIMIZE_NODE_LIMIT: usize = 512;
 
@@ -338,11 +306,6 @@ fn print_gpu_kernel_profile(
 pub(crate) struct Resolver {
     execution_graph: ExecutionGraph,
     node_mapping: FxHashMap<NodeIndex, ExecutionNodeIndex>,
-    // Persistent memoized layout inference: the inner graph's node variants
-    // are immutable during optimization (rewrites only touch the execution
-    // graph and dependency edges), so layouts computed once stay valid for
-    // the whole resolve.
-    layout_pass: LayoutPass,
     targets: Vec<NodeIndex>,
     resolved_set: FxHashSet<NodeIndex>,
     // Materialization-plan recorder, armed only on the second sighting of an
@@ -380,7 +343,6 @@ impl Resolver {
             targets,
             execution_graph: Default::default(),
             node_mapping: Default::default(),
-            layout_pass: Default::default(),
             resolved_set,
             recorder: None,
             horizontal_merge: false,

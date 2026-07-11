@@ -272,11 +272,10 @@ impl BufferLedger {
             + u32::from(self.queued.contains(&ptr))
             + self.transient.get(&ptr).copied().unwrap_or(0)
             + self.recorder_pins.get(&ptr).copied().unwrap_or(0)
-            + u32::from(self.device.buffer_pool_is_tracked(
-                buffer.size(),
-                buffer.usage(),
-                &buffer,
-            ));
+            + u32::from(
+                self.device
+                    .buffer_pool_is_tracked(buffer.size(), buffer.usage(), &buffer),
+            );
         if Arc::strong_count(&buffer) as u32 != expected {
             return None;
         }
