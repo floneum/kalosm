@@ -1,5 +1,5 @@
 use crate::{
-    Device, Layout, Tensor, compute_graph::NodeIndex, kernel_selection::CooperativeMatrixKind,
+    Layout, Tensor, compute_graph::NodeIndex,
     nary_wise::UnaryFunctionChain, tensor::DataTypeEnum,
 };
 
@@ -13,20 +13,16 @@ mod variants;
 
 pub(crate) use kernel::{MatmulMergeKey, build_merged_matmul_kernel};
 pub(crate) use variants::CoopTile;
-use variants::select_dense_matmul_params;
-
-pub fn get_optimal_params(m: usize, n: usize, k: usize, device: &Device) -> MatMulParams {
-    select_dense_matmul_params(m, n, k, device, &[CooperativeMatrixKind::F32F32M8N8K8])
-}
 
 #[derive(Debug, Clone, PartialEq, Hash)]
-pub enum MatMulParams {
+pub(crate) enum MatMulParams {
     Vector(sgemv::SgemvParams),
     MatMul(sgemm::SgemmParams),
-    /// The cooperative-matrix family. Geometry is not a parameter:
-    /// the scored tile selection derives it per kernel build, so
-    /// dispatch, allocation, and kernel agree by construction.
-    CoopMatMul(CooperativeMatrixKind),
+    /// The cooperative-matrix family. Neither geometry nor the matrix
+    /// kind is a parameter: the scored tile selection derives geometry per
+    /// kernel build and the kind follows from the datatype, so dispatch,
+    /// allocation, and kernel agree by construction.
+    CoopMatMul,
 }
 
 /// An affine relayout between an operand's dims and its node's logical
@@ -209,35 +205,6 @@ impl Tensor {
             output_datatype: datatype,
         }));
         product.sum(k_dim)
-    }
-
-    /// Matrix multiply with explicit kernel parameters: a tuning/benchmark
-    /// API. The parameters cannot round-trip through the composed graph, so
-    /// the operation builds directly against materialized inputs and
-    /// executes eagerly, returning a fresh leaf tensor.
-    pub fn mat_mul_with_parameters(&self, other: &Self, parameters: MatMulParams) -> Self {
-        assert_eq!(self.datatype(), other.datatype());
-        self.data.materialize();
-        other.data.materialize();
-        let operation = MatMulOperation::new(
-            self.datatype(),
-            self.key(),
-            other.key(),
-            self.shape(),
-            other.shape(),
-            Some(parameters),
-            self.device(),
-        );
-        let output = self
-            .device()
-            .compute_graph()
-            .execute_eager(&operation)
-            .unwrap_or_else(|| {
-                panic!(
-                    "mat_mul_with_parameters could not build a kernel for the requested parameters"
-                )
-            });
-        Tensor::from(output)
     }
 }
 
@@ -496,7 +463,6 @@ mod selection_tests {
 mod split_k_tests {
     //! GPU gates for automatic split-K selection and aligned-span codegen.
 
-    use super::MatMulOperation;
     use crate::{Device, Tensor};
 
     fn check_dense_split_k(m: usize, k: usize, n: usize) {
@@ -511,23 +477,7 @@ mod split_k_tests {
             let b_data = values(k * n, 0.07);
             let a = Tensor::from_slice(&device, [m, k], &a_data);
             let b = Tensor::from_slice(&device, [k, n], &b_data);
-            a.data.materialize();
-            b.data.materialize();
-            let operation = MatMulOperation::new(
-                crate::DataTypeEnum::F32,
-                a.key(),
-                b.key(),
-                &[m, k],
-                &[k, n],
-                None,
-                &device,
-            );
-            let Some(output) = device.compute_graph().execute_eager(&operation) else {
-                // Devices without cooperative matrices run the generic path;
-                // nothing dense-specific to gate there.
-                return;
-            };
-            let out: Tensor = Tensor::from(output);
+            let out = a.mat_mul(&b);
             let actual = out.as_slice::<2, f32>().await.unwrap();
             for mi in 0..m {
                 for ni in 0..n {

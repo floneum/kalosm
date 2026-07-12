@@ -28,7 +28,7 @@ use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
 use rustc_hash::FxHasher;
 
-use super::{QMatMulDirectPipelineKey, QMatrix, QMatrixStorageLayout};
+use super::{QMatrix, QMatrixStorageLayout};
 
 mod kernel;
 #[cfg(test)]
@@ -167,7 +167,9 @@ fn qgemv_subgroup_supported(
     n: u32,
     caps: KernelDeviceCaps,
 ) -> bool {
-    let subgroups = tile_ir_kernels::qgemv_subgroups_per_workgroup_for_shape(format, k, n);
+    // The subgroup count the emitted kernel will actually use — not the
+    // per-format default, which disagrees in the shape-specialized regimes.
+    let subgroups = tile_ir_kernels::qgemv_selected_shape(format, k, n).subgroups;
     subgroup_runtime_supported(caps) && subgroup_workgroup_size_supported(caps, subgroups)
 }
 
@@ -658,9 +660,8 @@ fn qmatmul_qgemv_dispatch_supported(
     n: u32,
     max_workgroups_per_dimension: u32,
 ) -> bool {
-    let qgemv_cols_per_workgroup = qgemv_cols_per_workgroup_for_direct(format, k, n);
-    let qgemv_workgroups = n.div_ceil(qgemv_cols_per_workgroup);
-    split_workgroups_2d(qgemv_workgroups, max_workgroups_per_dimension).is_some()
+    let cols = tile_ir_kernels::qgemv_selected_shape(format, k, n).cols_per_workgroup();
+    split_workgroups_2d(n.div_ceil(cols), max_workgroups_per_dimension).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -740,40 +741,11 @@ fn qmatrix_direct_quant_format(matrix: &QMatrix) -> Option<tile_ir::GgmlQuantFor
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cached_qmatmul_direct_kernel(
-    kernel_name: &str,
-    matrix: &QMatrix,
-    pipeline_key: &QMatMulDirectPipelineKey,
-    input: &TensorData,
-    output: &TensorData,
-    dispatch_size: [u32; 3],
-) -> Option<DirectKernel> {
-    let pipeline = matrix
-        .direct_pipeline_cache()
-        .write()
-        .get(pipeline_key)
-        .cloned()?;
-    Some(
-        kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
-            kernel_name.to_owned(),
-            pipeline,
-            None,
-            input.buffer().clone(),
-            matrix.buffer().clone(),
-            output.buffer().clone(),
-            dispatch_size,
-        ),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 fn qmatmul_direct_kernel_from_ir(
     device: &Device,
-    cached_kernel_name: String,
     kernel_name: String,
     cache_key: kernel_backend::KernelCacheKey,
     matrix: &QMatrix,
-    pipeline_key: QMatMulDirectPipelineKey,
     input: &TensorData,
     pre_extra_tensors: &[&TensorData],
     post_extra_tensors: &[&TensorData],
@@ -804,27 +776,12 @@ fn qmatmul_direct_kernel_from_ir(
             dispatch_size,
         );
     }
-    if let Some(kernel) = cached_qmatmul_direct_kernel(
-        &cached_kernel_name,
-        matrix,
-        &pipeline_key,
-        input,
-        output,
-        dispatch_size,
-    ) {
-        return Some(kernel);
-    }
     let (pipeline, cached) = kernel_backend::three_buffer_pipeline_from_ir(
         device.kernel_cache(),
         &kernel_name,
         cache_key,
         build_ir,
     )?;
-    let pipeline = matrix
-        .direct_pipeline_cache()
-        .write()
-        .get_or_insert(pipeline_key, || pipeline.clone())
-        .clone();
     Some(
         kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
             kernel_name,
@@ -850,17 +807,6 @@ fn split_workgroups_2d(
 
 fn effective_qmatmul_max_workgroups_per_dimension(limits: &wgpu::Limits) -> u32 {
     limits.max_compute_workgroups_per_dimension.max(1)
-}
-
-/// Output columns per workgroup for the direct qgemv path: exactly the
-/// geometry the qgemv builder will emit, so the launched grid and the
-/// kernel's internal grid agree by construction. The former re-derived
-/// (format, K, N) range table disagreed with the builder on several cells
-/// (e.g. 4x too many masked workgroups on Q4K K<=4096/N in 8192..=16384,
-/// and a permanently missed pipeline fast path anywhere the totals
-/// differed, since the pipeline key includes the dispatch size).
-fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32, n: u32) -> u32 {
-    tile_ir_kernels::qgemv_selected_shape(format, k, n).cols_per_workgroup()
 }
 
 fn qmatmul_m_pad_target_for_caps(m: usize, n: usize, caps: KernelDeviceCaps) -> Option<usize> {

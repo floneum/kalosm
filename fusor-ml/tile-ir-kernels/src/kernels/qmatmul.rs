@@ -68,7 +68,12 @@ pub fn qmatmul_with_epilogue(
     assert_eq!(b.cols, y_n, "qmatmul output column count must match B");
 
     if m == 1 {
-        super::qgemv::qgemv_with_epilogue(program, a, b, y, 1, subgroups, epilogues);
+        let shape = crate::dispatch::qgemv_selected_shape(
+            b.format,
+            b.rows,
+            epilogues.post_output_cols(b.cols),
+        );
+        super::qgemv::qgemv_tile_with_epilogue(program, a, b, y, 1, subgroups, shape, epilogues);
     } else {
         qmatmul_tile_with_epilogue(program, a, b, y, epilogues, coop, subgroups, bm, bn, bk);
     }
@@ -198,9 +203,6 @@ pub(crate) fn qmatmul_try_coop(
     bn: u32,
     bk: u32,
 ) -> bool {
-    if std::env::var_os("FUSOR_DIAG_DISABLE_COOP").is_some() {
-        return false;
-    }
     if b.format.is_q4k_family() || b.format.is_q6k_family() {
         return false;
     }

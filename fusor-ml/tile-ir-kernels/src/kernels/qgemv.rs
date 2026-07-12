@@ -94,6 +94,7 @@ fn qgemv_shape(subgroups: u32, cols_per_subgroup: u32) -> QgemvShape {
 ///         &y,
 ///         1,
 ///         fusor_tile_ir_kernels::SubgroupConfig::fixed(subgroup, 32),
+///         fusor_tile_ir_kernels::qgemv_selected_shape(GgmlQuantFormat::Q4K, 256, 128),
 ///         Option::<&UnaryEpilogue>::None,
 ///     );
 /// });
@@ -106,10 +107,11 @@ pub fn qgemv_with_epilogue<'a>(
     y: &Storage,
     workgroups_x: u32,
     subgroups: SubgroupConfig,
+    shape: QgemvShape,
     epilogues: impl IntoQgemvEpilogues<'a>,
 ) {
     let epilogues = epilogues.into_qgemv_epilogues();
-    qgemv_tile_with_epilogue(program, a, b, y, workgroups_x, subgroups, &epilogues);
+    qgemv_tile_with_epilogue(program, a, b, y, workgroups_x, subgroups, shape, &epilogues);
 }
 
 /// Format-dispatched qgemv body with optional pre/post unary epilogues.
@@ -128,23 +130,22 @@ pub(crate) fn qgemv_tile_with_epilogue(
     y: &Storage,
     workgroups_x: u32,
     subgroups: SubgroupConfig,
+    shape: QgemvShape,
     ep: &QmatmulEpilogues<'_>,
 ) {
     let [m, _] = matrix_shape(a.layout());
     assert_eq!(m, 1, "qgemv requires a single input row");
+    debug_assert_eq!(
+        shape,
+        qgemv_selected_shape(b.format, b.rows, ep.post_output_cols(b.cols)),
+        "caller-provided qgemv shape must be the selected shape for this matrix",
+    );
     let tensors = QgemvTensors { a, b, y };
-    let output_cols = ep.post_output_cols(b.cols);
 
     match b.format {
-        GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native => qgemv_perf_with_epilogue(
-            program,
-            tensors,
-            workgroups_x,
-            subgroups,
-            ep,
-            qgemv_selected_shape(b.format, b.rows, output_cols),
-            8,
-        ),
+        GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native => {
+            qgemv_perf_with_epilogue(program, tensors, workgroups_x, subgroups, ep, shape, 8)
+        }
         GgmlQuantFormat::Q8_1 => qgemv_perf_with_epilogue(
             program,
             tensors,
@@ -155,7 +156,6 @@ pub(crate) fn qgemv_tile_with_epilogue(
             8,
         ),
         GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative => {
-            let shape = qgemv_selected_shape(b.format, b.rows, output_cols);
             // The decode matmuls (no pre-epilogue) take the ggml super-block-
             // amortized dot, which decodes each 256-element super-block's
             // scale/min once per lane instead of re-decoding per 16-element
@@ -219,7 +219,6 @@ pub(crate) fn qgemv_tile_with_epilogue(
             8,
         ),
         GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative => {
-            let shape = qgemv_selected_shape(b.format, b.rows, output_cols);
             // Only the default (8, 4) regime uses the 16-value lanes; the
             // large/tall/4-subgroup regimes all stage 8 values per lane.
             let values_per_lane = if shape == qgemv_shape(8, 4) { 16 } else { 8 };

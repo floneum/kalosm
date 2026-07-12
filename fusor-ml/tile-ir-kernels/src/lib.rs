@@ -11,7 +11,7 @@ mod types;
 
 pub use dispatch::{
     qgemv_selected_shape,
-    qgemv_subgroups_per_workgroup_for_shape, SubgroupConfig,
+    SubgroupConfig,
 };
 pub use kernels::{
     coop_tile_entries, linear_storage_layout, qgemv_with_epilogue,

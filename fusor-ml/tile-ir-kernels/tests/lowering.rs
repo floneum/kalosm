@@ -41,6 +41,7 @@ fn qgemv_ir_with_subgroup_size(
             &y,
             1,
             subgroup_config(subgroup_size),
+            fusor_tile_ir_kernels::qgemv_selected_shape(format, rows, cols),
             Option::<&UnaryEpilogue>::None,
         );
     })

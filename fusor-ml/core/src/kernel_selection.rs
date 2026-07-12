@@ -11,7 +11,7 @@ const DIM_SAMPLE_ATTEMPTS: usize = 128;
 const SHAPE_SAMPLE_ATTEMPTS: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CooperativeMatrixKind {
+pub(crate) enum CooperativeMatrixKind {
     F32F32M8N8K8,
     F16F16M8N8K8,
 }

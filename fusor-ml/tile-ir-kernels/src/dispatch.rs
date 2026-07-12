@@ -7,18 +7,8 @@
 //! the literal generic
 //! arguments.
 //!
-//! The mapping from environment variables and `(rows, cols)` heuristics to
-//! ShapeKeys mirrors the table that previously lived inline in the builder
-//! methods. Snapshot tests in this module pin the current behavior so that
-//! the move from inline shape-tables to policy functions is observably a
-//! no-op.
-//!
-//! Env vars (all preserved):
-//!   - `FUSOR_Q4K_MID_TILE`   (rows<=4096, 4096<=cols<8192)
-//!   - `FUSOR_Q4K_LARGE_TILE` (rows<=4096, cols>=8192)
-//!   - `FUSOR_Q4K_TALL_TILE`  (rows>4096,  cols<=4096)
-//!   - `FUSOR_Q6K_LARGE_TILE` (rows<=4096, cols>=8192)
-//!   - `FUSOR_Q6K_TALL_TILE`  (rows>4096,  cols<=4096)
+//! Shape selection is automatic and deterministic. Tests exercise the pure
+//! policy functions directly; production has no environment-forced geometry.
 
 use fusor_tile_ir::{GgmlQuantFormat, SubgroupToken};
 
@@ -38,7 +28,7 @@ pub(crate) const fn qgemv_subgroups_per_workgroup(format: GgmlQuantFormat) -> u3
 }
 
 /// Shape-aware subgroup count used by the qgemv dispatch policy.
-pub const fn qgemv_subgroups_per_workgroup_for_shape(
+const fn qgemv_subgroups_per_workgroup_for_shape(
     format: GgmlQuantFormat,
     rows: u32,
     _cols: u32,
@@ -91,13 +81,13 @@ pub fn qgemv_selected_shape(
         GgmlQuantFormat::Q8_1 => QgemvShape::new(4, 4),
         GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative => {
             if rows <= 4096 && (4096..8192).contains(&output_cols) {
-                q4k_mid_override(q4k_default_mid(rows, output_cols))
+                q4k_default_mid(rows, output_cols)
             } else if rows <= 4096 && output_cols <= 4096 {
                 QgemvShape::new(8, 4)
             } else if rows <= 4096 && output_cols >= 8192 {
-                q4k_large_override(q4k_default_large(rows, output_cols))
+                q4k_default_large(rows, output_cols)
             } else if rows > 4096 && output_cols <= 4096 {
-                q4k_tall_override(q4k_default_tall(rows, output_cols))
+                q4k_default_tall(rows, output_cols)
             } else if qgemv_subgroups_per_workgroup_for_shape(format, rows, output_cols) == 8 {
                 QgemvShape::new(8, 8)
             } else {
@@ -114,9 +104,9 @@ pub fn qgemv_selected_shape(
         GgmlQuantFormat::Q5K | GgmlQuantFormat::Q5KNative => QgemvShape::new(2, 1),
         GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative => {
             if rows <= 4096 && output_cols >= 8192 {
-                q6k_large_override(q6k_default_large(rows, output_cols))
+                q6k_default_large(rows, output_cols)
             } else if rows > 4096 && output_cols <= 4096 {
-                q6k_tall_override(q6k_default_tall(rows, output_cols))
+                q6k_default_tall(rows, output_cols)
             } else if qgemv_subgroups_per_workgroup_for_shape(format, rows, output_cols) == 4 {
                 QgemvShape::new(4, 4)
             } else {
@@ -191,66 +181,6 @@ pub(crate) const fn q4k_default_mid(_rows: u32, cols: u32) -> QgemvShape {
     QgemvShape::new(2, 2)
 }
 
-/// Apply `FUSOR_Q4K_MID_TILE` if set; otherwise return the default. The set
-/// of accepted env values is exactly the inline `qgemv_ggml_env!` table that
-/// used to live in `qgemv_tile`.
-/// Per-context env override tables. Each entry maps an env-var token to the
-/// `QgemvShape` it selects. Different contexts (mid / large / tall, Q4K vs
-/// Q6K) accept different subsets of the 14 total shapes.
-const Q4K_MID_TILES: &[(&str, QgemvShape)] = &[
-    ("ggml_2x2", QgemvShape::new(2, 2)),
-    ("ggml_2x3", QgemvShape::new(2, 3)),
-    ("ggml_2x4", QgemvShape::new(2, 4)),
-    ("ggml_2x8", QgemvShape::new(2, 8)),
-    ("ggml_4x2", QgemvShape::new(4, 2)),
-    ("ggml_4x3", QgemvShape::new(4, 3)),
-    ("ggml_4x4", QgemvShape::new(4, 4)),
-    ("ggml_4x8", QgemvShape::new(4, 8)),
-    ("ggml_8x2", QgemvShape::new(8, 2)),
-    ("ggml_8x4", QgemvShape::new(8, 4)),
-];
-
-const Q4K_LARGE_TILES: &[(&str, QgemvShape)] = &[
-    ("ggml_1x4", QgemvShape::new(1, 4)),
-    ("ggml_1x8", QgemvShape::new(1, 8)),
-    ("ggml_2x2", QgemvShape::new(2, 2)),
-    ("ggml_2x4", QgemvShape::new(2, 4)),
-    ("ggml_2x8", QgemvShape::new(2, 8)),
-    ("ggml_4x1", QgemvShape::new(4, 1)),
-    ("ggml_4x2", QgemvShape::new(4, 2)),
-    ("ggml_4x4", QgemvShape::new(4, 4)),
-    ("ggml_4x8", QgemvShape::new(4, 8)),
-    ("ggml_8x1", QgemvShape::new(8, 1)),
-    ("ggml_8x2", QgemvShape::new(8, 2)),
-    ("ggml_8x4", QgemvShape::new(8, 4)),
-];
-
-const STANDARD_8_TILES: &[(&str, QgemvShape)] = &[
-    ("ggml_2x2", QgemvShape::new(2, 2)),
-    ("ggml_2x4", QgemvShape::new(2, 4)),
-    ("ggml_2x8", QgemvShape::new(2, 8)),
-    ("ggml_4x2", QgemvShape::new(4, 2)),
-    ("ggml_4x4", QgemvShape::new(4, 4)),
-    ("ggml_4x8", QgemvShape::new(4, 8)),
-    ("ggml_8x2", QgemvShape::new(8, 2)),
-    ("ggml_8x4", QgemvShape::new(8, 4)),
-];
-
-fn env_tile_override(var: &str, table: &[(&str, QgemvShape)], default: QgemvShape) -> QgemvShape {
-    let Ok(value) = std::env::var(var) else {
-        return default;
-    };
-    table
-        .iter()
-        .find(|(name, _)| *name == value)
-        .map(|(_, shape)| *shape)
-        .unwrap_or(default)
-}
-
-pub(crate) fn q4k_mid_override(default: QgemvShape) -> QgemvShape {
-    env_tile_override("FUSOR_Q4K_MID_TILE", Q4K_MID_TILES, default)
-}
-
 // ----- Q4K large (rows<=4096, cols>=8192) -----
 
 /// Default Q4K large-shape: cols<=16_384 → 8x4, else 2x4.
@@ -262,22 +192,11 @@ pub(crate) const fn q4k_default_large(_rows: u32, cols: u32) -> QgemvShape {
     }
 }
 
-/// Apply `FUSOR_Q4K_LARGE_TILE` if set. Carries the same tile list as the
-/// inline macro: adds 1x4/1x8/4x1/8x1 (no 2x3/4x3 entries).
-pub(crate) fn q4k_large_override(default: QgemvShape) -> QgemvShape {
-    env_tile_override("FUSOR_Q4K_LARGE_TILE", Q4K_LARGE_TILES, default)
-}
-
 // ----- Q4K tall (rows>4096, cols<=4096) -----
 
 /// Default Q4K tall-shape: 4x2.
 pub(crate) const fn q4k_default_tall(_rows: u32, _cols: u32) -> QgemvShape {
     QgemvShape::new(4, 2)
-}
-
-/// Apply `FUSOR_Q4K_TALL_TILE` if set. Standard 8-tile set.
-pub(crate) fn q4k_tall_override(default: QgemvShape) -> QgemvShape {
-    env_tile_override("FUSOR_Q4K_TALL_TILE", STANDARD_8_TILES, default)
 }
 
 // ----- Q6K large (rows<=4096, cols>=8192) -----
@@ -291,11 +210,6 @@ pub(crate) const fn q6k_default_large(_rows: u32, cols: u32) -> QgemvShape {
     }
 }
 
-/// Apply `FUSOR_Q6K_LARGE_TILE` if set. Standard 8-tile set.
-pub(crate) fn q6k_large_override(default: QgemvShape) -> QgemvShape {
-    env_tile_override("FUSOR_Q6K_LARGE_TILE", STANDARD_8_TILES, default)
-}
-
 // ----- Q6K tall (rows>4096, cols<=4096) -----
 
 /// Default Q6K tall-shape: 2x2.
@@ -303,49 +217,11 @@ pub(crate) const fn q6k_default_tall(_rows: u32, _cols: u32) -> QgemvShape {
     QgemvShape::new(2, 2)
 }
 
-/// Apply `FUSOR_Q6K_TALL_TILE` if set. Standard 8-tile set.
-pub(crate) fn q6k_tall_override(default: QgemvShape) -> QgemvShape {
-    env_tile_override("FUSOR_Q6K_TALL_TILE", STANDARD_8_TILES, default)
-}
-
 #[cfg(test)]
 mod tests {
-    //! Snapshot tests pinning the current `(format, rows, cols, env) →
-    //! ShapeKey` mapping. These must continue to pass after the inline
-    //! `qgemv_ggml_env!` invocations and `if b.cols == ...` heuristics in
-    //! `kernels/qgemv.rs` are replaced with calls into this module.
-    //!
-    //! Env-var tests use a serial mutex because `std::env::set_var` is
-    //! process-global. They also unset the variable on entry to avoid
-    //! cross-test contamination from a developer's shell.
+    //! Snapshot tests pinning the automatic `(format, rows, cols) → ShapeKey`
+    //! mapping.
     use super::*;
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn with_env<R>(var: &str, value: Option<&str>, f: impl FnOnce() -> R) -> R {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var(var).ok();
-        // SAFETY: tests serialize on env_lock above; no other thread reads or
-        // mutates this var while the closure runs.
-        unsafe {
-            match value {
-                Some(v) => std::env::set_var(var, v),
-                None => std::env::remove_var(var),
-            }
-        }
-        let out = f();
-        unsafe {
-            match prior {
-                Some(p) => std::env::set_var(var, p),
-                None => std::env::remove_var(var),
-            }
-        }
-        out
-    }
 
     /// The selected shape is the single source for dispatch and kernel
     /// geometry; these cells pin it where the deleted core-side re-derivation
@@ -413,137 +289,4 @@ mod tests {
         assert_eq!(q6k_default_tall(8192, 4096), QgemvShape::new(2, 2));
     }
 
-    #[test]
-    fn q4k_mid_override_table_unchanged() {
-        with_env("FUSOR_Q4K_MID_TILE", None, || {
-            assert_eq!(
-                q4k_mid_override(QgemvShape::new(2, 2)),
-                QgemvShape::new(2, 2)
-            );
-        });
-        let cases = [
-            ("ggml_2x2", QgemvShape::new(2, 2)),
-            ("ggml_2x3", QgemvShape::new(2, 3)),
-            ("ggml_2x4", QgemvShape::new(2, 4)),
-            ("ggml_2x8", QgemvShape::new(2, 8)),
-            ("ggml_4x2", QgemvShape::new(4, 2)),
-            ("ggml_4x3", QgemvShape::new(4, 3)),
-            ("ggml_4x4", QgemvShape::new(4, 4)),
-            ("ggml_4x8", QgemvShape::new(4, 8)),
-            ("ggml_8x2", QgemvShape::new(8, 2)),
-            ("ggml_8x4", QgemvShape::new(8, 4)),
-        ];
-        for (val, expect) in cases {
-            with_env("FUSOR_Q4K_MID_TILE", Some(val), || {
-                assert_eq!(
-                    q4k_mid_override(QgemvShape::new(4, 4)),
-                    expect,
-                    "FUSOR_Q4K_MID_TILE={val}"
-                );
-            });
-        }
-        // Unrecognized value falls through to default.
-        with_env("FUSOR_Q4K_MID_TILE", Some("nonsense"), || {
-            assert_eq!(
-                q4k_mid_override(QgemvShape::new(4, 4)),
-                QgemvShape::new(4, 4)
-            );
-        });
-    }
-
-    #[test]
-    fn q4k_large_override_table_unchanged() {
-        let cases = [
-            ("ggml_1x4", QgemvShape::new(1, 4)),
-            ("ggml_1x8", QgemvShape::new(1, 8)),
-            ("ggml_2x2", QgemvShape::new(2, 2)),
-            ("ggml_2x4", QgemvShape::new(2, 4)),
-            ("ggml_2x8", QgemvShape::new(2, 8)),
-            ("ggml_4x1", QgemvShape::new(4, 1)),
-            ("ggml_4x2", QgemvShape::new(4, 2)),
-            ("ggml_4x4", QgemvShape::new(4, 4)),
-            ("ggml_4x8", QgemvShape::new(4, 8)),
-            ("ggml_8x1", QgemvShape::new(8, 1)),
-            ("ggml_8x2", QgemvShape::new(8, 2)),
-            ("ggml_8x4", QgemvShape::new(8, 4)),
-        ];
-        for (val, expect) in cases {
-            with_env("FUSOR_Q4K_LARGE_TILE", Some(val), || {
-                assert_eq!(
-                    q4k_large_override(QgemvShape::new(4, 4)),
-                    expect,
-                    "FUSOR_Q4K_LARGE_TILE={val}"
-                );
-            });
-        }
-    }
-
-    #[test]
-    fn q4k_tall_override_table_unchanged() {
-        let cases = [
-            ("ggml_2x2", QgemvShape::new(2, 2)),
-            ("ggml_2x4", QgemvShape::new(2, 4)),
-            ("ggml_2x8", QgemvShape::new(2, 8)),
-            ("ggml_4x2", QgemvShape::new(4, 2)),
-            ("ggml_4x4", QgemvShape::new(4, 4)),
-            ("ggml_4x8", QgemvShape::new(4, 8)),
-            ("ggml_8x2", QgemvShape::new(8, 2)),
-            ("ggml_8x4", QgemvShape::new(8, 4)),
-        ];
-        for (val, expect) in cases {
-            with_env("FUSOR_Q4K_TALL_TILE", Some(val), || {
-                assert_eq!(
-                    q4k_tall_override(QgemvShape::new(4, 2)),
-                    expect,
-                    "FUSOR_Q4K_TALL_TILE={val}"
-                );
-            });
-        }
-    }
-
-    #[test]
-    fn q6k_large_override_table_unchanged() {
-        let cases = [
-            ("ggml_2x2", QgemvShape::new(2, 2)),
-            ("ggml_2x4", QgemvShape::new(2, 4)),
-            ("ggml_2x8", QgemvShape::new(2, 8)),
-            ("ggml_4x2", QgemvShape::new(4, 2)),
-            ("ggml_4x4", QgemvShape::new(4, 4)),
-            ("ggml_4x8", QgemvShape::new(4, 8)),
-            ("ggml_8x2", QgemvShape::new(8, 2)),
-            ("ggml_8x4", QgemvShape::new(8, 4)),
-        ];
-        for (val, expect) in cases {
-            with_env("FUSOR_Q6K_LARGE_TILE", Some(val), || {
-                assert_eq!(
-                    q6k_large_override(QgemvShape::new(2, 2)),
-                    expect,
-                    "FUSOR_Q6K_LARGE_TILE={val}"
-                );
-            });
-        }
-    }
-
-    #[test]
-    fn q6k_tall_override_table_unchanged() {
-        let cases = [
-            ("ggml_2x2", QgemvShape::new(2, 2)),
-            ("ggml_2x4", QgemvShape::new(2, 4)),
-            ("ggml_2x8", QgemvShape::new(2, 8)),
-            ("ggml_4x2", QgemvShape::new(4, 2)),
-            ("ggml_4x4", QgemvShape::new(4, 4)),
-            ("ggml_4x8", QgemvShape::new(4, 8)),
-            ("ggml_8x2", QgemvShape::new(8, 2)),
-            ("ggml_8x4", QgemvShape::new(8, 4)),
-        ];
-        for (val, expect) in cases {
-            with_env("FUSOR_Q6K_TALL_TILE", Some(val), || {
-                assert_eq!(
-                    q6k_tall_override(QgemvShape::new(2, 2)),
-                    expect,
-                    "FUSOR_Q6K_TALL_TILE={val}"
-                );
-            });
-        }
-    }
 }

@@ -232,10 +232,11 @@ impl MatMulOperation {
         {
             return None;
         }
-        let MatMulParams::CoopMatMul(kind) = &self.parameters else {
+        let MatMulParams::CoopMatMul = &self.parameters else {
             return None;
         };
-        device.coop_token(*kind)?;
+        let kind = *dense_coop_kinds_from_datatype(self.datatype).first()?;
+        device.coop_token(kind)?;
         let subgroup_config = device.subgroup_config()?;
         if !subgroup_config.is_fixed() {
             return None;
@@ -406,10 +407,11 @@ impl MatMulOperation {
             n_padded,
         } = self.hardware_matmul_prep(device, input_a, input_b, output)?;
         let subgroup_config = device_supported(device.subgroup_config())?;
-        let MatMulParams::CoopMatMul(kind) = &self.parameters else {
+        let MatMulParams::CoopMatMul = &self.parameters else {
             return Err(kernel_backend::DeviceNotSupported);
         };
-        let coop = device_supported(device.coop_token(*kind))?;
+        let kind = *device_supported(dense_coop_kinds_from_datatype(self.datatype).first())?;
+        let coop = device_supported(device.coop_token(kind))?;
 
         let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
         let datatype = self.datatype;
@@ -537,7 +539,7 @@ impl MatMulOperation {
     /// split) and [`Self::build_hardware_matmul`], so allocation and kernel
     /// selection agree by construction.
     fn split_k_factor(&self, device: &Device, tile: &CoopTile) -> Option<u32> {
-        if std::option_env!("FUSOR_NO_SPLITK").is_some() || self.has_elementwise_epilogues() {
+        if self.has_elementwise_epilogues() {
             return None;
         }
         let m: u32 = self.a.rows().try_into().ok()?;
@@ -920,10 +922,13 @@ pub(crate) fn build_merged_matmul_kernel(
     let Some(subgroup_config) = device.subgroup_config() else {
         decline!("subgroups");
     };
-    let MatMulParams::CoopMatMul(kind) = &first.parameters else {
+    let MatMulParams::CoopMatMul = &first.parameters else {
         decline!("params");
     };
-    let Some(coop) = device.coop_token(*kind) else {
+    let Some(&kind) = dense_coop_kinds_from_datatype(first.datatype).first() else {
+        decline!("coop_kind");
+    };
+    let Some(coop) = device.coop_token(kind) else {
         decline!("coop_token");
     };
     let element = match first.datatype {
@@ -1145,7 +1150,7 @@ impl Operation for MatMulOperation {
             // The cooperative kernels carry their own grid and block
             // (`ir.grid`); this shape only reaches the generic fused-reduce
             // fallback, so it is the fallback's own policy.
-            MatMulParams::CoopMatMul(_) => {
+            MatMulParams::CoopMatMul => {
                 crate::row_program::RowProgramOperation::from_reduce(&self.as_fused_reduce())
                     .workgroup_shape_constraints(device)
             }
@@ -1186,7 +1191,7 @@ impl Operation for MatMulOperation {
                 workgroup_shape,
                 sgemm_params,
             ),
-            MatMulParams::CoopMatMul(_) => {
+            MatMulParams::CoopMatMul => {
                 crate::row_program::RowProgramOperation::from_reduce(&self.as_fused_reduce())
                     .dispatch_size(workgroup_shape, inputs)
             }

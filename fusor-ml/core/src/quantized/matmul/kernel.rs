@@ -410,71 +410,17 @@ impl QMatMulOperation {
             }
             ^ if f16_storage { 0xF16F_0001u64 } else { 0 }
             ^ accumulator_offsets_identity;
-        let fast_dispatch_size = if use_workgroup_qmatmul {
-            // The workgroup-tiled kernel computes its own grid inside
-            // `tile::build`; skip the pre-built-pipeline fast path.
-            None
-        } else {
-            match variant {
-                QMatmulPath::Q5SmallSingleRow | QMatmulPath::SingleRow => {
-                    let qgemv_cols_per_workgroup =
-                        qgemv_cols_per_workgroup_for_direct(format, k, n);
-                    let qgemv_workgroups = n.div_ceil(qgemv_cols_per_workgroup);
-                    let [dispatch_x, _] = split_workgroups_2d(qgemv_workgroups, max_workgroups)?;
-                    qmatmul_workgroups_x = dispatch_x;
-                    Some([
-                        qmatmul_workgroups_x,
-                        qgemv_workgroups.div_ceil(qmatmul_workgroups_x),
-                        1,
-                    ])
-                }
-                // The IR-build fallback (cached=false catch-all) is the only
-                // path that defers the dispatch to the IR builder; every
-                // tile-aligned coop variant has a precomputed `[n/BN, m/BM, 1]`.
-                QMatmulPath::Tile {
-                    cached: false,
-                    tile,
-                } if tile == CoopTile::new(64, 64, QMATMUL_COOP_BK) => None,
-                QMatmulPath::Workgroup => None,
-                QMatmulPath::Q8Wide(tile) | QMatmulPath::Tile { tile, .. } => {
-                    Some([n / tile.bn, m / tile.bm, 1])
-                }
-            }
-        };
-        let kernel_name = kernel_name.into();
-        // The pre-built-pipeline fast path can only be reused when there's no
-        // epilogue attached — otherwise the cached pipeline encodes the wrong
-        // (no-epilogue) kernel. Skip the fast path entirely when fusing.
-        if pre_extra_tensors.is_empty()
-            && post_extra_tensors.is_empty()
-            && !has_custom_accumulator_offsets
-            && pre_epilogue_with_extras.is_none()
-            && post_epilogue_with_extras.is_none()
-            && let Some(dispatch_size) = fast_dispatch_size
+        // The one qgemv geometry decision: the dispatch here and the kernel
+        // body below both consume this value, so they cannot disagree.
+        let qgemv_shape = tile_ir_kernels::qgemv_selected_shape(format, k, n);
+        if !use_workgroup_qmatmul
+            && matches!(variant, QMatmulPath::Q5SmallSingleRow | QMatmulPath::SingleRow)
         {
-            if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
-                return None;
-            }
-            let pipeline_key = QMatMulDirectPipelineKey::new(
-                matrix.datatype(),
-                matrix.storage_layout(),
-                crate::quantized::QMatMulShape { m, k, n: matrix_n },
-                subgroup_size_range,
-                dispatch_size,
-                input.layout(),
-                output.layout(),
-            );
-            if let Some(kernel) = cached_qmatmul_direct_kernel(
-                &kernel_name,
-                matrix,
-                &pipeline_key,
-                input,
-                output,
-                dispatch_size,
-            ) {
-                return Some(kernel);
-            }
+            let qgemv_workgroups = n.div_ceil(qgemv_shape.cols_per_workgroup());
+            let [dispatch_x, _] = split_workgroups_2d(qgemv_workgroups, max_workgroups)?;
+            qmatmul_workgroups_x = dispatch_x;
         }
+        let kernel_name = kernel_name.into();
         let pre_with_extras_for_ir = pre_epilogue_with_extras.clone();
         let post_with_extras_for_ir = post_epilogue_with_extras.clone();
         let post_accumulator_offsets_for_ir = post_accumulator_offsets.to_vec();
@@ -636,6 +582,7 @@ impl QMatMulOperation {
                         &y,
                         qmatmul_workgroups_x,
                         subgroups,
+                        qgemv_shape,
                         &epilogues,
                     );
                     return;
@@ -658,16 +605,6 @@ impl QMatMulOperation {
         if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
             return None;
         }
-        let pipeline_key = QMatMulDirectPipelineKey::new_with_epilogue(
-            matrix.datatype(),
-            matrix.storage_layout(),
-            crate::quantized::QMatMulShape { m, k, n: matrix_n },
-            epilogue_identity,
-            subgroup_size_range,
-            dispatch_size,
-            input.layout(),
-            output.layout(),
-        );
         let cache_key = qmatmul_direct_cache_key::<QMatmulDirectEpilogueKernelVariant>(
             |state| {
                 variant.hash(state);
@@ -696,11 +633,9 @@ impl QMatMulOperation {
         );
         qmatmul_direct_kernel_from_ir(
             device,
-            kernel_name.clone(),
             kernel_name,
             cache_key,
             matrix,
-            pipeline_key,
             input,
             pre_extra_tensors,
             post_extra_tensors,

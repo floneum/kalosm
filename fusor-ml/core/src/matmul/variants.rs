@@ -68,9 +68,7 @@ pub(super) fn select_dense_matmul_params(
         .select(shape, &ctx, caps)
         .expect("dense matmul selector has a catch-all rule")
     {
-        DenseMatmulVariant::Coop => {
-            MatMulParams::CoopMatMul(select_coop_kind(caps, coop_kinds))
-        }
+        DenseMatmulVariant::Coop => MatMulParams::CoopMatMul,
         DenseMatmulVariant::Vector => MatMulParams::Vector(gemv_parameters(m, n, k)),
         DenseMatmulVariant::MatMul => MatMulParams::MatMul(gemm_parameters(m, n, k)),
     }
@@ -90,6 +88,7 @@ pub(super) fn coop_supported(caps: KernelDeviceCaps, coop_kinds: &[CooperativeMa
         && caps.max_compute_workgroup_size_x >= 64
 }
 
+#[cfg(test)]
 pub(super) fn select_coop_kind(
     caps: KernelDeviceCaps,
     coop_kinds: &[CooperativeMatrixKind],
@@ -138,12 +137,6 @@ impl CoopTile {
         !matches!((self.bm, self.bn, self.bk), (256, 256, 16))
     }
 
-    fn workgroup_size_supported(self, max_workgroup_size_x: u32, max_subgroup_size: u32) -> bool {
-        self.subgroup_groups()
-            .checked_mul(max_subgroup_size)
-            .is_some_and(|block| block <= max_workgroup_size_x)
-    }
-
     /// Pick a cooperative-matrix tile for the given (m, k, n) shape, or
     /// `None` when no coop tile is worth it (degenerate contractions route
     /// to the vector/generic families). Selection is the general scored
@@ -155,22 +148,6 @@ impl CoopTile {
         policy: &crate::occupancy::DispatchPolicy,
         max_subgroup_size: u32,
     ) -> Option<Self> {
-        if let Some(forced) = Self::forced_tile(policy.max_workgroup_lanes(), max_subgroup_size) {
-            return Some(forced);
-        }
         super::cost::select_coop_tile(m, k, n, policy, max_subgroup_size)
     }
-
-    /// Debug override: `FUSOR_FORCE_COOP_TILE=<bm>x<bn>` forces a specific
-    /// tile geometry for every coop matmul (bk is always 16). Used by the
-    /// per-tile conformance sweep and A/B tile experiments; unset in normal
-    /// operation.
-    fn forced_tile(max_workgroup_size_x: u32, max_subgroup_size: u32) -> Option<Self> {
-        let value = std::env::var("FUSOR_FORCE_COOP_TILE").ok()?;
-        let (bm, bn) = value.split_once('x')?;
-        let tile = Self::new(bm.parse().ok()?, bn.parse().ok()?, 16);
-        tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size)
-            .then_some(tile)
-    }
-
 }

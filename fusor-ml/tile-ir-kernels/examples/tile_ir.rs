@@ -128,6 +128,7 @@ fn qgemv_ir(format: GgmlQuantFormat, n: u32, k: u32) -> KernelIr {
             &y,
             1,
             subgroup_config(32),
+            tile_ir_kernels::qgemv_selected_shape(format, k, n),
             Option::<&tile_ir_kernels::UnaryEpilogue>::None,
         );
     })
@@ -151,6 +152,7 @@ fn qgemv_with_silu_epilogue_ir(format: GgmlQuantFormat, n: u32, k: u32) -> Kerne
             &y,
             1,
             subgroup_config(32),
+            tile_ir_kernels::qgemv_selected_shape(format, k, n),
             Some(&silu),
         );
     })
