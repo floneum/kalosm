@@ -242,13 +242,6 @@ pub(crate) struct RowProgramOperation {
     /// `Some` exactly when the program pins one lane per axis position
     /// (element steps / reducing output); `None` for chunked map programs.
     pub(crate) dynamic_axis: Option<DynamicAxis>,
-    /// Dense-large-graph codegen tuning: axis-sized workgroups, subgroup
-    /// whole-block reductions, and staged single-chunk reads. Set only by
-    /// `optimize_large_graph`'s dense branch (and the dense-only horizontal
-    /// merger), so quantized decode graphs and small (conformance-golden)
-    /// graphs keep the exact committed codegen. Hashed into the kernel
-    /// cache key.
-    pub(crate) dense_codegen: bool,
 }
 
 impl RowProgramOperation {
@@ -268,7 +261,6 @@ impl RowProgramOperation {
             ],
             output_datatype: reduce.out_datatype(),
             dynamic_axis: None,
-            dense_codegen: false,
         }
     }
 
@@ -324,12 +316,7 @@ impl RowProgramOperation {
             None => {
                 let policy = device.dispatch_policy();
                 let max_block = policy.preferred_workgroup_lanes();
-                if !self.dense_codegen {
-                    // Committed sizing for decode and small (golden-covered)
-                    // graphs: one full-width workgroup.
-                    return max_block;
-                }
-                // Dense-graph tuning: size the workgroup to the axis: a k=64
+                // Size the workgroup to the axis: a k=64
                 // softmax runs 64-lane workgroups whose whole-block reduction
                 // is subgroup-accelerated, instead of packing four rows into
                 // a 256-lane workgroup whose per-row reduction walks the
@@ -397,7 +384,6 @@ impl Operation for RowProgramOperation {
         self.axis.hash(state);
         self.steps.hash(state);
         self.output_datatype.hash(state);
-        self.dense_codegen.hash(state);
     }
 
     fn workgroup_shape_constraints(&self, device: &crate::Device) -> WorkgroupShapeConstraints {
@@ -761,22 +747,15 @@ fn fixed_subgroups(device: &crate::Device) -> FixedSubgroups {
 /// The per-row-group reduction: subgroup-accelerated when the group spans
 /// the whole workgroup on a fixed-subgroup device, the shared-memory tree
 /// otherwise. A 1-wide group is the lane's own value (the k=1 bias-grad
-/// sum), skipping the scratch round-trip entirely. Both accelerations are
-/// dense-large-graph tuning (`dense` mirrors
-/// [`RowProgramOperation::dense_codegen`]); with `dense` unset the emitted
-/// reduction is the committed shared-memory tree, unconditionally.
+/// sum), skipping the scratch round-trip entirely.
 fn emit_group_reduce(
     program: &mut tile_ir::tile::TileBlock<'_>,
-    dense: bool,
     subgroups: FixedSubgroups,
     op: tile_ir::TileReduceOp,
     group_size: u32,
     block: u32,
     value: Tile,
 ) -> Tile {
-    if !dense {
-        return program.group_reduce(op, group_size, value);
-    }
     if group_size == 1 {
         return program.bind(value);
     }
@@ -885,15 +864,11 @@ fn build_row_program_kernel(
         row_program_cache_key(operation, workgroup_shape, dispatch_size, inputs, 1, splits);
 
     let input_count = operation.inputs.len();
-    // Dense-large-graph codegen tuning gate: with `dense_codegen` unset
-    // (decode and small golden-covered graphs) every `emit_group_reduce`
-    // walks the committed shared-memory tree and reads are never staged.
-    let dense = operation.dense_codegen;
     let subgroups = fixed_subgroups(&graph.device());
     // Single-chunk chunked-map programs stage each distinct tensor read once
     // per lane and evaluate every phase (and the output) from the registers
     // instead of re-reading storage per phase.
-    let staged_reads = (dense && !lanes_own_axis && k.div_ceil(block) == 1)
+    let staged_reads = (!lanes_own_axis && k.div_ceil(block) == 1)
         .then(|| stage_single_chunk_reads(&phase_steps, &output_kind, input_count))
         .flatten();
     let axis_bound_dim = operation
@@ -965,7 +940,6 @@ fn build_row_program_kernel(
                         let masked_m = Tile::select(j_active.clone(), m_j.clone(), max_identity);
                         let global_max = emit_group_reduce(
                             program,
-                            dense,
                             subgroups,
                             tile_reduce_op(ReduceOp::Max),
                             block,
@@ -986,7 +960,6 @@ fn build_row_program_kernel(
                         );
                         let denom = emit_group_reduce(
                             program,
-                            dense,
                             subgroups,
                             tile_reduce_op(ReduceOp::Sum),
                             block,
@@ -1256,7 +1229,6 @@ fn build_row_program_kernel(
                         ));
                         let tile_max = emit_group_reduce(
                             program,
-                            dense,
                             subgroups,
                             tile_reduce_op(ReduceOp::Max),
                             block,
@@ -1275,7 +1247,6 @@ fn build_row_program_kernel(
                         ));
                         let tile_sum = emit_group_reduce(
                             program,
-                            dense,
                             subgroups,
                             tile_reduce_op(ReduceOp::Sum),
                             block,
@@ -1432,9 +1403,8 @@ fn build_row_program_kernel(
                     // value, so later phases can use it directly. With one row
                     // per workgroup `k_group == block` and this is the full
                     // workgroup reduction.
-                    let combined = emit_group_reduce(
-                        program, dense, subgroups, reduce_op, k_group, block, partial,
-                    );
+                    let combined =
+                        emit_group_reduce(program, subgroups, reduce_op, k_group, block, partial);
                     let (combined, combined_ty) =
                         apply_unary_function_chain(combined, phase_dtype, &reduce.post_chain)
                             .expect("validated row program post chain");
@@ -1777,7 +1747,6 @@ pub(crate) fn build_merged_row_program_kernel(
                             );
                             let combined = emit_group_reduce(
                                 program,
-                                true,
                                 subgroups,
                                 reduce_op,
                                 segment.k_group,
@@ -2067,6 +2036,5 @@ pub(crate) fn attention_row_program(
             input_axis_dims,
             axis_bound_dim: causal.then_some(2),
         }),
-        dense_codegen: false,
     })
 }

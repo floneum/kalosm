@@ -1,8 +1,5 @@
-//! Large-graph (training-path) row-fusion gates. Interleaved-view scalar
-//! absorption only runs in `optimize_large_graph`, so this file — its own
-//! process — forces the large path with `FUSOR_RESOLVE_OPTIMIZE_MAX_NODES`
-//! before touching the device. Exactly one test lives here: env mutation
-//! must not race other tests in the same binary.
+//! Aggressive row-fusion regression. Interleaved-view scalar absorption is
+//! part of the one default optimizer path for every graph size.
 
 use fusor_core::{Device, Tensor};
 
@@ -12,8 +9,6 @@ fn pattern(len: usize, scale: f32) -> Vec<f32> {
 
 #[test]
 fn keepdim_scalar_chain_sandwich_fuses_to_single_kernel() {
-    // Force every resolve through the large-graph optimizer.
-    unsafe { std::env::set_var("FUSOR_RESOLVE_OPTIMIZE_MAX_NODES", "1") };
     pollster::block_on(async {
         let Ok(device) = Device::new().await else {
             return;

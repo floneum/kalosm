@@ -7,7 +7,7 @@
 //! command records. Flush replay skips deterministic planning but rejoins the
 //! same command-record encoder.
 
-use std::{str::FromStr, sync::Arc};
+use std::sync::Arc;
 
 use web_time::{Duration, Instant};
 
@@ -134,17 +134,6 @@ struct ResolveHostProfile {
     encode: Duration,
     submit: Duration,
     profile_readback: Duration,
-}
-
-const LARGE_GRAPH_NARY_FUSION_MIN_LAST_DIM: usize = 512;
-
-const DEFAULT_OPTIMIZE_NODE_LIMIT: usize = 512;
-
-fn optimize_node_limit() -> usize {
-    std::env::var("FUSOR_RESOLVE_OPTIMIZE_MAX_NODES")
-        .ok()
-        .and_then(|value| usize::from_str(&value).ok())
-        .unwrap_or(DEFAULT_OPTIMIZE_NODE_LIMIT)
 }
 
 impl ResolveHostProfile {
@@ -314,10 +303,8 @@ pub(crate) struct Resolver {
     // `RefCell` because some hook sites (`add_physical_dependencies`) only
     // hold `&self`.
     recorder: Option<std::cell::RefCell<flush_replay::PlanRecorder>>,
-    // QMatMul-free graphs may merge independent cooperative matmuls. The
-    // large dense profile additionally merges row and elementwise work.
+    // Compatible independent operations may merge into one dispatch.
     horizontal_merge: bool,
-    horizontal_merge_dense_ops: bool,
     /// One semantic e-class may satisfy several lazy graph observations.
     /// Keys are the execution nodes that materialize; values receive the
     /// same allocation without another dispatch.
@@ -353,7 +340,6 @@ impl Resolver {
             resolved_set,
             recorder: None,
             horizontal_merge: false,
-            horizontal_merge_dense_ops: false,
             shared_outputs: Default::default(),
             optimize_phases: Default::default(),
         }

@@ -39,8 +39,6 @@ use self::lang::{FusorLang, PayloadId};
 use super::{ExecutionVariant, Resolver};
 use crate::compute_graph::{ComputeGraphInner, NodeIndex};
 
-pub(super) use self::rules_fuse::{CandidateKind, ReduceFusion, Stage2Profile};
-
 /// Owns one stage's e-graph plus the provenance bookkeeping connecting it to
 /// the resolver's execution graph.
 pub(super) struct EGraphDriver {
@@ -170,16 +168,11 @@ impl Resolver {
 impl Resolver {
     /// Stage 2: plan and extract fusions. Allocation-independent local windows
     /// are memoized automatically for every resolve.
-    pub(super) fn fuse_operations(
-        &mut self,
-        graph: &mut ComputeGraphInner,
-        profile: rules_fuse::Stage2Profile,
-    ) {
+    pub(super) fn fuse_operations(&mut self, graph: &mut ComputeGraphInner) {
         let mut driver = EGraphDriver::ingest(self, graph);
         let extraction = {
             let ctx = rules_fuse::Stage2Ctx {
                 graph,
-                profile,
                 layouts: std::cell::RefCell::new(Default::default()),
             };
             driver.extract_with_fusion(&ctx)

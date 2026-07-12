@@ -1,7 +1,4 @@
-//! Large-decode default optimizer regression.
-//!
-//! This test has its own process because resolver policy is configured through
-//! environment variables that must be set before the device is created.
+//! Decode regression for the default aggressive optimizer.
 
 use fusor_core::{Device, QMatrix, Tensor};
 use fusor_gguf::GgmlType;
@@ -24,11 +21,7 @@ fn weight(device: &Device) -> (QMatrix, Vec<f32>) {
 }
 
 #[test]
-fn large_decode_runs_the_optimizer_by_default() {
-    unsafe {
-        std::env::set_var("FUSOR_RESOLVE_OPTIMIZE_MAX_NODES", "1");
-    }
-
+fn decode_runs_the_full_optimizer_by_default() {
     pollster::block_on(async {
         let Ok(device) = Device::new().await else {
             return;
@@ -46,7 +39,7 @@ fn large_decode_runs_the_optimizer_by_default() {
 
         assert!(
             total.count_kernels_to_resolve() < QMATMULS * 2 - 1,
-            "large decode should take the automatic planning and fusion path",
+            "decode should take the automatic planning and fusion path",
         );
 
         let actual = total.as_slice::<2, f32>().await.unwrap();

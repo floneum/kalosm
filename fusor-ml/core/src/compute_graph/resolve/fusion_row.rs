@@ -40,13 +40,6 @@ struct ClusterBuilder<'a> {
     full_exprs: FxHashMap<NodeIndex, NaryExpr>,
     /// The closed absorbable set: nodes outside it read as externals.
     allowed: &'a FxHashSet<NodeIndex>,
-    /// Large dense graphs only: accept pure views *between* the unary
-    /// chain and the reduce (the `sum_keepdim` unsqueeze under
-    /// `div_scalar`/`sqrt` in layer norm) by composing them into the
-    /// running layout. Moving a scalar chain into a row-program post chain
-    /// can shift results by an ulp, so small graphs keep the exact
-    /// pre-existing lowering.
-    allow_interleaved_views: bool,
 }
 
 struct BuilderSnapshot {
@@ -82,21 +75,12 @@ impl ClusterBuilder<'_> {
         }
     }
 
-    /// Member insertion. On the large dense path (`allow_interleaved_views`)
-    /// this is idempotent: the same node can be reached through several
-    /// operand walks (a shared view, or one reduction read through two
-    /// different unary chains), and duplicate entries would trip the
-    /// member/exec count check at commit and abort the whole cluster.
-    ///
-    /// On every other path — which includes every QMatMul (decode) graph —
-    /// duplicates are pushed as-is so the commit check aborts exactly as it
-    /// historically did: dedup silently admits clusters the frozen decode
-    /// path used to reject, changing its kernel counts and reduce numerics.
+    /// Member insertion is idempotent: one node can be reached through
+    /// several operand walks, but is absorbed and removed exactly once.
     fn add_member(&mut self, node: NodeIndex) {
-        if self.allow_interleaved_views && self.members.contains(&node) {
-            return;
+        if !self.members.contains(&node) {
+            self.members.push(node);
         }
-        self.members.push(node);
     }
 
     fn add_members(&mut self, nodes: impl IntoIterator<Item = NodeIndex>) {
@@ -178,11 +162,7 @@ impl Resolver {
     /// broadcast into some elementwise consumer, and the root is the last
     /// single-consumer elementwise below it — so graphs full of elementwise
     /// chains with no reductions (most of a decode graph) cost nothing.
-    pub(super) fn fuse_row_programs(
-        &mut self,
-        graph: &mut ComputeGraphInner,
-        interleaved_views: bool,
-    ) {
+    pub(super) fn fuse_row_programs(&mut self, graph: &mut ComputeGraphInner) {
         let reduces: Vec<ExecutionNodeIndex> = self
             .execution_graph
             .node_indices()
@@ -231,7 +211,7 @@ impl Resolver {
             if !self.execution_graph.contains_node(root) {
                 continue;
             }
-            self.try_fuse_row_program(graph, root, interleaved_views);
+            self.try_fuse_row_program(graph, root);
         }
     }
 
@@ -293,7 +273,6 @@ impl Resolver {
         &mut self,
         graph: &mut ComputeGraphInner,
         root_idx: ExecutionNodeIndex,
-        interleaved_views: bool,
     ) -> bool {
         let ExecutionVariant::Elementwise(root) = self.execution_graph[root_idx].variant.clone()
         else {
@@ -307,7 +286,7 @@ impl Resolver {
         // outside the set — what remains can fuse without anything
         // escaping. Dropped nodes read as external inputs and materialize
         // once, exactly as they must.
-        let mut allowed = self.collect_row_cluster(graph, root_idx, &root, None, interleaved_views);
+        let mut allowed = self.collect_row_cluster(graph, root_idx, &root, None);
         loop {
             let allowed_execs: FxHashSet<ExecutionNodeIndex> = allowed
                 .iter()
@@ -335,13 +314,12 @@ impl Resolver {
             }
             // Re-walk: regions only reachable through a dropped node fall
             // out of the set too.
-            allowed =
-                self.collect_row_cluster(graph, root_idx, &root, Some(&allowed), interleaved_views);
+            allowed = self.collect_row_cluster(graph, root_idx, &root, Some(&allowed));
         }
         if allowed.is_empty() {
             return false;
         }
-        self.build_row_cluster(graph, root_idx, &root, &allowed, interleaved_views)
+        self.build_row_cluster(graph, root_idx, &root, &allowed)
     }
 
     /// Collect the nodes the absorption walk could claim: full-shape
@@ -354,20 +332,11 @@ impl Resolver {
         _root_idx: ExecutionNodeIndex,
         root: &ElementwiseOperation,
         within: Option<&FxHashSet<NodeIndex>>,
-        interleaved_views: bool,
     ) -> FxHashSet<NodeIndex> {
         let mut out = FxHashSet::default();
         let mut axis = None;
         for &input in &root.inputs {
-            self.collect_operand(
-                graph,
-                &root.shape,
-                &mut axis,
-                input,
-                within,
-                &mut out,
-                interleaved_views,
-            );
+            self.collect_operand(graph, &root.shape, &mut axis, input, within, &mut out);
         }
         out
     }
@@ -381,7 +350,6 @@ impl Resolver {
         inner: NodeIndex,
         within: Option<&FxHashSet<NodeIndex>>,
         out: &mut FxHashSet<NodeIndex>,
-        interleaved_views: bool,
     ) {
         let eligible = |node: NodeIndex| {
             within.is_none_or(|allowed| allowed.contains(&node)) && !out.contains(&node)
@@ -447,9 +415,8 @@ impl Resolver {
                     // `sum_keepdim` unsqueeze under `div_scalar`/`sqrt` in
                     // layer norm) composes into the running layout; unaries
                     // are pointwise, so their position relative to pure
-                    // layout stages cannot change per-row values. Dense
-                    // graphs only.
-                    ExecutionVariant::View(view) if interleaved_views => {
+                    // layout stages cannot change per-row values.
+                    ExecutionVariant::View(view) => {
                         let Some(collapsed) = view.composed_layout() else {
                             break 'scalar;
                         };
@@ -475,7 +442,7 @@ impl Resolver {
             *axis = Some(reduce.axis);
             out.extend(nodes);
             out.insert(node);
-            self.collect_operand(graph, shape, axis, value, within, out, interleaved_views);
+            self.collect_operand(graph, shape, axis, value, within, out);
             return;
         }
 
@@ -495,7 +462,7 @@ impl Resolver {
         let inputs = nary.inputs.clone();
         out.insert(inner);
         for input in inputs {
-            self.collect_operand(graph, shape, axis, input, within, out, interleaved_views);
+            self.collect_operand(graph, shape, axis, input, within, out);
         }
     }
 
@@ -505,7 +472,6 @@ impl Resolver {
         root_idx: ExecutionNodeIndex,
         root: &ElementwiseOperation,
         allowed: &FxHashSet<NodeIndex>,
-        interleaved_views: bool,
     ) -> bool {
         let mut builder = ClusterBuilder {
             shape: root.shape.clone(),
@@ -515,7 +481,6 @@ impl Resolver {
             members: Vec::new(),
             full_exprs: FxHashMap::default(),
             allowed,
-            allow_interleaved_views: interleaved_views,
         };
         let mut rewrites = Vec::with_capacity(root.inputs.len());
         for &input in &root.inputs {
@@ -575,7 +540,6 @@ impl Resolver {
             steps,
             output_datatype: root.output_datatype,
             dynamic_axis: None,
-            dense_codegen: false,
         };
         let externals = builder.externals;
         if trace {
@@ -712,7 +676,7 @@ impl Resolver {
                     chain_nodes.push(node);
                     node = input;
                 }
-                ExecutionVariant::View(view) if builder.allow_interleaved_views => {
+                ExecutionVariant::View(view) => {
                     let collapsed = view.composed_layout()?;
                     layout = crate::view::compose_layouts(&layout, &collapsed)?;
                     sandwich_views.push(node);

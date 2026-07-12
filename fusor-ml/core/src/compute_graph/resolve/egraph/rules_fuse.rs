@@ -21,49 +21,8 @@ use crate::compute_graph::{ComputeGraphInner, NodeIndex};
 use crate::nary_wise::{ElementwiseOperation, NaryExpr, NaryFunction, UnaryFunctionChain};
 use crate::{DataTypeEnum, Layout};
 
-/// Which nodes seed and re-enter the fusion worklist. Transcribes
-/// `CandidateProfile` (execution.rs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::compute_graph::resolve) enum CandidateKind {
-    /// Elementwise | MatMul | QMatMul | Reduce (`is_optimization_candidate`).
-    General,
-    /// Elementwise | Reduce (`is_dense_graph_candidate`).
-    Dense,
-    /// Large quantized graphs (`is_large_graph_nary_candidate`).
-    LargeQuantized,
-}
-
-/// Which reduce-fusion generators run (`ReduceFusionProfile`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::compute_graph::resolve) enum ReduceFusion {
-    Disabled,
-    Conservative,
-    Dense,
-}
-
-/// Stage-2 fusion policy, selected per graph by `optimize()`: which nodes
-/// seed the worklist, which rule families run, and the decode-protecting
-/// gates (reduce fusion stays off for quantized graphs; qmatmul epilogue
-/// fusion is node-count-bounded on the standard profile).
-#[derive(Debug, Clone)]
-pub(in crate::compute_graph::resolve) struct Stage2Profile {
-    pub(in crate::compute_graph::resolve) candidates: CandidateKind,
-    pub(in crate::compute_graph::resolve) reduce_fusion: ReduceFusion,
-    pub(in crate::compute_graph::resolve) try_matmul_fusion: bool,
-    pub(in crate::compute_graph::resolve) allow_qmatmul_elementwise_fusion: bool,
-    /// `dense` in the fixpoint: allow indexed inlining in nary/reduce fusion.
-    pub(in crate::compute_graph::resolve) dense: bool,
-    /// The dense-region branch: externally-live producers are not inlined
-    /// (region formation emits them as region outputs instead).
-    pub(in crate::compute_graph::resolve) skip_externally_live: bool,
-    /// Dense large-graph kernel tuning (region formation +
-    /// `mark_dense_codegen`) runs after fusion settles.
-    pub(in crate::compute_graph::resolve) enable_dense_codegen: bool,
-}
-
 pub(super) struct Stage2Ctx<'a> {
     pub(super) graph: &'a ComputeGraphInner,
-    pub(super) profile: Stage2Profile,
     /// Memoized layout inference over the (immutable) inner graph, used by
     /// qmatmul extra normalization. Fresh per stage; recomputation is
     /// correctness-neutral.
@@ -137,12 +96,6 @@ impl<'a> FusionView<'a> {
         self.ctx.graph.device()
     }
 
-    /// The profile's `allow_qmatmul_elementwise_fusion` flag, exposed for the
-    /// matmul-family generators in `rules_fuse_matmul.rs`.
-    pub(super) fn allow_qmatmul_elementwise_fusion(&self) -> bool {
-        self.ctx.profile.allow_qmatmul_elementwise_fusion
-    }
-
     /// Transcription of `Resolver::walk_view_chain` over current selections.
     pub(super) fn walk_view_chain(&self, mut inner: NodeIndex) -> (NodeIndex, Option<Layout>) {
         let mut composed: Option<Layout> = None;
@@ -207,7 +160,7 @@ impl<'a> FusionView<'a> {
         }
     }
 
-    /// `CandidateProfile::matches` transcription over current selections.
+    /// Whether the selected operation can participate in any fusion family.
     pub(super) fn is_seed_candidate(&self, prov: Prov) -> bool {
         let facts = self.driver.egraph.analysis.facts_of(prov);
         if facts.exec.is_none() || !self.state.needed[prov.0 as usize] {
@@ -216,36 +169,13 @@ impl<'a> FusionView<'a> {
         let Some(variant) = self.variant_of(facts.inner) else {
             return false;
         };
-        match self.ctx.profile.candidates {
-            CandidateKind::General => matches!(
-                variant,
-                ExecutionVariant::Elementwise(_)
-                    | ExecutionVariant::MatMul(_)
-                    | ExecutionVariant::QMatMul(_)
-                    | ExecutionVariant::Reduce(_)
-            ),
-            CandidateKind::Dense => matches!(
-                variant,
-                ExecutionVariant::Elementwise(_) | ExecutionVariant::Reduce(_)
-            ),
-            CandidateKind::LargeQuantized => {
-                let ExecutionVariant::Elementwise(nary) = variant else {
-                    return false;
-                };
-                if nary.shape.last().copied().unwrap_or_default()
-                    >= super::super::LARGE_GRAPH_NARY_FUSION_MIN_LAST_DIM
-                {
-                    return true;
-                }
-                nary.inputs.iter().any(|&input| {
-                    let (base_inner, _) = self.walk_view_chain(input);
-                    matches!(
-                        self.variant_of(base_inner),
-                        Some(ExecutionVariant::QMatMul(_))
-                    )
-                })
-            }
-        }
+        matches!(
+            variant,
+            ExecutionVariant::Elementwise(_)
+                | ExecutionVariant::MatMul(_)
+                | ExecutionVariant::QMatMul(_)
+                | ExecutionVariant::Reduce(_)
+        )
     }
 
     /// `enqueue_downstream_candidates` transcription: enqueue candidates
@@ -303,9 +233,7 @@ impl<'a> FusionView<'a> {
             _ => {}
         }
         candidates.extend(self.gen_fuse_reduce_candidates(&current));
-        if self.ctx.profile.try_matmul_fusion
-            && let Some(matmul) = self.gen_fuse_into_matmul(&current)
-        {
+        if let Some(matmul) = self.gen_fuse_into_matmul(&current) {
             candidates.push(matmul);
         }
         candidates
@@ -362,7 +290,6 @@ impl<'a> FusionView<'a> {
 
     /// Transcription of `try_fuse_naries` (fusion_basic.rs:6-170).
     fn gen_fuse_naries(&self, nary: &ElementwiseOperation) -> Option<ExecutionVariant> {
-        let allow_indexed_inline = self.ctx.profile.dense;
         let mut expression = nary.expression.clone();
         let mut all_inputs = nary.inputs.clone();
         let mut fused_any = false;
@@ -372,11 +299,10 @@ impl<'a> FusionView<'a> {
             if self.is_cached(input_inner) {
                 continue;
             }
-            // Dense branch: an externally live producer (pending sink /
-            // user-held node) materializes regardless, so inlining it here
-            // would duplicate its compute. Region formation fuses it with
-            // its consumers instead, emitting it as a region output.
-            if self.ctx.profile.skip_externally_live && self.externally_live(input_inner) {
+            // An externally live producer materializes regardless, so
+            // inlining it here would duplicate its compute. Region formation
+            // fuses it with consumers and emits it as another output.
+            if self.externally_live(input_inner) {
                 continue;
             }
             // Inlining duplicates the producer's work unless this node is
@@ -405,7 +331,6 @@ impl<'a> FusionView<'a> {
                 success &= s;
             }
             if !success
-                && allow_indexed_inline
                 && target_slots
                     .iter()
                     .all(|&slot| input_reread_factor(&expression, &nary.shape, slot) == 1)
@@ -452,23 +377,15 @@ impl<'a> FusionView<'a> {
         }))
     }
 
-    /// Transcription of `try_fuse_reduce` (execution.rs:558-578).
+    /// All legal reduce-fusion alternatives. Extraction's cost and
+    /// duplication constraints decide whether any candidate commits.
     fn gen_fuse_reduce_candidates(&self, current: &ExecutionVariant) -> Vec<ExecutionVariant> {
         let mut candidates = Vec::new();
-        match self.ctx.profile.reduce_fusion {
-            ReduceFusion::Disabled => {}
-            ReduceFusion::Conservative => {
-                candidates.extend(self.gen_unary_into_reduce(current));
-                candidates.extend(self.gen_producer_into_reduce(current, false));
-            }
-            ReduceFusion::Dense => {
-                candidates.extend(self.gen_collapse_unit_reduce(current));
-                candidates.extend(self.gen_fold_views_into_reduce(current));
-                candidates.extend(self.gen_unary_into_reduce(current));
-                candidates.extend(self.gen_indexed_unary_into_reduce(current));
-                candidates.extend(self.gen_producer_into_reduce(current, true));
-            }
-        }
+        candidates.extend(self.gen_collapse_unit_reduce(current));
+        candidates.extend(self.gen_fold_views_into_reduce(current));
+        candidates.extend(self.gen_unary_into_reduce(current));
+        candidates.extend(self.gen_indexed_unary_into_reduce(current));
+        candidates.extend(self.gen_producer_into_reduce(current, true));
         candidates
     }
 

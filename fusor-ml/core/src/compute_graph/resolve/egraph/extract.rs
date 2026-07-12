@@ -1,5 +1,5 @@
-//! Cost-guided extraction: choose one form per execution node under the
-//! profile's legality gates, minimizing estimated GPU runtime.
+//! Cost-guided extraction: choose one legal form per execution node,
+//! minimizing estimated GPU runtime.
 //!
 //! Selection state remains per observation so liveness constraints are
 //! explicit, while equivalent observations may reference the same e-class.
@@ -365,13 +365,12 @@ impl EGraphDriver {
     }
 
     /// Stage-2 extraction: the fusion-generator worklist. Seeded with every
-    /// profile-eligible node in provenance order; after each committed
+    /// fusion-eligible node in provenance order; after each committed
     /// switch, everything whose situation changed — the node itself, old and
     /// new producers, killed nodes' children, and consumers reachable
     /// through views — re-enters the worklist. Counts only decrease and the
     /// generators' gates are antitone in them, so the loop converges to the
-    /// greatest fixpoint regardless of order: maximal fusion under the
-    /// profile's legality gates.
+    /// greatest fixpoint regardless of order: maximal legal fusion.
     pub(super) fn extract_with_fusion(&mut self, ctx: &Stage2Ctx<'_>) -> Extraction {
         let mut state = ExtractState::new(self);
         let mut plans = FusionPlanMemo::default();

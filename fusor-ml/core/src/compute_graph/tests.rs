@@ -703,16 +703,7 @@ fn natural_form_updates_replay_and_claim_in_place() {
             m = m2;
             v = v2;
             p = p2;
-            // Push the resolve over the large-graph threshold so region
-            // formation and horizontal merging run.
-            let fillers: Vec<Tensor> = (0..300)
-                .map(|_| {
-                    let x = Tensor::new::<f32, 1, _>(&device, &vec![1.0f32; 8]);
-                    &(&x + 1.0f32) + 1.0f32
-                })
-                .collect();
             device.flush();
-            drop(fillers);
 
             let ptrs = [&m, &v, &p].map(|tensor| {
                 let (data, _) = tensor.data.materialize();

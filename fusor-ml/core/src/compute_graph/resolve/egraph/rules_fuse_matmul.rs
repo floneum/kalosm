@@ -33,8 +33,6 @@ impl FusionView<'_> {
     /// matmul pre unary chains, in the original attempt order. Returns the
     /// new variant for the node being rewritten (first success wins).
     pub(super) fn gen_matmul_family(&self, current: &ExecutionVariant) -> Option<ExecutionVariant> {
-        let allow_qmatmul_elementwise_fusion = self.allow_qmatmul_elementwise_fusion();
-
         // Post-op: fuse elementwise after matmul (dense or quantized).
         if let Some(el_op) = Resolver::try_get_unary_chain(current) {
             let input_inner = el_op.value;
@@ -61,7 +59,7 @@ impl FusionView<'_> {
         // Post-op (QMatMul): fuse a general element-wise expression after
         // qmatmul. This handles composite expressions like GELU and ordered
         // extra inputs whose layouts match the output visitation shape.
-        if allow_qmatmul_elementwise_fusion && let ExecutionVariant::Elementwise(nary) = current {
+        if let ExecutionVariant::Elementwise(nary) = current {
             // Split/gate expressions built from `narrow` views of a qmatmul
             // output (e.g. SwiGLU's gate/up halves) reach the qmatmul through
             // MapLayout chains with distinct last-dimension column offsets.
@@ -235,8 +233,7 @@ impl FusionView<'_> {
         // transformed activation tile is reloaded for each output-column
         // tile, so expensive expressions like GELU would be recomputed many
         // times. Keep those chains materialized once instead.
-        if allow_qmatmul_elementwise_fusion
-            && let ExecutionVariant::QMatMul(qmatmul_op) = current
+        if let ExecutionVariant::QMatMul(qmatmul_op) = current
             && qmatmul_op.in_shape[..qmatmul_op.in_shape.len() - 1]
                 .iter()
                 .product::<usize>()

@@ -38,27 +38,18 @@ impl Resolver {
         // Pass 2: Apply Rewrite Rules
         {
             let start = host_trace.then(Instant::now);
-            let optimize_limit = optimize_node_limit();
             let node_count = self.execution_graph.node_count();
-            let large_graph_profile = optimize_limit != 0 && node_count > optimize_limit;
-            let policy = super::execution::OptimizePolicy::select(node_count, optimize_limit);
             let optimizer_enabled = std::env::var_os("FUSOR_RESOLVE_SKIP_OPTIMIZE").is_none();
             if optimizer_enabled {
-                self.optimize(graph, policy);
+                self.optimize(graph);
             }
             if let Some(start) = start {
                 host_profile.optimize += start.elapsed();
             }
-            if host_trace && large_graph_profile {
-                tracing::info!(
-                    "resolve_host_profile optimizer_policy={} optimizer_enabled={optimizer_enabled} node_count={node_count} limit={optimize_limit}",
-                    policy.label(),
-                );
-            }
             if host_trace {
                 let phases = self.optimize_phases;
                 tracing::info!(
-                    "resolve_optimize_phases node_count={node_count} recognize={:?} row_fusion={:?} stage2={:?} regions={:?} coalesce={:?}",
+                    "resolve_optimize_phases optimizer_enabled={optimizer_enabled} node_count={node_count} recognize={:?} row_fusion={:?} stage2={:?} regions={:?} coalesce={:?}",
                     phases.recognize,
                     phases.row_fusion,
                     phases.stage2,
@@ -87,11 +78,8 @@ impl Resolver {
 
         {
             let start = host_trace.then(Instant::now);
-            let mut merger = merge_horizontal::HorizontalMerger::new(
-                self.horizontal_merge,
-                self.horizontal_merge_dense_ops,
-                &device,
-            );
+            let mut merger =
+                merge_horizontal::HorizontalMerger::new(self.horizontal_merge, &device);
             for idx in sorted_nodes {
                 let node = &self.execution_graph[idx];
                 // Handle Tensor caching explicitly here
@@ -160,9 +148,8 @@ impl Resolver {
         let plan_cache_enabled = device.kernel_cache().direct_plan_cache().enabled();
         // Every graph takes the three-phase queue runner: serial input
         // gathering, parallel kernel building, serial recording/encoding.
-        // Standard dense graphs may merge compatible matmuls; row and region
-        // merging stays gated on the dense large-graph optimizer. Quantized
-        // decode graphs retain their standalone kernels.
+        // Compatible independent operations may merge across the queue; each
+        // operation kind retains its own shape, dependency and binding gates.
         let mut ledger = super::alloc_reuse::BufferLedger::new(&device, Some(&remaining_consumers));
         if let Some(recorder) = &self.recorder {
             ledger.register_recorder_pins(recorder.borrow().pinned_ptrs());

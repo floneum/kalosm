@@ -104,7 +104,6 @@ impl MatMulOperation {
             ],
             post_element_wise: UnaryFunctionChain::empty(datatype),
             parameters,
-            dense_codegen: false,
         }
     }
 
@@ -559,10 +558,9 @@ impl MatMulOperation {
             .checked_mul(device.max_subgroup_size())
             .filter(|&threads| threads > 0)?;
         let k_iterations = k.div_ceil(tile.bk);
-        let per_lane_macs = u64::from(tile.bm) * u64::from(tile.bn)
-            * u64::from(k_iterations)
-            * u64::from(tile.bk)
-            / u64::from(threads);
+        let per_lane_macs =
+            u64::from(tile.bm) * u64::from(tile.bn) * u64::from(k_iterations) * u64::from(tile.bk)
+                / u64::from(threads);
         // Split only when all three hold: the unsplit grid is starved enough
         // that fan-out beats the combine pass it buys, K is long enough that
         // every span keeps at least two K-iterations, and each lane's
@@ -678,7 +676,6 @@ impl MatMulOperation {
                         bk: tile.bk,
                     },
                 },
-                self.dense_codegen,
             ));
         });
         if !used.get() {
@@ -701,7 +698,6 @@ impl MatMulOperation {
                 tile.hash(state);
                 subgroup_config.hash(state);
                 splits.hash(state);
-                self.dense_codegen.hash(state);
                 1u64.hash(state);
             });
         let cache_key = self.kernel_cache_key_with_dispatch(variant, None, dispatch_size, &inputs);
@@ -762,7 +758,6 @@ impl MatMulOperation {
                 tile.hash(state);
                 subgroup_config.hash(state);
                 splits.hash(state);
-                self.dense_codegen.hash(state);
                 2u64.hash(state);
             });
         let combine_key =
@@ -791,9 +786,8 @@ struct MergedMatmulVariant;
 /// merge into one dispatch only when every field matches, which makes the
 /// guarded segment bodies identical up to their storage bindings (same
 /// logical shape, tile geometry, workgroup size, split factor, and element
-/// type and codegen profile). Only matmuls that will take the
-/// cooperative-matrix route produce a key; the resolver keeps quantized
-/// graphs out of the horizontal merger.
+/// type). Only matmuls that will take the cooperative-matrix route produce a
+/// key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct MatmulMergeKey {
     m: u32,
@@ -803,7 +797,6 @@ pub(crate) struct MatmulMergeKey {
     tile: CoopTile,
     splits: Option<u32>,
     datatype: DataTypeEnum,
-    dense_codegen: bool,
 }
 
 impl MatmulMergeKey {
@@ -841,7 +834,6 @@ impl MatMulOperation {
             tile,
             splits: self.split_k_factor(device, &tile),
             datatype: self.datatype,
-            dense_codegen: self.dense_codegen,
         })
     }
 }
@@ -918,11 +910,10 @@ pub(crate) fn build_merged_matmul_kernel(
         decline!("profile_mismatch");
     }
     let splits = first.split_k_factor(&device, &tile);
-    if segments.iter().any(|op| {
-        op.split_k_factor(&device, &tile) != splits
-            || op.datatype != first.datatype
-            || op.dense_codegen != first.dense_codegen
-    }) {
+    if segments
+        .iter()
+        .any(|op| op.split_k_factor(&device, &tile) != splits || op.datatype != first.datatype)
+    {
         decline!("splits_mismatch");
     }
 
@@ -980,7 +971,6 @@ pub(crate) fn build_merged_matmul_kernel(
 
     let used = std::cell::Cell::new(false);
     let splits_or_one = splits.unwrap_or(1);
-    let elide_aligned_k_bounds = first.dense_codegen;
     let ir = tile_ir::tile::build(|phase| {
         let mut storages = Vec::with_capacity(segments.len());
         for prep in &preps {
@@ -1014,7 +1004,6 @@ pub(crate) fn build_merged_matmul_kernel(
             splits_or_one,
             max_wg_per_dim,
             config,
-            elide_aligned_k_bounds,
         ));
     });
     if !used.get() {
@@ -1140,7 +1129,6 @@ impl Operation for MatMulOperation {
         self.pre_element_wise.hash(state);
         self.post_element_wise.hash(state);
         self.parameters.hash(state);
-        self.dense_codegen.hash(state);
     }
 
     fn workgroup_shape_constraints(

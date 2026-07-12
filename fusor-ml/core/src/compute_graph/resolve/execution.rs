@@ -12,38 +12,6 @@ pub(super) struct OptimizePhases {
     pub(super) coalesce: Duration,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) enum OptimizePolicy {
-    Standard,
-    LargeGraph,
-}
-
-// This is a separate safety/performance gate from the configurable threshold
-// that selects the optimizer profile. Preserve the historical behavior unless
-// the dedicated QMatMul fusion override is set.
-const STANDARD_QMATMUL_FUSION_NODE_LIMIT: usize = 512;
-
-impl OptimizePolicy {
-    pub(super) fn select(node_count: usize, node_limit: usize) -> Self {
-        if node_limit != 0 && node_count > node_limit {
-            Self::LargeGraph
-        } else {
-            Self::Standard
-        }
-    }
-
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::LargeGraph => "large_graph",
-        }
-    }
-
-    fn is_large_graph(self) -> bool {
-        matches!(self, Self::LargeGraph)
-    }
-}
-
 impl Resolver {
     pub(super) fn release_dead_intermediates(
         graph: &mut ComputeGraphInner,
@@ -296,153 +264,39 @@ impl Resolver {
 
     // --- Rewrite Engine ---
 
-    pub(super) fn optimize(&mut self, graph: &mut ComputeGraphInner, policy: OptimizePolicy) {
+    pub(super) fn optimize(&mut self, graph: &mut ComputeGraphInner) {
         // Rebuild composed contraction / normalization clusters into their
         // specialized operations first, while they are still in the exact
         // canonical form the API emitted (before view folding or fusion
-        // disturbs them). Profile selection follows because recognition can
-        // mint QMatMul nodes.
+        // disturbs them).
         let phase_start = Instant::now();
         self.recognize_operations(graph);
         self.optimize_phases.recognize += phase_start.elapsed();
-        // The qmatmul scan runs after recognition (which can mint QMatMul
-        // nodes) and before row fusion (which never creates or removes
-        // them), so the dense gate below is structural and stable.
-        let has_qmatmul = self.execution_graph.node_indices().any(|node| {
-            matches!(
-                self.execution_graph[node].variant,
-                ExecutionVariant::QMatMul(_)
-            )
-        });
-        let dense = Self::dense_reduce_fusion_enabled(has_qmatmul);
-        let large_dense = policy.is_large_graph() && dense;
-        let has_dense_matmul = dense
-            && self.execution_graph.node_indices().any(|node| {
-                matches!(
-                    self.execution_graph[node].variant,
-                    ExecutionVariant::MatMul(_)
-                )
-            });
-        // Standard dense graphs may merge independent cooperative matmuls and
-        // model graphs may absorb mathematically equivalent interleaved views
-        // into row programs. Standalone reduction graphs retain their exact
-        // legacy ordering; dense codegen and horizontal row/region merging
-        // remain restricted to the established large dense profile.
-        self.horizontal_merge =
-            dense && std::env::var_os("FUSOR_DISABLE_HORIZONTAL_FUSION").is_none();
-        self.horizontal_merge_dense_ops = large_dense;
+
+        // Every graph uses the full optimizer. Individual generators retain
+        // their semantic, device and cost gates; graph size is not one of
+        // them. The plan memo keeps repeated-layer discovery proportional to
+        // unique local structure rather than total layer count.
+        self.horizontal_merge = std::env::var_os("FUSOR_DISABLE_HORIZONTAL_FUSION").is_none();
         let phase_start = Instant::now();
-        self.fuse_row_programs(graph, large_dense || has_dense_matmul);
+        self.fuse_row_programs(graph);
         self.recognize_assign_chains(graph);
         self.optimize_phases.row_fusion += phase_start.elapsed();
 
-        let has_reduce = self.execution_graph.node_indices().any(|node| {
-            matches!(
-                self.execution_graph[node].variant,
-                ExecutionVariant::Reduce(_)
-            )
-        });
-        let has_matmul = self.execution_graph.node_indices().any(|node| {
-            matches!(
-                self.execution_graph[node].variant,
-                ExecutionVariant::MatMul(_)
-            )
-        });
-        use super::egraph::{CandidateKind, ReduceFusion, Stage2Profile};
-        let profile = match policy {
-            OptimizePolicy::Standard => Stage2Profile {
-                candidates: CandidateKind::General,
-                reduce_fusion: if !has_reduce {
-                    ReduceFusion::Disabled
-                } else if dense {
-                    ReduceFusion::Dense
-                } else {
-                    ReduceFusion::Conservative
-                },
-                try_matmul_fusion: has_matmul || has_qmatmul,
-                allow_qmatmul_elementwise_fusion: self.execution_graph.node_count()
-                    <= STANDARD_QMATMUL_FUSION_NODE_LIMIT
-                    || std::env::var_os("FUSOR_RESOLVE_QMATMUL_ELEMENTWISE_FUSION").is_some(),
-                dense,
-                skip_externally_live: self.horizontal_merge_dense_ops,
-                enable_dense_codegen: false,
-            },
-            OptimizePolicy::LargeGraph if has_qmatmul => Stage2Profile {
-                candidates: CandidateKind::LargeQuantized,
-                reduce_fusion: ReduceFusion::Disabled,
-                try_matmul_fusion: true,
-                allow_qmatmul_elementwise_fusion: true,
-                dense,
-                skip_externally_live: self.horizontal_merge_dense_ops,
-                enable_dense_codegen: false,
-            },
-            OptimizePolicy::LargeGraph => Stage2Profile {
-                candidates: CandidateKind::Dense,
-                reduce_fusion: if dense && has_reduce {
-                    ReduceFusion::Dense
-                } else {
-                    ReduceFusion::Disabled
-                },
-                try_matmul_fusion: true,
-                allow_qmatmul_elementwise_fusion: true,
-                dense,
-                skip_externally_live: self.horizontal_merge_dense_ops,
-                enable_dense_codegen: dense,
-            },
-        };
-
         let phase_start = Instant::now();
-        self.fuse_operations(graph, profile.clone());
+        self.fuse_operations(graph);
         self.optimize_phases.stage2 += phase_start.elapsed();
 
-        // Dense large-graph kernel tuning is opted into per operation, after
-        // rewrite has settled: matmuls get the wider divisor-aligned split-K
-        // fan-out (with elided K bounds), row programs get axis-sized
-        // workgroups, subgroup whole-block reductions, and staged reads.
-        // Quantized graphs (`has_qmatmul`) leave the flags unset, so decode
-        // kernels are byte-identical to the committed lowering.
-        if profile.enable_dense_codegen {
-            // Region formation generalizes the sole-consumer nary gate: it
-            // fuses externally-live producers into multi-output regions.
-            // Regions lower independently; horizontal merging may combine
-            // them with additional compatible work but is not required.
-            let phase_start = Instant::now();
-            self.form_elementwise_regions(graph);
-            self.mark_dense_codegen();
-            self.optimize_phases.regions += phase_start.elapsed();
-        }
+        // Region formation generalizes the sole-consumer nary gate: it fuses
+        // externally-live producers into multi-output regions. Codegen then
+        // selects tuned kernels from operation shape and device capabilities.
+        let phase_start = Instant::now();
+        self.form_elementwise_regions(graph);
+        self.optimize_phases.regions += phase_start.elapsed();
+
         let phase_start = Instant::now();
         self.coalesce_equivalent_eclasses(graph);
         self.optimize_phases.coalesce += phase_start.elapsed();
-    }
-
-    /// Set `dense_codegen` on every matmul and row-program operation in the
-    /// execution graph after the large dense rewrite profile settles.
-    fn mark_dense_codegen(&mut self) {
-        let nodes: Vec<ExecutionNodeIndex> = self.execution_graph.node_indices().collect();
-        for node in nodes {
-            match &mut self.execution_graph[node].variant {
-                ExecutionVariant::MatMul(op) => op.dense_codegen = true,
-                ExecutionVariant::GraphOp(op) => {
-                    if let Some(row) = op.as_row_program()
-                        && !row.dense_codegen
-                    {
-                        let mut row = row.clone();
-                        row.dense_codegen = true;
-                        *op = std::sync::Arc::new(row);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Whether the dense-graph reduce-fusion rules may run: never for
-    /// graphs containing QMatMul (decode behavior is frozen), and gated by
-    /// a kill-switch env var that is also hashed into the flush-replay
-    /// fingerprint.
-    pub(super) fn dense_reduce_fusion_enabled(has_qmatmul: bool) -> bool {
-        !has_qmatmul && std::env::var_os("FUSOR_RESOLVE_DISABLE_DENSE_REDUCE_FUSION").is_none()
     }
 
     // Helpers
@@ -542,22 +396,5 @@ impl Resolver {
                 self.remove_node_if_dead(dep);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod optimizer_policy_tests {
-    use super::OptimizePolicy;
-
-    #[test]
-    fn configured_node_limit_selects_optimizer_policy() {
-        let standard = OptimizePolicy::select(600, 1_024);
-        assert!(matches!(standard, OptimizePolicy::Standard));
-
-        let large = OptimizePolicy::select(1_025, 1_024);
-        assert!(matches!(large, OptimizePolicy::LargeGraph));
-
-        let unlimited = OptimizePolicy::select(10_000, 0);
-        assert!(matches!(unlimited, OptimizePolicy::Standard));
     }
 }

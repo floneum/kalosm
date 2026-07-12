@@ -1,12 +1,11 @@
 //! Multi-output region formation.
 //!
-//! Runs at the end of `optimize_large_graph`'s dense branch, after the
-//! nary-fusion fixpoint. Grows regions from each unclaimed elementwise sink
-//! by absorbing elementwise producers whose *every* consumer already sits in
-//! the region — the generalization of the sole-consumer rule: an externally
-//! live value (flush target / user-held node) no longer blocks fusion, it is
-//! emitted as one of the region's outputs while later statements read it
-//! from a register.
+//! Runs after e-graph fusion for every resolve. Grows regions from each
+//! unclaimed elementwise sink by absorbing elementwise producers whose
+//! *every* consumer already sits in the region — the generalization of the
+//! sole-consumer rule: an externally live value (flush target / user-held
+//! node) no longer blocks fusion, it is emitted as one of the region's
+//! outputs while later statements read it from a register.
 //!
 //! Contracting a region is acyclic by construction: an absorbed producer has
 //! no out-edges leaving the member set, so redirecting its remaining

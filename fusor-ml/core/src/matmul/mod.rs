@@ -150,13 +150,6 @@ pub(crate) struct MatMulOperation {
     pub(crate) pre_element_wise: [UnaryFunctionChain; 2],
     pub(crate) post_element_wise: UnaryFunctionChain,
     pub(crate) parameters: MatMulParams,
-    /// Dense-large-graph kernel tuning: wider split-K fan-out with
-    /// divisor-aligned spans and elided K bounds. Set only by
-    /// `optimize_large_graph`'s dense branch, so quantized-pipeline graphs
-    /// (decode f32 attention matmuls included) and small (conformance-
-    /// golden) graphs keep the exact committed split-K behavior. Hashed
-    /// into the split-K kernel cache key.
-    pub(crate) dense_codegen: bool,
 }
 
 impl Tensor {
@@ -412,8 +405,10 @@ mod selection_tests {
     fn scored_selection_properties() {
         let mut lcg = 0x5eed_1234u64;
         let mut next = |range: u32| {
-            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-             ((lcg >> 33) as u32) % range + 1
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((lcg >> 33) as u32) % range + 1
         };
         for _ in 0..2000 {
             let (m, k, n) = (next(9000), next(5000), next(9000));
@@ -430,8 +425,10 @@ mod selection_tests {
                 threads <= max_lanes,
                 "m={m} k={k} n={n} lanes={max_lanes}: illegal tile {tile:?}"
             );
-            let padded = u64::from(m.div_ceil(tile.bm)) * u64::from(tile.bm)
-                * u64::from(n.div_ceil(tile.bn)) * u64::from(tile.bn);
+            let padded = u64::from(m.div_ceil(tile.bm))
+                * u64::from(tile.bm)
+                * u64::from(n.div_ceil(tile.bn))
+                * u64::from(tile.bn);
             assert!(
                 padded * 4 <= u64::from(m) * u64::from(n) * 5,
                 "m={m} k={k} n={n}: padding bound violated by {tile:?}"
@@ -441,14 +438,8 @@ mod selection_tests {
 }
 
 #[cfg(test)]
-mod dense_split_k_tests {
-    //! GPU gates for the dense-large-graph split-K tuning
-    //! (`MatMulOperation::dense_codegen`): the wider divisor-aligned
-    //! fan-out and the elided-K-bounds kernel are unreachable from the
-    //! public tensor API (the flag is set only by `optimize_large_graph`'s
-    //! dense branch), so these tests set the flag directly and execute the
-    //! operation eagerly. `tests/small_tile_matmul.rs` covers the committed
-    //! (flag-unset) split-K behavior through the public API.
+mod split_k_tests {
+    //! GPU gates for automatic split-K selection and aligned-span codegen.
 
     use super::MatMulOperation;
     use crate::{Device, Tensor};
@@ -467,7 +458,7 @@ mod dense_split_k_tests {
             let b = Tensor::from_slice(&device, [k, n], &b_data);
             a.data.materialize();
             b.data.materialize();
-            let mut operation = MatMulOperation::new(
+            let operation = MatMulOperation::new(
                 crate::DataTypeEnum::F32,
                 a.key(),
                 b.key(),
@@ -476,7 +467,6 @@ mod dense_split_k_tests {
                 None,
                 &device,
             );
-            operation.dense_codegen = true;
             let Some(output) = device.compute_graph().execute_eager(&operation) else {
                 // Devices without cooperative matrices run the generic path;
                 // nothing dense-specific to gate there.

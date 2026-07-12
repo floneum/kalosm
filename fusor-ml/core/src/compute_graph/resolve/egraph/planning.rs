@@ -458,22 +458,8 @@ fn same_matrix_allocation(a: &crate::quantized::QMatrix, b: &crate::quantized::Q
 mod tests {
     use super::*;
     use crate::compute_graph::resolve::Resolver;
-    use crate::compute_graph::resolve::egraph::rules_fuse::{
-        CandidateKind, ReduceFusion, Stage2Ctx, Stage2Profile,
-    };
+    use crate::compute_graph::resolve::egraph::rules_fuse::Stage2Ctx;
     use crate::{Device, QMatrix, Tensor};
-
-    fn profile() -> Stage2Profile {
-        Stage2Profile {
-            candidates: CandidateKind::General,
-            reduce_fusion: ReduceFusion::Disabled,
-            try_matmul_fusion: false,
-            allow_qmatmul_elementwise_fusion: false,
-            dense: false,
-            skip_externally_live: false,
-            enable_dense_codegen: false,
-        }
-    }
 
     #[test]
     fn repeated_windows_share_a_plan_but_rebind_distinct_values() {
@@ -496,7 +482,6 @@ mod tests {
                 let state = ExtractState::new(&driver);
                 let ctx = Stage2Ctx {
                     graph,
-                    profile: profile(),
                     layouts: std::cell::RefCell::new(Default::default()),
                 };
                 let view = FusionView::new(&driver, &state, &ctx);
@@ -582,7 +567,6 @@ mod tests {
                 let state = ExtractState::new(&driver);
                 let ctx = Stage2Ctx {
                     graph,
-                    profile: profile(),
                     layouts: std::cell::RefCell::new(Default::default()),
                 };
                 let view = FusionView::new(&driver, &state, &ctx);
@@ -697,7 +681,6 @@ mod tests {
                 let state = ExtractState::new(&driver);
                 let ctx = Stage2Ctx {
                     graph,
-                    profile: profile(),
                     layouts: std::cell::RefCell::new(Default::default()),
                 };
                 let view = FusionView::new(&driver, &state, &ctx);

@@ -13,9 +13,9 @@
 //! [`crate::nary_direct::eval_nary_expr`]: statement `j`'s value is read as
 //! `NaryExpr::IndexedInput { input_idx: inputs.len() + j, indices: [] }`.
 //!
-//! Regions exist only inside the resolver, between `optimize_large_graph`'s
-//! dense branch and lowering: the inner compute graph never contains one, so
-//! the flush fingerprint recipe is unaffected by their formation.
+//! Regions exist only inside the resolver between optimization and lowering:
+//! the inner compute graph never contains one, so the flush fingerprint
+//! recipe is unaffected by their formation.
 
 use rustc_hash::FxHasher;
 use std::hash::Hash;

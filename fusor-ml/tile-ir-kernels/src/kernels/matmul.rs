@@ -11,8 +11,8 @@ use crate::{
         dispatch_grid_1d, scalar_of, zero_literal,
     },
     types::{
-        apply_optional_epilogue, cooperative_store_layout_supported, DenseMatmulEpilogues,
-        UnaryEpilogue,
+        DenseMatmulEpilogues, UnaryEpilogue, apply_optional_epilogue,
+        cooperative_store_layout_supported,
     },
 };
 
@@ -295,9 +295,7 @@ fn coop_tile_entry(tile: DenseCoopMatmulTile) -> Option<&'static CoopTileEntry> 
 /// Returns false when the tile geometry is unsupported (unknown or
 /// single-buffered table entries) or the grid exceeds the dispatch limit.
 ///
-/// `elide_aligned_k_bounds` opts into skipping the K bounds checks when the
-/// spans partition K exactly (dense-large-graph tuning; callers that must
-/// keep the committed codegen pass `false`, keeping every K bound live).
+/// K bounds are skipped automatically when the spans partition K exactly.
 pub fn try_batched_coop_matmul_split_k(
     program: &mut Program,
     tensors: DenseMatmulTensors<'_>,
@@ -305,7 +303,6 @@ pub fn try_batched_coop_matmul_split_k(
     splits: u32,
     max_workgroups_per_dimension: u32,
     config: DenseCoopMatmulConfig,
-    elide_aligned_k_bounds: bool,
 ) -> bool {
     const COOP_DIM: u32 = 8;
     let DenseMatmulTensors { a, b, y } = tensors;
@@ -372,12 +369,9 @@ pub fn try_batched_coop_matmul_split_k(
         let y_batch_base = (split.clone() * shape.batch + batch) * m_padded;
         // The K bound is live only when a span can overrun the logical K
         // extent (K not dividing the tile, or the spans not covering K
-        // exactly). Aligned spans may skip it (opt-in) — a live bound forces
-        // the tile fills onto the scalar per-element path and off the vec4
-        // staging fast path.
-        let k_spans_aligned = elide_aligned_k_bounds
-            && shape.k.is_multiple_of(bk)
-            && k_iterations.is_multiple_of(splits);
+        // exactly). A live bound forces the tile fills onto the scalar
+        // per-element path and off the vec4 staging fast path.
+        let k_spans_aligned = shape.k.is_multiple_of(bk) && k_iterations.is_multiple_of(splits);
         let a_bounds: [Option<Tile>; 2] = [
             (!shape.m.is_multiple_of(bm)).then(|| a_batch_base.clone() + shape.m),
             (!k_spans_aligned).then(|| Tile::literal(TileLiteral::U32(shape.k))),
@@ -477,7 +471,6 @@ pub fn try_merged_coop_matmul(
     splits: u32,
     max_workgroups_per_dimension: u32,
     config: DenseCoopMatmulConfig,
-    elide_aligned_k_bounds: bool,
 ) -> bool {
     const COOP_DIM: u32 = 8;
     let DenseCoopMatmulConfig {
@@ -557,8 +550,7 @@ pub fn try_merged_coop_matmul(
         for (index, segment) in segments.iter().enumerate() {
             let DenseMatmulTensors { a, b, y } = *segment;
             let base = index as u32 * per_segment;
-            let in_segment =
-                wg_id.clone().ge(base) & wg_id.clone().lt(base + per_segment);
+            let in_segment = wg_id.clone().ge(base) & wg_id.clone().lt(base + per_segment);
             program.if_then(in_segment, |program| {
                 let local = program.bind(wg_id.clone() - base);
                 let (split, tile_id) = if split_k {
@@ -586,10 +578,8 @@ pub fn try_merged_coop_matmul(
                 // Bounds mirror the standalone kernels exactly: the split
                 // path may elide aligned K bounds (vec4 staging fast path),
                 // the single-pass path keeps K live only for ragged K.
-                let k_spans_aligned = split_k
-                    && elide_aligned_k_bounds
-                    && shape.k.is_multiple_of(bk)
-                    && k_iterations.is_multiple_of(splits);
+                let k_spans_aligned =
+                    split_k && shape.k.is_multiple_of(bk) && k_iterations.is_multiple_of(splits);
                 let k_bound_live = if split_k {
                     !k_spans_aligned
                 } else {
@@ -803,8 +793,7 @@ pub fn merged_split_k_combine(
         );
         for (index, y) in ys.iter().enumerate() {
             let base = index as u32 * per_segment;
-            let in_segment =
-                wg_id.clone().ge(base) & wg_id.clone().lt(base + per_segment);
+            let in_segment = wg_id.clone().ge(base) & wg_id.clone().lt(base + per_segment);
             program.if_then(in_segment, |program| {
                 let local = wg_id.clone() - base;
                 let index = program.bind(local * BLOCK + program.lane());

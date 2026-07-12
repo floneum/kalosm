@@ -10,10 +10,9 @@
 //! each guarded by a uniform linear-workgroup-id range compare.
 //!
 //! Safety and gating:
-//! - QMatMul-free standard graphs expose only cooperative matmuls to the
-//!   pass, preserving their existing split-K and bounds codegen. The large
-//!   dense profile additionally exposes row and elementwise operations.
-//!   `FUSOR_DISABLE_HORIZONTAL_FUSION` disables both scopes.
+//! - Every graph exposes compatible matmul, row and elementwise operations.
+//!   Per-operation shape and binding limits decide eligibility.
+//!   `FUSOR_DISABLE_HORIZONTAL_FUSION` disables the pass.
 //! - Grouping is dependency-sound by a wave discipline: an operation joins
 //!   the open wave of its category only if it does not (transitively) depend
 //!   on any open-wave member of any category; a dependency on an open wave
@@ -39,7 +38,6 @@ const CAT_MATMUL_SPLITK: usize = 4;
 /// single elementwise operations hosted as one-statement regions.
 const CAT_REGION: usize = 0;
 const CATEGORY_COUNT: usize = 6;
-
 
 /// Segments of one merged dispatch, in queue order. All members are
 /// mutually independent.
@@ -123,7 +121,6 @@ const MATMUL_SEGMENT_BINDINGS: usize = 3;
 
 pub(super) struct HorizontalMerger {
     enabled: bool,
-    merge_dense_ops: bool,
     device: crate::Device,
     /// Max total storage bindings per merged dispatch.
     budget: usize,
@@ -150,10 +147,9 @@ pub(super) struct HorizontalMerger {
 }
 
 impl HorizontalMerger {
-    pub(super) fn new(enabled: bool, merge_dense_ops: bool, device: &crate::Device) -> Self {
+    pub(super) fn new(enabled: bool, device: &crate::Device) -> Self {
         Self {
             enabled,
-            merge_dense_ops,
             device: device.clone(),
             // Total storage bindings per merged dispatch. The nary budget is
             // inputs-only (it assumes one extra output binding); merged
@@ -186,8 +182,8 @@ impl HorizontalMerger {
             // Regions already have a valid single-region queue lowering. The
             // merger may combine independent regions; there is no element cap
             // because multi-output regions have no tiled fallback.
-            ExecutionVariant::Region(op) if self.merge_dense_ops => Some(SegOp::Region(op.clone())),
-            ExecutionVariant::Elementwise(op) if self.merge_dense_ops => {
+            ExecutionVariant::Region(op) => Some(SegOp::Region(op.clone())),
+            ExecutionVariant::Elementwise(op) => {
                 // Ops at or above the register-reuse tiled path's engagement
                 // element count stay out of merges so that plan never
                 // regresses; the bound is derived from the same policy the
@@ -201,14 +197,10 @@ impl HorizontalMerger {
                     ))
                 })
             }
-            ExecutionVariant::Reduce(op) if self.merge_dense_ops => {
-                let mut row = RowProgramOperation::from_reduce(op);
-                // Raw reduces reach this arm only in the dense profile, so
-                // hosted row programs take the tuned codegen.
-                row.dense_codegen = true;
-                self.row_candidate(row)
+            ExecutionVariant::Reduce(op) => {
+                self.row_candidate(RowProgramOperation::from_reduce(op))
             }
-            ExecutionVariant::GraphOp(op) if self.merge_dense_ops => {
+            ExecutionVariant::GraphOp(op) => {
                 let row = op.as_row_program()?.clone();
                 self.row_candidate(row)
             }
@@ -218,9 +210,8 @@ impl HorizontalMerger {
                 // epilogue-fused matmuls lower standalone.
                 if std::env::var_os("FUSOR_TRACE_MATMUL_MERGE").is_some() {
                     eprintln!(
-                        "matmul_merge_candidate name={} dense={} profile={:?}",
+                        "matmul_merge_candidate name={} profile={:?}",
                         op.name(),
-                        op.dense_codegen,
                         op.merge_profile(&self.device)
                     );
                 }
