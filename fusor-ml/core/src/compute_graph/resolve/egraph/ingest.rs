@@ -106,6 +106,11 @@ impl EGraphDriver {
             Exit { inner: NodeIndex, prov: Prov },
         }
         let mut stack = Vec::new();
+        // Nodes whose Exit frame has not run yet. Re-entering one means the
+        // execution graph has a dependency cycle, which the placeholder
+        // class slots downstream would turn into an opaque unionfind panic.
+        #[cfg(debug_assertions)]
+        let mut open: FxHashSet<NodeIndex> = FxHashSet::default();
         for &target in resolver.targets.iter().rev() {
             stack.push(Frame::Enter(target));
         }
@@ -113,6 +118,42 @@ impl EGraphDriver {
             match frame {
                 Frame::Enter(inner) => {
                     if driver.prov_of.contains_key(&inner) {
+                        #[cfg(debug_assertions)]
+                        if open.contains(&inner) {
+                            let describe = |node: NodeIndex| {
+                                resolver
+                                    .node_mapping
+                                    .get(&node)
+                                    .map(|&exec| format!("{:?}", resolver.execution_graph[exec].variant))
+                                    .unwrap_or_else(|| "<boundary>".into())
+                            };
+                            let variant = describe(inner);
+                            let deps = resolver
+                                .node_mapping
+                                .get(&inner)
+                                .map(|&exec| {
+                                    variant_dependencies(&resolver.execution_graph[exec].variant)
+                                        .into_iter()
+                                        .map(|dep| format!("{dep:?}: {}", describe(dep)))
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            let spine: Vec<String> = stack
+                                .iter()
+                                .filter_map(|frame| match frame {
+                                    Frame::Exit { inner, .. } => {
+                                        let mut text = describe(*inner);
+                                        text.truncate(120);
+                                        Some(format!("{inner:?}: {text}"))
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            panic!(
+                                "dependency cycle through inner node {inner:?} ({variant}) reached \
+                                 egraph ingest; dependencies: {deps:#?}; open spine: {spine:#?}"
+                            );
+                        }
                         continue;
                     }
                     let exec = resolver.node_mapping.get(&inner).copied();
@@ -169,6 +210,8 @@ impl EGraphDriver {
                         .identity_enodes
                         .push(FusorLang::Boundary(prov, AllocationId(inner.index())));
                     driver.identity_variants.push(None);
+                    #[cfg(debug_assertions)]
+                    open.insert(inner);
                     stack.push(Frame::Exit { inner, prov });
                     let deps = variant_dependencies(&resolver.execution_graph[exec_idx].variant);
                     for &dep in deps.iter().rev() {
@@ -176,6 +219,8 @@ impl EGraphDriver {
                     }
                 }
                 Frame::Exit { inner, prov } => {
+                    #[cfg(debug_assertions)]
+                    open.remove(&inner);
                     let exec_idx = resolver.node_mapping[&inner];
                     let variant = resolver.execution_graph[exec_idx].variant.clone();
                     let children: Vec<Id> = variant_dependencies(&variant)

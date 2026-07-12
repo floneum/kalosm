@@ -8,10 +8,12 @@
 //! the flush-replay recording hook identically). Killed producers fall out
 //! through `remove_node_if_dead`, mirroring extraction's kill cascade.
 
+use egg::Language;
+
 use super::super::Resolver;
 use super::EGraphDriver;
 use super::extract::Extraction;
-use super::interner::variant_dependencies;
+use super::interner::{rebind_variant_dependencies, variant_dependencies};
 use crate::compute_graph::ComputeGraphInner;
 
 impl Resolver {
@@ -27,11 +29,40 @@ impl Resolver {
             let exec_idx = facts
                 .exec
                 .expect("deltas only select alternatives for execution nodes");
+            // An earlier delta's commit can kill this delta's target: when
+            // one recognized cluster's root is another cluster's
+            // intermediate (semantic identity lets both carry deltas), the
+            // outer commit rewires past the inner root and its kill cascade
+            // removes it. The removed node is unconsumed and not a target,
+            // so its rewrite is vacuous — both application orders converge
+            // to the same final graph.
+            if !self.execution_graph.contains_node(exec_idx) {
+                continue;
+            }
             let payload = enode
                 .payload()
                 .expect("non-identity selections carry a payload");
-            let variant = driver.egraph.analysis.payloads.get(payload).clone();
+            let mut variant = driver.egraph.analysis.payloads.get(payload).clone();
+            // The payload may have been interned by a different
+            // structurally-identical instance; its concrete inputs belong to
+            // that instance. Rebind them to this e-node's actual children,
+            // resolved through the same class-representative mapping
+            // extraction used for its read/kill accounting, so the graph
+            // edges agree with what extraction kept alive.
+            let child_inners: Vec<crate::compute_graph::NodeIndex> = enode
+                .children()
+                .iter()
+                .map(|&child| {
+                    let child_prov = driver.prov_of_class(child);
+                    driver.egraph.analysis.facts_of(child_prov).inner
+                })
+                .collect();
+            rebind_variant_dependencies(&mut variant, &child_inners);
             let dependencies = variant_dependencies(&variant);
+            debug_assert_eq!(
+                dependencies, child_inners,
+                "rebinding must place every child in a dependency slot"
+            );
             self.commit_recognized(graph, exec_idx, &dependencies, variant);
             applied += 1;
         }

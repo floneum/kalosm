@@ -102,6 +102,80 @@ pub(super) fn variant_dependencies(variant: &ExecutionVariant) -> Vec<NodeIndex>
     deps
 }
 
+/// Rewrite `variant`'s dependency slots — in `visit_dependencies` order — to
+/// `new`. Interned payloads deduplicate with their inputs ignored
+/// (`semantic_payload_eq`), so a payload fetched through the table may carry
+/// the concrete input indices of a *different* structurally-identical
+/// instance (another layer's matmul, say). Every materialization of a
+/// payload back into the execution graph must rebind its inputs to the
+/// e-node's actual children or it computes with the wrong operands.
+pub(super) fn rebind_variant_dependencies(variant: &mut ExecutionVariant, new: &[NodeIndex]) {
+    let mut slots = new.iter().copied();
+    match variant {
+        ExecutionVariant::Tensor(_) | ExecutionVariant::QMatrix(_) => {}
+        ExecutionVariant::Elementwise(op) => {
+            for input in &mut op.inputs {
+                *input = slots.next().expect("elementwise rebind arity");
+            }
+        }
+        ExecutionVariant::Reduce(op) => {
+            for input in &mut op.inputs {
+                *input = slots.next().expect("reduce rebind arity");
+            }
+        }
+        ExecutionVariant::View(op) => {
+            op.input = slots.next().expect("view rebind arity");
+        }
+        ExecutionVariant::Assign(op) => {
+            // Order matches `SliceAssignOperation::visit_dependencies`:
+            // value first, then input.
+            op.value = slots.next().expect("assign rebind arity");
+            op.input = slots.next().expect("assign rebind arity");
+        }
+        ExecutionVariant::Region(op) => {
+            for input in &mut op.inputs {
+                *input = slots.next().expect("region rebind arity");
+            }
+        }
+        ExecutionVariant::MatMul(op) => {
+            op.first = slots.next().expect("matmul rebind arity");
+            op.second = slots.next().expect("matmul rebind arity");
+        }
+        ExecutionVariant::QMatMul(op) => {
+            // Order matches `QMatMulOperation::visit_dependencies`: input,
+            // then pre-epilogue extras, then post-epilogue extras.
+            op.input = slots.next().expect("qmatmul rebind arity");
+            for epilogue in [&mut op.pre_element_wise_expr, &mut op.post_element_wise_expr]
+                .into_iter()
+                .flatten()
+            {
+                for extra in &mut epilogue.extras {
+                    *extra = slots.next().expect("qmatmul extras rebind arity");
+                }
+            }
+        }
+        ExecutionVariant::QEmbedding(op) => {
+            op.indexes = slots.next().expect("qembedding rebind arity");
+        }
+        // GraphOp payloads are identified by `Arc::ptr_eq`, so an interned
+        // GraphOp payload is always this exact object and its stored
+        // dependencies are already its own — nothing to rebind.
+        ExecutionVariant::GraphOp(op) => {
+            debug_assert_eq!(
+                variant_dependencies(&ExecutionVariant::GraphOp(op.clone())),
+                new,
+                "GraphOp payloads never conflate, so children must already match"
+            );
+            let _ = &mut slots;
+            return;
+        }
+    }
+    debug_assert!(
+        slots.next().is_none(),
+        "rebind received more children than the variant has dependency slots"
+    );
+}
+
 fn variant_tag(variant: &ExecutionVariant) -> u8 {
     match variant {
         ExecutionVariant::Tensor(_) => 0,
