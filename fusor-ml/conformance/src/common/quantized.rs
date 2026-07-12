@@ -121,7 +121,7 @@ pub fn assert_q_mat_mul_matches_host_reference(
     fixture: &QuantizedFixture,
     fuzz: QMatMulFuzz,
 ) -> AssertionCase {
-    use fusor::ToVec2;
+    use fusor::ToVec;
 
     let ty = fixture.ty;
     let weight_shape = fixture.weight_shape;
@@ -148,7 +148,7 @@ pub fn assert_q_mat_mul_matches_host_reference(
         let expected_weights = expected_weights.clone();
         async move {
             let device = input.device();
-            let input_values = input.as_slice().await.unwrap().to_vec2();
+            let input_values = input.as_slice().await.unwrap().to_vec();
             Tensor::new(
                 &device,
                 &super::matmul2(&input_values, &super::transpose2(&expected_weights)),

@@ -1,5 +1,7 @@
 //! Linear layer implementation.
 
+pub(crate) mod autograd;
+
 use crate::{
     CastTensor, CastTo, DataType, Device, Fusion, GgmlType, QMatrix, SimdElement, Tensor,
     VarBuilder,
@@ -59,20 +61,6 @@ impl<T: DataType + SimdElement + Default> Linear<T> {
     }
 }
 
-/// Run `q_mat_mul(weight)` over a 3D input by flattening (batch, seq, in) to
-/// (batch * seq, in), multiplying, then reshaping back. Shared by both the f32
-/// and the cast-via-f32 forward paths.
-fn q_mat_mul_3d(input: &Tensor<3, f32>, weight: &QMatrix) -> Tensor<3, f32> {
-    let [batch, seq_len, in_features] = input.shape();
-    let out_features = weight.shape()[0];
-
-    let input_2d: Tensor<2, f32> = input.reshape([batch * seq_len, in_features]).to_concrete();
-    let output_2d = input_2d.q_mat_mul(weight);
-    output_2d
-        .reshape([batch, seq_len, out_features])
-        .to_concrete()
-}
-
 // f32-specific implementations for loading and forward
 impl Linear<f32> {
     /// Load a Linear layer from a VarBuilder.
@@ -86,34 +74,16 @@ impl Linear<f32> {
         Ok(Self { weight, bias })
     }
 
-    /// Forward pass for 3D input (batch, seq_len, in_features)
-    ///
-    /// Input shape: (batch, seq_len, in_features)
-    /// Output shape: (batch, seq_len, out_features)
-    pub fn forward<B>(&self, input: &Tensor<3, f32, B>) -> Tensor<3, f32>
+    /// Applies the linear projection to the last dimension of an input tensor.
+    pub fn forward<const R: usize, B>(&self, input: &Tensor<R, f32, B>) -> Tensor<R, f32>
     where
-        B: Fusion<3, f32>,
-    {
-        let input_concrete = input.to_concrete();
-        let output = q_mat_mul_3d(&input_concrete, &self.weight);
-        if let Some(bias) = &self.bias {
-            output.add_(bias)
-        } else {
-            output
-        }
-    }
-    /// Forward pass for 2D input (batch, in_features)
-    ///
-    /// Input shape: (batch, in_features)
-    /// Output shape: (batch, out_features)
-    pub fn forward_2d<B>(&self, input: &Tensor<2, f32, B>) -> Tensor<2, f32>
-    where
-        B: Fusion<2, f32>,
+        B: Fusion<R, f32>,
+        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<1, f32>): crate::gpu::MaxRank<R, f32>,
+        (crate::ConcreteTensor<f32, R>, crate::ConcreteTensor<f32, 1>): crate::cpu::MaxRank<R, f32>,
     {
         let output = input.q_mat_mul(&self.weight);
-
         if let Some(bias) = &self.bias {
-            output.add_(bias)
+            output.add_::<1, R, _>(bias)
         } else {
             output
         }
@@ -127,17 +97,18 @@ where
     T: CastTo<f32> + CastTensor<f32>,
     f32: CastTo<T> + CastTensor<T>,
 {
-    /// Forward pass for 3D input with generic type.
-    /// Converts input to f32 for computation, then converts back.
-    pub fn forward_generic<B>(&self, input: &Tensor<3, T, B>) -> Tensor<3, T>
+    /// Applies the linear projection after converting the input to f32.
+    pub fn forward_generic<const R: usize, B>(&self, input: &Tensor<R, T, B>) -> Tensor<R, T>
     where
-        B: Fusion<3, T>,
+        B: Fusion<R, T>,
+        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<1, f32>): crate::gpu::MaxRank<R, f32>,
+        (crate::ConcreteTensor<f32, R>, crate::ConcreteTensor<f32, 1>): crate::cpu::MaxRank<R, f32>,
     {
         let input_f32 = input.cast::<f32>();
-        let output_f32 = q_mat_mul_3d(&input_f32, &self.weight);
+        let output_f32 = input_f32.q_mat_mul(&self.weight);
         let output_f32 = if let Some(bias) = &self.bias {
             let bias_f32: Tensor<1, f32> = bias.cast();
-            output_f32.add_(&bias_f32)
+            output_f32.add_::<1, R, _>(&bias_f32)
         } else {
             output_f32
         };

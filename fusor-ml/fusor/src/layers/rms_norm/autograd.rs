@@ -1,6 +1,6 @@
 //! Trainable RMS normalization implementation.
 
-use super::super::{Graph, Tensor};
+use crate::autograd::{Graph, Tensor};
 
 /// Root Mean Square Normalization.
 ///
@@ -46,19 +46,16 @@ impl<const N: usize> RmsNorm<N> {
 }
 
 impl RmsNorm<1> {
-    /// Forward pass for 2D input (batch, features).
-    pub fn forward_2d(&self, input: &Tensor<2>) -> Tensor<2> {
-        input.rms_norm_fused::<1, 1>(&self.weight, self.bias.as_ref(), self.eps)
-    }
-
-    /// Forward pass for 3D input (batch, seq_len, features).
-    pub fn forward(&self, input: &Tensor<3>) -> Tensor<3> {
-        input.rms_norm_fused::<1, 2>(&self.weight, self.bias.as_ref(), self.eps)
-    }
-
-    /// Forward pass for 4D input (batch, heads, seq_len, features).
-    pub fn forward_4d(&self, input: &Tensor<4>) -> Tensor<4> {
-        input.rms_norm_fused::<1, 3>(&self.weight, self.bias.as_ref(), self.eps)
+    /// Normalizes the last dimension of an input tensor.
+    pub fn forward<const R: usize, const OUT_RANK: usize>(&self, input: &Tensor<R>) -> Tensor<R>
+    where
+        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, f32> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, f32>>,
+        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<1, f32>): crate::gpu::MaxRank<R, f32>,
+    {
+        input.rms_norm_fused::<1, OUT_RANK>(&self.weight, self.bias.as_ref(), self.eps)
     }
 
     /// Forward pass for `input + residual` followed by RMSNorm.
@@ -66,4 +63,3 @@ impl RmsNorm<1> {
         input.rms_norm_residual_fused::<1, 2>(residual, &self.weight, self.bias.as_ref(), self.eps)
     }
 }
-

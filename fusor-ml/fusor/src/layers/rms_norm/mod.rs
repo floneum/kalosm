@@ -1,5 +1,7 @@
 //! RMS normalization implementation.
 
+pub(crate) mod autograd;
+
 use crate::fusion::Concrete;
 use crate::{CastTensor, CastTo, DataType, Device, Fusion, SimdElement, Tensor, VarBuilder};
 
@@ -63,31 +65,21 @@ impl<const R: usize> RmsNorm<R, f32> {
     }
 }
 
-// Forward implementations for specific ranks (2D, 3D, 4D inputs)
-// This avoids the complex trait bounds while still being useful
 impl RmsNorm<1, f32> {
-    /// Forward pass for 2D input (batch, features).
-    pub fn forward_2d<B>(&self, input: &Tensor<2, f32, B>) -> Tensor<2, f32>
+    /// Normalizes the last dimension of an input tensor.
+    pub fn forward<const R: usize, const OUT_RANK: usize, B>(
+        &self,
+        input: &Tensor<R, f32, B>,
+    ) -> Tensor<R, f32>
     where
-        B: Fusion<2, f32>,
+        B: Fusion<R, f32>,
+        Concrete<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, f32> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, f32>>,
+        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<1, f32>): crate::gpu::MaxRank<R, f32>,
     {
-        input.rms_norm_fused::<1, 1>(&self.weight, self.bias.as_ref(), self.eps)
-    }
-
-    /// Forward pass for 3D input (batch, seq_len, features).
-    pub fn forward<B>(&self, input: &Tensor<3, f32, B>) -> Tensor<3, f32>
-    where
-        B: Fusion<3, f32>,
-    {
-        input.rms_norm_fused::<1, 2>(&self.weight, self.bias.as_ref(), self.eps)
-    }
-
-    /// Forward pass for 4D input (batch, heads, seq_len, features).
-    pub fn forward_4d<B>(&self, input: &Tensor<4, f32, B>) -> Tensor<4, f32>
-    where
-        B: Fusion<4, f32>,
-    {
-        input.rms_norm_fused::<1, 3>(&self.weight, self.bias.as_ref(), self.eps)
+        input.rms_norm_fused::<1, OUT_RANK>(&self.weight, self.bias.as_ref(), self.eps)
     }
 }
 
@@ -98,11 +90,18 @@ where
     T: CastTo<f32> + CastTensor<f32>,
     f32: CastTo<T> + CastTensor<T>,
 {
-    /// Forward pass for 3D input with generic type.
-    /// Converts input to f32 for computation, then converts back.
-    pub fn forward_generic<B>(&self, input: &Tensor<3, T, B>) -> Tensor<3, T>
+    /// Normalizes after converting the input to f32, then converts it back.
+    pub fn forward_generic<const R: usize, const OUT_RANK: usize, B>(
+        &self,
+        input: &Tensor<R, T, B>,
+    ) -> Tensor<R, T>
     where
-        B: Fusion<3, T>,
+        B: Fusion<R, T>,
+        Concrete<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, f32> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, f32>>,
+        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<1, f32>): crate::gpu::MaxRank<R, f32>,
     {
         // Cast input and weights to f32
         let input_f32 = input.cast::<f32>();
@@ -110,7 +109,8 @@ where
         let bias_f32: Option<Tensor<1, f32>> = self.bias.as_ref().map(|b| b.cast());
 
         // Compute RMS norm in f32
-        let result_f32 = input_f32.rms_norm_fused::<1, 2>(&weight_f32, bias_f32.as_ref(), self.eps);
+        let result_f32 =
+            input_f32.rms_norm_fused::<1, OUT_RANK>(&weight_f32, bias_f32.as_ref(), self.eps);
 
         // Cast back to T
         result_f32.cast()
@@ -157,19 +157,5 @@ where
         input
             .rms_norm_residual_fused::<1, 2, _>(residual, &weight_f32, bias_f32.as_ref(), self.eps)
             .cast()
-    }
-
-    /// Forward pass for 4D input with generic type.
-    pub fn forward_generic_4d<B>(&self, input: &Tensor<4, T, B>) -> Tensor<4, T>
-    where
-        B: Fusion<4, T>,
-    {
-        let input_f32 = input.cast::<f32>();
-        let weight_f32: Tensor<1, f32> = self.weight.cast();
-        let bias_f32: Option<Tensor<1, f32>> = self.bias.as_ref().map(|b| b.cast());
-
-        let result_f32 = input_f32.rms_norm_fused::<1, 3>(&weight_f32, bias_f32.as_ref(), self.eps);
-
-        result_f32.cast()
     }
 }

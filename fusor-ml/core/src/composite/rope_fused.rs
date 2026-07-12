@@ -497,21 +497,29 @@ fn row_major_strides(shape: &[usize; 4]) -> Vec<usize> {
 }
 
 fn row_major_indices_from_flat(flat: NaryExpr, shape: &[usize; 4]) -> Vec<NaryExpr> {
-    let mut indices = Vec::with_capacity(shape.len());
-    for axis in 0..shape.len() {
-        let divisor = shape[axis + 1..].iter().product::<usize>();
-        let quotient = if divisor == 1 {
-            flat.clone()
-        } else {
-            NaryExpr::unary_op(
-                flat.clone(),
+    // Peel innermost-out with a running quotient — Metal miscompiles u32
+    // div/mod chains with large non-power-of-two constants (see
+    // nary_direct::output_dims_from_flat).
+    let mut indices = vec![NaryExpr::scalar(NaryScalar::U32(0)); shape.len()];
+    let mut rest = flat;
+    for axis in (0..shape.len()).rev() {
+        let dim = shape[axis];
+        if dim == 1 {
+            continue;
+        }
+        if shape[..axis].iter().any(|&outer| outer != 1) {
+            indices[axis] = rem_const(rest.clone(), dim, "dim_index");
+            rest = NaryExpr::unary_op(
+                rest,
                 "div_stride",
-                NaryOp::DivConst(NaryScalar::U32(divisor as u32)),
+                NaryOp::DivConst(NaryScalar::U32(dim as u32)),
                 DataTypeEnum::U32,
                 DataTypeEnum::U32,
-            )
-        };
-        indices.push(rem_const(quotient, shape[axis], "dim_index"));
+            );
+        } else {
+            indices[axis] = rest;
+            break;
+        }
     }
     indices
 }

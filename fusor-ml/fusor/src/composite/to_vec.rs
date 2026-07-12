@@ -6,32 +6,18 @@ use bytemuck::{AnyBitPattern, NoUninit};
 
 use crate::gpu::TensorSlice;
 
-/// Extension trait for TensorSlice to convert to Vec types
+/// Converts a tensor slice into nested `Vec`s matching its rank.
 pub trait ToVec {
     type Output;
     fn to_vec(&self) -> Self::Output;
 }
 
-/// Extension trait for TensorSlice to convert to Vec types
-pub trait ToVec1<D> {
-    fn to_vec1(&self) -> Vec<D>;
-}
-
-/// Extension trait for TensorSlice to convert to Vec types
-pub trait ToVec2<D> {
-    fn to_vec2(&self) -> Vec<Vec<D>>;
-}
-
-/// Extension trait for TensorSlice to convert to Vec types
-pub trait ToVec3<D> {
-    fn to_vec3(&self) -> Vec<Vec<Vec<D>>>;
-}
-
-impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec1<D>
+impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec
     for TensorSlice<1, D, Bytes>
 {
-    /// Convert a 1D tensor slice to a `Vec<D>`
-    fn to_vec1(&self) -> Vec<D> {
+    type Output = Vec<D>;
+
+    fn to_vec(&self) -> Self::Output {
         let shape = self.shape();
         let len = shape[0];
 
@@ -44,21 +30,11 @@ impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec1<D>
 }
 
 impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec
-    for TensorSlice<1, D, Bytes>
-{
-    type Output = Vec<D>;
-
-    /// Convert a 1D tensor slice to a `Vec<D>`
-    fn to_vec(&self) -> Self::Output {
-        self.to_vec1()
-    }
-}
-
-impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec2<D>
     for TensorSlice<2, D, Bytes>
 {
-    /// Convert a 2D tensor slice to a `Vec<Vec<D>>`
-    fn to_vec2(&self) -> Vec<Vec<D>> {
+    type Output = Vec<Vec<D>>;
+
+    fn to_vec(&self) -> Self::Output {
         let shape = self.shape();
         let rows = shape[0];
         let cols = shape[1];
@@ -76,21 +52,11 @@ impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec2<D>
 }
 
 impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec
-    for TensorSlice<2, D, Bytes>
-{
-    type Output = Vec<Vec<D>>;
-
-    /// Convert a 2D tensor slice to a `Vec<Vec<D>>`
-    fn to_vec(&self) -> Self::Output {
-        self.to_vec2()
-    }
-}
-
-impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec3<D>
     for TensorSlice<3, D, Bytes>
 {
-    /// Convert a 3D tensor slice to a `Vec<Vec<Vec<D>>>`
-    fn to_vec3(&self) -> Vec<Vec<Vec<D>>> {
+    type Output = Vec<Vec<Vec<D>>>;
+
+    fn to_vec(&self) -> Self::Output {
         let shape = self.shape();
         let dim0 = shape[0];
         let dim1 = shape[1];
@@ -109,16 +75,5 @@ impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec3<D>
             result.push(layer);
         }
         result
-    }
-}
-
-impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec
-    for TensorSlice<3, D, Bytes>
-{
-    type Output = Vec<Vec<Vec<D>>>;
-
-    /// Convert a 3D tensor slice to a `Vec<Vec<Vec<D>>>`
-    fn to_vec(&self) -> Self::Output {
-        self.to_vec3()
     }
 }

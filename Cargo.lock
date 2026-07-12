@@ -4707,6 +4707,7 @@ dependencies = [
  "fusor-gguf",
  "fusor-types",
  "futures",
+ "futures-channel",
  "half",
  "kalosm-common",
  "kalosm-model-types",
@@ -4718,6 +4719,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
  "ureq 3.3.0",
+ "wgpu",
 ]
 
 [[package]]

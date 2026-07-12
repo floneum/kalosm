@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use fusor::autograd::layers::{ConvNd, ConvNdConfig, Linear};
 use fusor::autograd::{Gradients, Graph, Tensor};
-use fusor::{Device, Tensor as RawTensor, ToVec1, ToVec2};
+use fusor::{Device, Tensor as RawTensor, ToVec};
 
 const BATCH_SIZE: usize = 64;
 const EPOCHS: usize = 1;
@@ -178,7 +178,7 @@ impl Cnn {
             .forward(&x)
             .relu()
             .pool_max::<2, 6, 7, 5>([2, 2]);
-        self.fc.forward_2d(&x.flatten_last_n::<2, 2>())
+        self.fc.forward(&x.flatten_last_n::<2, 2>())
     }
 }
 
@@ -198,7 +198,7 @@ fn sgd_step<const R: usize>(param: &mut RawTensor<R, f32>, gradients: &Gradients
 }
 
 async fn to_scalar(value: RawTensor<0, f32>) -> f32 {
-    value.reshape([1]).as_slice().await.unwrap().to_vec1()[0]
+    value.reshape([1]).as_slice().await.unwrap().to_vec()[0]
 }
 
 fn argmax(row: &[f32]) -> u32 {
@@ -274,7 +274,7 @@ async fn main() {
             &graph,
             RawTensor::from_slice(&device, [labels.len(), 1, IMAGE_SIZE, IMAGE_SIZE], images),
         );
-        let logits = model.forward(&x).raw().clone().as_slice().await.unwrap().to_vec2();
+        let logits = model.forward(&x).raw().clone().as_slice().await.unwrap().to_vec();
         correct += logits
             .iter()
             .zip(labels)

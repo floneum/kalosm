@@ -1,5 +1,7 @@
 //! Embedding layer implementation.
 
+pub(crate) mod autograd;
+
 use crate::{
     CastTensor, CastTo, DataType, Device, Fusion, QMatrix, SimdElement, Tensor, VarBuilder,
 };

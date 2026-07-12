@@ -142,7 +142,7 @@ where
 #[cfg(test)]
 #[tokio::test]
 async fn test_vision_patch_embed() {
-    use fusor::ToVec2;
+    use fusor::ToVec;
 
     let embed_dim = 4;
     let in_channels = 3;
@@ -239,7 +239,7 @@ async fn test_vision_patch_embed() {
         .unwrap()
         .cast::<f32>();
     let output_slice = output.as_slice().await.unwrap();
-    let output_vec = output_slice.to_vec2();
+    let output_vec = output_slice.to_vec();
     println!("Output: {output_vec:?}");
     let expected_output = [[0.3058, 0.6866, -0.7391, -0.6952]];
     assert_2d_vec_eq(output_vec, expected_output, 1e-2);

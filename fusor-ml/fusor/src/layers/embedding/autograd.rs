@@ -1,6 +1,7 @@
 //! Trainable embedding layer implementation.
 
-use super::super::{Graph, RawTensor, Tensor};
+use crate::Tensor as RawTensor;
+use crate::autograd::{Graph, Tensor};
 
 /// Embedding layer for token/position embeddings.
 ///
@@ -37,20 +38,24 @@ impl Embedding {
         Self::new_from_tensor(graph.leaf(table))
     }
 
-    /// Forward pass: lookup embeddings for the given indices.
-    ///
-    /// Input: [batch, seq_len] with indices
-    /// Output: [batch, seq_len, embedding_dim] with embeddings
-    pub fn forward(&self, indices: &RawTensor<2, u32>) -> Tensor<3> {
-        self.embeddings.embedding(indices)
-    }
-
-    /// Forward pass: lookup embeddings for flat indices.
-    ///
-    /// Input: [seq_len] with indices
-    /// Output: [seq_len, embedding_dim] with embeddings
-    pub fn forward_1d(&self, indices: &RawTensor<1, u32>) -> Tensor<2> {
-        self.embeddings.index_select(0, indices)
+    /// Looks up embeddings for an index tensor, appending the embedding dimension.
+    pub fn forward<const N: usize, const M: usize>(&self, indices: &RawTensor<N, u32>) -> Tensor<M>
+    where
+        crate::gpu::Tensor<N, u32>: crate::gpu::NextRank<M, u32>,
+    {
+        assert_eq!(M, N + 1, "embedding output rank must be input rank + 1");
+        let input_shape = indices.shape();
+        let output_shape = std::array::from_fn(|axis| {
+            if axis < N {
+                input_shape[axis]
+            } else {
+                self.embedding_dim
+            }
+        });
+        let indices = indices.flatten_all().to_concrete();
+        self.embeddings
+            .index_select(0, &indices)
+            .reshape(output_shape)
     }
 
     /// Get the embedding table.

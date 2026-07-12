@@ -4,7 +4,7 @@ use crate::common::quantized::{
     concrete_to_rows, q_mat_mul_input_fuzz, q4k_raw_bytes, qmatrix_from_raw_bytes,
 };
 use crate::common::{matmul2, transpose2};
-use fusor::{BlockQ4K, Device, GgmlType, GgufBlock, QuantizedTensor, Tensor, ToVec2};
+use fusor::{BlockQ4K, Device, GgmlType, GgufBlock, QuantizedTensor, Tensor, ToVec};
 use fusor_conformance::{
     AssertionCase, AssertionCases, approx_compare, approx_or_relative_compare, available_devices,
     cases_from_rows,
@@ -361,7 +361,7 @@ fn gated_matches_cpu_for_rows(input_row_count: usize, kind: GatedKind) -> Assert
         let expected_weights = expected_weights.clone();
         async move {
             let device = input.device();
-            let input_values = input.as_slice().await.unwrap().to_vec2();
+            let input_values = input.as_slice().await.unwrap().to_vec();
             let projected = matmul2(&input_values, &transpose2(&expected_weights));
             let expected = projected
                 .iter()

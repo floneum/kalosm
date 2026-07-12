@@ -4,11 +4,11 @@
 //!
 //! All layers support loading from GGUF files via `VarBuilder` for f32 types.
 
-mod conv;
-mod embedding;
-mod layer_norm;
-mod linear;
-mod rms_norm;
+pub(crate) mod conv;
+pub(crate) mod embedding;
+pub(crate) mod layer_norm;
+pub(crate) mod linear;
+pub(crate) mod rms_norm;
 
 pub use conv::{ConvNd, ConvNdConfig};
 pub use embedding::Embedding;

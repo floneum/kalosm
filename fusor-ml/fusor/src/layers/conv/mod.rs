@@ -1,5 +1,7 @@
 //! N-dimensional convolution layer.
 
+pub(crate) mod autograd;
+
 use crate::fusion::Concrete;
 use crate::{
     DataType, Device, FloatDataType, FloatOps, Fusion, MatmulImpl, SimdElement, Tensor, VarBuilder,

@@ -34,6 +34,8 @@ ndarray = "0.16.1"
 ureq = { version = "3.2.0", default-features = false, features = ["rustls"] }
 flate2 = "1.0.35"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["std", "naga-ir", "wgsl"] }
+futures-channel = "0.3"
 
 [lib]
 bench = false

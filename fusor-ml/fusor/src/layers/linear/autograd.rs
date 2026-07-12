@@ -1,6 +1,6 @@
 //! Trainable linear layer implementation.
 
-use super::super::{Graph, Tensor};
+use crate::autograd::{Graph, Tensor};
 
 /// A trainable linear (fully connected) layer.
 ///
@@ -46,27 +46,26 @@ impl Linear {
         self.weight.shape()[0]
     }
 
-    /// Forward pass for 3D input (batch, seq_len, in_features)
-    ///
-    /// Input shape: (batch, seq_len, in_features)
-    /// Output shape: (batch, seq_len, out_features)
-    pub fn forward(&self, input: &Tensor<3>) -> Tensor<3> {
-        let [batch, seq_len, in_features] = input.shape();
-        let input_2d = input.reshape([batch * seq_len, in_features]);
-        self.forward_2d(&input_2d)
-            .reshape([batch, seq_len, self.out_features()])
-    }
+    /// Applies the linear projection to the last dimension of an input tensor.
+    pub fn forward<const R: usize>(&self, input: &Tensor<R>) -> Tensor<R> {
+        assert!(R >= 2, "linear forward requires rank >= 2");
 
-    /// Forward pass for 2D input (batch, in_features)
-    ///
-    /// Input shape: (batch, in_features)
-    /// Output shape: (batch, out_features)
-    pub fn forward_2d(&self, input: &Tensor<2>) -> Tensor<2> {
-        let output = input.mat_mul_transposed_rhs(&self.weight);
-        if let Some(bias) = &self.bias {
-            output.add_(bias)
+        let input_shape = input.shape();
+        let rows = input_shape[..R - 1].iter().product();
+        let input_2d = input.reshape([rows, input_shape[R - 1]]);
+        let output_2d = input_2d.mat_mul_transposed_rhs(&self.weight);
+        let output_2d = if let Some(bias) = &self.bias {
+            output_2d.add_(bias)
         } else {
-            output
-        }
+            output_2d
+        };
+        let output_shape = std::array::from_fn(|axis| {
+            if axis == R - 1 {
+                self.out_features()
+            } else {
+                input_shape[axis]
+            }
+        });
+        output_2d.reshape(output_shape)
     }
 }

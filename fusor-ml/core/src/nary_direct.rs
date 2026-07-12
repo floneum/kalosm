@@ -1338,23 +1338,37 @@ pub(crate) fn output_dims_from_flat(
     flat: tile_ir::tile::Tile,
     shape: &[usize],
 ) -> Vec<tile_ir::tile::Tile> {
-    (0..shape.len())
-        .map(|axis| {
-            let dim = shape[axis] as u32;
-            if dim == 1 {
-                return tile_u32(0);
-            }
-            let divisor = shape[axis + 1..]
-                .iter()
-                .fold(1u32, |acc, dim| acc.saturating_mul(*dim as u32));
-            let quotient = if divisor == 1 {
-                flat.clone()
-            } else {
-                flat.clone() / tile_u32(divisor)
-            };
-            quotient % tile_u32(dim)
-        })
-        .collect()
+    // Peel innermost-out with a running quotient rather than dividing the
+    // flat index by each axis' suffix product. Load-bearing, not a style
+    // choice: the Apple Metal compiler miscompiles chains of u32 div/mod by
+    // large non-power-of-two constants (e.g. `flat / 393216` for a
+    // [64,6,256,256] delinearize) once the grid needs a second dispatch
+    // dimension — stores land at wild addresses, which with unchecked
+    // shaders corrupts arbitrary GPU memory (observed M2 Max, macOS 26;
+    // reproduced with stock wgpu + trivial WGSL). The peeled form only ever
+    // divides by a single dimension extent, on a quotient already reduced by
+    // the inner axes, which compiles correctly at any size.
+    // The outermost non-trivial axis takes the raw quotient without a `%`:
+    // for in-bounds lanes it is already < dim, out-of-bounds lanes never
+    // touch memory (stores are branch-masked, masked loads clamp their index
+    // to 0), and a trailing non-power-of-two `%` re-triggers the miscompile
+    // (observed with `% 48` on a [48,6,256,256] delinearize).
+    let mut dims = vec![tile_u32(0); shape.len()];
+    let mut rest = flat;
+    for axis in (0..shape.len()).rev() {
+        let dim = shape[axis] as u32;
+        if dim == 1 {
+            continue;
+        }
+        if shape[..axis].iter().any(|&outer| outer != 1) {
+            dims[axis] = rest.clone() % tile_u32(dim);
+            rest = rest / tile_u32(dim);
+        } else {
+            dims[axis] = rest;
+            break;
+        }
+    }
+    dims
 }
 
 pub(crate) fn layout_index(

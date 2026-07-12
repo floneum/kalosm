@@ -316,7 +316,7 @@ where
 
                 let query: Tensor<4, F> = query.cast();
                 if let Some(norm) = &self.attention_q_norm {
-                    norm.forward_generic_4d(&query)
+                    norm.forward_generic(&query)
                 } else {
                     query
                 }
@@ -332,7 +332,7 @@ where
 
                 let key: Tensor<4, F> = key.cast();
                 if let Some(norm) = &self.attention_k_norm {
-                    norm.forward_generic_4d(&key)
+                    norm.forward_generic(&key)
                 } else {
                     key
                 }
@@ -375,7 +375,7 @@ where
 
             let query: Tensor<4, F> = query.cast();
             if let Some(norm) = &self.attention_q_norm {
-                norm.forward_generic_4d(&query)
+                norm.forward_generic(&query)
             } else {
                 query
             }
@@ -395,7 +395,7 @@ where
 
             let key: Tensor<4, F> = key.cast();
             if let Some(norm) = &self.attention_k_norm {
-                norm.forward_generic_4d(&key)
+                norm.forward_generic(&key)
             } else {
                 key
             }

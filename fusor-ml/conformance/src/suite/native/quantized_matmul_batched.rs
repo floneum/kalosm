@@ -4,7 +4,7 @@ use crate::common::quantized::{
     deterministic_input, q4k_raw_bytes, q8_0_raw_bytes, qmatrix_from_raw_bytes,
 };
 use crate::common::{matmul2, transpose2};
-use fusor::{BlockQ4K, Device, GgmlType, GgufBlock, Tensor, ToVec2};
+use fusor::{BlockQ4K, Device, GgmlType, GgufBlock, Tensor, ToVec};
 use fusor_conformance::{AssertionCase, AssertionCases, approx_compare, available_devices};
 use std::mem::size_of;
 
@@ -53,7 +53,7 @@ fn assert_q_mat_mul_3d_contiguous(input_rows: usize, batch: usize) -> AssertionC
                     .as_slice()
                     .await
                     .unwrap()
-                    .to_vec2();
+                    .to_vec();
                 let weights_t = transpose2(&dequantized_rows);
                 let mut expected_rows = Vec::with_capacity(batch);
                 for b in 0..batch {
@@ -114,7 +114,7 @@ fn assert_q_mat_mul_3d_transposed(input_rows: usize, batch: usize) -> AssertionC
                     .as_slice()
                     .await
                     .unwrap()
-                    .to_vec2();
+                    .to_vec();
                 let weights_t = transpose2(&dequantized_rows);
                 let mut expected_rows = Vec::with_capacity(batch);
                 for b in 0..batch {
@@ -329,7 +329,7 @@ pub fn q_mat_mul_batched_matches_unbatched_property() -> AssertionCase {
                 let unbatched: Tensor<2, f32> =
                     Tensor::from_slice(&device, [input_rows, weight_shape[1]], &slice_data);
                 let result = unbatched.q_mat_mul(&weights).to_concrete();
-                expected.push(result.as_slice().await.unwrap().to_vec2());
+                expected.push(result.as_slice().await.unwrap().to_vec());
             }
             Tensor::new(&device, &expected)
         }

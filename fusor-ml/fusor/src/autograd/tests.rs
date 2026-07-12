@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Layout, ToVec1, ToVec2};
+use crate::{Layout, ToVec};
 use fusor_types::StrideSpec;
 
 fn assert_close(left: f32, right: f32) {
@@ -32,7 +32,7 @@ async fn flatten<const R: usize>(tensor: RawTensor<R, f32>) -> Vec<f32> {
         .as_slice()
         .await
         .unwrap()
-        .to_vec1()
+        .to_vec()
 }
 
 async fn finite_difference_gradient<const R: usize, F>(
@@ -103,7 +103,7 @@ async fn test_backward_squared_sum() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(dx[0], 2.0);
         assert_close(dx[1], 4.0);
@@ -118,7 +118,7 @@ async fn test_autograd_silu() {
         let x: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, -2.0, 0.5]);
 
         let output = x.silu();
-        let values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let values = output.raw().clone().as_slice().await.unwrap().to_vec();
 
         let expected = [1.0f32, -2.0, 0.5].map(|v| v / (1.0 + (-v).exp()));
         for (value, expected) in values.iter().zip(expected) {
@@ -132,7 +132,7 @@ async fn test_autograd_silu() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         let expected_grads = [1.0f32, -2.0, 0.5].map(|v| {
             let sigmoid = 1.0 / (1.0 + (-v).exp());
@@ -156,7 +156,7 @@ async fn test_autograd_gelu() {
         let x: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, -2.0, 0.5]);
 
         let output = x.gelu();
-        let values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let values = output.raw().clone().as_slice().await.unwrap().to_vec();
 
         let expected = [1.0f32, -2.0, 0.5].map(|v| {
             0.5 * v
@@ -173,7 +173,7 @@ async fn test_autograd_gelu() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         let expected_grads = [1.0f32, -2.0, 0.5].map(|v| {
             let scale = (2.0 / std::f32::consts::PI).sqrt();
@@ -202,7 +202,7 @@ async fn test_backward_where_cond() {
         let on_false: Tensor<1> = Tensor::new(&graph, &device, &[10.0f32, 20.0, 30.0]);
 
         let output = condition.where_cond(&on_true, &on_false);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.flatten_all().sum().backward().unwrap();
 
         let dcondition = gradients
@@ -211,21 +211,21 @@ async fn test_backward_where_cond() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let dtrue = gradients
             .get(&on_true)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let dfalse = gradients
             .get(&on_false)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![2.0, 20.0, 4.0]);
         assert_eq!(dcondition, vec![0.0, 0.0, 0.0]);
@@ -242,7 +242,7 @@ async fn test_backward_index_select() {
         let indices = RawTensor::from_slice(&device, [3], &[2u32, 0, 2]);
 
         let output = input.index_select(1, &indices);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum(1).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -250,7 +250,7 @@ async fn test_backward_index_select() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(
             output_values,
@@ -272,7 +272,7 @@ async fn test_backward_slice_assign() {
         let value: Tensor<2> = Tensor::new(&graph, &device, &[[10.0f32, 11.0], [12.0, 13.0]]);
 
         let output = input.slice_assign([0..2, 1..3], &value);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum(1).sum().backward().unwrap();
 
         let dinput = gradients
@@ -281,14 +281,14 @@ async fn test_backward_slice_assign() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
         let dvalue = gradients
             .get(&value)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(
             output_values,
@@ -317,7 +317,7 @@ async fn test_backward_expand() {
         let input: Tensor<2> = Tensor::new(&graph, &device, &[[2.0f32, 3.0, 4.0]]);
 
         let output = input.expand([2, 3]);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum(1).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -325,7 +325,7 @@ async fn test_backward_expand() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(
             output_values,
@@ -342,7 +342,7 @@ async fn test_backward_flatten_all() {
         let input: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 2.0], [3.0, 4.0]]);
 
         let output = input.flatten_all();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.flatten_all().sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -350,7 +350,7 @@ async fn test_backward_flatten_all() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(dinput, vec![vec![1.0, 1.0], vec![1.0, 1.0]]);
@@ -371,7 +371,7 @@ async fn test_backward_flatten_last_n() {
         );
 
         let output = input.flatten_last_n::<1, 2>();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum(1).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -380,7 +380,7 @@ async fn test_backward_flatten_last_n() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(
             output_values,
@@ -413,7 +413,7 @@ async fn test_backward_flatten_first_n() {
         );
 
         let output = input.flatten_first_n::<1, 2>();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum(1).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -422,7 +422,7 @@ async fn test_backward_flatten_first_n() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(
             output_values,
@@ -456,7 +456,7 @@ async fn test_backward_narrow() {
         );
 
         let output = input.narrow(1usize, 1, 2);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum(1).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -464,7 +464,7 @@ async fn test_backward_narrow() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(
             output_values,
@@ -488,7 +488,7 @@ async fn test_backward_repeat() {
         let input: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 2.0], [3.0, 4.0]]);
 
         let output = input.repeat([2, 3]);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum(1).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -496,7 +496,7 @@ async fn test_backward_repeat() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(
             output_values,
@@ -522,7 +522,7 @@ async fn test_backward_resize() {
         );
 
         let output = input.resize([2, 2]);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum(1).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -530,7 +530,7 @@ async fn test_backward_resize() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(output_values, vec![vec![1.0, 2.0], vec![4.0, 5.0]]);
         assert_eq!(
@@ -551,7 +551,7 @@ async fn test_backward_restride() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0, 4.0]);
 
         let output = input.restride([StrideSpec::dim(0, 2), StrideSpec::dim(0, 3)]);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum(1).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -559,7 +559,7 @@ async fn test_backward_restride() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(
             output_values,
@@ -580,7 +580,7 @@ async fn test_backward_restride_strided_overlap() {
         );
 
         let output = input.restride([StrideSpec::dim_with(0, 3, 2), StrideSpec::dim(0, 3)]);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum(1).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -588,7 +588,7 @@ async fn test_backward_restride_strided_overlap() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(
             output_values,
@@ -610,8 +610,8 @@ async fn test_backward_restride_layout() {
         let layout = Layout::contiguous(&[5])
             .restride(&[StrideSpec::dim(0, 2).with_offset(1), StrideSpec::dim(0, 2)]);
 
-        let output = input.restride_layout(layout);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output: Tensor<2> = input.restride_layout(layout);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum(1).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -619,7 +619,7 @@ async fn test_backward_restride_layout() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![vec![2.0, 3.0], vec![3.0, 4.0]]);
         assert_eq!(dinput, vec![0.0, 1.0, 2.0, 1.0, 0.0]);
@@ -637,7 +637,7 @@ async fn test_backward_squeeze_dims() {
         );
 
         let output = input.squeeze_dims::<2, 2>([1, 3]);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum(1).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -646,7 +646,7 @@ async fn test_backward_squeeze_dims() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(
             output_values,
@@ -670,7 +670,7 @@ async fn test_backward_unsqueeze_dims() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
         let gradients = output.sum(3).sum(2).sum(1).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -678,7 +678,7 @@ async fn test_backward_unsqueeze_dims() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(output.shape(), [1, 2, 1, 3]);
         assert_eq!(
@@ -696,7 +696,7 @@ async fn test_backward_max() {
         let input: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 5.0, 5.0], [4.0, 2.0, 0.0]]);
 
         let output = input.max::<1>(1);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -704,7 +704,7 @@ async fn test_backward_max() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(output_values, vec![5.0, 4.0]);
         assert_eq!(dinput, vec![vec![0.0, 0.5, 0.5], vec![1.0, 0.0, 0.0]]);
@@ -718,7 +718,7 @@ async fn test_backward_min() {
         let input: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 1.0, 5.0], [4.0, 2.0, 0.0]]);
 
         let output = input.min::<1>(1);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -726,7 +726,7 @@ async fn test_backward_min() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 0.0]);
         assert_eq!(dinput, vec![vec![0.5, 0.5, 0.0], vec![0.0, 0.0, 1.0]]);
@@ -740,7 +740,7 @@ async fn test_backward_mean() {
         let input: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
 
         let output = input.mean::<1>(1);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -748,7 +748,7 @@ async fn test_backward_mean() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(output_values, vec![2.0, 5.0]);
         assert_eq!(
@@ -772,7 +772,7 @@ async fn test_backward_product() {
         );
 
         let output = input.product::<1>(1);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -780,7 +780,7 @@ async fn test_backward_product() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(output_values, vec![24.0, 0.0, 0.0]);
         assert_eq!(
@@ -801,7 +801,7 @@ async fn test_backward_product_keepdim() {
         let input: Tensor<2> = Tensor::new(&graph, &device, &[[2.0f32, 3.0, 4.0], [5.0, 0.0, 7.0]]);
 
         let output = input.product_keepdim::<1>(1);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum(1).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -809,7 +809,7 @@ async fn test_backward_product_keepdim() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(output_values, vec![vec![24.0], vec![0.0]]);
         assert_eq!(dinput, vec![vec![12.0, 8.0, 6.0], vec![0.0, 35.0, 0.0]]);
@@ -823,7 +823,7 @@ async fn test_backward_var() {
         let input: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
 
         let output = input.var::<1>(1);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -831,7 +831,7 @@ async fn test_backward_var() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(output_values, vec![2.0 / 3.0, 2.0 / 3.0]);
         assert_eq!(
@@ -851,7 +851,7 @@ async fn test_backward_var_keepdim() {
         let input: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
 
         let output = input.var_keepdim::<1>(1);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum(1).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -859,7 +859,7 @@ async fn test_backward_var_keepdim() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_eq!(output_values, vec![vec![2.0 / 3.0], vec![2.0 / 3.0]]);
         assert_eq!(
@@ -879,7 +879,7 @@ async fn test_backward_clamp() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[-1.0f32, 0.0, 2.0, 5.0]);
 
         let output = input.clamp(0.0, 3.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -887,7 +887,7 @@ async fn test_backward_clamp() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![0.0, 0.0, 2.0, 3.0]);
         assert_eq!(dinput, vec![0.0, 0.0, 1.0, 0.0]);
@@ -901,7 +901,7 @@ async fn test_backward_eq() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 1.0]);
 
         let output = input.eq(1.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -909,7 +909,7 @@ async fn test_backward_eq() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 0.0, 1.0]);
         assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
@@ -923,7 +923,7 @@ async fn test_backward_eq_scalar() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[3.0f32, 2.0, 3.0]);
 
         let output = input.eq_scalar(3.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -931,7 +931,7 @@ async fn test_backward_eq_scalar() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 0.0, 1.0]);
         assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
@@ -946,7 +946,7 @@ async fn test_backward_eq_tensor() {
         let rhs: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 0.0, 3.0]);
 
         let output = lhs.eq_tensor(&rhs);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dlhs = gradients
             .get(&lhs)
@@ -954,14 +954,14 @@ async fn test_backward_eq_tensor() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let drhs = gradients
             .get(&rhs)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 0.0, 1.0]);
         assert_eq!(dlhs, vec![0.0, 0.0, 0.0]);
@@ -976,7 +976,7 @@ async fn test_backward_gt_scalar() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
 
         let output = input.gt_scalar(2.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -984,7 +984,7 @@ async fn test_backward_gt_scalar() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![0.0, 0.0, 1.0]);
         assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
@@ -999,7 +999,7 @@ async fn test_backward_gt_tensor() {
         let rhs: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32, 1.0, 3.0]);
 
         let output = lhs.gt_tensor(&rhs);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dlhs = gradients
             .get(&lhs)
@@ -1007,14 +1007,14 @@ async fn test_backward_gt_tensor() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let drhs = gradients
             .get(&rhs)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![0.0, 1.0, 0.0]);
         assert_eq!(dlhs, vec![0.0, 0.0, 0.0]);
@@ -1029,7 +1029,7 @@ async fn test_backward_gte_scalar() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
 
         let output = input.gte_scalar(2.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1037,7 +1037,7 @@ async fn test_backward_gte_scalar() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![0.0, 1.0, 1.0]);
         assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
@@ -1052,7 +1052,7 @@ async fn test_backward_gte_tensor() {
         let rhs: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32, 4.0, 2.0]);
 
         let output = lhs.gte_tensor(&rhs);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dlhs = gradients
             .get(&lhs)
@@ -1060,14 +1060,14 @@ async fn test_backward_gte_tensor() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let drhs = gradients
             .get(&rhs)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![0.0, 1.0, 1.0]);
         assert_eq!(dlhs, vec![0.0, 0.0, 0.0]);
@@ -1082,7 +1082,7 @@ async fn test_backward_lt() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
 
         let output = input.lt(2.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1090,7 +1090,7 @@ async fn test_backward_lt() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 0.0, 0.0]);
         assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
@@ -1104,7 +1104,7 @@ async fn test_backward_lt_scalar() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
 
         let output = input.lt_scalar(3.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1112,7 +1112,7 @@ async fn test_backward_lt_scalar() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 1.0, 0.0]);
         assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
@@ -1127,7 +1127,7 @@ async fn test_backward_lt_tensor() {
         let rhs: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32, 1.0, 3.0]);
 
         let output = lhs.lt_tensor(&rhs);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dlhs = gradients
             .get(&lhs)
@@ -1135,14 +1135,14 @@ async fn test_backward_lt_tensor() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let drhs = gradients
             .get(&rhs)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 0.0, 0.0]);
         assert_eq!(dlhs, vec![0.0, 0.0, 0.0]);
@@ -1157,7 +1157,7 @@ async fn test_backward_lte() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
 
         let output = input.lte(2.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1165,7 +1165,7 @@ async fn test_backward_lte() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 1.0, 0.0]);
         assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
@@ -1179,7 +1179,7 @@ async fn test_backward_lte_scalar() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
 
         let output = input.lte_scalar(1.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1187,7 +1187,7 @@ async fn test_backward_lte_scalar() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 0.0, 0.0]);
         assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
@@ -1202,7 +1202,7 @@ async fn test_backward_lte_tensor() {
         let rhs: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32, 2.0, 1.0]);
 
         let output = lhs.lte_tensor(&rhs);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dlhs = gradients
             .get(&lhs)
@@ -1210,14 +1210,14 @@ async fn test_backward_lte_tensor() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let drhs = gradients
             .get(&rhs)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 1.0, 0.0]);
         assert_eq!(dlhs, vec![0.0, 0.0, 0.0]);
@@ -1232,7 +1232,7 @@ async fn test_backward_max_elementwise() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[-1.0f32, 0.0, 2.0]);
 
         let output = input.max_elementwise(0.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1240,7 +1240,7 @@ async fn test_backward_max_elementwise() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![0.0, 0.0, 2.0]);
         assert_eq!(dinput, vec![0.0, 0.0, 1.0]);
@@ -1254,7 +1254,7 @@ async fn test_backward_max_scalar() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
 
         let output = input.max_scalar(3.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1262,7 +1262,7 @@ async fn test_backward_max_scalar() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![3.0, 4.0, 3.0]);
         assert_eq!(dinput, vec![0.0, 1.0, 0.0]);
@@ -1276,7 +1276,7 @@ async fn test_backward_min_elementwise() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
 
         let output = input.min_elementwise(3.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1284,7 +1284,7 @@ async fn test_backward_min_elementwise() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 3.0, 2.0]);
         assert_eq!(dinput, vec![1.0, 0.0, 1.0]);
@@ -1298,7 +1298,7 @@ async fn test_backward_min_scalar() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
 
         let output = input.min_scalar(2.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1306,7 +1306,7 @@ async fn test_backward_min_scalar() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 2.0, 2.0]);
         assert_eq!(dinput, vec![1.0, 0.0, 0.0]);
@@ -1320,7 +1320,7 @@ async fn test_backward_mt() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
 
         let output = input.mt(2.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1328,7 +1328,7 @@ async fn test_backward_mt() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![0.0, 1.0, 0.0]);
         assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
@@ -1342,7 +1342,7 @@ async fn test_backward_mte() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
 
         let output = input.mte(2.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1350,7 +1350,7 @@ async fn test_backward_mte() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![0.0, 1.0, 1.0]);
         assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
@@ -1364,7 +1364,7 @@ async fn test_backward_ne() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
 
         let output = input.ne(2.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1372,7 +1372,7 @@ async fn test_backward_ne() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 1.0, 0.0]);
         assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
@@ -1386,7 +1386,7 @@ async fn test_backward_ne_scalar() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
 
         let output = input.ne_scalar(4.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1394,7 +1394,7 @@ async fn test_backward_ne_scalar() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![1.0, 0.0, 1.0]);
         assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
@@ -1409,7 +1409,7 @@ async fn test_backward_ne_tensor() {
         let rhs: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 0.0, 3.0]);
 
         let output = lhs.ne_tensor(&rhs);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dlhs = gradients
             .get(&lhs)
@@ -1417,14 +1417,14 @@ async fn test_backward_ne_tensor() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let drhs = gradients
             .get(&rhs)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![0.0, 1.0, 1.0]);
         assert_eq!(dlhs, vec![0.0, 0.0, 0.0]);
@@ -1439,7 +1439,7 @@ async fn test_backward_abs() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[-2.0f32, 0.0, 3.0]);
 
         let output = input.abs();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1447,7 +1447,7 @@ async fn test_backward_abs() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![2.0, 0.0, 3.0]);
         assert_eq!(dinput, vec![-1.0, 0.0, 1.0]);
@@ -1461,7 +1461,7 @@ async fn test_backward_acos() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
 
         let output = input.acos();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1469,7 +1469,7 @@ async fn test_backward_acos() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 0.5f32.acos());
         assert_close(dinput[0], -1.0f32 / (1.0f32 - 0.25f32).sqrt());
@@ -1483,7 +1483,7 @@ async fn test_backward_acosh() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32]);
 
         let output = input.acosh();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1491,7 +1491,7 @@ async fn test_backward_acosh() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 2.0f32.acosh());
         assert_close(
@@ -1508,7 +1508,7 @@ async fn test_backward_approximate_exp() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32]);
 
         let output = input.approximate_exp();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1516,7 +1516,7 @@ async fn test_backward_approximate_exp() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 1.0f32.exp());
         assert_close(dinput[0], 1.0f32.exp());
@@ -1530,7 +1530,7 @@ async fn test_backward_asin() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
 
         let output = input.asin();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1538,7 +1538,7 @@ async fn test_backward_asin() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 0.5f32.asin());
         assert_close(dinput[0], 1.0f32 / (1.0f32 - 0.25f32).sqrt());
@@ -1552,7 +1552,7 @@ async fn test_backward_asinh() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.5f32]);
 
         let output = input.asinh();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1560,7 +1560,7 @@ async fn test_backward_asinh() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 1.5f32.asinh());
         assert_close(dinput[0], 1.0f32 / (1.5f32 * 1.5f32 + 1.0f32).sqrt());
@@ -1574,7 +1574,7 @@ async fn test_backward_atan() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
 
         let output = input.atan();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1582,7 +1582,7 @@ async fn test_backward_atan() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 0.5f32.atan());
         assert_close(dinput[0], 1.0f32 / (1.0f32 + 0.25f32));
@@ -1596,7 +1596,7 @@ async fn test_backward_atanh() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
 
         let output = input.atanh();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1604,7 +1604,7 @@ async fn test_backward_atanh() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 0.5f32.atanh());
         assert_close(dinput[0], 1.0f32 / (1.0f32 - 0.25f32));
@@ -1618,7 +1618,7 @@ async fn test_backward_cos() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
 
         let output = input.cos();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1626,7 +1626,7 @@ async fn test_backward_cos() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 0.5f32.cos());
         assert_close(dinput[0], -0.5f32.sin());
@@ -1640,7 +1640,7 @@ async fn test_backward_cosh() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
 
         let output = input.cosh();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1648,7 +1648,7 @@ async fn test_backward_cosh() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 0.5f32.cosh());
         assert_close(dinput[0], 0.5f32.sinh());
@@ -1662,7 +1662,7 @@ async fn test_backward_exp2() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32]);
 
         let output = input.exp2();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1670,7 +1670,7 @@ async fn test_backward_exp2() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 2.0f32.exp2());
         assert_close(dinput[0], std::f32::consts::LN_2 * 2.0f32.exp2());
@@ -1684,7 +1684,7 @@ async fn test_backward_less_approximate_exp() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32]);
 
         let output = input.less_approximate_exp();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1692,7 +1692,7 @@ async fn test_backward_less_approximate_exp() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 1.0f32.exp());
         assert_close(dinput[0], 1.0f32.exp());
@@ -1706,7 +1706,7 @@ async fn test_backward_log2() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[4.0f32]);
 
         let output = input.log2();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1714,7 +1714,7 @@ async fn test_backward_log2() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 4.0f32.log2());
         assert_close(dinput[0], 1.0f32 / (4.0f32 * std::f32::consts::LN_2));
@@ -1728,7 +1728,7 @@ async fn test_backward_sin() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
 
         let output = input.sin();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1736,7 +1736,7 @@ async fn test_backward_sin() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 0.5f32.sin());
         assert_close(dinput[0], 0.5f32.cos());
@@ -1750,7 +1750,7 @@ async fn test_backward_sinh() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
 
         let output = input.sinh();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1758,7 +1758,7 @@ async fn test_backward_sinh() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 0.5f32.sinh());
         assert_close(dinput[0], 0.5f32.cosh());
@@ -1772,7 +1772,7 @@ async fn test_backward_tan() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
 
         let output = input.tan();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1780,7 +1780,7 @@ async fn test_backward_tan() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 0.5f32.tan());
         assert_close(dinput[0], 1.0f32 / (0.5f32.cos() * 0.5f32.cos()));
@@ -1794,7 +1794,7 @@ async fn test_backward_tanh_exact() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
 
         let output = input.tanh_exact();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -1802,7 +1802,7 @@ async fn test_backward_tanh_exact() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 0.5f32.tanh());
         assert_close(dinput[0], 1.0f32 - 0.5f32.tanh().powi(2));
@@ -1816,7 +1816,7 @@ async fn test_cast() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
 
         let output = input.cast::<half::f16>();
-        let output_values = output.as_slice().await.unwrap().to_vec1();
+        let output_values = output.as_slice().await.unwrap().to_vec();
 
         assert_close(f32::from(output_values[0]), 1.0);
         assert_close(f32::from(output_values[1]), 2.0);
@@ -1830,7 +1830,7 @@ async fn test_arange() {
         let graph = Graph::new();
 
         let output = Tensor::<1>::arange(&graph, &device, 1.0, 5.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
 
         assert_eq!(output_values, vec![1.0, 2.0, 3.0, 4.0]);
     }
@@ -1842,7 +1842,7 @@ async fn test_arange_step() {
         let graph = Graph::new();
 
         let output = Tensor::<1>::arange_step(&graph, &device, 1.0, 6.0, 2.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
 
         assert_eq!(output_values, vec![1.0, 3.0, 5.0]);
     }
@@ -1906,7 +1906,7 @@ async fn test_backward_add_broadcast_api() {
         let rhs: Tensor<2> = Tensor::new(&graph, &device, &[[10.0f32], [20.0]]);
 
         let output: Tensor<2> = lhs.add_::<2, 2>(&rhs);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.flatten_all().sum().backward().unwrap();
         let dlhs = gradients
             .get(&lhs)
@@ -1914,14 +1914,14 @@ async fn test_backward_add_broadcast_api() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let drhs = gradients
             .get(&rhs)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_close(output_values[0][0], 11.0);
         assert_close(output_values[0][1], 12.0);
@@ -1942,7 +1942,7 @@ async fn test_backward_sub_broadcast_api() {
         let rhs: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0]);
 
         let output: Tensor<2> = lhs.sub_::<1, 2>(&rhs);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.flatten_all().sum().backward().unwrap();
         let dlhs = gradients
             .get(&lhs)
@@ -1950,14 +1950,14 @@ async fn test_backward_sub_broadcast_api() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
         let drhs = gradients
             .get(&rhs)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0][0], 2.0);
         assert_close(output_values[0][1], 1.0);
@@ -1978,7 +1978,7 @@ async fn test_backward_mul_broadcast_api() {
         let rhs: Tensor<2> = Tensor::new(&graph, &device, &[[10.0f32], [20.0]]);
 
         let output: Tensor<2> = lhs.mul_::<2, 2>(&rhs);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.flatten_all().sum().backward().unwrap();
         let dlhs = gradients
             .get(&lhs)
@@ -1986,14 +1986,14 @@ async fn test_backward_mul_broadcast_api() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let drhs = gradients
             .get(&rhs)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_close(output_values[0][0], 20.0);
         assert_close(output_values[0][1], 30.0);
@@ -2014,7 +2014,7 @@ async fn test_backward_div_broadcast_api() {
         let rhs: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32, 4.0]);
 
         let output: Tensor<2> = lhs.div_::<1, 2>(&rhs);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.flatten_all().sum().backward().unwrap();
         let dlhs = gradients
             .get(&lhs)
@@ -2022,14 +2022,14 @@ async fn test_backward_div_broadcast_api() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
         let drhs = gradients
             .get(&rhs)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0][0], 5.0);
         assert_close(output_values[0][1], 2.5);
@@ -2050,7 +2050,7 @@ async fn test_backward_pow_broadcast_api() {
         let rhs: Tensor<2> = Tensor::new(&graph, &device, &[[2.0f32], [1.0]]);
 
         let output: Tensor<2> = lhs.pow_::<2, 2>(&rhs);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.flatten_all().sum().backward().unwrap();
         let dlhs = gradients
             .get(&lhs)
@@ -2058,14 +2058,14 @@ async fn test_backward_pow_broadcast_api() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let drhs = gradients
             .get(&rhs)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_close(output_values[0][0], 4.0);
         assert_close(output_values[0][1], 9.0);
@@ -2090,8 +2090,8 @@ async fn test_backward_chunk() {
 
         let chunks = input.chunk(2, 1);
         assert_eq!(chunks.len(), 2);
-        let first = chunks[0].raw().clone().as_slice().await.unwrap().to_vec2();
-        let second = chunks[1].raw().clone().as_slice().await.unwrap().to_vec2();
+        let first = chunks[0].raw().clone().as_slice().await.unwrap().to_vec();
+        let second = chunks[1].raw().clone().as_slice().await.unwrap().to_vec();
         let loss = chunks[0]
             .flatten_all()
             .sum()
@@ -2103,7 +2103,7 @@ async fn test_backward_chunk() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_close(first[0][0], 1.0);
         assert_close(first[0][1], 2.0);
@@ -2297,14 +2297,14 @@ async fn test_backward_stack() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let dsecond = gradients
             .get(&second)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values.shape(), &[2, 2]);
         assert_close(output_values[[0, 0]], 1.0);
@@ -2543,7 +2543,7 @@ async fn test_backward_pow() {
         let rhs: Tensor<1> = Tensor::new(&graph, &device, &[3.0f32]);
 
         let output = lhs.pow(&rhs);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dlhs = gradients
             .get(&lhs)
@@ -2551,14 +2551,14 @@ async fn test_backward_pow() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let drhs = gradients
             .get(&rhs)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 8.0);
         assert_close(dlhs[0], 12.0);
@@ -2573,7 +2573,7 @@ async fn test_backward_pow_elementwise() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[3.0f32]);
 
         let output = input.pow_elementwise(2.0);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -2581,7 +2581,7 @@ async fn test_backward_pow_elementwise() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 9.0);
         assert_close(dinput[0], 6.0);
@@ -2595,7 +2595,7 @@ async fn test_backward_pow_scalar() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[4.0f32]);
 
         let output = input.pow_scalar(0.5);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -2603,7 +2603,7 @@ async fn test_backward_pow_scalar() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(output_values[0], 2.0);
         assert_close(dinput[0], 0.25);
@@ -2621,7 +2621,7 @@ async fn test_autograd_rms_norm() {
         );
 
         let output = input.rms_norm(&weight, 1e-5);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
 
         let expected = [[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]].map(|row| {
             let mean_sq = row.iter().map(|value| value * value).sum::<f32>() / row.len() as f32;
@@ -2642,7 +2642,7 @@ async fn test_autograd_rms_norm() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         // d/dx_j sum_k x_k * (mean(x^2) + eps)^-1/2
         //     = 1/rms - x_j * sum(x) / (n * rms^3)
@@ -2695,14 +2695,14 @@ async fn test_backward_matmul_with_broadcast_bias() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
         let db = gradients
             .get(&b)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_close(dw[0][0], 5.0);
         assert_close(dw[1][0], 7.0);
@@ -2729,7 +2729,7 @@ async fn test_backward_embedding() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_close(dtable[0][0], 1.0);
         assert_close(dtable[0][1], 1.0);
@@ -2758,7 +2758,7 @@ async fn test_backward_gather_last() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         assert_close(dvalues[0][0], 0.0);
         assert_close(dvalues[0][1], 0.0);
@@ -3227,7 +3227,7 @@ async fn test_backward_log() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32, 1.5, 2.5]);
 
         let output = input.log();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -3235,7 +3235,7 @@ async fn test_backward_log() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         for (value, input) in output_values.iter().zip([0.5f32, 1.5, 2.5]) {
             assert_close(*value, input.ln());
@@ -3258,7 +3258,7 @@ async fn test_backward_neg() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.5f32, -2.0, 0.5]);
 
         let output = input.neg();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -3266,7 +3266,7 @@ async fn test_backward_neg() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![-1.5, 2.0, -0.5]);
         assert_eq!(dinput, vec![-1.0, -1.0, -1.0]);
@@ -3285,7 +3285,7 @@ async fn test_backward_exp() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[0.0f32, 0.5, -1.0]);
 
         let output = input.exp();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -3293,7 +3293,7 @@ async fn test_backward_exp() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         for (value, input) in output_values.iter().zip([0.0f32, 0.5, -1.0]) {
             assert_close(*value, input.exp());
@@ -3317,7 +3317,7 @@ async fn test_backward_log_sum_exp() {
             Tensor::new(&graph, &device, &[[0.0f32, 0.5, 1.0], [1.0, -1.0, 0.0]]);
 
         let output = input.exp().sum_keepdim(1).log();
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.reshape([2]).sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -3325,7 +3325,7 @@ async fn test_backward_log_sum_exp() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
 
         // d/dx_j log(sum_k exp(x_k)) = softmax(x)_j
         let rows = [[0.0f32, 0.5, 1.0], [1.0, -1.0, 0.0]];
@@ -3364,7 +3364,7 @@ async fn test_backward_with_backwards() {
                     BackwardTarget::wrt(&y_target, grad.mul_scalar(-3.0).to_concrete()),
                 ])
             });
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dx = gradients
             .get(&x)
@@ -3372,14 +3372,14 @@ async fn test_backward_with_backwards() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let dy = gradients
             .get(&y)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_eq!(output_values, vec![5.0, 7.0, 9.0]);
         // the custom rule replaces add's backward, so the gradients are the
@@ -3571,7 +3571,7 @@ async fn test_train_xor_classifier() {
         let b2_t = Tensor::constant_from_raw(&graph, b2.clone());
         let hidden = b1_t.add_::<2, 2>(&x.mat_mul(&w1_t)).relu();
         let logits = b2_t.add_::<2, 2>(&hidden.mat_mul(&w2_t));
-        let logits = logits.raw().clone().as_slice().await.unwrap().to_vec2();
+        let logits = logits.raw().clone().as_slice().await.unwrap().to_vec();
         let correct = logits
             .iter()
             .zip(&labels)
@@ -3595,7 +3595,7 @@ async fn test_autograd_sigmoid() {
         let x: Tensor<1> = Tensor::new(&graph, &device, &inputs);
 
         let output = x.sigmoid();
-        let values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let values = output.raw().clone().as_slice().await.unwrap().to_vec();
 
         let expected = inputs.map(|v| 1.0 / (1.0 + (-v).exp()));
         for (value, expected) in values.iter().zip(expected) {
@@ -3609,7 +3609,7 @@ async fn test_autograd_sigmoid() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         let expected_grads = inputs.map(|v| {
             let sigmoid = 1.0 / (1.0 + (-v).exp());
@@ -3631,7 +3631,7 @@ async fn test_autograd_to_concrete() {
         let x: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, -2.0, 3.0]);
 
         let output = x.mul_scalar(2.0).to_concrete();
-        let values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let values = output.raw().clone().as_slice().await.unwrap().to_vec();
         assert_eq!(values, vec![2.0, -4.0, 6.0]);
 
         let gradients = output.sqr().sum().backward().unwrap();
@@ -3641,7 +3641,7 @@ async fn test_autograd_to_concrete() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         assert_slice_close(&dx, &[8.0, -16.0, 24.0]);
 
         let graph = Graph::new();
@@ -3653,7 +3653,7 @@ async fn test_autograd_to_concrete() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         assert_slice_close(&dx, &[2.0, -4.0, 6.0]);
 
         assert_gradient_matches_finite_difference(&device, [3], &[1.0f32, -2.0, 3.0], |_, x| {
@@ -3671,7 +3671,7 @@ async fn test_autograd_index_select_rank_generic() {
         let indices = RawTensor::from_slice(&device, [3], &[2u32, 0, 2]);
         let selected = x.index_select(0, &indices);
         assert_eq!(
-            selected.raw().clone().as_slice().await.unwrap().to_vec1(),
+            selected.raw().clone().as_slice().await.unwrap().to_vec(),
             vec![3.0, 1.0, 3.0]
         );
         let gradients = selected.sum().backward().unwrap();
@@ -3745,7 +3745,7 @@ async fn test_autograd_i_indexing() {
             Tensor::from_slice(&graph, &device, [2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let row = x.i((1, ..));
         assert_eq!(
-            row.raw().clone().as_slice().await.unwrap().to_vec1(),
+            row.raw().clone().as_slice().await.unwrap().to_vec(),
             vec![4.0, 5.0, 6.0]
         );
         let gradients = row.sum().backward().unwrap();
@@ -3757,7 +3757,7 @@ async fn test_autograd_i_indexing() {
             Tensor::from_slice(&graph, &device, [2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let column = x.i((0..2, 1));
         assert_eq!(
-            column.raw().clone().as_slice().await.unwrap().to_vec1(),
+            column.raw().clone().as_slice().await.unwrap().to_vec(),
             vec![2.0, 5.0]
         );
         let gradients = column.sum().backward().unwrap();
@@ -3818,7 +3818,7 @@ async fn test_backward_squeeze() {
             Tensor::from_slice(&graph, &device, [2, 1, 2], &[1.0, 2.0, 3.0, 4.0]);
         let output: Tensor<2> = input.squeeze::<2>(1);
         assert_eq!(output.shape(), [2, 2]);
-        let values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let values = output.raw().clone().as_slice().await.unwrap().to_vec();
         assert_eq!(values, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
 
         let gradients = output.sqr().flatten_all().sum().backward().unwrap();
@@ -3864,7 +3864,7 @@ async fn test_backward_cat_rank1() {
         let second: Tensor<1> = Tensor::new(&graph, &device, &[3.0f32, 4.0, 5.0]);
         let output = Tensor::cat(vec![first.clone(), second.clone()], 0);
         assert_eq!(output.shape(), [5]);
-        let values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let values = output.raw().clone().as_slice().await.unwrap().to_vec();
         assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
 
         let gradients = output.sqr().sum().backward().unwrap();
@@ -3894,7 +3894,7 @@ async fn test_backward_cat_rank2() {
         let second: Tensor<2> = Tensor::from_slice(&graph, &device, [2, 1], &[5.0, 6.0]);
         let output = Tensor::cat(vec![first.clone(), second.clone()], 1);
         assert_eq!(output.shape(), [2, 3]);
-        let values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let values = output.raw().clone().as_slice().await.unwrap().to_vec();
         assert_eq!(values, vec![vec![1.0, 2.0, 5.0], vec![3.0, 4.0, 6.0]]);
 
         let gradients = output.sqr().flatten_all().sum().backward().unwrap();
@@ -3922,7 +3922,7 @@ async fn test_backward_pad_with_zeros() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
         let output = input.pad_with_zeros(0, 1, 2);
         assert_eq!(output.shape(), [6]);
-        let values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let values = output.raw().clone().as_slice().await.unwrap().to_vec();
         assert_eq!(values, vec![0.0, 1.0, 2.0, 3.0, 0.0, 0.0]);
 
         let gradients = output.sqr().sum().backward().unwrap();
@@ -3953,7 +3953,7 @@ async fn test_backward_pad_axis() {
             Tensor::from_slice(&graph, &device, [2, 2], &[1.0, 2.0, 3.0, 4.0]);
         let output = input.pad_axis(1, 1);
         assert_eq!(output.shape(), [2, 4]);
-        let values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let values = output.raw().clone().as_slice().await.unwrap().to_vec();
         assert_eq!(
             values,
             vec![vec![0.0, 1.0, 2.0, 0.0], vec![0.0, 3.0, 4.0, 0.0]]
@@ -3983,7 +3983,7 @@ async fn test_backward_sliding_window_view() {
         let output: Tensor<2> =
             input.sliding_window_view::<1, 2>([fusor_types::SlidingWindow::new(0, 3, 1)]);
         assert_eq!(output.shape(), [3, 3]);
-        let values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let values = output.raw().clone().as_slice().await.unwrap().to_vec();
         assert_eq!(
             values,
             vec![
@@ -4052,7 +4052,7 @@ async fn test_backward_sum_axis() {
         let x: Tensor<2> =
             Tensor::from_slice(&graph, &device, [2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let summed = x.sum(1);
-        let forward = summed.raw().clone().as_slice().await.unwrap().to_vec1();
+        let forward = summed.raw().clone().as_slice().await.unwrap().to_vec();
         assert_slice_close(&forward, &[6.0, 15.0]);
 
         let weight =
@@ -4066,7 +4066,7 @@ async fn test_backward_sum_axis() {
         let x: Tensor<2> =
             Tensor::from_slice(&graph, &device, [2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let summed = x.sum(0);
-        let forward = summed.raw().clone().as_slice().await.unwrap().to_vec1();
+        let forward = summed.raw().clone().as_slice().await.unwrap().to_vec();
         assert_slice_close(&forward, &[5.0, 7.0, 9.0]);
 
         let weight = Tensor::constant_from_raw(
@@ -4139,7 +4139,7 @@ async fn test_backward_sum_keepdim() {
         let x: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
         let summed = x.sum_keepdim(0);
         assert_eq!(summed.shape(), [1]);
-        let forward = summed.raw().clone().as_slice().await.unwrap().to_vec1();
+        let forward = summed.raw().clone().as_slice().await.unwrap().to_vec();
         assert_slice_close(&forward, &[6.0]);
         let gradients = summed.sqr().sum().backward().unwrap();
         let dx = gradients
@@ -4148,7 +4148,7 @@ async fn test_backward_sum_keepdim() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         assert_slice_close(&dx, &[12.0, 12.0, 12.0]);
 
         let graph = Graph::new();
@@ -4192,7 +4192,7 @@ async fn test_backward_q_mat_mul_rank1() {
         .unwrap();
 
         let output = input.q_mat_mul(&weights);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         let gradients = output.sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
@@ -4200,7 +4200,7 @@ async fn test_backward_q_mat_mul_rank1() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
 
         assert_slice_close(&output_values, &[30.0, 70.0]);
         assert_slice_close(&dinput, &[6.0, 8.0, 10.0, 12.0]);
@@ -4889,7 +4889,7 @@ async fn test_autograd_ones() {
         let graph = Graph::new();
 
         let ones: Tensor<1> = Tensor::ones(&graph, &device, [3]);
-        let forward = ones.raw().clone().as_slice().await.unwrap().to_vec1();
+        let forward = ones.raw().clone().as_slice().await.unwrap().to_vec();
         assert_eq!(forward, vec![1.0, 1.0, 1.0]);
 
         let x: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32, -3.0, 4.0]);
@@ -4902,7 +4902,7 @@ async fn test_autograd_ones() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         assert_slice_close(&dx, &[1.0, 1.0, 1.0]);
         let dones = gradients
             .get(&ones)
@@ -4910,7 +4910,7 @@ async fn test_autograd_ones() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         assert_slice_close(&dones, &[2.0, -3.0, 4.0]);
     }
 }
@@ -5029,7 +5029,7 @@ async fn test_autograd_std_ops_add_sub() {
             &x + y.clone(),
             x.clone() + &y,
         ] {
-            let values = add.raw().clone().as_slice().await.unwrap().to_vec1();
+            let values = add.raw().clone().as_slice().await.unwrap().to_vec();
             assert_slice_close(&values, &[5.0, -3.0, 11.0]);
         }
         for sub in [
@@ -5038,7 +5038,7 @@ async fn test_autograd_std_ops_add_sub() {
             &x - y.clone(),
             x.clone() - &y,
         ] {
-            let values = sub.raw().clone().as_slice().await.unwrap().to_vec1();
+            let values = sub.raw().clone().as_slice().await.unwrap().to_vec();
             assert_slice_close(&values, &[-3.0, 7.0, -5.0]);
         }
 
@@ -5050,14 +5050,14 @@ async fn test_autograd_std_ops_add_sub() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let dy = gradients
             .get(&y)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         assert_slice_close(&dx, &[2.0, 4.0, 6.0]);
         assert_slice_close(&dy, &[-8.0, 10.0, -16.0]);
 
@@ -5093,7 +5093,7 @@ async fn test_autograd_std_ops_mul_div() {
             &x * y.clone(),
             x.clone() * &y,
         ] {
-            let values = mul.raw().clone().as_slice().await.unwrap().to_vec1();
+            let values = mul.raw().clone().as_slice().await.unwrap().to_vec();
             assert_slice_close(&values, &[4.0, -10.0, 24.0]);
         }
         for div in [
@@ -5102,7 +5102,7 @@ async fn test_autograd_std_ops_mul_div() {
             &x / y.clone(),
             x.clone() / &y,
         ] {
-            let values = div.raw().clone().as_slice().await.unwrap().to_vec1();
+            let values = div.raw().clone().as_slice().await.unwrap().to_vec();
             assert_slice_close(&values, &[0.25, -0.4, 0.375]);
         }
 
@@ -5114,14 +5114,14 @@ async fn test_autograd_std_ops_mul_div() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         let dy = gradients
             .get(&y)
             .unwrap()
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         assert_slice_close(&dx, &[4.25, -5.2, 8.125]);
         assert_slice_close(&dy, &[0.9375, 1.92, 2.953125]);
 
@@ -5151,7 +5151,7 @@ async fn test_autograd_std_ops_neg() {
         let x: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, -2.0, 3.0]);
 
         for neg in [-&x, -x.clone()] {
-            let values = neg.raw().clone().as_slice().await.unwrap().to_vec1();
+            let values = neg.raw().clone().as_slice().await.unwrap().to_vec();
             assert_slice_close(&values, &[-1.0, 2.0, -3.0]);
         }
 
@@ -5163,7 +5163,7 @@ async fn test_autograd_std_ops_neg() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         assert_slice_close(&dx, &[-2.0, 4.0, -6.0]);
 
         assert_gradient_matches_finite_difference(&device, [3], &[1.0, -2.0, 3.0], |_, x| {
@@ -5180,19 +5180,19 @@ async fn test_autograd_std_ops_scalar() {
         let x: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
 
         for mul in [&x * 2.5, x.clone() * 2.5] {
-            let values = mul.raw().clone().as_slice().await.unwrap().to_vec1();
+            let values = mul.raw().clone().as_slice().await.unwrap().to_vec();
             assert_slice_close(&values, &[2.5, 5.0, 7.5]);
         }
         for add in [&x + 1.5, x.clone() + 1.5] {
-            let values = add.raw().clone().as_slice().await.unwrap().to_vec1();
+            let values = add.raw().clone().as_slice().await.unwrap().to_vec();
             assert_slice_close(&values, &[2.5, 3.5, 4.5]);
         }
         for sub in [&x - 0.5, x.clone() - 0.5] {
-            let values = sub.raw().clone().as_slice().await.unwrap().to_vec1();
+            let values = sub.raw().clone().as_slice().await.unwrap().to_vec();
             assert_slice_close(&values, &[0.5, 1.5, 2.5]);
         }
         for div in [&x / 2.0, x.clone() / 2.0] {
-            let values = div.raw().clone().as_slice().await.unwrap().to_vec1();
+            let values = div.raw().clone().as_slice().await.unwrap().to_vec();
             assert_slice_close(&values, &[0.5, 1.0, 1.5]);
         }
 
@@ -5204,7 +5204,7 @@ async fn test_autograd_std_ops_scalar() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec1();
+            .to_vec();
         assert_slice_close(&dx, &[3.0, 3.0, 3.0]);
 
         assert_gradient_matches_finite_difference(&device, [3], &[1.0, 2.0, 3.0], |_, x| {
@@ -5234,7 +5234,7 @@ async fn test_autograd_layer_norm_rank_generic() {
             let b: Tensor<2> = Tensor::from_slice(&graph, &device, [1, 3], &b_data);
 
             let output = x.layer_norm(&w, Some(&b), eps, remove_mean);
-            let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+            let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
             for (row_index, row) in x_rows.iter().enumerate() {
                 let mean = if remove_mean {
                     row.iter().sum::<f32>() / 3.0
@@ -5327,7 +5327,7 @@ async fn test_autograd_rms_norm_rank_generic_weight() {
         let w: Tensor<2> = Tensor::from_slice(&graph, &device, [1, 3], &w_data);
 
         let output = x.rms_norm(&w, eps);
-        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
         for (row_index, row) in x_rows.iter().enumerate() {
             let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / 3.0;
             let rms = (mean_sq + eps).sqrt();
@@ -5346,7 +5346,7 @@ async fn test_autograd_rms_norm_rank_generic_weight() {
             .as_slice()
             .await
             .unwrap()
-            .to_vec2();
+            .to_vec();
         for column in 0..3 {
             let mut expected = 0.0f32;
             for row in x_rows.iter() {
@@ -5393,9 +5393,9 @@ async fn test_autograd_rms_norm_fused_weight_rank() {
         let w2: Tensor<2> = Tensor::from_slice(&graph, &device, [1, 3], &w_data);
 
         let biased = x.rms_norm_fused::<1, 1>(&w1, Some(&b1), eps);
-        let biased_values = biased.raw().clone().as_slice().await.unwrap().to_vec2();
+        let biased_values = biased.raw().clone().as_slice().await.unwrap().to_vec();
         let no_bias = x.rms_norm_fused_no_bias::<2, 1>(&w2, eps);
-        let no_bias_values = no_bias.raw().clone().as_slice().await.unwrap().to_vec2();
+        let no_bias_values = no_bias.raw().clone().as_slice().await.unwrap().to_vec();
         for (row_index, row) in x_rows.iter().enumerate() {
             let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / 3.0;
             let rms = (mean_sq + eps).sqrt();
@@ -5465,9 +5465,9 @@ async fn test_autograd_rms_norm_residual_fused_weight_rank() {
         let b: Tensor<2> = Tensor::from_slice(&graph, &device, [1, 3], &b_data);
 
         let biased = x.rms_norm_residual_fused::<2, 1>(&r, &w, Some(&b), eps);
-        let biased_values = biased.raw().clone().as_slice().await.unwrap().to_vec2();
+        let biased_values = biased.raw().clone().as_slice().await.unwrap().to_vec();
         let no_bias = x.rms_norm_residual_fused::<2, 1>(&r, &w, None, eps);
-        let no_bias_values = no_bias.raw().clone().as_slice().await.unwrap().to_vec2();
+        let no_bias_values = no_bias.raw().clone().as_slice().await.unwrap().to_vec();
         for row_index in 0..2 {
             let combined: Vec<f32> = (0..3)
                 .map(|column| x_data[row_index * 3 + column] + r_data[row_index * 3 + column])
@@ -5542,9 +5542,9 @@ async fn test_autograd_layer_norm_last_dim_fused_weight_rank() {
         let b2: Tensor<2> = Tensor::from_slice(&graph, &device, [1, 3], &b_data);
 
         let rank1 = x.layer_norm_last_dim_fused::<1, 1>(&w1, Some(&b1), eps);
-        let rank1_values = rank1.raw().clone().as_slice().await.unwrap().to_vec2();
+        let rank1_values = rank1.raw().clone().as_slice().await.unwrap().to_vec();
         let rank2 = x.layer_norm_last_dim_fused::<1, 2>(&w2, Some(&b2), eps);
-        let rank2_values = rank2.raw().clone().as_slice().await.unwrap().to_vec2();
+        let rank2_values = rank2.raw().clone().as_slice().await.unwrap().to_vec();
         for (row_index, row) in x_rows.iter().enumerate() {
             let mean = row.iter().sum::<f32>() / 3.0;
             let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / 3.0;
@@ -5642,9 +5642,9 @@ async fn test_autograd_layer_linear_forward_matches_inference() {
 
         let raw_input_2d = RawTensor::from_slice(&device, [4, 4], &input_data);
         let input_2d = Tensor::constant_from_raw(&graph, raw_input_2d.clone());
-        let output_2d = layer.forward_2d(&input_2d);
+        let output_2d = layer.forward(&input_2d);
         assert_eq!(output_2d.shape(), [4, 3]);
-        let expected_2d = flatten(inference.forward_2d(&raw_input_2d)).await;
+        let expected_2d = flatten(inference.forward(&raw_input_2d)).await;
         assert_slice_close(&flatten(output_2d.raw().clone()).await, &expected_2d);
 
         let layer_no_bias = layers::Linear::new(
@@ -5789,7 +5789,7 @@ async fn test_autograd_layer_embedding_forward_parity() {
 
         let flat_indices: RawTensor<1, u32> = RawTensor::from_slice(&device, [3], &[2, 0, 2]);
         let expected_flat: RawTensor<2, f32> = raw_layer.forward(&flat_indices);
-        let output_flat = layer.forward_1d(&flat_indices);
+        let output_flat = layer.forward(&flat_indices);
         assert_eq!(output_flat.shape(), [3, 3]);
         assert_slice_close(
             &flatten(output_flat.raw().clone()).await,
@@ -5815,7 +5815,7 @@ async fn test_autograd_layer_embedding_weight_gradient() {
         let flat_indices: RawTensor<1, u32> = RawTensor::from_slice(&device, [3], &[3, 1, 3]);
         assert_gradient_matches_finite_difference(&device, [4, 3], &weights, |_graph, table| {
             layers::Embedding::new_from_tensor(table)
-                .forward_1d(&flat_indices)
+                .forward(&flat_indices)
                 .sqr()
                 .flatten_all()
                 .sum()
@@ -5880,7 +5880,7 @@ async fn test_autograd_layer_layer_norm_forward_matches_inference() {
         let raw_input = RawTensor::from_slice(&device, [2, 3, 4], &input_data);
         let raw_input_2d = RawTensor::from_slice(&device, [6, 4], &input_data);
         let expected = flatten(inference.forward(&raw_input)).await;
-        let expected_2d = flatten(inference.forward_2d(&raw_input_2d)).await;
+        let expected_2d = flatten(inference.forward(&raw_input_2d)).await;
 
         let graph = Graph::new();
         let layer = layers::LayerNorm::new(
@@ -5892,11 +5892,11 @@ async fn test_autograd_layer_layer_norm_forward_matches_inference() {
         let input_2d = Tensor::from_slice(&graph, &device, [6, 4], &input_data);
         assert_slice_close(&flatten(layer.forward(&input).into_raw()).await, &expected);
         assert_slice_close(
-            &flatten(layer.forward_fused(&input).into_raw()).await,
+            &flatten(layer.forward(&input).into_raw()).await,
             &expected,
         );
         assert_slice_close(
-            &flatten(layer.forward_2d(&input_2d).into_raw()).await,
+            &flatten(layer.forward(&input_2d).into_raw()).await,
             &expected_2d,
         );
     }
@@ -5919,7 +5919,7 @@ async fn test_autograd_layer_layer_norm_nd_forward_matches_inference() {
         );
         let expected = flatten(inference.forward::<3, 2, _>(&raw_input)).await;
         let raw_input_2d = RawTensor::from_slice(&device, [6, 4], &input_data);
-        let expected_2d = flatten(inference.forward_2d(&raw_input_2d)).await;
+        let expected_2d = flatten(inference.forward(&raw_input_2d)).await;
 
         let inference_axis = crate::layers::LayerNormNd::new_over_axis(
             RawTensor::from_slice(&device, [3], &axis_weight_data),
@@ -5946,7 +5946,7 @@ async fn test_autograd_layer_layer_norm_nd_forward_matches_inference() {
             &expected,
         );
         assert_slice_close(
-            &flatten(layer.forward_2d(&input_2d).into_raw()).await,
+            &flatten(layer.forward(&input_2d).into_raw()).await,
             &expected_2d,
         );
 
@@ -5998,7 +5998,7 @@ async fn test_autograd_layer_layer_norm_parameter_gradients() {
             let bias = Tensor::from_slice(graph, &device, [4], &bias_data);
             let input = Tensor::from_slice(graph, &device, [2, 3, 4], &input_data);
             layers::LayerNorm::new(weight, Some(bias), 1e-5)
-                .forward_fused(&input)
+                .forward(&input)
                 .flatten_all()
                 .sum()
         })
@@ -6110,8 +6110,8 @@ async fn test_autograd_layer_rms_norm_forward_parity() {
         );
 
         let input_2d = RawTensor::from_slice(&device, [6, 4], &input_data);
-        let expected = flatten(raw_layer.forward_2d(&input_2d)).await;
-        let output = layer.forward_2d(&Tensor::constant_from_raw(&graph, input_2d));
+        let expected = flatten(raw_layer.forward(&input_2d)).await;
+        let output = layer.forward(&Tensor::constant_from_raw(&graph, input_2d));
         assert_slice_close(&flatten(output.raw().clone()).await, &expected);
 
         let input_3d = RawTensor::from_slice(&device, [2, 3, 4], &input_data);
@@ -6120,8 +6120,8 @@ async fn test_autograd_layer_rms_norm_forward_parity() {
         assert_slice_close(&flatten(output.raw().clone()).await, &expected);
 
         let input_4d = RawTensor::from_slice(&device, [2, 1, 3, 4], &input_data);
-        let expected = flatten(raw_layer.forward_4d(&input_4d)).await;
-        let output = layer.forward_4d(&Tensor::constant_from_raw(&graph, input_4d));
+        let expected = flatten(raw_layer.forward(&input_4d)).await;
+        let output = layer.forward(&Tensor::constant_from_raw(&graph, input_4d));
         assert_slice_close(&flatten(output.raw().clone()).await, &expected);
 
         let residual_3d = RawTensor::from_slice(&device, [2, 3, 4], &residual_data);
@@ -6145,7 +6145,7 @@ async fn test_autograd_layer_rms_norm_weight_gradient() {
         assert_gradient_matches_finite_difference(&device, [4], &weight_data, |graph, weight| {
             let layer = layers::RmsNorm::new(weight, None, 1e-5);
             layer
-                .forward_2d(&Tensor::constant_from_raw(graph, input_2d.clone()))
+                .forward(&Tensor::constant_from_raw(graph, input_2d.clone()))
                 .sqr()
                 .flatten_all()
                 .sum()
@@ -6606,8 +6606,8 @@ async fn test_train_xor_with_layers() {
                 Some(graph.leaf(b2.clone())),
             );
 
-            let hidden = layer1.forward_2d(&x).relu();
-            let logits = layer2.forward_2d(&hidden);
+            let hidden = layer1.forward(&x).relu();
+            let logits = layer2.forward(&hidden);
             // Numerically stable cross-entropy: log softmax via log-sum-exp
             // so a saturated class cannot underflow to log(0).
             let shifted = logits.sub_::<2, 2>(&logits.max_keepdim::<1>(1));
@@ -6644,9 +6644,9 @@ async fn test_train_xor_with_layers() {
             Tensor::constant_from_raw(&graph, w2.clone()),
             Some(Tensor::constant_from_raw(&graph, b2.clone())),
         );
-        let hidden = layer1.forward_2d(&x).relu();
-        let logits = layer2.forward_2d(&hidden);
-        let logits = logits.raw().clone().as_slice().await.unwrap().to_vec2();
+        let hidden = layer1.forward(&x).relu();
+        let logits = layer2.forward(&hidden);
+        let logits = logits.raw().clone().as_slice().await.unwrap().to_vec();
         let correct = logits
             .iter()
             .zip(&labels)

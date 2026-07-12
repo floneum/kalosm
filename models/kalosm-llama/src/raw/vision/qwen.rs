@@ -414,7 +414,7 @@ where
 #[cfg(test)]
 #[tokio::test]
 async fn test_loading_qwen_vision() {
-    use fusor::ToVec2;
+    use fusor::ToVec;
     use kalosm_common::Cache;
 
     // Skip in CI
@@ -469,7 +469,7 @@ async fn test_loading_qwen_vision() {
     let out = qwen_vision.rot_pos_emb(&vec![[2, 4, 4]]).unwrap();
     let out_first_5_by_5 = out.slice([0..5, 0..5]).to_concrete();
     let out_slice = out_first_5_by_5.as_slice().await.unwrap();
-    let out_first_5_by_5: Vec<Vec<f32>> = out_slice.to_vec2();
+    let out_first_5_by_5: Vec<Vec<f32>> = out_slice.to_vec();
     println!("Rotary Pos Emb first 5x5: {:?}", out_first_5_by_5);
 
     let expected: [[f32; 5]; 5] = [
@@ -497,7 +497,7 @@ async fn test_loading_qwen_vision() {
         .unwrap();
     let out_first_5_by_5 = out.slice([0..5, 0..5]).to_concrete();
     let out_slice = out_first_5_by_5.as_slice().await.unwrap();
-    println!("Qwen Vision: {:?}", out_slice.to_vec2());
+    println!("Qwen Vision: {:?}", out_slice.to_vec());
 
     // download image from https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg
     let image_bytes =
@@ -515,7 +515,7 @@ async fn test_loading_qwen_vision() {
     let out = qwen_vision.forward_image(&pixels, grid).unwrap();
     let out_first_5_by_5 = out.slice([0..5, 0..5]).to_concrete();
     let out_slice = out_first_5_by_5.as_slice().await.unwrap();
-    println!("Qwen Vision Image: {:?}", out_slice.to_vec2());
+    println!("Qwen Vision Image: {:?}", out_slice.to_vec());
 }
 
 fn generate_full_attention_blocks(block_count: usize, n_wa_pattern: u64) -> Vec<usize> {

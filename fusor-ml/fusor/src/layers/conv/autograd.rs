@@ -1,6 +1,6 @@
 //! Trainable N-dimensional convolution layer.
 
-use super::super::{Graph, Tensor};
+use crate::autograd::{Graph, Tensor};
 
 pub use crate::layers::ConvNdConfig;
 

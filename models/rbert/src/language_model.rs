@@ -8,7 +8,7 @@ use crate::BertBuilder;
 use crate::BertError;
 use crate::BertLoadingError;
 use crate::Pooling;
-use fusor::ToVec2;
+use fusor::ToVec;
 pub use kalosm_language_model::{
     Embedder, EmbedderCacheExt, EmbedderExt, Embedding, EmbeddingInput, EmbeddingVariant,
 };
@@ -38,7 +38,7 @@ impl Bert {
         tensor: fusor::Tensor<2, f32>,
     ) -> Result<Embedding, BertError> {
         let slice = tensor.as_slice().await.map_err(BertError::Fusor)?;
-        let slice_data = slice.to_vec2();
+        let slice_data = slice.to_vec();
         Ok(Embedding::from(
             slice_data.into_iter().next().into_iter().next().unwrap(),
         ))

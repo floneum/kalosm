@@ -499,36 +499,37 @@ pub(crate) fn row_major_indices_from_flat(
     flat: NaryExpr,
     shape: &[usize],
 ) -> Option<Vec<NaryExpr>> {
-    let mut indices = Vec::with_capacity(shape.len());
-    for axis in 0..shape.len() {
-        let divisor = shape[axis + 1..]
-            .iter()
-            .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
+    // Peel innermost-out with a running quotient instead of dividing by each
+    // axis' suffix product — the Apple Metal compiler miscompiles u32
+    // div/mod chains with large non-power-of-two constants (see
+    // output_dims_from_flat). The outermost non-trivial axis keeps the raw
+    // quotient, matching the previous form.
+    let mut indices = vec![NaryExpr::scalar(NaryScalar::U32(0)); shape.len()];
+    let mut rest = flat;
+    for axis in (0..shape.len()).rev() {
         let dim = u32::try_from(shape[axis]).ok()?;
-        let quotient = if divisor == 1 {
-            flat.clone()
-        } else {
-            NaryExpr::unary_op(
-                flat.clone(),
-                "div_const",
-                NaryOp::DivConst(NaryScalar::U32(divisor)),
-                DataTypeEnum::U32,
-                DataTypeEnum::U32,
-            )
-        };
-        indices.push(if dim == 1 {
-            NaryExpr::scalar(NaryScalar::U32(0))
-        } else if axis == 0 {
-            quotient
-        } else {
-            NaryExpr::unary_op(
-                quotient,
-                "rem_const",
-                NaryOp::RemConst(NaryScalar::U32(dim)),
-                DataTypeEnum::U32,
-                DataTypeEnum::U32,
-            )
-        });
+        if dim == 1 {
+            continue;
+        }
+        let outer_nontrivial = shape[..axis].iter().any(|&outer| outer != 1);
+        if !outer_nontrivial {
+            indices[axis] = rest;
+            break;
+        }
+        indices[axis] = NaryExpr::unary_op(
+            rest.clone(),
+            "rem_const",
+            NaryOp::RemConst(NaryScalar::U32(dim)),
+            DataTypeEnum::U32,
+            DataTypeEnum::U32,
+        );
+        rest = NaryExpr::unary_op(
+            rest,
+            "div_const",
+            NaryOp::DivConst(NaryScalar::U32(dim)),
+            DataTypeEnum::U32,
+            DataTypeEnum::U32,
+        );
     }
     Some(indices)
 }

@@ -214,7 +214,7 @@ fn assert_layer_norm_2d_case(batch: usize, features: usize, with_bias: bool) -> 
                 .map(|data| Tensor::from_slice(&device, [features], data));
             let layer_norm = LayerNorm::new(weight, bias, 1e-5);
             let input = Tensor::from_slice(&device, [batch, features], &input_data);
-            layer_norm.forward_2d(&input).to_concrete()
+            layer_norm.forward(&input).to_concrete()
         }
     })
     .arg(|device: &Device| device.clone())
@@ -273,7 +273,7 @@ fn assert_rms_norm_2d_case(batch: usize, features: usize, with_bias: bool) -> As
                 .map(|data| Tensor::from_slice(&device, [features], data));
             let rms_norm = RmsNorm::new(weight, bias, 1e-5);
             let input = Tensor::from_slice(&device, [batch, features], &input_data);
-            rms_norm.forward_2d(&input).to_concrete()
+            rms_norm.forward(&input).to_concrete()
         }
     })
     .arg(|device: &Device| device.clone())
@@ -338,7 +338,7 @@ fn assert_rms_norm_4d_case(
                 .map(|data| Tensor::from_slice(&device, [features], data));
             let rms_norm = RmsNorm::new(weight, bias, 1e-5);
             let input = Tensor::from_slice(&device, [batch, heads, seq_len, features], &input_data);
-            rms_norm.forward_4d(&input).to_concrete()
+            rms_norm.forward(&input).to_concrete()
         }
     })
     .arg(|device: &Device| device.clone())

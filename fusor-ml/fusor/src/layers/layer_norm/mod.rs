@@ -1,5 +1,7 @@
 //! Layer normalization implementation.
 
+pub(crate) mod autograd;
+
 use crate::fusion::Concrete;
 use crate::{
     DataType, Device, DivOp, FloatDataType, FloatOps, Fusion, MulOp, SimdBinaryOp, SimdElement,
@@ -99,10 +101,11 @@ impl<D> LayerNorm<1, D>
 where
     D: SimdElement + DataType + FloatDataType + FloatOps + Default,
 {
-    /// Forward pass for 2D input (batch, features).
-    ///
-    /// Normalizes over the last dimension (features).
-    pub fn forward_2d<B>(&self, input: &Tensor<2, D, B>) -> Tensor<2, D, Concrete<D, 2>>
+    /// Normalizes the last dimension of an input tensor.
+    pub fn forward<const R: usize, const OUT_RANK: usize, B>(
+        &self,
+        input: &Tensor<R, D, B>,
+    ) -> Tensor<R, D, Concrete<D, R>>
     where
         D: std::ops::Add<Output = D>
             + std::ops::Sub<Output = D>
@@ -114,40 +117,14 @@ where
         DivOp: SimdBinaryOp<D>,
         SumOp: SimdReduceOp<D>,
         SqrtOp: SimdUnaryOp<D>,
-        B: Fusion<2, D>,
+        B: Fusion<R, D>,
+        Concrete<D, R>: crate::cpu::LastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::LastRank<OUT_RANK, D>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
     {
-        // Broadcast weight to input shape
-        let weight_broadcast: Tensor<2, D, _> = self.weight.broadcast_as(input.shape());
-        let bias_broadcast: Option<Tensor<2, D, _>> =
-            self.bias.as_ref().map(|b| b.broadcast_as(input.shape()));
-        input.layer_norm(
-            &weight_broadcast,
-            bias_broadcast.as_ref(),
-            D::from_f32(self.eps),
-            true,
-        )
-    }
-
-    /// Forward pass for 3D input (batch, seq_len, features).
-    ///
-    /// Normalizes over the last dimension (features).
-    pub fn forward<B>(&self, input: &Tensor<3, D, B>) -> Tensor<3, D, Concrete<D, 3>>
-    where
-        D: std::ops::Add<Output = D>
-            + std::ops::Sub<Output = D>
-            + std::ops::Mul<Output = D>
-            + std::ops::Div<Output = D>,
-        crate::AddOp: SimdBinaryOp<D>,
-        SubOp: SimdBinaryOp<D>,
-        MulOp: SimdBinaryOp<D>,
-        DivOp: SimdBinaryOp<D>,
-        SumOp: SimdReduceOp<D>,
-        SqrtOp: SimdUnaryOp<D>,
-        B: Fusion<3, D>,
-    {
-        // Broadcast weight to input shape
-        let weight_broadcast: Tensor<3, D, _> = self.weight.broadcast_as(input.shape());
-        let bias_broadcast: Option<Tensor<3, D, _>> =
+        let weight_broadcast: Tensor<R, D, _> = self.weight.broadcast_as(input.shape());
+        let bias_broadcast: Option<Tensor<R, D, _>> =
             self.bias.as_ref().map(|b| b.broadcast_as(input.shape()));
         input.layer_norm(
             &weight_broadcast,
@@ -237,24 +214,6 @@ where
 
     pub fn eps(&self) -> f32 {
         self.eps
-    }
-
-    /// Forward pass for 2D input.
-    pub fn forward_2d<B>(&self, input: &Tensor<2, D, B>) -> Tensor<2, D, Concrete<D, 2>>
-    where
-        D: std::ops::Add<Output = D>
-            + std::ops::Sub<Output = D>
-            + std::ops::Mul<Output = D>
-            + std::ops::Div<Output = D>,
-        crate::AddOp: SimdBinaryOp<D>,
-        SubOp: SimdBinaryOp<D>,
-        MulOp: SimdBinaryOp<D>,
-        DivOp: SimdBinaryOp<D>,
-        SumOp: SimdReduceOp<D>,
-        SqrtOp: SimdUnaryOp<D>,
-        B: Fusion<2, D>,
-    {
-        self.forward(input)
     }
 
     /// Forward pass for any input rank. `OUT_RANK` equals `N - 1`.

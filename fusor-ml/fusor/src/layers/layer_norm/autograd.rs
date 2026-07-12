@@ -1,6 +1,6 @@
 //! Trainable layer normalization.
 
-use super::super::{Graph, Tensor};
+use crate::autograd::{Graph, Tensor};
 
 /// Layer Normalization.
 ///
@@ -46,29 +46,16 @@ impl<const N: usize> LayerNorm<N> {
 }
 
 impl LayerNorm<1> {
-    /// Forward pass for 2D input (batch, features).
-    ///
-    /// Normalizes over the last dimension (features).
-    pub fn forward_2d(&self, input: &Tensor<2>) -> Tensor<2> {
-        let weight_broadcast = self.weight.broadcast_as(input.shape());
-        let bias_broadcast = self
-            .bias
-            .as_ref()
-            .map(|bias| bias.broadcast_as(input.shape()));
-        input.layer_norm::<1>(&weight_broadcast, bias_broadcast.as_ref(), self.eps, true)
-    }
-
-    /// Forward pass for 3D input (batch, seq_len, features).
-    ///
-    /// Normalizes over the last dimension (features).
-    pub fn forward(&self, input: &Tensor<3>) -> Tensor<3> {
-        // Route through the fused last-dim kernel (composite replay backward).
-        self.forward_fused(input)
-    }
-
-    /// Forward pass through the fused last-dim kernel (3D input).
-    pub fn forward_fused(&self, input: &Tensor<3>) -> Tensor<3> {
-        input.layer_norm_last_dim_fused::<2, 1>(&self.weight, self.bias.as_ref(), self.eps)
+    /// Normalizes the last dimension of an input tensor.
+    pub fn forward<const R: usize, const OUT_RANK: usize>(&self, input: &Tensor<R>) -> Tensor<R>
+    where
+        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, f32> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, f32>>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+    {
+        input.layer_norm_last_dim_fused::<OUT_RANK, 1>(&self.weight, self.bias.as_ref(), self.eps)
     }
 }
 
@@ -145,11 +132,6 @@ impl LayerNormNd {
 
     pub fn eps(&self) -> f32 {
         self.eps
-    }
-
-    /// Forward pass for 2D input.
-    pub fn forward_2d(&self, input: &Tensor<2>) -> Tensor<2> {
-        self.forward::<2, 1>(input)
     }
 
     /// Forward pass for any input rank. `OUT_RANK` equals `N - 1`.

@@ -118,7 +118,7 @@ impl MlpMaskDecoder {
     fn forward(&self, xs: &Tensor<2, f32>) -> Tensor<2, f32> {
         let mut xs = xs.to_concrete();
         for (i, layer) in self.layers.iter().enumerate() {
-            xs = layer.forward_2d(&xs);
+            xs = layer.forward(&xs);
             if i + 1 < self.layers.len() {
                 xs = xs.relu();
             }

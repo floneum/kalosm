@@ -1,7 +1,7 @@
 //! RoPE op conformance cases.
 
 use crate::common::{reshape4, rope_interleaved_4d, rope_normal_4d};
-use fusor::{Device, RopeCache, Tensor, ToVec1, base_inverse_frequency};
+use fusor::{Device, RopeCache, Tensor, ToVec, base_inverse_frequency};
 use fusor_conformance::{AssertionCases, FuzzGenerator, approx_compare, exact_value_compare};
 use rand::distr::Uniform;
 
@@ -81,7 +81,7 @@ async fn rope_reference_tensor(
         .as_slice()
         .await
         .unwrap();
-    let flat: Vec<f32> = slice.to_vec1();
+    let flat: Vec<f32> = slice.to_vec();
     let host = reshape4(&flat, [1, 2, 3, 4]);
     let out = match reference {
         RopeReference::Normal => rope_normal_4d(&host, &cos, &sin),

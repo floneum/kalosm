@@ -24,7 +24,7 @@
 mod mask_generation;
 mod raw;
 
-use fusor::{Concrete, Device, Tensor, ToVec1, VarBuilder};
+use fusor::{Concrete, Device, Tensor, ToVec, VarBuilder};
 use image::{DynamicImage, GenericImage, GenericImageView, ImageBuffer, Rgba};
 use kalosm_model_types::FileSource;
 use mask_generation::LowResMaskBatch;
@@ -322,7 +322,7 @@ impl SegmentAnything {
         let mask_hwc = mask_t1.transpose(1, 2); // (H, W, 3);
         let mask_flat = mask_hwc.reshape([h * w * 3]);
         let mask_slice = mask_flat.as_slice().await?;
-        let mask_pixels: Vec<u8> = mask_slice.to_vec1().iter().map(|&v| v as u8).collect();
+        let mask_pixels: Vec<u8> = mask_slice.to_vec().iter().map(|&v| v as u8).collect();
 
         let mask_img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
             image::ImageBuffer::from_raw(w as u32, h as u32, mask_pixels)
@@ -427,12 +427,12 @@ impl SegmentAnything {
 
             let masks_flat = low_res_masks.reshape([total_mask_elems]);
             let masks_slice = masks_flat.as_slice().await?;
-            let masks_vec = masks_slice.to_vec1();
+            let masks_vec = masks_slice.to_vec();
 
             let total_iou_elems = batch * n_masks_per_point;
             let iou_flat = iou_preds.reshape([total_iou_elems]);
             let iou_slice = iou_flat.as_slice().await?;
-            let iou_vec = iou_slice.to_vec1();
+            let iou_vec = iou_slice.to_vec();
 
             mask_generation::collect_mask_candidates(
                 LowResMaskBatch {

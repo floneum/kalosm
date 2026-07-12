@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use fusor::autograd::layers::{Embedding, LayerNorm, Linear};
 use fusor::autograd::{Graph, Tensor};
-use fusor::{Device, StandardSamplerParams, Tensor as RawTensor, ToVec1, cat};
+use fusor::{Device, StandardSamplerParams, Tensor as RawTensor, ToVec, cat};
 
 const CONTEXT: usize = 256;
 const BATCH_SIZE: usize = 64;
@@ -25,7 +25,7 @@ const DIM: usize = 384;
 const HEADS: usize = 6;
 const HEAD_DIM: usize = DIM / HEADS;
 const MLP_DIM: usize = 4 * DIM;
-const LAYERS: usize = 2;
+const LAYERS: usize = 6;
 const STEPS: usize = 300;
 const LEARNING_RATE: f32 = 1e-3;
 const BETA1: f32 = 0.9;
@@ -404,7 +404,7 @@ impl Gpt {
         mask: &Tensor<2>,
     ) -> Tensor<3> {
         let [batch, seq] = tokens.shape();
-        let position_embedded = self.position_embedding.forward_1d(positions);
+        let position_embedded = self.position_embedding.forward(positions);
         let mut x = self
             .token_embedding
             .forward(tokens)
@@ -507,7 +507,7 @@ async fn read_metrics(
         .as_slice()
         .await
         .unwrap()
-        .to_vec1();
+        .to_vec();
     (metrics[0], metrics[1] / tokens as f32)
 }
 
@@ -583,7 +583,7 @@ async fn generate_synchronized(
             .reshape([vocab_size])
             .into_concrete();
         drop(logits);
-        let last_logits = last_logits.as_slice().await.unwrap().to_vec1();
+        let last_logits = last_logits.as_slice().await.unwrap().to_vec();
         tokens.push(sample(&last_logits, rng));
     }
     tokens

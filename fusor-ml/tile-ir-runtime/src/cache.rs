@@ -279,6 +279,10 @@ impl KernelCache {
 
     pub fn create_naga_shader_module(&self, kernel: &NagaKernel) -> wgpu::ShaderModule {
         crate::note_compile("shader");
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(dir) = std::env::var_os("FUSOR_DUMP_SHADERS") {
+            dump_shader(kernel, std::path::Path::new(&dir));
+        }
         // SAFETY: all kernels avoid out-of-bounds memory access and unbounded loops.
         unsafe {
             self.device.create_shader_module_trusted(
@@ -313,6 +317,20 @@ impl KernelCache {
 #[cfg(not(target_arch = "wasm32"))]
 fn shader_source(kernel: &NagaKernel) -> wgpu::ShaderSource<'static> {
     wgpu::ShaderSource::Naga(Cow::Owned(kernel.module().clone()))
+}
+
+/// Debug aid: with `FUSOR_DUMP_SHADERS=<dir>`, every compiled kernel is also
+/// serialized to WGSL in that directory, named by a running counter.
+#[cfg(not(target_arch = "wasm32"))]
+fn dump_shader(kernel: &NagaKernel, dir: &std::path::Path) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(
+        dir.join(format!("shader_{n:03}.ir.txt")),
+        format!("{:#?}", kernel.module()),
+    );
 }
 
 #[cfg(target_arch = "wasm32")]

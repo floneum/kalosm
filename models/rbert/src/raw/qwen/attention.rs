@@ -74,10 +74,10 @@ impl QwenSelfAttention {
 
         // Apply optional Q/K normalization
         if let Some(ref q_norm) = self.q_norm {
-            query_states = q_norm.forward_4d(&query_states);
+            query_states = q_norm.forward(&query_states);
         }
         if let Some(ref k_norm) = self.k_norm {
-            key_states = k_norm.forward_4d(&key_states);
+            key_states = k_norm.forward(&key_states);
         }
 
         // Apply RoPE to Q and K
