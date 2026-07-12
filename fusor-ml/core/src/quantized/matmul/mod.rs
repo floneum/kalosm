@@ -852,44 +852,15 @@ fn effective_qmatmul_max_workgroups_per_dimension(limits: &wgpu::Limits) -> u32 
     limits.max_compute_workgroups_per_dimension.max(1)
 }
 
-/// Output columns per workgroup for the direct qgemv path, by (format, K, N).
+/// Output columns per workgroup for the direct qgemv path: exactly the
+/// geometry the qgemv builder will emit, so the launched grid and the
+/// kernel's internal grid agree by construction. The former re-derived
+/// (format, K, N) range table disagreed with the builder on several cells
+/// (e.g. 4x too many masked workgroups on Q4K K<=4096/N in 8192..=16384,
+/// and a permanently missed pipeline fast path anywhere the totals
+/// differed, since the pipeline key includes the dispatch size).
 fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32, n: u32) -> u32 {
-    // Q4K specializations.
-    if format.is_q4k_family() && k <= 4096 && (4096..8192).contains(&n) {
-        return 4; // was Q4KSmallWide4
-    }
-    if format.is_q4k_family() && k <= 4096 && n >= 8192 {
-        return 8; // was Q4KSmallWide8
-    }
-    if format.is_q4k_family() && n <= 4096 && k > 4096 {
-        return 8; // was Q4KLargeNarrow8
-    }
-    // Q6K specializations.
-    if format.is_q6k_family() && k <= 4096 && n >= 8192 {
-        return 8; // was Q6KSmallWide8
-    }
-    if format.is_q6k_family() && n <= 4096 && k > 4096 {
-        return 4; // was Q6KLargeNarrow4
-    }
-    // Q8_0 wide.
-    if format.is_q8_0_family() && k <= 1024 && n >= 8192 {
-        return 32; // was Q8WideAccelerated32
-    }
-    // FormatAccelerated: Q5_0 mid (K,N both 2048..=4096), Q4K/Q6K general,
-    // or Q5_0 large (K*N >= 4M). Delegates to the format-aware helper.
-    let q5_mid =
-        format.is_q5_0_family() && (2048..=4096).contains(&k) && (2048..=4096).contains(&n);
-    let q5_large = format.is_q5_0_family()
-        && (k as u64)
-            .checked_mul(n as u64)
-            .is_some_and(|elements| elements >= 4 * 1024 * 1024);
-    if q5_mid || format.is_q4k_family() || format.is_q6k_family() || q5_large {
-        return tile_ir_kernels::qgemv_cols_per_workgroup_for_shape(format, k, n);
-    }
-    if format.is_q5_0_family() && k <= 1024 && n <= 4096 {
-        return 8; // was Q5Small8
-    }
-    4 // was Default4
+    tile_ir_kernels::qgemv_selected_shape(format, k, n).cols_per_workgroup()
 }
 
 fn qmatmul_m_pad_target_for_caps(m: usize, n: usize, caps: KernelDeviceCaps) -> Option<usize> {

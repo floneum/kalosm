@@ -18,11 +18,7 @@
 use fusor_tile_ir::tile::{range, Mask, Program, Storage, Tile, TileBlock};
 use fusor_tile_ir::{GgmlQuantFormat, QuantizedMatrix, TileLiteral};
 
-use crate::dispatch::{
-    q4k_default_large, q4k_default_mid, q4k_default_tall, q4k_large_override, q4k_mid_override,
-    q4k_tall_override, q6k_default_large, q6k_default_tall, q6k_large_override, q6k_tall_override,
-    qgemv_subgroups_per_workgroup_for_shape, QgemvShape, SubgroupConfig,
-};
+use crate::dispatch::{qgemv_selected_shape, QgemvShape, SubgroupConfig};
 use crate::grid::{
     dot4_sum, qgemv_grid, qgemv_has_no_packed_load_tails, qgemv_program_scope,
     store_qgemv_sums_with_epilogue, QgemvStoreTarget,
@@ -140,28 +136,15 @@ pub(crate) fn qgemv_tile_with_epilogue(
     let output_cols = ep.post_output_cols(b.cols);
 
     match b.format {
-        GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native => {
-            if output_cols >= 8192 {
-                return qgemv_perf_with_epilogue(
-                    program,
-                    tensors,
-                    workgroups_x,
-                    subgroups,
-                    ep,
-                    qgemv_shape(4, 8),
-                    8,
-                );
-            }
-            qgemv_perf_with_epilogue(
-                program,
-                tensors,
-                workgroups_x,
-                subgroups,
-                ep,
-                qgemv_shape(4, 4),
-                8,
-            )
-        }
+        GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native => qgemv_perf_with_epilogue(
+            program,
+            tensors,
+            workgroups_x,
+            subgroups,
+            ep,
+            qgemv_selected_shape(b.format, b.rows, output_cols),
+            8,
+        ),
         GgmlQuantFormat::Q8_1 => qgemv_perf_with_epilogue(
             program,
             tensors,
@@ -172,19 +155,7 @@ pub(crate) fn qgemv_tile_with_epilogue(
             8,
         ),
         GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative => {
-            let shape = if b.rows <= 4096 && (4096..8192).contains(&output_cols) {
-                q4k_mid_override(q4k_default_mid(b.rows, output_cols))
-            } else if b.rows <= 4096 && output_cols <= 4096 {
-                qgemv_shape(8, 4)
-            } else if b.rows <= 4096 && output_cols >= 8192 {
-                q4k_large_override(q4k_default_large(b.rows, output_cols))
-            } else if b.rows > 4096 && output_cols <= 4096 {
-                q4k_tall_override(q4k_default_tall(b.rows, output_cols))
-            } else if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, output_cols) == 8 {
-                qgemv_shape(8, 8)
-            } else {
-                qgemv_shape(4, 8)
-            };
+            let shape = qgemv_selected_shape(b.format, b.rows, output_cols);
             // The decode matmuls (no pre-epilogue) take the ggml super-block-
             // amortized dot, which decodes each 256-element super-block's
             // scale/min once per lane instead of re-decoding per 16-element
@@ -248,36 +219,10 @@ pub(crate) fn qgemv_tile_with_epilogue(
             8,
         ),
         GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative => {
-            if b.rows <= 4096 && output_cols >= 8192 {
-                let shape = q6k_large_override(q6k_default_large(b.rows, output_cols));
-                return qgemv_perf_with_epilogue(
-                    program,
-                    tensors,
-                    workgroups_x,
-                    subgroups,
-                    ep,
-                    shape,
-                    8,
-                );
-            }
-            if b.rows > 4096 && output_cols <= 4096 {
-                let shape = q6k_tall_override(q6k_default_tall(b.rows, output_cols));
-                return qgemv_perf_with_epilogue(
-                    program,
-                    tensors,
-                    workgroups_x,
-                    subgroups,
-                    ep,
-                    shape,
-                    8,
-                );
-            }
-            let (shape, values_per_lane) =
-                if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, output_cols) == 4 {
-                    (qgemv_shape(4, 4), 8)
-                } else {
-                    (qgemv_shape(8, 4), 16)
-                };
+            let shape = qgemv_selected_shape(b.format, b.rows, output_cols);
+            // Only the default (8, 4) regime uses the 16-value lanes; the
+            // large/tall/4-subgroup regimes all stage 8 values per lane.
+            let values_per_lane = if shape == qgemv_shape(8, 4) { 16 } else { 8 };
             // The decode matmuls (no pre-epilogue) take the ggml super-block-
             // amortized dot, which decodes each 256-element super-block's `d`
             // and sub-block scales once per 16-element lane region instead of

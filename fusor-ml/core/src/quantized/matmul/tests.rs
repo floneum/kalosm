@@ -538,6 +538,68 @@ mod tests {
         });
     }
 
+    // Q6K in the large regime (K <= 4096, 8192 <= N <= 16384): the dispatch
+    // ladder and the kernel's own geometry must agree on columns per
+    // workgroup, or the launched grid covers only part of the output. Checks
+    // the high columns that an under-dispatch leaves unwritten.
+    #[test]
+    fn q6k_large_single_row_qgemv_covers_all_columns() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            if !device.subgroups_supported() {
+                return;
+            }
+
+            let weight_shape = [8192usize, 2048usize];
+            let blocks_per_row = weight_shape[1] / BlockQ6K::BLOCK_SIZE;
+            let raw_bytes = patterned_q6k_bytes(weight_shape);
+            let matrix =
+                QMatrix::from_parts(&device, &raw_bytes, weight_shape.into(), GgmlType::Q6K)
+                    .unwrap();
+            let blocks: &[BlockQ6K] = bytemuck::cast_slice(&raw_bytes);
+            let input_values = (0..weight_shape[1])
+                .map(|index| {
+                    let bucket = (index.wrapping_mul(37).wrapping_add(11)) % 101;
+                    (bucket as f32 - 50.0) * 0.0025
+                })
+                .collect::<Vec<_>>();
+            // Two runs: the first builds the kernel (whose own grid is
+            // authoritative), the second takes the cached-pipeline fast
+            // path whose dispatch the core-side ladder computes.
+            for run in 0..2 {
+                let input =
+                    Tensor::from_slice::<f32>(&device, [1, weight_shape[1]], &input_values);
+                let result = input.q_mat_mul(&matrix).as_slice::<2, f32>().await.unwrap();
+
+                assert_eq!(result.shape(), &[1, weight_shape[0]]);
+                for col in [0usize, 1, 4095, 4096, 6000, 8190, 8191] {
+                    let expected = (0..blocks_per_row)
+                        .map(|block_col| {
+                            let block = &blocks[col * blocks_per_row + block_col];
+                            let weights = block.dequantize();
+                            weights
+                                .as_ref()
+                                .iter()
+                                .enumerate()
+                                .map(|(offset, weight)| {
+                                    input_values[block_col * BlockQ6K::BLOCK_SIZE + offset]
+                                        * *weight
+                                })
+                                .sum::<f32>()
+                        })
+                        .sum::<f32>();
+                    let actual = result[[0, col]];
+                    assert!(
+                        (actual - expected).abs() <= 1e-2_f32.max(expected.abs() * 1.0e-4),
+                        "run={run} col={col} actual={actual} expected={expected}"
+                    );
+                }
+            }
+        });
+    }
+
     #[test]
     fn q4k_large_single_row_qgemv_handles_tail_columns_with_subgroups() {
         pollster::block_on(async {

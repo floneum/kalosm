@@ -10,7 +10,7 @@ mod kernels;
 mod types;
 
 pub use dispatch::{
-    qgemv_cols_per_workgroup, qgemv_cols_per_workgroup_for_shape,
+    qgemv_selected_shape,
     qgemv_subgroups_per_workgroup_for_shape, SubgroupConfig,
 };
 pub use kernels::{

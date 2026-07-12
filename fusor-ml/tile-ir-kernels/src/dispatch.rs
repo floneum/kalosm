@@ -24,47 +24,6 @@ use fusor_tile_ir::{GgmlQuantFormat, SubgroupToken};
 
 // ===== qgemv shapes (Q4K and Q6K ggml paths) =====
 
-const fn is_q4k_family(format: GgmlQuantFormat) -> bool {
-    format.is_q4k_family()
-}
-
-const fn is_q6k_family(format: GgmlQuantFormat) -> bool {
-    format.is_q6k_family()
-}
-
-/// Default qgemv output columns handled by one workgroup for `format`.
-pub const fn qgemv_cols_per_workgroup(format: GgmlQuantFormat) -> u32 {
-    qgemv_subgroups_per_workgroup(format) * qgemv_cols_per_subgroup(format)
-}
-
-/// Shape-aware qgemv output columns handled by one workgroup.
-///
-/// This includes the Q4K/Q6K GGML specializations whose column grouping
-/// depends on both K (`rows`) and N (`cols`).
-pub fn qgemv_cols_per_workgroup_for_shape(format: GgmlQuantFormat, rows: u32, cols: u32) -> u32 {
-    if is_q4k_family(format) && rows <= 4096 && (4096..8192).contains(&cols) {
-        return q4k_mid_override(q4k_default_mid(rows, cols)).cols_per_workgroup();
-    }
-
-    if is_q4k_family(format) && rows <= 4096 && cols >= 8192 {
-        return q4k_large_override(q4k_default_large(rows, cols)).cols_per_workgroup();
-    }
-
-    if is_q4k_family(format) && rows > 4096 && cols <= 4096 {
-        return q4k_tall_override(q4k_default_tall(rows, cols)).cols_per_workgroup();
-    }
-
-    if is_q6k_family(format) && rows <= 4096 && cols >= 8192 {
-        return q6k_large_override(q6k_default_large(rows, cols)).cols_per_workgroup();
-    }
-
-    if is_q6k_family(format) && rows > 4096 && cols <= 4096 {
-        return q6k_tall_override(q6k_default_tall(rows, cols)).cols_per_workgroup();
-    }
-
-    qgemv_subgroups_per_workgroup_for_shape(format, rows, cols) * qgemv_cols_per_subgroup(format)
-}
-
 pub(crate) const fn qgemv_cols_per_subgroup(format: GgmlQuantFormat) -> u32 {
     match format {
         GgmlQuantFormat::Q2K => 4,
@@ -107,7 +66,7 @@ pub const fn qgemv_subgroups_per_workgroup_for_shape(
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct QgemvShape {
+pub struct QgemvShape {
     pub subgroups: u32,
     pub cols_per_subgroup: u32,
 }
@@ -120,8 +79,66 @@ impl QgemvShape {
         }
     }
 
-    pub(crate) const fn cols_per_workgroup(self) -> u32 {
+    pub const fn cols_per_workgroup(self) -> u32 {
         self.subgroups * self.cols_per_subgroup
+    }
+}
+
+/// The workgroup geometry the qgemv builder will emit for `(format, rows,
+/// output_cols)` — the single source for both the kernel body and the
+/// dispatch grid. `rows` is the contraction depth (K) and `output_cols` the
+/// epilogue-adjusted output width (N). Callers computing a dispatch must use
+/// this (never a re-derived approximation): the launched grid and the
+/// kernel's internal `qgemv_grid` agree by construction only when both come
+/// from here.
+pub fn qgemv_selected_shape(
+    format: GgmlQuantFormat,
+    rows: u32,
+    output_cols: u32,
+) -> QgemvShape {
+    match format {
+        GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native => {
+            if output_cols >= 8192 {
+                QgemvShape::new(4, 8)
+            } else {
+                QgemvShape::new(4, 4)
+            }
+        }
+        GgmlQuantFormat::Q8_1 => QgemvShape::new(4, 4),
+        GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative => {
+            if rows <= 4096 && (4096..8192).contains(&output_cols) {
+                q4k_mid_override(q4k_default_mid(rows, output_cols))
+            } else if rows <= 4096 && output_cols <= 4096 {
+                QgemvShape::new(8, 4)
+            } else if rows <= 4096 && output_cols >= 8192 {
+                q4k_large_override(q4k_default_large(rows, output_cols))
+            } else if rows > 4096 && output_cols <= 4096 {
+                q4k_tall_override(q4k_default_tall(rows, output_cols))
+            } else if qgemv_subgroups_per_workgroup_for_shape(format, rows, output_cols) == 8 {
+                QgemvShape::new(8, 8)
+            } else {
+                QgemvShape::new(4, 8)
+            }
+        }
+        GgmlQuantFormat::Q5_0 | GgmlQuantFormat::Q5_0Native => QgemvShape::new(2, 4),
+        GgmlQuantFormat::Q4_0
+        | GgmlQuantFormat::Q4_0Native
+        | GgmlQuantFormat::Q4_1
+        | GgmlQuantFormat::Q5_1
+        | GgmlQuantFormat::Q2K => QgemvShape::new(2, 4),
+        GgmlQuantFormat::Q3K | GgmlQuantFormat::Q8K => QgemvShape::new(2, 2),
+        GgmlQuantFormat::Q5K | GgmlQuantFormat::Q5KNative => QgemvShape::new(2, 1),
+        GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative => {
+            if rows <= 4096 && output_cols >= 8192 {
+                q6k_large_override(q6k_default_large(rows, output_cols))
+            } else if rows > 4096 && output_cols <= 4096 {
+                q6k_tall_override(q6k_default_tall(rows, output_cols))
+            } else if qgemv_subgroups_per_workgroup_for_shape(format, rows, output_cols) == 4 {
+                QgemvShape::new(4, 4)
+            } else {
+                QgemvShape::new(8, 4)
+            }
+        }
     }
 }
 
@@ -344,6 +361,32 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The selected shape is the single source for dispatch and kernel
+    /// geometry; these cells pin it where the deleted core-side re-derivation
+    /// used to disagree with the builder (over-dispatching masked workgroups
+    /// and permanently missing the prebuilt-pipeline fast path).
+    #[test]
+    fn selected_shape_pins_previously_desynced_cells() {
+        use GgmlQuantFormat as F;
+        let cols = |f, k, n| qgemv_selected_shape(f, k, n).cols_per_workgroup();
+        // Q4K large: the old dispatch ladder said 8; the builder emits 32.
+        assert_eq!(cols(F::Q4K, 2048, 8192), 32);
+        assert_eq!(cols(F::Q4K, 4096, 11008), 32);
+        // Q4K mid: old ladder said 4 for every mid shape; the builder varies.
+        assert_eq!(cols(F::Q4K, 4096, 4097), 4);
+        assert_eq!(cols(F::Q4K, 4096, 5120), 12);
+        assert_eq!(cols(F::Q4K, 4096, 6144), 16);
+        // Q6K large <=16384: old ladder said 8; the builder emits 4.
+        assert_eq!(cols(F::Q6K, 2048, 8192), 4);
+        assert_eq!(cols(F::Q6K, 2048, 16385), 8);
+        // Q8_0 wide: old ladder said 32; the builder emits 32 (4x8).
+        assert_eq!(cols(F::Q8_0, 1024, 8192), 32);
+        // SmolLM2 decode cells.
+        assert_eq!(cols(F::Q4K, 576, 1536), 32);
+        assert_eq!(cols(F::Q4K, 1536, 576), 32);
+        assert_eq!(cols(F::Q6K, 576, 49152), 8);
     }
 
     #[test]
