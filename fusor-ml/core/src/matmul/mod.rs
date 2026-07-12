@@ -4,6 +4,7 @@ use crate::{
 };
 
 pub mod coop_gemm;
+mod cost;
 mod kernel;
 pub mod sgemm;
 mod sgemm_params;
@@ -397,12 +398,21 @@ mod selection_tests {
         );
     }
 
+    fn select_with_lanes(m: u32, k: u32, n: u32, max_lanes: u32) -> Option<CoopTile> {
+        let policy = crate::occupancy::DispatchPolicy::from_parts(64 << 10, 32, max_lanes, 8 << 20);
+        CoopTile::select(m, k, n, &policy, 32)
+    }
+
+    /// The scored selection's choices, pinned with the measurements that
+    /// justify each divergence from the old divisibility ladder. Anchors are
+    /// min-of-many chained-dependency benches on M2 Max; "flat" families are
+    /// shapes where every zero-pad tile measured within noise.
     #[test]
-    fn direct_tile_coop_selector_prefers_largest_supported_tile() {
-        let select =
-            |m, k, n, max_workgroup_size_x| CoopTile::select(m, k, n, max_workgroup_size_x, 32);
-        // 4096³ (square) hits Tile128x512 — it has fewer barriers than
-        // Tile256x256 because it's double-buffered.
+    fn scored_selection_pins() {
+        let select = select_with_lanes;
+        // 4096³: 128x512 stages the least of the mergeable profiles
+        // (measured 5.30 vs 128x64's 4.86; the excluded single-buffered
+        // 256x256 measured 5.37 standalone but cannot merge).
         assert_eq!(
             select(4096, 4096, 4096, 512),
             Some(CoopTile::new(128, 512, 16))
@@ -412,69 +422,60 @@ mod selection_tests {
                 .unwrap()
                 .supports_horizontal_merge(),
         );
-        // Shapes where N is divisible by 256 but not 512 — with enough
-        // tiles — fall to Tile256x256 single-buffer.
-        assert_eq!(
-            select(8192, 1024, 4352, 512),
-            Some(CoopTile::new(256, 256, 16))
-        );
-        assert!(
-            !select(8192, 1024, 4352, 512)
-                .unwrap()
-                .supports_horizontal_merge(),
-            "single-buffered 256x256 tiles must remain standalone",
-        );
-        // N=512 doesn't divide 256 on the M side... actually wait, 4096 % 256 == 0.
-        // For shapes where N is divisible by 512 but M isn't by 256, fall to
-        // Tile128x512.
-        assert_eq!(
-            select(384, 1024, 1024, 512),
-            Some(CoopTile::new(128, 64, 16))
-        );
-        // 1024³ doesn't have enough tiles for Tile128x512 OR Tile128x256;
-        // falls back to Tile128x64 for better parallelism.
+        // 1024³: the ladder chose 128x64 "for better parallelism" — measured
+        // 2x WRONG (128x512 1.60 TF/s vs 128x64's 0.79). Staging wins.
         assert_eq!(
             select(1024, 1024, 1024, 512),
-            Some(CoopTile::new(128, 64, 16))
+            Some(CoopTile::new(128, 512, 16))
         );
-        // 8192x256 has tiles_for(128, 256) = 64*1 = 64 — below the threshold,
-        // so it falls to Tile128x64.
+        // Zero-pad beats the ladder's tile-count thresholds; measured flat
+        // (all ~6.25 TF/s at 8192x1024x256), so the staging argmin decides.
         assert_eq!(
             select(8192, 1024, 256, 256),
-            Some(CoopTile::new(128, 64, 16))
-        );
-        // M=4096, N=1024 gives tiles_for(128, 256) = 32*4 = 128. Below 256.
-        // Falls to Tile128x64.
-        assert_eq!(
-            select(4096, 1024, 1024, 256),
-            Some(CoopTile::new(128, 64, 16))
-        );
-        // M=8192, N=512 gives tiles_for(128, 256) = 64*2 = 128 (still <256),
-        // so falls to Tile128x64. To hit Tile128x256 we need a wider shape:
-        // 8192x1024 → 64*4 = 256 ✓.
-        assert_eq!(
-            select(8192, 1024, 1024, 256),
             Some(CoopTile::new(128, 256, 16))
         );
-        // N=128 doesn't divide 256 so Tile128x256/Tile128x512 are out; falls
-        // back to Tile128x64.
+        assert_eq!(
+            select(8192, 1024, 1024, 256),
+            Some(CoopTile::new(128, 512, 16))
+        );
+        assert_eq!(
+            select(4096, 1024, 1024, 256),
+            Some(CoopTile::new(128, 512, 16))
+        );
+        // Measured flat at 384x1024x1024 (3.20 TF/s for every tile tried).
+        assert_eq!(
+            select(384, 1024, 1024, 512),
+            Some(CoopTile::new(128, 512, 16))
+        );
+        // N=4352 divides 256 but not 512: 128x256 is the least-staging
+        // zero-pad mergeable profile.
+        assert_eq!(
+            select(8192, 1024, 4352, 512),
+            Some(CoopTile::new(128, 256, 16))
+        );
+        // The re-profiled 128x128 tile is the natural zero-pad choice for
+        // N=128 (and ties 128x64 at the training shape: 6.94 vs 6.95).
         assert_eq!(
             select(1024, 1024, 128, 256),
-            Some(CoopTile::new(128, 64, 16))
+            Some(CoopTile::new(128, 128, 16))
         );
+        assert_eq!(
+            select(16384, 384, 384, 512),
+            Some(CoopTile::new(128, 128, 16))
+        );
+        // Lane-capped devices keep the ≤4-subgroup entries.
         assert_eq!(
             select(1024, 1024, 1024, 128),
             Some(CoopTile::new(64, 64, 16))
         );
-        // M=1000 divides nothing: the masked-edge fallback picks the tile
-        // with the least padded work (all candidates pad M to 1024; the
-        // preference order breaks the tie toward the biggest tile).
+        // M=1000 divides nothing: every 128-row tile pads M to 1024
+        // equally; staging then prefers the fattest tile (128x512 measured
+        // 4.18 TF/s vs 16x64's 3.85 here).
         assert_eq!(
             select(1000, 1024, 1024, 512),
-            Some(CoopTile::new(128, 64, 16))
+            Some(CoopTile::new(128, 512, 16))
         );
-        // N=16 shapes route to the small-side (64, 16) tile (M pads
-        // 1000 → 1024, well inside the bound).
+        // N=16 shapes take the small-side (64, 16) tile.
         assert_eq!(select(1000, 1024, 16, 512), Some(CoopTile::new(64, 16, 16)));
         // True gemv shapes (one axis tiny beyond what padding allows) stay
         // on the generic path.
@@ -483,9 +484,8 @@ mod selection_tests {
     }
 
     #[test]
-    fn small_side_tiles_select_only_after_primary_declines() {
-        let select =
-            |m, k, n, max_workgroup_size_x| CoopTile::select(m, k, n, max_workgroup_size_x, 32);
+    fn small_side_and_edge_selection_pins() {
+        let select = select_with_lanes;
         // Aligned small-side shapes: the attention head_dim family.
         assert_eq!(select(64, 64, 16, 512), Some(CoopTile::new(64, 16, 16)));
         assert_eq!(select(16, 64, 64, 512), Some(CoopTile::new(16, 64, 16)));
@@ -498,10 +498,46 @@ mod selection_tests {
         // contractions stay generic.
         assert_eq!(select(16, 64, 16, 512), None);
         assert_eq!(select(17, 64, 17, 512), None);
-        // Shapes the primary ladder already served keep their exact tile.
         assert_eq!(select(64, 64, 64, 512), Some(CoopTile::new(64, 64, 16)));
+        // N=112: the 14%-padded (64, 128) stages 7x less than the zero-pad
+        // (64, 16) chain of tiles and wins the combined cost — the same
+        // choice the old ladder made.
         assert_eq!(select(64, 512, 112, 512), Some(CoopTile::new(64, 128, 16)));
         assert_eq!(select(128, 1024, 64, 512), Some(CoopTile::new(128, 64, 16)));
+    }
+
+    /// Every selection must be legal and within the padding bound for every
+    /// (shape, caps) combination — the properties the scorer guarantees by
+    /// construction, checked over a deterministic sweep.
+    #[test]
+    fn scored_selection_properties() {
+        let mut lcg = 0x5eed_1234u64;
+        let mut next = |range: u32| {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+             ((lcg >> 33) as u32) % range + 1
+        };
+        for _ in 0..2000 {
+            let (m, k, n) = (next(9000), next(5000), next(9000));
+            let max_lanes = [128u32, 256, 512, 1024][(next(4) - 1) as usize];
+            let Some(tile) = select_with_lanes(m, k, n, max_lanes) else {
+                continue;
+            };
+            let entry = fusor_tile_ir_kernels::coop_tile_entries()
+                .iter()
+                .find(|entry| entry.tile.bm == tile.bm && entry.tile.bn == tile.bn)
+                .expect("selected tile must exist in the kernel table");
+            let threads = entry.row_groups * entry.col_groups * 32;
+            assert!(
+                threads <= max_lanes,
+                "m={m} k={k} n={n} lanes={max_lanes}: illegal tile {tile:?}"
+            );
+            let padded = u64::from(m.div_ceil(tile.bm)) * u64::from(tile.bm)
+                * u64::from(n.div_ceil(tile.bn)) * u64::from(tile.bn);
+            assert!(
+                padded * 4 <= u64::from(m) * u64::from(n) * 5,
+                "m={m} k={k} n={n}: padding bound violated by {tile:?}"
+            );
+        }
     }
 }
 

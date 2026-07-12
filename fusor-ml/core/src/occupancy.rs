@@ -79,6 +79,16 @@ impl DispatchPolicy {
         FULL_WORKGROUP_LANES.min(self.max_workgroup_lanes)
     }
 
+    /// Hardware cap on one workgroup's invocations.
+    pub(crate) fn max_workgroup_lanes(&self) -> u32 {
+        self.max_workgroup_lanes
+    }
+
+    /// The device-parallelism floor (see [`crate::Device::saturation_lanes`]).
+    pub(crate) fn saturation_lanes(&self) -> u32 {
+        self.saturation_lanes
+    }
+
     /// Smallest workgroup worth a subgroup-accelerated whole-block
     /// reduction: two subgroups — one subgroup makes the cross-subgroup
     /// combine tree degenerate.

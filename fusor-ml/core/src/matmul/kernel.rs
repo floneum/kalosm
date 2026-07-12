@@ -240,9 +240,7 @@ impl MatMulOperation {
             m,
             k,
             n,
-            limits
-                .max_compute_workgroup_size_x
-                .min(limits.max_compute_invocations_per_workgroup),
+            &device.dispatch_policy(),
             subgroup_config.max_size(),
         )?;
         let total_tiles = m

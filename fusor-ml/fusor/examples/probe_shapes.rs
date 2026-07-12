@@ -645,6 +645,50 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
                 println!("  f={f} got={got} want={want}");
             }
         }
+        // timed matmul: probe_shapes matmul_bench M K N [iters]
+        "matmul_bench" => {
+            let dims: Vec<usize> = std::env::args()
+                .skip(2)
+                .map(|a| a.parse().unwrap())
+                .collect();
+            let (m, k, n) = (dims[0], dims[1], dims[2]);
+            let iters = dims.get(3).copied().unwrap_or(20);
+            let a = fill(m * k);
+            // Scale toward identity-ish magnitudes so a 40-deep chain
+            // neither overflows nor denormals out.
+            let b: Vec<f32> = fill(k * n).iter().map(|v| v * 0.05).collect();
+            let b_back: Vec<f32> = fill(n * k).iter().map(|v| v * 0.05).collect();
+            let at = Tensor::from_slice(&device, [m, k], &a);
+            let bt = Tensor::from_slice(&device, [k, n], &b);
+            // For k != n, alternate with an [n, k] partner so the chain's
+            // shapes ping-pong between m×n and m×k (both measured strides
+            // of the same geometry family).
+            let bt_back = Tensor::from_slice(&device, [n, k], &b_back);
+            // Warm the kernel cache and pipeline.
+            at.mat_mul(&bt).as_slice().await.unwrap();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                // A dependency chain defeats semantic-identity dedup and
+                // amortizes the single readback sync across all iterations.
+                let mut y = at.mat_mul(&bt);
+                for i in 1..iters {
+                    y = if i % 2 == 1 {
+                        y.mat_mul(&bt_back)
+                    } else {
+                        y.mat_mul(&bt)
+                    };
+                }
+                let _ = y.as_slice().await.unwrap();
+                best = best.min(start.elapsed().as_secs_f64() / iters as f64);
+            }
+            let flops = 2.0 * m as f64 * k as f64 * n as f64;
+            println!(
+                "matmul_bench {m}x{k}x{n}: min {:.3} ms/matmul, {:.2} TF/s",
+                best * 1e3,
+                flops / best / 1e12
+            );
+        }
         other => {
             eprintln!("unknown case {other}");
             std::process::exit(2);

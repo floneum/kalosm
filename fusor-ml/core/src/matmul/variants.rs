@@ -177,24 +177,21 @@ impl CoopTile {
             .is_some_and(|block| block <= max_workgroup_size_x)
     }
 
-    /// Pick a cooperative-matrix tile for the given (m, k, n) shape, returning
-    /// `None` when no coop tile fits. All entries use BK=16 to keep
-    /// double-buffered workgroup tiles inside Apple's 32 KB limit; the
-    /// (256, 256, 16) entry runs single-buffered in the inner perf kernel.
-    /// Heuristic: bigger tiles only fire when (M/BM)*(N/BN) clears a minimum
-    /// tile count so there's enough work for the GPU.
+    /// Pick a cooperative-matrix tile for the given (m, k, n) shape, or
+    /// `None` when no coop tile is worth it (degenerate contractions route
+    /// to the vector/generic families). Selection is the general scored
+    /// argmin over the full kernel tile table — see [`super::cost`].
     pub(super) fn select(
         m: u32,
         k: u32,
         n: u32,
-        max_workgroup_size_x: u32,
+        policy: &crate::occupancy::DispatchPolicy,
         max_subgroup_size: u32,
     ) -> Option<Self> {
-        if let Some(forced) = Self::forced_tile(max_workgroup_size_x, max_subgroup_size) {
+        if let Some(forced) = Self::forced_tile(policy.max_workgroup_lanes(), max_subgroup_size) {
             return Some(forced);
         }
-        Self::select_primary(m, k, n, max_workgroup_size_x, max_subgroup_size)
-            .or_else(|| Self::select_small_side(m, k, n, max_workgroup_size_x, max_subgroup_size))
+        super::cost::select_coop_tile(m, k, n, policy, max_subgroup_size)
     }
 
     /// Debug override: `FUSOR_FORCE_COOP_TILE=<bm>x<bn>` forces a specific
@@ -209,129 +206,4 @@ impl CoopTile {
             .then_some(tile)
     }
 
-    /// The primary tile ladder: every selection that predates the small-side
-    /// tiles goes through here unchanged, so shapes that already reached the
-    /// coop kernel keep the exact same tile.
-    fn select_primary(
-        m: u32,
-        k: u32,
-        n: u32,
-        max_workgroup_size_x: u32,
-        max_subgroup_size: u32,
-    ) -> Option<Self> {
-        let tiles_for = |bm: u32, bn: u32| -> u32 { (m / bm) * (n / bn) };
-        if m == 0 || n == 0 || k == 0 {
-            return None;
-        }
-        // Tile256x256 single-buffer has lower memory traffic (sqrt-min) but
-        // 2× the barriers of Tile128x512 double-buffer; only fires when N
-        // is divisible by 256 but not by 512.
-        if m.is_multiple_of(256)
-            && n.is_multiple_of(256)
-            && !n.is_multiple_of(512)
-            && tiles_for(256, 256) >= 256
-        {
-            let tile = Self::new(256, 256, 16);
-            if tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
-                return Some(tile);
-            }
-        }
-        if m.is_multiple_of(128) && n.is_multiple_of(512) && tiles_for(128, 512) >= 256 {
-            let tile = Self::new(128, 512, 16);
-            if tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
-                return Some(tile);
-            }
-        }
-        if m.is_multiple_of(128) && n.is_multiple_of(256) && tiles_for(128, 256) >= 256 {
-            let tile = Self::new(128, 256, 16);
-            if tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
-                return Some(tile);
-            }
-        }
-        if m.is_multiple_of(128) && n.is_multiple_of(64) {
-            let tile = Self::new(128, 64, 16);
-            if tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
-                return Some(tile);
-            }
-        }
-        if m.is_multiple_of(64) && n.is_multiple_of(128) {
-            let tile = Self::new(64, 128, 16);
-            if tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
-                return Some(tile);
-            }
-        }
-        if m.is_multiple_of(64) && n.is_multiple_of(64) {
-            let tile = Self::new(64, 64, 16);
-            if tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
-                return Some(tile);
-            }
-        }
-
-        // Shapes that divide no tile run with masked edge tiles: pick the
-        // candidate minimizing padded work, in preference order on ties.
-        // Selections whose padding inflates the output by more than a
-        // quarter stay on the generic path — that bound also keeps
-        // gemv-shaped contractions (tiny M or N) off the tile kernels.
-        // Candidates stick to geometries the aligned rules already reach
-        // (the (128, 128) table entry was never selectable and miscomputes).
-        let mut best: Option<(u64, Self)> = None;
-        for (bm, bn) in [(128, 64), (64, 128), (64, 64)] {
-            let tile = Self::new(bm, bn, 16);
-            if !tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
-                continue;
-            }
-            let padded = u64::from(m.div_ceil(bm) * bm) * u64::from(n.div_ceil(bn) * bn);
-            if padded * 4 > u64::from(m) * u64::from(n) * 5 {
-                continue;
-            }
-            if best.is_none_or(|(best_padded, _)| padded < best_padded) {
-                best = Some((padded, tile));
-            }
-        }
-        best.map(|(_, tile)| tile)
-    }
-
-    /// Second-chance selection for contractions with a 16-wide (or 16-padded)
-    /// M or N side — batched attention contractions like `P@V` (n = head_dim)
-    /// and `Qᵀ@dS` (m = head_dim), and narrow-vocab lm_head shapes. Runs only
-    /// after [`Self::select_primary`] declines, so no shape that reaches the
-    /// coop kernel today changes tile. The masked-edge candidates keep the
-    /// primary ladder's bound: padding may inflate the output by at most a
-    /// quarter, which still keeps gemv-shaped contractions (M and N both
-    /// tiny) on the generic path.
-    fn select_small_side(
-        m: u32,
-        k: u32,
-        n: u32,
-        max_workgroup_size_x: u32,
-        max_subgroup_size: u32,
-    ) -> Option<Self> {
-        const SMALL_SIDE_TILES: [(u32, u32); 2] = [(64, 16), (16, 64)];
-        if m == 0 || n == 0 || k == 0 {
-            return None;
-        }
-        for (bm, bn) in SMALL_SIDE_TILES {
-            if m.is_multiple_of(bm) && n.is_multiple_of(bn) {
-                let tile = Self::new(bm, bn, 16);
-                if tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
-                    return Some(tile);
-                }
-            }
-        }
-        let mut best: Option<(u64, Self)> = None;
-        for (bm, bn) in SMALL_SIDE_TILES {
-            let tile = Self::new(bm, bn, 16);
-            if !tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size) {
-                continue;
-            }
-            let padded = u64::from(m.div_ceil(bm) * bm) * u64::from(n.div_ceil(bn) * bn);
-            if padded * 4 > u64::from(m) * u64::from(n) * 5 {
-                continue;
-            }
-            if best.is_none_or(|(best_padded, _)| padded < best_padded) {
-                best = Some((padded, tile));
-            }
-        }
-        best.map(|(_, tile)| tile)
-    }
 }
