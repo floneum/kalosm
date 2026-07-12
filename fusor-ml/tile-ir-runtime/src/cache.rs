@@ -13,7 +13,7 @@ use parking_lot::RwLock;
 use rustc_hash::{FxBuildHasher, FxHasher};
 use wgpu::{BindGroupLayout, PipelineLayout};
 
-use crate::DirectPlanCache;
+use crate::KernelPlanCache;
 
 #[cfg(not(target_arch = "wasm32"))]
 const KERNEL_CACHE_SIZE: usize = 4096;
@@ -157,7 +157,7 @@ pub struct KernelCache {
     pub(crate) kernels: RwLock<LruCache<KernelCacheKey, Arc<CachedKernel>, FxBuildHasher>>,
     pub(crate) direct_dynamic_bind_group_cache:
         RwLock<LruCache<DirectDynamicBindGroupKey, CachedDirectBindGroup, FxBuildHasher>>,
-    direct_plan_cache: DirectPlanCache,
+    kernel_plan_cache: KernelPlanCache,
     direct_three_buffer_bind_group_layout: OnceLock<BindGroupLayout>,
     direct_three_buffer_pipeline_layout: OnceLock<PipelineLayout>,
 }
@@ -197,8 +197,8 @@ impl KernelCache {
             (None, None)
         };
 
-        let direct_plan_cache = DirectPlanCache::new();
-        direct_plan_cache.attach_disk(device_capability_fingerprint(&device));
+        let kernel_plan_cache = KernelPlanCache::new();
+        kernel_plan_cache.attach_disk(device_capability_fingerprint(&device));
 
         Self {
             device,
@@ -206,7 +206,7 @@ impl KernelCache {
             cache_file,
             kernels: make_lru(KERNEL_CACHE_SIZE),
             direct_dynamic_bind_group_cache: make_lru(DIRECT_DYNAMIC_BIND_GROUP_CACHE_SIZE),
-            direct_plan_cache,
+            kernel_plan_cache,
             direct_three_buffer_bind_group_layout: OnceLock::new(),
             direct_three_buffer_pipeline_layout: OnceLock::new(),
         }
@@ -216,8 +216,8 @@ impl KernelCache {
         &self.device
     }
 
-    pub fn direct_plan_cache(&self) -> &DirectPlanCache {
-        &self.direct_plan_cache
+    pub fn kernel_plan_cache(&self) -> &KernelPlanCache {
+        &self.kernel_plan_cache
     }
 
     pub fn direct_three_buffer_bind_group_layout(&self) -> BindGroupLayout {
@@ -371,12 +371,14 @@ fn device_capability_fingerprint(device: &wgpu::Device) -> u64 {
     limits.max_compute_workgroup_size_x.hash(&mut hasher);
     limits.max_compute_workgroup_size_y.hash(&mut hasher);
     limits.max_compute_workgroup_size_z.hash(&mut hasher);
-    limits.max_compute_invocations_per_workgroup.hash(&mut hasher);
-    limits.max_compute_workgroups_per_dimension.hash(&mut hasher);
-    limits.max_storage_buffers_per_shader_stage.hash(&mut hasher);
-    std::env::var_os("FUSOR_DISABLE_SUBGROUPS")
-        .is_some()
+    limits
+        .max_compute_invocations_per_workgroup
         .hash(&mut hasher);
-    std::env::var_os("FUSOR_LAST_LEVEL_CACHE_BYTES").hash(&mut hasher);
+    limits
+        .max_compute_workgroups_per_dimension
+        .hash(&mut hasher);
+    limits
+        .max_storage_buffers_per_shader_stage
+        .hash(&mut hasher);
     hasher.finish()
 }

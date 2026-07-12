@@ -318,8 +318,7 @@ impl DirectKernel {
                 })
             }
             DirectKernelKind::Dynamic { cached, bindings } => {
-                let (bind_group_layout, pipeline) =
-                    self.dynamic_pipeline(cache, cached, bindings);
+                let (bind_group_layout, pipeline) = self.dynamic_pipeline(cache, cached, bindings);
 
                 let bind_entries = bindings
                     .iter()
@@ -388,70 +387,70 @@ impl DirectKernel {
         cached: &Arc<CachedKernel>,
         bindings: &[DirectKernelBinding],
     ) -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
-                let bind_group_layout = cached
-                    .dynamic_bind_group_layout
-                    .get_or_init(|| {
-                        let layout_entries = bindings
-                            .iter()
-                            .map(|binding| wgpu::BindGroupLayoutEntry {
-                                binding: binding.binding,
-                                visibility: wgpu::ShaderStages::COMPUTE,
-                                ty: wgpu::BindingType::Buffer {
-                                    ty: wgpu::BufferBindingType::Storage {
-                                        read_only: binding.read_only,
-                                    },
-                                    has_dynamic_offset: false,
-                                    min_binding_size: None,
-                                },
-                                count: None,
-                            })
-                            .collect::<Vec<_>>();
-                        cache
-                            .device
-                            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                                label: Some(&self.name),
-                                entries: &layout_entries,
-                            })
+        let bind_group_layout = cached
+            .dynamic_bind_group_layout
+            .get_or_init(|| {
+                let layout_entries = bindings
+                    .iter()
+                    .map(|binding| wgpu::BindGroupLayoutEntry {
+                        binding: binding.binding,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage {
+                                read_only: binding.read_only,
+                            },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     })
-                    .clone();
+                    .collect::<Vec<_>>();
+                cache
+                    .device
+                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some(&self.name),
+                        entries: &layout_entries,
+                    })
+            })
+            .clone();
         let pipeline_layout = cached
-                    .dynamic_pipeline_layout
-                    .get_or_init(|| {
-                        cache
-                            .device
-                            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                                label: Some(&self.name),
-                                bind_group_layouts: &[Some(&bind_group_layout)],
-                                immediate_size: 0,
-                            })
+            .dynamic_pipeline_layout
+            .get_or_init(|| {
+                cache
+                    .device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some(&self.name),
+                        bind_group_layouts: &[Some(&bind_group_layout)],
+                        immediate_size: 0,
                     })
-                    .clone();
+            })
+            .clone();
 
-                let shader = cache.shader_for(cached);
-                let pipeline = cached
-                    .pipeline
-                    .get_or_init(|| {
-                        crate::note_compile(&format!(
-                            "pipeline name={} dispatch={:?} bindings={}",
-                            self.name,
-                            self.dispatch_size,
-                            bindings.len()
-                        ));
-                        cache
-                            .device
-                            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                                label: Some(&self.name),
-                                layout: Some(&pipeline_layout),
-                                module: shader,
-                                entry_point: Some("main"),
-                                cache: cache.wgpu_cache.as_ref(),
-                                compilation_options: PipelineCompilationOptions {
-                                    zero_initialize_workgroup_memory: false,
-                                    ..Default::default()
-                                },
-                            })
+        let shader = cache.shader_for(cached);
+        let pipeline = cached
+            .pipeline
+            .get_or_init(|| {
+                crate::note_compile(&format!(
+                    "pipeline name={} dispatch={:?} bindings={}",
+                    self.name,
+                    self.dispatch_size,
+                    bindings.len()
+                ));
+                cache
+                    .device
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some(&self.name),
+                        layout: Some(&pipeline_layout),
+                        module: shader,
+                        entry_point: Some("main"),
+                        cache: cache.wgpu_cache.as_ref(),
+                        compilation_options: PipelineCompilationOptions {
+                            zero_initialize_workgroup_memory: false,
+                            ..Default::default()
+                        },
                     })
-                    .clone();
+            })
+            .clone();
         (bind_group_layout, pipeline)
     }
 

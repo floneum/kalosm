@@ -60,7 +60,10 @@ pub(crate) enum DiskTemplateKind {
     },
     /// The singleton three-buffer (input, weight, output) fast-path layout;
     /// the pipeline is rebuilt from the module on revival.
-    Storage3 { module: naga::Module, subgroups: bool },
+    Storage3 {
+        module: naga::Module,
+        subgroups: bool,
+    },
     Sequence(Vec<DiskTemplate>),
 }
 
@@ -70,11 +73,8 @@ pub(crate) struct DiskPlanCache {
 
 impl DiskPlanCache {
     /// Open (creating if needed) the plan directory for this executable and
-    /// device fingerprint, or `None` when disabled or unresolvable.
+    /// device fingerprint, or `None` when its location is unresolvable.
     pub(crate) fn open(device_fingerprint: u64) -> Option<Self> {
-        if std::env::var_os("FUSOR_DISABLE_KERNEL_DISK_CACHE").is_some() {
-            return None;
-        }
         let base = match std::env::var_os("FUSOR_KERNEL_CACHE_DIR") {
             Some(dir) => PathBuf::from(dir),
             None => default_cache_dir()?,
@@ -148,12 +148,14 @@ fn remove_stale_salts(base: &std::path::Path) {
     };
     let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
-        let stale = entry.metadata().ok().and_then(|meta| meta.modified().ok()).is_some_and(
-            |modified| {
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .is_some_and(|modified| {
                 now.duration_since(modified)
                     .is_ok_and(|age| age > STALE_SALT_AGE)
-            },
-        );
+            });
         if stale {
             let _ = std::fs::remove_dir_all(entry.path());
         }

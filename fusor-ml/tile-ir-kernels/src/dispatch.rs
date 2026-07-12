@@ -65,11 +65,7 @@ impl QgemvShape {
 /// this (never a re-derived approximation): the launched grid and the
 /// kernel's internal `qgemv_grid` agree by construction only when both come
 /// from here.
-pub fn qgemv_selected_shape(
-    format: GgmlQuantFormat,
-    rows: u32,
-    output_cols: u32,
-) -> QgemvShape {
+pub fn qgemv_selected_shape(format: GgmlQuantFormat, rows: u32, output_cols: u32) -> QgemvShape {
     match format {
         GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native => {
             if output_cols >= 8192 {
@@ -288,5 +284,4 @@ mod tests {
         // Constant 2x2 from kernels/qgemv.rs.
         assert_eq!(q6k_default_tall(8192, 4096), QgemvShape::new(2, 2));
     }
-
 }

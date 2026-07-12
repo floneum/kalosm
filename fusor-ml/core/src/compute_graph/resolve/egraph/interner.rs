@@ -108,9 +108,25 @@ pub(super) fn variant_dependencies(variant: &ExecutionVariant) -> Vec<NodeIndex>
             use crate::mir::operation::Operation;
             op.visit_dependencies(&mut push);
         }
-        ExecutionVariant::GraphOp(op) => op.visit_dependencies(&mut push),
+        ExecutionVariant::RowProgram(op) => {
+            use crate::mir::operation::Operation;
+            op.visit_dependencies(&mut push);
+        }
     }
     deps
+}
+
+/// Exact equality for an execution-graph occurrence: semantic operation
+/// fields plus its concrete dependency slots. This is intentionally stricter
+/// than payload interning, which erases dependencies so equivalent e-nodes
+/// can share an e-class.
+pub(super) fn concrete_variant_eq(a: &ExecutionVariant, b: &ExecutionVariant) -> bool {
+    match (a, b) {
+        (ExecutionVariant::Assign(a), ExecutionVariant::Assign(b)) => {
+            a.input == b.input && a.value == b.value && a.slices == b.slices
+        }
+        _ => semantic_payload_eq(a, b) && variant_dependencies(a) == variant_dependencies(b),
+    }
 }
 
 /// Rewrite `variant`'s dependency slots — in `visit_dependencies` order — to
@@ -171,17 +187,10 @@ pub(super) fn rebind_variant_dependencies(variant: &mut ExecutionVariant, new: &
         ExecutionVariant::QEmbedding(op) => {
             op.indexes = slots.next().expect("qembedding rebind arity");
         }
-        // GraphOp payloads are identified by `Arc::ptr_eq`, so an interned
-        // GraphOp payload is always this exact object and its stored
-        // dependencies are already its own — nothing to rebind.
-        ExecutionVariant::GraphOp(op) => {
-            debug_assert_eq!(
-                variant_dependencies(&ExecutionVariant::GraphOp(op.clone())),
-                new,
-                "GraphOp payloads never conflate, so children must already match"
-            );
-            let _ = &mut slots;
-            return;
+        ExecutionVariant::RowProgram(op) => {
+            for input in &mut op.inputs {
+                *input = slots.next().expect("row program rebind arity");
+            }
         }
     }
     debug_assert!(
@@ -202,7 +211,7 @@ fn variant_tag(variant: &ExecutionVariant) -> u8 {
         ExecutionVariant::MatMul(_) => 7,
         ExecutionVariant::QMatMul(_) => 8,
         ExecutionVariant::QEmbedding(_) => 9,
-        ExecutionVariant::GraphOp(_) => 10,
+        ExecutionVariant::RowProgram(_) => 10,
     }
 }
 
@@ -221,7 +230,7 @@ fn hash_variant_fields(variant: &ExecutionVariant, hasher: &mut FxHasher) {
         ExecutionVariant::MatMul(op) => op.hash_kernel_fields(hasher),
         ExecutionVariant::QMatMul(op) => op.hash_kernel_fields(hasher),
         ExecutionVariant::QEmbedding(op) => op.hash_kernel_fields(hasher),
-        ExecutionVariant::GraphOp(op) => op.hash_kernel_fields(hasher),
+        ExecutionVariant::RowProgram(op) => op.hash_kernel_fields(hasher),
     }
 }
 
@@ -261,11 +270,11 @@ impl PayloadTable {
         id
     }
 
-    /// Append without semantic payload dedup. Stage-2 generates each concrete
+    /// Append without semantic payload dedup. Fusion generates each concrete
     /// occurrence once, so idempotence lookup buys nothing; the first planning
     /// occurrence still establishes its allocation-independent spec. Repeated
     /// occurrences use [`Self::push_unique_with_spec`] and skip that structural
-    /// hash too. Stage-1 saturation must keep using [`Self::intern`], because
+    /// hash too. Saturation must keep using [`Self::intern`], because
     /// its convergence detection relies on semantic dedup.
     pub(super) fn push_unique(&mut self, variant: ExecutionVariant) -> PayloadId {
         let key = payload_key(&variant);
@@ -397,10 +406,12 @@ fn planning_payload_eq(a: &ExecutionVariant, b: &ExecutionVariant) -> bool {
                 && a.out_shape == b.out_shape
                 && a.datatype == b.datatype
         }
-        (ExecutionVariant::GraphOp(a), ExecutionVariant::GraphOp(b)) => {
-            // GraphOperation has no structural equality contract. Keep its
-            // allocation identity until that contract exists.
-            std::sync::Arc::ptr_eq(a, b)
+        (ExecutionVariant::RowProgram(a), ExecutionVariant::RowProgram(b)) => {
+            let mut a = a.clone();
+            let mut b = b.clone();
+            a.inputs.clear();
+            b.inputs.clear();
+            a == b
         }
         // Effects and multi-output regions are observation-specific.
         (ExecutionVariant::Assign(_), ExecutionVariant::Assign(_))
@@ -472,8 +483,12 @@ fn semantic_payload_eq(a: &ExecutionVariant, b: &ExecutionVariant) -> bool {
             b.indexes = zero;
             a == b
         }
-        (ExecutionVariant::GraphOp(a), ExecutionVariant::GraphOp(b)) => {
-            std::sync::Arc::ptr_eq(a, b)
+        (ExecutionVariant::RowProgram(a), ExecutionVariant::RowProgram(b)) => {
+            let mut a = a.clone();
+            let mut b = b.clone();
+            a.inputs.clear();
+            b.inputs.clear();
+            a == b
         }
         // Effects and multi-output regions are observation-specific.
         (ExecutionVariant::Assign(_), ExecutionVariant::Assign(_))

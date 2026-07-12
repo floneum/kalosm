@@ -148,7 +148,7 @@ impl Resolver {
             graph,
             node_idx,
             &dependencies,
-            ExecutionVariant::GraphOp(Arc::new(operation)),
+            ExecutionVariant::RowProgram(operation),
         );
         true
     }

@@ -526,10 +526,6 @@ mod tests {
     /// browser. The suite internally expands each case across the
     /// {subgroups, no subgroups} × {cold pool, poisoned pool} device matrix, so
     /// the no-subgroup kernel fallbacks the web build takes are covered natively.
-    ///
-    /// To approximate the browser quantized storage layout on a native GPU, set
-    /// `FUSOR_Q_NATIVE=0` to force the `GpuF32Scales` layout (the web build
-    /// disables `SHADER_F16`, so it never uses the native f16-scale layout).
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn webgpu_kernel_suite_runs_on_gpu() {

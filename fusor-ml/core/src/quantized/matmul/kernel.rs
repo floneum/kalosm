@@ -414,7 +414,10 @@ impl QMatMulOperation {
         // body below both consume this value, so they cannot disagree.
         let qgemv_shape = tile_ir_kernels::qgemv_selected_shape(format, k, n);
         if !use_workgroup_qmatmul
-            && matches!(variant, QMatmulPath::Q5SmallSingleRow | QMatmulPath::SingleRow)
+            && matches!(
+                variant,
+                QMatmulPath::Q5SmallSingleRow | QMatmulPath::SingleRow
+            )
         {
             let qgemv_workgroups = n.div_ceil(qgemv_shape.cols_per_workgroup());
             let [dispatch_x, _] = split_workgroups_2d(qgemv_workgroups, max_workgroups)?;

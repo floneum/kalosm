@@ -192,9 +192,8 @@ fn weighted_sum_fuses_to_single_kernel() {
         };
 
         // `sum_k w[k] * x[m, k]`: the k-dependent inputs share no (row, col)
-        // pair. Lowers serially by default; with the cache threshold forced
-        // down (FUSOR_LAST_LEVEL_CACHE_BYTES) it takes the 1D register
-        // tiling — correct either way.
+        // pair. The automatic dispatch policy decides whether to use the 1D
+        // register tiling; both legal lowerings are reference-correct.
         let (m, k) = (512usize, 64usize);
         let x_values = pattern(m * k, 0.13);
         let w_values = pattern(k, 0.07);

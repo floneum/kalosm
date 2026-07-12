@@ -4,7 +4,7 @@ use parking_lot::RwLock;
 pub use petgraph::graph::NodeIndex;
 use petgraph::prelude::StableGraph;
 use resolve::Resolver;
-use resolve::flush_replay::{self, FlushPlanEntry, ReplayAction};
+use resolve::flush_replay::{self, ReplayAction};
 use rustc_hash::FxHashMap;
 #[cfg(feature = "graphvis")]
 use tabbycat::Graph;
@@ -20,14 +20,9 @@ mod tests;
 mod visualize;
 
 use crate::{
-    DataTypeEnum, Device, QMatrix, ReduceOperation,
-    compute_graph::resolve::ResolverResult,
-    dequantize::DequantizeOperation,
-    mir::{inputs::MirValue, operation::Operation},
-    nary_wise::ElementwiseOperation,
-    slice_assign::SliceAssignOperation,
-    tensor::TensorData,
-    view::ViewOperation,
+    DataTypeEnum, Device, QMatrix, ReduceOperation, compute_graph::resolve::ResolverResult,
+    dequantize::DequantizeOperation, nary_wise::ElementwiseOperation,
+    slice_assign::SliceAssignOperation, tensor::TensorData, view::ViewOperation,
     visit_tiled::MaybeQData,
 };
 
@@ -66,13 +61,6 @@ impl ComputeGraph {
 
     pub(crate) fn create_view(&self, op: ViewOperation) -> NodeIndex {
         self.create_node(ComputeGraphNodeVariant::View(op))
-    }
-
-    /// Build and submit one operation immediately against already-cached
-    /// inputs, bypassing the graph. Used by tuning APIs whose kernel
-    /// parameters cannot round-trip through the composed vocabulary.
-    pub(crate) fn execute_eager(&self, operation: &dyn Operation) -> Option<TensorData> {
-        self.with_mut(|inner| inner.execute_eager(operation))
     }
 
     /// Clone the view at `key` if that node is an unresolved view. Used to
@@ -135,25 +123,6 @@ impl ComputeGraph {
             };
         }
 
-        let (direct, removed) = {
-            let mut inner = self.inner.write();
-            let mut removed = Vec::new();
-            let data = inner.try_resolve_direct_qmatmul(key);
-            if data.is_some() {
-                inner.try_auto_flush(&mut removed);
-            }
-            inner.prune_deferred_dead(&mut removed);
-            #[cfg(feature = "extra_assertions")]
-            {
-                inner.verify_integrity()
-            }
-            (data, removed)
-        };
-        drop(removed);
-        if let Some(data) = direct {
-            return data;
-        }
-
         let (data, removed) = {
             let mut inner = self.inner.write();
             let mut removed = Vec::new();
@@ -200,42 +169,10 @@ impl ComputeGraph {
             );
         }
 
-        let mut tail = Some(tail);
-        let (direct, removed) = {
-            let mut inner = self.inner.write();
-            let mut removed = Vec::new();
-            let direct = inner.try_encode_direct_qmatmul(key).map(
-                |(device, result, mut command_encoder)| {
-                    let tail_result = tail.take().expect("resolver tail is consumed exactly once")(
-                        &result.data,
-                        &mut command_encoder,
-                    );
-                    device.wgpu_queue().submit(Some(command_encoder.finish()));
-                    device.reset_initialized_buffers();
-                    inner.try_auto_flush(&mut removed);
-                    (result, tail_result)
-                },
-            );
-            inner.prune_deferred_dead(&mut removed);
-            #[cfg(feature = "extra_assertions")]
-            {
-                inner.verify_integrity()
-            }
-            (direct, removed)
-        };
-        drop(removed);
-        if let Some(direct) = direct {
-            return direct;
-        }
-
         let (data, removed, tail_result) = {
             let mut inner = self.inner.write();
             let mut removed = Vec::new();
-            let (data, tail_result) = inner.resolve_target_with_replay(
-                key,
-                &mut removed,
-                tail.expect("direct QMatMul did not consume the resolver tail"),
-            );
+            let (data, tail_result) = inner.resolve_target_with_replay(key, &mut removed, tail);
             inner.try_auto_flush(&mut removed);
             inner.prune_deferred_dead(&mut removed);
             #[cfg(feature = "extra_assertions")]
@@ -362,15 +299,6 @@ impl ComputeGraphNode {
     }
 }
 
-pub(crate) trait GraphOperation: Operation + Send + Sync {
-    /// The concrete row program behind this graph op, if it is one — lets
-    /// the horizontal merge pass recover fused row programs without a
-    /// blanket `Any` downcast.
-    fn as_row_program(&self) -> Option<&crate::row_program::RowProgramOperation> {
-        None
-    }
-}
-
 /// The graph vocabulary. Exactly three core operations — elementwise
 /// visitation, reduction, and zero-dispatch views — over tensor and
 /// quantized-matrix leaves, plus the in-place region write (pure data
@@ -419,11 +347,6 @@ pub(crate) struct ComputeGraphInner {
     // where the user would otherwise need to sprinkle explicit `resolve()`
     // calls. 0 disables.
     flush_threshold: usize,
-    // Number of `QMatrix` nodes currently in the graph. O(1) structural gate
-    // for the flush-plan replay path: quantized decode/vision graphs must see
-    // zero behavior change, so a flush on a graph containing any QMatrix pays
-    // exactly one integer compare and takes the full-resolve path.
-    qmatrix_node_count: usize,
     // Incremental pending-sink set: every node with `reference_count > 0 &&
     // cached.is_none()`, tagged with a monotonically increasing insertion
     // sequence number. Replaces the O(all-nodes) scan in `flush_all_pending`
@@ -458,7 +381,6 @@ impl ComputeGraphInner {
             device: device.downgrade(),
             nodes: ComputeGraphNodes::default(),
             flush_threshold: read_flush_threshold(),
-            qmatrix_node_count: 0,
             pending_sinks: FxHashMap::default(),
             pending_seq: 0,
             deferred_dead: Vec::new(),
@@ -471,7 +393,6 @@ impl ComputeGraphInner {
             device,
             nodes: ComputeGraphNodes::default(),
             flush_threshold: 0,
-            qmatrix_node_count: 0,
             pending_sinks: FxHashMap::default(),
             pending_seq: 0,
             deferred_dead: Vec::new(),
@@ -496,19 +417,13 @@ impl ComputeGraphInner {
 
     /// Materialize every pending lazy output in a single batched resolve.
     ///
-    /// For QMatMul-free graphs (dense training tapes), consecutive flushes of
-    /// structurally identical pending subgraphs go through the flush-plan
-    /// replay cache: the first sighting of a fingerprint marks it seen, the
-    /// second records the full resolve into a replayable plan, and later
-    /// sightings replay it — skipping the execution-graph build, optimizer,
-    /// lowering and kernel building entirely.
+    /// Consecutive structurally identical pending subgraphs go through the
+    /// flush-plan replay cache: the first occurrence records the full resolve
+    /// and later occurrences replay it, skipping execution-graph building,
+    /// optimization, lowering, and kernel building.
     fn flush_all_pending(&mut self, removed: &mut Vec<ComputeGraphNode>) {
         // Enumerate pending sinks in insertion (tape-construction) order so
-        // fingerprints of isomorphic steps are deterministic. Frozen decode
-        // path: QMatMul graphs keep the historical `node_indices()` ascending
-        // enumeration exactly — insertion order diverges from index order
-        // once StableGraph recycles indices, and target order drives the
-        // per-target DFS, optimizer sweep order, and toposort tie-breaks.
+        // fingerprints of isomorphic steps are deterministic for every graph.
         let mut pending: Vec<(u64, NodeIndex)> = self
             .pending_sinks
             .iter()
@@ -521,11 +436,7 @@ impl ComputeGraphInner {
             })
             .map(|(&key, &seq)| (seq, key))
             .collect();
-        if self.qmatrix_node_count > 0 {
-            pending.sort_unstable_by_key(|&(_, key)| key);
-        } else {
-            pending.sort_unstable();
-        }
+        pending.sort_unstable();
         let pending: Vec<NodeIndex> = pending.into_iter().map(|(_, key)| key).collect();
         if pending.is_empty() {
             return;
@@ -541,9 +452,7 @@ impl ComputeGraphInner {
                 let mut resolver = Resolver::new_batch_with_recording(self, pending, fingerprint);
                 let _ = resolver.run(self, removed);
                 if let Some(plan) = resolver.take_recorded_plan() {
-                    self.device()
-                        .flush_plan_cache()
-                        .insert(key, FlushPlanEntry::Recorded(Arc::new(plan)));
+                    self.device().flush_plan_cache().insert(key, Arc::new(plan));
                 }
                 return;
             }
@@ -573,9 +482,7 @@ impl ComputeGraphInner {
                     Resolver::new_batch_with_recording(self, vec![target], fingerprint);
                 let result = resolver.run_with_tail(self, removed, tail);
                 if let Some(plan) = resolver.take_recorded_plan() {
-                    self.device()
-                        .flush_plan_cache()
-                        .insert(key, FlushPlanEntry::Recorded(Arc::new(plan)));
+                    self.device().flush_plan_cache().insert(key, Arc::new(plan));
                 }
                 result
             }
@@ -595,16 +502,12 @@ impl ComputeGraphInner {
     }
 
     fn create_node(&mut self, node: ComputeGraphNodeVariant) -> NodeIndex {
-        let is_qmatrix = matches!(node, ComputeGraphNodeVariant::QMatrix(_));
         let node = self.nodes.nodes.add_node(ComputeGraphNode {
             variant: node,
             reference_count: 1,
             live_descendant_count: 0,
             cached: None,
         });
-        if is_qmatrix {
-            self.qmatrix_node_count += 1;
-        }
         // New node has `reference_count = 1` and no cached result: pending.
         self.mark_pending(node);
         // New node has `reference_count = 1`, so it is alive. Adding edges
@@ -728,71 +631,6 @@ impl ComputeGraphInner {
         }
     }
 
-    fn ensure_tensor_cached(&mut self, key: NodeIndex) -> Option<()> {
-        if self.get_cached_result(key).is_some() {
-            return Some(());
-        }
-
-        let data = match self.nodes.nodes.node_weight(key)?.variant.clone() {
-            ComputeGraphNodeVariant::Tensor(data) => data,
-            _ => return None,
-        };
-        self.set_cached_result(key, data);
-        Some(())
-    }
-
-    fn try_encode_direct_qmatmul(
-        &mut self,
-        key: NodeIndex,
-    ) -> Option<(Device, ResolverResult, wgpu::CommandEncoder)> {
-        let operation = self.match_direct_qmatmul(key)?;
-        self.ensure_tensor_cached(operation.input)?;
-        Some(Resolver::encode_direct_operation(
-            self,
-            key,
-            Arc::new(operation),
-        ))
-    }
-
-    fn execute_eager(&mut self, operation: &dyn Operation) -> Option<TensorData> {
-        let device = self.device();
-        let inputs = operation.inputs(self);
-        let workgroup_shape = operation
-            .workgroup_shape_constraints(&device)
-            .solve(device.max_subgroup_size(), &device.limits())?;
-        let kernel_plan = operation
-            .build_direct_kernel_plan(self, &workgroup_shape, &inputs)
-            .ok()?;
-        let MirValue::Tensor(output) = operation.output(self, &inputs) else {
-            return None;
-        };
-
-        let mut command_encoder =
-            device
-                .wgpu_device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Eager Operation Encoder"),
-                });
-        let total_kernels = kernel_plan.dispatch_count();
-        for kernel in kernel_plan.into_kernels() {
-            kernel.run(device.kernel_cache(), &mut command_encoder);
-        }
-        if total_kernels > 0 {
-            device.wgpu_queue().submit(Some(command_encoder.finish()));
-            device.reset_initialized_buffers();
-        }
-        Some(output)
-    }
-
-    fn try_resolve_direct_qmatmul(&mut self, key: NodeIndex) -> Option<ResolverResult> {
-        let (device, result, command_encoder) = self.try_encode_direct_qmatmul(key)?;
-        if result.total_kernels > 0 {
-            device.wgpu_queue().submit(Some(command_encoder.finish()));
-            device.reset_initialized_buffers();
-        }
-        Some(result)
-    }
-
     fn remove_reference(&mut self, key: NodeIndex, removed: &mut Vec<ComputeGraphNode>) {
         let (transitioned_dead, still_referenced) = {
             let node = self.nodes.nodes.node_weight_mut(key).unwrap();
@@ -858,9 +696,6 @@ impl ComputeGraphInner {
     fn remove_key(&mut self, key: NodeIndex, removed: &mut Vec<ComputeGraphNode>) {
         // Remove the node from the graph (this also removes all edges)
         if let Some(node) = self.nodes.nodes.remove_node(key) {
-            if matches!(node.variant, ComputeGraphNodeVariant::QMatrix(_)) {
-                self.qmatrix_node_count = self.qmatrix_node_count.saturating_sub(1);
-            }
             // A removable node has `reference_count == 0`, so it should
             // already be out of the pending set; defensive removal keeps the
             // set exact even if that invariant ever slips.
@@ -1047,24 +882,5 @@ impl ComputeGraphInner {
                 "pending_sinks contains removed node {key:?}"
             );
         }
-
-        // Check that the O(1) qmatrix counter matches a full scan.
-        let qmatrix_nodes = self
-            .nodes
-            .nodes
-            .node_indices()
-            .filter(|&key| {
-                self.nodes
-                    .nodes
-                    .node_weight(key)
-                    .map(|n| matches!(n.variant, ComputeGraphNodeVariant::QMatrix(_)))
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(
-            self.qmatrix_node_count, qmatrix_nodes,
-            "qmatrix_node_count mismatch: counter {}, scan {qmatrix_nodes}",
-            self.qmatrix_node_count
-        );
     }
 }

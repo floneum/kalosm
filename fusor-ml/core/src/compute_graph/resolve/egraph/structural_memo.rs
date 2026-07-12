@@ -1,16 +1,14 @@
 //! Allocation-independent fusion-plan sharing.
 //!
 //! The value e-graph cannot equate two transformer layers: their activation
-//! and weight buffers are different values.  Fusion planning, however, only
-//! needs a bounded local window of operator shapes, layouts and liveness
-//! facts.  This module builds those windows in a second, private egg e-graph.
-//! Egg's hash-consing gives every isomorphic window one e-class, and the
-//! first occurrence records a rewrite template that later occurrences can
-//! instantiate by rebinding dependency roles and the concrete QMatrix.
+//! and weight buffers are different values. Fusion planning can still share
+//! allocation-independent structural templates. A compact structural
+//! interner canonicalizes those templates without creating a second e-graph;
+//! the first occurrence records a rewrite that later occurrences instantiate
+//! by rebinding dependency roles and the concrete QMatrix.
 
 use std::hash::Hash;
 
-use egg::{EGraph, Id, Language};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::ExecutionVariant;
@@ -22,40 +20,16 @@ use super::rules_fuse::FusionView;
 use crate::DataTypeEnum;
 use crate::compute_graph::NodeIndex;
 
-/// The deepest operation a single fusion generator can inspect. Views are
-/// canonicalized at construction (view-over-view is collapsed), so four
-/// expanded levels cover nary/reduce fusion and both sides of the qmatmul
-/// pre/post epilogue rules. The frontier still records exact value layout and
-/// liveness, but deliberately abstracts its producer history; that is what
-/// lets layer-local plans share without equating layer values.
-const PLANNING_WINDOW_DEPTH: usize = 4;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct PlanAtomId(u32);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum PlanLang {
-    Node(PlanAtomId, Box<[Id]>),
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct StructuralId(u32);
 
-impl Language for PlanLang {
-    fn matches(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Node(a, _), Self::Node(b, _)) => a == b,
-        }
-    }
-
-    fn children(&self) -> &[Id] {
-        match self {
-            Self::Node(_, children) => children,
-        }
-    }
-
-    fn children_mut(&mut self) -> &mut [Id] {
-        match self {
-            Self::Node(_, children) => children,
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StructuralNode {
+    atom: PlanAtomId,
+    children: Box<[StructuralId]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -95,7 +69,7 @@ struct PlanAtom {
 }
 
 pub(super) struct PlanInstance {
-    pub(super) root: Id,
+    pub(super) root: StructuralId,
     nodes: Vec<NodeIndex>,
     role_of: FxHashMap<NodeIndex, u32>,
 }
@@ -127,27 +101,28 @@ pub(super) struct PlanSharingStats {
     pub(super) misses: u64,
     pub(super) templates: u64,
     pub(super) negative_templates: u64,
-    pub(super) fallback_rebuilds: u64,
 }
 
 /// Per-resolve memo. It is intentionally not global: device capabilities,
 /// graph liveness and policy are part of a planning decision, while repeated
 /// layers within this resolve are the redundancy we want to remove.
 pub(super) struct FusionPlanMemo {
-    egraph: EGraph<PlanLang, ()>,
     atoms: Vec<PlanAtom>,
     atom_ids: FxHashMap<PlanAtom, PlanAtomId>,
-    decisions: FxHashMap<Id, PlanDecision>,
-    seen_windows: FxHashSet<Id>,
+    nodes: Vec<StructuralNode>,
+    node_ids: FxHashMap<StructuralNode, StructuralId>,
+    decisions: FxHashMap<StructuralId, PlanDecision>,
+    seen_windows: FxHashSet<StructuralId>,
     stats: PlanSharingStats,
 }
 
 impl Default for FusionPlanMemo {
     fn default() -> Self {
         Self {
-            egraph: EGraph::default(),
             atoms: Vec::new(),
             atom_ids: FxHashMap::default(),
+            nodes: Vec::new(),
+            node_ids: FxHashMap::default(),
             decisions: FxHashMap::default(),
             seen_windows: FxHashSet::default(),
             stats: PlanSharingStats::default(),
@@ -175,8 +150,7 @@ impl FusionPlanMemo {
             local_ids: FxHashMap::default(),
             matrix_aliases: FxHashMap::default(),
         };
-        let root = builder.add(inner, 0);
-        let root = builder.memo.egraph.find(root);
+        let root = builder.add(inner);
         builder.memo.seen_windows.insert(root);
         builder.memo.stats.unique_windows = builder.memo.seen_windows.len() as u64;
         PlanInstance {
@@ -194,16 +168,9 @@ impl FusionPlanMemo {
         self.stats.hits += 1;
         match decision {
             PlanDecision::NoRewrite => PlanLookup::Hit(None),
-            PlanDecision::Rewrite(template) => match template.instantiate(instance, view) {
-                Some(variant) => PlanLookup::Hit(Some(variant)),
-                None => {
-                    // A missing role means the window invariant changed in a
-                    // way its key did not capture. Recompute conservatively;
-                    // never apply a partially rebound template.
-                    self.stats.fallback_rebuilds += 1;
-                    PlanLookup::Miss
-                }
-            },
+            PlanDecision::Rewrite(template) => {
+                PlanLookup::Hit(Some(template.instantiate(instance, view)))
+            }
         }
     }
 
@@ -222,12 +189,7 @@ impl FusionPlanMemo {
                 PlanDecision::NoRewrite
             }
             Some(variant) => {
-                let Some(template) = VariantTemplate::capture(variant, instance, view) else {
-                    // Opaque/effectful variants do not have a safe generic
-                    // rebinding contract. They simply keep the per-instance
-                    // path instead of weakening correctness.
-                    return;
-                };
+                let template = VariantTemplate::capture(variant, instance, view);
                 self.stats.templates += 1;
                 PlanDecision::Rewrite(template)
             }
@@ -246,7 +208,7 @@ impl FusionPlanMemo {
         template.spec
     }
 
-    pub(super) fn record_spec(&mut self, root: Id, spec: SpecId) {
+    pub(super) fn record_spec(&mut self, root: StructuralId, spec: SpecId) {
         let Some(PlanDecision::Rewrite(template)) = self.decisions.get_mut(&root) else {
             return;
         };
@@ -265,6 +227,16 @@ impl FusionPlanMemo {
         self.atom_ids.insert(atom, id);
         id
     }
+
+    fn intern_node(&mut self, node: StructuralNode) -> StructuralId {
+        if let Some(&id) = self.node_ids.get(&node) {
+            return id;
+        }
+        let id = StructuralId(self.nodes.len() as u32);
+        self.nodes.push(node.clone());
+        self.node_ids.insert(node, id);
+        id
+    }
 }
 
 struct WindowBuilder<'a> {
@@ -274,12 +246,12 @@ struct WindowBuilder<'a> {
     view: &'a FusionView<'a>,
     nodes: Vec<NodeIndex>,
     role_of: FxHashMap<NodeIndex, u32>,
-    local_ids: FxHashMap<NodeIndex, Id>,
+    local_ids: FxHashMap<NodeIndex, StructuralId>,
     matrix_aliases: FxHashMap<usize, u32>,
 }
 
 impl WindowBuilder<'_> {
-    fn add(&mut self, inner: NodeIndex, depth: usize) -> Id {
+    fn add(&mut self, inner: NodeIndex) -> StructuralId {
         if let Some(&id) = self.local_ids.get(&inner) {
             return id;
         }
@@ -294,13 +266,12 @@ impl WindowBuilder<'_> {
 
         let prov = self.driver.prov_of.get(&inner).copied();
         let facts = prov.map(|prov| self.driver.egraph.analysis.facts_of(prov));
-        let expanded = depth < PLANNING_WINDOW_DEPTH;
-        let variant = expanded.then(|| self.view.variant_of(inner)).flatten();
+        let variant = self.view.variant_of(inner);
         // Rules only look through these five pure operator families. Other
         // operations are materialization frontiers: their output layout and
         // liveness matter, but their private implementation/allocation does
-        // not. Treating row programs and embeddings this way is particularly
-        // important for repeated transformer blocks.
+        // not. Embeddings and effectful/multi-output nodes stay frontiers;
+        // row programs have a structural equality and rebinding contract.
         let opaque = variant.is_some_and(|variant| {
             matches!(
                 variant,
@@ -308,7 +279,6 @@ impl WindowBuilder<'_> {
                     | ExecutionVariant::Assign(_)
                     | ExecutionVariant::Region(_)
                     | ExecutionVariant::QEmbedding(_)
-                    | ExecutionVariant::GraphOp(_)
             )
         });
         let matrix_alias = (!opaque)
@@ -320,7 +290,7 @@ impl WindowBuilder<'_> {
                 let next = self.matrix_aliases.len() as u32;
                 *self.matrix_aliases.entry(allocation).or_insert(next)
             });
-        let (kind, dependencies) = if !expanded || opaque {
+        let (kind, dependencies) = if opaque {
             (PlanNodeKind::Frontier, Vec::new())
         } else if let Some(variant) = variant {
             let kind = match variant {
@@ -361,39 +331,35 @@ impl WindowBuilder<'_> {
             is_target: facts.is_some_and(|facts| facts.is_target),
         };
         let atom = self.memo.intern_atom(atom);
-        let children: Vec<Id> = dependencies
+        let children: Vec<StructuralId> = dependencies
             .into_iter()
-            .map(|dependency| self.add(dependency, depth + 1))
+            .map(|dependency| self.add(dependency))
             .collect();
-        let id = self
-            .memo
-            .egraph
-            .add(PlanLang::Node(atom, children.into_boxed_slice()));
+        let id = self.memo.intern_node(StructuralNode {
+            atom,
+            children: children.into_boxed_slice(),
+        });
         self.local_ids.insert(inner, id);
         id
     }
 }
 
 impl VariantTemplate {
-    fn capture(
-        variant: &ExecutionVariant,
-        instance: &PlanInstance,
-        view: &FusionView<'_>,
-    ) -> Option<Self> {
-        if matches!(
-            variant,
-            ExecutionVariant::Tensor(_)
-                | ExecutionVariant::QMatrix(_)
-                | ExecutionVariant::Assign(_)
-                | ExecutionVariant::Region(_)
-                | ExecutionVariant::GraphOp(_)
-        ) {
-            return None;
-        }
+    fn capture(variant: &ExecutionVariant, instance: &PlanInstance, view: &FusionView<'_>) -> Self {
+        assert!(
+            !matches!(
+                variant,
+                ExecutionVariant::Tensor(_)
+                    | ExecutionVariant::QMatrix(_)
+                    | ExecutionVariant::Assign(_)
+                    | ExecutionVariant::Region(_)
+            ),
+            "fusion generators must produce a structurally rebindable variant"
+        );
         let dependency_roles = variant_dependencies(variant)
             .into_iter()
-            .map(|dependency| instance.role_of.get(&dependency).copied())
-            .collect::<Option<Vec<_>>>()?;
+            .map(|dependency| instance.role_of[&dependency])
+            .collect();
         let matrix_role = matrix_of(variant).and_then(|matrix| {
             instance
                 .nodes
@@ -405,39 +371,41 @@ impl VariantTemplate {
                 })
                 .map(|role| role as u32)
         });
-        if matrix_of(variant).is_some() && matrix_role.is_none() {
-            return None;
-        }
-        Some(Self {
+        assert!(
+            matrix_of(variant).is_none() || matrix_role.is_some(),
+            "quantized fusion template matrix must be part of its structural window"
+        );
+        Self {
             variant: variant.clone(),
             dependency_roles,
             matrix_role,
             spec: None,
-        })
+        }
     }
 
-    fn instantiate(
-        &self,
-        instance: &PlanInstance,
-        view: &FusionView<'_>,
-    ) -> Option<ExecutionVariant> {
+    fn instantiate(&self, instance: &PlanInstance, view: &FusionView<'_>) -> ExecutionVariant {
         let dependencies = self
             .dependency_roles
             .iter()
-            .map(|&role| instance.nodes.get(role as usize).copied())
-            .collect::<Option<Vec<_>>>()?;
+            .map(|&role| instance.nodes[role as usize])
+            .collect::<Vec<_>>();
         let mut variant = self.variant.clone();
         rebind_variant_dependencies(&mut variant, &dependencies);
         if let Some(role) = self.matrix_role {
-            let inner = *instance.nodes.get(role as usize)?;
-            let matrix = matrix_of(view.variant_of(inner)?)?.clone();
+            let inner = instance.nodes[role as usize];
+            let matrix = matrix_of(
+                view.variant_of(inner)
+                    .expect("template matrix role must have a selected variant"),
+            )
+            .expect("template matrix role must remain quantized")
+            .clone();
             match &mut variant {
                 ExecutionVariant::QMatMul(operation) => operation.matrix = matrix,
                 ExecutionVariant::QEmbedding(operation) => operation.matrix = matrix,
-                _ => return None,
+                _ => unreachable!("only quantized variants carry a matrix role"),
             }
         }
-        Some(variant)
+        variant
     }
 }
 
@@ -458,7 +426,7 @@ fn same_matrix_allocation(a: &crate::quantized::QMatrix, b: &crate::quantized::Q
 mod tests {
     use super::*;
     use crate::compute_graph::resolve::Resolver;
-    use crate::compute_graph::resolve::egraph::rules_fuse::Stage2Ctx;
+    use crate::compute_graph::resolve::egraph::rules_fuse::FusionCtx;
     use crate::{Device, QMatrix, Tensor};
 
     #[test]
@@ -480,7 +448,7 @@ mod tests {
                 }
                 let driver = EGraphDriver::ingest(&resolver, graph);
                 let state = ExtractState::new(&driver);
-                let ctx = Stage2Ctx {
+                let ctx = FusionCtx {
                     graph,
                     layouts: std::cell::RefCell::new(Default::default()),
                 };
@@ -565,7 +533,7 @@ mod tests {
                 }
                 let driver = EGraphDriver::ingest(&resolver, graph);
                 let state = ExtractState::new(&driver);
-                let ctx = Stage2Ctx {
+                let ctx = FusionCtx {
                     graph,
                     layouts: std::cell::RefCell::new(Default::default()),
                 };
@@ -664,7 +632,11 @@ mod tests {
                 for &target in &targets {
                     resolver.build_execution_graph(graph, target);
                 }
-                resolver.recognize_operations(graph);
+                let mut driver =
+                    EGraphDriver::ingest_for_recognition(&resolver, graph).run_recognition();
+                let extraction = driver.extract();
+                resolver.apply_egraph_deltas(graph, &driver, &extraction);
+                resolver.recognize_attention(graph);
                 assert_eq!(
                     resolver
                         .execution_graph
@@ -677,13 +649,22 @@ mod tests {
                     qmatmuls.len(),
                     "every observation of a shared e-class must be specialized"
                 );
-                let driver = EGraphDriver::ingest(&resolver, graph);
-                let state = ExtractState::new(&driver);
-                let ctx = Stage2Ctx {
+                let state = ExtractState::from_execution(&mut driver, &resolver);
+                let ctx = FusionCtx {
                     graph,
                     layouts: std::cell::RefCell::new(Default::default()),
                 };
                 let view = FusionView::new(&driver, &state, &ctx);
+                assert_eq!(
+                    variant_dependencies(view.variant_of(qmatmuls[0]).unwrap()),
+                    vec![activations[0].data().key],
+                    "a synchronized alternative must keep the first occurrence's concrete dependencies"
+                );
+                assert_eq!(
+                    variant_dependencies(view.variant_of(qmatmuls[2]).unwrap()),
+                    vec![activations[2].data().key],
+                    "a synchronized alternative must keep this occurrence's concrete dependencies"
+                );
                 // Use the unique left-weight observation here; qmatmuls[0]
                 // deliberately shares a value e-class with the duplicate
                 // pair below and therefore has an aggregated read count.

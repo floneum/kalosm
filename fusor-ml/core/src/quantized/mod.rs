@@ -1,124 +1,14 @@
-use std::{borrow::Cow, mem::size_of, num::NonZeroUsize, sync::Arc};
+use std::{borrow::Cow, mem::size_of, sync::Arc};
 
-use crate::{Device, Layout};
+use crate::Device;
 use fusor_gguf::{
     BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, GgmlType, GgufBlock,
     GgufMetadata, GgufReadError, GgufTensorMetadata,
 };
-use lru::LruCache;
-use parking_lot::RwLock;
-use rustc_hash::FxBuildHasher;
 
 pub(crate) mod dequantize;
 pub(crate) mod embedding;
 pub(crate) mod matmul;
-
-const QMATRIX_DIRECT_PIPELINE_CACHE_SIZE: usize = 16;
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct QMatMulDirectPipelineKey {
-    format: u8,
-    storage_layout: QMatrixStorageLayout,
-    m: u32,
-    k: u32,
-    n: u32,
-    // Structural hash of attached epilogues and lowering-only choices.
-    // Zero for plain qmatmul; non-zero values disambiguate kernels whose
-    // bindings/dispatch are otherwise identical.
-    epilogue_identity: u64,
-    subgroup_size_range: [u32; 2],
-    dispatch_size: [u32; 3],
-    input_layout: QMatMulDirectLayoutKey,
-    output_layout: QMatMulDirectLayoutKey,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct QMatMulShape {
-    pub m: u32,
-    pub k: u32,
-    pub n: u32,
-}
-
-impl QMatMulDirectPipelineKey {
-    pub(crate) fn new(
-        format: GgmlType,
-        storage_layout: QMatrixStorageLayout,
-        shape: QMatMulShape,
-        subgroup_size_range: [u32; 2],
-        dispatch_size: [u32; 3],
-        input_layout: &Layout,
-        output_layout: &Layout,
-    ) -> Self {
-        Self::new_with_epilogue(
-            format,
-            storage_layout,
-            shape,
-            0,
-            subgroup_size_range,
-            dispatch_size,
-            input_layout,
-            output_layout,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_with_epilogue(
-        format: GgmlType,
-        storage_layout: QMatrixStorageLayout,
-        shape: QMatMulShape,
-        epilogue_identity: u64,
-        subgroup_size_range: [u32; 2],
-        dispatch_size: [u32; 3],
-        input_layout: &Layout,
-        output_layout: &Layout,
-    ) -> Self {
-        let QMatMulShape { m, k, n } = shape;
-        Self {
-            format: format as u8,
-            storage_layout,
-            m,
-            k,
-            n,
-            epilogue_identity,
-            subgroup_size_range,
-            dispatch_size,
-            input_layout: QMatMulDirectLayoutKey::new(input_layout),
-            output_layout: QMatMulDirectLayoutKey::new(output_layout),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum QMatMulDirectLayoutKey {
-    Rank2 {
-        offset: usize,
-        shape: [usize; 2],
-        strides: [usize; 2],
-    },
-    General {
-        offset: usize,
-        shape: Box<[usize]>,
-        strides: Box<[usize]>,
-    },
-}
-
-impl QMatMulDirectLayoutKey {
-    fn new(layout: &Layout) -> Self {
-        if layout.shape().len() == 2 && layout.strides().len() == 2 {
-            Self::Rank2 {
-                offset: layout.offset(),
-                shape: [layout.shape()[0], layout.shape()[1]],
-                strides: [layout.strides()[0], layout.strides()[1]],
-            }
-        } else {
-            Self::General {
-                offset: layout.offset(),
-                shape: layout.shape().into(),
-                strides: layout.strides().into(),
-            }
-        }
-    }
-}
 
 fn padded_copy_size(size: u64) -> u64 {
     let align_mask = wgpu::COPY_BUFFER_ALIGNMENT - 1;
@@ -209,23 +99,6 @@ pub(crate) enum QMatrixStorageLayout {
     GpuF32Scales,
 }
 
-fn env_bool(value: &str) -> Option<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" | "native" => Some(true),
-        "0" | "false" | "no" | "off" | "expanded" | "f32" => Some(false),
-        _ => None,
-    }
-}
-
-fn native_half_scale_storage_enabled(
-    shader_f16_supported: bool,
-    env_override: Option<&str>,
-) -> bool {
-    env_override
-        .and_then(env_bool)
-        .unwrap_or(shader_f16_supported)
-}
-
 fn qmatrix_storage_layout_for_parts(
     ty: GgmlType,
     shader_f16_supported: bool,
@@ -235,20 +108,12 @@ fn qmatrix_storage_layout_for_parts(
         let _ = shader_f16_supported;
         false
     };
-    qmatrix_storage_layout_for_parts_with_env(
-        ty,
-        shader_f16_supported,
-        std::env::var("FUSOR_Q_NATIVE")
-            .ok()
-            .or_else(|| std::env::var("FUSOR_Q4K_NATIVE").ok())
-            .as_deref(),
-    )
+    qmatrix_storage_layout_for_parts_with_capability(ty, shader_f16_supported)
 }
 
-fn qmatrix_storage_layout_for_parts_with_env(
+fn qmatrix_storage_layout_for_parts_with_capability(
     ty: GgmlType,
     shader_f16_supported: bool,
-    env_override: Option<&str>,
 ) -> QMatrixStorageLayout {
     // Q6K is always stored with f32 scales. Its native block is 210 bytes —
     // not a multiple of 4 — so blocks past the first are not word-aligned, which
@@ -263,7 +128,7 @@ fn qmatrix_storage_layout_for_parts_with_env(
     if matches!(
         ty,
         GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K
-    ) && native_half_scale_storage_enabled(shader_f16_supported, env_override)
+    ) && shader_f16_supported
     {
         QMatrixStorageLayout::Native
     } else if matches!(
@@ -283,8 +148,6 @@ pub struct QMatrix {
     buffer: Arc<wgpu::Buffer>,
     datatype: GgmlType,
     storage_layout: QMatrixStorageLayout,
-    direct_pipeline_cache:
-        Arc<RwLock<LruCache<QMatMulDirectPipelineKey, wgpu::ComputePipeline, FxBuildHasher>>>,
 }
 
 impl std::fmt::Debug for QMatrix {
@@ -378,10 +241,6 @@ impl QMatrix {
             buffer,
             datatype,
             storage_layout,
-            direct_pipeline_cache: Arc::new(RwLock::new(LruCache::with_hasher(
-                NonZeroUsize::new(QMATRIX_DIRECT_PIPELINE_CACHE_SIZE).unwrap(),
-                Default::default(),
-            ))),
         })
     }
 
@@ -497,21 +356,11 @@ impl QMatrix {
             buffer,
             datatype,
             storage_layout,
-            direct_pipeline_cache: Arc::new(RwLock::new(LruCache::with_hasher(
-                NonZeroUsize::new(QMATRIX_DIRECT_PIPELINE_CACHE_SIZE).unwrap(),
-                Default::default(),
-            ))),
         })
     }
 
     pub(crate) fn buffer(&self) -> &Arc<wgpu::Buffer> {
         &self.buffer
-    }
-
-    pub(crate) fn direct_pipeline_cache(
-        &self,
-    ) -> &RwLock<LruCache<QMatMulDirectPipelineKey, wgpu::ComputePipeline, FxBuildHasher>> {
-        &self.direct_pipeline_cache
     }
 
     pub fn shape(&self) -> &[usize] {
@@ -545,32 +394,20 @@ mod tests {
             GgmlType::Q5K,
         ] {
             assert_eq!(
-                qmatrix_storage_layout_for_parts_with_env(ty, true, None),
+                qmatrix_storage_layout_for_parts_with_capability(ty, true),
                 QMatrixStorageLayout::Native
             );
             assert_eq!(
-                qmatrix_storage_layout_for_parts_with_env(ty, false, None),
+                qmatrix_storage_layout_for_parts_with_capability(ty, false),
                 QMatrixStorageLayout::GpuF32Scales
             );
         }
         assert_eq!(
-            qmatrix_storage_layout_for_parts_with_env(GgmlType::Q6K, true, None),
+            qmatrix_storage_layout_for_parts_with_capability(GgmlType::Q6K, true),
             QMatrixStorageLayout::GpuF32Scales
         );
         assert_eq!(
-            qmatrix_storage_layout_for_parts_with_env(GgmlType::Q6K, false, None),
-            QMatrixStorageLayout::GpuF32Scales
-        );
-    }
-
-    #[test]
-    fn q4k_storage_env_can_force_native_or_f32_expanded() {
-        assert_eq!(
-            qmatrix_storage_layout_for_parts_with_env(GgmlType::Q4K, false, Some("1")),
-            QMatrixStorageLayout::Native
-        );
-        assert_eq!(
-            qmatrix_storage_layout_for_parts_with_env(GgmlType::Q4K, true, Some("0")),
+            qmatrix_storage_layout_for_parts_with_capability(GgmlType::Q6K, false),
             QMatrixStorageLayout::GpuF32Scales
         );
     }

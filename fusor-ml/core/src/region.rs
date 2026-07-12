@@ -24,10 +24,6 @@ use crate::DataTypeEnum;
 use crate::compute_graph::NodeIndex;
 use crate::nary_wise::{ElementwiseOperation, NaryExpr};
 
-/// Statements per region: bounds live register values (each statement's
-/// value is one bound register while later statements can read it).
-pub(crate) const REGION_MAX_STATEMENTS: usize = 16;
-
 #[derive(Debug, Clone)]
 pub(crate) struct RegionStatement {
     /// Slots `0..inputs.len()` read region inputs (elementwise or

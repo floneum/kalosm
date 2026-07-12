@@ -53,7 +53,7 @@ impl Resolver {
                 .children()
                 .iter()
                 .map(|&child| {
-                    let child_prov = driver.prov_of_class(child);
+                    let child_prov = driver.prov_of_class(child, &extraction.needed);
                     driver.egraph.analysis.facts_of(child_prov).inner
                 })
                 .collect();

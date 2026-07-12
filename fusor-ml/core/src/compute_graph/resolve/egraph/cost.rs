@@ -53,7 +53,7 @@ impl CostDelta {
         self < Self::default()
     }
 
-    /// Stage-2 rules are one-way structural simplifications. An equal-cost
+    /// Fusion rules are one-way structural simplifications. An equal-cost
     /// canonicalization (notably unit-reduce -> elementwise) is useful because
     /// it exposes the next fusion and cannot cycle back to its old form.
     pub(super) fn non_worse(self) -> bool {
@@ -246,7 +246,7 @@ pub(super) fn variant_cost(variant: &ExecutionVariant) -> GpuCost {
             materialized_bytes: bytes(&operation.out_shape, operation.datatype),
             work: elements(&operation.out_shape),
         },
-        ExecutionVariant::GraphOp(_) => GpuCost {
+        ExecutionVariant::RowProgram(_) => GpuCost {
             dispatches: 1,
             materialized_bytes: 0,
             work: 1,

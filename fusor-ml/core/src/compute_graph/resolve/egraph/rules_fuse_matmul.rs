@@ -1,4 +1,4 @@
-//! Stage-2 matmul/qmatmul fusion generators: pure transcriptions of
+//! Matmul/qmatmul fusion generators derived from
 //! `try_fuse_into_matmul` and its graph-reading helpers (fusion_matmul.rs),
 //! consulted by the extraction worklist.
 //!

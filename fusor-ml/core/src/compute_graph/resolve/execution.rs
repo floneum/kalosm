@@ -1,15 +1,11 @@
 use super::*;
 
-/// Wall-clock per optimizer sub-phase, one resolve. Keep the sections aligned
-/// with the actual work: Stage-1 recognition, imperative row/assign fusion,
-/// Stage-2 planning and extraction, region formation, and semantic coalescing.
+/// Wall-clock per optimizer phase, one resolve.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct OptimizePhases {
-    pub(super) recognize: Duration,
-    pub(super) row_fusion: Duration,
-    pub(super) stage2: Duration,
-    pub(super) regions: Duration,
-    pub(super) coalesce: Duration,
+    pub(super) recognition: Duration,
+    pub(super) extraction: Duration,
+    pub(super) physical: Duration,
 }
 
 impl Resolver {
@@ -204,7 +200,9 @@ impl Resolver {
             }
             ExecutionVariant::MatMul(op) => Some(QueuedOperation::Operation(Arc::new(op.clone()))),
             ExecutionVariant::Reduce(op) => Some(QueuedOperation::Operation(Arc::new(op.clone()))),
-            ExecutionVariant::GraphOp(op) => Some(QueuedOperation::Operation(op.clone())),
+            ExecutionVariant::RowProgram(op) => {
+                Some(QueuedOperation::Operation(Arc::new(op.clone())))
+            }
             ExecutionVariant::View(op) => Some(QueuedOperation::Operation(Arc::new(op.clone()))),
             ExecutionVariant::Assign(op) => Some(QueuedOperation::Operation(Arc::new(op.clone()))),
             ExecutionVariant::QEmbedding(op) => {
@@ -265,38 +263,17 @@ impl Resolver {
     // --- Rewrite Engine ---
 
     pub(super) fn optimize(&mut self, graph: &mut ComputeGraphInner) {
-        // Rebuild composed contraction / normalization clusters into their
-        // specialized operations first, while they are still in the exact
-        // canonical form the API emitted (before view folding or fusion
-        // disturbs them).
-        let phase_start = Instant::now();
-        self.recognize_operations(graph);
-        self.optimize_phases.recognize += phase_start.elapsed();
-
-        // Every graph uses the full optimizer. Individual generators retain
-        // their semantic, device and cost gates; graph size is not one of
-        // them. The plan memo keeps repeated-layer discovery proportional to
-        // unique local structure rather than total layer count.
-        self.horizontal_merge = std::env::var_os("FUSOR_DISABLE_HORIZONTAL_FUSION").is_none();
-        let phase_start = Instant::now();
-        self.fuse_row_programs(graph);
-        self.recognize_assign_chains(graph);
-        self.optimize_phases.row_fusion += phase_start.elapsed();
-
-        let phase_start = Instant::now();
-        self.fuse_operations(graph);
-        self.optimize_phases.stage2 += phase_start.elapsed();
+        // Every graph uses the full optimizer. Recognition and fusion share
+        // one value e-graph; the structural plan memo reuses discovery across
+        // repeated layers while preserving allocation-distinct values.
+        self.optimize_operations(graph);
 
         // Region formation generalizes the sole-consumer nary gate: it fuses
         // externally-live producers into multi-output regions. Codegen then
         // selects tuned kernels from operation shape and device capabilities.
         let phase_start = Instant::now();
         self.form_elementwise_regions(graph);
-        self.optimize_phases.regions += phase_start.elapsed();
-
-        let phase_start = Instant::now();
-        self.coalesce_equivalent_eclasses(graph);
-        self.optimize_phases.coalesce += phase_start.elapsed();
+        self.optimize_phases.physical += phase_start.elapsed();
     }
 
     // Helpers
@@ -391,10 +368,50 @@ impl Resolver {
                 .neighbors_directed(node_idx, petgraph::Direction::Incoming)
                 .collect();
             self.execution_graph.remove_node(node_idx);
+            self.node_mapping.remove(&inner_idx);
             // Recursively check if dependencies are now dead
             for dep in incoming {
                 self.remove_node_if_dead(dep);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Device, Tensor};
+
+    #[test]
+    fn dead_node_removal_clears_its_inner_mapping() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let input = Tensor::new(&device, &[1.0f32, 2.0, 3.0, 4.0]);
+            let intermediate = &input + 1.0;
+            let output = &intermediate * 2.0;
+            let target = output.data().key;
+            let intermediate_inner = intermediate.data().key;
+
+            device.compute_graph().with_mut(|graph| {
+                let mut resolver = Resolver::new_batch(graph, vec![target]);
+                resolver.build_execution_graph(graph, target);
+                let intermediate_exec = resolver.node_mapping[&intermediate_inner];
+                let target_exec = resolver.node_mapping[&target];
+                let edge = resolver
+                    .execution_graph
+                    .find_edge(intermediate_exec, target_exec)
+                    .expect("intermediate feeds the target");
+                resolver.execution_graph.remove_edge(edge);
+                resolver.remove_node_if_dead(intermediate_exec);
+
+                assert!(!resolver.execution_graph.contains_node(intermediate_exec));
+                assert!(
+                    !resolver.node_mapping.contains_key(&intermediate_inner),
+                    "removed execution nodes must not remain addressable"
+                );
+            });
+        });
     }
 }

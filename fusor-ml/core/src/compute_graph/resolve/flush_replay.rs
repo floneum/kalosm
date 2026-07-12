@@ -1,4 +1,4 @@
-//! Reusable materialization-plan replay for dense (QMatMul-free) graphs.
+//! Reusable materialization-plan replay for structurally repeated graphs.
 //!
 //! Training loops flush an isomorphic tape every step, while iterative dense
 //! inference repeatedly resolves one isomorphic output graph. Both present
@@ -26,10 +26,10 @@
 //!   `release_dead_intermediates` — evaluated live, never recorded, so
 //!   reference-count drift (e.g. a user cloning a mid-graph handle) is
 //!   handled identically to a full resolve.
-//! - Decode graphs are untouched: the replay path is gated on the O(1)
-//!   `qmatrix_node_count == 0` check before any fingerprint work, the
-//!   fingerprint DFS aborts on any `QMatrix` variant, and the recorder
-//!   poisons on the `QMatMul` lowering arm.
+//! - Tensor and quantized-matrix storage are separate binding roles. A
+//!   `QMatrix` node can therefore supply its raw block buffer to fused
+//!   consumers and later materialize a dense tensor at the same graph slot
+//!   without either binding being confused with the other.
 //! - Buffer identity between slots is deliberately absent from the
 //!   fingerprint (buffers change every step), so the recorder must never
 //!   produce a plan whose bindings depend on two slots incidentally sharing
@@ -59,9 +59,9 @@ use crate::{DataTypeEnum, Device, Layout};
 
 /// Bump when anything about the recorded plan layout or the fingerprint
 /// recipe changes, so stale entries can never be replayed.
-/// v7: equality-saturation optimizer — recorded physical-edge sets shrink to
-/// final-inputs-only and the optimizer output is produced by extraction.
-const REPLAY_RECIPE_VERSION: u64 = 7;
+/// v8: quantized inputs and build-local scratch buffers are first-class plan
+/// bindings, and plans are recorded on their first occurrence.
+const REPLAY_RECIPE_VERSION: u64 = 8;
 
 const FLUSH_PLAN_CACHE_SIZE: usize = 8;
 
@@ -69,17 +69,9 @@ const FLUSH_PLAN_CACHE_SIZE: usize = 8;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct FlushPlanKey([u64; 2]);
 
-#[derive(Clone)]
-pub(crate) enum FlushPlanEntry {
-    /// The fingerprint has been seen once. Recording is armed only on the
-    /// second occurrence so one-shot workloads never pay plan construction.
-    Seen,
-    Recorded(Arc<FlushPlan>),
-}
-
 /// The reusable-plan decision for one materialization boundary. Both batched
 /// flushes and ordinary single-target resolves enter through this gate so an
-/// isomorphic graph has one cache lifecycle: see it, record it, then replay.
+/// isomorphic graph has one cache lifecycle: record, then replay.
 pub(crate) enum ReplayAction {
     Resolve,
     Record {
@@ -92,10 +84,10 @@ pub(crate) enum ReplayAction {
     },
 }
 
-/// Per-device two-touch LRU of flush plans. Lives on `DeviceInner` beside the
+/// Per-device LRU of flush plans. Lives on `DeviceInner` beside the
 /// kernel cache so it is reachable under the compute-graph write lock.
 pub(crate) struct FlushPlanCache {
-    plans: Mutex<LruCache<FlushPlanKey, FlushPlanEntry, FxBuildHasher>>,
+    plans: Mutex<LruCache<FlushPlanKey, Arc<FlushPlan>, FxBuildHasher>>,
     replays: AtomicU64,
     records: AtomicU64,
 }
@@ -114,15 +106,13 @@ impl Default for FlushPlanCache {
 }
 
 impl FlushPlanCache {
-    pub(crate) fn get(&self, key: &FlushPlanKey) -> Option<FlushPlanEntry> {
+    pub(crate) fn get(&self, key: &FlushPlanKey) -> Option<Arc<FlushPlan>> {
         self.plans.lock().get(key).cloned()
     }
 
-    pub(crate) fn insert(&self, key: FlushPlanKey, entry: FlushPlanEntry) {
-        if matches!(entry, FlushPlanEntry::Recorded(_)) {
-            self.records.fetch_add(1, Ordering::Relaxed);
-        }
-        self.plans.lock().put(key, entry);
+    pub(crate) fn insert(&self, key: FlushPlanKey, plan: Arc<FlushPlan>) {
+        self.records.fetch_add(1, Ordering::Relaxed);
+        self.plans.lock().put(key, plan);
     }
 
     pub(crate) fn note_replay(&self) {
@@ -140,32 +130,12 @@ impl FlushPlanCache {
     }
 }
 
-/// Whether the flush-plan replay path may run at all. Trace modes that need
-/// the full resolver pipeline to produce their output disable it.
-pub(crate) fn replay_enabled() -> bool {
-    const DISABLING_ENVS: &[&str] = &[
-        "FUSOR_DISABLE_RESOLVE_PLAN_CACHE",
-        "FUSOR_TRACE_GPU_KERNELS",
-        "FUSOR_TRACE_DECODE",
-        "FUSOR_TRACE_RESOLVE",
-        "FUSOR_TRACE_DECODE_NAMES",
-        "FUSOR_TRACE_RESOLVE_HOST_CATEGORIES",
-        "FUSOR_TRACE_ROW_FUSION",
-    ];
-    DISABLING_ENVS
-        .iter()
-        .all(|var| std::env::var_os(var).is_none())
-}
-
 /// Choose whether `targets` need a full resolve, should record, or can replay.
 ///
-/// This performs the QMatrix gate before fingerprinting so quantized decode
-/// retains its historical direct/general resolve paths. A failed replay
-/// validation is non-mutating and falls back to a normal resolve.
+/// A failed replay validation is non-mutating and falls back to a normal
+/// resolve. A cache miss records immediately, so the second occurrence can
+/// replay without an extra warm-up resolve.
 pub(crate) fn prepare_replay(graph: &mut ComputeGraphInner, targets: &[NodeIndex]) -> ReplayAction {
-    if graph.qmatrix_node_count != 0 || !replay_enabled() {
-        return ReplayAction::Resolve;
-    }
     let Some(fingerprint) = fingerprint_pending(graph, targets) else {
         return ReplayAction::Resolve;
     };
@@ -188,44 +158,17 @@ pub(crate) fn prepare_replay(graph: &mut ComputeGraphInner, targets: &[NodeIndex
     let device = graph.device();
     let cache = device.flush_plan_cache();
     match cache.get(&fingerprint.key) {
-        Some(FlushPlanEntry::Recorded(plan)) => {
+        Some(plan) => {
             if validate_replay(graph, &device, &plan, &fingerprint) {
                 ReplayAction::Replay { plan, fingerprint }
             } else {
                 ReplayAction::Resolve
             }
         }
-        Some(FlushPlanEntry::Seen) => ReplayAction::Record {
+        None => ReplayAction::Record {
             key: fingerprint.key,
             fingerprint,
         },
-        None => {
-            cache.insert(fingerprint.key, FlushPlanEntry::Seen);
-            ReplayAction::Resolve
-        }
-    }
-}
-
-/// Env vars that change what the resolver produces. Their values join the
-/// fingerprint so plans recorded under different settings can never collide.
-fn hash_env_snapshot(state: &mut FxHasher) {
-    const KEYED_ENVS: &[&str] = &[
-        "FUSOR_RESOLVE_SKIP_OPTIMIZE",
-        "FUSOR_RESOLVE_SKIP_ASSIGN_CHAINS",
-        "FUSOR_DISABLE_DECODE_PLAN_CACHE",
-        "FUSOR_DISABLE_HORIZONTAL_FUSION",
-        "FUSOR_DISABLE_REGION_FUSION",
-        "FUSOR_DISABLE_ALLOC_REUSE",
-        "FUSOR_LAST_LEVEL_CACHE_BYTES",
-    ];
-    for var in KEYED_ENVS {
-        match std::env::var(var) {
-            Ok(value) => {
-                1u8.hash(state);
-                value.hash(state);
-            }
-            Err(_) => 0u8.hash(state),
-        }
     }
 }
 
@@ -296,8 +239,9 @@ struct FingerprintState {
 /// Fingerprint the pending subgraph, mirroring `build_execution_graph`'s
 /// traversal exactly: DFS from the pending sinks in order, visiting
 /// dependencies in `visit_dependencies` order, stopping at cached nodes.
-/// Returns `None` if any reachable node is a `QMatrix` (decode graphs are
-/// never fingerprinted).
+/// Tensor and QMatrix allocation identity is deliberately absent: their
+/// shape/storage contracts are hashed while current buffers are rebound by
+/// fingerprint position during replay.
 pub(crate) fn fingerprint_pending(
     graph: &ComputeGraphInner,
     pending: &[NodeIndex],
@@ -315,7 +259,6 @@ pub(crate) fn fingerprint_pending(
         state.hasher.write_u64(pos as u64);
     }
     state.hasher.write_u64(REPLAY_RECIPE_VERSION);
-    state.hasher.write_u64(local_hash(hash_env_snapshot));
 
     Some(FlushFingerprint {
         key: state.hasher.finish(),
@@ -363,7 +306,13 @@ fn fingerprint_visit(
     // so the liveness bit is part of the structure.
     let live_ref = node_data.reference_count > 0;
     match &node_data.variant {
-        ComputeGraphNodeVariant::QMatrix(_) => return None,
+        ComputeGraphNodeVariant::QMatrix(operation) => {
+            state.hasher.write_u64(0xA6);
+            state.hasher.write_u64(live_ref as u64);
+            state
+                .hasher
+                .write_u64(local_hash(|h| operation.hash_kernel_fields(h)));
+        }
         ComputeGraphNodeVariant::Tensor(data) => {
             state.hasher.write_u64(0xA1);
             state.hasher.write_u64(live_ref as u64);
@@ -429,6 +378,7 @@ enum PlanStep {
     Dispatch {
         pos: u32,
         kernels: Box<[PlanKernel]>,
+        scratch: Box<[BufferSpec]>,
         output: OutputSpec,
         /// Dependency positions (with multiplicity, in `visit_dependencies`
         /// order) to feed the release accounting after this step.
@@ -440,14 +390,31 @@ enum PlanStep {
     MergedDispatch {
         outputs: Box<[(u32, OutputSpec)]>,
         kernels: Box<[PlanKernel]>,
+        scratch: Box<[BufferSpec]>,
         consumed: Box<[u32]>,
     },
 }
 
 struct PlanKernel {
     template: DirectKernelTemplate,
-    /// Slot position per binding buffer, in `binding_buffers()` order.
-    bindings: Box<[u32]>,
+    /// Source per binding buffer, in `binding_buffers()` order.
+    bindings: Box<[BufferBinding]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BufferBinding {
+    /// Tensor leaf, cached boundary, or materialized output at this slot.
+    Tensor(u32),
+    /// Raw block storage embedded in a QMatrix node at this slot.
+    QMatrix(u32),
+    /// Build-local buffer allocated once for this plan step.
+    Scratch(u32),
+}
+
+#[derive(Clone, Copy)]
+struct BufferSpec {
+    size: u64,
+    usage: wgpu::BufferUsages,
 }
 
 struct OutputSpec {
@@ -467,11 +434,9 @@ enum OutputSource {
     Alias { slot: u32 },
 }
 
-/// Records one materialization into a [`FlushPlan`]. Armed on the second
-/// sighting of a fingerprint; every hook is a no-op once poisoned. Any
-/// structure the plan format cannot express
-/// (unknown scratch buffers, quantized matmuls) poisons the recording — the
-/// resolve completes normally and no plan is stored.
+/// Records one materialization into a [`FlushPlan`]. Every hook is a no-op
+/// once poisoned. Poisoning is reserved for ambiguous alias provenance; raw
+/// QMatrix storage and build-local scratch buffers are plan-expressible.
 pub(crate) struct PlanRecorder {
     pos_of: FxHashMap<NodeIndex, u32>,
     node_count: u32,
@@ -483,7 +448,7 @@ pub(crate) struct PlanRecorder {
     /// pointer can never be pool-recycled into a different buffer
     /// mid-recording) and because incidental sharing poisons the recording
     /// (see [`Self::attribute_buffer`]).
-    provenance: FxHashMap<usize, u32>,
+    provenance: FxHashMap<usize, BufferBinding>,
     /// Strong clones of every buffer entered into `provenance`. Dropped with
     /// the recorder at the end of the flush, so no buffer outlives the step.
     pinned: Vec<Arc<wgpu::Buffer>>,
@@ -527,9 +492,15 @@ impl PlanRecorder {
                 // Boundary sharing is incidental (e.g. a cached view aliasing
                 // its cached input): never reproduced by the plan, so it must
                 // poison rather than conflate the slots.
-                recorder.attribute_buffer(cached.buffer(), i as u32, false);
+                recorder.attribute_buffer(cached.buffer(), BufferBinding::Tensor(i as u32), false);
             } else if let ComputeGraphNodeVariant::Tensor(data) = &node_data.variant {
-                recorder.attribute_buffer(data.buffer(), i as u32, false);
+                recorder.attribute_buffer(data.buffer(), BufferBinding::Tensor(i as u32), false);
+            } else if let ComputeGraphNodeVariant::QMatrix(operation) = &node_data.variant {
+                recorder.attribute_buffer(
+                    operation.matrix.buffer(),
+                    BufferBinding::QMatrix(i as u32),
+                    false,
+                );
             }
         }
         recorder
@@ -547,10 +518,17 @@ impl PlanRecorder {
     /// to alias this step) is NOT part of the fingerprint — an isomorphic
     /// later step may present distinct buffers, and a plan recorded here
     /// would silently bind the wrong tensor. Poison instead.
-    fn attribute_buffer(&mut self, buffer: &Arc<wgpu::Buffer>, pos: u32, structural: bool) {
+    fn attribute_buffer(
+        &mut self,
+        buffer: &Arc<wgpu::Buffer>,
+        binding: BufferBinding,
+        structural: bool,
+    ) {
         self.pinned.push(buffer.clone());
-        if let Some(prev) = self.provenance.insert(Arc::as_ptr(buffer) as usize, pos)
-            && prev != pos
+        if let Some(prev) = self
+            .provenance
+            .insert(Arc::as_ptr(buffer) as usize, binding)
+            && prev != binding
             && !structural
         {
             self.poison();
@@ -577,7 +555,7 @@ impl PlanRecorder {
         claimed_from: Option<NodeIndex>,
     ) -> Option<OutputSource> {
         match (self.provenance.get(&output_ptr).copied(), claimed_from) {
-            (Some(slot), Some(_)) => Some(OutputSource::Alias { slot }),
+            (Some(BufferBinding::Tensor(slot)), Some(_)) => Some(OutputSource::Alias { slot }),
             (None, None) => Some(OutputSource::Fresh {
                 buffer_size: output.buffer().size(),
                 usage: output.buffer().usage(),
@@ -614,6 +592,44 @@ impl PlanRecorder {
         Some(consumed.into())
     }
 
+    fn record_kernels(
+        &mut self,
+        kernels: &[DirectKernel],
+    ) -> (Box<[PlanKernel]>, Box<[BufferSpec]>) {
+        let mut scratch_by_ptr = FxHashMap::<usize, u32>::default();
+        let mut scratch = Vec::new();
+        let mut plan_kernels = Vec::with_capacity(kernels.len());
+        for kernel in kernels {
+            let buffers = kernel.binding_buffers();
+            let mut bindings = Vec::with_capacity(buffers.len());
+            for buffer in &buffers {
+                let ptr = Arc::as_ptr(buffer) as usize;
+                let binding = if let Some(&binding) = self.provenance.get(&ptr) {
+                    binding
+                } else if let Some(&slot) = scratch_by_ptr.get(&ptr) {
+                    BufferBinding::Scratch(slot)
+                } else {
+                    let slot = scratch.len() as u32;
+                    scratch.push(BufferSpec {
+                        size: buffer.size(),
+                        usage: buffer.usage(),
+                    });
+                    scratch_by_ptr.insert(ptr, slot);
+                    // Keep the allocation alive so another scratch buffer
+                    // cannot recycle the same raw pointer while recording.
+                    self.pinned.push(buffer.clone());
+                    BufferBinding::Scratch(slot)
+                };
+                bindings.push(binding);
+            }
+            plan_kernels.push(PlanKernel {
+                template: kernel.to_template(),
+                bindings: bindings.into(),
+            });
+        }
+        (plan_kernels.into(), scratch.into())
+    }
+
     pub(super) fn poison(&mut self) {
         self.poisoned = true;
     }
@@ -634,7 +650,7 @@ impl PlanRecorder {
         let Some(pos) = self.pos(node) else { return };
         // A leaf sharing a buffer with another slot (boundary or leaf) is
         // incidental: poison rather than conflate.
-        self.attribute_buffer(data.buffer(), pos, false);
+        self.attribute_buffer(data.buffer(), BufferBinding::Tensor(pos), false);
         self.steps.push(PlanStep::TensorLeaf { pos });
     }
 
@@ -653,7 +669,7 @@ impl PlanRecorder {
         };
         // Structural: replay re-derives this alias from the input's current
         // buffer via `try_map_tensor`, so the sharing holds every step.
-        self.attribute_buffer(result.buffer(), pos, true);
+        self.attribute_buffer(result.buffer(), BufferBinding::Tensor(pos), true);
         self.steps.push(PlanStep::ViewAlias { pos, consumed });
     }
 
@@ -674,7 +690,7 @@ impl PlanRecorder {
         };
         // Structural: replay re-derives the in-place output from the current
         // graph via `try_prepare_in_place_slice_assign_copy`.
-        self.attribute_buffer(output.buffer(), pos, true);
+        self.attribute_buffer(output.buffer(), BufferBinding::Tensor(pos), true);
         self.steps.push(PlanStep::CopyAssign { pos, consumed });
     }
 
@@ -710,26 +726,9 @@ impl PlanRecorder {
         // Register the output before classifying bindings: the output buffer
         // is itself a binding slot (appended by `Operation::inputs`).
         // Structural: replay reproduces the alias through `OutputSource`.
-        self.attribute_buffer(output.buffer(), pos, true);
+        self.attribute_buffer(output.buffer(), BufferBinding::Tensor(pos), true);
 
-        let mut plan_kernels = Vec::with_capacity(kernels.len());
-        for kernel in kernels {
-            let buffers = kernel.binding_buffers();
-            let mut bindings = Vec::with_capacity(buffers.len());
-            for buffer in &buffers {
-                let Some(&slot) = self.provenance.get(&(Arc::as_ptr(buffer) as usize)) else {
-                    // Build-internal scratch buffer (e.g. split row-program
-                    // sequences): the plan cannot re-create it.
-                    self.poison();
-                    return;
-                };
-                bindings.push(slot);
-            }
-            plan_kernels.push(PlanKernel {
-                template: kernel.to_template(),
-                bindings: bindings.into(),
-            });
-        }
+        let (plan_kernels, scratch) = self.record_kernels(kernels);
 
         let mut deps = Vec::new();
         op.visit_dependencies(&mut |dep| deps.push(dep));
@@ -738,7 +737,8 @@ impl PlanRecorder {
         };
         self.steps.push(PlanStep::Dispatch {
             pos,
-            kernels: plan_kernels.into(),
+            kernels: plan_kernels,
+            scratch,
             output: output_spec,
             consumed,
         });
@@ -774,24 +774,9 @@ impl PlanRecorder {
             ));
             // Structural: the merged replay arm re-creates this slot (fresh
             // allocation or the recorded alias).
-            self.attribute_buffer(output.buffer(), pos, true);
+            self.attribute_buffer(output.buffer(), BufferBinding::Tensor(pos), true);
         }
-        let mut plan_kernels = Vec::with_capacity(kernels.len());
-        for kernel in kernels {
-            let buffers = kernel.binding_buffers();
-            let mut bindings = Vec::with_capacity(buffers.len());
-            for buffer in &buffers {
-                let Some(&slot) = self.provenance.get(&(Arc::as_ptr(buffer) as usize)) else {
-                    self.poison();
-                    return;
-                };
-                bindings.push(slot);
-            }
-            plan_kernels.push(PlanKernel {
-                template: kernel.to_template(),
-                bindings: bindings.into(),
-            });
-        }
+        let (plan_kernels, scratch) = self.record_kernels(kernels);
 
         let mut deps = Vec::new();
         op.visit_dependencies(&mut |dep| deps.push(dep));
@@ -800,7 +785,8 @@ impl PlanRecorder {
         };
         self.steps.push(PlanStep::MergedDispatch {
             outputs: outputs.into(),
-            kernels: plan_kernels.into(),
+            kernels: plan_kernels,
+            scratch,
             consumed,
         });
     }
@@ -958,9 +944,14 @@ pub(crate) fn execute_replay_with_tail<T>(
     // buffer a later dispatch still binds — mirroring how the full resolve
     // pins bound buffers in its command records.
     let mut slot_buffers: Vec<Option<Arc<wgpu::Buffer>>> = vec![None; slots.len()];
+    let mut qmatrix_buffers: Vec<Option<Arc<wgpu::Buffer>>> = vec![None; slots.len()];
     for (i, &node) in slots.iter().enumerate() {
         if fingerprint.boundary[i] {
             slot_buffers[i] = graph.get_cached_result(node).map(|d| d.buffer().clone());
+        } else if let Some(node) = graph.nodes.nodes.node_weight(node)
+            && let ComputeGraphNodeVariant::QMatrix(operation) = &node.variant
+        {
+            qmatrix_buffers[i] = Some(operation.matrix.buffer().clone());
         }
     }
 
@@ -1026,6 +1017,7 @@ pub(crate) fn execute_replay_with_tail<T>(
             PlanStep::Dispatch {
                 pos,
                 kernels,
+                scratch,
                 output,
                 consumed,
             } => {
@@ -1053,14 +1045,22 @@ pub(crate) fn execute_replay_with_tail<T>(
                     }
                 };
                 slot_buffers[*pos as usize] = Some(output_data.buffer().clone());
+                let scratch_buffers = scratch
+                    .iter()
+                    .map(|spec| device.create_buffer(spec.size, spec.usage))
+                    .collect::<Vec<_>>();
                 for kernel in kernels.iter() {
                     let buffers = kernel
                         .bindings
                         .iter()
-                        .map(|&slot| {
-                            slot_buffers[slot as usize]
+                        .map(|binding| match *binding {
+                            BufferBinding::Tensor(slot) => slot_buffers[slot as usize]
                                 .clone()
-                                .expect("flush replay: binding slot has no buffer")
+                                .expect("flush replay: tensor binding slot has no buffer"),
+                            BufferBinding::QMatrix(slot) => qmatrix_buffers[slot as usize]
+                                .clone()
+                                .expect("flush replay: QMatrix binding slot has no buffer"),
+                            BufferBinding::Scratch(slot) => scratch_buffers[slot as usize].clone(),
                         })
                         .collect::<Vec<_>>();
                     let bound = kernel.template.bind_buffers(&buffers);
@@ -1078,6 +1078,7 @@ pub(crate) fn execute_replay_with_tail<T>(
             PlanStep::MergedDispatch {
                 outputs,
                 kernels,
+                scratch,
                 consumed,
             } => {
                 for (pos, output) in outputs.iter() {
@@ -1098,14 +1099,22 @@ pub(crate) fn execute_replay_with_tail<T>(
                     slot_buffers[*pos as usize] = Some(output_data.buffer().clone());
                     graph.set_cached_result(slots[*pos as usize], output_data);
                 }
+                let scratch_buffers = scratch
+                    .iter()
+                    .map(|spec| device.create_buffer(spec.size, spec.usage))
+                    .collect::<Vec<_>>();
                 for kernel in kernels.iter() {
                     let buffers = kernel
                         .bindings
                         .iter()
-                        .map(|&slot| {
-                            slot_buffers[slot as usize]
+                        .map(|binding| match *binding {
+                            BufferBinding::Tensor(slot) => slot_buffers[slot as usize]
                                 .clone()
-                                .expect("flush replay: binding slot has no buffer")
+                                .expect("flush replay: tensor binding slot has no buffer"),
+                            BufferBinding::QMatrix(slot) => qmatrix_buffers[slot as usize]
+                                .clone()
+                                .expect("flush replay: QMatrix binding slot has no buffer"),
+                            BufferBinding::Scratch(slot) => scratch_buffers[slot as usize].clone(),
                         })
                         .collect::<Vec<_>>();
                     let bound = kernel.template.bind_buffers(&buffers);
@@ -1126,6 +1135,31 @@ pub(crate) fn execute_replay_with_tail<T>(
         .iter()
         .filter(|command| matches!(command, CommandRecord::Dispatch(_)))
         .count();
+    let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+        || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+    if trace {
+        let trace_names = std::env::var_os("FUSOR_TRACE_DECODE_NAMES").is_some();
+        let mut categories = FxHashMap::<String, usize>::default();
+        let mut names = FxHashMap::<String, usize>::default();
+        for command in &commands {
+            let CommandRecord::Dispatch(record) = command else {
+                continue;
+            };
+            let category = record.name.split('_').take(2).collect::<Vec<_>>().join("_");
+            *categories.entry(category).or_default() += 1;
+            if trace_names {
+                *names.entry(record.name.clone()).or_default() += 1;
+            }
+        }
+        let mut categories = categories.into_iter().collect::<Vec<_>>();
+        categories.sort_by(|a, b| a.0.cmp(&b.0));
+        tracing::info!("resolve_dispatch_categories {categories:?} replayed=true");
+        if trace_names {
+            let mut names = names.into_iter().collect::<Vec<_>>();
+            names.sort_by(|a, b| a.0.cmp(&b.0));
+            tracing::info!("resolve_dispatch_names {names:?} replayed=true");
+        }
+    }
     let mut command_encoder = encode_commands(&device, &commands, total_kernels);
     let target = slots[plan.target_positions[0] as usize];
     let data = graph

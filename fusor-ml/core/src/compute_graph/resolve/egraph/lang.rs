@@ -51,8 +51,8 @@ pub(super) enum FusorLang {
     MatMul(Prov, PayloadId, [Id; 2]),
     QMatMul(Prov, PayloadId, Box<[Id]>),
     QEmbedding(Prov, PayloadId, [Id; 1]),
-    /// Opaque fused program (attention row program and future GraphOps).
-    GraphOp(Prov, PayloadId, Box<[Id]>),
+    /// Structurally comparable fused row program, including attention.
+    RowProgram(Prov, PayloadId, Box<[Id]>),
     /// Multi-output elementwise region (only after region formation).
     Region(Prov, PayloadId, Box<[Id]>),
 }
@@ -66,7 +66,7 @@ impl PartialEq for FusorLang {
             (Elementwise(_, a, ac), Elementwise(_, b, bc))
             | (Reduce(_, a, ac), Reduce(_, b, bc))
             | (QMatMul(_, a, ac), QMatMul(_, b, bc))
-            | (GraphOp(_, a, ac), GraphOp(_, b, bc)) => a == b && ac == bc,
+            | (RowProgram(_, a, ac), RowProgram(_, b, bc)) => a == b && ac == bc,
             (View(_, a, ac), View(_, b, bc)) | (QEmbedding(_, a, ac), QEmbedding(_, b, bc)) => {
                 a == b && ac == bc
             }
@@ -99,7 +99,7 @@ impl Ord for FusorLang {
             Self::MatMul(..) => 7,
             Self::QMatMul(..) => 8,
             Self::QEmbedding(..) => 9,
-            Self::GraphOp(..) => 10,
+            Self::RowProgram(..) => 10,
             Self::Region(..) => 11,
         };
         tag(self)
@@ -166,7 +166,7 @@ impl FusorLang {
             | Self::MatMul(prov, _, _)
             | Self::QMatMul(prov, _, _)
             | Self::QEmbedding(prov, _, _)
-            | Self::GraphOp(prov, _, _)
+            | Self::RowProgram(prov, _, _)
             | Self::Region(prov, _, _) => *prov,
         }
     }
@@ -182,7 +182,7 @@ impl FusorLang {
             | Self::MatMul(_, payload, _)
             | Self::QMatMul(_, payload, _)
             | Self::QEmbedding(_, payload, _)
-            | Self::GraphOp(_, payload, _)
+            | Self::RowProgram(_, payload, _)
             | Self::Region(_, payload, _) => Some(*payload),
         }
     }
@@ -210,7 +210,7 @@ impl Language for FusorLang {
             Self::Elementwise(_, _, children)
             | Self::Reduce(_, _, children)
             | Self::QMatMul(_, _, children)
-            | Self::GraphOp(_, _, children)
+            | Self::RowProgram(_, _, children)
             | Self::Region(_, _, children) => children,
             Self::View(_, _, children) | Self::QEmbedding(_, _, children) => children,
             Self::Assign(_, _, children) | Self::MatMul(_, _, children) => children,
@@ -223,7 +223,7 @@ impl Language for FusorLang {
             Self::Elementwise(_, _, children)
             | Self::Reduce(_, _, children)
             | Self::QMatMul(_, _, children)
-            | Self::GraphOp(_, _, children)
+            | Self::RowProgram(_, _, children)
             | Self::Region(_, _, children) => children,
             Self::View(_, _, children) | Self::QEmbedding(_, _, children) => children,
             Self::Assign(_, _, children) | Self::MatMul(_, _, children) => children,

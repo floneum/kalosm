@@ -4,10 +4,9 @@ use crate::mir::inputs::MirValue;
 use crate::mir::kernel_backend::{KernelCacheKey, KernelVariantKey};
 use crate::mir::operation::Operation;
 use crate::mir::workgroup_shape::WorkgroupShape;
-use rustc_hash::FxHasher;
 use std::hash::Hash;
 
-struct DirectPlanCacheKernelVariant;
+struct KernelPlanCacheVariant;
 
 pub(crate) fn structural_kernel_key(
     operation: &dyn Operation,
@@ -16,20 +15,14 @@ pub(crate) fn structural_kernel_key(
 ) -> KernelCacheKey {
     let dispatch_size = operation.dispatch_size(workgroup, inputs);
     let operation_key = operation.kernel_cache_key_with_dispatch(
-        KernelVariantKey::of::<DirectPlanCacheKernelVariant>(),
+        KernelVariantKey::of::<KernelPlanCacheVariant>(),
         Some(workgroup),
         dispatch_size,
         inputs,
     );
     KernelCacheKey::from_hash_inputs(|state| {
         operation_key.hash(state);
-        hash_plan_environment(state);
     })
-}
-
-/// Process-level settings that change which direct-kernel plan is selected.
-pub(super) fn hash_plan_environment(state: &mut FxHasher) {
-    std::env::var_os("FUSOR_LAST_LEVEL_CACHE_BYTES").hash(state);
 }
 
 #[cfg(test)]
@@ -147,7 +140,7 @@ mod tests {
     // reference. Covers both build arms, including the fused-epilogue qmatmul the
     // old fast cache could not key.
     #[test]
-    fn direct_plan_cache_rebind_matches_fresh_build() {
+    fn kernel_plan_cache_rebind_matches_fresh_build() {
         pollster::block_on(async {
             let Ok(device) = Device::new().await else {
                 return;
@@ -197,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_plan_cache_distinguishes_same_shape_generic_ops() {
+    fn kernel_plan_cache_distinguishes_same_shape_generic_ops() {
         pollster::block_on(async {
             let Ok(device) = Device::new().await else {
                 return;
@@ -216,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_plan_cache_rebinds_repeated_binding_slots_positionally() {
+    fn kernel_plan_cache_rebinds_repeated_binding_slots_positionally() {
         pollster::block_on(async {
             let Ok(device) = Device::new().await else {
                 return;
@@ -242,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_plan_cache_distinguishes_same_shape_slice_assign_ranges() {
+    fn kernel_plan_cache_distinguishes_same_shape_slice_assign_ranges() {
         pollster::block_on(async {
             let Ok(device) = Device::new().await else {
                 return;

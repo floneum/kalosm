@@ -39,22 +39,17 @@ impl Resolver {
         {
             let start = host_trace.then(Instant::now);
             let node_count = self.execution_graph.node_count();
-            let optimizer_enabled = std::env::var_os("FUSOR_RESOLVE_SKIP_OPTIMIZE").is_none();
-            if optimizer_enabled {
-                self.optimize(graph);
-            }
+            self.optimize(graph);
             if let Some(start) = start {
                 host_profile.optimize += start.elapsed();
             }
             if host_trace {
                 let phases = self.optimize_phases;
                 tracing::info!(
-                    "resolve_optimize_phases optimizer_enabled={optimizer_enabled} node_count={node_count} recognize={:?} row_fusion={:?} stage2={:?} regions={:?} coalesce={:?}",
-                    phases.recognize,
-                    phases.row_fusion,
-                    phases.stage2,
-                    phases.regions,
-                    phases.coalesce,
+                    "resolve_optimize_phases node_count={node_count} recognition={:?} extraction={:?} physical={:?}",
+                    phases.recognition,
+                    phases.extraction,
+                    phases.physical,
                 );
             }
         }
@@ -78,8 +73,7 @@ impl Resolver {
 
         {
             let start = host_trace.then(Instant::now);
-            let mut merger =
-                merge_horizontal::HorizontalMerger::new(self.horizontal_merge, &device);
+            let mut merger = merge_horizontal::HorizontalMerger::new(&device);
             for idx in sorted_nodes {
                 let node = &self.execution_graph[idx];
                 // Handle Tensor caching explicitly here
@@ -94,7 +88,7 @@ impl Resolver {
                 }
 
                 let lowered = self.lower_node(idx, node);
-                merger.push(node, lowered, &mut queued_operations);
+                merger.push(node, lowered, &self.shared_outputs, &mut queued_operations);
             }
             merger.finish(&mut queued_operations);
             if let Some(start) = start {
@@ -145,7 +139,6 @@ impl Resolver {
         let mut commands = Vec::<CommandRecord>::with_capacity(queued_operations.len());
         let mut dispatch_categories = FxHashMap::<String, usize>::default();
         let mut dispatch_names = FxHashMap::<String, usize>::default();
-        let plan_cache_enabled = device.kernel_cache().direct_plan_cache().enabled();
         // Every graph takes the three-phase queue runner: serial input
         // gathering, parallel kernel building, serial recording/encoding.
         // Compatible independent operations may merge across the queue; each
@@ -164,7 +157,6 @@ impl Resolver {
             &target_set,
             &self.shared_outputs,
             &mut ledger,
-            plan_cache_enabled,
             &mut commands,
             &mut host_profile,
             host_trace,
@@ -462,7 +454,7 @@ impl Resolver {
     }
 }
 
-pub(super) fn resolve_cached_direct_plan(
+pub(super) fn resolve_cached_kernel_plan(
     kernel_cache: &fusor_tile_ir_runtime::KernelCache,
     cache_key: crate::mir::kernel_backend::KernelCacheKey,
     binding_buffers: Vec<Vec<std::sync::Arc<wgpu::Buffer>>>,
@@ -473,14 +465,14 @@ pub(super) fn resolve_cached_direct_plan(
         .map(Vec::as_slice)
         .collect::<Vec<_>>();
     kernel_cache
-        .direct_plan_cache()
+        .kernel_plan_cache()
         .try_get_or_insert_many(kernel_cache, cache_key, &binding_slices, || {
             Ok::<_, std::convert::Infallible>(build())
         })
-        .expect("infallible direct plan cache build failed")
+        .expect("infallible kernel plan cache build failed")
 }
 
-pub(super) fn direct_plan_binding_buffers(
+pub(super) fn kernel_plan_binding_buffers(
     inputs: &[MirValue],
 ) -> Vec<Vec<std::sync::Arc<wgpu::Buffer>>> {
     let buffers = inputs

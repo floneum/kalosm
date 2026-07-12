@@ -1,21 +1,14 @@
 //! Equality-saturation optimizer for operation recognition and fusion.
 //!
-//! The pipeline has two internal stages:
-//! - Stage 1 (always): native egg saturation for contraction and quantized
-//!   embedding recognition, followed by attention's cluster builder.
-//! - Stage 2: cost-guided view, nary/reduce, matmul and qmatmul fusion. A
-//!   planning e-graph hash-conses bounded local windows so repeated layers
-//!   reuse the first occurrence's plan.
-//!
 //! Rules are strictly additive: appliers union an alternative e-node into the
 //! root's class and never remove anything. A GPU-oriented extractor chooses
-//! among legal terms, and the chosen terms are applied back onto the
-//! execution graph as in-place deltas.
+//! among recognition and fusion alternatives, and one physical planner
+//! applies the chosen terms back onto the execution graph.
 //!
 //! Pure e-node identity is semantic: operator payload plus child e-classes.
-//! Allocation-backed leaves use allocation identity. A separate private
-//! planning e-graph erases allocation identity, allowing isomorphic repeated
-//! layers to share rewrite plans without ever sharing their values. Multiple
+//! Allocation-backed leaves use allocation identity. An allocation-independent
+//! structural interner lets isomorphic repeated layers share rewrite templates
+//! without ever sharing their values. Multiple
 //! execution-graph observations of one value e-class are materialized once
 //! and cached under every observed `NodeIndex`.
 
@@ -26,10 +19,10 @@ mod extract;
 mod ingest;
 mod interner;
 mod lang;
-mod planning;
 mod rules_fuse;
 mod rules_fuse_matmul;
 mod rules_recognize;
+mod structural_memo;
 
 use egg::{BackoffScheduler, EGraph, Id, Runner, StopReason};
 use rustc_hash::FxHashMap;
@@ -39,8 +32,8 @@ use self::lang::{FusorLang, PayloadId};
 use super::{ExecutionVariant, Resolver};
 use crate::compute_graph::{ComputeGraphInner, NodeIndex};
 
-/// Owns one stage's e-graph plus the provenance bookkeeping connecting it to
-/// the resolver's execution graph.
+/// Owns the resolve's value e-graph plus the provenance bookkeeping
+/// connecting it to the resolver's execution graph.
 pub(super) struct EGraphDriver {
     egraph: EGraph<FusorLang, FusorAnalysis>,
     /// Provenance -> e-class id (as returned at add time; canonicalize with
@@ -73,7 +66,7 @@ impl EGraphDriver {
                 .push(lang::Prov(index as u32));
         }
     }
-    /// Stage-2 mint: skips semantic payload dedup and can reuse a planning
+    /// Fusion mint: skips semantic payload dedup and can reuse a structural
     /// spec learned from an isomorphic earlier occurrence.
     fn mint_alternative_unique(
         &mut self,
@@ -102,12 +95,43 @@ impl EGraphDriver {
         enode
     }
 
+    /// Insert the execution graph's current structural form into this
+    /// driver's root class. An unchanged operation reuses its ingested
+    /// identity. A committed alternative keeps an occurrence-local payload:
+    /// semantic payload interning erases concrete dependencies, while fusion
+    /// generators must read the dependencies of this exact occurrence.
+    fn ensure_current_variant(&mut self, root: lang::Prov, variant: ExecutionVariant) -> FusorLang {
+        if self
+            .identity_variant(root)
+            .is_some_and(|identity| interner::concrete_variant_eq(identity, &variant))
+        {
+            return self.identity_enode(root).clone();
+        }
+        let children: Vec<Id> = interner::variant_dependencies(&variant)
+            .into_iter()
+            .map(|dep| {
+                self.class_for(dep)
+                    .expect("current variant dependencies were ingested")
+            })
+            .collect();
+        let enode = ingest::enode_for(
+            &mut self.egraph.analysis,
+            &variant,
+            root,
+            children,
+            false,
+            None,
+        );
+        let id = self.egraph.add(enode.clone());
+        self.egraph.union(self.class_of[root.0 as usize], id);
+        enode
+    }
+
     /// Run native egg recognition over the ingested graph. The runner owns
     /// saturation detection, rebuilds, scheduling and hard growth limits;
     /// Fusor's custom searchers/appliers only describe matches and semantic
     /// alternatives.
     fn run_recognition(mut self) -> Self {
-        const RECOGNITION_ITER_LIMIT: usize = 4;
         let initial_nodes = self.egraph.total_number_of_nodes();
         let node_limit = initial_nodes
             .saturating_mul(8)
@@ -119,11 +143,11 @@ impl EGraphDriver {
             .do_not_ban("recognize-qembedding");
         let runner = Runner::default()
             .with_egraph(egraph)
-            .with_iter_limit(RECOGNITION_ITER_LIMIT)
+            .with_iter_limit(usize::MAX)
             .with_node_limit(node_limit)
             // Deterministic node/iteration limits own termination. Keep the
             // runner's wall-clock guard effectively disabled.
-            .with_time_limit(std::time::Duration::from_secs(365 * 24 * 60 * 60))
+            .with_time_limit(std::time::Duration::MAX)
             .with_scheduler(scheduler)
             .run(&rules);
         if !matches!(runner.stop_reason, Some(StopReason::Saturated)) {
@@ -152,39 +176,45 @@ impl EGraphDriver {
 }
 
 impl Resolver {
-    /// Stage 1: recognize specialized operations through equality saturation.
-    pub(super) fn recognize_operations(&mut self, graph: &mut ComputeGraphInner) {
-        let driver = EGraphDriver::ingest_for_recognition(self, graph).run_recognition();
+    /// Recognize specialized operations, extend them with explicit cluster
+    /// builders, and extract fusion alternatives through one value e-graph.
+    /// Allocation-independent structural templates make repeated-layer
+    /// fusion planning proportional to unique local structure.
+    pub(super) fn optimize_operations(&mut self, graph: &mut ComputeGraphInner) {
+        let recognition_start = std::time::Instant::now();
+        let mut driver = EGraphDriver::ingest_for_recognition(self, graph).run_recognition();
         let extraction = driver.extract();
         self.apply_egraph_deltas(graph, &driver, &extraction);
-        // Attention builds an opaque GraphOperation, which intentionally has
-        // no structural-equality contract. Run its cluster builder over the
-        // extracted MatMul graph; pure contraction/embedding alternatives
-        // remain native egg rewrites.
+        // Run the attention cluster builder over the extracted MatMul graph;
+        // its result is an explicit, structurally comparable row program.
         self.recognize_attention(graph);
-    }
-}
+        self.optimize_phases.recognition += recognition_start.elapsed();
 
-impl Resolver {
-    /// Stage 2: plan and extract fusions. Allocation-independent local windows
-    /// are memoized automatically for every resolve.
-    pub(super) fn fuse_operations(&mut self, graph: &mut ComputeGraphInner) {
-        let mut driver = EGraphDriver::ingest(self, graph);
+        let extraction_start = std::time::Instant::now();
+        self.fuse_row_programs(graph);
+        self.recognize_assign_chains(graph);
         let extraction = {
-            let ctx = rules_fuse::Stage2Ctx {
+            let ctx = rules_fuse::FusionCtx {
                 graph,
                 layouts: std::cell::RefCell::new(Default::default()),
             };
-            driver.extract_with_fusion(&ctx)
+            driver.extract_with_fusion(self, &ctx)
         };
+        driver.egraph.rebuild();
+        driver.refresh_prov_classes();
         self.apply_egraph_deltas(graph, &driver, &extraction);
+        self.coalesce_equivalent_eclasses(graph, &driver);
+        self.optimize_phases.extraction += extraction_start.elapsed();
     }
 
     /// Collapse execution nodes that ingestion places in the same semantic
     /// e-class. The representative performs the work; every other inner
     /// `NodeIndex` remains an observation of that result in `shared_outputs`.
-    pub(super) fn coalesce_equivalent_eclasses(&mut self, graph: &mut ComputeGraphInner) {
-        let driver = EGraphDriver::ingest(self, graph);
+    fn coalesce_equivalent_eclasses(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        driver: &EGraphDriver,
+    ) {
         let groups: Vec<Vec<lang::Prov>> = driver.provs_of_class.values().cloned().collect();
         // Removing a duplicate can leave its dependencies dead. Do not prune
         // those dependencies until every e-class from this ingestion snapshot
@@ -207,7 +237,7 @@ impl Resolver {
                             | ExecutionVariant::MatMul(_)
                             | ExecutionVariant::QMatMul(_)
                             | ExecutionVariant::QEmbedding(_)
-                            | ExecutionVariant::GraphOp(_)
+                            | ExecutionVariant::RowProgram(_)
                     )
                     .then_some(exec)
                 })

@@ -41,10 +41,6 @@ impl DirectKernelPlan {
         Self { kernels }
     }
 
-    pub(crate) fn dispatch_count(&self) -> usize {
-        self.kernels.len()
-    }
-
     pub(crate) fn into_kernels(self) -> Vec<DirectKernel> {
         self.kernels
     }

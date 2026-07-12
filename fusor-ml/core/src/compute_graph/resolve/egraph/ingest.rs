@@ -3,8 +3,8 @@
 //! Traversal mirrors `build_execution_graph` (and the flush-replay
 //! fingerprint): targets in order, dependencies in `visit_dependencies`
 //! order, provenance assigned at first visit (pre-order). Payloads are
-//! interned byte-faithful — no dedup, no normalization — because Stage-1
-//! recognition matchers depend on the exact API-emitted forms.
+//! interned byte-faithful — no dedup, no normalization — because recognition
+//! matchers depend on the exact API-emitted forms.
 //!
 //! Inputs outside the execution graph (cached before this resolve, the
 //! `resolved_set`) become opaque [`FusorLang::Boundary`] leaves: the
@@ -83,14 +83,15 @@ pub(super) fn enode_for(
         ExecutionVariant::QEmbedding(_) => {
             FusorLang::QEmbedding(prov, intern(analysis, variant), [children[0]])
         }
-        ExecutionVariant::GraphOp(_) => {
-            FusorLang::GraphOp(prov, intern(analysis, variant), children.into_boxed_slice())
+        ExecutionVariant::RowProgram(_) => {
+            FusorLang::RowProgram(prov, intern(analysis, variant), children.into_boxed_slice())
         }
     }
 }
 
 impl EGraphDriver {
     /// Ingest the resolver's execution graph reachable from its targets.
+    #[cfg(test)]
     pub(super) fn ingest(resolver: &Resolver, graph: &ComputeGraphInner) -> Self {
         Self::ingest_impl(resolver, graph, false)
     }
@@ -472,6 +473,28 @@ mod tests {
     }
 
     #[test]
+    fn class_resolution_selects_a_needed_equivalent_observation() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let input = Tensor::new(&device, &[1.0f32, 2.0, 3.0, 4.0]);
+            let left = &input * 2.0;
+            let right = &input * 2.0;
+            with_ingested(&device, &[&left, &right], |_, _, driver| {
+                let class = driver.class_for(left.data().key).unwrap();
+                let provenances = &driver.provs_of_class[&class];
+                assert_eq!(provenances.len(), 2);
+                let mut needed = vec![true; driver.egraph.analysis.facts.len()];
+                needed[provenances[0].0 as usize] = false;
+
+                let selected = driver.prov_of_class(class, &needed);
+                assert_eq!(selected, provenances[1]);
+            });
+        });
+    }
+
+    #[test]
     fn allocation_identity_distinguishes_equal_contents() {
         pollster::block_on(async {
             let Ok(device) = Device::new().await else {
@@ -523,7 +546,8 @@ mod tests {
                 for &target in &targets {
                     resolver.build_execution_graph(graph, target);
                 }
-                resolver.coalesce_equivalent_eclasses(graph);
+                let driver = EGraphDriver::ingest(&resolver, graph);
+                resolver.coalesce_equivalent_eclasses(graph, &driver);
                 assert_eq!(resolver.execution_graph.node_count(), 2);
                 assert_eq!(
                     resolver
@@ -559,7 +583,8 @@ mod tests {
                     resolver.build_execution_graph(graph, target);
                 }
 
-                resolver.coalesce_equivalent_eclasses(graph);
+                let driver = EGraphDriver::ingest(&resolver, graph);
+                resolver.coalesce_equivalent_eclasses(graph, &driver);
 
                 assert_eq!(resolver.execution_graph.node_count(), DEPTH + 2);
                 assert!(

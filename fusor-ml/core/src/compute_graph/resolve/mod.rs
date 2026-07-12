@@ -22,9 +22,7 @@ use petgraph::algo::toposort;
 use petgraph::stable_graph::StableGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{
-    ComputeGraphInner, ComputeGraphNode, ComputeGraphNodeVariant, GraphOperation, NodeIndex,
-};
+use super::{ComputeGraphInner, ComputeGraphNode, ComputeGraphNodeVariant, NodeIndex};
 use crate::{
     MatMulOperation, ReduceOperation, dequantize::DequantizeOperation,
     quantized::embedding::QEmbeddingOperation, slice_assign::SliceAssignOperation,
@@ -185,7 +183,7 @@ pub(crate) enum ExecutionVariant {
     MatMul(MatMulOperation),
     QMatMul(Box<QMatMulOperation>),
     QEmbedding(QEmbeddingOperation),
-    GraphOp(Arc<dyn GraphOperation>),
+    RowProgram(crate::row_program::RowProgramOperation),
 }
 
 impl From<ComputeGraphNodeVariant> for ExecutionVariant {
@@ -297,14 +295,12 @@ pub(crate) struct Resolver {
     node_mapping: FxHashMap<NodeIndex, ExecutionNodeIndex>,
     targets: Vec<NodeIndex>,
     resolved_set: FxHashSet<NodeIndex>,
-    // Materialization-plan recorder, armed only on the second sighting of an
-    // isomorphic QMatMul-free target set. `None` on first-seen and quantized
-    // resolve paths, so decode resolves never record.
+    // Materialization-plan recorder, armed on the first occurrence of a
+    // structurally cacheable target set. Dense and quantized graphs share it.
     // `RefCell` because some hook sites (`add_physical_dependencies`) only
     // hold `&self`.
     recorder: Option<std::cell::RefCell<flush_replay::PlanRecorder>>,
     // Compatible independent operations may merge into one dispatch.
-    horizontal_merge: bool,
     /// One semantic e-class may satisfy several lazy graph observations.
     /// Keys are the execution nodes that materialize; values receive the
     /// same allocation without another dispatch.
@@ -339,7 +335,6 @@ impl Resolver {
             node_mapping: Default::default(),
             resolved_set,
             recorder: None,
-            horizontal_merge: false,
             shared_outputs: Default::default(),
             optimize_phases: Default::default(),
         }

@@ -569,8 +569,7 @@ mod tests {
             // authoritative), the second takes the cached-pipeline fast
             // path whose dispatch the core-side ladder computes.
             for run in 0..2 {
-                let input =
-                    Tensor::from_slice::<f32>(&device, [1, weight_shape[1]], &input_values);
+                let input = Tensor::from_slice::<f32>(&device, [1, weight_shape[1]], &input_values);
                 let result = input.q_mat_mul(&matrix).as_slice::<2, f32>().await.unwrap();
 
                 assert_eq!(result.shape(), &[1, weight_shape[0]]);

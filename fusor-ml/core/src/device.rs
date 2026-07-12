@@ -148,8 +148,8 @@ struct DeviceInner {
     queue: Arc<wgpu::Queue>,
     kernel_cache: KernelCache,
     buffer_pool: BufferPool,
-    /// Two-touch cache of recorded flush plans for dense (QMatMul-free)
-    /// graphs, replayed by `flush_all_pending`. Lives here beside the kernel
+    /// First-occurrence cache of recorded dense and quantized materialization
+    /// plans, replayed by `flush_all_pending`. Lives here beside the kernel
     /// cache so it is reachable under the compute-graph write lock.
     flush_plan_cache: crate::compute_graph::FlushPlanCache,
     cooperative_matrix_caps: CooperativeMatrixCaps,
@@ -346,13 +346,10 @@ impl Device {
         let kernel_cache = KernelCache::new(device.clone(), &adapter);
         let buffer_pool = BufferPool::new(device.clone(), queue.clone());
 
-        // `FUSOR_DISABLE_SUBGROUPS` / `FUSOR_DIRTY_BUFFERS` are construction-time
-        // defaults for the device flags, so a plain `Device::gpu()` from a repro
-        // binary reproduces the web path without code changes. Tests instead
-        // derive `without_subgroups()` / `with_poisoned_allocations()` sibling
-        // devices explicitly. `var_os` is always `None` on wasm.
-        let disable_subgroups = std::env::var_os("FUSOR_DISABLE_SUBGROUPS").is_some();
-        let poison_allocations = std::env::var_os("FUSOR_DIRTY_BUFFERS").is_some();
+        // Capability simulation is explicit through derived test devices;
+        // production always reflects the adapter's reported subgroup support.
+        let disable_subgroups = false;
+        let poison_allocations = false;
 
         let adapter_info = adapter.get_info();
         let limits = adapter.limits();
@@ -433,14 +430,8 @@ impl Device {
     /// below this size is treated as cache-resident — re-reading it costs no
     /// bandwidth — so the reuse-driven tilings (which trade thread-level
     /// parallelism for explicit reuse) only engage above it. wgpu exposes no
-    /// cache size, so this is a floor per device class; override with
-    /// `FUSOR_LAST_LEVEL_CACHE_BYTES` when tuning a specific part.
-    pub fn last_level_cache_bytes(&self) -> u64 {
-        if let Ok(value) = std::env::var("FUSOR_LAST_LEVEL_CACHE_BYTES")
-            && let Ok(parsed) = value.parse::<u64>()
-        {
-            return parsed;
-        }
+    /// cache size, so this is a conservative floor per device class.
+    pub(crate) fn last_level_cache_bytes(&self) -> u64 {
         let info = &self.inner.adapter_info;
         // Apple-silicon system-level cache starts at 8 MiB on the base M1
         // and only grows with tier; other GPU classes floor lower (older
@@ -458,14 +449,8 @@ impl Device {
     /// so this is a conservative per-class floor: base-tier GPUs keep on the
     /// order of 16K lanes resident and need ~4x oversubscription to hide
     /// memory latency. A conservative under-estimate only makes policies keep
-    /// MORE parallelism, never less. Override with `FUSOR_SATURATION_LANES`
-    /// when tuning a specific part.
-    pub fn saturation_lanes(&self) -> u32 {
-        if let Ok(value) = std::env::var("FUSOR_SATURATION_LANES")
-            && let Ok(parsed) = value.parse::<u32>()
-        {
-            return parsed.max(1);
-        }
+    /// MORE parallelism, never less.
+    pub(crate) fn saturation_lanes(&self) -> u32 {
         64 << 10
     }
 
@@ -481,10 +466,9 @@ impl Device {
     }
 
     pub fn subgroups_supported(&self) -> bool {
-        // A device constructed via `without_subgroups()` (or built with
-        // `FUSOR_DISABLE_SUBGROUPS` set) reports no subgroups, so kernel
-        // selection picks the no-subgroup fallbacks. Browser builds also take
-        // this path because they never request `wgpu::Features::SUBGROUP`.
+        // A test device constructed via `without_subgroups()` reports no
+        // subgroups, so selection picks the capability fallback. Browser
+        // builds also take this path because they do not request the feature.
         if self.inner.disable_subgroups {
             return false;
         }

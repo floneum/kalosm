@@ -8,7 +8,7 @@ use std::{
 pub use fusor_core::{
     CastTensor, DataType, DataTypeEnum, Device, Dim, Error, FloatDataType, GgufReadError,
     GpuMirostat2Sampler, GpuMirostat2SamplerParams, GpuStandardSamplerParams, Layout, MappedBuffer,
-    MatMulParams, NodeIndex, PendingGpuSampledToken as CorePendingGpuSampledToken, QMatrix, Result,
+    NodeIndex, PendingGpuSampledToken as CorePendingGpuSampledToken, QMatrix, Result,
     ShapeWithOneHole, StrideSpec, TensorSlice, WasmNotSend, WasmNotSync,
 };
 
@@ -259,14 +259,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     #[inline]
     pub fn mat_mul(&self, other: &Self) -> Self {
         Self::from_core(self.inner.mat_mul(other.as_core()))
-    }
-
-    #[inline]
-    pub fn mat_mul_with_parameters(&self, other: &Self, parameters: MatMulParams) -> Self {
-        Self::from_core(
-            self.inner
-                .mat_mul_with_parameters(other.as_core(), parameters),
-        )
     }
 
     #[inline]

@@ -1,4 +1,4 @@
-//! Stage-2 fusion generators: the per-node fusion rules (view folding, nary
+//! Fusion generators: per-node view folding, nary
 //! inlining, the reduce-fusion family, matmul/qmatmul epilogues), consulted
 //! by the extraction worklist with live consumer counts.
 //!
@@ -21,7 +21,7 @@ use crate::compute_graph::{ComputeGraphInner, NodeIndex};
 use crate::nary_wise::{ElementwiseOperation, NaryExpr, NaryFunction, UnaryFunctionChain};
 use crate::{DataTypeEnum, Layout};
 
-pub(super) struct Stage2Ctx<'a> {
+pub(super) struct FusionCtx<'a> {
     pub(super) graph: &'a ComputeGraphInner,
     /// Memoized layout inference over the (immutable) inner graph, used by
     /// qmatmul extra normalization. Fresh per stage; recomputation is
@@ -34,14 +34,14 @@ pub(super) struct Stage2Ctx<'a> {
 pub(super) struct FusionView<'a> {
     driver: &'a EGraphDriver,
     state: &'a ExtractState,
-    ctx: &'a Stage2Ctx<'a>,
+    ctx: &'a FusionCtx<'a>,
 }
 
 impl<'a> FusionView<'a> {
     pub(super) fn new(
         driver: &'a EGraphDriver,
         state: &'a ExtractState,
-        ctx: &'a Stage2Ctx<'a>,
+        ctx: &'a FusionCtx<'a>,
     ) -> Self {
         Self { driver, state, ctx }
     }

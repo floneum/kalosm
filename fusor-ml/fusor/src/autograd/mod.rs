@@ -663,10 +663,14 @@ impl BackwardTarget {
 impl GraphInner {
     fn add_node(
         &self,
-        parents: Vec<NodeId>,
-        backward: Option<BackwardRule>,
+        mut parents: Vec<NodeId>,
+        mut backward: Option<BackwardRule>,
         requires_grad: bool,
     ) -> NodeId {
+        if !requires_grad {
+            parents.clear();
+            backward = None;
+        }
         let mut state = self.state.lock().unwrap();
         let id = state.next_id;
         state.next_id += 1;
@@ -681,7 +685,11 @@ impl GraphInner {
         id
     }
 
-    fn replace_node(&self, id: NodeId, node: Node) {
+    fn replace_node(&self, id: NodeId, mut node: Node) {
+        if !node.requires_grad {
+            node.parents.clear();
+            node.backward = None;
+        }
         self.state.lock().unwrap().nodes.insert(id, node);
     }
 

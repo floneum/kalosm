@@ -27,7 +27,7 @@ use tile_ir::{
 };
 
 use crate::{
-    compute_graph::{GraphOperation, NodeIndex},
+    compute_graph::NodeIndex,
     mir::{
         inputs::MirValue,
         kernel_backend::{self, DirectKernel},
@@ -47,7 +47,7 @@ use crate::{
 /// One reduction phase: `expression` (over the external inputs and the
 /// slots of earlier phases) folded along the row axis, then `post_chain`
 /// applied to the combined value once per row.
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub(crate) struct RowReduce {
     pub(crate) expression: NaryExpr,
     pub(crate) function: ReduceFunction,
@@ -57,13 +57,13 @@ pub(crate) struct RowReduce {
 /// The private inner axis of an element phase: the expression is evaluated
 /// `len` times with the fold coordinate as `DimIndex(rank)` and accumulated
 /// with `function` — an inline dot product per axis position.
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub(crate) struct RowFold {
     pub(crate) len: usize,
     pub(crate) function: ReduceFunction,
 }
 
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub(crate) enum RowOutput {
     /// One output element per index-space position; output shape == `shape`.
     Map(NaryExpr),
@@ -83,7 +83,7 @@ pub(crate) enum RowOutput {
 /// Dynamic-axis configuration: the kernel is compiled for the `block`
 /// capacity bucket and reads the active axis length from a trailing u32
 /// params input, so per-token axis growth (the KV cache) reuses one kernel.
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub(crate) struct DynamicAxis {
     /// Workgroup size and per-tile capacity; axis lengths beyond it stream
     /// through the online tile loop.
@@ -100,7 +100,7 @@ pub(crate) struct DynamicAxis {
 /// One ordered row-program step. All non-output steps produce slots for later
 /// expressions; the final step must be [`RowStep::Output`] and defines the
 /// tensor write contract.
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub(crate) enum RowStep {
     /// Fold over the row axis into a per-row scalar slot.
     Reduce(RowReduce),
@@ -231,7 +231,7 @@ fn match_online_softmax<'a>(steps: &'a [RowStep], input_count: usize) -> Option<
 /// value for non-output steps (a per-row scalar for reduce steps, a
 /// per-element value for element steps). The final output step never produces
 /// a reusable slot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RowProgramOperation {
     pub(crate) inputs: Vec<NodeIndex>,
     /// The full row-parallel index space (including the axis).
@@ -465,12 +465,6 @@ impl Operation for RowProgramOperation {
                 .collect::<Vec<_>>()
                 .join("x")
         )
-    }
-}
-
-impl GraphOperation for RowProgramOperation {
-    fn as_row_program(&self) -> Option<&RowProgramOperation> {
-        Some(self)
     }
 }
 

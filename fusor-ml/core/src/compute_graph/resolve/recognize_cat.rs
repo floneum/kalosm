@@ -19,14 +19,6 @@ use crate::view::{AffineIndex, affine_dim_indices};
 
 use super::*;
 
-/// Every destination element evaluates all lifted arms (both sides of a
-/// select execute), so a K-way lift multiplies branch arithmetic by K.
-/// Chains longer than this keep their materialized branches and fuse through
-/// the regular n-ary path instead.
-const MAX_LIFTED_BRANCHES: usize = 4;
-/// Per-arm expression size cap for the non-collapsed (select chain) form.
-const MAX_ARM_OPS: usize = 32;
-
 /// One matched slice-assign link: an `Elementwise` node whose expression is
 /// exactly `slice_assign_expression(slices)` over `[destination, value]`.
 struct AssignLink {
@@ -194,21 +186,8 @@ fn slices_tile(out_shape: &[usize], chain: &[&AssignLink]) -> bool {
     }
 }
 
-fn expr_op_count(expr: &NaryExpr) -> usize {
-    match expr {
-        NaryExpr::Op { children, .. } => 1 + children.iter().map(expr_op_count).sum::<usize>(),
-        NaryExpr::IndexedInput { indices, .. } => {
-            1 + indices.iter().map(expr_op_count).sum::<usize>()
-        }
-        NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => 0,
-    }
-}
-
 impl Resolver {
     pub(super) fn recognize_assign_chains(&mut self, graph: &mut ComputeGraphInner) {
-        if std::env::var_os("FUSOR_RESOLVE_SKIP_ASSIGN_CHAINS").is_some() {
-            return;
-        }
         let mut links: FxHashMap<NodeIndex, AssignLink> = FxHashMap::default();
         for exec in self.execution_graph.node_indices() {
             let node = &self.execution_graph[exec];
@@ -300,9 +279,6 @@ impl Resolver {
             chain.push(prev);
         }
         chain.reverse();
-        if chain.len() > MAX_LIFTED_BRANCHES {
-            return;
-        }
         let base_inner = chain[0].destination;
 
         let out_shape = tail.shape.clone();
@@ -324,9 +300,6 @@ impl Resolver {
         let expression = if collapsed {
             arms.swap_remove(0).1
         } else {
-            if arms.iter().any(|(_, arm)| expr_op_count(arm) > MAX_ARM_OPS) {
-                return;
-            }
             let mut expression = NaryExpr::input(base_slot, rank);
             for (condition, arm) in arms {
                 expression =

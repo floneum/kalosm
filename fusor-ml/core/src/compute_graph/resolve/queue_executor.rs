@@ -99,9 +99,6 @@ struct QueueWork {
 struct BuiltWork {
     kernels: Vec<DirectKernel>,
     prepared: Vec<Option<(PreparedDirectDispatch, String)>>,
-    /// False when a merged builder declined and the kernels are per-segment
-    /// fallbacks (which a flush plan cannot express).
-    merged_ok: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -133,7 +130,6 @@ fn merged_plan_cache_key(
     struct MergedPlanKernelVariant;
     crate::mir::kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
         use std::hash::Hash;
-        super::plan_cache::hash_plan_environment(state);
         crate::mir::kernel_backend::KernelVariantKey::of::<MergedPlanKernelVariant>().hash(state);
         std::mem::discriminant(merged).hash(state);
         segment_inputs.len().hash(state);
@@ -167,10 +163,9 @@ fn build_queue_work(
     work: &QueueWork,
     graph: &ComputeGraphInner,
     device: &crate::Device,
-    plan_cache_enabled: bool,
 ) -> BuiltWork {
     let build_timer = std::time::Instant::now();
-    let (kernels, merged_ok) = match (&work.op, &work.kind) {
+    let kernels = match (&work.op, &work.kind) {
         (
             QueuedOperation::Operation(operation),
             QueueWorkKind::Operation {
@@ -185,18 +180,14 @@ fn build_queue_work(
                     .unwrap_or_else(|error| panic!("{error}"))
                     .into_kernels()
             };
-            let kernels = if plan_cache_enabled {
-                let kernel_key = structural_kernel_key(operation.as_ref(), inputs, workgroup_shape);
-                super::run::resolve_cached_direct_plan(
-                    device.kernel_cache(),
-                    kernel_key,
-                    super::run::direct_plan_binding_buffers(inputs),
-                    build_kernels,
-                )
-            } else {
-                build_kernels()
-            };
-            (kernels, true)
+            let kernel_key = structural_kernel_key(operation.as_ref(), inputs, workgroup_shape);
+            let kernels = super::run::resolve_cached_kernel_plan(
+                device.kernel_cache(),
+                kernel_key,
+                super::run::kernel_plan_binding_buffers(inputs),
+                build_kernels,
+            );
+            kernels
         }
         (QueuedOperation::Merged(merged), QueueWorkKind::Merged { segment_inputs, .. }) => {
             // Merged kernels go through the same plan cache as single ops:
@@ -212,16 +203,13 @@ fn build_queue_work(
                     MirValue::Integer(_) | MirValue::Float(_) => None,
                 })
                 .collect();
-            let plan_key =
-                plan_cache_enabled.then(|| merged_plan_cache_key(merged, segment_inputs));
-            if let Some(key) = plan_key
-                && let Some(kernels) = device.kernel_cache().direct_plan_cache().get_many(
-                    device.kernel_cache(),
-                    key,
-                    &[&expected],
-                )
-            {
-                return finish_queue_build(build_timer, kernels, true, device);
+            let plan_key = merged_plan_cache_key(merged, segment_inputs);
+            if let Some(kernels) = device.kernel_cache().kernel_plan_cache().get_many(
+                device.kernel_cache(),
+                plan_key,
+                &[&expected],
+            ) {
+                return finish_queue_build(build_timer, kernels, device);
             }
             let built = match merged {
                 MergedSegments::Row(segments) => {
@@ -253,19 +241,16 @@ fn build_queue_work(
             };
             match built {
                 Some(kernel) => {
-                    if let Some(key) = plan_key {
-                        device.kernel_cache().direct_plan_cache().insert_many(
-                            key,
-                            std::slice::from_ref(&kernel),
-                            &[&expected],
-                        );
-                    }
-                    (vec![kernel], true)
+                    device.kernel_cache().kernel_plan_cache().insert_many(
+                        plan_key,
+                        std::slice::from_ref(&kernel),
+                        &[&expected],
+                    );
+                    vec![kernel]
                 }
                 None if matches!(merged, MergedSegments::Region(_)) => {
                     // Region fallback: one standalone region kernel per
-                    // segment. Correct but not plan-expressible; poisoned in
-                    // phase 3.
+                    // segment. Replay records the resulting kernel batch.
                     let MergedSegments::Region(segments) = merged else {
                         unreachable!("matched above");
                     };
@@ -283,11 +268,11 @@ fn build_queue_work(
                             })
                         })
                         .collect();
-                    (kernels, false)
+                    kernels
                 }
                 None => {
-                    // Fallback: per-segment kernels. Correct but not
-                    // plan-expressible; the recording is poisoned in phase 3.
+                    // Fallback: per-segment kernels. Replay records the
+                    // resulting kernel batch with the same output slots.
                     let max_subgroup_size = device.max_subgroup_size();
                     let kernels = merged
                         .segment_ops()
@@ -305,13 +290,13 @@ fn build_queue_work(
                                 .into_kernels()
                         })
                         .collect();
-                    (kernels, false)
+                    kernels
                 }
             }
         }
         _ => unreachable!("queue work kind matches its queued operation"),
     };
-    finish_queue_build(build_timer, kernels, merged_ok, device)
+    finish_queue_build(build_timer, kernels, device)
 }
 
 /// Prepare dispatches (which also compiles shaders and pipelines, here on
@@ -319,7 +304,6 @@ fn build_queue_work(
 fn finish_queue_build(
     build_timer: std::time::Instant,
     kernels: Vec<crate::mir::kernel_backend::DirectKernel>,
-    merged_ok: bool,
     device: &crate::Device,
 ) -> BuiltWork {
     let prepared = kernels
@@ -339,11 +323,7 @@ fn finish_queue_build(
             );
         }
     }
-    BuiltWork {
-        kernels,
-        prepared,
-        merged_ok,
-    }
+    BuiltWork { kernels, prepared }
 }
 
 impl Resolver {
@@ -362,7 +342,6 @@ impl Resolver {
         target_set: &FxHashSet<NodeIndex>,
         shared_outputs: &FxHashMap<NodeIndex, Vec<NodeIndex>>,
         ledger: &mut super::alloc_reuse::BufferLedger,
-        plan_cache_enabled: bool,
         commands: &mut Vec<CommandRecord>,
         host_profile: &mut ResolveHostProfile,
         host_trace: bool,
@@ -653,8 +632,7 @@ impl Resolver {
         let build_start = host_trace.then(Instant::now);
         #[cfg(target_arch = "wasm32")]
         for item in &work {
-            *item.built.lock().unwrap() =
-                Some(build_queue_work(item, graph, device, plan_cache_enabled));
+            *item.built.lock().unwrap() = Some(build_queue_work(item, graph, device));
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -670,15 +648,13 @@ impl Resolver {
             // onto parallel workers.
             if workers <= 1 || work.len() < MIN_PARALLEL_BUILD_QUEUE {
                 for item in &work {
-                    *item.built.lock().unwrap() =
-                        Some(build_queue_work(item, graph, device, plan_cache_enabled));
+                    *item.built.lock().unwrap() = Some(build_queue_work(item, graph, device));
                 }
             } else {
                 let mut next_index = 0;
                 while let Some(item) = work.get(next_index) {
                     let probe_start = std::time::Instant::now();
-                    *item.built.lock().unwrap() =
-                        Some(build_queue_work(item, graph, device, plan_cache_enabled));
+                    *item.built.lock().unwrap() = Some(build_queue_work(item, graph, device));
                     next_index += 1;
                     if should_parallelize_build_remainder(
                         workers,
@@ -700,12 +676,7 @@ impl Resolver {
                                     let index =
                                         next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     let Some(item) = work.get(index) else { break };
-                                    let built = build_queue_work(
-                                        item,
-                                        graph_ref,
-                                        device,
-                                        plan_cache_enabled,
-                                    );
+                                    let built = build_queue_work(item, graph_ref, device);
                                     *item.built.lock().unwrap() = Some(built);
                                 }
                             });
@@ -790,30 +761,18 @@ impl Resolver {
                                 QueuedOperation::Merged(merged),
                                 QueueWorkKind::Merged { outputs, .. },
                             ) => {
-                                if built.merged_ok {
-                                    let node_outputs: Vec<(
-                                        NodeIndex,
-                                        &TensorData,
-                                        Option<NodeIndex>,
-                                    )> = outputs
+                                let node_outputs: Vec<(NodeIndex, &TensorData, Option<NodeIndex>)> =
+                                    outputs
                                         .iter()
                                         .map(|(node, output, claimed)| (*node, output, *claimed))
                                         .collect();
-                                    recorder.borrow_mut().record_merged_dispatch(
-                                        &node_outputs,
-                                        &built.kernels,
-                                        merged,
-                                    );
-                                    for (node, output, _) in outputs {
-                                        record_shared_outputs(
-                                            recorder,
-                                            *node,
-                                            output,
-                                            shared_outputs,
-                                        );
-                                    }
-                                } else {
-                                    recorder.borrow_mut().poison();
+                                recorder.borrow_mut().record_merged_dispatch(
+                                    &node_outputs,
+                                    &built.kernels,
+                                    merged,
+                                );
+                                for (node, output, _) in outputs {
+                                    record_shared_outputs(recorder, *node, output, shared_outputs);
                                 }
                             }
                             _ => unreachable!("queue work kind matches its queued operation"),
@@ -840,76 +799,6 @@ impl Resolver {
         if let Some(start) = encode_start {
             host_profile.prepare_dispatch += start.elapsed();
         }
-    }
-
-    /// Execute one already-recognized operation without rebuilding or
-    /// optimizing an execution graph. The fast path still crosses the same
-    /// queue, plan cache, allocation/liveness, and command-record seams as a
-    /// full resolve.
-    pub(crate) fn encode_direct_operation(
-        graph: &mut ComputeGraphInner,
-        target: NodeIndex,
-        operation: Arc<dyn Operation>,
-    ) -> (crate::Device, ResolverResult, wgpu::CommandEncoder) {
-        let device = graph.device();
-        let mut remaining_consumers = FxHashMap::default();
-        operation.visit_dependencies(&mut |dependency| {
-            *remaining_consumers.entry(dependency).or_insert(0) += 1;
-        });
-        let target_set = std::iter::once(target).collect::<FxHashSet<_>>();
-        let mut ledger = super::alloc_reuse::BufferLedger::new(&device, Some(&remaining_consumers));
-        let mut commands = Vec::new();
-        let mut host_profile = ResolveHostProfile::default();
-        Self::execute_queue(
-            None,
-            graph,
-            &device,
-            device.max_subgroup_size(),
-            vec![(target, QueuedOperation::Operation(operation))],
-            &mut remaining_consumers,
-            &target_set,
-            &Default::default(),
-            &mut ledger,
-            device.kernel_cache().direct_plan_cache().enabled(),
-            &mut commands,
-            &mut host_profile,
-            false,
-            &mut |_| None,
-        );
-
-        let total_kernels = commands
-            .iter()
-            .filter(|command| matches!(command, CommandRecord::Dispatch(_)))
-            .count();
-        let command_encoder =
-            device
-                .wgpu_device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Resolver Direct Encoder"),
-                });
-        let command_encoder = encode_command_records(
-            &device,
-            &commands,
-            total_kernels,
-            command_encoder,
-            |encoder, wait| {
-                device.wgpu_queue().submit(Some(encoder.finish()));
-                if wait {
-                    device.poll_wait();
-                }
-            },
-        );
-        let data = graph
-            .get_result(target)
-            .expect("direct operation target result not cached");
-        (
-            device,
-            ResolverResult {
-                data,
-                total_kernels,
-            },
-            command_encoder,
-        )
     }
 }
 

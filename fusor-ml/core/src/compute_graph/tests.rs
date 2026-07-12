@@ -1,5 +1,5 @@
 use crate::{Device, StrideSpec, Tensor};
-use fusor_gguf::GgmlType;
+use fusor_gguf::{BlockQ4K, GgmlType};
 
 // Build a small intermediate that requires a real kernel (not a Tensor input).
 // `x` materializes via `(input * 2.0) + 1.0`, which fuses to a single nary.
@@ -204,7 +204,7 @@ fn auto_flush_resolves_pending_siblings() {
 }
 
 #[test]
-fn direct_qmatmul_triggers_auto_flush() {
+fn qmatmul_triggers_auto_flush() {
     pollster::block_on(async {
         const N: usize = 4;
         const K: usize = 8;
@@ -225,25 +225,25 @@ fn direct_qmatmul_triggers_auto_flush() {
             GgmlType::F32,
         )
         .unwrap();
-        let direct =
+        let output =
             Tensor::new::<f32, 2, _>(&device, &[[1.0f32, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0]])
                 .q_mat_mul(&weight);
 
         device.compute_graph().set_flush_threshold(1);
-        let (_, kernels) = direct.data.materialize();
-        assert!(kernels > 0, "direct QMatMul dispatched no kernels");
+        let (_, kernels) = output.data.materialize();
+        assert!(kernels > 0, "QMatMul dispatched no kernels");
 
         for sibling in siblings {
             assert!(
                 device.compute_graph().is_cached_for_test(sibling.key()),
-                "direct QMatMul should auto-flush pending sibling outputs",
+                "QMatMul should auto-flush pending sibling outputs",
             );
         }
     });
 }
 
 #[test]
-fn direct_qmatmul_releases_a_dead_cached_activation() {
+fn qmatmul_releases_a_dead_cached_activation() {
     pollster::block_on(async {
         const N: usize = 64;
         const K: usize = 4;
@@ -485,6 +485,79 @@ fn three_way_chunk_cat_collapses() {
                     (result[[r, c]] - value * 2.0).abs() < 1e-5,
                     "mismatch at [{r}, {c}]"
                 );
+            }
+        }
+    });
+}
+
+#[test]
+fn wide_deep_chunk_cat_has_no_branch_or_expression_cap() {
+    pollster::block_on(async {
+        const CHUNKS: usize = 8;
+        const ROWS_PER_CHUNK: usize = 2;
+        const COLS: usize = 4;
+        const OPS_PER_BRANCH: usize = 40;
+
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let rows: Vec<Vec<f32>> = (0..CHUNKS * ROWS_PER_CHUNK)
+            .map(|row| {
+                (0..COLS)
+                    .map(|column| (row * COLS + column) as f32 * 0.01)
+                    .collect()
+            })
+            .collect();
+        let input = Tensor::new::<f32, 2, _>(&device, &rows);
+        let mut output = Tensor::splat(&device, 0.0f32, [CHUNKS * ROWS_PER_CHUNK, COLS]);
+        for chunk in 0..CHUNKS {
+            let start = chunk * ROWS_PER_CHUNK;
+            let mut branch = narrow2(&input, 0, start, ROWS_PER_CHUNK);
+            for _ in 0..OPS_PER_BRANCH {
+                branch = &branch + 0.25f32;
+            }
+            output = output.slice_assign([start..start + ROWS_PER_CHUNK, 0..COLS], &branch);
+        }
+
+        let (_, kernels) = output.data.materialize();
+        assert_eq!(
+            kernels, 1,
+            "wide/deep concat should remain one automatic fusion"
+        );
+        let values = output.as_slice::<2, f32>().await.unwrap();
+        for (row, source) in rows.iter().enumerate() {
+            for (column, value) in source.iter().enumerate() {
+                let expected = value + OPS_PER_BRANCH as f32 * 0.25;
+                assert!((values[[row, column]] - expected).abs() < 1e-4);
+            }
+        }
+    });
+}
+
+#[test]
+fn live_elementwise_region_has_no_statement_cap() {
+    pollster::block_on(async {
+        const STATEMENTS: usize = 20;
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let input = Tensor::new::<f32, 1, _>(&device, &[1.0, 2.0, 3.0, 4.0]);
+        let mut current = input;
+        let mut live = Vec::new();
+        for _ in 0..STATEMENTS {
+            current = &current + 1.0f32;
+            live.push(current.clone());
+        }
+
+        let (_, kernels) = current.data.materialize();
+        assert_eq!(
+            kernels, 1,
+            "all live statements should lower as one legal multi-output region"
+        );
+        for (statement, tensor) in live.iter().enumerate() {
+            let values = tensor.as_slice::<1, f32>().await.unwrap();
+            for (index, base) in [1.0f32, 2.0, 3.0, 4.0].iter().enumerate() {
+                assert_eq!(values[[index]], base + statement as f32 + 1.0);
             }
         }
     });
@@ -817,16 +890,86 @@ fn single_target_materialization_records_and_replays() {
     });
 }
 
-/// Ordinary and encoder-tail materialization share the bare-QMatMul direct
-/// path. Wrapping QMatMul in an identity elementwise op forces the general
-/// resolver; all three paths must compute the same result.
 #[test]
-fn qmatmul_materialization_paths_match() {
+fn quantized_materialization_records_and_replays() {
+    pollster::block_on(async {
+        const N: usize = 7;
+        const K: usize = 11;
+
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let records_before = device.flush_plan_cache().record_count();
+        let replays_before = device.flush_plan_cache().replay_count();
+
+        for iteration in 0..2 {
+            let input_values = (0..K)
+                .map(|index| iteration as f32 + index as f32 * 0.125)
+                .collect::<Vec<_>>();
+            let weight_values = (0..N * K)
+                .map(|index| (index as f32 + iteration as f32) * 0.03125)
+                .collect::<Vec<_>>();
+            let weight_bytes = weight_values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
+            let weight =
+                crate::QMatrix::from_parts(&device, &weight_bytes, Box::new([N, K]), GgmlType::F32)
+                    .unwrap();
+            let input = Tensor::from_slice(&device, [1, K], &input_values);
+            let output = input.q_mat_mul(&weight);
+            let values = output.as_slice::<2, f32>().await.unwrap();
+            for row in 0..N {
+                let expected = (0..K)
+                    .map(|column| input_values[column] * weight_values[row * K + column])
+                    .sum::<f32>();
+                assert!((values[[0, row]] - expected).abs() < 1e-4);
+            }
+        }
+
+        assert!(device.flush_plan_cache().record_count() > records_before);
+        assert!(device.flush_plan_cache().replay_count() > replays_before);
+    });
+}
+
+#[test]
+fn dequantization_replay_keeps_raw_and_materialized_bindings_distinct() {
+    pollster::block_on(async {
+        const ROWS: usize = 4;
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let records_before = device.flush_plan_cache().record_count();
+        let replays_before = device.flush_plan_cache().replay_count();
+
+        for _ in 0..2 {
+            let raw = vec![0u8; ROWS * std::mem::size_of::<BlockQ4K>()];
+            let matrix = crate::QMatrix::from_parts(
+                &device,
+                &raw,
+                Box::new([ROWS, BlockQ4K::BLOCK_SIZE]),
+                GgmlType::Q4K,
+            )
+            .unwrap();
+            let dense = matrix.dequantize::<f32>();
+            let values = dense.as_slice::<2, f32>().await.unwrap();
+            assert!(values.as_slice().iter().all(|value| *value == 0.0));
+        }
+
+        assert!(device.flush_plan_cache().record_count() > records_before);
+        assert!(device.flush_plan_cache().replay_count() > replays_before);
+    });
+}
+
+/// Plain, encoder-tail, and epilogue-fused QMatMul materialization all cross
+/// the unified resolver and must compute the same result.
+#[test]
+fn qmatmul_materialization_forms_match() {
     pollster::block_on(async {
         const N: usize = 4;
         const K: usize = 8;
 
-        let Ok(direct_device) = Device::new().await else {
+        let Ok(plain_device) = Device::new().await else {
             return;
         };
         let Ok(general_device) = Device::new().await else {
@@ -852,17 +995,17 @@ fn qmatmul_materialization_paths_match() {
         };
         let input = [1.0f32, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0];
 
-        let direct = Tensor::new::<f32, 2, _>(&direct_device, &[input])
-            .q_mat_mul(&make_weight(&direct_device));
-        let (_, direct_kernels) = direct.data.materialize();
-        assert!(direct_kernels > 0, "direct QMatMul dispatched no kernels");
+        let plain = Tensor::new::<f32, 2, _>(&plain_device, &[input])
+            .q_mat_mul(&make_weight(&plain_device));
+        let (_, plain_kernels) = plain.data.materialize();
+        assert!(plain_kernels > 0, "plain QMatMul dispatched no kernels");
 
         let direct_tail =
             Tensor::new::<f32, 2, _>(&tail_device, &[input]).q_mat_mul(&make_weight(&tail_device));
         let (_, tail_kernels, ()) = direct_tail.data.materialize_with_tail(|_, _| ());
         assert!(
             tail_kernels > 0,
-            "encoder-tail direct QMatMul dispatched no kernels"
+            "encoder-tail QMatMul dispatched no kernels"
         );
 
         let qmatmul = Tensor::new::<f32, 2, _>(&general_device, &[input])
@@ -874,20 +1017,20 @@ fn qmatmul_materialization_paths_match() {
             "general-resolver QMatMul dispatched no kernels"
         );
 
-        let direct_values = direct.as_slice::<2, f32>().await.unwrap();
+        let plain_values = plain.as_slice::<2, f32>().await.unwrap();
         let tail_values = direct_tail.as_slice::<2, f32>().await.unwrap();
         let general_values = general.as_slice::<2, f32>().await.unwrap();
         for column in 0..N {
             let expected = (0..K)
                 .map(|k| input[k] * weights[column * K + k])
                 .sum::<f32>();
-            let direct_value = direct_values[[0, column]];
+            let plain_value = plain_values[[0, column]];
             let tail_value = tail_values[[0, column]];
             let general_value = general_values[[0, column]];
             let tolerance = 1e-4 * expected.abs().max(1.0);
             assert!(
-                (direct_value - expected).abs() <= tolerance,
-                "direct QMatMul mismatch at {column}: got {direct_value}, expected {expected}",
+                (plain_value - expected).abs() <= tolerance,
+                "plain QMatMul mismatch at {column}: got {plain_value}, expected {expected}",
             );
             assert!(
                 (tail_value - expected).abs() <= tolerance,
@@ -898,9 +1041,9 @@ fn qmatmul_materialization_paths_match() {
                 "general QMatMul mismatch at {column}: got {general_value}, expected {expected}",
             );
             assert!(
-                (direct_value - tail_value).abs() <= tolerance
-                    && (direct_value - general_value).abs() <= tolerance,
-                "QMatMul paths differ at {column}: direct {direct_value}, tail {tail_value}, general {general_value}",
+                (plain_value - tail_value).abs() <= tolerance
+                    && (plain_value - general_value).abs() <= tolerance,
+                "QMatMul forms differ at {column}: plain {plain_value}, tail {tail_value}, epilogue {general_value}",
             );
         }
     });

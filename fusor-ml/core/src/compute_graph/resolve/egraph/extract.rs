@@ -5,9 +5,9 @@
 //! explicit, while equivalent observations may reference the same e-class.
 //! Every observation starts at its identity selection.
 //! Two candidate sources drive switches:
-//! - **Pre-generated alternatives** (Stage-1 recognition rules) already in
-//!   the node's class.
-//! - **Fusion generators** (Stage 2): legal alternatives are planned once
+//! - **Pre-generated alternatives** from saturation already in the node's
+//!   class.
+//! - **Fusion generators**: legal alternatives are planned once
 //!   per allocation-independent local window and reused by repeated layers.
 //!   Successful generations are recorded into the value e-graph and
 //!   committed as switches.
@@ -25,11 +25,12 @@
 
 use egg::Language;
 
+use super::super::Resolver;
 use super::EGraphDriver;
 use super::interner::variant_dependencies;
 use super::lang::{FusorLang, Prov};
-use super::planning::{FusionPlanMemo, PlanLookup};
-use super::rules_fuse::{FusionView, Stage2Ctx};
+use super::rules_fuse::{FusionCtx, FusionView};
+use super::structural_memo::{FusionPlanMemo, PlanLookup};
 
 /// What extraction chose for one execution node.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +42,9 @@ pub(super) enum Selection {
 pub(super) struct Extraction {
     /// Indexed by `Prov`.
     pub(super) sel: Vec<Selection>,
+    /// Selection already materialized in the execution graph when this
+    /// extraction began. Only changes from this baseline need applying.
+    baseline: Vec<Selection>,
     /// Indexed by `Prov`; false = killed (no longer materialized).
     pub(super) needed: Vec<bool>,
 }
@@ -52,6 +56,7 @@ impl Extraction {
             .iter()
             .enumerate()
             .filter(|(prov, _)| self.needed[*prov])
+            .filter(|(prov, selection)| **selection != self.baseline[*prov])
             .filter_map(|(prov, selection)| match selection {
                 Selection::Identity => None,
                 Selection::Alt(enode) => Some((Prov(prov as u32), enode)),
@@ -62,7 +67,7 @@ impl Extraction {
 /// Stable tie-break between equal-cost recognition alternatives.
 fn kind_rank(enode: &FusorLang) -> u32 {
     match enode {
-        FusorLang::GraphOp(_, _, _) => 0,
+        FusorLang::RowProgram(_, _, _) => 0,
         FusorLang::QMatMul(_, _, _) => 1,
         FusorLang::QEmbedding(_, _, _) => 2,
         FusorLang::MatMul(_, _, _) => 3,
@@ -104,13 +109,67 @@ impl ExtractState {
         state
     }
 
+    /// Reconstruct selection/liveness from the execution graph after the
+    /// recognition builders have committed their chosen structural forms.
+    /// New row-program/assign alternatives are inserted into the same value
+    /// e-graph; removed cluster intermediates stay unneeded.
+    pub(super) fn from_execution(driver: &mut EGraphDriver, resolver: &Resolver) -> Self {
+        let count = driver.egraph.analysis.facts.len();
+        let mut state = ExtractState {
+            sel: vec![Selection::Identity; count],
+            needed: vec![false; count],
+            reads: vec![0; count],
+            consumers: vec![Vec::new(); count],
+        };
+
+        for index in 0..count {
+            let prov = Prov(index as u32);
+            let facts = driver.egraph.analysis.facts_of(prov);
+            let Some(&exec) = resolver.node_mapping.get(&facts.inner) else {
+                // Cached boundaries are not execution nodes but remain
+                // available as leaves. Removed cluster intermediates have an
+                // original exec index and stay dead.
+                state.needed[index] = facts.exec.is_none();
+                continue;
+            };
+            if !resolver.execution_graph.contains_node(exec) {
+                continue;
+            }
+            let variant = resolver.execution_graph[exec].variant.clone();
+            let enode = driver.ensure_current_variant(prov, variant);
+            state.sel[index] = if driver.is_identity(&enode) {
+                Selection::Identity
+            } else {
+                Selection::Alt(enode)
+            };
+            state.needed[index] = true;
+        }
+
+        // Adding the current variants can merge equivalent root classes.
+        // Canonicalize before translating their child classes back to
+        // provenances for read and liveness accounting.
+        driver.egraph.rebuild();
+        driver.refresh_prov_classes();
+
+        for prov in 0..count as u32 {
+            if !state.needed[prov as usize] {
+                continue;
+            }
+            for child in state.selected_child_provs(driver, Prov(prov)) {
+                state.reads[child as usize] += 1;
+                state.consumers[child as usize].push(prov);
+            }
+        }
+        state
+    }
+
     /// Child provenances of the current selection, one entry per read
     /// occurrence.
     pub(super) fn selected_child_provs(&self, driver: &EGraphDriver, prov: Prov) -> Vec<u32> {
         self.selected_enode(driver, prov)
             .children()
             .iter()
-            .map(|&child| driver.prov_of_class(child).0)
+            .map(|&child| driver.prov_of_class(child, &self.needed).0)
             .collect()
     }
 
@@ -136,7 +195,7 @@ impl ExtractState {
             candidate
                 .children()
                 .iter()
-                .map(|&child| driver.prov_of_class(child).0),
+                .map(|&child| driver.prov_of_class(child, &self.needed).0),
         )
     }
 
@@ -260,7 +319,7 @@ impl ExtractState {
             touched.push(child);
         }
         for &child in candidate.children() {
-            let child_prov = driver.prov_of_class(child).0;
+            let child_prov = driver.prov_of_class(child, &self.needed).0;
             self.reads[child_prov as usize] += 1;
             self.consumers[child_prov as usize].push(prov.0);
             touched.push(child_prov);
@@ -288,21 +347,28 @@ fn remove_one(consumers: &mut Vec<u32>, value: u32) {
 }
 
 impl EGraphDriver {
-    /// Stage-1 extraction: pre-generated alternatives only.
+    /// Extraction over pre-generated alternatives only.
     pub(super) fn extract(&self) -> Extraction {
-        // Stage 1 never mutates the e-graph during extraction, but the
+        // Recognition never mutates the e-graph during extraction, but the
         // shared loop wants `&mut self`; recognition alternatives are all
         // already present, so the generator hook is simply absent.
         let mut state = ExtractState::new(self);
+        let baseline = state.sel.clone();
         self.run_alternative_switches(&mut state);
         Extraction {
             sel: state.sel,
+            baseline,
             needed: state.needed,
         }
     }
 
-    pub(super) fn prov_of_class(&self, id: egg::Id) -> Prov {
-        self.provs_of_class[&self.egraph.find(id)][0]
+    pub(super) fn prov_of_class(&self, id: egg::Id, needed: &[bool]) -> Prov {
+        let provenances = &self.provs_of_class[&self.egraph.find(id)];
+        provenances
+            .iter()
+            .copied()
+            .find(|prov| needed[prov.0 as usize])
+            .expect("a selected e-class child must retain a needed provenance")
     }
 
     /// The identity e-node of a provenance: the one ingested for the
@@ -317,7 +383,7 @@ impl EGraphDriver {
         self.identity_payloads[node.prov().0 as usize] == node.payload()
     }
 
-    /// Cost-guided worklist over pre-generated class alternatives (Stage 1).
+    /// Cost-guided worklist over pre-generated class alternatives.
     fn run_alternative_switches(&self, state: &mut ExtractState) {
         let mut worklist: std::collections::VecDeque<u32> = (0..state.sel.len() as u32).collect();
         let mut queued = vec![true; state.sel.len()];
@@ -364,15 +430,20 @@ impl EGraphDriver {
         Some(state.commit(self, prov, candidate.clone(), &kills))
     }
 
-    /// Stage-2 extraction: the fusion-generator worklist. Seeded with every
+    /// Fusion extraction worklist, seeded with every
     /// fusion-eligible node in provenance order; after each committed
     /// switch, everything whose situation changed — the node itself, old and
     /// new producers, killed nodes' children, and consumers reachable
     /// through views — re-enters the worklist. Counts only decrease and the
     /// generators' gates are antitone in them, so the loop converges to the
     /// greatest fixpoint regardless of order: maximal legal fusion.
-    pub(super) fn extract_with_fusion(&mut self, ctx: &Stage2Ctx<'_>) -> Extraction {
-        let mut state = ExtractState::new(self);
+    pub(super) fn extract_with_fusion(
+        &mut self,
+        resolver: &Resolver,
+        ctx: &FusionCtx<'_>,
+    ) -> Extraction {
+        let mut state = ExtractState::from_execution(self, resolver);
+        let baseline = state.sel.clone();
         let mut plans = FusionPlanMemo::default();
         let count = state.sel.len() as u32;
         let mut worklist: std::collections::VecDeque<u32> = (0..count)
@@ -475,14 +546,13 @@ impl EGraphDriver {
             let sharing = plans.stats();
             let cost = self.extraction_cost(&state);
             tracing::info!(
-                "resolve_egg_plans windows={} unique={} hits={} misses={} templates={} negative={} fallbacks={} payloads={} specs={} dispatches={} bytes={} work={}",
+                "resolve_egg_plans windows={} unique={} hits={} misses={} templates={} negative={} payloads={} specs={} dispatches={} bytes={} work={}",
                 sharing.windows,
                 sharing.unique_windows,
                 sharing.hits,
                 sharing.misses,
                 sharing.templates,
                 sharing.negative_templates,
-                sharing.fallback_rebuilds,
                 self.egraph.analysis.payloads.payload_count(),
                 self.egraph.analysis.payloads.spec_count(),
                 cost.dispatches,
@@ -492,6 +562,7 @@ impl EGraphDriver {
         }
         Extraction {
             sel: state.sel,
+            baseline,
             needed: state.needed,
         }
     }

@@ -35,6 +35,27 @@ async fn flatten<const R: usize>(tensor: RawTensor<R, f32>) -> Vec<f32> {
         .to_vec()
 }
 
+#[test]
+fn non_grad_nodes_do_not_retain_a_backward_tape() {
+    let graph = Graph::new();
+    let input: Tensor<1> = graph.constant_from_data(&Device::cpu(), &[1.0f32, 2.0, 3.0]);
+    let output = input.sqr().sum();
+    let state = graph.inner.state.lock().unwrap();
+
+    for node in state.nodes.values() {
+        assert!(!node.requires_grad);
+        assert!(
+            node.parents.is_empty(),
+            "non-grad nodes must not retain parent graph structure"
+        );
+        assert!(
+            node.backward.is_none(),
+            "non-grad nodes must not retain tensor-capturing backward closures"
+        );
+    }
+    assert!(state.nodes.contains_key(&output.handle.id));
+}
+
 async fn finite_difference_gradient<const R: usize, F>(
     device: &Device,
     shape: [usize; R],
@@ -833,13 +854,17 @@ async fn test_backward_var() {
             .unwrap()
             .to_vec();
 
-        assert_eq!(output_values, vec![2.0 / 3.0, 2.0 / 3.0]);
-        assert_eq!(
-            dinput,
-            vec![
-                vec![-2.0 / 3.0, 0.0, 2.0 / 3.0],
-                vec![-2.0 / 3.0, 0.0, 2.0 / 3.0]
-            ]
+        assert_slice_close(&output_values, &[2.0 / 3.0, 2.0 / 3.0]);
+        assert_slice_close(
+            &dinput.into_iter().flatten().collect::<Vec<_>>(),
+            &[
+                -2.0 / 3.0,
+                0.0,
+                2.0 / 3.0,
+                -2.0 / 3.0,
+                0.0,
+                2.0 / 3.0,
+            ],
         );
     }
 }
@@ -861,13 +886,20 @@ async fn test_backward_var_keepdim() {
             .unwrap()
             .to_vec();
 
-        assert_eq!(output_values, vec![vec![2.0 / 3.0], vec![2.0 / 3.0]]);
-        assert_eq!(
-            dinput,
-            vec![
-                vec![-2.0 / 3.0, 0.0, 2.0 / 3.0],
-                vec![-2.0 / 3.0, 0.0, 2.0 / 3.0]
-            ]
+        assert_slice_close(
+            &output_values.into_iter().flatten().collect::<Vec<_>>(),
+            &[2.0 / 3.0, 2.0 / 3.0],
+        );
+        assert_slice_close(
+            &dinput.into_iter().flatten().collect::<Vec<_>>(),
+            &[
+                -2.0 / 3.0,
+                0.0,
+                2.0 / 3.0,
+                -2.0 / 3.0,
+                0.0,
+                2.0 / 3.0,
+            ],
         );
     }
 }

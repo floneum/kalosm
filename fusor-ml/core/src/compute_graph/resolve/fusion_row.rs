@@ -10,8 +10,6 @@
 //! collapse to one kernel this way — and so does any other normalization-
 //! shaped cluster the tensor API emits.
 
-use std::sync::Arc;
-
 use petgraph::algo::toposort;
 
 use crate::{
@@ -555,7 +553,7 @@ impl Resolver {
             graph,
             root_idx,
             &externals,
-            ExecutionVariant::GraphOp(Arc::new(operation)),
+            ExecutionVariant::RowProgram(operation),
         );
         true
     }

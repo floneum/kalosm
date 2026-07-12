@@ -2,16 +2,14 @@
 //!
 //! The tensor API expresses contractions as `Elementwise(Mul) + Reduce(Sum)`
 //! over a shared index space (see `Tensor::mat_mul` / `Tensor::q_mat_mul`).
-//! The matchers and builders here serve two callers: the equality-saturation
-//! recognition rules (`egraph::rules_recognize`, which match against the
-//! ingested identity forms — the exact canonical shapes the API emitted) and
-//! the single-target inner-graph fast path (`match_direct_qmatmul`).
+//! The matchers and builders are consumed by the equality-saturation
+//! recognition rules (`egraph::rules_recognize`), which match against the
+//! ingested identity forms emitted by the tensor interface.
 //! Anything they do not recognize lowers through the generic elementwise +
 //! reduce kernels — slower, but correct.
 
 use crate::{
-    MatMulOperation, ReduceOperation, dequantize::DequantizeOperation,
-    quantized::matmul::QMatMulOperation, reduce::ReduceOp,
+    MatMulOperation, ReduceOperation, quantized::matmul::QMatMulOperation, reduce::ReduceOp,
 };
 
 use super::*;
@@ -163,46 +161,6 @@ impl Contraction {
             device,
         );
         Some((operation, [a.0, b.0]))
-    }
-}
-
-impl ComputeGraphInner {
-    pub(crate) fn dequantize_variant(&self, key: NodeIndex) -> Option<DequantizeOperation> {
-        match &self.nodes.nodes.node_weight(key)?.variant {
-            ComputeGraphNodeVariant::QMatrix(op) => Some(op.clone()),
-            _ => None,
-        }
-    }
-
-    /// Recognize a composed contraction rooted at `key` directly on the inner
-    /// graph (the single-target fast path, no resolver involved). The multiply
-    /// must feed only this reduce.
-    pub(crate) fn match_direct_qmatmul(&self, key: NodeIndex) -> Option<QMatMulOperation> {
-        let ComputeGraphNodeVariant::Reduce(reduce) = &self.nodes.nodes.node_weight(key)?.variant
-        else {
-            return None;
-        };
-        let value = reduce.plain_input()?;
-        if self.get_cached_result(value).is_some() || self.has_live_reference(value) {
-            return None;
-        }
-        let ComputeGraphNodeVariant::Elementwise(nary) =
-            &self.nodes.nodes.node_weight(value)?.variant
-        else {
-            return None;
-        };
-        if self
-            .nodes
-            .nodes
-            .neighbors_directed(value, petgraph::Direction::Outgoing)
-            .count()
-            != 1
-        {
-            return None;
-        }
-        let contraction = match_contraction(reduce, nary)?;
-        let (operation, _) = contraction.to_q_mat_mul(|key| self.dequantize_variant(key))?;
-        Some(operation)
     }
 }
 

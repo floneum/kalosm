@@ -12,7 +12,6 @@
 //! Safety and gating:
 //! - Every graph exposes compatible matmul, row and elementwise operations.
 //!   Per-operation shape and binding limits decide eligibility.
-//!   `FUSOR_DISABLE_HORIZONTAL_FUSION` disables the pass.
 //! - Grouping is dependency-sound by a wave discipline: an operation joins
 //!   the open wave of its category only if it does not (transitively) depend
 //!   on any open-wave member of any category; a dependency on an open wave
@@ -115,12 +114,32 @@ impl SegOp {
     }
 }
 
+fn output_observations(
+    outputs: impl IntoIterator<Item = NodeIndex>,
+    shared_outputs: &FxHashMap<NodeIndex, Vec<NodeIndex>>,
+) -> Vec<NodeIndex> {
+    let mut observations = Vec::new();
+    let mut seen = FxHashSet::default();
+    for output in outputs {
+        if seen.insert(output) {
+            observations.push(output);
+        }
+        if let Some(aliases) = shared_outputs.get(&output) {
+            for &alias in aliases {
+                if seen.insert(alias) {
+                    observations.push(alias);
+                }
+            }
+        }
+    }
+    observations
+}
+
 /// Bindings per merged-matmul segment: `a`, `b`, and the output (whose
 /// allocation carries any split-K scratch).
 const MATMUL_SEGMENT_BINDINGS: usize = 3;
 
 pub(super) struct HorizontalMerger {
-    enabled: bool,
     device: crate::Device,
     /// Max total storage bindings per merged dispatch.
     budget: usize,
@@ -147,9 +166,8 @@ pub(super) struct HorizontalMerger {
 }
 
 impl HorizontalMerger {
-    pub(super) fn new(enabled: bool, device: &crate::Device) -> Self {
+    pub(super) fn new(device: &crate::Device) -> Self {
         Self {
-            enabled,
             device: device.clone(),
             // Total storage bindings per merged dispatch. The nary budget is
             // inputs-only (it assumes one extra output binding); merged
@@ -200,10 +218,7 @@ impl HorizontalMerger {
             ExecutionVariant::Reduce(op) => {
                 self.row_candidate(RowProgramOperation::from_reduce(op))
             }
-            ExecutionVariant::GraphOp(op) => {
-                let row = op.as_row_program()?.clone();
-                self.row_candidate(row)
-            }
+            ExecutionVariant::RowProgram(op) => self.row_candidate(op.clone()),
             ExecutionVariant::MatMul(op) => {
                 // Only matmuls bound for the cooperative-matrix kernel
                 // produce a profile; generic-path contractions and
@@ -235,15 +250,9 @@ impl HorizontalMerger {
         &mut self,
         node: &ExecutionNode,
         lowered: Option<QueuedOperation>,
+        shared_outputs: &FxHashMap<NodeIndex, Vec<NodeIndex>>,
         out: &mut Vec<(NodeIndex, QueuedOperation)>,
     ) {
-        if !self.enabled {
-            if let Some(op) = lowered {
-                out.push((node.inner_idx, op));
-            }
-            return;
-        }
-
         // Latest wave generation (per category) this node depends on,
         // through direct wave members and transitively via `dep_gen`.
         let mut dep = [0u32; CATEGORY_COUNT];
@@ -268,12 +277,26 @@ impl HorizontalMerger {
             ExecutionVariant::MatMul(op) => op.visit_dependencies(&mut visit),
             ExecutionVariant::QMatMul(op) => op.visit_dependencies(&mut visit),
             ExecutionVariant::QEmbedding(op) => op.visit_dependencies(&mut visit),
-            ExecutionVariant::GraphOp(op) => op.visit_dependencies(&mut visit),
+            ExecutionVariant::RowProgram(op) => op.visit_dependencies(&mut visit),
         }
 
         match self.categorize(node) {
             Some(seg) => {
                 let cat = seg.category();
+                // Multi-output regions are observed through every emitted
+                // inner node, not only the sink that represents the region
+                // in the execution graph. A later segment may depend on any
+                // of those observations and must therefore flush this wave.
+                let outputs: Vec<NodeIndex> = match &seg {
+                    SegOp::Region(op) => op
+                        .statements
+                        .iter()
+                        .filter_map(|statement| statement.output)
+                        .collect(),
+                    _ => vec![node.inner_idx],
+                };
+                let observations = output_observations(outputs, shared_outputs);
+                debug_assert!(observations.contains(&node.inner_idx));
                 // Flush the own-category wave first if this op depends on it
                 // (this also flushes the wave's ordered predecessors).
                 if dep[cat] == self.open_gen[cat] {
@@ -316,13 +339,18 @@ impl HorizontalMerger {
                     }
                 }
                 self.wave_bindings[cat] += seg_bindings;
-                self.member
-                    .insert(node.inner_idx, (cat, self.open_gen[cat]));
                 self.waves[cat].push((node.inner_idx, seg));
-                self.dep_gen.insert(node.inner_idx, dep);
+                for observation in observations {
+                    self.member.insert(observation, (cat, self.open_gen[cat]));
+                    self.dep_gen.insert(observation, dep);
+                }
             }
             None => {
-                self.dep_gen.insert(node.inner_idx, dep);
+                let observations =
+                    output_observations(std::iter::once(node.inner_idx), shared_outputs);
+                for &observation in &observations {
+                    self.dep_gen.insert(observation, dep);
+                }
                 let open: Vec<usize> = (0..CATEGORY_COUNT)
                     .filter(|&cat| dep[cat] == self.open_gen[cat])
                     .collect();
@@ -339,8 +367,9 @@ impl HorizontalMerger {
                         .iter()
                         .find(|&&cat| open.iter().all(|&o| o == cat || self.reaches(o, cat)))
                     {
-                        self.member
-                            .insert(node.inner_idx, (last, self.open_gen[last]));
+                        for observation in observations {
+                            self.member.insert(observation, (last, self.open_gen[last]));
+                        }
                         self.trailing[last].push((node.inner_idx, op));
                         return;
                     }
@@ -492,8 +521,93 @@ pub(crate) fn hash_merged_segments<O: Operation>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::kernel_selection::CooperativeMatrixKind;
+    use crate::nary_wise::{NaryExpr, NaryScalar};
+    use crate::region::{ElementwiseRegionOperation, RegionStatement};
     use crate::{Device, Tensor};
+
+    #[test]
+    fn region_output_alias_orders_a_dependent_region_after_its_wave() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let region = |inputs: Vec<NodeIndex>, outputs: &[usize]| ElementwiseRegionOperation {
+                inputs,
+                statements: outputs
+                    .iter()
+                    .map(|&output| RegionStatement {
+                        expression: NaryExpr::Scalar(NaryScalar::F32(0.0)),
+                        datatype: crate::DataTypeEnum::F32,
+                        output: Some(NodeIndex::new(output)),
+                    })
+                    .collect(),
+                shape: vec![1].into_boxed_slice(),
+            };
+            let first = ExecutionNode {
+                inner_idx: NodeIndex::new(10),
+                variant: ExecutionVariant::Region(region(vec![NodeIndex::new(0)], &[10, 11])),
+            };
+            let second = ExecutionNode {
+                inner_idx: NodeIndex::new(20),
+                variant: ExecutionVariant::Region(region(vec![NodeIndex::new(11)], &[20])),
+            };
+
+            let mut merger = HorizontalMerger::new(&device);
+            let mut output = Vec::new();
+            let shared_outputs = FxHashMap::default();
+            merger.push(&first, None, &shared_outputs, &mut output);
+            merger.push(&second, None, &shared_outputs, &mut output);
+            merger.finish(&mut output);
+
+            assert_eq!(
+                output.len(),
+                2,
+                "a consumer of any emitted region output must run in a later dispatch"
+            );
+        });
+    }
+
+    #[test]
+    fn shared_output_alias_orders_its_consumer_after_the_producer_wave() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let region = |inputs: Vec<NodeIndex>, output: usize| ElementwiseRegionOperation {
+                inputs,
+                statements: vec![RegionStatement {
+                    expression: NaryExpr::Scalar(NaryScalar::F32(0.0)),
+                    datatype: crate::DataTypeEnum::F32,
+                    output: Some(NodeIndex::new(output)),
+                }],
+                shape: vec![1].into_boxed_slice(),
+            };
+            let first = ExecutionNode {
+                inner_idx: NodeIndex::new(10),
+                variant: ExecutionVariant::Region(region(vec![NodeIndex::new(0)], 10)),
+            };
+            let second = ExecutionNode {
+                inner_idx: NodeIndex::new(20),
+                variant: ExecutionVariant::Region(region(vec![NodeIndex::new(11)], 20)),
+            };
+            let shared_outputs =
+                FxHashMap::from_iter([(NodeIndex::new(10), vec![NodeIndex::new(11)])]);
+
+            let mut merger = HorizontalMerger::new(&device);
+            let mut output = Vec::new();
+            merger.push(&first, None, &shared_outputs, &mut output);
+            merger.push(&second, None, &shared_outputs, &mut output);
+            merger.finish(&mut output);
+
+            assert_eq!(
+                output.len(),
+                2,
+                "a consumer of a shared observation must run after its representative"
+            );
+        });
+    }
 
     #[test]
     fn standard_graph_merges_independent_qkv_matmuls() {

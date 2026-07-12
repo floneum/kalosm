@@ -62,8 +62,7 @@ impl BufferLedger {
         device: &crate::Device,
         shadow_consumers: Option<&FxHashMap<NodeIndex, usize>>,
     ) -> Self {
-        let enabled = std::env::var_os("FUSOR_DISABLE_ALLOC_REUSE").is_none()
-            && !device.poisons_allocations();
+        let enabled = !device.poisons_allocations();
         Self {
             enabled,
             accepting: enabled,

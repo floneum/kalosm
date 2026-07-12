@@ -1,11 +1,5 @@
-//! Per-tile conformance sweep over the full cooperative-matrix tile table.
-//!
-//! `FUSOR_FORCE_COOP_TILE` pins each geometry in turn and every tile must
-//! produce reference-correct results over aligned, edge-masked, batched, and
-//! transposed-B shapes. The (128, 128) entry shipped in the table for months
-//! while being unreachable and miscomputing — a general tile-selection cost
-//! model reaches every entry, so every entry has to earn its place here
-//! before selection may consider it.
+//! Automatic cooperative-matrix selector conformance over shapes derived
+//! from every tile-table geometry.
 
 use fusor_core::{Device, Layout, Tensor};
 
@@ -32,9 +26,8 @@ fn cpu_matmul(a: &[f32], b: &[f32], batch: usize, m: usize, k: usize, n: usize) 
     out
 }
 
-async fn check_forced(
+async fn check_automatic(
     device: &Device,
-    tile: (u32, u32),
     batch: usize,
     m: usize,
     k: usize,
@@ -73,20 +66,16 @@ async fn check_forced(
                 let got = actual[[bi, mi, ni]];
                 assert!(
                     (got - want).abs() < 1e-3 + want.abs() * 1e-3,
-                    "tile {}x{} batch={batch} m={m} k={k} n={n} transpose_b={transpose_b} \
+                    "batch={batch} m={m} k={k} n={n} transpose_b={transpose_b} \
                      [{bi}, {mi}, {ni}]: got {got}, expected {want}",
-                    tile.0,
-                    tile.1,
                 );
             }
         }
     }
 }
 
-/// One sequential sweep: the tile-forcing env is process-global, so all
-/// forced cases run inside a single test body.
 #[test]
-fn every_coop_tile_entry_computes_correctly() {
+fn automatic_coop_selection_computes_table_derived_shapes_correctly() {
     pollster::block_on(async {
         let Ok(device) = Device::new().await else {
             return;
@@ -96,18 +85,12 @@ fn every_coop_tile_entry_computes_correctly() {
             .map(|entry| (entry.tile.bm, entry.tile.bn))
             .collect();
         for (bm, bn) in geometries {
-            // SAFETY: this test mutates the process environment; the sweep
-            // is one sequential test body, and the selection code re-reads
-            // the variable per call.
-            unsafe { std::env::set_var("FUSOR_FORCE_COOP_TILE", format!("{bm}x{bn}")) };
             let (m, n) = (2 * bm as usize, 2 * bn as usize);
             // Aligned, all edges masked at once, batched, and transposed-B.
-            check_forced(&device, (bm, bn), 1, m, 64, n, false).await;
-            check_forced(&device, (bm, bn), 1, m - 13, 50, n.saturating_sub(9).max(1), false)
-                .await;
-            check_forced(&device, (bm, bn), 3, m, 64, n, false).await;
-            check_forced(&device, (bm, bn), 2, m, 64, n, true).await;
+            check_automatic(&device, 1, m, 64, n, false).await;
+            check_automatic(&device, 1, m - 13, 50, n.saturating_sub(9).max(1), false).await;
+            check_automatic(&device, 3, m, 64, n, false).await;
+            check_automatic(&device, 2, m, 64, n, true).await;
         }
-        unsafe { std::env::remove_var("FUSOR_FORCE_COOP_TILE") };
     });
 }
