@@ -18,7 +18,7 @@ use super::super::{ExecutionVariant, Resolver};
 use super::EGraphDriver;
 use super::analysis::{FusorAnalysis, NodeFacts};
 use super::interner::variant_dependencies;
-use super::lang::{FusorLang, Prov};
+use super::lang::{AllocationId, FusorLang, Prov};
 use crate::compute_graph::{ComputeGraphInner, NodeIndex};
 
 /// Build the e-node for `variant` with the given children (in
@@ -39,13 +39,20 @@ pub(super) fn enode_for(
         }
     };
     match variant {
-        ExecutionVariant::Tensor(_) => {
+        ExecutionVariant::Tensor(data) => {
             debug_assert!(children.is_empty());
-            FusorLang::TensorLeaf(prov)
+            FusorLang::TensorLeaf(
+                prov,
+                AllocationId(std::sync::Arc::as_ptr(data.buffer()) as usize),
+            )
         }
-        ExecutionVariant::QMatrix(_) => {
+        ExecutionVariant::QMatrix(op) => {
             debug_assert!(children.is_empty());
-            FusorLang::QMatrixLeaf(prov, intern(analysis, variant))
+            FusorLang::QMatrixLeaf(
+                prov,
+                AllocationId(std::sync::Arc::as_ptr(op.matrix.buffer()) as usize),
+                intern(analysis, variant),
+            )
         }
         ExecutionVariant::Elementwise(_) => {
             FusorLang::Elementwise(prov, intern(analysis, variant), children.into_boxed_slice())
@@ -87,7 +94,10 @@ impl EGraphDriver {
             }),
             class_of: Vec::new(),
             identity_payloads: Vec::new(),
+            identity_enodes: Vec::new(),
+            identity_variants: Vec::new(),
             prov_of: Default::default(),
+            provs_of_class: Default::default(),
         };
         let target_set: FxHashSet<NodeIndex> = resolver.targets.iter().copied().collect();
 
@@ -119,9 +129,18 @@ impl EGraphDriver {
                                 consumer_count: 0,
                             },
                         );
-                        let id = driver.egraph.add(FusorLang::Boundary(prov));
+                        let allocation = graph
+                            .get_cached_result(inner)
+                            .map(
+                                |data| AllocationId(std::sync::Arc::as_ptr(data.buffer()) as usize),
+                            )
+                            .unwrap_or(AllocationId(inner.index()));
+                        let boundary = FusorLang::Boundary(prov, allocation);
+                        let id = driver.egraph.add(boundary.clone());
                         driver.class_of.push(id);
                         driver.identity_payloads.push(None);
+                        driver.identity_enodes.push(boundary);
+                        driver.identity_variants.push(None);
                         debug_assert_eq!(driver.class_of.len(), prov.0 as usize + 1);
                         continue;
                     };
@@ -146,6 +165,10 @@ impl EGraphDriver {
                     // and the validation pass below re-checks every slot.
                     driver.class_of.push(Id::from(0usize));
                     driver.identity_payloads.push(None);
+                    driver
+                        .identity_enodes
+                        .push(FusorLang::Boundary(prov, AllocationId(inner.index())));
+                    driver.identity_variants.push(None);
                     stack.push(Frame::Exit { inner, prov });
                     let deps = variant_dependencies(&resolver.execution_graph[exec_idx].variant);
                     for &dep in deps.iter().rev() {
@@ -162,12 +185,15 @@ impl EGraphDriver {
                     let enode =
                         enode_for(&mut driver.egraph.analysis, &variant, prov, children, true);
                     driver.identity_payloads[prov.0 as usize] = enode.payload();
+                    driver.identity_enodes[prov.0 as usize] = enode.clone();
+                    driver.identity_variants[prov.0 as usize] = Some(variant);
                     let id = driver.egraph.add(enode);
                     driver.class_of[prov.0 as usize] = id;
                 }
             }
         }
         driver.egraph.rebuild();
+        driver.refresh_prov_classes();
         debug_assert_eq!(
             driver.class_of.len(),
             driver.egraph.analysis.facts.len(),
@@ -175,10 +201,10 @@ impl EGraphDriver {
         );
         #[cfg(debug_assertions)]
         for (index, &id) in driver.class_of.iter().enumerate() {
-            let class = &driver.egraph[driver.egraph.find(id)];
-            assert_eq!(
-                class.data.prov.0 as usize, index,
-                "class slot must hold the class of its own provenance"
+            let class = driver.egraph.find(id);
+            assert!(
+                driver.provs_of_class[&class].contains(&Prov(index as u32)),
+                "class slot must contain its own provenance"
             );
         }
         driver
@@ -347,7 +373,87 @@ mod tests {
                     "cached producer must ingest as an opaque boundary leaf"
                 );
                 let class = &driver.egraph[driver.egraph.find(driver.class_of[x_prov.0 as usize])];
-                assert!(matches!(class.nodes.as_slice(), [FusorLang::Boundary(_)]));
+                assert!(matches!(class.nodes.as_slice(), [FusorLang::Boundary(..)]));
+            });
+        });
+    }
+
+    #[test]
+    fn equivalent_pure_nodes_share_an_eclass() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let input = Tensor::new(&device, &[1.0f32, 2.0, 3.0, 4.0]);
+            let left = &input * 2.0;
+            let right = &input * 2.0;
+            with_ingested(&device, &[&left, &right], |_, _, driver| {
+                let left_class = driver.class_for(left.data().key).unwrap();
+                let right_class = driver.class_for(right.data().key).unwrap();
+                assert_eq!(left_class, right_class);
+                assert_eq!(driver.provs_of_class[&left_class].len(), 2);
+            });
+        });
+    }
+
+    #[test]
+    fn allocation_identity_distinguishes_equal_contents() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let a = Tensor::new(&device, &[1.0f32, 2.0, 3.0, 4.0]);
+            let b = Tensor::new(&device, &[1.0f32, 2.0, 3.0, 4.0]);
+            let left = &a * 2.0;
+            let right = &b * 2.0;
+            with_ingested(&device, &[&left, &right], |_, _, driver| {
+                assert_ne!(
+                    driver.class_for(left.data().key),
+                    driver.class_for(right.data().key)
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn congruence_shares_equivalent_nested_subgraphs() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let input = Tensor::new(&device, &[1.0f32, 2.0, 3.0, 4.0]);
+            let left = (&input * 2.0) + 1.0;
+            let right = (&input * 2.0) + 1.0;
+            with_ingested(&device, &[&left, &right], |_, _, driver| {
+                assert_eq!(
+                    driver.class_for(left.data().key),
+                    driver.class_for(right.data().key)
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn shared_eclass_coalesces_to_one_execution_node() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let input = Tensor::new(&device, &[1.0f32, 2.0, 3.0, 4.0]);
+            let left = &input * 2.0;
+            let right = &input * 2.0;
+            let targets = vec![left.data().key, right.data().key];
+            device.compute_graph().with_mut(|graph| {
+                let mut resolver = Resolver::new_batch(graph, targets.clone());
+                for &target in &targets {
+                    resolver.build_execution_graph(graph, target);
+                }
+                resolver.coalesce_equivalent_eclasses(graph);
+                assert_eq!(resolver.execution_graph.node_count(), 2);
+                assert_eq!(
+                    resolver.shared_outputs.values().flatten().copied().collect::<Vec<_>>(),
+                    vec![targets[1]]
+                );
             });
         });
     }

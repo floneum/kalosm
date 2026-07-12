@@ -1,8 +1,9 @@
 //! Greedy extraction: choose one form per execution node, maximizing fusion
 //! under the profile's legality gates.
 //!
-//! The unit of materialization is the execution node (1:1 with e-classes
-//! under provenance salting). Every node starts at its identity selection.
+//! Selection state remains per observation so liveness constraints are
+//! explicit, while equivalent observations may reference the same e-class.
+//! Every observation starts at its identity selection.
 //! Two candidate sources drive switches:
 //! - **Pre-generated alternatives** (Stage-1 recognition rules) already in
 //!   the node's class, ranked by [`kind_rank`].
@@ -71,7 +72,7 @@ fn kind_rank(enode: &FusorLang) -> u32 {
         FusorLang::Elementwise(_, _, _) => 6,
         FusorLang::View(_, _, _) => 7,
         FusorLang::Assign(_, _, _) => 8,
-        FusorLang::TensorLeaf(_) | FusorLang::Boundary(_) | FusorLang::QMatrixLeaf(_, _) => 9,
+        FusorLang::TensorLeaf(..) | FusorLang::Boundary(..) | FusorLang::QMatrixLeaf(..) => 9,
     }
 }
 
@@ -99,15 +100,6 @@ impl ExtractState {
             for child in state.selected_child_provs(driver, Prov(prov)) {
                 state.reads[child as usize] += 1;
                 state.consumers[child as usize].push(prov);
-            }
-        }
-        #[cfg(debug_assertions)]
-        for (prov, facts) in driver.egraph.analysis.facts.iter().enumerate() {
-            if facts.exec.is_some() {
-                debug_assert_eq!(
-                    state.reads[prov], facts.consumer_count,
-                    "identity reads must reproduce execution-graph consumer counts"
-                );
             }
         }
         state
@@ -241,18 +233,13 @@ impl EGraphDriver {
     }
 
     pub(super) fn prov_of_class(&self, id: egg::Id) -> Prov {
-        self.egraph[self.egraph.find(id)].data.prov
+        self.provs_of_class[&self.egraph.find(id)][0]
     }
 
     /// The identity e-node of a provenance: the one ingested for the
     /// execution node itself (unique per class by construction).
     pub(super) fn identity_enode(&self, prov: Prov) -> &FusorLang {
-        let id = self.egraph.find(self.class_of[prov.0 as usize]);
-        self.egraph[id]
-            .nodes
-            .iter()
-            .find(|node| node.prov() == prov && self.is_identity(node))
-            .expect("every provenance has its ingested identity e-node")
+        &self.identity_enodes[prov.0 as usize]
     }
 
     /// Whether an e-node is the ingested identity form (rather than a

@@ -85,7 +85,7 @@ fn datatype_element(datatype: DataTypeEnum) -> Option<tile_ir::ElementType> {
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct QEmbeddingOperation {
     pub(crate) indexes: NodeIndex,
     pub(crate) matrix: QMatrix,

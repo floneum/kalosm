@@ -22,7 +22,7 @@ const BLOCKSIZE: u32 = 256;
 /// logical value space). `defined` is a prefix box of `layout.shape()`:
 /// coordinates with `coord_i < defined[i]` for every axis read data;
 /// anything outside reads `fill`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ViewStage {
     pub(crate) layout: Layout,
     pub(crate) input_shape: Box<[usize]>,
@@ -133,7 +133,7 @@ impl ViewStage {
 ///
 /// `input` is never itself a view node: view-over-view always collapses
 /// into one node at construction.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ViewOperation {
     pub(crate) input: NodeIndex,
     /// Innermost first; never empty.

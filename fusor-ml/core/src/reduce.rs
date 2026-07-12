@@ -43,7 +43,7 @@ fn unsqueeze_dim(tensor: &Tensor, dim_idx: usize) -> Tensor {
 /// `input(0, rank)`; the resolver widens it by inlining upstream elementwise
 /// expressions, so composed map-reduce clusters (contractions included) lower
 /// as a single kernel without materializing the intermediate.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReduceOperation {
     /// Producer inputs referenced by `expression`.
     pub(crate) inputs: Vec<NodeIndex>,
@@ -190,7 +190,7 @@ impl Operation for ReduceOperation {
     }
 }
 
-#[derive(Clone, Debug, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReduceFunction {
     pub(crate) name: Option<String>,
     pub(crate) op: ReduceOp,

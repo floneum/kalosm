@@ -9,6 +9,35 @@ use super::merge_horizontal::MergedSegments;
 use super::*;
 use crate::mir::kernel_backend::DirectKernel;
 
+fn cache_output(
+    graph: &mut ComputeGraphInner,
+    node: NodeIndex,
+    result: &TensorData,
+    shared_outputs: &FxHashMap<NodeIndex, Vec<NodeIndex>>,
+) {
+    graph.set_cached_result(node, result.clone());
+    if let Some(observations) = shared_outputs.get(&node) {
+        for &observation in observations {
+            graph.set_cached_result(observation, result.clone());
+        }
+    }
+}
+
+fn record_shared_outputs(
+    recorder: &std::cell::RefCell<flush_replay::PlanRecorder>,
+    node: NodeIndex,
+    result: &TensorData,
+    shared_outputs: &FxHashMap<NodeIndex, Vec<NodeIndex>>,
+) {
+    if let Some(observations) = shared_outputs.get(&node) {
+        for &observation in observations {
+            recorder
+                .borrow_mut()
+                .record_view_alias(observation, result, &[node]);
+        }
+    }
+}
+
 impl MergedSegments {
     /// Segment (node, op) views in queue order.
     fn segment_ops(&self) -> Vec<(NodeIndex, &dyn Operation)> {
@@ -331,6 +360,7 @@ impl Resolver {
         queued_operations: Vec<(NodeIndex, QueuedOperation)>,
         remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
         target_set: &FxHashSet<NodeIndex>,
+        shared_outputs: &FxHashMap<NodeIndex, Vec<NodeIndex>>,
         ledger: &mut super::alloc_reuse::BufferLedger,
         plan_cache_enabled: bool,
         commands: &mut Vec<CommandRecord>,
@@ -356,7 +386,7 @@ impl Resolver {
             if let Some(result) = view_result {
                 let mut deps = Vec::new();
                 graph.visit_dependencies(node, &mut |dep| deps.push(dep));
-                graph.set_cached_result(node, result.clone());
+                cache_output(graph, node, &result, shared_outputs);
                 ledger.note_transient(result.buffer());
                 ledger.consume(graph, &deps, target_set);
                 steps.push(QueueStep::View { node, result, deps });
@@ -369,7 +399,7 @@ impl Resolver {
                 Self::try_prepare_in_place_slice_assign_copy(graph, slice_assign)
             });
             if let Some((output, copies)) = slice_copy {
-                graph.set_cached_result(node, output.clone());
+                cache_output(graph, node, &output, shared_outputs);
                 ledger.note_transient(output.buffer());
                 for copy in &copies {
                     ledger.note_transient(&copy.source);
@@ -395,7 +425,7 @@ impl Resolver {
                     // Cache the output before the death accounting: a
                     // source is only releasable once every alive-uncached
                     // descendant (this very operation) is cached.
-                    graph.set_cached_result(node, resolved.clone());
+                    cache_output(graph, node, &resolved, shared_outputs);
                     let mut deps = Vec::new();
                     queued_operation.visit_dependencies(&mut |dep| deps.push(dep));
                     ledger.consume(graph, &deps, target_set);
@@ -422,7 +452,7 @@ impl Resolver {
                             }
                             resolved = swapped;
                             claimed_from = ledger.chosen_source(node);
-                            graph.set_cached_result(node, resolved.clone());
+                            cache_output(graph, node, &resolved, shared_outputs);
                         }
                     }
                     ledger.note_alloc(&resolved);
@@ -514,7 +544,7 @@ impl Resolver {
                                     &op.shape,
                                     statement.datatype,
                                 );
-                                graph.set_cached_result(out_node, output.clone());
+                                cache_output(graph, out_node, &output, shared_outputs);
                                 fresh_outputs.push(output);
                             }
                             {
@@ -567,7 +597,7 @@ impl Resolver {
                                     claimed_from = ledger.chosen_source(out_node);
                                 }
                                 if claimed_from.is_some() {
-                                    graph.set_cached_result(out_node, output.clone());
+                                    cache_output(graph, out_node, &output, shared_outputs);
                                 }
                                 ledger.note_alloc(&output);
                                 ledger.note_transient(output.buffer());
@@ -582,7 +612,7 @@ impl Resolver {
                             let MirValue::Tensor(output) = op.output(graph, &inputs) else {
                                 panic!("merged segment output is not a tensor");
                             };
-                            graph.set_cached_result(seg_node, output.clone());
+                            cache_output(graph, seg_node, &output, shared_outputs);
                             ledger.note_alloc(&output);
                             for value in &inputs {
                                 if let MirValue::Tensor(tensor) = value {
@@ -697,6 +727,7 @@ impl Resolver {
                         recorder
                             .borrow_mut()
                             .record_view_alias(node, &result, &deps);
+                        record_shared_outputs(recorder, node, &result, shared_outputs);
                     }
                     Self::release_dead_intermediates_from_graph(
                         graph,
@@ -748,6 +779,12 @@ impl Resolver {
                                     &item.op,
                                     *claimed_from,
                                 );
+                                record_shared_outputs(
+                                    recorder,
+                                    item.node,
+                                    resolved,
+                                    shared_outputs,
+                                );
                             }
                             (
                                 QueuedOperation::Merged(merged),
@@ -767,6 +804,14 @@ impl Resolver {
                                         &built.kernels,
                                         merged,
                                     );
+                                    for (node, output, _) in outputs {
+                                        record_shared_outputs(
+                                            recorder,
+                                            *node,
+                                            output,
+                                            shared_outputs,
+                                        );
+                                    }
                                 } else {
                                     recorder.borrow_mut().poison();
                                 }
@@ -823,6 +868,7 @@ impl Resolver {
             vec![(target, QueuedOperation::Operation(operation))],
             &mut remaining_consumers,
             &target_set,
+            &Default::default(),
             &mut ledger,
             device.kernel_cache().direct_plan_cache().enabled(),
             &mut commands,
@@ -943,6 +989,7 @@ pub(super) fn encode_command_records(
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::{Device, Tensor};
 
     #[test]
     fn warm_build_probe_keeps_queue_serial() {
@@ -974,5 +1021,32 @@ mod tests {
             32,
             COLD_BUILD_THRESHOLD,
         ));
+    }
+
+    #[test]
+    fn shared_eclass_dispatches_once_and_caches_every_observation() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let input = Tensor::new(&device, &[1.0f32, 2.0, 3.0, 4.0]);
+            let left = &input * 2.0;
+            let right = &input * 2.0;
+            let targets = vec![left.data().key, right.data().key];
+            let (kernels, same_buffer) = device.compute_graph().with_mut(|graph| {
+                let mut resolver = Resolver::new_batch(graph, targets.clone());
+                let mut removed = Vec::new();
+                let result = resolver.run(graph, &mut removed);
+                let left = graph.get_cached_result(targets[0]).unwrap();
+                let right = graph.get_cached_result(targets[1]).unwrap();
+                (
+                    result.total_kernels,
+                    std::sync::Arc::ptr_eq(left.buffer(), right.buffer()),
+                )
+            });
+            device.poll_wait();
+            assert_eq!(kernels, 1);
+            assert!(same_buffer);
+        });
     }
 }

@@ -13,10 +13,10 @@
 //! decisions are reproduced by the mimic-greedy extractor, and the chosen
 //! terms are applied back onto the execution graph as in-place deltas.
 //!
-//! Every e-node is salted with the provenance of the execution node it
-//! denotes, so distinct graph nodes never share an e-class: kernel counts are
-//! byte-identical to the destructive optimizer (no accidental CSE). Dropping
-//! the salt is the future opt-in CSE switch.
+//! Pure e-node identity is semantic: operator payload plus child e-classes.
+//! Allocation-backed leaves use allocation identity. Multiple execution-graph
+//! observations of one e-class are materialized once and cached under every
+//! observed `NodeIndex`.
 
 mod analysis;
 mod apply;
@@ -49,8 +49,11 @@ pub(super) struct EGraphDriver {
     /// tensor/boundary leaves). Distinguishes the identity form from
     /// rule-minted alternatives during extraction.
     identity_payloads: Vec<Option<PayloadId>>,
+    identity_enodes: Vec<FusorLang>,
+    identity_variants: Vec<Option<ExecutionVariant>>,
     /// Inner-graph node -> provenance.
     prov_of: FxHashMap<NodeIndex, lang::Prov>,
+    provs_of_class: FxHashMap<Id, Vec<lang::Prov>>,
 }
 
 /// One rewrite rule: a programmatic searcher + applier pair run as whole
@@ -71,6 +74,15 @@ struct RuleCtx<'a> {
 }
 
 impl EGraphDriver {
+    fn refresh_prov_classes(&mut self) {
+        self.provs_of_class.clear();
+        for (index, &class) in self.class_of.iter().enumerate() {
+            self.provs_of_class
+                .entry(self.egraph.find(class))
+                .or_default()
+                .push(lang::Prov(index as u32));
+        }
+    }
     /// Add `variant` as an alternative form of `root`'s execution node.
     /// Children are derived from the payload's own dependency list so the
     /// payload/children lockstep has one owner. Returns false when the
@@ -126,6 +138,7 @@ impl EGraphDriver {
                 changed |= rule.apply_round(self, ctx);
             }
             self.egraph.rebuild();
+            self.refresh_prov_classes();
             if !changed {
                 return;
             }
@@ -186,5 +199,77 @@ impl Resolver {
             driver.extract_with_fusion(&ctx)
         };
         self.apply_egraph_deltas(graph, &driver, &extraction);
+    }
+
+    /// Collapse execution nodes that ingestion places in the same semantic
+    /// e-class. The representative performs the work; every other inner
+    /// `NodeIndex` remains an observation of that result in `shared_outputs`.
+    pub(super) fn coalesce_equivalent_eclasses(&mut self, graph: &mut ComputeGraphInner) {
+        let driver = EGraphDriver::ingest(self, graph);
+        let groups: Vec<Vec<lang::Prov>> = driver.provs_of_class.values().cloned().collect();
+        for group in groups {
+            let executions: Vec<_> = group
+                .into_iter()
+                .filter_map(|prov| {
+                    let facts = driver.egraph.analysis.facts_of(prov);
+                    let exec = facts.exec?;
+                    let variant = &self.execution_graph[exec].variant;
+                    matches!(
+                        variant,
+                        ExecutionVariant::Elementwise(_)
+                            | ExecutionVariant::Reduce(_)
+                            | ExecutionVariant::View(_)
+                            | ExecutionVariant::MatMul(_)
+                            | ExecutionVariant::QMatMul(_)
+                            | ExecutionVariant::QEmbedding(_)
+                            | ExecutionVariant::GraphOp(_)
+                    )
+                    .then_some(exec)
+                })
+                .collect();
+            let Some((&representative, duplicates)) = executions.split_first() else {
+                continue;
+            };
+            let representative_inner = self.execution_graph[representative].inner_idx;
+            for &duplicate in duplicates {
+                if !self.execution_graph.contains_node(duplicate) {
+                    continue;
+                }
+                let duplicate_inner = self.execution_graph[duplicate].inner_idx;
+                let consumers: Vec<_> = self
+                    .execution_graph
+                    .neighbors_directed(duplicate, petgraph::Direction::Outgoing)
+                    .collect();
+                let dependencies: Vec<_> = self
+                    .execution_graph
+                    .neighbors_directed(duplicate, petgraph::Direction::Incoming)
+                    .collect();
+                for consumer in consumers {
+                    if consumer != representative
+                        && self
+                            .execution_graph
+                            .find_edge(representative, consumer)
+                            .is_none()
+                    {
+                        self.execution_graph.add_edge(representative, consumer, ());
+                    }
+                }
+                self.execution_graph.remove_node(duplicate);
+                self.node_mapping.remove(&duplicate_inner);
+                self.shared_outputs
+                    .entry(representative_inner)
+                    .or_default()
+                    .push(duplicate_inner);
+                graph.add_dependency_edge(representative_inner, duplicate_inner);
+                if let Some(recorder) = &self.recorder {
+                    recorder
+                        .borrow_mut()
+                        .record_physical_edge(representative_inner, duplicate_inner);
+                }
+                for dependency in dependencies {
+                    self.remove_node_if_dead(dependency);
+                }
+            }
+        }
     }
 }

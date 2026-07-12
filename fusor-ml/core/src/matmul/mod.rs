@@ -19,7 +19,7 @@ pub fn get_optimal_params(m: usize, n: usize, k: usize, device: &Device) -> MatM
     select_dense_matmul_params(m, n, k, device, &[CooperativeMatrixKind::F32F32M8N8K8])
 }
 
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum MatMulParams {
     Vector(sgemv::SgemvParams),
     MatMul(sgemm::SgemmParams),
@@ -30,7 +30,7 @@ pub enum MatMulParams {
 /// space: conv's sliding windows. The kernels concretize it lazily — the
 /// coop path composes it with the node's runtime buffer layout, the generic
 /// reduce substitutes it into the load coordinates.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OperandBaseMap {
     pub(crate) layout: Layout,
     pub(crate) base_shape: Box<[usize]>,
@@ -52,7 +52,7 @@ impl std::hash::Hash for OperandBaseMap {
 /// im2col operand keeps the windowed view's dims (mapped onto the node by
 /// `base_map`), and the kernels divmod the flat matrix coordinates back
 /// apart per load.
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub(crate) struct MatrixOperand {
     pub(crate) shape: Box<[usize]>,
     pub(crate) batch_dims: usize,
@@ -136,7 +136,7 @@ impl MatrixOperand {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MatMulOperation {
     pub(crate) datatype: DataTypeEnum,
     pub(crate) first: NodeIndex,

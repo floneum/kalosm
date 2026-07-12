@@ -418,7 +418,7 @@ pub(crate) struct ElementwiseEpilogue {
     pub(crate) output_datatype: DataTypeEnum,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct QMatMulOperation {
     pub(crate) input_datatype: DataTypeEnum,
     pub(crate) input: NodeIndex,

@@ -21,7 +21,7 @@ use crate::nary_wise::NaryExpr;
 impl EGraphDriver {
     /// The ingested (identity) payload of a provenance, if it has one.
     pub(super) fn identity_variant(&self, prov: Prov) -> Option<&ExecutionVariant> {
-        self.identity_payloads[prov.0 as usize].map(|id| self.egraph.analysis.payloads.get(id))
+        self.identity_variants[prov.0 as usize].as_ref()
     }
 
     pub(super) fn prov_count(&self) -> u32 {

@@ -414,6 +414,7 @@ impl Resolver {
             self.form_elementwise_regions(graph);
             self.mark_dense_codegen();
         }
+        self.coalesce_equivalent_eclasses(graph);
         run_fixpoint
     }
 

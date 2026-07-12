@@ -175,7 +175,7 @@ impl NaryFunction {
 
 /// A chain of unary functions used for pre/post processing in reduce/matmul/dequantize.
 /// Each function takes a single input and produces a single output; the chain is applied sequentially.
-#[derive(Clone, Debug, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct UnaryFunctionChain {
     input_datatype: DataTypeEnum,
     pub(crate) functions: Vec<NaryFunction>,
@@ -472,7 +472,7 @@ impl NaryExpr {
 
 /// N-ary operation combining multiple inputs with arbitrary operations.
 /// Can fuse chains of element-wise and pair-wise operations into a single kernel.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ElementwiseOperation {
     /// Input tensors (leaves of expression tree)
     pub(crate) inputs: Vec<NodeIndex>,

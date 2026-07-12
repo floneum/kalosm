@@ -49,7 +49,7 @@ pub(crate) fn workgroup_shape_constraints(
     constraints
 }
 
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct SgemvParams {
     chunk_size: u32,
     vector_size: u32,

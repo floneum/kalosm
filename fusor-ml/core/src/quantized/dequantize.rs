@@ -18,7 +18,7 @@ use crate::{
 
 use super::{QMatrix, QMatrixStorageLayout};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DequantizeOperation {
     pub(crate) matrix: QMatrix,
     pub(crate) datatype: DataTypeEnum,

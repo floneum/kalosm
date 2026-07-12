@@ -76,7 +76,8 @@ impl Resolver {
 
         // Pass 4: Execution
         // Extract operations in order.
-        let target_set: FxHashSet<NodeIndex> = self.targets.iter().copied().collect();
+        let mut target_set: FxHashSet<NodeIndex> = self.targets.iter().copied().collect();
+        target_set.extend(self.shared_outputs.keys().copied());
         let mut queued_operations = Vec::with_capacity(sorted_nodes.len());
 
         {
@@ -169,6 +170,7 @@ impl Resolver {
             queued_operations,
             &mut remaining_consumers,
             &target_set,
+            &self.shared_outputs,
             &mut ledger,
             plan_cache_enabled,
             &mut commands,

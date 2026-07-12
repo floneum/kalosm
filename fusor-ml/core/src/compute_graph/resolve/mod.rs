@@ -318,6 +318,10 @@ pub(crate) struct Resolver {
     // large dense profile additionally merges row and elementwise work.
     horizontal_merge: bool,
     horizontal_merge_dense_ops: bool,
+    /// One semantic e-class may satisfy several lazy graph observations.
+    /// Keys are the execution nodes that materialize; values receive the
+    /// same allocation without another dispatch.
+    shared_outputs: FxHashMap<NodeIndex, Vec<NodeIndex>>,
 }
 
 impl Resolver {
@@ -347,6 +351,7 @@ impl Resolver {
             recorder: None,
             horizontal_merge: false,
             horizontal_merge_dense_ops: false,
+            shared_outputs: Default::default(),
         }
     }
 

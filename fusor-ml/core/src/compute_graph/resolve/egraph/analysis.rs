@@ -1,12 +1,9 @@
 //! Per-class analysis data and the driver context rules read through the
 //! e-graph.
 //!
-//! Under provenance salting every e-class denotes exactly one execution
-//! node, so the only per-class datum is that node's [`Prov`]; `merge`
-//! asserts the salting invariant (unions may only join alternatives of one
-//! node). Everything else rules need — per-node facts snapshotted at
-//! ingestion, the payload table, the device — lives on the analysis struct
-//! itself, reachable from appliers via `egraph.analysis`.
+//! Per-observation facts live in [`FusorAnalysis::facts`]. E-class membership
+//! is maintained by the driver because hash-consing may attach several graph
+//! observations to one class without invoking `Analysis::merge`.
 
 use egg::{Analysis, DidMerge, EGraph, Id};
 
@@ -47,24 +44,17 @@ impl FusorAnalysis {
 }
 
 #[derive(Debug)]
-pub(super) struct ClassData {
-    pub(super) prov: Prov,
-}
+pub(super) struct ClassData;
 
 impl Analysis<FusorLang> for FusorAnalysis {
     type Data = ClassData;
 
-    fn make(_egraph: &EGraph<FusorLang, Self>, enode: &FusorLang) -> Self::Data {
-        ClassData { prov: enode.prov() }
+    fn make(_egraph: &EGraph<FusorLang, Self>, _enode: &FusorLang) -> Self::Data {
+        ClassData
     }
 
     fn merge(&mut self, a: &mut Self::Data, b: Self::Data) -> DidMerge {
-        // The salting invariant: a union may only join alternatives of one
-        // execution node. A mismatch here is a rule bug.
-        debug_assert_eq!(
-            a.prov, b.prov,
-            "e-graph union across distinct execution nodes"
-        );
+        let _ = (a, b);
         DidMerge(false, false)
     }
 
