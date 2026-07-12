@@ -96,11 +96,6 @@ impl DispatchPolicy {
         (2 * self.subgroup_width).min(self.preferred_workgroup_lanes())
     }
 
-    /// Workgroups of `wg_lanes` needed to fill the device.
-    pub(crate) fn workgroups_to_saturate(&self, wg_lanes: u32) -> u32 {
-        self.saturation_lanes.div_ceil(wg_lanes.max(1))
-    }
-
     /// A natural one-workgroup-per-row dispatch leaves the device idle, so a
     /// fan-out-plus-combine split pays for its combine kernel.
     pub(crate) fn should_split_for_occupancy(&self, natural_wgs: u32, wg_lanes: u32) -> bool {
@@ -212,10 +207,4 @@ mod tests {
         assert_eq!(p.dynamic_block_buckets().collect::<Vec<_>>(), vec![128, 256, 512]);
     }
 
-    #[test]
-    fn saturation_math() {
-        let p = apple();
-        assert_eq!(p.workgroups_to_saturate(256), 256);
-        assert_eq!(p.workgroups_to_saturate(64), 1024);
-    }
 }

@@ -24,22 +24,6 @@ use fusor_tile_ir::{GgmlQuantFormat, SubgroupToken};
 
 // ===== qgemv shapes (Q4K and Q6K ggml paths) =====
 
-pub(crate) const fn qgemv_cols_per_subgroup(format: GgmlQuantFormat) -> u32 {
-    match format {
-        GgmlQuantFormat::Q2K => 4,
-        GgmlQuantFormat::Q4_0
-        | GgmlQuantFormat::Q4_0Native
-        | GgmlQuantFormat::Q4_1
-        | GgmlQuantFormat::Q5_1 => 4,
-        GgmlQuantFormat::Q5_0 | GgmlQuantFormat::Q5_0Native => 4,
-        GgmlQuantFormat::Q3K | GgmlQuantFormat::Q8K => 2,
-        GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative => 8,
-        GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative => 4,
-        GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native | GgmlQuantFormat::Q8_1 => 4,
-        GgmlQuantFormat::Q5K | GgmlQuantFormat::Q5KNative => 1,
-    }
-}
-
 pub(crate) const fn qgemv_subgroups_per_workgroup(format: GgmlQuantFormat) -> u32 {
     match format {
         GgmlQuantFormat::Q4K
