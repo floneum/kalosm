@@ -10,7 +10,10 @@ use crate::{
         coop_load_a_fragments, coop_load_b_fragments, coop_mma_grid, coop_store_acc_grid,
         dispatch_grid_1d, scalar_of, zero_literal,
     },
-    types::{cooperative_store_layout_supported, DenseMatmulEpilogues},
+    types::{
+        apply_optional_epilogue, cooperative_store_layout_supported, DenseMatmulEpilogues,
+        UnaryEpilogue,
+    },
 };
 
 /// Logical shape for flattened batched dense matmul views.
@@ -76,8 +79,10 @@ pub fn coop_tile_entries() -> &'static [CoopTileEntry] {
     COOP_TILE_TABLE
 }
 
-/// Try to emit a fast cooperative-matrix batched matmul. Returns false
-/// when shape/layout/epilogues require the generic path. The storage element
+/// Try to emit a fast cooperative-matrix batched matmul. Optional unary
+/// pre-epilogues run while staging A/B; a post-epilogue runs over the
+/// workgroup's output tile after the cooperative store. Returns false when
+/// shape/layout requirements need the generic path. The storage element
 /// travels in the bound [`Storage`] views, so both F32 and F16 use the same
 /// runtime dispatch table.
 pub fn try_batched_coop_matmul(
@@ -101,12 +106,7 @@ pub fn try_batched_coop_matmul(
     // to `ceil(m / bm) * bm` per batch and its columns to `ceil(n / bn) * bn`
     // (the stores cover whole tiles; the pad region holds garbage the
     // logical view never reads).
-    if !subgroups.is_fixed()
-        || epilogues.pre_a.is_some()
-        || epilogues.pre_b.is_some()
-        || epilogues.post.is_some()
-        || !cooperative_store_layout_supported(y.layout())
-    {
+    if !subgroups.is_fixed() || !cooperative_store_layout_supported(y.layout()) {
         return false;
     }
     let total_tiles = shape.batch * shape.m.div_ceil(bm) * shape.n.div_ceil(bn);
@@ -136,6 +136,7 @@ pub fn try_batched_coop_matmul(
             entry.col_groups,
             entry.n_passes,
             subgroups,
+            epilogues,
         );
     } else {
         batched_coop_matmul_perf(
@@ -155,6 +156,7 @@ pub fn try_batched_coop_matmul(
             entry.col_groups,
             entry.n_passes,
             subgroups,
+            epilogues,
         );
     }
     true
@@ -406,6 +408,9 @@ pub fn try_batched_coop_matmul_split_k(
             &col_base,
             &sg_row_base,
             &sg_col_base_in_pass,
+            bm,
+            block,
+            None,
             |program, pass_col_base, accs| {
                 program.loop_range(span_iters, |program, iter_idx| {
                     let k_base = (span_base.clone() + iter_idx) * bk;
@@ -431,6 +436,11 @@ pub fn try_batched_coop_matmul_split_k(
                         bk,
                         COOP_DIM,
                         scalar,
+                        block,
+                        bm,
+                        bn_pass,
+                        None,
+                        None,
                     );
                     // Trailing barrier: the next iteration overwrites the
                     // tiles this one just read through the coop loads.
@@ -615,6 +625,9 @@ pub fn try_merged_coop_matmul(
                     &col_base,
                     &sg_row_base,
                     &sg_col_base_in_pass,
+                    bm,
+                    block,
+                    None,
                     |program, pass_col_base, accs| {
                         if let Some(span_base) = &span_base {
                             // Split-K span: single-buffered staging over this
@@ -643,6 +656,11 @@ pub fn try_merged_coop_matmul(
                                     bk,
                                     COOP_DIM,
                                     scalar,
+                                    block,
+                                    bm,
+                                    bn_pass,
+                                    None,
+                                    None,
                                 );
                                 program.workgroup_barrier();
                             });
@@ -680,6 +698,11 @@ pub fn try_merged_coop_matmul(
                                     bk,
                                     COOP_DIM,
                                     scalar,
+                                    block,
+                                    bm,
+                                    bn_pass,
+                                    None,
+                                    None,
                                 );
                                 coop_stage_and_mma(
                                     program,
@@ -703,6 +726,11 @@ pub fn try_merged_coop_matmul(
                                     bk,
                                     COOP_DIM,
                                     scalar,
+                                    block,
+                                    bm,
+                                    bn_pass,
+                                    None,
+                                    None,
                                 );
                             });
                         }
@@ -731,6 +759,11 @@ pub fn try_merged_coop_matmul(
                                 bk,
                                 COOP_DIM,
                                 scalar,
+                                block,
+                                bm,
+                                bn_pass,
+                                None,
+                                None,
                             );
                             program.workgroup_barrier();
                         }
@@ -845,6 +878,93 @@ pub fn split_k_combine(
 /// `kk` MMA sweep into the accumulator grid. The caller decides the trailing
 /// barrier; the K-pair shape elides it between halves.
 #[allow(clippy::too_many_arguments)]
+fn fill_tile_bounded_with_epilogue(
+    program: &mut TileBlock<'_>,
+    dst: &fusor_tile_ir::tile::WorkgroupTile,
+    src: &Storage,
+    row_base: Tile,
+    col_base: Tile,
+    bounds: [Option<Tile>; 2],
+    rows: u32,
+    cols: u32,
+    padded_stride: u32,
+    lanes: u32,
+    epilogue: Option<&UnaryEpilogue>,
+    scalar: ScalarElement,
+) {
+    let Some(epilogue) = epilogue else {
+        program.fill_tile_bounded(dst, src, row_base, col_base, bounds);
+        return;
+    };
+
+    let total = rows * cols;
+    let passes = total.div_ceil(lanes);
+    for pass in 0..passes {
+        let flat = program.lane() + pass * lanes;
+        let local_row = flat.clone() / cols;
+        let local_col = flat.clone() % cols;
+        let global_row = row_base.clone() + local_row.clone();
+        let global_col = col_base.clone() + local_col.clone();
+        let within_tile = flat.lt(total);
+        let mut active = within_tile.clone();
+        if let Some(bound) = &bounds[0] {
+            active = active & global_row.clone().lt(bound.clone());
+        }
+        if let Some(bound) = &bounds[1] {
+            active = active & global_col.clone().lt(bound.clone());
+        }
+        let zero = zero_literal(scalar);
+        let loaded = program.load(src.at((global_row, global_col)), active.clone(), zero);
+        let transformed = apply_optional_epilogue(Some(epilogue), loaded);
+        let value = Tile::select(active, transformed, Tile::literal(zero));
+        let tile_index = local_row * padded_stride + local_col;
+        program.if_then(within_tile, |program| {
+            program.store_workgroup(dst, tile_index, value);
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_post_epilogue_in_place(
+    program: &mut TileBlock<'_>,
+    y: &Storage,
+    y_batch_base: &Tile,
+    row_base: &Tile,
+    col_base: &Tile,
+    rows: u32,
+    cols: u32,
+    lanes: u32,
+    epilogue: Option<&UnaryEpilogue>,
+    scalar: ScalarElement,
+) {
+    let Some(epilogue) = epilogue else {
+        return;
+    };
+
+    // Cooperative accumulator fragments are opaque to scalar tile-IR. Store
+    // them first, synchronize storage visibility within the workgroup, then
+    // map the epilogue over this workgroup's disjoint output tile in place.
+    program.storage_barrier();
+    let total = rows * cols;
+    let passes = total.div_ceil(lanes);
+    for pass in 0..passes {
+        let flat = program.lane() + pass * lanes;
+        let local_row = flat.clone() / cols;
+        let local_col = flat.clone() % cols;
+        let row = y_batch_base.clone() + row_base.clone() + local_row;
+        let col = col_base.clone() + local_col;
+        let active = flat.lt(total);
+        let loaded = program.load(
+            y.at((row.clone(), col.clone())),
+            active.clone(),
+            zero_literal(scalar),
+        );
+        let value = apply_optional_epilogue(Some(epilogue), loaded);
+        program.store(y.at((row, col)), value, active);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn coop_stage_and_mma(
     program: &mut TileBlock<'_>,
     coop: CoopMatrixToken,
@@ -867,20 +987,39 @@ fn coop_stage_and_mma(
     bk: u32,
     coop_dim: u32,
     scalar: ScalarElement,
+    block: u32,
+    bm: u32,
+    bn_pass: u32,
+    pre_a: Option<&UnaryEpilogue>,
+    pre_b: Option<&UnaryEpilogue>,
 ) {
-    program.fill_tile_bounded(
+    fill_tile_bounded_with_epilogue(
+        program,
         a_tile,
         a,
         a_batch_base.clone() + row_base.clone(),
-        k_base,
+        k_base.clone(),
         a_bounds.clone(),
+        bm,
+        bk,
+        bk + 1,
+        block,
+        pre_a,
+        scalar,
     );
-    program.fill_tile_bounded(
+    fill_tile_bounded_with_epilogue(
+        program,
         b_tile,
         b,
         b_batch_base.clone() + k_base.clone(),
-        pass_col_base,
+        pass_col_base.clone(),
         b_bounds.clone(),
+        bk,
+        bn_pass,
+        bn_pass + 1,
+        block,
+        pre_b,
+        scalar,
     );
     program.workgroup_barrier();
 
@@ -929,6 +1068,9 @@ fn coop_perf_pass_loop<F>(
     col_base: &Tile,
     sg_row_base: &Tile,
     sg_col_base_in_pass: &Tile,
+    bm: u32,
+    block: u32,
+    post: Option<&UnaryEpilogue>,
     mut k_body: F,
 ) where
     F: FnMut(&mut TileBlock<'_>, &Tile, &[Vec<CoopAcc>]),
@@ -949,6 +1091,18 @@ fn coop_perf_pass_loop<F>(
             &pass_col_base,
             sg_row_base,
             sg_col_base_in_pass,
+        );
+        apply_post_epilogue_in_place(
+            program,
+            y,
+            y_batch_base,
+            row_base,
+            &pass_col_base,
+            bm,
+            bn_pass,
+            block,
+            post,
+            scalar,
         );
     }
 }
@@ -976,6 +1130,7 @@ fn batched_coop_matmul_perf_single(
     col_groups: u32,
     n_passes: u32,
     subgroups: SubgroupConfig,
+    epilogues: &DenseMatmulEpilogues<'_>,
 ) {
     const COOP_DIM: u32 = 8;
     debug_assert!(n_passes >= 1);
@@ -1051,6 +1206,9 @@ fn batched_coop_matmul_perf_single(
             &col_base,
             &sg_row_base,
             &sg_col_base_in_pass,
+            bm,
+            block,
+            epilogues.post,
             |program, pass_col_base, accs| {
                 program.loop_range(k_iterations, |program, iter_idx| {
                     let k_base = iter_idx * bk;
@@ -1076,6 +1234,11 @@ fn batched_coop_matmul_perf_single(
                         bk,
                         COOP_DIM,
                         scalar,
+                        block,
+                        bm,
+                        bn_pass,
+                        epilogues.pre_a,
+                        epilogues.pre_b,
                     );
                     // Trailing barrier required: next iter overwrites the same
                     // tile that this iter just finished reading via coop loads.
@@ -1114,6 +1277,7 @@ fn batched_coop_matmul_perf(
     col_groups: u32,
     n_passes: u32,
     subgroups: SubgroupConfig,
+    epilogues: &DenseMatmulEpilogues<'_>,
 ) {
     const COOP_DIM: u32 = 8;
     debug_assert!(n_passes >= 1, "n_passes must be at least 1");
@@ -1197,6 +1361,9 @@ fn batched_coop_matmul_perf(
             &col_base,
             &sg_row_base,
             &sg_col_base_in_pass,
+            bm,
+            block,
+            epilogues.post,
             |program, pass_col_base, accs| {
                 if k_pairs > 0 {
                     program.loop_range(k_pairs, |program, pair_idx| {
@@ -1231,6 +1398,11 @@ fn batched_coop_matmul_perf(
                             bk,
                             COOP_DIM,
                             scalar,
+                            block,
+                            bm,
+                            bn_pass,
+                            epilogues.pre_a,
+                            epilogues.pre_b,
                         );
 
                         coop_stage_and_mma(
@@ -1255,6 +1427,11 @@ fn batched_coop_matmul_perf(
                             bk,
                             COOP_DIM,
                             scalar,
+                            block,
+                            bm,
+                            bn_pass,
+                            epilogues.pre_a,
+                            epilogues.pre_b,
                         );
                         // No trailing barrier: next iter writes to tile_0 first
                         // (different from MMA-tile_1 reads above) — barrier-2 of
@@ -1288,6 +1465,11 @@ fn batched_coop_matmul_perf(
                         bk,
                         COOP_DIM,
                         scalar,
+                        block,
+                        bm,
+                        bn_pass,
+                        epilogues.pre_a,
+                        epilogues.pre_b,
                     );
                     program.workgroup_barrier();
                 }

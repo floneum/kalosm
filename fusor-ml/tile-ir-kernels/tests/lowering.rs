@@ -182,6 +182,58 @@ fn cooperative_dense_f32_matmul_lowers() {
 }
 
 #[test]
+fn cooperative_dense_f32_matmul_with_pre_and_post_epilogues_lowers() {
+    let pre = UnaryEpilogue::new("test_scale", |tile| tile * tile::Tile::f32(0.5));
+    let post = UnaryEpilogue::new("test_tanh", |tile| tile.tanh());
+    let ir = tile::build(|program| {
+        let shape = DenseMatmulShape {
+            batch: 1,
+            m: 61,
+            k: 63,
+            n: 59,
+        };
+        let a = program.storage_read(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.m, shape.k]),
+        );
+        let b = program.storage_read(
+            ScalarElement::F32.element(),
+            Shape::new([shape.batch * shape.k, shape.n]),
+        );
+        let y = program.storage_write(
+            ScalarElement::F32.element(),
+            // Cooperative stores cover the whole selected output tile.
+            Shape::new([64, 64]),
+        );
+        assert!(try_batched_coop_matmul(
+            program,
+            DenseMatmulTensors {
+                a: &a,
+                b: &b,
+                y: &y,
+            },
+            shape,
+            &DenseMatmulEpilogues {
+                pre_a: Some(&pre),
+                pre_b: None,
+                post: Some(&post),
+            },
+            65_535,
+            DenseCoopMatmulConfig {
+                coop: coop_token(),
+                subgroups: subgroup_config(32),
+                tile: DenseCoopMatmulTile {
+                    bm: 64,
+                    bn: 64,
+                    bk: 16,
+                },
+            },
+        ));
+    });
+    lower_or_fail(&ir, "cooperative dense f32 matmul with epilogues");
+}
+
+#[test]
 fn cooperative_dense_f16_matmul_lowers() {
     let ir = tile::build(|program| {
         let shape = DenseMatmulShape {

@@ -130,6 +130,8 @@ pub enum Stmt {
     Break,
     /// Return from the kernel entry point.
     Return,
-    /// Workgroup-scope memory barrier.
+    /// Workgroup-memory barrier with workgroup execution scope.
     Barrier,
+    /// Storage-memory barrier with workgroup execution scope.
+    StorageBarrier,
 }

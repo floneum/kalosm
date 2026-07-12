@@ -459,6 +459,39 @@ pub fn gpu_unary_inputs_fuse_into_matmul_kernel() -> AssertionCases {
     assertions
 }
 
+pub fn gpu_coop_matmul_fuses_pre_and_post_unary_chains() -> AssertionCases {
+    // Large enough to select a cooperative tile on capable adapters. The
+    // expression exercises both operand staging hooks and the in-dispatch
+    // post-store map.
+    let shape = [64, 64];
+    let a_data = matrix_data(shape, 0.07);
+    let b_data = matrix_data(shape, -0.03);
+    let kernel_a_data = a_data.clone();
+    let kernel_b_data = b_data.clone();
+    let mut assertions = AssertionCases::new();
+    assertions.push(assert_gpu_tensor_case(
+        "fusion_behavior::gpu_coop_matmul_fuses_pre_and_post_unary_chains::correctness",
+        move |device| {
+            let a = Tensor::from_slice(&device, shape, &a_data);
+            let b = Tensor::from_slice(&device, shape, &b_data);
+            ((-a).mat_mul(&b.sin()).cos() + 1.0).to_concrete()
+        },
+        1e-3,
+    ));
+    assertions.push(assert_gpu_kernel_property(
+        "fusion_behavior::gpu_coop_matmul_fuses_pre_and_post_unary_chains::kernels",
+        move |device| {
+            let a = Tensor::from_slice(&device, shape, &kernel_a_data);
+            let b = Tensor::from_slice(&device, shape, &kernel_b_data);
+            let matmul = (-a).mat_mul(&b.sin());
+            let out = matmul.cos() + 1.0;
+            out.as_gpu()
+                .is_some_and(|gpu| gpu.count_kernels_to_resolve() == 1)
+        },
+    ));
+    assertions
+}
+
 pub fn gpu_reduce_then_unary_chain_fuses_into_one_kernel() -> AssertionCases {
     let shape = [3, 5];
     let data = matrix_data(shape, 0.3);

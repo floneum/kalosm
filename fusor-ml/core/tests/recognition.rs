@@ -77,6 +77,49 @@ fn composed_dense_matmul_resolves_to_single_kernel() {
 }
 
 #[test]
+fn cooperative_dense_matmul_keeps_unary_chains_in_one_kernel() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        const M: usize = 61;
+        const K: usize = 63;
+        const N: usize = 59;
+        let a_data: Vec<f32> = (0..M * K)
+            .map(|index| (index as f32 * 0.013).sin() * 0.1)
+            .collect();
+        let b_data: Vec<f32> = (0..K * N)
+            .map(|index| (index as f32 * 0.017).cos() * 0.1)
+            .collect();
+        let a = Tensor::from_slice(&device, [M, K], &a_data);
+        let b = Tensor::from_slice(&device, [K, N], &b_data);
+        let matmul = (-a).mat_mul(&b.sin());
+        let out = matmul.cos() + 1.0;
+        assert_eq!(
+            out.count_kernels_to_resolve(),
+            1,
+            "cooperative matmul should host both pre and post chains"
+        );
+
+        let actual = out.as_slice::<2, f32>().await.unwrap();
+        for row in 0..M {
+            for col in 0..N {
+                let mut sum = 0.0f32;
+                for k in 0..K {
+                    sum += -a_data[row * K + k] * b_data[k * N + col].sin();
+                }
+                let expected = sum.cos() + 1.0;
+                let got = actual[[row, col]];
+                assert!(
+                    (got - expected).abs() < 1e-3,
+                    "[{row}, {col}]: got {got}, expected {expected}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
 fn composed_qmatmul_resolves_to_single_kernel() {
     pollster::block_on(async {
         let Ok(device) = Device::new().await else {

@@ -111,6 +111,10 @@ impl<'a> Lowerer<'a> {
                 );
                 Ok(())
             }
+            Stmt::StorageBarrier => {
+                body.push(Statement::ControlBarrier(Barrier::STORAGE), Span::default());
+                Ok(())
+            }
         }
     }
 

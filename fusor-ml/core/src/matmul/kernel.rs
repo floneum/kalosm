@@ -15,6 +15,7 @@ use crate::{
             tile_storage_write_with_direct_layout_typed,
         },
     },
+    nary_direct::apply_typed_unary_function_chain,
     nary_wise::{NaryExpr, NaryFunction, NaryOp, NaryScalar, UnaryFunctionChain},
     reduce::{ReduceFunction, ReduceOp, ReduceOperation},
     tensor::{DataTypeEnum, TensorData},
@@ -109,6 +110,23 @@ impl MatMulOperation {
 
     fn can_use_hardware_matmul(&self) -> bool {
         matches!(self.datatype, DataTypeEnum::F32 | DataTypeEnum::F16)
+    }
+
+    /// The cooperative kernel currently hosts dtype-preserving unary chains.
+    /// Dtype-changing chains keep using the generic fused reduction so the
+    /// operand staging and padded output allocation retain one element type.
+    fn coop_epilogues_supported(&self) -> bool {
+        self.pre_element_wise.iter().all(|chain| {
+            chain.input_datatype() == self.datatype && chain.out_datatype() == self.datatype
+        }) && self.post_element_wise.input_datatype() == self.datatype
+            && self.post_element_wise.out_datatype() == self.datatype
+    }
+
+    fn has_elementwise_epilogues(&self) -> bool {
+        self.pre_element_wise
+            .iter()
+            .any(|chain| !chain.functions.is_empty())
+            || !self.post_element_wise.functions.is_empty()
     }
 
     /// The contraction in its composed map-reduce form: a multiply over the
@@ -211,9 +229,7 @@ impl MatMulOperation {
     pub(crate) fn coop_tile(&self, device: &Device) -> Option<CoopTile> {
         if !self.can_use_hardware_matmul()
             || (self.datatype == DataTypeEnum::F16 && !device.f16_supported())
-            || !self.pre_element_wise[0].functions.is_empty()
-            || !self.pre_element_wise[1].functions.is_empty()
-            || !self.post_element_wise.functions.is_empty()
+            || !self.coop_epilogues_supported()
         {
             return None;
         }
@@ -326,8 +342,8 @@ impl MatMulOperation {
         let shape = tile_ir_kernels::DenseMatmulShape { batch, m, k, n };
 
         // Only the cooperative-matrix route stays hand-specialized; gemv
-        // shapes lower through the generic subgroup-per-output reduce, and
-        // fused chains lower through the generic tiled reduce.
+        // shapes and dtype-changing fused chains lower through the generic
+        // row reduction. Dtype-preserving unary chains remain hosted here.
         let tile = device_supported(self.coop_tile(device))?;
 
         // The store covers whole tiles, so `y` is the padded matrix: rows
@@ -399,6 +415,21 @@ impl MatMulOperation {
         let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
         let datatype = self.datatype;
 
+        let make_epilogue = |label, chain: &UnaryFunctionChain| {
+            if chain.functions.is_empty() {
+                return None;
+            }
+            let chain = chain.clone();
+            Some(tile_ir_kernels::UnaryEpilogue::new(label, move |value| {
+                apply_typed_unary_function_chain(value, datatype, &chain)
+                    .expect("cooperative matmul epilogue validated before kernel construction")
+                    .0
+            }))
+        };
+        let pre_a = make_epilogue("dense_matmul_pre_a", &self.pre_element_wise[0]);
+        let pre_b = make_epilogue("dense_matmul_pre_b", &self.pre_element_wise[1]);
+        let post = make_epilogue("dense_matmul_post", &self.post_element_wise);
+
         // Starved tile grids with a long contraction split K across
         // workgroups: partials land in scratch slices of the over-allocated
         // output buffer and a combine kernel folds them (sum-reorder-only
@@ -444,9 +475,9 @@ impl MatMulOperation {
                 },
                 shape,
                 &tile_ir_kernels::DenseMatmulEpilogues {
-                    pre_a: None,
-                    pre_b: None,
-                    post: None,
+                    pre_a: pre_a.as_ref(),
+                    pre_b: pre_b.as_ref(),
+                    post: post.as_ref(),
                 },
                 max_wg_per_dim,
                 tile_ir_kernels::DenseCoopMatmulConfig {
@@ -507,6 +538,9 @@ impl MatMulOperation {
     /// split) and [`Self::build_hardware_matmul`], so allocation and kernel
     /// selection agree by construction.
     fn split_k_factor(&self, tile: &CoopTile) -> Option<u32> {
+        if self.has_elementwise_epilogues() {
+            return None;
+        }
         const SPLIT_K_MAX_TILES: u32 = if std::option_env!("FUSOR_NO_SPLITK").is_some() {
             0
         } else {
@@ -773,6 +807,11 @@ impl MatmulMergeKey {
 impl MatMulOperation {
     /// See [`MatmulMergeKey`]. `None` = not horizontally mergeable.
     pub(crate) fn merge_profile(&self, device: &Device) -> Option<MatmulMergeKey> {
+        // Standalone coop kernels host unary epilogues. The guarded merged
+        // body does not yet carry per-segment epilogue identities/bindings.
+        if self.has_elementwise_epilogues() {
+            return None;
+        }
         let tile = self.coop_tile(device)?;
         if !tile.supports_horizontal_merge() {
             return None;

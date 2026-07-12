@@ -312,6 +312,11 @@ impl TileBlock<'_> {
         self.push_stmt(Stmt::Barrier);
     }
 
+    /// Storage-memory barrier with workgroup execution scope.
+    pub fn storage_barrier(&mut self) {
+        self.push_stmt(Stmt::StorageBarrier);
+    }
+
     /// Conditional block (no else).
     pub fn if_then(&mut self, condition: impl Into<Mask>, accept: impl FnOnce(&mut Self)) {
         self.if_else(condition, accept, |_| {});

@@ -621,6 +621,21 @@ pub(crate) enum ValueTile {
 }
 
 impl ValueTile {
+    fn from_typed_tile(value: tile_ir::tile::Tile, datatype: DataTypeEnum) -> Self {
+        match datatype {
+            DataTypeEnum::F32 => Self::F32(value),
+            DataTypeEnum::F16 => Self::F16(value),
+            DataTypeEnum::U32 => Self::U32(value),
+        }
+    }
+
+    fn into_typed_tile(self, datatype: DataTypeEnum) -> tile_ir::tile::Tile {
+        match self.cast_to(datatype) {
+            Self::F32(value) | Self::F16(value) | Self::U32(value) => value,
+            Self::Bool(_) => unreachable!("tensor datatypes never store bool tiles"),
+        }
+    }
+
     pub(crate) fn cast_to(self, target: DataTypeEnum) -> Self {
         match (self, target) {
             (Self::F32(v), DataTypeEnum::F32) => Self::F32(v),
@@ -1272,6 +1287,32 @@ pub(crate) fn apply_unary_function_chain(
         value_ty = function.output_type;
     }
     Some((value.into_f32(), value_ty))
+}
+
+/// Apply a unary chain while preserving its declared output tile type.
+/// Cooperative dense matmul uses this for f16 as well as f32 staging/store
+/// epilogues; the older helper above intentionally normalizes to f32 for row
+/// reduction callers.
+pub(crate) fn apply_typed_unary_function_chain(
+    value: tile_ir::tile::Tile,
+    value_ty: DataTypeEnum,
+    chain: &UnaryFunctionChain,
+) -> Option<(tile_ir::tile::Tile, DataTypeEnum)> {
+    if chain.input_datatype() != value_ty {
+        return None;
+    }
+
+    let mut value = ValueTile::from_typed_tile(value, value_ty);
+    let mut value_ty = value_ty;
+    for function in &chain.functions {
+        if function.input_types.as_slice() != [value_ty] {
+            return None;
+        }
+        let mut values = [(value, value_ty)];
+        value = emit_function(function, &mut values);
+        value_ty = function.output_type;
+    }
+    Some((value.into_typed_tile(value_ty), value_ty))
 }
 
 pub(crate) fn apply_single_input_elementwise_expr(

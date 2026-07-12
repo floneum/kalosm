@@ -186,7 +186,7 @@ pub(crate) fn apply_epilogue_values_with_extras(
     }
 }
 
-/// Bundle of pre- and post-reduce epilogues for dense F32 matmul kernels.
+/// Bundle of pre- and post-reduce epilogues for dense F32/F16 matmul kernels.
 #[derive(Clone, Default)]
 pub struct DenseMatmulEpilogues<'a> {
     /// Optional transform applied to each loaded lhs value before the product.

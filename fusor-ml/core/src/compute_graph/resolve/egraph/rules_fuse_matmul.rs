@@ -41,17 +41,11 @@ impl FusionView<'_> {
             if !self.is_cached(input_inner)
                 && let Some(input_variant) = self.variant_of(input_inner)
             {
-                // An un-flattened operand was chosen for the coop kernel,
-                // which hosts no element-wise chains: fusing one here would
-                // demote the matmul to the generic divmod-per-load reduce.
-                // The same demotion applies to any coop-viable matmul: the
-                // coop kernel refuses element-wise chains, so folding one in
-                // trades a cheap standalone n-ary for the generic fallback.
-                if let ExecutionVariant::MatMul(matmul_op) = input_variant
-                    && matmul_op.a.is_plain()
-                    && matmul_op.b.is_plain()
-                    && !matmul_op.hardware_matmul_statically_viable(&self.device())
-                {
+                // Dtype-preserving unary chains are hosted after the
+                // cooperative store, independently of how A/B are mapped.
+                // Unsupported chains still lower through the generic fused
+                // reduction.
+                if let ExecutionVariant::MatMul(matmul_op) = input_variant {
                     let mut new_matmul = matmul_op.clone();
                     let mut existing_post = new_matmul.post_element_wise.functions.clone();
                     existing_post.extend(el_op.functions.functions.iter().cloned());
@@ -369,14 +363,14 @@ impl FusionView<'_> {
             }
         }
 
-        // Pre-op: fuse elementwise before matmul inputs. Skipped for
-        // un-flattened operands: pre chains would demote the matmul off the
-        // coop kernel they were chosen for. Likewise skipped for any
-        // coop-viable matmul, which hosts no element-wise chains.
+        // Pre-op: fuse elementwise before plain matmul inputs. Cooperative
+        // matmuls apply dtype-preserving chains while staging A/B; other
+        // chains lower through the generic fused reduction. Un-flattened
+        // operands remain excluded because their producer mapping is already
+        // being absorbed by cooperative staging.
         if let ExecutionVariant::MatMul(matmul_op) = current
             && matmul_op.a.is_plain()
             && matmul_op.b.is_plain()
-            && !matmul_op.hardware_matmul_statically_viable(&self.device())
         {
             let mut new_matmul = matmul_op.clone();
             let mut changed = false;

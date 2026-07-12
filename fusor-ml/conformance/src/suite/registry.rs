@@ -163,6 +163,7 @@ registry! {
     flash_attention_ops::flash_attention_with_kv_cache_matches_cpu_reference_on_varied_shapes,
     flash_attention_ops::flash_attention_with_qk_mask_matches_cpu_reference_on_varied_shapes,
     fusion_behavior::gpu_flash_attention_fuses_into_one_kernel,
+    fusion_behavior::gpu_coop_matmul_fuses_pre_and_post_unary_chains,
     fusion_behavior::gpu_gelu_lowers_to_one_kernel,
     fusion_behavior::gpu_indexing_then_arithmetic_matches_cpu,
     fusion_behavior::gpu_matmul_then_unary_chain_fuses_into_one_kernel,

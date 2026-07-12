@@ -161,7 +161,7 @@ impl Analysis {
                     self.visit_stmt(s);
                 }
             }
-            Stmt::Break | Stmt::Return | Stmt::Barrier => {}
+            Stmt::Break | Stmt::Return | Stmt::Barrier | Stmt::StorageBarrier => {}
         }
     }
 
