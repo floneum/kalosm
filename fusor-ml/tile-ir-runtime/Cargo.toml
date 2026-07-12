@@ -19,6 +19,7 @@ naga = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", feature
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["metal"] }
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["dx12"] }

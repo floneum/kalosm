@@ -52,7 +52,7 @@ impl CachedBuffer {
     }
 }
 
-fn prune_cached_buffers(buffers: &mut Vec<CachedBuffer>) {
+fn prune_cached_buffers(buffers: &mut Vec<CachedBuffer>, live_bytes: &AtomicU64) {
     let mut kept_free_buffers = 0;
     buffers.retain(|cached| {
         let is_free = Arc::strong_count(&cached.buffer) == 1;
@@ -64,9 +64,53 @@ fn prune_cached_buffers(buffers: &mut Vec<CachedBuffer>) {
             kept_free_buffers += 1;
             true
         } else {
+            // The pool holds the last reference: dropping it deallocates.
+            live_bytes.fetch_sub(cached.buffer.size(), Ordering::Relaxed);
             false
         }
     });
+}
+
+/// The in-flight GPU memory cap for pool allocations, resolved once.
+///
+/// Exceeding physical unified memory with GPU-referenced allocations does not
+/// fail gracefully on macOS: the OS wires the memory and the machine panics
+/// (`watchdogd` starvation / `IOGPUMemory` asserts) rather than returning an
+/// error. Apple's contract is `MTLDevice.recommendedMaxWorkingSetSize` (about
+/// two thirds of RAM below 64GB); PyTorch MPS and MLX both enforce a
+/// framework-level watermark against it for the same reason. wgpu does not
+/// expose the Metal value, so this reproduces the same formula from physical
+/// RAM. `FUSOR_MAX_GPU_MEMORY_BYTES` overrides; non-Apple targets default to
+/// uncapped (VRAM exhaustion fails with driver errors, not a dead OS).
+fn gpu_memory_cap() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        if let Some(value) = std::env::var_os("FUSOR_MAX_GPU_MEMORY_BYTES")
+            && let Some(parsed) = value.to_str().and_then(|v| v.parse::<u64>().ok())
+        {
+            return parsed.max(1);
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut memsize: u64 = 0;
+            let mut len = std::mem::size_of::<u64>();
+            let name = c"hw.memsize";
+            // SAFETY: standard sysctlbyname read of a u64 with matching size.
+            let ok = unsafe {
+                libc::sysctlbyname(
+                    name.as_ptr(),
+                    &mut memsize as *mut u64 as *mut libc::c_void,
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if ok == 0 && memsize > 0 {
+                return memsize / 3 * 2;
+            }
+        }
+        u64::MAX
+    })
 }
 
 /// Cumulative allocation statistics for a [`BufferPool`]. `requested` counts
@@ -77,6 +121,8 @@ fn prune_cached_buffers(buffers: &mut Vec<CachedBuffer>) {
 pub struct BufferPoolCounters {
     pub requested: u64,
     pub created: u64,
+    /// Bytes of pool-created buffers still tracked (free-list + handed out).
+    pub live_bytes: u64,
 }
 
 /// Per-device buffer pool keyed by `(size, usage)`. Reuses freed buffer
@@ -90,6 +136,10 @@ pub struct BufferPool {
     initialized_buffer_keys: Mutex<Vec<(u64, BufferUsages)>>,
     buffers_requested: AtomicU64,
     buffers_created: AtomicU64,
+    /// Bytes of pool-created buffers still tracked. Slightly overcounts when
+    /// the LRU evicts a whole bucket (those buffers stop being tracked
+    /// without a decrement) — the safe direction for a memory cap.
+    live_bytes: AtomicU64,
 }
 
 impl std::fmt::Debug for BufferPool {
@@ -112,6 +162,7 @@ impl BufferPool {
             initialized_buffer_keys: Mutex::new(Vec::new()),
             buffers_requested: AtomicU64::new(0),
             buffers_created: AtomicU64::new(0),
+            live_bytes: AtomicU64::new(0),
         }
     }
 
@@ -120,6 +171,7 @@ impl BufferPool {
         BufferPoolCounters {
             requested: self.buffers_requested.load(Ordering::Relaxed),
             created: self.buffers_created.load(Ordering::Relaxed),
+            live_bytes: self.live_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -150,7 +202,7 @@ impl BufferPool {
                 for buffer in buffers.iter_mut() {
                     buffer.writen = false;
                 }
-                prune_cached_buffers(buffers);
+                prune_cached_buffers(buffers, &self.live_bytes);
             }
         }
     }
@@ -198,32 +250,59 @@ impl BufferPool {
         self.buffers_requested.fetch_add(1, Ordering::Relaxed);
         let buffer = self
             .get_cached_buffer(size, usage, to_initilize)
-            .unwrap_or_else(|| {
-                self.buffers_created.fetch_add(1, Ordering::Relaxed);
-                let new_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Tensor Buffer"),
-                    size,
-                    usage,
-                    mapped_at_creation: false,
-                });
-
-                let buffer = Arc::new(new_buffer);
-                self.buffer_allocation_cache
-                    .write()
-                    .get_or_insert_mut((size, usage), Vec::new)
-                    .push(CachedBuffer::new(buffer.clone(), to_initilize));
-                if let Some(buffers) = self.buffer_allocation_cache.write().get_mut(&(size, usage))
-                {
-                    prune_cached_buffers(buffers);
-                }
-                buffer
-            });
+            .unwrap_or_else(|| self.create_uncached_buffer(size, usage, to_initilize));
         // Buffers created with init data are fully overwritten by the caller, so
         // only the to-be-written-by-a-kernel buffers need poisoning to surface
         // zero-initialization assumptions.
         if poison && !to_initilize {
             self.poison_buffer(&buffer, usage);
         }
+        buffer
+    }
+
+    /// Cache-miss path: create a fresh wgpu buffer, enforcing the in-flight
+    /// memory cap. Growing past physical unified memory does not fail
+    /// gracefully on macOS — the OS panics — so when a new allocation would
+    /// cross the cap this first blocks on the GPU (completed submissions
+    /// release their buffers back to the free lists) and retries the cache;
+    /// only a working set that genuinely exceeds the cap fails, loudly, on
+    /// the host.
+    fn create_uncached_buffer(
+        &self,
+        size: u64,
+        usage: wgpu::BufferUsages,
+        to_initilize: bool,
+    ) -> Arc<wgpu::Buffer> {
+        let cap = gpu_memory_cap();
+        if self.live_bytes.load(Ordering::Relaxed).saturating_add(size) > cap {
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            if let Some(buffer) = self.get_cached_buffer(size, usage, to_initilize) {
+                return buffer;
+            }
+            let live = self.live_bytes.load(Ordering::Relaxed);
+            if live.saturating_add(size) > cap {
+                panic!(
+                    "fusor: allocating {size} more bytes of GPU memory would exceed the \
+                     in-flight cap ({live} bytes live, cap {cap}). This working set does not \
+                     fit safely in unified memory; reduce the batch/model size, read results \
+                     back more often, or raise FUSOR_MAX_GPU_MEMORY_BYTES."
+                );
+            }
+        }
+        self.buffers_created.fetch_add(1, Ordering::Relaxed);
+        self.live_bytes.fetch_add(size, Ordering::Relaxed);
+        let new_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Tensor Buffer"),
+            size,
+            usage,
+            mapped_at_creation: false,
+        });
+
+        let buffer = Arc::new(new_buffer);
+        let mut cache = self.buffer_allocation_cache.write();
+        let buffers = cache.get_or_insert_mut((size, usage), Vec::new);
+        buffers.push(CachedBuffer::new(buffer.clone(), to_initilize));
+        prune_cached_buffers(buffers, &self.live_bytes);
         buffer
     }
 

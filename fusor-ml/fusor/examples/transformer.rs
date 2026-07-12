@@ -95,6 +95,13 @@ impl RunConfig {
     }
 }
 
+/// Block until all submitted GPU work has completed (no-op on CPU).
+fn wait_for_gpu(device: &Device) {
+    if let Device::Gpu(gpu) = device {
+        gpu.poll_wait();
+    }
+}
+
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/data")
 }
@@ -841,6 +848,10 @@ async fn main() {
             );
         }
     }
+    // Drain the GPU before timing and before exit: without this, sparse
+    // progress reporting lets the loop report throughput (or terminate the
+    // process) with steps still queued on the GPU.
+    wait_for_gpu(&device);
     let elapsed = start.elapsed();
     let steps_per_second = config.steps as f64 / elapsed.as_secs_f64();
     println!(
