@@ -22,7 +22,7 @@ use crate::{
 };
 
 use super::{
-    MatMulOperation, MatMulParams, MatrixOperand, coop_gemm, sgemm, sgemv,
+    MatMulOperation, MatMulParams, MatrixOperand, sgemm, sgemv,
     variants::{CoopTile, dense_coop_kinds_from_datatype, select_dense_matmul_params},
 };
 
@@ -233,10 +233,10 @@ impl MatMulOperation {
         {
             return None;
         }
-        let MatMulParams::CoopMatMul(params) = &self.parameters else {
+        let MatMulParams::CoopMatMul(kind) = &self.parameters else {
             return None;
         };
-        device.coop_token(params.kind())?;
+        device.coop_token(*kind)?;
         let subgroup_config = device.subgroup_config()?;
         if !subgroup_config.is_fixed() {
             return None;
@@ -407,10 +407,10 @@ impl MatMulOperation {
             n_padded,
         } = self.hardware_matmul_prep(device, input_a, input_b, output)?;
         let subgroup_config = device_supported(device.subgroup_config())?;
-        let MatMulParams::CoopMatMul(params) = &self.parameters else {
+        let MatMulParams::CoopMatMul(kind) = &self.parameters else {
             return Err(kernel_backend::DeviceNotSupported);
         };
-        let coop = device_supported(device.coop_token(params.kind()))?;
+        let coop = device_supported(device.coop_token(*kind))?;
 
         let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
         let datatype = self.datatype;
@@ -435,7 +435,7 @@ impl MatMulOperation {
         // output buffer and a combine kernel folds them (sum-reorder-only
         // numerics). A weight-gradient shape like 64×2048×64 otherwise runs
         // as a single workgroup.
-        if let Some(splits) = self.split_k_factor(&tile)
+        if let Some(splits) = self.split_k_factor(device, &tile)
             && let Some(kernel) = self.build_split_k_matmul(
                 device,
                 input_a,
@@ -537,26 +537,10 @@ impl MatMulOperation {
     /// (which over-allocates the output backing with one scratch slice per
     /// split) and [`Self::build_hardware_matmul`], so allocation and kernel
     /// selection agree by construction.
-    fn split_k_factor(&self, tile: &CoopTile) -> Option<u32> {
-        if self.has_elementwise_epilogues() {
+    fn split_k_factor(&self, device: &Device, tile: &CoopTile) -> Option<u32> {
+        if std::option_env!("FUSOR_NO_SPLITK").is_some() || self.has_elementwise_epilogues() {
             return None;
         }
-        const SPLIT_K_MAX_TILES: u32 = if std::option_env!("FUSOR_NO_SPLITK").is_some() {
-            0
-        } else {
-            24
-        };
-        const SPLIT_K_MIN_K: u32 = 512;
-        // Committed fan-out, kept exactly for quantized-pipeline and small
-        // graphs (`dense_codegen` unset).
-        const SPLIT_K_SPLITS: u32 = 16;
-        // Dense-large-graph tuning: enough splits to cover the GPU from a
-        // starved tile grid; K-spans that divide the K-tile count keep the
-        // kernel's staging on the unbounded vec4 fast path (measured ~3x on
-        // the 64×2048×64 weight-gradient shape), so prefer the largest
-        // divisor at or under the target and fall back to the raw target
-        // only when the K-tile count has no useful divisor.
-        const DENSE_SPLIT_K_SPLITS: u32 = 32;
         let m: u32 = self.a.rows().try_into().ok()?;
         let n: u32 = self.b.cols().try_into().ok()?;
         let k: u32 = self.a.cols().try_into().ok()?;
@@ -569,23 +553,48 @@ impl MatMulOperation {
             .div_ceil(tile.bm)
             .checked_mul(n.div_ceil(tile.bn))?
             .checked_mul(batch)?;
-        if total_tiles >= SPLIT_K_MAX_TILES || k < SPLIT_K_MIN_K {
+        let policy = device.dispatch_policy();
+        let threads = tile
+            .subgroup_groups()
+            .checked_mul(device.max_subgroup_size())
+            .filter(|&threads| threads > 0)?;
+        let k_iterations = k.div_ceil(tile.bk);
+        let per_lane_macs = u64::from(tile.bm) * u64::from(tile.bn)
+            * u64::from(k_iterations)
+            * u64::from(tile.bk)
+            / u64::from(threads);
+        // Split only when all three hold: the unsplit grid is starved enough
+        // that fan-out beats the combine pass it buys, K is long enough that
+        // every span keeps at least two K-iterations, and each lane's
+        // unsplit serial walk is long enough that the extra partials +
+        // combine dispatch amortize (a quarter-saturation of per-lane MACs
+        // reproduces the committed k >= 512 boundary for the 256-lane
+        // tiles).
+        if !policy.split_amortizes_combine(total_tiles, threads)
+            || k_iterations < 4
+            || per_lane_macs < u64::from(policy.saturation_lanes() / 4)
+        {
             if std::env::var_os("FUSOR_TRACE_SPLITK").is_some() {
-                eprintln!("splitk_gate name={} tiles={total_tiles} k={k}", self.name());
+                eprintln!(
+                    "splitk_gate name={} tiles={total_tiles} k={k} per_lane_macs={per_lane_macs}",
+                    self.name()
+                );
             }
             return None;
         }
-        let k_iterations = k.div_ceil(tile.bk);
-        let splits = if self.dense_codegen {
-            let target = DENSE_SPLIT_K_SPLITS.min(k_iterations);
-            (2..=target)
-                .rev()
-                .find(|candidate| k_iterations.is_multiple_of(*candidate))
-                .unwrap_or(target)
-        } else {
-            SPLIT_K_SPLITS.min(k_iterations)
-        };
-        (splits >= 2).then_some(splits)
+        // Enough splits to fill the device from the starved grid, bounded so
+        // each span keeps at least two K-iterations. K-spans that divide the
+        // K-tile count keep the kernel's staging on the unbounded vec4 fast
+        // path (measured ~3x on the 64×2048×64 weight-gradient shape), so
+        // prefer the largest divisor at or under the target and fall back to
+        // the raw target only when the K-tile count has no useful divisor.
+        let concurrent = (policy.saturation_lanes() / threads).max(1);
+        let target = concurrent.div_ceil(total_tiles).clamp(2, k_iterations / 2);
+        let splits = (2..=target)
+            .rev()
+            .find(|candidate| k_iterations.is_multiple_of(*candidate))
+            .unwrap_or(target);
+        Some(splits)
     }
 
     /// Split-K route for coop matmuls whose tile grid starves the GPU: the
@@ -830,7 +839,7 @@ impl MatMulOperation {
             n,
             batch,
             tile,
-            splits: self.split_k_factor(&tile),
+            splits: self.split_k_factor(device, &tile),
             datatype: self.datatype,
             dense_codegen: self.dense_codegen,
         })
@@ -908,9 +917,9 @@ pub(crate) fn build_merged_matmul_kernel(
     }) {
         decline!("profile_mismatch");
     }
-    let splits = first.split_k_factor(&tile);
+    let splits = first.split_k_factor(&device, &tile);
     if segments.iter().any(|op| {
-        op.split_k_factor(&tile) != splits
+        op.split_k_factor(&device, &tile) != splits
             || op.datatype != first.datatype
             || op.dense_codegen != first.dense_codegen
     }) {
@@ -920,10 +929,10 @@ pub(crate) fn build_merged_matmul_kernel(
     let Some(subgroup_config) = device.subgroup_config() else {
         decline!("subgroups");
     };
-    let MatMulParams::CoopMatMul(params) = &first.parameters else {
+    let MatMulParams::CoopMatMul(kind) = &first.parameters else {
         decline!("params");
     };
-    let Some(coop) = device.coop_token(params.kind()) else {
+    let Some(coop) = device.coop_token(*kind) else {
         decline!("coop_token");
     };
     let element = match first.datatype {
@@ -1145,8 +1154,12 @@ impl Operation for MatMulOperation {
             MatMulParams::MatMul(sgemm_params) => {
                 sgemm::workgroup_shape_constraints(self, device, sgemm_params)
             }
-            MatMulParams::CoopMatMul(coop_params) => {
-                coop_gemm::workgroup_shape_constraints(self, device, coop_params)
+            // The cooperative kernels carry their own grid and block
+            // (`ir.grid`); this shape only reaches the generic fused-reduce
+            // fallback, so it is the fallback's own policy.
+            MatMulParams::CoopMatMul(_) => {
+                crate::row_program::RowProgramOperation::from_reduce(&self.as_fused_reduce())
+                    .workgroup_shape_constraints(device)
             }
         }
     }
@@ -1185,13 +1198,10 @@ impl Operation for MatMulOperation {
                 workgroup_shape,
                 sgemm_params,
             ),
-            MatMulParams::CoopMatMul(coop_params) => coop_gemm::dispatch_size(
-                last_dim_size,
-                second_to_last_dim_size,
-                batch_size,
-                workgroup_shape,
-                coop_params,
-            ),
+            MatMulParams::CoopMatMul(_) => {
+                crate::row_program::RowProgramOperation::from_reduce(&self.as_fused_reduce())
+                    .dispatch_size(workgroup_shape, inputs)
+            }
         }
     }
 
@@ -1220,7 +1230,7 @@ impl Operation for MatMulOperation {
             let m_padded = m.div_ceil(tile.bm as usize) * tile.bm as usize;
             let n_padded = n.div_ceil(tile.bn as usize) * tile.bn as usize;
             let slices = self
-                .split_k_factor(&tile)
+                .split_k_factor(device, &tile)
                 .map(|splits| splits as usize + 1)
                 .unwrap_or(1);
             (slices > 1 || m_padded != m || n_padded != n).then_some((m_padded, n_padded, slices))

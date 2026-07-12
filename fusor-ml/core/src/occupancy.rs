@@ -107,6 +107,17 @@ impl DispatchPolicy {
         (natural_wgs as u64) * (wg_lanes as u64) < self.saturation_lanes as u64
     }
 
+    /// Whether a fan-out-plus-combine split of a *matmul-sized* workload
+    /// amortizes its combine pass: only when the unsplit grid fills less
+    /// than an eighth of the device. The combine costs roughly one extra
+    /// pass over the output plus a dispatch, so mild underfill never pays —
+    /// measured on M2 Max weight-gradient shapes: a 28%-occupancy grid lost
+    /// 30% by splitting, 12.5% lost 2x, 9.4% was neutral, and a
+    /// single-tile grid (0.4%) won 1.7x.
+    pub(crate) fn split_amortizes_combine(&self, natural_wgs: u32, wg_lanes: u32) -> bool {
+        (natural_wgs as u64) * (wg_lanes as u64) * 8 < self.saturation_lanes as u64
+    }
+
     /// Register tiling may trade threads for per-thread work only when the
     /// post-tiling thread count still saturates the device.
     pub(crate) fn tiling_leaves_saturated(&self, total_threads: u32) -> bool {

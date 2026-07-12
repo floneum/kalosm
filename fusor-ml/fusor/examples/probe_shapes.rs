@@ -682,6 +682,24 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
                 let _ = y.as_slice().await.unwrap();
                 best = best.min(start.elapsed().as_secs_f64() / iters as f64);
             }
+            // Correctness tripwire: one un-chained product checked against a
+            // sampled f64 reference. A "fast" wrong kernel reads as an
+            // impossible TF/s without this.
+            let single = at.mat_mul(&bt);
+            let got = single.as_slice().await.unwrap();
+            for &row in &[0usize, m - 1] {
+                for &col in &[0usize, n - 1] {
+                    let mut want = 0.0f64;
+                    for kk in 0..k {
+                        want += a[row * k + kk] as f64 * b[kk * n + col] as f64;
+                    }
+                    let got = got[[row, col]];
+                    assert!(
+                        (got as f64 - want).abs() < 1e-2 * want.abs().max(1.0),
+                        "verification failed at [{row},{col}]: got {got}, want {want}"
+                    );
+                }
+            }
             let flops = 2.0 * m as f64 * k as f64 * n as f64;
             println!(
                 "matmul_bench {m}x{k}x{n}: min {:.3} ms/matmul, {:.2} TF/s",

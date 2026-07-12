@@ -1,46 +1,42 @@
 //! General cooperative-tile selection.
 //!
 //! Selection enumerates the full kernel tile table and picks the argmin of a
-//! constant-free lexicographic cost — no divisibility ladder, no per-shape
-//! rules, no tuned weights. Alignment enters only through what it does to
-//! the cost (edge tiles execute padded MACs); the device enters only through
-//! legality.
+//! lexicographic cost — no divisibility ladder, no per-shape rules. Alignment
+//! enters only through what it does to the cost (edge tiles execute padded
+//! MACs); the device enters only through legality and the occupancy policy.
 //!
-//! The cost is `padded_macs + W x staging_elems`:
-//! - **Padded MACs** (`tiles x bm*bn*k_pad`): edge tiles execute their pad
-//!   region, and padding measured brutally real (a 33%-padded tile ran ~2x
-//!   slower than its zero-pad neighbor at N=384; a 6.7%-padded 128x512 ran
-//!   ~2x slower than the least-padded choice on the vision shape).
-//! - **Staging traffic** (`tiles x k_pad*(bm+bn)` elements through
-//!   workgroup memory): larger tiles re-stage less per MAC; this is what
-//!   actually discriminates among zero-pad tiles (128x512 measured 2x
-//!   faster than 128x64 at 1024^3, +9% at 4096^3).
-//! - **W = 4** MAC-equivalents per staged element — the one calibrated
-//!   constant, and it is bounded on both sides by measurement: W > 0.24 or
-//!   16x64 would beat 128x512 at m=1000 (measured 3.85 vs 4.18 TF/s), and
-//!   W < 7.96 or 128x512's 6.7% padding would beat 64x128 on the vision
-//!   shape (measured 1.12 vs ~2.1 TF/s). The midpoint power of two is 4.
+//! The key orders by, in priority:
+//! 1. **Total padded MACs** (`tiles x bm*bn*k_pad`): padding is the dominant
+//!    measured effect — a 33%-padded tile ran ~2x slower than its zero-pad
+//!    neighbor at N=384, and a 6.7%-padded 128x512 ran ~2x slower than the
+//!    least-padded choice on the vision shape.
+//! 2. **Serial depth** (`waves x (per-lane tile MACs + overhead)`):
+//!    workgroups within a wave run in parallel, waves serialize, and each
+//!    tile pays a fixed prologue/epilogue (a quarter-saturation of per-lane
+//!    MAC-equivalents). This prefers small tiles when the grid underfills
+//!    the device (128x64 measured 3.64 TF/s vs 128x512's 2.15 at 1024^3 and
+//!    2.6x at the 384x16384x1536 weight gradient) and large tiles when depth
+//!    ties (fewer per-tile overheads at 4096^3, measured flat 5.12 = 5.12).
+//! 3. **Larger tiles**: deterministic tie-break.
 //!
 //! Single-buffered profiles are excluded from automatic selection outright:
 //! they cannot horizontally merge (`supports_horizontal_merge`), and their
-//! best measured standalone advantage (+1.3% at 4096^3) never pays for
+//! best measured standalone advantage (+3% at 4096^3) never pays for
 //! decomposing a merged wave into standalone dispatches (~15% on the vision
-//! QKV family). They stay in the kernel table for forced experiments; if a
-//! merge-aware selection context ever lands, revisit. Remaining ties break
-//! toward larger tiles (fewer workgroups amortize prologue/epilogue).
+//! QKV family). They stay in the kernel table for forced experiments.
 //!
-//! Occupancy terms were evaluated and deliberately dropped: across every
-//! measured shape (16384x384x384, 384x1024x1024, 8192x1024x256, 1024^3,
-//! 4096^3, 1944x1280x3840, 1000x1024x1024) workgroup-count differences never
-//! showed outside noise once padding and staging were accounted for.
+//! Staging-traffic terms were evaluated and deliberately dropped: with the
+//! verification tripwire in place, every earlier "large tiles stage less and
+//! win" measurement turned out to be a stale-build or unverified-chain
+//! artifact; verified numbers show zero-pad tiles flat except for occupancy.
 //!
-//! Measured anchors on M2 Max (min-of-many, chained-dependency bench):
-//! 16384x384x384 — 128x64 6.95 / 128x128 6.94 / 64x64 6.82 / padded 128x256
-//! 3.25 TF/s; 4096^3 — 256x256 5.37 / 128x512 5.30 / 128x64 4.86; 1024^3 —
-//! 128x512 1.60 vs 128x64 0.79 (the ladder chose 128x64 here); 1000x1024x1024
-//! — 128x512 4.18 vs 16x64 3.85; 384x1024x1024 — all ~3.20; 8192x1024x256 —
-//! all ~6.25; 1944x1280x3840 — 128x64 2.09 ~= 128x256 2.01, padded 128x512
-//! 1.12.
+//! Measured anchors on M2 Max (min-of-many, verified chained bench):
+//! 1024^3 — 128x64 3.64 / 64x64 2.69 / 128x512 2.15 TF/s; 384x16384x1536 —
+//! 128x64 unsplit ~5.9 vs 128x512+split ~2.3; 4096^3 — 128x512 5.12 = 128x64
+//! 5.12 (256x256 5.28, excluded as unmergeable); 16384x384x384 — 128x64 6.95
+//! ~= 128x128 6.94, padded 128x256 3.25; 1944x1280x3840 — 64x128 ~= 128x64
+//! ~2.1, padded 128x512 1.12; 1000x1024x1024 — 128x512 4.18 vs 16x64 3.85
+//! (padding-first picks 16x64; accepted, least wasted work).
 
 use std::cmp::Reverse;
 
@@ -49,11 +45,7 @@ use fusor_tile_ir_kernels::coop_tile_entries;
 use super::variants::CoopTile;
 use crate::occupancy::DispatchPolicy;
 
-/// MAC-equivalents one workgroup-memory staged element costs. See the
-/// module docs for the measured bounds (0.24 < W < 7.96).
-const STAGED_ELEMENT_MACS: u128 = 4;
-
-type ScoreKey = (u128, Reverse<u64>, Reverse<u32>, Reverse<u32>);
+type ScoreKey = (u128, u128, Reverse<u64>, Reverse<u32>, Reverse<u32>);
 
 /// Pick the cooperative-matrix tile for an `m x k @ k x n` contraction, or
 /// `None` when no coop tile is worth it (degenerate contractions route to
@@ -68,6 +60,8 @@ pub(super) fn select_coop_tile(
     if m == 0 || n == 0 || k == 0 {
         return None;
     }
+    // Per-tile prologue/epilogue/launch overhead in per-lane MAC-equivalents.
+    let tile_overhead = u128::from(policy.saturation_lanes() / 4);
     let mut best: Option<(ScoreKey, CoopTile, u128)> = None;
     for entry in coop_tile_entries() {
         let (bm, bn, bk) = (entry.tile.bm, entry.tile.bn, entry.tile.bk);
@@ -80,11 +74,14 @@ pub(super) fn select_coop_tile(
         }
         let tiles = u64::from(m.div_ceil(bm)) * u64::from(n.div_ceil(bn));
         let k_pad = u64::from(k.div_ceil(bk)) * u64::from(bk);
-        let padded_macs =
-            u128::from(tiles) * u128::from(bm) * u128::from(bn) * u128::from(k_pad);
-        let staging = u128::from(tiles) * u128::from(k_pad) * u128::from(bm + bn);
+        let per_tile_macs = u128::from(bm) * u128::from(bn) * u128::from(k_pad);
+        let padded_macs = u128::from(tiles) * per_tile_macs;
+        let concurrent = u64::from((policy.saturation_lanes() / threads).max(1));
+        let waves = u128::from(tiles.div_ceil(concurrent));
+        let depth = waves * (per_tile_macs / u128::from(threads) + tile_overhead);
         let key: ScoreKey = (
-            padded_macs + STAGED_ELEMENT_MACS * staging,
+            padded_macs,
+            depth,
             Reverse(u64::from(bm) * u64::from(bn)),
             Reverse(bm),
             Reverse(bn),

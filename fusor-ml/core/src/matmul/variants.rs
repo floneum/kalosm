@@ -8,10 +8,9 @@ use crate::{
     tensor::DataTypeEnum,
 };
 
-use super::{MatMulParams, coop_gemm};
+use super::MatMulParams;
 
 pub(super) const DENSE_M: Axis<0> = Axis;
-pub(super) const DENSE_K: Axis<1> = Axis;
 pub(super) const DENSE_N: Axis<2> = Axis;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,15 +39,8 @@ pub(super) fn dense_matmul_selector() -> ShapeSelector<3, DenseMatmulCtx, DenseM
     ShapeSelector::new()
         .rule(
             DenseMatmulVariant::Coop,
-            ShapeRule::new().when(|shape: KernelShape<3>, ctx: &DenseMatmulCtx, caps| {
-                coop_gemm_params_from_caps(
-                    shape[DENSE_M],
-                    shape[DENSE_N],
-                    shape[DENSE_K],
-                    caps,
-                    ctx.coop_kinds,
-                )
-                .is_some()
+            ShapeRule::new().when(|_shape: KernelShape<3>, ctx: &DenseMatmulCtx, caps| {
+                coop_supported(caps, ctx.coop_kinds)
             }),
         )
         .rule(
@@ -76,51 +68,26 @@ pub(super) fn select_dense_matmul_params(
         .select(shape, &ctx, caps)
         .expect("dense matmul selector has a catch-all rule")
     {
-        DenseMatmulVariant::Coop => MatMulParams::CoopMatMul(
-            coop_gemm::optimal_params(m, n, k, device, select_coop_kind(caps, coop_kinds))
-                .expect("coop selector and coop parameter selection disagree"),
-        ),
+        DenseMatmulVariant::Coop => {
+            MatMulParams::CoopMatMul(select_coop_kind(caps, coop_kinds))
+        }
         DenseMatmulVariant::Vector => MatMulParams::Vector(gemv_parameters(m, n, k)),
         DenseMatmulVariant::MatMul => MatMulParams::MatMul(gemm_parameters(m, n, k)),
     }
 }
 
-pub(super) fn coop_gemm_params_from_caps(
-    m: usize,
-    n: usize,
-    _k: usize,
-    caps: KernelDeviceCaps,
-    coop_kinds: &[CooperativeMatrixKind],
-) -> Option<coop_gemm::CoopGemmParams> {
-    if !caps.subgroups_supported
-        || !coop_kinds
+/// Whether the cooperative-matrix family is available at all on this
+/// device: fixed-width subgroups, a supported cooperative kind, and room
+/// for at least the smallest coop workgroup. Geometry is not consulted —
+/// the scored tile selection decides it per kernel build, and shapes it
+/// declines lower through the generic fused reduction.
+pub(super) fn coop_supported(caps: KernelDeviceCaps, coop_kinds: &[CooperativeMatrixKind]) -> bool {
+    caps.subgroups_supported
+        && coop_kinds
             .iter()
             .any(|kind| caps.cooperative_matrix.supports(*kind))
-        || caps.min_subgroup_size != caps.max_subgroup_size
-        || caps.max_compute_workgroup_size_x < 64
-    {
-        return None;
-    }
-
-    let mut params = coop_gemm::CoopGemmParams::default();
-    if n <= 16 {
-        params.block_n = 16;
-        params.n_passes = 1;
-    } else if n <= 32 {
-        params.block_n = 32;
-        params.n_passes = 2;
-    }
-
-    if m <= 16 {
-        params.block_m = 16;
-        params.wg_threads = 64;
-    } else if m < params.block_m as usize {
-        params.block_m = 64;
-        params.wg_threads = 128;
-    }
-
-    params.kind = select_coop_kind(caps, coop_kinds);
-    (params.wg_threads <= caps.max_compute_workgroup_size_x).then_some(params)
+        && caps.min_subgroup_size == caps.max_subgroup_size
+        && caps.max_compute_workgroup_size_x >= 64
 }
 
 pub(super) fn select_coop_kind(
@@ -153,7 +120,7 @@ impl CoopTile {
     /// Subgroups per workgroup for this geometry, from the kernel table —
     /// the single source of truth for coop tile execution properties.
     /// Zero means the geometry has no kernel entry and is unselectable.
-    fn subgroup_groups(self) -> u32 {
+    pub(super) fn subgroup_groups(self) -> u32 {
         fusor_tile_ir_kernels::coop_tile_entries()
             .iter()
             .find(|entry| {
