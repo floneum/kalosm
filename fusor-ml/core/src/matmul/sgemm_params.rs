@@ -1,3 +1,10 @@
+//! Measured selection tree for the generic tiled-matmul fallback. This
+//! family only runs where cooperative matrices are unavailable (no-subgroup
+//! devices and the WebGPU baseline), so the leaves are measurement, not
+//! derivation — rederiving them requires benching those targets. Structural
+//! legality of every leaf is pinned by
+//! `fallback_family_params_are_legal_everywhere`.
+
 use crate::sgemm::SgemmParams;
 
 #[inline]

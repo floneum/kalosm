@@ -1,3 +1,9 @@
+//! Measured (m, k) bucket table for the vector-family fallback. This family
+//! only runs where cooperative matrices are unavailable (no-subgroup devices
+//! and the WebGPU baseline), so the cells are measurement, not derivation —
+//! rederiving them requires benching those targets. Structural legality of
+//! every cell is pinned by `fallback_family_params_are_legal_everywhere`.
+
 use crate::sgemv::SgemvParams;
 
 #[inline]

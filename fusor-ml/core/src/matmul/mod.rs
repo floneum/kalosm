@@ -435,6 +435,61 @@ mod selection_tests {
             );
         }
     }
+
+    /// The sgemv bucket table and the sgemm regression tree are measured
+    /// policies for the non-cooperative fallback families; every cell they
+    /// can produce must still be structurally legal (kernel divisibility,
+    /// workgroup lane bounds, shared-memory budget) for every shape.
+    #[test]
+    fn fallback_family_params_are_legal_everywhere() {
+        let mut lcg = 0x0fa1_1bac_c5u64;
+        let mut next = |range: u32| {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((lcg >> 33) as u32) % range + 1
+        };
+        for _ in 0..4000 {
+            let (m, k, n) = (
+                next(20_000) as usize,
+                next(20_000) as usize,
+                next(20_000) as usize,
+            );
+
+            let gemm = crate::matmul::sgemm_params::gemm_parameters(m, n, k);
+            let (bm, bn, bk) = (
+                gemm.block_m_size(),
+                gemm.block_n_size(),
+                gemm.block_k_size(),
+            );
+            let (tm, tn) = (gemm.thread_m_size(), gemm.thread_n_size());
+            assert!(
+                bm.is_multiple_of(tm) && bn.is_multiple_of(tn),
+                "m={m} n={n} k={k}: thread tile must divide the block tile ({gemm:?})"
+            );
+            let lanes = (bm * bn) / (tm * tn);
+            assert!(
+                (32..=1024).contains(&lanes),
+                "m={m} n={n} k={k}: workgroup lanes {lanes} out of range ({gemm:?})"
+            );
+            // A and B staging tiles, doubled when double-buffered, must fit
+            // Apple's 32 KB workgroup-memory floor.
+            let buffers = if gemm.double_buffer() { 2 } else { 1 };
+            let smem_bytes = u64::from((bm + bn) * bk) * 4 * buffers;
+            assert!(
+                smem_bytes <= 32 * 1024,
+                "m={m} n={n} k={k}: {smem_bytes}B of workgroup memory ({gemm:?})"
+            );
+
+            let gemv = crate::matmul::sgemv_params::gemv_parameters(m, n, k);
+            assert!(
+                gemv.chunk_size() >= 1
+                    && matches!(gemv.vector_size(), 1 | 2 | 4)
+                    && (1..=32).contains(&gemv.subgroups_per_workgroup()),
+                "m={m} n={n} k={k}: illegal gemv params ({gemv:?})"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
