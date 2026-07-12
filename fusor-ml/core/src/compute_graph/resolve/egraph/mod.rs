@@ -1,34 +1,37 @@
-//! Equality-saturation optimizer replacing the recognition sweeps and the
-//! destructive rewrite fixpoint.
+//! Equality-saturation optimizer for operation recognition and fusion.
 //!
-//! The pipeline runs two saturation stages over per-stage e-graphs:
-//! - Stage 1 (always): recognition rules (contraction, quantized embedding,
-//!   attention) — the original composed forms persist in the e-graph, so
-//!   recognition no longer depends on running before other rewrites.
-//! - Stage 2 (policy gated): fusion rules (view folding, nary/reduce fusion,
-//!   matmul and qmatmul epilogues), registered per stage-2 profile.
+//! The pipeline has two internal stages:
+//! - Stage 1 (always): native egg saturation for contraction and quantized
+//!   embedding recognition, followed by attention's cluster builder.
+//! - Stage 2: cost-guided view, nary/reduce, matmul and qmatmul fusion. A
+//!   planning e-graph hash-conses bounded local windows so repeated layers
+//!   reuse the first occurrence's plan.
 //!
 //! Rules are strictly additive: appliers union an alternative e-node into the
-//! root's class and never remove anything. Today's destructive greedy
-//! decisions are reproduced by the mimic-greedy extractor, and the chosen
-//! terms are applied back onto the execution graph as in-place deltas.
+//! root's class and never remove anything. A GPU-oriented extractor chooses
+//! among legal terms, and the chosen terms are applied back onto the
+//! execution graph as in-place deltas.
 //!
 //! Pure e-node identity is semantic: operator payload plus child e-classes.
-//! Allocation-backed leaves use allocation identity. Multiple execution-graph
-//! observations of one e-class are materialized once and cached under every
-//! observed `NodeIndex`.
+//! Allocation-backed leaves use allocation identity. A separate private
+//! planning e-graph erases allocation identity, allowing isomorphic repeated
+//! layers to share rewrite plans without ever sharing their values. Multiple
+//! execution-graph observations of one value e-class are materialized once
+//! and cached under every observed `NodeIndex`.
 
 mod analysis;
 mod apply;
+mod cost;
 mod extract;
 mod ingest;
 mod interner;
 mod lang;
+mod planning;
 mod rules_fuse;
 mod rules_fuse_matmul;
 mod rules_recognize;
 
-use egg::{EGraph, Id};
+use egg::{BackoffScheduler, EGraph, Id, Runner, StopReason};
 use rustc_hash::FxHashMap;
 
 use self::analysis::FusorAnalysis;
@@ -56,24 +59,13 @@ pub(super) struct EGraphDriver {
     provs_of_class: FxHashMap<Id, Vec<lang::Prov>>,
 }
 
-/// One rewrite rule: a programmatic searcher + applier pair run as whole
-/// rounds over the e-graph. Rules are strictly additive — they may only add
-/// alternative e-nodes and union them into existing classes. Saturation is
-/// detected through the payload interner: re-applying a rule re-interns the
-/// identical payload, hash-conses to the identical e-node, and adds nothing.
-trait EgRule {
-    /// One deterministic round; returns true if the e-graph grew.
-    fn apply_round(&self, driver: &mut EGraphDriver, ctx: &RuleCtx<'_>) -> bool;
-}
-
-/// Read-only context rules match against. The inner graph and resolver are
-/// immutable for the whole stage; rules mutate only the e-graph.
-struct RuleCtx<'a> {
-    graph: &'a ComputeGraphInner,
-    resolver: &'a Resolver,
-}
-
 impl EGraphDriver {
+    /// The API-emitted operation for one observation, before any egg
+    /// alternative is selected.
+    fn identity_variant(&self, prov: lang::Prov) -> Option<&ExecutionVariant> {
+        self.identity_variants[prov.0 as usize].as_ref()
+    }
+
     fn refresh_prov_classes(&mut self) {
         self.provs_of_class.clear();
         for (index, &class) in self.class_of.iter().enumerate() {
@@ -83,36 +75,13 @@ impl EGraphDriver {
                 .push(lang::Prov(index as u32));
         }
     }
-    /// Add `variant` as an alternative form of `root`'s execution node.
-    /// Children are derived from the payload's own dependency list so the
-    /// payload/children lockstep has one owner. Returns false when the
-    /// identical alternative was already present (idempotent re-application).
-    fn add_alternative(&mut self, root: lang::Prov, variant: ExecutionVariant) -> bool {
-        let before = self.egraph.total_number_of_nodes();
-        self.mint_alternative(root, variant);
-        self.egraph.total_number_of_nodes() > before
-    }
-
-    /// Like [`Self::add_alternative`], returning the minted e-node (which the
-    /// Stage-2 extractor commits as a switch).
-    fn mint_alternative(&mut self, root: lang::Prov, variant: ExecutionVariant) -> FusorLang {
-        self.mint_alternative_impl(root, variant, true)
-    }
-
-    /// Stage-2 mint: skips interner dedup (see `PayloadTable::push_unique`).
+    /// Stage-2 mint: skips semantic payload dedup and can reuse a planning
+    /// spec learned from an isomorphic earlier occurrence.
     fn mint_alternative_unique(
         &mut self,
         root: lang::Prov,
         variant: ExecutionVariant,
-    ) -> FusorLang {
-        self.mint_alternative_impl(root, variant, false)
-    }
-
-    fn mint_alternative_impl(
-        &mut self,
-        root: lang::Prov,
-        variant: ExecutionVariant,
-        dedup: bool,
+        known_spec: Option<interner::SpecId>,
     ) -> FusorLang {
         let children: Vec<Id> = interner::variant_dependencies(&variant)
             .into_iter()
@@ -121,70 +90,87 @@ impl EGraphDriver {
                     .expect("alternative dependencies must already be ingested")
             })
             .collect();
-        let enode = ingest::enode_for(&mut self.egraph.analysis, &variant, root, children, dedup);
+        let enode = ingest::enode_for(
+            &mut self.egraph.analysis,
+            &variant,
+            root,
+            children,
+            false,
+            known_spec,
+        );
         let id = self.egraph.add(enode.clone());
         let root_id = self.class_of[root.0 as usize];
         self.egraph.union(root_id, id);
         enode
     }
 
-    /// Run rule rounds to saturation (bounded by `iter_limit`). Deterministic:
-    /// rules run in slice order, each round iterates provenances in order,
-    /// and no wall-clock limit exists.
-    fn saturate(&mut self, rules: &[&dyn EgRule], ctx: &RuleCtx<'_>, iter_limit: usize) {
-        for _ in 0..iter_limit {
-            let mut changed = false;
-            for rule in rules {
-                changed |= rule.apply_round(self, ctx);
-            }
-            self.egraph.rebuild();
-            self.refresh_prov_classes();
-            if !changed {
-                return;
-            }
+    /// Run native egg recognition over the ingested graph. The runner owns
+    /// saturation detection, rebuilds, scheduling and hard growth limits;
+    /// Fusor's custom searchers/appliers only describe matches and semantic
+    /// alternatives.
+    fn run_recognition(mut self) -> Self {
+        const RECOGNITION_ITER_LIMIT: usize = 4;
+        let initial_nodes = self.egraph.total_number_of_nodes();
+        let node_limit = initial_nodes
+            .saturating_mul(8)
+            .max(initial_nodes.saturating_add(4096));
+        let egraph = std::mem::replace(&mut self.egraph, EGraph::default());
+        let rules = rules_recognize::rules();
+        let scheduler = BackoffScheduler::default()
+            .do_not_ban("recognize-contraction")
+            .do_not_ban("recognize-qembedding");
+        let runner = Runner::default()
+            .with_egraph(egraph)
+            .with_iter_limit(RECOGNITION_ITER_LIMIT)
+            .with_node_limit(node_limit)
+            // Deterministic node/iteration limits own termination. Keep the
+            // runner's wall-clock guard effectively disabled.
+            .with_time_limit(std::time::Duration::from_secs(365 * 24 * 60 * 60))
+            .with_scheduler(scheduler)
+            .run(&rules);
+        if !matches!(runner.stop_reason, Some(StopReason::Saturated)) {
+            tracing::warn!(
+                "egg recognition stopped before saturation: {:?}",
+                runner.stop_reason
+            );
         }
-        tracing::warn!("egraph saturation hit its iteration limit ({iter_limit})");
+        if std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some() {
+            let report = runner.report();
+            tracing::info!(
+                "resolve_egg_recognition iterations={} nodes={} classes={} search_s={:.6} apply_s={:.6} rebuild_s={:.6} stop={:?}",
+                report.iterations,
+                report.egraph_nodes,
+                report.egraph_classes,
+                report.search_time,
+                report.apply_time,
+                report.rebuild_time,
+                report.stop_reason,
+            );
+        }
+        self.egraph = runner.egraph;
+        self.refresh_prov_classes();
+        self
     }
 }
 
 impl Resolver {
-    /// Stage 1: recognition via equality saturation. Always runs (the
-    /// decode-policy contract: recognition happens even when rewriting is
-    /// skipped). Replaces the `recognize_contractions` /
-    /// `recognize_embeddings` / `recognize_attention` sweeps.
-    pub(super) fn recognize_via_egraph(&mut self, graph: &mut ComputeGraphInner) {
-        let mut driver = EGraphDriver::ingest(self, graph);
-        {
-            let ctx = RuleCtx {
-                graph,
-                resolver: self,
-            };
-            let rules: [&dyn EgRule; 2] = [
-                &rules_recognize::RecognizeContraction,
-                &rules_recognize::RecognizeQEmbedding,
-            ];
-            // Recognition needs one round plus one for chained recognitions
-            // (attention consumes contraction's output); the extra headroom
-            // is saturation-detection slack, not a behavioral knob.
-            driver.saturate(&rules, &ctx, 4);
-        }
+    /// Stage 1: recognize specialized operations through equality saturation.
+    pub(super) fn recognize_operations(&mut self, graph: &mut ComputeGraphInner) {
+        let driver = EGraphDriver::ingest_for_recognition(self, graph).run_recognition();
         let extraction = driver.extract();
         self.apply_egraph_deltas(graph, &driver, &extraction);
-        // Attention recognition consumes the committed MatMul plus the
-        // composed softmax cluster on the execution graph, exactly as the
-        // destructive pipeline ordered it. Its ordering after contraction
-        // recognition is structural here (it runs on the extracted graph),
-        // not a phase-fragility: the matcher stays imperative in v1.
+        // Attention builds an opaque GraphOperation, which intentionally has
+        // no structural-equality contract. Run its cluster builder over the
+        // extracted MatMul graph; pure contraction/embedding alternatives
+        // remain native egg rewrites.
         self.recognize_attention(graph);
     }
 }
 
 impl Resolver {
-    /// Stage 2: fusion via the extraction worklist consulting the pure
-    /// generator transcriptions. Replaces `run_rewrite_fixpoint`; the same
-    /// policy gates (including the large-decode skip) select whether this
-    /// runs at all, upstream in `optimize`.
-    pub(super) fn fuse_via_egraph(
+    /// Stage 2: plan and extract fusions. Allocation-independent local windows
+    /// are memoized automatically for every resolve.
+    pub(super) fn fuse_operations(
         &mut self,
         graph: &mut ComputeGraphInner,
         profile: rules_fuse::Stage2Profile,

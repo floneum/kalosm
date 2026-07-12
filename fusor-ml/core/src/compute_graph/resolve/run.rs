@@ -41,24 +41,18 @@ impl Resolver {
             let optimize_limit = optimize_node_limit();
             let node_count = self.execution_graph.node_count();
             let large_graph_profile = optimize_limit != 0 && node_count > optimize_limit;
-            let policy = super::execution::OptimizePolicy::select(
-                node_count,
-                optimize_limit,
-                std::env::var_os("FUSOR_RESOLVE_OPTIMIZE_DECODE_GRAPHS").is_some(),
-            );
-            let fixpoint_ran = if std::env::var_os("FUSOR_RESOLVE_SKIP_OPTIMIZE").is_none() {
-                Some(self.optimize(graph, policy))
-            } else {
-                None
-            };
+            let policy = super::execution::OptimizePolicy::select(node_count, optimize_limit);
+            let optimizer_enabled = std::env::var_os("FUSOR_RESOLVE_SKIP_OPTIMIZE").is_none();
+            if optimizer_enabled {
+                self.optimize(graph, policy);
+            }
             if let Some(start) = start {
                 host_profile.optimize += start.elapsed();
             }
             if host_trace && large_graph_profile {
                 tracing::info!(
-                    "resolve_host_profile optimizer_policy={} node_count={node_count} limit={optimize_limit} skipped_decode_fixpoint={}",
+                    "resolve_host_profile optimizer_policy={} optimizer_enabled={optimizer_enabled} node_count={node_count} limit={optimize_limit}",
                     policy.label(),
-                    fixpoint_ran == Some(false),
                 );
             }
             if host_trace {

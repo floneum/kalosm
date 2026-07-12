@@ -16,8 +16,8 @@ use rustc_hash::FxHashSet;
 
 use super::super::{ExecutionVariant, Resolver};
 use super::EGraphDriver;
-use super::analysis::{FusorAnalysis, NodeFacts};
-use super::interner::variant_dependencies;
+use super::analysis::{FusorAnalysis, NodeFacts, PlannerSnapshot};
+use super::interner::{SpecId, variant_dependencies};
 use super::lang::{AllocationId, FusorLang, Prov};
 use crate::compute_graph::{ComputeGraphInner, NodeIndex};
 
@@ -30,9 +30,14 @@ pub(super) fn enode_for(
     prov: Prov,
     children: Vec<Id>,
     dedup: bool,
+    known_spec: Option<SpecId>,
 ) -> FusorLang {
     let intern = |analysis: &mut FusorAnalysis, variant: &ExecutionVariant| {
-        if dedup {
+        if let Some(spec) = known_spec {
+            analysis
+                .payloads
+                .push_unique_with_spec(variant.clone(), spec)
+        } else if dedup {
             analysis.payloads.intern(variant.clone())
         } else {
             analysis.payloads.push_unique(variant.clone())
@@ -87,10 +92,26 @@ pub(super) fn enode_for(
 impl EGraphDriver {
     /// Ingest the resolver's execution graph reachable from its targets.
     pub(super) fn ingest(resolver: &Resolver, graph: &ComputeGraphInner) -> Self {
+        Self::ingest_impl(resolver, graph, false)
+    }
+
+    /// Recognition's native egg appliers additionally need immutable view
+    /// and quantized-matrix metadata. Other stages skip this snapshot.
+    pub(super) fn ingest_for_recognition(resolver: &Resolver, graph: &ComputeGraphInner) -> Self {
+        Self::ingest_impl(resolver, graph, true)
+    }
+
+    fn ingest_impl(
+        resolver: &Resolver,
+        graph: &ComputeGraphInner,
+        with_planner_snapshot: bool,
+    ) -> Self {
         let mut driver = EGraphDriver {
             egraph: EGraph::new(FusorAnalysis {
                 facts: Vec::new(),
                 payloads: Default::default(),
+                planner: None,
+                class_of_inner: Default::default(),
             }),
             class_of: Vec::new(),
             identity_payloads: Vec::new(),
@@ -124,7 +145,9 @@ impl EGraphDriver {
                                 resolver
                                     .node_mapping
                                     .get(&node)
-                                    .map(|&exec| format!("{:?}", resolver.execution_graph[exec].variant))
+                                    .map(|&exec| {
+                                        format!("{:?}", resolver.execution_graph[exec].variant)
+                                    })
                                     .unwrap_or_else(|| "<boundary>".into())
                             };
                             let variant = describe(inner);
@@ -167,7 +190,6 @@ impl EGraphDriver {
                                 exec: None,
                                 externally_live: graph.has_live_reference(inner),
                                 is_target: target_set.contains(&inner),
-                                consumer_count: 0,
                             },
                         );
                         let allocation = graph
@@ -178,6 +200,7 @@ impl EGraphDriver {
                             .unwrap_or(AllocationId(inner.index()));
                         let boundary = FusorLang::Boundary(prov, allocation);
                         let id = driver.egraph.add(boundary.clone());
+                        driver.egraph.analysis.class_of_inner.insert(inner, id);
                         driver.class_of.push(id);
                         driver.identity_payloads.push(None);
                         driver.identity_enodes.push(boundary);
@@ -185,10 +208,6 @@ impl EGraphDriver {
                         debug_assert_eq!(driver.class_of.len(), prov.0 as usize + 1);
                         continue;
                     };
-                    let consumer_count = resolver
-                        .execution_graph
-                        .edges_directed(exec_idx, petgraph::Direction::Outgoing)
-                        .count() as u32;
                     let prov = driver.alloc_prov(
                         inner,
                         NodeFacts {
@@ -196,7 +215,6 @@ impl EGraphDriver {
                             exec: Some(exec_idx),
                             externally_live: graph.has_live_reference(inner),
                             is_target: target_set.contains(&inner),
-                            consumer_count,
                         },
                     );
                     // Reserve the class slot now (pre-order prov => index
@@ -227,18 +245,31 @@ impl EGraphDriver {
                         .into_iter()
                         .map(|dep| driver.class_of[driver.prov_of[&dep].0 as usize])
                         .collect();
-                    let enode =
-                        enode_for(&mut driver.egraph.analysis, &variant, prov, children, true);
+                    let enode = enode_for(
+                        &mut driver.egraph.analysis,
+                        &variant,
+                        prov,
+                        children,
+                        true,
+                        None,
+                    );
                     driver.identity_payloads[prov.0 as usize] = enode.payload();
                     driver.identity_enodes[prov.0 as usize] = enode.clone();
                     driver.identity_variants[prov.0 as usize] = Some(variant);
                     let id = driver.egraph.add(enode);
                     driver.class_of[prov.0 as usize] = id;
+                    driver.egraph.analysis.class_of_inner.insert(inner, id);
                 }
             }
         }
         driver.egraph.rebuild();
         driver.refresh_prov_classes();
+        if with_planner_snapshot {
+            driver.egraph.analysis.planner = Some(std::sync::Arc::new(PlannerSnapshot::new(
+                graph,
+                driver.prov_of.keys().copied(),
+            )));
+        }
         debug_assert_eq!(
             driver.class_of.len(),
             driver.egraph.analysis.facts.len(),
@@ -317,12 +348,11 @@ mod tests {
             nodes.sort();
             writeln!(
                 out,
-                "prov={index} inner={} exec={:?} live={} target={} consumers={} nodes={nodes:?}",
+                "prov={index} inner={} exec={:?} live={} target={} nodes={nodes:?}",
                 facts.inner.index(),
                 facts.exec.map(|e| e.index()),
                 facts.externally_live,
                 facts.is_target,
-                facts.consumer_count,
             )
             .unwrap();
         }
@@ -496,7 +526,12 @@ mod tests {
                 resolver.coalesce_equivalent_eclasses(graph);
                 assert_eq!(resolver.execution_graph.node_count(), 2);
                 assert_eq!(
-                    resolver.shared_outputs.values().flatten().copied().collect::<Vec<_>>(),
+                    resolver
+                        .shared_outputs
+                        .values()
+                        .flatten()
+                        .copied()
+                        .collect::<Vec<_>>(),
                     vec![targets[1]]
                 );
             });

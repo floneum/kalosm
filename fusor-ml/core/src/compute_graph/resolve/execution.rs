@@ -1,9 +1,8 @@
 use super::*;
 
-/// Wall-clock per optimizer sub-phase, one resolve. The decode host-cost
-/// budget is judged against this ledger, so keep the sections aligned with
-/// the actual work: Stage-1 recognition, imperative row/assign fusion,
-/// the Stage-2 fusion fixpoint, region formation, and semantic coalescing.
+/// Wall-clock per optimizer sub-phase, one resolve. Keep the sections aligned
+/// with the actual work: Stage-1 recognition, imperative row/assign fusion,
+/// Stage-2 planning and extraction, region formation, and semantic coalescing.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct OptimizePhases {
     pub(super) recognize: Duration,
@@ -16,7 +15,7 @@ pub(super) struct OptimizePhases {
 #[derive(Clone, Copy, Debug)]
 pub(super) enum OptimizePolicy {
     Standard,
-    LargeGraph { optimize_decode_graphs: bool },
+    LargeGraph,
 }
 
 // This is a separate safety/performance gate from the configurable threshold
@@ -25,15 +24,9 @@ pub(super) enum OptimizePolicy {
 const STANDARD_QMATMUL_FUSION_NODE_LIMIT: usize = 512;
 
 impl OptimizePolicy {
-    pub(super) fn select(
-        node_count: usize,
-        node_limit: usize,
-        optimize_decode_graphs: bool,
-    ) -> Self {
+    pub(super) fn select(node_count: usize, node_limit: usize) -> Self {
         if node_limit != 0 && node_count > node_limit {
-            Self::LargeGraph {
-                optimize_decode_graphs,
-            }
+            Self::LargeGraph
         } else {
             Self::Standard
         }
@@ -42,21 +35,12 @@ impl OptimizePolicy {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Standard => "standard",
-            Self::LargeGraph { .. } => "large_graph",
+            Self::LargeGraph => "large_graph",
         }
     }
 
     fn is_large_graph(self) -> bool {
-        matches!(self, Self::LargeGraph { .. })
-    }
-
-    fn runs_stage2_fusion(self, is_single_token_decode: bool) -> bool {
-        match self {
-            Self::Standard => true,
-            Self::LargeGraph {
-                optimize_decode_graphs,
-            } => optimize_decode_graphs || !is_single_token_decode,
-        }
+        matches!(self, Self::LargeGraph)
     }
 }
 
@@ -312,18 +296,14 @@ impl Resolver {
 
     // --- Rewrite Engine ---
 
-    pub(super) fn optimize(
-        &mut self,
-        graph: &mut ComputeGraphInner,
-        policy: OptimizePolicy,
-    ) -> bool {
+    pub(super) fn optimize(&mut self, graph: &mut ComputeGraphInner, policy: OptimizePolicy) {
         // Rebuild composed contraction / normalization clusters into their
         // specialized operations first, while they are still in the exact
         // canonical form the API emitted (before view folding or fusion
-        // disturbs them). This phase is unconditional: decode classification
-        // is only reliable after recognition has minted QMatMul nodes.
+        // disturbs them). Profile selection follows because recognition can
+        // mint QMatMul nodes.
         let phase_start = Instant::now();
-        self.recognize_via_egraph(graph);
+        self.recognize_operations(graph);
         self.optimize_phases.recognize += phase_start.elapsed();
         // The qmatmul scan runs after recognition (which can mint QMatMul
         // nodes) and before row fusion (which never creates or removes
@@ -387,7 +367,7 @@ impl Resolver {
                 skip_externally_live: self.horizontal_merge_dense_ops,
                 enable_dense_codegen: false,
             },
-            OptimizePolicy::LargeGraph { .. } if has_qmatmul => Stage2Profile {
+            OptimizePolicy::LargeGraph if has_qmatmul => Stage2Profile {
                 candidates: CandidateKind::LargeQuantized,
                 reduce_fusion: ReduceFusion::Disabled,
                 try_matmul_fusion: true,
@@ -396,7 +376,7 @@ impl Resolver {
                 skip_externally_live: self.horizontal_merge_dense_ops,
                 enable_dense_codegen: false,
             },
-            OptimizePolicy::LargeGraph { .. } => Stage2Profile {
+            OptimizePolicy::LargeGraph => Stage2Profile {
                 candidates: CandidateKind::Dense,
                 reduce_fusion: if dense && has_reduce {
                     ReduceFusion::Dense
@@ -411,13 +391,9 @@ impl Resolver {
             },
         };
 
-        let is_single_token_decode = has_qmatmul && self.is_single_token_qmatmul_graph();
-        let run_fixpoint = policy.runs_stage2_fusion(is_single_token_decode);
-        if run_fixpoint {
-            let phase_start = Instant::now();
-            self.fuse_via_egraph(graph, profile.clone());
-            self.optimize_phases.stage2 += phase_start.elapsed();
-        }
+        let phase_start = Instant::now();
+        self.fuse_operations(graph, profile.clone());
+        self.optimize_phases.stage2 += phase_start.elapsed();
 
         // Dense large-graph kernel tuning is opted into per operation, after
         // rewrite has settled: matmuls get the wider divisor-aligned split-K
@@ -438,7 +414,6 @@ impl Resolver {
         let phase_start = Instant::now();
         self.coalesce_equivalent_eclasses(graph);
         self.optimize_phases.coalesce += phase_start.elapsed();
-        run_fixpoint
     }
 
     /// Set `dense_codegen` on every matmul and row-program operation in the
@@ -468,26 +443,6 @@ impl Resolver {
     /// fingerprint.
     pub(super) fn dense_reduce_fusion_enabled(has_qmatmul: bool) -> bool {
         !has_qmatmul && std::env::var_os("FUSOR_RESOLVE_DISABLE_DENSE_REDUCE_FUSION").is_none()
-    }
-
-    fn is_single_token_qmatmul_graph(&self) -> bool {
-        let mut qmatmul_count = 0usize;
-        let mut single_token_count = 0usize;
-        for node in self.execution_graph.node_indices() {
-            let ExecutionVariant::QMatMul(qmatmul) = &self.execution_graph[node].variant else {
-                continue;
-            };
-            qmatmul_count += 1;
-            if qmatmul.in_shape.len() >= 2
-                && qmatmul.in_shape[..qmatmul.in_shape.len() - 1]
-                    .iter()
-                    .product::<usize>()
-                    == 1
-            {
-                single_token_count += 1;
-            }
-        }
-        qmatmul_count >= 16 && single_token_count * 4 >= qmatmul_count * 3
     }
 
     // Helpers
@@ -596,26 +551,13 @@ mod optimizer_policy_tests {
 
     #[test]
     fn configured_node_limit_selects_optimizer_policy() {
-        let standard = OptimizePolicy::select(600, 1_024, false);
+        let standard = OptimizePolicy::select(600, 1_024);
         assert!(matches!(standard, OptimizePolicy::Standard));
 
-        let large = OptimizePolicy::select(1_025, 1_024, false);
-        assert!(matches!(large, OptimizePolicy::LargeGraph { .. }));
+        let large = OptimizePolicy::select(1_025, 1_024);
+        assert!(matches!(large, OptimizePolicy::LargeGraph));
 
-        let unlimited = OptimizePolicy::select(10_000, 0, false);
+        let unlimited = OptimizePolicy::select(10_000, 0);
         assert!(matches!(unlimited, OptimizePolicy::Standard));
-    }
-
-    #[test]
-    fn only_large_decode_policy_can_skip_the_rewrite_fixpoint() {
-        let standard = OptimizePolicy::select(10, 512, false);
-        assert!(standard.runs_stage2_fusion(true));
-
-        let large = OptimizePolicy::select(513, 512, false);
-        assert!(!large.runs_stage2_fusion(true));
-        assert!(large.runs_stage2_fusion(false));
-
-        let opted_in = OptimizePolicy::select(513, 512, true);
-        assert!(opted_in.runs_stage2_fusion(true));
     }
 }

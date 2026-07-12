@@ -3,10 +3,10 @@
 //! by the extraction worklist with live consumer counts.
 //!
 //! Each generator is a pure function from the node's current form (and the
-//! evolving selection state, read through [`FusionView`]) to a better form;
-//! the extractor commits it as a switch and cascades the kills. Gates are
-//! legality and profitability conditions: binding budgets, dtype and device
-//! capabilities, sole-consumer duplication checks against live counts.
+//! evolving selection state, read through [`FusionView`]) to a legal
+//! alternative. The extractor compares alternatives with the GPU cost model,
+//! commits the winner, and cascades the kills. Gates cover binding budgets,
+//! dtype/device capabilities and duplication checks against live counts.
 
 use std::cell::RefCell;
 
@@ -280,35 +280,35 @@ impl<'a> FusionView<'a> {
         }
     }
 
-    /// The per-pop generator pipeline in the fixpoint's attempt order: fold
-    /// views, fuse naries, reduce-fusion family, matmul fusion. First
-    /// success wins; the extractor commits it and re-enqueues, so composed
-    /// sequences (fold-then-fuse in one destructive pop) play out across
-    /// consecutive pops with identical results.
-    pub(super) fn generate(&self, prov: Prov) -> Option<ExecutionVariant> {
+    /// All immediately legal alternatives in deterministic tie-break order:
+    /// fold views, fuse naries, reduce-fusion family, then matmul fusion.
+    /// Extraction compares their GPU costs and re-enqueues the winner, so
+    /// chained rewrites happen on later pops after that form becomes current.
+    pub(super) fn generate_candidates(&self, prov: Prov) -> Vec<ExecutionVariant> {
         let facts = self.driver.egraph.analysis.facts_of(prov);
-        let current = self.variant_of(facts.inner)?.clone();
+        let Some(current) = self.variant_of(facts.inner).cloned() else {
+            return Vec::new();
+        };
+        let mut candidates = Vec::new();
         match &current {
             ExecutionVariant::Elementwise(nary) => {
                 if let Some(folded) = self.gen_fold_views_elementwise(nary) {
-                    return Some(folded);
+                    candidates.push(folded);
                 }
                 if let Some(fused) = self.gen_fuse_naries(nary) {
-                    return Some(fused);
+                    candidates.push(fused);
                 }
             }
             ExecutionVariant::Reduce(_) => {}
             _ => {}
         }
-        if let Some(reduced) = self.gen_fuse_reduce(&current) {
-            return Some(reduced);
-        }
+        candidates.extend(self.gen_fuse_reduce_candidates(&current));
         if self.ctx.profile.try_matmul_fusion
             && let Some(matmul) = self.gen_fuse_into_matmul(&current)
         {
-            return Some(matmul);
+            candidates.push(matmul);
         }
-        None
+        candidates
     }
 
     /// Transcription of `try_fold_view_inputs` (fold_views.rs:19-91).
@@ -453,19 +453,23 @@ impl<'a> FusionView<'a> {
     }
 
     /// Transcription of `try_fuse_reduce` (execution.rs:558-578).
-    fn gen_fuse_reduce(&self, current: &ExecutionVariant) -> Option<ExecutionVariant> {
+    fn gen_fuse_reduce_candidates(&self, current: &ExecutionVariant) -> Vec<ExecutionVariant> {
+        let mut candidates = Vec::new();
         match self.ctx.profile.reduce_fusion {
-            ReduceFusion::Disabled => None,
-            ReduceFusion::Conservative => self
-                .gen_unary_into_reduce(current)
-                .or_else(|| self.gen_producer_into_reduce(current, false)),
-            ReduceFusion::Dense => self
-                .gen_collapse_unit_reduce(current)
-                .or_else(|| self.gen_fold_views_into_reduce(current))
-                .or_else(|| self.gen_unary_into_reduce(current))
-                .or_else(|| self.gen_indexed_unary_into_reduce(current))
-                .or_else(|| self.gen_producer_into_reduce(current, true)),
+            ReduceFusion::Disabled => {}
+            ReduceFusion::Conservative => {
+                candidates.extend(self.gen_unary_into_reduce(current));
+                candidates.extend(self.gen_producer_into_reduce(current, false));
+            }
+            ReduceFusion::Dense => {
+                candidates.extend(self.gen_collapse_unit_reduce(current));
+                candidates.extend(self.gen_fold_views_into_reduce(current));
+                candidates.extend(self.gen_unary_into_reduce(current));
+                candidates.extend(self.gen_indexed_unary_into_reduce(current));
+                candidates.extend(self.gen_producer_into_reduce(current, true));
+            }
         }
+        candidates
     }
 
     /// Transcription of `try_fuse_into_reduce` (fusion_basic.rs:525-571).

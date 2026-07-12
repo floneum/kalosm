@@ -207,101 +207,6 @@ impl ComputeGraphInner {
 }
 
 impl Resolver {
-    /// Read a recognized matmul's A operand through its un-flattened
-    /// producer. Conv's im2col flatten regroups a windowed view's dims
-    /// across overlapping strides, which no single strided layout can
-    /// express: the view keeps a stage boundary and would materialize
-    /// through the gather fallback. When the flat `[M, K]` operand is
-    /// exactly such a reinterpret over an affine stage, point the matmul at
-    /// the producer, carry the affine stage as the operand's base map, and
-    /// let the kernels divmod the flat coordinates back apart per load — an
-    /// implicit GEMM with no gather dispatch.
-    pub(super) fn try_unflatten_matmul_input(
-        &self,
-        graph: &ComputeGraphInner,
-        operation: &mut crate::MatMulOperation,
-    ) {
-        if !operation.a.is_plain() || operation.a.batch_dims != 0 {
-            return;
-        }
-        // Only the cooperative-matrix kernel reads an un-flattened operand
-        // faster than gather-then-matmul: its tile staging amortizes the
-        // per-load coordinate decomposition. The generic reduce re-derives
-        // coordinates for every load and measures slower than the gather at
-        // every meaningful size, so anything bound for it keeps the
-        // materialized matrix.
-        if !operation.hardware_matmul_statically_viable(&graph.device()) {
-            return;
-        }
-        let (m, k) = (operation.a.rows(), operation.a.cols());
-        // An already-materialized (or externally held) operand is cheaper to
-        // read flat than to re-derive coordinates for.
-        if self.check_cached(graph, operation.first) || graph.has_live_reference(operation.first) {
-            return;
-        }
-        let Some(node) = graph.nodes.nodes.node_weight(operation.first) else {
-            return;
-        };
-        let ComputeGraphNodeVariant::View(view) = &node.variant else {
-            return;
-        };
-        // The stack must be an affine relayout under a flat [M, K]
-        // reinterpret, both pure relayouts (no fill regions).
-        let [windowed, flat] = view.stages.as_slice() else {
-            return;
-        };
-        if !windowed.is_fully_defined()
-            || !flat.is_fully_defined()
-            || !flat.layout.is_contiguous()
-            || flat.layout.offset() != 0
-            || flat.layout.shape() != [m, k]
-        {
-            return;
-        }
-        // The kernels substitute the windowed map as affine per-dim index
-        // arithmetic; validate it here so the lowering can rely on it.
-        if crate::view::affine_dim_indices(&windowed.layout, &windowed.input_shape).is_none() {
-            return;
-        }
-        let operand_shape = windowed.shape();
-        // The producer's dims must split cleanly into an `M` prefix and a
-        // `K` suffix for the per-side flat-coordinate decomposition.
-        let mut product = 1usize;
-        let mut k_start = operand_shape.len();
-        while k_start > 0 && product < k {
-            k_start -= 1;
-            let Some(next) = product.checked_mul(operand_shape[k_start]) else {
-                return;
-            };
-            product = next;
-        }
-        if product != k
-            || k_start == 0
-            || k_start == operand_shape.len()
-            || operand_shape[..k_start].iter().product::<usize>() != m
-        {
-            return;
-        }
-        // The flat row/column coordinates decompose with u32 arithmetic.
-        let probe = NaryExpr::DimIndex(0);
-        if crate::view::row_major_indices_from_flat(probe.clone(), &operand_shape[..k_start])
-            .is_none()
-            || crate::view::row_major_indices_from_flat(probe, &operand_shape[k_start..]).is_none()
-        {
-            return;
-        }
-        operation.first = view.input;
-        operation.a = crate::matmul::MatrixOperand {
-            shape: operand_shape.into(),
-            batch_dims: 0,
-            row_dims: k_start,
-            base_map: Some(crate::matmul::OperandBaseMap {
-                layout: windowed.layout.clone(),
-                base_shape: windowed.input_shape.clone(),
-            }),
-        };
-    }
-
     /// Replace a recognized cluster's root with the rebuilt operation: drop
     /// every edge from the cluster's intermediates, wire the operation's
     /// dependencies directly, and let the now-unconsumed intermediates fall
@@ -336,4 +241,91 @@ impl Resolver {
             self.remove_node_if_dead(prev);
         }
     }
+}
+
+/// Read a recognized matmul's A operand through its un-flattened producer.
+/// Native egg appliers own their context and cannot borrow the live compute
+/// graph, so every graph observation is supplied explicitly.
+pub(super) fn try_unflatten_matmul_input_with(
+    operation: &mut crate::MatMulOperation,
+    device: &crate::Device,
+    check_cached: impl Fn(NodeIndex) -> bool,
+    has_live_reference: impl Fn(NodeIndex) -> bool,
+    view_for: impl Fn(NodeIndex) -> Option<crate::view::ViewOperation>,
+) {
+    if !operation.a.is_plain() || operation.a.batch_dims != 0 {
+        return;
+    }
+    // Only the cooperative-matrix kernel reads an un-flattened operand
+    // faster than gather-then-matmul: its tile staging amortizes the
+    // per-load coordinate decomposition. The generic reduce re-derives
+    // coordinates for every load and measures slower than the gather at
+    // every meaningful size, so anything bound for it keeps the
+    // materialized matrix.
+    if !operation.hardware_matmul_statically_viable(device) {
+        return;
+    }
+    let (m, k) = (operation.a.rows(), operation.a.cols());
+    // An already-materialized (or externally held) operand is cheaper to
+    // read flat than to re-derive coordinates for.
+    if check_cached(operation.first) || has_live_reference(operation.first) {
+        return;
+    }
+    let Some(view) = view_for(operation.first) else {
+        return;
+    };
+    // The stack must be an affine relayout under a flat [M, K]
+    // reinterpret, both pure relayouts (no fill regions).
+    let [windowed, flat] = view.stages.as_slice() else {
+        return;
+    };
+    if !windowed.is_fully_defined()
+        || !flat.is_fully_defined()
+        || !flat.layout.is_contiguous()
+        || flat.layout.offset() != 0
+        || flat.layout.shape() != [m, k]
+    {
+        return;
+    }
+    // The kernels substitute the windowed map as affine per-dim index
+    // arithmetic; validate it here so the lowering can rely on it.
+    if crate::view::affine_dim_indices(&windowed.layout, &windowed.input_shape).is_none() {
+        return;
+    }
+    let operand_shape = windowed.shape();
+    // The producer's dims must split cleanly into an `M` prefix and a
+    // `K` suffix for the per-side flat-coordinate decomposition.
+    let mut product = 1usize;
+    let mut k_start = operand_shape.len();
+    while k_start > 0 && product < k {
+        k_start -= 1;
+        let Some(next) = product.checked_mul(operand_shape[k_start]) else {
+            return;
+        };
+        product = next;
+    }
+    if product != k
+        || k_start == 0
+        || k_start == operand_shape.len()
+        || operand_shape[..k_start].iter().product::<usize>() != m
+    {
+        return;
+    }
+    // The flat row/column coordinates decompose with u32 arithmetic.
+    let probe = NaryExpr::DimIndex(0);
+    if crate::view::row_major_indices_from_flat(probe.clone(), &operand_shape[..k_start]).is_none()
+        || crate::view::row_major_indices_from_flat(probe, &operand_shape[k_start..]).is_none()
+    {
+        return;
+    }
+    operation.first = view.input;
+    operation.a = crate::matmul::MatrixOperand {
+        shape: operand_shape.into(),
+        batch_dims: 0,
+        row_dims: k_start,
+        base_map: Some(crate::matmul::OperandBaseMap {
+            layout: windowed.layout.clone(),
+            base_shape: windowed.input_shape.clone(),
+        }),
+    };
 }
