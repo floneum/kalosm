@@ -12,7 +12,7 @@
 //! (incoming) edges to the region node cannot create a cycle.
 
 use super::*;
-use crate::region::{ElementwiseRegionOperation, REGION_MAX_STATEMENTS, RegionStatement};
+use crate::region::{ElementwiseRegionOperation, RegionStatement};
 
 /// Where a member's input slot points after region rewriting.
 enum RegionSlot {
@@ -36,7 +36,6 @@ struct RegionRejects {
     outside_consumer: u32,
     custom_indexed_read: u32,
     binding_budget: u32,
-    max_statements: u32,
 }
 
 impl RegionRejects {
@@ -47,15 +46,11 @@ impl RegionRejects {
         self.outside_consumer += other.outside_consumer;
         self.custom_indexed_read += other.custom_indexed_read;
         self.binding_budget += other.binding_budget;
-        self.max_statements += other.max_statements;
     }
 }
 
 impl Resolver {
     pub(super) fn form_elementwise_regions(&mut self, graph: &mut ComputeGraphInner) {
-        if std::env::var_os("FUSOR_DISABLE_REGION_FUSION").is_some() {
-            return;
-        }
         let budget = graph.device().nary_direct_input_binding_budget();
         let Ok(order) = toposort(&self.execution_graph, None) else {
             return;
@@ -94,16 +89,13 @@ impl Resolver {
                     &claimed,
                     &shape,
                     budget,
+                    &position,
+                    position[&sink],
                     &mut probe,
                 );
                 match candidate {
-                    Some(producer) if member_set.len() < REGION_MAX_STATEMENTS => {
+                    Some(producer) => {
                         member_set.insert(producer);
-                    }
-                    Some(_) => {
-                        probe.max_statements += 1;
-                        rejects.add(&probe);
-                        break;
                     }
                     None => {
                         // The fixpoint probe: these producers are what
@@ -135,6 +127,7 @@ impl Resolver {
 
     /// One producer of the current member set that passes every absorption
     /// gate, or `None` at fixpoint.
+    #[allow(clippy::too_many_arguments)]
     fn find_absorbable_producer(
         &self,
         graph: &ComputeGraphInner,
@@ -142,6 +135,8 @@ impl Resolver {
         claimed: &FxHashSet<ExecutionNodeIndex>,
         shape: &[usize],
         budget: usize,
+        position: &FxHashMap<ExecutionNodeIndex, usize>,
+        sink_position: usize,
         rejects: &mut RegionRejects,
     ) -> Option<ExecutionNodeIndex> {
         for &member in member_set {
@@ -167,11 +162,24 @@ impl Resolver {
                     rejects.producer_cached += 1;
                     continue;
                 }
-                // THE gate: every consumer already sits inside the region.
+                // Outside consumers no longer block absorption: the
+                // producer's value becomes a region output (the binding
+                // budget below already accounts for it). The one hazard is
+                // ordering: a consumer scheduled before the region's last
+                // member could need the value before the region runs — and
+                // could, transitively, feed the region, a cycle. Every
+                // member feeds the sink, so the sink carries the region's
+                // maximum topological position; consumers strictly after it
+                // are provably downstream and safe.
                 if self
                     .execution_graph
                     .neighbors_directed(producer, petgraph::Direction::Outgoing)
-                    .any(|consumer| !member_set.contains(&consumer))
+                    .any(|consumer| {
+                        !member_set.contains(&consumer)
+                            && position
+                                .get(&consumer)
+                                .is_none_or(|&pos| pos <= sink_position)
+                    })
                 {
                     rejects.outside_consumer += 1;
                     continue;
@@ -315,7 +323,11 @@ impl Resolver {
                     .nodes
                     .nodes
                     .node_weight(member_inner)
-                    .is_some_and(|node| node.reference_count > 0);
+                    .is_some_and(|node| node.reference_count > 0)
+                || self
+                    .execution_graph
+                    .neighbors_directed(member, petgraph::Direction::Outgoing)
+                    .any(|consumer| !member_set.contains(&consumer));
             statements.push((
                 op.expression,
                 op.output_datatype,
@@ -363,6 +375,22 @@ impl Resolver {
                     .any(|existing| existing == producer)
                 {
                     self.execution_graph.add_edge(producer, sink, ());
+                }
+            }
+            // A member absorbed as a region output keeps its downstream
+            // ordering: its consumers now read the region's cached result.
+            let outgoing: Vec<ExecutionNodeIndex> = self
+                .execution_graph
+                .neighbors_directed(member, petgraph::Direction::Outgoing)
+                .filter(|consumer| !member_set.contains(consumer))
+                .collect();
+            for consumer in outgoing {
+                if !self
+                    .execution_graph
+                    .neighbors_directed(sink, petgraph::Direction::Outgoing)
+                    .any(|existing| existing == consumer)
+                {
+                    self.execution_graph.add_edge(sink, consumer, ());
                 }
             }
             let member_inner = self.execution_graph[member].inner_idx;
