@@ -40,10 +40,6 @@ const CAT_MATMUL_SPLITK: usize = 4;
 const CAT_REGION: usize = 0;
 const CATEGORY_COUNT: usize = 6;
 
-/// Elementwise ops at or above this element count may take the register
-/// reuse tiled path in the single-op builder; keep them out of merges so
-/// that plan never regresses.
-const MAX_MERGED_NARY_ELEMENTS: usize = 262_144;
 
 /// Segments of one merged dispatch, in queue order. All members are
 /// mutually independent.
@@ -192,15 +188,18 @@ impl HorizontalMerger {
             // because multi-output regions have no tiled fallback.
             ExecutionVariant::Region(op) if self.merge_dense_ops => Some(SegOp::Region(op.clone())),
             ExecutionVariant::Elementwise(op) if self.merge_dense_ops => {
+                // Ops at or above the register-reuse tiled path's engagement
+                // element count stay out of merges so that plan never
+                // regresses; the bound is derived from the same policy the
+                // tiled planner reads, so the two cannot drift apart.
                 let elements: usize = op.shape.iter().product();
-                (elements < MAX_MERGED_NARY_ELEMENTS && op.inputs.len() + 1 < self.budget).then(
-                    || {
-                        SegOp::Region(crate::region::ElementwiseRegionOperation::from_nary(
-                            op.clone(),
-                            node.inner_idx,
-                        ))
-                    },
-                )
+                let bound = self.device.dispatch_policy().merge_elements_bound();
+                (elements < bound && op.inputs.len() + 1 < self.budget).then(|| {
+                    SegOp::Region(crate::region::ElementwiseRegionOperation::from_nary(
+                        op.clone(),
+                        node.inner_idx,
+                    ))
+                })
             }
             ExecutionVariant::Reduce(op) if self.merge_dense_ops => {
                 let mut row = RowProgramOperation::from_reduce(op);

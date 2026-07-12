@@ -17,7 +17,7 @@ use crate::{
     visit_tiled::MaybeQData,
 };
 
-const BLOCK: usize = 256;
+const BLOCK: usize = crate::occupancy::FULL_WORKGROUP_LANES as usize;
 const SMALL_BLOCK: usize = 1;
 
 struct NaryDirectKernelVariant;
@@ -104,6 +104,7 @@ fn build_nary_direct_kernel_with_output_index(
             if let Some(plan) = &plan {
                 plan.dim.hash(state);
                 plan.invariant.hash(state);
+                plan.tm.hash(state);
             }
         });
     let cache_key = operation.kernel_cache_key_with_dispatch(
@@ -401,23 +402,21 @@ pub(crate) fn build_merged_region_kernel(
     )
 }
 
-/// Outputs per thread along the tiled dim of a reuse-tiled elementwise
-/// kernel.
-const NARY_TM: u32 = 4;
-/// Floor on post-tiling thread count: trading threads for register reuse
-/// must leave the device saturated.
-const MIN_TILED_THREADS: u32 = 65536;
-
 /// A register-reuse tiling for an elementwise kernel: each thread covers
-/// `NARY_TM` outputs along `dim`, loading the inputs that are invariant
-/// along `dim` once instead of per output.
+/// `tm` outputs along `dim`, loading the inputs that are invariant along
+/// `dim` once instead of per output.
 struct NaryTilePlan {
     dim: usize,
     /// Per input: invariant along `dim` (its loads hoist out of the run).
     invariant: Vec<bool>,
     /// Per input: index-space dim read by each input dimension.
     dims: Vec<Vec<usize>>,
-    /// The output shape with `dim` divided by `NARY_TM`.
+    /// Outputs per thread along `dim`
+    /// ([`crate::occupancy::DispatchPolicy::work_per_thread`]); carried in
+    /// the plan so the planner's arithmetic and the kernel builder's loop
+    /// trip count cannot diverge.
+    tm: u32,
+    /// The output shape with `dim` divided by `tm`.
     thread_shape: Vec<usize>,
     total_threads: u32,
 }
@@ -455,17 +454,21 @@ fn plan_nary_tiling(
         .collect::<Option<_>>()?;
     let access =
         crate::access_analysis::InputAccesses::collect(&operation.expression, input_count, &metas)?;
+    let policy = device.dispatch_policy();
+    let tm = policy.work_per_thread(crate::occupancy::RegPressure::ElementwiseFew);
 
     let mut best: Option<(u64, usize)> = None;
     for dim in 0..rank.saturating_sub(1) {
-        if operation.shape[dim] < NARY_TM as usize {
+        if operation.shape[dim] < tm as usize {
             continue;
         }
         let invariant_bytes: u64 = (0..input_count)
             .filter(|&i| !access.depends_on(i, dim))
             .map(|i| input_allocation_bytes(&metas[i], &values[i]))
             .sum();
-        if invariant_bytes < device.last_level_cache_bytes() {
+        if policy.cache_resident(invariant_bytes) {
+            // Cache-resident re-reads are free; the tiling would only cost
+            // thread-level parallelism.
             continue;
         }
         if best
@@ -481,15 +484,16 @@ fn plan_nary_tiling(
         .collect();
 
     let mut thread_shape = operation.shape.to_vec();
-    thread_shape[dim] = thread_shape[dim].div_ceil(NARY_TM as usize);
+    thread_shape[dim] = thread_shape[dim].div_ceil(tm as usize);
     let total_threads = total_elements(&thread_shape)?;
-    if total_threads < MIN_TILED_THREADS {
+    if !policy.tiling_leaves_saturated(total_threads) {
         return None;
     }
     Some(NaryTilePlan {
         dim,
         invariant,
         dims: access.dims,
+        tm,
         thread_shape,
         total_threads,
     })
@@ -525,7 +529,7 @@ fn build_nary_tiled_ir(
             let flat = group * BLOCK as u32 + lane;
             let in_bounds = flat.clone().lt(total_threads);
             let mut coords = output_dims_from_flat(flat, &plan.thread_shape);
-            let base = program.bind(coords[plan.dim].clone() * NARY_TM);
+            let base = program.bind(coords[plan.dim].clone() * plan.tm);
 
             // Invariant loads hoist out of the per-output run; the base
             // coordinate is always in range for an in-bounds thread.
@@ -548,7 +552,7 @@ fn build_nary_tiled_ir(
                 })
                 .collect();
 
-            for j in 0..NARY_TM {
+            for j in 0..plan.tm {
                 let coord = base.clone() + j;
                 let in_bounds_j = in_bounds.clone() & coord.clone().lt(extent);
                 coords[plan.dim] = coord;

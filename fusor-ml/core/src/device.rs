@@ -452,6 +452,30 @@ impl Device {
         }
     }
 
+    /// Shader lanes that must be in flight before a dispatch policy may trade
+    /// thread-level parallelism for per-thread work (register tiling, wider
+    /// qgemv columns, skipping a fan-out split). wgpu exposes no core count,
+    /// so this is a conservative per-class floor: base-tier GPUs keep on the
+    /// order of 16K lanes resident and need ~4x oversubscription to hide
+    /// memory latency. A conservative under-estimate only makes policies keep
+    /// MORE parallelism, never less. Override with `FUSOR_SATURATION_LANES`
+    /// when tuning a specific part.
+    pub fn saturation_lanes(&self) -> u32 {
+        if let Ok(value) = std::env::var("FUSOR_SATURATION_LANES")
+            && let Ok(parsed) = value.parse::<u32>()
+        {
+            return parsed.max(1);
+        }
+        64 << 10
+    }
+
+    /// The dispatch-sizing policy derived from this device's capabilities.
+    /// Every "how many workgroups / how much work per thread" decision reads
+    /// from this one place instead of local constants.
+    pub(crate) fn dispatch_policy(&self) -> crate::occupancy::DispatchPolicy {
+        crate::occupancy::DispatchPolicy::from_device(self)
+    }
+
     pub fn features(&self) -> wgpu::Features {
         self.inner.device.features()
     }

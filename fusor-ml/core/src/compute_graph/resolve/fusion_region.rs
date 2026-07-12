@@ -24,6 +24,34 @@ enum RegionSlot {
     Register(usize),
 }
 
+/// Why producers were rejected at region-growth fixpoints, accumulated per
+/// resolve and reported under `FUSOR_TRACE_RESOLVE`. Only the final
+/// (fixpoint-reaching) probe of each region contributes, so the counts
+/// describe the frontier that actually blocked growth, not transient
+/// re-scans.
+#[derive(Debug, Default, Clone, Copy)]
+struct RegionRejects {
+    non_elementwise: u32,
+    shape_mismatch: u32,
+    producer_cached: u32,
+    outside_consumer: u32,
+    custom_indexed_read: u32,
+    binding_budget: u32,
+    max_statements: u32,
+}
+
+impl RegionRejects {
+    fn add(&mut self, other: &Self) {
+        self.non_elementwise += other.non_elementwise;
+        self.shape_mismatch += other.shape_mismatch;
+        self.producer_cached += other.producer_cached;
+        self.outside_consumer += other.outside_consumer;
+        self.custom_indexed_read += other.custom_indexed_read;
+        self.binding_budget += other.binding_budget;
+        self.max_statements += other.max_statements;
+    }
+}
+
 impl Resolver {
     pub(super) fn form_elementwise_regions(&mut self, graph: &mut ComputeGraphInner) {
         if std::env::var_os("FUSOR_DISABLE_REGION_FUSION").is_some() {
@@ -39,6 +67,10 @@ impl Resolver {
             .map(|(pos, &node)| (node, pos))
             .collect();
         let mut claimed: FxHashSet<ExecutionNodeIndex> = FxHashSet::default();
+        let trace = std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+        let mut rejects = RegionRejects::default();
+        let mut regions_formed = 0usize;
+        let mut statements_fused = 0usize;
 
         for &sink in order.iter().rev() {
             if claimed.contains(&sink) || !self.execution_graph.contains_node(sink) {
@@ -56,24 +88,49 @@ impl Resolver {
             let mut member_set: FxHashSet<ExecutionNodeIndex> = FxHashSet::default();
             member_set.insert(sink);
             loop {
-                let candidate =
-                    self.find_absorbable_producer(graph, &member_set, &claimed, &shape, budget);
+                let mut probe = RegionRejects::default();
+                let candidate = self.find_absorbable_producer(
+                    graph,
+                    &member_set,
+                    &claimed,
+                    &shape,
+                    budget,
+                    &mut probe,
+                );
                 match candidate {
                     Some(producer) if member_set.len() < REGION_MAX_STATEMENTS => {
                         member_set.insert(producer);
                     }
-                    _ => break,
+                    Some(_) => {
+                        probe.max_statements += 1;
+                        rejects.add(&probe);
+                        break;
+                    }
+                    None => {
+                        // The fixpoint probe: these producers are what
+                        // actually blocked further growth.
+                        rejects.add(&probe);
+                        break;
+                    }
                 }
             }
             if member_set.len() == 1 {
                 continue;
             }
 
+            regions_formed += 1;
+            statements_fused += member_set.len();
             // Topological member order = statement order.
             let mut members: Vec<ExecutionNodeIndex> = member_set.iter().copied().collect();
             members.sort_by_key(|node| position[node]);
             self.finalize_region(graph, sink, &members, &member_set, shape);
             claimed.extend(member_set);
+        }
+
+        if trace {
+            tracing::info!(
+                "region_fusion regions={regions_formed} statements={statements_fused} rejects={rejects:?}"
+            );
         }
     }
 
@@ -86,6 +143,7 @@ impl Resolver {
         claimed: &FxHashSet<ExecutionNodeIndex>,
         shape: &[usize],
         budget: usize,
+        rejects: &mut RegionRejects,
     ) -> Option<ExecutionNodeIndex> {
         for &member in member_set {
             for producer in self
@@ -99,12 +157,15 @@ impl Resolver {
                 let ExecutionVariant::Elementwise(producer_op) =
                     &self.execution_graph[producer].variant
                 else {
+                    rejects.non_elementwise += 1;
                     continue;
                 };
                 if producer_op.shape.as_ref() != shape {
+                    rejects.shape_mismatch += 1;
                     continue;
                 }
                 if self.check_cached(graph, producer_inner) {
+                    rejects.producer_cached += 1;
                     continue;
                 }
                 // THE gate: every consumer already sits inside the region.
@@ -113,6 +174,7 @@ impl Resolver {
                     .neighbors_directed(producer, petgraph::Direction::Outgoing)
                     .any(|consumer| !member_set.contains(&consumer))
                 {
+                    rejects.outside_consumer += 1;
                     continue;
                 }
                 // Every member reads the producer elementwise: register
@@ -131,11 +193,13 @@ impl Resolver {
                         .all(|(slot, _)| !reader_op.expression.uses_custom_indexing_for_input(slot))
                 });
                 if !read_elementwise {
+                    rejects.custom_indexed_read += 1;
                     continue;
                 }
                 // Binding budget: distinct external inputs + live outputs of
                 // the grown region must fit one dispatch.
                 if self.region_binding_count(graph, member_set, Some(producer)) > budget {
+                    rejects.binding_budget += 1;
                     continue;
                 }
                 return Some(producer);

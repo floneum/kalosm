@@ -1,5 +1,18 @@
 use super::*;
 
+/// Wall-clock per optimizer sub-phase, one resolve. The decode host-cost
+/// budget is judged against this ledger, so keep the sections aligned with
+/// the actual work: Stage-1 recognition, imperative row/assign fusion,
+/// the Stage-2 fusion fixpoint, region formation, and semantic coalescing.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct OptimizePhases {
+    pub(super) recognize: Duration,
+    pub(super) row_fusion: Duration,
+    pub(super) stage2: Duration,
+    pub(super) regions: Duration,
+    pub(super) coalesce: Duration,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum OptimizePolicy {
     Standard,
@@ -309,7 +322,9 @@ impl Resolver {
         // canonical form the API emitted (before view folding or fusion
         // disturbs them). This phase is unconditional: decode classification
         // is only reliable after recognition has minted QMatMul nodes.
+        let phase_start = Instant::now();
         self.recognize_via_egraph(graph);
+        self.optimize_phases.recognize += phase_start.elapsed();
         // The qmatmul scan runs after recognition (which can mint QMatMul
         // nodes) and before row fusion (which never creates or removes
         // them), so the dense gate below is structural and stable.
@@ -336,8 +351,10 @@ impl Resolver {
         self.horizontal_merge =
             dense && std::env::var_os("FUSOR_DISABLE_HORIZONTAL_FUSION").is_none();
         self.horizontal_merge_dense_ops = large_dense;
+        let phase_start = Instant::now();
         self.fuse_row_programs(graph, large_dense || has_dense_matmul);
         self.recognize_assign_chains(graph);
+        self.optimize_phases.row_fusion += phase_start.elapsed();
 
         let has_reduce = self.execution_graph.node_indices().any(|node| {
             matches!(
@@ -397,7 +414,9 @@ impl Resolver {
         let is_single_token_decode = has_qmatmul && self.is_single_token_qmatmul_graph();
         let run_fixpoint = policy.runs_stage2_fusion(is_single_token_decode);
         if run_fixpoint {
+            let phase_start = Instant::now();
             self.fuse_via_egraph(graph, profile.clone());
+            self.optimize_phases.stage2 += phase_start.elapsed();
         }
 
         // Dense large-graph kernel tuning is opted into per operation, after
@@ -411,10 +430,14 @@ impl Resolver {
             // fuses externally-live producers into multi-output regions.
             // Regions lower independently; horizontal merging may combine
             // them with additional compatible work but is not required.
+            let phase_start = Instant::now();
             self.form_elementwise_regions(graph);
             self.mark_dense_codegen();
+            self.optimize_phases.regions += phase_start.elapsed();
         }
+        let phase_start = Instant::now();
         self.coalesce_equivalent_eclasses(graph);
+        self.optimize_phases.coalesce += phase_start.elapsed();
         run_fixpoint
     }
 

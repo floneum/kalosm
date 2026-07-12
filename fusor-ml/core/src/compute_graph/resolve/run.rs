@@ -61,6 +61,17 @@ impl Resolver {
                     fixpoint_ran == Some(false),
                 );
             }
+            if host_trace {
+                let phases = self.optimize_phases;
+                tracing::info!(
+                    "resolve_optimize_phases node_count={node_count} recognize={:?} row_fusion={:?} stage2={:?} regions={:?} coalesce={:?}",
+                    phases.recognize,
+                    phases.row_fusion,
+                    phases.stage2,
+                    phases.regions,
+                    phases.coalesce,
+                );
+            }
         }
 
         // Pass 3: Topological Sort

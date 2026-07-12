@@ -322,6 +322,9 @@ pub(crate) struct Resolver {
     /// Keys are the execution nodes that materialize; values receive the
     /// same allocation without another dispatch.
     shared_outputs: FxHashMap<NodeIndex, Vec<NodeIndex>>,
+    /// Wall-clock spent in each optimizer sub-phase of this resolve, for the
+    /// host-cost ledger printed under `FUSOR_TRACE_RESOLVE_HOST`.
+    optimize_phases: execution::OptimizePhases,
 }
 
 impl Resolver {
@@ -352,6 +355,7 @@ impl Resolver {
             horizontal_merge: false,
             horizontal_merge_dense_ops: false,
             shared_outputs: Default::default(),
+            optimize_phases: Default::default(),
         }
     }
 

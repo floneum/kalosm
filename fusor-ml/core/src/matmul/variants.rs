@@ -192,8 +192,23 @@ impl CoopTile {
         max_workgroup_size_x: u32,
         max_subgroup_size: u32,
     ) -> Option<Self> {
+        if let Some(forced) = Self::forced_tile(max_workgroup_size_x, max_subgroup_size) {
+            return Some(forced);
+        }
         Self::select_primary(m, k, n, max_workgroup_size_x, max_subgroup_size)
             .or_else(|| Self::select_small_side(m, k, n, max_workgroup_size_x, max_subgroup_size))
+    }
+
+    /// Debug override: `FUSOR_FORCE_COOP_TILE=<bm>x<bn>` forces a specific
+    /// tile geometry for every coop matmul (bk is always 16). Used by the
+    /// per-tile conformance sweep and A/B tile experiments; unset in normal
+    /// operation.
+    fn forced_tile(max_workgroup_size_x: u32, max_subgroup_size: u32) -> Option<Self> {
+        let value = std::env::var("FUSOR_FORCE_COOP_TILE").ok()?;
+        let (bm, bn) = value.split_once('x')?;
+        let tile = Self::new(bm.parse().ok()?, bn.parse().ok()?, 16);
+        tile.workgroup_size_supported(max_workgroup_size_x, max_subgroup_size)
+            .then_some(tile)
     }
 
     /// The primary tile ladder: every selection that predates the small-side

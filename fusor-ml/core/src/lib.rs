@@ -37,6 +37,7 @@ pub mod matmul;
 mod mir;
 mod nary_direct;
 mod nary_wise;
+mod occupancy;
 mod pair_wise;
 mod quantized;
 mod rank;

@@ -44,22 +44,6 @@ use crate::{
     visit_tiled::{MaybeQData, distribute_workgroups},
 };
 
-const BLOCK: u32 = 256;
-
-/// Smallest workgroup for static-axis chunked-map programs. Axes shorter
-/// than this pack several rows per workgroup (`k_group` lane groups).
-const MIN_STATIC_BLOCK: u32 = 64;
-
-/// Below this many rows a long axis is split across workgroups (one tile
-/// each) with a combine kernel folding the spans — decode has too few rows
-/// to fill the device with one workgroup per row.
-const SPLIT_ROWS_TARGET: u32 = 256;
-
-/// Workgroup buckets for dynamic-axis row programs, smallest first. The
-/// kernel monomorphizes per bucket; the active axis length rides in the
-/// params input.
-const ROW_DYNAMIC_BLOCKS: [u32; 4] = [128, 256, 512, 1024];
-
 /// One reduction phase: `expression` (over the external inputs and the
 /// slots of earlier phases) folded along the row axis, then `post_chain`
 /// applied to the combined value once per row.
@@ -338,7 +322,8 @@ impl RowProgramOperation {
         match &self.dynamic_axis {
             Some(dynamic) => dynamic.block,
             None => {
-                let max_block = device.limits().max_compute_workgroup_size_x.min(BLOCK);
+                let policy = device.dispatch_policy();
+                let max_block = policy.preferred_workgroup_lanes();
                 if !self.dense_codegen {
                     // Committed sizing for decode and small (golden-covered)
                     // graphs: one full-width workgroup.
@@ -352,7 +337,7 @@ impl RowProgramOperation {
                 let k = u32::try_from(self.shape[self.axis]).unwrap_or(max_block);
                 k.max(1)
                     .next_power_of_two()
-                    .clamp(MIN_STATIC_BLOCK.min(max_block), max_block)
+                    .clamp(policy.min_reduction_lanes().min(max_block), max_block)
             }
         }
     }
@@ -858,7 +843,10 @@ fn build_row_program_kernel(
     let splits: u32 = match free_dim_out {
         Some(free)
             if lanes_own_axis
-                && rows < SPLIT_ROWS_TARGET
+                && graph
+                    .device()
+                    .dispatch_policy()
+                    .should_split_for_occupancy(rows, block)
                 && tiles > 1
                 && tiles <= block
                 && (free as u32 + 2) <= block =>
@@ -1546,7 +1534,8 @@ pub(crate) fn build_merged_row_program_kernel(
     // unmerged `RowProgramOperation::block`): a merge of k=64 softmax
     // segments runs 64-lane workgroups whose whole-block reductions are
     // subgroup-accelerated instead of walking the shared-memory tree.
-    let max_block = device.limits().max_compute_workgroup_size_x.min(BLOCK);
+    let policy = device.dispatch_policy();
+    let max_block = policy.preferred_workgroup_lanes();
     let block = segments
         .iter()
         .map(|op| {
@@ -1554,7 +1543,7 @@ pub(crate) fn build_merged_row_program_kernel(
                 .unwrap_or(max_block)
                 .max(1)
                 .next_power_of_two()
-                .clamp(MIN_STATIC_BLOCK.min(max_block), max_block)
+                .clamp(policy.min_reduction_lanes().min(max_block), max_block)
         })
         .max()?;
 
@@ -1953,16 +1942,15 @@ pub(crate) fn attention_row_program(
     if mask.is_some() != mask_shape.is_some() {
         return None;
     }
-    let limits = device.limits();
+    let policy = device.dispatch_policy();
     // The workgroup bucket is one axis tile: small tiles let the split
     // lowering fan decode across workgroups and stream longer axes through
-    // the online loop with good occupancy.
-    let needed = head_dim.max(256) as u32;
-    let block = ROW_DYNAMIC_BLOCKS.iter().copied().find(|&candidate| {
-        candidate >= needed
-            && candidate <= limits.max_compute_workgroup_size_x
-            && candidate <= limits.max_compute_invocations_per_workgroup
-    })?;
+    // the online loop with good occupancy. The floor is one full-width
+    // workgroup; the kernel monomorphizes per bucket.
+    let needed = head_dim.max(policy.preferred_workgroup_lanes() as usize) as u32;
+    let block = policy
+        .dynamic_block_buckets()
+        .find(|&candidate| candidate >= needed)?;
 
     let groups = num_heads / num_kv_heads;
     let f32 = DataTypeEnum::F32;
