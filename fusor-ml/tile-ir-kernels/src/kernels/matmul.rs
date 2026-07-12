@@ -54,18 +54,26 @@ pub struct DenseCoopMatmulConfig {
 }
 
 #[derive(Clone, Copy)]
-struct CoopTileEntry {
-    tile: DenseCoopMatmulTile,
-    row_groups: u32,
-    col_groups: u32,
-    n_passes: u32,
-    single_buffered: bool,
+pub struct CoopTileEntry {
+    pub tile: DenseCoopMatmulTile,
+    pub row_groups: u32,
+    pub col_groups: u32,
+    pub n_passes: u32,
+    pub single_buffered: bool,
 }
 
 impl CoopTileEntry {
     const fn block(self, subgroups: SubgroupConfig) -> u32 {
         subgroups.block_for_subgroups(self.row_groups * self.col_groups)
     }
+}
+
+/// The full cooperative-matrix tile candidate set, geometry plus the static
+/// execution properties a selection cost model scores over. This table is
+/// the single source of truth for coop tile geometry; selection layers must
+/// derive from it rather than duplicating rows.
+pub fn coop_tile_entries() -> &'static [CoopTileEntry] {
+    COOP_TILE_TABLE
 }
 
 /// Try to emit a fast cooperative-matrix batched matmul. Returns false
@@ -193,6 +201,11 @@ const COOP_TILE_TABLE: &[CoopTileEntry] = &[
         n_passes: 4,
         single_buffered: false,
     },
+    // The original (4, 4) profile — the table's only 16-subgroup, 512-lane
+    // configuration — miscomputed (all-zero output even on aligned shapes;
+    // caught by `coop_tile_conformance`). Re-profiled into the proven
+    // 8-subgroup family: per pass this is exactly the 128x256 entry's
+    // per-subgroup geometry with half the passes.
     CoopTileEntry {
         tile: DenseCoopMatmulTile {
             bm: 128,
@@ -200,7 +213,7 @@ const COOP_TILE_TABLE: &[CoopTileEntry] = &[
             bk: 16,
         },
         row_groups: 4,
-        col_groups: 4,
+        col_groups: 2,
         n_passes: 2,
         single_buffered: false,
     },

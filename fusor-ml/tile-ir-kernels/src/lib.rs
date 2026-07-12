@@ -14,13 +14,13 @@ pub use dispatch::{
     qgemv_subgroups_per_workgroup_for_shape, SubgroupConfig,
 };
 pub use kernels::{
-    linear_storage_layout, qgemv_with_epilogue, qgemv_workgroup_f16_with_epilogue,
-    qgemv_workgroup_storage_f16_with_epilogue, qgemv_workgroup_with_epilogue,
-    qmatmul_with_epilogue, qmatmul_workgroup_f16_with_epilogues,
+    coop_tile_entries, linear_storage_layout, qgemv_with_epilogue,
+    qgemv_workgroup_f16_with_epilogue, qgemv_workgroup_storage_f16_with_epilogue,
+    qgemv_workgroup_with_epilogue, qmatmul_with_epilogue, qmatmul_workgroup_f16_with_epilogues,
     qmatmul_workgroup_storage_f16_with_epilogues, qmatmul_workgroup_with_epilogues,
     merged_split_k_combine, quantized_matrix, quantized_matrix_for, split_k_combine,
     try_batched_coop_matmul, try_batched_coop_matmul_split_k, try_merged_coop_matmul,
-    AccumCast, DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulShape,
+    AccumCast, CoopTileEntry, DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulShape,
     DenseMatmulTensors, IntoQgemvEpilogues,
 };
 pub use types::{

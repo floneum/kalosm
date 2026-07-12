@@ -150,19 +150,17 @@ impl CoopTile {
         Self { bm, bn, bk }
     }
 
-    const fn subgroup_groups(self) -> u32 {
-        match (self.bm, self.bn, self.bk) {
-            (256, 256, 16) => 8,
-            (128, 512, 16) => 8,
-            (128, 256, 16) => 8,
-            (128, 128, 16) => 16,
-            (128, 64, 16) => 8,
-            (64, 128, 16) => 8,
-            (64, 64, 16) => 4,
-            (64, 16, 16) => 4,
-            (16, 64, 16) => 4,
-            _ => 0,
-        }
+    /// Subgroups per workgroup for this geometry, from the kernel table —
+    /// the single source of truth for coop tile execution properties.
+    /// Zero means the geometry has no kernel entry and is unselectable.
+    fn subgroup_groups(self) -> u32 {
+        fusor_tile_ir_kernels::coop_tile_entries()
+            .iter()
+            .find(|entry| {
+                entry.tile.bm == self.bm && entry.tile.bn == self.bn && entry.tile.bk == self.bk
+            })
+            .map(|entry| entry.row_groups * entry.col_groups)
+            .unwrap_or(0)
     }
 
     /// The merged kernel shares one double-buffered workgroup-tile pair
