@@ -207,13 +207,19 @@ impl Resolver {
     pub(super) fn coalesce_equivalent_eclasses(&mut self, graph: &mut ComputeGraphInner) {
         let driver = EGraphDriver::ingest(self, graph);
         let groups: Vec<Vec<lang::Prov>> = driver.provs_of_class.values().cloned().collect();
+        // Removing a duplicate can leave its dependencies dead. Do not prune
+        // those dependencies until every e-class from this ingestion snapshot
+        // has been coalesced: a dead dependency may itself be a duplicate in a
+        // later group, whose snapshotted `facts.exec` must remain valid long
+        // enough to register all of its shared output observations.
+        let mut potentially_dead = Vec::new();
         for group in groups {
             let executions: Vec<_> = group
                 .into_iter()
                 .filter_map(|prov| {
                     let facts = driver.egraph.analysis.facts_of(prov);
                     let exec = facts.exec?;
-                    let variant = &self.execution_graph[exec].variant;
+                    let variant = &self.execution_graph.node_weight(exec)?.variant;
                     matches!(
                         variant,
                         ExecutionVariant::Elementwise(_)
@@ -266,10 +272,11 @@ impl Resolver {
                         .borrow_mut()
                         .record_physical_edge(representative_inner, duplicate_inner);
                 }
-                for dependency in dependencies {
-                    self.remove_node_if_dead(dependency);
-                }
+                potentially_dead.extend(dependencies);
             }
+        }
+        for dependency in potentially_dead {
+            self.remove_node_if_dead(dependency);
         }
     }
 }

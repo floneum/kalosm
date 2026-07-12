@@ -457,4 +457,46 @@ mod tests {
             });
         });
     }
+
+    #[test]
+    fn nested_shared_eclasses_coalesce_without_stale_execution_nodes() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let input = Tensor::new(&device, &[1.0f32, 2.0, 3.0, 4.0]);
+            let mut left = &input * 2.0;
+            let mut right = &input * 2.0;
+            const DEPTH: usize = 2;
+            for _ in 0..DEPTH {
+                left = &left + 1.0;
+                right = &right + 1.0;
+            }
+            let targets = vec![left.data().key, right.data().key];
+            device.compute_graph().with_mut(|graph| {
+                let mut resolver = Resolver::new_batch(graph, targets.clone());
+                for &target in &targets {
+                    resolver.build_execution_graph(graph, target);
+                }
+
+                resolver.coalesce_equivalent_eclasses(graph);
+
+                assert_eq!(resolver.execution_graph.node_count(), DEPTH + 2);
+                assert!(
+                    resolver
+                        .node_mapping
+                        .values()
+                        .all(|&execution| { resolver.execution_graph.contains_node(execution) })
+                );
+                assert_eq!(
+                    resolver
+                        .shared_outputs
+                        .values()
+                        .map(Vec::len)
+                        .sum::<usize>(),
+                    DEPTH + 1
+                );
+            });
+        });
+    }
 }
