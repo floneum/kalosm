@@ -355,7 +355,7 @@ fn same_epilogue_spec(
 /// Exact equality for the allocation-independent planning surface.
 /// `payload_key` is only a bucket selector, so this comparison deliberately
 /// checks every relevant field and makes hash collisions harmless.
-fn planning_payload_eq(a: &ExecutionVariant, b: &ExecutionVariant) -> bool {
+pub(super) fn planning_payload_eq(a: &ExecutionVariant, b: &ExecutionVariant) -> bool {
     let zero = NodeIndex::new(0);
     match (a, b) {
         (ExecutionVariant::Tensor(a), ExecutionVariant::Tensor(b)) => {

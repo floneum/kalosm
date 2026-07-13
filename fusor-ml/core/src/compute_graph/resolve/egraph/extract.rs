@@ -472,6 +472,54 @@ impl EGraphDriver {
                 let instance = plans.capture(self, &state, &view, Prov(prov));
                 match plans.lookup(&instance, &view) {
                     PlanLookup::Hit(result) => {
+                        // The window horizon must cover everything a
+                        // generator observes; this tripwire proves it by
+                        // regenerating and comparing on every hit.
+                        if std::env::var_os("FUSOR_VERIFY_PLAN_SHARING").is_some() {
+                            let fresh = view
+                                .generate_candidates(Prov(prov))
+                                .into_iter()
+                                .enumerate()
+                                .filter_map(|(order, variant)| {
+                                    let kills = state.kills_for_variant(self, Prov(prov), &variant);
+                                    if state.variant_duplicates_required_producer(
+                                        self,
+                                        Prov(prov),
+                                        &variant,
+                                        &kills,
+                                    ) {
+                                        return None;
+                                    }
+                                    let delta = self.switch_cost_delta(
+                                        &state,
+                                        Prov(prov),
+                                        &variant,
+                                        &kills,
+                                    );
+                                    delta.non_worse().then_some((delta, order, variant))
+                                })
+                                .min_by_key(|(delta, order, _)| (*delta, *order))
+                                .map(|(_, _, variant)| variant);
+                            match (&result, &fresh) {
+                                (None, None) => {}
+                                (Some(shared), Some(generated)) => {
+                                    assert!(
+                                        super::interner::planning_payload_eq(shared, generated),
+                                        "shared plan diverges from regeneration: window                                          horizon misses generator input (prov {prov})"
+                                    );
+                                    assert_eq!(
+                                        super::interner::variant_dependencies(shared),
+                                        super::interner::variant_dependencies(generated),
+                                        "shared plan dependencies diverge (prov {prov})"
+                                    );
+                                }
+                                _ => panic!(
+                                    "shared plan presence diverges from regeneration                                      (prov {prov}, shared={}, fresh={})",
+                                    result.is_some(),
+                                    fresh.is_some()
+                                ),
+                            }
+                        }
                         let spec = plans.known_spec(&instance);
                         (result, instance.root, spec)
                     }

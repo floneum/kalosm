@@ -150,7 +150,7 @@ impl FusionPlanMemo {
             local_ids: FxHashMap::default(),
             matrix_aliases: FxHashMap::default(),
         };
-        let root = builder.add(inner);
+        let root = builder.add(inner, 0);
         builder.memo.seen_windows.insert(root);
         builder.memo.stats.unique_windows = builder.memo.seen_windows.len() as u64;
         PlanInstance {
@@ -250,8 +250,18 @@ struct WindowBuilder<'a> {
     matrix_aliases: FxHashMap<usize, u32>,
 }
 
+/// Fusion generators make one single-step decision per visit: they observe
+/// the candidate node, its direct inputs' selected variants and facts, and
+/// (through the variants they emit) the identities and layouts of the
+/// inputs' inputs. Deeper structure is invisible to a generation step, and
+/// every hit re-validates kills and switch cost against live state — so the
+/// structural window cuts at that horizon. Cutting is what makes repeated
+/// layers share: an unbounded walk would drag each window's whole upstream
+/// cone in, making every layer's window unique and the walk quadratic.
+const WINDOW_STUB_DEPTH: u32 = 2;
+
 impl WindowBuilder<'_> {
-    fn add(&mut self, inner: NodeIndex) -> StructuralId {
+    fn add(&mut self, inner: NodeIndex, depth: u32) -> StructuralId {
         if let Some(&id) = self.local_ids.get(&inner) {
             return id;
         }
@@ -290,8 +300,31 @@ impl WindowBuilder<'_> {
                 let next = self.matrix_aliases.len() as u32;
                 *self.matrix_aliases.entry(allocation).or_insert(next)
             });
-        let (kind, dependencies) = if opaque {
-            (PlanNodeKind::Frontier, Vec::new())
+        let stub = depth >= WINDOW_STUB_DEPTH;
+        let (kind, dependencies) = if opaque || stub {
+            let kind = if opaque {
+                PlanNodeKind::Frontier
+            } else if let Some(variant) = variant {
+                match variant {
+                    ExecutionVariant::Tensor(_) => PlanNodeKind::Tensor,
+                    _ => {
+                        let prov = prov.expect("selected execution variant has provenance");
+                        let payload = self
+                            .state
+                            .selected_enode(self.driver, prov)
+                            .payload()
+                            .expect("non-tensor execution variant has a payload");
+                        PlanNodeKind::Operator(
+                            self.driver.egraph.analysis.payloads.spec_of(payload),
+                        )
+                    }
+                }
+            } else if facts.is_some_and(|facts| facts.exec.is_none()) {
+                PlanNodeKind::Boundary
+            } else {
+                PlanNodeKind::Missing
+            };
+            (kind, Vec::new())
         } else if let Some(variant) = variant {
             let kind = match variant {
                 ExecutionVariant::Tensor(_) => PlanNodeKind::Tensor,
@@ -333,7 +366,7 @@ impl WindowBuilder<'_> {
         let atom = self.memo.intern_atom(atom);
         let children: Vec<StructuralId> = dependencies
             .into_iter()
-            .map(|dependency| self.add(dependency))
+            .map(|dependency| self.add(dependency, depth + 1))
             .collect();
         let id = self.memo.intern_node(StructuralNode {
             atom,
