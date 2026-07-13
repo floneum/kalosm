@@ -826,6 +826,40 @@ fn natural_form_updates_replay_and_claim_in_place() {
     });
 }
 
+#[test]
+fn shared_eclass_observations_replay_as_aliases() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let records_before = device.flush_plan_cache().record_count();
+        let replays_before = device.flush_plan_cache().replay_count();
+
+        for iteration in 0..3 {
+            let input_values = (0..64)
+                .map(|index| iteration as f32 + index as f32 * 0.25)
+                .collect::<Vec<_>>();
+            let input = Tensor::new::<f32, 1, _>(&device, &input_values);
+            let left = &input * 2.0;
+            let right = &input * 2.0;
+
+            device.flush();
+            let left_values = left.as_slice::<1, f32>().await.unwrap();
+            let right_values = right.as_slice::<1, f32>().await.unwrap();
+            for (index, &input_value) in input_values.iter().enumerate() {
+                assert_eq!(left_values[[index]], input_value * 2.0);
+                assert_eq!(right_values[[index]], input_value * 2.0);
+            }
+        }
+
+        assert!(device.flush_plan_cache().record_count() > records_before);
+        assert!(
+            device.flush_plan_cache().replay_count() > replays_before,
+            "a shared e-class observation was recorded as an executable view instead of an alias"
+        );
+    });
+}
+
 /// Repeated ordinary materialization (the path used by `as_slice`) should
 /// share the same reusable-plan lifecycle as batched flushes. Varying input
 /// contents verifies that replay rebinds the current graph's buffers instead

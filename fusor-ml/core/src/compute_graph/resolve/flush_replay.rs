@@ -59,9 +59,9 @@ use crate::{DataTypeEnum, Device, Layout};
 
 /// Bump when anything about the recorded plan layout or the fingerprint
 /// recipe changes, so stale entries can never be replayed.
-/// v8: quantized inputs and build-local scratch buffers are first-class plan
-/// bindings, and plans are recorded on their first occurrence.
-const REPLAY_RECIPE_VERSION: u64 = 8;
+/// v9: equivalent e-class observations replay as aliases of their physical
+/// representative rather than pretending to be executable view nodes.
+const REPLAY_RECIPE_VERSION: u64 = 9;
 
 const FLUSH_PLAN_CACHE_SIZE: usize = 8;
 
@@ -372,6 +372,14 @@ enum PlanStep {
     TensorLeaf { pos: u32 },
     /// Zero-cost view alias re-derived via `try_map_tensor`.
     ViewAlias { pos: u32, consumed: Box<[u32]> },
+    /// A semantically equivalent observation aliases the representative that
+    /// performed the physical work. The original observation may be any
+    /// operation kind; replay copies the representative's tensor metadata.
+    SharedAlias {
+        pos: u32,
+        source: u32,
+        consumed: Box<[u32]>,
+    },
     /// In-place slice-assign buffer copies re-derived from the current graph.
     CopyAssign { pos: u32, consumed: Box<[u32]> },
     /// One lowered operation's kernel dispatches.
@@ -673,6 +681,27 @@ impl PlanRecorder {
         self.steps.push(PlanStep::ViewAlias { pos, consumed });
     }
 
+    pub(super) fn record_shared_alias(
+        &mut self,
+        node: NodeIndex,
+        result: &TensorData,
+        source: NodeIndex,
+    ) {
+        if self.poisoned {
+            return;
+        }
+        let Some(pos) = self.pos(node) else { return };
+        let Some(source) = self.pos(source) else {
+            return;
+        };
+        self.attribute_buffer(result.buffer(), BufferBinding::Tensor(pos), true);
+        self.steps.push(PlanStep::SharedAlias {
+            pos,
+            source,
+            consumed: vec![source].into_boxed_slice(),
+        });
+    }
+
     pub(super) fn record_copy_assign(
         &mut self,
         node: NodeIndex,
@@ -874,6 +903,16 @@ fn validate_replay(
                 produced[*pos as usize] = true;
                 check_slot(*pos, 1)
             }
+            PlanStep::SharedAlias { pos, source, .. } => {
+                let observation_is_uncached = graph
+                    .nodes
+                    .nodes
+                    .node_weight(slots[*pos as usize])
+                    .is_some_and(|node| node.cached.is_none());
+                let ok = produced[*source as usize] && observation_is_uncached;
+                produced[*pos as usize] = true;
+                ok
+            }
             PlanStep::CopyAssign { pos, .. } => {
                 produced[*pos as usize] = true;
                 check_slot(*pos, 2)
@@ -993,6 +1032,19 @@ pub(crate) fn execute_replay_with_tail<T>(
                 };
                 slot_buffers[*pos as usize] = Some(result.buffer().clone());
                 graph.set_cached_result(idx, result);
+                release_consumed(graph, slots, &mut counts, &is_target, consumed);
+            }
+            PlanStep::SharedAlias {
+                pos,
+                source,
+                consumed,
+            } => {
+                let idx = slots[*pos as usize];
+                let result = graph
+                    .get_cached_result(slots[*source as usize])
+                    .expect("flush replay: shared representative must be cached");
+                slot_buffers[*pos as usize] = Some(result.buffer().clone());
+                graph.set_cached_result(idx, result.clone());
                 release_consumed(graph, slots, &mut counts, &is_target, consumed);
             }
             PlanStep::CopyAssign { pos, consumed } => {
@@ -1190,6 +1242,7 @@ fn step_consumed(step: &PlanStep) -> &[u32] {
     match step {
         PlanStep::TensorLeaf { .. } => &[],
         PlanStep::ViewAlias { consumed, .. }
+        | PlanStep::SharedAlias { consumed, .. }
         | PlanStep::CopyAssign { consumed, .. }
         | PlanStep::Dispatch { consumed, .. }
         | PlanStep::MergedDispatch { consumed, .. } => consumed,

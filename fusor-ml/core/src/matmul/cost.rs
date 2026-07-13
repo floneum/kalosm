@@ -68,6 +68,17 @@ pub(super) fn select_coop_tile(
         if entry.single_buffered {
             continue;
         }
+        // The 16-wide profiles exist to avoid padding genuinely narrow
+        // matrix sides. On a wide side they multiply workgroup count and
+        // repeatedly stage the opposite operand; the serial-depth term can
+        // otherwise prefer that artificial parallelism for long-K weight
+        // gradients even though measured throughput collapses. Keep the
+        // narrow profiles available through two 64-wide tiles (including the
+        // 65-column vocabulary head), then use the regular tile family.
+        const NARROW_PROFILE_LIMIT: u32 = 128;
+        if (bm == 16 && m > NARROW_PROFILE_LIMIT) || (bn == 16 && n > NARROW_PROFILE_LIMIT) {
+            continue;
+        }
         let threads = entry.row_groups * entry.col_groups * max_subgroup_size;
         if threads == 0 || threads > policy.max_workgroup_lanes() {
             continue;

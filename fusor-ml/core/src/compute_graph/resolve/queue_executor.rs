@@ -33,7 +33,7 @@ fn record_shared_outputs(
         for &observation in observations {
             recorder
                 .borrow_mut()
-                .record_view_alias(observation, result, &[node]);
+                .record_shared_alias(observation, result, node);
         }
     }
 }
