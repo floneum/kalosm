@@ -3,11 +3,12 @@
 //!
 //! Dense training tapes are dominated by launch overhead: dozens of tiny
 //! elementwise kernels, per-parameter Adam updates, and same-shape row
-//! reduces, each ~5-10us of fixed launch cost. This pass walks the already
-//! toposorted queue and groups independent operations of the same category
-//! (Adam updates / elementwise naries / chunked-map row programs) into one
-//! kernel whose body is a build-time-unrolled chain of per-segment regions,
-//! each guarded by a uniform linear-workgroup-id range compare.
+//! reduces, each ~5-10us of fixed launch cost. This pass walks the queue in
+//! canonical dependency-depth order and groups independent operations of the
+//! same category (Adam updates / elementwise naries / chunked-map row
+//! programs) into one kernel whose body is a build-time-unrolled chain of
+//! per-segment regions, each guarded by a uniform linear-workgroup-id range
+//! compare.
 //!
 //! Safety and gating:
 //! - Every graph exposes compatible matmul, row and elementwise operations.
@@ -37,6 +38,30 @@ const CAT_MATMUL_SPLITK: usize = 4;
 /// single elementwise operations hosted as one-statement regions.
 const CAT_REGION: usize = 0;
 const CATEGORY_COUNT: usize = 6;
+
+/// Return a deterministic, fusion-friendly topological order.
+///
+/// `petgraph::toposort` returns an arbitrary valid linear extension. Feeding
+/// that order directly to the greedy horizontal merger can interleave one
+/// branch's consumer before another branch's independent producer, creating
+/// false category-level dependency cycles and singleton flushes. Grouping by
+/// dependency depth preserves topological validity while presenting every
+/// ready antichain to the merger before any newly-ready consumers.
+pub(super) fn fusion_toposort(graph: &ExecutionGraph) -> Vec<ExecutionNodeIndex> {
+    let mut order =
+        toposort(graph, None).unwrap_or_else(|_| panic!("Cycle detected in execution graph"));
+    let mut depth = FxHashMap::<ExecutionNodeIndex, usize>::default();
+    for &node in &order {
+        let node_depth = graph
+            .neighbors_directed(node, petgraph::Direction::Incoming)
+            .filter_map(|parent| depth.get(&parent).copied())
+            .max()
+            .map_or(0, |parent_depth| parent_depth + 1);
+        depth.insert(node, node_depth);
+    }
+    order.sort_by_key(|&node| (depth[&node], graph[node].inner_idx.index()));
+    order
+}
 
 /// Segments of one merged dispatch, in queue order. All members are
 /// mutually independent.
@@ -524,8 +549,103 @@ mod tests {
     use super::*;
     use crate::kernel_selection::CooperativeMatrixKind;
     use crate::nary_wise::{NaryExpr, NaryScalar};
+    use crate::reduce::{ReduceFunction, ReduceOp, ReduceOperation};
     use crate::region::{ElementwiseRegionOperation, RegionStatement};
     use crate::{Device, Tensor};
+
+    #[test]
+    fn fusion_toposort_is_invariant_to_valid_topological_interleaving() {
+        let region_node = |output: usize, input: usize| ExecutionNode {
+            inner_idx: NodeIndex::new(output),
+            variant: ExecutionVariant::Region(ElementwiseRegionOperation {
+                inputs: vec![NodeIndex::new(input)],
+                statements: vec![RegionStatement {
+                    expression: NaryExpr::input(0, 1),
+                    datatype: crate::DataTypeEnum::F32,
+                    output: Some(NodeIndex::new(output)),
+                }],
+                shape: vec![64].into_boxed_slice(),
+            }),
+        };
+        let row_node = |output: usize, input: usize| ExecutionNode {
+            inner_idx: NodeIndex::new(output),
+            variant: ExecutionVariant::RowProgram(RowProgramOperation::from_reduce(
+                &ReduceOperation {
+                    inputs: vec![NodeIndex::new(input)],
+                    expression: NaryExpr::indexed_input(
+                        0,
+                        vec![NaryExpr::DimIndex(0), NaryExpr::DimIndex(1)],
+                    ),
+                    shape: vec![1, 64].into_boxed_slice(),
+                    function: ReduceFunction {
+                        name: Some("sum".to_string()),
+                        op: ReduceOp::Sum,
+                        initial_value: NaryScalar::F32(0.0),
+                        datatype: crate::DataTypeEnum::F32,
+                    },
+                    post_element_wise: crate::nary_wise::UnaryFunctionChain::empty(
+                        crate::DataTypeEnum::F32,
+                    ),
+                    axis: 1,
+                },
+            )),
+        };
+
+        let schedule = |nodes: Vec<ExecutionNode>| {
+            let mut graph = ExecutionGraph::default();
+            let mut by_inner = FxHashMap::default();
+            for node in nodes {
+                let inner = node.inner_idx;
+                let exec = graph.add_node(node);
+                by_inner.insert(inner, exec);
+            }
+            let execs = graph.node_indices().collect::<Vec<_>>();
+            for exec in execs {
+                let mut dependencies = Vec::new();
+                match &graph[exec].variant {
+                    ExecutionVariant::Region(op) => {
+                        op.visit_dependencies(&mut |dep| dependencies.push(dep))
+                    }
+                    ExecutionVariant::RowProgram(op) => {
+                        op.visit_dependencies(&mut |dep| dependencies.push(dep))
+                    }
+                    _ => unreachable!("test graph only contains regions and row programs"),
+                }
+                for dependency in dependencies {
+                    if let Some(&parent) = by_inner.get(&dependency) {
+                        graph.add_edge(parent, exec, ());
+                    }
+                }
+            }
+
+            fusion_toposort(&graph)
+                .into_iter()
+                .map(|exec| graph[exec].inner_idx.index())
+                .collect::<Vec<_>>()
+        };
+
+        // Both insertion orders encode the same two independent
+        // region -> row -> region branches.
+        let layered = schedule(vec![
+            region_node(10, 0),
+            region_node(20, 1),
+            row_node(11, 10),
+            row_node(21, 20),
+            region_node(12, 11),
+            region_node(22, 21),
+        ]);
+        let interleaved = schedule(vec![
+            region_node(10, 0),
+            row_node(11, 10),
+            region_node(12, 11),
+            region_node(20, 1),
+            row_node(21, 20),
+            region_node(22, 21),
+        ]);
+
+        assert_eq!(interleaved, layered);
+        assert_eq!(layered, [10, 20, 11, 21, 12, 22]);
+    }
 
     #[test]
     fn region_output_alias_orders_a_dependent_region_after_its_wave() {

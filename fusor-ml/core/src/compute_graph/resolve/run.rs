@@ -54,11 +54,10 @@ impl Resolver {
             }
         }
 
-        // Pass 3: Topological Sort
+        // Pass 3: Fusion-friendly topological sort.
         let sorted_nodes = {
             let start = host_trace.then(Instant::now);
-            let sorted_nodes = toposort(&self.execution_graph, None)
-                .unwrap_or_else(|_| panic!("Cycle detected in execution graph"));
+            let sorted_nodes = merge_horizontal::fusion_toposort(&self.execution_graph);
             if let Some(start) = start {
                 host_profile.toposort += start.elapsed();
             }
