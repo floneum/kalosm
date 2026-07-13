@@ -87,9 +87,9 @@ impl QwenSelfAttention {
         let hidden_size = self.num_heads * self.head_dim;
         let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-        // Convert attention mask for flash attention if provided
+        // Convert the attention mask if provided.
         // The mask should be [b_sz, seq_len] where 1 = valid, 0 = pad
-        // Flash attention expects None for no mask, or a mask tensor
+        // Attention expects None for no mask, or a mask tensor
         // Note: We use a large negative value instead of NEG_INFINITY because
         // the GPU shader path does not support inf literals. -10000 is enough to effectively
         // zero out masked positions after softmax.
@@ -105,7 +105,7 @@ impl QwenSelfAttention {
             ((ones - mask_f32) * MASK_NEG_VALUE).to_concrete()
         });
 
-        let attn_output = query_states.flash_attention(
+        let attn_output = query_states.attention(
             &key_states,
             &value_states,
             scale,

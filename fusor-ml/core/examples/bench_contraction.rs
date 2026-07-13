@@ -188,7 +188,7 @@ fn main() {
                     &values(batch * heads * kv * head_dim, 0.11),
                 );
                 time_case(&format!("attn_decode_kv{kv}"), 3, 50, || {
-                    let out = q.flash_attention(&k, &v, scale, None);
+                    let out = q.attention(&k, &v, scale, None);
                     out.materialize_sync();
                 });
             }
@@ -206,7 +206,7 @@ fn main() {
                 &values(batch * kv_heads * kv * head_dim, 0.11),
             );
             time_case("attn_decode_gqa_kv1024", 3, 50, || {
-                let out = q.flash_attention(&k, &v, scale, None);
+                let out = q.attention(&k, &v, scale, None);
                 out.materialize_sync();
             });
         }
@@ -234,7 +234,7 @@ fn main() {
                 &values(batch * heads * seq * head_dim, 0.11),
             );
             time_case("attn_prefill_512_causal", 3, 20, || {
-                let out = q.flash_attention_causal(&k, &v, scale);
+                let out = q.attention_causal(&k, &v, scale);
                 out.materialize_sync();
             });
 
@@ -255,7 +255,7 @@ fn main() {
                 &values(batch * heads * kv * head_dim, 0.11),
             );
             time_case("attn_prefill_q64_kv1024", 3, 30, || {
-                let out = q64.flash_attention(&k, &v, scale, None);
+                let out = q64.attention(&k, &v, scale, None);
                 out.materialize_sync();
             });
         }

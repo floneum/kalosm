@@ -16,7 +16,7 @@ use rustc_hash::FxHashSet;
 
 use super::super::{ExecutionVariant, Resolver};
 use super::EGraphDriver;
-use super::analysis::{FusorAnalysis, NodeFacts, PlannerSnapshot};
+use super::analysis::{FusorAnalysis, NodeFacts};
 use super::interner::{SpecId, variant_dependencies};
 use super::lang::{AllocationId, FusorLang, Prov};
 use crate::compute_graph::{ComputeGraphInner, NodeIndex};
@@ -91,27 +91,11 @@ pub(super) fn enode_for(
 
 impl EGraphDriver {
     /// Ingest the resolver's execution graph reachable from its targets.
-    #[cfg(test)]
     pub(super) fn ingest(resolver: &Resolver, graph: &ComputeGraphInner) -> Self {
-        Self::ingest_impl(resolver, graph, false)
-    }
-
-    /// Recognition's native egg appliers additionally need immutable view
-    /// and quantized-matrix metadata. Other stages skip this snapshot.
-    pub(super) fn ingest_for_recognition(resolver: &Resolver, graph: &ComputeGraphInner) -> Self {
-        Self::ingest_impl(resolver, graph, true)
-    }
-
-    fn ingest_impl(
-        resolver: &Resolver,
-        graph: &ComputeGraphInner,
-        with_planner_snapshot: bool,
-    ) -> Self {
         let mut driver = EGraphDriver {
             egraph: EGraph::new(FusorAnalysis {
                 facts: Vec::new(),
                 payloads: Default::default(),
-                planner: None,
                 class_of_inner: Default::default(),
             }),
             class_of: Vec::new(),
@@ -265,12 +249,6 @@ impl EGraphDriver {
         }
         driver.egraph.rebuild();
         driver.refresh_prov_classes();
-        if with_planner_snapshot {
-            driver.egraph.analysis.planner = Some(std::sync::Arc::new(PlannerSnapshot::new(
-                graph,
-                driver.prov_of.keys().copied(),
-            )));
-        }
         debug_assert_eq!(
             driver.class_of.len(),
             driver.egraph.analysis.facts.len(),

@@ -410,9 +410,7 @@ async fn main() {
                     }
                 }
             }
-            println!(
-                "writemap {dims:?}: untouched={untouched} identity={identity} moved={moved}"
-            );
+            println!("writemap {dims:?}: untouched={untouched} identity={identity} moved={moved}");
             for (t, s) in samples {
                 let tc = (
                     t / (d1 * d2 * d3),
@@ -426,7 +424,10 @@ async fn main() {
                     (s / d3) % d2,
                     s % d3,
                 );
-                println!("  t={t} {tc:?}  <-  s={s} {sc:?}  (s-t={})", s as i64 - t as i64);
+                println!(
+                    "  t={t} {tc:?}  <-  s={s} {sc:?}  (s-t={})",
+                    s as i64 - t as i64
+                );
             }
         }
         // same failing add, but materialize + sleep before reading back:
@@ -475,15 +476,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
-            let pipeline =
-                wgpu_device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: None,
-                    layout: None,
-                    module: &module,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+            let pipeline = wgpu_device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
             let bind = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &pipeline.get_bind_group_layout(0),
@@ -508,11 +508,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             encoder.copy_buffer_to_buffer(&out, 0, &staging, 0, total as u64 * 4);
             queue.submit(Some(encoder.finish()));
             let (sender, receiver) = futures_channel::oneshot::channel();
-            staging
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |r| {
-                    let _ = sender.send(r);
-                });
+            staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = sender.send(r);
+            });
             core_device.poll_wait();
             receiver.await.unwrap().unwrap();
             let view = staging.slice(..).get_mapped_range();
@@ -583,15 +581,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
-            let pipeline =
-                wgpu_device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: None,
-                    layout: None,
-                    module: &module,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+            let pipeline = wgpu_device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
             let bind = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &pipeline.get_bind_group_layout(0),
@@ -620,11 +617,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             encoder.copy_buffer_to_buffer(&out, 0, &staging, 0, total as u64 * 4);
             queue.submit(Some(encoder.finish()));
             let (sender, receiver) = futures_channel::oneshot::channel();
-            staging
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |r| {
-                    let _ = sender.send(r);
-                });
+            staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = sender.send(r);
+            });
             core_device.poll_wait();
             receiver.await.unwrap().unwrap();
             let view = staging.slice(..).get_mapped_range();

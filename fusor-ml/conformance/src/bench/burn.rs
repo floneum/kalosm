@@ -757,8 +757,8 @@ pub fn q4k_paired_silu() -> BenchmarkCase {
     })
 }
 
-pub fn flash_attention_small() -> BenchmarkCase {
-    bench_case("burn::flash_attention_small", |_fusor_device, config| {
+pub fn attention_small() -> BenchmarkCase {
+    bench_case("burn::attention_small", |_fusor_device, config| {
         Box::pin(async move {
             let device = initialized_device().await;
             let shape = [1usize, 4usize, 128usize, 64usize];
@@ -797,7 +797,7 @@ pub fn flash_attention_small() -> BenchmarkCase {
             .await?;
 
             Ok(BenchmarkReport::new(
-                "burn::flash_attention_small",
+                "burn::attention_small",
                 config,
                 samples,
                 format!("{} scaled dot-product attention", shape_label(&shape)),
@@ -806,59 +806,56 @@ pub fn flash_attention_small() -> BenchmarkCase {
     })
 }
 
-pub fn flash_attention_causal_small() -> BenchmarkCase {
-    bench_case(
-        "burn::flash_attention_causal_small",
-        |_fusor_device, config| {
-            Box::pin(async move {
-                let device = initialized_device().await;
-                let shape = [1usize, 4usize, 128usize, 64usize];
-                let q = burn_tensor(
-                    deterministic_values(elements(&shape), 34, 0.003),
-                    shape,
-                    &device,
-                );
-                let k = burn_tensor(
-                    deterministic_values(elements(&shape), 35, 0.003),
-                    shape,
-                    &device,
-                );
-                let v = burn_tensor(
-                    deterministic_values(elements(&shape), 36, 0.003),
-                    shape,
-                    &device,
-                );
-                materialize_inputs(&[q.clone(), k.clone(), v.clone()]).await?;
+pub fn attention_causal_small() -> BenchmarkCase {
+    bench_case("burn::attention_causal_small", |_fusor_device, config| {
+        Box::pin(async move {
+            let device = initialized_device().await;
+            let shape = [1usize, 4usize, 128usize, 64usize];
+            let q = burn_tensor(
+                deterministic_values(elements(&shape), 34, 0.003),
+                shape,
+                &device,
+            );
+            let k = burn_tensor(
+                deterministic_values(elements(&shape), 35, 0.003),
+                shape,
+                &device,
+            );
+            let v = burn_tensor(
+                deterministic_values(elements(&shape), 36, 0.003),
+                shape,
+                &device,
+            );
+            materialize_inputs(&[q.clone(), k.clone(), v.clone()]).await?;
 
-                let samples = time_samples(config, || {
-                    let output = module::attention(
-                        q.clone(),
-                        k.clone(),
-                        v.clone(),
-                        None,
-                        None,
-                        AttentionModuleOptions {
-                            scale: Some(1.0 / (64.0f64).sqrt()),
-                            softcap: None,
-                            is_causal: true,
-                        },
-                    );
-                    async move { materialize(output).await }
-                })
-                .await?;
-
-                Ok(BenchmarkReport::new(
-                    "burn::flash_attention_causal_small",
-                    config,
-                    samples,
-                    format!(
-                        "{} causal scaled dot-product attention",
-                        shape_label(&shape)
-                    ),
-                ))
+            let samples = time_samples(config, || {
+                let output = module::attention(
+                    q.clone(),
+                    k.clone(),
+                    v.clone(),
+                    None,
+                    None,
+                    AttentionModuleOptions {
+                        scale: Some(1.0 / (64.0f64).sqrt()),
+                        softcap: None,
+                        is_causal: true,
+                    },
+                );
+                async move { materialize(output).await }
             })
-        },
-    )
+            .await?;
+
+            Ok(BenchmarkReport::new(
+                "burn::attention_causal_small",
+                config,
+                samples,
+                format!(
+                    "{} causal scaled dot-product attention",
+                    shape_label(&shape)
+                ),
+            ))
+        })
+    })
 }
 
 pub fn rope_fused_decode() -> BenchmarkCase {

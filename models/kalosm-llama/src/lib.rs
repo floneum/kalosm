@@ -350,7 +350,6 @@ where
 pub struct LlamaBuilder<F: FloatDataType + SimdElement = f32> {
     source: source::LlamaSource,
     device: Option<Device>,
-    flash_attn: bool,
     _marker: std::marker::PhantomData<F>,
 }
 
@@ -359,7 +358,6 @@ impl<F: FloatDataType + SimdElement> Default for LlamaBuilder<F> {
         Self {
             source: Default::default(),
             device: None,
-            flash_attn: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -374,12 +372,6 @@ impl<F: FloatDataType + SimdElement> LlamaBuilder<F> {
     /// Set the source for the model.
     pub fn with_source(mut self, source: source::LlamaSource) -> Self {
         self.source = source;
-        self
-    }
-
-    /// Set whether to use Flash Attention.
-    pub fn with_flash_attn(mut self, use_flash_attn: bool) -> Self {
-        self.flash_attn = use_flash_attn;
         self
     }
 

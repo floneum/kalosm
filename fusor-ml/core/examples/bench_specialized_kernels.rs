@@ -41,13 +41,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             measured_batches,
             dispatches_per_batch,
         );
-        bench_flash_attention_streaming(
+        bench_attention_streaming(
             &device,
             warmup_batches,
             measured_batches,
             dispatches_per_batch,
         );
-        bench_flash_attention_decode(
+        bench_attention_decode(
             &device,
             warmup_batches,
             measured_batches,
@@ -81,7 +81,7 @@ fn bench_rms_norm_vec4(
     );
 }
 
-fn bench_flash_attention_streaming(
+fn bench_attention_streaming(
     device: &Device,
     warmup_batches: usize,
     measured_batches: usize,
@@ -95,16 +95,16 @@ fn bench_flash_attention_streaming(
     v.materialize_sync();
 
     bench_tensor_case(
-        "flash_attention_streaming_1x32x48x128_by_8x48",
+        "attention_streaming_1x32x48x128_by_8x48",
         warmup_batches,
         measured_batches,
         dispatches_per_batch,
-        || q.flash_attention(&k, &v, 1.0 / f32::sqrt(128.0), None),
+        || q.attention(&k, &v, 1.0 / f32::sqrt(128.0), None),
         device,
     );
 }
 
-fn bench_flash_attention_decode(
+fn bench_attention_decode(
     device: &Device,
     warmup_batches: usize,
     measured_batches: usize,
@@ -118,11 +118,11 @@ fn bench_flash_attention_decode(
     v.materialize_sync();
 
     bench_tensor_case(
-        "flash_attention_decode_1x32x1x128_by_8x512",
+        "attention_decode_1x32x1x128_by_8x512",
         warmup_batches,
         measured_batches,
         dispatches_per_batch,
-        || q.flash_attention(&k, &v, 1.0 / f32::sqrt(128.0), None),
+        || q.attention(&k, &v, 1.0 / f32::sqrt(128.0), None),
         device,
     );
 }

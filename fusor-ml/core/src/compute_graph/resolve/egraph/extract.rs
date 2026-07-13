@@ -65,6 +65,7 @@ impl Extraction {
 }
 
 /// Stable tie-break between equal-cost recognition alternatives.
+#[cfg(test)]
 fn kind_rank(enode: &FusorLang) -> u32 {
     match enode {
         FusorLang::RowProgram(_, _, _) => 0,
@@ -92,6 +93,7 @@ pub(super) struct ExtractState {
 }
 
 impl ExtractState {
+    #[cfg(test)]
     pub(super) fn new(driver: &EGraphDriver) -> Self {
         let count = driver.egraph.analysis.facts.len();
         let mut state = ExtractState {
@@ -348,6 +350,7 @@ fn remove_one(consumers: &mut Vec<u32>, value: u32) {
 
 impl EGraphDriver {
     /// Extraction over pre-generated alternatives only.
+    #[cfg(test)]
     pub(super) fn extract(&self) -> Extraction {
         // Recognition never mutates the e-graph during extraction, but the
         // shared loop wants `&mut self`; recognition alternatives are all
@@ -384,6 +387,7 @@ impl EGraphDriver {
     }
 
     /// Cost-guided worklist over pre-generated class alternatives.
+    #[cfg(test)]
     fn run_alternative_switches(&self, state: &mut ExtractState) {
         let mut worklist: std::collections::VecDeque<u32> = (0..state.sel.len() as u32).collect();
         let mut queued = vec![true; state.sel.len()];
@@ -408,6 +412,7 @@ impl EGraphDriver {
 
     /// Try to switch `prov` to a better pre-generated alternative from its
     /// class. Returns the touched set on success.
+    #[cfg(test)]
     fn try_alternative_switch(&self, state: &mut ExtractState, prov: Prov) -> Option<Vec<u32>> {
         let id = self.egraph.find(self.class_of[prov.0 as usize]);
         let candidates: Vec<&FusorLang> = self.egraph[id]

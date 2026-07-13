@@ -177,7 +177,11 @@ impl<const R: usize> Tensor<R> {
     pub fn acosh(&self) -> Self {
         let input = self.value.clone();
         self.unary_from_value(self.value.acosh().into_concrete(), move |grad, _| {
-            let lower = input.add_scalar(-1.0).into_concrete().sqrt().into_concrete();
+            let lower = input
+                .add_scalar(-1.0)
+                .into_concrete()
+                .sqrt()
+                .into_concrete();
             let upper = input.add_scalar(1.0).into_concrete().sqrt().into_concrete();
             (grad / (lower * upper).into_concrete()).into_concrete()
         })
@@ -322,11 +326,14 @@ impl<const R: usize> Tensor<R> {
 
     pub fn clamp(&self, min: f32, max: f32) -> Self {
         let input = self.value.clone();
-        self.unary_from_value(self.value.clamp(min, max).into_concrete(), move |grad, _| {
-            let lower = input.mt(min).into_concrete();
-            let upper = input.lt(max).into_concrete();
-            ((grad * lower).into_concrete() * upper).into_concrete()
-        })
+        self.unary_from_value(
+            self.value.clamp(min, max).into_concrete(),
+            move |grad, _| {
+                let lower = input.mt(min).into_concrete();
+                let upper = input.lt(max).into_concrete();
+                ((grad * lower).into_concrete() * upper).into_concrete()
+            },
+        )
     }
 
     pub fn eq(&self, rhs: f32) -> Self {
@@ -525,8 +532,8 @@ impl<const R: usize> Tensor<R> {
             let du = ((&x_sq * (3.0f32 * 0.044_715f32) + 1.0f32).into_concrete() * coeff)
                 .into_concrete();
             let tail = ((&x * &sech_sq).into_concrete() * du).into_concrete();
-            let dgelu = (((t + 1.0f32).into_concrete() + tail).into_concrete() * 0.5f32)
-                .into_concrete();
+            let dgelu =
+                (((t + 1.0f32).into_concrete() + tail).into_concrete() * 0.5f32).into_concrete();
             Ok(vec![BackwardTarget {
                 node: input_id,
                 gradient: Box::new((&grad * &dgelu).into_concrete()),

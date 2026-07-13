@@ -41,13 +41,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bench_matmul(&device, name, m, k, n);
         }
 
-        bench_flash_attention_vision(&device);
+        bench_attention_vision(&device);
 
         Ok(())
     })
 }
 
-fn bench_flash_attention_vision(device: &Device) {
+fn bench_attention_vision(device: &Device) {
     // Mirror the vision attention shape: 16 heads, seq=1944, head_dim=80,
     // unmasked self-attention (the per-window mask is dense and irrelevant
     // to throughput).
@@ -61,7 +61,7 @@ fn bench_flash_attention_vision(device: &Device) {
     // Cold-start
     let cold = Instant::now();
     {
-        let y = q.flash_attention(&k, &v, 1.0 / (80f32).sqrt(), None);
+        let y = q.attention(&k, &v, 1.0 / (80f32).sqrt(), None);
         let _ = y.count_kernels_to_resolve();
         device.poll_wait();
         drop(y);
@@ -69,7 +69,7 @@ fn bench_flash_attention_vision(device: &Device) {
     let cold_elapsed = cold.elapsed();
 
     for _ in 0..WARMUP_BATCHES {
-        let y = q.flash_attention(&k, &v, 1.0 / (80f32).sqrt(), None);
+        let y = q.attention(&k, &v, 1.0 / (80f32).sqrt(), None);
         let _ = y.count_kernels_to_resolve();
         device.poll_wait();
         drop(y);
@@ -78,7 +78,7 @@ fn bench_flash_attention_vision(device: &Device) {
     let mut samples = Vec::with_capacity(MEASURED_BATCHES);
     for _ in 0..MEASURED_BATCHES {
         let start = Instant::now();
-        let y = q.flash_attention(&k, &v, 1.0 / (80f32).sqrt(), None);
+        let y = q.attention(&k, &v, 1.0 / (80f32).sqrt(), None);
         let _ = y.count_kernels_to_resolve();
         device.poll_wait();
         samples.push(start.elapsed());
@@ -92,7 +92,7 @@ fn bench_flash_attention_vision(device: &Device) {
     let p90 = percentile_duration(&sorted, 90);
     let min = sorted.first().copied().unwrap_or_default();
     println!();
-    println!("vision_flash_attention NO MASK (Q=K=V [1,16,1944,80]):");
+    println!("vision_attention NO MASK (Q=K=V [1,16,1944,80]):");
     println!("  cold ms: {:.3}", cold_elapsed.as_secs_f64() * 1000.0);
     println!("  mean_ms: {:.3}", mean.as_secs_f64() * 1000.0);
     println!("  p50_ms:  {:.3}", p50.as_secs_f64() * 1000.0);
@@ -106,7 +106,7 @@ fn bench_flash_attention_vision(device: &Device) {
     // Bench with TRANSPOSED Q/K/V layout — the model produces Q via
     // `xs.transpose(0,1).unsqueeze(0)` so the underlying tensor has
     // non-contiguous strides. If that defeats a fast path in
-    // `try_flash_attention_direct`, this case will be much slower.
+    // `try_attention_direct`, this case will be much slower.
     // Build a [1, 16, 1944, 80] tensor whose underlying layout is the
     // [1944, 16, 80] memory order — same as `q.transpose(0, 1).unsqueeze(0)`
     // in the model. We do this by allocating [1944, 16, 80] and then using
@@ -114,11 +114,11 @@ fn bench_flash_attention_vision(device: &Device) {
     // swapped (head: 80, seq: 16*80=1280).
     // (the transposed-Q/K/V bench was removed — see kernel-level analysis
     //  in qwen_vision_block.rs: the issue is V's non-contiguous layout
-    //  defeats coalesced GPU loads in the streaming flash kernel.)
+    //  defeats coalesced GPU loads in the streaming attention kernel.)
     let _ = mask;
 
     for _ in 0..WARMUP_BATCHES {
-        let y = q.flash_attention(&k, &v, 1.0 / (80f32).sqrt(), Some(&mask));
+        let y = q.attention(&k, &v, 1.0 / (80f32).sqrt(), Some(&mask));
         let _ = y.count_kernels_to_resolve();
         device.poll_wait();
         drop(y);
@@ -127,7 +127,7 @@ fn bench_flash_attention_vision(device: &Device) {
     let mut masked_samples = Vec::with_capacity(MEASURED_BATCHES);
     for _ in 0..MEASURED_BATCHES {
         let start = Instant::now();
-        let y = q.flash_attention(&k, &v, 1.0 / (80f32).sqrt(), Some(&mask));
+        let y = q.attention(&k, &v, 1.0 / (80f32).sqrt(), Some(&mask));
         let _ = y.count_kernels_to_resolve();
         device.poll_wait();
         masked_samples.push(start.elapsed());
@@ -136,7 +136,7 @@ fn bench_flash_attention_vision(device: &Device) {
     let mut sorted_m = masked_samples.clone();
     sorted_m.sort_unstable();
     println!();
-    println!("vision_flash_attention WITH MASK (1944x1944):");
+    println!("vision_attention WITH MASK (1944x1944):");
     println!(
         "  mean_ms: {:.3}",
         mean_duration(&masked_samples).as_secs_f64() * 1000.0

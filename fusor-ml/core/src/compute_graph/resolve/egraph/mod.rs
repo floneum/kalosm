@@ -21,10 +21,9 @@ mod interner;
 mod lang;
 mod rules_fuse;
 mod rules_fuse_matmul;
-mod rules_recognize;
 mod structural_memo;
 
-use egg::{BackoffScheduler, EGraph, Id, Runner, StopReason};
+use egg::{EGraph, Id};
 use rustc_hash::FxHashMap;
 
 use self::analysis::FusorAnalysis;
@@ -126,53 +125,6 @@ impl EGraphDriver {
         self.egraph.union(self.class_of[root.0 as usize], id);
         enode
     }
-
-    /// Run native egg recognition over the ingested graph. The runner owns
-    /// saturation detection, rebuilds, scheduling and hard growth limits;
-    /// Fusor's custom searchers/appliers only describe matches and semantic
-    /// alternatives.
-    fn run_recognition(mut self) -> Self {
-        let initial_nodes = self.egraph.total_number_of_nodes();
-        let node_limit = initial_nodes
-            .saturating_mul(8)
-            .max(initial_nodes.saturating_add(4096));
-        let egraph = std::mem::replace(&mut self.egraph, EGraph::default());
-        let rules = rules_recognize::rules();
-        let scheduler = BackoffScheduler::default()
-            .do_not_ban("recognize-contraction")
-            .do_not_ban("recognize-qembedding");
-        let runner = Runner::default()
-            .with_egraph(egraph)
-            .with_iter_limit(usize::MAX)
-            .with_node_limit(node_limit)
-            // Deterministic node/iteration limits own termination. Keep the
-            // runner's wall-clock guard effectively disabled.
-            .with_time_limit(std::time::Duration::MAX)
-            .with_scheduler(scheduler)
-            .run(&rules);
-        if !matches!(runner.stop_reason, Some(StopReason::Saturated)) {
-            tracing::warn!(
-                "egg recognition stopped before saturation: {:?}",
-                runner.stop_reason
-            );
-        }
-        if std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some() {
-            let report = runner.report();
-            tracing::info!(
-                "resolve_egg_recognition iterations={} nodes={} classes={} search_s={:.6} apply_s={:.6} rebuild_s={:.6} stop={:?}",
-                report.iterations,
-                report.egraph_nodes,
-                report.egraph_classes,
-                report.search_time,
-                report.apply_time,
-                report.rebuild_time,
-                report.stop_reason,
-            );
-        }
-        self.egraph = runner.egraph;
-        self.refresh_prov_classes();
-        self
-    }
 }
 
 impl Resolver {
@@ -182,17 +134,15 @@ impl Resolver {
     /// fusion planning proportional to unique local structure.
     pub(super) fn optimize_operations(&mut self, graph: &mut ComputeGraphInner) {
         let recognition_start = std::time::Instant::now();
-        let mut driver = EGraphDriver::ingest_for_recognition(self, graph).run_recognition();
-        let extraction = driver.extract();
-        self.apply_egraph_deltas(graph, &driver, &extraction);
-        // Run the attention cluster builder over the extracted MatMul graph;
-        // its result is an explicit, structurally comparable row program.
+        self.recognize_contractions(graph);
+        self.recognize_embeddings(graph);
         self.recognize_attention(graph);
+        self.fuse_row_programs(graph);
+        self.recognize_assign_chains(graph);
         self.optimize_phases.recognition += recognition_start.elapsed();
 
         let extraction_start = std::time::Instant::now();
-        self.fuse_row_programs(graph);
-        self.recognize_assign_chains(graph);
+        let mut driver = EGraphDriver::ingest(self, graph);
         let extraction = {
             let ctx = rules_fuse::FusionCtx {
                 graph,

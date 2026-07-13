@@ -33,7 +33,10 @@ impl<const R: usize> Tensor<R> {
             let input_gradient = if dimension == 0 {
                 scattered.into_concrete()
             } else {
-                scattered.into_concrete().transpose(0, dimension).into_concrete()
+                scattered
+                    .into_concrete()
+                    .transpose(0, dimension)
+                    .into_concrete()
             };
             Ok(vec![BackwardTarget {
                 node: input_id,
@@ -48,8 +51,7 @@ impl<const R: usize> Tensor<R> {
         crate::gpu::Tensor<R, f32>: crate::gpu::SmallerRank<1, OUT, f32>,
     {
         let shape = self.shape();
-        let slices: [Range<usize>; R] =
-            std::array::from_fn(|axis| ops[axis].to_range(shape[axis]));
+        let slices: [Range<usize>; R] = std::array::from_fn(|axis| ops[axis].to_range(shape[axis]));
         let dim = crate::composite::index::removed_dim(ops.map(|op| op.removes_dim()));
         self.slice(slices).squeeze_dims::<1, OUT>([dim])
     }
@@ -118,7 +120,12 @@ impl Tensor<2> {
             .into_concrete()
             .exp()
             .into_concrete();
-        let lse_total = (shifted_exp.sum_keepdim::<1>(1).into_concrete().log().into_concrete() + max)
+        let lse_total = (shifted_exp
+            .sum_keepdim::<1>(1)
+            .into_concrete()
+            .log()
+            .into_concrete()
+            + max)
             .into_concrete();
         let row_offsets: Vec<u32> = (0..rows).map(|row| (row * width) as u32).collect();
         let row_offsets: RawTensor<1, u32> = RawTensor::from_slice(&device, [rows], &row_offsets);
@@ -135,7 +142,8 @@ impl Tensor<2> {
             let grad = downcast_tensor::<0>(&*gradient, "softmax_cross_entropy")?;
             let probs = logits_value.softmax_last_dim::<1>();
             let one_hot = one_hot_matrix(&targets, width);
-            let scale = (grad.reshape([1, 1]).into_concrete() * (1.0 / rows as f32)).into_concrete();
+            let scale =
+                (grad.reshape([1, 1]).into_concrete() * (1.0 / rows as f32)).into_concrete();
             let diff = (probs - one_hot).into_concrete();
             let dlogits = (&diff * &scale.broadcast_as([rows, width])).into_concrete();
             Ok(vec![BackwardTarget {

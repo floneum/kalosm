@@ -1,4 +1,4 @@
-//! Flash attention operations that work on both CPU and GPU backends.
+//! Attention operations that work on both CPU and GPU backends.
 
 use crate::cpu::{MatmulImpl, MaxOp, SimdReduceOp, SumOp};
 use crate::gpu::{DataType, FloatDataType};
@@ -17,9 +17,9 @@ pub enum MaskKind {
     /// Used for padding masks in encoder/embedding models.
     BatchKeyMask,
     /// Mask is a strict lower-triangular causal mask of shape [seq_len, seq_len].
-    /// The GPU flash-attention kernel can skip the upper-triangle Q·K work
-    /// entirely and does not load the mask tensor at all. Falls back to
-    /// `QKMask` semantics on backends that don't support the optimisation.
+    /// GPU graphs encode causality directly so the compiler can skip the
+    /// upper-triangle Q·K work without loading the mask tensor. Other
+    /// backends apply the provided mask with `QKMask` semantics.
     Causal,
 }
 
@@ -44,7 +44,7 @@ where
     SumOp: SimdReduceOp<D>,
     ExpOp: SimdUnaryOp<D>,
 {
-    /// Computes flash attention with optional masking.
+    /// Computes scaled dot-product attention with optional masking.
     ///
     /// Supports grouped-query attention (GQA) and multi-query attention (MQA) where
     /// K and V may have fewer heads than Q. The number of Q heads must be divisible
@@ -55,7 +55,7 @@ where
     ///   - v: Value tensor with shape [batch, num_kv_heads, kv_seq_len, head_dim]
     ///   - scale: Scale factor (typically 1/sqrt(head_dim))
     ///   - mask: Optional attention mask with a [`MaskKind`] describing its layout
-    pub fn flash_attention(
+    pub fn attention(
         &self,
         k: &Self,
         v: &Self,
@@ -63,54 +63,29 @@ where
         mask: Option<(&Tensor<2, D, ConcreteTensor<D, 2>>, MaskKind)>,
     ) -> Self {
         match (self, k, v) {
-            // GPU path - use the optimized fused kernel (QKMask/Causal only)
+            // Preserve the canonical GPU graph shape for the compiler's
+            // attention recognizer. Batch-key masks use the backend-neutral
+            // composition below because the recognizer accepts QK masks.
             #[cfg(feature = "gpu")]
             (Tensor::Gpu(q), Tensor::Gpu(k_gpu), Tensor::Gpu(v_gpu))
                 if !matches!(mask, Some((_, MaskKind::BatchKeyMask))) =>
             {
-                // Decode (q_seq_len == 1) runs the DecodeSmall attention kernel,
-                // which uses workgroup reductions and needs no subgroups, so it
-                // works on browser adapters that report no subgroup support. Only
-                // the prefill/streaming kernels require subgroups — keep the
-                // fallback for those (q_seq_len > 1).
-                if !q.device().subgroups_supported() && self.shape()[2] != 1 {
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        return self.flash_attention_composite_impl(k, v, scale, mask);
-                    }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        let cpu_q = tensor4_to_cpu(q);
-                        let cpu_k = tensor4_to_cpu(k_gpu);
-                        let cpu_v = tensor4_to_cpu(v_gpu);
-                        let cpu_mask = mask.map(|(m, kind)| {
-                            let Tensor::Gpu(mask) = m else {
-                                panic!("Mask must be on the same device as other tensors");
-                            };
-                            (tensor2_to_cpu(mask), kind)
-                        });
-                        let cpu_mask_ref = cpu_mask.as_ref().map(|(mask, kind)| (mask, *kind));
-                        let cpu_output = cpu_q.flash_attention(&cpu_k, &cpu_v, scale, cpu_mask_ref);
-                        return tensor4_to_gpu(cpu_output, q.device());
-                    }
-                }
                 if matches!(mask, Some((_, MaskKind::Causal))) {
-                    return Tensor::Gpu(q.flash_attention_causal(k_gpu, v_gpu, scale));
+                    return Tensor::Gpu(q.attention_causal(k_gpu, v_gpu, scale));
                 }
                 let gpu_mask = mask.map(|(m, _kind)| match m {
                     Tensor::Gpu(mask) => mask,
                     _ => panic!("Mask must be on the same device as other tensors"),
                 });
-                Tensor::Gpu(q.flash_attention(k_gpu, v_gpu, scale, gpu_mask))
+                Tensor::Gpu(q.attention(k_gpu, v_gpu, scale, gpu_mask))
             }
-            // CPU path and GPU+BatchKeyMask fallback - use composite operations via Tensor methods
-            _ => self.flash_attention_composite_impl(k, v, scale, mask),
+            // CPU path and GPU+BatchKeyMask path.
+            _ => self.attention_composite_impl(k, v, scale, mask),
         }
     }
 
-    /// Implementation of flash attention using Tensor composite operations.
-    /// Works on both CPU and GPU tensors (GPU uses individual ops instead of fused kernel).
-    fn flash_attention_composite_impl(
+    /// Backend-neutral attention composition.
+    fn attention_composite_impl(
         &self,
         k: &Self,
         v: &Self,
@@ -234,63 +209,4 @@ where
         // attn_weights @ V -> [batch, num_heads, q_seq_len, head_dim]
         attn_weights.mat_mul(&v_expanded)
     }
-}
-
-#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-fn tensor4_to_cpu<D>(tensor: &crate::gpu::Tensor<4, D>) -> Tensor<4, D>
-where
-    D: SimdElement + DataType + Copy,
-{
-    let shape = *tensor.shape();
-    let slice = pollster::block_on(tensor.as_slice()).expect("failed to read tensor");
-    let mut values = Vec::with_capacity(shape.iter().product());
-    for b in 0..shape[0] {
-        for h in 0..shape[1] {
-            for s in 0..shape[2] {
-                for d in 0..shape[3] {
-                    values.push(slice[[b, h, s, d]]);
-                }
-            }
-        }
-    }
-    Tensor::Cpu(crate::cpu::TypedTensor::from_slice(shape, &values))
-}
-
-#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-fn tensor4_to_gpu<D>(tensor: Tensor<4, D>, device: &crate::gpu::Device) -> Tensor<4, D>
-where
-    D: SimdElement + DataType + Copy,
-{
-    let Tensor::Cpu(tensor) = tensor else {
-        unreachable!("subgroup fallback should produce a CPU tensor");
-    };
-    let shape = tensor.shape();
-    let slice = tensor.as_slice();
-    let mut values = Vec::with_capacity(shape.iter().product());
-    for b in 0..shape[0] {
-        for h in 0..shape[1] {
-            for s in 0..shape[2] {
-                for d in 0..shape[3] {
-                    values.push(slice[[b, h, s, d]]);
-                }
-            }
-        }
-    }
-    Tensor::Gpu(crate::gpu::Tensor::from_slice(device, shape, &values))
-}
-
-#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-fn tensor2_to_cpu<D>(tensor: &crate::gpu::Tensor<2, D>) -> Tensor<2, D>
-where
-    D: SimdElement + DataType + Copy,
-{
-    let shape = *tensor.shape();
-    let slice = pollster::block_on(tensor.as_slice()).expect("failed to read tensor");
-    let mut values = Vec::with_capacity(shape.iter().product());
-    for row in 0..shape[0] {
-        for col in 0..shape[1] {
-            values.push(slice[[row, col]]);
-        }
-    }
-    Tensor::Cpu(crate::cpu::TypedTensor::from_slice(shape, &values))
 }

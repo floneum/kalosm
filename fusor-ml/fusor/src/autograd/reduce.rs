@@ -142,7 +142,8 @@ impl<const R: usize> Tensor<R> {
                 .into_concrete();
             let gradient = ((no_zero_grad * zero_count_broadcast.eq(0.0).into_concrete())
                 .into_concrete()
-                + (single_zero_grad * zero_count_broadcast.eq(1.0).into_concrete()).into_concrete())
+                + (single_zero_grad * zero_count_broadcast.eq(1.0).into_concrete())
+                    .into_concrete())
             .into_concrete();
             Ok(vec![BackwardTarget {
                 node: input_id,

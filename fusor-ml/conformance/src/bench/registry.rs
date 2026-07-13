@@ -142,10 +142,8 @@ fn burn_cases_for_suite(name: &str) -> Option<Vec<BenchmarkCase>> {
         "burn::q8_0_qgemv" => Some(vec![crate::bench::burn::q8_0_qgemv()]),
         "burn::q4k_qgemv" => Some(vec![crate::bench::burn::q4k_qgemv()]),
         "burn::q4k_paired_silu" => Some(vec![crate::bench::burn::q4k_paired_silu()]),
-        "burn::flash_attention_small" => Some(vec![crate::bench::burn::flash_attention_small()]),
-        "burn::flash_attention_causal_small" => {
-            Some(vec![crate::bench::burn::flash_attention_causal_small()])
-        }
+        "burn::attention_small" => Some(vec![crate::bench::burn::attention_small()]),
+        "burn::attention_causal_small" => Some(vec![crate::bench::burn::attention_causal_small()]),
         "burn::rope_fused_decode" => Some(vec![crate::bench::burn::rope_fused_decode()]),
         _ => None,
     }
@@ -225,8 +223,8 @@ mod burn_generated_tests {
         q8_0_qgemv,
         q4k_qgemv,
         q4k_paired_silu,
-        flash_attention_small,
-        flash_attention_causal_small,
+        attention_small,
+        attention_causal_small,
         rope_fused_decode,
     }
 }
@@ -252,7 +250,7 @@ registry! {
     q8_0_qgemv,
     q4k_qgemv,
     q4k_paired_silu,
-    flash_attention_small,
-    flash_attention_causal_small,
+    attention_small,
+    attention_causal_small,
     rope_fused_decode,
 }

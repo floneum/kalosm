@@ -2,9 +2,10 @@
 //!
 //! The tensor API expresses contractions as `Elementwise(Mul) + Reduce(Sum)`
 //! over a shared index space (see `Tensor::mat_mul` / `Tensor::q_mat_mul`).
-//! The matchers and builders are consumed by the equality-saturation
-//! recognition rules (`egraph::rules_recognize`), which match against the
-//! ingested identity forms emitted by the tensor interface.
+//! The matchers and builders are consumed by a linear recognition sweep over
+//! the identity forms emitted by the tensor interface. Keeping recognition
+//! outside the equality-saturation pass avoids rebuilding the same large
+//! decode e-graph for every generated token.
 //! Anything they do not recognize lowers through the generic elementwise +
 //! reduce kernels — slower, but correct.
 
@@ -164,7 +165,187 @@ impl Contraction {
     }
 }
 
+impl ComputeGraphInner {
+    pub(crate) fn dequantize_variant(&self, key: NodeIndex) -> Option<DequantizeOperation> {
+        match &self.nodes.nodes.node_weight(key)?.variant {
+            ComputeGraphNodeVariant::QMatrix(op) => Some(op.clone()),
+            _ => None,
+        }
+    }
+}
+
 impl Resolver {
+    /// Recognize canonical contraction clusters with one linear graph sweep.
+    /// This is equivalent to the former native-egg recognition rule, but the
+    /// API emits an exact canonical form so saturation adds no value here.
+    pub(super) fn recognize_contractions(&mut self, graph: &mut ComputeGraphInner) {
+        let reduces: Vec<ExecutionNodeIndex> = self
+            .execution_graph
+            .node_indices()
+            .filter(|&node| {
+                matches!(
+                    self.execution_graph[node].variant,
+                    ExecutionVariant::Reduce(_)
+                )
+            })
+            .collect();
+        for node in reduces {
+            self.try_recognize_contraction(graph, node);
+        }
+    }
+
+    fn try_recognize_contraction(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        node_idx: ExecutionNodeIndex,
+    ) -> bool {
+        let ExecutionVariant::Reduce(reduce) = &self.execution_graph[node_idx].variant else {
+            return false;
+        };
+        let Some(value) = reduce.plain_input() else {
+            return false;
+        };
+        if self.check_cached(graph, value) || graph.has_live_reference(value) {
+            return false;
+        }
+        let Some(nary_exec) = self.get_input_node_in_exec_graph(value) else {
+            return false;
+        };
+        let ExecutionVariant::Elementwise(nary) = &self.execution_graph[nary_exec].variant else {
+            return false;
+        };
+        if self
+            .execution_graph
+            .neighbors_directed(nary_exec, petgraph::Direction::Outgoing)
+            .count()
+            != 1
+        {
+            return false;
+        }
+        let Some(contraction) = match_contraction(reduce, nary) else {
+            return false;
+        };
+
+        if let Some((operation, activation)) =
+            contraction.to_q_mat_mul(|key| graph.dequantize_variant(key))
+        {
+            self.commit_recognized(
+                graph,
+                node_idx,
+                &[activation],
+                ExecutionVariant::QMatMul(Box::new(operation)),
+            );
+            return true;
+        }
+        if let Some((mut operation, _)) = contraction.to_mat_mul(&graph.device()) {
+            let device = graph.device();
+            try_unflatten_matmul_input_with(
+                &mut operation,
+                &device,
+                |node| self.check_cached(graph, node),
+                |node| graph.has_live_reference(node),
+                |node| match &graph.nodes.nodes.node_weight(node)?.variant {
+                    ComputeGraphNodeVariant::View(view) => Some(view.clone()),
+                    _ => None,
+                },
+            );
+            let inputs = [operation.first, operation.second];
+            self.commit_recognized(
+                graph,
+                node_idx,
+                &inputs,
+                ExecutionVariant::MatMul(operation),
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Recognize quantized row gathers with one linear graph sweep.
+    pub(super) fn recognize_embeddings(&mut self, graph: &mut ComputeGraphInner) {
+        let candidates: Vec<ExecutionNodeIndex> = self
+            .execution_graph
+            .node_indices()
+            .filter(|&node| {
+                matches!(
+                    self.execution_graph[node].variant,
+                    ExecutionVariant::Elementwise(_)
+                )
+            })
+            .collect();
+        for node in candidates {
+            if self.execution_graph.contains_node(node) {
+                self.try_recognize_q_embedding(graph, node);
+            }
+        }
+    }
+
+    fn try_recognize_q_embedding(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        node_idx: ExecutionNodeIndex,
+    ) -> bool {
+        let ExecutionVariant::Elementwise(nary) = &self.execution_graph[node_idx].variant else {
+            return false;
+        };
+        if nary.inputs.len() != 2 || nary.shape.len() != 2 {
+            return false;
+        }
+        let gather = match &nary.expression {
+            NaryExpr::Op { children, function }
+                if function.op == crate::nary_wise::NaryOp::Cast && children.len() == 1 =>
+            {
+                &children[0]
+            }
+            expr => expr,
+        };
+        let NaryExpr::IndexedInput {
+            input_idx: 0,
+            indices,
+        } = gather
+        else {
+            return false;
+        };
+        let [row, NaryExpr::DimIndex(1)] = indices.as_slice() else {
+            return false;
+        };
+        let NaryExpr::IndexedInput {
+            input_idx: 1,
+            indices: row_indices,
+        } = row
+        else {
+            return false;
+        };
+        if row_indices.as_slice() != [NaryExpr::DimIndex(0)] {
+            return false;
+        }
+
+        let Some(dequantize) = graph.dequantize_variant(nary.inputs[0]) else {
+            return false;
+        };
+        if crate::quantized::dequantize::quant_format(&dequantize.matrix).is_none()
+            || dequantize.matrix.shape().len() != 2
+            || dequantize.matrix.shape()[1] != nary.shape[1]
+        {
+            return false;
+        }
+
+        let indexes = nary.inputs[1];
+        let operation = QEmbeddingOperation::new(
+            indexes,
+            nary.shape[0],
+            dequantize.matrix.clone(),
+            nary.output_datatype,
+        );
+        self.commit_recognized(
+            graph,
+            node_idx,
+            &[indexes],
+            ExecutionVariant::QEmbedding(operation),
+        );
+        true
+    }
+
     /// Replace a recognized cluster's root with the rebuilt operation: drop
     /// every edge from the cluster's intermediates, wire the operation's
     /// dependencies directly, and let the now-unconsumed intermediates fall

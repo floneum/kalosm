@@ -291,21 +291,21 @@ where
         }
 
         // The attention pattern is block-diagonal per `cu_seqlens`. The dense
-        // masked path runs the full M×M flash kernel even when most of the
+        // masked path runs the full M×M attention kernel even when most of the
         // mask is -inf — that's where ~95% of vision-encoder GPU time goes.
         // For window-attention layers we instead slice Q/K/V per window and
-        // run dense (unmasked) flash on each — same arithmetic the
+        // run dense (unmasked) attention on each — same arithmetic the
         // block-diagonal mask intended, but at window² scale (~64²) rather
         // than seq² (1944²). Full-attention layers (cu_seqlens=[0, seq])
-        // skip the slicing and just run one regular flash call.
-        let t_flash = Instant::now();
+        // skip the slicing and just run one regular attention call.
+        let t_attention = Instant::now();
         let query_f32 = query_states;
         let key_f32 = key_states_f32;
         let value_f32 = value_states_f32;
         let is_full_attn =
             cu_seqlens.len() == 2 && cu_seqlens[0] == 0 && cu_seqlens[1] as usize == seq_len;
         let attn_out_4d = if is_full_attn {
-            query_f32.flash_attention(
+            query_f32.attention(
                 &key_f32,
                 &value_f32,
                 1.0 / (self.head_dim as f64).sqrt() as f32,
@@ -345,7 +345,7 @@ where
                 let k_run = key_f32.restride(run_specs).to_concrete();
                 let v_run = value_f32.restride(run_specs).to_concrete();
 
-                let run_out = q_run.flash_attention(&k_run, &v_run, scale, None);
+                let run_out = q_run.attention(&k_run, &v_run, scale, None);
                 let run_out = run_out
                     .reshape([self.head_count, run_count * len, self.head_dim])
                     .unsqueeze(0)
@@ -357,13 +357,13 @@ where
             fusor::cat(run_outputs, 2).to_concrete()
         };
 
-        // After flash: transpose+reshape to [b_sz, seq, hidden_size] then proj.
+        // After attention: transpose+reshape to [b_sz, seq, hidden_size] then proj.
         let attn_output = attn_out_4d.transpose(1, 2);
         let attn_output = attn_output.reshape([bsz, seq_len, self.embed_dim]);
         let output: Tensor<3, F> = self.proj.forward_generic(&attn_output.cast());
         if trace_attn {
             output.as_gpu().map(|g| g.materialize_sync());
-            tracing::info!("      flash+proj: {:.2?}", t_flash.elapsed());
+            tracing::info!("      attention+proj: {:.2?}", t_attention.elapsed());
         }
 
         Ok(output)

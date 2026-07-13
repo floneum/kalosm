@@ -123,18 +123,18 @@ fn bench_backend(
         },
     );
 
-    let device_flash = device.clone();
-    let q_data_flash = q_data.to_vec();
-    let k_data_flash = k_data.to_vec();
-    let v_data_flash = v_data.to_vec();
+    let device_attention = device.clone();
+    let q_data_attention = q_data.to_vec();
+    let k_data_attention = k_data.to_vec();
+    let v_data_attention = v_data.to_vec();
     group.bench_with_input(
-        BenchmarkId::new(format!("{backend}_flash"), size_str),
+        BenchmarkId::new(format!("{backend}_attention"), size_str),
         &shape,
         move |b, &shape| {
-            let device = device_flash.clone();
-            let q_data = q_data_flash.clone();
-            let k_data = k_data_flash.clone();
-            let v_data = v_data_flash.clone();
+            let device = device_attention.clone();
+            let q_data = q_data_attention.clone();
+            let k_data = k_data_attention.clone();
+            let v_data = v_data_attention.clone();
 
             b.to_async(FuturesExecutor).iter_custom(move |iters| {
                 let device = device.clone();
@@ -149,7 +149,7 @@ fn bench_backend(
                     while total.is_zero() {
                         for _ in 0..iters {
                             let start = std::time::Instant::now();
-                            let output = q.flash_attention(&k, &v, scale, None);
+                            let output = q.attention(&k, &v, scale, None);
                             resolve_tensor(&output).await;
                             total += start.elapsed();
                         }

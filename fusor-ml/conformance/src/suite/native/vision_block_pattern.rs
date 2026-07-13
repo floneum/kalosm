@@ -3,7 +3,7 @@
 //! Regression test for the qwen-vision multi-block resolve pattern.
 //!
 //! Each "block" mimics the shape of `VisionBlock::forward`: narrow a fused QKV
-//! tensor into Q/K/V, run windowed flash attention (multiple narrows + flash
+//! tensor into Q/K/V, run windowed attention (multiple narrows + attention
 //! per block, then sum), add a residual, then an MLP-shaped elementwise pass.
 //! The point isn't numerical correctness against a reference, it's to exercise
 //! the same fusion+resolve interaction the qwen vision encoder hits — without
@@ -30,7 +30,7 @@ const MLP_INTERMEDIATE: usize = 3420;
 
 fn ramp_data(len: usize, scale: f32) -> Vec<f32> {
     // Small magnitudes keep the values finite through many stacked blocks of
-    // matmul + flash + residual + mlp without depending on real
+    // matmul + attention + residual + mlp without depending on real
     // initialization.
     (0..len)
         .map(|i| (((i % 23) as f32) / 23.0 - 0.5) * scale + 0.001)
@@ -80,7 +80,7 @@ async fn run_blocks(device: &fusor::Device, flush_every: Option<usize>) -> Vec<f
             let qw = q.narrow(2, start, WINDOW_LEN).to_concrete();
             let kw = k.narrow(2, start, WINDOW_LEN).to_concrete();
             let vw = v.narrow(2, start, WINDOW_LEN).to_concrete();
-            let attn_w: Tensor<4, f32> = qw.flash_attention(&kw, &vw, scale, None);
+            let attn_w: Tensor<4, f32> = qw.attention(&kw, &vw, scale, None);
             window_outputs.push(attn_w);
         }
         let attn_out: Tensor<4, f32> = fusor::cat(window_outputs, 2).to_concrete();

@@ -18,17 +18,17 @@ impl Tensor {
         )))
     }
 
-    /// Causal flash attention in its composed form: scores at kv positions
+    /// Causal attention in its composed form: scores at kv positions
     /// beyond the query position are replaced with `-inf` via an
     /// index-comparison select (`kv_pos <= q_pos`), so causality is pure
     /// index arithmetic — no mask tensor. The resolver recognizes the
     /// cluster and routes it to the attention row program, whose axis bound
     /// skips the masked upper-triangle tiles entirely.
-    pub fn flash_attention_causal(&self, k: &Self, v: &Self, scale: f32) -> Self {
+    pub fn attention_causal(&self, k: &Self, v: &Self, scale: f32) -> Self {
         assert_eq!(
             self.shape()[2],
             k.shape()[2],
-            "causal flash attention requires q_seq_len == kv_seq_len \
+            "causal attention requires q_seq_len == kv_seq_len \
              (self-attention prefill); use an explicit mask otherwise"
         );
         self.compose_attention(k, v, scale, None, true)
@@ -40,7 +40,7 @@ impl Tensor {
     /// canonical cluster and routes it to the fused attention row program;
     /// ineligible shapes lower through the recognized matmul + softmax
     /// kernels (the same math).
-    pub fn flash_attention(&self, k: &Self, v: &Self, scale: f32, mask: Option<&Tensor>) -> Self {
+    pub fn attention(&self, k: &Self, v: &Self, scale: f32, mask: Option<&Tensor>) -> Self {
         self.compose_attention(k, v, scale, mask, false)
     }
 
@@ -107,7 +107,7 @@ impl Tensor {
         let scores = match self.datatype() {
             DataTypeEnum::F32 => self.mat_mul(&k_t) * scale,
             DataTypeEnum::F16 => self.mat_mul(&k_t) * half::f16::from_f32(scale),
-            DataTypeEnum::U32 => panic!("flash_attention requires f32/f16 tensors"),
+            DataTypeEnum::U32 => panic!("attention requires f32/f16 tensors"),
         };
         let scores = if causal {
             // Keep kv positions at or before the query position; everything

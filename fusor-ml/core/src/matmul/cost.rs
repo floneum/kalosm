@@ -106,9 +106,8 @@ pub(super) fn select_coop_tile(
     // padding — degenerate (gemv-shaped) contractions with a tiny M or N.
     // Those belong to the vector/generic families; declining here is the
     // routing signal.
-    let useful_macs = u128::from(m)
-        * u128::from(n)
-        * (u128::from(k.div_ceil(tile.bk)) * u128::from(tile.bk));
+    let useful_macs =
+        u128::from(m) * u128::from(n) * (u128::from(k.div_ceil(tile.bk)) * u128::from(tile.bk));
     if padded_macs * 4 > useful_macs * 5 {
         return None;
     }

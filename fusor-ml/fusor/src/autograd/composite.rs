@@ -149,7 +149,9 @@ impl<const R: usize> Tensor<R> {
         // absorbs it, and the output is a single P * (dP - s) expression.
         self.unary_from_value(value, move |grad, probs| {
             let shape = probs.shape();
-            let row_sum = (&probs * &grad).into_concrete().sum_keepdim::<OUT_RANK>(R - 1);
+            let row_sum = (&probs * &grad)
+                .into_concrete()
+                .sum_keepdim::<OUT_RANK>(R - 1);
             let shifted = (&grad - &row_sum.broadcast_as(shape)).into_concrete();
             (&probs * &shifted).into_concrete()
         })
@@ -259,9 +261,11 @@ impl<const R: usize> Tensor<R> {
                 "rms_norm_residual_fused",
                 value,
                 move |input, residual, weight, bias| {
-                    input
-                        .add(&residual)
-                        .rms_norm_composite::<W, OUT_RANK>(&weight, Some(&bias), eps)
+                    input.add(&residual).rms_norm_composite::<W, OUT_RANK>(
+                        &weight,
+                        Some(&bias),
+                        eps,
+                    )
                 },
             ),
         }
@@ -311,7 +315,10 @@ impl<const R: usize> Tensor<R> {
             let x = input_value.to_concrete();
             let mean = x.mean_keepdim::<OUT_RANK>(R - 1);
             let centered = (&x - &mean.broadcast_as(shape)).into_concrete();
-            let var = centered.sqr().into_concrete().mean_keepdim::<OUT_RANK>(R - 1);
+            let var = centered
+                .sqr()
+                .into_concrete()
+                .mean_keepdim::<OUT_RANK>(R - 1);
             let std = var.add_scalar(eps).sqrt().into_concrete();
             let xhat = (&centered / &std.broadcast_as(shape)).into_concrete();
 
@@ -396,9 +403,8 @@ impl<const R: usize> Tensor<R> {
         let input_shape = self.shape();
         let spatial_start = R - DIFF;
         let output_shape = Self::conv_output_shape(input_shape, 0, kernel, padding, strides);
-        let windows: [SlidingWindow; DIFF] = std::array::from_fn(|i| {
-            SlidingWindow::new(spatial_start + i, kernel[i], strides[i])
-        });
+        let windows: [SlidingWindow; DIFF] =
+            std::array::from_fn(|i| SlidingWindow::new(spatial_start + i, kernel[i], strides[i]));
         let windows: Tensor<R2> = self.pad_spatial(padding).sliding_window_view(windows);
         let permutation: [usize; R2] = std::array::from_fn(|index| {
             if index == 0 {
@@ -515,20 +521,16 @@ impl<const R: usize> Tensor<R> {
             None => self.replay_binary(weight, "conv", value, move |input, weight| {
                 input.conv_composite::<WEIGHT_RANK, DIFF, R2>(&weight, None, padding, strides)
             }),
-            Some(bias) => self.replay_ternary(
-                weight,
-                bias,
-                "conv",
-                value,
-                move |input, weight, bias| {
+            Some(bias) => {
+                self.replay_ternary(weight, bias, "conv", value, move |input, weight, bias| {
                     input.conv_composite::<WEIGHT_RANK, DIFF, R2>(
                         &weight,
                         Some(&bias),
                         padding,
                         strides,
                     )
-                },
-            ),
+                })
+            }
         }
     }
 
@@ -701,17 +703,17 @@ impl Tensor<4> {
         self.rope_interleaved_composite(cos, sin)
     }
 
-    pub fn flash_attention(
+    pub fn attention(
         &self,
         k: &Tensor<4>,
         v: &Tensor<4>,
         scale: f32,
         mask: Option<(&RawTensor<2, f32>, MaskKind)>,
     ) -> Tensor<4> {
-        let value = self.value.flash_attention(&k.value, &v.value, scale, mask);
+        let value = self.value.attention(&k.value, &v.value, scale, mask);
         let mask_value = mask.map(|(mask, kind)| (mask.clone(), kind));
-        self.replay_ternary(k, v, "flash_attention", value, move |q, k, v| {
-            q.flash_attention_composite(&k, &v, scale, mask_value.as_ref())
+        self.replay_ternary(k, v, "attention", value, move |q, k, v| {
+            q.attention_composite(&k, &v, scale, mask_value.as_ref())
         })
     }
 
@@ -719,7 +721,10 @@ impl Tensor<4> {
         assert_same_graph(self, cos);
         assert_same_graph(self, sin);
 
-        let value = self.value.rope_fused(&cos.value, &sin.value).into_concrete();
+        let value = self
+            .value
+            .rope_fused(&cos.value, &sin.value)
+            .into_concrete();
         self.replay_ternary(cos, sin, "rope_fused", value, |input, cos, sin| {
             input.rope_interleaved_composite(&cos, &sin)
         })
@@ -837,7 +842,7 @@ impl Tensor<4> {
         })
     }
 
-    pub(super) fn flash_attention_composite(
+    pub(super) fn attention_composite(
         &self,
         k: &Tensor<4>,
         v: &Tensor<4>,

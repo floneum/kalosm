@@ -665,10 +665,8 @@ mod tests {
                 for &target in &targets {
                     resolver.build_execution_graph(graph, target);
                 }
-                let mut driver =
-                    EGraphDriver::ingest_for_recognition(&resolver, graph).run_recognition();
-                let extraction = driver.extract();
-                resolver.apply_egraph_deltas(graph, &driver, &extraction);
+                resolver.recognize_contractions(graph);
+                resolver.recognize_embeddings(graph);
                 resolver.recognize_attention(graph);
                 assert_eq!(
                     resolver
@@ -682,6 +680,7 @@ mod tests {
                     qmatmuls.len(),
                     "every observation of a shared e-class must be specialized"
                 );
+                let mut driver = EGraphDriver::ingest(&resolver, graph);
                 let state = ExtractState::from_execution(&mut driver, &resolver);
                 let ctx = FusionCtx {
                     graph,

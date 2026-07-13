@@ -113,9 +113,9 @@ fn check_attention(case: AttentionCase, tolerance: f32) {
             .map(|data| Tensor::from_slice(&device, [q_len, kv_len], data.as_slice()));
 
         let out = if causal {
-            q.flash_attention_causal(&k, &v, scale)
+            q.attention_causal(&k, &v, scale)
         } else {
-            q.flash_attention(&k, &v, scale, mask_tensor.as_ref())
+            q.attention(&k, &v, scale, mask_tensor.as_ref())
         };
         assert_eq!(
             out.count_kernels_to_resolve(),
@@ -279,7 +279,7 @@ fn attention_f16_io() {
         let k = Tensor::from_slice(&device, [1, heads, kv_len, head_dim], &to_f16(&k_data));
         let v = Tensor::from_slice(&device, [1, heads, kv_len, head_dim], &to_f16(&v_data));
 
-        let out = q.flash_attention(&k, &v, scale, None);
+        let out = q.attention(&k, &v, scale, None);
         let actual = out.as_slice::<4, half::f16>().await.unwrap();
 
         let case = AttentionCase {

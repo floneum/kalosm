@@ -2,7 +2,7 @@
 //! builder DSL (no `fusor-tile-ir-kernels` high-level builders): the contiguous
 //! f16 workgroup-tile copy.
 //!
-//! The full corpus (qgemv/qmatmul/coop/flash) lives in
+//! The full corpus (qgemv/qmatmul/coop/attention) lives in
 //! `tile-ir-kernels/tests/golden.rs` because it needs the kernel-crate
 //! builders; this module proves the rewritten *builder* reaches the same module
 //! for the one kernel it can build against `tile-ir` alone.

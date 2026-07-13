@@ -655,22 +655,13 @@ impl Tensor<1, f32> {
 
 impl<T: DataType> Tensor<4, T> {
     #[inline]
-    pub fn flash_attention_causal(&self, k: &Self, v: &Self, scale: f32) -> Self {
-        Self::from_core(
-            self.inner
-                .flash_attention_causal(k.as_core(), v.as_core(), scale),
-        )
+    pub fn attention_causal(&self, k: &Self, v: &Self, scale: f32) -> Self {
+        Self::from_core(self.inner.attention_causal(k.as_core(), v.as_core(), scale))
     }
 
     #[inline]
-    pub fn flash_attention(
-        &self,
-        k: &Self,
-        v: &Self,
-        scale: f32,
-        mask: Option<&Tensor<2, T>>,
-    ) -> Self {
-        Self::from_core(self.inner.flash_attention(
+    pub fn attention(&self, k: &Self, v: &Self, scale: f32, mask: Option<&Tensor<2, T>>) -> Self {
+        Self::from_core(self.inner.attention(
             k.as_core(),
             v.as_core(),
             scale,

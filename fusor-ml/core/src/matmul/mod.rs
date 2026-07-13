@@ -1,6 +1,5 @@
 use crate::{
-    Layout, Tensor, compute_graph::NodeIndex,
-    nary_wise::UnaryFunctionChain, tensor::DataTypeEnum,
+    Layout, Tensor, compute_graph::NodeIndex, nary_wise::UnaryFunctionChain, tensor::DataTypeEnum,
 };
 
 mod cost;

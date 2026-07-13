@@ -49,8 +49,11 @@ async fn bench_batched_matmul(device: &Device, b0: usize, b1: usize, m: usize, k
     for _ in 0..ROUNDS {
         let outputs: Vec<Tensor<4, f32>> = (0..REPEATS)
             .map(|i| {
-                let a =
-                    Tensor::from_slice(device, [b0, b1, m, k], &fill(3 + i as u32, b0 * b1 * m * k));
+                let a = Tensor::from_slice(
+                    device,
+                    [b0, b1, m, k],
+                    &fill(3 + i as u32, b0 * b1 * m * k),
+                );
                 let b = Tensor::from_slice(
                     device,
                     [b0, b1, k, n],

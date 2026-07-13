@@ -84,7 +84,7 @@ impl BertSelfAttention {
             let attention_probs = attention_scores.softmax_last_dim::<3>();
             attention_probs.mat_mul(&value_layer)
         } else {
-            query_layer.flash_attention(&key_layer, &value_layer, scale, None)
+            query_layer.attention(&key_layer, &value_layer, scale, None)
         };
         let context_layer = context_layer.transpose(1, 2).to_concrete();
         context_layer.flatten_last_n::<1, _>()

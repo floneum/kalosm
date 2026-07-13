@@ -112,11 +112,11 @@ pub async fn run_webgpu_kernel_suite_with_progress(
 }
 
 fn skip_browser_registry_case(name: &str) -> bool {
-    name.starts_with("flash_attention_ops::flash_attention_decode_tiled_matches_cpu_reference::")
+    name.starts_with("attention_ops::attention_decode_tiled_matches_cpu_reference::")
         || name.starts_with(
-            "flash_attention_ops::flash_attention_decode_tiled_with_transposed_q_matches_cpu_reference::",
+            "attention_ops::attention_decode_tiled_with_transposed_q_matches_cpu_reference::",
         )
-        || name == "flash_attention_ops::flash_attention_subgroup_fallback_preserves_gpu_backend"
+        || name == "attention_ops::attention_without_subgroups_preserves_gpu_backend"
 }
 
 // ---------------------------------------------------------------------------

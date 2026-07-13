@@ -58,7 +58,10 @@ fn load_images(name: &str) -> Vec<f32> {
     assert_eq!(read_be_u32(&bytes, 0), 0x803, "bad image file magic");
     assert_eq!(read_be_u32(&bytes, 8), IMAGE_SIZE);
     assert_eq!(read_be_u32(&bytes, 12), IMAGE_SIZE);
-    bytes[16..].iter().map(|&pixel| pixel as f32 / 255.0).collect()
+    bytes[16..]
+        .iter()
+        .map(|&pixel| pixel as f32 / 255.0)
+        .collect()
 }
 
 fn load_labels(name: &str) -> Vec<u32> {
@@ -173,11 +176,7 @@ impl Cnn {
             .forward(images)
             .relu()
             .pool_max::<2, 6, 7, 5>([2, 2]);
-        let x = self
-            .conv2
-            .forward(&x)
-            .relu()
-            .pool_max::<2, 6, 7, 5>([2, 2]);
+        let x = self.conv2.forward(&x).relu().pool_max::<2, 6, 7, 5>([2, 2]);
         self.fc.forward(&x.flatten_last_n::<2, 2>())
     }
 }
@@ -192,7 +191,11 @@ fn cross_entropy(logits: &Tensor<2>, targets: &RawTensor<1, u32>) -> Tensor<0> {
     label_log_probs.sum().mul_scalar(-1.0 / batch as f32)
 }
 
-fn sgd_step<const R: usize>(param: &mut RawTensor<R, f32>, gradients: &Gradients, leaf: &Tensor<R>) {
+fn sgd_step<const R: usize>(
+    param: &mut RawTensor<R, f32>,
+    gradients: &Gradients,
+    leaf: &Tensor<R>,
+) {
     let gradient = gradients.get(leaf).expect("missing gradient");
     *param = (param.clone() - gradient * LEARNING_RATE).to_concrete();
 }
@@ -250,9 +253,17 @@ async fn main() {
             let loss_value = to_scalar(loss.raw().clone()).await;
             let gradients = loss.backward().unwrap().into_detached();
             sgd_step(&mut params.conv1_weight, &gradients, model.conv1.weight());
-            sgd_step(&mut params.conv1_bias, &gradients, model.conv1.bias().unwrap());
+            sgd_step(
+                &mut params.conv1_bias,
+                &gradients,
+                model.conv1.bias().unwrap(),
+            );
             sgd_step(&mut params.conv2_weight, &gradients, model.conv2.weight());
-            sgd_step(&mut params.conv2_bias, &gradients, model.conv2.bias().unwrap());
+            sgd_step(
+                &mut params.conv2_bias,
+                &gradients,
+                model.conv2.bias().unwrap(),
+            );
             sgd_step(&mut params.fc_weight, &gradients, model.fc.weight());
             sgd_step(&mut params.fc_bias, &gradients, model.fc.bias().unwrap());
 
@@ -274,7 +285,14 @@ async fn main() {
             &graph,
             RawTensor::from_slice(&device, [labels.len(), 1, IMAGE_SIZE, IMAGE_SIZE], images),
         );
-        let logits = model.forward(&x).raw().clone().as_slice().await.unwrap().to_vec();
+        let logits = model
+            .forward(&x)
+            .raw()
+            .clone()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec();
         correct += logits
             .iter()
             .zip(labels)

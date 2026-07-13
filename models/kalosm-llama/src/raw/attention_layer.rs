@@ -629,7 +629,7 @@ where
         crate::raw::debug_check_nan_f32(&value_f32, layer_idx, "V_cache_view", start_pos);
 
         let scale = 1. / (head_dim as f64).sqrt();
-        let attn_raw = query_f32.flash_attention(
+        let attn_raw = query_f32.attention(
             &key_f32,
             &value_f32,
             scale as f32,
@@ -642,7 +642,7 @@ where
                 (m.mask(), kind)
             }),
         );
-        crate::raw::debug_check_nan_f32(&attn_raw, layer_idx, "flash_out", start_pos);
+        crate::raw::debug_check_nan_f32(&attn_raw, layer_idx, "attention_out", start_pos);
         let attn_output = attn_raw.transpose(1, 2);
         let attn_output = attn_output.reshape([b_sz, q_len, hidden_size]);
         let attn_output_f: Tensor<3, F> = attn_output.cast();
@@ -672,7 +672,7 @@ where
     f32: CastTo<F> + CastTensor<F>,
 {
     let scale = 1. / (head_dim as f64).sqrt();
-    let attn_output = query_states.flash_attention(
+    let attn_output = query_states.attention(
         key_states,
         value_states,
         scale as f32,

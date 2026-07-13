@@ -670,8 +670,8 @@ pub fn q4k_paired_silu() -> BenchmarkCase {
     })
 }
 
-pub fn flash_attention_small() -> BenchmarkCase {
-    bench_case("webgpu::flash_attention_small", |device, config| {
+pub fn attention_small() -> BenchmarkCase {
+    bench_case("webgpu::attention_small", |device, config| {
         Box::pin(async move {
             let shape = [1usize, 4usize, 128usize, 64usize];
             let q_values = deterministic_values(elements(&shape), 31, 0.003);
@@ -683,7 +683,7 @@ pub fn flash_attention_small() -> BenchmarkCase {
             materialize_inputs(&[&q, &k, &v]).await;
 
             let samples = time_samples(config, || {
-                let output = q.flash_attention(&k, &v, 1.0 / (64.0f32).sqrt(), None);
+                let output = q.attention(&k, &v, 1.0 / (64.0f32).sqrt(), None);
                 async move {
                     output.materialize().await;
                     Ok(())
@@ -692,17 +692,17 @@ pub fn flash_attention_small() -> BenchmarkCase {
             .await?;
 
             Ok(BenchmarkReport::new(
-                "webgpu::flash_attention_small",
+                "webgpu::attention_small",
                 config,
                 samples,
-                format!("{} flash attention", shape_label(&shape)),
+                format!("{} attention", shape_label(&shape)),
             ))
         })
     })
 }
 
-pub fn flash_attention_causal_small() -> BenchmarkCase {
-    bench_case("webgpu::flash_attention_causal_small", |device, config| {
+pub fn attention_causal_small() -> BenchmarkCase {
+    bench_case("webgpu::attention_causal_small", |device, config| {
         Box::pin(async move {
             let shape = [1usize, 4usize, 128usize, 64usize];
             let mask_shape = [128usize, 128usize];
@@ -718,7 +718,7 @@ pub fn flash_attention_causal_small() -> BenchmarkCase {
             materialize_inputs(&[&mask]).await;
 
             let samples = time_samples(config, || {
-                let output = q.flash_attention(
+                let output = q.attention(
                     &k,
                     &v,
                     1.0 / (64.0f32).sqrt(),
@@ -732,10 +732,10 @@ pub fn flash_attention_causal_small() -> BenchmarkCase {
             .await?;
 
             Ok(BenchmarkReport::new(
-                "webgpu::flash_attention_causal_small",
+                "webgpu::attention_causal_small",
                 config,
                 samples,
-                format!("{} causal flash attention", shape_label(&shape)),
+                format!("{} causal attention", shape_label(&shape)),
             ))
         })
     })

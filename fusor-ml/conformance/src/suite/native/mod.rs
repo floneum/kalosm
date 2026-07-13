@@ -5,10 +5,10 @@
 //! one `#[tokio::test]` per case; the cases that aren't (`should_panic`,
 //! `vision_block_pattern`) carry their own `#[cfg(test)]` test module.
 
+pub mod attention_ops;
 pub mod cache_ops;
 pub mod dtypes;
 pub mod elementwise_ops;
-pub mod flash_attention_ops;
 pub mod fusion_behavior;
 pub mod fusion_correctness;
 pub mod layer_ops;

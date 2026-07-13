@@ -4,10 +4,10 @@
 //! across CPU and GPU tensors via the Tensor abstraction.
 
 mod activations;
+mod attention;
 mod comparison;
 mod construction;
 mod conv;
-mod flash_attention;
 pub mod index;
 mod index_select;
 mod math;
@@ -20,7 +20,7 @@ mod to_vec;
 mod upsample;
 mod where_cond;
 
-pub use flash_attention::MaskKind;
+pub use attention::MaskKind;
 pub use rope::{RopeCache, base_inverse_frequency};
 pub(crate) use shape::broadcast_shapes;
 pub use shape::{arange, arange_step, cat, stack};

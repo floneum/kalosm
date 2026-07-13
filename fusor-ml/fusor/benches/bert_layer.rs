@@ -313,12 +313,8 @@ fn self_attention(c: &mut Criterion) {
                                     let k = k_reshaped.transpose(1, 2).to_concrete();
                                     let v = v_reshaped.transpose(1, 2).to_concrete();
 
-                                    let context = q.flash_attention(
-                                        &k,
-                                        &v,
-                                        1.0 / (head_size as f32).sqrt(),
-                                        None,
-                                    );
+                                    let context =
+                                        q.attention(&k, &v, 1.0 / (head_size as f32).sqrt(), None);
                                     let context = context.transpose(1, 2);
                                     let output = context.flatten_last_n::<1, _>();
 

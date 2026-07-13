@@ -10,8 +10,8 @@ use crate::{ConcreteTensor, Device, SimdElement, Tensor};
 pub struct AttentionMask<D: SimdElement> {
     mask: Tensor<2, D, ConcreteTensor<D, 2>>,
     /// `true` when the mask is exactly the strict lower-triangular causal
-    /// mask of shape `[n, n]`. Hint to GPU flash attention so it can skip the
-    /// mask tensor entirely and prune upper-triangle work.
+    /// mask of shape `[n, n]`. This lets the compiler omit the mask tensor
+    /// and prune upper-triangle work.
     is_strict_causal: bool,
 }
 
@@ -28,7 +28,7 @@ where
     }
 
     /// Returns true if this is a strict lower-triangular causal mask. The
-    /// GPU flash attention kernel can then skip masking work entirely.
+    /// compiler can then skip masking work entirely.
     pub fn is_strict_causal(&self) -> bool {
         self.is_strict_causal
     }

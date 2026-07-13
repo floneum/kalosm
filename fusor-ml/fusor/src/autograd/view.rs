@@ -59,7 +59,11 @@ impl<const R: usize> Tensor<R> {
             let zeros = RawTensor::zeros(&gradient.device(), input_shape);
             Ok(vec![BackwardTarget {
                 node: input_id,
-                gradient: Box::new(zeros.slice_assign(slices.clone(), &gradient).into_concrete()),
+                gradient: Box::new(
+                    zeros
+                        .slice_assign(slices.clone(), &gradient)
+                        .into_concrete(),
+                ),
             }])
         });
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
@@ -229,7 +233,10 @@ impl<const R: usize> Tensor<R> {
     pub fn restride_layout<const OUT: usize>(&self, new_layout: Layout) -> Tensor<OUT> {
         assert_eq!(new_layout.rank(), OUT, "restride_layout rank mismatch");
         let input_shape = self.shape();
-        let value = self.value.restride_layout(new_layout.clone()).into_concrete();
+        let value = self
+            .value
+            .restride_layout(new_layout.clone())
+            .into_concrete();
         let input_id = self.handle.id;
         let output_shape: [usize; OUT] = std::array::from_fn(|axis| new_layout.shape()[axis]);
         let input_strides = Layout::continuous_strides(&input_shape);
@@ -398,7 +405,11 @@ impl<const R: usize> Tensor<R> {
             Ok(vec![
                 BackwardTarget {
                     node: input_id,
-                    gradient: Box::new(gradient.slice_assign(slices.clone(), &zeros).into_concrete()),
+                    gradient: Box::new(
+                        gradient
+                            .slice_assign(slices.clone(), &zeros)
+                            .into_concrete(),
+                    ),
                 },
                 BackwardTarget {
                     node: value_id,
@@ -830,12 +841,17 @@ fn scatter_restride_gradient<const IN: usize, const OUT: usize>(
         let input_index = input_index(output_index);
         let output_slices: [Range<usize>; OUT] =
             std::array::from_fn(|axis| output_index[axis]..output_index[axis] + 1);
-        let patch = gradient.slice(output_slices).reshape([1; IN]).into_concrete();
+        let patch = gradient
+            .slice(output_slices)
+            .reshape([1; IN])
+            .into_concrete();
         let target: [Range<usize>; IN] =
             std::array::from_fn(|axis| input_index[axis]..input_index[axis] + 1);
         let current = input_gradient.slice(target.clone()).into_concrete();
         let updated = (current + patch).into_concrete();
-        input_gradient = input_gradient.slice_assign(target, &updated).into_concrete();
+        input_gradient = input_gradient
+            .slice_assign(target, &updated)
+            .into_concrete();
     });
     input_gradient
 }

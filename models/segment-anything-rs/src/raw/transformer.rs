@@ -80,7 +80,7 @@ impl Attention {
         let c_per_head = q.shape()[3];
         let scale = 1.0 / (c_per_head as f32).sqrt();
 
-        let out = q.flash_attention(&k, &v, scale, None);
+        let out = q.attention(&k, &v, scale, None);
         let out = self.recombine_heads(&out);
         self.out_proj.forward(&out)
     }

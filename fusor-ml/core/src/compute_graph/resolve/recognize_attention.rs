@@ -1,7 +1,7 @@
 //! Recognition of composed attention clusters.
 //!
 //! Runs third, after contractions and normalizations: by then the canonical
-//! cluster from `Tensor::flash_attention` has collapsed to
+//! cluster from `Tensor::attention` has collapsed to
 //! `MatMul(Softmax(scale·MatMul(q, kᵀ) [+ mask]), v)` with the GQA-expand /
 //! transpose / mask broadcast views still attached to the original
 //! q/k/v/mask nodes. Recognition rebuilds the attention row program when its
@@ -190,7 +190,7 @@ impl Resolver {
         let expected_consumers = |node: NodeIndex| if node == softmax.input { 2 } else { 1 };
 
         // Causal masking: select(kv_pos <= q_pos, scaled, -inf) — pure index
-        // arithmetic emitted by `flash_attention_causal`.
+        // arithmetic emitted by `attention_causal`.
         let mut causal = false;
         if let Some(scaled) = self.inner_nary(scores_inner).and_then(match_causal_select) {
             if !self.exclusively_consumed(graph, scores_inner, expected_consumers(scores_inner)) {

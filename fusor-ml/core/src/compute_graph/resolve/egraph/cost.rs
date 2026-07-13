@@ -49,6 +49,7 @@ pub(super) struct CostDelta {
 }
 
 impl CostDelta {
+    #[cfg(test)]
     pub(super) fn improves(self) -> bool {
         self < Self::default()
     }

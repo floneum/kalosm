@@ -519,8 +519,7 @@ impl<const R: usize> Tensor<R> {
                 replay_fourth.clone(),
             );
             let gradients = replay_output.backward_with(gradient)?;
-            let missing =
-                || Error::msg(format!("missing replay gradient in {context}"));
+            let missing = || Error::msg(format!("missing replay gradient in {context}"));
             Ok(vec![
                 BackwardTarget {
                     node: ids[0],

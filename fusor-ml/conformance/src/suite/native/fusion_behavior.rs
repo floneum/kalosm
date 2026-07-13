@@ -241,7 +241,7 @@ pub fn gpu_nary_where_cond_fuses_into_one_kernel() -> AssertionCases {
     assertions
 }
 
-pub fn gpu_flash_attention_fuses_into_one_kernel() -> AssertionCases {
+pub fn gpu_attention_fuses_into_one_kernel() -> AssertionCases {
     let q_shape = [1, 2, 3, 4];
     let kv_shape = [1, 2, 5, 4];
     let q_data = attention_data(q_shape.iter().product(), 0.1);
@@ -254,17 +254,17 @@ pub fn gpu_flash_attention_fuses_into_one_kernel() -> AssertionCases {
     let mut assertions = AssertionCases::new();
 
     assertions.push(assert_gpu_tensor_case(
-        "fusion_behavior::gpu_flash_attention_fuses_into_one_kernel::correctness",
+        "fusion_behavior::gpu_attention_fuses_into_one_kernel::correctness",
         move |device| {
             let q = Tensor::from_slice(&device, q_shape, &q_data);
             let k = Tensor::from_slice(&device, kv_shape, &k_data);
             let v = Tensor::from_slice(&device, kv_shape, &v_data);
-            q.flash_attention(&k, &v, scale, None).to_concrete()
+            q.attention(&k, &v, scale, None).to_concrete()
         },
         1e-4,
     ));
     assertions.push(assert_gpu_kernel_property(
-        "fusion_behavior::gpu_flash_attention_fuses_into_one_kernel::kernels",
+        "fusion_behavior::gpu_attention_fuses_into_one_kernel::kernels",
         move |device| {
             let Some(gpu) = device.as_gpu() else {
                 return true;
@@ -275,7 +275,7 @@ pub fn gpu_flash_attention_fuses_into_one_kernel() -> AssertionCases {
             let q = Tensor::from_slice(&device, q_shape, &kernel_q_data);
             let k = Tensor::from_slice(&device, kv_shape, &kernel_k_data);
             let v = Tensor::from_slice(&device, kv_shape, &kernel_v_data);
-            q.flash_attention(&k, &v, scale, None)
+            q.attention(&k, &v, scale, None)
                 .as_gpu()
                 .is_some_and(|gpu| gpu.count_kernels_to_resolve() == 1)
         },

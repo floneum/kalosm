@@ -857,14 +857,7 @@ async fn test_backward_var() {
         assert_slice_close(&output_values, &[2.0 / 3.0, 2.0 / 3.0]);
         assert_slice_close(
             &dinput.into_iter().flatten().collect::<Vec<_>>(),
-            &[
-                -2.0 / 3.0,
-                0.0,
-                2.0 / 3.0,
-                -2.0 / 3.0,
-                0.0,
-                2.0 / 3.0,
-            ],
+            &[-2.0 / 3.0, 0.0, 2.0 / 3.0, -2.0 / 3.0, 0.0, 2.0 / 3.0],
         );
     }
 }
@@ -892,14 +885,7 @@ async fn test_backward_var_keepdim() {
         );
         assert_slice_close(
             &dinput.into_iter().flatten().collect::<Vec<_>>(),
-            &[
-                -2.0 / 3.0,
-                0.0,
-                2.0 / 3.0,
-                -2.0 / 3.0,
-                0.0,
-                2.0 / 3.0,
-            ],
+            &[-2.0 / 3.0, 0.0, 2.0 / 3.0, -2.0 / 3.0, 0.0, 2.0 / 3.0],
         );
     }
 }
@@ -2850,12 +2836,8 @@ async fn test_backward_rms_norm_fused_matches_composite() {
 
         let composite_graph = Graph::new();
         let composite_input: Tensor<3> = Tensor::new(&composite_graph, &device, input_data);
-        let composite_weight: Tensor<3> = Tensor::from_slice(
-            &composite_graph,
-            &device,
-            [1, 1, 3],
-            weight_data,
-        );
+        let composite_weight: Tensor<3> =
+            Tensor::from_slice(&composite_graph, &device, [1, 1, 3], weight_data);
         let composite_output = composite_input.rms_norm(&composite_weight, eps);
         let composite_loss = composite_output.sqr().reshape([12]).sum();
         let composite_gradients = composite_loss.backward().unwrap();
@@ -2895,18 +2877,10 @@ async fn test_backward_layer_norm_last_dim_fused_matches_composite() {
 
         let composite_graph = Graph::new();
         let composite_input: Tensor<3> = Tensor::new(&composite_graph, &device, input_data);
-        let composite_weight: Tensor<3> = Tensor::from_slice(
-            &composite_graph,
-            &device,
-            [1, 1, 3],
-            weight_data,
-        );
-        let composite_bias: Tensor<3> = Tensor::from_slice(
-            &composite_graph,
-            &device,
-            [1, 1, 3],
-            bias_data,
-        );
+        let composite_weight: Tensor<3> =
+            Tensor::from_slice(&composite_graph, &device, [1, 1, 3], weight_data);
+        let composite_bias: Tensor<3> =
+            Tensor::from_slice(&composite_graph, &device, [1, 1, 3], bias_data);
         let composite_output =
             composite_input.layer_norm(&composite_weight, Some(&composite_bias), eps, true);
         let composite_loss = composite_output.sqr().reshape([12]).sum();
@@ -2929,7 +2903,7 @@ async fn test_backward_layer_norm_last_dim_fused_matches_composite() {
 }
 
 #[tokio::test]
-async fn test_backward_flash_attention_matches_composite() {
+async fn test_backward_attention_matches_composite() {
     for device in test_devices().await {
         let q_data = &[[[[0.2f32, 0.6], [1.0, -0.3]]]];
         let k_data = &[[[[0.4f32, -0.7], [0.9, 0.1]]]];
@@ -2940,7 +2914,7 @@ async fn test_backward_flash_attention_matches_composite() {
         let fused_q: Tensor<4> = Tensor::new(&fused_graph, &device, q_data);
         let fused_k: Tensor<4> = Tensor::new(&fused_graph, &device, k_data);
         let fused_v: Tensor<4> = Tensor::new(&fused_graph, &device, v_data);
-        let fused_output = fused_q.flash_attention(&fused_k, &fused_v, scale, None);
+        let fused_output = fused_q.attention(&fused_k, &fused_v, scale, None);
         let fused_loss = fused_output.sqr().reshape([4]).sum();
         let fused_gradients = fused_loss.backward().unwrap();
 
@@ -2949,7 +2923,7 @@ async fn test_backward_flash_attention_matches_composite() {
         let composite_k: Tensor<4> = Tensor::new(&composite_graph, &device, k_data);
         let composite_v: Tensor<4> = Tensor::new(&composite_graph, &device, v_data);
         let composite_output =
-            composite_q.flash_attention_composite(&composite_k, &composite_v, scale, None);
+            composite_q.attention_composite(&composite_k, &composite_v, scale, None);
         let composite_loss = composite_output.sqr().reshape([4]).sum();
         let composite_gradients = composite_loss.backward().unwrap();
 
@@ -3718,7 +3692,9 @@ async fn test_autograd_index_select_rank_generic() {
         assert_eq!(selected.shape(), [2, 4, 2]);
         assert_eq!(
             flatten(selected.raw().clone()).await,
-            vec![4.0, 5.0, 0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 10.0, 11.0, 6.0, 7.0, 8.0, 9.0, 6.0, 7.0]
+            vec![
+                4.0, 5.0, 0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 10.0, 11.0, 6.0, 7.0, 8.0, 9.0, 6.0, 7.0
+            ]
         );
         let gradients = selected.flatten_all().sum().backward().unwrap();
         let dx = flatten(gradients.get(&x).unwrap()).await;
@@ -3921,8 +3897,7 @@ async fn test_backward_cat_rank1() {
 async fn test_backward_cat_rank2() {
     for device in test_devices().await {
         let graph = Graph::new();
-        let first: Tensor<2> =
-            Tensor::from_slice(&graph, &device, [2, 2], &[1.0, 2.0, 3.0, 4.0]);
+        let first: Tensor<2> = Tensor::from_slice(&graph, &device, [2, 2], &[1.0, 2.0, 3.0, 4.0]);
         let second: Tensor<2> = Tensor::from_slice(&graph, &device, [2, 1], &[5.0, 6.0]);
         let output = Tensor::cat(vec![first.clone(), second.clone()], 1);
         assert_eq!(output.shape(), [2, 3]);
@@ -3934,7 +3909,10 @@ async fn test_backward_cat_rank2() {
             &flatten(gradients.get(&first).unwrap()).await,
             &[2.0, 4.0, 6.0, 8.0],
         );
-        assert_slice_close(&flatten(gradients.get(&second).unwrap()).await, &[10.0, 12.0]);
+        assert_slice_close(
+            &flatten(gradients.get(&second).unwrap()).await,
+            &[10.0, 12.0],
+        );
 
         assert_gradient_matches_finite_difference(&device, [2, 1], &[5.0, 6.0], |graph, x| {
             let other = Tensor::constant_from_raw(
@@ -3981,8 +3959,7 @@ async fn test_backward_pad_with_zeros() {
 async fn test_backward_pad_axis() {
     for device in test_devices().await {
         let graph = Graph::new();
-        let input: Tensor<2> =
-            Tensor::from_slice(&graph, &device, [2, 2], &[1.0, 2.0, 3.0, 4.0]);
+        let input: Tensor<2> = Tensor::from_slice(&graph, &device, [2, 2], &[1.0, 2.0, 3.0, 4.0]);
         let output = input.pad_axis(1, 1);
         assert_eq!(output.shape(), [2, 4]);
         let values = output.raw().clone().as_slice().await.unwrap().to_vec();
@@ -4158,10 +4135,8 @@ async fn test_backward_sum_keepdim() {
         let forward = flatten(summed.raw().clone()).await;
         assert_slice_close(&forward, &[6.0, 15.0]);
 
-        let weight = Tensor::constant_from_raw(
-            &graph,
-            RawTensor::from_slice(&device, [2, 1], &[1.0, 2.0]),
-        );
+        let weight =
+            Tensor::constant_from_raw(&graph, RawTensor::from_slice(&device, [2, 1], &[1.0, 2.0]));
         let loss = summed.mul(&weight).flatten_all().sum();
         let gradients = loss.backward().unwrap();
         let dx = flatten(gradients.get(&x).unwrap()).await;
@@ -4278,44 +4253,34 @@ async fn test_autograd_conv1d() {
 
         let fd_device = device.clone();
         let w_fd = w_data.clone();
-        assert_gradient_matches_finite_difference(
-            &device,
-            [1, 2, 4],
-            &x_data,
-            move |graph, x| {
-                let w = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [2, 2, 2], &w_fd),
-                );
-                let b = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [2], &[0.5f32, -1.0]),
-                );
-                let out = x.conv(&w, Some(&b), [1], [1]);
-                out.mul(&composite_ramp(graph, &fd_device, out.shape()))
-                    .flatten_all()
-                    .sum()
-            },
-        )
+        assert_gradient_matches_finite_difference(&device, [1, 2, 4], &x_data, move |graph, x| {
+            let w = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [2, 2, 2], &w_fd),
+            );
+            let b = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [2], &[0.5f32, -1.0]),
+            );
+            let out = x.conv(&w, Some(&b), [1], [1]);
+            out.mul(&composite_ramp(graph, &fd_device, out.shape()))
+                .flatten_all()
+                .sum()
+        })
         .await;
 
         let fd_device = device.clone();
         let x_fd = x_data.clone();
-        assert_gradient_matches_finite_difference(
-            &device,
-            [2, 2, 2],
-            &w_data,
-            move |graph, w| {
-                let x = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [1, 2, 4], &x_fd),
-                );
-                let out = x.conv(&w, None, [1], [1]);
-                out.mul(&composite_ramp(graph, &fd_device, out.shape()))
-                    .flatten_all()
-                    .sum()
-            },
-        )
+        assert_gradient_matches_finite_difference(&device, [2, 2, 2], &w_data, move |graph, w| {
+            let x = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [1, 2, 4], &x_fd),
+            );
+            let out = x.conv(&w, None, [1], [1]);
+            out.mul(&composite_ramp(graph, &fd_device, out.shape()))
+                .flatten_all()
+                .sum()
+        })
         .await;
 
         let fd_device = device.clone();
@@ -4422,44 +4387,34 @@ async fn test_autograd_grouped_conv() {
 
         let fd_device = device.clone();
         let w_fd = w_data.clone();
-        assert_gradient_matches_finite_difference(
-            &device,
-            [1, 4, 4],
-            &x_data,
-            move |graph, x| {
-                let w = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [4, 2, 2], &w_fd),
-                );
-                let b = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [4], &[0.2f32, -0.4, 0.6, -0.8]),
-                );
-                let out = x.grouped_conv(&w, Some(&b), [1], [2], 2);
-                out.mul(&composite_ramp(graph, &fd_device, out.shape()))
-                    .flatten_all()
-                    .sum()
-            },
-        )
+        assert_gradient_matches_finite_difference(&device, [1, 4, 4], &x_data, move |graph, x| {
+            let w = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [4, 2, 2], &w_fd),
+            );
+            let b = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [4], &[0.2f32, -0.4, 0.6, -0.8]),
+            );
+            let out = x.grouped_conv(&w, Some(&b), [1], [2], 2);
+            out.mul(&composite_ramp(graph, &fd_device, out.shape()))
+                .flatten_all()
+                .sum()
+        })
         .await;
 
         let fd_device = device.clone();
         let x_fd = x_data.clone();
-        assert_gradient_matches_finite_difference(
-            &device,
-            [4, 2, 2],
-            &w_data,
-            move |graph, w| {
-                let x = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [1, 4, 4], &x_fd),
-                );
-                let out = x.grouped_conv(&w, None, [1], [2], 2);
-                out.mul(&composite_ramp(graph, &fd_device, out.shape()))
-                    .flatten_all()
-                    .sum()
-            },
-        )
+        assert_gradient_matches_finite_difference(&device, [4, 2, 2], &w_data, move |graph, w| {
+            let x = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [1, 4, 4], &x_fd),
+            );
+            let out = x.grouped_conv(&w, None, [1], [2], 2);
+            out.mul(&composite_ramp(graph, &fd_device, out.shape()))
+                .flatten_all()
+                .sum()
+        })
         .await;
     }
 }
@@ -4487,17 +4442,12 @@ async fn test_autograd_upsample_nearest2d() {
         }
 
         let fd_device = device.clone();
-        assert_gradient_matches_finite_difference(
-            &device,
-            [1, 2, 2, 3],
-            &data,
-            move |graph, x| {
-                let out = x.upsample_nearest2d(2, 3);
-                out.mul(&composite_ramp(graph, &fd_device, out.shape()))
-                    .flatten_all()
-                    .sum()
-            },
-        )
+        assert_gradient_matches_finite_difference(&device, [1, 2, 2, 3], &data, move |graph, x| {
+            let out = x.upsample_nearest2d(2, 3);
+            out.mul(&composite_ramp(graph, &fd_device, out.shape()))
+                .flatten_all()
+                .sum()
+        })
         .await;
     }
 }
@@ -4558,25 +4508,20 @@ async fn test_autograd_layer_norm_rms_norm_rank4() {
         );
 
         let fd_device = device.clone();
-        assert_gradient_matches_finite_difference(
-            &device,
-            [1, 2, 2, 3],
-            &data,
-            move |graph, x| {
-                let w = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [1, 1, 1, 3], &[0.5f32, 1.5, 2.0]),
-                );
-                let b = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [1, 1, 1, 3], &[0.1f32, -0.2, 0.3]),
-                );
-                let out = x.layer_norm(&w, Some(&b), eps, true);
-                out.mul(&composite_ramp(graph, &fd_device, out.shape()))
-                    .flatten_all()
-                    .sum()
-            },
-        )
+        assert_gradient_matches_finite_difference(&device, [1, 2, 2, 3], &data, move |graph, x| {
+            let w = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [1, 1, 1, 3], &[0.5f32, 1.5, 2.0]),
+            );
+            let b = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [1, 1, 1, 3], &[0.1f32, -0.2, 0.3]),
+            );
+            let out = x.layer_norm(&w, Some(&b), eps, true);
+            out.mul(&composite_ramp(graph, &fd_device, out.shape()))
+                .flatten_all()
+                .sum()
+        })
         .await;
 
         let rms = x.rms_norm(&w, eps);
@@ -4588,21 +4533,16 @@ async fn test_autograd_layer_norm_rms_norm_rank4() {
         );
 
         let fd_device = device.clone();
-        assert_gradient_matches_finite_difference(
-            &device,
-            [1, 2, 2, 3],
-            &data,
-            move |graph, x| {
-                let w = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [1, 1, 1, 3], &[0.5f32, 1.5, 2.0]),
-                );
-                let out = x.rms_norm(&w, eps);
-                out.mul(&composite_ramp(graph, &fd_device, out.shape()))
-                    .flatten_all()
-                    .sum()
-            },
-        )
+        assert_gradient_matches_finite_difference(&device, [1, 2, 2, 3], &data, move |graph, x| {
+            let w = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [1, 1, 1, 3], &[0.5f32, 1.5, 2.0]),
+            );
+            let out = x.rms_norm(&w, eps);
+            out.mul(&composite_ramp(graph, &fd_device, out.shape()))
+                .flatten_all()
+                .sum()
+        })
         .await;
     }
 }
@@ -4650,52 +4590,42 @@ async fn test_autograd_rms_norm_residual_fused() {
 
         let fd_device = device.clone();
         let r_fd = r_data.clone();
-        assert_gradient_matches_finite_difference(
-            &device,
-            [2, 2, 3],
-            &x_data,
-            move |graph, x| {
-                let r = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [2, 2, 3], &r_fd),
-                );
-                let w = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [3], &[0.5f32, 1.5, 2.0]),
-                );
-                let b = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [3], &[0.1f32, -0.2, 0.3]),
-                );
-                let out = x.rms_norm_residual_fused(&r, &w, Some(&b), eps);
-                out.mul(&composite_ramp(graph, &fd_device, out.shape()))
-                    .flatten_all()
-                    .sum()
-            },
-        )
+        assert_gradient_matches_finite_difference(&device, [2, 2, 3], &x_data, move |graph, x| {
+            let r = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [2, 2, 3], &r_fd),
+            );
+            let w = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [3], &[0.5f32, 1.5, 2.0]),
+            );
+            let b = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [3], &[0.1f32, -0.2, 0.3]),
+            );
+            let out = x.rms_norm_residual_fused(&r, &w, Some(&b), eps);
+            out.mul(&composite_ramp(graph, &fd_device, out.shape()))
+                .flatten_all()
+                .sum()
+        })
         .await;
 
         let fd_device = device.clone();
         let x_fd = x_data.clone();
-        assert_gradient_matches_finite_difference(
-            &device,
-            [2, 2, 3],
-            &r_data,
-            move |graph, r| {
-                let x = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [2, 2, 3], &x_fd),
-                );
-                let w = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [3], &[0.5f32, 1.5, 2.0]),
-                );
-                let out = x.rms_norm_residual_fused(&r, &w, None, eps);
-                out.mul(&composite_ramp(graph, &fd_device, out.shape()))
-                    .flatten_all()
-                    .sum()
-            },
-        )
+        assert_gradient_matches_finite_difference(&device, [2, 2, 3], &r_data, move |graph, r| {
+            let x = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [2, 2, 3], &x_fd),
+            );
+            let w = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [3], &[0.5f32, 1.5, 2.0]),
+            );
+            let out = x.rms_norm_residual_fused(&r, &w, None, eps);
+            out.mul(&composite_ramp(graph, &fd_device, out.shape()))
+                .flatten_all()
+                .sum()
+        })
         .await;
 
         let fd_device = device.clone();
@@ -4991,17 +4921,13 @@ async fn test_backward_mat_mul_rank4() {
         for batch in 0..4 {
             for i in 0..2 {
                 for k in 0..3 {
-                    let expected = (0..2)
-                        .map(|j| rhs_data[batch * 6 + k * 2 + j])
-                        .sum::<f32>();
+                    let expected = (0..2).map(|j| rhs_data[batch * 6 + k * 2 + j]).sum::<f32>();
                     assert_close(dlhs[batch * 6 + i * 3 + k], expected);
                 }
             }
             for k in 0..3 {
                 for j in 0..2 {
-                    let expected = (0..2)
-                        .map(|i| lhs_data[batch * 6 + i * 3 + k])
-                        .sum::<f32>();
+                    let expected = (0..2).map(|i| lhs_data[batch * 6 + i * 3 + k]).sum::<f32>();
                     assert_close(drhs[batch * 6 + k * 2 + j], expected);
                 }
             }
@@ -5282,66 +5208,51 @@ async fn test_autograd_layer_norm_rank_generic() {
             }
 
             let fd_device = device.clone();
-            assert_gradient_matches_finite_difference(
-                &device,
-                [2, 3],
-                &x_data,
-                move |graph, x| {
-                    let w = Tensor::constant_from_raw(
-                        graph,
-                        RawTensor::from_slice(&fd_device, [1, 3], &w_data),
-                    );
-                    let b = Tensor::constant_from_raw(
-                        graph,
-                        RawTensor::from_slice(&fd_device, [1, 3], &b_data),
-                    );
-                    x.layer_norm(&w, Some(&b), eps, remove_mean)
-                        .flatten_all()
-                        .sum()
-                },
-            )
+            assert_gradient_matches_finite_difference(&device, [2, 3], &x_data, move |graph, x| {
+                let w = Tensor::constant_from_raw(
+                    graph,
+                    RawTensor::from_slice(&fd_device, [1, 3], &w_data),
+                );
+                let b = Tensor::constant_from_raw(
+                    graph,
+                    RawTensor::from_slice(&fd_device, [1, 3], &b_data),
+                );
+                x.layer_norm(&w, Some(&b), eps, remove_mean)
+                    .flatten_all()
+                    .sum()
+            })
             .await;
 
             let fd_device = device.clone();
-            assert_gradient_matches_finite_difference(
-                &device,
-                [1, 3],
-                &w_data,
-                move |graph, w| {
-                    let x = Tensor::constant_from_raw(
-                        graph,
-                        RawTensor::from_slice(&fd_device, [2, 3], &x_data),
-                    );
-                    let b = Tensor::constant_from_raw(
-                        graph,
-                        RawTensor::from_slice(&fd_device, [1, 3], &b_data),
-                    );
-                    x.layer_norm(&w, Some(&b), eps, remove_mean)
-                        .flatten_all()
-                        .sum()
-                },
-            )
+            assert_gradient_matches_finite_difference(&device, [1, 3], &w_data, move |graph, w| {
+                let x = Tensor::constant_from_raw(
+                    graph,
+                    RawTensor::from_slice(&fd_device, [2, 3], &x_data),
+                );
+                let b = Tensor::constant_from_raw(
+                    graph,
+                    RawTensor::from_slice(&fd_device, [1, 3], &b_data),
+                );
+                x.layer_norm(&w, Some(&b), eps, remove_mean)
+                    .flatten_all()
+                    .sum()
+            })
             .await;
 
             let fd_device = device.clone();
-            assert_gradient_matches_finite_difference(
-                &device,
-                [1, 3],
-                &b_data,
-                move |graph, b| {
-                    let x = Tensor::constant_from_raw(
-                        graph,
-                        RawTensor::from_slice(&fd_device, [2, 3], &x_data),
-                    );
-                    let w = Tensor::constant_from_raw(
-                        graph,
-                        RawTensor::from_slice(&fd_device, [1, 3], &w_data),
-                    );
-                    x.layer_norm(&w, Some(&b), eps, remove_mean)
-                        .flatten_all()
-                        .sum()
-                },
-            )
+            assert_gradient_matches_finite_difference(&device, [1, 3], &b_data, move |graph, b| {
+                let x = Tensor::constant_from_raw(
+                    graph,
+                    RawTensor::from_slice(&fd_device, [2, 3], &x_data),
+                );
+                let w = Tensor::constant_from_raw(
+                    graph,
+                    RawTensor::from_slice(&fd_device, [1, 3], &w_data),
+                );
+                x.layer_norm(&w, Some(&b), eps, remove_mean)
+                    .flatten_all()
+                    .sum()
+            })
             .await;
         }
     }
@@ -5440,14 +5351,10 @@ async fn test_autograd_rms_norm_fused_weight_rank() {
 
         let fd_device = device.clone();
         assert_gradient_matches_finite_difference(&device, [2, 3], &x_data, move |graph, x| {
-            let w = Tensor::constant_from_raw(
-                graph,
-                RawTensor::from_slice(&fd_device, [3], &w_data),
-            );
-            let b = Tensor::constant_from_raw(
-                graph,
-                RawTensor::from_slice(&fd_device, [3], &b_data),
-            );
+            let w =
+                Tensor::constant_from_raw(graph, RawTensor::from_slice(&fd_device, [3], &w_data));
+            let b =
+                Tensor::constant_from_raw(graph, RawTensor::from_slice(&fd_device, [3], &b_data));
             x.rms_norm_fused::<1, 1>(&w, Some(&b), eps)
                 .flatten_all()
                 .sum()
@@ -5460,7 +5367,9 @@ async fn test_autograd_rms_norm_fused_weight_rank() {
                 graph,
                 RawTensor::from_slice(&fd_device, [2, 3], &x_data),
             );
-            x.rms_norm_fused_no_bias::<2, 1>(&w, eps).flatten_all().sum()
+            x.rms_norm_fused_no_bias::<2, 1>(&w, eps)
+                .flatten_all()
+                .sum()
         })
         .await;
 
@@ -5470,10 +5379,8 @@ async fn test_autograd_rms_norm_fused_weight_rank() {
                 graph,
                 RawTensor::from_slice(&fd_device, [2, 3], &x_data),
             );
-            let w = Tensor::constant_from_raw(
-                graph,
-                RawTensor::from_slice(&fd_device, [3], &w_data),
-            );
+            let w =
+                Tensor::constant_from_raw(graph, RawTensor::from_slice(&fd_device, [3], &w_data));
             x.rms_norm_fused::<1, 1>(&w, Some(&b), eps)
                 .flatten_all()
                 .sum()
@@ -5808,8 +5715,7 @@ async fn test_autograd_layer_embedding_forward_parity() {
         let table = RawTensor::from_slice(&device, [4, 3], &weights);
         let raw_layer = crate::layers::Embedding::new_from_tensor(table.clone());
         let graph = Graph::new();
-        let layer =
-            layers::Embedding::new_from_tensor(graph.leaf(table));
+        let layer = layers::Embedding::new_from_tensor(graph.leaf(table));
         assert_eq!(layer.num_embeddings(), 4);
         assert_eq!(layer.embedding_dim(), 3);
 
@@ -5817,7 +5723,10 @@ async fn test_autograd_layer_embedding_forward_parity() {
         let expected: RawTensor<3, f32> = raw_layer.forward(&indices);
         let output = layer.forward(&indices);
         assert_eq!(output.shape(), [2, 2, 3]);
-        assert_slice_close(&flatten(output.raw().clone()).await, &flatten(expected).await);
+        assert_slice_close(
+            &flatten(output.raw().clone()).await,
+            &flatten(expected).await,
+        );
 
         let flat_indices: RawTensor<1, u32> = RawTensor::from_slice(&device, [3], &[2, 0, 2]);
         let expected_flat: RawTensor<2, f32> = raw_layer.forward(&flat_indices);
@@ -5864,13 +5773,9 @@ async fn test_autograd_layer_embedding_from_inference() {
         .flat_map(|value| value.to_le_bytes())
         .collect();
     for device in test_devices().await {
-        let quantized = crate::QMatrix::from_raw_bytes(
-            &device,
-            [4usize, 3],
-            &bytes,
-            fusor_gguf::GgmlType::F32,
-        )
-        .unwrap();
+        let quantized =
+            crate::QMatrix::from_raw_bytes(&device, [4usize, 3], &bytes, fusor_gguf::GgmlType::F32)
+                .unwrap();
         let quantized_layer = crate::layers::Embedding::<f32>::new(quantized);
         let dense_layer = crate::layers::Embedding::<f32>::new_from_tensor(RawTensor::from_slice(
             &device,
@@ -5882,13 +5787,15 @@ async fn test_autograd_layer_embedding_from_inference() {
             let expected: RawTensor<3, f32> = raw_layer.forward(&indices);
 
             let graph = Graph::new();
-            let layer =
-                layers::Embedding::from_inference(&graph, raw_layer);
+            let layer = layers::Embedding::from_inference(&graph, raw_layer);
             assert_eq!(layer.num_embeddings(), 4);
             assert_eq!(layer.embedding_dim(), 3);
             assert_slice_close(&flatten(layer.embeddings().raw().clone()).await, &weights);
             let output = layer.forward(&indices);
-            assert_slice_close(&flatten(output.raw().clone()).await, &flatten(expected).await);
+            assert_slice_close(
+                &flatten(output.raw().clone()).await,
+                &flatten(expected).await,
+            );
 
             let loss = layer.forward(&indices).sqr().flatten_all().sum();
             let gradients = loss.backward().unwrap();
@@ -5923,10 +5830,7 @@ async fn test_autograd_layer_layer_norm_forward_matches_inference() {
         let input = Tensor::from_slice(&graph, &device, [2, 3, 4], &input_data);
         let input_2d = Tensor::from_slice(&graph, &device, [6, 4], &input_data);
         assert_slice_close(&flatten(layer.forward(&input).into_raw()).await, &expected);
-        assert_slice_close(
-            &flatten(layer.forward(&input).into_raw()).await,
-            &expected,
-        );
+        assert_slice_close(&flatten(layer.forward(&input).into_raw()).await, &expected);
         assert_slice_close(
             &flatten(layer.forward(&input_2d).into_raw()).await,
             &expected_2d,
@@ -6113,8 +6017,7 @@ async fn test_autograd_layer_layer_norm_from_inference_roundtrip() {
             1e-5,
         );
         let expected_axis = flatten(inference_axis.forward::<3, 2, _>(&raw_input)).await;
-        let layer_axis =
-            layers::LayerNormNd::from_inference_over_axis(&graph, &inference_axis, 1);
+        let layer_axis = layers::LayerNormNd::from_inference_over_axis(&graph, &inference_axis, 1);
         assert_slice_close(
             &flatten(layer_axis.forward::<3, 2>(&input).into_raw()).await,
             &expected_axis,
@@ -6135,11 +6038,7 @@ async fn test_autograd_layer_rms_norm_forward_parity() {
             crate::layers::RmsNorm::new(raw_weight.clone(), Some(raw_bias.clone()), 1e-5);
 
         let graph = Graph::new();
-        let layer = layers::RmsNorm::new(
-            graph.leaf(raw_weight),
-            Some(graph.leaf(raw_bias)),
-            1e-5,
-        );
+        let layer = layers::RmsNorm::new(graph.leaf(raw_weight), Some(graph.leaf(raw_bias)), 1e-5);
 
         let input_2d = RawTensor::from_slice(&device, [6, 4], &input_data);
         let expected = flatten(raw_layer.forward(&input_2d)).await;
@@ -6346,10 +6245,8 @@ async fn test_autograd_layer_conv_nd_1d_parameter_gradients() {
             Some(Tensor::from_slice(&graph, &device, [2], &b_data)),
             config,
         );
-        let x = Tensor::constant_from_raw(
-            &graph,
-            RawTensor::from_slice(&device, [1, 3, 5], &x_data),
-        );
+        let x =
+            Tensor::constant_from_raw(&graph, RawTensor::from_slice(&device, [1, 3, 5], &x_data));
         let gradients = layer.forward(&x).flatten_all().sum().backward().unwrap();
         assert!(gradients.get(layer.weight()).is_some());
         assert!(gradients.get(layer.bias().unwrap()).is_some());
@@ -6357,29 +6254,24 @@ async fn test_autograd_layer_conv_nd_1d_parameter_gradients() {
         let fd_device = device.clone();
         let x_fd = x_data.clone();
         let b_fd = b_data;
-        assert_gradient_matches_finite_difference(
-            &device,
-            [2, 3, 2],
-            &w_data,
-            move |graph, w| {
-                let layer = layers::ConvNd::<1, 3>::new(
-                    w,
-                    Some(Tensor::constant_from_raw(
-                        graph,
-                        RawTensor::from_slice(&fd_device, [2], &b_fd),
-                    )),
-                    config,
-                );
-                let x = Tensor::constant_from_raw(
+        assert_gradient_matches_finite_difference(&device, [2, 3, 2], &w_data, move |graph, w| {
+            let layer = layers::ConvNd::<1, 3>::new(
+                w,
+                Some(Tensor::constant_from_raw(
                     graph,
-                    RawTensor::from_slice(&fd_device, [1, 3, 5], &x_fd),
-                );
-                let out = layer.forward(&x);
-                out.mul(&composite_ramp(graph, &fd_device, out.shape()))
-                    .flatten_all()
-                    .sum()
-            },
-        )
+                    RawTensor::from_slice(&fd_device, [2], &b_fd),
+                )),
+                config,
+            );
+            let x = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [1, 3, 5], &x_fd),
+            );
+            let out = layer.forward(&x);
+            out.mul(&composite_ramp(graph, &fd_device, out.shape()))
+                .flatten_all()
+                .sum()
+        })
         .await;
 
         let fd_device = device.clone();
@@ -6507,26 +6399,21 @@ async fn test_autograd_layer_conv_nd_parameter_gradients() {
 
         let fd_device = device.clone();
         let x_fd = x_data.clone();
-        assert_gradient_matches_finite_difference(
-            &device,
-            [4, 2, 2],
-            &w_data,
-            move |graph, w| {
-                let layer = layers::ConvNd::<1, 3>::new(
-                    w,
-                    Some(Tensor::from_slice(graph, &fd_device, [4], &b_data)),
-                    config,
-                );
-                let x = Tensor::constant_from_raw(
-                    graph,
-                    RawTensor::from_slice(&fd_device, [1, 4, 4], &x_fd),
-                );
-                let out = layer.forward(&x);
-                out.mul(&composite_ramp(graph, &fd_device, out.shape()))
-                    .flatten_all()
-                    .sum()
-            },
-        )
+        assert_gradient_matches_finite_difference(&device, [4, 2, 2], &w_data, move |graph, w| {
+            let layer = layers::ConvNd::<1, 3>::new(
+                w,
+                Some(Tensor::from_slice(graph, &fd_device, [4], &b_data)),
+                config,
+            );
+            let x = Tensor::constant_from_raw(
+                graph,
+                RawTensor::from_slice(&fd_device, [1, 4, 4], &x_fd),
+            );
+            let out = layer.forward(&x);
+            out.mul(&composite_ramp(graph, &fd_device, out.shape()))
+                .flatten_all()
+                .sum()
+        })
         .await;
 
         let fd_device = device.clone();
@@ -6629,14 +6516,8 @@ async fn test_train_xor_with_layers() {
         for step in 0..STEPS {
             let graph = Graph::new();
             let x = Tensor::constant_from_raw(&graph, inputs.clone());
-            let layer1 = layers::Linear::new(
-                graph.leaf(w1.clone()),
-                Some(graph.leaf(b1.clone())),
-            );
-            let layer2 = layers::Linear::new(
-                graph.leaf(w2.clone()),
-                Some(graph.leaf(b2.clone())),
-            );
+            let layer1 = layers::Linear::new(graph.leaf(w1.clone()), Some(graph.leaf(b1.clone())));
+            let layer2 = layers::Linear::new(graph.leaf(w2.clone()), Some(graph.leaf(b2.clone())));
 
             let hidden = layer1.forward(&x).relu();
             let logits = layer2.forward(&hidden);

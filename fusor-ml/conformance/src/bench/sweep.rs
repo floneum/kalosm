@@ -372,14 +372,14 @@ pub fn descriptor(case: &str) -> Option<BenchmarkSweepDescriptor> {
             detail: "Fusor fused paired SiLU GEMV against a Burn dense-f32 baseline.",
             sizes: &PAIRED_SILU_SIZES,
         },
-        "flash_attention_small" => BenchmarkSweepDescriptor {
-            case: "flash_attention_small",
+        "attention_small" => BenchmarkSweepDescriptor {
+            case: "attention_small",
             title: "Attention",
             detail: "Scaled dot-product attention across sequence lengths.",
             sizes: &SEQ_SIZES,
         },
-        "flash_attention_causal_small" => BenchmarkSweepDescriptor {
-            case: "flash_attention_causal_small",
+        "attention_causal_small" => BenchmarkSweepDescriptor {
+            case: "attention_causal_small",
             title: "Causal attention",
             detail: "Causal scaled dot-product attention across sequence lengths.",
             sizes: &SEQ_SIZES,
@@ -1103,7 +1103,7 @@ async fn run_webgpu_case(
                 format!("1x1024 @ paired Q4K {}", shape_label(&weight_shape)),
             ))
         }
-        "flash_attention_small" | "flash_attention_causal_small" => {
+        "attention_small" | "attention_causal_small" => {
             let seq_len = size.value;
             let shape = [1usize, 4usize, seq_len, 64usize];
             let q: FusorTensor<4, f32> = FusorTensor::from_slice(
@@ -1126,16 +1126,16 @@ async fn run_webgpu_case(
             let mask: FusorTensor<2, f32> =
                 FusorTensor::from_slice(device, mask_shape, &mask_values);
             materialize_inputs(&[&q, &k, &v]).await;
-            if case == "flash_attention_causal_small" {
+            if case == "attention_causal_small" {
                 materialize_inputs(&[&mask]).await;
             }
             let samples = time_samples(config, || {
-                let mask_arg = if case == "flash_attention_causal_small" {
+                let mask_arg = if case == "attention_causal_small" {
                     Some((&mask, MaskKind::Causal))
                 } else {
                     None
                 };
-                let output = q.flash_attention(&k, &v, 1.0 / (64.0f32).sqrt(), mask_arg);
+                let output = q.attention(&k, &v, 1.0 / (64.0f32).sqrt(), mask_arg);
                 async move {
                     output.materialize().await;
                     Ok(())
@@ -1757,7 +1757,7 @@ async fn run_burn_case(
                 ),
             ))
         }
-        "flash_attention_small" | "flash_attention_causal_small" => {
+        "attention_small" | "attention_causal_small" => {
             let seq_len = size.value;
             let shape = [1usize, 4usize, seq_len, 64usize];
             let q = burn_tensor(
@@ -1786,7 +1786,7 @@ async fn run_burn_case(
                     AttentionModuleOptions {
                         scale: Some(1.0 / (64.0f64).sqrt()),
                         softcap: None,
-                        is_causal: case == "flash_attention_causal_small",
+                        is_causal: case == "attention_causal_small",
                     },
                 );
                 async move { burn_materialize(output).await }

@@ -267,7 +267,7 @@ fn composed_rms_norm_with_bias_resolves_to_fused_kernel() {
 }
 
 #[test]
-fn composed_attention_resolves_to_flash_kernel() {
+fn composed_attention_resolves_to_attention_kernel() {
     pollster::block_on(async {
         let Ok(device) = Device::new().await else {
             return;
@@ -287,11 +287,11 @@ fn composed_attention_resolves_to_flash_kernel() {
         let v = Tensor::from_slice(&device, [1, kv_heads, kv_len, d], &v_data);
         let scale = 1.0 / (d as f32).sqrt();
 
-        let out = q.flash_attention(&k, &v, scale, None);
+        let out = q.attention(&k, &v, scale, None);
         assert_eq!(
             out.count_kernels_to_resolve(),
             1,
-            "gqa decode attention should recognize as one fused flash kernel"
+            "gqa decode attention should recognize as one fused attention kernel"
         );
         let slice = out.as_slice::<4, f32>().await.unwrap();
 

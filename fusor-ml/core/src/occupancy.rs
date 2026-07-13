@@ -196,7 +196,10 @@ mod tests {
     fn baseline_device_clamps() {
         let p = webgpu_baseline();
         assert_eq!(p.preferred_workgroup_lanes(), 256);
-        assert_eq!(p.dynamic_block_buckets().collect::<Vec<_>>(), vec![128, 256]);
+        assert_eq!(
+            p.dynamic_block_buckets().collect::<Vec<_>>(),
+            vec![128, 256]
+        );
     }
 
     #[test]
@@ -204,7 +207,9 @@ mod tests {
         // Subgroup width falls back to 32 → same reduction floor.
         let p = DispatchPolicy::from_parts(64 << 10, 32, 512, 4 << 20);
         assert_eq!(p.min_reduction_lanes(), 64);
-        assert_eq!(p.dynamic_block_buckets().collect::<Vec<_>>(), vec![128, 256, 512]);
+        assert_eq!(
+            p.dynamic_block_buckets().collect::<Vec<_>>(),
+            vec![128, 256, 512]
+        );
     }
-
 }
