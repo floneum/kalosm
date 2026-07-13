@@ -193,6 +193,19 @@ impl Program {
         )
     }
 
+    /// Allocate a rank-1 workgroup-scope scratch array of arbitrary element
+    /// type (vectors included — one load/store moves the whole element).
+    pub fn alloc_workgroup_array_elements(
+        &mut self,
+        element: ElementType,
+        len: u32,
+    ) -> WorkgroupTile {
+        self.alloc_tile(
+            element,
+            Layout::contiguous(MemoryLevel::Workgroup, Shape::new([len])),
+        )
+    }
+
     /// Allocate a rank-1 workgroup-scope scratch array.
     pub fn alloc_workgroup_array(&mut self, element: ScalarElement, len: u32) -> WorkgroupTile {
         self.alloc_tile(

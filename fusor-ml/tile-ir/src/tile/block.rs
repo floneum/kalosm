@@ -274,6 +274,24 @@ impl TileBlock<'_> {
         )
     }
 
+    /// Extract one component of a vector tile.
+    pub fn vector_component(&self, vector: Tile, component: u32) -> Tile {
+        let scalar = match vector.element() {
+            ElementType::Vector { scalar, lanes } => {
+                assert!(component < lanes, "vector component out of range");
+                scalar
+            }
+            other => panic!("vector_component on non-vector element {other:?}"),
+        };
+        Tile::new(
+            ExprKind::VecComponent {
+                vector: vector.into_expr().into(),
+                component,
+            },
+            scalar.element(),
+        )
+    }
+
     /// Compose a `LANES`-wide vector by broadcasting one scalar `value` into
     /// every lane.
     pub fn vector_splat<const LANES: usize>(&self, scalar: ScalarElement, value: Tile) -> Tile {

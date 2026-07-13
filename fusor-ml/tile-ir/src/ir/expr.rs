@@ -278,6 +278,13 @@ pub enum ExprKind {
         /// Number of f32 lanes produced.
         lanes: u32,
     },
+    /// Extract one component of a vector value (naga `AccessIndex`).
+    VecComponent {
+        /// The vector expression.
+        vector: Box<Expr>,
+        /// Component index (< the vector's lane count).
+        component: u32,
+    },
     /// Project lane `lane` out of a `Dequantize` (usually wrapped in `Shared`).
     LaneOf {
         /// The block being projected (a `Dequantize`, typically `Shared`).
@@ -483,6 +490,10 @@ fn hash_kind_into(kind: &ExprKind, h: &mut FxHasher) {
     std::mem::discriminant(kind).hash(h);
     match kind {
         ExprKind::Literal(lit) => lit.hash(h),
+        ExprKind::VecComponent { vector, component } => {
+            hash_kind_into(vector.kind(), h);
+            component.hash(h);
+        }
         ExprKind::Builtin(builtin) => builtin.hash(h),
         ExprKind::LoadLocal(local) => hash_ptr(local, h),
         ExprKind::Load {

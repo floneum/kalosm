@@ -211,6 +211,7 @@ impl Analysis {
         self.note_element(expr.element());
         match expr.kind() {
             ExprKind::Literal(_) => {}
+            ExprKind::VecComponent { vector, .. } => self.visit_expr(vector),
             ExprKind::Builtin(builtin) => match builtin {
                 Builtin::SubgroupId => self.caps.subgroup_id = true,
                 Builtin::SubgroupLane => self.caps.subgroup_lane = true,

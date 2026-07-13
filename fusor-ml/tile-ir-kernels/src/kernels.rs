@@ -11,10 +11,10 @@ mod quantized_matrix;
 
 pub use helpers::AccumCast;
 pub use matmul::{
+    fma_matmul_f32,
     coop_tile_entries, merged_split_k_combine, split_k_combine, try_batched_coop_matmul,
-    try_batched_coop_matmul_split_k, try_merged_coop_matmul, CoopTileEntry, DenseCoopMatmulConfig,
-    DenseCoopMatmulTile, DenseMatmulShape, DenseMatmulTensors,
-};
+    try_batched_coop_matmul_split_k, try_merged_coop_matmul, CoopTileEntry,
+    DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulShape, DenseMatmulTensors,};
 pub use qgemv::{qgemv_with_epilogue, IntoQgemvEpilogues};
 pub use qmatmul::qmatmul_with_epilogue;
 pub use qmatmul_workgroup::{

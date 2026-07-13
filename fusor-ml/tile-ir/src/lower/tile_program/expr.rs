@@ -211,6 +211,17 @@ impl<'a> Lowerer<'a> {
                 let handles = self.lower_dequantize(expressions, body, expr, spill_depth)?;
                 Ok(handles[0])
             }
+            ExprKind::VecComponent { vector, component } => {
+                let base = self.lower_expr_lane(expressions, body, vector, spill_depth + 1)?;
+                Ok(self.emit(
+                    expressions,
+                    body,
+                    Expression::AccessIndex {
+                        base,
+                        index: *component,
+                    },
+                ))
+            }
             ExprKind::LaneOf { block, lane } => {
                 let handles = self.lower_lane_of_block(expressions, body, block, spill_depth)?;
                 handles

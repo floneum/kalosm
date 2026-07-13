@@ -9,16 +9,19 @@ mod grid;
 mod kernels;
 mod types;
 
-pub use dispatch::{qgemv_selected_shape, SubgroupConfig};
+pub use dispatch::{
+    qgemv_selected_shape,
+    SubgroupConfig,
+};
 pub use kernels::{
-    coop_tile_entries, linear_storage_layout, merged_split_k_combine, qgemv_with_epilogue,
+    coop_tile_entries, fma_matmul_f32, linear_storage_layout, qgemv_with_epilogue,
     qgemv_workgroup_f16_with_epilogue, qgemv_workgroup_storage_f16_with_epilogue,
     qgemv_workgroup_with_epilogue, qmatmul_with_epilogue, qmatmul_workgroup_f16_with_epilogues,
     qmatmul_workgroup_storage_f16_with_epilogues, qmatmul_workgroup_with_epilogues,
-    quantized_matrix, quantized_matrix_for, split_k_combine, try_batched_coop_matmul,
-    try_batched_coop_matmul_split_k, try_merged_coop_matmul, AccumCast, CoopTileEntry,
-    DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulShape, DenseMatmulTensors,
-    IntoQgemvEpilogues,
+    merged_split_k_combine, quantized_matrix, quantized_matrix_for, split_k_combine,
+    try_batched_coop_matmul, try_batched_coop_matmul_split_k, try_merged_coop_matmul,
+    AccumCast, CoopTileEntry, DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulShape,
+    DenseMatmulTensors, IntoQgemvEpilogues,
 };
 pub use types::{
     cooperative_store_layout_supported, DenseMatmulEpilogues, QmatmulEpilogues, QmatmulExtra,
