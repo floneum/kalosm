@@ -130,6 +130,18 @@ impl Analysis {
                 self.note_view(dst);
                 self.visit_addr(addr);
             }
+            Stmt::CoopStoreTile {
+                acc,
+                tile,
+                row,
+                col,
+            } => {
+                self.caps.uses_coop = true;
+                self.note_local(acc);
+                self.note_tile(tile);
+                self.visit_expr(row);
+                self.visit_expr(col);
+            }
             Stmt::If {
                 condition,
                 accept,

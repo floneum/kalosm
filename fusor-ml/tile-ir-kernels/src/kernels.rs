@@ -1,5 +1,6 @@
 use fusor_tile_ir::{Layout, MemoryLevel, Shape};
 
+mod attention;
 mod helpers;
 mod matmul;
 mod qgemv;
@@ -9,6 +10,7 @@ mod qmatmul;
 mod qmatmul_workgroup;
 mod quantized_matrix;
 
+pub use attention::{flash_attention_f32, flash_attention_supported, FlashAttentionShape};
 pub use helpers::AccumCast;
 pub use matmul::{
     fma_matmul_f32,

@@ -181,4 +181,18 @@ impl CoopMatrixToken {
     ) {
         program.coop_store(acc, dst, row, col);
     }
+
+    /// Cooperatively store an accumulator into a workgroup tile at
+    /// `(row, col)` — the staging step between fragment math and per-lane
+    /// passes over the same values.
+    pub fn coop_store_tile(
+        self,
+        program: &mut TileBlock<'_>,
+        acc: &CoopAcc,
+        tile: &WorkgroupTile,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
+    ) {
+        program.coop_store_tile(acc, tile, row, col);
+    }
 }

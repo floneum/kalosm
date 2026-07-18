@@ -44,6 +44,12 @@ impl<'a> Lowerer<'a> {
             Stmt::CoopStore { acc, dst, addr } => {
                 self.lower_store_coop_acc(expressions, body, acc, dst, addr)
             }
+            Stmt::CoopStoreTile {
+                acc,
+                tile,
+                row,
+                col,
+            } => self.lower_store_coop_tile(expressions, body, acc, tile, row, col),
             Stmt::If {
                 condition,
                 accept,
@@ -976,6 +982,46 @@ impl<'a> Lowerer<'a> {
             );
             Ok(accept)
         })
+    }
+
+    /// Lower `Stmt::CoopStoreTile` to a `Statement::CooperativeStore` whose
+    /// destination is a workgroup tile — the staging step that lets per-lane
+    /// passes read fragment results. Never routed through per-lane stores.
+    fn lower_store_coop_tile(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        acc: &Local,
+        tile: &Tile,
+        row: &Expr,
+        col: &Expr,
+    ) -> Result<(), LowerError> {
+        // Flush any pending acc SSA so the Load below sees the current value.
+        self.flush_coop_acc_cache(expressions, body);
+        let acc_local = self.private_local(acc)?;
+        let stride_u = Self::row_major_tile_stride(self.tile_layout(tile))?;
+        let row_h = self.lower_expr(expressions, body, row)?;
+        let col_h = self.lower_expr(expressions, body, col)?;
+        let index = self.tile_matrix_index_inline(expressions, body, row_h, col_h, stride_u);
+        let ptr = self.tile_dynamic_pointer(expressions, tile, index, body)?;
+        let stride = self.u32(expressions, stride_u);
+        let acc_ptr = self.local_var(expressions, acc_local);
+        let acc_value = Self::emit_load(expressions, body, acc_ptr);
+        body.push(
+            Statement::CooperativeStore {
+                target: acc_value,
+                data: CooperativeData {
+                    pointer: ptr,
+                    stride,
+                    // Accumulators are transposed internally; workgroup tiles
+                    // are row-major, so the inverted flag is `false` exactly
+                    // as in the row-major global-store case.
+                    row_major: false,
+                },
+            },
+            Span::default(),
+        );
+        Ok(())
     }
 
     /// Lower `Stmt::CoopStore` to a `Statement::CooperativeStore`. Never routed

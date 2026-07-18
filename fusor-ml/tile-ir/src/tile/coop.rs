@@ -177,4 +177,23 @@ impl TileBlock<'_> {
             },
         });
     }
+
+    /// Cooperatively store an accumulator into a workgroup tile at
+    /// `(row, col)` — the staging step between fragment math and per-lane
+    /// passes over the same values. A distinct collective primitive — never
+    /// a per-lane store.
+    pub(crate) fn coop_store_tile(
+        &mut self,
+        acc: &CoopAcc,
+        tile: &WorkgroupTile,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
+    ) {
+        self.push_stmt(Stmt::CoopStoreTile {
+            acc: acc.decl().clone(),
+            tile: tile.decl().clone(),
+            row: boxed_index(row),
+            col: boxed_index(col),
+        });
+    }
 }

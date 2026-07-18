@@ -104,6 +104,19 @@ pub enum Stmt {
         /// Destination address.
         addr: Addr,
     },
+    /// Cooperatively store an accumulator into a workgroup tile at
+    /// `(row, col)` — the staging step between fragment math and per-lane
+    /// passes over the same values (attention's softmax over staged scores).
+    CoopStoreTile {
+        /// Accumulator local.
+        acc: Local,
+        /// Destination workgroup tile.
+        tile: Tile,
+        /// Row coordinate of the fragment origin.
+        row: Box<Expr>,
+        /// Column coordinate of the fragment origin.
+        col: Box<Expr>,
+    },
     /// Per-invocation control flow.
     If {
         /// Bool condition.
