@@ -186,6 +186,10 @@ impl Tile {
     pub fn exp2(self) -> Self {
         self.unary(TileUnaryOp::Exp2)
     }
+    /// Natural logarithm.
+    pub fn log(self) -> Self {
+        self.unary(TileUnaryOp::Log)
+    }
     /// Hyperbolic tangent.
     pub fn tanh(self) -> Self {
         self.unary(TileUnaryOp::Tanh)

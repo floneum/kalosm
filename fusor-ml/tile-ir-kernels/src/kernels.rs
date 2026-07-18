@@ -11,8 +11,10 @@ mod qmatmul_workgroup;
 mod quantized_matrix;
 
 pub use attention::{
-    flash_attention_dispatch, flash_attention_f32, flash_attention_supported,
-    FlashAttentionLayouts, FlashAttentionShape, FlashMaskLayout, FlashOperandLayout,
+    flash_attention_bwd_supported, flash_attention_dispatch, flash_attention_f32,
+    flash_attention_supported, flash_bwd_kv_dispatch, flash_bwd_kv_f32, flash_bwd_q_dispatch,
+    flash_bwd_q_f32, flash_lse_dispatch, flash_lse_f32, FlashAttentionLayouts,
+    FlashAttentionShape, FlashBwdLayouts, FlashMaskLayout, FlashOperandLayout, FlashRowLayout,
 };
 pub use helpers::AccumCast;
 pub use matmul::{
