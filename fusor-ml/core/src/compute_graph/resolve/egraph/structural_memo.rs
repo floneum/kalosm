@@ -9,16 +9,22 @@
 
 use std::hash::Hash;
 
+use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::ExecutionVariant;
 use super::EGraphDriver;
 use super::extract::ExtractState;
-use super::interner::{SpecId, rebind_variant_dependencies, variant_dependencies};
+use super::interner::{
+    PayloadKey, SpecId, TwoLane, local_hash, rebind_variant_dependencies, variant_dependencies,
+};
 use super::lang::Prov;
 use super::rules_fuse::FusionView;
 use crate::DataTypeEnum;
 use crate::compute_graph::NodeIndex;
+use crate::quantized::QMatrix;
+use crate::quantized::embedding::QEmbeddingOperation;
+use crate::quantized::matmul::{ElementwiseEpilogue, QMatMulOperation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct PlanAtomId(u32);
@@ -75,7 +81,7 @@ pub(super) struct PlanInstance {
 }
 
 #[derive(Clone)]
-struct VariantTemplate {
+pub(super) struct VariantTemplate {
     variant: ExecutionVariant,
     dependency_roles: Vec<u32>,
     matrix_role: Option<u32>,
@@ -83,7 +89,7 @@ struct VariantTemplate {
 }
 
 #[derive(Clone)]
-enum PlanDecision {
+pub(super) enum PlanDecision {
     NoRewrite,
     Rewrite(VariantTemplate),
 }
@@ -101,11 +107,242 @@ pub(super) struct PlanSharingStats {
     pub(super) misses: u64,
     pub(super) templates: u64,
     pub(super) negative_templates: u64,
+    /// Per-resolve misses answered by the device-scoped [`FusionPlanStore`].
+    pub(super) store_hits: u64,
+    pub(super) store_misses: u64,
 }
 
-/// Per-resolve memo. It is intentionally not global: device capabilities,
-/// graph liveness and policy are part of a planning decision, while repeated
-/// layers within this resolve are the redundancy we want to remove.
+/// Resolve-independent identity of one planning window: a two-lane
+/// structural hash over the window's atoms and topology. Like
+/// `FlushPlanKey`, the key is trusted without exact verification;
+/// `FUSOR_VERIFY_PLAN_SHARING` regenerates and compares on every hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct WindowKey([u64; 2]);
+
+/// A stored template body with quantized-matrix identity erased. The store
+/// outlives resolves on its device, so entries must hold no [`QMatrix`]: its
+/// buffer Arc would pin dropped weights and its `Device` handle would cycle
+/// the store back to `DeviceInner`. The template's `matrix_role` re-supplies
+/// the concrete matrix at instantiation ([`VariantTemplate::capture`]
+/// asserts one exists for every matrix-carrying variant).
+#[derive(Clone)]
+enum StoredBody {
+    /// Variant kinds that hold no buffer or device handles.
+    Plain(ExecutionVariant),
+    QMatMul(StoredQMatMul),
+    QEmbedding(StoredQEmbedding),
+}
+
+#[derive(Clone)]
+struct StoredQMatMul {
+    input_datatype: DataTypeEnum,
+    input: NodeIndex,
+    in_shape: Box<[usize]>,
+    out_shape: Box<[usize]>,
+    pre_element_wise_expr: Option<ElementwiseEpilogue>,
+    post_element_wise_expr: Option<ElementwiseEpilogue>,
+    post_accumulator_offsets: Box<[u32]>,
+}
+
+#[derive(Clone)]
+struct StoredQEmbedding {
+    indexes: NodeIndex,
+    out_shape: Box<[usize]>,
+    datatype: DataTypeEnum,
+}
+
+impl StoredBody {
+    fn capture(variant: &ExecutionVariant) -> Self {
+        match variant {
+            ExecutionVariant::QMatMul(op) => {
+                let QMatMulOperation {
+                    input_datatype,
+                    input,
+                    matrix: _,
+                    in_shape,
+                    out_shape,
+                    pre_element_wise_expr,
+                    post_element_wise_expr,
+                    post_accumulator_offsets,
+                } = op.as_ref().clone();
+                StoredBody::QMatMul(StoredQMatMul {
+                    input_datatype,
+                    input,
+                    in_shape,
+                    out_shape,
+                    pre_element_wise_expr,
+                    post_element_wise_expr,
+                    post_accumulator_offsets,
+                })
+            }
+            ExecutionVariant::QEmbedding(op) => {
+                let QEmbeddingOperation {
+                    indexes,
+                    matrix: _,
+                    out_shape,
+                    datatype,
+                } = op.clone();
+                StoredBody::QEmbedding(StoredQEmbedding {
+                    indexes,
+                    out_shape,
+                    datatype,
+                })
+            }
+            ExecutionVariant::Elementwise(_)
+            | ExecutionVariant::Reduce(_)
+            | ExecutionVariant::View(_)
+            | ExecutionVariant::MatMul(_)
+            | ExecutionVariant::RowProgram(_)
+            | ExecutionVariant::Attention(_) => StoredBody::Plain(variant.clone()),
+            ExecutionVariant::Tensor(_)
+            | ExecutionVariant::QMatrix(_)
+            | ExecutionVariant::Assign(_)
+            | ExecutionVariant::Region(_) => {
+                unreachable!("fusion templates never store this variant kind")
+            }
+        }
+    }
+
+    fn rebuild(&self, matrix: Option<QMatrix>) -> ExecutionVariant {
+        match self {
+            StoredBody::Plain(variant) => {
+                debug_assert!(matrix.is_none());
+                variant.clone()
+            }
+            StoredBody::QMatMul(stored) => {
+                let StoredQMatMul {
+                    input_datatype,
+                    input,
+                    in_shape,
+                    out_shape,
+                    pre_element_wise_expr,
+                    post_element_wise_expr,
+                    post_accumulator_offsets,
+                } = stored.clone();
+                ExecutionVariant::QMatMul(Box::new(QMatMulOperation {
+                    input_datatype,
+                    input,
+                    matrix: matrix.expect("stored qmatmul template requires a matrix role"),
+                    in_shape,
+                    out_shape,
+                    pre_element_wise_expr,
+                    post_element_wise_expr,
+                    post_accumulator_offsets,
+                }))
+            }
+            StoredBody::QEmbedding(stored) => {
+                let StoredQEmbedding {
+                    indexes,
+                    out_shape,
+                    datatype,
+                } = stored.clone();
+                ExecutionVariant::QEmbedding(QEmbeddingOperation {
+                    indexes,
+                    matrix: matrix.expect("stored qembedding template requires a matrix role"),
+                    out_shape,
+                    datatype,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct StoredTemplate {
+    body: StoredBody,
+    dependency_roles: Vec<u32>,
+    matrix_role: Option<u32>,
+}
+
+impl StoredTemplate {
+    fn from_template(template: &VariantTemplate) -> Self {
+        Self {
+            body: StoredBody::capture(&template.variant),
+            dependency_roles: template.dependency_roles.clone(),
+            matrix_role: template.matrix_role,
+        }
+    }
+
+    fn instantiate(&self, instance: &PlanInstance, view: &FusionView<'_>) -> ExecutionVariant {
+        let matrix = self.matrix_role.map(|role| {
+            let inner = instance.nodes[role as usize];
+            matrix_of(
+                view.variant_of(inner)
+                    .expect("stored template matrix role must have a selected variant"),
+            )
+            .expect("stored template matrix role must remain quantized")
+            .clone()
+        });
+        let mut variant = self.body.rebuild(matrix);
+        let dependencies = self
+            .dependency_roles
+            .iter()
+            .map(|&role| instance.nodes[role as usize])
+            .collect::<Vec<_>>();
+        rebind_variant_dependencies(&mut variant, &dependencies);
+        variant
+    }
+}
+
+#[derive(Clone)]
+enum StoredDecision {
+    NoRewrite,
+    Rewrite(StoredTemplate),
+}
+
+/// Entries are individually cheap to regenerate; the cap only guards
+/// runaway unique structure, so eviction is a wholesale reset.
+const FUSION_PLAN_STORE_CAP: usize = 4096;
+
+/// Device-scoped fusion-plan decisions keyed by [`WindowKey`], shared across
+/// resolves: the first resolve to plan a window pays generation, every later
+/// isomorphic window on the device — next training step, next decode token —
+/// instantiates the stored template. Templates are matrix-free (see
+/// [`StoredBody`]) and every hit still re-validates kills and switch cost
+/// against live state, exactly like intra-resolve sharing.
+#[derive(Default)]
+pub(crate) struct FusionPlanStore {
+    decisions: Mutex<FxHashMap<WindowKey, StoredDecision>>,
+}
+
+impl FusionPlanStore {
+    /// `None`: no stored decision. `Some(None)`: stored no-rewrite.
+    /// `Some(Some(variant))`: stored template instantiated for `instance`.
+    pub(super) fn instantiate(
+        &self,
+        key: WindowKey,
+        instance: &PlanInstance,
+        view: &FusionView<'_>,
+    ) -> Option<Option<ExecutionVariant>> {
+        let decisions = self.decisions.lock();
+        Some(match decisions.get(&key)? {
+            StoredDecision::NoRewrite => None,
+            StoredDecision::Rewrite(template) => Some(template.instantiate(instance, view)),
+        })
+    }
+
+    pub(super) fn record(&self, key: WindowKey, decision: &PlanDecision) {
+        let stored = match decision {
+            PlanDecision::NoRewrite => StoredDecision::NoRewrite,
+            PlanDecision::Rewrite(template) => {
+                StoredDecision::Rewrite(StoredTemplate::from_template(template))
+            }
+        };
+        let mut decisions = self.decisions.lock();
+        if decisions.len() >= FUSION_PLAN_STORE_CAP && !decisions.contains_key(&key) {
+            tracing::debug!(
+                "fusion plan store reached {FUSION_PLAN_STORE_CAP} unique windows; resetting"
+            );
+            decisions.clear();
+        }
+        decisions.entry(key).or_insert(stored);
+    }
+}
+
+/// Per-resolve memo. Liveness facts and read counts are part of every window
+/// key, so repeated layers within this resolve share plans while windows
+/// with different liveness never conflate. Per-resolve misses fall through
+/// to the device-scoped [`FusionPlanStore`].
 pub(super) struct FusionPlanMemo {
     atoms: Vec<PlanAtom>,
     atom_ids: FxHashMap<PlanAtom, PlanAtomId>,
@@ -179,22 +416,84 @@ impl FusionPlanMemo {
         instance: &PlanInstance,
         view: &FusionView<'_>,
         result: Option<&ExecutionVariant>,
+    ) -> &PlanDecision {
+        if !self.decisions.contains_key(&instance.root) {
+            let decision = match result {
+                None => {
+                    self.stats.negative_templates += 1;
+                    PlanDecision::NoRewrite
+                }
+                Some(variant) => {
+                    let template = VariantTemplate::capture(variant, instance, view);
+                    self.stats.templates += 1;
+                    PlanDecision::Rewrite(template)
+                }
+            };
+            self.decisions.insert(instance.root, decision);
+        }
+        &self.decisions[&instance.root]
+    }
+
+    pub(super) fn note_store_hit(&mut self) {
+        self.stats.store_hits += 1;
+    }
+
+    pub(super) fn note_store_miss(&mut self) {
+        self.stats.store_misses += 1;
+    }
+
+    /// Resolve-independent identity of one planning window. Per-resolve
+    /// `SpecId`s are replaced by their stable structural spec keys; roles,
+    /// facts, layouts and topology hash in exactly the interned content, so
+    /// equal keys reproduce equal role numbering on both sides.
+    pub(super) fn window_key(&self, root: StructuralId, driver: &EGraphDriver) -> WindowKey {
+        let mut lanes = TwoLane::new();
+        let mut order: FxHashMap<StructuralId, u64> = FxHashMap::default();
+        self.hash_window(root, driver, &mut lanes, &mut order);
+        WindowKey(lanes.finish().0)
+    }
+
+    fn hash_window(
+        &self,
+        id: StructuralId,
+        driver: &EGraphDriver,
+        lanes: &mut TwoLane,
+        order: &mut FxHashMap<StructuralId, u64>,
     ) {
-        if self.decisions.contains_key(&instance.root) {
+        if let Some(&back) = order.get(&id) {
+            // Shared subterm: a back-reference, disjoint from the kind tags.
+            lanes.write_u64(u64::MAX);
+            lanes.write_u64(back);
             return;
         }
-        let decision = match result {
-            None => {
-                self.stats.negative_templates += 1;
-                PlanDecision::NoRewrite
+        order.insert(id, order.len() as u64);
+        let node = &self.nodes[id.0 as usize];
+        let atom = &self.atoms[node.atom.0 as usize];
+        lanes.write_u64(atom.role as u64);
+        match atom.kind {
+            PlanNodeKind::Operator(spec) => {
+                lanes.write_u64(0);
+                let PayloadKey(words) = driver.egraph.analysis.payloads.spec_key(spec);
+                lanes.write_u64(words[0]);
+                lanes.write_u64(words[1]);
             }
-            Some(variant) => {
-                let template = VariantTemplate::capture(variant, instance, view);
-                self.stats.templates += 1;
-                PlanDecision::Rewrite(template)
-            }
-        };
-        self.decisions.insert(instance.root, decision);
+            PlanNodeKind::Tensor => lanes.write_u64(1),
+            PlanNodeKind::Boundary => lanes.write_u64(2),
+            PlanNodeKind::Missing => lanes.write_u64(3),
+            PlanNodeKind::Frontier => lanes.write_u64(4),
+        }
+        lanes.write_u64(local_hash(|hasher| {
+            atom.matrix_alias.hash(hasher);
+            atom.layout.hash(hasher);
+            atom.reads.hash(hasher);
+            atom.cached.hash(hasher);
+            atom.externally_live.hash(hasher);
+            atom.is_target.hash(hasher);
+        }));
+        lanes.write_u64(node.children.len() as u64);
+        for &child in node.children.iter() {
+            self.hash_window(child, driver, lanes, order);
+        }
     }
 
     pub(super) fn stats(&self) -> PlanSharingStats {
@@ -533,6 +832,127 @@ mod tests {
                 assert_eq!(stats.templates, 1);
                 assert_eq!(stats.hits, 1);
             });
+        });
+    }
+
+    #[test]
+    fn plan_store_shares_templates_across_resolves() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            for step in 0..2u32 {
+                let input =
+                    Tensor::new::<f32, 1, _>(&device, &[step as f32, 2.0, 3.0, 4.0]);
+                let out = (&input + 1.0) * 2.0;
+                let targets = [out.data().key];
+                device.compute_graph().with_mut(|graph| {
+                    let mut resolver = Resolver::new_batch(graph, targets.to_vec());
+                    for &target in &targets {
+                        resolver.build_execution_graph(graph, target);
+                    }
+                    let driver = EGraphDriver::ingest(&resolver, graph);
+                    let state = ExtractState::new(&driver);
+                    let ctx = FusionCtx {
+                        graph,
+                        layouts: std::cell::RefCell::new(Default::default()),
+                    };
+                    let view = FusionView::new(&driver, &state, &ctx);
+                    let prov = driver.prov_of[&targets[0]];
+                    let mut memo = FusionPlanMemo::default();
+                    let instance = memo.capture(&driver, &state, &view, prov);
+                    let key = memo.window_key(instance.root, &driver);
+                    let store = device.fusion_plan_store();
+                    let fresh = view
+                        .generate_candidates(prov)
+                        .into_iter()
+                        .next()
+                        .expect("chain fuses");
+                    match store.instantiate(key, &instance, &view) {
+                        None => {
+                            assert_eq!(step, 0, "second resolve must hit the store");
+                            let decision = memo.record(&instance, &view, Some(&fresh));
+                            store.record(key, decision);
+                        }
+                        Some(Some(rebound)) => {
+                            assert_eq!(step, 1, "first resolve cannot hit an empty store");
+                            let (
+                                ExecutionVariant::Elementwise(rebound),
+                                ExecutionVariant::Elementwise(fresh),
+                            ) = (rebound, fresh)
+                            else {
+                                panic!("unexpected variant kinds");
+                            };
+                            assert_eq!(rebound, fresh);
+                            assert!(rebound.inputs.iter().all(|input| {
+                                instance.role_of.contains_key(input)
+                            }));
+                        }
+                        Some(None) => panic!("no-rewrite stored for a fusible window"),
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn plan_store_rebinds_weights_across_resolves() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let weights = [dense_qmatrix(&device, 0.25), dense_qmatrix(&device, 0.5)];
+            for step in 0..2usize {
+                let activation = Tensor::new::<f32, 2, _>(
+                    &device,
+                    &[vec![1.0 + step as f32, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0]],
+                );
+                let out = activation.q_mat_mul(&weights[step]);
+                let targets = [out.data().key];
+                device.compute_graph().with_mut(|graph| {
+                    let mut resolver = Resolver::new_batch(graph, targets.to_vec());
+                    for &target in &targets {
+                        resolver.build_execution_graph(graph, target);
+                    }
+                    resolver.recognize_contractions(graph);
+                    let mut driver = EGraphDriver::ingest(&resolver, graph);
+                    let state = ExtractState::from_execution(&mut driver, &resolver);
+                    let ctx = FusionCtx {
+                        graph,
+                        layouts: std::cell::RefCell::new(Default::default()),
+                    };
+                    let view = FusionView::new(&driver, &state, &ctx);
+                    let prov = driver.prov_of[&targets[0]];
+                    let mut memo = FusionPlanMemo::default();
+                    let instance = memo.capture(&driver, &state, &view, prov);
+                    let key = memo.window_key(instance.root, &driver);
+                    let store = device.fusion_plan_store();
+                    match store.instantiate(key, &instance, &view) {
+                        None => {
+                            assert_eq!(step, 0, "second resolve must hit the store");
+                            let variant = view.variant_of(targets[0]).unwrap().clone();
+                            let decision = memo.record(&instance, &view, Some(&variant));
+                            store.record(key, decision);
+                        }
+                        Some(Some(ExecutionVariant::QMatMul(rebound))) => {
+                            assert_eq!(step, 1, "first resolve cannot hit an empty store");
+                            assert!(std::sync::Arc::ptr_eq(
+                                rebound.matrix.buffer(),
+                                weights[1].buffer()
+                            ));
+                            assert!(!std::sync::Arc::ptr_eq(
+                                rebound.matrix.buffer(),
+                                weights[0].buffer()
+                            ));
+                            assert_eq!(rebound.input, activation.data().key);
+                        }
+                        other => panic!(
+                            "unexpected stored decision (step {step}, some={})",
+                            other.is_some()
+                        ),
+                    }
+                });
+            }
         });
     }
 

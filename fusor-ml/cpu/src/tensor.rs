@@ -1082,6 +1082,7 @@ where
 pub trait Scalar: Copy {}
 
 impl Scalar for f32 {}
+impl Scalar for half::f16 {}
 impl Scalar for f64 {}
 impl Scalar for i8 {}
 impl Scalar for i16 {}

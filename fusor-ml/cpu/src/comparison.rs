@@ -175,6 +175,45 @@ macro_rules! impl_all_comparisons {
 
 impl_all_comparisons!(f32, f64, i8, i16, i32, i64, u8, u16, u32, u64);
 
+// f16 comparisons through the single-lane scalar wrapper, mirroring the f16
+// pairwise ops: pulp has no native f16 SIMD.
+macro_rules! impl_f16_comparison_op {
+    ($op:ty, $cmp:expr) => {
+        impl SimdBinaryOp<half::f16> for $op {
+            #[inline(always)]
+            fn apply_simd_vec<S: Simd>(
+                _simd: S,
+                a: crate::F16Scalar,
+                b: crate::F16Scalar,
+            ) -> crate::F16Scalar {
+                let cmp: fn(half::f16, half::f16) -> bool = $cmp;
+                crate::F16Scalar(if cmp(a.0, b.0) {
+                    half::f16::ONE
+                } else {
+                    half::f16::ZERO
+                })
+            }
+
+            #[inline(always)]
+            fn apply_scalar(a: half::f16, b: half::f16) -> half::f16 {
+                let cmp: fn(half::f16, half::f16) -> bool = $cmp;
+                if cmp(a, b) {
+                    half::f16::ONE
+                } else {
+                    half::f16::ZERO
+                }
+            }
+        }
+    };
+}
+
+impl_f16_comparison_op!(EqOp, |a, b| a == b);
+impl_f16_comparison_op!(NeOp, |a, b| a != b);
+impl_f16_comparison_op!(LtOp, |a, b| a < b);
+impl_f16_comparison_op!(LteOp, |a, b| a <= b);
+impl_f16_comparison_op!(GtOp, |a, b| a > b);
+impl_f16_comparison_op!(GteOp, |a, b| a >= b);
+
 // Comparison tensor expression types
 define_tensor_op!(@binary Eq, EqOp);
 define_tensor_op!(@binary Ne, NeOp);

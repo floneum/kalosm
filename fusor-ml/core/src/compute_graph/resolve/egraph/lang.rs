@@ -189,6 +189,30 @@ impl FusorLang {
 }
 
 impl Language for FusorLang {
+    /// Everything `matches` compares below the children: variant, leaf
+    /// allocation, payload, and observation identity for effectful nodes.
+    /// Discriminant equality must coincide with `matches`.
+    type Discriminant = (
+        std::mem::Discriminant<FusorLang>,
+        Option<AllocationId>,
+        Option<PayloadId>,
+        Option<Prov>,
+    );
+
+    fn discriminant(&self) -> Self::Discriminant {
+        let allocation = match self {
+            Self::TensorLeaf(_, allocation)
+            | Self::Boundary(_, allocation)
+            | Self::QMatrixLeaf(_, allocation, _) => Some(*allocation),
+            _ => None,
+        };
+        let prov = match self {
+            Self::Assign(prov, _, _) | Self::Region(prov, _, _) => Some(*prov),
+            _ => None,
+        };
+        (std::mem::discriminant(self), allocation, self.payload(), prov)
+    }
+
     fn matches(&self, other: &Self) -> bool {
         use FusorLang::*;
         match (self, other) {

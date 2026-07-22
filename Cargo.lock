@@ -4209,16 +4209,18 @@ dependencies = [
 
 [[package]]
 name = "egg"
-version = "0.9.5"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96beaf9d35dbc4686bc86a4ecb851fd6a406f0bf32d9f646b1225a5c5cf5b5d7"
+checksum = "dd40cfd4196d7a8f882ace95d623d4d6734588e502b4e188675a7c2f55eb4fb4"
 dependencies = [
  "env_logger",
- "fxhash",
- "hashbrown 0.12.3",
- "indexmap 1.9.3",
- "instant",
+ "hashbrown 0.15.5",
+ "indexmap 2.14.0",
  "log",
+ "num-bigint",
+ "num-traits",
+ "quanta",
+ "rustc-hash 2.1.2",
  "smallvec 1.15.1",
  "symbol_table",
  "symbolic_expressions",
@@ -4763,7 +4765,6 @@ dependencies = [
  "fusor-types",
  "futures-channel",
  "half",
- "instant",
  "lru 0.14.0",
  "parking_lot",
  "petgraph 0.8.3",
@@ -6208,18 +6209,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "instant"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0242819d153cba4b4b05a5a8f2a7e9bbf97b6055b2a002b395c96b5ff3c0222"
-dependencies = [
- "cfg-if",
- "js-sys",
- "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
 name = "interpolate_name"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7389,7 +7378,6 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "29.0.3"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#c4f55cabaadc22b942c1dd8894bf85f17f2718dc"
 dependencies = [
  "arrayvec",
  "bit-set 0.9.1",
@@ -8720,6 +8708,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "quanta"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3ab5a9d756f0d97bdc89019bd2e4ea098cf9cde50ee7564dde6b81ccc8f06c7"
+dependencies = [
+ "crossbeam-utils",
+ "libc",
+ "once_cell",
+ "raw-cpuid",
+ "wasi",
+ "web-sys",
+ "winapi",
 ]
 
 [[package]]
@@ -10740,12 +10743,13 @@ dependencies = [
 
 [[package]]
 name = "symbol_table"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32bf088d1d7df2b2b6711b06da3471bc86677383c57b27251e18c56df8deac14"
+checksum = "f19bffd69fb182e684d14e3c71d04c0ef33d1641ac0b9e81c712c734e83703bc"
 dependencies = [
- "ahash 0.7.8",
- "hashbrown 0.12.3",
+ "crossbeam-utils",
+ "foldhash 0.1.5",
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
@@ -12364,7 +12368,6 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "wgpu"
 version = "29.0.3"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#c4f55cabaadc22b942c1dd8894bf85f17f2718dc"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.0",
@@ -12393,7 +12396,6 @@ dependencies = [
 [[package]]
 name = "wgpu-core"
 version = "29.0.3"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#c4f55cabaadc22b942c1dd8894bf85f17f2718dc"
 dependencies = [
  "arrayvec",
  "bit-set 0.9.1",
@@ -12425,7 +12427,6 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-apple"
 version = "29.0.3"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#c4f55cabaadc22b942c1dd8894bf85f17f2718dc"
 dependencies = [
  "wgpu-hal",
 ]
@@ -12433,7 +12434,6 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-emscripten"
 version = "29.0.3"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#c4f55cabaadc22b942c1dd8894bf85f17f2718dc"
 dependencies = [
  "wgpu-hal",
 ]
@@ -12441,7 +12441,6 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-windows-linux-android"
 version = "29.0.3"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#c4f55cabaadc22b942c1dd8894bf85f17f2718dc"
 dependencies = [
  "wgpu-hal",
 ]
@@ -12449,7 +12448,6 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "29.0.3"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#c4f55cabaadc22b942c1dd8894bf85f17f2718dc"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -12502,7 +12500,6 @@ dependencies = [
 [[package]]
 name = "wgpu-naga-bridge"
 version = "29.0.3"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#c4f55cabaadc22b942c1dd8894bf85f17f2718dc"
 dependencies = [
  "naga",
  "wgpu-types",
@@ -12511,7 +12508,6 @@ dependencies = [
 [[package]]
 name = "wgpu-types"
 version = "29.0.3"
-source = "git+https://github.com/ealmloff/wgpu?branch=yield-now#c4f55cabaadc22b942c1dd8894bf85f17f2718dc"
 dependencies = [
  "bitflags 2.13.0",
  "bytemuck",

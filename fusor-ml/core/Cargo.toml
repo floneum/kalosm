@@ -20,7 +20,7 @@ tracing = "0.1.41"
 lru = { version = "0.14.0", default-features = false }
 pollster = "0.4.0"
 petgraph = { version = "0.8.3", features = ["stable_graph", "std"], default-features = false }
-egg = { version = "0.9", default-features = false }
+egg = { version = "0.11", default-features = false }
 fusor-tile-ir = { workspace = true }
 fusor-tile-ir-kernels = { workspace = true }
 fusor-tile-ir-runtime = { workspace = true }
@@ -41,9 +41,6 @@ wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["webgpu"] }
-# egg's Runner calls Instant::now(); the wasm-bindgen feature makes the
-# transitive `instant` dependency functional on wasm32-unknown-unknown.
-instant = { version = "0.1", features = ["wasm-bindgen"] }
 
 [features]
 default = []

@@ -17,6 +17,10 @@ pub struct KernelIr {
     pub block: u32,
     /// Program statements.
     pub(crate) body: Vec<Stmt>,
+    /// The backend supports the workgroup-alias extension (proved by a
+    /// device token at build time): mixed-stride tiles may pack into one
+    /// byte arena instead of per-type regions.
+    pub(crate) byte_arena: bool,
 }
 
 impl Default for KernelIr {
@@ -26,6 +30,7 @@ impl Default for KernelIr {
             grid: [1, 1, 1],
             block: 0,
             body: Vec::new(),
+            byte_arena: false,
         }
     }
 }
@@ -34,6 +39,27 @@ impl KernelIr {
     /// Lower this IR into a validated Naga module.
     pub fn lower_to_naga(&self) -> Result<NagaKernel, LowerError> {
         crate::lower::lower_to_naga(self)
+    }
+
+    /// Total workgroup (threadgroup) memory this kernel allocates, in bytes.
+    ///
+    /// The residency input for occupancy-aware selection: Apple Silicon keeps
+    /// two workgroups per core resident only while a kernel's footprint stays
+    /// at or below half the 32 KB threadgroup budget.
+    pub fn workgroup_bytes(&self) -> u64 {
+        crate::lower::workgroup_bytes(self)
+    }
+
+    /// Top-level barrier insertions that would shrink the workgroup
+    /// footprint, best first. The caller owns the policy: apply one only
+    /// when the saving buys an occupancy class worth the barrier's cost.
+    pub fn barrier_suggestions(&self) -> Vec<crate::BarrierSuggestion> {
+        crate::analysis::barrier_suggestions(self)
+    }
+
+    /// Insert the suggested barrier.
+    pub fn apply_barrier_suggestion(&mut self, suggestion: &crate::BarrierSuggestion) {
+        crate::analysis::apply_barrier_suggestion(self, suggestion);
     }
 }
 

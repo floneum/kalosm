@@ -5,7 +5,7 @@ use std::{
 
 use fusor_tile_ir::{CoopMatrixToken, SubgroupToken};
 use fusor_tile_ir_kernels::SubgroupConfig;
-use fusor_tile_ir_runtime::{BufferPool, KernelCache};
+use fusor_tile_ir_runtime::{BufferPool, FusorConfig, KernelCache};
 use wgpu::{BackendOptions, Dx12BackendOptions};
 
 use crate::{
@@ -37,10 +37,9 @@ fn poll_until_queue_empty(device: &wgpu::Device) -> Result<wgpu::PollStatus, wgp
 async fn select_adapter(
     instance: &wgpu::Instance,
     backends: wgpu::Backends,
+    desired_adapter_name: Option<&str>,
 ) -> Result<wgpu::Adapter, crate::Error> {
-    let desired_adapter_name = std::env::var("WGPU_ADAPTER_NAME")
-        .ok()
-        .map(|name| name.to_ascii_lowercase());
+    let desired_adapter_name = desired_adapter_name.map(|name| name.to_ascii_lowercase());
 
     let mut adapters = instance.enumerate_adapters(backends).await;
     if let Some(desired_adapter_name) = desired_adapter_name {
@@ -55,7 +54,7 @@ async fn select_adapter(
             })
             .ok_or_else(|| {
                 crate::Error::msg(format!(
-                    "WGPU_ADAPTER_NAME={desired_adapter_name:?} did not match any available adapter"
+                    "adapter name {desired_adapter_name:?} (WGPU_ADAPTER_NAME) did not match any available adapter"
                 ))
             });
     }
@@ -138,6 +137,7 @@ fn install_device_diagnostics(device: &wgpu::Device) {
 
 struct DeviceInner {
     device: Arc<wgpu::Device>,
+    config: Arc<FusorConfig>,
     adapter: wgpu::Adapter,
     /// Cached `adapter.get_info()` / `adapter.limits()`. These are constant for
     /// the device's lifetime; re-querying them per kernel build (every op, every
@@ -152,6 +152,9 @@ struct DeviceInner {
     /// plans, replayed by `flush_all_pending`. Lives here beside the kernel
     /// cache so it is reachable under the compute-graph write lock.
     flush_plan_cache: crate::compute_graph::FlushPlanCache,
+    /// Structural fusion-plan decisions shared across resolves; templates are
+    /// matrix-free so nothing here pins buffers or cycles back to this inner.
+    fusion_plan_store: crate::compute_graph::FusionPlanStore,
     cooperative_matrix_caps: CooperativeMatrixCaps,
     compute_graph: OnceLock<ComputeGraph>,
     /// When set, this device reports `subgroups_supported() == false` so kernel
@@ -204,10 +207,12 @@ impl Device {
         let device = src.device.clone();
         let queue = src.queue.clone();
         let adapter = src.adapter.clone();
-        let kernel_cache = KernelCache::new(device.clone(), &adapter);
-        let buffer_pool = BufferPool::new(device.clone(), queue.clone());
+        let config = src.config.clone();
+        let kernel_cache = KernelCache::new(device.clone(), &adapter, config.clone());
+        let buffer_pool = BufferPool::new(device.clone(), queue.clone(), &config);
         let inner = Arc::new(DeviceInner {
             device,
+            config,
             adapter,
             adapter_info: src.adapter_info.clone(),
             limits: src.limits.clone(),
@@ -215,6 +220,7 @@ impl Device {
             kernel_cache,
             buffer_pool,
             flush_plan_cache: Default::default(),
+            fusion_plan_store: Default::default(),
             cooperative_matrix_caps: src.cooperative_matrix_caps,
             compute_graph: OnceLock::new(),
             disable_subgroups,
@@ -251,6 +257,13 @@ impl Device {
     }
 
     pub async fn new() -> Result<Self, crate::Error> {
+        Self::new_with_config(FusorConfig::from_env()).await
+    }
+
+    /// Construct a device with an explicit [`FusorConfig`] instead of reading
+    /// the process environment.
+    pub async fn new_with_config(config: FusorConfig) -> Result<Self, crate::Error> {
+        let config = Arc::new(config);
         let dx_compiler = wgpu::Dx12Compiler::from_env().unwrap_or_default();
         let backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -264,7 +277,7 @@ impl Device {
             },
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
-        let adapter = select_adapter(&instance, backends).await?;
+        let adapter = select_adapter(&instance, backends, config.adapter_name.as_deref()).await?;
         let adapter_features = adapter.features();
         #[cfg(target_arch = "wasm32")]
         {
@@ -286,7 +299,7 @@ impl Device {
         if adapter_features.contains(wgpu::Features::SHADER_F16) {
             required_features |= wgpu::Features::SHADER_F16;
         }
-        if std::env::var_os("FUSOR_TRACE_GPU_KERNELS").is_some() {
+        if config.trace_gpu_kernels {
             if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
                 required_features |= wgpu::Features::TIMESTAMP_QUERY;
                 if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
@@ -306,6 +319,11 @@ impl Device {
                 // SAFETY: cooperative matrix is an experimental feature that requires opting in
                 features = unsafe { wgpu::ExperimentalFeatures::enabled() };
             }
+            if adapter_features.contains(wgpu::Features::EXPERIMENTAL_WORKGROUP_MEMORY_ALIAS) {
+                required_features |= wgpu::Features::EXPERIMENTAL_WORKGROUP_MEMORY_ALIAS;
+                // SAFETY: same experimental opt-in as cooperative matrix.
+                features = unsafe { wgpu::ExperimentalFeatures::enabled() };
+            }
             features
         };
         #[cfg(target_arch = "wasm32")]
@@ -320,9 +338,7 @@ impl Device {
             required_features,
             &cooperative_matrix_properties,
         );
-        if std::env::var_os("FUSOR_TRACE_GPU_KERNELS").is_some()
-            && !cooperative_matrix_properties.is_empty()
-        {
+        if config.trace_gpu_kernels && !cooperative_matrix_properties.is_empty() {
             tracing::info!(
                 "Fusor cooperative matrix properties: {cooperative_matrix_properties:?}"
             );
@@ -343,8 +359,8 @@ impl Device {
         let device = Arc::new(device);
         let queue = Arc::new(queue);
 
-        let kernel_cache = KernelCache::new(device.clone(), &adapter);
-        let buffer_pool = BufferPool::new(device.clone(), queue.clone());
+        let kernel_cache = KernelCache::new(device.clone(), &adapter, config.clone());
+        let buffer_pool = BufferPool::new(device.clone(), queue.clone(), &config);
 
         // Capability simulation is explicit through derived test devices;
         // production always reflects the adapter's reported subgroup support.
@@ -355,6 +371,7 @@ impl Device {
         let limits = adapter.limits();
         let inner = Arc::new(DeviceInner {
             device,
+            config,
             adapter,
             adapter_info,
             limits,
@@ -362,6 +379,7 @@ impl Device {
             kernel_cache,
             buffer_pool,
             flush_plan_cache: Default::default(),
+            fusion_plan_store: Default::default(),
             cooperative_matrix_caps,
             compute_graph: OnceLock::new(),
             disable_subgroups,
@@ -548,6 +566,15 @@ impl Device {
         Some(CoopMatrixToken::new_unchecked())
     }
 
+    /// Proof that the backend can alias workgroup tiles into one byte arena
+    /// (the Metal workgroup-alias extension): mixed-stride tiles then pack
+    /// at byte offsets instead of separate typed allocations.
+    pub(crate) fn byte_arena_token(&self) -> Option<fusor_tile_ir::ByteArenaToken> {
+        self.features()
+            .contains(wgpu::Features::EXPERIMENTAL_WORKGROUP_MEMORY_ALIAS)
+            .then(fusor_tile_ir::ByteArenaToken::new_unchecked)
+    }
+
     pub fn wgpu_adapter(&self) -> &wgpu::Adapter {
         &self.inner.adapter
     }
@@ -578,8 +605,17 @@ impl Device {
         &self.inner.kernel_cache
     }
 
+    /// The process configuration this device was constructed with.
+    pub fn config(&self) -> &FusorConfig {
+        &self.inner.config
+    }
+
     pub(crate) fn flush_plan_cache(&self) -> &crate::compute_graph::FlushPlanCache {
         &self.inner.flush_plan_cache
+    }
+
+    pub(crate) fn fusion_plan_store(&self) -> &crate::compute_graph::FusionPlanStore {
+        &self.inner.fusion_plan_store
     }
 
     /// Reset the initialized flag on all cached buffers.

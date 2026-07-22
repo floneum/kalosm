@@ -45,7 +45,7 @@ impl<'a> Lowerer<'a> {
             ExprKind::LoadTile { tile, index } => {
                 let index = self.lower_expr_lane(expressions, body, index, spill_depth)?;
                 let ptr = self.tile_dynamic_pointer(expressions, tile, index, body)?;
-                Ok(Self::emit_load(expressions, body, ptr))
+                Ok(self.load_tile_value(expressions, body, tile, ptr))
             }
             ExprKind::LoadLocal(local) => {
                 // Coop accumulators chain through the acc-value SSA memo: a live

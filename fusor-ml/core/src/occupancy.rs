@@ -40,6 +40,10 @@ pub(crate) struct DispatchPolicy {
     /// Hardware cap on one workgroup's invocations.
     max_workgroup_lanes: u32,
     last_level_cache_bytes: u64,
+    /// Hardware cap on one workgroup's shared-memory bytes
+    /// (`max_compute_workgroup_storage_size`: 16 KB WebGPU baseline, 32 KB
+    /// on Apple silicon).
+    max_workgroup_storage_bytes: u32,
 }
 
 impl DispatchPolicy {
@@ -57,6 +61,7 @@ impl DispatchPolicy {
                 .max_compute_workgroup_size_x
                 .min(limits.max_compute_invocations_per_workgroup),
             device.last_level_cache_bytes(),
+            limits.max_compute_workgroup_storage_size,
         )
     }
 
@@ -65,12 +70,14 @@ impl DispatchPolicy {
         subgroup_width: u32,
         max_workgroup_lanes: u32,
         last_level_cache_bytes: u64,
+        max_workgroup_storage_bytes: u32,
     ) -> Self {
         Self {
             saturation_lanes: saturation_lanes.max(1),
             subgroup_width: subgroup_width.max(1),
             max_workgroup_lanes: max_workgroup_lanes.max(1),
             last_level_cache_bytes,
+            max_workgroup_storage_bytes,
         }
     }
 
@@ -82,6 +89,11 @@ impl DispatchPolicy {
     /// Hardware cap on one workgroup's invocations.
     pub(crate) fn max_workgroup_lanes(&self) -> u32 {
         self.max_workgroup_lanes
+    }
+
+    /// Hardware cap on one workgroup's shared-memory bytes.
+    pub(crate) fn max_workgroup_storage_bytes(&self) -> u32 {
+        self.max_workgroup_storage_bytes
     }
 
     /// The device-parallelism floor (see [`crate::Device::saturation_lanes`]).
@@ -160,12 +172,12 @@ mod tests {
 
     /// Apple-silicon Metal: 32-wide subgroups, 1024-lane workgroups.
     fn apple() -> DispatchPolicy {
-        DispatchPolicy::from_parts(64 << 10, 32, 1024, 8 << 20)
+        DispatchPolicy::from_parts(64 << 10, 32, 1024, 8 << 20, 32 << 10)
     }
 
     /// WebGPU baseline limits: 256-lane workgroups.
     fn webgpu_baseline() -> DispatchPolicy {
-        DispatchPolicy::from_parts(64 << 10, 32, 256, 4 << 20)
+        DispatchPolicy::from_parts(64 << 10, 32, 256, 4 << 20, 16 << 10)
     }
 
     /// The derived values must reproduce the constants the kernels were
@@ -205,7 +217,7 @@ mod tests {
     #[test]
     fn no_subgroup_device_floors() {
         // Subgroup width falls back to 32 → same reduction floor.
-        let p = DispatchPolicy::from_parts(64 << 10, 32, 512, 4 << 20);
+        let p = DispatchPolicy::from_parts(64 << 10, 32, 512, 4 << 20, 32 << 10);
         assert_eq!(p.min_reduction_lanes(), 64);
         assert_eq!(
             p.dynamic_block_buckets().collect::<Vec<_>>(),

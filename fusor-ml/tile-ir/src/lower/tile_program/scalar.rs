@@ -137,13 +137,7 @@ impl<'a> Lowerer<'a> {
             Statement::ControlBarrier(Barrier::WORK_GROUP),
             Span::default(),
         );
-        body.push(
-            Statement::Store {
-                pointer: lane_ptr,
-                value,
-            },
-            Span::default(),
-        );
+        self.store_tile_value(expressions, body, scratch_tile, lane_ptr, value);
         body.push(
             Statement::ControlBarrier(Barrier::WORK_GROUP),
             Span::default(),
@@ -196,7 +190,7 @@ impl<'a> Lowerer<'a> {
 
         let result_ptr =
             self.tile_dynamic_pointer(expressions, scratch_tile, result_index, body)?;
-        Ok(Self::emit_load(expressions, body, result_ptr))
+        Ok(self.load_tile_value(expressions, body, scratch_tile, result_ptr))
     }
 
     fn lower_reduce_step(
@@ -211,20 +205,14 @@ impl<'a> Lowerer<'a> {
         let rhs_index = self.add_literal_u32_emitted(expressions, lane, stride, &mut body);
         let lhs_ptr = self.tile_dynamic_pointer(expressions, scratch_tile, lane, &mut body)?;
         let rhs_ptr = self.tile_dynamic_pointer(expressions, scratch_tile, rhs_index, &mut body)?;
-        let lhs = Self::emit_load(expressions, &mut body, lhs_ptr);
-        let rhs = Self::emit_load(expressions, &mut body, rhs_ptr);
+        let lhs = self.load_tile_value(expressions, &mut body, scratch_tile, lhs_ptr);
+        let rhs = self.load_tile_value(expressions, &mut body, scratch_tile, rhs_ptr);
         let reduced = self.emit(
             expressions,
             &mut body,
             Self::tile_reduce_expression(op, lhs, rhs),
         );
-        body.push(
-            Statement::Store {
-                pointer: lhs_ptr,
-                value: reduced,
-            },
-            Span::default(),
-        );
+        self.store_tile_value(expressions, &mut body, scratch_tile, lhs_ptr, reduced);
         Ok(body)
     }
 

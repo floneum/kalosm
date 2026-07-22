@@ -78,6 +78,10 @@ fn check_golden_structural(name: &str, ir: &KernelIr) {
     let lowered = lower_or_fail(ir, name);
     let serialized = format!("{:#?}", lowered.module());
     let path = golden_dir().join(format!("{name}.txt"));
+    if std::env::var_os("FUSOR_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&path, &serialized)
+            .unwrap_or_else(|error| panic!("writing {}: {error}", path.display()));
+    }
     let expected = std::fs::read_to_string(&path)
         .unwrap_or_else(|_| panic!("golden snapshot missing: {}", path.display()));
     assert_eq!(

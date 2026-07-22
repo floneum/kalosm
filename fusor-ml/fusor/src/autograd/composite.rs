@@ -3,13 +3,50 @@ use fusor_types::SlidingWindow;
 
 use super::*;
 
-impl<const R: usize> Tensor<R> {
+impl<const R: usize, T: AutogradElement> Tensor<R, T>
+where
+    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
+{
     fn softmax_composite<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
         crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<f32>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+        <crate::gpu::Tensor<R, T> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, T>>,
+        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
     {
         let input_shape = self.shape();
         let max_values = self.max_keepdim_any::<OUT_RANK>(axis);
@@ -23,29 +60,29 @@ impl<const R: usize> Tensor<R> {
 
     fn rms_norm_composite<const W: usize, const OUT_RANK: usize>(
         &self,
-        weight: &Tensor<W>,
-        bias: Option<&Tensor<W>>,
+        weight: &Tensor<W, T>,
+        bias: Option<&Tensor<W, T>>,
         eps: f32,
     ) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
     {
         self.layer_norm_composite::<W, OUT_RANK>(weight, bias, eps, false)
     }
 
     fn layer_norm_composite<const W: usize, const OUT_RANK: usize>(
         &self,
-        weight: &Tensor<W>,
-        bias: Option<&Tensor<W>>,
+        weight: &Tensor<W, T>,
+        bias: Option<&Tensor<W, T>>,
         eps: f32,
         remove_mean: bool,
     ) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
     {
         let centered = if remove_mean {
             let mean = self.mean_keepdim_any::<OUT_RANK>(R - 1);
@@ -66,10 +103,13 @@ impl<const R: usize> Tensor<R> {
 
     pub fn softmax<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
         crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<f32>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+        <crate::gpu::Tensor<R, T> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, T>>,
+        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
     {
         if axis == R - 1 {
             // Fused forward with composite replay backward: fewer kernels, same math.
@@ -80,69 +120,80 @@ impl<const R: usize> Tensor<R> {
 
     pub fn softmax_last_dim<const OUT_RANK: usize>(&self) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
         crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<f32>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+        <crate::gpu::Tensor<R, T> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, T>>,
+        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
     {
         self.softmax::<OUT_RANK>(R - 1)
     }
 
     pub fn softmax_slow<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
         crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<f32>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+        <crate::gpu::Tensor<R, T> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, T>>,
+        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
     {
         self.softmax::<OUT_RANK>(axis)
     }
 
     pub fn softmax_slow_last_dim<const OUT_RANK: usize>(&self) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
         crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<f32>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+        <crate::gpu::Tensor<R, T> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, T>>,
+        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
     {
         self.softmax_slow::<OUT_RANK>(R - 1)
     }
 
     pub fn layer_norm<const OUT_RANK: usize>(
         &self,
-        weight: &Tensor<R>,
-        bias: Option<&Tensor<R>>,
+        weight: &Tensor<R, T>,
+        bias: Option<&Tensor<R, T>>,
         eps: f32,
         remove_mean: bool,
     ) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
     {
         self.layer_norm_composite::<R, OUT_RANK>(weight, bias, eps, remove_mean)
     }
 
-    pub fn rms_norm<const OUT_RANK: usize>(&self, weight: &Tensor<R>, eps: f32) -> Self
+    pub fn rms_norm<const OUT_RANK: usize>(&self, weight: &Tensor<R, T>, eps: f32) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
     {
         self.rms_norm_composite::<R, OUT_RANK>(weight, None, eps)
     }
 
     pub fn softmax_last_dim_fused<const OUT_RANK: usize>(&self) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
+        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
         crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<f32>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LastRankInner,
+        <crate::gpu::Tensor<R, T> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, T>>,
     {
         let value = self
             .value
-            .softmax_last_dim_fused::<OUT_RANK>()
+            .softmax_last_dim::<OUT_RANK>()
             .into_concrete();
         // Analytic softmax backward: dS = P * (dP - rowsum(dP * P)).
         // The product inside the row sum is written inline so the reduce
@@ -159,21 +210,24 @@ impl<const R: usize> Tensor<R> {
 
     pub fn rms_norm_fused<const W: usize, const OUT_RANK: usize>(
         &self,
-        weight: &Tensor<W>,
-        bias: Option<&Tensor<W>>,
+        weight: &Tensor<W, T>,
+        bias: Option<&Tensor<W, T>>,
         eps: f32,
     ) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
+        <crate::gpu::Tensor<R, T> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, T>>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+        crate::MulOp: crate::cpu::SimdBinaryOp<T>,
+        crate::DivOp: crate::cpu::SimdBinaryOp<T>,
+        crate::AddOp: crate::cpu::SimdBinaryOp<T>,
+        crate::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+        (crate::gpu::Tensor<R, T>, crate::gpu::Tensor<W, T>): crate::gpu::MaxRank<R, T>,
+        T: crate::CastTensor<f32>,
+        f32: crate::CastTensor<T>,
         crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        <crate::gpu::Tensor<R, f32> as crate::gpu::LastRankInner>::LastRank:
-            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, f32>>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
-        crate::MulOp: crate::cpu::SimdBinaryOp<f32>,
-        crate::DivOp: crate::cpu::SimdBinaryOp<f32>,
-        crate::AddOp: crate::cpu::SimdBinaryOp<f32>,
-        crate::SqrtOp: crate::cpu::SimdUnaryOp<f32>,
-        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<W, f32>): crate::gpu::MaxRank<R, f32>,
     {
         let value = self.value.rms_norm_fused::<W, OUT_RANK>(
             &weight.value,
@@ -199,20 +253,23 @@ impl<const R: usize> Tensor<R> {
 
     pub fn rms_norm_fused_no_bias<const W: usize, const OUT_RANK: usize>(
         &self,
-        weight: &Tensor<W>,
+        weight: &Tensor<W, T>,
         eps: f32,
     ) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
+        <crate::gpu::Tensor<R, T> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, T>>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+        crate::MulOp: crate::cpu::SimdBinaryOp<T>,
+        crate::DivOp: crate::cpu::SimdBinaryOp<T>,
+        crate::AddOp: crate::cpu::SimdBinaryOp<T>,
+        crate::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+        (crate::gpu::Tensor<R, T>, crate::gpu::Tensor<W, T>): crate::gpu::MaxRank<R, T>,
+        T: crate::CastTensor<f32>,
+        f32: crate::CastTensor<T>,
         crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        <crate::gpu::Tensor<R, f32> as crate::gpu::LastRankInner>::LastRank:
-            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, f32>>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
-        crate::MulOp: crate::cpu::SimdBinaryOp<f32>,
-        crate::DivOp: crate::cpu::SimdBinaryOp<f32>,
-        crate::AddOp: crate::cpu::SimdBinaryOp<f32>,
-        crate::SqrtOp: crate::cpu::SimdUnaryOp<f32>,
-        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<W, f32>): crate::gpu::MaxRank<R, f32>,
     {
         self.rms_norm_fused::<W, OUT_RANK>(weight, None, eps)
     }
@@ -220,21 +277,24 @@ impl<const R: usize> Tensor<R> {
     pub fn rms_norm_residual_fused<const W: usize, const OUT_RANK: usize>(
         &self,
         residual: &Self,
-        weight: &Tensor<W>,
-        bias: Option<&Tensor<W>>,
+        weight: &Tensor<W, T>,
+        bias: Option<&Tensor<W, T>>,
         eps: f32,
     ) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
+        <crate::gpu::Tensor<R, T> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, T>>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+        crate::MulOp: crate::cpu::SimdBinaryOp<T>,
+        crate::DivOp: crate::cpu::SimdBinaryOp<T>,
+        crate::AddOp: crate::cpu::SimdBinaryOp<T>,
+        crate::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+        (crate::gpu::Tensor<R, T>, crate::gpu::Tensor<W, T>): crate::gpu::MaxRank<R, T>,
+        T: crate::CastTensor<f32>,
+        f32: crate::CastTensor<T>,
         crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        <crate::gpu::Tensor<R, f32> as crate::gpu::LastRankInner>::LastRank:
-            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, f32>>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
-        crate::MulOp: crate::cpu::SimdBinaryOp<f32>,
-        crate::DivOp: crate::cpu::SimdBinaryOp<f32>,
-        crate::AddOp: crate::cpu::SimdBinaryOp<f32>,
-        crate::SqrtOp: crate::cpu::SimdUnaryOp<f32>,
-        (crate::gpu::Tensor<R, f32>, crate::gpu::Tensor<W, f32>): crate::gpu::MaxRank<R, f32>,
     {
         let value = self.value.rms_norm_residual_fused::<W, OUT_RANK, _>(
             &residual.value,
@@ -273,29 +333,31 @@ impl<const R: usize> Tensor<R> {
 
     pub fn layer_norm_last_dim_fused<const OUT_RANK: usize, const W: usize>(
         &self,
-        weight: &Tensor<W>,
-        bias: Option<&Tensor<W>>,
+        weight: &Tensor<W, T>,
+        bias: Option<&Tensor<W, T>>,
         eps: f32,
     ) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LastRank<OUT_RANK, f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
-        <crate::gpu::Tensor<R, f32> as crate::gpu::LastRankInner>::LastRank:
-            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, f32>>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<f32>,
-        crate::AddOp: crate::cpu::SimdBinaryOp<f32>,
-        crate::SubOp: crate::cpu::SimdBinaryOp<f32>,
-        crate::MulOp: crate::cpu::SimdBinaryOp<f32>,
-        crate::DivOp: crate::cpu::SimdBinaryOp<f32>,
-        crate::SqrtOp: crate::cpu::SimdUnaryOp<f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
+        <crate::gpu::Tensor<R, T> as crate::gpu::LastRankInner>::LastRank:
+            crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, T>>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+        crate::AddOp: crate::cpu::SimdBinaryOp<T>,
+        crate::SubOp: crate::cpu::SimdBinaryOp<T>,
+        crate::MulOp: crate::cpu::SimdBinaryOp<T>,
+        crate::DivOp: crate::cpu::SimdBinaryOp<T>,
+        crate::SqrtOp: crate::cpu::SimdUnaryOp<T>,
     {
-        let value = self.value.layer_norm_last_dim_fused::<OUT_RANK, W, _, _>(
-            &weight.value,
-            bias.as_ref().map(|bias| &bias.value),
-            eps,
-        );
         let mut param_shape = [1usize; R];
         param_shape[R - 1] = self.shape()[R - 1];
+        let weight_row = weight.value.reshape(param_shape);
+        let weight_b = weight_row.broadcast_as(self.shape());
+        let bias_row = bias.map(|bias| bias.value.reshape(param_shape));
+        let bias_b = bias_row.as_ref().map(|bias| bias.broadcast_as(self.shape()));
+        let value =
+            self.value
+                .layer_norm::<OUT_RANK, _, _>(&weight_b, bias_b.as_ref(), T::from_f32(eps), true);
 
         let input_id = self.handle.id;
         let weight_id = weight.handle.id;
@@ -307,7 +369,7 @@ impl<const R: usize> Tensor<R> {
         // instead of saved from the forward pass so the forward chain stays
         // exclusively consumed (and therefore fusable into one row program).
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let dy = downcast_tensor::<R>(&*gradient, "layer_norm_last_dim_fused")?;
+            let dy = downcast_tensor::<R, T>(&*gradient, "layer_norm_last_dim_fused")?;
             let shape = input_value.shape();
             let n = shape[R - 1];
             let rows: usize = shape.iter().take(R - 1).product();
@@ -319,7 +381,7 @@ impl<const R: usize> Tensor<R> {
                 .sqr()
                 .into_concrete()
                 .mean_keepdim::<OUT_RANK>(R - 1);
-            let std = var.add_scalar(eps).sqrt().into_concrete();
+            let std = var.add_scalar(T::from_f32(eps)).sqrt().into_concrete();
             let xhat = (&centered / &std.broadcast_as(shape)).into_concrete();
 
             let weight_row = weight_value.reshape(param_shape).into_concrete();
@@ -395,17 +457,17 @@ impl<const R: usize> Tensor<R> {
         kernel: [usize; DIFF],
         padding: [usize; DIFF],
         strides: [usize; DIFF],
-    ) -> Tensor<2>
+    ) -> Tensor<2, T>
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LargerRank<R2, DIFF, f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LargerRank<R2, DIFF, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LargerRank<DIFF, R2, T>,
     {
         let input_shape = self.shape();
         let spatial_start = R - DIFF;
         let output_shape = Self::conv_output_shape(input_shape, 0, kernel, padding, strides);
         let windows: [SlidingWindow; DIFF] =
             std::array::from_fn(|i| SlidingWindow::new(spatial_start + i, kernel[i], strides[i]));
-        let windows: Tensor<R2> = self.pad_spatial(padding).sliding_window_view(windows);
+        let windows: Tensor<R2, T> = self.pad_spatial(padding).sliding_window_view(windows);
         let permutation: [usize; R2] = std::array::from_fn(|index| {
             if index == 0 {
                 0
@@ -428,12 +490,12 @@ impl<const R: usize> Tensor<R> {
     /// Reshape the `(batch * out_spatial, out_channels)` matmul output back to
     /// `(batch, out_channels, ...out_spatial)` and add the broadcast bias.
     fn conv_reassemble<const DIFF: usize>(
-        output: Tensor<2>,
-        bias: Option<&Tensor<1>>,
+        output: Tensor<2, T>,
+        bias: Option<&Tensor<1, T>>,
         output_shape: [usize; R],
     ) -> Self {
         let out_channels = output_shape[1];
-        let output: Tensor<R> = output.reshape(std::array::from_fn(|axis| {
+        let output: Tensor<R, T> = output.reshape(std::array::from_fn(|axis| {
             if axis == 0 {
                 output_shape[0]
             } else if axis <= DIFF {
@@ -463,14 +525,14 @@ impl<const R: usize> Tensor<R> {
 
     fn conv_composite<const WEIGHT_RANK: usize, const DIFF: usize, const R2: usize>(
         &self,
-        weight: &Tensor<WEIGHT_RANK>,
-        bias: Option<&Tensor<1>>,
+        weight: &Tensor<WEIGHT_RANK, T>,
+        bias: Option<&Tensor<1, T>>,
         padding: [usize; DIFF],
         strides: [usize; DIFF],
     ) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LargerRank<R2, DIFF, f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LargerRank<R2, DIFF, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LargerRank<DIFF, R2, T>,
     {
         assert_eq!(
             R,
@@ -502,14 +564,14 @@ impl<const R: usize> Tensor<R> {
 
     pub fn conv<const WEIGHT_RANK: usize, const DIFF: usize, const R2: usize>(
         &self,
-        weight: &Tensor<WEIGHT_RANK>,
-        bias: Option<&Tensor<1>>,
+        weight: &Tensor<WEIGHT_RANK, T>,
+        bias: Option<&Tensor<1, T>>,
         padding: [usize; DIFF],
         strides: [usize; DIFF],
     ) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LargerRank<R2, DIFF, f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LargerRank<R2, DIFF, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LargerRank<DIFF, R2, T>,
     {
         let value = self.value.conv::<WEIGHT_RANK, DIFF, R2>(
             &weight.value,
@@ -536,15 +598,15 @@ impl<const R: usize> Tensor<R> {
 
     fn grouped_conv_composite<const WEIGHT_RANK: usize, const DIFF: usize, const R2: usize>(
         &self,
-        weight: &Tensor<WEIGHT_RANK>,
-        bias: Option<&Tensor<1>>,
+        weight: &Tensor<WEIGHT_RANK, T>,
+        bias: Option<&Tensor<1, T>>,
         padding: [usize; DIFF],
         strides: [usize; DIFF],
         groups: usize,
     ) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LargerRank<R2, DIFF, f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LargerRank<R2, DIFF, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LargerRank<DIFF, R2, T>,
     {
         assert_eq!(R, 2 + DIFF);
         let input_shape = self.shape();
@@ -585,15 +647,15 @@ impl<const R: usize> Tensor<R> {
 
     pub fn grouped_conv<const WEIGHT_RANK: usize, const DIFF: usize, const R2: usize>(
         &self,
-        weight: &Tensor<WEIGHT_RANK>,
-        bias: Option<&Tensor<1>>,
+        weight: &Tensor<WEIGHT_RANK, T>,
+        bias: Option<&Tensor<1, T>>,
         padding: [usize; DIFF],
         strides: [usize; DIFF],
         groups: usize,
     ) -> Self
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LargerRank<R2, DIFF, f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LargerRank<R2, DIFF, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LargerRank<DIFF, R2, T>,
     {
         let value = self.value.grouped_conv::<WEIGHT_RANK, DIFF, R2>(
             &weight.value,
@@ -627,8 +689,42 @@ impl<const R: usize> Tensor<R> {
     }
 }
 
-impl Tensor<4> {
-    fn rotate_half(&self) -> Tensor<4> {
+impl<T: AutogradElement> Tensor<4, T>
+where
+    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
+{
+    fn rotate_half(&self) -> Tensor<4, T> {
         let [batch, heads, sequence_length, embed] = self.shape();
         let half = embed / 2;
         let first_half = self.narrow(3, 0, half);
@@ -646,7 +742,7 @@ impl Tensor<4> {
         )
     }
 
-    fn rope_interleaved_composite(&self, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<4> {
+    fn rope_interleaved_composite(&self, cos: &Tensor<2, T>, sin: &Tensor<2, T>) -> Tensor<4, T> {
         assert_same_graph(self, cos);
         assert_same_graph(self, sin);
 
@@ -675,7 +771,7 @@ impl Tensor<4> {
             .flatten_last_n::<1, 4>()
     }
 
-    pub fn rope(&self, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<4> {
+    pub fn rope(&self, cos: &Tensor<2, T>, sin: &Tensor<2, T>) -> Tensor<4, T> {
         assert_same_graph(self, cos);
         assert_same_graph(self, sin);
 
@@ -699,25 +795,85 @@ impl Tensor<4> {
         self.mul(&cos).add(&rotated.mul(&sin))
     }
 
-    pub fn rope_interleaved(&self, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<4> {
+    pub fn rope_interleaved(&self, cos: &Tensor<2, T>, sin: &Tensor<2, T>) -> Tensor<4, T> {
         self.rope_interleaved_composite(cos, sin)
     }
 
     pub fn attention(
         &self,
-        k: &Tensor<4>,
-        v: &Tensor<4>,
+        k: &Tensor<4, T>,
+        v: &Tensor<4, T>,
         scale: f32,
-        mask: Option<(&RawTensor<2, f32>, MaskKind)>,
-    ) -> Tensor<4> {
+        mask: Option<(&RawTensor<2, T>, MaskKind)>,
+    ) -> Tensor<4, T> {
         let value = self.value.attention(&k.value, &v.value, scale, mask);
         let mask_value = mask.map(|(mask, kind)| (mask.clone(), kind));
+        // The explicit rule recomputes probabilities from the forward output
+        // and its row log-sum-exp, so no probability matrix survives into
+        // the graph and pattern recognition can stream every piece.
+        // Grouped-query, batch-key-masked, and CPU shapes replay the
+        // composite as before.
+        let explicit = self.shape()[1] == k.shape()[1]
+            && matches!(&self.value, RawTensor::Gpu(_))
+            && !matches!(mask, Some((_, MaskKind::BatchKeyMask)));
+        if explicit {
+            let q_id = self.handle.id;
+            let k_id = k.handle.id;
+            let v_id = v.handle.id;
+            let q_value = self.value.clone();
+            let k_value = k.value.clone();
+            let v_value = v.value.clone();
+            let o_value = value.clone();
+            let backward: BackwardRule = Arc::new(move |gradient| {
+                let grad = downcast_tensor::<4, T>(&*gradient, "attention")?;
+                let (
+                    RawTensor::Gpu(q),
+                    RawTensor::Gpu(k),
+                    RawTensor::Gpu(v),
+                    RawTensor::Gpu(o),
+                    RawTensor::Gpu(grad),
+                ) = (&q_value, &k_value, &v_value, &o_value, &grad)
+                else {
+                    return Err(Error::msg("attention gradient expects GPU tensors"));
+                };
+                let causal = matches!(mask_value, Some((_, MaskKind::Causal)));
+                let mask_gpu = match &mask_value {
+                    Some((RawTensor::Gpu(mask), MaskKind::QKMask)) => Some(mask),
+                    Some((_, MaskKind::QKMask)) => {
+                        return Err(Error::msg("attention mask must be a GPU tensor"));
+                    }
+                    _ => None,
+                };
+                let lse = q.attention_lse(k, scale, mask_gpu, causal);
+                let (dq, dk, dv) =
+                    q.attention_grads(k, v, o, grad, &lse, scale, mask_gpu, causal);
+                Ok(vec![
+                    BackwardTarget {
+                        node: q_id,
+                        gradient: Box::new(RawTensor::Gpu(dq)),
+                    },
+                    BackwardTarget {
+                        node: k_id,
+                        gradient: Box::new(RawTensor::Gpu(dk)),
+                    },
+                    BackwardTarget {
+                        node: v_id,
+                        gradient: Box::new(RawTensor::Gpu(dv)),
+                    },
+                ])
+            });
+            return self.emit_op(
+                value,
+                vec![self.handle.clone(), k.handle.clone(), v.handle.clone()],
+                Some(backward),
+            );
+        }
         self.replay_ternary(k, v, "attention", value, move |q, k, v| {
             q.attention_composite(&k, &v, scale, mask_value.as_ref())
         })
     }
 
-    pub fn rope_fused(&self, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<4> {
+    pub fn rope_fused(&self, cos: &Tensor<2, T>, sin: &Tensor<2, T>) -> Tensor<4, T> {
         assert_same_graph(self, cos);
         assert_same_graph(self, sin);
 
@@ -730,7 +886,7 @@ impl Tensor<4> {
         })
     }
 
-    pub fn rope_normal_fused(&self, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<4> {
+    pub fn rope_normal_fused(&self, cos: &Tensor<2, T>, sin: &Tensor<2, T>) -> Tensor<4, T> {
         assert_same_graph(self, cos);
         assert_same_graph(self, sin);
 
@@ -746,9 +902,9 @@ impl Tensor<4> {
     pub fn rope_pair_fused(
         &self,
         k: &Self,
-        cos: &Tensor<2>,
-        sin: &Tensor<2>,
-    ) -> (Tensor<4>, Tensor<4>) {
+        cos: &Tensor<2, T>,
+        sin: &Tensor<2, T>,
+    ) -> (Tensor<4, T>, Tensor<4, T>) {
         let (q_value, k_value) = self.value.rope_pair_fused(&k.value, &cos.value, &sin.value);
         (
             self.replay_ternary(
@@ -771,9 +927,9 @@ impl Tensor<4> {
     pub fn rope_normal_pair_fused(
         &self,
         k: &Self,
-        cos: &Tensor<2>,
-        sin: &Tensor<2>,
-    ) -> (Tensor<4>, Tensor<4>) {
+        cos: &Tensor<2, T>,
+        sin: &Tensor<2, T>,
+    ) -> (Tensor<4, T>, Tensor<4, T>) {
         let (q_value, k_value) = self
             .value
             .rope_normal_pair_fused(&k.value, &cos.value, &sin.value);
@@ -795,43 +951,7 @@ impl Tensor<4> {
         )
     }
 
-    fn rope_cache_tables(
-        &self,
-        cache: &crate::RopeCache,
-        start_pos: usize,
-    ) -> (Tensor<2>, Tensor<2>) {
-        let seq_len = self.shape()[2];
-        let graph = self.graph();
-        let table = |table: RawTensor<2, f32>| {
-            Tensor::constant_from_raw(&graph, table.narrow(0, start_pos, seq_len).into_concrete())
-        };
-        (table(cache.cos().clone()), table(cache.sin().clone()))
-    }
-
-    /// Autograd companion of [`crate::RopeCache::forward`]: applies normal
-    /// RoPE to `self` (q) and `k` from the cache's tables at `start_pos`.
-    pub fn rope_cache_forward(
-        &self,
-        k: &Self,
-        cache: &crate::RopeCache,
-        start_pos: usize,
-    ) -> (Tensor<4>, Tensor<4>) {
-        let (cos, sin) = self.rope_cache_tables(cache, start_pos);
-        self.rope_normal_pair_fused(k, &cos, &sin)
-    }
-
-    /// Autograd companion of [`crate::RopeCache::forward_interleaved`].
-    pub fn rope_cache_forward_interleaved(
-        &self,
-        k: &Self,
-        cache: &crate::RopeCache,
-        start_pos: usize,
-    ) -> (Tensor<4>, Tensor<4>) {
-        let (cos, sin) = self.rope_cache_tables(cache, start_pos);
-        self.rope_pair_fused(k, &cos, &sin)
-    }
-
-    pub fn upsample_nearest2d(&self, scale_h: usize, scale_w: usize) -> Tensor<4> {
+    pub fn upsample_nearest2d(&self, scale_h: usize, scale_w: usize) -> Tensor<4, T> {
         let value = self.value.upsample_nearest2d(scale_h, scale_w);
         self.replay_unary("upsample_nearest2d", value, move |input| {
             let [b, c, h, w] = input.shape();
@@ -844,11 +964,11 @@ impl Tensor<4> {
 
     pub(super) fn attention_composite(
         &self,
-        k: &Tensor<4>,
-        v: &Tensor<4>,
+        k: &Tensor<4, T>,
+        v: &Tensor<4, T>,
         scale: f32,
-        mask: Option<&(RawTensor<2, f32>, MaskKind)>,
-    ) -> Tensor<4> {
+        mask: Option<&(RawTensor<2, T>, MaskKind)>,
+    ) -> Tensor<4, T> {
         let q_shape = self.shape();
         let k_shape = k.shape();
         let batch = q_shape[0];
@@ -915,4 +1035,44 @@ impl Tensor<4> {
             .softmax_last_dim::<3>()
             .mat_mul_internal(&v_expanded)
     }
+}
+
+/// RoPE-cache companions stay on f32: [`crate::RopeCache`] holds f32 tables.
+impl Tensor<4> {
+    fn rope_cache_tables(
+        &self,
+        cache: &crate::RopeCache,
+        start_pos: usize,
+    ) -> (Tensor<2>, Tensor<2>) {
+        let seq_len = self.shape()[2];
+        let graph = self.graph();
+        let table = |table: RawTensor<2, f32>| {
+            Tensor::constant_from_raw(&graph, table.narrow(0, start_pos, seq_len).into_concrete())
+        };
+        (table(cache.cos().clone()), table(cache.sin().clone()))
+    }
+
+    /// Autograd companion of [`crate::RopeCache::forward`]: applies normal
+    /// RoPE to `self` (q) and `k` from the cache's tables at `start_pos`.
+    pub fn rope_cache_forward(
+        &self,
+        k: &Self,
+        cache: &crate::RopeCache,
+        start_pos: usize,
+    ) -> (Tensor<4>, Tensor<4>) {
+        let (cos, sin) = self.rope_cache_tables(cache, start_pos);
+        self.rope_normal_pair_fused(k, &cos, &sin)
+    }
+
+    /// Autograd companion of [`crate::RopeCache::forward_interleaved`].
+    pub fn rope_cache_forward_interleaved(
+        &self,
+        k: &Self,
+        cache: &crate::RopeCache,
+        start_pos: usize,
+    ) -> (Tensor<4>, Tensor<4>) {
+        let (cos, sin) = self.rope_cache_tables(cache, start_pos);
+        self.rope_pair_fused(k, &cos, &sin)
+    }
+
 }

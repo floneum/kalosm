@@ -203,6 +203,9 @@ impl Resolver {
             ExecutionVariant::RowProgram(op) => {
                 Some(QueuedOperation::Operation(Arc::new(op.clone())))
             }
+            ExecutionVariant::Attention(op) => {
+                Some(QueuedOperation::Operation(Arc::new(op.clone())))
+            }
             ExecutionVariant::View(op) => Some(QueuedOperation::Operation(Arc::new(op.clone()))),
             ExecutionVariant::Assign(op) => Some(QueuedOperation::Operation(Arc::new(op.clone()))),
             ExecutionVariant::QEmbedding(op) => {

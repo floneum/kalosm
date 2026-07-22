@@ -89,7 +89,7 @@ fn apply_reps(expr: &NaryExpr, reps: &[Rep]) -> NaryExpr {
 
 /// Recover the slice ranges from a candidate slice-assign expression, then
 /// verify the match by regenerating the canonical expression and comparing.
-fn match_slice_assign(nary: &ElementwiseOperation) -> Option<Box<[Range<usize>]>> {
+pub(super) fn match_slice_assign(nary: &ElementwiseOperation) -> Option<Box<[Range<usize>]>> {
     if nary.inputs.len() != 2 {
         return None;
     }

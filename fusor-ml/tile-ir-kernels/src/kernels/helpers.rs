@@ -200,6 +200,33 @@ pub(super) fn coop_load_b_fragments(
         .collect()
 }
 
+/// Cooperatively load `cols` B-role 8x8 fragments of a workgroup tile's
+/// TRANSPOSE: the tile holds the operand row-major and each fragment reads
+/// its transpose, so no staged transpose copy is needed.
+pub(super) fn coop_load_b_fragments_transposed(
+    program: &TileBlock<'_>,
+    coop: CoopMatrixToken,
+    tile: &WorkgroupTile,
+    sg_col_base: &Tile,
+    kk: u32,
+    cols: u32,
+    scalar: ScalarElement,
+) -> Vec<Tile> {
+    (0..cols)
+        .map(|c| {
+            coop.coop_load_b_transposed(
+                program,
+                tile,
+                kk * COOP_DIM,
+                sg_col_base.clone() + c * COOP_DIM,
+                scalar,
+                COOP_DIM,
+                COOP_DIM,
+            )
+        })
+        .collect()
+}
+
 /// Cooperatively load `cols` C-role fragments from a rank-1 column vector,
 /// broadcasting each 8-column slice across the fragment rows.
 pub(super) fn coop_load_c_broadcast_fragments(
@@ -247,9 +274,56 @@ pub(super) fn coop_mma_grid(
 /// 1D-logical workgroup count dispatched as a 3D grid clamped to
 /// `max_per_dim` in each axis. Shared by dense and quantized matmul
 /// dispatch paths.
+/// Clamp a spread grid's overhang workgroup ids to the last valid unit of
+/// work. Cooperative ops require uniform control flow, so an early return
+/// fails naga validation; the clamp is branch-free — overhang workgroups
+/// redundantly recompute the final tile and store identical values, which
+/// is deterministic. Emitted only when the grid over-covers, keeping
+/// exact-grid kernels' IR unchanged.
+pub(super) fn clamp_grid_overhang(
+    program: &mut TileBlock<'_>,
+    id: Tile,
+    total: u32,
+    grid: [u32; 3],
+) -> Tile {
+    let covered = grid[0] as u64 * grid[1] as u64 * grid[2] as u64;
+    if covered == u64::from(total) {
+        return id;
+    }
+    program.bind(id.min(Tile::u32(total - 1)))
+}
+
 pub(super) fn dispatch_grid_1d(total_workgroups: u32, max_per_dim: u32) -> [u32; 3] {
     assert!(total_workgroups > 0, "matmul dispatch must have workgroups");
     assert!(max_per_dim > 0, "max_per_dim must be non-zero");
+    if total_workgroups <= max_per_dim {
+        return [total_workgroups, 1, 1];
+    }
+    // Prefer an exact factorization: tile totals are products of tile-grid
+    // dims and batch, so a divisor at or under the cap almost always exists
+    // (65536 tiles = 256 x 256), and an exact grid needs no overhang clamp.
+    let mut x = max_per_dim;
+    while x > 1 {
+        if total_workgroups.is_multiple_of(x) {
+            let rest = total_workgroups / x;
+            if rest <= max_per_dim {
+                return [x, rest, 1];
+            }
+            let mut y = max_per_dim;
+            while y > 1 {
+                if rest.is_multiple_of(y) && rest / y <= max_per_dim {
+                    return [x, y, rest / y];
+                }
+                y -= 1;
+            }
+        }
+        // Bound the scan: totals this composite always factor quickly; a
+        // pathological near-prime falls through to the covering grid.
+        if max_per_dim - x > 4096 {
+            break;
+        }
+        x -= 1;
+    }
     let x = total_workgroups.min(max_per_dim);
     let y_needed = total_workgroups.div_ceil(x);
     let y = y_needed.min(max_per_dim);

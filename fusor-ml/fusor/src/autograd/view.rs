@@ -5,13 +5,47 @@ use fusor_types::{SlidingWindow, StrideSpec};
 
 use super::*;
 
-impl<const R: usize> Tensor<R> {
-    pub fn reshape<const OUT: usize>(&self, shape: [usize; OUT]) -> Tensor<OUT> {
+impl<const R: usize, T: AutogradElement> Tensor<R, T>
+where
+    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
+{
+    pub fn reshape<const OUT: usize>(&self, shape: [usize; OUT]) -> Tensor<OUT, T> {
         let input_shape = self.shape();
         let value = self.value.reshape(shape).into_concrete();
         let input_id = self.handle.id;
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<OUT>(&*gradient, "reshape")?;
+            let gradient = downcast_tensor::<OUT, T>(&*gradient, "reshape")?;
             Ok(vec![BackwardTarget {
                 node: input_id,
                 gradient: Box::new(gradient.reshape(input_shape).into_concrete()),
@@ -24,7 +58,7 @@ impl<const R: usize> Tensor<R> {
         let value = self.value.transpose(dim0, dim1).into_concrete();
         let input_id = self.handle.id;
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<R>(&*gradient, "transpose")?;
+            let gradient = downcast_tensor::<R, T>(&*gradient, "transpose")?;
             Ok(vec![BackwardTarget {
                 node: input_id,
                 gradient: Box::new(gradient.transpose(dim0, dim1).into_concrete()),
@@ -41,7 +75,7 @@ impl<const R: usize> Tensor<R> {
             inverse[axis] = index;
         }
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<R>(&*gradient, "permute")?;
+            let gradient = downcast_tensor::<R, T>(&*gradient, "permute")?;
             Ok(vec![BackwardTarget {
                 node: input_id,
                 gradient: Box::new(gradient.permute(inverse).into_concrete()),
@@ -55,7 +89,7 @@ impl<const R: usize> Tensor<R> {
         let value = self.value.slice(slices.clone()).into_concrete();
         let input_id = self.handle.id;
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<R>(&*gradient, "slice")?;
+            let gradient = downcast_tensor::<R, T>(&*gradient, "slice")?;
             let zeros = RawTensor::zeros(&gradient.device(), input_shape);
             Ok(vec![BackwardTarget {
                 node: input_id,
@@ -69,12 +103,12 @@ impl<const R: usize> Tensor<R> {
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
-    pub fn broadcast_as<const OUT: usize>(&self, shape: [usize; OUT]) -> Tensor<OUT> {
+    pub fn broadcast_as<const OUT: usize>(&self, shape: [usize; OUT]) -> Tensor<OUT, T> {
         let input_shape = self.shape();
         let value = self.value.broadcast_as(shape).into_concrete();
         let input_id = self.handle.id;
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<OUT>(&*gradient, "broadcast_as")?;
+            let gradient = downcast_tensor::<OUT, T>(&*gradient, "broadcast_as")?;
             let reduced = reduce_broadcast_gradient(gradient, input_shape)?;
             Ok(vec![BackwardTarget {
                 node: input_id,
@@ -84,17 +118,17 @@ impl<const R: usize> Tensor<R> {
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
-    pub fn expand<const OUT: usize>(&self, shape: [usize; OUT]) -> Tensor<OUT> {
+    pub fn expand<const OUT: usize>(&self, shape: [usize; OUT]) -> Tensor<OUT, T> {
         self.broadcast_as(shape)
     }
 
-    pub fn flatten_all(&self) -> Tensor<1> {
+    pub fn flatten_all(&self) -> Tensor<1, T> {
         self.reshape([self.shape().iter().product()])
     }
 
-    pub fn flatten_last_n<const FROM_END: usize, const OUT: usize>(&self) -> Tensor<OUT>
+    pub fn flatten_last_n<const FROM_END: usize, const OUT: usize>(&self) -> Tensor<OUT, T>
     where
-        crate::gpu::Tensor<R, f32>: crate::gpu::SmallerRank<FROM_END, OUT, f32>,
+        crate::gpu::Tensor<R, T>: crate::gpu::SmallerRank<FROM_END, OUT, T>,
     {
         let shape = self.shape();
         let new_shape: [usize; OUT] = std::array::from_fn(|i| {
@@ -109,9 +143,9 @@ impl<const R: usize> Tensor<R> {
         self.reshape(new_shape)
     }
 
-    pub fn flatten_first_n<const FROM_START: usize, const OUT: usize>(&self) -> Tensor<OUT>
+    pub fn flatten_first_n<const FROM_START: usize, const OUT: usize>(&self) -> Tensor<OUT, T>
     where
-        crate::gpu::Tensor<R, f32>: crate::gpu::SmallerRank<FROM_START, OUT, f32>,
+        crate::gpu::Tensor<R, T>: crate::gpu::SmallerRank<FROM_START, OUT, T>,
     {
         let shape = self.shape();
         let new_shape: [usize; OUT] = std::array::from_fn(|i| {
@@ -158,7 +192,7 @@ impl<const R: usize> Tensor<R> {
         let value = self.value.repeat(repeats).into_concrete();
         let input_id = self.handle.id;
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<R>(&*gradient, "repeat")?;
+            let gradient = downcast_tensor::<R, T>(&*gradient, "repeat")?;
             let total: usize = gradient.shape().iter().product();
             let mut flat = gradient.reshape([total]).into_concrete();
             for axis in (0..R).rev() {
@@ -191,7 +225,7 @@ impl<const R: usize> Tensor<R> {
         let copy_shape = std::array::from_fn(|axis| input_shape[axis].min(new_shape[axis]));
         let copy_slices = copy_shape.map(|size| 0..size);
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<R>(&*gradient, "resize")?;
+            let gradient = downcast_tensor::<R, T>(&*gradient, "resize")?;
             let patch = gradient.slice(copy_slices.clone()).into_concrete();
             let zeros = RawTensor::zeros(&gradient.device(), input_shape);
             Ok(vec![BackwardTarget {
@@ -206,13 +240,13 @@ impl<const R: usize> Tensor<R> {
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
-    pub fn restride<const OUT: usize>(&self, specs: [StrideSpec; OUT]) -> Tensor<OUT> {
+    pub fn restride<const OUT: usize>(&self, specs: [StrideSpec; OUT]) -> Tensor<OUT, T> {
         let input_shape = self.shape();
         let value = self.value.restride(specs).into_concrete();
         let input_id = self.handle.id;
         let output_shape: [usize; OUT] = specs.map(|spec| spec.size);
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<OUT>(&*gradient, "restride")?;
+            let gradient = downcast_tensor::<OUT, T>(&*gradient, "restride")?;
             let reduced = reduce_restride_gradient(&gradient, &specs, [0; R], input_shape)
                 .unwrap_or_else(|| {
                     scatter_restride_gradient(
@@ -230,7 +264,7 @@ impl<const R: usize> Tensor<R> {
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
-    pub fn restride_layout<const OUT: usize>(&self, new_layout: Layout) -> Tensor<OUT> {
+    pub fn restride_layout<const OUT: usize>(&self, new_layout: Layout) -> Tensor<OUT, T> {
         assert_eq!(new_layout.rank(), OUT, "restride_layout rank mismatch");
         let input_shape = self.shape();
         let value = self
@@ -241,7 +275,7 @@ impl<const R: usize> Tensor<R> {
         let output_shape: [usize; OUT] = std::array::from_fn(|axis| new_layout.shape()[axis]);
         let input_strides = Layout::continuous_strides(&input_shape);
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<OUT>(&*gradient, "restride_layout")?;
+            let gradient = downcast_tensor::<OUT, T>(&*gradient, "restride_layout")?;
             let reduced = layout_restride_specs(&new_layout, input_shape)
                 .and_then(|(specs, offsets)| {
                     reduce_restride_gradient(&gradient, &specs, offsets, input_shape)
@@ -268,9 +302,9 @@ impl<const R: usize> Tensor<R> {
     pub fn squeeze_dims<const DIFF: usize, const OUT: usize>(
         &self,
         axes: [usize; DIFF],
-    ) -> Tensor<OUT>
+    ) -> Tensor<OUT, T>
     where
-        crate::gpu::Tensor<R, f32>: crate::gpu::SmallerRank<DIFF, OUT, f32>,
+        crate::gpu::Tensor<R, T>: crate::gpu::SmallerRank<DIFF, OUT, T>,
     {
         let shape = self.shape();
         for &axis in &axes {
@@ -299,9 +333,9 @@ impl<const R: usize> Tensor<R> {
     pub fn unsqueeze_dims<const DIFF: usize, const OUT: usize>(
         &self,
         axes: [usize; DIFF],
-    ) -> Tensor<OUT>
+    ) -> Tensor<OUT, T>
     where
-        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, OUT, f32>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LargerRank<DIFF, OUT, T>,
     {
         let shape = self.shape();
         let mut sorted_axes = axes;
@@ -321,16 +355,16 @@ impl<const R: usize> Tensor<R> {
         self.restride(specs)
     }
 
-    pub fn squeeze<const OUT: usize>(&self, dim: usize) -> Tensor<OUT>
+    pub fn squeeze<const OUT: usize>(&self, dim: usize) -> Tensor<OUT, T>
     where
-        crate::gpu::Tensor<R, f32>: crate::gpu::SmallerRank<1, OUT, f32>,
+        crate::gpu::Tensor<R, T>: crate::gpu::SmallerRank<1, OUT, T>,
     {
         self.squeeze_dims::<1, OUT>([dim])
     }
 
-    pub fn unsqueeze<const OUT: usize>(&self, dim: usize) -> Tensor<OUT>
+    pub fn unsqueeze<const OUT: usize>(&self, dim: usize) -> Tensor<OUT, T>
     where
-        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<1, OUT, f32>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LargerRank<1, OUT, T>,
     {
         self.unsqueeze_dims::<1, OUT>([dim])
     }
@@ -338,10 +372,10 @@ impl<const R: usize> Tensor<R> {
     pub fn sliding_window_view<const DIFF: usize, const R2: usize>(
         &self,
         windows: [SlidingWindow; DIFF],
-    ) -> Tensor<R2>
+    ) -> Tensor<R2, T>
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LargerRank<R2, DIFF, f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<DIFF, R2, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LargerRank<R2, DIFF, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LargerRank<DIFF, R2, T>,
     {
         let shape = self.shape();
         let mut sorted_windows = windows;
@@ -400,7 +434,7 @@ impl<const R: usize> Tensor<R> {
             .clone()
             .map(|range| range.end.saturating_sub(range.start));
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<R>(&*gradient, "slice_assign")?;
+            let gradient = downcast_tensor::<R, T>(&*gradient, "slice_assign")?;
             let zeros = RawTensor::zeros(&gradient.device(), slice_shape);
             Ok(vec![
                 BackwardTarget {
@@ -427,10 +461,10 @@ impl<const R: usize> Tensor<R> {
     pub fn stack<const OUT: usize>(
         tensors: impl IntoIterator<Item = Self>,
         dim: usize,
-    ) -> Tensor<OUT>
+    ) -> Tensor<OUT, T>
     where
-        crate::ConcreteTensor<f32, R>: crate::cpu::LargerRank<OUT, 1, f32>,
-        crate::gpu::Tensor<R, f32>: crate::gpu::LargerRank<1, OUT, f32>,
+        crate::ConcreteTensor<T, R>: crate::cpu::LargerRank<OUT, 1, T>,
+        crate::gpu::Tensor<R, T>: crate::gpu::LargerRank<1, OUT, T>,
     {
         let tensors: Vec<Self> = tensors.into_iter().collect();
         assert!(!tensors.is_empty(), "stack requires at least one tensor");
@@ -459,7 +493,7 @@ impl<const R: usize> Tensor<R> {
             .collect::<Vec<_>>();
         let parent_ids = parents.iter().map(|parent| parent.id).collect::<Vec<_>>();
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<OUT>(&*gradient, "stack")?;
+            let gradient = downcast_tensor::<OUT, T>(&*gradient, "stack")?;
             let mut targets = Vec::with_capacity(parent_ids.len());
             for (index, &parent_id) in parent_ids.iter().enumerate() {
                 let slices: [Range<usize>; OUT] = std::array::from_fn(|axis| {
@@ -512,7 +546,7 @@ impl<const R: usize> Tensor<R> {
             })
             .collect::<Vec<_>>();
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<R>(&*gradient, "cat")?;
+            let gradient = downcast_tensor::<R, T>(&*gradient, "cat")?;
             let mut targets = Vec::with_capacity(parent_ids.len());
             for (&parent_id, slice) in parent_ids.iter().zip(slices.iter()) {
                 let ranges: [Range<usize>; R] = std::array::from_fn(|axis| {
@@ -664,12 +698,16 @@ fn group_restride_runs<const IN: usize>(
 /// then fold each axis with [`fold_restride_axis`]. Returns `None` for
 /// restrides that do not factor into per-axis runs; those go through the
 /// host-loop fallback.
-fn reduce_restride_gradient<const IN: usize, const OUT: usize>(
-    gradient: &RawTensor<OUT, f32>,
+fn reduce_restride_gradient<const IN: usize, const OUT: usize, T: AutogradElement>(
+    gradient: &RawTensor<OUT, T>,
     specs: &[StrideSpec],
     base_offsets: [usize; IN],
     input_shape: [usize; IN],
-) -> Option<RawTensor<IN, f32>> {
+) -> Option<RawTensor<IN, T>>
+where
+    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+{
     let output_shape = gradient.shape();
     if input_shape.contains(&0) || output_shape.contains(&0) {
         return None;
@@ -732,8 +770,8 @@ fn reduce_restride_gradient<const IN: usize, const OUT: usize>(
 /// `p` and window element `w`, with the surrounding axes flattened into
 /// `before` and `after` batch extents.
 #[allow(clippy::too_many_arguments)]
-fn fold_restride_axis(
-    flat: RawTensor<1, f32>,
+fn fold_restride_axis<T: AutogradElement>(
+    flat: RawTensor<1, T>,
     before: usize,
     positions: usize,
     step: usize,
@@ -741,12 +779,16 @@ fn fold_restride_axis(
     offset: usize,
     size: usize,
     after: usize,
-) -> RawTensor<1, f32> {
+) -> RawTensor<1, T>
+where
+    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+{
     let fold_len = (positions - 1) * step + window;
     let block = flat
         .reshape([before, positions, window, after])
         .into_concrete();
-    let folded: RawTensor<3, f32> = if positions == 1 {
+    let folded: RawTensor<3, T> = if positions == 1 {
         block.reshape([before, window, after]).into_concrete()
     } else if step >= window {
         // Injective: interleave the windows with zeros and trim the overhang.
@@ -830,12 +872,16 @@ fn layout_restride_specs<const IN: usize>(
 
 /// Host-loop fallback for the restride patterns [`reduce_restride_gradient`]
 /// cannot factor into per-axis runs.
-fn scatter_restride_gradient<const IN: usize, const OUT: usize>(
-    gradient: &RawTensor<OUT, f32>,
+fn scatter_restride_gradient<const IN: usize, const OUT: usize, T: AutogradElement>(
+    gradient: &RawTensor<OUT, T>,
     output_shape: [usize; OUT],
     input_shape: [usize; IN],
     input_index: impl Fn([usize; OUT]) -> [usize; IN],
-) -> RawTensor<IN, f32> {
+) -> RawTensor<IN, T>
+where
+    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+{
     let mut input_gradient = RawTensor::zeros(&gradient.device(), input_shape);
     for_each_index(output_shape, |output_index| {
         let input_index = input_index(output_index);
@@ -856,10 +902,14 @@ fn scatter_restride_gradient<const IN: usize, const OUT: usize>(
     input_gradient
 }
 
-fn reduce_broadcast_gradient<const IN: usize, const OUT: usize>(
-    gradient: RawTensor<OUT, f32>,
+fn reduce_broadcast_gradient<const IN: usize, const OUT: usize, T: AutogradElement>(
+    gradient: RawTensor<OUT, T>,
     input_shape: [usize; IN],
-) -> Result<Box<dyn AnyTensorValue>> {
+) -> Result<Box<dyn AnyTensorValue>>
+where
+    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+{
     let output_shape = gradient.shape();
     let mut aligned_input_shape = [1usize; OUT];
     for axis in 0..IN {

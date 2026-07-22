@@ -71,7 +71,7 @@ fn prune_cached_buffers(buffers: &mut Vec<CachedBuffer>, live_bytes: &AtomicU64)
     });
 }
 
-/// The in-flight GPU memory cap for pool allocations, resolved once.
+/// The in-flight GPU memory cap for pool allocations.
 ///
 /// Exceeding physical unified memory with GPU-referenced allocations does not
 /// fail gracefully on macOS: the OS wires the memory and the machine panics
@@ -80,37 +80,33 @@ fn prune_cached_buffers(buffers: &mut Vec<CachedBuffer>, live_bytes: &AtomicU64)
 /// two thirds of RAM below 64GB); PyTorch MPS and MLX both enforce a
 /// framework-level watermark against it for the same reason. wgpu does not
 /// expose the Metal value, so this reproduces the same formula from physical
-/// RAM. `FUSOR_MAX_GPU_MEMORY_BYTES` overrides; non-Apple targets default to
-/// uncapped (VRAM exhaustion fails with driver errors, not a dead OS).
-fn gpu_memory_cap() -> u64 {
-    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        if let Some(value) = std::env::var_os("FUSOR_MAX_GPU_MEMORY_BYTES")
-            && let Some(parsed) = value.to_str().and_then(|v| v.parse::<u64>().ok())
-        {
-            return parsed.max(1);
+/// RAM. [`crate::FusorConfig::max_gpu_memory_bytes`] overrides; non-Apple
+/// targets default to uncapped (VRAM exhaustion fails with driver errors, not
+/// a dead OS).
+fn gpu_memory_cap(config_override: Option<u64>) -> u64 {
+    if let Some(cap) = config_override {
+        return cap.max(1);
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut memsize: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        let name = c"hw.memsize";
+        // SAFETY: standard sysctlbyname read of a u64 with matching size.
+        let ok = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut memsize as *mut u64 as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ok == 0 && memsize > 0 {
+            return memsize / 3 * 2;
         }
-        #[cfg(target_vendor = "apple")]
-        {
-            let mut memsize: u64 = 0;
-            let mut len = std::mem::size_of::<u64>();
-            let name = c"hw.memsize";
-            // SAFETY: standard sysctlbyname read of a u64 with matching size.
-            let ok = unsafe {
-                libc::sysctlbyname(
-                    name.as_ptr(),
-                    &mut memsize as *mut u64 as *mut libc::c_void,
-                    &mut len,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            if ok == 0 && memsize > 0 {
-                return memsize / 3 * 2;
-            }
-        }
-        u64::MAX
-    })
+    }
+    u64::MAX
 }
 
 /// Cumulative allocation statistics for a [`BufferPool`]. `requested` counts
@@ -140,6 +136,8 @@ pub struct BufferPool {
     /// the LRU evicts a whole bucket (those buffers stop being tracked
     /// without a decrement) — the safe direction for a memory cap.
     live_bytes: AtomicU64,
+    /// In-flight allocation cap; see [`gpu_memory_cap`].
+    memory_cap: u64,
 }
 
 impl std::fmt::Debug for BufferPool {
@@ -149,7 +147,11 @@ impl std::fmt::Debug for BufferPool {
 }
 
 impl BufferPool {
-    pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Self {
+    pub fn new(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        config: &crate::FusorConfig,
+    ) -> Self {
         let buffer_allocation_cache = RwLock::new(LruCache::with_hasher(
             const { std::num::NonZeroUsize::new(BUFFER_ALLOCATION_CACHE_SIZE).unwrap() },
             Default::default(),
@@ -163,6 +165,7 @@ impl BufferPool {
             buffers_requested: AtomicU64::new(0),
             buffers_created: AtomicU64::new(0),
             live_bytes: AtomicU64::new(0),
+            memory_cap: gpu_memory_cap(config.max_gpu_memory_bytes),
         }
     }
 
@@ -273,7 +276,7 @@ impl BufferPool {
         usage: wgpu::BufferUsages,
         to_initilize: bool,
     ) -> Arc<wgpu::Buffer> {
-        let cap = gpu_memory_cap();
+        let cap = self.memory_cap;
         if self.live_bytes.load(Ordering::Relaxed).saturating_add(size) > cap {
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
             if let Some(buffer) = self.get_cached_buffer(size, usage, to_initilize) {

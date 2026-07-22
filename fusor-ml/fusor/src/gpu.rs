@@ -659,6 +659,55 @@ impl<T: DataType> Tensor<4, T> {
         Self::from_core(self.inner.attention_causal(k.as_core(), v.as_core(), scale))
     }
 
+    /// Row log-sum-exp of the attention scores over the KV axis.
+    #[inline]
+    pub fn attention_lse(
+        &self,
+        k: &Self,
+        scale: f32,
+        mask: Option<&Tensor<2, T>>,
+        causal: bool,
+    ) -> Tensor<3, T> {
+        Tensor::from_core(self.inner.attention_lse(
+            k.as_core(),
+            scale,
+            mask.map(|mask| mask.as_core()),
+            causal,
+        ))
+    }
+
+    /// Gradients of [`Self::attention`] with respect to q, k, and v,
+    /// recomputed from the forward output and its row log-sum-exp.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_grads(
+        &self,
+        k: &Self,
+        v: &Self,
+        o: &Self,
+        grad_o: &Self,
+        lse: &Tensor<3, T>,
+        scale: f32,
+        mask: Option<&Tensor<2, T>>,
+        causal: bool,
+    ) -> (Self, Self, Self) {
+        let (dq, dk, dv) = self.inner.attention_grads(
+            k.as_core(),
+            v.as_core(),
+            o.as_core(),
+            grad_o.as_core(),
+            lse.as_core(),
+            scale,
+            mask.map(|mask| mask.as_core()),
+            causal,
+        );
+        (
+            Self::from_core(dq),
+            Self::from_core(dk),
+            Self::from_core(dv),
+        )
+    }
+
     #[inline]
     pub fn attention(&self, k: &Self, v: &Self, scale: f32, mask: Option<&Tensor<2, T>>) -> Self {
         Self::from_core(self.inner.attention(

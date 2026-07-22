@@ -17,6 +17,51 @@ mod view;
 #[cfg(test)]
 mod tests;
 
+/// The element types the autograd layer can differentiate through: the
+/// float types every backend implements end-to-end (`f32`, `half::f16`).
+/// The SIMD op traits (`SimdUnaryOp`/`SimdBinaryOp`/`SimdReduceOp`) are
+/// implemented per concrete element type in the CPU backend, so impl blocks
+/// that use them still carry those bounds explicitly.
+pub trait AutogradElement:
+    crate::FloatElement
+    + crate::MatmulElement
+    + crate::cpu::Scalar
+    + crate::IsNonZero
+    + Default
+    + PartialEq
+    + PartialOrd
+    + std::ops::Add<Output = Self>
+    + std::ops::Sub<Output = Self>
+    + std::ops::Mul<Output = Self>
+    + std::ops::Div<Output = Self>
+    + std::ops::Neg<Output = Self>
+    + crate::WasmNotSend
+    + crate::WasmNotSync
+    + std::fmt::Debug
+    + 'static
+{
+}
+
+impl<T> AutogradElement for T where
+    T: crate::FloatElement
+        + crate::MatmulElement
+        + crate::cpu::Scalar
+        + crate::IsNonZero
+        + Default
+        + PartialEq
+        + PartialOrd
+        + std::ops::Add<Output = Self>
+        + std::ops::Sub<Output = Self>
+        + std::ops::Mul<Output = Self>
+        + std::ops::Div<Output = Self>
+        + std::ops::Neg<Output = Self>
+        + crate::WasmNotSend
+        + crate::WasmNotSync
+        + std::fmt::Debug
+        + 'static
+{
+}
+
 type NodeId = usize;
 #[cfg(not(target_arch = "wasm32"))]
 type BackwardRule =
@@ -40,8 +85,8 @@ pub struct Graph {
 }
 
 #[derive(Clone)]
-pub struct Tensor<const R: usize> {
-    value: RawTensor<R, f32>,
+pub struct Tensor<const R: usize, T: crate::cpu::SimdElement = f32> {
+    value: RawTensor<R, T>,
     handle: NodeHandle,
 }
 
@@ -109,33 +154,55 @@ impl Graph {
         }
     }
 
-    pub fn leaf<const R: usize>(&self, value: RawTensor<R, f32>) -> Tensor<R> {
+    pub fn leaf<const R: usize, T: AutogradElement>(&self, value: RawTensor<R, T>) -> Tensor<R, T>
+    where
+        crate::AddOp: crate::SimdBinaryOp<T>,
+    {
         self.tensor_with_grad(value, true)
     }
 
-    pub fn constant<const R: usize>(&self, value: RawTensor<R, f32>) -> Tensor<R> {
+    pub fn constant<const R: usize, T: AutogradElement>(
+        &self,
+        value: RawTensor<R, T>,
+    ) -> Tensor<R, T>
+    where
+        crate::AddOp: crate::SimdBinaryOp<T>,
+    {
         self.tensor_with_grad(value, false)
     }
 
-    pub fn tensor<const R: usize, T>(&self, device: &Device, data: T) -> Tensor<R>
+    pub fn tensor<const R: usize, T: AutogradElement, A>(
+        &self,
+        device: &Device,
+        data: A,
+    ) -> Tensor<R, T>
     where
-        RawTensor<R, f32>: fusor_types::FromArray<R, f32, T, Device>,
+        RawTensor<R, T>: fusor_types::FromArray<R, T, A, Device>,
+        crate::AddOp: crate::SimdBinaryOp<T>,
     {
         self.leaf(RawTensor::new(device, data))
     }
 
-    pub fn constant_from_data<const R: usize, T>(&self, device: &Device, data: T) -> Tensor<R>
+    pub fn constant_from_data<const R: usize, T: AutogradElement, A>(
+        &self,
+        device: &Device,
+        data: A,
+    ) -> Tensor<R, T>
     where
-        RawTensor<R, f32>: fusor_types::FromArray<R, f32, T, Device>,
+        RawTensor<R, T>: fusor_types::FromArray<R, T, A, Device>,
+        crate::AddOp: crate::SimdBinaryOp<T>,
     {
         self.constant(RawTensor::new(device, data))
     }
 
-    fn tensor_with_grad<const R: usize>(
+    fn tensor_with_grad<const R: usize, T: AutogradElement>(
         &self,
-        value: RawTensor<R, f32>,
+        value: RawTensor<R, T>,
         requires_grad: bool,
-    ) -> Tensor<R> {
+    ) -> Tensor<R, T>
+    where
+        crate::AddOp: crate::SimdBinaryOp<T>,
+    {
         let id = self.inner.add_node(Vec::new(), None, requires_grad);
         Tensor {
             value,
@@ -153,30 +220,33 @@ impl Default for Graph {
     }
 }
 
-impl<const R: usize> Tensor<R> {
-    pub fn from_raw(graph: &Graph, value: RawTensor<R, f32>) -> Self {
+impl<const R: usize, T: AutogradElement> Tensor<R, T>
+where
+    crate::AddOp: crate::SimdBinaryOp<T>,
+{
+    pub fn from_raw(graph: &Graph, value: RawTensor<R, T>) -> Self {
         graph.leaf(value)
     }
 
-    pub fn constant_from_raw(graph: &Graph, value: RawTensor<R, f32>) -> Self {
+    pub fn constant_from_raw(graph: &Graph, value: RawTensor<R, T>) -> Self {
         graph.constant(value)
     }
 
-    pub fn new<T>(graph: &Graph, device: &Device, data: T) -> Self
+    pub fn new<A>(graph: &Graph, device: &Device, data: A) -> Self
     where
-        RawTensor<R, f32>: fusor_types::FromArray<R, f32, T, Device>,
+        RawTensor<R, T>: fusor_types::FromArray<R, T, A, Device>,
     {
         graph.tensor(device, data)
     }
 
-    pub fn from_array<T>(graph: &Graph, device: &Device, data: T) -> Self
+    pub fn from_array<A>(graph: &Graph, device: &Device, data: A) -> Self
     where
-        RawTensor<R, f32>: fusor_types::FromArray<R, f32, T, Device>,
+        RawTensor<R, T>: fusor_types::FromArray<R, T, A, Device>,
     {
         Self::new(graph, device, data)
     }
 
-    pub fn from_slice(graph: &Graph, device: &Device, shape: [usize; R], data: &[f32]) -> Self {
+    pub fn from_slice(graph: &Graph, device: &Device, shape: [usize; R], data: &[T]) -> Self {
         graph.leaf(RawTensor::from_slice(device, shape, data))
     }
 
@@ -189,7 +259,7 @@ impl<const R: usize> Tensor<R> {
     }
 
     pub fn splat(graph: &Graph, device: &Device, value: f32, shape: [usize; R]) -> Self {
-        graph.leaf(RawTensor::splat(device, value, shape))
+        graph.leaf(RawTensor::splat(device, T::from_f32(value), shape))
     }
 
     pub fn full(graph: &Graph, device: &Device, shape: [usize; R], value: f32) -> Self {
@@ -204,11 +274,11 @@ impl<const R: usize> Tensor<R> {
         Self::ones(&self.graph(), &self.device(), self.shape())
     }
 
-    pub fn raw(&self) -> &RawTensor<R, f32> {
+    pub fn raw(&self) -> &RawTensor<R, T> {
         &self.value
     }
 
-    pub fn into_raw(self) -> RawTensor<R, f32> {
+    pub fn into_raw(self) -> RawTensor<R, T> {
         self.value
     }
 
@@ -252,7 +322,7 @@ impl<const R: usize> Tensor<R> {
     pub fn with_backwards<I, F>(self, parents: I, backwards: F) -> Self
     where
         I: IntoIterator<Item = Parent>,
-        F: Fn(RawTensor<R, f32>) -> Result<Vec<BackwardTarget>> + Send + Sync + 'static,
+        F: Fn(RawTensor<R, T>) -> Result<Vec<BackwardTarget>> + Send + Sync + 'static,
     {
         self.with_backwards_impl(parents, backwards)
     }
@@ -261,7 +331,7 @@ impl<const R: usize> Tensor<R> {
     pub fn with_backwards<I, F>(self, parents: I, backwards: F) -> Self
     where
         I: IntoIterator<Item = Parent>,
-        F: Fn(RawTensor<R, f32>) -> Result<Vec<BackwardTarget>> + 'static,
+        F: Fn(RawTensor<R, T>) -> Result<Vec<BackwardTarget>> + 'static,
     {
         self.with_backwards_impl(parents, backwards)
     }
@@ -269,7 +339,7 @@ impl<const R: usize> Tensor<R> {
     fn with_backwards_impl<I, F>(self, parents: I, backwards: F) -> Self
     where
         I: IntoIterator<Item = Parent>,
-        F: Fn(RawTensor<R, f32>) -> Result<Vec<BackwardTarget>> + BackwardClosure,
+        F: Fn(RawTensor<R, T>) -> Result<Vec<BackwardTarget>> + BackwardClosure,
     {
         let parent_handles = parents
             .into_iter()
@@ -285,7 +355,7 @@ impl<const R: usize> Tensor<R> {
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = gradient
                 .as_any()
-                .downcast_ref::<RawTensor<R, f32>>()
+                .downcast_ref::<RawTensor<R, T>>()
                 .ok_or_else(|| Error::msg("gradient rank mismatch in custom backward"))?
                 .clone();
             let targets = backwards(gradient)?;
@@ -321,20 +391,20 @@ impl<const R: usize> Tensor<R> {
                 "backward() requires a single-element tensor; use backward_with() for non-scalars",
             ));
         }
-        let seed = RawTensor::splat(&self.device(), 1.0, self.shape());
+        let seed = RawTensor::splat(&self.device(), T::from_f32(1.0), self.shape());
         self.backward_with(seed)
     }
 
-    pub fn backward_with(&self, seed: RawTensor<R, f32>) -> Result<Gradients> {
+    pub fn backward_with(&self, seed: RawTensor<R, T>) -> Result<Gradients> {
         self.handle.graph.backward(self.handle.id, Box::new(seed))
     }
 
-    fn emit_op<const OUT: usize>(
+    fn emit_op<const OUT: usize, T2: AutogradElement>(
         &self,
-        value: RawTensor<OUT, f32>,
+        value: RawTensor<OUT, T2>,
         parents: Vec<NodeHandle>,
         backward: Option<BackwardRule>,
-    ) -> Tensor<OUT> {
+    ) -> Tensor<OUT, T2> {
         for parent in &parents {
             assert!(
                 Arc::ptr_eq(&self.handle.graph, &parent.graph),
@@ -360,13 +430,13 @@ impl<const R: usize> Tensor<R> {
 
     fn unary_from_value(
         &self,
-        value: RawTensor<R, f32>,
-        backward: impl Fn(RawTensor<R, f32>, RawTensor<R, f32>) -> RawTensor<R, f32> + BackwardClosure,
+        value: RawTensor<R, T>,
+        backward: impl Fn(RawTensor<R, T>, RawTensor<R, T>) -> RawTensor<R, T> + BackwardClosure,
     ) -> Self {
         let input_id = self.handle.id;
         let output = value.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<R>(&*gradient, "unary")?;
+            let gradient = downcast_tensor::<R, T>(&*gradient, "unary")?;
             Ok(vec![BackwardTarget {
                 node: input_id,
                 gradient: Box::new(backward(gradient, output.clone()).into_concrete()),
@@ -378,12 +448,12 @@ impl<const R: usize> Tensor<R> {
     fn binary_op(
         &self,
         rhs: &Self,
-        value: RawTensor<R, f32>,
+        value: RawTensor<R, T>,
         backward: impl Fn(
-            RawTensor<R, f32>,
-            RawTensor<R, f32>,
-            RawTensor<R, f32>,
-        ) -> Vec<RawTensor<R, f32>>
+            RawTensor<R, T>,
+            RawTensor<R, T>,
+            RawTensor<R, T>,
+        ) -> Vec<RawTensor<R, T>>
         + BackwardClosure,
     ) -> Self {
         assert!(
@@ -395,7 +465,7 @@ impl<const R: usize> Tensor<R> {
         let lhs_value = self.value.clone();
         let rhs_value = rhs.value.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<R>(&*gradient, "binary")?;
+            let gradient = downcast_tensor::<R, T>(&*gradient, "binary")?;
             let gradients = backward(gradient, lhs_value.clone(), rhs_value.clone());
             Ok(vec![
                 BackwardTarget {
@@ -418,13 +488,13 @@ impl<const R: usize> Tensor<R> {
     fn replay_unary<const OUT: usize>(
         &self,
         context: &'static str,
-        value: RawTensor<OUT, f32>,
-        replay: impl Fn(Tensor<R>) -> Tensor<OUT> + BackwardClosure,
-    ) -> Tensor<OUT> {
+        value: RawTensor<OUT, T>,
+        replay: impl Fn(Tensor<R, T>) -> Tensor<OUT, T> + BackwardClosure,
+    ) -> Tensor<OUT, T> {
         let input_id = self.handle.id;
         let input_value = self.value.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<OUT>(&*gradient, context)?;
+            let gradient = downcast_tensor::<OUT, T>(&*gradient, context)?;
             let graph = Graph::new();
             let replay_input = Tensor::from_raw(&graph, input_value.clone());
             let replay_output = replay(replay_input.clone());
@@ -442,18 +512,18 @@ impl<const R: usize> Tensor<R> {
 
     fn replay_binary<const R2: usize, const OUT: usize>(
         &self,
-        rhs: &Tensor<R2>,
+        rhs: &Tensor<R2, T>,
         context: &'static str,
-        value: RawTensor<OUT, f32>,
-        replay: impl Fn(Tensor<R>, Tensor<R2>) -> Tensor<OUT> + BackwardClosure,
-    ) -> Tensor<OUT> {
+        value: RawTensor<OUT, T>,
+        replay: impl Fn(Tensor<R, T>, Tensor<R2, T>) -> Tensor<OUT, T> + BackwardClosure,
+    ) -> Tensor<OUT, T> {
         assert_same_graph(self, rhs);
         let lhs_id = self.handle.id;
         let rhs_id = rhs.handle.id;
         let lhs_value = self.value.clone();
         let rhs_value = rhs.value.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<OUT>(&*gradient, context)?;
+            let gradient = downcast_tensor::<OUT, T>(&*gradient, context)?;
             let graph = Graph::new();
             let replay_lhs = Tensor::from_raw(&graph, lhs_value.clone());
             let replay_rhs = Tensor::from_raw(&graph, rhs_value.clone());
@@ -485,13 +555,14 @@ impl<const R: usize> Tensor<R> {
 
     fn replay_quaternary<const R2: usize, const R3: usize, const R4: usize, const OUT: usize>(
         &self,
-        second: &Tensor<R2>,
-        third: &Tensor<R3>,
-        fourth: &Tensor<R4>,
+        second: &Tensor<R2, T>,
+        third: &Tensor<R3, T>,
+        fourth: &Tensor<R4, T>,
         context: &'static str,
-        value: RawTensor<OUT, f32>,
-        replay: impl Fn(Tensor<R>, Tensor<R2>, Tensor<R3>, Tensor<R4>) -> Tensor<OUT> + BackwardClosure,
-    ) -> Tensor<OUT> {
+        value: RawTensor<OUT, T>,
+        replay: impl Fn(Tensor<R, T>, Tensor<R2, T>, Tensor<R3, T>, Tensor<R4, T>) -> Tensor<OUT, T>
+        + BackwardClosure,
+    ) -> Tensor<OUT, T> {
         assert_same_graph(self, second);
         assert_same_graph(self, third);
         assert_same_graph(self, fourth);
@@ -506,7 +577,7 @@ impl<const R: usize> Tensor<R> {
         let third_value = third.value.clone();
         let fourth_value = fourth.value.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<OUT>(&*gradient, context)?;
+            let gradient = downcast_tensor::<OUT, T>(&*gradient, context)?;
             let graph = Graph::new();
             let replay_first = Tensor::from_raw(&graph, first_value.clone());
             let replay_second = Tensor::from_raw(&graph, second_value.clone());
@@ -553,12 +624,13 @@ impl<const R: usize> Tensor<R> {
 
     fn replay_ternary<const R2: usize, const R3: usize, const OUT: usize>(
         &self,
-        second: &Tensor<R2>,
-        third: &Tensor<R3>,
+        second: &Tensor<R2, T>,
+        third: &Tensor<R3, T>,
         context: &'static str,
-        value: RawTensor<OUT, f32>,
-        replay: impl Fn(Tensor<R>, Tensor<R2>, Tensor<R3>) -> Tensor<OUT> + BackwardClosure,
-    ) -> Tensor<OUT> {
+        value: RawTensor<OUT, T>,
+        replay: impl Fn(Tensor<R, T>, Tensor<R2, T>, Tensor<R3, T>) -> Tensor<OUT, T>
+        + BackwardClosure,
+    ) -> Tensor<OUT, T> {
         assert_same_graph(self, second);
         assert_same_graph(self, third);
         let first_id = self.handle.id;
@@ -568,7 +640,7 @@ impl<const R: usize> Tensor<R> {
         let second_value = second.value.clone();
         let third_value = third.value.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<OUT>(&*gradient, context)?;
+            let gradient = downcast_tensor::<OUT, T>(&*gradient, context)?;
             let graph = Graph::new();
             let replay_first = Tensor::from_raw(&graph, first_value.clone());
             let replay_second = Tensor::from_raw(&graph, second_value.clone());
@@ -632,10 +704,13 @@ impl Tensor<1> {
 }
 
 impl Gradients {
-    pub fn get<const R: usize>(&self, tensor: &Tensor<R>) -> Option<RawTensor<R, f32>> {
+    pub fn get<const R: usize, T: AutogradElement>(
+        &self,
+        tensor: &Tensor<R, T>,
+    ) -> Option<RawTensor<R, T>> {
         self.gradients
             .get(&tensor.handle.id)
-            .and_then(|gradient| gradient.as_any().downcast_ref::<RawTensor<R, f32>>())
+            .and_then(|gradient| gradient.as_any().downcast_ref::<RawTensor<R, T>>())
             .cloned()
     }
 
@@ -651,7 +726,13 @@ impl Gradients {
 }
 
 impl BackwardTarget {
-    pub fn wrt<const R: usize>(tensor: &Tensor<R>, gradient: RawTensor<R, f32>) -> Self {
+    pub fn wrt<const R: usize, T: AutogradElement>(
+        tensor: &Tensor<R, T>,
+        gradient: RawTensor<R, T>,
+    ) -> Self
+    where
+        crate::AddOp: crate::SimdBinaryOp<T>,
+    {
         Self {
             node: tensor.handle.id,
             gradient: Box::new(gradient),
@@ -769,7 +850,10 @@ impl GraphInner {
     }
 }
 
-impl<const R: usize> AnyTensorValue for RawTensor<R, f32> {
+impl<const R: usize, T: AutogradElement> AnyTensorValue for RawTensor<R, T>
+where
+    crate::AddOp: crate::SimdBinaryOp<T>,
+{
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -788,7 +872,7 @@ impl<const R: usize> AnyTensorValue for RawTensor<R, f32> {
     fn add_box(&self, other: &dyn AnyTensorValue) -> Result<Box<dyn AnyTensorValue>> {
         let other = other
             .as_any()
-            .downcast_ref::<RawTensor<R, f32>>()
+            .downcast_ref::<RawTensor<R, T>>()
             .ok_or_else(|| Error::msg("gradient rank mismatch while accumulating"))?;
         Ok(Box::new((self.clone() + other.clone()).into_concrete()))
     }
@@ -811,18 +895,21 @@ fn accumulate_gradient(
     Ok(())
 }
 
-fn downcast_tensor<const R: usize>(
+fn downcast_tensor<const R: usize, T: AutogradElement>(
     value: &dyn AnyTensorValue,
     context: &str,
-) -> Result<RawTensor<R, f32>> {
+) -> Result<RawTensor<R, T>> {
     value
         .as_any()
-        .downcast_ref::<RawTensor<R, f32>>()
+        .downcast_ref::<RawTensor<R, T>>()
         .cloned()
         .ok_or_else(|| Error::msg(format!("gradient rank mismatch in {context}")))
 }
 
-fn assert_same_graph<const R: usize, const R2: usize>(lhs: &Tensor<R>, rhs: &Tensor<R2>) {
+fn assert_same_graph<const R: usize, const R2: usize, T: crate::cpu::SimdElement, T2: crate::cpu::SimdElement>(
+    lhs: &Tensor<R, T>,
+    rhs: &Tensor<R2, T2>,
+) {
     assert!(
         Arc::ptr_eq(&lhs.handle.graph, &rhs.handle.graph),
         "cannot mix autograd tensors from different graphs"

@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use lru::LruCache;
 use parking_lot::Mutex;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHasher};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet, FxHasher};
 use web_time::Instant;
 
 use super::{
@@ -63,7 +63,16 @@ use crate::{DataTypeEnum, Device, Layout};
 /// representative rather than pretending to be executable view nodes.
 const REPLAY_RECIPE_VERSION: u64 = 9;
 
-const FLUSH_PLAN_CACHE_SIZE: usize = 8;
+/// Admission (see [`FlushPlanCache::admit_record`]) keeps one-shot
+/// fingerprints out, so capacity only bounds host metadata for fingerprints
+/// that provably recur.
+const FLUSH_PLAN_CACHE_SIZE: usize = 64;
+
+/// Bound on the sighted-fingerprint admission set (16 bytes per key). On
+/// overflow the set resets wholesale; recurring shapes then re-earn
+/// admission with two fresh sightings, which is harmless next to unbounded
+/// growth.
+const SEEN_KEY_CAP: usize = 1 << 16;
 
 /// Structural fingerprint of one flush's pending subgraph.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -71,7 +80,8 @@ pub(crate) struct FlushPlanKey([u64; 2]);
 
 /// The reusable-plan decision for one materialization boundary. Both batched
 /// flushes and ordinary single-target resolves enter through this gate so an
-/// isomorphic graph has one cache lifecycle: record, then replay.
+/// isomorphic graph has one cache lifecycle: resolve once, record on the
+/// second sighting, then replay.
 pub(crate) enum ReplayAction {
     Resolve,
     Record {
@@ -88,6 +98,9 @@ pub(crate) enum ReplayAction {
 /// kernel cache so it is reachable under the compute-graph write lock.
 pub(crate) struct FlushPlanCache {
     plans: Mutex<LruCache<FlushPlanKey, Arc<FlushPlan>, FxBuildHasher>>,
+    /// Fingerprints sighted at least once; recording is admitted only on a
+    /// second sighting (see [`FlushPlanCache::admit_record`]).
+    seen: Mutex<FxHashSet<FlushPlanKey>>,
     replays: AtomicU64,
     records: AtomicU64,
 }
@@ -99,6 +112,7 @@ impl Default for FlushPlanCache {
                 NonZeroUsize::new(FLUSH_PLAN_CACHE_SIZE).expect("cache size must be non-zero"),
                 FxBuildHasher,
             )),
+            seen: Mutex::new(FxHashSet::default()),
             replays: AtomicU64::new(0),
             records: AtomicU64::new(0),
         }
@@ -108,6 +122,19 @@ impl Default for FlushPlanCache {
 impl FlushPlanCache {
     pub(crate) fn get(&self, key: &FlushPlanKey) -> Option<Arc<FlushPlan>> {
         self.plans.lock().get(key).cloned()
+    }
+
+    /// Admission gate: record a plan only for a fingerprint sighted before.
+    /// Recording costs a fully instrumented resolve, and shape-drifting
+    /// workloads — decode's growing KV cache, varying batch sizes — mint a
+    /// fresh fingerprint every flush; one-shot keys pay one hash-set insert
+    /// here instead and never occupy a plan slot.
+    pub(crate) fn admit_record(&self, key: FlushPlanKey) -> bool {
+        let mut seen = self.seen.lock();
+        if seen.len() >= SEEN_KEY_CAP && !seen.contains(&key) {
+            seen.clear();
+        }
+        !seen.insert(key)
     }
 
     pub(crate) fn insert(&self, key: FlushPlanKey, plan: Arc<FlushPlan>) {
@@ -133,8 +160,8 @@ impl FlushPlanCache {
 /// Choose whether `targets` need a full resolve, should record, or can replay.
 ///
 /// A failed replay validation is non-mutating and falls back to a normal
-/// resolve. A cache miss records immediately, so the second occurrence can
-/// replay without an extra warm-up resolve.
+/// resolve. A cache miss records only for fingerprints sighted before, so
+/// one-shot graphs never pay the instrumented recording resolve.
 pub(crate) fn prepare_replay(graph: &mut ComputeGraphInner, targets: &[NodeIndex]) -> ReplayAction {
     let Some(fingerprint) = fingerprint_pending(graph, targets) else {
         return ReplayAction::Resolve;
@@ -165,10 +192,16 @@ pub(crate) fn prepare_replay(graph: &mut ComputeGraphInner, targets: &[NodeIndex
                 ReplayAction::Resolve
             }
         }
-        None => ReplayAction::Record {
-            key: fingerprint.key,
-            fingerprint,
-        },
+        None => {
+            if cache.admit_record(fingerprint.key) {
+                ReplayAction::Record {
+                    key: fingerprint.key,
+                    fingerprint,
+                }
+            } else {
+                ReplayAction::Resolve
+            }
+        }
     }
 }
 
@@ -956,7 +989,7 @@ pub(crate) fn execute_replay_with_tail<T>(
 ) -> (super::ResolverResult, T) {
     let slots = &fingerprint.slots;
     let device = graph.device();
-    let host_trace = std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some();
+    let host_trace = device.config().trace_resolve_host;
     let start = host_trace.then(Instant::now);
 
     // Re-add the optimizer's persistent physical dependency edges through the
@@ -1187,10 +1220,9 @@ pub(crate) fn execute_replay_with_tail<T>(
         .iter()
         .filter(|command| matches!(command, CommandRecord::Dispatch(_)))
         .count();
-    let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-        || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+    let trace = device.config().trace_decode || device.config().trace_resolve;
     if trace {
-        let trace_names = std::env::var_os("FUSOR_TRACE_DECODE_NAMES").is_some();
+        let trace_names = device.config().trace_decode_names;
         let mut categories = FxHashMap::<String, usize>::default();
         let mut names = FxHashMap::<String, usize>::default();
         for command in &commands {

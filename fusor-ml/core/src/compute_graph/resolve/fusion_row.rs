@@ -187,7 +187,7 @@ impl Resolver {
                 rootless += 1;
             }
         }
-        if std::env::var_os("FUSOR_TRACE_ROW_FUSION").is_some() {
+        if graph.device().config().trace_row_fusion {
             eprintln!(
                 "row_fusion: {reduce_count} reduces, {} roots, {rootless} rootless",
                 roots.len()
@@ -491,7 +491,7 @@ impl Resolver {
             return false;
         };
 
-        let trace = std::env::var_os("FUSOR_TRACE_ROW_FUSION").is_some();
+        let trace = graph.device().config().trace_row_fusion;
         // Fusing pays for itself only when at least one reduction folds in.
         if builder.phases.is_empty() {
             return false;

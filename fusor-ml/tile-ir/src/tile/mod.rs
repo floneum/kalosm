@@ -36,7 +36,7 @@ mod storage;
 mod value;
 
 pub use block::TileBlock;
-pub use capability::{CoopMatrixToken, SubgroupToken};
+pub use capability::{ByteArenaToken, CoopMatrixToken, SubgroupToken};
 pub use grid::build;
 pub use program::Program;
 pub use storage::{Storage, StorageIndex};

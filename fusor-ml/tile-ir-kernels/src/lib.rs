@@ -14,8 +14,9 @@ pub use dispatch::{
     SubgroupConfig,
 };
 pub use kernels::{
-    coop_tile_entries, flash_attention_bwd_supported, flash_attention_dispatch,
-    flash_attention_f32, flash_attention_supported, flash_bwd_kv_dispatch, flash_bwd_kv_f32,
+    coop_tile_entries, DEFAULT_SWIZZLE_GROUP_M, flash_attention_bwd_supported, flash_attention_dispatch,
+    flash_attention_f32, flash_attention_supported, flash_attention_workgroup_bytes,
+    flash_bwd_kv_dispatch, flash_bwd_kv_f32,
     flash_bwd_q_dispatch, flash_bwd_q_f32, flash_lse_dispatch, flash_lse_f32,
     fma_matmul_f32, linear_storage_layout, qgemv_with_epilogue,
     qgemv_workgroup_f16_with_epilogue, qgemv_workgroup_storage_f16_with_epilogue,
@@ -25,7 +26,7 @@ pub use kernels::{
     try_batched_coop_matmul, try_batched_coop_matmul_split_k, try_merged_coop_matmul,
     AccumCast, CoopTileEntry, DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulShape,
     DenseMatmulTensors, FlashAttentionLayouts, FlashAttentionShape, FlashBwdLayouts,
-    FlashMaskLayout, FlashOperandLayout, FlashRowLayout, IntoQgemvEpilogues,
+    FlashKvOutputs, FlashMaskLayout, FlashOperandLayout, FlashRowLayout, IntoQgemvEpilogues,
 };
 pub use types::{
     cooperative_store_layout_supported, DenseMatmulEpilogues, QmatmulEpilogues, QmatmulExtra,

@@ -1162,7 +1162,13 @@ fn build_row_program_kernel(
                                 len,
                                 function: fold_fn,
                             }) => {
-                                let fold_dtype = fold_fn.datatype();
+                                let fold_wire_dtype = fold_fn.datatype();
+                                // f32 accumulation for half-precision dots,
+                                // rounded once below.
+                                let fold_dtype = match fold_wire_dtype {
+                                    DataTypeEnum::F16 => DataTypeEnum::F32,
+                                    other => other,
+                                };
                                 let identity = Tile::literal(tile_literal_for(
                                     fold_fn.initial_value,
                                     fold_dtype,
@@ -1187,7 +1193,14 @@ fn build_row_program_kernel(
                                         [fold_acc.binary(reduce_op.binary(), value)]
                                     },
                                 );
-                                folded
+                                if fold_dtype == fold_wire_dtype {
+                                    folded
+                                } else {
+                                    raw_tile(
+                                        ValueTile::F32(program.bind(folded))
+                                            .cast_to(fold_wire_dtype),
+                                    )
+                                }
                             }
                             None => {
                                 let (value, _) = eval_nary_expr(
@@ -1351,7 +1364,14 @@ fn build_row_program_kernel(
                     let RowStep::Reduce(reduce) = phase else {
                         unreachable!("element phases require a dynamic-axis row program")
                     };
-                    let phase_dtype = reduce.function.datatype();
+                    let function_dtype = reduce.function.datatype();
+                    // Half-precision folds accumulate in f32 and round once
+                    // after the group reduction — the same accumulator policy
+                    // as the matmul kernels and the composed fused reduce.
+                    let phase_dtype = match function_dtype {
+                        DataTypeEnum::F16 => DataTypeEnum::F32,
+                        other => other,
+                    };
                     let identity = || {
                         Tile::literal(tile_literal_for(reduce.function.initial_value, phase_dtype))
                     };
@@ -1399,8 +1419,13 @@ fn build_row_program_kernel(
                     // workgroup reduction.
                     let combined =
                         emit_group_reduce(program, subgroups, reduce_op, k_group, block, partial);
+                    let combined = if phase_dtype == function_dtype {
+                        combined
+                    } else {
+                        raw_tile(ValueTile::F32(program.bind(combined)).cast_to(function_dtype))
+                    };
                     let (combined, combined_ty) =
-                        apply_unary_function_chain(combined, phase_dtype, &reduce.post_chain)
+                        apply_unary_function_chain(combined, function_dtype, &reduce.post_chain)
                             .expect("validated row program post chain");
                     let scalar = ValueTile::F32(program.bind(combined)).cast_to(combined_ty);
                     slots.push((scalar, combined_ty));
@@ -1601,7 +1626,7 @@ pub(crate) fn build_merged_row_program_kernel(
             segment_inputs,
         );
     });
-    let name = if std::env::var_os("FUSOR_TRACE_DECODE_NAMES").is_some() {
+    let name = if device.config().trace_decode_names {
         format!(
             "merged_row_program[{}]",
             segments
@@ -1695,7 +1720,13 @@ pub(crate) fn build_merged_row_program_kernel(
                             let RowStep::Reduce(reduce) = phase else {
                                 unreachable!("merged row programs are reduce-phase only")
                             };
-                            let phase_dtype = reduce.function.datatype();
+                            let function_dtype = reduce.function.datatype();
+                            // Same f32 accumulation policy as the standalone
+                            // reduce phases above.
+                            let phase_dtype = match function_dtype {
+                                DataTypeEnum::F16 => DataTypeEnum::F32,
+                                other => other,
+                            };
                             let identity = || {
                                 Tile::literal(tile_literal_for(
                                     reduce.function.initial_value,
@@ -1747,9 +1778,17 @@ pub(crate) fn build_merged_row_program_kernel(
                                 block,
                                 partial,
                             );
+                            let combined = if phase_dtype == function_dtype {
+                                combined
+                            } else {
+                                raw_tile(
+                                    ValueTile::F32(program.bind(combined))
+                                        .cast_to(function_dtype),
+                                )
+                            };
                             let (combined, combined_ty) = apply_unary_function_chain(
                                 combined,
-                                phase_dtype,
+                                function_dtype,
                                 &reduce.post_chain,
                             )
                             .expect("validated row program post chain");

@@ -31,6 +31,9 @@ enum RegionSlot {
 #[derive(Debug, Default, Clone, Copy)]
 struct RegionRejects {
     non_elementwise: u32,
+    /// Breakdown of `non_elementwise` by the producer's variant, in order:
+    /// tensor/view inputs, reduces, row programs, matmul-family, other.
+    non_elementwise_kinds: [u32; 5],
     shape_mismatch: u32,
     producer_cached: u32,
     outside_consumer: u32,
@@ -41,6 +44,13 @@ struct RegionRejects {
 impl RegionRejects {
     fn add(&mut self, other: &Self) {
         self.non_elementwise += other.non_elementwise;
+        for (slot, value) in self
+            .non_elementwise_kinds
+            .iter_mut()
+            .zip(other.non_elementwise_kinds)
+        {
+            *slot += value;
+        }
         self.shape_mismatch += other.shape_mismatch;
         self.producer_cached += other.producer_cached;
         self.outside_consumer += other.outside_consumer;
@@ -61,7 +71,7 @@ impl Resolver {
             .map(|(pos, &node)| (node, pos))
             .collect();
         let mut claimed: FxHashSet<ExecutionNodeIndex> = FxHashSet::default();
-        let trace = std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+        let trace = graph.device().config().trace_resolve;
         let mut rejects = RegionRejects::default();
         let mut regions_formed = 0usize;
         let mut statements_fused = 0usize;
@@ -78,8 +88,12 @@ impl Resolver {
             }
             let shape = sink_op.shape.clone();
 
-            // Fixpoint absorption.
+            // Fixpoint absorption. Outside consumers admitted through the
+            // precise reachability fallback (rather than the topological
+            // fast path) are remembered: later candidates must not sit
+            // downstream of them, or contraction would close a cycle.
             let mut member_set: FxHashSet<ExecutionNodeIndex> = FxHashSet::default();
+            let mut risky_outside: FxHashSet<ExecutionNodeIndex> = FxHashSet::default();
             member_set.insert(sink);
             loop {
                 let mut probe = RegionRejects::default();
@@ -91,11 +105,13 @@ impl Resolver {
                     budget,
                     &position,
                     position[&sink],
+                    &risky_outside,
                     &mut probe,
                 );
                 match candidate {
-                    Some(producer) => {
+                    Some((producer, borderline)) => {
                         member_set.insert(producer);
+                        risky_outside.extend(borderline);
                     }
                     None => {
                         // The fixpoint probe: these producers are what
@@ -126,7 +142,8 @@ impl Resolver {
     }
 
     /// One producer of the current member set that passes every absorption
-    /// gate, or `None` at fixpoint.
+    /// gate (returned with any outside consumers admitted through the
+    /// reachability fallback), or `None` at fixpoint.
     #[allow(clippy::too_many_arguments)]
     fn find_absorbable_producer(
         &self,
@@ -137,8 +154,9 @@ impl Resolver {
         budget: usize,
         position: &FxHashMap<ExecutionNodeIndex, usize>,
         sink_position: usize,
+        risky_outside: &FxHashSet<ExecutionNodeIndex>,
         rejects: &mut RegionRejects,
-    ) -> Option<ExecutionNodeIndex> {
+    ) -> Option<(ExecutionNodeIndex, Vec<ExecutionNodeIndex>)> {
         for &member in member_set {
             for producer in self
                 .execution_graph
@@ -152,6 +170,16 @@ impl Resolver {
                     &self.execution_graph[producer].variant
                 else {
                     rejects.non_elementwise += 1;
+                    let kind = match &self.execution_graph[producer].variant {
+                        ExecutionVariant::Tensor(_) | ExecutionVariant::View(_) => 0,
+                        ExecutionVariant::Reduce(_) => 1,
+                        ExecutionVariant::RowProgram(_) => 2,
+                        ExecutionVariant::MatMul(_)
+                        | ExecutionVariant::QMatMul(_)
+                        | ExecutionVariant::Attention(_) => 3,
+                        _ => 4,
+                    };
+                    rejects.non_elementwise_kinds[kind] += 1;
                     continue;
                 };
                 if producer_op.shape.as_ref() != shape {
@@ -164,22 +192,46 @@ impl Resolver {
                 }
                 // Outside consumers no longer block absorption: the
                 // producer's value becomes a region output (the binding
-                // budget below already accounts for it). The one hazard is
-                // ordering: a consumer scheduled before the region's last
-                // member could need the value before the region runs — and
-                // could, transitively, feed the region, a cycle. Every
-                // member feeds the sink, so the sink carries the region's
-                // maximum topological position; consumers strictly after it
-                // are provably downstream and safe.
-                if self
+                // budget below already accounts for it). The hazard is a
+                // cycle: a consumer that transitively feeds the region.
+                // Fast path: every member feeds the sink, so the sink
+                // carries the region's maximum topological position, and
+                // consumers strictly after it are provably downstream. A
+                // consumer at or before the sink in the linearization is
+                // only *possibly* cyclic — one arbitrary topological order
+                // proves nothing about independence — so those fall through
+                // to a bounded reachability probe: reject only when the
+                // consumer actually reaches a member. Admitted borderline
+                // consumers are returned so the fixpoint can keep later
+                // candidates from sitting downstream of them.
+                let mut borderline: Vec<ExecutionNodeIndex> = Vec::new();
+                for consumer in self
                     .execution_graph
                     .neighbors_directed(producer, petgraph::Direction::Outgoing)
-                    .any(|consumer| {
-                        !member_set.contains(&consumer)
-                            && position
-                                .get(&consumer)
-                                .is_none_or(|&pos| pos <= sink_position)
-                    })
+                {
+                    if member_set.contains(&consumer) {
+                        continue;
+                    }
+                    if position
+                        .get(&consumer)
+                        .is_some_and(|&pos| pos > sink_position)
+                    {
+                        continue;
+                    }
+                    borderline.push(consumer);
+                }
+                if borderline
+                    .iter()
+                    .any(|&consumer| self.region_probe_reaches(consumer, member_set))
+                {
+                    rejects.outside_consumer += 1;
+                    continue;
+                }
+                // A candidate downstream of a previously-admitted borderline
+                // consumer would order the region after that consumer while
+                // the consumer waits on the region: a cycle.
+                if !risky_outside.is_empty()
+                    && self.region_probe_reached_from(producer, risky_outside)
                 {
                     rejects.outside_consumer += 1;
                     continue;
@@ -209,10 +261,66 @@ impl Resolver {
                     rejects.binding_budget += 1;
                     continue;
                 }
-                return Some(producer);
+                return Some((producer, borderline));
             }
         }
         None
+    }
+
+    /// Bounded DFS along outgoing edges: does `from` reach any member?
+    /// Exceeding the probe cap answers `true` (conservative reject).
+    fn region_probe_reaches(
+        &self,
+        from: ExecutionNodeIndex,
+        targets: &FxHashSet<ExecutionNodeIndex>,
+    ) -> bool {
+        const CAP: usize = 512;
+        let mut stack = vec![from];
+        let mut visited: FxHashSet<ExecutionNodeIndex> = FxHashSet::default();
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            if visited.len() > CAP {
+                return true;
+            }
+            if targets.contains(&node) {
+                return true;
+            }
+            stack.extend(
+                self.execution_graph
+                    .neighbors_directed(node, petgraph::Direction::Outgoing),
+            );
+        }
+        false
+    }
+
+    /// Bounded DFS along incoming edges: is `node` downstream of any source?
+    /// Exceeding the probe cap answers `true` (conservative reject).
+    fn region_probe_reached_from(
+        &self,
+        node: ExecutionNodeIndex,
+        sources: &FxHashSet<ExecutionNodeIndex>,
+    ) -> bool {
+        const CAP: usize = 512;
+        let mut stack = vec![node];
+        let mut visited: FxHashSet<ExecutionNodeIndex> = FxHashSet::default();
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            if visited.len() > CAP {
+                return true;
+            }
+            if current != node && sources.contains(&current) {
+                return true;
+            }
+            stack.extend(
+                self.execution_graph
+                    .neighbors_directed(current, petgraph::Direction::Incoming),
+            );
+        }
+        false
     }
 
     /// Distinct external inputs + emitted outputs for `member_set`

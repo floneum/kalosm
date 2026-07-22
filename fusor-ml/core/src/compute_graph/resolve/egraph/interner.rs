@@ -33,18 +33,18 @@ use crate::compute_graph::NodeIndex;
 pub(super) struct SpecId(pub(super) u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct PayloadKey([u64; 2]);
+pub(super) struct PayloadKey(pub(super) [u64; 2]);
 
 /// Two differently-seeded accumulator lanes over the same 64-bit words; the
 /// second lane widens the accumulator state against cancellation collisions
 /// (the `flush_replay::FingerprintHasher` recipe).
-struct TwoLane {
+pub(super) struct TwoLane {
     a: FxHasher,
     b: FxHasher,
 }
 
 impl TwoLane {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let mut a = FxHasher::default();
         0u64.hash(&mut a);
         let mut b = FxHasher::default();
@@ -52,17 +52,17 @@ impl TwoLane {
         Self { a, b }
     }
 
-    fn write_u64(&mut self, value: u64) {
+    pub(super) fn write_u64(&mut self, value: u64) {
         value.hash(&mut self.a);
         (value.rotate_left(32) ^ 0x9E37_79B9_7F4A_7C15).hash(&mut self.b);
     }
 
-    fn finish(self) -> PayloadKey {
+    pub(super) fn finish(self) -> PayloadKey {
         PayloadKey([self.a.finish(), self.b.finish()])
     }
 }
 
-fn local_hash(f: impl FnOnce(&mut FxHasher)) -> u64 {
+pub(super) fn local_hash(f: impl FnOnce(&mut FxHasher)) -> u64 {
     let mut hasher = FxHasher::default();
     f(&mut hasher);
     hasher.finish()
@@ -109,6 +109,10 @@ pub(super) fn variant_dependencies(variant: &ExecutionVariant) -> Vec<NodeIndex>
             op.visit_dependencies(&mut push);
         }
         ExecutionVariant::RowProgram(op) => {
+            use crate::mir::operation::Operation;
+            op.visit_dependencies(&mut push);
+        }
+        ExecutionVariant::Attention(op) => {
             use crate::mir::operation::Operation;
             op.visit_dependencies(&mut push);
         }
@@ -192,6 +196,24 @@ pub(super) fn rebind_variant_dependencies(variant: &mut ExecutionVariant, new: &
                 *input = slots.next().expect("row program rebind arity");
             }
         }
+        ExecutionVariant::Attention(op) => {
+            // Order matches `FlashAttentionOperation::visit_dependencies`:
+            // q, k, then the present optional operands in declaration order.
+            op.q = slots.next().expect("attention rebind arity");
+            op.k = slots.next().expect("attention rebind arity");
+            for slot in [
+                &mut op.v,
+                &mut op.grad_o,
+                &mut op.lse,
+                &mut op.dsum,
+                &mut op.mask,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                *slot = slots.next().expect("attention rebind arity");
+            }
+        }
     }
     debug_assert!(
         slots.next().is_none(),
@@ -212,6 +234,7 @@ fn variant_tag(variant: &ExecutionVariant) -> u8 {
         ExecutionVariant::QMatMul(_) => 8,
         ExecutionVariant::QEmbedding(_) => 9,
         ExecutionVariant::RowProgram(_) => 10,
+        ExecutionVariant::Attention(_) => 11,
     }
 }
 
@@ -231,6 +254,7 @@ fn hash_variant_fields(variant: &ExecutionVariant, hasher: &mut FxHasher) {
         ExecutionVariant::QMatMul(op) => op.hash_kernel_fields(hasher),
         ExecutionVariant::QEmbedding(op) => op.hash_kernel_fields(hasher),
         ExecutionVariant::RowProgram(op) => op.hash_kernel_fields(hasher),
+        ExecutionVariant::Attention(op) => op.hash_kernel_fields(hasher),
     }
 }
 
@@ -249,6 +273,9 @@ pub(super) struct PayloadTable {
     by_key: FxHashMap<PayloadKey, Vec<PayloadId>>,
     specs: Vec<ExecutionVariant>,
     specs_by_key: FxHashMap<PayloadKey, Vec<SpecId>>,
+    /// The spec's structural hash. `SpecId`s are per-resolve; this key is the
+    /// resolve-independent identity the persistent plan store hashes instead.
+    spec_keys: Vec<PayloadKey>,
     spec_of_payload: Vec<SpecId>,
 }
 
@@ -307,6 +334,10 @@ impl PayloadTable {
         self.spec_of_payload[id.0 as usize]
     }
 
+    pub(super) fn spec_key(&self, id: SpecId) -> PayloadKey {
+        self.spec_keys[id.0 as usize]
+    }
+
     pub(super) fn spec_count(&self) -> usize {
         self.specs.len()
     }
@@ -326,6 +357,7 @@ impl PayloadTable {
         let id = SpecId(self.specs.len() as u32);
         self.specs.push(variant.clone());
         self.specs_by_key.entry(key).or_default().push(id);
+        self.spec_keys.push(key);
         id
     }
 }
@@ -413,6 +445,20 @@ pub(super) fn planning_payload_eq(a: &ExecutionVariant, b: &ExecutionVariant) ->
             b.inputs.clear();
             a == b
         }
+        (ExecutionVariant::Attention(a), ExecutionVariant::Attention(b)) => {
+            let zero_deps = |op: &crate::flash_attention::FlashAttentionOperation| {
+                let mut op = op.clone();
+                op.q = zero;
+                op.k = zero;
+                op.v = op.v.map(|_| zero);
+                op.grad_o = op.grad_o.map(|_| zero);
+                op.lse = op.lse.map(|_| zero);
+                op.dsum = op.dsum.map(|_| zero);
+                op.mask = op.mask.map(|_| zero);
+                op
+            };
+            zero_deps(a) == zero_deps(b)
+        }
         // Effects and multi-output regions are observation-specific.
         (ExecutionVariant::Assign(_), ExecutionVariant::Assign(_))
         | (ExecutionVariant::Region(_), ExecutionVariant::Region(_)) => false,
@@ -489,6 +535,20 @@ fn semantic_payload_eq(a: &ExecutionVariant, b: &ExecutionVariant) -> bool {
             a.inputs.clear();
             b.inputs.clear();
             a == b
+        }
+        (ExecutionVariant::Attention(a), ExecutionVariant::Attention(b)) => {
+            let zero_deps = |op: &crate::flash_attention::FlashAttentionOperation| {
+                let mut op = op.clone();
+                op.q = zero;
+                op.k = zero;
+                op.v = op.v.map(|_| zero);
+                op.grad_o = op.grad_o.map(|_| zero);
+                op.lse = op.lse.map(|_| zero);
+                op.dsum = op.dsum.map(|_| zero);
+                op.mask = op.mask.map(|_| zero);
+                op
+            };
+            zero_deps(a) == zero_deps(b)
         }
         // Effects and multi-output regions are observation-specific.
         (ExecutionVariant::Assign(_), ExecutionVariant::Assign(_))

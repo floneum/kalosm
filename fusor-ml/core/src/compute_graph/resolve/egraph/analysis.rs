@@ -50,7 +50,7 @@ pub(super) struct ClassData;
 impl Analysis<FusorLang> for FusorAnalysis {
     type Data = ClassData;
 
-    fn make(_egraph: &EGraph<FusorLang, Self>, _enode: &FusorLang) -> Self::Data {
+    fn make(_egraph: &mut EGraph<FusorLang, Self>, _enode: &FusorLang, _id: Id) -> Self::Data {
         ClassData
     }
 

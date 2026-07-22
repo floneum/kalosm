@@ -199,19 +199,36 @@ impl Resolver {
         graph: &mut ComputeGraphInner,
         node_idx: ExecutionNodeIndex,
     ) -> bool {
+        let trace = std::env::var_os("FUSOR_TRACE_RECOGNIZE").is_some();
         let ExecutionVariant::Reduce(reduce) = &self.execution_graph[node_idx].variant else {
             return false;
         };
         let Some(value) = reduce.plain_input() else {
+            if trace {
+                eprintln!("recognize-matmul: no plain input");
+            }
             return false;
         };
         if self.check_cached(graph, value) || graph.has_live_reference(value) {
+            if trace {
+                eprintln!(
+                    "recognize-matmul: cached={} live={}",
+                    self.check_cached(graph, value),
+                    graph.has_live_reference(value)
+                );
+            }
             return false;
         }
         let Some(nary_exec) = self.get_input_node_in_exec_graph(value) else {
+            if trace {
+                eprintln!("recognize-matmul: producer not in exec graph");
+            }
             return false;
         };
         let ExecutionVariant::Elementwise(nary) = &self.execution_graph[nary_exec].variant else {
+            if trace {
+                eprintln!("recognize-matmul: producer not elementwise");
+            }
             return false;
         };
         if self
@@ -220,9 +237,15 @@ impl Resolver {
             .count()
             != 1
         {
+            if trace {
+                eprintln!("recognize-matmul: multi-consumer producer shape={:?}", nary.shape);
+            }
             return false;
         }
         let Some(contraction) = match_contraction(reduce, nary) else {
+            if trace {
+                eprintln!("recognize-matmul: contraction mismatch shape={:?}", nary.shape);
+            }
             return false;
         };
 
@@ -250,6 +273,14 @@ impl Resolver {
                 },
             );
             let inputs = [operation.first, operation.second];
+            if trace {
+                eprintln!(
+                    "recognize-matmul: COMMIT m={} k={} n={}",
+                    operation.a.rows(),
+                    operation.a.cols(),
+                    operation.b.cols()
+                );
+            }
             self.commit_recognized(
                 graph,
                 node_idx,

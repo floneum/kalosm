@@ -221,6 +221,7 @@ fn if_branches_do_not_share_branch_local_expression_memos() {
         buffers: Vec::new(),
         grid: [1, 1, 1],
         block: 1,
+        byte_arena: false,
         body: vec![Stmt::If {
             condition: Expr::new(
                 ExprKind::Literal(TileLiteral::Bool(true)),

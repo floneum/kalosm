@@ -15,8 +15,13 @@ fn cached_kernel(
     if let Some(cached) = cache.kernels.write().get(&key) {
         return Some(cached.clone());
     }
-    let lowered = build_ir()?.lower_to_naga();
-    if std::env::var_os("FUSOR_TRACE_MATMUL_MERGE").is_some()
+    let ir = build_ir()?;
+    // The threadgroup footprint decides residency on Apple Silicon (two
+    // workgroups per core at or below half the 32 KB budget); record it per
+    // fresh build so selection work always has real numbers.
+    tracing::debug!("kernel_built workgroup_bytes={}", ir.workgroup_bytes());
+    let lowered = ir.lower_to_naga();
+    if cache.config().trace_matmul_merge
         && let Err(error) = &lowered
     {
         eprintln!("tile_ir_lower_error: {error:?}");
@@ -41,7 +46,11 @@ pub fn dynamic_kernel_from_ir(
     dispatch_size: [u32; 3],
 ) -> Option<DirectKernel> {
     let cached = cached_kernel(cache, cache_key, build_ir)?;
-    let bindings = bindings_from_naga(cached.kernel.module(), buffers)?;
+    let bindings = bindings_from_naga(
+        cached.kernel.module(),
+        buffers,
+        cache.config().trace_matmul_merge,
+    )?;
     Some(DirectKernel::from_cached(
         name,
         cached,
@@ -141,6 +150,7 @@ pub fn three_buffer_pipeline_from_ir(
 fn bindings_from_naga(
     module: &wgpu::naga::Module,
     buffers: impl IntoIterator<Item = Arc<wgpu::Buffer>>,
+    trace_mismatch: bool,
 ) -> Option<Vec<DirectKernelBinding>> {
     let mut storages: Vec<(u32, bool)> = module
         .global_variables
@@ -158,7 +168,7 @@ fn bindings_from_naga(
 
     let buffers: Vec<Arc<wgpu::Buffer>> = buffers.into_iter().collect();
     if buffers.len() != storages.len() {
-        if std::env::var_os("FUSOR_TRACE_MATMUL_MERGE").is_some() {
+        if trace_mismatch {
             eprintln!(
                 "bindings_from_naga mismatch: buffers={} storages={}",
                 buffers.len(),

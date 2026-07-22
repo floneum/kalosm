@@ -3,6 +3,7 @@ use super::*;
 // trees directly, so pull them from the internal module.
 use crate::ir::*;
 
+mod arena;
 mod golden;
 mod layout;
 mod lowering;

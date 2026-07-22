@@ -72,6 +72,22 @@ impl SubgroupToken {
     }
 }
 
+/// Capability token for byte-arena workgroup packing: the adapter supports
+/// the workgroup-alias backend extension, so mixed-stride tiles may share
+/// bytes at packed offsets. Same trust model as [`CoopMatrixToken`]: safe
+/// construction lives in device code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ByteArenaToken {
+    _private: (),
+}
+
+impl ByteArenaToken {
+    /// Construct a byte-arena token without checking device capabilities.
+    pub fn new_unchecked() -> Self {
+        Self { _private: () }
+    }
+}
+
 /// Capability token for tile-IR cooperative-matrix operations.
 ///
 /// Safe constructors live in higher-level device code. The unchecked
@@ -150,6 +166,38 @@ impl CoopMatrixToken {
         cols: u32,
     ) -> Tile {
         program.coop_load_b(tile, row, col, scalar, rows, cols)
+    }
+
+    /// Cooperatively load an A-role fragment of the tile's transpose:
+    /// fragment `(i, j)` reads tile element `(col + j, row + i)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn coop_load_a_transposed(
+        self,
+        program: &TileBlock<'_>,
+        tile: &WorkgroupTile,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
+        scalar: ScalarElement,
+        rows: u32,
+        cols: u32,
+    ) -> Tile {
+        program.coop_load_a_transposed(tile, row, col, scalar, rows, cols)
+    }
+
+    /// Cooperatively load a B-role fragment of the tile's transpose:
+    /// fragment `(i, j)` reads tile element `(col + j, row + i)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn coop_load_b_transposed(
+        self,
+        program: &TileBlock<'_>,
+        tile: &WorkgroupTile,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
+        scalar: ScalarElement,
+        rows: u32,
+        cols: u32,
+    ) -> Tile {
+        program.coop_load_b_transposed(tile, row, col, scalar, rows, cols)
     }
 
     /// Cooperatively load a C-role fragment from a rank-1 storage vector.

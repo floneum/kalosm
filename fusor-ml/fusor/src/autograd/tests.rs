@@ -1834,7 +1834,7 @@ async fn test_cast() {
         let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
 
         let output = input.cast::<half::f16>();
-        let output_values = output.as_slice().await.unwrap().to_vec();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec();
 
         assert_close(f32::from(output_values[0]), 1.0);
         assert_close(f32::from(output_values[1]), 2.0);
@@ -2936,6 +2936,93 @@ async fn test_backward_attention_matches_composite() {
         let fused_dv = flatten(fused_gradients.get(&fused_v).unwrap()).await;
         let composite_dv = flatten(composite_gradients.get(&composite_v).unwrap()).await;
 
+        assert_slice_close(&fused_output, &composite_output);
+        assert_slice_close(&fused_dq, &composite_dq);
+        assert_slice_close(&fused_dk, &composite_dk);
+        assert_slice_close(&fused_dv, &composite_dv);
+    }
+}
+
+#[tokio::test]
+async fn test_backward_attention_flash_ineligible_shape() {
+    // A causal shape every flash gate rejects (q and kv not multiples of the
+    // tile sizes, head_dim not a multiple of 32): the forward lowers through
+    // the attention row program and the explicit backward's lse/grad
+    // clusters stay composed. The whole pipeline must still produce finite
+    // gradients that match the composite replay.
+    const BATCH: usize = 1;
+    const HEADS: usize = 2;
+    const SEQ: usize = 50;
+    const DIM: usize = 48;
+    let elements = BATCH * HEADS * SEQ * DIM;
+    let mut state = 0x2458_71a3_u64;
+    let mut next = move || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+    };
+    let q_data: Vec<f32> = (0..elements).map(|_| next()).collect();
+    let k_data: Vec<f32> = (0..elements).map(|_| next()).collect();
+    let v_data: Vec<f32> = (0..elements).map(|_| next()).collect();
+    let mask_data: Vec<f32> = (0..SEQ * SEQ)
+        .map(|i| if i % SEQ <= i / SEQ { 0.0 } else { -1.0e9 })
+        .collect();
+    let scale = 1.0 / (DIM as f32).sqrt();
+
+    for device in test_devices().await {
+        let mask = crate::Tensor::from_slice(&device, [SEQ, SEQ], &mask_data);
+
+        let fused_graph = Graph::new();
+        let fused_q: Tensor<4> =
+            Tensor::from_slice(&fused_graph, &device, [BATCH, HEADS, SEQ, DIM], &q_data);
+        let fused_k: Tensor<4> =
+            Tensor::from_slice(&fused_graph, &device, [BATCH, HEADS, SEQ, DIM], &k_data);
+        let fused_v: Tensor<4> =
+            Tensor::from_slice(&fused_graph, &device, [BATCH, HEADS, SEQ, DIM], &v_data);
+        let fused_output = fused_q.attention(
+            &fused_k,
+            &fused_v,
+            scale,
+            Some((&mask, crate::MaskKind::Causal)),
+        );
+        let fused_loss = fused_output.sqr().reshape([elements]).sum();
+        let fused_gradients = fused_loss.backward().unwrap();
+
+        let composite_graph = Graph::new();
+        let composite_q: Tensor<4> =
+            Tensor::from_slice(&composite_graph, &device, [BATCH, HEADS, SEQ, DIM], &q_data);
+        let composite_k: Tensor<4> =
+            Tensor::from_slice(&composite_graph, &device, [BATCH, HEADS, SEQ, DIM], &k_data);
+        let composite_v: Tensor<4> =
+            Tensor::from_slice(&composite_graph, &device, [BATCH, HEADS, SEQ, DIM], &v_data);
+        let composite_output = composite_q.attention_composite(
+            &composite_k,
+            &composite_v,
+            scale,
+            Some(&(mask.clone(), crate::MaskKind::Causal)),
+        );
+        let composite_loss = composite_output.sqr().reshape([elements]).sum();
+        let composite_gradients = composite_loss.backward().unwrap();
+
+        let fused_output = flatten(fused_output.raw().clone()).await;
+        let composite_output = flatten(composite_output.raw().clone()).await;
+        let fused_dq = flatten(fused_gradients.get(&fused_q).unwrap()).await;
+        let composite_dq = flatten(composite_gradients.get(&composite_q).unwrap()).await;
+        let fused_dk = flatten(fused_gradients.get(&fused_k).unwrap()).await;
+        let composite_dk = flatten(composite_gradients.get(&composite_k).unwrap()).await;
+        let fused_dv = flatten(fused_gradients.get(&fused_v).unwrap()).await;
+        let composite_dv = flatten(composite_gradients.get(&composite_v).unwrap()).await;
+
+        for (name, values) in [
+            ("output", &fused_output),
+            ("dq", &fused_dq),
+            ("dk", &fused_dk),
+            ("dv", &fused_dv),
+        ] {
+            assert!(
+                values.iter().all(|value| value.is_finite()),
+                "{name} contains non-finite values"
+            );
+        }
         assert_slice_close(&fused_output, &composite_output);
         assert_slice_close(&fused_dq, &composite_dq);
         assert_slice_close(&fused_dk, &composite_dk);

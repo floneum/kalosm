@@ -37,9 +37,12 @@ impl Program {
         }
     }
 
-    /// Consume the builder and return the constructed [`KernelIr`].
+    /// Consume the builder and return the constructed [`KernelIr`], with
+    /// barriers that separate no hazardous access pair elided.
     pub(crate) fn into_ir(self) -> KernelIr {
-        self.ir
+        let mut ir = self.ir;
+        crate::analysis::elide_barriers(&mut ir);
+        ir
     }
 }
 
@@ -169,6 +172,13 @@ impl Program {
     // ---- tile / local allocation ----------------------------------------
 
     /// Allocate a rank-2 workgroup-scope tile of shape `[rows, cols]`.
+    /// Opt this kernel into byte-arena workgroup packing: mixed-stride
+    /// tiles share bytes at packed offsets via the workgroup-alias backend
+    /// extension the token proves.
+    pub fn enable_byte_arena(&mut self, _token: crate::tile::ByteArenaToken) {
+        self.ir.byte_arena = true;
+    }
+
     pub fn alloc_workgroup_tile(
         &mut self,
         element: ScalarElement,

@@ -19,8 +19,9 @@ use fusor_tile_ir::{CoopMatrixToken, ElementType, ScalarElement, WorkgroupAxis};
 
 use crate::dispatch::SubgroupConfig;
 use crate::kernels::helpers::{
-    coop_load_a_fragments, coop_load_b_fragments, coop_mma_grid, dispatch_grid_1d,
-    zero_coop_acc_grid,
+    scalar_of,
+    coop_load_a_fragments, coop_load_b_fragments, coop_load_b_fragments_transposed,
+    coop_mma_grid, dispatch_grid_1d, zero_coop_acc_grid,
 };
 
 /// Query rows per workgroup.
@@ -29,9 +30,30 @@ const BR: u32 = 32;
 const BC: u32 = 16;
 /// Cooperative fragment side.
 const COOP_DIM: u32 = 8;
+/// Element the Q/K/V/dO operand tiles stage in: f16 halves their threadgroup
+/// footprint and the MMAs run f16 fragments against f32 accumulators at full
+/// rate. Tiles that receive f32 accumulator stores (scores, dP) stay f32.
+
 /// Finite stand-in for -inf: masked scores exp to zero without the
 /// `(-inf) - (-inf)` NaN when a row is entirely masked so far.
 const MASKED_SCORE: f32 = -3.0e38;
+
+/// The kernel's math runs in f32; convert at the storage boundary when the
+/// operand tensors are f16 (per-lane stores don't convert element types).
+fn cast_to_storage(dst: &Storage, value: Tile) -> Tile {
+    match scalar_of(dst.element()) {
+        ScalarElement::F32 => value,
+        elem => value.cast(elem.element()),
+    }
+}
+
+/// Widen a storage-loaded value into the kernel's f32 math.
+fn cast_from_storage(src: &Storage, value: Tile) -> Tile {
+    match scalar_of(src.element()) {
+        ScalarElement::F32 => value,
+        _ => value.cast(ElementType::F32),
+    }
+}
 
 /// Shape of one fused attention dispatch over rank-4
 /// `[batch, heads, seq, head_dim]` operands.
@@ -126,6 +148,23 @@ pub fn flash_attention_supported(shape: &FlashAttentionShape, subgroups: Subgrou
         && shape.heads % shape.kv_groups == 0
 }
 
+/// Workgroup-memory footprint of [`flash_attention_f32`] in bytes for one
+/// head dim and stage element: the staged Q/KV/P operand tiles in `stage`
+/// (K and V share one tile) plus the f32 score tile and the three per-row
+/// statistic arrays, each tile row carrying one pad element against bank
+/// conflicts. Asserted equal to the lowered IR's `workgroup_bytes` in
+/// `tests/footprint.rs`.
+pub const fn flash_attention_workgroup_bytes(head_dim: u32, stage: ScalarElement) -> u64 {
+    let d = head_dim as u64;
+    let (br, bc) = (BR as u64, BC as u64);
+    let s_cols = if d > bc { d } else { bc };
+    // A padded tile spans `rows * (cols + 1) - 1` elements: the pad after
+    // its last row is never addressed and is not allocated.
+    let stage_elements = (br * (d + 1) - 1) + (bc * (d + 1) - 1) + (br * (bc + 1) - 1);
+    let f32_elements = (br * (s_cols + 1) - 1) + 3 * br;
+    stage_elements * stage.byte_size() + f32_elements * ScalarElement::F32.byte_size()
+}
+
 /// Decompose an operand's (batch, head) base into dynamic (row, col) origins
 /// over a `[seq_stride, 1]`-strided rank-2 view of the same buffer: base
 /// components divisible by the sequence stride advance whole rows, the rest
@@ -197,32 +236,34 @@ pub fn flash_attention_f32(
     let cols_per_lane = d / lanes_per_row;
 
     // Staged tiles (+1 pad on the inner stride against bank conflicts).
-    // `s_tile` holds the BR×BC score/probability tile, then is overwritten
-    // with the BR×d P·V partial after a barrier — probabilities are dead once
-    // every subgroup's MMAs have read them.
-    let q_tile = program.alloc_workgroup_tile_padded(scalar, BR, d, 1);
-    let kt_tile = program.alloc_workgroup_tile_padded(scalar, d, BC, 1);
-    let v_tile = program.alloc_workgroup_tile_padded(scalar, BC, d, 1);
+    // Operands stage in f16; `s_tile` receives the f32 QKᵀ accumulators (cols
+    // 0..BC) and, after a barrier, the f32 P·V partial (cols 0..d) —
+    // probabilities live in the small f16 `p_tile` so they can feed the P·V
+    // MMA as f16 A-fragments.
+    // Stage operands in their own element type: casting f32 operands to
+    // f16 tiles injects ~2e-4 noise per attention op, which measurably
+    // degrades training and compounds to NaN within a few hundred steps.
+    let stage = scalar_of(q.element());
+    let q_tile = program.alloc_workgroup_tile_padded(stage, BR, d, 1);
+    // K and V share one tile: K is dead once the score MMA's post-store
+    // barrier passes, and V is not read until the barrier before the P*V
+    // MMA, so V stages into K's slot between the two existing barriers.
+    // The sharing costs nothing and holds the f16 kernel's footprint at
+    // 16.0 KB - the two-workgroups-per-core residency boundary.
+    let kv_tile = program.alloc_workgroup_tile_padded(stage, BC, d, 1);
     let s_tile = program.alloc_workgroup_tile_padded(scalar, BR, d.max(BC), 1);
+    let p_tile = program.alloc_workgroup_tile_padded(stage, BR, BC, 1);
     let m_arr = program.alloc_workgroup_array(scalar, BR);
     let l_arr = program.alloc_workgroup_array(scalar, BR);
     let alpha_arr = program.alloc_workgroup_array(scalar, BR);
 
-    let q_stride = d + 1;
-    let kt_stride = BC + 1;
-    let v_stride = d + 1;
     let s_stride = d.max(BC) + 1;
+    let p_stride = BC + 1;
 
-    // Rank-2 `[seq positions, head dim]` views over the same buffers keep
-    // `fill_tile`'s vectorized staging whenever the head dim is unit-stride;
-    // other layouts stage through the scalar fallback loops.
     let kv_heads = shape.heads / shape.kv_groups;
-    let q_fast = (lq.dim_stride == 1 && lq.seq_stride > 0).then(|| {
-        q.restride([shape.batch * shape.heads * shape.q_len, d], [lq.seq_stride, 1])
-    });
-    let v_fast = (lv.dim_stride == 1 && lv.seq_stride > 0).then(|| {
-        v.restride([shape.batch * kv_heads * shape.kv_len, d], [lv.seq_stride, 1])
-    });
+    let q_fast = fast_rows_view(q, lq, shape.batch * shape.heads * shape.q_len, d);
+    let k_fast = fast_rows_view(k, lk, shape.batch * kv_heads * shape.kv_len, d);
+    let v_fast = fast_rows_view(v, lv, shape.batch * kv_heads * shape.kv_len, d);
 
     let grid = flash_attention_dispatch(&shape, max_workgroups_per_dimension);
     program.program_grid(block, grid, |program| {
@@ -234,10 +275,6 @@ pub fn flash_attention_f32(
         let b = program.bind(bh.clone() / shape.heads);
         let h = program.bind(bh % shape.heads);
         let kv_h = program.bind(h.clone() / shape.kv_groups);
-        // Element bases of this workgroup's operand slices.
-        let k_base = program.bind(
-            b.clone() * lk.batch_stride + kv_h.clone() * lk.head_stride + lk.offset,
-        );
         let o_base = program.bind(
             b.clone() * lo.batch_stride
                 + h.clone() * lo.head_stride
@@ -265,36 +302,9 @@ pub fn flash_attention_f32(
         let o_col_base = program.bind((lane.clone() % lanes_per_row) * cols_per_lane);
 
         // Q tile is loop-invariant: staged once.
-        if let Some(q_view) = &q_fast {
-            let (row0, col0) = rank2_origins(program, lq, &b, &h);
-            program.fill_tile(&q_tile, q_view, row0 + q_pos_base.clone(), col0);
-        } else {
-            let q_base = program.bind(
-                b.clone() * lq.batch_stride
-                    + h.clone() * lq.head_stride
-                    + qt.clone() * (BR * lq.seq_stride)
-                    + lq.offset,
-            );
-            let q_elems = BR * d;
-            debug_assert_eq!(q_elems % block, 0);
-            for i in 0..q_elems / block {
-                let flat = program.bind(lane.clone() + i * block);
-                let r = program.bind(flat.clone() / d);
-                let c = program.bind(flat % d);
-                let value = program.load(
-                    q.at(q_base.clone() + r.clone() * lq.seq_stride + c.clone() * lq.dim_stride),
-                    Tile::all(),
-                    0.0,
-                );
-                program.store_workgroup(&q_tile, r * q_stride + c, value);
-            }
-        }
-        let v_origins = v_fast
-            .as_ref()
-            .map(|_| rank2_origins(program, lv, &b, &kv_h));
-        let v_base = v_fast.is_none().then(|| {
-            program.bind(b.clone() * lv.batch_stride + kv_h.clone() * lv.head_stride + lv.offset)
-        });
+        stage_rows(
+            program, q, &q_fast, lq, &q_tile, &b, &h, &q_pos_base, BR, d, &lane, block,
+        );
 
         program.loop_range(kv_tiles, |program, kv_t| {
             let kv_pos_base = program.bind(kv_t * BC);
@@ -303,52 +313,11 @@ pub fn flash_attention_f32(
                 program.break_if(kv_pos_base.clone().gt(q_pos_base.clone() + (BR - 1)));
             }
 
-            // Stage Kᵀ ([d][BC], transposed at staging time so QKᵀ is a plain
-            // A×B over workgroup tiles) and V ([BC][d]).
-            let k_tile_base =
-                program.bind(k_base.clone() + kv_pos_base.clone() * lk.seq_stride);
-            let kt_elems = d * BC;
-            debug_assert_eq!(kt_elems % block, 0);
-            for i in 0..kt_elems / block {
-                let flat = program.bind(lane.clone() + i * block);
-                let kv_local = program.bind(flat.clone() / d);
-                let dim = program.bind(flat % d);
-                let value = program.load(
-                    k.at(k_tile_base.clone()
-                        + kv_local.clone() * lk.seq_stride
-                        + dim.clone() * lk.dim_stride),
-                    Tile::all(),
-                    0.0,
-                );
-                program.store_workgroup(&kt_tile, dim * kt_stride + kv_local, value);
-            }
-            if let (Some(v_view), Some((v_row0, v_col0))) = (&v_fast, &v_origins) {
-                program.fill_tile(
-                    &v_tile,
-                    v_view,
-                    v_row0.clone() + kv_pos_base.clone(),
-                    v_col0.clone(),
-                );
-            } else {
-                let v_base = v_base.as_ref().expect("scalar V staging needs a base");
-                let v_tile_base =
-                    program.bind(v_base.clone() + kv_pos_base.clone() * lv.seq_stride);
-                let v_elems = BC * d;
-                debug_assert_eq!(v_elems % block, 0);
-                for i in 0..v_elems / block {
-                    let flat = program.bind(lane.clone() + i * block);
-                    let r = program.bind(flat.clone() / d);
-                    let c = program.bind(flat % d);
-                    let value = program.load(
-                        v.at(v_tile_base.clone()
-                            + r.clone() * lv.seq_stride
-                            + c.clone() * lv.dim_stride),
-                        Tile::all(),
-                        0.0,
-                    );
-                    program.store_workgroup(&v_tile, r * v_stride + c, value);
-                }
-            }
+            // Stage K row-major; QKᵀ reads it through transposed fragment
+            // loads. V stages into the same tile after the score phase.
+            stage_rows(
+                program, k, &k_fast, lk, &kv_tile, &b, &kv_h, &kv_pos_base, BC, d, &lane, block,
+            );
             program.workgroup_barrier();
 
             // S = Q · Kᵀ on fragments: 2×2 subgroup grid, each owning
@@ -369,16 +338,16 @@ pub fn flash_attention_f32(
                     &sg_row_base,
                     kk,
                     s_rows,
-                    scalar,
+                    stage,
                 );
-                let b_frags = coop_load_b_fragments(
+                let b_frags = coop_load_b_fragments_transposed(
                     program,
                     coop,
-                    &kt_tile,
+                    &kv_tile,
                     &sg_col_base,
                     kk,
                     s_cols,
-                    scalar,
+                    stage,
                 );
                 coop_mma_grid(program, coop, &s_accs, &a_frags, &b_frags);
             }
@@ -395,7 +364,17 @@ pub fn flash_attention_f32(
             }
             program.workgroup_barrier();
 
+            // Every subgroup's score MMA reads of K completed before the
+            // barrier above, so V now stages into the shared tile while the
+            // BR softmax lanes work the staged scores; the barrier below
+            // gates the P·V reads of V.
+            stage_rows(
+                program, v, &v_fast, lv, &kv_tile, &b, &kv_h, &kv_pos_base, BC, d, &lane, block,
+            );
+
             // Online softmax over the staged scores: one lane per query row.
+            // Probabilities land in the f16 `p_tile` — the A operand of the
+            // P·V MMA below.
             program.if_then(lane.clone().lt(BR), |program| {
                 let row = lane.clone();
                 let q_pos = program.bind(q_pos_base.clone() + row.clone());
@@ -409,12 +388,15 @@ pub fn flash_attention_f32(
                                 (kv_pos_base.clone() + c).le(q_pos.clone());
                             Tile::select(allowed, raw, Tile::f32(MASKED_SCORE))
                         } else if let Some((mask, lm)) = &mask {
-                            raw + program.load(
-                                mask.at(q_pos.clone() * lm.q_stride
-                                    + (kv_pos_base.clone() + c) * lm.kv_stride
-                                    + lm.offset),
-                                Tile::all(),
-                                0.0,
+                            raw + cast_from_storage(
+                                mask,
+                                program.load(
+                                    mask.at(q_pos.clone() * lm.q_stride
+                                        + (kv_pos_base.clone() + c) * lm.kv_stride
+                                        + lm.offset),
+                                    Tile::all(),
+                                    0.0,
+                                ),
                             )
                         } else {
                             raw
@@ -432,8 +414,8 @@ pub fn flash_attention_f32(
                 for (c, val) in vals.iter().enumerate() {
                     let p = program.bind((val.clone() - m_new.clone()).exp());
                     program.store_workgroup(
-                        &s_tile,
-                        row.clone() * s_stride + c as u32,
+                        &p_tile,
+                        row.clone() * p_stride + c as u32,
                         p.clone(),
                     );
                     row_sum = row_sum + p;
@@ -447,7 +429,7 @@ pub fn flash_attention_f32(
 
             // P·V on fragments: each subgroup owns d/4 output columns across
             // all BR rows. Accumulators stay in registers past the barrier
-            // below, so overwriting the probabilities is safe.
+            // below, so overwriting the score region is safe.
             let pv_rows = BR / COOP_DIM;
             let pv_cols = d / 4 / COOP_DIM;
             let sg_d_base = program.bind(subgroups.token().subgroup_id(program) * (d / 4));
@@ -457,20 +439,20 @@ pub fn flash_attention_f32(
                 let a_frags = coop_load_a_fragments(
                     program,
                     coop,
-                    &s_tile,
+                    &p_tile,
                     &zero_row,
                     kk,
                     pv_rows,
-                    scalar,
+                    stage,
                 );
                 let b_frags = coop_load_b_fragments(
                     program,
                     coop,
-                    &v_tile,
+                    &kv_tile,
                     &sg_d_base,
                     kk,
                     pv_cols,
-                    scalar,
+                    stage,
                 );
                 coop_mma_grid(program, coop, &pv_accs, &a_frags, &b_frags);
             }
@@ -500,8 +482,12 @@ pub fn flash_attention_f32(
                 let folded = program.load_local(reg) * alpha.clone() + partial;
                 program.store_local(reg, folded);
             }
-            // The next iteration's staging writes k/v tiles only; the score
-            // store is gated by the post-staging barrier above.
+            // The trailing barrier gates this iteration's `s_tile`/`alpha_arr`
+            // reads against the next iteration's shared-memory writes. An
+            // attempted elision here (reasoning the post-staging barrier
+            // covers it) produced run-to-run nondeterminism and eventual NaNs
+            // at training step ~300 — the next iteration touches shared
+            // state before its first collective barrier.
             program.workgroup_barrier();
         });
 
@@ -512,7 +498,7 @@ pub fn flash_attention_f32(
                 o.at(o_base.clone()
                     + o_row.clone() * lo.seq_stride
                     + (o_col_base.clone() + i as u32) * lo.dim_stride),
-                program.load_local(reg) * inv_l.clone(),
+                cast_to_storage(o, program.load_local(reg) * inv_l.clone()),
                 Tile::all(),
             );
         }
@@ -521,11 +507,6 @@ pub fn flash_attention_f32(
 }
 
 // ---- backward -------------------------------------------------------------
-
-/// Query/KV rows per workgroup in the backward kernels — halved from the
-/// forward's `BR` so the extra staged operands (dO and both orientations of
-/// the tiles feeding two MMA chains) fit in workgroup memory.
-const BR_BWD: u32 = 16;
 
 /// Element strides of one rank-3 `[batch, heads, seq]` row statistic (the
 /// forward's log-sum-exp, the backward's `rowsum(dO ∘ O)`).
@@ -565,7 +546,7 @@ pub fn flash_attention_bwd_supported(
 ) -> bool {
     flash_attention_supported(shape, subgroups)
         && shape.q_len % BR == 0
-        && shape.kv_len % BR_BWD == 0
+        && shape.kv_len % BR == 0
         && shape.kv_groups == 1
 }
 
@@ -580,24 +561,24 @@ pub fn flash_lse_dispatch(
     )
 }
 
-/// One workgroup per `BR_BWD`-row query tile of one (batch, head).
+/// One workgroup per `BR`-row query tile of one (batch, head).
 pub fn flash_bwd_q_dispatch(
     shape: &FlashAttentionShape,
     max_workgroups_per_dimension: u32,
 ) -> [u32; 3] {
     dispatch_grid_1d(
-        shape.batch * shape.heads * (shape.q_len / BR_BWD),
+        shape.batch * shape.heads * (shape.q_len / BR),
         max_workgroups_per_dimension,
     )
 }
 
-/// One workgroup per `BR_BWD`-row KV tile of one (batch, head).
+/// One workgroup per `BR`-row KV tile of one (batch, head).
 pub fn flash_bwd_kv_dispatch(
     shape: &FlashAttentionShape,
     max_workgroups_per_dimension: u32,
 ) -> [u32; 3] {
     dispatch_grid_1d(
-        shape.batch * shape.heads * (shape.kv_len / BR_BWD),
+        shape.batch * shape.heads * (shape.kv_len / BR),
         max_workgroups_per_dimension,
     )
 }
@@ -659,44 +640,6 @@ fn stage_rows(
     }
 }
 
-/// Stage `rows` consecutive sequence rows transposed into a
-/// `[d][rows + 1]` workgroup tile (row `dim`, column `sequence position`).
-#[allow(clippy::too_many_arguments)]
-fn stage_rows_transposed(
-    program: &mut TileBlock,
-    src: &Storage,
-    layout: FlashOperandLayout,
-    tile: &fusor_tile_ir::tile::WorkgroupTile,
-    b: &Tile,
-    h: &Tile,
-    seq_base: &Tile,
-    rows: u32,
-    d: u32,
-    lane: &Tile,
-    block: u32,
-) {
-    let base = program.bind(
-        b.clone() * layout.batch_stride
-            + h.clone() * layout.head_stride
-            + seq_base.clone() * layout.seq_stride
-            + layout.offset,
-    );
-    let elems = rows * d;
-    debug_assert_eq!(elems % block, 0);
-    let stride = rows + 1;
-    for i in 0..elems / block {
-        let flat = program.bind(lane.clone() + i * block);
-        let r = program.bind(flat.clone() / d);
-        let c = program.bind(flat % d);
-        let value = program.load(
-            src.at(base.clone() + r.clone() * layout.seq_stride + c.clone() * layout.dim_stride),
-            Tile::all(),
-            0.0,
-        );
-        program.store_workgroup(tile, c * stride + r, value);
-    }
-}
-
 /// Load `rows` per-row statistics into a workgroup array (one lane each).
 #[allow(clippy::too_many_arguments)]
 fn load_row_stats(
@@ -727,9 +670,129 @@ fn load_row_stats(
     });
 }
 
+/// Store a `[rows][d]` f32 accumulator grid — each of the four subgroups
+/// owning the `d/4`-column slice at `subgroup_id * d/4` — to `out` at
+/// `out_base + r * seq_stride + col * dim_stride`, staged through the given
+/// dead f32 `[rows][BC + 1]` tiles. One subgroup stages per tile per round
+/// (guarded coop stores are subgroup-uniform), then every lane copies out.
+/// Requires `d / 4 <= BC` so a subgroup slice fits a tile; the last loop
+/// iteration's trailing barrier covers the first round's tile reuse.
+#[allow(clippy::too_many_arguments)]
+fn store_acc_grid_chunked(
+    program: &mut TileBlock,
+    coop: CoopMatrixToken,
+    subgroups: SubgroupConfig,
+    accs: &[Vec<fusor_tile_ir::tile::CoopAcc>],
+    tiles: &[&fusor_tile_ir::tile::WorkgroupTile],
+    out: &Storage,
+    layout: FlashOperandLayout,
+    out_base: &Tile,
+    rows: u32,
+    d: u32,
+    lane: &Tile,
+    block: u32,
+) {
+    let chunk_cols = d / 4;
+    debug_assert!(chunk_cols <= BC && (rows * chunk_cols).is_multiple_of(block));
+    let stride = BC + 1;
+    let sgid = subgroups.token().subgroup_id(program);
+    let mut sg = 0u32;
+    while sg < 4 {
+        if sg > 0 {
+            // The previous round's copies finish before the tiles are reused.
+            program.workgroup_barrier();
+        }
+        let in_round = (tiles.len() as u32).min(4 - sg);
+        for i in 0..in_round {
+            let owner = sg + i;
+            program.if_then(sgid.clone().eq(owner), |program| {
+                for (r, row_accs) in accs.iter().enumerate() {
+                    for (c, acc) in row_accs.iter().enumerate() {
+                        coop.coop_store_tile(
+                            program,
+                            acc,
+                            tiles[i as usize],
+                            Tile::u32(r as u32 * COOP_DIM),
+                            Tile::u32(c as u32 * COOP_DIM),
+                        );
+                    }
+                }
+            });
+        }
+        program.workgroup_barrier();
+        for i in 0..in_round {
+            let col_base = (sg + i) * chunk_cols;
+            for pass in 0..rows * chunk_cols / block {
+                let flat = program.bind(lane.clone() + pass * block);
+                let r = program.bind(flat.clone() / chunk_cols);
+                let c = program.bind(flat % chunk_cols);
+                let value =
+                    program.load_workgroup(tiles[i as usize], r.clone() * stride + c.clone());
+                program.store(
+                    out.at(out_base.clone()
+                        + r * layout.seq_stride
+                        + (c + col_base) * layout.dim_stride),
+                    cast_to_storage(out, value),
+                    Tile::all(),
+                );
+            }
+        }
+        sg += in_round;
+    }
+}
+
+/// Store a `[rows][d]` f32 accumulator grid to `out` staged through one dead
+/// f32 `[rows][d + 1]` tile — the wide-head fallback when a subgroup's
+/// column slice exceeds the chunk tiles.
+#[allow(clippy::too_many_arguments)]
+fn store_acc_grid_whole(
+    program: &mut TileBlock,
+    coop: CoopMatrixToken,
+    subgroups: SubgroupConfig,
+    accs: &[Vec<fusor_tile_ir::tile::CoopAcc>],
+    tile: &fusor_tile_ir::tile::WorkgroupTile,
+    out: &Storage,
+    layout: FlashOperandLayout,
+    out_base: &Tile,
+    rows: u32,
+    d: u32,
+    lane: &Tile,
+    block: u32,
+) {
+    let sg_d_base = program.bind(subgroups.token().subgroup_id(program) * (d / 4));
+    for (r, row_accs) in accs.iter().enumerate() {
+        for (c, acc) in row_accs.iter().enumerate() {
+            coop.coop_store_tile(
+                program,
+                acc,
+                tile,
+                Tile::u32(r as u32 * COOP_DIM),
+                sg_d_base.clone() + c as u32 * COOP_DIM,
+            );
+        }
+    }
+    program.workgroup_barrier();
+    let lanes_per_row = block / rows;
+    let cols_per_lane = d / lanes_per_row;
+    let o_row = program.bind(lane.clone() / lanes_per_row);
+    let o_col_base = program.bind((lane.clone() % lanes_per_row) * cols_per_lane);
+    let stride = d + 1;
+    for i in 0..cols_per_lane {
+        let value =
+            program.load_workgroup(tile, o_row.clone() * stride + o_col_base.clone() + i);
+        program.store(
+            out.at(out_base.clone()
+                + o_row.clone() * layout.seq_stride
+                + (o_col_base.clone() + i) * layout.dim_stride),
+            cast_to_storage(out, value),
+            Tile::all(),
+        );
+    }
+}
+
 /// Emit the row log-sum-exp kernel: `lse[row] = m + ln Σ exp(scale·q·kᵀ
-/// [+ mask] − m)` — the forward statistic the backward kernels use to
-/// reconstruct probabilities per tile. Returns `false` when the shape fails
+/// [+ mask] − m)` — the forward statistic that reconstructs probabilities
+/// per tile. Returns `false` when the shape fails
 /// [`flash_attention_bwd_supported`].
 #[allow(clippy::too_many_arguments)]
 pub fn flash_lse_f32(
@@ -755,14 +818,23 @@ pub fn flash_lse_f32(
     let kv_tiles = shape.kv_len / BC;
     let scalar = ScalarElement::F32;
 
-    let q_tile = program.alloc_workgroup_tile_padded(scalar, BR, d, 1);
-    let kt_tile = program.alloc_workgroup_tile_padded(scalar, d, BC, 1);
+    // Stage operands in their own element type: casting f32 operands to
+    // f16 tiles injects ~2e-4 noise per attention op, which measurably
+    // degrades training and compounds to NaN within a few hundred steps.
+    let stage = scalar_of(q.element());
+    let q_tile = program.alloc_workgroup_tile_padded(stage, BR, d, 1);
+    // Stage operands in their own element type: casting f32 operands to
+    // f16 tiles injects ~2e-4 noise per attention op, which measurably
+    // degrades training and compounds to NaN within a few hundred steps.
+    let stage = scalar_of(q.element());
+    let k_tile = program.alloc_workgroup_tile_padded(stage, BC, d, 1);
     let s_tile = program.alloc_workgroup_tile_padded(scalar, BR, BC, 1);
     let m_arr = program.alloc_workgroup_array(scalar, BR);
     let l_arr = program.alloc_workgroup_array(scalar, BR);
     let s_stride = BC + 1;
 
     let q_fast = fast_rows_view(q, q_layout, shape.batch * shape.heads * shape.q_len, d);
+    let k_fast = fast_rows_view(k, k_layout, shape.batch * shape.heads * shape.kv_len, d);
 
     let grid = flash_lse_dispatch(&shape, max_workgroups_per_dimension);
     program.program_grid(block, grid, |program| {
@@ -790,8 +862,9 @@ pub fn flash_lse_f32(
             if shape.causal {
                 program.break_if(kv_pos_base.clone().gt(q_pos_base.clone() + (BR - 1)));
             }
-            stage_rows_transposed(
-                program, k, k_layout, &kt_tile, &b, &kv_h, &kv_pos_base, BC, d, &lane, block,
+            stage_rows(
+                program, k, &k_fast, k_layout, &k_tile, &b, &kv_h, &kv_pos_base, BC, d, &lane,
+                block,
             );
             program.workgroup_barrier();
 
@@ -805,9 +878,10 @@ pub fn flash_lse_f32(
             let s_accs = zero_coop_acc_grid(program, coop, scalar, s_rows, s_cols);
             for kk in 0..d / COOP_DIM {
                 let a_frags =
-                    coop_load_a_fragments(program, coop, &q_tile, &sg_row_base, kk, s_rows, scalar);
-                let b_frags =
-                    coop_load_b_fragments(program, coop, &kt_tile, &sg_col_base, kk, s_cols, scalar);
+                    coop_load_a_fragments(program, coop, &q_tile, &sg_row_base, kk, s_rows, stage);
+                let b_frags = coop_load_b_fragments_transposed(
+                    program, coop, &k_tile, &sg_col_base, kk, s_cols, stage,
+                );
                 coop_mma_grid(program, coop, &s_accs, &a_frags, &b_frags);
             }
             for (r, row_accs) in s_accs.iter().enumerate() {
@@ -835,12 +909,15 @@ pub fn flash_lse_f32(
                             let allowed = (kv_pos_base.clone() + c).le(q_pos.clone());
                             Tile::select(allowed, raw, Tile::f32(MASKED_SCORE))
                         } else if let Some((mask, lm)) = &mask {
-                            raw + program.load(
-                                mask.at(q_pos.clone() * lm.q_stride
-                                    + (kv_pos_base.clone() + c) * lm.kv_stride
-                                    + lm.offset),
-                                Tile::all(),
-                                0.0,
+                            raw + cast_from_storage(
+                                mask,
+                                program.load(
+                                    mask.at(q_pos.clone() * lm.q_stride
+                                        + (kv_pos_base.clone() + c) * lm.kv_stride
+                                        + lm.offset),
+                                    Tile::all(),
+                                    0.0,
+                                ),
                             )
                         } else {
                             raw
@@ -876,7 +953,7 @@ pub fn flash_lse_f32(
             let l = program.load_workgroup(&l_arr, lane.clone());
             program.store(
                 lse_out.at(lse_base.clone() + lane.clone() * lse_layout.seq_stride),
-                m + l.log(),
+                cast_to_storage(lse_out, m + l.log()),
                 Tile::all(),
             );
         });
@@ -884,7 +961,7 @@ pub fn flash_lse_f32(
     true
 }
 
-/// Emit the dQ kernel: per `BR_BWD`-row query tile, stream KV tiles
+/// Emit the dQ kernel: per `BR`-row query tile, stream KV tiles
 /// reconstructing `P = exp(scale·q·kᵀ [+ mask] − lse)`, form
 /// `dS = P ∘ (dO·vᵀ − dsum) · scale`, and accumulate `dq = Σ dS·k` in
 /// cooperative registers. Returns `false` when the shape fails
@@ -911,27 +988,41 @@ pub fn flash_bwd_q_f32(
     }
     let block = subgroups.block_for_subgroups(4);
     let d = shape.head_dim;
-    let rows = BR_BWD;
-    let q_tiles = shape.q_len / rows;
+    let q_tiles = shape.q_len / BR;
     let kv_tiles = shape.kv_len / BC;
     let scalar = ScalarElement::F32;
     let (lq, lk, lv, ldo) = (layouts.q, layouts.k, layouts.v, layouts.grad_o);
 
-    let q_tile = program.alloc_workgroup_tile_padded(scalar, rows, d, 1);
-    let do_tile = program.alloc_workgroup_tile_padded(scalar, rows, d, 1);
-    let k_tile = program.alloc_workgroup_tile_padded(scalar, BC, d, 1);
-    let kt_tile = program.alloc_workgroup_tile_padded(scalar, d, BC, 1);
-    let vt_tile = program.alloc_workgroup_tile_padded(scalar, d, BC, 1);
-    let s_tile = program.alloc_workgroup_tile_padded(scalar, rows, BC, 1);
-    let dp_tile = program.alloc_workgroup_tile_padded(scalar, rows, BC, 1);
-    let lse_arr = program.alloc_workgroup_array(scalar, rows);
-    let d_arr = program.alloc_workgroup_array(scalar, rows);
+    // Stage operands in their own element type: casting f32 operands to
+    // f16 tiles injects ~2e-4 noise per attention op, which measurably
+    // degrades training and compounds to NaN within a few hundred steps.
+    let stage = scalar_of(q.element());
+    let q_tile = program.alloc_workgroup_tile_padded(stage, BR, d, 1);
+    let do_tile = program.alloc_workgroup_tile_padded(stage, BR, d, 1);
+    // Stage operands in their own element type: casting f32 operands to
+    // f16 tiles injects ~2e-4 noise per attention op, which measurably
+    // degrades training and compounds to NaN within a few hundred steps.
+    let stage = scalar_of(q.element());
+    let k_tile = program.alloc_workgroup_tile_padded(stage, BC, d, 1);
+    let v_tile = program.alloc_workgroup_tile_padded(stage, BC, d, 1);
+    let s_tile = program.alloc_workgroup_tile_padded(scalar, BR, BC, 1);
+    let dp_tile = program.alloc_workgroup_tile_padded(scalar, BR, BC, 1);
+    // dS feeds the dq MMA as f16 A-fragments; the f32 score/dP tiles stay the
+    // accumulator staging (and later the chunked output staging).
+    let ds_tile = program.alloc_workgroup_tile_padded(stage, BR, BC, 1);
+    let lse_arr = program.alloc_workgroup_array(scalar, BR);
+    let d_arr = program.alloc_workgroup_array(scalar, BR);
     let s_stride = BC + 1;
+    // Output staging: dq columns leave through the dead f32 score/dP tiles
+    // when a subgroup's `d/4` slice fits; wider heads stage through one
+    // dedicated f32 tile.
+    let out_whole =
+        (d / 4 > BC).then(|| program.alloc_workgroup_tile_padded(scalar, BR, d, 1));
 
     let q_fast = fast_rows_view(q, lq, shape.batch * shape.heads * shape.q_len, d);
     let do_fast = fast_rows_view(grad_o, ldo, shape.batch * shape.heads * shape.q_len, d);
-    let kv_heads = shape.heads / shape.kv_groups;
-    let k_fast = fast_rows_view(k, lk, shape.batch * kv_heads * shape.kv_len, d);
+    let k_fast = fast_rows_view(k, lk, shape.batch * shape.heads * shape.kv_len, d);
+    let v_fast = fast_rows_view(v, lv, shape.batch * shape.heads * shape.kv_len, d);
 
     let grid = flash_bwd_q_dispatch(&shape, max_workgroups_per_dimension);
     program.program_grid(block, grid, |program| {
@@ -942,26 +1033,25 @@ pub fn flash_bwd_q_f32(
         let qt = program.bind(tile_id % q_tiles);
         let b = program.bind(bh.clone() / shape.heads);
         let h = program.bind(bh % shape.heads);
-        let kv_h = program.bind(h.clone() / shape.kv_groups);
-        let q_pos_base = program.bind(qt * rows);
+        let q_pos_base = program.bind(qt * BR);
         let lane = program.lane();
 
         stage_rows(
-            program, q, &q_fast, lq, &q_tile, &b, &h, &q_pos_base, rows, d, &lane, block,
+            program, q, &q_fast, lq, &q_tile, &b, &h, &q_pos_base, BR, d, &lane, block,
         );
         stage_rows(
-            program, grad_o, &do_fast, ldo, &do_tile, &b, &h, &q_pos_base, rows, d, &lane, block,
+            program, grad_o, &do_fast, ldo, &do_tile, &b, &h, &q_pos_base, BR, d, &lane, block,
         );
         load_row_stats(
-            program, lse, layouts.lse, &lse_arr, &b, &h, &q_pos_base, rows, &lane,
+            program, lse, layouts.lse, &lse_arr, &b, &h, &q_pos_base, BR, &lane,
         );
         load_row_stats(
-            program, dsum, layouts.dsum, &d_arr, &b, &h, &q_pos_base, rows, &lane,
+            program, dsum, layouts.dsum, &d_arr, &b, &h, &q_pos_base, BR, &lane,
         );
 
         // Each subgroup owns `d / 4` output columns across all rows.
         let sg_d_base = program.bind(subgroups.token().subgroup_id(program) * (d / 4));
-        let dq_rows = rows / COOP_DIM;
+        let dq_rows = BR / COOP_DIM;
         let dq_cols = d / 4 / COOP_DIM;
         let dq_accs = zero_coop_acc_grid(program, coop, scalar, dq_rows, dq_cols);
         let zero_row = Tile::u32(0);
@@ -969,39 +1059,39 @@ pub fn flash_bwd_q_f32(
         program.loop_range(kv_tiles, |program, kv_t| {
             let kv_pos_base = program.bind(kv_t * BC);
             if shape.causal {
-                program.break_if(kv_pos_base.clone().gt(q_pos_base.clone() + (rows - 1)));
+                program.break_if(kv_pos_base.clone().gt(q_pos_base.clone() + (BR - 1)));
             }
             stage_rows(
-                program, k, &k_fast, lk, &k_tile, &b, &kv_h, &kv_pos_base, BC, d, &lane, block,
+                program, k, &k_fast, lk, &k_tile, &b, &h, &kv_pos_base, BC, d, &lane, block,
             );
-            stage_rows_transposed(
-                program, k, lk, &kt_tile, &b, &kv_h, &kv_pos_base, BC, d, &lane, block,
-            );
-            stage_rows_transposed(
-                program, v, lv, &vt_tile, &b, &kv_h, &kv_pos_base, BC, d, &lane, block,
+            stage_rows(
+                program, v, &v_fast, lv, &v_tile, &b, &h, &kv_pos_base, BC, d, &lane, block,
             );
             program.workgroup_barrier();
 
-            // S = q·kᵀ and dP = dO·vᵀ on one 2×2 subgroup grid.
+            // S = q·kᵀ and dP = dO·vᵀ on one 2×2 subgroup grid, K/V read
+            // through transposed fragment loads.
             let subgroup_id = subgroups.token().subgroup_id(program);
             let sg_row = program.bind(subgroup_id.clone() / 2);
             let sg_col = program.bind(subgroup_id % 2);
-            let sg_row_base = program.bind(sg_row * (rows / 2));
+            let sg_row_base = program.bind(sg_row * (BR / 2));
             let sg_col_base = program.bind(sg_col * (BC / 2));
-            let s_rows = rows / 2 / COOP_DIM;
+            let s_rows = BR / 2 / COOP_DIM;
             let s_cols = BC / 2 / COOP_DIM;
             let s_accs = zero_coop_acc_grid(program, coop, scalar, s_rows, s_cols);
             let dp_accs = zero_coop_acc_grid(program, coop, scalar, s_rows, s_cols);
             for kk in 0..d / COOP_DIM {
                 let a_frags =
-                    coop_load_a_fragments(program, coop, &q_tile, &sg_row_base, kk, s_rows, scalar);
-                let b_frags =
-                    coop_load_b_fragments(program, coop, &kt_tile, &sg_col_base, kk, s_cols, scalar);
+                    coop_load_a_fragments(program, coop, &q_tile, &sg_row_base, kk, s_rows, stage);
+                let b_frags = coop_load_b_fragments_transposed(
+                    program, coop, &k_tile, &sg_col_base, kk, s_cols, stage,
+                );
                 coop_mma_grid(program, coop, &s_accs, &a_frags, &b_frags);
                 let da_frags =
-                    coop_load_a_fragments(program, coop, &do_tile, &sg_row_base, kk, s_rows, scalar);
-                let db_frags =
-                    coop_load_b_fragments(program, coop, &vt_tile, &sg_col_base, kk, s_cols, scalar);
+                    coop_load_a_fragments(program, coop, &do_tile, &sg_row_base, kk, s_rows, stage);
+                let db_frags = coop_load_b_fragments_transposed(
+                    program, coop, &v_tile, &sg_col_base, kk, s_cols, stage,
+                );
                 coop_mma_grid(program, coop, &dp_accs, &da_frags, &db_frags);
             }
             for (r, row_accs) in s_accs.iter().enumerate() {
@@ -1028,8 +1118,9 @@ pub fn flash_bwd_q_f32(
             }
             program.workgroup_barrier();
 
-            // dS = P ∘ (dP − dsum) · scale, written over the score tile.
-            program.if_then(lane.clone().lt(rows), |program| {
+            // dS = P ∘ (dP − dsum) · scale, written to the f16 dS tile (the
+            // A operand of the dq MMA).
+            program.if_then(lane.clone().lt(BR), |program| {
                 let row = lane.clone();
                 let q_pos = program.bind(q_pos_base.clone() + row.clone());
                 let lse_row = program.bind(program.load_workgroup(&lse_arr, row.clone()));
@@ -1041,12 +1132,15 @@ pub fn flash_bwd_q_f32(
                         let allowed = (kv_pos_base.clone() + c).le(q_pos.clone());
                         Tile::select(allowed, raw, Tile::f32(MASKED_SCORE))
                     } else if let Some((mask, lm)) = &mask {
-                        raw + program.load(
-                            mask.at(q_pos.clone() * lm.q_stride
-                                + (kv_pos_base.clone() + c) * lm.kv_stride
-                                + lm.offset),
-                            Tile::all(),
-                            0.0,
+                        raw + cast_from_storage(
+                            mask,
+                            program.load(
+                                mask.at(q_pos.clone() * lm.q_stride
+                                    + (kv_pos_base.clone() + c) * lm.kv_stride
+                                    + lm.offset),
+                                Tile::all(),
+                                0.0,
+                            ),
                         )
                     } else {
                         raw
@@ -1054,7 +1148,7 @@ pub fn flash_bwd_q_f32(
                     let p = program.bind((masked - lse_row.clone()).exp());
                     let dp = program.load_workgroup(&dp_tile, row.clone() * s_stride + c);
                     let ds = p * (dp - d_row.clone()) * shape.scale;
-                    program.store_workgroup(&s_tile, row.clone() * s_stride + c, ds);
+                    program.store_workgroup(&ds_tile, row.clone() * s_stride + c, ds);
                 }
             });
             program.workgroup_barrier();
@@ -1062,72 +1156,80 @@ pub fn flash_bwd_q_f32(
             // dq += dS·k.
             for kk in 0..BC / COOP_DIM {
                 let a_frags =
-                    coop_load_a_fragments(program, coop, &s_tile, &zero_row, kk, dq_rows, scalar);
+                    coop_load_a_fragments(program, coop, &ds_tile, &zero_row, kk, dq_rows, stage);
                 let b_frags =
-                    coop_load_b_fragments(program, coop, &k_tile, &sg_d_base, kk, dq_cols, scalar);
+                    coop_load_b_fragments(program, coop, &k_tile, &sg_d_base, kk, dq_cols, stage);
                 coop_mma_grid(program, coop, &dq_accs, &a_frags, &b_frags);
             }
             program.workgroup_barrier();
         });
 
-        // Stage the accumulators through the (now dead) q tile and store.
-        for (r, row_accs) in dq_accs.iter().enumerate() {
-            for (c, acc) in row_accs.iter().enumerate() {
-                coop.coop_store_tile(
-                    program,
-                    acc,
-                    &q_tile,
-                    Tile::u32(r as u32 * COOP_DIM),
-                    sg_d_base.clone() + c as u32 * COOP_DIM,
-                );
-            }
-        }
-        program.workgroup_barrier();
+        // Stage the accumulators through dead f32 tiles and store.
         let lo = layouts.out;
-        let lanes_per_row = block / rows;
-        let cols_per_lane = d / lanes_per_row;
-        let o_row = program.bind(lane.clone() / lanes_per_row);
-        let o_col_base = program.bind((lane.clone() % lanes_per_row) * cols_per_lane);
         let out_base = program.bind(
             b * lo.batch_stride
                 + h * lo.head_stride
-                + (q_pos_base + o_row.clone()) * lo.seq_stride
+                + q_pos_base * lo.seq_stride
                 + lo.offset,
         );
-        let q_stride = d + 1;
-        for i in 0..cols_per_lane {
-            let value = program.load_workgroup(
-                &q_tile,
-                o_row.clone() * q_stride + o_col_base.clone() + i,
+        if let Some(out_whole) = &out_whole {
+            store_acc_grid_whole(
+                program, coop, subgroups, &dq_accs, out_whole, dq_out, lo, &out_base, BR, d,
+                &lane, block,
             );
-            program.store(
-                dq_out.at(out_base.clone() + (o_col_base.clone() + i) * lo.dim_stride),
-                value,
-                Tile::all(),
+        } else {
+            store_acc_grid_chunked(
+                program,
+                coop,
+                subgroups,
+                &dq_accs,
+                &[&s_tile, &dp_tile],
+                dq_out,
+                lo,
+                &out_base,
+                BR,
+                d,
+                &lane,
+                block,
             );
         }
     });
     true
 }
 
-/// Emit the dK/dV kernel: per `BR_BWD`-row KV tile, stream query tiles
+/// Which gradients [`flash_bwd_kv_f32`] emits. The independent modes exist so
+/// each recognized contraction can lower alone; a later horizontal merge can
+/// combine two single-output dispatches back into `Both`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FlashKvOutputs {
+    /// dk and dv into one tensor whose sequence axis spans `2·kv_len`
+    /// (dk rows first, dv rows at `kv_len + position`).
+    Both,
+    /// dk only, into a `[batch, heads, kv_len, head_dim]` tensor.
+    Dk,
+    /// dv only, into a `[batch, heads, kv_len, head_dim]` tensor.
+    Dv,
+}
+
+/// Emit the dK/dV kernel: per `BR`-row KV tile, stream query tiles
 /// (descending when causal so the break skips the empty upper triangle),
 /// reconstruct `Pᵀ` from the forward statistics, and accumulate
-/// `dv = Σ Pᵀ·dO` and `dk = Σ dSᵀ·q` in cooperative registers. Both land in
-/// one output tensor whose sequence axis spans `2·kv_len` (dk rows first).
-/// Returns `false` when the shape fails [`flash_attention_bwd_supported`].
+/// `dv = Σ Pᵀ·dO` and/or `dk = Σ dSᵀ·q` in cooperative registers per
+/// `outputs`. Returns `false` when the shape fails
+/// [`flash_attention_bwd_supported`].
 #[allow(clippy::too_many_arguments)]
 pub fn flash_bwd_kv_f32(
     program: &mut Program,
     q: &Storage,
     k: &Storage,
-    v: &Storage,
+    v: Option<&Storage>,
     grad_o: &Storage,
     lse: &Storage,
-    dsum: &Storage,
+    dsum: Option<&Storage>,
     mask: Option<(&Storage, FlashMaskLayout)>,
     dkv_out: &Storage,
     layouts: &FlashBwdLayouts,
+    outputs: FlashKvOutputs,
     shape: FlashAttentionShape,
     subgroups: SubgroupConfig,
     coop: CoopMatrixToken,
@@ -1136,32 +1238,45 @@ pub fn flash_bwd_kv_f32(
     if !flash_attention_bwd_supported(&shape, subgroups) || (shape.causal && mask.is_some()) {
         return false;
     }
+    let emit_dk = outputs != FlashKvOutputs::Dv;
+    let emit_dv = outputs != FlashKvOutputs::Dk;
     let block = subgroups.block_for_subgroups(4);
     let d = shape.head_dim;
-    let kv_rows = BR_BWD;
-    let q_rows = BR_BWD;
-    let kv_tiles = shape.kv_len / kv_rows;
-    let q_tiles = shape.q_len / q_rows;
+    let kv_tiles = shape.kv_len / BR;
+    let q_tiles = shape.q_len / BC;
     let scalar = ScalarElement::F32;
     let (lq, lk, lv, ldo) = (layouts.q, layouts.k, layouts.v, layouts.grad_o);
 
-    let k_tile = program.alloc_workgroup_tile_padded(scalar, kv_rows, d, 1);
-    let v_tile = program.alloc_workgroup_tile_padded(scalar, kv_rows, d, 1);
-    let q_tile = program.alloc_workgroup_tile_padded(scalar, q_rows, d, 1);
-    let do_tile = program.alloc_workgroup_tile_padded(scalar, q_rows, d, 1);
-    let qt_tile = program.alloc_workgroup_tile_padded(scalar, d, q_rows, 1);
-    let dot_tile = program.alloc_workgroup_tile_padded(scalar, d, q_rows, 1);
-    let st_tile = program.alloc_workgroup_tile_padded(scalar, kv_rows, q_rows, 1);
-    let dpt_tile = program.alloc_workgroup_tile_padded(scalar, kv_rows, q_rows, 1);
-    let lse_arr = program.alloc_workgroup_array(scalar, q_rows);
-    let d_arr = program.alloc_workgroup_array(scalar, q_rows);
-    let st_stride = q_rows + 1;
+    // Stage operands in their own element type: casting f32 operands to
+    // f16 tiles injects ~2e-4 noise per attention op, which measurably
+    // degrades training and compounds to NaN within a few hundred steps.
+    let stage = scalar_of(q.element());
+    let k_tile = program.alloc_workgroup_tile_padded(stage, BR, d, 1);
+    // dPᵀ = v·dOᵀ is only needed for dk.
+    let v_tile = emit_dk.then(|| program.alloc_workgroup_tile_padded(stage, BR, d, 1));
+    // Stage operands in their own element type: casting f32 operands to
+    // f16 tiles injects ~2e-4 noise per attention op, which measurably
+    // degrades training and compounds to NaN within a few hundred steps.
+    let stage = scalar_of(q.element());
+    let q_tile = program.alloc_workgroup_tile_padded(stage, BC, d, 1);
+    let do_tile = program.alloc_workgroup_tile_padded(stage, BC, d, 1);
+    let st_tile = program.alloc_workgroup_tile_padded(scalar, BR, BC, 1);
+    let dpt_tile = emit_dk.then(|| program.alloc_workgroup_tile_padded(scalar, BR, BC, 1));
+    // Pᵀ and dSᵀ feed the dv/dk MMAs as f16 A-fragments; the f32 tiles above
+    // keep the accumulator staging (and later the chunked output staging).
+    let pt_tile = emit_dv.then(|| program.alloc_workgroup_tile_padded(stage, BR, BC, 1));
+    let dst_tile = emit_dk.then(|| program.alloc_workgroup_tile_padded(stage, BR, BC, 1));
+    let lse_arr = program.alloc_workgroup_array(scalar, BC);
+    let d_arr = emit_dk.then(|| program.alloc_workgroup_array(scalar, BC));
+    let st_stride = BC + 1;
+    // Wide-head output staging fallback, as in the dq kernel.
+    let out_whole =
+        (d / 4 > BC).then(|| program.alloc_workgroup_tile_padded(scalar, BR, d, 1));
 
     let q_fast = fast_rows_view(q, lq, shape.batch * shape.heads * shape.q_len, d);
     let do_fast = fast_rows_view(grad_o, ldo, shape.batch * shape.heads * shape.q_len, d);
-    let kv_heads = shape.heads / shape.kv_groups;
-    let k_fast = fast_rows_view(k, lk, shape.batch * kv_heads * shape.kv_len, d);
-    let v_fast = fast_rows_view(v, lv, shape.batch * kv_heads * shape.kv_len, d);
+    let k_fast = fast_rows_view(k, lk, shape.batch * shape.heads * shape.kv_len, d);
+    let v_fast = v.and_then(|v| fast_rows_view(v, lv, shape.batch * shape.heads * shape.kv_len, d));
 
     let grid = flash_bwd_kv_dispatch(&shape, max_workgroups_per_dimension);
     program.program_grid(block, grid, |program| {
@@ -1172,21 +1287,26 @@ pub fn flash_bwd_kv_f32(
         let kvt = program.bind(tile_id % kv_tiles);
         let b = program.bind(bh.clone() / shape.heads);
         let h = program.bind(bh % shape.heads);
-        let kv_pos_base = program.bind(kvt * kv_rows);
+        let kv_pos_base = program.bind(kvt * BR);
         let lane = program.lane();
 
         stage_rows(
-            program, k, &k_fast, lk, &k_tile, &b, &h, &kv_pos_base, kv_rows, d, &lane, block,
+            program, k, &k_fast, lk, &k_tile, &b, &h, &kv_pos_base, BR, d, &lane, block,
         );
-        stage_rows(
-            program, v, &v_fast, lv, &v_tile, &b, &h, &kv_pos_base, kv_rows, d, &lane, block,
-        );
+        if let Some(v_tile) = &v_tile {
+            let v = v.expect("dk emission requires the values operand");
+            stage_rows(
+                program, v, &v_fast, lv, v_tile, &b, &h, &kv_pos_base, BR, d, &lane, block,
+            );
+        }
 
         let sg_d_base = program.bind(subgroups.token().subgroup_id(program) * (d / 4));
-        let acc_rows = kv_rows / COOP_DIM;
+        let acc_rows = BR / COOP_DIM;
         let acc_cols = d / 4 / COOP_DIM;
-        let dk_accs = zero_coop_acc_grid(program, coop, scalar, acc_rows, acc_cols);
-        let dv_accs = zero_coop_acc_grid(program, coop, scalar, acc_rows, acc_cols);
+        let dk_accs =
+            emit_dk.then(|| zero_coop_acc_grid(program, coop, scalar, acc_rows, acc_cols));
+        let dv_accs =
+            emit_dv.then(|| zero_coop_acc_grid(program, coop, scalar, acc_rows, acc_cols));
         let zero_row = Tile::u32(0);
 
         program.loop_range(q_tiles, |program, i| {
@@ -1197,53 +1317,56 @@ pub fn flash_bwd_kv_f32(
             } else {
                 program.bind(i)
             };
-            let q_pos_base = program.bind(q_t * q_rows);
+            let q_pos_base = program.bind(q_t * BC);
             if shape.causal {
-                program.break_if((q_pos_base.clone() + (q_rows - 1)).lt(kv_pos_base.clone()));
+                program.break_if((q_pos_base.clone() + (BC - 1)).lt(kv_pos_base.clone()));
             }
             stage_rows(
-                program, q, &q_fast, lq, &q_tile, &b, &h, &q_pos_base, q_rows, d, &lane, block,
+                program, q, &q_fast, lq, &q_tile, &b, &h, &q_pos_base, BC, d, &lane, block,
             );
             stage_rows(
-                program, grad_o, &do_fast, ldo, &do_tile, &b, &h, &q_pos_base, q_rows, d, &lane,
+                program, grad_o, &do_fast, ldo, &do_tile, &b, &h, &q_pos_base, BC, d, &lane,
                 block,
             );
-            stage_rows_transposed(
-                program, q, lq, &qt_tile, &b, &h, &q_pos_base, q_rows, d, &lane, block,
-            );
-            stage_rows_transposed(
-                program, grad_o, ldo, &dot_tile, &b, &h, &q_pos_base, q_rows, d, &lane, block,
-            );
             load_row_stats(
-                program, lse, layouts.lse, &lse_arr, &b, &h, &q_pos_base, q_rows, &lane,
+                program, lse, layouts.lse, &lse_arr, &b, &h, &q_pos_base, BC, &lane,
             );
-            load_row_stats(
-                program, dsum, layouts.dsum, &d_arr, &b, &h, &q_pos_base, q_rows, &lane,
-            );
+            if let Some(d_arr) = &d_arr {
+                let dsum = dsum.expect("dk emission requires the dsum operand");
+                load_row_stats(
+                    program, dsum, layouts.dsum, d_arr, &b, &h, &q_pos_base, BC, &lane,
+                );
+            }
             program.workgroup_barrier();
 
-            // S̃ = k·qᵀ and dPᵀ = v·dOᵀ on one 2×2 subgroup grid.
+            // S̃ = k·qᵀ (and dPᵀ = v·dOᵀ when dk is emitted) on one 2×2
+            // subgroup grid; Q/dO read through transposed fragment loads.
             let subgroup_id = subgroups.token().subgroup_id(program);
             let sg_row = program.bind(subgroup_id.clone() / 2);
             let sg_col = program.bind(subgroup_id % 2);
-            let sg_row_base = program.bind(sg_row * (kv_rows / 2));
-            let sg_col_base = program.bind(sg_col * (q_rows / 2));
-            let s_rows = kv_rows / 2 / COOP_DIM;
-            let s_cols = q_rows / 2 / COOP_DIM;
+            let sg_row_base = program.bind(sg_row * (BR / 2));
+            let sg_col_base = program.bind(sg_col * (BC / 2));
+            let s_rows = BR / 2 / COOP_DIM;
+            let s_cols = BC / 2 / COOP_DIM;
             let st_accs = zero_coop_acc_grid(program, coop, scalar, s_rows, s_cols);
-            let dpt_accs = zero_coop_acc_grid(program, coop, scalar, s_rows, s_cols);
+            let dpt_accs =
+                emit_dk.then(|| zero_coop_acc_grid(program, coop, scalar, s_rows, s_cols));
             for kk in 0..d / COOP_DIM {
                 let a_frags =
-                    coop_load_a_fragments(program, coop, &k_tile, &sg_row_base, kk, s_rows, scalar);
-                let b_frags =
-                    coop_load_b_fragments(program, coop, &qt_tile, &sg_col_base, kk, s_cols, scalar);
-                coop_mma_grid(program, coop, &st_accs, &a_frags, &b_frags);
-                let da_frags =
-                    coop_load_a_fragments(program, coop, &v_tile, &sg_row_base, kk, s_rows, scalar);
-                let db_frags = coop_load_b_fragments(
-                    program, coop, &dot_tile, &sg_col_base, kk, s_cols, scalar,
+                    coop_load_a_fragments(program, coop, &k_tile, &sg_row_base, kk, s_rows, stage);
+                let b_frags = coop_load_b_fragments_transposed(
+                    program, coop, &q_tile, &sg_col_base, kk, s_cols, stage,
                 );
-                coop_mma_grid(program, coop, &dpt_accs, &da_frags, &db_frags);
+                coop_mma_grid(program, coop, &st_accs, &a_frags, &b_frags);
+                if let (Some(dpt_accs), Some(v_tile)) = (&dpt_accs, &v_tile) {
+                    let da_frags = coop_load_a_fragments(
+                        program, coop, v_tile, &sg_row_base, kk, s_rows, stage,
+                    );
+                    let db_frags = coop_load_b_fragments_transposed(
+                        program, coop, &do_tile, &sg_col_base, kk, s_cols, stage,
+                    );
+                    coop_mma_grid(program, coop, dpt_accs, &da_frags, &db_frags);
+                }
             }
             for (r, row_accs) in st_accs.iter().enumerate() {
                 for (c, acc) in row_accs.iter().enumerate() {
@@ -1256,25 +1379,28 @@ pub fn flash_bwd_kv_f32(
                     );
                 }
             }
-            for (r, row_accs) in dpt_accs.iter().enumerate() {
-                for (c, acc) in row_accs.iter().enumerate() {
-                    coop.coop_store_tile(
-                        program,
-                        acc,
-                        &dpt_tile,
-                        sg_row_base.clone() + r as u32 * COOP_DIM,
-                        sg_col_base.clone() + c as u32 * COOP_DIM,
-                    );
+            if let (Some(dpt_accs), Some(dpt_tile)) = (&dpt_accs, &dpt_tile) {
+                for (r, row_accs) in dpt_accs.iter().enumerate() {
+                    for (c, acc) in row_accs.iter().enumerate() {
+                        coop.coop_store_tile(
+                            program,
+                            acc,
+                            dpt_tile,
+                            sg_row_base.clone() + r as u32 * COOP_DIM,
+                            sg_col_base.clone() + c as u32 * COOP_DIM,
+                        );
+                    }
                 }
             }
             program.workgroup_barrier();
 
-            // Pᵀ over the score tile, dSᵀ over the dPᵀ tile. Row = KV
-            // position, column = query position, statistics indexed by query.
-            program.if_then(lane.clone().lt(kv_rows), |program| {
+            // Pᵀ over the score tile (and dSᵀ over the dPᵀ tile when dk is
+            // emitted). Row = KV position, column = query position,
+            // statistics indexed by query.
+            program.if_then(lane.clone().lt(BR), |program| {
                 let kv_row = lane.clone();
                 let kv_pos = program.bind(kv_pos_base.clone() + kv_row.clone());
-                for c in 0..q_rows {
+                for c in 0..BC {
                     let q_pos = program.bind(q_pos_base.clone() + c);
                     let raw = program
                         .load_workgroup(&st_tile, kv_row.clone() * st_stride + c)
@@ -1283,81 +1409,108 @@ pub fn flash_bwd_kv_f32(
                         let allowed = kv_pos.clone().le(q_pos.clone());
                         Tile::select(allowed, raw, Tile::f32(MASKED_SCORE))
                     } else if let Some((mask, lm)) = &mask {
-                        raw + program.load(
-                            mask.at(q_pos.clone() * lm.q_stride
-                                + kv_pos.clone() * lm.kv_stride
-                                + lm.offset),
-                            Tile::all(),
-                            0.0,
+                        raw + cast_from_storage(
+                            mask,
+                            program.load(
+                                mask.at(q_pos.clone() * lm.q_stride
+                                    + kv_pos.clone() * lm.kv_stride
+                                    + lm.offset),
+                                Tile::all(),
+                                0.0,
+                            ),
                         )
                     } else {
                         raw
                     };
                     let lse_col = program.load_workgroup(&lse_arr, Tile::u32(c));
-                    let d_col = program.load_workgroup(&d_arr, Tile::u32(c));
                     let p = program.bind((masked - lse_col).exp());
-                    let dp = program.load_workgroup(&dpt_tile, kv_row.clone() * st_stride + c);
-                    let ds = p.clone() * (dp - d_col) * shape.scale;
-                    program.store_workgroup(&st_tile, kv_row.clone() * st_stride + c, p);
-                    program.store_workgroup(&dpt_tile, kv_row.clone() * st_stride + c, ds);
+                    if let (Some(d_arr), Some(dpt_tile), Some(dst_tile)) =
+                        (&d_arr, &dpt_tile, &dst_tile)
+                    {
+                        let d_col = program.load_workgroup(d_arr, Tile::u32(c));
+                        let dp =
+                            program.load_workgroup(dpt_tile, kv_row.clone() * st_stride + c);
+                        let ds = p.clone() * (dp - d_col) * shape.scale;
+                        program.store_workgroup(dst_tile, kv_row.clone() * st_stride + c, ds);
+                    }
+                    if let Some(pt_tile) = &pt_tile {
+                        program.store_workgroup(pt_tile, kv_row.clone() * st_stride + c, p);
+                    }
                 }
             });
             program.workgroup_barrier();
 
             // dv += Pᵀ·dO and dk += dSᵀ·q.
-            for kk in 0..q_rows / COOP_DIM {
-                let a_frags =
-                    coop_load_a_fragments(program, coop, &st_tile, &zero_row, kk, acc_rows, scalar);
-                let b_frags =
-                    coop_load_b_fragments(program, coop, &do_tile, &sg_d_base, kk, acc_cols, scalar);
-                coop_mma_grid(program, coop, &dv_accs, &a_frags, &b_frags);
-                let ka_frags =
-                    coop_load_a_fragments(program, coop, &dpt_tile, &zero_row, kk, acc_rows, scalar);
-                let kb_frags =
-                    coop_load_b_fragments(program, coop, &q_tile, &sg_d_base, kk, acc_cols, scalar);
-                coop_mma_grid(program, coop, &dk_accs, &ka_frags, &kb_frags);
+            for kk in 0..BC / COOP_DIM {
+                if let (Some(dv_accs), Some(pt_tile)) = (&dv_accs, &pt_tile) {
+                    let a_frags = coop_load_a_fragments(
+                        program, coop, pt_tile, &zero_row, kk, acc_rows, stage,
+                    );
+                    let b_frags = coop_load_b_fragments(
+                        program, coop, &do_tile, &sg_d_base, kk, acc_cols, stage,
+                    );
+                    coop_mma_grid(program, coop, dv_accs, &a_frags, &b_frags);
+                }
+                if let (Some(dk_accs), Some(dst_tile)) = (&dk_accs, &dst_tile) {
+                    let ka_frags = coop_load_a_fragments(
+                        program, coop, dst_tile, &zero_row, kk, acc_rows, stage,
+                    );
+                    let kb_frags = coop_load_b_fragments(
+                        program, coop, &q_tile, &sg_d_base, kk, acc_cols, stage,
+                    );
+                    coop_mma_grid(program, coop, dk_accs, &ka_frags, &kb_frags);
+                }
             }
             program.workgroup_barrier();
         });
 
-        // Stage each accumulator through a dead operand tile and store: dk at
-        // sequence `kv_pos`, dv at `kv_len + kv_pos`.
-        for (accs, tile) in [(&dk_accs, &q_tile), (&dv_accs, &do_tile)] {
-            for (r, row_accs) in accs.iter().enumerate() {
-                for (c, acc) in row_accs.iter().enumerate() {
-                    coop.coop_store_tile(
-                        program,
-                        acc,
-                        tile,
-                        Tile::u32(r as u32 * COOP_DIM),
-                        sg_d_base.clone() + c as u32 * COOP_DIM,
-                    );
-                }
-            }
-        }
-        program.workgroup_barrier();
+        // Stage each accumulator grid through dead f32 tiles and store. In
+        // `Both` mode dk lands at sequence `kv_pos` and dv at
+        // `kv_len + kv_pos`; single-output modes write at `kv_pos`.
+        let dv_seq_offset = if emit_dk { shape.kv_len } else { 0 };
         let lo = layouts.out;
-        let lanes_per_row = block / kv_rows;
-        let cols_per_lane = d / lanes_per_row;
-        let o_row = program.bind(lane.clone() / lanes_per_row);
-        let o_col_base = program.bind((lane.clone() % lanes_per_row) * cols_per_lane);
-        let tile_stride = d + 1;
-        for (seq_offset, tile) in [(0u32, &q_tile), (shape.kv_len, &do_tile)] {
+        let mut stores: Vec<(u32, &Vec<Vec<fusor_tile_ir::tile::CoopAcc>>)> = Vec::new();
+        if let Some(dk_accs) = &dk_accs {
+            stores.push((0, dk_accs));
+        }
+        if let Some(dv_accs) = &dv_accs {
+            stores.push((dv_seq_offset, dv_accs));
+        }
+        let mut chunk_tiles: Vec<&fusor_tile_ir::tile::WorkgroupTile> = vec![&st_tile];
+        if let Some(dpt_tile) = &dpt_tile {
+            chunk_tiles.push(dpt_tile);
+        }
+        for (i, (seq_offset, accs)) in stores.iter().enumerate() {
+            if i > 0 {
+                // The first output's copies finish before its staging tiles
+                // are reused.
+                program.workgroup_barrier();
+            }
             let out_base = program.bind(
                 b.clone() * lo.batch_stride
                     + h.clone() * lo.head_stride
-                    + (kv_pos_base.clone() + o_row.clone() + seq_offset) * lo.seq_stride
+                    + (kv_pos_base.clone() + *seq_offset) * lo.seq_stride
                     + lo.offset,
             );
-            for i in 0..cols_per_lane {
-                let value = program.load_workgroup(
-                    tile,
-                    o_row.clone() * tile_stride + o_col_base.clone() + i,
+            if let Some(out_whole) = &out_whole {
+                store_acc_grid_whole(
+                    program, coop, subgroups, accs, out_whole, dkv_out, lo, &out_base, BR, d,
+                    &lane, block,
                 );
-                program.store(
-                    dkv_out.at(out_base.clone() + (o_col_base.clone() + i) * lo.dim_stride),
-                    value,
-                    Tile::all(),
+            } else {
+                store_acc_grid_chunked(
+                    program,
+                    coop,
+                    subgroups,
+                    accs,
+                    &chunk_tiles,
+                    dkv_out,
+                    lo,
+                    &out_base,
+                    BR,
+                    d,
+                    &lane,
+                    block,
                 );
             }
         }

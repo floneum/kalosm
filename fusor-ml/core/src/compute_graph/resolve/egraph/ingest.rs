@@ -83,7 +83,7 @@ pub(super) fn enode_for(
         ExecutionVariant::QEmbedding(_) => {
             FusorLang::QEmbedding(prov, intern(analysis, variant), [children[0]])
         }
-        ExecutionVariant::RowProgram(_) => {
+        ExecutionVariant::RowProgram(_) | ExecutionVariant::Attention(_) => {
             FusorLang::RowProgram(prov, intern(analysis, variant), children.into_boxed_slice())
         }
     }

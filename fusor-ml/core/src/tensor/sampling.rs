@@ -100,7 +100,9 @@ impl Tensor {
         let chunks = input_len.div_ceil(crate::top_k::TOP_K_CHUNK);
         let mut candidate_count = k
             .div_ceil(chunks)
-            .max(crate::top_k::min_top_k_candidates_per_chunk())
+            .max(crate::top_k::min_top_k_candidates_per_chunk(
+                self.device().config(),
+            ))
             .min(k)
             .min(crate::top_k::TOP_K_CHUNK);
 

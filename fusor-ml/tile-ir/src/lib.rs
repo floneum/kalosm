@@ -25,6 +25,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+mod analysis;
 mod ir;
 mod kernel_builder;
 mod lower;
@@ -40,10 +41,11 @@ pub use ir::{
 // LocalDecl, Node, ReduceKind, Source, Stmt, Tile, TileDecl) is intentionally not
 // re-exported: consumers only build via `tile`/`KernelBuilder` and lower to an
 // opaque `NagaKernel`. Internal code names these through `crate::ir::*`.
+pub use analysis::{set_liveness_trace, BarrierSuggestion};
 pub use kernel_builder::{KernelBuilder, KernelTensorRef};
 pub use lower::{LowerError, NagaKernel};
 pub use quantized::{GgmlQuantFormat, QuantizedMatrix};
-pub use tile::{CoopMatrixToken, SubgroupToken};
+pub use tile::{ByteArenaToken, CoopMatrixToken, SubgroupToken};
 
 #[cfg(test)]
 mod tests;

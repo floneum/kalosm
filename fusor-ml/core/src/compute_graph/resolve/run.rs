@@ -16,11 +16,10 @@ impl Resolver {
         _removed: &mut Vec<ComputeGraphNode>,
         tail: impl FnOnce(&TensorData, &mut wgpu::CommandEncoder) -> T,
     ) -> (ResolverResult, T) {
-        let host_trace =
-            cfg!(target_arch = "wasm32") || std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some();
+        let device = graph.device();
+        let host_trace = cfg!(target_arch = "wasm32") || device.config().trace_resolve_host;
         let host_total_start = host_trace.then(Instant::now);
         let mut host_profile = ResolveHostProfile::default();
-        let device = graph.device();
         let max_subgroup_size = device.max_subgroup_size();
 
         // Pass 1: Build execution graph for all targets
@@ -130,10 +129,9 @@ impl Resolver {
             command_encoder
         };
 
-        let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-            || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
-        let trace_names = std::env::var_os("FUSOR_TRACE_DECODE_NAMES").is_some();
-        let profile_gpu_kernels = std::env::var_os("FUSOR_TRACE_GPU_KERNELS").is_some();
+        let trace = device.config().trace_decode || device.config().trace_resolve;
+        let trace_names = device.config().trace_decode_names;
+        let profile_gpu_kernels = device.config().trace_gpu_kernels;
         let collect_dispatch_metadata = trace || profile_gpu_kernels;
         let mut commands = Vec::<CommandRecord>::with_capacity(queued_operations.len());
         let mut dispatch_categories = FxHashMap::<String, usize>::default();
@@ -268,8 +266,10 @@ impl Resolver {
             } else {
                 let mut dispatch_index = 0usize;
                 let mut command_index = 0usize;
-                let dispatches_per_pass = dispatches_per_pass(total_kernels);
-                let dispatches_per_submit = dispatches_per_submit(total_kernels, device.backend());
+                let mut copy_records = 0usize;
+                let mut pass_segments = 0usize;
+                let dispatches_per_pass = dispatches_per_pass(&device, total_kernels);
+                let dispatches_per_submit = dispatches_per_submit(&device, total_kernels);
                 let wait_after_chunk_submit = device.backend() == wgpu::Backend::Metal;
                 let mut dispatches_in_submit = 0usize;
                 let mut encoder_has_commands = false;
@@ -296,6 +296,7 @@ impl Resolver {
                                 copy.destination_offset,
                                 copy.size,
                             );
+                            copy_records += 1;
                             encoder_has_commands = true;
                             command_index += 1;
                         }
@@ -334,6 +335,7 @@ impl Resolver {
                                     label: Some("Resolver Direct Kernels"),
                                     timestamp_writes: None,
                                 });
+                            pass_segments += 1;
                             let mut pass_dispatches = 0usize;
                             while command_index < commands.len() {
                                 if pass_dispatches >= dispatches_per_pass {
@@ -366,6 +368,11 @@ impl Resolver {
                             }
                         }
                     }
+                }
+                if host_trace {
+                    tracing::info!(
+                        "resolve_pass_layout kernels={total_kernels} passes={pass_segments} copies={copy_records}"
+                    );
                 }
             }
 
@@ -485,28 +492,22 @@ pub(super) fn kernel_plan_binding_buffers(
     vec![buffers]
 }
 
-pub(super) fn dispatches_per_pass(total_kernels: usize) -> usize {
-    if let Ok(value) = std::env::var("FUSOR_RESOLVE_DISPATCHES_PER_PASS")
-        && let Ok(parsed) = value.parse::<usize>()
-        && parsed > 0
-    {
-        return parsed;
+pub(super) fn dispatches_per_pass(device: &crate::Device, total_kernels: usize) -> usize {
+    if let Some(value) = device.config().resolve_dispatches_per_pass {
+        return value;
     }
 
     if total_kernels >= 1024 { 1 } else { usize::MAX }
 }
 
-pub(super) fn dispatches_per_submit(total_kernels: usize, backend: wgpu::Backend) -> usize {
-    if let Ok(value) = std::env::var("FUSOR_RESOLVE_DISPATCHES_PER_SUBMIT")
-        && let Ok(parsed) = value.parse::<usize>()
-        && parsed > 0
-    {
-        return parsed;
+pub(super) fn dispatches_per_submit(device: &crate::Device, total_kernels: usize) -> usize {
+    if let Some(value) = device.config().resolve_dispatches_per_submit {
+        return value;
     }
 
     // Chunked submits exist to bound in-flight memory on giant training
     // graphs; small inference graphs must stay a single submit.
-    if backend == wgpu::Backend::Metal && total_kernels >= 1024 {
+    if device.backend() == wgpu::Backend::Metal && total_kernels >= 1024 {
         256
     } else {
         usize::MAX

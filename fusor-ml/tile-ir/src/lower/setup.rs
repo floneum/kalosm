@@ -1,7 +1,10 @@
 use super::*;
 
 impl<'a> Lowerer<'a> {
-    pub(super) fn new(ir: &'a KernelIr) -> Result<Self, LowerError> {
+    pub(super) fn new(
+        ir: &'a KernelIr,
+        tile_arena: super::arena::TileArena,
+    ) -> Result<Self, LowerError> {
         let analysis = analysis::Analysis::run(ir);
         let mut caps = analysis.caps;
         // Cooperative-matrix lowering needs a subgroup id even if the kernel
@@ -114,6 +117,7 @@ impl<'a> Lowerer<'a> {
             buffer_decls: analysis.buffers,
             tile_decls: analysis.tiles,
             local_decls: analysis.locals,
+            tile_arena,
         })
     }
 
@@ -231,6 +235,9 @@ impl<'a> Lowerer<'a> {
         if self.caps.uses_coop {
             capabilities |= naga::valid::Capabilities::COOPERATIVE_MATRIX;
         }
+        if matches!(self.tile_arena.mode, super::arena::ArenaMode::ByteArena) {
+            capabilities |= naga::valid::Capabilities::WORKGROUP_MEMORY_ALIAS;
+        }
         let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
             .validate(&self.module)
             .map_err(|error| LowerError::Validation(format!("{error:#?}")))?;
@@ -266,6 +273,7 @@ impl<'a> Lowerer<'a> {
                     ty,
                     init: None,
                     memory_decorations: naga::MemoryDecorations::empty(),
+                    workgroup_alias: None,
                 },
                 Span::default(),
             );
@@ -277,13 +285,26 @@ impl<'a> Lowerer<'a> {
     }
 
     fn create_workgroup_globals(&mut self) -> Result<(), LowerError> {
-        let tiles = self.collect_tiles();
-        for tile in &tiles {
-            if tile.layout.memory_level() != MemoryLevel::Workgroup {
-                continue;
-            }
-            let ty = self.tile_type(tile.element, &tile.layout)?;
-            let global = self.module.global_variables.append(
+        // One global per arena region: barrier-separated disjoint-lifetime
+        // tiles of one stride class share the allocation, sized for the
+        // widest occupant and typed with the region's canonical element.
+        // Every tile indexes from zero within its own logical extent, so
+        // sharing needs no address rewriting; a heterogeneous region
+        // bitcasts values at each access instead.
+        let mut region_globals: Vec<Option<Handle<GlobalVariable>>> =
+            vec![None; self.tile_arena.regions.len()];
+        // ByteArena mode: one untyped-by-convention backing store, typed
+        // per-tile globals aliased into it at packed byte offsets. Created
+        // before any alias so the arena handle always precedes them.
+        let mut arena_global: Option<Handle<GlobalVariable>> = None;
+        if matches!(self.tile_arena.mode, super::arena::ArenaMode::ByteArena) {
+            let quads = std::num::NonZeroU32::new(self.tile_arena.arena_bytes / 16)
+                .ok_or(LowerError::UnsupportedOperation("empty workgroup arena"))?;
+            let ty = self.array_type_with_size(
+                ElementType::vector(ScalarElement::U32, 4),
+                ArraySize::Constant(quads),
+            )?;
+            arena_global = Some(self.module.global_variables.append(
                 GlobalVariable {
                     name: None,
                     space: AddressSpace::WorkGroup,
@@ -291,12 +312,78 @@ impl<'a> Lowerer<'a> {
                     ty,
                     init: None,
                     memory_decorations: naga::MemoryDecorations::empty(),
+                    workgroup_alias: None,
                 },
                 Span::default(),
-            );
-            self.globals
-                .borrow_mut()
-                .insert(std::rc::Rc::as_ptr(tile) as *const (), global);
+            ));
+        }
+        let tiles = self.collect_tiles();
+        for tile in &tiles {
+            if tile.layout.memory_level() != MemoryLevel::Workgroup {
+                continue;
+            }
+            let key = std::rc::Rc::as_ptr(tile) as *const ();
+            let global = match self.tile_arena.assignment.get(&key).copied() {
+                Some(super::arena::Placement::Region { index }) => {
+                    if region_globals[index].is_none() {
+                        let region = &self.tile_arena.regions[index];
+                        let elements = std::num::NonZeroU32::new(region.elements)
+                            .ok_or(LowerError::UnsupportedOperation("empty workgroup tile"))?;
+                        let ty = self.array_type_with_size(
+                            region.canonical,
+                            ArraySize::Constant(elements),
+                        )?;
+                        region_globals[index] = Some(self.module.global_variables.append(
+                            GlobalVariable {
+                                name: None,
+                                space: AddressSpace::WorkGroup,
+                                binding: None,
+                                ty,
+                                init: None,
+                                memory_decorations: naga::MemoryDecorations::empty(),
+                                workgroup_alias: None,
+                            },
+                            Span::default(),
+                        ));
+                    }
+                    region_globals[index].expect("created above")
+                }
+                Some(super::arena::Placement::Arena { byte_offset }) => {
+                    let ty = self.tile_type(tile.element, &tile.layout)?;
+                    self.module.global_variables.append(
+                        GlobalVariable {
+                            name: None,
+                            space: AddressSpace::WorkGroup,
+                            binding: None,
+                            ty,
+                            init: None,
+                            memory_decorations: naga::MemoryDecorations::empty(),
+                            workgroup_alias: Some(naga::WorkgroupAlias {
+                                arena: arena_global.expect("created above for ByteArena mode"),
+                                byte_offset,
+                            }),
+                        },
+                        Span::default(),
+                    )
+                }
+                // Declared but never touched: keep a private allocation.
+                None => {
+                    let ty = self.tile_type(tile.element, &tile.layout)?;
+                    self.module.global_variables.append(
+                        GlobalVariable {
+                            name: None,
+                            space: AddressSpace::WorkGroup,
+                            binding: None,
+                            ty,
+                            init: None,
+                            memory_decorations: naga::MemoryDecorations::empty(),
+                            workgroup_alias: None,
+                        },
+                        Span::default(),
+                    )
+                }
+            };
+            self.globals.borrow_mut().insert(key, global);
         }
         Ok(())
     }
@@ -443,36 +530,11 @@ impl<'a> Lowerer<'a> {
     }
 
     fn element_array_stride(element: ElementType) -> Result<u32, LowerError> {
-        match element {
-            ElementType::F32 | ElementType::U32 => Ok(4),
-            ElementType::F16 => Ok(2),
-            ElementType::Vector { scalar, lanes } => Self::vector_array_stride(scalar, lanes),
-            ElementType::Bool => Err(LowerError::UnsupportedOperation(
-                "bool arrays are not supported",
-            )),
-            ElementType::CoopMatrix { .. } => Err(LowerError::UnsupportedOperation(
-                "cooperative-matrix arrays are not supported",
-            )),
-        }
-    }
-
-    fn vector_array_stride(scalar: ScalarElement, lanes: u32) -> Result<u32, LowerError> {
-        let scalar_size = match scalar {
-            ScalarElement::F32 | ScalarElement::U32 => 4,
-            ScalarElement::F16 => 2,
-            ScalarElement::Bool => {
-                return Err(LowerError::UnsupportedOperation(
-                    "bool vector arrays are not supported",
-                ));
-            }
-        };
-        match lanes {
-            2 => Ok(2 * scalar_size),
-            3 | 4 => Ok(4 * scalar_size),
-            _ => Err(LowerError::UnsupportedOperation(
-                "vectors must have 2, 3, or 4 lanes",
-            )),
-        }
+        element
+            .workgroup_array_stride()
+            .ok_or(LowerError::UnsupportedOperation(
+                "element cannot back a workgroup array",
+            ))
     }
 }
 

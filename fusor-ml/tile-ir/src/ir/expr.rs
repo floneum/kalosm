@@ -74,6 +74,9 @@ pub enum CoopSrc {
         row: Box<Expr>,
         /// Column coordinate of the fragment origin.
         col: Box<Expr>,
+        /// Load the transpose of the addressed region: fragment `(i, j)`
+        /// reads tile element `(col + j, row + i)`.
+        transposed: bool,
     },
     /// A rank-1 storage vector broadcast across all fragment rows.
     BroadcastCol {
@@ -446,11 +449,17 @@ fn hash_addr(addr: &Addr, h: &mut FxHasher) {
 
 fn hash_coop_src(src: &CoopSrc, h: &mut FxHasher) {
     match src {
-        CoopSrc::TileRegion { tile, row, col } => {
+        CoopSrc::TileRegion {
+            tile,
+            row,
+            col,
+            transposed,
+        } => {
             h.write_u8(0);
             hash_ptr(tile, h);
             hash_expr(row, h);
             hash_expr(col, h);
+            h.write_u8(*transposed as u8);
         }
         CoopSrc::BroadcastCol { src, col } => {
             h.write_u8(1);
@@ -653,13 +662,15 @@ fn coop_src_eq(a: &CoopSrc, b: &CoopSrc) -> bool {
                 tile: tx,
                 row: rx,
                 col: cx,
+                transposed: px,
             },
             CoopSrc::TileRegion {
                 tile: ty,
                 row: ry,
                 col: cy,
+                transposed: py,
             },
-        ) => Rc::ptr_eq(tx, ty) && expr_eq(rx, ry) && expr_eq(cx, cy),
+        ) => Rc::ptr_eq(tx, ty) && expr_eq(rx, ry) && expr_eq(cx, cy) && px == py,
         (
             CoopSrc::BroadcastCol { src: sx, col: cx },
             CoopSrc::BroadcastCol { src: sy, col: cy },
@@ -901,4 +912,132 @@ fn kind_eq(a: &ExprKind, b: &ExprKind) -> bool {
         (ExprKind::Shared(x), ExprKind::Shared(y)) => expr_eq(x, y),
         _ => false,
     }
+}
+
+impl ExprKind {
+    /// Visit every direct child expression of this node, exhaustively: new
+    /// variants must extend this or fail to compile, so structural passes
+    /// (liveness, footprint) cannot silently skip children.
+    pub(crate) fn for_each_child(&self, f: &mut dyn FnMut(&Expr)) {
+        let addr = |addr: &Addr, f: &mut dyn FnMut(&Expr)| match addr {
+            Addr::Rc2 { row, col } => {
+                f(row);
+                f(col);
+            }
+            Addr::Linear(index) => f(index),
+        };
+        match self {
+            Self::Literal(_) | Self::Builtin(_) | Self::LoadLocal(_) => {}
+            Self::Load {
+                addr: a,
+                mask,
+                fill,
+                ..
+            } => {
+                addr(a, f);
+                f(mask);
+                f(fill);
+            }
+            Self::LoadTile { index, .. } => f(index),
+            Self::Unary { value, .. } => f(value),
+            Self::Binary { left, right, .. } | Self::Compare { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            Self::Cast { value, .. } | Self::Bitcast { value, .. } => f(value),
+            Self::Select {
+                condition,
+                accept,
+                reject,
+            } => {
+                f(condition);
+                f(accept);
+                f(reject);
+            }
+            Self::Vec { parts, .. } => {
+                for part in parts {
+                    f(part);
+                }
+            }
+            Self::Dot { left, right } => {
+                f(left);
+                f(right);
+            }
+            Self::Reduce { value, .. } => f(value),
+            Self::CoopLoad { src, .. } => match src {
+                CoopSrc::TileRegion { row, col, .. } => {
+                    f(row);
+                    f(col);
+                }
+                CoopSrc::BroadcastCol { col, .. } => f(col),
+            },
+            Self::CoopMma { a, b, c } => {
+                f(a);
+                f(b);
+                f(c);
+            }
+            Self::Dequantize {
+                k_base,
+                col,
+                mask,
+                fill,
+                ..
+            } => {
+                f(k_base);
+                f(col);
+                f(mask);
+                f(fill);
+            }
+            Self::VecComponent { vector, .. } => f(vector),
+            Self::LaneOf { block, .. } => f(block),
+            Self::QuantizedDot {
+                activations,
+                k_base,
+                col,
+                mask,
+                fill,
+                ..
+            } => {
+                for activation in activations {
+                    f(activation);
+                }
+                f(k_base);
+                f(col);
+                f(mask);
+                f(fill);
+            }
+            Self::Shared(inner) => f(inner),
+        }
+    }
+
+    /// Visit every workgroup/private tile this node references directly
+    /// (not through children): tile loads, cooperative tile-region loads,
+    /// and reduction scratch tiles. Loads are plain reads; reduction scratch
+    /// is a collective read-modify-write.
+    pub(crate) fn for_each_tile(&self, f: &mut dyn FnMut(&Tile, TileUse)) {
+        match self {
+            Self::LoadTile { tile, .. } => f(tile, TileUse::Read),
+            Self::CoopLoad {
+                src: CoopSrc::TileRegion { tile, .. },
+                ..
+            } => f(tile, TileUse::CoopRead),
+            Self::Reduce { kind, .. } => match kind {
+                ReduceKind::Subgroup => {}
+                ReduceKind::Workgroup { scratch, .. } => f(scratch, TileUse::ReadWrite),
+                ReduceKind::Loop { scratch, .. } => f(scratch, TileUse::ReadWrite),
+            },
+            _ => {}
+        }
+    }
+}
+
+/// How an expression node uses a tile it references directly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TileUse {
+    Read,
+    /// Read through a raw cooperative-matrix pointer: the tile's emitted
+    /// array type must equal its element type.
+    CoopRead,
+    /// Collective read-modify-write (reduction scratch).
+    ReadWrite,
 }

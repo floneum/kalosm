@@ -9,6 +9,7 @@ use rustc_hash::FxHashMap;
 #[cfg(feature = "graphvis")]
 use tabbycat::Graph;
 
+pub(crate) use resolve::FusionPlanStore;
 pub(crate) use resolve::flush_replay::FlushPlanCache;
 
 mod layout_pass;
@@ -368,19 +369,15 @@ pub(crate) struct ComputeGraphInner {
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 8192;
 
-fn read_flush_threshold() -> usize {
-    std::env::var("FUSOR_GRAPH_FLUSH_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_FLUSH_THRESHOLD)
-}
-
 impl ComputeGraphInner {
     fn new(device: &Device) -> Self {
         Self {
             device: device.downgrade(),
             nodes: ComputeGraphNodes::default(),
-            flush_threshold: read_flush_threshold(),
+            flush_threshold: device
+                .config()
+                .graph_flush_threshold
+                .unwrap_or(DEFAULT_FLUSH_THRESHOLD),
             pending_sinks: FxHashMap::default(),
             pending_seq: 0,
             deferred_dead: Vec::new(),

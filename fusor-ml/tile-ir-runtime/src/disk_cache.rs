@@ -74,9 +74,10 @@ pub(crate) struct DiskPlanCache {
 impl DiskPlanCache {
     /// Open (creating if needed) the plan directory for this executable and
     /// device fingerprint, or `None` when its location is unresolvable.
-    pub(crate) fn open(device_fingerprint: u64) -> Option<Self> {
-        let base = match std::env::var_os("FUSOR_KERNEL_CACHE_DIR") {
-            Some(dir) => PathBuf::from(dir),
+    /// `dir_override` replaces the platform cache directory when set.
+    pub(crate) fn open(device_fingerprint: u64, dir_override: Option<PathBuf>) -> Option<Self> {
+        let base = match dir_override {
+            Some(dir) => dir,
             None => default_cache_dir()?,
         };
         remove_stale_salts(&base);

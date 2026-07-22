@@ -1,5 +1,6 @@
 use fusor_tile_ir::{tile, GgmlQuantFormat, NagaKernel, ScalarElement, Shape};
 use fusor_tile_ir_kernels::{
+    DEFAULT_SWIZZLE_GROUP_M,
     qgemv_with_epilogue, qgemv_workgroup_f16_with_epilogue, qgemv_workgroup_with_epilogue,
     qmatmul_with_epilogue, qmatmul_workgroup_f16_with_epilogues, qmatmul_workgroup_with_epilogues,
     quantized_matrix, try_batched_coop_matmul, DenseCoopMatmulConfig, DenseCoopMatmulTile,
@@ -176,6 +177,8 @@ fn cooperative_dense_f32_matmul_lowers() {
                     bn: 64,
                     bk: 16,
                 },
+                staging: None,
+                swizzle_group_m: DEFAULT_SWIZZLE_GROUP_M,
             },
         ));
     });
@@ -228,6 +231,8 @@ fn cooperative_dense_f32_matmul_with_pre_and_post_epilogues_lowers() {
                     bn: 64,
                     bk: 16,
                 },
+                staging: None,
+                swizzle_group_m: DEFAULT_SWIZZLE_GROUP_M,
             },
         ));
     });
@@ -273,6 +278,8 @@ fn cooperative_dense_f16_matmul_lowers() {
                     bn: 64,
                     bk: 16,
                 },
+                staging: None,
+                swizzle_group_m: DEFAULT_SWIZZLE_GROUP_M,
             },
         ));
     });
@@ -318,6 +325,8 @@ fn cooperative_dense_f32_matmul_128x128_lowers() {
                     bn: 128,
                     bk: 16,
                 },
+                staging: None,
+                swizzle_group_m: DEFAULT_SWIZZLE_GROUP_M,
             },
         ));
     });
@@ -363,6 +372,8 @@ fn cooperative_dense_f32_matmul_128x64_lowers() {
                     bn: 64,
                     bk: 16,
                 },
+                staging: None,
+                swizzle_group_m: DEFAULT_SWIZZLE_GROUP_M,
             },
         ));
     });
@@ -410,6 +421,8 @@ fn cooperative_dense_f32_matmul_128x256_npass_lowers() {
                     bn: 256,
                     bk: 16,
                 },
+                staging: None,
+                swizzle_group_m: DEFAULT_SWIZZLE_GROUP_M,
             },
         ));
     });

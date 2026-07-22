@@ -196,7 +196,12 @@ impl Analysis {
 
     fn visit_coop_src(&mut self, src: &CoopSrc) {
         match src {
-            CoopSrc::TileRegion { tile, row, col } => {
+            CoopSrc::TileRegion {
+                tile,
+                row,
+                col,
+                transposed: _,
+            } => {
                 self.note_tile(tile);
                 self.visit_expr(row);
                 self.visit_expr(col);

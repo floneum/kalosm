@@ -430,12 +430,15 @@ impl DirectKernel {
         let pipeline = cached
             .pipeline
             .get_or_init(|| {
-                crate::note_compile(&format!(
-                    "pipeline name={} dispatch={:?} bindings={}",
-                    self.name,
-                    self.dispatch_size,
-                    bindings.len()
-                ));
+                crate::note_compile(
+                    cache.config(),
+                    &format!(
+                        "pipeline name={} dispatch={:?} bindings={}",
+                        self.name,
+                        self.dispatch_size,
+                        bindings.len()
+                    ),
+                );
                 cache
                     .device
                     .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

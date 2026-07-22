@@ -145,9 +145,10 @@ impl CoopTile {
         m: u32,
         k: u32,
         n: u32,
+        datatype: crate::DataTypeEnum,
         policy: &crate::occupancy::DispatchPolicy,
         max_subgroup_size: u32,
     ) -> Option<Self> {
-        super::cost::select_coop_tile(m, k, n, policy, max_subgroup_size)
+        super::cost::select_coop_tile(m, k, n, datatype, policy, max_subgroup_size)
     }
 }

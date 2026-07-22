@@ -765,7 +765,10 @@ fn natural_form_updates_replay_and_claim_in_place() {
         let mut previous_ptrs: Option<[usize; 3]> = None;
         let mut stable_iterations = 0;
         let (mut expected_m, mut expected_v, mut expected_p) = (0.5f32, 0.25f32, 1.0f32);
-        for iteration in 0..5 {
+        // Lifecycle: plain resolve, record on the second sighting, then
+        // replay — so replays (and in-place claim stability) start at the
+        // third iteration.
+        for iteration in 0..6 {
             let g = Tensor::new::<f32, 1, _>(&device, &vec![0.01f32; N]);
             let m2 = &(&m + 0.1f32) + &g;
             let v2 = &(&v + 0.2f32) + &g;
@@ -936,7 +939,7 @@ fn quantized_materialization_records_and_replays() {
         let records_before = device.flush_plan_cache().record_count();
         let replays_before = device.flush_plan_cache().replay_count();
 
-        for iteration in 0..2 {
+        for iteration in 0..3 {
             let input_values = (0..K)
                 .map(|index| iteration as f32 + index as f32 * 0.125)
                 .collect::<Vec<_>>();
@@ -976,7 +979,7 @@ fn dequantization_replay_keeps_raw_and_materialized_bindings_distinct() {
         let records_before = device.flush_plan_cache().record_count();
         let replays_before = device.flush_plan_cache().replay_count();
 
-        for _ in 0..2 {
+        for _ in 0..3 {
             let raw = vec![0u8; ROWS * std::mem::size_of::<BlockQ4K>()];
             let matrix = crate::QMatrix::from_parts(
                 &device,

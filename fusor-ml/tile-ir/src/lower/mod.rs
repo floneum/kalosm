@@ -23,8 +23,18 @@ const WORKGROUP_ID_ARG: u32 = 1;
 const DEFAULT_WORKGROUP_INVOCATIONS: u32 = 256;
 const DEFAULT_WORKGROUP_SIZE: [u32; 3] = [16, 16, 1];
 
+/// Workgroup memory the lowered kernel allocates, in bytes — after
+/// liveness-based tile sharing, i.e. what the GPU actually reserves.
+pub(crate) fn workgroup_bytes(ir: &crate::KernelIr) -> u64 {
+    let info = crate::analysis::LivenessInfo::compute(ir);
+    arena::TileArena::assign(&info, ir.byte_arena).total_bytes()
+}
+
 pub(crate) fn lower_to_naga(ir: &KernelIr) -> Result<NagaKernel, LowerError> {
-    Lowerer::new(ir)?.lower()
+    let info = crate::analysis::LivenessInfo::compute(ir);
+    let tile_arena = arena::TileArena::assign(&info, ir.byte_arena);
+    crate::analysis::verify_arena(&info, &tile_arena).map_err(LowerError::BarrierHazard)?;
+    Lowerer::new(ir, tile_arena)?.lower()
 }
 
 /// A validated Naga lowering result.
@@ -43,7 +53,8 @@ impl NagaKernel {
         let capabilities = naga::valid::Capabilities::SHADER_FLOAT16
             | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
             | naga::valid::Capabilities::SUBGROUP
-            | naga::valid::Capabilities::COOPERATIVE_MATRIX;
+            | naga::valid::Capabilities::COOPERATIVE_MATRIX
+            | naga::valid::Capabilities::WORKGROUP_MEMORY_ALIAS;
         let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
             .validate(&module)
             .map_err(|error| LowerError::Validation(format!("{error:#?}")))?;
@@ -103,6 +114,8 @@ pub enum LowerError {
     UnsupportedMemoryLevel(MemoryLevel),
     /// The typed IR operation is outside the supported lowering subset.
     UnsupportedOperation(&'static str),
+    /// Tiles share workgroup bytes without a guaranteed separating barrier.
+    BarrierHazard(String),
     /// Naga rejected the generated module.
     Validation(String),
 }
@@ -114,6 +127,7 @@ impl fmt::Display for LowerError {
                 write!(f, "unsupported memory level {:?}", memory)
             }
             Self::UnsupportedOperation(op) => write!(f, "unsupported operation {op}"),
+            Self::BarrierHazard(error) => write!(f, "workgroup barrier hazard: {error}"),
             Self::Validation(error) => write!(f, "naga validation failed: {error}"),
         }
     }
@@ -207,6 +221,9 @@ struct Lowerer<'a> {
     buffer_decls: Vec<Buffer>,
     tile_decls: Vec<Tile>,
     local_decls: Vec<Local>,
+    /// Liveness-based sharing of workgroup allocations: barrier-separated
+    /// disjoint-lifetime tiles of one element type map onto one global.
+    tile_arena: arena::TileArena,
 }
 
 /// Snapshot of the per-iteration caches that are scoped to one loop iteration:
@@ -236,6 +253,7 @@ fn local_key(local: &Local) -> *const () {
 }
 
 mod analysis;
+pub(crate) mod arena;
 mod block;
 mod control;
 mod coop;

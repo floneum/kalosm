@@ -12,12 +12,14 @@ mod quantized_matrix;
 
 pub use attention::{
     flash_attention_bwd_supported, flash_attention_dispatch, flash_attention_f32,
-    flash_attention_supported, flash_bwd_kv_dispatch, flash_bwd_kv_f32, flash_bwd_q_dispatch,
-    flash_bwd_q_f32, flash_lse_dispatch, flash_lse_f32, FlashAttentionLayouts,
-    FlashAttentionShape, FlashBwdLayouts, FlashMaskLayout, FlashOperandLayout, FlashRowLayout,
+    flash_attention_supported, flash_attention_workgroup_bytes, flash_bwd_kv_dispatch,
+    flash_bwd_kv_f32, flash_bwd_q_dispatch, flash_bwd_q_f32, flash_lse_dispatch, flash_lse_f32,
+    FlashAttentionLayouts, FlashAttentionShape, FlashBwdLayouts, FlashKvOutputs, FlashMaskLayout,
+    FlashOperandLayout, FlashRowLayout,
 };
 pub use helpers::AccumCast;
 pub use matmul::{
+    DEFAULT_SWIZZLE_GROUP_M,
     fma_matmul_f32,
     coop_tile_entries, merged_split_k_combine, split_k_combine, try_batched_coop_matmul,
     try_batched_coop_matmul_split_k, try_merged_coop_matmul, CoopTileEntry,

@@ -34,6 +34,8 @@ pub use composite::{
 };
 pub use device::Device;
 pub use error::Error;
+#[cfg(feature = "gpu")]
+pub use fusor_core::FusorConfig;
 pub use fusion::{Concrete, Fusion};
 pub use fusor_types::{D, Dim, FromArray, Layout, StrideSpec};
 

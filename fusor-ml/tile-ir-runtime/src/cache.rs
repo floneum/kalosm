@@ -152,6 +152,7 @@ impl DirectDynamicBindGroupKey {
 /// pipeline cache.
 pub struct KernelCache {
     pub(crate) device: Arc<wgpu::Device>,
+    config: Arc<crate::FusorConfig>,
     pub(crate) wgpu_cache: Option<wgpu::PipelineCache>,
     cache_file: Option<PathBuf>,
     pub(crate) kernels: RwLock<LruCache<KernelCacheKey, Arc<CachedKernel>, FxBuildHasher>>,
@@ -176,8 +177,15 @@ fn make_lru<K: Hash + Eq, V>(size: usize) -> RwLock<LruCache<K, V, FxBuildHasher
 }
 
 impl KernelCache {
-    pub fn new(device: Arc<wgpu::Device>, adapter: &wgpu::Adapter) -> Self {
+    pub fn new(
+        device: Arc<wgpu::Device>,
+        adapter: &wgpu::Adapter,
+        config: Arc<crate::FusorConfig>,
+    ) -> Self {
         use wgpu::PipelineCacheDescriptor;
+        // tile-ir cannot see the config (the dependency points this way);
+        // push the liveness/arena trace flag down at device creation.
+        fusor_tile_ir::set_liveness_trace(config.trace_arena);
         let filename = wgpu::util::pipeline_cache_key(&adapter.get_info());
         let (wgpu_cache, cache_file) = if let Some(filename) =
             filename.filter(|_| device.features().contains(wgpu::Features::PIPELINE_CACHE))
@@ -197,11 +205,15 @@ impl KernelCache {
             (None, None)
         };
 
-        let kernel_plan_cache = KernelPlanCache::new();
-        kernel_plan_cache.attach_disk(device_capability_fingerprint(&device));
+        let kernel_plan_cache = KernelPlanCache::new(config.trace_resolve_host);
+        kernel_plan_cache.attach_disk(
+            device_capability_fingerprint(&device),
+            config.kernel_cache_dir.clone(),
+        );
 
         Self {
             device,
+            config,
             wgpu_cache,
             cache_file,
             kernels: make_lru(KERNEL_CACHE_SIZE),
@@ -214,6 +226,11 @@ impl KernelCache {
 
     pub fn wgpu_device(&self) -> &Arc<wgpu::Device> {
         &self.device
+    }
+
+    /// The process configuration this cache was constructed with.
+    pub fn config(&self) -> &crate::FusorConfig {
+        &self.config
     }
 
     pub fn kernel_plan_cache(&self) -> &KernelPlanCache {
@@ -278,10 +295,10 @@ impl KernelCache {
     }
 
     pub fn create_naga_shader_module(&self, kernel: &NagaKernel) -> wgpu::ShaderModule {
-        crate::note_compile("shader");
+        crate::note_compile(&self.config, "shader");
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(dir) = std::env::var_os("FUSOR_DUMP_SHADERS") {
-            dump_shader(kernel, std::path::Path::new(&dir));
+        if let Some(dir) = &self.config.dump_shaders {
+            dump_shader(kernel, dir);
         }
         // SAFETY: all kernels avoid out-of-bounds memory access and unbounded loops.
         unsafe {

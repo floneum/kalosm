@@ -223,6 +223,7 @@ Module {
             memory_decorations: MemoryDecorations(
                 0x0,
             ),
+            workgroup_alias: None,
         },
         [1]: GlobalVariable {
             name: None,
@@ -242,6 +243,7 @@ Module {
             memory_decorations: MemoryDecorations(
                 0x0,
             ),
+            workgroup_alias: None,
         },
         [2]: GlobalVariable {
             name: None,
@@ -252,6 +254,7 @@ Module {
             memory_decorations: MemoryDecorations(
                 0x0,
             ),
+            workgroup_alias: None,
         },
     },
     global_expressions: {},

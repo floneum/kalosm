@@ -87,6 +87,13 @@ impl CastTo<half::f16> for f64 {
     }
 }
 
+impl CastTo<half::f16> for u32 {
+    #[inline(always)]
+    fn cast(self) -> half::f16 {
+        half::f16::from_f32(self as f32)
+    }
+}
+
 /// Cast a tensor from one element type to another
 pub(crate) fn cast_tensor<T, T2, const R: usize>(
     input: &ConcreteTensor<T, R>,

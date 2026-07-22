@@ -44,7 +44,9 @@ members = [
 ]
 
 [patch.crates-io]
-wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now" }
+# Local checkout of the wgpu fork while the mixed-precision cooperative-MMA
+# extension bakes (f16 operands with f32 accumulators in the MSL writer).
+wgpu = { path = "../wgpu-fusor/wgpu" }
 
 [workspace.dependencies]
 kalosm = { path = "./interfaces/kalosm", version = "0.4.0", default-features = false }
@@ -390,3 +392,7 @@ codegen-units = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[patch."https://github.com/ealmloff/wgpu"]
+naga = { path = "../wgpu-fusor/naga" }
+wgpu = { path = "../wgpu-fusor/wgpu" }

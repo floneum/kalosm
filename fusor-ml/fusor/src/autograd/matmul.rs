@@ -1,6 +1,40 @@
 use super::*;
 
-impl<const R: usize> Tensor<R> {
+impl<const R: usize, T: AutogradElement> Tensor<R, T>
+where
+    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
+{
     pub(super) fn mat_mul_internal(&self, rhs: &Self) -> Self {
         assert_same_graph(self, rhs);
         let value = self.value.mat_mul(&rhs.value);
@@ -9,7 +43,7 @@ impl<const R: usize> Tensor<R> {
         let lhs_value = self.value.clone();
         let rhs_value = rhs.value.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<R>(&*gradient, "mat_mul")?;
+            let gradient = downcast_tensor::<R, T>(&*gradient, "mat_mul")?;
             Ok(vec![
                 BackwardTarget {
                     node: lhs_id,
@@ -46,7 +80,7 @@ impl<const R: usize> Tensor<R> {
         let lhs_value = self.value.clone();
         let rhs_value = rhs.value.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<R>(&*gradient, "mat_mul_transposed_rhs")?;
+            let gradient = downcast_tensor::<R, T>(&*gradient, "mat_mul_transposed_rhs")?;
             Ok(vec![
                 BackwardTarget {
                     node: lhs_id,
@@ -74,6 +108,9 @@ impl<const R: usize> Tensor<R> {
         self.transpose(R - 2, R - 1)
     }
 
+}
+
+impl<const R: usize> Tensor<R> {
     pub fn q_mat_mul(&self, weights: &crate::QMatrix) -> Self {
         if R == 1 {
             let k = self.shape()[0];

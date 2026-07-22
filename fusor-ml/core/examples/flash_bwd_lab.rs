@@ -6,8 +6,8 @@
 use fusor_core::Device;
 use fusor_tile_ir::tile;
 use fusor_tile_ir_kernels::{
-    FlashAttentionShape, FlashBwdLayouts, FlashMaskLayout, FlashOperandLayout, FlashRowLayout,
-    SubgroupConfig,
+    FlashAttentionShape, FlashBwdLayouts, FlashKvOutputs, FlashMaskLayout, FlashOperandLayout,
+    FlashRowLayout, SubgroupConfig,
 };
 
 fn env_u32(name: &str, default: u32) -> u32 {
@@ -295,13 +295,14 @@ fn main() {
                         phase,
                         &q,
                         &k,
-                        &v,
+                        Some(&v),
                         &go,
                         &lse,
-                        &dsum,
+                        Some(&dsum),
                         mask.as_ref().map(|m| (m, mask_layout)),
                         &dkv,
                         &dkv_layouts,
+                        FlashKvOutputs::Both,
                         shape,
                         subgroups,
                         coop,

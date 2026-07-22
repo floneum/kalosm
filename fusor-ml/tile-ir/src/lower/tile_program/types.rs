@@ -46,6 +46,55 @@ impl<'a> Lowerer<'a> {
         self.cast_as(expressions, body, value, scalar.kind, Some(scalar.width))
     }
 
+    /// Element type a tile's backing array is emitted with: its region's
+    /// canonical element, which differs from the tile's own element only
+    /// when the region is shared across types.
+    pub(in crate::lower) fn tile_emitted_element(&self, tile: &Tile) -> ElementType {
+        match self.tile_arena.assignment.get(&super::super::tile_key(tile)) {
+            Some(super::super::arena::Placement::Region { index }) => {
+                self.tile_arena.regions[*index].canonical
+            }
+            _ => tile.element,
+        }
+    }
+
+    /// Load one element through a tile pointer, bitcasting from the
+    /// region's canonical type back to the tile's element when they differ.
+    pub(in crate::lower) fn load_tile_value(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        tile: &Tile,
+        pointer: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let value = Self::emit_load(expressions, body, pointer);
+        if self.tile_emitted_element(tile) == tile.element {
+            return value;
+        }
+        let scalar = Self::element_scalar(tile.element);
+        self.cast_as(expressions, body, value, scalar.kind, None)
+    }
+
+    /// Bitcast a tile-element value to the region's canonical type (when
+    /// they differ) and store it through the tile pointer.
+    pub(in crate::lower) fn store_tile_value(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        tile: &Tile,
+        pointer: Handle<Expression>,
+        value: Handle<Expression>,
+    ) {
+        let emitted = self.tile_emitted_element(tile);
+        let value = if emitted == tile.element {
+            value
+        } else {
+            let scalar = Self::element_scalar(emitted);
+            self.cast_as(expressions, body, value, scalar.kind, None)
+        };
+        body.push(Statement::Store { pointer, value }, Span::default());
+    }
+
     pub(in crate::lower) fn condition_value(
         &self,
         expressions: &mut Arena<Expression>,

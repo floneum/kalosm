@@ -4,7 +4,42 @@ use crate::composite::index::IndexOp;
 
 use super::*;
 
-impl<const R: usize> Tensor<R> {
+impl<const R: usize, T: AutogradElement> Tensor<R, T>
+where
+    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
+    u32: crate::CastTo<T> + crate::CastTensor<T>,
+{
     pub fn index_select(&self, dimension: usize, indices: &RawTensor<1, u32>) -> Self {
         let input_shape = self.shape();
         assert!(dimension < R, "index_select dimension out of bounds");
@@ -13,7 +48,7 @@ impl<const R: usize> Tensor<R> {
         let input_id = self.handle.id;
         let indices = indices.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<R>(&*gradient, "index_select")?;
+            let gradient = downcast_tensor::<R, T>(&*gradient, "index_select")?;
             let one_hot = one_hot_matrix(&indices, input_shape[dimension]);
             // transpose+reshape only commute through a copy, so the moved axis
             // is materialized once on each side of the matmul; dimension 0
@@ -46,9 +81,9 @@ impl<const R: usize> Tensor<R> {
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
-    fn index_ops<const OUT: usize>(&self, ops: [IndexOp; R]) -> Tensor<OUT>
+    fn index_ops<const OUT: usize>(&self, ops: [IndexOp; R]) -> Tensor<OUT, T>
     where
-        crate::gpu::Tensor<R, f32>: crate::gpu::SmallerRank<1, OUT, f32>,
+        crate::gpu::Tensor<R, T>: crate::gpu::SmallerRank<1, OUT, T>,
     {
         let shape = self.shape();
         let slices: [Range<usize>; R] = std::array::from_fn(|axis| ops[axis].to_range(shape[axis]));
@@ -57,8 +92,43 @@ impl<const R: usize> Tensor<R> {
     }
 }
 
-impl Tensor<2> {
-    pub fn i<I1, I2>(&self, index: (I1, I2)) -> Tensor<1>
+impl<T: AutogradElement> Tensor<2, T>
+where
+    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
+    u32: crate::CastTo<T> + crate::CastTensor<T>,
+{
+    pub fn i<I1, I2>(&self, index: (I1, I2)) -> Tensor<1, T>
     where
         I1: Into<IndexOp>,
         I2: Into<IndexOp>,
@@ -66,7 +136,7 @@ impl Tensor<2> {
         self.index_ops([index.0.into(), index.1.into()])
     }
 
-    pub fn gather_last(&self, indices: &RawTensor<1, u32>) -> Tensor<1> {
+    pub fn gather_last(&self, indices: &RawTensor<1, u32>) -> Tensor<1, T> {
         let shape = self.shape();
         assert_eq!(
             shape[0],
@@ -86,9 +156,9 @@ impl Tensor<2> {
         let input_id = self.handle.id;
         let indices = indices.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let gradient = downcast_tensor::<1>(&*gradient, "gather_last")?;
+            let gradient = downcast_tensor::<1, T>(&*gradient, "gather_last")?;
             let one_hot = one_hot_matrix(&indices, width);
-            let input_gradient: RawTensor<2, f32> = one_hot.mul_(&gradient.reshape([shape[0], 1]));
+            let input_gradient: RawTensor<2, T> = one_hot.mul_(&gradient.reshape([shape[0], 1]));
             Ok(vec![BackwardTarget {
                 node: input_id,
                 gradient: Box::new(input_gradient),
@@ -102,7 +172,7 @@ impl Tensor<2> {
     /// log-sum-exp max-shifted. The backward is analytic —
     /// `dlogits = (softmax(x) - onehot(t)) * grad / rows` — so the whole
     /// loss runs in a handful of fused kernels instead of a taped chain.
-    pub fn softmax_cross_entropy(&self, targets: &RawTensor<1, u32>) -> Tensor<0> {
+    pub fn softmax_cross_entropy(&self, targets: &RawTensor<1, u32>) -> Tensor<0, T> {
         let [rows, width] = self.shape();
         assert_eq!(
             targets.shape()[0],
@@ -133,17 +203,17 @@ impl Tensor<2> {
         let flat = logits.reshape([rows * width]).into_concrete();
         let picked = flat.index_select(0, &linear).into_concrete();
         let per_row = (lse_total.reshape([rows]).into_concrete() - picked).into_concrete();
-        let value = (per_row.sum::<0>(0) * (1.0 / rows as f32)).into_concrete();
+        let value = (per_row.sum::<0>(0) * T::from_f32(1.0 / rows as f32)).into_concrete();
 
         let input_id = self.handle.id;
         let logits_value = self.value.clone();
         let targets = targets.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
-            let grad = downcast_tensor::<0>(&*gradient, "softmax_cross_entropy")?;
+            let grad = downcast_tensor::<0, T>(&*gradient, "softmax_cross_entropy")?;
             let probs = logits_value.softmax_last_dim::<1>();
             let one_hot = one_hot_matrix(&targets, width);
             let scale =
-                (grad.reshape([1, 1]).into_concrete() * (1.0 / rows as f32)).into_concrete();
+                (grad.reshape([1, 1]).into_concrete() * T::from_f32(1.0 / rows as f32)).into_concrete();
             let diff = (probs - one_hot).into_concrete();
             let dlogits = (&diff * &scale.broadcast_as([rows, width])).into_concrete();
             Ok(vec![BackwardTarget {
@@ -154,7 +224,7 @@ impl Tensor<2> {
         self.emit_op(value, vec![self.handle.clone()], Some(backward))
     }
 
-    pub fn embedding(&self, indices: &RawTensor<2, u32>) -> Tensor<3> {
+    pub fn embedding(&self, indices: &RawTensor<2, u32>) -> Tensor<3, T> {
         let [rows, columns] = indices.shape();
         let width = self.shape()[1];
         let flat_indices = indices.clone().reshape([rows * columns]).into_concrete();
@@ -163,8 +233,43 @@ impl Tensor<2> {
     }
 }
 
-impl Tensor<3> {
-    pub fn i<I1, I2, I3>(&self, index: (I1, I2, I3)) -> Tensor<2>
+impl<T: AutogradElement> Tensor<3, T>
+where
+    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
+    u32: crate::CastTo<T> + crate::CastTensor<T>,
+{
+    pub fn i<I1, I2, I3>(&self, index: (I1, I2, I3)) -> Tensor<2, T>
     where
         I1: Into<IndexOp>,
         I2: Into<IndexOp>,
@@ -174,8 +279,43 @@ impl Tensor<3> {
     }
 }
 
-impl Tensor<4> {
-    pub fn i<I1, I2, I3, I4>(&self, index: (I1, I2, I3, I4)) -> Tensor<3>
+impl<T: AutogradElement> Tensor<4, T>
+where
+    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
+    crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
+    crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
+    u32: crate::CastTo<T> + crate::CastTensor<T>,
+{
+    pub fn i<I1, I2, I3, I4>(&self, index: (I1, I2, I3, I4)) -> Tensor<3, T>
     where
         I1: Into<IndexOp>,
         I2: Into<IndexOp>,
@@ -191,16 +331,21 @@ impl Tensor<4> {
     }
 }
 
-/// Build a `[indices.len(), size]` f32 matrix with 1.0 at `[row, indices[row]]`
+/// Build a `[indices.len(), size]` one-hot matrix with 1.0 at `[row, indices[row]]`
 /// so scatter-adds stay on-device as matmuls/products against it; duplicate
 /// indices accumulate through the contraction.
-fn one_hot_matrix(indices: &RawTensor<1, u32>, size: usize) -> RawTensor<2, f32> {
+fn one_hot_matrix<T: AutogradElement>(indices: &RawTensor<1, u32>, size: usize) -> RawTensor<2, T>
+where
+    u32: crate::CastTo<T> + crate::CastTensor<T>,
+    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+{
     let device = indices.device();
     let rows = indices.shape()[0];
     let positions = (0..size)
-        .map(|position| position as f32)
+        .map(|position| T::from_f32(position as f32))
         .collect::<Vec<_>>();
-    let positions: RawTensor<2, f32> = RawTensor::from_slice(&device, [1, size], &positions);
-    let indices = indices.cast::<f32>().reshape([rows, 1]).into_concrete();
-    indices.sub_(&positions).eq(0.0)
+    let positions: RawTensor<2, T> = RawTensor::from_slice(&device, [1, size], &positions);
+    let indices = indices.cast::<T>().reshape([rows, 1]).into_concrete();
+    indices.sub_(&positions).eq(T::from_f32(0.0))
 }

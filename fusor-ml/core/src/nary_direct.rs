@@ -79,7 +79,7 @@ fn build_nary_direct_kernel_with_output_index(
     let total_elements = total_elements(&operation.shape)?;
     let plan = plan_nary_tiling(operation, &graph.device(), &values, output_index);
     if let Some(plan) = &plan
-        && std::env::var_os("FUSOR_TRACE_REDUCE_TILED").is_some()
+        && graph.device().config().trace_reduce_tiled
     {
         eprintln!(
             "nary_tiled dim={} invariant={:?} threads={} shape={:?}",
@@ -113,7 +113,7 @@ fn build_nary_direct_kernel_with_output_index(
         dispatch_size,
         inputs,
     );
-    let name = if std::env::var_os("FUSOR_TRACE_DECODE_NAMES").is_some() {
+    let name = if graph.device().config().trace_decode_names {
         operation.name()
     } else {
         format!("nary_direct_out_{output_index}")
@@ -277,7 +277,7 @@ pub(crate) fn build_merged_region_kernel(
             class.hash(state);
         }
     });
-    let name = if std::env::var_os("FUSOR_TRACE_DECODE_NAMES").is_some() {
+    let name = if device.config().trace_decode_names {
         format!(
             "merged_region[{}]",
             segments

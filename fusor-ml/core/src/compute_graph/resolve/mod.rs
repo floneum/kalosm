@@ -47,6 +47,7 @@ mod recognize_attention;
 mod recognize_cat;
 mod run;
 
+pub(crate) use egraph::FusionPlanStore;
 pub(crate) use plan_cache::structural_kernel_key;
 
 pub(crate) struct ResolverResult {
@@ -184,6 +185,7 @@ pub(crate) enum ExecutionVariant {
     QMatMul(Box<QMatMulOperation>),
     QEmbedding(QEmbeddingOperation),
     RowProgram(crate::row_program::RowProgramOperation),
+    Attention(crate::flash_attention::FlashAttentionOperation),
 }
 
 impl From<ComputeGraphNodeVariant> for ExecutionVariant {

@@ -38,6 +38,14 @@ impl Device {
         }
     }
 
+    /// Create a new GPU device with an explicit [`crate::FusorConfig`]
+    /// instead of reading the process environment.
+    #[cfg(feature = "gpu")]
+    pub async fn gpu_with_config(config: crate::FusorConfig) -> Result<Self, Error> {
+        let device = crate::gpu::Device::new_with_config(config).await?;
+        Ok(Device::Gpu(device))
+    }
+
     /// Create a new GPU device, blocking until ready.
     pub fn gpu_blocking() -> Result<Self, Error> {
         #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
@@ -78,10 +86,10 @@ impl Device {
         match Self::gpu().await {
             Ok(gpu) => gpu,
             Err(err) => {
-                if std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
-                    || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-                    || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some()
-                {
+                // No device exists to carry a config when creation fails, so
+                // this bootstrap diagnostic reads the environment directly.
+                let config = crate::FusorConfig::from_env();
+                if config.trace_decode_timing || config.trace_decode || config.trace_resolve {
                     tracing::warn!("fusor_device_auto_gpu_error={err}");
                 }
                 Device::Cpu

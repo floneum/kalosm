@@ -22,7 +22,7 @@ macro_rules! impl_is_nonzero {
 }
 
 impl_is_nonzero!(
-    f32 => 0.0, f64 => 0.0,
+    f32 => 0.0, f64 => 0.0, half::f16 => half::f16::ZERO,
     i8 => 0, i16 => 0, i32 => 0, i64 => 0,
     u8 => 0, u16 => 0, u32 => 0, u64 => 0
 );

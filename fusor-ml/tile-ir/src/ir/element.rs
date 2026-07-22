@@ -20,6 +20,14 @@ pub enum ScalarElement {
 }
 
 impl ScalarElement {
+    /// Byte size of one scalar as stored in memory.
+    pub const fn byte_size(self) -> u64 {
+        match self {
+            Self::F32 | Self::U32 | Self::Bool => 4,
+            Self::F16 => 2,
+        }
+    }
+
     /// Element type for this scalar by itself.
     pub const fn element(self) -> ElementType {
         match self {
@@ -95,6 +103,43 @@ impl ElementType {
             role,
             rows,
             cols,
+        }
+    }
+
+    /// Byte size of one element as allocated in an array of this type.
+    /// Cooperative fragments live in registers, not addressable arrays, and
+    /// report the size of their scalar so footprint sums stay conservative.
+    pub const fn byte_size(self) -> u64 {
+        match self {
+            Self::F32 | Self::U32 | Self::Bool => 4,
+            Self::F16 => 2,
+            Self::Vector { scalar, lanes } => scalar.byte_size() * lanes as u64,
+            Self::CoopMatrix { scalar, .. } => scalar.byte_size(),
+        }
+    }
+
+    /// Array stride of one element in a workgroup array, or `None` for
+    /// elements that cannot back one (bool, cooperative fragments). The
+    /// single source of stride truth: allocation packing and Naga array
+    /// emission both read this, so they can never disagree. Differs from
+    /// [`Self::byte_size`] for vec3, which pads to the vec4 stride.
+    pub const fn workgroup_array_stride(self) -> Option<u32> {
+        match self {
+            Self::F32 | Self::U32 => Some(4),
+            Self::F16 => Some(2),
+            Self::Vector { scalar, lanes } => {
+                let size = match scalar {
+                    ScalarElement::F32 | ScalarElement::U32 => 4,
+                    ScalarElement::F16 => 2,
+                    ScalarElement::Bool => return None,
+                };
+                match lanes {
+                    2 => Some(2 * size),
+                    3 | 4 => Some(4 * size),
+                    _ => None,
+                }
+            }
+            Self::Bool | Self::CoopMatrix { .. } => None,
         }
     }
 

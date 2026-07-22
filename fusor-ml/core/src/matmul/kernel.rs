@@ -111,14 +111,21 @@ impl MatMulOperation {
         matches!(self.datatype, DataTypeEnum::F32 | DataTypeEnum::F16)
     }
 
-    /// The cooperative kernel currently hosts dtype-preserving unary chains.
-    /// Dtype-changing chains keep using the generic fused reduction so the
-    /// operand staging and padded output allocation retain one element type.
+    /// The cooperative kernel hosts dtype-preserving unary chains, plus post
+    /// chains that widen f16 operands into an f32 output (the fused form of
+    /// matmul-then-cast, which training's mixed-precision backward emits for
+    /// every weight gradient). The store lands in the chain's output dtype;
+    /// the in-place epilogue rounds back to the operand dtype before the
+    /// chain reads it, so the fused result matches the unfused one exactly.
+    /// Narrowing chains would round the accumulator ahead of the chain, so
+    /// they keep using the generic fused reduction.
     fn coop_epilogues_supported(&self) -> bool {
+        let post_out = self.post_element_wise.out_datatype();
         self.pre_element_wise.iter().all(|chain| {
             chain.input_datatype() == self.datatype && chain.out_datatype() == self.datatype
         }) && self.post_element_wise.input_datatype() == self.datatype
-            && self.post_element_wise.out_datatype() == self.datatype
+            && (post_out == self.datatype
+                || (self.datatype == DataTypeEnum::F16 && post_out == DataTypeEnum::F32))
     }
 
     fn has_elementwise_epilogues(&self) -> bool {
@@ -256,14 +263,21 @@ impl MatMulOperation {
             m,
             k,
             n,
+            self.datatype,
             &device.dispatch_policy(),
             subgroup_config.max_size(),
         )?;
-        let total_tiles = m
+        // The 1D->3D grid spread plus the kernels' overhang guard cover any
+        // u32 tile count; the checked math above is the only real bound. A
+        // per-dimension cap here silently dropped real-vocab lm-head shapes
+        // (16384x384x32768 = 65536 tiles) onto the generic fallback at ~17x
+        // the cost.
+        let _ = m
             .div_ceil(tile.bm)
             .checked_mul(n.div_ceil(tile.bn))
             .and_then(|tiles| tiles.checked_mul(batch))?;
-        (total_tiles <= limits.max_compute_workgroups_per_dimension).then_some(tile)
+        let _ = limits;
+        Some(tile)
     }
 
     /// Row-major strides of the logical output over its padded backing:
@@ -361,7 +375,8 @@ impl MatMulOperation {
                 .checked_mul(m_padded as usize)
                 .and_then(|rows| rows.checked_mul(n_padded as usize)),
         )?;
-        let padded_bytes = padded_elements as u64 * self.datatype.element_size() as u64;
+        let padded_bytes =
+            padded_elements as u64 * self.post_element_wise.out_datatype().element_size() as u64;
         if output.layout().offset() != 0
             || output.layout().strides() != &*expected_strides
             || padded_bytes > output.buffer().size()
@@ -464,9 +479,14 @@ impl MatMulOperation {
                 DataTypeEnum::F16 => tile_ir::ElementType::F16,
                 _ => unreachable!("hardware matmul only supports f32/f16"),
             };
+            let out_element = match self.post_element_wise.out_datatype() {
+                DataTypeEnum::F32 => tile_ir::ElementType::F32,
+                DataTypeEnum::F16 => tile_ir::ElementType::F16,
+                _ => unreachable!("hardware matmul only supports f32/f16 outputs"),
+            };
             let a = tile_storage_read_with_direct_layout_typed(phase, element, a_view.clone());
             let b = tile_storage_read_with_direct_layout_typed(phase, element, b_view.clone());
-            let y = tile_storage_write_with_direct_layout_typed(phase, element, y_view.clone());
+            let y = tile_storage_write_with_direct_layout_typed(phase, out_element, y_view.clone());
             used.set(tile_ir_kernels::try_batched_coop_matmul(
                 phase,
                 tile_ir_kernels::DenseMatmulTensors {
@@ -489,6 +509,13 @@ impl MatMulOperation {
                         bn: tile.bn,
                         bk: tile.bk,
                     },
+                    staging: None,
+                    swizzle_group_m: super::cost::swizzle_group_m(
+                        self.a.rows(),
+                        self.a.cols(),
+                        self.b.cols(),
+                        self.datatype,
+                    ),
                 },
             ));
         });
@@ -539,9 +566,6 @@ impl MatMulOperation {
     /// split) and [`Self::build_hardware_matmul`], so allocation and kernel
     /// selection agree by construction.
     fn split_k_factor(&self, device: &Device, tile: &CoopTile) -> Option<u32> {
-        if self.has_elementwise_epilogues() {
-            return None;
-        }
         let m: u32 = self.a.rows().try_into().ok()?;
         let n: u32 = self.b.cols().try_into().ok()?;
         let k: u32 = self.a.cols().try_into().ok()?;
@@ -550,51 +574,20 @@ impl MatMulOperation {
             .batch_shape()
             .iter()
             .try_fold(1u32, |acc, &dim| acc.checked_mul(u32::try_from(dim).ok()?))?;
-        let total_tiles = m
-            .div_ceil(tile.bm)
-            .checked_mul(n.div_ceil(tile.bn))?
-            .checked_mul(batch)?;
-        let policy = device.dispatch_policy();
-        let threads = tile
-            .subgroup_groups()
-            .checked_mul(device.max_subgroup_size())
-            .filter(|&threads| threads > 0)?;
-        let k_iterations = k.div_ceil(tile.bk);
-        let per_lane_macs =
-            u64::from(tile.bm) * u64::from(tile.bn) * u64::from(k_iterations) * u64::from(tile.bk)
-                / u64::from(threads);
-        // Split only when all three hold: the unsplit grid is starved enough
-        // that fan-out beats the combine pass it buys, K is long enough that
-        // every span keeps at least two K-iterations, and each lane's
-        // unsplit serial walk is long enough that the extra partials +
-        // combine dispatch amortize (a quarter-saturation of per-lane MACs
-        // reproduces the committed k >= 512 boundary for the 256-lane
-        // tiles).
-        if !policy.split_amortizes_combine(total_tiles, threads)
-            || k_iterations < 4
-            || per_lane_macs < u64::from(policy.saturation_lanes() / 4)
-        {
-            if std::env::var_os("FUSOR_TRACE_SPLITK").is_some() {
-                eprintln!(
-                    "splitk_gate name={} tiles={total_tiles} k={k} per_lane_macs={per_lane_macs}",
-                    self.name()
-                );
-            }
-            return None;
+        let splits = super::cost::split_k_plan(
+            m,
+            k,
+            n,
+            batch,
+            tile,
+            &device.dispatch_policy(),
+            device.max_subgroup_size(),
+            self.has_elementwise_epilogues(),
+        );
+        if splits.is_none() && device.config().trace_splitk {
+            eprintln!("splitk_gate name={} m={m} k={k} n={n}", self.name());
         }
-        // Enough splits to fill the device from the starved grid, bounded so
-        // each span keeps at least two K-iterations. K-spans that divide the
-        // K-tile count keep the kernel's staging on the unbounded vec4 fast
-        // path (measured ~3x on the 64×2048×64 weight-gradient shape), so
-        // prefer the largest divisor at or under the target and fall back to
-        // the raw target only when the K-tile count has no useful divisor.
-        let concurrent = (policy.saturation_lanes() / threads).max(1);
-        let target = concurrent.div_ceil(total_tiles).clamp(2, k_iterations / 2);
-        let splits = (2..=target)
-            .rev()
-            .find(|candidate| k_iterations.is_multiple_of(*candidate))
-            .unwrap_or(target);
-        Some(splits)
+        splits
     }
 
     /// Split-K route for coop matmuls whose tile grid starves the GPU: the
@@ -677,11 +670,18 @@ impl MatMulOperation {
                         bn: tile.bn,
                         bk: tile.bk,
                     },
+                    staging: None,
+                    swizzle_group_m: super::cost::swizzle_group_m(
+                        self.a.rows(),
+                        self.a.cols(),
+                        self.b.cols(),
+                        self.datatype,
+                    ),
                 },
             ));
         });
         if !used.get() {
-            if std::env::var_os("FUSOR_TRACE_SPLITK").is_some() {
+            if device.config().trace_splitk {
                 eprintln!("splitk_declined_by_kernel name={}", self.name());
             }
             return None;
@@ -856,15 +856,15 @@ pub(crate) fn build_merged_matmul_kernel(
     segments: &[MatMulOperation],
     segment_inputs: &[Vec<crate::mir::inputs::MirValue>],
 ) -> Option<DirectKernel> {
+    let device = graph.device();
     macro_rules! decline {
         ($reason:expr) => {{
-            if std::env::var_os("FUSOR_TRACE_MATMUL_MERGE").is_some() {
+            if device.config().trace_matmul_merge {
                 eprintln!("matmul_merge_decline reason={}", $reason);
             }
             return None;
         }};
     }
-    let device = graph.device();
     let first = segments.first()?;
     let mut tensors = Vec::with_capacity(segments.len());
     for (op, inputs) in segments.iter().zip(segment_inputs) {
@@ -945,6 +945,13 @@ pub(crate) fn build_merged_matmul_kernel(
             bn: tile.bn,
             bk: tile.bk,
         },
+        staging: None,
+        swizzle_group_m: super::cost::swizzle_group_m(
+            first.a.rows(),
+            first.a.cols(),
+            first.b.cols(),
+            first.datatype,
+        ),
     };
 
     // Split-K segments store partials into scratch slices of their own
@@ -961,7 +968,7 @@ pub(crate) fn build_merged_matmul_kernel(
         }
     }
 
-    let name = if std::env::var_os("FUSOR_TRACE_DECODE_NAMES").is_some() {
+    let name = if device.config().trace_decode_names {
         format!(
             "merged_matmul[{}]",
             segments
@@ -1267,7 +1274,7 @@ impl Operation for MatMulOperation {
         if self.can_use_hardware_matmul()
             && input_a.datatype() == self.datatype
             && input_b.datatype() == self.datatype
-            && output.datatype() == self.datatype
+            && output.datatype() == self.post_element_wise.out_datatype()
             && (self.datatype != DataTypeEnum::F16 || graph.device().f16_supported())
             && let Ok(kernel) =
                 self.build_hardware_matmul(&graph.device(), input_a, input_b, output)
@@ -1277,6 +1284,24 @@ impl Operation for MatMulOperation {
         // Everything else is the composed contraction's own lowering: the
         // generic tiled (or serial) fused reduce, identical to what any
         // unrecognized contraction gets.
+        if std::env::var_os("FUSOR_TRACE_MATMUL_FALLBACK").is_some() {
+            tracing::warn!(
+                "matmul fallback to row reduce: dtype={:?} params={:?} m={} k={} n={} batch={:?} hw={} epi={} f16_dev={} coop_tile={:?} a_dt={:?} b_dt={:?} out_dt={:?}",
+                self.datatype,
+                std::mem::discriminant(&self.parameters),
+                self.a.rows(),
+                self.a.cols(),
+                self.b.cols(),
+                self.a.batch_shape(),
+                self.can_use_hardware_matmul(),
+                self.coop_epilogues_supported(),
+                graph.device().f16_supported(),
+                self.coop_tile(&graph.device()).map(|tile| (tile.bm, tile.bn, tile.bk)),
+                input_a.datatype(),
+                input_b.datatype(),
+                output.datatype(),
+            );
+        }
         let reduce = self.as_fused_reduce();
         crate::row_program::RowProgramOperation::from_reduce(&reduce).build_direct_kernel(
             graph,

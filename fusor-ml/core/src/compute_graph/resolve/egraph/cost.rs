@@ -247,7 +247,7 @@ pub(super) fn variant_cost(variant: &ExecutionVariant) -> GpuCost {
             materialized_bytes: bytes(&operation.out_shape, operation.datatype),
             work: elements(&operation.out_shape),
         },
-        ExecutionVariant::RowProgram(_) => GpuCost {
+        ExecutionVariant::RowProgram(_) | ExecutionVariant::Attention(_) => GpuCost {
             dispatches: 1,
             materialized_bytes: 0,
             work: 1,

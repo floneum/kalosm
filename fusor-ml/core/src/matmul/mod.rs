@@ -359,9 +359,103 @@ mod selection_tests {
         );
     }
 
+    /// Generator for the dense-plan golden table: run with
+    /// `cargo test -p fusor-core dense_plan_golden -- --nocapture` after a
+    /// deliberate selection change and paste the printed rows below.
+    #[test]
+    fn dense_plan_golden() {
+        let policy =
+            crate::occupancy::DispatchPolicy::from_parts(64 << 10, 32, 64 << 10, 8 << 20, 32 << 10);
+        let shapes: [(usize, usize, usize); 8] = [
+            (16384, 384, 1536),
+            (16384, 1536, 384),
+            (384, 16384, 1536),
+            (16384, 384, 384),
+            (4096, 4096, 4096),
+            (16384, 3072, 1536),
+            (64, 2048, 64),
+            (1, 4096, 4096),
+        ];
+        let mut rows = Vec::new();
+        for &(m, k, n) in &shapes {
+            for datatype in [crate::DataTypeEnum::F32, crate::DataTypeEnum::F16] {
+                let plan = super::cost::plan_dense_matmul(
+                    m,
+                    k,
+                    n,
+                    1,
+                    datatype,
+                    &policy,
+                    32,
+                    caps(true),
+                );
+                rows.push(format!(
+                    "{m}x{k}x{n} {datatype:?} => {:?} tile={:?} splits={:?} sw={}",
+                    plan.variant,
+                    plan.tile.map(|tile| (tile.bm, tile.bn, tile.bk)),
+                    plan.splits,
+                    plan.swizzle_group_m
+                ));
+            }
+        }
+        let golden = GOLDEN_PLANS.trim().lines().map(str::trim).collect::<Vec<_>>();
+        for row in &rows {
+            println!("{row}");
+        }
+        assert_eq!(rows, golden, "dense matmul routing changed; regenerate deliberately");
+    }
+
+    /// The locked routing surface. The `Coop tile=None` row is truthful and
+    /// interesting: the family selector picks the coop family for the
+    /// gemv-shaped contraction while the tile scorer's padding gate then
+    /// declines, which production resolves through the generic fallback —
+    /// the selector does not consult the tile scorer.
+    const GOLDEN_PLANS: &str = "
+        16384x384x1536 F32 => Coop tile=Some((128, 64, 16)) splits=None sw=8
+        16384x384x1536 F16 => Coop tile=Some((128, 64, 16)) splits=None sw=1
+        16384x1536x384 F32 => Coop tile=Some((128, 64, 16)) splits=None sw=8
+        16384x1536x384 F16 => Coop tile=Some((128, 64, 16)) splits=None sw=1
+        384x16384x1536 F32 => Coop tile=Some((128, 64, 16)) splits=None sw=8
+        384x16384x1536 F16 => Coop tile=Some((128, 64, 16)) splits=None sw=8
+        16384x384x384 F32 => Coop tile=Some((128, 64, 16)) splits=None sw=8
+        16384x384x384 F16 => Coop tile=Some((128, 64, 16)) splits=None sw=1
+        4096x4096x4096 F32 => Coop tile=Some((128, 64, 16)) splits=None sw=8
+        4096x4096x4096 F16 => Coop tile=Some((128, 64, 16)) splits=None sw=1
+        16384x3072x1536 F32 => Coop tile=Some((128, 64, 16)) splits=None sw=1
+        16384x3072x1536 F16 => Coop tile=Some((128, 64, 16)) splits=None sw=1
+        64x2048x64 F32 => Coop tile=Some((64, 16, 16)) splits=Some(64) sw=1
+        64x2048x64 F16 => Coop tile=Some((64, 16, 16)) splits=Some(64) sw=1
+        1x4096x4096 F32 => Coop tile=None splits=None sw=8
+        1x4096x4096 F16 => Coop tile=None splits=None sw=1
+    ";
+
     fn select_with_lanes(m: u32, k: u32, n: u32, max_lanes: u32) -> Option<CoopTile> {
-        let policy = crate::occupancy::DispatchPolicy::from_parts(64 << 10, 32, max_lanes, 8 << 20);
-        CoopTile::select(m, k, n, &policy, 32)
+        let policy = crate::occupancy::DispatchPolicy::from_parts(
+            64 << 10,
+            32,
+            max_lanes,
+            8 << 20,
+            32 << 10,
+        );
+        CoopTile::select(m, k, n, crate::DataTypeEnum::F32, &policy, 32)
+    }
+
+    /// At WebGPU's 16 KB default workgroup-storage limit the footprint
+    /// filter is live: every double-buffered f32 entry the 4096-cube can
+    /// reach overflows (the 16-wide profiles are out on a 4096-wide side),
+    /// while f16 halves the staged bytes and keeps the standard profile.
+    #[test]
+    fn footprint_filter_at_16kb_limit() {
+        let policy =
+            crate::occupancy::DispatchPolicy::from_parts(64 << 10, 32, 64 << 10, 8 << 20, 16 << 10);
+        assert_eq!(
+            CoopTile::select(4096, 4096, 4096, crate::DataTypeEnum::F32, &policy, 32),
+            None
+        );
+        assert_eq!(
+            CoopTile::select(4096, 4096, 4096, crate::DataTypeEnum::F16, &policy, 32),
+            Some(CoopTile::new(128, 64, 16))
+        );
     }
 
     /// Every selection must be legal and within the padding bound for every

@@ -94,10 +94,14 @@ struct EncodedSampleAttempt {
     debug_top_k: Option<(TensorData, TensorData)>,
 }
 
-fn initial_sampler_candidate_count(top_k: usize, chunks: usize) -> usize {
+fn initial_sampler_candidate_count(
+    config: &fusor_tile_ir_runtime::FusorConfig,
+    top_k: usize,
+    chunks: usize,
+) -> usize {
     top_k
         .div_ceil(chunks)
-        .max(min_top_k_candidates_per_chunk())
+        .max(min_top_k_candidates_per_chunk(config))
         .min(top_k)
         .min(TOP_K_CHUNK)
 }
@@ -117,10 +121,8 @@ fn next_sampler_candidate_count(candidate_count: usize, top_k: usize) -> usize {
         .min(TOP_K_CHUNK)
 }
 
-fn sampler_trace_enabled() -> bool {
-    cfg!(target_arch = "wasm32")
-        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-        || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some()
+fn sampler_trace_enabled(config: &fusor_tile_ir_runtime::FusorConfig) -> bool {
+    cfg!(target_arch = "wasm32") || config.trace_decode || config.trace_sampler
 }
 
 /// Encode one full sampling attempt into `encoder`. Complete, unfiltered
@@ -273,9 +275,10 @@ pub(crate) async fn sample_token_to_host(
     }
 
     let chunks = input_len.div_ceil(TOP_K_CHUNK);
-    let mut candidate_count = initial_sampler_candidate_count(top_k, chunks);
-    let trace = sampler_trace_enabled();
-    let debug_dump = std::env::var_os("FUSOR_DEBUG_SAMPLER").is_some();
+    let config = logits.device.config();
+    let mut candidate_count = initial_sampler_candidate_count(config, top_k, chunks);
+    let trace = sampler_trace_enabled(config);
+    let debug_dump = config.debug_sampler;
 
     let (logits_data, _, mut attempt) = logits.materialize_with_tail(|logits_data, encoder| {
         let attempt = encode_sample_attempt(

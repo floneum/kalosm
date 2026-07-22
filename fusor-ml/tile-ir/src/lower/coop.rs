@@ -32,10 +32,20 @@ impl<'a> Lowerer<'a> {
                 self.lower_store_local(expressions, body, dst, value)
             }
             Stmt::StoreTile { dst, index, value } => {
+                let source = value.element();
                 let value = self.lower_expr(expressions, body, value)?;
+                // Mixed-precision staging: a per-lane f32 value stored into an
+                // f16 tile (or vice versa) converts on the way in, matching the
+                // FillTile fast path's cast.
+                let value = match (source, dst.element) {
+                    (ElementType::F32, ElementType::F16) | (ElementType::F16, ElementType::F32) => {
+                        self.cast_tile_value(expressions, body, value, source, dst.element)
+                    }
+                    _ => value,
+                };
                 let index = self.lower_expr(expressions, body, index)?;
                 let pointer = self.tile_dynamic_pointer(expressions, dst, index, body)?;
-                body.push(Statement::Store { pointer, value }, Span::default());
+                self.store_tile_value(expressions, body, dst, pointer, value);
                 Ok(())
             }
             Stmt::FillTile { dst, value, bounds } => {
@@ -173,14 +183,28 @@ impl<'a> Lowerer<'a> {
             CoopMatrixRole::C => CooperativeRole::C,
         };
         match src {
-            CoopSrc::TileRegion { tile, row, col } => {
+            CoopSrc::TileRegion {
+                tile,
+                row,
+                col,
+                transposed,
+            } => {
                 let layout = self.tile_layout(tile);
                 let stride_u = Self::row_major_tile_stride(layout)?;
                 let _ = scalar;
                 let row_h = self.lower_expr(expressions, body, row)?;
                 let col_h = self.lower_expr(expressions, body, col)?;
+                // A transposed load addresses the fragment origin in the
+                // tile's memory coordinates (swapped) and flips the load
+                // orientation, so fragment (i, j) reads tile (col + j,
+                // row + i) without a staged transpose.
+                let (first, second) = if *transposed {
+                    (col_h, row_h)
+                } else {
+                    (row_h, col_h)
+                };
                 let index =
-                    self.tile_matrix_index_inline(expressions, body, row_h, col_h, stride_u);
+                    self.tile_matrix_index_inline(expressions, body, first, second, stride_u);
                 let ptr = self.tile_dynamic_pointer(expressions, tile, index, body)?;
                 let stride = self.u32(expressions, stride_u);
                 Ok(self.emit(
@@ -196,8 +220,9 @@ impl<'a> Lowerer<'a> {
                             // Metal's simdgroup matrix orientation makes
                             // row-major A/B fragments multiply as B * A.
                             // Keep Fusor's logical A * B by holding coop
-                            // fragments transposed internally.
-                            row_major: false,
+                            // fragments transposed internally; a transposed
+                            // load flips that orientation.
+                            row_major: *transposed,
                         },
                     },
                 ))
@@ -460,8 +485,14 @@ impl<'a> Lowerer<'a> {
                             storage_index,
                             &mut accept,
                         )?;
-                        values[i as usize] =
-                            Some(Self::emit_load(expressions, &mut accept, storage_ptr));
+                        let loaded = Self::emit_load(expressions, &mut accept, storage_ptr);
+                        values[i as usize] = Some(self.cast_tile_value(
+                            expressions,
+                            &mut accept,
+                            loaded,
+                            src.buffer.element,
+                            dst.element,
+                        ));
                     }
                     for i in 0..VEC {
                         let tile_index = self.add_literal_u32_emitted(
@@ -472,12 +503,12 @@ impl<'a> Lowerer<'a> {
                         );
                         let tile_ptr =
                             self.tile_dynamic_pointer(expressions, dst, tile_index, &mut accept)?;
-                        accept.push(
-                            Statement::Store {
-                                pointer: tile_ptr,
-                                value: values[i as usize].expect("loaded above"),
-                            },
-                            Span::default(),
+                        self.store_tile_value(
+                            expressions,
+                            &mut accept,
+                            dst,
+                            tile_ptr,
+                            values[i as usize].expect("loaded above"),
                         );
                     }
                     Ok(accept)
@@ -553,8 +584,14 @@ impl<'a> Lowerer<'a> {
                             storage_index,
                             &mut accept,
                         )?;
-                        values[i as usize] =
-                            Some(Self::emit_load(expressions, &mut accept, storage_ptr));
+                        let loaded = Self::emit_load(expressions, &mut accept, storage_ptr);
+                        values[i as usize] = Some(self.cast_tile_value(
+                            expressions,
+                            &mut accept,
+                            loaded,
+                            src.buffer.element,
+                            dst.element,
+                        ));
                     }
                     for i in 0..VEC {
                         let tile_index = self.add_literal_u32_emitted(
@@ -565,12 +602,12 @@ impl<'a> Lowerer<'a> {
                         );
                         let tile_ptr =
                             self.tile_dynamic_pointer(expressions, dst, tile_index, &mut accept)?;
-                        accept.push(
-                            Statement::Store {
-                                pointer: tile_ptr,
-                                value: values[i as usize].expect("loaded above"),
-                            },
-                            Span::default(),
+                        self.store_tile_value(
+                            expressions,
+                            &mut accept,
+                            dst,
+                            tile_ptr,
+                            values[i as usize].expect("loaded above"),
                         );
                     }
                     Ok(accept)
@@ -642,13 +679,14 @@ impl<'a> Lowerer<'a> {
                     let storage_ptr =
                         self.storage_dynamic_pointer(expressions, src, storage_index, &mut accept)?;
                     let value = Self::emit_load(expressions, &mut accept, storage_ptr);
-                    accept.push(
-                        Statement::Store {
-                            pointer: tile_ptr,
-                            value,
-                        },
-                        Span::default(),
+                    let value = self.cast_tile_value(
+                        expressions,
+                        &mut accept,
+                        value,
+                        src.buffer.element,
+                        dst.element,
                     );
+                    self.store_tile_value(expressions, &mut accept, dst, tile_ptr, value);
                 }
                 Some(in_bounds) => {
                     let mut in_bounds_body = Block::new();
@@ -665,13 +703,14 @@ impl<'a> Lowerer<'a> {
                         &mut in_bounds_body,
                     )?;
                     let value = Self::emit_load(expressions, &mut in_bounds_body, storage_ptr);
-                    in_bounds_body.push(
-                        Statement::Store {
-                            pointer: tile_ptr,
-                            value,
-                        },
-                        Span::default(),
+                    let value = self.cast_tile_value(
+                        expressions,
+                        &mut in_bounds_body,
+                        value,
+                        src.buffer.element,
+                        dst.element,
                     );
+                    self.store_tile_value(expressions, &mut in_bounds_body, dst, tile_ptr, value);
 
                     let zero_f32 = self.f32(expressions, 0.0);
                     let mut out_of_bounds_body = Block::new();
@@ -682,13 +721,7 @@ impl<'a> Lowerer<'a> {
                         ElementType::F32,
                         dst.element,
                     );
-                    out_of_bounds_body.push(
-                        Statement::Store {
-                            pointer: tile_ptr,
-                            value: zero,
-                        },
-                        Span::default(),
-                    );
+                    self.store_tile_value(expressions, &mut out_of_bounds_body, dst, tile_ptr, zero);
                     accept.push(
                         Statement::If {
                             condition: in_bounds,
@@ -849,13 +882,7 @@ impl<'a> Lowerer<'a> {
                         ElementType::F32,
                         dst.element,
                     );
-                    in_bounds_body.push(
-                        Statement::Store {
-                            pointer: ptr,
-                            value,
-                        },
-                        Span::default(),
-                    );
+                    self.store_tile_value(expressions, &mut in_bounds_body, dst, ptr, value);
                 }
 
                 let zero_f32 = self.f32(expressions, 0.0);
@@ -868,13 +895,7 @@ impl<'a> Lowerer<'a> {
                 );
                 let mut out_of_bounds_body = Block::new();
                 for ptr in tile_ptrs {
-                    out_of_bounds_body.push(
-                        Statement::Store {
-                            pointer: ptr,
-                            value: zero,
-                        },
-                        Span::default(),
-                    );
+                    self.store_tile_value(expressions, &mut out_of_bounds_body, dst, ptr, zero);
                 }
                 accept.push(
                     Statement::If {
@@ -949,13 +970,7 @@ impl<'a> Lowerer<'a> {
                 ElementType::F32,
                 dst.element,
             );
-            in_bounds_body.push(
-                Statement::Store {
-                    pointer: tile_ptr,
-                    value,
-                },
-                Span::default(),
-            );
+            self.store_tile_value(expressions, &mut in_bounds_body, dst, tile_ptr, value);
             let zero_f32 = self.f32(expressions, 0.0);
             let zero = self.cast_tile_value(
                 expressions,
@@ -965,13 +980,7 @@ impl<'a> Lowerer<'a> {
                 dst.element,
             );
             let mut out_of_bounds_body = Block::new();
-            out_of_bounds_body.push(
-                Statement::Store {
-                    pointer: tile_ptr,
-                    value: zero,
-                },
-                Span::default(),
-            );
+            self.store_tile_value(expressions, &mut out_of_bounds_body, dst, tile_ptr, zero);
             accept.push(
                 Statement::If {
                     condition: in_bounds,

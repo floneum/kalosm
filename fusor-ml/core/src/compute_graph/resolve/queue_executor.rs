@@ -314,7 +314,7 @@ fn finish_queue_build(
                 .map(|dispatch| (dispatch, kernel.name().to_string()))
         })
         .collect();
-    if std::env::var_os("FUSOR_TRACE_BUILD_TIMES").is_some() {
+    if device.config().trace_build_times {
         let total = build_timer.elapsed();
         if total.as_millis() >= 2 {
             eprintln!(
@@ -814,12 +814,14 @@ pub(super) fn encode_command_records(
     mut command_encoder: wgpu::CommandEncoder,
     mut submit_chunk: impl FnMut(wgpu::CommandEncoder, bool),
 ) -> wgpu::CommandEncoder {
-    let dispatches_per_pass = super::run::dispatches_per_pass(total_kernels);
-    let dispatches_per_submit = super::run::dispatches_per_submit(total_kernels, device.backend());
+    let dispatches_per_pass = super::run::dispatches_per_pass(device, total_kernels);
+    let dispatches_per_submit = super::run::dispatches_per_submit(device, total_kernels);
     let wait_after_chunk_submit = device.backend() == wgpu::Backend::Metal;
     let mut command_index = 0usize;
     let mut dispatches_in_submit = 0usize;
     let mut encoder_has_commands = false;
+    let mut pass_segments = 0usize;
+    let mut copy_records = 0usize;
 
     while command_index < commands.len() {
         if encoder_has_commands && dispatches_in_submit >= dispatches_per_submit {
@@ -844,6 +846,7 @@ pub(super) fn encode_command_records(
                     copy.destination_offset,
                     copy.size,
                 );
+                copy_records += 1;
                 encoder_has_commands = true;
                 command_index += 1;
             }
@@ -852,6 +855,7 @@ pub(super) fn encode_command_records(
                     label: Some("Resolver Direct Kernels"),
                     timestamp_writes: None,
                 });
+                pass_segments += 1;
                 let mut pass_dispatches = 0usize;
                 while command_index < commands.len()
                     && pass_dispatches < dispatches_per_pass
@@ -870,6 +874,11 @@ pub(super) fn encode_command_records(
                 }
             }
         }
+    }
+    if device.config().trace_resolve_host {
+        tracing::info!(
+            "resolve_pass_layout kernels={total_kernels} passes={pass_segments} copies={copy_records}"
+        );
     }
 
     command_encoder

@@ -22,6 +22,7 @@ mod lang;
 mod rules_fuse;
 mod rules_fuse_matmul;
 mod structural_memo;
+pub(crate) use structural_memo::FusionPlanStore;
 
 use egg::{EGraph, Id};
 use rustc_hash::FxHashMap;

@@ -14,6 +14,7 @@ pub use storage::{
 
 mod expr;
 pub use expr::{Addr, Builtin, CoopSrc, Expr, ExprKind, Node, QuantActivation, ReduceKind, Source};
+pub(crate) use expr::TileUse;
 
 mod program;
 pub use program::{Accumulator, KernelIr, Stmt};

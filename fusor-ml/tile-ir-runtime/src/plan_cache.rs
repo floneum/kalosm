@@ -32,6 +32,8 @@ pub struct KernelPlanCache {
     hits: AtomicU64,
     misses: AtomicU64,
     disk_hits: AtomicU64,
+    /// Log hit/miss totals on every event (wasm always logs).
+    trace_events: bool,
 }
 
 struct CachedKernelPlan {
@@ -57,12 +59,12 @@ impl std::fmt::Debug for KernelPlanCache {
 
 impl Default for KernelPlanCache {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }
 
 impl KernelPlanCache {
-    pub fn new() -> Self {
+    pub fn new(trace_events: bool) -> Self {
         Self {
             plans: Mutex::new(LruCache::with_hasher(
                 NonZeroUsize::new(KERNEL_PLAN_CACHE_SIZE)
@@ -73,15 +75,18 @@ impl KernelPlanCache {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             disk_hits: AtomicU64::new(0),
+            trace_events,
         }
     }
 
     /// Attach the persistent plan store. Kernel codegen depends on device
     /// capabilities, so the store is salted by their fingerprint.
-    pub fn attach_disk(&self, device_fingerprint: u64) {
-        let _ = self
-            .disk
-            .set(crate::disk_cache::DiskPlanCache::open(device_fingerprint));
+    /// `dir_override` replaces the platform cache directory when set.
+    pub fn attach_disk(&self, device_fingerprint: u64, dir_override: Option<std::path::PathBuf>) {
+        let _ = self.disk.set(crate::disk_cache::DiskPlanCache::open(
+            device_fingerprint,
+            dir_override,
+        ));
     }
 
     pub fn try_get_or_insert<E>(
@@ -126,7 +131,7 @@ impl KernelPlanCache {
             && binding_shape_matches(&plan, binding_buffers)
         {
             let hit_total = self.hits.fetch_add(1, Ordering::Relaxed) + 1;
-            trace_cache_event(hit_total, self.misses.load(Ordering::Relaxed));
+            self.trace_cache_event(hit_total, self.misses.load(Ordering::Relaxed));
             return Some(bind_plan(&plan, binding_buffers));
         }
 
@@ -143,8 +148,14 @@ impl KernelPlanCache {
         }
 
         let miss_total = self.misses.fetch_add(1, Ordering::Relaxed) + 1;
-        trace_cache_event(self.hits.load(Ordering::Relaxed), miss_total);
+        self.trace_cache_event(self.hits.load(Ordering::Relaxed), miss_total);
         None
+    }
+
+    fn trace_cache_event(&self, hits: u64, misses: u64) {
+        if cfg!(target_arch = "wasm32") || self.trace_events {
+            tracing::info!("kernel_plan_cache hit={hits} miss={misses}");
+        }
     }
 
     /// Clone the immutable plan snapshot while touching its LRU entry, then
@@ -303,12 +314,6 @@ fn binding_shape_matches(
             .all(|(plan, buffers)| alias_pattern_matches(&plan.alias_class, buffers))
 }
 
-fn trace_cache_event(hits: u64, misses: u64) {
-    if cfg!(target_arch = "wasm32") || std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some() {
-        tracing::info!("kernel_plan_cache hit={hits} miss={misses}");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +328,7 @@ mod tests {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             disk_hits: AtomicU64::new(0),
+            trace_events: false,
         }
     }
 

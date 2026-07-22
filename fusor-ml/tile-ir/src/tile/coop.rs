@@ -73,7 +73,21 @@ impl TileBlock<'_> {
         rows: u32,
         cols: u32,
     ) -> Tile {
-        self.coop_load_tile(CoopMatrixRole::A, tile, row, col, scalar, rows, cols)
+        self.coop_load_tile(CoopMatrixRole::A, tile, row, col, scalar, rows, cols, false)
+    }
+
+    /// Cooperatively load an A-role fragment of the tile's transpose:
+    /// fragment `(i, j)` reads tile element `(col + j, row + i)`.
+    pub(crate) fn coop_load_a_transposed(
+        &self,
+        tile: &WorkgroupTile,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
+        scalar: ScalarElement,
+        rows: u32,
+        cols: u32,
+    ) -> Tile {
+        self.coop_load_tile(CoopMatrixRole::A, tile, row, col, scalar, rows, cols, true)
     }
 
     /// Cooperatively load a B-role fragment from a region of a workgroup tile.
@@ -86,9 +100,24 @@ impl TileBlock<'_> {
         rows: u32,
         cols: u32,
     ) -> Tile {
-        self.coop_load_tile(CoopMatrixRole::B, tile, row, col, scalar, rows, cols)
+        self.coop_load_tile(CoopMatrixRole::B, tile, row, col, scalar, rows, cols, false)
     }
 
+    /// Cooperatively load a B-role fragment of the tile's transpose:
+    /// fragment `(i, j)` reads tile element `(col + j, row + i)`.
+    pub(crate) fn coop_load_b_transposed(
+        &self,
+        tile: &WorkgroupTile,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
+        scalar: ScalarElement,
+        rows: u32,
+        cols: u32,
+    ) -> Tile {
+        self.coop_load_tile(CoopMatrixRole::B, tile, row, col, scalar, rows, cols, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn coop_load_tile(
         &self,
@@ -99,6 +128,7 @@ impl TileBlock<'_> {
         scalar: ScalarElement,
         rows: u32,
         cols: u32,
+        transposed: bool,
     ) -> Tile {
         assert!(rows == 8 || rows == 16, "coop rows must be 8 or 16");
         assert!(cols == 8 || cols == 16, "coop cols must be 8 or 16");
@@ -112,6 +142,7 @@ impl TileBlock<'_> {
                     tile: tile.decl().clone(),
                     row: boxed_index(row),
                     col: boxed_index(col),
+                    transposed,
                 },
             },
             ElementType::coop_matrix(scalar, role, rows, cols),

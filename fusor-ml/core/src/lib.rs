@@ -5,6 +5,7 @@
 pub use device::*;
 pub use element_wise::CastTensor;
 pub use fusor_gguf::GgufReadError;
+pub use fusor_tile_ir_runtime::FusorConfig;
 pub use fusor_types::{
     Layout, SlidingWindow, StrideSpec, TILE_SIZE, TensorSlice, slice_shape, slice_strides,
 };
@@ -29,6 +30,7 @@ mod compute_graph;
 pub use compute_graph::NodeIndex;
 mod device;
 mod element_wise;
+mod flash_attention;
 mod index_select;
 #[doc(hidden)]
 pub mod kernel_selection;

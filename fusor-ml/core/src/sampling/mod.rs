@@ -51,10 +51,10 @@ impl PendingGpuSampledToken {
     pub async fn read_token(self) -> Result<Option<u32>, wgpu::BufferAsyncError> {
         // Diagnostic: time the wait for GPU completion + token readback (the
         // per-token sync the pending decode path stalls on). On wasm this is
-        // always on; native gates on the FUSOR_TRACE_* env vars.
-        let trace = cfg!(target_arch = "wasm32")
-            || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-            || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
+        // always on; native gates on the trace config flags.
+        let config = self.token.device().config();
+        let trace =
+            cfg!(target_arch = "wasm32") || config.trace_decode || config.trace_sampler;
         let await_start = trace.then(web_time::Instant::now);
         self.receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
         if let Some(start) = await_start {
@@ -83,10 +83,9 @@ impl PendingGpuSampledToken {
     }
 }
 
-pub(crate) fn min_top_k_candidates_per_chunk() -> usize {
-    std::env::var("FUSOR_TOP_K_MIN_CANDIDATES_PER_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
+pub(crate) fn min_top_k_candidates_per_chunk(config: &fusor_tile_ir_runtime::FusorConfig) -> usize {
+    config
+        .top_k_min_candidates_per_chunk
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_MIN_TOP_K_CANDIDATES_PER_CHUNK)
         .min(TOP_K_CHUNK)

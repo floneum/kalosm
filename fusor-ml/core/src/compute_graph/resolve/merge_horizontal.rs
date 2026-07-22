@@ -248,7 +248,7 @@ impl HorizontalMerger {
                 // Only matmuls bound for the cooperative-matrix kernel
                 // produce a profile; generic-path contractions and
                 // epilogue-fused matmuls lower standalone.
-                if std::env::var_os("FUSOR_TRACE_MATMUL_MERGE").is_some() {
+                if self.device.config().trace_matmul_merge {
                     eprintln!(
                         "matmul_merge_candidate name={} profile={:?}",
                         op.name(),
@@ -303,6 +303,7 @@ impl HorizontalMerger {
             ExecutionVariant::QMatMul(op) => op.visit_dependencies(&mut visit),
             ExecutionVariant::QEmbedding(op) => op.visit_dependencies(&mut visit),
             ExecutionVariant::RowProgram(op) => op.visit_dependencies(&mut visit),
+            ExecutionVariant::Attention(op) => op.visit_dependencies(&mut visit),
         }
 
         match self.categorize(node) {
@@ -486,7 +487,7 @@ impl HorizontalMerger {
                 }
             }
             for (key, group) in groups {
-                if std::env::var_os("FUSOR_TRACE_MATMUL_MERGE").is_some() {
+                if self.device.config().trace_matmul_merge {
                     eprintln!(
                         "matmul_merge_flush cat={cat} size={} key={key:?}",
                         group.len()

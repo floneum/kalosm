@@ -435,6 +435,60 @@ impl EGraphDriver {
         Some(state.commit(self, prov, candidate.clone(), &kills))
     }
 
+    /// The cheapest legal generator candidate for `prov` under live counts.
+    fn best_fusion_candidate(
+        &self,
+        state: &ExtractState,
+        view: &FusionView<'_>,
+        prov: Prov,
+    ) -> Option<super::super::ExecutionVariant> {
+        view.generate_candidates(prov)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(order, variant)| {
+                let kills = state.kills_for_variant(self, prov, &variant);
+                if state.variant_duplicates_required_producer(self, prov, &variant, &kills) {
+                    return None;
+                }
+                let delta = self.switch_cost_delta(state, prov, &variant, &kills);
+                delta.non_worse().then_some((delta, order, variant))
+            })
+            .min_by_key(|(delta, order, _)| (*delta, *order))
+            .map(|(_, _, variant)| variant)
+    }
+
+    fn verify_shared_plan(
+        &self,
+        state: &ExtractState,
+        view: &FusionView<'_>,
+        prov: Prov,
+        shared: Option<&super::super::ExecutionVariant>,
+    ) {
+        let fresh = self.best_fusion_candidate(state, view, prov);
+        match (shared, &fresh) {
+            (None, None) => {}
+            (Some(shared), Some(generated)) => {
+                assert!(
+                    super::interner::planning_payload_eq(shared, generated),
+                    "shared plan diverges from regeneration: window horizon misses generator input (prov {})",
+                    prov.0
+                );
+                assert_eq!(
+                    super::interner::variant_dependencies(shared),
+                    super::interner::variant_dependencies(generated),
+                    "shared plan dependencies diverge (prov {})",
+                    prov.0
+                );
+            }
+            _ => panic!(
+                "shared plan presence diverges from regeneration (prov {}, shared={}, fresh={})",
+                prov.0,
+                shared.is_some(),
+                fresh.is_some()
+            ),
+        }
+    }
+
     /// Fusion extraction worklist, seeded with every
     /// fusion-eligible node in provenance order; after each committed
     /// switch, everything whose situation changed — the node itself, old and
@@ -450,6 +504,12 @@ impl EGraphDriver {
         let mut state = ExtractState::from_execution(self, resolver);
         let baseline = state.sel.clone();
         let mut plans = FusionPlanMemo::default();
+        let device = ctx.graph.device();
+        // The window horizon must cover everything a generator observes;
+        // this tripwire proves it by regenerating and comparing on every
+        // hit, per-resolve and device-store alike.
+        let verify_sharing = device.config().verify_plan_sharing;
+        let store = device.fusion_plan_store();
         let count = state.sel.len() as u32;
         let mut worklist: std::collections::VecDeque<u32> = (0..count)
             .filter(|&prov| {
@@ -477,79 +537,36 @@ impl EGraphDriver {
                 let instance = plans.capture(self, &state, &view, Prov(prov));
                 match plans.lookup(&instance, &view) {
                     PlanLookup::Hit(result) => {
-                        // The window horizon must cover everything a
-                        // generator observes; this tripwire proves it by
-                        // regenerating and comparing on every hit.
-                        if std::env::var_os("FUSOR_VERIFY_PLAN_SHARING").is_some() {
-                            let fresh = view
-                                .generate_candidates(Prov(prov))
-                                .into_iter()
-                                .enumerate()
-                                .filter_map(|(order, variant)| {
-                                    let kills = state.kills_for_variant(self, Prov(prov), &variant);
-                                    if state.variant_duplicates_required_producer(
-                                        self,
-                                        Prov(prov),
-                                        &variant,
-                                        &kills,
-                                    ) {
-                                        return None;
-                                    }
-                                    let delta = self.switch_cost_delta(
-                                        &state,
-                                        Prov(prov),
-                                        &variant,
-                                        &kills,
-                                    );
-                                    delta.non_worse().then_some((delta, order, variant))
-                                })
-                                .min_by_key(|(delta, order, _)| (*delta, *order))
-                                .map(|(_, _, variant)| variant);
-                            match (&result, &fresh) {
-                                (None, None) => {}
-                                (Some(shared), Some(generated)) => {
-                                    assert!(
-                                        super::interner::planning_payload_eq(shared, generated),
-                                        "shared plan diverges from regeneration: window                                          horizon misses generator input (prov {prov})"
-                                    );
-                                    assert_eq!(
-                                        super::interner::variant_dependencies(shared),
-                                        super::interner::variant_dependencies(generated),
-                                        "shared plan dependencies diverge (prov {prov})"
-                                    );
-                                }
-                                _ => panic!(
-                                    "shared plan presence diverges from regeneration                                      (prov {prov}, shared={}, fresh={})",
-                                    result.is_some(),
-                                    fresh.is_some()
-                                ),
-                            }
+                        if verify_sharing {
+                            self.verify_shared_plan(&state, &view, Prov(prov), result.as_ref());
                         }
                         let spec = plans.known_spec(&instance);
                         (result, instance.root, spec)
                     }
                     PlanLookup::Miss => {
-                        let result = view
-                            .generate_candidates(Prov(prov))
-                            .into_iter()
-                            .enumerate()
-                            .filter_map(|(order, variant)| {
-                                let kills = state.kills_for_variant(self, Prov(prov), &variant);
-                                if state.variant_duplicates_required_producer(
-                                    self,
-                                    Prov(prov),
-                                    &variant,
-                                    &kills,
-                                ) {
-                                    return None;
+                        let key = plans.window_key(instance.root, self);
+                        let result = match store.instantiate(key, &instance, &view) {
+                            Some(result) => {
+                                plans.note_store_hit();
+                                if verify_sharing {
+                                    self.verify_shared_plan(
+                                        &state,
+                                        &view,
+                                        Prov(prov),
+                                        result.as_ref(),
+                                    );
                                 }
-                                let delta =
-                                    self.switch_cost_delta(&state, Prov(prov), &variant, &kills);
-                                delta.non_worse().then_some((delta, order, variant))
-                            })
-                            .min_by_key(|(delta, order, _)| (*delta, *order))
-                            .map(|(_, _, variant)| variant);
-                        plans.record(&instance, &view, result.as_ref());
+                                plans.record(&instance, &view, result.as_ref());
+                                result
+                            }
+                            None => {
+                                plans.note_store_miss();
+                                let result = self.best_fusion_candidate(&state, &view, Prov(prov));
+                                let decision = plans.record(&instance, &view, result.as_ref());
+                                store.record(key, decision);
+                                result
+                            }
+                        };
                         (result, instance.root, None)
                     }
                 }
@@ -595,15 +612,17 @@ impl EGraphDriver {
                 .chain(touched);
             view.enqueue_downstream(&state, seeds, &mut worklist, &mut queued);
         }
-        if std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some() {
+        if ctx.graph.device().config().trace_resolve_host {
             let sharing = plans.stats();
             let cost = self.extraction_cost(&state);
             tracing::info!(
-                "resolve_egg_plans windows={} unique={} hits={} misses={} templates={} negative={} payloads={} specs={} dispatches={} bytes={} work={}",
+                "resolve_egg_plans windows={} unique={} hits={} misses={} store_hits={} store_misses={} templates={} negative={} payloads={} specs={} dispatches={} bytes={} work={}",
                 sharing.windows,
                 sharing.unique_windows,
                 sharing.hits,
                 sharing.misses,
+                sharing.store_hits,
+                sharing.store_misses,
                 sharing.templates,
                 sharing.negative_templates,
                 self.egraph.analysis.payloads.payload_count(),

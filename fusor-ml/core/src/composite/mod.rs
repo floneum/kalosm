@@ -1,4 +1,4 @@
-mod attention;
+pub(crate) mod attention;
 mod rms_norm_fused;
 mod rope_fused;
 mod softmax;
