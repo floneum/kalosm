@@ -28,8 +28,8 @@ use fusor::{
 
 const CONTEXT: usize = 256;
 const BATCH_SIZE: usize = 64;
-const DIM: usize = 384;
-const HEADS: usize = 6;
+const DIM: usize = 512;
+const HEADS: usize = 8;
 const HEAD_DIM: usize = DIM / HEADS;
 const MLP_DIM: usize = 4 * DIM;
 const LAYERS: usize = 6;
