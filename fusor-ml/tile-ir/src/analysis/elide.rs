@@ -25,7 +25,7 @@
 
 use crate::ir::{KernelIr, Stmt};
 
-use super::{LivenessInfo, LoopInfo};
+use super::LivenessInfo;
 
 /// Remove every removable barrier from `ir`. Returns how many were removed.
 pub(crate) fn elide_barriers(ir: &mut KernelIr) -> usize {
