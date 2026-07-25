@@ -283,6 +283,14 @@ impl Resolver {
         let phase_start = Instant::now();
         self.form_elementwise_regions(graph);
         self.optimize_phases.physical += phase_start.elapsed();
+        #[cfg(feature = "graphvis")]
+        if let Some(dir) = &graph.device().config().dump_stages {
+            super::visualize::dump_stage(
+                dir,
+                &self.execution_graph,
+                super::visualize::Stage::Regions,
+            );
+        }
     }
 
     // Helpers

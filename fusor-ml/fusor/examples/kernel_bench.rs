@@ -47,9 +47,20 @@ fn print_profiles(case: &str, device: &Device) {
 }
 
 async fn bench_matmul(case: &str, device: &Device, m: usize, k: usize, n: usize) {
-    println!("=== matmul {m}x{k} by {k}x{n} ===");
+    bench_matmul_repeats(case, device, m, k, n, REPEATS).await
+}
+
+async fn bench_matmul_repeats(
+    case: &str,
+    device: &Device,
+    m: usize,
+    k: usize,
+    n: usize,
+    repeats: usize,
+) {
+    println!("=== matmul {m}x{k} by {k}x{n} x{repeats} ===");
     for _ in 0..ROUNDS {
-        let outputs: Vec<Tensor<2, f32>> = (0..REPEATS)
+        let outputs: Vec<Tensor<2, f32>> = (0..repeats)
             .map(|i| {
                 let a = Tensor::from_slice(device, [m, k], &fill(3 + i as u32, m * k));
                 let b = Tensor::from_slice(device, [k, n], &fill(77 + i as u32, k * n));
@@ -128,6 +139,30 @@ async fn bench_softmax(case: &str, device: &Device, b0: usize, b1: usize, m: usi
     }
 }
 
+/// Streaming elementwise over a working set far larger than cache: the
+/// achievable-bandwidth roof for the roofline model. One add reads two
+/// operands and writes one result, so the kernel moves `3 * n * 4` bytes and
+/// does one flop per element.
+async fn bench_stream(case: &str, device: &Device, n: usize) {
+    println!("=== stream add {n} elements ===");
+    for _ in 0..ROUNDS {
+        let outputs: Vec<Tensor<1, f32>> = (0..2)
+            .map(|i| {
+                let a = Tensor::from_slice(device, [n], &fill(3 + i as u32, n));
+                let b = Tensor::from_slice(device, [n], &fill(77 + i as u32, n));
+                (&a + &b).to_concrete()
+            })
+            .collect();
+        device.flush();
+        let mut total = 0.0f32;
+        for out in outputs {
+            total += out.as_slice().await.unwrap()[[0]];
+        }
+        println!("checksum {total}");
+        print_profiles(case, device);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::var_os("RUST_LOG").is_some() {
@@ -148,6 +183,11 @@ async fn main() {
         "fwdup" => bench_matmul("fwdup", &device, 2048, 64, 256).await,
         "attn" => bench_batched_matmul("attn", &device, 32, 4, 64, 64, 16).await,
         "softmax" => bench_softmax("softmax", &device, 32, 4, 64, 64).await,
+        // Roofline anchors: the achievable bandwidth and compute roofs this
+        // machine sustains, measured through the same profile path as the
+        // shape cases so the comparison uses one clock.
+        "roof_bw" => bench_stream("roof_bw", &device, 32 << 20).await,
+        "roof_flops" => bench_matmul_repeats("roof_flops", &device, 2048, 2048, 2048, 4).await,
         _ => {
             bench_matmul("wgrad", &device, 64, 2048, 64).await;
             bench_matmul("fwd", &device, 2048, 64, 64).await;

@@ -47,6 +47,8 @@ mod recognize_cat;
 #[cfg(test)]
 mod recognize_gates;
 mod run;
+#[cfg(feature = "graphvis")]
+mod visualize;
 
 pub(crate) use egraph::FusionPlanStore;
 pub(crate) use plan_cache::structural_kernel_key;

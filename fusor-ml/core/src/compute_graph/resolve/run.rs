@@ -32,6 +32,14 @@ impl Resolver {
             if let Some(start) = start {
                 host_profile.build_execution_graph += start.elapsed();
             }
+            #[cfg(feature = "graphvis")]
+            if let Some(dir) = &device.config().dump_stages {
+                super::visualize::dump_stage(
+                    dir,
+                    &self.execution_graph,
+                    super::visualize::Stage::Built,
+                );
+            }
         }
 
         // Pass 2: Apply Rewrite Rules

@@ -110,6 +110,14 @@ impl Resolver {
         }
         let recognition = recognition_start.elapsed();
         self.optimize_phases.recognition += recognition;
+        #[cfg(feature = "graphvis")]
+        if let Some(dir) = &config.dump_stages {
+            super::visualize::dump_stage(
+                dir,
+                &self.execution_graph,
+                super::visualize::Stage::Recognized,
+            );
+        }
 
         let extraction_start = std::time::Instant::now();
         let mut driver = EGraphDriver::ingest(self, graph);
@@ -140,6 +148,14 @@ impl Resolver {
         self.apply_egraph_deltas(graph, &driver, &extraction);
         self.coalesce_equivalent_eclasses(graph, &driver);
         self.optimize_phases.extraction += extraction_start.elapsed();
+        #[cfg(feature = "graphvis")]
+        if let Some(dir) = &config.dump_stages {
+            super::visualize::dump_stage(
+                dir,
+                &self.execution_graph,
+                super::visualize::Stage::Extracted,
+            );
+        }
     }
 
     /// Every matcher that claims a composed cluster, in nesting order:

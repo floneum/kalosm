@@ -70,6 +70,10 @@ pub struct FusorConfig {
     pub spike_window_depth: Option<u32>,
     /// Write every generated shader to this directory (`FUSOR_DUMP_SHADERS`).
     pub dump_shaders: Option<PathBuf>,
+    /// Write a Graphviz digraph of the execution graph after each resolver
+    /// stage to this directory (`FUSOR_DUMP_STAGES`). Requires the `graphvis`
+    /// feature; one `resolve<n>-<stage>.dot` per stage per resolve.
+    pub dump_stages: Option<PathBuf>,
     /// Override the lazy graph's auto-flush node threshold
     /// (`FUSOR_GRAPH_FLUSH_THRESHOLD`; 0 disables auto-flush).
     pub graph_flush_threshold: Option<usize>,
@@ -126,6 +130,7 @@ impl FusorConfig {
             spike_no_recognition: parse("FUSOR_SPIKE_NO_RECOGNITION"),
             spike_window_depth: parse("FUSOR_SPIKE_WINDOW_DEPTH"),
             dump_shaders: std::env::var_os("FUSOR_DUMP_SHADERS").map(PathBuf::from),
+            dump_stages: std::env::var_os("FUSOR_DUMP_STAGES").map(PathBuf::from),
             graph_flush_threshold: parse("FUSOR_GRAPH_FLUSH_THRESHOLD"),
             resolve_dispatches_per_pass: parse("FUSOR_RESOLVE_DISPATCHES_PER_PASS")
                 .filter(|&v: &usize| v > 0),
