@@ -107,6 +107,9 @@ pub(super) struct PlanSharingStats {
     pub(super) misses: u64,
     pub(super) templates: u64,
     pub(super) negative_templates: u64,
+    /// Rewrites reading past the window horizon, which plan fresh every
+    /// visit ([`VariantTemplate::capture`]).
+    pub(super) unshareable: u64,
     /// Per-resolve misses answered by the device-scoped [`FusionPlanStore`].
     pub(super) store_hits: u64,
     pub(super) store_misses: u64,
@@ -445,7 +448,7 @@ impl FusionPlanMemo {
         instance: &PlanInstance,
         view: &FusionView<'_>,
         result: Option<&ExecutionVariant>,
-    ) -> &PlanDecision {
+    ) -> Option<&PlanDecision> {
         if !self.decisions.contains_key(&instance.root) {
             let decision = match result {
                 None => {
@@ -453,14 +456,17 @@ impl FusionPlanMemo {
                     PlanDecision::NoRewrite
                 }
                 Some(variant) => {
-                    let template = VariantTemplate::capture(variant, instance, view);
+                    let Some(template) = VariantTemplate::capture(variant, instance, view) else {
+                        self.stats.unshareable += 1;
+                        return None;
+                    };
                     self.stats.templates += 1;
                     PlanDecision::Rewrite(template)
                 }
             };
             self.decisions.insert(instance.root, decision);
         }
-        &self.decisions[&instance.root]
+        Some(&self.decisions[&instance.root])
     }
 
     pub(super) fn note_store_hit(&mut self) {
@@ -710,7 +716,16 @@ impl WindowBuilder<'_> {
 }
 
 impl VariantTemplate {
-    fn capture(variant: &ExecutionVariant, instance: &PlanInstance, view: &FusionView<'_>) -> Self {
+    /// `None` when the rewrite reads a node the window cannot name. Epilogue
+    /// generators fold a whole producer chain in one step and so reach the
+    /// chain's own operands, which sit past the horizon; those roots plan
+    /// fresh every visit rather than share a template that cannot say which
+    /// node a later instance should rebind to.
+    fn capture(
+        variant: &ExecutionVariant,
+        instance: &PlanInstance,
+        view: &FusionView<'_>,
+    ) -> Option<Self> {
         assert!(
             !matches!(
                 variant,
@@ -723,8 +738,8 @@ impl VariantTemplate {
         );
         let dependency_roles = variant_dependencies(variant)
             .into_iter()
-            .map(|dependency| instance.role_of[&dependency])
-            .collect();
+            .map(|dependency| instance.role_of.get(&dependency).copied())
+            .collect::<Option<Vec<_>>>()?;
         let matrix_role = matrix_of(variant).and_then(|matrix| {
             instance
                 .nodes
@@ -740,12 +755,12 @@ impl VariantTemplate {
             matrix_of(variant).is_none() || matrix_role.is_some(),
             "quantized fusion template matrix must be part of its structural window"
         );
-        Self {
+        Some(Self {
             variant: variant.clone(),
             dependency_roles,
             matrix_role,
             spec: None,
-        }
+        })
     }
 
     fn instantiate(&self, instance: &PlanInstance, view: &FusionView<'_>) -> ExecutionVariant {
@@ -903,7 +918,9 @@ mod tests {
                     match store.instantiate(key, &instance, &view) {
                         None => {
                             assert_eq!(step, 0, "second resolve must hit the store");
-                            let decision = memo.record(&instance, &view, Some(&fresh));
+                            let decision = memo
+                                .record(&instance, &view, Some(&fresh))
+                                .expect("chain rewrite stays inside its window");
                             store.record(key, decision);
                         }
                         Some(Some(rebound)) => {
@@ -975,7 +992,9 @@ mod tests {
                         None => {
                             assert_eq!(step, 0, "second resolve must hit the store");
                             let variant = view.variant_of(targets[0]).unwrap().clone();
-                            let decision = memo.record(&instance, &view, Some(&variant));
+                            let decision = memo
+                                .record(&instance, &view, Some(&variant))
+                                .expect("qmatmul rewrite stays inside its window");
                             store.record(key, decision);
                         }
                         Some(Some(ExecutionVariant::QMatMul(rebound))) => {

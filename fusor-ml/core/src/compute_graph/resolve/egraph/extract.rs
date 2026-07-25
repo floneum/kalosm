@@ -96,6 +96,20 @@ impl ExtractState {
             .collect()
     }
 
+    /// Child provenances of a node the cascade is killing. A child class
+    /// whose observations are all dead was killed earlier in the same
+    /// cascade — a chain-folding generator kills a producer and that
+    /// producer's own inputs — and its counts no longer reach any live
+    /// selection, so it drops out instead of resolving.
+    fn killed_child_provs(&self, driver: &EGraphDriver, prov: Prov) -> Vec<u32> {
+        self.selected_enode(driver, prov)
+            .children()
+            .iter()
+            .filter_map(|&child| driver.live_prov_of_class(child, &self.needed))
+            .map(|prov| prov.0)
+            .collect()
+    }
+
     pub(super) fn selected_enode<'d>(
         &'d self,
         driver: &'d EGraphDriver,
@@ -253,7 +267,7 @@ impl ExtractState {
                 continue;
             }
             self.needed[dead as usize] = false;
-            for child in self.selected_child_provs(driver, Prov(dead)) {
+            for child in self.killed_child_provs(driver, Prov(dead)) {
                 self.reads[child as usize] = self.reads[child as usize].saturating_sub(1);
                 remove_one(&mut self.consumers[child as usize], dead);
                 touched.push(child);
@@ -271,12 +285,17 @@ fn remove_one(consumers: &mut Vec<u32>, value: u32) {
 
 impl EGraphDriver {
     pub(super) fn prov_of_class(&self, id: egg::Id, needed: &[bool]) -> Prov {
-        let provenances = &self.provs_of_class[&self.egraph.find(id)];
-        provenances
+        self.live_prov_of_class(id, needed)
+            .expect("a selected e-class child must retain a needed provenance")
+    }
+
+    /// The live provenance of `id`, or `None` once every observation in the
+    /// class has been killed.
+    pub(super) fn live_prov_of_class(&self, id: egg::Id, needed: &[bool]) -> Option<Prov> {
+        self.provs_of_class[&self.egraph.find(id)]
             .iter()
             .copied()
             .find(|prov| needed[prov.0 as usize])
-            .expect("a selected e-class child must retain a needed provenance")
     }
 
     /// The identity e-node of a provenance: the one ingested for the
@@ -407,8 +426,10 @@ impl EGraphDriver {
                             None => {
                                 plans.note_store_miss();
                                 let result = self.best_fusion_candidate(&state, &view, Prov(prov));
-                                let decision = plans.record(&instance, &view, result.as_ref());
-                                store.record(key, decision);
+                                if let Some(decision) = plans.record(&instance, &view, result.as_ref())
+                                {
+                                    store.record(key, decision);
+                                }
                                 result
                             }
                         };
@@ -491,6 +512,12 @@ impl EGraphDriver {
                 cost.materialized_bytes,
                 cost.work,
             );
+            if sharing.unshareable > 0 {
+                tracing::info!(
+                    "resolve_egg_plans_unshareable rewrites={}",
+                    sharing.unshareable
+                );
+            }
         }
         Extraction {
             sel: state.sel,

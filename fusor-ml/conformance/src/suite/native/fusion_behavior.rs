@@ -2,7 +2,8 @@
 
 use fusor::{Device, Tensor};
 use fusor_conformance::{
-    AssertionCase, AssertionCases, approx_compare, available_devices, exact_value_compare,
+    AssertionCase, AssertionCases, approx_compare, approx_or_relative_compare, available_devices,
+    exact_value_compare,
 };
 
 async fn gpu_devices() -> Vec<Device> {
@@ -337,7 +338,12 @@ pub fn gpu_nary_fusion_respects_binding_limit() -> AssertionCases {
             let num_tensors = nary_binding_limit_stress_input_count(&device).unwrap_or(1);
             Tensor::from_slice(&device, shape, &binding_limit_sum_data(shape, num_tensors))
         })
-        .compare_with(approx_compare::<2, f32>(5e-6))
+        // Exceeding the binding budget is the point of the case, so the sum
+        // splits into differently associated partial sums than the reference
+        // accumulates. The element magnitude grows with the adapter's budget
+        // (one f32 ulp already exceeds an absolute 5e-6 by the hundredth
+        // term), so the accumulation term has to be relative.
+        .compare_with(approx_or_relative_compare::<2>(5e-6, 1e-5))
         .baseline_on_test_device()
         .devices_async(gpu_devices())
         .runs(1)
