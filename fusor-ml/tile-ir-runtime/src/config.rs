@@ -54,6 +54,20 @@ pub struct FusorConfig {
     /// Cross-check structurally shared fusion plans against fresh planning
     /// (`FUSOR_VERIFY_PLAN_SHARING`).
     pub verify_plan_sharing: bool,
+    /// Log the per-resolve ingest and window-capture ledgers of the
+    /// recognition-hoisting spike (`FUSOR_SPIKE_HOISTING`; see
+    /// `compute_graph/resolve/egraph/HOISTING_SPIKE.md`). Measurement only:
+    /// the ledgers change no decision.
+    pub spike_hoisting: bool,
+    /// Skip the pre-ingest recognition sweep for resolves with at most this
+    /// many execution nodes (`FUSOR_SPIKE_NO_RECOGNITION`), so the e-graph
+    /// ingests the un-preshrunk graph. This is the cost side of hoisting
+    /// every recognizer into a fusion generator; it is scoped by graph size
+    /// because an un-preshrunk training step does not fit in unified memory.
+    pub spike_no_recognition: Option<usize>,
+    /// Override the structural fusion-plan window horizon
+    /// (`FUSOR_SPIKE_WINDOW_DEPTH`); unset keeps the built-in stub depth.
+    pub spike_window_depth: Option<u32>,
     /// Write every generated shader to this directory (`FUSOR_DUMP_SHADERS`).
     pub dump_shaders: Option<PathBuf>,
     /// Override the lazy graph's auto-flush node threshold
@@ -108,6 +122,9 @@ impl FusorConfig {
             trace_pipeline_compiles: flag("FUSOR_TRACE_PIPELINE_COMPILES"),
             debug_sampler: flag("FUSOR_DEBUG_SAMPLER"),
             verify_plan_sharing: flag("FUSOR_VERIFY_PLAN_SHARING"),
+            spike_hoisting: flag("FUSOR_SPIKE_HOISTING"),
+            spike_no_recognition: parse("FUSOR_SPIKE_NO_RECOGNITION"),
+            spike_window_depth: parse("FUSOR_SPIKE_WINDOW_DEPTH"),
             dump_shaders: std::env::var_os("FUSOR_DUMP_SHADERS").map(PathBuf::from),
             graph_flush_threshold: parse("FUSOR_GRAPH_FLUSH_THRESHOLD"),
             resolve_dispatches_per_pass: parse("FUSOR_RESOLVE_DISPATCHES_PER_PASS")

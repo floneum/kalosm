@@ -7,8 +7,8 @@ use crate::types::QmatmulExtra;
 /// accumulator elements are [`ScalarElement`] data. The `F32 -> F32` /
 /// `F16 -> F16` cases are identity; the `F16 -> F32` case inserts the cast
 /// pair that lets F16 storage be loaded into F32 accumulators and stored back.
-/// Used by the unified `batched_matmul_with_epilogues` / `batched_gemv_*`
-/// kernels so we don't have to duplicate every body per (storage, accum) pair.
+/// Used by the workgroup-tiled quantized kernels so we don't have to duplicate
+/// every body per (storage, accum) pair.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct AccumCast {
     storage: ScalarElement,

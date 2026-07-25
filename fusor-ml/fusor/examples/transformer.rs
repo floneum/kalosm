@@ -57,6 +57,7 @@ enum Dtype {
 struct RunConfig {
     steps: usize,
     min_steps_per_second: Option<f64>,
+    expect_loss: Option<f32>,
     skip_eval: bool,
     progress_every: usize,
     trace_host: bool,
@@ -70,6 +71,7 @@ impl RunConfig {
         let mut config = Self {
             steps: STEPS,
             min_steps_per_second: None,
+            expect_loss: None,
             skip_eval: false,
             progress_every: PROGRESS_EVERY,
             trace_host: false,
@@ -88,6 +90,11 @@ impl RunConfig {
                     let value = args.next().expect("--min-steps-per-sec requires a value");
                     config.min_steps_per_second =
                         Some(value.parse().expect("--min-steps-per-sec must be a number"));
+                }
+                "--expect-loss" => {
+                    let value = args.next().expect("--expect-loss requires a value");
+                    config.expect_loss =
+                        Some(value.parse().expect("--expect-loss must be a number"));
                 }
                 "--skip-eval" => config.skip_eval = true,
                 "--progress-every" => {
@@ -814,6 +821,7 @@ macro_rules! gpt_model {
                 };
 
                 let mut rng = Lcg(7);
+                let mut final_loss = None;
                 let start = std::time::Instant::now();
                 for step in 0..config.steps {
                     let report_progress = config.progress_every != 0
@@ -901,6 +909,7 @@ macro_rules! gpt_model {
                     if let Some((loss, correct)) = progress {
                         let (loss, train_accuracy) =
                             read_metrics(loss, correct, BATCH_SIZE * CONTEXT).await;
+                        final_loss = Some(loss);
                         let (_, test_accuracy) = evaluate_batch(
                             &device,
                             &params,
@@ -938,6 +947,18 @@ macro_rules! gpt_model {
                 {
                     panic!(
                         "transformer throughput {steps_per_second:.1} steps/s below required {min_steps_per_second:.1}"
+                    );
+                }
+
+                // Bit-exact loss gate for refactors that claim no numeric
+                // change: the run is deterministic, so the final reported
+                // training loss must reproduce exactly.
+                if let Some(expected) = config.expect_loss {
+                    let final_loss =
+                        final_loss.expect("--expect-loss requires the final step to report progress");
+                    assert!(
+                        final_loss.to_bits() == expected.to_bits(),
+                        "final loss {final_loss:?} does not match expected {expected:?}"
                     );
                 }
 

@@ -127,9 +127,7 @@ pub fn gpu_nary_triple_add_fuses_into_one_kernel() -> AssertionCases {
                 let c = Tensor::from_slice(&device, shape, &kernel_c_data);
                 let sum = &a + &b;
                 let result = &sum + &c;
-                result
-                    .as_gpu()
-                    .is_some_and(|gpu| gpu.count_kernels_to_resolve() == 1)
+                result.as_gpu().is_some_and(|gpu| gpu.resolves_in::<1>())
             },
         ));
     }
@@ -164,9 +162,7 @@ pub fn gpu_nary_unary_chain_fuses_into_one_kernel() -> AssertionCases {
                 let b = Tensor::from_slice(&device, shape, &kernel_b_data);
                 let sum = (-a.clone()) + b.sin();
                 let result = sum.cos() + 1.0;
-                result
-                    .as_gpu()
-                    .is_some_and(|gpu| gpu.count_kernels_to_resolve() == 1)
+                result.as_gpu().is_some_and(|gpu| gpu.resolves_in::<1>())
             },
         ));
     }
@@ -195,7 +191,7 @@ pub fn gpu_nary_same_input_multiple_times_deduplicates_bindings() -> AssertionCa
                 let result = &sum + &a;
                 result
                     .as_gpu()
-                    .is_some_and(|gpu| gpu.count_kernels_to_resolve() == 1)
+                    .is_some_and(|gpu| gpu.resolves_in::<1>())
             },
         ));
     }
@@ -232,9 +228,7 @@ pub fn gpu_nary_where_cond_fuses_into_one_kernel() -> AssertionCases {
                 let on_true = Tensor::from_slice(&device, shape, &kernel_on_true_data);
                 let on_false = Tensor::from_slice(&device, shape, &kernel_on_false_data);
                 let result = condition.where_cond(&on_true, &on_false);
-                result
-                    .as_gpu()
-                    .is_some_and(|gpu| gpu.count_kernels_to_resolve() == 1)
+                result.as_gpu().is_some_and(|gpu| gpu.resolves_in::<1>())
             },
         ));
     }
@@ -277,7 +271,7 @@ pub fn gpu_attention_fuses_into_one_kernel() -> AssertionCases {
             let v = Tensor::from_slice(&device, kv_shape, &kernel_v_data);
             q.attention(&k, &v, scale, None)
                 .as_gpu()
-                .is_some_and(|gpu| gpu.count_kernels_to_resolve() == 1)
+                .is_some_and(|gpu| gpu.resolves_in::<1>())
         },
     ));
     assertions
@@ -316,7 +310,7 @@ pub fn gpu_residual_rms_norm_fuses_into_one_kernel() -> AssertionCases {
             input
                 .rms_norm_residual_fused::<1, 2, _>(&residual, &weight, None, 1e-5)
                 .as_gpu()
-                .is_some_and(|gpu| gpu.count_kernels_to_resolve() == 1)
+                .is_some_and(|gpu| gpu.resolves_in::<1>())
         },
     ));
     assertions
@@ -389,7 +383,7 @@ pub fn gpu_gelu_lowers_to_one_kernel() -> AssertionCases {
                 Tensor::from_slice(&device, shape, &kernel_data)
                     .gelu()
                     .as_gpu()
-                    .is_some_and(|gpu| gpu.count_kernels_to_resolve() == 1)
+                    .is_some_and(|gpu| gpu.resolves_in::<1>())
             },
         ));
     }
@@ -420,9 +414,7 @@ pub fn gpu_matmul_then_unary_chain_fuses_into_one_kernel() -> AssertionCases {
             let b = Tensor::from_slice(&device, b_shape, &kernel_b_data);
             let matmul = a.mat_mul(&b);
             let result = matmul.cos() + 1.0;
-            result
-                .as_gpu()
-                .is_some_and(|gpu| gpu.count_kernels_to_resolve() == 1)
+            result.as_gpu().is_some_and(|gpu| gpu.resolves_in::<1>())
         },
     ));
     assertions
@@ -453,7 +445,7 @@ pub fn gpu_unary_inputs_fuse_into_matmul_kernel() -> AssertionCases {
             (-a.clone())
                 .mat_mul(&b.sin())
                 .as_gpu()
-                .is_some_and(|gpu| gpu.count_kernels_to_resolve() == 1)
+                .is_some_and(|gpu| gpu.resolves_in::<1>())
         },
     ));
     assertions
@@ -485,8 +477,7 @@ pub fn gpu_coop_matmul_fuses_pre_and_post_unary_chains() -> AssertionCases {
             let b = Tensor::from_slice(&device, shape, &kernel_b_data);
             let matmul = (-a).mat_mul(&b.sin());
             let out = matmul.cos() + 1.0;
-            out.as_gpu()
-                .is_some_and(|gpu| gpu.count_kernels_to_resolve() == 1)
+            out.as_gpu().is_some_and(|gpu| gpu.resolves_in::<1>())
         },
     ));
     assertions
@@ -511,9 +502,7 @@ pub fn gpu_reduce_then_unary_chain_fuses_into_one_kernel() -> AssertionCases {
             let tensor = Tensor::from_slice(&device, shape, &kernel_data);
             let reduced = tensor.sum::<1>(0);
             let result = reduced.cos() + 1.0;
-            result
-                .as_gpu()
-                .is_some_and(|gpu| gpu.count_kernels_to_resolve() == 1)
+            result.as_gpu().is_some_and(|gpu| gpu.resolves_in::<1>())
         },
     ));
     assertions
@@ -561,9 +550,7 @@ pub fn gpu_reduce_then_gelu_uses_two_kernels() -> AssertionCases {
                     .sum_keepdim::<1>(0)
                     .gelu();
                 // Resize between Reduce and Gelu prevents fusion of the two kernels.
-                result
-                    .as_gpu()
-                    .is_some_and(|gpu| gpu.count_kernels_to_resolve() == 2)
+                result.as_gpu().is_some_and(|gpu| gpu.resolves_in::<2>())
             },
         ));
     }

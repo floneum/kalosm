@@ -174,8 +174,9 @@ where
             let single_zero_grad = zero_mask
                 .where_cond(&(upstream * product_non_zero).into_concrete(), &zeros)
                 .into_concrete();
-            let gradient = ((no_zero_grad * zero_count_broadcast.eq(T::from_f32(0.0)).into_concrete())
-                .into_concrete()
+            let gradient = ((no_zero_grad
+                * zero_count_broadcast.eq(T::from_f32(0.0)).into_concrete())
+            .into_concrete()
                 + (single_zero_grad * zero_count_broadcast.eq(T::from_f32(1.0)).into_concrete())
                     .into_concrete())
             .into_concrete();
@@ -250,8 +251,7 @@ where
         crate::gpu::Tensor<R2, T>: crate::gpu::LargerRank<1, R3, T>,
         crate::gpu::Tensor<R3, T>: crate::gpu::SmallerRank<DIFF, O, T>,
         crate::ConcreteTensor<T, O>: crate::cpu::LastRank<R, T>,
-        crate::gpu::Tensor<O, T>:
-            crate::gpu::LastRank<R, T> + crate::gpu::SmallerRank<1, R, T>,
+        crate::gpu::Tensor<O, T>: crate::gpu::LastRank<R, T> + crate::gpu::SmallerRank<1, R, T>,
         crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
         crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
     {
@@ -269,8 +269,7 @@ where
         crate::gpu::Tensor<R2, T>: crate::gpu::LargerRank<1, R3, T>,
         crate::gpu::Tensor<R3, T>: crate::gpu::SmallerRank<DIFF, O, T>,
         crate::ConcreteTensor<T, O>: crate::cpu::LastRank<R, T>,
-        crate::gpu::Tensor<O, T>:
-            crate::gpu::LastRank<R, T> + crate::gpu::SmallerRank<1, R, T>,
+        crate::gpu::Tensor<O, T>: crate::gpu::LastRank<R, T> + crate::gpu::SmallerRank<1, R, T>,
         crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
         crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
     {

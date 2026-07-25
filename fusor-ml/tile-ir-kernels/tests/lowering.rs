@@ -1,11 +1,10 @@
 use fusor_tile_ir::{tile, GgmlQuantFormat, NagaKernel, ScalarElement, Shape};
 use fusor_tile_ir_kernels::{
     DEFAULT_SWIZZLE_GROUP_M,
-    qgemv_with_epilogue, qgemv_workgroup_f16_with_epilogue, qgemv_workgroup_with_epilogue,
-    qmatmul_with_epilogue, qmatmul_workgroup_f16_with_epilogues, qmatmul_workgroup_with_epilogues,
-    quantized_matrix, try_batched_coop_matmul, DenseCoopMatmulConfig, DenseCoopMatmulTile,
-    DenseMatmulEpilogues, DenseMatmulShape, DenseMatmulTensors, QmatmulEpilogues, SubgroupConfig,
-    UnaryEpilogue, UnaryEpilogueWithExtras,
+    qgemv_with_epilogue, qmatmul_with_epilogue, qmatmul_workgroup_with_epilogues, quantized_matrix,
+    try_batched_coop_matmul, DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulEpilogues,
+    DenseMatmulShape, DenseMatmulTensors, QmatmulEpilogues, SubgroupConfig, UnaryEpilogue,
+    UnaryEpilogueWithExtras,
 };
 
 fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
@@ -491,117 +490,83 @@ fn module_uses_tanh(module: &naga::Module) -> bool {
 }
 
 #[test]
-fn workgroup_qmatmul_lowers_without_subgroups() {
-    let ir = tile::build(|program| {
-        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([32, 256]));
-        let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 32);
-        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([32, 32]));
-        qmatmul_workgroup_with_epilogues(program, &a, &b, &y, &QmatmulEpilogues::empty(), 65_535);
-    });
-    let lowered = lower_or_fail(&ir, "workgroup qmatmul");
-    assert!(
-        !module_uses_subgroup(lowered.module()),
-        "workgroup qmatmul emitted subgroup ops"
-    );
-}
-
-#[test]
-fn f16_staged_workgroup_qmatmul_lowers_without_subgroups() {
-    let ir = tile::build(|program| {
-        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([32, 256]));
-        let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 32);
-        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([32, 32]));
-        qmatmul_workgroup_f16_with_epilogues(
-            program,
-            &a,
-            &b,
-            &y,
-            &QmatmulEpilogues::empty(),
-            65_535,
-        );
-    });
-    let lowered = lower_or_fail(&ir, "f16 staged workgroup qmatmul");
-    assert!(
-        module_uses_f16(lowered.module()),
-        "f16 staged workgroup qmatmul did not allocate f16 scratch"
-    );
-    assert!(
-        !module_uses_subgroup(lowered.module()),
-        "f16 staged workgroup qmatmul emitted subgroup ops"
-    );
-}
-
-#[test]
-fn workgroup_qgemv_lowers_without_subgroups() {
-    let ir = tile::build(|program| {
-        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, 256]));
-        let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 128);
-        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, 128]));
-        qgemv_workgroup_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 65_535);
-    });
-    let lowered = lower_or_fail(&ir, "workgroup qgemv");
-    assert!(
-        !module_uses_subgroup(lowered.module()),
-        "workgroup qgemv emitted subgroup ops"
-    );
-}
-
-#[test]
-fn f16_staged_workgroup_qgemv_lowers_without_subgroups() {
-    let ir = tile::build(|program| {
-        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, 256]));
-        let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 128);
-        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, 128]));
-        qgemv_workgroup_f16_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 65_535);
-    });
-    let lowered = lower_or_fail(&ir, "f16 staged workgroup qgemv");
-    assert!(
-        module_uses_f16(lowered.module()),
-        "f16 staged workgroup qgemv did not allocate f16 scratch"
-    );
-    assert!(
-        !module_uses_subgroup(lowered.module()),
-        "f16 staged workgroup qgemv emitted subgroup ops"
-    );
-}
-
-#[test]
-fn q4k_native_workgroup_qgemv_lowers_without_subgroups() {
-    let ir = tile::build(|program| {
-        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, 256]));
-        let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 128);
-        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, 128]));
-        qgemv_workgroup_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 65_535);
-    });
-    let lowered = lower_or_fail(&ir, "q4k native workgroup qgemv");
-    assert!(
-        !module_uses_subgroup(lowered.module()),
-        "native workgroup qgemv emitted subgroup ops"
-    );
-}
-
-#[test]
-fn workgroup_qgemv_accumulator_offsets_lower_without_subgroups() {
-    let post = UnaryEpilogueWithExtras::new_with_value_arity("paired_product", 2, 0, |values| {
+fn workgroup_qmatmul_family_lowers_without_subgroups() {
+    let paired = UnaryEpilogueWithExtras::new_with_value_arity("paired_product", 2, 0, |values| {
         values[0].clone() * values[1].clone()
     });
     let offsets = [0, 64];
-    let epilogues = QmatmulEpilogues {
-        post_with_extras: Some(&post),
+    let paired_epilogues = QmatmulEpilogues {
+        post_with_extras: Some(&paired),
         post_accumulator_offsets: &offsets,
         ..QmatmulEpilogues::empty()
     };
-    let ir = tile::build(|program| {
-        let a = program.storage_read(ScalarElement::F32.element(), Shape::new([1, 256]));
-        let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 128);
-        let y = program.storage_write(ScalarElement::F32.element(), Shape::new([1, 64]));
-        qgemv_workgroup_with_epilogue(program, &a, &b, &y, &epilogues, 65_535);
-    });
-    let lowered = lower_or_fail(&ir, "workgroup qgemv accumulator offsets");
-    assert!(
-        !module_uses_subgroup(lowered.module()),
-        "workgroup qgemv accumulator offsets emitted subgroup ops"
-    );
+    let empty = QmatmulEpilogues::empty();
+    // (label, [m, k, n], format, staging element, epilogues)
+    let cases = [
+        (
+            "workgroup qmatmul",
+            [32, 256, 32],
+            GgmlQuantFormat::Q8_0,
+            ScalarElement::F32,
+            &empty,
+        ),
+        (
+            "f16 staged workgroup qmatmul",
+            [32, 256, 32],
+            GgmlQuantFormat::Q4KNative,
+            ScalarElement::F16,
+            &empty,
+        ),
+        (
+            "workgroup qgemv",
+            [1, 256, 128],
+            GgmlQuantFormat::Q4K,
+            ScalarElement::F32,
+            &empty,
+        ),
+        (
+            "f16 staged workgroup qgemv",
+            [1, 256, 128],
+            GgmlQuantFormat::Q4KNative,
+            ScalarElement::F16,
+            &empty,
+        ),
+        (
+            "q4k native workgroup qgemv",
+            [1, 256, 128],
+            GgmlQuantFormat::Q4KNative,
+            ScalarElement::F32,
+            &empty,
+        ),
+        (
+            "workgroup qgemv accumulator offsets",
+            [1, 256, 64],
+            GgmlQuantFormat::Q4K,
+            ScalarElement::F32,
+            &paired_epilogues,
+        ),
+    ];
+    for (label, [m, k, n], format, staging, epilogues) in cases {
+        // The paired epilogue reads two accumulators per output column.
+        let matrix_cols = n * epilogues.post_value_arity() as u32;
+        let ir = tile::build(|program| {
+            let a = program.storage_read(ScalarElement::F32.element(), Shape::new([m, k]));
+            let b = quantized_matrix(program, format, k, matrix_cols);
+            let y = program.storage_write(ScalarElement::F32.element(), Shape::new([m, n]));
+            qmatmul_workgroup_with_epilogues(program, &a, &b, &y, staging, epilogues, 65_535);
+        });
+        let lowered = lower_or_fail(&ir, label);
+        assert!(
+            !module_uses_subgroup(lowered.module()),
+            "{label} emitted subgroup ops"
+        );
+        if staging == ScalarElement::F16 {
+            assert!(
+                module_uses_f16(lowered.module()),
+                "{label} did not allocate f16 scratch"
+            );
+        }
+    }
 }
 
 fn module_uses_subgroup(module: &naga::Module) -> bool {

@@ -1,8 +1,8 @@
-//! Equality-saturation optimizer for operation recognition and fusion.
+//! Value e-graph optimizer for operation fusion.
 //!
-//! Rules are strictly additive: appliers union an alternative e-node into the
-//! root's class and never remove anything. A GPU-oriented extractor chooses
-//! among recognition and fusion alternatives, and one physical planner
+//! Rewrites are strictly additive: a fusion generator's alternative e-node is
+//! unioned into the root's class and nothing is ever removed. A GPU-oriented
+//! extractor chooses among those alternatives, and one physical planner
 //! applies the chosen terms back onto the execution graph.
 //!
 //! Pure e-node identity is semantic: operator payload plus child e-classes.
@@ -14,6 +14,7 @@
 
 mod analysis;
 mod apply;
+pub(super) mod compose;
 mod cost;
 mod extract;
 mod ingest;
@@ -28,7 +29,7 @@ use egg::{EGraph, Id};
 use rustc_hash::FxHashMap;
 
 use self::analysis::FusorAnalysis;
-use self::lang::{FusorLang, PayloadId};
+use self::lang::FusorLang;
 use super::{ExecutionVariant, Resolver};
 use crate::compute_graph::{ComputeGraphInner, NodeIndex};
 
@@ -39,10 +40,6 @@ pub(super) struct EGraphDriver {
     /// Provenance -> e-class id (as returned at add time; canonicalize with
     /// `egraph.find` after unions).
     class_of: Vec<Id>,
-    /// Provenance -> the ingested identity e-node's payload id (`None` for
-    /// tensor/boundary leaves). Distinguishes the identity form from
-    /// rule-minted alternatives during extraction.
-    identity_payloads: Vec<Option<PayloadId>>,
     identity_enodes: Vec<FusorLang>,
     identity_variants: Vec<Option<ExecutionVariant>>,
     /// Inner-graph node -> provenance.
@@ -94,38 +91,6 @@ impl EGraphDriver {
         self.egraph.union(root_id, id);
         enode
     }
-
-    /// Insert the execution graph's current structural form into this
-    /// driver's root class. An unchanged operation reuses its ingested
-    /// identity. A committed alternative keeps an occurrence-local payload:
-    /// semantic payload interning erases concrete dependencies, while fusion
-    /// generators must read the dependencies of this exact occurrence.
-    fn ensure_current_variant(&mut self, root: lang::Prov, variant: ExecutionVariant) -> FusorLang {
-        if self
-            .identity_variant(root)
-            .is_some_and(|identity| interner::concrete_variant_eq(identity, &variant))
-        {
-            return self.identity_enode(root).clone();
-        }
-        let children: Vec<Id> = interner::variant_dependencies(&variant)
-            .into_iter()
-            .map(|dep| {
-                self.class_for(dep)
-                    .expect("current variant dependencies were ingested")
-            })
-            .collect();
-        let enode = ingest::enode_for(
-            &mut self.egraph.analysis,
-            &variant,
-            root,
-            children,
-            false,
-            None,
-        );
-        let id = self.egraph.add(enode.clone());
-        self.egraph.union(self.class_of[root.0 as usize], id);
-        enode
-    }
 }
 
 impl Resolver {
@@ -134,28 +99,58 @@ impl Resolver {
     /// Allocation-independent structural templates make repeated-layer
     /// fusion planning proportional to unique local structure.
     pub(super) fn optimize_operations(&mut self, graph: &mut ComputeGraphInner) {
+        let device = graph.device();
+        let config = device.config();
+        let recognized = !config
+            .spike_no_recognition
+            .is_some_and(|budget| self.execution_graph.node_count() <= budget);
         let recognition_start = std::time::Instant::now();
-        self.recognize_contractions(graph);
-        self.recognize_embeddings(graph);
-        self.recognize_attention(graph);
-        self.fuse_row_programs(graph);
-        self.recognize_assign_chains(graph);
-        self.optimize_phases.recognition += recognition_start.elapsed();
+        if recognized {
+            self.recognize_all(graph);
+        }
+        let recognition = recognition_start.elapsed();
+        self.optimize_phases.recognition += recognition;
 
         let extraction_start = std::time::Instant::now();
         let mut driver = EGraphDriver::ingest(self, graph);
+        if config.spike_hoisting {
+            let analysis = &driver.egraph.analysis;
+            tracing::info!(
+                "hoisting_spike_ingest recognized={} exec_nodes={} recognition_us={} ingest_us={} provs={} enodes={} classes={} payloads={} specs={}",
+                recognized,
+                self.execution_graph.node_count(),
+                recognition.as_micros(),
+                extraction_start.elapsed().as_micros(),
+                analysis.facts.len(),
+                driver.egraph.total_number_of_nodes(),
+                driver.egraph.number_of_classes(),
+                analysis.payloads.payload_count(),
+                analysis.payloads.spec_count(),
+            );
+        }
         let extraction = {
             let ctx = rules_fuse::FusionCtx {
                 graph,
                 layouts: std::cell::RefCell::new(Default::default()),
             };
-            driver.extract_with_fusion(self, &ctx)
+            driver.extract_with_fusion(&ctx)
         };
         driver.egraph.rebuild();
         driver.refresh_prov_classes();
         self.apply_egraph_deltas(graph, &driver, &extraction);
         self.coalesce_equivalent_eclasses(graph, &driver);
         self.optimize_phases.extraction += extraction_start.elapsed();
+    }
+
+    /// Every matcher that claims a composed cluster, in nesting order:
+    /// attention reads recognized contractions, and the assign chains close
+    /// over whatever the earlier passes left.
+    pub(super) fn recognize_all(&mut self, graph: &mut ComputeGraphInner) {
+        self.recognize_contractions(graph);
+        self.recognize_embeddings(graph);
+        self.recognize_attention(graph);
+        self.fuse_row_programs(graph);
+        self.recognize_assign_chains(graph);
     }
 
     /// Collapse execution nodes that ingestion places in the same semantic

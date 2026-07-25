@@ -85,7 +85,10 @@ where
     f32: crate::CastTensor<T>,
 {
     /// Normalizes the last dimension of an input tensor.
-    pub fn forward<const R: usize, const OUT_RANK: usize>(&self, input: &Tensor<R, T>) -> Tensor<R, T>
+    pub fn forward<const R: usize, const OUT_RANK: usize>(
+        &self,
+        input: &Tensor<R, T>,
+    ) -> Tensor<R, T>
     where
         crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
         crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,

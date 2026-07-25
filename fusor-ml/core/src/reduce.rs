@@ -135,6 +135,12 @@ impl Operation for ReduceOperation {
         }
     }
 
+    fn visit_dependencies_mut(&mut self, f: &mut dyn FnMut(&mut NodeIndex)) {
+        for input in &mut self.inputs {
+            f(input);
+        }
+    }
+
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
         let mut mir_inputs: Vec<MirValue> = self
             .inputs

@@ -49,11 +49,6 @@ pub(super) struct CostDelta {
 }
 
 impl CostDelta {
-    #[cfg(test)]
-    pub(super) fn improves(self) -> bool {
-        self < Self::default()
-    }
-
     /// Fusion rules are one-way structural simplifications. An equal-cost
     /// canonicalization (notably unit-reduce -> elementwise) is useful because
     /// it exposes the next fusion and cannot cycle back to its old form.
@@ -266,8 +261,7 @@ mod tests {
                 dispatches: -1,
                 materialized_bytes: 1_000_000,
                 work: 1_000_000,
-            }
-            .improves()
+            } < CostDelta::default()
         );
     }
 
@@ -278,18 +272,23 @@ mod tests {
                 dispatches: 0,
                 materialized_bytes: -1,
                 work: 1_000_000,
-            }
-            .improves()
+            } < CostDelta::default()
         );
         assert!(
             CostDelta {
                 dispatches: 0,
                 materialized_bytes: 0,
                 work: -1,
-            }
-            .improves()
+            } < CostDelta::default()
         );
-        assert!(!CostDelta::default().improves());
         assert!(CostDelta::default().non_worse());
+        assert!(
+            !CostDelta {
+                dispatches: 0,
+                materialized_bytes: 0,
+                work: 1,
+            }
+            .non_worse()
+        );
     }
 }

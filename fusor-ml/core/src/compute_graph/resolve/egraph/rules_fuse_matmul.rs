@@ -1,40 +1,28 @@
-//! Matmul/qmatmul fusion generators derived from
-//! `try_fuse_into_matmul` and its graph-reading helpers (fusion_matmul.rs),
-//! consulted by the extraction worklist.
+//! Matmul/qmatmul fusion generators, consulted by the extraction worklist.
 //!
-//! Each branch reproduces the destructive body with the graph reads replaced
-//! by [`FusionView`] calls and the commit tails removed
-//! (`commit_qmatmul_post_fusion`, edge surgery, `add_physical_dependencies`,
-//! dead-node pruning) — the extractor's switch/kill machinery is the commit.
-//! Where the original commits a variant to the rewritten node and returns
-//! `true`, the generator returns `Some(variant)`. Gate order, early-return
-//! structure, budget checks, and builder calls are transcribed verbatim from
-//! the destructive originals — those stay untouched until deletion so the
-//! parity baseline holds. Pure expression helpers
-//! (`replace_indexed_qmatmul_accumulators`, `remap_temp_accumulator_inputs`,
-//! `qmatmul_last_dim_view_offset`) are called on `Resolver` directly; only
-//! the helpers that read graph state (`try_extract_indexed_qmatmul_post_expr`,
-//! `try_extract_mapped_qmatmul_post_expr`,
-//! `try_fuse_qmatmul_narrow_accumulators`) are re-transcribed here.
+//! Each branch reads graph state through [`FusionView`] and returns the new
+//! variant for the node being rewritten; the extractor's switch/kill
+//! machinery is the commit. The accumulator-offset epilogue's own expression
+//! rules ride on the shared [`compose`] walk at the end of this file.
 
 use rustc_hash::FxHashMap;
 
 use super::super::{ExecutionVariant, Resolver};
+use super::compose;
 use super::rules_fuse::FusionView;
 use crate::Layout;
 use crate::compute_graph::NodeIndex;
-use crate::nary_wise::{ElementwiseOperation, NaryExpr, UnaryFunctionChain};
-use crate::quantized::matmul::ElementwiseEpilogue;
+use crate::nary_wise::{ElementwiseOperation, NaryExpr, NaryOp, NaryScalar, UnaryFunctionChain};
+use crate::quantized::matmul::{ElementwiseEpilogue, QMatMulOperation};
 
 impl FusionView<'_> {
-    /// Transcription of `try_fuse_into_matmul` (fusion_matmul.rs:4-471):
-    /// dense matmul post unary chains, qmatmul narrow-accumulator, indexed
+    /// Dense matmul post unary chains, qmatmul narrow-accumulator, indexed
     /// post, general elementwise post, qmatmul pre epilogues, and dense
-    /// matmul pre unary chains, in the original attempt order. Returns the
-    /// new variant for the node being rewritten (first success wins).
+    /// matmul pre unary chains, in attempt order. Returns the new variant
+    /// for the node being rewritten (first success wins).
     pub(super) fn gen_matmul_family(&self, current: &ExecutionVariant) -> Option<ExecutionVariant> {
         // Post-op: fuse elementwise after matmul (dense or quantized).
-        if let Some(el_op) = Resolver::try_get_unary_chain(current) {
+        if let Some(el_op) = compose::try_get_unary_chain(current) {
             let input_inner = el_op.value;
             if !self.is_cached(input_inner)
                 && let Some(input_variant) = self.variant_of(input_inner)
@@ -161,7 +149,7 @@ impl FusionView<'_> {
                         _ => None,
                     };
                     if let Some(base_qmatmul) = base_qmatmul
-                        && Resolver::qmatmul_same_base(&qmatmul_op, &base_qmatmul)
+                        && qmatmul_same_base(&qmatmul_op, &base_qmatmul)
                     {
                         let alias_layout = Resolver::apply_view_chain(
                             &Layout::contiguous(&base_qmatmul.out_shape),
@@ -170,11 +158,8 @@ impl FusionView<'_> {
                         if alias_layout == Some(Layout::contiguous(&nary.shape))
                             && !nary.expression.uses_custom_indexing_for_input(input_idx)
                         {
-                            replacements[input_idx] = Resolver::qmatmul_output_expr(
-                                &base_qmatmul,
-                                &mut extras,
-                                nary.shape.len(),
-                            );
+                            replacements[input_idx] =
+                                qmatmul_output_expr(&base_qmatmul, &mut extras, nary.shape.len());
                             continue;
                         }
                         valid_expression = false;
@@ -194,7 +179,7 @@ impl FusionView<'_> {
                     continue;
                 }
                 let Some(expression) =
-                    Resolver::replace_inputs_in_expr(&nary.expression, &replacements)
+                    compose::replace_inputs_in_expr(&nary.expression, &replacements)
                 else {
                     continue;
                 };
@@ -315,38 +300,39 @@ impl FusionView<'_> {
                 if !valid_expression {
                     continue;
                 }
-                let expression = nary.expression.remap_inputs(&mapping);
+                let expression = compose::remap_inputs(&nary.expression, &mapping);
 
-                let pre_element_wise_expr =
-                    if let Some(existing) = &qmatmul_op.pre_element_wise_expr {
-                        if existing.input_datatype != nary.output_datatype {
-                            continue;
-                        }
-                        let mut mapping = Vec::with_capacity(1 + existing.extras.len());
-                        mapping.push(0);
-                        mapping.extend((0..existing.extras.len()).map(|i| i + 1 + extras.len()));
-                        let shifted_existing = existing.expression.remap_inputs(&mapping);
-                        let (expression, success) =
-                            Resolver::substitute_input_in_expr(&shifted_existing, 0, &expression);
-                        if !success {
-                            continue;
-                        }
-                        let mut combined_extras = extras.clone();
-                        combined_extras.extend(existing.extras.clone());
-                        ElementwiseEpilogue {
-                            expression,
-                            extras: combined_extras,
-                            input_datatype,
-                            output_datatype: existing.output_datatype,
-                        }
-                    } else {
-                        ElementwiseEpilogue {
-                            expression,
-                            extras: extras.clone(),
-                            input_datatype,
-                            output_datatype: nary.output_datatype,
-                        }
-                    };
+                let pre_element_wise_expr = if let Some(existing) =
+                    &qmatmul_op.pre_element_wise_expr
+                {
+                    if existing.input_datatype != nary.output_datatype {
+                        continue;
+                    }
+                    let mut mapping = Vec::with_capacity(1 + existing.extras.len());
+                    mapping.push(0);
+                    mapping.extend((0..existing.extras.len()).map(|i| i + 1 + extras.len()));
+                    let shifted_existing = compose::remap_inputs(&existing.expression, &mapping);
+                    let (expression, success) =
+                        compose::substitute_input_in_expr(&shifted_existing, 0, &expression);
+                    if !success {
+                        continue;
+                    }
+                    let mut combined_extras = extras.clone();
+                    combined_extras.extend(existing.extras.clone());
+                    ElementwiseEpilogue {
+                        expression,
+                        extras: combined_extras,
+                        input_datatype,
+                        output_datatype: existing.output_datatype,
+                    }
+                } else {
+                    ElementwiseEpilogue {
+                        expression,
+                        extras: extras.clone(),
+                        input_datatype,
+                        output_datatype: nary.output_datatype,
+                    }
+                };
 
                 let mut new_q = qmatmul_op.clone();
                 new_q.input = primary_inner;
@@ -375,7 +361,7 @@ impl FusionView<'_> {
             // Check first input
             if !self.is_cached(matmul_op.first)
                 && let Some(first_variant) = self.variant_of(matmul_op.first)
-                && let Some(el_op) = Resolver::try_get_unary_chain(first_variant)
+                && let Some(el_op) = compose::try_get_unary_chain(first_variant)
             {
                 new_matmul.first = el_op.value;
                 let mut functions = el_op.functions.functions.clone();
@@ -388,7 +374,7 @@ impl FusionView<'_> {
             // Check second input
             if !self.is_cached(matmul_op.second)
                 && let Some(second_variant) = self.variant_of(matmul_op.second)
-                && let Some(el_op) = Resolver::try_get_unary_chain(second_variant)
+                && let Some(el_op) = compose::try_get_unary_chain(second_variant)
             {
                 new_matmul.second = el_op.value;
                 let mut functions = el_op.functions.functions.clone();
@@ -406,8 +392,7 @@ impl FusionView<'_> {
         None
     }
 
-    /// Transcription of `try_fuse_qmatmul_narrow_accumulators`
-    /// (fusion_matmul.rs:535-610). Absorb a split/gate n-ary whose inputs are
+    /// Absorb a split/gate n-ary whose inputs are
     /// `narrow` (MapLayout) views of a single-row qmatmul output into that
     /// qmatmul's accumulator-offset post epilogue. Each distinct
     /// last-dimension column offset (e.g. the gate half at 0 and the up half
@@ -481,8 +466,7 @@ impl FusionView<'_> {
         Some(ExecutionVariant::QMatMul(new_q))
     }
 
-    /// Transcription of `try_extract_mapped_qmatmul_post_expr`
-    /// (fusion_matmul.rs:619-708). Build the post epilogue expression,
+    /// Build the post epilogue expression,
     /// accumulator column offsets, and extra-tensor dependencies for an n-ary
     /// whose inputs are last-dimension `narrow` views of `qmatmul_inner`.
     /// Inputs that view the qmatmul become accumulator values (indices
@@ -539,8 +523,7 @@ impl FusionView<'_> {
             let (base_inner, chain) = self.walk_view_chain(nary_input);
             if base_inner == qmatmul_inner {
                 let view = Resolver::apply_view_chain(&qmatmul_out_layout, &chain)?;
-                let offset =
-                    Resolver::qmatmul_last_dim_view_offset(&view, &nary.shape, matrix_cols)?;
+                let offset = qmatmul_last_dim_view_offset(&view, &nary.shape, matrix_cols)?;
                 let value_idx = *accumulator_map.entry(offset).or_insert_with(|| {
                     let idx = accumulator_offsets.len();
                     accumulator_offsets.push(offset);
@@ -576,12 +559,12 @@ impl FusionView<'_> {
             }
         }
 
-        let expression = Resolver::replace_inputs_in_expr(&nary.expression, &replacements)?;
+        let expression = compose::replace_inputs_in_expr(&nary.expression, &replacements)?;
         Some((expression, accumulator_offsets, extras))
     }
 
-    /// Transcription of `try_extract_indexed_qmatmul_post_expr`
-    /// (fusion_matmul.rs:732-792).
+    /// Build the post epilogue expression and extra-tensor dependencies for
+    /// an n-ary that reads `qmatmul_inner` through an index expression.
     fn try_extract_indexed_qmatmul_post_expr(
         &self,
         nary: &ElementwiseOperation,
@@ -603,7 +586,7 @@ impl FusionView<'_> {
         let temp_input_base = nary.inputs.len();
         let mut accumulator_offsets = Vec::new();
         let mut accumulator_map = FxHashMap::default();
-        let expression = Resolver::replace_indexed_qmatmul_accumulators(
+        let expression = replace_indexed_qmatmul_accumulators(
             &nary.expression,
             qmatmul_input_idx,
             nary.shape.len(),
@@ -634,12 +617,169 @@ impl FusionView<'_> {
             extras.push(extra);
         }
 
-        let expression = Resolver::replace_inputs_in_expr(&expression, &replacements)?;
-        let expression = Resolver::remap_temp_accumulator_inputs(
-            &expression,
-            temp_input_base,
-            accumulator_offsets.len(),
-        );
+        let expression = compose::replace_inputs_in_expr(&expression, &replacements)?;
+        let expression =
+            remap_temp_accumulator_inputs(&expression, temp_input_base, accumulator_offsets.len());
         Some((expression, accumulator_offsets, extras))
     }
+}
+
+/// Whether two qmatmuls compute the same accumulators, so a view of one can
+/// alias the other's output.
+fn qmatmul_same_base(first: &QMatMulOperation, second: &QMatMulOperation) -> bool {
+    first.input_datatype == second.input_datatype
+        && first.input == second.input
+        && first.matrix == second.matrix
+        && first.in_shape == second.in_shape
+        && first.out_shape == second.out_shape
+        && first.pre_element_wise_expr == second.pre_element_wise_expr
+        && first.post_accumulator_offsets == second.post_accumulator_offsets
+}
+
+/// The expression a qmatmul's output presents to a consumer: its existing
+/// post epilogue with the epilogue's own extras appended to `extras`, or a
+/// bare read of the accumulator.
+fn qmatmul_output_expr(
+    qmatmul: &QMatMulOperation,
+    extras: &mut Vec<NodeIndex>,
+    rank: usize,
+) -> Option<NaryExpr> {
+    if let Some(epilogue) = &qmatmul.post_element_wise_expr {
+        let value_arity = qmatmul.post_accumulator_offsets.len().max(1);
+        let mut mapping = Vec::with_capacity(value_arity + epilogue.extras.len());
+        mapping.extend(0..value_arity);
+        mapping.extend((0..epilogue.extras.len()).map(|i| extras.len() + value_arity + i));
+        extras.extend(epilogue.extras.iter().copied());
+        Some(compose::remap_inputs(&epilogue.expression, &mapping))
+    } else {
+        Some(NaryExpr::input(0, rank))
+    }
+}
+
+/// If `view` is a contiguous last-dimension narrow of a single-row qmatmul
+/// output whose shape matches `output_shape`, return its column offset.
+/// Returns `None` for any non-narrow / strided / out-of-range view.
+fn qmatmul_last_dim_view_offset(
+    view: &Layout,
+    output_shape: &[usize],
+    matrix_cols: u32,
+) -> Option<u32> {
+    if view.shape() != output_shape {
+        return None;
+    }
+    if view.strides().last().copied() != Some(1) {
+        return None;
+    }
+    let offset = u32::try_from(view.offset()).ok()?;
+    let output_cols = *output_shape.last()? as u32;
+    if offset.checked_add(output_cols)? > matrix_cols {
+        return None;
+    }
+    Some(offset)
+}
+
+/// Replace every last-dimension-offset read of the qmatmul input with a
+/// temporary accumulator slot, one per distinct column offset.
+#[allow(clippy::too_many_arguments)]
+fn replace_indexed_qmatmul_accumulators(
+    expr: &NaryExpr,
+    qmatmul_input_idx: usize,
+    output_rank: usize,
+    output_cols: u32,
+    matrix_cols: u32,
+    temp_input_base: usize,
+    accumulator_offsets: &mut Vec<u32>,
+    accumulator_map: &mut FxHashMap<u32, usize>,
+) -> Option<NaryExpr> {
+    compose::rewrite_loads(expr, &mut |input_idx, indices, mapped| {
+        if input_idx != qmatmul_input_idx {
+            return Some(NaryExpr::IndexedInput {
+                input_idx,
+                indices: mapped,
+            });
+        }
+        let offset = extract_qmatmul_last_dim_offset(indices, output_rank)?;
+        if output_cols
+            .checked_add(offset)
+            .is_none_or(|cols| cols > matrix_cols)
+        {
+            return None;
+        }
+        let value_idx = *accumulator_map.entry(offset).or_insert_with(|| {
+            let value_idx = accumulator_offsets.len();
+            accumulator_offsets.push(offset);
+            value_idx
+        });
+        Some(NaryExpr::input(temp_input_base + value_idx, output_rank))
+    })
+}
+
+fn extract_qmatmul_last_dim_offset(indices: &[NaryExpr], output_rank: usize) -> Option<u32> {
+    if indices.len() != output_rank {
+        return None;
+    }
+    for (dim, index) in indices[..output_rank - 1].iter().enumerate() {
+        if !matches!(index, NaryExpr::DimIndex(index_dim) if *index_dim == dim) {
+            return None;
+        }
+    }
+    extract_dim_plus_u32_offset(&indices[output_rank - 1], output_rank - 1)
+}
+
+fn extract_dim_plus_u32_offset(expr: &NaryExpr, dim: usize) -> Option<u32> {
+    match expr {
+        NaryExpr::DimIndex(index_dim) if *index_dim == dim => Some(0),
+        NaryExpr::Op { children, function }
+            if function.op == NaryOp::Add && children.len() == 2 =>
+        {
+            extract_dim_plus_u32_offset_pair(&children[0], &children[1], dim)
+                .or_else(|| extract_dim_plus_u32_offset_pair(&children[1], &children[0], dim))
+        }
+        NaryExpr::Op { children, function }
+            if matches!(function.op, NaryOp::AddConst(NaryScalar::U32(_)))
+                && children.len() == 1 =>
+        {
+            let NaryOp::AddConst(NaryScalar::U32(offset)) = function.op else {
+                unreachable!();
+            };
+            matches!(&children[0], NaryExpr::DimIndex(index_dim) if *index_dim == dim)
+                .then_some(offset)
+        }
+        _ => None,
+    }
+}
+
+fn extract_dim_plus_u32_offset_pair(
+    dim_expr: &NaryExpr,
+    offset_expr: &NaryExpr,
+    dim: usize,
+) -> Option<u32> {
+    let NaryExpr::DimIndex(index_dim) = dim_expr else {
+        return None;
+    };
+    if *index_dim != dim {
+        return None;
+    }
+    let NaryExpr::Scalar(NaryScalar::U32(offset)) = offset_expr else {
+        return None;
+    };
+    Some(*offset)
+}
+
+/// Fold the temporary accumulator slots back onto the epilogue's value
+/// inputs, which the qmatmul kernel binds first.
+fn remap_temp_accumulator_inputs(
+    expr: &NaryExpr,
+    temp_input_base: usize,
+    accumulator_count: usize,
+) -> NaryExpr {
+    compose::map_loads(expr, &mut |input_idx, _, indices| {
+        let input_idx =
+            if (temp_input_base..temp_input_base + accumulator_count).contains(&input_idx) {
+                input_idx - temp_input_base
+            } else {
+                input_idx
+            };
+        NaryExpr::IndexedInput { input_idx, indices }
+    })
 }

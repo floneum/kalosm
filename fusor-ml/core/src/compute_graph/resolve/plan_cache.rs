@@ -1,28 +1,136 @@
-//! Structural plan-cache keys for resolved operations.
+//! The canonical structural folds behind the resolver's cache keys.
+//!
+//! The single-operation plan key and the horizontally merged plan key fold
+//! the same item — an operation's type and kernel fields plus the MIR values
+//! it binds — and differ only in how much dispatch identity survives, which
+//! [`Identity`] names: a merged segment shares one grid the merged builder
+//! derives from the whole wave, so per-segment geometry cannot key it.
+//!
+//! These keys select cached kernel plans that are replayed by positional
+//! rebind and shared across processes through the persistent plan store, so
+//! the exact bytes are load-bearing; `key_goldens` pins them.
 
-use crate::mir::inputs::MirValue;
-use crate::mir::kernel_backend::{KernelCacheKey, KernelVariantKey};
-use crate::mir::operation::Operation;
-use crate::mir::workgroup_shape::WorkgroupShape;
 use std::hash::Hash;
 
+use rustc_hash::FxHasher;
+
+use super::merge_horizontal::MergedSegments;
+use crate::mir::inputs::MirValue;
+use crate::mir::kernel_backend::{KernelCacheKey, KernelVariantKey};
+use crate::mir::operation::{Operation, hash_mir_value};
+use crate::mir::workgroup_shape::WorkgroupShape;
+
+/// A variant marker's `TypeId` is hashed into every key it stamps, so its
+/// declaration site — module path included — is part of the recipe.
 struct KernelPlanCacheVariant;
+
+/// How much of the dispatch an operation's structural key keeps.
+enum Identity<'a> {
+    /// The exact dispatch this operation will run: its solved workgroup
+    /// shape and grid are baked into the generated kernel.
+    Dispatch(&'a WorkgroupShape),
+    /// Dispatch geometry erased, for segments whose grid is decided by the
+    /// merged builder rather than by the segment itself.
+    Erased,
+}
+
+/// One work item's structural key at the requested dispatch identity.
+fn item_key(
+    operation: &dyn Operation,
+    identity: Identity<'_>,
+    inputs: &[MirValue],
+    variant: KernelVariantKey,
+) -> KernelCacheKey {
+    let (workgroup, dispatch_size) = match identity {
+        Identity::Dispatch(workgroup) => {
+            (Some(workgroup), operation.dispatch_size(workgroup, inputs))
+        }
+        Identity::Erased => (None, [0; 3]),
+    };
+    operation.kernel_cache_key_with_dispatch(variant, workgroup, dispatch_size, inputs)
+}
 
 pub(crate) fn structural_kernel_key(
     operation: &dyn Operation,
     inputs: &[MirValue],
     workgroup: &WorkgroupShape,
 ) -> KernelCacheKey {
-    let dispatch_size = operation.dispatch_size(workgroup, inputs);
-    let operation_key = operation.kernel_cache_key_with_dispatch(
-        KernelVariantKey::of::<KernelPlanCacheVariant>(),
-        Some(workgroup),
-        dispatch_size,
+    let operation_key = item_key(
+        operation,
+        Identity::Dispatch(workgroup),
         inputs,
+        KernelVariantKey::of::<KernelPlanCacheVariant>(),
     );
     KernelCacheKey::from_hash_inputs(|state| {
         operation_key.hash(state);
     })
+}
+
+/// A structural plan-cache key for one horizontally merged dispatch: the
+/// wave discriminant plus every segment's own structural key, so isomorphic
+/// waves across resolves and processes share one plan. Region segments merge
+/// without the `Operation` trait and fold their kernel fields inline.
+pub(super) fn merged_segments_key(
+    variant: KernelVariantKey,
+    merged: &MergedSegments,
+    segment_inputs: &[Vec<MirValue>],
+) -> KernelCacheKey {
+    KernelCacheKey::from_hash_inputs(|state| {
+        variant.hash(state);
+        std::mem::discriminant(merged).hash(state);
+        match merged {
+            MergedSegments::Region(segments) => {
+                hash_merged_segments(state, segments.iter().map(|(_, op)| op), segment_inputs)
+            }
+            _ => {
+                segment_inputs.len().hash(state);
+                for ((_, op), inputs) in merged.segment_ops().iter().zip(segment_inputs) {
+                    item_key(*op, Identity::Erased, inputs, variant).hash(state);
+                }
+            }
+        }
+    })
+}
+
+/// The kernel-field surface merged segments key on. Region segments merge
+/// without the `Operation` trait, so the fold names this surface directly.
+pub(crate) trait SegmentFields {
+    fn hash_kernel_fields(&self, state: &mut FxHasher);
+}
+
+impl SegmentFields for crate::matmul::MatMulOperation {
+    fn hash_kernel_fields(&self, state: &mut FxHasher) {
+        Operation::hash_kernel_fields(self, state);
+    }
+}
+
+impl SegmentFields for crate::row_program::RowProgramOperation {
+    fn hash_kernel_fields(&self, state: &mut FxHasher) {
+        Operation::hash_kernel_fields(self, state);
+    }
+}
+
+impl SegmentFields for crate::region::ElementwiseRegionOperation {
+    fn hash_kernel_fields(&self, state: &mut FxHasher) {
+        crate::region::ElementwiseRegionOperation::hash_kernel_fields(self, state);
+    }
+}
+
+/// Hash one merged dispatch's cache-key material: every segment's kernel
+/// fields plus every MIR input value layout.
+pub(crate) fn hash_merged_segments<'a, S: SegmentFields + 'a>(
+    state: &mut FxHasher,
+    segments: impl ExactSizeIterator<Item = &'a S>,
+    segment_inputs: &[Vec<MirValue>],
+) {
+    segments.len().hash(state);
+    for (op, inputs) in segments.zip(segment_inputs) {
+        op.hash_kernel_fields(state);
+        inputs.len().hash(state);
+        for input in inputs {
+            hash_mir_value(state, input);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -96,7 +96,7 @@ pub fn rmsnorm_post_relu_resolves_to_single_kernel() -> AssertionCase {
                 .relu()
                 .to_concrete()
                 .as_gpu()
-                .is_some_and(|gpu_out| gpu_out.count_kernels_to_resolve() == 1)
+                .is_some_and(|gpu_out| gpu_out.resolves_in::<1>())
         },
     )
 }
@@ -137,7 +137,7 @@ pub fn q4k_qmatmul_fusion_kernels() -> AssertionCases {
                     .q_mat_mul(&weights)
                     .to_concrete()
                     .as_gpu()
-                    .is_some_and(|gpu_out| gpu_out.count_kernels_to_resolve() == 1)
+                    .is_some_and(|gpu_out| gpu_out.resolves_in::<1>())
             },
         ),
         // `q_mat_mul(...).relu()` post-activation fusion (all GPU backends).
@@ -152,7 +152,7 @@ pub fn q4k_qmatmul_fusion_kernels() -> AssertionCases {
                     .relu()
                     .to_concrete()
                     .as_gpu()
-                    .is_some_and(|gpu_out| gpu_out.count_kernels_to_resolve() == 1)
+                    .is_some_and(|gpu_out| gpu_out.resolves_in::<1>())
             },
         ),
     ])

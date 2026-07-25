@@ -20,11 +20,11 @@ use super::interner::{
 };
 use super::lang::Prov;
 use super::rules_fuse::FusionView;
-use crate::DataTypeEnum;
 use crate::compute_graph::NodeIndex;
 use crate::quantized::QMatrix;
 use crate::quantized::embedding::QEmbeddingOperation;
 use crate::quantized::matmul::{ElementwiseEpilogue, QMatMulOperation};
+use crate::{DataTypeEnum, FusorConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct PlanAtomId(u32);
@@ -351,6 +351,10 @@ pub(super) struct FusionPlanMemo {
     decisions: FxHashMap<StructuralId, PlanDecision>,
     seen_windows: FxHashSet<StructuralId>,
     stats: PlanSharingStats,
+    stub_depth: u32,
+    /// Spike ledger: total time spent capturing windows, accumulated only
+    /// when `FUSOR_SPIKE_HOISTING` asked for it.
+    capture_time: Option<std::time::Duration>,
 }
 
 impl Default for FusionPlanMemo {
@@ -363,11 +367,21 @@ impl Default for FusionPlanMemo {
             decisions: FxHashMap::default(),
             seen_windows: FxHashSet::default(),
             stats: PlanSharingStats::default(),
+            stub_depth: WINDOW_STUB_DEPTH,
+            capture_time: None,
         }
     }
 }
 
 impl FusionPlanMemo {
+    pub(super) fn for_config(config: &FusorConfig) -> Self {
+        Self {
+            stub_depth: config.spike_window_depth.unwrap_or(WINDOW_STUB_DEPTH),
+            capture_time: config.spike_hoisting.then(Default::default),
+            ..Default::default()
+        }
+    }
+
     pub(super) fn capture(
         &mut self,
         driver: &EGraphDriver,
@@ -375,13 +389,16 @@ impl FusionPlanMemo {
         view: &FusionView<'_>,
         prov: Prov,
     ) -> PlanInstance {
+        let start = self.capture_time.map(|_| std::time::Instant::now());
         self.stats.windows += 1;
         let inner = driver.egraph.analysis.facts_of(prov).inner;
+        let stub_depth = self.stub_depth;
         let mut builder = WindowBuilder {
             memo: self,
             driver,
             state,
             view,
+            stub_depth,
             nodes: Vec::new(),
             role_of: FxHashMap::default(),
             local_ids: FxHashMap::default(),
@@ -390,11 +407,23 @@ impl FusionPlanMemo {
         let root = builder.add(inner, 0);
         builder.memo.seen_windows.insert(root);
         builder.memo.stats.unique_windows = builder.memo.seen_windows.len() as u64;
-        PlanInstance {
+        let instance = PlanInstance {
             root,
             nodes: builder.nodes,
             role_of: builder.role_of,
+        };
+        if let (Some(total), Some(start)) = (self.capture_time.as_mut(), start) {
+            *total += start.elapsed();
         }
+        instance
+    }
+
+    pub(super) fn capture_time(&self) -> std::time::Duration {
+        self.capture_time.unwrap_or_default()
+    }
+
+    pub(super) fn stub_depth(&self) -> u32 {
+        self.stub_depth
     }
 
     pub(super) fn lookup(&mut self, instance: &PlanInstance, view: &FusionView<'_>) -> PlanLookup {
@@ -543,6 +572,7 @@ struct WindowBuilder<'a> {
     driver: &'a EGraphDriver,
     state: &'a ExtractState,
     view: &'a FusionView<'a>,
+    stub_depth: u32,
     nodes: Vec<NodeIndex>,
     role_of: FxHashMap<NodeIndex, u32>,
     local_ids: FxHashMap<NodeIndex, StructuralId>,
@@ -557,6 +587,9 @@ struct WindowBuilder<'a> {
 /// structural window cuts at that horizon. Cutting is what makes repeated
 /// layers share: an unbounded walk would drag each window's whole upstream
 /// cone in, making every layer's window unique and the walk quadratic.
+/// `FUSOR_SPIKE_WINDOW_DEPTH` widens the horizon for measurement only —
+/// widening is always sound (windows only get more specific), it just costs
+/// capture time and sharing.
 const WINDOW_STUB_DEPTH: u32 = 2;
 
 impl WindowBuilder<'_> {
@@ -599,7 +632,7 @@ impl WindowBuilder<'_> {
                 let next = self.matrix_aliases.len() as u32;
                 *self.matrix_aliases.entry(allocation).or_insert(next)
             });
-        let stub = depth >= WINDOW_STUB_DEPTH;
+        let stub = depth >= self.stub_depth;
         let (kind, dependencies) = if opaque || stub {
             let kind = if opaque {
                 PlanNodeKind::Frontier
@@ -842,8 +875,7 @@ mod tests {
                 return;
             };
             for step in 0..2u32 {
-                let input =
-                    Tensor::new::<f32, 1, _>(&device, &[step as f32, 2.0, 3.0, 4.0]);
+                let input = Tensor::new::<f32, 1, _>(&device, &[step as f32, 2.0, 3.0, 4.0]);
                 let out = (&input + 1.0) * 2.0;
                 let targets = [out.data().key];
                 device.compute_graph().with_mut(|graph| {
@@ -884,9 +916,12 @@ mod tests {
                                 panic!("unexpected variant kinds");
                             };
                             assert_eq!(rebound, fresh);
-                            assert!(rebound.inputs.iter().all(|input| {
-                                instance.role_of.contains_key(input)
-                            }));
+                            assert!(
+                                rebound
+                                    .inputs
+                                    .iter()
+                                    .all(|input| { instance.role_of.contains_key(input) })
+                            );
                         }
                         Some(None) => panic!("no-rewrite stored for a fusible window"),
                     }
@@ -905,7 +940,16 @@ mod tests {
             for step in 0..2usize {
                 let activation = Tensor::new::<f32, 2, _>(
                     &device,
-                    &[vec![1.0 + step as f32, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0]],
+                    &[vec![
+                        1.0 + step as f32,
+                        -2.0,
+                        3.0,
+                        -4.0,
+                        5.0,
+                        -6.0,
+                        7.0,
+                        -8.0,
+                    ]],
                 );
                 let out = activation.q_mat_mul(&weights[step]);
                 let targets = [out.data().key];
@@ -915,8 +959,8 @@ mod tests {
                         resolver.build_execution_graph(graph, target);
                     }
                     resolver.recognize_contractions(graph);
-                    let mut driver = EGraphDriver::ingest(&resolver, graph);
-                    let state = ExtractState::from_execution(&mut driver, &resolver);
+                    let driver = EGraphDriver::ingest(&resolver, graph);
+                    let state = ExtractState::new(&driver);
                     let ctx = FusionCtx {
                         graph,
                         layouts: std::cell::RefCell::new(Default::default()),
@@ -1100,8 +1144,8 @@ mod tests {
                     qmatmuls.len(),
                     "every observation of a shared e-class must be specialized"
                 );
-                let mut driver = EGraphDriver::ingest(&resolver, graph);
-                let state = ExtractState::from_execution(&mut driver, &resolver);
+                let driver = EGraphDriver::ingest(&resolver, graph);
+                let state = ExtractState::new(&driver);
                 let ctx = FusionCtx {
                     graph,
                     layouts: std::cell::RefCell::new(Default::default()),

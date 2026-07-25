@@ -514,29 +514,18 @@ impl Resolver {
     /// their identity indices (guaranteed by the absorption gate) and point
     /// past the input slots into the statement `extras`.
     fn remap_region_expr(expr: &NaryExpr, slot_map: &[RegionSlot], input_count: usize) -> NaryExpr {
-        match expr {
-            NaryExpr::Op { children, function } => NaryExpr::Op {
-                children: children
-                    .iter()
-                    .map(|child| Self::remap_region_expr(child, slot_map, input_count))
-                    .collect(),
-                function: function.clone(),
-            },
-            NaryExpr::IndexedInput { input_idx, indices } => match &slot_map[*input_idx] {
+        egraph::compose::map_loads(
+            expr,
+            &mut |input_idx, _, indices| match &slot_map[input_idx] {
                 RegionSlot::Register(statement) => NaryExpr::IndexedInput {
                     input_idx: input_count + statement,
                     indices: Vec::new(),
                 },
                 RegionSlot::External(slot) => NaryExpr::IndexedInput {
                     input_idx: *slot,
-                    indices: indices
-                        .iter()
-                        .map(|index| Self::remap_region_expr(index, slot_map, input_count))
-                        .collect(),
+                    indices,
                 },
             },
-            NaryExpr::DimIndex(dim) => NaryExpr::DimIndex(*dim),
-            NaryExpr::Scalar(value) => NaryExpr::Scalar(*value),
-        }
+        )
     }
 }

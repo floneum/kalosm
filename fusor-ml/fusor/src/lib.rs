@@ -34,9 +34,9 @@ pub use composite::{
 };
 pub use device::Device;
 pub use error::Error;
+pub use fusion::{Concrete, Fusion};
 #[cfg(feature = "gpu")]
 pub use fusor_core::FusorConfig;
-pub use fusion::{Concrete, Fusion};
 pub use fusor_types::{D, Dim, FromArray, Layout, StrideSpec};
 
 /// Result type for fusor operations.
@@ -75,7 +75,8 @@ pub(crate) use crate::gpu::Tensor as GpuTensor;
 
 #[allow(unused_imports)]
 pub use crate::gpu::{
-    CastTensor, DataType, FloatDataType, GgufReadError, NodeIndex, WasmNotSend, WasmNotSync,
+    CastTensor, DataType, FloatDataType, GgufReadError, KernelProfile, KernelProfileRow, NodeIndex,
+    WasmNotSend, WasmNotSync,
 };
 
 pub use crate::gpu::{

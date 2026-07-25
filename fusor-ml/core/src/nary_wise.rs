@@ -305,27 +305,6 @@ impl NaryExpr {
         }
     }
 
-    pub(crate) fn remap_inputs(&self, mapping: &[usize]) -> NaryExpr {
-        match self {
-            NaryExpr::Op { children, function } => NaryExpr::Op {
-                children: children
-                    .iter()
-                    .map(|child| child.remap_inputs(mapping))
-                    .collect(),
-                function: function.clone(),
-            },
-            NaryExpr::IndexedInput { input_idx, indices } => NaryExpr::IndexedInput {
-                input_idx: mapping[*input_idx],
-                indices: indices
-                    .iter()
-                    .map(|index| index.remap_inputs(mapping))
-                    .collect(),
-            },
-            NaryExpr::DimIndex(dim) => NaryExpr::DimIndex(*dim),
-            NaryExpr::Scalar(value) => NaryExpr::Scalar(*value),
-        }
-    }
-
     /// Create a select expression (ternary operator)
     /// Semantics: condition != 0 ? on_true : on_false
     pub fn select(
@@ -578,6 +557,12 @@ impl Operation for ElementwiseOperation {
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
         for input in &self.inputs {
             f(*input);
+        }
+    }
+
+    fn visit_dependencies_mut(&mut self, f: &mut dyn FnMut(&mut NodeIndex)) {
+        for input in &mut self.inputs {
+            f(input);
         }
     }
 

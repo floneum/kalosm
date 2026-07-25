@@ -107,7 +107,6 @@ where
         assert!(R >= 2, "t requires rank >= 2");
         self.transpose(R - 2, R - 1)
     }
-
 }
 
 impl<const R: usize> Tensor<R> {

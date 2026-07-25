@@ -44,20 +44,13 @@ impl FusorAnalysis {
     }
 }
 
-#[derive(Debug)]
-pub(super) struct ClassData;
-
 impl Analysis<FusorLang> for FusorAnalysis {
-    type Data = ClassData;
+    /// No per-class data: every fact this optimizer needs is per observation.
+    type Data = ();
 
-    fn make(_egraph: &mut EGraph<FusorLang, Self>, _enode: &FusorLang, _id: Id) -> Self::Data {
-        ClassData
-    }
+    fn make(_egraph: &mut EGraph<FusorLang, Self>, _enode: &FusorLang, _id: Id) -> Self::Data {}
 
-    fn merge(&mut self, a: &mut Self::Data, b: Self::Data) -> DidMerge {
-        let _ = (a, b);
+    fn merge(&mut self, _a: &mut Self::Data, _b: Self::Data) -> DidMerge {
         DidMerge(false, false)
     }
-
-    fn modify(_egraph: &mut EGraph<FusorLang, Self>, _id: Id) {}
 }

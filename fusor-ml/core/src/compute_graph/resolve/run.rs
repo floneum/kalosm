@@ -247,134 +247,21 @@ impl Resolver {
 
         if !commands.is_empty() {
             let encode_start = host_trace.then(Instant::now);
-            if query_resources.is_none() {
-                command_encoder = super::queue_executor::encode_command_records(
-                    &device,
-                    &commands,
-                    total_kernels,
-                    command_encoder,
-                    |encoder, wait| {
-                        submit_resolver_encoder(
-                            &device,
-                            encoder,
-                            wait,
-                            host_trace,
-                            &mut host_profile,
-                        );
-                    },
-                );
-            } else {
-                let mut dispatch_index = 0usize;
-                let mut command_index = 0usize;
-                let mut copy_records = 0usize;
-                let mut pass_segments = 0usize;
-                let dispatches_per_pass = dispatches_per_pass(&device, total_kernels);
-                let dispatches_per_submit = dispatches_per_submit(&device, total_kernels);
-                let wait_after_chunk_submit = device.backend() == wgpu::Backend::Metal;
-                let mut dispatches_in_submit = 0usize;
-                let mut encoder_has_commands = false;
-                while command_index < commands.len() {
-                    if encoder_has_commands && dispatches_in_submit >= dispatches_per_submit {
-                        let next_encoder = resolver_command_encoder(&device);
-                        let ready_encoder = std::mem::replace(&mut command_encoder, next_encoder);
-                        submit_resolver_encoder(
-                            &device,
-                            ready_encoder,
-                            wait_after_chunk_submit,
-                            host_trace,
-                            &mut host_profile,
-                        );
-                        encoder_has_commands = false;
-                        dispatches_in_submit = 0;
+            command_encoder = super::queue_executor::encode_command_records(
+                &device,
+                &commands,
+                total_kernels,
+                query_resources.as_ref().map(|(query_set, _, _, _)| {
+                    super::queue_executor::TimestampPlan {
+                        query_set,
+                        inside_pass: profile_inside_pass_timestamps,
                     }
-                    match &commands[command_index] {
-                        CommandRecord::CopyBuffer(copy) => {
-                            command_encoder.copy_buffer_to_buffer(
-                                &copy.source,
-                                copy.source_offset,
-                                &copy.destination,
-                                copy.destination_offset,
-                                copy.size,
-                            );
-                            copy_records += 1;
-                            encoder_has_commands = true;
-                            command_index += 1;
-                        }
-                        CommandRecord::Dispatch(_) => {
-                            if let Some((query_set, _, _, _)) = &query_resources
-                                && !profile_inside_pass_timestamps
-                            {
-                                if let CommandRecord::Dispatch(record) = &commands[command_index] {
-                                    let mut pass = command_encoder.begin_compute_pass(
-                                        &wgpu::ComputePassDescriptor {
-                                            label: Some(record.name.as_str()),
-                                            timestamp_writes: Some(
-                                                wgpu::ComputePassTimestampWrites {
-                                                    query_set,
-                                                    beginning_of_pass_write_index: Some(
-                                                        (dispatch_index * 2) as u32,
-                                                    ),
-                                                    end_of_pass_write_index: Some(
-                                                        (dispatch_index * 2 + 1) as u32,
-                                                    ),
-                                                },
-                                            ),
-                                        },
-                                    );
-                                    record.dispatch.run(&mut pass);
-                                }
-                                dispatch_index += 1;
-                                dispatches_in_submit += 1;
-                                encoder_has_commands = true;
-                                command_index += 1;
-                                continue;
-                            }
-
-                            let mut pass =
-                                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                    label: Some("Resolver Direct Kernels"),
-                                    timestamp_writes: None,
-                                });
-                            pass_segments += 1;
-                            let mut pass_dispatches = 0usize;
-                            while command_index < commands.len() {
-                                if pass_dispatches >= dispatches_per_pass {
-                                    break;
-                                }
-                                if dispatches_in_submit >= dispatches_per_submit {
-                                    break;
-                                }
-                                let CommandRecord::Dispatch(record) = &commands[command_index]
-                                else {
-                                    break;
-                                };
-                                if let Some((query_set, _, _, _)) = &query_resources {
-                                    pass.write_timestamp(query_set, (dispatch_index * 2) as u32);
-                                }
-                                pass.push_debug_group(&record.name);
-                                record.dispatch.run(&mut pass);
-                                pass.pop_debug_group();
-                                if let Some((query_set, _, _, _)) = &query_resources {
-                                    pass.write_timestamp(
-                                        query_set,
-                                        (dispatch_index * 2 + 1) as u32,
-                                    );
-                                }
-                                dispatch_index += 1;
-                                dispatches_in_submit += 1;
-                                command_index += 1;
-                                pass_dispatches += 1;
-                                encoder_has_commands = true;
-                            }
-                        }
-                    }
-                }
-                if host_trace {
-                    tracing::info!(
-                        "resolve_pass_layout kernels={total_kernels} passes={pass_segments} copies={copy_records}"
-                    );
-                }
-            }
+                }),
+                command_encoder,
+                |encoder, wait| {
+                    submit_resolver_encoder(&device, encoder, wait, host_trace, &mut host_profile);
+                },
+            );
 
             if let Some((query_set, query_buffer, readback_buffer, raw_query_size)) =
                 &query_resources
@@ -420,7 +307,7 @@ impl Resolver {
                     Ok(Ok(())) => {
                         let view = slice.get_mapped_range();
                         let timestamps = bytemuck::cast_slice::<u8, u64>(&view);
-                        print_gpu_kernel_profile(
+                        let profile = collect_gpu_kernel_profile(
                             &dispatch_metadata,
                             timestamps,
                             device.wgpu_queue().get_timestamp_period() as f64,
@@ -430,6 +317,7 @@ impl Resolver {
                                 "pass_boundary"
                             },
                         );
+                        device.record_kernel_profile(profile);
                         drop(view);
                         readback_buffer.unmap();
                     }
@@ -512,14 +400,6 @@ pub(super) fn dispatches_per_submit(device: &crate::Device, total_kernels: usize
     } else {
         usize::MAX
     }
-}
-
-fn resolver_command_encoder(device: &crate::Device) -> wgpu::CommandEncoder {
-    device
-        .wgpu_device()
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Resolver Encoder"),
-        })
 }
 
 fn submit_resolver_encoder(

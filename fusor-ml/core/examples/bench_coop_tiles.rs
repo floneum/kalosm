@@ -10,7 +10,7 @@ use fusor_tile_ir_kernels::{
     SubgroupConfig,
 };
 
-const SHAPES: [(u32, u32, u32); 8] = [
+const SHAPES: [(u32, u32, u32); 10] = [
     (16384, 384, 384),
     (16384, 384, 1536),
     (16384, 1536, 384),
@@ -18,7 +18,9 @@ const SHAPES: [(u32, u32, u32); 8] = [
     (1536, 16384, 384),
     (4096, 4096, 4096),
     (16384, 3072, 1536),
+    (1024, 1024, 1024),
     (1000, 1024, 1024),
+    (1944, 1280, 3840),
 ];
 
 fn main() {
@@ -95,11 +97,6 @@ fn main() {
                 .iter()
                 .flat_map(|entry| swizzle_groups.iter().map(move |&group| (entry, group)))
             {
-                // The single-buffered profile is excluded from selection and
-                // miscomputes when driven raw; skip it.
-                if entry.single_buffered {
-                    continue;
-                }
                 let tile = entry.tile;
                 let (bm, bn) = (tile.bm, tile.bn);
                 let label = format!(

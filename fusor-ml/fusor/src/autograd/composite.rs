@@ -191,10 +191,7 @@ where
         <crate::gpu::Tensor<R, T> as crate::gpu::LastRankInner>::LastRank:
             crate::gpu::NextRankInner<NextRank = crate::gpu::Tensor<R, T>>,
     {
-        let value = self
-            .value
-            .softmax_last_dim::<OUT_RANK>()
-            .into_concrete();
+        let value = self.value.softmax_last_dim::<OUT_RANK>().into_concrete();
         // Analytic softmax backward: dS = P * (dP - rowsum(dP * P)).
         // The product inside the row sum is written inline so the reduce
         // absorbs it, and the output is a single P * (dP - s) expression.
@@ -354,10 +351,15 @@ where
         let weight_row = weight.value.reshape(param_shape);
         let weight_b = weight_row.broadcast_as(self.shape());
         let bias_row = bias.map(|bias| bias.value.reshape(param_shape));
-        let bias_b = bias_row.as_ref().map(|bias| bias.broadcast_as(self.shape()));
-        let value =
-            self.value
-                .layer_norm::<OUT_RANK, _, _>(&weight_b, bias_b.as_ref(), T::from_f32(eps), true);
+        let bias_b = bias_row
+            .as_ref()
+            .map(|bias| bias.broadcast_as(self.shape()));
+        let value = self.value.layer_norm::<OUT_RANK, _, _>(
+            &weight_b,
+            bias_b.as_ref(),
+            T::from_f32(eps),
+            true,
+        );
 
         let input_id = self.handle.id;
         let weight_id = weight.handle.id;
@@ -845,8 +847,7 @@ where
                     _ => None,
                 };
                 let lse = q.attention_lse(k, scale, mask_gpu, causal);
-                let (dq, dk, dv) =
-                    q.attention_grads(k, v, o, grad, &lse, scale, mask_gpu, causal);
+                let (dq, dk, dv) = q.attention_grads(k, v, o, grad, &lse, scale, mask_gpu, causal);
                 Ok(vec![
                     BackwardTarget {
                         node: q_id,
@@ -1074,5 +1075,4 @@ impl Tensor<4> {
         let (cos, sin) = self.rope_cache_tables(cache, start_pos);
         self.rope_pair_fused(k, &cos, &sin)
     }
-
 }

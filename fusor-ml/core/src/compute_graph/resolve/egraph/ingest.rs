@@ -46,28 +46,22 @@ pub(super) fn enode_for(
     match variant {
         ExecutionVariant::Tensor(data) => {
             debug_assert!(children.is_empty());
-            FusorLang::TensorLeaf(
-                prov,
-                AllocationId(std::sync::Arc::as_ptr(data.buffer()) as usize),
-            )
+            FusorLang::TensorLeaf(AllocationId(std::sync::Arc::as_ptr(data.buffer()) as usize))
         }
         ExecutionVariant::QMatrix(op) => {
             debug_assert!(children.is_empty());
             FusorLang::QMatrixLeaf(
-                prov,
                 AllocationId(std::sync::Arc::as_ptr(op.matrix.buffer()) as usize),
                 intern(analysis, variant),
             )
         }
         ExecutionVariant::Elementwise(_) => {
-            FusorLang::Elementwise(prov, intern(analysis, variant), children.into_boxed_slice())
+            FusorLang::Elementwise(intern(analysis, variant), children.into_boxed_slice())
         }
         ExecutionVariant::Reduce(_) => {
-            FusorLang::Reduce(prov, intern(analysis, variant), children.into_boxed_slice())
+            FusorLang::Reduce(intern(analysis, variant), children.into_boxed_slice())
         }
-        ExecutionVariant::View(_) => {
-            FusorLang::View(prov, intern(analysis, variant), [children[0]])
-        }
+        ExecutionVariant::View(_) => FusorLang::View(intern(analysis, variant), [children[0]]),
         ExecutionVariant::Assign(_) => {
             FusorLang::Assign(prov, intern(analysis, variant), [children[0], children[1]])
         }
@@ -75,16 +69,16 @@ pub(super) fn enode_for(
             FusorLang::Region(prov, intern(analysis, variant), children.into_boxed_slice())
         }
         ExecutionVariant::MatMul(_) => {
-            FusorLang::MatMul(prov, intern(analysis, variant), [children[0], children[1]])
+            FusorLang::MatMul(intern(analysis, variant), [children[0], children[1]])
         }
         ExecutionVariant::QMatMul(_) => {
-            FusorLang::QMatMul(prov, intern(analysis, variant), children.into_boxed_slice())
+            FusorLang::QMatMul(intern(analysis, variant), children.into_boxed_slice())
         }
         ExecutionVariant::QEmbedding(_) => {
-            FusorLang::QEmbedding(prov, intern(analysis, variant), [children[0]])
+            FusorLang::QEmbedding(intern(analysis, variant), [children[0]])
         }
         ExecutionVariant::RowProgram(_) | ExecutionVariant::Attention(_) => {
-            FusorLang::RowProgram(prov, intern(analysis, variant), children.into_boxed_slice())
+            FusorLang::RowProgram(intern(analysis, variant), children.into_boxed_slice())
         }
     }
 }
@@ -99,7 +93,6 @@ impl EGraphDriver {
                 class_of_inner: Default::default(),
             }),
             class_of: Vec::new(),
-            identity_payloads: Vec::new(),
             identity_enodes: Vec::new(),
             identity_variants: Vec::new(),
             prov_of: Default::default(),
@@ -183,11 +176,10 @@ impl EGraphDriver {
                                 |data| AllocationId(std::sync::Arc::as_ptr(data.buffer()) as usize),
                             )
                             .unwrap_or(AllocationId(inner.index()));
-                        let boundary = FusorLang::Boundary(prov, allocation);
+                        let boundary = FusorLang::Boundary(allocation);
                         let id = driver.egraph.add(boundary.clone());
                         driver.egraph.analysis.class_of_inner.insert(inner, id);
                         driver.class_of.push(id);
-                        driver.identity_payloads.push(None);
                         driver.identity_enodes.push(boundary);
                         driver.identity_variants.push(None);
                         debug_assert_eq!(driver.class_of.len(), prov.0 as usize + 1);
@@ -208,10 +200,9 @@ impl EGraphDriver {
                     // dependency's Exit frame ran (DAG + stack ordering),
                     // and the validation pass below re-checks every slot.
                     driver.class_of.push(Id::from(0usize));
-                    driver.identity_payloads.push(None);
                     driver
                         .identity_enodes
-                        .push(FusorLang::Boundary(prov, AllocationId(inner.index())));
+                        .push(FusorLang::Boundary(AllocationId(inner.index())));
                     driver.identity_variants.push(None);
                     #[cfg(debug_assertions)]
                     open.insert(inner);
@@ -238,7 +229,6 @@ impl EGraphDriver {
                         true,
                         None,
                     );
-                    driver.identity_payloads[prov.0 as usize] = enode.payload();
                     driver.identity_enodes[prov.0 as usize] = enode.clone();
                     driver.identity_variants[prov.0 as usize] = Some(variant);
                     let id = driver.egraph.add(enode);
@@ -383,27 +373,6 @@ mod tests {
                 first, second,
                 "ingestion must be a pure function of the graph"
             );
-        });
-    }
-
-    #[test]
-    fn identity_extraction_has_no_deltas() {
-        pollster::block_on(async {
-            let Ok(device) = Device::new().await else {
-                return;
-            };
-            let rows = vec![vec![1.0f32, 2.0, 3.0, 4.0]; 8];
-            let input = Tensor::new::<f32, 2, _>(&device, &rows);
-            let target = ((&input * 3.0) + 0.5).max(0);
-            with_ingested(&device, &[&target], |_resolver, _inner, driver| {
-                let extraction = driver.extract();
-                assert_eq!(
-                    extraction.deltas().count(),
-                    0,
-                    "no rules fired: extraction must select every identity"
-                );
-                assert!(extraction.needed.iter().all(|&needed| needed));
-            });
         });
     }
 

@@ -212,8 +212,8 @@ where
             let grad = downcast_tensor::<0, T>(&*gradient, "softmax_cross_entropy")?;
             let probs = logits_value.softmax_last_dim::<1>();
             let one_hot = one_hot_matrix(&targets, width);
-            let scale =
-                (grad.reshape([1, 1]).into_concrete() * T::from_f32(1.0 / rows as f32)).into_concrete();
+            let scale = (grad.reshape([1, 1]).into_concrete() * T::from_f32(1.0 / rows as f32))
+                .into_concrete();
             let diff = (probs - one_hot).into_concrete();
             let dlogits = (&diff * &scale.broadcast_as([rows, width])).into_concrete();
             Ok(vec![BackwardTarget {

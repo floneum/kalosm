@@ -3,17 +3,16 @@ use std::mem::size_of;
 use crate::{DataTypeEnum, Device, Tensor, TensorData, quantized::QMatrix};
 use fusor_gguf::{BlockQ4_0, GgmlType};
 
-use crate::mir::kernel_backend::sampling_topk::chunk_top_k_pair_data_with_processors_with_encoder;
-use crate::mir::kernel_backend::standard_sampler::{
-    sample_categorical_logits_data_with_encoder, supports_unfiltered_categorical,
+use crate::mir::kernel_backend::sampling::{
+    ChunkProcessors, ProcessorSettings, chunk_top_k_pair_data_with_encoder,
+    sample_categorical_logits_data_with_encoder, sample_from_sorted_top_k_data_with_encoder,
+    supports_unfiltered_categorical,
 };
 
 use super::{
     GPU_SAMPLE_STATUS_INVALID, GPU_SAMPLE_STATUS_RETRY_NEEDED, GPU_SAMPLE_STATUS_SAMPLED,
     GpuMirostat2Sampler, GpuMirostat2SamplerParams, GpuSamplerRequest, GpuStandardSamplerParams,
-    mirostat::sample_from_sorted_top_k_data_with_encoder, sample_token_to_host,
-    standard_sampler::sample_from_sorted_top_k_data_with_encoder as sample_standard_from_sorted_top_k_data_with_encoder,
-    topk::ProcessorSettings,
+    sample_token_to_host,
 };
 
 fn unfiltered_params(input_len: usize, temperature: f32, random: f32) -> GpuStandardSamplerParams {
@@ -97,13 +96,16 @@ fn processed_chunk_top_k_applies_temperature_and_repetition_penalty() {
         );
         let data = TensorData::new_from_buffer(&device, buffer, &[values.len()], DataTypeEnum::F32);
         let previous_tokens = [0, 3, 9];
-        let (ids, logits) = chunk_top_k_pair_data_with_processors_with_encoder(
+        let (ids, logits) = chunk_top_k_pair_data_with_encoder(
             &data,
-            &previous_tokens,
-            ProcessorSettings {
-                temperature: 0.5,
-                repetition_penalty: 2.0,
-            },
+            Some(ChunkProcessors {
+                previous_tokens: &previous_tokens,
+                gpu_tail: None,
+                settings: ProcessorSettings {
+                    temperature: 0.5,
+                    repetition_penalty: 2.0,
+                },
+            }),
             5,
             5,
             None,
@@ -442,8 +444,10 @@ fn backend_mirostat2_sampler_uses_full_top_k_without_surprise_cutoff() {
         let output = sample_from_sorted_top_k_data_with_encoder(
             &ids_data,
             &values_data,
-            &mut sampler,
-            params,
+            &mut GpuSamplerRequest::Mirostat2 {
+                sampler: &mut sampler,
+                params,
+            },
             None,
             None,
         )
@@ -486,10 +490,10 @@ fn backend_standard_sampler_applies_top_p_on_gpu() {
             random: 0.8,
         };
 
-        let output = sample_standard_from_sorted_top_k_data_with_encoder(
+        let output = sample_from_sorted_top_k_data_with_encoder(
             &ids_data,
             &values_data,
-            params,
+            &mut GpuSamplerRequest::Standard { params },
             None,
             None,
         )
@@ -538,8 +542,10 @@ fn backend_mirostat2_sampler_matches_cpu_reference_for_sorted_top_k() {
         let output = sample_from_sorted_top_k_data_with_encoder(
             &ids_data,
             &values_data,
-            &mut sampler,
-            params,
+            &mut GpuSamplerRequest::Mirostat2 {
+                sampler: &mut sampler,
+                params,
+            },
             None,
             None,
         )
@@ -596,8 +602,10 @@ fn retry_status_does_not_mutate_mirostat_state() {
         let output = sample_from_sorted_top_k_data_with_encoder(
             &ids_data,
             &values_data,
-            &mut sampler,
-            params,
+            &mut GpuSamplerRequest::Mirostat2 {
+                sampler: &mut sampler,
+                params,
+            },
             Some(&exactness_flag),
             None,
         )

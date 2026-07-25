@@ -441,25 +441,15 @@ impl QMatMulOperation {
                     y_view,
                 );
                 let epilogues = tile_ir_kernels::QmatmulEpilogues::default();
-                if m == 1 {
-                    tile_ir_kernels::qgemv_workgroup_storage_f16_with_epilogue(
-                        phase,
-                        &a,
-                        &b,
-                        &y,
-                        &epilogues,
-                        max_workgroups,
-                    );
-                } else {
-                    tile_ir_kernels::qmatmul_workgroup_storage_f16_with_epilogues(
-                        phase,
-                        &a,
-                        &b,
-                        &y,
-                        &epilogues,
-                        max_workgroups,
-                    );
-                }
+                tile_ir_kernels::qmatmul_workgroup_with_epilogues(
+                    phase,
+                    &a,
+                    &b,
+                    &y,
+                    tile_ir::ScalarElement::F16,
+                    &epilogues,
+                    max_workgroups,
+                );
                 return;
             }
             let a = tile_storage_read_with_direct_layout(phase, a_view);
@@ -527,47 +517,20 @@ impl QMatMulOperation {
                 },
             };
             if use_workgroup_qmatmul {
-                if m == 1 {
-                    if use_f16_workgroup_tiles {
-                        tile_ir_kernels::qgemv_workgroup_f16_with_epilogue(
-                            phase,
-                            &a,
-                            &b,
-                            &y,
-                            &epilogues,
-                            max_workgroups,
-                        );
-                    } else {
-                        tile_ir_kernels::qgemv_workgroup_with_epilogue(
-                            phase,
-                            &a,
-                            &b,
-                            &y,
-                            &epilogues,
-                            max_workgroups,
-                        );
-                    }
+                let staging = if use_f16_workgroup_tiles {
+                    tile_ir::ScalarElement::F16
                 } else {
-                    if use_f16_workgroup_tiles {
-                        tile_ir_kernels::qmatmul_workgroup_f16_with_epilogues(
-                            phase,
-                            &a,
-                            &b,
-                            &y,
-                            &epilogues,
-                            max_workgroups,
-                        );
-                    } else {
-                        tile_ir_kernels::qmatmul_workgroup_with_epilogues(
-                            phase,
-                            &a,
-                            &b,
-                            &y,
-                            &epilogues,
-                            max_workgroups,
-                        );
-                    }
-                }
+                    tile_ir::ScalarElement::F32
+                };
+                tile_ir_kernels::qmatmul_workgroup_with_epilogues(
+                    phase,
+                    &a,
+                    &b,
+                    &y,
+                    staging,
+                    &epilogues,
+                    max_workgroups,
+                );
                 return;
             }
             // Map the selected variant to its cooperative tile dimensions.
@@ -749,6 +712,21 @@ impl Operation for QMatMulOperation {
         if let Some(epilogue) = &self.post_element_wise_expr {
             for extra in &epilogue.extras {
                 f(*extra);
+            }
+        }
+    }
+
+    fn visit_dependencies_mut(&mut self, f: &mut dyn FnMut(&mut NodeIndex)) {
+        f(&mut self.input);
+        for epilogue in [
+            &mut self.pre_element_wise_expr,
+            &mut self.post_element_wise_expr,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for extra in &mut epilogue.extras {
+                f(extra);
             }
         }
     }

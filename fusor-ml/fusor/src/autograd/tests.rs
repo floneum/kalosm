@@ -2957,7 +2957,9 @@ async fn test_backward_attention_flash_ineligible_shape() {
     let elements = BATCH * HEADS * SEQ * DIM;
     let mut state = 0x2458_71a3_u64;
     let mut next = move || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
     };
     let q_data: Vec<f32> = (0..elements).map(|_| next()).collect();
@@ -3555,18 +3557,16 @@ fn test_gpu_gradients_can_detach() {
     let dx = gradients.get(&x).expect("missing x gradient");
     let dw = gradients.get(&w).expect("missing w gradient");
 
-    assert_eq!(
+    assert!(
         dx.as_gpu()
             .expect("expected GPU x gradient")
-            .count_kernels_to_resolve(),
-        0,
+            .resolves_in::<0>(),
         "detached x gradient should not retain backward compute graph",
     );
-    assert_eq!(
+    assert!(
         dw.as_gpu()
             .expect("expected GPU w gradient")
-            .count_kernels_to_resolve(),
-        0,
+            .resolves_in::<0>(),
         "detached w gradient should not retain backward compute graph",
     );
 }

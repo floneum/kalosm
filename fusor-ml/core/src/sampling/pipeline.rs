@@ -1,7 +1,10 @@
 use crate::{
     Layout, Tensor,
-    mir::kernel_backend::standard_sampler::{
-        sample_categorical_logits_data_with_encoder, supports_unfiltered_categorical,
+    mir::kernel_backend::sampling::{
+        ChunkProcessors, MergeSortedChunkTopKParams, ProcessorSettings,
+        chunk_top_k_pair_data_with_encoder, merge_sorted_chunk_top_k_pair_data_with_encoder,
+        sample_categorical_logits_data_with_encoder, sample_from_sorted_top_k_data_with_encoder,
+        supports_unfiltered_categorical, top_k_exactness_flag_data_with_encoder,
     },
     tensor::{DataTypeEnum, LazyTensorData, TensorData},
 };
@@ -13,12 +16,6 @@ use super::{
     GPU_SAMPLE_RESULT_WORDS, GPU_SAMPLE_STATUS_INVALID, GPU_SAMPLE_STATUS_RETRY_NEEDED,
     GPU_SAMPLE_STATUS_SAMPLED, GpuMirostat2Sampler, GpuMirostat2SamplerParams,
     GpuStandardSamplerParams, PendingGpuSampledToken, TOP_K_CHUNK, min_top_k_candidates_per_chunk,
-    mirostat::sample_from_sorted_top_k_data_with_encoder,
-    standard_sampler::sample_from_sorted_top_k_data_with_encoder as sample_standard_from_sorted_top_k_data_with_encoder,
-    topk::{
-        ProcessorSettings, chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder,
-        merge_sorted_chunk_top_k_pair_data_with_encoder, top_k_exactness_flag_data_with_encoder,
-    },
 };
 
 /// Which sampler kernel terminates the top-k tail, along with its parameters.
@@ -34,7 +31,7 @@ pub(crate) enum GpuSamplerRequest<'a> {
 }
 
 impl GpuSamplerRequest<'_> {
-    fn top_k(&self) -> usize {
+    pub(crate) fn top_k(&self) -> usize {
         match self {
             Self::Mirostat2 { params, .. } => params.top_k,
             Self::Standard { params } => params.top_k,
@@ -51,32 +48,6 @@ impl GpuSamplerRequest<'_> {
                 temperature: params.temperature,
                 repetition_penalty: params.repetition_penalty,
             },
-        }
-    }
-
-    fn encode_sample(
-        &mut self,
-        ids: &TensorData,
-        values: &TensorData,
-        exactness_flag: Option<&TensorData>,
-        encoder: &mut CommandEncoder,
-    ) -> Option<TensorData> {
-        match self {
-            Self::Mirostat2 { sampler, params } => sample_from_sorted_top_k_data_with_encoder(
-                ids,
-                values,
-                sampler,
-                *params,
-                exactness_flag,
-                Some(encoder),
-            ),
-            Self::Standard { params } => sample_standard_from_sorted_top_k_data_with_encoder(
-                ids,
-                values,
-                *params,
-                exactness_flag,
-                Some(encoder),
-            ),
         }
     }
 }
@@ -153,21 +124,22 @@ fn encode_sample_attempt(
     }
 
     let output_per_chunk = sampler_output_per_chunk(dims.candidate_count);
-    let (chunk_ids, chunk_values) =
-        chunk_top_k_pair_data_with_processors_and_gpu_tail_with_encoder(
-            logits,
+    let (chunk_ids, chunk_values) = chunk_top_k_pair_data_with_encoder(
+        logits,
+        Some(ChunkProcessors {
             previous_tokens,
-            previous_gpu_token,
-            request.processor_settings(),
-            dims.candidate_count,
-            output_per_chunk,
-            Some(encoder),
-        )?;
+            gpu_tail: previous_gpu_token,
+            settings: request.processor_settings(),
+        }),
+        dims.candidate_count,
+        output_per_chunk,
+        Some(encoder),
+    )?;
 
     let (ids, values) = merge_sorted_chunk_top_k_pair_data_with_encoder(
         &chunk_ids,
         &chunk_values,
-        crate::sampling::topk::MergeSortedChunkTopKParams {
+        MergeSortedChunkTopKParams {
             chunks: dims.chunks,
             chunk_len: dims.candidate_count,
             chunk_stride: output_per_chunk,
@@ -192,7 +164,13 @@ fn encode_sample_attempt(
         None
     };
 
-    let output = request.encode_sample(&ids, &values, exactness_flag.as_ref(), encoder)?;
+    let output = sample_from_sorted_top_k_data_with_encoder(
+        &ids,
+        &values,
+        request,
+        exactness_flag.as_ref(),
+        Some(encoder),
+    )?;
     Some(EncodedSampleAttempt {
         output,
         debug_top_k: Some((ids, values)),

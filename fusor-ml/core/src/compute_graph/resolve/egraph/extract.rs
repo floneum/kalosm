@@ -3,14 +3,11 @@
 //!
 //! Selection state remains per observation so liveness constraints are
 //! explicit, while equivalent observations may reference the same e-class.
-//! Every observation starts at its identity selection.
-//! Two candidate sources drive switches:
-//! - **Pre-generated alternatives** from saturation already in the node's
-//!   class.
-//! - **Fusion generators**: legal alternatives are planned once
-//!   per allocation-independent local window and reused by repeated layers.
-//!   Successful generations are recorded into the value e-graph and
-//!   committed as switches.
+//! Every observation starts at its identity selection. Fusion generators
+//! drive every switch: legal alternatives are planned once per
+//! allocation-independent local window and reused by repeated layers.
+//! Successful generations are recorded into the value e-graph and committed
+//! as switches.
 //!
 //! Consumer counts are multisets over the current selection, initialized
 //! from the identity selections (one entry per read occurrence). A switch's
@@ -20,12 +17,11 @@
 //!
 //! The cost tuple is lexicographic: dispatch count, materialized bytes, then
 //! estimated arithmetic work. Determinism comes from provenance-order
-//! worklists, fixed rule order and payload-id tie breaks; no decision consults
-//! hash-map iteration order.
+//! worklists, fixed generator order and generation-order tie breaks; no
+//! decision consults hash-map iteration order.
 
 use egg::Language;
 
-use super::super::Resolver;
 use super::EGraphDriver;
 use super::interner::variant_dependencies;
 use super::lang::{FusorLang, Prov};
@@ -33,7 +29,7 @@ use super::rules_fuse::{FusionCtx, FusionView};
 use super::structural_memo::{FusionPlanMemo, PlanLookup};
 
 /// What extraction chose for one execution node.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(super) enum Selection {
     Identity,
     Alt(FusorLang),
@@ -42,9 +38,6 @@ pub(super) enum Selection {
 pub(super) struct Extraction {
     /// Indexed by `Prov`.
     pub(super) sel: Vec<Selection>,
-    /// Selection already materialized in the execution graph when this
-    /// extraction began. Only changes from this baseline need applying.
-    baseline: Vec<Selection>,
     /// Indexed by `Prov`; false = killed (no longer materialized).
     pub(super) needed: Vec<bool>,
 }
@@ -56,28 +49,10 @@ impl Extraction {
             .iter()
             .enumerate()
             .filter(|(prov, _)| self.needed[*prov])
-            .filter(|(prov, selection)| **selection != self.baseline[*prov])
             .filter_map(|(prov, selection)| match selection {
                 Selection::Identity => None,
                 Selection::Alt(enode) => Some((Prov(prov as u32), enode)),
             })
-    }
-}
-
-/// Stable tie-break between equal-cost recognition alternatives.
-#[cfg(test)]
-fn kind_rank(enode: &FusorLang) -> u32 {
-    match enode {
-        FusorLang::RowProgram(_, _, _) => 0,
-        FusorLang::QMatMul(_, _, _) => 1,
-        FusorLang::QEmbedding(_, _, _) => 2,
-        FusorLang::MatMul(_, _, _) => 3,
-        FusorLang::Region(_, _, _) => 4,
-        FusorLang::Reduce(_, _, _) => 5,
-        FusorLang::Elementwise(_, _, _) => 6,
-        FusorLang::View(_, _, _) => 7,
-        FusorLang::Assign(_, _, _) => 8,
-        FusorLang::TensorLeaf(..) | FusorLang::Boundary(..) | FusorLang::QMatrixLeaf(..) => 9,
     }
 }
 
@@ -93,7 +68,7 @@ pub(super) struct ExtractState {
 }
 
 impl ExtractState {
-    #[cfg(test)]
+    /// Every ingested observation starts needed and at its identity form.
     pub(super) fn new(driver: &EGraphDriver) -> Self {
         let count = driver.egraph.analysis.facts.len();
         let mut state = ExtractState {
@@ -103,60 +78,6 @@ impl ExtractState {
             consumers: vec![Vec::new(); count],
         };
         for prov in 0..count as u32 {
-            for child in state.selected_child_provs(driver, Prov(prov)) {
-                state.reads[child as usize] += 1;
-                state.consumers[child as usize].push(prov);
-            }
-        }
-        state
-    }
-
-    /// Reconstruct selection/liveness from the execution graph after the
-    /// recognition builders have committed their chosen structural forms.
-    /// New row-program/assign alternatives are inserted into the same value
-    /// e-graph; removed cluster intermediates stay unneeded.
-    pub(super) fn from_execution(driver: &mut EGraphDriver, resolver: &Resolver) -> Self {
-        let count = driver.egraph.analysis.facts.len();
-        let mut state = ExtractState {
-            sel: vec![Selection::Identity; count],
-            needed: vec![false; count],
-            reads: vec![0; count],
-            consumers: vec![Vec::new(); count],
-        };
-
-        for index in 0..count {
-            let prov = Prov(index as u32);
-            let facts = driver.egraph.analysis.facts_of(prov);
-            let Some(&exec) = resolver.node_mapping.get(&facts.inner) else {
-                // Cached boundaries are not execution nodes but remain
-                // available as leaves. Removed cluster intermediates have an
-                // original exec index and stay dead.
-                state.needed[index] = facts.exec.is_none();
-                continue;
-            };
-            if !resolver.execution_graph.contains_node(exec) {
-                continue;
-            }
-            let variant = resolver.execution_graph[exec].variant.clone();
-            let enode = driver.ensure_current_variant(prov, variant);
-            state.sel[index] = if driver.is_identity(&enode) {
-                Selection::Identity
-            } else {
-                Selection::Alt(enode)
-            };
-            state.needed[index] = true;
-        }
-
-        // Adding the current variants can merge equivalent root classes.
-        // Canonicalize before translating their child classes back to
-        // provenances for read and liveness accounting.
-        driver.egraph.rebuild();
-        driver.refresh_prov_classes();
-
-        for prov in 0..count as u32 {
-            if !state.needed[prov as usize] {
-                continue;
-            }
             for child in state.selected_child_provs(driver, Prov(prov)) {
                 state.reads[child as usize] += 1;
                 state.consumers[child as usize].push(prov);
@@ -349,22 +270,6 @@ fn remove_one(consumers: &mut Vec<u32>, value: u32) {
 }
 
 impl EGraphDriver {
-    /// Extraction over pre-generated alternatives only.
-    #[cfg(test)]
-    pub(super) fn extract(&self) -> Extraction {
-        // Recognition never mutates the e-graph during extraction, but the
-        // shared loop wants `&mut self`; recognition alternatives are all
-        // already present, so the generator hook is simply absent.
-        let mut state = ExtractState::new(self);
-        let baseline = state.sel.clone();
-        self.run_alternative_switches(&mut state);
-        Extraction {
-            sel: state.sel,
-            baseline,
-            needed: state.needed,
-        }
-    }
-
     pub(super) fn prov_of_class(&self, id: egg::Id, needed: &[bool]) -> Prov {
         let provenances = &self.provs_of_class[&self.egraph.find(id)];
         provenances
@@ -378,61 +283,6 @@ impl EGraphDriver {
     /// execution node itself (unique per class by construction).
     pub(super) fn identity_enode(&self, prov: Prov) -> &FusorLang {
         &self.identity_enodes[prov.0 as usize]
-    }
-
-    /// Whether an e-node is the ingested identity form (rather than a
-    /// rule-minted alternative).
-    pub(super) fn is_identity(&self, node: &FusorLang) -> bool {
-        self.identity_payloads[node.prov().0 as usize] == node.payload()
-    }
-
-    /// Cost-guided worklist over pre-generated class alternatives.
-    #[cfg(test)]
-    fn run_alternative_switches(&self, state: &mut ExtractState) {
-        let mut worklist: std::collections::VecDeque<u32> = (0..state.sel.len() as u32).collect();
-        let mut queued = vec![true; state.sel.len()];
-        while let Some(prov) = worklist.pop_front() {
-            queued[prov as usize] = false;
-            if !state.needed[prov as usize] {
-                continue;
-            }
-            if self.egraph.analysis.facts[prov as usize].exec.is_none() {
-                continue;
-            }
-            if let Some(touched) = self.try_alternative_switch(state, Prov(prov)) {
-                for t in touched {
-                    if !queued[t as usize] {
-                        queued[t as usize] = true;
-                        worklist.push_back(t);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Try to switch `prov` to a better pre-generated alternative from its
-    /// class. Returns the touched set on success.
-    #[cfg(test)]
-    fn try_alternative_switch(&self, state: &mut ExtractState, prov: Prov) -> Option<Vec<u32>> {
-        let id = self.egraph.find(self.class_of[prov.0 as usize]);
-        let candidates: Vec<&FusorLang> = self.egraph[id]
-            .nodes
-            .iter()
-            .filter(|node| !self.is_identity(node))
-            .collect();
-        let (candidate, kills, _) = candidates
-            .into_iter()
-            .filter_map(|candidate| {
-                let payload = candidate.payload()?;
-                let variant = self.egraph.analysis.payloads.get(payload);
-                let kills = state.kills(self, prov, candidate);
-                let delta = self.switch_cost_delta(state, prov, variant, &kills);
-                delta.improves().then_some((candidate, kills, delta))
-            })
-            .min_by_key(|(candidate, _, delta)| {
-                (*delta, kind_rank(candidate), candidate.payload())
-            })?;
-        Some(state.commit(self, prov, candidate.clone(), &kills))
     }
 
     /// The cheapest legal generator candidate for `prov` under live counts.
@@ -496,15 +346,10 @@ impl EGraphDriver {
     /// through views — re-enters the worklist. Counts only decrease and the
     /// generators' gates are antitone in them, so the loop converges to the
     /// greatest fixpoint regardless of order: maximal legal fusion.
-    pub(super) fn extract_with_fusion(
-        &mut self,
-        resolver: &Resolver,
-        ctx: &FusionCtx<'_>,
-    ) -> Extraction {
-        let mut state = ExtractState::from_execution(self, resolver);
-        let baseline = state.sel.clone();
-        let mut plans = FusionPlanMemo::default();
+    pub(super) fn extract_with_fusion(&mut self, ctx: &FusionCtx<'_>) -> Extraction {
+        let mut state = ExtractState::new(self);
         let device = ctx.graph.device();
+        let mut plans = FusionPlanMemo::for_config(device.config());
         // The window horizon must cover everything a generator observes;
         // this tripwire proves it by regenerating and comparing on every
         // hit, per-resolve and device-store alike.
@@ -612,7 +457,22 @@ impl EGraphDriver {
                 .chain(touched);
             view.enqueue_downstream(&state, seeds, &mut worklist, &mut queued);
         }
-        if ctx.graph.device().config().trace_resolve_host {
+        if device.config().spike_hoisting {
+            let sharing = plans.stats();
+            tracing::info!(
+                "hoisting_spike_windows stub_depth={} windows={} unique={} hits={} misses={} store_hits={} store_misses={} capture_us={} capture_ns_per_window={}",
+                plans.stub_depth(),
+                sharing.windows,
+                sharing.unique_windows,
+                sharing.hits,
+                sharing.misses,
+                sharing.store_hits,
+                sharing.store_misses,
+                plans.capture_time().as_micros(),
+                plans.capture_time().as_nanos() / sharing.windows.max(1) as u128,
+            );
+        }
+        if device.config().trace_resolve_host {
             let sharing = plans.stats();
             let cost = self.extraction_cost(&state);
             tracing::info!(
@@ -634,7 +494,6 @@ impl EGraphDriver {
         }
         Extraction {
             sel: state.sel,
-            baseline,
             needed: state.needed,
         }
     }

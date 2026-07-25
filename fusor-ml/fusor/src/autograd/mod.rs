@@ -449,11 +449,7 @@ where
         &self,
         rhs: &Self,
         value: RawTensor<R, T>,
-        backward: impl Fn(
-            RawTensor<R, T>,
-            RawTensor<R, T>,
-            RawTensor<R, T>,
-        ) -> Vec<RawTensor<R, T>>
+        backward: impl Fn(RawTensor<R, T>, RawTensor<R, T>, RawTensor<R, T>) -> Vec<RawTensor<R, T>>
         + BackwardClosure,
     ) -> Self {
         assert!(
@@ -628,8 +624,7 @@ where
         third: &Tensor<R3, T>,
         context: &'static str,
         value: RawTensor<OUT, T>,
-        replay: impl Fn(Tensor<R, T>, Tensor<R2, T>, Tensor<R3, T>) -> Tensor<OUT, T>
-        + BackwardClosure,
+        replay: impl Fn(Tensor<R, T>, Tensor<R2, T>, Tensor<R3, T>) -> Tensor<OUT, T> + BackwardClosure,
     ) -> Tensor<OUT, T> {
         assert_same_graph(self, second);
         assert_same_graph(self, third);
@@ -906,7 +901,12 @@ fn downcast_tensor<const R: usize, T: AutogradElement>(
         .ok_or_else(|| Error::msg(format!("gradient rank mismatch in {context}")))
 }
 
-fn assert_same_graph<const R: usize, const R2: usize, T: crate::cpu::SimdElement, T2: crate::cpu::SimdElement>(
+fn assert_same_graph<
+    const R: usize,
+    const R2: usize,
+    T: crate::cpu::SimdElement,
+    T2: crate::cpu::SimdElement,
+>(
     lhs: &Tensor<R, T>,
     rhs: &Tensor<R2, T2>,
 ) {

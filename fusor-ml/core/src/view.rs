@@ -572,6 +572,10 @@ impl Operation for ViewOperation {
         f(self.input);
     }
 
+    fn visit_dependencies_mut(&mut self, f: &mut dyn FnMut(&mut NodeIndex)) {
+        f(&mut self.input);
+    }
+
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
         let input = nodes.get_cached_result(self.input).unwrap().clone();
         let output = TensorData::new_for_shape(input.device(), self.shape(), input.datatype());

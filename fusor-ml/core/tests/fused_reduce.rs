@@ -43,9 +43,8 @@ fn broadcast_composed_contraction_fuses_to_single_kernel() {
         let (a3, b3) = broadcast_factors(&device, m, n, k, &a_values, &b_values);
 
         let out = (&a3 * &b3).sum(2);
-        assert_eq!(
-            out.count_kernels_to_resolve(),
-            1,
+        assert!(
+            out.resolves_in::<1>(),
             "broadcast-composed contraction must fuse into one map-reduce kernel"
         );
 
@@ -80,7 +79,7 @@ fn small_composed_contraction_fuses_through_serial_path() {
         let (a3, b3) = broadcast_factors(&device, m, n, k, &a_values, &b_values);
 
         let out = (&a3 * &b3).sum(2);
-        assert_eq!(out.count_kernels_to_resolve(), 1, "small fused contraction");
+        assert!(out.resolves_in::<1>(), "small fused contraction");
 
         let slice = out.as_slice::<2, f32>().await.unwrap();
         for row in 0..m {
@@ -114,7 +113,7 @@ fn max_contraction_fuses_with_masked_tiles() {
         let (a3, b3) = broadcast_factors(&device, m, n, k, &a_values, &b_values);
 
         let out = (&a3 * &b3).max(2);
-        assert_eq!(out.count_kernels_to_resolve(), 1, "fused max contraction");
+        assert!(out.resolves_in::<1>(), "fused max contraction");
 
         let slice = out.as_slice::<2, f32>().await.unwrap();
         for row in [0usize, 39, m - 1] {
@@ -168,7 +167,7 @@ fn quantized_weighted_reduce_fuses_to_single_kernel() {
         let wd = w.dequantize::<f32>();
         let xb = x.reshape([1, k]).broadcast_as([n, k]);
         let out = (&wd * &xb).sum(1);
-        assert_eq!(out.count_kernels_to_resolve(), 1, "fused quantized reduce");
+        assert!(out.resolves_in::<1>(), "fused quantized reduce");
 
         let slice = out.as_slice::<1, f32>().await.unwrap();
         for row in [0usize, 17, n - 1] {
@@ -202,7 +201,7 @@ fn weighted_sum_fuses_to_single_kernel() {
         let w2 = w.reshape([1, k]).broadcast_as([m, k]);
 
         let out = (&x * &w2).sum(1);
-        assert_eq!(out.count_kernels_to_resolve(), 1, "fused weighted sum");
+        assert!(out.resolves_in::<1>(), "fused weighted sum");
 
         let slice = out.as_slice::<1, f32>().await.unwrap();
         for row in [0usize, 100, 255, m - 1] {
@@ -234,7 +233,7 @@ fn broadcast_table_elementwise_reuses_invariant_loads() {
         let t3 = t.reshape([1, s, h]).broadcast_as([b, s, h]);
 
         let out = &x * &t3;
-        assert_eq!(out.count_kernels_to_resolve(), 1, "broadcast table apply");
+        assert!(out.resolves_in::<1>(), "broadcast table apply");
 
         let slice = out.as_slice::<3, f32>().await.unwrap();
         for batch in 0..b {
@@ -268,9 +267,8 @@ fn contraction_with_k_independent_factor_fuses() {
         let c3 = c.reshape([m, n, 1]).broadcast_as([m, n, k]);
 
         let out = (&(&a3 * &b3) * &c3).sum(2);
-        assert_eq!(
-            out.count_kernels_to_resolve(),
-            1,
+        assert!(
+            out.resolves_in::<1>(),
             "contraction with k-independent factor"
         );
 
@@ -310,9 +308,8 @@ fn reshaped_elementwise_producer_folds_into_reduce() {
         let y = Tensor::from_slice(&device, [b, s, h], &y_values);
 
         let out = (&x * &y).reshape([b * s, h]).sum(0);
-        assert_eq!(
-            out.count_kernels_to_resolve(),
-            1,
+        assert!(
+            out.resolves_in::<1>(),
             "reshape + sum over an exclusive producer must fuse"
         );
 
@@ -346,9 +343,8 @@ fn unary_chain_across_keepdim_view_fuses_into_reduce() {
         let x = Tensor::from_slice(&device, [m, k], &x_values);
 
         let mean = &x.sum_keepdim(1) / (k as f32);
-        assert_eq!(
-            mean.count_kernels_to_resolve(),
-            1,
+        assert!(
+            mean.resolves_in::<1>(),
             "post-keepdim unary chain must fold into the reduce"
         );
 
@@ -381,9 +377,8 @@ fn unit_axis_reduce_collapses_into_consumer() {
         let y = Tensor::from_slice(&device, [m, k], &y_values);
 
         let out = &x.sum(0) + &y;
-        assert_eq!(
-            out.count_kernels_to_resolve(),
-            1,
+        assert!(
+            out.resolves_in::<1>(),
             "size-1-axis reduce must collapse into the consumer"
         );
 

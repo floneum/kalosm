@@ -76,6 +76,12 @@ pub(crate) trait Operation: Debug + Send + Sync + 'static {
 
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex));
 
+    /// Visit the same dependency slots as [`Self::visit_dependencies`], in
+    /// the same order, so callers can rebind them. Materializing an operation
+    /// that was interned from a structurally identical instance rewrites
+    /// every slot through this visitor.
+    fn visit_dependencies_mut(&mut self, f: &mut dyn FnMut(&mut NodeIndex));
+
     fn inputs(&self, nodes: &ComputeGraphInner) -> Vec<MirValue>;
 
     fn output(&self, nodes: &ComputeGraphInner, inputs: &[MirValue]) -> MirValue;
@@ -155,7 +161,7 @@ pub(crate) fn hash_mir_value(state: &mut FxHasher, value: &MirValue) {
     }
 }
 
-fn hash_layout(state: &mut FxHasher, layout: &crate::Layout) {
+pub(crate) fn hash_layout(state: &mut FxHasher, layout: &crate::Layout) {
     layout.offset().hash(state);
     layout.shape().hash(state);
     layout.strides().hash(state);

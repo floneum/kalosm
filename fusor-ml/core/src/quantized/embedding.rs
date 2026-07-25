@@ -222,6 +222,10 @@ impl Operation for QEmbeddingOperation {
         f(self.indexes);
     }
 
+    fn visit_dependencies_mut(&mut self, f: &mut dyn FnMut(&mut NodeIndex)) {
+        f(&mut self.indexes);
+    }
+
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
         let indexes = nodes
             .get_result(self.indexes)

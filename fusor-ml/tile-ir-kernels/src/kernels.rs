@@ -20,17 +20,12 @@ pub use attention::{
 pub use helpers::AccumCast;
 pub use matmul::{
     DEFAULT_SWIZZLE_GROUP_M,
-    fma_matmul_f32,
     coop_tile_entries, merged_split_k_combine, split_k_combine, try_batched_coop_matmul,
     try_batched_coop_matmul_split_k, try_merged_coop_matmul, CoopTileEntry,
     DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulShape, DenseMatmulTensors,};
 pub use qgemv::{qgemv_with_epilogue, IntoQgemvEpilogues};
 pub use qmatmul::qmatmul_with_epilogue;
-pub use qmatmul_workgroup::{
-    qgemv_workgroup_f16_with_epilogue, qgemv_workgroup_storage_f16_with_epilogue,
-    qgemv_workgroup_with_epilogue, qmatmul_workgroup_f16_with_epilogues,
-    qmatmul_workgroup_storage_f16_with_epilogues, qmatmul_workgroup_with_epilogues,
-};
+pub use qmatmul_workgroup::qmatmul_workgroup_with_epilogues;
 pub use quantized_matrix::{quantized_matrix, quantized_matrix_for};
 
 /// The default rank-1 unit-stride layout used by tile-ir's pre-built kernels

@@ -136,9 +136,13 @@ where
     pub fn pow_elementwise(&self, exponent: f32) -> Self {
         let input = self.value.clone();
         self.unary_from_value(
-            self.value.pow_elementwise(T::from_f32(exponent)).into_concrete(),
+            self.value
+                .pow_elementwise(T::from_f32(exponent))
+                .into_concrete(),
             move |grad, _| {
-                let power = input.pow_elementwise(T::from_f32(exponent - 1.0)).into_concrete();
+                let power = input
+                    .pow_elementwise(T::from_f32(exponent - 1.0))
+                    .into_concrete();
                 (grad * power)
                     .into_concrete()
                     .mul_scalar(T::from_f32(exponent))
@@ -152,11 +156,17 @@ where
     }
 
     pub fn add_scalar(&self, scalar: f32) -> Self {
-        self.unary_from_value(self.value.add_scalar(T::from_f32(scalar)), move |grad, _| grad)
+        self.unary_from_value(
+            self.value.add_scalar(T::from_f32(scalar)),
+            move |grad, _| grad,
+        )
     }
 
     pub fn sub_scalar(&self, scalar: f32) -> Self {
-        self.unary_from_value(self.value.sub_scalar(T::from_f32(scalar)), move |grad, _| grad)
+        self.unary_from_value(
+            self.value.sub_scalar(T::from_f32(scalar)),
+            move |grad, _| grad,
+        )
     }
 
     pub fn mul_scalar(&self, scalar: f32) -> Self {
@@ -182,7 +192,10 @@ where
     pub fn sqr(&self) -> Self {
         let input = self.value.clone();
         self.unary_from_value(self.value.sqr().into_concrete(), move |grad, _| {
-            ((grad * input.clone()).into_concrete().mul_scalar(T::from_f32(2.0))).into_concrete()
+            ((grad * input.clone())
+                .into_concrete()
+                .mul_scalar(T::from_f32(2.0)))
+            .into_concrete()
         })
     }
 
@@ -216,7 +229,11 @@ where
                 .into_concrete()
                 .sqrt()
                 .into_concrete();
-            let upper = input.add_scalar(T::from_f32(1.0)).into_concrete().sqrt().into_concrete();
+            let upper = input
+                .add_scalar(T::from_f32(1.0))
+                .into_concrete()
+                .sqrt()
+                .into_concrete();
             (grad / (lower * upper).into_concrete()).into_concrete()
         })
     }
@@ -384,7 +401,9 @@ where
     pub fn clamp(&self, min: f32, max: f32) -> Self {
         let input = self.value.clone();
         self.unary_from_value(
-            self.value.clamp(T::from_f32(min), T::from_f32(max)).into_concrete(),
+            self.value
+                .clamp(T::from_f32(min), T::from_f32(max))
+                .into_concrete(),
             move |grad, _| {
                 let lower = input.mt(T::from_f32(min)).into_concrete();
                 let upper = input.lt(T::from_f32(max)).into_concrete();
@@ -394,9 +413,10 @@ where
     }
 
     pub fn eq(&self, rhs: f32) -> Self {
-        self.unary_from_value(self.value.eq(T::from_f32(rhs)).into_concrete(), move |_, out| {
-            RawTensor::zeros(&out.device(), out.shape())
-        })
+        self.unary_from_value(
+            self.value.eq(T::from_f32(rhs)).into_concrete(),
+            move |_, out| RawTensor::zeros(&out.device(), out.shape()),
+        )
     }
 
     pub fn eq_scalar(&self, rhs: f32) -> Self {
@@ -418,9 +438,10 @@ where
     }
 
     pub fn gt_scalar(&self, rhs: f32) -> Self {
-        self.unary_from_value(self.value.gt_scalar(T::from_f32(rhs)).into_concrete(), move |_, out| {
-            RawTensor::zeros(&out.device(), out.shape())
-        })
+        self.unary_from_value(
+            self.value.gt_scalar(T::from_f32(rhs)).into_concrete(),
+            move |_, out| RawTensor::zeros(&out.device(), out.shape()),
+        )
     }
 
     pub fn gt_tensor(&self, rhs: &Self) -> Self {
@@ -438,9 +459,10 @@ where
     }
 
     pub fn gte_scalar(&self, rhs: f32) -> Self {
-        self.unary_from_value(self.value.gte_scalar(T::from_f32(rhs)).into_concrete(), move |_, out| {
-            RawTensor::zeros(&out.device(), out.shape())
-        })
+        self.unary_from_value(
+            self.value.gte_scalar(T::from_f32(rhs)).into_concrete(),
+            move |_, out| RawTensor::zeros(&out.device(), out.shape()),
+        )
     }
 
     pub fn gte_tensor(&self, rhs: &Self) -> Self {
@@ -458,9 +480,10 @@ where
     }
 
     pub fn lt(&self, rhs: f32) -> Self {
-        self.unary_from_value(self.value.lt(T::from_f32(rhs)).into_concrete(), move |_, out| {
-            RawTensor::zeros(&out.device(), out.shape())
-        })
+        self.unary_from_value(
+            self.value.lt(T::from_f32(rhs)).into_concrete(),
+            move |_, out| RawTensor::zeros(&out.device(), out.shape()),
+        )
     }
 
     pub fn lt_scalar(&self, rhs: f32) -> Self {
@@ -482,9 +505,10 @@ where
     }
 
     pub fn lte(&self, rhs: f32) -> Self {
-        self.unary_from_value(self.value.lte(T::from_f32(rhs)).into_concrete(), move |_, out| {
-            RawTensor::zeros(&out.device(), out.shape())
-        })
+        self.unary_from_value(
+            self.value.lte(T::from_f32(rhs)).into_concrete(),
+            move |_, out| RawTensor::zeros(&out.device(), out.shape()),
+        )
     }
 
     pub fn lte_scalar(&self, rhs: f32) -> Self {
@@ -538,9 +562,10 @@ where
     }
 
     pub fn ne(&self, rhs: f32) -> Self {
-        self.unary_from_value(self.value.ne(T::from_f32(rhs)).into_concrete(), move |_, out| {
-            RawTensor::zeros(&out.device(), out.shape())
-        })
+        self.unary_from_value(
+            self.value.ne(T::from_f32(rhs)).into_concrete(),
+            move |_, out| RawTensor::zeros(&out.device(), out.shape()),
+        )
     }
 
     pub fn ne_scalar(&self, rhs: f32) -> Self {
@@ -677,40 +702,40 @@ where
 macro_rules! impl_autograd_pairwise_op {
     ($trait:ident, $method:ident) => {
         impl<const R: usize, T: AutogradElement> std::ops::$trait<Tensor<R, T>> for Tensor<R, T>
-where
-    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
-{
+        where
+            crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
+        {
             type Output = Tensor<R, T>;
 
             fn $method(self, rhs: Tensor<R, T>) -> Tensor<R, T> {
@@ -719,40 +744,40 @@ where
         }
 
         impl<const R: usize, T: AutogradElement> std::ops::$trait<&Tensor<R, T>> for Tensor<R, T>
-where
-    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
-{
+        where
+            crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
+        {
             type Output = Tensor<R, T>;
 
             fn $method(self, rhs: &Tensor<R, T>) -> Tensor<R, T> {
@@ -761,40 +786,40 @@ where
         }
 
         impl<const R: usize, T: AutogradElement> std::ops::$trait<Tensor<R, T>> for &Tensor<R, T>
-where
-    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
-{
+        where
+            crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
+        {
             type Output = Tensor<R, T>;
 
             fn $method(self, rhs: Tensor<R, T>) -> Tensor<R, T> {
@@ -803,40 +828,40 @@ where
         }
 
         impl<const R: usize, T: AutogradElement> std::ops::$trait<&Tensor<R, T>> for &Tensor<R, T>
-where
-    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
-{
+        where
+            crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
+        {
             type Output = Tensor<R, T>;
 
             fn $method(self, rhs: &Tensor<R, T>) -> Tensor<R, T> {
@@ -854,40 +879,40 @@ impl_autograd_pairwise_op!(Div, div);
 macro_rules! impl_autograd_scalar_op {
     ($trait:ident, $method:ident, $scalar_method:ident) => {
         impl<const R: usize, T: AutogradElement> std::ops::$trait<f32> for Tensor<R, T>
-where
-    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
-{
+        where
+            crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
+        {
             type Output = Tensor<R, T>;
 
             fn $method(self, rhs: f32) -> Tensor<R, T> {
@@ -896,40 +921,40 @@ where
         }
 
         impl<const R: usize, T: AutogradElement> std::ops::$trait<f32> for &Tensor<R, T>
-where
-    crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
-    crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
-    crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
-    crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
-{
+        where
+            crate::cpu::AddOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::SubOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::MulOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::DivOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::EqOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::NeOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::LtOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::LteOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::GtOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::GteOp: crate::cpu::SimdBinaryOp<T>,
+            crate::cpu::SumOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::MaxOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::MinOp: crate::cpu::SimdReduceOp<T>,
+            crate::cpu::NegOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AbsOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::ExpOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::Exp2Op: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::LogOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::Log2Op: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SinOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::CosOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::TanOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::TanhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::SinhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::CoshOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AsinOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AcosOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AtanOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AsinhOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AcoshOp: crate::cpu::SimdUnaryOp<T>,
+            crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
+        {
             type Output = Tensor<R, T>;
 
             fn $method(self, rhs: f32) -> Tensor<R, T> {

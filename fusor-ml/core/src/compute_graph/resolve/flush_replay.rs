@@ -23,7 +23,7 @@
 //! - Replay mutates the inner graph exclusively through the blessed APIs:
 //!   `set_cached_result`, `add_dependency_edge` (re-adding the optimizer's
 //!   recorded physical edges), and the exact release predicate used by
-//!   `release_dead_intermediates` — evaluated live, never recorded, so
+//!   `release_consumed` — evaluated live, never recorded, so
 //!   reference-count drift (e.g. a user cloning a mid-graph handle) is
 //!   handled identically to a full resolve.
 //! - Tensor and quantized-matrix storage are separate binding roles. A
@@ -38,14 +38,15 @@
 //!   sharing (view aliases, in-place outputs), and pins every tracked `Arc`
 //!   so pool recycling cannot alias pointers mid-recording.
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use fusor_tile_ir_runtime::{TwoLaneHasher, single_lane};
 use lru::LruCache;
 use parking_lot::Mutex;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet, FxHasher};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use web_time::Instant;
 
 use super::{
@@ -53,7 +54,7 @@ use super::{
     QueuedOperation, Resolver,
 };
 use crate::mir::kernel_backend::{DirectKernel, DirectKernelTemplate};
-use crate::mir::operation::Operation;
+use crate::mir::operation::{Operation, hash_layout};
 use crate::tensor::TensorData;
 use crate::{DataTypeEnum, Device, Layout};
 
@@ -205,47 +206,35 @@ pub(crate) fn prepare_replay(graph: &mut ComputeGraphInner, targets: &[NodeIndex
     }
 }
 
-/// Two accumulating hashers producing the 128-bit plan key. Lane `b` is fed
-/// a deterministic mix of the same 64-bit words as lane `a`, so per-write
-/// entropy stays 64 bits (one FxHash); the second lane widens the
-/// *accumulator* state to make cross-node cancellation collisions harder,
-/// not the per-node hash. Replay correctness does not rest on this key alone:
-/// upfront validation re-checks step kinds and boundary caching, and the
-/// recorder refuses plans whose buffer provenance is ambiguous.
-struct FingerprintHasher {
-    a: FxHasher,
-    b: FxHasher,
-}
+/// The canonical [`TwoLaneHasher`] producing the 128-bit plan key. Replay
+/// correctness does not rest on this key alone: upfront validation re-checks
+/// step kinds and boundary caching, and the recorder refuses plans whose
+/// buffer provenance is ambiguous.
+struct FingerprintHasher(TwoLaneHasher);
 
 impl FingerprintHasher {
     fn new() -> Self {
-        let mut a = FxHasher::default();
-        0u64.hash(&mut a);
-        let mut b = FxHasher::default();
-        1u64.hash(&mut b);
-        Self { a, b }
+        Self(TwoLaneHasher::new())
     }
 
     fn write_u64(&mut self, value: u64) {
-        value.hash(&mut self.a);
-        (value.rotate_left(32) ^ 0x9E37_79B9_7F4A_7C15).hash(&mut self.b);
+        self.0.write_u64(value);
     }
 
     fn finish(self) -> FlushPlanKey {
-        FlushPlanKey([self.a.finish(), self.b.finish()])
+        FlushPlanKey(self.0.finish())
     }
 }
 
-fn local_hash(f: impl FnOnce(&mut FxHasher)) -> u64 {
-    let mut hasher = FxHasher::default();
-    f(&mut hasher);
-    hasher.finish()
-}
-
-fn hash_layout(state: &mut FxHasher, layout: &Layout) {
-    layout.offset().hash(state);
-    layout.shape().hash(state);
-    layout.strides().hash(state);
+/// The allocation-erased storage contract of one boundary or leaf: what the
+/// recorded kernels were compiled against, with the buffer identity — pure
+/// per-step data — left out.
+fn storage_contract(data: &TensorData) -> u64 {
+    single_lane(|state| {
+        data.datatype().hash(state);
+        hash_layout(state, data.layout());
+        data.buffer().size().hash(state);
+    })
 }
 
 /// The structural fingerprint of one flush: a 128-bit key plus the slot
@@ -326,11 +315,7 @@ fn fingerprint_visit(
         state
             .hasher
             .write_u64((node_data.reference_count > 0) as u64);
-        state.hasher.write_u64(local_hash(|h| {
-            cached.datatype().hash(h);
-            hash_layout(h, cached.layout());
-            cached.buffer().size().hash(h);
-        }));
+        state.hasher.write_u64(storage_contract(cached));
         return Some(pos);
     }
     state.boundary.push(false);
@@ -344,16 +329,12 @@ fn fingerprint_visit(
             state.hasher.write_u64(live_ref as u64);
             state
                 .hasher
-                .write_u64(local_hash(|h| operation.hash_kernel_fields(h)));
+                .write_u64(single_lane(|h| operation.hash_kernel_fields(h)));
         }
         ComputeGraphNodeVariant::Tensor(data) => {
             state.hasher.write_u64(0xA1);
             state.hasher.write_u64(live_ref as u64);
-            state.hasher.write_u64(local_hash(|h| {
-                data.datatype().hash(h);
-                hash_layout(h, data.layout());
-                data.buffer().size().hash(h);
-            }));
+            state.hasher.write_u64(storage_contract(data));
         }
         variant => {
             let (tag, op): (u64, &dyn Operation) = match variant {
@@ -369,7 +350,7 @@ fn fingerprint_visit(
             state.hasher.write_u64(live_ref as u64);
             state
                 .hasher
-                .write_u64(local_hash(|h| op.hash_kernel_fields(h)));
+                .write_u64(single_lane(|h| op.hash_kernel_fields(h)));
         }
     }
 
@@ -1010,6 +991,11 @@ pub(crate) fn execute_replay_with_tail<T>(
     for &t in plan.target_positions.iter() {
         is_target[t as usize] = true;
     }
+    let mut counts = super::execution::SlotConsumers {
+        slots,
+        counts: &mut counts,
+        is_target: &is_target,
+    };
 
     // Buffers per slot, captured at each slot's caching event. Kept locally
     // (not read back through `cached`) so mid-replay releases can't drop a
@@ -1065,7 +1051,7 @@ pub(crate) fn execute_replay_with_tail<T>(
                 };
                 slot_buffers[*pos as usize] = Some(result.buffer().clone());
                 graph.set_cached_result(idx, result);
-                release_consumed(graph, slots, &mut counts, &is_target, consumed);
+                release_slots(graph, &mut counts, consumed);
             }
             PlanStep::SharedAlias {
                 pos,
@@ -1078,7 +1064,7 @@ pub(crate) fn execute_replay_with_tail<T>(
                     .expect("flush replay: shared representative must be cached");
                 slot_buffers[*pos as usize] = Some(result.buffer().clone());
                 graph.set_cached_result(idx, result.clone());
-                release_consumed(graph, slots, &mut counts, &is_target, consumed);
+                release_slots(graph, &mut counts, consumed);
             }
             PlanStep::CopyAssign { pos, consumed } => {
                 let idx = slots[*pos as usize];
@@ -1097,7 +1083,7 @@ pub(crate) fn execute_replay_with_tail<T>(
                 slot_buffers[*pos as usize] = Some(output.buffer().clone());
                 graph.set_cached_result(idx, output);
                 commands.extend(copies.into_iter().map(CommandRecord::CopyBuffer));
-                release_consumed(graph, slots, &mut counts, &is_target, consumed);
+                release_slots(graph, &mut counts, consumed);
             }
             PlanStep::Dispatch {
                 pos,
@@ -1158,7 +1144,7 @@ pub(crate) fn execute_replay_with_tail<T>(
                     }
                 }
                 graph.set_cached_result(idx, output_data);
-                release_consumed(graph, slots, &mut counts, &is_target, consumed);
+                release_slots(graph, &mut counts, consumed);
             }
             PlanStep::MergedDispatch {
                 outputs,
@@ -1211,7 +1197,7 @@ pub(crate) fn execute_replay_with_tail<T>(
                         }));
                     }
                 }
-                release_consumed(graph, slots, &mut counts, &is_target, consumed);
+                release_slots(graph, &mut counts, consumed);
             }
         }
     }
@@ -1281,32 +1267,16 @@ fn step_consumed(step: &PlanStep) -> &[u32] {
     }
 }
 
-/// The exact release predicate of `Resolver::release_dead_intermediates`,
-/// evaluated live against the current graph: clear `cached` only when the
-/// last recorded consumer ran AND the node is not a flush target AND no
-/// user-held lazy tensor still transitively depends on it. Because
-/// `has_live_lazy_descendant` is consulted at replay time, reference-count
-/// drift invisible to the structural fingerprint is handled exactly as a
-/// full resolve would handle it.
-fn release_consumed(
+/// Release the plan slots one step consumed, evaluating the live release
+/// predicate against the current graph.
+fn release_slots(
     graph: &mut ComputeGraphInner,
-    slots: &[NodeIndex],
-    counts: &mut [u32],
-    is_target: &[bool],
+    counts: &mut super::execution::SlotConsumers<'_>,
     consumed: &[u32],
 ) {
-    for &c in consumed {
-        let c = c as usize;
-        let count = &mut counts[c];
-        *count = count.saturating_sub(1);
-        if *count == 0
-            && !is_target[c]
-            && !graph.has_live_lazy_descendant(slots[c])
-            && let Some(node) = graph.nodes.nodes.node_weight_mut(slots[c])
-        {
-            node.cached = None;
-        }
-    }
+    super::execution::release_consumed(graph, counts, None, |release| {
+        consumed.iter().copied().for_each(release)
+    });
 }
 
 /// Encode and submit the replayed command stream with the same pass/submit
@@ -1327,6 +1297,7 @@ fn encode_commands(
         device,
         commands,
         total_kernels,
+        None,
         command_encoder,
         |encoder, wait| {
             device.wgpu_queue().submit(Some(encoder.finish()));

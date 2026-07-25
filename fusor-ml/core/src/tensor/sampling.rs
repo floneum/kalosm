@@ -208,6 +208,7 @@ fn encode_top_k_attempt(
     };
     let (chunk_ids, chunk_values) = crate::top_k::chunk_top_k_pair_data_with_encoder(
         input,
+        None,
         candidate_count,
         output_per_chunk,
         Some(encoder),

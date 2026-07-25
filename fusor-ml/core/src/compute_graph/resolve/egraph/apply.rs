@@ -1,20 +1,21 @@
 //! Delta application: write extraction's non-identity selections back onto
 //! the execution graph.
 //!
-//! Reuses `commit_recognized` — the destructive optimizer's own commit
-//! surgery — so the two invariants every rewrite maintains hold here by
-//! construction: execution-graph edges match the new payload's `inputs`, and
-//! `add_physical_dependencies` records persistent inner-graph edges (firing
-//! the flush-replay recording hook identically). Killed producers fall out
-//! through `remove_node_if_dead`, mirroring extraction's kill cascade.
+//! [`Resolver::commit_recognized`] is the one commit surgery — the pre-ingest
+//! recognizers land their clusters through it too — so the two invariants
+//! every rewrite maintains hold by construction: execution-graph edges match
+//! the new payload's `inputs`, and `add_physical_dependencies` records
+//! persistent inner-graph edges (firing the flush-replay recording hook
+//! identically). Killed producers fall out through `remove_node_if_dead`,
+//! mirroring extraction's kill cascade.
 
 use egg::Language;
 
-use super::super::Resolver;
+use super::super::{ExecutionNodeIndex, ExecutionVariant, Resolver};
 use super::EGraphDriver;
 use super::extract::Extraction;
 use super::interner::{rebind_variant_dependencies, variant_dependencies};
-use crate::compute_graph::ComputeGraphInner;
+use crate::compute_graph::{ComputeGraphInner, NodeIndex};
 
 impl Resolver {
     pub(super) fn apply_egraph_deltas(
@@ -67,5 +68,39 @@ impl Resolver {
             applied += 1;
         }
         applied
+    }
+
+    /// Replace a rewritten node's variant: drop every edge from the form it
+    /// replaces, wire the operation's dependencies directly, and let the
+    /// now-unconsumed producers fall out of the execution graph.
+    pub(in super::super) fn commit_recognized(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        node_idx: ExecutionNodeIndex,
+        dependencies: &[NodeIndex],
+        variant: ExecutionVariant,
+    ) {
+        self.execution_graph[node_idx].variant = variant;
+
+        let previous: Vec<ExecutionNodeIndex> = self
+            .execution_graph
+            .neighbors_directed(node_idx, petgraph::Direction::Incoming)
+            .collect();
+        for &prev in &previous {
+            if let Some(edge) = self.execution_graph.find_edge(prev, node_idx) {
+                self.execution_graph.remove_edge(edge);
+            }
+        }
+        for &dependency in dependencies {
+            if let Some(exec) = self.get_input_node_in_exec_graph(dependency)
+                && self.execution_graph.find_edge(exec, node_idx).is_none()
+            {
+                self.execution_graph.add_edge(exec, node_idx, ());
+            }
+        }
+        self.add_physical_dependencies(graph, node_idx, dependencies);
+        for prev in previous {
+            self.remove_node_if_dead(prev);
+        }
     }
 }

@@ -24,9 +24,8 @@ fn keepdim_scalar_chain_sandwich_fuses_to_single_kernel() {
 
         let mean = &x.sum_keepdim(2) / (h as f32);
         let centered = &x - &mean.broadcast_as([b, s, h]);
-        assert_eq!(
-            centered.count_kernels_to_resolve(),
-            1,
+        assert!(
+            centered.resolves_in::<1>(),
             "keepdim mean chain must fold into one row program"
         );
 

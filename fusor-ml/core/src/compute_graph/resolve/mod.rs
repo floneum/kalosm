@@ -14,7 +14,7 @@ use web_time::{Duration, Instant};
 use crate::{
     DataTypeEnum, Layout,
     mir::{inputs::MirValue, kernel_backend::PreparedDirectDispatch, operation::Operation},
-    nary_wise::{ElementwiseOperation, ExtractedUnaryChain, NaryExpr, NaryOp, NaryScalar},
+    nary_wise::{ElementwiseOperation, NaryExpr, NaryOp, NaryScalar},
     quantized::matmul::QMatMulOperation,
     tensor::TensorData,
 };
@@ -34,17 +34,18 @@ mod cluster_match;
 mod egraph;
 mod execution;
 pub(crate) mod flush_replay;
-mod fold_views;
-mod fusion_basic;
-mod fusion_matmul;
 mod fusion_region;
 mod fusion_row;
+#[cfg(test)]
+mod key_goldens;
 pub(crate) mod merge_horizontal;
-mod plan_cache;
+pub(crate) mod plan_cache;
 mod queue_executor;
 mod recognize;
 mod recognize_attention;
 mod recognize_cat;
+#[cfg(test)]
+mod recognize_gates;
 mod run;
 
 pub(crate) use egraph::FusionPlanStore;
@@ -188,6 +189,46 @@ pub(crate) enum ExecutionVariant {
     Attention(crate::flash_attention::FlashAttentionOperation),
 }
 
+impl ExecutionVariant {
+    /// Dependencies in dependency-slot order: the order the e-graph mirrors
+    /// as e-node children. Tensor leaves have none.
+    pub(super) fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
+        match self {
+            Self::Tensor(_) => {}
+            Self::QMatrix(op) => op.visit_dependencies(f),
+            Self::Elementwise(op) => op.visit_dependencies(f),
+            Self::Reduce(op) => op.visit_dependencies(f),
+            Self::View(op) => op.visit_dependencies(f),
+            Self::Assign(op) => op.visit_dependencies(f),
+            Self::Region(op) => op.visit_dependencies(f),
+            Self::MatMul(op) => op.visit_dependencies(f),
+            Self::QMatMul(op) => op.visit_dependencies(f),
+            Self::QEmbedding(op) => op.visit_dependencies(f),
+            Self::RowProgram(op) => op.visit_dependencies(f),
+            Self::Attention(op) => op.visit_dependencies(f),
+        }
+    }
+
+    /// The same slots as [`Self::visit_dependencies`], in the same order, as
+    /// rebindable references.
+    pub(super) fn visit_dependencies_mut(&mut self, f: &mut dyn FnMut(&mut NodeIndex)) {
+        match self {
+            Self::Tensor(_) => {}
+            Self::QMatrix(op) => op.visit_dependencies_mut(f),
+            Self::Elementwise(op) => op.visit_dependencies_mut(f),
+            Self::Reduce(op) => op.visit_dependencies_mut(f),
+            Self::View(op) => op.visit_dependencies_mut(f),
+            Self::Assign(op) => op.visit_dependencies_mut(f),
+            Self::Region(op) => op.visit_dependencies_mut(f),
+            Self::MatMul(op) => op.visit_dependencies_mut(f),
+            Self::QMatMul(op) => op.visit_dependencies_mut(f),
+            Self::QEmbedding(op) => op.visit_dependencies_mut(f),
+            Self::RowProgram(op) => op.visit_dependencies_mut(f),
+            Self::Attention(op) => op.visit_dependencies_mut(f),
+        }
+    }
+}
+
 impl From<ComputeGraphNodeVariant> for ExecutionVariant {
     fn from(variant: ComputeGraphNodeVariant) -> Self {
         match variant {
@@ -220,12 +261,12 @@ fn padded_query_buffer_size(size: u64) -> u64 {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn print_gpu_kernel_profile(
+fn collect_gpu_kernel_profile(
     records: &[DispatchMetadata],
     timestamps: &[u64],
     timestamp_period_ns: f64,
-    timestamp_mode: &str,
-) {
+    timestamp_mode: &'static str,
+) -> crate::KernelProfile {
     let mut category_profile = FxHashMap::<String, KernelProfileAggregate>::default();
     let mut name_profile = FxHashMap::<String, KernelProfileAggregate>::default();
     let mut accounted_ns = 0.0;
@@ -251,44 +292,67 @@ fn print_gpu_kernel_profile(
         _ => 0.0,
     };
 
-    let mut categories = category_profile
-        .into_iter()
-        .map(|(name, aggregate)| {
-            (
+    let rows = |profile: FxHashMap<String, KernelProfileAggregate>| {
+        let mut rows = profile
+            .into_iter()
+            .map(|(name, aggregate)| crate::KernelProfileRow {
                 name,
-                aggregate.count,
-                aggregate.total_ns / 1_000_000.0,
-                aggregate.total_ns / aggregate.count as f64 / 1_000.0,
-                aggregate.max_ns / 1_000.0,
-            )
-        })
-        .collect::<Vec<_>>();
-    categories.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                count: aggregate.count,
+                total_ms: aggregate.total_ns / 1_000_000.0,
+                average_us: aggregate.total_ns / aggregate.count as f64 / 1_000.0,
+                max_us: aggregate.max_ns / 1_000.0,
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| {
+            b.total_ms
+                .partial_cmp(&a.total_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows
+    };
+    let categories = rows(category_profile);
+    let mut top_names = rows(name_profile);
+    top_names.truncate(32);
 
-    let mut names = name_profile
-        .into_iter()
-        .map(|(name, aggregate)| {
-            (
-                name,
-                aggregate.count,
-                aggregate.total_ns / 1_000_000.0,
-                aggregate.total_ns / aggregate.count as f64 / 1_000.0,
-                aggregate.max_ns / 1_000.0,
-            )
-        })
-        .collect::<Vec<_>>();
-    names.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-    names.truncate(32);
+    let profile = crate::KernelProfile {
+        timestamp_mode,
+        kernels: records.len(),
+        accounted_ms: accounted_ns / 1_000_000.0,
+        span_ms: span_ns / 1_000_000.0,
+        timestamp_period_ns,
+        categories,
+        top_names,
+    };
+    log_gpu_kernel_profile(&profile);
+    profile
+}
 
+#[cfg(not(target_arch = "wasm32"))]
+fn log_gpu_kernel_profile(profile: &crate::KernelProfile) {
+    let tuples = |rows: &[crate::KernelProfileRow]| {
+        rows.iter()
+            .map(|row| {
+                (
+                    row.name.clone(),
+                    row.count,
+                    row.total_ms,
+                    row.average_us,
+                    row.max_us,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
     tracing::info!(
         "resolve_gpu_kernel_profile mode={} kernels={} accounted_ms={:.3} span_ms={:.3} timestamp_period_ns={:.3}",
-        timestamp_mode,
-        records.len(),
-        accounted_ns / 1_000_000.0,
-        span_ns / 1_000_000.0,
-        timestamp_period_ns
+        profile.timestamp_mode,
+        profile.kernels,
+        profile.accounted_ms,
+        profile.span_ms,
+        profile.timestamp_period_ns
     );
+    let categories = tuples(&profile.categories);
     tracing::info!("resolve_gpu_kernel_categories {categories:?}");
+    let names = tuples(&profile.top_names);
     tracing::info!("resolve_gpu_kernel_top_names {names:?}");
 }
 

@@ -8,78 +8,84 @@ pub(super) struct OptimizePhases {
     pub(super) physical: Duration,
 }
 
+/// The remaining-consumer bookkeeping a release pass decrements. A live
+/// resolve counts by inner node index; a replayed plan counts by plan slot.
+pub(super) trait ConsumerCounts {
+    type Key: Copy;
+
+    /// Drop one consumer of `key`, returning the node whose cached buffer is
+    /// now dead: `None` while consumers remain, while the key is untracked,
+    /// or when the node is an output of this execution.
+    fn consume(&mut self, key: Self::Key) -> Option<NodeIndex>;
+}
+
+pub(super) struct NodeConsumers<'a> {
+    pub(super) counts: &'a mut FxHashMap<NodeIndex, usize>,
+    pub(super) targets: &'a FxHashSet<NodeIndex>,
+}
+
+impl ConsumerCounts for NodeConsumers<'_> {
+    type Key = NodeIndex;
+
+    fn consume(&mut self, node: NodeIndex) -> Option<NodeIndex> {
+        let count = self.counts.get_mut(&node)?;
+        *count = count.saturating_sub(1);
+        (*count == 0 && !self.targets.contains(&node)).then_some(node)
+    }
+}
+
+pub(super) struct SlotConsumers<'a> {
+    pub(super) slots: &'a [NodeIndex],
+    pub(super) counts: &'a mut [u32],
+    pub(super) is_target: &'a [bool],
+}
+
+impl ConsumerCounts for SlotConsumers<'_> {
+    type Key = u32;
+
+    fn consume(&mut self, slot: u32) -> Option<NodeIndex> {
+        let slot = slot as usize;
+        let count = &mut self.counts[slot];
+        *count = count.saturating_sub(1);
+        (*count == 0 && !self.is_target[slot]).then(|| self.slots[slot])
+    }
+}
+
+/// Free the cached buffers of the dependencies `visit` yields. A buffer is
+/// released once all consumers within this execution have been processed and
+/// no user-held lazy tensor still transitively depends on it. The descendant
+/// check must include `live_descendant_count`, not just direct references:
+/// clearing `cached` on a node that still has an alive-uncached descendant
+/// flips it back to alive-uncached without propagating the transition,
+/// undercounting every ancestor's descendant counter. Because
+/// `has_live_lazy_descendant` is consulted here, reference-count drift
+/// invisible to a replayed plan's structural fingerprint is handled exactly
+/// as a full resolve handles it.
+pub(super) fn release_consumed<C: ConsumerCounts>(
+    graph: &mut ComputeGraphInner,
+    counts: &mut C,
+    mut ledger: Option<&mut super::alloc_reuse::BufferLedger>,
+    visit: impl FnOnce(&mut dyn FnMut(C::Key)),
+) {
+    visit(&mut |key| {
+        let Some(dep) = counts.consume(key) else {
+            return;
+        };
+        if graph.has_live_lazy_descendant(dep) {
+            return;
+        }
+        if let Some(ledger) = ledger.as_deref_mut()
+            && let Some(cached) = graph.get_cached_result(dep)
+        {
+            ledger.note_released(dep, cached);
+        }
+        if let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
+            node.cached = None;
+        }
+    });
+}
+
 impl Resolver {
-    pub(super) fn release_dead_intermediates(
-        graph: &mut ComputeGraphInner,
-        produced_ops: &[&QueuedOperation],
-        remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
-        targets: &FxHashSet<NodeIndex>,
-        ledger: &mut super::alloc_reuse::BufferLedger,
-    ) {
-        for op in produced_ops {
-            op.visit_dependencies(&mut |dep| {
-                if let Some(count) = remaining_consumers.get_mut(&dep) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0
-                        && !targets.contains(&dep)
-                        && !graph.has_live_lazy_descendant(dep)
-                    {
-                        if let Some(cached) = graph.get_cached_result(dep) {
-                            ledger.note_released(dep, cached);
-                        }
-                        // All consumers within this execution have been
-                        // processed and no user-held lazy tensor still
-                        // transitively depends on `dep` — free the cached
-                        // buffer. The descendant check must include
-                        // `live_descendant_count`, not just direct
-                        // references: clearing `cached` on a node that still
-                        // has an alive-uncached descendant flips it back to
-                        // alive-uncached without propagating the transition,
-                        // undercounting every ancestor's descendant counter.
-                        if let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
-                            node.cached = None;
-                        }
-                    }
-                }
-            });
-        }
-    }
-
-    /// Like `release_dead_intermediates` but uses the compute graph's
-    /// `visit_dependencies` instead of an Operation's. Used for map-layout
-    /// and resize nodes that are resolved immediately without being lowered
-    /// to an Operation.
-    pub(super) fn release_dead_intermediates_from_graph(
-        graph: &mut ComputeGraphInner,
-        produced_nodes: &[NodeIndex],
-        remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
-        targets: &FxHashSet<NodeIndex>,
-        ledger: &mut super::alloc_reuse::BufferLedger,
-    ) {
-        for &produced in produced_nodes {
-            let mut deps = Vec::new();
-            graph.visit_dependencies(produced, &mut |dep| {
-                deps.push(dep);
-            });
-            for dep in deps {
-                if let Some(count) = remaining_consumers.get_mut(&dep) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0
-                        && !targets.contains(&dep)
-                        && !graph.has_live_lazy_descendant(dep)
-                    {
-                        if let Some(cached) = graph.get_cached_result(dep) {
-                            ledger.note_released(dep, cached);
-                        }
-                        if let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
-                            node.cached = None;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     pub(super) fn try_prepare_in_place_slice_assign_copy(
         graph: &ComputeGraphInner,
         operation: &crate::slice_assign::SliceAssignOperation,
@@ -304,37 +310,16 @@ impl Resolver {
         self.node_mapping.get(&inner_input).copied()
     }
 
-    /// Walk through view nodes from `inner` down to the first non-view
-    /// node, composing each view's collapsed stage stack. Public tensor ops
-    /// collapse into single view nodes at construction, but composed
-    /// clusters (attention's attached GQA/transpose views) still layer view
-    /// nodes deliberately. Returns the base node and the composed layout
-    /// over the base's logical value space; the layout is `None` when
-    /// `inner` is not a view (identity). Views that don't collapse or
-    /// compose (or carry a fill region) act as chain breaks: the walk stops
-    /// without seeing through them.
-    pub(super) fn walk_view_chain(&self, mut inner: NodeIndex) -> (NodeIndex, Option<Layout>) {
-        let mut composed: Option<Layout> = None;
-        loop {
-            let Some(exec) = self.get_input_node_in_exec_graph(inner) else {
-                return (inner, composed);
-            };
+    /// [`egraph::compose::walk_view_chain`] over the execution graph's
+    /// current forms.
+    pub(super) fn walk_view_chain(&self, inner: NodeIndex) -> (NodeIndex, Option<Layout>) {
+        egraph::compose::walk_view_chain(inner, |inner| {
+            let exec = self.get_input_node_in_exec_graph(inner)?;
             let ExecutionVariant::View(view) = &self.execution_graph[exec].variant else {
-                return (inner, composed);
+                return None;
             };
-            let Some(collapsed) = view.composed_layout() else {
-                return (inner, composed);
-            };
-            let next = match &composed {
-                None => collapsed,
-                Some(outer) => match crate::view::compose_layouts(outer, &collapsed) {
-                    Some(layout) => layout,
-                    None => return (inner, composed),
-                },
-            };
-            composed = Some(next);
-            inner = view.input;
-        }
+            Some((view.composed_layout()?, view.input))
+        })
     }
 
     /// The layout a (possibly chained-view) node presents over its base

@@ -127,31 +127,14 @@ fn rewrite_slots(expr: &NaryExpr, rewrites: &[SlotRewrite]) -> Option<NaryExpr> 
 
 /// Remap construction-time scalar slots to their final indices.
 fn finalize_slots(expr: &NaryExpr, external_count: usize) -> NaryExpr {
-    match expr {
-        NaryExpr::Op { children, function } => NaryExpr::Op {
-            children: children
-                .iter()
-                .map(|child| finalize_slots(child, external_count))
-                .collect(),
-            function: function.clone(),
-        },
-        NaryExpr::IndexedInput { input_idx, indices } => {
-            let input_idx = if *input_idx >= SCALAR_SLOT_BASE {
-                external_count + (*input_idx - SCALAR_SLOT_BASE)
-            } else {
-                *input_idx
-            };
-            NaryExpr::IndexedInput {
-                input_idx,
-                indices: indices
-                    .iter()
-                    .map(|index| finalize_slots(index, external_count))
-                    .collect(),
-            }
-        }
-        NaryExpr::DimIndex(dim) => NaryExpr::DimIndex(*dim),
-        NaryExpr::Scalar(value) => NaryExpr::Scalar(*value),
-    }
+    egraph::compose::map_loads(expr, &mut |input_idx, _, indices| {
+        let input_idx = if input_idx >= SCALAR_SLOT_BASE {
+            external_count + (input_idx - SCALAR_SLOT_BASE)
+        } else {
+            input_idx
+        };
+        NaryExpr::IndexedInput { input_idx, indices }
+    })
 }
 
 impl Resolver {

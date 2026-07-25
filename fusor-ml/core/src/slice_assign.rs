@@ -137,6 +137,11 @@ impl Operation for SliceAssignOperation {
         f(self.input);
     }
 
+    fn visit_dependencies_mut(&mut self, f: &mut dyn FnMut(&mut NodeIndex)) {
+        f(&mut self.value);
+        f(&mut self.input);
+    }
+
     fn inputs(&self, nodes: &ComputeGraphInner) -> Vec<MirValue> {
         // Pass the ORIGINAL input tensor (not sliced) and the value tensor
         let input = nodes.get_cached_result(self.input).unwrap();

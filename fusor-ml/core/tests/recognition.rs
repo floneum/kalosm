@@ -52,7 +52,7 @@ fn composed_dense_matmul_resolves_to_single_kernel() {
         let a = Tensor::new::<f32, 2, _>(&device, &[[1.0f32, 2.0], [3.0, 4.0]]);
         let b = Tensor::new::<f32, 2, _>(&device, &[[5.0f32, 6.0], [7.0, 8.0]]);
         let out = a.mat_mul(&b);
-        assert_eq!(out.count_kernels_to_resolve(), 1, "dense matmul");
+        assert!(out.resolves_in::<1>(), "dense matmul");
         let slice = out.as_slice::<2, f32>().await.unwrap();
         assert_eq!(slice[[0, 0]], 19.0);
         assert_eq!(slice[[0, 1]], 22.0);
@@ -68,7 +68,7 @@ fn composed_dense_matmul_resolves_to_single_kernel() {
             &[[[1.0f32, 0.0], [0.0, 1.0]], [[2.0, 0.0], [0.0, 2.0]]],
         );
         let out = a.mat_mul(&b);
-        assert_eq!(out.count_kernels_to_resolve(), 1, "batched matmul");
+        assert!(out.resolves_in::<1>(), "batched matmul");
         let slice = out.as_slice::<3, f32>().await.unwrap();
         assert_eq!(slice[[0, 0, 0]], 1.0);
         assert_eq!(slice[[1, 0, 0]], 10.0);
@@ -95,9 +95,8 @@ fn cooperative_dense_matmul_keeps_unary_chains_in_one_kernel() {
         let b = Tensor::from_slice(&device, [K, N], &b_data);
         let matmul = (-a).mat_mul(&b.sin());
         let out = matmul.cos() + 1.0;
-        assert_eq!(
-            out.count_kernels_to_resolve(),
-            1,
+        assert!(
+            out.resolves_in::<1>(),
             "cooperative matmul should host both pre and post chains"
         );
 
@@ -130,7 +129,7 @@ fn composed_qmatmul_resolves_to_single_kernel() {
         let w = f32_weight(&device, 4, K);
         let x = Tensor::new::<f32, 2, _>(&device, &[[1.0f32, 0.5, -1.0, 2.0, 0.0, 1.0, -0.5, 3.0]]);
         let out = x.q_mat_mul(&w);
-        assert_eq!(out.count_kernels_to_resolve(), 1, "bare quantized matmul");
+        assert!(out.resolves_in::<1>(), "bare quantized matmul");
     });
 }
 
@@ -150,11 +149,7 @@ fn composed_q8_qmatmul_with_epilogue_resolves_to_single_kernel() {
         let x = Tensor::from_slice(&device, [1, K], &x_values);
         let bias = Tensor::from_slice(&device, [1, N], &bias_values);
         let out = x.q_mat_mul(&w) + &bias;
-        assert_eq!(
-            out.count_kernels_to_resolve(),
-            1,
-            "q8_0 matmul + bias epilogue"
-        );
+        assert!(out.resolves_in::<1>(), "q8_0 matmul + bias epilogue");
 
         let slice = out.as_slice::<2, f32>().await.unwrap();
         for col in 0..N {
@@ -215,7 +210,7 @@ fn composed_softmax_resolves_to_fused_kernel() {
         let values: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.1).sin()).collect();
         let x = Tensor::from_slice(&device, [2, 128], &values);
         let out = x.softmax(1);
-        assert_eq!(out.count_kernels_to_resolve(), 1, "single-pass softmax");
+        assert!(out.resolves_in::<1>(), "single-pass softmax");
 
         let slice = out.as_slice::<2, f32>().await.unwrap();
         for row in 0..2 {
@@ -248,7 +243,7 @@ fn composed_rms_norm_with_bias_resolves_to_fused_kernel() {
         let weight = Tensor::from_slice(&device, [4], &[0.5f32, 1.0, 1.5, 2.0]);
         let bias = Tensor::from_slice(&device, [4], &[0.1f32, -0.2, 0.3, -0.4]);
         let out = x.rms_norm_fused(&weight, Some(&bias), 1e-5);
-        assert_eq!(out.count_kernels_to_resolve(), 1, "rms norm with bias");
+        assert!(out.resolves_in::<1>(), "rms norm with bias");
 
         let slice = out.as_slice::<2, f32>().await.unwrap();
         let mean_square = (1.0 + 4.0 + 9.0 + 16.0) / 4.0;
@@ -288,9 +283,8 @@ fn composed_attention_resolves_to_attention_kernel() {
         let scale = 1.0 / (d as f32).sqrt();
 
         let out = q.attention(&k, &v, scale, None);
-        assert_eq!(
-            out.count_kernels_to_resolve(),
-            1,
+        assert!(
+            out.resolves_in::<1>(),
             "gqa decode attention should recognize as one fused attention kernel"
         );
         let slice = out.as_slice::<4, f32>().await.unwrap();

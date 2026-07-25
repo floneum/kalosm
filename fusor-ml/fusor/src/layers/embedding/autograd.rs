@@ -96,7 +96,10 @@ where
     u32: crate::CastTo<T> + crate::CastTensor<T>,
 {
     /// Looks up embeddings for an index tensor, appending the embedding dimension.
-    pub fn forward<const N: usize, const M: usize>(&self, indices: &RawTensor<N, u32>) -> Tensor<M, T>
+    pub fn forward<const N: usize, const M: usize>(
+        &self,
+        indices: &RawTensor<N, u32>,
+    ) -> Tensor<M, T>
     where
         crate::gpu::Tensor<N, u32>: crate::gpu::NextRank<M, u32>,
     {

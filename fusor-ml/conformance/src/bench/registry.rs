@@ -64,6 +64,23 @@ macro_rules! registry {
             }
         }
 
+        #[cfg(feature = "burn-bench")]
+        fn burn_cases_for_suite(name: &str) -> Option<Vec<BenchmarkCase>> {
+            match name {
+                $(
+                    concat!("burn::", stringify!($case)) => Some(vec![
+                        crate::bench::burn::$case(),
+                    ]),
+                )*
+                _ => None,
+            }
+        }
+
+        #[cfg(not(feature = "burn-bench"))]
+        fn burn_cases_for_suite(_name: &str) -> Option<Vec<BenchmarkCase>> {
+            None
+        }
+
         #[cfg(test)]
         mod generated_tests {
             use super::*;
@@ -112,64 +129,21 @@ macro_rules! registry {
                 }
             )*
         }
-    };
-}
 
-#[cfg(feature = "burn-bench")]
-fn burn_cases_for_suite(name: &str) -> Option<Vec<BenchmarkCase>> {
-    match name {
-        "burn::elementwise_add_square" => Some(vec![crate::bench::burn::elementwise_add_square()]),
-        "burn::elementwise_mul_rank4" => Some(vec![crate::bench::burn::elementwise_mul_rank4()]),
-        "burn::unary_trig_chain" => Some(vec![crate::bench::burn::unary_trig_chain()]),
-        "burn::activation_gelu" => Some(vec![crate::bench::burn::activation_gelu()]),
-        "burn::broadcast_add" => Some(vec![crate::bench::burn::broadcast_add()]),
-        "burn::transpose_then_elementwise" => {
-            Some(vec![crate::bench::burn::transpose_then_elementwise()])
-        }
-        "burn::reduction_sum_last_dim" => Some(vec![crate::bench::burn::reduction_sum_last_dim()]),
-        "burn::reduction_max_middle_axis" => {
-            Some(vec![crate::bench::burn::reduction_max_middle_axis()])
-        }
-        "burn::softmax_last_dim" => Some(vec![crate::bench::burn::softmax_last_dim()]),
-        "burn::softmax_middle_axis" => Some(vec![crate::bench::burn::softmax_middle_axis()]),
-        "burn::layer_norm_last_dim" => Some(vec![crate::bench::burn::layer_norm_last_dim()]),
-        "burn::rms_norm_fused" => Some(vec![crate::bench::burn::rms_norm_fused()]),
-        "burn::dense_matmul_square" => Some(vec![crate::bench::burn::dense_matmul_square()]),
-        "burn::dense_batched_matmul" => Some(vec![crate::bench::burn::dense_batched_matmul()]),
-        "burn::conv1d_small" => Some(vec![crate::bench::burn::conv1d_small()]),
-        "burn::top_k_large" => Some(vec![crate::bench::burn::top_k_large()]),
-        "burn::top_k_qwen_vocab" => Some(vec![crate::bench::burn::top_k_qwen_vocab()]),
-        "burn::q8_0_qgemv" => Some(vec![crate::bench::burn::q8_0_qgemv()]),
-        "burn::q4k_qgemv" => Some(vec![crate::bench::burn::q4k_qgemv()]),
-        "burn::q4k_paired_silu" => Some(vec![crate::bench::burn::q4k_paired_silu()]),
-        "burn::attention_small" => Some(vec![crate::bench::burn::attention_small()]),
-        "burn::attention_causal_small" => Some(vec![crate::bench::burn::attention_causal_small()]),
-        "burn::rope_fused_decode" => Some(vec![crate::bench::burn::rope_fused_decode()]),
-        _ => None,
-    }
-}
+        #[cfg(all(test, feature = "burn-bench"))]
+        mod burn_generated_tests {
+            use super::*;
 
-#[cfg(not(feature = "burn-bench"))]
-fn burn_cases_for_suite(_name: &str) -> Option<Vec<BenchmarkCase>> {
-    None
-}
-
-#[cfg(all(test, feature = "burn-bench"))]
-mod burn_generated_tests {
-    use super::*;
-
-    async fn gpu_device() -> Option<Device> {
-        match Device::gpu().await {
-            Ok(device) => Some(device),
-            Err(err) => {
-                tracing::warn!("skipping Burn benchmark smoke test: {err}");
-                None
+            async fn gpu_device() -> Option<Device> {
+                match Device::gpu().await {
+                    Ok(device) => Some(device),
+                    Err(err) => {
+                        tracing::warn!("skipping Burn benchmark smoke test: {err}");
+                        None
+                    }
+                }
             }
-        }
-    }
 
-    macro_rules! burn_tests {
-        ($($case:ident),* $(,)?) => {
             $(
                 #[allow(clippy::await_holding_lock)]
                 #[tokio::test]
@@ -199,34 +173,8 @@ mod burn_generated_tests {
                     }
                 }
             )*
-        };
-    }
-
-    burn_tests! {
-        elementwise_add_square,
-        elementwise_mul_rank4,
-        unary_trig_chain,
-        activation_gelu,
-        broadcast_add,
-        transpose_then_elementwise,
-        reduction_sum_last_dim,
-        reduction_max_middle_axis,
-        softmax_last_dim,
-        softmax_middle_axis,
-        layer_norm_last_dim,
-        rms_norm_fused,
-        dense_matmul_square,
-        dense_batched_matmul,
-        conv1d_small,
-        top_k_large,
-        top_k_qwen_vocab,
-        q8_0_qgemv,
-        q4k_qgemv,
-        q4k_paired_silu,
-        attention_small,
-        attention_causal_small,
-        rope_fused_decode,
-    }
+        }
+    };
 }
 
 registry! {

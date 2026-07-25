@@ -12,6 +12,7 @@ mod direct_kernel;
 mod disk_cache;
 mod dispatch;
 mod plan_cache;
+mod two_lane;
 
 pub use buffer_pool::{BufferPool, BufferPoolCounters};
 pub use cache::{
@@ -25,6 +26,7 @@ pub use dispatch::{
     dynamic_kernel_from_ir, run_direct_kernel, run_kernel, three_buffer_pipeline_from_ir,
 };
 pub use plan_cache::KernelPlanCache;
+pub use two_lane::{TwoLaneHasher, single_lane, two_lane_salted};
 
 /// Diagnostic: total shader-module / compute-pipeline compilations performed at
 /// runtime. Each WGSL shader-module and pipeline creation bumps this counter.

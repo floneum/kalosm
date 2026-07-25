@@ -26,6 +26,11 @@ const DIRECT_DYNAMIC_BIND_GROUP_CACHE_SIZE: usize = 512;
 
 /// Content-addressed key used to dedupe compiled kernel modules, shader
 /// modules, and pipelines across dispatches of the same kernel.
+///
+/// Built on the canonical two-lane hash (see [`crate::two_lane_salted`]);
+/// trusted without exact verification, so the hashed inputs must cover every
+/// fact that changes generated source or binding layout — a collision or an
+/// omitted field both mean dispatching the wrong pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct KernelCacheKey([u64; 2]);
 
@@ -39,12 +44,7 @@ impl KernelCacheKey {
     }
 
     pub fn from_hash_inputs(hash_inputs: impl Fn(&mut FxHasher)) -> Self {
-        Self(std::array::from_fn(|salt| {
-            let mut hasher = FxHasher::default();
-            (salt as u64).hash(&mut hasher);
-            hash_inputs(&mut hasher);
-            hasher.finish()
-        }))
+        Self(crate::two_lane_salted(hash_inputs))
     }
 }
 

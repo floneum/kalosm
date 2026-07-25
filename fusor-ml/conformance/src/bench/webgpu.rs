@@ -1,4 +1,9 @@
 //! Concrete WebGPU benchmark cases.
+//!
+//! Each case body is parameterized by the sizes that vary between the fixed
+//! registry entry and the per-size sweep, so both are thin callers into one
+//! implementation. The `fixed_cases!` invocation at the bottom pins the sizes
+//! every registry entry runs at.
 
 use fusor::{Device, GgmlType, MaskKind, QMatrix, Tensor};
 
@@ -22,6 +27,27 @@ fn deterministic_values(len: usize, seed: usize, scale: f32) -> Vec<f32> {
         .collect()
 }
 
+pub(super) fn topk_values(input_len: usize) -> Vec<f32> {
+    (0..input_len)
+        .map(|index| {
+            let base = ((index * 67 + 29) % 10_007) as f32 * 0.001;
+            let bump = if index % 4099 == 0 { 20.0 } else { 0.0 };
+            base + bump - (index % 13) as f32 * 0.0001
+        })
+        .collect()
+}
+
+fn rope_values(shape: [usize; 2], head_dim: usize, cos: bool) -> Vec<f32> {
+    (0..shape[0])
+        .flat_map(|i| {
+            (0..shape[1]).map(move |j| {
+                let value = (i as f32) / 10000f32.powf((2 * (j / 2)) as f32 / head_dim as f32);
+                if cos { value.cos() } else { value.sin() }
+            })
+        })
+        .collect()
+}
+
 fn shape_label(shape: &[usize]) -> String {
     shape
         .iter()
@@ -34,17 +60,37 @@ fn elements(shape: &[usize]) -> usize {
     shape.iter().product()
 }
 
-async fn materialize_inputs<const R: usize>(inputs: &[&Tensor<R, f32>]) {
-    for input in inputs {
-        input.materialize().await;
-    }
+async fn values_input<const R: usize>(
+    device: &Device,
+    shape: [usize; R],
+    values: &[f32],
+) -> Tensor<R, f32> {
+    let tensor: Tensor<R, f32> = Tensor::from_slice(device, shape, values);
+    tensor.materialize().await;
+    tensor
+}
+
+async fn input_tensor<const R: usize>(
+    device: &Device,
+    shape: [usize; R],
+    seed: usize,
+    scale: f32,
+) -> Tensor<R, f32> {
+    values_input(
+        device,
+        shape,
+        &deterministic_values(elements(&shape), seed, scale),
+    )
+    .await
 }
 
 fn bench_case(
     name: &'static str,
-    run: impl for<'a> FnOnce(&'a Device, BenchmarkConfig) -> super::CaseFuture<'a> + 'static,
+    run: impl for<'a> FnOnce(&'a Device, BenchmarkConfig, String) -> super::CaseFuture<'a> + 'static,
 ) -> BenchmarkCase {
-    BenchmarkCase::new(name, run)
+    BenchmarkCase::new(name, move |device, config| {
+        run(device, config, name.to_string())
+    })
 }
 
 pub async fn run_webgpu_bench_suite(device: &Device) -> BenchmarkResult<Vec<BenchmarkReport>> {
@@ -60,729 +106,618 @@ pub async fn run_webgpu_bench_suite_with_progress(
         .await
 }
 
-pub fn elementwise_add_square() -> BenchmarkCase {
-    bench_case("webgpu::elementwise_add_square", |device, config| {
-        Box::pin(async move {
-            let shape = [512usize, 512usize];
-            let lhs_values = deterministic_values(elements(&shape), 1, 0.01);
-            let rhs_values = deterministic_values(elements(&shape), 2, 0.008);
-            let lhs: Tensor<2, f32> = Tensor::from_slice(device, shape, &lhs_values);
-            let rhs: Tensor<2, f32> = Tensor::from_slice(device, shape, &rhs_values);
-            materialize_inputs(&[&lhs, &rhs]).await;
-
-            let samples = time_samples(config, || {
-                let output = (&lhs + &rhs).to_concrete();
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::elementwise_add_square",
-                config,
-                samples,
-                format!("{} f32 add", shape_label(&shape)),
-            ))
-        })
+pub(super) async fn elementwise_add_square_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    size: usize,
+) -> BenchmarkResult<BenchmarkReport> {
+    let shape = [size, size];
+    let lhs = input_tensor(device, shape, 1, 0.01).await;
+    let rhs = input_tensor(device, shape, 2, 0.008).await;
+    let samples = time_samples(config, || {
+        let output = (&lhs + &rhs).to_concrete();
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{} f32 add", shape_label(&shape)),
+    ))
 }
 
-pub fn elementwise_mul_rank4() -> BenchmarkCase {
-    bench_case("webgpu::elementwise_mul_rank4", |device, config| {
-        Box::pin(async move {
-            let shape = [9usize, 11usize, 32usize, 16usize];
-            let lhs_values = deterministic_values(elements(&shape), 3, 0.012);
-            let rhs_values = deterministic_values(elements(&shape), 4, 0.009);
-            let lhs: Tensor<4, f32> = Tensor::from_slice(device, shape, &lhs_values);
-            let rhs: Tensor<4, f32> = Tensor::from_slice(device, shape, &rhs_values);
-            materialize_inputs(&[&lhs, &rhs]).await;
-
-            let samples = time_samples(config, || {
-                let output = (&lhs * &rhs).to_concrete();
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::elementwise_mul_rank4",
-                config,
-                samples,
-                format!("{} f32 mul", shape_label(&shape)),
-            ))
-        })
+pub(super) async fn elementwise_mul_rank4_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    shape: [usize; 4],
+) -> BenchmarkResult<BenchmarkReport> {
+    let lhs = input_tensor(device, shape, 3, 0.012).await;
+    let rhs = input_tensor(device, shape, 4, 0.009).await;
+    let samples = time_samples(config, || {
+        let output = (&lhs * &rhs).to_concrete();
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{} f32 mul", shape_label(&shape)),
+    ))
 }
 
-pub fn unary_trig_chain() -> BenchmarkCase {
-    bench_case("webgpu::unary_trig_chain", |device, config| {
-        Box::pin(async move {
-            let shape = [384usize, 384usize];
-            let values = deterministic_values(elements(&shape), 10, 0.01);
-            let input: Tensor<2, f32> = Tensor::from_slice(device, shape, &values);
-            materialize_inputs(&[&input]).await;
-
-            let samples = time_samples(config, || {
-                let output = (input.sin() + input.cos()).to_concrete();
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::unary_trig_chain",
-                config,
-                samples,
-                format!("{} sin+cos", shape_label(&shape)),
-            ))
-        })
+pub(super) async fn unary_trig_chain_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    size: usize,
+) -> BenchmarkResult<BenchmarkReport> {
+    let shape = [size, size];
+    let input = input_tensor(device, shape, 10, 0.01).await;
+    let samples = time_samples(config, || {
+        let output = (input.sin() + input.cos()).to_concrete();
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{} sin+cos", shape_label(&shape)),
+    ))
 }
 
-pub fn activation_gelu() -> BenchmarkCase {
-    bench_case("webgpu::activation_gelu", |device, config| {
-        Box::pin(async move {
-            let shape = [512usize, 256usize];
-            let values = deterministic_values(elements(&shape), 11, 0.015);
-            let input: Tensor<2, f32> = Tensor::from_slice(device, shape, &values);
-            materialize_inputs(&[&input]).await;
-
-            let samples = time_samples(config, || {
-                let output = input.gelu();
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::activation_gelu",
-                config,
-                samples,
-                format!("{} gelu", shape_label(&shape)),
-            ))
-        })
+pub(super) async fn activation_gelu_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    shape: [usize; 2],
+) -> BenchmarkResult<BenchmarkReport> {
+    let input = input_tensor(device, shape, 11, 0.015).await;
+    let samples = time_samples(config, || {
+        let output = input.gelu();
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{} gelu", shape_label(&shape)),
+    ))
 }
 
-pub fn broadcast_add() -> BenchmarkCase {
-    bench_case("webgpu::broadcast_add", |device, config| {
-        Box::pin(async move {
-            let matrix_shape = [256usize, 512usize];
-            let vector_shape = [512usize];
-            let matrix_values = deterministic_values(elements(&matrix_shape), 12, 0.006);
-            let vector_values = deterministic_values(elements(&vector_shape), 13, 0.01);
-            let matrix: Tensor<2, f32> = Tensor::from_slice(device, matrix_shape, &matrix_values);
-            let vector: Tensor<1, f32> = Tensor::from_slice(device, vector_shape, &vector_values);
-            materialize_inputs(&[&matrix]).await;
-            materialize_inputs(&[&vector]).await;
-
-            let samples = time_samples(config, || {
-                let vector_row = vector.reshape([1, vector_shape[0]]);
-                let vector_broadcast = vector_row.broadcast_as(matrix_shape);
-                let output = (&matrix + vector_broadcast).to_concrete();
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::broadcast_add",
-                config,
-                samples,
-                "256x512 + broadcast 512",
-            ))
-        })
+pub(super) async fn broadcast_add_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    rows: usize,
+) -> BenchmarkResult<BenchmarkReport> {
+    let matrix_shape = [rows, 512usize];
+    let vector_shape = [512usize];
+    let matrix = input_tensor(device, matrix_shape, 12, 0.006).await;
+    let vector = input_tensor(device, vector_shape, 13, 0.01).await;
+    let samples = time_samples(config, || {
+        let vector_row = vector.reshape([1, vector_shape[0]]);
+        let output = (&matrix + vector_row.broadcast_as(matrix_shape)).to_concrete();
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{} + broadcast 512", shape_label(&matrix_shape)),
+    ))
 }
 
-pub fn transpose_then_elementwise() -> BenchmarkCase {
-    bench_case("webgpu::transpose_then_elementwise", |device, config| {
-        Box::pin(async move {
-            let shape = [256usize, 384usize];
-            let values = deterministic_values(elements(&shape), 14, 0.01);
-            let input: Tensor<2, f32> = Tensor::from_slice(device, shape, &values);
-            materialize_inputs(&[&input]).await;
-
-            let samples = time_samples(config, || {
-                let transposed = input.transpose(0, 1);
-                let output = (transposed.clone() * transposed).to_concrete();
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::transpose_then_elementwise",
-                config,
-                samples,
-                "256x384 transpose, square",
-            ))
-        })
+pub(super) async fn transpose_then_elementwise_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    shape: [usize; 2],
+) -> BenchmarkResult<BenchmarkReport> {
+    let input = input_tensor(device, shape, 14, 0.01).await;
+    let samples = time_samples(config, || {
+        let transposed = input.transpose(0, 1);
+        let output = (transposed.clone() * transposed).to_concrete();
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{} transpose, square", shape_label(&shape)),
+    ))
 }
 
-pub fn reduction_sum_last_dim() -> BenchmarkCase {
-    bench_case("webgpu::reduction_sum_last_dim", |device, config| {
-        Box::pin(async move {
-            let shape = [256usize, 512usize];
-            let values = deterministic_values(elements(&shape), 15, 0.004);
-            let input: Tensor<2, f32> = Tensor::from_slice(device, shape, &values);
-            materialize_inputs(&[&input]).await;
-
-            let samples = time_samples(config, || {
-                let output = input.sum::<1>(1);
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::reduction_sum_last_dim",
-                config,
-                samples,
-                format!("{} sum axis 1", shape_label(&shape)),
-            ))
-        })
+pub(super) async fn reduction_sum_last_dim_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    rows: usize,
+) -> BenchmarkResult<BenchmarkReport> {
+    let shape = [rows, 512usize];
+    let input = input_tensor(device, shape, 15, 0.004).await;
+    let samples = time_samples(config, || {
+        let output = input.sum::<1>(1);
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{} sum axis 1", shape_label(&shape)),
+    ))
 }
 
-pub fn reduction_max_middle_axis() -> BenchmarkCase {
-    bench_case("webgpu::reduction_max_middle_axis", |device, config| {
-        Box::pin(async move {
-            let shape = [64usize, 128usize, 64usize];
-            let values = deterministic_values(elements(&shape), 16, 0.004);
-            let input: Tensor<3, f32> = Tensor::from_slice(device, shape, &values);
-            materialize_inputs(&[&input]).await;
-
-            let samples = time_samples(config, || {
-                let output = input.max::<2>(1);
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::reduction_max_middle_axis",
-                config,
-                samples,
-                format!("{} max axis 1", shape_label(&shape)),
-            ))
-        })
+pub(super) async fn reduction_max_middle_axis_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    shape: [usize; 3],
+) -> BenchmarkResult<BenchmarkReport> {
+    let input = input_tensor(device, shape, 16, 0.004).await;
+    let samples = time_samples(config, || {
+        let output = input.max::<2>(1);
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{} max axis 1", shape_label(&shape)),
+    ))
 }
 
-pub fn softmax_last_dim() -> BenchmarkCase {
-    bench_case("webgpu::softmax_last_dim", |device, config| {
-        Box::pin(async move {
-            let shape = [512usize, 256usize];
-            let values = deterministic_values(elements(&shape), 5, 0.006);
-            let input: Tensor<2, f32> = Tensor::from_slice(device, shape, &values);
-            materialize_inputs(&[&input]).await;
-
-            let samples = time_samples(config, || {
-                let output = input.softmax_last_dim::<1>();
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::softmax_last_dim",
-                config,
-                samples,
-                format!("{} last-axis softmax", shape_label(&shape)),
-            ))
-        })
+pub(super) async fn softmax_last_dim_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    rows: usize,
+) -> BenchmarkResult<BenchmarkReport> {
+    let shape = [rows, 256usize];
+    let input = input_tensor(device, shape, 5, 0.006).await;
+    let samples = time_samples(config, || {
+        let output = input.softmax_last_dim::<1>();
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{} last-axis softmax", shape_label(&shape)),
+    ))
 }
 
-pub fn softmax_middle_axis() -> BenchmarkCase {
-    bench_case("webgpu::softmax_middle_axis", |device, config| {
-        Box::pin(async move {
-            let shape = [32usize, 128usize, 64usize];
-            let values = deterministic_values(elements(&shape), 17, 0.004);
-            let input: Tensor<3, f32> = Tensor::from_slice(device, shape, &values);
-            materialize_inputs(&[&input]).await;
-
-            let samples = time_samples(config, || {
-                let output = input.softmax::<2>(1);
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::softmax_middle_axis",
-                config,
-                samples,
-                format!("{} softmax axis 1", shape_label(&shape)),
-            ))
-        })
+pub(super) async fn softmax_middle_axis_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    shape: [usize; 3],
+) -> BenchmarkResult<BenchmarkReport> {
+    let input = input_tensor(device, shape, 17, 0.004).await;
+    let samples = time_samples(config, || {
+        let output = input.softmax::<2>(1);
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{} softmax axis 1", shape_label(&shape)),
+    ))
 }
 
-pub fn layer_norm_last_dim() -> BenchmarkCase {
-    bench_case("webgpu::layer_norm_last_dim", |device, config| {
-        Box::pin(async move {
-            let shape = [8usize, 128usize, 512usize];
-            let last_dim = shape[2];
-            let values = deterministic_values(elements(&shape), 18, 0.01);
-            let weight_values = deterministic_values(last_dim, 19, 0.002)
-                .into_iter()
-                .map(|value| value + 1.0)
-                .collect::<Vec<_>>();
-            let bias_values = deterministic_values(last_dim, 20, 0.001);
-            let input: Tensor<3, f32> = Tensor::from_slice(device, shape, &values);
-            let weight: Tensor<1, f32> = Tensor::from_slice(device, [last_dim], &weight_values);
-            let bias: Tensor<1, f32> = Tensor::from_slice(device, [last_dim], &bias_values);
-            materialize_inputs(&[&input]).await;
-            materialize_inputs(&[&weight, &bias]).await;
-
-            let samples = time_samples(config, || {
-                let output =
-                    input.layer_norm_last_dim_fused::<2, 1, _, _>(&weight, Some(&bias), 1.0e-5);
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::layer_norm_last_dim",
-                config,
-                samples,
-                format!("{} layer norm", shape_label(&shape)),
-            ))
-        })
+pub(super) async fn layer_norm_last_dim_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    shape: [usize; 3],
+) -> BenchmarkResult<BenchmarkReport> {
+    let last_dim = shape[2];
+    let input = input_tensor(device, shape, 18, 0.01).await;
+    let weight_values = deterministic_values(last_dim, 19, 0.002)
+        .into_iter()
+        .map(|value| value + 1.0)
+        .collect::<Vec<_>>();
+    let weight = values_input(device, [last_dim], &weight_values).await;
+    let bias = input_tensor(device, [last_dim], 20, 0.001).await;
+    let samples = time_samples(config, || {
+        let output = input.layer_norm_last_dim_fused::<2, 1, _, _>(&weight, Some(&bias), 1.0e-5);
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{} layer norm", shape_label(&shape)),
+    ))
 }
 
-pub fn rms_norm_fused() -> BenchmarkCase {
-    bench_case("webgpu::rms_norm_fused", |device, config| {
-        Box::pin(async move {
-            let shape = [8usize, 128usize, 512usize];
-            let last_dim = shape[2];
-            let values = deterministic_values(elements(&shape), 21, 0.01);
-            let weight_values = deterministic_values(last_dim, 22, 0.002)
-                .into_iter()
-                .map(|value| value + 1.0)
-                .collect::<Vec<_>>();
-            let input: Tensor<3, f32> = Tensor::from_slice(device, shape, &values);
-            let weight: Tensor<1, f32> = Tensor::from_slice(device, [last_dim], &weight_values);
-            materialize_inputs(&[&input]).await;
-            materialize_inputs(&[&weight]).await;
-
-            let samples = time_samples(config, || {
-                let output = input.rms_norm_fused_no_bias::<1, 2>(&weight, 1.0e-5);
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::rms_norm_fused",
-                config,
-                samples,
-                format!("{} rms norm", shape_label(&shape)),
-            ))
-        })
+pub(super) async fn rms_norm_fused_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    shape: [usize; 3],
+) -> BenchmarkResult<BenchmarkReport> {
+    let last_dim = shape[2];
+    let input = input_tensor(device, shape, 21, 0.01).await;
+    let weight_values = deterministic_values(last_dim, 22, 0.002)
+        .into_iter()
+        .map(|value| value + 1.0)
+        .collect::<Vec<_>>();
+    let weight = values_input(device, [last_dim], &weight_values).await;
+    let samples = time_samples(config, || {
+        let output = input.rms_norm_fused_no_bias::<1, 2>(&weight, 1.0e-5);
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{} rms norm", shape_label(&shape)),
+    ))
 }
 
-pub fn dense_matmul_square() -> BenchmarkCase {
-    bench_case("webgpu::dense_matmul_square", |device, config| {
-        Box::pin(async move {
-            let lhs_shape = [256usize, 256usize];
-            let rhs_shape = [256usize, 256usize];
-            let lhs_values = deterministic_values(elements(&lhs_shape), 6, 0.004);
-            let rhs_values = deterministic_values(elements(&rhs_shape), 7, 0.004);
-            let lhs: Tensor<2, f32> = Tensor::from_slice(device, lhs_shape, &lhs_values);
-            let rhs: Tensor<2, f32> = Tensor::from_slice(device, rhs_shape, &rhs_values);
-            materialize_inputs(&[&lhs, &rhs]).await;
-
-            let samples = time_samples(config, || {
-                let output = lhs.matmul(&rhs);
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::dense_matmul_square",
-                config,
-                samples,
-                "256x256 @ 256x256 f32",
-            ))
-        })
+pub(super) async fn dense_matmul_square_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    size: usize,
+) -> BenchmarkResult<BenchmarkReport> {
+    let lhs_shape = [size, size];
+    let rhs_shape = [size, size];
+    let lhs = input_tensor(device, lhs_shape, 6, 0.004).await;
+    let rhs = input_tensor(device, rhs_shape, 7, 0.004).await;
+    let samples = time_samples(config, || {
+        let output = lhs.matmul(&rhs);
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!(
+            "{} @ {} f32",
+            shape_label(&lhs_shape),
+            shape_label(&rhs_shape)
+        ),
+    ))
 }
 
-pub fn dense_batched_matmul() -> BenchmarkCase {
-    bench_case("webgpu::dense_batched_matmul", |device, config| {
-        Box::pin(async move {
-            let lhs_shape = [8usize, 64usize, 96usize];
-            let rhs_shape = [8usize, 96usize, 64usize];
-            let lhs_values = deterministic_values(elements(&lhs_shape), 23, 0.004);
-            let rhs_values = deterministic_values(elements(&rhs_shape), 24, 0.004);
-            let lhs: Tensor<3, f32> = Tensor::from_slice(device, lhs_shape, &lhs_values);
-            let rhs: Tensor<3, f32> = Tensor::from_slice(device, rhs_shape, &rhs_values);
-            materialize_inputs(&[&lhs, &rhs]).await;
-
-            let samples = time_samples(config, || {
-                let output = lhs.matmul(&rhs);
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::dense_batched_matmul",
-                config,
-                samples,
-                "8x64x96 @ 8x96x64 f32",
-            ))
-        })
+pub(super) async fn dense_batched_matmul_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    batch: usize,
+    m: usize,
+    k: usize,
+) -> BenchmarkResult<BenchmarkReport> {
+    let lhs_shape = [batch, m, k];
+    let rhs_shape = [batch, k, m];
+    let lhs = input_tensor(device, lhs_shape, 23, 0.004).await;
+    let rhs = input_tensor(device, rhs_shape, 24, 0.004).await;
+    let samples = time_samples(config, || {
+        let output = lhs.matmul(&rhs);
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!(
+            "{} @ {} f32",
+            shape_label(&lhs_shape),
+            shape_label(&rhs_shape)
+        ),
+    ))
 }
 
-pub fn conv1d_small() -> BenchmarkCase {
-    bench_case("webgpu::conv1d_small", |device, config| {
-        Box::pin(async move {
-            let input_shape = [4usize, 8usize, 256usize];
-            let weight_shape = [16usize, 8usize, 5usize];
-            let bias_shape = [16usize];
-            let input_values = deterministic_values(elements(&input_shape), 25, 0.01);
-            let weight_values = deterministic_values(elements(&weight_shape), 26, 0.01);
-            let bias_values = deterministic_values(elements(&bias_shape), 27, 0.001);
-            let input: Tensor<3, f32> = Tensor::from_slice(device, input_shape, &input_values);
-            let weight: Tensor<3, f32> = Tensor::from_slice(device, weight_shape, &weight_values);
-            let bias: Tensor<1, f32> = Tensor::from_slice(device, bias_shape, &bias_values);
-            materialize_inputs(&[&input]).await;
-            materialize_inputs(&[&weight]).await;
-            materialize_inputs(&[&bias]).await;
-
-            let samples = time_samples(config, || {
-                let output = input.conv(&weight, Some(&bias), [2], [1]);
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::conv1d_small",
-                config,
-                samples,
-                "4x8x256 conv 16x8x5",
-            ))
-        })
+pub(super) async fn conv1d_small_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    len: usize,
+) -> BenchmarkResult<BenchmarkReport> {
+    let input_shape = [4usize, 8usize, len];
+    let weight_shape = [16usize, 8usize, 5usize];
+    let bias_shape = [16usize];
+    let input = input_tensor(device, input_shape, 25, 0.01).await;
+    let weight = input_tensor(device, weight_shape, 26, 0.01).await;
+    let bias = input_tensor(device, bias_shape, 27, 0.001).await;
+    let samples = time_samples(config, || {
+        let output = input.conv(&weight, Some(&bias), [2], [1]);
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!(
+            "{} conv {}",
+            shape_label(&input_shape),
+            shape_label(&weight_shape)
+        ),
+    ))
 }
 
-pub fn top_k_large() -> BenchmarkCase {
-    bench_case("webgpu::top_k_large", |device, config| {
-        Box::pin(async move {
-            let input_len = 65_537usize;
-            let k = 64usize;
-            let values = (0..input_len)
-                .map(|index| {
-                    let base = ((index * 67 + 29) % 10_007) as f32 * 0.001;
-                    let bump = if index % 4099 == 0 { 20.0 } else { 0.0 };
-                    base + bump - (index % 13) as f32 * 0.0001
-                })
-                .collect::<Vec<_>>();
-            let input: Tensor<1, f32> = Tensor::from_slice(device, [input_len], &values);
-            materialize_inputs(&[&input]).await;
-
-            let samples = time_samples(config, || async {
-                let top = input.top_k_pairs(k).await?;
-                if top.len() != k {
-                    return Err(format!("top_k returned {} pairs, expected {k}", top.len()).into());
-                }
-                Ok(())
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::top_k_large",
-                config,
-                samples,
-                format!("{input_len} logits, k={k}"),
-            ))
-        })
+pub(super) async fn top_k_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    input_len: usize,
+    k: usize,
+    values: Vec<f32>,
+) -> BenchmarkResult<BenchmarkReport> {
+    let input = values_input(device, [input_len], &values).await;
+    let samples = time_samples(config, || async {
+        let top = input.top_k_pairs(k).await?;
+        if top.len() != k {
+            return Err(format!("top_k returned {} pairs, expected {k}", top.len()).into());
+        }
+        Ok(())
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{input_len} logits, k={k}"),
+    ))
 }
 
-pub fn top_k_qwen_vocab() -> BenchmarkCase {
-    bench_case("webgpu::top_k_qwen_vocab", |device, config| {
-        Box::pin(async move {
-            let input_len = 151_936usize;
-            let k = 40usize;
-            let values = deterministic_values(input_len, 28, 0.01);
-            let input: Tensor<1, f32> = Tensor::from_slice(device, [input_len], &values);
-            materialize_inputs(&[&input]).await;
-
-            let samples = time_samples(config, || async {
-                let top = input.top_k_pairs(k).await?;
-                if top.len() != k {
-                    return Err(format!("top_k returned {} pairs, expected {k}", top.len()).into());
-                }
-                Ok(())
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::top_k_qwen_vocab",
-                config,
-                samples,
-                format!("{input_len} logits, k={k}"),
-            ))
-        })
+pub(super) async fn q8_0_qgemv_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    weight_shape: [usize; 2],
+) -> BenchmarkResult<BenchmarkReport> {
+    let input_shape = [1usize, weight_shape[1]];
+    let raw_bytes = q8_0_raw_bytes(weight_shape);
+    let matrix: QMatrix = qmatrix_from_raw_bytes(device, weight_shape, &raw_bytes, GgmlType::Q8_0);
+    let input = input_tensor(device, input_shape, 8, 0.003).await;
+    let samples = time_samples(config, || {
+        let output = input.q_mat_mul(&matrix);
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!(
+            "1x{} @ Q8_0 {}",
+            weight_shape[1],
+            shape_label(&weight_shape)
+        ),
+    ))
 }
 
-pub fn q8_0_qgemv() -> BenchmarkCase {
-    bench_case("webgpu::q8_0_qgemv", |device, config| {
-        Box::pin(async move {
-            let weight_shape = [4096usize, 896usize];
-            let input_shape = [1usize, weight_shape[1]];
-            let raw_bytes = q8_0_raw_bytes(weight_shape);
-            let matrix: QMatrix =
-                qmatrix_from_raw_bytes(device, weight_shape, &raw_bytes, GgmlType::Q8_0);
-            let input_values = deterministic_values(elements(&input_shape), 8, 0.003);
-            let input: Tensor<2, f32> = Tensor::from_slice(device, input_shape, &input_values);
-            materialize_inputs(&[&input]).await;
-
-            let samples = time_samples(config, || {
-                let output = input.q_mat_mul(&matrix);
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::q8_0_qgemv",
-                config,
-                samples,
-                "1x896 @ Q8_0 4096x896",
-            ))
-        })
+pub(super) async fn q4k_qgemv_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    weight_shape: [usize; 2],
+) -> BenchmarkResult<BenchmarkReport> {
+    let input_shape = [1usize, weight_shape[1]];
+    let raw_bytes = q4k_raw_bytes(weight_shape);
+    let matrix: QMatrix = qmatrix_from_raw_bytes(device, weight_shape, &raw_bytes, GgmlType::Q4K);
+    let input = input_tensor(device, input_shape, 29, 0.003).await;
+    let samples = time_samples(config, || {
+        let output = input.q_mat_mul(&matrix);
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("1x{} @ Q4K {}", weight_shape[1], shape_label(&weight_shape)),
+    ))
 }
 
-pub fn q4k_qgemv() -> BenchmarkCase {
-    bench_case("webgpu::q4k_qgemv", |device, config| {
-        Box::pin(async move {
-            let weight_shape = [2048usize, 1024usize];
-            let input_shape = [1usize, weight_shape[1]];
-            let raw_bytes = q4k_raw_bytes(weight_shape);
-            let matrix: QMatrix =
-                qmatrix_from_raw_bytes(device, weight_shape, &raw_bytes, GgmlType::Q4K);
-            let input_values = deterministic_values(elements(&input_shape), 29, 0.003);
-            let input: Tensor<2, f32> = Tensor::from_slice(device, input_shape, &input_values);
-            materialize_inputs(&[&input]).await;
-
-            let samples = time_samples(config, || {
-                let output = input.q_mat_mul(&matrix);
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::q4k_qgemv",
-                config,
-                samples,
-                "1x1024 @ Q4K 2048x1024",
-            ))
-        })
+pub(super) async fn q4k_paired_silu_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    weight_shape: [usize; 2],
+) -> BenchmarkResult<BenchmarkReport> {
+    let input_shape = [1usize, weight_shape[1]];
+    let raw_bytes = q4k_raw_bytes(weight_shape);
+    let matrix: QMatrix = qmatrix_from_raw_bytes(device, weight_shape, &raw_bytes, GgmlType::Q4K);
+    let input = input_tensor(device, input_shape, 30, 0.003).await;
+    let samples = time_samples(config, || {
+        let pair_len = weight_shape[0] / 2;
+        let projected = input.q_mat_mul(&matrix);
+        let gate = projected
+            .narrow(fusor::D::Minus1, 0, pair_len)
+            .to_concrete();
+        let up = projected
+            .narrow(fusor::D::Minus1, pair_len, pair_len)
+            .to_concrete();
+        let output = (gate.silu() * up).to_concrete();
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!(
+            "1x{} @ paired Q4K {}",
+            weight_shape[1],
+            shape_label(&weight_shape)
+        ),
+    ))
 }
 
-pub fn q4k_paired_silu() -> BenchmarkCase {
-    bench_case("webgpu::q4k_paired_silu", |device, config| {
-        Box::pin(async move {
-            let weight_shape = [2048usize, 1024usize];
-            let input_shape = [1usize, weight_shape[1]];
-            let raw_bytes = q4k_raw_bytes(weight_shape);
-            let matrix: QMatrix =
-                qmatrix_from_raw_bytes(device, weight_shape, &raw_bytes, GgmlType::Q4K);
-            let input_values = deterministic_values(elements(&input_shape), 30, 0.003);
-            let input: Tensor<2, f32> = Tensor::from_slice(device, input_shape, &input_values);
-            materialize_inputs(&[&input]).await;
-
-            let samples = time_samples(config, || {
-                let pair_len = weight_shape[0] / 2;
-                let projected = input.q_mat_mul(&matrix);
-                let gate = projected
-                    .narrow(fusor::D::Minus1, 0, pair_len)
-                    .to_concrete();
-                let up = projected
-                    .narrow(fusor::D::Minus1, pair_len, pair_len)
-                    .to_concrete();
-                let output = (gate.silu() * up).to_concrete();
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::q4k_paired_silu",
-                config,
-                samples,
-                "1x1024 @ paired Q4K 2048x1024",
-            ))
-        })
+pub(super) async fn attention_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    seq_len: usize,
+    seeds: [usize; 3],
+    causal: bool,
+    detail_op: &'static str,
+) -> BenchmarkResult<BenchmarkReport> {
+    let shape = [1usize, 4usize, seq_len, 64usize];
+    let q = input_tensor(device, shape, seeds[0], 0.003).await;
+    let k = input_tensor(device, shape, seeds[1], 0.003).await;
+    let v = input_tensor(device, shape, seeds[2], 0.003).await;
+    let mask_shape = [seq_len, seq_len];
+    let mask = if causal {
+        Some(values_input(device, mask_shape, &vec![0.0f32; elements(&mask_shape)]).await)
+    } else {
+        None
+    };
+    let samples = time_samples(config, || {
+        let mask_arg = mask.as_ref().map(|mask| (mask, MaskKind::Causal));
+        let output = q.attention(&k, &v, 1.0 / (64.0f32).sqrt(), mask_arg);
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{} {detail_op}", shape_label(&shape)),
+    ))
 }
 
-pub fn attention_small() -> BenchmarkCase {
-    bench_case("webgpu::attention_small", |device, config| {
-        Box::pin(async move {
-            let shape = [1usize, 4usize, 128usize, 64usize];
-            let q_values = deterministic_values(elements(&shape), 31, 0.003);
-            let k_values = deterministic_values(elements(&shape), 32, 0.003);
-            let v_values = deterministic_values(elements(&shape), 33, 0.003);
-            let q: Tensor<4, f32> = Tensor::from_slice(device, shape, &q_values);
-            let k: Tensor<4, f32> = Tensor::from_slice(device, shape, &k_values);
-            let v: Tensor<4, f32> = Tensor::from_slice(device, shape, &v_values);
-            materialize_inputs(&[&q, &k, &v]).await;
-
-            let samples = time_samples(config, || {
-                let output = q.attention(&k, &v, 1.0 / (64.0f32).sqrt(), None);
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::attention_small",
-                config,
-                samples,
-                format!("{} attention", shape_label(&shape)),
-            ))
-        })
+pub(super) async fn rope_fused_decode_case(
+    device: &Device,
+    config: BenchmarkConfig,
+    name: String,
+    seq_len: usize,
+) -> BenchmarkResult<BenchmarkReport> {
+    let shape = [1usize, 8usize, seq_len, 64usize];
+    let [_, _, _, head_dim] = shape;
+    let pos_shape = [seq_len * 2, head_dim / 2];
+    let input = input_tensor(device, shape, 9, 0.01).await;
+    let cos = values_input(device, pos_shape, &rope_values(pos_shape, head_dim, true)).await;
+    let sin = values_input(device, pos_shape, &rope_values(pos_shape, head_dim, false)).await;
+    let samples = time_samples(config, || {
+        let output = input.rope_fused(&cos, &sin);
+        async move {
+            output.materialize().await;
+            Ok(())
+        }
     })
+    .await?;
+    Ok(BenchmarkReport::new(
+        name,
+        config,
+        samples,
+        format!("{} fused rope", shape_label(&shape)),
+    ))
 }
 
-pub fn attention_causal_small() -> BenchmarkCase {
-    bench_case("webgpu::attention_causal_small", |device, config| {
-        Box::pin(async move {
-            let shape = [1usize, 4usize, 128usize, 64usize];
-            let mask_shape = [128usize, 128usize];
-            let q_values = deterministic_values(elements(&shape), 34, 0.003);
-            let k_values = deterministic_values(elements(&shape), 35, 0.003);
-            let v_values = deterministic_values(elements(&shape), 36, 0.003);
-            let mask_values = vec![0.0f32; elements(&mask_shape)];
-            let q: Tensor<4, f32> = Tensor::from_slice(device, shape, &q_values);
-            let k: Tensor<4, f32> = Tensor::from_slice(device, shape, &k_values);
-            let v: Tensor<4, f32> = Tensor::from_slice(device, shape, &v_values);
-            let mask: Tensor<2, f32> = Tensor::from_slice(device, mask_shape, &mask_values);
-            materialize_inputs(&[&q, &k, &v]).await;
-            materialize_inputs(&[&mask]).await;
-
-            let samples = time_samples(config, || {
-                let output = q.attention(
-                    &k,
-                    &v,
-                    1.0 / (64.0f32).sqrt(),
-                    Some((&mask, MaskKind::Causal)),
-                );
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::attention_causal_small",
-                config,
-                samples,
-                format!("{} causal attention", shape_label(&shape)),
-            ))
-        })
-    })
+macro_rules! fixed_cases {
+    ($($case:ident => $body:ident($($arg:expr),* $(,)?);)*) => {
+        $(
+            pub fn $case() -> BenchmarkCase {
+                bench_case(
+                    concat!("webgpu::", stringify!($case)),
+                    |device, config, name| Box::pin($body(device, config, name, $($arg),*)),
+                )
+            }
+        )*
+    };
 }
 
-pub fn rope_fused_decode() -> BenchmarkCase {
-    bench_case("webgpu::rope_fused_decode", |device, config| {
-        Box::pin(async move {
-            let shape = [1usize, 8usize, 256usize, 64usize];
-            let [batch, heads, seq_len, head_dim] = shape;
-            let pos_shape = [seq_len * 2, head_dim / 2];
-            let cos_values = (0..pos_shape[0])
-                .flat_map(|i| {
-                    (0..pos_shape[1]).map(move |j| {
-                        ((i as f32) / 10000f32.powf((2 * (j / 2)) as f32 / head_dim as f32)).cos()
-                    })
-                })
-                .collect::<Vec<_>>();
-            let sin_values = (0..pos_shape[0])
-                .flat_map(|i| {
-                    (0..pos_shape[1]).map(move |j| {
-                        ((i as f32) / 10000f32.powf((2 * (j / 2)) as f32 / head_dim as f32)).sin()
-                    })
-                })
-                .collect::<Vec<_>>();
-            let input_values = deterministic_values(batch * heads * seq_len * head_dim, 9, 0.01);
-            let input: Tensor<4, f32> = Tensor::from_slice(device, shape, &input_values);
-            let cos: Tensor<2, f32> = Tensor::from_slice(device, pos_shape, &cos_values);
-            let sin: Tensor<2, f32> = Tensor::from_slice(device, pos_shape, &sin_values);
-            materialize_inputs(&[&input]).await;
-            materialize_inputs(&[&cos, &sin]).await;
-
-            let samples = time_samples(config, || {
-                let output = input.rope_fused(&cos, &sin);
-                async move {
-                    output.materialize().await;
-                    Ok(())
-                }
-            })
-            .await?;
-
-            Ok(BenchmarkReport::new(
-                "webgpu::rope_fused_decode",
-                config,
-                samples,
-                format!("{} fused rope", shape_label(&shape)),
-            ))
-        })
-    })
+fixed_cases! {
+    elementwise_add_square => elementwise_add_square_case(512);
+    elementwise_mul_rank4 => elementwise_mul_rank4_case([9, 11, 32, 16]);
+    unary_trig_chain => unary_trig_chain_case(384);
+    activation_gelu => activation_gelu_case([512, 256]);
+    broadcast_add => broadcast_add_case(256);
+    transpose_then_elementwise => transpose_then_elementwise_case([256, 384]);
+    reduction_sum_last_dim => reduction_sum_last_dim_case(256);
+    reduction_max_middle_axis => reduction_max_middle_axis_case([64, 128, 64]);
+    softmax_last_dim => softmax_last_dim_case(512);
+    softmax_middle_axis => softmax_middle_axis_case([32, 128, 64]);
+    layer_norm_last_dim => layer_norm_last_dim_case([8, 128, 512]);
+    rms_norm_fused => rms_norm_fused_case([8, 128, 512]);
+    dense_matmul_square => dense_matmul_square_case(256);
+    dense_batched_matmul => dense_batched_matmul_case(8, 64, 96);
+    conv1d_small => conv1d_small_case(256);
+    top_k_large => top_k_case(65_537, 64, topk_values(65_537));
+    top_k_qwen_vocab => top_k_case(151_936, 40, deterministic_values(151_936, 28, 0.01));
+    q8_0_qgemv => q8_0_qgemv_case([4096, 896]);
+    q4k_qgemv => q4k_qgemv_case([2048, 1024]);
+    q4k_paired_silu => q4k_paired_silu_case([2048, 1024]);
+    attention_small => attention_case(128, [31, 32, 33], false, "attention");
+    attention_causal_small => attention_case(128, [34, 35, 36], true, "causal attention");
+    rope_fused_decode => rope_fused_decode_case(256);
 }

@@ -5,7 +5,8 @@
 //! The matchers and builders are consumed by a linear recognition sweep over
 //! the identity forms emitted by the tensor interface. Keeping recognition
 //! outside the equality-saturation pass avoids rebuilding the same large
-//! decode e-graph for every generated token.
+//! decode e-graph for every generated token; `egraph/HOISTING_SPIKE.md`
+//! measures what that would cost.
 //! Anything they do not recognize lowers through the generic elementwise +
 //! reduce kernels — slower, but correct.
 
@@ -238,13 +239,19 @@ impl Resolver {
             != 1
         {
             if trace {
-                eprintln!("recognize-matmul: multi-consumer producer shape={:?}", nary.shape);
+                eprintln!(
+                    "recognize-matmul: multi-consumer producer shape={:?}",
+                    nary.shape
+                );
             }
             return false;
         }
         let Some(contraction) = match_contraction(reduce, nary) else {
             if trace {
-                eprintln!("recognize-matmul: contraction mismatch shape={:?}", nary.shape);
+                eprintln!(
+                    "recognize-matmul: contraction mismatch shape={:?}",
+                    nary.shape
+                );
             }
             return false;
         };
@@ -375,41 +382,6 @@ impl Resolver {
             ExecutionVariant::QEmbedding(operation),
         );
         true
-    }
-
-    /// Replace a recognized cluster's root with the rebuilt operation: drop
-    /// every edge from the cluster's intermediates, wire the operation's
-    /// dependencies directly, and let the now-unconsumed intermediates fall
-    /// out of the execution graph.
-    pub(super) fn commit_recognized(
-        &mut self,
-        graph: &mut ComputeGraphInner,
-        node_idx: ExecutionNodeIndex,
-        dependencies: &[NodeIndex],
-        variant: ExecutionVariant,
-    ) {
-        self.execution_graph[node_idx].variant = variant;
-
-        let previous: Vec<ExecutionNodeIndex> = self
-            .execution_graph
-            .neighbors_directed(node_idx, petgraph::Direction::Incoming)
-            .collect();
-        for &prev in &previous {
-            if let Some(edge) = self.execution_graph.find_edge(prev, node_idx) {
-                self.execution_graph.remove_edge(edge);
-            }
-        }
-        for &dependency in dependencies {
-            if let Some(exec) = self.get_input_node_in_exec_graph(dependency)
-                && self.execution_graph.find_edge(exec, node_idx).is_none()
-            {
-                self.execution_graph.add_edge(exec, node_idx, ());
-            }
-        }
-        self.add_physical_dependencies(graph, node_idx, dependencies);
-        for prev in previous {
-            self.remove_node_if_dead(prev);
-        }
     }
 }
 

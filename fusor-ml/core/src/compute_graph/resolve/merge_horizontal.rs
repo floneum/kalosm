@@ -22,7 +22,6 @@
 //!   buffer), so flush-replay slot attribution stays 1 buffer <-> 1 slot.
 
 use super::*;
-use crate::mir::operation::hash_mir_value;
 use crate::row_program::RowProgramOperation;
 
 const CAT_ROW: usize = 2;
@@ -89,6 +88,23 @@ impl MergedSegments {
                 for (_, op) in segments {
                     op.visit_dependencies(f);
                 }
+            }
+        }
+    }
+
+    /// Segment (node, op) views in queue order.
+    pub(super) fn segment_ops(&self) -> Vec<(NodeIndex, &dyn Operation)> {
+        match self {
+            Self::Row(segments) => segments
+                .iter()
+                .map(|(node, op)| (*node, op as &dyn Operation))
+                .collect(),
+            Self::MatMul(segments) => segments
+                .iter()
+                .map(|(node, op)| (*node, op as &dyn Operation))
+                .collect(),
+            Self::Region(_) => {
+                unreachable!("region segments are gathered without the Operation trait")
             }
         }
     }
@@ -527,24 +543,6 @@ impl HorizontalMerger {
     }
 }
 
-/// Hash one merged dispatch's cache-key material: every segment's kernel
-/// fields plus every MIR input value layout.
-pub(crate) fn hash_merged_segments<O: Operation>(
-    state: &mut rustc_hash::FxHasher,
-    segments: &[O],
-    segment_inputs: &[Vec<MirValue>],
-) {
-    use std::hash::Hash;
-    segments.len().hash(state);
-    for (op, inputs) in segments.iter().zip(segment_inputs) {
-        op.hash_kernel_fields(state);
-        inputs.len().hash(state);
-        for input in inputs {
-            hash_mir_value(state, input);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,9 +764,8 @@ mod tests {
             let v = input.mat_mul(&Tensor::from_slice(&device, [D, D], &diagonal(-0.5)));
             let output = &(&q + &k) + &v;
 
-            assert_eq!(
-                output.count_kernels_to_resolve(),
-                2,
+            assert!(
+                output.resolves_in::<2>(),
                 "Q/K/V should share one matmul dispatch followed by one nary dispatch",
             );
             let values = output.as_slice::<2, f32>().await.unwrap();

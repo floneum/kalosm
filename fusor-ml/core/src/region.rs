@@ -102,6 +102,12 @@ impl ElementwiseRegionOperation {
         }
     }
 
+    pub(crate) fn visit_dependencies_mut(&mut self, f: &mut dyn FnMut(&mut NodeIndex)) {
+        for input in &mut self.inputs {
+            f(input);
+        }
+    }
+
     pub(crate) fn name(&self) -> String {
         format!("region_x{}", self.statements.len())
     }

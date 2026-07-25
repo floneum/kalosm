@@ -1,9 +1,9 @@
 //! The e-graph term language over execution-graph nodes.
 //!
-//! Pure operators compare by semantic payload and child e-classes; `Prov` is
-//! observation metadata and does not participate in their identity. Concrete
-//! and cached leaves compare by [`AllocationId`]. Effectful assignments and
-//! multi-output regions retain observation identity.
+//! Pure operators compare by semantic payload and child e-classes and carry
+//! no observation metadata. Concrete and cached leaves compare by
+//! [`AllocationId`]. Effectful assignments and multi-output regions retain
+//! observation identity through the [`Prov`] they were ingested for.
 //!
 //! Payloads are complete [`ExecutionVariant`]s held in the driver's
 //! [`super::interner::PayloadTable`], referenced by [`PayloadId`]. Children
@@ -39,20 +39,20 @@ pub(super) struct AllocationId(pub(super) usize);
 #[derive(Debug, Clone)]
 pub(super) enum FusorLang {
     /// Concrete tensor data already bound to a buffer.
-    TensorLeaf(Prov, AllocationId),
+    TensorLeaf(AllocationId),
     /// A node cached before this resolve began; contents opaque.
-    Boundary(Prov, AllocationId),
+    Boundary(AllocationId),
     /// Quantized-matrix leaf (`DequantizeOperation` payload).
-    QMatrixLeaf(Prov, AllocationId, PayloadId),
-    Elementwise(Prov, PayloadId, Box<[Id]>),
-    Reduce(Prov, PayloadId, Box<[Id]>),
-    View(Prov, PayloadId, [Id; 1]),
+    QMatrixLeaf(AllocationId, PayloadId),
+    Elementwise(PayloadId, Box<[Id]>),
+    Reduce(PayloadId, Box<[Id]>),
+    View(PayloadId, [Id; 1]),
     Assign(Prov, PayloadId, [Id; 2]),
-    MatMul(Prov, PayloadId, [Id; 2]),
-    QMatMul(Prov, PayloadId, Box<[Id]>),
-    QEmbedding(Prov, PayloadId, [Id; 1]),
+    MatMul(PayloadId, [Id; 2]),
+    QMatMul(PayloadId, Box<[Id]>),
+    QEmbedding(PayloadId, [Id; 1]),
     /// Structurally comparable fused row program, including attention.
-    RowProgram(Prov, PayloadId, Box<[Id]>),
+    RowProgram(PayloadId, Box<[Id]>),
     /// Multi-output elementwise region (only after region formation).
     Region(Prov, PayloadId, Box<[Id]>),
 }
@@ -61,16 +61,16 @@ impl PartialEq for FusorLang {
     fn eq(&self, other: &Self) -> bool {
         use FusorLang::*;
         match (self, other) {
-            (TensorLeaf(_, a), TensorLeaf(_, b)) | (Boundary(_, a), Boundary(_, b)) => a == b,
-            (QMatrixLeaf(_, aa, a), QMatrixLeaf(_, ba, b)) => aa == ba && a == b,
-            (Elementwise(_, a, ac), Elementwise(_, b, bc))
-            | (Reduce(_, a, ac), Reduce(_, b, bc))
-            | (QMatMul(_, a, ac), QMatMul(_, b, bc))
-            | (RowProgram(_, a, ac), RowProgram(_, b, bc)) => a == b && ac == bc,
-            (View(_, a, ac), View(_, b, bc)) | (QEmbedding(_, a, ac), QEmbedding(_, b, bc)) => {
+            (TensorLeaf(a), TensorLeaf(b)) | (Boundary(a), Boundary(b)) => a == b,
+            (QMatrixLeaf(aa, a), QMatrixLeaf(ba, b)) => aa == ba && a == b,
+            (Elementwise(a, ac), Elementwise(b, bc))
+            | (Reduce(a, ac), Reduce(b, bc))
+            | (QMatMul(a, ac), QMatMul(b, bc))
+            | (RowProgram(a, ac), RowProgram(b, bc)) => a == b && ac == bc,
+            (View(a, ac), View(b, bc)) | (QEmbedding(a, ac), QEmbedding(b, bc)) => {
                 a == b && ac == bc
             }
-            (MatMul(_, a, ac), MatMul(_, b, bc)) => a == b && ac == bc,
+            (MatMul(a, ac), MatMul(b, bc)) => a == b && ac == bc,
             (Assign(ap, a, ac), Assign(bp, b, bc)) => ap == bp && a == b && ac == bc,
             (Region(ap, a, ac), Region(bp, b, bc)) => ap == bp && a == b && ac == bc,
             _ => false,
@@ -105,9 +105,9 @@ impl Ord for FusorLang {
         tag(self)
             .cmp(&tag(other))
             .then_with(|| match (self, other) {
-                (Self::TensorLeaf(_, a), Self::TensorLeaf(_, b))
-                | (Self::Boundary(_, a), Self::Boundary(_, b)) => a.cmp(b),
-                (Self::QMatrixLeaf(_, aa, a), Self::QMatrixLeaf(_, ba, b)) => {
+                (Self::TensorLeaf(a), Self::TensorLeaf(b))
+                | (Self::Boundary(a), Self::Boundary(b)) => a.cmp(b),
+                (Self::QMatrixLeaf(aa, a), Self::QMatrixLeaf(ba, b)) => {
                     aa.cmp(ba).then_with(|| a.cmp(b))
                 }
                 (Self::Assign(ap, a, ac), Self::Assign(bp, b, bc)) => {
@@ -128,10 +128,8 @@ impl Hash for FusorLang {
     fn hash<H: Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
-            Self::TensorLeaf(_, allocation) | Self::Boundary(_, allocation) => {
-                allocation.hash(state)
-            }
-            Self::QMatrixLeaf(_, allocation, payload) => {
+            Self::TensorLeaf(allocation) | Self::Boundary(allocation) => allocation.hash(state),
+            Self::QMatrixLeaf(allocation, payload) => {
                 allocation.hash(state);
                 payload.hash(state);
             }
@@ -154,35 +152,18 @@ impl Hash for FusorLang {
 }
 
 impl FusorLang {
-    pub(super) fn prov(&self) -> Prov {
-        match self {
-            Self::TensorLeaf(prov, _)
-            | Self::Boundary(prov, _)
-            | Self::QMatrixLeaf(prov, _, _)
-            | Self::Elementwise(prov, _, _)
-            | Self::Reduce(prov, _, _)
-            | Self::View(prov, _, _)
-            | Self::Assign(prov, _, _)
-            | Self::MatMul(prov, _, _)
-            | Self::QMatMul(prov, _, _)
-            | Self::QEmbedding(prov, _, _)
-            | Self::RowProgram(prov, _, _)
-            | Self::Region(prov, _, _) => *prov,
-        }
-    }
-
     pub(super) fn payload(&self) -> Option<PayloadId> {
         match self {
             Self::TensorLeaf(..) | Self::Boundary(..) => None,
-            Self::QMatrixLeaf(_, _, payload)
-            | Self::Elementwise(_, payload, _)
-            | Self::Reduce(_, payload, _)
-            | Self::View(_, payload, _)
+            Self::QMatrixLeaf(_, payload)
+            | Self::Elementwise(payload, _)
+            | Self::Reduce(payload, _)
+            | Self::View(payload, _)
             | Self::Assign(_, payload, _)
-            | Self::MatMul(_, payload, _)
-            | Self::QMatMul(_, payload, _)
-            | Self::QEmbedding(_, payload, _)
-            | Self::RowProgram(_, payload, _)
+            | Self::MatMul(payload, _)
+            | Self::QMatMul(payload, _)
+            | Self::QEmbedding(payload, _)
+            | Self::RowProgram(payload, _)
             | Self::Region(_, payload, _) => Some(*payload),
         }
     }
@@ -201,23 +182,28 @@ impl Language for FusorLang {
 
     fn discriminant(&self) -> Self::Discriminant {
         let allocation = match self {
-            Self::TensorLeaf(_, allocation)
-            | Self::Boundary(_, allocation)
-            | Self::QMatrixLeaf(_, allocation, _) => Some(*allocation),
+            Self::TensorLeaf(allocation)
+            | Self::Boundary(allocation)
+            | Self::QMatrixLeaf(allocation, _) => Some(*allocation),
             _ => None,
         };
         let prov = match self {
             Self::Assign(prov, _, _) | Self::Region(prov, _, _) => Some(*prov),
             _ => None,
         };
-        (std::mem::discriminant(self), allocation, self.payload(), prov)
+        (
+            std::mem::discriminant(self),
+            allocation,
+            self.payload(),
+            prov,
+        )
     }
 
     fn matches(&self, other: &Self) -> bool {
         use FusorLang::*;
         match (self, other) {
-            (TensorLeaf(_, a), TensorLeaf(_, b)) | (Boundary(_, a), Boundary(_, b)) => a == b,
-            (QMatrixLeaf(_, aa, a), QMatrixLeaf(_, ba, b)) => aa == ba && a == b,
+            (TensorLeaf(a), TensorLeaf(b)) | (Boundary(a), Boundary(b)) => a == b,
+            (QMatrixLeaf(aa, a), QMatrixLeaf(ba, b)) => aa == ba && a == b,
             (Assign(ap, a, _), Assign(bp, b, _)) | (Region(ap, a, _), Region(bp, b, _)) => {
                 ap == bp && a == b
             }
@@ -231,26 +217,28 @@ impl Language for FusorLang {
     fn children(&self) -> &[Id] {
         match self {
             Self::TensorLeaf(..) | Self::Boundary(..) | Self::QMatrixLeaf(..) => &[],
-            Self::Elementwise(_, _, children)
-            | Self::Reduce(_, _, children)
-            | Self::QMatMul(_, _, children)
-            | Self::RowProgram(_, _, children)
+            Self::Elementwise(_, children)
+            | Self::Reduce(_, children)
+            | Self::QMatMul(_, children)
+            | Self::RowProgram(_, children)
             | Self::Region(_, _, children) => children,
-            Self::View(_, _, children) | Self::QEmbedding(_, _, children) => children,
-            Self::Assign(_, _, children) | Self::MatMul(_, _, children) => children,
+            Self::View(_, children) | Self::QEmbedding(_, children) => children,
+            Self::MatMul(_, children) => children,
+            Self::Assign(_, _, children) => children,
         }
     }
 
     fn children_mut(&mut self) -> &mut [Id] {
         match self {
             Self::TensorLeaf(..) | Self::Boundary(..) | Self::QMatrixLeaf(..) => &mut [],
-            Self::Elementwise(_, _, children)
-            | Self::Reduce(_, _, children)
-            | Self::QMatMul(_, _, children)
-            | Self::RowProgram(_, _, children)
+            Self::Elementwise(_, children)
+            | Self::Reduce(_, children)
+            | Self::QMatMul(_, children)
+            | Self::RowProgram(_, children)
             | Self::Region(_, _, children) => children,
-            Self::View(_, _, children) | Self::QEmbedding(_, _, children) => children,
-            Self::Assign(_, _, children) | Self::MatMul(_, _, children) => children,
+            Self::View(_, children) | Self::QEmbedding(_, children) => children,
+            Self::MatMul(_, children) => children,
+            Self::Assign(_, _, children) => children,
         }
     }
 }

@@ -68,9 +68,8 @@ fn check_matmul_tol(batch: usize, m: usize, k: usize, n: usize, transpose_b: boo
         };
 
         let out = a.mat_mul(&b);
-        assert_eq!(
-            out.count_kernels_to_resolve(),
-            1,
+        assert!(
+            out.resolves_in::<1>(),
             "batch={batch} m={m} k={k} n={n} transpose_b={transpose_b}: \
              the contraction should resolve to one matmul kernel"
         );

@@ -13,8 +13,9 @@
 //! shader source, kernel-cache keys, and dispatch names to the destructive
 //! optimizer.
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 
+use fusor_tile_ir_runtime::TwoLaneHasher;
 use rustc_hash::{FxHashMap, FxHasher};
 
 use super::super::ExecutionVariant;
@@ -35,102 +36,32 @@ pub(super) struct SpecId(pub(super) u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct PayloadKey(pub(super) [u64; 2]);
 
-/// Two differently-seeded accumulator lanes over the same 64-bit words; the
-/// second lane widens the accumulator state against cancellation collisions
-/// (the `flush_replay::FingerprintHasher` recipe).
-pub(super) struct TwoLane {
-    a: FxHasher,
-    b: FxHasher,
-}
+/// Accumulating payload/window hasher on the canonical [`TwoLaneHasher`]
+/// (see `fusor_tile_ir_runtime::two_lane` for the collision model).
+pub(super) struct TwoLane(TwoLaneHasher);
 
 impl TwoLane {
     pub(super) fn new() -> Self {
-        let mut a = FxHasher::default();
-        0u64.hash(&mut a);
-        let mut b = FxHasher::default();
-        1u64.hash(&mut b);
-        Self { a, b }
+        Self(TwoLaneHasher::new())
     }
 
     pub(super) fn write_u64(&mut self, value: u64) {
-        value.hash(&mut self.a);
-        (value.rotate_left(32) ^ 0x9E37_79B9_7F4A_7C15).hash(&mut self.b);
+        self.0.write_u64(value);
     }
 
     pub(super) fn finish(self) -> PayloadKey {
-        PayloadKey([self.a.finish(), self.b.finish()])
+        PayloadKey(self.0.finish())
     }
 }
 
-pub(super) fn local_hash(f: impl FnOnce(&mut FxHasher)) -> u64 {
-    let mut hasher = FxHasher::default();
-    f(&mut hasher);
-    hasher.finish()
-}
+pub(super) use fusor_tile_ir_runtime::single_lane as local_hash;
 
 /// The payload's dependencies in `visit_dependencies` order — the order the
 /// e-node's children mirror.
 pub(super) fn variant_dependencies(variant: &ExecutionVariant) -> Vec<NodeIndex> {
     let mut deps = Vec::new();
-    let mut push = |dep: NodeIndex| deps.push(dep);
-    match variant {
-        ExecutionVariant::Tensor(_) => {}
-        ExecutionVariant::QMatrix(op) => {
-            use crate::mir::operation::Operation;
-            op.visit_dependencies(&mut push);
-        }
-        ExecutionVariant::Elementwise(op) => {
-            use crate::mir::operation::Operation;
-            op.visit_dependencies(&mut push);
-        }
-        ExecutionVariant::Reduce(op) => {
-            use crate::mir::operation::Operation;
-            op.visit_dependencies(&mut push);
-        }
-        ExecutionVariant::View(op) => {
-            use crate::mir::operation::Operation;
-            op.visit_dependencies(&mut push);
-        }
-        ExecutionVariant::Assign(op) => {
-            use crate::mir::operation::Operation;
-            op.visit_dependencies(&mut push);
-        }
-        ExecutionVariant::Region(op) => op.visit_dependencies(&mut push),
-        ExecutionVariant::MatMul(op) => {
-            use crate::mir::operation::Operation;
-            op.visit_dependencies(&mut push);
-        }
-        ExecutionVariant::QMatMul(op) => {
-            use crate::mir::operation::Operation;
-            op.visit_dependencies(&mut push);
-        }
-        ExecutionVariant::QEmbedding(op) => {
-            use crate::mir::operation::Operation;
-            op.visit_dependencies(&mut push);
-        }
-        ExecutionVariant::RowProgram(op) => {
-            use crate::mir::operation::Operation;
-            op.visit_dependencies(&mut push);
-        }
-        ExecutionVariant::Attention(op) => {
-            use crate::mir::operation::Operation;
-            op.visit_dependencies(&mut push);
-        }
-    }
+    variant.visit_dependencies(&mut |dep| deps.push(dep));
     deps
-}
-
-/// Exact equality for an execution-graph occurrence: semantic operation
-/// fields plus its concrete dependency slots. This is intentionally stricter
-/// than payload interning, which erases dependencies so equivalent e-nodes
-/// can share an e-class.
-pub(super) fn concrete_variant_eq(a: &ExecutionVariant, b: &ExecutionVariant) -> bool {
-    match (a, b) {
-        (ExecutionVariant::Assign(a), ExecutionVariant::Assign(b)) => {
-            a.input == b.input && a.value == b.value && a.slices == b.slices
-        }
-        _ => semantic_payload_eq(a, b) && variant_dependencies(a) == variant_dependencies(b),
-    }
 }
 
 /// Rewrite `variant`'s dependency slots — in `visit_dependencies` order — to
@@ -142,79 +73,9 @@ pub(super) fn concrete_variant_eq(a: &ExecutionVariant, b: &ExecutionVariant) ->
 /// e-node's actual children or it computes with the wrong operands.
 pub(super) fn rebind_variant_dependencies(variant: &mut ExecutionVariant, new: &[NodeIndex]) {
     let mut slots = new.iter().copied();
-    match variant {
-        ExecutionVariant::Tensor(_) | ExecutionVariant::QMatrix(_) => {}
-        ExecutionVariant::Elementwise(op) => {
-            for input in &mut op.inputs {
-                *input = slots.next().expect("elementwise rebind arity");
-            }
-        }
-        ExecutionVariant::Reduce(op) => {
-            for input in &mut op.inputs {
-                *input = slots.next().expect("reduce rebind arity");
-            }
-        }
-        ExecutionVariant::View(op) => {
-            op.input = slots.next().expect("view rebind arity");
-        }
-        ExecutionVariant::Assign(op) => {
-            // Order matches `SliceAssignOperation::visit_dependencies`:
-            // value first, then input.
-            op.value = slots.next().expect("assign rebind arity");
-            op.input = slots.next().expect("assign rebind arity");
-        }
-        ExecutionVariant::Region(op) => {
-            for input in &mut op.inputs {
-                *input = slots.next().expect("region rebind arity");
-            }
-        }
-        ExecutionVariant::MatMul(op) => {
-            op.first = slots.next().expect("matmul rebind arity");
-            op.second = slots.next().expect("matmul rebind arity");
-        }
-        ExecutionVariant::QMatMul(op) => {
-            // Order matches `QMatMulOperation::visit_dependencies`: input,
-            // then pre-epilogue extras, then post-epilogue extras.
-            op.input = slots.next().expect("qmatmul rebind arity");
-            for epilogue in [
-                &mut op.pre_element_wise_expr,
-                &mut op.post_element_wise_expr,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                for extra in &mut epilogue.extras {
-                    *extra = slots.next().expect("qmatmul extras rebind arity");
-                }
-            }
-        }
-        ExecutionVariant::QEmbedding(op) => {
-            op.indexes = slots.next().expect("qembedding rebind arity");
-        }
-        ExecutionVariant::RowProgram(op) => {
-            for input in &mut op.inputs {
-                *input = slots.next().expect("row program rebind arity");
-            }
-        }
-        ExecutionVariant::Attention(op) => {
-            // Order matches `FlashAttentionOperation::visit_dependencies`:
-            // q, k, then the present optional operands in declaration order.
-            op.q = slots.next().expect("attention rebind arity");
-            op.k = slots.next().expect("attention rebind arity");
-            for slot in [
-                &mut op.v,
-                &mut op.grad_o,
-                &mut op.lse,
-                &mut op.dsum,
-                &mut op.mask,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                *slot = slots.next().expect("attention rebind arity");
-            }
-        }
-    }
+    variant.visit_dependencies_mut(&mut |slot| {
+        *slot = slots.next().expect("rebind arity");
+    });
     debug_assert!(
         slots.next().is_none(),
         "rebind received more children than the variant has dependency slots"
@@ -301,8 +162,8 @@ impl PayloadTable {
     /// occurrence once, so idempotence lookup buys nothing; the first planning
     /// occurrence still establishes its allocation-independent spec. Repeated
     /// occurrences use [`Self::push_unique_with_spec`] and skip that structural
-    /// hash too. Saturation must keep using [`Self::intern`], because
-    /// its convergence detection relies on semantic dedup.
+    /// hash too. Ingestion keeps using [`Self::intern`], whose semantic dedup
+    /// is what places equivalent observations in one e-class.
     pub(super) fn push_unique(&mut self, variant: ExecutionVariant) -> PayloadId {
         let key = payload_key(&variant);
         let spec = self.intern_spec(key, &variant);

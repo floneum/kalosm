@@ -1,20 +1,17 @@
 use crate::{Device, Tensor, tensor::TensorData};
 
-mod mirostat;
 mod pipeline;
 pub(crate) mod processors;
 pub(crate) mod row_kernels;
-mod standard_sampler;
-mod topk;
 
 #[cfg(test)]
 mod tests;
 
-pub(crate) use pipeline::{GpuSamplerRequest, sample_token_pending, sample_token_to_host};
-pub(crate) use topk::{
+pub(crate) use crate::mir::kernel_backend::sampling::{
     MergeSortedChunkTopKParams, chunk_top_k_pair_data_with_encoder,
     merge_sorted_chunk_top_k_pair_data_with_encoder,
 };
+pub(crate) use pipeline::{GpuSamplerRequest, sample_token_pending, sample_token_to_host};
 
 pub(crate) const TOP_K_BLOCK: u32 = 256;
 pub(crate) const TOP_K_CHUNK: usize = TOP_K_BLOCK as usize;

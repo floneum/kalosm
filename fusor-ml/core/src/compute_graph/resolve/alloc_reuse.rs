@@ -145,7 +145,7 @@ impl BufferLedger {
     }
 
     /// Advance the shadow release accounting for one produced node's
-    /// dependencies (mirror of `release_dead_intermediates`, without the
+    /// dependencies (mirror of `release_consumed`, without the
     /// release): nodes whose last consumer this is enter the free list when
     /// their buffer was allocated this resolve.
     pub(super) fn consume(

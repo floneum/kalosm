@@ -38,25 +38,6 @@ fn record_shared_outputs(
     }
 }
 
-impl MergedSegments {
-    /// Segment (node, op) views in queue order.
-    fn segment_ops(&self) -> Vec<(NodeIndex, &dyn Operation)> {
-        match self {
-            Self::Row(segments) => segments
-                .iter()
-                .map(|(node, op)| (*node, op as &dyn Operation))
-                .collect(),
-            Self::MatMul(segments) => segments
-                .iter()
-                .map(|(node, op)| (*node, op as &dyn Operation))
-                .collect(),
-            Self::Region(_) => {
-                unreachable!("region segments are gathered without the Operation trait")
-            }
-        }
-    }
-}
-
 /// One entry of the three-phase queue, preserving queue order.
 enum QueueStep {
     View {
@@ -119,44 +100,18 @@ fn should_parallelize_build_remainder(
         && probe_elapsed >= COLD_BUILD_THRESHOLD
 }
 
-/// A structural plan-cache key for one horizontally merged dispatch: the
-/// wave discriminant plus every segment's own structural kernel key (or the
-/// region's kernel fields), so isomorphic waves across resolves and
-/// processes share one plan.
-fn merged_plan_cache_key(
+pub(super) fn merged_plan_cache_key(
     merged: &MergedSegments,
     segment_inputs: &[Vec<MirValue>],
 ) -> crate::mir::kernel_backend::KernelCacheKey {
+    // Declared here because its `TypeId` — declaration site and all — stamps
+    // every merged plan key already in the persistent store.
     struct MergedPlanKernelVariant;
-    crate::mir::kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
-        use std::hash::Hash;
-        crate::mir::kernel_backend::KernelVariantKey::of::<MergedPlanKernelVariant>().hash(state);
-        std::mem::discriminant(merged).hash(state);
-        segment_inputs.len().hash(state);
-        match merged {
-            MergedSegments::Region(segments) => {
-                for ((_, op), inputs) in segments.iter().zip(segment_inputs) {
-                    op.hash_kernel_fields(state);
-                    inputs.len().hash(state);
-                    for input in inputs {
-                        crate::mir::operation::hash_mir_value(state, input);
-                    }
-                }
-            }
-            _ => {
-                for ((_, op), inputs) in merged.segment_ops().iter().zip(segment_inputs) {
-                    op.kernel_cache_key_with_dispatch(
-                        crate::mir::kernel_backend::KernelVariantKey::of::<MergedPlanKernelVariant>(
-                        ),
-                        None,
-                        [0; 3],
-                        inputs,
-                    )
-                    .hash(state);
-                }
-            }
-        }
-    })
+    super::plan_cache::merged_segments_key(
+        crate::mir::kernel_backend::KernelVariantKey::of::<MergedPlanKernelVariant>(),
+        merged,
+        segment_inputs,
+    )
 }
 
 fn build_queue_work(
@@ -691,6 +646,10 @@ impl Resolver {
 
         // Phase 3: record, encode, and release in queue order.
         let encode_start = host_trace.then(Instant::now);
+        let mut consumers = super::execution::NodeConsumers {
+            counts: remaining_consumers,
+            targets: target_set,
+        };
         for step in steps {
             match step {
                 QueueStep::View { node, result, deps } => {
@@ -700,12 +659,11 @@ impl Resolver {
                             .record_view_alias(node, &result, &deps);
                         record_shared_outputs(recorder, node, &result, shared_outputs);
                     }
-                    Self::release_dead_intermediates_from_graph(
+                    super::execution::release_consumed(
                         graph,
-                        &[node],
-                        remaining_consumers,
-                        target_set,
-                        ledger,
+                        &mut consumers,
+                        Some(ledger),
+                        |release| deps.into_iter().for_each(release),
                     );
                 }
                 QueueStep::CopyAssign { node, copies, op } => {
@@ -717,12 +675,11 @@ impl Resolver {
                         recorder.borrow_mut().record_copy_assign(node, &output, &op);
                     }
                     commands.extend(copies.into_iter().map(CommandRecord::CopyBuffer));
-                    Self::release_dead_intermediates(
+                    super::execution::release_consumed(
                         graph,
-                        &[&op],
-                        remaining_consumers,
-                        target_set,
-                        ledger,
+                        &mut consumers,
+                        Some(ledger),
+                        |release| op.visit_dependencies(release),
                     );
                 }
                 QueueStep::Work(index) => {
@@ -786,12 +743,11 @@ impl Resolver {
                             category,
                         }));
                     }
-                    Self::release_dead_intermediates(
+                    super::execution::release_consumed(
                         graph,
-                        &[&item.op],
-                        remaining_consumers,
-                        target_set,
-                        ledger,
+                        &mut consumers,
+                        Some(ledger),
+                        |release| item.op.visit_dependencies(release),
                     );
                 }
             }
@@ -800,6 +756,14 @@ impl Resolver {
             host_profile.prepare_dispatch += start.elapsed();
         }
     }
+}
+
+/// Where a profiled resolve writes its per-dispatch timestamps.
+pub(super) struct TimestampPlan<'a> {
+    pub(super) query_set: &'a wgpu::QuerySet,
+    /// Timestamps ride inside the shared passes; without the feature every
+    /// dispatch takes its own pass and the writes land on its boundaries.
+    pub(super) inside_pass: bool,
 }
 
 /// Encode a command stream with the resolver's pass and submit chunking.
@@ -811,6 +775,7 @@ pub(super) fn encode_command_records(
     device: &crate::Device,
     commands: &[CommandRecord],
     total_kernels: usize,
+    timestamps: Option<TimestampPlan<'_>>,
     mut command_encoder: wgpu::CommandEncoder,
     mut submit_chunk: impl FnMut(wgpu::CommandEncoder, bool),
 ) -> wgpu::CommandEncoder {
@@ -818,6 +783,7 @@ pub(super) fn encode_command_records(
     let dispatches_per_submit = super::run::dispatches_per_submit(device, total_kernels);
     let wait_after_chunk_submit = device.backend() == wgpu::Backend::Metal;
     let mut command_index = 0usize;
+    let mut dispatch_index = 0usize;
     let mut dispatches_in_submit = 0usize;
     let mut encoder_has_commands = false;
     let mut pass_segments = 0usize;
@@ -850,7 +816,29 @@ pub(super) fn encode_command_records(
                 encoder_has_commands = true;
                 command_index += 1;
             }
-            CommandRecord::Dispatch(_) => {
+            CommandRecord::Dispatch(record) => {
+                if let Some(plan) = &timestamps
+                    && !plan.inside_pass
+                {
+                    let mut pass =
+                        command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some(record.name.as_str()),
+                            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                                query_set: plan.query_set,
+                                beginning_of_pass_write_index: Some((dispatch_index * 2) as u32),
+                                end_of_pass_write_index: Some((dispatch_index * 2 + 1) as u32),
+                            }),
+                        });
+                    record.dispatch.run(&mut pass);
+                    drop(pass);
+                    pass_segments += 1;
+                    dispatch_index += 1;
+                    dispatches_in_submit += 1;
+                    encoder_has_commands = true;
+                    command_index += 1;
+                    continue;
+                }
+
                 let mut pass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Resolver Direct Kernels"),
                     timestamp_writes: None,
@@ -864,9 +852,16 @@ pub(super) fn encode_command_records(
                     let CommandRecord::Dispatch(record) = &commands[command_index] else {
                         break;
                     };
+                    if let Some(plan) = &timestamps {
+                        pass.write_timestamp(plan.query_set, (dispatch_index * 2) as u32);
+                    }
                     pass.push_debug_group(&record.name);
                     record.dispatch.run(&mut pass);
                     pass.pop_debug_group();
+                    if let Some(plan) = &timestamps {
+                        pass.write_timestamp(plan.query_set, (dispatch_index * 2 + 1) as u32);
+                    }
+                    dispatch_index += 1;
                     dispatches_in_submit += 1;
                     command_index += 1;
                     pass_dispatches += 1;
@@ -875,7 +870,7 @@ pub(super) fn encode_command_records(
             }
         }
     }
-    if device.config().trace_resolve_host {
+    if cfg!(target_arch = "wasm32") || device.config().trace_resolve_host {
         tracing::info!(
             "resolve_pass_layout kernels={total_kernels} passes={pass_segments} copies={copy_records}"
         );

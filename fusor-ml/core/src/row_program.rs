@@ -411,6 +411,12 @@ impl Operation for RowProgramOperation {
         }
     }
 
+    fn visit_dependencies_mut(&mut self, f: &mut dyn FnMut(&mut NodeIndex)) {
+        for input in &mut self.inputs {
+            f(input);
+        }
+    }
+
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
         let mut mir_inputs: Vec<MirValue> = self
             .inputs
@@ -1620,9 +1626,9 @@ pub(crate) fn build_merged_row_program_kernel(
         kernel_backend::KernelVariantKey::of::<MergedRowProgramKernelVariant>().hash(state);
         dispatch_size.hash(state);
         block.hash(state);
-        crate::compute_graph::resolve::merge_horizontal::hash_merged_segments(
+        crate::compute_graph::resolve::plan_cache::hash_merged_segments(
             state,
-            segments,
+            segments.iter(),
             segment_inputs,
         );
     });

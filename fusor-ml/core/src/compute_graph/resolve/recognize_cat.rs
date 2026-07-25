@@ -65,26 +65,15 @@ enum Rep {
 }
 
 fn apply_reps(expr: &NaryExpr, reps: &[Rep]) -> NaryExpr {
-    match expr {
-        NaryExpr::Op { children, function } => NaryExpr::Op {
-            children: children.iter().map(|c| apply_reps(c, reps)).collect(),
-            function: function.clone(),
+    egraph::compose::map_loads(expr, &mut |input_idx, _, indices| match &reps[input_idx] {
+        // Inline replacements are only built for slots accessed
+        // element-wise, where the whole load is the producer's value.
+        Rep::Inline(expr) => expr.clone(),
+        Rep::Slot(slot) => NaryExpr::IndexedInput {
+            input_idx: *slot,
+            indices,
         },
-        NaryExpr::IndexedInput { input_idx, indices } => {
-            let indices: Vec<NaryExpr> = indices.iter().map(|c| apply_reps(c, reps)).collect();
-            match &reps[*input_idx] {
-                // Inline replacements are only built for slots accessed
-                // element-wise, where the whole load is the producer's value.
-                Rep::Inline(expr) => expr.clone(),
-                Rep::Slot(slot) => NaryExpr::IndexedInput {
-                    input_idx: *slot,
-                    indices,
-                },
-            }
-        }
-        NaryExpr::DimIndex(dim) => NaryExpr::DimIndex(*dim),
-        NaryExpr::Scalar(value) => NaryExpr::Scalar(*value),
-    }
+    })
 }
 
 /// Recover the slice ranges from a candidate slice-assign expression, then
@@ -308,7 +297,8 @@ impl Resolver {
             expression
         };
 
-        let (final_inputs, final_expression) = Self::deduplicate_inputs(state.inputs, expression);
+        let (final_inputs, final_expression) =
+            egraph::compose::deduplicate_inputs(state.inputs, expression);
         if final_inputs.len() > graph.device().nary_direct_input_binding_budget() {
             return;
         }

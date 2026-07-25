@@ -117,9 +117,8 @@ fn check_attention(case: AttentionCase, tolerance: f32) {
         } else {
             q.attention(&k, &v, scale, mask_tensor.as_ref())
         };
-        assert_eq!(
-            out.count_kernels_to_resolve(),
-            1,
+        assert!(
+            out.resolves_in::<1>(),
             "attention should lower as one row-program kernel"
         );
         let actual = out.as_slice::<4, f32>().await.unwrap();

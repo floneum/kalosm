@@ -1032,9 +1032,9 @@ pub(crate) fn build_merged_matmul_kernel(
         subgroup_config.hash(state);
         splits.hash(state);
         1u64.hash(state);
-        crate::compute_graph::resolve::merge_horizontal::hash_merged_segments(
+        crate::compute_graph::resolve::plan_cache::hash_merged_segments(
             state,
-            segments,
+            segments.iter(),
             segment_inputs,
         );
     });
@@ -1106,9 +1106,9 @@ pub(crate) fn build_merged_matmul_kernel(
         subgroup_config.hash(state);
         splits.hash(state);
         2u64.hash(state);
-        crate::compute_graph::resolve::merge_horizontal::hash_merged_segments(
+        crate::compute_graph::resolve::plan_cache::hash_merged_segments(
             state,
-            segments,
+            segments.iter(),
             segment_inputs,
         );
     });
@@ -1208,6 +1208,11 @@ impl Operation for MatMulOperation {
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
         f(self.first);
         f(self.second);
+    }
+
+    fn visit_dependencies_mut(&mut self, f: &mut dyn FnMut(&mut NodeIndex)) {
+        f(&mut self.first);
+        f(&mut self.second);
     }
 
     fn inputs(

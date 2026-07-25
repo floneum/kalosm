@@ -281,6 +281,11 @@ impl Tensor {
         count
     }
 
+    /// Whether fully resolving this tensor takes exactly `N` kernel calls
+    pub fn resolves_in<const N: usize>(&self) -> bool {
+        self.count_kernels_to_resolve() == N
+    }
+
     pub async fn as_slice<const R: usize, D: DataType>(
         &self,
     ) -> Result<TensorSlice<R, D, MappedBuffer>, wgpu::BufferAsyncError> {

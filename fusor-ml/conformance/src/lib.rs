@@ -6,6 +6,10 @@
 mod builder;
 mod comparison;
 mod fuzz;
+#[cfg(test)]
+mod goldens;
+#[cfg(test)]
+mod pinned_failures;
 mod table;
 mod tuple_macros;
 

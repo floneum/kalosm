@@ -8,22 +8,27 @@
 //! The key orders by, in priority:
 //! 1. **Total padded MACs** (`tiles x bm*bn*k_pad`): padding is the dominant
 //!    measured effect — a 33%-padded tile ran ~2x slower than its zero-pad
-//!    neighbor at N=384, and a 6.7%-padded 128x512 ran ~2x slower than the
+//!    neighbor at N=384, and a 6.7%-padded 128x512 ran ~3x slower than the
 //!    least-padded choice on the vision shape.
 //! 2. **Serial depth** (`waves x (per-lane tile MACs + overhead)`):
 //!    workgroups within a wave run in parallel, waves serialize, and each
 //!    tile pays a fixed prologue/epilogue (a quarter-saturation of per-lane
 //!    MAC-equivalents). This prefers small tiles when the grid underfills
-//!    the device (128x64 measured 3.64 TF/s vs 128x512's 2.15 at 1024^3 and
-//!    2.6x at the 384x16384x1536 weight gradient) and large tiles when depth
-//!    ties (fewer per-tile overheads at 4096^3, measured flat 5.12 = 5.12).
-//! 3. **Larger tiles**: deterministic tie-break.
+//!    the device (128x64 measured 5.06 TF/s vs 128x512's 2.68 at 1024^3 and
+//!    4x at the 384x16384x1536 weight gradient).
+//! 3. **Larger tiles**: deterministic tie-break; it takes 128x64 over 64x64
+//!    wherever padding, passes and depth all tie, which pays at
+//!    16384x384x384 (7.15 vs 6.03), 4096^3 (7.64 vs 7.42) and 1024^3 (flat
+//!    5.06 = 5.06), and loses at 384x16384x1536 (5.94 vs 6.31) and
+//!    1000x1024x1024 (2.62 vs 3.11).
 //!
 //! Single-buffered profiles are excluded from automatic selection outright:
 //! they cannot horizontally merge (`supports_horizontal_merge`), and their
-//! best measured standalone advantage (+3% at 4096^3) never pays for
-//! decomposing a merged wave into standalone dispatches (~15% on the vision
-//! QKV family). They stay in the kernel table for forced experiments.
+//! best standalone shape (4096^3) measures 5.57 TF/s against the selected
+//! 128x64's 7.64 — even at parity it would not pay for decomposing a merged
+//! wave into standalone dispatches (~15% on the vision QKV family). They
+//! stay in the kernel table for forced experiments, where
+//! `coop_tile_conformance` keeps them verified.
 //!
 //! Workgroup-memory footprint enters only as legality: entries whose
 //! `CoopTileEntry::workgroup_bytes` for the contraction's stage element
@@ -36,13 +41,17 @@
 //! win" measurement turned out to be a stale-build or unverified-chain
 //! artifact; verified numbers show zero-pad tiles flat except for occupancy.
 //!
-//! Measured anchors on M2 Max (min-of-many, verified chained bench):
-//! 1024^3 — 128x64 3.64 / 64x64 2.69 / 128x512 2.15 TF/s; 384x16384x1536 —
-//! 128x64 unsplit ~5.9 vs 128x512+split ~2.3; 4096^3 — 128x512 5.12 = 128x64
-//! 5.12 (256x256 5.28, excluded as unmergeable); 16384x384x384 — 128x64 6.95
-//! ~= 128x128 6.94, padded 128x256 3.25; 1944x1280x3840 — 64x128 ~= 128x64
-//! ~2.1, padded 128x512 1.12; 1000x1024x1024 — 128x512 4.18 vs 16x64 3.85
-//! (padding-first picks 16x64; accepted, least wasted work).
+//! Measured anchors on M2 Max, per-entry minima over the round-robin reps of
+//! `CHECK=1 ITERS=12 REPS=8 cargo run --release -p fusor-core --example
+//! bench_coop_tiles` (every entry verified against the host reference in the
+//! same run, so no rate here belongs to a miscomputing kernel):
+//! 1024^3 — 128x64 5.06 = 64x64 5.06 / 128x128 3.91 / 128x512 2.68 TF/s;
+//! 384x16384x1536 — 64x64 6.31 / 128x64 5.94 / 128x512 1.49; 4096^3 —
+//! 128x64 7.64 / 64x64 7.42 / 256x256 5.57 (excluded as unmergeable) /
+//! 128x512 5.20; 16384x384x384 — 128x64 7.15 / 64x64 6.03 / 128x128 5.22,
+//! padded 128x256 3.38; 1944x1280x3840 — 64x64 4.19 (least padded) vs
+//! 128x64 2.70 ~= 64x128 2.61, padded 128x512 1.47; 1000x1024x1024 — 64x64
+//! 3.11 / 128x64 2.62, padded 128x512 1.09.
 
 use std::cmp::Reverse;
 
@@ -132,11 +141,14 @@ pub(super) fn select_coop_tile(
         // workgroup memory once per pass. The raw tile sweep (zero-pad,
         // saturated grids) measures them losing at every shape — no wave
         // structure trades against it: 16384x384x1536 — 128x64 (1 pass)
-        // 7.40 TF/s vs 128x128 (2) 5.54, 128x256 (4) 5.53, 128x512 (8)
-        // 5.34; 16384x1536x384 — 7.37 vs 3.32; 4096^3 — 6.32 vs 5.09;
-        // 16384x3072x1536 — 5.56 vs 4.22. Pass count therefore orders
-        // lexicographically after padding: multi-pass geometry is reachable
-        // only when padding genuinely favors it.
+        // 7.55 TF/s vs 128x128 (2) 5.83, 128x256 (4) 5.62, 128x512 (8)
+        // 5.42; 16384x1536x384 — 7.64 vs 3.32; 4096^3 — 7.64 vs 5.20;
+        // 16384x3072x1536 — 7.49 vs 5.28. Padded MACs are monotone in tile
+        // extent, so padding alone can never put one of them ahead of the
+        // single-pass 64x64 (legal wherever they are): pass count ordering
+        // ahead of depth is what keeps a starved grid's wave count from
+        // rescuing them on a padding tie, which it otherwise does at most
+        // aligned shapes (4096^3 would take 128x512, 5.20 against 7.64).
         let key: ScoreKey = (
             padded_macs,
             entry.n_passes,
@@ -216,7 +228,10 @@ pub(super) fn swizzle_group_m(
 
 /// Split-K decision for a coop tile, pure in its inputs (see the gate and
 /// divisor commentary at the call site in `kernel.rs`, which this preserves
-/// verbatim). Returns the split count, or `None` to run unsplit.
+/// verbatim). Returns the split count, or `None` to run unsplit. Splitting
+/// buys parallelism the tile grid cannot supply and nothing else: the
+/// 384x16384x1536 weight gradient ran ~2.3 TF/s on split 128x512 against
+/// 5.94 unsplit on 128x64.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn split_k_plan(
     m: u32,

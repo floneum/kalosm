@@ -110,6 +110,8 @@ impl Operation for DequantizeOperation {
 
     fn visit_dependencies(&self, _: &mut dyn FnMut(crate::compute_graph::NodeIndex)) {}
 
+    fn visit_dependencies_mut(&mut self, _: &mut dyn FnMut(&mut crate::compute_graph::NodeIndex)) {}
+
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
         let shape = &self.matrix.shape;
         let output_tensor = TensorData::new_for_shape(&nodes.device(), shape, self.datatype);

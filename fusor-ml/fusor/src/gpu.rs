@@ -7,9 +7,10 @@ use std::{
 
 pub use fusor_core::{
     CastTensor, DataType, DataTypeEnum, Device, Dim, Error, FloatDataType, GgufReadError,
-    GpuMirostat2Sampler, GpuMirostat2SamplerParams, GpuStandardSamplerParams, Layout, MappedBuffer,
-    NodeIndex, PendingGpuSampledToken as CorePendingGpuSampledToken, QMatrix, Result,
-    ShapeWithOneHole, StrideSpec, TensorSlice, WasmNotSend, WasmNotSync,
+    GpuMirostat2Sampler, GpuMirostat2SamplerParams, GpuStandardSamplerParams, KernelProfile,
+    KernelProfileRow, Layout, MappedBuffer, NodeIndex,
+    PendingGpuSampledToken as CorePendingGpuSampledToken, QMatrix, Result, ShapeWithOneHole,
+    StrideSpec, TensorSlice, WasmNotSend, WasmNotSync,
 };
 
 type CoreTensor = fusor_core::Tensor;
@@ -154,6 +155,11 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     #[inline]
     pub fn count_kernels_to_resolve(&self) -> usize {
         self.inner.count_kernels_to_resolve()
+    }
+
+    #[inline]
+    pub fn resolves_in<const N: usize>(&self) -> bool {
+        self.inner.resolves_in::<N>()
     }
 
     #[inline]

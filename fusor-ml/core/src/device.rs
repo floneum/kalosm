@@ -1,6 +1,6 @@
 use std::{
     fmt::Debug,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use fusor_tile_ir::{CoopMatrixToken, SubgroupToken};
@@ -135,6 +135,35 @@ fn install_device_diagnostics(device: &wgpu::Device) {
     }));
 }
 
+/// One timed dispatch aggregate (per category or per kernel name) from a
+/// profiled resolve.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KernelProfileRow {
+    pub name: String,
+    pub count: usize,
+    pub total_ms: f64,
+    pub average_us: f64,
+    pub max_us: f64,
+}
+
+/// GPU timestamp profile of one resolve, recorded when
+/// [`FusorConfig::trace_gpu_kernels`] is set and drained with
+/// [`Device::take_kernel_profiles`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct KernelProfile {
+    /// `"inside_pass"` when the adapter timestamps individual dispatches,
+    /// otherwise `"pass_boundary"`.
+    pub timestamp_mode: &'static str,
+    pub kernels: usize,
+    pub accounted_ms: f64,
+    pub span_ms: f64,
+    pub timestamp_period_ns: f64,
+    /// Per-category aggregates, sorted by total time descending.
+    pub categories: Vec<KernelProfileRow>,
+    /// The most expensive kernel names, sorted by total time descending.
+    pub top_names: Vec<KernelProfileRow>,
+}
+
 struct DeviceInner {
     device: Arc<wgpu::Device>,
     config: Arc<FusorConfig>,
@@ -165,6 +194,10 @@ struct DeviceInner {
     /// pre-filled with a poison pattern instead of left zeroed, reproducing the
     /// app's reused buffer pool. A property of the device for the same reason.
     poison_allocations: bool,
+    /// GPU kernel profiles recorded by profiled resolves
+    /// (`FUSOR_TRACE_GPU_KERNELS`), drained by
+    /// [`Device::take_kernel_profiles`].
+    kernel_profiles: Mutex<Vec<KernelProfile>>,
 }
 
 impl Debug for DeviceInner {
@@ -225,6 +258,7 @@ impl Device {
             compute_graph: OnceLock::new(),
             disable_subgroups,
             poison_allocations,
+            kernel_profiles: Default::default(),
         });
         let device = Device {
             inner: inner.clone(),
@@ -384,6 +418,7 @@ impl Device {
             compute_graph: OnceLock::new(),
             disable_subgroups,
             poison_allocations,
+            kernel_profiles: Default::default(),
         });
 
         let device = Device {
@@ -608,6 +643,19 @@ impl Device {
     /// The process configuration this device was constructed with.
     pub fn config(&self) -> &FusorConfig {
         &self.inner.config
+    }
+
+    /// Every GPU kernel profile recorded since the last call, oldest first.
+    /// One profile is recorded per profiled resolve when
+    /// [`FusorConfig::trace_gpu_kernels`] is set; replayed resolves skip
+    /// profiling.
+    pub fn take_kernel_profiles(&self) -> Vec<KernelProfile> {
+        std::mem::take(&mut self.inner.kernel_profiles.lock().unwrap())
+    }
+
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn record_kernel_profile(&self, profile: KernelProfile) {
+        self.inner.kernel_profiles.lock().unwrap().push(profile);
     }
 
     pub(crate) fn flush_plan_cache(&self) -> &crate::compute_graph::FlushPlanCache {

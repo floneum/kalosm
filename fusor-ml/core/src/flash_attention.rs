@@ -394,6 +394,23 @@ impl Operation for FlashAttentionOperation {
         }
     }
 
+    fn visit_dependencies_mut(&mut self, f: &mut dyn FnMut(&mut NodeIndex)) {
+        f(&mut self.q);
+        f(&mut self.k);
+        for node in [
+            &mut self.v,
+            &mut self.grad_o,
+            &mut self.lse,
+            &mut self.dsum,
+            &mut self.mask,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            f(node);
+        }
+    }
+
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
         let resolved = |node: NodeIndex| {
             nodes

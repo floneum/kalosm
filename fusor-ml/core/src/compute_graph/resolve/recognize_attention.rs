@@ -184,8 +184,10 @@ impl Resolver {
         // — decode's single row, ragged or oversized extents, non-f32 —
         // lowers through the generic attention row program as before.
         if matched.q_shape[2] > 1
-            && let Some(operation) =
-                crate::flash_attention::FlashAttentionOperation::try_new_output(&graph.device(), &inputs)
+            && let Some(operation) = crate::flash_attention::FlashAttentionOperation::try_new_output(
+                &graph.device(),
+                &inputs,
+            )
         {
             self.commit_recognized(
                 graph,
@@ -838,7 +840,8 @@ impl Resolver {
         };
         let datatype = add.output_datatype;
         for (m_side, log_side) in [(lhs, rhs), (rhs, lhs)] {
-            let Some((max_axis, max_value)) = self.match_reduce(m_side, crate::reduce::ReduceOp::Max)
+            let Some((max_axis, max_value)) =
+                self.match_reduce(m_side, crate::reduce::ReduceOp::Max)
             else {
                 continue;
             };
@@ -911,7 +914,9 @@ impl Resolver {
 }
 
 /// The operation's dependencies in `visit_dependencies` order.
-fn grad_dependencies(operation: &crate::flash_attention::FlashAttentionOperation) -> Vec<NodeIndex> {
+fn grad_dependencies(
+    operation: &crate::flash_attention::FlashAttentionOperation,
+) -> Vec<NodeIndex> {
     use crate::mir::operation::Operation;
     let mut dependencies = Vec::new();
     operation.visit_dependencies(&mut |node| dependencies.push(node));
@@ -920,11 +925,7 @@ fn grad_dependencies(operation: &crate::flash_attention::FlashAttentionOperation
 
 impl Resolver {
     /// Match the dk-shaped contraction `dsᵀ · q` at a matmul node.
-    fn match_grad_k_root(
-        &self,
-        graph: &ComputeGraphInner,
-        inner: NodeIndex,
-    ) -> Option<MatchedDs> {
+    fn match_grad_k_root(&self, graph: &ComputeGraphInner, inner: NodeIndex) -> Option<MatchedDs> {
         let matmul = self.inner_matmul(inner)?;
         if !matmul.pre_element_wise[0].functions.is_empty()
             || !matmul.pre_element_wise[1].functions.is_empty()

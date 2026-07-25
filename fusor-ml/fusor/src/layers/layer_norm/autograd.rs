@@ -83,7 +83,10 @@ where
     crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
 {
     /// Normalizes the last dimension of an input tensor.
-    pub fn forward<const R: usize, const OUT_RANK: usize>(&self, input: &Tensor<R, T>) -> Tensor<R, T>
+    pub fn forward<const R: usize, const OUT_RANK: usize>(
+        &self,
+        input: &Tensor<R, T>,
+    ) -> Tensor<R, T>
     where
         crate::ConcreteTensor<T, R>: crate::cpu::LastRank<OUT_RANK, T>,
         crate::gpu::Tensor<R, T>: crate::gpu::LastRank<OUT_RANK, T>,
@@ -208,7 +211,10 @@ where
     crate::cpu::AtanhOp: crate::cpu::SimdUnaryOp<T>,
 {
     /// Forward pass for any input rank. `OUT_RANK` equals `N - 1`.
-    pub fn forward<const N: usize, const OUT_RANK: usize>(&self, input: &Tensor<N, T>) -> Tensor<N, T>
+    pub fn forward<const N: usize, const OUT_RANK: usize>(
+        &self,
+        input: &Tensor<N, T>,
+    ) -> Tensor<N, T>
     where
         crate::ConcreteTensor<T, N>: crate::cpu::LastRank<OUT_RANK, T>,
         crate::gpu::Tensor<N, T>: crate::gpu::LastRank<OUT_RANK, T>,
