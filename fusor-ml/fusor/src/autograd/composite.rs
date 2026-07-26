@@ -489,6 +489,61 @@ where
         ])
     }
 
+    /// The same window operand as [`Self::conv_windows_flat`], built from one
+    /// shifted slice per kernel offset instead of a sliding-window view, with
+    /// columns ordered kernel-major (`offset * in_channels + channel`).
+    ///
+    /// A sliding-window view reads each input element from several output
+    /// locations, so its transpose is an overlap-add — which the generic view
+    /// backward expresses as a masked reduce over *every* (input position,
+    /// output position) pair. That is quadratic in the spatial extent: a
+    /// 768-long sequence spends 1.8 billion element visits per convolution to
+    /// scatter 5.7 million gradients. Concatenated slices carry the same
+    /// values with a linear backward — `cat` differentiates to slices and
+    /// `narrow` to a zero-fill assign — and still materialize exactly once,
+    /// because concatenating along the trailing (channel) axis of a
+    /// channels-last view already produces the contiguous matmul operand.
+    ///
+    /// Only valid for unit strides; strided windows keep the view path.
+    fn conv_windows_shifted<const DIFF: usize>(
+        &self,
+        kernel: [usize; DIFF],
+        padding: [usize; DIFF],
+        out_spatial: [usize; DIFF],
+    ) -> Tensor<2, T> {
+        let input_shape = self.shape();
+        let in_channels = input_shape[1];
+        let kernel_size: usize = kernel.iter().product();
+        let out_spatial_size: usize = out_spatial.iter().product();
+        // (batch, channels, ...spatial) -> (batch, ...spatial, channels)
+        let channels_last: [usize; R] = std::array::from_fn(|axis| {
+            if axis == 0 {
+                0
+            } else if axis < R - 1 {
+                axis + 1
+            } else {
+                1
+            }
+        });
+        let padded = self.pad_spatial(padding).permute(channels_last);
+        let slices: Vec<Self> = (0..kernel_size)
+            .map(|flat_offset| {
+                let mut window = padded.clone();
+                let mut rest = flat_offset;
+                for axis in (0..DIFF).rev() {
+                    let offset = rest % kernel[axis];
+                    rest /= kernel[axis];
+                    window = window.narrow(1 + axis, offset, out_spatial[axis]);
+                }
+                window
+            })
+            .collect();
+        Self::cat(slices, R - 1).reshape([
+            input_shape[0] * out_spatial_size,
+            kernel_size * in_channels,
+        ])
+    }
+
     /// Reshape the `(batch * out_spatial, out_channels)` matmul output back to
     /// `(batch, out_channels, ...out_spatial)` and add the broadcast bias.
     fn conv_reassemble<const DIFF: usize>(
@@ -497,6 +552,15 @@ where
         output_shape: [usize; R],
     ) -> Self {
         let out_channels = output_shape[1];
+        // Add the bias to the matmul's own `(rows, out_channels)` output,
+        // where it broadcasts along the trailing axis, rather than after the
+        // reassembly permute: an elementwise expression sitting directly on
+        // the matmul result can ride its epilogue, while one behind a permute
+        // costs a separate full pass over the activation.
+        let output = match bias {
+            Some(bias) => output.add_::<1, 2>(bias),
+            None => output,
+        };
         let output: Tensor<R, T> = output.reshape(std::array::from_fn(|axis| {
             if axis == 0 {
                 output_shape[0]
@@ -515,14 +579,7 @@ where
                 index - 1
             }
         });
-        let output = output.permute(permutation);
-        if let Some(bias) = bias {
-            let bias_shape: [usize; R] =
-                std::array::from_fn(|axis| if axis == 1 { out_channels } else { 1 });
-            output.add(&bias.reshape(bias_shape).broadcast_as(output_shape))
-        } else {
-            output
-        }
+        output.permute(permutation)
     }
 
     fn conv_composite<const WEIGHT_RANK: usize, const DIFF: usize, const R2: usize>(
@@ -553,14 +610,38 @@ where
 
         let kernel: [usize; DIFF] = std::array::from_fn(|i| weight_shape[spatial_start + i]);
         let kernel_size: usize = kernel.iter().product();
-        let windows_flat = self.conv_windows_flat::<DIFF, R2>(kernel, padding, strides);
-        let weight_t = weight
-            .reshape([out_channels, in_channels * kernel_size])
-            .transpose(0, 1);
-        let output = windows_flat.mat_mul_internal(&weight_t);
-
         let output_shape =
             Self::conv_output_shape(input_shape, out_channels, kernel, padding, strides);
+
+        // Unit strides take the shifted-slice operand, whose backward is
+        // linear in the spatial extent; strided windows keep the view.
+        // Its columns are kernel-major, so the weight is laid out to match:
+        // (out, in, ...kernel) -> (...kernel, in, out).
+        let output = if strides.iter().all(|stride| *stride == 1) {
+            let out_spatial: [usize; DIFF] =
+                std::array::from_fn(|i| output_shape[spatial_start + i]);
+            let windows_flat = self.conv_windows_shifted::<DIFF>(kernel, padding, out_spatial);
+            let kernel_major: [usize; WEIGHT_RANK] = std::array::from_fn(|axis| {
+                if axis < DIFF {
+                    axis + spatial_start
+                } else if axis == DIFF {
+                    1
+                } else {
+                    0
+                }
+            });
+            let weight_rows = weight
+                .permute(kernel_major)
+                .reshape([kernel_size * in_channels, out_channels]);
+            windows_flat.mat_mul_internal(&weight_rows)
+        } else {
+            let windows_flat = self.conv_windows_flat::<DIFF, R2>(kernel, padding, strides);
+            let weight_t = weight
+                .reshape([out_channels, in_channels * kernel_size])
+                .transpose(0, 1);
+            windows_flat.mat_mul_internal(&weight_t)
+        };
+
         Self::conv_reassemble::<DIFF>(output, bias, output_shape)
     }
 

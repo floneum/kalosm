@@ -46,6 +46,7 @@ mod recognize_attention;
 mod recognize_cat;
 #[cfg(test)]
 mod recognize_gates;
+mod sink_views;
 mod run;
 #[cfg(feature = "graphvis")]
 mod visualize;
@@ -373,6 +374,8 @@ pub(crate) struct Resolver {
     /// Keys are the execution nodes that materialize; values receive the
     /// same allocation without another dispatch.
     shared_outputs: FxHashMap<NodeIndex, Vec<NodeIndex>>,
+    /// Unary chains moved into a matmul epilogue this resolve.
+    sunk_chains: usize,
     /// Wall-clock spent in each optimizer sub-phase of this resolve, for the
     /// host-cost ledger printed under `FUSOR_TRACE_RESOLVE_HOST`.
     optimize_phases: execution::OptimizePhases,
@@ -404,6 +407,7 @@ impl Resolver {
             resolved_set,
             recorder: None,
             shared_outputs: Default::default(),
+            sunk_chains: 0,
             optimize_phases: Default::default(),
         }
     }

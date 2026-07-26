@@ -161,15 +161,23 @@ fn output_observations(
 ) -> Vec<NodeIndex> {
     let mut observations = Vec::new();
     let mut seen = FxHashSet::default();
+    let mut pending: Vec<NodeIndex> = Vec::new();
     for output in outputs {
         if seen.insert(output) {
             observations.push(output);
         }
-        if let Some(aliases) = shared_outputs.get(&output) {
-            for &alias in aliases {
-                if seen.insert(alias) {
-                    observations.push(alias);
-                }
+        pending.push(output);
+    }
+    // Observations chain: follow them to the end, or a merged dispatch will
+    // leave the far end of a chain unobserved.
+    while let Some(current) = pending.pop() {
+        let Some(aliases) = shared_outputs.get(&current) else {
+            continue;
+        };
+        for &alias in aliases {
+            if seen.insert(alias) {
+                observations.push(alias);
+                pending.push(alias);
             }
         }
     }

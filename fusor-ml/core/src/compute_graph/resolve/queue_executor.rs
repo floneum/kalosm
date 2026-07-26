@@ -9,6 +9,33 @@ use super::merge_horizontal::MergedSegments;
 use super::*;
 use crate::mir::kernel_backend::DirectKernel;
 
+/// Every node that observes `node`'s value, transitively.
+///
+/// Observations chain: one pass can record `a` as an observation of `b` and a
+/// later one record `b` as an observation of `c`, and then caching `c` has to
+/// reach `a` too. Following only the direct entries leaves the far end of such
+/// a chain uncached, and its readers resolve to nothing.
+fn observations_of(
+    node: NodeIndex,
+    shared_outputs: &FxHashMap<NodeIndex, Vec<NodeIndex>>,
+) -> Vec<NodeIndex> {
+    let mut observations = Vec::new();
+    let mut pending = vec![node];
+    let mut seen = FxHashSet::default();
+    while let Some(current) = pending.pop() {
+        let Some(direct) = shared_outputs.get(&current) else {
+            continue;
+        };
+        for &observation in direct {
+            if seen.insert(observation) {
+                observations.push(observation);
+                pending.push(observation);
+            }
+        }
+    }
+    observations
+}
+
 fn cache_output(
     graph: &mut ComputeGraphInner,
     node: NodeIndex,
@@ -16,10 +43,8 @@ fn cache_output(
     shared_outputs: &FxHashMap<NodeIndex, Vec<NodeIndex>>,
 ) {
     graph.set_cached_result(node, result.clone());
-    if let Some(observations) = shared_outputs.get(&node) {
-        for &observation in observations {
-            graph.set_cached_result(observation, result.clone());
-        }
+    for observation in observations_of(node, shared_outputs) {
+        graph.set_cached_result(observation, result.clone());
     }
 }
 
@@ -29,12 +54,10 @@ fn record_shared_outputs(
     result: &TensorData,
     shared_outputs: &FxHashMap<NodeIndex, Vec<NodeIndex>>,
 ) {
-    if let Some(observations) = shared_outputs.get(&node) {
-        for &observation in observations {
-            recorder
-                .borrow_mut()
-                .record_shared_alias(observation, result, node);
-        }
+    for observation in observations_of(node, shared_outputs) {
+        recorder
+            .borrow_mut()
+            .record_shared_alias(observation, result, node);
     }
 }
 

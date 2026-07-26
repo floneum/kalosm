@@ -147,6 +147,9 @@ impl Resolver {
         driver.refresh_prov_classes();
         self.apply_egraph_deltas(graph, &driver, &extraction);
         self.coalesce_equivalent_eclasses(graph, &driver);
+        // After extraction, like coalescing: both leave observations behind,
+        // and a later rewrite that rewired past one would strand it.
+        self.sink_unary_chains_into_matmuls(graph);
         self.optimize_phases.extraction += extraction_start.elapsed();
         #[cfg(feature = "graphvis")]
         if let Some(dir) = &config.dump_stages {

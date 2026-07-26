@@ -306,6 +306,13 @@ where
         }
     }
 
+    /// This tensor's gradient destination, without a handle on the graph.
+    /// See [`GradientSlot`]: custom backward closures must capture this
+    /// rather than a `Tensor`.
+    pub fn slot(&self) -> GradientSlot {
+        GradientSlot(self.handle.id)
+    }
+
     pub fn detach(&self) -> Self {
         let requires_grad = self.requires_grad();
         let id = self.handle.graph.add_node(Vec::new(), None, requires_grad);
@@ -352,6 +359,13 @@ where
             .iter()
             .map(|parent| parent.id)
             .collect::<Vec<_>>();
+        // The graph owns this closure, so the closure may only hold a *weak*
+        // reference back: parent handles would close a reference cycle that
+        // keeps the whole tape — and every activation buffer it cached —
+        // alive for the rest of the process. The closure never runs outside
+        // `backward()`, where the graph is alive by construction.
+        let owner = Arc::downgrade(&self.handle.graph);
+        let checked_ids = parent_ids.clone();
         let backward: BackwardRule = Arc::new(move |gradient| {
             let gradient = gradient
                 .as_any()
@@ -362,13 +376,15 @@ where
             // The scheduler only unlocks a parent once every child sends it a
             // gradient, so a missing target would silently starve that
             // parent's whole subgraph.
-            for parent in &parent_handles {
-                if parent.graph.requires_grad(parent.id)
-                    && !targets.iter().any(|target| target.node == parent.id)
-                {
-                    return Err(Error::msg(
-                        "custom backward omitted a gradient for a parent that requires grad",
-                    ));
+            if let Some(graph) = owner.upgrade() {
+                for &parent in &checked_ids {
+                    if graph.requires_grad(parent)
+                        && !targets.iter().any(|target| target.node == parent)
+                    {
+                        return Err(Error::msg(
+                            "custom backward omitted a gradient for a parent that requires grad",
+                        ));
+                    }
                 }
             }
             Ok(targets)
@@ -728,12 +744,33 @@ impl BackwardTarget {
     where
         crate::AddOp: crate::SimdBinaryOp<T>,
     {
+        Self::to(tensor.slot(), gradient)
+    }
+
+    /// Route a gradient to a slot captured with [`Tensor::slot`].
+    pub fn to<const R: usize, T: AutogradElement>(
+        slot: GradientSlot,
+        gradient: RawTensor<R, T>,
+    ) -> Self
+    where
+        crate::AddOp: crate::SimdBinaryOp<T>,
+    {
         Self {
-            node: tensor.handle.id,
+            node: slot.0,
             gradient: Box::new(gradient),
         }
     }
 }
+
+/// Where a custom backward sends a gradient: a node identity detached from
+/// the graph that owns it.
+///
+/// A [`Tensor::with_backwards`] closure is stored *inside* the graph, so
+/// capturing a `Tensor` to name the destination would give the graph an
+/// `Arc` to itself — a cycle that keeps every buffer the tape cached alive
+/// for the rest of the process. Capture a slot instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GradientSlot(NodeId);
 
 impl GraphInner {
     fn add_node(

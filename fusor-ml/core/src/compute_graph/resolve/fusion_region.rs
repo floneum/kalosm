@@ -393,10 +393,24 @@ impl Resolver {
             .enumerate()
             .map(|(pos, &member)| (member, pos))
             .collect();
-        let inner_of: FxHashMap<NodeIndex, ExecutionNodeIndex> = members
+        let mut inner_of: FxHashMap<NodeIndex, ExecutionNodeIndex> = members
             .iter()
             .map(|&member| (self.execution_graph[member].inner_idx, member))
             .collect();
+        // A member's input can name a coalesced *observation* of another
+        // member's value rather than that member's own index: ingestion puts
+        // semantically identical nodes in one e-class, keeps one execution
+        // node, and records the rest in `shared_outputs`. Those aliases must
+        // map to the producing member's register too — leaving one as an
+        // external input makes the region read a value it computes itself,
+        // which nothing in the queue produces.
+        for (owner, aliases) in &self.shared_outputs {
+            if let Some(&member) = inner_of.get(owner) {
+                for &alias in aliases {
+                    inner_of.entry(alias).or_insert(member);
+                }
+            }
+        }
 
         // Deduplicated external inputs; slots assigned in first-use order.
         let mut inputs: Vec<NodeIndex> = Vec::new();
