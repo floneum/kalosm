@@ -65,6 +65,22 @@ pub(super) struct ExtractState {
     /// Reverse index: consumers (by prov) of each node under the current
     /// selection, one entry per read occurrence.
     pub(super) consumers: Vec<Vec<u32>>,
+    /// Spike: price producer duplication instead of forbidding it
+    /// (`FUSOR_SPIKE_NO_DUP_GATE`). Default false keeps the gate.
+    pub(super) no_dup_gate: bool,
+    /// Spike: count input reads in the byte term (`FUSOR_SPIKE_READ_TRAFFIC`).
+    pub(super) read_traffic: bool,
+    /// Spike: compare costs on one clock instead of the lexicographic tuple
+    /// (`FUSOR_SPIKE_SCALAR_COST`). Implies `read_traffic` — scalarizing a
+    /// write-only byte term would weigh a number that is not bandwidth.
+    pub(super) scalar_cost: bool,
+    /// Spike ledger: distinct producers the gate refused to inline, and how
+    /// many candidates it rejected. Recorded whether or not the gate is
+    /// enforcing, so the surface is measurable from an unmodified run.
+    /// Off by default; the bookkeeping allocates and the gate is hot.
+    pub(super) dup_ledger: bool,
+    pub(super) dup_blocked: std::cell::RefCell<rustc_hash::FxHashSet<u32>>,
+    pub(super) dup_firings: std::cell::Cell<u64>,
 }
 
 impl ExtractState {
@@ -76,6 +92,12 @@ impl ExtractState {
             needed: vec![true; count],
             reads: vec![0; count],
             consumers: vec![Vec::new(); count],
+            no_dup_gate: false,
+            read_traffic: false,
+            scalar_cost: false,
+            dup_ledger: false,
+            dup_blocked: Default::default(),
+            dup_firings: Default::default(),
         };
         for prov in 0..count as u32 {
             for child in state.selected_child_provs(driver, Prov(prov)) {
@@ -181,14 +203,29 @@ impl ExtractState {
     ) -> bool {
         let candidate_children: rustc_hash::FxHashSet<u32> =
             candidate_children.into_iter().collect();
-        self.selected_child_provs(driver, prov)
+        let mut duplicated = self
+            .selected_child_provs(driver, prov)
             .into_iter()
-            .any(|child| {
-                !candidate_children.contains(&child)
-                    && !kills.contains(&child)
-                    && self.needed[child as usize]
-                    && driver.selection_cost(self, Prov(child)).dispatches > 0
-            })
+            .filter(|child| {
+                !candidate_children.contains(child)
+                    && !kills.contains(child)
+                    && self.needed[*child as usize]
+                    && driver.selection_cost(self, Prov(*child)).dispatches > 0
+            });
+        if !self.dup_ledger {
+            // Default path: the first offender decides, no bookkeeping and no
+            // allocation, exactly as before the spike was added.
+            return duplicated.next().is_some() && !self.no_dup_gate;
+        }
+        let duplicated: Vec<u32> = duplicated.collect();
+        if duplicated.is_empty() {
+            return false;
+        }
+        // The ledger records whether or not the gate enforces, so the surface
+        // is measurable from an otherwise-stock run.
+        self.dup_firings.set(self.dup_firings.get() + 1);
+        self.dup_blocked.borrow_mut().extend(duplicated);
+        !self.no_dup_gate
     }
 
     fn kills_from_child_provs(
@@ -368,6 +405,10 @@ impl EGraphDriver {
     pub(super) fn extract_with_fusion(&mut self, ctx: &FusionCtx<'_>) -> Extraction {
         let mut state = ExtractState::new(self);
         let device = ctx.graph.device();
+        state.no_dup_gate = device.config().spike_no_dup_gate;
+        state.dup_ledger = device.config().spike_dup_ledger;
+        state.scalar_cost = device.config().spike_scalar_cost;
+        state.read_traffic = device.config().spike_read_traffic || state.scalar_cost;
         let mut plans = FusionPlanMemo::for_config(device.config());
         // The window horizon must cover everything a generator observes;
         // this tripwire proves it by regenerating and comparing on every
@@ -426,7 +467,8 @@ impl EGraphDriver {
                             None => {
                                 plans.note_store_miss();
                                 let result = self.best_fusion_candidate(&state, &view, Prov(prov));
-                                if let Some(decision) = plans.record(&instance, &view, result.as_ref())
+                                if let Some(decision) =
+                                    plans.record(&instance, &view, result.as_ref())
                                 {
                                     store.record(key, decision);
                                 }
@@ -477,6 +519,36 @@ impl EGraphDriver {
                 .chain(new_consumers)
                 .chain(touched);
             view.enqueue_downstream(&state, seeds, &mut worklist, &mut queued);
+        }
+        if device.config().spike_dup_ledger {
+            // The remat surface: producers a candidate wanted to inline while
+            // they still materialize for another consumer. `write_bytes` is
+            // what dies if every consumer inlines; `recompute_work` is what
+            // each extra consumer then pays. Note the cost model counts only
+            // output writes, so neither side includes input re-reads.
+            let blocked = state.dup_blocked.borrow();
+            let (mut live, mut write_bytes, mut recompute_work, mut extra_consumers) =
+                (0u64, 0u128, 0u128, 0u64);
+            for &prov in blocked.iter() {
+                if !state.needed[prov as usize] {
+                    continue;
+                }
+                let cost = self.selection_cost(&state, Prov(prov));
+                live += 1;
+                write_bytes = write_bytes.saturating_add(cost.materialized_bytes);
+                recompute_work = recompute_work.saturating_add(cost.work);
+                extra_consumers += u64::from(state.reads[prov as usize].saturating_sub(1));
+            }
+            tracing::info!(
+                "dup_gate_ledger enforcing={} firings={} producers={} live={} write_bytes={} recompute_work={} extra_consumers={}",
+                !state.no_dup_gate,
+                state.dup_firings.get(),
+                blocked.len(),
+                live,
+                write_bytes,
+                recompute_work,
+                extra_consumers,
+            );
         }
         if device.config().spike_hoisting {
             let sharing = plans.stats();

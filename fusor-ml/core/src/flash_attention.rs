@@ -300,13 +300,21 @@ impl FlashAttentionOperation {
         let mut next = || iter.next().and_then(MirValue::as_tensor);
         let q = next()?;
         let k = next()?;
-        let v = if self.v.is_some() { Some(next()?) } else { None };
+        let v = if self.v.is_some() {
+            Some(next()?)
+        } else {
+            None
+        };
         let grad_o = if self.grad_o.is_some() {
             Some(next()?)
         } else {
             None
         };
-        let lse = if self.lse.is_some() { Some(next()?) } else { None };
+        let lse = if self.lse.is_some() {
+            Some(next()?)
+        } else {
+            None
+        };
         let dsum = if self.dsum.is_some() {
             Some(next()?)
         } else {
@@ -573,11 +581,8 @@ impl Operation for FlashAttentionOperation {
                 let needs_dsum = kind != AttentionKernel::GradV;
                 // The combined output's sequence axis spans 2*kv_len; its
                 // layout already reflects that from the allocation.
-                let placeholder = FlashOperandLayout::contiguous(
-                    self.kv_heads,
-                    self.kv_len,
-                    self.head_dim,
-                );
+                let placeholder =
+                    FlashOperandLayout::contiguous(self.kv_heads, self.kv_len, self.head_dim);
                 let layouts = FlashBwdLayouts {
                     q: lq,
                     k: lk,

@@ -193,6 +193,7 @@ impl StoredBody {
             }
             ExecutionVariant::Elementwise(_)
             | ExecutionVariant::Reduce(_)
+            | ExecutionVariant::Fold(_)
             | ExecutionVariant::View(_)
             | ExecutionVariant::MatMul(_)
             | ExecutionVariant::RowProgram(_)

@@ -320,6 +320,7 @@ impl HorizontalMerger {
             ExecutionVariant::QMatrix(op) => op.visit_dependencies(&mut visit),
             ExecutionVariant::Elementwise(op) => op.visit_dependencies(&mut visit),
             ExecutionVariant::Reduce(op) => op.visit_dependencies(&mut visit),
+            ExecutionVariant::Fold(op) => op.visit_dependencies(&mut visit),
             ExecutionVariant::View(op) => op.visit_dependencies(&mut visit),
             ExecutionVariant::Assign(op) => op.visit_dependencies(&mut visit),
             ExecutionVariant::Region(op) => op.visit_dependencies(&mut visit),

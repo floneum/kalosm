@@ -16,6 +16,10 @@ use crate::{
     },
 };
 
+/// Cooperative-matrix fragment side: every per-subgroup fragment grid
+/// counts whole 8x8 fragments.
+const COOP_DIM: u32 = 8;
+
 /// Logical shape for flattened batched dense matmul views.
 #[derive(Clone, Copy, Debug)]
 pub struct DenseMatmulShape {
@@ -68,6 +72,17 @@ pub struct DenseCoopMatmulConfig {
     pub coop: CoopMatrixToken,
     pub subgroups: SubgroupConfig,
     pub tile: DenseCoopMatmulTile,
+    /// How the workgroup's subgroups tile the output block. Derived by
+    /// [`CoopTileEntry::subgroup_split`]; it travels on the config so a
+    /// forced-geometry experiment can override it without editing the table.
+    pub row_groups: u32,
+    pub col_groups: u32,
+    /// Staged operand tile pairs, 1 or 2. Two pairs let the next K-tile fill
+    /// while the current one's MMAs issue; one pair halves the workgroup's
+    /// threadgroup footprint, so more workgroups sit resident per core and
+    /// hide each other's epilogue drain. Which wins is a per-contraction
+    /// trade the caller scores; `single_buffered` entries force 1.
+    pub stage_buffers: u32,
     /// Traversal-order parameter: the tile swizzle walks the grid in
     /// super-blocks of this many M-lines so a resident wavefront covers a
     /// near-square output patch (see [`DEFAULT_SWIZZLE_GROUP_M`]).
@@ -82,15 +97,54 @@ pub struct DenseCoopMatmulConfig {
 #[derive(Clone, Copy)]
 pub struct CoopTileEntry {
     pub tile: DenseCoopMatmulTile,
-    pub row_groups: u32,
-    pub col_groups: u32,
+    /// Subgroups per workgroup. Sets `block`; a compiled kernel property.
+    /// Its factorization into rows x cols is not data — see
+    /// [`Self::subgroup_split`].
+    pub subgroups: u32,
     pub n_passes: u32,
     pub single_buffered: bool,
 }
 
 impl CoopTileEntry {
+    /// `(row_groups, col_groups)`: how this entry's subgroups tile the output
+    /// block. At a fixed subgroup count `S` the per-subgroup fragment grid has
+    /// invariant area (`bm * bn_pass / (64 * S)`) and the staged operand bytes
+    /// do not depend on the factorization at all, so the only quantity it
+    /// moves is threadgroup fragment loads: a subgroup issues `tr + tc` loads
+    /// to feed `tr * tc` MMAs per kk-step, which summed over the workgroup is
+    /// `cg * bm + rg * bn_pass`. Minimize that subject to both fragment sides
+    /// staying whole multiples of `COOP_DIM`; ties keep the smaller `rg`,
+    /// which reproduces the table's hand-set 64x128 row.
+    pub const fn subgroup_split(self) -> (u32, u32) {
+        let bn_pass = self.tile.bn / self.n_passes;
+        let mut best_rg = 0;
+        let mut best_loads = 0;
+        let mut rg = 1;
+        while rg <= self.subgroups {
+            let cg = self.subgroups / rg;
+            if self.subgroups % rg == 0
+                && self.tile.bm % (COOP_DIM * rg) == 0
+                && bn_pass % (COOP_DIM * cg) == 0
+            {
+                let loads = cg * self.tile.bm + rg * bn_pass;
+                if best_rg == 0 || loads < best_loads {
+                    best_rg = rg;
+                    best_loads = loads;
+                }
+            }
+            rg += 1;
+        }
+        // Total for a hypothetical row whose sides admit no legal split; the
+        // kernels' own divisibility asserts catch it at build time.
+        if best_rg == 0 {
+            (1, self.subgroups)
+        } else {
+            (best_rg, self.subgroups / best_rg)
+        }
+    }
+
     const fn block(self, subgroups: SubgroupConfig) -> u32 {
-        subgroups.block_for_subgroups(self.row_groups * self.col_groups)
+        subgroups.block_for_subgroups(self.subgroups)
     }
 
     /// Workgroup-memory footprint of this entry's single-pass kernel in
@@ -98,8 +152,14 @@ impl CoopTileEntry {
     /// the entry is single-buffered. Asserted equal to the lowered IR's
     /// `workgroup_bytes` per entry in `tests/footprint.rs`.
     pub const fn workgroup_bytes(self, stage: ScalarElement) -> u64 {
-        let buffers = if self.single_buffered { 1 } else { 2 };
-        self.tile.stage_pair_elements(self.n_passes) * stage.byte_size() * buffers
+        self.workgroup_bytes_at(stage, if self.single_buffered { 1 } else { 2 })
+    }
+
+    /// The same footprint at an explicit staging depth. The residency term
+    /// reads this: `max_workgroup_storage / workgroup_bytes_at(..)` is how
+    /// many workgroups a core can hold.
+    pub const fn workgroup_bytes_at(self, stage: ScalarElement, buffers: u32) -> u64 {
+        self.tile.stage_pair_elements(self.n_passes) * stage.byte_size() * buffers as u64
     }
 }
 
@@ -130,7 +190,10 @@ pub fn try_batched_coop_matmul(
         coop,
         subgroups,
         tile,
+        row_groups,
+        col_groups,
         staging,
+        stage_buffers,
         swizzle_group_m,
     } = config;
     let subgroup = subgroups.token();
@@ -147,7 +210,7 @@ pub fn try_batched_coop_matmul(
         return false;
     };
     let block = entry.block(subgroups);
-    if entry.single_buffered {
+    if entry.single_buffered || stage_buffers <= 1 {
         batched_coop_matmul_perf_single(
             program,
             staging,
@@ -162,8 +225,8 @@ pub fn try_batched_coop_matmul(
             bm,
             bn,
             bk,
-            entry.row_groups,
-            entry.col_groups,
+            row_groups,
+            col_groups,
             entry.n_passes,
             subgroups,
             epilogues,
@@ -183,8 +246,8 @@ pub fn try_batched_coop_matmul(
             bm,
             bn,
             bk,
-            entry.row_groups,
-            entry.col_groups,
+            row_groups,
+            col_groups,
             entry.n_passes,
             subgroups,
             epilogues,
@@ -210,8 +273,7 @@ const COOP_TILE_TABLE: &[CoopTileEntry] = &[
             bn: 256,
             bk: 16,
         },
-        row_groups: 8,
-        col_groups: 1,
+        subgroups: 8,
         n_passes: 8,
         single_buffered: true,
     },
@@ -221,8 +283,7 @@ const COOP_TILE_TABLE: &[CoopTileEntry] = &[
             bn: 512,
             bk: 16,
         },
-        row_groups: 4,
-        col_groups: 2,
+        subgroups: 8,
         n_passes: 8,
         single_buffered: false,
     },
@@ -232,8 +293,7 @@ const COOP_TILE_TABLE: &[CoopTileEntry] = &[
             bn: 256,
             bk: 16,
         },
-        row_groups: 4,
-        col_groups: 2,
+        subgroups: 8,
         n_passes: 4,
         single_buffered: false,
     },
@@ -248,8 +308,7 @@ const COOP_TILE_TABLE: &[CoopTileEntry] = &[
             bn: 128,
             bk: 16,
         },
-        row_groups: 4,
-        col_groups: 2,
+        subgroups: 8,
         n_passes: 2,
         single_buffered: false,
     },
@@ -259,8 +318,7 @@ const COOP_TILE_TABLE: &[CoopTileEntry] = &[
             bn: 64,
             bk: 16,
         },
-        row_groups: 4,
-        col_groups: 2,
+        subgroups: 8,
         n_passes: 1,
         single_buffered: false,
     },
@@ -270,8 +328,7 @@ const COOP_TILE_TABLE: &[CoopTileEntry] = &[
             bn: 128,
             bk: 16,
         },
-        row_groups: 2,
-        col_groups: 4,
+        subgroups: 8,
         n_passes: 2,
         single_buffered: false,
     },
@@ -281,8 +338,7 @@ const COOP_TILE_TABLE: &[CoopTileEntry] = &[
             bn: 64,
             bk: 16,
         },
-        row_groups: 2,
-        col_groups: 2,
+        subgroups: 4,
         n_passes: 1,
         single_buffered: false,
     },
@@ -296,8 +352,7 @@ const COOP_TILE_TABLE: &[CoopTileEntry] = &[
             bn: 16,
             bk: 16,
         },
-        row_groups: 2,
-        col_groups: 2,
+        subgroups: 4,
         n_passes: 1,
         single_buffered: false,
     },
@@ -307,8 +362,7 @@ const COOP_TILE_TABLE: &[CoopTileEntry] = &[
             bn: 64,
             bk: 16,
         },
-        row_groups: 2,
-        col_groups: 2,
+        subgroups: 4,
         n_passes: 1,
         single_buffered: false,
     },
@@ -338,13 +392,16 @@ pub fn try_batched_coop_matmul_split_k(
     max_workgroups_per_dimension: u32,
     config: DenseCoopMatmulConfig,
 ) -> bool {
-    const COOP_DIM: u32 = 8;
     let DenseMatmulTensors { a, b, y } = tensors;
     let DenseCoopMatmulConfig {
         coop,
         subgroups,
         tile,
+        row_groups,
+        col_groups,
         staging,
+        // The partials body always stages one pair; see `buffers` below.
+        stage_buffers: _,
         // The split grid is starved by construction; traversal order has no
         // resident wavefront to shape.
         swizzle_group_m: _,
@@ -371,8 +428,8 @@ pub fn try_batched_coop_matmul_split_k(
 
     let block = entry.block(subgroups);
     let bn_pass: u32 = bn / entry.n_passes;
-    let subgroup_rows: u32 = bm / entry.row_groups;
-    let subgroup_cols_per_pass: u32 = bn_pass / entry.col_groups;
+    let subgroup_rows: u32 = bm / row_groups;
+    let subgroup_cols_per_pass: u32 = bn_pass / col_groups;
     let tile_rows_per_sg: u32 = subgroup_rows / COOP_DIM;
     let tile_cols_per_sg: u32 = subgroup_cols_per_pass / COOP_DIM;
     let scalar = scalar_of(a.element());
@@ -384,8 +441,17 @@ pub fn try_batched_coop_matmul_split_k(
     let span_iters = k_iterations.div_ceil(splits);
     let m_padded = tiles_m * bm;
 
-    let a_tile = program.alloc_workgroup_tile_padded(stage_scalar, bm, bk, 1);
-    let b_tile = program.alloc_workgroup_tile_padded(stage_scalar, bk, bn_pass, 1);
+    // The partials body always stages one pair. A split grid exists to raise
+    // occupancy, and a second pair halves how many of its workgroups a core
+    // can hold: measured directly, double-buffering this loop costs 55% of
+    // wall time on 64x2048x256 at identical tile, splits and grid.
+    let buffers = 1;
+    let a_tiles: Vec<_> = (0..buffers)
+        .map(|_| program.alloc_workgroup_tile_padded(stage_scalar, bm, bk, 1))
+        .collect();
+    let b_tiles: Vec<_> = (0..buffers)
+        .map(|_| program.alloc_workgroup_tile_padded(stage_scalar, bk, bn_pass, 1))
+        .collect();
 
     let grid = dispatch_grid_1d(total_workgroups, max_workgroups_per_dimension);
     program.program_grid(block, grid, |program| {
@@ -423,8 +489,8 @@ pub fn try_batched_coop_matmul_split_k(
         ];
 
         let subgroup_id = subgroup.subgroup_id(program);
-        let sg_row = subgroup_id.clone() / entry.col_groups;
-        let sg_col = subgroup_id % entry.col_groups;
+        let sg_row = subgroup_id.clone() / col_groups;
+        let sg_col = subgroup_id % col_groups;
         let sg_row_base = sg_row * subgroup_rows;
         let sg_col_base_in_pass = sg_col * subgroup_cols_per_pass;
 
@@ -447,40 +513,43 @@ pub fn try_batched_coop_matmul_split_k(
             block,
             None,
             |program, pass_col_base, accs| {
-                program.loop_range(span_iters, |program, iter_idx| {
-                    let k_base = (span_base.clone() + iter_idx) * bk;
-                    coop_stage_and_mma(
-                        program,
-                        coop,
-                        a,
-                        b,
-                        &a_tile,
-                        &b_tile,
-                        &a_batch_base,
-                        &b_batch_base,
-                        &row_base,
-                        pass_col_base,
-                        &k_base,
-                        &sg_row_base,
-                        &sg_col_base_in_pass,
-                        &a_bounds,
-                        &b_bounds,
-                        accs,
-                        tile_rows_per_sg,
-                        tile_cols_per_sg,
-                        bk,
-                        COOP_DIM,
-                        stage_scalar,
-                        block,
-                        bm,
-                        bn_pass,
-                        None,
-                        None,
-                    );
-                    // Trailing barrier: the next iteration overwrites the
-                    // tiles this one just read through the coop loads.
-                    program.workgroup_barrier();
-                });
+                coop_k_span_pairs(
+                    program,
+                    &span_base,
+                    span_iters,
+                    bk,
+                    buffers,
+                    |program, k_base, buffer| {
+                        coop_stage_and_mma(
+                            program,
+                            coop,
+                            a,
+                            b,
+                            &a_tiles[buffer],
+                            &b_tiles[buffer],
+                            &a_batch_base,
+                            &b_batch_base,
+                            &row_base,
+                            pass_col_base,
+                            k_base,
+                            &sg_row_base,
+                            &sg_col_base_in_pass,
+                            &a_bounds,
+                            &b_bounds,
+                            accs,
+                            tile_rows_per_sg,
+                            tile_cols_per_sg,
+                            bk,
+                            COOP_DIM,
+                            stage_scalar,
+                            block,
+                            bm,
+                            bn_pass,
+                            None,
+                            None,
+                        );
+                    },
+                );
             },
         );
     });
@@ -513,12 +582,14 @@ pub fn try_merged_coop_matmul(
     max_workgroups_per_dimension: u32,
     config: DenseCoopMatmulConfig,
 ) -> bool {
-    const COOP_DIM: u32 = 8;
     let DenseCoopMatmulConfig {
         coop,
         subgroups,
         tile,
+        row_groups,
+        col_groups,
         staging,
+        stage_buffers,
         // Merged segments walk per-segment grids; the swizzle applies to the
         // standalone dense path.
         swizzle_group_m: _,
@@ -556,8 +627,8 @@ pub fn try_merged_coop_matmul(
 
     let block = entry.block(subgroups);
     let bn_pass: u32 = bn / entry.n_passes;
-    let subgroup_rows: u32 = bm / entry.row_groups;
-    let subgroup_cols_per_pass: u32 = bn_pass / entry.col_groups;
+    let subgroup_rows: u32 = bm / row_groups;
+    let subgroup_cols_per_pass: u32 = bn_pass / col_groups;
     let tile_rows_per_sg: u32 = subgroup_rows / COOP_DIM;
     let tile_cols_per_sg: u32 = subgroup_cols_per_pass / COOP_DIM;
     let scalar = scalar_of(segments[0].a.element());
@@ -572,18 +643,17 @@ pub fn try_merged_coop_matmul(
     let k_remainder = k_iterations % 2;
 
     // Shared workgroup tiles: every guarded branch has the same geometry.
-    // The split path stages single-buffered; the single-pass path double-
-    // buffers with a second pair (matching the standalone kernels).
-    let a_tile_0 = program.alloc_workgroup_tile_padded(stage_scalar, bm, bk, 1);
-    let b_tile_0 = program.alloc_workgroup_tile_padded(stage_scalar, bk, bn_pass, 1);
-    let (a_tile_1, b_tile_1) = if split_k {
-        (None, None)
-    } else {
-        (
-            Some(program.alloc_workgroup_tile_padded(stage_scalar, bm, bk, 1)),
-            Some(program.alloc_workgroup_tile_padded(stage_scalar, bk, bn_pass, 1)),
-        )
-    };
+    // Both bodies double-buffer with two pairs, matching the standalone
+    // kernels.
+    // Split partials always stage one pair (see `try_batched_coop_matmul_split_k`);
+    // the single-pass body takes the scored depth.
+    let buffers = if split_k { 1 } else { stage_buffers.clamp(1, 2) as usize };
+    let a_tiles: Vec<_> = (0..buffers)
+        .map(|_| program.alloc_workgroup_tile_padded(stage_scalar, bm, bk, 1))
+        .collect();
+    let b_tiles: Vec<_> = (0..buffers)
+        .map(|_| program.alloc_workgroup_tile_padded(stage_scalar, bk, bn_pass, 1))
+        .collect();
 
     let grid = dispatch_grid_1d(total_workgroups, max_workgroups_per_dimension);
     program.program_grid(block, grid, |program| {
@@ -642,8 +712,8 @@ pub fn try_merged_coop_matmul(
                 ];
 
                 let subgroup_id = subgroup.subgroup_id(program);
-                let sg_row = subgroup_id.clone() / entry.col_groups;
-                let sg_col = subgroup_id % entry.col_groups;
+                let sg_row = subgroup_id.clone() / col_groups;
+                let sg_col = subgroup_id % col_groups;
                 let sg_row_base = sg_row * subgroup_rows;
                 let sg_col_base_in_pass = sg_col * subgroup_cols_per_pass;
 
@@ -667,48 +737,65 @@ pub fn try_merged_coop_matmul(
                     None,
                     |program, pass_col_base, accs| {
                         if let Some(span_base) = &span_base {
-                            // Split-K span: single-buffered staging over this
-                            // split's contiguous K-tile range.
-                            program.loop_range(span_iters, |program, iter_idx| {
-                                let k_base = (span_base.clone() + iter_idx) * bk;
+                            // Split-K span: the same double-buffered K-pair
+                            // loop over this split's contiguous K-tile range.
+                            coop_k_span_pairs(
+                                program,
+                                span_base,
+                                span_iters,
+                                bk,
+                                buffers,
+                                |program, k_base, buffer| {
+                                    coop_stage_and_mma(
+                                        program,
+                                        coop,
+                                        a,
+                                        b,
+                                        &a_tiles[buffer],
+                                        &b_tiles[buffer],
+                                        &a_batch_base,
+                                        &b_batch_base,
+                                        &row_base,
+                                        pass_col_base,
+                                        k_base,
+                                        &sg_row_base,
+                                        &sg_col_base_in_pass,
+                                        &a_bounds,
+                                        &b_bounds,
+                                        accs,
+                                        tile_rows_per_sg,
+                                        tile_cols_per_sg,
+                                        bk,
+                                        COOP_DIM,
+                                        stage_scalar,
+                                        block,
+                                        bm,
+                                        bn_pass,
+                                        None,
+                                        None,
+                                    );
+                                },
+                            );
+                            return;
+                        }
+                        if buffers == 1 {
+                            program.loop_range(k_iterations, |program, iter_idx| {
+                                let k_base = iter_idx * bk;
                                 coop_stage_and_mma(
-                                    program,
-                                    coop,
-                                    a,
-                                    b,
-                                    &a_tile_0,
-                                    &b_tile_0,
-                                    &a_batch_base,
-                                    &b_batch_base,
-                                    &row_base,
-                                    pass_col_base,
-                                    &k_base,
-                                    &sg_row_base,
-                                    &sg_col_base_in_pass,
-                                    &a_bounds,
-                                    &b_bounds,
-                                    accs,
-                                    tile_rows_per_sg,
-                                    tile_cols_per_sg,
-                                    bk,
-                                    COOP_DIM,
-                                    stage_scalar,
-                                    block,
-                                    bm,
-                                    bn_pass,
-                                    None,
-                                    None,
+                                    program, coop, a, b, &a_tiles[0], &b_tiles[0],
+                                    &a_batch_base, &b_batch_base, &row_base,
+                                    pass_col_base, &k_base, &sg_row_base,
+                                    &sg_col_base_in_pass, &a_bounds, &b_bounds, accs,
+                                    tile_rows_per_sg, tile_cols_per_sg, bk, COOP_DIM,
+                                    stage_scalar, block, bm, bn_pass, None, None,
                                 );
                                 program.workgroup_barrier();
                             });
                             return;
                         }
-                        // Single-pass: the double-buffered K-pair loop of the
-                        // standalone kernel.
-                        let (a_tile_1, b_tile_1) = (
-                            a_tile_1.as_ref().expect("allocated for single-pass"),
-                            b_tile_1.as_ref().expect("allocated for single-pass"),
-                        );
+                        // Single-pass: the same K-pair loop written out
+                        // against literal K bases (no span offset to add).
+                        let (a_tile_1, b_tile_1) = (&a_tiles[1], &b_tiles[1]);
                         if k_pairs > 0 {
                             program.loop_range(k_pairs, |program, pair_idx| {
                                 let k_base_0 = pair_idx.clone() * (2 * bk);
@@ -718,8 +805,8 @@ pub fn try_merged_coop_matmul(
                                     coop,
                                     a,
                                     b,
-                                    &a_tile_0,
-                                    &b_tile_0,
+                                    &a_tiles[0],
+                                    &b_tiles[0],
                                     &a_batch_base,
                                     &b_batch_base,
                                     &row_base,
@@ -779,8 +866,8 @@ pub fn try_merged_coop_matmul(
                                 coop,
                                 a,
                                 b,
-                                &a_tile_0,
-                                &b_tile_0,
+                                &a_tiles[0],
+                                &b_tiles[0],
                                 &a_batch_base,
                                 &b_batch_base,
                                 &row_base,
@@ -1093,6 +1180,53 @@ fn coop_stage_and_mma(
     }
 }
 
+/// A double-buffered K loop over `iters` consecutive `bk`-tiles starting at
+/// K-tile index `span_base`. `stage(program, k_base, buffer)` emits one
+/// stage-and-MMA against tile pair 0 or 1.
+///
+/// Alternating pairs is what exposes the global fill to the MMAs: the only
+/// synchronization [`coop_stage_and_mma`] emits is the barrier between its
+/// fill and its cooperative loads, so the second half of a K-pair fills
+/// while the first half's MMAs are still issuing. Correctness rests on that
+/// same barrier — a thread entering the next pair's fill of buffer 0 has
+/// passed the barrier the previous stage put after its fill of buffer 1,
+/// and every thread finished its buffer-0 MMAs before reaching it.
+fn coop_k_span_pairs(
+    program: &mut TileBlock<'_>,
+    span_base: &Tile,
+    iters: u32,
+    bk: u32,
+    buffers: usize,
+    mut stage: impl FnMut(&mut TileBlock<'_>, &Tile, usize),
+) {
+    if buffers == 1 {
+        program.loop_range(iters, |program, iter_idx| {
+            let k_base = (span_base.clone() + iter_idx) * bk;
+            stage(program, &k_base, 0);
+            // Trailing barrier: the next iteration overwrites the tiles this
+            // one just read through the coop loads.
+            program.workgroup_barrier();
+        });
+        return;
+    }
+    let pairs = iters / 2;
+    if pairs > 0 {
+        program.loop_range(pairs, |program, pair_idx| {
+            let first = (span_base.clone() + pair_idx.clone() * 2) * bk;
+            stage(program, &first, 0);
+            let second = (span_base.clone() + (pair_idx * 2 + 1)) * bk;
+            stage(program, &second, 1);
+        });
+    }
+    if iters % 2 == 1 {
+        let last = (span_base.clone() + (iters - 1)) * bk;
+        stage(program, &last, 0);
+        // The odd tile closes the span on buffer 0, so nothing behind it
+        // separates it from whatever reuses the tiles next.
+        program.workgroup_barrier();
+    }
+}
+
 /// Shared pass-loop scaffolding for the coop-perf matmul variants (single-
 /// and double-buffered). For each of `N_PASSES` column sub-passes, allocates
 /// a fresh accumulator grid, runs the caller-supplied K-loop body, then
@@ -1184,7 +1318,6 @@ fn batched_coop_matmul_perf_single(
     subgroups: SubgroupConfig,
     epilogues: &DenseMatmulEpilogues<'_>,
 ) {
-    const COOP_DIM: u32 = 8;
     debug_assert!(n_passes >= 1);
     debug_assert_eq!(bn % n_passes, 0);
     let bn_pass: u32 = bn / n_passes;
@@ -1419,7 +1552,6 @@ fn batched_coop_matmul_perf(
     epilogues: &DenseMatmulEpilogues<'_>,
     swizzle_group_m: u32,
 ) {
-    const COOP_DIM: u32 = 8;
     debug_assert!(n_passes >= 1, "n_passes must be at least 1");
     debug_assert_eq!(bn % n_passes, 0, "bn must be divisible by n_passes");
     let bn_pass: u32 = bn / n_passes;

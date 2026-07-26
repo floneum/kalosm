@@ -271,18 +271,6 @@ impl Resolver {
                 },
             );
 
-            if let Some((query_set, query_buffer, readback_buffer, raw_query_size)) =
-                &query_resources
-            {
-                command_encoder.resolve_query_set(query_set, 0..query_count, query_buffer, 0);
-                command_encoder.copy_buffer_to_buffer(
-                    query_buffer,
-                    0,
-                    readback_buffer,
-                    0,
-                    *raw_query_size,
-                );
-            }
             if let Some(start) = encode_start {
                 host_profile.encode += start.elapsed();
             }
@@ -303,8 +291,31 @@ impl Resolver {
         );
         #[cfg(not(target_arch = "wasm32"))]
         {
-            if let Some((_, _, readback_buffer, raw_query_size)) = &query_resources {
+            if let Some((query_set, query_buffer, readback_buffer, raw_query_size)) =
+                &query_resources
+            {
                 let profile_readback_start = host_trace.then(Instant::now);
+                // A command buffer's counter samples are not guaranteed visible to
+                // `resolve_query_set` until it has completed: Metal's writeback of the
+                // final compute encoder's stage-boundary samples races a resolve encoded
+                // behind it, leaving those slots zero. Resolving from a command buffer
+                // submitted after the sampling work retired removes the race.
+                device.poll_wait();
+                let mut resolve_encoder =
+                    device
+                        .wgpu_device()
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Resolver Timestamp Resolve"),
+                        });
+                resolve_encoder.resolve_query_set(query_set, 0..query_count, query_buffer, 0);
+                resolve_encoder.copy_buffer_to_buffer(
+                    query_buffer,
+                    0,
+                    readback_buffer,
+                    0,
+                    *raw_query_size,
+                );
+                device.wgpu_queue().submit(Some(resolve_encoder.finish()));
                 let slice = readback_buffer.slice(..*raw_query_size);
                 let (sender, receiver) = std::sync::mpsc::channel();
                 slice.map_async(wgpu::MapMode::Read, move |result| {

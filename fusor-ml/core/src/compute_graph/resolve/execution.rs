@@ -206,6 +206,15 @@ impl Resolver {
             }
             ExecutionVariant::MatMul(op) => Some(QueuedOperation::Operation(Arc::new(op.clone()))),
             ExecutionVariant::Reduce(op) => Some(QueuedOperation::Operation(Arc::new(op.clone()))),
+            // A fold lowers through its reduce form. Multi-slot carriers have
+            // no kernel yet, and nothing constructs one, so reaching this with
+            // a general fold is a wiring bug rather than a missing feature.
+            ExecutionVariant::Fold(op) => {
+                let reduce = op.to_reduce().expect(
+                    "a multi-slot fold reached lowering; only reduce-form folds are lowerable",
+                );
+                Some(QueuedOperation::Operation(Arc::new(reduce)))
+            }
             ExecutionVariant::RowProgram(op) => {
                 Some(QueuedOperation::Operation(Arc::new(op.clone())))
             }

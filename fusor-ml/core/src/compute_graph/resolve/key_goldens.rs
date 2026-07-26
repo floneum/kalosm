@@ -29,31 +29,31 @@ use crate::{Device, QMatrix, Tensor};
 const KERNEL_KEY_GOLDENS: &[(&str, &str)] = &[
     (
         "step_elementwise",
-        "KernelCacheKey([16471553309229238721, 5488565396097342240])",
+        "KernelCacheKey([11452713101039835292, 469725187975047675])",
     ),
     (
         "step_reduce",
-        "KernelCacheKey([14461885498005454950, 3478897584873558469])",
+        "KernelCacheKey([14261650954393790832, 3278663041261894351])",
     ),
     (
         "step_view",
-        "KernelCacheKey([10229830369531949427, 17693586530176713425])",
+        "KernelCacheKey([13199296625049102793, 2216308711984315176])",
     ),
     (
         "step_assign",
-        "KernelCacheKey([10527443992534951948, 17991200153112607082])",
+        "KernelCacheKey([3412231204244641173, 10875987364889405171])",
     ),
     (
         "decode_elementwise",
-        "KernelCacheKey([5744166422789977743, 13207922583434741741])",
+        "KernelCacheKey([4670963369128312198, 12134719529705967332])",
     ),
     (
         "decode_reduce",
-        "KernelCacheKey([14004285640874462945, 3021297727809675328])",
+        "KernelCacheKey([10432744781750632184, 17896500942395396182])",
     ),
     (
         "quantized_elementwise",
-        "KernelCacheKey([17079719460357749957, 6096731547292962340])",
+        "KernelCacheKey([8460052255698420948, 15923808416343184946])",
     ),
 ];
 
@@ -71,11 +71,11 @@ const MERGED_KEY_GOLDENS: &[(&str, &str)] = &[
     ),
     (
         "row_x1",
-        "KernelCacheKey([13902752502679103160, 16611653512458465905])",
+        "KernelCacheKey([5374707752665978227, 8083608762445340972])",
     ),
     (
         "row_x2",
-        "KernelCacheKey([10371129316798825822, 15253781405597726022])",
+        "KernelCacheKey([11580284453418073024, 16462936542216973224])",
     ),
 ];
 

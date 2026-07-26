@@ -32,8 +32,14 @@ fn print_profiles(case: &str, device: &Device) {
     };
     for profile in gpu.take_kernel_profiles() {
         println!(
-            "kernel_profile case={case} mode={} kernels={} accounted_ms={:.3} span_ms={:.3}",
-            profile.timestamp_mode, profile.kernels, profile.accounted_ms, profile.span_ms
+            "kernel_profile case={case} mode={} kernels={} unmeasured={} accounted_ms={:.3} span_ms={}",
+            profile.timestamp_mode,
+            profile.kernels,
+            profile.unmeasured_kernels,
+            profile.accounted_ms,
+            profile
+                .span_ms
+                .map_or_else(|| "absent".to_string(), |span| format!("{span:.3}"))
         );
         let mut categories = profile.categories;
         categories.sort_by(|a, b| a.name.cmp(&b.name));
@@ -182,6 +188,11 @@ async fn main() {
         "fwd256" => bench_matmul("fwd256", &device, 2048, 256, 64).await,
         "fwdup" => bench_matmul("fwdup", &device, 2048, 64, 256).await,
         "attn" => bench_batched_matmul("attn", &device, 32, 4, 64, 64, 16).await,
+        // The shape the pre-unification split-K guard was calibrated on: its
+        // unsplit grid fills ~28% of the device, which the guard's flat
+        // threshold refused to split. Kept as a standing check that the
+        // scored split count does not resurrect that loss.
+        "wgradbig" => bench_matmul_repeats("wgradbig", &device, 384, 16384, 1536, 4).await,
         "softmax" => bench_softmax("softmax", &device, 32, 4, 64, 64).await,
         // Roofline anchors: the achievable bandwidth and compute roofs this
         // machine sustains, measured through the same profile path as the

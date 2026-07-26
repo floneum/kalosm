@@ -719,7 +719,7 @@ impl Resolver {
             phase_key,
             RowReduce {
                 expression,
-                function: reduce.function.clone(),
+                combine: crate::row_program::RowCombine::BuiltIn(reduce.function.clone()),
                 post_chain,
             },
         ));

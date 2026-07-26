@@ -44,6 +44,12 @@ pub(super) fn enode_for(
         }
     };
     match variant {
+        // Folds share the `Reduce` e-node kind: same child order, same
+        // structural role. The payload tag distinguishes them, exactly as
+        // attention shares `RowProgram`.
+        ExecutionVariant::Fold(_) => {
+            FusorLang::Reduce(intern(analysis, variant), children.into_boxed_slice())
+        }
         ExecutionVariant::Tensor(data) => {
             debug_assert!(children.is_empty());
             FusorLang::TensorLeaf(AllocationId(std::sync::Arc::as_ptr(data.buffer()) as usize))

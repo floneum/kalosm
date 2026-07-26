@@ -112,6 +112,14 @@ pub(crate) enum NaryOp {
     LessEqualConst(NaryScalar),
     GreaterConst(NaryScalar),
     GreaterEqualConst(NaryScalar),
+    /// Binary maximum. `ReduceOp::Max` predates this and lowers separately;
+    /// the fold algebra needs a two-value max as an expression.
+    ///
+    /// Appended, not inserted: these discriminants are hashed into kernel
+    /// cache keys, so reordering invalidates every cached plan.
+    Max,
+    /// Binary minimum. Appended for the same reason.
+    Min,
 }
 
 /// A function that can be applied in the expression tree.

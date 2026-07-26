@@ -22,7 +22,9 @@ use crate::{
 };
 
 use super::{
-    MatMulOperation, MatMulParams, MatrixOperand, sgemm, sgemv,
+    MatMulOperation, MatMulParams, MatrixOperand,
+    cost::CoopDispatch,
+    sgemm, sgemv,
     variants::{CoopTile, dense_coop_kinds_from_datatype, select_dense_matmul_params},
 };
 
@@ -38,8 +40,36 @@ struct HardwareMatmulPrep {
     y_view: crate::mir::tile_direct::DirectMatrixLayout,
     shape: tile_ir_kernels::DenseMatmulShape,
     tile: CoopTile,
+    row_groups: u32,
+    col_groups: u32,
     batch_m_padded: u32,
     n_padded: u32,
+}
+
+/// The split count an already-allocated output can host: the partials occupy
+/// scratch slices `1..=splits` of the output backing, which was sized before
+/// the wave was partitioned. Splitting fewer times is always a correct
+/// kernel, so a build that wants a deeper split than the allocation carries
+/// takes what fits instead of falling back to the single-pass body.
+fn splits_fitting_allocation(
+    splits: u32,
+    output: &TensorData,
+    batch_m_padded: u32,
+    n_padded: u32,
+    datatype: DataTypeEnum,
+) -> u32 {
+    if splits <= 1 {
+        return 1;
+    }
+    let slice_bytes =
+        u64::from(batch_m_padded) * u64::from(n_padded) * datatype.element_size() as u64;
+    if slice_bytes == 0 {
+        return 1;
+    }
+    let slices = output.buffer().size() / slice_bytes;
+    splits
+        .min(u32::try_from(slices.saturating_sub(1)).unwrap_or(u32::MAX))
+        .max(1)
 }
 
 impl MatMulOperation {
@@ -228,11 +258,66 @@ impl MatMulOperation {
         self.coop_tile(device).is_some()
     }
 
+    /// The contraction as the planner sees it, at the given launched-segment
+    /// count. `None` when the shape is not a coop contraction at all.
+    fn coop_dispatch(&self, segments: u32) -> Option<super::cost::CoopDispatch> {
+        Some(super::cost::CoopDispatch {
+            m: self.a.rows().try_into().ok()?,
+            k: self.a.cols().try_into().ok()?,
+            n: self.b.cols().try_into().ok()?,
+            batch: self
+                .a
+                .batch_shape()
+                .iter()
+                .try_fold(1u32, |acc, &dim| acc.checked_mul(u32::try_from(dim).ok()?))?,
+            segments,
+            datatype: self.datatype,
+            has_epilogues: self.has_elementwise_epilogues(),
+        })
+    }
+
+    /// Split count and staged tile pairs for the dispatch that will actually
+    /// run this contraction: `(1, _)` for the single-pass body. `segments` is
+    /// the real launched grid depth — 1 standalone, `segments.len()` for a
+    /// merged dispatch — never a probe.
+    fn coop_splits(
+        &self,
+        device: &Device,
+        tile: CoopTile,
+        rg: u32,
+        cg: u32,
+        segments: u32,
+    ) -> (u32, u32) {
+        let Some(dispatch) = self.coop_dispatch(segments) else {
+            return (1, 2);
+        };
+        let (splits, buffers) = super::cost::plan_coop_splits(
+            dispatch,
+            tile,
+            rg,
+            cg,
+            &device.dispatch_policy(),
+            device.max_subgroup_size(),
+        );
+        if device.config().trace_splitk {
+            let CoopDispatch { m, k, n, batch, .. } = dispatch;
+            eprintln!(
+                "matmul_plan name={} m={m} k={k} n={n} batch={batch} segments={segments} \
+                 tile={}x{}x{} rg={rg} cg={cg} splits={splits} buffers={buffers}",
+                self.name(),
+                tile.bm,
+                tile.bn,
+                tile.bk,
+            );
+        }
+        (splits, buffers)
+    }
+
     /// The tile geometry the cooperative-matrix kernel would run with on
     /// this device, `None` when any static gate fails and the contraction is
     /// bound for the generic path. Shapes need not divide the tile: edge
     /// tiles mask their fills and the output allocation pads to whole tiles.
-    pub(crate) fn coop_tile(&self, device: &Device) -> Option<CoopTile> {
+    pub(crate) fn coop_tile(&self, device: &Device) -> Option<(CoopTile, u32, u32)> {
         if !self.can_use_hardware_matmul()
             || (self.datatype == DataTypeEnum::F16 && !device.f16_supported())
             || !self.coop_epilogues_supported()
@@ -248,25 +333,46 @@ impl MatMulOperation {
         if !subgroup_config.is_fixed() {
             return None;
         }
-        let (m, k, n): (u32, u32, u32) = (
-            self.a.rows().try_into().ok()?,
-            self.a.cols().try_into().ok()?,
-            self.b.cols().try_into().ok()?,
-        );
-        let batch = self
-            .a
-            .batch_shape()
-            .iter()
-            .try_fold(1u32, |acc, &dim| acc.checked_mul(u32::try_from(dim).ok()?))?;
-        let limits = device.limits();
-        let tile = CoopTile::select(
+        let CoopDispatch {
             m,
             k,
             n,
-            self.datatype,
-            &device.dispatch_policy(),
-            subgroup_config.max_size(),
+            batch,
+            has_epilogues,
+            ..
+        } = self.coop_dispatch(1)?;
+        let limits = device.limits();
+        // Memoized on the device: the scored selection is asked once per
+        // static-viability probe, once per prep, once per allocation and once
+        // per trace for every matmul in every resolve, and it enumerates the
+        // whole table against every legal split count each time.
+        let probe_group = super::cost::tile_probe_group(device, has_epilogues);
+        let [bm, bn, bk, row_groups, col_groups] = device.coop_tile_memo(
+            crate::device::CoopTileKey {
+                m,
+                k,
+                n,
+                batch,
+                datatype: self.datatype,
+                has_epilogues,
+                probe_group,
+            },
+            || {
+                super::cost::plan_coop_tile(
+                    m,
+                    k,
+                    n,
+                    batch,
+                    self.datatype,
+                    has_epilogues,
+                    probe_group,
+                    &device.dispatch_policy(),
+                    subgroup_config.max_size(),
+                )
+                .map(|(tile, rg, cg)| [tile.bm, tile.bn, tile.bk, rg, cg])
+            },
         )?;
+        let tile = CoopTile::new(bm, bn, bk);
         // The 1D->3D grid spread plus the kernels' overhang guard cover any
         // u32 tile count; the checked math above is the only real bound. A
         // per-dimension cap here silently dropped real-vocab lm-head shapes
@@ -277,7 +383,7 @@ impl MatMulOperation {
             .checked_mul(n.div_ceil(tile.bn))
             .and_then(|tiles| tiles.checked_mul(batch))?;
         let _ = limits;
-        Some(tile)
+        Some((tile, row_groups, col_groups))
     }
 
     /// Row-major strides of the logical output over its padded backing:
@@ -358,7 +464,7 @@ impl MatMulOperation {
         // Only the cooperative-matrix route stays hand-specialized; gemv
         // shapes and dtype-changing fused chains lower through the generic
         // row reduction. Dtype-preserving unary chains remain hosted here.
-        let tile = device_supported(self.coop_tile(device))?;
+        let (tile, row_groups, col_groups) = device_supported(self.coop_tile(device))?;
 
         // The store covers whole tiles, so `y` is the padded matrix: rows
         // padded to `ceil(m / bm) * bm` per batch and columns to
@@ -400,6 +506,8 @@ impl MatMulOperation {
             y_view,
             shape,
             tile,
+            row_groups,
+            col_groups,
             batch_m_padded,
             n_padded,
         })
@@ -418,6 +526,8 @@ impl MatMulOperation {
             y_view,
             shape,
             tile,
+            row_groups,
+            col_groups,
             batch_m_padded,
             n_padded,
         } = self.hardware_matmul_prep(device, input_a, input_b, output)?;
@@ -451,7 +561,16 @@ impl MatMulOperation {
         // output buffer and a combine kernel folds them (sum-reorder-only
         // numerics). A weight-gradient shape like 64×2048×64 otherwise runs
         // as a single workgroup.
-        if let Some(splits) = self.split_k_factor(device, &tile)
+        let (standalone_splits, stage_buffers) =
+            self.coop_splits(device, tile, row_groups, col_groups, 1);
+        let splits = splits_fitting_allocation(
+            standalone_splits,
+            output,
+            batch_m_padded,
+            n_padded,
+            self.datatype,
+        );
+        if splits > 1
             && let Some(kernel) = self.build_split_k_matmul(
                 device,
                 input_a,
@@ -462,6 +581,8 @@ impl MatMulOperation {
                 &y_view,
                 shape,
                 tile,
+                row_groups,
+                col_groups,
                 subgroup_config,
                 coop,
                 batch_m_padded,
@@ -509,7 +630,10 @@ impl MatMulOperation {
                         bn: tile.bn,
                         bk: tile.bk,
                     },
+                    row_groups,
+                    col_groups,
                     staging: None,
+                    stage_buffers,
                     swizzle_group_m: super::cost::swizzle_group_m(
                         self.a.rows(),
                         self.a.cols(),
@@ -559,37 +683,6 @@ impl MatMulOperation {
         )
     }
 
-    /// The split factor for coop matmuls whose tile grid starves the GPU
-    /// (few output tiles against a long contraction), `None` when the shape
-    /// runs the single-pass kernel. Consulted by both [`Self::inputs`]
-    /// (which over-allocates the output backing with one scratch slice per
-    /// split) and [`Self::build_hardware_matmul`], so allocation and kernel
-    /// selection agree by construction.
-    fn split_k_factor(&self, device: &Device, tile: &CoopTile) -> Option<u32> {
-        let m: u32 = self.a.rows().try_into().ok()?;
-        let n: u32 = self.b.cols().try_into().ok()?;
-        let k: u32 = self.a.cols().try_into().ok()?;
-        let batch = self
-            .a
-            .batch_shape()
-            .iter()
-            .try_fold(1u32, |acc, &dim| acc.checked_mul(u32::try_from(dim).ok()?))?;
-        let splits = super::cost::split_k_plan(
-            m,
-            k,
-            n,
-            batch,
-            tile,
-            &device.dispatch_policy(),
-            device.max_subgroup_size(),
-            self.has_elementwise_epilogues(),
-        );
-        if splits.is_none() && device.config().trace_splitk {
-            eprintln!("splitk_gate name={} m={m} k={k} n={n}", self.name());
-        }
-        splits
-    }
-
     /// Split-K route for coop matmuls whose tile grid starves the GPU: the
     /// partials kernel runs `splits × total_tiles` workgroups, each covering
     /// one K-span with the standard coop tile loop and storing an
@@ -613,6 +706,8 @@ impl MatMulOperation {
         y_view: &crate::mir::tile_direct::DirectMatrixLayout,
         shape: tile_ir_kernels::DenseMatmulShape,
         tile: CoopTile,
+        row_groups: u32,
+        col_groups: u32,
         subgroup_config: fusor_tile_ir_kernels::SubgroupConfig,
         coop: tile_ir::CoopMatrixToken,
         batch_m_padded: u32,
@@ -670,7 +765,11 @@ impl MatMulOperation {
                         bn: tile.bn,
                         bk: tile.bk,
                     },
+                    row_groups,
+                    col_groups,
                     staging: None,
+                    // The partials body stages one pair; see `staging_depths`.
+                    stage_buffers: 1,
                     swizzle_group_m: super::cost::swizzle_group_m(
                         self.a.rows(),
                         self.a.cols(),
@@ -796,15 +895,20 @@ pub(crate) struct MatmulMergeKey {
     k: u32,
     n: u32,
     batch: u32,
-    tile: CoopTile,
-    splits: Option<u32>,
+    /// Whether this profile would split its K loop as a standalone dispatch.
+    /// The tile and the split count themselves are pure functions of the
+    /// fields above, so they cannot discriminate two keys these do not; this
+    /// one derived bool survives only to keep the split-K wave category where
+    /// it is.
+    split_candidate: bool,
     datatype: DataTypeEnum,
 }
 
 impl MatmulMergeKey {
-    /// The shared split-K factor, `None` for single-pass profiles.
+    /// Whether the profile is a split-K candidate, which is the wave category
+    /// its one consumer wants.
     pub(crate) fn splits(&self) -> Option<u32> {
-        self.splits
+        self.split_candidate.then_some(1)
     }
 }
 
@@ -816,25 +920,27 @@ impl MatMulOperation {
         if self.has_elementwise_epilogues() {
             return None;
         }
-        let tile = self.coop_tile(device)?;
-        if !tile.supports_horizontal_merge() {
-            return None;
-        }
-        let m: u32 = self.a.rows().try_into().ok()?;
-        let k: u32 = self.a.cols().try_into().ok()?;
-        let n: u32 = self.b.cols().try_into().ok()?;
-        let batch: u32 = self
-            .a
-            .batch_shape()
-            .iter()
-            .try_fold(1u32, |acc, &dim| acc.checked_mul(u32::try_from(dim).ok()?))?;
+        let (tile, row_groups, col_groups) = self.coop_tile(device)?;
+        let CoopDispatch { m, k, n, batch, .. } = self.coop_dispatch(1)?;
         Some(MatmulMergeKey {
             m,
             k,
             n,
             batch,
-            tile,
-            splits: self.split_k_factor(device, &tile),
+            // Scored at the probe group, not at 1: the category exists to
+            // keep split-K profiles in their own merged wave, so the question
+            // is what the merged dispatch will do, and the merged dispatch is
+            // bounded by exactly this group.
+            split_candidate: self
+                .coop_splits(
+                    device,
+                    tile,
+                    row_groups,
+                    col_groups,
+                    super::cost::tile_probe_group(device, false),
+                )
+                .0
+                > 1,
             datatype: self.datatype,
         })
     }
@@ -911,13 +1017,32 @@ pub(crate) fn build_merged_matmul_kernel(
     }) {
         decline!("profile_mismatch");
     }
-    let splits = first.split_k_factor(&device, &tile);
-    if segments
-        .iter()
-        .any(|op| op.split_k_factor(&device, &tile) != splits || op.datatype != first.datatype)
-    {
-        decline!("splits_mismatch");
+    if segments.iter().any(|op| op.datatype != first.datatype) {
+        decline!("datatype_mismatch");
     }
+    // The one place the grid that actually launches is known:
+    // `splits x tiles x segments.len()` workgroups. The tile was scored at a
+    // fixed probe group (allocation had to precede this partition), so the
+    // split the real grid wants may exceed the scratch that was allocated;
+    // clamping is always legal — fewer splits is a correct kernel.
+    let (merged_splits, stage_buffers) = first.coop_splits(
+        &device,
+        tile,
+        preps[0].row_groups,
+        preps[0].col_groups,
+        segments.len() as u32,
+    );
+    let splits = splits_fitting_allocation(
+        merged_splits,
+        tensors
+            .iter()
+            .map(|(_, _, output)| *output)
+            .min_by_key(|output| output.buffer().size())
+            .expect("merged matmul builds from a non-empty segment list"),
+        batch_m_padded,
+        n_padded,
+        first.datatype,
+    );
 
     let Some(subgroup_config) = device.subgroup_config() else {
         decline!("subgroups");
@@ -945,7 +1070,10 @@ pub(crate) fn build_merged_matmul_kernel(
             bn: tile.bn,
             bk: tile.bk,
         },
+        row_groups: preps[0].row_groups,
+        col_groups: preps[0].col_groups,
         staging: None,
+        stage_buffers,
         swizzle_group_m: super::cost::swizzle_group_m(
             first.a.rows(),
             first.a.cols(),
@@ -957,7 +1085,7 @@ pub(crate) fn build_merged_matmul_kernel(
     // Split-K segments store partials into scratch slices of their own
     // output allocation; verify every allocation carries the slices.
     let slice_elements = batch_m_padded.checked_mul(n_padded)?;
-    if let Some(splits) = splits {
+    if splits > 1 {
         let total_elements = slice_elements.checked_mul(splits.checked_add(1)?)?;
         let required_bytes = total_elements as u64 * first.datatype.element_size() as u64;
         if tensors
@@ -982,15 +1110,14 @@ pub(crate) fn build_merged_matmul_kernel(
     };
 
     let used = std::cell::Cell::new(false);
-    let splits_or_one = splits.unwrap_or(1);
     let ir = tile_ir::tile::build(|phase| {
         let mut storages = Vec::with_capacity(segments.len());
         for prep in &preps {
             let a = tile_storage_read_with_direct_layout_typed(phase, element, prep.a_view.clone());
             let b = tile_storage_read_with_direct_layout_typed(phase, element, prep.b_view.clone());
-            let y_view = match splits {
-                // Partials land in the scratch slices (`1..=splits`).
-                Some(splits) => crate::mir::tile_direct::DirectMatrixLayout {
+            // Partials land in the scratch slices (`1..=splits`).
+            let y_view = if splits > 1 {
+                crate::mir::tile_direct::DirectMatrixLayout {
                     rows: splits * batch_m_padded,
                     cols: n_padded,
                     offset: slice_elements,
@@ -999,8 +1126,9 @@ pub(crate) fn build_merged_matmul_kernel(
                         tile_ir::Shape::new([splits * batch_m_padded, n_padded]),
                         &[n_padded, 1],
                     ),
-                },
-                None => prep.y_view.clone(),
+                }
+            } else {
+                prep.y_view.clone()
             };
             let y = tile_storage_write_with_direct_layout_typed(phase, element, y_view);
             storages.push((a, b, y));
@@ -1013,7 +1141,7 @@ pub(crate) fn build_merged_matmul_kernel(
             phase,
             &segment_tensors,
             shape,
-            splits_or_one,
+            splits,
             max_wg_per_dim,
             config,
         ));
@@ -1058,9 +1186,9 @@ pub(crate) fn build_merged_matmul_kernel(
     ) else {
         decline!("pipeline");
     };
-    let Some(splits) = splits else {
+    if splits <= 1 {
         return Some(main);
-    };
+    }
 
     // The merged combine: every segment's `(1 + splits)`-slice buffer bound
     // once read-write, folded by guarded ranges in the same segment order.
@@ -1231,13 +1359,16 @@ impl Operation for MatMulOperation {
         // Shapes that already divide the tile — and anything bound for the
         // generic path — allocate exactly.
         let (m, n) = (self.a.rows(), self.b.cols());
-        let padded = self.coop_tile(device).and_then(|tile| {
+        let padded = self.coop_tile(device).and_then(|(tile, rg, cg)| {
             let m_padded = m.div_ceil(tile.bm as usize) * tile.bm as usize;
             let n_padded = n.div_ceil(tile.bn as usize) * tile.bn as usize;
-            let slices = self
-                .split_k_factor(device, &tile)
-                .map(|splits| splits as usize + 1)
-                .unwrap_or(1);
+            // Allocation predates the merge partition, so it sizes against the
+            // same fixed probe group the tile was scored at. A merged build of
+            // a shorter tail chunk may want more splits than this; that build
+            // clamps, rather than every matmul over-allocating for the worst
+            // case the way the group-1 sizing did.
+            let probe = super::cost::tile_probe_group(device, self.has_elementwise_epilogues());
+            let slices = self.coop_splits(device, tile, rg, cg, probe).0 as usize + 1;
             (slices > 1 || m_padded != m || n_padded != n).then_some((m_padded, n_padded, slices))
         });
         let output_tensor = match padded {
@@ -1301,7 +1432,8 @@ impl Operation for MatMulOperation {
                 self.can_use_hardware_matmul(),
                 self.coop_epilogues_supported(),
                 graph.device().f16_supported(),
-                self.coop_tile(&graph.device()).map(|tile| (tile.bm, tile.bn, tile.bk)),
+                self.coop_tile(&graph.device())
+                    .map(|(tile, ..)| (tile.bm, tile.bn, tile.bk)),
                 input_a.datatype(),
                 input_b.datatype(),
                 output.datatype(),

@@ -96,6 +96,7 @@ fn variant_tag(variant: &ExecutionVariant) -> u8 {
         ExecutionVariant::QEmbedding(_) => 9,
         ExecutionVariant::RowProgram(_) => 10,
         ExecutionVariant::Attention(_) => 11,
+        ExecutionVariant::Fold(_) => 12,
     }
 }
 
@@ -108,6 +109,9 @@ fn hash_variant_fields(variant: &ExecutionVariant, hasher: &mut FxHasher) {
         ExecutionVariant::QMatrix(op) => op.hash_kernel_fields(hasher),
         ExecutionVariant::Elementwise(op) => op.hash_kernel_fields(hasher),
         ExecutionVariant::Reduce(op) => op.hash_kernel_fields(hasher),
+        // A fold has no `Operation` impl: it is an algebra term, and only its
+        // reduce form is lowerable. Hash the carrier structure directly.
+        ExecutionVariant::Fold(op) => op.hash_carrier_fields(hasher),
         ExecutionVariant::View(op) => op.hash_kernel_fields(hasher),
         ExecutionVariant::Assign(op) => op.hash_kernel_fields(hasher),
         ExecutionVariant::Region(op) => op.hash_kernel_fields(hasher),

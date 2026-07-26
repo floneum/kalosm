@@ -44,3 +44,56 @@ fn keepdim_scalar_chain_sandwich_fuses_to_single_kernel() {
         }
     });
 }
+
+/// Lane groups narrower than the workgroup make the axis stride in chunks and
+/// pin one row per group of lanes, so every axis length exercises a different
+/// (group width, chunk count, masked tail) triple. Sweep the widths around the
+/// subgroup width and the chunking thresholds against a host reference.
+#[test]
+fn row_reductions_match_host_across_axis_widths() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        // The no-subgroup sibling takes the shared-memory reduction tree, the
+        // only path the web build has.
+        sweep_axis_widths(&device).await;
+        sweep_axis_widths(&device.without_subgroups()).await;
+    });
+}
+
+async fn sweep_axis_widths(device: &Device) {
+    const ROWS: usize = 37;
+    for k in [
+        1usize, 2, 3, 8, 16, 31, 32, 33, 63, 64, 65, 100, 128, 129, 200, 256, 257, 384, 512, 1000,
+    ] {
+        let values = pattern(ROWS * k, 0.31);
+        let x = Tensor::from_slice(device, [ROWS, k], &values);
+
+        let sums = x.sum(1).as_slice::<1, f32>().await.unwrap();
+        let softmax = x.softmax_last_dim().as_slice::<2, f32>().await.unwrap();
+        for row in [0usize, 1, ROWS / 2, ROWS - 1] {
+            let base = row * k;
+            let span = &values[base..base + k];
+
+            let expected: f32 = span.iter().sum();
+            let actual = sums[[row]];
+            let tolerance = 1e-4 * expected.abs().max(1.0);
+            assert!(
+                (actual - expected).abs() < tolerance,
+                "k={k} row={row}: sum {actual}, expected {expected}"
+            );
+
+            let max = span.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let denominator: f32 = span.iter().map(|v| (v - max).exp()).sum();
+            for col in [0usize, k / 2, k - 1] {
+                let expected = (span[col] - max).exp() / denominator;
+                let actual = softmax[[row, col]];
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "k={k} row={row} col={col}: softmax {actual}, expected {expected}"
+                );
+            }
+        }
+    }
+}

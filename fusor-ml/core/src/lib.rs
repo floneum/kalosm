@@ -31,6 +31,7 @@ pub use compute_graph::NodeIndex;
 mod device;
 mod element_wise;
 mod flash_attention;
+mod fold;
 mod index_select;
 #[doc(hidden)]
 pub mod kernel_selection;

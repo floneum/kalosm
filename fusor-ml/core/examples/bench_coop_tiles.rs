@@ -41,6 +41,21 @@ fn main() {
         // DTYPE=f16 benches the native f16-storage kernels (mixed MMA with
         // f32 accumulation); verification stays on the f32 path.
         let f16_storage = std::env::var("DTYPE").as_deref() == Ok("f16");
+        // SHAPES=m,k,n;m,k,n sweeps caller-supplied contractions instead of
+        // the built-in training-step set.
+        let shapes: Vec<(u32, u32, u32)> = std::env::var("SHAPES")
+            .map(|list| {
+                list.split(';')
+                    .map(|entry| {
+                        let dims: Vec<u32> = entry
+                            .split(',')
+                            .map(|v| v.trim().parse().expect("SHAPES=m,k,n;.."))
+                            .collect();
+                        (dims[0], dims[1], dims[2])
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|_| SHAPES.to_vec());
         // SWIZZLE=1,2,4,8,16 sweeps traversal-order groups per tile entry
         // (1 = plain row-major decomposition).
         let swizzle_groups: Vec<u32> = std::env::var("SWIZZLE")
@@ -65,10 +80,17 @@ fn main() {
         };
         let check = std::env::var_os("CHECK").is_some();
         let staging_f16 = std::env::var("STAGING").as_deref() == Ok("f16");
+        // BUFFERS=1 stages every entry from one tile pair (half the
+        // workgroup footprint, no load/MMA overlap) — the raw-sweep side of
+        // the staging-depth trade the planner scores.
+        let stage_buffers: u32 = std::env::var("BUFFERS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2);
 
         // Optional shape filter for tight alternation windows: SHAPE=MxKxN.
         let shape_filter = std::env::var("SHAPE").ok();
-        for (m, k, n) in SHAPES {
+        for (m, k, n) in shapes {
             if let Some(filter) = &shape_filter {
                 if *filter != format!("{m}x{k}x{n}") {
                     continue;
@@ -99,9 +121,22 @@ fn main() {
             {
                 let tile = entry.tile;
                 let (bm, bn) = (tile.bm, tile.bn);
+                // `SUBGROUP_SPLIT=rg,cg` forces a factorization the closed
+                // form would not pick — the vehicle for isolating what a
+                // threadgroup fragment load actually costs.
+                let (row_groups, col_groups) = match std::env::var("SUBGROUP_SPLIT") {
+                    Ok(forced) => {
+                        let (rg, cg) = forced.split_once(',').expect("SUBGROUP_SPLIT=rg,cg");
+                        (rg.trim().parse().unwrap(), cg.trim().parse().unwrap())
+                    }
+                    Err(_) => entry.subgroup_split(),
+                };
+                if row_groups * col_groups != entry.subgroups {
+                    continue;
+                }
                 let label = format!(
-                    "{bm}x{bn} rg{} cg{} np{} sw{swizzle_group_m}",
-                    entry.row_groups, entry.col_groups, entry.n_passes,
+                    "{bm}x{bn} rg{row_groups} cg{col_groups} np{} sw{swizzle_group_m}",
+                    entry.n_passes,
                 );
                 let m_pad = m.div_ceil(bm) * bm;
                 let n_pad = n.div_ceil(bn) * bn;
@@ -144,7 +179,10 @@ fn main() {
                             coop,
                             subgroups,
                             tile,
+                            row_groups,
+                            col_groups,
                             staging: staging_f16.then_some(fusor_tile_ir::ScalarElement::F16),
+                            stage_buffers,
                             swizzle_group_m,
                         },
                     );

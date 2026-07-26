@@ -47,6 +47,7 @@ fn label(variant: &ExecutionVariant) -> &'static str {
         ExecutionVariant::QMatrix(_) => "qmatrix",
         ExecutionVariant::Elementwise(_) => "elementwise",
         ExecutionVariant::Reduce(_) => "reduce",
+        ExecutionVariant::Fold(_) => "fold",
         ExecutionVariant::View(_) => "view",
         ExecutionVariant::Assign(_) => "assign",
         ExecutionVariant::Region(_) => "region",

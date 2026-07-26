@@ -17,12 +17,13 @@ fn subgroup_config() -> SubgroupConfig {
 }
 
 /// Build one table entry's kernel IR without buffers: the standard path for
-/// `splits: None` (single- or double-buffered per the entry), the split-K
-/// partials kernel otherwise.
+/// `splits: None` (at the requested staging depth, or one pair when the entry
+/// forces it), the split-K partials kernel otherwise.
 fn coop_matmul_ir(
     entry: &CoopTileEntry,
     storage: ScalarElement,
     staging: Option<ScalarElement>,
+    stage_buffers: u32,
     splits: Option<u32>,
 ) -> fusor_tile_ir::KernelIr {
     let geometry = entry.tile;
@@ -43,11 +44,15 @@ fn coop_matmul_ir(
             b: &b,
             y: &y,
         };
+        let (row_groups, col_groups) = entry.subgroup_split();
         let config = DenseCoopMatmulConfig {
             coop: fusor_tile_ir::CoopMatrixToken::new_unchecked(),
             subgroups: subgroup_config(),
             tile: geometry,
+            row_groups,
+            col_groups,
             staging,
+            stage_buffers,
             swizzle_group_m: DEFAULT_SWIZZLE_GROUP_M,
         };
         let emitted = match splits {
@@ -74,7 +79,7 @@ fn coop_matmul_ir(
 fn coop_table_footprints_match_ir() {
     for entry in coop_tile_entries() {
         for storage in [ScalarElement::F32, ScalarElement::F16] {
-            let ir = coop_matmul_ir(entry, storage, None, None);
+            let ir = coop_matmul_ir(entry, storage, None, 2, None);
             assert_eq!(
                 ir.workgroup_bytes(),
                 entry.workgroup_bytes(storage),
@@ -85,7 +90,9 @@ fn coop_table_footprints_match_ir() {
     }
 }
 
-/// The split-K partials kernel stages exactly one tile pair.
+/// The split-K partials kernel stages exactly one tile pair, whatever depth
+/// the config asks for: a split grid exists to raise occupancy and a second
+/// pair would halve how many of its workgroups a core holds.
 #[test]
 fn split_k_footprints_match_ir() {
     for entry in coop_tile_entries() {
@@ -93,10 +100,10 @@ fn split_k_footprints_match_ir() {
         if entry.single_buffered {
             continue;
         }
-        let ir = coop_matmul_ir(entry, ScalarElement::F32, None, Some(2));
+        let ir = coop_matmul_ir(entry, ScalarElement::F32, None, 2, Some(2));
         assert_eq!(
             ir.workgroup_bytes(),
-            entry.tile.stage_pair_elements(entry.n_passes) * ScalarElement::F32.byte_size(),
+            entry.workgroup_bytes_at(ScalarElement::F32, 1),
             "{:?} split-k",
             entry.tile,
         );
@@ -113,13 +120,35 @@ fn f16_staging_over_f32_storage_matches_ir() {
         if entry.single_buffered {
             continue;
         }
-        let ir = coop_matmul_ir(entry, ScalarElement::F32, Some(ScalarElement::F16), None);
+        let ir = coop_matmul_ir(entry, ScalarElement::F32, Some(ScalarElement::F16), 2, None);
         assert_eq!(
             ir.workgroup_bytes(),
             entry.workgroup_bytes(ScalarElement::F16),
             "{:?} staged f16",
             entry.tile,
         );
+    }
+}
+
+/// `stage_buffers: 1` on a double-bufferable entry lowers to exactly one
+/// staged pair. `DispatchPolicy::core_workgroup_slots` divides the workgroup
+/// storage limit by this number, so a wrong footprint here would mis-price
+/// the whole staging-depth choice.
+#[test]
+fn single_pair_staging_halves_the_footprint() {
+    for entry in coop_tile_entries() {
+        if entry.single_buffered {
+            continue;
+        }
+        for storage in [ScalarElement::F32, ScalarElement::F16] {
+            let ir = coop_matmul_ir(entry, storage, None, 1, None);
+            assert_eq!(
+                ir.workgroup_bytes(),
+                entry.workgroup_bytes_at(storage, 1),
+                "{:?} {storage:?} single pair",
+                entry.tile,
+            );
+        }
     }
 }
 
@@ -257,4 +286,35 @@ fn flash_f16_byte_arena_footprint() {
     let packed = flash_ir_byte_arena(64, ScalarElement::F16).workgroup_bytes();
     assert_eq!(regions, 16_022);
     assert_eq!(packed, regions);
+}
+
+/// `subgroup_split` is a derivation, not a table column: it reproduces the
+/// hand-set factorization on seven of the nine rows and on the eighth
+/// through its documented tie-break, and it deliberately disagrees on the
+/// two 16-wide rows — (64,16,16) 2x2 -> 4x1 and (16,64,16) 2x2 -> 1x4, each
+/// going from 1.25 to 1.00 threadgroup fragment loads per MMA at identical
+/// MMA count, staged bytes and workgroup footprint.
+#[test]
+fn subgroup_split_derives_the_table() {
+    for entry in coop_tile_entries() {
+        let (bm, bn) = (entry.tile.bm, entry.tile.bn);
+        // The nine hand-set factorizations the table carried before the
+        // derivation replaced them.
+        let expected = match (bm, bn) {
+            (256, 256) => (8, 1),
+            (64, 128) => (2, 4),
+            (64, 64) => (2, 2),
+            // The two rows the derivation deliberately moves: 2x2 wasted a
+            // fragment load per MMA on both.
+            (64, 16) => (4, 1),
+            (16, 64) => (1, 4),
+            _ => (4, 2),
+        };
+        assert_eq!(entry.subgroup_split(), expected, "{bm}x{bn}");
+        // Both fragment sides stay whole 8x8 fragment counts.
+        let (rg, cg) = entry.subgroup_split();
+        assert_eq!(rg * cg, entry.subgroups, "{bm}x{bn} factorization");
+        assert_eq!(bm % (8 * rg), 0, "{bm}x{bn} A side");
+        assert_eq!((bn / entry.n_passes) % (8 * cg), 0, "{bm}x{bn} B side");
+    }
 }

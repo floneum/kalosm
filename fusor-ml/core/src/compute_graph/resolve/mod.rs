@@ -179,6 +179,10 @@ pub(crate) enum ExecutionVariant {
     QMatrix(DequantizeOperation),
     Elementwise(ElementwiseOperation),
     Reduce(ReduceOperation),
+    /// A fold with a named carrier and an explicit combine. `Reduce` is the
+    /// single-slot, built-in-combine special case; a fold that has one lowers
+    /// through it, and multi-slot folds are the new capability.
+    Fold(crate::fold::FoldOperation),
     View(ViewOperation),
     Assign(SliceAssignOperation),
     /// Multi-output elementwise region formed by `fusion_region` on the
@@ -201,6 +205,7 @@ impl ExecutionVariant {
             Self::QMatrix(op) => op.visit_dependencies(f),
             Self::Elementwise(op) => op.visit_dependencies(f),
             Self::Reduce(op) => op.visit_dependencies(f),
+            Self::Fold(op) => op.visit_dependencies(f),
             Self::View(op) => op.visit_dependencies(f),
             Self::Assign(op) => op.visit_dependencies(f),
             Self::Region(op) => op.visit_dependencies(f),
@@ -220,6 +225,7 @@ impl ExecutionVariant {
             Self::QMatrix(op) => op.visit_dependencies_mut(f),
             Self::Elementwise(op) => op.visit_dependencies_mut(f),
             Self::Reduce(op) => op.visit_dependencies_mut(f),
+            Self::Fold(op) => op.visit_dependencies_mut(f),
             Self::View(op) => op.visit_dependencies_mut(f),
             Self::Assign(op) => op.visit_dependencies_mut(f),
             Self::Region(op) => op.visit_dependencies_mut(f),
@@ -273,11 +279,31 @@ fn collect_gpu_kernel_profile(
     let mut category_profile = FxHashMap::<String, KernelProfileAggregate>::default();
     let mut name_profile = FxHashMap::<String, KernelProfileAggregate>::default();
     let mut accounted_ns = 0.0;
+    let mut unmeasured = 0usize;
+    let mut span_begin = u64::MAX;
+    let mut span_end = 0u64;
 
     for (index, record) in records.iter().enumerate() {
-        let begin = timestamps.get(index * 2).copied().unwrap_or_default();
-        let end = timestamps.get(index * 2 + 1).copied().unwrap_or(begin);
-        let ns = end.saturating_sub(begin) as f64 * timestamp_period_ns;
+        // A slot the GPU never sampled resolves as zero, and an invalid sample as
+        // `MTLCounterErrorValue`. Both are indistinguishable from a free dispatch if
+        // summed, so they are counted as unmeasured instead of folded in as 0 ns.
+        let sample = timestamps
+            .get(index * 2)
+            .zip(timestamps.get(index * 2 + 1))
+            .filter(|(begin, end)| {
+                **begin != 0
+                    && **end != 0
+                    && **begin != u64::MAX
+                    && **end != u64::MAX
+                    && end >= begin
+            });
+        let Some((&begin, &end)) = sample else {
+            unmeasured += 1;
+            continue;
+        };
+        span_begin = span_begin.min(begin);
+        span_end = span_end.max(end);
+        let ns = (end - begin) as f64 * timestamp_period_ns;
         accounted_ns += ns;
         if let Some(category) = &record.category {
             category_profile
@@ -290,10 +316,10 @@ fn collect_gpu_kernel_profile(
         }
     }
 
-    let span_ns = match (timestamps.first(), timestamps.last()) {
-        (Some(first), Some(last)) => last.saturating_sub(*first) as f64 * timestamp_period_ns,
-        _ => 0.0,
-    };
+    // Only the sampled dispatches bound the span; a partially measured resolve has no
+    // honest wall span, so report it as absent rather than as a subset.
+    let span_ms = (unmeasured == 0 && span_begin <= span_end)
+        .then(|| (span_end - span_begin) as f64 * timestamp_period_ns / 1_000_000.0);
 
     let rows = |profile: FxHashMap<String, KernelProfileAggregate>| {
         let mut rows = profile
@@ -320,8 +346,9 @@ fn collect_gpu_kernel_profile(
     let profile = crate::KernelProfile {
         timestamp_mode,
         kernels: records.len(),
+        unmeasured_kernels: unmeasured,
         accounted_ms: accounted_ns / 1_000_000.0,
-        span_ms: span_ns / 1_000_000.0,
+        span_ms,
         timestamp_period_ns,
         categories,
         top_names,
@@ -346,17 +373,74 @@ fn log_gpu_kernel_profile(profile: &crate::KernelProfile) {
             .collect::<Vec<_>>()
     };
     tracing::info!(
-        "resolve_gpu_kernel_profile mode={} kernels={} accounted_ms={:.3} span_ms={:.3} timestamp_period_ns={:.3}",
+        "resolve_gpu_kernel_profile mode={} kernels={} unmeasured={} accounted_ms={:.3} span_ms={} timestamp_period_ns={:.3}",
         profile.timestamp_mode,
         profile.kernels,
+        profile.unmeasured_kernels,
         profile.accounted_ms,
-        profile.span_ms,
+        profile
+            .span_ms
+            .map_or_else(|| "absent".to_string(), |span| format!("{span:.3}")),
         profile.timestamp_period_ns
     );
     let categories = tuples(&profile.categories);
     tracing::info!("resolve_gpu_kernel_categories {categories:?}");
     let names = tuples(&profile.top_names);
     tracing::info!("resolve_gpu_kernel_top_names {names:?}");
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod profile_tests {
+    use super::{DispatchMetadata, collect_gpu_kernel_profile};
+
+    fn records(count: usize) -> Vec<DispatchMetadata> {
+        (0..count)
+            .map(|i| DispatchMetadata {
+                name: Some(format!("kernel_{i}")),
+                category: Some("matmul_x".to_string()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_sampled_dispatch_is_accounted() {
+        let profile = collect_gpu_kernel_profile(
+            &records(3),
+            &[100, 400, 500, 900, 1000, 1600],
+            1.0,
+            "pass_boundary",
+        );
+        assert_eq!(profile.kernels, 3);
+        assert_eq!(profile.unmeasured_kernels, 0);
+        assert_eq!(profile.accounted_ms, (300 + 400 + 600) as f64 / 1_000_000.0);
+        assert_eq!(profile.span_ms, Some(1500.0 / 1_000_000.0));
+        assert_eq!(profile.categories[0].count, 3);
+    }
+
+    #[test]
+    fn unsampled_dispatches_are_reported_not_summed_as_zero() {
+        // Slots the GPU never wrote resolve as zero; the middle dispatch must not
+        // land in the aggregates as a free kernel, and the span no longer covers
+        // the whole resolve.
+        let profile = collect_gpu_kernel_profile(
+            &records(3),
+            &[100, 400, 0, 0, 1000, 1600],
+            1.0,
+            "pass_boundary",
+        );
+        assert_eq!(profile.unmeasured_kernels, 1);
+        assert_eq!(profile.accounted_ms, (300 + 600) as f64 / 1_000_000.0);
+        assert_eq!(profile.span_ms, None);
+        assert_eq!(profile.categories[0].count, 2);
+    }
+
+    #[test]
+    fn truncated_readback_reports_the_missing_tail() {
+        let profile = collect_gpu_kernel_profile(&records(2), &[100, 400], 1.0, "inside_pass");
+        assert_eq!(profile.kernels, 2);
+        assert_eq!(profile.unmeasured_kernels, 1);
+        assert_eq!(profile.span_ms, None);
+    }
 }
 
 pub(crate) struct Resolver {

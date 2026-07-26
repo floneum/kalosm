@@ -44,6 +44,40 @@ pub(crate) struct DispatchPolicy {
     /// (`max_compute_workgroup_storage_size`: 16 KB WebGPU baseline, 32 KB
     /// on Apple silicon).
     max_workgroup_storage_bytes: u32,
+    /// Physical rates the matmul cost model prices its terms in. See the
+    /// accessors for units; all four are per-class floors derived in
+    /// [`crate::Device::matmul_rates`].
+    rates: MatmulRates,
+}
+
+/// The four device rates the cooperative-matmul cost model needs to express
+/// MMA issue, threadgroup traffic, output stores and DRAM traffic in one
+/// commensurable unit (femtoseconds). Integers so the argmin is exact and
+/// bit-reproducible — candidate scores tie often, the tile table being built
+/// from powers of two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MatmulRates {
+    /// Peak MAC issue in MACs per nanosecond.
+    pub(crate) mac_per_ns: u64,
+    /// Achievable DRAM bandwidth in bytes per nanosecond x10 (one decimal).
+    pub(crate) dram_decibytes_per_ns: u64,
+    /// Achievable threadgroup-memory bandwidth in bytes per nanosecond,
+    /// covering both operand staging and cooperative fragment loads.
+    pub(crate) workgroup_bytes_per_ns: u64,
+    /// Accumulator zeroing, the cooperative store's fragment shuffles and the
+    /// store itself, in femtoseconds per padded output element a workgroup
+    /// emits *per subgroup in that workgroup* — the drain is barrier-gated
+    /// across the whole workgroup, so its per-element cost tracks the
+    /// workgroup's width. See the T3 term in `matmul::cost`.
+    pub(crate) store_fs_per_element: u64,
+    /// Threadgroup traffic of a single-buffered body as a percentage of the
+    /// same traffic double-buffered. A single-buffered kernel cannot overlap
+    /// the next K iteration's staging with the current iteration's MMAs, and
+    /// the other three rates are all fitted on double-buffered bodies, so a
+    /// body that stages from one tile pair pays this on its staging — every
+    /// K iteration, which is why the penalty grows with the K loop while what
+    /// it buys ([`Self::core_workgroup_slots`]) does not.
+    pub(crate) single_buffered_traffic_pct: u64,
 }
 
 impl DispatchPolicy {
@@ -62,6 +96,7 @@ impl DispatchPolicy {
                 .min(limits.max_compute_invocations_per_workgroup),
             device.last_level_cache_bytes(),
             limits.max_compute_workgroup_storage_size,
+            device.matmul_rates(),
         )
     }
 
@@ -71,6 +106,7 @@ impl DispatchPolicy {
         max_workgroup_lanes: u32,
         last_level_cache_bytes: u64,
         max_workgroup_storage_bytes: u32,
+        rates: MatmulRates,
     ) -> Self {
         Self {
             saturation_lanes: saturation_lanes.max(1),
@@ -78,7 +114,13 @@ impl DispatchPolicy {
             max_workgroup_lanes: max_workgroup_lanes.max(1),
             last_level_cache_bytes,
             max_workgroup_storage_bytes,
+            rates,
         }
+    }
+
+    /// Physical rates for the cooperative-matmul cost model.
+    pub(crate) fn matmul_rates(&self) -> MatmulRates {
+        self.rates
     }
 
     /// The workgroup width for full-width dispatches.
@@ -101,6 +143,27 @@ impl DispatchPolicy {
         self.saturation_lanes
     }
 
+    /// The parallelism floor for a body that prefetches its own operands.
+    /// [`Self::saturation_lanes`] carries a ~4x oversubscription factor
+    /// because a latency-exposed kernel can only cover a DRAM round trip by
+    /// having other warps ready to issue. A double-buffered cooperative-matmul
+    /// body issues the next K tile's loads before running the current tile's
+    /// MMAs, so it covers that round trip in software and reaches peak issue
+    /// at half the residency.
+    pub(crate) fn prefetched_saturation_lanes(&self) -> u32 {
+        (self.saturation_lanes / 2).max(1)
+    }
+
+    /// How many workgroups of the given threadgroup-memory footprint a core
+    /// can hold at once. Shared memory is carved from a per-core pool the
+    /// same size as the per-workgroup cap, so this is a plain division —
+    /// and it is the only place a kernel's footprint costs anything beyond
+    /// legality. Co-resident workgroups cover each other's epilogue drain,
+    /// which is why the T3 term in `matmul::cost` is divided by it.
+    pub(crate) fn core_workgroup_slots(&self, workgroup_bytes: u64) -> u64 {
+        (u64::from(self.max_workgroup_storage_bytes) / workgroup_bytes.max(1)).max(1)
+    }
+
     /// Smallest workgroup worth a subgroup-accelerated whole-block
     /// reduction: two subgroups — one subgroup makes the cross-subgroup
     /// combine tree degenerate.
@@ -112,17 +175,6 @@ impl DispatchPolicy {
     /// fan-out-plus-combine split pays for its combine kernel.
     pub(crate) fn should_split_for_occupancy(&self, natural_wgs: u32, wg_lanes: u32) -> bool {
         (natural_wgs as u64) * (wg_lanes as u64) < self.saturation_lanes as u64
-    }
-
-    /// Whether a fan-out-plus-combine split of a *matmul-sized* workload
-    /// amortizes its combine pass: only when the unsplit grid fills less
-    /// than an eighth of the device. The combine costs roughly one extra
-    /// pass over the output plus a dispatch, so mild underfill never pays —
-    /// measured on M2 Max weight-gradient shapes: a 28%-occupancy grid lost
-    /// 30% by splitting, 12.5% lost 2x, 9.4% was neutral, and a
-    /// single-tile grid (0.4%) won 1.7x.
-    pub(crate) fn split_amortizes_combine(&self, natural_wgs: u32, wg_lanes: u32) -> bool {
-        (natural_wgs as u64) * (wg_lanes as u64) * 8 < self.saturation_lanes as u64
     }
 
     /// Register tiling may trade threads for per-thread work only when the
@@ -172,12 +224,12 @@ mod tests {
 
     /// Apple-silicon Metal: 32-wide subgroups, 1024-lane workgroups.
     fn apple() -> DispatchPolicy {
-        DispatchPolicy::from_parts(64 << 10, 32, 1024, 8 << 20, 32 << 10)
+        DispatchPolicy::from_parts(64 << 10, 32, 1024, 8 << 20, 32 << 10, crate::device::APPLE_MATMUL_RATES)
     }
 
     /// WebGPU baseline limits: 256-lane workgroups.
     fn webgpu_baseline() -> DispatchPolicy {
-        DispatchPolicy::from_parts(64 << 10, 32, 256, 4 << 20, 16 << 10)
+        DispatchPolicy::from_parts(64 << 10, 32, 256, 4 << 20, 16 << 10, crate::device::APPLE_MATMUL_RATES)
     }
 
     /// The derived values must reproduce the constants the kernels were
@@ -217,7 +269,7 @@ mod tests {
     #[test]
     fn no_subgroup_device_floors() {
         // Subgroup width falls back to 32 → same reduction floor.
-        let p = DispatchPolicy::from_parts(64 << 10, 32, 512, 4 << 20, 32 << 10);
+        let p = DispatchPolicy::from_parts(64 << 10, 32, 512, 4 << 20, 32 << 10, crate::device::APPLE_MATMUL_RATES);
         assert_eq!(p.min_reduction_lanes(), 64);
         assert_eq!(
             p.dynamic_block_buckets().collect::<Vec<_>>(),

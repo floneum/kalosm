@@ -100,10 +100,10 @@ pub(super) fn select_coop_kind(
         .expect("coop selector called with no supported cooperative matrix kind")
 }
 
-/// (BM, BN, BK) tile dimensions for a cooperative-matrix matmul tile. The
-/// `select` helper below returns `Option<CoopTile>` (`None` = no coop variant
-/// fits the shape); the kernel layer uses the tuple to look up the matching
-/// ROW_GROUPS/COL_GROUPS/N_PASSES/BLOCK in its internal table.
+/// (BM, BN, BK) tile dimensions for a cooperative-matrix matmul tile. Chosen
+/// by [`super::cost::plan_coop_tile`], which also derives the subgroup split
+/// the kernel runs with; the kernel layer looks the remaining execution
+/// properties (N_PASSES, BLOCK) up by geometry in its own table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CoopTile {
     pub(crate) bm: u32,
@@ -116,39 +116,4 @@ impl CoopTile {
         Self { bm, bn, bk }
     }
 
-    /// Subgroups per workgroup for this geometry, from the kernel table —
-    /// the single source of truth for coop tile execution properties.
-    /// Zero means the geometry has no kernel entry and is unselectable.
-    pub(super) fn subgroup_groups(self) -> u32 {
-        fusor_tile_ir_kernels::coop_tile_entries()
-            .iter()
-            .find(|entry| {
-                entry.tile.bm == self.bm && entry.tile.bn == self.bn && entry.tile.bk == self.bk
-            })
-            .map(|entry| entry.row_groups * entry.col_groups)
-            .unwrap_or(0)
-    }
-
-    /// The merged kernel shares one double-buffered workgroup-tile pair
-    /// across guarded segments. The 256x256 standalone profile is deliberately
-    /// single-buffered because a second pair would exceed the workgroup-memory
-    /// budget, so it must remain a standalone dispatch.
-    pub(super) const fn supports_horizontal_merge(self) -> bool {
-        !matches!((self.bm, self.bn, self.bk), (256, 256, 16))
-    }
-
-    /// Pick a cooperative-matrix tile for the given (m, k, n) shape, or
-    /// `None` when no coop tile is worth it (degenerate contractions route
-    /// to the vector/generic families). Selection is the general scored
-    /// argmin over the full kernel tile table — see [`super::cost`].
-    pub(super) fn select(
-        m: u32,
-        k: u32,
-        n: u32,
-        datatype: crate::DataTypeEnum,
-        policy: &crate::occupancy::DispatchPolicy,
-        max_subgroup_size: u32,
-    ) -> Option<Self> {
-        super::cost::select_coop_tile(m, k, n, datatype, policy, max_subgroup_size)
-    }
 }

@@ -47,6 +47,9 @@ fn style(variant: &ExecutionVariant) -> (&'static str, &'static str) {
         ExecutionVariant::QMatrix(_) => ("box", "#d8d0e8"),
         ExecutionVariant::Elementwise(_) => ("ellipse", "#cfe4f7"),
         ExecutionVariant::Reduce(_) => ("ellipse", "#a8cbe8"),
+        // Folds share the reduce hue; a multi-slot carrier is the distinction
+        // worth seeing, so the label carries it.
+        ExecutionVariant::Fold(_) => ("ellipse", "#8fbcd9"),
         ExecutionVariant::View(_) => ("ellipse", "#eef3f7"),
         ExecutionVariant::Assign(_) => ("ellipse", "#f7e4cf"),
         ExecutionVariant::Region(_) => ("octagon", "#bfe8cf"),
@@ -66,6 +69,12 @@ fn label(variant: &ExecutionVariant) -> String {
             format!("elementwise x{}\\n{:?}", op.inputs.len(), op.shape)
         }
         ExecutionVariant::Reduce(op) => format!("reduce {}", op.function.name()),
+        ExecutionVariant::Fold(op) => format!(
+            "fold x{}{}\\n{} outputs",
+            op.carrier.len(),
+            op.block.map_or(String::new(), |block| format!(" /{block}")),
+            op.outputs.len(),
+        ),
         ExecutionVariant::View(_) => "view".to_string(),
         ExecutionVariant::Assign(_) => "slice_assign".to_string(),
         ExecutionVariant::Region(op) => format!("region\\n{} statements", op.statements.len()),

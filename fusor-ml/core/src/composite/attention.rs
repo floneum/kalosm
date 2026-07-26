@@ -299,8 +299,7 @@ impl Tensor {
         let scores = self.attention_scores(k, scale, mask, causal);
         let shape = scores.shape().to_vec();
         let kept = [shape[0], shape[1], shape[2], 1];
-        let row_broadcast =
-            |row: &Tensor| row.reshape(&kept).broadcast_as(&shape);
+        let row_broadcast = |row: &Tensor| row.reshape(&kept).broadcast_as(&shape);
         let p = (&scores - &row_broadcast(lse)).exp();
         let dsum = (grad_o * o).sum(3);
         let expanded = [shape[0], shape[1], shape[3], self.shape()[3]];
@@ -328,11 +327,8 @@ impl Tensor {
             DataTypeEnum::F16 => Tensor::splat(self.device(), half::f16::ZERO, combined_shape),
             _ => Tensor::splat(self.device(), 0.0f32, combined_shape),
         }
-            .slice_assign([0..batch, 0..heads, 0..kv_len, 0..head_dim], &dk)
-            .slice_assign(
-                [0..batch, 0..heads, kv_len..2 * kv_len, 0..head_dim],
-                &dv,
-            );
+        .slice_assign([0..batch, 0..heads, 0..kv_len, 0..head_dim], &dk)
+        .slice_assign([0..batch, 0..heads, kv_len..2 * kv_len, 0..head_dim], &dv);
         let half_strides: Box<[usize]> = [
             heads * 2 * kv_len * head_dim,
             2 * kv_len * head_dim,

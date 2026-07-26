@@ -364,8 +364,7 @@ mod selection_tests {
     /// deliberate selection change and paste the printed rows below.
     #[test]
     fn dense_plan_golden() {
-        let policy =
-            crate::occupancy::DispatchPolicy::from_parts(64 << 10, 32, 64 << 10, 8 << 20, 32 << 10);
+        let policy = apple_policy(64 << 10, 32 << 10);
         let shapes: [(usize, usize, usize); 8] = [
             (16384, 384, 1536),
             (16384, 1536, 384),
@@ -384,25 +383,60 @@ mod selection_tests {
                     k,
                     n,
                     1,
+                    PROBE_GROUP,
+                    1,
                     datatype,
                     &policy,
                     32,
                     caps(true),
                 );
                 rows.push(format!(
-                    "{m}x{k}x{n} {datatype:?} => {:?} tile={:?} splits={:?} sw={}",
+                    "{m}x{k}x{n} {datatype:?} => {:?} tile={:?} groups={:?} splits={:?} \
+                     buffers={:?} sw={}",
                     plan.variant,
-                    plan.tile.map(|tile| (tile.bm, tile.bn, tile.bk)),
-                    plan.splits,
+                    plan.coop.map(|(tile, ..)| (tile.bm, tile.bn, tile.bk)),
+                    plan.coop.map(|(_, rg, cg, ..)| (rg, cg)),
+                    plan.coop.map(|(.., splits, _)| splits),
+                    plan.coop.map(|(.., buffers)| buffers),
                     plan.swizzle_group_m
                 ));
             }
         }
-        let golden = GOLDEN_PLANS.trim().lines().map(str::trim).collect::<Vec<_>>();
+        // The split count sizes the launched grid, so a horizontally merged
+        // dispatch of `group` same-profile contractions splits less. The tile
+        // is held at the probe group throughout: allocation precedes the
+        // partition, so only the split count may move with it.
+        for group in [2, 4, 8, 16] {
+            let plan = super::cost::plan_dense_matmul(
+                64,
+                2048,
+                64,
+                1,
+                PROBE_GROUP,
+                group,
+                crate::DataTypeEnum::F32,
+                &policy,
+                32,
+                caps(true),
+            );
+            rows.push(format!(
+                "64x2048x64 F32 group={group} => splits={:?} buffers={:?}",
+                plan.coop.map(|(.., splits, _)| splits),
+                plan.coop.map(|(.., buffers)| buffers)
+            ));
+        }
+        let golden = GOLDEN_PLANS
+            .trim()
+            .lines()
+            .map(str::trim)
+            .collect::<Vec<_>>();
         for row in &rows {
             println!("{row}");
         }
-        assert_eq!(rows, golden, "dense matmul routing changed; regenerate deliberately");
+        assert_eq!(
+            rows, golden,
+            "dense matmul routing changed; regenerate deliberately"
+        );
     }
 
     /// The locked routing surface. The `Coop tile=None` row is truthful and
@@ -411,49 +445,96 @@ mod selection_tests {
     /// declines, which production resolves through the generic fallback —
     /// the selector does not consult the tile scorer.
     const GOLDEN_PLANS: &str = "
-        16384x384x1536 F32 => Coop tile=Some((128, 64, 16)) splits=None sw=8
-        16384x384x1536 F16 => Coop tile=Some((128, 64, 16)) splits=None sw=1
-        16384x1536x384 F32 => Coop tile=Some((128, 64, 16)) splits=None sw=8
-        16384x1536x384 F16 => Coop tile=Some((128, 64, 16)) splits=None sw=1
-        384x16384x1536 F32 => Coop tile=Some((128, 64, 16)) splits=None sw=8
-        384x16384x1536 F16 => Coop tile=Some((128, 64, 16)) splits=None sw=8
-        16384x384x384 F32 => Coop tile=Some((128, 64, 16)) splits=None sw=8
-        16384x384x384 F16 => Coop tile=Some((128, 64, 16)) splits=None sw=1
-        4096x4096x4096 F32 => Coop tile=Some((128, 64, 16)) splits=None sw=8
-        4096x4096x4096 F16 => Coop tile=Some((128, 64, 16)) splits=None sw=1
-        16384x3072x1536 F32 => Coop tile=Some((128, 64, 16)) splits=None sw=1
-        16384x3072x1536 F16 => Coop tile=Some((128, 64, 16)) splits=None sw=1
-        64x2048x64 F32 => Coop tile=Some((64, 16, 16)) splits=Some(64) sw=1
-        64x2048x64 F16 => Coop tile=Some((64, 16, 16)) splits=Some(64) sw=1
-        1x4096x4096 F32 => Coop tile=None splits=None sw=8
-        1x4096x4096 F16 => Coop tile=None splits=None sw=1
+    16384x384x1536 F32 => Coop tile=Some((128, 64, 16)) groups=Some((4, 2)) splits=Some(1) buffers=Some(2) sw=8
+    16384x384x1536 F16 => Coop tile=Some((64, 64, 16)) groups=Some((2, 2)) splits=Some(1) buffers=Some(2) sw=1
+    16384x1536x384 F32 => Coop tile=Some((128, 64, 16)) groups=Some((4, 2)) splits=Some(1) buffers=Some(2) sw=8
+    16384x1536x384 F16 => Coop tile=Some((128, 64, 16)) groups=Some((4, 2)) splits=Some(1) buffers=Some(2) sw=1
+    384x16384x1536 F32 => Coop tile=Some((128, 64, 16)) groups=Some((4, 2)) splits=Some(2) buffers=Some(1) sw=8
+    384x16384x1536 F16 => Coop tile=Some((128, 64, 16)) groups=Some((4, 2)) splits=Some(2) buffers=Some(1) sw=8
+    16384x384x384 F32 => Coop tile=Some((128, 64, 16)) groups=Some((4, 2)) splits=Some(1) buffers=Some(2) sw=8
+    16384x384x384 F16 => Coop tile=Some((64, 64, 16)) groups=Some((2, 2)) splits=Some(1) buffers=Some(2) sw=1
+    4096x4096x4096 F32 => Coop tile=Some((128, 64, 16)) groups=Some((4, 2)) splits=Some(1) buffers=Some(2) sw=8
+    4096x4096x4096 F16 => Coop tile=Some((128, 64, 16)) groups=Some((4, 2)) splits=Some(1) buffers=Some(2) sw=1
+    16384x3072x1536 F32 => Coop tile=Some((128, 64, 16)) groups=Some((4, 2)) splits=Some(1) buffers=Some(2) sw=1
+    16384x3072x1536 F16 => Coop tile=Some((128, 64, 16)) groups=Some((4, 2)) splits=Some(1) buffers=Some(2) sw=1
+    64x2048x64 F32 => Coop tile=Some((64, 64, 16)) groups=Some((2, 2)) splits=Some(32) buffers=Some(1) sw=1
+    64x2048x64 F16 => Coop tile=Some((64, 64, 16)) groups=Some((2, 2)) splits=Some(32) buffers=Some(1) sw=1
+    1x4096x4096 F32 => Coop tile=None groups=None splits=None buffers=None sw=8
+    1x4096x4096 F16 => Coop tile=None groups=None splits=None buffers=None sw=1
+    64x2048x64 F32 group=2 => splits=Some(32) buffers=Some(1)
+    64x2048x64 F32 group=4 => splits=Some(32) buffers=Some(1)
+    64x2048x64 F32 group=8 => splits=Some(32) buffers=Some(1)
+    64x2048x64 F32 group=16 => splits=Some(16) buffers=Some(1)
     ";
 
-    fn select_with_lanes(m: u32, k: u32, n: u32, max_lanes: u32) -> Option<CoopTile> {
-        let policy = crate::occupancy::DispatchPolicy::from_parts(
+    /// The group the tile is scored at everywhere in production: the
+    /// horizontal merger's own maximum, `budget / MATMUL_SEGMENT_BINDINGS`.
+    const PROBE_GROUP: u32 = 10;
+
+    /// A policy carrying this machine's measured rates, so the selection
+    /// tests exercise the same decision surface production does.
+    fn apple_policy(
+        max_workgroup_lanes: u32,
+        max_workgroup_storage_bytes: u32,
+    ) -> crate::occupancy::DispatchPolicy {
+        crate::occupancy::DispatchPolicy::from_parts(
             64 << 10,
             32,
-            max_lanes,
+            max_workgroup_lanes,
             8 << 20,
-            32 << 10,
-        );
-        CoopTile::select(m, k, n, crate::DataTypeEnum::F32, &policy, 32)
+            max_workgroup_storage_bytes,
+            crate::device::APPLE_MATMUL_RATES,
+        )
+    }
+
+    fn select_with_lanes(m: u32, k: u32, n: u32, max_lanes: u32) -> Option<CoopTile> {
+        let policy = apple_policy(max_lanes, 32 << 10);
+        super::cost::plan_coop_tile(
+            m,
+            k,
+            n,
+            1,
+            crate::DataTypeEnum::F32,
+            false,
+            PROBE_GROUP,
+            &policy,
+            32,
+        )
+        .map(|(tile, ..)| tile)
     }
 
     /// At WebGPU's 16 KB default workgroup-storage limit the footprint
-    /// filter is live: every double-buffered f32 entry the 4096-cube can
-    /// reach overflows (the 16-wide profiles are out on a 4096-wide side),
-    /// while f16 halves the staged bytes and keeps the standard profile.
+    /// filter is live: every 64-wide-or-more f32 entry overflows two staged
+    /// pairs, so the 4096-cube falls back to the narrow 64x16 profile it
+    /// would never pick at 32 KB, while f16 halves the staged bytes and
+    /// keeps the profile the full limit chooses.
     #[test]
     fn footprint_filter_at_16kb_limit() {
-        let policy =
-            crate::occupancy::DispatchPolicy::from_parts(64 << 10, 32, 64 << 10, 8 << 20, 16 << 10);
+        let select = |datatype, storage| {
+            let policy = apple_policy(64 << 10, storage);
+            super::cost::plan_coop_tile(
+                4096,
+                4096,
+                4096,
+                1,
+                datatype,
+                false,
+                PROBE_GROUP,
+                &policy,
+                32,
+            )
+            .map(|(tile, ..)| tile)
+        };
         assert_eq!(
-            CoopTile::select(4096, 4096, 4096, crate::DataTypeEnum::F32, &policy, 32),
-            None
+            select(crate::DataTypeEnum::F32, 32 << 10),
+            Some(CoopTile::new(128, 64, 16))
         );
         assert_eq!(
-            CoopTile::select(4096, 4096, 4096, crate::DataTypeEnum::F16, &policy, 32),
+            select(crate::DataTypeEnum::F32, 16 << 10),
+            Some(CoopTile::new(64, 16, 16))
+        );
+        assert_eq!(
+            select(crate::DataTypeEnum::F16, 16 << 10),
             Some(CoopTile::new(128, 64, 16))
         );
     }
@@ -480,7 +561,7 @@ mod selection_tests {
                 .iter()
                 .find(|entry| entry.tile.bm == tile.bm && entry.tile.bn == tile.bn)
                 .expect("selected tile must exist in the kernel table");
-            let threads = entry.row_groups * entry.col_groups * 32;
+            let threads = entry.subgroups * 32;
             assert!(
                 threads <= max_lanes,
                 "m={m} k={k} n={n} lanes={max_lanes}: illegal tile {tile:?}"
@@ -610,3 +691,4 @@ mod split_k_tests {
         check_dense_split_k(64, 520, 64);
     }
 }
+

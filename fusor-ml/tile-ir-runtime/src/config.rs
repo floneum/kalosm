@@ -68,6 +68,34 @@ pub struct FusorConfig {
     /// Override the structural fusion-plan window horizon
     /// (`FUSOR_SPIKE_WINDOW_DEPTH`); unset keeps the built-in stub depth.
     pub spike_window_depth: Option<u32>,
+    /// Log what the extraction duplication gate refused
+    /// (`FUSOR_SPIKE_DUP_LEDGER`): the producers a fusion candidate would
+    /// have inlined while they still materialize for someone else. This is
+    /// the rematerialization surface. Measurement only; changes no decision.
+    pub spike_dup_ledger: bool,
+    /// Score the extraction byte term as total traffic — input reads plus the
+    /// output write — instead of the output write alone
+    /// (`FUSOR_SPIKE_READ_TRAFFIC`). Without it, inlining a producer looks
+    /// free because only the deleted write is counted and the added reads of
+    /// that producer's own inputs are not.
+    pub spike_read_traffic: bool,
+    /// Rewrite every built-in row-phase combine into an equivalent general
+    /// combine before emission (`FUSOR_SPIKE_GENERAL_COMBINE`). The results
+    /// must be bit-identical: this is how the general fold path is validated
+    /// against the closed-operator path on real reductions.
+    pub spike_general_combine: bool,
+    /// Compare extraction costs on one clock — dispatches, bytes and work
+    /// converted to nanoseconds by measured roofline constants — instead of
+    /// the lexicographic tuple (`FUSOR_SPIKE_SCALAR_COST`). Implies
+    /// `spike_read_traffic`. Under the tuple, dispatch count is effectively
+    /// infinite and no amount of bandwidth or arithmetic can outweigh it.
+    pub spike_scalar_cost: bool,
+    /// Let candidates that duplicate a live producer through to the cost
+    /// model instead of rejecting them outright (`FUSOR_SPIKE_NO_DUP_GATE`).
+    /// Measures whether the lexicographic cost tuple can price duplication
+    /// on its own. Experimental: the cost model does not count input reads,
+    /// so this is expected to over-fuse.
+    pub spike_no_dup_gate: bool,
     /// Write every generated shader to this directory (`FUSOR_DUMP_SHADERS`).
     pub dump_shaders: Option<PathBuf>,
     /// Write a Graphviz digraph of the execution graph after each resolver
@@ -129,6 +157,11 @@ impl FusorConfig {
             spike_hoisting: flag("FUSOR_SPIKE_HOISTING"),
             spike_no_recognition: parse("FUSOR_SPIKE_NO_RECOGNITION"),
             spike_window_depth: parse("FUSOR_SPIKE_WINDOW_DEPTH"),
+            spike_dup_ledger: flag("FUSOR_SPIKE_DUP_LEDGER"),
+            spike_read_traffic: flag("FUSOR_SPIKE_READ_TRAFFIC"),
+            spike_scalar_cost: flag("FUSOR_SPIKE_SCALAR_COST"),
+            spike_general_combine: flag("FUSOR_SPIKE_GENERAL_COMBINE"),
+            spike_no_dup_gate: flag("FUSOR_SPIKE_NO_DUP_GATE"),
             dump_shaders: std::env::var_os("FUSOR_DUMP_SHADERS").map(PathBuf::from),
             dump_stages: std::env::var_os("FUSOR_DUMP_STAGES").map(PathBuf::from),
             graph_flush_threshold: parse("FUSOR_GRAPH_FLUSH_THRESHOLD"),

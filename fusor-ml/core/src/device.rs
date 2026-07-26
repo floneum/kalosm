@@ -19,6 +19,56 @@ use web_time::{Duration, Instant};
 #[cfg(not(target_arch = "wasm32"))]
 const GPU_POLL_SPIN_BUDGET: Duration = Duration::from_millis(2);
 
+/// Apple-silicon cooperative-matmul rates (see [`Device::matmul_rates`]).
+/// `dram_decibytes_per_ns` is the measured M2 Max bandwidth roof (379.5
+/// GB/s). `mac_per_ns` is the measured simdgroup issue ceiling, 8.9 TF/s:
+/// the 5.60 TF/s this used to carry was never a roof at all — the same
+/// kernels sustain 7.57 TF/s on 16384x3072x1536 and 7.64 on the 4096-cube,
+/// so the model was charging MMA issue above what the hardware bills and the
+/// term crowded out every geometry difference it was supposed to arbitrate.
+///
+/// The other two have no roof to read and are fitted together against 13
+/// contractions crossed with every legal tile — the eight merged microbench
+/// cases (K from 64 to 16,384) plus five standalone `bench_coop_tiles`
+/// contractions from 1024^3 to 16384x3072x1536, 65 measured spans. They are
+/// what decides the geometry, so they are fitted for ranking, not for
+/// absolute span: `workgroup_bytes_per_ns` sets what a wider tile buys and
+/// `store_fs_per_element` what it costs, and the values below sit at the
+/// centre of the box in which every one of the 13 picks the measured
+/// fastest tile (`workgroup_bytes_per_ns` 650..800, `store_fs_per_element`
+/// 2,000..4,200). Off the low side the K<=16 shapes take a 128-wide profile
+/// and lose 8-22%; off the high side the K>=384 shapes take a 64-wide one
+/// and lose 3-7%.
+pub(crate) const APPLE_MATMUL_RATES: crate::occupancy::MatmulRates =
+    crate::occupancy::MatmulRates {
+        mac_per_ns: 4450,
+        dram_decibytes_per_ns: 3795,
+        workgroup_bytes_per_ns: 700,
+        store_fs_per_element: 4_000,
+        // Fitted against the direct measurement of the trade: the same
+        // merged body staged from one pair instead of two, at identical
+        // tile, split count and grid, runs 2048x64x64 -14.0%, 2048x64x256
+        // -11.0%, 2048x256x64 +0.8% and 384x16384x1536 +7.2% (warm-resolve
+        // span medians, 20 interleaved processes per arm, controls flat).
+        // Those four shapes bracket the crossover at 4 < k_iterations < 16
+        // against the residency credit in T3, which pins this to 103..108.
+        single_buffered_traffic_pct: 105,
+    };
+
+/// Every other device class. The cost model is a ratio of these rates, so
+/// what matters off Apple silicon is their proportion, not their scale: keep
+/// the Apple ratios and scale the two absolute roofs down to a conservative
+/// mid-range discrete part. Under-stating both roofs equally leaves every
+/// comparison unchanged.
+pub(crate) const OTHER_MATMUL_RATES: crate::occupancy::MatmulRates =
+    crate::occupancy::MatmulRates {
+        mac_per_ns: 2225,
+        dram_decibytes_per_ns: 1900,
+        workgroup_bytes_per_ns: 350,
+        store_fs_per_element: 8_000,
+        single_buffered_traffic_pct: 105,
+    };
+
 #[cfg(not(target_arch = "wasm32"))]
 fn poll_until_queue_empty(device: &wgpu::Device) -> Result<wgpu::PollStatus, wgpu::PollError> {
     let start = Instant::now();
@@ -155,8 +205,13 @@ pub struct KernelProfile {
     /// otherwise `"pass_boundary"`.
     pub timestamp_mode: &'static str,
     pub kernels: usize,
+    /// Dispatches the GPU did not sample. `accounted_ms` covers
+    /// `kernels - unmeasured_kernels` dispatches, never all of them silently.
+    pub unmeasured_kernels: usize,
     pub accounted_ms: f64,
-    pub span_ms: f64,
+    /// Wall span from the first sampled begin to the last sampled end, or `None`
+    /// when any dispatch went unmeasured and the span would not cover the resolve.
+    pub span_ms: Option<f64>,
     pub timestamp_period_ns: f64,
     /// Per-category aggregates, sorted by total time descending.
     pub categories: Vec<KernelProfileRow>,
@@ -198,6 +253,26 @@ struct DeviceInner {
     /// (`FUSOR_TRACE_GPU_KERNELS`), drained by
     /// [`Device::take_kernel_profiles`].
     kernel_profiles: Mutex<Vec<KernelProfile>>,
+    /// Memoized cooperative tile geometry per contraction shape. The scored
+    /// selection enumerates every table entry against every legal split count
+    /// (~1.5 us) and is asked five times per matmul per resolve, on a decode
+    /// path that builds hundreds of dispatches per token. Same class as the
+    /// cached adapter info above: a device-lifetime cache of a pure function
+    /// of device state.
+    coop_tile_memo: Mutex<rustc_hash::FxHashMap<CoopTileKey, Option<[u32; 5]>>>,
+}
+
+/// Everything [`crate::matmul::cost::plan_coop_tile`] reads that varies per
+/// call; every other input is device state, which the memo's owner pins.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CoopTileKey {
+    pub(crate) m: u32,
+    pub(crate) k: u32,
+    pub(crate) n: u32,
+    pub(crate) batch: u32,
+    pub(crate) datatype: crate::DataTypeEnum,
+    pub(crate) has_epilogues: bool,
+    pub(crate) probe_group: u32,
 }
 
 impl Debug for DeviceInner {
@@ -259,6 +334,7 @@ impl Device {
             disable_subgroups,
             poison_allocations,
             kernel_profiles: Default::default(),
+            coop_tile_memo: Default::default(),
         });
         let device = Device {
             inner: inner.clone(),
@@ -419,6 +495,7 @@ impl Device {
             disable_subgroups,
             poison_allocations,
             kernel_profiles: Default::default(),
+            coop_tile_memo: Default::default(),
         });
 
         let device = Device {
@@ -505,6 +582,37 @@ impl Device {
     /// MORE parallelism, never less.
     pub(crate) fn saturation_lanes(&self) -> u32 {
         64 << 10
+    }
+
+    /// The memoized `[bm, bn, bk, row_groups, col_groups]` geometry for one
+    /// contraction shape, `None` when the shape declines the coop family.
+    pub(crate) fn coop_tile_memo(
+        &self,
+        key: CoopTileKey,
+        plan: impl FnOnce() -> Option<[u32; 5]>,
+    ) -> Option<[u32; 5]> {
+        let mut memo = self
+            .inner
+            .coop_tile_memo
+            .lock()
+            .expect("coop tile memo poisoned");
+        *memo.entry(key).or_insert_with(plan)
+    }
+
+    /// Physical rates the cooperative-matmul cost model prices its terms in.
+    /// wgpu exposes no clock, no bandwidth and no core count, so these are
+    /// per-class values in the same spirit as [`Self::saturation_lanes`] —
+    /// but unlike a parallelism floor, a rate that is wrong in either
+    /// direction moves the argmin, so they are anchored on measured roofs
+    /// where a roof exists and on fitted spans where none does (see
+    /// [`APPLE_MATMUL_RATES`]).
+    pub(crate) fn matmul_rates(&self) -> crate::occupancy::MatmulRates {
+        let info = &self.inner.adapter_info;
+        if info.backend == wgpu::Backend::Metal && info.name.starts_with("Apple") {
+            APPLE_MATMUL_RATES
+        } else {
+            OTHER_MATMUL_RATES
+        }
     }
 
     /// The dispatch-sizing policy derived from this device's capabilities.

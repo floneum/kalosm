@@ -205,7 +205,7 @@ pub struct ReduceFunction {
 }
 
 impl ReduceFunction {
-    fn new(op: ReduceOp, initial_value: NaryScalar, datatype: DataTypeEnum) -> Self {
+    pub(crate) fn new(op: ReduceOp, initial_value: NaryScalar, datatype: DataTypeEnum) -> Self {
         Self {
             name: None,
             op,

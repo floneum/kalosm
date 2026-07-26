@@ -1058,11 +1058,7 @@ async fn main() {
     }
 
     match config.dtype {
-        Dtype::F32 => {
-            gpt_f32::run(config, device, vocab, train_tokens, test_tokens, &tokens).await
-        }
-        Dtype::F16 => {
-            gpt_f16::run(config, device, vocab, train_tokens, test_tokens, &tokens).await
-        }
+        Dtype::F32 => gpt_f32::run(config, device, vocab, train_tokens, test_tokens, &tokens).await,
+        Dtype::F16 => gpt_f16::run(config, device, vocab, train_tokens, test_tokens, &tokens).await,
     }
 }

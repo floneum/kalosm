@@ -5,7 +5,7 @@
 use fusor_core::{Device, Layout, Tensor};
 use fusor_tile_ir::{CoopMatrixToken, ScalarElement, Shape, SubgroupToken, tile};
 use fusor_tile_ir_kernels::{
-    DEFAULT_SWIZZLE_GROUP_M, DenseCoopMatmulConfig, DenseCoopMatmulTile, DenseMatmulEpilogues,
+    CoopTileEntry, DEFAULT_SWIZZLE_GROUP_M, DenseCoopMatmulConfig, DenseMatmulEpilogues,
     DenseMatmulShape, DenseMatmulTensors, SubgroupConfig, coop_tile_entries,
     try_batched_coop_matmul,
 };
@@ -85,7 +85,9 @@ async fn check_automatic(
 /// output against the host reference. The output buffer covers whole tiles,
 /// so the rows and columns past `m` and `n` hold pad values the comparison
 /// skips.
-fn check_forced(device: &Device, tile: DenseCoopMatmulTile, m: u32, k: u32, n: u32) {
+fn check_forced(device: &Device, entry: &CoopTileEntry, m: u32, k: u32, n: u32) {
+    let tile = entry.tile;
+    let (row_groups, col_groups) = entry.subgroup_split();
     let a_data = values((m * k) as usize, 0.13);
     let b_data = values((k * n) as usize, 0.07);
     let m_pad = m.div_ceil(tile.bm) * tile.bm;
@@ -123,7 +125,10 @@ fn check_forced(device: &Device, tile: DenseCoopMatmulTile, m: u32, k: u32, n: u
                 coop: CoopMatrixToken::new_unchecked(),
                 subgroups: SubgroupConfig::fixed(SubgroupToken::new_unchecked(), 32),
                 tile,
+                row_groups,
+                col_groups,
                 staging: None,
+                stage_buffers: 2,
                 swizzle_group_m: DEFAULT_SWIZZLE_GROUP_M,
             },
         );
@@ -232,8 +237,8 @@ fn forced_coop_tiles_compute_their_own_geometry_correctly() {
         }
         for entry in coop_tile_entries() {
             let tile = entry.tile;
-            check_forced(&device, tile, tile.bm, 48, tile.bn);
-            check_forced(&device, tile, tile.bm + 7, 30, tile.bn + 5);
+            check_forced(&device, entry, tile.bm, 48, tile.bn);
+            check_forced(&device, entry, tile.bm + 7, 30, tile.bn + 5);
         }
     });
 }

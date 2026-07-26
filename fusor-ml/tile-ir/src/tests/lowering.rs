@@ -337,3 +337,73 @@ fn cooperative_load_store_layout_flags_use_transposed_internal_layout() {
     assert_eq!(loads, [false, false]);
     assert_eq!(stores, [true]);
 }
+
+#[test]
+fn general_group_reduce_lowers_without_subgroup_intrinsics() {
+    // A general combine cannot use subgroup collectives (they are
+    // per-operator), so `group_reduce_with` stages through workgroup memory.
+    // It must therefore lower on devices with no subgroup support at all.
+    let ir = tile::build(|phase| {
+        let x = phase.storage_read(f32(), Shape::new([64]));
+        let y = phase.storage_write(f32(), Shape::new([64]));
+        phase.program_grid(64, [1, 1, 1], |program| {
+            let lane = program.lane();
+            let mask = lane.clone().lt(64u32);
+            let value = program.load(x.at(lane.clone()), mask.clone(), 0.0);
+            // An arbitrary associative body, not one of the closed ops.
+            let combined = program.group_reduce_with(16, value, |program, a, b| {
+                let scaled = a.clone() * b.clone();
+                program.bind(a + b + scaled)
+            });
+            program.store(y.at(lane), combined, mask);
+        });
+    });
+
+    let lowered = lower_or_fail(&ir, "general group reduce");
+    assert_eq!(
+        lowered.wgsl_extension_prelude(),
+        "",
+        "a general combine must not require the subgroups extension"
+    );
+}
+
+#[test]
+fn joint_carrier_group_reduce_stages_every_slot() {
+    // A two-slot carrier whose second slot reads the first on both sides —
+    // the shape that makes online softmax a carrier rather than two
+    // independent reductions. Each slot needs its own staging array, so the
+    // lowered program must hold two block-sized workgroup allocations.
+    let ir = tile::build(|phase| {
+        let x = phase.storage_read(f32(), Shape::new([64]));
+        let y = phase.storage_write(f32(), Shape::new([64]));
+        phase.program_grid(64, [1, 1, 1], |program| {
+            let lane = program.lane();
+            let mask = lane.clone().lt(64u32);
+            let value = program.load(x.at(lane.clone()), mask.clone(), 0.0);
+            let one = program.bind(value.clone() * 0.0 + 1.0);
+            let combined = program.group_reduce_with_vec(
+                16,
+                vec![value, one],
+                |program, acc, incoming| {
+                    let mut acc = acc.into_iter();
+                    let (m, l) = (acc.next().unwrap(), acc.next().unwrap());
+                    let mut incoming = incoming.into_iter();
+                    let (m2, l2) = (incoming.next().unwrap(), incoming.next().unwrap());
+                    let joined = program.bind(m.clone().max(m2.clone()));
+                    let scaled = l * (m - joined.clone()).exp() + l2 * (m2 - joined.clone()).exp();
+                    vec![joined, program.bind(scaled)]
+                },
+            );
+            let mut combined = combined.into_iter();
+            let (m, l) = (combined.next().unwrap(), combined.next().unwrap());
+            program.store(y.at(lane), m + l.log(), mask);
+        });
+    });
+
+    let lowered = lower_or_fail(&ir, "joint carrier group reduce");
+    assert_eq!(
+        lowered.wgsl_extension_prelude(),
+        "",
+        "a joint carrier must not require the subgroups extension"
+    );
+}

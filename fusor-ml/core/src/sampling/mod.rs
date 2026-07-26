@@ -50,8 +50,7 @@ impl PendingGpuSampledToken {
         // per-token sync the pending decode path stalls on). On wasm this is
         // always on; native gates on the trace config flags.
         let config = self.token.device().config();
-        let trace =
-            cfg!(target_arch = "wasm32") || config.trace_decode || config.trace_sampler;
+        let trace = cfg!(target_arch = "wasm32") || config.trace_decode || config.trace_sampler;
         let await_start = trace.then(web_time::Instant::now);
         self.receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
         if let Some(start) = await_start {

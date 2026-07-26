@@ -1056,6 +1056,14 @@ fn emit_function(function: &NaryFunction, values: &mut [(ValueTile, DataTypeEnum
             .0
             .clone()
             .binary(tile_ir::TileBinaryOp::Pow, values[1].0.clone()),
+        NaryOp::Max => values[0]
+            .0
+            .clone()
+            .binary(tile_ir::TileBinaryOp::Max, values[1].0.clone()),
+        NaryOp::Min => values[0]
+            .0
+            .clone()
+            .binary(tile_ir::TileBinaryOp::Min, values[1].0.clone()),
         NaryOp::Neg => values[0].0.clone().unary(tile_ir::TileUnaryOp::Neg),
         NaryOp::Cast => values[0].0.clone().cast_to(function.output_type),
         NaryOp::Select => match values[1].0.clone().cast_to(function.output_type) {

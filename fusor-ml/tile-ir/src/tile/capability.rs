@@ -70,6 +70,23 @@ impl SubgroupToken {
     ) -> Tile {
         program.workgroup_reduce_via_subgroups(op, subgroup_size, value)
     }
+
+    /// Reduction over subgroup-aligned lane groups of `group_size`, the
+    /// sub-block form of [`Self::workgroup_reduce`]: no barrier at all when a
+    /// group is one subgroup, two otherwise. `group_size` must be a multiple
+    /// of the device's fixed subgroup width and divide the workgroup size, and
+    /// the caller must derive group membership from `subgroup_id` (see
+    /// [`TileBlock::group_reduce_via_subgroups`]).
+    pub fn group_reduce(
+        self,
+        program: &mut TileBlock<'_>,
+        op: TileReduceOp,
+        subgroup_size: u32,
+        group_size: u32,
+        value: Tile,
+    ) -> Tile {
+        program.group_reduce_via_subgroups(op, subgroup_size, group_size, value)
+    }
 }
 
 /// Capability token for byte-arena workgroup packing: the adapter supports
