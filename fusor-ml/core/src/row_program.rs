@@ -23,11 +23,12 @@ use fusor_tile_ir as tile_ir;
 use rustc_hash::FxHasher;
 use tile_ir::{
     ElementType, ScalarElement,
-    tile::{Mask, Tile, WorkgroupTile},
+    tile::{Mask, Tile},
 };
 
 use crate::{
     compute_graph::NodeIndex,
+    fold::FoldOperation,
     mir::{
         inputs::MirValue,
         kernel_backend::{self, DirectKernel},
@@ -35,8 +36,8 @@ use crate::{
         workgroup_shape::{Constraint, WorkgroupShape, WorkgroupShapeConstraints},
     },
     nary_direct::{
-        ValueTile, apply_unary_function_chain, declare_value, eval_nary_expr, layout_index,
-        output_dims_from_flat, tile_u32,
+        ValueTile, apply_unary_function_chain, datatype_element, declare_value, eval_nary_expr,
+        layout_index, output_dims_from_flat, tile_u32,
     },
     nary_wise::{NaryExpr, NaryFunction, NaryOp, NaryScalar, UnaryFunctionChain},
     reduce::{ReduceFunction, ReduceOp, ReduceOperation, max_fn, sum_fn},
@@ -147,7 +148,7 @@ pub(crate) enum RowOutput {
 /// Dynamic-axis configuration: the kernel is compiled for the `block`
 /// capacity bucket and reads the active axis length from a trailing u32
 /// params input, so per-token axis growth (the KV cache) reuses one kernel.
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DynamicAxis {
     /// Workgroup size and per-tile capacity; axis lengths beyond it stream
     /// through the online tile loop.
@@ -159,6 +160,23 @@ pub(crate) struct DynamicAxis {
     /// `effective_len = min(axis_len, coord + 1)` — causal attention skips
     /// every tile past the query position.
     pub(crate) axis_bound_dim: Option<usize>,
+    /// The joint carrier streamed over the axis.
+    ///
+    /// A dynamic-axis program *is* one fold, not a phase list: its slots
+    /// advance together in a single pass, which is exactly what a `RowStep`
+    /// sequence cannot express (phase `i` there sees phase `j < i`'s
+    /// *completed* value). So `steps` stays empty for these programs and the
+    /// carrier is the whole declaration.
+    pub(crate) carrier: FoldOperation,
+}
+
+impl Hash for DynamicAxis {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.block.hash(state);
+        self.input_axis_dims.hash(state);
+        self.axis_bound_dim.hash(state);
+        self.carrier.hash_carrier_fields(state);
+    }
 }
 
 /// One ordered row-program step. All non-output steps produce slots for later
@@ -178,121 +196,11 @@ pub(crate) enum RowStep {
     Output(RowOutput),
 }
 
-/// The algebraic shape the online-streaming lowering requires: a staged
-/// score element, a max step over a scaled score `e`, an exp-sum step
-/// shifted by that max, a staged probability element, and a linear combine.
-/// The exp shift is what licenses streaming — rescaling the running sum and
-/// accumulators by `exp(M_old − M_new)` keeps them exact across tiles.
-struct OnlineSoftmax<'a> {
-    /// Element step: the raw per-position score (slot `n`).
-    score: (&'a NaryExpr, &'a Option<RowFold>),
-    /// The scaled/masked score expression `e` over slot `n` (max step body).
-    scaled: &'a NaryExpr,
-    max_identity: NaryScalar,
-    /// The per-position weight in `combine = p · weight`.
-    weight: &'a NaryExpr,
-}
-
 fn slot_expr(input_count: usize, phase: usize) -> NaryExpr {
     NaryExpr::IndexedInput {
         input_idx: input_count + phase,
         indices: vec![],
     }
-}
-
-fn unary_op_child<'a>(expr: &'a NaryExpr, op: &NaryOp) -> Option<&'a NaryExpr> {
-    match expr {
-        NaryExpr::Op { children, function } if function.op == *op && children.len() == 1 => {
-            Some(&children[0])
-        }
-        _ => None,
-    }
-}
-
-fn binary_op_children<'a>(expr: &'a NaryExpr, op: &NaryOp) -> Option<(&'a NaryExpr, &'a NaryExpr)> {
-    match expr {
-        NaryExpr::Op { children, function } if function.op == *op && children.len() == 2 => {
-            Some((&children[0], &children[1]))
-        }
-        _ => None,
-    }
-}
-
-/// Match the terminal-output online-softmax shape (see [`OnlineSoftmax`]). The
-/// attention constructor builds exactly this; the lowering re-derives it so
-/// the step expressions stay the single source of truth.
-fn match_online_softmax<'a>(steps: &'a [RowStep], input_count: usize) -> Option<OnlineSoftmax<'a>> {
-    let [
-        RowStep::Element {
-            expression: score,
-            fold: score_fold,
-            ..
-        },
-        RowStep::Reduce(max_phase),
-        RowStep::Reduce(sum_phase),
-        RowStep::Element {
-            expression: prob,
-            fold: None,
-            ..
-        },
-        RowStep::Output(RowOutput::Reduce {
-            combine, function, ..
-        }),
-    ] = steps
-    else {
-        return None;
-    };
-    let (Some(max_function), Some(sum_function)) =
-        (max_phase.combine.built_in(), sum_phase.combine.built_in())
-    else {
-        return None;
-    };
-    if max_function.op != ReduceOp::Max
-        || sum_function.op != ReduceOp::Sum
-        || !max_phase.post_chain.functions.is_empty()
-        || !sum_phase.post_chain.functions.is_empty()
-    {
-        return None;
-    }
-    let scaled = &max_phase.expression;
-    // sum phase: exp(e − m)
-    let (shift_lhs, shift_rhs) = binary_op_children(
-        unary_op_child(&sum_phase.expression, &NaryOp::Exp)?,
-        &NaryOp::Sub,
-    )?;
-    if shift_lhs != scaled || *shift_rhs != slot_expr(input_count, 1) {
-        return None;
-    }
-    // prob element: exp(e − m) / l
-    let (num, denom) = binary_op_children(prob, &NaryOp::Div)?;
-    if num != &sum_phase.expression || *denom != slot_expr(input_count, 2) {
-        return None;
-    }
-    // combine: p · weight, summed
-    if function.op != ReduceOp::Sum {
-        return None;
-    }
-    let (p_ref, weight) = binary_op_children(combine, &NaryOp::Mul)?;
-    if *p_ref != slot_expr(input_count, 3) {
-        return None;
-    }
-    // The weight and scaled score may only reference tensor inputs, dims,
-    // and the score slot — never later phase slots (those are consumed by
-    // the streaming structure itself).
-    for later in 1..4 {
-        if weight.uses_input(input_count + later) || scaled.uses_input(input_count + later) {
-            return None;
-        }
-    }
-    if weight.uses_input(input_count) {
-        return None;
-    }
-    Some(OnlineSoftmax {
-        score: (score, score_fold),
-        scaled,
-        max_identity: max_function.initial_value,
-        weight,
-    })
 }
 
 /// Slot convention for every expression in the program: indices below
@@ -392,6 +300,10 @@ impl RowProgramOperation {
     /// intrinsics are per-operator — so until tile-ir grows a group reduce
     /// parameterized by an expression, these programs have no direct kernel.
     pub(crate) fn has_general_combine(&self) -> bool {
+        if self.dynamic_axis.is_some() {
+            // A streaming fold has no phase list; its combine is the carrier's.
+            return false;
+        }
         self.phase_steps().iter().any(|step| match step {
             RowStep::Reduce(reduce) => reduce.combine.built_in().is_none(),
             _ => false,
@@ -429,6 +341,14 @@ impl RowProgramOperation {
     }
 
     pub(crate) fn out_shape(&self) -> Vec<usize> {
+        if let Some(dynamic) = &self.dynamic_axis {
+            let output = dynamic
+                .carrier
+                .outputs
+                .first()
+                .expect("a carrier has at least one output");
+            return dynamic.carrier.output_shape(output);
+        }
         match self.output_step() {
             RowOutput::Map(_) => self.shape.to_vec(),
             RowOutput::Scalar(_) => self.row_shape(),
@@ -442,6 +362,17 @@ impl RowProgramOperation {
 
     pub(crate) fn phase_count(&self) -> usize {
         self.phase_steps().len()
+    }
+
+    /// How many expression evaluations one index-space position costs — the
+    /// phase count for a chunked-map program, the carrier width plus its
+    /// element for a streaming fold. Used by the cost model and the graph
+    /// dump, both of which want one number per program.
+    pub(crate) fn work_units(&self) -> usize {
+        match &self.dynamic_axis {
+            Some(dynamic) => dynamic.carrier.width() + 1,
+            None => self.steps.len(),
+        }
     }
 
     fn block(&self, device: &crate::Device) -> u32 {
@@ -464,6 +395,18 @@ impl RowProgramOperation {
     }
 
     fn uses_custom_indexing_for_input(&self, input_idx: usize) -> bool {
+        if let Some(dynamic) = &self.dynamic_axis {
+            let carrier = &dynamic.carrier;
+            return carrier.expression.uses_custom_indexing_for_input(input_idx)
+                || carrier.element_fold.as_ref().is_some_and(|fold| {
+                    fold.expression.uses_custom_indexing_for_input(input_idx)
+                })
+                || carrier.carrier.iter().any(|slot| {
+                    slot.element
+                        .as_ref()
+                        .is_some_and(|read| read.uses_custom_indexing_for_input(input_idx))
+                });
+        }
         let output_uses_custom_indexing = match self.output_step() {
             RowOutput::Map(expr) | RowOutput::Scalar(expr) => {
                 expr.uses_custom_indexing_for_input(input_idx)
@@ -536,6 +479,11 @@ impl Operation for RowProgramOperation {
     fn visit_dependencies_mut(&mut self, f: &mut dyn FnMut(&mut NodeIndex)) {
         for input in &mut self.inputs {
             f(input);
+        }
+        // The carrier mirrors the same operands; rebinding must reach both or
+        // a rematerialized program would fold over the pre-interning nodes.
+        if let Some(dynamic) = &mut self.dynamic_axis {
+            dynamic.carrier.inputs.clone_from(&self.inputs);
         }
     }
 
@@ -892,10 +840,6 @@ fn stage_chunk_values(
         .collect()
 }
 
-fn f32_literal(value: f32) -> Tile {
-    Tile::literal(tile_ir::TileLiteral::f32(value))
-}
-
 fn tile_literal_for(value: NaryScalar, target: DataTypeEnum) -> tile_ir::TileLiteral {
     match target {
         DataTypeEnum::F32 => match value {
@@ -1096,38 +1040,131 @@ fn emit_group_reduce(
     }
 }
 
-fn build_row_program_kernel(
+/// The element of a streaming fold: the private inner fold (attention's q·k
+/// dot over the head dim) when there is one, then the element expression,
+/// which reads the folded value as [`crate::fold::fold_value`].
+fn emit_fold_element(
+    program: &mut tile_ir::tile::TileBlock<'_>,
+    carrier: &FoldOperation,
+    coords: &[Tile],
+    storages: &[crate::nary_direct::Storage2],
+    metas: &[crate::nary_direct::TensorMeta],
+    mask: Mask,
+) -> Tile {
+    let mut extras: Vec<(ValueTile, DataTypeEnum)> = Vec::new();
+    if let Some(inner) = &carrier.element_fold {
+        let wire = inner.function.datatype();
+        // f32 accumulation for half-precision dots, rounded once below.
+        let accumulate = match wire {
+            DataTypeEnum::F16 => DataTypeEnum::F32,
+            other => other,
+        };
+        let identity = Tile::literal(tile_literal_for(inner.function.initial_value, accumulate));
+        let op = tile_reduce_op(inner.function.op);
+        let [folded] = program.fold(
+            tile_ir::tile::range(inner.len as u32),
+            [identity],
+            |program, index, [acc]| {
+                let mut inner_coords = coords.to_vec();
+                inner_coords.push(index);
+                let (value, _) = eval_nary_expr(
+                    program,
+                    &inner.expression,
+                    &inner_coords,
+                    storages,
+                    metas,
+                    mask.clone(),
+                    &[],
+                );
+                let value = raw_tile(value.cast_to(accumulate));
+                [acc.binary(op.binary(), value)]
+            },
+        );
+        let folded = if accumulate == wire {
+            folded
+        } else {
+            raw_tile(ValueTile::F32(program.bind(folded)).cast_to(wire))
+        };
+        extras.push((typed_tile(program.bind(folded), wire), wire));
+    }
+    let (value, _) = eval_nary_expr(
+        program,
+        &carrier.expression,
+        coords,
+        storages,
+        metas,
+        mask,
+        &extras,
+    );
+    raw_tile(value.cast_to(DataTypeEnum::F32))
+}
+
+/// Evaluate one carrier body. `init`, `step`, `combine` and the outputs are
+/// ordinary [`NaryExpr`]s over the slot convention, so evaluation is the same
+/// `eval_nary_expr` every other expression in the compiler goes through, with
+/// the bindings supplied as extras.
+fn eval_carrier_expr(
+    program: &mut tile_ir::tile::TileBlock<'_>,
+    expression: &NaryExpr,
+    storages: &[crate::nary_direct::Storage2],
+    metas: &[crate::nary_direct::TensorMeta],
+    bindings: &[(ValueTile, DataTypeEnum)],
+    datatype: DataTypeEnum,
+) -> Tile {
+    let (value, _) = eval_nary_expr(
+        program,
+        expression,
+        &[],
+        storages,
+        metas,
+        Mask::from(true),
+        bindings,
+    );
+    raw_tile(value.cast_to(datatype))
+}
+
+fn carrier_bindings(carrier: &FoldOperation, values: &[Tile]) -> Vec<(ValueTile, DataTypeEnum)> {
+    carrier
+        .carrier
+        .iter()
+        .zip(values)
+        .map(|(slot, value)| (typed_tile(value.clone(), slot.datatype), slot.datatype))
+        .collect()
+}
+
+/// Streaming lowering for a joint carrier: one workgroup per row makes one
+/// pass over the axis in `block`-wide tiles, and every tile advances the whole
+/// carrier at once.
+///
+/// Within a tile the lanes change role, which is what a joint carrier over a
+/// free dimension forces:
+///
+/// 1. lane = one axis position. Each lane absorbs its own element into a
+///    *fresh* carrier (`step` applied to `init`) and the block's partial
+///    carriers are joined across lanes with `combine`
+///    ([`tile_ir::tile::TileBlock::group_reduce_with_vec`]), giving the tile's
+///    scalar statistics. The elements are staged through workgroup memory.
+/// 2. lane = one position of the free dimension. The free-dimension slots fold
+///    the staged elements with the scalar slots pinned at their completed tile
+///    values, then the tile's carrier is joined onto the running one.
+///
+/// Long axes over few rows fan out across workgroups: each split writes its
+/// partial carrier record to scratch and a combine kernel folds the spans with
+/// the same `combine`. That is [`FoldOperation::split`] instantiated in tile
+/// space, with ragged runtime-bounded spans an `init` (identity) carrier
+/// absorbs harmlessly.
+fn build_streaming_fold_kernel(
     operation: &RowProgramOperation,
+    dynamic: &DynamicAxis,
     graph: &crate::compute_graph::ComputeGraphInner,
     workgroup_shape: &WorkgroupShape,
     inputs: &[MirValue],
 ) -> Option<DirectKernel> {
-    // Validation spike: re-express every built-in phase as the equivalent
-    // general combine, so the general path runs on real reductions and must
-    // reproduce the closed-operator results bit for bit.
-    let rewritten;
-    let operation = if graph.device().config().spike_general_combine
-        && let Some(general) = operation.as_general_combines()
-    {
-        rewritten = general;
-        &rewritten
-    } else {
-        operation
-    };
-    // Reject before emitting rather than panicking inside it: a general
-    // combine is a capability gap in the cross-lane reduction, and the caller
-    // already surfaces a missing direct kernel as a lowering error.
-    if operation.has_general_combine() && !graph.device().config().spike_general_combine {
-        return None;
-    }
+    let carrier = dynamic.carrier.clone();
     let (output, producers) = inputs.split_last()?;
     let output = output.as_tensor()?.clone();
-    let (params, producers) = if operation.dynamic_axis.is_some() {
-        let (params, producers) = producers.split_last()?;
-        (Some(params.as_tensor()?.clone()), producers)
-    } else {
-        (None, producers)
-    };
+    let (params, producers) = producers.split_last()?;
+    let params = params.as_tensor()?.clone();
     let values = producers
         .iter()
         .map(|input| MaybeQData::try_from(input.clone()).ok())
@@ -1151,51 +1188,43 @@ fn build_row_program_kernel(
     let axis = operation.axis;
     let rank = operation.shape.len();
     let block = workgroup_shape.x();
-    let lanes_own_axis = operation.dynamic_axis.is_some();
+    let width = carrier.width();
+    let (slot_offsets, record) = carrier.slot_offsets();
+    let output_spec = carrier.outputs.first()?.clone();
+    let free_dim = carrier.output_free_dim(&output_spec);
+    // Lanes serve free-dimension positions in the second half of a tile, so a
+    // free dimension wider than the workgroup would silently drop positions.
+    if free_dim.is_some_and(|free| free as u32 > block) {
+        return None;
+    }
+    let lanes_used = free_dim.unwrap_or(1) as u32;
+    let scalar_slots: Vec<usize> = carrier
+        .carrier
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| slot.free_dim.is_none().then_some(index))
+        .collect();
 
-    // Long axes with few rows fan out across workgroups: each split runs
-    // the online body over one tile, writing its unnormalized accumulator
-    // and softmax statistics to scratch; a combine kernel folds the spans
-    // with the online monoid.
-    let output_kind = operation.output_step().clone();
-    let phase_steps = operation.phase_steps().to_vec();
-    let free_dim_out = match &output_kind {
-        RowOutput::Reduce { free_dim, .. } => Some(*free_dim),
-        RowOutput::Map(_) | RowOutput::Scalar(_) => None,
-    };
+    // Long axes with few rows fan out across workgroups: each split folds one
+    // span and writes its carrier record; a combine kernel joins the spans.
     let tiles = k.div_ceil(block);
-    let splits: u32 = match free_dim_out {
-        Some(free)
-            if lanes_own_axis
-                && graph
-                    .device()
-                    .dispatch_policy()
-                    .should_split_for_occupancy(rows, block)
-                && tiles > 1
-                && tiles <= block
-                && (free as u32 + 2) <= block =>
-        {
-            tiles
-        }
-        _ => 1,
-    };
-    // Chunked programs pack several rows per workgroup: lanes split into
-    // `block / k_group` groups of `k_group` lanes, each group owning one row,
-    // reduced with per-group reductions. Without packing a k=64 reduce runs
-    // one row per 256-lane workgroup with 75% of the lanes idle (and a k=1
-    // bias-grad sum runs one workgroup per output scalar).
-    let subgroups = fixed_subgroups(&graph.device());
-    let k_group: u32 = if lanes_own_axis || splits > 1 {
-        block
+    let splits: u32 = if free_dim.is_some()
+        && graph
+            .device()
+            .dispatch_policy()
+            .should_split_for_occupancy(rows, block)
+        && tiles > 1
+        && tiles <= block
+        && record as u32 <= block
+    {
+        tiles
     } else {
-        lane_group_width(&graph.device().dispatch_policy(), subgroups, k, block)
+        1
     };
-    let rows_per_workgroup = block / k_group;
-    let dispatch_rows = rows.div_ceil(rows_per_workgroup);
 
     let max_dispatch_dim = graph.device().limits().max_compute_workgroups_per_dimension;
     let dispatch_spec = crate::row_dispatch::RowDispatchSpec::distributed(
-        dispatch_rows.saturating_mul(splits),
+        rows.saturating_mul(splits),
         block,
         max_dispatch_dim,
     );
@@ -1203,158 +1232,34 @@ fn build_row_program_kernel(
     let cache_key =
         row_program_cache_key(operation, workgroup_shape, dispatch_size, inputs, 1, splits);
 
-    let input_count = operation.inputs.len();
-    let stage_budget = graph
-        .device()
-        .dispatch_policy()
-        .work_per_thread(crate::occupancy::RegPressure::ElementwiseFew);
-    // Chunked-map programs whose axis fits the per-lane register budget stage
-    // each distinct tensor read once per chunk and evaluate every phase (and
-    // the output) from the registers instead of re-reading storage per phase.
-    let staged_reads = (!lanes_own_axis && k.div_ceil(k_group) <= stage_budget)
-        .then(|| stage_chunk_reads(&phase_steps, &output_kind, input_count))
-        .flatten();
-    let axis_bound_dim = operation
-        .dynamic_axis
-        .as_ref()
-        .and_then(|dynamic| dynamic.axis_bound_dim);
+    let axis_bound_dim = dynamic.axis_bound_dim;
     let output_dtype = output.datatype();
     let output_value = MaybeQData::Tensor(output);
-    let params_value = params.map(MaybeQData::Tensor);
-
+    let params_value = MaybeQData::Tensor(params);
     let scratch_value = (splits > 1).then(|| {
         MaybeQData::Tensor(TensorData::new_for_shape(
             &graph.device(),
-            &[
-                rows as usize,
-                splits as usize,
-                free_dim_out.expect("split row programs reduce") + 2,
-            ],
+            &[rows as usize, splits as usize, record],
             DataTypeEnum::F32,
         ))
     });
-    let online_max_identity = match phase_steps.get(1) {
-        Some(RowStep::Reduce(reduce)) => Some(reduce.combine.initial_value()),
-        _ => None,
-    };
-    let combine = if splits > 1 {
-        let scratch_b = scratch_value.clone().expect("split scratch");
-        let output_b = output_value.clone();
-        let row_shape_b = row_shape.clone();
-        let dispatch_spec_b =
-            crate::row_dispatch::RowDispatchSpec::distributed(rows, block, max_dispatch_dim);
-        let dispatch_b = dispatch_spec_b.dispatch_size;
-        let free = free_dim_out.expect("split row programs reduce") as u32;
-        let max_identity_scalar =
-            online_max_identity.expect("split row programs carry a max phase");
-        let key_b =
-            row_program_cache_key(operation, workgroup_shape, dispatch_b, inputs, 2, splits);
-        let combine = kernel_backend::run_kernel(
-            graph.device().kernel_cache(),
-            format!("{}_combine", operation.name()),
-            key_b,
-            dispatch_b,
-            move |kb| {
-                let (scratch_storage, scratch_meta) = declare_value(kb, &scratch_b, false)?;
-                let (output_storage, output_meta) = declare_value(kb, &output_b, true)?;
-                crate::row_dispatch::emit_row_grid(
-                    kb.program(),
-                    dispatch_spec_b,
-                    |program, ctx| {
-                        let lane = ctx.lane;
-                        let row_flat = ctx.row;
-                        let in_bounds = ctx.active;
-                        let row_dims = output_dims_from_flat(row_flat.clone(), &row_shape_b);
-                        let max_identity =
-                            Tile::literal(tile_literal_for(max_identity_scalar, DataTypeEnum::F32));
 
-                        // Lane = one span: fold the spans' maxima and rescaled
-                        // sums into the row's softmax statistics.
-                        let j_active = in_bounds.clone() & lane.clone().lt(splits);
-                        let m_index = layout_index(
-                            &scratch_meta,
-                            &[row_flat.clone(), lane.clone(), tile_u32(free + 1)],
-                        );
-                        let m_j = program.bind(raw_tile(scratch_storage.load(
-                            program,
-                            m_index,
-                            j_active.clone(),
-                        )));
-                        let masked_m = Tile::select(j_active.clone(), m_j.clone(), max_identity);
-                        let global_max = emit_group_reduce(
-                            program,
-                            subgroups,
-                            tile_reduce_op(ReduceOp::Max),
-                            block,
-                            block,
-                            masked_m,
-                        );
-                        let global_max = program.bind(global_max);
-                        let l_index = layout_index(
-                            &scratch_meta,
-                            &[row_flat.clone(), lane.clone(), tile_u32(free)],
-                        );
-                        let l_j =
-                            raw_tile(scratch_storage.load(program, l_index, j_active.clone()));
-                        let weighted = Tile::select(
-                            j_active,
-                            l_j * (m_j - global_max.clone()).exp(),
-                            f32_literal(0.0),
-                        );
-                        let denom = emit_group_reduce(
-                            program,
-                            subgroups,
-                            tile_reduce_op(ReduceOp::Sum),
-                            block,
-                            block,
-                            weighted,
-                        );
-                        let denom = program.bind(denom);
-
-                        // Lane = one free-dim position: rescale and fold the
-                        // spans' accumulators.
-                        let acc = program.private(ElementType::F32);
-                        program.store_local(&acc, f32_literal(0.0));
-                        let out_active = in_bounds & lane.clone().lt(free);
-                        program.if_then(out_active, |program| {
-                            program.loop_range(splits, |program, j| {
-                                let m_index = layout_index(
-                                    &scratch_meta,
-                                    &[row_flat.clone(), j.clone(), tile_u32(free + 1)],
-                                );
-                                let m =
-                                    raw_tile(scratch_storage.load(program, m_index, Mask::all()));
-                                let o_index = layout_index(
-                                    &scratch_meta,
-                                    &[row_flat.clone(), j, lane.clone()],
-                                );
-                                let o =
-                                    raw_tile(scratch_storage.load(program, o_index, Mask::all()));
-                                let current = program.load_local(&acc);
-                                program.store_local(
-                                    &acc,
-                                    current + o * (m - global_max.clone()).exp(),
-                                );
-                            });
-                            let value = program.load_local(&acc) / denom.clone();
-                            let mut out_coords = row_dims.clone();
-                            out_coords.push(lane.clone());
-                            let output_index = layout_index(&output_meta, &out_coords);
-                            output_storage.store(
-                                program,
-                                output_index,
-                                ValueTile::F32(value).cast_to(output_dtype),
-                                Mask::all(),
-                            );
-                        });
-                    },
-                );
-                Some(())
-            },
-        )?;
-        Some(combine)
-    } else {
-        None
+    let combine_kernel = match &scratch_value {
+        Some(scratch) => Some(build_fold_span_combine_kernel(
+            operation,
+            &carrier,
+            graph,
+            workgroup_shape,
+            inputs,
+            scratch.clone(),
+            output_value.clone(),
+            &row_shape,
+            rows,
+            splits,
+            lanes_used,
+            output_dtype,
+        )?),
+        None => None,
     };
 
     let partials = kernel_backend::run_kernel(
@@ -1370,52 +1275,26 @@ fn build_row_program_kernel(
                 storages.push(storage);
                 metas.push(meta);
             }
-            let params_storage = match &params_value {
-                Some(value) => Some(declare_value(kb, value, false)?),
-                None => None,
-            };
+            let (params_storage, _) = declare_value(kb, &params_value, false)?;
             let (output_storage, output_meta) = match &scratch_value {
                 Some(scratch) => declare_value(kb, scratch, true)?,
                 None => declare_value(kb, &output_value, true)?,
             };
 
             let phase_handle = kb.program();
-            // Element-phase values the reducing output reads across lanes are
-            // staged through workgroup memory (the probs of decode attention).
-            let staged: Vec<Option<WorkgroupTile>> = phase_steps
-                .iter()
-                .enumerate()
-                .map(|(p, phase)| match (&output_kind, phase) {
-                    (RowOutput::Reduce { combine, .. }, RowStep::Element { .. })
-                        if combine.uses_input(input_count + p) =>
-                    {
-                        Some(phase_handle.alloc_workgroup_array(ScalarElement::F32, block))
-                    }
-                    _ => None,
-                })
-                .collect();
+            // The bridge between the two lane roles: every lane's element,
+            // read back by the lanes serving free-dimension positions.
+            let staged = phase_handle.alloc_workgroup_array(ScalarElement::F32, block);
 
             crate::row_dispatch::emit_row_grid(phase_handle, dispatch_spec, |program, ctx| {
-                let wg_flat = ctx.row;
-                // With packing, `lane` becomes the position inside the row's
-                // `k_group`-wide lane group; every later axis index and the
-                // scalar-store lane test use it unchanged.
-                let (row_flat, split_idx, lane) = if rows_per_workgroup > 1 {
-                    let (row_local, lane) =
-                        split_lane_groups(program, subgroups, ctx.lane, k_group, block);
+                let (row_flat, split_idx, lane) = if splits > 1 {
                     (
-                        program.bind(wg_flat * rows_per_workgroup + row_local),
-                        tile_u32(0),
-                        lane,
-                    )
-                } else if splits > 1 {
-                    (
-                        program.bind(wg_flat.clone() / splits),
-                        program.bind(wg_flat % splits),
+                        program.bind(ctx.row.clone() / splits),
+                        program.bind(ctx.row % splits),
                         ctx.lane,
                     )
                 } else {
-                    (wg_flat, tile_u32(0), ctx.lane)
+                    (ctx.row, tile_u32(0), ctx.lane)
                 };
                 let in_bounds = row_flat.clone().lt(rows);
                 let row_dims = output_dims_from_flat(row_flat.clone(), &row_shape);
@@ -1433,195 +1312,181 @@ fn build_row_program_kernel(
                     coords
                 };
 
-                // The active axis length: a params read for dynamic-axis
-                // programs, the compiled extent otherwise.
-                let axis_len: Tile = match &params_storage {
-                    Some((storage, _)) => raw_tile(storage.load(program, tile_u32(0), Mask::all())),
-                    None => tile_u32(k),
+                // The active axis length rides in the params input, so a
+                // growing KV cache reuses one compiled kernel.
+                let axis_len: Tile =
+                    raw_tile(params_storage.load(program, tile_u32(0), Mask::all()));
+                // Causal bound: tiles past the bounding row coordinate hold no
+                // live positions, so the loop ends there. Uniform per
+                // workgroup, which keeps the tile loop's break uniform.
+                let effective_len: Tile = match axis_bound_dim {
+                    Some(dim) => {
+                        let row_index = dim - usize::from(axis < dim);
+                        program.bind(
+                            axis_len
+                                .clone()
+                                .min(row_dims[row_index].clone() + tile_u32(1)),
+                        )
+                    }
+                    None => axis_len,
+                };
+                let (span_start, span_end) = if splits > 1 {
+                    let start = program.bind(split_idx.clone() * block);
+                    let end =
+                        program.bind((start.clone() + tile_u32(block)).min(effective_len.clone()));
+                    (start, end)
+                } else {
+                    (tile_u32(0), effective_len.clone())
                 };
 
-                let mut slots: Vec<(ValueTile, DataTypeEnum)> = Vec::new();
+                // The running carrier and, per tile, the free-dimension slots'
+                // own partial. Both are one private per lane: a free-dimension
+                // slot's lane *is* its free coordinate.
+                let running: Vec<_> = carrier
+                    .carrier
+                    .iter()
+                    .map(|slot| program.private(datatype_element(slot.datatype)))
+                    .collect();
+                let tile_slots: Vec<_> = carrier
+                    .carrier
+                    .iter()
+                    .map(|slot| program.private(datatype_element(slot.datatype)))
+                    .collect();
+                let tile_base = program.private(ElementType::U32);
+                let item = program.private(ElementType::U32);
 
-                if lanes_own_axis {
-                    // Online streaming over axis tiles of `block`: lanes own
-                    // one axis position per tile; the running max, sum, and
-                    // free-dim accumulator are rescaled by
-                    // `exp(M_old − M_new)` each tile, so any axis length
-                    // streams through one workgroup with exact results.
-                    let RowOutput::Reduce { free_dim, .. } = &output_kind else {
-                        unreachable!("dynamic-axis row programs have a reducing output")
-                    };
-                    let mut online_steps = phase_steps.clone();
-                    online_steps.push(RowStep::Output(output_kind.clone()));
-                    let online = match_online_softmax(&online_steps, input_count)
-                        .expect("dynamic-axis row programs are built in online-softmax shape");
-                    let probs = staged[3]
-                        .as_ref()
-                        .expect("the probability element phase is staged");
-                    let free = *free_dim as u32;
-
-                    // Causal bound: tiles past the bounding row coordinate
-                    // hold no live positions, so the loop ends there.
-                    let effective_len: Tile = match axis_bound_dim {
-                        Some(dim) => {
-                            let row_index = dim - usize::from(axis < dim);
-                            program.bind(
-                                axis_len
-                                    .clone()
-                                    .min(row_dims[row_index].clone() + tile_u32(1)),
-                            )
-                        }
-                        None => axis_len,
-                    };
-
-                    // A split workgroup owns one `block`-wide span of the
-                    // axis; the single-workgroup form owns it all.
-                    let (span_start, span_end) = if splits > 1 {
-                        let start = program.bind(split_idx.clone() * block);
-                        let end = program
-                            .bind((start.clone() + tile_u32(block)).min(effective_len.clone()));
-                        (start, end)
-                    } else {
-                        (tile_u32(0), effective_len.clone())
-                    };
-
-                    let max_identity =
-                        || Tile::literal(tile_literal_for(online.max_identity, DataTypeEnum::F32));
-                    let running_max = program.private(ElementType::F32);
-                    let running_sum = program.private(ElementType::F32);
-                    let acc = program.private(ElementType::F32);
-                    let tile_base = program.private(ElementType::U32);
-                    let item = program.private(ElementType::U32);
-                    program.store_local(&running_max, max_identity());
-                    program.store_local(&running_sum, f32_literal(0.0));
-                    program.store_local(&acc, f32_literal(0.0));
-                    program.store_local(&tile_base, span_start);
-                    let out_active = in_bounds.clone() & lane.clone().lt(free);
-
-                    program.loop_forever(|program| {
-                        let base = program.load_local(&tile_base);
-                        program.break_if(base.clone().ge(span_end.clone()));
-                        let kv = program.bind(base.clone() + lane.clone());
-                        let kv_active = in_bounds.clone() & kv.clone().lt(effective_len.clone());
-                        let coords = full_coords(kv);
-
-                        // Per-position score, optionally an inline fold (the
-                        // q·k dot over the head dim).
-                        let (score_expr, score_fold) = online.score;
-                        let score = match score_fold {
-                            Some(RowFold {
-                                len,
-                                function: fold_fn,
-                            }) => {
-                                let fold_wire_dtype = fold_fn.datatype();
-                                // f32 accumulation for half-precision dots,
-                                // rounded once below.
-                                let fold_dtype = match fold_wire_dtype {
-                                    DataTypeEnum::F16 => DataTypeEnum::F32,
-                                    other => other,
-                                };
-                                let identity = Tile::literal(tile_literal_for(
-                                    fold_fn.initial_value,
-                                    fold_dtype,
-                                ));
-                                let reduce_op = tile_reduce_op(fold_fn.op);
-                                let [folded] = program.fold(
-                                    tile_ir::tile::range(*len as u32),
-                                    [identity],
-                                    |program, fold_idx, [fold_acc]| {
-                                        let mut fold_coords = coords.clone();
-                                        fold_coords.push(fold_idx);
-                                        let (value, _) = eval_nary_expr(
-                                            program,
-                                            score_expr,
-                                            &fold_coords,
-                                            &storages,
-                                            &metas,
-                                            kv_active.clone(),
-                                            &slots,
-                                        );
-                                        let value = raw_tile(value.cast_to(fold_dtype));
-                                        [fold_acc.binary(reduce_op.binary(), value)]
-                                    },
-                                );
-                                if fold_dtype == fold_wire_dtype {
-                                    folded
-                                } else {
-                                    raw_tile(
-                                        ValueTile::F32(program.bind(folded))
-                                            .cast_to(fold_wire_dtype),
-                                    )
-                                }
-                            }
-                            None => {
-                                let (value, _) = eval_nary_expr(
-                                    program,
-                                    score_expr,
-                                    &coords,
-                                    &storages,
-                                    &metas,
-                                    kv_active.clone(),
-                                    &slots,
-                                );
-                                raw_tile(value.cast_to(DataTypeEnum::F32))
-                            }
-                        };
-                        let score = program.bind(score);
-                        let score_slot = [(ValueTile::F32(score), DataTypeEnum::F32)];
-
-                        // Scaled/masked score, tile max, and the online
-                        // rescale of the running state.
-                        let (scaled, _) = eval_nary_expr(
+                let init: Vec<Tile> = carrier
+                    .init
+                    .iter()
+                    .zip(&carrier.carrier)
+                    .map(|(expression, slot)| {
+                        let value = eval_carrier_expr(
                             program,
-                            online.scaled,
-                            &coords,
+                            expression,
                             &storages,
                             &metas,
-                            kv_active.clone(),
-                            &score_slot,
+                            &[],
+                            slot.datatype,
                         );
-                        let scaled = program.bind(Tile::select(
-                            kv_active.clone(),
-                            raw_tile(scaled.cast_to(DataTypeEnum::F32)),
-                            max_identity(),
-                        ));
-                        let tile_max = emit_group_reduce(
-                            program,
-                            subgroups,
-                            tile_reduce_op(ReduceOp::Max),
-                            block,
-                            block,
-                            scaled.clone(),
-                        );
-                        let old_max = program.load_local(&running_max);
-                        let new_max = program.bind(old_max.clone().max(tile_max));
-                        program.store_local(&running_max, new_max.clone());
-                        let factor = program.bind((old_max - new_max.clone()).exp());
+                        program.bind(value)
+                    })
+                    .collect();
+                for (local, value) in running.iter().zip(&init) {
+                    program.store_local(local, value.clone());
+                }
+                program.store_local(&tile_base, span_start);
+                let out_active = in_bounds.clone() & lane.clone().lt(lanes_used);
 
-                        let prob = program.bind(Tile::select(
-                            kv_active.clone(),
-                            (scaled - new_max).exp(),
-                            f32_literal(0.0),
-                        ));
-                        let tile_sum = emit_group_reduce(
-                            program,
-                            subgroups,
-                            tile_reduce_op(ReduceOp::Sum),
-                            block,
-                            block,
-                            prob.clone(),
-                        );
-                        let sum = program.load_local(&running_sum);
-                        program.store_local(&running_sum, sum * factor.clone() + tile_sum);
-                        program.store_workgroup(probs, lane.clone(), prob);
-                        program.workgroup_barrier();
+                program.loop_forever(|program| {
+                    let base = program.load_local(&tile_base);
+                    program.break_if(base.clone().ge(span_end.clone()));
+                    let kv = program.bind(base.clone() + lane.clone());
+                    let kv_active = in_bounds.clone() & kv.clone().lt(effective_len.clone());
+                    let coords = full_coords(kv);
 
-                        // Lanes switch to owning one free-dim position each
-                        // and fold this tile's staged probabilities against
-                        // the weight input.
+                    // Lane = one axis position: absorb this lane's element into
+                    // a fresh carrier, then join the block's partials.
+                    let element = emit_fold_element(
+                        program,
+                        &carrier,
+                        &coords,
+                        &storages,
+                        &metas,
+                        kv_active.clone(),
+                    );
+                    let element = program.bind(element);
+                    let mut bindings = carrier_bindings(&carrier, &init);
+                    bindings.push((ValueTile::F32(element.clone()), DataTypeEnum::F32));
+                    // Only the scalar slots take part in the cross-lane join;
+                    // the free-dimension ones are folded in the second lane
+                    // role, so staging them would burn workgroup memory on
+                    // values nothing reads.
+                    let per_lane: Vec<Tile> = scalar_slots
+                        .iter()
+                        .map(|&index| {
+                            let value = eval_carrier_expr(
+                                program,
+                                &carrier.step[index],
+                                &storages,
+                                &metas,
+                                &bindings,
+                                carrier.carrier[index].datatype,
+                            );
+                            program.bind(Tile::select(
+                                kv_active.clone(),
+                                value,
+                                init[index].clone(),
+                            ))
+                        })
+                        .collect();
+                    let scalar_joined = {
+                        let carrier = carrier.clone();
+                        let storages = storages.clone();
+                        let metas = metas.clone();
+                        let scalar_slots = scalar_slots.clone();
+                        let init = init.clone();
+                        program.group_reduce_with_vec(
+                            block,
+                            per_lane,
+                            move |program, acc, incoming| {
+                                let expand = |partial: &[Tile]| -> Vec<Tile> {
+                                    let mut full = init.clone();
+                                    for (slot, value) in scalar_slots.iter().zip(partial) {
+                                        full[*slot] = value.clone();
+                                    }
+                                    full
+                                };
+                                let mut bindings = carrier_bindings(&carrier, &expand(&acc));
+                                bindings
+                                    .extend(carrier_bindings(&carrier, &expand(&incoming)));
+                                scalar_slots
+                                    .iter()
+                                    .map(|&index| {
+                                        eval_carrier_expr(
+                                            program,
+                                            &carrier.combine[index],
+                                            &storages,
+                                            &metas,
+                                            &bindings,
+                                            carrier.carrier[index].datatype,
+                                        )
+                                    })
+                                    .collect()
+                            },
+                        )
+                    };
+                    let mut joined = init.clone();
+                    for (slot, value) in scalar_slots.iter().zip(scalar_joined) {
+                        joined[*slot] = program.bind(value);
+                    }
+
+                    // Stage the elements for the free-dimension pass.
+                    program.store_workgroup(&staged, lane.clone(), element);
+                    program.workgroup_barrier();
+
+                    // Bound, not lazy loads: the carrier is written back slot
+                    // by slot, so a re-evaluated `load_local` would see a
+                    // sibling slot's *new* value.
+                    let old: Vec<Tile> = running
+                        .iter()
+                        .map(|local| {
+                            let value = program.load_local(local);
+                            program.bind(value)
+                        })
+                        .collect();
+                    let mut join_bindings = carrier_bindings(&carrier, &old);
+                    join_bindings.extend(carrier_bindings(&carrier, &joined));
+
+                    if carrier.has_free_dim() {
+                        // Lane = one free-dimension position. The scalar slots
+                        // hold their completed tile values, so a slot's step
+                        // absorbs each staged element exactly once.
                         program.if_then(out_active.clone(), |program| {
-                            let rescaled = program.load_local(&acc) * factor.clone();
-                            program.store_local(&acc, rescaled);
+                            for (index, slot) in carrier.carrier.iter().enumerate() {
+                                if slot.free_dim.is_some() {
+                                    program.store_local(&tile_slots[index], init[index].clone());
+                                }
+                            }
                             program.store_local(&item, tile_u32(0));
                             program.loop_forever(|program| {
                                 let j = program.load_local(&item);
@@ -1629,75 +1494,465 @@ fn build_row_program_kernel(
                                 program.break_if(
                                     j.clone().ge(block) | kv_j.clone().ge(effective_len.clone()),
                                 );
-                                let prob_j = program.load_workgroup(probs, j.clone());
-                                let mut weight_coords = full_coords(kv_j);
-                                weight_coords.push(lane.clone());
-                                let (weight, _) = eval_nary_expr(
-                                    program,
-                                    online.weight,
-                                    &weight_coords,
-                                    &storages,
-                                    &metas,
-                                    Mask::all(),
-                                    &slots,
-                                );
-                                let weight = raw_tile(weight.cast_to(DataTypeEnum::F32));
-                                let current = program.load_local(&acc);
-                                program.store_local(&acc, current + prob_j * weight);
+                                let staged_element = program.load_workgroup(&staged, j.clone());
+                                let mut inner_coords = full_coords(kv_j);
+                                inner_coords.push(lane.clone());
+                                for (index, slot) in carrier.carrier.iter().enumerate() {
+                                    let Some(slot_element) = &slot.element else {
+                                        continue;
+                                    };
+                                    let (value, _) = eval_nary_expr(
+                                        program,
+                                        slot_element,
+                                        &inner_coords,
+                                        &storages,
+                                        &metas,
+                                        Mask::all(),
+                                        &[],
+                                    );
+                                    let value = raw_tile(value.cast_to(slot.datatype));
+                                    let mut values = joined.clone();
+                                    values[index] = {
+                                        let value = program.load_local(&tile_slots[index]);
+                                        program.bind(value)
+                                    };
+                                    let mut bindings = carrier_bindings(&carrier, &values);
+                                    bindings.push((
+                                        ValueTile::F32(staged_element.clone()),
+                                        DataTypeEnum::F32,
+                                    ));
+                                    bindings
+                                        .push((typed_tile(value, slot.datatype), slot.datatype));
+                                    let next = eval_carrier_expr(
+                                        program,
+                                        &carrier.step[index],
+                                        &storages,
+                                        &metas,
+                                        &bindings,
+                                        slot.datatype,
+                                    );
+                                    let next = program.bind(next);
+                                    program.store_local(&tile_slots[index], next);
+                                }
                                 program.store_local(&item, j + tile_u32(1));
                             });
-                        });
-                        program.workgroup_barrier();
-                        program.store_local(&tile_base, base + tile_u32(block));
-                    });
-
-                    if splits > 1 {
-                        // Partials: the unnormalized accumulator plus this
-                        // span's softmax statistics — the combine kernel
-                        // folds the spans with the online monoid.
-                        program.if_then(out_active, |program| {
-                            let index = layout_index(
-                                &output_meta,
-                                &[row_flat.clone(), split_idx.clone(), lane.clone()],
-                            );
-                            let value = ValueTile::F32(program.load_local(&acc));
-                            output_storage.store(program, index, value, Mask::all());
-                        });
-                        let stat_active = |offset: u32| {
-                            in_bounds.clone()
-                                & lane.clone().ge(free + offset)
-                                & lane.clone().lt(free + offset + 1)
-                        };
-                        program.if_then(stat_active(0), |program| {
-                            let index = layout_index(
-                                &output_meta,
-                                &[row_flat.clone(), split_idx.clone(), tile_u32(free)],
-                            );
-                            let value = ValueTile::F32(program.load_local(&running_sum));
-                            output_storage.store(program, index, value, Mask::all());
-                        });
-                        program.if_then(stat_active(1), |program| {
-                            let index = layout_index(
-                                &output_meta,
-                                &[row_flat.clone(), split_idx.clone(), tile_u32(free + 1)],
-                            );
-                            let value = ValueTile::F32(program.load_local(&running_max));
-                            output_storage.store(program, index, value, Mask::all());
-                        });
-                    } else {
-                        // out = O / L — the division the probability phase
-                        // declares, applied once at the end.
-                        program.if_then(out_active, |program| {
-                            let value = program.load_local(&acc) / program.load_local(&running_sum);
-                            let mut out_coords = row_dims.clone();
-                            out_coords.push(lane.clone());
-                            let output_index = layout_index(&output_meta, &out_coords);
-                            let value = ValueTile::F32(value).cast_to(output_dtype);
-                            output_storage.store(program, output_index, value, Mask::all());
+                            // Join the tile's free-dimension slots onto the
+                            // running carrier with the same `combine`.
+                            for (index, slot) in carrier.carrier.iter().enumerate() {
+                                if slot.free_dim.is_none() {
+                                    continue;
+                                }
+                                let mut values = join_bindings.clone();
+                                values[width + index] = (
+                                    typed_tile(
+                                        program.load_local(&tile_slots[index]),
+                                        slot.datatype,
+                                    ),
+                                    slot.datatype,
+                                );
+                                let next = eval_carrier_expr(
+                                    program,
+                                    &carrier.combine[index],
+                                    &storages,
+                                    &metas,
+                                    &values,
+                                    slot.datatype,
+                                );
+                                let next = program.bind(next);
+                                program.store_local(&running[index], next);
+                            }
                         });
                     }
-                    return;
+                    let scalar_next: Vec<Tile> = scalar_slots
+                        .iter()
+                        .map(|&index| {
+                            let next = eval_carrier_expr(
+                                program,
+                                &carrier.combine[index],
+                                &storages,
+                                &metas,
+                                &join_bindings,
+                                carrier.carrier[index].datatype,
+                            );
+                            program.bind(next)
+                        })
+                        .collect();
+                    for (&index, value) in scalar_slots.iter().zip(scalar_next) {
+                        program.store_local(&running[index], value);
+                    }
+                    program.workgroup_barrier();
+                    program.store_local(&tile_base, base + tile_u32(block));
+                });
+
+                match &scratch_value {
+                    Some(_) => {
+                        // Partials: this span's carrier record, folded by the
+                        // combine kernel with the same monoid.
+                        for (index, slot) in carrier.carrier.iter().enumerate() {
+                            let offset = slot_offsets[index] as u32;
+                            if slot.free_dim.is_some() {
+                                program.if_then(out_active.clone(), |program| {
+                                    let position = program.bind(lane.clone() + tile_u32(offset));
+                                    let store_index = layout_index(
+                                        &output_meta,
+                                        &[row_flat.clone(), split_idx.clone(), position],
+                                    );
+                                    let value = ValueTile::F32(program.load_local(&running[index]));
+                                    output_storage.store(program, store_index, value, Mask::all());
+                                });
+                            } else {
+                                let active = in_bounds.clone()
+                                    & lane.clone().ge(offset)
+                                    & lane.clone().lt(offset + 1);
+                                program.if_then(active, |program| {
+                                    let store_index = layout_index(
+                                        &output_meta,
+                                        &[
+                                            row_flat.clone(),
+                                            split_idx.clone(),
+                                            tile_u32(offset),
+                                        ],
+                                    );
+                                    let value = ValueTile::F32(program.load_local(&running[index]));
+                                    output_storage.store(program, store_index, value, Mask::all());
+                                });
+                            }
+                        }
+                    }
+                    None => {
+                        program.if_then(out_active, |program| {
+                            let values: Vec<Tile> = running
+                                .iter()
+                                .map(|local| {
+                                    let value = program.load_local(local);
+                                    program.bind(value)
+                                })
+                                .collect();
+                            let bindings = carrier_bindings(&carrier, &values);
+                            let value = eval_carrier_expr(
+                                program,
+                                &output_spec.expression,
+                                &storages,
+                                &metas,
+                                &bindings,
+                                DataTypeEnum::F32,
+                            );
+                            let mut out_coords = row_dims.clone();
+                            if free_dim.is_some() {
+                                out_coords.push(lane.clone());
+                            }
+                            let store_index = layout_index(&output_meta, &out_coords);
+                            output_storage.store(
+                                program,
+                                store_index,
+                                ValueTile::F32(value).cast_to(output_dtype),
+                                Mask::all(),
+                            );
+                        });
+                    }
                 }
+            });
+            Some(())
+        },
+    )?;
+
+    match combine_kernel {
+        Some(combine) => Some(DirectKernel::sequence(
+            "row_program_split",
+            vec![partials, combine],
+        )),
+        None => Some(partials),
+    }
+}
+
+/// Join the span partials a blocked streaming fold wrote.
+///
+/// One workgroup per row, one lane per free-dimension position. Each lane
+/// folds all `splits` records with `combine`, recomputing the scalar slots
+/// redundantly — they are a handful of values per span, and duplicating them
+/// buys a combine kernel with no cross-lane communication at all.
+#[allow(clippy::too_many_arguments)]
+fn build_fold_span_combine_kernel(
+    operation: &RowProgramOperation,
+    carrier: &FoldOperation,
+    graph: &crate::compute_graph::ComputeGraphInner,
+    workgroup_shape: &WorkgroupShape,
+    inputs: &[MirValue],
+    scratch: MaybeQData,
+    output: MaybeQData,
+    row_shape: &[usize],
+    rows: u32,
+    splits: u32,
+    lanes_used: u32,
+    output_dtype: DataTypeEnum,
+) -> Option<DirectKernel> {
+    let block = workgroup_shape.x();
+    let max_dispatch_dim = graph.device().limits().max_compute_workgroups_per_dimension;
+    let dispatch_spec =
+        crate::row_dispatch::RowDispatchSpec::distributed(rows, block, max_dispatch_dim);
+    let dispatch_size = dispatch_spec.dispatch_size;
+    let key = row_program_cache_key(operation, workgroup_shape, dispatch_size, inputs, 2, splits);
+    let carrier = carrier.clone();
+    let (slot_offsets, _) = carrier.slot_offsets();
+    let output_spec = carrier.outputs.first()?.clone();
+    let free_dim = carrier.output_free_dim(&output_spec);
+    let row_shape = row_shape.to_vec();
+    kernel_backend::run_kernel(
+        graph.device().kernel_cache(),
+        format!("{}_combine", operation.name()),
+        key,
+        dispatch_size,
+        move |kb| {
+            let (scratch_storage, scratch_meta) = declare_value(kb, &scratch, false)?;
+            let (output_storage, output_meta) = declare_value(kb, &output, true)?;
+            crate::row_dispatch::emit_row_grid(kb.program(), dispatch_spec, |program, ctx| {
+                let lane = ctx.lane;
+                let row_flat = ctx.row;
+                let row_dims = output_dims_from_flat(row_flat.clone(), &row_shape);
+                let active = ctx.active & lane.clone().lt(lanes_used);
+                let running: Vec<_> = carrier
+                    .carrier
+                    .iter()
+                    .map(|slot| program.private(datatype_element(slot.datatype)))
+                    .collect();
+                let init: Vec<Tile> = carrier
+                    .init
+                    .iter()
+                    .zip(&carrier.carrier)
+                    .map(|(expression, slot)| {
+                        let bindings = vec![
+                            (ValueTile::F32(tile_u32(0)), DataTypeEnum::F32);
+                            carrier.base()
+                        ];
+                        eval_carrier_expr(program, expression, &[], &[], &bindings, slot.datatype)
+                    })
+                    .collect();
+                for (local, value) in running.iter().zip(init) {
+                    program.store_local(local, value);
+                }
+                program.if_then(active, |program| {
+                    program.loop_range(splits, |program, span| {
+                        let incoming: Vec<Tile> = carrier
+                            .carrier
+                            .iter()
+                            .enumerate()
+                            .map(|(index, slot)| {
+                                let offset = slot_offsets[index] as u32;
+                                let position = match slot.free_dim {
+                                    Some(_) => program.bind(lane.clone() + tile_u32(offset)),
+                                    None => tile_u32(offset),
+                                };
+                                let read = layout_index(
+                                    &scratch_meta,
+                                    &[row_flat.clone(), span.clone(), position],
+                                );
+                                raw_tile(scratch_storage.load(program, read, Mask::all()))
+                            })
+                            .collect();
+                        let current: Vec<Tile> = running
+                            .iter()
+                            .map(|local| {
+                                let value = program.load_local(local);
+                                program.bind(value)
+                            })
+                            .collect();
+                        let mut bindings = vec![
+                            (ValueTile::F32(tile_u32(0)), DataTypeEnum::F32);
+                            carrier.base()
+                        ];
+                        bindings.extend(carrier_bindings(&carrier, &current));
+                        bindings.extend(carrier_bindings(&carrier, &incoming));
+                        let next: Vec<Tile> = carrier
+                            .carrier
+                            .iter()
+                            .enumerate()
+                            .map(|(index, slot)| {
+                                let value = eval_carrier_expr(
+                                    program,
+                                    &carrier.combine[index],
+                                    &[],
+                                    &[],
+                                    &bindings,
+                                    slot.datatype,
+                                );
+                                program.bind(value)
+                            })
+                            .collect();
+                        for (local, value) in running.iter().zip(next) {
+                            program.store_local(local, value);
+                        }
+                    });
+                    let values: Vec<Tile> = running
+                        .iter()
+                        .map(|local| program.load_local(local))
+                        .collect();
+                    let mut bindings = vec![
+                        (ValueTile::F32(tile_u32(0)), DataTypeEnum::F32);
+                        carrier.base()
+                    ];
+                    bindings.extend(carrier_bindings(&carrier, &values));
+                    let value = eval_carrier_expr(
+                        program,
+                        &output_spec.expression,
+                        &[],
+                        &[],
+                        &bindings,
+                        DataTypeEnum::F32,
+                    );
+                    let mut out_coords = row_dims.clone();
+                    if free_dim.is_some() {
+                        out_coords.push(lane.clone());
+                    }
+                    let store_index = layout_index(&output_meta, &out_coords);
+                    output_storage.store(
+                        program,
+                        store_index,
+                        ValueTile::F32(value).cast_to(output_dtype),
+                        Mask::all(),
+                    );
+                });
+            });
+            Some(())
+        },
+    )
+}
+
+fn build_row_program_kernel(
+    operation: &RowProgramOperation,
+    graph: &crate::compute_graph::ComputeGraphInner,
+    workgroup_shape: &WorkgroupShape,
+    inputs: &[MirValue],
+) -> Option<DirectKernel> {
+    // A dynamic axis means a joint carrier streamed over the axis, which is a
+    // fold rather than a phase list — everything below is the chunked-map
+    // path and reads `steps`.
+    if let Some(dynamic) = &operation.dynamic_axis {
+        return build_streaming_fold_kernel(operation, dynamic, graph, workgroup_shape, inputs);
+    }
+    // Validation spike: re-express every built-in phase as the equivalent
+    // general combine, so the general path runs on real reductions and must
+    // reproduce the closed-operator results bit for bit.
+    let rewritten;
+    let operation = if graph.device().config().spike_general_combine
+        && let Some(general) = operation.as_general_combines()
+    {
+        rewritten = general;
+        &rewritten
+    } else {
+        operation
+    };
+    // Reject before emitting rather than panicking inside it: a general
+    // combine is a capability gap in the cross-lane reduction, and the caller
+    // already surfaces a missing direct kernel as a lowering error.
+    if operation.has_general_combine() && !graph.device().config().spike_general_combine {
+        return None;
+    }
+    let (output, producers) = inputs.split_last()?;
+    let output = output.as_tensor()?.clone();
+    let values = producers
+        .iter()
+        .map(|input| MaybeQData::try_from(input.clone()).ok())
+        .collect::<Option<Vec<_>>>()?;
+    if !graph.device().f16_supported() {
+        let uses_f16 = output.datatype() == DataTypeEnum::F16
+            || values.iter().any(|value| match value {
+                MaybeQData::Tensor(tensor) => tensor.datatype() == DataTypeEnum::F16,
+                MaybeQData::QMatrix(matrix) => {
+                    matches!(matrix.datatype(), fusor_gguf::GgmlType::F16)
+                }
+            });
+        if uses_f16 {
+            return None;
+        }
+    }
+
+    let rows: u32 = operation.rows().try_into().ok()?;
+    let k: u32 = operation.shape[operation.axis].try_into().ok()?;
+    let row_shape = operation.row_shape();
+    let axis = operation.axis;
+    let rank = operation.shape.len();
+    let block = workgroup_shape.x();
+
+    let output_kind = operation.output_step().clone();
+    let phase_steps = operation.phase_steps().to_vec();
+    // Chunked programs pack several rows per workgroup: lanes split into
+    // `block / k_group` groups of `k_group` lanes, each group owning one row,
+    // reduced with per-group reductions. Without packing a k=64 reduce runs
+    // one row per 256-lane workgroup with 75% of the lanes idle (and a k=1
+    // bias-grad sum runs one workgroup per output scalar).
+    let subgroups = fixed_subgroups(&graph.device());
+    let k_group: u32 = lane_group_width(&graph.device().dispatch_policy(), subgroups, k, block);
+    let rows_per_workgroup = block / k_group;
+    let dispatch_rows = rows.div_ceil(rows_per_workgroup);
+
+    let max_dispatch_dim = graph.device().limits().max_compute_workgroups_per_dimension;
+    let dispatch_spec =
+        crate::row_dispatch::RowDispatchSpec::distributed(dispatch_rows, block, max_dispatch_dim);
+    let dispatch_size = dispatch_spec.dispatch_size;
+    let cache_key = row_program_cache_key(operation, workgroup_shape, dispatch_size, inputs, 1, 1);
+
+    let input_count = operation.inputs.len();
+    let stage_budget = graph
+        .device()
+        .dispatch_policy()
+        .work_per_thread(crate::occupancy::RegPressure::ElementwiseFew);
+    // Chunked-map programs whose axis fits the per-lane register budget stage
+    // each distinct tensor read once per chunk and evaluate every phase (and
+    // the output) from the registers instead of re-reading storage per phase.
+    let staged_reads = (k.div_ceil(k_group) <= stage_budget)
+        .then(|| stage_chunk_reads(&phase_steps, &output_kind, input_count))
+        .flatten();
+    let output_dtype = output.datatype();
+    let output_value = MaybeQData::Tensor(output);
+
+    let partials = kernel_backend::run_kernel(
+        graph.device().kernel_cache(),
+        operation.name(),
+        cache_key,
+        dispatch_size,
+        move |kb| {
+            let mut storages = Vec::with_capacity(values.len());
+            let mut metas = Vec::with_capacity(values.len());
+            for value in &values {
+                let (storage, meta) = declare_value(kb, value, false)?;
+                storages.push(storage);
+                metas.push(meta);
+            }
+            let (output_storage, output_meta) = declare_value(kb, &output_value, true)?;
+
+            let phase_handle = kb.program();
+            crate::row_dispatch::emit_row_grid(phase_handle, dispatch_spec, |program, ctx| {
+                let wg_flat = ctx.row;
+                // With packing, `lane` becomes the position inside the row's
+                // `k_group`-wide lane group; every later axis index and the
+                // scalar-store lane test use it unchanged.
+                let (row_flat, lane) = if rows_per_workgroup > 1 {
+                    let (row_local, lane) =
+                        split_lane_groups(program, subgroups, ctx.lane, k_group, block);
+                    (
+                        program.bind(wg_flat * rows_per_workgroup + row_local),
+                        lane,
+                    )
+                } else {
+                    (wg_flat, ctx.lane)
+                };
+                let in_bounds = row_flat.clone().lt(rows);
+                let row_dims = output_dims_from_flat(row_flat.clone(), &row_shape);
+                let full_coords = |k_index: Tile| -> Vec<Tile> {
+                    let mut coords = Vec::with_capacity(rank);
+                    let mut row_dim = 0;
+                    for dim in 0..rank {
+                        if dim == axis {
+                            coords.push(k_index.clone());
+                        } else {
+                            coords.push(row_dims[row_dim].clone());
+                            row_dim += 1;
+                        }
+                    }
+                    coords
+                };
+
+                let mut slots: Vec<(ValueTile, DataTypeEnum)> = Vec::new();
 
                 // Chunked map program: lanes stride the axis by their lane
                 // group's width for each phase's fold. Programs within the
@@ -1945,13 +2200,7 @@ fn build_row_program_kernel(
         },
     )?;
 
-    match combine {
-        Some(combine) => Some(DirectKernel::sequence(
-            "row_program_split",
-            vec![partials, combine],
-        )),
-        None => Some(partials),
-    }
+    Some(partials)
 }
 
 struct MergedRowProgramKernelVariant;
@@ -2505,7 +2754,10 @@ pub(crate) fn attention_row_program(
         None => vec![q, k, v],
     };
     let input_count = graph_inputs.len();
+    // The inner fold's value: the score `q·k` the scaled-score expression
+    // reads. `fold_value` and `slot_expr` name the same binding.
     let slot = |p: usize| slot_expr(input_count, p);
+    debug_assert_eq!(slot(0), crate::fold::fold_value(input_count));
     // The fold/free coordinate is one past the rank-4 index space. Loads
     // are cast to the f32 expression types by evaluation, so f16 tensors
     // need no explicit casts.
@@ -2543,51 +2795,41 @@ pub(crate) fn attention_row_program(
             base
         }
     };
-    let shifted_exp = || unary(NaryOp::Exp, binary(NaryOp::Sub, scaled_score(), slot(1)));
-
     let mut input_axis_dims = vec![None, Some(2), Some(2)];
     if mask.is_some() {
         input_axis_dims.push(Some(1));
     }
+    let shape: Box<[usize]> = [batch, num_heads, q_seq_len, kv_len].into();
+    // The whole program is one carrier: the running score maximum, the
+    // softmax normalizer, and the `Σ p·v` accumulator over the head dim,
+    // advancing together over the KV axis.
+    let carrier = crate::fold::streaming_attention_carrier(
+        graph_inputs.clone(),
+        crate::fold::ElementFold {
+            expression: binary(NaryOp::Mul, q_read, k_read),
+            len: head_dim,
+            function: sum_fn(f32),
+        },
+        scaled_score(),
+        v_read,
+        shape.clone(),
+        3,
+        head_dim,
+        max_fn(f32).initial_value,
+        input_dtype,
+    );
+    debug_assert!(carrier.validate().is_ok(), "{:?}", carrier.validate());
     Some(RowProgramOperation {
         inputs: graph_inputs,
-        shape: [batch, num_heads, q_seq_len, kv_len].into(),
+        shape,
         axis: 3,
-        steps: vec![
-            RowStep::Element {
-                expression: binary(NaryOp::Mul, q_read, k_read),
-                fold: Some(RowFold {
-                    len: head_dim,
-                    function: sum_fn(f32),
-                }),
-                datatype: f32,
-            },
-            RowStep::Reduce(RowReduce {
-                expression: scaled_score(),
-                combine: RowCombine::BuiltIn(max_fn(f32)),
-                post_chain: UnaryFunctionChain::empty(f32),
-            }),
-            RowStep::Reduce(RowReduce {
-                expression: shifted_exp(),
-                combine: RowCombine::BuiltIn(sum_fn(f32)),
-                post_chain: UnaryFunctionChain::empty(f32),
-            }),
-            RowStep::Element {
-                expression: binary(NaryOp::Div, shifted_exp(), slot(2)),
-                fold: None,
-                datatype: f32,
-            },
-            RowStep::Output(RowOutput::Reduce {
-                combine: binary(NaryOp::Mul, slot(3), v_read),
-                function: sum_fn(f32),
-                free_dim: head_dim,
-            }),
-        ],
+        steps: Vec::new(),
         output_datatype: input_dtype,
         dynamic_axis: Some(DynamicAxis {
             block,
             input_axis_dims,
             axis_bound_dim: causal.then_some(2),
+            carrier,
         }),
     })
 }

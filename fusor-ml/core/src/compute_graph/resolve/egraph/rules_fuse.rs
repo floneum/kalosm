@@ -22,6 +22,31 @@ use crate::compute_graph::{ComputeGraphInner, NodeIndex};
 use crate::nary_wise::{ElementwiseOperation, NaryExpr, NaryFunction, UnaryFunctionChain};
 use crate::{DataTypeEnum, Layout};
 
+/// Largest expression a fusion rewrite may produce.
+///
+/// [`NaryExpr`] is a tree, so substituting a producer into a consumer copies
+/// the producer once per read of it. Along a chain where each step's result is
+/// read twice — a prefix scan's carry, a residual reused by two branches — the
+/// expression doubles per fusion, and a chain of any depth is exponential.
+/// That cost lands entirely in the resolver: cloning and walking the tree, and
+/// then in the shader it emits.
+///
+/// The bound is on the *result*, not the growth ratio, because a single
+/// rewrite that lands under it is affordable no matter how much it grew, and
+/// a chain that would run away is stopped at the first step that crosses it.
+/// A rewrite that declines here is not lost work — the producer materializes
+/// instead, which is what an expression this large is worth.
+const MAX_FUSED_EXPRESSION_NODES: usize = 4_096;
+
+fn expression_fits(expression: &NaryExpr) -> bool {
+    let count = expression.node_count();
+    if count > MAX_FUSED_EXPRESSION_NODES {
+        tracing::debug!("declining fusion: expression would be {count} nodes");
+        return false;
+    }
+    true
+}
+
 /// Where the two producer-inlining rewrites disagree; everything else about
 /// them is shared.
 struct InlineGate {
@@ -281,6 +306,9 @@ impl<'a> FusionView<'a> {
             let Some(rewritten) = compose::rewrite_view_input(&expression, slot, &view) else {
                 continue;
             };
+            if !expression_fits(&rewritten) {
+                continue;
+            }
             expression = rewritten;
             inputs[slot] = view.input;
             folded = true;
@@ -385,6 +413,9 @@ impl<'a> FusionView<'a> {
                 }
             }
 
+            if success && !expression_fits(&new_expression) {
+                success = false;
+            }
             if success {
                 let unique_inputs: FxHashSet<_> = all_inputs
                     .iter()

@@ -91,7 +91,7 @@ fn label(variant: &ExecutionVariant) -> String {
                 .map_or("", |_| "\\n+post epilogue"),
         ),
         ExecutionVariant::QEmbedding(_) => "qembedding".to_string(),
-        ExecutionVariant::RowProgram(op) => format!("row_program\\n{} steps", op.steps.len()),
+        ExecutionVariant::RowProgram(op) => format!("row_program\\n{} steps", op.work_units()),
         ExecutionVariant::Attention(op) => format!("attention\\n{:?}", op.kind),
     }
 }

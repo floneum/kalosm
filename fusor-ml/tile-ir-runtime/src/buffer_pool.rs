@@ -303,7 +303,30 @@ impl BufferPool {
 
         let buffer = Arc::new(new_buffer);
         let mut cache = self.buffer_allocation_cache.write();
-        let buffers = cache.get_or_insert_mut((size, usage), Vec::new);
+        // Inserting a key the cache has never seen can evict the
+        // least-recently-used bucket, and dropping that bucket releases every
+        // pool reference in it. Those bytes have to leave the counter with
+        // them: without this they were counted forever, so `live_bytes`
+        // ratcheted upward on any workload with more than
+        // `BUFFER_ALLOCATION_CACHE_SIZE` distinct shapes and eventually
+        // tripped the cap on memory that was never allocated. Measured: a
+        // training run died at 22.89 GB "live" against a 22.91 GB cap with a
+        // resident set under half a gigabyte.
+        //
+        // A buffer a caller still holds stops being counted here. That is
+        // sound — the pool has released it and can never hand it out again,
+        // so it is freed when its holder drops it — and it under-counts only
+        // for buffers in the *least* recently used bucket, which are by
+        // construction the ones least likely to still be in use.
+        let key = (size, usage);
+        if cache.peek(&key).is_none()
+            && cache.len() == cache.cap().get()
+            && let Some((_, evicted)) = cache.pop_lru()
+        {
+            let released: u64 = evicted.iter().map(|cached| cached.buffer.size()).sum();
+            self.live_bytes.fetch_sub(released, Ordering::Relaxed);
+        }
+        let buffers = cache.get_or_insert_mut(key, Vec::new);
         buffers.push(CachedBuffer::new(buffer.clone(), to_initilize));
         prune_cached_buffers(buffers, &self.live_bytes);
         buffer

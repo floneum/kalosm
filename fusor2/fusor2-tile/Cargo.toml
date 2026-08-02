@@ -1,0 +1,17 @@
+[package]
+name = "fusor2-tile"
+description = "fusor2 L2 tile algorithms, schedule domains and the contraction lowering rules"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+fusor2-ir.workspace = true
+smallvec.workspace = true
+rustc-hash.workspace = true
+fixedbitset.workspace = true
+half.workspace = true
+parking_lot.workspace = true

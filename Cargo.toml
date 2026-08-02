@@ -42,6 +42,9 @@ members = [
     "fusor-ml/tile-ir-runtime",
     "fusor-ml/webgpu-runner",
 ]
+# `fusor2` is a standalone crate with its own `[workspace]`; keep the parent
+# workspace from trying to absorb it.
+exclude = ["fusor2"]
 
 [patch.crates-io]
 # Local checkout of the wgpu fork while the mixed-precision cooperative-MMA

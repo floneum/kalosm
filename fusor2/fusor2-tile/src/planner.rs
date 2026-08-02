@@ -1,0 +1,966 @@
+//! [`Planner`] — the one [`ArenaPlanner`] implementation.
+//!
+//! `arena_plan` is a **pure memoized function** of the ordered tile
+//! declaration list, the barrier and loop structure of the body, and
+//! `caps.fingerprint()`. `workgroup_bytes` synthesizes a minimal body over a
+//! candidate geometry's tiles and runs the *same* function, so `verify_l1`'s
+//! admission test, the L1 occupancy term and the L2 emitter's layout are
+//! provably the same number. There is no estimator, therefore no L1/L2
+//! admission mismatch and no "extraction commits a plan that fails L2
+//! verification and silently falls back".
+//!
+//! Owned by W3.
+
+use std::sync::{Arc, OnceLock};
+
+use fusor2_ir::Result;
+use fusor2_ir::device::Caps;
+use fusor2_ir::ir::level2::{
+    Addr, ArenaMode, ArenaPlan, ArenaPlanner, BarrierSuggestion, Buffer, CoopSrc, KernelIr, Local,
+    MergeBody, Placement, QuantizedView, ReduceKind, Source, Stmt, StorageView, Tile, TileExpr,
+    TileExprKind, Tiles,
+};
+use parking_lot::RwLock;
+use rustc_hash::{FxHashMap, FxHasher};
+use smallvec::SmallVec;
+use std::hash::{Hash, Hasher};
+
+use crate::arena;
+use crate::liveness::{LivenessInfo, analyze, for_each_addr_expr, for_each_child};
+
+/// Memo key: everything `arena_plan`'s result depends on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PlanKey {
+    /// The tile declaration list, the barrier/loop skeleton, and the body
+    /// term itself. The body term is a superset of the first two, which keeps
+    /// the key exact at the cost of a few memo misses.
+    pub body_hash: u64,
+    pub caps_fingerprint: u64,
+}
+
+/// Memo key for the geometry-only entry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TilesKey {
+    pub tiles_hash: u64,
+    pub caps_fingerprint: u64,
+}
+
+/// The shared arena planner. The memo is behind an `RwLock` because kernel
+/// building runs on worker threads.
+#[derive(Default)]
+pub struct Planner {
+    memo: RwLock<FxHashMap<PlanKey, ArenaPlan>>,
+    tiles_memo: RwLock<FxHashMap<TilesKey, u32>>,
+}
+
+static GLOBAL: OnceLock<Planner> = OnceLock::new();
+
+impl Planner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The handle `CoreSemantics::new` wants.
+    pub fn shared() -> Arc<dyn ArenaPlanner> {
+        Arc::new(Self::new())
+    }
+
+    /// The process-wide planner, so `verify_l2` and the emitters share one
+    /// memo instead of re-deriving every plan.
+    pub fn global() -> &'static Self {
+        GLOBAL.get_or_init(Self::new)
+    }
+
+    pub fn memo_len(&self) -> usize {
+        self.memo.read().len()
+    }
+
+    pub fn tiles_memo_len(&self) -> usize {
+        self.tiles_memo.read().len()
+    }
+
+    /// True when `(ir, caps)` is already planned. Test-facing.
+    pub fn is_memoized(&self, ir: &KernelIr, caps: &Caps) -> bool {
+        let live = analyze(ir);
+        self.memo.read().contains_key(&plan_key(ir, &live, caps))
+    }
+}
+
+/// Everything the plan depends on, hashed. The liveness digest is the
+/// architecture's stated key (tile declarations in order, plus the barrier and
+/// loop structure); the raw body term is folded in as well so a memo hit can
+/// never cross two bodies that merely happen to have the same skeleton.
+fn plan_key(ir: &KernelIr, live: &LivenessInfo, caps: &Caps) -> PlanKey {
+    let mut h = FxHasher::default();
+    // Ordered tile declaration list: element type, layout, allocation extent.
+    (live.order.len() as u64).hash(&mut h);
+    for tile in live.iter() {
+        tile.element.hash(&mut h);
+        tile.tile.layout.hash(&mut h);
+        tile.elements.hash(&mut h);
+        for access in &tile.accesses {
+            access.position.hash(&mut h);
+            access.kind.hash(&mut h);
+        }
+    }
+    // Barrier and loop structure.
+    for barrier in &live.barriers {
+        barrier.position.hash(&mut h);
+        barrier.guaranteed.hash(&mut h);
+    }
+    for info in &live.loops {
+        info.span.hash(&mut h);
+        info.guaranteed_once().hash(&mut h);
+    }
+    // The body term itself — barrier *insertion* candidates depend on the root
+    // statement list, not only on the skeleton above.
+    //
+    // Structurally, **not** via `Stmt`'s derived `Hash`: `StorageView::hash`
+    // hashes the buffer's address, `LocalDecl` and `TileDecl` hash their `id`,
+    // so the derived hash of two separately-built copies of the same kernel
+    // never agreed. That made this memo a total miss for every kernel holding
+    // a buffer or a local — i.e. all of them — and left only the tile-only
+    // test fixture hitting. `BodyHasher` substitutes each declaration's
+    // first-use ordinal for its address and is otherwise exact.
+    BodyHasher::default().body(&ir.body, &mut h);
+    PlanKey {
+        body_hash: h.finish(),
+        caps_fingerprint: caps.fingerprint(),
+    }
+}
+
+/// Hashes an L2 body up to renaming of its buffer, tile and local
+/// declarations.
+///
+/// Every other field is folded in verbatim, so the key stays as exact as the
+/// derived `Hash` was — two bodies differing in an operator, a literal or a
+/// layout still hash apart. Only *which allocation* a leaf names is
+/// canonicalized, and that is precisely what `rebind` puts back on retrieval.
+#[derive(Default)]
+struct BodyHasher {
+    buffers: FxHashMap<usize, u32>,
+    tiles: FxHashMap<usize, u32>,
+    locals: FxHashMap<usize, u32>,
+}
+
+fn ptr_of<T>(v: &Arc<T>) -> usize {
+    Arc::as_ptr(v) as *const () as usize
+}
+
+impl BodyHasher {
+    fn ordinal(map: &mut FxHashMap<usize, u32>, ptr: usize) -> u32 {
+        let next = map.len() as u32;
+        *map.entry(ptr).or_insert(next)
+    }
+
+    fn buffer(&mut self, b: &Buffer, h: &mut FxHasher) {
+        Self::ordinal(&mut self.buffers, ptr_of(b)).hash(h);
+        // The decl's own contents still matter: two buffers may be distinct
+        // allocations of different element types.
+        b.element.hash(h);
+        b.layout.hash(h);
+        b.access.hash(h);
+    }
+
+    fn tile(&mut self, t: &Tile, h: &mut FxHasher) {
+        Self::ordinal(&mut self.tiles, ptr_of(t)).hash(h);
+        t.element.hash(h);
+        t.layout.hash(h);
+        t.name.hash(h);
+    }
+
+    fn local(&mut self, l: &Local, h: &mut FxHasher) {
+        Self::ordinal(&mut self.locals, ptr_of(l)).hash(h);
+        l.element.hash(h);
+    }
+
+    fn view(&mut self, v: &StorageView, h: &mut FxHasher) {
+        self.buffer(&v.buffer, h);
+        v.offset.hash(h);
+        v.layout.hash(h);
+    }
+
+    fn quantized(&mut self, q: &QuantizedView, h: &mut FxHasher) {
+        self.view(&q.data, h);
+        q.fmt.hash(h);
+        q.layout.hash(h);
+        q.rows.hash(h);
+        q.cols.hash(h);
+    }
+
+    fn source(&mut self, s: &Source, h: &mut FxHasher) {
+        std::mem::discriminant(s).hash(h);
+        match s {
+            Source::Storage(v) => self.view(v, h),
+            Source::Quantized(q) => self.quantized(q, h),
+        }
+    }
+
+    fn addr(&mut self, a: &Addr, h: &mut FxHasher) {
+        std::mem::discriminant(a).hash(h);
+        for_each_addr_expr(a, &mut |e| self.expr(e, h));
+    }
+
+    fn reduce_kind(&mut self, k: &ReduceKind, h: &mut FxHasher) {
+        std::mem::discriminant(k).hash(h);
+        match k {
+            ReduceKind::Subgroup => {}
+            ReduceKind::Workgroup {
+                scratch,
+                group_size,
+            } => {
+                self.tile(scratch, h);
+                group_size.hash(h);
+            }
+            ReduceKind::Loop {
+                iterations,
+                index,
+                scratch,
+                group_size,
+            } => {
+                iterations.hash(h);
+                self.local(index, h);
+                self.tile(scratch, h);
+                group_size.hash(h);
+            }
+        }
+    }
+
+    /// The per-node payload: everything that is neither a child expression
+    /// (walked by `for_each_child`) nor an identity already folded in above.
+    fn expr(&mut self, e: &TileExpr, h: &mut FxHasher) {
+        let kind = e.kind();
+        std::mem::discriminant(kind).hash(h);
+        e.element().hash(h);
+        match kind {
+            TileExprKind::Literal(l) => l.hash(h),
+            TileExprKind::Builtin(b) => b.hash(h),
+            TileExprKind::LoadLocal(l) => self.local(l, h),
+            TileExprKind::Load { src, .. } => self.source(src, h),
+            TileExprKind::LoadTile { tile, .. } => self.tile(tile, h),
+            TileExprKind::Unary { op, numeric, .. } => {
+                op.hash(h);
+                numeric.hash(h);
+            }
+            TileExprKind::Binary { op, numeric, .. } => {
+                op.hash(h);
+                numeric.hash(h);
+            }
+            TileExprKind::Compare { op, .. } => op.hash(h),
+            TileExprKind::Round { mode, .. } => mode.hash(h),
+            TileExprKind::Cast { to, .. } | TileExprKind::Bitcast { to, .. } => to.hash(h),
+            TileExprKind::Vec { scalar, lanes, .. } => {
+                scalar.hash(h);
+                lanes.hash(h);
+            }
+            TileExprKind::VecComponent { component, .. } => component.hash(h),
+            TileExprKind::Reduce { op, kind, .. } => {
+                op.hash(h);
+                self.reduce_kind(kind, h);
+            }
+            TileExprKind::CoopZero {
+                role,
+                scalar,
+                rows,
+                cols,
+            } => {
+                role.hash(h);
+                scalar.hash(h);
+                rows.hash(h);
+                cols.hash(h);
+            }
+            TileExprKind::CoopLoad {
+                role,
+                scalar,
+                rows,
+                cols,
+                src,
+            } => {
+                role.hash(h);
+                scalar.hash(h);
+                rows.hash(h);
+                cols.hash(h);
+                std::mem::discriminant(src.as_ref()).hash(h);
+                match src.as_ref() {
+                    CoopSrc::TileRegion {
+                        tile, transposed, ..
+                    } => {
+                        self.tile(tile, h);
+                        transposed.hash(h);
+                    }
+                    CoopSrc::BroadcastCol { src, .. } => self.view(src, h),
+                }
+            }
+            TileExprKind::Dequantize { src, lanes, .. } => {
+                self.quantized(src, h);
+                lanes.hash(h);
+            }
+            TileExprKind::LaneOf { lane, .. } => lane.hash(h),
+            TileExprKind::QuantizedDot { src, packing, .. } => {
+                self.quantized(src, h);
+                packing.hash(h);
+            }
+            // No payload beyond the children.
+            TileExprKind::Select { .. } | TileExprKind::Dot { .. } | TileExprKind::CoopMma { .. } => {}
+        }
+        for_each_child(kind, &mut |c| self.expr(c, h));
+    }
+
+    fn merge(&mut self, m: &MergeBody, h: &mut FxHasher) {
+        for l in m.lhs.iter().chain(m.rhs.iter()) {
+            self.local(l, h);
+        }
+        for e in &m.body {
+            self.expr(e, h);
+        }
+    }
+
+    fn body(&mut self, stmts: &[Stmt], h: &mut FxHasher) {
+        (stmts.len() as u64).hash(h);
+        for s in stmts {
+            self.stmt(s, h);
+        }
+    }
+
+    fn stmt(&mut self, s: &Stmt, h: &mut FxHasher) {
+        std::mem::discriminant(s).hash(h);
+        match s {
+            Stmt::Store {
+                dst,
+                addr,
+                value,
+                mask,
+            }
+            | Stmt::AtomicAdd {
+                dst,
+                addr,
+                value,
+                mask,
+            } => {
+                self.view(dst, h);
+                self.addr(addr, h);
+                self.expr(value, h);
+                self.expr(mask, h);
+            }
+            Stmt::StoreLocal { dst, value } => {
+                self.local(dst, h);
+                self.expr(value, h);
+            }
+            Stmt::StoreTile { dst, index, value } => {
+                self.tile(dst, h);
+                self.expr(index, h);
+                self.expr(value, h);
+            }
+            Stmt::FillTile { dst, value, bounds } => {
+                self.tile(dst, h);
+                self.expr(value, h);
+                for b in bounds {
+                    b.is_some().hash(h);
+                    if let Some(b) = b {
+                        self.expr(b, h);
+                    }
+                }
+            }
+            Stmt::CoopStore { acc, dst, addr } => {
+                self.expr(acc, h);
+                self.view(dst, h);
+                self.addr(addr, h);
+            }
+            Stmt::CoopStoreTile {
+                acc,
+                tile,
+                row,
+                col,
+            } => {
+                self.expr(acc, h);
+                self.tile(tile, h);
+                self.expr(row, h);
+                self.expr(col, h);
+            }
+            Stmt::If {
+                condition,
+                accept,
+                reject,
+            } => {
+                self.expr(condition, h);
+                self.body(accept, h);
+                self.body(reject, h);
+            }
+            Stmt::Loop {
+                count,
+                index,
+                accumulators,
+                body,
+            } => {
+                count.is_some().hash(h);
+                if let Some(c) = count {
+                    self.expr(c, h);
+                }
+                index.is_some().hash(h);
+                if let Some(i) = index {
+                    self.local(i, h);
+                }
+                (accumulators.len() as u64).hash(h);
+                for a in accumulators {
+                    self.local(&a.local, h);
+                    self.expr(&a.init, h);
+                    self.expr(&a.update, h);
+                }
+                self.body(body, h);
+            }
+            Stmt::Reduce {
+                kind,
+                values,
+                merge,
+                fast,
+                outs,
+                scratch,
+            } => {
+                self.reduce_kind(kind, h);
+                (values.len() as u64).hash(h);
+                for v in values {
+                    self.expr(v, h);
+                }
+                self.merge(merge, h);
+                fast.hash(h);
+                for o in outs {
+                    self.local(o, h);
+                }
+                for t in scratch {
+                    self.tile(t, h);
+                }
+            }
+            Stmt::Break | Stmt::Return | Stmt::Barrier | Stmt::StorageBarrier => {}
+        }
+    }
+}
+
+/// A memoized plan is stored with placements in liveness order and no tile
+/// identity of its own; retrieval rebinds them onto the caller's tiles. Two
+/// same-shaped tiles are distinct allocations, so identity must come from the
+/// caller's IR, never from whichever IR first populated the memo.
+fn rebind(template: &ArenaPlan, live: &LivenessInfo) -> ArenaPlan {
+    let mut plan = template.clone();
+    for (placement, tile) in plan.placements.iter_mut().zip(live.iter()) {
+        placement.tile = tile.tile.clone();
+    }
+    plan
+}
+
+/// Ordering key for the argmin. Fully deterministic: fewest bytes, then
+/// `Regions`, then fewest insertions, then the lowest suggestion index.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Rank {
+    bytes: u32,
+    mode_rank: u8,
+    insertions: u8,
+    suggestion_index: u32,
+}
+
+impl Planner {
+    fn plan_uncached(&self, ir: &KernelIr, caps: &Caps) -> Result<ArenaPlan> {
+        let base_live = analyze(ir);
+        let mut options: Vec<(SmallVec<[u32; 4]>, u32)> = vec![(SmallVec::new(), u32::MAX)];
+        for suggestion in crate::barrier::suggestions(ir, &base_live)
+            .into_iter()
+            .take(3)
+        {
+            let mut one = SmallVec::new();
+            one.push(suggestion.index);
+            options.push((one, suggestion.index));
+        }
+
+        let mut best: Option<(Rank, ArenaPlan)> = None;
+        for (insertions, suggestion_index) in options {
+            let candidate = if insertions.is_empty() {
+                ir.clone()
+            } else {
+                crate::barrier::insert(ir, &insertions)?
+            };
+            let live = analyze(&candidate);
+            for mode in [ArenaMode::Regions, ArenaMode::ByteArena] {
+                let plan = match mode {
+                    ArenaMode::Regions => arena::regions(&live),
+                    ArenaMode::ByteArena => {
+                        // The arena only wins when cross-stride reuse actually
+                        // fires; without it 16-byte rounding is a strict loss.
+                        if !caps.workgroup_alias
+                            || !arena::all_packable(&live)
+                            || !arena::mixes_stride_widths(&live)
+                        {
+                            continue;
+                        }
+                        match arena::byte_arena(&live) {
+                            Some(plan) => plan,
+                            None => continue,
+                        }
+                    }
+                };
+                let rank = Rank {
+                    bytes: plan.total_bytes,
+                    mode_rank: match mode {
+                        ArenaMode::Regions => 0,
+                        ArenaMode::ByteArena => 1,
+                    },
+                    insertions: insertions.len() as u8,
+                    suggestion_index,
+                };
+                let better = match &best {
+                    Some((best_rank, _)) => rank < *best_rank,
+                    None => true,
+                };
+                if better {
+                    let mut plan = plan;
+                    plan.barriers_inserted = insertions.clone();
+                    best = Some((rank, plan));
+                }
+            }
+        }
+
+        let (_, plan) = best.expect("Regions is always a candidate");
+        arena::check_budget(&plan, ir, caps)?;
+        Ok(plan)
+    }
+}
+
+impl ArenaPlanner for Planner {
+    fn arena_plan(&self, ir: &KernelIr, caps: &Caps) -> Result<ArenaPlan> {
+        let live = analyze(ir);
+        let key = plan_key(ir, &live, caps);
+        if let Some(template) = self.memo.read().get(&key) {
+            return Ok(rebind(template, &live));
+        }
+        let plan = self.plan_uncached(ir, caps)?;
+        self.memo.write().insert(key, plan.clone());
+        Ok(rebind(&plan, &live))
+    }
+
+    fn workgroup_bytes(&self, tiles: &Tiles, caps: &Caps) -> Result<u32> {
+        let mut h = FxHasher::default();
+        tiles.hash(&mut h);
+        let key = TilesKey {
+            tiles_hash: h.finish(),
+            caps_fingerprint: caps.fingerprint(),
+        };
+        if let Some(bytes) = self.tiles_memo.read().get(&key) {
+            return Ok(*bytes);
+        }
+        let ir = synth_ir(tiles);
+        let bytes = self.arena_plan(&ir, caps)?.total_bytes;
+        self.tiles_memo.write().insert(key, bytes);
+        Ok(bytes)
+    }
+
+    fn barrier_suggestions(&self, ir: &KernelIr) -> Vec<BarrierSuggestion> {
+        crate::barrier::barrier_suggestions(ir)
+    }
+
+    fn verify_arena(&self, ir: &KernelIr, plan: &ArenaPlan) -> Result<()> {
+        crate::verify_arena::verify_arena(ir, plan)
+    }
+
+    fn verify_uniformity(&self, ir: &KernelIr) -> Result<()> {
+        crate::uniformity::verify_uniformity(ir)
+    }
+}
+
+/// The minimal body a declared tile set implies: every tile written, one
+/// barrier, every tile written again. Each tile's live range then spans the
+/// barrier, so no two can share and the footprint is the geometry's
+/// simultaneous demand — which is exactly what `verify_l1` must admit against.
+pub fn synth_ir(tiles: &Tiles) -> KernelIr {
+    let mut builder = crate::build::TileBuilder::new();
+    let mut body: Vec<Stmt> = Vec::with_capacity(tiles.decls.len() * 2 + 1);
+    let mut writes: Vec<Stmt> = Vec::with_capacity(tiles.decls.len());
+    for tile in &tiles.decls {
+        let value = builder.zero(tile.element);
+        writes.push(builder.fill_tile(tile.clone(), value, [None, None]));
+    }
+    body.extend(writes.iter().cloned());
+    body.push(Stmt::Barrier);
+    body.extend(writes);
+    KernelIr {
+        buffers: Vec::new(),
+        grid: [1, 1, 1],
+        block: 1,
+        body,
+        byte_arena: None,
+        name: "workgroup_bytes",
+    }
+}
+
+/// Placements are always emitted in liveness order; a caller that wants them
+/// keyed by tile can index with this.
+pub fn placement_of<'a>(plan: &'a ArenaPlan, tile: &fusor2_ir::ir::level2::Tile) -> Option<&'a Placement> {
+    let key = crate::liveness::tile_key(tile);
+    plan.placements
+        .iter()
+        .find(|placement| crate::liveness::tile_key(&placement.tile) == key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::build::TileBuilder;
+    use crate::build::fixtures::{self, SHARED, UNSHARED};
+    use fusor2_ir::ir::level2::{MemoryLevel, ScalarElement, TileLayout};
+
+    fn caps() -> Caps {
+        fixtures::caps_with(|_| {})
+    }
+
+    /// The footprint of the body **as written** — no barrier insertion. This
+    /// is what tests 1-6 are about: whether the barriers already present
+    /// separate the two tiles. `arena_plan` may legitimately beat it by
+    /// inserting one, which is what `barrier_suggestion_bytes_saved_is_exact`
+    /// and `insertion_rescues_a_skippable_in_loop_barrier` cover.
+    fn footprint(ir: &KernelIr) -> u32 {
+        arena::regions(&analyze(ir)).total_bytes
+    }
+
+    #[test]
+    fn shares_through_top_level_barrier() {
+        let mut b = TileBuilder::new();
+        let ir = fixtures::pair_kernel(&mut b, vec![Stmt::Barrier]);
+        assert_eq!(footprint(&ir), SHARED);
+        let plan = Planner::new().arena_plan(&ir, &caps()).unwrap();
+        assert_eq!(plan.total_bytes, SHARED);
+        assert!(plan.barriers_inserted.is_empty());
+    }
+
+    #[test]
+    fn shares_through_static_loop_barrier() {
+        let mut b = TileBuilder::new();
+        let count = b.lit_u32(4);
+        let looped = b.loop_counted(Some(count), None, Vec::new(), vec![Stmt::Barrier]);
+        let ir = fixtures::pair_kernel(&mut b, vec![looped]);
+        assert_eq!(footprint(&ir), SHARED);
+        let plan = Planner::new().arena_plan(&ir, &caps()).unwrap();
+        assert_eq!(plan.total_bytes, SHARED);
+        assert!(plan.barriers_inserted.is_empty());
+    }
+
+    #[test]
+    fn no_share_through_unstructured_loop_barrier() {
+        let mut b = TileBuilder::new();
+        let looped = b.loop_forever(vec![Stmt::Barrier, Stmt::Break]);
+        let ir = fixtures::pair_kernel(&mut b, vec![looped]);
+        assert_eq!(footprint(&ir), UNSHARED);
+    }
+
+    #[test]
+    fn no_share_through_breaking_static_loop_barrier() {
+        let mut b = TileBuilder::new();
+        let count = b.lit_u32(4);
+        let looped = b.loop_counted(
+            Some(count),
+            None,
+            Vec::new(),
+            vec![Stmt::Break, Stmt::Barrier],
+        );
+        let ir = fixtures::pair_kernel(&mut b, vec![looped]);
+        assert_eq!(footprint(&ir), UNSHARED);
+    }
+
+    #[test]
+    fn no_share_through_returning_static_loop_barrier() {
+        let mut b = TileBuilder::new();
+        let count = b.lit_u32(4);
+        let looped = b.loop_counted(
+            Some(count),
+            None,
+            Vec::new(),
+            vec![Stmt::Return, Stmt::Barrier],
+        );
+        let ir = fixtures::pair_kernel(&mut b, vec![looped]);
+        assert_eq!(footprint(&ir), UNSHARED);
+    }
+
+    /// The argmin's whole point: a skippable in-loop barrier separates
+    /// nothing, and one inserted root-level barrier recovers the sharing.
+    #[test]
+    fn insertion_rescues_a_skippable_in_loop_barrier() {
+        let mut b = TileBuilder::new();
+        let looped = b.loop_forever(vec![Stmt::Barrier, Stmt::Break]);
+        let ir = fixtures::pair_kernel(&mut b, vec![looped]);
+        let plan = Planner::new().arena_plan(&ir, &caps()).unwrap();
+        assert_eq!(plan.total_bytes, SHARED);
+        assert_eq!(plan.barriers_inserted.len(), 1);
+    }
+
+    #[test]
+    fn accumulator_update_is_live_across_loop() {
+        // A's only in-loop touch is the accumulator update, which runs at the
+        // end of every iteration — after the in-loop barrier — so A's range
+        // covers the whole loop and the post-loop write of B cannot share it.
+        let mut b = TileBuilder::new();
+        let (a, c) = fixtures::two_f32_tiles(&mut b);
+        let zero = b.lit_f32(0.0);
+        let index = b.lit_u32(0);
+        let count = b.lit_u32(4);
+        let local = b.alloc_local(ScalarElement::F32.element());
+        let update = b.load_tile(a.clone(), index.clone());
+        let write_a = b.store_tile(a, index.clone(), zero.clone());
+        let looped = b.loop_counted(
+            Some(count),
+            None,
+            vec![fusor2_ir::ir::level2::Accumulator {
+                local,
+                init: zero.clone(),
+                update,
+            }],
+            vec![Stmt::Barrier],
+        );
+        let write_c = b.store_tile(c, index, zero);
+        b.set_body(vec![write_a, looped, write_c]);
+        let ir = b.finish([1, 1, 1], 64, "acc");
+        assert_eq!(footprint(&ir), UNSHARED);
+    }
+
+    #[test]
+    fn control_without_the_accumulator_shares() {
+        let mut b = TileBuilder::new();
+        let (a, c) = fixtures::two_f32_tiles(&mut b);
+        let zero = b.lit_f32(0.0);
+        let index = b.lit_u32(0);
+        let count = b.lit_u32(4);
+        let write_a = b.store_tile(a, index.clone(), zero.clone());
+        let looped = b.loop_counted(Some(count), None, Vec::new(), vec![Stmt::Barrier]);
+        let write_c = b.store_tile(c, index, zero);
+        b.set_body(vec![write_a, looped, write_c]);
+        let ir = b.finish([1, 1, 1], 64, "ctl");
+        assert_eq!(footprint(&ir), SHARED);
+    }
+
+    #[test]
+    fn byte_arena_beats_regions_on_mixed_strides() {
+        let mut b = TileBuilder::new();
+        let wide = b.alloc_tile(
+            ScalarElement::F32.element(),
+            TileLayout::contiguous(MemoryLevel::Workgroup, &[64]),
+        );
+        let narrow = b.alloc_tile(
+            ScalarElement::F16.element(),
+            TileLayout::contiguous(MemoryLevel::Workgroup, &[64]),
+        );
+        let zero_f32 = b.zero(ScalarElement::F32.element());
+        let zero_f16 = b.zero(ScalarElement::F16.element());
+        let index = b.lit_u32(0);
+        let write_wide = b.store_tile(wide, index.clone(), zero_f32);
+        let write_narrow = b.store_tile(narrow, index, zero_f16);
+        b.set_body(vec![write_wide, Stmt::Barrier, write_narrow]);
+        let ir = b.finish([1, 1, 1], 64, "mixed");
+
+        let aliasing = fixtures::caps_with(|c| {
+            c.workgroup_alias = true;
+            c.f16 = true;
+        });
+        let plan = Planner::new().arena_plan(&ir, &aliasing).unwrap();
+        assert_eq!(plan.mode, ArenaMode::ByteArena);
+        assert_eq!(plan.total_bytes, 256);
+
+        let plain = fixtures::caps_with(|c| {
+            c.workgroup_alias = false;
+            c.f16 = true;
+        });
+        let plan = Planner::new().arena_plan(&ir, &plain).unwrap();
+        assert_eq!(plan.mode, ArenaMode::Regions);
+        assert_eq!(plan.total_bytes, 384);
+    }
+
+    #[test]
+    fn barrier_suggestion_bytes_saved_is_exact() {
+        let mut b = TileBuilder::new();
+        let ir = fixtures::pair_kernel(&mut b, Vec::new());
+        let planner = Planner::new();
+        let suggestions = planner.barrier_suggestions(&ir);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].index, 1);
+        assert_eq!(suggestions[0].bytes_saved, UNSHARED - SHARED);
+        let plan = planner.arena_plan(&ir, &caps()).unwrap();
+        assert_eq!(plan.total_bytes, SHARED);
+        assert_eq!(plan.barriers_inserted.as_slice(), &[1]);
+    }
+
+    #[test]
+    fn arena_plan_is_deterministic_and_memoized() {
+        let planner = Planner::new();
+        let mut first = TileBuilder::new();
+        let ir_a = fixtures::pair_kernel(&mut first, vec![Stmt::Barrier]);
+        let mut second = TileBuilder::new();
+        let ir_b = fixtures::pair_kernel(&mut second, vec![Stmt::Barrier]);
+
+        let plan_a = planner.arena_plan(&ir_a, &caps()).unwrap();
+        assert_eq!(planner.memo_len(), 1);
+        assert!(planner.is_memoized(&ir_b, &caps()));
+        let plan_b = planner.arena_plan(&ir_b, &caps()).unwrap();
+        assert_eq!(planner.memo_len(), 1);
+
+        // The *layout* is identical — that is what "deterministic" claims.
+        //
+        // This used to be `assert_eq!(plan_a, plan_b)`, which held only
+        // because `TileDecl` compared structurally. It is identity-bearing
+        // now, so two allocations of the same shape are two tiles and the two
+        // plans deliberately name different ones — as the `ptr_eq` check
+        // below has always demanded. Comparing whole plans asserted the
+        // opposite of that check and could only pass while tiles had no
+        // identity.
+        assert_eq!(plan_a.mode, plan_b.mode);
+        assert_eq!(plan_a.total_bytes, plan_b.total_bytes);
+        assert_eq!(plan_a.barriers_inserted, plan_b.barriers_inserted);
+        assert_eq!(plan_a.placements.len(), plan_b.placements.len());
+        for (a, b) in plan_a.placements.iter().zip(&plan_b.placements) {
+            assert_eq!(a.byte_offset, b.byte_offset);
+            assert_eq!(a.byte_len, b.byte_len);
+            assert_eq!(a.tile.layout, b.tile.layout);
+            assert_eq!(a.tile.element, b.tile.element);
+        }
+        // ...and the second plan names the second kernel's own tiles.
+        for (placement, tile) in plan_b.placements.iter().zip(&second_tiles(&ir_b)) {
+            assert!(std::sync::Arc::ptr_eq(&placement.tile, tile));
+        }
+    }
+
+    fn second_tiles(ir: &KernelIr) -> Vec<fusor2_ir::ir::level2::Tile> {
+        analyze(ir).iter().map(|t| t.tile.clone()).collect()
+    }
+
+    /// A kernel holding a storage buffer and a private local memoizes across
+    /// two independent builds.
+    ///
+    /// This is the case the memo never served: `StorageView` hashes its
+    /// buffer's *address* and `LocalDecl` hashes its `id`, so `Stmt`'s derived
+    /// `Hash` gave two copies of one kernel two different keys. Every real
+    /// kernel holds a buffer, so the hit rate was zero and only the tile-only
+    /// fixture above ever exercised a hit.
+    #[test]
+    fn two_builds_of_one_kernel_with_a_buffer_and_a_local_share_a_plan() {
+        fn build(b: &mut TileBuilder) -> KernelIr {
+            let (tile, _) = fixtures::two_f32_tiles(b);
+            let src = b.alloc_buffer(
+                1,
+                ScalarElement::F32.element(),
+                TileLayout::contiguous(MemoryLevel::Storage, &[64]),
+                fusor2_ir::ir::level2::BufferAccess::Read,
+            );
+            let view = fixtures::whole_buffer_view(&src);
+            let acc = b.alloc_local(ScalarElement::F32.element());
+            let index = b.lit_u32(0);
+            let mask = b.mask_true();
+            let zero = b.lit_f32(0.0);
+            let loaded = b.load(
+                Source::Storage(view),
+                Addr::Linear(index.clone()),
+                mask,
+                zero,
+            );
+            let store_acc = b.store_local(acc.clone(), loaded);
+            let read_acc = b.load_local(acc);
+            let write = b.store_tile(tile, index, read_acc);
+            b.set_body(vec![store_acc, Stmt::Barrier, write]);
+            b.finish([1, 1, 1], 64, "buffered")
+        }
+
+        let planner = Planner::new();
+        let mut first = TileBuilder::new();
+        let ir_a = build(&mut first);
+        let mut second = TileBuilder::new();
+        let ir_b = build(&mut second);
+
+        planner.arena_plan(&ir_a, &caps()).unwrap();
+        assert_eq!(planner.memo_len(), 1);
+        assert!(
+            planner.is_memoized(&ir_b, &caps()),
+            "two builds of one kernel must share a plan key"
+        );
+        planner.arena_plan(&ir_b, &caps()).unwrap();
+        assert_eq!(planner.memo_len(), 1);
+    }
+
+    /// ...and the key stays discriminating: change one literal and the plan
+    /// key must not be reused.
+    #[test]
+    fn a_different_body_does_not_reuse_a_plan() {
+        fn build(b: &mut TileBuilder, fill: f32) -> KernelIr {
+            let (tile, _) = fixtures::two_f32_tiles(b);
+            let index = b.lit_u32(0);
+            let value = b.lit_f32(fill);
+            let write = b.store_tile(tile, index, value);
+            b.set_body(vec![write]);
+            b.finish([1, 1, 1], 64, "lit")
+        }
+
+        let planner = Planner::new();
+        let mut first = TileBuilder::new();
+        let ir_a = build(&mut first, 0.0);
+        let mut second = TileBuilder::new();
+        let ir_b = build(&mut second, 1.0);
+
+        planner.arena_plan(&ir_a, &caps()).unwrap();
+        assert!(
+            !planner.is_memoized(&ir_b, &caps()),
+            "the ordinal substitution must not erase the payload"
+        );
+    }
+
+    #[test]
+    fn workgroup_bytes_agrees_with_arena_plan() {
+        let planner = Planner::new();
+        let caps = fixtures::caps_with(|c| {
+            c.f16 = true;
+            c.workgroup_alias = true;
+        });
+        for seed in 0..20u32 {
+            let mut b = TileBuilder::new();
+            let mut decls: SmallVec<[fusor2_ir::ir::level2::Tile; 8]> = SmallVec::new();
+            let count = 1 + (seed % 4);
+            for slot in 0..count {
+                let element = if (seed + slot) % 3 == 0 {
+                    ScalarElement::F16.element()
+                } else {
+                    ScalarElement::F32.element()
+                };
+                let extent = 8 * (1 + (seed + slot) % 5);
+                decls.push(b.alloc_tile(
+                    element,
+                    TileLayout::contiguous(MemoryLevel::Workgroup, &[extent]),
+                ));
+            }
+            let tiles = Tiles { decls };
+            let bytes = planner.workgroup_bytes(&tiles, &caps).unwrap();
+            let ir = synth_ir(&tiles);
+            let plan = planner.arena_plan(&ir, &caps).unwrap();
+            assert_eq!(bytes, plan.total_bytes, "seed {seed}");
+            // The synthesized body never lets two tiles share.
+            let expected: u32 = tiles
+                .decls
+                .iter()
+                .map(|tile| {
+                    let stride = tile
+                        .element
+                        .workgroup_array_stride()
+                        .unwrap_or(tile.element.byte_size() as u32);
+                    tile.layout.element_count() as u32 * stride
+                })
+                .sum();
+            assert_eq!(bytes, expected, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn over_budget_is_a_legality_error() {
+        let mut b = TileBuilder::new();
+        let tile = b.alloc_tile(
+            ScalarElement::F32.element(),
+            TileLayout::contiguous(MemoryLevel::Workgroup, &[1 << 14]),
+        );
+        let zero = b.zero(ScalarElement::F32.element());
+        let stmt = b.fill_tile(tile, zero, [None, None]);
+        b.push(stmt);
+        let ir = b.finish([1, 1, 1], 64, "huge");
+        assert!(matches!(
+            Planner::new().arena_plan(&ir, &caps()),
+            Err(fusor2_ir::error::Error::Legality(_))
+        ));
+    }
+}

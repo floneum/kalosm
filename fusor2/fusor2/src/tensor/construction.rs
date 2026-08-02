@@ -1,0 +1,486 @@
+//! Constructing leaves: parameters, buffers, constants, uniforms and the
+//! shaped fills.
+//!
+//! `zeros`/`ones`/`splat`/`full` mint an `L0::Leaf(LeafKind::Const)` — **no
+//! upload and no kernel**. `arange` is built host-side and uploaded once,
+//! exactly as the reference does.
+//!
+//! Owned by W12.
+
+
+use fusor2_ir::dtype::{Dtype, Splat};
+use fusor2_ir::ir::level0::{L0, LeafKind};
+use fusor2_ir::shape::{Dim, SymId};
+
+use crate::graph::GraphRef;
+use crate::tensor::typed::Element;
+use crate::tensor::{Tensor, splat_as, splat_one, splat_zero};
+use crate::{Error, Result};
+
+/// Mint a `Leaf::Buffer` and attach host bytes to it.
+pub(crate) fn upload(
+    graph: &GraphRef,
+    dtype: Dtype,
+    shape: &[Dim],
+    bytes: Vec<u8>,
+) -> Result<Tensor> {
+    let t = Tensor::emit(
+        graph,
+        L0::Leaf(LeafKind::Buffer {
+            name: graph.fresh_buffer_id(),
+            dtype,
+            shape: shape.iter().copied().collect(),
+        }),
+    )?;
+    graph.set_leaf_bytes(t.id, bytes);
+    Ok(t)
+}
+
+impl Tensor {
+    /// Upload dense host bytes as a step-local buffer.
+    pub fn from_slice(graph: &GraphRef, dtype: Dtype, shape: &[Dim], data: &[u8]) -> Result<Tensor> {
+        let want = byte_len(dtype, shape)?;
+        if data.len() as u64 != want {
+            return Err(Error::Shape(format!(
+                "from_slice: {} bytes for a {shape:?} {dtype:?} tensor that needs {want}",
+                data.len()
+            )));
+        }
+        upload(graph, dtype, shape, data.to_vec())
+    }
+
+    /// Upload a typed host slice.
+    pub fn from_elements<D: Element>(graph: &GraphRef, shape: &[Dim], data: &[D]) -> Result<Tensor> {
+        Self::from_slice(graph, D::DTYPE, shape, bytemuck::cast_slice(data))
+    }
+
+    /// Build from a nested Rust array, slice or `Vec`, inferring the shape
+    /// from the nesting.
+    pub fn new<A: FromArray>(graph: &GraphRef, data: A) -> Result<Tensor> {
+        let (shape, flat) = data.to_parts()?;
+        Self::from_elements(graph, &shape, &flat)
+    }
+
+    /// A constant fill. One `Leaf(Const)`: no upload, no kernel.
+    pub fn splat(graph: &GraphRef, value: Splat, shape: &[Dim]) -> Result<Tensor> {
+        Tensor::emit(
+            graph,
+            L0::Leaf(LeafKind::Const {
+                value,
+                shape: shape.iter().copied().collect(),
+            }),
+        )
+    }
+
+    /// Argument-order alias of [`Tensor::splat`].
+    pub fn full(graph: &GraphRef, shape: &[Dim], value: Splat) -> Result<Tensor> {
+        Self::splat(graph, value, shape)
+    }
+
+    /// A constant fill given as `f32`, retyped to `dtype`.
+    pub fn full_f32(graph: &GraphRef, dtype: Dtype, shape: &[Dim], value: f32) -> Result<Tensor> {
+        Self::splat(graph, splat_as(Splat::F32(value), dtype), shape)
+    }
+
+    pub fn zeros(graph: &GraphRef, dtype: Dtype, shape: &[Dim]) -> Result<Tensor> {
+        Self::splat(graph, splat_zero(dtype), shape)
+    }
+
+    pub fn ones(graph: &GraphRef, dtype: Dtype, shape: &[Dim]) -> Result<Tensor> {
+        Self::splat(graph, splat_one(dtype), shape)
+    }
+
+    pub fn zeros_like(&self) -> Result<Tensor> {
+        let facts = self.facts();
+        Self::zeros(&self.graph, facts.dtype, &facts.shape)
+    }
+
+    pub fn ones_like(&self) -> Result<Tensor> {
+        let facts = self.facts();
+        Self::ones(&self.graph, facts.dtype, &facts.shape)
+    }
+
+    /// An uninitialized device allocation. The only constructor whose
+    /// contents are undefined; every kernel that writes one must write all
+    /// of it.
+    pub fn uninit(graph: &GraphRef, dtype: Dtype, shape: &[Dim]) -> Result<Tensor> {
+        Tensor::emit(
+            graph,
+            L0::Leaf(LeafKind::Buffer {
+                name: graph.fresh_buffer_id(),
+                dtype,
+                shape: shape.iter().copied().collect(),
+            }),
+        )
+    }
+
+    /// A trainable parameter: `Persistence::Persistent`, so a quantized
+    /// repack amortizes against its lifetime and the extractor knows it may
+    /// not recompute it.
+    pub fn param(graph: &GraphRef, name: &str, dtype: Dtype, shape: &[Dim]) -> Result<Tensor> {
+        let _ = name;
+        Tensor::emit(
+            graph,
+            L0::Leaf(LeafKind::Param {
+                name: graph.fresh_buffer_id(),
+                dtype,
+                shape: shape.iter().copied().collect(),
+            }),
+        )
+    }
+
+    /// A runtime scalar read from binding 0. **Not** a `[1]` tensor and not a
+    /// baked literal — this is what deletes the trainer's scalar-tensor
+    /// workaround. Rank 0.
+    pub fn uniform(graph: &GraphRef, dtype: Dtype, sym: SymId) -> Result<Tensor> {
+        Tensor::emit(graph, L0::Leaf(LeafKind::Uniform { sym, dtype }))
+    }
+
+    /// [`Tensor::uniform`] against a freshly minted symbol.
+    pub fn uniform_scalar(graph: &GraphRef, dtype: Dtype) -> Result<(Tensor, SymId)> {
+        let sym = graph.fresh_sym();
+        Ok((Self::uniform(graph, dtype, sym)?, sym))
+    }
+
+    /// `[start, end)` with step 1, built host-side and uploaded.
+    pub fn arange(graph: &GraphRef, dtype: Dtype, start: f64, end: f64) -> Result<Tensor> {
+        Self::arange_step(graph, dtype, start, end, 1.0)
+    }
+
+    /// `[start, end)` with an arbitrary nonzero step; a negative step counts
+    /// down.
+    ///
+    /// # Panics
+    /// If `step == 0`.
+    pub fn arange_step(
+        graph: &GraphRef,
+        dtype: Dtype,
+        start: f64,
+        end: f64,
+        step: f64,
+    ) -> Result<Tensor> {
+        let bytes = arange_bytes(dtype, start, end, step)?;
+        let n = bytes.len() as u64 / dtype.byte_size().max(1);
+        Self::from_slice(graph, dtype, &[Dim::Const(n)], &bytes)
+    }
+}
+
+/// Free-function spelling of [`Tensor::arange`].
+pub fn arange(graph: &GraphRef, dtype: Dtype, start: f64, end: f64) -> Result<Tensor> {
+    Tensor::arange(graph, dtype, start, end)
+}
+
+/// Free-function spelling of [`Tensor::arange_step`].
+pub fn arange_step(
+    graph: &GraphRef,
+    dtype: Dtype,
+    start: f64,
+    end: f64,
+    step: f64,
+) -> Result<Tensor> {
+    Tensor::arange_step(graph, dtype, start, end, step)
+}
+
+/// Element count times element size, or an error under a symbolic extent.
+fn byte_len(dtype: Dtype, shape: &[Dim]) -> Result<u64> {
+    if dtype.is_quantized() {
+        return Err(Error::Dtype(
+            "a dense upload cannot carry a quantized dtype".into(),
+        ));
+    }
+    let n = shape
+        .iter()
+        .try_fold(1u64, |acc, d| acc.checked_mul(d.as_const()?))
+        .ok_or_else(|| Error::Shape("cannot upload into a symbolic shape".into()))?;
+    Ok(n * dtype.byte_size())
+}
+
+/// The host-side bytes of `arange_step`. Split out so the value sequence is
+/// testable without a graph.
+///
+/// # Panics
+/// If `step == 0`.
+pub fn arange_bytes(dtype: Dtype, start: f64, end: f64, step: f64) -> Result<Vec<u8>> {
+    assert!(step != 0.0, "arange_step needs a nonzero step");
+    if dtype.is_quantized() {
+        return Err(Error::Dtype("arange has no quantized form".into()));
+    }
+    let raw = (end - start) / step;
+    let count = if raw <= 0.0 { 0usize } else { raw.ceil() as usize };
+    let mut out = Vec::with_capacity(count * dtype.byte_size() as usize);
+    for i in 0..count {
+        let v = start + step * i as f64;
+        push_scalar(&mut out, dtype, v);
+    }
+    Ok(out)
+}
+
+fn push_scalar(out: &mut Vec<u8>, dtype: Dtype, v: f64) {
+    match dtype {
+        Dtype::F32 => out.extend_from_slice(&(v as f32).to_le_bytes()),
+        Dtype::F16 => out.extend_from_slice(&half::f16::from_f64(v).to_bits().to_le_bytes()),
+        Dtype::BF16 => out.extend_from_slice(&half::bf16::from_f64(v).to_bits().to_le_bytes()),
+        Dtype::U32 => out.extend_from_slice(&(v as u32).to_le_bytes()),
+        Dtype::I32 => out.extend_from_slice(&(v as i32).to_le_bytes()),
+        Dtype::Q(_) => unreachable!("guarded by arange_bytes"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FromArray
+// ---------------------------------------------------------------------------
+
+/// Nested host data whose shape is inferred from its nesting. Implemented for
+/// arrays and `Vec`s up to depth 4 plus flat slices.
+pub trait FromArray {
+    type Elem: Element;
+    /// The inferred shape and the row-major flattening.
+    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<Self::Elem>)>;
+}
+
+impl<D: Element> FromArray for [D] {
+    type Elem = D;
+    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
+        Ok((vec![Dim::Const(self.len() as u64)], self.to_vec()))
+    }
+}
+
+impl<D: Element, const N: usize> FromArray for [D; N] {
+    type Elem = D;
+    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
+        Ok((vec![Dim::Const(N as u64)], self.to_vec()))
+    }
+}
+
+impl<T: FromArray + ?Sized> FromArray for &T {
+    type Elem = T::Elem;
+    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<T::Elem>)> {
+        (**self).to_parts()
+    }
+}
+
+impl<D: Element, const M: usize, const N: usize> FromArray for [[D; M]; N] {
+    type Elem = D;
+    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
+        let mut flat = Vec::with_capacity(N * M);
+        for row in self {
+            flat.extend_from_slice(row);
+        }
+        Ok((vec![Dim::Const(N as u64), Dim::Const(M as u64)], flat))
+    }
+}
+
+impl<D: Element, const K: usize, const M: usize, const N: usize> FromArray for [[[D; K]; M]; N] {
+    type Elem = D;
+    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
+        let mut flat = Vec::with_capacity(N * M * K);
+        for a in self {
+            for b in a {
+                flat.extend_from_slice(b);
+            }
+        }
+        Ok((
+            vec![
+                Dim::Const(N as u64),
+                Dim::Const(M as u64),
+                Dim::Const(K as u64),
+            ],
+            flat,
+        ))
+    }
+}
+
+impl<D: Element, const J: usize, const K: usize, const M: usize, const N: usize> FromArray
+    for [[[[D; J]; K]; M]; N]
+{
+    type Elem = D;
+    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
+        let mut flat = Vec::with_capacity(N * M * K * J);
+        for a in self {
+            for b in a {
+                for c in b {
+                    flat.extend_from_slice(c);
+                }
+            }
+        }
+        Ok((
+            vec![
+                Dim::Const(N as u64),
+                Dim::Const(M as u64),
+                Dim::Const(K as u64),
+                Dim::Const(J as u64),
+            ],
+            flat,
+        ))
+    }
+}
+
+impl<D: Element> FromArray for Vec<D> {
+    type Elem = D;
+    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
+        Ok((vec![Dim::Const(self.len() as u64)], self.clone()))
+    }
+}
+
+impl<D: Element> FromArray for Vec<Vec<D>> {
+    type Elem = D;
+    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
+        let inner = self.first().map_or(0, Vec::len);
+        let mut flat = Vec::with_capacity(self.len() * inner);
+        for row in self {
+            if row.len() != inner {
+                return Err(ragged());
+            }
+            flat.extend_from_slice(row);
+        }
+        Ok((
+            vec![Dim::Const(self.len() as u64), Dim::Const(inner as u64)],
+            flat,
+        ))
+    }
+}
+
+impl<D: Element> FromArray for Vec<Vec<Vec<D>>> {
+    type Elem = D;
+    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
+        let mid = self.first().map_or(0, Vec::len);
+        let inner = self.first().and_then(|r| r.first()).map_or(0, Vec::len);
+        let mut flat = Vec::new();
+        for a in self {
+            if a.len() != mid {
+                return Err(ragged());
+            }
+            for b in a {
+                if b.len() != inner {
+                    return Err(ragged());
+                }
+                flat.extend_from_slice(b);
+            }
+        }
+        Ok((
+            vec![
+                Dim::Const(self.len() as u64),
+                Dim::Const(mid as u64),
+                Dim::Const(inner as u64),
+            ],
+            flat,
+        ))
+    }
+}
+
+impl<D: Element> FromArray for Vec<Vec<Vec<Vec<D>>>> {
+    type Elem = D;
+    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
+        let d1 = self.first().map_or(0, Vec::len);
+        let d2 = self.first().and_then(|a| a.first()).map_or(0, Vec::len);
+        let d3 = self
+            .first()
+            .and_then(|a| a.first())
+            .and_then(|b| b.first())
+            .map_or(0, Vec::len);
+        let mut flat = Vec::new();
+        for a in self {
+            if a.len() != d1 {
+                return Err(ragged());
+            }
+            for b in a {
+                if b.len() != d2 {
+                    return Err(ragged());
+                }
+                for c in b {
+                    if c.len() != d3 {
+                        return Err(ragged());
+                    }
+                    flat.extend_from_slice(c);
+                }
+            }
+        }
+        Ok((
+            vec![
+                Dim::Const(self.len() as u64),
+                Dim::Const(d1 as u64),
+                Dim::Const(d2 as u64),
+                Dim::Const(d3 as u64),
+            ],
+            flat,
+        ))
+    }
+}
+
+fn ragged() -> Error {
+    Error::Shape("nested input is ragged; every sibling must have the same length".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f32s(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+    fn u32s(bytes: &[u8]) -> Vec<u32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn arange_counts_up() {
+        let b = arange_bytes(Dtype::F32, 0.0, 4.0, 1.0).unwrap();
+        assert_eq!(f32s(&b), vec![0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn arange_counts_down_with_a_negative_step() {
+        let b = arange_bytes(Dtype::F32, 5.0, 0.0, -2.0).unwrap();
+        assert_eq!(f32s(&b), vec![5.0, 3.0, 1.0]);
+    }
+
+    #[test]
+    fn arange_row_offsets_for_gather_last() {
+        // rows = 3, width = 4 -> [0, 4, 8]
+        let b = arange_bytes(Dtype::U32, 0.0, 12.0, 4.0).unwrap();
+        assert_eq!(u32s(&b), vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn arange_is_empty_when_the_step_points_away() {
+        assert!(arange_bytes(Dtype::F32, 0.0, 4.0, -1.0).unwrap().is_empty());
+        assert!(arange_bytes(Dtype::F32, 4.0, 4.0, 1.0).unwrap().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "nonzero step")]
+    fn arange_rejects_a_zero_step() {
+        let _ = arange_bytes(Dtype::F32, 0.0, 4.0, 0.0);
+    }
+
+    #[test]
+    fn from_array_infers_the_shape_from_the_nesting() {
+        let (shape, flat) = [[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]].to_parts().unwrap();
+        assert_eq!(shape, vec![Dim::Const(3), Dim::Const(2)]);
+        assert_eq!(flat, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        let (shape, flat) = vec![vec![vec![1u32, 2]], vec![vec![3, 4]]]
+            .to_parts()
+            .unwrap();
+        assert_eq!(shape, vec![Dim::Const(2), Dim::Const(1), Dim::Const(2)]);
+        assert_eq!(flat, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn ragged_nesting_is_an_error() {
+        let v: Vec<Vec<f32>> = vec![vec![1.0, 2.0], vec![3.0]];
+        assert!(v.to_parts().is_err());
+    }
+
+    #[test]
+    fn byte_len_refuses_a_symbolic_shape() {
+        assert!(byte_len(Dtype::F32, &[Dim::Sym(SymId(0))]).is_err());
+        assert_eq!(byte_len(Dtype::F16, &[Dim::Const(3)]).unwrap(), 6);
+    }
+}

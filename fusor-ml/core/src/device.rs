@@ -905,6 +905,38 @@ mod dirty_buffer_tests {
     /// clone), reports it via `is_tracked` under the exact `(size, usage)`
     /// key only, and the allocation counters distinguish fresh creations
     /// from pool-cache hits.
+    /// Cycling through far more buffer shapes than the LRU holds must not
+    /// inflate `live_bytes`. Evicting a bucket drops every pool reference in
+    /// it, and if those bytes stay on the counter it becomes a ratchet: the
+    /// in-flight cap closes on memory freed long ago. Measured before the
+    /// fix, a training run died claiming 22.89 GB live against a 22.91 GB cap
+    /// with a resident set under half a gigabyte.
+    #[test]
+    fn evicting_buffer_buckets_releases_their_bytes() {
+        pollster::FutureExt::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+            let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+            // Distinct sizes so each takes its own bucket, several times over
+            // the cache capacity, with every buffer dropped immediately.
+            let shapes = 512u64;
+            let mut rounds = Vec::new();
+            for _ in 0..3 {
+                for shape in 0..shapes {
+                    drop(device.create_buffer(4096 + shape * 256, usage));
+                }
+                rounds.push(device.buffer_pool_counters().live_bytes);
+            }
+            // The counter may hold whatever the cache still retains, but it
+            // must not grow with the number of rounds.
+            assert!(
+                rounds[2] <= rounds[0] + rounds[0] / 4,
+                "live_bytes ratcheted across rounds: {rounds:?}"
+            );
+        });
+    }
+
     #[test]
     fn buffer_pool_tracking_and_counters() {
         pollster::FutureExt::block_on(async {

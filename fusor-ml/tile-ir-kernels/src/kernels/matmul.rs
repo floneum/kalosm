@@ -443,8 +443,20 @@ pub fn try_batched_coop_matmul_split_k(
 
     // The partials body always stages one pair. A split grid exists to raise
     // occupancy, and a second pair halves how many of its workgroups a core
-    // can hold: measured directly, double-buffering this loop costs 55% of
-    // wall time on 64x2048x256 at identical tile, splits and grid.
+    // can hold — 8504 B/workgroup against the 32 KB core pool is 3 slots, two
+    // pairs is 1 — which lands the grid under the ~4 workgroups/core knee
+    // where every component of a K iteration inflates at once.
+    //
+    // Re-measured on the merged production dispatches (one binary, one env
+    // switch, separate kernel caches, 23 interleaved rounds/arm) now that the
+    // scored split counts leave a span long enough to pipeline (wgrad
+    // splits=16 -> 8 K-iterations per workgroup, wgrad256/256m splits=8 -> 16):
+    // still a loss at every percentile, median +18.7% / +45.2% / +47.3%,
+    // p25 +19.4% / +1.9% / +22.2%, against untouched controls holding to
+    // +-1% (fwd +0.5%, softmax -0.3%). Utilization falls with it — wgrad
+    // 128.3 -> 108.1 GB/s, wgrad256 114.5 -> 78.9 — so the second pair is not
+    // buying overlap the grid could not already hide. Numerics are unaffected
+    // (bit-identical checksums), the depth is purely a residency trade.
     let buffers = 1;
     let a_tiles: Vec<_> = (0..buffers)
         .map(|_| program.alloc_workgroup_tile_padded(stage_scalar, bm, bk, 1))
@@ -800,45 +812,18 @@ pub fn try_merged_coop_matmul(
                             program.loop_range(k_pairs, |program, pair_idx| {
                                 let k_base_0 = pair_idx.clone() * (2 * bk);
                                 let k_base_1 = pair_idx * (2 * bk) + bk;
-                                coop_stage_and_mma(
+                                coop_k_pair(
                                     program,
                                     coop,
                                     a,
                                     b,
-                                    &a_tiles[0],
-                                    &b_tiles[0],
+                                    (&a_tiles[0], &b_tiles[0]),
+                                    (a_tile_1, b_tile_1),
                                     &a_batch_base,
                                     &b_batch_base,
                                     &row_base,
                                     pass_col_base,
                                     &k_base_0,
-                                    &sg_row_base,
-                                    &sg_col_base_in_pass,
-                                    &a_bounds,
-                                    &b_bounds,
-                                    accs,
-                                    tile_rows_per_sg,
-                                    tile_cols_per_sg,
-                                    bk,
-                                    COOP_DIM,
-                                    stage_scalar,
-                                    block,
-                                    bm,
-                                    bn_pass,
-                                    None,
-                                    None,
-                                );
-                                coop_stage_and_mma(
-                                    program,
-                                    coop,
-                                    a,
-                                    b,
-                                    a_tile_1,
-                                    b_tile_1,
-                                    &a_batch_base,
-                                    &b_batch_base,
-                                    &row_base,
-                                    pass_col_base,
                                     &k_base_1,
                                     &sg_row_base,
                                     &sg_col_base_in_pass,
@@ -1177,6 +1162,92 @@ fn coop_stage_and_mma(
             scalar,
         );
         coop_mma_grid(program, coop, accs, &a_frags, &b_frags);
+    }
+}
+
+/// One K-pair against the two workgroup tile sets, at two barriers per pair.
+///
+/// The halves alternate `stage; barrier; sweep`, so the second half's
+/// storage→workgroup copy issues while the first half's cooperative loads run,
+/// and the *next* pair's first barrier is what separates this pair's reads of a
+/// tile from the next pair's writes to it — no trailing barrier needed.
+///
+/// The alternative — stage both halves, one barrier, then both sweeps, with an
+/// explicit trailing barrier — puts twice as many device loads in flight per
+/// barrier at the same barrier count and the same footprint. It was built and
+/// measured against this shape (naga does sink all the MMAs past the trailing
+/// barrier, so register pressure is unchanged) and it LOSES: attn +3.4% and
+/// wgradbig +9.8% median on a steady machine where the untouched controls held
+/// to ±0.5%, and +9.1% / +11.1% on min-of-87 pooled across contention regimes.
+/// fwd256 gained ~9%, but not on any case whose workgroups outnumber the cores.
+/// Exposed device-load latency is only ~15% of a K iteration to begin with;
+/// batching the fills buys less than making the barrier wait for both fills
+/// costs, because that barrier is what gates the first half's MMAs.
+#[allow(clippy::too_many_arguments)]
+fn coop_k_pair(
+    program: &mut TileBlock<'_>,
+    coop: CoopMatrixToken,
+    a: &Storage,
+    b: &Storage,
+    tiles_0: (
+        &fusor_tile_ir::tile::WorkgroupTile,
+        &fusor_tile_ir::tile::WorkgroupTile,
+    ),
+    tiles_1: (
+        &fusor_tile_ir::tile::WorkgroupTile,
+        &fusor_tile_ir::tile::WorkgroupTile,
+    ),
+    a_batch_base: &Tile,
+    b_batch_base: &Tile,
+    row_base: &Tile,
+    pass_col_base: &Tile,
+    k_base_0: &Tile,
+    k_base_1: &Tile,
+    sg_row_base: &Tile,
+    sg_col_base_in_pass: &Tile,
+    a_bounds: &[Option<Tile>; 2],
+    b_bounds: &[Option<Tile>; 2],
+    accs: &[Vec<CoopAcc>],
+    tile_rows_per_sg: u32,
+    tile_cols_per_sg: u32,
+    bk: u32,
+    coop_dim: u32,
+    scalar: ScalarElement,
+    block: u32,
+    bm: u32,
+    bn_pass: u32,
+    pre_a: Option<&UnaryEpilogue>,
+    pre_b: Option<&UnaryEpilogue>,
+) {
+    for ((a_tile, b_tile), k_base) in [(tiles_0, k_base_0), (tiles_1, k_base_1)] {
+        coop_stage_and_mma(
+            program,
+            coop,
+            a,
+            b,
+            a_tile,
+            b_tile,
+            a_batch_base,
+            b_batch_base,
+            row_base,
+            pass_col_base,
+            k_base,
+            sg_row_base,
+            sg_col_base_in_pass,
+            a_bounds,
+            b_bounds,
+            accs,
+            tile_rows_per_sg,
+            tile_cols_per_sg,
+            bk,
+            coop_dim,
+            scalar,
+            block,
+            bm,
+            bn_pass,
+            pre_a,
+            pre_b,
+        );
     }
 }
 
@@ -1593,8 +1664,11 @@ fn batched_coop_matmul_perf(
 
     // +1 inner padding on workgroup tiles avoids Apple shared-memory bank
     // conflicts on the inner stride (matches `stride_a = block_k + 1` in
-    // `coop_gemm.rs`). Two A and two B tiles let the K loop issue both halves
-    // of a K-pair before barriering.
+    // `coop_gemm.rs`). Two A and two B tiles let the halves of a K-pair
+    // alternate, so each half barriers only against its own fill and the
+    // second half's fill overlaps the first half's cooperative loads. They do
+    // *not* both fill before one barrier — see [`coop_k_pair`], where that
+    // shape is measured and rejected.
     let a_tile_0 = program.alloc_workgroup_tile_padded(stage_scalar, bm, bk, 1);
     let a_tile_1 = program.alloc_workgroup_tile_padded(stage_scalar, bm, bk, 1);
     let b_tile_0 = program.alloc_workgroup_tile_padded(stage_scalar, bk, bn_pass, 1);
@@ -1655,52 +1729,20 @@ fn batched_coop_matmul_perf(
                         let k_base_0 = pair_idx.clone() * (2 * bk);
                         let k_base_1 = pair_idx * (2 * bk) + bk;
 
-                        // Two-barrier K-pair shape: the load into tile_1 happens
-                        // *after* the MMA from tile_0 so the compiler can overlap
-                        // the storage→workgroup copy with the running MMAs (they
-                        // touch disjoint workgroup memory). The barrier-2 of the
-                        // next iter gates this iter's MMA reads of tile_0/tile_1
-                        // against the next iter's writes to the same tiles.
-                        coop_stage_and_mma(
+                        // Two barriers per K-pair; `coop_k_pair` owns where they
+                        // fall and how the two halves interleave.
+                        coop_k_pair(
                             program,
                             coop,
                             a,
                             b,
-                            &a_tile_0,
-                            &b_tile_0,
+                            (&a_tile_0, &b_tile_0),
+                            (&a_tile_1, &b_tile_1),
                             &a_batch_base,
                             &b_batch_base,
                             &row_base,
                             pass_col_base,
                             &k_base_0,
-                            &sg_row_base,
-                            &sg_col_base_in_pass,
-                            &a_bounds,
-                            &b_bounds,
-                            accs,
-                            tile_rows_per_sg,
-                            tile_cols_per_sg,
-                            bk,
-                            COOP_DIM,
-                            stage_scalar,
-                            block,
-                            bm,
-                            bn_pass,
-                            epilogues.pre_a,
-                            epilogues.pre_b,
-                        );
-
-                        coop_stage_and_mma(
-                            program,
-                            coop,
-                            a,
-                            b,
-                            &a_tile_1,
-                            &b_tile_1,
-                            &a_batch_base,
-                            &b_batch_base,
-                            &row_base,
-                            pass_col_base,
                             &k_base_1,
                             &sg_row_base,
                             &sg_col_base_in_pass,
@@ -1718,10 +1760,6 @@ fn batched_coop_matmul_perf(
                             epilogues.pre_a,
                             epilogues.pre_b,
                         );
-                        // No trailing barrier: next iter writes to tile_0 first
-                        // (different from MMA-tile_1 reads above) — barrier-2 of
-                        // the next iter (after its load_0) transitively gates
-                        // any tile_1 races.
                     });
                 }
 

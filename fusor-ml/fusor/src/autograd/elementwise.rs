@@ -1052,3 +1052,79 @@ where
         Tensor::neg(self)
     }
 }
+
+#[cfg(test)]
+mod gelu_backward_tests {
+    use crate::autograd::{Graph, Tensor};
+    use crate::{Device, Tensor as RawTensor, ToVec};
+
+    /// Which primitive saturates and which overflows. `tanh` must return
+    /// +-1 for large arguments, and `gelu` must return `x` there; a
+    /// polyfilled `(e^x - e^-x) / (e^x + e^-x)` gives `inf / inf` instead.
+    #[test]
+    fn tanh_and_gelu_saturate_rather_than_overflow() {
+        let device = Device::gpu_blocking().unwrap_or_else(|_| Device::cpu());
+        let inputs: Vec<f32> = (0..60).map(|step| step as f32 * 4.0).collect();
+        let raw = RawTensor::from_slice(&device, [inputs.len()], &inputs);
+        let tanh = pollster::block_on(raw.clone().tanh().as_slice())
+            .unwrap()
+            .to_vec();
+        let gelu = pollster::block_on(raw.gelu().as_slice()).unwrap().to_vec();
+        let first_bad = |values: &[f32]| {
+            inputs
+                .iter()
+                .zip(values)
+                .find(|(_, value)| !value.is_finite())
+                .map(|(input, _)| *input)
+        };
+        assert_eq!(
+            (first_bad(&tanh), first_bad(&gelu)),
+            (None, None),
+            "tanh first non-finite at {:?}, gelu at {:?}",
+            first_bad(&tanh),
+            first_bad(&gelu)
+        );
+    }
+
+    /// `gelu`'s backward feeds `tanh` the value `0.798 * (x + 0.045 x^3)`,
+    /// which reaches 44 — where a fast-math `tanh` overflows to NaN — at
+    /// `x = 11`. A model whose activations touch 11 anywhere then poisons
+    /// every parameter one step later, since the global-norm clip turns one
+    /// `inf` into an all-NaN update. This sweeps the magnitudes a trained
+    /// model can actually produce.
+    ///
+    /// Above ~1e13 the derivative is still non-finite. That range needs
+    /// `x^2 > 1e26` and cannot arise from bounded weights, so it is left
+    /// alone rather than guarded speculatively.
+    #[test]
+    fn gelu_backward_is_finite_across_the_range() {
+        let device = Device::gpu_blocking().unwrap_or_else(|_| Device::cpu());
+        let mut inputs: Vec<f32> = Vec::new();
+        for exponent in -20i32..=12 {
+            let scale = 10f32.powi(exponent);
+            for step in 0..8 {
+                let value = scale * (1.0 + step as f32 / 8.0);
+                inputs.push(value);
+                inputs.push(-value);
+            }
+        }
+        inputs.push(0.0);
+        let graph = Graph::new();
+        let leaf = graph.leaf(RawTensor::from_slice(&device, [inputs.len()], &inputs));
+        let gradients = leaf.gelu().sum().backward().expect("gelu backward");
+        let derivative = gradients.get(&leaf).expect("no gelu gradient");
+        let values = pollster::block_on(derivative.as_slice()).unwrap().to_vec();
+        let bad: Vec<(f32, f32)> = inputs
+            .iter()
+            .zip(&values)
+            .filter(|(_, derivative)| !derivative.is_finite())
+            .map(|(input, derivative)| (*input, *derivative))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "gelu' is non-finite at {} inputs, e.g. {:?}",
+            bad.len(),
+            &bad[..bad.len().min(6)]
+        );
+    }
+}

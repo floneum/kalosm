@@ -671,6 +671,17 @@ impl ValueTile {
         }
     }
 
+    /// `tanh`, through the tile helper that clamps before the intrinsic —
+    /// Metal's fast-math `tanh` is `NaN` past |x| = 44 rather than saturating.
+    fn tanh(self) -> Self {
+        match self {
+            Self::F32(v) => Self::F32(v.tanh()),
+            Self::F16(v) => Self::F16(v.tanh()),
+            Self::U32(v) => Self::U32(v.tanh()),
+            Self::Bool(v) => Self::Bool(v.tanh()),
+        }
+    }
+
     fn unary(self, op: tile_ir::TileUnaryOp) -> Self {
         match self {
             Self::F32(v) => Self::F32(v.unary(op)),
@@ -1122,7 +1133,7 @@ fn emit_function(function: &NaryFunction, values: &mut [(ValueTile, DataTypeEnum
         NaryOp::Sin => values[0].0.clone().unary(tile_ir::TileUnaryOp::Sin),
         NaryOp::Cos => values[0].0.clone().unary(tile_ir::TileUnaryOp::Cos),
         NaryOp::Tan => values[0].0.clone().unary(tile_ir::TileUnaryOp::Tan),
-        NaryOp::Tanh => values[0].0.clone().unary(tile_ir::TileUnaryOp::Tanh),
+        NaryOp::Tanh => values[0].0.clone().tanh(),
         NaryOp::TanhExact => tanh_exact(values[0].0.clone()),
         NaryOp::Asin => values[0].0.clone().unary(tile_ir::TileUnaryOp::Asin),
         NaryOp::Acos => values[0].0.clone().unary(tile_ir::TileUnaryOp::Acos),

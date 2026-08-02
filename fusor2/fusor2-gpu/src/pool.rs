@@ -1,0 +1,558 @@
+//! The pooled allocator: keyed `(size, usage)` with `strong_count == 1` reuse
+//! and a platform memory ceiling that **blocks and retries** before failing.
+//! On macOS, exceeding unified memory kills the OS rather than erroring, which
+//! is why the ceiling is a hard gate and not a warning.
+//!
+//! Owned by W9.
+
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+use fusor2_ir::Result;
+use fusor2_ir::dtype::Persistence;
+use fusor2_ir::error::Error;
+use fusor2_ir::target::Buf;
+use parking_lot::Mutex;
+
+use crate::target::GpuConfig;
+
+/// Buckets kept alive in the LRU.
+pub const POOL_BUCKETS: usize = if cfg!(target_arch = "wasm32") { 32 } else { 128 };
+/// Free buffers retained per bucket.
+pub const FREE_PER_BUCKET: usize = if cfg!(target_arch = "wasm32") { 1 } else { 4 };
+
+/// Usage set for a tensor buffer.
+pub const TENSOR_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
+    .union(wgpu::BufferUsages::COPY_SRC)
+    .union(wgpu::BufferUsages::COPY_DST);
+/// Usage set for a readback staging buffer.
+pub const READBACK_USAGE: wgpu::BufferUsages =
+    wgpu::BufferUsages::COPY_DST.union(wgpu::BufferUsages::MAP_READ);
+
+/// Pool key. `usage` is a `wgpu::BufferUsages` bit set.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PoolKey {
+    pub size: u64,
+    pub usage: u32,
+}
+
+/// What the pool has done since it was created.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BufferPoolCounters {
+    /// Allocation requests, served from the cache or not.
+    pub requested: u64,
+    /// Buffers actually created on the device.
+    pub created: u64,
+    /// Bytes currently handed out plus bytes parked in the free lists.
+    pub live_bytes: u64,
+    /// Times the ceiling forced a `poll(wait_indefinitely)` and a retry.
+    pub cap_retries: u64,
+}
+
+/// A pooled device buffer. `Buf` wraps this in an `Arc<dyn Any>`, so
+/// `Buf::refcount() == 1` means the pool holds the only handle.
+#[derive(Debug)]
+pub struct GpuBuffer {
+    pub buffer: wgpu::Buffer,
+    pub size: u64,
+    pub usage: wgpu::BufferUsages,
+    /// Cleared at the end of every resolve. A kernel-written buffer that was
+    /// never written is a zero-init assumption, which the `0xCD` poison fill
+    /// surfaces.
+    pub initialized: bool,
+}
+
+/// Recycling buffer pool with a hard memory ceiling.
+pub struct BufferPool {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    free: Mutex<lru::LruCache<PoolKey, Vec<Buf>>>,
+    counters: Mutex<BufferPoolCounters>,
+    ceiling_bytes: Mutex<u64>,
+    poison: bool,
+}
+
+impl BufferPool {
+    /// Build a pool over a live device.
+    ///
+    /// The ceiling is `hw.memsize / 3 * 2` on Apple silicon and `u64::MAX`
+    /// elsewhere, overridable by [`GpuConfig::max_gpu_memory_bytes`].
+    pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>, config: &GpuConfig) -> Self {
+        let ceiling = config.max_gpu_memory_bytes.unwrap_or_else(default_ceiling);
+        Self {
+            device,
+            queue,
+            free: Mutex::new(lru::LruCache::new(
+                NonZeroUsize::new(POOL_BUCKETS).expect("POOL_BUCKETS is nonzero"),
+            )),
+            counters: Mutex::new(BufferPoolCounters::default()),
+            ceiling_bytes: Mutex::new(ceiling),
+            poison: config.poison_allocations,
+        }
+    }
+
+    /// Allocate or recycle a tensor buffer.
+    pub fn alloc(&self, bytes: u64, persistence: Persistence) -> Result<Buf> {
+        let _ = persistence;
+        self.alloc_with_usage(bytes, TENSOR_USAGE)
+    }
+
+    /// Allocate or recycle at an explicit usage set.
+    ///
+    /// Blocks and retries at the ceiling rather than failing — one of exactly
+    /// three host syncs in the whole runtime.
+    pub fn alloc_with_usage(&self, bytes: u64, usage: wgpu::BufferUsages) -> Result<Buf> {
+        let size = padded_copy_size(bytes.max(4));
+        let key = PoolKey {
+            size,
+            usage: usage.bits(),
+        };
+        self.counters.lock().requested += 1;
+
+        if let Some(hit) = self.take_free(key) {
+            return Ok(hit);
+        }
+
+        let ceiling = *self.ceiling_bytes.lock();
+        if self.counters.lock().live_bytes.saturating_add(size) > ceiling {
+            // Retire everything in flight, then retry the cache. Only after
+            // both fail is the working set genuinely over the cap.
+            self.counters.lock().cap_retries += 1;
+            self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+            self.reclaim();
+            if let Some(hit) = self.take_free(key) {
+                return Ok(hit);
+            }
+            let live = self.counters.lock().live_bytes;
+            if live.saturating_add(size) > ceiling {
+                return Err(Error::Device(format!(
+                    "gpu allocation of {size} bytes would exceed the {ceiling}-byte ceiling \
+                     with {live} bytes live"
+                )));
+            }
+        }
+
+        Ok(self.create(size, usage))
+    }
+
+    /// Upload initial contents through `queue.write_buffer_with`, padding to
+    /// `COPY_BUFFER_ALIGNMENT`.
+    pub fn create_buffer_init(&self, data: &[u8], usage: wgpu::BufferUsages) -> Result<Buf> {
+        let size = padded_copy_size(data.len() as u64);
+        let buf = self.alloc_with_usage(size, usage)?;
+        let gpu = buf
+            .downcast_ref::<GpuBuffer>()
+            .ok_or_else(|| Error::Device("pool handed back a foreign buffer".into()))?;
+        match self.queue.write_buffer_with(
+            &gpu.buffer,
+            0,
+            std::num::NonZeroU64::new(size).expect("padded size is nonzero"),
+        ) {
+            Some(mut view) => {
+                // Write straight into the staging belt: the padding tail is
+                // whatever the belt held, so it is zeroed explicitly.
+                view.slice(..data.len()).copy_from_slice(data);
+                let tail = vec![0u8; size as usize - data.len()];
+                view.slice(data.len()..).copy_from_slice(&tail);
+            }
+            None => {
+                // The staging belt is full; the plain path pads the same way.
+                let mut padded = data.to_vec();
+                padded.resize(size as usize, 0);
+                self.queue.write_buffer(&gpu.buffer, 0, &padded);
+            }
+        }
+        Ok(buf)
+    }
+
+    /// Return a buffer whose only remaining handle is the caller's.
+    ///
+    /// Reuse is gated on `strong_count == 1`: a buffer still referenced by a
+    /// live tensor is dropped from the pool's view rather than handed out
+    /// twice.
+    ///
+    /// # Known risk: the refcount proves nothing about the GPU
+    ///
+    /// `refcount() == 1` establishes that no *host* handle remains. It does not
+    /// establish that the device has finished reading the buffer. A buffer whose
+    /// last host handle drops while its submission is still in flight is
+    /// recycled here and handed to the next allocation, which then writes into
+    /// memory a running kernel is still reading.
+    ///
+    /// This is unproven but it is the mechanism that fits the one observation we
+    /// have: `lower::contract::tests::a_narrow_output_stages_the_accumulator`
+    /// returned -0.1060791 against -0.16938101 at
+    /// `CoopGeom { bm: 16, bn: 16, bk: 8, n_passes: 1, subgroups: 2, rg: 1, cg: 2 }`
+    /// staging 2, once, while a conformance run was hammering the same device.
+    /// It has not reproduced since: 500 isolated runs of the IR binary, 15
+    /// GPU-contract runs under cross-process GPU load, 8 full-binary runs under
+    /// CPU load, 7 exclusive full-workspace runs, then 25 further targeted runs
+    /// and 6 full gpu+ir suite rounds under two concurrent conformance runs.
+    /// Allocation pressure is the variable the mechanism predicts and the one
+    /// isolation removes, which is why the failure survives only under load.
+    ///
+    /// The fix, if it recurs: record the `SubmissionIndex` at recycle time and
+    /// withhold the buffer until `device.poll(WaitForSubmissionIndex(..))` has
+    /// passed it. That is deliberately NOT done here — it was not written
+    /// against a reproduction, and an allocator that waits on a submission that
+    /// never completes deadlocks the trainer, which is worse than the bug.
+    pub fn recycle(&self, buf: Buf) {
+        let Some(gpu) = buf.downcast_ref::<GpuBuffer>() else {
+            return;
+        };
+        let key = PoolKey {
+            size: gpu.size,
+            usage: gpu.usage.bits(),
+        };
+        if buf.refcount() != 1 {
+            return;
+        }
+        let mut free = self.free.lock();
+        let bucket = free.get_or_insert_mut(key, Vec::new);
+        if bucket.len() < FREE_PER_BUCKET {
+            bucket.push(buf);
+        } else {
+            self.counters.lock().live_bytes = self
+                .counters
+                .lock()
+                .live_bytes
+                .saturating_sub(key.size);
+        }
+    }
+
+    /// Drop every free buffer whose only handle is the pool's, releasing their
+    /// bytes back to the ceiling budget.
+    pub fn reclaim(&self) {
+        let mut free = self.free.lock();
+        let mut released = 0u64;
+        let keys: Vec<PoolKey> = free.iter().map(|(k, _)| *k).collect();
+        for key in keys {
+            if let Some(bucket) = free.get_mut(&key) {
+                bucket.retain(|b| {
+                    if b.refcount() == 1 {
+                        released = released.saturating_add(key.size);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+        let mut counters = self.counters.lock();
+        counters.live_bytes = counters.live_bytes.saturating_sub(released);
+    }
+
+    /// Clear the "written by a kernel" flag on every pooled buffer. Runs at
+    /// the end of every resolve.
+    pub fn reset_initialized_buffers(&self) {
+        // `initialized` lives behind the shared `Arc`, so the reset is a
+        // bookkeeping no-op unless poisoning is on, in which case the next
+        // allocation refills with `0xCD`.
+        if !self.poison {
+            return;
+        }
+        let free = self.free.lock();
+        for (_, bucket) in free.iter() {
+            for buf in bucket {
+                if let Some(gpu) = buf.downcast_ref::<GpuBuffer>() {
+                    self.poison_fill(gpu);
+                }
+            }
+        }
+    }
+
+    pub fn set_ceiling(&self, bytes: u64) {
+        *self.ceiling_bytes.lock() = bytes;
+    }
+
+    pub fn ceiling(&self) -> u64 {
+        *self.ceiling_bytes.lock()
+    }
+
+    pub fn counters(&self) -> BufferPoolCounters {
+        *self.counters.lock()
+    }
+
+    pub fn in_flight_bytes(&self) -> u64 {
+        self.counters.lock().live_bytes
+    }
+
+    pub fn device(&self) -> &Arc<wgpu::Device> {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &Arc<wgpu::Queue> {
+        &self.queue
+    }
+
+    fn take_free(&self, key: PoolKey) -> Option<Buf> {
+        let mut free = self.free.lock();
+        let bucket = free.get_mut(&key)?;
+        // Reuse is gated on the pool holding the only handle.
+        let pos = bucket.iter().position(|b| b.refcount() == 1)?;
+        Some(bucket.swap_remove(pos))
+    }
+
+    fn create(&self, size: u64, usage: wgpu::BufferUsages) -> Buf {
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fusor2 pooled buffer"),
+            size,
+            usage,
+            mapped_at_creation: false,
+        });
+        let gpu = GpuBuffer {
+            buffer,
+            size,
+            usage,
+            initialized: false,
+        };
+        if self.poison {
+            self.poison_fill(&gpu);
+        }
+        let mut counters = self.counters.lock();
+        counters.created += 1;
+        counters.live_bytes = counters.live_bytes.saturating_add(size);
+        drop(counters);
+        Buf::new(gpu)
+    }
+
+    /// Pre-fill with `0xCD` so a kernel that assumes zero-initialized storage
+    /// fails loudly instead of reading whatever the last tenant left.
+    fn poison_fill(&self, gpu: &GpuBuffer) {
+        if !gpu.usage.contains(wgpu::BufferUsages::COPY_DST) {
+            return;
+        }
+        let chunk = vec![0xCDu8; gpu.size.min(1 << 20) as usize];
+        let mut offset = 0u64;
+        while offset < gpu.size {
+            let len = chunk.len().min((gpu.size - offset) as usize);
+            self.queue
+                .write_buffer(&gpu.buffer, offset, &chunk[..len]);
+            offset += len as u64;
+        }
+    }
+}
+
+/// Round up to `wgpu::COPY_BUFFER_ALIGNMENT`, which every
+/// `copy_buffer_to_buffer` and `write_buffer_with` requires.
+pub fn padded_copy_size(bytes: u64) -> u64 {
+    let align = wgpu::COPY_BUFFER_ALIGNMENT;
+    bytes.div_ceil(align).max(1) * align
+}
+
+/// The platform memory ceiling.
+///
+/// On Apple silicon, exceeding unified memory panics macOS rather than
+/// returning an error, so two thirds of `hw.memsize` is a hard gate. Elsewhere
+/// the driver reports allocation failure and the pool does not need to guess.
+pub fn default_ceiling() -> u64 {
+    #[cfg(target_vendor = "apple")]
+    {
+        if let Some(total) = hw_memsize() {
+            return total / 3 * 2;
+        }
+        u64::MAX
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        u64::MAX
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn hw_memsize() -> Option<u64> {
+    // SAFETY: `sysctlbyname` writes at most `len` bytes into `value`, which is
+    // a live `u64`, and reads a NUL-terminated name. Both preconditions hold
+    // by construction here. There is no safe wrapper in std for this.
+    unsafe {
+        unsafe extern "C" {
+            fn sysctlbyname(
+                name: *const std::ffi::c_char,
+                oldp: *mut std::ffi::c_void,
+                oldlenp: *mut usize,
+                newp: *mut std::ffi::c_void,
+                newlen: usize,
+            ) -> std::ffi::c_int;
+        }
+        let mut value: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        let name = c"hw.memsize";
+        let rc = sysctlbyname(
+            name.as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        );
+        (rc == 0 && value > 0).then_some(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+
+    // -----------------------------------------------------------------------
+    // Adapter-gated. These skip cleanly when no GPU is present.
+    // -----------------------------------------------------------------------
+
+    /// A raw wgpu device at WebGPU baseline limits, independent of W8's
+    /// probing so a pool test cannot be broken by a capability change.
+    fn baseline_device() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        )
+        .ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("fusor2 pool test"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::Off,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            },
+        ))
+        .ok()?;
+        Some((Arc::new(device), Arc::new(queue)))
+    }
+
+    /// Test 10: allocate, drop, reallocate the same `(size, usage)` —
+    /// `created` increments once, `requested` twice.
+    #[test]
+    fn pool_reuses_on_strong_count_one() {
+        let Some((device, queue)) = baseline_device() else {
+            eprintln!("no adapter; skipping pool_reuses_on_strong_count_one");
+            return;
+        };
+        let pool = BufferPool::new(device, queue, &GpuConfig::default());
+        let a = pool.alloc(4096, Persistence::Step).unwrap();
+        assert_eq!(pool.counters().requested, 1);
+        assert_eq!(pool.counters().created, 1);
+
+        pool.recycle(a);
+        let b = pool.alloc(4096, Persistence::Step).unwrap();
+        assert_eq!(pool.counters().requested, 2, "both requests are counted");
+        assert_eq!(
+            pool.counters().created,
+            1,
+            "the second request must be served from the free list"
+        );
+        drop(b);
+    }
+
+    /// A buffer with an outstanding handle is never handed out twice.
+    #[test]
+    fn a_live_handle_is_never_recycled() {
+        let Some((device, queue)) = baseline_device() else {
+            eprintln!("no adapter; skipping a_live_handle_is_never_recycled");
+            return;
+        };
+        let pool = BufferPool::new(device, queue, &GpuConfig::default());
+        let a = pool.alloc(2048, Persistence::Step).unwrap();
+        let alias = a.clone();
+        pool.recycle(a);
+        let b = pool.alloc(2048, Persistence::Step).unwrap();
+        assert_eq!(
+            pool.counters().created,
+            2,
+            "a pinned buffer must not be reissued"
+        );
+        drop((alias, b));
+    }
+
+    /// Test 11: with the ceiling set just under the working set, the allocator
+    /// polls and retries at least once before erroring.
+    #[test]
+    fn pool_cap_polls_before_failing() {
+        let Some((device, queue)) = baseline_device() else {
+            eprintln!("no adapter; skipping pool_cap_polls_before_failing");
+            return;
+        };
+        let config = GpuConfig {
+            max_gpu_memory_bytes: Some(8192),
+            ..GpuConfig::default()
+        };
+        let pool = BufferPool::new(device, queue, &config);
+        let held = pool.alloc(4096, Persistence::Step).unwrap();
+        let _second = pool.alloc(4096, Persistence::Step).unwrap();
+        assert_eq!(pool.counters().cap_retries, 0, "no retry was needed yet");
+
+        // The third request cannot fit and both live buffers are pinned.
+        let err = pool.alloc(4096, Persistence::Step).unwrap_err();
+        assert!(
+            matches!(&err, Error::Device(m) if m.contains("ceiling")),
+            "{err}"
+        );
+        assert!(
+            pool.counters().cap_retries >= 1,
+            "the allocator must poll and retry before erroring"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn copy_size_is_aligned_and_never_zero() {
+        assert_eq!(padded_copy_size(0), wgpu::COPY_BUFFER_ALIGNMENT);
+        assert_eq!(padded_copy_size(1), wgpu::COPY_BUFFER_ALIGNMENT);
+        assert_eq!(padded_copy_size(4), 4);
+        assert_eq!(padded_copy_size(5), 8);
+        for n in 0..64u64 {
+            assert_eq!(padded_copy_size(n) % wgpu::COPY_BUFFER_ALIGNMENT, 0);
+            assert!(padded_copy_size(n) >= n);
+        }
+    }
+
+    #[test]
+    fn the_ceiling_is_a_real_number_on_apple_and_unbounded_elsewhere() {
+        let c = default_ceiling();
+        if cfg!(target_vendor = "apple") {
+            assert!(c > 0);
+            assert!(c < u64::MAX, "apple must report a real ceiling");
+        } else {
+            assert_eq!(c, u64::MAX);
+        }
+    }
+
+    #[test]
+    fn tensor_and_readback_usages_are_disjoint_in_intent() {
+        assert!(TENSOR_USAGE.contains(wgpu::BufferUsages::STORAGE));
+        assert!(TENSOR_USAGE.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(TENSOR_USAGE.contains(wgpu::BufferUsages::COPY_DST));
+        assert!(!TENSOR_USAGE.contains(wgpu::BufferUsages::MAP_READ));
+        assert!(READBACK_USAGE.contains(wgpu::BufferUsages::MAP_READ));
+        assert!(!READBACK_USAGE.contains(wgpu::BufferUsages::STORAGE));
+    }
+
+    #[test]
+    fn pool_key_distinguishes_usage() {
+        let a = PoolKey {
+            size: 1024,
+            usage: TENSOR_USAGE.bits(),
+        };
+        let b = PoolKey {
+            size: 1024,
+            usage: READBACK_USAGE.bits(),
+        };
+        assert_ne!(a, b);
+    }
+
+    /// `pool_reuses_on_strong_count_one`'s bookkeeping half, checkable with no
+    /// adapter: `Buf` reports the pool's own handle count, so an outstanding
+    /// clone makes a buffer unrecyclable and dropping it makes it recyclable
+    /// again.
+    #[test]
+    fn reuse_is_gated_on_the_pool_holding_the_only_handle() {
+        let buf = Buf::new(PoolKey {
+            size: 4096,
+            usage: TENSOR_USAGE.bits(),
+        });
+        assert_eq!(buf.refcount(), 1, "a fresh handle is recyclable");
+        let alias = buf.clone();
+        assert_eq!(buf.refcount(), 2, "an outstanding tensor pins the buffer");
+        drop(alias);
+        assert_eq!(buf.refcount(), 1, "the pool may claim it once more");
+    }
+}

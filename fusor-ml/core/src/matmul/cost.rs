@@ -401,7 +401,7 @@ pub(super) fn plan_coop_tile(
     // The kernels stage operand tiles in the storage element (`staging` stays
     // off in production paths).
     let stage = stage_element(datatype);
-    let mut best: Option<((u128, u32, Reverse<u32>, Reverse<u32>), CoopTile, u32, u32, u128)> = None;
+    let mut best: Option<((u128, u32, Reverse<u32>, Reverse<u32>), CoopTile, u32, u32)> = None;
     for entry in coop_tile_entries() {
         let (bm, bn, bk) = (entry.tile.bm, entry.tile.bn, entry.tile.bk);
         if entry.single_buffered {
@@ -444,30 +444,44 @@ pub(super) fn plan_coop_tile(
         // grid — and the recorded sweeps say fewer passes wins at every
         // measured shape, so it leads the tie-break. The two Reverse levels
         // reproduce the previous selector's tie-breaks and are reached.
-        let key = (score, entry.n_passes, Reverse(bm), Reverse(bn));
+        // A tile that wastes more than a quarter of its work on padding is
+        // not a candidate — a truly degenerate (gemv-shaped) contraction is
+        // one where *no* tile clears the bar, and that is the routing signal
+        // this function returns `None` for. Screening each candidate rather
+        // than vetoing the score winner matters: the table's narrow entries
+        // (16x64, 64x16) fit an M or N of 196 to within 6%, while the winner
+        // on score is a wide tile that pads it to 256 and trips the bar. The
+        // veto form declined those shapes outright, and since the dense
+        // selector commits to the cooperative family from device capability
+        // alone, "declined" meant the generic fused reduce — ~40x slower on
+        // exactly the conv-backward shapes that reach it.
+        //
+        // It compares against kernel families this model cannot cost, so it
+        // stays a guard rather than a term.
         let padded_macs = u128::from(m.div_ceil(bm))
             * u128::from(n.div_ceil(bn))
             * u128::from(batch)
             * u128::from(bm)
             * u128::from(bn)
             * u128::from(u64::from(k.div_ceil(bk)) * u64::from(bk));
+        let useful_macs = u128::from(m)
+            * u128::from(n)
+            * u128::from(batch)
+            * (u128::from(k.div_ceil(bk)) * u128::from(bk));
+        if padded_macs * 4 > useful_macs * 5 && std::env::var_os("FUSOR_OLD_PAD_GUARD").is_none() {
+            continue;
+        }
+        // The score is invariant to `n_passes` by construction — a p-pass
+        // profile does p times the per-workgroup work over a p-times-smaller
+        // grid — and the recorded sweeps say fewer passes wins at every
+        // measured shape, so it leads the tie-break. The two Reverse levels
+        // reproduce the previous selector's tie-breaks and are reached.
+        let key = (score, entry.n_passes, Reverse(bm), Reverse(bn));
         if best.as_ref().is_none_or(|(best_key, ..)| key < *best_key) {
-            best = Some((key, CoopTile::new(bm, bn, bk), rg, cg, padded_macs));
+            best = Some((key, CoopTile::new(bm, bn, bk), rg, cg));
         }
     }
-    let (_, tile, rg, cg, padded_macs) = best?;
-    // Even the best tile may waste more than a quarter of its work on padding
-    // — degenerate (gemv-shaped) contractions with a tiny M or N. Those belong
-    // to the vector/generic families; declining here is the routing signal.
-    // It compares against kernel families this model cannot cost, so it stays
-    // a guard rather than a term.
-    let useful_macs = u128::from(m)
-        * u128::from(n)
-        * u128::from(batch)
-        * (u128::from(k.div_ceil(tile.bk)) * u128::from(tile.bk));
-    if padded_macs * 4 > useful_macs * 5 {
-        return None;
-    }
+    let (_, tile, rg, cg) = best?;
     Some((tile, rg, cg))
 }
 

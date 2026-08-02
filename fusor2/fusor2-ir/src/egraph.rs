@@ -1,0 +1,527 @@
+//! The acyclic, append-only e-graph, the rule language and the saturation
+//! driver's contract.
+
+use crate::device::Caps;
+use crate::error::{Error, Result};
+use crate::facts::ValueFacts;
+use crate::ir::level0::L0;
+use crate::ir::level1::L1;
+use crate::ir::{Children, Level, Node, Op, OpTag, Semantics};
+use crate::shape::{StrideSpec, SymId};
+use fixedbitset::FixedBitSet;
+use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
+use std::fmt;
+use std::sync::Arc;
+
+/// An e-graph node id. Ids are dense and monotone: `children` may only hold
+/// ids strictly smaller than the node's own, and `union(a, b)` allocates an
+/// id greater than both — so acyclicity is a property of this allocator and
+/// no rule author can violate it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Id(pub u32);
+
+impl Id {
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl fmt::Display for Id {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "%{}", self.0)
+    }
+}
+
+/// An e-class handle: the id of the topmost `Op::Union` node containing a
+/// value, or the value's own id when it has no alternatives.
+///
+/// **This replaces the union-find handle.** There is no `UnionFind`, no
+/// rank, no path compression and no `rebuild()`. A class's identity is
+/// never a merge artifact, so max-rank can never stop preserving global
+/// acyclicity. The price, paid deliberately: **equality is not congruent** —
+/// unioning `a` and `b` does not union `f(a)` and `f(b)`. Alternatives are
+/// minted by rules *at the consumer*, and patterns may match a spine
+/// ([`Builder::trace_pure_views`]), which is what makes a consumer-rooted
+/// rewrite like `sink_epilogue` expressible with no multi-root rule form.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClassId(pub Id);
+
+/// Hash-cons key: the operator plus its canonicalized children. Commutative
+/// ops sort children by [`Id`] at construction, so associativity and
+/// commutativity are a canonical form, not a rule family.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NodeKey {
+    pub op: Op,
+    pub children: Children,
+}
+
+/// The e-graph: one node arena, one memo, one facts table, no union-find.
+pub struct EGraph {
+    nodes: Vec<Node>,
+    facts: Vec<ValueFacts>,
+    memo: FxHashMap<NodeKey, Id>,
+    parent: Vec<Option<Id>>,
+    defns: FixedBitSet,
+    roots: Vec<Id>,
+    next_sym: u32,
+    sem: Arc<dyn Semantics>,
+}
+
+impl EGraph {
+    pub fn new(sem: Arc<dyn Semantics>) -> Self {
+        Self {
+            nodes: Vec::new(),
+            facts: Vec::new(),
+            memo: FxHashMap::default(),
+            parent: Vec::new(),
+            defns: FixedBitSet::new(),
+            roots: Vec::new(),
+            next_sym: 0,
+            sem,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+    pub fn semantics(&self) -> &Arc<dyn Semantics> {
+        &self.sem
+    }
+    pub fn node(&self, id: Id) -> &Node {
+        &self.nodes[id.index()]
+    }
+    pub fn facts(&self, id: Id) -> &ValueFacts {
+        &self.facts[id.index()]
+    }
+    pub fn level(&self, id: Id) -> Level {
+        self.nodes[id.index()].level
+    }
+    /// Extraction roots: the loss plus every requested parameter gradient.
+    pub fn roots(&self) -> &[Id] {
+        &self.roots
+    }
+    pub fn add_root(&mut self, id: Id) {
+        if !self.roots.contains(&id) {
+            self.roots.push(id);
+        }
+    }
+    /// Mark an id as a macro op's definitional expansion. Sugar and its
+    /// `defn` are unioned at construction, so there is nothing to
+    /// recognize; a `defn` node is never evicted.
+    pub fn mark_defn(&mut self, id: Id) {
+        self.defns.grow(self.nodes.len());
+        self.defns.insert(id.index());
+    }
+    pub fn is_defn(&self, id: Id) -> bool {
+        self.defns.contains(id.index())
+    }
+
+    pub fn fresh_sym(&mut self) -> SymId {
+        let s = SymId(self.next_sym);
+        self.next_sym += 1;
+        s
+    }
+
+    /// Add a node, hash-consing on canonicalized children. Returns the
+    /// existing id on a memo hit.
+    pub fn add(&mut self, op: Op) -> Result<Id> {
+        let mut children = self.sem.children(&op);
+        canonicalize(&op, &mut children);
+        let next = Id(self.nodes.len() as u32);
+        if let Some(bad) = children.iter().find(|c| c.0 >= next.0) {
+            return Err(Error::verify_global(
+                Level::L0,
+                format!("child {bad} is not strictly smaller than {next}"),
+            ));
+        }
+        let key = NodeKey {
+            op: op.clone(),
+            children: children.clone(),
+        };
+        if let Some(&hit) = self.memo.get(&key) {
+            return Ok(hit);
+        }
+        let ins: SmallVec<[ValueFacts; 4]> = children
+            .iter()
+            .map(|c| self.facts[c.index()].clone())
+            .collect();
+        let facts = match &op {
+            Op::Union(a, _) => self.facts[a.index()].clone(),
+            other => self.sem.infer(other, &ins)?,
+        };
+        let level = match &op {
+            Op::Union(a, _) => self.nodes[a.index()].level,
+            other => other.level().expect("non-union ops carry a level"),
+        };
+        self.nodes.push(Node {
+            op,
+            level,
+            children,
+        });
+        self.facts.push(facts);
+        self.parent.push(None);
+        self.memo.insert(key, next);
+        Ok(next)
+    }
+
+    /// Assert `a` and `b` are equal by allocating a `Union` above the
+    /// *roots* of both chains. Rooting keeps a class complete: unioning `a`
+    /// with `b` and later `a` with `d` must leave one class `{a, b, d}`.
+    pub fn union(&mut self, a: Id, b: Id) -> Result<Id> {
+        let (ra, rb) = (self.root_of(a), self.root_of(b));
+        if ra == rb {
+            return Ok(ra);
+        }
+        let (lo, hi) = if ra.0 < rb.0 { (ra, rb) } else { (rb, ra) };
+        let u = self.add(Op::Union(lo, hi))?;
+        self.parent[lo.index()] = Some(u);
+        self.parent[hi.index()] = Some(u);
+        Ok(u)
+    }
+
+    pub fn class_of(&self, id: Id) -> ClassId {
+        ClassId(self.root_of(id))
+    }
+
+    pub fn root_of(&self, id: Id) -> Id {
+        let mut cur = id;
+        while let Some(next) = self.parent[cur.index()] {
+            cur = next;
+        }
+        cur
+    }
+
+    pub fn chain(&self, id: Id) -> Vec<Id> {
+        self.members(self.class_of(id))
+    }
+
+    /// Every id that resolves to `class`, **including the `Union` spine**.
+    ///
+    /// [`members`](Self::members) answers "what may `sigma` select", so it
+    /// drops the `Union` nodes. A `Union` id is still a name a caller holds:
+    /// `macro_op` returns the id `union(defn, sugar)` produced, so the
+    /// `Tensor` the user reads back *is* the spine node. Anything keyed on
+    /// "this value" rather than "this candidate" has to use this.
+    pub fn class_ids(&self, class: ClassId) -> Vec<Id> {
+        let mut out = Vec::new();
+        let mut stack = vec![class.0];
+        while let Some(cur) = stack.pop() {
+            if out.contains(&cur) {
+                continue;
+            }
+            out.push(cur);
+            if let Op::Union(a, b) = self.nodes[cur.index()].op {
+                stack.push(b);
+                stack.push(a);
+            }
+        }
+        out
+    }
+
+    /// Every non-`Union` member of an e-class, in creation order.
+    pub fn members(&self, class: ClassId) -> Vec<Id> {
+        let mut out = Vec::new();
+        let mut stack = vec![class.0];
+        while let Some(cur) = stack.pop() {
+            match self.nodes[cur.index()].op {
+                Op::Union(a, b) => {
+                    stack.push(b);
+                    stack.push(a);
+                }
+                _ => {
+                    if !out.contains(&cur) {
+                        out.push(cur);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn builder<'a>(&'a mut self, caps: &'a Caps) -> Builder<'a> {
+        Builder { graph: self, caps }
+    }
+
+    /// The read-only legality view of `id`, as handed to a rule. The
+    /// returned [`Facts`] borrows **only** `caps`, never the graph, so a
+    /// driver can build it and then hand out a `&mut Builder` over the same
+    /// graph — that is what makes the four-argument [`RuleFn`] sound.
+    pub fn facts_view<'c>(&self, id: Id, caps: &'c Caps) -> Facts<'c> {
+        let node = &self.nodes[id.index()];
+        Facts {
+            caps,
+            level: node.level,
+            own: self.facts[id.index()].clone(),
+            operands: node
+                .children
+                .iter()
+                .map(|c| self.facts[c.index()].clone())
+                .collect(),
+        }
+    }
+}
+
+fn canonicalize(op: &Op, children: &mut Children) {
+    if let Op::Union(..) = op {
+        children.sort_unstable();
+    }
+}
+
+/// The write side of the e-graph, handed to a rule. Deliberately exposes
+/// **no** consumer counts, no liveness, no cost and no extraction state.
+/// Guards written against a `Builder` and a [`Facts`] can only encode
+/// legality; profitability lives in the cost model or nowhere. That
+/// restriction is enforced by this API surface, not by convention.
+pub struct Builder<'a> {
+    graph: &'a mut EGraph,
+    caps: &'a Caps,
+}
+
+impl<'a> Builder<'a> {
+    pub fn caps(&self) -> &Caps {
+        self.caps
+    }
+    pub fn node(&self, id: Id) -> &Node {
+        self.graph.node(id)
+    }
+    pub fn facts_of(&self, id: Id) -> &ValueFacts {
+        self.graph.facts(id)
+    }
+    pub fn level_of(&self, id: Id) -> Level {
+        self.graph.level(id)
+    }
+    pub fn add_l0(&mut self, op: L0) -> Result<Id> {
+        self.graph.add(Op::L0(op))
+    }
+    pub fn add_l1(&mut self, op: L1) -> Result<Id> {
+        self.graph.add(Op::L1(op))
+    }
+    pub fn add(&mut self, op: Op) -> Result<Id> {
+        self.graph.add(op)
+    }
+    pub fn union(&mut self, a: Id, b: Id) -> Result<Id> {
+        self.graph.union(a, b)
+    }
+    /// Mint a fresh symbolic dim (`fold_split`'s block count).
+    pub fn fresh_sym(&mut self) -> SymId {
+        self.graph.fresh_sym()
+    }
+    pub fn mark_defn(&mut self, id: Id) {
+        self.graph.mark_defn(id);
+    }
+
+    /// Walk a chain of pure `Restride` views down to their base. This is
+    /// what makes `sink_epilogue` — the reference's self-declared "single
+    /// clearest structural gap" — a single-rooted rule.
+    pub fn trace_pure_views(&self, mut v: Id) -> ViewSpine {
+        let mut views: SmallVec<[Id; 4]> = SmallVec::new();
+        loop {
+            match &self.graph.node(v).op {
+                Op::L0(L0::Restride { x, .. }) => {
+                    views.push(v);
+                    v = *x;
+                }
+                _ => break,
+            }
+        }
+        views.reverse();
+        ViewSpine { base: v, views }
+    }
+
+    /// The restride specs along a spine, outermost last.
+    pub fn spine_specs(&self, spine: &ViewSpine) -> SmallVec<[StrideSpec; 6]> {
+        let mut out: SmallVec<[StrideSpec; 6]> = SmallVec::new();
+        for id in &spine.views {
+            if let Op::L0(L0::Restride { specs, .. }) = &self.graph.node(*id).op {
+                out.extend(specs.iter().copied());
+            }
+        }
+        out
+    }
+}
+
+/// A chain of pure views over one base value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewSpine {
+    pub base: Id,
+    pub views: SmallVec<[Id; 4]>,
+}
+
+impl ViewSpine {
+    pub fn is_empty(&self) -> bool {
+        self.views.is_empty()
+    }
+}
+
+/// The read-only capability token a rule's guards see. Borrows only
+/// [`Caps`], never the graph, so a rule can hold it across a `&mut Builder`
+/// call. It exposes types, shapes, numerics and device caps and
+/// **structurally does not expose** consumer counts, liveness, cost or
+/// extraction state.
+pub struct Facts<'a> {
+    caps: &'a Caps,
+    level: Level,
+    own: ValueFacts,
+    operands: SmallVec<[ValueFacts; 4]>,
+}
+
+impl<'a> Facts<'a> {
+    pub fn caps(&self) -> &'a Caps {
+        self.caps
+    }
+    pub fn level(&self) -> Level {
+        self.level
+    }
+    pub fn own(&self) -> &ValueFacts {
+        &self.own
+    }
+    pub fn operand(&self, slot: usize) -> Option<&ValueFacts> {
+        self.operands.get(slot)
+    }
+    pub fn operands(&self) -> &[ValueFacts] {
+        &self.operands
+    }
+    pub fn numeric(&self, slot: usize) -> Option<crate::dtype::NumericContract> {
+        self.operands.get(slot).map(|f| f.numeric)
+    }
+    pub fn dim(&self, slot: usize, axis: usize) -> Option<crate::shape::Dim> {
+        self.operands.get(slot)?.shape.get(axis).copied()
+    }
+    pub fn dtype(&self, slot: usize) -> Option<crate::dtype::Dtype> {
+        self.operands.get(slot).map(|f| f.dtype)
+    }
+}
+
+/// Whether a rule adds an alternative or is guaranteed to descend a level.
+/// On budget exhaustion the driver offers only `StrictlyLowering` rules, so
+/// every chain still reaches a runnable plan — a degraded-but-valid plan,
+/// never a hard error.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RuleTag {
+    Additive,
+    StrictlyLowering,
+}
+
+/// A rewrite rule's body. The driver clones the node and builds [`Facts`]
+/// before calling, so the four parameters do not alias. `Some(id)` reports
+/// the id the rule unioned into the chain; `None` means it did not apply.
+pub type RuleFn = fn(&mut Builder<'_>, Id, &Node, &Facts<'_>) -> Option<Id>;
+
+/// One rewrite rule. **Rule order carries no semantics**; the fixed order
+/// in a `RULES: &[Rule]` exists only for reproducibility.
+#[derive(Copy, Clone)]
+pub struct Rule {
+    pub name: &'static str,
+    pub level: Level,
+    pub head: OpTag,
+    pub tag: RuleTag,
+    pub apply: RuleFn,
+}
+
+impl fmt::Debug for Rule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rule")
+            .field("name", &self.name)
+            .field("level", &self.level)
+            .field("head", &self.head)
+            .field("tag", &self.tag)
+            .finish()
+    }
+}
+
+/// Saturation limits. Exhausting any of them degrades to
+/// [`RuleTag::StrictlyLowering`]; it is never an error.
+///
+/// **Every term is a count, never a clock.** A wall-clock cutoff makes the
+/// set of alternatives — and therefore the extracted plan, and therefore the
+/// `PlanHash` the cross-process cache is keyed on — depend on how loaded the
+/// machine was. The shipped 2 ms deadline did bind: a five-line `rms_norm`
+/// truncated at 96 of its 134 nodes, at a different node each run.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SaturationBudget {
+    /// `MAX_NODES = node_slope * initial + node_slack`.
+    pub node_slope: u32,
+    pub node_slack: u32,
+    pub max_rounds: u32,
+    /// Rule bodies invoked. The `(rule, node)` fired set already bounds this
+    /// at `rules * nodes`; this is the term that keeps a pathological graph's
+    /// compile time bounded without reading a clock.
+    pub max_applications: u32,
+}
+
+impl Default for SaturationBudget {
+    /// The shipped budget: `8 * initial + 4096` nodes, 10 rounds, 200k rule
+    /// applications.
+    ///
+    /// 200k is ~40x the largest graph in the conformance suite and still
+    /// bounds a 3,000-node step graph's saturation, so in practice the node
+    /// ceiling and the round count are what bind.
+    ///
+    /// **10 rounds, not 6.** A round count bounds chain *depth*, and the
+    /// deepest chain in the suite is attention. Measured by A/B on
+    /// `attention_rope::*_defn_saturates`'s own gate, which is the only
+    /// honest instrument — the budget is what the gate reads: first
+    /// saturation is at 9 rounds (CPU, non-causal), 8 (CPU, causal), 7 (GPU,
+    /// non-causal) and 6 (GPU, causal), which is exactly why causal-on-GPU
+    /// was the one member of that quartet passing at 6. The other three were
+    /// not observing a slow saturation, they were observing a budget shorter
+    /// than the graph.
+    ///
+    /// The chain converges rather than diverges, so the deeper budget is a
+    /// fixpoint and not a longer walk: CPU non-causal reports 472 nodes at 7
+    /// rounds, 484 at 8 and a fixpoint at 9. Ten is the tightest value that
+    /// clears all four with a round of headroom.
+    ///
+    /// **Measured against the `splice` widening, and it is why that widening
+    /// is not landed.** With `fusion::splice` restating an absorbed producer's
+    /// operands over a promoted `space`, the CPU attention graph goes 472 ->
+    /// 1352 nodes and the fixpoint moves to 12 rounds, so this would have to
+    /// become 13. That cost is not the reason the widening was dropped — see
+    /// `fusor2-conformance::launch_counts` — but it is part of its price.
+    ///
+    /// Raising this moves extraction across the whole suite and `PlanHash` is
+    /// a golden, so it is not a knob to turn without re-running both
+    /// `fusor2-conformance` and `cargo test --workspace`.
+    fn default() -> Self {
+        Self {
+            node_slope: 8,
+            node_slack: 4096,
+            max_rounds: 10,
+            max_applications: 200_000,
+        }
+    }
+}
+
+/// What saturation did. Truncation is never silent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SaturationReport {
+    pub initial_nodes: usize,
+    pub final_nodes: usize,
+    pub rounds: u32,
+    /// Wall time. **Observability only** — nothing in the driver reads it,
+    /// so two runs of one graph report different micros and the same graph.
+    pub micros: u64,
+    /// Rule bodies invoked, against `SaturationBudget::max_applications`.
+    pub applications: u32,
+    pub saturated: bool,
+    /// Chains that stopped receiving additive alternatives because a budget
+    /// was hit. Reported to conformance.
+    pub truncated: Vec<Id>,
+    pub fired: Vec<(&'static str, u32)>,
+}
+
+/// The saturation driver. Object-safe. Implemented once in `fusor2-ir`;
+/// targets contribute rules, never a driver.
+pub trait Saturate: Send + Sync {
+    fn saturate(
+        &self,
+        graph: &mut EGraph,
+        caps: &Caps,
+        rules: &[Rule],
+        budget: SaturationBudget,
+    ) -> Result<SaturationReport>;
+}

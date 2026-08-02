@@ -1,0 +1,40 @@
+[package]
+name = "fusor2"
+description = "fusor2 user-facing facade: one runtime-rank Tensor, layers, Graph/Session, optimizers"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+fusor2-ir.workspace = true
+fusor2-tile.workspace = true
+fusor2-autograd.workspace = true
+fusor2-cost.workspace = true
+fusor2-gguf.workspace = true
+fusor2-gpu.workspace = true
+fusor2-cpu.workspace = true
+smallvec.workspace = true
+rustc-hash.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+parking_lot.workspace = true
+pollster.workspace = true
+
+[features]
+default = ["cpu", "gpu"]
+cpu = []
+gpu = []
+# Re-export the const-rank `tensor::typed::Tensor` and `device::Device` as the
+# crate-root `Tensor` and `Device` instead of the runtime-rank pair. Both views
+# are always compiled and always reachable by module path; this moves two
+# re-exports and nothing else. See the crate docs for why the two `Device::cpu`
+# signatures cannot be one item.
+#
+# NOT ADDITIVE: it changes two names rather than adding any, so
+# `--all-features` is not a valid configuration of this workspace (133 errors
+# in fusor2-conformance, measured). Enable it from the consumer that wants the
+# const-rank root and nowhere else.
+typed-api = []

@@ -377,7 +377,7 @@ pub(super) fn variant_cost(variant: &ExecutionVariant) -> GpuCost {
         ExecutionVariant::RowProgram(operation) => GpuCost {
             dispatches: 1,
             materialized_bytes: bytes(&operation.shape, operation.output_datatype),
-            work: elements(&operation.shape).saturating_mul(operation.steps.len() as u128),
+            work: elements(&operation.shape).saturating_mul(operation.work_units() as u128),
         },
         // Attention cannot size its own output: the shape lives on its Q
         // operand, so `traffic_cost` fills the write in from the dependency

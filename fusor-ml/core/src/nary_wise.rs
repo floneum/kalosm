@@ -272,6 +272,25 @@ impl NaryExpr {
             .all(|(i, idx)| matches!(idx, NaryExpr::DimIndex(d) if *d == i))
     }
 
+    /// Nodes in the tree, index expressions included.
+    ///
+    /// `NaryExpr` is a tree, not a DAG: every rewrite that substitutes a
+    /// producer into a consumer *copies* the producer once per read. A graph
+    /// whose nodes each feed two consumers therefore doubles the expression
+    /// per fusion step, so an unbounded rewrite chain is exponential in the
+    /// depth of the chain. Rewrites price themselves against this count.
+    pub(crate) fn node_count(&self) -> usize {
+        match self {
+            NaryExpr::Op { children, .. } => {
+                1 + children.iter().map(NaryExpr::node_count).sum::<usize>()
+            }
+            NaryExpr::IndexedInput { indices, .. } => {
+                1 + indices.iter().map(NaryExpr::node_count).sum::<usize>()
+            }
+            NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => 1,
+        }
+    }
+
     pub(crate) fn uses_input(&self, target_input_idx: usize) -> bool {
         match self {
             NaryExpr::Op { children, .. } => {

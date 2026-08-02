@@ -309,6 +309,7 @@ impl TileBlock<'_> {
         if group_size == 1 {
             return values.into_iter().map(|value| self.bind(value)).collect();
         }
+        let width = values.len();
         let scratch: Vec<_> = values
             .iter()
             .map(|value| {
@@ -327,24 +328,78 @@ impl TileBlock<'_> {
             self.store_workgroup(slot, lane.clone(), value);
         }
         self.workgroup_barrier();
-        let base = self.bind(lane / group_size * group_size);
-        let mut combined: Vec<Tile> = scratch
-            .iter()
-            .map(|slot| self.load_workgroup(slot, base.clone()))
-            .collect();
-        for index in 1..group_size {
-            let next: Vec<Tile> = scratch
+        let base = self.bind(lane.clone() / group_size * group_size);
+        if group_size.is_power_of_two() {
+            // Halving tree: `log2(group_size)` inlined copies of the combine
+            // instead of `group_size - 1`. That matters here in a way it does
+            // not for a closed operator — a carrier's combine can be a dozen
+            // transcendental ops per slot, and unrolling it 255 deep inside a
+            // streaming loop produces a shader no driver compiles usefully.
+            //
+            // Each round's write is guarded but its barrier is not, so the
+            // barrier stays workgroup-uniform.
+            let local = self.bind(lane % group_size);
+            let mut stride = group_size / 2;
+            while stride >= 1 {
+                let scratch = &scratch;
+                let (base, local) = (base.clone(), local.clone());
+                self.if_then(local.clone().lt(stride), |program| {
+                    let target = program.bind(base + local);
+                    // Bind before combining and again before storing: the
+                    // results go back into the very arrays the other slots'
+                    // bodies read, so an unbound load would be re-evaluated
+                    // *after* a sibling slot had overwritten it.
+                    let acc: Vec<Tile> = scratch
+                        .iter()
+                        .map(|slot| {
+                            let value = program.load_workgroup(slot, target.clone());
+                            program.bind(value)
+                        })
+                        .collect();
+                    let incoming: Vec<Tile> = scratch
+                        .iter()
+                        .map(|slot| {
+                            let value = program.load_workgroup(slot, target.clone() + stride);
+                            program.bind(value)
+                        })
+                        .collect();
+                    let next = combine(program, acc, incoming);
+                    assert_eq!(next.len(), width, "joint combine changed the carrier width");
+                    let next: Vec<Tile> =
+                        next.into_iter().map(|value| program.bind(value)).collect();
+                    for (slot, value) in scratch.iter().zip(next) {
+                        program.store_workgroup(slot, target.clone(), value);
+                    }
+                });
+                self.workgroup_barrier();
+                stride /= 2;
+            }
+        } else {
+            // No halving tree without a power-of-two group: every lane folds
+            // its own group's slice left to right.
+            let mut combined: Vec<Tile> = scratch
                 .iter()
-                .map(|slot| self.load_workgroup(slot, base.clone() + index))
+                .map(|slot| self.load_workgroup(slot, base.clone()))
                 .collect();
-            combined = combine(self, combined, next);
-            assert_eq!(
-                combined.len(),
-                scratch.len(),
-                "joint combine returned the wrong carrier width"
-            );
+            for index in 1..group_size {
+                let next: Vec<Tile> = scratch
+                    .iter()
+                    .map(|slot| self.load_workgroup(slot, base.clone() + index))
+                    .collect();
+                combined = combine(self, combined, next);
+                assert_eq!(combined.len(), width, "joint combine changed the carrier width");
+            }
+            return combined.into_iter().map(|value| self.bind(value)).collect();
         }
-        combined.into_iter().map(|value| self.bind(value)).collect()
+        // Every lane leaves holding the group's combined carrier — the same
+        // broadcast contract as `group_reduce`.
+        scratch
+            .iter()
+            .map(|slot| {
+                let value = self.load_workgroup(slot, base.clone());
+                self.bind(value)
+            })
+            .collect()
     }
 
     fn reduce(&mut self, op: TileReduceOp, value: Tile) -> Tile {

@@ -655,11 +655,14 @@ pub(crate) fn online_softmax_carrier(
         binary(NaryOp::Sub, x, new_max.clone(), datatype),
         datatype,
     );
-    let step_slot = |k: usize| {
+    // Slot 1 accumulates the weights themselves (the normalizer); slot 2
+    // accumulates the weighted element. Giving both the same body would make
+    // `acc2 / acc1` identically one, which is a carrier that proves nothing.
+    let step_slot = |k: usize, contribution: NaryExpr| {
         binary(
             NaryOp::Add,
             binary(NaryOp::Mul, acc(base, k), rescale.clone(), datatype),
-            weight.clone(),
+            contribution,
             datatype,
         )
     };
@@ -695,6 +698,7 @@ pub(crate) fn online_softmax_carrier(
     FoldOperation {
         inputs,
         expression,
+        element_fold: None,
         shape,
         axis,
         carrier: vec![
@@ -707,9 +711,17 @@ pub(crate) fn online_softmax_carrier(
             NaryExpr::Scalar(zero),
             NaryExpr::Scalar(zero),
         ],
-        step: vec![new_max, step_slot(1), step_slot(2)],
+        step: vec![
+            new_max,
+            step_slot(1, weight.clone()),
+            step_slot(
+                2,
+                binary(NaryOp::Mul, weight.clone(), element(base, width), datatype),
+            ),
+        ],
         combine: vec![joined_max.clone(), combine_slot(1), combine_slot(2)],
         outputs: vec![
+            // The softmax-weighted mean of the element.
             FoldOutput {
                 expression: binary(NaryOp::Div, acc(base, 2), acc(base, 1), datatype),
                 datatype,
@@ -725,6 +737,115 @@ pub(crate) fn online_softmax_carrier(
                 datatype,
             },
         ],
+        algebra: FoldAlgebra::RescalingMonoid,
+        block: None,
+        element_is_carrier: false,
+    }
+}
+
+/// The carrier streaming attention folds over the key/value axis: the running
+/// score maximum, the softmax normalizer, and the unnormalized `Σ p·v`
+/// accumulator — a *vector* over the head dimension.
+///
+/// This is [`online_softmax_carrier`] with two things it cannot express:
+///
+/// - the element is itself a fold (the `q·k` dot over the head dim), and
+/// - the third slot ranges over a free dimension and absorbs its own tensor
+///   read (`v` at the key position and the free coordinate), while the first
+///   two stay scalar.
+///
+/// Stating those in the carrier is what retires the hand-written streaming
+/// emitter: the recurrence, the rescale and the tile join all follow from
+/// `step` and `combine` rather than from a matcher over a fixed phase list.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn streaming_attention_carrier(
+    inputs: Vec<NodeIndex>,
+    score: ElementFold,
+    scaled: NaryExpr,
+    value: NaryExpr,
+    shape: Box<[usize]>,
+    axis: usize,
+    free_dim: usize,
+    max_identity: NaryScalar,
+    output_datatype: DataTypeEnum,
+) -> FoldOperation {
+    // Softmax statistics accumulate in f32 whatever the tensors' wire type;
+    // only the finalized output is rounded back.
+    let datatype = DataTypeEnum::F32;
+    let base = inputs.len();
+    let width = 3;
+    let zero = NaryExpr::Scalar(NaryScalar::F32(0.0));
+    let x = element(base, width);
+    let v = slot_element(base, width);
+
+    let new_max = binary(NaryOp::Max, acc(base, 0), x.clone(), datatype);
+    let rescale = unary(
+        NaryOp::Exp,
+        binary(NaryOp::Sub, acc(base, 0), new_max.clone(), datatype),
+        datatype,
+    );
+    let weight = unary(
+        NaryOp::Exp,
+        binary(NaryOp::Sub, x, new_max.clone(), datatype),
+        datatype,
+    );
+    let absorb = |k: usize, contribution: NaryExpr| {
+        binary(
+            NaryOp::Add,
+            binary(NaryOp::Mul, acc(base, k), rescale.clone(), datatype),
+            contribution,
+            datatype,
+        )
+    };
+
+    let joined_max = binary(NaryOp::Max, acc(base, 0), rhs(base, width, 0), datatype);
+    let alpha = |source: NaryExpr| {
+        unary(
+            NaryOp::Exp,
+            binary(NaryOp::Sub, source, joined_max.clone(), datatype),
+            datatype,
+        )
+    };
+    let join = |k: usize| {
+        binary(
+            NaryOp::Add,
+            binary(NaryOp::Mul, acc(base, k), alpha(acc(base, 0)), datatype),
+            binary(
+                NaryOp::Mul,
+                rhs(base, width, k),
+                alpha(rhs(base, width, 0)),
+                datatype,
+            ),
+            datatype,
+        )
+    };
+
+    FoldOperation {
+        inputs,
+        expression: scaled,
+        element_fold: Some(score),
+        shape,
+        axis,
+        carrier: vec![
+            CarrierSlot::new("max", datatype),
+            CarrierSlot::new("normalizer", datatype),
+            CarrierSlot::vector("accumulator", datatype, free_dim, value),
+        ],
+        init: vec![
+            NaryExpr::Scalar(max_identity),
+            zero.clone(),
+            zero,
+        ],
+        step: vec![
+            new_max,
+            absorb(1, weight.clone()),
+            absorb(2, binary(NaryOp::Mul, weight, v, datatype)),
+        ],
+        combine: vec![joined_max.clone(), join(1), join(2)],
+        outputs: vec![FoldOutput {
+            expression: binary(NaryOp::Div, acc(base, 2), acc(base, 1), datatype),
+            datatype: output_datatype,
+        }],
         algebra: FoldAlgebra::RescalingMonoid,
         block: None,
         element_is_carrier: false,
@@ -770,6 +891,15 @@ pub(crate) fn welford_carrier(
 
     // combine: the pairwise Chan-Golub-LeVeque update.
     let n_total = binary(NaryOp::Add, acc(base, 0), rhs(base, width, 0), datatype);
+    // Joining two empty partials leaves `n_total == 0`; clamping the divisor
+    // keeps the combine total (the numerators are zero there anyway) so a fold
+    // whose blocking leaves idle lanes does not manufacture NaNs.
+    let n_divisor = binary(
+        NaryOp::Max,
+        n_total.clone(),
+        NaryExpr::Scalar(NaryScalar::F32(1.0)),
+        datatype,
+    );
     let mean_delta = binary(NaryOp::Sub, rhs(base, width, 1), acc(base, 1), datatype);
     let mean_joined = binary(
         NaryOp::Add,
@@ -777,7 +907,7 @@ pub(crate) fn welford_carrier(
         binary(
             NaryOp::Mul,
             mean_delta.clone(),
-            binary(NaryOp::Div, rhs(base, width, 0), n_total.clone(), datatype),
+            binary(NaryOp::Div, rhs(base, width, 0), n_divisor.clone(), datatype),
             datatype,
         ),
         datatype,
@@ -791,7 +921,7 @@ pub(crate) fn welford_carrier(
             binary(
                 NaryOp::Div,
                 binary(NaryOp::Mul, acc(base, 0), rhs(base, width, 0), datatype),
-                n_total.clone(),
+                n_divisor,
                 datatype,
             ),
             datatype,
@@ -802,6 +932,7 @@ pub(crate) fn welford_carrier(
     FoldOperation {
         inputs,
         expression,
+        element_fold: None,
         shape,
         axis,
         carrier: vec![
@@ -974,6 +1105,166 @@ mod tests {
                 assert!((a - b).abs() < 1e-5, "factor {factor}: {whole:?} vs {split:?}");
             }
         }
+    }
+
+    /// One `step` for a free-dimension slot: bindings are
+    /// `[acc.., element, slot_element]`.
+    fn step_once_free(fold: &FoldOperation, acc: &[f32], value: f32, slot_value: f32) -> Vec<f32> {
+        let mut slots = acc.to_vec();
+        slots.push(value);
+        slots.push(slot_value);
+        fold.step.iter().map(|e| eval(e, &slots)).collect()
+    }
+
+    /// Run a carrier with one free-dimension slot the way the lowering does:
+    /// once per free coordinate, with the scalar slots recomputed alongside.
+    /// Returns `outputs[0]` per free coordinate.
+    fn run_whole_free(fold: &FoldOperation, elements: &[f32], values: &[Vec<f32>]) -> Vec<f32> {
+        let free = fold
+            .carrier
+            .iter()
+            .find_map(|slot| slot.free_dim)
+            .expect("a free-dimension slot");
+        (0..free)
+            .map(|d| {
+                let mut acc = init_carrier(fold);
+                for (j, &value) in elements.iter().enumerate() {
+                    acc = step_once_free(fold, &acc, value, values[j][d]);
+                }
+                eval(&fold.outputs[0].expression, &acc)
+            })
+            .collect()
+    }
+
+    /// The same fold blocked into runs of `factor`, joined by `combine`.
+    fn run_split_free(
+        fold: &FoldOperation,
+        elements: &[f32],
+        values: &[Vec<f32>],
+        factor: usize,
+    ) -> Vec<f32> {
+        let (partial, joiner) = fold
+            .split(factor, NumericsPolicy::RelativeErrorPermitted)
+            .expect("split");
+        let free = fold
+            .carrier
+            .iter()
+            .find_map(|slot| slot.free_dim)
+            .expect("a free-dimension slot");
+        (0..free)
+            .map(|d| {
+                let partials: Vec<Vec<f32>> = elements
+                    .chunks(factor)
+                    .enumerate()
+                    .map(|(block, chunk)| {
+                        let mut acc = init_carrier(&partial);
+                        for (offset, &value) in chunk.iter().enumerate() {
+                            let j = block * factor + offset;
+                            acc = step_once_free(&partial, &acc, value, values[j][d]);
+                        }
+                        acc
+                    })
+                    .collect();
+                let mut acc = init_carrier(&joiner);
+                for incoming in &partials {
+                    acc = combine_once(fold, &acc, incoming);
+                }
+                eval(&joiner.outputs[0].expression, &acc)
+            })
+            .collect()
+    }
+
+    fn reference_attention(elements: &[f32], values: &[Vec<f32>], free: usize) -> Vec<f32> {
+        let max = elements.iter().cloned().fold(f32::MIN, f32::max);
+        let weights: Vec<f32> = elements.iter().map(|x| (x - max).exp()).collect();
+        let total: f32 = weights.iter().sum();
+        (0..free)
+            .map(|d| {
+                weights
+                    .iter()
+                    .zip(values)
+                    .map(|(w, row)| w * row[d])
+                    .sum::<f32>()
+                    / total
+            })
+            .collect()
+    }
+
+    fn attention_fold(free: usize) -> FoldOperation {
+        let (inputs, expression, shape) = parts();
+        streaming_attention_carrier(
+            inputs,
+            ElementFold {
+                expression: expression.clone(),
+                len: 4,
+                function: crate::reduce::sum_fn(DataTypeEnum::F32),
+            },
+            expression,
+            NaryExpr::input(1, 3),
+            shape,
+            1,
+            free,
+            NaryScalar::F32(f32::MIN),
+            DataTypeEnum::F32,
+        )
+    }
+
+    #[test]
+    fn online_softmax_carrier_weights_the_element() {
+        let (inputs, expression, shape) = parts();
+        let fold = online_softmax_carrier(inputs, expression, shape, 1, DataTypeEnum::F32);
+        let data = vec![1.0, 3.0, 2.0, -4.0, 0.5, 8.0, 7.0, -2.0];
+        let max = data.iter().cloned().fold(f32::MIN, f32::max);
+        let weights: Vec<f32> = data.iter().map(|v| (v - max).exp()).collect();
+        let expected = weights.iter().zip(&data).map(|(w, v)| w * v).sum::<f32>()
+            / weights.iter().sum::<f32>();
+
+        let whole = run_whole(&fold, &data);
+        // Not identically one: slots 1 and 2 must accumulate different things.
+        assert!(
+            (whole[0] - expected).abs() < 1e-4,
+            "weighted mean {whole:?} vs {expected}"
+        );
+        assert!((whole[0] - 1.0).abs() > 1e-3, "carrier is degenerate");
+    }
+
+    #[test]
+    fn streaming_attention_carrier_matches_reference_attention() {
+        let free = 3;
+        let fold = attention_fold(free);
+        fold.validate().unwrap();
+        assert!(fold.has_free_dim());
+        assert_eq!(fold.slot_offsets(), (vec![0, 1, 2], 2 + free));
+        assert_eq!(fold.output_free_dim(&fold.outputs[0]), Some(free));
+        assert_eq!(
+            fold.output_shape(&fold.outputs[0]),
+            vec![1, free],
+            "an output reading the accumulator gains its free dimension"
+        );
+
+        let elements = vec![1.0, 3.0, 2.0, -4.0, 0.5, 8.0, 7.0, -2.0];
+        let values: Vec<Vec<f32>> = (0..elements.len())
+            .map(|j| (0..free).map(|d| (j as f32) - 2.0 * (d as f32)).collect())
+            .collect();
+        let expected = reference_attention(&elements, &values, free);
+        let whole = run_whole_free(&fold, &elements, &values);
+        for (got, want) in whole.iter().zip(&expected) {
+            assert!((got - want).abs() < 1e-4, "{whole:?} vs {expected:?}");
+        }
+        for factor in [2usize, 4] {
+            let split = run_split_free(&fold, &elements, &values, factor);
+            for (got, want) in split.iter().zip(&expected) {
+                assert!(
+                    (got - want).abs() < 1e-4,
+                    "factor {factor}: {split:?} vs {expected:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_free_dimension_slot_has_no_reduce_form() {
+        assert!(attention_fold(3).to_reduce().is_none());
     }
 
     #[test]

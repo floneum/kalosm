@@ -1,0 +1,144 @@
+//! ISA and cache detection. The detected `Level` is cached in a `OnceLock` and
+//! dispatched **once per kernel launch**, not per row.
+//!
+//! Owned by W10.
+
+use fusor2_ir::device::{Caps, DeviceKind, Limits, SubgroupWidths};
+use smallvec::smallvec;
+use std::sync::OnceLock;
+
+pub use fearless_simd::Level;
+
+static LEVEL: OnceLock<Level> = OnceLock::new();
+static CAPS: OnceLock<Caps> = OnceLock::new();
+
+/// The cached ISA level. Detection runs once per process; `dispatch!` runs
+/// once per kernel launch, never per row.
+pub fn level() -> Level {
+    *LEVEL.get_or_init(Level::new)
+}
+
+/// A stable name for the detected level, used as `Caps::name`.
+pub fn level_name(level: Level) -> &'static str {
+    #[allow(unreachable_patterns)]
+    match level {
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon(_) => "cpu-neon",
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Level::Avx2(_) => "cpu-avx2",
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        Level::WasmSimd128(_) => "cpu-wasm-simd128",
+        _ => "cpu-fallback",
+    }
+}
+
+/// The natural machine vector width in f32 lanes for a level.
+///
+/// The emitter can instantiate 4, 8 and 16 regardless — the register type is a
+/// statically-sized array, so an `MxN` accumulator tile is expressible at every
+/// width. This is only the *preferred* width the cost model orders moves by.
+pub fn native_width(level: Level) -> u32 {
+    #[allow(unreachable_patterns)]
+    match level {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Level::Avx2(_) => 8,
+        _ => 4,
+    }
+}
+
+/// The widest lane count the emitter will instantiate. `Reduce{Subgroup}` is
+/// legal at this width and lowers to a horizontal reduce.
+pub const MAX_WIDTH: u32 = 16;
+
+/// Every width the emitter can instantiate, widest last.
+pub const WIDTHS: [u32; 3] = [4, 8, 16];
+
+/// CPU capability probe.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CpuCaps;
+
+impl CpuCaps {
+    /// SIMD widths the emitter may instantiate, thread count, and cache sizes,
+    /// mapped onto the shared [`Caps`] shape.
+    pub fn detect() -> Caps {
+        cpu_caps().clone()
+    }
+
+    /// Bytes of the last-level cache, feeding `DeviceFacts::llc_bytes`.
+    pub fn llc_bytes() -> u64 {
+        // No portable query exists. 8 MiB matches the Apple-silicon SLC slice a
+        // single core sees and is a middling x86 L3-per-core figure; the value
+        // is a *device fact*, so `fusor2-cost::calibrate` overwrites it with a
+        // measured number when calibration runs.
+        8 << 20
+    }
+
+    /// Available worker threads. 1 on wasm32.
+    pub fn threads() -> u32 {
+        #[cfg(target_arch = "wasm32")]
+        {
+            1
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
+        }
+    }
+}
+
+/// The CPU's [`Caps`]. Cached, because `Caps` owns a `String`.
+pub fn cpu_caps() -> &'static Caps {
+    CAPS.get_or_init(|| {
+        let lvl = level();
+        let w = MAX_WIDTH;
+        Caps {
+            kind: DeviceKind::Cpu,
+            name: level_name(lvl).to_string(),
+            limits: Limits {
+                max_compute_invocations_per_workgroup: 1024,
+                max_compute_workgroup_size: [1024, 1024, 64],
+                max_compute_workgroups_per_dimension: u32::MAX,
+                max_compute_workgroup_storage_size: 256 * 1024,
+                max_storage_buffers_per_shader_stage: 64,
+                max_storage_buffer_binding_size: u64::MAX,
+            },
+            // A "subgroup" on CPU is one SIMD register, so `Reduce{Subgroup}`
+            // is legal and lowers to a horizontal reduce. Fixed width, which
+            // is what every subgroup-size-aware kernel requires.
+            subgroups: Some(SubgroupWidths { min: w, max: w }),
+            f16: true,
+            bf16: true,
+            coop: smallvec![],
+            // No f32 atomics: this forces `ScatterMode::{WgPrivateMerge,
+            // SortSegment}` and makes `ScatterMode::Atomic` unreachable.
+            atomic_f32: false,
+            // Thread-local scratch aliases freely, so `ArenaMode::ByteArena` is
+            // always available and the arena separation predicate is trivially
+            // true.
+            workgroup_alias: true,
+            mixed_precision_coop_store: false,
+            pipeline_cache: false,
+            timestamp_query: false,
+            simd_widths: WIDTHS.iter().copied().collect(),
+            threads: CpuCaps::threads(),
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caps_are_stable_and_coherent() {
+        let c = cpu_caps();
+        assert_eq!(c.kind, DeviceKind::Cpu);
+        assert!(c.name.starts_with("cpu-"));
+        assert!(!c.atomic_f32, "atomic_f32 must be false so Atomic scatter is unreachable");
+        assert!(c.workgroup_alias);
+        assert!(c.coop.is_empty(), "Family::Coop must never be lowered on CPU");
+        assert!(c.subgroups.is_some_and(|s| s.is_fixed()));
+        assert_eq!(c.simd_widths.as_slice(), &WIDTHS);
+        assert!(c.threads >= 1);
+    }
+}

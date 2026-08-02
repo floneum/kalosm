@@ -190,9 +190,22 @@ impl Tile {
     pub fn log(self) -> Self {
         self.unary(TileUnaryOp::Log)
     }
-    /// Hyperbolic tangent.
+    /// Hyperbolic tangent, saturating rather than overflowing.
+    ///
+    /// Metal compiles with fast math, where `tanh` becomes an exp ratio —
+    /// `(e^2x - 1) / (e^2x + 1)`. Past `2x = 88` both halves are `inf` in
+    /// f32 and the result is `NaN`, where tanh has long since converged to
+    /// +-1. Measured: `tanh(48)` is non-finite on an M2, and that is enough
+    /// to poison a training run, since `gelu`'s analytic derivative feeds it
+    /// `0.798 * (x + 0.045 x^3)` and reaches 44 at `x = 11`.
+    ///
+    /// Clamping first costs one min and one max and changes no representable
+    /// result: `tanh(20)` is already exactly 1.0 in f32.
     pub fn tanh(self) -> Self {
-        self.unary(TileUnaryOp::Tanh)
+        const SATURATED: f32 = 20.0;
+        self.min(Self::f32(SATURATED))
+            .max(Self::f32(-SATURATED))
+            .unary(TileUnaryOp::Tanh)
     }
     /// Reciprocal square root.
     pub fn inverse_sqrt(self) -> Self {
