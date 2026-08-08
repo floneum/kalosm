@@ -58,9 +58,6 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Bump when the apt dependency list below changes so the next run
-  # rebuilds the apt archive instead of restoring a stale one.
-  APT_CACHE_VERSION: "v2"
 
 jobs:
   check:
@@ -72,10 +69,11 @@ jobs:
       # hashes the real `Cargo.lock`. Without it every job gets the same
       # toolchain-only key and clobbers the previous job's cache.
       - uses: actions/checkout@v6
-      - uses: awalsh128/cache-apt-pkgs-action@latest
-        with:
-          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
-          version: ${{ env.APT_CACHE_VERSION }}
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -116,10 +114,11 @@ jobs:
           sudo rm -rf /opt/ghc
           docker system prune -af || true
           df -h
-      - uses: awalsh128/cache-apt-pkgs-action@latest
-        with:
-          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev mesa-vulkan-drivers vulkan-tools
-          version: ${{ env.APT_CACHE_VERSION }}
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev mesa-vulkan-drivers vulkan-tools
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -180,10 +179,11 @@ jobs:
           sudo rm -rf /opt/ghc
           docker system prune -af || true
           df -h
-      - uses: awalsh128/cache-apt-pkgs-action@latest
-        with:
-          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
-          version: ${{ env.APT_CACHE_VERSION }}
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -211,10 +211,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
-      - uses: awalsh128/cache-apt-pkgs-action@latest
-        with:
-          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
-          version: ${{ env.APT_CACHE_VERSION }}
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
