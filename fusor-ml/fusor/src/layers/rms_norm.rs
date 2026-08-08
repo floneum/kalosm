@@ -98,6 +98,21 @@ where
     T: CastTo<f32> + CastTensor<f32>,
     f32: CastTo<T> + CastTensor<T>,
 {
+    /// Forward pass for 2D input with generic type.
+    /// Converts input to f32 for computation, then converts back.
+    pub fn forward_generic_2d<B>(&self, input: &Tensor<2, T, B>) -> Tensor<2, T>
+    where
+        B: Fusion<2, T>,
+    {
+        let input_f32 = input.cast::<f32>();
+        let weight_f32: Tensor<1, f32> = self.weight.cast();
+        let bias_f32: Option<Tensor<1, f32>> = self.bias.as_ref().map(|b| b.cast());
+
+        let result_f32 = input_f32.rms_norm_fused::<1, 1>(&weight_f32, bias_f32.as_ref(), self.eps);
+
+        result_f32.cast()
+    }
+
     /// Forward pass for 3D input with generic type.
     /// Converts input to f32 for computation, then converts back.
     pub fn forward_generic<B>(&self, input: &Tensor<3, T, B>) -> Tensor<3, T>

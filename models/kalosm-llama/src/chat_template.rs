@@ -1,6 +1,6 @@
-use std::fmt::Display;
+use std::{collections::BTreeMap, fmt::Display};
 
-use kalosm_language_model::{ChatMessage, ContentChunk};
+use kalosm_language_model::{ChatMessage, ContentChunk, MediaType};
 use minijinja::{context, Environment, ErrorKind, Value};
 use minijinja_contrib::pycompat;
 
@@ -11,11 +11,14 @@ use pretty_assertions::assert_eq;
 
 pub(crate) struct HuggingFaceChatTemplate {
     environment: Environment<'static>,
+    enable_thinking_by_default: bool,
 }
 
 impl HuggingFaceChatTemplate {
     pub(crate) fn create(chat_template: impl Display) -> Result<Self, minijinja::Error> {
         let chat_template = chat_template.to_string();
+        let enable_thinking_by_default =
+            chat_template.contains("enable_thinking") && chat_template.contains("<|think|>");
         let mut environment = Environment::new();
 
         // enable python compatibility methods because most models are tested with python
@@ -40,7 +43,10 @@ impl HuggingFaceChatTemplate {
         // compile the template expression in the environment
         environment.add_template_owned("main", chat_template)?;
 
-        Ok(Self { environment })
+        Ok(Self {
+            environment,
+            enable_thinking_by_default,
+        })
     }
 
     pub(crate) fn format(
@@ -64,11 +70,17 @@ impl HuggingFaceChatTemplate {
                         .iter()
                         .map(|chunk| match chunk {
                             ContentChunk::Text(text) => {
-                                context! { text }
+                                chunk_context([("type", "text"), ("text", text)])
                             }
-                            ContentChunk::Media(_) => {
-                                context! { image => "" }
-                            }
+                            ContentChunk::Media(media) => match media.media_type() {
+                                MediaType::Image => {
+                                    chunk_context([("type", "image"), ("image", "")])
+                                }
+                                MediaType::Video => {
+                                    chunk_context([("type", "video"), ("video", "")])
+                                }
+                                _ => chunk_context([("type", "media")]),
+                            },
                         })
                         .collect::<Vec<_>>();
                     chunks.into()
@@ -76,11 +88,16 @@ impl HuggingFaceChatTemplate {
                 context! { role, content }
             })
             .collect::<Vec<_>>();
-        let ctx = context! { bos_token, eos_token, messages, add_generation_prompt, tools };
+        let enable_thinking = self.enable_thinking_by_default;
+        let ctx = context! { bos_token, eos_token, messages, add_generation_prompt, tools, enable_thinking };
         let template = self.environment.get_template("main")?;
         let result = template.render(&ctx)?;
         Ok(result)
     }
+}
+
+fn chunk_context<const N: usize>(entries: [(&str, &str); N]) -> Value {
+    Value::from_serialize(BTreeMap::from(entries))
 }
 
 #[test]
@@ -235,6 +252,49 @@ I'm doing great. How can I help you today?<|im_end|>
 <|im_start|>user
 I'd like to show off how chat templating works!<|vision_start|><|image_pad|><|vision_end|><|im_end|>
 "#
+    );
+}
+
+#[test]
+fn test_gemma_vl_chat_template_media_type() {
+    use kalosm_language_model::{MediaChunk, MediaSource};
+
+    let template = "{% for message in messages %}{% for item in message['content'] %}{% if item['type'] == 'image' %}<|image|>{% elif item['type'] == 'text' %}{{ item['text'] }}{% endif %}{% endfor %}{% endfor %}";
+    let template = HuggingFaceChatTemplate::create(template).unwrap();
+    let inputs = [ChatMessage::new(
+        MessageType::UserMessage,
+        (
+            MediaChunk::new(
+                MediaSource::url("https://example.com/image.png"),
+                kalosm_language_model::MediaType::Image,
+            ),
+            "Describe this image.",
+        ),
+    )];
+    let result = template.format("<bos>", "<eos>", &inputs, false).unwrap();
+    assert_eq!(result, "<|image|>Describe this image.");
+}
+
+#[test]
+fn test_gemma_4_chat_template_enables_thinking() {
+    use kalosm_language_model::{MediaChunk, MediaSource};
+
+    let template = "{{- bos_token -}}{%- if enable_thinking is defined and enable_thinking -%}{{- '<|turn>system\n<|think|>\n<turn|>\n' -}}{%- endif -%}{%- for message in messages -%}{{- '<|turn>' + message['role'] + '\n' -}}{%- for item in message['content'] -%}{%- if item['type'] == 'image' -%}{{- '<|image|>' -}}{%- elif item['type'] == 'text' -%}{{- item['text'] | trim -}}{%- endif -%}{%- endfor -%}{{- '<turn|>\n' -}}{%- endfor -%}{%- if add_generation_prompt -%}{{- '<|turn>model\n' -}}{%- endif -%}";
+    let template = HuggingFaceChatTemplate::create(template).unwrap();
+    let inputs = [ChatMessage::new(
+        MessageType::UserMessage,
+        (
+            MediaChunk::new(
+                MediaSource::url("https://example.com/image.png"),
+                kalosm_language_model::MediaType::Image,
+            ),
+            "Describe this image.",
+        ),
+    )];
+    let result = template.format("<bos>", "<eos>", &inputs, true).unwrap();
+    assert_eq!(
+        result,
+        "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\n<|image|>Describe this image.<turn|>\n<|turn>model\n"
     );
 }
 

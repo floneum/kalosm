@@ -139,6 +139,19 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    pub(in crate::lower) fn q4_0_data_byte_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        match format {
+            GgmlQuantFormat::Q4_0 => Ok(4),
+            GgmlQuantFormat::Q4_0Native => Ok(2),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q4_0 data offset requires a Q4_0 format",
+            )),
+        }
+    }
+
     pub(in crate::lower) fn q4k_data_word_offset(
         &self,
         format: GgmlQuantFormat,

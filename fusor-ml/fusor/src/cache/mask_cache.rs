@@ -60,7 +60,12 @@ where
         } else {
             // Create the mask based on whether we have a sliding window
             let mask = if let Some(sliding_window_size) = sliding_window_size {
-                Self::create_sliding_window_mask(device, seq_len, sliding_window_size)
+                let mask = Self::create_sliding_window_mask(device, seq_len, sliding_window_size);
+                if seq_len <= sliding_window_size {
+                    mask.mark_strict_causal()
+                } else {
+                    mask
+                }
             } else {
                 AttentionMask::causal(device, seq_len)
             };

@@ -24,7 +24,13 @@ impl LlamaCache {
         let max_seq_len = config.context_length;
         let mut blocks = Vec::with_capacity(config.n_layer);
         for layer_idx in 0..config.n_layer {
-            let max_seq_len = if let (Some(sliding_window_type), Some(sliding_window_size)) =
+            let max_seq_len = if let Some(layer_window_size) = config
+                .layer_sliding_window_sizes
+                .as_ref()
+                .and_then(|sizes| sizes.get(layer_idx).copied().flatten())
+            {
+                layer_window_size
+            } else if let (Some(sliding_window_type), Some(sliding_window_size)) =
                 (config.sliding_window_type, config.sliding_window_size)
             {
                 let is_sliding = (layer_idx + 1) % sliding_window_type != 0;

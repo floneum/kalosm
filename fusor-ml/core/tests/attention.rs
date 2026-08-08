@@ -9,6 +9,15 @@ fn values(len: usize, scale: f32) -> Vec<f32> {
     (0..len).map(|i| ((i as f32) * scale).sin()).collect()
 }
 
+fn high_variance_values(len: usize, scale: f32) -> Vec<f32> {
+    (0..len)
+        .map(|i| {
+            let x = i as f32;
+            ((x * 0.173).sin() * 1.7 + (x * 0.071).cos() * 0.9) * scale
+        })
+        .collect()
+}
+
 struct AttentionCase {
     batch: usize,
     heads: usize,
@@ -81,6 +90,24 @@ fn cpu_attention(
 }
 
 fn check_attention(case: AttentionCase, tolerance: f32) {
+    check_attention_with_scale(case, tolerance, None);
+}
+
+fn check_attention_with_scale(case: AttentionCase, tolerance: f32, scale_override: Option<f32>) {
+    check_attention_impl(case, tolerance, scale_override, false, false);
+}
+
+fn check_attention_full_high_variance(case: AttentionCase, tolerance: f32, scale_override: f32) {
+    check_attention_impl(case, tolerance, Some(scale_override), true, true);
+}
+
+fn check_attention_impl(
+    case: AttentionCase,
+    tolerance: f32,
+    scale_override: Option<f32>,
+    full_compare: bool,
+    high_variance: bool,
+) {
     pollster::block_on(async {
         let Ok(device) = Device::new().await else {
             return;
@@ -95,15 +122,27 @@ fn check_attention(case: AttentionCase, tolerance: f32) {
             causal,
             masked,
         } = case;
-        let q_data = values(batch * heads * q_len * head_dim, 0.13);
-        let k_data = values(batch * kv_heads * kv_len * head_dim, 0.07);
-        let v_data = values(batch * kv_heads * kv_len * head_dim, 0.11);
+        let q_data = if high_variance {
+            high_variance_values(batch * heads * q_len * head_dim, 1.0)
+        } else {
+            values(batch * heads * q_len * head_dim, 0.13)
+        };
+        let k_data = if high_variance {
+            high_variance_values(batch * kv_heads * kv_len * head_dim, 0.8)
+        } else {
+            values(batch * kv_heads * kv_len * head_dim, 0.07)
+        };
+        let v_data = if high_variance {
+            high_variance_values(batch * kv_heads * kv_len * head_dim, 1.1)
+        } else {
+            values(batch * kv_heads * kv_len * head_dim, 0.11)
+        };
         let mask_data = masked.then(|| {
             (0..q_len * kv_len)
                 .map(|i| if i % 7 == 0 { -1.5 } else { 0.25 })
                 .collect::<Vec<f32>>()
         });
-        let scale = 1.0 / (head_dim as f32).sqrt();
+        let scale = scale_override.unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
 
         let q = Tensor::from_slice(&device, [batch, heads, q_len, head_dim], &q_data);
         let k = Tensor::from_slice(&device, [batch, kv_heads, kv_len, head_dim], &k_data);
@@ -132,16 +171,44 @@ fn check_attention(case: AttentionCase, tolerance: f32) {
             mask_data.as_deref(),
             scale,
         );
-        for b in 0..batch {
-            for h in [0, heads - 1] {
-                for qi in [0, q_len / 2, q_len - 1] {
-                    for d in [0, head_dim / 2, head_dim - 1] {
-                        let want = expected[((b * heads + h) * q_len + qi) * head_dim + d];
-                        let got = actual[[b, h, qi, d]];
-                        assert!(
-                            (got - want).abs() < tolerance,
-                            "b={b} h={h} q={qi} d={d}: got {got}, expected {want}"
-                        );
+        if full_compare {
+            let mut worst = 0.0f32;
+            let mut worst_index = (0, 0, 0, 0);
+            for b in 0..batch {
+                for h in 0..heads {
+                    for qi in 0..q_len {
+                        for d in 0..head_dim {
+                            let want = expected[((b * heads + h) * q_len + qi) * head_dim + d];
+                            let got = actual[[b, h, qi, d]];
+                            let err = (got - want).abs();
+                            if err > worst {
+                                worst = err;
+                                worst_index = (b, h, qi, d);
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(
+                worst < tolerance,
+                "worst attention diff {worst} at {worst_index:?}: got {}, expected {}, tolerance {tolerance}",
+                actual[[worst_index.0, worst_index.1, worst_index.2, worst_index.3]],
+                expected[((worst_index.0 * heads + worst_index.1) * q_len + worst_index.2)
+                    * head_dim
+                    + worst_index.3]
+            );
+        } else {
+            for b in 0..batch {
+                for h in [0, heads - 1] {
+                    for qi in [0, q_len / 2, q_len - 1] {
+                        for d in [0, head_dim / 2, head_dim - 1] {
+                            let want = expected[((b * heads + h) * q_len + qi) * head_dim + d];
+                            let got = actual[[b, h, qi, d]];
+                            assert!(
+                                (got - want).abs() < tolerance,
+                                "b={b} h={h} q={qi} d={d}: got {got}, expected {want}"
+                            );
+                        }
                     }
                 }
             }
@@ -222,6 +289,80 @@ fn attention_causal_prefill_streams_long_kv() {
 }
 
 #[test]
+fn attention_unmasked_prefill_streams_long_kv() {
+    // Gemma 4 vision uses full, non-causal image self-attention over thousands
+    // of patch tokens. This exercises the streaming row-program path without
+    // the causal axis bound.
+    check_attention(
+        AttentionCase {
+            batch: 1,
+            heads: 4,
+            kv_heads: 4,
+            q_len: 1024,
+            kv_len: 1024,
+            head_dim: 64,
+            causal: false,
+            masked: false,
+        },
+        1e-4,
+    );
+}
+
+#[test]
+fn attention_unmasked_prefill_streams_long_kv_scale_one() {
+    check_attention_full_high_variance(
+        AttentionCase {
+            batch: 1,
+            heads: 4,
+            kv_heads: 4,
+            q_len: 1024,
+            kv_len: 1024,
+            head_dim: 64,
+            causal: false,
+            masked: false,
+        },
+        3e-4,
+        1.0,
+    );
+}
+
+#[test]
+fn attention_unmasked_prefill_many_tiles_scale_one() {
+    check_attention_full_high_variance(
+        AttentionCase {
+            batch: 1,
+            heads: 2,
+            kv_heads: 2,
+            q_len: 384,
+            kv_len: 2304,
+            head_dim: 64,
+            causal: false,
+            masked: false,
+        },
+        3e-4,
+        1.0,
+    );
+}
+
+#[test]
+fn attention_masked_prefill_streams_long_kv_scale_one() {
+    check_attention_full_high_variance(
+        AttentionCase {
+            batch: 1,
+            heads: 4,
+            kv_heads: 4,
+            q_len: 512,
+            kv_len: 768,
+            head_dim: 64,
+            causal: false,
+            masked: true,
+        },
+        3e-4,
+        1.0,
+    );
+}
+
+#[test]
 fn attention_odd_sized_causal_prefill() {
     // Odd extents that don't align with any tile or bucket boundary.
     check_attention(
@@ -254,6 +395,113 @@ fn attention_masked_prefill() {
         },
         1e-4,
     );
+}
+
+#[test]
+fn attention_offset_causal_mask_prefill() {
+    check_offset_causal_mask_prefill(20, 280, 4, 4);
+}
+
+#[test]
+fn attention_offset_causal_mask_prefill_single_tile() {
+    check_offset_causal_mask_prefill(20, 256, 4, 4);
+}
+
+#[test]
+fn attention_offset_causal_mask_prefill_gqa() {
+    check_offset_causal_mask_prefill(20, 256, 8, 4);
+}
+
+fn check_offset_causal_mask_prefill(q_len: usize, kv_len: usize, heads: usize, kv_heads: usize) {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        let case = AttentionCase {
+            batch: 1,
+            heads,
+            kv_heads,
+            q_len,
+            kv_len,
+            head_dim: 64,
+            causal: false,
+            masked: true,
+        };
+        let q_data =
+            high_variance_values(case.batch * case.heads * case.q_len * case.head_dim, 1.0);
+        let k_data = high_variance_values(
+            case.batch * case.kv_heads * case.kv_len * case.head_dim,
+            0.8,
+        );
+        let v_data = high_variance_values(
+            case.batch * case.kv_heads * case.kv_len * case.head_dim,
+            1.1,
+        );
+        let prefix = case.kv_len - case.q_len;
+        let mask_data = (0..case.q_len * case.kv_len)
+            .map(|i| {
+                let q = i / case.kv_len;
+                let kv = i % case.kv_len;
+                if kv <= prefix + q {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                }
+            })
+            .collect::<Vec<f32>>();
+        let q = Tensor::from_slice(
+            &device,
+            [case.batch, case.heads, case.q_len, case.head_dim],
+            &q_data,
+        );
+        let k = Tensor::from_slice(
+            &device,
+            [case.batch, case.kv_heads, case.kv_len, case.head_dim],
+            &k_data,
+        );
+        let v = Tensor::from_slice(
+            &device,
+            [case.batch, case.kv_heads, case.kv_len, case.head_dim],
+            &v_data,
+        );
+        let mask = Tensor::from_slice(&device, [case.q_len, case.kv_len], &mask_data);
+        let scale = 1.0;
+
+        let out = q.flash_attention(&k, &v, scale, Some(&mask));
+        assert_eq!(
+            out.count_kernels_to_resolve(),
+            1,
+            "offset-causal mask attention should lower as one row-program kernel"
+        );
+        let actual = out.as_slice::<4, f32>().await.unwrap();
+        let expected = cpu_attention(&case, &q_data, &k_data, &v_data, Some(&mask_data), scale);
+        let mut worst = 0.0f32;
+        let mut worst_index = (0, 0, 0, 0);
+        for b in 0..case.batch {
+            for h in 0..case.heads {
+                for qi in 0..case.q_len {
+                    for d in 0..case.head_dim {
+                        let want =
+                            expected[((b * case.heads + h) * case.q_len + qi) * case.head_dim + d];
+                        let got = actual[[b, h, qi, d]];
+                        let err = (got - want).abs();
+                        if err > worst {
+                            worst = err;
+                            worst_index = (b, h, qi, d);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            worst < 3e-4,
+            "worst offset-causal attention diff {worst} at {worst_index:?}: got {}, expected {}",
+            actual[[worst_index.0, worst_index.1, worst_index.2, worst_index.3]],
+            expected[((worst_index.0 * case.heads + worst_index.1) * case.q_len + worst_index.2)
+                * case.head_dim
+                + worst_index.3]
+        );
+    });
 }
 
 #[test]

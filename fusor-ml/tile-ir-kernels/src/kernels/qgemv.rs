@@ -19,8 +19,9 @@ use fusor_tile_ir::tile::{range, Mask, Program, Storage, Tile, TileBlock};
 use fusor_tile_ir::{GgmlQuantFormat, QuantizedMatrix, TileLiteral};
 
 use crate::dispatch::{
-    q4k_default_large, q4k_default_mid, q4k_default_tall, q4k_large_override, q4k_mid_override,
-    q4k_tall_override, q6k_default_large, q6k_default_tall, q6k_large_override, q6k_tall_override,
+    q4_0_default, q4_0_override, q4_0_values_per_lane, q4k_default_large, q4k_default_mid,
+    q4k_default_tall, q4k_large_override, q4k_mid_override, q4k_tall_override, q6k_default_large,
+    q6k_default_tall, q6k_large_override, q6k_tall_override,
     qgemv_subgroups_per_workgroup_for_shape, QgemvShape, SubgroupConfig,
 };
 use crate::grid::{
@@ -216,19 +217,30 @@ pub(crate) fn qgemv_tile_with_epilogue(
             qgemv_shape(2, 4),
             16,
         ),
-        GgmlQuantFormat::Q4_0
-        | GgmlQuantFormat::Q4_0Native
-        | GgmlQuantFormat::Q4_1
-        | GgmlQuantFormat::Q5_1
-        | GgmlQuantFormat::Q2K => qgemv_perf_with_epilogue(
-            program,
-            tensors,
-            workgroups_x,
-            subgroups,
-            ep,
-            qgemv_shape(2, 4),
-            8,
-        ),
+        GgmlQuantFormat::Q4_0 | GgmlQuantFormat::Q4_0Native => {
+            let shape = q4_0_override(q4_0_default(b.rows, output_cols));
+            let values_per_lane = q4_0_values_per_lane(8);
+            qgemv_perf_with_epilogue(
+                program,
+                tensors,
+                workgroups_x,
+                subgroups,
+                ep,
+                shape,
+                values_per_lane,
+            )
+        }
+        GgmlQuantFormat::Q4_1 | GgmlQuantFormat::Q5_1 | GgmlQuantFormat::Q2K => {
+            qgemv_perf_with_epilogue(
+                program,
+                tensors,
+                workgroups_x,
+                subgroups,
+                ep,
+                qgemv_shape(2, 4),
+                8,
+            )
+        }
         GgmlQuantFormat::Q3K | GgmlQuantFormat::Q8K => qgemv_perf_with_epilogue(
             program,
             tensors,
@@ -334,6 +346,11 @@ fn select_qgemv_dot(
     q6k_vocab_f32_dot: bool,
 ) -> QgemvDot {
     if format.is_q8_0_family() && values_per_lane == 8 {
+        return QgemvDot::F32Vec;
+    }
+    if format.is_q4_0_family()
+        && (values_per_lane == 8 || values_per_lane == 16 || values_per_lane == 32)
+    {
         return QgemvDot::F32Vec;
     }
     if format.is_q4k_family()

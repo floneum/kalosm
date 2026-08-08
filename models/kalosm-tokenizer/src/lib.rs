@@ -57,6 +57,7 @@ pub struct FastBpe {
     byte_to_token: [u32; 256],
     all_bytes_present: bool,
     byte_token_mapping: ByteTokenMapping,
+    raw_utf8_initial_tokens: bool,
     token_bytes: FxHashMap<Vec<u8>, u32>,
     id_to_bytes: Vec<Option<Vec<u8>>>,
     merges: FxHashMap<PairKey, MergeRule>,
@@ -72,24 +73,75 @@ impl FastBpe {
         merges: impl IntoIterator<Item = String>,
         ignore_merges: bool,
     ) -> Result<Self, TokenizerError> {
+        Self::from_vocab_and_merges_with_decoder(
+            vocab,
+            merges,
+            ignore_merges,
+            TokenByteDecoder::ByteLevel,
+        )
+    }
+
+    /// Build a BPE tokenizer whose vocabulary tokens are raw UTF-8 strings.
+    ///
+    /// Some GGUF tokenizers, including Gemma 4, are BPE tokenizers but do not
+    /// use the GPT-2 byte-level character mapping. Their byte fallback tokens
+    /// are encoded as `<0xNN>` strings in the vocabulary.
+    pub fn from_raw_utf8_vocab_and_merges(
+        vocab: impl IntoIterator<Item = (String, u32)>,
+        merges: impl IntoIterator<Item = String>,
+        ignore_merges: bool,
+    ) -> Result<Self, TokenizerError> {
+        Self::from_vocab_and_merges_with_decoder(
+            vocab,
+            merges,
+            ignore_merges,
+            TokenByteDecoder::RawUtf8WithHexBytes,
+        )
+    }
+
+    fn from_vocab_and_merges_with_decoder(
+        vocab: impl IntoIterator<Item = (String, u32)>,
+        merges: impl IntoIterator<Item = String>,
+        ignore_merges: bool,
+        decoder: TokenByteDecoder,
+    ) -> Result<Self, TokenizerError> {
         let mut byte_to_token = [MISSING_BYTE_TOKEN; 256];
         let mut token_bytes = FxHashMap::default();
+        let mut token_byte_preference = FxHashMap::default();
+        let mut exact_token_ids = FxHashMap::default();
         let mut id_to_bytes = Vec::new();
+        let mut vocab = vocab.into_iter().collect::<Vec<_>>();
+        vocab.sort_unstable_by_key(|(_, id)| *id);
 
         for (token, id) in vocab {
-            let bytes = decode_token_bytes(&token);
+            let bytes = decoder.decode_token_bytes(&token);
+            let is_byte_fallback = decoder.is_byte_fallback_token(&token);
             if bytes.len() == 1 {
                 if id == MISSING_BYTE_TOKEN {
                     return Err(TokenizerError::ReservedByteTokenId(id));
                 }
-                byte_to_token[bytes[0] as usize] = id;
+                if decoder == TokenByteDecoder::RawUtf8WithHexBytes {
+                    if is_byte_fallback {
+                        byte_to_token[bytes[0] as usize] = id;
+                    }
+                } else {
+                    byte_to_token[bytes[0] as usize] = id;
+                }
             }
             let id = id as usize;
             if id >= id_to_bytes.len() {
                 id_to_bytes.resize(id + 1, None);
             }
             id_to_bytes[id] = Some(bytes.clone());
-            token_bytes.insert(bytes, id as u32);
+            exact_token_ids.insert(token, id as u32);
+            let preference = TokenBytePreference::new(is_byte_fallback, id as u32);
+            if token_byte_preference
+                .get(&bytes)
+                .is_none_or(|existing: &TokenBytePreference| preference < *existing)
+            {
+                token_byte_preference.insert(bytes.clone(), preference);
+                token_bytes.insert(bytes, id as u32);
+            }
         }
 
         let all_bytes_present = byte_to_token
@@ -100,7 +152,9 @@ impl FastBpe {
         let raw_merges = merges
             .into_iter()
             .enumerate()
-            .map(|(rank, merge)| parse_merge(rank as u32, &merge, &token_bytes))
+            .map(|(rank, merge)| {
+                parse_merge(rank as u32, &merge, &token_bytes, &exact_token_ids, decoder)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let merge_levels = assign_merge_levels(&raw_merges);
         let level_count = merge_levels
@@ -154,6 +208,7 @@ impl FastBpe {
             byte_to_token,
             all_bytes_present,
             byte_token_mapping,
+            raw_utf8_initial_tokens: decoder == TokenByteDecoder::RawUtf8WithHexBytes,
             token_bytes,
             id_to_bytes,
             merges: merges_by_pair,
@@ -271,6 +326,10 @@ impl FastBpe {
     }
 
     fn encode_bytes_into(&self, input: &[u8], out: &mut Vec<u32>) -> Result<(), TokenizerError> {
+        if self.raw_utf8_initial_tokens {
+            return self.encode_raw_utf8_chars_into(input, out);
+        }
+
         out.clear();
         out.resize(input.len(), 0);
 
@@ -283,6 +342,28 @@ impl FastBpe {
         Ok(())
     }
 
+    fn encode_raw_utf8_chars_into(
+        &self,
+        input: &[u8],
+        out: &mut Vec<u32>,
+    ) -> Result<(), TokenizerError> {
+        out.clear();
+        let text = std::str::from_utf8(input).map_err(|_| TokenizerError::InvalidUtf8)?;
+        out.reserve(text.len());
+        for ch in text.chars() {
+            let mut buf = [0; 4];
+            let bytes = ch.encode_utf8(&mut buf).as_bytes();
+            if let Some(token) = self.token_bytes.get(bytes) {
+                out.push(*token);
+            } else {
+                for byte in bytes {
+                    out.push(lookup_byte_token(&self.byte_to_token, *byte)?);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn encode_bytes_and_apply_single_merge(
         &self,
         input: &[u8],
@@ -291,6 +372,12 @@ impl FastBpe {
         right: u32,
         new_token: u32,
     ) -> Result<(), TokenizerError> {
+        if self.raw_utf8_initial_tokens {
+            self.encode_raw_utf8_chars_into(input, out)?;
+            apply_single_merge(out, left, right, new_token);
+            return Ok(());
+        }
+
         if self.all_bytes_present {
             self.encode_bytes_and_apply_single_merge_unchecked(input, out, left, right, new_token);
             Ok(())
@@ -457,6 +544,9 @@ pub enum TokenizerError {
     /// A byte was missing from the vocabulary.
     #[error("byte 0x{0:02x} is missing from the vocabulary")]
     MissingByteToken(u8),
+    /// Raw UTF-8 tokenization received invalid UTF-8.
+    #[error("raw UTF-8 input is invalid")]
+    InvalidUtf8,
 }
 
 #[inline(always)]
@@ -625,27 +715,52 @@ struct RawMerge {
     new_token: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct TokenBytePreference {
+    byte_fallback_rank: u8,
+    id: u32,
+}
+
+impl TokenBytePreference {
+    fn new(is_byte_fallback: bool, id: u32) -> Self {
+        Self {
+            byte_fallback_rank: u8::from(is_byte_fallback),
+            id,
+        }
+    }
+}
+
 fn parse_merge(
     rank: u32,
     merge: &str,
     token_bytes: &FxHashMap<Vec<u8>, u32>,
+    exact_token_ids: &FxHashMap<String, u32>,
+    decoder: TokenByteDecoder,
 ) -> Result<RawMerge, TokenizerError> {
-    let (left, right) = merge
-        .split_once(' ')
+    let split_at = merge
+        .char_indices()
+        .skip(1)
+        .find_map(|(index, ch)| (ch == ' ').then_some(index))
         .ok_or_else(|| TokenizerError::InvalidMerge(merge.to_owned()))?;
-    let left_bytes = decode_token_bytes(left);
-    let right_bytes = decode_token_bytes(right);
+    let left = &merge[..split_at];
+    let right = &merge[split_at + 1..];
+    let left_bytes = decoder.decode_token_bytes(left);
+    let right_bytes = decoder.decode_token_bytes(right);
     let new_bytes = left_bytes
         .iter()
         .chain(right_bytes.iter())
         .copied()
         .collect::<Vec<_>>();
 
-    let left = *token_bytes
-        .get(&left_bytes)
+    let left = exact_token_ids
+        .get(left)
+        .or_else(|| token_bytes.get(&left_bytes))
+        .copied()
         .ok_or_else(|| TokenizerError::MissingToken(left.to_owned()))?;
-    let right = *token_bytes
-        .get(&right_bytes)
+    let right = exact_token_ids
+        .get(right)
+        .or_else(|| token_bytes.get(&right_bytes))
+        .copied()
         .ok_or_else(|| TokenizerError::MissingToken(right.to_owned()))?;
     let new_token = *token_bytes
         .get(&new_bytes)
@@ -663,6 +778,25 @@ fn apply_greedy_merges(merges: &FxHashMap<PairKey, MergeRule>, tokens: &mut Vec<
         tokens[index] = new_token;
         tokens.remove(index + 1);
     }
+}
+
+fn apply_single_merge(tokens: &mut Vec<u32>, left: u32, right: u32, new_token: u32) {
+    let len = tokens.len();
+    let mut read = 0;
+    let mut write = 0;
+
+    while read < len {
+        if read + 1 < len && tokens[read] == left && tokens[read + 1] == right {
+            tokens[write] = new_token;
+            read += 2;
+        } else {
+            tokens[write] = tokens[read];
+            read += 1;
+        }
+        write += 1;
+    }
+
+    tokens.truncate(write);
 }
 
 fn rebuild_merge_candidates(
@@ -1381,6 +1515,59 @@ fn decode_token_bytes(token: &str) -> Vec<u8> {
     bytes
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TokenByteDecoder {
+    ByteLevel,
+    RawUtf8WithHexBytes,
+}
+
+impl TokenByteDecoder {
+    fn decode_token_bytes(self, token: &str) -> Vec<u8> {
+        match self {
+            Self::ByteLevel => decode_token_bytes(token),
+            Self::RawUtf8WithHexBytes => decode_raw_utf8_token_bytes(token),
+        }
+    }
+
+    fn is_byte_fallback_token(self, token: &str) -> bool {
+        self == Self::RawUtf8WithHexBytes && decode_raw_utf8_byte_fallback(token).is_some()
+    }
+}
+
+fn decode_raw_utf8_token_bytes(token: &str) -> Vec<u8> {
+    if let Some(byte) = decode_raw_utf8_byte_fallback(token) {
+        return vec![byte];
+    }
+
+    token.as_bytes().to_vec()
+}
+
+fn decode_raw_utf8_byte_fallback(token: &str) -> Option<u8> {
+    if token.len() == 6
+        && token.as_bytes()[0] == b'<'
+        && token.as_bytes()[1] == b'0'
+        && matches!(token.as_bytes()[2], b'x' | b'X')
+        && token.as_bytes()[5] == b'>'
+    {
+        if let (Some(high), Some(low)) = (
+            hex_value(token.as_bytes()[3]),
+            hex_value(token.as_bytes()[4]),
+        ) {
+            return Some((high << 4) | low);
+        }
+    }
+    None
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn byte_level_char_to_byte(ch: char) -> Option<u8> {
     let codepoint = ch as u32;
     if (33..=126).contains(&codepoint)
@@ -1472,6 +1659,46 @@ mod tests {
         assert_eq!(decode_token_bytes("Ġ"), b" ");
         assert_eq!(decode_token_bytes("Ċ"), b"\n");
         assert_eq!(decode_token_bytes("Ā"), &[0]);
+    }
+
+    #[test]
+    fn raw_utf8_hex_byte_tokens_decode_to_original_bytes() {
+        let vocab = [("<0x20>", 0), ("<0xC3>", 1), ("<0xA9>", 2), ("é", 3)]
+            .into_iter()
+            .map(|(token, id)| (token.to_owned(), id));
+        let tokenizer =
+            FastBpe::from_raw_utf8_vocab_and_merges(vocab, ["<0xC3> <0xA9>".to_owned()], false)
+                .unwrap();
+
+        assert_eq!(tokenizer.tokenize(" é".as_bytes()).unwrap(), vec![0, 3]);
+        assert_eq!(tokenizer.token_bytes(0), Some(b" ".as_slice()));
+        assert_eq!(tokenizer.token_bytes(3), Some("é".as_bytes()));
+    }
+
+    #[test]
+    fn raw_utf8_single_merge_fast_path_keeps_direct_char_tokens() {
+        let vocab = [
+            ("<0x20>", 0),
+            ("<0xC3>", 1),
+            ("<0xA9>", 2),
+            ("é", 3),
+            ("a", 4),
+            ("b", 5),
+            ("ab", 6),
+        ]
+        .into_iter()
+        .map(|(token, id)| (token.to_owned(), id));
+        let tokenizer =
+            FastBpe::from_raw_utf8_vocab_and_merges(vocab, ["a b".to_owned()], false).unwrap();
+
+        assert_eq!(
+            tokenizer.tokenize(" éab".as_bytes()).unwrap(),
+            vec![0, 3, 6]
+        );
+        assert_eq!(
+            tokenizer.tokenize(" éab".as_bytes()).unwrap(),
+            tokenizer.tokenize_reference(" éab".as_bytes()).unwrap()
+        );
     }
 
     #[test]

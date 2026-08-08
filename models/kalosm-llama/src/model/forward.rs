@@ -46,7 +46,11 @@ where
         };
         let token_start = trace_enabled.then(Instant::now);
         let build_start = trace_enabled.then(Instant::now);
-        let logits = model.forward(tokens, images, device, cache);
+        let logits = if !images.is_empty() && model.should_chunk_multimodal_prompt() {
+            model.forward_chunked_multimodal(tokens, images, device, cache)
+        } else {
+            model.forward(tokens, images, device, cache)
+        };
         if let Some(start) = build_start {
             tracing::info!(
                 "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",
@@ -229,7 +233,9 @@ where
             );
         }
 
-        if gpu_fused_logits_sampling_enabled() {
+        if gpu_fused_logits_sampling_enabled()
+            && (images.is_empty() || !model.should_chunk_multimodal_prompt())
+        {
             return Self::forward_sample_token_fused_logits(
                 ForwardInputs {
                     model,
@@ -327,6 +333,18 @@ where
             return Ok(None);
         }
 
+        if !images.is_empty() && model.should_chunk_multimodal_prompt() {
+            let logits = model.forward_chunked_multimodal(tokens, images, device, cache)?;
+            let logits: fusor::Tensor<1, f32> = logits.squeeze(0).cast();
+            return Self::forward_sample_token_pending_from_logits(
+                logits,
+                sampler,
+                previous_tokens,
+                None,
+                top_k,
+            );
+        }
+
         Self::forward_sample_token_pending_from_hidden(
             model.forward_last_hidden_f32(tokens, images, device, cache)?,
             model,
@@ -335,6 +353,37 @@ where
             None,
             top_k,
         )
+    }
+
+    fn forward_sample_token_pending_from_logits(
+        logits: fusor::Tensor<1, f32>,
+        sampler: &mut LlamaGpuSamplerState,
+        previous_tokens: Vec<u32>,
+        previous_gpu_token: Option<&fusor::GpuSampledToken>,
+        top_k: usize,
+    ) -> Result<Option<fusor::GpuSampledToken>, LlamaModelError> {
+        match sampler.config.sampling_strategy {
+            kalosm_language_model::SamplingStrategy::Mirostat2 => {
+                let params = sampler.mirostat_params(top_k);
+                let mirostat = sampler.mirostat.as_mut().ok_or_else(|| {
+                    LlamaModelError::SamplerError("missing Mirostat GPU sampler".into())
+                })?;
+                logits
+                    .sample_mirostat2_token_pending(
+                        mirostat,
+                        &previous_tokens,
+                        previous_gpu_token,
+                        params,
+                    )
+                    .map_err(LlamaModelError::from)
+            }
+            kalosm_language_model::SamplingStrategy::Standard => {
+                let params = sampler.standard_params(top_k);
+                logits
+                    .sample_standard_token_pending(&previous_tokens, previous_gpu_token, params)
+                    .map_err(LlamaModelError::from)
+            }
+        }
     }
 
     pub(crate) fn forward_sample_token_from_gpu_token_pending(
@@ -377,32 +426,14 @@ where
         previous_gpu_token: Option<&fusor::GpuSampledToken>,
         top_k: usize,
     ) -> Result<Option<fusor::GpuSampledToken>, LlamaModelError> {
-        let logits = hidden
-            .squeeze(0)
-            .to_concrete()
-            .q_mat_mul(model.output_matrix());
-        match sampler.config.sampling_strategy {
-            kalosm_language_model::SamplingStrategy::Mirostat2 => {
-                let params = sampler.mirostat_params(top_k);
-                let mirostat = sampler.mirostat.as_mut().ok_or_else(|| {
-                    LlamaModelError::SamplerError("missing Mirostat GPU sampler".into())
-                })?;
-                logits
-                    .sample_mirostat2_token_pending(
-                        mirostat,
-                        &previous_tokens,
-                        previous_gpu_token,
-                        params,
-                    )
-                    .map_err(LlamaModelError::from)
-            }
-            kalosm_language_model::SamplingStrategy::Standard => {
-                let params = sampler.standard_params(top_k);
-                logits
-                    .sample_standard_token_pending(&previous_tokens, previous_gpu_token, params)
-                    .map_err(LlamaModelError::from)
-            }
-        }
+        let logits = model.logits_from_hidden_f32(hidden.squeeze(0).to_concrete());
+        Self::forward_sample_token_pending_from_logits(
+            logits,
+            sampler,
+            previous_tokens,
+            previous_gpu_token,
+            top_k,
+        )
     }
 
     fn forward_sample_token_fused_logits<'a>(
@@ -443,10 +474,7 @@ where
             Ok(hidden) => hidden,
             Err(err) => return Box::pin(async move { Err(err.into()) }),
         };
-        let logits = hidden
-            .squeeze(0)
-            .to_concrete()
-            .q_mat_mul(model.output_matrix());
+        let logits = model.logits_from_hidden_f32(hidden.squeeze(0).to_concrete());
         let mut kernels = 0;
         if trace {
             if let Some(gpu_logits) = logits.as_gpu() {

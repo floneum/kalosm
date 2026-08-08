@@ -135,6 +135,9 @@ impl<'a> Lowerer<'a> {
                 let c = self.lower_expr_lane(expressions, block, col, spill_depth)?;
                 match packing {
                     QuantActivation::F32 => match (src.format, block_n) {
+                        (GgmlQuantFormat::Q4_0 | GgmlQuantFormat::Q4_0Native, 8 | 16 | 32) => {
+                            self.q4_0_f32_dot(expressions, src, k, c, &a_handles, block)
+                        }
                         (GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native, 8) => {
                             let a8 = Self::expect_dot8(&a_handles)?;
                             self.dequantize_q8_0_dot8(expressions, src, k, c, &a8, block)
@@ -147,7 +150,7 @@ impl<'a> Lowerer<'a> {
                             self.q4k_f32_dot(expressions, src, k, c, &a_handles, block)
                         }
                         _ => Err(LowerError::UnsupportedOperation(
-                            "f32 activation dot only supports Q8_0/Q6K dot8 or Q4K dot8/16/32",
+                            "f32 activation dot only supports Q4_0 dot8/16, Q8_0/Q6K dot8, or Q4K dot8/16/32",
                         )),
                     },
                     QuantActivation::Q8 => {
