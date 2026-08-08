@@ -258,4 +258,39 @@ fn main() {
         });
         row("attention_1x8x1024x64", &t);
     }
+
+    // ---- 7. quantized matmul, Q4K weights, LLM-decode shape ----
+    //
+    // The row this whole exercise is for. A quantized contraction used to be a
+    // separate `L1::KQContract` with no `family` field, so it could not reach
+    // the cooperative-matrix path at all — the path that took dense attention
+    // from 27.6 ms to 9.3 ms. With the decode moved into the coop staging fill
+    // it is an ordinary `KContract` whose operand happens to be `Dtype::Q(fmt)`.
+    {
+        use fusor2_ir::dtype::{QFmt, QLayout};
+        let fmt = QFmt::Q4K;
+        let be = fmt.block_elements() as u64;
+        let (k, n, m) = (be * 16, 4096u64, 256u64); // k=4096
+        let blocks = (k / be) * n;
+        let bytes = vec![0x11u8; (blocks * u64::from(fmt.block_bytes(QLayout::Native))) as usize];
+        let act = bytes_of(&make((m * k) as usize, 0.013, 0.5));
+        let t = time_it(&session, || {
+            let g = Graph::new(&session);
+            let w = g
+                .quantized(fmt, QLayout::Native, [Dim::Const(n), Dim::Const(k)], &bytes)
+                .map_err(|e| e.to_string())?;
+            let a = Tensor::from_slice(
+                g.handle(),
+                Dtype::F32,
+                &dims(&[m, k]),
+                &act,
+            )
+            .map_err(|e| e.to_string())?;
+            let y = a.matmul_t(&w).map_err(|e| e.to_string())?;
+            let s = y.sum(1).map_err(|e| e.to_string())?;
+            s.to_vec_f32().map_err(|e| e.to_string())?;
+            Ok(())
+        });
+        row("qmatmul_q4k_256x4096x4096", &t);
+    }
 }

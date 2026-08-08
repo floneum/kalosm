@@ -13,7 +13,7 @@
 //! Owned by W2.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
-use crate::ir::level1::{AccessPlan, L1, Operand};
+use crate::ir::level1::{AccessPlan, ContractSide, L1, Operand};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::shape::{AxisGroup, Layout, MultiFlattenMap, SubAxis};
@@ -163,8 +163,6 @@ pub fn operand_pack(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) ->
         k,
         batch,
         family,
-        pre_a,
-        pre_b,
         post,
         acc,
         a,
@@ -190,10 +188,19 @@ pub fn operand_pack(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) ->
             access: AccessPlan::Pack { into },
         })
     };
-    let (new_a, new_b) = match (repack(a), repack(rhs)) {
-        (Some(pa), _) => (pa, rhs.clone()),
-        (None, Some(pb)) => (a.clone(), pb),
-        (None, None) => return None,
+    // Each operand of a side is loaded through its own access plan, so packing
+    // one and aliasing its neighbour is sound. Exactly one alternative is
+    // minted per fire — the first packable operand in `children_of` order —
+    // and the rule being additive is what lets extraction see the rest.
+    let pack_first = |side: &ContractSide| -> Option<ContractSide> {
+        let (i, packed) = side.ops.iter().enumerate().find_map(|(i, o)| Some((i, repack(o)?)))?;
+        let mut out = side.clone();
+        out.ops[i] = packed;
+        Some(out)
+    };
+    let (new_a, new_b) = match pack_first(a) {
+        Some(pa) => (pa, rhs.clone()),
+        None => (a.clone(), pack_first(rhs)?),
     };
     let alt = b
         .add_l1(L1::KContract {
@@ -202,8 +209,6 @@ pub fn operand_pack(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) ->
             k: *k,
             batch: *batch,
             family: *family,
-            pre_a: pre_a.clone(),
-            pre_b: pre_b.clone(),
             post: post.clone(),
             acc: *acc,
             a: new_a,
@@ -334,7 +339,7 @@ mod tests {
         let Op::L1(L1::KContract { a, .. }) = &g.node(pack_alt).op else {
             panic!()
         };
-        assert!(matches!(a.access, AccessPlan::Pack { .. }));
+        assert!(matches!(a.primary().access, AccessPlan::Pack { .. }));
 
         // And the producer is one node, read two different ways.
         assert_eq!(g.node(alias_alt).children[0], src);

@@ -1,8 +1,7 @@
 //! The lowering rules that consult a schedule-domain generator: the four
 //! order-free contraction family rules plus `tile_contract` and
-//! `unfuse_coop_epilogue`, the four `Scatter` lowerings, the three gather
-//! lowerings, the ten quantized contraction rules, the two activation
-//! packings and `qrepack`.
+//! `unfuse_coop_epilogue`, the four `Scatter` lowerings, the two gather
+//! lowerings.
 //!
 //! `ShapeSelector`'s first-match ordering is structurally impossible here:
 //! all four families coexist in one chain and compete on cost. The
@@ -14,7 +13,6 @@
 
 pub mod contract;
 pub mod gather;
-pub mod quantized;
 pub mod scatter;
 
 use fusor2_ir::egraph::{Builder, Facts, Id, Rule, RuleTag};
@@ -241,28 +239,7 @@ pub static TILE_RULES: &[Rule] = &[
     // gather: three coexisting lowerings
     gather::GATHER_ROW_PER_GROUP,
     gather::GATHER_VECTORIZED,
-    gather::GATHER_QUANTIZED_ROWS,
-    // quantized: ten paths, two activation packings, one repack
-    quantized::QMM_Q5_SMALL_SINGLE_ROW,
-    quantized::QMM_SINGLE_ROW,
-    quantized::QMM_Q8_WIDE_64X128,
-    quantized::QMM_TILE_128X128,
-    quantized::QMM_TILE_128X64,
-    quantized::QMM_TILE_64X128,
-    quantized::QMM_TILE_64X64_CACHED,
-    quantized::QMM_TILE_64X32_Q4K,
-    quantized::QMM_TILE_64X64,
-    quantized::QMM_WORKGROUP,
-    quantized::QACT_F32,
-    quantized::QACT_Q8_DP4A,
-    quantized::QREPACK,
 ];
-
-/// The name every rule in [`TILE_RULES`] fires under, for the conformance
-/// harness.
-pub fn rule_names() -> impl Iterator<Item = &'static str> {
-    TILE_RULES.iter().map(|r| r.name)
-}
 
 /// The name `fusor2-tile`'s rule table has always been exported under.
 pub static SCHED_RULES: &[Rule] = TILE_RULES;
@@ -276,14 +253,14 @@ pub(crate) mod testing {
 
     use fusor2_ir::Result;
     use fusor2_ir::device::Caps;
-    use fusor2_ir::dtype::{Dtype, QFmt, QLayout};
+    use fusor2_ir::dtype::Dtype;
     use fusor2_ir::egraph::{EGraph, Id};
     use fusor2_ir::facts::{ValueFacts, Work};
     use fusor2_ir::ir::level0::{
         BufferId, EinSpec, L0, Label, LeafKind, ScatterCombine,
     };
     use fusor2_ir::ir::level1::{
-        Effect, Family, L1, Operand, ScheduleDomain,
+        ContractSide, Effect, Family, L1, Operand, ScheduleDomain,
     };
     use fusor2_ir::ir::{Children, Op, Semantics, VerifyCtx};
     use fusor2_ir::scalar::ScalarExpr;
@@ -322,8 +299,8 @@ pub(crate) mod testing {
                     | L1::KGather { ops, .. }
                     | L1::KScatter { ops, .. }
                     | L1::Ext { ops, .. } => ops_children(ops),
-                    L1::KContract { a, b, .. } | L1::KQContract { a, b, .. } => {
-                        smallvec![a.src, b.src]
+                    L1::KContract { a, b, .. } => {
+                        a.ops.iter().chain(b.ops.iter()).map(|o| o.src).collect()
                     }
                     L1::KRegion { members, .. } => members.iter().copied().collect(),
                     L1::KMerged(m) => m.segments().iter().copied().collect(),
@@ -409,7 +386,6 @@ pub(crate) mod testing {
                     L1::KContract {
                         m, n, batch, post, ..
                     } => ValueFacts::new(post.dtype(), [*batch, *m, *n]),
-                    L1::KQContract { acc, m, n, .. } => ValueFacts::new(*acc, [*m, *n]),
                     L1::KGather { space, .. } => {
                         ValueFacts::new(dense(first().dtype), space.dims.iter().copied())
                     }
@@ -507,18 +483,6 @@ pub(crate) mod testing {
                 .expect("leaf")
         }
 
-        pub fn quantized(&mut self, fmt: QFmt, layout: QLayout, shape: &[u64]) -> Id {
-            let name = self.name();
-            self.graph
-                .add(Op::L0(L0::Leaf(LeafKind::Quantized {
-                    name,
-                    fmt,
-                    layout,
-                    shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
-                })))
-                .expect("quantized leaf")
-        }
-
         pub fn contract(&mut self, spec: EinSpec, acc: Dtype, a: Id, b: Id) -> Id {
             self.graph
                 .add(Op::L0(L0::Contract {
@@ -581,12 +545,10 @@ pub(crate) mod testing {
                     k: dim,
                     batch: Dim::Const(1),
                     family,
-                    pre_a: ScalarExpr::arg(0, dtype),
-                    pre_b: ScalarExpr::arg(0, dtype),
                     post: ScalarExpr::arg(0, dtype),
                     acc: dtype,
-                    a: operand(a),
-                    b: operand(b),
+                    a: ContractSide::one(ScalarExpr::arg(0, dtype), operand(a)),
+                    b: ContractSide::one(ScalarExpr::arg(0, dtype), operand(b)),
                     sched: ScheduleDomain::Point,
                 }))
                 .expect("point contract")
@@ -766,8 +728,8 @@ mod tests {
 
     #[test]
     fn rule_names_are_unique_and_stable() {
-        let names: Vec<&'static str> = rule_names().collect();
-        assert_eq!(names.len(), 29);
+        let names: Vec<&'static str> = TILE_RULES.iter().map(|r| r.name).collect();
+        assert_eq!(names.len(), 15);
 
         let mut sorted = names.clone();
         sorted.sort_unstable();
@@ -777,26 +739,12 @@ mod tests {
         assert_eq!(
             sorted,
             [
-                "GATHER_QUANTIZED_ROWS",
                 "GATHER_ROW_PER_GROUP",
                 "GATHER_VECTORIZED",
                 "LOWER_COOP",
                 "LOWER_GENERIC",
                 "LOWER_SGEMM",
                 "LOWER_SGEMV",
-                "QACT_F32",
-                "QACT_Q8_DP4A",
-                "QMM_Q5_SMALL_SINGLE_ROW",
-                "QMM_Q8_WIDE_64X128",
-                "QMM_SINGLE_ROW",
-                "QMM_TILE_128X128",
-                "QMM_TILE_128X64",
-                "QMM_TILE_64X128",
-                "QMM_TILE_64X32_Q4K",
-                "QMM_TILE_64X64",
-                "QMM_TILE_64X64_CACHED",
-                "QMM_WORKGROUP",
-                "QREPACK",
                 "SCATTER_ATOMIC",
                 "SCATTER_ONE_HOT_CONTRACT",
                 "SCATTER_SORT_SEGMENT",

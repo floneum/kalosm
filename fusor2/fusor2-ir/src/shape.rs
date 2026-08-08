@@ -41,13 +41,6 @@ impl Dim {
         }
     }
 
-    pub const fn multiple_of(self, n: u64) -> bool {
-        match self {
-            Self::Const(v) => n != 0 && v % n == 0,
-            Self::Sym(_) => false,
-        }
-    }
-
     /// Decidably equal. Two distinct `Sym`s are not decidably equal even if
     /// they happen to bind the same value.
     pub const fn known_eq(self, other: Self) -> bool {

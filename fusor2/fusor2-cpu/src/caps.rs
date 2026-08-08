@@ -32,20 +32,6 @@ pub fn level_name(level: Level) -> &'static str {
     }
 }
 
-/// The natural machine vector width in f32 lanes for a level.
-///
-/// The emitter can instantiate 4, 8 and 16 regardless — the register type is a
-/// statically-sized array, so an `MxN` accumulator tile is expressible at every
-/// width. This is only the *preferred* width the cost model orders moves by.
-pub fn native_width(level: Level) -> u32 {
-    #[allow(unreachable_patterns)]
-    match level {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        Level::Avx2(_) => 8,
-        _ => 4,
-    }
-}
-
 /// The widest lane count the emitter will instantiate. `Reduce{Subgroup}` is
 /// legal at this width and lowers to a horizontal reduce.
 pub const MAX_WIDTH: u32 = 16;
@@ -58,12 +44,6 @@ pub const WIDTHS: [u32; 3] = [4, 8, 16];
 pub struct CpuCaps;
 
 impl CpuCaps {
-    /// SIMD widths the emitter may instantiate, thread count, and cache sizes,
-    /// mapped onto the shared [`Caps`] shape.
-    pub fn detect() -> Caps {
-        cpu_caps().clone()
-    }
-
     /// Bytes of the last-level cache, feeding `DeviceFacts::llc_bytes`.
     pub fn llc_bytes() -> u64 {
         // No portable query exists. 8 MiB matches the Apple-silicon SLC slice a

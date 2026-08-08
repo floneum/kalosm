@@ -66,8 +66,6 @@ pub fn sink_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
             k,
             batch,
             family,
-            pre_a,
-            pre_b,
             post,
             acc,
             a,
@@ -83,41 +81,8 @@ pub fn sink_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
                 k,
                 batch,
                 family,
-                pre_a,
-                pre_b,
                 post: body.compose(&[post]),
                 acc,
-                a,
-                b: rhs,
-                sched,
-            })
-            .ok()?
-        }
-        Op::L1(L1::KQContract {
-            fmt,
-            layout,
-            act,
-            m,
-            n,
-            k,
-            acc,
-            post,
-            a,
-            b: rhs,
-            sched,
-        }) => {
-            if !epilogue_preserves_accum(body.dtype(), acc) {
-                return None;
-            }
-            b.add_l1(L1::KQContract {
-                fmt,
-                layout,
-                act,
-                m,
-                n,
-                k,
-                acc,
-                post: body.compose(&[post]),
                 a,
                 b: rhs,
                 sched,

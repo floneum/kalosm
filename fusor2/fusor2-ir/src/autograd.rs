@@ -63,9 +63,6 @@ pub enum AdjointKind {
     /// elementwise mask-and-broadcast; overlapping windows give
     /// `Scatter{Add}`, itself a chain with four lowerings.
     Structural,
-    /// Forward opaque, adjoint identity. QAT fake-quant is this, with zero
-    /// user code.
-    StraightThrough,
 }
 
 /// One row of the adjoint table.
@@ -74,14 +71,6 @@ pub struct Adjoint {
     pub op: OpTag,
     pub kind: AdjointKind,
 }
-
-/// Differentiating one [`ScalarExpr`] covers all 23 elementwise unaries,
-/// all 12 comparisons (which differentiate to zero automatically,
-/// satisfying the invariant that every requires-grad parent receives a
-/// gradient), `where_cond`, `clamp`, `gelu`, `sigmoid`, `silu` and the
-/// scalar-arith family. Implemented in `fusor2-autograd`; declared here
-/// because it is the single [`Adjoint`] entry for `OpTag::Map`.
-pub type MapAdjointFn = AdjointFn;
 
 /// The whole reverse-mode transform. Object-safe.
 pub trait Autograd: Send + Sync {

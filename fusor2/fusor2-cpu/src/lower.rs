@@ -60,7 +60,6 @@ pub fn lower(
             }
             contract::lower(caps, node, theta, cx)
         }
-        L1::KQContract { .. } => contract::lower(caps, node, theta, cx),
         L1::KGather { .. } | L1::KScatter { .. } => gather_scatter::lower(caps, node, theta, cx),
         L1::KRegion { members, .. } => compose(caps, members, theta, cx, "cpu_region"),
         L1::KMerged(wave) => compose(caps, wave.segments(), theta, cx, "cpu_merged"),
@@ -544,11 +543,6 @@ pub(crate) fn const_extents(shape: &[Dim]) -> Result<Vec<u32>> {
         .collect()
 }
 
-#[allow(dead_code)]
-pub(crate) fn elements(shape: &[Dim]) -> Result<u64> {
-    Ok(const_extents(shape)?.iter().map(|e| *e as u64).product())
-}
-
 /// A masked load of operand `slot` at `index`.
 pub(crate) fn load(buffer: Arc<BufferDecl>, index: TileExpr, mask: TileExpr) -> TileExpr {
     let element = buffer.element;
@@ -732,23 +726,12 @@ pub(crate) fn operand_src(cx: &LowerCtx<'_>, binds: &Binds, src: Id) -> Result<O
     let facts = cx.graph.facts(src);
     if let Dtype::Q(fmt) = facts.dtype {
         let layout = qlayout_of(cx, src).unwrap_or(QLayout::Native);
-        let cols = facts.shape.last().and_then(|d| d.as_const()).unwrap_or(0);
-        let rows: u64 = facts.shape[..facts.shape.len().saturating_sub(1)]
-            .iter()
-            .filter_map(|d| d.as_const())
-            .product();
         let data = StorageView {
             layout: buffer.layout.clone(),
             buffer,
             offset: 0,
         };
-        return Ok(OperandSrc::Quantized(QuantizedView {
-            data,
-            fmt,
-            layout,
-            rows: rows as u32,
-            cols: cols as u32,
-        }));
+        return Ok(OperandSrc::Quantized(QuantizedView { data, fmt, layout }));
     }
     Ok(OperandSrc::Buffer(buffer))
 }
@@ -769,7 +752,7 @@ pub(crate) fn qlayout_of(cx: &LowerCtx<'_>, value: Id) -> Option<QLayout> {
     })
 }
 
-fn const_operand(cx: &LowerCtx<'_>, src: Id) -> Option<TileExpr> {
+pub(crate) fn const_operand(cx: &LowerCtx<'_>, src: Id) -> Option<TileExpr> {
     let fusor2_ir::ir::Op::L0(fusor2_ir::ir::level0::L0::Leaf(
         fusor2_ir::ir::level0::LeafKind::Const { value, .. },
     )) = &cx.graph.node(cx.selected(src)).op
@@ -953,19 +936,6 @@ pub(crate) fn coords_of(flat: &TileExpr, extents: &[u32]) -> Vec<TileExpr> {
 pub(crate) fn grid_for(n: u64, block: u32) -> [u32; 3] {
     let groups = n.div_ceil(block as u64).max(1);
     [groups as u32, 1, 1]
-}
-
-/// The operand list of an L1 node, whichever variant it is.
-#[allow(dead_code)]
-pub(crate) fn operands(op: &L1) -> &[Operand] {
-    match op {
-        L1::KMap { ops, .. }
-        | L1::KFold { ops, .. }
-        | L1::KGather { ops, .. }
-        | L1::KScatter { ops, .. }
-        | L1::Ext { ops, .. } => ops,
-        _ => &[],
-    }
 }
 
 #[cfg(test)]

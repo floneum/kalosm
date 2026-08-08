@@ -23,24 +23,8 @@ use fusor2_ir::scalar::{BinOp, CmpOp, UnOp};
 
 use super::access::AccessForm;
 
-/// The widest lane count any instantiation uses.
-pub const MAX_W: usize = 16;
-
 /// A tape register index.
 pub type Slot = u32;
-
-/// One emitted value: a `width`-lane vector in the kernel's register file.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LaneValue {
-    pub slot: u32,
-    pub width: u32,
-}
-
-impl LaneValue {
-    pub const fn new(slot: Slot, width: u32) -> Self {
-        Self { slot, width }
-    }
-}
 
 /// Compute type of a register. Storage-only narrow floats never appear: they
 /// widen on load and narrow on store.
@@ -249,8 +233,6 @@ impl<const W: usize> Default for Reg<W> {
 }
 
 impl<const W: usize> Reg<W> {
-    pub const TRUE: u32 = u32::MAX;
-
     #[inline(always)]
     pub fn splat_bits(bits: u32) -> Self {
         Self([bits; W])
@@ -334,22 +316,6 @@ impl<const W: usize> Reg<W> {
         }
         Self(o)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Scalar-fallback accounting
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-pub static SCALAR_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Record that a lane had to leave the vector path. Nothing in this file calls
-/// it: every transcendental below is a polynomial or a rational, so the tests
-/// assert this counter is zero.
-#[inline(always)]
-pub fn note_scalar_fallback() {
-    #[cfg(test)]
-    SCALAR_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,12 +1014,6 @@ pub unsafe fn write_elem(elem: ScalarElement, base: *mut u8, index: usize, bits:
     }
 }
 
-/// A divergent `If` becomes a `select` on a lane mask.
-#[inline(always)]
-pub fn select_mask<const W: usize>(cond: Reg<W>, accept: Reg<W>, reject: Reg<W>) -> Reg<W> {
-    Reg::select(cond, accept, reject)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1108,11 +1068,6 @@ mod tests {
             assert!(*e <= 1e-6, "{name}: max relative error {e:e} exceeds 1e-6");
         }
         assert_eq!(worst.len(), 21);
-        assert_eq!(
-            SCALAR_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "a transcendental left the vector path"
-        );
     }
 
     #[test]

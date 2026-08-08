@@ -134,7 +134,8 @@ impl VarBuilder {
 mod tests {
     use super::*;
     use crate::parse::{GgufVersion, fixture};
-    use fusor2_ir::dtype::{GgmlType, QFmt};
+    use crate::parse::GgmlType;
+    use fusor2_ir::dtype::QFmt;
 
     fn model() -> Arc<Gguf> {
         let file = fixture::build(

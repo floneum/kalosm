@@ -130,8 +130,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use fusor2_gguf::parse::{GgufMetadata, GgufTensor, GgufVersion};
-    use fusor2_ir::dtype::GgmlType;
+    use fusor2_gguf::parse::{GgmlType, GgufMetadata, GgufTensor, GgufVersion};
     use fusor2_ir::shape::Dim;
 
     use crate::graph::Graph;

@@ -13,14 +13,12 @@
 //! Owned by W7.
 
 use crate::realize::{self, Realized};
-use fusor2_ir::Result;
 use fusor2_ir::cost::{CostModel, Picoseconds};
 use fusor2_ir::egraph::{ClassId, EGraph, Id};
 use fusor2_ir::extract::{ExtractBudget, Extraction, Move};
 use fusor2_ir::facts::ValueFacts;
 use fusor2_ir::ir::Op;
 use fusor2_ir::ir::level1::{Effect, L1, SchedPoint, ScheduleDomain};
-use fusor2_ir::ir::level2::ArenaPlanner;
 use fusor2_ir::shape::Layout;
 use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
@@ -47,8 +45,14 @@ pub enum Undo {
         node: Id,
         node_was_materialized: bool,
     },
-    Flip { node: Id, was_materialized: bool },
-    Reschedule { node: Id, was: Option<SchedPoint> },
+    Flip {
+        node: Id,
+        was_materialized: bool,
+    },
+    Reschedule {
+        node: Id,
+        was: Option<SchedPoint>,
+    },
 }
 
 /// Memo for the `RESCHEDULE` frontier: the per-point score and the sorted
@@ -115,10 +119,6 @@ impl SchedCache {
             );
         }
         &self.order[&(id, context)]
-    }
-
-    pub fn score_of(&self, id: Id, theta: SchedPoint, context: u64) -> Option<Picoseconds> {
-        self.score.get(&(id, theta, context)).copied()
     }
 }
 
@@ -328,44 +328,6 @@ pub fn is_pinned(graph: &EGraph, roots: &[Id], id: Id) -> bool {
     graph.semantics().effect(&graph.node(id).op) != Effect::Pure
 }
 
-/// Exact realized cost of the current state.
-pub fn evaluate(
-    graph: &EGraph,
-    extraction: &Extraction,
-    roots: &[Id],
-    cost: &dyn CostModel,
-    arena: &dyn ArenaPlanner,
-) -> Result<Picoseconds> {
-    let realized = realize::realize(graph, roots, extraction, cost, arena)?;
-    Ok(realize::exact_cost(&realized, extraction, cost))
-}
-
-/// The launches a change at `node` can move: the launch holding it plus the
-/// launch of every realized consumer. Ascending, deduplicated.
-pub fn affected_launches(realized: &Realized, node: Id) -> SmallVec<[u32; 4]> {
-    let mut out: SmallVec<[u32; 4]> = SmallVec::new();
-    let mut push = |l: u32| {
-        if !out.contains(&l) {
-            out.push(l);
-        }
-    };
-    if let Some(l) = realized.launch_of.get(node) {
-        push(*l);
-    }
-    for consumer in realized
-        .consumer_nodes
-        .get(node)
-        .map(|c| c.as_slice())
-        .unwrap_or(&[])
-    {
-        if let Some(l) = realized.launch_of.get(*consumer) {
-            push(*l);
-        }
-    }
-    out.sort_unstable();
-    out
-}
-
 /// Everything a schedule score depends on besides the point itself: merged
 /// segment count, epilogue signature, operand layouts and the consumer
 /// demand set. Two occurrences of the same node in different surroundings
@@ -381,14 +343,11 @@ pub fn context_hash(graph: &EGraph, realized: &Realized, node: Id) -> u64 {
     h.write_u64(segments);
 
     match &n.op {
-        Op::L1(L1::KContract {
-            pre_a, pre_b, post, ..
-        }) => {
-            h.write_u64(pre_a.structural_hash());
-            h.write_u64(pre_b.structural_hash());
+        Op::L1(L1::KContract { a, b, post, .. }) => {
+            h.write_u64(a.pre.structural_hash());
+            h.write_u64(b.pre.structural_hash());
             h.write_u64(post.structural_hash());
         }
-        Op::L1(L1::KQContract { post, .. }) => h.write_u64(post.structural_hash()),
         Op::L1(L1::KFold { carrier, post, .. }) => {
             for l in &carrier.lift {
                 h.write_u64(l.structural_hash());
@@ -433,9 +392,8 @@ fn operand_layouts(op: &Op) -> SmallVec<[Layout; 4]> {
             | L1::KGather { ops, .. }
             | L1::KScatter { ops, .. }
             | L1::Ext { ops, .. } => out.extend(ops.iter().map(|o| o.layout.clone())),
-            L1::KContract { a, b, .. } | L1::KQContract { a, b, .. } => {
-                out.push(a.layout.clone());
-                out.push(b.layout.clone());
+            L1::KContract { a, b, .. } => {
+                out.extend(a.ops.iter().chain(b.ops.iter()).map(|o| o.layout.clone()))
             }
             L1::KRegion { .. } | L1::KMerged(_) => {}
         }
@@ -454,7 +412,7 @@ fn domain(graph: &EGraph, id: Id) -> Option<&ScheduleDomain> {
 mod tests {
     use super::*;
     use crate::realize::testkit::{
-        N, TestCost, TestPlanner, buffer, chain_graph, fork_graph, kscatter, new_graph, seed_for,
+        N, TestCost, TestPlanner, buffer, chain_graph, kscatter, new_graph, seed_for,
     };
 
     #[test]
@@ -575,17 +533,5 @@ mod tests {
             crate::verify_plan::verify_plan(&g, &plan)
                 .unwrap_or_else(|e| panic!("{c:?} produced an unverifiable plan: {e}"));
         }
-    }
-
-    #[test]
-    fn affected_set_is_the_node_plus_its_consumers() {
-        let (g, roots, shared) = fork_graph();
-        let ex = seed_for(&g, &roots);
-        let cost = TestCost::default();
-        let arena = TestPlanner;
-        let r = crate::realize::realize(&g, &roots, &ex, &cost, &arena).unwrap();
-        let a = affected_launches(&r, shared);
-        assert!(!a.is_empty());
-        assert!(a.windows(2).all(|w| w[0] < w[1]), "ascending and unique");
     }
 }

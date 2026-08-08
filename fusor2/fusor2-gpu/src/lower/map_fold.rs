@@ -286,7 +286,7 @@ pub fn lower_kfold(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Kerne
     }
 
     let space_total = space.iterations().unwrap_or(0);
-    let acc_elem = ScalarElement::from_dtype(*acc);
+    let acc_elem = scalar_element(*acc);
 
     let (block, lane_group) = match strat {
         FoldStrat::Subgroup => (
@@ -568,7 +568,7 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<K
         .filter(|i| !vec_axes.contains(&(*i as u32)))
         .collect();
     let space_total = space.iterations().unwrap_or(0);
-    let acc_elem = ScalarElement::from_dtype(*acc);
+    let acc_elem = scalar_element(*acc);
     let acc_ty = ElementType::Scalar(acc_elem);
     let limits = ctx.caps.limits;
     let max_block = emitted_block(1, ctx.caps);
@@ -863,17 +863,6 @@ fn identity_expr(ctx: &mut Ctx<'_>, s: Splat, elem: ScalarElement) -> TileExpr {
     }
 }
 
-/// `Dtype` -> `ScalarElement`, as a trait method so call sites read as the
-/// conversion they are.
-trait FromDtype {
-    fn from_dtype(d: fusor2_ir::dtype::Dtype) -> ScalarElement;
-}
-impl FromDtype for ScalarElement {
-    fn from_dtype(d: fusor2_ir::dtype::Dtype) -> ScalarElement {
-        scalar_element(d)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,11 +1057,16 @@ mod tests {
         // the multiply away entirely — for the wgtree ones), and the `z` term
         // likewise. Every shader is 19-35 bytes shorter for exactly that
         // reason; nothing else in these four kernels changed.
+        //
+        // Re-baselined again when masked storage loads went branchless: the
+        // `var tmp = fill; if (mask) { tmp = buf[i]; } tmp` round trip became
+        // `let masked_N = select(fill, buf[min(i, last)], mask)`. Every shader
+        // is exactly 62 bytes shorter and loses one `if`.
         let cases: [(&'static str, BinOp, u64, usize); 4] = [
-            ("add_subgroup", BinOp::Add, 0xe4e4_d00b_18ea_3c53, 912),
-            ("max_subgroup", BinOp::Max, 0xecbc_d05f_4a28_88e8, 951),
-            ("add_wgtree", BinOp::Add, 0x0883_6b93_f121_3c11, 2103),
-            ("max_wgtree", BinOp::Max, 0x910e_8e1e_1f48_987b, 2152),
+            ("add_subgroup", BinOp::Add, 0x1fa7_abfd_a91a_cd43, 850),
+            ("max_subgroup", BinOp::Max, 0x41dc_217d_1c7a_9838, 889),
+            ("add_wgtree", BinOp::Add, 0xe393_a7c7_3d68_a13f, 2041),
+            ("max_wgtree", BinOp::Max, 0x3f7c_18bc_3e7d_7171, 2090),
         ];
         let texts: Vec<(&'static str, String)> = cases
             .iter()

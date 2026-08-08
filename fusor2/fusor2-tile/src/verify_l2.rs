@@ -285,19 +285,6 @@ pub fn infer_kind(kind: &TileExprKind) -> Result<ElementType> {
                 cols: cc,
             }
         }
-        K::Dequantize { lanes, .. } => ElementType::Vector {
-            scalar: ScalarElement::F32,
-            lanes: *lanes,
-        },
-        K::LaneOf { block, lane } => match block.element() {
-            ElementType::Vector { scalar, lanes } if *lane < lanes => ElementType::Scalar(scalar),
-            other => {
-                return Err(invalid(format!(
-                    "lane {lane} is not below the decoded block width {other:?}"
-                )));
-            }
-        },
-        K::QuantizedDot { .. } => ElementType::Scalar(ScalarElement::F32),
     })
 }
 
@@ -310,13 +297,6 @@ const fn literal_scalar(lit: TileLiteral) -> ScalarElement {
         TileLiteral::I32(_) => ScalarElement::I32,
         TileLiteral::Bool(_) => ScalarElement::Bool,
     }
-}
-
-/// Full expression type-check; returns the checked element type.
-pub fn type_check(expr: &TileExpr) -> Result<ElementType> {
-    let mut seen = FxHashSet::default();
-    check_expr(expr, &mut seen)?;
-    Ok(expr.element())
 }
 
 fn check_expr(expr: &TileExpr, seen: &mut FxHashSet<u64>) -> Result<()> {
@@ -407,7 +387,6 @@ fn check_node(expr: &TileExpr) -> Result<()> {
             }
             check_mask(mask)?;
         }
-        K::Dequantize { mask, .. } | K::QuantizedDot { mask, .. } => check_mask(mask)?,
         _ => {}
     }
     // The cached type must equal what inference derives.
@@ -540,9 +519,29 @@ fn load_in_range(src: &Source, addr: &Addr) -> bool {
     }
 }
 
+/// A non-negative integer literal, whichever integer type it carries.
+///
+/// The `I32` guard mirrors [`max_value`]'s own: a negative literal is not a
+/// bound on an unsigned index, so it stays undecidable rather than wrapping.
+fn literal_u64(expr: &TileExpr) -> Option<u64> {
+    match expr.kind() {
+        TileExprKind::Literal(TileLiteral::U32(v)) => Some(u64::from(*v)),
+        TileExprKind::Literal(TileLiteral::I32(v)) if *v >= 0 => Some(*v as u64),
+        _ => None,
+    }
+}
+
 /// The maximum value an index expression can take, when it is decidable. A
 /// literal, or an affine/monotone composition of literals; anything reading a
 /// builtin or memory is unbounded and needs a real mask.
+///
+/// The bit operators are read as their unsigned arithmetic twins — `x >> k` is
+/// `x / 2^k`, `x << k` is `x * 2^k`, `x & m` is bounded like `x % (m + 1)` when
+/// `m` is `2^k - 1` — because otherwise the verifier decides `lane % 32` and
+/// refuses `lane & 31`, which are the same function of `lane`. That asymmetry
+/// is not neutral: it forbids a lowering from spelling an address with the
+/// natural power-of-two wrap, the very form `emit::expr::mod_literal_u32`
+/// rewrites the remainder into one layer down.
 fn max_value(expr: &TileExpr) -> Option<u64> {
     use fusor2_ir::scalar::BinOp;
     match expr.kind() {
@@ -558,8 +557,44 @@ fn max_value(expr: &TileExpr) -> Option<u64> {
             BinOp::Add => max_value(left)?.checked_add(max_value(right)?),
             BinOp::Mul => max_value(left)?.checked_mul(max_value(right)?),
             // Integer subtraction and division only lower the bound.
-            BinOp::Sub | BinOp::Div | BinOp::Shr => max_value(left),
+            BinOp::Sub | BinOp::Div => max_value(left),
             BinOp::Rem => Some(max_value(right)?.saturating_sub(1)),
+            // `x >> k == x / 2^k` at a literal count. A dynamic count still
+            // only lowers the bound, which is the arm this replaces.
+            BinOp::Shr => match literal_u64(right) {
+                Some(k) if k < 64 => Some(max_value(left)? >> k),
+                Some(_) => Some(0),
+                None => max_value(left),
+            },
+            // `x << k == x * 2^k`, checked exactly the way `Mul` is.
+            BinOp::Shl => {
+                let k = literal_u64(right)?;
+                if k >= 64 {
+                    return None;
+                }
+                max_value(left)?.checked_mul(1u64 << k)
+            }
+            // `x & m <= x` and `x & m <= m` for unsigned, so *one* decidable
+            // side bounds the pair: `& 0xFF` is bounded however unbounded its
+            // left operand is. Stating it as a `min` also covers a mask that
+            // is not `2^k - 1`.
+            BinOp::BitAnd => match (max_value(left), max_value(right)) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            },
+            // Neither `|` nor `^` sets a bit above the highest bit either side
+            // can set, so the bound is that position's all-ones mask. Note
+            // `a | b <= A | B` is false in general (`A = B = 2` admits
+            // `1 | 2 == 3`), which is why this rounds up to the mask.
+            BinOp::BitOr | BinOp::BitXor => {
+                let m = max_value(left)?.max(max_value(right)?);
+                Some(if m == 0 {
+                    0
+                } else {
+                    u64::MAX >> m.leading_zeros()
+                })
+            }
             BinOp::Min => match (max_value(left), max_value(right)) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (Some(a), None) | (None, Some(a)) => Some(a),
@@ -696,8 +731,6 @@ fn check_one_reduce(
                 TileExprKind::Builtin(b) => bad = Some(format!("{b:?}")),
                 TileExprKind::Load { .. }
                 | TileExprKind::LoadTile { .. }
-                | TileExprKind::Dequantize { .. }
-                | TileExprKind::QuantizedDot { .. }
                 | TileExprKind::Reduce { .. } => {
                     bad = Some(format!("{:?}", std::mem::discriminant(node.kind())));
                 }
@@ -1045,6 +1078,59 @@ mod tests {
         b.push(stmt);
         let ir = b.finish([1, 1, 1], 1, "in-range");
         verify_l2(&ir, &caps_with(|_| {})).unwrap();
+    }
+
+    /// `lane & 31` and `lane % 32` are the same function of `lane`. The
+    /// verifier used to decide the second and refuse the first, so a lowering
+    /// could not spell an address with the natural power-of-two wrap — the
+    /// very form `mod_literal_u32` rewrites the remainder into one layer down.
+    #[test]
+    fn a_power_of_two_mask_bounds_an_address_the_way_a_remainder_does() {
+        for (op, rhs) in [(BinOp::BitAnd, 31u32), (BinOp::Rem, 32)] {
+            let mut b = TileBuilder::new();
+            let buffer = b.alloc_buffer(
+                0,
+                ScalarElement::F32.element(),
+                TileLayout::contiguous(MemoryLevel::Storage, &[32]),
+                BufferAccess::Read,
+            );
+            let view = whole_buffer_view(&buffer);
+            let lane = b.builtin(fusor2_ir::ir::level2::Builtin::Lane);
+            let k = b.lit_u32(rhs);
+            let index = b.binary(op, lane, k, NumericContract::RELAXED);
+            let mask = b.mask_true();
+            let fill = b.lit_f32(0.0);
+            let load = b.load(Source::Storage(view), Addr::Linear(index), mask, fill);
+            let local = b.alloc_local(ScalarElement::F32.element());
+            let stmt = b.store_local(local, load);
+            b.push(stmt);
+            let ir = b.finish([1, 1, 1], 32, "wrap");
+            verify_l2(&ir, &caps_with(|_| {})).unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
+        }
+    }
+
+    /// A shift and a mask compose the way their arithmetic twins do: the byte
+    /// selector `(word >> 24) & 0xF` that a block decode spells is bounded at
+    /// 15 without any knowledge of `word`, exactly as `(word / 2^24) % 16`
+    /// would be. `Shl` is checked against its `Mul` reading in the same shape.
+    #[test]
+    fn bit_arithmetic_bounds_compose_like_their_arithmetic_twins() {
+        let mut b = TileBuilder::new();
+        let lane = b.builtin(fusor2_ir::ir::level2::Builtin::Lane);
+        let twenty_four = b.lit_u32(24);
+        let fifteen = b.lit_u32(15);
+        let shifted = b.binary(BinOp::Shr, lane.clone(), twenty_four, NumericContract::RELAXED);
+        let nibble = b.binary(BinOp::BitAnd, shifted, fifteen, NumericContract::RELAXED);
+        assert_eq!(max_value(&nibble), Some(15));
+
+        // `x << k` is `x * 2^k`: a decidable left operand scales, an
+        // undecidable one stays undecidable.
+        let seven = b.lit_u32(7);
+        let two = b.lit_u32(2);
+        let scaled = b.binary(BinOp::Shl, seven, two.clone(), NumericContract::RELAXED);
+        assert_eq!(max_value(&scaled), Some(28));
+        let unbounded = b.binary(BinOp::Shl, lane, two, NumericContract::RELAXED);
+        assert_eq!(max_value(&unbounded), None);
     }
 
     #[test]

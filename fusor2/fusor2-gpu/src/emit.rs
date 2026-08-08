@@ -397,39 +397,6 @@ impl Analysis {
                 self.expr(b, seen);
                 self.expr(c, seen);
             }
-            TileExprKind::Dequantize {
-                src,
-                k_base,
-                col,
-                mask,
-                fill,
-                ..
-            } => {
-                self.quantized(src, seen);
-                self.expr(k_base, seen);
-                self.expr(col, seen);
-                self.expr(mask, seen);
-                self.expr(fill, seen);
-            }
-            TileExprKind::LaneOf { block, .. } => self.expr(block, seen),
-            TileExprKind::QuantizedDot {
-                src,
-                activations,
-                k_base,
-                col,
-                mask,
-                fill,
-                ..
-            } => {
-                self.quantized(src, seen);
-                for a in activations {
-                    self.expr(a, seen);
-                }
-                self.expr(k_base, seen);
-                self.expr(col, seen);
-                self.expr(mask, seen);
-                self.expr(fill, seen);
-            }
         }
     }
 
@@ -479,11 +446,6 @@ pub enum ScratchKind {
     Spill,
     /// An atomic compare-exchange loop's `old`/`ok` slots.
     Atomic,
-    /// A dequantized block-lane value.
-    BlockDequant,
-    Q8Scale,
-    Q8Pack,
-    Q8Sum,
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +469,15 @@ pub struct Emitter<'a> {
     pub(crate) local_handles: FxHashMap<usize, naga::Handle<naga::LocalVariable>>,
     pub(crate) scratch:
         FxHashMap<(ScratchKind, ElementType, u32), naga::Handle<naga::LocalVariable>>,
+    /// Expressions to force into a named temporary, drained into
+    /// [`naga::Function::named_expressions`] by [`Emitter::finish`].
+    ///
+    /// A backend inlines a single-use expression into its consumer, so a run
+    /// of them nests one inside the next and Metal's front end refuses past
+    /// 256 brackets. Naming one emits `const auto _n = <expr>;` — an SSA
+    /// binding, not a memory round trip, which is what makes it cheaper than
+    /// spilling through a [`Self::scratch`] local.
+    pub(crate) forced_names: Vec<(naga::Handle<naga::Expression>, String)>,
     /// Hash-consed expression memo. `TileExpr: Hash + Eq` is O(1) through its
     /// cached structural hash; this is precisely why the `Shared` node was
     /// deleted — two identical subtrees built separately merge here, which
@@ -516,9 +487,6 @@ pub struct Emitter<'a> {
     /// that reads memory is a hit only while every space it reads is still at
     /// that epoch — see [`Emitter::expr`].
     pub(crate) memo: FxHashMap<TileExpr, (naga::Handle<naga::Expression>, MemStamp)>,
-    /// `Dequantize` -> its N projected lane handles, so N `LaneOf`s share one
-    /// decode. Epoch-stamped like [`Self::memo`].
-    pub(crate) dequant_memo: FxHashMap<TileExpr, (Vec<naga::Handle<naga::Expression>>, MemStamp)>,
     /// Write counter per memory space, indexed by [`MEM_SPACES`] order:
     /// storage, workgroup tile, private local.
     ///
@@ -530,16 +498,12 @@ pub struct Emitter<'a> {
     /// Latest SSA value of each cooperative accumulator local: one `Load`,
     /// N MMAs, one `Store` per scope.
     pub(crate) coop_acc: FxHashMap<usize, naga::Handle<naga::Expression>>,
-    /// Dedups one activation set's int8 pack per store/quant scope.
-    pub(crate) q8_cache: FxHashMap<Vec<naga::Handle<naga::Expression>>, quantized::Q8Packs>,
     pub(crate) workgroup_invocations: u32,
     pub(crate) workgroup_size: [u32; 3],
     /// Argument indices of the four optional subgroup builtins, in the fixed
     /// order they are appended.
     pub(crate) subgroup_args: [Option<u32>; 4],
     pub(crate) depth: u32,
-    /// Test/oracle seam: overrides every format's decode program.
-    pub(crate) block_program_override: Option<fusor2_ir::dtype::BlockProgram>,
     pub(crate) u32_ty: naga::Handle<naga::Type>,
     pub(crate) u32_vec3_ty: naga::Handle<naga::Type>,
 }
@@ -594,16 +558,14 @@ impl<'a> Emitter<'a> {
             tile_backing: FxHashMap::default(),
             local_handles: FxHashMap::default(),
             scratch: FxHashMap::default(),
+            forced_names: Vec::new(),
             memo: FxHashMap::default(),
-            dequant_memo: FxHashMap::default(),
             mem_epoch: MemStamp::default(),
             coop_acc: FxHashMap::default(),
-            q8_cache: FxHashMap::default(),
             workgroup_invocations,
             workgroup_size: [workgroup_invocations, 1, 1],
             subgroup_args: [None; 4],
             depth: 0,
-            block_program_override: None,
             u32_ty: prelude.u32_ty,
             u32_vec3_ty: prelude.u32_vec3_ty,
         })
@@ -650,7 +612,7 @@ impl<'a> Emitter<'a> {
             naga::Span::default(),
         );
 
-        let function = naga::Function {
+        let mut function = naga::Function {
             name: None,
             arguments,
             result: None,
@@ -660,6 +622,9 @@ impl<'a> Emitter<'a> {
             body,
             diagnostic_filter_leaf: None,
         };
+        for (handle, name) in std::mem::take(&mut self.forced_names) {
+            function.named_expressions.insert(handle, name);
+        }
 
         let workgroup_size = self.workgroup_size;
         let subgroups = self.analysis.uses_subgroups();
@@ -914,19 +879,6 @@ pub(crate) mod testkit {
             placements,
             barriers_inserted: Default::default(),
         }
-    }
-
-    /// Emit with a substituted decode program, so a quantized test does not
-    /// depend on `fusor2-gguf`'s tables being filled in yet.
-    pub fn emit_with_program(
-        ir: &KernelIr,
-        caps: &Caps,
-        plan: &ArenaPlan,
-        program: fusor2_ir::dtype::BlockProgram,
-    ) -> Result<EmittedModule, EmitError> {
-        Emitter::new(ir, caps, plan)?
-            .with_block_program(program)
-            .finish()
     }
 
     /// The one `main` function of an emitted module.

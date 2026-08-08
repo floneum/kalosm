@@ -15,22 +15,12 @@ use fusor2_ir::{Error, Result};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-/// How a user-registered node produces its gradients.
-#[derive(Copy, Clone, Debug)]
-pub enum CustomRule {
-    /// An explicit rule over the node's declared parents.
-    Analytic(AdjointFn),
-    /// Forward opaque, adjoint identity. QAT fake-quant is this, with zero
-    /// user code: the trainer's `fake_quant` + `with_backwards` pair
-    /// collapses to one attribute.
-    StraightThrough,
-}
-
-/// A user-supplied backward attached to one value.
+/// A user-supplied backward attached to one value: an explicit rule over the
+/// node's declared parents.
 #[derive(Clone, Debug)]
 pub struct CustomBackward {
     pub parents: SmallVec<[Parent; 4]>,
-    pub rule: CustomRule,
+    pub rule: AdjointFn,
 }
 
 impl CustomBackward {
@@ -43,10 +33,7 @@ impl CustomBackward {
         ins: &[Val],
         out: Val,
     ) -> Result<Grads> {
-        let grads = match self.rule {
-            CustomRule::Analytic(f) => f(tape, node, grad, ins, out)?,
-            CustomRule::StraightThrough => crate::backward::straight_through_grads(grad, ins.len()),
-        };
+        let grads = (self.rule)(tape, node, grad, ins, out)?;
         let targets: SmallVec<[BackwardTarget; 4]> = ins
             .iter()
             .enumerate()
@@ -107,23 +94,7 @@ pub fn with_backwards(
         value,
         CustomBackward {
             parents: parents.iter().copied().collect(),
-            rule: CustomRule::Analytic(rule),
-        },
-    );
-    Ok(value)
-}
-
-/// Mark `value` straight-through: the forward is opaque and the adjoint is
-/// the identity into `x`. This is the whole of QAT fake-quant.
-pub fn straight_through(registry: &mut CustomRegistry, value: Val, x: Val) -> Result<Val> {
-    registry.insert(
-        value,
-        CustomBackward {
-            parents: smallvec::smallvec![Parent {
-                value: x,
-                requires_grad: true,
-            }],
-            rule: CustomRule::StraightThrough,
+            rule,
         },
     );
     Ok(value)
@@ -271,27 +242,6 @@ mod tests {
             requires_grad: false,
         }];
         validate_parents(&parents, &[]).unwrap();
-    }
-
-    /// QAT fake-quant: `round` has a zero derivative, so the straight-through
-    /// attribute is what keeps the master weight learning.
-    #[test]
-    fn straight_through_on_a_round_passes_the_gradient_unchanged() {
-        let mut g = graph();
-        let x = param(&mut g, &[3]);
-        let y = {
-            let mut t = GraphTape::new(&mut g);
-            let body = ScalarExpr::round(
-                RoundMode::HalfAwayFromZero,
-                ScalarExpr::arg(0, Dtype::F32),
-            );
-            t.map(body, &[x]).unwrap()
-        };
-        let s = ones(&mut g, &[3]);
-        let mut reg = CustomRegistry::new();
-        straight_through(&mut reg, y, x).unwrap();
-        let got = backward_into_with(&mut g, &caps(), y, s, &[x], &reg).unwrap();
-        assert_eq!(got[0], Some(s), "the seed reaches the master weight verbatim");
     }
 
     #[test]

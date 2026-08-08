@@ -17,14 +17,13 @@ pub mod contract;
 pub mod gather_scatter;
 pub mod map_fold;
 pub mod merged;
-pub mod quantized;
 
 use fusor2_ir::Result;
 use fusor2_ir::device::{Caps, Limits};
 use fusor2_ir::dtype::{Dtype, NumericContract, QLayout};
 use fusor2_ir::egraph::Id;
 use fusor2_ir::error::Error;
-use fusor2_ir::ir::level1::{IndexSpace, L1, Operand, SchedPoint};
+use fusor2_ir::ir::level1::{ContractSide, IndexSpace, L1, Operand, SchedPoint};
 use fusor2_ir::ir::level2::{
     Addr, Buffer, BufferAccess, BufferDecl, Builtin, CoopMatrixRole, CoopSrc, ElementType, KernelIr,
     Local, LocalDecl, MemoryLevel, ReduceKind, ScalarElement, Source, Stmt, Tile, TileBinaryOp,
@@ -51,6 +50,14 @@ pub const UNIFORM_BINDING: u32 = 0;
 /// exists it is authoritative — that is the padded stride set the extractor
 /// committed to and it is never re-derived. Where none exists the value is a
 /// leaf, and its own facts are the whole truth about it.
+/// One staged input of a contraction side: a memory source, or a `Const`
+/// leaf already folded to its literal.
+#[derive(Clone)]
+pub enum StagedSource {
+    Mem(Source),
+    Const(TileExpr),
+}
+
 pub fn bound_layout(cx: &LowerCtx<'_>, value: Id) -> (Layout, Dtype) {
     let value = cx.selected(value);
     match cx.plan.buffers.iter().find(|b| b.value == value) {
@@ -342,15 +349,6 @@ pub fn matrix_split_for(
         })
 }
 
-/// The whole layout as one 2-D matrix split before the last axis.
-pub fn flatten_matrix_layout(layout: &Layout, binding: &DimBinding) -> Result<MatrixView> {
-    let split = layout
-        .rank()
-        .checked_sub(1)
-        .ok_or_else(|| Error::Plan("rank-0 operand has no matrix view".into()))?;
-    flatten_matrix_layout_split(layout, split, binding)
-}
-
 // ---------------------------------------------------------------------------
 // Element types
 // ---------------------------------------------------------------------------
@@ -378,7 +376,7 @@ pub fn qlayout_of(cx: &LowerCtx<'_>, value: Id) -> Option<QLayout> {
 }
 
 /// L0/L1 dtype to L2 element. Quantized weights bind as plain `u32` storage;
-/// their decode is a [`TileExprKind::Dequantize`] program, never a buffer type.
+/// their decode is arithmetic over those words, never a buffer type.
 pub const fn scalar_element(dtype: Dtype) -> ScalarElement {
     match dtype {
         Dtype::F32 => ScalarElement::F32,
@@ -789,62 +787,6 @@ impl L2 {
         self.intern(TileExprKind::CoopMma { a, b, c }, ty)
     }
 
-    pub fn dequantize(
-        &mut self,
-        src: fusor2_ir::ir::level2::QuantizedView,
-        k_base: TileExpr,
-        col: TileExpr,
-        mask: TileExpr,
-        fill: TileExpr,
-        lanes: u32,
-    ) -> TileExpr {
-        self.intern(
-            TileExprKind::Dequantize {
-                src,
-                k_base,
-                col,
-                mask,
-                fill,
-                lanes,
-            },
-            ElementType::Vector {
-                scalar: ScalarElement::F32,
-                lanes,
-            },
-        )
-    }
-
-    pub fn lane_of(&mut self, block: TileExpr, lane: u32) -> TileExpr {
-        self.intern(
-            TileExprKind::LaneOf { block, lane },
-            ElementType::Scalar(ScalarElement::F32),
-        )
-    }
-
-    pub fn quantized_dot(
-        &mut self,
-        src: fusor2_ir::ir::level2::QuantizedView,
-        packing: fusor2_ir::dtype::QAct,
-        activations: Vec<TileExpr>,
-        k_base: TileExpr,
-        col: TileExpr,
-        mask: TileExpr,
-        fill: TileExpr,
-    ) -> TileExpr {
-        self.intern(
-            TileExprKind::QuantizedDot {
-                src,
-                packing,
-                activations,
-                k_base,
-                col,
-                mask,
-                fill,
-            },
-            ElementType::Scalar(ScalarElement::F32),
-        )
-    }
-
     /// A private per-invocation local. Locals are identity-bearing, so they
     /// are deliberately *not* interned.
     pub fn local(&self, element: ElementType) -> Local {
@@ -949,10 +891,6 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    pub fn uniform_pack(&self) -> &UniformPack {
-        &self.pack
-    }
-
     /// The bound buffer for a plan value.
     pub fn buffer(&self, value: Id) -> Result<Buffer> {
         let slot = self
@@ -991,7 +929,8 @@ impl<'a> Ctx<'a> {
         operand: &Operand,
         row_dims: usize,
     ) -> Result<fusor2_ir::ir::level2::StorageView> {
-        let view = flatten_matrix_layout_split(&operand.layout, row_dims, &self.binding)?;
+        let layout = self.repad_operand_layout(operand)?;
+        let view = flatten_matrix_layout_split(&layout, row_dims, &self.binding)?;
         let buffer = self.buffer(operand.src)?;
         Ok(fusor2_ir::ir::level2::StorageView {
             buffer,
@@ -1000,8 +939,166 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// A contraction operand as exactly `rows` by `cols` elements. The split
-    /// comes from [`matrix_split_for`], never from the operand's rank.
+    /// An operand's layout restated over the producer's *plan* buffer.
+    ///
+    /// The operand's strides address the producer's logical dense element
+    /// space; the buffer holds whatever the plan laid out, and those differ
+    /// exactly when the producer's schedule point padded it. This is
+    /// [`Ctx::repad_index`]'s statement for the contraction path, which loads
+    /// through strided views rather than a flat index: every operand axis
+    /// must walk exactly one producer axis — its stride is that axis's dense
+    /// row-major stride — and the restatement substitutes the padded stride
+    /// for the dense one, axis for axis. A transposed or batch-permuted edge
+    /// (`permuted_alias`, an absorbed producer) satisfies that by
+    /// construction; an operand whose stride is no producer axis's own is an
+    /// error, never a silent dense read.
+    fn repad_operand_layout(&self, operand: &Operand) -> Result<Layout> {
+        let selected = self.cx.selected(operand.src);
+        let Some(plan) = self
+            .cx
+            .plan
+            .buffers
+            .iter()
+            .find(|b| b.value == selected)
+        else {
+            return Ok(operand.layout.clone());
+        };
+        let logical = self.cx.graph.facts(selected).shape.clone();
+        if plan.layout.rank() != logical.len() || logical.is_empty() {
+            return Ok(operand.layout.clone());
+        }
+        let dense = Layout::row_major_strides(&logical);
+        let unpadded = plan.layout.offset().known_eq(Dim::Const(0))
+            && plan
+                .layout
+                .shape()
+                .iter()
+                .zip(&logical)
+                .all(|(p, l)| p.known_eq(*l))
+            && plan
+                .layout
+                .strides()
+                .iter()
+                .zip(&dense)
+                .all(|(s, w)| s.known_eq(*w));
+        if unpadded {
+            return Ok(operand.layout.clone());
+        }
+        if !plan.layout.offset().known_eq(Dim::Const(0)) {
+            return Err(Error::Plan(format!(
+                "operand {} reads a buffer at offset {}; the contraction path \
+                 cannot restate an offset layout",
+                operand.src,
+                plan.layout.offset()
+            )));
+        }
+        // The operand may be a *reshaped* spelling of the producer — a
+        // `[2, 2, 3, 4]` read of a `[4, 3, 4]` contract — so an operand axis
+        // walks `k` steps of one producer axis rather than exactly one: its
+        // stride is `k * dense[i]`, and it stays inside that axis
+        // (`k * (ext - 1) < logical[i]`). Substituting `k * padded[i]`
+        // restates it, because a within-axis walk scales linearly with the
+        // axis's own stride whatever the padding did to the axes outside it.
+        let padded = plan.layout.strides();
+        let remap = |ext: Dim, s: Dim| -> Result<Dim> {
+            // Unobservable axes keep whatever they said.
+            if ext.known_eq(Dim::Const(1)) || s.known_eq(Dim::Const(0)) {
+                return Ok(s);
+            }
+            let (Some(sv), Some(ev)) = (s.as_const(), ext.as_const()) else {
+                return Err(Error::Plan(format!(
+                    "operand {} reads a padded buffer through symbolic stride {s}",
+                    operand.src
+                )));
+            };
+            for (i, d) in dense.iter().enumerate() {
+                let (Some(dv), Some(lv)) = (d.as_const(), logical[i].as_const()) else {
+                    continue;
+                };
+                if dv == 0 || sv % dv != 0 {
+                    continue;
+                }
+                let k = sv / dv;
+                if k >= 1 && k.saturating_mul(ev - 1) < lv {
+                    let pv = padded[i].as_const().ok_or_else(|| {
+                        Error::Plan(format!(
+                            "operand {} reads a buffer with symbolic padded stride",
+                            operand.src
+                        ))
+                    })?;
+                    return Ok(Dim::Const(k * pv));
+                }
+            }
+            Err(Error::Plan(format!(
+                "operand {} reads a padded buffer through stride {s}, which walks \
+                 no single axis of the producer's dense layout {dense:?}",
+                operand.src
+            )))
+        };
+        let strides: Vec<Dim> = operand
+            .layout
+            .shape()
+            .iter()
+            .zip(operand.layout.strides())
+            .map(|(ext, s)| remap(*ext, *s))
+            .collect::<Result<_>>()?;
+        Layout::from_parts(operand.layout.offset(), operand.layout.shape(), &strides)
+    }
+
+    /// The [`Source`] a contraction stages one operand from.
+    ///
+    /// Dense operands read storage. A block-quantized operand reads
+    /// [`Source::Quantized`], whose decode program the L2 emitter runs at the
+    /// `(row, col)` the staging fill already computes — so a quantized weight
+    /// costs the decode math on the way into shared memory and nothing else.
+    /// The staging tile, the fragments, the MMA and the arena footprint are the
+    /// dense ones.
+    pub fn contract_stage_source(
+        &mut self,
+        operand: &Operand,
+        view: &fusor2_ir::ir::level2::StorageView,
+    ) -> Result<Source> {
+        let Dtype::Q(fmt) = self.plan_dtype(operand.src)? else {
+            return Ok(Source::Storage(view.clone()));
+        };
+        let qlayout = qlayout_of(self.cx, operand.src).unwrap_or(QLayout::Native);
+        Ok(Source::Quantized(fusor2_ir::ir::level2::QuantizedView {
+            data: view.clone(),
+            fmt,
+            layout: qlayout,
+        }))
+    }
+
+    /// Every buffer one contraction side reads, as a staging source apiece.
+    ///
+    /// A side is a list because an absorbed producer brings its own edges —
+    /// the GGUF block decode arrives with the quant plane, the block scale,
+    /// the block minimum and the group scales, each a `Restride` of the same
+    /// block stream at its own offset. They share the side's `(rows, cols)`
+    /// index and differ only in strides, so each gets its own view and all of
+    /// them are loaded at the same coordinate before the side's `pre` runs
+    /// over the results.
+    pub fn contract_side_sources(
+        &mut self,
+        side: &ContractSide,
+        rows: u32,
+        cols: u32,
+    ) -> Result<Vec<StagedSource>> {
+        side.ops
+            .iter()
+            .map(|o| {
+                // A `Const` leaf is folded into the kernel — no buffer, no
+                // binding — exactly as `load_operand` treats it. Absorbed
+                // producers bring these: a layer norm's `1/N`, an epsilon.
+                if let Some(lit) = self.const_operand(o.src) {
+                    return Ok(StagedSource::Const(lit));
+                }
+                let view = self.contract_operand_view(o, rows, cols)?;
+                Ok(StagedSource::Mem(self.contract_stage_source(o, &view)?))
+            })
+            .collect()
+    }
+
     pub fn contract_operand_view(
         &self,
         operand: &Operand,
@@ -1340,6 +1437,116 @@ impl<'a> Ctx<'a> {
         })
     }
 
+    /// Re-address a **logical** dense element index of `src` into the buffer
+    /// the plan actually laid out for it.
+    ///
+    /// `Plan::buffers` is authoritative about storage, and
+    /// `fusor2_cost::plan::buffer_layout_for` pads a `Coop` contraction's
+    /// output to whole `bm x bn` blocks. Every other reader of that value
+    /// still names its elements densely — an `Operand`'s `layout`, its
+    /// `AccessPlan::Unflatten` map and the fold's row/lane arithmetic are all
+    /// stated over the logical shape — so without this step a `[16, 1]`
+    /// contraction padded to `[16, 16]` is read as the first sixteen elements
+    /// of row 0: one real value followed by fifteen zeros of padding. That is
+    /// how `sample_standard_token_respects_top_p` drew a token id of 120 out
+    /// of a 16-token vocabulary: the nucleus prefix scan read as all-zero, so
+    /// every candidate passed the filter and the one-hot selector summed to
+    /// `0 + 1 + .. + 15`.
+    ///
+    /// Identity — and emitted as nothing — whenever the plan's layout is the
+    /// logical dense one, which is every value the extractor did not pad.
+    fn repad_index(&mut self, src: Id, index: TileExpr) -> Result<TileExpr> {
+        let selected = self.cx.selected(src);
+        let Some(plan) = self
+            .cx
+            .plan
+            .buffers
+            .iter()
+            .find(|b| b.value == selected)
+            .cloned()
+        else {
+            return Ok(index);
+        };
+        let logical = self.cx.graph.facts(selected).shape.clone();
+        if plan.layout.rank() != logical.len() || logical.is_empty() {
+            return Ok(index);
+        }
+        let strides = plan.layout.strides().to_vec();
+        let shape = plan.layout.shape().to_vec();
+        let dense = Layout::row_major_strides(&logical);
+        let unpadded = plan.layout.offset().known_eq(Dim::Const(0))
+            && shape.iter().zip(&logical).all(|(p, l)| p.known_eq(*l))
+            && strides.iter().zip(&dense).all(|(s, w)| s.known_eq(*w));
+        if unpadded {
+            return Ok(index);
+        }
+        // Every extent has to be decidable to state the delinearize; when one
+        // is not, the previous dense address is still what the rest of the
+        // launch agreed on, so leave it alone rather than mint a wrong one.
+        let Ok(extents) = logical
+            .iter()
+            .map(|d| self.binding.require(*d))
+            .collect::<Result<Vec<u64>>>()
+        else {
+            return Ok(index);
+        };
+        let Ok(logical_strides) = dense
+            .iter()
+            .map(|d| self.binding.require(*d))
+            .collect::<Result<Vec<u64>>>()
+        else {
+            return Ok(index);
+        };
+        let Ok(padded_strides) = strides
+            .iter()
+            .map(|d| self.binding.require(*d))
+            .collect::<Result<Vec<u64>>>()
+        else {
+            return Ok(index);
+        };
+        let offset = plan.layout.offset().as_const().unwrap_or(0);
+
+        let mut acc: Option<TileExpr> = (offset != 0).then(|| {
+            let o = u32::try_from(offset).unwrap_or(u32::MAX);
+            self.b.u32(o)
+        });
+        for axis in 0..logical.len() {
+            let extent = extents[axis];
+            let stride = padded_strides[axis];
+            if extent <= 1 || stride == 0 {
+                continue;
+            }
+            let mut e = index.clone();
+            let div = logical_strides[axis];
+            if div > 1 {
+                let d = self.b.u32(u32::try_from(div).unwrap_or(u32::MAX));
+                e = self
+                    .b
+                    .binary(TileBinaryOp::Div, e, d, NumericContract::RELAXED);
+            }
+            // The most significant axis needs no `%`: `flat` is already below
+            // its bound for every live lane, and an overhang lane is masked.
+            if axis > 0 {
+                let m = self.b.u32(u32::try_from(extent).unwrap_or(u32::MAX));
+                e = self
+                    .b
+                    .binary(TileBinaryOp::Rem, e, m, NumericContract::RELAXED);
+            }
+            if stride != 1 {
+                let s = self.b.u32(u32::try_from(stride).unwrap_or(u32::MAX));
+                e = self.b.mul(e, s);
+            }
+            acc = Some(match acc {
+                Some(a) => self.b.add(a, e),
+                None => e,
+            });
+        }
+        Ok(match acc {
+            Some(a) => a,
+            None => self.b.u32(0),
+        })
+    }
+
     /// Load one operand at an already-computed **storage** element index. The
     /// mask is the plan's runtime bounds obligation; a load is never emitted
     /// unmasked unless the extent is a compile-time multiple of the block.
@@ -1351,6 +1558,14 @@ impl<'a> Ctx<'a> {
         if let Some(lit) = self.const_operand(operand.src) {
             return Ok(lit);
         }
+        // An `Operand`'s index arithmetic is stated over the producer's
+        // *logical* dense element space; the buffer it lands in is whatever
+        // the plan laid out. Those differ exactly when the producer's
+        // schedule point padded it — a `Coop` contraction pads `m` to `bm`
+        // and `n` to `bn` so its subgroup-collective store needs no mask —
+        // and then a dense read of element `i` lands `i` columns into row 0
+        // instead of on row `i`.
+        let index = self.repad_index(operand.src, index)?;
         let buffer = self.buffer(operand.src)?;
         // A block-quantized operand has no dense element to load: reading
         // element `i` runs the format's decode program at flat index `i`.
@@ -1380,8 +1595,6 @@ impl<'a> Ctx<'a> {
                 },
                 fmt,
                 layout: qlayout,
-                rows: u32::try_from(rows).unwrap_or(u32::MAX),
-                cols: u32::try_from(cols).unwrap_or(u32::MAX),
             };
             return Ok(self
                 .b
@@ -1408,7 +1621,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// The literal a `Leaf::Const` operand folds to, if it is one.
-    fn const_operand(&mut self, src: Id) -> Option<TileExpr> {
+    pub(crate) fn const_operand(&mut self, src: Id) -> Option<TileExpr> {
         let selected = self.cx.selected(src);
         let fusor2_ir::ir::Op::L0(fusor2_ir::ir::level0::L0::Leaf(
             fusor2_ir::ir::level0::LeafKind::Const { value, .. },
@@ -1469,7 +1682,6 @@ pub fn lower_node(
         L1::KMap { .. } => map_fold::lower_kmap(ctx, op, theta).map(|k| vec![k]),
         L1::KFold { .. } => map_fold::lower_kfold(ctx, op, theta).map(|k| vec![k]),
         L1::KContract { family, .. } => contract::lower_contract(ctx, op, *family, theta),
-        L1::KQContract { .. } => quantized::lower_kqcontract(ctx, op, theta).map(|k| vec![k]),
         L1::KGather { .. } => gather_scatter::lower_kgather(ctx, op, theta).map(|k| vec![k]),
         L1::KScatter { .. } => gather_scatter::lower_kscatter(ctx, op, theta),
         L1::KMerged(m) => merged::lower_kmerged(ctx, m, theta).map(|k| vec![k]),

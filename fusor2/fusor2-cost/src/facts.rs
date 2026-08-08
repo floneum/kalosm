@@ -11,10 +11,8 @@
 //!
 //! Owned by W6.
 
-use crate::cache;
 use fusor2_ir::cost::{DeviceFacts, RateDtype};
 use fusor2_ir::device::{Caps, DeviceKind};
-use std::path::Path;
 
 /// Rows of [`DeviceFacts::mac_per_us`] in `MacUnit` order.
 ///
@@ -53,9 +51,7 @@ const fn cpu_mac_table(fma_f32: u64) -> [[u64; RateDtype::COUNT]; 3] {
 ///
 /// This is the only calibrated rate vector that exists, so it seeds *every*
 /// GPU: an unmeasured device gets an honest starting point and calibration
-/// overwrites it. [`other_gpu_seed`] is the conservative half-rate table for
-/// callers that would rather start pessimistic; nothing selects it from a
-/// device name.
+/// overwrites it.
 ///
 /// Not a `const fn`: [`DeviceFacts`] owns a [`Caps`], which owns a `String`.
 pub fn seed_facts_gpu(caps: &Caps) -> DeviceFacts {
@@ -67,30 +63,6 @@ pub fn seed_facts_gpu(caps: &Caps) -> DeviceFacts {
         mac_per_us: gpu_mac_table(4_450_000, 17_800_000),
         trans_ps: 4,
         store_ps_per_element: 4,
-        saturation_lanes: 65_536,
-        single_buffered_traffic_pct: 105,
-        compile_ps_per_kernel: 1_000_000_000,
-        thread_wake_ps: 5_000_000,
-        caps: caps.clone(),
-    }
-}
-
-/// The reference's `OTHER_MATMUL_RATES` scaled the same way: every MAC rate
-/// halved, half the DRAM and threadgroup bandwidth, twice the per-element
-/// store cost, half the last-level cache.
-///
-/// Exposed for callers that want a deliberately conservative start on an
-/// unknown adapter. [`seed_facts`] never reaches it, because reaching it
-/// would require testing the adapter name.
-pub fn other_gpu_seed(caps: &Caps) -> DeviceFacts {
-    DeviceFacts {
-        launch_ps: 1_000_000,
-        dram_bytes_per_us: 190_000,
-        llc_bytes: 4 << 20,
-        wg_bytes_per_us: 350_000,
-        mac_per_us: gpu_mac_table(2_225_000, 8_900_000),
-        trans_ps: 4,
-        store_ps_per_element: 8,
         saturation_lanes: 65_536,
         single_buffered_traffic_pct: 105,
         compile_ps_per_kernel: 1_000_000_000,
@@ -138,32 +110,6 @@ pub fn seed_facts(caps: &Caps) -> DeviceFacts {
         DeviceKind::Gpu => seed_facts_gpu(caps),
         DeviceKind::Cpu => seed_facts_cpu(caps),
     }
-}
-
-/// A conservative table for any device. Retained under the scaffold's name;
-/// it is [`other_gpu_seed`] for a GPU and [`seed_facts_cpu`] for a CPU.
-pub fn generic_seed(caps: &Caps) -> DeviceFacts {
-    match caps.kind {
-        DeviceKind::Gpu => other_gpu_seed(caps),
-        DeviceKind::Cpu => seed_facts_cpu(caps),
-    }
-}
-
-/// The cached calibration for these caps if one is on disk and its format
-/// version and caps fingerprint both match, otherwise [`seed_facts`].
-///
-/// `dir` defaults to [`cache::cache_dir`]. A corrupt or stale file is a
-/// miss, never an error: a bad cache must not fail a training run.
-pub fn seed_or_cached(caps: &Caps, dir: Option<&Path>) -> DeviceFacts {
-    let owned;
-    let dir = match dir {
-        Some(d) => d,
-        None => {
-            owned = cache::cache_dir();
-            owned.as_path()
-        }
-    };
-    cache::load(dir, caps).unwrap_or_else(|| seed_facts(caps))
 }
 
 #[cfg(test)]
@@ -289,13 +235,6 @@ pub(crate) mod tests {
         assert_eq!(f.single_buffered_traffic_pct, 105);
         assert_eq!(f.compile_ps_per_kernel, 1_000_000_000);
         assert_eq!(f.thread_wake_ps, 5_000_000);
-
-        let o = other_gpu_seed(&gpu_caps("dev"));
-        assert_eq!(o.mac_rate(MacUnit::Fma, Dtype::F32), 2_225_000);
-        assert_eq!(o.dram_bytes_per_us, 190_000);
-        assert_eq!(o.wg_bytes_per_us, 350_000);
-        assert_eq!(o.store_ps_per_element, 8);
-        assert_eq!(o.llc_bytes, 4 << 20);
     }
 
     /// Every field has a seed. A zero rate would divide by one and silently

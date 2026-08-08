@@ -21,7 +21,6 @@ use fusor2_ir::ir::level0::{L0, LeafKind};
 use fusor2_ir::ir::{Children, Node, Op};
 use fusor2_ir::{Error, Result};
 use rustc_hash::FxHashMap;
-use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -448,21 +447,10 @@ fn adjoint_of_node(
                 match kind {
                     AdjointKind::Analytic(f) => f(tape, node, grad, operands, id),
                     AdjointKind::Structural => structural_adjoint(tape, node, grad, operands, id),
-                    AdjointKind::StraightThrough => Ok(straight_through_grads(grad, operands.len())),
                 }
             }
         },
     }
-}
-
-/// Forward opaque, adjoint identity: operand 0 receives the gradient
-/// unchanged and every other operand receives none.
-pub fn straight_through_grads(grad: Val, arity: usize) -> Grads {
-    let mut out: Grads = SmallVec::with_capacity(arity);
-    for slot in 0..arity {
-        out.push(if slot == 0 { Some(grad) } else { None });
-    }
-    out
 }
 
 #[cfg(test)]

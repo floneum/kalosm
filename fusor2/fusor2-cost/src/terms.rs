@@ -178,13 +178,6 @@ pub fn occupancy_scale_num_den(facts: &DeviceFacts, resident_lanes: u64) -> (u12
     )
 }
 
-/// [`occupancy_scale_num_den`] as fixed point with a denominator of 1000,
-/// for callers that want one number. `1000` means "saturated".
-pub fn occupancy_scale(facts: &DeviceFacts, resident_lanes: u64) -> u64 {
-    let (num, den) = occupancy_scale_num_den(facts, resident_lanes);
-    u64::try_from(num * 1_000 / den).unwrap_or(u64::MAX)
-}
-
 /// Apply an occupancy rational to a duration, saturating.
 pub fn scaled(value: Picoseconds, num: u128, den: u128) -> Picoseconds {
     ps(u128::from(value.0) * num / den.max(1))
@@ -199,102 +192,10 @@ pub fn combine_ps(facts: &DeviceFacts, splits: u32, padded_bytes: u64) -> Picose
     if splits <= 1 {
         return Picoseconds(0);
     }
-    ps(u128::from(splits + 1) * u128::from(padded_bytes) * PS_PER_US
-        / u128::from(facts.dram_bytes_per_us.max(1)))
-}
-
-/// Grid traversal swizzle: how many M-lines of the cooperative grid walk
-/// together before advancing N.
-///
-/// The swizzle exists to share B column slabs across the resident wavefront,
-/// and it pays exactly when B is too big to sit in the last-level cache.
-/// This reads `llc_bytes` from the one device-fact source; the reference's
-/// private `LLC_CLASS = 32 MiB` and `SMALL_B = 4 MiB` constants — unrelated
-/// to its own `Device::last_level_cache_bytes()` — are deleted.
-///
-/// At Apple's 8 MiB this makes the 4096-cube f32 case (64 MiB of B) pick 4,
-/// which is the reference's documented 2.7% miss.
-pub fn swizzle_group_m(facts: &DeviceFacts, b_bytes: u64) -> u32 {
-    if b_bytes <= facts.llc_bytes / 2 {
-        1
-    } else if b_bytes <= facts.llc_bytes * 8 {
-        4
-    } else {
-        8
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The four named per-kernel parameters
-// ---------------------------------------------------------------------------
-//
-// The reference has one `work_per_thread = 4` governing elementwise register
-// tiling, row-program lane-group narrowing, row-program register staging and
-// the horizontal-merge element bound. One number tuned for elementwise
-// register pressure silently controls three unrelated policies. Here each is
-// its own function of `DeviceFacts` plus that kernel's own shape, and **none
-// reads another's value**.
-
-/// Live vector registers an elementwise body can hold staged outputs in:
-/// ~32 architectural vector registers at ~8 per staged output.
-const ELEMENTWISE_STAGED_OUTPUTS: u64 = 4;
-/// Registers a row reduction can spend on staged reads before it spills its
-/// accumulator. Wider than the elementwise class per value because the
-/// reduction stages plain scalars, narrower in total because it also carries
-/// per-phase state.
-const ROW_STAGED_READS: u64 = 8;
-/// Per-lane staging pressure of a merged wave's body. A merged segment
-/// carries the union of its members' live values, so its budget is the
-/// tightest of the four.
-const MERGED_STAGED_VALUES: u64 = 4;
-
-/// Outputs one thread computes when an elementwise register-reuse tiling
-/// engages. Bounded above by the body's register budget and below by keeping
-/// the post-tiling thread count at the parallelism floor.
-pub fn elementwise_work_per_thread(facts: &DeviceFacts, elements: u64) -> u32 {
-    let by_occupancy = elements / u64::from(facts.saturation_lanes).max(1);
-    by_occupancy.clamp(1, ELEMENTWISE_STAGED_OUTPUTS) as u32
-}
-
-/// Narrowest lane group a row program may use for a reduction of extent `k`
-/// over `rows` rows.
-///
-/// A group narrower than this leaves the dispatch short of the parallelism
-/// floor; a group wider than `k` wastes lanes outright. Rounded up to a
-/// power of two so the cross-lane tree stays balanced.
-pub fn row_lane_group_floor(facts: &DeviceFacts, k: u64, rows: u64) -> u32 {
-    let need = u64::from(facts.saturation_lanes)
-        .max(1)
-        .div_ceil(rows.max(1));
-    let floor = need.clamp(1, k.max(1)).next_power_of_two();
-    u32::try_from(floor).unwrap_or(u32::MAX)
-}
-
-/// Elements one lane may stage into registers before a row program falls
-/// back to re-reading storage per phase. Zero means "do not stage".
-pub fn row_staging_budget(facts: &DeviceFacts, k: u64, lanes_per_row: u32) -> u32 {
-    // Deliberately independent of every other parameter here: the reference
-    // shares one constant across this and three unrelated policies.
-    let _ = facts;
-    let per_lane = k.div_ceil(u64::from(lanes_per_row.max(1)));
-    if per_lane > ROW_STAGED_READS {
-        0
-    } else {
-        per_lane as u32
-    }
-}
-
-/// Elementwise element-count ceiling for joining a merged wave.
-///
-/// A segment big enough to saturate the device on its own gains nothing from
-/// sharing a dispatch, and a segment whose operands no longer fit the
-/// last-level cache is bandwidth-bound rather than launch-bound. The bound
-/// is the tighter of the two, so it degrades on a device with a small cache
-/// instead of staying pinned at the reference's 262,144.
-pub fn merge_elements_bound(facts: &DeviceFacts, elem_bytes: u32) -> u64 {
-    let by_occupancy = u64::from(facts.saturation_lanes).max(1) * MERGED_STAGED_VALUES;
-    let by_cache = facts.llc_bytes / u64::from(elem_bytes.max(1));
-    by_occupancy.min(by_cache).max(1)
+    ps(
+        u128::from(splits + 1) * u128::from(padded_bytes) * PS_PER_US
+            / u128::from(facts.dram_bytes_per_us.max(1)),
+    )
 }
 
 #[cfg(test)]
@@ -395,22 +296,6 @@ mod tests {
         assert_eq!(at(llc / 2, 1), at(llc / 2, 16));
     }
 
-    /// Test 6.
-    #[test]
-    fn swizzle_reads_llc_bytes() {
-        let mut f = seed_facts(&gpu_caps("dev"));
-        // 4096-cube f32: B is k*n*4 = 64 MiB.
-        let b_bytes = 4096u64 * 4096 * 4;
-        assert_eq!(f.llc_bytes, 8 << 20);
-        assert_eq!(swizzle_group_m(&f, b_bytes), 4);
-
-        f.llc_bytes = 512 << 20;
-        assert_eq!(swizzle_group_m(&f, b_bytes), 1);
-
-        f.llc_bytes = 8 << 20;
-        assert_eq!(swizzle_group_m(&f, 256 << 20), 8);
-    }
-
     /// The occupancy law is a cube root of the shortfall against half the
     /// saturation floor, and exactly 1 once saturated.
     #[test]
@@ -424,33 +309,6 @@ mod tests {
         let (num, den) = occupancy_scale_num_den(&f, 20_480);
         let scale = num as f64 / den as f64;
         assert!((scale - 1.6f64.cbrt()).abs() < 0.001, "{scale}");
-    }
-
-    /// The four per-kernel parameters are independent functions. Changing a
-    /// fact only one of them reads must move only that one.
-    #[test]
-    fn per_kernel_parameters_are_independent() {
-        let f = seed_facts(&gpu_caps("dev"));
-        assert_eq!(elementwise_work_per_thread(&f, 1_000), 1);
-        assert_eq!(elementwise_work_per_thread(&f, 4 * 65_536), 4);
-        assert_eq!(elementwise_work_per_thread(&f, 1 << 30), 4);
-
-        // A 64-row reduction needs 1024 lanes per row to reach the floor,
-        // clamped by k.
-        assert_eq!(row_lane_group_floor(&f, 4_096, 64), 1_024);
-        assert_eq!(row_lane_group_floor(&f, 128, 64), 128);
-        assert_eq!(row_lane_group_floor(&f, 4_096, 1 << 20), 1);
-
-        assert_eq!(row_staging_budget(&f, 256, 64), 4);
-        assert_eq!(row_staging_budget(&f, 512, 64), 8);
-        assert_eq!(row_staging_budget(&f, 1_024, 64), 0);
-
-        // Occupancy-bound on Apple's 8 MiB cache; cache-bound once the cache
-        // shrinks, which is the whole point of not pinning a constant.
-        assert_eq!(merge_elements_bound(&f, 4), 262_144);
-        let mut small = f.clone();
-        small.llc_bytes = 256 << 10;
-        assert_eq!(merge_elements_bound(&small, 4), 65_536);
     }
 
     /// `math_ps` is a genuine lower bound: no traffic, no occupancy, and

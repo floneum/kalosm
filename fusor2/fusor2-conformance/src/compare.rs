@@ -90,34 +90,6 @@ impl Display for ItemMismatchError {
 
 impl std::error::Error for ItemMismatchError {}
 
-/// A whole value disagreed (a shape, a launch count, a plan hash).
-#[derive(Debug, Clone)]
-pub struct ValueMismatchError {
-    pub expected: String,
-    pub actual: String,
-}
-
-impl ValueMismatchError {
-    pub fn new(expected: impl Debug, actual: impl Debug) -> Self {
-        Self {
-            expected: format!("{expected:?}"),
-            actual: format!("{actual:?}"),
-        }
-    }
-}
-
-impl Display for ValueMismatchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "value mismatch: expected {}, got {}",
-            self.expected, self.actual
-        )
-    }
-}
-
-impl std::error::Error for ValueMismatchError {}
-
 // ---------------------------------------------------------------------------
 // Comparators
 // ---------------------------------------------------------------------------
@@ -233,14 +205,6 @@ pub fn exact_compare() -> Comparator {
     Box::new(exact_eq)
 }
 
-pub fn approx_compare(tol: f32) -> Comparator {
-    Box::new(move |d, s, a, b| approx_eq(d, s, a, b, tol))
-}
-
-pub fn relative_compare(rel: f32) -> Comparator {
-    Box::new(move |d, s, a, b| relative_eq(d, s, a, b, rel))
-}
-
 pub fn approx_or_relative_compare(abs: f32, rel: f32) -> Comparator {
     Box::new(move |d, s, a, b| approx_or_relative_eq(d, s, a, b, abs, rel))
 }
@@ -252,15 +216,6 @@ pub fn compare_for(dtype: Dtype) -> Comparator {
         exact_compare()
     } else {
         approx_or_relative_compare(abs, rel)
-    }
-}
-
-/// Compare two whole values, reporting both on a mismatch.
-pub fn exact_value_compare<T: Debug + PartialEq>(a: &T, b: &T) -> Result<(), ValueMismatchError> {
-    if a == b {
-        Ok(())
-    } else {
-        Err(ValueMismatchError::new(a, b))
     }
 }
 

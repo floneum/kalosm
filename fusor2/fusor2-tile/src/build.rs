@@ -10,10 +10,10 @@
 //!
 //! Owned by W3.
 
-use fusor2_ir::dtype::{NumericContract, QAct, RoundMode};
+use fusor2_ir::dtype::{NumericContract, RoundMode};
 use fusor2_ir::ir::level2::{
-    Accumulator, Addr, Buffer, BufferAccess, BufferDecl, Builtin, ByteArenaToken, CoopMatrixRole,
-    CoopSrc, ElementType, KernelIr, Local, LocalDecl, QuantizedView, ReduceKind, ScalarElement,
+    Accumulator, Addr, Buffer, BufferAccess, BufferDecl, Builtin, CoopMatrixRole,
+    CoopSrc, ElementType, KernelIr, Local, LocalDecl, ReduceKind, ScalarElement,
     Source, Stmt, StorageView, Tile, TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileExprKind,
     TileLayout, TileLiteral, TileReduceOp, TileUnaryOp,
 };
@@ -51,9 +51,6 @@ fn tag_of(kind: &TileExprKind) -> DiscriminantTag {
         TileExprKind::CoopLoad { .. } => 16,
         TileExprKind::CoopZero { .. } => 21,
         TileExprKind::CoopMma { .. } => 17,
-        TileExprKind::Dequantize { .. } => 18,
-        TileExprKind::LaneOf { .. } => 19,
-        TileExprKind::QuantizedDot { .. } => 20,
     })
 }
 
@@ -70,7 +67,6 @@ pub struct TileBuilder {
     locals: Vec<Local>,
     buffers: Vec<Buffer>,
     body: Vec<Stmt>,
-    byte_arena: Option<ByteArenaToken>,
 }
 
 impl TileBuilder {
@@ -139,15 +135,6 @@ impl TileBuilder {
         &self.locals
     }
 
-    /// Whether `local` was declared through this builder.
-    pub fn declares_local(&self, local: &Local) -> bool {
-        self.locals.iter().any(|l| Arc::ptr_eq(l, local))
-    }
-
-    pub fn enable_byte_arena(&mut self, token: ByteArenaToken) {
-        self.byte_arena = Some(token);
-    }
-
     /// How many distinct expression nodes have been interned.
     pub fn interned_len(&self) -> usize {
         self.exprs.len()
@@ -195,9 +182,6 @@ impl TileBuilder {
     }
     pub fn lit_u32(&mut self, value: u32) -> TileExpr {
         self.lit(TileLiteral::U32(value))
-    }
-    pub fn lit_i32(&mut self, value: i32) -> TileExpr {
-        self.lit(TileLiteral::I32(value))
     }
     pub fn lit_bool(&mut self, value: bool) -> TileExpr {
         self.lit(TileLiteral::Bool(value))
@@ -312,10 +296,6 @@ impl TileBuilder {
         })
     }
 
-    pub fn vec_component(&mut self, vector: TileExpr, component: u32) -> TileExpr {
-        self.infer_expr(TileExprKind::VecComponent { vector, component })
-    }
-
     pub fn dot(&mut self, left: TileExpr, right: TileExpr) -> TileExpr {
         self.infer_expr(TileExprKind::Dot { left, right })
     }
@@ -424,52 +404,6 @@ impl TileBuilder {
         self.infer_expr(TileExprKind::CoopMma { a, b, c })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn dequantize(
-        &mut self,
-        src: QuantizedView,
-        k_base: TileExpr,
-        col: TileExpr,
-        mask: TileExpr,
-        fill: TileExpr,
-        lanes: u32,
-    ) -> TileExpr {
-        self.infer_expr(TileExprKind::Dequantize {
-            src,
-            k_base,
-            col,
-            mask,
-            fill,
-            lanes,
-        })
-    }
-
-    pub fn lane_of(&mut self, block: TileExpr, lane: u32) -> TileExpr {
-        self.infer_expr(TileExprKind::LaneOf { block, lane })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn quantized_dot(
-        &mut self,
-        src: QuantizedView,
-        packing: QAct,
-        activations: Vec<TileExpr>,
-        k_base: TileExpr,
-        col: TileExpr,
-        mask: TileExpr,
-        fill: TileExpr,
-    ) -> TileExpr {
-        self.infer_expr(TileExprKind::QuantizedDot {
-            src,
-            packing,
-            activations,
-            k_base,
-            col,
-            mask,
-            fill,
-        })
-    }
-
     // -----------------------------------------------------------------
     // Statement constructors — plain data, never interned
     // -----------------------------------------------------------------
@@ -559,17 +493,8 @@ impl TileBuilder {
         }
     }
 
-    pub fn break_(&self) -> Stmt {
-        Stmt::Break
-    }
-    pub fn return_(&self) -> Stmt {
-        Stmt::Return
-    }
     pub fn barrier(&self) -> Stmt {
         Stmt::Barrier
-    }
-    pub fn storage_barrier(&self) -> Stmt {
-        Stmt::StorageBarrier
     }
 
     // -----------------------------------------------------------------
@@ -594,13 +519,16 @@ impl TileBuilder {
 
     /// Close the kernel. Buffers come out in binding order, so the derived
     /// bind group and the builder's buffer list cannot drift.
+    ///
+    /// Never byte-arena'd: the token is a device capability the backend
+    /// lowerers mint from their own `Caps`, and this builder has none.
     pub fn finish(&mut self, grid: [u32; 3], block: u32, name: &'static str) -> KernelIr {
         KernelIr {
             buffers: self.buffers(),
             grid,
             block,
             body: std::mem::take(&mut self.body),
-            byte_arena: self.byte_arena,
+            byte_arena: None,
             name,
         }
     }

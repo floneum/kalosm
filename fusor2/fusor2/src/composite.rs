@@ -13,6 +13,7 @@ pub mod conv;
 pub mod loss;
 pub mod normalization;
 pub mod pool;
+pub mod quantized;
 pub mod rope;
 pub mod upsample;
 

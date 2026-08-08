@@ -50,7 +50,7 @@
 //! Owned by W2.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
-use crate::ir::level1::{AccessPlan, IndexSpace, L1, Operand};
+use crate::ir::level1::{AccessPlan, ContractSide, IndexSpace, L1, Operand};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::rules::{MapView, access_legal_in, map_view, operand_dtypes, shift_args};
@@ -835,15 +835,13 @@ pub fn map_into_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
 ///
 /// `KContract` carries exactly two operand edges, so only a one-operand
 /// producer can be absorbed without inventing a third edge.
-pub fn map_into_contract(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
+pub fn map_into_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::L1(L1::KContract {
         m,
         n,
         k,
         batch,
         family,
-        pre_a,
-        pre_b,
         post,
         acc,
         a,
@@ -854,37 +852,24 @@ pub fn map_into_contract(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_
         return None;
     };
     let space = IndexSpace::new([*batch, *m, *n, *k]);
-    let mut new_a = a.clone();
-    let mut new_b = rhs.clone();
-    let mut new_pre_a = pre_a.clone();
-    let mut new_pre_b = pre_b.clone();
-    let mut changed = false;
-
-    // The `pre` chain runs per loaded element of its own operand, so the
-    // guard is the producer's access predicate at that operand's shape — the
-    // reader's `(batch, m, n, k)` space covers it by construction.
-    for (operand, pre) in [(&mut new_a, &mut new_pre_a), (&mut new_b, &mut new_pre_b)] {
-        if !matches!(operand.access, AccessPlan::Alias) {
-            continue;
-        }
-        let Some(inner) = map_view(b, operand.src) else {
-            continue;
-        };
-        if inner.ops.len() != 1 || !inner.ops.iter().all(|o| access_legal_in(&o.access, &space)) {
-            continue;
-        }
-        if !matches!(inner.ops[0].access, AccessPlan::Alias) {
-            continue;
-        }
-        *pre = pre.compose(&[inner.body.clone()]);
-        *operand = Operand {
-            src: inner.ops[0].src,
-            layout: inner.ops[0].layout.clone(),
-            access: inner.ops[0].access.clone(),
-        };
-        changed = true;
+    let new_a = absorb_into_side(b, a, &space);
+    let new_b = absorb_into_side(b, rhs, &space);
+    if new_a.is_none() && new_b.is_none() {
+        return None;
     }
-    if !changed {
+    // The same device budget `map_into_map` consults, over both sides at
+    // once: a contraction binds every operand of both sides in one launch,
+    // so the count that has to fit is the union, not either side's own.
+    let budget = f.caps().limits.max_storage_buffers_per_shader_stage as usize;
+    let all: Vec<Operand> = new_a
+        .as_ref()
+        .unwrap_or(a)
+        .ops
+        .iter()
+        .chain(new_b.as_ref().unwrap_or(rhs).ops.iter())
+        .cloned()
+        .collect();
+    if storage_bindings(b, &all) > budget {
         return None;
     }
     let fused = b
@@ -894,16 +879,239 @@ pub fn map_into_contract(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_
             k: *k,
             batch: *batch,
             family: *family,
-            pre_a: new_pre_a,
-            pre_b: new_pre_b,
             post: post.clone(),
             acc: *acc,
-            a: new_a,
-            b: new_b,
+            a: new_a.unwrap_or_else(|| a.clone()),
+            b: new_b.unwrap_or_else(|| rhs.clone()),
             sched: sched.clone(),
         })
         .ok()?;
     b.union(id, fused).ok()
+}
+
+/// Absorb one elementwise producer into a contraction side, or `None` when
+/// no slot of it reads one.
+///
+/// # Why the producer's own arity is not a condition
+///
+/// It used to be. This rule required `inner.ops.len() == 1`, because a side
+/// was exactly one [`Operand`] and there was nowhere to put a second edge —
+/// which made the *one* producer worth absorbing permanently ineligible. The
+/// GGUF block decode reads its block stream through several `Restride` views
+/// at once (quant plane, block scale, block minimum, group scales), so it
+/// arrives here with nine operands and no rewrite collapses them to one. The
+/// guard did not restrict absorption to safe cases; it excluded the case.
+///
+/// With [`ContractSide`] holding a list the producer's operands simply join
+/// the side's, and the quantized staging fill stops being a backend special
+/// case. Every *other* condition is unchanged: the slot must be a plain
+/// alias, and each operand the producer brings must satisfy the reader's
+/// access predicate over the contraction's `(batch, m, n, k)` space.
+///
+/// # Every eligible slot absorbs in one fire, and that is not an optimization
+///
+/// The obvious spelling — absorb the first eligible slot and let the additive
+/// rule re-fire — is what a one-operand side could afford. There, absorbing
+/// left the arity at one, so the successors of a node formed a *chain* as
+/// long as the producer chain was deep.
+///
+/// With a list they form a lattice. A side of width `w` with `e` eligible
+/// slots has `e` distinct one-slot successors, each of which has its own
+/// eligible set, so the class fills with every order in which the absorptions
+/// could have been performed — nodes that all denote the same value and
+/// differ only in how far along each edge the rewriting got. Measured: the
+/// `sampling::standard` tests stopped terminating, spinning in `saturate`
+/// with the graph still growing after twenty minutes, because the sampler's
+/// `lm_head` contraction reads a multi-operand `where_cond` chain.
+///
+/// Absorbing every eligible slot at once gives each node exactly one
+/// successor per side, so the successors are a chain again and the node count
+/// is linear in producer depth. What is lost is the *partial* absorptions as
+/// separate alternatives — the class still holds the un-absorbed node (this
+/// rule is additive) and the fully absorbed one, which are the two the cost
+/// model actually chooses between.
+fn absorb_into_side(
+    b: &Builder<'_>,
+    side: &ContractSide,
+    space: &IndexSpace,
+) -> Option<ContractSide> {
+    let eligible = |o: &Operand| -> Option<(MapView, SmallVec<[usize; 4]>)> {
+        if !matches!(o.access, AccessPlan::Alias) {
+            return None;
+        }
+        let mut inner = map_view(b, o.src)?;
+        // Fold each operand's pure-view spine into its layout before the
+        // splice. A producer's operand routinely names a `Restride` class —
+        // every broadcast row statistic does — and carrying that class into
+        // the contraction forces it to materialize as its own launch, since
+        // the contraction path has no later rule to fold it. Composed here it
+        // is a stride vector (a broadcast is stride 0) and costs nothing. A
+        // spine that does not compose to an offset-0 plain layout is left
+        // alone: the operand stays legal, just materialized.
+        for p in inner.ops.iter_mut() {
+            if !matches!(p.access, AccessPlan::Alias) {
+                continue;
+            }
+            let spine = b.trace_pure_views(p.src);
+            if spine.views.len() != 1 {
+                continue;
+            }
+            // Only an identity read of the view composes by substitution:
+            // the operand's own strides must be the view value's dense
+            // row-major set, or the composed walk is not the view's.
+            let view_shape = b.facts_of(p.src).shape.clone();
+            if p.layout.shape() != &view_shape[..]
+                || !p.layout.offset().known_eq(Dim::Const(0))
+                || p.layout
+                    .strides()
+                    .iter()
+                    .zip(&Layout::row_major_strides(&view_shape))
+                    .any(|(s, w)| !s.known_eq(*w))
+            {
+                continue;
+            }
+            let Op::L0(crate::ir::level0::L0::Restride { specs, .. }) =
+                b.node(spine.views[0]).op.clone()
+            else {
+                continue;
+            };
+            let base_shape = b.facts_of(spine.base).shape.clone();
+            let Some(composed) = crate::rules::composed_layout(&specs, &base_shape) else {
+                continue;
+            };
+            // Clause 8: an L1 operand may not name a buffer offset.
+            if !composed.offset().known_eq(Dim::Const(0)) {
+                continue;
+            }
+            *p = Operand {
+                src: spine.base,
+                layout: composed,
+                access: AccessPlan::Alias,
+            };
+        }
+        if !inner
+            .ops
+            .iter()
+            .all(|p| matches!(p.access, AccessPlan::Alias) && access_legal_in(&p.access, space))
+        {
+            return None;
+        }
+        // The edge may read the producer through any *axis permutation* of
+        // its dense value — `permuted_alias` mints exactly that for a
+        // transposed or batch-reordered contraction operand — and the
+        // permutation must survive absorption. It is carried by permuting
+        // every absorbed operand's own axes with it (see [`permute_layout`]);
+        // an edge that is not a permutation (a window, a broadcast, an
+        // offset) declines, since replacing its layout with the producer's
+        // would silently re-read the whole dense value.
+        let perm = dense_permutation(&o.layout, &inner.space.dims)?;
+        // A body reading its own coordinates absorbs too: the contraction's
+        // staging loop hands `pre` the operand-axis coordinate vector (see
+        // the `coords` argument of each lowering's `eval_scalar`), and
+        // producer axis `perm[j]` is operand axis `j`, so the axis names
+        // shift by the inverse. This is what lets a structural causal mask —
+        // `select(IndexOf(k) <= IndexOf(q) + off, s, -inf)` — ride into the
+        // contraction instead of forcing the masked scores to materialize.
+        if reads_index_of(&inner.body) {
+            let mut inv: SmallVec<[u32; 4]> = smallvec::smallvec![0; perm.len()];
+            for (j, &i) in perm.iter().enumerate() {
+                inv[i] = j as u32;
+            }
+            inner.body = inner.body.remap_index_axes(&|axis| {
+                inv.get(axis as usize).copied().unwrap_or(axis)
+            });
+        }
+        Some((inner, perm))
+    };
+    let plans: Vec<Option<(MapView, SmallVec<[usize; 4]>)>> =
+        side.ops.iter().map(eligible).collect();
+    if plans.iter().all(Option::is_none) {
+        return None;
+    }
+
+    // Retained operands keep their order and take the low arg indices; each
+    // absorbed producer's operands are appended in slot order, so a producer
+    // body is shifted by the count of everything placed before it. This is
+    // `splice`'s convention, and it keeps one side's numbering independent of
+    // the other's arity.
+    let outer_dtypes = operand_dtypes(b, &side.ops);
+    let retained = plans.iter().filter(|p| p.is_none()).count();
+    let mut ops: SmallVec<[Operand; 2]> = SmallVec::new();
+    for (o, plan) in side.ops.iter().zip(&plans) {
+        if plan.is_none() {
+            ops.push(o.clone());
+        }
+    }
+    let mut appended = retained;
+    let mut args: Vec<ScalarExpr> = Vec::with_capacity(side.ops.len());
+    let mut next_retained = 0u32;
+    for (j, plan) in plans.iter().enumerate() {
+        match plan {
+            None => {
+                args.push(ScalarExpr::arg(next_retained, outer_dtypes[j]));
+                next_retained += 1;
+            }
+            Some((inner, perm)) => {
+                let inner_dtypes = operand_dtypes(b, &inner.ops);
+                args.push(shift_args(&inner.body, appended as u32, &inner_dtypes));
+                for p in &inner.ops {
+                    ops.push(Operand {
+                        src: p.src,
+                        layout: permute_layout(&p.layout, perm)?,
+                        access: p.access.clone(),
+                    });
+                }
+                appended += inner.ops.len();
+            }
+        }
+    }
+    Some(ContractSide {
+        pre: side.pre.compose(&args),
+        ops,
+    })
+}
+
+/// The axis order in which `layout` reads a dense value of shape `producer`,
+/// or `None` when it is not a pure permutation of it.
+///
+/// `perm[j] = i` means the edge's axis `j` walks the producer's axis `i`:
+/// each of the layout's `(extent, stride)` pairs must be exactly one
+/// producer axis's `(extent, row-major stride)`, offset zero, every axis
+/// claimed once. The identity read — the common case — is the identity
+/// permutation. A window (offset), a broadcast (stride 0 where the value has
+/// none) or a gather-shaped read all fail the match and refuse absorption.
+///
+/// Axes may repeat an extent; matching on the *pair* keeps the bijection
+/// unambiguous wherever it matters, because equal extents with equal strides
+/// address identically whichever way they are paired.
+fn dense_permutation(layout: &Layout, producer: &[Dim]) -> Option<SmallVec<[usize; 4]>> {
+    if !layout.offset().known_eq(Dim::Const(0)) || layout.rank() != producer.len() {
+        return None;
+    }
+    let row_major = Layout::row_major_strides(producer);
+    let mut claimed = vec![false; producer.len()];
+    let mut perm: SmallVec<[usize; 4]> = SmallVec::with_capacity(producer.len());
+    for (d, s) in layout.shape().iter().zip(layout.strides()) {
+        let i = producer.iter().enumerate().position(|(i, pd)| {
+            !claimed[i] && d.known_eq(*pd) && s.known_eq(row_major[i])
+        })?;
+        claimed[i] = true;
+        perm.push(i);
+    }
+    Some(perm)
+}
+
+/// `layout` with its axes reordered by `perm` — the producer-operand layout
+/// as seen through an edge that walks producer axis `perm[j]` at its own
+/// axis `j`. Pure axis renaming: extents and strides travel together, so the
+/// set of addresses is untouched and only the coordinate order changes.
+fn permute_layout(layout: &Layout, perm: &[usize]) -> Option<Layout> {
+    if layout.rank() != perm.len() {
+        return None;
+    }
+    let shape: SmallVec<[Dim; 6]> = perm.iter().map(|&i| layout.shape()[i]).collect();
+    let strides: SmallVec<[Dim; 6]> = perm.iter().map(|&i| layout.strides()[i]).collect();
+    Layout::from_parts(layout.offset(), &shape, &strides).ok()
 }
 
 /// A single-operand `KMap` reading a `KFold` at the fold's *output* space is
@@ -1420,11 +1628,11 @@ mod tests {
         );
         assert!(fire(&mut g, c, &MAP_INTO_CONTRACT).is_some());
         let alt = g.chain(c).into_iter().find(|&i| i != c).unwrap();
-        let Op::L1(L1::KContract { pre_a, a, .. }) = &g.node(alt).op else {
+        let Op::L1(L1::KContract { a, .. }) = &g.node(alt).op else {
             panic!()
         };
-        assert_eq!(a.src, raw);
-        assert!(matches!(pre_a.kind(), crate::scalar::ScalarKind::Un { .. }));
+        assert_eq!(a.primary().src, raw);
+        assert!(matches!(a.pre.kind(), crate::scalar::ScalarKind::Un { .. }));
     }
 
     /// A reader that names only part of its producer may not absorb it.

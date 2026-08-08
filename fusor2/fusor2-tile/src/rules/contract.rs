@@ -17,7 +17,7 @@ use fusor2_ir::facts::ValueFacts;
 use fusor2_ir::carrier::Carrier;
 use fusor2_ir::ir::level0::{EinSpec, L0, Label};
 use fusor2_ir::ir::level1::{
-    AccessPlan, Family, IndexSpace, L1, Operand, ScheduleDomain,
+    AccessPlan, ContractSide, Family, IndexSpace, L1, Operand, ScheduleDomain,
 };
 use fusor2_ir::ir::{Level, Node, Op, OpTag};
 use fusor2_ir::rule;
@@ -227,10 +227,33 @@ fn contract_parts(node: &Node) -> Option<(&EinSpec, Dtype, Id, Id)> {
     }
 }
 
-/// Only dense operands reach the dense families; a quantized operand's
-/// lowerings live in [`crate::rules::quantized`].
-fn dense_operands(f: &Facts<'_>) -> bool {
-    f.operands().iter().all(|o| !o.dtype.is_quantized())
+/// Whether this family can address these operands.
+///
+/// **A block-quantized operand is admitted to [`Family::Coop`] only.** The
+/// cooperative kernel stages both operands into workgroup tiles before the MMA,
+/// and `Source::Quantized` decodes at the `(row, col)` that staging fill
+/// already computes — so a quantized weight is the format's decode math on the
+/// way into shared memory and nothing else changes: same staging tile, same
+/// fragments, same MMA, same arena footprint, same epilogue, same schedule
+/// domain, same autotuner.
+///
+/// The other three families read operands element-wise from a dense layout with
+/// no staging step to decode in, so they still decline. A quantized operand
+/// they turn down still reaches a runnable form: `LOWER_DEQUANT` expands
+/// `L0::Dequant` into its defn, and the contraction then sees a dense operand
+/// like any other.
+fn operands_addressable(f: &Facts<'_>, family: Family) -> bool {
+    f.operands()
+        .iter()
+        .all(|o| !o.dtype.is_quantized() || family == Family::Coop)
+}
+
+/// The dtype the matrix unit actually sees. A quantized operand is decoded
+/// during the staging fill, so the fragments are f32 and the storage format
+/// never reaches the MMA — the coop legality probe and the MAC rate must be
+/// asked about the decoded type, not the stored one.
+fn compute_dtype(d: Dtype) -> Dtype {
+    if d.is_quantized() { Dtype::F32 } else { d }
 }
 
 /// Whether the m/n/k kernels can address this spec's operands at all.
@@ -333,11 +356,12 @@ fn lower_family(
     f: &Facts<'_>,
     family: Family,
 ) -> Option<Id> {
-    if !dense_operands(f) {
+    if !operands_addressable(f, family) {
         return None;
     }
     let (spec, acc, a_id, b_id) = contract_parts(node)?;
     let (fa, fb) = (f.operand(0)?, f.operand(1)?);
+    let operand_dtype = compute_dtype(fa.dtype);
     // `out` still has to be canonical: `KContract` does not parameterize its
     // *write* map, so an output in another axis order genuinely is a different
     // kernel. Both *reads* are a stride vector away from canonical, so they are
@@ -359,14 +383,14 @@ fn lower_family(
 
     let sched = match family {
         Family::Coop => {
-            let dom = coop_domain(mnk.m, mnk.n, mnk.k, mnk.batch, fa.dtype, acc, &cx);
+            let dom = coop_domain(mnk.m, mnk.n, mnk.k, mnk.batch, operand_dtype, acc, &cx);
             if dom.is_empty() {
                 return None;
             }
             ScheduleDomain::Coop(dom)
         }
         Family::Sgemm => {
-            let dom = sgemm_domain(fa.dtype.byte_size() as u32, &cx);
+            let dom = sgemm_domain(operand_dtype.byte_size() as u32, &cx);
             if dom.params.is_empty() {
                 return None;
             }
@@ -391,12 +415,10 @@ fn lower_family(
         k: mnk.k,
         batch: mnk.batch,
         family,
-        pre_a: identity(fa.dtype),
-        pre_b: identity(fb.dtype),
         post: identity(acc),
         acc,
-        a: a_op,
-        b: b_op,
+        a: ContractSide::one(identity(compute_dtype(fa.dtype)), a_op),
+        b: ContractSide::one(identity(compute_dtype(fb.dtype)), b_op),
         sched,
     };
     let new = b.add_l1(op).ok()?;
@@ -496,7 +518,11 @@ pub fn lower_sgemv(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> O
 /// `Contract -> KFold` at an `Add` carrier lifting `mul(Arg0, Arg1)`. The floor
 /// that guarantees every contraction reaches a runnable form.
 pub fn lower_generic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    if !dense_operands(f) {
+    // The generic-fold floor reads its operands element-wise from a dense
+    // layout and has no staging step to decode a block format in, so a
+    // quantized operand is left to `LOWER_DEQUANT`, which expands the decode
+    // into an ordinary `Map` this rule can then read.
+    if !operands_addressable(f, Family::GenericFold) {
         return None;
     }
     let (spec, acc, a_id, b_id) = contract_parts(node)?;
@@ -551,8 +577,8 @@ pub fn unfuse_coop_epilogue(
         n,
         batch,
         family: Family::Coop,
-        pre_a,
-        pre_b,
+        a,
+        b: rhs,
         post,
         acc,
         ..
@@ -564,7 +590,7 @@ pub fn unfuse_coop_epilogue(
         return None;
     }
     let operand = f.dtype(0).unwrap_or(*acc);
-    if coop_epilogue_hostable(pre_a, pre_b, post, operand) {
+    if coop_epilogue_hostable(&a.pre, &rhs.pre, post, operand) {
         return None;
     }
 

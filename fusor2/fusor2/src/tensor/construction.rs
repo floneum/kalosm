@@ -17,27 +17,40 @@ use crate::tensor::typed::Element;
 use crate::tensor::{Tensor, splat_as, splat_one, splat_zero};
 use crate::{Error, Result};
 
-/// Mint a `Leaf::Buffer` and attach host bytes to it.
-pub(crate) fn upload(
-    graph: &GraphRef,
-    dtype: Dtype,
-    shape: &[Dim],
-    bytes: Vec<u8>,
-) -> Result<Tensor> {
-    let t = Tensor::emit(
+/// Mint a `Leaf::Buffer` with no host bytes and no device buffer.
+fn leaf_buffer_node(graph: &GraphRef, dtype: Dtype, shape: &[Dim]) -> Result<Tensor> {
+    Tensor::emit(
         graph,
         L0::Leaf(LeafKind::Buffer {
             name: graph.fresh_buffer_id(),
             dtype,
             shape: shape.iter().copied().collect(),
         }),
-    )?;
+    )
+}
+
+/// Mint a `Leaf::Buffer` and attach owned host bytes to it. The bytes stay on
+/// the host until a resolve uploads them, and stay readable through
+/// `leaf_bytes` afterwards — `arange` and `detach` need that.
+pub(crate) fn upload(
+    graph: &GraphRef,
+    dtype: Dtype,
+    shape: &[Dim],
+    bytes: Vec<u8>,
+) -> Result<Tensor> {
+    let t = leaf_buffer_node(graph, dtype, shape)?;
     graph.set_leaf_bytes(t.id, bytes);
     Ok(t)
 }
 
 impl Tensor {
     /// Upload dense host bytes as a step-local buffer.
+    ///
+    /// **One copy, into the transfer staging buffer.** Staging the caller's
+    /// slice in a host `Vec` first cost a second full allocation and memcpy
+    /// here, and a third when the resolve path cloned it back out again. The
+    /// reference (`fusor-ml` `TensorData::new_from_slice`) hands the caller's
+    /// slice straight to `create_buffer_init`; so does this.
     pub fn from_slice(graph: &GraphRef, dtype: Dtype, shape: &[Dim], data: &[u8]) -> Result<Tensor> {
         let want = byte_len(dtype, shape)?;
         if data.len() as u64 != want {
@@ -46,7 +59,11 @@ impl Tensor {
                 data.len()
             )));
         }
-        upload(graph, dtype, shape, data.to_vec())
+        let t = leaf_buffer_node(graph, dtype, shape)?;
+        let persistence = graph.facts(t.id).persistence;
+        let buf = graph.session().device().upload(data, persistence)?;
+        graph.set_device_buf(t.id, buf);
+        Ok(t)
     }
 
     /// Upload a typed host slice.
@@ -161,7 +178,11 @@ impl Tensor {
     ) -> Result<Tensor> {
         let bytes = arange_bytes(dtype, start, end, step)?;
         let n = bytes.len() as u64 / dtype.byte_size().max(1);
-        Self::from_slice(graph, dtype, &[Dim::Const(n)], &bytes)
+        // Deliberately `upload`, not `from_slice`: the sequence is built on the
+        // host and callers read it back through `leaf_bytes` without ever
+        // resolving, so this leaf must keep its host bytes. `from_slice` now
+        // goes straight to the device and keeps none.
+        upload(graph, dtype, &[Dim::Const(n)], bytes)
     }
 }
 

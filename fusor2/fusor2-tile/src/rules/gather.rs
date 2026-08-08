@@ -30,14 +30,6 @@ rule!(
     apply = gather_vectorized,
 );
 
-rule!(
-    GATHER_QUANTIZED_ROWS,
-    level = Level::L0,
-    head = OpTag::Gather,
-    tag = RuleTag::StrictlyLowering,
-    apply = gather_quantized_rows,
-);
-
 /// A vectorized row load moves whole 16-byte quads.
 const VECTOR_BYTES: u64 = 16;
 
@@ -104,29 +96,13 @@ pub fn gather_vectorized(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>
     mint(b, id, node, f, GatherMode::Vectorized)
 }
 
-/// Decode quantized rows straight into the output dtype. This is
-/// `QMatrix::index_select_rows`: the dense table is never materialized,
-/// because `Dequant` is never selected on that edge.
-pub fn gather_quantized_rows(
-    b: &mut Builder<'_>,
-    id: Id,
-    node: &Node,
-    f: &Facts<'_>,
-) -> Option<Id> {
-    parts(node)?;
-    if !f.operand(0)?.dtype.is_quantized() {
-        return None;
-    }
-    mint(b, id, node, f, GatherMode::QuantizedRows)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domains::testing::apple_caps;
     use crate::rules::TILE_RULES;
     use crate::rules::testing::{Fixture, l1_of};
-    use fusor2_ir::dtype::{Dtype, QFmt, QLayout};
+    use fusor2_ir::dtype::Dtype;
 
     fn modes(fx: &Fixture, id: Id) -> Vec<GatherMode> {
         fx.chain(id)
@@ -150,7 +126,6 @@ mod tests {
         let modes = modes(&fx, g);
         assert!(modes.contains(&GatherMode::RowPerGroup));
         assert!(modes.contains(&GatherMode::Vectorized));
-        assert!(!modes.contains(&GatherMode::QuantizedRows));
         // The L0 gather plus its two lowerings.
         assert_eq!(fx.chain(g).len(), 3);
     }
@@ -165,16 +140,5 @@ mod tests {
         fx.apply_all(TILE_RULES, g);
         let modes = modes(&fx, g);
         assert_eq!(modes, vec![GatherMode::RowPerGroup]);
-    }
-
-    #[test]
-    fn quantized_rows_minted_for_q4k_leaf() {
-        let mut fx = Fixture::new(apple_caps());
-        let table = fx.quantized(QFmt::Q4K, QLayout::Native, &[4096, 1024]);
-        let idx = fx.buffer(Dtype::U32, &[128]);
-        let g = fx.gather(0, table, idx);
-        fx.apply_all(TILE_RULES, g);
-        let modes = modes(&fx, g);
-        assert_eq!(modes, vec![GatherMode::QuantizedRows]);
     }
 }

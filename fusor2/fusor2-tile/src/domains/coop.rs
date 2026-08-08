@@ -113,13 +113,6 @@ pub fn coop_domain(
     }
 }
 
-/// Candidate block geometries after the structural and footprint filters,
-/// at the staging element `operand` implies.
-pub fn candidate_geoms(caps: &Caps) -> Vec<CoopGeom> {
-    let cx = DomainCtx::new(caps, crate::domains::default_planner());
-    candidate_geoms_for(Dtype::F32, &cx).into_vec()
-}
-
 /// `(caps, staged element, planner identity) -> geometries`. The grid below
 /// is ~7,000 candidates each costing an exact arena query, and none of it
 /// depends on the contraction — only on the device.

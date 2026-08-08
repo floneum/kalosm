@@ -37,8 +37,6 @@ pub fn specialize_dim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) 
         k,
         batch,
         family,
-        pre_a,
-        pre_b,
         post,
         acc,
         a,
@@ -48,8 +46,10 @@ pub fn specialize_dim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) 
     else {
         return None;
     };
-    let a_shape = a.layout.shape();
-    let b_shape = rhs.layout.shape();
+    // Every operand of a side agrees on shape — they differ only in buffer,
+    // stride and access — so the decided extent is readable off either one.
+    let a_shape = a.primary().layout.shape();
+    let b_shape = rhs.primary().layout.shape();
     // `a` is `[batch?, m, k]` and `b` is `[batch?, k, n]`, so each field has
     // exactly one place to read a decided extent from.
     let from_end = |shape: &[Dim], back: usize| -> Option<Dim> {
@@ -77,8 +77,6 @@ pub fn specialize_dim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) 
             k: new_k.unwrap_or(*k),
             batch: new_batch.unwrap_or(*batch),
             family: *family,
-            pre_a: pre_a.clone(),
-            pre_b: pre_b.clone(),
             post: post.clone(),
             acc: *acc,
             a: a.clone(),
@@ -95,7 +93,7 @@ mod tests {
     use crate::dtype::Dtype;
     use crate::rules::test_support as ts;
     use crate::rules::{alias_operand_of, ident_expr};
-    use crate::ir::level1::{Family, ScheduleDomain};
+    use crate::ir::level1::{ContractSide, Family, ScheduleDomain};
 
     #[test]
     fn specialize_dim_binds_a_symbolic_row_count() {
@@ -112,12 +110,10 @@ mod tests {
                 k: Dim::Const(8),
                 batch: Dim::ONE,
                 family: Family::Sgemm,
-                pre_a: ident_expr(Dtype::F32),
-                pre_b: ident_expr(Dtype::F32),
                 post: ident_expr(Dtype::F32),
                 acc: Dtype::F32,
-                a: alias_operand_of(a, &a_shape),
-                b: alias_operand_of(bb, &b_shape),
+                a: ContractSide::one(ident_expr(Dtype::F32), alias_operand_of(a, &a_shape)),
+                b: ContractSide::one(ident_expr(Dtype::F32), alias_operand_of(bb, &b_shape)),
                 sched: ScheduleDomain::Point,
             }))
             .unwrap();

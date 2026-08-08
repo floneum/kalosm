@@ -17,7 +17,7 @@ use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
 use fusor2_ir::ir::level2::{
     Addr, ArenaMode, ArenaPlan, ArenaPlanner, BarrierSuggestion, Buffer, CoopSrc, KernelIr, Local,
-    MergeBody, Placement, QuantizedView, ReduceKind, Source, Stmt, StorageView, Tile, TileExpr,
+    MergeBody, QuantizedView, ReduceKind, Source, Stmt, StorageView, Tile, TileExpr,
     TileExprKind, Tiles,
 };
 use parking_lot::RwLock;
@@ -73,10 +73,6 @@ impl Planner {
 
     pub fn memo_len(&self) -> usize {
         self.memo.read().len()
-    }
-
-    pub fn tiles_memo_len(&self) -> usize {
-        self.tiles_memo.read().len()
     }
 
     /// True when `(ir, caps)` is already planned. Test-facing.
@@ -184,8 +180,6 @@ impl BodyHasher {
         self.view(&q.data, h);
         q.fmt.hash(h);
         q.layout.hash(h);
-        q.rows.hash(h);
-        q.cols.hash(h);
     }
 
     fn source(&mut self, s: &Source, h: &mut FxHasher) {
@@ -290,15 +284,6 @@ impl BodyHasher {
                     }
                     CoopSrc::BroadcastCol { src, .. } => self.view(src, h),
                 }
-            }
-            TileExprKind::Dequantize { src, lanes, .. } => {
-                self.quantized(src, h);
-                lanes.hash(h);
-            }
-            TileExprKind::LaneOf { lane, .. } => lane.hash(h),
-            TileExprKind::QuantizedDot { src, packing, .. } => {
-                self.quantized(src, h);
-                packing.hash(h);
             }
             // No payload beyond the children.
             TileExprKind::Select { .. } | TileExprKind::Dot { .. } | TileExprKind::CoopMma { .. } => {}
@@ -587,15 +572,6 @@ pub fn synth_ir(tiles: &Tiles) -> KernelIr {
         byte_arena: None,
         name: "workgroup_bytes",
     }
-}
-
-/// Placements are always emitted in liveness order; a caller that wants them
-/// keyed by tile can index with this.
-pub fn placement_of<'a>(plan: &'a ArenaPlan, tile: &fusor2_ir::ir::level2::Tile) -> Option<&'a Placement> {
-    let key = crate::liveness::tile_key(tile);
-    plan.placements
-        .iter()
-        .find(|placement| crate::liveness::tile_key(&placement.tile) == key)
 }
 
 #[cfg(test)]

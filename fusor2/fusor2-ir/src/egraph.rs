@@ -7,7 +7,7 @@ use crate::facts::ValueFacts;
 use crate::ir::level0::L0;
 use crate::ir::level1::L1;
 use crate::ir::{Children, Level, Node, Op, OpTag, Semantics};
-use crate::shape::{StrideSpec, SymId};
+use crate::shape::SymId;
 use fixedbitset::FixedBitSet;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -60,7 +60,12 @@ pub struct NodeKey {
 pub struct EGraph {
     nodes: Vec<Node>,
     facts: Vec<ValueFacts>,
-    memo: FxHashMap<NodeKey, Id>,
+    /// Shared with every [`SaturationDelta`] recorded off this graph, so a
+    /// replay is a refcount bump rather than a copy of the whole table.
+    /// `add` is the only writer and takes it back by `Arc::make_mut`, so a
+    /// graph that keeps growing after a replay still hash-conses against a
+    /// fully populated memo — copy-on-write, not a lazy rebuild.
+    memo: Arc<FxHashMap<NodeKey, Id>>,
     parent: Vec<Option<Id>>,
     defns: FixedBitSet,
     roots: Vec<Id>,
@@ -73,7 +78,7 @@ impl EGraph {
         Self {
             nodes: Vec::new(),
             facts: Vec::new(),
-            memo: FxHashMap::default(),
+            memo: Arc::new(FxHashMap::default()),
             parent: Vec::new(),
             defns: FixedBitSet::new(),
             roots: Vec::new(),
@@ -164,7 +169,10 @@ impl EGraph {
         });
         self.facts.push(facts);
         self.parent.push(None);
-        self.memo.insert(key, next);
+        // Copy-on-write: a no-op clone unless a `SaturationDelta` still holds
+        // the table, which is exactly the case where the copy is required for
+        // the delta to stay a faithful recording.
+        Arc::make_mut(&mut self.memo).insert(key, next);
         Ok(next)
     }
 
@@ -244,6 +252,96 @@ impl EGraph {
 
     pub fn builder<'a>(&'a mut self, caps: &'a Caps) -> Builder<'a> {
         Builder { graph: self, caps }
+    }
+
+    /// The next symbol this graph will mint. Part of a
+    /// [`SaturationDelta`]'s validity condition: two graphs with identical
+    /// nodes but a different `next_sym` saturate to different `fold_split`
+    /// block symbols.
+    pub fn next_sym_counter(&self) -> u32 {
+        self.next_sym
+    }
+
+    /// Capture everything saturation may **overwrite** rather than append.
+    ///
+    /// `nodes` and `facts` are push-only — `add` is the sole allocator and
+    /// nothing in this module ever assigns into either — so they are still
+    /// readable after saturation and are captured at record time instead.
+    /// `parent`, `defns`, `roots` and `next_sym` are not, so they are
+    /// captured here.
+    pub fn pre_saturation(&self) -> PreSaturation {
+        PreSaturation {
+            len: self.nodes.len(),
+            parent: self.parent.clone(),
+            defns: self.defns.ones().map(|i| i as u32).collect(),
+            roots: self.roots.clone(),
+            next_sym: self.next_sym,
+        }
+    }
+
+    /// Record everything a saturation appended above `pre`.
+    ///
+    /// Saturation is a pure function of `(graph, caps, rules, budget)` —
+    /// [`SaturationBudget`]'s doc says so and
+    /// `saturate::tests::saturation_is_deterministic_under_any_wall_time`
+    /// proves it — so a graph in exactly the state `pre` describes saturates
+    /// to exactly these nodes at exactly these ids. Replaying the recording
+    /// is therefore the same graph, not an approximation of one.
+    pub fn record_saturation(&self, pre: PreSaturation) -> SaturationDelta {
+        debug_assert!(pre.len <= self.nodes.len());
+        SaturationDelta {
+            nodes: self.nodes.clone(),
+            facts: self.facts.clone(),
+            // Kept whole rather than as the appended entries alone —
+            // re-inserting the tail would rehash every `NodeKey`, and the tail
+            // is the overwhelming majority of the table. Sharing it is free:
+            // the next `add` on this graph is what pays for a private copy,
+            // and only if there ever is one.
+            memo: Arc::clone(&self.memo),
+            parent: self.parent.clone(),
+            defns: self.defns.clone(),
+            roots: self.roots.clone(),
+            next_sym: self.next_sym,
+            pre,
+        }
+    }
+
+    /// Re-append a recorded saturation, or report `false` when this graph is
+    /// not the one the delta was recorded against.
+    ///
+    /// The validity check is **exact, not a fingerprint**: every pre-existing
+    /// node, every parent link, the `defn` set, the root set and the symbol
+    /// counter are compared by value. There is no collision to reason about —
+    /// either the graph is bit-for-bit the term the recording was taken from
+    /// and the replay is that same pure function's answer, or nothing is
+    /// touched and the caller saturates for real. Rejection is cheap: `len`
+    /// and `next_sym` reject a mismatch before any node is looked at.
+    pub fn replay_saturation(&mut self, delta: &SaturationDelta) -> bool {
+        let pre = &delta.pre;
+        if self.nodes.len() != pre.len
+            || self.next_sym != pre.next_sym
+            || self.roots != pre.roots
+            || self.parent != pre.parent
+            || self.nodes[..] != delta.nodes[..pre.len]
+        {
+            return false;
+        }
+        if !self.defns.ones().map(|i| i as u32).eq(pre.defns.iter().copied()) {
+            return false;
+        }
+        // The prefix is already equal by the check above, so only the tail is
+        // copied. `memo` is not copied at all: the recording's table is the
+        // post-saturation table by construction, and `add` is its only reader
+        // and writer, so the graph adopts it and `Arc::make_mut` forks it if
+        // and only if this graph is later grown.
+        self.nodes.extend_from_slice(&delta.nodes[pre.len..]);
+        self.facts.extend_from_slice(&delta.facts[pre.len..]);
+        self.memo = Arc::clone(&delta.memo);
+        self.parent.clone_from(&delta.parent);
+        self.defns.clone_from(&delta.defns);
+        self.roots.clone_from(&delta.roots);
+        self.next_sym = delta.next_sym;
+        true
     }
 
     /// The read-only legality view of `id`, as handed to a rule. The
@@ -332,16 +430,6 @@ impl<'a> Builder<'a> {
         ViewSpine { base: v, views }
     }
 
-    /// The restride specs along a spine, outermost last.
-    pub fn spine_specs(&self, spine: &ViewSpine) -> SmallVec<[StrideSpec; 6]> {
-        let mut out: SmallVec<[StrideSpec; 6]> = SmallVec::new();
-        for id in &spine.views {
-            if let Op::L0(L0::Restride { specs, .. }) = &self.graph.node(*id).op {
-                out.extend(specs.iter().copied());
-            }
-        }
-        out
-    }
 }
 
 /// A chain of pure views over one base value.
@@ -512,6 +600,66 @@ pub struct SaturationReport {
     /// was hit. Reported to conformance.
     pub truncated: Vec<Id>,
     pub fired: Vec<(&'static str, u32)>,
+}
+
+/// The overwritable part of a graph's state immediately before saturation.
+/// Captured by [`EGraph::pre_saturation`]; carried inside a
+/// [`SaturationDelta`] as the exact condition its replay is valid under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreSaturation {
+    len: usize,
+    parent: Vec<Option<Id>>,
+    defns: Vec<u32>,
+    roots: Vec<Id>,
+    next_sym: u32,
+}
+
+impl PreSaturation {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Everything one saturation appended to a graph, replayable onto any graph
+/// in the identical pre-state.
+///
+/// Holds no [`Caps`], no rule table and no [`SaturationBudget`]: it is a
+/// recording of an *outcome*, and the caller is what guarantees the other
+/// three inputs are the ones that produced it. A `Session` fixes its device,
+/// its rules and the default budget for its whole life, which is exactly that
+/// guarantee.
+#[derive(Clone, Debug)]
+pub struct SaturationDelta {
+    pre: PreSaturation,
+    /// The whole post-saturation state. `nodes[..pre.len]` doubles as the
+    /// recording's validity condition — `nodes` is append-only, so those
+    /// entries are exactly the term saturation was handed.
+    nodes: Vec<Node>,
+    facts: Vec<ValueFacts>,
+    memo: Arc<FxHashMap<NodeKey, Id>>,
+    parent: Vec<Option<Id>>,
+    defns: FixedBitSet,
+    roots: Vec<Id>,
+    next_sym: u32,
+}
+
+impl SaturationDelta {
+    /// Nodes the graph held before saturation.
+    pub fn prefix(&self) -> usize {
+        self.pre.len
+    }
+    /// Nodes saturation appended.
+    pub fn added(&self) -> usize {
+        self.nodes.len() - self.pre.len
+    }
+    /// O(1) rejection, so a memo scan does not compare node lists it is
+    /// already known to differ from.
+    pub fn could_apply_to(&self, graph: &EGraph) -> bool {
+        graph.len() == self.pre.len && graph.next_sym_counter() == self.pre.next_sym
+    }
 }
 
 /// The saturation driver. Object-safe. Implemented once in `fusor2-ir`;

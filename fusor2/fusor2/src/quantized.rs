@@ -8,6 +8,7 @@
 
 use fusor2_gguf::VarBuilder;
 use fusor2_ir::dtype::{Dtype, QFmt, QLayout};
+use fusor2_ir::ir::Op;
 use fusor2_ir::ir::level0::{L0, LeafKind};
 use fusor2_ir::shape::Dim;
 
@@ -26,6 +27,40 @@ pub struct QMatrix {
 }
 
 impl QMatrix {
+    /// The `QMatrix` a quantized *value* denotes, or `None` when the tensor
+    /// is not one.
+    ///
+    /// Recovers `(fmt, layout, shape)` from the `LeafKind::Quantized` node
+    /// itself, so any quantized tensor — `Graph::quantized`, a GGUF load, a
+    /// concat — gets the same [`Self::dequantize`] class without its caller
+    /// having carried a `QMatrix` around. A quantized value that is not a
+    /// leaf (nothing mints one today) returns `None` and stays on the raw
+    /// path.
+    pub fn of_tensor(t: &Tensor) -> Option<Self> {
+        if !t.dtype().is_quantized() {
+            return None;
+        }
+        let (fmt, layout, shape) = t
+            .graph()
+            .with_egraph(|g| {
+                Ok(match &g.node(t.id()).op {
+                    Op::L0(L0::Leaf(LeafKind::Quantized {
+                        fmt, layout, shape, ..
+                    })) => Some((*fmt, *layout, shape.clone())),
+                    _ => None,
+                })
+            })
+            .ok()??;
+        let [rows, cols] = [*shape.first()?, *shape.get(1)?];
+        Some(Self {
+            tensor: t.clone(),
+            fmt,
+            layout,
+            rows,
+            cols,
+        })
+    }
+
     /// A `QMatrix` over raw block bytes, with no file behind it.
     ///
     /// `shape` is `[rows, cols]` **in elements**, not blocks; `bytes` is the
@@ -123,15 +158,52 @@ impl QMatrix {
 
     /// Materialize the dequantized matrix. Almost always the wrong thing —
     /// `q_mat_mul` keeps the weights quantized inside the kernel.
+    ///
+    /// The sugar node and its definitional `Restride` + `Map` expansion are
+    /// unioned into one class here, so there is nothing to recognize later:
+    /// see [`crate::composite::quantized::dequant_defn`], which returns `None`
+    /// for the `(fmt, layout)` pairs that still need a block program.
     pub fn dequantize(&self) -> Result<Tensor> {
-        Tensor::emit(
-            self.tensor.graph(),
-            L0::Dequant {
-                fmt: self.fmt,
-                layout: self.layout,
-                x: self.tensor.id(),
-            },
-        )
+        let graph = self.tensor.graph();
+        // The sugar is minted **first**, so it takes the lower id and lands in
+        // operand 0 of the `Union`. Every other composite does the reverse,
+        // and for the reverse reason: there only the `defn` is
+        // differentiable, whereas here it is the *sugar* that carries the
+        // intentional "quantized weights are not trainable" refusal. Building
+        // the defn first would silently route a gradient into the unpack
+        // `Map` and its `U32` leaves.
+        let sugar = graph.add_l0(L0::Dequant {
+            fmt: self.fmt,
+            layout: self.layout,
+            x: self.tensor.id(),
+        })?;
+        let Some(defn) = crate::composite::quantized::dequant_defn(self)? else {
+            return Ok(graph.tensor(sugar));
+        };
+        let root = graph.with_egraph(|g| {
+            g.mark_defn(defn);
+            g.union(sugar, defn)
+        })?;
+        Ok(graph.tensor(root))
+    }
+
+    /// The `Restride` + `Map` expansion alone, with no `L0::Dequant` in the
+    /// class — the `*_slow` spelling [`crate::composite::core_op`] documents.
+    ///
+    /// The extractor has no alternative here, so a test against this proves
+    /// the bit arithmetic rather than proving which class member happened to
+    /// win.
+    pub fn dequantize_slow(&self) -> Result<Tensor> {
+        let graph = self.tensor.graph();
+        match crate::composite::quantized::dequant_defn(self)? {
+            Some(id) => Ok(graph.tensor(id)),
+            None => Err(Error::Dtype(format!(
+                "{:?}/{:?} has no Map-spelled decode: a decode is a `Restride` \
+                 over the block stream read as `u32` words, and this block's \
+                 stride is not a whole number of words",
+                self.fmt, self.layout
+            ))),
+        }
     }
 
     /// `act @ self^T`: the activation contracts against the quantized rows,
@@ -360,6 +432,120 @@ mod tests {
                 assert!(want.iter().any(|v| *v != 0.0), "{fmt:?}/{layout:?}");
             }
         }
+    }
+
+    /// A `QMatrix` over `rows(fmt, layout)`.
+    fn matrix(g: &Graph, fmt: QFmt, layout: QLayout) -> (QMatrix, Vec<f32>) {
+        let (bytes, want) = rows(fmt, layout);
+        let qm = QMatrix::from_raw_bytes(
+            g,
+            fmt,
+            layout,
+            [
+                Dim::Const(ROWS),
+                Dim::Const(u64::from(fmt.block_elements())),
+            ],
+            &bytes,
+        )
+        .unwrap();
+        (qm, want)
+    }
+
+    /// The `defn` alone, forced: the extractor cannot fall back to the block
+    /// program, so this is a statement about the bit arithmetic and not about
+    /// which class member happened to win.
+    ///
+    /// Exact equality, not a tolerance: every one of these decodes is an
+    /// integer widened to f32 and multiplied by the block's f32 scale, which
+    /// is bit-for-bit what the scalar reference decoder does.
+    ///
+    /// Both layouts: an f16 scale is decoded by `f16_lane`'s bit arithmetic,
+    /// which is exact against `f16::to_f32`, so `Native` is held to the same
+    /// bit-for-bit bar. What is left of the old layout restriction is the
+    /// **block stride**: a decode reads the stream as `u32` words, so a block
+    /// whose stride is not a whole number of words has no expansion, and
+    /// `word_aligned` is that predicate. It is asserted in both directions so
+    /// a format silently losing its expansion fails here.
+    #[test]
+    fn the_dequant_defn_decodes_exactly_as_the_reference_block_decoder() {
+        let g = graph();
+        for fmt in QFmt::ALL {
+            for layout in [QLayout::Native, QLayout::F32Scales] {
+                let (qm, want) = matrix(&g, fmt, layout);
+                let slow = qm.dequantize_slow();
+                if !fusor2_gguf::blocks::word_aligned(fmt, layout) {
+                    assert!(slow.is_err(), "{fmt:?}/{layout:?} is not word-aligned");
+                    continue;
+                }
+                let got = slow.unwrap().to_vec_f32().unwrap();
+                assert_eq!(got.len(), want.len(), "{fmt:?}/{layout:?}");
+                for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(a, b, "{fmt:?}/{layout:?} element {i}");
+                }
+                assert!(want.iter().any(|v| *v != 0.0), "{fmt:?}/{layout:?}");
+            }
+        }
+    }
+
+    /// The class shape every other composite is tested for: the sugar and a
+    /// marked `defn`, both in one class.
+    #[test]
+    fn a_dequant_class_holds_both_the_sugar_and_a_marked_defn() {
+        use fusor2_ir::ir::Op;
+        let g = graph();
+        let shape = |qm: &QMatrix| {
+            let y = qm.dequantize().unwrap();
+            g.handle()
+                .with_egraph(|eg| {
+                    let ms = eg.members(eg.class_of(y.id()));
+                    let sugars = ms
+                        .iter()
+                        .filter(|m| matches!(eg.node(**m).op, Op::L0(L0::Dequant { .. })))
+                        .count();
+                    let defns = ms.iter().filter(|m| eg.is_defn(**m)).count();
+                    Ok((ms.len(), sugars, defns))
+                })
+                .unwrap()
+        };
+        let (qm, _) = matrix(&g, QFmt::Q8_0, QLayout::F32Scales);
+        let (members, sugars, defns) = shape(&qm);
+        assert!(members >= 2, "expected sugar + defn, got {members}");
+        assert_eq!((sugars, defns), (1, 1));
+
+        // ... and the same shape at `Native`, wherever the block stride tiles
+        // the word stream: the f16 scales decode through `f16_lane`, so this
+        // class holds a real alternative to the block program rather than the
+        // bare sugar it used to.
+        let (q4k, _) = matrix(&g, QFmt::Q4K, QLayout::Native);
+        let (members, sugars, defns) = shape(&q4k);
+        assert!(members >= 2, "expected sugar + defn, got {members}");
+        assert_eq!((sugars, defns), (1, 1));
+
+        // Q8_0's native block is 34 bytes, so it does not tile the `u32` word
+        // stream a `Restride` reads: the class is the bare sugar and there is
+        // nothing to force. (Q4K/Q5K native *are* word-aligned and do get a
+        // defn — the layout is not what decides this.)
+        let (native, _) = matrix(&g, QFmt::Q8_0, QLayout::Native);
+        assert!(native.dequantize_slow().is_err());
+        let bare = native.dequantize().unwrap();
+        g.handle()
+            .with_egraph(|eg| {
+                assert!(matches!(eg.node(bare.id()).op, Op::L0(L0::Dequant { .. })));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// The gradient still stops at the quantized leaf. The `Union`'s adjoint
+    /// routes to operand 0, which is the lower id, which is the sugar — the
+    /// one node carrying the refusal. Build the `defn` first and this silently
+    /// becomes a gradient into a `Map` over `U32` leaves.
+    #[test]
+    fn a_dequantize_with_a_defn_still_refuses_a_gradient() {
+        let g = graph();
+        let (qm, _) = matrix(&g, QFmt::Q8_0, QLayout::F32Scales);
+        let y = qm.dequantize().unwrap();
+        assert!(g.backward_with(&y, &[qm.tensor.clone()]).is_err());
     }
 
     #[test]

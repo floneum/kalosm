@@ -41,7 +41,7 @@ use fusor2_ir::ir::Node;
 use fusor2_ir::ir::level0::ScatterCombine;
 use fusor2_ir::ir::level1::{GatherMode, L1, MapTiling, Operand, SchedPoint, ScatterMode};
 use fusor2_ir::ir::level2::{
-    Accumulator, Addr, ElementType, KernelIr, QuantizedView, ScalarElement, Stmt, TileBinaryOp,
+    Accumulator, Addr, ElementType, KernelIr, ScalarElement, Stmt, TileBinaryOp,
     TileCompareOp, TileExpr,
 };
 use fusor2_ir::target::LowerCtx;
@@ -240,11 +240,7 @@ fn lane_offset_exprs(
 // Gather
 // ---------------------------------------------------------------------------
 
-/// `RowPerGroup`, `Vectorized` and `QuantizedRows`, each at the lane tiling
-/// `theta` selected.
-///
-/// `QuantizedRows` decodes straight into the output dtype: a quantized
-/// embedding table is never densified first.
+/// `RowPerGroup` and `Vectorized`, each at the lane tiling `theta` selected.
 ///
 /// The mode fixes the *contiguous* group one lane reads (`Vectorized`'s four
 /// f32 are one `dwordx4`); `theta` fixes how many such groups a lane owns and
@@ -390,60 +386,6 @@ pub fn lower_kgather(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
                     addr: Addr::Linear(flat),
                     value,
                     mask,
-                });
-            }
-        }
-        GatherMode::QuantizedRows => {
-            let dtype = ctx.plan_dtype(src.src)?;
-            let fusor2_ir::dtype::Dtype::Q(fmt) = dtype else {
-                return Err(Error::Plan(format!(
-                    "QuantizedRows gather reads a {dtype:?} source"
-                )));
-            };
-            let data = ctx.linear_view(src.src)?;
-            let block_elems = fmt.block_elements();
-            let qview = QuantizedView {
-                data,
-                fmt,
-                // Both layouts are legal inputs everywhere; which one this
-                // weight carries is a plan attribute, not a device branch.
-                layout: fusor2_ir::dtype::QLayout::Native,
-                rows,
-                cols: width,
-            };
-            let be = ctx.b.u32(block_elems);
-            let fill = ctx.b.f32(0.0);
-            for flat in &offsets {
-                let flat = flat.clone();
-                let (_, row, col) = decompose(&mut ctx, flat.clone());
-                let live = ctx.b.compare(TileCompareOp::Lt, flat.clone(), n_e.clone());
-                // Row indices are `u32` values, never a dtype the body could
-                // confuse with data.
-                let picked = ctx.load_operand(idx, row)?;
-                let picked = ctx.b.cast(picked, ElementType::Scalar(ScalarElement::U32));
-                let k_base = ctx.b.binary(
-                    TileBinaryOp::Div,
-                    col,
-                    be.clone(),
-                    NumericContract::RELAXED,
-                );
-                let decoded = ctx.b.dequantize(
-                    qview.clone(),
-                    k_base,
-                    picked,
-                    live.clone(),
-                    fill.clone(),
-                    block_elems,
-                );
-                // One decode serves the whole block; the lane projection picks
-                // this invocation's element out of it.
-                let value = ctx.b.lane_of(decoded, 0);
-                let value = ctx.b.cast(value, out_elem);
-                body.push(Stmt::Store {
-                    dst: out_view.clone(),
-                    addr: Addr::Linear(flat),
-                    value,
-                    mask: live,
                 });
             }
         }

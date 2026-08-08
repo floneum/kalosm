@@ -123,17 +123,6 @@ fn count(e: &ScalarExpr, seen: &mut FxHashSet<u64>, acc: &mut (u64, u64, u64)) {
     }
 }
 
-/// Transcendental and MAC counts of one `ScalarExpr` evaluated once.
-pub fn expr_work(expr: &ScalarExpr) -> Work {
-    let (arith, trans, index) = scalar_expr_cost(expr);
-    Work {
-        macs: arith,
-        transcendentals: trans,
-        index_ops: index,
-        wg_bytes: 0,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // L0 rows
 // ---------------------------------------------------------------------------
@@ -311,8 +300,8 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             k,
             batch,
             family,
-            pre_a,
-            pre_b,
+            a,
+            b: rhs,
             post,
             acc,
             sched,
@@ -323,26 +312,18 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
                 macs: b.saturating_mul(m).saturating_mul(n).saturating_mul(k),
                 ..Work::default()
             };
-            w = w.add(epilogue_work(pre_a, b.saturating_mul(m).saturating_mul(k)));
-            w = w.add(epilogue_work(pre_b, b.saturating_mul(k).saturating_mul(n)));
+            // A side's `pre` runs once per loaded element of *that side*.
+            // Operand index arithmetic is deliberately not priced here: it
+            // never was, and a contraction's traffic term dominates it. What
+            // multiplies with a multi-operand side is the *bytes*, which
+            // `fusor2_cost::realize` counts per operand.
+            w = w.add(epilogue_work(&a.pre, b.saturating_mul(m).saturating_mul(k)));
+            w = w.add(epilogue_work(&rhs.pre, b.saturating_mul(k).saturating_mul(n)));
             w = w.add(epilogue_work(post, b.saturating_mul(m).saturating_mul(n)));
             if *family == Family::Coop {
                 w.wg_bytes = coop_staged_bytes(sched, element_of(*acc));
             }
             w
-        }
-
-        L1::KQContract {
-            m, n, k, fmt, post, ..
-        } => {
-            let (m, n, k) = (priced(*m), priced(*n), priced(*k));
-            let macs = m.saturating_mul(n).saturating_mul(k);
-            let w = Work {
-                macs,
-                index_ops: macs / fmt.block_elements().max(1) as u64,
-                ..Work::default()
-            };
-            w.add(epilogue_work(post, m.saturating_mul(n)))
         }
 
         L1::KGather { ops, .. } => Work {
@@ -377,12 +358,6 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             ..Work::default()
         },
     }
-}
-
-/// Sum of every `Work` in `parts` — the exact `KRegion`/`KMerged` row for a
-/// caller that has the member nodes.
-pub fn sum_work(parts: &[Work]) -> Work {
-    parts.iter().fold(Work::default(), |a, b| a.add(*b))
 }
 
 fn epilogue_work(expr: &ScalarExpr, iterations: u64) -> Work {

@@ -19,7 +19,6 @@ pub static GPU_RULES: &[Rule] = &[
     GPU_FOLD_SUBGROUP,
     GPU_COOP_STAGE_VIA_TILE,
     GPU_SCATTER_ATOMIC,
-    GPU_QGEMV_PACKED_LOAD,
 ];
 
 
@@ -45,14 +44,6 @@ rule!(
     head = OpTag::KScatter,
     tag = RuleTag::Additive,
     apply = gpu_scatter_atomic,
-);
-
-rule!(
-    GPU_QGEMV_PACKED_LOAD,
-    level = Level::L1,
-    head = OpTag::KQContract,
-    tag = RuleTag::Additive,
-    apply = gpu_qgemv_packed_load,
 );
 
 /// Mint `FoldStrat::Subgroup` into a `KFold`'s domain.
@@ -120,8 +111,6 @@ fn gpu_coop_stage_via_tile(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'
         k,
         batch,
         family,
-        pre_a,
-        pre_b,
         post,
         acc,
         a,
@@ -155,8 +144,6 @@ fn gpu_coop_stage_via_tile(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'
             k: *k,
             batch: *batch,
             family: fusor2_ir::ir::level1::Family::Coop,
-            pre_a: pre_a.clone(),
-            pre_b: pre_b.clone(),
             post: post.clone(),
             acc: *acc,
             a: a.clone(),
@@ -206,72 +193,6 @@ fn gpu_scatter_atomic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -
     b.union(id, alt).ok()
 }
 
-/// Mint the packed-load qgemv alternative.
-///
-/// Legal when the block count divides evenly by lanes-per-item under a fixed
-/// subgroup width, which is what lets the tail-free packed load run without a
-/// masked remainder group.
-fn gpu_qgemv_packed_load(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let widths = f.caps().subgroups?;
-    if !widths.is_fixed() {
-        return None;
-    }
-    let Op::L1(L1::KQContract {
-        fmt,
-        layout,
-        act,
-        m,
-        n,
-        k,
-        acc,
-        post,
-        a,
-        b: rhs,
-        sched,
-    }) = &node.op
-    else {
-        return None;
-    };
-    let k_const = k.as_const()?;
-    let blocks = k_const.div_ceil(u64::from(fmt.block_elements().max(1)));
-    let lanes_per_item = u64::from(widths.assumed().max(1));
-    if lanes_per_item == 0 || blocks % lanes_per_item != 0 {
-        return None;
-    }
-    // A packed load reads whole words, so the vectorized schedule point is the
-    // one this alternative exists for.
-    let mut domain = match sched {
-        ScheduleDomain::Sgemv(d) => d.clone(),
-        _ => return None,
-    };
-    let width = widths.assumed().max(1);
-    let packed = fusor2_ir::ir::level1::SgemvParams {
-        chunk: 1,
-        vector: 4,
-        subgroups: (f.caps().limits.max_compute_invocations_per_workgroup / width).max(1),
-    };
-    if domain.params.contains(&packed) {
-        return None;
-    }
-    domain.params.push(packed);
-    let alt = b
-        .add_l1(L1::KQContract {
-            fmt: *fmt,
-            layout: *layout,
-            act: *act,
-            m: *m,
-            n: *n,
-            k: *k,
-            acc: *acc,
-            post: post.clone(),
-            a: a.clone(),
-            b: rhs.clone(),
-            sched: ScheduleDomain::Sgemv(domain),
-        })
-        .ok()?;
-    b.union(id, alt).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,7 +219,7 @@ mod tests {
 
     #[test]
     fn every_gpu_rule_is_additive_and_head_filtered() {
-        assert_eq!(GPU_RULES.len(), 4);
+        assert_eq!(GPU_RULES.len(), 3);
         for r in GPU_RULES {
             assert_eq!(r.tag, RuleTag::Additive, "{}", r.name);
             assert_eq!(r.level, Level::L1, "{}", r.name);
@@ -312,7 +233,6 @@ mod tests {
         assert!(names.contains(&"GPU_FOLD_SUBGROUP"));
         assert!(names.contains(&"GPU_COOP_STAGE_VIA_TILE"));
         assert!(names.contains(&"GPU_SCATTER_ATOMIC"));
-        assert!(names.contains(&"GPU_QGEMV_PACKED_LOAD"));
     }
 
     #[test]
@@ -320,7 +240,6 @@ mod tests {
         let by = |n: &str| GPU_RULES.iter().find(|r| r.name == n).unwrap().head;
         assert_eq!(by("GPU_FOLD_SUBGROUP"), OpTag::KFold);
         assert_eq!(by("GPU_SCATTER_ATOMIC"), OpTag::KScatter);
-        assert_eq!(by("GPU_QGEMV_PACKED_LOAD"), OpTag::KQContract);
         assert_eq!(by("GPU_COOP_STAGE_VIA_TILE"), OpTag::KContract);
     }
 

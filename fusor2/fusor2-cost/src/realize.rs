@@ -284,25 +284,6 @@ pub fn exact_cost(
     cost.total(extraction, &launches)
 }
 
-/// The bare roofline sum, without compile amortization — exposed because the
-/// per-launch delta is what the incremental move evaluation re-prices.
-pub fn launch_sum(
-    realized: &Realized,
-    extraction: &Extraction,
-    cost: &dyn CostModel,
-) -> Picoseconds {
-    realized
-        .launches(extraction)
-        .iter()
-        .map(|l| cost.launch_cost(l))
-        .sum()
-}
-
-/// The launches, as the architecture's `launches_of` names them.
-pub fn launches_of<'a>(realized: &'a Realized, extraction: &'a Extraction) -> Vec<LaunchPlan<'a>> {
-    realized.launches(extraction)
-}
-
 /// True when an edge must be cut regardless of `M`: a leaf operand, an
 /// index-space mismatch, a fold-to-fold dependency, a merged wave, an
 /// in-place producer, or a producer that is itself a root.
@@ -404,7 +385,7 @@ pub fn is_merged(graph: &EGraph, id: Id) -> bool {
 pub fn reduces(graph: &EGraph, id: Id) -> bool {
     matches!(
         graph.node(id).op,
-        Op::L1(L1::KFold { .. } | L1::KContract { .. } | L1::KQContract { .. })
+        Op::L1(L1::KFold { .. } | L1::KContract { .. })
             | Op::L0(L0::Fold { .. } | L0::Contract { .. })
     )
 }
@@ -420,7 +401,6 @@ pub fn index_space(graph: &EGraph, id: Id) -> IndexSpace {
             | L1::KScatter { space, .. },
         ) => space.clone(),
         Op::L1(L1::KContract { batch, m, n, .. }) => IndexSpace::new([*batch, *m, *n]),
-        Op::L1(L1::KQContract { m, n, .. }) => IndexSpace::new([Dim::ONE, *m, *n]),
         _ => IndexSpace {
             dims: graph.facts(id).shape.clone(),
         },
@@ -1123,9 +1103,8 @@ pub(crate) mod testkit {
                 | L1::KGather { ops, .. }
                 | L1::KScatter { ops, .. }
                 | L1::Ext { ops, .. } => out.extend(ops.iter().map(|o| o.src)),
-                L1::KContract { a, b, .. } | L1::KQContract { a, b, .. } => {
-                    out.push(a.src);
-                    out.push(b.src);
+                L1::KContract { a, b, .. } => {
+                    out.extend(a.ops.iter().chain(b.ops.iter()).map(|o| o.src))
                 }
                 L1::KRegion { members, .. } => out.extend(members.iter().copied()),
                 L1::KMerged(m) => out.extend(m.segments().iter().copied()),
@@ -1186,7 +1165,6 @@ pub(crate) mod testkit {
                 Op::L1(L1::KContract {
                     batch, m, n, acc, ..
                 }) => f(*acc, &[*batch, *m, *n]),
-                Op::L1(L1::KQContract { m, n, acc, .. }) => f(*acc, &[*m, *n]),
                 Op::L1(L1::KGather { .. } | L1::KScatter { .. }) => {
                     let space = match op {
                         Op::L1(L1::KGather { space, .. } | L1::KScatter { space, .. }) => {

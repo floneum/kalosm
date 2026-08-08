@@ -151,11 +151,6 @@ pub fn derive_bindings(
 }
 
 /// The padded layout one materialized value needs under one schedule point.
-pub fn buffer_layout(graph: &EGraph, node: Id, theta: Option<SchedPoint>) -> Result<Layout> {
-    buffer_layout_for(graph.facts(node), theta)
-}
-
-/// The same, against value facts directly.
 ///
 /// - default: `Layout::contiguous(shape)`;
 /// - `Coop { geom, splits, .. }`: pad `m` to a multiple of `geom.bm` and `n`
@@ -710,8 +705,6 @@ fn hash_l1<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L1) {
             k,
             batch,
             family,
-            pre_a,
-            pre_b,
             post,
             acc,
             a,
@@ -723,36 +716,18 @@ fn hash_l1<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L1) {
             hash_dim(h, sm, *k);
             hash_dim(h, sm, *batch);
             family.hash(h);
-            hash_scalar(h, sm, pre_a);
-            hash_scalar(h, sm, pre_b);
+            hash_scalar(h, sm, &a.pre);
+            hash_scalar(h, sm, &b.pre);
             hash_scalar(h, sm, post);
             acc.hash(h);
-            hash_operand(h, sm, a);
-            hash_operand(h, sm, b);
-        }
-        L1::KQContract {
-            fmt,
-            layout,
-            act,
-            m,
-            n,
-            k,
-            acc,
-            post,
-            a,
-            b,
-            ..
-        } => {
-            fmt.hash(h);
-            layout.hash(h);
-            act.hash(h);
-            hash_dim(h, sm, *m);
-            hash_dim(h, sm, *n);
-            hash_dim(h, sm, *k);
-            acc.hash(h);
-            hash_scalar(h, sm, post);
-            hash_operand(h, sm, a);
-            hash_operand(h, sm, b);
+            // Arity first: a kernel keyed only on the operands it happens to
+            // list would collide a two-buffer contraction with a wider one
+            // whose extra edges hash the same way.
+            h.write_usize(a.len());
+            h.write_usize(b.len());
+            for o in a.ops.iter().chain(b.ops.iter()) {
+                hash_operand(h, sm, o);
+            }
         }
         L1::KGather {
             space,
@@ -907,33 +882,17 @@ fn collect_op(op: &Op, dims: &mut Vec<SymId>, scalars: &mut Vec<SymId>) {
                 n,
                 k,
                 batch,
-                pre_a,
-                pre_b,
                 post,
                 a,
                 b,
                 ..
             } => {
                 collect_dims(&[*m, *n, *k, *batch], dims);
-                collect_scalar(pre_a, scalars);
-                collect_scalar(pre_b, scalars);
+                collect_scalar(&a.pre, scalars);
+                collect_scalar(&b.pre, scalars);
                 collect_scalar(post, scalars);
-                collect_ops(std::slice::from_ref(a), dims);
-                collect_ops(std::slice::from_ref(b), dims);
-            }
-            L1::KQContract {
-                m,
-                n,
-                k,
-                post,
-                a,
-                b,
-                ..
-            } => {
-                collect_dims(&[*m, *n, *k], dims);
-                collect_scalar(post, scalars);
-                collect_ops(std::slice::from_ref(a), dims);
-                collect_ops(std::slice::from_ref(b), dims);
+                collect_ops(&a.ops, dims);
+                collect_ops(&b.ops, dims);
             }
             L1::KGather { space, ops, .. } | L1::KScatter { space, ops, .. } => {
                 collect_dims(&space.dims, dims);

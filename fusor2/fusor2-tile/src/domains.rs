@@ -10,7 +10,6 @@
 pub mod coop;
 pub mod fold;
 pub mod map;
-pub mod quantized;
 pub mod sgemm;
 pub mod sgemv;
 
@@ -23,14 +22,11 @@ pub use sgemv::legal as sgemv_legal;
 pub use coop::{coop_domain, coop_tiles, stage_element};
 pub use fold::{emitted_block, fold_blocks, fold_domain, fold_domain_for};
 pub use map::map_domain;
-pub use quantized::{
-    QLanes, q5_row_domain, qrow_domain, qtile_domain, qtile_exact_domain, row_lanes, tile_lanes,
-};
 pub use sgemm::sgemm_domain;
 pub use sgemv::sgemv_domain;
 
 use fusor2_ir::device::Caps;
-use fusor2_ir::ir::level1::{FoldStrat, MapTiling, SchedPoint, SgemmParams, SgemvParams};
+use fusor2_ir::ir::level1::{FoldStrat, MapTiling, SgemmParams, SgemvParams};
 use fusor2_ir::ir::level2::ArenaPlanner;
 
 /// Everything a generator reads. `planner` is the *exact* footprint
@@ -97,58 +93,6 @@ impl<K: Clone + PartialEq, V: Clone> DomainMemo<K, V> {
 /// table is only valid for the planner that filtered it.
 pub(crate) fn planner_id(planner: &dyn ArenaPlanner) -> usize {
     std::ptr::from_ref(planner) as *const () as usize
-}
-
-/// Move-ordering seed for one schedule point, read by W7 through
-/// `ExtractBudget::sched_frontier`. **Seeds order the move frontier; they
-/// never gate it.** 0 is a measured winner on the calibration set, rising
-/// to 255 for a point nothing has ever measured.
-///
-/// The coop ranks come from `core/src/matmul/cost.rs`'s module doc (lines
-/// 39-73), the sgemm ranks from the deleted regression tree's distinct
-/// leaves, the sgemv ranks from the deleted 21-arm bucket table's eleven
-/// distinct cells.
-pub fn seed_rank(point: &SchedPoint) -> u8 {
-    match point {
-        SchedPoint::Point => 0,
-        SchedPoint::Coop {
-            geom,
-            splits,
-            staging,
-        } => {
-            let base = match (geom.bm, geom.bn, geom.bk) {
-                (128, 64, 16) | (64, 64, 16) => 0u8,
-                (128, 128, 16) | (64, 128, 16) | (128, 256, 16) => 1,
-                (64, 16, 16) | (16, 64, 16) => 2,
-                (128, 512, 16) | (256, 256, 16) => 3,
-                _ => UNMEASURED,
-            };
-            let mut rank = base;
-            if *staging == 1 {
-                rank = rank.saturating_add(1);
-            }
-            if *splits > 1 {
-                rank = rank.saturating_add(2);
-            }
-            rank
-        }
-        SchedPoint::Sgemm(p) => {
-            if sgemm::SEED_LEAVES.contains(p) {
-                0
-            } else {
-                UNMEASURED
-            }
-        }
-        SchedPoint::Sgemv(p) => {
-            if sgemv::SEED_CELLS.contains(p) {
-                0
-            } else {
-                UNMEASURED
-            }
-        }
-        SchedPoint::Fold(s) => fold::seed_rank(*s),
-        SchedPoint::Map(t) => map::seed_rank(*t),
-    }
 }
 
 /// Rank of a point no bench has ever visited. Deliberately far from the

@@ -8,13 +8,12 @@ use fusor2_ir::dtype::Persistence;
 use fusor2_ir::egraph::{Id, Rule};
 use fusor2_ir::error::Error;
 use fusor2_ir::ir::level1::SchedPoint;
-use fusor2_ir::ir::level2::{ArenaPlanner, KernelIr};
+use fusor2_ir::ir::level2::KernelIr;
 use fusor2_ir::ir::Node;
 use fusor2_ir::target::{Artifact, Buf, EmitError, LowerCtx, Target, Uniforms};
 use fusor2_ir::Result;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use std::sync::Arc;
 
 use crate::alloc::AlignedBuf;
 use crate::emit::{CpuArtifact, CpuKernel};
@@ -23,7 +22,6 @@ use crate::emit::{CpuArtifact, CpuKernel};
 pub struct CpuTarget {
     caps: Caps,
     facts: DeviceFacts,
-    planner: Option<Arc<dyn ArenaPlanner>>,
     /// `(size)`-keyed free list; a buffer is reusable once its `Arc` is unique.
     pool: Mutex<FxHashMap<u64, Vec<Buf>>>,
 }
@@ -35,30 +33,16 @@ impl CpuTarget {
         Ok(Self {
             caps,
             facts,
-            planner: None,
             pool: Mutex::new(FxHashMap::default()),
         })
     }
 
-    /// Override the measured rates, e.g. from `fusor2-cost::calibrate`.
-    pub fn with_facts(facts: DeviceFacts) -> Result<Self> {
-        let mut t = Self::new()?;
-        t.facts = facts;
-        Ok(t)
-    }
-
-    /// Attach the shared `fusor2-tile` planner, so `arena_plan`,
-    /// `verify_arena` and `verify_uniformity` all run before compilation.
-    /// Without one the emitter falls back to a sequential packing, which is
-    /// always legal here because thread-local scratch aliases freely.
-    pub fn with_planner(mut self, planner: Arc<dyn ArenaPlanner>) -> Self {
-        self.planner = Some(planner);
-        self
-    }
-
     /// Compile without going through the opaque [`Artifact`] wrapper.
+    ///
+    /// No arena planner is attached: the emitter's sequential packing is
+    /// always legal here because thread-local scratch aliases freely.
     pub fn compile(&self, ir: &KernelIr) -> std::result::Result<CpuArtifact, EmitError> {
-        crate::emit::compile(ir, &self.caps, self.planner.as_deref())
+        crate::emit::compile(ir, &self.caps, None)
     }
 }
 

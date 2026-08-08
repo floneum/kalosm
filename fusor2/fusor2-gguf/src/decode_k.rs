@@ -8,10 +8,10 @@
 //! Owned by W11.
 
 use fusor2_ir::Result;
-use fusor2_ir::dtype::{BlockDecodeArgs, BlockProgram, QFmt, QLayout};
+use fusor2_ir::dtype::{QFmt, QLayout};
 use fusor2_ir::ir::level2::{TileCompareOp, TileExpr};
 
-use crate::blocks::{BlockFields, block_fields};
+use crate::blocks::{BlockDecodeArgs, BlockFields, BlockProgram, block_fields};
 use crate::decode::{
     add, and_lit, block_base_and_q, cmp, expect_layout, f32_lit, finish, load_block_byte,
     load_scale_f32, mul, or, sel, shl_lit, shr, shr_lit, signed_byte_f32, sub, u32_lit, u32_to_f32,
@@ -147,12 +147,11 @@ fn decode_k4(
     expect_layout(args, want, name)?;
     let fields = block_fields(fmt, want);
     let with_high_bit = matches!(fmt, QFmt::Q5K);
-    let mut parts = Vec::with_capacity(args.lanes as usize);
-    for lane in 0..args.lanes {
-        let (base, q) = block_base_and_q(args, fmt, lane);
-        parts.push(k4_lane(args, &fields, &base, &q, with_high_bit));
-    }
-    Ok(finish(args, parts))
+    let (base, q) = block_base_and_q(args, fmt);
+    Ok(finish(
+        args,
+        k4_lane(args, &fields, &base, &q, with_high_bit),
+    ))
 }
 
 /// `scale * scales_i8[k/16] * (((qh_bits << 4) | ql_nibble) - 32)`.
@@ -207,12 +206,8 @@ fn q6k_lane(
 fn decode_q6k(args: &BlockDecodeArgs<'_>, want: QLayout, name: &'static str) -> Result<TileExpr> {
     expect_layout(args, want, name)?;
     let fields = block_fields(QFmt::Q6K, want);
-    let mut parts = Vec::with_capacity(args.lanes as usize);
-    for lane in 0..args.lanes {
-        let (base, q) = block_base_and_q(args, QFmt::Q6K, lane);
-        parts.push(q6k_lane(args, &fields, &base, &q));
-    }
-    Ok(finish(args, parts))
+    let (base, q) = block_base_and_q(args, QFmt::Q6K);
+    Ok(finish(args, q6k_lane(args, &fields, &base, &q)))
 }
 
 // ---------------------------------------------------------------------------

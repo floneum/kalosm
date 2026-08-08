@@ -308,7 +308,6 @@ Consumer counts come from the DAG, so **rematerialization is priced exactly** as
 pub enum AdjointKind {
     Analytic(fn(&mut Tape, &Node, Val, &[Val], Val) -> SmallVec<[Option<Val>; 4]>),
     Structural,        // derived from the op's own attributes
-    StraightThrough,   // forward opaque, adjoint identity
 }
 pub static ADJOINTS: &[Adjoint] = &[
     Adjoint { op: Contract, kind: Analytic(|t,n,g,i,_| smallvec![
@@ -329,7 +328,7 @@ pub static ADJOINTS: &[Adjoint] = &[
 
 **There is no `replay_*`.** `conv`, `grouped_conv`, `rms_norm`, `layer_norm`, `rope`, `attention`, `upsample`, `pool`, `q_mat_mul` are macro ops whose `defn` expansion into core L0 is present from node zero, so their adjoints are the composition of core adjoints, automatically. The reference's four replay combinators — build a throwaway `Graph` at backward time and re-differentiate — do not exist. Neither does the tape: no `Arc<dyn Fn>` closures, no type-erased `AnyTensorValue` downcasts with runtime rank-mismatch strings, no self-`Arc` cycle hazard.
 
-The named risk is that the reference's **hand-fused backwards** (`attention_grads`, `rms_norm_fused`'s backward, the analytic softmax Jacobian) must be re-derived by rewrite rules from the composed backward. Mitigation is a tripwire, not hope: `KFlash` is minted by a rule matching the composed backward, and conformance asserts launch counts (`resolves_in::<N>`, carried over) for **eight named backward shapes**. A non-firing rule is a hard test failure, not a quiet 5-10× throughput regression. The trainer's `distillation_loss` becomes the plain taped softplus chain, with `softplus_bce_adjoint` rewriting its adjoint to the single-sigmoid form; QAT fake-quant is `AdjointKind::StraightThrough` with zero user code. `with_backwards` survives verbatim — `Parent`, `GradientSlot` as a bare `NodeId` so a closure can never close an `Arc` cycle, and validation that every requires-grad parent receives a gradient — as the fallback, needed by nothing the trainer does.
+The named risk is that the reference's **hand-fused backwards** (`attention_grads`, `rms_norm_fused`'s backward, the analytic softmax Jacobian) must be re-derived by rewrite rules from the composed backward. Mitigation is a tripwire, not hope: `KFlash` is minted by a rule matching the composed backward, and conformance asserts launch counts (`resolves_in::<N>`, carried over) for **eight named backward shapes**. A non-firing rule is a hard test failure, not a quiet 5-10× throughput regression. The trainer's `distillation_loss` becomes the plain taped softplus chain, with `softplus_bce_adjoint` rewriting its adjoint to the single-sigmoid form; QAT fake-quant is one `with_backwards` registration with zero user code. `with_backwards` survives verbatim — `Parent`, `GradientSlot` as a bare `NodeId` so a closure can never close an `Arc` cycle, and validation that every requires-grad parent receives a gradient — as the fallback, needed by nothing the trainer does.
 
 ---
 

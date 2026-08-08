@@ -82,13 +82,6 @@ pub fn elide_barriers(ir: &mut KernelIr) -> usize {
     paths.len()
 }
 
-/// Drop barriers that separate no hazard pair, returning the rewritten body.
-pub fn elide(ir: &KernelIr, _live: &LivenessInfo) -> Result<KernelIr> {
-    let mut out = ir.clone();
-    elide_barriers(&mut out);
-    Ok(out)
-}
-
 fn any_barrier(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|stmt| match stmt {
         Stmt::Barrier => true,
@@ -261,12 +254,6 @@ pub fn insert(ir: &KernelIr, at: &[u32]) -> Result<KernelIr> {
         out.body.insert(position, Stmt::Barrier);
     }
     Ok(out)
-}
-
-/// Apply one suggestion in place.
-pub fn apply_barrier_suggestion(ir: &mut KernelIr, suggestion: &BarrierSuggestion) {
-    let index = (suggestion.index as usize).min(ir.body.len());
-    ir.body.insert(index, Stmt::Barrier);
 }
 
 #[cfg(test)]

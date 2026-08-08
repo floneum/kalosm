@@ -9,7 +9,7 @@
 //! elision and arena packing stay closed-form argmins here with an independent
 //! verifier — an honest exclusion, marked as such.
 
-use crate::dtype::{NumericContract, QAct, QFmt, QLayout};
+use crate::dtype::{NumericContract, QFmt, QLayout};
 use crate::error::Result;
 use crate::shape::MultiFlattenMap;
 use rustc_hash::FxHasher;
@@ -121,14 +121,13 @@ impl ElementType {
 // Memory
 // ---------------------------------------------------------------------------
 
-/// Exactly three memory spaces. Nothing fusor emits needs uniform buffers,
+/// Exactly two memory spaces. Nothing fusor emits needs uniform buffers,
 /// push constants, textures, samplers, or (outside [`Stmt::AtomicAdd`])
 /// atomics.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryLevel {
     Storage,
     Workgroup,
-    Private,
 }
 
 /// Access a storage buffer requires.
@@ -398,13 +397,17 @@ pub enum Source {
 }
 
 /// A quantized matrix bound as a plain u32 storage buffer.
+///
+/// The decode program addresses the block stream from `data` and the
+/// `(k_base, col)` the load supplies; the matrix extents are not among its
+/// inputs (`BlockDecodeArgs` has no row or column count), so they are not
+/// carried here. A reader that needs a bound computes it where the bound is
+/// used, not from the view.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct QuantizedView {
     pub data: StorageView,
     pub fmt: QFmt,
     pub layout: QLayout,
-    pub rows: u32,
-    pub cols: u32,
 }
 
 /// Address of a memory access.
@@ -606,33 +609,6 @@ pub enum TileExprKind {
         b: TileExpr,
         c: TileExpr,
     },
-    // quantized
-    /// Decode one block into `lanes` f32 values, projected per lane with
-    /// [`TileExprKind::LaneOf`].
-    Dequantize {
-        src: QuantizedView,
-        k_base: TileExpr,
-        col: TileExpr,
-        mask: TileExpr,
-        fill: TileExpr,
-        lanes: u32,
-    },
-    LaneOf {
-        block: TileExpr,
-        lane: u32,
-    },
-    /// Fused per-column quantized dot. Decodes the block scale **once**;
-    /// `Dequantize + Dot` re-decodes it per lane, and the `Q8Dp4a` packing
-    /// is not expressible as dequantize-then-dot at all.
-    QuantizedDot {
-        src: QuantizedView,
-        packing: QAct,
-        activations: Vec<TileExpr>,
-        k_base: TileExpr,
-        col: TileExpr,
-        mask: TileExpr,
-        fill: TileExpr,
-    },
 }
 
 impl TileExpr {
@@ -673,10 +649,6 @@ impl TileExpr {
         self.0.mem_reads
     }
 
-    /// True when [`Self::mem_reads`] names any space at all.
-    pub fn reads_memory(&self) -> bool {
-        !self.0.mem_reads.is_empty()
-    }
 }
 
 /// Fold the memory-read set for one node from its children.
@@ -716,38 +688,12 @@ fn kind_mem_reads(kind: &TileExprKind) -> MemReads {
                 .union(col.mem_reads()),
             CoopSrc::BroadcastCol { col, .. } => MemReads::STORAGE.union(col.mem_reads()),
         },
-        K::Dequantize {
-            k_base,
-            col,
-            mask,
-            fill,
-            ..
-        } => MemReads::STORAGE
-            .union(k_base.mem_reads())
-            .union(col.mem_reads())
-            .union(mask.mem_reads())
-            .union(fill.mem_reads()),
-        K::QuantizedDot {
-            activations,
-            k_base,
-            col,
-            mask,
-            fill,
-            ..
-        } => activations
-            .iter()
-            .fold(MemReads::STORAGE, |acc, a| acc.union(a.mem_reads()))
-            .union(k_base.mem_reads())
-            .union(col.mem_reads())
-            .union(mask.mem_reads())
-            .union(fill.mem_reads()),
         // Pure combinators: the union over the children.
         K::Unary { value, .. }
         | K::Round { value, .. }
         | K::Cast { value, .. }
         | K::Bitcast { value, .. }
-        | K::VecComponent { vector: value, .. }
-        | K::LaneOf { block: value, .. } => value.mem_reads(),
+        | K::VecComponent { vector: value, .. } => value.mem_reads(),
         // A cross-lane reduction stages through the scratch tile its
         // `ReduceKind` names, so it reads a workgroup tile on every strategy
         // but `Subgroup`.
@@ -961,16 +907,6 @@ impl Stmt {
 // Capability tokens
 // ---------------------------------------------------------------------------
 
-/// Proof that the device supports subgroups at a fixed width.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SubgroupToken {
-    pub width: u32,
-}
-/// Proof that the device supports cooperative matrices.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CoopMatrixToken {
-    pub dim: u32,
-}
 /// Proof that the device supports workgroup byte-arena aliasing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ByteArenaToken;
@@ -1067,8 +1003,6 @@ pub trait ArenaPlanner: Send + Sync {
 /// Why L2 lowering failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LowerError {
-    UnsupportedMemoryLevel(MemoryLevel),
-    UnsupportedOperation(&'static str),
     BarrierHazard(String),
     NonUniformBarrier(String),
     UnmaskedLoad(String),
@@ -1079,8 +1013,6 @@ pub enum LowerError {
 impl fmt::Display for LowerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedMemoryLevel(m) => write!(f, "unsupported memory level {m:?}"),
-            Self::UnsupportedOperation(o) => write!(f, "unsupported operation {o}"),
             Self::BarrierHazard(e) => write!(f, "workgroup barrier hazard: {e}"),
             Self::NonUniformBarrier(e) => write!(f, "barrier under non-uniform control: {e}"),
             Self::UnmaskedLoad(e) => write!(f, "load not provably in range: {e}"),

@@ -18,7 +18,7 @@
 use fusor2::{Dtype, Session, Tensor};
 use half::{bf16, f16};
 
-use crate::harness::{CaseError, CaseResult, Cases, dims, from_f32, from_u32, skip};
+use crate::harness::{CaseError, CaseResult, Cases, dims, from_u32, skip};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
 const SHAPE: &[u64] = &[2, 6];
@@ -446,17 +446,6 @@ fn widening_accumulator(session: &Session) -> CaseResult {
         .into());
     }
     Ok(())
-}
-
-/// Kept next to the cases so the f32 upload helper the rest of the suite uses
-/// stays exercised from this file too.
-#[allow(dead_code)]
-fn upload_f32(
-    graph: &fusor2::graph::GraphRef,
-    shape: &[u64],
-    data: &[f32],
-) -> fusor2::Result<Tensor> {
-    from_f32(graph, &dims(shape), data)
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@
 //! Precision is **not** a cost term — it is a verifier property
 //! (`NumericContract`), because a time-only model eliminates f32 everywhere.
 
+pub mod tune_cache;
 pub mod cache;
 pub mod calibrate;
 pub mod extract;

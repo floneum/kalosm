@@ -3,6 +3,8 @@
 //!
 //! Owned by W9.
 
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -13,13 +15,13 @@ use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::Persistence;
 use fusor2_ir::egraph::{EGraph, Id, Rule};
 use fusor2_ir::error::Error;
-use fusor2_ir::extract::{Plan, PlanHash};
+use fusor2_ir::extract::{Launch, Plan, PlanHash};
 use fusor2_ir::ir::Node;
 use fusor2_ir::ir::level1::SchedPoint;
 use fusor2_ir::ir::level2::KernelIr;
 use fusor2_ir::shape::SymId;
 use fusor2_ir::target::{Artifact, Buf, EmitError, LowerCtx, Target, Uniforms};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::device::GpuDevice;
 use crate::launch::{
@@ -27,7 +29,7 @@ use crate::launch::{
     should_parallelize_build_remainder,
 };
 use crate::plan_cache::PlanCache;
-use crate::pool::{BufferPool, BufferPoolCounters};
+use crate::pool::BufferPool;
 use crate::uniforms::UniformPack;
 
 /// Runtime policy. Every field names a decision the library owns; none is read
@@ -76,11 +78,61 @@ fn default_cache_dir() -> Option<PathBuf> {
     })
 }
 
+/// Live compiled pipelines retained per target. A transformer training step's
+/// whole distinct kernel set fits well inside this; past it the LRU drops the
+/// coldest, which costs one rebuild and never correctness.
+pub const ARTIFACT_CAPACITY: usize = 1024;
+
+/// Everything the emitted kernel body depends on.
+///
+/// `PlanHash` is `hash(realized DAG term + M + theta + DeviceFacts)`: it fixes
+/// the launch set, every member's op with symbols *as symbols*, every leaf
+/// operand's dtype and shape, `materialized`, `theta`, and the device. What it
+/// deliberately leaves out is exactly what the rest of this key adds back:
+/// `Plan::buffers`, which `lower::bound_layout` treats as the authoritative
+/// padded stride set; `Plan::symbols`, which `UniformPack::new` turns into
+/// baked uniform slot indices; and the concrete extents `DimBinding` resolves
+/// `KernelIr::grid` against. `launch` pins which dispatch of the plan this is.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+struct ArtifactKey {
+    plan: PlanHash,
+    launch: u64,
+    tail: u64,
+    dims: u64,
+}
+
+fn artifact_key(plan: &Plan, launch: &Launch, binds: &BindingEnv) -> ArtifactKey {
+    let mut lh = FxHasher::default();
+    launch.hash(&mut lh);
+
+    let mut th = FxHasher::default();
+    plan.buffers.hash(&mut th);
+    plan.symbols.hash(&mut th);
+
+    // An `FxHashMap` has no stable iteration order, so the dim fold has to be
+    // commutative. Keys are distinct `SymId`s, so no two terms cancel.
+    let mut dims = 0u64;
+    for (sym, value) in &binds.dims {
+        let mut dh = FxHasher::default();
+        dh.write_u32(sym.0);
+        dh.write_u64(*value);
+        dims = dims.wrapping_add(dh.finish());
+    }
+
+    ArtifactKey {
+        plan: plan.hash,
+        launch: lh.finish(),
+        tail: th.finish(),
+        dims,
+    }
+}
+
 /// The wgpu backend.
 pub struct GpuTarget {
     device: Arc<GpuDevice>,
     pool: BufferPool,
     cache: PlanCache,
+    artifacts: parking_lot::Mutex<lru::LruCache<ArtifactKey, (Artifact, [u32; 3])>>,
     launcher: Launcher,
     config: GpuConfig,
 }
@@ -109,6 +161,9 @@ impl GpuTarget {
             device,
             pool,
             cache,
+            artifacts: parking_lot::Mutex::new(lru::LruCache::new(
+                NonZeroUsize::new(ARTIFACT_CAPACITY).expect("ARTIFACT_CAPACITY is nonzero"),
+            )),
             launcher,
             config,
         })
@@ -133,10 +188,6 @@ impl GpuTarget {
     }
     pub fn config(&self) -> &GpuConfig {
         &self.config
-    }
-
-    pub fn pool_counters(&self) -> BufferPoolCounters {
-        self.pool.counters()
     }
 
     pub fn take_kernel_profiles(&self) -> Vec<KernelProfile> {
@@ -219,10 +270,6 @@ impl GpuTarget {
         }
 
         // ---- Phase 2: build, serially probing then in parallel -----------
-        let cached = self.cache.get(plan.hash);
-        if cached.is_none() {
-            self.cache.note_miss();
-        }
         let queue_len = work.len();
         let mut cutover = queue_len;
         for i in 0..queue_len {
@@ -301,26 +348,49 @@ impl GpuTarget {
             }
         }
         self.pool.recycle(uniform_buf);
-        self.pool.reset_initialized_buffers();
+        self.pool.repoison_free_buffers();
 
-        if self.config.trace_gpu_kernels {
+        if let Some(set) = query_set.as_ref() {
             // The query set is resolved from a command buffer submitted after
             // a `poll_wait`: Metal's writeback of the final encoder's boundary
             // samples races a resolve encoded behind it and leaves slots zero.
             self.launcher.poll_wait()?;
-            let samples: Vec<(String, f64)> = work
-                .iter()
-                .filter_map(|w| {
-                    w.artifact
-                        .as_ref()?
-                        .downcast_ref::<GpuArtifact>()
-                        .map(|g| (g.name.to_string(), 0.0))
-                })
-                .collect();
-            self.launcher.push_profile(KernelProfile::from_samples(
-                start.elapsed().as_secs_f64() * 1000.0,
-                &samples,
-            ));
+            let live = records.iter().filter(|r| !r.is_empty_dispatch()).count();
+            let samples = self.launcher.read_timestamps(&self.pool, set, live)?;
+            // Back to plan order: a zero-grid launch never reached the encoder
+            // and owns no sample.
+            let mut next = 0usize;
+            let mut per_launch = Vec::with_capacity(records.len());
+            for record in &records {
+                if record.is_empty_dispatch() {
+                    per_launch.push(0.0);
+                } else {
+                    per_launch.push(samples.get(next).copied().unwrap_or(0.0));
+                    next += 1;
+                }
+            }
+            if self.config.trace_gpu_kernels {
+                let named: Vec<(String, f64)> = work
+                    .iter()
+                    .zip(&per_launch)
+                    .filter_map(|(w, us)| {
+                        w.artifact
+                            .as_ref()?
+                            .downcast_ref::<GpuArtifact>()
+                            .map(|g| (g.name.to_string(), *us))
+                    })
+                    .collect();
+                self.launcher.push_profile(KernelProfile::from_samples(
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    &named,
+                ));
+            }
+            // An all-zero read is a device that did not write the slots, not a
+            // plan that took no time. Publishing it would make every candidate
+            // look infinitely fast, so the tuner falls back to the wall clock.
+            if per_launch.iter().any(|us| *us > 0.0) {
+                self.launcher.set_last_profile(per_launch);
+            }
         }
         Ok(())
     }
@@ -342,6 +412,10 @@ impl GpuTarget {
             .iter()
             .find(|l| l.root == item.root)
             .ok_or_else(|| Error::Plan(format!("no launch roots at {}", item.root)))?;
+        let key = artifact_key(plan, launch, binds);
+        if let Some(hit) = self.artifacts.lock().get(&key).cloned() {
+            return Ok(hit);
+        }
         let cx = LowerCtx {
             plan,
             launch,
@@ -370,6 +444,7 @@ impl GpuTarget {
         fusor2_tile::verify_l2(&ir, self.caps())?;
         let grid = ir.grid;
         let artifact = self.emit(&ir).map_err(Error::from)?;
+        self.artifacts.lock().put(key, (artifact.clone(), grid));
         Ok((artifact, grid))
     }
 }

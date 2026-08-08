@@ -23,8 +23,8 @@ use fusor2_ir::cost::{CostModel, DeviceFacts, LaunchPlan, MacUnit, Picoseconds, 
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::extract::{Extraction, PlanHash};
 use fusor2_ir::facts::ValueFacts;
-use fusor2_ir::ir::level1::{L1, SchedPoint};
-use fusor2_ir::ir::{Node, Op};
+use fusor2_ir::ir::level1::SchedPoint;
+use fusor2_ir::ir::Node;
 use fusor2_ir::shape::Dim;
 use parking_lot::RwLock;
 use rustc_hash::{FxHashSet, FxHasher};
@@ -188,21 +188,10 @@ impl Roofline {
 
 /// Which functional unit and dtype a node's MACs issue on.
 fn unit_and_dtype(
-    node: &Node,
     ins: &[ValueFacts],
     out: &ValueFacts,
     theta: Option<SchedPoint>,
 ) -> (MacUnit, Dtype) {
-    if let Op::L1(L1::KQContract {
-        act: fusor2_ir::dtype::QAct::Q8Dp4a,
-        ..
-    }) = &node.op
-    {
-        // The activations are packed i8 and the accumulate is i32; pricing
-        // this at the operand's quantized dtype would land on the dp4a
-        // row's float slot, which is deliberately 1.
-        return (MacUnit::Dp4a, Dtype::I32);
-    }
     // MACs issue at the operand dtype; `acc` is a separate attribute and
     // does not set the issue rate.
     let dtype = ins.first().map_or(out.dtype, |f| f.dtype);
@@ -228,7 +217,7 @@ impl CostModel for Roofline {
         out: &ValueFacts,
         theta: Option<SchedPoint>,
     ) -> Picoseconds {
-        let (unit, dtype) = unit_and_dtype(node, ins, out, theta);
+        let (unit, dtype) = unit_and_dtype(ins, out, theta);
         let work = fusor2_ir::semantics::work::work_of(&node.op, ins, out);
         // Zero traffic, no occupancy scaling. The admissible lower bound is
         // built from this, and either addition would break admissibility.

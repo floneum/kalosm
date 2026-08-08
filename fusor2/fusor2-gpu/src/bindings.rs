@@ -20,9 +20,6 @@ pub struct BindingDesc {
     pub name: Option<String>,
 }
 
-/// The spec's name for [`BindingDesc`].
-pub type BindingSlot = BindingDesc;
-
 /// Walk `module`'s storage globals in binding order.
 ///
 /// This is the only source of binding order in the crate: nothing else may
@@ -69,11 +66,6 @@ pub fn layout_entries(bindings: &[BindingDesc]) -> Vec<wgpu::BindGroupLayoutEntr
             count: None,
         })
         .collect()
-}
-
-/// The spec's name for [`layout_entries`].
-pub fn bind_group_layout_entries(slots: &[BindingDesc]) -> Vec<wgpu::BindGroupLayoutEntry> {
-    layout_entries(slots)
 }
 
 /// Zip a derived binding list positionally with the caller's buffers.
@@ -179,7 +171,7 @@ mod tests {
             vec![(0, true), (1, true), (2, false)]
         );
 
-        let entries = bind_group_layout_entries(&slots);
+        let entries = layout_entries(&slots);
         assert_eq!(entries.len(), 3);
         assert!(matches!(
             entries[0].ty,

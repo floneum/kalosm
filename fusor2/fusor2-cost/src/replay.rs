@@ -111,16 +111,6 @@ impl ReplayCache {
         Ok((plan, unchanged))
     }
 
-    /// Drop every plan extracted against one device fingerprint. Called when
-    /// a driver update or a recalibration moves the rates the plan was
-    /// chosen under.
-    pub fn invalidate_device(&self, device: u64) {
-        let mut e = self.entries.lock();
-        e.plans.retain(|(k, _)| k.device != device);
-        let live: Vec<ReplayKey> = e.plans.iter().map(|(k, _)| *k).collect();
-        e.order.retain(|k| live.contains(k));
-    }
-
     pub fn clear(&self) {
         let mut e = self.entries.lock();
         e.plans.clear();
@@ -395,8 +385,10 @@ mod tests {
         assert_ne!(one, both, "the root set is an extraction input");
     }
 
+    /// The device fingerprint is part of the key: two devices holding the
+    /// same term are two entries, never one served to both.
     #[test]
-    fn invalidate_device_drops_only_that_device() {
+    fn the_device_fingerprint_separates_entries() {
         let cache = ReplayCache::new();
         let a = ReplayKey {
             l0_term: 1,
@@ -411,9 +403,7 @@ mod tests {
         cache.insert(a, plan_for());
         cache.insert(b, plan_for());
         assert_eq!(cache.len(), 2);
-        cache.invalidate_device(10);
-        assert_eq!(cache.len(), 1);
-        assert!(cache.get(a).is_none());
+        assert!(cache.get(a).is_some());
         assert!(cache.get(b).is_some());
     }
 

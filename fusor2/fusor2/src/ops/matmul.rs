@@ -64,9 +64,10 @@ impl Tensor {
 
     fn contract_2d(&self, rhs: &Tensor, transposed_rhs: bool) -> Result<Tensor> {
         // A block-quantized weight is a legal contraction operand on exactly
-        // one side: `L1::KQContract` reads the blocks in the kernel and the
-        // extractor prices it against dequantize-then-contract. Two quantized
-        // sides is not a kernel anybody has.
+        // one side: an ordinary `KContract` decodes the blocks on the way into
+        // its staging fill, and the extractor prices that against
+        // dequantize-then-contract. Two quantized sides is not a kernel
+        // anybody has.
         let (q_lhs, q_rhs) = (self.dtype().is_quantized(), rhs.dtype().is_quantized());
         if q_lhs && q_rhs {
             return Err(Error::Dtype(
@@ -110,6 +111,33 @@ impl Tensor {
         // format has none of its own.
         let acc = if q_lhs { rhs.dtype() } else { self.dtype() }.compute_dtype();
         let spec = matmul_spec(batch, transposed_rhs)?;
+
+        // A quantized side enters the contraction as its *dequantize class*,
+        // not its raw leaf. The class is `L0::Dequant` unioned with the
+        // `Restride` + `Map` definitional expansion (see
+        // `QMatrix::dequantize`), so the extractor prices the format's staged
+        // block decode against the general bit-arithmetic spelling —
+        // `map_into_contract` absorbs the latter's unpack into the
+        // contraction's own operand list, no materialization in either case.
+        // Contracting the raw leaf instead would put exactly one spelling in
+        // the graph: the hand-written block program, reachable by no rewrite
+        // and admitted to `Family::Coop` alone.
+        //
+        // A quantized value `QMatrix::of_tensor` cannot name (not a leaf, or
+        // rank over 2 — today nothing mints either) falls back to the raw
+        // operand, which is the old behavior, not an error.
+        let deq = |t: &Tensor| -> Result<Option<Tensor>> {
+            match crate::quantized::QMatrix::of_tensor(t) {
+                Some(q) => Ok(Some(q.dequantize()?)),
+                None => Ok(None),
+            }
+        };
+        if q_lhs && let Some(w) = deq(self)? {
+            return w.contract(rhs, spec, acc);
+        }
+        if q_rhs && let Some(w) = deq(rhs)? {
+            return self.contract(&w, spec, acc);
+        }
         self.contract(rhs, spec, acc)
     }
 

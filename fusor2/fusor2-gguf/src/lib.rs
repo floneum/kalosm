@@ -18,7 +18,7 @@ pub mod sharded;
 pub mod varbuilder;
 
 pub use blocks::{BLOCK_SPECS, block_spec};
-pub use parse::{Gguf, GgufMetadata, GgufTensor};
+pub use parse::{GgmlType, Gguf, GgufMetadata, GgufTensor};
 pub use repack::repack;
 pub use sharded::{AsyncShardedVarBuilder, ShardedVarBuilder};
 pub use varbuilder::VarBuilder;

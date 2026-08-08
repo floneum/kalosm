@@ -240,15 +240,9 @@ fn atomic_array_type(
 
 /// Declare a storage buffer global. Read-only-ness comes from
 /// [`BufferDecl::access`] and is what [`crate::bindings`] reads back out.
-pub fn storage_global(
-    module: &mut naga::Module,
-    decl: &BufferDecl,
-) -> Result<Handle<GlobalVariable>, EmitError> {
-    storage_global_with(module, decl, false)
-}
-
-/// As [`storage_global`], typing the array as `array<atomic<..>>` when the
-/// analysis found a [`fusor2_ir::ir::level2::Stmt::AtomicAdd`] on this binding.
+///
+/// The array is typed `array<atomic<..>>` when the analysis found a
+/// [`fusor2_ir::ir::level2::Stmt::AtomicAdd`] on this binding.
 pub fn storage_global_with(
     module: &mut naga::Module,
     decl: &BufferDecl,

@@ -68,8 +68,8 @@ verify_l0  verify_l1  rule_macro  rules{,::*}  saturate
 |---|---|---|
 | `Error`, `Result<T, E = Error>` | `error` | flat, `Clone`, `PartialEq` |
 | `Dtype` = `F32\|F16\|BF16\|U32\|I32\|Q(QFmt)` | `dtype` | no `Bool`; comparisons are 1.0/0.0 |
-| `QFmt` (6), `QLayout`, `QAct`, `BlockSpec`, `BlockProgram`, `GgmlType` | `dtype` | |
-| `NumericContract { min_accum_bits, reassoc, contract }` | `dtype` | `RELAXED`, `STRICT`, `allows`, `meet`, `require` |
+| `QFmt` (6), `QLayout` | `dtype` | `BlockSpec`, `BlockProgram`, `GgmlType` live in `fusor2-gguf` |
+| `NumericContract { min_accum_bits, reassoc, contract }` | `dtype` | `RELAXED`, `STRICT`, `allows`, `meet` |
 | `Persistence`, `RoundMode`, `Splat` | `dtype` | `Splat` eq/hash are **bitwise** |
 | `SymId`, `Dim`, `Dims`, `StrideSpec`, `SlidingWindow`, `Layout`, `MultiFlattenMap`, `BoundsProof` | `shape` | plus `broadcast_specs`, `broadcast_shapes` |
 | `ValueFacts`, `Work` | `facts` | |

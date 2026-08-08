@@ -12,7 +12,7 @@ pub mod work;
 use crate::device::Caps;
 use crate::error::{Error, Result};
 use crate::facts::{ValueFacts, Work};
-use crate::ir::level0::{L0, ScatterCombine};
+use crate::ir::level0::ScatterCombine;
 use crate::ir::level1::{BufferRole, Effect, L1, ScatterMode};
 use crate::ir::level2::ArenaPlanner;
 use crate::ir::{Children, Level, Op, OpDefRegistry, Semantics, VerifyCtx};
@@ -119,15 +119,6 @@ pub fn level_of(op: &Op) -> Level {
     op.level().unwrap_or(Level::L0)
 }
 
-/// Assert `op` is an L0 node and return it — a small helper so callers that
-/// only handle one level need not restate the match.
-pub fn as_l0(op: &Op) -> Option<&L0> {
-    match op {
-        Op::L0(o) => Some(o),
-        _ => None,
-    }
-}
-
 /// A trivially-correct [`ArenaPlanner`] for callers that need a
 /// [`CoreSemantics`] before `fusor2-tile`'s planner exists — notably
 /// `fusor2-ir`'s own tests and the CPU target, which has no workgroup memory
@@ -184,8 +175,10 @@ mod tests {
     use crate::dtype::{Dtype, QFmt, QLayout, Splat};
     use crate::egraph::Id;
     use crate::carrier::{Carrier, SlotTy};
-    use crate::ir::level0::{BufferId, EinSpec, Label, LeafKind, TiePolicy};
-    use crate::ir::level1::{AccessPlan, Family, IndexSpace, MapDomain, Operand, ScheduleDomain};
+    use crate::ir::level0::{BufferId, EinSpec, L0, Label, LeafKind, TiePolicy};
+    use crate::ir::level1::{
+        AccessPlan, ContractSide, Family, IndexSpace, MapDomain, Operand, ScheduleDomain,
+    };
     use crate::ir::{Node, OpTag};
     use crate::scalar::{BinOp, CmpOp, ScalarExpr, UnOp};
     use crate::shape::{BoundsProof, Dim, Layout, SlidingWindow, StrideSpec, SymId};
@@ -226,7 +219,6 @@ mod tests {
         assert_eq!(facts.persistence, crate::dtype::Persistence::Persistent);
         assert_eq!(sem.effect(&leaf), Effect::Pure);
         assert!(sem.children(&leaf).is_empty());
-        assert!(as_l0(&leaf).is_some());
         assert_eq!(level_of(&leaf), Level::L0);
 
         let node = Node {
@@ -530,7 +522,7 @@ mod tests {
     fn rand_l1(rng: &mut Rng) -> L1 {
         let space = IndexSpace::new((0..rng.below(4)).map(|_| rand_dim(rng)).collect::<Vec<_>>());
         let ops: Vec<Operand> = (0..rng.below(4)).map(|_| rand_operand(rng)).collect();
-        match rng.below(8) {
+        match rng.below(7) {
             0 => L1::KMap {
                 space,
                 body: rand_expr(rng, 2),
@@ -553,35 +545,20 @@ mod tests {
                 k: rand_dim(rng),
                 batch: rand_dim(rng),
                 family: Family::Coop,
-                pre_a: rand_expr(rng, 2),
-                pre_b: rand_expr(rng, 2),
                 post: rand_expr(rng, 2),
                 acc: rand_dtype(rng),
-                a: rand_operand(rng),
-                b: rand_operand(rng),
+                a: ContractSide::one(rand_expr(rng, 2), rand_operand(rng)),
+                b: ContractSide::one(rand_expr(rng, 2), rand_operand(rng)),
                 sched: ScheduleDomain::Coop(Default::default()),
             },
-            3 => L1::KQContract {
-                fmt: QFmt::Q4_0,
-                layout: QLayout::Native,
-                act: crate::dtype::QAct::Q8Dp4a,
-                m: rand_dim(rng),
-                n: rand_dim(rng),
-                k: rand_dim(rng),
-                acc: Dtype::F32,
-                post: rand_expr(rng, 2),
-                a: rand_operand(rng),
-                b: rand_operand(rng),
-                sched: ScheduleDomain::Point,
-            },
-            4 => L1::KGather {
+            3 => L1::KGather {
                 space,
                 axis: rng.below(4) as u32,
                 mode: crate::ir::level1::GatherMode::RowPerGroup,
                 ops,
                 sched: ScheduleDomain::Point,
             },
-            5 => L1::KScatter {
+            4 => L1::KScatter {
                 space,
                 axis: rng.below(4) as u32,
                 mode: ScatterMode::Atomic,
@@ -589,7 +566,7 @@ mod tests {
                 ops,
                 sched: ScheduleDomain::Point,
             },
-            6 => L1::KRegion {
+            5 => L1::KRegion {
                 members: (0..rng.below(4)).map(|i| Id(i as u32)).collect(),
                 live_outs: (0..rng.below(3)).map(|i| i as u32).collect(),
                 sched: ScheduleDomain::Map(MapDomain::linear(&caps(), rng.below(4096) as u64)),
@@ -663,8 +640,8 @@ mod tests {
             }
             let _ = children::children_of(&op);
         }
-        // 10 L0 tags + 8 of the 9 L1 tags (KMerged needs its constructor,
+        // 10 L0 tags + 7 of the 8 L1 tags (KMerged needs its constructor,
         // which is exercised in `verify_l1`'s tests).
-        assert!(seen.len() >= 18, "only saw {} tags", seen.len());
+        assert!(seen.len() >= 17, "only saw {} tags", seen.len());
     }
 }

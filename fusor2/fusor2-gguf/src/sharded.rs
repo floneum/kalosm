@@ -225,7 +225,7 @@ mod tests {
     use super::*;
     use crate::async_read::{BytesRange, block_on};
     use crate::parse::{Gguf, GgufVersion, fixture};
-    use fusor2_ir::dtype::GgmlType;
+    use crate::parse::GgmlType;
 
     fn two_shards() -> (Vec<u8>, Vec<u8>) {
         let a = fixture::build(

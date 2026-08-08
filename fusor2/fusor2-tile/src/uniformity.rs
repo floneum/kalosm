@@ -35,9 +35,6 @@ pub enum Uniformity {
 }
 
 impl Uniformity {
-    pub const fn is_uniform(self) -> bool {
-        matches!(self, Self::Uniform)
-    }
     /// `Uniform` only when both are.
     pub const fn meet(self, other: Self) -> Self {
         match (self, other) {
@@ -97,11 +94,8 @@ impl Ctx {
             K::LoadLocal(local) => self.local(local),
             K::Load { .. }
             | K::LoadTile { .. }
-            | K::Dequantize { .. }
-            | K::QuantizedDot { .. }
             | K::CoopLoad { .. }
-            | K::CoopMma { .. }
-            | K::LaneOf { .. } => Uniformity::NonUniform,
+            | K::CoopMma { .. } => Uniformity::NonUniform,
             K::Reduce { kind, value, .. } => match kind.as_ref() {
                 ReduceKind::Subgroup => Uniformity::NonUniform,
                 ReduceKind::Workgroup { .. } | ReduceKind::Loop { .. } => self.classify(value),
@@ -119,13 +113,6 @@ impl Ctx {
     }
 }
 
-/// Uniformity of one expression on its own, with no knowledge of what the
-/// kernel stores into its locals. Every `LoadLocal` is therefore
-/// `NonUniform`; [`verify_uniformity`] runs the refined whole-kernel version.
-pub fn expr_uniformity(expr: &TileExpr) -> Uniformity {
-    Ctx::default().classify(expr)
-}
-
 /// A `Barrier` may not appear under an `If` whose predicate is non-uniform
 /// over the group.
 pub fn verify_uniformity(ir: &KernelIr) -> Result<()> {
@@ -133,15 +120,6 @@ pub fn verify_uniformity(ir: &KernelIr) -> Result<()> {
     classify_locals(&ir.body, &mut ctx);
     let mut path: Vec<u32> = Vec::new();
     walk(&ir.body, Uniformity::Uniform, &mut ctx, &mut path)
-}
-
-/// Walk `body` under an accumulated control-flow uniformity, reporting the
-/// first violation.
-pub fn check_body(body: &[Stmt], enclosing: Uniformity) -> Result<()> {
-    let mut ctx = Ctx::default();
-    classify_locals(body, &mut ctx);
-    let mut path: Vec<u32> = Vec::new();
-    walk(body, enclosing, &mut ctx, &mut path)
 }
 
 /// Every value assigned to a local, plus the locals that are uniform by

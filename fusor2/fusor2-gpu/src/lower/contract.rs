@@ -14,7 +14,9 @@ use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::NumericContract;
 use fusor2_ir::error::Error;
 use fusor2_ir::ir::Node;
-use fusor2_ir::ir::level1::{CoopGeom, Family, L1, SchedPoint, SgemmParams, SgemvParams};
+use fusor2_ir::ir::level1::{
+    ContractSide, CoopGeom, Family, L1, SchedPoint, SgemmParams, SgemvParams,
+};
 use fusor2_ir::ir::level2::{
     Accumulator, Addr, Builtin, CoopMatrixRole, CoopSrc, ElementType, KernelIr, ReduceKind,
     ScalarElement, Source, Stmt, StorageView, Tile, TileBinaryOp, TileCompareOp, TileExpr,
@@ -24,7 +26,7 @@ use fusor2_ir::scalar::{ScalarExpr, ScalarKind};
 use fusor2_ir::shape::Dim;
 use fusor2_ir::target::LowerCtx;
 
-use crate::lower::{Ctx, DimBinding, distribute_workgroups, scalar_element};
+use crate::lower::{Ctx, DimBinding, StagedSource, distribute_workgroups, scalar_element};
 
 /// Contract-shaped entry point (see CONTRACTS.md §4.10).
 pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
@@ -219,13 +221,7 @@ pub fn lower_coop(
     staging: u8,
 ) -> Result<Vec<KernelIr>> {
     let L1::KContract {
-        pre_a,
-        pre_b,
-        post,
-        acc,
-        a,
-        b,
-        ..
+        post, acc, a, b, ..
     } = op
     else {
         return Err(Error::Plan("lower_coop on a non-KContract node".into()));
@@ -253,21 +249,13 @@ pub fn lower_coop(
     }
 
     let acc_elem = scalar_element(*acc);
-    let operand_elem = scalar_element(ctx.plan_dtype(a.src)?);
+    let operand_elem = scalar_element(ctx.plan_dtype(a.primary().src)?);
 
     // The operands as 2-D matrices in their own strides: A is `[batch * m, k]`
     // and B is `[batch * k, n]`, whatever ranks those extents are spread
     // across. A transposed rhs is a stride swap, never a copy.
-    let a_view = ctx.contract_operand_view(
-        a,
-        shape.batch.saturating_mul(shape.m).max(1),
-        shape.k.max(1),
-    )?;
-    let b_view = ctx.contract_operand_view(
-        b,
-        shape.batch.saturating_mul(shape.k).max(1),
-        shape.n.max(1),
-    )?;
+    let a_rows = shape.batch.saturating_mul(shape.m).max(1);
+    let b_rows = shape.batch.saturating_mul(shape.k).max(1);
 
     // The output. `plan::buffer_layout_for` pads `m` to `bm` and `n` to `bn` at
     // exactly this schedule point *so that* a whole-block cooperative store
@@ -321,6 +309,18 @@ pub fn lower_coop(
         ElementType::Scalar(operand_elem),
         &[depth.saturating_mul(geom.bk), cs.bn_pass],
     );
+
+    // The staging sources, one per buffer each side reads. A side that has
+    // absorbed a producer brings several — the block decode's quant plane,
+    // scale, minimum and group scales — and they are all loaded at the same
+    // `(row, col)` the staging fill already computes, then combined by the
+    // side's `pre`. That is the entire quantized path: no branch here knows
+    // what the operands mean, and the MMA, the arena footprint and the
+    // epilogue below are untouched.
+    let a_sources = ctx.contract_side_sources(a, a_rows, shape.k.max(1))?;
+    let b_sources = ctx.contract_side_sources(b, b_rows, shape.n.max(1))?;
+    let a_coords = SideCoords::for_side(&ctx, a, u64::from(a_rows), u64::from(shape.k.max(1)))?;
+    let b_coords = SideCoords::for_side(&ctx, b, u64::from(b_rows), u64::from(shape.n.max(1)))?;
 
     // --- workgroup identity -------------------------------------------------
     let block = cs.lanes;
@@ -424,7 +424,8 @@ pub fn lower_coop(
                 &mut loop_body,
                 &a_tile,
                 d.saturating_mul(geom.bm).saturating_mul(geom.bk),
-                &a_view,
+                &a_sources,
+                a_coords.as_ref(),
                 &lane,
                 a_row_base.clone(),
                 k_base.clone(),
@@ -433,7 +434,7 @@ pub fn lower_coop(
                 geom.bm,
                 geom.bk,
                 cs.lanes,
-                pre_a,
+                &a.pre,
                 operand_elem,
             )?;
             let b_row_base = ctx.b.add(b_batch_base.clone(), k_base);
@@ -442,7 +443,8 @@ pub fn lower_coop(
                 &mut loop_body,
                 &b_tile,
                 d.saturating_mul(geom.bk).saturating_mul(cs.bn_pass),
-                &b_view,
+                &b_sources,
+                b_coords.as_ref(),
                 &lane,
                 b_row_base,
                 pass_col_base.clone(),
@@ -451,7 +453,7 @@ pub fn lower_coop(
                 geom.bk,
                 cs.bn_pass,
                 cs.lanes,
-                pre_b,
+                &b.pre,
                 operand_elem,
             )?;
         }
@@ -776,19 +778,109 @@ fn swizzle_tile(
     (m_tile, n_tile)
 }
 
-/// Copy a `rows x cols` window of a 2-D storage view into a workgroup tile,
+/// Copy a `rows x cols` window of a 2-D operand into a workgroup tile,
 /// `lanes` elements per pass, applying `pre` on the way in.
+///
+/// **The source may be block-quantized.** A [`Source::Quantized`] runs the
+/// format's decode program at `(row, col)` and yields f32, so the staging tile
+/// holds decoded values and everything downstream — the fragments, the MMA, the
+/// epilogue, the geometry the arena was admitted on — is byte-identical to the
+/// dense path. That is the whole of what a quantized contraction needs: the
+/// decode is a bit more math on the way into shared memory, not a second kernel
+/// family.
 ///
 /// Past `row_limit` / `col_limit` the tile holds a **zero**, not `pre(0)`: an
 /// edge tile's padding must not enter the contraction, and `pre` is an
 /// arbitrary scalar body whose value at zero is arbitrary.
 #[allow(clippy::too_many_arguments)]
+/// The coordinate vector one contraction side hands its `pre`.
+///
+/// An absorbed producer's body may read its own loop coordinates — a
+/// structural causal mask is `select(IndexOf(k) <= IndexOf(q) + off, s, -inf)`
+/// — and after absorption those axes name the *operand's* axes (the absorb
+/// rule remaps them through the edge permutation). The side's staging loops
+/// know only the flattened `(row, col)` pair, so this splits it back: `row`
+/// enumerates the leading `split` axes row-major and `col` the rest, which is
+/// exactly the factorization `matrix_split_for` proved exists.
+///
+/// Built only when the side's `pre` names a coordinate; every other
+/// contraction pays nothing.
+struct SideCoords {
+    extents: Vec<u64>,
+    split: usize,
+}
+
+impl SideCoords {
+    fn for_side(
+        ctx: &Ctx<'_>,
+        side: &ContractSide,
+        rows: u64,
+        cols: u64,
+    ) -> Result<Option<Self>> {
+        if !side.pre.reads_index_of() {
+            return Ok(None);
+        }
+        let layout = &side.primary().layout;
+        let split = crate::lower::matrix_split_for(layout, &ctx.binding, rows, cols)?;
+        let extents = layout
+            .shape()
+            .iter()
+            .map(|d| ctx.binding.require(*d))
+            .collect::<Result<Vec<u64>>>()?;
+        Ok(Some(Self { extents, split }))
+    }
+
+    /// The per-axis coordinates at `(row, col)`, innermost axis of each group
+    /// varying fastest.
+    fn at(&self, ctx: &mut Ctx<'_>, row: &TileExpr, col: &TileExpr) -> Vec<TileExpr> {
+        let mut out = vec![ctx.b.u32(0); self.extents.len()];
+        let decompose = |ctx: &mut Ctx<'_>, flat: &TileExpr, axes: std::ops::Range<usize>, out: &mut Vec<TileExpr>| {
+            let mut rest = flat.clone();
+            for i in axes.rev() {
+                let e = ctx.b.u32(u32::try_from(self.extents[i]).unwrap_or(u32::MAX).max(1));
+                out[i] = ctx.b.binary(
+                    TileBinaryOp::Rem,
+                    rest.clone(),
+                    e.clone(),
+                    NumericContract::RELAXED,
+                );
+                rest = ctx.b.binary(TileBinaryOp::Div, rest, e, NumericContract::RELAXED);
+            }
+        };
+        decompose(ctx, row, 0..self.split, &mut out);
+        decompose(ctx, col, self.split..self.extents.len(), &mut out);
+        out
+    }
+}
+
+/// The element a plain storage read of this view yields.
+fn element_of_view(v: &fusor2_ir::ir::level2::StorageView) -> ScalarElement {
+    match v.buffer.element {
+        ElementType::Scalar(e) => e,
+        _ => ScalarElement::F32,
+    }
+}
+
+/// The element a staging load of this source yields — the buffer's own for a
+/// plain storage read, f32 for a decode. Must agree with `Builder::load`,
+/// which types the resulting expression the same way.
+fn source_element(src: &Source) -> ScalarElement {
+    match src {
+        Source::Storage(v) => match v.buffer.element {
+            ElementType::Scalar(e) => e,
+            _ => ScalarElement::F32,
+        },
+        Source::Quantized(_) => ScalarElement::F32,
+    }
+}
+
 fn stage_operand_tile(
     ctx: &mut Ctx<'_>,
     body: &mut Vec<Stmt>,
     tile: &Tile,
     tile_base: u32,
-    view: &StorageView,
+    srcs: &[StagedSource],
+    coords: Option<&SideCoords>,
     lane: &TileExpr,
     row_base: TileExpr,
     col_base: TileExpr,
@@ -840,13 +932,38 @@ fn stage_operand_tile(
             None
         };
         let fill = ctx.b.zero(elem);
-        let raw = ctx.b.load(
-            Source::Storage(view.clone()),
-            Addr::Rc2 { row, col },
-            active.clone(),
-            fill.clone(),
-        );
-        let value = ctx.eval_scalar(pre, &[raw], &[])?;
+        // One load per buffer this side reads, all at the same coordinate.
+        // `pre` is written over `Arg(0..srcs.len())` in operand order, so a
+        // single-buffer side is the same two statements it always was.
+        //
+        // Each out-of-range fill takes its own *source's* element type, not
+        // the staging tile's: a decode reads `u32` words and only becomes
+        // `elem` after `pre` has run.
+        let mut raws: Vec<TileExpr> = Vec::with_capacity(srcs.len());
+        for src in srcs {
+            let src = match src {
+                StagedSource::Const(lit) => {
+                    raws.push(lit.clone());
+                    continue;
+                }
+                StagedSource::Mem(s) => s,
+            };
+            let src_fill = ctx.b.zero(source_element(src));
+            raws.push(ctx.b.load(
+                src.clone(),
+                Addr::Rc2 {
+                    row: row.clone(),
+                    col: col.clone(),
+                },
+                active.clone(),
+                src_fill,
+            ));
+        }
+        let coord_exprs = match coords {
+            Some(c) => c.at(ctx, &row, &col),
+            None => Vec::new(),
+        };
+        let value = ctx.eval_scalar(pre, &raws, &coord_exprs)?;
         let value = ctx.b.cast(value, ElementType::Scalar(elem));
         let value = ctx.b.select(active, value, fill);
         let index = if tile_base == 0 {
@@ -954,20 +1071,14 @@ fn per_lane_block<'a>(
 /// order to do it in.
 pub fn lower_sgemm(ctx: Ctx<'_>, op: &L1, p: SgemmParams) -> Result<KernelIr> {
     let L1::KContract {
-        pre_a,
-        pre_b,
-        post,
-        acc,
-        a,
-        b,
-        ..
+        post, acc, a, b, ..
     } = op
     else {
         return Err(Error::Plan("lower_sgemm on a non-KContract node".into()));
     };
     let shape = shape_of(&ctx, op)?;
     let acc_elem = scalar_element(*acc);
-    let operand_elem = scalar_element(ctx.plan_dtype(a.src)?);
+    let operand_elem = scalar_element(ctx.plan_dtype(a.primary().src)?);
     if !p.legal(
         operand_elem.byte_size() as u32,
         ctx.caps.limits.max_compute_workgroup_storage_size,
@@ -978,8 +1089,6 @@ pub fn lower_sgemm(ctx: Ctx<'_>, op: &L1, p: SgemmParams) -> Result<KernelIr> {
     contract_rows(
         ctx,
         SchedPoint::Sgemm(p),
-        pre_a,
-        pre_b,
         post,
         acc_elem,
         a,
@@ -1029,12 +1138,10 @@ fn row_tiling(theta: SchedPoint, caps: &Caps) -> (u32, u32) {
 fn contract_rows(
     mut ctx: Ctx<'_>,
     theta: SchedPoint,
-    pre_a: &fusor2_ir::scalar::ScalarExpr,
-    pre_b: &fusor2_ir::scalar::ScalarExpr,
     post: &fusor2_ir::scalar::ScalarExpr,
     acc_elem: ScalarElement,
-    a: &fusor2_ir::ir::level1::Operand,
-    b: &fusor2_ir::ir::level1::Operand,
+    a: &ContractSide,
+    b: &ContractSide,
     shape: &Shape,
     name: &'static str,
 ) -> Result<KernelIr> {
@@ -1042,16 +1149,14 @@ fn contract_rows(
     // point's; they were parameters, which let a caller pass one point's `tn`
     // with another point's block.
     let (tn, block) = row_tiling(theta, ctx.caps);
-    let a_view = ctx.contract_operand_view(
-        a,
-        shape.batch.saturating_mul(shape.m).max(1),
-        shape.k.max(1),
-    )?;
-    let b_view = ctx.contract_operand_view(
-        b,
-        shape.batch.saturating_mul(shape.k).max(1),
-        shape.n.max(1),
-    )?;
+    // One source per buffer each side reads, all indexed by that side's own
+    // `(row, col)`. A side that absorbed a producer simply has more of them.
+    let a_rows = shape.batch.saturating_mul(shape.m).max(1);
+    let b_rows = shape.batch.saturating_mul(shape.k).max(1);
+    let a_sources = ctx.contract_side_sources(a, a_rows, shape.k.max(1))?;
+    let b_sources = ctx.contract_side_sources(b, b_rows, shape.n.max(1))?;
+    let a_coords = SideCoords::for_side(&ctx, a, u64::from(a_rows), u64::from(shape.k.max(1)))?;
+    let b_coords = SideCoords::for_side(&ctx, b, u64::from(b_rows), u64::from(shape.n.max(1)))?;
     let out = ctx.output()?;
     let out_view = ctx.linear_view(out)?;
     let out_elem = out_view.buffer.element;
@@ -1097,17 +1202,31 @@ fn contract_rows(
 
     let k_index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
     let kk = ctx.b.load_local(k_index.clone());
-    let zero = ctx.b.zero(acc_elem);
-    let av = ctx.b.load(
-        Source::Storage(a_view),
-        Addr::Rc2 {
-            row: row.clone(),
-            col: kk.clone(),
-        },
-        live.clone(),
-        zero.clone(),
-    );
-    let av = ctx.eval_scalar(pre_a, &[av], &[])?;
+    let mut avs = Vec::with_capacity(a_sources.len());
+    for src in &a_sources {
+        let src = match src {
+            StagedSource::Const(lit) => {
+                avs.push(lit.clone());
+                continue;
+            }
+            StagedSource::Mem(s) => s,
+        };
+        let fill = ctx.b.zero(source_element(src));
+        avs.push(ctx.b.load(
+            src.clone(),
+            Addr::Rc2 {
+                row: row.clone(),
+                col: kk.clone(),
+            },
+            live.clone(),
+            fill,
+        ));
+    }
+    let a_coord_exprs = match &a_coords {
+        Some(c) => c.at(&mut ctx, &row, &kk),
+        None => Vec::new(),
+    };
+    let av = ctx.eval_scalar(&a.pre, &avs, &a_coord_exprs)?;
     let av = ctx.b.cast(av, ElementType::Scalar(acc_elem));
     let b_row = ctx.b.add(b_row_base, kk);
 
@@ -1121,16 +1240,31 @@ fn contract_rows(
         let n_bound = ctx.b.u32(n);
         let in_n = ctx.b.compare(TileCompareOp::Lt, col.clone(), n_bound);
         let ok = ctx.b.and(live.clone(), in_n);
-        let bv = ctx.b.load(
-            Source::Storage(b_view.clone()),
-            Addr::Rc2 {
-                row: b_row.clone(),
-                col: col.clone(),
-            },
-            ok.clone(),
-            zero.clone(),
-        );
-        let bv = ctx.eval_scalar(pre_b, &[bv], &[])?;
+        let mut bvs = Vec::with_capacity(b_sources.len());
+        for src in &b_sources {
+            let src = match src {
+                StagedSource::Const(lit) => {
+                    bvs.push(lit.clone());
+                    continue;
+                }
+                StagedSource::Mem(s) => s,
+            };
+            let fill = ctx.b.zero(source_element(src));
+            bvs.push(ctx.b.load(
+                src.clone(),
+                Addr::Rc2 {
+                    row: b_row.clone(),
+                    col: col.clone(),
+                },
+                ok.clone(),
+                fill,
+            ));
+        }
+        let b_coord_exprs = match &b_coords {
+            Some(c) => c.at(&mut ctx, &b_row, &col),
+            None => Vec::new(),
+        };
+        let bv = ctx.eval_scalar(&b.pre, &bvs, &b_coord_exprs)?;
         let bv = ctx.b.cast(bv, ElementType::Scalar(acc_elem));
         let local = ctx.b.local(ElementType::Scalar(acc_elem));
         let read = ctx.b.load_local(local.clone());
@@ -1184,13 +1318,7 @@ fn contract_rows(
 /// `chunk`-long, `vector`-wide slice of K.
 pub fn lower_sgemv(mut ctx: Ctx<'_>, op: &L1, p: SgemvParams) -> Result<KernelIr> {
     let L1::KContract {
-        pre_a,
-        pre_b,
-        post,
-        acc,
-        a,
-        b,
-        ..
+        post, acc, a, b, ..
     } = op
     else {
         return Err(Error::Plan("lower_sgemv on a non-KContract node".into()));
@@ -1202,8 +1330,34 @@ pub fn lower_sgemv(mut ctx: Ctx<'_>, op: &L1, p: SgemvParams) -> Result<KernelIr
         .min(ctx.caps.limits.max_compute_invocations_per_workgroup)
         .max(1);
 
-    let a_view = ctx.matrix_view(a, 1)?;
-    let b_view = ctx.matrix_view(b, 1)?;
+    // One view per buffer each side reads. `matrix_view` is per operand, so a
+    // side that has absorbed a producer contributes one view per edge and the
+    // side's `pre` combines them.
+    let a_views = a
+        .ops
+        .iter()
+        .map(|o| match ctx.const_operand(o.src) {
+            Some(lit) => Ok(None.ok_or(lit)),
+            None => ctx.matrix_view(o, 1).map(Ok),
+        })
+        .collect::<Result<Vec<std::result::Result<_, TileExpr>>>>()?;
+    let b_views = b
+        .ops
+        .iter()
+        .map(|o| match ctx.const_operand(o.src) {
+            Some(lit) => Ok(None.ok_or(lit)),
+            None => ctx.matrix_view(o, 1).map(Ok),
+        })
+        .collect::<Result<Vec<std::result::Result<_, TileExpr>>>>()?;
+    let a_coords = SideCoords::for_side(
+        &ctx,
+        a,
+        u64::from(shape.m.saturating_mul(shape.batch).max(1)),
+        u64::from(shape.k.max(1)),
+    )?;
+    // B is addressed flat along k: every axis is in the column group.
+    let b_coords = SideCoords::for_side(&ctx, b, 1, u64::from(shape.k.max(1)))?;
+    let zero_row = ctx.b.u32(0);
     let out = ctx.output()?;
     let out_view = ctx.linear_view(out)?;
     let out_elem = out_view.buffer.element;
@@ -1230,24 +1384,53 @@ pub fn lower_sgemv(mut ctx: Ctx<'_>, op: &L1, p: SgemvParams) -> Result<KernelIr
         };
         let k_bound = ctx.b.u32(shape.k.max(1));
         let mask = ctx.b.compare(TileCompareOp::Lt, k.clone(), k_bound);
-        let zero = ctx.b.zero(acc_elem);
-        let av = ctx.b.load(
-            Source::Storage(a_view.clone()),
-            Addr::Rc2 {
-                row: row.clone(),
-                col: k.clone(),
-            },
-            mask.clone(),
-            zero.clone(),
-        );
-        let bv = ctx.b.load(
-            Source::Storage(b_view.clone()),
-            Addr::Linear(k),
-            mask,
-            zero,
-        );
-        let av = ctx.eval_scalar(pre_a, &[av], &[])?;
-        let bv = ctx.eval_scalar(pre_b, &[bv], &[])?;
+        let mut avs = Vec::with_capacity(a_views.len());
+        for view in &a_views {
+            let view = match view {
+                Err(lit) => {
+                    avs.push(lit.clone());
+                    continue;
+                }
+                Ok(v) => v,
+            };
+            let fill = ctx.b.zero(element_of_view(view));
+            avs.push(ctx.b.load(
+                Source::Storage(view.clone()),
+                Addr::Rc2 {
+                    row: row.clone(),
+                    col: k.clone(),
+                },
+                mask.clone(),
+                fill,
+            ));
+        }
+        let mut bvs = Vec::with_capacity(b_views.len());
+        for view in &b_views {
+            let view = match view {
+                Err(lit) => {
+                    bvs.push(lit.clone());
+                    continue;
+                }
+                Ok(v) => v,
+            };
+            let fill = ctx.b.zero(element_of_view(view));
+            bvs.push(ctx.b.load(
+                Source::Storage(view.clone()),
+                Addr::Linear(k.clone()),
+                mask.clone(),
+                fill,
+            ));
+        }
+        let a_coord_exprs = match &a_coords {
+            Some(c) => c.at(&mut ctx, &row, &k),
+            None => Vec::new(),
+        };
+        let b_coord_exprs = match &b_coords {
+            Some(c) => c.at(&mut ctx, &zero_row, &k),
+            None => Vec::new(),
+        };
+        let av = ctx.eval_scalar(&a.pre, &avs, &a_coord_exprs)?;
+        let bv = ctx.eval_scalar(&b.pre, &bvs, &b_coord_exprs)?;
         let av = ctx.b.cast(av, ElementType::Scalar(acc_elem));
         let bv = ctx.b.cast(bv, ElementType::Scalar(acc_elem));
         partial = ctx.b.fma(av, bv, partial);
@@ -1318,13 +1501,7 @@ pub fn lower_sgemv(mut ctx: Ctx<'_>, op: &L1, p: SgemvParams) -> Result<KernelIr
 /// that reads either.
 pub fn lower_generic(ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<KernelIr> {
     let L1::KContract {
-        pre_a,
-        pre_b,
-        post,
-        acc,
-        a,
-        b,
-        ..
+        post, acc, a, b, ..
     } = op
     else {
         return Err(Error::Plan("lower_generic on a non-KContract node".into()));
@@ -1336,8 +1513,6 @@ pub fn lower_generic(ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<KernelI
     contract_rows(
         ctx,
         theta,
-        pre_a,
-        pre_b,
         post,
         acc_elem,
         a,
@@ -1571,7 +1746,9 @@ mod tests {
         out_dtype: Dtype,
     ) {
         use fusor2_ir::extract::{BindKind, BindingPlan, BufferPlan, Extraction, Launch, Plan, PlanHash};
-        use fusor2_ir::ir::level1::{AccessPlan, CoopDomain, Family, Operand, ScheduleDomain};
+        use fusor2_ir::ir::level1::{
+            AccessPlan, ContractSide, CoopDomain, Family, Operand, ScheduleDomain,
+        };
         use fusor2_ir::egraph::EGraph;
         use fusor2_ir::ir::Op;
         use fusor2_ir::ir::level0::{BufferId, L0, LeafKind};
@@ -1608,12 +1785,10 @@ mod tests {
                 k: Dim::Const(k),
                 batch: Dim::Const(batch),
                 family: Family::Coop,
-                pre_a: ident.clone(),
-                pre_b: ident,
                 post: post.clone(),
                 acc: Dtype::F32,
-                a: operand(lhs, &[batch, m, k]),
-                b: operand(rhs, &[batch, k, n]),
+                a: ContractSide::one(ident.clone(), operand(lhs, &[batch, m, k])),
+                b: ContractSide::one(ident, operand(rhs, &[batch, k, n])),
                 sched: ScheduleDomain::Coop(CoopDomain {
                     geoms: smallvec::smallvec![geom],
                     splits: smallvec::smallvec![1],

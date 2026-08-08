@@ -427,35 +427,6 @@ pub fn for_each_child(kind: &TileExprKind, f: &mut dyn FnMut(&TileExpr)) {
             f(b);
             f(c);
         }
-        TileExprKind::Dequantize {
-            k_base,
-            col,
-            mask,
-            fill,
-            ..
-        } => {
-            f(k_base);
-            f(col);
-            f(mask);
-            f(fill);
-        }
-        TileExprKind::LaneOf { block, .. } => f(block),
-        TileExprKind::QuantizedDot {
-            activations,
-            k_base,
-            col,
-            mask,
-            fill,
-            ..
-        } => {
-            for activation in activations {
-                f(activation);
-            }
-            f(k_base);
-            f(col);
-            f(mask);
-            f(fill);
-        }
     }
 }
 

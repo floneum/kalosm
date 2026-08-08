@@ -56,10 +56,6 @@ pub struct GpuBuffer {
     pub buffer: wgpu::Buffer,
     pub size: u64,
     pub usage: wgpu::BufferUsages,
-    /// Cleared at the end of every resolve. A kernel-written buffer that was
-    /// never written is a zero-init assumption, which the `0xCD` poison fill
-    /// surfaces.
-    pub initialized: bool,
 }
 
 /// Recycling buffer pool with a hard memory ceiling.
@@ -152,8 +148,7 @@ impl BufferPool {
                 // Write straight into the staging belt: the padding tail is
                 // whatever the belt held, so it is zeroed explicitly.
                 view.slice(..data.len()).copy_from_slice(data);
-                let tail = vec![0u8; size as usize - data.len()];
-                view.slice(data.len()..).copy_from_slice(&tail);
+                view.slice(data.len()..).fill(0);
             }
             None => {
                 // The staging belt is full; the plain path pads the same way.
@@ -197,26 +192,40 @@ impl BufferPool {
     /// against a reproduction, and an allocator that waits on a submission that
     /// never completes deadlocks the trainer, which is worse than the bug.
     pub fn recycle(&self, buf: Buf) {
-        let Some(gpu) = buf.downcast_ref::<GpuBuffer>() else {
+        // `map` ends the borrow before `buf` may be moved into the bucket.
+        let Some((size, usage)) = buf
+            .downcast_ref::<GpuBuffer>()
+            .map(|g| (g.size, g.usage.bits()))
+        else {
             return;
         };
-        let key = PoolKey {
-            size: gpu.size,
-            usage: gpu.usage.bits(),
+        let key = PoolKey { size, usage };
+        let addr = buf.addr();
+        // Everything this pool created is already tracked, so recycling is
+        // dropping the caller's clone. Only a foreign handle is adopted.
+        // The old `if buf.refcount() != 1 { return; }` guard is gone on
+        // purpose: a tracked buffer has refcount 2 (pool + caller) here, and
+        // a caller that still holds another clone simply fails `take_free`'s
+        // `refcount() == 1` test until it drops it.
+        //
+        // The old `else` arm here also locked `self.counters` twice inside one
+        // assignment — the RHS guard is still alive when the LHS locks, which
+        // is a hard `parking_lot` deadlock. It was unreachable only because
+        // `swap_remove` kept buckets under `FREE_PER_BUCKET`; retention makes
+        // that branch reachable, so it is gone.
+        let released = {
+            let mut free = self.free.lock();
+            let bucket = free.get_or_insert_mut(key, Vec::new);
+            if !bucket.iter().any(|b| b.addr() == addr) {
+                bucket.push(buf);
+            }
+            prune_bucket(bucket)
         };
-        if buf.refcount() != 1 {
-            return;
-        }
-        let mut free = self.free.lock();
-        let bucket = free.get_or_insert_mut(key, Vec::new);
-        if bucket.len() < FREE_PER_BUCKET {
-            bucket.push(buf);
-        } else {
-            self.counters.lock().live_bytes = self
-                .counters
-                .lock()
+        if released > 0 {
+            let mut counters = self.counters.lock();
+            counters.live_bytes = counters
                 .live_bytes
-                .saturating_sub(key.size);
+                .saturating_sub(released.saturating_mul(key.size));
         }
     }
 
@@ -242,27 +251,23 @@ impl BufferPool {
         counters.live_bytes = counters.live_bytes.saturating_sub(released);
     }
 
-    /// Clear the "written by a kernel" flag on every pooled buffer. Runs at
-    /// the end of every resolve.
-    pub fn reset_initialized_buffers(&self) {
-        // `initialized` lives behind the shared `Arc`, so the reset is a
-        // bookkeeping no-op unless poisoning is on, in which case the next
-        // allocation refills with `0xCD`.
+    /// Refill every free buffer with `0xCD` at the end of a resolve, so the
+    /// next tenant that assumes zero-initialized storage fails loudly. A
+    /// no-op unless poisoning is on.
+    pub fn repoison_free_buffers(&self) {
         if !self.poison {
             return;
         }
         let free = self.free.lock();
         for (_, bucket) in free.iter() {
-            for buf in bucket {
+            // The pool tracks in-use buffers now; poisoning one would
+            // overwrite a live tensor.
+            for buf in bucket.iter().filter(|b| b.refcount() == 1) {
                 if let Some(gpu) = buf.downcast_ref::<GpuBuffer>() {
                     self.poison_fill(gpu);
                 }
             }
         }
-    }
-
-    pub fn set_ceiling(&self, bytes: u64) {
-        *self.ceiling_bytes.lock() = bytes;
     }
 
     pub fn ceiling(&self) -> u64 {
@@ -271,10 +276,6 @@ impl BufferPool {
 
     pub fn counters(&self) -> BufferPoolCounters {
         *self.counters.lock()
-    }
-
-    pub fn in_flight_bytes(&self) -> u64 {
-        self.counters.lock().live_bytes
     }
 
     pub fn device(&self) -> &Arc<wgpu::Device> {
@@ -288,9 +289,11 @@ impl BufferPool {
     fn take_free(&self, key: PoolKey) -> Option<Buf> {
         let mut free = self.free.lock();
         let bucket = free.get_mut(&key)?;
-        // Reuse is gated on the pool holding the only handle.
-        let pos = bucket.iter().position(|b| b.refcount() == 1)?;
-        Some(bucket.swap_remove(pos))
+        // The pool holds its own handle, so `refcount() == 1` is exactly "no
+        // caller has this one". Handing back a **clone** leaves the entry
+        // tracked, which is what makes a dropped buffer reusable with no
+        // `recycle` call at all.
+        bucket.iter().find(|b| b.refcount() == 1).cloned()
     }
 
     fn create(&self, size: u64, usage: wgpu::BufferUsages) -> Buf {
@@ -304,16 +307,35 @@ impl BufferPool {
             buffer,
             size,
             usage,
-            initialized: false,
         };
         if self.poison {
             self.poison_fill(&gpu);
         }
+        let buf = Buf::new(gpu);
+        // **The pool keeps its own handle to everything it creates.** Without
+        // it, a buffer that is never explicitly `recycle`d is destroyed with
+        // its last caller handle and re-created from the driver next resolve
+        // — and nothing recycles a plan output (`GpuTarget::resolve` skips
+        // every value in `binds.buffers`, which `Session::run` fills with
+        // every launch root) or an uploaded leaf.
+        let key = PoolKey {
+            size,
+            usage: usage.bits(),
+        };
+        let released = {
+            let mut free = self.free.lock();
+            let bucket = free.get_or_insert_mut(key, Vec::new);
+            let released = prune_bucket(bucket);
+            bucket.push(buf.clone());
+            released
+        };
         let mut counters = self.counters.lock();
         counters.created += 1;
-        counters.live_bytes = counters.live_bytes.saturating_add(size);
-        drop(counters);
-        Buf::new(gpu)
+        counters.live_bytes = counters
+            .live_bytes
+            .saturating_add(size)
+            .saturating_sub(released.saturating_mul(size));
+        buf
     }
 
     /// Pre-fill with `0xCD` so a kernel that assumes zero-initialized storage
@@ -331,6 +353,30 @@ impl BufferPool {
             offset += len as u64;
         }
     }
+}
+
+/// Drop idle entries past [`FREE_PER_BUCKET`], returning how many were
+/// released so the caller can decrement `live_bytes`.
+///
+/// An entry with an outstanding caller handle (`refcount() > 1`) is **always**
+/// kept: the pool's clone is what tracks the buffer, and dropping it would
+/// untrack a live allocation and lose the reuse this pool exists for.
+fn prune_bucket(bucket: &mut Vec<Buf>) -> u64 {
+    let mut idle = 0usize;
+    let mut released = 0u64;
+    bucket.retain(|b| {
+        if b.refcount() > 1 {
+            return true;
+        }
+        idle += 1;
+        if idle <= FREE_PER_BUCKET {
+            true
+        } else {
+            released += 1;
+            false
+        }
+    });
+    released
 }
 
 /// Round up to `wgpu::COPY_BUFFER_ALIGNMENT`, which every

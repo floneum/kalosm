@@ -4,6 +4,10 @@
 //! 2. Seed `sigma_0 = argmin lb`; realize; `m_0 = roots u {shared} u
 //!    {index-space mismatch} u {InPlace}`; `theta_0` from the local ranking.
 //! 3. Exact cost on the realized DAG.
+//! 3b. [`co_select`] over the multi-slot carriers only, from the seed, so the
+//!    one move the climb cannot make is not gated on where a truncated climb
+//!    happened to stop. Speculative: when it changes anything, step 4 runs
+//!    from both states and the cheaper plan wins.
 //! 4. Local search over `RESELECT`, `FLIP`, `RESCHEDULE`.
 //! 4b. [`co_select`], the compound move: adopt every reader of one producer
 //!    class together.
@@ -131,11 +135,12 @@ use fusor2_ir::Result;
 use fusor2_ir::cost::{CostModel, Picoseconds, ShapeStats};
 use fusor2_ir::device::Caps;
 use fusor2_ir::egraph::{ClassId, EGraph, Id};
-use fusor2_ir::extract::{ExtractBudget, Extraction, Extractor, Plan};
+use fusor2_ir::extract::{ExtractBudget, Extraction, Extractor, Launch, Plan};
 use fusor2_ir::facts::ValueFacts;
 use fusor2_ir::ir::Op;
 use fusor2_ir::ir::OpDefRegistry;
-use fusor2_ir::ir::level1::{Effect, ScheduleDomain};
+use fusor2_ir::error::Error;
+use fusor2_ir::ir::level1::{Effect, L1, SchedPoint, ScheduleDomain};
 use fusor2_ir::ir::level2::ArenaPlanner;
 use fusor2_ir::shape::Dim;
 use parking_lot::Mutex;
@@ -156,9 +161,6 @@ pub struct LocalSearch {
     /// — nothing compiles per length bucket.
     stats: Mutex<ShapeStats>,
 }
-
-/// The architecture document's name for the same type.
-pub type LocalSearchExtractor = LocalSearch;
 
 /// What the search actually did. Exposed so conformance can assert the
 /// budget was honoured and best-so-far never regressed.
@@ -314,67 +316,58 @@ impl LocalSearch {
             best: vec![best_cost],
             ..SearchTrace::default()
         };
-        let mut sched = SchedCache::new();
-
-        'search: loop {
-            let mut improved = false;
-            for mv in moves::frontier(graph, &ex, &classes, budget) {
-                if trace.moves >= cap {
-                    break 'search;
-                }
-                let options = moves::candidates(graph, &ex, &realized, mv, &lb, &mut sched, cost);
-                for candidate in options {
-                    if trace.moves >= cap {
-                        break 'search;
-                    }
-                    trace.moves += 1;
-                    let Some(undo) = moves::apply(graph, &mut ex, candidate) else {
-                        continue;
-                    };
-                    let attempt =
-                        self.price(graph, roots, &mut ex, cost, &mut cache);
-                    match attempt {
-                        // Strict improvements only; a tie keeps the earlier
-                        // (smaller-id) state, which is what makes the whole
-                        // search reproducible.
-                        Ok((r, c, _)) if c < best_cost => {
-                            best_cost = c;
-                            realized = r;
-                            trace.best.push(c);
-                            improved = true;
-                            break;
-                        }
-                        // The move is undone *after* the obligations it
-                        // implied, so a rejected candidate leaves no trace.
-                        Ok((_, _, trail)) => {
-                            unrepair(&mut ex, trail);
-                            moves::undo(&mut ex, undo);
-                        }
-                        Err(trail) => {
-                            unrepair(&mut ex, trail);
-                            moves::undo(&mut ex, undo);
-                        }
-                    }
-                }
-            }
-            if !improved {
-                break;
-            }
-        }
-
-        // Step 4b: the compound move the single-move climb above cannot make.
-        // Sweeps until a sweep improves nothing.
-        //
-        // **Its own counter, deliberately.** The loop above normally spends
-        // every move `cap` allows — on the attention graphs `by_work` binds at
-        // `90_000 / 605 = 148` and the climb takes all of them — so a shared
-        // counter would make this pass unreachable on exactly the graphs it
-        // exists for. `cap` is reused as the *bound* rather than the budget, so
-        // the worst case is two searches of the sanctioned size and the whole
-        // extraction is still a pure function of the graph.
         let readers = readers_by_producer(graph, &classes, &self.caps);
-        while trace.co_moves < cap
-            && co_select(
+
+        // Step 4b, **from the seed**, over the joints only — and then the
+        // whole descent twice, keeping the cheaper plan.
+        //
+        // [`co_select`] makes a move the single-move climb provably cannot
+        // (its own doc says so: every step of the path is a cost increase).
+        // Running it *only* after the climb does not make it a cheap
+        // afterthought — it makes the one pass that can reach these states
+        // start from wherever a **truncated** climb happened to stop, and the
+        // climb is truncated on every graph in the suite: `trace.moves` equals
+        // `cap` on both backends at the shipped budget and still does at ten
+        // times it.
+        //
+        // Measured on `attention_with_lse`, which is what this is for. The
+        // same cpu graph gives **6** launches at a move cap of 450 and **7** at
+        // 137 and at 800, because two climb steps worth 295 ps each — 0.00002%
+        // of a 1.4 us plan — select one slot view of the online-softmax
+        // `(m, l)` carrier and so hide the whole compound move behind
+        // `proposal.len() < 2`. The shipped cpu cap is 137 and the gpu cap is
+        // 471 on the *same* frontend chain, purely because `CPU_RULES` mint 655
+        // nodes where the gpu table mints 191 and `by_work` divides by node
+        // count; that is the entire cpu/gpu spread on this shape.
+        //
+        // **Restricted to producer classes holding a multi-slot carrier.**
+        // That is the shape this pass exists for and the only one where
+        // adopting a single reader is provably worse than adopting none.
+        // Unrestricted, a seeded sweep re-plans graphs the climb had already
+        // settled and reaches class members that are *unequal* to their
+        // siblings — 20 extra gpu value failures across `matmul`,
+        // `normalization` and `sampling`, which is the latent-member hazard
+        // this file's history section describes rather than a costing error.
+        //
+        // **And it is speculative, because entering a joint is one-way.** The
+        // argument that the climb cannot enter a co-selected state is
+        // symmetric: once every reader of a joint reads it, dropping one
+        // reader alone recomputes that slot's nest while the joint still runs,
+        // so every single step back out is a cost increase too. On
+        // `attention_grads_all_three` [gpu] the seeded adoption is a strict
+        // improvement when it is made and leaves the climb in a basin that
+        // bottoms out a whole dispatch worse — 17 -> 18 launches, 17.0 -> 18.0
+        // us. So when the seeded sweep changes anything, the descent runs
+        // **twice**, once from each state, and the cheaper plan wins. Neither
+        // start can lose to the other by construction, and a tie keeps the
+        // un-seeded one, which is the state this file shipped.
+        let joints = joint_producers(graph, &readers);
+        let plain = (ex.clone(), realized.clone(), best_cost);
+        let mut seeded_best: Vec<Picoseconds> = Vec::new();
+        let mut seed_moves = 0u32;
+        while seed_moves < cap
+            && co_select_over(
+                &joints,
                 graph,
                 roots,
                 cost,
@@ -384,22 +377,155 @@ impl LocalSearch {
                 &mut realized,
                 &mut best_cost,
                 &mut cache,
-                &mut trace.best,
-                &mut trace.co_moves,
+                &mut seeded_best,
+                &mut seed_moves,
                 cap,
             )?
         {}
 
-        // The winner is the live state: every rejected move was undone and
-        // every accepted one strictly improved, so `realized` and
-        // `best_cost` already describe best-so-far — *up to* the invariants a
-        // sequence of independent moves does not preserve on its own.
-        if repair(graph, &mut ex, &realized, cost) {
-            realized =
-                realize::realize_with(graph, roots, &ex, cost, self.arena.as_ref(), &mut cache)?;
-            best_cost = realize::exact_cost(&realized, &ex, cost);
-            trace.best.push(best_cost);
+        let descend = |ex: &mut Extraction,
+                           realized: &mut Realized,
+                           best_cost: &mut Picoseconds,
+                           cache: &mut NodeCache,
+                           best: &mut Vec<Picoseconds>,
+                           moves: &mut u32,
+                           co_moves: &mut u32|
+         -> Result<()> {
+            let mut sched = SchedCache::new();
+            'search: loop {
+                let mut improved = false;
+                for mv in moves::frontier(graph, ex, &classes, budget) {
+                    if *moves >= cap {
+                        break 'search;
+                    }
+                    let options = moves::candidates(graph, ex, realized, mv, &lb, &mut sched, cost);
+                    for candidate in options {
+                        if *moves >= cap {
+                            break 'search;
+                        }
+                        *moves += 1;
+                        let Some(undo) = moves::apply(graph, ex, candidate) else {
+                            continue;
+                        };
+                        let attempt = price(graph, roots, ex, cost, self.arena.as_ref(), cache);
+                        match attempt {
+                            // Strict improvements only; a tie keeps the earlier
+                            // (smaller-id) state, which is what makes the whole
+                            // search reproducible.
+                            Ok((r, c, _)) if c < *best_cost => {
+                                *best_cost = c;
+                                *realized = r;
+                                best.push(c);
+                                improved = true;
+                                break;
+                            }
+                            // The move is undone *after* the obligations it
+                            // implied, so a rejected candidate leaves no trace.
+                            Ok((_, _, trail)) => {
+                                unrepair(ex, trail);
+                                moves::undo(ex, undo);
+                            }
+                            Err(trail) => {
+                                unrepair(ex, trail);
+                                moves::undo(ex, undo);
+                            }
+                        }
+                    }
+                }
+                if !improved {
+                    break;
+                }
+            }
+
+            // Step 4b: the compound move the single-move climb above cannot
+            // make. Sweeps until a sweep improves nothing.
+            //
+            // **Its own counter, deliberately.** The loop above normally spends
+            // every move `cap` allows — on the attention graphs `by_work` binds
+            // at `90_000 / 605 = 148` and the climb takes all of them — so a
+            // shared counter would make this pass unreachable on exactly the
+            // graphs it exists for. `cap` is reused as the *bound* rather than
+            // the budget, so one descent is at worst two searches of the
+            // sanctioned size — four when the seeded sweep above makes step 4
+            // run twice, and only on a graph that holds a multi-slot carrier.
+            // The whole extraction is still a pure function of the graph.
+            while *co_moves < cap
+                && co_select(
+                    graph,
+                    roots,
+                    cost,
+                    &readers,
+                    self.arena.as_ref(),
+                    ex,
+                    realized,
+                    best_cost,
+                    cache,
+                    best,
+                    co_moves,
+                    cap,
+                )?
+            {}
+
+            // The winner is the live state: every rejected move was undone and
+            // every accepted one strictly improved, so `realized` and
+            // `best_cost` already describe best-so-far — *up to* the invariants
+            // a sequence of independent moves does not preserve on its own.
+            if repair(graph, ex, realized, cost) {
+                *realized =
+                    realize::realize_with(graph, roots, ex, cost, self.arena.as_ref(), cache)?;
+                *best_cost = realize::exact_cost(realized, ex, cost);
+                best.push(*best_cost);
+            }
+            Ok(())
+        };
+
+        let mut a_best = seeded_best.clone();
+        let mut a_moves = 0u32;
+        let mut a_co = seed_moves;
+        descend(
+            &mut ex,
+            &mut realized,
+            &mut best_cost,
+            &mut cache,
+            &mut a_best,
+            &mut a_moves,
+            &mut a_co,
+        )?;
+
+        if seeded_best.is_empty() {
+            // The seeded sweep changed nothing, so the two starts are the same
+            // state and the second descent would repeat the first move for
+            // move. This is the overwhelming majority of graphs: nothing
+            // without a multi-slot carrier pays anything for this pass.
+            trace.moves = a_moves;
+            trace.co_moves = a_co;
+            trace.best.extend(a_best);
+        } else {
+            let (mut b_ex, mut b_realized, mut b_cost) = plain;
+            let mut b_best: Vec<Picoseconds> = Vec::new();
+            let mut b_moves = 0u32;
+            let mut b_co = 0u32;
+            descend(
+                &mut b_ex,
+                &mut b_realized,
+                &mut b_cost,
+                &mut cache,
+                &mut b_best,
+                &mut b_moves,
+                &mut b_co,
+            )?;
+            trace.moves = a_moves.max(b_moves);
+            trace.co_moves = a_co.max(b_co);
+            if b_cost <= best_cost {
+                ex = b_ex;
+                realized = b_realized;
+                best_cost = b_cost;
+                trace.best.extend(b_best);
+            } else {
+                trace.best.extend(a_best);
+            }
         }
+
         let plan = derive_plan(graph, &ex, &realized, cost.facts(), best_cost)?;
         crate::verify_plan::verify_plan_with(
             graph,
@@ -444,6 +570,31 @@ impl LocalSearch {
         price(graph, roots, ex, cost, self.arena.as_ref(), cache)
     }
 
+    /// The plan a *given* extraction denotes: realize, repair, re-realize,
+    /// derive, verify. No search. A candidate is therefore priced and built
+    /// by exactly the path `extract` returns its winner through.
+    pub fn replan(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        ex: &mut Extraction,
+        cost: &dyn CostModel,
+    ) -> Result<Plan> {
+        let mut cache = NodeCache::new(graph.len());
+        let (realized, exact, _) = self
+            .price(graph, roots, ex, cost, &mut cache)
+            .map_err(|_| Error::Plan("autotune candidate does not realize".into()))?;
+        let plan = derive_plan(graph, ex, &realized, cost.facts(), exact)?;
+        crate::verify_plan::verify_plan_with(
+            graph,
+            &plan,
+            self.arena.as_ref(),
+            &self.caps,
+            self.registry.as_ref(),
+        )?;
+        Ok(plan)
+    }
+
     /// The same, reporting what the search did.
     pub fn extract_traced(
         &self,
@@ -481,6 +632,81 @@ impl Extractor for LocalSearch {
             &self.caps,
             self.registry.as_ref(),
         )
+    }
+
+    fn launch_variants(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        base: &Plan,
+        launch_ix: usize,
+        cost: &dyn CostModel,
+        min_macs: u64,
+    ) -> Vec<(String, Plan)> {
+        let Some(launch) = base.launches.get(launch_ix) else {
+            return Vec::new();
+        };
+        let root = launch.root;
+        if launch_work(graph, base, launch_ix) < min_macs {
+            return Vec::new();
+        }
+        // Timing a plan re-runs it. An in-place node makes that destructive,
+        // so an impure plan is never tuned.
+        if base.launches.iter().any(|l| {
+            l.members
+                .iter()
+                .any(|m| graph.semantics().effect(&graph.node(*m).op) != Effect::Pure)
+        }) {
+            return Vec::new();
+        }
+
+        let class = graph.class_of(root);
+        let here = base.extraction.theta.get(&root).copied();
+        let mut out: Vec<(String, Plan)> = Vec::new();
+        for member in graph.members(class) {
+            let Op::L1(l1) = &graph.node(member).op else {
+                continue;
+            };
+            let Some(domain) = l1.schedule() else { continue };
+            for theta in sample_points(domain) {
+                if out.len() >= TUNE_MAX_VARIANTS {
+                    return out;
+                }
+                if member == root && Some(theta) == here {
+                    continue;
+                }
+                let mut ex = base.extraction.clone();
+                if member != root
+                    && moves::apply(
+                        graph,
+                        &mut ex,
+                        moves::Candidate::Select {
+                            class,
+                            node: member,
+                        },
+                    )
+                    .is_none()
+                {
+                    continue;
+                }
+                moves::apply(
+                    graph,
+                    &mut ex,
+                    moves::Candidate::Schedule { node: member, theta },
+                );
+                let Ok(plan) = self.replan(graph, roots, &mut ex, cost) else {
+                    continue;
+                };
+                // A candidate that changes the dispatch count changes every
+                // `resolves_in` assert in the suite. Rank tiles, not plans of
+                // a different shape.
+                if plan.launches.len() != base.launches.len() {
+                    continue;
+                }
+                out.push((variant_signature(graph, member, theta), plan));
+            }
+        }
+        out
     }
 }
 
@@ -577,8 +803,54 @@ fn co_select(
 ) -> Result<bool> {
     let mut producers: Vec<ClassId> = readers.keys().copied().collect();
     producers.sort_unstable();
+    co_select_over(
+        &producers, graph, roots, cost, readers, arena, ex, realized, best_cost, cache, best,
+        moves, cap,
+    )
+}
+
+/// The producer classes holding a **multi-slot carrier** — a node that fuses
+/// several values into one, so its readers are slot views and adopting one
+/// alone is strictly worse than adopting none.
+///
+/// Ascending, so a sweep over it is a pure function of the graph.
+fn joint_producers(
+    graph: &EGraph,
+    readers: &FxHashMap<ClassId, Vec<(ClassId, Id)>>,
+) -> Vec<ClassId> {
+    let mut out: Vec<ClassId> = readers
+        .keys()
+        .copied()
+        .filter(|p| {
+            graph.members(*p).iter().any(|m| {
+                matches!(&graph.node(*m).op, Op::L1(L1::KFold { carrier, .. })
+                    if carrier.width() > 1)
+            })
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// [`co_select`] over a stated set of producer classes, in the order given.
+#[allow(clippy::too_many_arguments)]
+fn co_select_over(
+    producers: &[ClassId],
+    graph: &EGraph,
+    roots: &[Id],
+    cost: &dyn CostModel,
+    readers: &FxHashMap<ClassId, Vec<(ClassId, Id)>>,
+    arena: &dyn ArenaPlanner,
+    ex: &mut Extraction,
+    realized: &mut Realized,
+    best_cost: &mut Picoseconds,
+    cache: &mut NodeCache,
+    best: &mut Vec<Picoseconds>,
+    moves: &mut u32,
+    cap: u32,
+) -> Result<bool> {
     let mut improved = false;
-    for p in producers {
+    for p in producers.iter().copied() {
         if *moves >= cap {
             break;
         }
@@ -1014,6 +1286,313 @@ fn binding_of(graph: &EGraph, realized: &Realized) -> Vec<Dim> {
         out.extend(graph.facts(*r).shape.iter().copied());
     }
     out
+}
+
+/// Variants offered per launch. The round-3 probe timed ~10 and the whole
+/// tuning round cost ~450 ms of cold time on a 2048-cube matmul.
+const TUNE_MAX_VARIANTS: usize = 16;
+
+/// The tile shapes the round-3 pin sweep separated on. Coop geometries are
+/// generated `bm`-major, so a domain *prefix* is six spellings of the same
+/// narrowest tile; this is a spread over the axis that actually measured.
+const TUNE_GEOMS: [(u32, u32, u32); 6] = [
+    (16, 16, 8),
+    (32, 32, 8),
+    (64, 64, 8),
+    (64, 64, 16),
+    (128, 64, 8),
+    (128, 128, 8),
+];
+
+/// The points of one domain worth timing.
+///
+/// `splits` and `staging` are pinned to the domain's first entry — always
+/// `1` and `1`. Splits change the dispatch count, and `coop_tiles`'s own doc
+/// records that the `staging == 2` footprint filter is loose by nearly 2x,
+/// so neither belongs in the first measured round.
+fn sample_points(domain: &ScheduleDomain) -> SmallVec<[SchedPoint; 8]> {
+    let mut out: SmallVec<[SchedPoint; 8]> = SmallVec::new();
+    match domain {
+        ScheduleDomain::Point => {}
+        ScheduleDomain::Coop(d) => {
+            let (Some(splits), Some(staging)) = (d.splits.first(), d.staging.first()) else {
+                return out;
+            };
+            for (bm, bn, bk) in TUNE_GEOMS {
+                if let Some(geom) = d
+                    .geoms
+                    .iter()
+                    .find(|g| g.bm == bm && g.bn == bn && g.bk == bk)
+                {
+                    out.push(SchedPoint::Coop {
+                        geom: *geom,
+                        splits: *splits,
+                        staging: *staging,
+                    });
+                }
+            }
+        }
+        other => {
+            // Two points off a non-coop family: enough to tell the family
+            // apart from Coop, which is what this axis is here for.
+            let n = other.len();
+            for i in [0usize, n / 2] {
+                if let Some(p) = other.point(i)
+                    && !out.contains(&p)
+                {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Work a whole launch issues, across **every** node family.
+///
+/// This replaces a contraction-only MAC count. That gate meant only a
+/// `KContract` above 64M MACs was ever tuned, so softmax, rms_norm, the
+/// elementwise chain and every gather/scatter launch were invisible to the
+/// tuner however much time they took — measured, those are 4 of fusor2's 7
+/// benchmark rows. Work is summed over the launch's members, not just its
+/// root, because a fused region's cost lives in the members.
+///
+/// `transcendentals` are weighted because a fold whose lift is `exp` is not
+/// the same price as one that adds: the weight is the ratio the roofline's own
+/// `trans_ps` implies against a MAC, rounded to a small integer so the gate
+/// stays a pure function of the graph.
+///
+/// The separation the old MAC gate provided is preserved. The conformance
+/// suite's largest launch is a few thousand work units and the benchmark's
+/// smallest is millions, so a gate between them still keeps the suite untuned
+/// — which matters, because tuning re-runs a plan and would multiply suite
+/// time by the variant count.
+fn launch_work(graph: &EGraph, base: &Plan, launch_ix: usize) -> u64 {
+    const TRANS_WEIGHT: u64 = 8;
+    let Some(launch) = base.launches.get(launch_ix) else {
+        return 0;
+    };
+    let mut total: u64 = 0;
+    for m in &launch.members {
+        let node = graph.node(*m);
+        let ins: SmallVec<[ValueFacts; 4]> = node
+            .children
+            .iter()
+            .map(|c| graph.facts(*c).clone())
+            .collect();
+        let w = graph.semantics().work(&node.op, &ins, graph.facts(*m));
+        total = total
+            .saturating_add(w.macs)
+            .saturating_add(w.transcendentals.saturating_mul(TRANS_WEIGHT))
+            .saturating_add(w.index_ops);
+    }
+    total
+}
+
+/// A launch's identity **across processes**, for the persistent tune cache.
+///
+/// Node `Id`s are graph-allocation order and mean nothing in the next process,
+/// so the cache cannot key on them. This is the op family plus the extents and
+/// dtypes that decide which schedule wins — the same shape in a later run gets
+/// the same string and reuses what was already measured.
+///
+/// **It keys the launch, not its root.** A recorded nanosecond is only a
+/// property of a kernel if the key names that kernel, and the root alone does
+/// not name one:
+///
+/// * `facts.shape` is the *output* shape, so a fold's reduced extent is
+///   invisible to it — attention's score softmax reduces 1024 and its trailing
+///   `sum(3)` reduces 64, and both root a `KFold|F32|[1x8x1024]|axis=3`. The
+///   extent is on the node, in `L1::KFold::space`.
+/// * The fused body is invisible to it — every workload in `vs_fusor1` ends in
+///   a `sum(1)` over 2048x2048, so a bare reduction, a 20-op elementwise chain
+///   and a softmax all root a `KFold|F32|[2048]|axis=1`.
+///
+/// `TuneCache::record` merges by minimum, so a key that cannot tell two kernels
+/// apart does not store both — it stores the cheaper one's span under the other
+/// one's name. Everything the cache then does with that number (ordering,
+/// `SKIP_RATIO`, `converged`) is reasoning about a kernel it never ran.
+pub fn launch_signature(graph: &EGraph, launch: &Launch) -> String {
+    let root = launch.root;
+    let facts = graph.facts(root);
+    let extents = |dims: &[Dim]| -> String {
+        dims.iter()
+            .map(|d| d.as_const().map_or_else(|| "s".to_string(), |v| v.to_string()))
+            .collect::<Vec<_>>()
+            .join("x")
+    };
+    let tag = match &graph.node(root).op {
+        Op::L1(l1) => format!("{:?}", l1.tag()),
+        Op::L0(_) => "L0".to_string(),
+        Op::Union(..) => "U".to_string(),
+    };
+    let extra = match &graph.node(root).op {
+        Op::L1(L1::KContract { m, n, k, batch, .. }) => {
+            let c = |d: &Dim| d.as_const().map_or(0, |v| v);
+            format!("mnkb={},{},{},{}", c(m), c(n), c(k), c(batch))
+        }
+        // `space` is the *iteration* domain and carries the reduced extent;
+        // the output shape above does not.
+        Op::L1(L1::KFold {
+            space,
+            axis,
+            vec_axes,
+            carrier,
+            ..
+        }) => format!(
+            "space=[{}] axis={axis} vec={vec_axes:?} slots={}",
+            extents(&space.dims),
+            carrier.slots.len()
+        ),
+        _ => String::new(),
+    };
+    // What the launch *computes*, one digest per member, sorted: member order
+    // is a realization detail, and a key is a string in a JSON file so it has
+    // to stay short. Fusion in this IR happens **inside** a node — the
+    // 20-op elementwise chain and a bare reduction are both one `KFold`
+    // member — so a histogram of member tags would not tell them apart. The
+    // digest is over the scalar bodies and operand accesses, which is exactly
+    // what differs.
+    let mut body: Vec<String> = launch
+        .members
+        .iter()
+        .map(|m| {
+            let op = &graph.node(*m).op;
+            format!("{:?}:{:08x}", op.tag(), body_digest(op) as u32)
+        })
+        .collect();
+    body.sort_unstable();
+    format!(
+        "{tag}|{:?}|[{}]|{extra}|body={}",
+        facts.dtype,
+        extents(&facts.shape),
+        body.join(",")
+    )
+}
+
+/// A stable digest of what one member computes, for [`launch_signature`].
+///
+/// Deliberately **excludes `Operand::src`**: that is a graph-allocation `Id`
+/// and means nothing in the next process, so hashing it would make every key
+/// a cache miss. Everything else that decides the emitted kernel is hashed,
+/// and scalar bodies contribute [`ScalarExpr::structural_hash`], which is
+/// cached and bottom-up — so this is O(operands), not O(expression).
+///
+/// Families with no scalar body of their own contribute their extents and
+/// accesses only; that is no coarser than the whole key was before.
+///
+/// A symbolic extent hashes its `SymId`, which is allocation order within a
+/// session. The same program allocates them in the same order, so the key is
+/// still stable run to run; a program that did not would take a cache miss and
+/// one tuning pass, never a wrong answer.
+fn body_digest(op: &Op) -> u64 {
+    use fusor2_ir::ir::level1::Operand;
+    use rustc_hash::FxHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn operand(o: &Operand, h: &mut FxHasher) {
+        o.layout.hash(h);
+        o.access.hash(h);
+    }
+
+    let mut h = FxHasher::default();
+    op.tag().hash(&mut h);
+    match op {
+        Op::L1(L1::KMap {
+            space, body, ops, ..
+        }) => {
+            space.dims.hash(&mut h);
+            body.structural_hash().hash(&mut h);
+            for o in ops {
+                operand(o, &mut h);
+            }
+        }
+        Op::L1(L1::KFold {
+            space,
+            axis,
+            vec_axes,
+            carrier,
+            acc,
+            post,
+            ops,
+            ..
+        }) => {
+            space.dims.hash(&mut h);
+            axis.hash(&mut h);
+            vec_axes.hash(&mut h);
+            carrier.hash(&mut h);
+            acc.hash(&mut h);
+            for p in post {
+                p.structural_hash().hash(&mut h);
+            }
+            for o in ops {
+                operand(o, &mut h);
+            }
+        }
+        Op::L1(L1::KContract {
+            m,
+            n,
+            k,
+            batch,
+            family,
+            post,
+            acc,
+            a,
+            b,
+            ..
+        }) => {
+            (m, n, k, batch, family, acc).hash(&mut h);
+            for e in [&a.pre, &b.pre, post] {
+                e.structural_hash().hash(&mut h);
+            }
+            // Arity is part of the key: two sides holding the same leading
+            // operand differ if one has absorbed a producer.
+            (a.len(), b.len()).hash(&mut h);
+            for o in a.ops.iter().chain(b.ops.iter()) {
+                operand(o, &mut h);
+            }
+        }
+        Op::L1(L1::KGather {
+            space,
+            axis,
+            mode,
+            ops,
+            ..
+        }) => {
+            space.dims.hash(&mut h);
+            (axis, mode).hash(&mut h);
+            for o in ops {
+                operand(o, &mut h);
+            }
+        }
+        Op::L1(L1::KScatter {
+            space,
+            axis,
+            mode,
+            combine,
+            ops,
+            ..
+        }) => {
+            space.dims.hash(&mut h);
+            (axis, mode, combine).hash(&mut h);
+            for o in ops {
+                operand(o, &mut h);
+            }
+        }
+        Op::L1(L1::KRegion { live_outs, .. }) => live_outs.hash(&mut h),
+        Op::L1(L1::KMerged(_) | L1::Ext { .. }) | Op::L0(_) | Op::Union(..) => {}
+    }
+    h.finish()
+}
+
+/// One candidate's identity across processes: the member's family and the
+/// schedule point. Paired with [`launch_signature`] this is the cache key.
+fn variant_signature(graph: &EGraph, member: Id, theta: SchedPoint) -> String {
+    let tag = match &graph.node(member).op {
+        Op::L1(l1) => format!("{:?}", l1.tag()),
+        _ => "?".to_string(),
+    };
+    format!("{tag}|{theta:?}")
 }
 
 #[cfg(test)]

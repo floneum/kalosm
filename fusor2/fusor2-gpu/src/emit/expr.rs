@@ -64,9 +64,6 @@ impl Emitter<'_> {
     pub(crate) fn u32_lit(&mut self, v: u32) -> Handle<Expression> {
         self.append(Expression::Literal(Literal::U32(v)))
     }
-    pub(crate) fn i32_lit(&mut self, v: i32) -> Handle<Expression> {
-        self.append(Expression::Literal(Literal::I32(v)))
-    }
     pub(crate) fn f32_lit(&mut self, v: f32) -> Handle<Expression> {
         self.append(Expression::Literal(Literal::F32(v)))
     }
@@ -556,22 +553,18 @@ impl Emitter<'_> {
 
     // ---- memo scoping ---------------------------------------------------
 
-    /// Take the memo caches. Every value they hold is an SSA handle defined in
+    /// Take the memo cache. Every value it holds is an SSA handle defined in
     /// the *current* block, so a nested block must start empty and the parent
     /// must get its entries back on exit. This is the scoping property that
     /// replaces the reference's manual `LoopCacheSnapshot`.
     pub(crate) fn push_scope(&mut self) -> Scope {
         Scope {
             memo: std::mem::take(&mut self.memo),
-            dequant: std::mem::take(&mut self.dequant_memo),
-            q8: std::mem::take(&mut self.q8_cache),
         }
     }
 
     pub(crate) fn pop_scope(&mut self, scope: Scope) {
         self.memo = scope.memo;
-        self.dequant_memo = scope.dequant;
-        self.q8_cache = scope.q8;
     }
 
     /// Lower `f` into a fresh nested block with its own memo scope.
@@ -582,7 +575,6 @@ impl Emitter<'_> {
         let scope = self.push_scope();
         // A nested block may still reuse values the enclosing block defined.
         self.memo = scope.memo.clone();
-        self.dequant_memo = scope.dequant.clone();
         let mut block = Block::new();
         let result = f(self, &mut block);
         self.pop_scope(scope);
@@ -597,8 +589,6 @@ impl Emitter<'_> {
 /// parent's memoized reads.
 pub(crate) struct Scope {
     memo: rustc_hash::FxHashMap<TileExpr, (Handle<Expression>, super::MemStamp)>,
-    dequant: rustc_hash::FxHashMap<TileExpr, (Vec<Handle<Expression>>, super::MemStamp)>,
-    q8: rustc_hash::FxHashMap<Vec<Handle<Expression>>, super::quantized::Q8Packs>,
 }
 
 /// The naga scalar underlying an element type.
@@ -905,20 +895,6 @@ impl Emitter<'_> {
                 src,
             } => self.coop_load_parts(body, *role, *scalar, *rows, *cols, src),
             TileExprKind::CoopMma { a, b, c } => self.coop_mma(a, b, c, body),
-            TileExprKind::Dequantize { .. } => {
-                let lanes = self.dequantize_lanes(expr, body)?;
-                lanes
-                    .first()
-                    .copied()
-                    .ok_or_else(|| EmitError::Unsupported("empty dequantized block".into()))
-            }
-            TileExprKind::LaneOf { block, lane } => {
-                let lanes = self.dequantize_lanes(block, body)?;
-                lanes.get(*lane as usize).copied().ok_or_else(|| {
-                    EmitError::Unsupported(format!("quantized block lane {lane} out of range"))
-                })
-            }
-            TileExprKind::QuantizedDot { .. } => self.quantized_dot(expr, body),
         }
     }
 
@@ -1121,13 +1097,69 @@ impl Emitter<'_> {
                 let mask_h = self.expr(mask, body)?;
                 let mask_ty = mask.element();
                 let mask_h = self.condition_value(body, mask_h, mask_ty)?;
-                let view = view.clone();
-                let addr = addr.clone();
-                self.masked_value(body, element, fill_h, mask_h, move |em, accept| {
-                    let index = em.addr_index(accept, &view, &addr)?;
-                    let ptr = em.storage_dynamic_pointer(accept, &view, index)?;
-                    Ok(em.emit_load(accept, ptr))
-                })
+
+                // Branchless masking. `masked_value` costs a function-scope
+                // scratch var, a store of the fill, an `If` around the address
+                // math and the load, and a reload -- per masked load, and
+                // `scratch_local` keys that var on `(kind, element, depth)` so
+                // every masked load in a block shares one. The load cannot
+                // leave the `If` (its address may be out of range), so an
+                // unrolled staging sequence of N masked loads is N branches the
+                // shader compiler cannot batch and N device loads it issues one
+                // at a time. Clamping the element index into the buffer makes
+                // the load unconditionally safe, so it issues straight-line and
+                // the mask collapses to one `select`.
+                //
+                // Values are unchanged: a masked-out lane still yields `fill`,
+                // it just also performs a discarded in-buffer read. The clamp
+                // bound is the buffer's own element count -- the same bound
+                // `Ctx::load_operand` already builds its masks against.
+                let count = view.buffer.layout.element_count();
+                match u32::try_from(count) {
+                    Ok(count) if count > 0 => {
+                        let index = self.addr_index(body, view, addr)?;
+                        let index = self.add_literal_u32(body, index, view.offset);
+                        let last = self.u32_lit(count - 1);
+                        let index = self.math2(body, MathFunction::Min, index, last);
+                        let global = self.buffer_global(&view.buffer)?;
+                        let base = self.global_var(global);
+                        let ptr = self.emit_expr(body, Expression::Access { base, index });
+                        let loaded = self.emit_load(body, ptr);
+                        let selected = self.emit_expr(
+                            body,
+                            Expression::Select {
+                                condition: mask_h,
+                                accept: loaded,
+                                reject: fill_h,
+                            },
+                        );
+                        // Force the result into a named temporary. A backend
+                        // inlines a single-use expression into its consumer,
+                        // so an unrolled run of these nests one `select(..)`
+                        // inside the next; `qcontract`'s decode chain overran
+                        // Metal's 256-bracket limit outright ("fatal error:
+                        // bracket nesting level exceeded"). A name caps the
+                        // nesting at one load. It is an SSA binding rather
+                        // than a spill through `scratch_local`, which measured
+                        // ~3 ms slower on 2048-cube matmul: one shared scratch
+                        // makes an unrolled staging run a write-after-write
+                        // chain in the source.
+                        let n = self.forced_names.len();
+                        self.forced_names.push((selected, format!("masked_{n}")));
+                        Ok(selected)
+                    }
+                    // A buffer whose extent does not fit a u32 (or is empty)
+                    // has no clamp constant, so it keeps the guarded form.
+                    _ => {
+                        let view = view.clone();
+                        let addr = addr.clone();
+                        self.masked_value(body, element, fill_h, mask_h, move |em, accept| {
+                            let index = em.addr_index(accept, &view, &addr)?;
+                            let ptr = em.storage_dynamic_pointer(accept, &view, index)?;
+                            Ok(em.emit_load(accept, ptr))
+                        })
+                    }
+                }
             }
             Source::Quantized(q) => {
                 let f32_element = ElementType::Scalar(ScalarElement::F32);

@@ -30,7 +30,7 @@
 use fusor2_ir::device::Caps;
 use fusor2_ir::error::Error;
 use fusor2_ir::ir::level0::ScatterCombine;
-use fusor2_ir::ir::level1::{GatherMode, L1, SchedPoint, ScatterMode};
+use fusor2_ir::ir::level1::{L1, SchedPoint, ScatterMode};
 use fusor2_ir::ir::level2::{
     Accumulator, Addr, KernelIr, Local, LocalDecl, StorageView, Stmt, TileExpr, TileExprKind,
 };
@@ -51,8 +51,8 @@ pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> 
     let tm = lane_tile(theta)?;
     match op {
         L1::KGather {
-            space, axis, mode, ops, ..
-        } => gather(caps, cx, space, *axis, *mode, ops, tm),
+            space, axis, ops, ..
+        } => gather(caps, cx, space, *axis, ops, tm),
         L1::KScatter {
             space,
             axis,
@@ -101,27 +101,20 @@ fn view(buf: &Arc<fusor2_ir::ir::level2::BufferDecl>) -> StorageView {
 
 /// `out[i, rest] = src[idx[i], rest]`, one lane per output element.
 ///
-/// All three `GatherMode`s share this nest; they differ only in how many
-/// output elements one lane owns, which is a schedule attribute rather than a
-/// different kernel. `QuantizedRows` additionally decodes the row through the
-/// shared block program, which is refused here until W11 populates the table.
+/// Both `GatherMode`s share this nest; they differ only in how many output
+/// elements one lane owns, which is a schedule attribute rather than a
+/// different kernel.
 fn gather(
     caps: &Caps,
     cx: &LowerCtx<'_>,
     space: &fusor2_ir::ir::level1::IndexSpace,
     axis: u32,
-    mode: GatherMode,
     ops: &[fusor2_ir::ir::level1::Operand],
     tm: u32,
 ) -> Result<KernelIr> {
     if ops.len() < 2 {
         return Err(Error::Legality(
             "a gather needs a source and an index operand".into(),
-        ));
-    }
-    if mode == GatherMode::QuantizedRows && fusor2_gguf::BLOCK_SPECS.is_empty() {
-        return Err(Error::Legality(
-            "GatherMode::QuantizedRows needs the shared block table".into(),
         ));
     }
     let binds = Binds::build(cx)?;
@@ -537,7 +530,7 @@ mod tests {
             .add(Op::L1(L1::KGather {
                 space: IndexSpace::new(dims(&[rows, width]).into_iter()),
                 axis: 0,
-                mode: GatherMode::RowPerGroup,
+                mode: fusor2_ir::ir::level1::GatherMode::RowPerGroup,
                 ops: vec![operand(&g, src), operand(&g, idx)],
                 sched: ScheduleDomain::Point,
             }))

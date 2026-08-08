@@ -231,10 +231,16 @@ pub fn check_adjoint_specs(spec: &EinSpec) -> Result<()> {
 
     let d_lhs = spec.d_lhs();
     let d_rhs = spec.d_rhs();
-    partition(&d_lhs)
-        .map_err(|e| Error::Shape(format!("d_lhs of this contraction is not a contraction: {e}")))?;
-    partition(&d_rhs)
-        .map_err(|e| Error::Shape(format!("d_rhs of this contraction is not a contraction: {e}")))?;
+    partition(&d_lhs).map_err(|e| {
+        Error::Shape(format!(
+            "d_lhs of this contraction is not a contraction: {e}"
+        ))
+    })?;
+    partition(&d_rhs).map_err(|e| {
+        Error::Shape(format!(
+            "d_rhs of this contraction is not a contraction: {e}"
+        ))
+    })?;
 
     // `d_lhs` is `out x b -> a`. Every label the original summed is free in
     // `a` and read from `b`, i.e. an N label of the adjoint.
@@ -260,35 +266,10 @@ pub fn check_adjoint_specs(spec: &EinSpec) -> Result<()> {
     Ok(())
 }
 
-// --- scaffold-compatible spellings ----------------------------------------
-
-/// Labels appearing in both `a` and `b` but not in `out`: the summed axes.
-pub fn contracted_labels(spec: &EinSpec) -> SmallVec<[Label; 4]> {
-    spec.a
-        .iter()
-        .copied()
-        .filter(|&l| spec.b.contains(&l) && !spec.out.contains(&l))
-        .collect()
-}
-
-/// Labels appearing in all three of `a`, `b` and `out`: the batch axes.
-pub fn batch_labels(spec: &EinSpec) -> SmallVec<[Label; 4]> {
-    spec.out
-        .iter()
-        .copied()
-        .filter(|&l| spec.a.contains(&l) && spec.b.contains(&l))
-        .collect()
-}
-
 /// `verify_l0` clause 4's structural half: every label appears in >= 2 of
 /// `{a, b, out}`, and no operand repeats a label.
 pub fn verify_spec(spec: &EinSpec) -> Result<()> {
     partition(spec).map(|_| ())
-}
-
-/// Output shape of `spec` applied to two operand shapes.
-pub fn out_shape_of(spec: &EinSpec, a: &[Dim], b: &[Dim]) -> Result<Dims> {
-    out_shape(spec, &extents(spec, a, b)?)
 }
 
 /// `(batch, m, n, k)` for a `KContract` lowering, from two operand shapes.
@@ -450,15 +431,9 @@ mod tests {
     #[test]
     fn scaffold_spellings_agree() {
         let s = batched();
-        assert_eq!(&contracted_labels(&s)[..], &[Label(b'k')]);
-        assert_eq!(&batch_labels(&s)[..], &[Label(b'b')]);
         verify_spec(&s).unwrap();
         let a = [Dim::Const(2), Dim::Const(3), Dim::Const(4)];
         let b = [Dim::Const(2), Dim::Const(5), Dim::Const(4)];
-        assert_eq!(
-            &out_shape_of(&s, &a, &b).unwrap()[..],
-            &[Dim::Const(2), Dim::Const(3), Dim::Const(5)]
-        );
         assert_eq!(
             mnk(&s, &a, &b).unwrap(),
             (Dim::Const(2), Dim::Const(3), Dim::Const(5), Dim::Const(4))

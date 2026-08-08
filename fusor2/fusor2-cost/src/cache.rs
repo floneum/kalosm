@@ -26,9 +26,6 @@ use std::path::{Path, PathBuf};
 /// Bumped whenever a rate's meaning changes; a mismatch is a cache miss.
 pub const FORMAT_VERSION: u32 = 1;
 
-/// The name the W6 spec uses for [`FORMAT_VERSION`].
-pub const FACTS_FORMAT_VERSION: u32 = FORMAT_VERSION;
-
 /// Whether to consult, refresh or ignore the cache. **A function argument,
 /// never an environment variable.**
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
@@ -175,16 +172,6 @@ pub fn store(dir: &Path, facts: &DeviceFacts) -> Result<()> {
     }
 }
 
-/// The default-directory form the crate contract lists.
-pub fn load_default(caps: &Caps) -> Result<Option<DeviceFacts>> {
-    Ok(load(&cache_dir(), caps))
-}
-
-/// See [`load_default`].
-pub fn store_default(facts: &DeviceFacts) -> Result<()> {
-    store(&cache_dir(), facts)
-}
-
 /// The facts a target should compile against.
 ///
 /// `Cached` loads, else calibrates and stores, else seeds and stores.
@@ -276,13 +263,12 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
         assert!(
             load(scratch.path(), &caps).is_none(),
-            "a bumped FACTS_FORMAT_VERSION must be a miss"
+            "a bumped FORMAT_VERSION must be a miss"
         );
 
         // So is a corrupt file, and it must not be an error.
         std::fs::write(&path, "{ not json").unwrap();
         assert!(load(scratch.path(), &caps).is_none());
-        assert!(load_default(&caps).is_ok());
     }
 
     /// A caps change that only touches workgroup storage files under a
@@ -300,21 +286,18 @@ mod tests {
         assert!(load(scratch.path(), &b).is_none());
     }
 
-    /// `seed_or_cached` prefers a hit and falls back to the seed.
+    /// A stored record is served back in preference to the seed.
     #[test]
-    fn seed_or_cached_prefers_the_cache() {
+    fn a_stored_record_beats_the_seed() {
         let scratch = Scratch::new("seedor");
         let caps = gpu_caps("seed-or-cached");
-        assert_eq!(
-            crate::facts::seed_or_cached(&caps, Some(scratch.path())),
-            seed_facts(&caps)
-        );
+        assert!(load(scratch.path(), &caps).is_none());
 
         let mut measured = seed_facts(&caps);
         measured.dram_bytes_per_us = 123_456;
         store(scratch.path(), &measured).unwrap();
         assert_eq!(
-            crate::facts::seed_or_cached(&caps, Some(scratch.path())).dram_bytes_per_us,
+            load(scratch.path(), &caps).unwrap().dram_bytes_per_us,
             123_456
         );
     }

@@ -9,7 +9,7 @@
 //! Owned by W9.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use fusor2_ir::Result;
@@ -189,6 +189,14 @@ pub struct Launcher {
     dispatches: AtomicU64,
     pipeline_compiles: AtomicU64,
     profiles: Mutex<Vec<KernelProfile>>,
+    /// Set for the duration of a tuning pass. A tuner needs a number that is a
+    /// property of one launch, which is what the timestamp path produces and
+    /// what a wall clock around the whole plan cannot.
+    tuning: AtomicBool,
+    /// The most recent traced resolve's per-launch microseconds, in plan order.
+    /// Overwritten rather than queued, so draining it cannot steal a caller's
+    /// [`Self::take_kernel_profiles`] telemetry.
+    last_profile: Mutex<Option<Vec<f64>>>,
 }
 
 impl Launcher {
@@ -208,6 +216,8 @@ impl Launcher {
             dispatches: AtomicU64::new(0),
             pipeline_compiles: AtomicU64::new(0),
             profiles: Mutex::new(Vec::new()),
+            tuning: AtomicBool::new(false),
+            last_profile: Mutex::new(None),
         }
     }
 
@@ -381,11 +391,19 @@ impl Launcher {
         mut query: u32,
         total: usize,
     ) -> Result<u32> {
-        let per_pass = dispatches_per_pass(total);
         let inside_passes = self
             .device
             .features()
             .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
+        // A pass writes exactly one boundary pair, so packing dispatches into
+        // one pass attributes all of their time to the first and leaves every
+        // later slot unwritten. Without in-pass writes, one dispatch per pass
+        // is what makes a sample a property of the kernel.
+        let per_pass = if timestamps.is_some() && !inside_passes {
+            1
+        } else {
+            dispatches_per_pass(total)
+        };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -542,22 +560,111 @@ impl Launcher {
         Ok(out)
     }
 
-    /// Allocate the query set for a traced resolve, bounded by
-    /// `wgpu::QUERY_SET_MAX_QUERIES`.
+    /// Allocate the query set for a traced resolve.
+    ///
+    /// `None` — no timestamps, and the caller falls back to a wall clock — when
+    /// the feature is absent, when nothing asked to be traced, or when the plan
+    /// is too big to give every dispatch its own slot pair.
     pub fn timestamp_query_set(&self, total_kernels: usize) -> Option<wgpu::QuerySet> {
-        if !self.config.trace_gpu_kernels
+        if !self.profiling()
             || !self.device.features().contains(wgpu::Features::TIMESTAMP_QUERY)
         {
             return None;
         }
-        let count = (total_kernels.saturating_mul(2) as u32)
-            .min(wgpu::QUERY_SET_MAX_QUERIES)
-            .max(2);
+        // Two slots per dispatch and every slot must exist: a write past the
+        // set's count is a validation error, so a plan too big to time is not
+        // timed at all rather than timed wrongly.
+        let count = u32::try_from(total_kernels.saturating_mul(2)).ok()?;
+        if count == 0 || count > wgpu::QUERY_SET_MAX_QUERIES {
+            return None;
+        }
         Some(self.device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("fusor2 kernel timestamps"),
             ty: wgpu::QueryType::Timestamp,
             count,
         }))
+    }
+
+    /// Resolve `set` and return one microsecond figure per dispatch, in encoded
+    /// order. Call only *after* [`Self::poll_wait`].
+    pub fn read_timestamps(
+        &self,
+        pool: &BufferPool,
+        set: &wgpu::QuerySet,
+        dispatches: usize,
+    ) -> Result<Vec<f64>> {
+        let slots = dispatches.saturating_mul(2);
+        if slots == 0 {
+            return Ok(Vec::new());
+        }
+        // `resolve_query_set` writes 8 bytes per query into a 256-aligned
+        // destination.
+        let bytes = ((slots as u64) * 8).div_ceil(256).max(1) * 256;
+        let resolved = pool.alloc_with_usage(
+            bytes,
+            wgpu::BufferUsages::QUERY_RESOLVE.union(wgpu::BufferUsages::COPY_SRC),
+        )?;
+        let staging = pool.alloc_with_usage(bytes, READBACK_USAGE)?;
+        let dst = resolved
+            .downcast_ref::<GpuBuffer>()
+            .ok_or_else(|| Error::Device("query resolve target is not pooled".into()))?;
+        let host = staging
+            .downcast_ref::<GpuBuffer>()
+            .ok_or_else(|| Error::Device("query staging buffer is not pooled".into()))?;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fusor2 timestamp resolve"),
+            });
+        encoder.resolve_query_set(set, 0..slots as u32, &dst.buffer, 0);
+        encoder.copy_buffer_to_buffer(&dst.buffer, 0, &host.buffer, 0, bytes);
+        self.queue.submit([encoder.finish()]);
+
+        let slice = host.buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.poll_wait()?;
+        rx.recv()
+            .map_err(|_| Error::Device("timestamp callback never fired".into()))?
+            .map_err(|e| Error::Device(format!("timestamp map failed: {e}")))?;
+        let raw = slice.get_mapped_range().to_vec();
+        host.buffer.unmap();
+        pool.recycle(staging);
+        pool.recycle(resolved);
+
+        // Nanoseconds per tick. A device that reports zero has no usable clock,
+        // and every span below then reads as zero — which the caller treats as
+        // "not timed", never as "took no time".
+        let period = f64::from(self.queue.get_timestamp_period());
+        let tick = |i: usize| {
+            raw.get(i * 8..i * 8 + 8)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map_or(0u64, u64::from_le_bytes)
+        };
+        Ok((0..dispatches)
+            .map(|d| tick(d * 2 + 1).saturating_sub(tick(d * 2)) as f64 * period / 1000.0)
+            .collect())
+    }
+
+    /// Turn the per-dispatch timestamp path on for a tuning pass.
+    pub fn set_tuning(&self, on: bool) {
+        self.tuning.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether this resolve must carry timestamps.
+    pub fn profiling(&self) -> bool {
+        self.config.trace_gpu_kernels || self.tuning.load(Ordering::Relaxed)
+    }
+
+    pub fn set_last_profile(&self, per_launch: Vec<f64>) {
+        *self.last_profile.lock() = Some(per_launch);
+    }
+
+    /// The last traced resolve's per-launch microseconds, in plan order.
+    pub fn take_last_profile(&self) -> Option<Vec<f64>> {
+        self.last_profile.lock().take()
     }
 
     pub fn push_profile(&self, profile: KernelProfile) {
@@ -596,18 +703,7 @@ impl BuildCursor {
 /// Nodes are launches, edges are the buffers one launch writes and another
 /// reads, so the picture is the plan the extractor committed to rather than an
 /// approximation of it.
-pub fn graphvis(plan: &Plan, graph: &fusor2_ir::egraph::EGraph) -> String {
-    let _ = graph;
-    graphvis_impl(plan)
-}
-
-/// The same rendering without an e-graph handle, for callers that only hold a
-/// plan.
 pub fn graphvis_dot(plan: &Plan) -> String {
-    graphvis_impl(plan)
-}
-
-fn graphvis_impl(plan: &Plan) -> String {
     use std::fmt::Write as _;
     let mut out = String::from("digraph plan {\n  rankdir=TB;\n");
     for (i, launch) in plan.launches.iter().enumerate() {

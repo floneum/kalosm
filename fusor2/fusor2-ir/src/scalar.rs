@@ -5,7 +5,6 @@
 use crate::dtype::{Dtype, RoundMode, Splat};
 use crate::shape::SymId;
 use rustc_hash::FxHasher;
-use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -253,6 +252,67 @@ impl ScalarExpr {
         Self::new(ScalarKind::Round { mode, x }, dtype)
     }
 
+    /// `IndexOf(i)` rewritten to `IndexOf(map(i))` throughout. What an
+    /// absorbed producer's coordinates are called in its consumer's space —
+    /// a permuted contraction operand walks producer axis `perm[j]` at its
+    /// own axis `j`, so the body's axis names shift by `perm⁻¹`.
+    pub fn remap_index_axes(&self, map: &impl Fn(u32) -> u32) -> Self {
+        match &self.0.kind {
+            ScalarKind::IndexOf(axis) => Self::index_of(map(*axis)),
+            ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::Uniform(_) => self.clone(),
+            ScalarKind::Un { op, x } => Self::un(*op, x.remap_index_axes(map)),
+            ScalarKind::Bin { op, a, b } => {
+                Self::bin(*op, a.remap_index_axes(map), b.remap_index_axes(map))
+            }
+            ScalarKind::Cmp { op, a, b } => {
+                Self::cmp(*op, a.remap_index_axes(map), b.remap_index_axes(map))
+            }
+            ScalarKind::Select { c, t, f } => Self::select(
+                c.remap_index_axes(map),
+                t.remap_index_axes(map),
+                f.remap_index_axes(map),
+            ),
+            ScalarKind::Cast { to, x } => Self::cast(*to, x.remap_index_axes(map)),
+            ScalarKind::Bitcast { to, x } => Self::bitcast(*to, x.remap_index_axes(map)),
+            ScalarKind::Round { mode, x } => Self::round(*mode, x.remap_index_axes(map)),
+            ScalarKind::Dot { a, b } => Self::new(
+                ScalarKind::Dot {
+                    a: a.remap_index_axes(map),
+                    b: b.remap_index_axes(map),
+                },
+                self.0.dtype,
+            ),
+            ScalarKind::Splat { lanes, x } => Self::new(
+                ScalarKind::Splat {
+                    lanes: *lanes,
+                    x: x.remap_index_axes(map),
+                },
+                self.0.dtype,
+            ),
+        }
+    }
+
+    /// Whether this expression names a loop coordinate anywhere. A lowering
+    /// that evaluates a body with no coordinate vector consults this to know
+    /// whether it must build one.
+    pub fn reads_index_of(&self) -> bool {
+        match &self.0.kind {
+            ScalarKind::IndexOf(_) => true,
+            ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::Uniform(_) => false,
+            ScalarKind::Un { x, .. }
+            | ScalarKind::Cast { x, .. }
+            | ScalarKind::Bitcast { x, .. }
+            | ScalarKind::Round { x, .. }
+            | ScalarKind::Splat { x, .. } => x.reads_index_of(),
+            ScalarKind::Bin { a, b, .. }
+            | ScalarKind::Cmp { a, b, .. }
+            | ScalarKind::Dot { a, b } => a.reads_index_of() || b.reads_index_of(),
+            ScalarKind::Select { c, t, f } => {
+                c.reads_index_of() || t.reads_index_of() || f.reads_index_of()
+            }
+        }
+    }
+
     /// Substitute `args` for `Arg(i)` throughout. This *is*
     /// elementwise-into-elementwise fusion: `pre.compose(body)` needs no
     /// rewrite rule at all, only a tree substitution.
@@ -302,6 +362,3 @@ impl Hash for ScalarExpr {
         state.write_u64(self.0.hash);
     }
 }
-
-/// Operand list of a `Map` body, inline up to 4.
-pub type Args = SmallVec<[ScalarExpr; 4]>;

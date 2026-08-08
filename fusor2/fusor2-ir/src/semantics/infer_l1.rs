@@ -85,10 +85,6 @@ fn infer_l1_inner(
         L1::KContract {
             m, n, batch, post, ..
         } => Ok(contract_facts(*m, *n, *batch, post, ins)),
-        L1::KQContract { m, n, post, .. } => {
-            Ok(contract_facts(*m, *n, Dim::Const(1), post, ins))
-        }
-
         L1::KGather { space, .. } => Ok(ValueFacts {
             dtype: ins.first().map_or(Dtype::F32, |f| f.dtype),
             shape: space.dims.clone(),
@@ -200,7 +196,8 @@ mod tests {
     use crate::carrier::{ArgRemap, Carrier};
     use crate::scalar::BinOp;
     use crate::ir::level1::{
-        AccessPlan, Family, IndexSpace, KMerged, MergeKey, MergeSegment, Operand, ScheduleDomain,
+        AccessPlan, ContractSide, Family, IndexSpace, KMerged, MergeKey, MergeSegment, Operand,
+        ScheduleDomain,
         WaveCat,
     };
     use crate::scalar::ScalarExpr;
@@ -312,12 +309,10 @@ mod tests {
             k: Dim::Const(4),
             batch,
             family: Family::Sgemm,
-            pre_a: ScalarExpr::arg(0, Dtype::F32),
-            pre_b: ScalarExpr::arg(0, Dtype::F32),
             post: ScalarExpr::arg(0, Dtype::F32),
             acc: Dtype::F32,
-            a: operand(0),
-            b: operand(1),
+            a: ContractSide::one(ScalarExpr::arg(0, Dtype::F32), operand(0)),
+            b: ContractSide::one(ScalarExpr::arg(0, Dtype::F32), operand(1)),
             sched: ScheduleDomain::Point,
         };
         let ins = [f32s(&[3, 4]), f32s(&[4, 5])];

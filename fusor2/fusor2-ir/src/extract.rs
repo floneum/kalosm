@@ -47,10 +47,9 @@ pub enum Move {
     Reschedule(Id),
 }
 
-/// Extraction limits. Deterministic: ties break by node id.
-/// `sched_frontier` is how many `score_fs`-ordered points the move frontier
-/// offers first — **the full domain stays reachable** and the accept test
-/// is always the exact global cost.
+/// Extraction limits. Deterministic: ties break by node id. **The full
+/// schedule domain stays reachable** and the accept test is always the exact
+/// global cost.
 ///
 /// **No term is a clock.** The plan is the cache key and the cache is
 /// cross-process, so an extraction that stops when a deadline expires
@@ -64,11 +63,10 @@ pub struct ExtractBudget {
     /// `max_move_work / graph.len()` moves, whichever of that and
     /// `moves_per_chain * chains` is smaller.
     pub max_move_work: u64,
-    pub sched_frontier: u32,
 }
 
 impl Default for ExtractBudget {
-    /// `64 * |chains|` moves, 90k realized node visits, Pareto top-4 first.
+    /// `64 * |chains|` moves, 90k realized node visits.
     ///
     /// 90k is the deterministic restatement of the 2 ms wall clock it
     /// replaces: at ~20 ns per realized node it is the same ~1.8 ms of
@@ -129,7 +127,6 @@ impl Default for ExtractBudget {
         Self {
             moves_per_chain: 64,
             max_move_work: 90_000,
-            sched_frontier: 4,
         }
     }
 }
@@ -232,6 +229,28 @@ pub trait Extractor: Send + Sync {
     /// operand access satisfiable; every buffer stride derivable; no
     /// `InPlace` node inlined. A failure is an error, never a fallback.
     fn verify_plan(&self, graph: &EGraph, plan: &Plan) -> Result<()>;
+
+    /// Alternative plans for one launch of `base`: every `(class member,
+    /// schedule point)` pair the launch root's class offers, each re-planned
+    /// whole. Family **and** geometry vary together, which is the only way a
+    /// single measurement can rank them — see the `candidate_geoms_for` doc
+    /// in `fusor2-tile`.
+    ///
+    /// Contractions below `min_macs` return nothing, so a suite of 3x4x2048
+    /// matmuls never pays for a measurement round. The default is "no
+    /// alternatives": an extractor that cannot replan is simply not tuned.
+    fn launch_variants(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        base: &Plan,
+        launch_ix: usize,
+        cost: &dyn CostModel,
+        min_macs: u64,
+    ) -> Vec<(String, Plan)> {
+        let _ = (graph, roots, base, launch_ix, cost, min_macs);
+        Vec::new()
+    }
 }
 
 /// The replay memo, keyed on the *extraction inputs* rather than a

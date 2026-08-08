@@ -83,12 +83,6 @@ pub fn sgemv_domain(cx: &DomainCtx<'_>) -> SgemvDomain {
     }
 }
 
-/// Move-ordering seeds only.
-pub fn seed_order(dtype: Dtype) -> &'static [SgemvParams] {
-    let _ = dtype;
-    SEED_CELLS
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

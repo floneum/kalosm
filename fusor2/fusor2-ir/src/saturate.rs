@@ -32,7 +32,7 @@ impl CoreSaturate {
 }
 
 /// Dense index of an [`OpTag`], for the O(1) head-dispatch table.
-const TAG_COUNT: usize = 21;
+const TAG_COUNT: usize = 20;
 
 const fn tag_index(tag: OpTag) -> usize {
     match tag {
@@ -49,13 +49,12 @@ const fn tag_index(tag: OpTag) -> usize {
         OpTag::KMap => 10,
         OpTag::KFold => 11,
         OpTag::KContract => 12,
-        OpTag::KQContract => 13,
-        OpTag::KGather => 14,
-        OpTag::KScatter => 15,
-        OpTag::KRegion => 16,
-        OpTag::KMerged => 17,
-        OpTag::Ext => 18,
-        OpTag::Union => 19,
+        OpTag::KGather => 13,
+        OpTag::KScatter => 14,
+        OpTag::KRegion => 15,
+        OpTag::KMerged => 16,
+        OpTag::Ext => 17,
+        OpTag::Union => 18,
     }
 }
 

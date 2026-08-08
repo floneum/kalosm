@@ -253,7 +253,7 @@ pub(crate) mod test_support {
     use crate::facts::{ValueFacts, Work};
     use crate::carrier::Carrier;
     use crate::ir::level0::{BufferId, EinSpec, LeafKind, ScatterCombine};
-    use crate::ir::level1::{Effect, Family, ScheduleDomain};
+    use crate::ir::level1::{ContractSide, Effect, Family, ScheduleDomain};
     use crate::ir::{Children, Semantics, VerifyCtx};
     use crate::shape::{BoundsProof, Dims};
     use smallvec::smallvec;
@@ -322,8 +322,8 @@ pub(crate) mod test_support {
                 | L1::KGather { ops, .. }
                 | L1::KScatter { ops, .. }
                 | L1::Ext { ops, .. } => ops.iter().map(|p| p.src).collect(),
-                L1::KContract { a, b, .. } | L1::KQContract { a, b, .. } => {
-                    smallvec![a.src, b.src]
+                L1::KContract { a, b, .. } => {
+                    a.ops.iter().chain(b.ops.iter()).map(|p| p.src).collect()
                 }
                 L1::KRegion { members, .. } => members.iter().copied().collect(),
                 L1::KMerged(m) => m.segments().iter().copied().collect(),
@@ -471,9 +471,6 @@ pub(crate) mod test_support {
                 shape.push(*n);
                 facts(post.dtype(), shape, ins)
             }
-            L1::KQContract {
-                m, n, post, ..
-            } => facts(post.dtype(), smallvec![*m, *n], ins),
             L1::KGather { space, .. } | L1::KScatter { space, .. } => {
                 facts(ins[0].dtype, space.dims.clone(), ins)
             }
@@ -663,12 +660,10 @@ pub(crate) mod test_support {
             k,
             batch: Dim::ONE,
             family: Family::Sgemm,
-            pre_a: ident_expr(Dtype::F32),
-            pre_b: ident_expr(Dtype::F32),
             post,
             acc: Dtype::F32,
-            a,
-            b,
+            a: ContractSide::one(ident_expr(Dtype::F32), a),
+            b: ContractSide::one(ident_expr(Dtype::F32), b),
             sched: ScheduleDomain::Point,
         }))
         .unwrap()

@@ -134,7 +134,7 @@ pub fn is_lane_uniform(e: &TileExpr) -> bool {
         | K::Builtin(Builtin::SubgroupLane)
         | K::Builtin(Builtin::SubgroupId) => false,
         K::Literal(_) | K::Builtin(_) | K::LoadLocal(_) => true,
-        K::Load { .. } | K::LoadTile { .. } | K::Dequantize { .. } | K::QuantizedDot { .. } => false,
+        K::Load { .. } | K::LoadTile { .. } => false,
         K::Unary { value, .. } => is_lane_uniform(value),
         K::Binary { left, right, .. } | K::Compare { left, right, .. } => {
             is_lane_uniform(left) && is_lane_uniform(right)
@@ -152,7 +152,6 @@ pub fn is_lane_uniform(e: &TileExpr) -> bool {
         K::Dot { left, right } => is_lane_uniform(left) && is_lane_uniform(right),
         // A cross-lane reduce is uniform across its group by construction.
         K::Reduce { .. } => true,
-        K::LaneOf { block, .. } => is_lane_uniform(block),
         K::CoopLoad { .. } | K::CoopMma { .. } | K::CoopZero { .. } => false,
     }
 }

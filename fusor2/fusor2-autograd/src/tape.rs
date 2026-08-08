@@ -5,7 +5,7 @@
 //! Owned by W5.
 
 use fusor2_ir::autograd::{Tape, Val};
-use fusor2_ir::dtype::{Dtype, NumericContract, Splat};
+use fusor2_ir::dtype::{Dtype, Splat};
 use fusor2_ir::egraph::EGraph;
 use fusor2_ir::facts::ValueFacts;
 use fusor2_ir::carrier::Carrier;
@@ -19,17 +19,11 @@ use smallvec::SmallVec;
 /// A tape that is not a tape: a thin writer over the live e-graph.
 pub struct GraphTape<'a> {
     graph: &'a mut EGraph,
-    /// The primal contract adjoint nodes must not relax. Set by the backward
-    /// driver before each rule runs; `None` disables the check.
-    contract: Option<NumericContract>,
 }
 
 impl<'a> GraphTape<'a> {
     pub fn new(graph: &'a mut EGraph) -> Self {
-        Self {
-            graph,
-            contract: None,
-        }
+        Self { graph }
     }
 
     pub fn graph(&self) -> &EGraph {
@@ -38,12 +32,6 @@ impl<'a> GraphTape<'a> {
 
     pub fn graph_mut(&mut self) -> &mut EGraph {
         self.graph
-    }
-
-    /// Require every subsequently emitted non-leaf node to satisfy `nc`.
-    /// The adjoint may never relax the primal's contract.
-    pub fn set_contract(&mut self, nc: Option<NumericContract>) {
-        self.contract = nc;
     }
 
     pub fn node(&self, v: Val) -> &Node {
@@ -277,14 +265,7 @@ impl<T: Tape + ?Sized> TapeExt for T {}
 
 impl Tape for GraphTape<'_> {
     fn add(&mut self, op: L0) -> Result<Val> {
-        let is_leaf = matches!(op, L0::Leaf(_));
-        let id = self.graph.add(Op::L0(op))?;
-        // A constant seed carries no numerics of consequence; every computed
-        // node must satisfy the primal's contract.
-        if !is_leaf && let Some(needed) = self.contract {
-            self.graph.facts(id).numeric.require(needed)?;
-        }
-        Ok(id)
+        self.graph.add(Op::L0(op))
     }
 
     fn facts(&self, v: Val) -> &ValueFacts {

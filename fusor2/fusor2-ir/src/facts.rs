@@ -40,15 +40,6 @@ impl ValueFacts {
         Some(self.elements()? * self.dtype.byte_size())
     }
 
-    pub fn persistent(mut self) -> Self {
-        self.persistence = Persistence::Persistent;
-        self
-    }
-
-    pub const fn with_numeric(mut self, numeric: NumericContract) -> Self {
-        self.numeric = numeric;
-        self
-    }
 }
 
 /// The work one op performs, in units the cost model can price.

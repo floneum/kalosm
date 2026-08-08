@@ -203,7 +203,6 @@ impl Emitter<'_> {
         // A store closes a value scope: nothing computed for the previous
         // store may be reused, because the next one may run under a different
         // predicate.
-        self.q8_cache.clear();
         let v = self.expr(value, out)?;
         if mask.is_constant_true() {
             let index = self.addr_index(out, dst, addr)?;
@@ -560,49 +559,17 @@ impl Emitter<'_> {
                     em.guarded_tile_store(accept, &dst, tile_ptr, in_bounds, load)
                 })
             }
-            Source::Quantized(q) => {
-                if bounded {
-                    return Err(EmitError::Unsupported(
-                        "bounded fills are not supported for quantized sources".into(),
-                    ));
-                }
-                let q = q.clone();
-                let dst = dst.clone();
-                let total = rows
-                    .checked_mul(cols)
-                    .ok_or_else(|| EmitError::Unsupported("workgroup tile size overflow".into()))?;
-                let (q_rows, q_cols) = (q.rows, q.cols);
-                self.copy_passes(out, total, move |em, accept, flat| {
-                    // Quantized matrices store row-major blocks, so lanes keep
-                    // the column order regardless of the tile's own layout.
-                    let (local_row, local_col) = em.lane_coords(accept, flat, rows, cols, true);
-                    let global_row = em.add_u32(accept, row_base, local_row);
-                    let global_col = em.add_u32(accept, col_base, local_col);
-                    let tile_index = em.tile_matrix_index(accept, local_row, local_col, stride);
-                    let tile_ptr = em.tile_dynamic_pointer(accept, &dst, tile_index)?;
-                    let rows_lit = em.u32_lit(q_rows);
-                    let cols_lit = em.u32_lit(q_cols);
-                    let in_bounds = em.bounds_check(
-                        accept,
-                        global_row,
-                        global_col,
-                        Some(rows_lit),
-                        Some(cols_lit),
-                    );
-                    let q = q.clone();
-                    let dst_element = dst.element;
-                    let load = move |em: &mut Self, block: &mut Block| -> Result<_, EmitError> {
-                        let v = em.decode_one_handles(block, &q, global_row, global_col)?;
-                        em.cast_tile_value(
-                            block,
-                            v,
-                            ElementType::Scalar(ScalarElement::F32),
-                            dst_element,
-                        )
-                    };
-                    em.guarded_tile_store(accept, &dst, tile_ptr, in_bounds, load)
-                })
-            }
+            // A block-quantized operand never reaches the collective fill:
+            // `stage_operand_tile` stages it one lane at a time as a
+            // `Load` + `StoreTile`, because `pre` has to run per element on
+            // the way in. Verified by probe at a shape that does select
+            // `Family::Coop` for a quantized operand (m=n=256, k=256): the
+            // arm this replaces was never entered.
+            Source::Quantized(_) => Err(EmitError::Unsupported(
+                "FillTile's source must be dense storage: a quantized operand \
+                 stages through per-lane Load + StoreTile"
+                    .into(),
+            )),
         }
     }
 

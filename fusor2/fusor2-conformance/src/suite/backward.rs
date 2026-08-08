@@ -442,7 +442,7 @@ fn relu_kink(session: &Session) -> CaseResult {
 }
 
 /// QAT: `fake_quant` is opaque forward and the identity backward, and it
-/// needs zero user code — `AdjointKind::StraightThrough` carries it.
+/// needs zero user code — the backward it registers carries it.
 ///
 /// Without it the round inside would differentiate to zero everywhere and no
 /// quantization-aware model would train at all.

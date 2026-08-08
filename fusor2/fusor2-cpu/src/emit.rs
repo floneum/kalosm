@@ -166,7 +166,7 @@ pub fn compile(
         None => None,
     };
 
-    let mut c = Compiler::new(ir, width);
+    let mut c = Compiler::new(ir);
     if let Some(plan) = &arena {
         c.seed_arena(plan);
     }
@@ -230,10 +230,6 @@ fn scalar_of(e: ElementType) -> std::result::Result<ScalarElement, EmitError> {
 
 struct Compiler<'a> {
     ir: &'a KernelIr,
-    /// The instantiation width the tape is built for; reported back on the
-    /// `Program` so `launch` picks the same monomorphization.
-    #[allow(dead_code)]
-    width: u32,
     tape: Vec<Instr>,
     regs: u32,
     memo: FxHashMap<TileExpr, Slot>,
@@ -252,10 +248,9 @@ struct Compiler<'a> {
 }
 
 impl<'a> Compiler<'a> {
-    fn new(ir: &'a KernelIr, width: u32) -> Self {
+    fn new(ir: &'a KernelIr) -> Self {
         Self {
             ir,
-            width,
             tape: Vec::new(),
             regs: 0,
             memo: FxHashMap::default(),
@@ -892,10 +887,8 @@ impl<'a> Compiler<'a> {
                         Addr::Rc2 { row, col } => (row.clone(), col.clone()),
                         Addr::Linear(e) => (e.clone(), zero_u32()),
                     };
-                    let block =
-                        quantized::expand_dequantize(q, &k_base, &col, mask, fill, 1)?;
-                    let lane0 = quantized::lane_of(block, 0);
-                    return self.compile_expr(&lane0);
+                    let element = quantized::expand_dequantize(q, &k_base, &col, mask, fill)?;
+                    return self.compile_expr(&element);
                 }
             },
             K::LoadTile { tile, index } => {
@@ -1098,47 +1091,6 @@ impl<'a> Compiler<'a> {
                     ));
                 }
             },
-            K::Dequantize {
-                src,
-                k_base,
-                col,
-                mask,
-                fill,
-                lanes,
-            } => {
-                let expanded =
-                    quantized::expand_dequantize(src, k_base, col, mask, fill, *lanes)?;
-                return self.compile_expr(&expanded);
-            }
-            K::LaneOf { block, lane } => {
-                let base = self.compile_expr(block)?;
-                let out = self.slot();
-                self.push(Instr::VecComponent {
-                    out,
-                    base,
-                    component: *lane,
-                })
-            }
-            K::QuantizedDot {
-                src,
-                packing,
-                activations,
-                k_base,
-                col,
-                mask,
-                fill,
-            } => {
-                let expanded = quantized::expand_quantized_dot(
-                    src,
-                    *packing,
-                    activations,
-                    k_base,
-                    col,
-                    mask,
-                    fill,
-                )?;
-                return self.compile_expr(&expanded);
-            }
             K::CoopLoad { .. } | K::CoopMma { .. } | K::CoopZero { .. } => {
                 return Err(EmitError::MissingCapability(
                     "cooperative matrix: the CPU target reports no coop config",
@@ -1268,26 +1220,6 @@ fn children_of(e: &TileExpr) -> Vec<TileExpr> {
         K::VecComponent { vector, .. } => vec![vector.clone()],
         K::Reduce { value, .. } => vec![value.clone()],
         K::CoopLoad { .. } | K::CoopMma { .. } | K::CoopZero { .. } => vec![],
-        K::Dequantize {
-            k_base,
-            col,
-            mask,
-            fill,
-            ..
-        } => vec![k_base.clone(), col.clone(), mask.clone(), fill.clone()],
-        K::LaneOf { block, .. } => vec![block.clone()],
-        K::QuantizedDot {
-            activations,
-            k_base,
-            col,
-            mask,
-            fill,
-            ..
-        } => {
-            let mut v = activations.clone();
-            v.extend([k_base.clone(), col.clone(), mask.clone(), fill.clone()]);
-            v
-        }
     }
 }
 

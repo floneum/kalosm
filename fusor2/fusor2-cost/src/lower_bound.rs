@@ -79,14 +79,6 @@ pub fn lower_bound(graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds> {
     lb
 }
 
-/// The bound for one node, given bounds for every other id. Exposed so a
-/// branch-and-bound prune can re-derive a single entry.
-pub fn node_bound(graph: &EGraph, cost: &dyn CostModel, id: Id, lb: &[Picoseconds]) -> Picoseconds {
-    let mut math = vec![Picoseconds(0); graph.len()];
-    math[id.index()] = best_math(graph, cost, id, &mut MATH_CALL_BUDGET.clone());
-    combine(graph, id, &math, lb)
-}
-
 /// The cheapest **selectable** member of `class`, ties by smaller [`Id`]. The
 /// seed selection is exactly this, per class.
 ///

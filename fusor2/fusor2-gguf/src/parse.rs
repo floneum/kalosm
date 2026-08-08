@@ -6,10 +6,78 @@
 //! Owned by W11.
 
 use fusor2_ir::Result;
-use fusor2_ir::dtype::{Dtype, GgmlType};
+use fusor2_ir::dtype::{Dtype, QFmt};
 use fusor2_ir::error::Error;
 use smallvec::SmallVec;
 use std::io::{Read, Seek, SeekFrom, Write};
+
+/// GGUF wire format tags. Wider than [`QFmt`] because a file may name a
+/// format fusor2 does not ingest; [`Self::to_qfmt`] is the total gate.
+///
+/// A wire tag is a fact about the *file*, not about the IR, so it lives with
+/// the parser that reads it: nothing in the compiler crates names one.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[allow(non_camel_case_types)]
+#[repr(u32)]
+pub enum GgmlType {
+    F32 = 0,
+    F16 = 1,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    Q5_0 = 6,
+    Q5_1 = 7,
+    Q8_0 = 8,
+    Q8_1 = 9,
+    Q2K = 10,
+    Q3K = 11,
+    Q4K = 12,
+    Q5K = 13,
+    Q6K = 14,
+    Q8K = 15,
+}
+
+impl GgmlType {
+    pub const fn to_dtype(self) -> Option<Dtype> {
+        match self {
+            Self::F32 => Some(Dtype::F32),
+            Self::F16 => Some(Dtype::F16),
+            Self::Q4_0 => Some(Dtype::Q(QFmt::Q4_0)),
+            Self::Q5_0 => Some(Dtype::Q(QFmt::Q5_0)),
+            Self::Q8_0 => Some(Dtype::Q(QFmt::Q8_0)),
+            Self::Q4K => Some(Dtype::Q(QFmt::Q4K)),
+            Self::Q5K => Some(Dtype::Q(QFmt::Q5K)),
+            Self::Q6K => Some(Dtype::Q(QFmt::Q6K)),
+            _ => None,
+        }
+    }
+
+    pub const fn to_qfmt(self) -> Option<QFmt> {
+        match self.to_dtype() {
+            Some(Dtype::Q(q)) => Some(q),
+            _ => None,
+        }
+    }
+
+    pub const fn from_u32(v: u32) -> Option<Self> {
+        Some(match v {
+            0 => Self::F32,
+            1 => Self::F16,
+            2 => Self::Q4_0,
+            3 => Self::Q4_1,
+            6 => Self::Q5_0,
+            7 => Self::Q5_1,
+            8 => Self::Q8_0,
+            9 => Self::Q8_1,
+            10 => Self::Q2K,
+            11 => Self::Q3K,
+            12 => Self::Q4K,
+            13 => Self::Q5K,
+            14 => Self::Q6K,
+            15 => Self::Q8K,
+            _ => return None,
+        })
+    }
+}
 
 /// `GGUF`. A byte-reversed spelling is also accepted, as the reference does.
 pub const GGUF_MAGIC_BYTES: [u8; 4] = *b"GGUF";

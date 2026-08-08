@@ -19,8 +19,8 @@ const BK_CHOICES: [u32; 4] = [8, 16, 32, 64];
 const T_CHOICES: [u32; 4] = [1, 2, 4, 8];
 
 /// How many tilings survive into the domain. Bounds the move frontier's
-/// size; the cap keeps the lowest [`crate::domains::seed_rank`] first, so
-/// it never removes a measured winner.
+/// size; the cap keeps the [`SEED_LEAVES`] members first, so it never
+/// removes a measured winner.
 pub const MAX_PARAMS: usize = 64;
 
 /// The distinct leaves of the deleted regression tree that this generator's
@@ -126,15 +126,6 @@ fn generate_params(elem_bytes: u32, cx: &DomainCtx<'_>) -> SgemmDomain {
     SgemmDomain {
         params: SmallVec::from_vec(all),
     }
-}
-
-/// The measured leaves of the deleted regression tree. Ordering, never
-/// gating.
-pub fn seed_order(dtype: Dtype) -> &'static [SgemmParams] {
-    // The tree branched on shape only, never on element type: the leaves it
-    // reaches are the same rows for f32 and f16.
-    let _ = dtype;
-    SEED_LEAVES
 }
 
 #[cfg(test)]

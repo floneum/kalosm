@@ -4,7 +4,7 @@
 //! L1**: buffers are derived from the extracted plan.
 
 use crate::carrier::Carrier;
-use crate::dtype::{Dtype, QAct, QFmt, QLayout};
+use crate::dtype::Dtype;
 use crate::egraph::Id;
 use crate::error::{Error, Result};
 use crate::ir::{AttrId, OpDefId, OpTag};
@@ -59,27 +59,10 @@ pub enum L1 {
         k: Dim,
         batch: Dim,
         family: Family,
-        pre_a: ScalarExpr,
-        pre_b: ScalarExpr,
         post: ScalarExpr,
         acc: Dtype,
-        a: Operand,
-        b: Operand,
-        sched: ScheduleDomain,
-    },
-
-    /// Quantized contraction. Both `QAct` packings coexist; cost decides.
-    KQContract {
-        fmt: QFmt,
-        layout: QLayout,
-        act: QAct,
-        m: Dim,
-        n: Dim,
-        k: Dim,
-        acc: Dtype,
-        post: ScalarExpr,
-        a: Operand,
-        b: Operand,
+        a: ContractSide,
+        b: ContractSide,
         sched: ScheduleDomain,
     },
 
@@ -131,7 +114,6 @@ impl L1 {
             Self::KMap { .. } => OpTag::KMap,
             Self::KFold { .. } => OpTag::KFold,
             Self::KContract { .. } => OpTag::KContract,
-            Self::KQContract { .. } => OpTag::KQContract,
             Self::KGather { .. } => OpTag::KGather,
             Self::KScatter { .. } => OpTag::KScatter,
             Self::KRegion { .. } => OpTag::KRegion,
@@ -173,7 +155,6 @@ impl L1 {
             Self::KMap { sched, .. }
             | Self::KFold { sched, .. }
             | Self::KContract { sched, .. }
-            | Self::KQContract { sched, .. }
             | Self::KGather { sched, .. }
             | Self::KScatter { sched, .. }
             | Self::KRegion { sched, .. } => Some(sched),
@@ -251,6 +232,103 @@ impl AccessPlan {
             Self::Pack { .. } => 1,
             Self::Unflatten(map) => map.divmod_ops(),
         }
+    }
+}
+
+/// One side of a [`L1::KContract`]: the buffers it reads and the elementwise
+/// chain run per loaded element.
+///
+/// # Why a side is a list
+///
+/// A contraction operand used to be exactly one [`Operand`], which made
+/// `KContract` the only fixed-arity L1 node — `KMap`, `KFold`, `KGather` and
+/// `KScatter` all carry `Vec<Operand>`. That asymmetry is what made
+/// [`crate::rules::fusion::map_into_contract`] bail whenever the producer it
+/// wanted to absorb read more than one buffer: there was nowhere to put the
+/// second edge.
+///
+/// The producer that matters is the GGUF block decode. It reads one block
+/// stream through several `Restride` views at once — the quant plane, the
+/// block scale, the block minimum, the group scales — so it is irreducibly
+/// multi-edge, and no rewrite collapses it. With a side as a list that decode
+/// is an ordinary absorbed producer, and the quantized staging fill stops
+/// being a special case in the backend.
+///
+/// # Numbering
+///
+/// `pre` is written over `Arg(0..ops.len())` numbered **within this side**,
+/// not across the node. Splicing a producer into `a` therefore never
+/// renumbers `b`'s body, which is what keeps [`map_into_contract`] a local
+/// rewrite on the side it fires for.
+///
+/// [`map_into_contract`]: crate::rules::fusion::map_into_contract
+///
+/// # Shape
+///
+/// Every operand of a side maps the same index triple to its own address —
+/// `(batch, m, k)` on `a`, `(batch, k, n)` on `b` — so they agree on shape
+/// and differ only in buffer, stride and access. Geometry may be read off
+/// [`Self::primary`]; predicates about *reachability* (addressability, dtype
+/// admissibility, traffic) must range over all of [`Self::ops`].
+///
+/// `ops` is non-empty. A side with no operand would make `pre` a constant,
+/// which is a `KMap` and not a contraction; `verify_l1` rejects it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ContractSide {
+    pub pre: ScalarExpr,
+    pub ops: SmallVec<[Operand; 2]>,
+}
+
+impl ContractSide {
+    /// The single-operand side every contraction is born with.
+    pub fn one(pre: ScalarExpr, op: Operand) -> Self {
+        Self {
+            pre,
+            ops: smallvec::smallvec![op],
+        }
+    }
+
+    pub fn new(pre: ScalarExpr, ops: impl IntoIterator<Item = Operand>) -> Self {
+        Self {
+            pre,
+            ops: ops.into_iter().collect(),
+        }
+    }
+
+    /// The operand this side's geometry is read off. See the type's docs for
+    /// why any operand would do and why predicates still may not use it.
+    pub fn primary(&self) -> &Operand {
+        &self.ops[0]
+    }
+
+    /// The sole operand, or `None` once a multi-buffer producer has been
+    /// absorbed. Rules that rewrite *the* operand — rather than each of them
+    /// independently — decline on `None` instead of silently rewriting the
+    /// first of several.
+    pub fn sole(&self) -> Option<&Operand> {
+        match &self.ops[..] {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// Rebuild with each operand mapped, keeping `pre` and the arg numbering.
+    /// `f` returning `None` for any operand abandons the whole rewrite —
+    /// a side half-repacked reads two layouts for one index.
+    pub fn try_map_ops(&self, f: impl Fn(&Operand) -> Option<Operand>) -> Option<Self> {
+        let ops: Option<SmallVec<[Operand; 2]>> = self.ops.iter().map(f).collect();
+        Some(Self {
+            pre: self.pre.clone(),
+            ops: ops?,
+        })
     }
 }
 
@@ -390,8 +468,6 @@ pub enum Family {
 pub enum GatherMode {
     RowPerGroup,
     Vectorized,
-    /// Decode quantized rows straight into the output dtype.
-    QuantizedRows,
 }
 
 /// Scatter lowering. All four coexist as alternatives; `OneHotContract`

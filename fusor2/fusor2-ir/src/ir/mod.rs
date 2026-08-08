@@ -93,7 +93,6 @@ pub enum OpTag {
     KMap,
     KFold,
     KContract,
-    KQContract,
     KGather,
     KScatter,
     KRegion,

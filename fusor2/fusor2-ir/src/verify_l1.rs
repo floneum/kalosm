@@ -29,7 +29,7 @@ use crate::error::{Error, Result};
 use crate::ir::{Op, VerifyCtx};
 use crate::ir::level0::ScatterCombine;
 use crate::ir::level1::{
-    AccessPlan, CoopGeom, Effect, IndexSpace, L1, Operand, SchedPoint, ScheduleDomain,
+    AccessPlan, CoopGeom, Effect, IndexSpace, L1, Operand, ScheduleDomain,
 };
 use crate::ir::level2::{
     ArenaPlanner, ElementType, MemoryLevel, ScalarElement, TileDecl, TileLayout, Tiles,
@@ -442,6 +442,18 @@ fn check_fold_axis_not_written(cx: &VerifyCtx<'_>, op: &L1) -> Result<()> {
 /// failure names the operand, so it disqualifies only the rewrite that
 /// produced it.
 pub fn check_operand_access(op: &L1) -> Result<()> {
+    // A contraction side holds a list, and an empty one would make its `pre`
+    // a constant — a `KMap`, not a contraction, and a node the lowerings would
+    // read `ops[0]` off. `ContractSide::primary` is written against this.
+    if let L1::KContract { a, b, .. } = op {
+        for (side, which) in [(a, "a"), (b, "b")] {
+            if side.is_empty() {
+                return Err(Error::Legality(format!(
+                    "contraction side {which} reads no operand"
+                )));
+            }
+        }
+    }
     let space = index_space_of(op);
     for (i, o) in operands_of(op).iter().enumerate() {
         let fail = |msg: String| Error::Legality(format!("operand {i}: {msg}"));
@@ -749,7 +761,7 @@ fn operands_of(op: &L1) -> Vec<Operand> {
         | L1::KGather { ops, .. }
         | L1::KScatter { ops, .. }
         | L1::Ext { ops, .. } => ops.clone(),
-        L1::KContract { a, b, .. } | L1::KQContract { a, b, .. } => vec![a.clone(), b.clone()],
+        L1::KContract { a, b, .. } => a.ops.iter().chain(b.ops.iter()).cloned().collect(),
         L1::KRegion { .. } | L1::KMerged(_) => Vec::new(),
     }
 }
@@ -772,7 +784,7 @@ fn store_dtype(op: &L1) -> Dtype {
     match op {
         L1::KMap { body, .. } => body.dtype(),
         L1::KFold { acc, .. } => *acc,
-        L1::KContract { post, .. } | L1::KQContract { post, .. } => post.dtype(),
+        L1::KContract { post, .. } => post.dtype(),
         _ => Dtype::F32,
     }
 }
@@ -787,12 +799,6 @@ fn element_of(d: Dtype) -> ScalarElement {
     }
 }
 
-/// `SchedPoint` of a domain's first point, for callers that only need a
-/// representative geometry.
-pub fn first_point(sched: &ScheduleDomain) -> Option<SchedPoint> {
-    sched.point(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,7 +809,8 @@ mod tests {
     use crate::carrier::Carrier;
     use crate::scalar::BinOp;
     use crate::ir::level1::{
-        BufferRole, Family, KMerged, MapDomain, MergeKey, MergeSegment, ScatterMode, WaveCat,
+        BufferRole, ContractSide, Family, KMerged, MapDomain, MergeKey, MergeSegment, ScatterMode,
+        WaveCat,
     };
     use crate::ir::level2::{ArenaMode, ArenaPlan, BarrierSuggestion, KernelIr};
     use crate::ir::{Level, Node, Op, OpDefRegistry};
@@ -1057,12 +1064,10 @@ mod tests {
             k: Dim::Const(64),
             batch: Dim::Const(1),
             family: Family::Coop,
-            pre_a: ScalarExpr::arg(0, Dtype::F32),
-            pre_b: ScalarExpr::arg(0, Dtype::F32),
             post: ScalarExpr::arg(0, Dtype::F32),
             acc: Dtype::F32,
-            a: operand(0, &[64, 64]),
-            b: operand(1, &[64, 64]),
+            a: ContractSide::one(ScalarExpr::arg(0, Dtype::F32), operand(0, &[64, 64])),
+            b: ContractSide::one(ScalarExpr::arg(0, Dtype::F32), operand(1, &[64, 64])),
             sched: ScheduleDomain::Coop(domain),
         };
         // (64*32 + 32*64) * 4 bytes = 16 KiB, inside the 32 KiB limit.
@@ -1085,12 +1090,10 @@ mod tests {
             k: Dim::Const(4),
             batch: Dim::Const(1),
             family: Family::Coop,
-            pre_a: ScalarExpr::arg(0, Dtype::F32),
-            pre_b: ScalarExpr::arg(0, Dtype::F32),
             post: ScalarExpr::arg(0, Dtype::F32),
             acc: Dtype::F32,
-            a: operand(0, &[4, 4]),
-            b: operand(1, &[4, 4]),
+            a: ContractSide::one(ScalarExpr::arg(0, Dtype::F32), operand(0, &[4, 4])),
+            b: ContractSide::one(ScalarExpr::arg(0, Dtype::F32), operand(1, &[4, 4])),
             sched: ScheduleDomain::Coop(Default::default()),
         };
         assert!(matches!(

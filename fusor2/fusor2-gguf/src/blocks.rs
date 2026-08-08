@@ -7,15 +7,63 @@
 //!
 //! Owned by W11.
 
-use fusor2_ir::dtype::{BlockProgram, BlockSpec, QAct, QFmt, QLayout};
+use fusor2_ir::Result;
+use fusor2_ir::dtype::{QFmt, QLayout};
+use fusor2_ir::ir::level2::{StorageView, TileExpr};
 
 use crate::decode;
 use crate::decode_k;
 
-/// Both activation paths are legal for every ingestible format: `QAct::F32`
-/// dequantizes into registers and FMAs, `QAct::Q8Dp4a` packs the activations
-/// and dots against still-quantized weights. The cost model chooses.
-static BOTH_ACTIVATIONS: &[QAct] = &[QAct::F32, QAct::Q8Dp4a];
+/// A format's decode program. Not one `ScalarExpr`: Q6K's 210-byte
+/// non-word-aligned block with per-super-block group scales is not a
+/// per-element formula. Returns the one decoded element as a scalar f32.
+pub type BlockEmitFn = fn(&BlockDecodeArgs<'_>) -> Result<TileExpr>;
+
+/// Inputs a [`BlockEmitFn`] decodes from.
+///
+/// A decode yields exactly one element. Every consumer — both emitters' single
+/// quantized load and the cooperative staging fill — asks for one, and a
+/// contraction over a block-quantized operand reaches its elements through the
+/// staging fill's own lane arithmetic, never through a width carried in here.
+#[derive(Clone, Debug)]
+pub struct BlockDecodeArgs<'a> {
+    pub src: &'a StorageView,
+    pub layout: QLayout,
+    pub k_base: TileExpr,
+    pub col: TileExpr,
+    pub mask: TileExpr,
+    pub fill: TileExpr,
+}
+
+/// A decode program plus its identity. Equality and hashing are by `name`,
+/// never by function-pointer address (codegen units may merge functions).
+#[derive(Copy, Clone, Debug)]
+pub struct BlockProgram {
+    pub name: &'static str,
+    pub emit: BlockEmitFn,
+}
+
+impl PartialEq for BlockProgram {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+impl Eq for BlockProgram {}
+impl std::hash::Hash for BlockProgram {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+/// One row of the quantized format table. Formats are data.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BlockSpec {
+    pub fmt: QFmt,
+    pub elements: u16,
+    pub bytes: u16,
+    pub layout: QLayout,
+    pub decode: BlockProgram,
+}
 
 /// Every `(format, layout)` pair fusor2 can decode, in `QFmt::ALL` order with
 /// `Native` first in each pair. The twelve formats the reference names but
@@ -45,8 +93,6 @@ const fn row(fmt: QFmt, layout: QLayout, decode: BlockProgram) -> BlockSpec {
         bytes: fmt.block_bytes(layout) as u16,
         layout,
         decode,
-        native_f16_scales: matches!(layout, QLayout::Native),
-        activation: BOTH_ACTIVATIONS,
     }
 }
 
@@ -74,13 +120,6 @@ pub struct BlockFields {
     pub ql: u32,
     /// `true` iff `scale`/`min` are f16, which is exactly `layout == Native`.
     pub scale_is_f16: bool,
-}
-
-impl BlockFields {
-    /// Width of `scale` (and of `min`, when present) in bytes.
-    pub const fn scale_width(&self) -> u32 {
-        if self.scale_is_f16 { 2 } else { 4 }
-    }
 }
 
 /// Field offsets for one `(format, layout)`. Native is the raw GGUF block
@@ -161,18 +200,6 @@ pub const fn qh_width(fmt: QFmt) -> u32 {
         QFmt::Q6K => 64,
         _ => 0,
     }
-}
-
-/// Bytes a `rows x cols` matrix occupies in this format and layout.
-pub const fn matrix_storage_bytes(fmt: QFmt, layout: QLayout, rows: u64, cols: u64) -> u64 {
-    let elements = rows * cols;
-    let per_block = fmt.block_elements() as u64;
-    elements.div_ceil(per_block) * fmt.block_bytes(layout) as u64
-}
-
-/// Bytes one row of `cols` elements occupies in this format and layout.
-pub const fn row_bytes(fmt: QFmt, layout: QLayout, cols: u64) -> u64 {
-    matrix_storage_bytes(fmt, layout, 1, cols)
 }
 
 /// Whether a block's stride is a whole number of u32 words. This is the single
@@ -356,9 +383,6 @@ mod tests {
                 assert_eq!(spec.layout, layout);
                 assert_eq!(spec.bytes as u32, fmt.block_bytes(layout));
                 assert_eq!(spec.elements as u32, fmt.block_elements());
-                assert_eq!(spec.native_f16_scales, layout == QLayout::Native);
-                assert!(spec.activation.contains(&QAct::F32));
-                assert!(spec.activation.contains(&QAct::Q8Dp4a));
                 assert!(
                     names.insert(spec.decode.name),
                     "duplicate block program name {}",
@@ -372,13 +396,17 @@ mod tests {
 
     #[test]
     fn block_fields_land_inside_the_block() {
+        /// Width of `scale` (and of `min`, when present) in bytes.
+        const fn scale_width(f: &BlockFields) -> u32 {
+            if f.scale_is_f16 { 2 } else { 4 }
+        }
         for fmt in QFmt::ALL {
             for layout in [QLayout::Native, QLayout::F32Scales] {
                 let f = block_fields(fmt, layout);
                 let bytes = fmt.block_bytes(layout);
-                let mut spans: Vec<(u32, u32)> = vec![(f.scale, f.scale_width())];
+                let mut spans: Vec<(u32, u32)> = vec![(f.scale, scale_width(&f))];
                 if let Some(min) = f.min {
-                    spans.push((min, f.scale_width()));
+                    spans.push((min, scale_width(&f)));
                 }
                 if let Some((off, len)) = f.group_scales {
                     spans.push((off, len));
@@ -406,15 +434,6 @@ mod tests {
 
     #[test]
     fn storage_size_and_alignment_are_derived() {
-        assert_eq!(
-            matrix_storage_bytes(QFmt::Q4_0, QLayout::Native, 2, 64),
-            4 * 18
-        );
-        assert_eq!(
-            matrix_storage_bytes(QFmt::Q6K, QLayout::Native, 1, 512),
-            2 * 210
-        );
-        assert_eq!(row_bytes(QFmt::Q8_0, QLayout::F32Scales, 32), 36);
         assert!(!word_aligned(QFmt::Q6K, QLayout::Native));
         assert!(word_aligned(QFmt::Q6K, QLayout::F32Scales));
         assert!(!word_aligned(QFmt::Q4_0, QLayout::Native));

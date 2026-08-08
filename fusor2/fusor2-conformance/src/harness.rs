@@ -183,10 +183,6 @@ impl Cases {
         self.0.iter()
     }
 
-    pub fn into_vec(self) -> Vec<Case> {
-        self.0
-    }
-
     /// The names, in registration order. The acceptance bar is "every case in
     /// the named list is present", so this is asserted on directly.
     pub fn names(&self) -> Vec<&str> {
@@ -283,22 +279,6 @@ pub fn sessions() -> Vec<Session> {
         out.push(session);
     }
     out
-}
-
-/// Sessions whose device can run f16 compute.
-pub fn f16_sessions() -> Vec<Session> {
-    sessions()
-        .into_iter()
-        .filter(|s| s.device().target().caps().f16)
-        .collect()
-}
-
-/// Sessions whose device can run bf16 compute.
-pub fn bf16_sessions() -> Vec<Session> {
-    sessions()
-        .into_iter()
-        .filter(|s| s.device().target().caps().bf16)
-        .collect()
 }
 
 /// True when `session` runs on the GPU.
@@ -401,18 +381,6 @@ pub fn from_u32(graph: &GraphRef, shape: &[Dim], data: &[u32]) -> fusor2::Result
         bytes.extend_from_slice(&v.to_le_bytes());
     }
     Tensor::from_slice(graph, Dtype::U32, shape, &bytes)
-}
-
-/// A random f32 tensor with values in `[-0.5, 0.5)`.
-pub fn random_tensor(graph: &GraphRef, shape: &[Dim], seed: u32) -> fusor2::Result<Tensor> {
-    let data = fill(seed, dense_len(shape));
-    from_f32(graph, shape, &data)
-}
-
-/// `[0, 1, 2, ...]`.
-pub fn sequential_tensor(graph: &GraphRef, shape: &[Dim]) -> fusor2::Result<Tensor> {
-    let data: Vec<f32> = (0..dense_len(shape)).map(|i| i as f32).collect();
-    from_f32(graph, shape, &data)
 }
 
 // ---------------------------------------------------------------------------
@@ -593,23 +561,6 @@ impl Harness {
                     outcome: run_one(case, session),
                 });
             }
-        }
-        out
-    }
-
-    /// Every matching case on one backend.
-    pub fn run_backend(&self, device: Device) -> Vec<Report> {
-        let Ok(session) = Session::new(device) else {
-            return Vec::new();
-        };
-        let registry = crate::suite::registry();
-        let mut out = Vec::new();
-        for case in registry.iter().filter(|c| self.matches(&c.name)) {
-            out.push(Report {
-                case: case.name.clone(),
-                backend: backend_name(&session),
-                outcome: run_one(case, &session),
-            });
         }
         out
     }

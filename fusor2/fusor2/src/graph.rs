@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use fusor2_autograd::custom::{CustomRegistry, straight_through, with_backwards as register_custom};
+use fusor2_autograd::custom::{CustomRegistry, with_backwards as register_custom};
 use fusor2_autograd::tape::{GraphTape, splat_of};
 use fusor2_ir::autograd::{AdjointFn, Parent};
 use fusor2_ir::dtype::{Dtype, QFmt, QLayout};
@@ -126,16 +126,6 @@ impl GraphInner {
 
     pub fn mark_defn(&self, id: Id) {
         self.egraph.lock().mark_defn(id);
-    }
-
-    /// Mark `value` straight-through: forward opaque, adjoint the identity
-    /// into operand 0, which must be `x`. The `GraphRef`-level spelling of
-    /// [`Graph::straight_through`], so an op that builds its own opaque node
-    /// can declare it without a `Graph` handle.
-    pub fn register_straight_through(&self, value: Id, x: Id) -> Result<()> {
-        let mut reg = self.custom.lock();
-        straight_through(&mut reg, value, x)?;
-        Ok(())
     }
 
     /// The `GraphRef`-level spelling of [`Graph::with_backwards`].
@@ -292,6 +282,22 @@ impl GraphInner {
 
     pub fn leaf_bytes(&self, id: Id) -> Option<Vec<u8>> {
         self.leaves.lock().bytes.get(&id).cloned()
+    }
+
+    /// Run `f` over an external leaf's host bytes **without copying them**.
+    ///
+    /// [`Self::leaf_bytes`] clones the whole `Vec`. On the upload path that
+    /// clone is a fresh 16 MB allocation plus a 16 MB memcpy for a 2048^2 f32
+    /// leaf, per leaf, per resolve, for bytes that are read once, handed to
+    /// the staging belt and dropped. The reference copies an uploaded byte
+    /// exactly once (`fusor-ml` `eager_data.rs::new_from_slice`).
+    ///
+    /// `f` runs with the `leaves` mutex held, so it must not re-enter this
+    /// graph. The only caller uploads through the target's pool, which locks
+    /// nothing of the graph's.
+    pub(crate) fn with_leaf_bytes<T>(&self, id: Id, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
+        let store = self.leaves.lock();
+        store.bytes.get(&id).map(|b| f(b.as_slice()))
     }
 
     /// The device buffer backing `id`, once a resolve has produced one.
@@ -484,14 +490,6 @@ impl Graph {
     ) -> Result<Tensor> {
         let mut reg = self.inner.custom.lock();
         register_custom(&mut reg, value.id, parents, rule)?;
-        Ok(value.clone())
-    }
-
-    /// Mark `value` straight-through: forward opaque, adjoint the identity
-    /// into `x`. This is the whole of QAT fake-quant.
-    pub fn straight_through(&self, value: &Tensor, x: &Tensor) -> Result<Tensor> {
-        let mut reg = self.inner.custom.lock();
-        straight_through(&mut reg, value.id, x.id)?;
         Ok(value.clone())
     }
 

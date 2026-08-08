@@ -34,8 +34,10 @@ pub fn children_l0(op: &L0) -> Children {
 }
 
 /// Operand ids of an L1 node, taken from its `Operand` lists. `KContract`
-/// and `KQContract` are `[a.src, b.src]`; a region is its members and a
-/// merged wave is its segments.
+/// is its A-side operands followed by its B-side ones — one each in the
+/// two-buffer case that reads `[a.src, b.src]`, more once a multi-edge
+/// producer has been absorbed. A region is its members and a merged wave is
+/// its segments.
 pub fn children_l1(op: &L1) -> Children {
     match op {
         L1::KMap { ops, .. }
@@ -43,9 +45,12 @@ pub fn children_l1(op: &L1) -> Children {
         | L1::KGather { ops, .. }
         | L1::KScatter { ops, .. }
         | L1::Ext { ops, .. } => ops.iter().map(|o| o.src).collect(),
-        L1::KContract { a, b, .. } | L1::KQContract { a, b, .. } => {
-            Children::from_slice(&[a.src, b.src])
-        }
+        L1::KContract { a, b, .. } => a
+            .ops
+            .iter()
+            .chain(b.ops.iter())
+            .map(|o| o.src)
+            .collect(),
         L1::KRegion { members, .. } => members.iter().copied().collect(),
         L1::KMerged(m) => m.segments().iter().copied().collect(),
     }

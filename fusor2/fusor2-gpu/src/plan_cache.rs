@@ -80,8 +80,6 @@ pub struct PlanCache {
 pub struct CacheCounters {
     pub memory_hits: u64,
     pub disk_hits: u64,
-    pub misses: u64,
-    pub rejected_aliasing: u64,
 }
 
 impl PlanCache {
@@ -149,15 +147,6 @@ impl PlanCache {
             permutation,
             alias_class: alias_classes(caller_buffers),
         })
-    }
-
-    /// Note a miss, for the `pipeline_compiles == 0` acceptance check.
-    pub fn note_miss(&self) {
-        self.hits.lock().misses += 1;
-    }
-
-    pub fn note_alias_rejection(&self) {
-        self.hits.lock().rejected_aliasing += 1;
     }
 
     pub fn counters(&self) -> CacheCounters {

@@ -1,7 +1,5 @@
 //! Scalar dtypes, quantized block formats, numeric contracts, persistence.
 
-use crate::error::{Error, Result};
-use crate::ir::level2::TileExpr;
 use crate::scalar::Lit;
 
 /// Element type of an L0/L1 value. Two widenings past the reference's
@@ -110,10 +108,6 @@ impl QFmt {
             (Self::Q6K, QLayout::F32Scales) => 212,
         }
     }
-
-    pub const fn is_k_quant(self) -> bool {
-        self.block_elements() == 256
-    }
 }
 
 /// On-device byte layout of a quantized matrix. Both are legal inputs
@@ -123,129 +117,6 @@ impl QFmt {
 pub enum QLayout {
     Native,
     F32Scales,
-}
-
-/// How activations meet quantized weights inside a fused dot. Both coexist
-/// as extraction candidates; `Q8Dp4a` is provably not expressible as
-/// dequantize-then-dot.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum QAct {
-    F32,
-    Q8Dp4a,
-}
-
-/// A format's decode program. Not one `ScalarExpr`: Q6K's 210-byte
-/// non-word-aligned block with per-super-block group scales is not a
-/// per-element formula. Returns a `lanes`-wide f32 vector.
-pub type BlockEmitFn = fn(&BlockDecodeArgs<'_>) -> Result<TileExpr>;
-
-/// Inputs a [`BlockEmitFn`] decodes from.
-#[derive(Clone, Debug)]
-pub struct BlockDecodeArgs<'a> {
-    pub src: &'a crate::ir::level2::StorageView,
-    pub layout: QLayout,
-    pub k_base: TileExpr,
-    pub col: TileExpr,
-    pub mask: TileExpr,
-    pub fill: TileExpr,
-    pub lanes: u32,
-}
-
-/// A decode program plus its identity. Equality and hashing are by `name`,
-/// never by function-pointer address (codegen units may merge functions).
-#[derive(Copy, Clone, Debug)]
-pub struct BlockProgram {
-    pub name: &'static str,
-    pub emit: BlockEmitFn,
-}
-
-impl PartialEq for BlockProgram {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-    }
-}
-impl Eq for BlockProgram {}
-impl std::hash::Hash for BlockProgram {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
-    }
-}
-
-/// One row of the quantized format table. Formats are data.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct BlockSpec {
-    pub fmt: QFmt,
-    pub elements: u16,
-    pub bytes: u16,
-    pub layout: QLayout,
-    pub decode: BlockProgram,
-    pub native_f16_scales: bool,
-    pub activation: &'static [QAct],
-}
-
-/// GGUF wire format tags. Wider than [`QFmt`] because a file may name a
-/// format fusor2 does not ingest; [`Self::to_qfmt`] is the total gate.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-#[allow(non_camel_case_types)]
-#[repr(u32)]
-pub enum GgmlType {
-    F32 = 0,
-    F16 = 1,
-    Q4_0 = 2,
-    Q4_1 = 3,
-    Q5_0 = 6,
-    Q5_1 = 7,
-    Q8_0 = 8,
-    Q8_1 = 9,
-    Q2K = 10,
-    Q3K = 11,
-    Q4K = 12,
-    Q5K = 13,
-    Q6K = 14,
-    Q8K = 15,
-}
-
-impl GgmlType {
-    pub const fn to_dtype(self) -> Option<Dtype> {
-        match self {
-            Self::F32 => Some(Dtype::F32),
-            Self::F16 => Some(Dtype::F16),
-            Self::Q4_0 => Some(Dtype::Q(QFmt::Q4_0)),
-            Self::Q5_0 => Some(Dtype::Q(QFmt::Q5_0)),
-            Self::Q8_0 => Some(Dtype::Q(QFmt::Q8_0)),
-            Self::Q4K => Some(Dtype::Q(QFmt::Q4K)),
-            Self::Q5K => Some(Dtype::Q(QFmt::Q5K)),
-            Self::Q6K => Some(Dtype::Q(QFmt::Q6K)),
-            _ => None,
-        }
-    }
-
-    pub const fn to_qfmt(self) -> Option<QFmt> {
-        match self.to_dtype() {
-            Some(Dtype::Q(q)) => Some(q),
-            _ => None,
-        }
-    }
-
-    pub const fn from_u32(v: u32) -> Option<Self> {
-        Some(match v {
-            0 => Self::F32,
-            1 => Self::F16,
-            2 => Self::Q4_0,
-            3 => Self::Q4_1,
-            6 => Self::Q5_0,
-            7 => Self::Q5_1,
-            8 => Self::Q8_0,
-            9 => Self::Q8_1,
-            10 => Self::Q2K,
-            11 => Self::Q3K,
-            12 => Self::Q4K,
-            13 => Self::Q5K,
-            14 => Self::Q6K,
-            15 => Self::Q8K,
-            _ => return None,
-        })
-    }
 }
 
 /// Rounding mode carried on `ScalarKind::Round`. A real primitive, so the
@@ -276,7 +147,7 @@ pub struct NumericContract {
     /// contracting a `mul`+`add` into an FMA and widening an accumulator are
     /// all exact-to-rounding, while re-encoding an operand onto a coarser
     /// grid is not. Without it, `reassoc` was being read as licence for the
-    /// int8 activation path (`QAct::Q8Dp4a`), whose error is ~1.7% at Q8_0 —
+    /// int8 activation path, whose error is ~1.7% at Q8_0 —
     /// four orders of magnitude past anything a rounding permission can
     /// authorize, and independent of accumulation order.
     pub min_operand_bits: u8,
@@ -304,15 +175,17 @@ impl NumericContract {
     };
 
     /// [`Self::RELAXED`] plus permission to re-encode operands onto an 8-bit
-    /// grid: what licenses `QAct::Q8Dp4a`, the int8-activation dot.
+    /// grid: what would license an int8-activation dot.
     ///
     /// Weaker than `RELAXED` — `RELAXED.allows(RELAXED_OPERANDS)` — so it
     /// cannot be reached by [`Self::meet`] from values that do not already
     /// carry it. That is the point: quantizing the activations is an opt-in
     /// with a measurable accuracy cost, not something a fusion can decide.
-    /// **Nothing in the tree mints it yet**, so the int8 path is currently
-    /// offered nowhere; a frontend that wants it must put this contract on
-    /// the values that feed the dot.
+    /// **Nothing in the tree mints it**, so the int8 path is offered nowhere.
+    /// This is the licence kept for it: when an int8 dot returns it must
+    /// return as one mechanism — a `Dot4I8`-shaped `ScalarKind` over packed
+    /// operands inside an ordinary `KContract` — guarded by this contract,
+    /// never as a second contraction node with its own lowerings.
     pub const RELAXED_OPERANDS: Self = Self {
         min_operand_bits: 8,
         ..Self::RELAXED
@@ -344,16 +217,6 @@ impl NumericContract {
         }
     }
 
-    /// Reject a narrowing. Rules call this instead of writing the field.
-    pub fn require(self, needed: Self) -> Result<()> {
-        if self.allows(needed) {
-            Ok(())
-        } else {
-            Err(Error::Numeric(format!(
-                "contract {self:?} does not satisfy {needed:?}"
-            )))
-        }
-    }
 }
 
 /// How long a value lives. Lets a quantized repack amortize against a
@@ -465,7 +328,5 @@ mod tests {
             NumericContract::RELAXED.meet(NumericContract::STRICT),
             NumericContract::STRICT
         );
-        assert!(NumericContract::RELAXED.require(NumericContract::RELAXED).is_ok());
-        assert!(NumericContract::RELAXED.require(NumericContract::STRICT).is_err());
     }
 }

@@ -23,14 +23,14 @@
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::error::Error;
-use fusor2_ir::ir::level1::{FoldStrat, L1, Operand, SchedPoint};
+use fusor2_ir::ir::level1::{ContractSide, FoldStrat, L1, SchedPoint};
 use fusor2_ir::ir::level2::{
-    Accumulator, Addr, Builtin, ElementType, KernelIr, LocalDecl, QuantizedView, ScalarElement,
+    Accumulator, Addr, Builtin, ElementType, KernelIr, LocalDecl, ScalarElement,
     StorageView, Stmt, TileExpr, TileExprKind, WorkgroupAxis,
 };
 use fusor2_ir::ir::{Node, Op};
 use fusor2_ir::scalar::{BinOp, CmpOp, ScalarExpr};
-use fusor2_ir::shape::Dim;
+use fusor2_ir::shape::{Dim, Layout};
 use fusor2_ir::target::LowerCtx;
 use fusor2_ir::Result;
 use std::sync::Arc;
@@ -97,18 +97,6 @@ impl Tile {
         self
     }
 
-    /// The one-column-per-lane form the quantized body is written in: its
-    /// decode program addresses one weight row per lane, so a `tn`-wide
-    /// register tile has nowhere to go and what survives of the point is its
-    /// lane count.
-    fn columns_only(self) -> Self {
-        Self {
-            tm: 1,
-            tn: 1,
-            row_groups: 1,
-            col_groups: self.lanes(),
-        }
-    }
 }
 
 /// The tile a resolved schedule point names.
@@ -182,8 +170,6 @@ pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> 
             n,
             k,
             batch,
-            pre_a,
-            pre_b,
             post,
             a,
             b,
@@ -200,36 +186,7 @@ pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> 
             tile_of(theta, caps)?,
             a,
             b,
-            pre_a,
-            pre_b,
             post,
-        ),
-        L1::KQContract {
-            fmt,
-            layout,
-            act,
-            m,
-            n,
-            k,
-            post,
-            a,
-            b,
-            ..
-        } => build_quantized(
-            cx,
-            caps,
-            tile_of(theta, caps)?.columns_only(),
-            QDims {
-                fmt: *fmt,
-                layout: *layout,
-                act: *act,
-                m: *m,
-                n: *n,
-                k: *k,
-            },
-            post,
-            a,
-            b,
         ),
         _ => Err(Error::Legality("contract got a foreign node".into())),
     }
@@ -243,15 +200,129 @@ struct Dims {
 }
 
 #[allow(clippy::too_many_arguments)]
+
+/// The three strides this kernel indexes an operand with, collapsed out of the
+/// operand's own per-axis layout.
+///
+/// # Why this exists
+///
+/// `build` addressed A as `((batch*m + row)*k) + kk` and B as
+/// `((batch*k + kk)*n) + col` — dense `[batch, m, k]` and `[batch, k, n]`,
+/// hardcoded. That silently ignores `Operand::layout`, which is a *contract
+/// violation*: `L1::KContract` carries a full strided `Layout` per operand
+/// precisely so a contraction whose spec is not in kernel axis order can be
+/// read by permuting strides instead of by copying. `fusor2-tile`'s
+/// `permuted_alias` mints exactly that, and this kernel read it densely and
+/// computed wrong values — 22 CPU conformance rows, `matmul [cpu]` returning
+/// `0.4009152` for `0.9157541`.
+///
+/// # The collapse
+///
+/// The kernel's three loop indices are the *products* `batch`, `m`/`k` and
+/// `k`/`n`, while a layout has one axis per einsum label — `bhqd` is four axes
+/// collapsing to `batch=b*h, m=q, k=d`. Group boundaries are recovered from the
+/// extents alone (no labels needed here): walk the axes outermost-first and cut
+/// each group when its running extent product reaches that group's total.
+///
+/// A group collapses to a single stride only when its own axes are internally
+/// dense — `stride[i] == stride[i+1] * extent[i+1]` — and then the collapsed
+/// stride is the innermost axis's. `None` when they are not, which is a layout
+/// this three-stride kernel genuinely cannot address.
+///
+/// # Extent-1 axes are not part of the structure
+///
+/// An axis of extent 1 has one coordinate, always `0`, so it contributes `0` to
+/// every address whatever its stride: neither its stride nor its position among
+/// the other axes is observable. Walking it as if it were structure was wrong in
+/// both directions. A *trailing* unit axis was consumed by nobody — a group
+/// whose `want` is 1 enters with `prod == 1` and never advances the cursor — so
+/// the "every axis accounted for" test refused `[m, 1]` presented as
+/// `[batch=1, m, k=1]`, which is every `[n, 1]` column operand in
+/// `fusor2::sampling::row`. An *interior* unit axis was worse: it entered the
+/// density test as a real neighbour, and `stride[i] == stride[i+1] * 1` compares
+/// a stride nothing reads, which is how a broadcast KV head
+/// (`[2, 1, 4, 4]` at `[16, 16, 1, 4]`, GQA and MQA) was refused for a
+/// "gap" between two axes that address the same byte.
+///
+/// So the unit axes are dropped up front and the walk sees only observable
+/// structure. This is a widening: a layout accepted before is accepted with
+/// byte-identical strides, since a group's collapsed stride is its innermost
+/// axis's and unit axes can only have been interior padding in that group.
+fn collapsed_strides(layout: &Layout, groups: [u32; 3]) -> Option<[u32; 3]> {
+    let shape = layout.shape();
+    let strides = layout.strides();
+    if shape.len() != strides.len() {
+        return None;
+    }
+    let ext_all: Vec<u32> = shape.iter().map(|d| d.as_const().map(|v| v as u32)).collect::<Option<_>>()?;
+    let str_all: Vec<u32> = strides.iter().map(|d| d.as_const().map(|v| v as u32)).collect::<Option<_>>()?;
+
+    let (ext, str_): (Vec<u32>, Vec<u32>) = ext_all
+        .iter()
+        .zip(&str_all)
+        .filter(|(e, _)| **e != 1)
+        .map(|(e, s)| (*e, *s))
+        .unzip();
+
+    let mut out = [0u32; 3];
+    let mut axis = 0usize;
+    for (gi, want) in groups.iter().copied().enumerate() {
+        let want = want.max(1);
+        let start = axis;
+        let mut prod: u64 = 1;
+        while prod < u64::from(want) && axis < ext.len() {
+            prod = prod.saturating_mul(u64::from(ext[axis]));
+            axis += 1;
+        }
+        if prod != u64::from(want) {
+            return None;
+        }
+        if axis == start {
+            // A group of extent 1 spans no axis and never advances an index.
+            out[gi] = 0;
+            continue;
+        }
+        for i in start..axis - 1 {
+            if u64::from(str_[i]) != u64::from(str_[i + 1]) * u64::from(ext[i + 1]) {
+                return None;
+            }
+        }
+        out[gi] = str_[axis - 1];
+    }
+    (axis == ext.len()).then_some(out)
+}
+
+/// `base + a*sa + b*sb + c*sc`, dropping the zero-stride terms.
+fn strided_index(
+    x: (&TileExpr, u32),
+    y: (&TileExpr, u32),
+    z: (&TileExpr, u32),
+) -> TileExpr {
+    let mut acc: Option<TileExpr> = None;
+    for (e, s) in [x, y, z] {
+        if s == 0 {
+            continue;
+        }
+        let term = if s == 1 {
+            e.clone()
+        } else {
+            bin(BinOp::Mul, e.clone(), lit_u32(s), u32_ty())
+        };
+        acc = Some(match acc {
+            Some(a) => bin(BinOp::Add, a, term, u32_ty()),
+            None => term,
+        });
+    }
+    acc.unwrap_or_else(|| lit_u32(0))
+}
+
 fn build(
     cx: &LowerCtx<'_>,
     caps: &Caps,
     d: Dims,
     tile: Tile,
-    a: &Operand,
-    b: &Operand,
-    pre_a: &ScalarExpr,
-    pre_b: &ScalarExpr,
+    a: &ContractSide,
+    b: &ContractSide,
     post: &ScalarExpr,
 ) -> Result<KernelIr> {
     let m = konst(d.m, "m")?.max(1);
@@ -261,8 +332,6 @@ fn build(
 
     let binds = Binds::build(cx)?;
     let uniforms = binds.buffers.first().cloned();
-    let a_buf = binds.of(a.src)?;
-    let b_buf = binds.of(b.src)?;
     let out_buf = binds.of(cx.launch.root)?;
 
     let tile = tile.fit(
@@ -357,58 +426,128 @@ fn build(
     // — the register-tile shape, with zero accumulator spill. The emitter
     // memoizes identical expressions, so each operand element is read once
     // however many accumulators consume it.
+    // Address both operands through their own layouts. `permuted_alias` in
+    // `fusor2-tile` mints a non-contiguous `Alias` for any contraction whose
+    // spec is not already in kernel axis order, and reading that densely is a
+    // miscompile, not a slowdown. A contiguous layout collapses to exactly the
+    // dense strides this kernel used to hardcode, so every previously-working
+    // plan emits byte-identical text.
+    //
+    // A side is a list of operands, each with its own buffer and its own
+    // layout, all addressed by that side's `(batch, row, k)` or
+    // `(batch, k, col)` triple. One entry is the ordinary dense contraction;
+    // several is a side that absorbed a multi-buffer producer, and the only
+    // difference downstream is how many `Arg`s the side's `pre` reads.
+    // Each entry is either a bound buffer with its collapsed strides, or a
+    // `Const` leaf already folded to its literal — those have no binding.
+    let bind_side = |side: &ContractSide, groups: [u32; 3], which: &str| {
+        side.ops
+            .iter()
+            .map(|o| {
+                if let Some(lit) = crate::lower::const_operand(cx, o.src) {
+                    return Ok(Err(lit));
+                }
+                let strides = collapsed_strides(&o.layout, groups).ok_or_else(|| {
+                    Error::Plan(format!(
+                        "cpu contraction cannot address operand {which} at layout {:?}",
+                        o.layout
+                    ))
+                })?;
+                Ok(Ok((binds.of(o.src)?, strides)))
+            })
+            .collect::<Result<Vec<std::result::Result<_, TileExpr>>>>()
+    };
+    let a_binds = bind_side(a, [batch, m, k], "a")?;
+    let b_binds = bind_side(b, [batch, k, n], "b")?;
+
+    // The per-axis coordinates a side's `pre` may read (an absorbed causal
+    // mask does), reconstructed from the three collapsed group indices the
+    // kernel actually loops over. Each operand axis belongs to exactly one
+    // group — the same factorization `collapsed_strides` proved — so its
+    // coordinate is a divmod of that group's flat index.
+    let side_coords = |side: &ContractSide,
+                       groups: [u32; 3],
+                       flats: [&TileExpr; 3]|
+     -> Option<Vec<TileExpr>> {
+        if !side.pre.reads_index_of() {
+            return Some(Vec::new());
+        }
+        let shape = side.primary().layout.shape();
+        let exts: Vec<u32> = shape
+            .iter()
+            .map(|d| d.as_const().map(|v| v as u32))
+            .collect::<Option<_>>()?;
+        let mut coords = vec![lit_u32(0); exts.len()];
+        let mut axis = 0usize;
+        for (gi, want) in groups.iter().copied().enumerate() {
+            let want = want.max(1);
+            let start = axis;
+            let mut prod: u64 = 1;
+            while prod < u64::from(want) && axis < exts.len() {
+                // Unit axes carry no structure; fold them into whichever
+                // group the walk is in, coordinate zero.
+                prod = prod.saturating_mul(u64::from(exts[axis].max(1)));
+                axis += 1;
+            }
+            if prod != u64::from(want) {
+                return None;
+            }
+            let mut rest = flats[gi].clone();
+            for i in (start..axis).rev() {
+                let e = lit_u32(exts[i].max(1));
+                coords[i] = bin(BinOp::Rem, rest.clone(), e.clone(), u32_ty());
+                rest = bin(BinOp::Div, rest, e, u32_ty());
+            }
+        }
+        Some(coords)
+    };
+
     let mut b_vals = Vec::with_capacity(tn as usize);
     for j in 0..tn as usize {
-        let b_index = bin(
-            BinOp::Add,
-            bin(
-                BinOp::Mul,
-                bin(
-                    BinOp::Add,
-                    bin(BinOp::Mul, bidx.clone(), lit_u32(k), u32_ty()),
-                    k_idx.clone(),
-                    u32_ty(),
-                ),
-                lit_u32(n),
-                u32_ty(),
-            ),
-            cols[j].clone(),
-            u32_ty(),
-        );
+        let args: Vec<TileExpr> = b_binds
+            .iter()
+            .map(|entry| match entry {
+                Err(lit) => lit.clone(),
+                Ok((buf, str_)) => {
+                    let index =
+                        strided_index((&bidx, str_[0]), (&k_idx, str_[1]), (&cols[j], str_[2]));
+                    load(Arc::clone(buf), index, col_oks[j].clone())
+                }
+            })
+            .collect();
+        let coords = side_coords(b, [batch, k, n], [&bidx, &k_idx, &cols[j]])
+            .ok_or_else(|| Error::Plan("cpu contraction cannot state side coordinates".into()))?;
         b_vals.push(
             Translate {
-                args: &[load(Arc::clone(&b_buf), b_index, col_oks[j].clone())],
-                coords: &[],
+                args: &args,
+                coords: &coords,
                 uniforms: uniforms.clone(),
             }
-            .run(pre_b)?,
+            .run(&b.pre)?,
         );
     }
 
     let mut updates = Vec::with_capacity(accs.len());
     for i in 0..tm as usize {
-        let a_index = bin(
-            BinOp::Add,
-            bin(
-                BinOp::Mul,
-                bin(
-                    BinOp::Add,
-                    bin(BinOp::Mul, bidx.clone(), lit_u32(m), u32_ty()),
-                    rows[i].clone(),
-                    u32_ty(),
-                ),
-                lit_u32(k),
-                u32_ty(),
-            ),
-            k_idx.clone(),
-            u32_ty(),
-        );
+        let args: Vec<TileExpr> = a_binds
+            .iter()
+            .map(|entry| match entry {
+                Err(lit) => lit.clone(),
+                Ok((buf, str_)) => {
+                    let index =
+                        strided_index((&bidx, str_[0]), (&rows[i], str_[1]), (&k_idx, str_[2]));
+                    load(Arc::clone(buf), index, row_oks[i].clone())
+                }
+            })
+            .collect();
+        let coords = side_coords(a, [batch, m, k], [&bidx, &rows[i], &k_idx])
+            .ok_or_else(|| Error::Plan("cpu contraction cannot state side coordinates".into()))?;
         let a_val = Translate {
-            args: &[load(Arc::clone(&a_buf), a_index, row_oks[i].clone())],
-            coords: &[],
+            args: &args,
+            coords: &coords,
             uniforms: uniforms.clone(),
         }
-        .run(pre_a)?;
+        .run(&a.pre)?;
         for (j, b_val) in b_vals.iter().enumerate() {
             let slot = i * tn as usize + j;
             let prev = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&accs[slot])), f32_ty);
@@ -486,220 +625,6 @@ fn build(
     })
 }
 
-struct QDims {
-    fmt: fusor2_ir::dtype::QFmt,
-    layout: fusor2_ir::dtype::QLayout,
-    act: fusor2_ir::dtype::QAct,
-    m: Dim,
-    n: Dim,
-    k: Dim,
-}
-
-/// `KQContract`: `out[row, col] = sum_k act[row, k] * W[col, k]`, with `W`
-/// still block-quantized and decoded inside the k nest.
-///
-/// One lane per output column, one workgroup per `(output row, column block)`,
-/// and a loop over the weight's blocks. The two activation packings differ
-/// only in the node the k-loop body builds — `Dequantize` + `LaneOf` +
-/// `mul_add` for [`QAct::F32`], one `QuantizedDot` for [`QAct::Q8Dp4a`] — and
-/// both are expanded into ordinary `TileExpr`s by `emit::quantized`, so there
-/// is no per-format code here either.
-///
-/// **No cross-lane reduction.** Each lane loops over every block of its own
-/// row, so its accumulator is already the whole dot product.
-///
-/// The lane count is the schedule point's, and the column block is a grid
-/// axis: this body had the same written-in 64 the dense one did, and with one
-/// workgroup per output row it could not reach a weight matrix with more than
-/// 64 rows at all.
-#[allow(clippy::too_many_arguments)]
-fn build_quantized(
-    cx: &LowerCtx<'_>,
-    caps: &Caps,
-    tile: Tile,
-    d: QDims,
-    post: &ScalarExpr,
-    a: &Operand,
-    b: &Operand,
-) -> Result<KernelIr> {
-    let m = konst(d.m, "m")?.max(1);
-    let n = konst(d.n, "n")?.max(1);
-    let k = konst(d.k, "k")?.max(1);
-    let (fmt, layout, act) = (d.fmt, d.layout, d.act);
-
-    let spec = fusor2_gguf::block_spec(fmt, layout);
-    if !spec.activation.contains(&act) {
-        return Err(Error::Legality(format!(
-            "{fmt:?}/{layout:?} does not support activation packing {act:?}"
-        )));
-    }
-    let block_elems = u32::from(spec.elements).max(1);
-    let blocks_per_row = k.div_ceil(block_elems).max(1);
-
-    let binds = Binds::build(cx)?;
-    let uniforms = binds.buffers.first().cloned();
-    let a_buf = binds.of(a.src)?;
-    let w_buf = binds.of(b.src)?;
-    let out_buf = binds.of(cx.launch.root)?;
-
-    let weights = QuantizedView {
-        data: StorageView {
-            buffer: Arc::clone(&w_buf),
-            offset: 0,
-            layout: w_buf.layout.clone(),
-        },
-        fmt,
-        layout,
-        rows: n,
-        cols: k,
-    };
-
-    // One row per workgroup, `block` columns of it per workgroup, every column
-    // reached by `ceil(n / block)` blocks of the grid.
-    let block = tile
-        .fit(1, n, caps.limits.max_compute_invocations_per_workgroup)
-        .cols();
-    let n_blocks = n.div_ceil(block).max(1);
-    let f32_ty = ElementType::Scalar(ScalarElement::F32);
-    let bool_ty = ElementType::Scalar(ScalarElement::Bool);
-
-    let pid = TileExpr::new(
-        TileExprKind::Builtin(Builtin::ProgramId(WorkgroupAxis::X)),
-        u32_ty(),
-    );
-    let lane = TileExpr::new(TileExprKind::Builtin(Builtin::Lane), u32_ty());
-    let row = bin(BinOp::Div, pid.clone(), lit_u32(n_blocks), u32_ty());
-    let col = bin(
-        BinOp::Add,
-        bin(
-            BinOp::Mul,
-            bin(BinOp::Rem, pid, lit_u32(n_blocks), u32_ty()),
-            lit_u32(block),
-            u32_ty(),
-        ),
-        lane,
-        u32_ty(),
-    );
-    let live = cmp(CmpOp::Lt, col.clone(), lit_u32(n));
-
-    let blk = Arc::new(LocalDecl::new(u32_ty()));
-    let blk_read = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&blk)), u32_ty());
-    let k_base = bin(BinOp::Mul, blk_read, lit_u32(block_elems), u32_ty());
-
-    // The activation elements of this block, read once and shared by the
-    // column this lane owns.
-    let mut activations = Vec::with_capacity(block_elems as usize);
-    for e in 0..block_elems {
-        let kk = bin(BinOp::Add, k_base.clone(), lit_u32(e), u32_ty());
-        let in_k = cmp(CmpOp::Lt, kk.clone(), lit_u32(k));
-        let index = bin(
-            BinOp::Add,
-            bin(BinOp::Mul, row.clone(), lit_u32(k), u32_ty()),
-            kk,
-            u32_ty(),
-        );
-        activations.push(load(Arc::clone(&a_buf), index, in_k));
-    }
-
-    // The decode program's flat element index is `k_base + col + lane`
-    // (`fusor2-gguf/src/decode.rs`, "Addressing convention"): the *caller*
-    // folds the row stride into `col`. The bare weight-row index would read `k`
-    // elements into row 0 instead of the start of row `col`.
-    let row_start = bin(BinOp::Mul, col.clone(), lit_u32(k), u32_ty());
-
-    let acc = Arc::new(LocalDecl::new(f32_ty));
-    let prev = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&acc)), f32_ty);
-    let fill = lit_f32(0.0);
-    let contribution = match act {
-        fusor2_ir::dtype::QAct::F32 => {
-            let decoded = TileExpr::new(
-                TileExprKind::Dequantize {
-                    src: weights.clone(),
-                    k_base: k_base.clone(),
-                    col: row_start.clone(),
-                    mask: live.clone(),
-                    fill: fill.clone(),
-                    lanes: block_elems,
-                },
-                f32_ty,
-            );
-            let mut sum = lit_f32(0.0);
-            for (e, a_v) in activations.iter().enumerate() {
-                let w = TileExpr::new(
-                    TileExprKind::LaneOf {
-                        block: decoded.clone(),
-                        lane: e as u32,
-                    },
-                    f32_ty,
-                );
-                sum = bin(
-                    BinOp::Add,
-                    sum,
-                    bin(BinOp::Mul, a_v.clone(), w, f32_ty),
-                    f32_ty,
-                );
-            }
-            sum
-        }
-        packing => TileExpr::new(
-            TileExprKind::QuantizedDot {
-                src: weights.clone(),
-                packing,
-                activations,
-                k_base: k_base.clone(),
-                col: row_start.clone(),
-                mask: live.clone(),
-                fill: fill.clone(),
-            },
-            f32_ty,
-        ),
-    };
-
-    let mut body = vec![Stmt::Loop {
-        count: Some(lit_u32(blocks_per_row)),
-        index: Some(blk),
-        accumulators: vec![Accumulator {
-            local: Arc::clone(&acc),
-            init: lit_f32(0.0),
-            update: bin(BinOp::Add, prev, contribution, f32_ty),
-        }],
-        body: vec![],
-    }];
-
-    let total = TileExpr::new(TileExprKind::LoadLocal(acc), f32_ty);
-    let value = Translate {
-        args: &[total],
-        coords: &[],
-        uniforms,
-    }
-    .run(post)?;
-    let index = bin(
-        BinOp::Add,
-        bin(BinOp::Mul, row.clone(), lit_u32(n), u32_ty()),
-        col,
-        u32_ty(),
-    );
-    let row_ok = cmp(CmpOp::Lt, row, lit_u32(m));
-    body.push(Stmt::Store {
-        dst: StorageView {
-            buffer: Arc::clone(&out_buf),
-            offset: 0,
-            layout: out_buf.layout.clone(),
-        },
-        addr: Addr::Linear(index),
-        value,
-        mask: bin(BinOp::LogicalAnd, row_ok, live, bool_ty),
-    });
-
-    Ok(KernelIr {
-        buffers: binds.buffers,
-        grid: [m.saturating_mul(n_blocks).max(1), 1, 1],
-        block,
-        body,
-        byte_arena: None,
-        name: "cpu_qcontract",
-    })
-}
 
 fn konst(d: Dim, what: &str) -> Result<u32> {
     d.as_const().map(|v| v as u32).ok_or_else(|| {
@@ -713,6 +638,55 @@ fn konst(d: Dim, what: &str) -> Result<u32> {
 mod tests {
     use super::*;
     use fusor2_ir::ir::level1::{SgemmParams, SgemvParams};
+
+    /// An extent-1 axis is not structure. A *trailing* one belongs to no group
+    /// (`ones([16, 1])` as the A operand of a `k = 1` contraction is
+    /// `[batch=1, m=16, k=1]`, the shape of every `[n, 1]` column operand in
+    /// `fusor2::sampling::row`), and an *interior* one sits between two axes
+    /// that address the same byte, so it may not be asked to bridge them.
+    #[test]
+    fn extent_one_axes_are_not_part_of_the_addressable_structure() {
+        let col = Layout::contiguous(&[Dim::Const(16), Dim::Const(1)]);
+        assert_eq!(collapsed_strides(&col, [1, 16, 1]), Some([0, 1, 0]));
+        let scalar = Layout::contiguous(&[Dim::Const(1), Dim::Const(1)]);
+        assert_eq!(collapsed_strides(&scalar, [1, 1, 1]), Some([0, 0, 0]));
+        let row = Layout::contiguous(&[Dim::Const(1), Dim::Const(16)]);
+        assert_eq!(collapsed_strides(&row, [1, 1, 16]), Some([0, 0, 1]));
+
+        // A broadcast KV head between the batch axis and a transposed
+        // `[d, s]`: `k` is `(h=1, d=4)` at stride 1, `n` is `s=4` at stride 4.
+        // The unit axis's stride of 16 describes nothing and must not be
+        // compared against `d`'s.
+        let gqa = Layout::from_parts(
+            Dim::Const(0),
+            &[Dim::Const(2), Dim::Const(1), Dim::Const(4), Dim::Const(4)],
+            &[Dim::Const(16), Dim::Const(16), Dim::Const(1), Dim::Const(4)],
+        )
+        .unwrap();
+        assert_eq!(collapsed_strides(&gqa, [2, 4, 4]), Some([16, 1, 4]));
+    }
+
+    /// The widening is exactly the unit axes: a genuine gap between two axes
+    /// that address different bytes is still refused, and every layout that
+    /// collapsed before collapses to the same three strides.
+    #[test]
+    fn a_genuinely_unaddressable_split_is_still_refused() {
+        // `[4, 4]` rows 8 apart cannot be one `m = 16` stride.
+        let gapped = Layout::from_parts(
+            Dim::Const(0),
+            &[Dim::Const(4), Dim::Const(4)],
+            &[Dim::Const(8), Dim::Const(1)],
+        )
+        .unwrap();
+        assert_eq!(collapsed_strides(&gapped, [1, 16, 1]), None);
+        // Extents that do not cover the geometry are refused, not padded.
+        let small = Layout::contiguous(&[Dim::Const(4), Dim::Const(4)]);
+        assert_eq!(collapsed_strides(&small, [1, 8, 4]), None);
+        // Unchanged: the dense cases this kernel used to hardcode.
+        let dense_a = Layout::contiguous(&[Dim::Const(3), Dim::Const(8), Dim::Const(5)]);
+        assert_eq!(collapsed_strides(&dense_a, [3, 8, 5]), Some([40, 5, 1]));
+        assert_eq!(collapsed_strides(&dense_a, [24, 5, 1]), Some([5, 1, 0]));
+    }
 
     #[test]
     fn a_symbolic_extent_is_refused_rather_than_guessed() {
@@ -807,7 +781,9 @@ mod exec_tests {
     use fusor2_ir::egraph::{EGraph, Id};
     use fusor2_ir::extract::{BindKind, BindingPlan, Extraction, Launch, Plan, PlanHash};
     use fusor2_ir::ir::level0::{BufferId, L0, LeafKind};
-    use fusor2_ir::ir::level1::{AccessPlan, Family, ScheduleDomain, SgemmParams, SgemvParams};
+    use fusor2_ir::ir::level1::{
+        AccessPlan, ContractSide, Family, Operand, ScheduleDomain, SgemmParams, SgemvParams,
+    };
     use fusor2_ir::ir::{Level, Node};
     use fusor2_ir::semantics::{CoreSemantics, SumArenaPlanner};
     use fusor2_ir::shape::Layout;
@@ -929,12 +905,10 @@ mod exec_tests {
             k: Dim::Const(u64::from(k)),
             batch: Dim::Const(u64::from(batch)),
             family: Family::Sgemm,
-            pre_a: ScalarExpr::arg(0, Dtype::F32),
-            pre_b: ScalarExpr::arg(0, Dtype::F32),
             post: ScalarExpr::arg(0, Dtype::F32),
             acc: Dtype::F32,
-            a: alias(&g, a_id),
-            b: alias(&g, b_id),
+            a: ContractSide::one(ScalarExpr::arg(0, Dtype::F32), alias(&g, a_id)),
+            b: ContractSide::one(ScalarExpr::arg(0, Dtype::F32), alias(&g, b_id)),
             // A real domain rather than `Point`, so nothing in this file
             // reads as a schedule-less mint even in a test.
             sched: sgemm_domain_of(theta),
@@ -1066,202 +1040,6 @@ mod exec_tests {
         }
     }
 
-    // -- KQContract ---------------------------------------------------------
-
-    /// One Q8_0 block per weight row, filled from a cheap LCG with an explicit
-    /// finite scale, plus the rows it decodes to.
-    fn q8_weights(n: u32, k: u32) -> (Vec<u8>, Vec<f32>) {
-        let fmt = fusor2_ir::dtype::QFmt::Q8_0;
-        let layout = fusor2_ir::dtype::QLayout::Native;
-        let block_bytes = fmt.block_bytes(layout) as usize;
-        let elems = fmt.block_elements() as usize;
-        assert_eq!(k as usize, elems, "one block per weight row keeps the rows aligned");
-        let mut bytes = Vec::with_capacity(n as usize * block_bytes);
-        let mut decoded = vec![0.0f32; (n * k) as usize];
-        for r in 0..n as usize {
-            let mut block = vec![0u8; block_bytes];
-            let mut state = (7919u32 + r as u32).wrapping_mul(2_654_435_761);
-            for slot in block.iter_mut() {
-                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                *slot = (state >> 24) as u8;
-            }
-            // An explicit finite scale: a random f16 is NaN about 1 time in 2000.
-            block[0..2].copy_from_slice(&half::f16::from_f32(0.015_625).to_le_bytes());
-            fusor2_gguf::blocks::cpu_dequantize_block(
-                fmt,
-                layout,
-                &block,
-                &mut decoded[r * k as usize..(r + 1) * k as usize],
-            );
-            bytes.extend_from_slice(&block);
-        }
-        (bytes, decoded)
-    }
-
-    fn upload_bytes(target: &CpuTarget, data: &[u8]) -> Buf {
-        let buf = target
-            .alloc(data.len().max(4) as u64, Persistence::Step)
-            .unwrap();
-        let raw = buf.downcast_ref::<AlignedBuf>().unwrap();
-        // SAFETY: nothing else holds this buffer yet; the pool handed it back
-        // because its refcount was one.
-        let slice = unsafe { std::slice::from_raw_parts_mut(raw.as_mut_ptr(), raw.len()) };
-        slice.fill(0);
-        slice[..data.len()].copy_from_slice(data);
-        buf
-    }
-
-    /// `out[row, col] = sum_k act[row, k] * W[col, k]` with `W` block-decoded.
-    ///
-    /// **`n` here is the weight's row count**, and nothing in the conformance
-    /// suite gives a CPU quantized contraction more than 32 of them, so this
-    /// is the only place the column-block grid of the quantized body is
-    /// exercised at all.
-    fn run_qcontract(theta: SchedPoint, act: fusor2_ir::dtype::QAct, m: u32, n: u32, k: u32) {
-        let fmt = fusor2_ir::dtype::QFmt::Q8_0;
-        let layout = fusor2_ir::dtype::QLayout::Native;
-        let (bytes, weights) = q8_weights(n, k);
-        let a = sample(m * k + 3, (m * k) as usize);
-
-        let mut g = graph();
-        let a_id = buffer(&mut g, &[u64::from(m), u64::from(k)]);
-        let next = g.len() as u32;
-        let w_id = g
-            .add(Op::L0(L0::Leaf(LeafKind::Quantized {
-                name: BufferId(next),
-                fmt,
-                layout,
-                shape: smallvec::smallvec![Dim::Const(u64::from(n)), Dim::Const(u64::from(k))],
-            })))
-            .unwrap();
-        let out_id = buffer(&mut g, &[u64::from(m), u64::from(n)]);
-
-        let node = Node {
-            op: Op::L1(L1::KQContract {
-                fmt,
-                layout,
-                act,
-                m: Dim::Const(u64::from(m)),
-                n: Dim::Const(u64::from(n)),
-                k: Dim::Const(u64::from(k)),
-                acc: Dtype::F32,
-                post: ScalarExpr::arg(0, Dtype::F32),
-                a: alias(&g, a_id),
-                b: alias(&g, w_id),
-                sched: sgemm_domain_of(theta),
-            }),
-            level: Level::L1,
-            children: smallvec::smallvec![a_id, w_id],
-        };
-        let plan = Plan {
-            extraction: Extraction::default(),
-            launches: vec![Launch {
-                root: out_id,
-                members: smallvec::smallvec![out_id],
-                bindings: vec![
-                    BindingPlan { binding: 1, value: a_id, kind: BindKind::Read },
-                    BindingPlan { binding: 2, value: w_id, kind: BindKind::Read },
-                    BindingPlan { binding: 3, value: out_id, kind: BindKind::Write },
-                ],
-                grid: [1, 1, 1],
-                block: 1,
-            }],
-            buffers: Vec::new(),
-            symbols: Vec::new(),
-            hash: PlanHash(0),
-            cost: fusor2_ir::cost::Picoseconds(0),
-        };
-        let cx = LowerCtx {
-            plan: &plan,
-            launch: &plan.launches[0],
-            graph: &g,
-            symbols: &[],
-        };
-        let caps = Caps::clone(crate::caps::cpu_caps());
-        let ir = lower(&caps, &node, theta, &cx).unwrap();
-
-        let target = CpuTarget::new().unwrap();
-        let a_buf = upload(&target, &a);
-        let w_buf = upload_bytes(&target, &bytes);
-        let out = upload(&target, &vec![0.0; (m * n) as usize]);
-        let artifact = target.emit(&ir).unwrap();
-        target
-            .launch(
-                &artifact,
-                ir.grid,
-                &[a_buf, w_buf, out.clone()],
-                &Default::default(),
-            )
-            .unwrap();
-        let got = download(&out, (m * n) as usize);
-
-        // `QAct::Q8Dp4a` rounds the activations through an int8 grid with a
-        // per-block scale of `max|a| / 127` before accumulating
-        // (`emit::quantized`), so each element carries up to half a step of
-        // error and the dot carries `sum|w| * max|a| / 254` of it. That is the
-        // packing's own arithmetic, not slack: the coverage claim this case
-        // exists for — a column the grid never reaches comes back 0.0 — is off
-        // by the whole dot product, an order of magnitude above the bound.
-        let amax = a
-            .iter()
-            .fold(0.0f64, |acc, v| acc.max(f64::from(v.abs())));
-        let mut informative = 0usize;
-        for row in 0..m as usize {
-            for col in 0..n as usize {
-                let w = &weights[col * k as usize..(col + 1) * k as usize];
-                let want: f64 = (0..k as usize)
-                    .map(|t| a[row * k as usize + t] as f64 * w[t] as f64)
-                    .sum();
-                let mut tol = 2e-3 * want.abs().max(1.0);
-                if matches!(act, fusor2_ir::dtype::QAct::Q8Dp4a) {
-                    let sum_w: f64 = w.iter().map(|v| f64::from(v.abs())).sum();
-                    tol += sum_w * amax / 254.0;
-                }
-                let g = got[row * n as usize + col];
-                assert!(
-                    (g as f64 - want).abs() <= tol,
-                    "{theta:?}/{act:?} at [{m},{n},{k}] row {row} col {col}: \
-                     got {g}, want {want} (tolerance {tol})"
-                );
-                informative += usize::from(want.abs() > 4.0 * tol);
-            }
-        }
-        // An output an unreached column could match by accident proves
-        // nothing: most entries have to sit well outside the tolerance.
-        assert!(
-            informative * 2 >= (m * n) as usize,
-            "only {informative} of {} entries are far enough from zero to \
-             witness coverage",
-            m * n
-        );
-    }
-
-    /// The quantized body had the same written-in 64 and one workgroup per
-    /// output row, so a weight matrix with more than 64 rows was unreachable.
-    #[test]
-    fn the_quantized_body_reaches_every_weight_row() {
-        for act in [fusor2_ir::dtype::QAct::F32, fusor2_ir::dtype::QAct::Q8Dp4a] {
-            for theta in [
-                SchedPoint::Fold(FoldStrat::Subgroup),
-                SchedPoint::Fold(FoldStrat::WgTree { lane_group: 256 }),
-                SchedPoint::Sgemv(SgemvParams { chunk: 2, vector: 4, subgroups: 1 }),
-                SchedPoint::Sgemm(SgemmParams {
-                    double_buffer: false,
-                    bm: 16,
-                    bn: 32,
-                    bk: 8,
-                    tm: 2,
-                    tn: 2,
-                }),
-            ] {
-                for n in [3u32, 64, 96, 130] {
-                    run_qcontract(theta, act, 2, n, 32);
-                }
-            }
-        }
-    }
-
-    /// Batches are not aliased: the m-block and n-block decomposition has to
     /// leave the batch index recoverable.
     #[test]
     fn batched_contractions_stay_separate() {

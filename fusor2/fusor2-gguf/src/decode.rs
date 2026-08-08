@@ -7,13 +7,13 @@
 //! ## Addressing convention
 //!
 //! `BlockDecodeArgs` carries no row extent, so the flat element index a
-//! program decodes is `k_base + col + lane`: the caller folds the row stride
+//! program decodes is `k_base + col`: the caller folds the row stride
 //! into `col` (typically `row_index * elements_per_row`) exactly as the
 //! reference's `quantized_flat_block_base_and_q` does, and `k_base` is the
-//! element offset inside that row. Block base and intra-block index are then
-//! recomputed **per lane**, so a decode that straddles a block boundary is
-//! still correct; when `lanes` divides the block, constant folding in the
-//! emitter collapses the arithmetic.
+//! element offset inside that row. Block base and intra-block index are
+//! recomputed from that flat index alone, so an element anywhere in the row —
+//! including one whose block differs from its neighbour's — decodes correctly
+//! with no notion of a decode width.
 //!
 //! `src` is a plain `u32` storage view. Native blocks are not word-aligned
 //! (18, 22, 34 and 210 bytes), so every field read goes through
@@ -23,13 +23,13 @@
 //! Owned by W11.
 
 use fusor2_ir::Result;
-use fusor2_ir::dtype::{BlockDecodeArgs, BlockProgram, NumericContract, QFmt, QLayout};
+use fusor2_ir::dtype::{NumericContract, QFmt, QLayout};
 use fusor2_ir::ir::level2::{
     Addr, ElementType, ScalarElement, Source, TileBinaryOp, TileCompareOp, TileExpr, TileExprKind,
     TileLiteral, TileUnaryOp,
 };
 
-use crate::blocks::{BlockFields, block_fields};
+use crate::blocks::{BlockDecodeArgs, BlockFields, BlockProgram, block_fields};
 
 // ---------------------------------------------------------------------------
 // Expression builders
@@ -142,17 +142,13 @@ pub(crate) fn signed_byte_f32(byte: TileExpr) -> TileExpr {
 // Block addressing
 // ---------------------------------------------------------------------------
 
-/// Byte base of the block holding lane `lane`, and that lane's index inside
-/// the block.
-pub(crate) fn block_base_and_q(
-    args: &BlockDecodeArgs<'_>,
-    fmt: QFmt,
-    lane: u32,
-) -> (TileExpr, TileExpr) {
+/// Byte base of the block holding the addressed element, and that element's
+/// index inside the block.
+pub(crate) fn block_base_and_q(args: &BlockDecodeArgs<'_>, fmt: QFmt) -> (TileExpr, TileExpr) {
     let elements = fmt.block_elements();
     debug_assert!(elements.is_power_of_two());
     let bytes = fmt.block_bytes(args.layout);
-    let flat = add_lit(add(args.k_base.clone(), args.col.clone()), lane);
+    let flat = add(args.k_base.clone(), args.col.clone());
     let block = shr_lit(flat.clone(), elements.trailing_zeros());
     let base = mul_lit(block, bytes);
     let q = and_lit(flat, elements - 1);
@@ -242,51 +238,19 @@ pub(crate) fn load_scale_f32(
     sel(cmp(TileCompareOp::Ne, half, u32_lit(0)), high, low)
 }
 
-/// Assemble the `lanes`-wide result, applying `mask`/`fill` uniformly.
-pub(crate) fn finish(args: &BlockDecodeArgs<'_>, parts: Vec<TileExpr>) -> TileExpr {
-    let lanes = args.lanes;
-    debug_assert_eq!(parts.len(), lanes as usize);
-    // A one-lane vector is not a type — WGSL has vec2/vec3/vec4 only — so a
-    // single-element decode is the scalar itself.
-    if lanes == 1 {
-        let value = parts.into_iter().next().unwrap_or_else(|| f32_lit(0.0));
-        if args.mask.is_constant_true() {
-            return value;
-        }
-        let fill = if args.fill.element() == F32 {
-            args.fill.clone()
-        } else {
-            f32_lit(0.0)
-        };
-        return sel(args.mask.clone(), value, fill);
-    }
-    let vector_ty = ElementType::Vector {
-        scalar: ScalarElement::F32,
-        lanes,
-    };
-    let value = TileExpr::new(
-        TileExprKind::Vec {
-            scalar: ScalarElement::F32,
-            lanes,
-            parts,
-        },
-        vector_ty,
-    );
-    let fill = if args.fill.element() == vector_ty {
-        args.fill.clone()
-    } else {
-        TileExpr::new(
-            TileExprKind::Vec {
-                scalar: ScalarElement::F32,
-                lanes,
-                parts: vec![args.fill.clone(); lanes as usize],
-            },
-            vector_ty,
-        )
-    };
+/// Apply the load's `mask`/`fill` to the decoded element.
+///
+/// The result is the scalar itself, never a one-lane vector — which is not a
+/// type, WGSL having vec2/vec3/vec4 only.
+pub(crate) fn finish(args: &BlockDecodeArgs<'_>, value: TileExpr) -> TileExpr {
     if args.mask.is_constant_true() {
         return value;
     }
+    let fill = if args.fill.element() == F32 {
+        args.fill.clone()
+    } else {
+        f32_lit(0.0)
+    };
     sel(args.mask.clone(), value, fill)
 }
 
@@ -361,26 +325,22 @@ fn decode_affine(
 ) -> Result<TileExpr> {
     expect_layout(args, want, name)?;
     let fields = block_fields(fmt, want);
-    let mut parts = Vec::with_capacity(args.lanes as usize);
-    for lane in 0..args.lanes {
-        let (base, q) = block_base_and_q(args, fmt, lane);
-        let scale = load_scale_f32(args, &base, fields.scale, fields.scale_is_f16);
-        let value = match fmt {
-            QFmt::Q4_0 => centered(nibble_q4(args, &base, &fields, &q), 8.0, scale),
-            QFmt::Q5_0 => centered(nibble_q5(args, &base, &fields, &q), 16.0, scale),
-            QFmt::Q8_0 => {
-                let byte = load_block_byte(args, &base, fields.ql, Some(q));
-                mul(signed_byte_f32(byte), scale)
-            }
-            other => {
-                return Err(fusor2_ir::error::Error::Dtype(format!(
-                    "{other:?} is not an affine-family format"
-                )));
-            }
-        };
-        parts.push(value);
-    }
-    Ok(finish(args, parts))
+    let (base, q) = block_base_and_q(args, fmt);
+    let scale = load_scale_f32(args, &base, fields.scale, fields.scale_is_f16);
+    let value = match fmt {
+        QFmt::Q4_0 => centered(nibble_q4(args, &base, &fields, &q), 8.0, scale),
+        QFmt::Q5_0 => centered(nibble_q5(args, &base, &fields, &q), 16.0, scale),
+        QFmt::Q8_0 => {
+            let byte = load_block_byte(args, &base, fields.ql, Some(q));
+            mul(signed_byte_f32(byte), scale)
+        }
+        other => {
+            return Err(fusor2_ir::error::Error::Dtype(format!(
+                "{other:?} is not an affine-family format"
+            )));
+        }
+    };
+    Ok(finish(args, value))
 }
 
 // ---------------------------------------------------------------------------
@@ -465,7 +425,9 @@ pub(crate) mod interp {
     }
 
     impl V {
-        pub fn f32s(&self) -> &[f32] {
+        /// Only `VecComponent` reads this: `Unpack2x16Float` is the one vector
+        /// a decode program still builds, and it is consumed immediately.
+        fn f32s(&self) -> &[f32] {
             match self {
                 V::Vf(v) => v,
                 other => panic!("expected an f32 vector, got {other:?}"),
@@ -477,7 +439,7 @@ pub(crate) mod interp {
                 other => panic!("expected u32, got {other:?}"),
             }
         }
-        fn f(&self) -> f32 {
+        pub fn f(&self) -> f32 {
             match self {
                 V::F(v) => *v,
                 other => panic!("expected f32, got {other:?}"),
@@ -682,10 +644,9 @@ mod tests {
     }
 
     /// Every one of the twelve rows must agree with the scalar decoder on
-    /// every lane of every block.
+    /// every element of every block.
     #[test]
     fn decode_programs_agree_with_cpu_dequantize() {
-        const LANES: u32 = 8;
         for spec in BLOCK_SPECS {
             let fmt = spec.fmt;
             let layout = spec.layout;
@@ -703,37 +664,29 @@ mod tests {
                     &raw[block * stride..(block + 1) * stride],
                     &mut expected,
                 );
-                for start in (0..elements).step_by(LANES as usize) {
+                for element in 0..elements {
                     let args = BlockDecodeArgs {
                         src: &view,
                         layout,
-                        k_base: u32_lit((block * elements + start) as u32),
+                        k_base: u32_lit((block * elements + element) as u32),
                         col: u32_lit(0),
                         mask: mask(true),
                         fill: f32_lit(0.0),
-                        lanes: LANES,
                     };
                     let program = (spec.decode.emit)(&args).unwrap();
                     assert_eq!(
                         program.element(),
-                        ElementType::Vector {
-                            scalar: ScalarElement::F32,
-                            lanes: LANES
-                        },
-                        "{} must return a {LANES}-wide f32 vector",
+                        F32,
+                        "{} must return a scalar f32",
                         spec.decode.name
                     );
-                    let got = eval(&program, &words);
-                    for lane in 0..LANES as usize {
-                        let want = expected[start + lane];
-                        let have = got.f32s()[lane];
-                        assert!(
-                            (want - have).abs() <= 1e-6 * want.abs().max(1.0),
-                            "{} block {block} lane {}: expected {want}, got {have}",
-                            spec.decode.name,
-                            start + lane
-                        );
-                    }
+                    let want = expected[element];
+                    let have = eval(&program, &words).f();
+                    assert!(
+                        (want - have).abs() <= 1e-6 * want.abs().max(1.0),
+                        "{} block {block} element {element}: expected {want}, got {have}",
+                        spec.decode.name,
+                    );
                 }
             }
         }
@@ -752,13 +705,12 @@ mod tests {
                 col: u32_lit(0),
                 mask: mask(false),
                 fill: f32_lit(-7.5),
-                lanes: 4,
             };
             let program = (spec.decode.emit)(&args).unwrap();
             let got = eval(&program, &words);
             assert_eq!(
-                got.f32s(),
-                &[-7.5; 4],
+                got.f(),
+                -7.5,
                 "{} ignored its mask",
                 spec.decode.name
             );
@@ -779,7 +731,6 @@ mod tests {
             col: u32_lit(0),
             mask: mask(true),
             fill: f32_lit(0.0),
-            lanes: 2,
         };
         assert!(decode_q4_0_native(&args).is_err());
         assert!(decode_q4_0_f32(&args).is_ok());
@@ -840,7 +791,6 @@ mod tests {
                 col: u32_lit(0),
                 mask: mask(true),
                 fill: f32_lit(0.0),
-                lanes: 2,
             };
             let program = (spec.decode.emit)(&args).unwrap();
             let mut seen = 0;
