@@ -1,24 +1,12 @@
-//! `verify_l2` — the L2 verifier, retained from the reference and extended.
+//! The L2 verifier.
 //!
-//! Seven clauses, in order:
-//! 1. **Full expression type-check.** Every node's cached `ty` equals what
-//!    inference derives, and every structural constraint inference assumes is
-//!    checked explicitly.
-//! 2. **Every `Load` masked or provably in range.** This discipline is the
-//!    *only* thing licensing `create_shader_module_trusted`.
-//! 3. **Every `Loop` accumulator declared** and written nowhere outside its
-//!    loop body.
-//! 4. **`cooperative_store_layout_supported` on every `CoopStore`**, plus
-//!    `Addr::Rc2`. The caller's documented recovery is the per-lane store
-//!    fallback: the emitters lower `CoopStore` to a masked per-lane `Store`
-//!    loop when the predicate fails, so `verify_l2` only rejects a `CoopStore`
-//!    node that survived to L2 with an unsupported layout.
-//! 5. **Uniformity** — the analysis backing "guaranteed uniform" barriers.
-//! 6. **`verify_arena`** against the planner's `arena_plan`.
-//! 7. **`f16`/`bf16` gated on `caps`**, up front, so an f16 handle on a
-//!    non-f16 adapter fails here rather than mis-lowering.
+//! Checks that every node's cached `ty` equals what inference derives, that
+//! every `Load` is masked or provably in range, that every `Loop` accumulator
+//! is written only inside its own loop body, that every `CoopStore` has a
+//! supported rank-2 layout, plus uniformity, the arena plan, and `f16`/`bf16`
+//! against `caps`.
 //!
-//! Owned by W3.
+//! Load masking is what licenses `create_shader_module_trusted`.
 
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
@@ -49,9 +37,8 @@ pub fn verify_l2(ir: &KernelIr, caps: &Caps) -> Result<()> {
     crate::uniformity::verify_uniformity(ir)?;
     let planner = crate::planner::Planner::global();
     let plan = planner.arena_plan(ir, caps)?;
-    // The plan may have bought its footprint with barrier insertions, which
-    // the emitter is required to apply before emitting; the arena is verified
-    // against the body the emitter will actually produce.
+    // The plan's barrier insertions are applied before emitting, so the arena
+    // is verified against the body the emitter produces.
     if plan.barriers_inserted.is_empty() {
         planner.verify_arena(ir, &plan)
     } else {
@@ -62,10 +49,6 @@ pub fn verify_l2(ir: &KernelIr, caps: &Caps) -> Result<()> {
         )
     }
 }
-
-// ---------------------------------------------------------------------------
-// (7) dtype capability gate
-// ---------------------------------------------------------------------------
 
 fn check_dtype_caps(ir: &KernelIr, caps: &Caps) -> Result<()> {
     let mut bad: Option<ScalarElement> = None;
@@ -141,10 +124,6 @@ fn for_each_element(ir: &KernelIr, f: &mut dyn FnMut(ElementType)) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// (1) type inference and check
-// ---------------------------------------------------------------------------
-
 /// Derive the element type of one node from its children's cached types. The
 /// builder uses this to type a node; `verify_l2` re-derives it and compares.
 pub fn infer_kind(kind: &TileExprKind) -> Result<ElementType> {
@@ -158,7 +137,18 @@ pub fn infer_kind(kind: &TileExprKind) -> Result<ElementType> {
             Source::Quantized(_) => ElementType::Scalar(ScalarElement::F32),
         },
         K::LoadTile { tile, .. } => tile.element,
-        K::Unary { value, .. } => value.element(),
+        // `Unpack2x16Float` takes a packed u32 and yields two f32 lanes; every
+        // other unary is type-preserving.
+        K::Unary { op, value, .. } => {
+            if *op == fusor2_ir::scalar::UnOp::Unpack2x16Float {
+                ElementType::Vector {
+                    scalar: ScalarElement::F32,
+                    lanes: 2,
+                }
+            } else {
+                value.element()
+            }
+        }
         K::Binary { left, right, .. } => {
             if left.element() != right.element() {
                 return Err(invalid(format!(
@@ -463,10 +453,6 @@ fn check_types(ir: &KernelIr) -> Result<()> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// (2) load masking
-// ---------------------------------------------------------------------------
-
 /// Every `Load` is masked or provably in range.
 pub fn check_loads(body: &[Stmt]) -> Result<()> {
     let mut seen = FxHashSet::default();
@@ -519,10 +505,9 @@ fn load_in_range(src: &Source, addr: &Addr) -> bool {
     }
 }
 
-/// A non-negative integer literal, whichever integer type it carries.
-///
-/// The `I32` guard mirrors [`max_value`]'s own: a negative literal is not a
-/// bound on an unsigned index, so it stays undecidable rather than wrapping.
+/// A non-negative integer literal, whichever integer type it carries. A
+/// negative literal is not a bound on an unsigned index, so it is undecidable
+/// rather than wrapping.
 fn literal_u64(expr: &TileExpr) -> Option<u64> {
     match expr.kind() {
         TileExprKind::Literal(TileLiteral::U32(v)) => Some(u64::from(*v)),
@@ -535,13 +520,9 @@ fn literal_u64(expr: &TileExpr) -> Option<u64> {
 /// literal, or an affine/monotone composition of literals; anything reading a
 /// builtin or memory is unbounded and needs a real mask.
 ///
-/// The bit operators are read as their unsigned arithmetic twins — `x >> k` is
-/// `x / 2^k`, `x << k` is `x * 2^k`, `x & m` is bounded like `x % (m + 1)` when
-/// `m` is `2^k - 1` — because otherwise the verifier decides `lane % 32` and
-/// refuses `lane & 31`, which are the same function of `lane`. That asymmetry
-/// is not neutral: it forbids a lowering from spelling an address with the
-/// natural power-of-two wrap, the very form `emit::expr::mod_literal_u32`
-/// rewrites the remainder into one layer down.
+/// Bit operators are read as their unsigned arithmetic twins: `x >> k` is
+/// `x / 2^k`, `x << k` is `x * 2^k`, and `x & m` is bounded like `x % (m + 1)`
+/// when `m` is `2^k - 1`.
 fn max_value(expr: &TileExpr) -> Option<u64> {
     use fusor2_ir::scalar::BinOp;
     match expr.kind() {
@@ -560,7 +541,7 @@ fn max_value(expr: &TileExpr) -> Option<u64> {
             BinOp::Sub | BinOp::Div => max_value(left),
             BinOp::Rem => Some(max_value(right)?.saturating_sub(1)),
             // `x >> k == x / 2^k` at a literal count. A dynamic count still
-            // only lowers the bound, which is the arm this replaces.
+            // only lowers the bound.
             BinOp::Shr => match literal_u64(right) {
                 Some(k) if k < 64 => Some(max_value(left)? >> k),
                 Some(_) => Some(0),
@@ -574,19 +555,17 @@ fn max_value(expr: &TileExpr) -> Option<u64> {
                 }
                 max_value(left)?.checked_mul(1u64 << k)
             }
-            // `x & m <= x` and `x & m <= m` for unsigned, so *one* decidable
-            // side bounds the pair: `& 0xFF` is bounded however unbounded its
-            // left operand is. Stating it as a `min` also covers a mask that
-            // is not `2^k - 1`.
+            // `x & m <= x` and `x & m <= m` for unsigned, so one decidable side
+            // bounds the pair, mask or not a `2^k - 1`.
             BinOp::BitAnd => match (max_value(left), max_value(right)) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (Some(a), None) | (None, Some(a)) => Some(a),
                 (None, None) => None,
             },
             // Neither `|` nor `^` sets a bit above the highest bit either side
-            // can set, so the bound is that position's all-ones mask. Note
+            // can set, so the bound is that position's all-ones mask.
             // `a | b <= A | B` is false in general (`A = B = 2` admits
-            // `1 | 2 == 3`), which is why this rounds up to the mask.
+            // `1 | 2 == 3`), so this rounds up to the mask.
             BinOp::BitOr | BinOp::BitXor => {
                 let m = max_value(left)?.max(max_value(right)?);
                 Some(if m == 0 {
@@ -607,17 +586,13 @@ fn max_value(expr: &TileExpr) -> Option<u64> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// (3) loop accumulators
-// ---------------------------------------------------------------------------
-
 /// Every `Loop` accumulator's `init`/`update` type matches its local, the
 /// local is the accumulator of exactly one loop, and nothing outside that
 /// loop's body writes it.
 ///
-/// The stated clause also requires the local to appear in the builder's local
-/// list. [`KernelIr`] carries no local list, so that half is checked by
-/// [`crate::build::TileBuilder::declares_local`] at construction instead.
+/// [`KernelIr`] carries no local list, so membership in the builder's local
+/// list is checked by [`crate::build::TileBuilder::declares_local`] at
+/// construction.
 pub fn check_accumulators(body: &[Stmt]) -> Result<()> {
     let mut owners: FxHashMap<usize, ()> = FxHashMap::default();
     collect_accumulator_owners(body, &mut owners)?;
@@ -629,18 +604,11 @@ fn local_key(local: &Local) -> usize {
     Arc::as_ptr(local) as *const () as usize
 }
 
-// ---------------------------------------------------------------------------
-// (8) the N-ary reduction
-// ---------------------------------------------------------------------------
-
 /// Every `Stmt::Reduce` is arity-consistent, element-consistent across lanes,
 /// carries one scratch tile per lane where its kind needs scratch, and has a
-/// `merge` reading nothing but its own formals.
-///
-/// The arity clause is what makes the `accs[0]` bug unrepresentable: there is no
-/// single `TileReduceOp` to resolve for the whole fold, and a node whose
-/// `values`, `merge.body`, `merge.lhs`, `merge.rhs` and `outs` disagree in
-/// length is rejected rather than truncated.
+/// `merge` reading nothing but its own formals. A node whose `values`,
+/// `merge.body`, `merge.lhs`, `merge.rhs` and `outs` disagree in length is
+/// rejected rather than truncated to its first slot.
 pub fn check_reduce_stmts(body: &[Stmt]) -> Result<()> {
     let mut error: Option<Error> = None;
     for_each_stmt(body, &mut |stmt| {
@@ -708,9 +676,9 @@ fn check_one_reduce(
             }
         }
     }
-    // `merge` reads only its own formals. A merge that reads a tile, a buffer or
-    // a lane id is not a merge; cross-*lane* reads of the formals are legal and
-    // required, so this checks the source of every leaf, not its index.
+    // `merge` reads only its own formals: no tile, buffer or lane id.
+    // Cross-lane reads of the formals are legal, so this checks the source of
+    // every leaf, not its index.
     let formals: FxHashSet<usize> = merge
         .lhs
         .iter()
@@ -741,8 +709,7 @@ fn check_one_reduce(
             return Err(invalid(format!("a reduction merge reads {bad}")));
         }
     }
-    // Scratch: one tile per lane, and lane 0's is the one the kind names, so a
-    // one-lane reduction is exactly the node it was before this form existed.
+    // Scratch: one tile per lane, and lane 0's is the one the kind names.
     match kind {
         ReduceKind::Subgroup => {
             if !scratch.is_empty() {
@@ -763,8 +730,8 @@ fn check_one_reduce(
             }
         }
     }
-    // `fast` is derived, so an author-supplied value that disagrees with `merge`
-    // would take the collective path on a merge the collective cannot express.
+    // `fast` must agree with `merge`, or the collective path runs on a merge
+    // the collective cannot express.
     if let Some(op) = fast {
         if n != 1 {
             return Err(invalid(format!(
@@ -872,10 +839,6 @@ fn check_accumulator_writes(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// (4) cooperative store layout
-// ---------------------------------------------------------------------------
-
 /// Every `CoopStore` destination is an affine rank-2 layout with a unit stride
 /// on one side, addressed rank-2.
 pub fn check_coop_stores(body: &[Stmt]) -> Result<()> {
@@ -905,10 +868,6 @@ pub fn check_coop_stores(body: &[Stmt]) -> Result<()> {
         None => Ok(()),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Traversal helpers
-// ---------------------------------------------------------------------------
 
 /// Every statement in the tree, pre-order.
 pub fn for_each_stmt(body: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
@@ -1080,10 +1039,8 @@ mod tests {
         verify_l2(&ir, &caps_with(|_| {})).unwrap();
     }
 
-    /// `lane & 31` and `lane % 32` are the same function of `lane`. The
-    /// verifier used to decide the second and refuse the first, so a lowering
-    /// could not spell an address with the natural power-of-two wrap — the
-    /// very form `mod_literal_u32` rewrites the remainder into one layer down.
+    /// `lane & 31` and `lane % 32` are the same function of `lane`, so both
+    /// bound an address.
     #[test]
     fn a_power_of_two_mask_bounds_an_address_the_way_a_remainder_does() {
         for (op, rhs) in [(BinOp::BitAnd, 31u32), (BinOp::Rem, 32)] {
@@ -1109,10 +1066,8 @@ mod tests {
         }
     }
 
-    /// A shift and a mask compose the way their arithmetic twins do: the byte
-    /// selector `(word >> 24) & 0xF` that a block decode spells is bounded at
-    /// 15 without any knowledge of `word`, exactly as `(word / 2^24) % 16`
-    /// would be. `Shl` is checked against its `Mul` reading in the same shape.
+    /// A shift and a mask compose the way their arithmetic twins do:
+    /// `(word >> 24) & 0xF` is bounded at 15 without any knowledge of `word`.
     #[test]
     fn bit_arithmetic_bounds_compose_like_their_arithmetic_twins() {
         let mut b = TileBuilder::new();
@@ -1123,8 +1078,7 @@ mod tests {
         let nibble = b.binary(BinOp::BitAnd, shifted, fifteen, NumericContract::RELAXED);
         assert_eq!(max_value(&nibble), Some(15));
 
-        // `x << k` is `x * 2^k`: a decidable left operand scales, an
-        // undecidable one stays undecidable.
+        // `x << k` is `x * 2^k`.
         let seven = b.lit_u32(7);
         let two = b.lit_u32(2);
         let scaled = b.binary(BinOp::Shl, seven, two.clone(), NumericContract::RELAXED);
@@ -1158,8 +1112,8 @@ mod tests {
         assert!(check_accumulators(&ir.body).is_err());
     }
 
-    /// A rank-2 layout whose first axis needs two sub-axes: not affine, so
-    /// the cooperative store predicate must reject it.
+    /// A rank-2 layout whose first axis needs two sub-axes, so it is not
+    /// affine.
     fn non_affine_rc2(buffer: &fusor2_ir::ir::level2::Buffer) -> StorageView {
         use fusor2_ir::shape::{AxisGroup, MultiFlattenMap, SubAxis};
         let indexing = MultiFlattenMap {
@@ -1283,9 +1237,6 @@ mod tests {
         assert!(verify_l2(&ir, &caps_with(|c| c.bf16 = false)).is_err());
         verify_l2(&ir, &caps_with(|c| c.bf16 = true)).unwrap();
     }
-    // -----------------------------------------------------------------------
-    // (8) the N-ary reduction
-    // -----------------------------------------------------------------------
 
     /// A two-lane `Stmt::Reduce` over `(max, sum)`-shaped scratch, built through
     /// the canonical constructor.
@@ -1334,9 +1285,8 @@ mod tests {
         max.tuple(&sum, &ArgRemap::identity(1)).carrier
     }
 
-    /// The constructor **delegates** at one scalar binop slot: it returns the
-    /// same `TileExprKind::Reduce` node and pushes no statement, so the term the
-    /// emitter sees — and therefore the shader — is untouched.
+    /// At one scalar binop slot the constructor returns the same
+    /// `TileExprKind::Reduce` node and pushes no statement.
     #[test]
     fn a_single_slot_carrier_delegates_to_the_collective() {
         use fusor2_ir::carrier::Carrier;
@@ -1378,8 +1328,8 @@ mod tests {
         verify_l2(&ir, &caps_with(|_| {})).unwrap();
     }
 
-    /// **The `accs[0]` bug, unrepresentable.** A node whose lane counts disagree
-    /// is rejected rather than truncated to its first slot.
+    /// A node whose lane counts disagree is rejected rather than truncated to
+    /// its first slot.
     #[test]
     fn a_reduction_with_disagreeing_lane_counts_is_rejected() {
         let mut b = TileBuilder::new();
@@ -1417,8 +1367,7 @@ mod tests {
         assert!(check_reduce_stmts(&body).is_err());
     }
 
-    /// A merge reads its formals and nothing else: one that reads a lane id is
-    /// not a merge, and one that reads a tile has already raced.
+    /// A merge reads its formals and nothing else.
     #[test]
     fn a_merge_reading_outside_its_formals_is_rejected() {
         let mut b = TileBuilder::new();
@@ -1431,8 +1380,7 @@ mod tests {
         merge.body[1] = lane;
         assert!(check_reduce_stmts(&body).is_err());
 
-        // A foreign local is refused for the same reason: it is not one of the
-        // two partials this level is merging.
+        // A foreign local is not one of the two partials being merged.
         let mut b2 = TileBuilder::new();
         let stray = b2.alloc_local(ScalarElement::F32.element());
         let read = b2.load_local(stray);
@@ -1444,9 +1392,8 @@ mod tests {
         assert!(check_reduce_stmts(&body).is_err());
     }
 
-    /// **Cross-lane reads are legal and required.** Flash's running sum and its
-    /// output accumulator both read the running max, so a merge that reads
-    /// `lhs[0]` from lane 1 must verify.
+    /// Cross-lane reads are legal: a merge that reads `lhs[0]` from lane 1
+    /// verifies.
     #[test]
     fn a_merge_reading_a_sibling_lane_is_accepted() {
         let mut b = TileBuilder::new();
@@ -1460,9 +1407,7 @@ mod tests {
         check_reduce_stmts(&body).unwrap();
     }
 
-    /// `fast` is derived, never author-supplied: a value that disagrees with
-    /// `merge` would take the collective path on a merge the collective cannot
-    /// express.
+    /// A `fast` operator that disagrees with `merge` is rejected.
     #[test]
     fn a_claimed_fast_operator_must_match_the_merge() {
         use fusor2_ir::ir::level2::TileReduceOp;
@@ -1522,8 +1467,8 @@ mod tests {
         assert!(check_reduce_stmts(&body).is_err());
     }
 
-    /// Liveness sees **every** lane's scratch tile, so the arena sizes N tiles
-    /// per reduction rather than one.
+    /// Liveness sees every lane's scratch tile, so the arena sizes N tiles per
+    /// reduction rather than one.
     #[test]
     fn liveness_sees_every_lane_scratch_tile() {
         let mut b = TileBuilder::new();

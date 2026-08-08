@@ -1,12 +1,9 @@
 //! The rope sin/cos table.
 //!
-//! `[rows, head_dim / 2]`, the half-width table
-//! [`crate::composite::rope`] expands through its `table_expansion` gather —
-//! not a `[rows, head_dim]` table with every column duplicated.
-//! [`base_inverse_frequency`] is shared with the rope op itself, so the table
-//! and the kernel cannot drift apart.
-//!
-//! Owned by W13.
+//! `[rows, head_dim / 2]`: the half-width table [`crate::composite::rope`]
+//! expands through its `table_expansion` gather. [`base_inverse_frequency`] is
+//! shared with the rope op itself, so the table and the kernel cannot drift
+//! apart.
 
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::shape::Dim;
@@ -31,10 +28,9 @@ pub struct RopeCache {
 impl RopeCache {
     /// A table covering `max_len` positions.
     ///
-    /// A symbolic `max_len` is refused rather than guessed: the *use* of the
-    /// table is symbolic (a narrow or a position gather, so a decode loop
-    /// recompiles nothing), but its contents are host-computed sines and
-    /// there is no length to compute them for until one is bound.
+    /// A symbolic `max_len` is refused: the table's contents are host-computed
+    /// sines and there is no length to compute them for until the symbol is
+    /// bound. Its use stays symbolic (a narrow or a position gather).
     pub fn new(graph: &Graph, head_dim: u32, max_len: Dim, theta: f32) -> Result<Self> {
         let Some(rows) = max_len.as_const() else {
             return Err(Error::Shape(
@@ -85,8 +81,8 @@ impl RopeCache {
         Ok(())
     }
 
-    /// The `[len, head_dim / 2]` prefix starting at `offset` — what one
-    /// decode step feeds `rope`.
+    /// The `[len, head_dim / 2]` prefix starting at `offset`, what one decode
+    /// step feeds `rope`.
     pub fn slice(&self, offset: u64, len: u64) -> Result<(Tensor, Tensor)> {
         if offset + len > self.rows {
             return Err(Error::Shape(format!(
@@ -193,11 +189,6 @@ mod tests {
         let g = graph();
         let c = RopeCache::new(&g, 4, Dim::Const(8), 10_000.0).unwrap();
         let (sin, cos) = c.slice(5, 2).unwrap();
-        // The numbers a narrowed view reads back are `views::narrow`'s
-        // obligation, and that case is red for a reason that is not this
-        // cache: the emitters index every operand with the flat output index
-        // and drop `Operand::layout`'s offset. What is asserted here is the
-        // slice this cache asks for.
         assert_eq!(&sin.shape()[..], &[Dim::Const(2), Dim::Const(2)]);
         assert_eq!(&cos.shape()[..], &[Dim::Const(2), Dim::Const(2)]);
         assert!(c.slice(7, 2).is_err(), "a slice past the table is an error");

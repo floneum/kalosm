@@ -1,7 +1,5 @@
 //! `RmsNorm`. Its fused form is what `fold_split` + `map_into_fold` produce;
 //! there is no fused kernel to select.
-//!
-//! Owned by W13.
 
 use fusor2_gguf::VarBuilder;
 
@@ -18,9 +16,9 @@ impl RmsNorm {
         Self { weight, eps }
     }
 
-    /// The GGUF `weight` entry. Required, as in the reference: an RMS norm
-    /// whose scale silently defaulted to one is indistinguishable from a
-    /// correctly loaded one until the outputs are compared.
+    /// The GGUF `weight` entry, required: an RMS norm whose scale silently
+    /// defaulted to one is indistinguishable from a correctly loaded one until
+    /// the outputs are compared.
     ///
     /// `RmsNorm::new(None, eps)` is the way to ask for the unweighted form.
     pub fn load(vb: &VarBuilder, graph: &crate::graph::GraphRef, eps: f32) -> Result<Self> {

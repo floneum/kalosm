@@ -1,17 +1,10 @@
-//! The SGEMV schedule domain. The 21-arm measured bucket table is deleted;
-//! its eleven distinct cells survive as move-ordering seeds only.
+//! The SGEMV schedule domain: every legal `(chunk, vector, subgroups)` on the
+//! device, with eleven measured cells acting as move-ordering seeds.
 //!
-//! The reference's `gemv_parameters(m, _: usize, k)` ignores `n` outright,
-//! so two contractions with wildly different output widths and identical
-//! `(m, k)` get identical vectorization. Here `n` participates in cost and
-//! nowhere else — the domain is a pure function of the device.
-//!
-//! Owned by W4.
+//! The domain is a pure function of the device. Shape participates in cost
+//! and nowhere else.
 
-use fusor2_ir::device::Caps;
-use fusor2_ir::dtype::Dtype;
 use fusor2_ir::ir::level1::{SgemvDomain, SgemvParams};
-use fusor2_ir::shape::Dim;
 use smallvec::SmallVec;
 
 use crate::domains::{DomainCtx, UNMEASURED, sgemv_order};
@@ -20,8 +13,7 @@ const CHUNK_CHOICES: [u32; 6] = [1, 2, 4, 8, 16, 32];
 const VECTOR_CHOICES: [u32; 3] = [1, 2, 4];
 const SUBGROUP_CHOICES: [u32; 6] = [1, 2, 4, 8, 16, 32];
 
-/// The eleven distinct cells of the deleted bucket table. Ordering, never
-/// gating.
+/// The eleven measured cells. Ordering, never gating.
 pub static SEED_CELLS: &[SgemvParams] = &[
     v(16, 4, 16),
     v(2, 4, 1),
@@ -42,14 +34,6 @@ const fn v(chunk: u32, vector: u32, subgroups: u32) -> SgemvParams {
         vector,
         subgroups,
     }
-}
-
-/// Compatibility entry point kept for the scaffold's `domains::sgemv_legal`
-/// re-export. None of `m`, `n`, `k` or `dtype` filters the domain.
-pub fn legal(m: Dim, n: Dim, k: Dim, dtype: Dtype, caps: &Caps) -> SgemvDomain {
-    let _ = (m, n, k, dtype);
-    let cx = DomainCtx::new(caps, crate::domains::default_planner());
-    sgemv_domain(&cx)
 }
 
 /// Every legal `(chunk, vector, subgroups)` on this device, ordered by
@@ -102,24 +86,12 @@ mod tests {
         }
     }
 
+    /// No shape reaches [`sgemv_domain`], so two calls agree.
     #[test]
     fn n_is_not_an_input() {
         let caps = apple_caps();
-        let a = legal(
-            Dim::Const(1),
-            Dim::Const(64),
-            Dim::Const(4096),
-            Dtype::F32,
-            &caps,
-        );
-        let b = legal(
-            Dim::Const(1),
-            Dim::Const(65536),
-            Dim::Const(4096),
-            Dtype::F32,
-            &caps,
-        );
-        assert_eq!(a, b);
+        let cx = DomainCtx::new(&caps, default_planner());
+        assert_eq!(sgemv_domain(&cx), sgemv_domain(&cx));
     }
 
     #[test]

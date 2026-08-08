@@ -111,7 +111,7 @@ fn main() {
     println!("# fusor2 on {}", session.device().name());
     println!("workload\tcold_ms\tmin_ms\tmedian_ms\tlaunches");
 
-    // ---- 0. upload + readback floor, no compute. Both sides move the same
+    // upload + readback floor, no compute. Both sides move the same
     //         bytes, so every row below is this plus its kernel. ----
     {
         let n = 2048usize;
@@ -127,7 +127,6 @@ fn main() {
         row("passthrough_2048", &t);
     }
 
-    // ---- 1. matmul 1024^3 ----
     {
         let n = 2048usize;
         let a = bytes_of(&make(n * n, 0.013, 0.5));
@@ -148,7 +147,6 @@ fn main() {
         row("matmul_2048", &t);
     }
 
-    // ---- 2. matmul + bias + gelu (epilogue fusion) ----
     {
         let n = 2048usize;
         let a = bytes_of(&make(n * n, 0.013, 0.5));
@@ -176,7 +174,6 @@ fn main() {
         row("matmul_epilogue_2048", &t);
     }
 
-    // ---- 3. elementwise chain, 2048^2 ----
     {
         let n = 2048usize;
         let x = bytes_of(&make(n * n, 0.013, 0.9));
@@ -193,7 +190,6 @@ fn main() {
         row("elementwise_chain_2048", &t);
     }
 
-    // ---- 4. softmax last dim, 2048^2 ----
     {
         let n = 2048usize;
         let x = bytes_of(&make(n * n, 0.013, 2.0));
@@ -212,7 +208,6 @@ fn main() {
         row("softmax_2048", &t);
     }
 
-    // ---- 5. rms_norm, 2048^2 ----
     {
         let n = 2048usize;
         let x = bytes_of(&make(n * n, 0.013, 1.0));
@@ -235,7 +230,6 @@ fn main() {
         row("rms_norm_2048", &t);
     }
 
-    // ---- 6. attention forward, [1,8,512,64] ----
     {
         let shape = [1u64, 8, 1024, 64];
         let numel: usize = shape.iter().product::<u64>() as usize;
@@ -259,13 +253,10 @@ fn main() {
         row("attention_1x8x1024x64", &t);
     }
 
-    // ---- 7. quantized matmul, Q4K weights, LLM-decode shape ----
     //
-    // The row this whole exercise is for. A quantized contraction used to be a
-    // separate `L1::KQContract` with no `family` field, so it could not reach
-    // the cooperative-matrix path at all — the path that took dense attention
-    // from 27.6 ms to 9.3 ms. With the decode moved into the coop staging fill
-    // it is an ordinary `KContract` whose operand happens to be `Dtype::Q(fmt)`.
+    // A quantized contraction is an ordinary `KContract` whose operand happens
+    // to be `Dtype::Q(fmt)`, with the decode folded into the coop staging fill,
+    // so it reaches the cooperative-matrix path like any dense contraction.
     {
         use fusor2_ir::dtype::{QFmt, QLayout};
         let fmt = QFmt::Q4K;
@@ -292,5 +283,37 @@ fn main() {
             Ok(())
         });
         row("qmatmul_q4k_256x4096x4096", &t);
+    }
+
+    // quantized matvec, Q4K weights, M=1: the LLM decode shape. A
+    //         materialize-the-weight plan is catastrophic here — one token
+    //         cannot amortize a 4096^2 decode — so this row is what forces
+    //         the staged-decode member to win extraction. ----
+    {
+        use fusor2_ir::dtype::{QFmt, QLayout};
+        let fmt = QFmt::Q4K;
+        let be = fmt.block_elements() as u64;
+        let (k, n, m) = (be * 16, 4096u64, 1u64);
+        let blocks = (k / be) * n;
+        let bytes = vec![0x11u8; (blocks * u64::from(fmt.block_bytes(QLayout::Native))) as usize];
+        let act = bytes_of(&make((m * k) as usize, 0.013, 0.5));
+        let t = time_it(&session, || {
+            let g = Graph::new(&session);
+            let w = g
+                .quantized(fmt, QLayout::Native, [Dim::Const(n), Dim::Const(k)], &bytes)
+                .map_err(|e| e.to_string())?;
+            let a = Tensor::from_slice(
+                g.handle(),
+                Dtype::F32,
+                &dims(&[m, k]),
+                &act,
+            )
+            .map_err(|e| e.to_string())?;
+            let y = a.matmul_t(&w).map_err(|e| e.to_string())?;
+            let s = y.sum(1).map_err(|e| e.to_string())?;
+            s.to_vec_f32().map_err(|e| e.to_string())?;
+            Ok(())
+        });
+        row("qmatmul_q4k_1x4096x4096", &t);
     }
 }

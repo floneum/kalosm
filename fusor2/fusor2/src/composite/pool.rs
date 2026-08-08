@@ -1,13 +1,10 @@
 //! `pool_max` and `pool_min` as macro ops over `Window` + `Fold`.
 //!
 //! Because `Window` carries `(window, step)` as integers, a non-overlapping
-//! pool's adjoint is provably an elementwise mask-and-broadcast — so the
-//! trainer's reshape-as-maxpool workaround deletes, and it deletes on the
-//! symbolic-shape path too, where injectivity of a relative stride
-//! composition is undecidable and a `Restride`-based pool would have to
-//! degrade to a scatter.
-//!
-//! Owned by W13.
+//! pool's adjoint is provably an elementwise mask-and-broadcast, including on
+//! the symbolic-shape path, where injectivity of a relative stride composition
+//! is undecidable and a `Restride`-based pool would have to degrade to a
+//! scatter.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt, accum_dtype};
 use fusor2_ir::autograd::{Tape, Val};
@@ -150,9 +147,8 @@ pub fn pool_min(x: &Tensor, pools: &[PoolSize]) -> Result<Tensor> {
     pool_with(x, pools, PoolReduce::Min)
 }
 
-/// Average pooling. The reference has none; it is the same node with
-/// an `Add` carrier and a scale, which is the point of the reduction being an
-/// attribute.
+/// Average pooling: the same node with an `Add` carrier and a scale, which is
+/// the point of the reduction being an attribute.
 pub fn pool_avg(x: &Tensor, pools: &[PoolSize]) -> Result<Tensor> {
     pool_with(x, pools, PoolReduce::Mean)
 }

@@ -28,10 +28,7 @@ fn main() -> ExitCode {
     }
     println!("exhaustive: {exhaustive_requested}");
 
-    let reports = match &filter {
-        Some(f) => harness::Harness::with_filter(f.clone()).run(),
-        None => harness::run_all(|_| {}),
-    };
+    let reports = harness::run_filtered(filter.as_deref(), |_| {});
     let failures = harness::summarize(&reports);
 
     // A run that executed nothing is not a green run.

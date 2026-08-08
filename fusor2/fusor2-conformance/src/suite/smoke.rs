@@ -1,10 +1,8 @@
-//! The smoke cases the suite was missing: upload-and-read-back, one
-//! elementwise op, one matmul, one repeated read. Every other area assumes
-//! these work; when they do not, 600 rows all fail for the same plumbing
-//! reason and the real failure distribution is invisible.
+//! Smoke cases: upload-and-read-back, one elementwise op, one matmul, one
+//! repeated read. Every other area assumes these work, so they are registered
+//! first in `suite::registry`.
 //!
 //! Each asserts the actual numbers, on every backend `sessions()` offers.
-//! Registered first in `suite::registry` for the same reason.
 
 use fusor2::{Graph, Session};
 
@@ -14,7 +12,7 @@ use crate::harness::{Cases, dims, from_f32};
 pub fn cases() -> Cases {
     let mut cases = Cases::new();
 
-    // 1. No ops at all. Four floats up, four floats back.
+    // No ops at all. Four floats up, four floats back.
     cases.push("smoke", "upload_and_read_back_four_f32", |s: &Session| {
         let g = Graph::new(s);
         let data = [1.0f32, -2.5, 3.25, 4.0];
@@ -24,7 +22,7 @@ pub fn cases() -> Cases {
         Ok(())
     });
 
-    // 2. One elementwise op, hand-computed.
+    // One elementwise op, hand-computed.
     cases.push("smoke", "add_one_to_four_f32", |s: &Session| {
         let g = Graph::new(s);
         let data = [1.0f32, -2.5, 3.25, 4.0];
@@ -36,9 +34,9 @@ pub fn cases() -> Cases {
         Ok(())
     });
 
-    // 3. [2,3] @ [3,2], hand-computed:
-    //    row0 = [1,2,3] . cols([[7,8],[9,10],[11,12]]) = [58, 64]
-    //    row1 = [4,5,6] . same                          = [139, 154]
+    // [2,3] @ [3,2], hand-computed:
+    // row0 = [1,2,3] . cols([[7,8],[9,10],[11,12]]) = [58, 64]
+    // row1 = [4,5,6] . same                         = [139, 154]
     cases.push("smoke", "matmul_2x3_by_3x2", |s: &Session| {
         let g = Graph::new(s);
         let a = from_f32(g.handle(), &dims(&[2, 3]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?;
@@ -54,8 +52,8 @@ pub fn cases() -> Cases {
         Ok(())
     });
 
-    // 4. A f32 leaf uploaded once and read twice: the second read must not
-    //    depend on a buffer the first resolve recycled.
+    // A f32 leaf uploaded once and read twice: the second read must not depend
+    // on a buffer the first resolve recycled.
     cases.push("smoke", "reading_twice_is_stable", |s: &Session| {
         let g = Graph::new(s);
         let data = [0.5f32, 1.5, 2.5, 3.5];

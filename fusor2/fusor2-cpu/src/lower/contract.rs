@@ -1,25 +1,12 @@
-//! `KContract` on CPU: real blocking and a register microkernel, so
-//! bias/gelu/dequant epilogues fuse into the k-loop. No external BLAS — one in
-//! the critical path makes epilogue fusion structurally impossible.
+//! `KContract` on CPU: blocking and a register microkernel, so bias/gelu/
+//! dequant epilogues fuse into the k-loop.
 //!
-//! The nest is the shape of betlang's `conv1d_block4_group16`: a `TM x TN`
-//! register tile whose accumulators are `Stmt::Loop` accumulators, so they stay
-//! resident across the whole k nest and never reload. Because the accumulators
-//! are **in the IR**, `pre_a`, `pre_b` and `post` fuse into the k-loop
-//! epilogue, which is exactly what delegating to `gemm` cannot do.
+//! The nest is a `TM x TN` register tile whose accumulators are `Stmt::Loop`
+//! accumulators, resident across the whole k nest. Because they are in the IR,
+//! `pre_a`, `pre_b` and `post` fuse into the k-loop epilogue.
 //!
-//! **The tile is `theta`'s and the grid covers the whole output.** What was
-//! here took the lane count from a written-in `CONTRACT_BLOCK = 64` and
-//! launched one workgroup per `(batch, m block)` with the lanes covering the
-//! whole n axis, so nothing ever wrote output column 64 and up: `[4,8] x
-//! [8,96]` came back with 127 of its 384 entries at exactly 0.0 and
-//! `[128,512] x [512,128]` with half of them wrong — every dense CPU layer
-//! wider than 64 units was silently wrong. The column block is a grid axis
-//! now, so coverage is `ceil(m / rows) * ceil(n / cols)` blocks whatever the
-//! tile is, and the tile itself is read out of the resolved schedule point
-//! rather than written here.
-//!
-//! Owned by W10.
+//! The tile comes from `theta`; the column block is a grid axis, so coverage
+//! is `ceil(m / rows) * ceil(n / cols)` blocks whatever the tile is.
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::error::Error;
@@ -40,12 +27,9 @@ use super::{bin, cmp, lit_f32, lit_u32, load, u32_ty, Binds, Translate};
 /// The output tile one workgroup owns: `tm x tn` accumulators held by each of
 /// `row_groups x col_groups` lanes.
 ///
-/// **Coverage never depends on it.** The grid takes
-/// `batch * ceil(m / rows) * ceil(n / cols)` workgroups, so a tile that is
-/// wider than the matrix, narrower than it, or shaped nothing like it still
-/// computes every output element. That is what makes reading the tile off
-/// `theta` safe: a schedule point moves the launch shape and the register
-/// reuse, never the answer.
+/// Coverage does not depend on it: the grid takes
+/// `batch * ceil(m / rows) * ceil(n / cols)` workgroups, so any tile shape
+/// still computes every output element.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct Tile {
     /// Output rows one lane accumulates.
@@ -74,14 +58,11 @@ impl Tile {
         self.col_groups.saturating_mul(self.tn).max(1)
     }
 
-    /// Narrow onto this shape and this device.
-    ///
-    /// A lane group starting past the last row or column runs only masked
-    /// lanes, and a workgroup may not exceed the device's own lane limit.
-    /// Both are narrowings of the *tile*; the grid picks up whatever the tile
-    /// stops covering, so neither can change a result. Columns are dropped
-    /// before rows because a dropped column group becomes one more grid block
-    /// on an axis that already loops.
+    /// Narrow onto this shape and this device: a lane group starting past the
+    /// last row or column would run only masked lanes, and a workgroup may not
+    /// exceed the device's lane limit. The grid picks up whatever the tile
+    /// stops covering. Columns are dropped before rows because a dropped
+    /// column group becomes one more grid block on an axis that already loops.
     fn fit(mut self, m: u32, n: u32, max_lanes: u32) -> Self {
         let m = m.max(1);
         let n = n.max(1);
@@ -99,25 +80,14 @@ impl Tile {
 
 }
 
-/// The tile a resolved schedule point names.
+/// The tile a resolved schedule point names; any other point names no
+/// contraction geometry and is refused.
 ///
-/// * [`SchedPoint::Sgemm`] is the register tiling directly: `bm / tm` lane
-///   groups down m, `bn / tn` across n, `tm x tn` accumulators each. `bk` and
-///   `double_buffer` size a staged workgroup tile this nest does not have — it
-///   reads A and B straight from storage and keeps the k reduction in
-///   registers — exactly as `fusor2-gpu`'s `lower_sgemm` does.
-/// * [`SchedPoint::Sgemv`] decomposes the **k** axis (`chunk`) and names the
-///   workgroup's width in subgroups; k is walked sequentially here, so what it
-///   contributes is `subgroups * subgroup_width` lanes each owning `vector`
-///   adjacent columns.
-/// * [`SchedPoint::Fold`] is what a `Family::GenericFold` contraction carries.
-///   Its lane-group width becomes the workgroup width; the reduction it
-///   describes is in-register in this nest, so no cross-lane tree is emitted
-///   and `iterations` prices a k loop that is already sequential.
-///
-/// Anything else names no contraction geometry at all. [`SchedPoint::Point`]
-/// in particular means no schedule decision was ever made for this node, which
-/// is a plan answer, not a tile to invent.
+/// * [`SchedPoint::Sgemm`]: `bm / tm` lane groups down m, `bn / tn` across n,
+///   `tm x tn` accumulators each.
+/// * [`SchedPoint::Sgemv`]: `subgroups * subgroup_width` lanes each owning
+///   `vector` columns, with k walked sequentially.
+/// * [`SchedPoint::Fold`]: the lane-group width becomes the workgroup width.
 fn tile_of(theta: SchedPoint, caps: &Caps) -> Result<Tile> {
     let width = caps.subgroup_width().max(1);
     Ok(match theta {
@@ -202,52 +172,13 @@ struct Dims {
 #[allow(clippy::too_many_arguments)]
 
 /// The three strides this kernel indexes an operand with, collapsed out of the
-/// operand's own per-axis layout.
-///
-/// # Why this exists
-///
-/// `build` addressed A as `((batch*m + row)*k) + kk` and B as
-/// `((batch*k + kk)*n) + col` — dense `[batch, m, k]` and `[batch, k, n]`,
-/// hardcoded. That silently ignores `Operand::layout`, which is a *contract
-/// violation*: `L1::KContract` carries a full strided `Layout` per operand
-/// precisely so a contraction whose spec is not in kernel axis order can be
-/// read by permuting strides instead of by copying. `fusor2-tile`'s
-/// `permuted_alias` mints exactly that, and this kernel read it densely and
-/// computed wrong values — 22 CPU conformance rows, `matmul [cpu]` returning
-/// `0.4009152` for `0.9157541`.
-///
-/// # The collapse
-///
-/// The kernel's three loop indices are the *products* `batch`, `m`/`k` and
-/// `k`/`n`, while a layout has one axis per einsum label — `bhqd` is four axes
-/// collapsing to `batch=b*h, m=q, k=d`. Group boundaries are recovered from the
-/// extents alone (no labels needed here): walk the axes outermost-first and cut
-/// each group when its running extent product reaches that group's total.
-///
-/// A group collapses to a single stride only when its own axes are internally
-/// dense — `stride[i] == stride[i+1] * extent[i+1]` — and then the collapsed
-/// stride is the innermost axis's. `None` when they are not, which is a layout
-/// this three-stride kernel genuinely cannot address.
-///
-/// # Extent-1 axes are not part of the structure
-///
-/// An axis of extent 1 has one coordinate, always `0`, so it contributes `0` to
-/// every address whatever its stride: neither its stride nor its position among
-/// the other axes is observable. Walking it as if it were structure was wrong in
-/// both directions. A *trailing* unit axis was consumed by nobody — a group
-/// whose `want` is 1 enters with `prod == 1` and never advances the cursor — so
-/// the "every axis accounted for" test refused `[m, 1]` presented as
-/// `[batch=1, m, k=1]`, which is every `[n, 1]` column operand in
-/// `fusor2::sampling::row`. An *interior* unit axis was worse: it entered the
-/// density test as a real neighbour, and `stride[i] == stride[i+1] * 1` compares
-/// a stride nothing reads, which is how a broadcast KV head
-/// (`[2, 1, 4, 4]` at `[16, 16, 1, 4]`, GQA and MQA) was refused for a
-/// "gap" between two axes that address the same byte.
-///
-/// So the unit axes are dropped up front and the walk sees only observable
-/// structure. This is a widening: a layout accepted before is accepted with
-/// byte-identical strides, since a group's collapsed stride is its innermost
-/// axis's and unit axes can only have been interior padding in that group.
+/// operand's per-axis layout: the loop indices are the products `batch`,
+/// `m`/`k` and `k`/`n`, while a layout has one axis per einsum label. Group
+/// boundaries come from extents: walk outermost-first and cut each group when
+/// its running extent product reaches that group's total. A group collapses to
+/// one stride only when its axes are internally dense
+/// (`stride[i] == stride[i+1] * extent[i+1]`), taking the innermost axis's
+/// stride; `None` otherwise. Extent-1 axes are dropped before the walk.
 fn collapsed_strides(layout: &Layout, groups: [u32; 3]) -> Option<[u32; 3]> {
     let shape = layout.shape();
     let strides = layout.strides();
@@ -342,9 +273,8 @@ fn build(
     let (tm, tn) = (tile.tm, tile.tn);
     let block = tile.lanes();
 
-    // One workgroup per `(batch, m block, n block)`. The n block is what was
-    // missing: lanes covered the whole n axis and were then clamped, so every
-    // column past the clamp went unwritten.
+    // One workgroup per `(batch, m block, n block)`; the n block is a grid
+    // axis so every column is covered whatever the tile width is.
     let m_blocks = m.div_ceil(tile.rows()).max(1);
     let n_blocks = n.div_ceil(tile.cols()).max(1);
     let grid = [
@@ -402,7 +332,7 @@ fn build(
     let k_idx = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&kk)), u32_ty());
 
     // `TM * TN` accumulator slots resident across the whole k nest. They are IR
-    // accumulators, not buffer traffic, which is what lets the epilogue fuse.
+    // accumulators, not buffer traffic, so the epilogue fuses onto them.
     let accs: Vec<Arc<LocalDecl>> = (0..tm * tn)
         .map(|_| Arc::new(LocalDecl::new(f32_ty)))
         .collect();
@@ -422,24 +352,14 @@ fn build(
         .map(|r| cmp(CmpOp::Lt, r.clone(), lit_u32(m)))
         .collect();
 
-    // `tn` B loads and `tm` broadcast A loads per k step, then `tm * tn` FMAs
-    // — the register-tile shape, with zero accumulator spill. The emitter
-    // memoizes identical expressions, so each operand element is read once
-    // however many accumulators consume it.
-    // Address both operands through their own layouts. `permuted_alias` in
-    // `fusor2-tile` mints a non-contiguous `Alias` for any contraction whose
-    // spec is not already in kernel axis order, and reading that densely is a
-    // miscompile, not a slowdown. A contiguous layout collapses to exactly the
-    // dense strides this kernel used to hardcode, so every previously-working
-    // plan emits byte-identical text.
+    // `tn` B loads and `tm` broadcast A loads per k step, then `tm * tn` FMAs.
+    // The emitter memoizes identical expressions, so each operand element is
+    // read once however many accumulators consume it.
     //
-    // A side is a list of operands, each with its own buffer and its own
-    // layout, all addressed by that side's `(batch, row, k)` or
-    // `(batch, k, col)` triple. One entry is the ordinary dense contraction;
-    // several is a side that absorbed a multi-buffer producer, and the only
-    // difference downstream is how many `Arg`s the side's `pre` reads.
+    // A side is a list of operands, each with its own buffer and layout, all
+    // addressed by that side's `(batch, row, k)` or `(batch, k, col)` triple.
     // Each entry is either a bound buffer with its collapsed strides, or a
-    // `Const` leaf already folded to its literal — those have no binding.
+    // `Const` leaf already folded to its literal, which has no binding.
     let bind_side = |side: &ContractSide, groups: [u32; 3], which: &str| {
         side.ops
             .iter()
@@ -462,9 +382,8 @@ fn build(
 
     // The per-axis coordinates a side's `pre` may read (an absorbed causal
     // mask does), reconstructed from the three collapsed group indices the
-    // kernel actually loops over. Each operand axis belongs to exactly one
-    // group — the same factorization `collapsed_strides` proved — so its
-    // coordinate is a divmod of that group's flat index.
+    // kernel loops over. Each operand axis belongs to exactly one group, so
+    // its coordinate is a divmod of that group's flat index.
     let side_coords = |side: &ContractSide,
                        groups: [u32; 3],
                        flats: [&TileExpr; 3]|
@@ -567,8 +486,8 @@ fn build(
         body: vec![],
     }];
 
-    // Epilogue, fused straight onto the resident accumulators: no intermediate
-    // buffer, one store per accumulator slot.
+    // Epilogue, fused onto the resident accumulators: no intermediate buffer,
+    // one store per accumulator slot.
     for i in 0..tm as usize {
         for j in 0..tn as usize {
             let acc = TileExpr::new(
@@ -639,11 +558,9 @@ mod tests {
     use super::*;
     use fusor2_ir::ir::level1::{SgemmParams, SgemvParams};
 
-    /// An extent-1 axis is not structure. A *trailing* one belongs to no group
-    /// (`ones([16, 1])` as the A operand of a `k = 1` contraction is
-    /// `[batch=1, m=16, k=1]`, the shape of every `[n, 1]` column operand in
-    /// `fusor2::sampling::row`), and an *interior* one sits between two axes
-    /// that address the same byte, so it may not be asked to bridge them.
+    /// An extent-1 axis is not structure: a trailing one belongs to no group,
+    /// and an interior one sits between two axes that address the same byte,
+    /// so it may not be asked to bridge them.
     #[test]
     fn extent_one_axes_are_not_part_of_the_addressable_structure() {
         let col = Layout::contiguous(&[Dim::Const(16), Dim::Const(1)]);
@@ -655,8 +572,7 @@ mod tests {
 
         // A broadcast KV head between the batch axis and a transposed
         // `[d, s]`: `k` is `(h=1, d=4)` at stride 1, `n` is `s=4` at stride 4.
-        // The unit axis's stride of 16 describes nothing and must not be
-        // compared against `d`'s.
+        // The unit axis's stride of 16 describes nothing.
         let gqa = Layout::from_parts(
             Dim::Const(0),
             &[Dim::Const(2), Dim::Const(1), Dim::Const(4), Dim::Const(4)],
@@ -666,9 +582,8 @@ mod tests {
         assert_eq!(collapsed_strides(&gqa, [2, 4, 4]), Some([16, 1, 4]));
     }
 
-    /// The widening is exactly the unit axes: a genuine gap between two axes
-    /// that address different bytes is still refused, and every layout that
-    /// collapsed before collapses to the same three strides.
+    /// A genuine gap between two axes that address different bytes is refused,
+    /// and dense layouts collapse to their plain strides.
     #[test]
     fn a_genuinely_unaddressable_split_is_still_refused() {
         // `[4, 4]` rows 8 apart cannot be one `m = 16` stride.
@@ -682,7 +597,7 @@ mod tests {
         // Extents that do not cover the geometry are refused, not padded.
         let small = Layout::contiguous(&[Dim::Const(4), Dim::Const(4)]);
         assert_eq!(collapsed_strides(&small, [1, 8, 4]), None);
-        // Unchanged: the dense cases this kernel used to hardcode.
+        // The plain dense cases.
         let dense_a = Layout::contiguous(&[Dim::Const(3), Dim::Const(8), Dim::Const(5)]);
         assert_eq!(collapsed_strides(&dense_a, [3, 8, 5]), Some([40, 5, 1]));
         assert_eq!(collapsed_strides(&dense_a, [24, 5, 1]), Some([5, 1, 0]));
@@ -697,9 +612,7 @@ mod tests {
         assert_eq!(konst(Dim::Const(96), "n").unwrap(), 96);
     }
 
-    /// A point that names no contraction geometry is a legality answer. The
-    /// arm this replaces invented `bn = 64`, which is how a 96-column matmul
-    /// came back with 32 columns of zeros.
+    /// A point that names no contraction geometry is refused.
     #[test]
     fn a_point_with_no_geometry_is_refused_rather_than_invented() {
         let caps = crate::caps::cpu_caps();
@@ -710,9 +623,9 @@ mod tests {
         assert!(tile_of(SchedPoint::Sgemv(SgemvParams { chunk: 2, vector: 4, subgroups: 1 }), caps).is_ok());
     }
 
-    /// `fit` narrows the tile and never the coverage: at every shape and
-    /// point, `ceil(m / rows) * ceil(n / cols)` blocks of `rows x cols` cover
-    /// the whole output and the workgroup stays inside the device's lanes.
+    /// `fit` narrows the tile and never the coverage: `ceil(m / rows) *
+    /// ceil(n / cols)` blocks of `rows x cols` cover the whole output and the
+    /// workgroup stays inside the device's lanes.
     #[test]
     fn every_fitted_tile_covers_the_whole_output() {
         let caps = crate::caps::cpu_caps();
@@ -768,11 +681,8 @@ mod tests {
 }
 
 /// The contraction nest against an f64 host reference, run on the worker pool.
-///
-/// The shapes sweep `n` across the old 64-lane boundary — `matmul::wide_n`
-/// reads exactly one of them — and every case runs at **every** schedule point
-/// the domain can hand this lowering, because a lowering whose answer depends
-/// on which legal point extraction picked is the bug this file just had.
+/// The shapes sweep `n` across the 64-lane boundary, and every case runs at
+/// every schedule point the domain can hand this lowering.
 #[cfg(test)]
 mod exec_tests {
     use super::*;
@@ -793,7 +703,7 @@ mod exec_tests {
     use crate::target::CpuTarget;
 
     /// A one-point domain for the node under test. `lower` reads the plan's
-    /// resolved point, never the node's domain, so this only has to be a real
+    /// resolved point, not the node's domain, so this only has to be a real
     /// domain rather than a schedule-less `Point`.
     fn sgemm_domain_of(theta: SchedPoint) -> ScheduleDomain {
         let p = match theta {
@@ -909,13 +819,11 @@ mod exec_tests {
             acc: Dtype::F32,
             a: ContractSide::one(ScalarExpr::arg(0, Dtype::F32), alias(&g, a_id)),
             b: ContractSide::one(ScalarExpr::arg(0, Dtype::F32), alias(&g, b_id)),
-            // A real domain rather than `Point`, so nothing in this file
-            // reads as a schedule-less mint even in a test.
             sched: sgemm_domain_of(theta),
         };
         // The node is built rather than added: `lower` reads the op and the
-        // launch, and the launch's root is the output buffer, so nothing here
-        // needs the contraction to have an e-class of its own.
+        // launch, whose root is the output buffer, so the contraction needs no
+        // e-class of its own.
         let node = Node {
             op: Op::L1(op),
             level: Level::L1,
@@ -976,8 +884,7 @@ mod exec_tests {
             n as usize,
             k as usize,
         );
-        // A reference of zeros would make every assertion below vacuous, and
-        // the defect this file had produced exactly zeros.
+        // A reference of zeros would make every assertion below vacuous.
         assert!(
             want.iter().filter(|w| w.abs() > 1e-3).count() * 4 >= want.len(),
             "the reference is degenerate at [{batch},{m},{n},{k}]"
@@ -994,9 +901,7 @@ mod exec_tests {
         }
     }
 
-    /// The regression this file exists for: every column past 64 came back
-    /// 0.0 on the shape `matmul::wide_n_columns` states, and wrong (not zero)
-    /// at wider n where a different geometry was selected.
+    /// Every output column is written, including past column 64.
     #[test]
     fn the_whole_output_is_written_past_column_64() {
         let theta = SchedPoint::Sgemv(SgemvParams { chunk: 2, vector: 4, subgroups: 1 });
@@ -1040,7 +945,8 @@ mod exec_tests {
         }
     }
 
-    /// leave the batch index recoverable.
+    /// The grid's batch index stays recoverable, so batched contractions do
+    /// not bleed into each other.
     #[test]
     fn batched_contractions_stay_separate() {
         let theta = SchedPoint::Sgemm(SgemmParams {

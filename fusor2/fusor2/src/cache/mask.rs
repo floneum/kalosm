@@ -1,22 +1,11 @@
-//! Attention masks. A causal mask is a `MaskKind::Causal` **attribute**, not a
-//! tensor: the compiler skips upper-triangle Q.K work without loading
-//! anything. `MaskCache` exists only for the genuinely data-dependent kinds.
+//! Attention masks. A causal mask is a `MaskKind::Causal` attribute, not a
+//! tensor: the compiler skips upper-triangle Q.K work without loading anything.
 //!
-//! The reference builds a `[n, n]` `-inf` triangle for every distinct sequence
-//! length, uploads it, memoizes it, and then *left-pads it with zeros* when
-//! decoding at an offset — at which point it stops being causal at all and the
-//! `is_strict_causal` fast path turns itself off. Here the same three
-//! situations are three answers from [`MaskCache::get`], and two of them
-//! upload nothing:
-//!
-//! * a square block is [`MaskKind::Causal`];
-//! * `q_len == 1` against a cache of `k_len` keys sees every key, so it is
-//!   [`MaskKind::None`];
-//! * anything else — a chunk of `q_len > 1` queries at an offset into a longer
-//!   key axis — is genuinely rectangular and needs a tensor, which is what
-//!   [`MaskCache::materialized`] builds and what `entries` memoizes.
-//!
-//! Owned by W13.
+//! [`MaskCache::get`] answers structurally in two cases: a square block is
+//! [`MaskKind::Causal`], and `q_len == 1` sees every key so it is
+//! [`MaskKind::None`]. A chunk of `q_len > 1` queries at an offset into a
+//! longer key axis needs a real tensor from [`MaskCache::materialized`], which
+//! `entries` memoizes.
 
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::ir::level1::MaskKind;
@@ -37,8 +26,7 @@ pub enum AttentionMask {
 }
 
 impl AttentionMask {
-    /// The tensor this mask carries, if it carries one. A structural mask
-    /// deliberately has none.
+    /// The tensor this mask carries; a structural mask has none.
     pub fn tensor(&self) -> Option<&Tensor> {
         match self {
             Self::Structural(_) => None,
@@ -75,10 +63,8 @@ impl MaskCache {
 
     /// The mask a `[q_len, k_len]` score block needs.
     ///
-    /// Structural whenever the shape alone decides it, which is both cases a
-    /// decode loop ever hits. The rectangular case is reported as an error
-    /// rather than guessed at, because materializing it needs a graph:
-    /// [`MaskCache::materialized`] is that entry point.
+    /// Structural whenever the shape alone decides it. A rectangular block is
+    /// an error here; it needs a graph, so use [`MaskCache::materialized`].
     pub fn get(&mut self, q_len: Dim, k_len: Dim) -> Result<AttentionMask> {
         Ok(AttentionMask::Structural(structural_kind(q_len, k_len).ok_or_else(
             || {
@@ -93,12 +79,11 @@ impl MaskCache {
     /// The additive `[q_len, k_len]` mask, uploaded once per shape.
     ///
     /// `mask[i, j] = 0` when key `j` is visible to query `i` and `-inf`
-    /// otherwise. Queries are the **last** `q_len` positions of the key axis,
-    /// which is what a chunked prefill against a warm cache means: query `i`
-    /// sits at absolute position `i + (k_len - q_len)`.
+    /// otherwise. Queries occupy the last `q_len` positions of the key axis:
+    /// query `i` sits at absolute position `i + (k_len - q_len)`.
     ///
-    /// `window` bounds how far back a query may look, mirroring the
-    /// reference's sliding-window mask; `None` is unbounded history.
+    /// `window` bounds how far back a query may look; `None` is unbounded
+    /// history.
     pub fn materialized(
         &mut self,
         graph: &Graph,
@@ -184,7 +169,6 @@ mod tests {
         assert!(m.tensor().is_none());
         assert!(c.is_empty(), "a structural mask must not be memoized");
 
-        // The symbolic square case is the whole point: no length buckets.
         let g = graph();
         let s = g.sym("len");
         assert!(matches!(

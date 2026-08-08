@@ -1,21 +1,11 @@
-//! The cooperative-matrix schedule domain: `geoms x splits x staging`.
-//! Carried whole on the node and resolved by extraction — minting every
-//! point blows the graph to ~90k nodes on a 32-layer transformer, minting a
-//! locally-Pareto top-4 lets a cheap heuristic gate the real cost model, and
-//! a nested argmin inside the node's cost is circular because the geometry
-//! determines the output's padded strides and therefore every consumer's
-//! read traffic.
+//! The cooperative-matrix schedule domain: `geoms x splits x staging`, carried
+//! whole on the node and resolved by extraction.
 //!
-//! The reference's nine-row `COOP_TILE_TABLE` is **generated**, not ported:
-//! every `(bm, bn, bk, subgroups, n_passes)` whose closed-form subgroup
-//! split exists, whose lanes fit, and whose *exact* arena footprint fits is
-//! a candidate. The `padded_macs * 4 > useful_macs * 5` routing guard and
-//! the `single_buffered` exclusion are deleted — padded MACs already enter
-//! the issue term, and `KMerged`'s constructor decides mergeability.
-//!
-//! Owned by W4.
+//! The geometry list is generated: every `(bm, bn, bk, subgroups, n_passes)`
+//! whose closed-form subgroup split exists, whose lanes fit, and whose exact
+//! arena footprint fits is a candidate. Padded MACs enter the issue term, so
+//! there is no padding routing guard.
 
-use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::ir::level1::{CoopDomain, CoopGeom};
 use fusor2_ir::ir::level2::{
@@ -39,18 +29,9 @@ const SUBGROUP_CHOICES: [u32; 6] = [1, 2, 4, 8, 16, 32];
 /// columns, which bounds `n_passes` at `bn / 16`.
 const MIN_PASS_COLS: u32 = 16;
 
-/// Compatibility entry point kept for the scaffold's `domains::coop_legal`
-/// re-export. Delegates to [`coop_domain`] with `batch = 1` and the
-/// crate-default planner.
-pub fn legal(m: Dim, n: Dim, k: Dim, operand: Dtype, acc: Dtype, caps: &Caps) -> CoopDomain {
-    let cx = DomainCtx::new(caps, crate::domains::default_planner());
-    coop_domain(m, n, k, Dim::Const(1), operand, acc, &cx)
-}
-
-/// Every legal `(geom, splits, staging)` for this contraction on this
-/// device. Empty when the device reports no usable cooperative
-/// configuration, which simply makes the `Coop` alternative unselectable —
-/// never an error.
+/// Every legal `(geom, splits, staging)` for this contraction on this device.
+/// Empty when the device reports no usable cooperative configuration, which
+/// makes the `Coop` alternative unselectable rather than an error.
 pub fn coop_domain(
     m: Dim,
     n: Dim,
@@ -60,9 +41,9 @@ pub fn coop_domain(
     acc: Dtype,
     cx: &DomainCtx<'_>,
 ) -> CoopDomain {
-    // `m`, `n` and `batch` price the domain; they do not filter it. Edge
-    // tiles fill zero past the logical extents, so no shape is illegal for
-    // any geometry — that is what deletes the reference's padding gate.
+    // `m`, `n` and `batch` price the domain; they do not filter it. Edge tiles
+    // fill zero past the logical extents, so no shape is illegal for any
+    // geometry.
     let _ = (m, n, batch);
 
     if cx.caps.coop_for(operand, acc).is_none() {
@@ -75,10 +56,9 @@ pub fn coop_domain(
     }
 
     // Splits are a domain-level list while `bk` is per-geometry, so the
-    // candidate set is the union over the surviving depths: a split count
-    // is a candidate when *some* surviving geometry admits it. A pair whose
-    // spans do not partition K exactly still runs — the split kernel bounds
-    // its K span — so the union is sound, and cost rejects the rest.
+    // candidate set is the union over the surviving depths. A pair whose spans
+    // do not partition K exactly still runs: the split kernel bounds its K
+    // span.
     let mut splits: SmallVec<[u32; 8]> = SmallVec::new();
     let mut depths: SmallVec<[u32; 3]> = SmallVec::new();
     for g in &geoms {
@@ -113,25 +93,26 @@ pub fn coop_domain(
     }
 }
 
-/// `(caps, staged element, planner identity) -> geometries`. The grid below
-/// is ~7,000 candidates each costing an exact arena query, and none of it
-/// depends on the contraction — only on the device.
+/// `(caps fingerprint, staged element, planner identity) -> geometries`. The
+/// grid is ~7,000 candidates each costing an exact arena query, and depends
+/// only on the device. The fingerprint is the digest the arena-plan memo keys
+/// on, so a hit is a `u64` compare.
 static GEOM_MEMO: crate::domains::DomainMemo<
-    (Caps, ScalarElement, usize),
+    (u64, ScalarElement, usize),
     SmallVec<[CoopGeom; 16]>,
 > = crate::domains::DomainMemo::new();
 
-/// # MEASURED: no cost term ranks these, and no analytical term fixed it
+/// # No cost term ranks these geometries
 ///
 /// Every one of the ~5,700 points this domain carries prices **identically**
-/// under the shipped cost model. `math_ps` counts MACs, which a tiling does not
+/// under the cost model. `math_ps` counts MACs, which a tiling does not
 /// change; `dram_ps` reads a reread factor derived from the index space, which
 /// a tiling does not change either. So the seed takes the argmin by domain
 /// index — whatever this function emits first — and no `RESCHEDULE` can tell
 /// the difference to move off it. A 2048-cube matmul runs at `bm=16, bn=16`.
 ///
 /// The tile is worth real time. Measured by pinning one geometry at a time
-/// through [`PIN_ENV`] on an Apple M2 Max, f32, against this workspace's
+/// through `FUSOR2_PIN_COOP` on an Apple M2 Max, f32, against this workspace's
 /// `vs_fusor1` example (median ms):
 ///
 /// | geom | `matmul` 2048-cube | attention `[1,8,1024,64]` |
@@ -145,43 +126,32 @@ static GEOM_MEMO: crate::domains::DomainMemo<
 ///
 /// **The optimum is shape-dependent and the two orderings are inverted**: the
 /// square matmul wants the narrowest tile in the set, attention one of the
-/// widest. That is why every analytical term tried against these numbers
-/// failed — four of them, each either tying (changing nothing) or regressing
-/// matmul by 2-3x: a blocked-GEMM reread count charged to `dram_ps`
-/// (matmul 20 -> 41 ms), a per-tile roofline in `node_math` (20 -> 35 ms, and
-/// it moved `argmin_member`'s *family* choice because the lower bound is built
-/// on `node_math`), the same term in the exact launch cost (no change, the
-/// tile never moved), and a device-wide `max(compute, load)` (20 -> 41 ms and
-/// Coop abandoned entirely).
+/// widest. Analytical terms over these numbers either tie or regress matmul by
+/// 2-3x: a blocked-GEMM reread count charged to `dram_ps` (matmul 20 -> 41 ms),
+/// a per-tile roofline in `node_math` (20 -> 35 ms, and it moves
+/// `argmin_member`'s *family* choice because the lower bound is built on
+/// `node_math`), the same term in the exact launch cost (no change, the tile
+/// never moves), and a device-wide `max(compute, load)` (20 -> 41 ms and Coop
+/// abandoned entirely).
 ///
-/// # The trap, and why a measured table is not a drop-in either
+/// # Reordering this list is not a fix either
 ///
-/// Reordering this domain so a measured winner sits first was built and
-/// measured too, and it **flips the family**: putting `128x64x8` first makes
-/// the seed adopt that point, the exact cost then prefers `Sgemv` over the
-/// whole `Coop` node, and attention's `1024x1024x64` contraction — Coop at
-/// baseline — lands on a matrix-*vector* kernel. So the pin sweep above is not
-/// measuring tiles in isolation; part of that 12.96 -> 7.90 is a family flip.
+/// Putting a measured winner first **flips the family**: with `128x64x8`
+/// first the seed adopts that point, the exact cost then prefers `Sgemv` over
+/// the whole `Coop` node, and attention's `1024x1024x64` contraction lands on
+/// a matrix-*vector* kernel. Part of the 12.96 -> 7.90 in the sweep above is
+/// that family flip, not the tile.
 ///
-/// The conclusion is that **selection here is not a tile problem, it is a
-/// ranking problem across tiles and families at once**, and the cost model can
-/// separate neither. The field's answer is measurement: PyTorch Inductor's
-/// `max-autotune` and Triton's `@triton.autotune` benchmark every candidate and
-/// cache the winner; TVM/Ansor learns an XGBoost model over 164 features;
-/// Halide's auto-scheduler uses 27 hand-built terms with *learned*
-/// coefficients. The one analytical model that ranks GEMM tiles well —
-/// tritonBLAS, arXiv:2512.04226, at 94.7% of exhaustive search — needs a
-/// two-level cache-hit-rate model with per-level bandwidths and a wave/tail
-/// occupancy term. `DeviceFacts` carries one `llc_bytes` and one
-/// `dram_bytes_per_us` and cannot express it.
-///
-/// Landing this properly means autotuning at the *plan* level — time the
-/// candidate plans, not the candidate tiles — so the family and the geometry
-/// are ranked by the same measurement, cached by caps fingerprint beside
-/// `fusor2_cost::cache`. Ordering this list alone is not enough.
+/// Selection here is **a ranking problem across tiles and families at once**,
+/// and the cost model separates neither. An analytical model that ranks GEMM
+/// tiles well needs a two-level cache-hit-rate model with per-level bandwidths
+/// and a wave/tail occupancy term; `DeviceFacts` carries one `llc_bytes` and
+/// one `dram_bytes_per_us` and cannot express it. Ranking them by measurement
+/// requires timing candidate *plans*, so family and geometry are ranked
+/// together.
 fn candidate_geoms_for(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopGeom; 16]> {
     let key = (
-        cx.caps.clone(),
+        cx.caps.fingerprint(),
         stage_element(operand),
         crate::domains::planner_id(cx.planner),
     );
@@ -196,8 +166,8 @@ fn generate_geoms(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopGeom; 16]
     let stage = stage_element(operand);
 
     // `FUSOR2_PIN_COOP="bm,bn,bk"` restricts the domain to one geometry, which
-    // is how the table in this module's doc was measured and how the next
-    // round should re-measure it. Ordinary runs never set it.
+    // is how the table in this module's doc is measured. Ordinary runs never
+    // set it.
     let pin: Option<(u32, u32, u32)> = std::env::var("FUSOR2_PIN_COOP").ok().and_then(|v| {
         let p: Vec<u32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         (p.len() == 3).then(|| (p[0], p[1], p[2]))
@@ -232,10 +202,10 @@ fn generate_geoms(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopGeom; 16]
 }
 
 /// One geometry, or `None` when no `(rg, cg)` factorization keeps both
-/// fragment sides whole multiples of [`CoopGeom::COOP_DIM`]. The
-/// reference's `(1, subgroups)` fallback is deleted: an unsplittable
-/// geometry is simply not a candidate, instead of reaching a kernel whose
-/// own divisibility asserts catch it at build time.
+/// fragment sides whole multiples of [`CoopGeom::COOP_DIM`]. There is no
+/// fallback split: an unsplittable geometry is simply not a candidate, so it
+/// never reaches a kernel whose divisibility asserts would catch it at build
+/// time.
 fn geom_of(bm: u32, bn: u32, bk: u32, n_passes: u32, subgroups: u32) -> Option<CoopGeom> {
     let (rg, cg) = CoopGeom::subgroup_split(bm, bn, n_passes, subgroups)?;
     Some(CoopGeom {
@@ -261,15 +231,14 @@ pub const fn stage_element(operand: Dtype) -> ScalarElement {
 /// The workgroup tiles one staged operand pair declares: a `bm x (bk + 1)`
 /// A tile and a `bk x (bn / n_passes + 1)` B tile, each less the pad after
 /// its final row, which is never addressed. The `+1` is the shared-memory
-/// bank-conflict pad, verbatim from `DenseCoopMatmulTile::stage_pair_elements`.
+/// bank-conflict pad.
 ///
-/// **This is not the tile set the emitters lay out, and the comment that
-/// said it was, was wrong.** `verify_l1::coop_tiles` is the documented single
-/// source — `check_schedule_domain` and `semantics::work` both call it, and
-/// `fusor2-gpu`'s `lower_coop` now declares exactly its shapes: an unpadded
-/// `[bm, bk]` A tile and `[bk, bn_pass]` B tile, **replicated `staging`
-/// times**, plus an f32 accumulator tile when the store element is narrower.
-/// Two consequences, in opposite directions:
+/// **This is not the tile set the emitters lay out.** `verify_l1::coop_tiles`
+/// is the single source — `check_schedule_domain` and `semantics::work` both
+/// call it, and `fusor2-gpu`'s `lower_coop` declares exactly its shapes: an
+/// unpadded `[bm, bk]` A tile and `[bk, bn_pass]` B tile, **replicated
+/// `staging` times**, plus an f32 accumulator tile when the store element is
+/// narrower. Two consequences, in opposite directions:
 ///
 /// - at `staging == 1` this formula is the *stricter* of the two (it charges
 ///   `bm + bk - 2` elements of bank pad the emitter does not allocate), so
@@ -278,11 +247,10 @@ pub const fn stage_element(operand: Dtype) -> ScalarElement {
 ///   admitted here can be one `check_schedule_domain` rejects and one whose
 ///   arena the emitter cannot pack.
 ///
-/// Nothing exercises the second case today — every coop point the conformance
-/// suite resolves is `staging: 1` at `16x16x8` — and closing it means
-/// filtering the geometry list at the deepest staging depth the domain will
-/// offer, which moves the admitted set for every contraction on the device.
-/// That is a measurement, not a patch, so it is stated rather than done.
+/// Nothing exercises the second case: every coop point the conformance suite
+/// resolves is `staging: 1` at `16x16x8`. Closing it means filtering the
+/// geometry list at the deepest staging depth the domain offers, which moves
+/// the admitted set for every contraction on the device.
 pub fn coop_tiles(geom: CoopGeom, stage: ScalarElement) -> Tiles {
     let bn_pass = geom.bn / geom.n_passes.max(1);
     let a_elems = geom.bm * (geom.bk + 1) - 1;
@@ -305,10 +273,9 @@ pub fn coop_tiles(geom: CoopGeom, stage: ScalarElement) -> Tiles {
 }
 
 /// Never-split, plus every divisor of the K loop leaving at least two
-/// iterations per workgroup, capped at [`MAX_SPLITS`]. Verbatim
-/// `split_candidates` from `core/src/matmul/cost.rs`, minus the
-/// `has_epilogues` gate — whether an epilogue survives a split is
-/// `unfuse_coop_epilogue`'s business, not the split generator's.
+/// iterations per workgroup, capped at [`MAX_SPLITS`]. Epilogues do not gate
+/// this — whether an epilogue survives a split is `unfuse_coop_epilogue`'s
+/// business, not the split generator's.
 ///
 /// A symbolic `k` cannot be divided at compile time, so it emits `[1]`.
 pub fn split_candidates(k: Dim, bk: u32) -> Vec<u32> {
@@ -329,14 +296,15 @@ mod tests {
     use super::*;
     use crate::domains::testing::{apple_caps, baseline_caps, no_coop_caps};
     use crate::domains::{DomainCtx, default_planner};
+    use fusor2_ir::device::Caps;
     use fusor2_ir::shape::SymId;
 
     fn ctx(caps: &Caps) -> DomainCtx<'_> {
         DomainCtx::new(caps, default_planner())
     }
 
-    /// The reference's `CoopTileEntry::subgroup_split`, re-derived here so
-    /// the expectation is the algorithm rather than a copied constant.
+    /// The subgroup-split objective, re-derived here so the expectation is the
+    /// algorithm rather than a copied constant.
     fn reference_split(bm: u32, bn: u32, n_passes: u32, subgroups: u32) -> (u32, u32) {
         const COOP_DIM: u32 = 8;
         let bn_pass = bn / n_passes;
@@ -361,8 +329,7 @@ mod tests {
         }
     }
 
-    /// The nine rows of the deleted `COOP_TILE_TABLE`, as
-    /// `(bm, bn, bk, subgroups, n_passes)`.
+    /// Nine reference geometries, as `(bm, bn, bk, subgroups, n_passes)`.
     const REFERENCE_ROWS: [(u32, u32, u32, u32, u32); 9] = [
         (256, 256, 16, 8, 8),
         (128, 512, 16, 8, 8),
@@ -394,8 +361,7 @@ mod tests {
         // objective and not a table.
         assert_eq!(CoopGeom::subgroup_split(64, 128, 2, 8), Some((2, 4)));
         assert_eq!(CoopGeom::subgroup_split(128, 64, 1, 8), Some((4, 2)));
-        // No factorization keeps both sides whole: not a candidate, rather
-        // than the reference's `(1, subgroups)` fallback.
+        // No factorization keeps both sides whole: not a candidate.
         assert_eq!(CoopGeom::subgroup_split(16, 16, 1, 8), None);
     }
 
@@ -480,10 +446,8 @@ mod tests {
 
     #[test]
     fn padded_shapes_are_not_declined() {
-        // The reference pins `1x4096x4096 => Coop tile=None`: the family
-        // selector picks Coop, the tile scorer declines on its padding
-        // gate, and production silently runs a third path. Here Coop stays
-        // a live candidate and loses on cost or does not.
+        // At `1x4096x4096` Coop stays a live candidate: no padding gate
+        // declines it, it either loses on cost or does not.
         let caps = apple_caps();
         let cx = ctx(&caps);
         let d = coop_domain(

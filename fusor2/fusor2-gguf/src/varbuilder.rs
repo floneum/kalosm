@@ -1,11 +1,9 @@
 //! The synchronous `VarBuilder`: a prefixed view over a GGUF file's tensor
 //! directory.
 //!
-//! `get` returns **bytes**, not a device tensor: this crate has no device and
-//! no `Target`. The `fusor2` facade turns a [`RawTensorBytes`] into a
-//! `LeafKind::Quantized` leaf and lets extraction decide whether to repack it.
-//!
-//! Owned by W11.
+//! `get` returns bytes, not a device tensor. The `fusor2` facade turns a
+//! [`RawTensorBytes`] into a `LeafKind::Quantized` leaf and lets extraction
+//! decide whether to repack it.
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::{Dtype, QLayout};
@@ -18,9 +16,8 @@ use crate::parse::{Gguf, GgufMetadata, GgufTensor, GgufValue, ingest_qfmt};
 /// One tensor as it sits in the file: raw bytes plus enough type information
 /// to build a leaf.
 ///
-/// `layout` is always [`QLayout::Native`] here — a GGUF file stores the raw
-/// block bytes, and moving to `F32Scales` is the priced `qrepack` rewrite, not
-/// something a loader decides.
+/// `layout` is always [`QLayout::Native`]: a GGUF file stores the raw block
+/// bytes, and moving to `F32Scales` is the priced `qrepack` rewrite.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawTensorBytes {
     pub name: Box<str>,

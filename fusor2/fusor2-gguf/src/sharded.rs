@@ -2,8 +2,6 @@
 //!
 //! Lookup is first-match in shard order, which is stable across runs, for both
 //! tensors and metadata.
-//!
-//! Owned by W11.
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::QLayout;

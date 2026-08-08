@@ -2,8 +2,6 @@
 //! binaries. Every one of these is **one `L0::Map` with a different
 //! `ScalarExpr`** — there is no 50-variant opcode enum whose discriminant
 //! ordering ends up load-bearing in a kernel cache key.
-//!
-//! Owned by W12.
 
 use fusor2_ir::scalar::{BinOp, ScalarExpr, UnOp};
 
@@ -73,18 +71,17 @@ impl Tensor {
         self.map1(ScalarExpr::bin(BinOp::Sub, pos, neg))
     }
 
-    // NOTE: `tanh_exact` lives in W13's `composite/activations.rs`, which
-    // builds the exact `(e^x - e^-x) / (e^x + e^-x)` form. Defining it here
-    // as `Un(Tanh)` under a STRICT contract would collide, and L0 has no
-    // carrier for a per-node `NumericContract` anyway — see the crate report.
+    // `tanh_exact` lives in `composite/activations.rs`, which builds the exact
+    // `(e^x - e^-x) / (e^x + e^-x)` form. It cannot be spelled here as
+    // `Un(Tanh)` under a strict contract: L0 carries no per-node
+    // `NumericContract`.
 
     /// `exp` under a relaxed accuracy contract.
     ///
     /// Its **own** [`UnOp`], not sugar for [`Tensor::exp`]: hash-consing would
     /// otherwise merge a relaxed exponential with a strict one and a target
     /// could never substitute a cheaper sequence for the first without
-    /// changing the second. Both currently lower to the target's exponential,
-    /// which is what the reference does with `NaryOp::ApproximateExp`.
+    /// changing the second. Both lower to the target's exponential.
     pub fn approximate_exp(&self) -> Result<Tensor> {
         self.map1(ScalarExpr::un(UnOp::ApproximateExp, self.arg0()))
     }
@@ -93,13 +90,6 @@ impl Tensor {
     pub fn less_approximate_exp(&self) -> Result<Tensor> {
         self.map1(ScalarExpr::un(UnOp::LessApproximateExp, self.arg0()))
     }
-
-    /// Unpack a `u32` of two packed f16s into a 2-lane f32 vector.
-    pub fn unpack2x16_float(&self) -> Result<Tensor> {
-        self.map1(ScalarExpr::un(UnOp::Unpack2x16Float, self.arg0()))
-    }
-
-    // -- same-rank binaries ---------------------------------------------------
 
     fn bin_same(&self, rhs: &Tensor, op: BinOp, what: &str) -> Result<Tensor> {
         if self.dtype() != rhs.dtype() {
@@ -129,8 +119,7 @@ impl Tensor {
     pub fn div(&self, rhs: &Tensor) -> Result<Tensor> {
         self.bin_same(rhs, BinOp::Div, "div")
     }
-    /// Elementwise `a % b`. Integer only, matching the reference's SIMD
-    /// coverage.
+    /// Elementwise `a % b`. Integer dtypes only.
     pub fn rem(&self, rhs: &Tensor) -> Result<Tensor> {
         if !self.dtype().is_int() {
             return Err(Error::Dtype(format!(
@@ -152,8 +141,6 @@ impl Tensor {
     pub fn minimum(&self, rhs: &Tensor) -> Result<Tensor> {
         self.bin_same(rhs, BinOp::Min, "minimum")
     }
-
-    // -- broadcasting binaries -------------------------------------------------
 
     fn bin_broadcast(&self, rhs: &Tensor, op: BinOp, what: &str) -> Result<Tensor> {
         let (a, b, _) = crate::broadcast::broadcast_pair(self, rhs)?;
@@ -181,23 +168,23 @@ impl Tensor {
         self.bin_broadcast(rhs, BinOp::Pow, "pow_")
     }
 
-    /// Scaffold spelling of [`Tensor::add_`].
+    /// Alias of [`Tensor::add_`].
     pub fn broadcast_add(&self, rhs: &Tensor) -> Result<Tensor> {
         self.add_(rhs)
     }
-    /// Scaffold spelling of [`Tensor::sub_`].
+    /// Alias of [`Tensor::sub_`].
     pub fn broadcast_sub(&self, rhs: &Tensor) -> Result<Tensor> {
         self.sub_(rhs)
     }
-    /// Scaffold spelling of [`Tensor::mul_`].
+    /// Alias of [`Tensor::mul_`].
     pub fn broadcast_mul(&self, rhs: &Tensor) -> Result<Tensor> {
         self.mul_(rhs)
     }
-    /// Scaffold spelling of [`Tensor::div_`].
+    /// Alias of [`Tensor::div_`].
     pub fn broadcast_div(&self, rhs: &Tensor) -> Result<Tensor> {
         self.div_(rhs)
     }
-    /// Scaffold spelling of [`Tensor::pow_`].
+    /// Alias of [`Tensor::pow_`].
     pub fn broadcast_pow(&self, rhs: &Tensor) -> Result<Tensor> {
         self.pow_(rhs)
     }
@@ -218,9 +205,7 @@ impl Tensor {
     }
 }
 
-// ---------------------------------------------------------------------------
 // std::ops, all four owned x ref combinations, panicking on the Result
-// ---------------------------------------------------------------------------
 
 macro_rules! std_binop {
     ($trait:ident, $method:ident, $call:ident) => {
@@ -289,9 +274,9 @@ mod tests {
         }
     }
 
-    /// The three exponentials are three nodes. They were all `UnOp::Exp`, so
-    /// `approximate_exp(x)` and `exp(x)` hash-consed to one value and the
-    /// accuracy contract had nowhere to live.
+    /// The three exponentials are three nodes, so `approximate_exp(x)` and
+    /// `exp(x)` do not hash-cons together and the accuracy contract has
+    /// somewhere to live.
     #[test]
     fn the_three_exponentials_are_three_distinct_nodes() {
         let a = ScalarExpr::arg(0, Dtype::F32);

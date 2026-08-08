@@ -1,14 +1,9 @@
 //! Host-side repack between the two on-device storage layouts.
 //!
-//! Both layouts are legal inputs everywhere; moving between them is a priced
-//! rewrite (`qrepack`, amortized over `Persistence::Persistent`), so a device
-//! that never runs the alignment-sensitive kernel no longer pays the extra
-//! bytes to satisfy that kernel's addressing requirement.
-//!
-//! Nothing here chooses a layout. `repack` moves bytes between two layouts the
-//! caller names; R8 prices the move.
-//!
-//! Owned by W11.
+//! Both layouts are legal inputs everywhere, and moving between them is a
+//! priced rewrite (`qrepack`, amortized over `Persistence::Persistent`).
+//! `repack` moves bytes between two layouts the caller names; it chooses
+//! nothing.
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::{QFmt, QLayout};
@@ -20,8 +15,8 @@ use crate::blocks::{block_fields, qh_width, ql_width};
 ///
 /// `Native -> F32Scales` widens each f16 scale (and `min`, where the format
 /// carries one) to f32 and copies the remaining planes to their new offsets.
-/// `F32Scales -> Native` narrows; that direction is lossless because the f32
-/// was produced from an f16 in the first place. `from == to` is a memcpy.
+/// `F32Scales -> Native` narrows, losslessly, since the f32 came from an f16.
+/// `from == to` is a memcpy.
 ///
 /// Appends to `dst`; the caller may reuse a buffer across weights.
 pub fn repack(fmt: QFmt, from: QLayout, to: QLayout, src: &[u8], dst: &mut Vec<u8>) -> Result<()> {

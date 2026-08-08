@@ -1,17 +1,11 @@
 //! Six formats x two layouts, plus `qrepack` round-tripping.
 //!
-//! The oracle everywhere in this area is
-//! [`fusor2_gguf::blocks::cpu_dequantize_block`]: one raw block in, its
-//! elements out. Comparing a device dequantize against that scalar decoder is
-//! what makes "the GPU decode program and the CPU decode program agree" a
-//! statement about the format rather than about two implementations agreeing
-//! with each other.
+//! The oracle throughout is [`fusor2_gguf::blocks::cpu_dequantize_block`]: one
+//! raw block in, its elements out.
 //!
-//! `QLayout` is deliberately *not* a property of a format: both layouts are
-//! legal inputs for all six, so every value case runs twice and the repack
-//! between them has to be byte-exact in both directions.
-//!
-//! Owned by W14.
+//! `QLayout` is not a property of a format: both layouts are legal inputs for
+//! all six, so every value case runs twice and the repack between them is
+//! byte-exact in both directions.
 
 use fusor2::{Dtype, QMatrix, Session};
 use fusor2_gguf::blocks::{block_fields, cpu_dequantize_block, word_aligned};
@@ -37,10 +31,8 @@ fn backend_of(session: &Session) -> &'static str {
 /// A well-formed block: an explicit finite scale (and min, where the format
 /// carries one) plus a deterministic quant payload.
 ///
-/// Random bytes would work for a decode comparison — the host oracle reads the
-/// same bytes — but a random f16 scale is NaN or Inf about 1 time in 2000, and
-/// a NaN compares unequal to itself. So the scale fields are written and the
-/// rest is filled.
+/// The scale fields are written explicitly because a random f16 scale is NaN
+/// or Inf about 1 time in 2000, and a NaN compares unequal to itself.
 fn make_block(fmt: QFmt, layout: QLayout, seed: u32) -> Vec<u8> {
     let fields = block_fields(fmt, layout);
     let bytes = fmt.block_bytes(layout) as usize;
@@ -124,13 +116,9 @@ pub fn cases() -> Cases {
             cases.push("quantized", name, move |s| dequantize_case(s, fmt, layout));
         }
     }
-    // The same decode forced through the `Restride` + `Map` expansion, with
-    // no `L0::Dequant` in the class for the extractor to fall back to. The
-    // sugared case above proves only that *some* class member is right.
-    // Both layouts wherever the block stride is a whole number of `u32` words,
-    // which is the one thing the expansion still needs: an f16 scale is now
-    // decoded by bit arithmetic, but a block that straddles a word is not
-    // addressable by a `Restride` over the word stream at all.
+    // The same decode forced through the `Restride` + `Map` expansion, with no
+    // `L0::Dequant` in the class. The expansion needs a block stride that is a
+    // whole number of `u32` words, so only word-aligned rows run.
     for fmt in QFmt::ALL {
         for layout in [QLayout::Native, QLayout::F32Scales] {
             if !word_aligned(fmt, layout) {
@@ -171,8 +159,8 @@ pub fn cases() -> Cases {
         let name = format!("qmatmul_coop_shape_{}", fmt_name(fmt));
         cases.push("quantized", name, move |s| qmatmul_coop_shape(s, fmt));
     }
-    // ... and the same geometry with the defn as the *only* class member, so
-    // the unpack `Map` really does run inside the staging fill.
+    // The same geometry with the defn as the only class member, so the unpack
+    // `Map` runs inside the staging fill.
     for fmt in QFmt::ALL {
         for layout in [QLayout::Native, QLayout::F32Scales] {
             if !word_aligned(fmt, layout) {
@@ -192,18 +180,11 @@ pub fn cases() -> Cases {
 }
 
 
-/// A quantized matmul at a shape the **cooperative-matrix** path can take.
+/// A quantized matmul at a shape the cooperative-matrix path can take, where
+/// the decode runs inside the coop staging fill. The other cases here are
+/// `m=2, n=3, k=32` and resolve to `L1::KQContract`.
 ///
-/// Every other case in this file is `m=2, n=3, k=32`, which is far below any
-/// coop geometry, so they all resolve to `L1::KQContract` and say nothing about
-/// the dense-family path. That mattered the moment a quantized operand became
-/// admissible to `Family::Coop`: the decode moved into the coop staging fill,
-/// and nothing here would have caught it decoding to the wrong values.
-///
-/// The oracle is the *dequantized dense* matmul of the same weight, so this
-/// asserts the two paths agree rather than re-deriving the arithmetic. A
-/// mismatch means the staging-fill decode addresses the block differently from
-/// the reference decode.
+/// The oracle is the dequantized dense matmul of the same weight.
 fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
     const M: u64 = 64;
     const N: u64 = 64;
@@ -214,9 +195,8 @@ fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
     let k = be * 8;
 
     let graph = graph_of(session);
-    // Valid blocks, not random bytes: several formats carry f16 scales, and
-    // arbitrary bytes decode to NaN — which compares unequal to itself and
-    // fails the case for a reason that has nothing to do with the kernel.
+    // Valid blocks, not random bytes: an arbitrary f16 scale decodes to NaN,
+    // which compares unequal to itself.
     let blocks = ((k / be) * N) as usize;
     let (bytes, _) = block_rows(fmt, layout, 3301, blocks);
     let w = graph
@@ -252,20 +232,12 @@ fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
     Ok(())
 }
 
-/// The `Map`-spelled decode driven through a **cooperative** contraction.
+/// The `Map`-spelled decode driven through a cooperative contraction.
 ///
-/// [`qmatmul_coop_shape`] runs at `QLayout::Native`, where `dequant_defn`
-/// returns `None`, so it resolves to `L1::KQContract` and proves nothing at
-/// all about the definitional expansion — a decode rewritten there could pass
-/// it without ever executing. This is the `F32Scales` twin: `dequantize_slow`
-/// leaves the `Restride` + `Map` as the only member of the class, so the
-/// contraction has no quantization-aware node to fall back to and the unpack
-/// bit-arithmetic has to survive being substituted into the staging fill at a
-/// geometry several `bk` deep.
-///
-/// The oracle is the host decode uploaded dense, so a mismatch means the
-/// staging fill addresses the block stream differently from
-/// `cpu_dequantize_block`.
+/// `dequantize_slow` leaves the `Restride` + `Map` as the only member of the
+/// class, so the contraction has no quantization-aware node to fall back to
+/// and the unpack bit-arithmetic is substituted into the staging fill at a
+/// geometry several `bk` deep. The oracle is the host decode uploaded dense.
 fn defn_coop_shape(session: &Session, fmt: QFmt, layout: QLayout) -> CaseResult {
     const M: u64 = 64;
     const N: u64 = 64;
@@ -362,17 +334,13 @@ fn dequantize_case(session: &Session, fmt: QFmt, layout: QLayout) -> CaseResult 
 }
 
 /// The decode spelled as a `Restride` over the block stream read as `u32`
-/// words plus a `Map` of unpack bit-arithmetic — `L0::Dequant`'s definitional
-/// expansion, with the sugar deliberately absent.
+/// words plus a `Map` of unpack bit-arithmetic: `L0::Dequant`'s definitional
+/// expansion, built alone by `dequantize_slow` so no other class member can
+/// run instead.
 ///
-/// `dequantize` unions the two, and extraction is free to pick either, so the
-/// sugared case says nothing about which arithmetic ran. `dequantize_slow`
-/// builds the expansion alone, which is what makes this a statement about the
-/// bit arithmetic on **both** backends.
-///
-/// Both layouts have an expansion wherever the block stride is word-aligned:
+/// Both layouts have an expansion wherever the block stride is word-aligned;
 /// an f16 scale decodes through the same `Shr`/`BitAnd`/`Exp2` arithmetic as
-/// everything else in the block, so `Native` is held to the same bar.
+/// the rest of the block.
 fn dequantize_defn_case(session: &Session, fmt: QFmt, layout: QLayout) -> CaseResult {
     let (bytes, expected) = quantized_rows(fmt, layout);
     let graph = graph_of(session);
@@ -396,8 +364,7 @@ fn dequantize_defn_case(session: &Session, fmt: QFmt, layout: QLayout) -> CaseRe
 }
 
 /// An activation against a quantized weight. The result must equal the dense
-/// matmul against the *reference-decoded* weight — which program extraction
-/// picked is invisible here, which is the point.
+/// matmul against the reference-decoded weight.
 fn qmatmul_case(session: &Session, fmt: QFmt) -> CaseResult {
     const BATCH: usize = 2;
     let layout = QLayout::Native;
@@ -434,9 +401,8 @@ fn qmatmul_case(session: &Session, fmt: QFmt) -> CaseResult {
     Ok(())
 }
 
-/// Gradients flow to the activation only. The weight is quantized and
-/// non-trainable through this route — that is exactly why QAT keeps a separate
-/// f32 master rather than a quantized backward kernel.
+/// Gradients flow to the activation only; a quantized weight is not trainable
+/// through this route.
 fn qmatmul_backward(session: &Session) -> CaseResult {
     const BATCH: usize = 2;
     let fmt = QFmt::Q8_0;
@@ -631,17 +597,11 @@ fn fields_tile(_session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// A quantized embedding lookup. Row `i` of the result must be exactly what
-/// the scalar reference decodes source row `idx[i]` to — for every format and
-/// both layouts, with the picks out of order and one row repeated, so a
-/// lookup that quietly returned rows `0..n` would not survive.
+/// A quantized embedding lookup. Row `i` of the result is what the scalar
+/// reference decodes source row `idx[i]` to, for every format and both
+/// layouts, with the picks out of order and one row repeated.
 ///
-/// The lookup is `Dequant` then `Gather`, so nothing here claims the dense
-/// table is skipped: `GatherMode::QuantizedRows` is minted only from a
-/// `Gather` whose *operand* is quantized, and that node's class carries the
-/// source's `Q(fmt)` dtype while both backends' gather bodies already decode,
-/// so the consuming `Dequant` decodes twice and the values are wrong. The
-/// fused mode is a tile-rule change away; the values are not waiting on it.
+/// The lookup is `Dequant` then `Gather`.
 fn index_select_rows(session: &Session) -> CaseResult {
     // Out of order, one repeat, and neither end of the table first.
     const PICKS: &[u32] = &[2, 0, 2, 1];
@@ -683,8 +643,8 @@ fn index_select_rows(session: &Session) -> CaseResult {
                 &want,
             )?;
 
-            // The picks are not the identity, so a lookup that ignored `idx`
-            // would have to be caught above. Say so, rather than trusting it.
+            // The picks must not start at source row 0, or a lookup that
+            // ignores `idx` passes the comparison above.
             if want[..cols] == decoded[..cols] {
                 return Err(format!(
                     "{fmt:?}/{layout:?}: the picks start with source row 0, which makes \
@@ -736,16 +696,14 @@ fn index_select_rows(session: &Session) -> CaseResult {
 /// Fused QKV projections concatenate three quantized weights row-wise without
 /// decoding them.
 ///
-/// Two claims. The block stream is row-major in blocks, so the concatenation
-/// is a byte append and the result must decode to the concatenation of the
-/// parts — checked for every format and both layouts. And the whole reason to
-/// concatenate is to issue one projection instead of three, so
-/// `q_mat_mul` against the concatenated weight must equal the three separate
-/// products stacked, and both must equal the host reference built from the
-/// reference decoder.
+/// The block stream is row-major in blocks, so the concatenation is a byte
+/// append and the result decodes to the concatenation of the parts, for every
+/// format and both layouts. `q_mat_mul` against the concatenated weight must
+/// equal the three separate products stacked, and both must equal the host
+/// reference.
 fn concat_rows(session: &Session) -> CaseResult {
-    // Unequal row counts, because a QKV fusion with grouped-query attention
-    // has them: equal parts would hide an offset bug in the byte append.
+    // Unequal row counts, as a QKV fusion with grouped-query attention has:
+    // equal parts would hide an offset bug in the byte append.
     const PARTS: [(u32, usize); 3] = [(3_100, 3), (3_200, 2), (3_300, 4)];
     let total: u64 = PARTS.iter().map(|(_, r)| *r as u64).sum();
 
@@ -811,9 +769,8 @@ fn concat_rows(session: &Session) -> CaseResult {
             at += rows;
         }
 
-        // Both against the reference-decoded weight. A quantized dot
-        // accumulates in f32 over up to 256 terms, so the bar is the one
-        // `qmatmul_case` uses.
+        // Both against the reference-decoded weight, at the relative bar a
+        // 256-term f32 quantized dot needs.
         let mut expected = vec![0.0f32; BATCH * total as usize];
         for b in 0..BATCH {
             for r in 0..total as usize {
@@ -946,8 +903,8 @@ mod tests {
 
     #[test]
     fn the_two_layouts_of_a_generated_block_are_a_repack_apart() {
-        // Guards `layouts_agree`: the widened bytes really do decode to the
-        // same values, independently of any device.
+        // The widened bytes decode to the same values, with no device
+        // involved.
         for fmt in QFmt::ALL {
             let (native, values) = quantized_rows(fmt, QLayout::Native);
             let mut widened = Vec::new();

@@ -1,24 +1,14 @@
-//! Rewrite rules that recover the reference's hand-fused backwards from the
-//! *composed* backward this crate generates.
+//! Rewrite rules that recover hand-fused backward forms from the *composed*
+//! backward this crate generates.
 //!
-//! These are the L0 -> L0 half. The four `KFlash` rules the architecture names
-//! are L1 (`KFold`/`KContract`-headed) and therefore live in
-//! `fusor2-ir/src/rules/flash.rs`; autograd runs before saturation and cannot
-//! see an L1 node, so they could not be written here.
+//! These are the L0 -> L0 half. The four `KFlash` rules are L1
+//! (`KFold`/`KContract`-headed) and live in `fusor2-ir/src/rules/flash.rs`;
+//! autograd runs before saturation and cannot see an L1 node.
 //!
-//! All three are `Additive`. The composed chain always stays live in the same
-//! e-class; these rules only add, so extraction — not rule order — decides.
-//! Each reads only [`Facts`], and each takes `NumericContract::reassoc` as its
-//! legality guard, because every one of them re-associates float arithmetic.
-//!
-//! The architecture calls these a tripwire backed by `resolves_in::<N>` asserts
-//! on eight named backward shapes. **Those asserts are not in the suite yet**,
-//! so nothing outside this file notices a rule that stops firing. The
-//! `on_a_real_tape` module below is the standing substitute: it differentiates
-//! a primal and fires the rule on the node the walk emitted, which is how the
-//! shape mismatch in [`logistic_normalize`] was found.
-//!
-//! Owned by W5.
+//! All three are `Additive`. The composed chain stays live in the same
+//! e-class, so extraction decides, not rule order. Each reads only [`Facts`]
+//! and takes `NumericContract::reassoc` as its legality guard, because every
+//! one re-associates float arithmetic.
 
 use fusor2_ir::egraph::{Builder, Facts, Id, Rule, RuleTag};
 use fusor2_ir::ir::level0::{EinSpec, L0, Label};
@@ -51,23 +41,18 @@ rule!(
     apply = attention_backward,
 );
 
-/// Every adjoint-recovery rule, in a fixed order (reproducibility only).
+/// Every adjoint-recovery rule, in a fixed order.
 pub static ADJOINT_RULES: &[Rule] = &[SOFTPLUS_BCE_ADJOINT, SOFTMAX_JACOBIAN, ATTENTION_BACKWARD];
 
 /// Rewrite the taped softplus-BCE chain's adjoint to the single-sigmoid form.
 ///
-/// Differentiating `w*softplus(x) - x*z` leaves the logistic factor in the
-/// form `exp(u) / (1 + exp(u))`, which is `inf/inf = NaN` once `exp(u)`
-/// overflows. The mathematically identical `1 / (1 + exp(-u))` is not.
-/// Unioning it in is what lets the trainer's `distillation_loss` be the plain
-/// taped chain instead of a hand-written analytic node.
+/// Differentiating `w*softplus(x) - x*z` leaves the logistic factor as
+/// `exp(u) / (1 + exp(u))`, which is `inf/inf = NaN` once `exp(u)` overflows.
+/// The identical `1 / (1 + exp(-u))` is not.
 ///
-/// The differentiator does not hand that factor over bare. `d/dx log(1 + e)`
-/// with `e = exp(u)` comes out as `(g / (1 + e)) * e` — the incoming adjoint
-/// is *inside* the quotient and the `exp` is a separate factor outside it. A
-/// pattern that only matched `Div(exp(u), 1 + exp(u))` therefore never fired
-/// on a real tape; the scaled form is matched too, and rewrites to
-/// `g * (1 / (1 + exp(-u)))`.
+/// The differentiator emits the factor scaled: `d/dx log(1 + e)` with
+/// `e = exp(u)` comes out as `(g / (1 + e)) * e`, so that form is matched as
+/// well as the bare `Div(exp(u), 1 + exp(u))`.
 pub fn softplus_bce_adjoint(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     if !f.own().numeric.reassoc {
         return None;
@@ -91,8 +76,8 @@ pub fn softplus_bce_adjoint(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<
 /// * `exp(u) / (1 + exp(u))`      -> `1 / (1 + exp(-u))`
 /// * `(g / (1 + exp(u))) * exp(u)` -> `g * (1 / (1 + exp(-u)))`
 ///
-/// with either operand order at every commutative position. The second is the
-/// one the map differentiator actually emits.
+/// with either operand order at every commutative position. The second is what
+/// the map differentiator emits.
 fn logistic_normalize(e: &ScalarExpr) -> Option<ScalarExpr> {
     match e.kind() {
         ScalarKind::Bin {
@@ -177,10 +162,8 @@ fn sigmoid_of(one: &ScalarExpr, u: &ScalarExpr) -> ScalarExpr {
 
 /// Recover the analytic softmax Jacobian from the composed backward.
 ///
-/// The composed form is `dS = P*dP - P*rowsum(dP*P)`, two multiplies over the
-/// full row. `dS = P * (dP - rowsum(dP*P))` is one, and is exactly the fused
-/// rule the reference hand-writes. Distributivity over a shared factor is the
-/// whole of it.
+/// The composed form `dS = P*dP - P*rowsum(dP*P)` is two multiplies over the
+/// full row; `dS = P * (dP - rowsum(dP*P))` is one.
 pub fn softmax_jacobian(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     if !f.own().numeric.reassoc {
         return None;
@@ -247,15 +230,10 @@ fn factor_shared(e: &ScalarExpr) -> Option<ScalarExpr> {
 /// other matmul backward) is written as, and mint an `L0::Contract` beside it.
 ///
 /// `dq = ds @ k`, `dk = ds^T @ q` and `dv = p^T @ grad_o` all arrive as
-/// `Fold{Add}(Map(Mul(a, b)))` over broadcast views of two lower-rank
-/// tensors. Left as a fold, each is a generic reduce; recognized as a
-/// contraction, each becomes one `KContract` chain with `Coop`, `Sgemm`,
-/// `Sgemv` and `GenericFold` all live in the same class — which is exactly
-/// what keeps the fused-backward tripwire from firing.
-///
-/// The `mul`+`fold` form stays in the class: this rule only adds, so a
-/// product node with two consumers keeps both options and the cost model,
-/// not a consumer count, decides.
+/// `Fold{Add}(Map(Mul(a, b)))` over broadcast views of two lower-rank tensors.
+/// Recognized as a contraction, each becomes one `KContract` chain with `Coop`,
+/// `Sgemm`, `Sgemv` and `GenericFold` live in the same class. The `mul`+`fold`
+/// form stays in the class, so the cost model decides.
 pub fn attention_backward(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     if !f.own().numeric.reassoc {
         return None;
@@ -356,8 +334,7 @@ fn is_plain_product(expr: &ScalarExpr) -> bool {
 
 /// The base tensor behind a broadcast view, plus the index labels it reads.
 /// `None` when the view is anything other than a pure right-order broadcast:
-/// a slice, a stride, a permutation or a reshape all disqualify *this*
-/// rewrite and nothing else.
+/// a slice, a stride, a permutation or a reshape all disqualify this rewrite.
 fn operand_labels(
     b: &Builder<'_>,
     v: Id,
@@ -401,7 +378,6 @@ fn operand_labels(
     }
 }
 
-// ------------------------------------------------------------------ helpers
 
 /// Bottom-up rewrite: apply `f` at every node, innermost first. Returns
 /// `None` when nothing changed, so a rule that would union a node with
@@ -523,7 +499,7 @@ mod tests {
 
     /// Every member of `id`'s class.
     fn members(g: &EGraph, id: Id) -> Vec<Id> {
-        g.members(g.class_of(id))
+        g.members(g.class_of(id)).into_vec()
     }
 
     #[test]
@@ -742,8 +718,7 @@ mod tests {
             }))
             .unwrap();
         // Both operands read every axis, so every surviving label is a batch
-        // label and the "contraction" is a diagonal — a legal `EinSpec`, and
-        // one this rule is happy to mint.
+        // label and the contraction is a diagonal, which is a legal `EinSpec`.
         assert!(fire(&mut g, &ATTENTION_BACKWARD, folded).is_some());
     }
 
@@ -783,10 +758,8 @@ mod tests {
 
 #[cfg(test)]
 mod on_a_real_tape {
-    //! The rules above are only worth having if they fire on what the
-    //! *adjoint walk* emits, not on a hand-built node in the shape the rule
-    //! was written for. These cases build a primal, differentiate it with
-    //! [`crate::backward`], and fire the rule on the node that comes out.
+    //! Cases that build a primal, differentiate it with [`crate::backward`],
+    //! and fire a rule on the node the adjoint walk emits.
 
     use super::*;
     use crate::backward::backward_into;
@@ -827,8 +800,8 @@ mod on_a_real_tape {
         .unwrap()
     }
 
-    /// `max(x, 0) + log(1 + exp(-|x|))`, character for character the
-    /// expression `fusor2::composite::activations::softplus_expr` builds.
+    /// `max(x, 0) + log(1 + exp(-|x|))`, the expression
+    /// `fusor2::composite::activations::softplus_expr` builds.
     fn softplus_expr() -> ScalarExpr {
         let d = Dtype::F32;
         let x = ScalarExpr::arg(0, d);
@@ -862,7 +835,7 @@ mod on_a_real_tape {
         };
         let seed = ones(&mut g, &[6]);
         let grads = backward_into(&mut g, &caps(), y, seed, &[x]).unwrap();
-        let dx = grads[0].expect("softplus is differentiable");
+        let dx = grads[0];
 
         let alt = fire(&mut g, &SOFTPLUS_BCE_ADJOINT, dx)
             .expect("the rule must fire on the adjoint the tape emits");
@@ -893,9 +866,8 @@ mod on_a_real_tape {
         }
     }
 
-    /// The scaled form is the whole point: `(g / (1 + e)) * e` is what the
-    /// differentiator writes, and the bare `e / (1 + e)` it used to require
-    /// never appears.
+    /// `(g / (1 + e)) * e` is what the differentiator writes; a bare
+    /// `e / (1 + e)` never appears on a tape.
     #[test]
     fn the_bare_quotient_alone_is_not_what_a_tape_emits() {
         let d = Dtype::F32;
@@ -952,10 +924,9 @@ mod on_a_real_tape {
         assert!(rewrite(&once, &logistic_normalize).is_none(), "and only once");
     }
 
-    /// The composed softmax backward is *not* one `Map` — every primitive
-    /// gets its own — so `softmax_jacobian`'s `p*dP - p*R` pattern cannot
-    /// appear until map-into-map fusion has merged them. This pins the
-    /// boundary rather than pretending the rule fires today.
+    /// The composed softmax backward is one `Map` per primitive, so
+    /// `softmax_jacobian`'s `p*dP - p*R` pattern cannot appear until
+    /// map-into-map fusion merges them.
     #[test]
     fn the_softmax_jacobian_needs_map_fusion_that_does_not_run_yet() {
         let mut g = graph();

@@ -24,9 +24,8 @@ pub enum L1 {
 
     /// A reduction nest over a [`Carrier`]. `space` is
     /// `free.. ++ vec.. ++ [reduced]`; the carrier owns the element
-    /// expression (`lift`, which is where the old `pre` went), the per-slot
-    /// identities and the merge, so a multi-slot accumulator is expressible
-    /// and there is no `TileReduceOp` to resolve for a whole fold.
+    /// expression (`lift`), the per-slot identities and the merge, so a
+    /// multi-slot accumulator is expressible.
     KFold {
         space: IndexSpace,
         axis: u32,
@@ -89,9 +88,7 @@ pub enum L1 {
     /// differing only in that it emits an extra buffer.
     ///
     /// `sched` is the members' shared index space walked as one linearized
-    /// body — see [`MapDomain::linear_over`]. Without it the one node family
-    /// the architecture calls its own fusion primitive would be the one whose
-    /// geometry is not a selection.
+    /// body — see [`MapDomain::linear_over`].
     KRegion {
         members: SmallVec<[Id; 8]>,
         live_outs: SmallVec<[u32; 4]>,
@@ -184,11 +181,16 @@ impl IndexSpace {
     /// The legality side of `map_into_fold`: a producer may be inlined only
     /// into a consumer whose space covers it.
     pub fn covers(&self, other: &IndexSpace) -> bool {
-        other.dims.len() <= self.dims.len()
-            && other
-                .dims
+        Self::covers_dims(&self.dims, &other.dims)
+    }
+
+    /// [`Self::covers`] on borrowed dims, for callers that read a node's own
+    /// storage instead of building a space.
+    pub fn covers_dims(covering: &[Dim], covered: &[Dim]) -> bool {
+        covered.len() <= covering.len()
+            && covered
                 .iter()
-                .zip(self.dims.iter())
+                .zip(covering.iter())
                 .all(|(a, b)| a.known_eq(*b))
     }
 
@@ -240,19 +242,14 @@ impl AccessPlan {
 ///
 /// # Why a side is a list
 ///
-/// A contraction operand used to be exactly one [`Operand`], which made
-/// `KContract` the only fixed-arity L1 node — `KMap`, `KFold`, `KGather` and
-/// `KScatter` all carry `Vec<Operand>`. That asymmetry is what made
-/// [`crate::rules::fusion::map_into_contract`] bail whenever the producer it
-/// wanted to absorb read more than one buffer: there was nowhere to put the
-/// second edge.
-///
-/// The producer that matters is the GGUF block decode. It reads one block
-/// stream through several `Restride` views at once — the quant plane, the
-/// block scale, the block minimum, the group scales — so it is irreducibly
-/// multi-edge, and no rewrite collapses it. With a side as a list that decode
-/// is an ordinary absorbed producer, and the quantized staging fill stops
-/// being a special case in the backend.
+/// A side holds several operands so that
+/// [`crate::rules::fusion::map_into_contract`] can absorb a producer that
+/// reads more than one buffer. The producer that matters is the GGUF block
+/// decode: it reads one block stream through several `Restride` views at once
+/// — the quant plane, the block scale, the block minimum, the group scales —
+/// so it is irreducibly multi-edge and no rewrite collapses it. As a list, it
+/// is an ordinary absorbed producer and the quantized staging fill is not a
+/// special case in the backend.
 ///
 /// # Numbering
 ///
@@ -599,9 +596,7 @@ pub enum Effect {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BufferRole(pub u32);
 
-// ---------------------------------------------------------------------------
 // Schedule domains
-// ---------------------------------------------------------------------------
 
 /// The enumerable schedule-parameter space of one node. **It is not
 /// e-nodes**: minting every point blows the graph up; minting a
@@ -781,9 +776,7 @@ pub struct SgemmParams {
 
 impl SgemmParams {
     /// `tm | bm`, `tn | bn`, 32..=max lanes, staged footprint within the
-    /// workgroup-storage limit. Exactly the predicates the reference
-    /// asserts over its regression tree's leaves — here they *generate*
-    /// candidates instead of validating one.
+    /// workgroup-storage limit.
     pub const fn legal(&self, elem_bytes: u32, max_wg_storage: u32, max_lanes: u32) -> bool {
         if self.tm == 0 || self.tn == 0 || self.bm % self.tm != 0 || self.bn % self.tn != 0 {
             return false;
@@ -795,8 +788,7 @@ impl SgemmParams {
     }
 }
 
-/// Every legal SGEMM tiling. The 200-line regression tree is deleted; its
-/// measured leaves seed move ordering only.
+/// Every legal SGEMM tiling. Measured leaves seed move ordering only.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct SgemmDomain {
     pub params: SmallVec<[SgemmParams; 16]>,
@@ -810,8 +802,7 @@ pub struct SgemvParams {
     pub subgroups: u32,
 }
 
-/// Every legal SGEMV parameterization. The 21-arm measured bucket table
-/// (which ignores `n` entirely) is deleted.
+/// Every legal SGEMV parameterization.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct SgemvDomain {
     pub params: SmallVec<[SgemvParams; 16]>,
@@ -886,11 +877,8 @@ pub fn fold_scratch_bytes(
     // and `emitted_block` is floored at the default block regardless of the
     // lane group, so a 24-lane Welford carrier wants 24 KiB and a 64-lane
     // `TN` register tile wants 64 KiB — over any device's limit at *every*
-    // lane group. Without this clause the fold domain of such a carrier is
-    // empty, `PROMOTE` mints a nest nothing can schedule, and §4.2 turns that
-    // into a hard `verify_plan` failure instead of a slow plan. With it, the
-    // row-per-lane schedule the emitters already lower correctly is also the
-    // one the generator can offer, and register tiling stays derivable.
+    // lane group. Without this clause such a carrier's fold domain is empty
+    // and `PROMOTE` mints a nest nothing can schedule.
     if lane_group <= 1 {
         return 0;
     }
@@ -917,16 +905,14 @@ pub struct MapTiling {
     pub vector: u32,
 }
 
-/// Candidate tilings: one per eligible dim, plus untiled. Replaces the
-/// strict LLC-watermark cliff and the argmax-invariant-bytes selection.
+/// Candidate tilings: one per eligible dim, plus untiled.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct MapDomain {
     pub tilings: SmallVec<[MapTiling; 8]>,
 }
 
-/// Outputs per lane worth scoring for a linearized body. A *policy* constant,
-/// and it belongs beside the generator that reads it rather than in a
-/// lowering — same rule `fusor2_tile::domains` follows for `BLOCK_CHOICES`.
+/// Outputs per lane worth scoring for a linearized body. A policy constant,
+/// kept beside the generator that reads it rather than in a lowering.
 const LINEAR_TM_CHOICES: [u32; 3] = [2, 4, 8];
 
 impl MapDomain {
@@ -1064,10 +1050,9 @@ mod schedule_tests {
         );
     }
 
-    /// **The gate.** Both composite forms carry a schedule domain, so
-    /// extraction resolves their geometry like every other node's. `Ext` is
-    /// the only `None` left: fusor2 cannot enumerate geometries for a
-    /// lowering it did not write.
+    /// Both composite forms carry a schedule domain, so extraction resolves
+    /// their geometry like every other node's. `Ext` is the only `None`:
+    /// fusor2 cannot enumerate geometries for a lowering it did not write.
     #[test]
     fn every_node_but_ext_declares_a_schedule_domain() {
         let d = ScheduleDomain::Map(MapDomain::linear(&caps(32), 8192));

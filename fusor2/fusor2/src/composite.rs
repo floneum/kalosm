@@ -1,11 +1,7 @@
-//! Macro ops. Every constructor here mints the sugar node **and unions its
-//! `defn` expansion into the same chain in the same call**, so there is
-//! nothing to recognize later: recognition ordering, sole-consumer gates and
-//! `spike_no_recognition` all evaporate, and the structural attributes a
-//! pattern match would have to re-derive (`MaskKind::Causal`) stay on the
-//! node.
-//!
-//! Owned by W13.
+//! Macro ops. Every constructor here mints the sugar node and unions its
+//! `defn` expansion into the same chain in the same call, so structural
+//! attributes such as `MaskKind::Causal` stay on the node and nothing has to
+//! be recognized later.
 
 pub mod activations;
 pub mod attention;
@@ -28,10 +24,6 @@ use smallvec::SmallVec;
 
 use crate::graph::GraphRef;
 use crate::tensor::Tensor;
-
-// ---------------------------------------------------------------------------
-// Attributes
-// ---------------------------------------------------------------------------
 
 /// Which reduction a normalization performs.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -92,10 +84,9 @@ pub enum MacroAttr {
         causal: bool,
         /// `H / Hkv`. 1 for plain multi-head attention.
         groups: u32,
-        /// Which value this sugar node stands for. Sugar is hash-consed on
-        /// its attributes, so two attention macros over the same operands
-        /// that compute different things must differ here or they are one
-        /// node. Nothing reads it; it exists to keep them apart.
+        /// Which value this sugar node stands for. Sugar is hash-consed on its
+        /// attributes, so two attention macros over the same operands that
+        /// compute different things must differ here or they are one node.
         produce: AttentionOut,
         scale: SymId,
     },
@@ -109,11 +100,9 @@ pub enum MacroAttr {
     },
 }
 
-/// Which value an `Attention` sugar node stands for.
-///
-/// A frontend fact about the macro surface, not an IR node kind: the four
-/// attention entry points build four macros over overlapping operand lists,
-/// and this is what keeps them from hash-consing into one.
+/// Which value an `Attention` sugar node stands for. The four attention entry
+/// points build four macros over overlapping operand lists; this keeps them
+/// from hash-consing into one.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AttentionOut {
     Output,
@@ -122,13 +111,9 @@ pub enum AttentionOut {
     GradKV,
 }
 
-// ---------------------------------------------------------------------------
-// The op table
-// ---------------------------------------------------------------------------
-
-/// One row of [`MACRO_OPS`]. The discriminant **is** the `OpDefId`, because
-/// registration happens once at `Session::new` in table order and `PlanHash`
-/// reads registration order.
+/// One row of [`MACRO_OPS`]. The discriminant is the `OpDefId`: registration
+/// happens once at `Session::new` in table order and `PlanHash` reads
+/// registration order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum MacroOp {
@@ -165,11 +150,9 @@ impl MacroOp {
 
 /// Every sugar op, in registration order.
 ///
-/// All eight declare `lower_per_target: &[]` — they are **unrunnable by
-/// construction**. They exist so rules can read the attributes a pattern
-/// match would otherwise have to re-derive; the `defn` in the same e-class is
-/// always the runnable floor, so a plan that selected a sugar node is
-/// unbuildable rather than merely unlikely.
+/// All eight declare `lower_per_target: &[]`, so they are unrunnable by
+/// construction. They carry the attributes rules read; the `defn` in the same
+/// e-class is the runnable floor.
 pub static MACRO_OPS: &[OpDef] = &[
     OpDef {
         name: "softmax",
@@ -266,13 +249,8 @@ pub fn register_macro_ops(registry: &mut OpDefRegistry) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Registry rows
-// ---------------------------------------------------------------------------
-
-/// The last operand of every sugar node is its `defn`, which is what makes
-/// inference total without handing `OpDef::infer` the attribute blob: the
-/// definitional expansion already knows the answer.
+/// The last operand of every sugar node is its `defn`, so inference is total
+/// without handing `OpDef::infer` the attribute blob.
 fn witness(ins: &[ValueFacts]) -> Result<&ValueFacts> {
     ins.last()
         .ok_or_else(|| Error::Shape("a macro op carries its defn as its last operand".into()))
@@ -401,26 +379,12 @@ fn work_rope(_ins: &[ValueFacts], out: &ValueFacts) -> Work {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The one construction discipline
-// ---------------------------------------------------------------------------
-
-/// Build one macro op.
-///
-/// Every macro op in this crate goes through exactly this function, and it
-/// always does the same five things:
-///
-/// 1. build the `defn` — the definitional core-L0 expansion — **first**, so
-///    its id is below the sugar's and the union's operand 0 is the defn (the
-///    adjoint walk descends operand 0, and only the defn has an adjoint);
-/// 2. `mark_defn` it, so it is never evicted;
-/// 3. intern `attrs` into the `AttrId` side table;
-/// 4. add the sugar `L1::Ext { def, ops, attrs }`, whose last operand is the
-///    defn — its shape witness;
-/// 5. `union(defn, sugar)` and return a [`Tensor`] over the **union root**.
-///
-/// No macro op may return the sugar id or the defn id alone: a caller holding
-/// either would pin one member of the class and defeat late selection.
+/// Build one macro op: the `defn` core-L0 expansion first, so the union's
+/// operand 0 is the defn (the adjoint walk descends operand 0, and only the
+/// defn has an adjoint); `mark_defn` it so it is never evicted; intern `attrs`;
+/// add the sugar `L1::Ext { def, ops, attrs }` whose last operand is the defn
+/// shape witness; union the two. The returned [`Tensor`] is over the union
+/// root — returning either id alone would pin one member of the class.
 pub(crate) fn macro_op(
     graph: &GraphRef,
     def: MacroOp,
@@ -455,9 +419,8 @@ pub(crate) fn macro_op(
     Ok(graph.tensor(root))
 }
 
-/// Build a plain core expansion with no sugar node — the `*_slow` spellings,
-/// whose only semantic difference from the sugared ones is that no rule can
-/// read an attribute off them.
+/// Build a plain core expansion with no sugar node: the `*_slow` spellings,
+/// off which no rule can read an attribute.
 pub(crate) fn core_op(
     graph: &GraphRef,
     build: impl FnOnce(&mut GraphTape<'_>) -> Result<Id>,
@@ -466,19 +429,16 @@ pub(crate) fn core_op(
     Ok(graph.tensor(id))
 }
 
-/// A const extent, or an error. Used only where an algorithm genuinely needs
-/// the integer (a window size, a kernel extent) rather than where a symbolic
-/// extent would do.
+/// A const extent, or an error. For places that need the integer itself, such
+/// as a window size or a kernel extent.
 pub(crate) fn const_dim(d: Dim, what: &str) -> Result<u64> {
     d.as_const()
         .ok_or_else(|| Error::Shape(format!("{what} needs a decidable extent, got {d}")))
 }
 
-/// A rank-1 `u32` index leaf holding `values`.
-///
-/// Scatter and gather both take a real index tensor. A pad's run, an
-/// upsample's repeat and a concatenation's destination rows are all this — one
-/// small buffer uploaded once, never a special node kind.
+/// A rank-1 `u32` index leaf holding `values`: one small buffer uploaded once.
+/// A pad's run, an upsample's repeat and a concatenation's destination rows are
+/// all spelled this way.
 pub(crate) fn index_leaf(graph: &GraphRef, values: &[u32]) -> Result<Id> {
     let mut bytes = Vec::with_capacity(values.len() * 4);
     for v in values {
@@ -562,22 +522,16 @@ mod tests {
 mod constant_identity {
     use super::*;
     use crate::graph::Graph;
-    // The backend selector, by module path. The crate root's `Device` is
-    // whichever of the two the `typed-api` feature selects; in-crate code
-    // names the one it means so it compiles under either root.
+    // Named by module path: the crate root's `Device` is whichever of the two
+    // the `typed-api` feature selects.
     use crate::session::{Device, Session};
 
     fn graph() -> Graph {
         Graph::new(&Session::new(Device::cpu().unwrap()).unwrap())
     }
 
-    /// Two index vectors of the same length are two different values.
-    ///
-    /// `index_leaf` used to name every leaf `BufferId(u32::MAX)`, so the
-    /// hash-cons key was `(U32, [len])` and the second `set_leaf_bytes`
-    /// overwrote the first. Rope mints `perm` and `expand` at the same length
-    /// in the same call, which is how its rotation permutation became its
-    /// table-expansion vector.
+    /// Two index vectors of the same length are two different values: the
+    /// hash-cons key covers the content, not just `(dtype, len)`.
     #[test]
     fn two_index_leaves_of_one_length_are_two_nodes() {
         let g = graph();
@@ -605,9 +559,8 @@ mod constant_identity {
         );
     }
 
-    /// Every leaf name in one graph comes from one allocator. Three private
-    /// counters used to hand out overlapping `BufferId`s, one of them starting
-    /// at exactly the `u32::MAX` the constant leaves hardcoded.
+    /// Every leaf name in one graph comes from one allocator, so uploads and
+    /// constant leaves never collide on a `BufferId`.
     #[test]
     fn uploads_and_constants_never_share_a_buffer_name() {
         use fusor2_ir::dtype::Dtype;

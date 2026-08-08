@@ -1,6 +1,6 @@
-//! Part 5: cross-backend differential. Same data, same call, CPU vs GPU vs a
-//! host reference. No probe touches the e-graph; `q/k/v` are never read back
-//! before the attention is built.
+//! Cross-backend differential for flash attention: same data, same call, CPU
+//! vs GPU vs a host reference. `q/k/v` are never read back before the
+//! attention is built.
 
 use fusor2::composite::attention::attention;
 use fusor2::{Session, Tensor};

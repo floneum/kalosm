@@ -1,13 +1,6 @@
-//! The replay memo, keyed on the *extraction inputs* rather than a structural
-//! fingerprint. Validity is "the inputs are identical", not "a fingerprint
-//! matches", so a training loop can no longer freeze step 1's decisions
-//! forever.
-//!
-//! This is affordable precisely because the trainer reads nothing back and the
-//! host runs several steps ahead: a ~1.4 ms re-extraction never lands on the
-//! critical path.
-//!
-//! Owned by W7.
+//! The replay memo, keyed on the extraction inputs rather than a structural
+//! fingerprint: an entry is valid only when the inputs are identical, so a
+//! training loop does not freeze the first step's decisions forever.
 
 use fusor2_ir::Result;
 use fusor2_ir::egraph::{EGraph, Id};
@@ -25,18 +18,14 @@ pub const CAPACITY: usize = 64;
 
 /// Bounded per-process memo from extraction inputs to a finished plan.
 ///
-/// A hit does **not** mean "skip extraction": [`Self::get_or_extract`] always
-/// runs the closure when the key is absent, and a caller that suspects an
-/// input changed simply builds a different key. Contrast the reference's
-/// `flush_replay`, whose validity condition is a structural fingerprint and
-/// which therefore freezes every decision a value (rather than a shape) should
-/// have driven.
+/// [`Self::get_or_extract`] runs the closure whenever the key is absent; a
+/// caller that suspects an input changed builds a different key.
 #[derive(Default)]
 pub struct ReplayCache {
     entries: Mutex<Lru>,
 }
 
-/// The architecture document's name for the same type.
+/// Alias for [`ReplayCache`].
 pub type ReplayMemo = ReplayCache;
 
 #[derive(Default)]
@@ -92,9 +81,9 @@ impl ReplayCache {
 
     /// Look up `key`, extracting through `f` on a miss.
     ///
-    /// The returned flag is `plan_unchanged`: `true` when the entry was
-    /// already present, or when a re-extraction produced the same
-    /// [`PlanHash`] — either way nothing recompiles.
+    /// The returned flag is `plan_unchanged`: `true` when the entry was already
+    /// present, or when a re-extraction produced the same [`PlanHash`]. Nothing
+    /// recompiles in either case.
     pub fn get_or_extract(
         &self,
         key: ReplayKey,
@@ -132,44 +121,25 @@ impl ReplayCache {
     }
 }
 
-/// Structural fingerprint of the graph a plan was extracted from, **with
-/// symbols as symbols**: two dispatches of one shape family produce the same
-/// value, so the key discriminates on the binding rather than on the shape.
+/// Structural fingerprint of the graph a plan was extracted from, with symbols
+/// left symbolic: two dispatches of one shape family produce the same value, so
+/// the key discriminates on the binding rather than on the shape.
 ///
-/// A leaf contributes its dtype and its shape, and a `Const` its value; what
-/// it does **not** contribute is its `BufferId`, so a re-upload into a fresh
-/// buffer replays.
-///
-/// Two regressions this fixes, both of them the same mistake — a key that is
-/// not injective over the thing a cached plan's `Id`s refer to, which is
-/// silent plan corruption that only `verify_plan` running again after the
-/// lookup turned into an error:
-///
-/// - the leaf arm hashed only `discriminant(kind)`, so two graphs differing
-///   *only* in a leaf's extents were one key. `cat_rank1` and `cat_rank2`
-///   collided and `cat_rank2` replayed `BufferPlan`s of rank 1 for its
-///   rank-2 values;
-/// - the walk covered only the root-reachable L0 spine and ignored the root
-///   set, so two graphs on one `Session` — and the conformance harness builds
-///   every case's graph on one shared `Session` — could share a key while
-///   their ids named different nodes.
+/// A leaf contributes its dtype and shape, and a `Const` its value, but not its
+/// `BufferId`, so a re-upload into a fresh buffer replays. Every allocated node
+/// and the root set reach the key, since a cached plan's `Id`s mean nothing in
+/// another graph.
 pub fn l0_term_hash(graph: &EGraph, roots: &[Id]) -> u64 {
     let mut h = FxHasher::default();
-    // The roots are an extraction *input*: the same term rooted at one value
-    // and at two is two different plans.
+    // The roots are an extraction input: the same term rooted at one value and
+    // at two is two different plans.
     h.write_usize(roots.len());
     for r in roots {
         h.write_u32(r.0);
     }
-    // Every id, not only the root-reachable L0 spine. A cached plan's `Id`s
-    // are meaningful **only** in the graph it was extracted from, so the key
-    // has to determine that graph, and an id is determined by everything
-    // allocated before it — including nodes this term never reaches. Walking
-    // the spine alone is what let `attention_with_lse` and
-    // `welford_agrees_with_the_two_pass_variance` replay a plan from an
-    // earlier case on the same `Session`: both pass in isolation and fail in
-    // a full run, with `verify_plan` reporting an operand class the stale
-    // `sigma` has no entry for.
+    // Every id, not only the root-reachable L0 spine: a cached plan's `Id`s
+    // are meaningful only in the graph it was extracted from, and an id is
+    // determined by everything allocated before it.
     //
     // `Hash for ScalarExpr` writes a cached digest, so this stays O(nodes).
     for i in 0..graph.len() {
@@ -188,9 +158,9 @@ pub fn l0_term_hash(graph: &EGraph, roots: &[Id]) -> u64 {
     h.finish()
 }
 
-/// Everything about a leaf that changes the plan, and nothing that only names
-/// a buffer: the uniform's *slot* rather than its bound value, and the
-/// buffer's dtype and shape rather than its `BufferId`.
+/// Everything about a leaf that changes the plan and nothing that only names a
+/// buffer: the uniform's slot rather than its bound value, and the buffer's
+/// dtype and shape rather than its `BufferId`.
 fn hash_leaf<H: Hasher>(h: &mut H, kind: &LeafKind) {
     std::mem::discriminant(kind).hash(h);
     match kind {
@@ -235,7 +205,7 @@ fn hash_shape<H: Hasher>(h: &mut H, shape: &[Dim]) {
     }
 }
 
-/// Hash of one dim binding — the vector a symbolic plan is dispatched at.
+/// Hash of one dim binding: the vector a symbolic plan is dispatched at.
 pub fn binding_hash(dims: &[Dim]) -> u64 {
     let mut h = FxHasher::default();
     for d in dims {
@@ -295,8 +265,7 @@ mod tests {
             .unwrap();
         assert!(!hit_a, "first sighting is a miss");
 
-        // Same term, different binding: a miss, and the extraction runs
-        // again rather than replaying step one's decisions.
+        // Same term, different binding: a miss, so extraction runs again.
         let (b, unchanged) = cache
             .get_or_extract(long, || {
                 search.extract(&g, &roots, &cost, ExtractBudget::default())
@@ -314,10 +283,8 @@ mod tests {
         assert!(hit);
     }
 
-    /// The key has to be injective over the term. Two graphs whose only
-    /// difference is a leaf's rank used to share one key, so the second
-    /// replayed the first's plan — with `BufferPlan`s of the wrong rank and
-    /// `Id`s that named different nodes.
+    /// Two graphs differing only in a leaf's rank are two keys; sharing one
+    /// would replay `BufferPlan`s of the wrong rank.
     #[test]
     fn a_different_leaf_shape_is_a_different_key() {
         use crate::realize::testkit::{buffer, kmap, new_graph};
@@ -336,17 +303,15 @@ mod tests {
         assert_ne!(rank2, wider, "extents must reach the key");
         assert_eq!(rank1, build(&[Dim::Const(12)]), "and it is still a function");
 
-        // A symbolic extent stays symbolic, so one plan still serves the
-        // family and `ReplayKey::binding` is what separates the dispatches.
+        // A symbolic extent stays symbolic, so one plan serves the family and
+        // `ReplayKey::binding` separates the dispatches.
         let sym = build(&[Dim::Sym(fusor2_ir::shape::SymId(3))]);
         assert_eq!(sym, build(&[Dim::Sym(fusor2_ir::shape::SymId(3))]));
         assert_ne!(sym, rank1);
     }
 
-    /// The key must determine the graph, not just the rooted term: a plan's
-    /// `Id`s mean nothing anywhere else. Two graphs that share a rooted term
-    /// but differ in what else is allocated, or in what is rooted, are two
-    /// keys.
+    /// Two graphs that share a rooted term but differ in what else is
+    /// allocated, or in what is rooted, are two keys.
     #[test]
     fn the_key_determines_the_graph_not_only_the_rooted_term() {
         use crate::realize::testkit::{buffer, kmap, new_graph};
@@ -358,8 +323,8 @@ mod tests {
         plain.add_root(m);
         let plain_roots = plain.roots().to_vec();
 
-        // Same rooted term, but an extra value was built first, so every id
-        // in the term sits one slot further along.
+        // Same rooted term, but an extra value built first shifts every id in
+        // the term one slot along.
         let mut shifted = new_graph();
         let _other = buffer(&mut shifted, 9, &[Dim::Const(4)]);
         let leaf2 = buffer(&mut shifted, 0, &shape);
@@ -385,8 +350,8 @@ mod tests {
         assert_ne!(one, both, "the root set is an extraction input");
     }
 
-    /// The device fingerprint is part of the key: two devices holding the
-    /// same term are two entries, never one served to both.
+    /// The device fingerprint is part of the key: two devices holding the same
+    /// term are two entries.
     #[test]
     fn the_device_fingerprint_separates_entries() {
         let cache = ReplayCache::new();

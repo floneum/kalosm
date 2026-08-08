@@ -10,10 +10,9 @@ use crate::scalar::ScalarExpr;
 use crate::shape::{BoundsProof, Dim, SlidingWindow, StrideSpec, SymId};
 use smallvec::SmallVec;
 
-/// The ten L0 nodes. `NaryOp`'s 50-variant discriminant — whose ordering
-/// the reference admits is load-bearing in kernel cache keys — does not
-/// exist: every elementwise unary, comparison, activation, `where_cond` and
-/// `clamp` is one `Map` with a different [`ScalarExpr`].
+/// The ten L0 nodes. There is no per-operation discriminant to keep stable in
+/// kernel cache keys: every elementwise unary, comparison, activation,
+/// `where_cond` and `clamp` is one `Map` with a different [`ScalarExpr`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum L0 {
     Leaf(LeafKind),
@@ -147,9 +146,9 @@ pub enum LeafKind {
 pub struct BufferId(pub u32);
 
 /// How an extremum reduction splits its gradient among tied elements. An
-/// explicit op attribute, so parity with a reference trainer is a
-/// declaration rather than an accident. Carried on [`Carrier::tie`] and read
-/// only by `fold_adjoint`: an autograd attribute, never a compiler decision.
+/// explicit op attribute rather than an implicit convention. Carried on
+/// [`Carrier::tie`] and read only by `fold_adjoint`: an autograd attribute,
+/// never a compiler decision.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TiePolicy {
     SplitEvenly,

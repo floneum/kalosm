@@ -4,12 +4,9 @@
 //! loss scale are ordinary graph structure rather than a supported
 //! configuration.
 //!
-//! Every pair among `{F32, F16, BF16, U32, I32}` is legal, **including the
-//! `f32 -> u32` and `f16 -> u32` the reference is missing**, and
-//! `round`/`floor`/`ceil`/`trunc` are real primitives, which is what deletes
-//! the trainer's 14-comparison `round_small`.
-//!
-//! Owned by W12.
+//! Every pair among `{F32, F16, BF16, U32, I32}` is legal, and
+//! `round`/`floor`/`ceil`/`trunc` are primitives rather than comparison
+//! chains.
 
 use fusor2_ir::dtype::{Dtype, RoundMode};
 use fusor2_ir::scalar::{BinOp, ScalarExpr};
@@ -76,10 +73,9 @@ impl Tensor {
 
     /// Round with an explicit mode.
     ///
-    /// **Known gap:** L0 has no carrier for a per-node `NumericContract`, so
-    /// the "this value is `STRICT`, do not fast-math it" obligation currently
-    /// rides on `ScalarKind::Round` itself and must be honoured by the
-    /// emitter. See the crate report.
+    /// L0 has no carrier for a per-node `NumericContract`, so the "this value
+    /// is `STRICT`, do not fast-math it" obligation rides on
+    /// `ScalarKind::Round` itself and must be honoured by the emitter.
     pub fn round_mode(&self, mode: RoundMode) -> Result<Tensor> {
         self.require_dense("round")?;
         self.map1(ScalarExpr::round(mode, self.arg0()))
@@ -107,12 +103,11 @@ impl Tensor {
     /// QAT fake-quant forward: `round(x / scale).clamp(-levels, levels) *
     /// scale`, with `scale` broadcast in.
     ///
-    /// **One `Map`, then one straight-through registration.** The four-node
-    /// chain this used to build differentiated node by node, and the `round`
-    /// in the middle has a zero derivative everywhere, so the gradient died
-    /// there and no QAT model could train. A straight-through rule routes the
-    /// incoming gradient to operand 0 unchanged — which requires operand 0 to
-    /// *be* `x`, hence the single fused map rather than the chain.
+    /// **One `Map`, then one straight-through registration.** `round` has a
+    /// zero derivative everywhere, so a node-by-node chain would kill the
+    /// gradient. The straight-through rule routes the incoming gradient to
+    /// operand 0 unchanged, which requires operand 0 to *be* `x` — hence the
+    /// single fused map rather than a chain.
     ///
     /// The scale receives an explicit **zero**, not nothing: a straight-through
     /// fake-quant is the assertion that the node behaves as `y = x` in the

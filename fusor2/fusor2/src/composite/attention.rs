@@ -1,21 +1,11 @@
-//! Attention: the macro node carrying `MaskKind`, plus its `defn` expansion,
-//! both present from node zero.
+//! Attention: the macro node carrying `MaskKind`, plus its `defn` expansion.
 //!
 //! `causal` is structural on the sugar node, so the compiler skips
-//! upper-triangle Q.K work **without loading a mask tensor** — while the
-//! decomposition is simultaneously present for algebra and autograd. There is
-//! no fused attention node: `KFlash` and its hand-written GPU kernel were
-//! deleted after `lower_kflash` was measured unreached across the whole
-//! suite, so the composed form is not one alternative among several — it is
-//! the only one, and the fold algebra is what has to collapse it.
+//! upper-triangle Q.K work without loading a mask tensor.
 //!
-//! Grouped-query attention expands nothing. The reference reshapes,
-//! broadcasts and reshapes K and V up to `H` heads — a materializing round
-//! trip. Here `q`'s head axis is **split** into `(Hkv, g)`, which is a legal
-//! restride at any strides, and `g` becomes a free axis of the contraction.
-//! The `EinSpec` does the rest.
-//!
-//! Owned by W13.
+//! Grouped-query attention materializes nothing: `q`'s head axis is split into
+//! `(Hkv, g)`, a legal restride at any strides, and `g` becomes a free axis of
+//! the contraction.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt, accum_dtype, splat_of};
 use fusor2_ir::autograd::{Tape, Val};
@@ -87,8 +77,8 @@ fn group_factor(graph: &GraphRef, q: &Tensor, k: &Tensor) -> Result<u64> {
 }
 
 /// Split `q`'s head axis into `(Hkv, g)` when the query has more heads than
-/// the key. Always a legal restride: `Restride` composes relative to the
-/// current strides.
+/// the key. `Restride` composes relative to the current strides, so this is
+/// always legal.
 fn split_query_heads(t: &mut GraphTape<'_>, q: Val, groups: u64) -> Result<Val> {
     if groups == 1 {
         return Ok(q);
@@ -130,7 +120,7 @@ fn merge_heads(t: &mut GraphTape<'_>, v: Val, groups: u64) -> Result<Val> {
 /// `q . k^T * scale`, plus whatever the mask contributes.
 ///
 /// `MaskKind::Causal` compiles to an `IndexOf` comparison inside the scaling
-/// `Map`, so **no mask tensor is ever loaded** and no buffer is bound for it.
+/// `Map`, so no mask tensor is loaded and no buffer is bound for it.
 #[allow(clippy::too_many_arguments)]
 fn scores(
     t: &mut GraphTape<'_>,
@@ -173,15 +163,9 @@ fn scores(
         ScalarExpr::uniform(scale, dtype),
     );
     let body = if matches!(mask, MaskKind::Causal) {
-        // Right-aligned: query `i` sees keys up to `i + (Lk - Lq)`.
-        //
-        // The reference's `attention_causal` masks `kv_pos <= q_pos` but
-        // *asserts* `q_seq_len == kv_seq_len`, so it defines causality only
-        // where the two conventions coincide. fusor2 accepts `Lq != Lk`, and
-        // the only meaning that has is decode against a KV cache, where the
-        // Lq queries are the *last* Lq of the Lk keys. Left-aligning there let
-        // query 0 see exactly one key, which is why a 3-query, 4-key row came
-        // back as `V[0]` instead of a two-key average.
+        // Right-aligned: query `i` sees keys up to `i + (Lk - Lq)`. `Lq != Lk`
+        // is decode against a KV cache, where the Lq queries are the last Lq of
+        // the Lk keys.
         let bound = match (shape_lq.as_const(), shape_lk.as_const()) {
             (Some(lq), Some(lk)) if lk > lq => ScalarExpr::bin(
                 BinOp::Add,
@@ -316,11 +300,9 @@ pub fn attention_masked(
 /// The row log-sum-exp of the attention scores: `m + ln sum exp(s - m)`,
 /// shaped `[.., Lq]`.
 ///
-/// This is the statistic that lets probabilities be recomputed as
-/// `exp(s - lse)` without ever storing the `[Lq, Lk]` matrix. Written as a max
-/// fold plus a sum fold rather than as a fused `(max, sum)` carrier directly:
-/// the fold laws are what turn exactly this pair into the one-pass form, and
-/// spelling it here would be the same decision made early — and in the core.
+/// Lets probabilities be recomputed as `exp(s - lse)` without storing the
+/// `[Lq, Lk]` matrix. Written as a max fold plus a sum fold; the fold laws
+/// collapse that pair into the one-pass form.
 pub fn attention_lse(
     q: &Tensor,
     k: &Tensor,
@@ -398,11 +380,9 @@ pub fn attention_with_lse(
 
 /// `(dq, dk, dv)`.
 ///
-/// `dk` and `dv` are `Restride` views of **one** `[B, H, 2*Lk, Dh]` buffer —
-/// dk rows then dv rows — so a paired streaming kernel can share the
-/// probability recomputation and the two halves cost nothing to hand back.
-/// Requires `H == Hkv`: grouped-query attention is expanded by the caller,
-/// exactly as in the reference.
+/// `dk` and `dv` are `Restride` views of one `[B, H, 2*Lk, Dh]` buffer — dk
+/// rows then dv rows — so a paired streaming kernel can share the probability
+/// recomputation. Requires `H == Hkv`; the caller expands grouped queries.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_grads(
     q: &Tensor,
@@ -511,8 +491,7 @@ pub fn attention_grads(
     Ok((dq, dk, dv))
 }
 
-/// `p = exp(s - lse)` — the probability matrix recomputed from the forward
-/// output rather than stored.
+/// `p = exp(s - lse)`, recomputed rather than stored.
 fn probabilities(
     t: &mut GraphTape<'_>,
     q: Val,
@@ -654,9 +633,7 @@ mod tests {
         let v = leaf(&g, "v", &[1, 2, 4, 8]);
         let o = attention_causal(&q, &k, &v, None).unwrap();
 
-        // Walk every node reachable from the result and count external
-        // buffers: q, k and v, and nothing else. A materialized mask would be
-        // a fourth.
+        // Count external buffers reachable from the result: q, k and v only.
         let buffers = g
             .handle()
             .with_egraph(|eg| {

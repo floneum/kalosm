@@ -9,12 +9,7 @@
 //!
 //! ## The schedule
 //!
-//! Both bodies ran at a hardcoded `BLOCK = 256` and took `_theta`, so the
-//! compiler decided to fuse by cost and then executed the fused kernel at a
-//! fixed geometry — the one node family the architecture calls its own
-//! fusion primitive was the one opting out of late decision-making.
-//!
-//! Both variants now carry a `sched` field, so
+//! Both variants carry a `sched` field, so
 //! [`fusor2_ir::ir::level1::L1::schedule`] returns their domain and
 //! extraction resolves it like any other node's. [`merged_domain`] and
 //! [`region_domain`] are this crate's spelling of that domain — both are
@@ -22,16 +17,15 @@
 //! and `verify_l1` checks it against — and both bodies consume the selected
 //! [`MapTiling`]: `tm` outputs per lane at stride `block`, over a workgroup
 //! width that is a whole number of subgroups and never wider than the work
-//! there is. Nothing here is a constant any more: the last one, the `256`
-//! ceiling, is `fusor2_tile::domains::emitted_block`, which is where the
-//! fold domain that prices the width already reads it.
-//!
-//! Owned by W9.
+//! there is. The width ceiling comes from
+//! `fusor2_tile::domains::emitted_block`, which is where the fold domain that
+//! prices the width reads it too.
 
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::NumericContract;
 use fusor2_ir::error::Error;
+#[cfg(test)]
 use fusor2_ir::ir::Node;
 use fusor2_ir::ir::level1::{KMerged, L1, MapDomain, MapTiling, SchedPoint, ScheduleDomain, WaveCat};
 use fusor2_ir::ir::level2::{
@@ -39,21 +33,16 @@ use fusor2_ir::ir::level2::{
     TileCompareOp, TileExpr, WorkgroupAxis,
 };
 use fusor2_ir::shape::Dim;
+#[cfg(test)]
 use fusor2_ir::target::LowerCtx;
 
 use crate::lower::{Ctx, DimBinding, distribute_workgroups};
 
-// ---------------------------------------------------------------------------
 // The schedule domain
-// ---------------------------------------------------------------------------
 
 /// The workgroup width for a linear body needing `lanes` lanes: a whole
 /// number of subgroups, never wider than the work and never wider than the
 /// device allows.
-///
-/// This is the term that used to be the constant 256. A 64-row merged wave
-/// launched 256 lanes and idled three quarters of them on every workgroup;
-/// an 8-element region launched 256 lanes for 8 stores.
 ///
 /// The ceiling is [`fusor2_tile::domains::emitted_block`] at a lane group of
 /// one — the single source of the default width, shared with the fold domain
@@ -146,7 +135,9 @@ fn tiling_of(theta: SchedPoint) -> Result<MapTiling> {
     }
 }
 
-/// Contract-shaped entry point (see CONTRACTS.md §4.10).
+/// Single-node entry point for the tests below; dispatch goes through
+/// `lower::lower_node`.
+#[cfg(test)]
 pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     let fusor2_ir::ir::Op::L1(op) = &node.op else {
         return Err(Error::Plan("merged got a foreign node".into()));
@@ -202,8 +193,7 @@ pub fn lower_kmerged(mut ctx: Ctx<'_>, wave: &KMerged, theta: SchedPoint) -> Res
 
     let tm = tiling_of(theta)?.tm;
     let block = block_for(ctx.caps, elements.div_ceil(u64::from(tm)));
-    // What one workgroup covers. At `tm == 1` this is `block`, so the whole
-    // index expression below collapses to the one that shipped.
+    // What one workgroup covers; at `tm == 1` this is just `block`.
     let per_group = block.saturating_mul(tm);
 
     let groups_per_segment = per_segment.div_ceil(per_group).max(1);
@@ -222,14 +212,14 @@ pub fn lower_kmerged(mut ctx: Ctx<'_>, wave: &KMerged, theta: SchedPoint) -> Res
         let gx = ctx.b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
         let gy = ctx.b.builtin(Builtin::ProgramId(WorkgroupAxis::Y));
         let gz = ctx.b.builtin(Builtin::ProgramId(WorkgroupAxis::Z));
-        let x_e = ctx.b.u32(grid[0].max(1));
-        let xy_e = ctx.b.u32(grid[0].max(1).saturating_mul(grid[1].max(1)));
+        let x_e = ctx.b.lit_u32(grid[0].max(1));
+        let xy_e = ctx.b.lit_u32(grid[0].max(1).saturating_mul(grid[1].max(1)));
         let yx = ctx.b.mul(gy, x_e);
         let zxy = ctx.b.mul(gz, xy_e);
         let g = ctx.b.add(gx, yx);
         ctx.b.add(g, zxy)
     };
-    let gps = ctx.b.u32(groups_per_segment);
+    let gps = ctx.b.lit_u32(groups_per_segment);
     let segment = ctx.b.binary(
         TileBinaryOp::Div,
         linear_group.clone(),
@@ -239,12 +229,12 @@ pub fn lower_kmerged(mut ctx: Ctx<'_>, wave: &KMerged, theta: SchedPoint) -> Res
     let within = ctx
         .b
         .binary(TileBinaryOp::Rem, linear_group, gps, NumericContract::RELAXED);
-    let group_e = ctx.b.u32(per_group);
+    let group_e = ctx.b.lit_u32(per_group);
     let tile_base = {
         let base = ctx.b.mul(within, group_e);
         ctx.b.add(base, lane)
     };
-    let bound = ctx.b.u32(per_segment);
+    let bound = ctx.b.lit_u32(per_segment);
     // The tile's own first element decides whether the workgroup does
     // anything at all: `tile_base + t*block` only grows with `t`.
     let tile_live = ctx
@@ -258,7 +248,7 @@ pub fn lower_kmerged(mut ctx: Ctx<'_>, wave: &KMerged, theta: SchedPoint) -> Res
         let off = if t == 0 {
             tile_base.clone()
         } else {
-            let step = ctx.b.u32(t.saturating_mul(block));
+            let step = ctx.b.lit_u32(t.saturating_mul(block));
             ctx.b.add(tile_base.clone(), step)
         };
         in_range.push(ctx.b.compare(TileCompareOp::Lt, off.clone(), bound.clone()));
@@ -269,7 +259,7 @@ pub fn lower_kmerged(mut ctx: Ctx<'_>, wave: &KMerged, theta: SchedPoint) -> Res
     // index, not on a per-segment epilogue: `KMerged::new` already proved
     // every segment epilogue-free.
     for (slot, seg_id) in segments.iter().enumerate() {
-        let slot_e = ctx.b.u32(slot as u32);
+        let slot_e = ctx.b.lit_u32(slot as u32);
         let is_mine = ctx.b.compare(TileCompareOp::Eq, segment.clone(), slot_e);
         let guards: Vec<TileExpr> = in_range
             .iter()
@@ -288,7 +278,7 @@ pub fn lower_kmerged(mut ctx: Ctx<'_>, wave: &KMerged, theta: SchedPoint) -> Res
                 .iter()
                 .zip(&guards)
                 .map(|(off, guard)| {
-                    let fill = ctx.b.zero(acc_elem);
+                    let fill = ctx.b.zero_scalar(acc_elem);
                     let v = ctx.b.load(
                         fusor2_ir::ir::level2::Source::Storage(view.clone()),
                         Addr::Linear(off.clone()),
@@ -311,8 +301,8 @@ pub fn lower_kmerged(mut ctx: Ctx<'_>, wave: &KMerged, theta: SchedPoint) -> Res
                 for (off, guard) in offsets.iter().zip(&guards) {
                     let acc_local = ctx.b.local(ElementType::Scalar(acc_elem));
                     let acc_read = ctx.b.load_local(acc_local.clone());
-                    let init = ctx.b.zero(acc_elem);
-                    let zero = ctx.b.zero(acc_elem);
+                    let init = ctx.b.zero_scalar(acc_elem);
+                    let zero = ctx.b.zero_scalar(acc_elem);
                     let operand = ctx.b.load(
                         fusor2_ir::ir::level2::Source::Storage(view.clone()),
                         Addr::Rc2 {
@@ -331,7 +321,7 @@ pub fn lower_kmerged(mut ctx: Ctx<'_>, wave: &KMerged, theta: SchedPoint) -> Res
                         update,
                     });
                 }
-                let count = ctx.b.u32(k);
+                let count = ctx.b.lit_u32(k);
                 let live = ctx.b.and(is_mine.clone(), tile_live.clone());
                 body.push(Stmt::If {
                     condition: live,
@@ -404,12 +394,12 @@ pub fn lower_kregion(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
         limits.max_compute_workgroups_per_dimension,
     );
     let base = ctx.global_index(block, grid);
-    // At `tm == 1` a group covers exactly `block`, so the index expression is
-    // the one that shipped, unwrapped.
+    // At `tm == 1` a group covers exactly `block`, so the index is the global
+    // index unchanged.
     let tile_base = if tm == 1 {
         base
     } else {
-        let block_e = ctx.b.u32(block);
+        let block_e = ctx.b.lit_u32(block);
         let group = ctx.b.binary(
             TileBinaryOp::Div,
             base.clone(),
@@ -419,11 +409,11 @@ pub fn lower_kregion(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
         let lane = ctx
             .b
             .binary(TileBinaryOp::Rem, base, block_e, NumericContract::RELAXED);
-        let group_e = ctx.b.u32(per_group);
+        let group_e = ctx.b.lit_u32(per_group);
         let scaled = ctx.b.mul(group, group_e);
         ctx.b.add(scaled, lane)
     };
-    let bound = ctx.b.u32(elements);
+    let bound = ctx.b.lit_u32(elements);
 
     let mut body = Vec::new();
     let zero_elem = match out_elem {
@@ -434,7 +424,7 @@ pub fn lower_kregion(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
         let index = if t == 0 {
             tile_base.clone()
         } else {
-            let step = ctx.b.u32(t.saturating_mul(block));
+            let step = ctx.b.lit_u32(t.saturating_mul(block));
             ctx.b.add(tile_base.clone(), step)
         };
         let live = ctx
@@ -445,7 +435,7 @@ pub fn lower_kregion(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
         // and written to every live-out. That register reuse is the whole
         // point of a region: a later statement reads it without a second
         // load.
-        let zero = ctx.b.zero(zero_elem);
+        let zero = ctx.b.zero_scalar(zero_elem);
         let shared = ctx.b.load(
             fusor2_ir::ir::level2::Source::Storage(out_view.clone()),
             Addr::Linear(index.clone()),
@@ -594,8 +584,6 @@ mod tests {
         }
     }
 
-    // -- the schedule domain ------------------------------------------------
-
     fn gpu_caps(subgroup: u32, max_invocations: u32) -> Caps {
         let mut c = crate::emit::testkit::caps(false, true);
         c.subgroups = Some(SubgroupWidths {
@@ -684,9 +672,8 @@ mod tests {
         assert_ne!(narrow, wide);
     }
 
-    /// The workgroup width was the constant this module existed to delete.
-    /// It is now a whole number of subgroups, bounded by the work and by the
-    /// device.
+    /// The workgroup width is a whole number of subgroups, bounded by the work
+    /// and by the device.
     #[test]
     fn the_width_is_derived_from_the_work_and_the_caps() {
         let caps = gpu_caps(32, 256);
@@ -716,8 +703,6 @@ mod tests {
         // `Point` is the untiled member of the node's own domain.
         assert_eq!(tiling_of(SchedPoint::Point).unwrap().tm, 1);
     }
-
-    // -- lowering at a point ------------------------------------------------
 
     fn graph_with(dims: &[u64], count: usize) -> (EGraph, Vec<Id>) {
         use fusor2_ir::ir::Op;
@@ -839,8 +824,6 @@ mod tests {
         })
     }
 
-    // -- the write set, evaluated out of the emitted body -------------------
-
     #[derive(Copy, Clone)]
     struct Thread {
         gx: u32,
@@ -961,9 +944,8 @@ mod tests {
         }
     }
 
-    /// The same, at `SchedPoint::Point` — the path every launch takes today,
-    /// since neither variant carries a `sched` field for extraction to
-    /// resolve.
+    /// The same, at `SchedPoint::Point` — the untiled fallback a launch takes
+    /// when extraction supplied no point for the root.
     #[test]
     fn the_default_point_writes_every_element_exactly_once() {
         let ir = merged_ir(WaveCat::Row, &[200], 3, SchedPoint::Point);
@@ -996,8 +978,7 @@ mod tests {
         assert_eq!(seen.len(), 4, "every point is a distinct dispatch");
     }
 
-    /// Small shapes stop launching a 256-lane workgroup for 8 stores. This
-    /// is the constant that was `BLOCK`.
+    /// A small shape does not launch a 256-lane workgroup for 8 stores.
     #[test]
     fn a_small_wave_no_longer_launches_a_full_workgroup() {
         let ir = merged_ir(WaveCat::Row, &[8], 2, SchedPoint::Point);
@@ -1062,11 +1043,10 @@ mod tests {
         }
     }
 
-    /// A split-K wave stored `k/splits` terms as if it were the whole sum —
-    /// a partial reduction that is nearly right, which is the worst kind of
-    /// wrong. Nothing mints `splits > 1` (`rules::merge::segment_of` writes
-    /// `splits: 1` on every segment), so refusing costs nothing and the
-    /// silently-partial answer is gone.
+    /// This body cannot combine split-K partials, so a `splits > 1` wave is
+    /// refused rather than stored as if `k/splits` terms were the whole sum.
+    /// Nothing mints `splits > 1` (`rules::merge::segment_of` writes
+    /// `splits: 1` on every segment), so refusing costs nothing.
     #[test]
     fn a_split_k_wave_is_refused_rather_than_summed_short() {
         use fusor2_ir::ir::Op;
@@ -1127,9 +1107,9 @@ mod tests {
     }
 
     /// The group index is linearized over all three dispatch axes, the way
-    /// `distribute_workgroups` laid the grid out. Dropping `z` aliased every
-    /// group past the second slab onto slab 0 — every one of them writing
-    /// the same elements.
+    /// `distribute_workgroups` lays the grid out. Without the `z` term every
+    /// group past the first slab would alias one in slab 0 and write the same
+    /// elements.
     #[test]
     fn the_group_index_reads_all_three_dispatch_axes() {
         // A device that only takes 4 workgroups per dimension folds 32 groups

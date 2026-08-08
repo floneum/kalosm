@@ -9,9 +9,10 @@ use crate::ir::level1::L1;
 use crate::ir::{Children, Level, Node, Op, OpTag, Semantics};
 use crate::shape::SymId;
 use fixedbitset::FixedBitSet;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// An e-graph node id. Ids are dense and monotone: `children` may only hold
@@ -36,8 +37,8 @@ impl fmt::Display for Id {
 /// An e-class handle: the id of the topmost `Op::Union` node containing a
 /// value, or the value's own id when it has no alternatives.
 ///
-/// **This replaces the union-find handle.** There is no `UnionFind`, no
-/// rank, no path compression and no `rebuild()`. A class's identity is
+/// There is no `UnionFind`, no rank, no path compression and no
+/// `rebuild()`. A class's identity is
 /// never a merge artifact, so max-rank can never stop preserving global
 /// acyclicity. The price, paid deliberately: **equality is not congruent** —
 /// unioning `a` and `b` does not union `f(a)` and `f(b)`. Alternatives are
@@ -47,25 +48,33 @@ impl fmt::Display for Id {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClassId(pub Id);
 
-/// Hash-cons key: the operator plus its canonicalized children. Commutative
-/// ops sort children by [`Id`] at construction, so associativity and
-/// commutativity are a canonical form, not a rule family.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct NodeKey {
-    pub op: Op,
-    pub children: Children,
+/// Hash of a node's hash-cons key — the operator plus its canonicalized
+/// children. Commutative ops sort children by [`Id`] at construction, so
+/// associativity and commutativity are a canonical form, not a rule family.
+/// The key itself is never stored: the arena node *is* the key, so a
+/// candidate under this hash is confirmed against `nodes[id]` directly.
+fn key_hash(op: &Op, children: &Children) -> u64 {
+    let mut h = FxHasher::default();
+    op.hash(&mut h);
+    children.hash(&mut h);
+    h.finish()
 }
 
 /// The e-graph: one node arena, one memo, one facts table, no union-find.
+///
+/// Nodes and facts are held behind [`Arc`] so the saturation driver can pin
+/// one node's `&Node`/`&ValueFacts` across the `&mut Builder` it hands to a
+/// rule — a refcount bump per visit, never a deep clone.
 pub struct EGraph {
-    nodes: Vec<Node>,
-    facts: Vec<ValueFacts>,
+    nodes: Vec<Arc<Node>>,
+    facts: Vec<Arc<ValueFacts>>,
+    /// [`key_hash`] to the ids carrying it; holds no `Op` payloads at all.
     /// Shared with every [`SaturationDelta`] recorded off this graph, so a
     /// replay is a refcount bump rather than a copy of the whole table.
     /// `add` is the only writer and takes it back by `Arc::make_mut`, so a
     /// graph that keeps growing after a replay still hash-conses against a
     /// fully populated memo — copy-on-write, not a lazy rebuild.
-    memo: Arc<FxHashMap<NodeKey, Id>>,
+    memo: Arc<FxHashMap<u64, SmallVec<[Id; 1]>>>,
     parent: Vec<Option<Id>>,
     defns: FixedBitSet,
     roots: Vec<Id>,
@@ -98,6 +107,12 @@ impl EGraph {
     }
     pub fn node(&self, id: Id) -> &Node {
         &self.nodes[id.index()]
+    }
+    /// The arena's shared handle to `id`'s node, for pinning a `&Node`
+    /// across a later `&mut` borrow of the graph. A refcount bump; the
+    /// pointee is immutable, `add` being the arena's only writer.
+    pub fn node_arc(&self, id: Id) -> Arc<Node> {
+        Arc::clone(&self.nodes[id.index()])
     }
     pub fn facts(&self, id: Id) -> &ValueFacts {
         &self.facts[id.index()]
@@ -143,36 +158,43 @@ impl EGraph {
                 format!("child {bad} is not strictly smaller than {next}"),
             ));
         }
-        let key = NodeKey {
-            op: op.clone(),
-            children: children.clone(),
-        };
-        if let Some(&hit) = self.memo.get(&key) {
-            return Ok(hit);
+        let hash = key_hash(&op, &children);
+        if let Some(bucket) = self.memo.get(&hash) {
+            for &hit in bucket {
+                let n = &self.nodes[hit.index()];
+                if n.op == op && n.children == children {
+                    return Ok(hit);
+                }
+            }
         }
-        let ins: SmallVec<[ValueFacts; 4]> = children
-            .iter()
-            .map(|c| self.facts[c.index()].clone())
-            .collect();
-        let facts = match &op {
-            Op::Union(a, _) => self.facts[a.index()].clone(),
-            other => self.sem.infer(other, &ins)?,
+        let (facts, level) = match &op {
+            Op::Union(a, _) => (
+                Arc::clone(&self.facts[a.index()]),
+                self.nodes[a.index()].level,
+            ),
+            other => {
+                let ins: SmallVec<[ValueFacts; 4]> = children
+                    .iter()
+                    .map(|c| (*self.facts[c.index()]).clone())
+                    .collect();
+                let facts = Arc::new(self.sem.infer(other, &ins)?);
+                (facts, other.level().expect("non-union ops carry a level"))
+            }
         };
-        let level = match &op {
-            Op::Union(a, _) => self.nodes[a.index()].level,
-            other => other.level().expect("non-union ops carry a level"),
-        };
-        self.nodes.push(Node {
+        self.nodes.push(Arc::new(Node {
             op,
             level,
             children,
-        });
+        }));
         self.facts.push(facts);
         self.parent.push(None);
         // Copy-on-write: a no-op clone unless a `SaturationDelta` still holds
         // the table, which is exactly the case where the copy is required for
         // the delta to stay a faithful recording.
-        Arc::make_mut(&mut self.memo).insert(key, next);
+        Arc::make_mut(&mut self.memo)
+            .entry(hash)
+            .or_default()
+            .push(next);
         Ok(next)
     }
 
@@ -204,7 +226,7 @@ impl EGraph {
     }
 
     pub fn chain(&self, id: Id) -> Vec<Id> {
-        self.members(self.class_of(id))
+        self.members(self.class_of(id)).into_vec()
     }
 
     /// Every id that resolves to `class`, **including the `Union` spine**.
@@ -214,9 +236,10 @@ impl EGraph {
     /// `macro_op` returns the id `union(defn, sugar)` produced, so the
     /// `Tensor` the user reads back *is* the spine node. Anything keyed on
     /// "this value" rather than "this candidate" has to use this.
-    pub fn class_ids(&self, class: ClassId) -> Vec<Id> {
-        let mut out = Vec::new();
-        let mut stack = vec![class.0];
+    pub fn class_ids(&self, class: ClassId) -> SmallVec<[Id; 8]> {
+        let mut out: SmallVec<[Id; 8]> = SmallVec::new();
+        let mut stack: SmallVec<[Id; 8]> = SmallVec::new();
+        stack.push(class.0);
         while let Some(cur) = stack.pop() {
             if out.contains(&cur) {
                 continue;
@@ -231,9 +254,10 @@ impl EGraph {
     }
 
     /// Every non-`Union` member of an e-class, in creation order.
-    pub fn members(&self, class: ClassId) -> Vec<Id> {
-        let mut out = Vec::new();
-        let mut stack = vec![class.0];
+    pub fn members(&self, class: ClassId) -> SmallVec<[Id; 8]> {
+        let mut out: SmallVec<[Id; 8]> = SmallVec::new();
+        let mut stack: SmallVec<[Id; 8]> = SmallVec::new();
+        stack.push(class.0);
         while let Some(cur) = stack.pop() {
             match self.nodes[cur.index()].op {
                 Op::Union(a, b) => {
@@ -293,7 +317,7 @@ impl EGraph {
             nodes: self.nodes.clone(),
             facts: self.facts.clone(),
             // Kept whole rather than as the appended entries alone —
-            // re-inserting the tail would rehash every `NodeKey`, and the tail
+            // re-inserting the tail would rehash every key, and the tail
             // is the overwhelming majority of the table. Sharing it is free:
             // the next `add` on this graph is what pays for a private copy,
             // and only if there ever is one.
@@ -347,17 +371,18 @@ impl EGraph {
     /// The read-only legality view of `id`, as handed to a rule. The
     /// returned [`Facts`] borrows **only** `caps`, never the graph, so a
     /// driver can build it and then hand out a `&mut Builder` over the same
-    /// graph — that is what makes the four-argument [`RuleFn`] sound.
+    /// graph — that is what makes the four-argument [`RuleFn`] sound. It
+    /// shares the arena's facts rather than cloning them.
     pub fn facts_view<'c>(&self, id: Id, caps: &'c Caps) -> Facts<'c> {
         let node = &self.nodes[id.index()];
         Facts {
             caps,
             level: node.level,
-            own: self.facts[id.index()].clone(),
+            own: Arc::clone(&self.facts[id.index()]),
             operands: node
                 .children
                 .iter()
-                .map(|c| self.facts[c.index()].clone())
+                .map(|c| Arc::clone(&self.facts[c.index()]))
                 .collect(),
         }
     }
@@ -412,9 +437,8 @@ impl<'a> Builder<'a> {
         self.graph.mark_defn(id);
     }
 
-    /// Walk a chain of pure `Restride` views down to their base. This is
-    /// what makes `sink_epilogue` — the reference's self-declared "single
-    /// clearest structural gap" — a single-rooted rule.
+    /// Walk a chain of pure `Restride` views down to their base. This is what
+    /// makes `sink_epilogue` a single-rooted rule.
     pub fn trace_pure_views(&self, mut v: Id) -> ViewSpine {
         let mut views: SmallVec<[Id; 4]> = SmallVec::new();
         loop {
@@ -453,8 +477,8 @@ impl ViewSpine {
 pub struct Facts<'a> {
     caps: &'a Caps,
     level: Level,
-    own: ValueFacts,
-    operands: SmallVec<[ValueFacts; 4]>,
+    own: Arc<ValueFacts>,
+    operands: SmallVec<[Arc<ValueFacts>; 4]>,
 }
 
 impl<'a> Facts<'a> {
@@ -468,16 +492,10 @@ impl<'a> Facts<'a> {
         &self.own
     }
     pub fn operand(&self, slot: usize) -> Option<&ValueFacts> {
-        self.operands.get(slot)
+        self.operands.get(slot).map(|f| &**f)
     }
-    pub fn operands(&self) -> &[ValueFacts] {
+    pub fn operands(&self) -> &[Arc<ValueFacts>] {
         &self.operands
-    }
-    pub fn numeric(&self, slot: usize) -> Option<crate::dtype::NumericContract> {
-        self.operands.get(slot).map(|f| f.numeric)
-    }
-    pub fn dim(&self, slot: usize, axis: usize) -> Option<crate::shape::Dim> {
-        self.operands.get(slot)?.shape.get(axis).copied()
     }
     pub fn dtype(&self, slot: usize) -> Option<crate::dtype::Dtype> {
         self.operands.get(slot).map(|f| f.dtype)
@@ -494,8 +512,9 @@ pub enum RuleTag {
     StrictlyLowering,
 }
 
-/// A rewrite rule's body. The driver clones the node and builds [`Facts`]
-/// before calling, so the four parameters do not alias. `Some(id)` reports
+/// A rewrite rule's body. The driver pins the node's [`Arc`] and builds
+/// [`Facts`] before calling, so the four parameters do not alias. `Some(id)`
+/// reports
 /// the id the rule unioned into the chain; `None` means it did not apply.
 pub type RuleFn = fn(&mut Builder<'_>, Id, &Node, &Facts<'_>) -> Option<Id>;
 
@@ -527,8 +546,7 @@ impl fmt::Debug for Rule {
 /// **Every term is a count, never a clock.** A wall-clock cutoff makes the
 /// set of alternatives — and therefore the extracted plan, and therefore the
 /// `PlanHash` the cross-process cache is keyed on — depend on how loaded the
-/// machine was. The shipped 2 ms deadline did bind: a five-line `rms_norm`
-/// truncated at 96 of its 134 nodes, at a different node each run.
+/// machine is.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SaturationBudget {
     /// `MAX_NODES = node_slope * initial + node_slack`.
@@ -542,34 +560,18 @@ pub struct SaturationBudget {
 }
 
 impl Default for SaturationBudget {
-    /// The shipped budget: `8 * initial + 4096` nodes, 10 rounds, 200k rule
-    /// applications.
+    /// `8 * initial + 4096` nodes, 10 rounds, 200k rule applications.
     ///
     /// 200k is ~40x the largest graph in the conformance suite and still
     /// bounds a 3,000-node step graph's saturation, so in practice the node
     /// ceiling and the round count are what bind.
     ///
-    /// **10 rounds, not 6.** A round count bounds chain *depth*, and the
-    /// deepest chain in the suite is attention. Measured by A/B on
-    /// `attention_rope::*_defn_saturates`'s own gate, which is the only
-    /// honest instrument — the budget is what the gate reads: first
-    /// saturation is at 9 rounds (CPU, non-causal), 8 (CPU, causal), 7 (GPU,
-    /// non-causal) and 6 (GPU, causal), which is exactly why causal-on-GPU
-    /// was the one member of that quartet passing at 6. The other three were
-    /// not observing a slow saturation, they were observing a budget shorter
-    /// than the graph.
-    ///
-    /// The chain converges rather than diverges, so the deeper budget is a
-    /// fixpoint and not a longer walk: CPU non-causal reports 472 nodes at 7
-    /// rounds, 484 at 8 and a fixpoint at 9. Ten is the tightest value that
+    /// A round count bounds chain *depth*, and the deepest chain in the suite
+    /// is attention: first saturation is at 9 rounds (CPU, non-causal), 8
+    /// (CPU, causal), 7 (GPU, non-causal) and 6 (GPU, causal). The chain
+    /// converges rather than diverges — CPU non-causal reports 472 nodes at 7
+    /// rounds, 484 at 8 and a fixpoint at 9 — so 10 is the tightest value that
     /// clears all four with a round of headroom.
-    ///
-    /// **Measured against the `splice` widening, and it is why that widening
-    /// is not landed.** With `fusion::splice` restating an absorbed producer's
-    /// operands over a promoted `space`, the CPU attention graph goes 472 ->
-    /// 1352 nodes and the fixpoint moves to 12 rounds, so this would have to
-    /// become 13. That cost is not the reason the widening was dropped — see
-    /// `fusor2-conformance::launch_counts` — but it is part of its price.
     ///
     /// Raising this moves extraction across the whole suite and `PlanHash` is
     /// a golden, so it is not a knob to turn without re-running both
@@ -637,9 +639,9 @@ pub struct SaturationDelta {
     /// The whole post-saturation state. `nodes[..pre.len]` doubles as the
     /// recording's validity condition — `nodes` is append-only, so those
     /// entries are exactly the term saturation was handed.
-    nodes: Vec<Node>,
-    facts: Vec<ValueFacts>,
-    memo: Arc<FxHashMap<NodeKey, Id>>,
+    nodes: Vec<Arc<Node>>,
+    facts: Vec<Arc<ValueFacts>>,
+    memo: Arc<FxHashMap<u64, SmallVec<[Id; 1]>>>,
     parent: Vec<Option<Id>>,
     defns: FixedBitSet,
     roots: Vec<Id>,

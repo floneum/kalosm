@@ -1,20 +1,19 @@
 //! `fusor2-tile` — everything that reasons about one kernel body and about the
 //! schedule-parameter space of one node.
 //!
-//! Owns the L2 algorithms the reference proved out (liveness, workgroup arena
-//! packing, barrier elision/insertion argmin, all-pairs arena verification,
-//! uniformity analysis, full L2 type-check) and the hash-consed L2 term
-//! builders both emitters share. Also owns the schedule-domain generators and
-//! the L1 lowering rules that consult them, because a rule whose legality
-//! filter is exact workgroup bytes must live with the function that computes
-//! them — that co-location is what makes the L1 admission test and the L2
-//! layout provably the same number.
+//! Holds the L2 algorithms (liveness, workgroup arena packing, barrier
+//! elision/insertion argmin, all-pairs arena verification, uniformity
+//! analysis, L2 type-check) and the hash-consed L2 term builders both emitters
+//! share, plus the schedule-domain generators and the L1 lowering rules that
+//! consult them; the L1 admission test and the L2 layout compute workgroup
+//! bytes from the same function.
 
 pub mod arena;
 pub mod barrier;
 pub mod build;
 pub mod domains;
 pub mod liveness;
+pub mod lower;
 pub mod planner;
 pub mod rules;
 pub mod uniformity;

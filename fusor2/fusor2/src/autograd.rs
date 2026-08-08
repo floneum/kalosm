@@ -169,16 +169,13 @@ impl Graph {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tensor
-// ---------------------------------------------------------------------------
 
 /// A value on the tape.
 pub struct Tensor<const R: usize, T: Element = f32> {
     value: RawTensor<R, T>,
     graph: Graph,
 }
-
 
 impl<const R: usize, T: Element> Clone for Tensor<R, T> {
     fn clone(&self) -> Self {
@@ -427,9 +424,7 @@ impl Gradients {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Differentiable ops
-// ---------------------------------------------------------------------------
 
 /// Rank- and dtype-preserving unaries.
 macro_rules! same {
@@ -508,9 +503,9 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 
     /// Broadcasting `a + b`, output rank `O = max(R, R2)`.
     ///
-    /// Two const parameters, matching the reference's tape-level binaries.
-    /// The raw tensor's take a third — the operand slot the reference spelled
-    /// `B: Fusion<R2, D>` — because that is what a raw call site turbofishes.
+    /// Two const parameters. The raw tensor's form takes a third, the operand
+    /// slot, which a raw call site turbofishes; here it is fixed to
+    /// `RawTensor<R2, T>`.
     #[track_caller]
     pub fn add_<const R2: usize, const O: usize>(&self, rhs: &Tensor<R2, T>) -> Tensor<O, T> {
         self.like(
@@ -603,7 +598,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         self.like(self.value.matmul(&rhs.value))
     }
 
-    /// The reference's spelling of [`Tensor::matmul`].
+    /// Alias for [`Tensor::matmul`].
     #[track_caller]
     pub fn mat_mul(&self, rhs: &Self) -> Self {
         self.matmul(rhs)

@@ -1,6 +1,4 @@
 //! `LayerNorm` over the last axis and `LayerNormNd` over a trailing group.
-//!
-//! Owned by W13.
 
 use fusor2_gguf::VarBuilder;
 use fusor2_ir::shape::Dim;
@@ -19,9 +17,8 @@ impl LayerNorm {
         Self { weight, bias, eps }
     }
 
-    /// `weight` is required and `bias` is optional, matching the reference's
-    /// `load_vector_f32` / `load_optional_vector_f32` pair. Both are squeezed
-    /// to rank 1 when the file writes them as `[1, n]`.
+    /// `weight` is required and `bias` is optional. Both are squeezed to
+    /// rank 1 when the file writes them as `[1, n]`.
     pub fn load(vb: &VarBuilder, graph: &crate::graph::GraphRef, eps: f32) -> Result<Self> {
         let w = crate::layers::load_dense(vb, graph, "weight")?;
         let weight = crate::layers::as_vector(w, "weight")?;
@@ -32,9 +29,8 @@ impl LayerNorm {
         Ok(Self { weight, bias, eps })
     }
 
-    /// `(x - mean) / sqrt(var + eps) * weight + bias` over the last axis, with
-    /// the **biased** variance the reference uses — the divisor is the axis
-    /// extent, not `n - 1`.
+    /// `(x - mean) / sqrt(var + eps) * weight + bias` over the last axis. The
+    /// variance is biased: the divisor is the axis extent, not `n - 1`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         x.layer_norm(&self.weight, self.bias.as_ref(), self.eps, true)
     }
@@ -51,13 +47,12 @@ impl LayerNormNd {
         Self { inner, axes }
     }
 
-    /// The statistic is taken over the **flattened tail**, not per trailing
-    /// axis: `[a, b, c]` with `axes == 2` has one mean and one variance per
-    /// `a`, over all `b * c` elements.
+    /// The statistic is taken over the flattened tail, not per trailing axis:
+    /// `[a, b, c]` with `axes == 2` has one mean and one variance per `a`, over
+    /// all `b * c` elements.
     ///
-    /// So this is the last-axis path over a reshaped view, and the affine
-    /// parameters flatten with it. No second normalization kernel exists and
-    /// none is wanted — the reshape is a `Restride`, which costs nothing.
+    /// This runs the last-axis path over a reshaped view, with the affine
+    /// parameters flattened to match.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let axes = self.axes as usize;
         if axes == 0 {
@@ -162,7 +157,7 @@ mod tests {
     }
 
     /// The mean is removed and the variance is biased, which is what the
-    /// reference's `layer_norm(.., true)` means.
+    /// `centered` flag of `layer_norm` selects.
     #[test]
     fn the_forward_is_the_centered_macro_op() {
         let g = graph();

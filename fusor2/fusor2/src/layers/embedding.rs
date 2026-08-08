@@ -1,7 +1,5 @@
 //! `Embedding`: a `Gather` whose adjoint is a `Scatter{Add}` with four
-//! coexisting lowerings. No hand-written backward.
-//!
-//! Owned by W13.
+//! coexisting lowerings.
 
 use fusor2_gguf::VarBuilder;
 use fusor2_ir::shape::Dim;
@@ -40,9 +38,9 @@ impl Embedding {
 
     /// `[..ids] -> [..ids, embedding_dim]`.
     ///
-    /// One `L0::Gather` over the flattened index run, reshaped back. There is
-    /// no backward here: `Gather`'s declared adjoint is a `Scatter{Add}`, so a
-    /// token appearing twice accumulates without this layer knowing.
+    /// One `L0::Gather` over the flattened index run, reshaped back. `Gather`'s
+    /// declared adjoint is a `Scatter{Add}`, so a token appearing twice
+    /// accumulates.
     pub fn forward(&self, ids: &Tensor) -> Result<Tensor> {
         if self.table.rank() != 2 {
             return Err(Error::Shape(format!(
@@ -88,8 +86,7 @@ mod tests {
         );
     }
 
-    /// One `Gather`, nothing else: the layer must not mint a second node the
-    /// adjoint would then have to know about.
+    /// The layer mints one `Gather` and nothing else.
     #[test]
     fn the_forward_is_exactly_the_gather() {
         let g = graph();

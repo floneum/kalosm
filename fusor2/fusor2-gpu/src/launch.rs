@@ -3,10 +3,7 @@
 //! **Host syncs are exactly three**: explicit readback, explicit
 //! [`Target::wait`](fusor2_ir::target::Target::wait), and the allocator's cap
 //! retry. Back-pressure on in-flight submissions is a runtime policy here
-//! ([`GpuConfig::max_in_flight_submits`]), not a `--drain-every` counter in a
-//! training script.
-//!
-//! Owned by W9.
+//! ([`GpuConfig::max_in_flight_submits`]), applied without the caller asking.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -14,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;
-use fusor2_ir::extract::{Plan, PlanHash};
 use fusor2_ir::target::{Artifact, Buf, Uniforms};
 use parking_lot::Mutex;
 
@@ -34,9 +30,7 @@ pub const METAL_SUBMIT_CHUNK: usize = 256;
 /// `poll_wait` spins in `Poll` mode for this long before blocking.
 pub const POLL_SPIN: Duration = Duration::from_millis(2);
 
-// ---------------------------------------------------------------------------
 // Chunking policy
-// ---------------------------------------------------------------------------
 
 /// Dispatches packed into one compute pass.
 ///
@@ -76,9 +70,7 @@ pub fn should_parallelize_build_remainder(
         && last_build > COLD_BUILD_THRESHOLD
 }
 
-// ---------------------------------------------------------------------------
 // Telemetry
-// ---------------------------------------------------------------------------
 
 /// One kernel's aggregated timing across a resolve.
 #[derive(Clone, Debug, PartialEq)]
@@ -135,9 +127,7 @@ impl KernelProfile {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Command records
-// ---------------------------------------------------------------------------
 
 /// One recorded command, in exact plan order.
 pub enum CommandRecord {
@@ -174,9 +164,7 @@ pub struct GpuArtifact {
     pub block: u32,
 }
 
-// ---------------------------------------------------------------------------
 // Launcher
-// ---------------------------------------------------------------------------
 
 /// Owns the encoder, the in-flight submission window and the profile buffer.
 pub struct Launcher {
@@ -278,9 +266,8 @@ impl Launcher {
         self.encode_command_records(&[record], None)
     }
 
-    /// Upload binding 0. This is the whole of trainer constraints 1 and 2: the
-    /// learning rate and the sequence length are words here, so neither enters
-    /// a kernel's identity.
+    /// Upload binding 0. Scalars like the learning rate and the sequence
+    /// length are words here, so neither enters a kernel's identity.
     pub fn write_uniforms(&self, slot0: &Buf, uniforms: &Uniforms) -> Result<()> {
         let gpu = slot0
             .downcast_ref::<GpuBuffer>()
@@ -676,9 +663,7 @@ impl Launcher {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Parallel build cursor
-// ---------------------------------------------------------------------------
 
 /// A shared cursor a build cohort drains. Every compiled artifact lives behind
 /// a `OnceLock` on the cached kernel, so racing workers can only duplicate
@@ -698,56 +683,11 @@ impl BuildCursor {
     }
 }
 
-/// A DOT rendering of the realized launch DAG.
-///
-/// Nodes are launches, edges are the buffers one launch writes and another
-/// reads, so the picture is the plan the extractor committed to rather than an
-/// approximation of it.
-pub fn graphvis_dot(plan: &Plan) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::from("digraph plan {\n  rankdir=TB;\n");
-    for (i, launch) in plan.launches.iter().enumerate() {
-        let _ = writeln!(
-            out,
-            "  L{i} [label=\"{} root={} grid={:?} block={}\"];",
-            i, launch.root, launch.grid, launch.block
-        );
-    }
-    for (i, producer) in plan.launches.iter().enumerate() {
-        for (j, consumer) in plan.launches.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            for w in producer
-                .bindings
-                .iter()
-                .filter(|b| b.kind != fusor2_ir::extract::BindKind::Read)
-            {
-                if consumer.bindings.iter().any(|r| r.value == w.value) {
-                    let _ = writeln!(out, "  L{i} -> L{j} [label=\"{}\"];", w.value);
-                }
-            }
-        }
-    }
-    out.push_str("}\n");
-    out
-}
-
-/// The plan's cache key — the `gpu_key` / `key` replacement. The plan **is**
-/// the key, so there is no `hash_kernel_fields` to thread a new decision
-/// variable into.
-pub const fn plan_key(plan: &Plan) -> PlanHash {
-    plan.hash
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-
-    // -----------------------------------------------------------------------
     // Adapter-gated. These skip cleanly when no GPU is present.
-    // -----------------------------------------------------------------------
 
     fn baseline_launcher() -> Option<Launcher> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -775,9 +715,9 @@ mod tests {
         ))
     }
 
-    /// Test 12: a resolve that reads nothing back records zero `poll_wait`
-    /// calls below the `max_in_flight_submits` threshold. Above it the
-    /// library — not the training script — applies back-pressure.
+    /// A resolve that reads nothing back records zero `poll_wait` calls below
+    /// the `max_in_flight_submits` threshold. Above it the library applies
+    /// back-pressure on its own.
     #[test]
     fn zero_readback_step_never_blocks() {
         let Some(launcher) = baseline_launcher() else {
@@ -820,8 +760,7 @@ mod tests {
         );
     }
 
-    /// Test 14, verbatim: the three `should_parallelize_build_remainder`
-    /// assertions.
+    /// The three `should_parallelize_build_remainder` cases.
     #[test]
     fn parallel_build_probe() {
         // A short queue stays serial no matter how cold the build was.
@@ -853,8 +792,8 @@ mod tests {
         ));
     }
 
-    /// Test 13: 2048 dispatches on Metal encode as 2048 passes across 8
-    /// submits; 512 dispatches encode as one pass and one submit.
+    /// 2048 dispatches on Metal encode as 2048 passes across 8 submits; 512
+    /// dispatches encode as one pass and one submit.
     #[test]
     fn pass_and_submit_chunking() {
         assert_eq!(dispatches_per_pass(2048), 1);
@@ -922,49 +861,4 @@ mod tests {
         assert!((p.top_names[1].max_us - 30.0).abs() < 1e-9);
     }
 
-    #[test]
-    fn plan_key_is_the_plan_hash() {
-        let plan = Plan {
-            extraction: Default::default(),
-            launches: Vec::new(),
-            buffers: Vec::new(),
-            symbols: Vec::new(),
-            hash: PlanHash(0xabc),
-            cost: Default::default(),
-        };
-        assert_eq!(plan_key(&plan), PlanHash(0xabc));
-    }
-
-    #[test]
-    fn graphvis_names_every_launch() {
-        use fusor2_ir::egraph::Id;
-        use fusor2_ir::extract::{BindKind, BindingPlan, Launch};
-        let launch = |root: u32, value: u32, kind: BindKind| Launch {
-            root: Id(root),
-            members: Default::default(),
-            bindings: vec![BindingPlan {
-                binding: 1,
-                value: Id(value),
-                kind,
-            }],
-            grid: [1, 1, 1],
-            block: 256,
-        };
-        let plan = Plan {
-            extraction: Default::default(),
-            launches: vec![
-                launch(1, 7, BindKind::Write),
-                launch(2, 7, BindKind::Read),
-            ],
-            buffers: Vec::new(),
-            symbols: Vec::new(),
-            hash: PlanHash(0),
-            cost: Default::default(),
-        };
-        let dot = graphvis_dot(&plan);
-        assert!(dot.starts_with("digraph plan {"));
-        assert!(dot.contains("L0"));
-        assert!(dot.contains("L1"));
-        assert!(dot.contains("L0 -> L1"), "the write/read edge must appear");
-    }
 }

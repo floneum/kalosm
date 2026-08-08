@@ -3,8 +3,6 @@
 //! Formats are **data**: the per-format decode is the `BlockProgram` that
 //! `fusor2-gguf` supplies as a `BlockEmitFn`, invoked here with a
 //! `BlockDecodeArgs`. Adding Q4_1 is a table row over there, not a kernel here.
-//!
-//! Owned by W8.
 
 use fusor2_gguf::blocks::{BlockDecodeArgs, BlockProgram};
 use fusor2_ir::ir::level2::{

@@ -1,11 +1,8 @@
 //! `Graph` and `Gradients`.
 //!
-//! The backward transform's output is ingested **together with the forward as
-//! one graph with one root set**, which is what makes gradient checkpointing
-//! the extractor's materialization bit. Nobody writes a checkpointing pass and
-//! there is no user annotation.
-//!
-//! Owned by W13.
+//! The backward transform's output is ingested together with the forward as
+//! one graph with one root set, so gradient checkpointing is the extractor's
+//! materialization bit.
 
 use std::sync::Arc;
 
@@ -67,23 +64,13 @@ pub struct GraphInner {
     /// Content-addressed names for immutable host-byte leaves. See
     /// [`GraphInner::constant_leaf`].
     constants: Mutex<FxHashMap<ConstKey, Id>>,
-    /// Serializes *whole* resolve-and-read sequences against this graph.
+    /// Serializes whole resolve-and-read sequences against this graph.
     ///
-    /// [`crate::session::Session::resolve`] cannot hold [`Self::egraph`] for
-    /// its own duration: saturation and extraction need it, but so do
-    /// `selected`, `bind_class` and `leaf_buffer` inside the dispatch that
-    /// follows, and the mutex is not reentrant. Releasing it between the two
-    /// halves is what let two threads interleave — one binding a freshly
-    /// allocated output buffer into [`Self::leaves`] while the other's
-    /// `read_bytes` found that buffer, saw nothing in flight, and downloaded
-    /// a buffer no dispatch had written yet. That returns **zeros**, not an
-    /// error. Measured before this existed: 4 bad readbacks in 640 across 8
-    /// threads on one `Device::cpu()`.
-    ///
-    /// A separate lock rather than a reentrant one, because the section that
-    /// has to be atomic is larger than any single e-graph operation:
-    /// `read_back` holds this across `resolve` *and* `read_bytes`, so a
-    /// concurrent resolve cannot land between them either.
+    /// [`Self::egraph`] is released between saturation and dispatch, so two
+    /// threads could otherwise interleave: one binds a freshly allocated
+    /// output buffer into [`Self::leaves`] while the other's `read_bytes`
+    /// downloads it before any dispatch has written it, returning zeros.
+    /// `read_back` holds this across both `resolve` and `read_bytes`.
     pub(crate) resolve_lock: Mutex<()>,
 }
 
@@ -180,15 +167,11 @@ impl GraphInner {
         id
     }
 
-    /// An immutable rank-N leaf holding `bytes`, named by its **content**.
+    /// An immutable rank-N leaf holding `bytes`, named by its content.
     ///
-    /// A leaf's hash-cons key is its `LeafKind`, and host bytes live in a side
-    /// table that is not part of that key. So a caller that mints two constants
-    /// of the same dtype and shape under one name gets **one node**, and the
-    /// second `set_leaf_bytes` silently overwrites the first — which is how
-    /// rope's permutation vector became its table-expansion vector. Naming the
-    /// leaf by its content makes the key exact in both directions: equal
-    /// constants still share a node, unequal ones cannot.
+    /// A leaf's hash-cons key is its `LeafKind` and host bytes live outside
+    /// that key, so keying on content is what keeps it exact in both
+    /// directions: equal constants share a node, unequal ones cannot.
     pub(crate) fn constant_leaf(&self, dtype: Dtype, shape: &[Dim], bytes: Vec<u8>) -> Result<Id> {
         let key = ConstKey {
             dtype,
@@ -284,17 +267,11 @@ impl GraphInner {
         self.leaves.lock().bytes.get(&id).cloned()
     }
 
-    /// Run `f` over an external leaf's host bytes **without copying them**.
-    ///
-    /// [`Self::leaf_bytes`] clones the whole `Vec`. On the upload path that
-    /// clone is a fresh 16 MB allocation plus a 16 MB memcpy for a 2048^2 f32
-    /// leaf, per leaf, per resolve, for bytes that are read once, handed to
-    /// the staging belt and dropped. The reference copies an uploaded byte
-    /// exactly once (`fusor-ml` `eager_data.rs::new_from_slice`).
+    /// Run `f` over an external leaf's host bytes without copying them, unlike
+    /// [`Self::leaf_bytes`], which clones the whole `Vec`.
     ///
     /// `f` runs with the `leaves` mutex held, so it must not re-enter this
-    /// graph. The only caller uploads through the target's pool, which locks
-    /// nothing of the graph's.
+    /// graph.
     pub(crate) fn with_leaf_bytes<T>(&self, id: Id, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
         let store = self.leaves.lock();
         store.bytes.get(&id).map(|b| f(b.as_slice()))
@@ -331,10 +308,7 @@ impl GraphInner {
     /// Resolve `id` and copy its bytes back to the host. One of exactly
     /// three host syncs.
     ///
-    /// The guard spans both halves: a concurrent resolve landing between them
-    /// could bind a fresh output buffer for a class this read is about to
-    /// download, and downloading a buffer whose dispatch has not run yet
-    /// returns zeros rather than an error. See [`GraphInner::resolve_lock`].
+    /// The guard spans both halves; see [`GraphInner::resolve_lock`].
     pub fn read_back(self: &Arc<Self>, id: Id) -> Result<Vec<u8>> {
         let tensor = self.tensor(id);
         let resolving = self.resolve_lock.lock();
@@ -407,8 +381,7 @@ impl Graph {
         Ok(t)
     }
 
-    /// Upload dense host data. The preserved spelling of the reference's
-    /// `Graph::tensor`.
+    /// Upload dense host data.
     pub fn tensor(&self, dtype: Dtype, shape: &[Dim], bytes: &[u8]) -> Result<Tensor> {
         self.constant_from_raw(dtype, shape, bytes)
     }
@@ -530,16 +503,12 @@ impl Graph {
 
     /// The subset of `candidates` that `value` actually depends on.
     ///
-    /// [`Graph::backward_with`] refuses a `wrt` the loss cannot reach, which
-    /// is right when the caller named it: an unreachable `wrt` is a typo or a
-    /// stray `detach`. A partial backward driven by [`crate::autograd`] is the
-    /// other case — it hands over a whole frontier and expects most of it to
-    /// be behind whatever it is descending from — so it filters first rather
-    /// than asking for a weaker error.
+    /// [`Graph::backward_with`] refuses a `wrt` the loss cannot reach; a
+    /// partial backward driven by [`crate::autograd`] filters through here
+    /// first instead.
     ///
-    /// Structural, over `children`: the e-graph only ever adds, so the
-    /// construction chain is still there to walk, and equal values are
-    /// compared by class rather than by id.
+    /// The walk is structural over `children`, comparing by class rather than
+    /// by id.
     pub fn reachable_from(&self, value: &Tensor, candidates: &[Tensor]) -> Vec<Tensor> {
         let g = self.inner.egraph.lock();
         let mut want: FxHashMap<fusor2_ir::egraph::ClassId, Vec<usize>> = FxHashMap::default();
@@ -573,8 +542,8 @@ impl Graph {
     /// Refuse a tensor from another graph.
     ///
     /// An `Id` is an index into *one* e-graph's arena, so a foreign one either
-    /// names an unrelated node or is out of range — the latter panicked in
-    /// `facts()` before reaching any check.
+    /// names an unrelated node or is out of range, which would panic in
+    /// `facts()`.
     fn owns(&self, t: &Tensor, role: &str) -> Result<()> {
         if Arc::ptr_eq(&t.graph, &self.inner) {
             return Ok(());
@@ -622,16 +591,13 @@ impl Graph {
         let grads = fusor2_autograd::backward::backward_into_with(
             &mut g, &caps, loss.id, seed, wrt, &custom,
         )?;
-        // Forward and backward are one graph with one root set: that is what
-        // makes "save this activation" versus "recompute it" the extractor's
-        // materialization bit rather than a pass anybody writes.
+        // Forward and backward share one root set, so save-versus-recompute is
+        // the extractor's materialization bit.
         g.add_root(loss.id);
         let mut entries = FxHashMap::default();
         for (primal, grad) in wrt.iter().zip(&grads) {
-            if let Some(grad) = grad {
-                g.add_root(*grad);
-                entries.insert(*primal, *grad);
-            }
+            g.add_root(*grad);
+            entries.insert(*primal, *grad);
         }
         Ok(Gradients { entries })
     }
@@ -664,9 +630,7 @@ impl Gradients {
         self.entries.is_empty()
     }
 
-    /// Drop the graph aliases, keeping only the ids. The replacement for the
-    /// reference's `into_detached`, which existed to sever lazy expression
-    /// trees; here there is nothing to sever.
+    /// Drop the graph aliases, keeping only the ids.
     pub fn into_detached(self) -> FxHashMap<Id, Id> {
         self.entries
     }

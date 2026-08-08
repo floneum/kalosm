@@ -1,21 +1,14 @@
 //! L2 expressions -> SIMD lane operations at a statically-known width.
 //!
-//! This is the SSA tape. One [`Instr`] per distinct `TileExprKind` node, one
-//! register slot per node; flattening the hash-consed DAG in topological order
-//! **is** the CSE that replaces the reference's deleted `Shared` node and its
-//! `Rc::as_ptr` memo.
+//! The SSA tape: one [`Instr`] per distinct `TileExprKind` node, one register
+//! slot per node. Flattening the hash-consed DAG in topological order is the
+//! CSE.
 //!
 //! The register file is `[u32; W]` with `W` a const generic resolved once per
-//! launch, so an `MxN` register accumulator tile is expressible — a
-//! width-erased vector type structurally cannot express one, which is the root
-//! cause of the reference's `[E; MAX_SIMD_LANES = 64]` spill in every
-//! comparison, every transcendental and every strided gather.
+//! launch, so an `MxN` register accumulator tile is expressible.
 //!
 //! `ElementType::Scalar(F16|BF16)` loads widen to `F32` registers and stores
-//! narrow: that is the emitter half of the `widen-compute` rule, and it is why
-//! there is no one-lane `F16Scalar` here.
-//!
-//! Owned by W10.
+//! narrow, so there is no one-lane `F16Scalar` here.
 
 use fusor2_ir::dtype::RoundMode;
 use fusor2_ir::ir::level2::{ScalarElement, TileReduceOp};
@@ -69,8 +62,7 @@ pub enum Instr {
     Uniform { out: Slot, which: UniformSrc },
     LoadLocal { out: Slot, local: u16 },
     /// Masked load. `index` is a per-lane element index; `form` is the access
-    /// lowering chosen **once at compile time** from the layout, never a
-    /// per-vector `is_contiguous()` branch.
+    /// lowering chosen once at compile time from the layout.
     Load {
         out: Slot,
         buf: u16,
@@ -99,7 +91,7 @@ pub enum Instr {
         b: Slot,
         ty: NumTy,
     },
-    /// A contracted `a * b + c`. Minted **only** when the operand's
+    /// A contracted `a * b + c`. Minted only when the operand's
     /// `NumericContract::contract` is set; a strict value emits separate
     /// `Bin{Mul}` and `Bin{Add}` instructions.
     Fma { out: Slot, a: Slot, b: Slot, c: Slot },
@@ -125,8 +117,8 @@ pub enum Instr {
         from: NumTy,
         to: NumTy,
     },
-    /// Narrow to a storage element and widen straight back — what a `Cast` to
-    /// `F16`/`BF16` means when the register file only holds f32.
+    /// Narrow to a storage element and widen straight back: a `Cast` to
+    /// `F16`/`BF16` when the register file only holds f32.
     Narrow {
         out: Slot,
         x: Slot,
@@ -148,9 +140,8 @@ pub enum Instr {
     },
     /// Unpack a `u32` of two packed f16s into a 2-lane f32 vector.
     Unpack2x16 { out: Slot, x: Slot },
-    /// Run a rank-2 address through the declared divmod chain of
-    /// `maps[map]`. Only the divmods the `MultiFlattenMap` declares are
-    /// performed, because `divmod_ops()` is the cost term.
+    /// Run a rank-2 address through the declared divmod chain of `maps[map]`.
+    /// Only the divmods the `MultiFlattenMap` declares are performed.
     Rc2Index {
         out: Slot,
         row: Slot,
@@ -190,8 +181,7 @@ impl Instr {
         }
     }
 
-    /// Is this a fused multiply-add? `numeric_contract_blocks_contraction`
-    /// inspects the tape with this.
+    /// Is this a fused multiply-add?
     pub fn is_fma(&self) -> bool {
         matches!(self, Instr::Fma { .. })
     }
@@ -211,15 +201,10 @@ pub enum UniformSrc {
     SubgroupLane,
 }
 
-// ---------------------------------------------------------------------------
-// The register type
-// ---------------------------------------------------------------------------
-
 /// A `W`-lane register. Bits, so `Bitcast` is free and a mask is `0`/`!0`.
 ///
-/// `W` is a const generic, i.e. the lane count is in the type. That is the
-/// whole point: `[Reg<W>; M]` is a register accumulator tile, and every
-/// operation below is a plain elementwise loop over a statically-sized array,
+/// `W` is a const generic, so `[Reg<W>; M]` is a register accumulator tile and
+/// every operation below is an elementwise loop over a statically-sized array,
 /// which lowers to whole vector instructions under the target features
 /// `dispatch!` established.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -317,10 +302,6 @@ impl<const W: usize> Reg<W> {
         Self(o)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Vector math: real approximations, no per-lane libm call
-// ---------------------------------------------------------------------------
 
 const LN2_HI: f32 = 0.693_145_75;
 const LN2_LO: f32 = 1.428_606_8e-6;
@@ -634,7 +615,7 @@ pub fn tanf(x: f32) -> f32 {
 }
 
 /// `tanh` by the [7/8] Padé rational near zero and the `exp` identity outside
-/// it, so the relative error stays flat across the whole line.
+/// it.
 #[inline(always)]
 pub fn tanhf(x: f32) -> f32 {
     let a = x.abs();
@@ -654,8 +635,6 @@ pub fn tanhf(x: f32) -> f32 {
 
 #[inline(always)]
 pub fn sqrtf(x: f32) -> f32 {
-    // A single hardware instruction on every target fusor2 runs on, not a
-    // libm call.
     x.sqrt()
 }
 
@@ -791,14 +770,11 @@ pub fn apply_un<const W: usize>(op: UnOp, ty: NumTy, x: Reg<W>) -> Reg<W> {
         (UnOp::Abs, NumTy::I32) => Reg(core::array::from_fn(|k| x.i(k).wrapping_abs() as u32)),
         (UnOp::Neg, NumTy::U32) => Reg(core::array::from_fn(|k| x.0[k].wrapping_neg())),
         (UnOp::Abs, NumTy::U32) => x,
-        // `Unpack2x16Float` has its own instruction: its result is a 2-lane
-        // vector, not a scalar register.
+        // `Unpack2x16Float` has its own instruction; its result is a 2-lane
+        // vector.
         (UnOp::Unpack2x16Float, _) => x,
         (op, _) => x.mapf(|v| match op {
-            // Both approximate exponentials lower to the target's `exp`,
-            // as `nary_direct.rs:1126` does: the relaxed contract is a
-            // permission to substitute, and the SIMD path has nothing
-            // cheaper to substitute.
+            // Both approximate exponentials lower to `exp`.
             UnOp::Exp | UnOp::ApproximateExp | UnOp::LessApproximateExp => expf(v),
             UnOp::Exp2 => exp2f(v),
             UnOp::Log => logf(v),
@@ -1082,8 +1058,7 @@ mod tests {
         assert_eq!(floorf(-1.2), -2.0);
         assert_eq!(ceilf(-1.2), -1.0);
         assert_eq!(trunc(-1.9), -1.0);
-        // Ties away from zero at every half-integer in [-8, 8]: what MSQ1
-        // export idempotence depends on.
+        // Ties away from zero at every half-integer in [-8, 8].
         for i in -16i32..=16 {
             if i % 2 == 0 {
                 continue;

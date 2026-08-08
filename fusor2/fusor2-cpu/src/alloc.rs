@@ -1,7 +1,5 @@
 //! 64-byte-aligned buffers, so a `f32x16` load is never split across a cache
 //! line and a workgroup tile can be addressed as a raw byte arena.
-//!
-//! Owned by W10.
 
 use fusor2_ir::error::Error;
 use fusor2_ir::Result;
@@ -40,8 +38,8 @@ impl AlignedBuf {
         Ok(Self { ptr, len })
     }
 
-    /// Grow in place-ish: reallocate zeroed when `len` exceeds the current
-    /// capacity, otherwise keep the existing allocation.
+    /// Reallocate zeroed when `len` exceeds the current capacity, otherwise
+    /// keep the existing allocation.
     pub fn ensure(&mut self, len: usize) -> Result<()> {
         if len <= self.len {
             return Ok(());
@@ -78,15 +76,12 @@ impl AlignedBuf {
         self.ptr
     }
 
-    /// The aliasing escape hatch the launcher needs.
-    ///
-    /// A dispatch hands the same `&AlignedBuf` to every worker thread and each
-    /// writes its own disjoint slice. Disjointness is not a promise this type
-    /// can check; it is `verify_l1`'s invariant 3 — *a nest's write map must be
-    /// injective unless the nest declares an associative combine* — which the
-    /// planner has already discharged before a kernel reaches [`crate::launch`].
-    /// Every cross-lane accumulation instead goes through
-    /// [`crate::emit::Program`]'s private-accumulate-then-merge path.
+    /// The aliasing escape hatch the launcher needs: a dispatch hands the same
+    /// `&AlignedBuf` to every worker thread and each writes its own disjoint
+    /// slice. Disjointness is `verify_l1`'s invariant 3, discharged by the
+    /// planner before a kernel reaches [`crate::launch`]; cross-lane
+    /// accumulation goes through [`crate::emit::Program`]'s
+    /// private-accumulate-then-merge path.
     pub fn as_mut_ptr(&self) -> *mut u8 {
         self.ptr
     }

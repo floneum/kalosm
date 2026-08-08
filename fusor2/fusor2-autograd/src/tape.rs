@@ -1,8 +1,6 @@
 //! [`GraphTape`]: the [`Tape`] implementation over a `&mut EGraph`. Every
-//! method appends L0 nodes to the *same* graph the forward lives in, which is
-//! what makes checkpointing an extraction decision.
-//!
-//! Owned by W5.
+//! method appends L0 nodes to the same graph the forward lives in, which makes
+//! checkpointing an extraction decision.
 
 use fusor2_ir::autograd::{Tape, Val};
 use fusor2_ir::dtype::{Dtype, Splat};
@@ -16,7 +14,7 @@ use fusor2_ir::shape::{BoundsProof, Dim, Dims, StrideSpec, broadcast_specs};
 use fusor2_ir::{Error, Result};
 use smallvec::SmallVec;
 
-/// A tape that is not a tape: a thin writer over the live e-graph.
+/// A thin writer over the live e-graph.
 pub struct GraphTape<'a> {
     graph: &'a mut EGraph,
 }
@@ -44,11 +42,11 @@ impl<'a> GraphTape<'a> {
 
 }
 
-/// Construction helpers every adjoint uses, on **any** tape.
+/// Construction helpers every adjoint uses, on any tape.
 ///
 /// These live on an extension trait rather than on [`GraphTape`] because
-/// [`fusor2_ir::autograd::AdjointFn`] receives `&mut dyn Tape`: a blanket
-/// impl over `T: Tape + ?Sized` is what makes them callable there.
+/// [`fusor2_ir::autograd::AdjointFn`] receives `&mut dyn Tape`, and the blanket
+/// impl over `T: Tape + ?Sized` makes them callable there.
 pub trait TapeExt: Tape {
     fn shape_of(&self, v: Val) -> Dims {
         self.facts(v).shape.clone()
@@ -95,8 +93,7 @@ pub trait TapeExt: Tape {
         self.map(body, &[c, t, f])
     }
 
-    /// Numeric conversion. Differentiable both directions with no special
-    /// case; this one line is the whole f32-master / f16-compute recipe.
+    /// Numeric conversion. Differentiable both directions with no special case.
     fn cast(&mut self, to: Dtype, v: Val) -> Result<Val> {
         if self.dtype_of(v) == to {
             return Ok(v);
@@ -126,8 +123,7 @@ pub trait TapeExt: Tape {
         }))
     }
 
-    /// `Fold{Add}` over `axis` — the sum reduction every broadcast backward
-    /// and `mean` is built from.
+    /// `Fold{Add}` over `axis`.
     fn sum_axis(&mut self, v: Val, axis: u32) -> Result<Val> {
         let acc = accum_dtype(self.dtype_of(v));
         self.fold_binop(fusor2_ir::scalar::BinOp::Add, axis, acc, v)
@@ -224,8 +220,8 @@ pub trait TapeExt: Tape {
         self.add(L0::Gather { axis, x, idx })
     }
 
-    /// `Scatter{Set}`. Only ever used by the adjoint of a `Scatter{Set}`,
-    /// which inherits the primal's uniqueness proof.
+    /// `Scatter{Set}`. Used by the adjoint of a `Scatter{Set}`, which inherits
+    /// the primal's uniqueness proof.
     fn scatter_set(
         &mut self,
         axis: u32,
@@ -282,8 +278,8 @@ impl Tape for GraphTape<'_> {
                 "Map needs at least one operand to fix its index space".into(),
             ));
         }
-        // verify_l0 clause 2: no implicit broadcasting inside a Map. The
-        // caller inserts `restride` first; this is the assertion that says so.
+        // verify_l0 clause 2: no implicit broadcasting inside a Map. The caller
+        // inserts `restride` first.
         let first = self.shape_of(ins[0]);
         for (slot, v) in ins.iter().enumerate().skip(1) {
             let s = self.shape_of(*v);
@@ -353,9 +349,8 @@ impl Tape for GraphTape<'_> {
     }
 }
 
-/// `BoundsProof::Static` when every extent is decidable and the composed
-/// reach provably lands inside the source; `RuntimeMask` otherwise. There is
-/// no third case and no user `assume`.
+/// `BoundsProof::Static` when every extent is decidable and the composed reach
+/// provably lands inside the source; `RuntimeMask` otherwise.
 pub fn bounds_proof(specs: &[StrideSpec], src: &[Dim]) -> BoundsProof {
     let Some(strides) = const_row_major(src) else {
         return BoundsProof::RuntimeMask;
@@ -424,8 +419,8 @@ pub fn lit(value: f32, dtype: Dtype) -> Result<ScalarExpr> {
     Ok(ScalarExpr::lit(splat_of(dtype, value)?))
 }
 
-/// Accumulator width for a fold over `dtype`. Narrow floats accumulate in
-/// f32 — the `NumericContract` floor, not a preference.
+/// Accumulator width for a fold over `dtype`. Narrow floats accumulate in f32,
+/// the `NumericContract` floor.
 pub const fn accum_dtype(dtype: Dtype) -> Dtype {
     dtype.compute_dtype()
 }
@@ -433,22 +428,12 @@ pub const fn accum_dtype(dtype: Dtype) -> Dtype {
 #[cfg(test)]
 pub(crate) mod testing {
     //! The e-graph this crate's tests build against, plus a naive L0
-    //! interpreter so every adjoint can be checked against a central
-    //! difference of the forward it claims to differentiate.
+    //! interpreter that checks every adjoint against a central difference of
+    //! the forward it differentiates.
     //!
-    //! The `Semantics` is the **real** [`CoreSemantics`], not a stand-in.
-    //! It used to be a local duplicate, written while `fusor2-ir::semantics`
-    //! was still landing, and the duplicate had drifted in the one place that
-    //! mattered: it inferred a float `Fold`'s output as the *operand* dtype
-    //! (`if f.dtype.is_float() { f.dtype } else { acc }`) where `infer_fold`
-    //! returns `acc`. Since `accum_dtype` floors every f16/bf16 fold at f32,
-    //! that one line hid every narrow-float adjoint bug in this crate from
-    //! every test in it — a `max` fold on f16 really does hand its adjoint an
-    //! f32 output, and the duplicate said otherwise. `verify` was also a
-    //! blanket `Ok(())`, so `verify_l0` never ran on a graph an adjoint built.
-    //!
-    //! [`SumArenaPlanner`] is the planner because this crate builds L0 only:
-    //! no L1 node is ever added, so no arena is ever planned.
+    //! The `Semantics` is [`CoreSemantics`], so `infer_fold` types a float
+    //! fold's output as `acc` and `verify_l0` runs on every graph an adjoint
+    //! builds. [`SumArenaPlanner`] suffices because this crate builds L0 only.
 
     use super::*;
     use fusor2_ir::device::{Caps, DeviceKind, Limits};
@@ -480,12 +465,7 @@ pub(crate) mod testing {
     }
 
 
-    // ------------------------------------------------------- L0 interpreter
-    //
-    // Dense, row-major, f32-valued, single-threaded and deliberately naive.
-    // Its only job is to let this crate's gradient tests be *numeric* — every
-    // adjoint checked against a central difference of the forward it claims
-    // to differentiate — without depending on a backend.
+    // The interpreter is dense, row-major, f32-valued and single-threaded.
 
     use fusor2_ir::egraph::Id;
     use fusor2_ir::scalar::{CmpOp, ScalarKind};
@@ -696,9 +676,8 @@ pub(crate) mod testing {
                             xc.extend_from_slice(&oc[axis..]);
                             let base: usize =
                                 xc.iter().zip(&xst).map(|(c, s)| c * s).sum::<usize>();
-                            // The carrier *is* the algorithm, so the
-                            // interpreter runs it rather than switching on a
-                            // name: seed from the identity and absorb.
+                            // Run the carrier rather than switching on a name:
+                            // seed from the identity and absorb.
                             let mut acc = carrier.identity_f32();
                             for k in 0..extent {
                                 let v = src[base + k * xst[axis]];
@@ -849,19 +828,18 @@ pub(crate) mod testing {
     }
 
     /// Compare every produced gradient against a central difference of
-    /// `sum(forward)` at `h = 1e-3`. This is the harness that makes the
-    /// adjoint table a claim about numbers rather than about node kinds.
+    /// `sum(forward)` at `h = 1e-3`.
     pub fn check_gradients(
         g: &EGraph,
         root: Id,
         wrt: &[Id],
-        grads: &[Option<Id>],
+        grads: &[Id],
         env: &Env,
         rtol: f32,
     ) {
         const H: f32 = 1e-3;
         for (k, w) in wrt.iter().enumerate() {
-            let gid = grads[k].unwrap_or_else(|| panic!("no gradient for {w}"));
+            let gid = grads[k];
             let analytic = eval(g, gid, env);
             let len = env[w].len();
             assert_eq!(analytic.len(), len, "gradient of {w} has the wrong extent");

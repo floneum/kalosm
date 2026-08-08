@@ -1,10 +1,7 @@
 //! The 12 comparisons. Results are 1.0/0.0 in the operand dtype; there is no
-//! boolean dtype at L0, which is what preserves `where_cond` verbatim.
+//! boolean dtype at L0.
 //!
-//! `CmpOp::Ne` exists, so `ne` is one node — the reference's `eq(s).eq(0)`
-//! double comparison has nothing to work around.
-//!
-//! Owned by W12.
+//! `CmpOp::Ne` is a primitive, so `ne` lowers to a single node.
 
 use fusor2_ir::scalar::{CmpOp, ScalarExpr};
 
@@ -35,7 +32,7 @@ impl Tensor {
     pub fn eq_scalar(&self, s: impl Into<Scalar>) -> Result<Tensor> {
         self.cmp_scalar(CmpOp::Eq, s)
     }
-    /// `1` where `x != s`. One node: `CmpOp::Ne` is a primitive.
+    /// `1` where `x != s`.
     pub fn ne_scalar(&self, s: impl Into<Scalar>) -> Result<Tensor> {
         self.cmp_scalar(CmpOp::Ne, s)
     }
@@ -55,11 +52,11 @@ impl Tensor {
     pub fn gte_scalar(&self, s: impl Into<Scalar>) -> Result<Tensor> {
         self.cmp_scalar(CmpOp::Ge, s)
     }
-    /// Reference spelling of [`Tensor::lte_scalar`].
+    /// Alias for [`Tensor::lte_scalar`].
     pub fn le_scalar(&self, s: impl Into<Scalar>) -> Result<Tensor> {
         self.lte_scalar(s)
     }
-    /// Reference spelling of [`Tensor::gte_scalar`].
+    /// Alias for [`Tensor::gte_scalar`].
     pub fn ge_scalar(&self, s: impl Into<Scalar>) -> Result<Tensor> {
         self.gte_scalar(s)
     }
@@ -104,7 +101,7 @@ mod tests {
         }
     }
 
-    /// `Ne` is a primitive; nothing needs `eq(s).eq(0)`.
+    /// `Ne` is a primitive, so it builds a single node.
     #[test]
     fn ne_is_one_node() {
         let e = ScalarExpr::cmp(

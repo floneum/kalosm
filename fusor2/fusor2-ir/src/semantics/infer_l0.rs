@@ -1,7 +1,5 @@
 //! Total shape/dtype/numeric/persistence inference for the ten L0 nodes.
 //! Never panics; every failure is an [`crate::Error`].
-//!
-//! Owned by W1.
 
 use crate::carrier::Carrier;
 use crate::contract_spec;
@@ -172,10 +170,6 @@ pub fn infer_l0(op: &L0, ins: &[ValueFacts]) -> Result<ValueFacts> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Per-node rules
-// ---------------------------------------------------------------------------
-
 fn infer_leaf(kind: &LeafKind) -> Result<ValueFacts> {
     Ok(match kind {
         LeafKind::Buffer { dtype, shape, .. } => ValueFacts {
@@ -261,12 +255,11 @@ fn infer_map(expr: &ScalarExpr, ins: &[ValueFacts], outs: u8) -> Result<ValueFac
 }
 
 /// A fold's result: the operand shape minus the reduced axis, with the
-/// carrier's lane count appended when it is more than one. That appended axis
-/// is how a multi-slot accumulator is read back — slot `i` is an ordinary
-/// `Restride` of it, so no new node kind appears.
+/// carrier's lane count appended when it is more than one. Slot `i` of a
+/// multi-slot accumulator is read back as a `Restride` of that axis.
 ///
-/// Every operand must have the same shape: the lift reads them all at one
-/// coordinate, exactly as a `Map` body does.
+/// Every operand must have the same shape; the lift reads them all at one
+/// coordinate.
 fn infer_fold(
     carrier: &Carrier,
     axis: u32,
@@ -315,14 +308,10 @@ fn infer_fold(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Restride
-// ---------------------------------------------------------------------------
-
 /// A spec references its `input_dim` when it is not a pure stride-0 axis at
-/// offset 0. The reference's `Layout::restride` reads `strides[input_dim]`
-/// for the offset term regardless of `multiplier`, so a broadcast spec with
-/// a nonzero offset still names an input dim.
+/// offset 0. `Layout::restride` reads `strides[input_dim]` for the offset
+/// term regardless of `multiplier`, so a broadcast spec with a nonzero
+/// offset still names an input dim.
 pub fn spec_reads_input_dim(s: &StrideSpec) -> bool {
     s.multiplier != 0 || !s.offset.known_eq(Dim::Const(0))
 }
@@ -339,16 +328,14 @@ fn check_restride_specs(specs: &[StrideSpec], in_rank: usize) -> Result<()> {
     Ok(())
 }
 
-/// The reference's `types/src/layout.rs::Layout::restride`, lifted to
-/// [`Dim`]: `out_shape[i] = spec.size`,
+/// Restride a layout over [`Dim`]: `out_shape[i] = spec.size`,
 /// `out_stride[i] = if multiplier == 0 { 0 } else { in_stride[input_dim] *
 /// multiplier }`, and the offset gains `sum(offset * in_stride[input_dim])`.
-/// Composition is **relative to the current strides**, which is what makes a
-/// view survive an upstream layout rewrite.
+/// Composition is relative to the current strides.
 ///
 /// A product or sum that is not decidable over `Const` dims becomes the
 /// symbolic stride placeholder `Dim::Sym(SymId(u32::MAX))`, the same
-/// convention `Layout::row_major_strides` already uses.
+/// convention `Layout::row_major_strides` uses.
 pub fn restride_layout(input: &Layout, specs: &[StrideSpec]) -> Result<Layout> {
     check_restride_specs(specs, input.rank())?;
     let in_strides = input.strides();
@@ -404,17 +391,12 @@ fn dim_add(a: Dim, b: Dim) -> Dim {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Window
-// ---------------------------------------------------------------------------
-
-/// `types/src/layout.rs::Layout::sliding_window`, lifted to [`Dim`].
+/// The sliding-window output shape over [`Dim`].
 ///
 /// Returns the output shape plus `true` when any windowed axis was symbolic.
-/// A symbolic axis does **not** mint a fresh extent: the output dim stays the
-/// input `Sym` (refined at dispatch) and the node carries a
-/// `BoundsProof::RuntimeMask` obligation, which is what keeps a symbolic
-/// sequence length from forcing a recompile.
+/// A symbolic axis mints no fresh extent: the output dim stays the input
+/// `Sym`, refined at dispatch, and the node carries a
+/// `BoundsProof::RuntimeMask` obligation.
 pub fn window_shape(
     specs: &[crate::shape::SlidingWindow],
     in_shape: &[Dim],
@@ -470,10 +452,6 @@ pub fn window_shape(
     Ok((shape, runtime_mask))
 }
 
-// ---------------------------------------------------------------------------
-// Scalar-expression helpers
-// ---------------------------------------------------------------------------
-
 /// Every `Arg(i)` in `expr` names an operand whose dtype matches the leaf's.
 fn check_arg_dtypes(expr: &ScalarExpr, ins: &[ValueFacts]) -> Result<()> {
     let mut err = None;
@@ -523,32 +501,10 @@ fn expr_is_closed(expr: &ScalarExpr) -> bool {
 /// [`ScalarExpr::structural_hash`].
 pub(crate) fn walk_expr(e: &ScalarExpr, f: &mut impl FnMut(&ScalarExpr)) {
     f(e);
-    match e.kind() {
-        ScalarKind::Arg(_)
-        | ScalarKind::Lit(_)
-        | ScalarKind::Uniform(_)
-        | ScalarKind::IndexOf(_) => {}
-        ScalarKind::Un { x, .. }
-        | ScalarKind::Cast { x, .. }
-        | ScalarKind::Bitcast { x, .. }
-        | ScalarKind::Round { x, .. }
-        | ScalarKind::Splat { x, .. } => walk_expr(x, f),
-        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
-            walk_expr(a, f);
-            walk_expr(b, f);
-        }
-        ScalarKind::Select { c, t, f: e_f } => {
-            walk_expr(c, f);
-            walk_expr(t, f);
-            walk_expr(e_f, f);
-        }
-    }
+    e.for_each_child(|c| walk_expr(c, f));
 }
 
-// ---------------------------------------------------------------------------
-// Arity helpers — every access is length-checked, so inference is total.
-// ---------------------------------------------------------------------------
-
+/// Length-checked operand access, so inference is total.
 fn one<'a>(ins: &'a [ValueFacts], what: &str) -> Result<&'a ValueFacts> {
     ins.first()
         .ok_or_else(|| Error::Shape(format!("{what} needs 1 operand, got {}", ins.len())))
@@ -602,8 +558,6 @@ mod tests {
         v.iter().map(|&d| Dim::Const(d)).collect()
     }
 
-    // ---- Test 1 ----------------------------------------------------------
-
     #[test]
     fn broadcast_specs_are_right_aligned() {
         let src = dims(&[3, 1, 5]);
@@ -621,8 +575,6 @@ mod tests {
         // An unconsumed source dim is an error.
         assert!(broadcast_specs(&dims(&[7, 3]), &dims(&[2, 3])).is_err());
     }
-
-    // ---- Test 2 ----------------------------------------------------------
 
     #[test]
     fn map_requires_identical_operand_shapes() {
@@ -690,8 +642,6 @@ mod tests {
         assert!(!facts.numeric.contract);
     }
 
-    // ---- Test 3 ----------------------------------------------------------
-
     #[test]
     fn contract_infers_the_output_shape() {
         let spec = EinSpec {
@@ -709,8 +659,6 @@ mod tests {
         let facts = infer_l0(&op, &[f32s(&[2, 3, 4]), f32s(&[2, 5, 4])]).unwrap();
         assert_eq!(&facts.shape[..], &dims(&[2, 3, 5])[..]);
     }
-
-    // ---- Test 5 ----------------------------------------------------------
 
     #[test]
     fn restride_composes_relative_to_current_strides() {
@@ -752,8 +700,6 @@ mod tests {
         };
         assert!(infer_l0(&bcast, &[f32s(&[])]).is_ok());
     }
-
-    // ---- Test 6 ----------------------------------------------------------
 
     #[test]
     fn window_shapes() {
@@ -802,12 +748,8 @@ mod tests {
         assert!(window_shape(&[SlidingWindow::new(3, 2, 1)], &x.shape).is_err());
     }
 
-    // ---- Test 7 ----------------------------------------------------------
-
-    /// A carrier's lanes become a trailing axis of the output shape, so slot
-    /// readback is an ordinary `Restride` and no new node kind appears. This
-    /// is the shape convention, not an arity table: three scalar slots and one
-    /// `Vector(3)` slot append the same axis.
+    /// A carrier's lanes become a trailing axis of the output shape: three
+    /// scalar slots and one `Vector(3)` slot append the same axis.
     #[test]
     fn fold_carrier_appends_lanes() {
         let three = binop(BinOp::Add)
@@ -892,8 +834,6 @@ mod tests {
         );
         assert!(infer_l0(&op, &[f32s(&[4, 8]), f32s(&[4, 9])]).is_err());
     }
-
-    // ---- gather / scatter / dequant / project ---------------------------
 
     #[test]
     fn gather_replaces_the_axis_extent() {

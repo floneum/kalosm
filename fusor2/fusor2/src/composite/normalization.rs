@@ -4,10 +4,8 @@
 //!
 //! The five softmax spellings share **one** `defn`; `softmax*` mint a sugar
 //! node over it and `softmax_slow*` return the bare expansion. That is the
-//! entire semantic difference between them now — there is no second kernel and
-//! no route to pick.
-//!
-//! Owned by W13.
+//! entire semantic difference between them — there is no second kernel and no
+//! route to pick.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt, accum_dtype};
 use fusor2_ir::autograd::{Tape, Val};
@@ -18,9 +16,7 @@ use crate::composite::{MacroAttr, MacroOp, NormKind, core_op, macro_op};
 use crate::graph::GraphRef;
 use crate::tensor::Tensor;
 
-// ---------------------------------------------------------------------------
 // Definitional expansions
-// ---------------------------------------------------------------------------
 
 /// `exp(x - max) / sum(exp(x - max))` over `axis`.
 ///
@@ -187,9 +183,7 @@ fn last_axis(graph: &GraphRef, x: &Tensor) -> Result<u32> {
         .ok_or_else(|| Error::Shape("a rank-0 value has no last axis".into()))
 }
 
-// ---------------------------------------------------------------------------
 // The tensor surface
-// ---------------------------------------------------------------------------
 
 impl Tensor {
     /// Softmax over `axis`, as a macro op: the sugar node carries the axis so
@@ -209,8 +203,8 @@ impl Tensor {
         self.softmax(last_axis(&self.graph, self)?)
     }
 
-    /// Preserved alias. Identical to [`Tensor::softmax_last_dim`]: there is no
-    /// fused kernel to select, only `fold_split` plus `map_into_fold`.
+    /// Alias for [`Tensor::softmax_last_dim`]: there is no fused kernel to
+    /// select, only `fold_split` plus `map_into_fold`.
     pub fn softmax_last_dim_fused(&self) -> Result<Tensor> {
         self.softmax_last_dim()
     }
@@ -226,7 +220,7 @@ impl Tensor {
         self.softmax_slow(last_axis(&self.graph, self)?)
     }
 
-    /// Preserved alias for the reference's `softmax_slow_last_dim`.
+    /// Alias for [`Tensor::softmax_slow_last_dim`].
     pub fn softmax_slow_last(&self) -> Result<Tensor> {
         self.softmax_slow_last_dim()
     }
@@ -315,7 +309,7 @@ impl Tensor {
     }
 
     /// `(x - mean) / sqrt(var + eps) * weight + bias` over the last axis.
-    /// `remove_mean == false` is the RMS-like spelling the reference keeps.
+    /// `remove_mean == false` is the RMS-like spelling.
     pub fn layer_norm(
         &self,
         weight: &Tensor,
@@ -342,8 +336,8 @@ impl Tensor {
         )
     }
 
-    /// Preserved alias. Identical construction; the launch count is the
-    /// extractor's answer, not this function's.
+    /// Alias for [`Tensor::layer_norm`] with mean removal; the launch count is
+    /// the extractor's answer, not this function's.
     pub fn layer_norm_last_dim_fused(
         &self,
         weight: &Tensor,

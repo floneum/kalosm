@@ -8,8 +8,6 @@
 //! provably the same number. There is no estimator, therefore no L1/L2
 //! admission mismatch and no "extraction commits a plan that fails L2
 //! verification and silently falls back".
-//!
-//! Owned by W3.
 
 use std::sync::{Arc, OnceLock};
 
@@ -53,22 +51,27 @@ pub struct Planner {
     tiles_memo: RwLock<FxHashMap<TilesKey, u32>>,
 }
 
-static GLOBAL: OnceLock<Planner> = OnceLock::new();
+static GLOBAL: OnceLock<Arc<Planner>> = OnceLock::new();
 
 impl Planner {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The handle `CoreSemantics::new` wants.
+    /// The handle `CoreSemantics::new` wants: the process-wide planner, so
+    /// every holder shares one memo instead of re-deriving every plan.
     pub fn shared() -> Arc<dyn ArenaPlanner> {
-        Arc::new(Self::new())
+        Self::global_arc().clone()
     }
 
     /// The process-wide planner, so `verify_l2` and the emitters share one
     /// memo instead of re-deriving every plan.
     pub fn global() -> &'static Self {
-        GLOBAL.get_or_init(Self::new)
+        Self::global_arc()
+    }
+
+    fn global_arc() -> &'static Arc<Planner> {
+        GLOBAL.get_or_init(|| Arc::new(Self::new()))
     }
 
     pub fn memo_len(&self) -> usize {
@@ -112,12 +115,11 @@ fn plan_key(ir: &KernelIr, live: &LivenessInfo, caps: &Caps) -> PlanKey {
     // statement list, not only on the skeleton above.
     //
     // Structurally, **not** via `Stmt`'s derived `Hash`: `StorageView::hash`
-    // hashes the buffer's address, `LocalDecl` and `TileDecl` hash their `id`,
-    // so the derived hash of two separately-built copies of the same kernel
-    // never agreed. That made this memo a total miss for every kernel holding
-    // a buffer or a local — i.e. all of them — and left only the tile-only
-    // test fixture hitting. `BodyHasher` substitutes each declaration's
-    // first-use ordinal for its address and is otherwise exact.
+    // hashes the buffer's address and `LocalDecl`/`TileDecl` hash their `id`,
+    // so two separately-built copies of the same kernel would never agree and
+    // every kernel holding a buffer or a local would miss the memo.
+    // `BodyHasher` substitutes each declaration's first-use ordinal for its
+    // address and is otherwise exact.
     BodyHasher::default().body(&ir.body, &mut h);
     PlanKey {
         body_hash: h.finish(),
@@ -128,9 +130,9 @@ fn plan_key(ir: &KernelIr, live: &LivenessInfo, caps: &Caps) -> PlanKey {
 /// Hashes an L2 body up to renaming of its buffer, tile and local
 /// declarations.
 ///
-/// Every other field is folded in verbatim, so the key stays as exact as the
-/// derived `Hash` was — two bodies differing in an operator, a literal or a
-/// layout still hash apart. Only *which allocation* a leaf names is
+/// Every other field is folded in verbatim, so the key stays exact — two
+/// bodies differing in an operator, a literal or a layout hash apart. Only
+/// *which allocation* a leaf names is
 /// canonicalized, and that is precisely what `rebind` puts back on retrieval.
 #[derive(Default)]
 struct BodyHasher {
@@ -773,14 +775,9 @@ mod tests {
         assert_eq!(planner.memo_len(), 1);
 
         // The *layout* is identical — that is what "deterministic" claims.
-        //
-        // This used to be `assert_eq!(plan_a, plan_b)`, which held only
-        // because `TileDecl` compared structurally. It is identity-bearing
-        // now, so two allocations of the same shape are two tiles and the two
-        // plans deliberately name different ones — as the `ptr_eq` check
-        // below has always demanded. Comparing whole plans asserted the
-        // opposite of that check and could only pass while tiles had no
-        // identity.
+        // Whole plans are not compared: tiles are identity-bearing, so two
+        // allocations of the same shape are two tiles and the two plans name
+        // different ones, as the `ptr_eq` check below demands.
         assert_eq!(plan_a.mode, plan_b.mode);
         assert_eq!(plan_a.total_bytes, plan_b.total_bytes);
         assert_eq!(plan_a.barriers_inserted, plan_b.barriers_inserted);
@@ -804,11 +801,10 @@ mod tests {
     /// A kernel holding a storage buffer and a private local memoizes across
     /// two independent builds.
     ///
-    /// This is the case the memo never served: `StorageView` hashes its
-    /// buffer's *address* and `LocalDecl` hashes its `id`, so `Stmt`'s derived
-    /// `Hash` gave two copies of one kernel two different keys. Every real
-    /// kernel holds a buffer, so the hit rate was zero and only the tile-only
-    /// fixture above ever exercised a hit.
+    /// `StorageView` hashes its buffer's *address* and `LocalDecl` hashes its
+    /// `id`, so `Stmt`'s derived `Hash` would give two copies of one kernel two
+    /// different keys; `BodyHasher`'s ordinal substitution is what makes them
+    /// share.
     #[test]
     fn two_builds_of_one_kernel_with_a_buffer_and_a_local_share_a_plan() {
         fn build(b: &mut TileBuilder) -> KernelIr {

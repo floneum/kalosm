@@ -1,13 +1,8 @@
-//! R6 — the four `Scatter` lowerings, all four coexisting.
+//! The four `Scatter` lowerings, all four coexisting.
 //!
-//! At the trainer's batch-128 / 768-unit / K=3 shape, `OneHotContract`
-//! prices at 1.2 GB of traffic against `WgPrivateMerge`'s private
-//! accumulator — so it survives only as the candidate the cost model
-//! rejects, not as a candidate a rule vetoes. The trainer's host-side
-//! three-level sorted gather-and-sum, its `ScatterShape` padding and its
-//! ~0.9 ms/batch host cost all delete.
-//!
-//! Owned by W4.
+//! At a batch-128 / 768-unit / K=3 shape, `OneHotContract` prices at 1.2 GB
+//! of traffic against `WgPrivateMerge`'s private accumulator, so it survives
+//! only as the candidate the cost model rejects, not as one a rule vetoes.
 
 use fusor2_ir::egraph::{Builder, Facts, Id, RuleTag};
 use fusor2_ir::ir::level0::{L0, ScatterCombine};
@@ -200,8 +195,8 @@ mod tests {
         out
     }
 
-    /// The trainer's embedding-gradient shape: 1024 bins, 24 f32 wide, on
-    /// a device with f32 atomics and 32 KiB of threadgroup memory.
+    /// An embedding-gradient shape: 1024 bins, 24 f32 wide, on a device with
+    /// f32 atomics and 32 KiB of threadgroup memory.
     fn trainer_scatter(rows: u64, caps: fusor2_ir::device::Caps) -> (Fixture, Id) {
         let mut fx = Fixture::new(caps);
         let base = fx.buffer(Dtype::F32, &[rows, 24]);
@@ -237,8 +232,8 @@ mod tests {
 
     #[test]
     fn one_hot_survives() {
-        // 1.2 GB of traffic at the trainer's shape, and still a candidate:
-        // rejecting it is the cost model's job.
+        // 1.2 GB of traffic at this shape, and still a candidate: rejecting
+        // it is the cost model's job.
         let (fx, s) = trainer_scatter(1024, apple_caps());
         assert!(modes(&fx, s).contains(&ScatterMode::OneHotContract));
     }

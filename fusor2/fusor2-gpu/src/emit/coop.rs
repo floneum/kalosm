@@ -1,17 +1,13 @@
 //! Cooperative-matrix fragment load, MMA and store.
 //!
-//! Accumulators are held **transposed internally**: Metal's simdgroup matrix
+//! Accumulators are held transposed internally: Metal's simdgroup matrix
 //! orientation makes row-major A/B fragments multiply as `B * A`, so keeping
-//! the fragments transposed preserves the logical `A * B`. That is why a
-//! transposed tile load swaps the fragment origin and sets
-//! `row_major: transposed`, and why a cooperative store inverts the
-//! destination layout's flag.
+//! the fragments transposed preserves the logical `A * B`. A transposed tile
+//! load therefore swaps the fragment origin and sets `row_major: transposed`,
+//! and a cooperative store inverts the destination layout's flag.
 //!
 //! Without the `fork-metal` mixed-precision cooperative store, an
-//! f32-accumulated f16-output kernel pays a staging tile plus a per-lane cast:
-//! footprint and a staging pass, never correctness.
-//!
-//! Owned by W8.
+//! f32-accumulated f16-output kernel pays a staging tile plus a per-lane cast.
 
 use fusor2_ir::ir::level2::{
     Addr, CoopMatrixRole, CoopSrc, ElementType, ScalarElement, StorageView, Tile, TileExpr,
@@ -138,9 +134,7 @@ impl Emitter<'_> {
             } => {
                 // The fragment's scalar and the tile's element are one memory
                 // reinterpretation apart: a `CoopLoad{scalar: F32}` off an f16
-                // tile reads the right addresses at twice the width and comes
-                // back with plausible garbage. Nothing downstream can see it,
-                // so it is checked where both are in hand.
+                // tile reads the right addresses at twice the width.
                 fragment_scalar_matches(scalar, tile.element, "a workgroup tile")?;
                 let stride_u = row_major_tile_stride(tile)?;
                 let row_h = self.expr(row, out)?;
@@ -239,7 +233,7 @@ impl Emitter<'_> {
     }
 
     /// `CoopStore` -> a subgroup-collective store, never a per-lane store.
-    /// `row_major` is **inverted** relative to the destination layout because
+    /// `row_major` is inverted relative to the destination layout because
     /// accumulators are held transposed.
     pub(crate) fn coop_store(
         &mut self,
@@ -340,9 +334,8 @@ impl Emitter<'_> {
     /// accumulator's own scalar, a cooperative store into it, then a per-lane
     /// cast-and-store into the narrower destination.
     ///
-    /// The staging tile is *not* part of the arena plan, so it costs its own
-    /// allocation. That is the documented price of building without
-    /// `fork-metal`.
+    /// The staging tile is not part of the arena plan, so it costs its own
+    /// allocation.
     #[allow(clippy::too_many_arguments)]
     fn staged_coop_store(
         &mut self,
@@ -685,11 +678,9 @@ mod tests {
     /// Without the fork's mixed-precision store, an f32 accumulator bound for
     /// f16 memory routes through a staging tile plus a per-lane cast.
     ///
-    /// The direct form is the fork's whole contribution here: released naga
-    /// rejects a float fragment stored into float memory of a different width,
-    /// so declaring `mixed_precision_coop_store` without the fork produces a
-    /// module the validator refuses — which is why the capability defaults to
-    /// false and the staged path is the shipped one.
+    /// Released naga rejects a float fragment stored into float memory of a
+    /// different width, so `mixed_precision_coop_store` defaults to false and
+    /// the staged path is the default one.
     #[test]
     fn mixed_precision_store_stages_without_the_fork() {
         let wg = |m: &naga::Module| {
@@ -797,8 +788,7 @@ mod tests {
             })
             .collect();
         assert_eq!(strides, vec![false]);
-        // The `Source` import keeps the fixture honest about what a broadcast
-        // is not: it never reads a quantized source.
+        // A broadcast load reads plain storage, never a quantized `Source`.
         let _: Option<Source> = None;
     }
 

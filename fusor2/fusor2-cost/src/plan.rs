@@ -1,19 +1,12 @@
 //! Plan derivation: buffers, bindings, symbols and the plan hash.
 //!
-//! **Allocation is derived from the plan**: for each node in `M`,
-//! [`buffer_layout`] gives the padded strides the selected geometry needs,
-//! including split-K scratch slices. `hardware_matmul_prep`'s exact-stride
-//! equality test and its silent generic-reduce fallback become an invariant
-//! the extractor establishes rather than a runtime test. A value not in `M`
-//! gets no buffer at all, which subsumes the reference's `BufferLedger`.
+//! Allocation is derived from the plan: for each node in `M`,
+//! [`buffer_layout_for`] gives the padded strides the selected geometry needs,
+//! including split-K scratch slices. A value not in `M` gets no buffer.
 //!
-//! **The plan is the cache key.** `Dim::Sym` and `LeafKind::Uniform` hash as
-//! the symbol's *index*, not its bound value, so one plan serves a whole
-//! shape family. There is no `hash_kernel_fields`, no
-//! `kernel_cache_key_with_dispatch`, no `structural_kernel_key` and no golden
-//! byte files.
-//!
-//! Owned by W7.
+//! The plan is the cache key. `Dim::Sym` and `LeafKind::Uniform` hash as the
+//! symbol's index, not its bound value, so one plan serves a whole shape
+//! family.
 
 use crate::realize::{self, Component, Realized};
 use fusor2_ir::Result;
@@ -30,10 +23,9 @@ use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 
-/// `SymId(u32::MAX)` is the crate-wide "symbolic, not statically known"
-/// sentinel — `Layout::row_major_strides` already mints it for a stride past
-/// a symbolic axis. A `BufferPlan::elements` of this value means the runtime
-/// derives the extent from `layout` plus the bound symbols.
+/// The crate-wide "symbolic, not statically known" sentinel. A
+/// `BufferPlan::elements` of this value means the runtime derives the extent
+/// from `layout` plus the bound symbols.
 pub const UNKNOWN_SYM: SymId = SymId(u32::MAX);
 
 /// Everything derived from one realized extraction: buffers, launches,
@@ -100,9 +92,9 @@ pub fn derive_buffers(
     Ok(out)
 }
 
-/// Bindings of one launch, in binding-index order. **Binding 0 is reserved
-/// for the uniform block** and is never listed here; storage bindings start
-/// at 1, reads first sorted by value id, then writes.
+/// Bindings of one launch, in binding-index order. Binding 0 is reserved for
+/// the uniform block and is never listed here; storage bindings start at 1,
+/// reads first sorted by value id, then writes.
 pub fn derive_bindings(
     graph: &EGraph,
     extraction: &Extraction,
@@ -159,14 +151,9 @@ pub fn derive_bindings(
 ///   `padded_m * padded_n` — the split-K scratch slice;
 /// - `Sgemm` / `Sgemv` / `Fold` / `Map` / `Point`: contiguous.
 ///
-/// **`Sgemm` pads nothing.** Padding exists so a kernel may write a whole
-/// block without a bounds test, and only the cooperative store does that: the
-/// SGEMM body masks every store with `row < batch * m && col < n`. Padding it
-/// anyway was not merely wasteful, it was unsound — this function pads the
-/// output's last *two axes*, which are the `m` and `n` axes only when each
-/// occupies exactly one, and a contraction with `n = 1` (every row reduction
-/// of a product: rms_norm, layer_norm, variance) has none. Its `[rows, cols]`
-/// output was being padded along two batch axes instead.
+/// Padding exists so the cooperative store may write a whole block without a
+/// bounds test. It applies to the last two axes only, which are the `m` and `n`
+/// axes only when each occupies exactly one axis.
 pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Result<Layout> {
     let shape = &facts.shape;
     let (bm, bn, splits) = match theta {
@@ -186,15 +173,8 @@ pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Resul
         return Ok(Layout::contiguous(&padded));
     }
 
-    // Split-K scratch: one whole padded output per partial, so the combine
-    // pass reads slice `s` one *whole output* in.
-    //
-    // That distance is the product of every padded extent, batch axes
-    // included — it is exactly the row-major stride a prepended axis gets,
-    // `strides[0] * padded[0]`. It used to be `padded_m * padded_n`, which is
-    // one batch element rather than one partial: with any leading batch axis,
-    // partial `s` began inside partial `s-1` and every batch past the first
-    // aliased.
+    // Split-K scratch: one whole padded output per partial. The slice stride is
+    // the product of every padded extent, batch axes included.
     let strides = Layout::row_major_strides(&padded);
     let slice = match (
         strides.first().and_then(|s| s.as_const()),
@@ -256,10 +236,10 @@ pub fn symbols_of(graph: &EGraph, realized: &Realized) -> Vec<SymId> {
 
 /// `hash(realized DAG term + M + theta + DeviceFacts::fingerprint)`.
 ///
-/// Two `FxHasher` lanes under seeds 0 and 1, folded into a `u128`. Walk
-/// launches in order, then members in order; `Dim::Sym(s)` and
-/// `LeafKind::Uniform { sym }` hash as the symbol's index in `symbols`,
-/// never its bound value.
+/// Two `FxHasher` lanes under seeds 0 and 1, folded into a `u128`. Launches are
+/// walked in order, then members in order; `Dim::Sym(s)` and
+/// `LeafKind::Uniform { sym }` hash as the symbol's index in `symbols`, never
+/// its bound value.
 pub fn plan_hash(
     graph: &EGraph,
     extraction: &Extraction,
@@ -285,11 +265,9 @@ pub fn plan_hash(
             for member in &launch.members {
                 h.write_u32(member.0);
                 hash_op(h, &sm, &graph.node(*member).op);
-                // Leaf operands are never launch members, so their kind
-                // would otherwise never reach the hash. Their *name* stays
-                // out: buffer identity is deliberately absent from the key,
-                // which is what lets a bufferless template rebind
-                // positionally.
+                // Leaf operands are never launch members, so their kind reaches
+                // the hash here. Their name stays out: buffer identity is
+                // absent from the key so a template can rebind positionally.
                 for child in graph.node(*member).children.iter() {
                     if let Op::L0(L0::Leaf(kind)) = &graph.node(*child).op {
                         hash_leaf_ref(h, &sm, kind);
@@ -310,15 +288,10 @@ pub fn plan_hash(
     PlanHash(((lanes[0].finish() as u128) << 64) | lanes[1].finish() as u128)
 }
 
-// ---------------------------------------------------------------------------
-// Symbol-aware structural hashing
-// ---------------------------------------------------------------------------
-
 struct SymMap<'a> {
     symbols: &'a [SymId],
-    /// Symbol-remapped digest per `ScalarExpr::structural_hash`. Repeated
-    /// transformer layers and a 3,000-node conv step share a handful of
-    /// distinct bodies, so this collapses the walk to one per body.
+    /// Symbol-remapped digest per `ScalarExpr::structural_hash`, memoized so
+    /// each distinct body is walked once.
     memo: std::cell::RefCell<rustc_hash::FxHashMap<u64, u64>>,
 }
 
@@ -330,8 +303,8 @@ impl<'a> SymMap<'a> {
         }
     }
 
-    /// The symbol's *index*, so two bindings of the same family collide and
-    /// two structurally different plans do not.
+    /// The symbol's index, so two bindings of the same family collide and two
+    /// structurally different plans do not.
     fn idx(&self, s: SymId) -> u32 {
         self.symbols
             .iter()
@@ -352,8 +325,8 @@ impl<'a> SymMap<'a> {
     }
 }
 
-/// A leaf as an *operand*: everything that changes the kernel body, and
-/// nothing that only names a buffer.
+/// A leaf as an operand: everything that changes the kernel body, and nothing
+/// that only names a buffer.
 fn hash_leaf_ref<H: Hasher>(h: &mut H, sm: &SymMap<'_>, kind: &LeafKind) {
     std::mem::discriminant(kind).hash(h);
     match kind {
@@ -531,8 +504,8 @@ fn hash_l0<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L0) {
                 value.hash(h);
                 hash_dims(h, sm, shape);
             }
-            // The bound value never appears in the IR and never enters the
-            // hash: only the symbol's slot in the uniform block does.
+            // Only the symbol's slot in the uniform block enters the hash, not
+            // its bound value.
             LeafKind::Uniform { sym, dtype } => {
                 h.write_u32(sm.idx(*sym));
                 dtype.hash(h);
@@ -631,7 +604,7 @@ fn hash_l0<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L0) {
 
 /// A carrier enters the plan hash as data: slot shapes, identities, and both
 /// expression vectors. Two folds that differ only in their merge are different
-/// kernels, and nothing about that is derivable from a name any more.
+/// kernels, and nothing about that is derivable from a name.
 fn hash_carrier<H: Hasher>(h: &mut H, sm: &SymMap<'_>, c: &fusor2_ir::carrier::Carrier) {
     h.write_usize(c.slots.len());
     for s in &c.slots {
@@ -785,9 +758,7 @@ fn hash_l1<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L1) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Symbol collection
-// ---------------------------------------------------------------------------
 
 fn collect_dims(dims: &[Dim], out: &mut Vec<SymId>) {
     for d in dims {
@@ -804,24 +775,10 @@ fn collect_layout(l: &Layout, out: &mut Vec<SymId>) {
 }
 
 fn collect_scalar(e: &ScalarExpr, scalars: &mut Vec<SymId>) {
-    match e.kind() {
-        ScalarKind::Uniform(s) => scalars.push(*s),
-        ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::IndexOf(_) => {}
-        ScalarKind::Un { x, .. }
-        | ScalarKind::Cast { x, .. }
-        | ScalarKind::Bitcast { x, .. }
-        | ScalarKind::Round { x, .. }
-        | ScalarKind::Splat { x, .. } => collect_scalar(x, scalars),
-        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
-            collect_scalar(a, scalars);
-            collect_scalar(b, scalars);
-        }
-        ScalarKind::Select { c, t, f } => {
-            collect_scalar(c, scalars);
-            collect_scalar(t, scalars);
-            collect_scalar(f, scalars);
-        }
+    if let ScalarKind::Uniform(s) = e.kind() {
+        scalars.push(*s);
     }
+    e.for_each_child(|c| collect_scalar(c, scalars));
 }
 
 fn collect_ops(ops: &[Operand], dims: &mut Vec<SymId>) {
@@ -946,12 +903,9 @@ mod tests {
         assert_eq!(layout.shape()[0], Dim::Const(4));
     }
 
-    /// One partial is one *whole* output, batch axes included.
-    ///
-    /// The stride used to be `padded_m * padded_n`, which is one batch
-    /// element. At `[3, 512, 512]` that put partial 1 at offset 262,144 —
-    /// inside partial 0's batch 1 — so a batched split-K summed each
-    /// partial into the next one's batch instead of into itself.
+    /// One partial is one *whole* output, batch axes included: at
+    /// `[3, 512, 512]` a stride of `padded_m * padded_n` would put partial 1
+    /// inside partial 0's batch 1.
     #[test]
     fn split_k_scratch_slice_spans_the_whole_batch() {
         let facts = f32_facts(&[Dim::Const(3), Dim::Const(512), Dim::Const(512)]);
@@ -989,8 +943,7 @@ mod tests {
         assert_eq!(layout.shape()[0], Dim::Const(128));
         assert_eq!(layout.shape()[1], Dim::Const(64));
         // The consumer reads a row every `padded_n` elements — exactly, not
-        // "close enough": the reference's stride-equality test is this
-        // invariant, established rather than checked.
+        // "close enough".
         assert_eq!(layout.strides()[0], Dim::Const(64));
         assert_eq!(layout.strides()[1], Dim::Const(1));
     }
@@ -1016,8 +969,6 @@ mod tests {
         assert!(l.is_contiguous());
         assert_eq!(l.shape()[0], Dim::Const(100));
     }
-
-    // -- PlanHash ---------------------------------------------------------
 
     /// `leaf[rows, 64] -> map -> map`, with `rows` supplied by the caller.
     fn family_graph(rows: Dim) -> (fusor2_ir::egraph::EGraph, Vec<Id>) {

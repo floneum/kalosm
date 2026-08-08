@@ -6,8 +6,6 @@
 //! the adjoint routes each element's gradient back to the element it came
 //! from — which for a broadcast axis is a sum and for an overlapping window is
 //! a scatter.
-//!
-//! Owned by W14.
 
 use fusor2::{Dtype, Session, Tensor};
 
@@ -221,7 +219,7 @@ pub fn cases() -> Cases {
         });
     }
 
-    // `cat` along each of the three axes, at both ranks the reference covers.
+    // `cat` along each of the three axes, at rank 1 and rank 2.
     cases.push("views", "cat_rank1", |s| cat_case(s, &[5], 0));
     cases.push("views", "cat_rank2", |s| cat_case(s, &[3, 4], 0));
     cases.push("views", "cat_dim0", |s| cat_case(s, SRC, 0));
@@ -232,8 +230,6 @@ pub fn cases() -> Cases {
 
     cases
 }
-
-// ---------------------------------------------------------------------------
 
 /// Forward against the host reference, then a finite-difference backward.
 ///

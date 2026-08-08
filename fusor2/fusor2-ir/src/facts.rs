@@ -43,9 +43,8 @@ impl ValueFacts {
 }
 
 /// The work one op performs, in units the cost model can price.
-/// **`verify_l0` rejects a registration whose `work` is a constant**: the
-/// reference's `Attention { work: 1 }` placeholder cannot recur, and
-/// `index_ops` is exactly the term view-fold-vs-gather needs.
+/// **`verify_l0` rejects a registration whose `work` is a nonzero constant**;
+/// `index_ops` is the term view-fold-vs-gather is decided on.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Work {
     pub macs: u64,

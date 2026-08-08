@@ -1,13 +1,9 @@
-//! `with_backwards` — the user-facing escape hatch, carried over verbatim
-//! because a few callers want it, and needed by nothing the trainer does.
+//! `with_backwards`, the escape hatch for supplying an explicit backward rule.
 //!
 //! [`fusor2_ir::autograd::GradientSlot`] is a bare node id, never a tensor
-//! handle: a closure capturing a graph handle would close an `Arc` cycle
-//! pinning every cached activation for the process lifetime. Here the rule
-//! is a plain `fn` pointer, so the hazard is not merely avoided by
-//! convention — it is unrepresentable.
-//!
-//! Owned by W5.
+//! handle, and a rule is a plain `fn` pointer: a closure capturing a graph
+//! handle would close an `Arc` cycle pinning every cached activation for the
+//! process lifetime.
 
 use fusor2_ir::autograd::{AdjointFn, BackwardTarget, GradientSlot, Grads, Parent, Tape, Val};
 use fusor2_ir::ir::Node;
@@ -50,7 +46,7 @@ impl CustomBackward {
 }
 
 /// Side table of user-supplied backwards, keyed by the node they belong to.
-/// Consulted by the reverse walk **before** [`crate::ADJOINTS`].
+/// Consulted by the reverse walk before [`crate::ADJOINTS`].
 #[derive(Clone, Debug, Default)]
 pub struct CustomRegistry {
     rules: FxHashMap<Val, CustomBackward>,
@@ -100,10 +96,8 @@ pub fn with_backwards(
     Ok(value)
 }
 
-/// Every requires-grad parent must receive a gradient. A custom rule that
-/// omits one is an error, not a silent zero: the omitted parent's whole
-/// subgraph would starve, and the walk's final check would report the
-/// symptom rather than the cause.
+/// Every requires-grad parent must receive a gradient. Omitting one is an
+/// error rather than a silent zero, which would starve that parent's subgraph.
 pub fn validate_parents(parents: &[Parent], targets: &[BackwardTarget]) -> Result<()> {
     for parent in parents {
         if !parent.requires_grad {
@@ -198,7 +192,7 @@ mod tests {
         .unwrap();
         let s = ones(&mut g, &[3]);
         let got = backward_into_with(&mut g, &caps(), y, s, &[x], &reg).unwrap();
-        let dx = got[0].unwrap();
+        let dx = got[0];
         // The custom rule wins over the `Map` adjoint: `2 * seed`, not
         // `seed * exp(x)`.
         assert!(matches!(g.node(dx).op, Op::L0(L0::Map { .. })));
@@ -260,7 +254,7 @@ mod tests {
         let got =
             backward_into_with(&mut g, &caps(), y, s, &[x], &CustomRegistry::new()).unwrap();
         assert!(matches!(
-            g.node(got[0].unwrap()).op,
+            g.node(got[0]).op,
             Op::L0(L0::Leaf(LeafKind::Const { .. }))
         ));
     }

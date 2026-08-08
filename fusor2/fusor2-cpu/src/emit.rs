@@ -1,16 +1,12 @@
 //! `KernelIr` -> a runnable CPU loop nest.
 //!
-//! `KernelIr` is **compiled**, not interpreted per element. [`compile`] lowers
-//! one kernel into a [`Program`]: a flat SSA `tape` plus a list of segments.
-//! Flattening the hash-consed `TileExpr` DAG into the tape *is* the CSE that
-//! replaces the reference's deleted `Shared` node and its `Rc::as_ptr` memo.
+//! `KernelIr` is compiled, not interpreted per element: [`compile`] lowers one
+//! kernel into a [`Program`], a flat SSA `tape` plus a list of segments.
+//! Flattening the hash-consed `TileExpr` DAG into the tape is the CSE.
 //!
 //! One grid point is one workgroup. `block` lanes are walked in chunks of `W`,
-//! and `Stmt::Barrier` lowers to a **segment split** (see
-//! [`stmt::block`]) so a lane chunk can never read a tile slot a later chunk
-//! has not written.
-//!
-//! Owned by W10.
+//! and `Stmt::Barrier` lowers to a segment split ([`stmt::block`]) so a lane
+//! chunk can never read a tile slot a later chunk has not written.
 
 pub mod access;
 pub mod expr;
@@ -35,9 +31,7 @@ use access::AccessForm;
 use expr::{Instr, NumTy, RKind, Reg, Slot, UniformSrc};
 use stmt::{CAcc, CStmt, LaneLoop};
 
-// ---------------------------------------------------------------------------
 // The compiled program
-// ---------------------------------------------------------------------------
 
 /// One workgroup tile's placement in the thread-local scratch arena.
 #[derive(Clone, Debug)]
@@ -71,9 +65,7 @@ pub struct Program {
 }
 
 impl Program {
-    /// Total `Store` statements at every depth. Used by
-    /// `matmul_epilogue_fuses_in_k_loop` to assert nothing is materialized in
-    /// between.
+    /// Total `Store` statements at every depth.
     pub fn store_count(&self) -> usize {
         fn go(s: &[CStmt]) -> usize {
             s.iter()
@@ -121,9 +113,7 @@ impl CpuKernel {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Entry points
-// ---------------------------------------------------------------------------
 
 /// Emit a kernel for this device.
 pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<CpuKernel, EmitError> {
@@ -139,12 +129,9 @@ pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<CpuKernel, EmitError> {
 /// Compile one `KernelIr`.
 ///
 /// When a planner is supplied its `verify_uniformity` and `verify_arena` run
-/// **before** compilation and a failure is `EmitError::Validation`, never a
-/// silent fallback. Without one — the planner lives in `fusor2-tile` and is
-/// injected by [`crate::CpuTarget::with_planner`] — the arena falls back to a
-/// sequential packing, which is always legal on CPU because thread-local
-/// scratch aliases freely (`Caps::workgroup_alias`) and the separation
-/// predicate is therefore trivially true.
+/// before compilation and a failure is `EmitError::Validation`. Without one the
+/// arena falls back to a sequential packing, legal on CPU because thread-local
+/// scratch aliases freely (`Caps::workgroup_alias`).
 pub fn compile(
     ir: &KernelIr,
     caps: &Caps,
@@ -224,9 +211,7 @@ fn scalar_of(e: ElementType) -> std::result::Result<ScalarElement, EmitError> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The compiler
-// ---------------------------------------------------------------------------
 
 struct Compiler<'a> {
     ir: &'a KernelIr,
@@ -334,9 +319,8 @@ impl<'a> Compiler<'a> {
             ElementType::Scalar(s) => s,
             _ => ScalarElement::F32,
         };
-        // Sequential packing: legal on CPU without further analysis because
-        // thread-local scratch aliases freely, so no two tiles need a
-        // separating barrier to share bytes — they simply do not share.
+        // Sequential packing: thread-local scratch aliases freely, so no two
+        // tiles share bytes.
         let offset = align_up(self.arena_bytes, 64);
         let len = elements * elem.byte_size() as u32;
         self.arena_bytes = offset + len;
@@ -380,8 +364,6 @@ impl<'a> Compiler<'a> {
         let out = self.slot();
         self.push(Instr::Const { out, bits })
     }
-
-    // -- statements ---------------------------------------------------------
 
     fn compile_stmts(&mut self, body: &[Stmt]) -> std::result::Result<Vec<CStmt>, EmitError> {
         let mut out = Vec::with_capacity(body.len());
@@ -709,8 +691,6 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    // -- expressions --------------------------------------------------------
-
     fn compile_addr(
         &mut self,
         layout: &fusor2_ir::ir::level2::TileLayout,
@@ -1021,12 +1001,8 @@ impl<'a> Compiler<'a> {
                 let t = self.compile_value(accept)?;
                 let f = self.compile_value(reject)?;
                 // A vector occupies `lanes` consecutive registers, so a
-                // vector-typed select is `lanes` selects. One `Instr::Select`
-                // wrote register `out` and left `out + 1 ..` untouched, and
-                // `VecComponent` then read uninitialized registers — every
-                // multi-lane block decode on this backend came back NaN past
-                // lane 0. (`fusor2-gguf`'s `finish` masks the decoded block
-                // with exactly this select.)
+                // vector-typed select is `lanes` selects; one would leave
+                // `out + 1 ..` uninitialized for `VecComponent` to read.
                 match e.element() {
                     ElementType::Vector { lanes, .. } if lanes > 1 => {
                         let out = self.slots(lanes);
@@ -1162,10 +1138,8 @@ fn mul_operands(e: &TileExpr, outer: &NumericContract) -> Option<(TileExpr, Tile
     }
 }
 
-/// `seen` is not an optimization. An L2 term is a hash-consed **DAG**: a
-/// `tm x tn` accumulator tile shares one operand load across every register,
-/// so walking it as a tree is exponential in the sharing depth and a batched
-/// matmul never finishes emitting.
+/// An L2 term is a hash-consed DAG, so `seen` is required: walking it as a
+/// tree is exponential in the sharing depth.
 fn collect_group_reduces(
     e: &TileExpr,
     out: &mut Vec<TileExpr>,
@@ -1223,10 +1197,9 @@ fn children_of(e: &TileExpr) -> Vec<TileExpr> {
     }
 }
 
-/// A one-lane `Stmt::Reduce` carrying a hardware operator **is** the expression
-/// form, so it is rewritten into it rather than reimplemented: the same
-/// `TileExprKind::Reduce` node goes down the same staging path and emits the
-/// same horizontal reduce or scratch tree. `None` when nothing is to rewrite.
+/// Rewrite a one-lane `Stmt::Reduce` carrying a hardware operator into the
+/// equivalent `TileExprKind::Reduce` expression, which takes the same staging
+/// path. `None` when there is nothing to rewrite.
 fn desugar_fast_reduce(s: &Stmt) -> Option<Stmt> {
     let Stmt::Reduce {
         kind,
@@ -1325,9 +1298,7 @@ fn visit_stmt_exprs(s: &Stmt, f: &mut impl FnMut(&TileExpr)) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The runner
-// ---------------------------------------------------------------------------
 
 /// A raw view of one bound buffer.
 #[derive(Copy, Clone)]
@@ -1795,11 +1766,9 @@ impl<'a, const W: usize> Exec<'a, W> {
                 body,
             } => {
                 self.eval(prep);
-                // **Every accumulator is read at the value it had entering the
-                // step, then all are written.** A loop carrying `(n, mean, m2)`
-                // has `mean`'s update read `n`; writing `n` first makes it read
-                // the *new* count, so the mean drifts and the variance comes
-                // back about half right. One accumulator is unaffected.
+                // Every accumulator is read at the value it had entering the
+                // step, then all are written: an update may read a sibling
+                // accumulator.
                 let mut next: Vec<Reg<W>> = Vec::with_capacity(accs.len());
                 for a in accs {
                     self.eval(&a.init_prep);
@@ -2097,11 +2066,17 @@ impl<'a, const W: usize> Exec<'a, W> {
     }
 }
 
-/// Execute one workgroup at a statically-known lane width.
+/// Execute a contiguous span of workgroups at a statically-known lane width.
+///
+/// The register file and the locals are allocated once for the whole span and
+/// reset between workgroups, so a dispatch never allocates per workgroup. The
+/// barrier-free segments were wrapped in their `CStmt::Lanes` by
+/// [`stmt::block`], so a segment runs as-is.
 #[inline(always)]
-pub fn run_workgroup<const W: usize>(
+pub fn run_span<const W: usize>(
     prog: &Program,
-    gid: [u32; 3],
+    span: std::ops::Range<u64>,
+    grid: [u32; 3],
     bufs: &[RawBuf],
     scratch: *mut u8,
 ) {
@@ -2111,26 +2086,31 @@ pub fn run_workgroup<const W: usize>(
         locals: vec![0u32; prog.locals * prog.block as usize],
         bufs,
         scratch,
-        gid,
+        gid: [0, 0, 0],
         lane_base: 0,
         active: Reg::splat_bits(u32::MAX),
     };
-    for seg in &prog.segments {
-        // A barrier between two segments is this boundary: the previous
-        // segment has completed for *every* lane before the next one starts.
-        let collective = seg.stmts.iter().any(CStmt::is_collective);
-        let flow = if collective {
-            ex.run(&seg.stmts)
-        } else {
-            ex.run_one(&CStmt::Lanes(seg.stmts.clone()))
-        };
-        if flow == Flow::Return {
-            break;
+    let mut first = true;
+    for linear in span {
+        if !first {
+            // The same state a fresh allocation hands a workgroup.
+            ex.regs.fill(Reg::default());
+            ex.locals.fill(0);
+            ex.lane_base = 0;
+            ex.active = Reg::splat_bits(u32::MAX);
+        }
+        first = false;
+        ex.gid = crate::launch::unlinearize(linear, grid);
+        for seg in &prog.segments {
+            // A barrier between two segments is this boundary: the previous
+            // segment has completed for *every* lane before the next one
+            // starts.
+            if ex.run(&seg.stmts) == Flow::Return {
+                break;
+            }
         }
     }
 }
-
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -2255,8 +2235,6 @@ mod tests {
         bytemuck::cast_slice::<u8, f32>(ab.as_slice()).to_vec()
     }
 
-    // -- 1. the barrier split ------------------------------------------------
-
     #[test]
     fn barrier_splits_lane_loop() {
         const BLOCK: u32 = 256;
@@ -2330,8 +2308,6 @@ mod tests {
         assert_ne!(got[8], 0.0);
     }
 
-    // -- 2. numeric contract -------------------------------------------------
-
     fn fma_program(nc: NumericContract) -> Arc<Program> {
         let uni = decl(0, ScalarElement::U32, 1, false);
         let a = decl(1, ScalarElement::F32, 8, false);
@@ -2394,8 +2370,6 @@ mod tests {
         }
     }
 
-    // -- 3. the four access lowerings ---------------------------------------
-
     #[test]
     fn four_access_lowerings() {
         access::reset_form_counts();
@@ -2442,12 +2416,8 @@ mod tests {
         }
     }
 
-    /// A vector-typed `Select` selects **every** lane.
-    ///
-    /// One `Instr::Select` wrote register `out` only, so lanes 1.. of the
-    /// result were uninitialized registers. `fusor2-gguf`'s block decode masks
-    /// its whole `lanes`-wide block with exactly this select, so every
-    /// multi-lane dequantize on this backend came back NaN past lane 0.
+    /// A vector-typed `Select` selects every lane; a single `Instr::Select`
+    /// writes register `out` only and leaves lanes `1..` uninitialized.
     #[test]
     fn a_masked_vector_select_writes_every_lane() {
         const LANES: u32 = 8;
@@ -2511,8 +2481,6 @@ mod tests {
         let got = run_f32(&ir, &[data.clone()], LANES as usize);
         assert_eq!(got, data, "every lane of the selected vector must survive");
     }
-
-    // -- 4. f16 / bf16 widen-compute ----------------------------------------
 
     #[test]
     fn f16_bf16_widen_compute() {
@@ -2595,8 +2563,6 @@ mod tests {
         }
     }
 
-    // -- 5. workgroup reduction ---------------------------------------------
-
     #[test]
     fn workgroup_reduce_sums_every_lane() {
         const BLOCK: u32 = 64;
@@ -2675,8 +2641,6 @@ mod tests {
         let got = run_f32(&ir, &[data], BLOCK as usize);
         assert!(got.iter().all(|v| *v == 7.5), "{got:?}");
     }
-
-    // -- 6. a loop with resident accumulators --------------------------------
 
     #[test]
     fn matmul_epilogue_fuses_in_the_k_loop() {
@@ -2766,13 +2730,11 @@ mod tests {
         }
     }
 
-    // -- 7. scatter-add ------------------------------------------------------
-
     #[test]
     fn scatter_add_accumulates_duplicates() {
-        // 4096 indices into 64 bins x 8 lanes, 7% of them in one bin, plus a
-        // pure-padding tail. One workgroup per bin, so the accumulation order
-        // is fixed and the result is bit-reproducible at any thread count.
+        // 4096 indices into 64 bins x 8 lanes, plus a pure-padding tail. One
+        // workgroup per bin fixes the accumulation order, so the result is
+        // bit-reproducible at any thread count.
         const BINS: u32 = 64;
         const WIDTH: u32 = 8;
         const N: u32 = 4096;
@@ -2901,8 +2863,6 @@ mod tests {
         }
     }
 
-    // -- 8. determinism and dispatch accounting ------------------------------
-
     #[test]
     fn parallel_for_is_deterministic() {
         const N: u32 = 4096;
@@ -2972,8 +2932,7 @@ mod tests {
         );
 
         // Sixteen times the workgroups, same bound: the dispatch count tracks
-        // the worker pool, not the grid. A per-row dispatch would be 1024x
-        // this.
+        // the worker pool, not the grid.
         let wide = KernelIr {
             block: 4,
             grid: [N / 4, 1, 1],
@@ -2988,8 +2947,6 @@ mod tests {
             N / 4
         );
     }
-
-    // -- 9. divergent control flow ------------------------------------------
 
     #[test]
     fn a_divergent_if_merges_both_arms_under_a_mask() {
@@ -3031,13 +2988,8 @@ mod tests {
             assert_eq!(got[i], if i % 2 == 0 { 1.0 } else { -1.0 }, "lane {i}");
         }
     }
-    /// **Loop accumulators step simultaneously.**
-    ///
-    /// Two accumulators that swap — `a' = b`, `b' = a` — must still swap after N
-    /// iterations. Writing them back one at a time makes `b'` read the already
-    /// updated `a`, so both collapse to the original `b`; a `(n, mean, m2)`
-    /// carrier hits the same edge, where `mean`'s update reads `n` and the
-    /// variance comes back about half right rather than obviously broken.
+    /// Two accumulators that swap — `a' = b`, `b' = a` — must still swap after
+    /// N iterations, which requires reading both before writing either.
     #[test]
     fn loop_accumulators_read_the_values_they_entered_the_step_with() {
         let uni = decl(0, ScalarElement::U32, 1, false);

@@ -1,14 +1,8 @@
-//! `work()` rows for every op. **Never a constant**: the verifier rejects a
-//! registration whose work does not vary with shape, so the reference's
-//! `Attention { materialized_bytes: 0, work: 1 }` placeholder cannot recur.
-//! `index_ops` is exactly the term the view-fold-vs-gather tradeoff needs.
+//! `work()` rows for every op. Never a constant: the verifier rejects a
+//! registration whose work does not vary with shape.
 //!
-//! Symbolic dims price as `1`. That is deliberate: a `Sym` extent is bound at
-//! dispatch, so a shape-family plan is costed at its smallest legal binding
-//! and the specialised variant — which knows the real extent — is the one that
-//! can out-price it.
-//!
-//! Owned by W1.
+//! Symbolic dims price as `1`, so a shape-family plan is costed at its
+//! smallest legal binding and a specialised variant can out-price it.
 
 use crate::contract_spec;
 use crate::facts::{ValueFacts, Work};
@@ -23,8 +17,8 @@ use rustc_hash::FxHashSet;
 /// Work one op performs at these shapes.
 ///
 /// `L1::Ext` has no row here — its cost lives in the open registry, which
-/// only [`crate::CoreSemantics`] holds. This function reports the honest
-/// index-op floor for it; [`work_of_with`] uses the registered row.
+/// only [`crate::CoreSemantics`] holds. This function reports the index-op
+/// floor for it; [`work_of_with`] uses the registered row.
 pub fn work_of(op: &Op, ins: &[ValueFacts], out: &ValueFacts) -> Work {
     match op {
         Op::L0(o) => work_l0(o, ins, out),
@@ -49,19 +43,8 @@ pub fn work_of_with(
     work_of(op, ins, out)
 }
 
-// ---------------------------------------------------------------------------
-// Scalar expression cost
-// ---------------------------------------------------------------------------
-
-/// `(arith, transcendental, index)` operation counts of one evaluation of
-/// `e`. The tree is hash-consed, so a shared subexpression is counted **once**
-/// — which is what a structurally-CSE'd emitter actually issues.
-///
-/// `UnOp::is_transcendental()` and `BinOp::Pow` are transcendental;
-/// `IndexOf` is an index op; everything else is arithmetic.
 /// `(arith, transcendental, index)` of evaluating every slot's lift once.
-/// Shared subexpressions across slots are counted once, which is what a
-/// structurally-CSE'd emitter actually issues.
+/// Subexpressions shared across slots are counted once.
 pub fn carrier_lift_cost(c: &crate::carrier::Carrier) -> (u64, u64, u64) {
     let mut seen: FxHashSet<u64> = FxHashSet::default();
     let mut acc = (0u64, 0u64, 0u64);
@@ -71,6 +54,11 @@ pub fn carrier_lift_cost(c: &crate::carrier::Carrier) -> (u64, u64, u64) {
     acc
 }
 
+/// `(arith, transcendental, index)` operation counts of one evaluation of
+/// `e`. The tree is hash-consed, so a shared subexpression is counted once.
+///
+/// `UnOp::is_transcendental()` and `BinOp::Pow` are transcendental;
+/// `IndexOf` is an index op; everything else is arithmetic.
 pub fn scalar_expr_cost(e: &ScalarExpr) -> (u64, u64, u64) {
     let mut seen: FxHashSet<u64> = FxHashSet::default();
     let mut acc = (0u64, 0u64, 0u64);
@@ -123,15 +111,11 @@ fn count(e: &ScalarExpr, seen: &mut FxHashSet<u64>, acc: &mut (u64, u64, u64)) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// L0 rows
-// ---------------------------------------------------------------------------
-
 pub fn work_l0(op: &L0, ins: &[ValueFacts], out: &ValueFacts) -> Work {
     let e = elements(out);
     match op {
-        // The two documented constant-work exemptions: a leaf reads a buffer
-        // the plan already accounts for, and a projection is a relabelling.
+        // A leaf reads a buffer the plan already accounts for and a projection
+        // is a relabelling: the two constant-work exemptions.
         L0::Leaf(_) | L0::Project { .. } => Work::default(),
 
         L0::Map { expr, .. } => {
@@ -144,9 +128,8 @@ pub fn work_l0(op: &L0, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             }
         }
 
-        // One merge per slot per element, plus the lift. `width` is what the
-        // deleted `Combine::arity` reported; it is now a property of the
-        // carrier's own slot list rather than of a name.
+        // One merge per slot per element, plus the lift. `width` is a property
+        // of the carrier's own slot list.
         L0::Fold { carrier, .. } => {
             let width = carrier.width() as u64;
             let ein = ins.first().map_or(0, elements);
@@ -195,38 +178,39 @@ pub fn work_l0(op: &L0, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             ..Work::default()
         },
 
+        // One fma per decoded element plus the per-block scale lookups. The
+        // per-format unpack program is priced by `decode_ops_of` on the
+        // operand read.
         L0::Dequant { fmt, .. } => Work {
             macs: e,
-            index_ops: e / fmt.block_elements().max(1) as u64,
+            index_ops: e / u64::from(fmt.block_elements()),
             ..Work::default()
         },
     }
 }
-
-// ---------------------------------------------------------------------------
-// L1 rows
-// ---------------------------------------------------------------------------
 
 pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
     let e = elements(out);
     match op {
         L1::KMap { body, ops, .. } => {
             let (arith, trans, index) = scalar_expr_cost(body);
+            let decode: u64 = ins
+                .iter()
+                .map(|f| decode_ops_of(f.dtype))
+                .fold(0, u64::saturating_add);
             Work {
                 macs: e.saturating_mul(arith),
                 transcendentals: e.saturating_mul(trans),
                 index_ops: e
                     .saturating_mul(index)
-                    .saturating_add(operand_index_ops(ops, e)),
+                    .saturating_add(operand_index_ops(ops, e))
+                    .saturating_add(e.saturating_mul(decode)),
                 wg_bytes: 0,
             }
         }
 
-        // The carrier's `lift` is what the deleted `pre` was, and `width`
-        // merges run per element instead of one named combine's arity. A
-        // promoted axis leaves the iteration domain and reappears as carrier
-        // lanes, so the per-element merge count rises with `lanes()`: the same
-        // total work, priced where it actually happens.
+        // The carrier's `lift` runs per loaded element and `width` merges run
+        // per element.
         L1::KFold {
             carrier,
             post,
@@ -237,36 +221,8 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
         } => {
             let lanes = carrier.lanes().unwrap_or(carrier.width() as u64);
             // A promoted axis leaves the iteration domain and reappears as
-            // carrier lanes, so its extent is already counted in `lanes`.
-            // Multiplying the full `space` by `lanes` again charges a nest that
-            // merges each element into its own lane exactly once at `lanes`
-            // times its true cost, which is why a promoted `KFold` was never
-            // selected. Filtering `vec_axes` out is the correct row and is a
-            // no-op on every unpromoted node.
-            //
-            // This row was previously left knowingly wrong, on the belief that
-            // correcting it produced a wrong value in
-            // `normalization::composed_backward_saturates [gpu]` (a layer_norm
-            // adjoint reading -2.0558887 where every entry must be zero) and so
-            // implied a second latent defect in the promoted path. **That
-            // diagnosis was wrong and the fix is restored.** Measured:
-            //
-            //   - CPU selects a promoted nest here (vec_axes=[0], axis=1),
-            //     lowers it, and is CORRECT.
-            //   - GPU never lowers a promoted nest in this case at all, yet
-            //     changes answer. Dumping every lowered node with its schedule
-            //     point shows an identical node set both ways; the *only*
-            //     difference is that one `KContract` moves from
-            //     `Sgemm{bm:16,bn:32,bk:8,tm:2,tn:2}` to
-            //     `Coop{bm:16,bn:16,bk:8,n_passes:1,subgroups:1,rg:1,cg:1}`.
-            //   - Denying `Caps::coop_supported` with this row corrected makes
-            //     the case pass.
-            //
-            // So the wrong value is a pre-existing defect in the GPU
-            // cooperative-matrix contraction at that geometry, which correcting
-            // this row merely perturbs extraction into selecting. It is not in
-            // the promoted path, and pricing promotion wrongly to avoid it was
-            // a cost model encoding a legality decision — which §3 forbids.
+            // carrier lanes, so its extent is already counted in `lanes` and
+            // `vec_axes` must be filtered out of the iteration count.
             let ein = space
                 .dims
                 .iter()
@@ -312,16 +268,29 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
                 macs: b.saturating_mul(m).saturating_mul(n).saturating_mul(k),
                 ..Work::default()
             };
-            // A side's `pre` runs once per loaded element of *that side*.
-            // Operand index arithmetic is deliberately not priced here: it
-            // never was, and a contraction's traffic term dominates it. What
-            // multiplies with a multi-operand side is the *bytes*, which
-            // `fusor2_cost::realize` counts per operand.
+            // A side's `pre` runs once per loaded element of that side.
+            // Operand index arithmetic is not priced here; the per-operand
+            // bytes are counted by `fusor2_cost::realize`.
             w = w.add(epilogue_work(&a.pre, b.saturating_mul(m).saturating_mul(k)));
             w = w.add(epilogue_work(&rhs.pre, b.saturating_mul(k).saturating_mul(n)));
+            // The staged decode of a quantized operand, once per element: the
+            // schedule-independent floor. Per-tile re-execution is priced in
+            // `fusor2_cost::realize`.
+            let (a_elems, b_elems) = (
+                b.saturating_mul(m).saturating_mul(k),
+                b.saturating_mul(k).saturating_mul(n),
+            );
+            // Decode arithmetic is shifts and masks on the scalar ALU, so it
+            // goes in `index_ops`, the field priced at that rate.
+            for (i, f) in ins.iter().enumerate() {
+                let elems = if i < a.len() { a_elems } else { b_elems };
+                w.index_ops = w
+                    .index_ops
+                    .saturating_add(elems.saturating_mul(decode_ops_of(f.dtype)));
+            }
             w = w.add(epilogue_work(post, b.saturating_mul(m).saturating_mul(n)));
             if *family == Family::Coop {
-                w.wg_bytes = coop_staged_bytes(sched, element_of(*acc));
+                w.wg_bytes = coop_staged_bytes(sched, acc.scalar_element());
             }
             w
         }
@@ -341,10 +310,10 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             }
         }
 
-        // A region's true work is the sum of its members'. `ins` carries only
-        // their *facts*, so this row is the shape-varying floor every member
-        // pays to land its output; `fusor2-cost` sums the exact rows on the
-        // realized DAG, where it has the member nodes ([`sum_work`]).
+        // A region's work is the sum of its members'. `ins` carries only their
+        // facts, so this row is the floor every member pays to land its
+        // output; `fusor2-cost::sum_work` sums the exact rows on the realized
+        // DAG.
         L1::KRegion { .. } | L1::KMerged(_) => ins.iter().fold(Work::default(), |acc, f| {
             acc.add(Work {
                 index_ops: elements(f),
@@ -352,7 +321,7 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             })
         }),
 
-        // Honest floor without the registry; see [`work_of_with`].
+        // Floor without the registry; see [`work_of_with`].
         L1::Ext { ops, .. } => Work {
             index_ops: e.saturating_add(operand_index_ops(ops, e)),
             ..Work::default()
@@ -360,7 +329,35 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
     }
 }
 
-fn epilogue_work(expr: &ScalarExpr, iterations: u64) -> Work {
+/// Arithmetic a backend's block-decode program spends per decoded element.
+///
+/// The decode is invisible to the IR on two paths — `Source::Quantized` in a
+/// contraction's staging fill, and the identity `KMap` a materializing
+/// `L0::Dequant` lowers to — so it is priced from the format alone. Counts
+/// are the per-element share of each format's unpack: shift/mask the quant,
+/// decode the block scale (and minimum, and 6-bit group scales for the K
+/// formats), one fma.
+pub fn quant_decode_ops(fmt: crate::dtype::QFmt) -> u64 {
+    use crate::dtype::QFmt;
+    match fmt {
+        QFmt::Q8_0 => 4,
+        QFmt::Q4_0 => 6,
+        QFmt::Q5_0 => 8,
+        QFmt::Q4K => 10,
+        QFmt::Q5K => 12,
+        QFmt::Q6K => 12,
+    }
+}
+
+/// [`quant_decode_ops`] for a dtype, zero when dense.
+pub fn decode_ops_of(d: crate::dtype::Dtype) -> u64 {
+    match d {
+        crate::dtype::Dtype::Q(fmt) => quant_decode_ops(fmt),
+        _ => 0,
+    }
+}
+
+pub fn epilogue_work(expr: &ScalarExpr, iterations: u64) -> Work {
     let (arith, trans, index) = scalar_expr_cost(expr);
     Work {
         macs: iterations.saturating_mul(arith),
@@ -376,10 +373,9 @@ fn operand_index_ops(ops: &[crate::ir::level1::Operand], iterations: u64) -> u64
     })
 }
 
-/// Bytes staged through workgroup memory by a cooperative geometry. This is
-/// the **traffic** term (`score_fs`'s T2), not a legality footprint: the
-/// allocation `verify_l1` admits against comes from the injected
-/// `ArenaPlanner` and nowhere else.
+/// Bytes staged through workgroup memory by a cooperative geometry: the
+/// traffic term (`score_fs`'s T2), not a legality footprint. The allocation
+/// `verify_l1` admits against comes from the injected `ArenaPlanner`.
 fn coop_staged_bytes(sched: &ScheduleDomain, elem: ScalarElement) -> u64 {
     if !matches!(sched, ScheduleDomain::Coop(_)) {
         return 0;
@@ -392,16 +388,6 @@ fn coop_staged_bytes(sched: &ScheduleDomain, elem: ScalarElement) -> u64 {
         .iter()
         .map(|t| t.layout.element_count() * t.element.byte_size())
         .sum()
-}
-
-fn element_of(d: crate::dtype::Dtype) -> ScalarElement {
-    match d {
-        crate::dtype::Dtype::F16 => ScalarElement::F16,
-        crate::dtype::Dtype::BF16 => ScalarElement::BF16,
-        crate::dtype::Dtype::U32 => ScalarElement::U32,
-        crate::dtype::Dtype::I32 => ScalarElement::I32,
-        _ => ScalarElement::F32,
-    }
 }
 
 /// Element count, symbolic dims priced as 1.
@@ -417,14 +403,39 @@ fn priced(d: Dim) -> u64 {
     d.as_const().unwrap_or(1)
 }
 
-/// True when `work` varies across two distinct shape bindings — the check
-/// [`crate::ir::Semantics::verify`] applies to an `OpDef` registration.
-pub fn work_is_shape_sensitive(
-    work: fn(&[ValueFacts], &ValueFacts) -> Work,
-    small: (&[ValueFacts], &ValueFacts),
-    large: (&[ValueFacts], &ValueFacts),
+/// The constant-work tripwire: true unless `work` is a nonzero constant
+/// across `ins`/`out` and the same binding with every `Const` dim doubled.
+/// A binding with no `Const` dim to double passes, as does work that is zero
+/// at both bindings.
+pub fn work_varies(
+    work: impl Fn(&[ValueFacts], &ValueFacts) -> Work,
+    ins: &[ValueFacts],
+    out: &ValueFacts,
 ) -> bool {
-    work(small.0, small.1) != work(large.0, large.1)
+    let has_const = ins
+        .iter()
+        .chain(std::iter::once(out))
+        .flat_map(|f| f.shape.iter())
+        .any(|d| d.as_const().is_some());
+    if !has_const {
+        return true;
+    }
+    let small = work(ins, out);
+    let doubled_ins: Vec<ValueFacts> = ins.iter().map(doubled).collect();
+    let doubled_out = doubled(out);
+    let large = work(&doubled_ins, &doubled_out);
+    small != large || small == Work::default()
+}
+
+/// Every `Const` dim doubled — the second binding the work tripwire prices.
+fn doubled(f: &ValueFacts) -> ValueFacts {
+    let mut out = f.clone();
+    for d in out.shape.iter_mut() {
+        if let Dim::Const(v) = *d {
+            *d = Dim::Const(v.saturating_mul(2));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -491,8 +502,6 @@ mod tests {
         assert_eq!(w.macs, 0);
     }
 
-    // ---- Test 3 ----------------------------------------------------------
-
     #[test]
     fn contract_macs_are_batch_m_n_k() {
         let spec = EinSpec {
@@ -527,8 +536,7 @@ mod tests {
         let w = work_l0(&fold, &[f32s(&[8, 4])], &f32s(&[4]));
         assert_eq!(w.macs, 32 + 4);
 
-        // A two-slot carrier does twice the merge work, and the row says so
-        // without knowing what either slot means.
+        // A two-slot carrier does twice the merge work.
         let two = L0::Fold {
             carrier: sum
                 .tuple(

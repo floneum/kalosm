@@ -1,24 +1,13 @@
 //! The admissible lower bound.
 //!
-//! `lb(c) = min over n in c of ( math_ps(n) + sum over *distinct* child chains
+//! `lb(c) = min over n in c of ( math_ps(n) + sum over distinct child classes
 //! lb(child) )` — zero traffic, free sharing, min over the schedule domain.
-//!
-//! It is a genuine relaxation in **both** regimes: an inlined node's true cost
-//! pays math `k` times where `lb` pays once; a materialized node's true cost
-//! pays math plus traffic where `lb` pays math. So it is a valid seed *and* a
-//! valid branch-and-bound prune.
-//!
-//! The alternative seed — assume everything shared is materialized — is not a
-//! lower bound at all: it maximizes launch count and pays a write plus a read
-//! for every edge the optimal fused cut deletes, which is precisely the
-//! conv-epilogue shape the trainer is made of.
-//!
-//! Owned by W7.
+//! It underestimates true cost in both the inlined and the materialized
+//! regime, so it serves as both a seed and a branch-and-bound prune.
 
 use fusor2_ir::cost::{CostModel, Picoseconds};
 use fusor2_ir::device::Caps;
 use fusor2_ir::egraph::{ClassId, EGraph, Id};
-use fusor2_ir::facts::ValueFacts;
 use fusor2_ir::ir::Op;
 use fusor2_ir::ir::level0::L0;
 use fusor2_ir::ir::level1::ScheduleDomain;
@@ -26,20 +15,14 @@ use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 
-/// `union(a, b)` allocates an id *above* both operands, so a consumer built
-/// before its producer gained an alternative sees `root_of(child) > own id`.
-/// A single forward sweep would then read an unwritten slot. Kleene iteration
-/// from `0` fixes that without giving up admissibility: the operator is
-/// monotone (`min` and `+` over non-negative picoseconds), so iterating from
-/// the bottom converges upward onto the least fixpoint — the exact class
-/// bound wherever the class graph is acyclic, and a safe underestimate where
-/// a class cycle exists.
+/// Iteration cap for the Kleene fixpoint. A class id can exceed its own
+/// members' ids, so one forward sweep is not enough; the operator is monotone
+/// over non-negative picoseconds, so iterating from `0` converges upward onto
+/// the least fixpoint.
 const MAX_PASSES: u32 = 8;
 
-/// Ceiling on `node_math` evaluations spent scanning schedule domains. Past
-/// it a node's math term degrades to zero, which is still a *lower* bound and
-/// therefore still admissible. Without a ceiling one `CoopDomain` of ~8,300
-/// points per contraction would put the bound alone over the 2 ms budget.
+/// Ceiling on `node_math` evaluations spent scanning schedule domains. Past it
+/// a node's math term degrades to zero, which is still admissible.
 const MATH_CALL_BUDGET: usize = 200_000;
 
 /// Domain size past which a node earns a memo entry.
@@ -79,12 +62,9 @@ pub fn lower_bound(graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds> {
     lb
 }
 
-/// The cheapest **selectable** member of `class`, ties by smaller [`Id`]. The
-/// seed selection is exactly this, per class.
-///
-/// Selectable, not just cheapest: the floor lowerings tie with the `L0` node
-/// they replace on math, so an unrestricted `min_by_key` would return the
-/// un-lowered original every time. See [`crate::realize::selectable`].
+/// The cheapest [`crate::realize::selectable`] member of `class`, ties by
+/// smaller [`Id`]. Restricting to selectable members matters because floor
+/// lowerings tie on math with the `L0` node they replace.
 pub fn argmin_member(
     graph: &EGraph,
     lb: &[Picoseconds],
@@ -100,16 +80,14 @@ pub fn argmin_member(
         .unwrap_or(class.0)
 }
 
-// ---------------------------------------------------------------------------
-
 fn combine(graph: &EGraph, id: Id, math: &[Picoseconds], lb: &[Picoseconds]) -> Picoseconds {
     let node = graph.node(id);
     match &node.op {
         Op::Union(a, b) => lb[a.index()].min(lb[b.index()]),
         Op::L0(L0::Leaf(_)) => Picoseconds(0),
         _ => {
-            // Deduplicate children by class: a node reading the same class
-            // twice contributes once, which is what makes sharing free.
+            // Deduplicate children by class so a node reading the same class
+            // twice contributes once.
             let mut seen: SmallVec<[ClassId; 4]> = SmallVec::new();
             let mut total = math[id.index()];
             for child in node.children.iter() {
@@ -128,9 +106,7 @@ fn combine(graph: &EGraph, id: Id, math: &[Picoseconds], lb: &[Picoseconds]) -> 
 fn node_math_table(graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds> {
     let n = graph.len();
     let mut out = vec![Picoseconds(0); n];
-    // Identical nodes at identical operand facts share a scan. Repeated
-    // transformer layers and the trainer's three conv stages collapse to one
-    // domain walk each.
+    // Identical nodes at identical operand facts share a scan.
     let mut memo: FxHashMap<u64, Picoseconds> = FxHashMap::default();
     let mut budget = MATH_CALL_BUDGET;
     for (i, slot) in out.iter_mut().enumerate() {
@@ -139,9 +115,8 @@ fn node_math_table(graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds> {
         if matches!(node.op, Op::Union(..) | Op::L0(L0::Leaf(_))) {
             continue;
         }
-        // Hashing a node's operand facts costs about as much as two
-        // `node_math` calls, so only a domain wide enough to pay for it gets
-        // a memo entry.
+        // Hashing operand facts costs about two `node_math` calls, so only a
+        // wide enough domain earns a memo entry.
         if domain_len(graph, id) <= MEMO_THRESHOLD {
             *slot = best_math(graph, cost, id, &mut budget);
             continue;
@@ -162,15 +137,8 @@ fn node_math_table(graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds> {
 /// `argmin over sched.iter()` of `node_math`; `ScheduleDomain::Point` passes
 /// `None`, as does any node without a domain.
 fn best_math(graph: &EGraph, cost: &dyn CostModel, id: Id, budget: &mut usize) -> Picoseconds {
-    let node = graph.node(id);
-    let ins: SmallVec<[ValueFacts; 4]> = node
-        .children
-        .iter()
-        .map(|c| graph.facts(*c).clone())
-        .collect();
-    let out = graph.facts(id);
-
-    let domain = match &node.op {
+    let scan = crate::realize::DomainScan::new(graph, id, cost);
+    let domain = match &graph.node(id).op {
         Op::L1(l1) => l1.schedule(),
         _ => None,
     };
@@ -180,19 +148,18 @@ fn best_math(graph: &EGraph, cost: &dyn CostModel, id: Id, budget: &mut usize) -
                 return Picoseconds(0);
             }
             *budget -= 1;
-            cost.node_math(node, &ins, out, None)
+            scan.price(cost, None)
         }
         Some(domain) => {
             let mut best: Option<Picoseconds> = None;
             for theta in domain.iter() {
                 if *budget == 0 {
-                    // An unfinished scan is still a lower bound only if we
-                    // drop the term entirely; a partial min could exceed the
-                    // true minimum and break admissibility.
+                    // A partial min could exceed the true minimum, so an
+                    // unfinished scan drops the term entirely.
                     return Picoseconds(0);
                 }
                 *budget -= 1;
-                let v = cost.node_math(node, &ins, out, Some(theta));
+                let v = scan.price(cost, Some(theta));
                 best = Some(match best {
                     Some(b) if b <= v => b,
                     _ => v,
@@ -247,17 +214,7 @@ mod tests {
     }
 
     /// An `L0` node never wins selection over its own lowering, however the
-    /// bound compares.
-    ///
-    /// A floor lowering is worse in *schedule*, not in arithmetic, so the two
-    /// members' bounds are at best a tie and can favour the `L0` node
-    /// outright. Either way the `L0` node is not runnable, so cost must not
-    /// get a vote: only [`crate::realize::selectable`] members are candidates.
-    ///
-    /// The regression this pins: `argmin_member` ranked every member and broke
-    /// ties by smaller `Id` — always the un-lowered original — so `verify_plan`
-    /// rejected every plan with "selected %N is at l0 but only L1 nodes are
-    /// runnable", for every op, on both backends.
+    /// bound compares, because it is not runnable.
     #[test]
     fn an_l0_node_never_wins_selection_over_its_own_lowering() {
         use crate::realize::testkit::{N, buffer, kmap, new_graph};
@@ -267,7 +224,7 @@ mod tests {
         let shape = [N];
         let leaf = buffer(&mut graph, 0, &shape);
         // An `L0::Map` and an `L1::KMap` with the identical body: same work,
-        // same bound, and the L0 node has the smaller id.
+        // same bound, smaller id on the L0 node.
         let l0 = graph
             .add(Op::L0(L0::Map {
                 expr: fusor2_ir::scalar::ScalarExpr::un(
@@ -284,8 +241,7 @@ mod tests {
 
         let cost = TestCost::default();
         let lb = lower_bound(&graph, &cost);
-        // The premise: on cost alone the L0 node wins — it is no dearer, and
-        // it holds the smaller id, so it also wins every tie-break.
+        // On cost alone the L0 node wins: no dearer, and smaller id.
         assert!(lb[l0.index()] <= lb[l1.index()]);
         assert!(l0 < l1);
 

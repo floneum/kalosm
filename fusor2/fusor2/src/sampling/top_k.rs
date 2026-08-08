@@ -1,7 +1,5 @@
 //! Top-k over a logits row, and the on-device sampled-token handle that lets a
 //! decode loop avoid a host round trip.
-//!
-//! Owned by W13.
 
 use crate::Result;
 use crate::tensor::Tensor;
@@ -20,7 +18,7 @@ pub struct GpuSampledToken {
 }
 
 impl GpuSampledToken {
-    /// Read the token back. One of exactly three host syncs.
+    /// Read the token back, costing a host sync.
     pub fn to_u32(&self) -> Result<u32> {
         let v = self.value.to_vec_u32()?;
         v.first()
@@ -31,9 +29,8 @@ impl GpuSampledToken {
 
 /// `(values, indices)` of the k largest entries along the last axis.
 ///
-/// The order is value descending, and **on an exact tie the larger token id
-/// comes first** — the reference's `better_candidate` rule. `values` is `F32`
-/// and `indices` is `U32`, both of shape `[k]`.
+/// The order is value descending, and on an exact tie the larger token id comes
+/// first. `values` is `F32` and `indices` is `U32`, both of shape `[k]`.
 ///
 /// A non-finite logit is treated as `-f32::MAX`, so `NaN` and the infinities
 /// sort below every real token and are reported with that sentinel as their
@@ -79,7 +76,7 @@ mod tests {
         }
     }
 
-    /// The declared rule: on an exact tie the larger token id sorts first.
+    /// On an exact tie the larger token id sorts first.
     #[test]
     fn ties_break_towards_the_larger_token_id() {
         let mut values = vec![0.0f32; 16];
@@ -90,8 +87,7 @@ mod tests {
         assert_eq!(ids.to_vec_u32().unwrap(), vec![9, 3]);
     }
 
-    /// A whole row of equal logits is the strongest form of the tie rule: the
-    /// ids must come back in strictly descending order.
+    /// A whole row of equal logits comes back in strictly descending id order.
     #[test]
     fn an_all_tied_row_sorts_by_descending_id() {
         let values = vec![1.5f32; 8];

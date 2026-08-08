@@ -1,22 +1,17 @@
-//! The adjoint table. **Seven entries.**
+//! The adjoint table: one row per differentiable core op.
 //!
-//! `map_adjoint` differentiates a `ScalarExpr` once and thereby covers all 23
-//! elementwise unaries, all 12 comparisons (which differentiate to zero
-//! automatically, satisfying the invariant that every requires-grad parent
-//! receives a gradient), `where_cond`, `clamp`, `gelu`, `sigmoid`, `silu` and
-//! the scalar-arith family.
+//! `map_adjoint` differentiates a `ScalarExpr`, covering the elementwise
+//! unaries, the comparisons (which differentiate to zero), `where_cond`,
+//! `clamp`, `gelu`, `sigmoid`, `silu` and the scalar-arith family.
 //!
-//! `conv`, `grouped_conv`, `rms_norm`, `layer_norm`, `rope`, `attention`,
-//! `upsample`, `pool` and `q_mat_mul` need no entry: they are macro ops whose
-//! `defn` expansion into core L0 is present from node zero, so their adjoints
-//! are the composition of core adjoints, automatically.
-//!
-//! Owned by W5.
+//! Macro ops such as `conv`, `rms_norm`, `rope`, `attention` and `q_mat_mul`
+//! have no row: their `defn` expands into core L0, so their adjoints are the
+//! composition of core adjoints.
 
 use fusor2_ir::autograd::{Adjoint, AdjointKind};
 use fusor2_ir::ir::{OpDefId, OpDefRegistry, OpTag};
 
-/// The seven rows.
+/// The differentiable core ops and how each is differentiated.
 pub static ADJOINTS: &[Adjoint] = &[
     Adjoint {
         op: OpTag::Contract,
@@ -48,15 +43,12 @@ pub static ADJOINTS: &[Adjoint] = &[
     },
 ];
 
-/// The row for `tag`, or `None` when the op is not differentiable (which for
-/// a requires-grad parent is an error, not a silent zero).
+/// The row for `tag`, or `None` when the op is not differentiable, which for
+/// a requires-grad parent is an error rather than a silent zero.
 ///
-/// `Leaf`, `Project` and `Dequant` have no row on purpose. `Leaf`
-/// terminates; `Project { slot }` routes the gradient into slot `slot` of
-/// its tuple parent, which the walk does directly; and `Dequant`'s input is
-/// a quantized leaf that is never trainable — the parity rule that
-/// `q_mat_mul`'s gradient goes to the activation only and QAT keeps a
-/// separate f32 master.
+/// `Leaf`, `Project` and `Dequant` have no row: `Leaf` terminates, `Project`
+/// routing is done directly by the walk, and a `Dequant` input is a quantized
+/// leaf that is never trainable.
 pub fn adjoint_of(tag: OpTag) -> Option<&'static Adjoint> {
     ADJOINTS.iter().find(|a| a.op == tag)
 }

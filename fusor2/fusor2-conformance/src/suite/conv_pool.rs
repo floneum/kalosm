@@ -1,13 +1,8 @@
 //! `conv`, `grouped_conv`, the three pools and `upsample`.
 //!
-//! The case that earns this file is `pool_max_non_overlapping_adjoint_is_mask`:
-//! `Window`'s structural adjoint reads two integers, and `step >= window`
-//! proves the adjoint is an elementwise mask-and-broadcast. That proof is what
-//! deletes the trainer's reshape-as-maxpool workaround, so the assert is that
-//! the adjoint graph contains **no** `Scatter` node — not merely that the
-//! numbers come out right, which they would either way.
-//!
-//! Owned by W14.
+//! `pool_max_non_overlapping_adjoint_is_mask` asserts a structural property:
+//! `step >= window` makes the `Window` adjoint an elementwise
+//! mask-and-broadcast, so the adjoint graph contains no `Scatter` node.
 
 use fusor2::composite::pool::PoolSize;
 use fusor2::{Dim, Dtype, Session};
@@ -34,8 +29,6 @@ pub fn cases() -> Cases {
     );
     cases
 }
-
-// ---------------------------------------------------------------------------
 
 /// `[batch, in_ch, len] * [out_ch, in_ch, k]` with `padding` and unit stride.
 #[allow(clippy::too_many_arguments)]
@@ -120,9 +113,7 @@ fn conv1d(session: &Session) -> CaseResult {
         &expected,
     )?;
 
-    // The bias gradient is one per output position per batch — the shape most
-    // likely to be wrong when conv is a `Window` + `Contract` composition
-    // rather than a hand-written kernel.
+    // The bias gradient is one per output position per batch.
     let d_bias = gradient_of(&graph, &y, &b)?;
     let want = (BATCH * out_len) as f32;
     for (i, v) in d_bias.iter().enumerate() {
@@ -303,11 +294,10 @@ fn pool_case(session: &Session, kind: Pool) -> CaseResult {
     Ok(())
 }
 
-/// `step >= window` proves the adjoint is an elementwise mask: each input
-/// element receives either the whole gradient of its window (if it is the
-/// extremum) or nothing, and **no element receives a contribution from two
-/// windows**. That last clause is the one a scatter would be needed for, and
-/// it is what this case falsifies.
+/// With `step >= window` the adjoint is an elementwise mask: each input
+/// element receives either the whole gradient of its window (when it is the
+/// extremum) or nothing, and no element receives a contribution from two
+/// windows.
 fn non_overlapping_adjoint_is_mask(session: &Session) -> CaseResult {
     const LEN: usize = 8;
     const WINDOW: usize = 4;

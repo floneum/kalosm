@@ -1,12 +1,6 @@
-//! R5 — reader-rooted sinking. A pattern may match a *spine*
-//! ([`crate::egraph::Builder::trace_pure_views`]), which is what makes the
-//! reference's self-declared "single clearest structural gap"
-//! (`sink_unary_chains_into_matmuls`, impossible there because "a generator
-//! may only return a new variant for the node it was asked about") a
-//! single-rooted rule here. No multi-root rule form is needed anywhere, and
-//! the reference's private-view-chain sole-reader walk is deleted outright.
-//!
-//! Owned by W2.
+//! Reader-rooted sinking. Patterns match a view spine via
+//! [`crate::egraph::Builder::trace_pure_views`], so sinking a unary chain into
+//! a matmul across a chain of views is a single-rooted rule.
 
 use crate::dtype::Dtype;
 use crate::egraph::{Builder, Facts, Id, RuleTag};
@@ -47,8 +41,7 @@ rule!(
 ///
 /// The only guard is numeric: the epilogue must not round the accumulator
 /// ahead of the chain, so its element type must be the accumulator's, or the
-/// F16-accumulator/F32-epilogue widening pair. That is legality — whether
-/// sinking pays is priced elsewhere.
+/// F16-accumulator/F32-epilogue widening pair.
 pub fn sink_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     let Op::L1(L1::KMap { body, ops, .. }) = &node.op else {
         return None;
@@ -92,8 +85,8 @@ pub fn sink_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
         _ => return None,
     };
 
-    // Re-apply the spine, innermost first. Each view keeps its own relative
-    // spec vector, which is what makes a multi-node spine compose correctly.
+    // Re-apply the spine, innermost first; each view keeps its own relative
+    // spec vector.
     let mut cursor = sunk;
     for view in spine.views.iter() {
         let Op::L0(L0::Restride { specs, bounds, .. }) = b.node(*view).op.clone() else {
@@ -122,10 +115,8 @@ fn epilogue_preserves_accum(epilogue: Dtype, acc: Dtype) -> bool {
 /// Read a view through the operand's index map instead of through a
 /// materialized copy.
 ///
-/// The reference gates this on `needs_delinearize && input_reread_factor > 1`
-/// inside the generator; that gate is deleted. `MultiFlattenMap::divmod_ops`
-/// is the term the pricing crate charges for the divmod chain, so a reread
-/// factor of two with a trivial delinearize can win on its own merits.
+/// The alternative is minted unconditionally and priced; the divmod chain is
+/// charged through `MultiFlattenMap::divmod_ops`.
 pub fn fold_views_into_index(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     let Op::L1(L1::KMap {
         space,
@@ -150,22 +141,9 @@ pub fn fold_views_into_index(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Fact
 
 /// The same law with a `KFold` in the consumer position.
 ///
-/// [`fold_views_into_index`] states "a view is an index map, not a copy", and
-/// nothing in that statement mentions the consumer's head. It shipped headed
-/// at `KMap` only, and the consequence was measurable rather than theoretical:
-/// on the attention forward chain the row max is broadcast back over the key
-/// axis and read by **two** consumers, the `exp` map and the sum fold. The map
-/// could fold the broadcast into its operand map; the fold could not, so the
-/// broadcast kept a live reader, stayed in `M`, and cost a whole dispatch that
-/// copied 48 floats into 192 bytes so a later kernel could read them back
-/// contiguously.
-///
-/// A `KFold`'s operands are indexed over `space` exactly as a `KMap`'s are
-/// (`verify_l1::check_operand_access` reads `index_space_of`, which returns
-/// `space` for both), so the rewrite is the same rewrite. `vec_axes` needs no
-/// special case: it renumbers nothing, and a promoted axis a rewritten operand
-/// varies along is checked by `check_vec_axes` on the minted node, so an
-/// illegal spelling is refused by `add_l1` rather than guarded here.
+/// A `KFold`'s operands are indexed over `space` exactly as a `KMap`'s are, so
+/// the rewrite is identical. `vec_axes` needs no special case: `check_vec_axes`
+/// on the minted node refuses an illegal spelling through `add_l1`.
 pub fn fold_views_into_fold_index(
     b: &mut Builder<'_>,
     id: Id,
@@ -215,33 +193,23 @@ fn fold_operand_views(
         if !matches!(slot.access, AccessPlan::Alias) {
             continue;
         }
-        // The rewrite **replaces the operand's layout outright** with one
-        // derived from the view's base, so whatever that layout said is
-        // discarded. That is sound only when it said exactly "read the view
-        // dense at the consuming coordinate". A permuted, strided, broadcast
-        // or offset alias says something else — and since `check_operand_access`
-        // only pins an `Alias`'s rank and extents, not its strides, every one
-        // of those spellings reaches here.
+        // The rewrite replaces the operand's layout with one derived from the
+        // view's base, which is sound only for a dense read at the consuming
+        // coordinate.
         if !reads_its_view_densely(slot, space) {
             continue;
         }
         let spine = b.trace_pure_views(slot.src);
         if spine.views.len() != 1 {
-            // A multi-node spine needs spec composition, which is only
-            // decidable once every extent is known; the single-view case is
-            // where the conv operand and the flat-parameter slice live.
+            // A multi-node spine needs spec composition, decidable only once
+            // every extent is known.
             continue;
         }
         let Op::L0(L0::Restride { specs, .. }) = b.node(spine.views[0]).op.clone() else {
             continue;
         };
-        // The map replaces the operand's layout outright, and a
-        // `MultiFlattenMap`'s extents are what `Operand::address_map` derives
-        // its divisors from. So the view must already span the consuming
-        // index space. When it does not — an operand broadcast against the
-        // space, whose `[rows, 1]` view is read over `[rows, cols]` — the
-        // layout is doing work the map cannot express, and adopting the map
-        // reads `flat % rows` where `flat / cols` belongs.
+        // `Operand::address_map` derives its divisors from the map's extents,
+        // so the view must span the consuming index space.
         if specs.len() != space.dims.len()
             || !specs
                 .iter()
@@ -254,10 +222,9 @@ fn fold_operand_views(
         let Some((map, offset)) = unflatten_of(&specs, &base_shape) else {
             continue;
         };
-        // `MultiFlattenMap` is a pure sum of stride terms and has nowhere to
-        // put a base offset, so `Operand::address_map` takes it from the
-        // layout. A contiguous layout says offset 0, which silently turned a
-        // narrowed view (`table[2..]`) back into the whole table.
+        // `MultiFlattenMap` is a sum of stride terms with no slot for a base
+        // offset, so the layout carries the view's offset and
+        // `Operand::address_map` reads it from there.
         let layout = Layout::from_parts(
             Dim::Const(offset),
             &base_shape,
@@ -278,26 +245,9 @@ fn fold_operand_views(
 /// zero — the one layout [`fold_operand_views`] may discard, because it is the
 /// one the replacement map reproduces.
 ///
-/// # Why this is a guard and not an assert
-///
-/// `verify_l1::check_operand_access` pins an `Alias`'s **rank and extents**
-/// against the index space and says nothing about its strides or its offset.
-/// So a transposed read (`strides = [1, rows]`), a broadcast one
-/// (`strides = [.., 0]`) and a window (`offset != 0`) are all legal operands
-/// at the extents this rule already checks, and all three arrive here.
-/// Replacing them with `unflatten_of`'s map states the *view's* index
-/// arithmetic in place of the operand's, which is a different address for
-/// every coordinate but the first.
-///
-/// Measured, and this is the whole reason the guard exists: with a co-selection
-/// pass in `fusor2-cost::extract` letting the search reach the fused members
-/// this rule mints, the unguarded version put **29** conformance cases on wrong
-/// values — every `softmax`, `layer_norm` and `rms_norm` row, `attention_qk_mask`
-/// and the attention gradients, on both backends. `softmax_rows_sum_to_one`
-/// reported a row summing to 1.13. The e-graph's invariant is that any member
-/// of a class computes the same value, so a search that reaches further is a
-/// search that reaches a wrong plan; the member has been in the graph, unequal
-/// and unselected, since this rule shipped.
+/// `verify_l1::check_operand_access` pins an `Alias`'s rank and extents only,
+/// so transposed, broadcast and offset aliases all reach this rule and must be
+/// refused here.
 fn reads_its_view_densely(o: &Operand, space: &crate::ir::level1::IndexSpace) -> bool {
     if !o.layout.offset().known_eq(Dim::Const(0)) {
         return false;
@@ -324,12 +274,11 @@ fn reads_its_view_densely(o: &Operand, space: &crate::ir::level1::IndexSpace) ->
 
 /// The index map a relative spec vector induces over a dense base, and the
 /// base offset it starts from. Declines when an extent, stride or offset is
-/// not decidable — there is no contiguous fallback here, only the alternative
-/// not being minted.
+/// not decidable.
 ///
-/// The offset is returned separately because `MultiFlattenMap` is a sum of
-/// stride terms with no constant slot; the caller must put it on the
-/// operand's layout, which is where [`Operand::address_map`] reads it from.
+/// The offset is returned separately because `MultiFlattenMap` has no constant
+/// slot; the caller puts it on the operand's layout, where
+/// [`Operand::address_map`] reads it from.
 fn unflatten_of(
     specs: &[crate::shape::StrideSpec],
     base_shape: &[Dim],
@@ -372,12 +321,8 @@ mod tests {
     }
 
     /// The `KFold` arm reads a broadcast row statistic through the operand's
-    /// index map instead of through the copy the floor would materialize.
-    ///
-    /// This is the attention forward chain's shape in miniature: a `[rows]`
-    /// value broadcast back over the reduced axis and consumed by a fold. The
-    /// `KMap` arm always had this; without the fold arm the broadcast keeps a
-    /// reader, stays in `M` and costs a dispatch.
+    /// index map instead of through a materialized copy: a `[rows]` value
+    /// broadcast over the reduced axis and consumed by a fold.
     #[test]
     fn fold_views_into_fold_index_reads_a_broadcast_through_the_index_map() {
         use crate::carrier::Carrier;
@@ -433,14 +378,8 @@ mod tests {
     }
 
     /// The rewrite discards the operand's own layout, so it fires only where
-    /// that layout was the dense read. Both halves, on one fixture: the
-    /// transposed read of a view is refused, and the dense read of the same
-    /// view is still rewritten.
-    ///
-    /// Without the guard the first assert fails — `check_operand_access` pins
-    /// an `Alias`'s rank and extents and says nothing about its strides, so a
-    /// transposed edge reaches the rule and comes back reading the view in
-    /// row-major order.
+    /// that layout was the dense read: the transposed read of a view is
+    /// refused, the dense read of the same view is rewritten.
     #[test]
     fn fold_views_into_index_refuses_an_operand_that_is_not_the_dense_read() {
         use crate::shape::StrideSpec;
@@ -507,7 +446,7 @@ mod tests {
         assert!(fire(&mut g, fold, &FOLD_VIEWS_INTO_FOLD_INDEX).is_none());
     }
 
-    /// Test 5. `KContract -> Restride -> Restride -> KMap(gelu-ish)`: the
+    /// `KContract -> Restride -> Restride -> KMap(gelu-ish)`: the
     /// map's class gains `Restride(Restride(KContract{post}))` and the
     /// composed form survives.
     #[test]

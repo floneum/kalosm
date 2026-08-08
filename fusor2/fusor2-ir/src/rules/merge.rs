@@ -1,13 +1,7 @@
-//! Horizontal merging. [`crate::ir::level1::KMerged`]'s constructor already
-//! refuses a segment carrying an epilogue, so the illegal state is
-//! unrepresentable; the un-merged epilogue-carrying contraction stays a live
-//! alternative in the same chain, and merging and epilogue fusion compete on
-//! price instead of one vetoing the other.
-//!
-//! The reference's `fusion_toposort`, its wave-generation dependency tracker
-//! and `merge_profile`'s `None`-on-epilogue veto are all deleted.
-//!
-//! Owned by W2.
+//! Horizontal merging. [`crate::ir::level1::KMerged`]'s constructor refuses a
+//! segment carrying an epilogue; the un-merged epilogue-carrying contraction
+//! stays a live alternative in the same chain, so merging and epilogue fusion
+//! compete on price.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
 use crate::ir::level1::{
@@ -110,23 +104,12 @@ fn segment_of(b: &Builder<'_>, id: Id) -> Option<MergeSegment> {
 
 /// Union a wave over `segs` into `id`'s class.
 ///
-/// **A wave of one is refused.** `KMerged { segments: [x] }` names `x` as a
-/// child, so unioning it into `x`'s own class produces a member whose operand
-/// resolves back to the class it is a member of. `realize::walk` reports any
-/// selection that reaches one as "selection is cyclic through %N", and the
-/// class's `lower_bound` becomes a self-referential recurrence that burns the
-/// whole Kleene iteration. It fired on **every** `KContract` and **every**
-/// `KFold`, so every graph holding a reduction carried one.
-///
-/// Nothing is lost: a one-segment wave denotes exactly the segment, and a
-/// genuine multi-segment wave still comes from [`merge_region_wave`], which
-/// reads sibling members off a `KRegion` and never names its own class.
-///
-/// The wave is minted **with its schedule domain**, derived from the segments'
-/// shared index space and the device. Every segment shares the `MergeKey`, so
-/// the first segment's own value is that space; `verify_l1` recomputes the
-/// same domain from the merged node's inferred facts, which are that same
-/// value, so the two cannot drift.
+/// A wave of one is refused: `KMerged { segments: [x] }` names `x` as a child,
+/// so unioning it into `x`'s own class produces a member naming its own class,
+/// which `realize::walk` reports as a cyclic selection. Multi-segment waves
+/// come from [`merge_region_wave`]. The wave is minted with its schedule
+/// domain, derived from the segments' shared index space and the device; every
+/// segment shares the `MergeKey`, so the first segment's value is that space.
 fn mint(b: &mut Builder<'_>, id: Id, cat: WaveCat, segs: Vec<MergeSegment>) -> Option<Id> {
     if segs.len() < 2 {
         return None;
@@ -147,11 +130,10 @@ pub fn linear_domain_of(b: &Builder<'_>, landed: Id) -> ScheduleDomain {
 
 /// The merged-wave spelling of a dense contraction.
 ///
-/// Reader-rooted like every other rule here: a node can only name itself and
-/// its children. A lone contraction therefore has no sibling to merge with
-/// and [`mint`] refuses the wave of one; the multi-segment case is
-/// [`merge_region_wave`]. A segment carrying an epilogue is refused by the
-/// constructor, not by this rule.
+/// A node can only name itself and its children, so a lone contraction has no
+/// sibling to merge with and [`mint`] refuses the wave of one; the
+/// multi-segment case is [`merge_region_wave`]. A segment carrying an epilogue
+/// is refused by the constructor, not by this rule.
 pub fn merge_contract_wave(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     if !matches!(node.op, Op::L1(L1::KContract { .. })) {
         return None;
@@ -174,10 +156,8 @@ pub fn merge_row_wave(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) 
     mint(b, id, WaveCat::Row, vec![seg])
 }
 
-/// A region already names several sibling members, so this is the one place
-/// a genuine multi-segment wave is expressible without a graph-global rule
-/// form: every member that is a mergeable shape and shares one key becomes a
-/// segment.
+/// A region names several sibling members, so every member that is a mergeable
+/// shape and shares one key becomes a segment of one wave.
 pub fn merge_region_wave(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     let Op::L1(L1::KRegion { members, .. }) = &node.op else {
         return None;
@@ -235,7 +215,7 @@ mod tests {
         )
     }
 
-    /// Test 7. A merged body with per-segment epilogue identities is
+    /// A merged body with per-segment epilogue identities is
     /// unbuildable, and the epilogue-carrying contraction stays in the chain.
     #[test]
     fn kmerged_rejects_epilogue_segments() {
@@ -270,14 +250,9 @@ mod tests {
         assert_eq!(chain, vec![with_epi]);
     }
 
-    /// CHANGED ASSERTION — this used to assert the rule mints a
-    /// `KMerged { segments: [plain] }` and unions it into `plain`'s class.
-    /// That is exactly the self-referential member: the wave's only child is
-    /// `plain`, and after the union `class_of(plain)` is the wave's own
-    /// class, so `realize::walk` reports any selection reaching it as
-    /// "selection is cyclic through %N". It fired on every `KContract` and
-    /// every `KFold` in every graph. A wave of one denotes exactly its
-    /// segment, so refusing it loses no alternative.
+    /// A lone contraction mints no wave: `KMerged { segments: [plain] }`
+    /// unioned into `plain`'s class would be a member naming its own class,
+    /// which `realize::walk` reports as a cyclic selection.
     #[test]
     fn a_lone_contraction_gets_no_wave_of_one() {
         let mut g = ts::graph();
@@ -286,8 +261,7 @@ mod tests {
         assert_eq!(g.chain(plain), vec![plain]);
     }
 
-    /// The invariant the refusal exists for: no class member may name its
-    /// own class as an operand.
+    /// No class member may name its own class as an operand.
     #[test]
     fn no_class_member_names_its_own_class() {
         let mut g = ts::graph();
@@ -316,11 +290,7 @@ mod tests {
     }
 
     /// A minted wave carries the domain its segments' shared index space
-    /// implies, and it is a domain with something in it to decide. Before
-    /// this, `L1::schedule()` returned `None` for both composite forms and
-    /// extraction handed the lowering `SchedPoint::Point` unconditionally —
-    /// the one node family the architecture calls its own fusion primitive
-    /// was the one whose geometry was not a selection.
+    /// implies, and that domain holds more than one point.
     #[test]
     fn a_minted_wave_carries_a_searchable_domain() {
         let mut g = ts::graph();

@@ -1,6 +1,4 @@
 //! `ConvNd`: rank-generic convolution over the `Window` + `Contract` macro op.
-//!
-//! Owned by W13.
 
 use fusor2_gguf::VarBuilder;
 use smallvec::SmallVec;
@@ -18,13 +16,10 @@ pub struct ConvNd {
 }
 
 impl ConvNd {
-    /// A convolution at the reference's `ConvNdConfig::default()`: unit
-    /// stride, no padding, one group. The spatial rank comes from the weight,
-    /// which is `[out_ch, in_ch / groups, ...kernel]`.
-    ///
-    /// Infallible, as the scaffold declares. A weight of rank < 2 has no
-    /// spatial axes at all; that is refused by `forward`, which has an
-    /// `Error` to put it in.
+    /// A convolution with unit stride, no padding and one group. The spatial
+    /// rank comes from the weight, which is `[out_ch, in_ch / groups,
+    /// ...kernel]`. A weight of rank < 2 is accepted here and refused by
+    /// `forward`.
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
         let spatial = weight.rank().saturating_sub(2);
         Self {
@@ -71,9 +66,8 @@ impl ConvNd {
 
     /// `[batch, in_ch, ...spatial] -> [batch, out_ch, ...out_spatial]`.
     ///
-    /// One `Window` view plus one `Contract` that contracts the channel label
-    /// and every kernel label at once — there is no im2col reshape, so the
-    /// windowed operand never has to be materialized.
+    /// One `Window` view plus one `Contract` over the channel label and every
+    /// kernel label, so the windowed operand is never materialized.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let spatial = self.weight.rank().checked_sub(2).ok_or_else(|| {
             Error::Shape(format!(

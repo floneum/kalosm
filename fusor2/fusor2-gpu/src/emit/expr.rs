@@ -5,10 +5,7 @@
 //! obligation** here: `reassoc: false` forbids the identity elimination,
 //! literal folding and operand reordering that would break
 //! `round(x, HalfAwayFromZero)` on Metal, and `contract: false` forbids fusing
-//! a multiply into an `Fma`. That is the whole reason the trainer's
-//! 14-chained-comparison `round_small` deletes.
-//!
-//! Owned by W8.
+//! a multiply into an `Fma`.
 
 use fusor2_ir::dtype::{NumericContract, RoundMode};
 use fusor2_ir::ir::level2::{
@@ -29,11 +26,9 @@ use super::{
 };
 
 /// The largest finite f32 WGSL will parse back identically.
-pub(crate) const WGSL_SAFE_F32_MAX: f32 = 3.40282e38;
+pub(crate) const WGSL_SAFE_F32_MAX: f32 = fusor2_tile::build::WGSL_SAFE_F32_MAX;
 
-// ---------------------------------------------------------------------------
 // Plumbing
-// ---------------------------------------------------------------------------
 
 impl Emitter<'_> {
     /// Append a *pure* expression (literal, pointer, argument): naga does not
@@ -234,11 +229,9 @@ impl Emitter<'_> {
             .ok_or_else(|| EmitError::Unsupported("local not declared".into()))
     }
 
-    // ---- u32 index peepholes -------------------------------------------
-    // Ported verbatim from `tile-ir/src/lower/math.rs`, power-of-two shift and
-    // mask rewrites included. These apply to **index arithmetic only** and are
-    // unreachable from any float value, so no `NumericContract` can observe
-    // them.
+    // Literal folding plus power-of-two shift and mask rewrites. These apply
+    // to **index arithmetic only** and are unreachable from any float value,
+    // so no `NumericContract` can observe them.
 
     pub(crate) fn u32_literal_of(&self, h: Handle<Expression>) -> Option<u32> {
         match self.exprs[h] {
@@ -336,8 +329,6 @@ impl Emitter<'_> {
         }
         self.bin(body, BinaryOperator::Add, left, right)
     }
-
-    // ---- addressing -----------------------------------------------------
 
     /// Flatten logical coordinates through a [`fusor2_ir::shape::MultiFlattenMap`]:
     /// one divmod chain per axis, most-significant-first, zero strides
@@ -470,8 +461,6 @@ impl Emitter<'_> {
         Ok(())
     }
 
-    // ---- values ---------------------------------------------------------
-
     pub(crate) fn cast_tile_value(
         &mut self,
         body: &mut Block,
@@ -551,12 +540,9 @@ impl Emitter<'_> {
         Ok(self.append(Expression::Literal(lit)))
     }
 
-    // ---- memo scoping ---------------------------------------------------
-
     /// Take the memo cache. Every value it holds is an SSA handle defined in
     /// the *current* block, so a nested block must start empty and the parent
-    /// must get its entries back on exit. This is the scoping property that
-    /// replaces the reference's manual `LoopCacheSnapshot`.
+    /// must get its entries back on exit.
     pub(crate) fn push_scope(&mut self) -> Scope {
         Scope {
             memo: std::mem::take(&mut self.memo),
@@ -600,15 +586,13 @@ pub(crate) fn element_scalar(element: ElementType) -> Result<Scalar, EmitError> 
     super::types::scalar_of(scalar)
 }
 
-// ---------------------------------------------------------------------------
 // Op tables
-// ---------------------------------------------------------------------------
 
 /// All 21 unary math functions. `Neg` is the one `UnaryOperator`.
 pub(crate) fn unary_math(op: UnOp) -> Option<MathFunction> {
     Some(match op {
-        // See `fusor2_ir::scalar::UnOp::ApproximateExp`: distinct nodes,
-        // one target instruction, exactly as the reference lowers them.
+        // See `fusor2_ir::scalar::UnOp::ApproximateExp`: distinct nodes, one
+        // target instruction.
         UnOp::Exp | UnOp::ApproximateExp | UnOp::LessApproximateExp => MathFunction::Exp,
         UnOp::Exp2 => MathFunction::Exp2,
         UnOp::Log => MathFunction::Log,
@@ -673,9 +657,7 @@ pub(crate) fn compare_operator(op: CmpOp) -> BinaryOperator {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Expression lowering
-// ---------------------------------------------------------------------------
 
 impl Emitter<'_> {
     /// Lower one expression, reusing the hash-cons memo so a repeated subtree
@@ -1073,8 +1055,6 @@ impl Emitter<'_> {
         Some(self.append(Expression::Literal(lit)))
     }
 
-    // ---- loads ----------------------------------------------------------
-
     fn load(
         &mut self,
         body: &mut Block,
@@ -1136,14 +1116,14 @@ impl Emitter<'_> {
                         // Force the result into a named temporary. A backend
                         // inlines a single-use expression into its consumer,
                         // so an unrolled run of these nests one `select(..)`
-                        // inside the next; `qcontract`'s decode chain overran
-                        // Metal's 256-bracket limit outright ("fatal error:
-                        // bracket nesting level exceeded"). A name caps the
-                        // nesting at one load. It is an SSA binding rather
-                        // than a spill through `scratch_local`, which measured
-                        // ~3 ms slower on 2048-cube matmul: one shared scratch
-                        // makes an unrolled staging run a write-after-write
-                        // chain in the source.
+                        // inside the next and a quantized decode chain hits
+                        // Metal's 256-bracket limit ("fatal error: bracket
+                        // nesting level exceeded"). A name caps the nesting at
+                        // one load. It is an SSA binding rather than a spill
+                        // through `scratch_local`, which measures ~3 ms slower
+                        // on 2048-cube matmul: one shared scratch makes an
+                        // unrolled staging run a write-after-write chain in
+                        // the source.
                         let n = self.forced_names.len();
                         self.forced_names.push((selected, format!("masked_{n}")));
                         Ok(selected)
@@ -1311,7 +1291,7 @@ mod tests {
         }
     }
 
-    /// Test 7 — the rounding modes are exact, and the `2^23` trick is absent.
+    /// The rounding modes are exact, and the `2^23` trick is absent.
     #[test]
     fn round_modes_are_exact() {
         let inputs = [-2.5f32, -0.5, 0.5, 1.5, 2.5, 6.5, 0.0, -0.0];
@@ -1346,7 +1326,7 @@ mod tests {
         }
     }
 
-    /// Test 8 — `reassoc: false` and `contract: false` survive to the module.
+    /// `reassoc: false` and `contract: false` survive to the module.
     #[test]
     fn reassoc_false_survives() {
         let caps = caps(false, true);
@@ -1570,8 +1550,8 @@ mod tests {
             logic = testkit::bin(BinOp::LogicalOr, logic, cmp, NumericContract::STRICT);
         }
 
-        // Cast in both directions, including the f32 -> u32 / f32 -> i32 pair
-        // the reference cannot express at all.
+        // Cast in both directions, including the f32 -> u32 and f32 -> i32
+        // pair.
         let to_u32 = TileExpr::new(
             TileExprKind::Cast {
                 value: acc.clone(),

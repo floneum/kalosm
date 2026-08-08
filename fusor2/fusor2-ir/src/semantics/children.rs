@@ -1,8 +1,5 @@
 //! Operand ids of every `Op`, in the order inference, verification, work
-//! accounting and the cost model all expect. The one place that order is
-//! written down.
-//!
-//! Owned by W1.
+//! accounting and the cost model all expect.
 
 use crate::ir::level0::L0;
 use crate::ir::level1::L1;
@@ -34,10 +31,8 @@ pub fn children_l0(op: &L0) -> Children {
 }
 
 /// Operand ids of an L1 node, taken from its `Operand` lists. `KContract`
-/// is its A-side operands followed by its B-side ones — one each in the
-/// two-buffer case that reads `[a.src, b.src]`, more once a multi-edge
-/// producer has been absorbed. A region is its members and a merged wave is
-/// its segments.
+/// is its A-side operands followed by its B-side ones. A region is its
+/// members and a merged wave is its segments.
 pub fn children_l1(op: &L1) -> Children {
     match op {
         L1::KMap { ops, .. }

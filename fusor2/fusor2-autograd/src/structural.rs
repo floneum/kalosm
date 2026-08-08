@@ -1,15 +1,8 @@
 //! The five structural adjoints, each read off the primal op's own attributes.
 //!
-//! [`window_adjoint`] is trainer constraint 4, solved by two integers: from
-//! `(window, step)`, `step >= window` proves the adjoint is an elementwise
-//! mask-and-broadcast; overlapping windows give `Scatter{Add}`, itself a chain
-//! with four lowerings. This is why `Window` survives as a core op — under
-//! `Dim::Sym`, injectivity of a *relative* stride composition with symbolic
-//! extents and offsets is undecidable, so a `Restride`-based encoding would
-//! degrade a non-overlapping max-pool to a scatter on exactly the
-//! symbolic-shape path the design exists to enable.
-//!
-//! Owned by W5.
+//! [`window_adjoint`] is decided by `(window, step)`: `step >= window` makes the
+//! adjoint an elementwise mask-and-broadcast; overlapping windows give
+//! `Scatter{Add}`.
 
 use crate::tape::{TapeExt, const_numel, const_row_major};
 use fusor2_ir::autograd::{Grads, Tape, Val};
@@ -20,7 +13,7 @@ use fusor2_ir::carrier::Carrier;
 use fusor2_ir::ir::level0::{L0, ScatterCombine, TiePolicy};
 use fusor2_ir::ir::level1::WindowAdjoint;
 use fusor2_ir::scalar::{BinOp, CmpOp, ScalarExpr};
-use fusor2_ir::shape::{Dim, Dims, Layout, SlidingWindow, StrideSpec, reshape_specs};
+use fusor2_ir::shape::{Dim, Dims, SlidingWindow, StrideSpec, reshape_specs};
 use fusor2_ir::{Error, Result};
 use smallvec::SmallVec;
 
@@ -44,7 +37,6 @@ pub fn structural_adjoint(
     }
 }
 
-// ---------------------------------------------------------------- Restride
 
 /// One input axis's contribution to the output index space.
 #[derive(Clone, Debug, Default)]
@@ -57,14 +49,10 @@ struct RestrideRun {
 /// Adjoint of `Restride`: sum over every stride-0 axis, then invert the
 /// remaining injective index map.
 ///
-/// Three stages, most-specific first:
-/// 1. every `multiplier == 0` output axis becomes a `Fold{Add}` — this *is*
-///    the broadcast backward;
-/// 2. if the remaining specs form an invertible per-axis run set (a permute
-///    and/or reshape), they invert into exactly one `Restride`;
-/// 3. otherwise the map is non-injective or partial, and the adjoint is a
-///    `Scatter{Add}` into a zero base with the index tensor computed by a
-///    `Map` of `IndexOf(axis)` terms. Never a host loop.
+/// Every `multiplier == 0` output axis becomes a `Fold{Add}`. Remaining specs
+/// forming an invertible per-axis run set invert into one `Restride`; a
+/// non-injective or partial map becomes a `Scatter{Add}` into a zero base,
+/// indexed by a `Map` of `IndexOf(axis)` terms.
 pub fn restride_adjoint(
     tape: &mut dyn Tape,
     node: &Node,
@@ -80,8 +68,8 @@ pub fn restride_adjoint(
         .ok_or_else(|| Error::Plan("Restride takes one operand".into()))?;
     let xshape = tape.shape_of(x);
 
-    // Stage 1: fold every stride-0 axis away, outermost last so the axis
-    // indices below it stay valid.
+    // Fold every stride-0 axis away, outermost last so the axis indices
+    // below it stay valid.
     let mut g = grad;
     for axis in (0..specs.len()).rev() {
         if specs[axis].is_broadcast() {
@@ -90,19 +78,15 @@ pub fn restride_adjoint(
     }
     let kept: Vec<StrideSpec> = specs.iter().copied().filter(|s| !s.is_broadcast()).collect();
 
-    // Stage 2: try to invert.
+    // Invert directly when the spec vector is invertible.
     if let Some(inverse) = invert_runs(&kept, &xshape) {
         let dx = tape.restride(&inverse, g)?;
         return Ok(smallvec::smallvec![Some(dx)]);
     }
 
-    // Stage 2b: a reshape. `invert_runs` works per input axis, and a *merge*
-    // names only the group's innermost input axis (`[2,3] -> [6]` is
-    // `dim_with(1, 6, 1)`), so the outer axes of the group look unread and it
-    // declines. But a spec vector whose composed layout is dense row-major
-    // over the whole input is the identity on flat indices — a pure reshape —
-    // and the adjoint of a reshape is the reshape back, which
-    // `reshape_specs` already spells in the same convention.
+    // A merge names only the group's innermost input axis, so `invert_runs`
+    // declines it. A spec vector whose composed layout is dense row-major over
+    // the whole input is a pure reshape, whose adjoint is the reshape back.
     let view_shape: Dims = kept.iter().map(|s| s.size).collect();
     if is_dense_reshape(&kept, &xshape, &view_shape) {
         let inverse = reshape_specs(&view_shape, &xshape)?;
@@ -110,7 +94,7 @@ pub fn restride_adjoint(
         return Ok(smallvec::smallvec![Some(dx)]);
     }
 
-    // Stage 3: the general index-tensor scatter.
+    // Otherwise fall back to the general index-tensor scatter.
     let idx_expr = restride_index_expr(&kept, &xshape)?;
     let dtype = tape.dtype_of(x);
     let dx = scatter_back(tape, g, idx_expr, &xshape, dtype)?;
@@ -118,35 +102,13 @@ pub fn restride_adjoint(
 }
 
 /// Whether `kept` reads every element of `xshape` exactly once in row-major
-/// order — the composed layout is `Layout::contiguous(view_shape)`, so the
-/// view's flat index *is* the source's flat index.
+/// order, so the view's flat index is the source's flat index.
 fn is_dense_reshape(kept: &[StrideSpec], xshape: &[Dim], view_shape: &[Dim]) -> bool {
     let (Some(have), Some(want)) = (const_numel(xshape), const_numel(view_shape)) else {
         return false;
     };
     have == want
-        && composed_layout(kept, xshape).is_some_and(|l| l.is_contiguous())
-}
-
-/// The dense layout `kept` composes to over `xshape`, or `None` when a stride
-/// is symbolic. Mirrors `fusor2_ir::rules::composed_layout`, which is private
-/// to the rule set; the adjoint has to agree with it exactly.
-fn composed_layout(kept: &[StrideSpec], xshape: &[Dim]) -> Option<Layout> {
-    let strides = const_row_major(xshape)?;
-    let mut shape: Vec<Dim> = Vec::with_capacity(kept.len());
-    let mut out: Vec<Dim> = Vec::with_capacity(kept.len());
-    let mut offset: u64 = 0;
-    for s in kept {
-        shape.push(s.size);
-        if s.multiplier == 0 {
-            out.push(Dim::Const(0));
-            continue;
-        }
-        let base = *strides.get(s.input_dim as usize)?;
-        out.push(Dim::Const(base.checked_mul(u64::from(s.multiplier))?));
-        offset = offset.checked_add(s.offset.as_const()?.checked_mul(base)?)?;
-    }
-    Layout::from_parts(Dim::Const(offset), &shape, &out).ok()
+        && fusor2_ir::rules::composed_layout(kept, xshape).is_some_and(|l| l.is_contiguous())
 }
 
 /// Invert a broadcast-free spec list into a single `Restride`, or `None`
@@ -223,17 +185,13 @@ fn restride_index_expr(kept: &[StrideSpec], xshape: &[Dim]) -> Result<ScalarExpr
     Ok(u32_sum(terms, constant))
 }
 
-// ------------------------------------------------------------------ Window
 
 /// Adjoint of `Window`.
 ///
-/// **Two integers decide it.** [`WindowAdjoint::of`] reads `(window, step)`
-/// off each spec: when every spec has `step == window` and tiles its axis
-/// exactly, the adjoint is a pure view — permute the trailing window axis
-/// next to its position axis and merge the two — and the emitted chain
-/// contains **no** `Scatter`. Otherwise the windows overlap or leave a tail,
-/// and the adjoint is the overlap-add `Scatter{Add}`, itself a chain with
-/// four lowerings the cost model picks between.
+/// When every spec has `step == window` and tiles its axis exactly, the adjoint
+/// is a pure view: permute the trailing window axis next to its position axis
+/// and merge the two, with no `Scatter`. Otherwise it is the overlap-add
+/// `Scatter{Add}`.
 pub fn window_adjoint(
     tape: &mut dyn Tape,
     node: &Node,
@@ -334,15 +292,11 @@ fn window_view_adjoint(
     Ok(Some(cur))
 }
 
-// ------------------------------------------------------------------ Gather
 
 /// Adjoint of `Gather` is `Scatter{Add}`; the index operand gets no gradient.
 ///
-/// **Trainer constraint 3.** Duplicates accumulate, so the embedding table
-/// receiving one token twice gets the summed gradient. The one-hot matmul
-/// the reference builds here does not appear anywhere in this crate — it
-/// survives only as one of `Scatter{Add}`'s four lowerings, kept so the cost
-/// model can reject it.
+/// Duplicates accumulate, so an embedding table receiving one token twice
+/// gets the summed gradient.
 pub fn gather_adjoint(
     tape: &mut dyn Tape,
     node: &Node,
@@ -367,14 +321,9 @@ pub fn gather_adjoint(
     Ok(smallvec::smallvec![Some(dx), None])
 }
 
-// ----------------------------------------------------------------- Scatter
 
 /// Adjoint of `Scatter`: `Gather` for the update operand, masked
 /// pass-through for the base.
-///
-/// This covers `cat`, `stack`, `pad_axis`, `repeat`, `resize` and
-/// `slice_assign`, all of which are `Scatter{Set}` into a const leaf, so
-/// each input receives the slice of the gradient covering its range.
 pub fn scatter_adjoint(
     tape: &mut dyn Tape,
     node: &Node,
@@ -402,7 +351,7 @@ pub fn scatter_adjoint(
     };
     let d_upd = tape.gather(*axis, grad, idx)?;
     let d_base = match combine {
-        // The written region no longer depends on `base`.
+        // The written region does not depend on `base`.
         ScatterCombine::Set => {
             let holes = tape.zeros_like(upd)?;
             tape.scatter_set(*axis, grad, idx, holes, *unique)?
@@ -413,7 +362,6 @@ pub fn scatter_adjoint(
     Ok(smallvec::smallvec![Some(d_base), None, Some(d_upd)])
 }
 
-// -------------------------------------------------------------------- Fold
 
 /// Adjoint of `Fold`, read off `combine`: `Add` broadcasts, `Mul` is the
 /// zero-aware product rule, `Max`/`Min` use the op's declared `TiePolicy`
@@ -444,10 +392,6 @@ pub fn fold_adjoint(
         .ok_or_else(|| Error::Shape(format!("fold axis {axis} out of range")))?;
     let dtype = tape.dtype_of(x);
 
-    // The adjoint reads the carrier's own **merge**, not a variant name: a
-    // single scalar slot merged by `Add` broadcasts, `Mul` is the zero-aware
-    // product rule, `Max`/`Min` use the declared `TiePolicy`. A carrier that
-    // is not one of those has no analytic adjoint here and says so.
     if ins.len() != 1 {
         return Err(Error::Numeric(
             "a multi-operand fold's adjoint is the composition of its lift's              adjoint with this one; autograd runs before fusion mints one"
@@ -474,18 +418,14 @@ pub fn fold_adjoint(
             )));
         }
     };
-    // A fold's output is at `acc`, and `accum_dtype` floors every narrow float
-    // there — an f16 `max` really does hand this adjoint an f32 output and an
-    // f32 incoming gradient. The adjoint of a value carries that value's own
-    // dtype, because two contributions to one value are summed by a `Map` that
-    // reads both at their declared width, so narrow back on the way out.
+    // The fold accumulates at `acc`, which is wider than a narrow-float
+    // operand; a value's gradient carries that value's own dtype.
     let dx = cast_to(tape, dx, dtype)?;
     Ok(smallvec::smallvec![Some(dx)])
 }
 
 /// `v` at `dtype`, or `v` unchanged when it is already there. The identity
-/// case emits no node, so a graph in which nothing widens is byte-identical
-/// to one built before any of this existed.
+/// case emits no node.
 fn cast_to(tape: &mut dyn Tape, v: Val, dtype: Dtype) -> Result<Val> {
     if tape.dtype_of(v) == dtype {
         return Ok(v);
@@ -505,9 +445,7 @@ fn arg_at(slot: u32, from: Dtype, to: Dtype) -> ScalarExpr {
 /// exactly one zero gives that slot `g * prod(others)` and every other slot
 /// zero; a row with two or more zeros gets exactly zero everywhere.
 ///
-/// Like [`extremum_adjoint`], the running product and the incoming gradient
-/// arrive at the accumulator width, so the body is built there and `x` is
-/// widened into it. `fold_adjoint` narrows the result back.
+/// The body is built at the accumulator width, with `x` widened into it.
 fn product_adjoint(
     tape: &mut dyn Tape,
     x: Val,
@@ -520,9 +458,7 @@ fn product_adjoint(
     let a0 = ScalarExpr::arg(0, dtype);
     let zero_x = crate::tape::lit(0.0, dtype)?;
     let one_x = crate::tape::lit(1.0, dtype)?;
-    // The zero test is on `x` itself, at `x`'s width: a value is zero in f16
-    // exactly when its widening is zero, so testing before or after the cast
-    // gives the same mask.
+    // The zero test is on `x` at its own width; widening preserves zero.
     let is_zero_x = ScalarExpr::cmp(CmpOp::Eq, a0.clone(), zero_x.clone());
 
     let safe = tape.map(
@@ -566,15 +502,11 @@ fn product_adjoint(
     tape.map(body, &[x, bg, bp, bzc])
 }
 
-/// Max/Min adjoint. The policy is read off the op — never assumed.
+/// Max/Min adjoint, using the op's declared [`TiePolicy`].
 ///
-/// The fold's own output lives at the accumulator width, which for f16/bf16
-/// is one step wider than the operand. Everything here is therefore built at
-/// **`out`'s** dtype rather than `x`'s: widening the operand into it is exact,
-/// and the extremum is by construction one of those widened operand values,
-/// so the equality test that finds the argmax stays exact too. `fold_adjoint`
-/// narrows the result back. Where the widths already agree — every f32 graph —
-/// no cast is emitted and the expression trees are unchanged.
+/// Everything is built at `out`'s dtype, the accumulator width: widening the
+/// operand into it is exact, so the equality test that finds the argmax is
+/// exact. No cast is emitted when the widths already agree.
 #[allow(clippy::too_many_arguments)]
 fn extremum_adjoint(
     tape: &mut dyn Tape,
@@ -620,9 +552,6 @@ fn extremum_adjoint(
                 ),
                 &[x, bout],
             )?;
-            // `FirstWins` on the index fold itself: its own adjoint, if
-            // anyone ever takes a second derivative, must not split a tie
-            // between two positions that are equal by construction.
             let facc = tape.dtype_of(pos).compute_dtype();
             let ident = Carrier::binop_identity(BinOp::Min, facc).ok_or_else(|| {
                 Error::Dtype(format!("Min has no identity in {facc:?}"))
@@ -657,11 +586,10 @@ fn sentinel(dtype: Dtype, extent: Dim) -> f32 {
     }
 }
 
-// ------------------------------------------------------------------ shared
 
 /// `Scatter{Add}` a gradient back through an arbitrary index map: flatten,
 /// scatter into a zero base, reshape. The index tensor is a `Map` of
-/// `IndexOf` terms — never a host loop.
+/// `IndexOf` terms.
 fn scatter_back(
     tape: &mut dyn Tape,
     grad: Val,
@@ -825,11 +753,8 @@ mod tests {
         assert!(matches!(t.node(dx).op, Op::L0(L0::Restride { .. })));
     }
 
-    /// `flatten_all` is `dim_with(inner, numel, 1)`, which names only the
-    /// innermost input axis. `invert_runs` sees the outer axes as unread and
-    /// declines; the reshape stage has to catch it, because falling through to
-    /// the index-tensor scatter is what made every `sum_all`-seeded gradient
-    /// wrong past element 0.
+    /// `flatten_all` names only the innermost input axis, so `invert_runs`
+    /// declines and the dense-reshape stage must catch it.
     #[test]
     fn a_merging_reshape_inverts_into_one_restride() {
         for (xshape, view) in [
@@ -911,7 +836,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Trainer constraint 4: a non-overlapping pool's adjoint is a view.
+    /// A non-overlapping pool's adjoint is a view.
     #[test]
     fn a_non_overlapping_window_adjoint_contains_no_scatter() {
         let mut g = graph();
@@ -992,7 +917,7 @@ mod tests {
         assert_eq!(count(g, dx, |op| matches!(op, L0::Scatter { .. })), 0);
     }
 
-    /// Trainer constraint 3: no one-hot matmul anywhere.
+    /// No one-hot matmul anywhere.
     #[test]
     fn gather_adjoint_is_a_scatter_add_with_no_contraction() {
         let mut g = graph();
@@ -1152,8 +1077,8 @@ mod tests {
         let mut t = GraphTape::new(&mut g);
         let dx = fold_adjoint(&mut t, &node, grad, &[x], y).unwrap()[0].unwrap();
         let g = t.graph();
-        // The adjoint recomputes the product over zero-substituted values
-        // rather than reusing the primal's, so `g*p/x` never divides by zero.
+        // The product is recomputed over zero-substituted values, so `g*p/x`
+        // never divides by zero.
         assert_eq!(
             count(g, dx, |op| matches!(
                 op,
@@ -1192,10 +1117,7 @@ mod tests {
         }
     }
 
-    /// A multi-slot carrier has no analytic adjoint here: those carriers are
-    /// minted by the fold laws *after* autograd, and the composed adjoint of
-    /// the chain they replaced is what carries the gradient. An honest `Err`,
-    /// never a silently wrong slot-0 gradient.
+    /// A multi-slot carrier has no analytic adjoint here and returns `Err`.
     #[test]
     fn multi_slot_carrier_folds_are_refused() {
         let mut g = graph();
@@ -1212,8 +1134,7 @@ mod tests {
             Err(Error::Numeric(_))
         ));
 
-        // So is a fold whose lift computes — fusion mints those, also after
-        // autograd.
+        // So is a fold whose lift computes.
         let fused = carrier(BinOp::Add).with_lift([ScalarExpr::un(
             fusor2_ir::scalar::UnOp::Exp,
             ScalarExpr::arg(0, Dtype::F32),
@@ -1231,8 +1152,8 @@ mod tests {
 #[cfg(test)]
 mod numeric {
     //! Every structural adjoint against a central difference of the forward
-    //! it claims to differentiate, plus the exact values the parity bullets
-    //! name where a finite difference cannot see them (ties, zeros).
+    //! it claims to differentiate, plus exact values where a finite
+    //! difference cannot see them (ties, zeros).
 
     use super::*;
     use crate::backward::backward_into;
@@ -1295,9 +1216,7 @@ mod numeric {
         fold_node_acc(g, x, op, tie, axis, Dtype::F32)
     }
 
-    /// A fold whose accumulator may be wider than its operand — the shape the
-    /// runtime always builds for a narrow float, since `accum_dtype` floors
-    /// every f16/bf16 fold at f32.
+    /// A fold whose accumulator may be wider than its operand.
     fn fold_node_acc(
         g: &mut EGraph,
         x: Id,
@@ -1351,7 +1270,7 @@ mod numeric {
         let e = env(&[(x, vec![0.3, -1.2, 2.0, 0.7, 1.1, -0.4, 0.9, 1.5])]);
         check_gradients(&g, m, &[x], &grads, &e, 2e-3);
         // mean over 4 elements: every slot gets exactly 1/4.
-        let analytic = eval(&g, grads[0].unwrap(), &e);
+        let analytic = eval(&g, grads[0], &e);
         assert!(analytic.iter().all(|v| (v - 0.25).abs() < 1e-6));
     }
 
@@ -1366,7 +1285,7 @@ mod numeric {
         let seed = ones(&mut g, &[3, 4]);
         let grads = backward_into(&mut g, &caps(), b, seed, &[x]).unwrap();
         let e = env(&[(x, vec![1.0, 2.0, 3.0, 4.0])]);
-        let analytic = eval(&g, grads[0].unwrap(), &e);
+        let analytic = eval(&g, grads[0], &e);
         assert_eq!(analytic, vec![3.0; 4], "a unit seed sums to 3*g");
         check_gradients(&g, b, &[x], &grads, &e, 2e-3);
     }
@@ -1379,7 +1298,7 @@ mod numeric {
         let seed = ones(&mut g, &[1]);
         let grads = backward_into(&mut g, &caps(), y, seed, &[x]).unwrap();
         let e = env(&[(x, vec![5.0, 5.0, 1.0, 5.0])]);
-        let analytic = eval(&g, grads[0].unwrap(), &e);
+        let analytic = eval(&g, grads[0], &e);
         let third = 1.0 / 3.0;
         for (got, want) in analytic.iter().zip([third, third, 0.0, third]) {
             assert!((got - want).abs() < 1e-6, "{analytic:?}");
@@ -1394,7 +1313,7 @@ mod numeric {
         let seed = ones(&mut g, &[1]);
         let grads = backward_into(&mut g, &caps(), y, seed, &[x]).unwrap();
         let e = env(&[(x, vec![5.0, 5.0, 1.0, 5.0])]);
-        let analytic = eval(&g, grads[0].unwrap(), &e);
+        let analytic = eval(&g, grads[0], &e);
         assert_eq!(analytic, vec![1.0, 0.0, 0.0, 0.0]);
     }
 
@@ -1406,15 +1325,12 @@ mod numeric {
         let seed = ones(&mut g, &[1]);
         let grads = backward_into(&mut g, &caps(), y, seed, &[x]).unwrap();
         let e = env(&[(x, vec![-2.0, 7.0, -2.0])]);
-        let analytic = eval(&g, grads[0].unwrap(), &e);
+        let analytic = eval(&g, grads[0], &e);
         assert_eq!(analytic, vec![0.5, 0.0, 0.5]);
     }
 
-    /// Every narrow float accumulates at `compute_dtype`, so a `max`/`min`
-    /// fold's own output — and the `sum_axis` count the `SplitEvenly` tie
-    /// divides by — come back one width wider than the operand. The adjoint
-    /// must read each operand at the dtype that operand actually has. This is
-    /// the whole of `betlang-train --f16`: its pool is a `max` fold on f16.
+    /// A narrow float accumulates at `compute_dtype`, so the adjoint must read
+    /// each operand at the dtype that operand actually has.
     #[test]
     fn the_extremum_adjoint_reads_a_wider_accumulator_at_its_own_width() {
         for dtype in [Dtype::F16, Dtype::BF16] {
@@ -1428,7 +1344,7 @@ mod numeric {
                     let seed = splat_ones(&mut g, &[1], acc);
                     let grads = backward_into(&mut g, &caps(), y, seed, &[x])
                         .unwrap_or_else(|e| panic!("{dtype:?}/{tie:?}/{op:?} backward: {e}"));
-                    let dx = grads[0].expect("x must receive a gradient");
+                    let dx = grads[0];
                     // The gradient of an f16 value is an f16 value.
                     assert_eq!(g.facts(dx).dtype, dtype, "{dtype:?}/{tie:?}/{op:?}");
                     assert_eq!(g.facts(dx).shape, g.facts(x).shape);
@@ -1437,9 +1353,8 @@ mod numeric {
         }
     }
 
-    /// The narrowing is a property of `fold_adjoint`, not of one branch: every
-    /// carrier it knows how to differentiate hands back a gradient at the
-    /// operand's own width, `Add` and `Mul` included.
+    /// Every carrier `fold_adjoint` differentiates hands back a gradient at the
+    /// operand's own width.
     #[test]
     fn every_fold_carrier_returns_a_gradient_at_the_operands_width() {
         for dtype in [Dtype::F16, Dtype::BF16, Dtype::F32] {
@@ -1451,7 +1366,7 @@ mod numeric {
                 let seed = splat_ones(&mut g, &[1], acc);
                 let grads = backward_into(&mut g, &caps(), y, seed, &[x])
                     .unwrap_or_else(|e| panic!("{dtype:?}/{op:?} backward: {e}"));
-                let dx = grads[0].expect("x must receive a gradient");
+                let dx = grads[0];
                 assert_eq!(g.facts(dx).dtype, dtype, "{dtype:?}/{op:?}");
             }
         }
@@ -1461,13 +1376,8 @@ mod numeric {
     /// every `Select` offers two arms of the same width. Returns the first
     /// violation.
     ///
-    /// `check_arg_dtypes` cannot see any of this: it checks only that each
-    /// `Arg(i)` leaf is *declared* at operand `i`'s dtype, and a body reading
-    /// an f16 arg and an f32 arg satisfies that while still asking an emitter
-    /// to compare two different widths. `ScalarExpr::bin` and `::cmp` take
-    /// their result dtype from `a` alone and `::select` from `t` alone, so a
-    /// mixed-width node is silently constructible and then silently mistyped
-    /// downstream.
+    /// `ScalarExpr::bin`/`::cmp` take their result dtype from `a` alone and
+    /// `::select` from `t` alone, so a mixed-width node is constructible.
     fn width_mismatch(e: &ScalarExpr) -> Option<String> {
         use fusor2_ir::scalar::ScalarKind as K;
         let pair = |what: &str, a: &ScalarExpr, b: &ScalarExpr| {
@@ -1494,10 +1404,7 @@ mod numeric {
     }
 
     /// No adjoint this file builds may hand an emitter a mixed-width
-    /// expression. This is what the widening cast on the operand side buys:
-    /// the verifier only type-checks `Arg` leaves, so without it an f16 `x`
-    /// gets compared against an f32 fold output inside one `Cmp` and nothing
-    /// downstream of `check_arg_dtypes` objects.
+    /// expression; `check_arg_dtypes` type-checks only `Arg` leaves.
     #[test]
     fn no_fold_adjoint_builds_a_mixed_width_expression() {
         for dtype in [Dtype::F16, Dtype::BF16, Dtype::F32] {
@@ -1509,7 +1416,7 @@ mod numeric {
                     let y = fold_node_acc(&mut g, x, op, tie, 1, acc);
                     let seed = splat_ones(&mut g, &[1], acc);
                     let grads = backward_into(&mut g, &caps(), y, seed, &[x]).unwrap();
-                    let dx = grads[0].unwrap();
+                    let dx = grads[0];
                     // Every node up to `dx` — the adjoint chain is the tail of
                     // the graph, so scanning all of it also covers the forward.
                     for i in 0..=dx.0 {
@@ -1524,8 +1431,8 @@ mod numeric {
         }
     }
 
-    /// The f16 product rule by value, since a finite difference cannot see the
-    /// zero cases: the widened accumulator must not change which branch fires.
+    /// The f16 product rule by value; a finite difference cannot see the zero
+    /// cases.
     #[test]
     fn a_narrow_product_rule_still_handles_zeros() {
         for (row, want) in [
@@ -1539,14 +1446,13 @@ mod numeric {
             let seed = splat_ones(&mut g, &[1], Dtype::F32);
             let grads = backward_into(&mut g, &caps(), y, seed, &[x]).unwrap();
             let e = env(&[(x, row.clone())]);
-            let analytic = eval(&g, grads[0].unwrap(), &e);
+            let analytic = eval(&g, grads[0], &e);
             assert_eq!(analytic, want, "row {row:?}");
         }
     }
 
-    /// The same widening on the operand side of the fold rather than the
-    /// accumulator side: `sum_axis` inside the `SplitEvenly` branch folds the
-    /// mask, and the mask is at the mask's dtype, not the tensor's.
+    /// `sum_axis` inside the `SplitEvenly` branch folds the mask at the mask's
+    /// dtype, not the tensor's.
     #[test]
     fn a_narrow_max_gradient_still_splits_a_tie_evenly() {
         let mut g = graph();
@@ -1555,7 +1461,7 @@ mod numeric {
         let seed = splat_ones(&mut g, &[1], Dtype::F32);
         let grads = backward_into(&mut g, &caps(), y, seed, &[x]).unwrap();
         let e = env(&[(x, vec![5.0, 5.0, 1.0, 5.0])]);
-        let analytic = eval(&g, grads[0].unwrap(), &e);
+        let analytic = eval(&g, grads[0], &e);
         let third = 1.0 / 3.0;
         for (got, want) in analytic.iter().zip([third, third, 0.0, third]) {
             assert!((got - want).abs() < 1e-3, "{analytic:?}");
@@ -1572,13 +1478,12 @@ mod numeric {
         let seed = splat_ones(&mut g, &[1], Dtype::F32);
         let grads = backward_into(&mut g, &caps(), y, seed, &[x]).unwrap();
         let e = env(&[(x, vec![5.0, 5.0, 1.0, 5.0])]);
-        let analytic = eval(&g, grads[0].unwrap(), &e);
+        let analytic = eval(&g, grads[0], &e);
         assert_eq!(analytic, vec![1.0, 0.0, 0.0, 0.0]);
     }
 
-    /// The narrowing is a consequence of the *fold's* widening, never a blanket
-    /// cast: an adjoint whose operands genuinely disagree in dtype for any
-    /// other reason must still be rejected by `check_arg_dtypes`.
+    /// An operand dtype disagreement that is not the accumulator's widening is
+    /// still rejected by `check_arg_dtypes`.
     #[test]
     fn a_dtype_disagreement_that_is_not_the_accumulator_is_still_an_error() {
         let mut g = graph();
@@ -1609,7 +1514,7 @@ mod numeric {
             let seed = ones(&mut g, &[1]);
             let grads = backward_into(&mut g, &caps(), y, seed, &[x]).unwrap();
             let e = env(&[(x, row.clone())]);
-            let analytic = eval(&g, grads[0].unwrap(), &e);
+            let analytic = eval(&g, grads[0], &e);
             for (got, exp) in analytic.iter().zip(&want) {
                 assert!(
                     (got - exp).abs() < 1e-5,
@@ -1619,7 +1524,7 @@ mod numeric {
         }
     }
 
-    /// Trainer constraint 3, numerically: the same bin twice gets the sum.
+    /// The same bin hit twice gets the sum.
     #[test]
     fn a_duplicated_gather_index_accumulates_both_gradients() {
         let mut g = graph();
@@ -1640,13 +1545,13 @@ mod numeric {
             (idx, vec![1.0, 3.0, 1.0]),
             (w, vec![1.0, 2.0, 10.0, 20.0, 100.0, 200.0]),
         ]);
-        let analytic = eval(&g, grads[0].unwrap(), &e);
+        let analytic = eval(&g, grads[0], &e);
         // bin 1 is hit by rows 0 and 2: 1 + 100 and 2 + 200.
         assert_eq!(analytic, vec![0.0, 0.0, 101.0, 202.0, 0.0, 0.0, 10.0, 20.0]);
     }
 
-    /// Trainer constraint 4, numerically: a non-overlapping pool routes each
-    /// gradient to its argmax slot, through a chain with no scatter.
+    /// A non-overlapping pool routes each gradient to its argmax slot,
+    /// through a chain with no scatter.
     #[test]
     fn a_non_overlapping_pool_routes_the_gradient_to_the_argmax() {
         let mut g = graph();
@@ -1662,7 +1567,7 @@ mod numeric {
         let seed = ones(&mut g, &[1, 2]);
         let grads = backward_into(&mut g, &caps(), pooled, seed, &[x]).unwrap();
         let e = env(&[(x, vec![1.0, 9.0, 2.0, 4.0, 3.0, 8.0])]);
-        let analytic = eval(&g, grads[0].unwrap(), &e);
+        let analytic = eval(&g, grads[0], &e);
         assert_eq!(analytic, vec![0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
     }
 
@@ -1679,7 +1584,7 @@ mod numeric {
         let seed = ones(&mut g, &[3, 3]);
         let grads = backward_into(&mut g, &caps(), win, seed, &[x]).unwrap();
         let e = env(&[(x, vec![0.0; 5])]);
-        let analytic = eval(&g, grads[0].unwrap(), &e);
+        let analytic = eval(&g, grads[0], &e);
         // Element k appears in min(k, 2, 4-k) + 1 windows.
         assert_eq!(analytic, vec![1.0, 2.0, 3.0, 2.0, 1.0]);
     }
@@ -1707,8 +1612,8 @@ mod numeric {
             (upd, vec![0.0; 2]),
             (idx, vec![1.0, 3.0]),
         ]);
-        let d_base = eval(&g, grads[0].unwrap(), &e);
-        let d_upd = eval(&g, grads[1].unwrap(), &e);
+        let d_base = eval(&g, grads[0], &e);
+        let d_upd = eval(&g, grads[1], &e);
         assert_eq!(d_base, vec![1.0, 0.0, 1.0, 0.0, 1.0], "the region is zeroed");
         assert_eq!(d_upd, vec![1.0, 1.0], "the value gets its slice");
     }
@@ -1747,7 +1652,7 @@ mod numeric {
         let grads = backward_into(&mut g, &caps(), y, seed, &[x]).unwrap();
         let e = env(&[(x, vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6])]);
         check_gradients(&g, y, &[x], &grads, &e, 2e-3);
-        let analytic = eval(&g, grads[0].unwrap(), &e);
+        let analytic = eval(&g, grads[0], &e);
         assert_eq!(&analytic[..2], &[0.0, 0.0], "the unread prefix gets zero");
     }
 
@@ -1793,7 +1698,7 @@ mod numeric {
         };
         let seed = ones(&mut g, &[4]);
         let grads = backward_into(&mut g, &caps(), y, seed, &[x]).unwrap();
-        let dx = grads[0].unwrap();
+        let dx = grads[0];
         assert_eq!(g.facts(dx).dtype, Dtype::F32, "the gradient lands in f32");
         let e = env(&[(x, vec![0.5, 1.5, -2.25, 3.0])]);
         let analytic = eval(&g, dx, &e);
@@ -1819,9 +1724,9 @@ mod numeric {
             (t_val, vec![0.0; 4]),
             (f_val, vec![0.0; 4]),
         ]);
-        assert_eq!(eval(&g, grads[0].unwrap(), &e), vec![0.0; 4]);
-        assert_eq!(eval(&g, grads[1].unwrap(), &e), vec![1.0, 0.0, 1.0, 0.0]);
-        assert_eq!(eval(&g, grads[2].unwrap(), &e), vec![0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(eval(&g, grads[0], &e), vec![0.0; 4]);
+        assert_eq!(eval(&g, grads[1], &e), vec![1.0, 0.0, 1.0, 0.0]);
+        assert_eq!(eval(&g, grads[2], &e), vec![0.0, 1.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -1842,6 +1747,6 @@ mod numeric {
         let seed = ones(&mut g, &[4]);
         let grads = backward_into(&mut g, &caps(), y, seed, &[x]).unwrap();
         let e = env(&[(x, vec![-3.0, 0.0, 1.5, 9.0])]);
-        assert_eq!(eval(&g, grads[0].unwrap(), &e), vec![0.0, 1.0, 1.0, 0.0]);
+        assert_eq!(eval(&g, grads[0], &e), vec![0.0, 1.0, 1.0, 0.0]);
     }
 }

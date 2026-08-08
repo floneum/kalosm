@@ -3,13 +3,10 @@
 //! naga IR is already an IR, so there is no target dialect between L2 and it:
 //! a dialect there would host zero rewrite rules.
 //!
-//! Structure mirrors `tile-ir/src/lower/{mod,setup,block}.rs`: one up-front
-//! [`Analysis`] walk decides every capability the module will declare *before*
-//! a single expression is lowered. Gating f16 here rather than lazily is what
-//! makes an f16 handle on a non-f16 adapter fail with
+//! One up-front [`Analysis`] walk decides every capability the module will
+//! declare *before* a single expression is lowered. Gating f16 here rather
+//! than lazily is what makes an f16 handle on a non-f16 adapter fail with
 //! [`EmitError::MissingCapability`] instead of mis-lowering.
-//!
-//! Owned by W8.
 
 pub mod coop;
 pub mod expr;
@@ -69,8 +66,8 @@ pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<naga::Module, EmitError> {
     Ok(emit_module(ir, caps, &plan)?.module)
 }
 
-/// Emit with a plan the caller already has. W9 uses this: it holds the plan
-/// from admission and must not recompute it.
+/// Emit with a plan the caller already has, for callers holding the plan from
+/// admission that must not recompute it.
 pub fn emit_module(
     ir: &KernelIr,
     caps: &Caps,
@@ -79,9 +76,7 @@ pub fn emit_module(
     Emitter::new(ir, caps, plan)?.finish()
 }
 
-// ---------------------------------------------------------------------------
 // Analysis
-// ---------------------------------------------------------------------------
 
 /// One walk of the whole body, run before any expression is lowered. Everything
 /// the module declares — types, entry-point arguments, atomic buffer types and
@@ -431,9 +426,7 @@ pub(crate) fn key<T>(v: &std::sync::Arc<T>) -> usize {
     std::sync::Arc::as_ptr(v) as *const () as usize
 }
 
-// ---------------------------------------------------------------------------
 // Scratch
-// ---------------------------------------------------------------------------
 
 /// Demand-allocated private scratch kinds, interned by
 /// `(kind, element, depth)`. Only keys that are actually used allocate.
@@ -448,9 +441,7 @@ pub enum ScratchKind {
     Atomic,
 }
 
-// ---------------------------------------------------------------------------
 // Emitter
-// ---------------------------------------------------------------------------
 
 /// Per-kernel emission state: the naga arenas plus the L2 -> naga handle maps.
 pub struct Emitter<'a> {
@@ -479,9 +470,8 @@ pub struct Emitter<'a> {
     /// spilling through a [`Self::scratch`] local.
     pub(crate) forced_names: Vec<(naga::Handle<naga::Expression>, String)>,
     /// Hash-consed expression memo. `TileExpr: Hash + Eq` is O(1) through its
-    /// cached structural hash; this is precisely why the `Shared` node was
-    /// deleted — two identical subtrees built separately merge here, which
-    /// `Rc::as_ptr` memoization structurally cannot do.
+    /// cached structural hash, so two identical subtrees built separately
+    /// merge here — which pointer-identity memoization cannot do.
     ///
     /// Each entry carries the [`Self::mem_epoch`] it was created at. A key
     /// that reads memory is a hit only while every space it reads is still at
@@ -683,9 +673,7 @@ fn builtin_arg(ty: naga::Handle<naga::Type>, builtin: naga::BuiltIn) -> naga::Fu
     }
 }
 
-// ---------------------------------------------------------------------------
 // Test kit
-// ---------------------------------------------------------------------------
 
 /// Fixture builders and a minimal dispatcher, shared by every emit test in
 /// this crate. Test-only: nothing here is compiled into a release build, and
@@ -894,8 +882,6 @@ pub(crate) mod testkit {
             .count()
     }
 
-    // ---- live dispatch -------------------------------------------------
-
     /// A device probed exactly the way the shipped path probes it.
     pub fn gpu() -> Option<crate::device::GpuDevice> {
         crate::device::gpu_blocking(&crate::device::DeviceOptions::default()).ok()
@@ -968,8 +954,7 @@ pub(crate) mod testkit {
                 buffer
             })
             .collect();
-        let bind_entries =
-            crate::bindings::zip_buffers(&emitted.bindings, &buffers).expect("zip buffers");
+        let bind_entries = zip_buffers(&emitted.bindings, &buffers).expect("zip buffers");
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &layout,
@@ -1022,6 +1007,49 @@ pub(crate) mod testkit {
     /// Binding 0 is always the read-only `Uniforms` storage buffer.
     pub fn uniforms() -> Vec<u8> {
         vec![0u8; 16]
+    }
+
+    /// Zip a derived binding list positionally with the caller's buffers.
+    ///
+    /// **Binding 0 is always the read-only `Uniforms` storage buffer.** A
+    /// module whose binding 0 is writable is rejected here rather than at
+    /// dispatch, and a length mismatch is a validation failure, never a
+    /// silent truncation.
+    pub fn zip_buffers<'a>(
+        slots: &[crate::bindings::BindingDesc],
+        buffers: &'a [wgpu::Buffer],
+    ) -> Result<Vec<wgpu::BindGroupEntry<'a>>, EmitError> {
+        check_uniform_binding(slots)?;
+        if slots.len() != buffers.len() {
+            return Err(EmitError::Validation(format!(
+                "{} derived bindings against {} buffers",
+                slots.len(),
+                buffers.len()
+            )));
+        }
+        Ok(slots
+            .iter()
+            .zip(buffers)
+            .map(|(slot, buffer)| wgpu::BindGroupEntry {
+                binding: slot.binding,
+                resource: buffer.as_entire_binding(),
+            })
+            .collect())
+    }
+
+    /// Assert the `Uniforms` invariant: binding 0 exists and is read-only.
+    pub fn check_uniform_binding(
+        slots: &[crate::bindings::BindingDesc],
+    ) -> Result<(), EmitError> {
+        match slots.first() {
+            Some(first) if first.binding == 0 && first.read_only => Ok(()),
+            Some(first) if first.binding == 0 => Err(EmitError::Validation(
+                "binding 0 is the Uniforms block and must be read-only".into(),
+            )),
+            Some(_) | None => Err(EmitError::Validation(
+                "binding 0 must be the Uniforms storage buffer".into(),
+            )),
+        }
     }
 }
 
@@ -1150,7 +1178,7 @@ mod tests {
         )
     }
 
-    /// Test 6 — one `main`, the right workgroup size, the right argument list.
+    /// One `main`, the right workgroup size, the right argument list.
     #[test]
     fn every_module_has_one_main() {
         let caps = caps(false, true);
@@ -1214,7 +1242,7 @@ mod tests {
         );
     }
 
-    /// Test 4 — f16 is gated up front, not lazily.
+    /// f16 is gated up front, not lazily.
     #[test]
     fn f16_without_capability_is_unsupported() {
         let uni = buffer(0, u32e(), 4, false);
@@ -1255,7 +1283,7 @@ mod tests {
         })
     }
 
-    /// Test 13 — the type arena is deterministic.
+    /// The type arena is deterministic.
     #[test]
     fn type_arena_is_deterministic() {
         let caps = caps(false, true);
@@ -1275,7 +1303,7 @@ mod tests {
         assert_eq!(format!("{x:#?}"), format!("{y:#?}"));
     }
 
-    /// Test 12 — the byte arena is a footprint choice, never a numeric one.
+    /// The byte arena is a footprint choice, never a numeric one.
     #[test]
     fn byte_arena_absence_is_only_footprint() {
         let (ir, a, b) = two_tiles();

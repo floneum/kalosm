@@ -1,11 +1,8 @@
 //! [`GpuTarget`] — the [`Target`] implementation tying device, lowering,
-//! emission, the pool, the plan cache and the launcher together.
-//!
-//! Owned by W9.
+//! emission, the pool, the artifact cache and the launcher together.
 
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,7 +25,6 @@ use crate::launch::{
     BuildCursor, CommandRecord, GpuArtifact, KernelProfile, Launcher,
     should_parallelize_build_remainder,
 };
-use crate::plan_cache::PlanCache;
 use crate::pool::BufferPool;
 use crate::uniforms::UniformPack;
 
@@ -42,15 +38,13 @@ pub struct GpuConfig {
     /// Pre-fill fresh allocations with `0xCD` so a zero-init assumption fails
     /// loudly instead of reading the last tenant's bytes.
     pub poison_allocations: bool,
-    /// Back-pressure window. **This is the `--drain-every` replacement**: the
-    /// runtime blocks when more than this many submissions are outstanding, so
-    /// a training script never counts steps by hand.
+    /// Back-pressure window: the runtime blocks when more than this many
+    /// submissions are outstanding, so a training script never counts steps by
+    /// hand.
     pub max_in_flight_submits: usize,
     /// Allocate a timestamp query set and fold the samples into
     /// [`KernelProfile`]s.
     pub trace_gpu_kernels: bool,
-    /// Root of the on-disk plan tier; `None` disables it.
-    pub cache_dir: Option<PathBuf>,
 }
 
 impl Default for GpuConfig {
@@ -60,22 +54,8 @@ impl Default for GpuConfig {
             poison_allocations: false,
             max_in_flight_submits: 8,
             trace_gpu_kernels: false,
-            cache_dir: default_cache_dir(),
         }
     }
-}
-
-fn default_cache_dir() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        return Some(PathBuf::from(xdg));
-    }
-    let home = std::env::var_os("HOME")?;
-    let home = PathBuf::from(home);
-    Some(if cfg!(target_vendor = "apple") {
-        home.join("Library").join("Caches")
-    } else {
-        home.join(".cache")
-    })
 }
 
 /// Live compiled pipelines retained per target. A transformer training step's
@@ -101,10 +81,21 @@ struct ArtifactKey {
     dims: u64,
 }
 
-fn artifact_key(plan: &Plan, launch: &Launch, binds: &BindingEnv) -> ArtifactKey {
+fn artifact_key(plan: &Plan, launch: &Launch, tail: u64, dims: u64) -> ArtifactKey {
     let mut lh = FxHasher::default();
     launch.hash(&mut lh);
+    ArtifactKey {
+        plan: plan.hash,
+        launch: lh.finish(),
+        tail,
+        dims,
+    }
+}
 
+/// The resolve-invariant halves of [`ArtifactKey`]: `Plan::buffers` +
+/// `Plan::symbols`, and the bound extents. Hashed once per resolve, not once
+/// per launch.
+fn resolve_key_parts(plan: &Plan, binds: &BindingEnv) -> (u64, u64) {
     let mut th = FxHasher::default();
     plan.buffers.hash(&mut th);
     plan.symbols.hash(&mut th);
@@ -118,20 +109,13 @@ fn artifact_key(plan: &Plan, launch: &Launch, binds: &BindingEnv) -> ArtifactKey
         dh.write_u64(*value);
         dims = dims.wrapping_add(dh.finish());
     }
-
-    ArtifactKey {
-        plan: plan.hash,
-        launch: lh.finish(),
-        tail: th.finish(),
-        dims,
-    }
+    (th.finish(), dims)
 }
 
 /// The wgpu backend.
 pub struct GpuTarget {
     device: Arc<GpuDevice>,
     pool: BufferPool,
-    cache: PlanCache,
     artifacts: parking_lot::Mutex<lru::LruCache<ArtifactKey, (Artifact, [u32; 3])>>,
     launcher: Launcher,
     config: GpuConfig,
@@ -148,19 +132,16 @@ impl GpuTarget {
         Self::from_device(device, config)
     }
 
-    /// Build over an already-requested device. This is the entry point W8's
-    /// `DeviceSetup` feeds.
+    /// Build over an already-requested device.
     pub fn from_device(device: Arc<GpuDevice>, config: GpuConfig) -> Result<Self> {
         let wgpu_device = Arc::new(device.device().clone());
         let queue = Arc::new(device.queue().clone());
         let backend = device.adapter().get_info().backend;
         let pool = BufferPool::new(wgpu_device.clone(), queue.clone(), &config);
-        let cache = PlanCache::with_facts(device.facts(), config.cache_dir.clone());
         let launcher = Launcher::new(wgpu_device, queue, backend, config.clone());
         Ok(Self {
             device,
             pool,
-            cache,
             artifacts: parking_lot::Mutex::new(lru::LruCache::new(
                 NonZeroUsize::new(ARTIFACT_CAPACITY).expect("ARTIFACT_CAPACITY is nonzero"),
             )),
@@ -180,9 +161,6 @@ impl GpuTarget {
     pub fn pool(&self) -> &BufferPool {
         &self.pool
     }
-    pub fn plan_cache(&self) -> &PlanCache {
-        &self.cache
-    }
     pub fn launcher(&self) -> &Launcher {
         &self.launcher
     }
@@ -194,9 +172,8 @@ impl GpuTarget {
         self.launcher.take_kernel_profiles()
     }
 
-    /// The plan **is** the cache key. There is no `hash_kernel_fields`, no
-    /// `kernel_cache_key_with_dispatch` and no golden byte file, so a new
-    /// decision variable cannot be forgotten in one of four hash recipes.
+    /// The plan **is** the cache key: one hash recipe, so a new decision
+    /// variable cannot be forgotten in some other one.
     pub const fn plan_key(&self, plan: &Plan) -> PlanHash {
         plan.hash
     }
@@ -214,17 +191,18 @@ impl GpuTarget {
     /// 1. **Serial, plan order** — bind buffers per `Launch::bindings` (binding
     ///    0 is the uniform block), allocate outputs from `Plan::buffers`
     ///    through the pool, resolve grids.
-    /// 2. **Parallel** — plan-cache lookup by [`PlanHash`], else lower, verify
-    ///    L2, emit and create the pipeline. A serial probe runs first so a warm
-    ///    cache never touches the thread pool.
+    /// 2. **Parallel** — artifact-cache lookup by [`ArtifactKey`], else lower,
+    ///    verify L2, emit and create the pipeline. A serial probe runs first so
+    ///    a warm cache never touches the thread pool.
     /// 3. **Serial, exact plan order** — push command records and release
     ///    consumed buffers.
     pub fn resolve(&self, plan: &Plan, graph: &EGraph, binds: &BindingEnv) -> Result<()> {
         let start = Instant::now();
+        let (key_tail, key_dims) = resolve_key_parts(plan, binds);
         let pack = UniformPack::new(plan);
         let uniforms = pack.fill(plan, &binds.dims, &binds.scalars)?;
 
-        // ---- Phase 1: serial, plan order --------------------------------
+        // Allocate and upload uniforms in plan order.
         let uniform_buf = self
             .pool
             .alloc_with_usage(pack.byte_len(), crate::pool::TENSOR_USAGE)?;
@@ -251,30 +229,33 @@ impl GpuTarget {
 
         let mut work: Vec<LaunchWork> = Vec::with_capacity(plan.launches.len());
         for launch in &plan.launches {
-            let mut ordered: Vec<_> = launch.bindings.iter().collect();
-            ordered.sort_by_key(|b| b.binding);
-            let mut buffers = Vec::with_capacity(ordered.len() + 1);
+            // `derive_bindings` is the only producer of `Launch::bindings` and
+            // emits them in ascending binding order.
+            debug_assert!(launch.bindings.windows(2).all(|w| w[0].binding < w[1].binding));
+            let mut buffers = Vec::with_capacity(launch.bindings.len() + 1);
             buffers.push(uniform_buf.clone());
-            for b in &ordered {
+            for b in &launch.bindings {
                 let buf = resolved.get(&b.value).cloned().ok_or_else(|| {
                     Error::Plan(format!("launch binds {} which the plan never allocates", b.value))
                 })?;
                 buffers.push(buf);
             }
             work.push(LaunchWork {
-                root: launch.root,
                 grid: launch.grid,
                 buffers,
                 artifact: None,
             });
         }
 
-        // ---- Phase 2: build, serially probing then in parallel -----------
+        // Build the queue: probe serially, then cut over to parallel.
+        // `work[i]` was built from `plan.launches[i]`, so the index carries
+        // the launch identity through both build passes.
         let queue_len = work.len();
         let mut cutover = queue_len;
         for i in 0..queue_len {
             let began = Instant::now();
-            let (artifact, grid) = self.build_one(plan, graph, &work[i], binds)?;
+            let (artifact, grid) =
+                self.build_one(plan, graph, &plan.launches[i], binds, key_tail, key_dims)?;
             work[i].artifact = Some(artifact);
             work[i].grid = grid;
             let remaining = queue_len - i - 1;
@@ -299,7 +280,14 @@ impl GpuTarget {
                 for _ in 0..threads {
                     scope.spawn(|| {
                         while let Some(i) = cursor.take(len) {
-                            let built = self.build_one(plan, graph, &tail_ref(tail, i), binds);
+                            let built = self.build_one(
+                                plan,
+                                graph,
+                                &plan.launches[cutover + i],
+                                binds,
+                                key_tail,
+                                key_dims,
+                            );
                             *results[i].0.lock() = Some(built);
                         }
                     });
@@ -315,7 +303,7 @@ impl GpuTarget {
             }
         }
 
-        // ---- Phase 3: serial, exact plan order ---------------------------
+        // Record dispatches serially, in exact plan order.
         let total = work.len();
         let query_set = self.launcher.timestamp_query_set(total);
         let mut records = Vec::with_capacity(total);
@@ -404,15 +392,12 @@ impl GpuTarget {
         &self,
         plan: &Plan,
         graph: &EGraph,
-        item: &LaunchWork,
+        launch: &Launch,
         binds: &BindingEnv,
+        key_tail: u64,
+        key_dims: u64,
     ) -> Result<(Artifact, [u32; 3])> {
-        let launch = plan
-            .launches
-            .iter()
-            .find(|l| l.root == item.root)
-            .ok_or_else(|| Error::Plan(format!("no launch roots at {}", item.root)))?;
-        let key = artifact_key(plan, launch, binds);
+        let key = artifact_key(plan, launch, key_tail, key_dims);
         if let Some(hit) = self.artifacts.lock().get(&key).cloned() {
             return Ok(hit);
         }
@@ -453,17 +438,7 @@ impl GpuTarget {
 #[derive(Default)]
 struct Mutexed(parking_lot::Mutex<Option<Result<(Artifact, [u32; 3])>>>);
 
-fn tail_ref<'a>(tail: &'a [LaunchWork], i: usize) -> LaunchWork {
-    LaunchWork {
-        root: tail[i].root,
-        grid: tail[i].grid,
-        buffers: tail[i].buffers.clone(),
-        artifact: None,
-    }
-}
-
 struct LaunchWork {
-    root: Id,
     grid: [u32; 3],
     buffers: Vec<Buf>,
     artifact: Option<Artifact>,
@@ -613,14 +588,5 @@ mod tests {
         assert_eq!(env.dim(fusor2_ir::shape::Dim::Const(7)), Some(7));
         assert_eq!(env.dim(fusor2_ir::shape::Dim::Sym(SymId(99))), None);
         assert_eq!(env.scalars.get(&lr).copied(), Some(1e-3));
-    }
-
-    #[test]
-    fn the_cache_dir_is_platform_shaped() {
-        // Not asserting a specific path: only that a home-relative default
-        // exists wherever HOME does, so the disk tier is on by default.
-        if std::env::var_os("HOME").is_some() || std::env::var_os("XDG_CACHE_HOME").is_some() {
-            assert!(default_cache_dir().is_some());
-        }
     }
 }

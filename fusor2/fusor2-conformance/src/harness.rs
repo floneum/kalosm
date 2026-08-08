@@ -1,13 +1,9 @@
 //! The test harness: build one named case, run it on every available backend,
 //! report rather than panic.
 //!
-//! Cases return `Err` instead of asserting because the browser conformance
-//! runner cannot recover from a wasm panic, and because a half-built backend
-//! should surface as a named failure rather than aborting the whole matrix.
-//! That is also why [`run_one`] wraps each case in `catch_unwind`: an
-//! unfinished op in a dependency is one red row, not a dead run.
-//!
-//! Owned by W14.
+//! Cases return `Err` instead of asserting: the browser runner cannot recover
+//! from a wasm panic. [`run_one`] wraps each case in `catch_unwind`, so a
+//! panic is one failed row rather than a dead run.
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -15,10 +11,6 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use fusor2::graph::GraphRef;
 use fusor2::{Device, Dim, Dtype, Session, Tensor};
-
-// ---------------------------------------------------------------------------
-// Case results and the `ensure!` family
-// ---------------------------------------------------------------------------
 
 /// Error returned by a conformance case. Boxed so a case can return a
 /// comparison mismatch or a free-form message uniformly.
@@ -97,10 +89,6 @@ macro_rules! ensure_ne {
         }
     }};
 }
-
-// ---------------------------------------------------------------------------
-// Cases
-// ---------------------------------------------------------------------------
 
 /// The body of a case. `Fn` rather than `FnOnce` so one case runs on every
 /// session in [`sessions`] without being rebuilt per backend.
@@ -183,8 +171,7 @@ impl Cases {
         self.0.iter()
     }
 
-    /// The names, in registration order. The acceptance bar is "every case in
-    /// the named list is present", so this is asserted on directly.
+    /// The names, in registration order.
     pub fn names(&self) -> Vec<&str> {
         self.0.iter().map(|c| c.name.as_str()).collect()
     }
@@ -197,23 +184,6 @@ impl IntoIterator for Cases {
         self.0.into_iter()
     }
 }
-
-/// Build one case per row of a table. The shape every area file uses.
-pub fn cases_from_rows<T: Send + Sync + 'static>(
-    area: &'static str,
-    rows: impl IntoIterator<Item = (&'static str, T)>,
-    body: impl Fn(&Session, &T) -> CaseResult + Copy + Send + Sync + 'static,
-) -> Cases {
-    let mut cases = Cases::new();
-    for (name, row) in rows {
-        cases.push(area, name, move |s| body(s, &row));
-    }
-    cases
-}
-
-// ---------------------------------------------------------------------------
-// Sessions
-// ---------------------------------------------------------------------------
 
 fn require_gpu() -> bool {
     std::env::var("FUSOR2_CONFORMANCE_REQUIRE_GPU")
@@ -239,12 +209,10 @@ fn acquire_gpu() -> Option<Device> {
 
 /// Acquire the GPU device; `None` means none is available.
 ///
-/// In the browser the full suite runs hundreds of cases that each ask for a
-/// device, and acquiring a fresh wgpu device per case is prohibitively slow,
-/// so the handle is memoized for the life of the page. Natively the cache is
-/// skipped: a thread-local holding a wgpu `Device` panics when dropped during
-/// thread teardown (wgpu's `Drop` touches already-destroyed thread-locals),
-/// and re-acquiring per run is cheap enough off the web.
+/// On wasm the handle is memoized for the life of the page, since acquiring a
+/// device per case is prohibitively slow. Natively it is not: a thread-local
+/// holding a wgpu `Device` panics when dropped during thread teardown, because
+/// wgpu's `Drop` touches already-destroyed thread-locals.
 #[cfg(not(target_arch = "wasm32"))]
 fn cached_gpu() -> Option<Device> {
     acquire_gpu()
@@ -299,23 +267,14 @@ pub fn gpu_test_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-// ---------------------------------------------------------------------------
-// Deterministic data
-// ---------------------------------------------------------------------------
-
-/// The LCG every golden depends on. Changing a single constant here
-/// invalidates every recorded output hash, which is why it lives in exactly
-/// one place and is never re-derived.
+/// The LCG every golden depends on; changing a constant here invalidates every
+/// recorded output hash.
 ///
 /// `state = state * 6364136223846793005 + 1442695040888963407`, value
-/// `((state >> 33) as f32 / 2^31) - 0.5`.
+/// `((state >> 33) as f32 / 2^31) - 0.5`, in `[-0.5, 0.5)`.
 ///
-/// The seed enters the state unmodified. Forcing the low bit (`seed | 1`)
-/// would fold every even seed onto its odd successor, so `fill(4, ..)` and
-/// `fill(5, ..)` would be the same stream — and a case table that draws its
-/// two operands from consecutive seeds would silently be testing `f(x, x)`.
-/// The increment is nonzero, so state 0 is not a fixed point and needs no
-/// special casing.
+/// The seed enters the state unmodified, so distinct seeds give distinct
+/// streams.
 pub fn fill(seed: u32, len: usize) -> Vec<f32> {
     let mut state = seed as u64;
     (0..len)
@@ -337,18 +296,8 @@ pub fn fill_range(seed: u32, len: usize, lo: f32, hi: f32) -> Vec<f32> {
         .collect()
 }
 
-/// `len` indices in `[0, modulus)`, from the same generator.
-pub fn fill_indices(seed: u32, len: usize, modulus: u32) -> Vec<u32> {
-    let modulus = modulus.max(1);
-    fill(seed, len)
-        .into_iter()
-        .map(|v| (((v + 0.5) * modulus as f32) as u32) % modulus)
-        .collect()
-}
-
-/// Element count of a fully constant shape. Panics on a symbolic extent: the
-/// host-side references need a concrete length, and a `Dim::Sym` here is a
-/// bug in the case rather than in the compiler.
+/// Element count of a fully constant shape. Panics on a symbolic extent, which
+/// the host-side references cannot size.
 pub fn dense_len(shape: &[Dim]) -> usize {
     shape
         .iter()
@@ -383,10 +332,6 @@ pub fn from_u32(graph: &GraphRef, shape: &[Dim], data: &[u32]) -> fusor2::Result
     Tensor::from_slice(graph, Dtype::U32, shape, &bytes)
 }
 
-// ---------------------------------------------------------------------------
-// Running
-// ---------------------------------------------------------------------------
-
 /// Outcome of one case on one backend.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
@@ -410,12 +355,8 @@ impl Outcome {
 /// The marker a case body puts at the front of its error to say "this device
 /// cannot run this row" rather than "this row is wrong".
 ///
-/// A case returns `Result<(), CaseError>` and has no third variant, so the
-/// alternative would be for every capability-gated row to return `Ok(())` on a
-/// device that never ran it — and a skipped f16 matrix would read as a passing
-/// one. Prefixing instead keeps the case signature and lets [`guard`] sort the
-/// two apart, so a run on a device without bf16 reports `skip`, not `ok` and
-/// not `FAILED`.
+/// [`guard`] sorts the two apart, so a run on a device without bf16 reports
+/// `skip` rather than `ok` or `FAILED`.
 pub const SKIP_PREFIX: &str = "skipped: ";
 
 /// Build the `Err` that [`guard`] turns into [`Outcome::Skipped`].
@@ -449,10 +390,8 @@ fn backend_name(session: &Session) -> &'static str {
 }
 
 /// Run a case body, converting a panic into a failure message and a
-/// [`SKIP_PREFIX`] error into [`Outcome::Skipped`].
-///
-/// A panic is never a skip, however it is worded: an unfinished op elsewhere
-/// in the workspace must stay one red row.
+/// [`SKIP_PREFIX`] error into [`Outcome::Skipped`]. A panic is never a skip,
+/// however it is worded.
 pub fn guard(body: impl FnOnce() -> CaseResult) -> Outcome {
     let hushed = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -476,31 +415,17 @@ pub fn run_one(case: &Case, session: &Session) -> Outcome {
     guard(|| (case.run)(session))
 }
 
-/// Run one named case on every session.
-pub fn run_case(name: &str) -> Vec<Report> {
-    let registry = crate::suite::registry();
-    let sessions = sessions();
-    let mut out = Vec::new();
-    for case in registry.iter().filter(|c| c.name == name) {
-        for session in &sessions {
-            let _guard = is_gpu(session).then(gpu_test_guard);
-            out.push(Report {
-                case: case.name.clone(),
-                backend: backend_name(session),
-                outcome: run_one(case, session),
-            });
-        }
-    }
-    out
-}
-
-/// Run the whole registry on every session, reporting progress as it goes.
-pub fn run_all(mut progress: impl FnMut(&Report)) -> Vec<Report> {
+/// Run every case whose name contains `filter` (all of them on `None`) on
+/// every available session, reporting progress as it goes.
+pub fn run_filtered(filter: Option<&str>, mut progress: impl FnMut(&Report)) -> Vec<Report> {
     let registry = crate::suite::registry();
     let sessions = sessions();
     let mut out = Vec::with_capacity(registry.len() * sessions.len().max(1));
-    if sessions.is_empty() {
-        for case in registry.iter() {
+    for case in registry
+        .iter()
+        .filter(|c| filter.is_none_or(|f| c.name.contains(f)))
+    {
+        if sessions.is_empty() {
             let report = Report {
                 case: case.name.clone(),
                 backend: "none",
@@ -508,10 +433,8 @@ pub fn run_all(mut progress: impl FnMut(&Report)) -> Vec<Report> {
             };
             progress(&report);
             out.push(report);
+            continue;
         }
-        return out;
-    }
-    for case in registry.iter() {
         for session in &sessions {
             let _guard = is_gpu(session).then(gpu_test_guard);
             let report = Report {
@@ -524,58 +447,6 @@ pub fn run_all(mut progress: impl FnMut(&Report)) -> Vec<Report> {
         }
     }
     out
-}
-
-/// Runs cases against one or both backends, optionally filtered by a
-/// substring of the case name.
-pub struct Harness {
-    pub filter: Option<String>,
-}
-
-impl Harness {
-    pub fn new() -> Self {
-        Self { filter: None }
-    }
-
-    pub fn with_filter(filter: impl Into<String>) -> Self {
-        Self {
-            filter: Some(filter.into()),
-        }
-    }
-
-    fn matches(&self, name: &str) -> bool {
-        self.filter.as_ref().is_none_or(|f| name.contains(f))
-    }
-
-    /// Every matching case on every available backend.
-    pub fn run(&self) -> Vec<Report> {
-        let registry = crate::suite::registry();
-        let sessions = sessions();
-        let mut out = Vec::new();
-        for case in registry.iter().filter(|c| self.matches(&c.name)) {
-            for session in &sessions {
-                let _guard = is_gpu(session).then(gpu_test_guard);
-                out.push(Report {
-                    case: case.name.clone(),
-                    backend: backend_name(session),
-                    outcome: run_one(case, session),
-                });
-            }
-        }
-        out
-    }
-
-    /// Per-dtype absolute/relative tolerance. Delegates to the one table in
-    /// [`crate::compare::DTYPE_TOL`] so nothing carries a second copy.
-    pub fn tolerance(dtype: Dtype) -> (f32, f32) {
-        crate::compare::tol_for(dtype)
-    }
-}
-
-impl Default for Harness {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// Print one line per report and return the failure count.
@@ -591,9 +462,7 @@ pub fn summarize(reports: &[Report]) -> usize {
             }
         }
     }
-    // A skip is reported separately, never folded into the pass count: a
-    // suite that skipped the whole f16 matrix must not read as one that ran
-    // it.
+    // A skip is counted separately, never folded into the pass count.
     let skipped = reports.iter().filter(|r| r.outcome.is_skipped()).count();
     let passed = reports.iter().filter(|r| r.outcome.is_pass()).count();
     println!(
@@ -609,9 +478,8 @@ mod tests {
 
     #[test]
     fn fill_is_the_exact_reference_generator() {
-        // Hand-evaluated from the documented recurrence: seed 1 forces
-        // state = 1, so the first value is ((s0 >> 33) / 2^31) - 0.5 with
-        // s0 = 1 * 6364136223846793005 + 1442695040888963407.
+        // Seed 1 enters as state 1, so the first value is
+        // ((s0 >> 33) / 2^31) - 0.5 with s0 the first recurrence step.
         let s0 = 1u64
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
@@ -627,10 +495,6 @@ mod tests {
 
     #[test]
     fn no_two_seeds_share_a_stream() {
-        // The regression this guards: `seed | 1` folded every even seed onto
-        // its odd successor, so `fill(4, ..)` and `fill(5, ..)` were the same
-        // numbers and a case table drawing two operands from consecutive
-        // seeds was silently testing `f(x, x)`.
         let mut streams: Vec<Vec<u32>> = (0..256)
             .map(|seed| fill(seed, 4).iter().map(|v| v.to_bits()).collect())
             .collect();
@@ -642,8 +506,7 @@ mod tests {
 
     #[test]
     fn the_seeds_the_suite_actually_uses_are_distinct() {
-        // Area files draw operands from nearby primes and from adjacent
-        // small integers; both must separate.
+        // Area files draw operands from nearby primes and adjacent integers.
         for pair in [
             (11u32, 23),
             (307, 311),
@@ -671,13 +534,6 @@ mod tests {
     }
 
     #[test]
-    fn fill_indices_stay_in_bounds() {
-        for i in fill_indices(3, 512, 7) {
-            assert!(i < 7);
-        }
-    }
-
-    #[test]
     fn case_names_are_area_qualified() {
         let case = Case::new("elementwise", "abs", |_| Ok(()));
         assert_eq!(case.name, "elementwise::abs");
@@ -685,15 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn cases_from_rows_names_every_row() {
-        let cases = cases_from_rows("demo", [("a", 1u32), ("b", 2u32)], |_, _| Ok(()));
-        assert_eq!(cases.names(), vec!["demo::a", "demo::b"]);
-    }
-
-    #[test]
     fn guard_turns_a_panic_into_a_named_failure() {
-        // The whole reason `guard` exists: an unfinished op elsewhere in the
-        // workspace must be one red row, not a dead run.
         let outcome = guard(|| panic!("todo!(\"W13: conv\")"));
         match outcome {
             Outcome::Fail(message) => assert!(message.contains("W13: conv"), "{message}"),
@@ -709,8 +557,6 @@ mod tests {
 
     #[test]
     fn a_skip_is_neither_a_pass_nor_a_failure() {
-        // The whole point: a device that cannot run a row must not report it
-        // as `ok`, and must not report it as broken either.
         let outcome = guard(|| Err(skip("this adapter has no bf16 support")));
         match &outcome {
             Outcome::Skipped(why) => assert_eq!(why, "this adapter has no bf16 support"),
@@ -723,8 +569,6 @@ mod tests {
 
     #[test]
     fn a_panic_is_never_a_skip_however_it_is_worded() {
-        // An unfinished op must stay one red row even if its message happens
-        // to start with the marker.
         let outcome = guard(|| panic!("skipped: not yet implemented"));
         assert!(outcome.is_fail(), "{outcome:?}");
     }

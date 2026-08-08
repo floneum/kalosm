@@ -1,17 +1,12 @@
 //! The debug ILP extraction oracle. It implements the same [`Extractor`]
 //! trait as the shipped local search and must agree with it on small graphs.
-//!
-//! This exists because a greedy search compared only against itself cannot
-//! distinguish "found the optimum" from "made the same mistake as the
-//! reference". The oracle is exponential by construction and refuses anything
-//! past its caps with [`Error::Budget`] rather than running forever.
+//! It is exponential by construction and refuses anything past its caps with
+//! [`Error::Budget`] rather than running forever.
 //!
 //! Everything below the search is shared with the shipped extractor: the same
-//! `realize`, the same `CostModel::total` on the same realized DAG, the same
-//! `lower_bound` for pruning, the same `derive_plan`. The only difference is
-//! that where `LocalSearch` walks a move frontier, this enumerates.
-//!
-//! Owned by W14.
+//! `realize`, `CostModel::total` on the same realized DAG, `lower_bound` for
+//! pruning, and `derive_plan`. Where `LocalSearch` walks a move frontier, this
+//! enumerates.
 
 use std::sync::Arc;
 
@@ -36,9 +31,8 @@ pub struct IlpExtractor {
 impl IlpExtractor {
     /// Nodes past which the oracle refuses outright.
     pub const MAX_NODES: usize = 64;
-    /// Union chains past which the oracle refuses. Eighteen because the
-    /// smallest interesting chain has two members and `2^18` already exceeds
-    /// the product cap below.
+    /// Union chains past which the oracle refuses. The smallest interesting
+    /// chain has two members, and `2^18` already exceeds the product cap.
     pub const MAX_CHAINS: usize = 18;
     /// Product of `|members|` over all chains.
     pub const MAX_SIGMA_POINTS: usize = 4_096;
@@ -76,10 +70,6 @@ impl std::fmt::Debug for IlpExtractor {
         f.write_str("IlpExtractor")
     }
 }
-
-// ---------------------------------------------------------------------------
-// The search
-// ---------------------------------------------------------------------------
 
 /// One class the oracle branches over, with its members in ascending id order
 /// so the enumeration is reproducible.
@@ -131,7 +121,10 @@ impl IlpExtractor {
                 }
                 n => {
                     product = product.saturating_mul(n);
-                    chains.push(Chain { class, members });
+                    chains.push(Chain {
+                        class,
+                        members: members.to_vec(),
+                    });
                 }
             }
         }
@@ -164,11 +157,9 @@ impl IlpExtractor {
             best: None,
         };
 
-        // Seed the incumbent from the shipped search so branch-and-bound has
-        // a real bound from the first node rather than pruning against
-        // infinity. Its optimality is exactly what the oracle tests, so it is
-        // used as a *bound*, never as an answer: any point the enumeration
-        // finds that is strictly cheaper replaces it.
+        // Seed the incumbent from the shipped search so branch-and-bound has a
+        // real bound from the first node. It is a bound, not an answer: any
+        // point the enumeration finds that is strictly cheaper replaces it.
         if let Ok(seed) = LocalSearch::new(self.arena.clone(), cost.facts().caps.clone())
             .seed(graph, roots, &search.lb, cost)
             && let Ok(realized) = realize::realize(graph, roots, &seed, cost, search.arena)
@@ -191,11 +182,10 @@ impl IlpExtractor {
 impl Search<'_> {
     /// A valid lower bound on any completion of a partial assignment.
     ///
-    /// `lower_bound` sums each *distinct child class* once, so the root bound
-    /// already contains `lb[class]` at least once for every reachable class.
-    /// Pinning that class to a specific member can only raise the total, and
-    /// it raises it by at least `lb[member] - lb[class]`; adding one copy of
-    /// that non-negative delta therefore still underestimates. Admissible, so
+    /// `lower_bound` sums each distinct child class once, so the root bound
+    /// already contains `lb[class]` for every reachable class. Pinning a class
+    /// to a member raises the total by at least `lb[member] - lb[class]`, so
+    /// adding one copy of that non-negative delta still underestimates and
     /// pruning on it cannot discard the optimum.
     fn root_bound(&self, penalty: Picoseconds) -> Picoseconds {
         let base: u64 = self
@@ -247,9 +237,9 @@ impl Search<'_> {
             theta: FxHashMap::default(),
         };
         // Forced materializations: the roots, plus every node `Flip` refuses.
-        // An `Effect::InPlace` node inlined into two consumers applies its
-        // atomics twice, so pinning is a precondition of the move, not a
-        // heuristic — and therefore not an enumeration variable.
+        // An `Effect::InPlace` node inlined into two consumers would apply its
+        // atomics twice, so pinning is a precondition, not an enumeration
+        // variable.
         for r in self.roots {
             let Ok(selected) = realize::select(self.graph, &probe, *r) else {
                 return Ok(());
@@ -385,9 +375,7 @@ impl Search<'_> {
 }
 
 impl Extractor for IlpExtractor {
-    /// The same admissible bound the shipped search uses. Sharing it is the
-    /// point: a wrong bound would make both wrong the same way, and the
-    /// oracle would prove nothing.
+    /// The same admissible bound the shipped search uses.
     fn lower_bound(&self, graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds> {
         lower_bound::lower_bound(graph, cost)
     }
@@ -399,9 +387,7 @@ impl Extractor for IlpExtractor {
         cost: &dyn CostModel,
         budget: ExtractBudget,
     ) -> Result<Plan> {
-        // The oracle is exhaustive by definition; a move/time budget cannot
-        // make it stop early without making it stop being an oracle. Its own
-        // caps are the `MAX_*` constants.
+        // The oracle is exhaustive; its own caps are the `MAX_*` constants.
         let _ = budget;
         let (extraction, cost_ps) = self.search(graph, roots, cost)?;
         let realized = realize::realize(graph, roots, &extraction, cost, self.arena.as_ref())?;
@@ -413,16 +399,11 @@ impl Extractor for IlpExtractor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The agreement assert
-// ---------------------------------------------------------------------------
-
-/// What the oracle is for: the shipped local search must reach the same plan
-/// **and** the same cost on a graph small enough to enumerate.
-///
-/// `PlanHash` equality is the strong half — two extractions with equal cost
-/// but different `(sigma, m, theta)` are not the same decision, and the plan
-/// is the cache key.
+/// The shipped local search must reach the same plan and the same cost as the
+/// oracle on a graph small enough to enumerate. `PlanHash` equality is the
+/// strong half: two extractions with equal cost but different
+/// `(sigma, m, theta)` are not the same decision, and the plan is the cache
+/// key.
 pub fn assert_oracle_agrees(
     graph: &EGraph,
     roots: &[Id],
@@ -460,12 +441,10 @@ pub fn assert_oracle_agrees(
     Ok(())
 }
 
-/// The twelve small graphs `assert_oracle_agrees` must hold on, by name.
-///
-/// Each is a shape where a greedy search has a documented way to go wrong:
-/// rematerialization (the two-consumer producer), the epilogue-versus-merge
-/// conflict, split-K folding, the four scatter-add lowerings, alias versus
-/// gather, and the quantized repack.
+/// The twelve small graphs `assert_oracle_agrees` must hold on, by name. Each
+/// is a shape where a greedy search can go wrong: rematerialization, the
+/// epilogue-versus-merge conflict, split-K folding, the four scatter-add
+/// lowerings, alias versus gather, and the quantized repack.
 pub const ORACLE_GRAPHS: [&str; 12] = [
     "elementwise_chain",
     "two_consumer_producer_rematerializes",
@@ -487,9 +466,8 @@ mod tests {
 
     #[test]
     fn the_caps_are_ordered_so_the_product_ceilings_bind() {
-        // MAX_CHAINS is only meaningful if the smallest chain can reach the
-        // product cap: 2^18 > 4096, so 18 two-member chains are refused by
-        // the product cap rather than silently enumerated.
+        // 2^18 > 4096, so 18 two-member chains hit the product cap rather
+        // than being silently enumerated.
         assert!(1usize << IlpExtractor::MAX_CHAINS > IlpExtractor::MAX_SIGMA_POINTS);
         assert_eq!(1usize << IlpExtractor::MAX_FLIP_BITS, 4_096);
         assert_eq!(IlpExtractor::MAX_SIGMA_POINTS, 4_096);

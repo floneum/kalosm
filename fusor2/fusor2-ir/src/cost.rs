@@ -4,7 +4,6 @@
 use crate::device::Caps;
 use crate::dtype::Dtype;
 use crate::egraph::Id;
-use crate::error::Result;
 use crate::extract::{Extraction, PlanHash};
 use crate::facts::{ValueFacts, Work};
 use crate::ir::Node;
@@ -14,10 +13,10 @@ use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 
-/// Modelled time in picoseconds. One scalar, not a lexicographic tuple: the
-/// reference's own unit test shows the tuple gives the wrong verdict, and
-/// its own doc concedes dispatches are 0.2% of modelled time while the
-/// tuple will pay unbounded bandwidth to remove one.
+/// Modelled time in picoseconds. One scalar, not a lexicographic tuple, so
+/// dispatch count cannot outrank bandwidth: dispatches are a fraction of a
+/// percent of modelled time, and a tuple would pay unbounded bandwidth to
+/// remove one.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Picoseconds(pub u64);
 
@@ -85,10 +84,7 @@ impl RateDtype {
 /// The measured device rates the cost model prices its terms in.
 /// `fusor2-cost::calibrate` runs seven microbenchmarks (~180 ms, once),
 /// caches to `~/.cache/fusor2/facts/<fingerprint>.json`, and falls back to
-/// a per-class table only when calibration is disabled. This closes the
-/// reference's largest portability liability: five integers fitted on one
-/// M2 Max, selected by an adapter-name string test, shared by every other
-/// GPU on earth.
+/// a per-class table only when calibration is disabled.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DeviceFacts {
     pub launch_ps: u64,
@@ -106,7 +102,6 @@ pub struct DeviceFacts {
     pub single_buffered_traffic_pct: u32,
     pub compile_ps_per_kernel: u64,
     /// Cost of waking the CPU worker pool for one parallel region.
-    /// Replaces `PARALLEL_THRESHOLD = 16_777_216`.
     pub thread_wake_ps: u64,
     pub caps: Caps,
 }
@@ -160,6 +155,23 @@ pub trait CostModel: Send + Sync {
         ins: &[ValueFacts],
         out: &ValueFacts,
         theta: Option<SchedPoint>,
+    ) -> Picoseconds {
+        self.math_at(self.node_work(node, ins, out), ins, out, theta)
+    }
+
+    /// The schedule-independent [`Work`] [`Self::node_math`] prices. Pure in
+    /// `(op, ins, out)` — never `theta` — so a domain scan derives it once
+    /// and prices every point through [`Self::math_at`].
+    fn node_work(&self, node: &Node, ins: &[ValueFacts], out: &ValueFacts) -> Work;
+
+    /// [`Self::node_math`] with the work already derived by
+    /// [`Self::node_work`].
+    fn math_at(
+        &self,
+        work: Work,
+        ins: &[ValueFacts],
+        out: &ValueFacts,
+        theta: Option<SchedPoint>,
     ) -> Picoseconds;
 
     /// Traffic for `bytes` read `rereads` times. Continuous in `llc_bytes`,
@@ -207,13 +219,4 @@ impl ShapeStats {
             .and_then(|e| e.iter().find(|(d, _)| d.as_slice() == binding))
             .map_or(1, |(_, n)| *n)
     }
-}
-
-/// Calibration entry point. Implemented in `fusor2-cost`; a backend only
-/// has to be a [`crate::target::Target`].
-pub trait Calibrate: Send + Sync {
-    fn calibrate(&self, target: &dyn crate::target::Target) -> Result<DeviceFacts>;
-
-    /// The shipped per-class table, used when calibration is disabled.
-    fn seed_facts(&self, caps: &Caps) -> DeviceFacts;
 }

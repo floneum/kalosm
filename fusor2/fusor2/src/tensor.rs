@@ -1,24 +1,9 @@
 //! The one tensor type: runtime rank, runtime dtype, one node id.
 //!
-//! Owned by W12.
-//!
-//! # The surface this item consumes from W13 (`graph.rs`, `session.rs`)
-//!
-//! Nothing else in `fusor2/src/tensor*`, `fusor2/src/ops/*` or
-//! `fusor2/src/broadcast.rs` touches the e-graph directly. Everything routes
-//! through these four `GraphInner` methods:
-//!
-//! ```ignore
-//! impl GraphInner {
-//!     pub fn add_l0(&self, op: L0) -> Result<Id>;         // hash-cons + infer
-//!     pub fn facts(&self, id: Id) -> ValueFacts;          // cloned; total
-//!     pub fn tensor(self: &Arc<Self>, id: Id) -> Tensor;  // wrap an id
-//!     pub fn set_leaf_bytes(&self, id: Id, bytes: Vec<u8>);
-//! }
-//! ```
-//!
-//! plus `GraphInner::{session, fresh_sym, read_back}`. [`Tensor::emit`] is the
-//! **only** place a node is minted inside this item.
+//! `fusor2/src/tensor*`, `fusor2/src/ops/*` and `fusor2/src/broadcast.rs` reach
+//! the e-graph only through `GraphInner::{add_l0, facts, tensor,
+//! set_leaf_bytes, session, fresh_sym, read_back}`. [`Tensor::emit`] is the
+//! only place this module mints a node.
 
 pub mod construction;
 pub mod readback;
@@ -45,9 +30,8 @@ pub use typed::{Axis, Element, SimdElement, Typed};
 /// A value in a [`crate::Graph`]. Cloning is one `Arc` bump; the node it names
 /// is immutable.
 ///
-/// There is no `const R: usize`, no `B: Fusion`, and no dtype type parameter:
-/// rank and dtype are runtime data that `verify_l0` checks. A zero-cost
-/// [`Typed`] newtype is available for callers who want compile-time rank.
+/// Rank and dtype are runtime data that `verify_l0` checks. The zero-cost
+/// [`Typed`] newtype gives callers compile-time rank instead.
 #[derive(Clone)]
 pub struct Tensor {
     pub(crate) id: Id,
@@ -55,8 +39,7 @@ pub struct Tensor {
 }
 
 impl Tensor {
-    /// The e-graph id this tensor names. Public so conformance can assert
-    /// against graph structure directly.
+    /// The e-graph id this tensor names.
     pub fn id(&self) -> Id {
         self.id
     }
@@ -72,8 +55,8 @@ impl Tensor {
     }
 
     /// This value's inference result, cloned out of the graph.
-    /// `CoreSemantics::infer` is total and already ran, when the node was
-    /// minted; nothing here recomputes a shape.
+    /// `CoreSemantics::infer` ran when the node was minted; nothing here
+    /// recomputes a shape.
     pub fn facts(&self) -> ValueFacts {
         self.graph.facts(self.id)
     }
@@ -95,8 +78,7 @@ impl Tensor {
     /// Extent of axis `i`.
     ///
     /// # Panics
-    /// If `i >= self.rank()`. Axis arguments are program structure, not data;
-    /// every op in this crate range-checks before calling.
+    /// If `i >= self.rank()`. Every op in this crate range-checks first.
     pub fn dim(&self, i: usize) -> Dim {
         let shape = self.shape();
         match shape.get(i) {
@@ -110,8 +92,7 @@ impl Tensor {
         self.facts().elements()
     }
 
-    /// Alternate spelling of [`Tensor::elem_count`], kept because the scaffold
-    /// declared it.
+    /// Alias for [`Tensor::elem_count`].
     pub fn elements(&self) -> Option<u64> {
         self.elem_count()
     }
@@ -124,33 +105,27 @@ impl Tensor {
         self.facts().persistence
     }
 
-    /// Rank 0 is a first-class rank: it is what a loss lives in.
+    /// True at rank 0, the rank a loss lives in.
     pub fn is_scalar(&self) -> bool {
         self.rank() == 0
     }
 
     /// Materialize and re-leaf, cutting this value off from its producers.
     ///
-    /// Correct but expensive: it resolves, reads the bytes back to the host
-    /// and uploads them into a fresh `Leaf::Buffer`. A device-side detach
-    /// wants a session-level "adopt this buffer as a leaf" hook that does not
-    /// exist yet; see the crate report.
+    /// Resolves, reads the bytes back to the host and uploads them into a
+    /// fresh `Leaf::Buffer`, so the round trip goes through host memory.
     pub fn detach(&self) -> Result<Tensor> {
         let facts = self.facts();
         let bytes = self.graph.read_back(self.id)?;
         construction::upload(&self.graph, facts.dtype, &facts.shape, bytes)
     }
 
-    /// Wrap in the compile-time-rank facade. Purely a type-level assertion —
-    /// the IR is unchanged.
+    /// Wrap in the compile-time-rank facade; the IR is unchanged.
     pub fn typed<const R: usize, D: Element>(self) -> Result<Typed<R, D>> {
         Typed::try_new(self)
     }
 
-    // -- node minting -------------------------------------------------------
-
-    /// Mint one L0 node and wrap it. The single call site for `add_l0` in
-    /// this item.
+    /// Mint one L0 node and wrap it. The only `add_l0` call site here.
     pub(crate) fn emit(graph: &GraphRef, op: L0) -> Result<Tensor> {
         let id = graph.add_l0(op)?;
         Ok(graph.tensor(id))
@@ -173,9 +148,9 @@ impl Tensor {
 
     /// One `L0::Map` over several operands, `outs: 1`.
     ///
-    /// **Rejects** operands whose shapes are not pointwise [`Dim::known_eq`]:
-    /// there is no implicit broadcasting inside the IR, callers pre-broadcast
-    /// with [`crate::broadcast::broadcast_pair`].
+    /// Rejects operands whose shapes are not pointwise [`Dim::known_eq`]. The
+    /// IR has no implicit broadcasting; callers pre-broadcast with
+    /// [`crate::broadcast::broadcast_pair`].
     pub(crate) fn mapn(g: &GraphRef, expr: ScalarExpr, ins: &[&Tensor]) -> Result<Tensor> {
         let Some(first) = ins.first() else {
             return Err(Error::Shape("Map needs at least one operand".into()));
@@ -245,17 +220,11 @@ pub(crate) fn dims_eq(a: &[Dim], b: &[Dim]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.known_eq(*y))
 }
 
-// ---------------------------------------------------------------------------
-// Scalar
-// ---------------------------------------------------------------------------
-
 /// A scalar operand of a scalar-arith or comparison op.
 ///
-/// This single type is what deletes the trainer's `[1]`-tensor workaround:
-/// `m.mul_scalar(lr)` with `lr: Scalar::Uniform(sym)` reads the learning rate
-/// out of the uniform block and **never bakes a literal into a kernel**, so
-/// changing it recompiles nothing. `m.mul_scalar(2.0f32)` still folds to a
-/// literal, because a structural constant belongs in the kernel key.
+/// `Scalar::Uniform(sym)` reads the value out of the uniform block and bakes
+/// no literal into the kernel, so changing it recompiles nothing.
+/// `Scalar::Lit` folds into the kernel key.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Scalar {
     Lit(Splat),
@@ -285,10 +254,9 @@ impl From<f32> for Scalar {
         Self::Lit(Splat::F32(v))
     }
 }
-// NOTE: deliberately no `From<f64>`. With exactly one float impl, trait
-// selection unifies an unsuffixed literal to `f32`, so `t.mul_scalar(2.0)`
-// compiles without a suffix; adding `From<f64>` makes every such call
-// ambiguous.
+// There is no `From<f64>`: with exactly one float impl, trait selection
+// unifies an unsuffixed literal to `f32`, so `t.mul_scalar(2.0)` compiles
+// without a suffix.
 impl From<half::f16> for Scalar {
     fn from(v: half::f16) -> Self {
         Self::Lit(Splat::F16(v.to_bits()))
@@ -332,7 +300,7 @@ pub(crate) fn splat_f64(v: Splat) -> f64 {
 }
 
 /// Retype a literal. A quantized target has no scalar literal form, so the
-/// value passes through unchanged and the surrounding op rejects it.
+/// value passes through unchanged for the surrounding op to reject.
 pub(crate) fn splat_as(v: Splat, dt: Dtype) -> Splat {
     if v.dtype() == dt {
         return v;
@@ -399,12 +367,8 @@ mod tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Graph-level acceptance tests.
-//
-// Every assertion here is against the **built L0 term**, not against
-// execution: this item mints nodes and has no backend.
-// ---------------------------------------------------------------------------
+// Graph-level acceptance tests. Every assertion is against the built L0 term,
+// not against execution.
 
 #[cfg(test)]
 mod graph_tests {
@@ -468,8 +432,6 @@ mod graph_tests {
             .unwrap()
     }
 
-    // ---- 1 ---------------------------------------------------------------
-
     /// Every elementwise/scalar-arith/comparison entry point grows the graph
     /// by exactly one node, and that node is a `Map`.
     #[test]
@@ -488,7 +450,7 @@ mod graph_tests {
             }};
         }
 
-        // 21 unaries plus sqr and recip.
+        // Unaries, plus sqr and recip.
         check!(|x: &Tensor| x.exp().unwrap());
         check!(|x: &Tensor| x.exp2().unwrap());
         check!(|x: &Tensor| x.log().unwrap());
@@ -526,7 +488,7 @@ mod graph_tests {
         check!(|x: &Tensor| x.min_scalar(6.0f32).unwrap());
         check!(|x: &Tensor| x.clamp(0.0f32, 6.0f32).unwrap());
 
-        // 12 comparisons.
+        // Comparisons against a scalar.
         check!(|x: &Tensor| x.eq_scalar(0.0f32).unwrap());
         check!(|x: &Tensor| x.ne_scalar(0.0f32).unwrap());
         check!(|x: &Tensor| x.lt_scalar(0.0f32).unwrap());
@@ -571,8 +533,6 @@ mod graph_tests {
         assert_eq!(tag_of(&w), OpTag::Map);
     }
 
-    // ---- 3 ---------------------------------------------------------------
-
     #[test]
     fn broadcast_right_aligned() {
         let g = graph();
@@ -603,8 +563,6 @@ mod graph_tests {
         assert_eq!(&midb.shape()[..], &dims(&[2, 3, 4])[..]);
     }
 
-    // ---- 4 ---------------------------------------------------------------
-
     #[test]
     fn no_implicit_broadcast_in_ir() {
         let g = graph();
@@ -618,8 +576,6 @@ mod graph_tests {
         assert_eq!(tag_of(&c), OpTag::Map);
         assert_eq!(&c.shape()[..], &dims(&[2, 3])[..]);
     }
-
-    // ---- 5 ---------------------------------------------------------------
 
     #[test]
     fn scalar_is_lit_or_uniform() {
@@ -658,8 +614,6 @@ mod graph_tests {
         assert_eq!(uni.id(), third.id());
     }
 
-    // ---- 6 ---------------------------------------------------------------
-
     #[test]
     fn views_are_restride() {
         let g = graph();
@@ -697,8 +651,6 @@ mod graph_tests {
         assert_eq!(&w.shape()[..], &dims(&[2, 3, 2, 2])[..]);
     }
 
-    // ---- 7 ---------------------------------------------------------------
-
     #[test]
     fn restride_composes_relatively() {
         use fusor2_ir::semantics::infer_l0::restride_layout;
@@ -720,8 +672,6 @@ mod graph_tests {
         assert_eq!(want.offset(), Dim::Const(12));
         assert_eq!(&b.shape()[..], want.shape());
     }
-
-    // ---- 8 ---------------------------------------------------------------
 
     #[test]
     fn matmul_spec() {
@@ -763,8 +713,6 @@ mod graph_tests {
         assert!(a.matmul(&wide).is_err());
     }
 
-    // ---- 9 ---------------------------------------------------------------
-
     #[test]
     fn reductions() {
         let g = graph();
@@ -787,7 +735,7 @@ mod graph_tests {
             assert_eq!(&y.shape()[..], &dims(&[2, 1, 4])[..]);
         }
 
-        // `max_with_tie` is how a parity requirement becomes a declaration.
+        // The tie policy is part of the node's structural identity.
         let split = x.max_with_tie(1, TiePolicy::SplitEvenly).unwrap();
         let first = x.max_with_tie(1, TiePolicy::FirstWins).unwrap();
         assert_ne!(split.id(), first.id());
@@ -816,18 +764,14 @@ mod graph_tests {
             other => panic!("{other:?}"),
         }
 
-        // var is exactly Map(sqr), Fold, Map(mul), Fold, Map(mul), Map(sqr),
-        // Map(sub) — seven nodes, no stable-variance carrier and no extra
-        // pass. Which carrier runs is a rewrite's decision, not the
-        // frontend's.
+        // var is Map(sqr), Fold, Map(mul), Fold, Map(mul), Map(sqr), Map(sub):
+        // seven nodes. Which carrier runs is a rewrite's decision.
         let fresh = leaf(&g, &[2, 7, 4]);
         let before = node_count(&g);
         let v = fresh.var(1).unwrap();
         assert_eq!(node_count(&g) - before, 7);
         assert_eq!(&v.shape()[..], &dims(&[2, 4])[..]);
     }
-
-    // ---- 10 --------------------------------------------------------------
 
     #[test]
     fn rank_zero_first_class() {
@@ -846,8 +790,6 @@ mod graph_tests {
         assert_eq!(total.rank(), 0);
         assert_eq!(tag_of(&total), OpTag::Fold);
     }
-
-    // ---- 11 --------------------------------------------------------------
 
     #[test]
     fn scatter_substrate() {
@@ -901,8 +843,6 @@ mod graph_tests {
         assert_eq!(&r.shape()[..], &dims(&[3, 2])[..]);
     }
 
-    // ---- 12 --------------------------------------------------------------
-
     #[test]
     fn index_ops() {
         let g = graph();
@@ -943,8 +883,6 @@ mod graph_tests {
         assert_eq!(linear, vec![1, 4, 11]);
     }
 
-    // ---- 13 --------------------------------------------------------------
-
     #[test]
     fn i_indexing() {
         let g = graph();
@@ -982,10 +920,7 @@ mod graph_tests {
         let _ = x.i((0usize, 1usize, ..));
     }
 
-    // ---- 16 --------------------------------------------------------------
-
-    /// Every alias hash-conses onto its target, which is the strongest form of
-    /// "structurally identical": the same node id.
+    /// Every alias hash-conses onto its target, landing on the same node id.
     #[test]
     fn alias_surface() {
         let g = graph();
@@ -1035,8 +970,6 @@ mod graph_tests {
         );
     }
 
-    // ---- 17 --------------------------------------------------------------
-
     #[test]
     fn arange_step_builds_the_right_leaf() {
         let g = graph();
@@ -1049,8 +982,6 @@ mod graph_tests {
             .collect();
         assert_eq!(v, vec![5.0, 3.0, 1.0]);
     }
-
-    // ---- constructors, casts, typed --------------------------------------
 
     #[test]
     fn fills_are_const_leaves_with_no_upload() {

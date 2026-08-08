@@ -3,12 +3,9 @@
 //!
 //! Every normalization here is a row program over the last axis: a max fold, a
 //! map, a sum fold and a divide. The five softmax spellings and the four
-//! rms_norm spellings are the *same* expansion behind different sugar, so a
-//! case that passes for `softmax_slow` and fails for `softmax` is evidence
-//! that the macro node and its `defn` are not in one e-class — which is the
-//! one thing the design says cannot happen.
-//!
-//! Owned by W14.
+//! rms_norm spellings are the same expansion behind different sugar, so a case
+//! that passes for `softmax_slow` and fails for `softmax` means the macro node
+//! and its `defn` are not in one e-class.
 
 use fusor2::{Dtype, Session, Tensor};
 
@@ -25,17 +22,12 @@ const WIDTH: usize = 5;
 const SHAPE: &[u64] = &[ROWS as u64, WIDTH as u64];
 const LEN: usize = ROWS * WIDTH;
 
-/// The eps every norm case uses. Large enough to matter at these magnitudes,
-/// so a case that silently drops it fails rather than passing by luck.
+/// The eps every norm case uses, large enough to matter at these magnitudes.
 const EPS: f32 = 1e-3;
 
 type Build = fn(&Tensor) -> fusor2::Result<Tensor>;
 /// A host reference over one row, producing that row's output.
 type RowRef = fn(&[f32]) -> Vec<f32>;
-
-// ---------------------------------------------------------------------------
-// Host references
-// ---------------------------------------------------------------------------
 
 fn host_softmax(row: &[f32]) -> Vec<f32> {
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -96,10 +88,6 @@ fn affine(normalized: &[f32], weight: &[f32], bias: Option<&[f32]>) -> Vec<f32> 
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Cases
-// ---------------------------------------------------------------------------
-
 /// The single-input row programs: forward against a host reference, backward
 /// against central differences.
 #[rustfmt::skip]
@@ -120,8 +108,7 @@ fn plain_rows() -> Vec<(&'static str, Build, RowRef)> {
 }
 
 /// `layer_norm` with an all-ones weight and no bias, so the host reference is
-/// the bare statistic. The weight is a constant leaf, not a parameter: this
-/// row checks the normalization, `layer_norm_fused` below checks the affine.
+/// the bare statistic. The weight is a constant leaf, not a parameter.
 fn layer_norm_bare(x: &Tensor, remove_mean: bool) -> fusor2::Result<Tensor> {
     let ones = Tensor::ones(x.graph(), Dtype::F32, &dims(&[WIDTH as u64]))?;
     x.layer_norm(&ones, None, EPS, remove_mean)
@@ -136,9 +123,8 @@ pub fn cases() -> Cases {
         });
     }
 
-    // The weighted spellings. Each is checked against `normalized * w (+ b)`
-    // with a *non-constant* weight, so a lowering that drops the affine is a
-    // value failure rather than a no-op.
+    // The weighted spellings, checked against `normalized * w (+ b)` with a
+    // non-constant weight.
     cases.push("normalization", "rms_norm", |s| {
         weighted_case(s, "rms_norm", host_rms, false, |x, w, _| x.rms_norm(w, EPS))
     });
@@ -207,14 +193,10 @@ pub fn cases() -> Cases {
     cases
 }
 
-/// The structural half: which law actually fired on the chain the frontend
-/// emits, and what the extracted plan did with it.
-///
-/// Every case above passes whether the program was rewritten or run naively —
-/// a numeric oracle cannot tell a landed law from a dead one. These read the
-/// saturation report and the extracted plan instead, on the *same* frontend
-/// calls, so a law that silently stops matching reports a rule name and a
-/// count rather than nothing at all.
+/// Which law fired on the chain the frontend emits, and what the extracted
+/// plan did with it. These read the saturation report and the extracted plan
+/// rather than values, so a law that stops matching reports a rule name and a
+/// count.
 mod structural {
     use fusor2::{Session, Tensor};
 
@@ -250,9 +232,6 @@ mod structural {
             "rms_norm_backward_plan",
             rms_norm_backward_plan,
         );
-        // The saturation tripwire, on a composed backward rather than on
-        // attention: this is the one case that says whether the budget is big
-        // enough for an ordinary program.
         cases.push(
             "normalization",
             "composed_backward_saturates",
@@ -265,19 +244,11 @@ mod structural {
         e.to_string().into()
     }
 
-    /// `RETARGET` on the softmax the frontend writes.
-    ///
-    /// The law never invents a reference: it fires only where the source
-    /// program already computed one, and `softmax_last_dim`'s `defn` computes
-    /// a row max and reinjects it by a broadcast along the reduced axis. That
-    /// is the structural condition, stated on address maps, and it is the same
-    /// condition that makes the law fire on a CRF forward recursion or an MoE
-    /// router — none of which is a softmax.
-    ///
-    /// The assert is on the **rule name**: a two-pass softmax computes the
-    /// same numbers as a one-pass one, so no numeric case can distinguish
-    /// them. `softmax_rows_sum_to_one` and `softmax_is_shift_invariant` above
-    /// carry the values.
+    /// `RETARGET` on the softmax the frontend writes. The law fires where the
+    /// source program already computes a reference and reinjects it by a
+    /// broadcast along the reduced axis, which `softmax_last_dim`'s `defn`
+    /// does. The assert is on the rule name, since a two-pass softmax computes
+    /// the same numbers as a one-pass one.
     fn softmax_retargets(session: &Session) -> CaseResult {
         let data = Domain::Wide.sample(801, (ROWS * WIDTH) as usize);
         let build = |s: &Session| -> Result<Vec<Tensor>, CaseError> {
@@ -306,12 +277,9 @@ mod structural {
     }
 
     /// `ABSORB` on `variance`, which is `mean((x - mean)^2)`: two reductions
-    /// over one axis with an elementwise chain between them.
-    ///
-    /// This is the shape `RETARGET`'s raw-moment row turns into Welford. The
-    /// firing assert here is on `ABSORB`, which is landed; the plan count is a
-    /// ceiling, because the one-pass form needs the raw-moment row and that
-    /// row is not in `RETARGET_TABLE` yet.
+    /// over one axis with an elementwise chain between them. The plan count is
+    /// a ceiling, because the one-pass form needs the raw-moment row that
+    /// `RETARGET_TABLE` does not carry.
     fn variance_absorbs(session: &Session) -> CaseResult {
         let data = Domain::Wide.sample(802, (ROWS * WIDTH) as usize);
         let build = |s: &Session| -> Result<Vec<Tensor>, CaseError> {
@@ -339,20 +307,14 @@ mod structural {
     }
 
     /// The composed layer-norm backward emits `sum(dy)` and `sum(dy * xhat)`
-    /// over the same feature axis of the same operands.
-    ///
-    /// No rule mentions layer_norm, normalization or backward. `TUPLE` joins
-    /// the two into one 2-slot fold and one launch — the fused
-    /// layer-norm-backward kernel every framework hand-writes, derived by the
-    /// same law as Welford. Until it does, this is a ceiling and the count is
-    /// the diff the day it lands.
+    /// over the same feature axis of the same operands; `TUPLE` joins them into
+    /// one 2-slot fold and one launch. The launch count is a ceiling, not an
+    /// exact expectation.
     fn layer_norm_backward_plan(session: &Session) -> CaseResult {
         backward_plan(session, "layer_norm_backward", true, 34)
     }
 
-    /// The same law on `rms_norm`, whose backward emits one sum instead of
-    /// two — so `TUPLE` has less to do and `ABSORB` more. Having both says
-    /// which law the count belongs to.
+    /// The same law on `rms_norm`, whose backward emits one sum instead of two.
     fn rms_norm_backward_plan(session: &Session) -> CaseResult {
         backward_plan(session, "rms_norm_backward", false, 28)
     }
@@ -389,9 +351,6 @@ mod structural {
             Ok(vec![dx, dw])
         };
 
-        // `composed_backward_saturates` owns the saturation claim; this case
-        // owns the count. A count read off a truncated saturation is still a
-        // regression guard, because the driver is deterministic.
         let p = structure::probe_fresh(session, &build)?;
         p.require_fired(
             "ABSORB",
@@ -408,17 +367,9 @@ mod structural {
         )
     }
 
-    /// The saturation budget, measured on a composed backward.
-    ///
-    /// `attention_rope::attention_defn_saturates` makes the same claim about
-    /// attention, where it is easy to read as "the flash derivation is not
-    /// finished". This says the wider thing: an eight-row layer-norm backward
-    /// — five lines of frontend, no attention anywhere — also runs out of
-    /// `MAX_ROUNDS`. The two failures have one cause and one fix, and the fix
-    /// is not in attention.
-    ///
-    /// The value is checked first, so a graph that stopped computing cannot
-    /// pass this by saturating trivially.
+    /// The saturation budget, measured on an eight-row layer-norm backward
+    /// against `MAX_ROUNDS`. The value is checked first, so a graph that
+    /// stopped computing cannot pass by saturating trivially.
     fn composed_backward_saturates(session: &Session) -> CaseResult {
         let data = Domain::Wide.sample(806, (ROWS * WIDTH) as usize);
         // An all-ones weight, so `sum(y)` is `sum(xhat)` and the row is
@@ -439,9 +390,8 @@ mod structural {
         };
 
         // `sum(layer_norm(x))` with a unit weight is `sum((x - mean)/sd)`,
-        // which is identically zero for every input, so every entry of
-        // `d(sum y)/dx` is zero to rounding. An independent number, and one a
-        // broken adjoint cannot produce by accident.
+        // identically zero for every input, so every entry of `d(sum y)/dx` is
+        // zero to rounding.
         let outs = build(session)?;
         let dx = crate::suite::support::read(&outs[0])?;
         let scale = data.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0);
@@ -483,8 +433,7 @@ fn row_case(session: &Session, name: &'static str, build: Build, reference: RowR
 }
 
 /// A norm with a learned weight and optional bias. All three gradients are
-/// checked: dropping `d_weight` is the classic way a fused epilogue rule goes
-/// wrong while the forward stays correct.
+/// checked.
 fn weighted_case(
     session: &Session,
     name: &'static str,
@@ -526,8 +475,8 @@ fn weighted_case(
     })?;
     assert_gradient_matches_finite_difference(&d_x, &numeric)?;
 
-    // d_weight[j] = sum over rows of normalized[r, j] — the stride-0 axis's
-    // adjoint is a sum, and it is over the *rows*, not the columns.
+    // d_weight[j] = sum over rows of normalized[r, j]: the stride-0 axis's
+    // adjoint is a sum over rows, not columns.
     let d_w = gradient_of(&graph, &y, &w)?;
     let want_w: Vec<f32> = (0..WIDTH)
         .map(|j| (0..ROWS).map(|r| normalized[r * WIDTH + j]).sum())
@@ -549,8 +498,8 @@ fn weighted_case(
     Ok(())
 }
 
-/// The transformer block boundary: `rms_norm(x + residual) * w`. The residual
-/// add must be inside the statistic, not applied to the normalized value.
+/// `rms_norm(x + residual) * w`: the residual add is inside the statistic, not
+/// applied to the normalized value.
 fn residual_case(session: &Session) -> CaseResult {
     let data = Domain::Wide.sample(431, LEN);
     let residual = Domain::Wide.sample(433, LEN);
@@ -570,8 +519,7 @@ fn residual_case(session: &Session) -> CaseResult {
     let expected = affine(&by_row(&summed, host_rms), &weight, None);
     expect_values(session, SHAPE, Dtype::F32, &read(&y)?, &expected)?;
 
-    // Both inputs enter the same sum, so their gradients must be identical —
-    // a rule that normalizes before adding gives the residual a different one.
+    // Both inputs enter the same sum, so their gradients must be identical.
     let d_x = gradient_of(&graph, &y, &x)?;
     let d_r = gradient_of(&graph, &y, &r)?;
     let backend = if crate::harness::is_gpu(session) {
@@ -615,9 +563,7 @@ fn variance_case(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// Every softmax row sums to exactly 1 within tolerance. Cheap, but it is the
-/// invariant an online-softmax carrier with a mis-rescaled running sum breaks
-/// while still looking plausible element by element.
+/// Every softmax row sums to 1 within tolerance and has no negative entry.
 fn rows_sum_to_one(session: &Session) -> CaseResult {
     let data = Domain::Custom(-4.0, 4.0).sample(449, LEN);
     let graph = graph_of(session);
@@ -638,8 +584,7 @@ fn rows_sum_to_one(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// softmax(x + c) == softmax(x). The max fold is the only thing that makes
-/// this true, so a lowering that drops it fails here before it overflows.
+/// softmax(x + c) == softmax(x), which holds only if the max fold is present.
 fn shift_invariance(session: &Session) -> CaseResult {
     let data = Domain::Custom(-2.0, 2.0).sample(457, LEN);
     let shifted: Vec<f32> = data.iter().map(|v| v + 60.0).collect();
@@ -676,11 +621,8 @@ fn sugar_agrees(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// `dS = P * (dP - rowsum(dP * P))`.
-///
-/// Seeded with a non-uniform upstream gradient: under `sum_all` the softmax
-/// adjoint is identically zero, so an all-ones seed cannot tell a correct
-/// Jacobian from a missing one.
+/// `dS = P * (dP - rowsum(dP * P))`, seeded with a non-uniform upstream
+/// gradient because under `sum_all` the softmax adjoint is identically zero.
 fn softmax_backward(session: &Session) -> CaseResult {
     let data = Domain::Wide.sample(463, LEN);
     // A fixed, non-uniform upstream weight, applied as `sum(w * softmax(x))`.
@@ -721,9 +663,8 @@ fn softmax_backward(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// `mean((x - mean)^2)` computed by `variance_last` must agree with the
-/// `mean(x^2) - mean(x)^2` spelling to f32 tolerance on well-conditioned data,
-/// and the composed form is the one autograd differentiates.
+/// `mean((x - mean)^2)` computed by `variance_last` agrees with the
+/// `mean(x^2) - mean(x)^2` spelling to f32 tolerance on well-conditioned data.
 fn welford_carrier(session: &Session) -> CaseResult {
     let data = Domain::Custom(10.0, 11.0).sample(479, LEN);
     let graph = graph_of(session);

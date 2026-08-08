@@ -1,6 +1,6 @@
-//! `verify_plan` — the hard conformance assert on the extraction winner.
+//! The hard conformance assert on the extraction winner.
 //!
-//! Six clauses, each an [`Error::Plan`], **never** a silent fallback:
+//! Seven clauses, each an [`Error::Plan`], never a silent fallback:
 //!
 //! 1. every selected non-`Leaf` node is at `Level::L1`;
 //! 2. `theta` is a member of the node's `ScheduleDomain`, the geometry's own
@@ -13,13 +13,11 @@
 //! 5. no `Effect::InPlace` node is inlined;
 //! 6. every root is in `M`, and every `L1::Ext` node can actually run
 //!    somewhere;
-//! 7. every launch's bind group — its operands **plus the `Uniforms` block** —
+//! 7. every launch's bind group — its operands plus the `Uniforms` block —
 //!    fits `max_storage_buffers_per_shader_stage`.
-//!
-//! Owned by W7.
 
 use crate::plan::UNKNOWN_SYM;
-use crate::realize::{self, scalar_element, tiles_for};
+use crate::realize::{self, tiles_for};
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
 use fusor2_ir::egraph::{EGraph, Id};
@@ -43,7 +41,7 @@ pub fn verify_plan(graph: &EGraph, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
-/// All six clauses. The schedule clause needs the exact planner and the caps
+/// All seven clauses. The schedule clause needs the exact planner and the caps
 /// it was admitted against; the extension clause needs the registry the
 /// e-graph's semantics were built with.
 pub fn verify_plan_with(
@@ -63,19 +61,9 @@ pub fn verify_plan_with(
 /// Clause 7: every launch's bind group fits
 /// `max_storage_buffers_per_shader_stage`.
 ///
-/// **The uniform block is one of them.** `plan::derive_bindings` reserves
-/// binding 0 for `Uniforms` and does not list it, but that block is emitted in
-/// the `storage` address space (`fusor2_gpu::bindings` walks storage globals
-/// and requires binding 0 to be the read-only `Uniforms` buffer), so it counts
-/// against the limit like any other. The bound is therefore
-/// `bindings.len() + 1`, and the off-by-one is exactly what let a plan with
-/// eight listed bindings reach `create_bind_group_layout` needing nine.
-///
-/// This is the last line, not the first: `fusion::storage_bindings` is what
-/// keeps the search from *building* such a launch. A rule that widens an
-/// operand list without consulting it lands here instead of in wgpu's
-/// validator, which is the difference between an `Error::Plan` naming the
-/// launch and a panic inside a scoped thread.
+/// The uniform block counts against the limit: `plan::derive_bindings`
+/// reserves binding 0 for `Uniforms` and does not list it, but the block is
+/// emitted in the `storage` address space. The bound is `bindings.len() + 1`.
 pub fn check_bind_groups(plan: &Plan, caps: &Caps) -> Result<()> {
     let limit = caps.limits.max_storage_buffers_per_shader_stage as usize;
     for (i, launch) in plan.launches.iter().enumerate() {
@@ -97,9 +85,8 @@ pub fn check_bind_groups(plan: &Plan, caps: &Caps) -> Result<()> {
 /// Clause 1: every selected non-leaf node is at L1 — nothing skipped a level.
 pub fn check_levels(graph: &EGraph, plan: &Plan) -> Result<()> {
     for id in selected(plan) {
-        // The same predicate the seed and the move generator select against,
-        // so a violation here means no rule ever lowered the class — not that
-        // the search disagreed with the verifier about what "runnable" means.
+        // The same predicate the seed and the move generator select against, so
+        // a violation here means no rule ever lowered the class.
         if !realize::is_runnable(graph, id) {
             return Err(Error::Plan(format!(
                 "selected {id} is at {} but only L1 nodes are runnable",
@@ -163,7 +150,7 @@ pub fn check_schedules(
             _ => {}
         }
         let lanes = realize::fold_footprint(graph, id).map(|(l, _)| l);
-        let tiles = tiles_for(Some(theta), scalar_element(graph.facts(id).dtype), lanes, caps);
+        let tiles = tiles_for(Some(theta), graph.facts(id).dtype.scalar_element(), lanes, caps);
         let bytes = arena.workgroup_bytes(&tiles, caps)?;
         if bytes > max_storage {
             return Err(Error::Plan(format!(
@@ -361,7 +348,7 @@ mod tests {
             .unwrap();
         verify_plan(&g, &plan).unwrap();
 
-        // Force the pin open the way only a broken extractor could.
+        // Force the pin open, as only a broken extractor could.
         plan.extraction.m.set(sc.index(), false);
         assert!(matches!(verify_plan(&g, &plan), Err(Error::Plan(_)),));
     }
@@ -399,11 +386,8 @@ mod tests {
         ));
     }
 
-    /// Clause 7 counts the `Uniforms` block, and that is the whole point of
-    /// it: `derive_bindings` does not list binding 0, so a launch with
-    /// `limit` listed bindings needs `limit + 1` storage buffers and dies in
-    /// `create_bind_group_layout`. A plan exactly *at* the limit must be
-    /// rejected here, not one over it.
+    /// Clause 7 counts the `Uniforms` block: a launch with `limit` listed
+    /// bindings needs `limit + 1` storage buffers and is rejected.
     #[test]
     fn verify_plan_rejects_a_bind_group_that_forgot_the_uniform_block() {
         use fusor2_ir::extract::{BindKind, BindingPlan};

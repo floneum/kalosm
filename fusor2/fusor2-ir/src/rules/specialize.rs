@@ -1,13 +1,8 @@
-//! R7 — `specialize_dim` substitutes a symbolic extent for the concrete one
-//! its operands already carry. Priced by compile amortization: on first
-//! sighting of a shape family the generic symbolic variant wins outright, so
-//! nothing compiles per length bucket. After a binding recurs, this variant
-//! wins where specialization pays.
-//!
-//! The trainer's ten sequence buckets, its `tiles = slots.div_ceil(64) + 1024`
-//! padding and `--bench`'s single-bucket filter all become unnecessary.
-//!
-//! Owned by W2.
+//! `specialize_dim` substitutes a symbolic extent for the concrete one its
+//! operands already carry. Priced by compile amortization: on first sighting
+//! of a shape family the generic symbolic variant wins outright, so nothing
+//! compiles per length bucket. After a binding recurs, this variant wins
+//! where specialization pays.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
 use crate::ir::level1::L1;

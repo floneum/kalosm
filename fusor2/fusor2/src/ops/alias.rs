@@ -1,20 +1,15 @@
-//! The preserved alias surface: the names the reference exposes that are thin
-//! wrappers over a primitive here. Kept so callers do not have to be
-//! rewritten.
+//! The alias surface: alternate names that are thin wrappers over a primitive.
 //!
 //! **Thin forwarders only.** Nothing in this file mints a node, so every alias
 //! is structurally identical to its target and hash-conses onto it.
 //!
-//! (`softmax_slow*` lives in W13's `composite/normalization.rs`, not here.)
-//!
-//! Owned by W12.
+//! (`softmax_slow*` lives in `composite/normalization.rs`, not here.)
 
 use crate::tensor::{Scalar, Tensor};
 use crate::Result;
 
 impl Tensor {
-    /// `more than` — the fusor-core-compatible spelling of
-    /// [`Tensor::gt_scalar`].
+    /// `more than` — [`Tensor::gt_scalar`].
     pub fn mt(&self, s: impl Into<Scalar>) -> Result<Tensor> {
         self.gt_scalar(s)
     }
@@ -52,7 +47,7 @@ impl Tensor {
     pub fn pow_elementwise(&self, s: impl Into<Scalar>) -> Result<Tensor> {
         self.pow_scalar(s)
     }
-    /// [`Tensor::max_scalar`]. The reference's `relu` is `max_elementwise(0)`.
+    /// [`Tensor::max_scalar`]. `relu` is `max_elementwise(0)`.
     pub fn max_elementwise(&self, s: impl Into<Scalar>) -> Result<Tensor> {
         self.max_scalar(s)
     }
@@ -69,7 +64,7 @@ impl Tensor {
     pub fn mt_matmul(&self, rhs: &Tensor) -> Result<Tensor> {
         self.matmul_t(rhs)
     }
-    /// [`Tensor::matmul_t`], the reference's spelling.
+    /// [`Tensor::matmul_t`].
     pub fn mat_mul_transposed_rhs(&self, rhs: &Tensor) -> Result<Tensor> {
         self.matmul_t(rhs)
     }

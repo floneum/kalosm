@@ -1,8 +1,6 @@
 //! Cross-lane reductions: subgroup collectives, shared-memory trees, and the
 //! loop-then-tree hybrid. The strategy is a parameter on the node, so it stays
 //! a late capability-driven choice rather than a construction-time one.
-//!
-//! Owned by W8.
 
 use fusor2_ir::ir::level2::{ElementType, ReduceKind, ScalarElement, Tile, TileExpr, TileReduceOp};
 use fusor2_ir::target::EmitError;
@@ -404,8 +402,8 @@ mod tests {
         }
     }
 
-    /// Test 9 — the `WgTree` fallback and the subgroup collective agree
-    /// bit-for-bit, and the 256-lane tree is exact.
+    /// The `WgTree` fallback and the subgroup collective agree bit-for-bit,
+    /// and the 256-lane tree is exact.
     ///
     /// A subgroup collective reduces within one subgroup, so the two
     /// strategies are compared at the subgroup width; the 256-lane total is
@@ -485,8 +483,7 @@ mod tests {
     /// The emitted WGSL for a plain single-slot fold, as text.
     ///
     /// Set `FUSOR2_WGSL_DUMP=<dir>` to write the four shaders out; that is how
-    /// [`single_slot_reduce_wgsl_is_unchanged`]'s goldens were recorded from the
-    /// tree *before* the N-ary reduction landed.
+    /// [`single_slot_reduce_wgsl_is_unchanged`]'s goldens are recorded.
     fn reduce_wgsl(name: &'static str, ir: &KernelIr) -> String {
         let emitted = emit_module(ir, &caps(false, true), &no_plan()).expect("emits");
         let mut flags = naga::back::wgsl::WriterFlags::empty();
@@ -499,12 +496,11 @@ mod tests {
         text
     }
 
-    /// **The fast path is byte-identical.** `TileReduceOp::{Sum,Max}` at one
-    /// scalar slot must keep emitting the same subgroup collective and the same
-    /// shared-memory tree it emitted before `Stmt::Reduce` existed. The assert is
-    /// textual equality of the shader, not numeric agreement: every one of the
-    /// passing folds in the suite goes down this path, and a diff here means the
-    /// N-ary form was built *in place of* the collective rather than beside it.
+    /// The fast path is byte-identical: `TileReduceOp::{Sum,Max}` at one scalar
+    /// slot emits a subgroup collective and a shared-memory tree. The assert is
+    /// textual equality of the shader, not numeric agreement: every passing
+    /// fold in the suite goes down this path, and a diff here means the N-ary
+    /// form was built *in place of* the collective rather than beside it.
     ///
     /// The goldens are FNV-1a hashes of the exact shader text plus its length, so
     /// a deliberate change is re-recorded by copying one line, and the failure

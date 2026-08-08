@@ -4,20 +4,28 @@
 
 use crate::dtype::{Dtype, RoundMode, Splat};
 use crate::shape::SymId;
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashMap, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-/// The 21 unary math functions.
+/// A `Splat` read as f32 — the host-side view of a literal.
+pub fn splat_f32(s: Splat) -> f32 {
+    match s {
+        Splat::F32(v) => v,
+        Splat::F16(b) => half::f16::from_bits(b).to_f32(),
+        Splat::BF16(b) => half::bf16::from_bits(b).to_f32(),
+        Splat::U32(v) => v as f32,
+        Splat::I32(v) => v as f32,
+    }
+}
+
+/// The unary math functions.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum UnOp {
     Exp,
-    /// `exp` under a relaxed accuracy contract. A **distinct node**, not sugar
-    /// for [`UnOp::Exp`]: the reference keeps `NaryOp::ApproximateExp` separate
-    /// so hash-consing cannot merge it with a strict `exp`, and lowers both to
-    /// the target's exponential (`nary_direct.rs:1126`). Same here — the
-    /// contract is a *permission* to substitute a cheaper sequence, and no
-    /// backend currently takes it.
+    /// `exp` under a relaxed accuracy contract, permitting a cheaper backend
+    /// sequence. A distinct node from [`UnOp::Exp`], so hash-consing cannot
+    /// merge the two.
     ApproximateExp,
     /// Medium-accuracy `exp`. See [`UnOp::ApproximateExp`].
     LessApproximateExp,
@@ -40,8 +48,8 @@ pub enum UnOp {
     Atanh,
     Abs,
     Neg,
-    /// Unpack a `u32` of two packed f16s into a 2-lane f32 vector — how
-    /// native-layout GGUF f16 scales are read without `SHADER_F16`.
+    /// Unpack a `u32` of two packed f16s into a 2-lane f32 vector, which reads
+    /// native-layout GGUF f16 scales without `SHADER_F16`.
     Unpack2x16Float,
 }
 
@@ -73,8 +81,8 @@ pub enum BinOp {
 }
 
 impl BinOp {
-    /// Commutative children are sorted by `Id` at construction, so
-    /// commutativity is a canonical form rather than a rule family.
+    /// Commutative children are sorted by `Id` at construction, making
+    /// commutativity a canonical form.
     pub const fn is_commutative(self) -> bool {
         matches!(
             self,
@@ -125,8 +133,8 @@ pub enum CmpOp {
 pub struct Lit(pub Splat);
 
 /// A hash-consed scalar expression tree. `Clone` is a refcount bump;
-/// `PartialEq` compares the cached hash first. `Arc`, not `Rc`: kernel
-/// building runs on worker threads.
+/// `PartialEq` compares the cached hash first. `Arc` because kernel building
+/// runs on worker threads.
 #[derive(Clone, Debug)]
 pub struct ScalarExpr(Arc<ScalarNode>);
 
@@ -145,8 +153,8 @@ pub enum ScalarKind {
     /// Operand `i` of the enclosing `Map`/`KMap` body.
     Arg(u32),
     Lit(Lit),
-    /// A runtime scalar read from the uniform block. Never baked into a
-    /// kernel — this is what deletes the trainer's `[1]`-tensor scalars.
+    /// A runtime scalar read from the uniform block, never baked into a
+    /// kernel.
     Uniform(SymId),
     /// The current coordinate along `axis` of the enclosing index space.
     IndexOf(u32),
@@ -170,8 +178,7 @@ pub enum ScalarKind {
         t: ScalarExpr,
         f: ScalarExpr,
     },
-    /// Numeric conversion, differentiable both directions with no special
-    /// case in `map_adjoint`.
+    /// Numeric conversion, differentiable in both directions.
     Cast {
         to: Dtype,
         x: ScalarExpr,
@@ -252,101 +259,145 @@ impl ScalarExpr {
         Self::new(ScalarKind::Round { mode, x }, dtype)
     }
 
-    /// `IndexOf(i)` rewritten to `IndexOf(map(i))` throughout. What an
-    /// absorbed producer's coordinates are called in its consumer's space —
-    /// a permuted contraction operand walks producer axis `perm[j]` at its
-    /// own axis `j`, so the body's axis names shift by `perm⁻¹`.
-    pub fn remap_index_axes(&self, map: &impl Fn(u32) -> u32) -> Self {
+    /// Visit each direct child, in field order.
+    pub fn for_each_child(&self, mut f: impl FnMut(&ScalarExpr)) {
         match &self.0.kind {
-            ScalarKind::IndexOf(axis) => Self::index_of(map(*axis)),
-            ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::Uniform(_) => self.clone(),
-            ScalarKind::Un { op, x } => Self::un(*op, x.remap_index_axes(map)),
-            ScalarKind::Bin { op, a, b } => {
-                Self::bin(*op, a.remap_index_axes(map), b.remap_index_axes(map))
+            ScalarKind::Arg(_)
+            | ScalarKind::Lit(_)
+            | ScalarKind::Uniform(_)
+            | ScalarKind::IndexOf(_) => {}
+            ScalarKind::Un { x, .. }
+            | ScalarKind::Cast { x, .. }
+            | ScalarKind::Bitcast { x, .. }
+            | ScalarKind::Round { x, .. }
+            | ScalarKind::Splat { x, .. } => f(x),
+            ScalarKind::Bin { a, b, .. }
+            | ScalarKind::Cmp { a, b, .. }
+            | ScalarKind::Dot { a, b } => {
+                f(a);
+                f(b);
             }
-            ScalarKind::Cmp { op, a, b } => {
-                Self::cmp(*op, a.remap_index_axes(map), b.remap_index_axes(map))
+            ScalarKind::Select { c, t, f: fe } => {
+                f(c);
+                f(t);
+                f(fe);
             }
-            ScalarKind::Select { c, t, f } => Self::select(
-                c.remap_index_axes(map),
-                t.remap_index_axes(map),
-                f.remap_index_axes(map),
-            ),
-            ScalarKind::Cast { to, x } => Self::cast(*to, x.remap_index_axes(map)),
-            ScalarKind::Bitcast { to, x } => Self::bitcast(*to, x.remap_index_axes(map)),
-            ScalarKind::Round { mode, x } => Self::round(*mode, x.remap_index_axes(map)),
-            ScalarKind::Dot { a, b } => Self::new(
-                ScalarKind::Dot {
-                    a: a.remap_index_axes(map),
-                    b: b.remap_index_axes(map),
-                },
-                self.0.dtype,
-            ),
+        }
+    }
+
+    /// Rebuild this node over `f` of each child, in field order. Constructor
+    /// nodes re-derive their dtype from the rebuilt children; `Dot` and
+    /// `Splat` keep this node's dtype.
+    pub fn map_children(&self, mut f: impl FnMut(&ScalarExpr) -> ScalarExpr) -> Self {
+        match &self.0.kind {
+            ScalarKind::Arg(_)
+            | ScalarKind::Lit(_)
+            | ScalarKind::Uniform(_)
+            | ScalarKind::IndexOf(_) => self.clone(),
+            ScalarKind::Un { op, x } => Self::un(*op, f(x)),
+            ScalarKind::Bin { op, a, b } => Self::bin(*op, f(a), f(b)),
+            ScalarKind::Cmp { op, a, b } => Self::cmp(*op, f(a), f(b)),
+            ScalarKind::Select { c, t, f: fe } => Self::select(f(c), f(t), f(fe)),
+            ScalarKind::Cast { to, x } => Self::cast(*to, f(x)),
+            ScalarKind::Bitcast { to, x } => Self::bitcast(*to, f(x)),
+            ScalarKind::Round { mode, x } => Self::round(*mode, f(x)),
+            ScalarKind::Dot { a, b } => {
+                Self::new(ScalarKind::Dot { a: f(a), b: f(b) }, self.0.dtype)
+            }
             ScalarKind::Splat { lanes, x } => Self::new(
                 ScalarKind::Splat {
                     lanes: *lanes,
-                    x: x.remap_index_axes(map),
+                    x: f(x),
                 },
                 self.0.dtype,
             ),
         }
+    }
+
+    /// `IndexOf(i)` rewritten to `IndexOf(map(i))` throughout, renaming an
+    /// absorbed producer's axes into its consumer's index space.
+    ///
+    /// Memoized on `Arc` identity, so the rewrite is linear in node count.
+    pub fn remap_index_axes(&self, map: &impl Fn(u32) -> u32) -> Self {
+        let mut memo = FxHashMap::default();
+        self.remap_memo(map, &mut memo)
+    }
+
+    fn remap_memo(
+        &self,
+        map: &impl Fn(u32) -> u32,
+        memo: &mut FxHashMap<*const ScalarNode, ScalarExpr>,
+    ) -> Self {
+        if let Some(hit) = memo.get(&Arc::as_ptr(&self.0)) {
+            return hit.clone();
+        }
+        let out = match &self.0.kind {
+            ScalarKind::IndexOf(axis) => Self::index_of(map(*axis)),
+            _ => self.map_children(|c| c.remap_memo(map, memo)),
+        };
+        memo.insert(Arc::as_ptr(&self.0), out.clone());
+        out
     }
 
     /// Whether this expression names a loop coordinate anywhere. A lowering
     /// that evaluates a body with no coordinate vector consults this to know
     /// whether it must build one.
     pub fn reads_index_of(&self) -> bool {
-        match &self.0.kind {
-            ScalarKind::IndexOf(_) => true,
-            ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::Uniform(_) => false,
-            ScalarKind::Un { x, .. }
-            | ScalarKind::Cast { x, .. }
-            | ScalarKind::Bitcast { x, .. }
-            | ScalarKind::Round { x, .. }
-            | ScalarKind::Splat { x, .. } => x.reads_index_of(),
-            ScalarKind::Bin { a, b, .. }
-            | ScalarKind::Cmp { a, b, .. }
-            | ScalarKind::Dot { a, b } => a.reads_index_of() || b.reads_index_of(),
-            ScalarKind::Select { c, t, f } => {
-                c.reads_index_of() || t.reads_index_of() || f.reads_index_of()
-            }
+        if matches!(self.0.kind, ScalarKind::IndexOf(_)) {
+            return true;
         }
+        let mut found = false;
+        self.for_each_child(|c| found = found || c.reads_index_of());
+        found
     }
 
-    /// Substitute `args` for `Arg(i)` throughout. This *is*
-    /// elementwise-into-elementwise fusion: `pre.compose(body)` needs no
-    /// rewrite rule at all, only a tree substitution.
+    /// Whether this expression names the loop coordinate of `axis`.
+    pub fn reads_index_of_axis(&self, axis: u32) -> bool {
+        if let ScalarKind::IndexOf(a) = &self.0.kind {
+            return *a == axis;
+        }
+        let mut found = false;
+        self.for_each_child(|c| found = found || c.reads_index_of_axis(axis));
+        found
+    }
+
+    /// Whether this expression rounds anywhere: the one syntactic marker of a
+    /// value whose contract forbids reassociation.
+    pub fn has_round(&self) -> bool {
+        if matches!(self.0.kind, ScalarKind::Round { .. }) {
+            return true;
+        }
+        let mut found = false;
+        self.for_each_child(|c| found = found || c.has_round());
+        found
+    }
+
+    /// Substitute `args` for `Arg(i)` throughout. `pre.compose(body)` is
+    /// elementwise-into-elementwise fusion.
+    ///
+    /// Memoized on `Arc` identity, so substitution is linear in node count.
     pub fn compose(&self, args: &[ScalarExpr]) -> Self {
-        match &self.0.kind {
+        let mut memo = FxHashMap::default();
+        self.compose_memo(args, &mut memo)
+    }
+
+    fn compose_memo(
+        &self,
+        args: &[ScalarExpr],
+        memo: &mut FxHashMap<*const ScalarNode, ScalarExpr>,
+    ) -> Self {
+        if let Some(hit) = memo.get(&Arc::as_ptr(&self.0)) {
+            return hit.clone();
+        }
+        let out = match &self.0.kind {
             ScalarKind::Arg(i) => args
                 .get(*i as usize)
                 .cloned()
                 .unwrap_or_else(|| self.clone()),
-            ScalarKind::Lit(_) | ScalarKind::Uniform(_) | ScalarKind::IndexOf(_) => self.clone(),
-            ScalarKind::Un { op, x } => Self::un(*op, x.compose(args)),
-            ScalarKind::Bin { op, a, b } => Self::bin(*op, a.compose(args), b.compose(args)),
-            ScalarKind::Cmp { op, a, b } => Self::cmp(*op, a.compose(args), b.compose(args)),
-            ScalarKind::Select { c, t, f } => {
-                Self::select(c.compose(args), t.compose(args), f.compose(args))
-            }
-            ScalarKind::Cast { to, x } => Self::cast(*to, x.compose(args)),
-            ScalarKind::Bitcast { to, x } => Self::bitcast(*to, x.compose(args)),
-            ScalarKind::Round { mode, x } => Self::round(*mode, x.compose(args)),
-            ScalarKind::Dot { a, b } => Self::new(
-                ScalarKind::Dot {
-                    a: a.compose(args),
-                    b: b.compose(args),
-                },
-                self.0.dtype,
-            ),
-            ScalarKind::Splat { lanes, x } => Self::new(
-                ScalarKind::Splat {
-                    lanes: *lanes,
-                    x: x.compose(args),
-                },
-                self.0.dtype,
-            ),
-        }
+            _ => self.map_children(|c| c.compose_memo(args, memo)),
+        };
+        memo.insert(Arc::as_ptr(&self.0), out.clone());
+        out
     }
 }
 

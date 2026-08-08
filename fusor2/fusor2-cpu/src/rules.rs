@@ -1,16 +1,11 @@
 //! CPU-exclusive lowering rules.
 //!
-//! `widen-compute` is a **lowering rule**, not a one-lane `F16Scalar`: widen
-//! to f32 registers, compute, narrow on store. Non-contiguous access is four
-//! lowering alternatives — contiguous, broadcast/splat, unit-inner-stride
-//! sub-slice, general gather — plus a `Pack` operand access, never a
-//! per-vector runtime `is_contiguous()` branch.
+//! `widen-compute` is a lowering rule: widen f16/bf16 to f32 registers,
+//! compute, narrow on store. Non-contiguous access is four lowering
+//! alternatives — contiguous, broadcast/splat, unit-inner-stride sub-slice,
+//! general gather — plus a `Pack` operand access.
 //!
 //! Every guard below reads only [`Facts`]: legality, never profitability.
-//! There is no consumer count, no liveness and no cost here, because the
-//! `Facts` API structurally cannot supply one.
-//!
-//! Owned by W10.
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::Dtype;
@@ -77,8 +72,7 @@ rule!(
     apply = parallel_outer,
 );
 
-/// Every rule this backend contributes, in a fixed order that carries no
-/// semantics.
+/// Every rule this backend contributes; the order carries no semantics.
 pub static CPU_RULES: &[Rule] = &[
     WIDEN_COMPUTE,
     SELECT_VECTOR_WIDTH,
@@ -119,11 +113,8 @@ fn rebuild(node: &Node, ops: Vec<Operand>, sched: ScheduleDomain, body: ScalarEx
     }
 }
 
-/// Widen f16/bf16 storage to f32 registers, compute, narrow on store.
-///
-/// **One rule**, not a one-lane `F16Scalar` plus sixty lines of boilerplate per
-/// op family: the whole of the reference's `impl_f16_*_op!` families is this
-/// function.
+/// Widen f16/bf16 storage to f32 registers, compute, narrow on store. One
+/// rule covers every op family.
 pub fn widen_compute(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let (_, ops, sched, body) = kmap_parts(node)?;
     let narrow = |d: Dtype| matches!(d, Dtype::F16 | Dtype::BF16);
@@ -156,9 +147,8 @@ pub fn widen_compute(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
 
 /// Mint one `MapTiling` alternative per SIMD width the device reports.
 ///
-/// The width is *not* chosen here — every legal width coexists on the node's
-/// `ScheduleDomain` and one extraction picks the winner against the real
-/// shapes and the real ISA level.
+/// Every legal width coexists on the node's `ScheduleDomain`; extraction picks
+/// the winner.
 pub fn select_vector_width(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let (_, ops, sched, body) = kmap_parts(node)?;
     let ScheduleDomain::Map(dom) = sched else {
@@ -277,16 +267,10 @@ fn mint_access(
 
 /// Mark an outer tile loop parallel.
 ///
-/// Parallelism is a *scheduling attribute*, priced by the cost model against
-/// `DeviceFacts::thread_wake_ps`. That pricing is the entire replacement for
-/// `PARALLEL_THRESHOLD = 16_777_216`, which appears nowhere in this crate:
-/// with a persistent pool the break-even is microseconds of work, and the
-/// break-even is a number the model computes rather than a constant somebody
-/// picked.
-///
-/// The attribute rides on `MapTiling { dim: Some(0), tm > 1 }`, i.e. an
-/// outermost tile loop of `tm` grid points — `launch::grain_for` turns that
-/// into the `parallel_for` grain.
+/// Parallelism is a scheduling attribute, priced by the cost model against
+/// `DeviceFacts::thread_wake_ps`. It rides on
+/// `MapTiling { dim: Some(0), tm > 1 }`, an outermost tile loop of `tm` grid
+/// points that `launch::grain_for` turns into the `parallel_for` grain.
 pub fn parallel_outer(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let (_, ops, sched, body) = kmap_parts(node)?;
     if f.caps().threads <= 1 {

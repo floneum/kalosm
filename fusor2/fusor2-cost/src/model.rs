@@ -4,38 +4,26 @@
 //! `launch_ps + max(dram_ps, occupancy * (math_ps + wg_ps)) + occupancy *
 //! drain_ps + combine_ps`.
 //!
-//! T1 and T2 are **summed** inside the `max` because they contend for the
-//! same per-core issue and load/store slots; DRAM overlaps them; the combine
-//! dispatch sits behind its own barrier and adds. That summation is what
-//! makes the Apple anchors rank correctly and is `cost.rs:272`.
+//! T1 and T2 are summed inside the `max` because they contend for the same
+//! per-core issue and load/store slots; DRAM overlaps them; the combine
+//! dispatch sits behind its own barrier and adds.
 //!
-//! One scalar. **Never a lexicographic tuple**: the reference's own unit
-//! test shows the tuple gives the wrong verdict, and its own doc concedes
-//! dispatches are 0.2% of modelled time while the tuple will pay unbounded
-//! bandwidth to remove one. **Never a precision term**: precision is a
-//! verifier property (`NumericContract`), because a time-only model
-//! eliminates f32 everywhere.
-//!
-//! Owned by W6.
+//! The cost is one scalar, never a lexicographic tuple and never carrying a
+//! precision term; precision is a verifier property (`NumericContract`).
 
 use crate::terms;
-use fusor2_ir::cost::{CostModel, DeviceFacts, LaunchPlan, MacUnit, Picoseconds, ShapeStats};
+use fusor2_ir::cost::{CostModel, DeviceFacts, LaunchPlan, MacUnit, Picoseconds};
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::extract::{Extraction, PlanHash};
-use fusor2_ir::facts::ValueFacts;
+use fusor2_ir::facts::{ValueFacts, Work};
 use fusor2_ir::ir::level1::SchedPoint;
 use fusor2_ir::ir::Node;
-use fusor2_ir::shape::Dim;
-use parking_lot::RwLock;
-use rustc_hash::{FxHashSet, FxHasher};
-use std::hash::{Hash, Hasher};
 
 /// The one cost model. `score_fs` maps onto its terms one for one:
 /// T1 -> math, T2 -> wg, T3 -> drain, T4 -> the `max`, T5 -> the combine
 /// launch.
 pub struct Roofline {
     facts: DeviceFacts,
-    stats: RwLock<ShapeStats>,
 }
 
 /// The schedule-dependent inputs one launch's terms need, decoded from its
@@ -46,8 +34,8 @@ struct Sched {
     /// 1 loses the load/MMA overlap the threadgroup rate was fitted on.
     staging: u8,
     splits: u32,
-    /// Emitting subgroups per workgroup — the epilogue drain is per element
-    /// *and* per subgroup.
+    /// Emitting subgroups per workgroup: the epilogue drain is per element and
+    /// per subgroup.
     subgroups: u32,
 }
 
@@ -90,99 +78,7 @@ impl Sched {
 
 impl Roofline {
     pub fn new(facts: DeviceFacts) -> Self {
-        Self {
-            facts,
-            stats: RwLock::new(ShapeStats::new()),
-        }
-    }
-
-    /// Record that this plan ran at this dim binding, and return how many
-    /// times that pair has now been seen.
-    ///
-    /// Also bumps a plan-level counter (the empty binding), which is what
-    /// [`CostModel::total`] amortizes compilation against — a plan is
-    /// compiled once per plan, not once per binding.
-    pub fn observe_binding(&self, plan: PlanHash, binding: &[Dim]) -> u32 {
-        let mut stats = self.stats.write();
-        stats.observe(plan, &[]);
-        stats.observe(plan, binding)
-    }
-
-    /// How many times this plan has been seen at any binding. `1` on first
-    /// sighting, so nothing compiles speculatively and the generic symbolic
-    /// variant wins outright.
-    pub fn expected_reuse(&self, plan: PlanHash) -> u32 {
-        self.stats.read().expected_reuse(plan, &[])
-    }
-
-    /// The compile identity of one launch: its root, its members, the
-    /// schedule points they resolved to, whether the root is materialized,
-    /// and the device fingerprint.
-    ///
-    /// This is a *stand-in*. The authoritative `PlanHash` is
-    /// `plan::plan_hash` over the whole realized term (W7); a launch alone
-    /// cannot see that term. It is derived here rather than read off
-    /// [`LaunchPlan`] because that struct carries no hash — reported as a
-    /// contract gap.
-    pub fn launch_plan_hash(&self, launch: &LaunchPlan<'_>, materialized: bool) -> PlanHash {
-        let mut h = FxHasher::default();
-        self.facts.fingerprint().hash(&mut h);
-        launch.root.hash(&mut h);
-        materialized.hash(&mut h);
-        for id in launch.members {
-            id.hash(&mut h);
-            launch.theta.get(id).hash(&mut h);
-        }
-        launch.grid.hash(&mut h);
-        let lo = h.finish();
-        // A second lane so a 64-bit collision is not a plan collision.
-        let mut h2 = FxHasher::default();
-        (lo, 0x9e37_79b9_7f4a_7c15u64).hash(&mut h2);
-        launch.work.hash(&mut h2);
-        PlanHash((u128::from(h2.finish()) << 64) | u128::from(lo))
-    }
-
-    /// [`CostModel::launch_cost`] at an explicit operand dtype.
-    ///
-    /// [`LaunchPlan`] carries no dtype, so the trait method assumes f32.
-    /// Callers that know better — every real lowering does — should come
-    /// through here, so an f16 contraction is priced at the f16 MAC rate.
-    pub fn launch_cost_at(&self, launch: &LaunchPlan<'_>, dtype: Dtype) -> Picoseconds {
-        let f = &self.facts;
-        let sched = Sched::of(launch.theta.get(&launch.root).copied());
-        let elem_bytes = dtype.byte_size().max(1);
-
-        let math = terms::math_ps(f, launch.work, sched.unit, dtype);
-        let wg = terms::wg_ps(f, launch.work.wg_bytes, sched.staging);
-        let (num, den) = terms::occupancy_scale_num_den(f, launch.resident_lanes);
-        let issue = terms::scaled(math + wg, num, den);
-
-        // `writes` is the padded output the launch actually stores,
-        // including every split's full tile — exactly the reference's
-        // `workgroups * bm * bn` once divided by the element size.
-        let padded_out_elems = launch.writes / elem_bytes;
-        let drain = terms::scaled(
-            terms::drain_ps(
-                f,
-                padded_out_elems,
-                sched.subgroups,
-                u32::try_from(launch.wg_bytes).unwrap_or(u32::MAX),
-                f.caps.limits.max_compute_workgroup_storage_size,
-            ),
-            num,
-            den,
-        );
-
-        let dram = terms::dram_ps(f, launch.reads, launch.writes);
-        // One split's padded output; `(splits + 1)` then counts reading
-        // every partial and writing the result.
-        let combine = terms::combine_ps(
-            f,
-            sched.splits,
-            launch.writes / u64::from(sched.splits.max(1)),
-        );
-
-        Picoseconds(f.launch_ps) + dram.max(issue) + drain + combine
+        Self { facts }
     }
 }
 
@@ -207,20 +103,58 @@ impl CostModel for Roofline {
     }
 
     fn launch_cost(&self, launch: &LaunchPlan<'_>) -> Picoseconds {
-        self.launch_cost_at(launch, Dtype::F32)
+        // [`LaunchPlan`] carries no dtype, so this prices at f32.
+        let dtype = Dtype::F32;
+        let f = &self.facts;
+        let sched = Sched::of(launch.theta.get(&launch.root).copied());
+        let elem_bytes = dtype.byte_size().max(1);
+
+        let math = terms::math_ps(f, launch.work, sched.unit, dtype);
+        let wg = terms::wg_ps(f, launch.work.wg_bytes, sched.staging);
+        let (num, den) = terms::occupancy_scale_num_den(f, launch.resident_lanes);
+        let issue = terms::scaled(math + wg, num, den);
+
+        // `writes` is the padded output the launch stores, including every
+        // split's full tile: `workgroups * bm * bn` in elements.
+        let padded_out_elems = launch.writes / elem_bytes;
+        let drain = terms::scaled(
+            terms::drain_ps(
+                f,
+                padded_out_elems,
+                sched.subgroups,
+                u32::try_from(launch.wg_bytes).unwrap_or(u32::MAX),
+                f.caps.limits.max_compute_workgroup_storage_size,
+            ),
+            num,
+            den,
+        );
+
+        let dram = terms::dram_ps(f, launch.reads, launch.writes);
+        // One split's padded output; `(splits + 1)` then counts reading
+        // every partial and writing the result.
+        let combine = terms::combine_ps(
+            f,
+            sched.splits,
+            launch.writes / u64::from(sched.splits.max(1)),
+        );
+
+        Picoseconds(f.launch_ps) + dram.max(issue) + drain + combine
     }
 
-    fn node_math(
+    fn node_work(&self, node: &Node, ins: &[ValueFacts], out: &ValueFacts) -> Work {
+        fusor2_ir::semantics::work::work_of(&node.op, ins, out)
+    }
+
+    fn math_at(
         &self,
-        node: &Node,
+        work: Work,
         ins: &[ValueFacts],
         out: &ValueFacts,
         theta: Option<SchedPoint>,
     ) -> Picoseconds {
         let (unit, dtype) = unit_and_dtype(ins, out, theta);
-        let work = fusor2_ir::semantics::work::work_of(&node.op, ins, out);
-        // Zero traffic, no occupancy scaling. The admissible lower bound is
-        // built from this, and either addition would break admissibility.
+        // Zero traffic, no occupancy scaling: the admissible lower bound is
+        // built from this.
         terms::math_ps(&self.facts, work, unit, dtype)
     }
 
@@ -233,17 +167,14 @@ impl CostModel for Roofline {
         Picoseconds(self.facts.compile_ps_per_kernel / u64::from(expected_reuse.max(1)))
     }
 
-    fn total(&self, extraction: &Extraction, launches: &[LaunchPlan<'_>]) -> Picoseconds {
+    fn total(&self, _extraction: &Extraction, launches: &[LaunchPlan<'_>]) -> Picoseconds {
         let mut total = Picoseconds(0);
-        let mut compiled = FxHashSet::default();
         for launch in launches {
             total += self.launch_cost(launch);
-            let hash = self.launch_plan_hash(launch, extraction.is_materialized(launch.root));
-            if compiled.insert(hash) {
-                total += self.compile_amortized(hash, self.expected_reuse(hash));
-            }
         }
-        total
+        // Compilation is one kernel per launch at first-sighting reuse; every
+        // launch's root is unique within one realized plan.
+        total + Picoseconds((launches.len() as u64).saturating_mul(self.facts.compile_ps_per_kernel))
     }
 }
 
@@ -261,7 +192,7 @@ mod tests {
     const SUBGROUP_WIDTH: u32 = 32;
     const COOP_DIM: u32 = 8;
 
-    /// One row of the reference's `COOP_TILE_TABLE`.
+    /// One row of `COOP_TILE_TABLE`.
     #[derive(Copy, Clone, Debug)]
     struct Profile {
         bm: u32,
@@ -294,7 +225,7 @@ mod tests {
                 cg,
             }
         }
-        /// `DenseCoopMatmulTile::stage_pair_elements`, verbatim.
+        /// Matches `DenseCoopMatmulTile::stage_pair_elements`.
         fn stage_pair_elements(self) -> u64 {
             let bn_pass = u64::from(self.bn / self.n_passes);
             let a_tile = u64::from(self.bm) * (u64::from(self.bk) + 1) - 1;
@@ -306,7 +237,7 @@ mod tests {
         }
     }
 
-    /// The five profiles the reference's doc header measures.
+    /// The five measured profiles.
     const P128X64: Profile = Profile::new(128, 64, 16, 8, 1);
     const P64X64: Profile = Profile::new(64, 64, 16, 4, 1);
     const P128X128: Profile = Profile::new(128, 128, 16, 8, 2);
@@ -350,10 +281,7 @@ mod tests {
     }
 
     /// The launch a cooperative contraction at one schedule point produces,
-    /// with every quantity derived exactly the way `score_fs` derives its
-    /// own. This is the arithmetic W1's `work()` and W7's `realize()` will
-    /// own; reproducing it here means the anchors test measures the cost
-    /// model rather than a stub.
+    /// with every quantity derived the way `score_fs` derives its own.
     #[allow(clippy::too_many_arguments)]
     fn coop_case(
         p: Profile,
@@ -385,10 +313,9 @@ mod tests {
         let m_padded = tiles_m * bm;
         let n_padded = tiles_n * bn;
 
-        // T1's MAC count, on the *padded* tile. There is no routing guard:
-        // an over-padded candidate simply prices high here.
+        // T1's MAC count, on the padded tile: an over-padded candidate prices
+        // high here rather than being vetoed.
         let macs = per_workgroup * bm * bn * bk;
-        // cost.rs:201-202, verbatim.
         let fragment_bytes =
             n_passes * subgroups * (tr + tc) * (bk / u64::from(COOP_DIM)) * 64 * elem_bytes;
         let stage_bytes = n_passes * (bm * bk + bk * bn_pass) * elem_bytes;
@@ -432,7 +359,7 @@ mod tests {
         }
     }
 
-    /// The reference's `split_candidates`: never splitting, plus every
+    /// The legal split counts: never splitting, plus every
     /// divisor of the K loop leaving two iterations per workgroup, capped at
     /// 64.
     fn split_candidates(k_iterations: u32) -> Vec<u32> {
@@ -443,7 +370,7 @@ mod tests {
     }
 
     /// Best cost of one profile on one contraction, minimized over its legal
-    /// split counts and staging depths exactly as the reference does.
+    /// split counts and staging depths.
     fn best_cost(model: &Roofline, p: Profile, m: u32, k: u32, n: u32, elem_bytes: u64) -> u64 {
         let max_storage = model.facts.caps.limits.max_compute_workgroup_storage_size;
         let mut best = u64::MAX;
@@ -464,21 +391,10 @@ mod tests {
         Roofline::new(seed_facts(&gpu_caps("anchor")))
     }
 
-    /// Test 1. The five profiles of the reference's doc header over its five
-    /// measured contractions. Measured per-entry minima in ms:
-    ///
-    /// | m x k x n        | 128x64 | 64x64 | 128x128 | 64x16 | 16x64 |
-    /// |------------------|--------|-------|---------|-------|-------|
-    /// | 16384x384x384    | 0.799  | 0.822 | 1.011   | 0.990 | 1.197 |
-    /// | 16384x384x1536   | 2.705  | 2.893 | 3.456   | 3.823 | 3.996 |
-    /// | 16384x1536x384   | 2.698  | 2.885 | 3.646   | 3.836 | 4.023 |
-    /// | 16384x3072x1536  | 20.41  | 21.16 | 28.30   | 30.58 | 32.44 |
-    /// | 1024x1024x1024   | 0.445  | 0.445 | 0.577   | 0.446 | 0.634 |
-    ///
-    /// The model is a *ranking* function; its absolute magnitude is not
-    /// calibrated (the rates are fitted for argmin inside a documented box).
-    /// What must hold is the argmin, and that the four K-deep shapes take a
-    /// 128-wide profile.
+    /// The five profiles over five measured contractions. The model is a
+    /// ranking function whose absolute magnitude is not calibrated: what must
+    /// hold is the argmin, and that the four K-deep shapes take a 128-wide
+    /// profile.
     #[test]
     fn apple_seed_reproduces_score_fs_anchors() {
         /// One measured row: a contraction, and the profile names that tied
@@ -507,12 +423,10 @@ mod tests {
                 .iter()
                 .map(|&(name, p)| (name, best_cost(&model, p, m, k, n, 4), p))
                 .collect();
-            // The reference's tie-break chain, reached and therefore
-            // load-bearing: the score is invariant to `n_passes` by
-            // construction (a p-pass profile does p times the per-workgroup
-            // work over a p-times-smaller grid), and every recorded sweep
-            // says fewer passes wins, so it leads. The two `Reverse` levels
-            // keep the wider tile on an exact tie.
+            // The score is invariant to `n_passes` (a p-pass profile does p
+            // times the per-workgroup work over a p-times-smaller grid), so
+            // fewer passes leads the tie-break; the two `Reverse` levels keep
+            // the wider tile on an exact tie.
             scored.sort_by_key(|&(_, cost, p)| {
                 (cost, p.n_passes, Reverse(p.bm), Reverse(p.bn))
             });
@@ -529,10 +443,8 @@ mod tests {
         }
     }
 
-    /// Test 2. A fusion that removes one launch but adds 64 MiB of DRAM
-    /// traffic must cost strictly more. Under the reference's lexicographic
-    /// `(dispatches, bytes, work)` the dispatch saving is worth unbounded
-    /// bandwidth; here the launch is worth 1 us and the traffic 177 us.
+    /// A fusion that removes one launch but adds 64 MiB of DRAM traffic costs
+    /// strictly more.
     #[test]
     fn scalar_cost_lets_traffic_outweigh_a_dispatch() {
         let model = apple();
@@ -549,11 +461,8 @@ mod tests {
         );
     }
 
-    /// Test 5. At `1x4096x4096` f32 — the reference's pinned golden row,
-    /// where its family selector picks Coop, its tile scorer declines on the
-    /// padding gate, and production silently runs a third path — every legal
-    /// cooperative schedule point must simply *price above* the sgemv
-    /// candidate. No guard is invoked, because none exists.
+    /// At `1x4096x4096` f32 every legal cooperative schedule point prices above
+    /// the sgemv candidate, with no guard involved.
     #[test]
     fn padded_coop_loses_to_sgemv_on_cost() {
         let model = apple();
@@ -600,26 +509,18 @@ mod tests {
                 "coop {name} priced {coop} against sgemv {sgemv_cost}"
             );
         }
-        // And the reason is padding, priced through `Work::macs` rather than
-        // vetoed: the 128-wide profile pads m from 1 to 128.
+        // Padding is priced through `Work::macs`: the 128-wide profile pads m
+        // from 1 to 128.
         let padded = coop_case(P128X64, m, k, n, 1, 1, 1, 2, elem);
         assert_eq!(padded.work.macs, 128 * 4_096 * 4_096);
         assert_eq!(sgemv.work.macs, 4_096 * 4_096);
     }
 
-    /// Test 7. The split-K sweep is a lane-count dial: more splits means
-    /// more resident lanes *and* more redundant padded-tile writes plus a
-    /// bigger combine. The reference measures 64x2048x64 at the 64x64
-    /// profile running 0.202 ms with 20,480 lanes resident and 0.310 ms with
-    /// 81,920 — the starved grid is 0.65x, where a linear occupancy law says
-    /// it should have been 3.2x slower.
-    ///
-    /// The reference records the lane counts but not the batch they were
-    /// measured at. With this profile's 128 threads and a single output
-    /// tile, `resident = batch * splits * 128`, so 20,480 and 81,920 are
-    /// reachable at batch 10 with splits 16 and 64 — both legal divisors of
-    /// the 128-iteration K loop, which is what keeps T1 and T2 constant
-    /// across the pair.
+    /// Split-K is a lane-count dial: more splits means more resident lanes,
+    /// more redundant padded-tile writes and a bigger combine. The occupancy
+    /// law is cube-root, not linear. With the 64x64 profile's 128 threads and
+    /// one output tile, `resident = batch * splits * 128`, and splits 16 and 64
+    /// both divide the 128-iteration K loop, so T1 and T2 stay constant.
     #[test]
     fn occupancy_cube_root_matches_split_k_sweep() {
         let model = apple();
@@ -638,8 +539,8 @@ mod tests {
             "predicted {ratio}, measured 0.202/0.310 = 0.652"
         );
 
-        // A linear law would scale the starved grid by
-        // `saturation_lanes / resident` = 3.2 and land nowhere near it.
+        // A linear law scales the starved grid by
+        // `saturation_lanes / resident` = 3.2.
         let f = &model.facts;
         let linear = |case: &Case, scale: f64| {
             let sched = Sched::of(case.theta.get(&case.members[0]).copied());
@@ -668,85 +569,28 @@ mod tests {
         assert!(linear_ratio > 1.5, "{linear_ratio}");
     }
 
-    /// Test 9. On first sighting the generic symbolic variant wins outright
-    /// — nothing compiles per length bucket. Once a binding recurs, a
-    /// specialization that saves real time wins.
+    /// `compile_amortized` divides by expected reuse and clamps zero to one.
     #[test]
-    fn compile_amortizes_to_generic_on_first_sighting() {
+    fn compile_amortized_divides_by_reuse() {
         let model = apple();
         let h = PlanHash(0xdead_beef);
         assert_eq!(model.compile_amortized(h, 1).0, 1_000_000_000);
         assert_eq!(model.compile_amortized(h, 64).0, 15_625_000);
         assert_eq!(model.compile_amortized(h, 0).0, 1_000_000_000);
-
-        // The trainer's modal bucket: 768 units at batch 128 through the
-        // 256->96 dense head. The symbolic variant reads its extents from
-        // binding 0 and pays index arithmetic for it; the specialized
-        // variant bakes them and does not.
-        let rows = 128u64 * 768;
-        let mk = |index_ops: u64, root: Id| {
-            let mut theta = FxHashMap::default();
-            theta.insert(root, SchedPoint::Point);
-            Case {
-                members: vec![root],
-                theta,
-                reads: vec![(rows * 256 * 4, 1)],
-                writes: rows * 96 * 4,
-                work: Work {
-                    macs: rows * 256 * 96,
-                    transcendentals: 0,
-                    index_ops,
-                    wg_bytes: 0,
-                },
-                resident_lanes: 1 << 20,
-                wg_bytes: 0,
-                grid: [1_024, 1, 1],
-            }
-        };
-        let symbolic = mk(rows * 96, Id(1));
-        let specialized = mk(0, Id(2));
-
-        let extraction = Extraction::default();
-        let sym_hash = model.launch_plan_hash(&symbolic.plan(), false);
-        let spec_hash = model.launch_plan_hash(&specialized.plan(), false);
-        assert_ne!(sym_hash, spec_hash);
-
-        // The symbolic plan already serves every other bucket.
-        for _ in 0..64 {
-            model.observe_binding(sym_hash, &[Dim::Const(768)]);
-        }
-        let sym_total = model.total(&extraction, &[symbolic.plan()]).0;
-        let spec_total = model.total(&extraction, &[specialized.plan()]).0;
-        assert!(
-            sym_total < spec_total,
-            "on first sighting the generic variant must win: {sym_total} vs {spec_total}"
-        );
-
-        // After the binding recurs, the specialization pays for itself.
-        for _ in 0..64 {
-            model.observe_binding(spec_hash, &[Dim::Const(768)]);
-        }
-        let sym_total = model.total(&extraction, &[symbolic.plan()]).0;
-        let spec_total = model.total(&extraction, &[specialized.plan()]).0;
-        assert!(
-            spec_total < sym_total,
-            "at reuse 64 the specialization must win: {spec_total} vs {sym_total}"
-        );
     }
 
-    /// `total` charges compilation once per distinct plan, not once per
-    /// launch, and is a plain sum otherwise.
+    /// `total` charges compilation once per launch at first-sighting reuse,
+    /// and is a plain sum otherwise.
     #[test]
-    fn total_is_a_plain_sum_with_one_compile_per_plan() {
+    fn total_is_a_plain_sum_with_one_compile_per_launch() {
         let model = apple();
         let case = coop_case(P64X64, 512, 512, 512, 1, 1, 1, 2, 4);
         let extraction = Extraction::default();
         let one = model.launch_cost(&case.plan()).0;
-        let hash = model.launch_plan_hash(&case.plan(), false);
-        let compile = model.compile_amortized(hash, 1).0;
+        let compile = model.compile_amortized(PlanHash(0), 1).0;
 
         let plans = [case.plan(), case.plan(), case.plan()];
-        assert_eq!(model.total(&extraction, &plans).0, 3 * one + compile);
+        assert_eq!(model.total(&extraction, &plans).0, 3 * (one + compile));
         assert_eq!(model.total(&extraction, &[]).0, 0);
     }
 
@@ -759,7 +603,7 @@ mod tests {
         assert_eq!(erased.facts().launch_ps, 1_000_000);
         let boxed: Box<dyn CostModel> = Box::new(apple());
         assert_eq!(boxed.traffic(1 << 30, 1).0, erased.traffic(1 << 30, 1).0);
-        // And `Send + Sync`, because kernel building runs on worker threads.
+        // `Send + Sync`, because kernel building runs on worker threads.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Roofline>();
     }
@@ -778,8 +622,7 @@ mod tests {
         assert_eq!(model.traffic(bytes, 1), model.traffic(bytes, 8));
     }
 
-    /// Staging depth and workgroup width both move the cost, which is what
-    /// makes them real decisions rather than table columns.
+    /// Staging depth and workgroup width both move the cost.
     #[test]
     fn staging_depth_and_subgroup_count_move_the_cost() {
         let model = apple();
@@ -789,7 +632,7 @@ mod tests {
             model.launch_cost(&single.plan()) > model.launch_cost(&double.plan()),
             "one staged pair loses the load/MMA overlap"
         );
-        // ... but it halves the arena, so a core holds more of them.
+        // Single staging halves the arena, so a core holds more of them.
         assert!(single.wg_bytes < double.wg_bytes);
     }
 }

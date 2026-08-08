@@ -1,10 +1,8 @@
 //! Dispatching a compiled [`CpuKernel`](crate::emit::CpuKernel) over the
-//! worker pool. The ISA level is dispatched **once per kernel launch**, not
-//! per row: `dispatch!` establishes the target features around the whole grid
+//! worker pool. The ISA level is dispatched once per kernel launch, not per
+//! row: `dispatch!` establishes the target features around the whole grid
 //! traversal, and the lane width `W` is a const generic inside it, so an `MxN`
-//! register accumulator tile survives all the way into the innermost body.
-//!
-//! Owned by W10.
+//! register accumulator tile survives into the innermost body.
 
 use fusor2_ir::error::Error;
 use fusor2_ir::target::{Buf, Uniforms};
@@ -12,7 +10,7 @@ use fusor2_ir::Result;
 use std::sync::atomic::Ordering;
 
 use crate::alloc::AlignedBuf;
-use crate::emit::{run_workgroup, CpuKernel, Program, RawBuf};
+use crate::emit::{run_span, CpuKernel, Program, RawBuf};
 use crate::pool::{WorkerPool, DISPATCH_COUNT};
 
 /// Run one dispatch, parallelizing the grid when the pool is worth waking.
@@ -65,9 +63,8 @@ pub fn run(kernel: &CpuKernel, grid: [u32; 3], binds: &[Buf], uniforms: &Uniform
     let width = prog.width;
 
     let bufs_ref: &[RawBuf] = &bufs;
-    // Dispatches attributable to *this* launch, so the count is grid
-    // independent and a concurrent launch on another host thread cannot
-    // inflate it.
+    // Dispatches attributable to this launch, so the count is grid independent
+    // and a concurrent launch on another host thread cannot inflate it.
     let dispatches = std::sync::atomic::AtomicU64::new(0);
     let body = |span: std::ops::Range<u64>| {
         pool.with_scratch(arena, |scratch| {
@@ -77,13 +74,10 @@ pub fn run(kernel: &CpuKernel, grid: [u32; 3], binds: &[Buf], uniforms: &Uniform
             dispatches.fetch_add(1, Ordering::Relaxed);
             let level = crate::caps::level();
             fearless_simd::dispatch!(level, _simd => {
-                for linear in span.clone() {
-                    let gid = unlinearize(linear, grid);
-                    match width {
-                        16 => run_workgroup::<16>(prog, gid, bufs_ref, ptr),
-                        8 => run_workgroup::<8>(prog, gid, bufs_ref, ptr),
-                        _ => run_workgroup::<4>(prog, gid, bufs_ref, ptr),
-                    }
+                match width {
+                    16 => run_span::<16>(prog, span.clone(), grid, bufs_ref, ptr),
+                    8 => run_span::<8>(prog, span.clone(), grid, bufs_ref, ptr),
+                    _ => run_span::<4>(prog, span.clone(), grid, bufs_ref, ptr),
                 }
             });
         });
@@ -96,7 +90,7 @@ pub fn run(kernel: &CpuKernel, grid: [u32; 3], binds: &[Buf], uniforms: &Uniform
 
 /// Recover the 3-D workgroup id from a linear grid index.
 #[inline(always)]
-fn unlinearize(linear: u64, grid: [u32; 3]) -> [u32; 3] {
+pub(crate) fn unlinearize(linear: u64, grid: [u32; 3]) -> [u32; 3] {
     let x = grid[0].max(1) as u64;
     let y = grid[1].max(1) as u64;
     [
@@ -109,11 +103,9 @@ fn unlinearize(linear: u64, grid: [u32; 3]) -> [u32; 3] {
 /// Chunk size handed to `parallel_for`, chosen so one chunk amortizes
 /// `thread_wake_ps`.
 ///
-/// This is the whole of the "should we parallelize?" question on CPU, and it
-/// is a *cost* question, which is why `PARALLEL_THRESHOLD = 16_777_216` does
-/// not appear anywhere in this crate: the extractor prices an outer tile loop
-/// marked parallel against the measured pool-wake cost, and the launcher only
-/// has to pick a grain that keeps every worker fed.
+/// Whether to parallelize at all is a cost question decided by the extractor,
+/// which prices an outer tile loop marked parallel against the measured
+/// pool-wake cost. The launcher only picks a grain that keeps every worker fed.
 pub fn grain_for(total: u64, threads: u32) -> u64 {
     let threads = threads.max(1) as u64;
     if threads == 1 {
@@ -124,7 +116,7 @@ pub fn grain_for(total: u64, threads: u32) -> u64 {
     (total.div_ceil(threads * 4)).max(1)
 }
 
-/// `Level` dispatches the most recent launch performed.
+/// Number of `Level` dispatches performed by the most recent launch.
 pub fn dispatch_count() -> u64 {
     DISPATCH_COUNT.load(Ordering::Relaxed)
 }

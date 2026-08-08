@@ -1,9 +1,6 @@
-//! L2 `tile` — one kernel body. The reference's `tile-ir` near-verbatim with
-//! four changes: `Shared` is **deleted** (structural sharing is the hash-cons,
-//! so two identical subtrees built separately merge — which `Rc::as_ptr`
-//! memoization structurally cannot); [`Stmt::AtomicAdd`] is added;
-//! `NumericContract` rides on `Unary`/`Binary`; and `bf16` joins
-//! [`ScalarElement`]. Element type is runtime data, never a marker type.
+//! L2 `tile` — one kernel body. Structural sharing *is* the hash-cons, so two
+//! identical subtrees built separately merge. `NumericContract` rides on
+//! `Unary`/`Binary`, and element type is runtime data, never a marker type.
 //!
 //! L2 is produced *after* extraction and is not part of the e-graph. Barrier
 //! elision and arena packing stay closed-form argmins here with an independent
@@ -18,9 +15,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-// ---------------------------------------------------------------------------
 // Element types
-// ---------------------------------------------------------------------------
 
 /// Scalar elements backing scalar, vector and cooperative-matrix values.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -117,9 +112,7 @@ impl ElementType {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Memory
-// ---------------------------------------------------------------------------
 
 /// Exactly two memory spaces. Nothing fusor emits needs uniform buffers,
 /// push constants, textures, samplers, or (outside [`Stmt::AtomicAdd`])
@@ -182,11 +175,10 @@ pub struct BufferDecl {
 ///
 /// **Identity-bearing**, for the same reason [`LocalDecl`] is. Two tiles of
 /// the same element, shape and name are two *allocations*, which the arena
-/// may place at two different offsets and which a barrier may separate. Under
-/// structural equality they were one value to the L2 term memo, so a
-/// `LoadTile`/`CoopLoad` off the second folded into the first — a lowering
-/// that staged into two same-shaped buffers (double buffering, `staging: 2`)
-/// read one of them twice and never touched the other.
+/// may place at two different offsets and which a barrier may separate, so
+/// `id` — not the element or shape — is what equality and hashing key on.
+/// Otherwise a `LoadTile`/`CoopLoad` off one would hash-cons into the other,
+/// and double buffering (`staging: 2`) would read one tile twice.
 #[derive(Clone, Debug, Eq)]
 pub struct TileDecl {
     pub element: ElementType,
@@ -227,10 +219,10 @@ impl Hash for TileDecl {
 ///
 /// **Identity-bearing.** Two locals of the same element type are two
 /// registers, so `id` — not `element` — is what equality and hashing key on.
-/// Without it the L2 term memo folded `LoadLocal(a)` into `LoadLocal(b)`
+/// Without it the L2 term memo would fold `LoadLocal(a)` into `LoadLocal(b)`
 /// whenever they had the same type, and every kernel carrying more than one
 /// same-typed accumulator (a `tn`-wide register tile, a multi-slot fold
-/// carrier, a coop accumulator pair) read one register `tn` times.
+/// carrier, a coop accumulator pair) would read one register `tn` times.
 #[derive(Clone, Debug, Eq)]
 pub struct LocalDecl {
     pub element: ElementType,
@@ -303,9 +295,7 @@ pub enum WorkgroupAxis {
     Z,
 }
 
-// ---------------------------------------------------------------------------
 // Op tables
-// ---------------------------------------------------------------------------
 
 /// The 21 unary math functions.
 pub type TileUnaryOp = crate::scalar::UnOp;
@@ -319,8 +309,7 @@ pub type TileCompareOp = crate::scalar::CmpOp;
 /// This is the **hardware fast path**, not the general reduction algebra: the
 /// four operators a subgroup collective and a shared-memory tree can be spelled
 /// with directly. Everything wider goes through [`Stmt::Reduce`]'s
-/// [`MergeBody`]. `TileReduceOp` survives because the single-slot path carries
-/// every fold in the system and must keep emitting byte-identical code.
+/// [`MergeBody`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileReduceOp {
     Sum,
@@ -365,6 +354,31 @@ pub fn fast_reduce_op(c: &crate::carrier::Carrier) -> Option<TileReduceOp> {
         return None;
     }
     TileReduceOp::of_binary(c.kind()?)
+}
+
+/// [`fast_reduce_op`] as a requirement: one scalar slot whose merge is a
+/// binop, mapped onto [`TileReduceOp`], or the reason there is none.
+///
+/// Everything wider needs the N-lane [`Stmt::Reduce`] and says so instead of
+/// computing slot 0 and dropping the rest. The message is target-neutral; the
+/// caller wraps it in its own error variant.
+pub fn single_slot_reduce_op(
+    c: &crate::carrier::Carrier,
+) -> std::result::Result<TileReduceOp, String> {
+    if !matches!(c.slots.as_slice(), [crate::carrier::SlotTy::Scalar]) {
+        return Err(format!(
+            "a {}-slot carrier needs the N-lane reduce; this backend only \
+             lowers a single scalar slot",
+            c.width()
+        ));
+    }
+    c.kind().and_then(TileReduceOp::of_binary).ok_or_else(|| {
+        format!(
+            "carrier merge {:?} has no hardware collective; the generic \
+             merge path is not built yet",
+            c.kind()
+        )
+    })
 }
 
 /// Built-in u32 quantities appearing as leaves in index arithmetic.
@@ -449,9 +463,7 @@ pub enum CoopSrc {
     },
 }
 
-// ---------------------------------------------------------------------------
 // Expressions
-// ---------------------------------------------------------------------------
 
 /// A hash-consed L2 value. Structural sharing *is* the hash-cons: two
 /// identical subtrees built separately merge, which pointer-keyed
@@ -587,10 +599,9 @@ pub enum TileExprKind {
     ///
     /// A `CoopMatrix` accumulator has to start somewhere, and a scalar zero is
     /// not that somewhere: `Stmt::Loop` requires `init.element() ==
-    /// local.element`, so `lower_coop` initializing its C fragment with an
-    /// `f32` literal failed `verify_l2` on every device that selected the
-    /// cooperative family. There is no arithmetic that produces a zero
-    /// fragment from a scalar, so it is a leaf.
+    /// local.element`, so a C fragment initialized with an `f32` literal fails
+    /// `verify_l2`. No arithmetic produces a zero fragment from a scalar, so
+    /// this is a leaf.
     CoopZero {
         role: CoopMatrixRole,
         scalar: ScalarElement,
@@ -736,9 +747,7 @@ impl Hash for TileExpr {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Statements
-// ---------------------------------------------------------------------------
 
 /// One accumulator carried by a counted loop, so the lowerer emits
 /// SSA-carried values rather than reloading per iteration.
@@ -774,8 +783,8 @@ impl MergeBody {
     pub fn lanes(&self) -> usize {
         self.body.len()
     }
-    /// Arity agreement across the three vectors — the clause that makes the
-    /// `accs[0]` bug unrepresentable.
+    /// Arity agreement across the three vectors: every lane has a left
+    /// parameter, a right parameter and a body expression.
     pub fn is_arity_consistent(&self) -> bool {
         self.lhs.len() == self.body.len() && self.rhs.len() == self.body.len()
     }
@@ -848,12 +857,11 @@ pub enum Stmt {
     /// `fast` is set by the canonical constructor **iff** `values.len() == 1`
     /// and `merge.body[0]` is exactly `binary(op.binary(), load(lhs[0]),
     /// load(rhs[0]))`. It is computed, never author-supplied, so it cannot drift
-    /// from `merge`; both emitters open their arm with it and take the existing
-    /// collective path unchanged.
+    /// from `merge`; both emitters open their arm with it and take the
+    /// collective path.
     ///
     /// `scratch` holds one workgroup tile per lane for the `Workgroup`/`Loop`
-    /// kinds and is empty for `Subgroup`. `kind`'s own scratch is `scratch[0]`,
-    /// so a one-lane reduction is exactly the node it is today.
+    /// kinds and is empty for `Subgroup`. `kind`'s own scratch is `scratch[0]`.
     Reduce {
         kind: Box<ReduceKind>,
         values: SmallVec<[TileExpr; 4]>,
@@ -903,17 +911,13 @@ impl Stmt {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Capability tokens
-// ---------------------------------------------------------------------------
 
 /// Proof that the device supports workgroup byte-arena aliasing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ByteArenaToken;
 
-// ---------------------------------------------------------------------------
 // Kernel IR
-// ---------------------------------------------------------------------------
 
 /// One kernel body. `buffers` is in binding order; binding 0 is always the
 /// uniform block. `grid` is already folded against
@@ -956,16 +960,13 @@ pub struct Tiles {
 /// `verify_l1` admits against and the L2 emitter lays out with. There is no
 /// estimator, therefore no L1/L2 admission mismatch and no "extraction
 /// commits a plan that fails L2 verification and silently falls back".
-/// `total_bytes` feeds both the footprint check and the occupancy term,
-/// closing the feedback loop the reference leaves open.
+/// `total_bytes` feeds both the footprint check and the occupancy term.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ArenaPlan {
     pub mode: ArenaMode,
     pub total_bytes: u32,
     pub placements: SmallVec<[Placement; 8]>,
-    /// Root-level statement indices where a barrier was inserted, best
-    /// first. The reference computes this delta and throws it away for want
-    /// of a caller; here it has one.
+    /// Root-level statement indices where a barrier was inserted, best first.
     pub barriers_inserted: SmallVec<[u32; 4]>,
 }
 
@@ -995,8 +996,7 @@ pub trait ArenaPlanner: Send + Sync {
     fn verify_arena(&self, ir: &KernelIr, plan: &ArenaPlan) -> Result<()>;
 
     /// A `Barrier` may not appear under an `If` whose predicate is
-    /// non-uniform over the group. The reference asserts "guaranteed" with
-    /// no analysis to establish it; this is that analysis.
+    /// non-uniform over the group. This is the analysis that establishes it.
     fn verify_uniformity(&self, ir: &KernelIr) -> Result<()>;
 }
 
@@ -1045,10 +1045,9 @@ pub fn cooperative_store_layout_supported(layout: &TileLayout) -> bool {
 mod local_identity_tests {
     use super::*;
 
-    /// Two locals of the same element type are two registers. Before `id` they
-    /// were `==`, so the L2 term memo folded their `LoadLocal`s together and a
-    /// kernel carrying `tn` same-typed accumulators read one register `tn`
-    /// times — which is what made every register-tiled GEMM column identical.
+    /// Two locals of the same element type are two registers, so their
+    /// `LoadLocal`s must not hash-cons together: a kernel carrying `tn`
+    /// same-typed accumulators would otherwise read one register `tn` times.
     #[test]
     fn two_same_typed_locals_are_two_registers() {
         let f32e = ElementType::Scalar(ScalarElement::F32);

@@ -1,19 +1,15 @@
 //! Dense contraction: the cooperative-matrix, SGEMM, SGEMV and generic-fold
 //! bodies.
 //!
-//! All four families coexist in one e-class, so nothing here routes: the arm
-//! that runs is the one extraction selected. `pre_a`/`pre_b`/`post` fuse into
-//! the k-loop prologue and epilogue; when the device cannot host a
+//! The arm that runs is the one extraction selected. `pre_a`/`pre_b`/`post`
+//! fuse into the k-loop prologue and epilogue. When the device cannot host a
 //! mixed-precision cooperative store the accumulator stages through a
-//! workgroup tile with a per-lane cast — footprint, never correctness.
-//!
-//! Owned by W9.
+//! workgroup tile with a per-lane cast.
 
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::NumericContract;
 use fusor2_ir::error::Error;
-use fusor2_ir::ir::Node;
 use fusor2_ir::ir::level1::{
     ContractSide, CoopGeom, Family, L1, SchedPoint, SgemmParams, SgemvParams,
 };
@@ -23,43 +19,18 @@ use fusor2_ir::ir::level2::{
     TileReduceOp, WorkgroupAxis, cooperative_store_layout_supported,
 };
 use fusor2_ir::scalar::{ScalarExpr, ScalarKind};
-use fusor2_ir::shape::Dim;
+#[cfg(test)]
 use fusor2_ir::target::LowerCtx;
+use fusor2_ir::shape::Dim;
+use crate::lower::{Ctx, StagedSource, distribute_workgroups, scalar_element};
 
-use crate::lower::{Ctx, DimBinding, StagedSource, distribute_workgroups, scalar_element};
-
-/// Contract-shaped entry point (see CONTRACTS.md §4.10).
-pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
-    let fusor2_ir::ir::Op::L1(op) = &node.op else {
-        return Err(Error::Plan("contract was handed a foreign node".into()));
-    };
-    let L1::KContract { family, .. } = op else {
-        return Err(Error::Plan("contract was handed a non-KContract node".into()));
-    };
-    let ctx = Ctx::new(caps, cx, DimBinding::new())?;
-    let mut ks = lower_contract(ctx, op, *family, theta)?;
-    if ks.len() == 1 {
-        Ok(ks.remove(0))
-    } else {
-        Err(Error::Plan(
-            "split-K lowers to two kernels; call lower_contract".into(),
-        ))
-    }
-}
-
-/// Dispatch on the selected family. The family is a property of *this
-/// lowering*, never of the L0 node, so a gemv-shaped contraction cannot pick
-/// Coop, have a tile scorer decline, and silently run a third path.
+/// Dispatch on the selected family.
 pub fn lower_contract(
     ctx: Ctx<'_>,
     op: &L1,
     family: Family,
     theta: SchedPoint,
 ) -> Result<Vec<KernelIr>> {
-    // Which family and which point extraction actually resolved, beside
-    // `FUSOR2_WGSL_DUMP`'s shader text. Reading a wrong number off a
-    // contraction tells you nothing until you know which of the four bodies
-    // produced it, and the answer is not in the graph — it is in `theta`.
     if std::env::var_os("FUSOR2_DUMP_CONTRACT").is_some() {
         let s = shape_of(&ctx, op);
         eprintln!(
@@ -110,22 +81,12 @@ fn shape_of(ctx: &Ctx<'_>, op: &L1) -> Result<Shape> {
     })
 }
 
-/// Grid swizzle group along M.
-///
-/// The reference branches on two private byte constants (`LLC_CLASS`,
-/// `SMALL_B`) unrelated to `Device::last_level_cache_bytes()`. Here the group
-/// is a pure function of the plan-carried geometry: the number of M blocks one
-/// traversal of the N blocks keeps resident. When `SchedPoint::Coop` grows the
-/// `swizzle` field W6/W7 compute from `llc_bytes`, this reads that instead —
-/// see `needsFromOthers`.
+/// Grid swizzle group along M: the number of M blocks one traversal of the N
+/// blocks keeps resident.
 pub fn swizzle_group_m(geom: CoopGeom, n: u32) -> u32 {
     let n_blocks = n.div_ceil(geom.bn.max(1)).max(1);
     n_blocks.clamp(1, 8)
 }
-
-// ---------------------------------------------------------------------------
-// Cooperative matrix
-// ---------------------------------------------------------------------------
 
 /// Everything a [`CoopGeom`] implies but does not store.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -145,10 +106,8 @@ struct CoopShape {
 }
 
 impl CoopShape {
-    /// The divisibility `CoopGeom::legal` asserts, spelled as an error rather
-    /// than a silent truncation: a geometry whose fragment grid does not tile
-    /// its block exactly cannot be lowered, because the k loop would drop the
-    /// remainder rows instead of computing them.
+    /// Errors when the fragment grid does not tile the block exactly; the k
+    /// loop would drop the remainder rows.
     fn of(geom: CoopGeom, width: u32) -> Result<Self> {
         let dim = CoopGeom::COOP_DIM;
         let n_passes = geom.n_passes.max(1);
@@ -180,39 +139,12 @@ impl CoopShape {
 
 /// `CoopLoad` / `CoopMma` / `CoopStore`.
 ///
-/// **CHANGED KERNEL.** What was here never read `Builtin::ProgramId`, so every
-/// workgroup of the `m_blocks * n_blocks * batch` grid computed the same
-/// fragment and wrote it to the same address; it staged A and B *outside* the
-/// k loop, from a loop index that had not been written yet; it indexed both
-/// workgroup tiles with a global element index instead of a tile-local one;
-/// and it carried a single `COOP_DIM x COOP_DIM` accumulator whatever
-/// `(rg, cg, bm, bn)` said, so even that one block was covered `8 x 8` of it.
-/// No cooperative contraction produced a correct number at any shape — a plain
-/// `[128,512] x [512,65]` f32 matmul, the smallest shape here whose cost picks
-/// Coop over Sgemm, was wrong in 8320 of 8320 elements starting at element 0.
-///
-/// The shape that runs now is the reference's: one workgroup per
-/// `(split, batch, m_block, n_block)`, `n_passes` column sub-passes, a
-/// `frags_m x frags_n` accumulator grid per subgroup, and a k loop that stages
-/// `staging` K tiles per iteration between two barriers. `pre_a` / `pre_b`
-/// fuse into the staging copy and are forced to zero past the logical extents,
-/// so `pre(0)` cannot leak into an edge tile. `post` fuses into the epilogue:
-/// into the per-lane pass when the accumulator stages through a tile, and
-/// otherwise into an in-place pass over this workgroup's own output block,
-/// which is disjoint from every other workgroup's.
-///
-/// `splits > 1` is **refused**, not lowered. A split contraction is two
-/// launches — `splits` partial slices, then a combine — and `GpuTarget` builds
-/// exactly one artifact per plan launch: `build_one` takes `kernels.remove(0)`
-/// and drops the rest on the floor. The combine that used to be built here
-/// therefore never ran once, and what came back was the `k / splits`-long
-/// prefix of the reduction wearing the answer's shape. Measured on a plain
-/// `[65,1024] x [1024,96]`, where cost picks `splits: 64`: every one of 6240
-/// elements wrong. Restoring it needs `GpuTarget::build_one` (and the
-/// `LaunchWork` queue behind it) to launch every kernel `lower_node` returns,
-/// in order, sharing one buffer binding — and then a combine that reads
-/// `splits` slices of `batch * padded_m * padded_n` elements each, applies
-/// `post` exactly once, and lands slice 0.
+/// One workgroup per `(batch, m_block, n_block)`, `n_passes` column sub-passes,
+/// a `frags_m x frags_n` accumulator grid per subgroup, and a k loop staging
+/// `staging` K tiles per iteration between two barriers. `pre_a` / `pre_b` fuse
+/// into the staging copy and are zero past the logical extents; `post` fuses
+/// into the epilogue. `splits > 1` is refused: a split contraction needs a
+/// second combine launch, and `GpuTarget` builds one artifact per plan launch.
 pub fn lower_coop(
     mut ctx: Ctx<'_>,
     op: &L1,
@@ -239,9 +171,6 @@ pub fn lower_coop(
     let dim = CoopGeom::COOP_DIM;
 
     if splits > 1 {
-        // See the note on this function: the target launches one kernel per
-        // plan launch, so the combine pass a split needs cannot run. Failing
-        // loudly beats returning the first slice's partial sum.
         return Err(Error::Plan(format!(
             "split-K coop wants {splits} partials and a combine launch; GpuTarget builds one \
              kernel per launch, so the combine would be dropped and the partial returned"
@@ -252,16 +181,13 @@ pub fn lower_coop(
     let operand_elem = scalar_element(ctx.plan_dtype(a.primary().src)?);
 
     // The operands as 2-D matrices in their own strides: A is `[batch * m, k]`
-    // and B is `[batch * k, n]`, whatever ranks those extents are spread
-    // across. A transposed rhs is a stride swap, never a copy.
+    // and B is `[batch * k, n]`. A transposed rhs is a stride swap, not a copy.
     let a_rows = shape.batch.saturating_mul(shape.m).max(1);
     let b_rows = shape.batch.saturating_mul(shape.k).max(1);
 
-    // The output. `plan::buffer_layout_for` pads `m` to `bm` and `n` to `bn` at
-    // exactly this schedule point *so that* a whole-block cooperative store
-    // needs no per-element mask — the store is subgroup-collective and cannot
-    // take one. If the plan did not deliver that padding the block store would
-    // run off the buffer, so it is checked here rather than assumed.
+    // A whole-block cooperative store is subgroup-collective and takes no
+    // per-element mask, so the output must be padded to whole `bm x bn` blocks.
+    // The padding is checked here rather than assumed.
     let out = ctx.output()?;
     let out_layout = ctx.plan_layout(out)?.clone();
     let split_at = out_layout.rank().saturating_sub(1).max(1);
@@ -285,20 +211,9 @@ pub fn lower_coop(
     };
     let out_elem = out_view.buffer.element;
 
-    // Operand staging tiles: `staging` buffers **stacked inside one
-    // declaration**, which is the same footprint `verify_l1::coop_tiles`
-    // admitted the geometry on (`depth * bm * bk` plus `depth * bk * bn_pass`).
-    //
-    // This shape was originally forced: `TileDecl` derived structural
-    // `PartialEq`/`Hash`, so two `coop_a` tiles of the same element and shape
-    // were *equal* and L2's term memo folded `CoopLoad(A1, r, c)` into
-    // `CoopLoad(A0, r, c)` — the kernel MMA'd the first buffer twice and never
-    // read the second, which is what
-    // `a_cooperative_contraction_computes_the_matrix` caught at `staging: 2`.
-    // `TileDecl` now carries an `id` like `LocalDecl`, so `depth` separate
-    // declarations would also be correct; stacking is kept because it is the
-    // footprint the geometry was admitted on and it is what the k loop's
-    // `depth`-strided addressing below is written against.
+    // Operand staging tiles: `staging` buffers stacked inside one declaration,
+    // footprint `depth * bm * bk` plus `depth * bk * bn_pass`, which the k
+    // loop's `depth`-strided addressing below is written against.
     let a_tile = ctx.b.tile(
         "coop_a",
         ElementType::Scalar(operand_elem),
@@ -310,19 +225,14 @@ pub fn lower_coop(
         &[depth.saturating_mul(geom.bk), cs.bn_pass],
     );
 
-    // The staging sources, one per buffer each side reads. A side that has
-    // absorbed a producer brings several — the block decode's quant plane,
-    // scale, minimum and group scales — and they are all loaded at the same
-    // `(row, col)` the staging fill already computes, then combined by the
-    // side's `pre`. That is the entire quantized path: no branch here knows
-    // what the operands mean, and the MMA, the arena footprint and the
-    // epilogue below are untouched.
+    // The staging sources, one per buffer each side reads. A side that absorbed
+    // a producer brings several; all are loaded at the same `(row, col)` the
+    // staging fill computes and combined by the side's `pre`.
     let a_sources = ctx.contract_side_sources(a, a_rows, shape.k.max(1))?;
     let b_sources = ctx.contract_side_sources(b, b_rows, shape.n.max(1))?;
     let a_coords = SideCoords::for_side(&ctx, a, u64::from(a_rows), u64::from(shape.k.max(1)))?;
     let b_coords = SideCoords::for_side(&ctx, b, u64::from(b_rows), u64::from(shape.n.max(1)))?;
 
-    // --- workgroup identity -------------------------------------------------
     let block = cs.lanes;
     let groups = shape
         .batch
@@ -340,14 +250,14 @@ pub fn lower_coop(
     let group_m = swizzle_group_m(geom, shape.n);
     let (m_tile, n_tile) = swizzle_tile(&mut ctx, local_tile, tiles_m, tiles_n, group_m);
 
-    let bm_e = ctx.b.u32(geom.bm.max(1));
-    let bn_e = ctx.b.u32(geom.bn.max(1));
+    let bm_e = ctx.b.lit_u32(geom.bm.max(1));
+    let bn_e = ctx.b.lit_u32(geom.bn.max(1));
     let row_block = ctx.b.mul(m_tile, bm_e);
     let col_block = ctx.b.mul(n_tile, bn_e);
 
     // Operand row origins of this batch element.
-    let m_e = ctx.b.u32(shape.m.max(1));
-    let k_e = ctx.b.u32(shape.k.max(1));
+    let m_e = ctx.b.lit_u32(shape.m.max(1));
+    let k_e = ctx.b.lit_u32(shape.k.max(1));
     let a_batch_base = ctx.b.mul(batch_index.clone(), m_e.clone());
     let b_batch_base = ctx.b.mul(batch_index.clone(), k_e.clone());
     let a_row_base = ctx.b.add(a_batch_base.clone(), row_block.clone());
@@ -355,17 +265,16 @@ pub fn lower_coop(
     let b_row_limit = ctx.b.add(b_batch_base.clone(), k_e);
 
     // Output row origin: the batch index walks the *padded* row space.
-    let mp_e = ctx.b.u32(m_padded.max(1));
+    let mp_e = ctx.b.lit_u32(m_padded.max(1));
     let out_row_origin = ctx.b.mul(batch_index, mp_e);
     let out_row_base = ctx.b.add(out_row_origin, row_block);
-    // The same row in the *logical* space, which is what a `post` body's
-    // `IndexOf` reads: `row` counts `(batch, m)` and `col` counts `n`, exactly
-    // as the register-tiled families pass them.
+    // The same row in the logical space, which is what a `post` body's
+    // `IndexOf` reads: `row` counts `(batch, m)` and `col` counts `n`.
     let logical_row_base = a_row_base.clone();
 
     // Subgroup fragment origin inside the block.
     let sg = ctx.b.builtin(Builtin::SubgroupId);
-    let cg_e = ctx.b.u32(geom.cg.max(1));
+    let cg_e = ctx.b.lit_u32(geom.cg.max(1));
     let sg_row = ctx.b.binary(
         TileBinaryOp::Div,
         sg.clone(),
@@ -375,12 +284,11 @@ pub fn lower_coop(
     let sg_col = ctx
         .b
         .binary(TileBinaryOp::Rem, sg, cg_e, NumericContract::RELAXED);
-    let sg_rows_e = ctx.b.u32(cs.sg_rows);
-    let sg_cols_e = ctx.b.u32(cs.sg_cols);
+    let sg_rows_e = ctx.b.lit_u32(cs.sg_rows);
+    let sg_cols_e = ctx.b.lit_u32(cs.sg_cols);
     let sg_row_base = ctx.b.mul(sg_row, sg_rows_e);
     let sg_col_base = ctx.b.mul(sg_col, sg_cols_e);
 
-    // --- k loop bounds ------------------------------------------------------
     let k_tiles = shape.k.max(1).div_ceil(geom.bk.max(1)).max(1);
     let iters = k_tiles.div_ceil(depth).max(1);
 
@@ -399,25 +307,24 @@ pub fn lower_coop(
         None
     };
 
-    let k_limit = ctx.b.u32(shape.k.max(1));
-    let n_limit = ctx.b.u32(shape.n.max(1));
+    let k_limit = ctx.b.lit_u32(shape.k.max(1));
+    let n_limit = ctx.b.lit_u32(shape.n.max(1));
 
     let mut body: Vec<Stmt> = Vec::new();
     for pass in 0..geom.n_passes.max(1) {
-        let pass_off = ctx.b.u32(pass.saturating_mul(cs.bn_pass));
+        let pass_off = ctx.b.lit_u32(pass.saturating_mul(cs.bn_pass));
         let pass_col_base = ctx.b.add(col_block.clone(), pass_off);
 
-        // The k loop. `Stmt::Loop` runs `body` before the accumulator updates,
-        // so the two barriers around the staging copy separate the previous
-        // iteration's fragment reads from this iteration's tile writes and
-        // then publish them.
+        // `Stmt::Loop` runs `body` before the accumulator updates, so the two
+        // barriers around the staging copy separate the previous iteration's
+        // fragment reads from this iteration's tile writes, then publish them.
         let mut loop_body: Vec<Stmt> = vec![Stmt::Barrier];
         let k_index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
         let kk = ctx.b.load_local(k_index.clone());
-        let iter_span = ctx.b.u32(depth.saturating_mul(geom.bk));
+        let iter_span = ctx.b.lit_u32(depth.saturating_mul(geom.bk));
         let iter_base = ctx.b.mul(kk, iter_span);
         for d in 0..depth {
-            let d_off = ctx.b.u32(d.saturating_mul(geom.bk));
+            let d_off = ctx.b.lit_u32(d.saturating_mul(geom.bk));
             let k_base = ctx.b.add(iter_base.clone(), d_off);
             stage_operand_tile(
                 &mut ctx,
@@ -465,10 +372,10 @@ pub fn lower_coop(
         let mut accumulators = Vec::with_capacity(frags);
         let mut locals = Vec::with_capacity(frags);
         for r in 0..cs.frags_m {
-            let r_off = ctx.b.u32(r.saturating_mul(dim));
+            let r_off = ctx.b.lit_u32(r.saturating_mul(dim));
             let a_row = ctx.b.add(sg_row_base.clone(), r_off);
             for c in 0..cs.frags_n {
-                let c_off = ctx.b.u32(c.saturating_mul(dim));
+                let c_off = ctx.b.lit_u32(c.saturating_mul(dim));
                 let b_col = ctx.b.add(sg_col_base.clone(), c_off);
                 let local = ctx.b.local(ElementType::CoopMatrix {
                     scalar: acc_elem,
@@ -476,18 +383,17 @@ pub fn lower_coop(
                     rows: dim,
                     cols: dim,
                 });
-                // A fragment accumulator starts from a **zero fragment**: a
-                // scalar zero has the wrong `ElementType`, and `verify_l2`
-                // refuses the kernel on exactly that.
+                // A fragment accumulator starts from a zero fragment; a scalar
+                // zero has the wrong `ElementType` and `verify_l2` refuses it.
                 let init = ctx.b.coop_zero(CoopMatrixRole::C, acc_elem, dim, dim);
                 let mut update = ctx.b.load_local(local.clone());
                 for d in 0..depth {
-                    let a_buf = ctx.b.u32(d.saturating_mul(geom.bm));
+                    let a_buf = ctx.b.lit_u32(d.saturating_mul(geom.bm));
                     let a_row_d = ctx.b.add(a_buf, a_row.clone());
                     let b_buf = d.saturating_mul(geom.bk);
                     for step in 0..cs.kk_steps {
-                        let a_col = ctx.b.u32(step.saturating_mul(dim));
-                        let b_row = ctx.b.u32(b_buf.saturating_add(step.saturating_mul(dim)));
+                        let a_col = ctx.b.lit_u32(step.saturating_mul(dim));
+                        let b_row = ctx.b.lit_u32(b_buf.saturating_add(step.saturating_mul(dim)));
                         let a_frag = ctx.b.coop_load(
                             CoopMatrixRole::A,
                             operand_elem,
@@ -524,7 +430,7 @@ pub fn lower_coop(
             }
         }
 
-        let count = ctx.b.u32(iters);
+        let count = ctx.b.lit_u32(iters);
         body.push(Stmt::Loop {
             count: Some(count),
             index: Some(k_index),
@@ -532,7 +438,6 @@ pub fn lower_coop(
             body: loop_body,
         });
 
-        // --- epilogue -------------------------------------------------------
         let mut taken = locals.into_iter();
         for r in 0..cs.frags_m {
             for c in 0..cs.frags_n {
@@ -540,8 +445,8 @@ pub fn lower_coop(
                     .next()
                     .ok_or_else(|| Error::Plan("coop fragment grid lost an accumulator".into()))?;
                 let value = ctx.b.load_local(local);
-                let r_off = ctx.b.u32(r.saturating_mul(dim));
-                let c_off = ctx.b.u32(c.saturating_mul(dim));
+                let r_off = ctx.b.lit_u32(r.saturating_mul(dim));
+                let c_off = ctx.b.lit_u32(c.saturating_mul(dim));
                 let frag_row = ctx.b.add(sg_row_base.clone(), r_off);
                 let frag_col = ctx.b.add(sg_col_base.clone(), c_off);
                 match &stage_tile {
@@ -597,10 +502,9 @@ pub fn lower_coop(
                 body.push(Stmt::Barrier);
             }
             // Fragments are opaque to scalar code, so a fused `post` reads them
-            // back: store, make the writes visible inside the workgroup, then
-            // map `post` over this workgroup's own block in place. That block
-            // is disjoint from every other workgroup's, so the
-            // read-modify-write races with nothing.
+            // back: store, publish the writes inside the workgroup, then map
+            // `post` over this workgroup's own block in place. The block is
+            // disjoint from every other workgroup's, so nothing races.
             None if !post_is_identity => {
                 body.push(Stmt::StorageBarrier);
                 per_lane_block(
@@ -613,7 +517,7 @@ pub fn lower_coop(
                     |ctx, out, _flat, local_row, local_col, active| {
                         let row = ctx.b.add(out_row_base.clone(), local_row.clone());
                         let col = ctx.b.add(pass_col_base.clone(), local_col);
-                        let fill = ctx.b.zero(acc_elem);
+                        let fill = ctx.b.zero_scalar(acc_elem);
                         let stored = ctx.b.load(
                             Source::Storage(out_view.clone()),
                             Addr::Rc2 {
@@ -644,27 +548,25 @@ pub fn lower_coop(
     Ok(vec![ctx.finish("coop_matmul", grid, block, body)])
 }
 
-/// The flat workgroup index of this launch, linearized against **this** grid
-/// rather than against the per-dimension cap — `distribute_workgroups` sizes
-/// `x` to the slab, so the cap is not the x extent.
+/// The flat workgroup index of this launch, linearized against this grid rather
+/// than the per-dimension cap.
 ///
-/// A cooperative op needs uniform control flow, so an overhang workgroup
-/// cannot return early: it is clamped onto the last block, recomputes it and
-/// stores the same values. The clamp is emitted only when the grid
-/// over-covers.
+/// A cooperative op needs uniform control flow, so an overhang workgroup cannot
+/// return early: it is clamped onto the last block and recomputes it. The clamp
+/// is emitted only when the grid over-covers.
 fn workgroup_index(ctx: &mut Ctx<'_>, grid: [u32; 3], groups: u32) -> TileExpr {
     let gx = ctx.b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
     let gy = ctx.b.builtin(Builtin::ProgramId(WorkgroupAxis::Y));
     let gz = ctx.b.builtin(Builtin::ProgramId(WorkgroupAxis::Z));
-    let x_e = ctx.b.u32(grid[0].max(1));
-    let xy_e = ctx.b.u32(grid[0].max(1).saturating_mul(grid[1].max(1)));
+    let x_e = ctx.b.lit_u32(grid[0].max(1));
+    let xy_e = ctx.b.lit_u32(grid[0].max(1).saturating_mul(grid[1].max(1)));
     let y_off = ctx.b.mul(gy, x_e);
     let z_off = ctx.b.mul(gz, xy_e);
     let id = ctx.b.add(gx, y_off);
     let id = ctx.b.add(id, z_off);
     let covered = u64::from(grid[0]) * u64::from(grid[1]) * u64::from(grid[2]);
     if covered > u64::from(groups) {
-        let last = ctx.b.u32(groups.saturating_sub(1));
+        let last = ctx.b.lit_u32(groups.saturating_sub(1));
         ctx.b
             .binary(TileBinaryOp::Min, id, last, NumericContract::RELAXED)
     } else {
@@ -681,10 +583,10 @@ fn split_const(
     stride: u32,
 ) -> (TileExpr, TileExpr) {
     if extent <= 1 {
-        let zero = ctx.b.u32(0);
+        let zero = ctx.b.lit_u32(0);
         return (zero, index);
     }
-    let stride_e = ctx.b.u32(stride.max(1));
+    let stride_e = ctx.b.lit_u32(stride.max(1));
     let quotient = ctx.b.binary(
         TileBinaryOp::Div,
         index.clone(),
@@ -699,10 +601,9 @@ fn split_const(
 
 /// `local_tile -> (m_tile, n_tile)`, walked in super-blocks of `group` M lines
 /// M-fastest, so a resident wavefront shares one B column slab while touching
-/// only `group` A row slabs. A bijection on `[0, tiles_m * tiles_n)`: the
-/// ragged tail of `tiles_m % group` M lines walks in the same order.
-/// Degenerate grids keep the plain row-major decomposition, which is also what
-/// `group == 1` reduces to.
+/// only `group` A row slabs. A bijection on `[0, tiles_m * tiles_n)`, including
+/// the ragged tail of `tiles_m % group` M lines. Degenerate grids and
+/// `group == 1` take the plain row-major decomposition.
 fn swizzle_tile(
     ctx: &mut Ctx<'_>,
     local_tile: TileExpr,
@@ -711,7 +612,7 @@ fn swizzle_tile(
     group: u32,
 ) -> (TileExpr, TileExpr) {
     if group <= 1 || tiles_m <= 1 || tiles_n <= 1 {
-        let n_e = ctx.b.u32(tiles_n.max(1));
+        let n_e = ctx.b.lit_u32(tiles_n.max(1));
         let m_tile = ctx.b.binary(
             TileBinaryOp::Div,
             local_tile.clone(),
@@ -727,8 +628,8 @@ fn swizzle_tile(
     let tail = tiles_m - full;
     let threshold = full.saturating_mul(tiles_n);
 
-    let span = ctx.b.u32(group.saturating_mul(tiles_n));
-    let group_e = ctx.b.u32(group);
+    let span = ctx.b.lit_u32(group.saturating_mul(tiles_n));
+    let group_e = ctx.b.lit_u32(group);
     let super_block = ctx.b.binary(
         TileBinaryOp::Div,
         local_tile.clone(),
@@ -756,18 +657,18 @@ fn swizzle_tile(
         return (m_full, n_in);
     }
 
-    // The ragged tail, selected branchlessly: nothing wants divergence around
-    // the block a cooperative store is about to write.
-    let threshold_e = ctx.b.u32(threshold);
+    // The ragged tail, selected branchlessly: no divergence around the block a
+    // cooperative store is about to write.
+    let threshold_e = ctx.b.lit_u32(threshold);
     let rest = ctx.b.sub(local_tile.clone(), threshold_e.clone());
-    let tail_e = ctx.b.u32(tail);
+    let tail_e = ctx.b.lit_u32(tail);
     let m_off = ctx.b.binary(
         TileBinaryOp::Rem,
         rest.clone(),
         tail_e.clone(),
         NumericContract::RELAXED,
     );
-    let full_e = ctx.b.u32(full);
+    let full_e = ctx.b.lit_u32(full);
     let m_tail = ctx.b.add(full_e, m_off);
     let n_tail = ctx
         .b
@@ -778,33 +679,13 @@ fn swizzle_tile(
     (m_tile, n_tile)
 }
 
-/// Copy a `rows x cols` window of a 2-D operand into a workgroup tile,
-/// `lanes` elements per pass, applying `pre` on the way in.
-///
-/// **The source may be block-quantized.** A [`Source::Quantized`] runs the
-/// format's decode program at `(row, col)` and yields f32, so the staging tile
-/// holds decoded values and everything downstream — the fragments, the MMA, the
-/// epilogue, the geometry the arena was admitted on — is byte-identical to the
-/// dense path. That is the whole of what a quantized contraction needs: the
-/// decode is a bit more math on the way into shared memory, not a second kernel
-/// family.
-///
-/// Past `row_limit` / `col_limit` the tile holds a **zero**, not `pre(0)`: an
-/// edge tile's padding must not enter the contraction, and `pre` is an
-/// arbitrary scalar body whose value at zero is arbitrary.
 #[allow(clippy::too_many_arguments)]
 /// The coordinate vector one contraction side hands its `pre`.
 ///
-/// An absorbed producer's body may read its own loop coordinates — a
-/// structural causal mask is `select(IndexOf(k) <= IndexOf(q) + off, s, -inf)`
-/// — and after absorption those axes name the *operand's* axes (the absorb
-/// rule remaps them through the edge permutation). The side's staging loops
-/// know only the flattened `(row, col)` pair, so this splits it back: `row`
-/// enumerates the leading `split` axes row-major and `col` the rest, which is
-/// exactly the factorization `matrix_split_for` proved exists.
-///
-/// Built only when the side's `pre` names a coordinate; every other
-/// contraction pays nothing.
+/// An absorbed producer's body may read loop coordinates that name the
+/// operand's axes. The staging loops know only the flattened `(row, col)` pair,
+/// so this splits it back: `row` enumerates the leading `split` axes row-major
+/// and `col` the rest. Built only when the side's `pre` names a coordinate.
 struct SideCoords {
     extents: Vec<u64>,
     split: usize,
@@ -833,11 +714,11 @@ impl SideCoords {
     /// The per-axis coordinates at `(row, col)`, innermost axis of each group
     /// varying fastest.
     fn at(&self, ctx: &mut Ctx<'_>, row: &TileExpr, col: &TileExpr) -> Vec<TileExpr> {
-        let mut out = vec![ctx.b.u32(0); self.extents.len()];
+        let mut out = vec![ctx.b.lit_u32(0); self.extents.len()];
         let decompose = |ctx: &mut Ctx<'_>, flat: &TileExpr, axes: std::ops::Range<usize>, out: &mut Vec<TileExpr>| {
             let mut rest = flat.clone();
             for i in axes.rev() {
-                let e = ctx.b.u32(u32::try_from(self.extents[i]).unwrap_or(u32::MAX).max(1));
+                let e = ctx.b.lit_u32(u32::try_from(self.extents[i]).unwrap_or(u32::MAX).max(1));
                 out[i] = ctx.b.binary(
                     TileBinaryOp::Rem,
                     rest.clone(),
@@ -850,14 +731,6 @@ impl SideCoords {
         decompose(ctx, row, 0..self.split, &mut out);
         decompose(ctx, col, self.split..self.extents.len(), &mut out);
         out
-    }
-}
-
-/// The element a plain storage read of this view yields.
-fn element_of_view(v: &fusor2_ir::ir::level2::StorageView) -> ScalarElement {
-    match v.buffer.element {
-        ElementType::Scalar(e) => e,
-        _ => ScalarElement::F32,
     }
 }
 
@@ -874,6 +747,13 @@ fn source_element(src: &Source) -> ScalarElement {
     }
 }
 
+/// Copy a `rows x cols` window of a 2-D operand into a workgroup tile, `lanes`
+/// elements per pass, applying `pre` on the way in.
+///
+/// A [`Source::Quantized`] runs the format's decode program at `(row, col)` and
+/// yields f32, so the staging tile holds decoded values. Past `row_limit` /
+/// `col_limit` the tile holds a zero, not `pre(0)`: edge padding must not enter
+/// the contraction, and `pre(0)` is arbitrary.
 fn stage_operand_tile(
     ctx: &mut Ctx<'_>,
     body: &mut Vec<Stmt>,
@@ -898,10 +778,10 @@ fn stage_operand_tile(
         let flat = if pass == 0 {
             lane.clone()
         } else {
-            let off = ctx.b.u32(pass.saturating_mul(lanes));
+            let off = ctx.b.lit_u32(pass.saturating_mul(lanes));
             ctx.b.add(lane.clone(), off)
         };
-        let cols_e = ctx.b.u32(cols.max(1));
+        let cols_e = ctx.b.lit_u32(cols.max(1));
         let local_row = ctx.b.binary(
             TileBinaryOp::Div,
             flat.clone(),
@@ -924,21 +804,19 @@ fn stage_operand_tile(
             .compare(TileCompareOp::Lt, col.clone(), col_limit.clone());
         let mut active = ctx.b.and(in_row, in_col);
         let within = if (pass + 1).saturating_mul(lanes) > total {
-            let total_e = ctx.b.u32(total);
+            let total_e = ctx.b.lit_u32(total);
             let w = ctx.b.compare(TileCompareOp::Lt, flat.clone(), total_e);
             active = ctx.b.and(active, w.clone());
             Some(w)
         } else {
             None
         };
-        let fill = ctx.b.zero(elem);
-        // One load per buffer this side reads, all at the same coordinate.
-        // `pre` is written over `Arg(0..srcs.len())` in operand order, so a
-        // single-buffer side is the same two statements it always was.
-        //
-        // Each out-of-range fill takes its own *source's* element type, not
-        // the staging tile's: a decode reads `u32` words and only becomes
-        // `elem` after `pre` has run.
+        let fill = ctx.b.zero_scalar(elem);
+        // One load per buffer this side reads, all at the same coordinate;
+        // `pre` is written over `Arg(0..srcs.len())` in operand order. Each
+        // out-of-range fill takes its own source's element type, not the
+        // staging tile's: a decode reads `u32` words and becomes `elem` only
+        // after `pre` has run.
         let mut raws: Vec<TileExpr> = Vec::with_capacity(srcs.len());
         for src in srcs {
             let src = match src {
@@ -948,7 +826,7 @@ fn stage_operand_tile(
                 }
                 StagedSource::Mem(s) => s,
             };
-            let src_fill = ctx.b.zero(source_element(src));
+            let src_fill = ctx.b.zero_scalar(source_element(src));
             raws.push(ctx.b.load(
                 src.clone(),
                 Addr::Rc2 {
@@ -969,7 +847,7 @@ fn stage_operand_tile(
         let index = if tile_base == 0 {
             flat
         } else {
-            let base = ctx.b.u32(tile_base);
+            let base = ctx.b.lit_u32(tile_base);
             ctx.b.add(base, flat)
         };
         let store = Stmt::StoreTile {
@@ -992,14 +870,11 @@ fn stage_operand_tile(
 /// Walk a `rows x cols` block one workgroup owns, `lanes` elements per step,
 /// handing the builder `(flat, local_row, local_col, active)`.
 ///
-/// A **counted loop, not an unrolled sequence**, and that is load-bearing.
-/// `Emitter`'s hash-cons memo is scoped to a block and is not invalidated by a
-/// barrier, so an identical `LoadTile(tile, flat)` emitted twice at the top
-/// level of one kernel resolves to the *first* one's SSA value — even with a
-/// barrier and a fresh `CoopStoreTile` in between. The `n_passes > 1` staged
-/// epilogue does exactly that: same tile, same lane, `n_passes` times. A loop
-/// body is a nested scope, and its index is a fresh identity-bearing `Local`,
-/// so each call mints its own read.
+/// A counted loop, not an unrolled sequence: `Emitter`'s hash-cons memo is
+/// scoped to a block and survives barriers, so an identical
+/// `LoadTile(tile, flat)` emitted twice at the top level of one kernel resolves
+/// to the first one's SSA value. A loop body is a nested scope with a fresh
+/// index `Local`, so each call mints its own read.
 fn per_lane_block<'a>(
     ctx: &mut Ctx<'a>,
     body: &mut Vec<Stmt>,
@@ -1020,10 +895,10 @@ fn per_lane_block<'a>(
     let lanes = lanes.max(1);
     let index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
     let step = ctx.b.load_local(index.clone());
-    let lanes_e = ctx.b.u32(lanes);
+    let lanes_e = ctx.b.lit_u32(lanes);
     let base = ctx.b.mul(step, lanes_e);
     let flat = ctx.b.add(base, lane.clone());
-    let cols_e = ctx.b.u32(cols.max(1));
+    let cols_e = ctx.b.lit_u32(cols.max(1));
     let local_row = ctx.b.binary(
         TileBinaryOp::Div,
         flat.clone(),
@@ -1034,13 +909,13 @@ fn per_lane_block<'a>(
         .b
         .binary(TileBinaryOp::Rem, flat.clone(), cols_e, NumericContract::RELAXED);
     // Never constant-true: the final step may be partial, and a load with a
-    // constant-true mask has to be *provably* in range for `check_loads`.
-    let total_e = ctx.b.u32(total);
+    // constant-true mask has to be provably in range for `check_loads`.
+    let total_e = ctx.b.lit_u32(total);
     let active = ctx.b.compare(TileCompareOp::Lt, flat.clone(), total_e);
 
     let mut inner: Vec<Stmt> = Vec::new();
     build(ctx, &mut inner, flat, local_row, local_col, active)?;
-    let count = ctx.b.u32(total.div_ceil(lanes).max(1));
+    let count = ctx.b.lit_u32(total.div_ceil(lanes).max(1));
     body.push(Stmt::Loop {
         count: Some(count),
         index: Some(index),
@@ -1050,25 +925,12 @@ fn per_lane_block<'a>(
     Ok(())
 }
 
-
-// ---------------------------------------------------------------------------
-// SGEMM
-// ---------------------------------------------------------------------------
-
 /// SGEMM with a per-thread `tn`-wide register accumulator.
 ///
-/// **CHANGED KERNEL.** What was here indexed A at `k_base + lane`, the register
-/// tile at `lane + i` / `lane + j` and the store at `lane + slot`, and never
-/// read `Builtin::ProgramId` at all: every workgroup computed the same
-/// fragment, so no matmul on this backend produced a correct number at any
-/// shape. This is a real contraction: one lane owns `tn` adjacent output
-/// columns of one output row and reuses the A element across them, which is
-/// the register-reuse term `SgemmParams` prices. The workgroup staging tiles
-/// are gone with it — `p.legal` still gates the point on the storage the
-/// staged form would need, so the admissible domain is unchanged, but the
-/// emitted kernel reads A and B straight from storage. Re-staging them is a
-/// traffic optimization on a kernel that is now correct, which is the right
-/// order to do it in.
+/// One lane owns `tn` adjacent output columns of one output row and reuses the
+/// A element across them. The emitted kernel reads A and B straight from
+/// storage; `p.legal` gates the point on the storage a workgroup-staged form
+/// would need, so the admissible domain is the staged one.
 pub fn lower_sgemm(ctx: Ctx<'_>, op: &L1, p: SgemmParams) -> Result<KernelIr> {
     let L1::KContract {
         post, acc, a, b, ..
@@ -1099,18 +961,11 @@ pub fn lower_sgemm(ctx: Ctx<'_>, op: &L1, p: SgemmParams) -> Result<KernelIr> {
 }
 
 /// `(output columns one lane owns, lanes per workgroup)` of a row-tiled
-/// contraction, **read off the schedule point**.
+/// contraction, read off the schedule point.
 ///
-/// `SgemmParams` names both: `tn` is the register tile width and
-/// `(bm / tm) * (bn / tn)` is the thread block that tile implies. Every other
-/// point that reaches the always-legal generic body is one output element per
-/// lane, at the widest workgroup the *device* admits.
-///
-/// Both used to be **parameters** of `contract_rows`, which took a
-/// `_theta` it never read: `lower_generic` passed a written-in `256` and
-/// `lower_sgemm` recomputed the lane count beside the point that already
-/// implied it, so nothing stopped a caller pairing one point's `tn` with
-/// another point's block width.
+/// For `SgemmParams`, `tn` is the register tile width and
+/// `(bm / tm) * (bn / tn)` the thread block it implies. Every other point is
+/// one output element per lane at the widest workgroup the device admits.
 fn row_tiling(theta: SchedPoint, caps: &Caps) -> (u32, u32) {
     let max_lanes = caps.limits.max_compute_invocations_per_workgroup.max(1);
     match theta {
@@ -1125,15 +980,11 @@ fn row_tiling(theta: SchedPoint, caps: &Caps) -> (u32, u32) {
 /// The shared body of [`lower_sgemm`] and [`lower_generic`]: one lane per
 /// `(row, column tile)` of the output, a k loop, `tn` accumulators.
 ///
-/// The operands are read through **2-D views built from the contraction's own
-/// extents** — A is `[batch * m, k]` and B is `[batch * k, n]` in their own
-/// strides, whatever ranks those extents are spread across — and the batch
-/// index is recovered from the output row rather than from a third grid axis.
-/// A transposed rhs is a stride swap, never a copy.
-///
-/// The output is contiguous: `plan::buffer_layout_for` pads nothing at these
-/// schedule points, and every store below is masked, so the address is the
-/// flat row-major index `row * n + col` of `[batch.., m.., n..]`.
+/// The operands are 2-D views in their own strides, A `[batch * m, k]` and B
+/// `[batch * k, n]`, and the batch index is recovered from the output row. A
+/// transposed rhs is a stride swap, not a copy. The output is contiguous and
+/// unpadded here and every store is masked, so the address is the flat
+/// row-major index `row * n + col` of `[batch.., m.., n..]`.
 #[allow(clippy::too_many_arguments)]
 fn contract_rows(
     mut ctx: Ctx<'_>,
@@ -1145,12 +996,9 @@ fn contract_rows(
     shape: &Shape,
     name: &'static str,
 ) -> Result<KernelIr> {
-    // The register tile width and the workgroup width are *this* schedule
-    // point's; they were parameters, which let a caller pass one point's `tn`
-    // with another point's block.
     let (tn, block) = row_tiling(theta, ctx.caps);
     // One source per buffer each side reads, all indexed by that side's own
-    // `(row, col)`. A side that absorbed a producer simply has more of them.
+    // `(row, col)`. A side that absorbed a producer has more of them.
     let a_rows = shape.batch.saturating_mul(shape.m).max(1);
     let b_rows = shape.batch.saturating_mul(shape.k).max(1);
     let a_sources = ctx.contract_side_sources(a, a_rows, shape.k.max(1))?;
@@ -1173,7 +1021,7 @@ fn contract_rows(
         limits.max_compute_workgroups_per_dimension,
     );
     let index = ctx.global_index(block, grid);
-    let n_tiles_e = ctx.b.u32(n_tiles);
+    let n_tiles_e = ctx.b.lit_u32(n_tiles);
     let row = ctx.b.binary(
         TileBinaryOp::Div,
         index.clone(),
@@ -1186,18 +1034,18 @@ fn contract_rows(
         n_tiles_e,
         NumericContract::RELAXED,
     );
-    let tiles_e = ctx.b.u32(tiles);
+    let tiles_e = ctx.b.lit_u32(tiles);
     let live = ctx.b.compare(TileCompareOp::Lt, index, tiles_e);
 
     // B's own row is `batch_index * k + kk`; the batch index rides in `row`.
-    let m_e = ctx.b.u32(shape.m.max(1));
+    let m_e = ctx.b.lit_u32(shape.m.max(1));
     let batch_index = ctx.b.binary(
         TileBinaryOp::Div,
         row.clone(),
         m_e,
         NumericContract::RELAXED,
     );
-    let k_e = ctx.b.u32(shape.k.max(1));
+    let k_e = ctx.b.lit_u32(shape.k.max(1));
     let b_row_base = ctx.b.mul(batch_index, k_e);
 
     let k_index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
@@ -1211,7 +1059,7 @@ fn contract_rows(
             }
             StagedSource::Mem(s) => s,
         };
-        let fill = ctx.b.zero(source_element(src));
+        let fill = ctx.b.zero_scalar(source_element(src));
         avs.push(ctx.b.load(
             src.clone(),
             Addr::Rc2 {
@@ -1230,14 +1078,14 @@ fn contract_rows(
     let av = ctx.b.cast(av, ElementType::Scalar(acc_elem));
     let b_row = ctx.b.add(b_row_base, kk);
 
-    let tn_e = ctx.b.u32(tn);
+    let tn_e = ctx.b.lit_u32(tn);
     let col0 = ctx.b.mul(col_tile, tn_e);
     let mut accs = Vec::with_capacity(tn as usize);
     let mut cols = Vec::with_capacity(tn as usize);
     for j in 0..tn {
-        let off = ctx.b.u32(j);
+        let off = ctx.b.lit_u32(j);
         let col = ctx.b.add(col0.clone(), off);
-        let n_bound = ctx.b.u32(n);
+        let n_bound = ctx.b.lit_u32(n);
         let in_n = ctx.b.compare(TileCompareOp::Lt, col.clone(), n_bound);
         let ok = ctx.b.and(live.clone(), in_n);
         let mut bvs = Vec::with_capacity(b_sources.len());
@@ -1249,7 +1097,7 @@ fn contract_rows(
                 }
                 StagedSource::Mem(s) => s,
             };
-            let fill = ctx.b.zero(source_element(src));
+            let fill = ctx.b.zero_scalar(source_element(src));
             bvs.push(ctx.b.load(
                 src.clone(),
                 Addr::Rc2 {
@@ -1269,7 +1117,7 @@ fn contract_rows(
         let local = ctx.b.local(ElementType::Scalar(acc_elem));
         let read = ctx.b.load_local(local.clone());
         let update = ctx.b.fma(av.clone(), bv, read);
-        let init = ctx.b.zero(acc_elem);
+        let init = ctx.b.zero_scalar(acc_elem);
         accs.push(Accumulator {
             local,
             init,
@@ -1278,7 +1126,7 @@ fn contract_rows(
         cols.push((col, ok));
     }
 
-    let count = ctx.b.u32(shape.k.max(1));
+    let count = ctx.b.lit_u32(shape.k.max(1));
     let locals: Vec<_> = accs.iter().map(|a| a.local.clone()).collect();
     let mut body = vec![Stmt::Loop {
         count: Some(count),
@@ -1287,14 +1135,13 @@ fn contract_rows(
         body: Vec::new(),
     }];
 
-    let n_e = ctx.b.u32(n);
+    let n_e = ctx.b.lit_u32(n);
     for (local, (col, ok)) in locals.into_iter().zip(cols) {
         let total = ctx.b.load_local(local);
         let value = ctx.eval_scalar(post, &[total], &[row.clone(), col.clone()])?;
         let value = ctx.b.cast(value, out_elem);
         // `row` counts `(batch, m)` and `col` counts `n`, so `row * n + col` is
-        // the flat row-major index of a `[batch.., m.., n..]` output — for any
-        // number of axes on each side.
+        // the flat row-major index of a `[batch.., m.., n..]` output.
         let addr = {
             let scaled = ctx.b.mul(row.clone(), n_e.clone());
             ctx.b.add(scaled, col)
@@ -1309,10 +1156,6 @@ fn contract_rows(
 
     Ok(ctx.finish(name, grid, block, body))
 }
-
-// ---------------------------------------------------------------------------
-// SGEMV
-// ---------------------------------------------------------------------------
 
 /// Vector-family contraction: `subgroups` lane groups per row, each summing a
 /// `chunk`-long, `vector`-wide slice of K.
@@ -1330,25 +1173,22 @@ pub fn lower_sgemv(mut ctx: Ctx<'_>, op: &L1, p: SgemvParams) -> Result<KernelIr
         .min(ctx.caps.limits.max_compute_invocations_per_workgroup)
         .max(1);
 
-    // One view per buffer each side reads. `matrix_view` is per operand, so a
-    // side that has absorbed a producer contributes one view per edge and the
-    // side's `pre` combines them.
-    let a_views = a
-        .ops
-        .iter()
-        .map(|o| match ctx.const_operand(o.src) {
-            Some(lit) => Ok(None.ok_or(lit)),
-            None => ctx.matrix_view(o, 1).map(Ok),
-        })
-        .collect::<Result<Vec<std::result::Result<_, TileExpr>>>>()?;
-    let b_views = b
-        .ops
-        .iter()
-        .map(|o| match ctx.const_operand(o.src) {
-            Some(lit) => Ok(None.ok_or(lit)),
-            None => ctx.matrix_view(o, 1).map(Ok),
-        })
-        .collect::<Result<Vec<std::result::Result<_, TileExpr>>>>()?;
+    // One staged source per buffer each side reads; the side's `pre` combines
+    // them. A quantized operand decodes at the `(row, k)` this loop computes.
+    let stage = |ctx: &mut Ctx<'_>, side: &ContractSide| -> Result<Vec<StagedSource>> {
+        side.ops
+            .iter()
+            .map(|o| {
+                if let Some(lit) = ctx.const_operand(o.src) {
+                    return Ok(StagedSource::Const(lit));
+                }
+                let view = ctx.matrix_view(o, 1)?;
+                Ok(StagedSource::Mem(ctx.contract_stage_source(o, &view)?))
+            })
+            .collect()
+    };
+    let a_views = stage(&mut ctx, a)?;
+    let b_views = stage(&mut ctx, b)?;
     let a_coords = SideCoords::for_side(
         &ctx,
         a,
@@ -1357,7 +1197,7 @@ pub fn lower_sgemv(mut ctx: Ctx<'_>, op: &L1, p: SgemvParams) -> Result<KernelIr
     )?;
     // B is addressed flat along k: every axis is in the column group.
     let b_coords = SideCoords::for_side(&ctx, b, 1, u64::from(shape.k.max(1)))?;
-    let zero_row = ctx.b.u32(0);
+    let zero_row = ctx.b.lit_u32(0);
     let out = ctx.output()?;
     let out_view = ctx.linear_view(out)?;
     let out_elem = out_view.buffer.element;
@@ -1368,34 +1208,34 @@ pub fn lower_sgemv(mut ctx: Ctx<'_>, op: &L1, p: SgemvParams) -> Result<KernelIr
 
     let acc_local = ctx.b.local(ElementType::Scalar(acc_elem));
     let acc_read = ctx.b.load_local(acc_local.clone());
-    let init = ctx.b.zero(acc_elem);
+    let init = ctx.b.zero_scalar(acc_elem);
     let k_index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
     let kk = ctx.b.load_local(k_index.clone());
 
     let vector = p.vector.max(1);
-    let stride = ctx.b.u32(block * vector);
+    let stride = ctx.b.lit_u32(block * vector);
     let step = ctx.b.mul(kk, stride);
     let mut partial = acc_read;
     for v in 0..vector {
-        let v_off = ctx.b.u32(v);
+        let v_off = ctx.b.lit_u32(v);
         let k = {
             let base = ctx.b.add(step.clone(), lane.clone());
             ctx.b.add(base, v_off)
         };
-        let k_bound = ctx.b.u32(shape.k.max(1));
+        let k_bound = ctx.b.lit_u32(shape.k.max(1));
         let mask = ctx.b.compare(TileCompareOp::Lt, k.clone(), k_bound);
         let mut avs = Vec::with_capacity(a_views.len());
-        for view in &a_views {
-            let view = match view {
-                Err(lit) => {
+        for src in &a_views {
+            let src = match src {
+                StagedSource::Const(lit) => {
                     avs.push(lit.clone());
                     continue;
                 }
-                Ok(v) => v,
+                StagedSource::Mem(s) => s,
             };
-            let fill = ctx.b.zero(element_of_view(view));
+            let fill = ctx.b.zero_scalar(source_element(src));
             avs.push(ctx.b.load(
-                Source::Storage(view.clone()),
+                src.clone(),
                 Addr::Rc2 {
                     row: row.clone(),
                     col: k.clone(),
@@ -1405,17 +1245,17 @@ pub fn lower_sgemv(mut ctx: Ctx<'_>, op: &L1, p: SgemvParams) -> Result<KernelIr
             ));
         }
         let mut bvs = Vec::with_capacity(b_views.len());
-        for view in &b_views {
-            let view = match view {
-                Err(lit) => {
+        for src in &b_views {
+            let src = match src {
+                StagedSource::Const(lit) => {
                     bvs.push(lit.clone());
                     continue;
                 }
-                Ok(v) => v,
+                StagedSource::Mem(s) => s,
             };
-            let fill = ctx.b.zero(element_of_view(view));
+            let fill = ctx.b.zero_scalar(source_element(src));
             bvs.push(ctx.b.load(
-                Source::Storage(view.clone()),
+                src.clone(),
                 Addr::Linear(k.clone()),
                 mask.clone(),
                 fill,
@@ -1440,7 +1280,7 @@ pub fn lower_sgemv(mut ctx: Ctx<'_>, op: &L1, p: SgemvParams) -> Result<KernelIr
         .k
         .div_ceil((block * vector * p.chunk.max(1)).max(1))
         .max(1);
-    let count = ctx.b.u32(chunks);
+    let count = ctx.b.lit_u32(chunks);
     body.push(Stmt::Loop {
         count: Some(count),
         index: Some(k_index),
@@ -1472,7 +1312,7 @@ pub fn lower_sgemv(mut ctx: Ctx<'_>, op: &L1, p: SgemvParams) -> Result<KernelIr
     };
     let value = ctx.eval_scalar(post, &[total], &[row.clone()])?;
     let value = ctx.b.cast(value, out_elem);
-    let zero_u = ctx.b.u32(0);
+    let zero_u = ctx.b.lit_u32(0);
     let mask = ctx.b.compare(TileCompareOp::Eq, lane, zero_u);
     body.push(Stmt::Store {
         dst: out_view,
@@ -1488,17 +1328,12 @@ pub fn lower_sgemv(mut ctx: Ctx<'_>, op: &L1, p: SgemvParams) -> Result<KernelIr
     Ok(ctx.finish("sgemv", grid, block, body))
 }
 
-// ---------------------------------------------------------------------------
-// Generic fold
-// ---------------------------------------------------------------------------
-
-/// The always-legal family: one lane per output element, a serial k loop.
-/// Slow, correct everywhere, and what the cost model reaches for on a device
-/// with neither subgroups nor cooperative matrices.
+/// The always-legal family: one lane per output element, a serial k loop. Slow,
+/// correct everywhere, and what the cost model reaches for on a device with
+/// neither subgroups nor cooperative matrices.
 ///
-/// It still carries `theta` through: the family says "no register tile", the
-/// point says how wide the workgroup is, and [`row_tiling`] is the one place
-/// that reads either.
+/// The family carries no register tile; `theta` fixes only the workgroup width,
+/// and [`row_tiling`] is the one place that reads either.
 pub fn lower_generic(ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<KernelIr> {
     let L1::KContract {
         post, acc, a, b, ..
@@ -1508,8 +1343,7 @@ pub fn lower_generic(ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<KernelI
     };
     let shape = shape_of(&ctx, op)?;
     let acc_elem = scalar_element(*acc);
-    // One output per lane: the family with no register tile, which is what
-    // makes it the always-legal floor.
+    // One output per lane, no register tile.
     contract_rows(
         ctx,
         theta,
@@ -1542,9 +1376,7 @@ mod tests {
 
     #[test]
     fn swizzle_is_a_pure_function_of_plan_data() {
-        // No private LLC byte constant appears: the group is bounded by the
-        // number of N blocks, so a one-block-wide problem cannot claim an
-        // 8-wide swizzle.
+        // The group is bounded by the number of N blocks.
         assert_eq!(swizzle_group_m(geom(), 64), 1);
         assert_eq!(swizzle_group_m(geom(), 4096), 8);
     }
@@ -1558,17 +1390,14 @@ mod tests {
 
     #[test]
     fn subgroup_split_is_the_closed_form_objective() {
-        // The template every other geometry factorization follows: minimize
-        // `cg*bm + rg*bn_pass` under COOP_DIM divisibility on both sides.
-        // (2,2) costs 2*64 + 2*64 = 256; (1,4) and (4,1) both cost 320.
+        // Minimize `cg*bm + rg*bn_pass` under COOP_DIM divisibility on both
+        // sides: (2,2) costs 256, (1,4) and (4,1) cost 320.
         assert_eq!(CoopGeom::subgroup_split(64, 64, 1, 4), Some((2, 2)));
         // No factorization keeps both fragment sides whole COOP_DIM multiples.
         assert_eq!(CoopGeom::subgroup_split(8, 8, 1, 4), None);
     }
 
     /// The fragment grid is the whole sub-block, not one fragment of it.
-    /// A `CoopShape` that reported `frags_m = frags_n = 1` here is what the
-    /// old body assumed, and it silently dropped `bm * bn - 64` outputs.
     #[test]
     fn the_fragment_grid_tiles_the_whole_subgroup_block() {
         let cs = CoopShape::of(geom(), 32).expect("legal geometry");
@@ -1577,13 +1406,13 @@ mod tests {
         assert_eq!(cs.kk_steps, 2);
         assert_eq!(cs.lanes, 128);
         // `rg * frags_m * COOP_DIM` and `cg * frags_n * COOP_DIM` cover the
-        // block exactly: no row or column of `bm x bn_pass` is unowned.
+        // block exactly.
         assert_eq!(geom().rg * cs.frags_m * CoopGeom::COOP_DIM, geom().bm);
         assert_eq!(geom().cg * cs.frags_n * CoopGeom::COOP_DIM, cs.bn_pass);
     }
 
-    /// The swizzle stays a bijection on `[0, tiles_m * tiles_n)` — including
-    /// the ragged tail, which is the half a super-block walk gets wrong.
+    /// The swizzle stays a bijection on `[0, tiles_m * tiles_n)`, including the
+    /// ragged tail.
     #[test]
     fn the_tile_swizzle_is_a_bijection() {
         for (tiles_m, tiles_n) in [(5u32, 6u32), (8, 3), (3, 8), (1, 7), (7, 1), (13, 5)] {
@@ -1600,8 +1429,7 @@ mod tests {
         }
     }
 
-    /// The closed form [`swizzle_tile`] emits, in host arithmetic. Kept beside
-    /// it so the bijection test states the algorithm rather than a table.
+    /// The closed form [`swizzle_tile`] emits, in host arithmetic.
     fn reference_swizzle(id: u32, tiles_m: u32, tiles_n: u32, group: u32) -> (u32, u32) {
         if group <= 1 || tiles_m <= 1 || tiles_n <= 1 {
             return (id / tiles_n, id % tiles_n);
@@ -1617,15 +1445,9 @@ mod tests {
         (full + rest % tail, rest / tail)
     }
 
-    /// A cooperative contraction that runs on the device and is checked
-    /// element by element against an f64 host reference, at shapes whose
-    /// `m` and `n` are **not** multiples of the block.
-    ///
-    /// Nothing in the conformance suite reads values out of a coop-selected
-    /// contraction with a ragged extent: `matmul::promotes` is 64x128x64, all
-    /// multiples of 16, and `contraction_resolves_a_schedule_point` checks the
-    /// resolved theta and not the numbers. That gap is why a kernel that was
-    /// wrong at *every* geometry and *every* shape survived.
+    /// A cooperative contraction that runs on the device and is checked element
+    /// by element against an f64 host reference, at shapes whose `m` and `n`
+    /// are not multiples of the block.
     #[test]
     fn a_cooperative_contraction_computes_the_matrix() {
         let Ok(target) = crate::target::GpuTarget::new_blocking() else {
@@ -1646,9 +1468,7 @@ mod tests {
         let shapes = [(1u64, 33u64, 37u64, 21u64), (1, 8, 7, 5), (3, 17, 13, 9)];
         let ident = ScalarExpr::arg(0, Dtype::F32);
         // `post` fused into the epilogue. The direct cooperative store cannot
-        // apply it to an opaque fragment, and the body this replaced simply
-        // dropped it on that path — so a non-identity `post` is the case that
-        // catches a silently unfused epilogue.
+        // apply it to an opaque fragment.
         let affine = ScalarExpr::bin(
             fusor2_ir::scalar::BinOp::Add,
             ScalarExpr::bin(
@@ -1678,9 +1498,8 @@ mod tests {
 
     /// The narrow-output epilogue. Without `fork-metal` an f32 accumulator
     /// bound for f16 memory cannot be stored cooperatively, so the fragments
-    /// stage through a workgroup tile and a per-lane pass casts them — a
-    /// different epilogue, a different tile in the arena, and the only one
-    /// where `post` is applied before the store rather than after it.
+    /// stage through a workgroup tile and a per-lane pass casts them, applying
+    /// `post` before the store.
     #[test]
     fn a_narrow_output_stages_the_accumulator() {
         let Ok(target) = crate::target::GpuTarget::new_blocking() else {
@@ -1797,9 +1616,8 @@ mod tests {
             }))
             .expect("contract node");
 
-        // The padded output layout is the extractor's, read from the same
-        // function the planner uses — the kernel's whole-block store depends
-        // on it and checks it.
+        // The padded output layout comes from the same function the planner
+        // uses; the kernel's whole-block store checks it.
         let layout = fusor2_cost::plan::buffer_layout_for(g.facts(out), Some(theta))
             .expect("padded output layout");
         let elements: u64 = layout.shape().iter().map(|d| d.as_const().unwrap_or(1)).product();

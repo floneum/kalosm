@@ -1,7 +1,5 @@
 //! Parameterized layers. Each is a thin struct over a few `Tensor` parameters
 //! and a `forward`; none of them owns a kernel.
-//!
-//! Owned by W13.
 
 pub mod conv;
 pub mod embedding;
@@ -28,13 +26,12 @@ use crate::{Error, Result};
 /// One GGUF tensor as a dense `F32` value in `graph`.
 ///
 /// `fusor2_gguf` reverses a tensor's extents at read, so `raw.shape` is
-/// already row-major: a `[out, in]` weight is `[out, in]` here, matching the
-/// reference's `weight.shape()[0] == out_features`.
+/// already row-major: a `[out, in]` weight is `[out, in]` here, and
+/// `shape()[0]` is `out_features`.
 ///
 /// A block-quantized entry becomes a `Leaf(Quantized)` plus one `L0::Dequant`
 /// — the decode is a device-side block program, never a host loop. `F16` and
-/// `BF16` entries are cast, which is what the reference's `dequantize()` does
-/// for every parameter it hands a layer.
+/// `BF16` entries are cast to `F32`.
 pub(crate) fn load_dense(vb: &VarBuilder, graph: &GraphRef, name: &str) -> Result<Tensor> {
     let raw = vb.get_raw(name)?;
     let shape: Vec<Dim> = raw.shape.iter().map(|d| Dim::Const(*d)).collect();
@@ -111,9 +108,8 @@ pub(crate) fn load_optional(
 
 /// A normalization weight or bias as a rank-1 value.
 ///
-/// GGUF writers disagree about whether a norm vector is `[n]` or `[1, n]`;
-/// the reference squeezes the degenerate axis rather than refusing, so this
-/// does too.
+/// GGUF writers disagree about whether a norm vector is `[n]` or `[1, n]`, so
+/// a degenerate axis is squeezed rather than refused.
 pub(crate) fn as_vector(t: Tensor, name: &str) -> Result<Tensor> {
     match t.shape().as_slice() {
         [_] => Ok(t),

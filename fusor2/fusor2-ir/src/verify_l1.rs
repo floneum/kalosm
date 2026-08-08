@@ -1,26 +1,11 @@
-//! `verify_l1` — the eight L1 invariants.
-//!
-//! 1. `Geom::legal(caps)`: lane limits and whole-fragment divisibility.
-//! 2. Workgroup footprint checked against the **exact** `arena_plan` value —
-//!    the same pure memoized function the L2 emitter uses, so there is no
-//!    estimator and therefore no L1/L2 admission mismatch.
-//! 3. A nest's write map must be injective unless the nest declares an
-//!    associative `combine`. One invariant, three jobs: scatter-add
-//!    legality, separating the four `Scatter{Add}` lowerings from an illegal
-//!    in-place write, and proving a non-overlapping pool's adjoint is an
-//!    elementwise mask.
-//! 4. A fold dim may not appear with nonzero stride in the write map.
-//! 5. Every operand's `AccessPlan` satisfies that operand's access
-//!    predicate. A failed access analysis disqualifies **this rewrite only**.
-//! 6. `KMerged` segments share a `MergeKey` and carry no epilogue — already
-//!    a constructor precondition, rechecked here — and both composite forms
-//!    carry the linear schedule domain their members' shared index space
-//!    implies, rather than an unsearchable point.
-//! 7. Every node carries an `Effect`.
-//! 8. Allocation is *not* described at L1; a node claiming a buffer is an
-//!    error.
-//!
-//! Owned by W1.
+//! The L1 invariants: schedule-point legality against lane limits and the
+//! exact `arena_plan` workgroup footprint; an injective write map unless the
+//! nest declares an associative `combine`; no fold dim with nonzero stride in
+//! the write map; every operand's `AccessPlan` satisfying its own predicate;
+//! `KMerged` segments sharing a `MergeKey` with no epilogue, and both
+//! composite forms carrying the linear schedule domain their members' shared
+//! index space implies; an `Effect` on every node; and no buffer offset,
+//! since allocation is not described at L1.
 
 use crate::carrier::SlotTy;
 use crate::device::Caps;
@@ -36,6 +21,7 @@ use crate::ir::level2::{
 };
 use crate::semantics::effect_of;
 use crate::shape::{Dim, Layout};
+use smallvec::SmallVec;
 use std::sync::Arc;
 
 /// Workgroup tiles a cooperative geometry declares, before packing.
@@ -46,9 +32,8 @@ use std::sync::Arc;
 /// narrower memory needs the staging pass unless the device supports a
 /// mixed-precision cooperative store).
 ///
-/// **This is the single source of coop tile shapes.** `verify_l1` and
-/// `fusor2-tile`'s `domains::coop` both call it, so an admitted geometry and
-/// a planned one cannot disagree.
+/// The single source of coop tile shapes: `verify_l1` and `fusor2-tile`'s
+/// `domains::coop` both call it.
 pub fn coop_tiles(geom: CoopGeom, elem: ScalarElement, staging: u8) -> Tiles {
     let mut tiles = Tiles::default();
     let n_passes = geom.n_passes.max(1);
@@ -156,43 +141,19 @@ pub fn verify_l1(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<()> {
     }
 
     // The `verify_l0` constant-work tripwire, applied to the one L1 variant
-    // whose row comes from outside the crate. An `OpDef` registering
-    // `Work { macs: 1, .. }` is exactly the reference's
-    // `Attention { work: 1 }` placeholder wearing an extension hat.
+    // whose row comes from outside the crate: an `OpDef` whose `work` does not
+    // vary with shape is a placeholder, not a cost model.
     if let L1::Ext { def, .. } = op
         && let Some(d) = cx.registry.get(*def)
+        && !crate::semantics::work::work_varies(d.work, cx.operands, cx.result)
     {
-        let small = (d.work)(cx.operands, cx.result);
-        let doubled_ins: Vec<crate::facts::ValueFacts> =
-            cx.operands.iter().map(doubled).collect();
-        let doubled_out = doubled(cx.result);
-        let large = (d.work)(&doubled_ins, &doubled_out);
-        let has_const = cx
-            .operands
-            .iter()
-            .chain(std::iter::once(cx.result))
-            .flat_map(|f| f.shape.iter())
-            .any(|dim| dim.as_const().is_some());
-        if has_const && small == large && small != crate::facts::Work::default() {
-            return Err(relabel(
-                cx,
-                format!("OpDef `{}`: work() does not vary with shape", d.name),
-            ));
-        }
+        return Err(relabel(
+            cx,
+            format!("OpDef `{}`: work() does not vary with shape", d.name),
+        ));
     }
 
     Ok(())
-}
-
-/// Every `Const` dim doubled — the second binding the work tripwire prices.
-fn doubled(f: &crate::facts::ValueFacts) -> crate::facts::ValueFacts {
-    let mut out = f.clone();
-    for d in out.shape.iter_mut() {
-        if let Dim::Const(v) = *d {
-            *d = Dim::Const(v.saturating_mul(2));
-        }
-    }
-    out
 }
 
 /// Invariant 6b: a composite node's schedule domain is the one its members'
@@ -244,7 +205,7 @@ pub fn check_schedule_domain(
         ));
     }
 
-    let elem = element_of(store_dtype(op));
+    let elem = store_dtype(op).scalar_element();
     let subgroup_width = caps.subgroup_width();
     let max_lanes = caps.limits.max_compute_invocations_per_workgroup;
     let max_storage = caps.limits.max_compute_workgroup_storage_size;
@@ -307,10 +268,10 @@ pub fn check_schedule_domain(
             // promoted carrier — one whose accumulator holds a free axis, so
             // `lanes` is that axis's extent rather than 1 — slips a strategy
             // needing `lanes * block * acc_bytes` bytes past it. The domain
-            // generator already filters on exactly this, so a domain built
-            // there cannot fail here; what this catches is a domain minted
-            // anywhere else, which §4.2 would otherwise turn into a
-            // `verify_plan` crash at extraction rather than a lost alternative.
+            // generator filters on exactly this, so a domain built there cannot
+            // fail here; what this catches is a domain minted anywhere else,
+            // which would otherwise be a `verify_plan` crash at extraction
+            // rather than a lost alternative.
             let carrier_lanes = fold_carrier_lanes(op);
             for s in &domain.strategies {
                 let group = s.lane_group(subgroup_width);
@@ -514,9 +475,7 @@ fn expected_effect(op: &L1) -> Effect {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 /// The promoted-axis invariants: `vec_axes` is a contiguous block immediately
 /// before `axis`, every promoted extent is accounted for in the carrier's lane
@@ -579,7 +538,6 @@ fn check_vec_axes(
             ));
         }
     }
-    // **A `Scalar` slot is one accumulator, not one per promoted position.**
     //
     // It is updated once per iteration step, so its `lift` is evaluated at a
     // single promoted position. An operand that varies along a promoted axis
@@ -592,6 +550,7 @@ fn check_vec_axes(
         let ops = operands_of(o);
         let varies: Vec<bool> = ops
             .iter()
+            .copied()
             .map(|o| {
                 vec_axes
                     .iter()
@@ -602,7 +561,7 @@ fn check_vec_axes(
             if *s != SlotTy::Scalar {
                 continue;
             }
-            let mut used = Vec::new();
+            let mut used = SmallVec::new();
             collect_args(&carrier.lift[k], &mut used);
             if let Some(i) = used
                 .iter()
@@ -647,27 +606,13 @@ fn check_vec_axes(
 }
 
 /// Every `Arg` index an expression names.
-fn collect_args(e: &crate::scalar::ScalarExpr, out: &mut Vec<u32>) {
-    use crate::scalar::ScalarKind as K;
-    match e.kind() {
-        K::Arg(i) => {
-            if !out.contains(i) {
-                out.push(*i);
-            }
-        }
-        K::Un { x, .. } | K::Cast { x, .. } | K::Bitcast { x, .. } | K::Round { x, .. }
-        | K::Splat { x, .. } => collect_args(x, out),
-        K::Bin { a, b, .. } | K::Cmp { a, b, .. } | K::Dot { a, b } => {
-            collect_args(a, out);
-            collect_args(b, out);
-        }
-        K::Select { c, t, f } => {
-            collect_args(c, out);
-            collect_args(t, out);
-            collect_args(f, out);
-        }
-        K::Lit(_) | K::Uniform(_) | K::IndexOf(_) => {}
+fn collect_args(e: &crate::scalar::ScalarExpr, out: &mut SmallVec<[u32; 4]>) {
+    if let crate::scalar::ScalarKind::Arg(i) = e.kind()
+        && !out.contains(i)
+    {
+        out.push(*i);
     }
+    e.for_each_child(|c| collect_args(c, out));
 }
 
 /// Whether an operand's read moves as `axis`'s coordinate advances.
@@ -697,25 +642,7 @@ fn cx_post_reads(cx: &VerifyCtx<'_>, axis: u32) -> bool {
     let Op::L1(L1::KFold { post, .. }) = &cx.node.op else {
         return false;
     };
-    post.iter().any(|e| reads_index_of(e, axis))
-}
-
-fn reads_index_of(e: &crate::scalar::ScalarExpr, axis: u32) -> bool {
-    use crate::scalar::ScalarKind as K;
-    match e.kind() {
-        K::IndexOf(a) => *a == axis,
-        K::Un { x, .. } | K::Cast { x, .. } | K::Bitcast { x, .. } | K::Round { x, .. } => {
-            reads_index_of(x, axis)
-        }
-        K::Bin { a, b, .. } | K::Cmp { a, b, .. } | K::Dot { a, b } => {
-            reads_index_of(a, axis) || reads_index_of(b, axis)
-        }
-        K::Select { c, t, f } => {
-            reads_index_of(c, axis) || reads_index_of(t, axis) || reads_index_of(f, axis)
-        }
-        K::Splat { x, .. } => reads_index_of(x, axis),
-        _ => false,
-    }
+    post.iter().any(|e| e.reads_index_of_axis(axis))
 }
 
 fn relabel(cx: &VerifyCtx<'_>, msg: String) -> Error {
@@ -754,19 +681,18 @@ fn index_space_of(op: &L1) -> Option<&IndexSpace> {
 }
 
 /// Every `Operand` a node carries, in `children_of` order.
-fn operands_of(op: &L1) -> Vec<Operand> {
+fn operands_of(op: &L1) -> SmallVec<[&Operand; 4]> {
     match op {
         L1::KMap { ops, .. }
         | L1::KFold { ops, .. }
         | L1::KGather { ops, .. }
         | L1::KScatter { ops, .. }
-        | L1::Ext { ops, .. } => ops.clone(),
-        L1::KContract { a, b, .. } => a.ops.iter().chain(b.ops.iter()).cloned().collect(),
-        L1::KRegion { .. } | L1::KMerged(_) => Vec::new(),
+        | L1::Ext { ops, .. } => ops.iter().collect(),
+        L1::KContract { a, b, .. } => a.ops.iter().chain(b.ops.iter()).collect(),
+        L1::KRegion { .. } | L1::KMerged(_) => SmallVec::new(),
     }
 }
 
-/// The element a node stores, which is what a staged coop tile holds.
 /// A `KFold`'s `(accumulator lanes, bytes per lane)`, or `None` when the node
 /// is not a fold or its carrier's lane count is symbolic.
 ///
@@ -786,16 +712,6 @@ fn store_dtype(op: &L1) -> Dtype {
         L1::KFold { acc, .. } => *acc,
         L1::KContract { post, .. } => post.dtype(),
         _ => Dtype::F32,
-    }
-}
-
-fn element_of(d: Dtype) -> ScalarElement {
-    match d {
-        Dtype::F16 => ScalarElement::F16,
-        Dtype::BF16 => ScalarElement::BF16,
-        Dtype::U32 => ScalarElement::U32,
-        Dtype::I32 => ScalarElement::I32,
-        _ => ScalarElement::F32,
     }
 }
 
@@ -992,8 +908,6 @@ mod tests {
         );
     }
 
-    // ---- Test 11 ---------------------------------------------------------
-
     #[test]
     fn coop_geometry_legality() {
         let geom = CoopGeom {
@@ -1107,8 +1021,8 @@ mod tests {
     /// strategy and `caps`, so it is decidable here. Both sides of the
     /// boundary are asserted: the widest carrier that fits is admitted, one
     /// lane more is refused. Without this the lane-group test is the only
-    /// admission a fold domain faces, and §4.2 makes the resulting
-    /// `verify_plan` failure a hard crash rather than a lost alternative.
+    /// admission a fold domain faces, and the resulting `verify_plan` failure
+    /// is a hard crash rather than a lost alternative.
     #[test]
     fn a_promoted_fold_carrier_over_the_workgroup_limit_is_refused() {
         let caps = caps();
@@ -1179,8 +1093,6 @@ mod tests {
                 .unwrap_or_else(|e| panic!("lane group {lane_group}: {e}"));
         }
     }
-
-    // ---- Test 14 ---------------------------------------------------------
 
     #[test]
     fn a_fold_axis_in_the_write_map_is_rejected() {
@@ -1263,8 +1175,6 @@ mod tests {
         .unwrap();
     }
 
-    // ---- Test 13 ---------------------------------------------------------
-
     #[test]
     fn effect_classification() {
         let atomic = L1::KScatter {
@@ -1289,8 +1199,6 @@ mod tests {
         };
         assert_eq!(effect_of(&Op::L1(map)), Effect::Pure);
     }
-
-    // ---- Test 12 ---------------------------------------------------------
 
     #[test]
     fn kmerged_constructor_is_the_only_way_in() {
@@ -1368,8 +1276,8 @@ mod tests {
 
     /// A composite whose domain is not the one its members' shared index
     /// space implies is refused. Without this the field is a place a rule may
-    /// write anything, and `SchedPoint::Point` — the value that made these
-    /// two nodes the only ones opting out of the search — reads as legal.
+    /// write anything, and `SchedPoint::Point` — a node opting out of the
+    /// search entirely — reads as legal.
     #[test]
     fn a_composite_carrying_a_foreign_domain_is_refused() {
         let members = smallvec::smallvec![Id(1), Id(2)];
@@ -1397,8 +1305,6 @@ mod tests {
         };
         assert!(run(wrong_shape, &[f32s(&[4, 4]), f32s(&[4, 4])], &f32s(&[4, 4])).is_err());
     }
-
-    // ---- Invariants 5 and 8 ---------------------------------------------
 
     #[test]
     fn operand_access_predicates() {
@@ -1448,8 +1354,6 @@ mod tests {
         };
         run(op, &[f32s(&[9])], &f32s(&[4])).unwrap();
     }
-
-    // ---- Test 10's first half, at the extension point --------------------
 
     #[test]
     fn an_opdef_with_constant_work_is_rejected() {

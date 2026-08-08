@@ -1,32 +1,33 @@
 //! `KMap` and `KFold`: the elementwise and reduction loop nests.
 //!
-//! Both read their geometry **off `theta`**. The reference derives the same
-//! numbers from three greedy formulas (`static_axis_block`,
-//! `lane_group_width`, `split_lane_groups`) plus an LLC-watermark gate and an
-//! argmax over invariant bytes; here W7 already scored the whole domain
-//! against the realized DAG, so there is nothing left to decide.
-//!
-//! Owned by W9.
+//! Both read their geometry **off `theta`**: the schedule domain is already
+//! scored against the realized DAG, so there is nothing left to decide here.
 
 use fusor2_ir::Result;
+#[cfg(test)]
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::NumericContract;
 use fusor2_ir::error::Error;
+#[cfg(test)]
 use fusor2_ir::ir::Node;
-use fusor2_ir::carrier::{Carrier, SlotTy};
+use fusor2_ir::carrier::Carrier;
 use fusor2_ir::dtype::Splat;
+#[cfg(test)]
 use fusor2_ir::scalar::BinOp;
 use fusor2_ir::ir::level1::{FoldStrat, L1, MapTiling, SchedPoint};
 use fusor2_ir::ir::level2::{
     Accumulator, Addr, ElementType, KernelIr, ReduceKind, ScalarElement, Stmt, TileBinaryOp,
     TileCompareOp, TileExpr, TileReduceOp,
 };
+#[cfg(test)]
 use fusor2_ir::target::LowerCtx;
 
 use crate::lower::{Ctx, DimBinding, grid_for, scalar_element};
 use fusor2_tile::domains::emitted_block;
 
-/// Contract-shaped entry point (see CONTRACTS.md §4.10).
+/// Single-node entry point used by the tests below; production dispatch
+/// goes through `lower::lower_node`.
+#[cfg(test)]
 pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     let ctx = Ctx::new(caps, cx, DimBinding::new())?;
     match &node.op {
@@ -36,9 +37,7 @@ pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> 
     }
 }
 
-// ---------------------------------------------------------------------------
 // KMap
-// ---------------------------------------------------------------------------
 
 /// Lower a `KMap` at a [`MapTiling`].
 ///
@@ -107,7 +106,7 @@ pub fn lower_kmap(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Kernel
                 )));
             }
             // A thread-local run along the innermost axis breaks inter-thread
-            // store coalescing, which is why W7's domain never offers it.
+            // store coalescing, so the schedule domain never offers it.
             if axis + 1 == space.rank() {
                 return Err(Error::Plan(
                     "map tiling on the innermost axis destroys store coalescing".into(),
@@ -116,7 +115,7 @@ pub fn lower_kmap(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Kernel
 
             let base = ctx.global_index(block, grid);
             let stride = inner_extent_expr(&mut ctx, op, axis)?;
-            let tm_e = ctx.b.u32(tm);
+            let tm_e = ctx.b.lit_u32(tm);
             let step = ctx.b.mul(stride.clone(), tm_e);
             let tile_base = {
                 let outer = ctx
@@ -129,9 +128,8 @@ pub fn lower_kmap(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Kernel
                 ctx.b.add(scaled, inner)
             };
 
-            // Hoist every operand whose access does not vary along `dim`.
-            // This is the reference's register-reuse body with its
-            // LLC-watermark gate removed: W7 already priced the reuse.
+            // Hoist every operand whose access does not vary along `dim`; the
+            // reuse it buys is already priced by the schedule domain.
             let mut hoisted: Vec<Option<TileExpr>> = Vec::with_capacity(ops.len());
             for operand in ops {
                 if operand_is_invariant(operand, axis) {
@@ -149,7 +147,7 @@ pub fn lower_kmap(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Kernel
 
             for t in 0..tm {
                 let off = {
-                    let t_e = ctx.b.u32(t);
+                    let t_e = ctx.b.lit_u32(t);
                     let scaled = ctx.b.mul(stride.clone(), t_e);
                     ctx.b.add(tile_base.clone(), scaled)
                 };
@@ -190,7 +188,7 @@ fn operand_is_invariant(operand: &fusor2_ir::ir::level1::Operand, axis: usize) -
 }
 
 fn space_extent_expr(ctx: &mut Ctx<'_>, space: &fusor2_ir::ir::level1::IndexSpace) -> Result<TileExpr> {
-    let mut acc = ctx.b.u32(1);
+    let mut acc = ctx.b.lit_u32(1);
     for dim in &space.dims {
         let e = ctx.dim_expr(*dim)?;
         acc = ctx.b.mul(acc, e);
@@ -204,7 +202,7 @@ fn inner_extent_expr(ctx: &mut Ctx<'_>, op: &L1, axis: usize) -> Result<TileExpr
     let L1::KMap { space, .. } = op else {
         return Err(Error::Plan("inner_extent_expr on a non-KMap node".into()));
     };
-    let mut acc = ctx.b.u32(1);
+    let mut acc = ctx.b.lit_u32(1);
     for dim in space.dims.iter().skip(axis + 1) {
         let e = ctx.dim_expr(*dim)?;
         acc = ctx.b.mul(acc, e);
@@ -223,9 +221,7 @@ fn tiled_grid(
     Ok(full)
 }
 
-// ---------------------------------------------------------------------------
 // KFold
-// ---------------------------------------------------------------------------
 
 /// Lower a `KFold` at a [`FoldStrat`].
 ///
@@ -238,11 +234,10 @@ fn tiled_grid(
 /// softmax's `exp` and a mean's divide fuse into the same launch.
 ///
 /// **Two bodies, one dispatch.** One scalar slot merged by a hardware operator
-/// takes the collective path below, unchanged and byte-identical; anything wider
-/// goes to [`lower_kfold_carrier`], which carries one accumulator per lane and
-/// closes with `Stmt::Reduce`'s N-ary merge. The shape this replaced resolved one
-/// `TileReduceOp` for the whole fold, updated only `accs[0]` and reduced a single
-/// value, so `Fold{(max, sum)}` computed `max(x)` and discarded the sum.
+/// takes the collective path below; anything wider goes to
+/// [`lower_kfold_carrier`], which carries one accumulator per lane and closes
+/// with `Stmt::Reduce`'s N-ary merge, so a carrier like `Fold{(max, sum)}`
+/// keeps every slot.
 pub fn lower_kfold(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<KernelIr> {
     let L1::KFold {
         space,
@@ -309,7 +304,7 @@ pub fn lower_kfold(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Kerne
     let rows = space_extent_expr(&mut ctx, &row_space)?;
     let axis_extent = ctx.dim_expr(space.dims[axis])?;
     let inner: TileExpr = {
-        let mut acc_e = ctx.b.u32(1);
+        let mut acc_e = ctx.b.lit_u32(1);
         for dim in space.dims.iter().skip(axis + 1) {
             let e = ctx.dim_expr(*dim)?;
             acc_e = ctx.b.mul(acc_e, e);
@@ -329,7 +324,7 @@ pub fn lower_kfold(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Kerne
 
     // Row identity: one lane group per output row.
     let group = ctx.global_index(block, grid);
-    let lg_e = ctx.b.u32(lane_group);
+    let lg_e = ctx.b.lit_u32(lane_group);
     let row = ctx
         .b
         .binary(TileBinaryOp::Div, group.clone(), lg_e.clone(), NumericContract::RELAXED);
@@ -382,9 +377,8 @@ pub fn lower_kfold(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Kerne
 
     // A lane past the reduced extent contributes the combine's identity. The
     // collective spans the whole lane group whatever the extent is, so without
-    // this a `[2, 4]` row fold on a 32-wide subgroup summed the *next* row into
-    // row 0 — every softmax, layer norm and axis reduction on this backend was
-    // wrong in its first row and right in its last.
+    // this a `[2, 4]` row fold on a 32-wide subgroup would sum the *next* row
+    // into row 0.
     let guard = |ctx: &mut Ctx<'_>, k: &TileExpr, v: TileExpr| -> TileExpr {
         let in_range = ctx
             .b
@@ -393,13 +387,8 @@ pub fn lower_kfold(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Kerne
         ctx.b.select(in_range, v, ident)
     };
 
-    // **One pass of the lane group covers `lane_group` elements of the axis.**
-    // A collective read at `k = lane` and nothing else, which is what the
-    // `Subgroup` and `WgTree` bodies did, therefore reduced only the *first*
-    // `lane_group` elements and silently dropped the rest — `fold_domain`
-    // offers both strategies at every `k`, and the floor lowering defaults to
-    // `Subgroup`, so a 120-element `sum_all` on a 32-wide subgroup returned the
-    // sum of its first 32 elements. Anything longer than one pass needs the
+    // A collective read at `k = lane` and nothing else would reduce only the
+    // first `lane_group` elements, so anything longer than one pass needs the
     // per-lane strided loop first, whichever collective closes it.
     let one_pass = space.dims[axis]
         .as_const()
@@ -433,7 +422,7 @@ pub fn lower_kfold(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Kerne
         );
         accs[0].update = partial;
         let count = {
-            let lg_minus_1 = ctx.b.u32(lane_group.max(1) - 1);
+            let lg_minus_1 = ctx.b.lit_u32(lane_group.max(1) - 1);
             let numerator = ctx.b.add(axis_extent.clone(), lg_minus_1);
             ctx.b.binary(
                 TileBinaryOp::Div,
@@ -479,7 +468,7 @@ pub fn lower_kfold(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Kerne
     let value = ctx.eval_scalar(post, &reduced, &[row.clone()])?;
     let value = ctx.b.cast(value, out_elem);
     let lane_zero = {
-        let z = ctx.b.u32(0);
+        let z = ctx.b.lit_u32(0);
         ctx.b.compare(TileCompareOp::Eq, lane, z)
     };
     let mask = ctx.b.and(row_live, lane_zero);
@@ -519,19 +508,6 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<K
     else {
         return Err(Error::Plan("lower_kfold_carrier on a non-KFold node".into()));
     };
-    let merges = carrier.merge_lanes().ok_or_else(|| {
-        Error::Plan("this carrier's merge does not expand to one expression per lane".into())
-    })?;
-    let lanes = merges.len();
-    let posts = carrier.expand_lanes(post).ok_or_else(|| {
-        Error::Plan(format!(
-            "a {}-slot carrier carries {} post expressions, or a slot's post reads \
-             a sibling of a different width",
-            carrier.width(),
-            post.len()
-        ))
-    })?;
-
     let axis = *axis as usize;
     if axis >= space.rank() {
         return Err(Error::Plan(format!(
@@ -539,34 +515,16 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<K
             space.rank()
         )));
     }
-    // A promoted nest: the accumulator-resident axes are a contiguous block
-    // immediately before the reduced axis, so `space` is `free.. ++ vec.. ++
-    // [reduced]` and one output row spans `vec_extent * axis_extent`
-    // consecutive elements. `verify_l1` establishes the block property; the
-    // reduced axis being last is what makes the address below one multiply,
-    // and a nest that arrives otherwise says so rather than computing it
-    // wrongly.
-    let vec_extent: u64 = vec_axes
-        .iter()
-        .map(|i| space.dims[*i as usize].as_const())
-        .try_fold(1u64, |a, d| Some(a * d?))
-        .ok_or_else(|| Error::Plan("a promoted axis has a symbolic extent".into()))?;
-    if !vec_axes.is_empty() && axis + 1 != space.rank() {
-        return Err(Error::Plan(
-            "a promoted KFold whose reduced axis is not last is not lowered".into(),
-        ));
-    }
-    if vec_axes.is_empty() && carrier.slots.iter().any(|s| *s != SlotTy::Scalar) {
-        return Err(Error::Plan(
-            "a Vector carrier slot needs a promoted axis to read its positions from".into(),
-        ));
-    }
-    // Iteration axis `j` is space axis `iter_axes[j]`. Every `ScalarExpr` on
-    // this node is written against the iteration space, so an `IndexOf` has to
-    // be resolved through this map and not against `space` directly.
-    let iter_axes: Vec<usize> = (0..space.rank())
-        .filter(|i| !vec_axes.contains(&(*i as u32)))
-        .collect();
+    // The shared expand/legality prologue: one output row spans
+    // `vec_extent * axis_extent` consecutive elements, which is what makes
+    // the address below one multiply.
+    let fusor2_ir::carrier::CarrierNest {
+        merges,
+        posts,
+        lanes,
+        vec_extent,
+        iter_axes,
+    } = fusor2_ir::carrier::CarrierNest::validate(carrier, space, axis, vec_axes, post)?;
     let space_total = space.iterations().unwrap_or(0);
     let acc_elem = scalar_element(*acc);
     let acc_ty = ElementType::Scalar(acc_elem);
@@ -591,7 +549,7 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<K
     let rows = space_extent_expr(&mut ctx, &row_space)?;
     let axis_extent = ctx.dim_expr(space.dims[axis])?;
     let inner: TileExpr = {
-        let mut acc_e = ctx.b.u32(1);
+        let mut acc_e = ctx.b.lit_u32(1);
         for dim in space.dims.iter().skip(axis + 1) {
             let e = ctx.dim_expr(*dim)?;
             acc_e = ctx.b.mul(acc_e, e);
@@ -606,7 +564,7 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<K
 
     let grid = grid_for(&row_space, block / lane_group, &ctx.binding, &limits)?;
     let group = ctx.global_index(block, grid);
-    let lg_e = ctx.b.u32(lane_group);
+    let lg_e = ctx.b.lit_u32(lane_group);
     let row = ctx
         .b
         .binary(TileBinaryOp::Div, group.clone(), lg_e.clone(), NumericContract::RELAXED);
@@ -622,11 +580,10 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<K
         .b
         .binary(TileBinaryOp::Rem, row.clone(), inner.clone(), NumericContract::RELAXED);
     // One output row spans every promoted position of every reduced element,
-    // so its stride carries `vec_extent`. At `vec_extent == 1` this is the
-    // expression that was here before.
+    // so its stride carries `vec_extent`.
     let pos_stride = ctx.b.mul(inner.clone(), axis_extent.clone());
     let row_stride = {
-        let ve = ctx.b.u32(vec_extent as u32);
+        let ve = ctx.b.lit_u32(vec_extent as u32);
         ctx.b.mul(pos_stride.clone(), ve)
     };
     let row_base = {
@@ -659,7 +616,7 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<K
                 if p == 0 {
                     base
                 } else {
-                    let pe = ctx.b.u32(p as u32);
+                    let pe = ctx.b.lit_u32(p as u32);
                     let shift = ctx.b.mul(pos_stride.clone(), pe);
                     ctx.b.add(base, shift)
                 }
@@ -727,7 +684,7 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<K
             accs[slot].update = ctx.eval_scalar(&merges[slot], &args, &[])?;
         }
         let count = {
-            let lg_minus_1 = ctx.b.u32(lane_group - 1);
+            let lg_minus_1 = ctx.b.lit_u32(lane_group - 1);
             let numerator = ctx.b.add(axis_extent.clone(), lg_minus_1);
             ctx.b
                 .binary(TileBinaryOp::Div, numerator, lg_e.clone(), NumericContract::RELAXED)
@@ -789,16 +746,16 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<K
         outs.iter().map(|l| ctx.b.load_local(l.clone())).collect()
     };
     let lane_zero = {
-        let z = ctx.b.u32(0);
+        let z = ctx.b.lit_u32(0);
         ctx.b.compare(TileCompareOp::Eq, lane, z)
     };
     let mask = ctx.b.and(row_live, lane_zero);
-    let lanes_e = ctx.b.u32(lanes as u32);
+    let lanes_e = ctx.b.lit_u32(lanes as u32);
     let base = ctx.b.mul(row.clone(), lanes_e);
     for slot in 0..lanes {
         let value = ctx.eval_scalar(&posts[slot], &reduced, &[row.clone()])?;
         let value = ctx.b.cast(value, out_elem);
-        let off = ctx.b.u32(slot as u32);
+        let off = ctx.b.lit_u32(slot as u32);
         let addr = ctx.b.add(base.clone(), off);
         stmts.push(Stmt::Store {
             dst: out_view.clone(),
@@ -817,49 +774,33 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<K
 /// onto `TileReduceOp`. Everything wider needs the N-lane `Stmt::Reduce` and
 /// says so instead of computing slot 0 and dropping the rest.
 fn single_slot_reduce_op(c: &Carrier) -> Result<TileReduceOp> {
-    if c.width() != 1 || c.slots[0] != SlotTy::Scalar {
-        return Err(Error::Plan(format!(
-            "a {}-slot carrier needs the N-lane collective; the GPU emitter \
-             only lowers a single scalar slot",
-            c.width()
-        )));
-    }
-    match c.kind() {
-        Some(BinOp::Add) => Ok(TileReduceOp::Sum),
-        Some(BinOp::Mul) => Ok(TileReduceOp::Product),
-        Some(BinOp::Max) => Ok(TileReduceOp::Max),
-        Some(BinOp::Min) => Ok(TileReduceOp::Min),
-        other => Err(Error::Plan(format!(
-            "carrier merge {other:?} has no hardware collective; the generic \
-             merge path is not built yet"
-        ))),
-    }
+    fusor2_ir::ir::level2::single_slot_reduce_op(c).map_err(Error::Plan)
 }
 
 /// A carrier identity as a tile literal. The infinities go through the
-/// builder's own spellings so the emitted text is unchanged.
+/// builder's own spellings rather than a formatted float.
 fn identity_expr(ctx: &mut Ctx<'_>, s: Splat, elem: ScalarElement) -> TileExpr {
     let f = match s {
         Splat::F32(v) => v,
         Splat::F16(b) => half::f16::from_bits(b).to_f32(),
         Splat::BF16(b) => half::bf16::from_bits(b).to_f32(),
-        Splat::U32(v) => return if v == 0 { ctx.b.zero(elem) } else if v == u32::MAX { ctx.b.pos_inf(elem) } else { ctx.b.u32(v) },
-        Splat::I32(v) => return if v == 0 { ctx.b.zero(elem) } else if v == i32::MIN { ctx.b.neg_inf(elem) } else if v == i32::MAX { ctx.b.pos_inf(elem) } else { ctx.b.i32(v) },
+        Splat::U32(v) => return if v == 0 { ctx.b.zero_scalar(elem) } else if v == u32::MAX { ctx.b.pos_inf(elem) } else { ctx.b.lit_u32(v) },
+        Splat::I32(v) => return if v == 0 { ctx.b.zero_scalar(elem) } else if v == i32::MIN { ctx.b.neg_inf(elem) } else if v == i32::MAX { ctx.b.pos_inf(elem) } else { ctx.b.lit_i32(v) },
     };
     if f == f32::NEG_INFINITY {
         ctx.b.neg_inf(elem)
     } else if f == f32::INFINITY {
         ctx.b.pos_inf(elem)
     } else if f == 0.0 {
-        ctx.b.zero(elem)
+        ctx.b.zero_scalar(elem)
     } else if f == 1.0 {
         match elem {
-            ScalarElement::U32 => ctx.b.u32(1),
-            ScalarElement::I32 => ctx.b.i32(1),
-            _ => ctx.b.f32(1.0),
+            ScalarElement::U32 => ctx.b.lit_u32(1),
+            ScalarElement::I32 => ctx.b.lit_i32(1),
+            _ => ctx.b.lit_f32(1.0),
         }
     } else {
-        ctx.b.f32(f)
+        ctx.b.lit_f32(f)
     }
 }
 
@@ -924,9 +865,7 @@ mod tests {
         assert_eq!(single_slot_reduce_op(&fused).unwrap(), TileReduceOp::Sum);
     }
 
-    // -----------------------------------------------------------------------
     // The single-slot shader golden
-    // -----------------------------------------------------------------------
 
     /// Lower one `KFold` at `carrier` over `[3, 8]` axis 1.
     fn fold_ir_result(carrier: Carrier, theta: SchedPoint) -> Result<KernelIr> {
@@ -1038,30 +977,13 @@ mod tests {
         h
     }
 
-    /// **The whole point of the single-slot fast path.** A plain `Fold{Add}` and
-    /// a plain `Fold{Max}`, lowered end to end and emitted, must produce
-    /// byte-identical WGSL before and after the N-ary reduction exists — the
-    /// N-slot form is a new `Stmt` *beside* the collective, never in place of
-    /// it, and every one of the passing folds in the suite goes down this path.
-    ///
-    /// Recorded from the tree in which `Stmt::Reduce` did not yet exist. The
-    /// failure message prints the shader, so a deliberate change is re-recorded
-    /// by copying one line.
+    /// The single-slot fast path, pinned: a plain `Fold{Add}` and a plain
+    /// `Fold{Max}` emit the subgroup collective, not the N-ary `Stmt::Reduce`.
+    /// The N-slot form is a new `Stmt` *beside* the collective, never in place
+    /// of it. The failure message prints the shader, so a deliberate change is
+    /// re-recorded by copying one line.
     #[test]
     fn single_slot_fold_wgsl_is_unchanged() {
-        // Re-baselined when `Ctx::global_index` started linearizing the
-        // workgroup id against the dispatched grid instead of against
-        // `max_compute_workgroups_per_dimension`. The only text that moved is
-        // that one expression: `param_1.y * 65535u` became `param_1.y * X` for
-        // this launch's real `X` (3 for the subgroup cases, 1 — so naga folds
-        // the multiply away entirely — for the wgtree ones), and the `z` term
-        // likewise. Every shader is 19-35 bytes shorter for exactly that
-        // reason; nothing else in these four kernels changed.
-        //
-        // Re-baselined again when masked storage loads went branchless: the
-        // `var tmp = fill; if (mask) { tmp = buf[i]; } tmp` round trip became
-        // `let masked_N = select(fill, buf[min(i, last)], mask)`. Every shader
-        // is exactly 62 bytes shorter and loses one `if`.
         let cases: [(&'static str, BinOp, u64, usize); 4] = [
             ("add_subgroup", BinOp::Add, 0x1fa7_abfd_a91a_cd43, 850),
             ("max_subgroup", BinOp::Max, 0x41dc_217d_1c7a_9838, 889),
@@ -1088,9 +1010,8 @@ mod tests {
         }
     }
 
-    /// The `accs[0]` bug, refused rather than miscomputed: a two-slot carrier
-    /// has no single `TileReduceOp`, so the fast path declines instead of
-    /// reducing slot 0 and discarding the rest.
+    /// A two-slot carrier has no single `TileReduceOp`, so the fast path
+    /// declines instead of reducing slot 0 and discarding the rest.
     #[test]
     fn a_multi_slot_carrier_is_refused_not_silently_truncated() {
         let pair = binop(BinOp::Max).tuple(&binop(BinOp::Add), &fusor2_ir::carrier::ArgRemap::identity(1));
@@ -1147,7 +1068,7 @@ mod tests {
             .filter(|s| matches!(s, Stmt::Store { .. }))
             .count();
         assert_eq!(stores, 2);
-        // And the whole kernel verifies, including the new arity clause.
+        // And the whole kernel verifies, including the arity clause.
         fusor2_tile::verify_l2(&ir, &crate::emit::testkit::caps(false, true)).unwrap();
     }
 
@@ -1192,7 +1113,6 @@ mod tests {
         );
     }
 
-    /// **A promoted nest lowers: one accumulator per promoted position.**
     ///
     /// `space = [3, 4, 8]` with `vec_axes = [1]` and the reduced axis last is
     /// the shape PROMOTE mints — the free axis `3`, four accumulator positions,

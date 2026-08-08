@@ -5,8 +5,6 @@
 //! `fusor2-tile`'s contraction domains. `matmul`, `mat_mul_transposed_rhs` and
 //! every batched form differ only in the spec, so this module is the whole of
 //! "transposed-rhs is a spec, not an op".
-//!
-//! Owned by W1.
 
 use crate::error::{Error, Result};
 use crate::ir::level0::{EinSpec, Label};
@@ -224,8 +222,7 @@ fn collapse(group: &[Label], extents: &FxHashMap<Label, Dim>, name: &str) -> Res
 /// original's contracted set becoming `a`'s free set.
 ///
 /// `verify_l0` calls this, so an unadjointable contraction is rejected at
-/// construction rather than at backward time — the one place the reference
-/// discovers it, several thousand kernels later.
+/// construction rather than at backward time.
 pub fn check_adjoint_specs(spec: &EinSpec) -> Result<()> {
     let original = partition(spec)?;
 
@@ -295,7 +292,7 @@ mod tests {
     fn batched() -> EinSpec {
         spec(b"bik", b"bjk", b"bij")
     }
-    // `mk,nk->mn` — the reference's `mat_mul_transposed_rhs`.
+    // `mk,nk->mn` — matmul with a transposed right-hand side.
     fn transposed_rhs() -> EinSpec {
         spec(b"mk", b"nk", b"mn")
     }
@@ -318,7 +315,7 @@ mod tests {
 
     #[test]
     fn a_label_only_in_out_errors() {
-        // Test 4's first half: `z` appears only in `out`.
+        // `z` appears only in `out`.
         let s = spec(b"mk", b"nk", b"mnz");
         assert!(matches!(role(&s, Label(b'z')), Err(Error::Shape(_))));
         assert!(partition(&s).is_err());
@@ -332,7 +329,7 @@ mod tests {
 
     #[test]
     fn extents_out_shape_and_mnkb() {
-        // Test 3: `bik,bjk->bij` on [2,3,4], [2,5,4].
+        // `bik,bjk->bij` on [2,3,4], [2,5,4].
         let s = batched();
         let a = [Dim::Const(2), Dim::Const(3), Dim::Const(4)];
         let b = [Dim::Const(2), Dim::Const(5), Dim::Const(4)];
@@ -415,7 +412,6 @@ mod tests {
 
     #[test]
     fn adjoint_specs_accepted() {
-        // Test 15.
         check_adjoint_specs(&batched()).unwrap();
         check_adjoint_specs(&transposed_rhs()).unwrap();
     }

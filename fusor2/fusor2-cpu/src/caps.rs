@@ -1,7 +1,5 @@
 //! ISA and cache detection. The detected `Level` is cached in a `OnceLock` and
-//! dispatched **once per kernel launch**, not per row.
-//!
-//! Owned by W10.
+//! dispatched once per kernel launch, not per row.
 
 use fusor2_ir::device::{Caps, DeviceKind, Limits, SubgroupWidths};
 use smallvec::smallvec;
@@ -46,10 +44,9 @@ pub struct CpuCaps;
 impl CpuCaps {
     /// Bytes of the last-level cache, feeding `DeviceFacts::llc_bytes`.
     pub fn llc_bytes() -> u64 {
-        // No portable query exists. 8 MiB matches the Apple-silicon SLC slice a
-        // single core sees and is a middling x86 L3-per-core figure; the value
-        // is a *device fact*, so `fusor2-cost::calibrate` overwrites it with a
-        // measured number when calibration runs.
+        // No portable query exists. 8 MiB is a middling per-core figure on both
+        // Apple silicon and x86; `fusor2-cost::calibrate` overwrites it with a
+        // measured number.
         8 << 20
     }
 
@@ -82,9 +79,8 @@ pub fn cpu_caps() -> &'static Caps {
                 max_storage_buffers_per_shader_stage: 64,
                 max_storage_buffer_binding_size: u64::MAX,
             },
-            // A "subgroup" on CPU is one SIMD register, so `Reduce{Subgroup}`
-            // is legal and lowers to a horizontal reduce. Fixed width, which
-            // is what every subgroup-size-aware kernel requires.
+            // A "subgroup" on CPU is one SIMD register of fixed width, so
+            // `Reduce{Subgroup}` lowers to a horizontal reduce.
             subgroups: Some(SubgroupWidths { min: w, max: w }),
             f16: true,
             bf16: true,
@@ -93,8 +89,7 @@ pub fn cpu_caps() -> &'static Caps {
             // SortSegment}` and makes `ScatterMode::Atomic` unreachable.
             atomic_f32: false,
             // Thread-local scratch aliases freely, so `ArenaMode::ByteArena` is
-            // always available and the arena separation predicate is trivially
-            // true.
+            // always available.
             workgroup_alias: true,
             mixed_precision_coop_store: false,
             pipeline_cache: false,

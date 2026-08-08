@@ -1,14 +1,11 @@
 //! `Gather` and all four `Scatter{Add}` lowerings, including duplicate
 //! indices, which must accumulate.
 //!
-//! That is the load-bearing property in this area: `Scatter{Add}` is the
-//! declared adjoint of `Gather`, so one token appearing twice in a batch must
-//! receive the summed gradient. Every gather case uses an index vector with a
-//! repeat *and* an unread row, because an index set that happens to be a
-//! permutation cannot tell a correct scatter-add from a scatter-set, and one
-//! with full coverage cannot tell an explicit zero from a missing gradient.
-//!
-//! Owned by W14.
+//! `Scatter{Add}` is the adjoint of `Gather`, so a token appearing twice in a
+//! batch receives the summed gradient. Every gather case uses an index vector
+//! with a repeat and an unread row: a permutation cannot distinguish
+//! scatter-add from scatter-set, and full coverage cannot distinguish an
+//! explicit zero from a missing gradient.
 
 use fusor2::{Dtype, Session};
 
@@ -20,7 +17,7 @@ const VOCAB: usize = 5;
 const WIDTH: usize = 3;
 const TABLE_LEN: usize = VOCAB * WIDTH;
 
-/// Deliberately not a permutation: `2` appears twice and `4` never.
+/// Not a permutation: `2` appears twice and `4` never.
 const IDS: &[u32] = &[2, 0, 2, 3];
 
 fn backend_of(session: &Session) -> &'static str {
@@ -161,9 +158,8 @@ fn index_select_case(session: &Session, dim: usize) -> CaseResult {
     Ok(())
 }
 
-/// The property the whole area exists for, isolated: the row read twice gets
-/// exactly twice the gradient, and the row never read gets an explicit zero
-/// rather than no gradient at all.
+/// The row read twice gets exactly twice the gradient; the row never read gets
+/// an explicit zero.
 fn dup_grad_case(session: &Session) -> CaseResult {
     let table = Domain::Wide.sample(1013, TABLE_LEN);
     let graph = graph_of(session);
@@ -217,9 +213,8 @@ fn embedding_case(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// Trainer constraint 3: there is no hand-written embedding backward. The
-/// adjoint is `Scatter{Add}`, so the table's gradient is the per-row token
-/// count.
+/// Embedding has no hand-written backward: its adjoint is `Scatter{Add}`, so
+/// the table's gradient is the per-row token count.
 fn embedding_backward(session: &Session) -> CaseResult {
     let table = Domain::Wide.sample(1021, TABLE_LEN);
     let graph = graph_of(session);
@@ -245,8 +240,7 @@ fn embedding_backward(session: &Session) -> CaseResult {
 }
 
 /// `gather_last`: one column per row, picked by a rank-1 index as long as the
-/// row count. The row-offset adjustment is the whole point — an
-/// implementation that forgets it reads row 0 every time.
+/// row count. Each pick is offset by its row.
 fn gather_last_case(session: &Session) -> CaseResult {
     let table = Domain::Wide.sample(1031, TABLE_LEN);
     let picks: Vec<u32> = vec![2, 0, 1, 2, 0];
@@ -332,10 +326,8 @@ fn scatter_add_case(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// Three updates aimed at the same row must all land. All four lowerings —
-/// atomic, sort-segment, workgroup-private merge, one-hot contraction — have
-/// to agree here, and only a colliding index distinguishes them from a
-/// last-writer-wins scatter.
+/// Three updates aimed at the same row must all land, in every lowering
+/// (atomic, sort-segment, workgroup-private merge, one-hot contraction).
 fn scatter_add_dups(session: &Session) -> CaseResult {
     let base = vec![0.0f32; TABLE_LEN];
     let idx: Vec<u32> = vec![2, 2, 2, 0];
@@ -472,8 +464,8 @@ fn scatter_set_case(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// `unique` is a caller-supplied proof and `verify_l0` rejects `Set` without
-/// it — otherwise the result would depend on which lane wrote last.
+/// `unique` is a caller-supplied proof; `verify_l0` rejects `Set` without it,
+/// since the result would otherwise depend on which lane wrote last.
 fn scatter_set_unproven(session: &Session) -> CaseResult {
     let graph = graph_of(session);
     let b = upload(
@@ -497,10 +489,6 @@ fn scatter_set_unproven(session: &Session) -> CaseResult {
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// i() / TensorIndex
-// ---------------------------------------------------------------------------
 
 const R2: &[u64] = &[3, 4];
 const R3: &[u64] = &[2, 3, 4];
@@ -555,9 +543,9 @@ fn index_rank4(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// A pick at a nonzero position with narrowed neighbours. This is the
-/// two-node path (`slice` then `squeeze`): a `StrideSpec` offset rides on the
-/// axis it names, and a dropped axis has no output axis left to carry it.
+/// A pick at a nonzero position with narrowed neighbours, taking the two-node
+/// path (`slice` then `squeeze`): a `StrideSpec` offset rides on the axis it
+/// names, and a dropped axis has no output axis to carry it.
 fn index_nonzero_pick(session: &Session) -> CaseResult {
     let data = Domain::Wide.sample(1109, 24);
     let graph = graph_of(session);

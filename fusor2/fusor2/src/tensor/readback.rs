@@ -2,11 +2,9 @@
 //! are an explicit wait and the allocator's memory-cap retry).
 //!
 //! A [`TensorSlice`] is bytes plus the [`Layout`] they were read under, so
-//! indexing honours **offset and strides** rather than assuming contiguity.
+//! indexing honours offset and strides rather than assuming contiguity.
 //! Every accessor is total: a symbolic extent that never got bound is an
 //! `Err`/`None`, never a panic.
-//!
-//! Owned by W12.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -141,7 +139,6 @@ impl TensorSlice {
 
     /// Row-major copy of every element, ignoring the layout's own order.
     pub fn to_flat<D: Element>(&self) -> Result<Vec<D>> {
-        let shape = self.const_shape()?;
         if D::DTYPE != self.dtype {
             return Err(Error::Dtype(format!(
                 "TensorSlice has dtype {:?}, not {:?}",
@@ -149,50 +146,35 @@ impl TensorSlice {
                 D::DTYPE
             )));
         }
-        let n: usize = shape.iter().product();
-        let mut out = Vec::with_capacity(n);
-        let mut idx = vec![0usize; shape.len()];
-        for _ in 0..n {
-            out.push(
-                self.get::<D>(&idx)
-                    .ok_or_else(|| Error::Shape("readback index out of range".into()))?,
-            );
-            for axis in (0..shape.len()).rev() {
-                idx[axis] += 1;
-                if idx[axis] < shape[axis] {
-                    break;
-                }
-                idx[axis] = 0;
-            }
-        }
-        Ok(out)
+        self.gather(|s, idx| {
+            s.get::<D>(idx)
+                .ok_or_else(|| Error::Shape("readback index out of range".into()))
+        })
     }
 
     /// Every element widened to `f32`, row-major.
     ///
-    /// [`TensorSlice::to_flat`] is the *typed* accessor and refuses a dtype it
-    /// was not asked for; this is the *numeric* one. An f16 activation and a
-    /// u32 token id both come back as the numbers they denote, because the
-    /// caller asked for numbers, not for a reinterpretation of the bytes. A
-    /// block-quantized value has no dense element and is still refused.
+    /// [`TensorSlice::to_flat`] is the typed accessor and refuses a dtype it
+    /// was not asked for; this is the numeric one, so an f16 activation and a
+    /// u32 token id both come back as the numbers they denote. A
+    /// block-quantized value has no dense element and is refused.
     pub fn to_vec_f32(&self) -> Result<Vec<f32>> {
         if self.dtype == Dtype::F32 {
             return self.to_flat::<f32>();
         }
+        self.gather(Self::element_f32)
+    }
+
+    /// Row-major visit of every position, parameterized by the element
+    /// decoder.
+    fn gather<T>(&self, read: impl Fn(&Self, &[usize]) -> Result<T>) -> Result<Vec<T>> {
         let shape = self.const_shape()?;
-        let n: usize = shape.iter().product();
-        let mut out = Vec::with_capacity(n);
-        let mut idx = vec![0usize; shape.len()];
-        for _ in 0..n {
-            out.push(self.element_f32(&idx)?);
-            for axis in (0..shape.len()).rev() {
-                idx[axis] += 1;
-                if idx[axis] < shape[axis] {
-                    break;
-                }
-                idx[axis] = 0;
-            }
-        }
+        let ranges: Vec<std::ops::Range<usize>> = shape.iter().map(|&e| 0..e).collect();
+        let mut out = Vec::with_capacity(shape.iter().product());
+        for_each_position(&ranges, |idx| {
+            out.push(read(self, idx)?);
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -216,6 +198,28 @@ impl TensorSlice {
     }
 }
 
+/// Row-major odometer over one `Range` per axis, last axis fastest: `f` runs
+/// at every position, and a failure stops the walk. The empty product — rank
+/// 0 — visits the single empty position once; an empty range visits nothing.
+pub(crate) fn for_each_position(
+    ranges: &[std::ops::Range<usize>],
+    mut f: impl FnMut(&[usize]) -> Result<()>,
+) -> Result<()> {
+    let count: usize = ranges.iter().map(|r| r.len()).product();
+    let mut cursor: Vec<usize> = ranges.iter().map(|r| r.start).collect();
+    for _ in 0..count {
+        f(&cursor)?;
+        for axis in (0..cursor.len()).rev() {
+            cursor[axis] += 1;
+            if cursor[axis] < ranges[axis].end {
+                break;
+            }
+            cursor[axis] = ranges[axis].start;
+        }
+    }
+    Ok(())
+}
+
 impl<const N: usize> Index<[usize; N]> for TensorSlice {
     /// The element's raw bytes: a `TensorSlice` is not generic over its
     /// element type, so `Index` cannot hand back a typed reference. Use
@@ -226,10 +230,6 @@ impl<const N: usize> Index<[usize; N]> for TensorSlice {
             .expect("TensorSlice index out of range")
     }
 }
-
-// ---------------------------------------------------------------------------
-// Debug for ranks 0-3
-// ---------------------------------------------------------------------------
 
 /// A rank- and dtype-checked view of a [`TensorSlice`].
 #[derive(Copy, Clone)]
@@ -337,17 +337,11 @@ impl<const R: usize, D: Element + fmt::Debug> fmt::Debug for Ranked<'_, R, D> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tensor -> host
-// ---------------------------------------------------------------------------
-
 impl Tensor {
     /// Resolve the graph up to this value and copy it back.
     ///
     /// `Session::read_bytes` hands back a contiguous copy, so the layout a
     /// [`TensorSlice`] carries is the value's own shape in row-major order.
-    /// The stride machinery above is still exercised by anything that builds
-    /// a slice directly over a device layout.
     pub fn as_slice(&self) -> Result<TensorSlice> {
         let facts = self.facts();
         let bytes = self.graph.read_back(self.id)?;

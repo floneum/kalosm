@@ -1,13 +1,8 @@
 //! `Linear`, `Embedding`, `ConvNd`, `LayerNorm`, `RmsNorm`, plus the caches
 //! and the optimizer that sit on top of them.
 //!
-//! A layer owns parameters and a `forward`; it owns no kernel. So every case
-//! here is really two assertions: that the layer's forward is the composition
-//! its documentation claims, and that gradients reach **every** parameter it
-//! holds. A layer whose bias never receives a gradient trains to a plausible
-//! but wrong model, and only the second assertion catches it.
-//!
-//! Owned by W14.
+//! Each case asserts two things: that the layer's forward is the composition it
+//! documents, and that gradients reach every parameter it holds.
 
 use fusor2::composite::loss::{
     binary_cross_entropy_with_logits, distillation_loss, mse, softmax_cross_entropy,
@@ -79,9 +74,8 @@ pub fn cases() -> Cases {
     cases
 }
 
-/// `Linear::forward` is `mat_mul_transposed_rhs` plus a broadcast bias — the
-/// transposed form specifically, so `d_weight` lands in the weight's own
-/// `[out, in]` layout and the optimizer's flat slice stays a view.
+/// `Linear::forward` is `mat_mul_transposed_rhs` plus a broadcast bias, so
+/// `d_weight` lands in the weight's own `[out, in]` layout.
 fn linear_case(session: &Session, bias: bool) -> CaseResult {
     let x_data = Domain::Wide.sample(1501, ROWS * IN);
     let w_data = Domain::Wide.sample(1511, OUT * IN);
@@ -200,8 +194,8 @@ fn embedding_layer(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// One token appearing twice gets the summed gradient — the layer inherits
-/// that from `Gather`'s declared adjoint rather than implementing it.
+/// One token appearing twice gets the summed gradient, inherited from
+/// `Gather`'s declared adjoint.
 fn embedding_layer_backward(session: &Session) -> CaseResult {
     let table = Domain::Wide.sample(1559, VOCAB * EMB);
     let graph = graph_of(session);
@@ -395,9 +389,7 @@ fn conv_layer(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// One gradient-descent step on a two-layer MLP must reduce the loss. This is
-/// the smallest end-to-end statement that the forward, the tape and the
-/// parameter update agree with each other.
+/// One gradient-descent step on a two-layer MLP reduces the loss.
 fn mlp_step(session: &Session) -> CaseResult {
     const LR: f32 = 0.05;
     let x_data = Domain::Wide.sample(1621, ROWS * IN);
@@ -530,9 +522,9 @@ fn cross_entropy_grad(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// The folded one-vs-all BCE the trainer's distillation loss is built from.
-/// Written as a plain softplus chain; `softplus_bce_adjoint` is what turns its
-/// backward into the single-sigmoid form, and the numbers must not change.
+/// The folded one-vs-all BCE, written as a plain softplus chain.
+/// `softplus_bce_adjoint` turns its backward into the single-sigmoid form
+/// without changing the numbers.
 fn bce_case(session: &Session) -> CaseResult {
     let logits = Domain::Custom(-3.0, 3.0).sample(1667, ROWS * CLASSES);
     let targets = Domain::Custom(0.0, 1.0).sample(1669, ROWS * CLASSES);
@@ -565,7 +557,7 @@ fn bce_case(session: &Session) -> CaseResult {
         &expected,
     )?;
 
-    // dL/dz = sigmoid(z) - y, which is what the rewrite must preserve.
+    // dL/dz = sigmoid(z) - y.
     let grad = gradient_of(&graph, &loss, &l)?;
     let want: Vec<f32> = logits
         .iter()
@@ -604,8 +596,7 @@ fn distillation_case(session: &Session) -> CaseResult {
     if got.iter().any(|v| !v.is_finite()) {
         return Err("the distillation loss produced a non-finite value".into());
     }
-    // The gradient must reach the student and must not reach the teacher's
-    // values as if they were trainable in the same step.
+    // The gradient reaches the student.
     let d_s = gradient_of(&graph, &loss, &s)?;
     if d_s.iter().all(|v| *v == 0.0) {
         return Err("the student received an identically-zero distillation gradient".into());
@@ -719,9 +710,8 @@ fn clip_case(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// The schedule is host-computed, so this needs no device at all — but it
-/// runs per session anyway, because a schedule that disagrees between
-/// backends would be a very confusing bug to find later.
+/// The schedule is host-computed and needs no device, but runs per session so
+/// a backend disagreement would show up.
 fn cosine_case(_session: &Session) -> CaseResult {
     const WARMUP: u64 = 10;
     const TOTAL: u64 = 100;
@@ -830,7 +820,6 @@ mod tests {
 
     #[test]
     fn the_embedding_tokens_repeat() {
-        // Otherwise `embedding_layer_backward` would prove nothing.
         let mut seen = vec![0u32; VOCAB];
         for t in TOKENS {
             seen[*t as usize] += 1;

@@ -2,24 +2,15 @@
 //! from: a descending sort with the declared tie rule, prefix scans, and the
 //! weighted pick.
 //!
-//! Owned by W13.
+//! Every shape here is `[n, 1]`, `[1, n]` or `[n, n]`, and every replicate
+//! step is a `Contract` against a dense all-ones constant rather than a
+//! broadcast: both emitters index every operand with the flat output index and
+//! ignore `Operand.layout`, so a stride-0 broadcast operand reads the wrong
+//! element and runs off the end of its buffer. Nothing here may use
+//! `broadcast_as`, `expand` or `repeat`.
 //!
-//! # Why this is matmul and dense constants rather than broadcasts
-//!
-//! Every shape here is either `[n, 1]`, `[1, n]` or `[n, n]`, and every
-//! "replicate a value across an axis" step goes through a `Contract` against a
-//! dense all-ones constant. That is deliberate: both emitters currently index
-//! every operand with the flat output index and ignore `Operand.layout`, so a
-//! stride-0 broadcast operand reads the wrong element and runs off the end of
-//! its buffer. A `[3]` row broadcast to `[3,3]` and multiplied by its own
-//! transpose returns `[1,4,9,0,0,0,0,0,0]` instead of the outer product. Until
-//! that is fixed in the two `lower` crates, anything built on `broadcast_as`,
-//! `expand` or `repeat` is silently wrong, so nothing here uses them.
-//!
-//! The cost is `O(V^2)` work for a vocabulary of `V`, against the reference's
-//! chunked `O(V log V)` bitonic pass. That is fine for the conformance
-//! vocabularies and wrong for a real one; see the module note on
-//! [`sort_desc`].
+//! The cost is `O(V^2)` work for a vocabulary of `V`, which does not scale to a
+//! real vocabulary; see [`sort_desc`].
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, Weak};
@@ -30,25 +21,22 @@ use crate::graph::{GraphInner, GraphRef};
 use crate::tensor::Tensor;
 use crate::{Dim, Dtype, Error, Result};
 
-/// The sentinel a non-finite logit is replaced by, matching the reference's
-/// `NEG_MAX_F32`. It sorts below every real logit and its `exp` underflows to
-/// zero, so such a token can never be drawn.
+/// The sentinel a non-finite logit is replaced by. It sorts below every real
+/// logit and its `exp` underflows to zero, so such a token can never be drawn.
 pub(crate) const NEG_MAX: f32 = -f32::MAX;
 
-/// Guards a division by an all-zero weight total, as the reference's
-/// `epsilon` does.
+/// Guards a division by an all-zero weight total.
 pub(crate) const EPSILON: f32 = 1.0e-20;
 
-/// The reference's `GPU_SAMPLER_PREVIOUS_TOKENS`: how far back the repetition
-/// penalty looks.
+/// How far back the repetition penalty looks.
 pub(crate) const PREVIOUS_TOKENS: usize = 64;
 
 pub(crate) fn dims(v: &[u64]) -> Vec<Dim> {
     v.iter().map(|&d| Dim::Const(d)).collect()
 }
 
-/// A dense f32 host constant. Dense because a splat leaf would reintroduce the
-/// stride-0 operand this module exists to avoid.
+/// A dense f32 host constant. Dense because a splat leaf would produce a
+/// stride-0 operand.
 pub(crate) fn konst(g: &GraphRef, shape: &[u64], data: &[f32]) -> Result<Tensor> {
     let mut bytes = Vec::with_capacity(data.len() * 4);
     for v in data {
@@ -60,11 +48,9 @@ pub(crate) fn konst(g: &GraphRef, shape: &[u64], data: &[f32]) -> Result<Tensor>
 /// The fixed matrices a draw needs. None depends on the logits, so each is
 /// built once per graph and reused.
 ///
-/// This matters for more than speed. `Graph::constant_from_raw` mints a fresh
-/// buffer id every call, so two byte-identical constants are two leaves and
-/// two uploads; a sampler that rebuilds a dozen of them per draw grows the
-/// graph fast enough to walk into the planner cliff documented on
-/// [`cached`].
+/// `Graph::constant_from_raw` mints a fresh buffer id every call, so two
+/// byte-identical constants are two leaves and two uploads; rebuilding a dozen
+/// per draw walks into the planner cliff documented on [`constants`].
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 enum Fixed {
     /// `[n, 1]` of ones.
@@ -120,16 +106,9 @@ type Constants = Mutex<Vec<(Weak<GraphInner>, HashMap<Fixed, Id>)>>;
 /// it, and held as a `(Weak, Id)` pair rather than a `Tensor` so the pool never
 /// keeps a graph alive.
 ///
-/// # The cliff this mitigates but does not fix
-///
-/// Resolving the same growing graph over and over eventually returns wrong
-/// numbers: with one graph reused across draws, every draw up to the 76th is
-/// exact and every draw from the 77th on is wrong, in the same way (the
-/// one-hot selector reads as all-ones, so the token comes back as the sum of
-/// every id). The break is a function of accumulated graph size, not of
-/// anything the sampler varies — the 77th draw runs identical code to the
-/// first. That is a planner/extractor defect in `fusor2-cost`, not something
-/// this module can repair; pooling constants only moves the cliff further out.
+/// Past a threshold in accumulated graph size the one-hot selector resolves as
+/// all-ones and the token comes back as the sum of every id. That is a planner
+/// defect in `fusor2-cost`; pooling only moves the threshold further out.
 fn constants() -> &'static Constants {
     static CONSTANTS: OnceLock<Constants> = OnceLock::new();
     CONSTANTS.get_or_init(|| Mutex::new(Vec::new()))
@@ -181,8 +160,7 @@ pub(crate) fn first_only(g: &GraphRef, n: u64) -> Result<Tensor> {
 
 /// Replicate a one-element tensor to `[n, 1]`.
 ///
-/// This is `ones([n,1]) @ s([1,1])` rather than a broadcast, for the reason in
-/// the module docs.
+/// `ones([n,1]) @ s([1,1])` rather than a broadcast.
 pub(crate) fn fanout(s: &Tensor, n: u64) -> Result<Tensor> {
     let g = s.graph();
     ones(g, n)?.matmul(&s.reshape_dims(&dims(&[1, 1]))?)
@@ -243,8 +221,8 @@ pub(crate) fn row_len(x: &Tensor) -> Result<u64> {
     }
 }
 
-/// Replace every non-finite logit with [`NEG_MAX`], as the reference's
-/// `is_finite` guard does. Returns an `[n, 1]` column.
+/// Replace every non-finite logit with [`NEG_MAX`]. Returns an `[n, 1]`
+/// column.
 pub(crate) fn sanitized_column(x: &Tensor, n: u64) -> Result<Tensor> {
     let col = x.reshape_dims(&dims(&[n, 1]))?;
     let col = if col.dtype() == Dtype::F32 {
@@ -262,15 +240,12 @@ pub(crate) fn sanitized_column(x: &Tensor, n: u64) -> Result<Tensor> {
 
 /// A descending sort of one logits row.
 ///
-/// Returns `(values, ids)` as `[n, 1]` f32 columns. The order is the rule the
-/// reference's `better_candidate` declares and `top_k_pairs` documents:
-/// **value descending, and on an exact tie the larger token id first**.
+/// Returns `(values, ids)` as `[n, 1]` f32 columns, in the order `top_k_pairs`
+/// documents: value descending, and on an exact tie the larger token id first.
 ///
-/// The sort is a rank-by-counting: `rank[i]` is how many tokens beat token
-/// `i`, which is a full `n x n` comparison, and the sorted arrays are read out
-/// by contracting against the `rank == r` indicator. That is `O(n^2)` work and
-/// `O(n^2)` memory, against the reference's chunked bitonic sort. It is exact
-/// and it is device-resident, but it does not scale to a real vocabulary.
+/// The sort is a rank-by-counting: `rank[i]` is how many tokens beat token `i`,
+/// a full `n x n` comparison, and the sorted arrays are read out by contracting
+/// against the `rank == r` indicator. `O(n^2)` in work and memory.
 pub(crate) fn sort_desc(x: &Tensor, n: u64) -> Result<(Tensor, Tensor)> {
     let g = x.graph();
     let col = sanitized_column(x, n)?; // [n,1], value[i]
@@ -303,15 +278,15 @@ pub(crate) fn sort_desc(x: &Tensor, n: u64) -> Result<(Tensor, Tensor)> {
     Ok((values, ids))
 }
 
-/// `exp(sorted[r] - sorted[0])` — the reference's unnormalised weight, whose
-/// first entry is exactly `1` and whose ratio to it is `p[r] / p_max`.
+/// `exp(sorted[r] - sorted[0])` — the unnormalised weight, whose first entry
+/// is exactly `1` and whose ratio to it is `p[r] / p_max`.
 pub(crate) fn weights_of(sorted_values: &Tensor, k: u64) -> Result<Tensor> {
     let top = sorted_values.narrow(0, 0, 1)?;
     let top = fanout(&top, k)?;
     sorted_values.sub(&top)?.exp()
 }
 
-/// The reference's `weighted_pick`, as a one-hot `[k, 1]` selector.
+/// The weighted pick, as a one-hot `[k, 1]` selector.
 ///
 /// `masked` is the candidate weight column with every rejected entry already
 /// zeroed. The pick is the first `r` whose inclusive prefix reaches
@@ -327,14 +302,13 @@ pub(crate) fn pick_one_hot(masked: &Tensor, k: u64, random: f32) -> Result<Tenso
     let first = first_only(g, k)?;
 
     // Exactly one r has `exclusive < threshold <= inclusive`. Row 0 is forced
-    // in so that a `threshold` of zero still selects the top candidate, which
-    // is what the reference's walk does when `random` is 0.
+    // in so that a `threshold` of zero still selects the top candidate.
     let after_start = exclusive.lt_tensor(&threshold)?.maximum(&first)?;
     let reached = inclusive.gte_tensor(&threshold)?;
     let chosen = reached.mul(&after_start)?;
 
     // If rounding in the scan left `threshold` just above the last prefix,
-    // nothing would be selected; the reference defaults to the top candidate.
+    // nothing would be selected, so the top candidate is chosen instead.
     let none = fanout(&total_of(&chosen)?, k)?.eq_scalar(0.0f32)?;
     chosen.add(&first.mul(&none)?)
 }
@@ -349,15 +323,11 @@ pub(crate) fn as_token(value: &Tensor) -> Result<Tensor> {
     value.reshape_dims(&dims(&[1]))?.to_u32()
 }
 
-// ---------------------------------------------------------------------------
-// Seeded randomness
-// ---------------------------------------------------------------------------
-
 /// `splitmix64`, then the top 24 bits as a float in `[0, 1)`.
 ///
-/// Host-side on purpose: the reference also passes the draw in as a `random`
-/// uniform rather than generating it on device, so a seed fully determines the
-/// token without the logits ever leaving the device.
+/// The draw is passed in as a `random` uniform rather than generated on
+/// device, so a seed fully determines the token without the logits ever
+/// leaving the device.
 pub(crate) fn unit_random(seed: u64) -> f32 {
     let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -372,16 +342,8 @@ pub(crate) fn unit_random_at(seed: u64, step: u64) -> f32 {
     unit_random(seed ^ step.wrapping_mul(0xD1B5_4A32_D192_ED03))
 }
 
-// ---------------------------------------------------------------------------
-// The repetition-penalty history
-// ---------------------------------------------------------------------------
-
-/// Tokens this process has already drawn, per graph.
-///
-/// `StandardSamplerParams` has nowhere to hand in a decode history and
-/// `sample` is a free function, so the penalty needs somewhere to remember
-/// what it drew. The scope is the [`crate::Graph`] the logits belong to, which
-/// for a decode loop is the loop itself.
+/// Tokens this process has already drawn, scoped to the [`crate::Graph`] the
+/// logits belong to.
 ///
 /// Entries hold the token's `Id` and a [`Weak`] graph handle rather than the
 /// `Tensor`: a `Tensor` owns a `GraphRef`, so parking one here would keep its
@@ -393,9 +355,8 @@ fn history() -> &'static History {
     HISTORY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Record a drawn token against its graph. Nothing is resolved here — only the
-/// node id is kept, so a decode loop that never asks for a penalty never pays
-/// for one.
+/// Record a drawn token against its graph. Only the node id is kept; nothing
+/// is resolved here.
 pub(crate) fn remember(graph: &GraphRef, token: Id) {
     let Ok(mut log) = history().lock() else {
         return;
@@ -437,10 +398,9 @@ pub(crate) fn previous_tokens(graph: &GraphRef) -> Vec<u32> {
 
 /// Apply the repetition penalty to a `[n, 1]` logits column.
 ///
-/// The reference's rule, verbatim: only for a token that has already been
-/// drawn, and only when the penalty is above `1`, a non-positive logit is
-/// *multiplied* by the penalty and a positive one *divided* by it. Both move
-/// the logit down.
+/// Only for a token that has already been drawn, and only when the penalty is
+/// above `1`: a non-positive logit is multiplied by the penalty and a positive
+/// one divided by it, so both move down.
 pub(crate) fn apply_repetition_penalty(
     column: &Tensor,
     n: u64,
@@ -482,8 +442,7 @@ mod tests {
 
     #[test]
     fn distinct_seeds_spread_over_the_unit_interval() {
-        // Ten buckets, 1000 seeds: a seed that never reached the sampler, or a
-        // constant draw, would pile into one bucket.
+        // A constant draw would pile into one bucket.
         let mut buckets = [0usize; 10];
         for seed in 0..1000u64 {
             let u = unit_random(seed);

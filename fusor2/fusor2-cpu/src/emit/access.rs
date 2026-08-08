@@ -1,12 +1,8 @@
-//! The four strided-access lowerings, selected **once at compile time** from
+//! The four strided-access lowerings, selected once at compile time from
 //! the `TileLayout` / `MultiFlattenMap`, never per vector.
 //!
-//! The reference re-evaluates `if self.layout.is_contiguous()` inside the hot
-//! loop and falls to a per-lane scalar gather through a `[E; 64]` stack buffer.
-//! Here the form is a property of the emitted `Instr`, so the inner loop has no
-//! branch at all.
-//!
-//! Owned by W10.
+//! The form is a property of the emitted `Instr`, so the inner loop carries no
+//! layout branch.
 
 use fusor2_ir::ir::level2::{Addr, Builtin, TileExpr, TileExprKind, TileLayout, TileLiteral};
 use fusor2_ir::scalar::BinOp;
@@ -45,8 +41,7 @@ impl AccessForm {
     }
 }
 
-/// Per-form selection counter, so `four_access_lowerings` can assert each case
-/// picked its own compiled form rather than all four collapsing to `Gather`.
+/// Per-form selection counter, so tests can assert which form was compiled.
 pub static FORM_COUNTS: [AtomicU64; 4] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -208,9 +203,8 @@ fn is_bare_lane(e: &TileExpr) -> bool {
 }
 
 /// Divmod one logical coordinate through an `AxisGroup`'s sub-axes,
-/// most-significant-first. Only the divmods the map actually declares are
-/// performed — `divmod_ops()` is the cost term the extractor prices, so
-/// emitting more than that would make the model wrong.
+/// most-significant-first. Performs exactly the divmods the map declares,
+/// which is what `divmod_ops()` prices.
 #[inline(always)]
 pub fn apply_group(map: &MultiFlattenMap, axis: usize, coord: u32) -> u32 {
     let group = &map.groups[axis];

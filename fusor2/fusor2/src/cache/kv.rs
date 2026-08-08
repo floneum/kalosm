@@ -1,16 +1,9 @@
 //! The KV cache. Sequence length is a `Dim::Sym` bound at dispatch, so growing
 //! the cache does not recompile anything and there are no length buckets.
 //!
-//! The reference carries `allocated_seq_len`, a power-of-two growth schedule,
-//! a `GPU_CACHE_MIN_ALLOC_SEQ_LEN` floor and a separate `backing` tensor it
-//! writes in place — all of it there to stop one `cat` per decode step from
-//! reallocating. None of that is here, and it is not an omission: an append
+//! There is no capacity schedule or preallocated backing store: an append
 //! builds a `cat` node, and whether that node lands in a new buffer or writes
-//! into the previous one is the arena planner's call, priced through the same
-//! `BufferRole` machinery every other in-place op goes through. A capacity
-//! schedule in the frontend would be the frontend second-guessing the planner.
-//!
-//! Owned by W13.
+//! into the previous one is the arena planner's call.
 
 use fusor2_ir::shape::Dim;
 
@@ -51,9 +44,7 @@ impl TensorCache {
     /// Append `value` along `axis` and return the whole cache, new part
     /// included.
     ///
-    /// The first append stores `value` itself: there is nothing to
-    /// concatenate it with, and a `cat` of one operand is a copy nobody
-    /// asked for.
+    /// The first append stores `value` itself rather than a one-operand `cat`.
     pub fn append(&mut self, value: &Tensor) -> Result<Tensor> {
         let axis = self.axis as usize;
         if axis >= value.rank() {
@@ -63,9 +54,8 @@ impl TensorCache {
             )));
         }
         let added = value.dim(axis);
-        // Every check runs before the cache is touched: a rejected append
-        // must leave the cache exactly as it was, or a caller that recovers
-        // from the error silently continues with an emptied cache.
+        // Every check runs before the cache is touched, so a rejected append
+        // leaves it exactly as it was.
         let out = match self.data.as_ref() {
             None => value.clone(),
             Some(prev) => {
@@ -100,8 +90,8 @@ impl TensorCache {
         Ok(out)
     }
 
-    /// Keep the newest `len` tokens and drop the oldest — the sliding-window
-    /// eviction the reference spells `narrow(dim, total - max, max)`.
+    /// Keep the newest `len` tokens and drop the oldest: sliding-window
+    /// eviction, spelled `narrow(axis, total - len, len)`.
     pub fn keep_last(&mut self, len: u64) -> Result<Option<Tensor>> {
         let Some(data) = self.data.as_ref() else {
             return Ok(None);
@@ -198,8 +188,7 @@ mod tests {
         g.tensor(Dtype::F32, &dims, &bytes).unwrap()
     }
 
-    /// The `Restride` operands of the class `id` names, in order — the two
-    /// halves a `cat` glues together.
+    /// The two halves a `cat` glues together, in order.
     fn cat_sources(t: &Tensor) -> Vec<Id> {
         let g = t.graph().egraph.lock();
         let mut out = Vec::new();
@@ -223,15 +212,13 @@ mod tests {
         let (ks, vs) = cache.append(&k0, &v0).unwrap();
         assert_eq!(cache.len(), Dim::Const(2));
         assert_eq!(ks.dim(2), Dim::Const(2));
-        // The first append is the value itself, not a copy of it, so this
-        // readback is a straight upload/download and asserts real numbers.
+        // The first append is the value itself, not a copy of it.
         assert_eq!(ks.id(), k0.id());
         assert_eq!(ks.to_vec_f32().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(vs.to_vec_f32().unwrap(), vec![-1.0, -2.0, -3.0, -4.0]);
 
-        // Step two: one more token. The cache grows along the cat axis only,
-        // and the *new* value is the second operand — appending is ordered,
-        // and reversing it silently corrupts a decode loop.
+        // One more token: the cache grows along the cat axis only, and the new
+        // value is the second operand.
         let k1 = upload(&g, &[1, 1, 1, 2], &[5.0, 6.0]);
         let v1 = upload(&g, &[1, 1, 1, 2], &[-5.0, -6.0]);
         let (ks2, vs2) = cache.append(&k1, &v1).unwrap();
@@ -244,12 +231,7 @@ mod tests {
         assert_eq!(cache.k.current().unwrap().id(), ks2.id());
         assert_eq!(cache.v.current().unwrap().id(), vs2.id());
 
-        // Numerically this is `views::cat_dim*`'s obligation, and those cases
-        // are red for a reason that is not this cache: the emitters index
-        // every operand with the flat output index and ignore
-        // `Operand::layout`. What is asserted here is the part the cache
-        // owns — that the second step glues the *new* value on after the
-        // cached one, in that order.
+        // The second step glues the new value on after the cached one.
         let sources = cat_sources(&ks2);
         assert!(
             sources.iter().any(|s| *s == k1.id()),
@@ -299,7 +281,7 @@ mod tests {
         let t = g.leaf("x", &[s, Dim::Const(2)], Dtype::F32).unwrap();
         cache.append(&t).unwrap();
         assert_eq!(cache.len(), s);
-        // And it cannot be evicted by a host-known window.
+        // It cannot be evicted by a host-known window.
         assert!(cache.keep_last(1).is_err());
     }
 

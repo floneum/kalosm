@@ -1,14 +1,7 @@
-//! The SGEMM schedule domain. [`SgemmParams::legal`] holds exactly the four
-//! predicates the reference asserts over its regression tree's leaves
-//! (`core/src/matmul/mod.rs:600-623`); here they **generate** candidates
-//! instead of validating one, and the 200-line tree is deleted.
-//!
-//! Owned by W4.
+//! The SGEMM schedule domain. [`SgemmParams::legal`] holds the four structural
+//! predicates a tiling must satisfy, and generates the candidate set.
 
-use fusor2_ir::device::Caps;
-use fusor2_ir::dtype::Dtype;
 use fusor2_ir::ir::level1::{SgemmDomain, SgemmParams};
-use fusor2_ir::shape::Dim;
 use smallvec::SmallVec;
 
 use crate::domains::{DomainCtx, UNMEASURED, sgemm_order};
@@ -18,20 +11,12 @@ const BN_CHOICES: [u32; 5] = [16, 32, 64, 128, 256];
 const BK_CHOICES: [u32; 4] = [8, 16, 32, 64];
 const T_CHOICES: [u32; 4] = [1, 2, 4, 8];
 
-/// How many tilings survive into the domain. Bounds the move frontier's
-/// size; the cap keeps the [`SEED_LEAVES`] members first, so it never
-/// removes a measured winner.
+/// How many tilings survive into the domain, bounding the move frontier. The
+/// cap keeps the [`SEED_LEAVES`] members first.
 pub const MAX_PARAMS: usize = 64;
 
-/// The distinct leaves of the deleted regression tree that this generator's
-/// grid can reach, used **only** to order the local search's move frontier.
-///
-/// Four of the tree's leaves are outside the grid (`bn = 8`, `bm = 8`,
-/// `bm = 48 / tm = 6`) and one (`bk = 4`) is below the smallest generated
-/// depth; the tree also reaches `(true, 16, 64, 64, 2, 2)`, which needs
-/// 40 KiB of staging and is illegal on every device fusor2 targets. None of
-/// them is a seed, because a seed that cannot be generated would order a
-/// frontier that does not contain it.
+/// Measured-good tilings, used only to order the local search's move frontier.
+/// Every entry must be reachable by [`generate_params`].
 pub static SEED_LEAVES: &[SgemmParams] = &[
     p(false, 32, 32, 32, 2, 2),
     p(true, 16, 64, 32, 2, 2),
@@ -69,29 +54,22 @@ const fn p(double_buffer: bool, bm: u32, bn: u32, bk: u32, tm: u32, tn: u32) -> 
     }
 }
 
-/// Compatibility entry point kept for the scaffold's `domains::sgemm_legal`
-/// re-export. `m`, `n` and `k` price the domain; they never filter it.
-pub fn legal(m: Dim, n: Dim, k: Dim, dtype: Dtype, caps: &Caps) -> SgemmDomain {
-    let _ = (m, n, k);
-    let cx = DomainCtx::new(caps, crate::domains::default_planner());
-    sgemm_domain(dtype.byte_size() as u32, &cx)
-}
-
 /// Every `(double_buffer, BM, BN, BK, TM, TN)` satisfying the four
 /// structural predicates on this device, capped at [`MAX_PARAMS`] by
 /// ascending `(seed_rank, bm, bn, bk, tm, tn, double_buffer)`.
 pub fn sgemm_domain(elem_bytes: u32, cx: &DomainCtx<'_>) -> SgemmDomain {
     let key = (
-        cx.caps.clone(),
+        cx.caps.fingerprint(),
         elem_bytes.max(1),
         crate::domains::planner_id(cx.planner),
     );
     PARAM_MEMO.get_or_insert(&key, || generate_params(elem_bytes, cx))
 }
 
-/// `(caps, element bytes, planner identity) -> tilings`. 3,200 candidates
-/// per call, none of them shape-dependent.
-static PARAM_MEMO: crate::domains::DomainMemo<(Caps, u32, usize), SgemmDomain> =
+/// `(caps fingerprint, element bytes, planner identity) -> tilings`. Nothing in
+/// the key is shape-dependent, and the fingerprint is a `u64` digest, so a hit
+/// is an integer compare.
+static PARAM_MEMO: crate::domains::DomainMemo<(u64, u32, usize), SgemmDomain> =
     crate::domains::DomainMemo::new();
 
 fn generate_params(elem_bytes: u32, cx: &DomainCtx<'_>) -> SgemmDomain {
@@ -140,41 +118,22 @@ mod tests {
         sgemm_domain(4, &cx)
     }
 
-    /// Every emitted tiling passes all four predicates at 4,000 random
-    /// shapes drawn from the reference's own LCG. The domain does not vary
-    /// with shape — that is the point — so this asserts the generator is
-    /// shape-independent as well as legal.
+    /// Every emitted tiling passes all four predicates. The domain is a pure
+    /// function of the device — no shape reaches [`sgemm_domain`] — so two
+    /// independent calls must also agree.
     #[test]
     fn generated_params_are_all_legal() {
         let caps = apple_caps();
         let cx = DomainCtx::new(&caps, default_planner());
-        let baseline = sgemm_domain(4, &cx);
-
-        let mut lcg = 0x0fa1_1bac_c5u64;
-        let mut next = |range: u32| {
-            lcg = lcg
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((lcg >> 33) as u32) % range + 1
-        };
-        for _ in 0..4000 {
-            let (m, k, n) = (next(20_000), next(20_000), next(20_000));
-            let domain = legal(
-                Dim::Const(m.into()),
-                Dim::Const(n.into()),
-                Dim::Const(k.into()),
-                Dtype::F32,
-                &caps,
-            );
-            assert_eq!(domain, baseline, "m={m} n={n} k={k}: domain moved");
-            for q in &domain.params {
-                assert!(q.bm.is_multiple_of(q.tm) && q.bn.is_multiple_of(q.tn), "{q:?}");
-                let lanes = (q.bm / q.tm) * (q.bn / q.tn);
-                assert!((32..=1024).contains(&lanes), "{q:?}: {lanes} lanes");
-                let depth = if q.double_buffer { 2 } else { 1 };
-                let bytes = u64::from((q.bm + q.bn) * q.bk * 4 * depth);
-                assert!(bytes <= 32 * 1024, "{q:?}: {bytes}B");
-            }
+        let domain = sgemm_domain(4, &cx);
+        assert_eq!(domain, sgemm_domain(4, &cx), "domain moved between calls");
+        for q in &domain.params {
+            assert!(q.bm.is_multiple_of(q.tm) && q.bn.is_multiple_of(q.tn), "{q:?}");
+            let lanes = (q.bm / q.tm) * (q.bn / q.tn);
+            assert!((32..=1024).contains(&lanes), "{q:?}: {lanes} lanes");
+            let depth = if q.double_buffer { 2 } else { 1 };
+            let bytes = u64::from((q.bm + q.bn) * q.bk * 4 * depth);
+            assert!(bytes <= 32 * 1024, "{q:?}: {bytes}B");
         }
     }
 

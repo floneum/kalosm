@@ -7,8 +7,6 @@
 //! nothing here re-derives it. Right-aligned: a source dim is consumed when it
 //! equals the target or is 1 (stride 0); unmatched target dims are inserted
 //! with stride 0 at **any** position; an unconsumed source dim is an error.
-//!
-//! Owned by W12.
 
 use fusor2_ir::ir::level0::L0;
 use fusor2_ir::shape::{Dim, Dims, broadcast_shapes, broadcast_specs};
@@ -33,7 +31,7 @@ impl Tensor {
         })
     }
 
-    /// Alias of [`Tensor::broadcast_as`], preserved for source compatibility.
+    /// Alias of [`Tensor::broadcast_as`].
     pub fn expand(&self, target: &[Dim]) -> Result<Tensor> {
         self.broadcast_as(target)
     }

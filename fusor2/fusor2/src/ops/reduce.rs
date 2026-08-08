@@ -3,8 +3,6 @@
 //! a `Map`. Nothing here chooses a reduction strategy — `fold_split` is the
 //! single rule that turns any of them into a two-stage reduction when the
 //! extractor decides the axis is long enough to pay for it.
-//!
-//! Owned by W12.
 
 use fusor2_ir::carrier::Carrier;
 use fusor2_ir::ir::level0::{L0, TiePolicy};
@@ -18,8 +16,7 @@ impl Tensor {
     /// One `L0::Fold` over `axis` with a scalar carrier.
     ///
     /// The accumulator is `dtype.compute_dtype()`, so an f16 reduction
-    /// accumulates — and therefore *results* — in f32. That is the
-    /// mixed-precision story the architecture asks for: `acc` is carried
+    /// accumulates — and therefore *results* — in f32. `acc` is carried
     /// separately from operand dtype, and narrowing back is an explicit
     /// `cast` the caller writes.
     fn fold(&self, op: BinOp, tie: Option<TiePolicy>, axis: usize) -> Result<Tensor> {
@@ -76,8 +73,7 @@ impl Tensor {
     pub fn min(&self, axis: usize) -> Result<Tensor> {
         self.fold(BinOp::Min, Some(TiePolicy::SplitEvenly), axis)
     }
-    /// Maximum with an explicit tie policy. Parity with a reference trainer
-    /// is a declaration, not an accident.
+    /// Maximum with an explicit tie policy.
     pub fn max_with_tie(&self, axis: usize, tie: TiePolicy) -> Result<Tensor> {
         self.fold(BinOp::Max, Some(tie), axis)
     }
@@ -139,12 +135,10 @@ impl Tensor {
         self.var(axis)?.unsqueeze(axis)
     }
 
-    /// Reference spelling of [`Tensor::var`].
+    /// Alias of [`Tensor::var`].
     pub fn variance(&self, axis: usize) -> Result<Tensor> {
         self.var(axis)
     }
-
-    // -- whole-tensor folds ---------------------------------------------------
 
     /// Sum every element into a rank-0 value.
     pub fn sum_all(&self) -> Result<Tensor> {
@@ -166,8 +160,6 @@ impl Tensor {
     pub fn mean_all(&self) -> Result<Tensor> {
         self.flatten_all()?.mean(0)
     }
-
-    // -- derived reductions ----------------------------------------------------
 
     /// `1` where any element along `axis` is nonzero.
     pub fn any(&self, axis: usize) -> Result<Tensor> {

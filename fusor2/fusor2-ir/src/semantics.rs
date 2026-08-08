@@ -1,8 +1,6 @@
 //! [`CoreSemantics`]: the single [`Semantics`] implementation covering the
 //! closed `L0`/`L1` enums plus the open [`OpDefRegistry`]. Total inference,
 //! work rows, effects and the two level verifiers hang off this type.
-//!
-//! Owned by W1.
 
 pub mod children;
 pub mod infer_l0;
@@ -15,13 +13,12 @@ use crate::facts::{ValueFacts, Work};
 use crate::ir::level0::ScatterCombine;
 use crate::ir::level1::{BufferRole, Effect, L1, ScatterMode};
 use crate::ir::level2::ArenaPlanner;
-use crate::ir::{Children, Level, Op, OpDefRegistry, Semantics, VerifyCtx};
+use crate::ir::{Children, Op, OpDefRegistry, Semantics, VerifyCtx};
 use std::sync::Arc;
 
-/// The core semantics. Holds the [`ArenaPlanner`] because `verify_l1` admits
-/// a geometry against the *exact* `arena_plan` bytes — the same pure
-/// memoized function the L2 emitter lays out with, so there is no L1/L2
-/// admission mismatch.
+/// The core semantics. Holds the [`ArenaPlanner`] because `verify_l1` admits a
+/// geometry against the exact `arena_plan` bytes, the same memoized function
+/// the L2 emitter lays out with.
 pub struct CoreSemantics {
     planner: Arc<dyn ArenaPlanner>,
     registry: OpDefRegistry,
@@ -29,8 +26,8 @@ pub struct CoreSemantics {
 
 impl CoreSemantics {
     /// Build the shared semantics object the e-graph is constructed with.
-    /// Returns `Arc<dyn Semantics>` rather than `Self` because the e-graph
-    /// only ever holds the trait object; that is the shared contract.
+    /// Returns `Arc<dyn Semantics>` because the e-graph holds only the trait
+    /// object.
     #[allow(clippy::new_ret_no_self)]
     pub fn new(planner: Arc<dyn ArenaPlanner>) -> Arc<dyn Semantics> {
         Arc::new(Self {
@@ -95,12 +92,10 @@ impl Semantics for CoreSemantics {
 
 /// Purity of one operator.
 ///
-/// `KScatter` writing through operand 0 with atomics or a `Set` combine
-/// mutates state and is therefore **pinned in the materialized set**:
-/// without that, toggling a two-consumer atomic scatter out of `M` inlines it
-/// into both consumers' kernels and the atomics apply twice, doubling the
-/// embedding gradient. Everything else is pure — an L0 node describes a
-/// value, not a write.
+/// `KScatter` writing through operand 0 with atomics or a `Set` combine mutates
+/// state and is pinned in the materialized set; inlining a two-consumer atomic
+/// scatter into both consumers applies the atomics twice. Everything else is
+/// pure: an L0 node describes a value, not a write.
 pub fn effect_of(op: &Op) -> Effect {
     match op {
         Op::L1(L1::KScatter { mode, combine, .. })
@@ -112,18 +107,10 @@ pub fn effect_of(op: &Op) -> Effect {
     }
 }
 
-/// Level of an operator, for callers that build a [`crate::ir::Node`] by hand.
-/// `Union` inherits its operands' level, which the e-graph resolves; here it
-/// defaults to `L0`.
-pub fn level_of(op: &Op) -> Level {
-    op.level().unwrap_or(Level::L0)
-}
-
 /// A trivially-correct [`ArenaPlanner`] for callers that need a
-/// [`CoreSemantics`] before `fusor2-tile`'s planner exists — notably
-/// `fusor2-ir`'s own tests and the CPU target, which has no workgroup memory
-/// at all, so the exact footprint of any tile set really is the sum of its
-/// declared bytes.
+/// [`CoreSemantics`] without `fusor2-tile`'s planner: `fusor2-ir`'s own tests
+/// and the CPU target, which has no workgroup memory, so a tile set's exact
+/// footprint is the sum of its declared bytes.
 pub struct SumArenaPlanner;
 
 impl ArenaPlanner for SumArenaPlanner {
@@ -179,7 +166,7 @@ mod tests {
     use crate::ir::level1::{
         AccessPlan, ContractSide, Family, IndexSpace, MapDomain, Operand, ScheduleDomain,
     };
-    use crate::ir::{Node, OpTag};
+    use crate::ir::{Level, Node, OpTag};
     use crate::scalar::{BinOp, CmpOp, ScalarExpr, UnOp};
     use crate::shape::{BoundsProof, Dim, Layout, SlidingWindow, StrideSpec, SymId};
     use smallvec::{SmallVec, smallvec};
@@ -219,7 +206,6 @@ mod tests {
         assert_eq!(facts.persistence, crate::dtype::Persistence::Persistent);
         assert_eq!(sem.effect(&leaf), Effect::Pure);
         assert!(sem.children(&leaf).is_empty());
-        assert_eq!(level_of(&leaf), Level::L0);
 
         let node = Node {
             children: Children::new(),
@@ -274,10 +260,6 @@ mod tests {
         );
         assert_eq!(effect_of(&Op::Union(Id(0), Id(1))), Effect::Pure);
     }
-
-    // -----------------------------------------------------------------
-    // Totality fuzz: 10,000 random ops at random shapes must never panic.
-    // -----------------------------------------------------------------
 
     /// xorshift64*, so the fuzz corpus is deterministic and dependency-free.
     struct Rng(u64);
@@ -485,9 +467,8 @@ mod tests {
         }
     }
 
-    /// A carrier the fuzzer builds without knowing what any of them *mean* —
-    /// including deliberately ill-typed ones, since the point is that
-    /// verification never panics on a node a rule could construct.
+    /// A random carrier, including ill-typed ones: verification must not panic
+    /// on any node a rule could construct.
     fn rand_carrier(rng: &mut Rng) -> Carrier {
         let d = rand_dtype(rng);
         let op = match rng.below(4) {
@@ -606,7 +587,7 @@ mod tests {
             };
 
             // Verification and work accounting are total at both the inferred
-            // facts and a deliberately wrong set.
+            // facts and a wrong set.
             let wrong = rand_facts(&mut rng);
             for result in [inferred.as_ref().ok(), Some(&wrong)].into_iter().flatten() {
                 let cx = VerifyCtx {

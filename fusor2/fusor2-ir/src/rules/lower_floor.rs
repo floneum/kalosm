@@ -1,27 +1,16 @@
 //! The [`crate::egraph::RuleTag::StrictlyLowering`] floor: one trivial,
-//! always-legal L0 -> L1 lowering per L0 op. These are what the driver falls
-//! back to when a saturation budget is exhausted, and they are what makes
-//! "budget exhaustion yields a degraded-but-valid plan, never a hard error"
-//! true rather than aspirational.
+//! always-legal L0 -> L1 lowering per L0 op, so an exhausted saturation budget
+//! yields a degraded-but-valid plan rather than an error.
 //!
-//! Every one emits [`ScheduleDomain::Point`]: the floor depends on no
-//! schedule generator, so it is available before any target has contributed a
+//! Every one emits [`ScheduleDomain::Point`] and depends on no schedule
+//! generator, so the floor is available before any target has contributed a
 //! rule. Every one is trivially correct and trivially slow. `Leaf` needs no
 //! rule.
 //!
-//! # This module is the only place `ScheduleDomain::Point` is minted
-//!
-//! `Point` is not a schedule — it is the *absence* of one, the marker the
-//! schedule rules match on to say "no target has spoken for this node yet".
-//! Any rule free to spell it inline is a rule free to declare a node
-//! unschedulable by accident, and the question "who decided this node's
-//! schedule?" stops having a single answer. So a rule that needs to mint a
-//! nest carrying no schedule of its own calls [`floor_map`],
-//! [`floor_alias_map`] or [`floor_fold`], and a descriptor that needs the
-//! value calls [`floor_sched`]. Those four, plus the nine lowerings in this
-//! file, are every occurrence in the IR crate.
-//!
-//! Owned by W2.
+//! `Point` marks the absence of a schedule, and this module is the only place
+//! in the IR crate that mints it: a rule needing a nest with no schedule of its
+//! own calls [`floor_map`], [`floor_alias_map`] or [`floor_fold`], and a
+//! descriptor needing the value calls [`floor_sched`].
 
 use crate::dtype::Dtype;
 use crate::egraph::{Builder, Facts, Id, RuleTag};
@@ -113,25 +102,17 @@ fn space_of(f: &Facts<'_>) -> IndexSpace {
     IndexSpace::new(f.own().shape.iter().copied())
 }
 
-// ---------------------------------------------------------------------------
-// The floor constructors — the only mints of `ScheduleDomain::Point`
-// ---------------------------------------------------------------------------
-
 /// The schedule a nest carries before any schedule rule has spoken.
 ///
-/// For a *descriptor* rather than a node: [`crate::rules::tuple`] normalizes an
-/// `L0::Fold` into the `KFold` fields it would lower to, and the schedule field
-/// of that normalization is this — the same value [`lower_fold`] would put
-/// there. Prefer the node constructors below wherever an id is what is wanted.
+/// For a descriptor rather than a node: [`crate::rules::tuple`] normalizes an
+/// `L0::Fold` into the `KFold` fields it would lower to, and its schedule field
+/// is this. Prefer the node constructors below wherever an id is wanted.
 pub(crate) fn floor_sched() -> ScheduleDomain {
     ScheduleDomain::Point
 }
 
-/// A `KMap` minted with no schedule of its own.
-///
-/// The schedule rules expand it exactly as they expand a `lower_map` output,
-/// which is the point: a rule that restates a value does not get to decide how
-/// that value is scheduled.
+/// A `KMap` minted with no schedule of its own. The schedule rules expand it
+/// exactly as they expand a `lower_map` output.
 pub(crate) fn floor_map(
     b: &mut Builder<'_>,
     space: IndexSpace,
@@ -153,8 +134,7 @@ pub(crate) fn floor_map(
 /// This is the readback spelling: a slot view of a multi-slot carrier, a
 /// recovery view of a promoted fold's flattened carrier axis. It computes
 /// nothing — the body is `Arg(0)` and the access is [`AccessPlan::Alias`] — so
-/// it is a node with no schedule decision in it at all, and minting it here
-/// rather than at each call site is what keeps that true by construction.
+/// it carries no schedule decision.
 pub(crate) fn floor_alias_map(
     b: &mut Builder<'_>,
     src: Id,
@@ -175,12 +155,8 @@ pub(crate) fn floor_alias_map(
 }
 
 /// A `KFold` minted with no schedule of its own — the nest [`lower_fold`]
-/// would have minted, given these fields.
-///
-/// TUPLE's joint carrier is the case: the joint takes neither side's schedule,
-/// because a schedule domain is not a value and a joint that inherited one
-/// would be a function of which spelling the consumer's operand happened to
-/// name.
+/// would have minted, given these fields. TUPLE's joint carrier takes neither
+/// side's schedule, since a schedule domain is not a value.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn floor_fold(
     b: &mut Builder<'_>,
@@ -242,11 +218,8 @@ pub fn lower_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Op
     let dtype = f.dtype(0)?;
     // The nest reads its operands at the operand dtype and accumulates at
     // `acc`, so the lift is retyped while the merge rides through untouched.
-    //
-    // Retyped, **not replaced**. A per-slot `Arg(0)` is right only for a
-    // single-slot binop carrier, whose lift already is `Arg(0)`; Welford's
-    // `(1, x, 0)` and a shift-stabilized `(x, 1)` would be silently rewritten
-    // into "every slot folds the element", which reduces `n` and `m2` over the
+    // Retyping, not replacing with a per-slot `Arg(0)`: Welford's `(1, x, 0)`
+    // and a shift-stabilized `(x, 1)` would then reduce `n` and `m2` over the
     // data instead of over the constants they are.
     let lift: SmallVec<[ScalarExpr; 4]> = carrier
         .lift
@@ -338,15 +311,13 @@ pub fn lower_contract_generic(
 
 /// One contraction operand read over the fold's `[out..., k]` index space.
 ///
-/// The fold walks the output plus one merged contraction axis; the operand's
-/// own axes are in `spec` order, which in general is neither. Aliasing the
-/// operand's dense layout says "axis `i` of the space is axis `i` of the
-/// operand", which is true only for a left operand of a canonical matmul —
-/// it is what read a `[m, k]` activation as `[k, m]` under `d_rhs`. So each
-/// space axis gets an explicit stride: the operand's stride for that label,
-/// or 0 where the operand does not carry it, and the merged `k` axis
-/// decomposes into one sub-axis per contracted label, most significant
-/// first, which is the order `fold_extent` multiplied them in.
+/// The fold walks the output plus one merged contraction axis while the
+/// operand's own axes are in `spec` order, so aliasing the operand's dense
+/// layout would read a `[m, k]` activation as `[k, m]` under `d_rhs`. Each
+/// space axis gets an explicit stride: the operand's stride for that label, or
+/// 0 where the operand does not carry it. The merged `k` axis decomposes into
+/// one sub-axis per contracted label, most significant first, the order
+/// `fold_extent` multiplied them in.
 #[allow(clippy::too_many_arguments)]
 fn contract_operand(
     src: Id,
@@ -795,8 +766,7 @@ mod tests {
     }
 
     /// Re-offering a lowering rule is one memo hit: hash-consing makes the
-    /// floor idempotent, which is what lets the degraded pass ignore the
-    /// fired set.
+    /// floor idempotent, so the degraded pass can ignore the fired set.
     #[test]
     fn the_floor_is_idempotent() {
         let mut g = ts::graph();

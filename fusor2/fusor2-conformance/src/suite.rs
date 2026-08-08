@@ -2,11 +2,7 @@
 //!
 //! Every area file returns [`Cases`]; every case runs on **every** session in
 //! [`crate::harness::sessions`], so nothing in the suite mentions a concrete
-//! backend. The shared case shapes live in [`support`] below rather than in a
-//! new file, because a new file means a new `pub mod` line in a module list
-//! other agents may also be editing.
-//!
-//! Owned by W14.
+//! backend. The shared case shapes live in [`support`] below.
 
 pub mod attention_rope;
 pub mod backward;
@@ -53,8 +49,6 @@ pub fn registry() -> Cases {
 
 /// The registry as a function pointer, which is what `lib.rs` re-exports.
 pub const REGISTRY: fn() -> Cases = registry;
-
-// ---------------------------------------------------------------------------
 
 /// Shared case shapes. Every area file is a table over these.
 pub mod support {
@@ -141,7 +135,7 @@ pub mod support {
             "cpu"
         };
         let shape: Vec<usize> = shape.iter().map(|n| *n as usize).collect();
-        compare::compare_for(dtype)(backend, &shape, expected, actual)?;
+        compare::compare_for(dtype, backend, &shape, expected, actual)?;
         Ok(())
     }
 
@@ -332,8 +326,6 @@ pub mod support {
     }
 }
 
-// ---------------------------------------------------------------------------
-
 /// The structural half of a generality case: saturate the graph the **real
 /// frontend** emits, extract a plan from it, and read both.
 ///
@@ -342,8 +334,8 @@ pub mod support {
 /// file:
 ///
 /// * **did the law fire** — [`Probe::fired`], on `report.fired`. A rule that
-///   silently stops matching the frontend's chain is how flash attention was
-///   unreachable on both backends for a week while every numeric case passed;
+///   silently stops matching the frontend's chain leaves a whole kernel family
+///   unreachable while every numeric case still passes;
 /// * **did the law decline** — the same reading, negated. The `STRICT` half of
 ///   the acceptance list is a *decline* assert, and asserting only that a law
 ///   fires somewhere else does not cover it;
@@ -376,7 +368,7 @@ pub mod probe {
     /// Saturate and extract the graph `outs` were built in.
     ///
     /// The pipeline is exactly `Session::resolve`'s: the session's own rule
-    /// table, the session's own caps, the shipped `Driver` and the shipped
+    /// table, the session's own caps, the same `Driver` and the same
     /// `LocalSearch`. Anything else would prove a claim about a pipeline
     /// nothing runs.
     pub fn probe(session: &Session, outs: &[Tensor]) -> Result<Probe, CaseError> {
@@ -559,7 +551,7 @@ mod tests {
         assert_eq!(
             before,
             names.len(),
-            "a case name is registered twice; `run_case` would run both"
+            "a case name is registered twice; a name filter would run both"
         );
     }
 

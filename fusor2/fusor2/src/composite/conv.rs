@@ -1,14 +1,9 @@
 //! `conv` and `grouped_conv` as macro ops over `Window` + `Contract`.
 //!
-//! There is no im2col reshape here. The reference flattens `(in_ch, kernel...)`
-//! into one axis so a 2-D matmul can read it, and then needs a
-//! `MultiFlattenMap` operand access to undo the flatten at load time. An
-//! `EinSpec` contracts over **several** labels directly, so the windowed view
-//! is contracted in place: `c` and every `k` label are contracted, `p` labels
-//! are free, and the operand's non-affine index map is the L1 lowering's
-//! business rather than a shape the frontend has to invent.
-//!
-//! Owned by W13.
+//! There is no im2col reshape here. An `EinSpec` contracts over several labels
+//! directly, so the windowed view is contracted in place: `c` and every `k`
+//! label are contracted, `p` labels are free, and the operand's non-affine
+//! index map is the L1 lowering's business.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt};
 use fusor2_ir::autograd::{Tape, Val};
@@ -50,17 +45,15 @@ pub fn pad_with_zeros(x: &Tensor, axis: u32, left: u64, right: u64) -> Result<Te
     Ok(x.graph.tensor(id))
 }
 
-/// Symmetric padding of one axis. Preserved spelling.
+/// Symmetric padding of one axis.
 pub fn pad_axis(x: &Tensor, axis: u32, padding: u64) -> Result<Tensor> {
     pad_with_zeros(x, axis, padding, padding)
 }
 
 /// Split axis `axis` of `v` into `(outer, inner)`.
 ///
-/// Always legal, at any strides: `Restride` composes **relative** to the
-/// current strides, so the outer axis is just the inner one's stride times the
-/// inner extent. This is why the channel split of a grouped convolution needs
-/// no contiguity proof.
+/// Always legal, at any strides: `Restride` composes relative to the current
+/// strides, so the outer axis is the inner one's stride times the inner extent.
 fn split_axis(t: &mut GraphTape<'_>, v: Val, axis: usize, outer: u64, inner: u64) -> Result<Val> {
     let shape = t.shape_of(v);
     let mut specs: SmallVec<[StrideSpec; 6]> = SmallVec::new();
@@ -159,9 +152,8 @@ pub fn grouped_conv(
         )));
     }
     if dilation.iter().any(|d| *d != 1) {
-        // `SlidingWindow` carries `(window, step)` and nothing else, on
-        // purpose: two integers are what make the adjoint decidable. Dilation
-        // would be a third, and no caller in the parity surface uses one.
+        // `SlidingWindow` carries `(window, step)` and nothing else; two
+        // integers are what make the adjoint decidable.
         return Err(Error::Legality(
             "dilated convolution is not expressible as a SlidingWindow".into(),
         ));
@@ -228,7 +220,6 @@ fn conv_defn(
 ) -> Result<Val> {
     let grouped = groups > 1;
 
-    // ---- operands -------------------------------------------------------
     // x: [batch, in_ch, ...spatial] -> optionally [batch, g, cpg, ...spatial]
     let x = if grouped {
         let in_ch = const_dim(t.shape_of(x)[1], "conv in_channels")?;
@@ -250,10 +241,9 @@ fn conv_defn(
         weight
     };
 
-    // ---- labels ---------------------------------------------------------
     // `b` and every `p` are free axes of the left operand, `o` is the free
     // axis of the right, and `c` plus every `k` are contracted. A group label
-    // is a batch label — it is the only difference grouping makes.
+    // is a batch label.
     let mut next = 0u8;
     let mut fresh = || {
         let l = Label(next);
@@ -299,7 +289,6 @@ fn conv_defn(
     let y = t.contract(x, weight, EinSpec { a, b, out }, acc)?;
     let y = t.cast(dtype, y)?;
 
-    // ---- back to [batch, out_ch, ...spatial] ----------------------------
     let y = if grouped { merge_axes(t, y, 1)? } else { y };
 
     match bias {

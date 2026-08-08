@@ -1,13 +1,10 @@
 //! Nearest and bilinear upsampling, macro ops over `Gather` and `Map`.
 //!
-//! The reference reshapes to `[b, c, h, 1, w, 1]`, broadcasts and reshapes
-//! back. That last reshape merges a stride-0 axis into a real one, which is
-//! not a view: it only works because the reference materializes. Here the
-//! same value is one `Gather` per axis with a repeated index run — a real
-//! node, whose adjoint is the `Scatter{Add}` that sums the duplicated
-//! positions, with four lowerings underneath it.
-//!
-//! Owned by W13.
+//! An upsample is one `Gather` per axis with a repeated index run, whose
+//! adjoint is the `Scatter{Add}` that sums the duplicated positions, with four
+//! lowerings underneath it. Broadcasting into `[b, c, h, 1, w, 1]` and
+//! reshaping back is not available: that reshape merges a stride-0 axis into a
+//! real one, which is not a view.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt};
 use fusor2_ir::autograd::{Tape, Val};
@@ -221,7 +218,7 @@ fn bilinear_taps(src: u64, dst: u64, align_corners: bool) -> (Vec<u32>, Vec<u32>
     (lo, hi, frac)
 }
 
-/// Preserved alias for the reference's `resize`.
+/// Alias for [`upsample_nearest`].
 pub fn resize(x: &Tensor, size: &[Dim]) -> Result<Tensor> {
     upsample_nearest(x, size)
 }

@@ -1,9 +1,7 @@
 //! The pooled allocator: keyed `(size, usage)` with `strong_count == 1` reuse
-//! and a platform memory ceiling that **blocks and retries** before failing.
-//! On macOS, exceeding unified memory kills the OS rather than erroring, which
-//! is why the ceiling is a hard gate and not a warning.
-//!
-//! Owned by W9.
+//! and a platform memory ceiling that blocks and retries before failing. On
+//! macOS, exceeding unified memory kills the OS rather than erroring, so the
+//! ceiling is a hard gate.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -95,8 +93,7 @@ impl BufferPool {
 
     /// Allocate or recycle at an explicit usage set.
     ///
-    /// Blocks and retries at the ceiling rather than failing — one of exactly
-    /// three host syncs in the whole runtime.
+    /// Blocks and retries at the ceiling rather than failing.
     pub fn alloc_with_usage(&self, bytes: u64, usage: wgpu::BufferUsages) -> Result<Buf> {
         let size = padded_copy_size(bytes.max(4));
         let key = PoolKey {
@@ -111,8 +108,7 @@ impl BufferPool {
 
         let ceiling = *self.ceiling_bytes.lock();
         if self.counters.lock().live_bytes.saturating_add(size) > ceiling {
-            // Retire everything in flight, then retry the cache. Only after
-            // both fail is the working set genuinely over the cap.
+            // Retire everything in flight, then retry the cache.
             self.counters.lock().cap_retries += 1;
             self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
             self.reclaim();
@@ -172,25 +168,13 @@ impl BufferPool {
     /// establish that the device has finished reading the buffer. A buffer whose
     /// last host handle drops while its submission is still in flight is
     /// recycled here and handed to the next allocation, which then writes into
-    /// memory a running kernel is still reading.
+    /// memory a running kernel is still reading. Under allocation pressure that
+    /// shows up as a single wrong value out of an otherwise correct kernel.
     ///
-    /// This is unproven but it is the mechanism that fits the one observation we
-    /// have: `lower::contract::tests::a_narrow_output_stages_the_accumulator`
-    /// returned -0.1060791 against -0.16938101 at
-    /// `CoopGeom { bm: 16, bn: 16, bk: 8, n_passes: 1, subgroups: 2, rg: 1, cg: 2 }`
-    /// staging 2, once, while a conformance run was hammering the same device.
-    /// It has not reproduced since: 500 isolated runs of the IR binary, 15
-    /// GPU-contract runs under cross-process GPU load, 8 full-binary runs under
-    /// CPU load, 7 exclusive full-workspace runs, then 25 further targeted runs
-    /// and 6 full gpu+ir suite rounds under two concurrent conformance runs.
-    /// Allocation pressure is the variable the mechanism predicts and the one
-    /// isolation removes, which is why the failure survives only under load.
-    ///
-    /// The fix, if it recurs: record the `SubmissionIndex` at recycle time and
-    /// withhold the buffer until `device.poll(WaitForSubmissionIndex(..))` has
-    /// passed it. That is deliberately NOT done here — it was not written
-    /// against a reproduction, and an allocator that waits on a submission that
-    /// never completes deadlocks the trainer, which is worse than the bug.
+    /// Recording the `SubmissionIndex` at recycle time and withholding the
+    /// buffer until `device.poll(WaitForSubmissionIndex(..))` has passed it
+    /// would close the window, at the cost of an allocator that deadlocks the
+    /// trainer whenever a submission never completes.
     pub fn recycle(&self, buf: Buf) {
         // `map` ends the borrow before `buf` may be moved into the bucket.
         let Some((size, usage)) = buf
@@ -202,17 +186,11 @@ impl BufferPool {
         let key = PoolKey { size, usage };
         let addr = buf.addr();
         // Everything this pool created is already tracked, so recycling is
-        // dropping the caller's clone. Only a foreign handle is adopted.
-        // The old `if buf.refcount() != 1 { return; }` guard is gone on
-        // purpose: a tracked buffer has refcount 2 (pool + caller) here, and
-        // a caller that still holds another clone simply fails `take_free`'s
-        // `refcount() == 1` test until it drops it.
-        //
-        // The old `else` arm here also locked `self.counters` twice inside one
-        // assignment — the RHS guard is still alive when the LHS locks, which
-        // is a hard `parking_lot` deadlock. It was unreachable only because
-        // `swap_remove` kept buckets under `FREE_PER_BUCKET`; retention makes
-        // that branch reachable, so it is gone.
+        // dropping the caller's clone; only a foreign handle is adopted. A
+        // tracked buffer has refcount 2 (pool + caller) here, and a caller
+        // holding a further clone simply fails `take_free`'s `refcount() == 1`
+        // test until it drops it. `self.counters` is locked once, outside the
+        // `self.free` critical section: nesting the two deadlocks.
         let released = {
             let mut free = self.free.lock();
             let bucket = free.get_or_insert_mut(key, Vec::new);
@@ -260,7 +238,7 @@ impl BufferPool {
         }
         let free = self.free.lock();
         for (_, bucket) in free.iter() {
-            // The pool tracks in-use buffers now; poisoning one would
+            // The pool tracks in-use buffers too; poisoning one would
             // overwrite a live tensor.
             for buf in bucket.iter().filter(|b| b.refcount() == 1) {
                 if let Some(gpu) = buf.downcast_ref::<GpuBuffer>() {
@@ -438,12 +416,9 @@ fn hw_memsize() -> Option<u64> {
 mod tests {
     use super::*;
 
-
-    // -----------------------------------------------------------------------
     // Adapter-gated. These skip cleanly when no GPU is present.
-    // -----------------------------------------------------------------------
 
-    /// A raw wgpu device at WebGPU baseline limits, independent of W8's
+    /// A raw wgpu device at WebGPU baseline limits, independent of capability
     /// probing so a pool test cannot be broken by a capability change.
     fn baseline_device() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -465,8 +440,8 @@ mod tests {
         Some((Arc::new(device), Arc::new(queue)))
     }
 
-    /// Test 10: allocate, drop, reallocate the same `(size, usage)` —
-    /// `created` increments once, `requested` twice.
+    /// Allocate, drop, reallocate the same `(size, usage)` — `created`
+    /// increments once, `requested` twice.
     #[test]
     fn pool_reuses_on_strong_count_one() {
         let Some((device, queue)) = baseline_device() else {
@@ -509,8 +484,8 @@ mod tests {
         drop((alias, b));
     }
 
-    /// Test 11: with the ceiling set just under the working set, the allocator
-    /// polls and retries at least once before erroring.
+    /// With the ceiling set just under the working set, the allocator polls
+    /// and retries at least once before erroring.
     #[test]
     fn pool_cap_polls_before_failing() {
         let Some((device, queue)) = baseline_device() else {

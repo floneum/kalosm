@@ -52,9 +52,7 @@ const HASH_COUNT: usize = 3;
 const POOLED: usize = 256;
 const CLASSES: usize = 48;
 
-// ---------------------------------------------------------------------------
 // model.rs
-// ---------------------------------------------------------------------------
 
 struct Params {
     flat: RawTensor<1, f32>,
@@ -270,9 +268,7 @@ fn hashed_embedding_compiles(
     })
 }
 
-// ---------------------------------------------------------------------------
 // main.rs
-// ---------------------------------------------------------------------------
 
 /// The folded distillation loss, written as one node with an analytic
 /// backward.
@@ -391,9 +387,7 @@ fn profile_compiles(device: &Device) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // optim.rs
-// ---------------------------------------------------------------------------
 
 fn adamw_step_compiles(
     device: &Device,
@@ -442,9 +436,7 @@ fn adamw_step_compiles(
     params.flat = (decayed - update).into_concrete();
 }
 
-// ---------------------------------------------------------------------------
 // Spellings the brief enumerates that the bodies above do not reach
-// ---------------------------------------------------------------------------
 
 fn remaining_spellings_compile(device: &Device) {
     let a = RawTensor::<2, f32>::zeros(device, [2, 3]);
@@ -570,7 +562,6 @@ mod tests {
         assert_eq!(row, [3.0, 4.0]);
     }
 
-    // -----------------------------------------------------------------------
     // The mixed-precision half of the surface
     //
     // Everything above compiles the trainer's spellings. These *run* them, and
@@ -580,8 +571,7 @@ mod tests {
     // cannot see: `crate::Tensor`'s folds and contractions accumulate in
     // `Dtype::compute_dtype`, so they *return* f32 for an f16 operand and
     // leave the narrowing cast to the caller. The const-rank facade is that
-    // caller. Before it wrote the cast, every one of these panicked.
-    // -----------------------------------------------------------------------
+    // caller.
 
     /// Every rank-reducing fold, every keepdim fold and both contractions,
     /// on an f16 operand: the result is f16, and it is the right f16.
@@ -679,15 +669,11 @@ mod tests {
     /// from `model.rs`, not a paraphrase — run on real values.
     ///
     /// Its `pool` is `reshape(..).max::<3>(3)` on a `Tensor<3, half::f16>`,
-    /// which is the fold that used to panic. The f32 stack over the same
-    /// numbers is the reference.
+    /// the narrowing fold path. The f32 stack over the same numbers is the
+    /// reference.
     ///
     /// The backward is taken too, by
     /// [`a_backward_through_the_f16_convolution_stack_reaches_the_weights`].
-    /// It used to be unreachable: `extremum_adjoint` declared both comparison
-    /// args at the operand dtype while the broadcast fold output is at
-    /// `compute_dtype`, so an f16 max reported `Map body reads Arg(1) as F16
-    /// but the operand is F32`. Fixed in `fusor2-autograd`.
     #[test]
     fn the_trainers_f16_convolution_stack_computes() {
         let _serial = crate::device::test_device_lock();
@@ -769,7 +755,7 @@ mod tests {
     /// `betlang-train --f16`, the whole of it: the trainer's own
     /// `conv_stack_f16` forward *and* the backward through it, landing on the
     /// f32 masters. The pool is `reshape(..).max::<3>(3)` on an f16 operand,
-    /// so this is the `Max` fold whose adjoint used to be unbuildable.
+    /// so this exercises the `Max` adjoint at a narrowed accumulator.
     ///
     /// The f32 stack over the same numbers is the reference. Gradients are
     /// compared with a wide band — three convolutions and three gelus in f16,

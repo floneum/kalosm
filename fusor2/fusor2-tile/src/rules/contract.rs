@@ -1,14 +1,11 @@
-//! R3 and R4: the schedule domain attached to a contraction, the four
-//! order-free family lowerings, and the epilogue un-fusing rule.
+//! The schedule domain attached to a contraction, the four order-free family
+//! lowerings, and the epilogue un-fusing rule.
 //!
-//! `tile_contract` mints **one node, not four and not four hundred**: the
-//! full legal `(geom x splits x staging)` space rides on the node and is
-//! resolved by extraction. `family` is never stored on an L0 op, and
-//! `ShapeSelector`'s first-match ordering is structurally impossible — all
-//! four families are unioned into one chain unconditionally and compete on
-//! cost.
-//!
-//! Owned by W4.
+//! `tile_contract` mints one node, not one per point: the full legal
+//! `(geom x splits x staging)` space rides on the node and is resolved by
+//! extraction. `family` is never stored on an L0 op; all four families are
+//! unioned into one chain unconditionally and compete on cost, so no
+//! first-match ordering decides between them.
 
 use fusor2_ir::contract_spec::partition;
 use fusor2_ir::dtype::Dtype;
@@ -77,9 +74,7 @@ rule!(
     apply = unfuse_coop_epilogue,
 );
 
-// ---------------------------------------------------------------------------
 // Shared shape and expression helpers
-// ---------------------------------------------------------------------------
 
 /// The four extents a contraction kernel is parameterized by.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -167,21 +162,16 @@ pub fn is_identity(e: &ScalarExpr) -> bool {
 
 /// The dtype the first `Arg` leaf of an expression reads.
 pub fn input_dtype(e: &ScalarExpr) -> Option<Dtype> {
-    match e.kind() {
-        ScalarKind::Arg(_) => Some(e.dtype()),
-        ScalarKind::Lit(_) | ScalarKind::Uniform(_) | ScalarKind::IndexOf(_) => None,
-        ScalarKind::Un { x, .. }
-        | ScalarKind::Cast { x, .. }
-        | ScalarKind::Bitcast { x, .. }
-        | ScalarKind::Round { x, .. }
-        | ScalarKind::Splat { x, .. } => input_dtype(x),
-        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
-            input_dtype(a).or_else(|| input_dtype(b))
-        }
-        ScalarKind::Select { c, t, f } => {
-            input_dtype(c).or_else(|| input_dtype(t)).or_else(|| input_dtype(f))
-        }
+    if let ScalarKind::Arg(_) = e.kind() {
+        return Some(e.dtype());
     }
+    let mut found = None;
+    e.for_each_child(|c| {
+        if found.is_none() {
+            found = input_dtype(c);
+        }
+    });
+    found
 }
 
 /// An aliasing operand over a value's own contiguous layout.
@@ -193,11 +183,10 @@ pub fn alias(src: Id, facts: &ValueFacts) -> Operand {
     }
 }
 
-/// Port of `coop_epilogues_supported` (`core/src/matmul/kernel.rs:152`),
-/// verbatim: both pre chains dtype-preserving, the post chain reading the
-/// operand dtype, and writing either the operand dtype or — for f16
-/// operands — f32. A narrowing post would round the accumulator ahead of
-/// the chain.
+/// Whether the cooperative kernel can host this epilogue: both pre chains
+/// dtype-preserving, the post chain reading the operand dtype, and writing
+/// either the operand dtype or — for f16 operands — f32. A narrowing post
+/// would round the accumulator ahead of the chain.
 ///
 /// This is a *legality* predicate on the epilogue, never a routing
 /// decision: an epilogue the coop kernel cannot host un-fuses into a second
@@ -243,9 +232,20 @@ fn contract_parts(node: &Node) -> Option<(&EinSpec, Dtype, Id, Id)> {
 /// `L0::Dequant` into its defn, and the contraction then sees a dense operand
 /// like any other.
 fn operands_addressable(f: &Facts<'_>, family: Family) -> bool {
+    // Sgemv joins Coop for quantized operands on the GPU: its A-side loads
+    // stage through `contract_stage_source` exactly as the coop fill does,
+    // so the decode runs per loaded element with no dense table. This is the
+    // M = 1 decode family — a coop tile wastes bm - 1 of its rows there.
+    // The CPU nest reads buffers through plain collapsed strides and would
+    // read block words as floats, so it keeps the dense-only rule.
+    let q_ok = |family: Family| {
+        family == Family::Coop
+            || (family == Family::Sgemv
+                && f.caps().kind == fusor2_ir::device::DeviceKind::Gpu)
+    };
     f.operands()
         .iter()
-        .all(|o| !o.dtype.is_quantized() || family == Family::Coop)
+        .all(|o| !o.dtype.is_quantized() || q_ok(family))
 }
 
 /// The dtype the matrix unit actually sees. A quantized operand is decoded
@@ -256,35 +256,16 @@ fn compute_dtype(d: Dtype) -> Dtype {
     if d.is_quantized() { Dtype::F32 } else { d }
 }
 
-/// Whether the m/n/k kernels can address this spec's operands at all.
+/// Whether a spec's axes already sit in canonical order:
+/// `a = [batch.., m.., k..]`, `b = [batch.., k.., n..]`,
+/// `out = [batch.., m.., n..]`.
 ///
-/// [`L1::KContract`] records four **extents** — `contract_mnk` takes the
-/// products of the m, n, k and batch labels — and its operands are plain
-/// contiguous layouts. That describes `a = [batch.., m.., k..]`,
-/// `b = [batch.., k.., n..]`, `out = [batch.., m.., n..]` and nothing else,
-/// so a spec in any other axis order is indistinguishable from the canonical
-/// one at this level. `mat_mul_transposed_rhs` differs from `matmul` *only*
-/// in that order, and the adjoint specs `d_lhs`/`d_rhs` are non-canonical by
-/// construction, which is how `dB` came to read a `[m, k]` activation as if
-/// it were `[k, m]`.
-///
-/// Declining leaves the contraction to `lower_contract_generic`, whose
-/// operands carry the spec's geometry explicitly. That is slower and correct.
-///
-/// **The m/n/k families no longer read this.** Teaching `KContract` to carry
-/// per-operand layouts — which is all `permuted_alias` does, since `Operand`
-/// already holds a strided `Layout` — restored the fast path for exactly the
-/// shapes this used to send to the floor, and it is where attention's cost
-/// was: `q @ k^T` is `bhqd,bhkd->bhqk`, non-canonical in `b`, so Coop, SGEMM
-/// and SGEMV all declined and the score matmul ran as a rank-5 generic reduce
-/// beside a `p @ v` that got Coop. On `[1,8,1024,64]` that was **26.0 ms ->
-/// 10.2 ms** end to end, with the score matmul becoming
-/// `KContract{m:1024, n:1024, k:64, batch:8}`.
-///
-/// What still reads it is [`lower_generic`], whose `KFold` nest really does
-/// address dense `[batch, m, k]` / `[batch, k, n]` aliases and has no operand
-/// layout to permute. `out` is still required canonical everywhere, because
-/// `KContract` does not parameterize its *write* map.
+/// Read only by [`lower_generic`], whose `KFold` nest addresses dense
+/// `[batch, m, k]` / `[batch, k, n]` aliases and has no operand layout to
+/// permute. The m/n/k families instead permute strides via
+/// [`permuted_alias`]. Declining leaves the contraction to
+/// `lower_contract_generic`, whose operands carry the spec's geometry
+/// explicitly — slower and correct.
 fn canonical_for_mnk(spec: &EinSpec) -> bool {
     let Ok(part) = partition(spec) else {
         return false;
@@ -310,18 +291,11 @@ fn canonical_for_mnk(spec: &EinSpec) -> bool {
 /// `L1::KContract` records four extents and addresses `a = [batch.., m.., k..]`,
 /// `b = [batch.., k.., n..]`. That does not oblige the *buffer* to be stored in
 /// that order — `Operand` carries a full strided `Layout`, and permuting the
-/// strides states exactly the same read. This is what the architecture means by
-/// "transposed-rhs is a spec, not an op": `mat_mul_transposed_rhs` differs from
-/// `matmul` only in axis order, so it differs only in this stride vector.
-///
-/// Requiring canonical order instead is what sent every non-canonical
-/// contraction to `lower_contract_generic`. Measured, and it is the whole of
-/// attention's cost on this half of the chain: `q @ k^T` is
-/// `bhqd,bhkd->bhqk`, whose `b` is `[batch, n, k]`, so **all three fast
-/// families declined** and the score matmul ran as a rank-5 generic reduce
-/// while `p @ v` next door — canonical — got `Family::Coop`. The adjoint specs
-/// `d_lhs`/`d_rhs` are non-canonical by construction and were in the same
-/// position.
+/// strides states exactly the same read. Transposed-rhs is therefore a spec,
+/// not an op: it differs from `matmul` only in axis order, so it differs only
+/// in this stride vector. Non-canonical specs such as attention's
+/// `bhqd,bhkd->bhqk` and the adjoints `d_lhs`/`d_rhs` reach the fast families
+/// through this.
 ///
 /// Returns `None` when a label is missing or an extent is symbolic, in which
 /// case the caller declines and the generic fold still carries the value.
@@ -426,9 +400,7 @@ fn lower_family(
     Some(new)
 }
 
-// ---------------------------------------------------------------------------
 // The rules
-// ---------------------------------------------------------------------------
 
 /// Attach the complete legal schedule domain to a `KContract` that arrived
 /// carrying [`ScheduleDomain::Point`]. An empty domain means the rule does
@@ -562,9 +534,8 @@ pub fn lower_generic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
 /// `KMap{body: post} . KContract{post: identity}`.
 ///
 /// A hostable epilogue fires no rule; `lower_generic`'s node is already the
-/// third alternative. This is what stops one unsupported activation from
-/// costing the whole coop speedup, which is what the reference's
-/// route-by-refusal does.
+/// third alternative. One unsupported activation therefore costs a second
+/// dispatch rather than the whole coop speedup.
 pub fn unfuse_coop_epilogue(
     b: &mut Builder<'_>,
     id: Id,

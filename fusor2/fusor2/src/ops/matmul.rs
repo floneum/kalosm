@@ -1,10 +1,7 @@
 //! Contractions. `matmul`, `mat_mul_transposed_rhs` and every batched form are
-//! one `L0::Contract` with a different `EinSpec` — **transposed-rhs is a spec,
-//! not an op**, and no `MatMulParams` is ever written onto a node. Kernel
-//! family, tile geometry, split-K and staging depth are all extraction
-//! decisions that do not exist yet at this level.
-//!
-//! Owned by W12.
+//! one `L0::Contract` with a different `EinSpec`; transposed-rhs is a spec, not
+//! an op. Kernel family, tile geometry, split-K and staging depth are all
+//! extraction decisions that do not exist at this level.
 
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::ir::level0::{EinSpec, L0, Label};
@@ -50,13 +47,12 @@ impl Tensor {
     /// `[batch.., m, k] @ [batch.., k, n] -> [batch.., m, n]`.
     ///
     /// Batch dims must be pairwise [`fusor2_ir::shape::Dim::known_eq`]: there
-    /// is **no implicit batch broadcast**, callers `broadcast_as` first, as
-    /// the reference also requires.
+    /// is no implicit batch broadcast, callers `broadcast_as` first.
     pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {
         self.contract_2d(rhs, false)
     }
 
-    /// `self @ rhs^T`. The **same node** as [`Tensor::matmul`]; only `b`'s two
+    /// `self @ rhs^T`. The same node as [`Tensor::matmul`]; only `b`'s two
     /// trailing labels swap.
     pub fn matmul_t(&self, rhs: &Tensor) -> Result<Tensor> {
         self.contract_2d(rhs, true)
@@ -65,9 +61,7 @@ impl Tensor {
     fn contract_2d(&self, rhs: &Tensor, transposed_rhs: bool) -> Result<Tensor> {
         // A block-quantized weight is a legal contraction operand on exactly
         // one side: an ordinary `KContract` decodes the blocks on the way into
-        // its staging fill, and the extractor prices that against
-        // dequantize-then-contract. Two quantized sides is not a kernel
-        // anybody has.
+        // its staging fill. Two quantized sides has no kernel.
         let (q_lhs, q_rhs) = (self.dtype().is_quantized(), rhs.dtype().is_quantized());
         if q_lhs && q_rhs {
             return Err(Error::Dtype(
@@ -107,25 +101,19 @@ impl Tensor {
                 rhs.dtype()
             )));
         }
-        // The accumulator is the *dense* side's compute dtype: a quantized
+        // The accumulator is the dense side's compute dtype: a quantized
         // format has none of its own.
         let acc = if q_lhs { rhs.dtype() } else { self.dtype() }.compute_dtype();
         let spec = matmul_spec(batch, transposed_rhs)?;
 
-        // A quantized side enters the contraction as its *dequantize class*,
-        // not its raw leaf. The class is `L0::Dequant` unioned with the
-        // `Restride` + `Map` definitional expansion (see
-        // `QMatrix::dequantize`), so the extractor prices the format's staged
-        // block decode against the general bit-arithmetic spelling —
-        // `map_into_contract` absorbs the latter's unpack into the
-        // contraction's own operand list, no materialization in either case.
-        // Contracting the raw leaf instead would put exactly one spelling in
-        // the graph: the hand-written block program, reachable by no rewrite
-        // and admitted to `Family::Coop` alone.
+        // Both spellings of a quantized operand enter the class: the raw Q leaf
+        // is the only path to the staged block decode, and the dequantize class
+        // (`L0::Dequant` unioned with the `Restride` + `Map` expansion) offers
+        // dequantize-once and the absorbed bit-arithmetic members. The
+        // extractor prices the choice per shape.
         //
         // A quantized value `QMatrix::of_tensor` cannot name (not a leaf, or
-        // rank over 2 — today nothing mints either) falls back to the raw
-        // operand, which is the old behavior, not an error.
+        // rank over 2) falls back to the raw operand rather than erroring.
         let deq = |t: &Tensor| -> Result<Option<Tensor>> {
             match crate::quantized::QMatrix::of_tensor(t) {
                 Some(q) => Ok(Some(q.dequantize()?)),
@@ -133,10 +121,20 @@ impl Tensor {
             }
         };
         if q_lhs && let Some(w) = deq(self)? {
-            return w.contract(rhs, spec, acc);
+            let dense = w.contract(rhs, spec.clone(), acc)?;
+            let staged = self.contract(rhs, spec, acc)?;
+            let root = self
+                .graph
+                .with_egraph(|g| g.union(dense.id, staged.id))?;
+            return Ok(self.graph.tensor(root));
         }
         if q_rhs && let Some(w) = deq(rhs)? {
-            return self.contract(&w, spec, acc);
+            let dense = self.contract(&w, spec.clone(), acc)?;
+            let staged = self.contract(rhs, spec, acc)?;
+            let root = self
+                .graph
+                .with_egraph(|g| g.union(dense.id, staged.id))?;
+            return Ok(self.graph.tensor(root));
         }
         self.contract(rhs, spec, acc)
     }

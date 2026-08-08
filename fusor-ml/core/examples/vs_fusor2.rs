@@ -226,4 +226,59 @@ fn main() {
         });
         row("attention_1x8x1024x64", &t);
     }
+
+    // ---- 7. quantized matmul, Q4K weights, same shape and bytes as the
+    //         fusor2 row: weight [n, k] = [4096, 4096] of 0x11 blocks,
+    //         activation [256, 4096]. Weight upload inside the timed region
+    //         on both sides. ----
+    {
+        use fusor_core::QMatrix;
+        use fusor_gguf::GgmlType;
+        let (k, n, m) = (4096usize, 4096usize, 256usize);
+        let block_bytes = 144usize; // Q4K native
+        let blocks = (k / 256) * n;
+        let bytes = vec![0x11u8; blocks * block_bytes];
+        let act = make(m * k, 0.013, 0.5);
+        let launches = {
+            let w =
+                QMatrix::from_parts(&device, &bytes, [n, k].into(), GgmlType::Q4K).unwrap();
+            let a = Tensor::from_slice(&device, [m, k], &act);
+            count_of(&a.q_mat_mul(&w).sum(1))
+        };
+        let t = time_it(|| {
+            let w =
+                QMatrix::from_parts(&device, &bytes, [n, k].into(), GgmlType::Q4K).unwrap();
+            let a = Tensor::from_slice(&device, [m, k], &act);
+            let y = a.q_mat_mul(&w).sum(1);
+            block_on(y.as_slice::<1, f32>()).unwrap();
+            launches
+        });
+        row("qmatmul_q4k_256x4096x4096", &t);
+    }
+
+    // ---- 8. quantized matvec, Q4K weights, M=1: the LLM decode shape. ----
+    {
+        use fusor_core::QMatrix;
+        use fusor_gguf::GgmlType;
+        let (k, n) = (4096usize, 4096usize);
+        let block_bytes = 144usize; // Q4K native
+        let blocks = (k / 256) * n;
+        let bytes = vec![0x11u8; blocks * block_bytes];
+        let act = make(k, 0.013, 0.5);
+        let launches = {
+            let w =
+                QMatrix::from_parts(&device, &bytes, [n, k].into(), GgmlType::Q4K).unwrap();
+            let a = Tensor::from_slice(&device, [1, k], &act);
+            count_of(&a.q_mat_mul(&w).sum(1))
+        };
+        let t = time_it(|| {
+            let w =
+                QMatrix::from_parts(&device, &bytes, [n, k].into(), GgmlType::Q4K).unwrap();
+            let a = Tensor::from_slice(&device, [1, k], &act);
+            let y = a.q_mat_mul(&w).sum(1);
+            block_on(y.as_slice::<1, f32>()).unwrap();
+            launches
+        });
+        row("qmatmul_q4k_1x4096x4096", &t);
+    }
 }

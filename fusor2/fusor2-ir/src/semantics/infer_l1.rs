@@ -1,7 +1,5 @@
 //! Total inference for the L1 op family. An L1 node's result shape is its
 //! index space minus the reduced axes, and its dtype is the epilogue's.
-//!
-//! Owned by W1.
 
 use crate::dtype::{Dtype, NumericContract, Persistence};
 use crate::error::{Error, Result};
@@ -12,10 +10,9 @@ use crate::shape::{Dim, Dims};
 
 /// Infer the result facts of an L1 node from its operands' facts.
 ///
-/// `L1::Ext` is the one variant this cannot answer alone — its row lives in
-/// the open [`OpDefRegistry`], which only [`crate::CoreSemantics`] holds. Use
-/// [`infer_l1_with`] when you have the registry; this function reports a
-/// typed error rather than guessing.
+/// `L1::Ext` is the one variant this cannot answer alone: its row lives in the
+/// open [`OpDefRegistry`]. Use [`infer_l1_with`] when you have the registry;
+/// this function reports a typed error instead.
 pub fn infer_l1(op: &L1, ins: &[ValueFacts]) -> Result<ValueFacts> {
     infer_l1_inner(op, ins, None)
 }
@@ -40,10 +37,9 @@ fn infer_l1_inner(
         }),
 
         // The reduced axis leaves the shape and the carrier's lane count is
-        // appended when it exceeds one — the convention slot readback is an
-        // ordinary `Restride` of. Promoted axes leave the *iteration* domain
-        // but stay in the output shape as carrier lanes, which is exactly why
-        // `PROMOTE` does not change a node's `ValueFacts` at all.
+        // appended when it exceeds one, so slot readback is an ordinary
+        // `Restride`. Promoted axes leave the iteration domain but stay in the
+        // output shape as carrier lanes.
         L1::KFold {
             space,
             axis,
@@ -93,13 +89,9 @@ fn infer_l1_inner(
             outs: 1,
         }),
 
-        // A scatter's value is its **base** with the updates applied, so its
-        // shape comes from operand 0 — never from `space`. The two disagree:
-        // `fusor2_tile::rules::scatter` mints the *update* iteration domain
-        // (`[index_count, ...]`), so reading the shape off `space` sized a
-        // 1024-row table's buffer at the 300 tokens that wrote into it, and
-        // every element past the update count came back undefined. `infer_l0`
-        // already says `Scatter` returns the base facts; this has to agree.
+        // A scatter's value is its base with the updates applied, so its shape
+        // comes from operand 0, never from `space`: `space` is the update
+        // iteration domain `[index_count, ...]`.
         L1::KScatter { space, .. } => match ins.first() {
             Some(base) => Ok(ValueFacts {
                 dtype: base.dtype,
@@ -268,10 +260,8 @@ mod tests {
         assert!(infer_l1(&bad_axis, &[f32s(&[4])]).is_err());
     }
 
-    /// **Promotion does not change the node's facts.** A free axis moving from
-    /// the iteration domain into the accumulator's data space leaves the output
-    /// shape byte-identical, which is the check that catches a botched
-    /// renumbering.
+    /// A free axis moving from the iteration domain into the accumulator's data
+    /// space leaves the output shape identical.
     #[test]
     fn promoting_an_axis_leaves_the_shape_identical() {
         let plain = L1::KFold {

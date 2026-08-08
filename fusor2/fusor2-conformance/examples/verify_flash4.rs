@@ -1,5 +1,5 @@
-//! Part 4: the pure user path. Build `attention(q,k,v)` and read it back.
-//! No probe touches the e-graph — this is exactly what a caller does.
+//! Builds `attention(q,k,v)` and reads it back through the public API, with no
+//! e-graph access, and compares against a host reference.
 
 use fusor2::composite::attention::attention;
 use fusor2::{Session, Tensor};

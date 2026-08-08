@@ -1,14 +1,9 @@
 //! One persistent worker pool. Parallelism is a scheduling attribute on an
 //! outer L1 tile loop, priced against the real pool-wake cost
-//! (`DeviceFacts::thread_wake_ps`) — which deletes
-//! `PARALLEL_THRESHOLD = 16_777_216`.
+//! (`DeviceFacts::thread_wake_ps`), so there is no element-count threshold.
 //!
-//! Threads are created once at pool init and never per call. That spawn cost
-//! is exactly why the reference sets a 16-million-element threshold before it
-//! will parallelize anything; with a persistent pool the break-even is a few
-//! microseconds of work and the constant has nothing to guard.
-//!
-//! Owned by W10.
+//! Threads are created once at pool init and never per call, which puts the
+//! break-even for parallelizing at a few microseconds of work.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;

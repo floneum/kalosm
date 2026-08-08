@@ -1,7 +1,5 @@
 //! `Linear`: `x @ Wt (+ b)`. The bias add is an epilogue the extractor fuses
 //! or does not, on cost.
-//!
-//! Owned by W13.
 
 use fusor2_gguf::VarBuilder;
 use fusor2_ir::shape::Dim;
@@ -121,9 +119,8 @@ mod tests {
         );
     }
 
-    /// The layer owns no kernel: its forward must hash-cons to exactly the
-    /// composition its documentation names, or the launch the extractor sees
-    /// is not the one the parity list was written against.
+    /// The layer owns no kernel: its forward hash-conses to exactly the
+    /// composition its documentation names.
     #[test]
     fn the_forward_is_mat_mul_transposed_rhs_plus_a_broadcast_bias() {
         let g = graph();
