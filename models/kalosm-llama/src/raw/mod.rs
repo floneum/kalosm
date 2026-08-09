@@ -75,8 +75,10 @@ use attention_layer::AttentionVariant;
 use attention_layer::FeedForwardVariant;
 use attention_layer::GroupedAttention;
 use attention_layer::LlamaFeedForward;
+use attention_layer::Norm;
 use attention_layer::PhiFeedForward;
 use attention_layer::SeparateAttention;
+use attention_layer::TransformerBlock;
 use fusor::cache::MaskCache;
 use fusor::layers::Embedding;
 use fusor::layers::Linear;
@@ -625,17 +627,17 @@ where
                 rope.clone()
             };
 
-            layers.push(LlamaAttention {
+            layers.push(TransformerBlock {
                 attention_variant,
                 attention_wo: Linear::new(attention_wo, None),
-                attention_norm: decode_norm(attention_norm, rms_norm_eps)?,
+                attention_norm: Some(Norm::Rms(decode_norm(attention_norm, rms_norm_eps)?)),
                 post_attention_norm: post_attention_norm
-                    .map(|norm| decode_norm(norm, rms_norm_eps))
+                    .map(|norm| decode_norm(norm, rms_norm_eps).map(Norm::Rms))
                     .transpose()?,
                 feed_forward_variant,
-                ffn_norm: decode_norm(ffn_norm, rms_norm_eps)?,
+                ffn_norm: Norm::Rms(decode_norm(ffn_norm, rms_norm_eps)?),
                 post_ffn_norm: ffn_post_norm
-                    .map(|norm| decode_norm(norm, rms_norm_eps))
+                    .map(|norm| decode_norm(norm, rms_norm_eps).map(Norm::Rms))
                     .transpose()?,
                 n_head: head_count,
                 n_kv_head: head_count_kv,
@@ -961,7 +963,11 @@ where
         for (i, layer) in self.layers.iter().enumerate() {
             let x = layer_in;
             let residual: Tensor<3, f32> = x.cast();
-            let x = layer.attention_norm.forward_generic(&x);
+            let x = layer
+                .attention_norm
+                .as_ref()
+                .expect("decoder layers always have a pre-attention norm")
+                .forward(&x);
             if trace_layer_nan {
                 let probe: fusor::Tensor<3, f32> = x.clone().cast();
                 debug_check_nan_f32(&probe, i, "post_attn_norm", index_pos);
@@ -974,7 +980,8 @@ where
                 #[cfg(feature = "vision")]
                 {
                     if trace_layer_nan {
-                        layer.forward_with_trace(
+                        attention_layer::forward_with_trace(
+                            layer,
                             &x,
                             mask.as_ref(),
                             index_pos,
@@ -1008,7 +1015,7 @@ where
                 debug_check_nan_f32(&probe, i, "attn_out", index_pos);
             }
             if let Some(post_attention_norm) = &layer.post_attention_norm {
-                attn = post_attention_norm.forward_generic(&attn);
+                attn = post_attention_norm.forward(&attn);
             }
             let attn_f32: Tensor<3, f32> = attn.cast();
 
@@ -1030,7 +1037,7 @@ where
             }
             let mut x = layer.feed_forward_variant.forward(&x);
             if let Some(post_ffn_norm) = &layer.post_ffn_norm {
-                x = post_ffn_norm.forward_generic(&x);
+                x = post_ffn_norm.forward(&x);
             }
             let x_f32: Tensor<3, f32> = x.cast();
             layer_in = (x_f32 + attn_f32 + residual).cast();

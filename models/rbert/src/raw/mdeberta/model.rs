@@ -1,0 +1,139 @@
+//! mDeBERTa-v3 encoder model.
+
+use fusor::layers::{Embedding, LayerNorm, Linear};
+use fusor::{Device, Result, Tensor, VarBuilder};
+
+use super::attention::RelativePositionEmbedding;
+use super::config::MDebertaConfig;
+use super::layer::MDebertaLayer;
+
+/// A raw synchronous mDeBERTa-v3 encoder model. This is a bidirectional
+/// transformer encoder using disentangled attention with relative position
+/// embeddings (DeBERTa-v3 architecture).
+pub struct MDebertaModel {
+    /// Token embeddings
+    token_embeddings: Embedding<f32>,
+    /// Embedding LayerNorm
+    embedding_norm: LayerNorm<1, f32>,
+    /// Relative position embeddings (shared across layers, with LayerNorm)
+    rel_pos_embedding: RelativePositionEmbedding,
+    /// Transformer layers
+    layers: Vec<MDebertaLayer>,
+    /// Optional encoder output projection (used by the `large` variants to
+    /// map the encoder's 1024-dim hidden state down to the 768-dim space
+    /// expected by the downstream heads). Absent on base/multi variants.
+    output_proj: Option<Linear<f32>>,
+    /// Device
+    device: Device,
+    /// Number of attention heads (the only config value needed at inference).
+    num_heads: usize,
+    span: tracing::Span,
+}
+
+impl MDebertaModel {
+    /// Load mDeBERTa from GGUF weights.
+    pub fn load(device: &Device, vb: &mut VarBuilder) -> Result<Self> {
+        let config = MDebertaConfig::from_gguf(vb)?;
+
+        // The disentangled attention reuses the content Q/K projections for the
+        // position embeddings (the `share_att_key=true` path, which all DeBERTa-v3
+        // / mDeBERTa-v3 checkpoints use). A `share_att_key=false` model ships
+        // separate `pos_q_proj` / `pos_key_proj` weights that we neither load nor
+        // apply, so fail loudly rather than silently producing wrong scores.
+        if !config.share_att_key {
+            return Err(fusor::Error::msg(
+                "mDeBERTa with share_att_key=false is not supported: disentangled \
+                 attention here reuses the content Q/K projections for position \
+                 embeddings and does not load separate pos_q_proj/pos_key_proj weights.",
+            ));
+        }
+
+        let token_embeddings = Embedding::load(device, &mut vb.pp("token_embd"))?;
+        let embedding_norm = LayerNorm::load(device, &mut vb.pp("embd_norm"), config.norm_eps)?;
+
+        // The `output_norm` tensor in GGUF is the LayerNorm for the relative
+        // position embeddings. Load it first to avoid borrow issues.
+        let rel_pos_norm = LayerNorm::load(device, &mut vb.pp("output_norm"), config.norm_eps).ok();
+        let rel_pos_embedding = RelativePositionEmbedding::load_with_norm(
+            device,
+            &mut vb.pp("rel_pos_embd"),
+            rel_pos_norm,
+        )?;
+
+        let mut layers = Vec::with_capacity(config.num_layers);
+        for i in 0..config.num_layers {
+            let layer = MDebertaLayer::load(
+                device,
+                &mut vb.pp(format!("blk.{i}")),
+                config.num_heads,
+                config.head_dimension,
+                config.norm_eps,
+            )?;
+            layers.push(layer);
+        }
+
+        // Optional post-encoder projection (only present on the large variants,
+        // which use DeBERTa-v3-large at 1024-dim and project down to 768).
+        let output_proj = Linear::load(device, &mut vb.pp("output_proj")).ok();
+
+        Ok(Self {
+            token_embeddings,
+            embedding_norm,
+            rel_pos_embedding,
+            layers,
+            output_proj,
+            device: device.clone(),
+            num_heads: config.num_heads,
+            span: tracing::span!(tracing::Level::TRACE, "mdeberta"),
+        })
+    }
+
+    /// Forward pass through the model.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [batch, seq_len]
+    /// * `attention_mask` - Optional attention mask [batch, seq_len]
+    ///
+    /// # Returns
+    /// Hidden states [batch, seq_len, hidden_size]
+    pub fn forward(
+        &self,
+        input_ids: &Tensor<2, u32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Tensor<3, f32> {
+        let _enter = self.span.enter();
+        let [_batch_size, seq_len] = input_ids.shape();
+
+        let [b_sz, _] = input_ids.shape();
+        let hidden_states = self.token_embeddings.forward(input_ids);
+        let mut hidden_states = self.embedding_norm.forward(&hidden_states);
+
+        // Compute the flat gather indices once per forward; every layer shares them.
+        let gather_idx = self.rel_pos_embedding.compute_gather_indices(
+            b_sz,
+            self.num_heads,
+            seq_len,
+            &self.device,
+        );
+        let rel_pos_emb = self.rel_pos_embedding.get_embeddings();
+        let attention_bias = attention_mask.map(|mask| {
+            let mask_bias = super::super::utils::attention_mask_to_bias(mask);
+            mask_bias.unsqueeze(1).unsqueeze(1).to_concrete()
+        });
+
+        for layer in &self.layers {
+            hidden_states = layer.forward_with_rel(
+                &hidden_states,
+                &rel_pos_emb,
+                &gather_idx,
+                attention_bias.as_ref(),
+            );
+        }
+
+        if let Some(ref proj) = self.output_proj {
+            hidden_states = proj.forward(&hidden_states);
+        }
+
+        hidden_states
+    }
+}

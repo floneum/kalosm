@@ -1,0 +1,219 @@
+//! Bidirectional LSTM implementation for GLiNER token representation.
+//!
+//! The BiLSTM processes encoder output to capture bidirectional context
+//! before span representation computation. The timestep loop is inherently
+//! sequential, but every tensor operation inside the loop runs on the active
+//! device — no `.as_slice()` round-trips or scalar Rust gate math.
+
+use fusor::{Device, Result, Tensor, VarBuilder};
+
+/// Per-direction LSTM parameters pre-arranged for matrix multiplication.
+struct LstmDir {
+    // Shape [input_size, 4 * hidden] — transpose of the GGUF `weight_ih_l0*` layout.
+    w_ih_t: Tensor<2, f32>,
+    // Shape [hidden_size, 4 * hidden] — transpose of the GGUF `weight_hh_l0*` layout.
+    w_hh_t: Tensor<2, f32>,
+    // Shape [4 * hidden] — pre-summed `bias_ih + bias_hh`.
+    bias: Tensor<1, f32>,
+}
+
+impl LstmDir {
+    fn load(device: &Device, vb: &mut VarBuilder, suffix: &str) -> Result<Self> {
+        let w_ih: Tensor<2, f32> = vb
+            .get(&format!("weight_ih_l0{suffix}"), device)?
+            .dequantize();
+        let w_hh: Tensor<2, f32> = vb
+            .get(&format!("weight_hh_l0{suffix}"), device)?
+            .dequantize();
+        let b_ih: Tensor<1, f32> = vb.get(&format!("bias_ih_l0{suffix}"), device)?.dequantize();
+        let b_hh: Tensor<1, f32> = vb.get(&format!("bias_hh_l0{suffix}"), device)?.dequantize();
+
+        let w_ih_t = w_ih.transpose(0, 1).to_concrete();
+        let w_hh_t = w_hh.transpose(0, 1).to_concrete();
+        let bias = (b_ih + b_hh).to_concrete();
+
+        Ok(Self {
+            w_ih_t,
+            w_hh_t,
+            bias,
+        })
+    }
+}
+
+/// Bidirectional LSTM layer for token representation.
+///
+/// Processes transformer encoder output through forward and backward LSTMs
+/// and concatenates the outputs.
+pub struct BiLstm {
+    forward: LstmDir,
+    backward: LstmDir,
+    hidden_size: usize,
+}
+
+impl BiLstm {
+    /// Load BiLSTM weights from GGUF.
+    pub fn load(device: &Device, vb: &mut VarBuilder) -> Result<Self> {
+        let forward = LstmDir::load(device, vb, "")?;
+        let backward = LstmDir::load(device, vb, "_reverse")?;
+
+        // The forward weight matrix is [4*hidden, input_size] in GGUF layout, which
+        // after transpose becomes [input_size, 4*hidden]. The hidden dim is the
+        // last axis divided by 4.
+        let hidden_size = forward.w_ih_t.shape()[1] / 4;
+
+        Ok(Self {
+            forward,
+            backward,
+            hidden_size,
+        })
+    }
+
+    /// Forward pass through BiLSTM with explicit per-item sequence lengths.
+    ///
+    /// Padded timesteps are masked out so shorter sequences in a batch do not
+    /// corrupt the backward direction state.
+    pub fn forward_with_lengths(
+        &self,
+        input: &Tensor<3, f32>,
+        lengths: &[usize],
+    ) -> Tensor<3, f32> {
+        let [batch, seq_len, _input_size] = input.shape();
+        assert_eq!(lengths.len(), batch, "lengths must match batch size");
+        let device = input.device();
+
+        let fwd_out = run_direction(
+            input,
+            &self.forward,
+            self.hidden_size,
+            &device,
+            false,
+            lengths,
+        );
+        let bwd_out = run_direction(
+            input,
+            &self.backward,
+            self.hidden_size,
+            &device,
+            true,
+            lengths,
+        );
+
+        // Concatenate forward and backward along the feature dim -> [batch, seq, 2*hidden]
+        Tensor::cat([fwd_out, bwd_out], 2)
+            .reshape([batch, seq_len, 2 * self.hidden_size])
+            .to_concrete()
+    }
+}
+
+/// Run one direction of the LSTM. Sequential over time; every timestep's gate
+/// math stays on-device.
+fn run_direction(
+    input: &Tensor<3, f32>,
+    dir: &LstmDir,
+    hidden_size: usize,
+    device: &Device,
+    reverse: bool,
+    lengths: &[usize],
+) -> Tensor<3, f32> {
+    let [batch, seq_len, input_size] = input.shape();
+
+    let mut h: Tensor<2, f32> = Tensor::zeros(device, [batch, hidden_size]);
+    let mut c: Tensor<2, f32> = Tensor::zeros(device, [batch, hidden_size]);
+    let mut outputs: Tensor<3, f32> = Tensor::zeros(device, [batch, seq_len, hidden_size]);
+    let all_active = lengths.iter().all(|&length| length >= seq_len);
+
+    let bias_broadcast: Tensor<2, f32> = dir
+        .bias
+        .unsqueeze(0)
+        .broadcast_as([batch, 4 * hidden_size])
+        .to_concrete();
+    let input_gates: Tensor<3, f32> = input
+        .reshape([batch * seq_len, input_size])
+        .to_concrete()
+        .mat_mul(&dir.w_ih_t)
+        .reshape([batch, seq_len, 4 * hidden_size])
+        .to_concrete();
+    let active_masks = if all_active {
+        None
+    } else {
+        Some(
+            Tensor::new(
+                device,
+                &lengths
+                    .iter()
+                    .flat_map(|&length| {
+                        (0..seq_len).flat_map(move |t| {
+                            std::iter::repeat_n(if t < length { 1.0 } else { 0.0 }, hidden_size)
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .reshape([batch, seq_len, hidden_size])
+            .to_concrete(),
+        )
+    };
+
+    let iter: Box<dyn Iterator<Item = usize>> = if reverse {
+        Box::new((0..seq_len).rev())
+    } else {
+        Box::new(0..seq_len)
+    };
+
+    for t in iter {
+        let x_gates_t: Tensor<2, f32> = input_gates
+            .narrow(1, t, 1)
+            .reshape([batch, 4 * hidden_size])
+            .to_concrete();
+
+        // gates_pre = x_t @ W_ih^T + h @ W_hh^T + bias, shape [batch, 4*hidden]
+        let gates_pre: Tensor<2, f32> =
+            (x_gates_t + h.mat_mul(&dir.w_hh_t) + bias_broadcast.clone()).to_concrete();
+
+        let i_raw: Tensor<2, f32> = gates_pre.narrow(1, 0, hidden_size).to_concrete();
+        let f_raw: Tensor<2, f32> = gates_pre.narrow(1, hidden_size, hidden_size).to_concrete();
+        let g_raw: Tensor<2, f32> = gates_pre
+            .narrow(1, 2 * hidden_size, hidden_size)
+            .to_concrete();
+        let o_raw: Tensor<2, f32> = gates_pre
+            .narrow(1, 3 * hidden_size, hidden_size)
+            .to_concrete();
+
+        let i_gate = i_raw.sigmoid();
+        let f_gate = f_raw.sigmoid();
+        let g_gate = g_raw.tanh();
+        let o_gate = o_raw.sigmoid();
+
+        let next_c = (f_gate * c.clone() + i_gate * g_gate).to_concrete();
+        let next_h = (o_gate * next_c.clone().tanh()).to_concrete();
+
+        if let Some(active_masks) = &active_masks {
+            let active_mask_2d = active_masks
+                .narrow(1, t, 1)
+                .reshape([batch, hidden_size])
+                .to_concrete();
+            c = active_mask_2d.where_cond(&next_c, &c).to_concrete();
+            h = active_mask_2d.where_cond(&next_h, &h).to_concrete();
+        } else {
+            c = next_c;
+            h = next_h;
+        }
+
+        let output_t = h.clone().unsqueeze(1).to_concrete();
+        outputs = outputs.slice_assign([0..batch, t..(t + 1), 0..hidden_size], &output_t);
+    }
+
+    if all_active {
+        outputs
+    } else {
+        let mask_data: Vec<f32> = lengths
+            .iter()
+            .flat_map(|&length| (0..seq_len).map(move |t| if t < length { 1.0 } else { 0.0 }))
+            .collect();
+        let mask: Tensor<3, f32> = Tensor::new(device, &mask_data)
+            .reshape([batch, seq_len, 1])
+            .broadcast_as([batch, seq_len, hidden_size])
+            .to_concrete();
+        let zeros: Tensor<3, f32> = Tensor::zeros(device, [batch, seq_len, hidden_size]);
+        mask.where_cond(&outputs, &zeros).to_concrete()
+    }
+}

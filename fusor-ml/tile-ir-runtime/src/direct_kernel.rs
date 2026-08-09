@@ -538,6 +538,19 @@ impl PreparedDirectDispatch {
         self.steps.len()
     }
 
+    /// Total number of workgroups this dispatch schedules across all of its
+    /// steps (the product of each step's `dispatch_size` dimensions). Used to
+    /// bound how much GPU work is recorded into a single submit.
+    pub fn workgroup_count(&self) -> u64 {
+        self.steps
+            .iter()
+            .map(|step| {
+                let [x, y, z] = step.dispatch_size;
+                u64::from(x) * u64::from(y) * u64::from(z)
+            })
+            .sum()
+    }
+
     pub fn run_step<'a>(&'a self, pass: &mut ComputePass<'a>, step_index: usize) {
         let Some(step) = self.steps.get(step_index) else {
             return;

@@ -49,7 +49,8 @@ use std::sync::{Arc, RwLock};
 use tokenizers::{Encoding, PaddingDirection, PaddingParams, Tokenizer};
 
 mod language_model;
-mod raw;
+/// Low-level encoder implementations (standard BERT, Qwen, ModernBERT, mDeBERTa-v3).
+pub mod raw;
 mod source;
 
 pub use crate::language_model::*;
@@ -169,9 +170,9 @@ pub enum Pooling {
 /// An embedding model that can be either BERT or Qwen
 pub enum EmbeddingModel {
     /// A BERT-style embedding model
-    Bert(BertModel),
+    Bert(Box<BertModel>),
     /// A Qwen-style embedding model
-    Qwen(QwenEmbeddingModel),
+    Qwen(Box<QwenEmbeddingModel>),
 }
 
 impl EmbeddingModel {
@@ -346,7 +347,7 @@ impl Bert {
             Some("qwen3") | Some("qwen2") => {
                 // Load Qwen embedding model
                 let qwen_model = QwenEmbeddingModel::load(&device, &mut vb)?;
-                EmbeddingModel::Qwen(qwen_model)
+                EmbeddingModel::Qwen(Box::new(qwen_model))
             }
             _ => {
                 // Load BERT model (default)
@@ -354,7 +355,7 @@ impl Bert {
                 let config: Config =
                     serde_json::from_slice(&config_bytes).map_err(BertLoadingError::LoadConfig)?;
                 let bert_model = BertModel::load(&device, &mut vb, &config)?;
-                EmbeddingModel::Bert(bert_model)
+                EmbeddingModel::Bert(Box::new(bert_model))
             }
         };
 
@@ -374,6 +375,15 @@ impl Bert {
         &self,
         sentences: Vec<&str>,
         pooling: Pooling,
+    ) -> Result<Vec<Tensor<2, f32>>, BertError> {
+        self.embed_batch_raw_with_options(sentences, pooling, true)
+    }
+
+    pub(crate) fn embed_batch_raw_with_options(
+        &self,
+        sentences: Vec<&str>,
+        pooling: Pooling,
+        normalize: bool,
     ) -> Result<Vec<Tensor<2, f32>>, BertError> {
         let embedding_dim = self.model.embedding_dim();
         // Approximates the quadratic attention memory cost (seq_len^2).
@@ -423,7 +433,7 @@ impl Bert {
         }
 
         for (indices, encodings) in chunks {
-            let embeddings = self.embed_batch_raw_inner(encodings, pooling)?;
+            let embeddings = self.embed_batch_raw_inner(encodings, pooling, normalize)?;
             for (i, embedding) in indices.iter().zip(embeddings) {
                 combined[*i] = Some(embedding);
             }
@@ -435,6 +445,7 @@ impl Bert {
         &self,
         mut tokens: Vec<Encoding>,
         pooling: Pooling,
+        normalize: bool,
     ) -> Result<Vec<Tensor<2, f32>>, BertError> {
         if tokens.is_empty() {
             return Ok(Vec::new());
@@ -484,13 +495,19 @@ impl Bert {
                 // Cast mask u32→f32, unsqueeze to [batch, seq_len, 1] for broadcasting
                 let mask_f32: Tensor<2, f32> = attention_mask.cast();
                 let mask_3d: Tensor<3, f32, _> = mask_f32.unsqueeze(2).to_concrete();
+                // Broadcast mask to match embedding shape [batch, seq, hidden]
+                let mask_3d: Tensor<3, f32> = mask_3d.broadcast_as(shape).to_concrete();
                 // Zero out padding positions, sum along seq dim → [batch, hidden_dim]
                 let masked_embeddings = (embeddings * mask_3d).to_concrete();
                 let summed = masked_embeddings.sum::<2>(1);
                 // Divide by valid token count [batch, 1] — broadcasts with [batch, hidden_dim]
                 let valid_count = mask_f32.sum_keepdim::<1>(1);
                 let embeddings = summed.div_(&valid_count);
-                let embeddings = normalize_l2(&embeddings);
+                let embeddings = if normalize {
+                    normalize_l2(&embeddings)
+                } else {
+                    embeddings
+                };
                 Ok(embeddings
                     .chunk(n_sentences, 0)
                     .into_iter()
@@ -509,7 +526,11 @@ impl Bert {
             Pooling::Last => {
                 // With left padding, the last token is always at the final position
                 let indexed_embeddings = embeddings.to_concrete().i((.., n_tokens - 1, ..));
-                let normalized = normalize_l2(&indexed_embeddings);
+                let normalized = if normalize {
+                    normalize_l2(&indexed_embeddings)
+                } else {
+                    indexed_embeddings
+                };
                 Ok(normalized
                     .chunk(n_sentences, 0)
                     .into_iter()

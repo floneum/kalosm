@@ -1,0 +1,32 @@
+[package]
+name = "rgliner"
+version = "0.4.0"
+edition = "2021"
+description = "GLiNER bi-encoder Named Entity Recognition for Rust"
+license = "MIT/Apache-2.0"
+repository = "https://github.com/floneum/floneum"
+authors = ["Evan Almloff <evanalmloff@gmail.com>"]
+keywords = ["ai", "ner", "nlp", "gliner", "transformers"]
+
+[dependencies]
+fusor = { workspace = true, default-features = false }
+tokenizers = { workspace = true, features = ["fancy-regex"] }
+thiserror.workspace = true
+rbert = { workspace = true }
+
+serde_json = "1.0.106"
+serde = { version = "1", features = ["derive"] }
+
+kalosm-common = { workspace = true }
+kalosm-model-types.workspace = true
+kalosm-language-model.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+
+[features]
+default = ["cpu", "gpu"]
+cpu = ["fusor/cpu", "rbert/cpu"]
+gpu = ["fusor/gpu", "rbert/gpu"]

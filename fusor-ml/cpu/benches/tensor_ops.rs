@@ -1,5 +1,6 @@
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fusor_cpu::__private::{Abs, Add, ConcreteTensor, Div, Mul, Neg, Sqrt, Sub, TensorBacking};
+use std::hint::black_box;
 
 const SIZES: &[usize] = &[64, 256];
 

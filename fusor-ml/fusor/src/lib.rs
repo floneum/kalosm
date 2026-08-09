@@ -29,8 +29,10 @@ pub use quantized::{CpuF32Tensor, QMatrix};
 use std::ops::{Deref, Range};
 
 pub use composite::{
-    MaskKind, RopeCache, ToVec, ToVec1, ToVec2, ToVec3, arange, arange_step,
-    base_inverse_frequency, cat, stack,
+    AttentionBias, AttentionVariant, FeedForwardVariant, GatedActivation, GroupedAttention,
+    LlamaFeedForward, MaskKind, Norm, PhiFeedForward, RopeCache, RopeLike, SeparateAttention,
+    ToVec, ToVec1, ToVec2, ToVec3, TransformerBlock, arange, arange_step, base_inverse_frequency,
+    cat, forward_attention_qkv_f32, stack,
 };
 pub use device::Device;
 pub use error::Error;

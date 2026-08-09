@@ -1,8 +1,9 @@
 use aligned_vec::AVec;
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fusor_cpu::__private::{ConcreteTensor, QuantizedTensor, TypedTensor};
 use fusor_cpu::BlockQ8_0;
 use half::f16;
+use std::hint::black_box;
 
 /// Helper to create a Q8_0 block from scale and data
 fn make_q8_0_block(scale: f32, data: [i8; 32]) -> BlockQ8_0 {

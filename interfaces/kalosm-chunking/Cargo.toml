@@ -1,0 +1,12 @@
+[package]
+name = "kalosm-chunking"
+version = "0.4.0"
+edition = "2021"
+description = "Text chunking primitives (sentence, paragraph, word) with language-aware sentence splitting"
+license = "MIT/Apache-2.0"
+repository = "https://github.com/floneum/floneum"
+authors = ["Evan Almloff <evanalmloff@gmail.com>"]
+
+[dependencies]
+srx = { version = "0.1.4", features = ["from_xml"] }
+whatlang = "0.16.3"

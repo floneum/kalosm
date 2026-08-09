@@ -36,11 +36,11 @@ docx-rs = { version = "0.4.7", optional = true }
 lopdf = { version = "0.35.0", features = ["async"], optional = true }
 convert_case = { version = "0.6.0", optional = true }
 kalosm-sample = { workspace = true }
+kalosm-chunking = { workspace = true, optional = true }
 ego-tree = { version = "0.6.2", optional = true }
 image = { version = "0.24.7", optional = true }
 whatlang = { version = "0.16.3", optional = true }
 texting_robots = { version = "0.2.2", optional = true }
-srx = { version = "0.1.4", features = ["from_xml"], optional = true }
 thiserror = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 roaring = { version = "0.10.6", optional = true }
@@ -74,7 +74,7 @@ chunking = [
     "documents",
     "dep:ego-tree",
     "dep:scraper",
-    "dep:srx",
+    "dep:kalosm-chunking",
     "dep:thiserror",
 ]
 vector-db = [
