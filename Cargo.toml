@@ -398,3 +398,10 @@ opt-level = 3
 [patch."https://github.com/ealmloff/wgpu"]
 naga = { path = "../wgpu-fusor/naga" }
 wgpu = { path = "../wgpu-fusor/wgpu" }
+
+# fusor2-verified's kernels need released naga 29 plus one correctness patch
+# (`CooperativeLoad` in `bake_ref_count`, so a simdgroup load cannot sink past
+# its barrier). Patch tables only apply from the build root, so the vendored
+# copy is named here as well as in fusor2-verified's own workspace.
+[patch.crates-io]
+naga = { path = "fusor2-verified/vendor/naga" }
