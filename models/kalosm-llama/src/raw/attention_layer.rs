@@ -223,6 +223,7 @@ impl SeparateAttention {
         hidden_states: &Tensor,
         rope_cache: &RopeImplementation,
         start_pos: usize,
+        positions: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (b_sz, seq_len) = match &hidden_states.shape()[..] {
             [Dim::Const(b), Dim::Const(s), _] => (*b as usize, *s as usize),
@@ -265,7 +266,8 @@ impl SeparateAttention {
         }
         let value = split_heads(&value_states, b_sz, seq_len, num_key_value_heads, head_dim)?;
 
-        let (query, key) = rope_cache.forward(&query, &key, start_pos, self.interleaved_rope)?;
+        let (query, key) =
+            rope_cache.forward(&query, &key, start_pos, self.interleaved_rope, positions)?;
         Ok((query, key, value))
     }
 }
@@ -284,6 +286,7 @@ impl GroupedAttention {
         x: &Tensor,
         rope_cache: &RopeImplementation,
         start_pos: usize,
+        positions: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (b_sz, seq_len) = match &x.shape()[..] {
             [Dim::Const(b), Dim::Const(s), _] => (*b as usize, *s as usize),
@@ -301,7 +304,8 @@ impl GroupedAttention {
         let key = split_heads(&key_states, b_sz, seq_len, num_key_value_heads, head_dim)?;
         let value = split_heads(&value_states, b_sz, seq_len, num_key_value_heads, head_dim)?;
 
-        let (query, key) = rope_cache.forward(&query, &key, start_pos, self.interleaved_rope)?;
+        let (query, key) =
+            rope_cache.forward(&query, &key, start_pos, self.interleaved_rope, positions)?;
         Ok((query, key, value))
     }
 }
@@ -328,6 +332,7 @@ impl LlamaAttention {
         hidden_states: &Tensor,
         mask: (MaskKind, Option<&Tensor>),
         start_pos: usize,
+        positions: Option<&Tensor>,
         cache: Option<&mut KvCache>,
     ) -> Result<Tensor> {
         let (b_sz, q_len) = match &hidden_states.shape()[..] {
@@ -347,6 +352,7 @@ impl LlamaAttention {
                 hidden_states,
                 &self.rope_cache,
                 start_pos,
+                positions,
             )?,
             AttentionVariant::Grouped(ref attention) => attention.forward(
                 num_heads,
@@ -355,12 +361,19 @@ impl LlamaAttention {
                 hidden_states,
                 &self.rope_cache,
                 start_pos,
+                positions,
             )?,
         };
 
         let mut cache = cache;
         let (key_states, value_states) = match cache.as_deref_mut() {
             None => (key_states, value_states),
+            Some(cache) if cache.is_fixed() => {
+                // Fixed mode: the append is a scatter into a persistent
+                // buffer; a windowed layer is a ring, so eviction is the
+                // write itself and no keep_last runs.
+                cache.append(&key_states, &value_states)?
+            }
             Some(cache) => {
                 // The first append stores the value itself, and ours is a
                 // transpose/narrow *view* of the projection — a pure view
@@ -401,8 +414,10 @@ impl LlamaAttention {
         // materialized mask already bounded what each query saw.
         if q_len > 1 {
             if let (Some(window), Some(cache)) = (self.sliding_window_size, cache.as_deref_mut()) {
-                cache.k.keep_last(window as u64)?;
-                cache.v.keep_last(window as u64)?;
+                if !cache.is_fixed() {
+                    cache.k.keep_last(window as u64)?;
+                    cache.v.keep_last(window as u64)?;
+                }
             }
         }
 

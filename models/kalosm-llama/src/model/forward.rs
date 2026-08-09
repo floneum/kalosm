@@ -50,13 +50,10 @@ impl LlamaModel {
             );
         }
         let logits = logits.map_err(LlamaModelError::from)?;
-        // Cut the KV cache off this step's producers so the next step plans
-        // only its own launches instead of the whole generation history.
-        if let Some(cache) = cache.as_deref_mut() {
-            model
-                .detach_kv_cache(cache, device, &logits)
-                .map_err(LlamaModelError::from)?;
-        }
+        // The KV caches were resolved and committed inside `forward`: each
+        // step's scatter output buffer was adopted by its cache leaf, so the
+        // next step reuses the same graph — no detach, no host round trip.
+        let _ = &cache;
         // The logits are `[1, vocab]`; row-major readback is the flat row.
         let len = logits
             .dim(logits.rank() - 1)

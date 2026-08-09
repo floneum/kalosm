@@ -1,5 +1,8 @@
 use super::{LlamaConfig, RopeScalingConfig};
-use fusor2::composite::rope::{rope_normal_pair_fused, rope_pair_fused};
+use fusor2::composite::rope::{
+    rope_normal_pair_fused, rope_normal_pair_fused_with_position, rope_pair_fused,
+    rope_pair_fused_with_position,
+};
 use fusor2::device::Device;
 use fusor2::graph::Graph;
 use fusor2::tensor::Tensor;
@@ -88,17 +91,27 @@ impl RopeImplementation {
 
     /// Rotate `q` and `k` at `start_pos`. `interleaved` pairs `(2i, 2i+1)`
     /// (the classic llama layout); otherwise halves `(i, i + Dh/2)`.
+    ///
+    /// `positions` is the decode-loop form: a rank-1 `u32` position tensor
+    /// whose *bytes* change per step, so one graph serves every step. The
+    /// host offset is a fallback for position-less callers.
     pub fn forward(
         &self,
         query: &Tensor,
         key: &Tensor,
         start_pos: usize,
         interleaved: bool,
+        positions: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
-        if interleaved {
-            rope_pair_fused(query, key, &self.cos, &self.sin, start_pos as u64)
-        } else {
-            rope_normal_pair_fused(query, key, &self.cos, &self.sin, start_pos as u64)
+        match (positions, interleaved) {
+            (Some(p), true) => rope_pair_fused_with_position(query, key, &self.cos, &self.sin, p),
+            (Some(p), false) => {
+                rope_normal_pair_fused_with_position(query, key, &self.cos, &self.sin, p)
+            }
+            (None, true) => rope_pair_fused(query, key, &self.cos, &self.sin, start_pos as u64),
+            (None, false) => {
+                rope_normal_pair_fused(query, key, &self.cos, &self.sin, start_pos as u64)
+            }
         }
     }
 }

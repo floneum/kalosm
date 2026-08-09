@@ -71,6 +71,10 @@ pub struct Model {
     output: QMatrix,
     /// Memoizes the materialized (rectangular / windowed) masks.
     masks: Mutex<MaskCache>,
+    /// The decode loop's persistent input leaves: the token id and its
+    /// absolute position, both `[1]` `u32`. Only their *bytes* change per
+    /// step, so every step reuses one graph and replays one plan.
+    step_inputs: std::sync::OnceLock<(Tensor, Tensor)>,
 }
 
 /// The embedded token inputs produced by [`Model::encode_tokens`], ready to be
@@ -420,17 +424,19 @@ impl Model {
             norm,
             output,
             masks: Mutex::new(MaskCache::new()),
+            step_inputs: std::sync::OnceLock::new(),
         })
     }
 
-    pub fn encode_tokens(
+    /// The context-window bookkeeping half of `encode_tokens`: which tokens
+    /// to run and at which absolute starting position, with the cache's
+    /// token record updated (and the cache cleared when the window overflows).
+    fn plan_tokens(
         &self,
         raw_tokens: &[u32],
-        device: &Device,
         mut cache: Option<&mut LlamaCache>,
-    ) -> Result<EncodedTokens> {
+    ) -> Result<(Vec<u32>, usize)> {
         let tokens = raw_tokens.to_vec();
-
         let mut seq_len = tokens.len();
         let cached_tokens = cache.as_ref().map(|c| c.tokens.len()).unwrap_or_default();
         // We use a lower cutoff than the context length to avoid recomputing the attention every single token
@@ -463,7 +469,18 @@ impl Model {
             }
             (tokens, index_pos)
         };
+        let _ = seq_len;
+        Ok((tokens, index_pos))
+    }
 
+    pub fn encode_tokens(
+        &self,
+        raw_tokens: &[u32],
+        device: &Device,
+        cache: Option<&mut LlamaCache>,
+    ) -> Result<EncodedTokens> {
+        let (tokens, index_pos) = self.plan_tokens(raw_tokens, cache)?;
+        let seq_len = tokens.len();
         let ids = Tensor::from_elements(
             device.graph().handle(),
             &[Dim::Const(tokens.len() as u64)],
@@ -514,9 +531,111 @@ impl Model {
         &self,
         tokens: &[u32],
         device: &Device,
-        cache: Option<&mut LlamaCache>,
+        mut cache: Option<&mut LlamaCache>,
     ) -> Result<Tensor> {
+        if cache.as_ref().is_some_and(|c| c.blocks.first().is_some_and(|b| b.is_fixed())) {
+            let cache = cache.as_deref_mut().expect("checked above");
+            let (steps, index_pos) = self.plan_tokens(tokens, Some(cache))?;
+            let n = steps.len();
+            let mut logits = None;
+            for (i, tok) in steps.iter().enumerate() {
+                let want_logits = i + 1 == n;
+                let out = self.decode_step(*tok, index_pos + i, device, cache, want_logits)?;
+                // One resolve per step: this step's KV writes (always) plus
+                // the logits on the sampled step. Then every cache adopts its
+                // written buffer so the *same* graph runs the next step.
+                let mut batch = Vec::with_capacity(2 * cache.blocks.len() + 1);
+                if want_logits {
+                    batch.push(out.clone());
+                }
+                for block in &cache.blocks {
+                    block.pending_into(&mut batch);
+                }
+                device.session().resolve(&batch)?;
+                for block in &mut cache.blocks {
+                    block.commit()?;
+                }
+                if want_logits {
+                    logits = Some(out);
+                }
+            }
+            return logits.ok_or_else(|| fusor2::Error::Shape("forward of no tokens".into()));
+        }
         let hidden = self.forward_last_hidden_f32(tokens, device, cache)?;
+        self.output.q_mat_mul(&hidden)
+    }
+
+    /// One decode-shaped step: token `token` at absolute `position`, one
+    /// query against the (symbolic-length) caches. The graph this builds is
+    /// **identical** across steps — same leaves, same nodes — so from step
+    /// two on, saturation and extraction are replays and the plan is reused;
+    /// only leaf bytes and the length bindings change.
+    fn decode_step(
+        &self,
+        token: u32,
+        position: usize,
+        device: &Device,
+        cache: &mut LlamaCache,
+        want_logits: bool,
+    ) -> Result<Tensor> {
+        let graph = device.graph().clone();
+        let (ids, pos) = self
+            .step_inputs
+            .get_or_init(|| {
+                let ids = graph
+                    .leaf("decode_ids", &[Dim::Const(1)], Dtype::U32)
+                    .expect("a fresh leaf on a live graph");
+                let pos = graph
+                    .leaf("decode_pos", &[Dim::Const(1)], Dtype::U32)
+                    .expect("a fresh leaf on a live graph");
+                (ids, pos)
+            })
+            .clone();
+        ids.set_bytes(token.to_le_bytes().to_vec())?;
+        pos.set_bytes((position as u32).to_le_bytes().to_vec())?;
+
+        let mut layer_in = self.tok_embeddings.index_select_rows(&ids)?.unsqueeze(0)?;
+        if let Some(scale) = self.tok_embedding_scale {
+            layer_in = layer_in.mul_scalar(scale)?;
+        }
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let residual = layer_in.clone();
+            let x = layer.attention_norm.forward(&layer_in)?;
+            // One query sees every cached key: structurally maskless.
+            let mut attn = layer.forward(
+                &x,
+                (MaskKind::None, None),
+                position,
+                Some(&pos),
+                Some(&mut cache.blocks[i]),
+            )?;
+            if let Some(post_attention_norm) = &layer.post_attention_norm {
+                attn = post_attention_norm.forward(&attn)?;
+            }
+            let x = layer.ffn_norm.forward_residual(&attn, &residual)?;
+            if layer.post_ffn_norm.is_none() {
+                if let Some(layer_out) = layer
+                    .feed_forward_variant
+                    .forward_add_residuals(&x, &attn, &residual)?
+                {
+                    layer_in = layer_out;
+                    continue;
+                }
+            }
+            let mut x = layer.feed_forward_variant.forward(&x)?;
+            if let Some(post_ffn_norm) = &layer.post_ffn_norm {
+                x = post_ffn_norm.forward(&x)?;
+            }
+            layer_in = x.add(&attn)?.add(&residual)?;
+        }
+        if !want_logits {
+            // A prefill step's product is its KV writes; the head is not run.
+            return Ok(layer_in);
+        }
+        let x = self.norm.forward(&layer_in)?;
+        let hidden_size = x.dim(2);
+        let hidden = x.reshape_dims(&[Dim::Const(1), hidden_size])?;
         self.output.q_mat_mul(&hidden)
     }
 
@@ -585,6 +704,7 @@ impl Model {
                 &x,
                 (mask.0, mask.1.as_ref()),
                 index_pos,
+                None,
                 cache_block,
             )?;
             if let Some(post_attention_norm) = &layer.post_attention_norm {
@@ -620,38 +740,5 @@ impl Model {
     #[allow(dead_code)]
     pub(crate) fn output_matrix(&self) -> &QMatrix {
         &self.output
-    }
-
-    /// Re-leaf the KV cache after a step so the next step's graph does not
-    /// chain back through the whole generation history. Without this, every
-    /// decode step's plan reaches (and rebuilds, and re-dispatches) every
-    /// launch since the prompt — quadratic in generated tokens. `anchor` is
-    /// this step's logits; resolving it together with the cache tensors makes
-    /// the detach readbacks pure downloads.
-    pub(crate) fn detach_kv_cache(
-        &self,
-        cache: &mut LlamaCache,
-        device: &Device,
-        anchor: &Tensor,
-    ) -> Result<()> {
-        let mut batch: Vec<Tensor> = vec![anchor.clone()];
-        for block in &cache.blocks {
-            if let Some(k) = block.k.current() {
-                batch.push(k.clone());
-            }
-            if let Some(v) = block.v.current() {
-                batch.push(v.clone());
-            }
-        }
-        device.session().resolve(&batch)?;
-        for block in &mut cache.blocks {
-            if let Some(k) = block.k.current().cloned() {
-                block.k.data = Some(k.detach()?);
-            }
-            if let Some(v) = block.v.current().cloned() {
-                block.v.data = Some(v.detach()?);
-            }
-        }
-        Ok(())
     }
 }
