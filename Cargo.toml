@@ -44,12 +44,11 @@ members = [
 ]
 # `fusor2` is a standalone crate with its own `[workspace]`; keep the parent
 # workspace from trying to absorb it.
-exclude = ["fusor2"]
+exclude = ["fusor2", "fusor2-verified"]
 
-[patch.crates-io]
-# Local checkout of the wgpu fork while the mixed-precision cooperative-MMA
-# extension bakes (f16 operands with f32 accumulators in the MSL writer).
-wgpu = { path = "../wgpu-fusor/wgpu" }
+# fusor-ml reaches the local wgpu fork through the
+# `[patch."https://github.com/ealmloff/wgpu"]` section below; crates-io wgpu
+# (used by fusor2-verified) stays on the released 29.x so its naga types match.
 
 [workspace.dependencies]
 kalosm = { path = "./interfaces/kalosm", version = "0.4.0", default-features = false }

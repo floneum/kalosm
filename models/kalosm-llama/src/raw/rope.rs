@@ -1,23 +1,22 @@
 use super::{LlamaConfig, RopeScalingConfig};
-use fusor::{
-    arange, base_inverse_frequency, CastTensor, CastTo, DataType, Device, FloatDataType,
-    SimdElement, Tensor,
-};
+use fusor2::composite::rope::{rope_normal_pair_fused, rope_pair_fused};
+use fusor2::device::Device;
+use fusor2::graph::Graph;
+use fusor2::tensor::Tensor;
+use fusor2::{Dtype, Result};
+use fusor2::Dim;
 use std::f32::consts::PI;
-use std::sync::{Arc, Mutex};
 
-pub(crate) fn create_inverse_frequency<F>(
+/// The base `1 / theta^(2i/dim)` frequencies with the llama3-style scaling and
+/// the optional per-frequency GGUF weights (`rope_freqs.weight`) applied.
+pub(crate) fn create_inverse_frequency(
     rope_scaling: Option<&RopeScalingConfig>,
-    rope_freq_weight: Option<&Tensor<1, F>>,
+    rope_freq_weight: Option<&[f32]>,
     dim: usize,
     rope_theta: f32,
-    device: &Device,
-) -> Tensor<2, F>
-where
-    F: FloatDataType + SimdElement + CastTo<f32> + CastTensor<f32>,
-    f32: CastTo<F> + CastTensor<F>,
-{
-    let mut inverse_frequency = base_inverse_frequency(dim, rope_theta);
+) -> Vec<f32> {
+    let mut inverse_frequency =
+        fusor2::composite::rope::base_inverse_frequency(dim as u32, rope_theta);
     if let Some(scaling_config) = &rope_scaling {
         let original_max_position_embeddings = scaling_config.original_max_position_embeddings;
         let factor = scaling_config.factor;
@@ -36,294 +35,70 @@ where
             }
         }
     }
-    let inverse_frequency_len = inverse_frequency.len();
-    let mut inverse_frequency_f32: Tensor<2, f32> = Tensor::new(device, &inverse_frequency)
-        .reshape([1, inverse_frequency_len])
-        .to_concrete();
-    if let Some(weight) = &rope_freq_weight {
-        let weight_f32: Tensor<1, f32> = weight.cast();
-        inverse_frequency_f32 =
-            (inverse_frequency_f32 * weight_f32.reshape((1, ())).to_concrete()).to_concrete();
+    if let Some(weight) = rope_freq_weight {
+        for (freq, w) in inverse_frequency.iter_mut().zip(weight.iter()) {
+            *freq *= w;
+        }
     }
-
-    inverse_frequency_f32.cast()
+    inverse_frequency
 }
 
+/// A `[context, head_dim / 2]` sin/cos table over custom inverse frequencies,
+/// consumed by `fusor2::composite::rope`.
 #[derive(Clone)]
-pub(crate) enum RopeImplementation<F: FloatDataType + SimdElement = f32> {
-    QwenVL(QwenVLRopeCache<F>),
-    Llama(fusor::RopeCache),
+pub(crate) struct RopeImplementation {
+    cos: Tensor,
+    sin: Tensor,
 }
 
-impl<F: FloatDataType + SimdElement> RopeImplementation<F>
-where
-    F: CastTo<f32> + CastTensor<f32>,
-    f32: CastTo<F> + CastTensor<F>,
-{
-    pub fn new(config: &LlamaConfig<F>, rope_theta: f32, device: &Device) -> fusor::Result<Self> {
-        if let Some(mrope_sections) = &config.mrope_sections {
-            let cache = QwenVLRopeCache::new(config, rope_theta, mrope_sections, device)?;
-            Ok(Self::QwenVL(cache))
-        } else {
-            let inverse_frequency: Tensor<2, F> = create_inverse_frequency(
-                config.rope_scaling.as_ref(),
-                config.rope_freq_weight.as_ref(),
-                config.head_dimension,
-                rope_theta,
-                device,
-            );
-            let inverse_frequency_f32: Tensor<2, f32> = inverse_frequency.cast();
-            let context_indices: Tensor<2, f32> =
-                arange(device, 0f32, config.context_length as f32)
-                    .reshape([config.context_length, 1])
-                    .to_concrete();
-            let outer_product = context_indices.mat_mul(&inverse_frequency_f32);
-            let sin = outer_product.sin().to_concrete();
-            let cos = outer_product.cos().to_concrete();
-            Ok(Self::Llama(fusor::RopeCache::from_parts(cos, sin)))
-        }
-    }
-
-    pub fn forward(
-        &self,
-        query: &Tensor<4, F>,
-        key: &Tensor<4, F>,
-        start_pos: usize,
-        position_ids: Option<&Tensor<2, F>>,
-        interleaved_rope: bool,
-    ) -> (Tensor<4, F>, Tensor<4, F>) {
-        match self {
-            Self::QwenVL(cache) => cache.forward(
-                position_ids.expect("qwen vl requires position ids"),
-                query,
-                key,
-            ),
-            Self::Llama(cache) => {
-                let q_f32: Tensor<4, f32> = query.cast();
-                let k_f32: Tensor<4, f32> = key.cast();
-                let (q_out, k_out) = if interleaved_rope {
-                    cache.forward_interleaved(&q_f32, &k_f32, start_pos)
-                } else {
-                    cache.forward(&q_f32, &k_f32, start_pos)
-                };
-                (q_out.cast(), k_out.cast())
-            }
-        }
-    }
-}
-
-pub(crate) struct QwenVLRopeCache<F: FloatDataType + SimdElement = f32> {
-    inverse_frequency: Tensor<2, F>,
-    mrope_sections: Vec<usize>,
-    // Per-forward-pass memoization. The (cos, sin) returned by
-    // `forward_sin_cos` depends only on `position_ids`; the same tensor is
-    // re-used across every attention layer in a single forward pass, so
-    // recomputing per layer would re-emit ~6 slice_assigns + a matmul + 2
-    // trig kernels per layer (35+ wasted dispatches at 36 layers). Identity
-    // is keyed on the GPU NodeIndex via `key()` because Tensor itself
-    // doesn't implement Hash/Eq, but identical pos_ids tensors always share
-    // their compute-graph key within a pass.
-    // Arc-shared so every layer in the model points at the same memo table:
-    // attention layers clone their `RopeImplementation`, but we want one
-    // cache that fills on the first layer and serves the rest.
-    cached: Arc<Mutex<Option<QwenVLRopeCacheEntry>>>,
-}
-
-type QwenVLRopeCacheEntry = (u64, Tensor<2, f32>, Tensor<2, f32>);
-
-impl<F: FloatDataType + SimdElement> Clone for QwenVLRopeCache<F> {
-    fn clone(&self) -> Self {
-        Self {
-            inverse_frequency: self.inverse_frequency.clone(),
-            mrope_sections: self.mrope_sections.clone(),
-            cached: Arc::clone(&self.cached),
-        }
-    }
-}
-
-impl<F: FloatDataType + SimdElement> QwenVLRopeCache<F>
-where
-    F: CastTo<f32> + CastTensor<f32>,
-    f32: CastTo<F> + CastTensor<F>,
-{
-    pub fn new(
-        config: &LlamaConfig<F>,
-        rope_theta: f32,
-        mrope_sections: &[usize],
-        device: &Device,
-    ) -> fusor::Result<Self> {
+impl RopeImplementation {
+    pub fn new(config: &LlamaConfig, rope_theta: f32, device: &Device) -> Result<Self> {
         let inverse_frequency = create_inverse_frequency(
             config.rope_scaling.as_ref(),
-            config.rope_freq_weight.as_ref(),
+            config.rope_freq_weight.as_deref(),
             config.head_dimension,
             rope_theta,
-            device,
         );
-        let mrope_sections = mrope_sections.iter().copied().filter(|&x| x > 0).collect();
+        Self::from_inverse_frequency(&inverse_frequency, config.context_length, device.graph())
+    }
+
+    pub(crate) fn from_inverse_frequency(
+        inverse_frequency: &[f32],
+        context_length: usize,
+        graph: &Graph,
+    ) -> Result<Self> {
+        let half = inverse_frequency.len();
+        let mut sin = Vec::with_capacity(context_length * half * 4);
+        let mut cos = Vec::with_capacity(context_length * half * 4);
+        for pos in 0..context_length {
+            for f in inverse_frequency {
+                // Accumulate the angle in f64: at large positions an f32
+                // product has already lost the low bits.
+                let angle = pos as f64 * *f as f64;
+                sin.extend_from_slice(&(angle.sin() as f32).to_le_bytes());
+                cos.extend_from_slice(&(angle.cos() as f32).to_le_bytes());
+            }
+        }
+        let shape = [Dim::Const(context_length as u64), Dim::Const(half as u64)];
         Ok(Self {
-            inverse_frequency,
-            mrope_sections,
-            cached: Arc::new(Mutex::new(None)),
+            sin: graph.tensor(Dtype::F32, &shape, &sin)?,
+            cos: graph.tensor(Dtype::F32, &shape, &cos)?,
         })
     }
 
-    fn position_ids_key(position_ids: &Tensor<2, F>) -> Option<u64> {
-        match position_ids {
-            Tensor::Gpu(g) => Some(g.key().index() as u64),
-            Tensor::Cpu(_) => None,
-        }
-    }
-
-    fn forward_sin_cos(&self, position_ids: &Tensor<2, F>) -> (Tensor<2, f32>, Tensor<2, f32>) {
-        let key = Self::position_ids_key(position_ids);
-        if let Some(k) = key {
-            if let Ok(guard) = self.cached.lock() {
-                if let Some((cached_key, cos, sin)) = guard.as_ref() {
-                    if *cached_key == k {
-                        return (cos.clone(), sin.clone());
-                    }
-                }
-            }
-        }
-        let (cos, sin) = self.compute_sin_cos(position_ids);
-        if let Some(k) = key {
-            if let Ok(mut guard) = self.cached.lock() {
-                *guard = Some((k, cos.clone(), sin.clone()));
-            }
-        }
-        (cos, sin)
-    }
-
-    fn compute_sin_cos(&self, position_ids: &Tensor<2, F>) -> (Tensor<2, f32>, Tensor<2, f32>) {
-        // Work in f32 for SIMD compatibility
-        let inv_freq_f32: Tensor<2, f32> = self.inverse_frequency.cast();
-        let position_ids_f32: Tensor<2, f32> = position_ids.cast();
-
-        let inv_freq_expanded = inv_freq_f32
-            .reshape(((),))
-            .repeat([3])
-            .reshape((3, 1, (), 1))
-            .to_concrete();
-        let position_ids_expanded = position_ids_f32.unsqueeze(1).unsqueeze(1).to_concrete();
-        let freqs = inv_freq_expanded
-            .mat_mul(&position_ids_expanded)
-            .transpose(2, 3)
-            .to_concrete();
-        let cos = freqs.cos().to_concrete();
-        let sin = freqs.sin().to_concrete();
-
-        // Resolve dimension for cat
-        // cos/sin are 4D: [3, batch, seq, head_dim]
-        // After i(m, (i % 3, .., .., ..)), result is 3D: [batch, seq, split_size]
-        // So we cat on dimension 2 (the last dimension of the 3D result)
-        let last_dim_4d = cos.shape().len() - 1; // dimension 3 for splitting the 4D tensor
-        let last_dim_3d = last_dim_4d - 1; // dimension 2 for concatenating the 3D results
-
-        let cos = Tensor::cat(
-            split(&cos, last_dim_4d, &self.mrope_sections)
-                .iter()
-                .enumerate()
-                .map(|(i, m)| Tensor::<4, f32>::i(m, (i % 3, .., .., ..)).to_concrete())
-                .collect::<Vec<_>>(),
-            last_dim_3d,
-        )
-        .squeeze(0)
-        .to_concrete();
-        let sin = Tensor::cat(
-            split(&sin, last_dim_4d, &self.mrope_sections)
-                .iter()
-                .enumerate()
-                .map(|(i, m)| Tensor::<4, f32>::i(m, (i % 3, .., .., ..)).to_concrete())
-                .collect::<Vec<_>>(),
-            last_dim_3d,
-        )
-        .squeeze(0)
-        .to_concrete();
-
-        (cos, sin)
-    }
-
-    pub(crate) fn forward(
+    /// Rotate `q` and `k` at `start_pos`. `interleaved` pairs `(2i, 2i+1)`
+    /// (the classic llama layout); otherwise halves `(i, i + Dh/2)`.
+    pub fn forward(
         &self,
-        position_ids: &Tensor<2, F>,
-        query: &Tensor<4, F>,
-        key: &Tensor<4, F>,
-    ) -> (Tensor<4, F>, Tensor<4, F>) {
-        let (cos, sin) = self.forward_sin_cos(position_ids);
-        // Rope operations work in f32, then cast back. The fused pair kernel
-        // emits a single GPU dispatch covering both q and k — replaces the
-        // ~16 element-wise kernels per layer that the composite `rope` path
-        // generated (cat+neg+mul+add+slice_assign chain).
-        let query_f32: Tensor<4, f32> = query.cast();
-        let key_f32: Tensor<4, f32> = key.cast();
-        let (query_out, key_out) = query_f32.rope_normal_pair_fused(&key_f32, &cos, &sin);
-        (query_out.cast(), key_out.cast())
+        query: &Tensor,
+        key: &Tensor,
+        start_pos: usize,
+        interleaved: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        if interleaved {
+            rope_pair_fused(query, key, &self.cos, &self.sin, start_pos as u64)
+        } else {
+            rope_normal_pair_fused(query, key, &self.cos, &self.sin, start_pos as u64)
+        }
     }
-}
-
-fn split<const R: usize, T: DataType + SimdElement>(
-    tensor: &Tensor<R, T>,
-    dim: usize,
-    split_at: &[usize],
-) -> Vec<Tensor<R, T>> {
-    let mut result = Vec::new();
-    let mut start = 0;
-    for len in split_at.iter().copied() {
-        let slice = tensor.narrow(dim, start, len).to_concrete();
-        result.push(slice);
-        start += len;
-    }
-    result
-}
-
-#[cfg(test)]
-#[test]
-fn test_rope_cache() {
-    pollster::block_on(async {
-        use fusor::{Device, RopeCache, Tensor};
-
-        let config: LlamaConfig<f32> = LlamaConfig::mock_test();
-        let device = Device::new().await.unwrap();
-        let cache = RopeCache::new(
-            config.head_dimension,
-            config.context_length,
-            config.rope_theta,
-            &device,
-        )
-        .unwrap();
-
-        let expected_cos: Tensor<2, f32> = Tensor::new(
-            &device,
-            &[
-                1.0000f32, 0.5403f32, -0.4161f32, -0.9900f32, -0.6536f32, 0.2837f32,
-            ],
-        )
-        .reshape([6, 1])
-        .to_concrete();
-        let expected_sin: Tensor<2, f32> = Tensor::new(
-            &device,
-            &[
-                0.0000f32, 0.8415f32, 0.9093f32, 0.1411f32, -0.7568f32, -0.9589f32,
-            ],
-        )
-        .reshape([6, 1])
-        .to_concrete();
-
-        let cos_error: f32 = (cache.cos().clone() - expected_cos)
-            .abs()
-            .sum(0)
-            .sum(0)
-            .to_scalar()
-            .await
-            .unwrap();
-        assert!(cos_error < 1e-2);
-        let sin_error: f32 = (cache.sin().clone() - expected_sin)
-            .abs()
-            .sum(0)
-            .sum(0)
-            .to_scalar()
-            .await
-            .unwrap();
-        assert!(sin_error < 1e-2);
-    })
 }

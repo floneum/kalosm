@@ -4,10 +4,6 @@ use std::{
 };
 
 use crate::{model::LlamaModelError, session::LlamaSessionLoadingError, Llama, LlamaSession};
-use fusor::{
-    AddOp, CastTensor, CastTo, FloatDataType, FloatOps, MatmulImpl, MulOp, SimdBinaryOp,
-    SimdElement, SimdReduceOp, SumOp,
-};
 #[cfg(feature = "structured")]
 use kalosm_language_model::StructuredTextCompletionModel;
 use kalosm_language_model::{
@@ -20,10 +16,10 @@ use kalosm_model_types::{WasmNotSend, WasmNotSendSync};
 use kalosm_sample::{CreateParserState, Parser};
 use minijinja::ErrorKind;
 
-fn get_new_tokens<F: FloatDataType + SimdElement>(
+fn get_new_tokens(
     messages: &[ChatMessage],
-    session: &mut LlamaChatSession<F>,
-    model: &Llama<F>,
+    session: &mut LlamaChatSession,
+    model: &Llama,
 ) -> Result<String, LlamaModelError> {
     let chat_template = model
         .config
@@ -55,32 +51,16 @@ fn get_new_tokens<F: FloatDataType + SimdElement>(
     Ok(new_text.to_string())
 }
 
-impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl> CreateChatSession
-    for Llama<F>
-where
-    F: CastTo<f32> + CastTensor<f32> + WasmNotSendSync + 'static,
-    f32: CastTo<F> + CastTensor<F>,
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
-{
+impl CreateChatSession for Llama {
     type Error = LlamaModelError;
-    type ChatSession = LlamaChatSession<F>;
+    type ChatSession = LlamaChatSession;
 
     fn new_chat_session(&self) -> Result<Self::ChatSession, Self::Error> {
         Ok(LlamaChatSession::new(self.new_session()?))
     }
 }
 
-impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl>
-    ChatModel<GenerationParameters> for Llama<F>
-where
-    F: CastTo<f32> + CastTensor<f32> + WasmNotSendSync + 'static,
-    f32: CastTo<F> + CastTensor<F>,
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
-{
+impl ChatModel<GenerationParameters> for Llama {
     fn add_messages_with_callback<'a>(
         &'a self,
         mut session: Self::ChatSession,
@@ -122,14 +102,9 @@ where
 }
 
 #[cfg(feature = "structured")]
-impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl, Constraints>
-    kalosm_language_model::StructuredChatModel<Constraints, GenerationParameters> for Llama<F>
+impl<Constraints>
+    kalosm_language_model::StructuredChatModel<Constraints, GenerationParameters> for Llama
 where
-    F: CastTo<f32> + CastTensor<f32> + WasmNotSendSync + 'static,
-    f32: CastTo<F> + CastTensor<F>,
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
     <Constraints as Parser>::Output: WasmNotSend,
     <Constraints as Parser>::PartialState: WasmNotSend,
     Constraints: CreateParserState + WasmNotSend + 'static,
@@ -194,12 +169,12 @@ where
 }
 
 /// A Llama chat session.
-pub struct LlamaChatSession<F: FloatDataType + SimdElement = f32> {
+pub struct LlamaChatSession {
     history: Vec<ChatMessage>,
-    session: LlamaSession<F>,
+    session: LlamaSession,
 }
 
-impl<F: FloatDataType + SimdElement> Clone for LlamaChatSession<F> {
+impl Clone for LlamaChatSession {
     fn clone(&self) -> Self {
         Self {
             history: self.history.clone(),
@@ -208,7 +183,7 @@ impl<F: FloatDataType + SimdElement> Clone for LlamaChatSession<F> {
     }
 }
 
-impl<F: FloatDataType + SimdElement> ChatSession for LlamaChatSession<F> {
+impl ChatSession for LlamaChatSession {
     type Error = LlamaSessionLoadingError;
 
     fn history(&self) -> Vec<ChatMessage> {
@@ -223,10 +198,10 @@ impl<F: FloatDataType + SimdElement> ChatSession for LlamaChatSession<F> {
     }
 }
 
-impl<F: FloatDataType + SimdElement> LlamaChatSession<F> {
+impl LlamaChatSession {
     #[allow(clippy::too_many_arguments)]
     /// Creates a new chat history.
-    fn new(session: LlamaSession<F>) -> Self {
+    fn new(session: LlamaSession) -> Self {
         Self {
             history: Vec::new(),
             session,

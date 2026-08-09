@@ -1,4 +1,3 @@
-use fusor_gguf::GgufReadError;
 use kalosm_common::CacheError;
 use kalosm_model_types::{FileLoadingProgress, FileSource};
 
@@ -90,12 +89,9 @@ pub enum LlamaSourceError {
     /// Could not find a specific entry in the gguf file.
     #[error("Could not find {0} in the gguf file")]
     MissingGgufEntry(String),
-    /// Failed to read the gguf file
-    #[error("Failed to read the gguf file: {0}")]
-    GgufRead(#[from] GgufReadError),
     /// An error occurred while loading the model onto the device.
     #[error("Failed to load the model onto the device: {0}")]
-    Device(#[from] fusor::Error),
+    Device(#[from] fusor2::Error),
     /// No stop token was found.
     #[error("No stop token was found")]
     NoStopToken,

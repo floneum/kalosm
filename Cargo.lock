@@ -2893,7 +2893,7 @@ dependencies = [
  "sanitize-filename",
  "tracing",
  "wasm-bindgen-futures",
- "wgpu",
+ "wgpu 29.0.4",
 ]
 
 [[package]]
@@ -4561,6 +4561,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fearless_simd"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
+
+[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4721,7 +4727,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
  "ureq 3.3.0",
- "wgpu",
+ "wgpu 29.0.3",
 ]
 
 [[package]]
@@ -4777,7 +4783,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
  "web-time",
- "wgpu",
+ "wgpu 29.0.3",
 ]
 
 [[package]]
@@ -4816,10 +4822,10 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "half",
- "naga",
+ "naga 29.0.3",
  "pollster",
  "rustc-hash 2.1.2",
- "wgpu",
+ "wgpu 29.0.3",
 ]
 
 [[package]]
@@ -4829,9 +4835,9 @@ dependencies = [
  "bytemuck",
  "fusor-tile-ir",
  "half",
- "naga",
+ "naga 29.0.3",
  "pollster",
- "wgpu",
+ "wgpu 29.0.3",
 ]
 
 [[package]]
@@ -4842,12 +4848,12 @@ dependencies = [
  "fusor-tile-ir",
  "libc",
  "lru 0.14.0",
- "naga",
+ "naga 29.0.3",
  "parking_lot",
  "rustc-hash 2.1.2",
  "serde",
  "tracing",
- "wgpu",
+ "wgpu 29.0.3",
 ]
 
 [[package]]
@@ -4870,6 +4876,117 @@ dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.2",
  "web-time",
+]
+
+[[package]]
+name = "fusor2"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "fusor2-autograd",
+ "fusor2-cost",
+ "fusor2-cpu",
+ "fusor2-gguf",
+ "fusor2-gpu",
+ "fusor2-ir",
+ "fusor2-tile",
+ "half",
+ "parking_lot",
+ "pollster",
+ "rustc-hash 2.1.2",
+ "smallvec 1.15.1",
+]
+
+[[package]]
+name = "fusor2-autograd"
+version = "0.1.0"
+dependencies = [
+ "fusor2-ir",
+ "half",
+ "rustc-hash 2.1.2",
+ "smallvec 1.15.1",
+]
+
+[[package]]
+name = "fusor2-cost"
+version = "0.1.0"
+dependencies = [
+ "fixedbitset 0.5.7",
+ "fusor2-ir",
+ "parking_lot",
+ "rustc-hash 2.1.2",
+ "serde",
+ "serde_json",
+ "smallvec 1.15.1",
+]
+
+[[package]]
+name = "fusor2-cpu"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "fearless_simd",
+ "fusor2-cost",
+ "fusor2-gguf",
+ "fusor2-ir",
+ "fusor2-tile",
+ "half",
+ "parking_lot",
+ "rustc-hash 2.1.2",
+ "smallvec 1.15.1",
+]
+
+[[package]]
+name = "fusor2-gguf"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "fusor2-ir",
+ "half",
+ "memmap2",
+ "rustc-hash 2.1.2",
+ "smallvec 1.15.1",
+]
+
+[[package]]
+name = "fusor2-gpu"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "fusor2-cost",
+ "fusor2-gguf",
+ "fusor2-ir",
+ "fusor2-tile",
+ "half",
+ "lru 0.14.0",
+ "naga 29.0.4",
+ "parking_lot",
+ "pollster",
+ "rustc-hash 2.1.2",
+ "smallvec 1.15.1",
+ "wgpu 29.0.4",
+]
+
+[[package]]
+name = "fusor2-ir"
+version = "0.1.0"
+dependencies = [
+ "fixedbitset 0.5.7",
+ "half",
+ "rustc-hash 2.1.2",
+ "smallvec 1.15.1",
+]
+
+[[package]]
+name = "fusor2-tile"
+version = "0.1.0"
+dependencies = [
+ "fixedbitset 0.5.7",
+ "fusor2-ir",
+ "half",
+ "parking_lot",
+ "rustc-hash 2.1.2",
+ "smallvec 1.15.1",
 ]
 
 [[package]]
@@ -5390,7 +5507,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.18",
- "windows 0.54.0",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -6529,8 +6646,8 @@ dependencies = [
  "ahash 0.8.12",
  "anyhow",
  "chrono",
- "fusor",
- "fusor-gguf",
+ "fusor2",
+ "fusor2-gguf",
  "futures-channel",
  "futures-util",
  "getrandom 0.3.4",
@@ -6947,6 +7064,9 @@ name = "lru"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f8cc7106155f10bdf99a6f379688f543ad6596a415375b36a59a054ceda1198"
+dependencies = [
+ "hashbrown 0.15.5",
+]
 
 [[package]]
 name = "lru-slab"
@@ -7395,6 +7515,32 @@ dependencies = [
  "once_cell",
  "rustc-hash 1.1.0",
  "serde",
+ "spirv",
+ "thiserror 2.0.18",
+ "unicode-ident",
+]
+
+[[package]]
+name = "naga"
+version = "29.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2bf919621e7975acb27d881bae2fb993e0d45c8e0446e85e6272971e00dc8df"
+dependencies = [
+ "arrayvec",
+ "bit-set 0.9.1",
+ "bitflags 2.13.0",
+ "cfg-if",
+ "cfg_aliases",
+ "codespan-reporting",
+ "half",
+ "hashbrown 0.16.1",
+ "hexf-parse",
+ "indexmap 2.14.0",
+ "libm",
+ "log",
+ "num-traits",
+ "once_cell",
+ "rustc-hash 1.1.0",
  "spirv",
  "thiserror 2.0.18",
  "unicode-ident",
@@ -12378,7 +12524,36 @@ dependencies = [
  "hashbrown 0.16.1",
  "js-sys",
  "log",
- "naga",
+ "naga 29.0.3",
+ "portable-atomic",
+ "profiling",
+ "raw-window-handle",
+ "smallvec 1.15.1",
+ "static_assertions",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu-core 29.0.3",
+ "wgpu-hal 29.0.3",
+ "wgpu-types 29.0.3",
+]
+
+[[package]]
+name = "wgpu"
+version = "29.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76e8840e1ba2881d4cbb18d2147627a56af426ff064c0401eb0c8410c6325d07"
+dependencies = [
+ "arrayvec",
+ "bitflags 2.13.0",
+ "bytemuck",
+ "cfg-if",
+ "cfg_aliases",
+ "document-features",
+ "hashbrown 0.16.1",
+ "js-sys",
+ "log",
+ "naga 29.0.4",
  "parking_lot",
  "portable-atomic",
  "profiling",
@@ -12388,9 +12563,9 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "wgpu-core",
- "wgpu-hal",
- "wgpu-types",
+ "wgpu-core 29.0.4",
+ "wgpu-hal 29.0.4",
+ "wgpu-types 29.0.4",
 ]
 
 [[package]]
@@ -12407,7 +12582,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "indexmap 2.14.0",
  "log",
- "naga",
+ "naga 29.0.3",
  "once_cell",
  "parking_lot",
  "portable-atomic",
@@ -12416,38 +12591,135 @@ dependencies = [
  "rustc-hash 1.1.0",
  "smallvec 1.15.1",
  "thiserror 2.0.18",
- "wgpu-core-deps-apple",
+ "wgpu-core-deps-apple 29.0.3",
+ "wgpu-core-deps-windows-linux-android 29.0.3",
+ "wgpu-hal 29.0.3",
+ "wgpu-naga-bridge 29.0.3",
+ "wgpu-types 29.0.3",
+]
+
+[[package]]
+name = "wgpu-core"
+version = "29.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f519832254e56965a9940c4af57dcb75f702b6f6fa4a0b172f685395843a4d7"
+dependencies = [
+ "arrayvec",
+ "bit-set 0.9.1",
+ "bit-vec 0.9.1",
+ "bitflags 2.13.0",
+ "bytemuck",
+ "cfg_aliases",
+ "document-features",
+ "hashbrown 0.16.1",
+ "indexmap 2.14.0",
+ "log",
+ "naga 29.0.4",
+ "once_cell",
+ "parking_lot",
+ "portable-atomic",
+ "profiling",
+ "raw-window-handle",
+ "rustc-hash 1.1.0",
+ "smallvec 1.15.1",
+ "thiserror 2.0.18",
+ "wgpu-core-deps-apple 29.0.4",
  "wgpu-core-deps-emscripten",
- "wgpu-core-deps-windows-linux-android",
- "wgpu-hal",
- "wgpu-naga-bridge",
- "wgpu-types",
+ "wgpu-core-deps-windows-linux-android 29.0.4",
+ "wgpu-hal 29.0.4",
+ "wgpu-naga-bridge 29.0.4",
+ "wgpu-types 29.0.4",
 ]
 
 [[package]]
 name = "wgpu-core-deps-apple"
 version = "29.0.3"
 dependencies = [
- "wgpu-hal",
+ "wgpu-hal 29.0.3",
+]
+
+[[package]]
+name = "wgpu-core-deps-apple"
+version = "29.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5e39e26c4c0e07589e67d18546cf79ff45383659fc72fca4dd293358a0347f3"
+dependencies = [
+ "wgpu-hal 29.0.4",
 ]
 
 [[package]]
 name = "wgpu-core-deps-emscripten"
-version = "29.0.3"
+version = "29.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01e09be551dc939498bdd5f6b2c66e55ab275dad25825267a08605a80fc9f0af"
 dependencies = [
- "wgpu-hal",
+ "wgpu-hal 29.0.4",
 ]
 
 [[package]]
 name = "wgpu-core-deps-windows-linux-android"
 version = "29.0.3"
 dependencies = [
- "wgpu-hal",
+ "wgpu-hal 29.0.3",
+]
+
+[[package]]
+name = "wgpu-core-deps-windows-linux-android"
+version = "29.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e592c1bbef6ad047647ae6e666ebd8cee7a32bb4544d9700ec96cbf73230257"
+dependencies = [
+ "wgpu-hal 29.0.4",
 ]
 
 [[package]]
 name = "wgpu-hal"
 version = "29.0.3"
+dependencies = [
+ "android_system_properties",
+ "arrayvec",
+ "ash",
+ "bit-set 0.9.1",
+ "bitflags 2.13.0",
+ "block2",
+ "bytemuck",
+ "cfg-if",
+ "cfg_aliases",
+ "gpu-allocator",
+ "gpu-descriptor",
+ "hashbrown 0.16.1",
+ "libc",
+ "libloading 0.8.9",
+ "log",
+ "naga 29.0.3",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-foundation",
+ "objc2-metal",
+ "objc2-quartz-core",
+ "once_cell",
+ "ordered-float",
+ "parking_lot",
+ "portable-atomic",
+ "portable-atomic-util",
+ "profiling",
+ "range-alloc",
+ "raw-window-handle",
+ "raw-window-metal",
+ "renderdoc-sys",
+ "smallvec 1.15.1",
+ "thiserror 2.0.18",
+ "wgpu-naga-bridge 29.0.3",
+ "wgpu-types 29.0.3",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+]
+
+[[package]]
+name = "wgpu-hal"
+version = "29.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97ace1c17727311c22a46e4e3faf56ea6de81af99dcc839bdfb54857b94d448d"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -12468,7 +12740,7 @@ dependencies = [
  "libc",
  "libloading 0.8.9",
  "log",
- "naga",
+ "naga 29.0.4",
  "ndk-sys 0.6.0+11769913",
  "objc2",
  "objc2-core-foundation",
@@ -12490,8 +12762,8 @@ dependencies = [
  "wasm-bindgen",
  "wayland-sys",
  "web-sys",
- "wgpu-naga-bridge",
- "wgpu-types",
+ "wgpu-naga-bridge 29.0.4",
+ "wgpu-types 29.0.4",
  "windows 0.62.2",
  "windows-core 0.62.2",
  "windows-result 0.4.1",
@@ -12501,13 +12773,37 @@ dependencies = [
 name = "wgpu-naga-bridge"
 version = "29.0.3"
 dependencies = [
- "naga",
- "wgpu-types",
+ "naga 29.0.3",
+ "wgpu-types 29.0.3",
+]
+
+[[package]]
+name = "wgpu-naga-bridge"
+version = "29.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95226013f547544b223281cd16a4fb549aa9dcb562adbda0faae4c73ffbbc161"
+dependencies = [
+ "naga 29.0.4",
+ "wgpu-types 29.0.4",
 ]
 
 [[package]]
 name = "wgpu-types"
 version = "29.0.3"
+dependencies = [
+ "bitflags 2.13.0",
+ "bytemuck",
+ "js-sys",
+ "log",
+ "raw-window-handle",
+ "web-sys",
+]
+
+[[package]]
+name = "wgpu-types"
+version = "29.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84bf84cd9ca8ca45e2b223a3868f1adf9bfc0c66aeac212e76ee7e40fdadf8f5"
 dependencies = [
  "bitflags 2.13.0",
  "bytemuck",

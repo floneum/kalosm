@@ -229,6 +229,7 @@ impl TokenOutputStream {
     }
 
     /// Get the tokens
+    #[allow(dead_code)]
     pub fn tokens(&self) -> &[u32] {
         &self.tokens
     }

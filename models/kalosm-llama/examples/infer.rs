@@ -1,4 +1,6 @@
-use fusor::Device;
+#![recursion_limit = "256"]
+
+use kalosm_llama::Device;
 use kalosm_llama::prelude::*;
 use std::io::Write;
 

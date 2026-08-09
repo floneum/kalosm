@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 // Native GPU reproduction for the decode-plan-cache gibberish bug.
 // Generates a short completion on the default (GPU) device and prints it, so
 // coherence can be eyeballed. Run with the cache on (default) vs off

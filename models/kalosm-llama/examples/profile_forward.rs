@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use kalosm_llama::prelude::*;
 use kalosm_model_types::ModelLoadingProgress;
 

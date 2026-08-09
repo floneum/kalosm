@@ -1,9 +1,3 @@
-use fusor::{
-    AddOp, CastTensor, CastTo, FloatDataType, FloatOps, MatmulImpl, MulOp, SimdBinaryOp,
-    SimdElement, SimdReduceOp, SumOp, WasmNotSend, WasmNotSync,
-};
-#[cfg(feature = "vision")]
-use kalosm_language_model::ContentChunk;
 use kalosm_language_model::MessageContent;
 use kalosm_sample::CreateParserState;
 use kalosm_sample::{LiteralParser, ParseStatus, Parser, ParserExt};
@@ -15,32 +9,16 @@ use crate::token_stream::TokenOutputStream;
 use crate::{LlamaModel, LlamaSession};
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn generate_structured<F, P: Parser>(
+pub(crate) async fn generate_structured<P: Parser>(
     prompt: MessageContent,
-    llm: &LlamaModel<F>,
-    session: &mut LlamaSession<F>,
+    llm: &LlamaModel,
+    session: &mut LlamaSession,
     parser: P,
     parser_state: P::PartialState,
     mut sampler: CpuSampler,
     mut on_token: impl FnMut(String) -> Result<(), LlamaModelError>,
     top_k: Option<usize>,
-) -> Result<P::Output, LlamaModelError>
-where
-    F: FloatDataType
-        + SimdElement
-        + Default
-        + CastTo<f32>
-        + CastTensor<f32>
-        + WasmNotSend
-        + WasmNotSync
-        + FloatOps
-        + MatmulImpl
-        + 'static,
-    f32: CastTo<F> + CastTensor<F>,
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
-{
+) -> Result<P::Output, LlamaModelError> {
     let eos_token = llm.model.config.stop_token_string.clone();
     let mut on_token = move |tok: String| {
         if tok == eos_token {
@@ -51,21 +29,6 @@ where
     let tokenizer = &llm.tokenizer;
 
     let prompt_text = prompt.text();
-    #[cfg(feature = "vision")]
-    let images = prompt
-        .chunks()
-        .iter()
-        .filter_map(|chunk| {
-            if let ContentChunk::Media(media) = chunk {
-                media.source().as_bytes().as_ref().map(|bytes| {
-                    image::load_from_memory(bytes).map(|img| (img, media.hints().clone()))
-                })
-            } else {
-                None
-            }
-        })
-        .collect::<Result<Vec<crate::LlamaImage>, _>>()?;
-    #[cfg(not(feature = "vision"))]
     let images: Vec<crate::LlamaImage> = {
         if prompt.has_media() {
             return Err(LlamaModelError::MediaUnsupported);

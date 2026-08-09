@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 #![allow(unused)]
 use kalosm::language::*;
 use kalosm_llama::Llama;

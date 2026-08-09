@@ -1,8 +1,5 @@
-use std::marker::PhantomData;
-
 use crate::raw::cache::LlamaCache;
 use crate::raw::LlamaConfig;
-use fusor::{FloatDataType, SimdElement};
 use kalosm_language_model::TextCompletionSession;
 use std::sync::{Arc, RwLock};
 
@@ -11,7 +8,7 @@ use std::sync::{Arc, RwLock};
 pub enum LlamaSessionLoadingError {
     /// An error from Fusor while loading or saving a [`LlamaSession`].
     #[error("Fusor error: {0:?}")]
-    Fusor(#[from] fusor::Error),
+    Fusor(#[from] fusor2::Error),
     /// The chat messages deserialized from the session are invalid.
     #[error("Chat messages deserialized from the session are invalid")]
     InvalidChatMessages,
@@ -19,12 +16,11 @@ pub enum LlamaSessionLoadingError {
 
 /// A Llama session with cached state for the current fed prompt
 #[derive(Clone)]
-pub struct LlamaSession<F: FloatDataType + SimdElement = f32> {
+pub struct LlamaSession {
     pub(crate) cache: Arc<RwLock<LlamaCache>>,
-    _marker: PhantomData<F>,
 }
 
-impl<F: FloatDataType + SimdElement> TextCompletionSession for LlamaSession<F> {
+impl TextCompletionSession for LlamaSession {
     type Error = LlamaSessionLoadingError;
 
     fn try_clone(&self) -> Result<Self, Self::Error>
@@ -35,32 +31,11 @@ impl<F: FloatDataType + SimdElement> TextCompletionSession for LlamaSession<F> {
     }
 }
 
-impl<F: FloatDataType + SimdElement> LlamaSession<F> {
+impl LlamaSession {
     /// Create a new session
-    pub(crate) fn new(cache: &LlamaConfig<F>) -> Self {
+    pub(crate) fn new(cache: &LlamaConfig) -> Self {
         Self {
             cache: Arc::new(RwLock::new(LlamaCache::new(cache))),
-            _marker: PhantomData,
         }
     }
-
-    // /// Export the current cache tensor map.
-    // pub fn get_tensor_map(&self, device: &Device) -> HashMap<String, Tensor> {
-    //     let cache = self.cache.read().unwrap();
-    //     cache.get_tensor_map(device)
-    // }
-
-    // /// Import a cache tensor map.
-    // pub fn set_tensor_map(&mut self, map: HashMap<String, Tensor>) -> fusor::Result<()> {
-    //     let mut cache = self.cache.write().unwrap();
-    //     *cache = LlamaCache::from_tensor_map(map)?;
-    //     Ok(())
-    // }
-
-    // /// Create a cache from a tensor map. This can be used to load a cache from disk.
-    // pub fn from_tensor_map(map: HashMap<String, Tensor>) -> fusor::Result<Self> {
-    //     Ok(Self {
-    //         cache: Arc::new(RwLock::new(LlamaCache::from_tensor_map(map)?)),
-    //     })
-    // }
 }
