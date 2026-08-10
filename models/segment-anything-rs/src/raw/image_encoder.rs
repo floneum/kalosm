@@ -2,7 +2,7 @@
 
 use fusor2::graph::Graph;
 use fusor2::layers::{ConvNd, LayerNorm, Linear};
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2_gguf::VarBuilder;
 
 use super::{channel_layer_norm, dims, linear, load_dense, udim, Activation, MlpBlock, Result};

@@ -3,7 +3,7 @@ use crate::raw::rope::RopeImplementation;
 use fusor2::cache::{KvCache, MaskKind};
 use fusor2::composite::attention::attention_masked;
 use fusor2::layers::RmsNorm;
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2::{QMatrix, Result};
 use fusor2::Dim;
 

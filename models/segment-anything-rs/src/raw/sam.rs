@@ -2,7 +2,7 @@
 
 use fusor2::composite::upsample::upsample_nearest2d;
 use fusor2::graph::Graph;
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2_gguf::VarBuilder;
 
 use super::image_encoder::ImageEncoderViT;

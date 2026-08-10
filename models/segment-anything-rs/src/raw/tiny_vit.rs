@@ -6,7 +6,7 @@
 use fusor2::composite::attention::{attention_masked, MaskKind};
 use fusor2::graph::Graph;
 use fusor2::layers::{ConvNd, LayerNorm, Linear};
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2_gguf::VarBuilder;
 
 use super::{dims, linear, load_dense, udim, Result};

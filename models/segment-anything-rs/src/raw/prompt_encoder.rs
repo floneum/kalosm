@@ -2,7 +2,7 @@
 
 use fusor2::graph::Graph;
 use fusor2::layers::{ConvNd, Embedding, LayerNorm};
-use fusor2::tensor::{arange_step, Tensor};
+use fusor2::tensor::{arange_step, Dyn as Tensor};
 use fusor2::Dtype;
 use fusor2_gguf::VarBuilder;
 

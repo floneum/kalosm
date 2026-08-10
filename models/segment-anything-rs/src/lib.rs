@@ -25,7 +25,7 @@ mod mask_generation;
 mod raw;
 
 use fusor2::device::Device;
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2_gguf::VarBuilder;
 use image::{DynamicImage, GenericImage, GenericImageView, ImageBuffer, Rgba};
 use kalosm_model_types::FileSource;

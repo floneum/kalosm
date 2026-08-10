@@ -2,7 +2,7 @@ use fusor2::cache::MaskKind;
 use fusor2::composite::attention::{attention, attention_masked};
 use fusor2::device::Device;
 use fusor2::layers::Linear;
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Dim, Result, VarBuilder};
 
 use super::{additive_key_mask, load_linear};

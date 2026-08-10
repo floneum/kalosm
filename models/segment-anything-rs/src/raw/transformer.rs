@@ -3,7 +3,7 @@
 use fusor2::composite::attention::{attention, MaskKind};
 use fusor2::graph::Graph;
 use fusor2::layers::{LayerNorm, Linear};
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2_gguf::VarBuilder;
 
 use super::{dims, linear, udim, Activation, MlpBlock, Result};

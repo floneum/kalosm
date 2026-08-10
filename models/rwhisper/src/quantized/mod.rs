@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use fusor2::cache::{AttentionMask, KvCache, MaskCache, TensorCache};
 use fusor2::device::Device;
 use fusor2::layers::{ConvNd, LayerNorm, Linear};
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Dim, Dtype, Error, QMatrix, Result, VarBuilder};
 use fusor2_gguf::RawTensorBytes;
 use timestamps::extract_timestamps;

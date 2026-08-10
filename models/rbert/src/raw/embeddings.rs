@@ -4,7 +4,7 @@
 
 use fusor2::device::Device;
 use fusor2::layers::{Embedding, LayerNorm};
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Dtype, Result, VarBuilder};
 
 // https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L180

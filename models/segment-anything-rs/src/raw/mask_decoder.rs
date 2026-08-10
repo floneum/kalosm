@@ -2,7 +2,7 @@
 
 use fusor2::graph::Graph;
 use fusor2::layers::{Embedding, LayerNorm, Linear};
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2::Error;
 use fusor2_gguf::VarBuilder;
 

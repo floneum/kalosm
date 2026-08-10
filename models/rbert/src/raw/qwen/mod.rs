@@ -7,7 +7,7 @@ pub use model::QwenEmbeddingModel;
 
 use fusor2::device::Device;
 use fusor2::layers::Linear;
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Dim, Dtype, QMatrix, Result, VarBuilder};
 
 /// A matmul weight that is either a block-quantized [`QMatrix`] read in place

@@ -13,7 +13,7 @@
 
 use fusor2::graph::Graph;
 use fusor2::layers::{LayerNorm, Linear};
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Dim, Dtype, QMatrix};
 use fusor2_gguf::VarBuilder;
 

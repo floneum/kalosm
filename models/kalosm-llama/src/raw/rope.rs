@@ -5,7 +5,7 @@ use fusor2::composite::rope::{
 };
 use fusor2::device::Device;
 use fusor2::graph::Graph;
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Dtype, Result};
 use fusor2::Dim;
 use std::f32::consts::PI;

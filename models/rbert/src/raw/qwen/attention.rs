@@ -3,7 +3,7 @@ use fusor2::composite::attention::{attention, attention_masked};
 use fusor2::composite::rope::rope_normal_pair_fused;
 use fusor2::device::Device;
 use fusor2::layers::RmsNorm;
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Dim, Result, VarBuilder};
 
 use super::model::QwenRope;

@@ -1,7 +1,7 @@
 // Based on an upstream Whisper DTW implementation with optimizations and refactoring.
 // https://rtavenar.github.io/blog/dtw.html is a good resource for understanding the dtw algorithm
 
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use std::num::NonZeroUsize;
 
 use crate::config::{HOP_LENGTH, N_FRAMES, SAMPLE_RATE};

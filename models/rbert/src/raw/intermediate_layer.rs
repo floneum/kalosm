@@ -1,6 +1,6 @@
 use fusor2::device::Device;
 use fusor2::layers::Linear;
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Result, VarBuilder};
 
 use super::{load_linear, HiddenActLayer};

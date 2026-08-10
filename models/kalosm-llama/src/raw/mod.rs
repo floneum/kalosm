@@ -14,7 +14,7 @@ use attention_layer::SeparateAttention;
 use fusor2::cache::{MaskCache, MaskKind};
 use fusor2::device::Device;
 use fusor2::graph::Graph;
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Dtype, QMatrix, Result};
 use fusor2_gguf::{GgufValue, RawTensorBytes, ShardedVarBuilder};
 use fusor2::Dim;

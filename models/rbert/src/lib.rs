@@ -44,7 +44,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Dim, Dtype, Result as FusorResult, VarBuilder};
 use kalosm_common::*;
 use kalosm_model_types::ModelLoadingProgress;
