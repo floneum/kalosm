@@ -1,4 +1,5 @@
-// Adapted from an upstream BERT implementation.
+// Adapted from an upstream BERT implementation, ported to fusor2's dynamic
+// tensor API.
 
 mod embeddings;
 use embeddings::*;
@@ -20,7 +21,10 @@ pub mod qwen;
 
 pub use qwen::QwenEmbeddingModel;
 
-use fusor::{Device, Result, Tensor, VarBuilder};
+use fusor2::device::Device;
+use fusor2::layers::Linear;
+use fusor2::tensor::Tensor;
+use fusor2::{Dtype, Result, VarBuilder};
 use serde::Deserialize;
 use std::fmt::Debug;
 
@@ -42,7 +46,7 @@ impl HiddenActLayer {
         Self { act, span }
     }
 
-    fn forward(&self, xs: &Tensor<3, f32>) -> Tensor<3, f32> {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         match self.act {
             // https://github.com/huggingface/transformers/blob/cd4584e3c809bb9e1392ccd3fe38b40daba5519a/src/transformers/activations.py#L213
@@ -50,6 +54,22 @@ impl HiddenActLayer {
             HiddenAct::Relu => xs.relu(),
         }
     }
+}
+
+/// Load a `Linear`, with the bias present iff the GGUF ships one.
+pub(crate) fn load_linear(vb: &VarBuilder, device: &Device) -> Result<Linear> {
+    let has_bias = vb.contains_key("bias");
+    Linear::load(vb, device.graph().handle(), has_bias)
+}
+
+/// `[B, Lk]` u32 validity mask (1 = valid, 0 = pad) as the additive f32 mask
+/// `composite::attention` adds to the scores: 0 where valid, a large negative
+/// value where padded.
+pub(crate) fn additive_key_mask(mask: &Tensor) -> Result<Tensor> {
+    const MASK_NEG_VALUE: f32 = -1e9;
+    mask.cast(Dtype::F32)?
+        .rsub_scalar(1.0f32)?
+        .mul_scalar(MASK_NEG_VALUE)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -92,7 +112,7 @@ pub struct BertModel {
 
 impl BertModel {
     /// Load a new [`BertModel`] from [`VarBuilder`] with a [`Config`].
-    pub fn load(device: &Device, vb: &mut VarBuilder, config: &Config) -> Result<Self> {
+    pub fn load(device: &Device, vb: &VarBuilder, config: &Config) -> Result<Self> {
         let (embeddings, encoder) = match (
             BertEmbeddings::load(device, vb, config),
             BertEncoder::load(device, vb, config),
@@ -103,14 +123,10 @@ impl BertModel {
                     if let (Ok(embeddings), Ok(encoder)) = (
                         BertEmbeddings::load(
                             device,
-                            &mut vb.pp(format!("{model_type}.embeddings")),
+                            &vb.pp(format!("{model_type}.embeddings")),
                             config,
                         ),
-                        BertEncoder::load(
-                            device,
-                            &mut vb.pp(format!("{model_type}.encoder")),
-                            config,
-                        ),
+                        BertEncoder::load(device, &vb.pp(format!("{model_type}.encoder")), config),
                     ) {
                         (embeddings, encoder)
                     } else {
@@ -136,12 +152,12 @@ impl BertModel {
     /// attention_mask: The attention mask of the input. This can be None for embedding tasks with a single sentence. If you pad the input with 0s, you will need to create an attention mask.
     pub fn forward(
         &self,
-        input_ids: &Tensor<2, u32>,
-        token_type_ids: &Tensor<2, u32>,
-        attention_mask: Option<&Tensor<2, u32>>,
-    ) -> Tensor<3, f32> {
+        input_ids: &Tensor,
+        token_type_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let embedding_output = self.embeddings.forward(input_ids, token_type_ids);
+        let embedding_output = self.embeddings.forward(input_ids, token_type_ids)?;
         self.encoder.forward(&embedding_output, attention_mask)
     }
 

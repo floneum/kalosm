@@ -11,8 +11,8 @@ keywords = ["ai", "whisper", "transcription"]
 [dependencies]
 cpal = "0.15.1"
 rand.workspace = true
-fusor = { workspace = true, default-features = false }
-fusor-gguf.workspace = true
+fusor2 = { path = "../../fusor2-verified/fusor2" }
+fusor2-gguf = { path = "../../fusor2-verified/fusor2-gguf" }
 byteorder = "1.4.3"
 tokenizers = { workspace = true, features = ["fancy-regex"] }
 serde_json = "1.0.107"
@@ -33,8 +33,10 @@ rustfft = "6.4.1"
 
 [features]
 default = ["cpu", "gpu"]
-cpu = ["fusor/cpu"]
-gpu = ["fusor/gpu"]
+# fusor2 compiles both backends unconditionally; these are kept as no-ops so
+# downstream feature selections keep resolving.
+cpu = []
+gpu = []
 
 [dev-dependencies]
 kalosm = { workspace = true, features = ["sound", "sound-source"], default-features = true }

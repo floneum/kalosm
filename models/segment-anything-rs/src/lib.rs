@@ -1,7 +1,7 @@
 //! # Segment Anything RS
 //! A rust wrapper for [Segment Anything](https://segment-anything.com/)
 //!
-//! The model uses fusor tensors and prefers GPU execution when available,
+//! The model uses fusor2 tensors and prefers GPU execution when available,
 //! automatically falling back to CPU otherwise.
 //!
 //! ## Usage
@@ -24,7 +24,9 @@
 mod mask_generation;
 mod raw;
 
-use fusor::{Concrete, Device, Tensor, ToVec, VarBuilder};
+use fusor2::device::Device;
+use fusor2::tensor::Tensor;
+use fusor2_gguf::VarBuilder;
 use image::{DynamicImage, GenericImage, GenericImageView, ImageBuffer, Rgba};
 use kalosm_model_types::FileSource;
 use mask_generation::LowResMaskBatch;
@@ -199,7 +201,7 @@ impl SegmentAnythingInferenceSettings {
 pub enum LoadSegmentAnythingError {
     /// An error that can occur when initializing the runtime for a [`SegmentAnything`] model.
     #[error("Failed to initialize model runtime: {0}")]
-    LoadModel(#[from] fusor::Error),
+    LoadModel(#[from] fusor2::Error),
     /// An error that can occur when downloading a [`SegmentAnything`] model from Hugging Face.
     #[error("Failed to download model from Hugging Face: {0}")]
     DownloadModel(#[from] kalosm_common::CacheError),
@@ -213,7 +215,7 @@ pub enum LoadSegmentAnythingError {
 pub enum SegmentAnythingInferenceError {
     /// An error that can occur when trying to run a [`SegmentAnything`] model.
     #[error("Failed to run model: {0}")]
-    RunModel(#[from] fusor::Error),
+    RunModel(#[from] fusor2::Error),
     /// An error that can occur when converting the result of a [`SegmentAnything`] model to an image.
     #[error("Failed to merge masks")]
     MergeMasks,
@@ -222,6 +224,7 @@ pub enum SegmentAnythingInferenceError {
 /// The [segment anything](https://segment-anything.com/) model.
 pub struct SegmentAnything {
     sam: Sam,
+    #[allow(dead_code)]
     device: Device,
 }
 
@@ -241,13 +244,16 @@ impl SegmentAnything {
                 kalosm_common::Cache::default().get(&source, |_| {}).await?
             }
         };
-        let device = Device::auto().await;
-        let mut reader = std::io::BufReader::new(std::fs::File::open(&model_path)?);
-        let mut vb = VarBuilder::from_gguf(&mut reader)
-            .map_err(|e| fusor::Error::msg(format!("Failed to read GGUF: {e}")))?;
+        let device = match Device::gpu().await {
+            Ok(device) => device,
+            // No usable GPU adapter; fall back to the CPU backend.
+            Err(_) => Device::cpu(),
+        };
+        let vb = VarBuilder::from_gguf(&model_path)?;
+        let graph = device.graph();
         let sam = match source.architecture {
-            SegmentAnythingArchitecture::MobileSamTiny => Sam::load_tiny(&device, &mut vb)?,
-            SegmentAnythingArchitecture::SamVitB => Sam::load_vit_b(&device, &mut vb)?,
+            SegmentAnythingArchitecture::MobileSamTiny => Sam::load_tiny(graph, &vb)?,
+            SegmentAnythingArchitecture::SamVitB => Sam::load_vit_b(graph, &vb)?,
         };
         Ok(Self { sam, device })
     }
@@ -284,7 +290,7 @@ impl SegmentAnything {
         let image_width = image.width();
         let image_height = image.height();
 
-        let image_tensor = self.image_to_tensor(image);
+        let image_tensor = self.image_to_tensor(image)?;
 
         let points = {
             let mut points = Vec::new();
@@ -297,32 +303,31 @@ impl SegmentAnything {
             points
         };
 
-        let (mask, _iou_predictions) = self.sam.forward(&image_tensor, &points, false);
+        let (mask, _iou_predictions) = self.sam.forward(&image_tensor, &points, false)?;
 
-        let mask_shape = mask.shape();
-        let h = mask_shape[2];
-        let w = mask_shape[3];
+        let h = dim(&mask, 2);
+        let w = dim(&mask, 3);
 
-        // Get first mask (batch=0, mask=0)
-        let mask_n0 = mask.narrow(0, 0, 1);
-        let mask_n1 = mask_n0.narrow(1, 0, 1);
-        let mask_2d = mask_n1.reshape([h, w]);
+        // Get first mask (batch=0, mask=0) as (H, W)
+        let mask_2d = mask
+            .narrow(0, 0, 1)?
+            .narrow(1, 0, 1)?
+            .reshape_dims(&raw_dims(&[h, w]))?;
 
         // Threshold: >= threshold -> 255, else 0
-        let threshold_mask = mask_2d.gt_scalar(threshold - 1e-6);
+        let threshold_mask = mask_2d.gt_scalar(threshold - 1e-6)?;
+        let mask_u8 = threshold_mask.mul_scalar(255.0f32)?;
 
-        let mask_u8: Tensor<2, f32> = threshold_mask.mul_scalar(255.0f32);
-
-        // Expand to 3 channels: (H, W) -> (3, H, W)
-        let mask_reshaped = mask_u8.reshape([1, h, w]);
-        let mask_3ch = mask_reshaped.broadcast_as([3, h, w]);
-
-        // Permute to (H, W, 3) and flatten
-        let mask_t1 = mask_3ch.transpose(0, 1); // (H, 3, W)
-        let mask_hwc = mask_t1.transpose(1, 2); // (H, W, 3);
-        let mask_flat = mask_hwc.reshape([h * w * 3]);
-        let mask_slice = mask_flat.as_slice().await?;
-        let mask_pixels: Vec<u8> = mask_slice.to_vec().iter().map(|&v| v as u8).collect();
+        // Expand to 3 channels: (H, W) -> (H, W, 3) and flatten
+        let mask_hwc = mask_u8
+            .reshape_dims(&raw_dims(&[h, w, 1]))?
+            .broadcast_as(&raw_dims(&[h, w, 3]))?;
+        let mask_flat = mask_hwc.reshape_dims(&raw_dims(&[h * w * 3]))?;
+        let mask_pixels: Vec<u8> = mask_flat
+            .to_vec_f32()?
+            .into_iter()
+            .map(|v| v as u8)
+            .collect();
 
         let mask_img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
             image::ImageBuffer::from_raw(w as u32, h as u32, mask_pixels)
@@ -335,7 +340,7 @@ impl SegmentAnything {
         ))
     }
 
-    fn image_to_tensor(&self, image: DynamicImage) -> Tensor<3, f32, Concrete<f32, 3>> {
+    fn image_to_tensor(&self, image: DynamicImage) -> Result<Tensor, fusor2::Error> {
         let image = {
             let resize_longest = IMAGE_SIZE;
             let (height, width) = (image.height(), image.width());
@@ -354,14 +359,13 @@ impl SegmentAnything {
         let data = img.into_raw();
         // Convert u8 to f32
         let data_f32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
-        let device = &self.device;
         // (H, W, 3) -> permute to (3, H, W)
-        let image: Tensor<3, f32, Concrete<f32, 3>> =
-            Tensor::from_slice(device, [height, width, 3], &data_f32)
-                .transpose(1, 2) // (H, 3, W)
-                .transpose(0, 1) // (3, H, W)
-                .to_concrete();
-        image
+        let image = Tensor::from_elements(
+            self.sam.graph().handle(),
+            &raw_dims(&[height, width, 3]),
+            &data_f32,
+        )?;
+        image.permute(&[2, 0, 1])
     }
 
     /// Segment everything in an image. Returns a list of [`DynamicImage`] masks.
@@ -386,12 +390,12 @@ impl SegmentAnything {
     ) -> Result<Vec<DynamicImage>, SegmentAnythingInferenceError> {
         let image_width = image.width();
         let image_height = image.height();
-        let image_tensor = self.image_to_tensor(image);
-        let original_h = image_tensor.shape()[1];
-        let original_w = image_tensor.shape()[2];
+        let image_tensor = self.image_to_tensor(image)?;
+        let original_h = dim(&image_tensor, 1);
+        let original_w = dim(&image_tensor, 2);
 
         // Compute image embeddings once
-        let img_embeddings = self.sam.embeddings(&image_tensor);
+        let img_embeddings = self.sam.embeddings(&image_tensor)?;
 
         let point_grid = build_point_grid(SEGMENT_EVERYTHING_POINTS_PER_SIDE);
 
@@ -407,14 +411,13 @@ impl SegmentAnything {
                 original_w,
                 &batch_points,
                 true, // multimask_output: get 3 mask alternatives per point
-            );
+            )?;
 
             // Read masks and IoU predictions to CPU in one shot
-            let masks_shape = low_res_masks.shape(); // (batch, 3, h, w)
-            let batch = masks_shape[0];
-            let n_masks_per_point = masks_shape[1];
-            let mask_h = masks_shape[2];
-            let mask_w = masks_shape[3];
+            let batch = dim(&low_res_masks, 0);
+            let n_masks_per_point = dim(&low_res_masks, 1);
+            let mask_h = dim(&low_res_masks, 2);
+            let mask_w = dim(&low_res_masks, 3);
             let mask_pixels = mask_h * mask_w;
             let total_mask_elems = batch * n_masks_per_point * mask_pixels;
 
@@ -425,14 +428,12 @@ impl SegmentAnything {
             let crop_h = mask_generation::low_res_crop_extent(original_h, mask_h);
             let crop_w = mask_generation::low_res_crop_extent(original_w, mask_w);
 
-            let masks_flat = low_res_masks.reshape([total_mask_elems]);
-            let masks_slice = masks_flat.as_slice().await?;
-            let masks_vec = masks_slice.to_vec();
+            let masks_flat = low_res_masks.reshape_dims(&raw_dims(&[total_mask_elems]))?;
+            let masks_vec = masks_flat.to_vec_f32()?;
 
             let total_iou_elems = batch * n_masks_per_point;
-            let iou_flat = iou_preds.reshape([total_iou_elems]);
-            let iou_slice = iou_flat.as_slice().await?;
-            let iou_vec = iou_slice.to_vec();
+            let iou_flat = iou_preds.reshape_dims(&raw_dims(&[total_iou_elems]))?;
+            let iou_vec = iou_flat.to_vec_f32()?;
 
             mask_generation::collect_mask_candidates(
                 LowResMaskBatch {
@@ -464,4 +465,16 @@ impl SegmentAnything {
 
         Ok(masks)
     }
+}
+
+/// Constant extent of axis `i` as a `usize`.
+fn dim(t: &Tensor, i: usize) -> usize {
+    t.dim(i)
+        .as_const()
+        .expect("SAM tensor extents are constant") as usize
+}
+
+/// `&[usize]` -> the `&[Dim]` the runtime-rank API wants.
+fn raw_dims(v: &[usize]) -> Vec<fusor2::Dim> {
+    v.iter().map(|&d| fusor2::Dim::Const(d as u64)).collect()
 }

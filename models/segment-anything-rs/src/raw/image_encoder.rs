@@ -1,63 +1,72 @@
 //! ViT-based image encoder for SAM.
 
-use fusor::layers::{ConvNd, ConvNdConfig, LayerNormNd, Linear};
-use fusor::{Concrete, Device, Fusion, Tensor, VarBuilder};
+use fusor2::graph::Graph;
+use fusor2::layers::{ConvNd, LayerNorm, Linear};
+use fusor2::tensor::Tensor;
+use fusor2_gguf::VarBuilder;
 
-use super::{Activation, MlpBlock, Result};
+use super::{channel_layer_norm, dims, linear, load_dense, udim, Activation, MlpBlock, Result};
+
+fn conv2d(
+    vb: &VarBuilder,
+    graph: &Graph,
+    bias: bool,
+    stride: u32,
+    padding: u32,
+) -> Result<ConvNd> {
+    let mut conv = ConvNd::load(vb, graph.handle(), bias)?;
+    conv.stride = [stride, stride].into_iter().collect();
+    conv.padding = [padding, padding].into_iter().collect();
+    Ok(conv)
+}
 
 struct PatchEmbed {
-    proj: ConvNd<2, 4, f32>,
+    proj: ConvNd,
 }
 
 impl PatchEmbed {
-    fn load(
-        device: &Device,
-        vb: &mut VarBuilder,
-        patch_size: usize,
-        padding: usize,
-    ) -> Result<Self> {
-        let cfg = ConvNdConfig {
-            padding: [padding, padding],
-            stride: [patch_size, patch_size],
-            groups: 1,
-        };
-        let proj = ConvNd::<2, 4, f32>::load(device, &mut vb.pp("proj"), cfg)?;
+    fn load(graph: &Graph, vb: &VarBuilder, patch_size: usize, padding: usize) -> Result<Self> {
+        let proj = conv2d(
+            &vb.pp("proj"),
+            graph,
+            true,
+            patch_size as u32,
+            padding as u32,
+        )?;
         Ok(Self { proj })
     }
 
-    fn forward(&self, xs: &Tensor<4, f32, impl Fusion<4, f32>>) -> Tensor<4, f32> {
-        let out = self.proj.forward(xs);
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let out = self.proj.forward(xs)?;
         // (B, C, H, W) -> (B, H, W, C)
-        let out = out.transpose(1, 2);
-        let out = out.transpose(2, 3);
-        out.to_concrete()
+        out.permute(&[0, 2, 3, 1])
     }
 }
 
 struct Attention {
-    qkv: Linear<f32>,
-    proj: Linear<f32>,
+    qkv: Linear,
+    proj: Linear,
     num_heads: usize,
     scale: f32,
-    rel_pos_h: Option<Tensor<2, f32, Concrete<f32, 2>>>,
-    rel_pos_w: Option<Tensor<2, f32, Concrete<f32, 2>>>,
+    rel_pos_h: Option<Tensor>,
+    rel_pos_w: Option<Tensor>,
 }
 
 impl Attention {
     fn load(
-        device: &Device,
-        vb: &mut VarBuilder,
+        graph: &Graph,
+        vb: &VarBuilder,
         dim: usize,
         num_heads: usize,
         use_rel_pos: bool,
     ) -> Result<Self> {
-        let qkv = Linear::load(device, &mut vb.pp("qkv"))?;
-        let proj = Linear::load(device, &mut vb.pp("proj"))?;
+        let qkv = linear(&vb.pp("qkv"), graph)?;
+        let proj = linear(&vb.pp("proj"), graph)?;
         let head_dim = dim / num_heads;
         let scale = 1.0 / (head_dim as f32).sqrt();
         let (rel_pos_h, rel_pos_w) = if use_rel_pos {
-            let h: Tensor<2, f32> = vb.get("rel_pos_h", device)?.dequantize();
-            let w: Tensor<2, f32> = vb.get("rel_pos_w", device)?.dequantize();
+            let h = load_dense(vb, graph, "rel_pos_h")?;
+            let w = load_dense(vb, graph, "rel_pos_w")?;
             (Some(h), Some(w))
         } else {
             (None, None)
@@ -72,118 +81,110 @@ impl Attention {
         })
     }
 
-    fn forward(&self, xs: &Tensor<4, f32>) -> Tensor<4, f32> {
-        let shape = xs.shape();
-        let b = shape[0];
-        let h = shape[1];
-        let w = shape[2];
-        let c = shape[3];
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let b = udim(xs, 0);
+        let h = udim(xs, 1);
+        let w = udim(xs, 2);
+        let c = udim(xs, 3);
 
         // Flatten to (b, h*w, c) for linear
-        let flat = xs.reshape([b, h * w, c]);
-        let qkv = self.qkv.forward(&flat);
+        let flat = xs.reshape_dims(&dims(&[b, h * w, c]))?;
+        let qkv = self.qkv.forward(&flat)?;
 
         // Reshape to (b, h*w, 3, num_heads, c/num_heads)
         let c_per_head = c / self.num_heads;
-        let qkv = qkv.reshape([b, h * w, 3, self.num_heads, c_per_head]);
+        let qkv = qkv.reshape_dims(&dims(&[b, h * w, 3, self.num_heads, c_per_head]))?;
 
         // Permute to (3, b, num_heads, h*w, c/num_heads) then reshape
         // -> (3, b*num_heads, h*w, c/num_heads)
-        let qkv = qkv.transpose(1, 2); // (b, 3, h*w, num_heads, c_per_head)
-        let qkv = qkv.transpose(0, 1); // (3, b, h*w, num_heads, c_per_head)
-        let qkv = qkv.transpose(2, 3); // (3, b, num_heads, h*w, c_per_head);
-        let qkv = qkv.reshape([3, b * self.num_heads, h * w, c_per_head]);
+        let qkv = qkv.permute(&[2, 0, 3, 1, 4])?;
+        let qkv = qkv.reshape_dims(&dims(&[3, b * self.num_heads, h * w, c_per_head]))?;
 
         let q = qkv
-            .narrow(0, 0, 1)
-            .reshape([b * self.num_heads, h * w, c_per_head])
-            .to_concrete();
-        let k = qkv.narrow(0, 1, 1);
-        let k = k.reshape([b * self.num_heads, h * w, c_per_head]);
-        let v = qkv.narrow(0, 2, 1);
-        let v = v.reshape([b * self.num_heads, h * w, c_per_head]);
+            .narrow(0, 0, 1)?
+            .reshape_dims(&dims(&[b * self.num_heads, h * w, c_per_head]))?;
+        let k = qkv
+            .narrow(0, 1, 1)?
+            .reshape_dims(&dims(&[b * self.num_heads, h * w, c_per_head]))?;
+        let v = qkv
+            .narrow(0, 2, 1)?
+            .reshape_dims(&dims(&[b * self.num_heads, h * w, c_per_head]))?;
 
         // attn = (q * scale) @ k^T
-        let q_scaled = q.mul_scalar(self.scale);
-        let attn: Tensor<3, f32> = q_scaled.mat_mul(&k.transpose(1, 2));
+        let q_scaled = q.mul_scalar(self.scale)?;
+        let attn = q_scaled.matmul_t(&k)?;
 
         // Add relative position bias
-        let attn = self.add_decomposed_rel_pos(attn, &q, (h, w), (h, w));
+        let attn = self.add_decomposed_rel_pos(attn, &q, (h, w), (h, w))?;
 
         // Softmax
-        let attn: Tensor<3, f32> = attn.softmax_last_dim::<2>();
+        let attn = attn.softmax_last_dim()?;
 
         // attn @ v
-        let attn = attn.mat_mul(&v);
+        let attn = attn.matmul(&v)?;
 
-        // Reshape back to (b, num_heads, h, w, c_per_head)
-        let attn = attn.reshape([b, self.num_heads, h, w, c_per_head]);
-        // Permute to (b, h, w, num_heads, c_per_head) then reshape to (b, h*w, c)
-        let attn = attn.transpose(1, 2); // (b, h, num_heads, w, c_per_head)
-        let attn = attn.transpose(2, 3); // (b, h, w, num_heads, c_per_head)
-        let attn = attn.reshape([b, h * w, c]);
+        // Reshape back to (b, num_heads, h, w, c_per_head), permute to
+        // (b, h, w, num_heads, c_per_head), then flatten to (b, h*w, c)
+        let attn = attn.reshape_dims(&dims(&[b, self.num_heads, h, w, c_per_head]))?;
+        let attn = attn.permute(&[0, 2, 3, 1, 4])?;
+        let attn = attn.reshape_dims(&dims(&[b, h * w, c]))?;
 
-        let out = self.proj.forward(&attn);
-        out.reshape([b, h, w, c]).to_concrete()
+        let out = self.proj.forward(&attn)?;
+        out.reshape_dims(&dims(&[b, h, w, c]))
     }
 
     fn add_decomposed_rel_pos(
         &self,
-        attn: Tensor<3, f32>,
-        q: &Tensor<3, f32>,
+        attn: Tensor,
+        q: &Tensor,
         (q_h, q_w): (usize, usize),
         (k_h, k_w): (usize, usize),
-    ) -> Tensor<3, f32> {
+    ) -> Result<Tensor> {
         match (&self.rel_pos_h, &self.rel_pos_w) {
             (Some(rel_pos_h), Some(rel_pos_w)) => {
-                let r_h = get_rel_pos(q_h, k_h, rel_pos_h);
-                let r_w = get_rel_pos(q_w, k_w, rel_pos_w);
+                let r_h = get_rel_pos(q_h, k_h, rel_pos_h)?;
+                let r_w = get_rel_pos(q_w, k_w, rel_pos_w)?;
 
-                let q_shape = q.shape();
-                let b_nh = q_shape[0]; // b * num_heads
-                let dim = q_shape[2];
+                let b_nh = udim(q, 0); // b * num_heads
+                let dim = udim(q, 2);
 
-                let r_q = q.reshape([b_nh, q_h, q_w, dim]);
+                let r_q = q.reshape_dims(&dims(&[b_nh, q_h, q_w, dim]))?;
 
                 // rel_h = r_q @ r_h^T: (b_nh, q_h, q_w, dim) @ (q_h, k_h, dim)^T -> (b_nh, q_h, q_w, k_h)
-                let r_h_t = r_h.transpose(1, 2); // (q_h, dim, k_h)
-                let r_h_broadcast = r_h_t.reshape([1, q_h, dim, k_h]);
-                let r_h_broadcast = r_h_broadcast.broadcast_as([b_nh, q_h, dim, k_h]);
-                let rel_h = r_q.mat_mul(&r_h_broadcast);
+                let r_h_t = r_h.transpose(1, 2)?; // (q_h, dim, k_h)
+                let r_h_broadcast = r_h_t
+                    .reshape_dims(&dims(&[1, q_h, dim, k_h]))?
+                    .broadcast_as(&dims(&[b_nh, q_h, dim, k_h]))?;
+                let rel_h = r_q.matmul(&r_h_broadcast)?;
 
                 // rel_w: transpose r_q to (b_nh, q_w, q_h, dim), matmul with r_w^T, transpose back
-                let r_w_t = r_w.transpose(1, 2); // (q_w, dim, k_w)
-                let r_w_broadcast = r_w_t.reshape([1, q_w, dim, k_w]);
-                let r_w_broadcast = r_w_broadcast.broadcast_as([b_nh, q_w, dim, k_w]);
-                let r_q_t = r_q.transpose(1, 2); // (b_nh, q_w, q_h, dim)
-                let rel_w = r_q_t.mat_mul(&r_w_broadcast);
-                let rel_w = rel_w.transpose(1, 2); // (b_nh, q_h, q_w, k_w)
+                let r_w_t = r_w.transpose(1, 2)?; // (q_w, dim, k_w)
+                let r_w_broadcast = r_w_t
+                    .reshape_dims(&dims(&[1, q_w, dim, k_w]))?
+                    .broadcast_as(&dims(&[b_nh, q_w, dim, k_w]))?;
+                let r_q_t = r_q.transpose(1, 2)?; // (b_nh, q_w, q_h, dim)
+                let rel_w = r_q_t.matmul(&r_w_broadcast)?;
+                let rel_w = rel_w.transpose(1, 2)?; // (b_nh, q_h, q_w, k_w)
 
                 // attn = attn.reshape(b_nh, q_h, q_w, k_h, k_w) + rel_h.unsqueeze(4) + rel_w.unsqueeze(3)
-                let attn_5d = attn.reshape([b_nh, q_h, q_w, k_h, k_w]);
-                // rel_h: (b_nh, q_h, q_w, k_h) -> (b_nh, q_h, q_w, k_h, 1)
-                let rel_h_5d = rel_h.reshape([b_nh, q_h, q_w, k_h, 1]);
-                let rel_h_5d = rel_h_5d.broadcast_as([b_nh, q_h, q_w, k_h, k_w]);
-                // rel_w: (b_nh, q_h, q_w, k_w) -> (b_nh, q_h, q_w, 1, k_w)
-                let rel_w_5d = rel_w.reshape([b_nh, q_h, q_w, 1, k_w]);
-                let rel_w_5d = rel_w_5d.broadcast_as([b_nh, q_h, q_w, k_h, k_w]);
+                let attn_5d = attn.reshape_dims(&dims(&[b_nh, q_h, q_w, k_h, k_w]))?;
+                let rel_h_5d = rel_h
+                    .reshape_dims(&dims(&[b_nh, q_h, q_w, k_h, 1]))?
+                    .broadcast_as(&dims(&[b_nh, q_h, q_w, k_h, k_w]))?;
+                let rel_w_5d = rel_w
+                    .reshape_dims(&dims(&[b_nh, q_h, q_w, 1, k_w]))?
+                    .broadcast_as(&dims(&[b_nh, q_h, q_w, k_h, k_w]))?;
 
-                let result = attn_5d + rel_h_5d + rel_w_5d;
-                result.reshape([b_nh, q_h * q_w, k_h * k_w]).to_concrete()
+                let result = attn_5d.add(&rel_h_5d)?.add(&rel_w_5d)?;
+                result.reshape_dims(&dims(&[b_nh, q_h * q_w, k_h * k_w]))
             }
-            _ => attn,
+            _ => Ok(attn),
         }
     }
 }
 
-fn get_rel_pos(
-    q_size: usize,
-    k_size: usize,
-    rel_pos: &Tensor<2, f32, Concrete<f32, 2>>,
-) -> Tensor<3, f32, Concrete<f32, 3>> {
+fn get_rel_pos(q_size: usize, k_size: usize, rel_pos: &Tensor) -> Result<Tensor> {
     // For SAM, q_size == k_size and rel_pos has shape (2*q_size-1, head_dim)
-    let device = rel_pos.device();
-
     let q_scale = f32::max(1.0, k_size as f32 / q_size as f32);
     let k_scale = f32::max(1.0, q_size as f32 / k_size as f32);
     let offset = (k_size as f32 - 1.0) * q_scale;
@@ -195,38 +196,38 @@ fn get_rel_pos(
             (0..k_size).map(move |k| (q as f32 * q_scale - k as f32 * k_scale + offset) as u32)
         })
         .collect();
-    let relative_coords_u32: Tensor<1, u32> =
-        Tensor::from_slice(&device, [q_size * k_size], &rc_data);
+    let relative_coords_u32 =
+        Tensor::from_elements(rel_pos.graph(), &dims(&[q_size * k_size]), &rc_data)?;
 
     // index_select from rel_pos
-    let selected: Tensor<2, f32> = rel_pos.index_select(0, &relative_coords_u32);
-    let head_dim = rel_pos.shape()[1];
-    selected.reshape([q_size, k_size, head_dim]).to_concrete()
+    let selected = rel_pos.index_select(0, &relative_coords_u32)?;
+    let head_dim = udim(rel_pos, 1);
+    selected.reshape_dims(&dims(&[q_size, k_size, head_dim]))
 }
 
 struct Block {
-    norm1: LayerNormNd<f32>,
+    norm1: LayerNorm,
     attn: Attention,
-    norm2: LayerNormNd<f32>,
+    norm2: LayerNorm,
     mlp: MlpBlock,
     window_size: usize,
 }
 
 impl Block {
     fn load(
-        device: &Device,
-        vb: &mut VarBuilder,
+        graph: &Graph,
+        vb: &VarBuilder,
         dim: usize,
         num_heads: usize,
         use_rel_pos: bool,
         window_size: usize,
     ) -> Result<Self> {
-        let norm1 = LayerNormNd::load(device, &mut vb.pp("norm1"), 1e-6)?;
-        let norm2 = LayerNormNd::load(device, &mut vb.pp("norm2"), 1e-6)?;
-        let attn = Attention::load(device, &mut vb.pp("attn"), dim, num_heads, use_rel_pos)?;
+        let norm1 = LayerNorm::load(&vb.pp("norm1"), graph.handle(), 1e-6)?;
+        let norm2 = LayerNorm::load(&vb.pp("norm2"), graph.handle(), 1e-6)?;
+        let attn = Attention::load(graph, &vb.pp("attn"), dim, num_heads, use_rel_pos)?;
         let mlp = MlpBlock::load(
-            device,
-            &mut vb.pp("mlp"),
+            graph,
+            &vb.pp("mlp"),
             Some(dim),
             Some(dim * 4),
             Activation::Gelu,
@@ -240,60 +241,56 @@ impl Block {
         })
     }
 
-    fn forward(&self, xs: &Tensor<4, f32>) -> Tensor<4, f32> {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let shortcut = xs;
-        let shape = xs.shape();
-        let h = shape[1];
-        let w = shape[2];
+        let h = udim(xs, 1);
+        let w = udim(xs, 2);
 
-        // LayerNormNd<f32> over last dim
-        let xs = layer_norm_bhwc(&self.norm1, xs);
+        // LayerNorm over the last (channel) dim of BHWC
+        let xs = self.norm1.forward(xs)?;
 
         let (xs, pad_hw) = if self.window_size > 0 {
-            window_partition(&xs, self.window_size)
+            window_partition(&xs, self.window_size)?
         } else {
             (xs, (0, 0))
         };
-        let xs = self.attn.forward(&xs);
+        let xs = self.attn.forward(&xs)?;
         let xs = if self.window_size > 0 {
-            window_unpartition(&xs, self.window_size, pad_hw, (h, w))
+            window_unpartition(&xs, self.window_size, pad_hw, (h, w))?
         } else {
             xs
         };
 
-        let xs = xs + shortcut;
+        let xs = xs.add(shortcut)?;
 
         // MLP
-        let mlp_in = layer_norm_bhwc(&self.norm2, &xs);
-        let mlp_shape = mlp_in.shape();
-        let mlp_flat = mlp_in.reshape([mlp_shape[0], mlp_shape[1] * mlp_shape[2], mlp_shape[3]]);
-        let mlp_out = self.mlp.forward(&mlp_flat);
-        let mlp_out = mlp_out.reshape(mlp_shape);
+        let mlp_in = self.norm2.forward(&xs)?;
+        let b = udim(&mlp_in, 0);
+        let c = udim(&mlp_in, 3);
+        let mlp_flat = mlp_in.reshape_dims(&dims(&[b, h * w, c]))?;
+        let mlp_out = self.mlp.forward(&mlp_flat)?;
+        let mlp_out = mlp_out.reshape_dims(&dims(&[b, h, w, c]))?;
 
-        (&xs + mlp_out).to_concrete()
+        xs.add(&mlp_out)
     }
 }
 
-fn window_partition(
-    xs: &Tensor<4, f32>,
-    window_size: usize,
-) -> (Tensor<4, f32, Concrete<f32, 4>>, (usize, usize)) {
-    let shape = xs.shape();
-    let b = shape[0];
-    let h = shape[1];
-    let w = shape[2];
-    let c = shape[3];
+fn window_partition(xs: &Tensor, window_size: usize) -> Result<(Tensor, (usize, usize))> {
+    let b = udim(xs, 0);
+    let h = udim(xs, 1);
+    let w = udim(xs, 2);
+    let c = udim(xs, 3);
 
     let pad_h = (window_size - h % window_size) % window_size;
     let pad_w = (window_size - w % window_size) % window_size;
 
     let xs = if pad_h > 0 {
-        xs.pad_with_zeros(1, 0, pad_h)
+        xs.pad_with_zeros(1, 0, pad_h)?
     } else {
-        xs.to_concrete()
+        xs.clone()
     };
     let xs = if pad_w > 0 {
-        xs.pad_with_zeros(2, 0, pad_w)
+        xs.pad_with_zeros(2, 0, pad_w)?
     } else {
         xs
     };
@@ -301,54 +298,38 @@ fn window_partition(
     let h_p = h + pad_h;
     let w_p = w + pad_w;
 
-    // (b, h_p/ws, ws, w_p/ws, ws, c) -> transpose(2,3) -> (b, h_p/ws, w_p/ws, ws, ws, c)
+    // (b, h_p/ws, ws, w_p/ws, ws, c) -> transpose(2,3) -> (b, n_h, n_w, ws, ws, c)
     // -> flatten first 3 dims -> (b * n_windows, ws, ws, c)
     let n_h = h_p / window_size;
     let n_w = w_p / window_size;
-    let windows: Tensor<4, f32, Concrete<f32, 4>> = xs
-        .reshape([b, n_h, window_size, n_w, window_size, c])
-        .transpose(2, 3) // (b, n_h, n_w, ws, ws, c)
-        .reshape([b * n_h * n_w, window_size, window_size, c])
-        .to_concrete();
+    let windows = xs
+        .reshape_dims(&dims(&[b, n_h, window_size, n_w, window_size, c]))?
+        .transpose(2, 3)?
+        .reshape_dims(&dims(&[b * n_h * n_w, window_size, window_size, c]))?;
 
-    (windows, (h_p, w_p))
+    Ok((windows, (h_p, w_p)))
 }
 
 fn window_unpartition(
-    windows: &Tensor<4, f32>,
+    windows: &Tensor,
     window_size: usize,
     (h_p, w_p): (usize, usize),
     (h, w): (usize, usize),
-) -> Tensor<4, f32, Concrete<f32, 4>> {
-    let shape = windows.shape();
-    let total = shape[0];
-    let c = shape[3];
+) -> Result<Tensor> {
+    let total = udim(windows, 0);
+    let c = udim(windows, 3);
     let n_h = h_p / window_size;
     let n_w = w_p / window_size;
     let b = total / (n_h * n_w);
 
-    // The middle `to_concrete()` is load-bearing: after `transpose(2, 3)` the
-    // tensor is non-contiguous, and the following `reshape` flattens windows
-    // back into the spatial dims with a stride pattern that requires
-    // contiguous backing storage.
-    let xs: Tensor<4, f32, Concrete<f32, 4>> = windows
-        .reshape([b, n_h, n_w, window_size, window_size, c])
-        .transpose(2, 3) // (b, n_h, ws, n_w, ws, c)
-        .to_concrete()
-        .reshape([b, h_p, w_p, c])
-        .to_concrete();
+    let xs = windows
+        .reshape_dims(&dims(&[b, n_h, n_w, window_size, window_size, c]))?
+        .transpose(2, 3)? // (b, n_h, ws, n_w, ws, c)
+        .reshape_dims(&dims(&[b, h_p, w_p, c]))?;
 
-    let xs = if h_p > h {
-        xs.narrow(1, 0, h).to_concrete()
-    } else {
-        xs
-    };
-    let xs = if w_p > w {
-        xs.narrow(2, 0, w).to_concrete()
-    } else {
-        xs
-    };
-    xs
+    let xs = if h_p > h { xs.narrow(1, 0, h)? } else { xs };
+    let xs = if w_p > w { xs.narrow(2, 0, w)? } else { xs };
+    Ok(xs)
 }
 
 /// Standard ViT-B/H/L image encoder used by the upstream SAM checkpoints.
@@ -358,18 +339,18 @@ fn window_unpartition(
 pub struct ImageEncoderViT {
     patch_embed: PatchEmbed,
     blocks: Vec<Block>,
-    neck_conv1: ConvNd<2, 4, f32>,
-    neck_ln1: LayerNormNd<f32>,
-    neck_conv2: ConvNd<2, 4, f32>,
-    neck_ln2: LayerNormNd<f32>,
-    pos_embed: Option<Tensor<4, f32, Concrete<f32, 4>>>,
+    neck_conv1: ConvNd,
+    neck_ln1: LayerNorm,
+    neck_conv2: ConvNd,
+    neck_ln2: LayerNorm,
+    pos_embed: Option<Tensor>,
 }
 
 impl ImageEncoderViT {
     #[allow(clippy::too_many_arguments)]
     pub fn load(
-        device: &Device,
-        vb: &mut VarBuilder,
+        graph: &Graph,
+        vb: &VarBuilder,
         _img_size: usize,
         patch_size: usize,
         embed_dim: usize,
@@ -381,7 +362,7 @@ impl ImageEncoderViT {
         window_size: usize,
         global_attn_indexes: &[usize],
     ) -> Result<Self> {
-        let patch_embed = PatchEmbed::load(device, &mut vb.pp("patch_embed"), patch_size, 0)?;
+        let patch_embed = PatchEmbed::load(graph, &vb.pp("patch_embed"), patch_size, 0)?;
 
         let mut blocks = Vec::with_capacity(depth);
         for i in 0..depth {
@@ -391,8 +372,8 @@ impl ImageEncoderViT {
                 window_size
             };
             let block = Block::load(
-                device,
-                &mut vb.pp(format!("blocks.{i}")),
+                graph,
+                &vb.pp(format!("blocks.{i}")),
                 embed_dim,
                 num_heads,
                 use_rel_pos,
@@ -401,23 +382,13 @@ impl ImageEncoderViT {
             blocks.push(block);
         }
 
-        let neck_conv1 = ConvNd::<2, 4, f32>::load_no_bias(
-            device,
-            &mut vb.pp("neck.0"),
-            ConvNdConfig::default(),
-        )?;
-        let neck_ln1 = LayerNormNd::<f32>::load_over_axis(device, &mut vb.pp("neck.1"), 1, 1e-6)?;
-        let cfg_pad1 = ConvNdConfig {
-            padding: [1, 1],
-            stride: [1, 1],
-            groups: 1,
-        };
-        let neck_conv2 = ConvNd::<2, 4, f32>::load_no_bias(device, &mut vb.pp("neck.2"), cfg_pad1)?;
-        let neck_ln2 = LayerNormNd::<f32>::load_over_axis(device, &mut vb.pp("neck.3"), 1, 1e-6)?;
+        let neck_conv1 = conv2d(&vb.pp("neck.0"), graph, false, 1, 0)?;
+        let neck_ln1 = LayerNorm::load(&vb.pp("neck.1"), graph.handle(), 1e-6)?;
+        let neck_conv2 = conv2d(&vb.pp("neck.2"), graph, false, 1, 1)?;
+        let neck_ln2 = LayerNorm::load(&vb.pp("neck.3"), graph.handle(), 1e-6)?;
 
         let pos_embed = if use_abs_pos {
-            let p: Tensor<4, f32> = vb.get("pos_embed", device)?.dequantize();
-            Some(p.to_concrete())
+            Some(load_dense(vb, graph, "pos_embed")?)
         } else {
             None
         };
@@ -433,40 +404,25 @@ impl ImageEncoderViT {
         })
     }
 
-    pub fn forward(&self, xs: &Tensor<4, f32, impl Fusion<4, f32>>) -> Tensor<4, f32> {
-        let xs = self.patch_embed.forward(xs); // (B, H, W, C)
+    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = self.patch_embed.forward(xs)?; // (B, H, W, C)
 
-        let mut xs: Tensor<4, f32> = match &self.pos_embed {
-            Some(pos_embed) => (xs + pos_embed).to_concrete(),
-            None => xs.to_concrete(),
+        let mut xs = match &self.pos_embed {
+            Some(pos_embed) => xs.add_(pos_embed)?,
+            None => xs,
         };
 
         for block in &self.blocks {
-            xs = block.forward(&xs);
+            xs = block.forward(&xs)?;
         }
 
         // (B, H, W, C) -> (B, C, H, W)
-        let xs: Tensor<4, f32> = xs
-            .transpose(2, 3) // (B, H, C, W)
-            .to_concrete()
-            .transpose(1, 2) // (B, C, H, W)
-            .to_concrete();
+        let xs = xs.permute(&[0, 3, 1, 2])?;
 
-        let xs = self.neck_conv1.forward(&xs);
-        let xs = self.neck_ln1.forward(&xs);
-        let xs = self.neck_conv2.forward(&xs.to_concrete());
-        self.neck_ln2.forward(&xs)
+        // Neck. The neck LayerNorms are Meta's LayerNorm2d: over channels.
+        let xs = self.neck_conv1.forward(&xs)?;
+        let xs = channel_layer_norm(&self.neck_ln1, &xs)?;
+        let xs = self.neck_conv2.forward(&xs)?;
+        channel_layer_norm(&self.neck_ln2, &xs)
     }
-}
-
-/// LayerNormNd<f32> helper for BHWC tensors (normalizes last dim).
-fn layer_norm_bhwc(
-    norm: &LayerNormNd<f32>,
-    input: &Tensor<4, f32, impl Fusion<4, f32>>,
-) -> Tensor<4, f32, Concrete<f32, 4>> {
-    let [b, h, w, c] = input.shape();
-    // Flatten to 3D (b*h, w, c) for layer_norm, then reshape back
-    let flat = input.reshape([b * h, w, c]);
-    let normed = norm.forward(&flat);
-    normed.reshape([b, h, w, c]).to_concrete()
 }

@@ -1,26 +1,30 @@
-use fusor::{Device, QMatrix, Result, Tensor, VarBuilder};
+use fusor2::device::Device;
+use fusor2::tensor::Tensor;
+use fusor2::{Result, VarBuilder};
+
+use super::QLinear;
 
 /// Qwen-style Feed Forward Network with gate/up/down projections
 /// Formula: SiLU(x @ gate) * (x @ up) @ down
 pub struct QwenFeedForward {
-    gate: QMatrix,
-    up: QMatrix,
-    down: QMatrix,
+    gate: QLinear,
+    up: QLinear,
+    down: QLinear,
 }
 
 impl QwenFeedForward {
-    pub fn load(device: &Device, vb: &mut VarBuilder) -> Result<Self> {
-        let gate = vb.get("ffn_gate.weight", device)?;
-        let up = vb.get("ffn_up.weight", device)?;
-        let down = vb.get("ffn_down.weight", device)?;
+    pub fn load(device: &Device, vb: &VarBuilder) -> Result<Self> {
+        let gate = QLinear::load(vb, device, "ffn_gate.weight")?;
+        let up = QLinear::load(vb, device, "ffn_up.weight")?;
+        let down = QLinear::load(vb, device, "ffn_down.weight")?;
 
         Ok(Self { gate, up, down })
     }
 
-    pub fn forward(&self, x: &Tensor<3, f32>) -> Tensor<3, f32> {
-        let gate = x.q_mat_mul(&self.gate);
-        let up = x.q_mat_mul(&self.up);
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gate = self.gate.forward(x)?;
+        let up = self.up.forward(x)?;
         // SiLU(gate) * up, then project down
-        gate.silu().mul_(&up).q_mat_mul(&self.down)
+        self.down.forward(&gate.silu()?.mul(&up)?)
     }
 }

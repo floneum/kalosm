@@ -1,5 +1,6 @@
-use fusor::{Device, VarBuilder};
-use fusor::{Result, Tensor};
+use fusor2::device::Device;
+use fusor2::tensor::Tensor;
+use fusor2::{Result, VarBuilder};
 
 use super::{BertAttention, BertIntermediate, BertOutput};
 
@@ -12,11 +13,7 @@ pub(crate) struct BertLayer {
 }
 
 impl BertLayer {
-    pub(crate) fn load(
-        device: &Device,
-        vb: &mut VarBuilder,
-        config: &super::Config,
-    ) -> Result<Self> {
+    pub(crate) fn load(device: &Device, vb: &VarBuilder, config: &super::Config) -> Result<Self> {
         let attention = BertAttention::load(device, vb, config)?;
         let intermediate = BertIntermediate::load(device, vb, config)?;
         let output = BertOutput::load(device, vb, config)?;
@@ -30,12 +27,12 @@ impl BertLayer {
 
     pub(crate) fn forward(
         &self,
-        hidden_states: &Tensor<3, f32>,
-        attention_mask: Option<&Tensor<2, u32>>,
-    ) -> Tensor<3, f32> {
+        hidden_states: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let attention_output = self.attention.forward(hidden_states, attention_mask);
-        let intermediate_output = self.intermediate.forward(&attention_output);
+        let attention_output = self.attention.forward(hidden_states, attention_mask)?;
+        let intermediate_output = self.intermediate.forward(&attention_output)?;
         self.output.forward(&intermediate_output, &attention_output)
     }
 }

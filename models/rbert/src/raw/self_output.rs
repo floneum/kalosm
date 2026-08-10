@@ -1,24 +1,23 @@
-use fusor::layers::{LayerNorm, Linear};
-use fusor::{Device, VarBuilder};
-use fusor::{Result, Tensor};
+use fusor2::device::Device;
+use fusor2::layers::{LayerNorm, Linear};
+use fusor2::tensor::Tensor;
+use fusor2::{Result, VarBuilder};
+
+use super::load_linear;
 
 pub(crate) struct BertSelfOutput {
-    dense: Linear<f32>,
-    layer_norm: LayerNorm<1, f32>,
+    dense: Linear,
+    layer_norm: LayerNorm,
     span: tracing::Span,
 }
 
 impl BertSelfOutput {
-    pub(crate) fn load(
-        device: &Device,
-        vb: &mut VarBuilder,
-        config: &super::Config,
-    ) -> Result<Self> {
-        let dense = Linear::load(device, &mut vb.pp("attn_output"))?;
+    pub(crate) fn load(device: &Device, vb: &VarBuilder, config: &super::Config) -> Result<Self> {
+        let dense = load_linear(&vb.pp("attn_output"), device)?;
         let layer_norm = LayerNorm::load(
-            device,
-            &mut vb.pp("attn_output_norm"),
-            config.layer_norm_eps as _,
+            &vb.pp("attn_output_norm"),
+            device.graph().handle(),
+            config.layer_norm_eps as f32,
         )?;
         Ok(Self {
             dense,
@@ -27,13 +26,9 @@ impl BertSelfOutput {
         })
     }
 
-    pub(crate) fn forward(
-        &self,
-        hidden_states: &Tensor<3, f32>,
-        input_tensor: &Tensor<3, f32>,
-    ) -> Tensor<3, f32> {
+    pub(crate) fn forward(&self, hidden_states: &Tensor, input_tensor: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let hidden_states = self.dense.forward(hidden_states);
-        self.layer_norm.forward(&(&hidden_states + input_tensor))
+        let hidden_states = self.dense.forward(hidden_states)?;
+        self.layer_norm.forward(&hidden_states.add(input_tensor)?)
     }
 }

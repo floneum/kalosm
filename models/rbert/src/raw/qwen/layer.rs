@@ -1,30 +1,34 @@
-use fusor::layers::RmsNorm;
-use fusor::{Device, Result, RopeCache, Tensor, VarBuilder};
+use fusor2::device::Device;
+use fusor2::layers::RmsNorm;
+use fusor2::tensor::Tensor;
+use fusor2::{Result, VarBuilder};
 
 use super::attention::QwenSelfAttention;
 use super::feed_forward::QwenFeedForward;
+use super::model::QwenRope;
 
 /// A single Qwen transformer layer with pre-norm architecture
 pub struct QwenLayer {
-    attention_norm: RmsNorm<1, f32>,
+    attention_norm: RmsNorm,
     attention: QwenSelfAttention,
-    ffn_norm: RmsNorm<1, f32>,
+    ffn_norm: RmsNorm,
     feed_forward: QwenFeedForward,
 }
 
 impl QwenLayer {
     pub fn load(
         device: &Device,
-        vb: &mut VarBuilder,
+        vb: &VarBuilder,
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
         eps: f32,
     ) -> Result<Self> {
-        let attention_norm = RmsNorm::load(device, &mut vb.pp("attn_norm"), eps)?;
+        let graph = device.graph().handle();
+        let attention_norm = RmsNorm::load(&vb.pp("attn_norm"), graph, eps)?;
         let attention =
             QwenSelfAttention::load(device, vb, num_heads, num_kv_heads, head_dim, eps)?;
-        let ffn_norm = RmsNorm::load(device, &mut vb.pp("ffn_norm"), eps)?;
+        let ffn_norm = RmsNorm::load(&vb.pp("ffn_norm"), graph, eps)?;
         let feed_forward = QwenFeedForward::load(device, vb)?;
 
         Ok(Self {
@@ -37,22 +41,22 @@ impl QwenLayer {
 
     pub fn forward(
         &self,
-        hidden_states: &Tensor<3, f32>,
-        rope_cache: &RopeCache,
-        attention_mask: Option<&Tensor<2, u32>>,
-    ) -> Tensor<3, f32> {
+        hidden_states: &Tensor,
+        rope: &QwenRope,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         // Pre-norm + attention + residual
         let residual = hidden_states;
-        let hidden_states = self.attention_norm.forward(hidden_states);
+        let hidden_states = self.attention_norm.forward(hidden_states)?;
         let hidden_states = self
             .attention
-            .forward(&hidden_states, rope_cache, attention_mask);
-        let hidden_states = residual.add_(&hidden_states);
+            .forward(&hidden_states, rope, attention_mask)?;
+        let hidden_states = residual.add(&hidden_states)?;
 
         // Pre-norm + FFN + residual
         let residual = &hidden_states;
-        let ffn_input = self.ffn_norm.forward(&hidden_states);
-        let ffn_output = self.feed_forward.forward(&ffn_input);
-        residual.add_(&ffn_output)
+        let ffn_input = self.ffn_norm.forward(&hidden_states)?;
+        let ffn_output = self.feed_forward.forward(&ffn_input)?;
+        residual.add(&ffn_output)
     }
 }
