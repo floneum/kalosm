@@ -55,10 +55,7 @@ impl LlamaModel {
         // next step reuses the same graph — no detach, no host round trip.
         let _ = &cache;
         // The logits are `[1, vocab]`; row-major readback is the flat row.
-        let len = logits
-            .dim(logits.rank() - 1)
-            .as_const()
-            .expect("logits length is constant") as usize;
+        let len = logits.dim(1);
 
         Ok(PreparedForwardLogits {
             logits,
@@ -102,7 +99,7 @@ impl LlamaModel {
         let PreparedForwardLogits { logits, len, trace } = prepared;
         Box::pin(async move {
             let download_start = trace.step_start();
-            let logits_vec = logits.to_vec_f32().map_err(LlamaModelError::from)?;
+            let logits_vec = logits.to_vec_f32_async().await.map_err(LlamaModelError::from)?;
             debug_assert_eq!(logits_vec.len(), len);
             if let Some(start) = download_start {
                 tracing::info!(
@@ -149,14 +146,15 @@ impl LlamaModel {
         Box::pin(async move {
             let download_start = trace.step_start();
             let top_logits = if use_full_logits_for_sampling(len) {
-                let logits_vec = logits.to_vec_f32().map_err(LlamaModelError::from)?;
+                let logits_vec = logits.to_vec_f32_async().await.map_err(LlamaModelError::from)?;
                 top_k_logits_from_full(&logits_vec, top_k)
             } else {
                 let k = top_k.clamp(1, len) as u32;
-                let (values, ids) =
-                    fusor2::sampling::top_k_pairs(&logits, k).map_err(LlamaModelError::from)?;
-                let values = values.to_vec_f32().map_err(LlamaModelError::from)?;
-                let ids = ids.to_vec_u32().map_err(LlamaModelError::from)?;
+                // The row is `[1, vocab]` so the sampler can be a resolve
+                // root; `top_k` reads it as the row it is.
+                let (values, ids) = logits.reshape([len]).top_k(k);
+                let values = values.to_vec_f32_async().await.map_err(LlamaModelError::from)?;
+                let ids = ids.to_flat_async().await.map_err(LlamaModelError::from)?;
                 ids.into_iter()
                     .zip(values)
                     .map(|(token_id, logit)| Logit {

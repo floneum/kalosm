@@ -24,7 +24,7 @@ fn main() {
         assert!(path.exists(), "model file not found: {}", path.display());
 
         let device = Device::gpu().await.unwrap();
-        let fusor2::session::Device::Gpu(target) = device.session().device().clone() else {
+        let fusor2::session::Backend::Gpu(target) = device.backend().clone() else {
             unreachable!("gpu device is gpu");
         };
 

@@ -12,22 +12,9 @@ use attention_layer::LlamaFeedForward;
 use attention_layer::PhiFeedForward;
 use attention_layer::SeparateAttention;
 use fusor2::cache::{MaskCache, MaskKind};
-use fusor2::device::Device;
-use fusor2::graph::Graph;
-use fusor2::tensor::Dyn as Tensor;
-use fusor2::{Dtype, QMatrix, Result};
+use fusor2::layers::RmsNorm;
+use fusor2::{Device, Dim, Dtype, Graph, QMatrix, Result, Tensor};
 use fusor2_gguf::{GgufValue, RawTensorBytes, ShardedVarBuilder};
-use fusor2::Dim;
-
-/// The const-rank spellings this module converts to at a layer or cache
-/// boundary. The hidden state is `[batch, seq, hidden]` and a norm's scale is
-/// `[hidden]`; the module itself threads the runtime-rank `Dyn`.
-type Tensor1 = fusor2::Tensor<1, f32>;
-type Tensor3 = fusor2::Tensor<3, f32>;
-
-fn rank3(t: &Tensor) -> Result<Tensor3> {
-    Tensor3::try_from_dyn(t.clone())
-}
 
 mod attention_layer;
 pub mod cache;
@@ -77,20 +64,20 @@ pub struct Model {
     tok_embeddings: QMatrix,
     tok_embedding_scale: Option<f32>,
     layers: Vec<LlamaAttention>,
-    norm: fusor2::layers::RmsNorm,
+    norm: RmsNorm,
     output: QMatrix,
     /// Memoizes the materialized (rectangular / windowed) masks.
     masks: Mutex<MaskCache>,
     /// The decode loop's persistent input leaves: the token id and its
     /// absolute position, both `[1]` `u32`. Only their *bytes* change per
     /// step, so every step reuses one graph and replays one plan.
-    step_inputs: std::sync::OnceLock<(Tensor, Tensor)>,
+    step_inputs: std::sync::OnceLock<(Tensor<1, u32>, Tensor<1, u32>)>,
 }
 
 /// The embedded token inputs produced by [`Model::encode_tokens`], ready to be
 /// run through the transformer layers.
 pub(crate) struct EncodedTokens {
-    embeddings: Tensor,
+    embeddings: Tensor<3>,
     seq_len: usize,
     index_pos: usize,
 }
@@ -141,17 +128,19 @@ fn qmatrix_from_raw(graph: &Graph, raw: &RawTensorBytes) -> Result<QMatrix> {
 
 /// A GGUF tensor as a dense rank-1 `f32` value (norm weights, biases,
 /// `rope_freqs.weight`).
-fn dense_1d(graph: &Graph, raw: &RawTensorBytes) -> Result<Tensor> {
+fn dense_1d(device: &Device, raw: &RawTensorBytes) -> Result<Tensor<1>> {
     let n: u64 = raw.shape.iter().product();
-    let shape = [Dim::Const(n)];
     match raw.fmt {
-        Dtype::F32 => graph.tensor(Dtype::F32, &shape, &raw.bytes),
-        Dtype::F16 => graph
-            .tensor(Dtype::F16, &shape, &raw.bytes)?
-            .cast(Dtype::F32),
-        Dtype::Q(_) => qmatrix_from_raw(graph, raw)?
-            .dequantize()?
-            .reshape_dims(&shape),
+        // The dtype is data read out of the file; the rank is not.
+        Dtype::F32 | Dtype::F16 => Ok(Tensor::from_raw_bytes(
+            device,
+            raw.fmt,
+            [Dim::Const(n)],
+            &raw.bytes,
+        )),
+        Dtype::Q(_) => Ok(qmatrix_from_raw(device.graph(), raw)?
+            .to_tensor()
+            .reshape_dims([Dim::Const(n)])),
         other => Err(fusor2::Error::Dtype(format!(
             "{} has dtype {other:?}, which has no dense 1d path",
             raw.name
@@ -169,12 +158,8 @@ impl Model {
     ) -> std::result::Result<Self, LlamaSourceError> {
         let graph = device.graph().clone();
 
-        let decode_norm = |raw: RawTensorBytes, eps: f64| -> Result<fusor2::layers::RmsNorm> {
-            let weight = dense_1d(&graph, &raw)?;
-            Ok(fusor2::layers::RmsNorm::new(
-                Some(Tensor1::try_from_dyn(weight)?),
-                eps as f32,
-            ))
+        let decode_norm = |raw: RawTensorBytes, eps: f64| -> Result<RmsNorm> {
+            Ok(RmsNorm::new(Some(dense_1d(device, &raw)?), eps as f32))
         };
 
         // Get the eos and bos tokens from the metadata
@@ -264,7 +249,7 @@ impl Model {
             .unwrap_or_else(|| embedding_length / head_count);
 
         let rope_freq_weight: Option<Vec<f32>> = match source.tensor("rope_freqs.weight") {
-            Ok(raw) => Some(dense_1d(&graph, &raw)?.to_vec_f32()?),
+            Ok(raw) => Some(dense_1d(device, &raw)?.to_vec_f32()),
             Err(_) => None,
         };
 
@@ -285,12 +270,10 @@ impl Model {
         };
         let config = Arc::new(config);
 
-        let rope = RopeImplementation::new(&config, config.rope_theta, device)?;
-        let sliding_rope = rope_freq_base_sliding
-            .map(|rope_freq_base_sliding| {
-                RopeImplementation::new(&config, rope_freq_base_sliding, device)
-            })
-            .transpose()?;
+        let rope = RopeImplementation::new(&config, config.rope_theta, device);
+        let sliding_rope = rope_freq_base_sliding.map(|rope_freq_base_sliding| {
+            RopeImplementation::new(&config, rope_freq_base_sliding, device)
+        });
 
         let tok_embeddings_q = qmatrix_from_raw(&graph, &source.tensor("token_embd.weight")?)?;
         let tok_embedding_scale =
@@ -326,10 +309,10 @@ impl Model {
                 let bias_v = source.tensor(&format!("{prefix}.attn_v.bias"));
                 let bias = if let (Ok(bias_q), Ok(bias_k), Ok(bias_v)) = (bias_q, bias_k, bias_v) {
                     Some(AttentionBias::new(
-                        dense_1d(&graph, &bias_q)?,
-                        dense_1d(&graph, &bias_k)?,
-                        dense_1d(&graph, &bias_v)?,
-                    )?)
+                        dense_1d(device, &bias_q)?,
+                        dense_1d(device, &bias_k)?,
+                        dense_1d(device, &bias_v)?,
+                    ))
                 } else {
                     None
                 };
@@ -448,7 +431,7 @@ impl Model {
         &self,
         raw_tokens: &[u32],
         mut cache: Option<&mut LlamaCache>,
-    ) -> Result<(Vec<u32>, usize)> {
+    ) -> (Vec<u32>, usize) {
         let tokens = raw_tokens.to_vec();
         let mut seq_len = tokens.len();
         let cached_tokens = cache.as_ref().map(|c| c.tokens.len()).unwrap_or_default();
@@ -483,7 +466,7 @@ impl Model {
             (tokens, index_pos)
         };
         let _ = seq_len;
-        Ok((tokens, index_pos))
+        (tokens, index_pos)
     }
 
     pub fn encode_tokens(
@@ -491,24 +474,20 @@ impl Model {
         raw_tokens: &[u32],
         device: &Device,
         cache: Option<&mut LlamaCache>,
-    ) -> Result<EncodedTokens> {
-        let (tokens, index_pos) = self.plan_tokens(raw_tokens, cache)?;
+    ) -> EncodedTokens {
+        let (tokens, index_pos) = self.plan_tokens(raw_tokens, cache);
         let seq_len = tokens.len();
-        let ids = Tensor::from_elements(
-            device.graph().handle(),
-            &[Dim::Const(tokens.len() as u64)],
-            &tokens,
-        )?;
-        let mut embeddings = self.tok_embeddings.index_select_rows(&ids)?.unsqueeze(0)?;
+        let ids = Tensor::from_slice(device, [seq_len], &tokens);
+        let mut embeddings = self.tok_embeddings.rows_at(&ids).unsqueeze(0);
         if let Some(scale) = self.tok_embedding_scale {
-            embeddings = embeddings.mul_scalar(scale)?;
+            embeddings = embeddings.mul_scalar(scale);
         }
 
-        Ok(EncodedTokens {
+        EncodedTokens {
             embeddings,
             seq_len,
             index_pos,
-        })
+        }
     }
 
     /// The `(MaskKind, mask tensor)` a `[q_len, k_len]` score block needs.
@@ -518,7 +497,7 @@ impl Model {
         q_len: usize,
         k_len: usize,
         window: Option<usize>,
-    ) -> Result<(MaskKind, Option<Tensor>)> {
+    ) -> Result<(MaskKind, Option<Tensor<2>>)> {
         if q_len == 1 {
             // One query against a warm cache sees every remaining key (a
             // sliding window is enforced by eviction).
@@ -533,10 +512,7 @@ impl Model {
             Dim::Const(k_len as u64),
             window.map(|w| w as u64),
         )?;
-        Ok((
-            MaskKind::QkMask,
-            mask.tensor().map(|t| t.clone().into_dyn()),
-        ))
+        Ok((MaskKind::QkMask, mask.tensor().cloned()))
     }
 
     /// The last token's logits as `[1, vocab]`. Deliberately NOT reshaped to
@@ -548,21 +524,26 @@ impl Model {
         tokens: &[u32],
         device: &Device,
         mut cache: Option<&mut LlamaCache>,
-    ) -> Result<Tensor> {
+    ) -> Result<Tensor<2>> {
         if cache.as_ref().is_some_and(|c| c.blocks.first().is_some_and(|b| b.is_fixed())) {
             let cache = cache.as_deref_mut().expect("checked above");
-            let (steps, index_pos) = self.plan_tokens(tokens, Some(cache))?;
+            let (steps, index_pos) = self.plan_tokens(tokens, Some(cache));
             let n = steps.len();
             let mut logits = None;
             for (i, tok) in steps.iter().enumerate() {
                 let want_logits = i + 1 == n;
-                let out = self.decode_step(*tok, index_pos + i, device, cache, want_logits)?;
+                let out = self.decode_step(*tok, index_pos + i, device, cache, want_logits);
                 // One resolve per step: this step's KV writes (always) plus
                 // the logits on the sampled step. Then every cache adopts its
                 // written buffer so the *same* graph runs the next step.
+                //
+                // The batch is the one genuinely rank-heterogeneous list here:
+                // a `[1, vocab]` logits row beside `[1, kv_heads, len, dim]`
+                // cache writes. That is what `resolve` takes and why the caches
+                // hand their pending roots over as `Dyn`.
                 let mut batch = Vec::with_capacity(2 * cache.blocks.len() + 1);
-                if want_logits {
-                    batch.push(out.clone());
+                if let Some(out) = &out {
+                    batch.push(out.clone().into_dyn());
                 }
                 for block in &cache.blocks {
                     block.pending_into(&mut batch);
@@ -571,14 +552,12 @@ impl Model {
                 for block in &mut cache.blocks {
                     block.commit();
                 }
-                if want_logits {
-                    logits = Some(out);
-                }
+                logits = out.or(logits);
             }
             return logits.ok_or_else(|| fusor2::Error::Shape("forward of no tokens".into()));
         }
         let hidden = self.forward_last_hidden_f32(tokens, device, cache)?;
-        self.output.q_mat_mul(&hidden)
+        Ok(hidden.q_mat_mul(&self.output))
     }
 
     /// One decode-shaped step: token `token` at absolute `position`, one
@@ -586,6 +565,9 @@ impl Model {
     /// **identical** across steps — same leaves, same nodes — so from step
     /// two on, saturation and extraction are replays and the plan is reused;
     /// only leaf bytes and the length bindings change.
+    ///
+    /// `None` is a prefill step: its product is the KV writes it left in the
+    /// caches, and the head is not run.
     fn decode_step(
         &self,
         token: u32,
@@ -593,69 +575,59 @@ impl Model {
         device: &Device,
         cache: &mut LlamaCache,
         want_logits: bool,
-    ) -> Result<Tensor> {
-        let graph = device.graph().clone();
+    ) -> Option<Tensor<2>> {
         let (ids, pos) = self
             .step_inputs
             .get_or_init(|| {
-                let ids = graph
-                    .leaf("decode_ids", &[Dim::Const(1)], Dtype::U32)
-                    .expect("a fresh leaf on a live graph");
-                let pos = graph
-                    .leaf("decode_pos", &[Dim::Const(1)], Dtype::U32)
-                    .expect("a fresh leaf on a live graph");
-                (ids, pos)
-            })
-            .clone();
-        ids.set_bytes(token.to_le_bytes().to_vec())?;
-        pos.set_bytes((position as u32).to_le_bytes().to_vec())?;
+                (
+                    Tensor::leaf(device, [Dim::Const(1)]),
+                    Tensor::leaf(device, [Dim::Const(1)]),
+                )
+            });
+        ids.set_elements(&[token]);
+        pos.set_elements(&[position as u32]);
 
-        let mut layer_in = self.tok_embeddings.index_select_rows(&ids)?.unsqueeze(0)?;
+        let mut layer_in = self.tok_embeddings.rows_at(ids).unsqueeze(0);
         if let Some(scale) = self.tok_embedding_scale {
-            layer_in = layer_in.mul_scalar(scale)?;
+            layer_in = layer_in.mul_scalar(scale);
         }
 
         for (i, layer) in self.layers.iter().enumerate() {
             let residual = layer_in.clone();
-            let x = layer.attention_norm.forward(&rank3(&layer_in)?).into_dyn();
+            let x = layer.attention_norm.forward(&layer_in);
             // One query sees every cached key: structurally maskless.
             let mut attn = layer.forward(
                 &x,
                 (MaskKind::None, None),
                 position,
-                Some(&pos),
+                Some(pos),
                 Some(&mut cache.blocks[i]),
-            )?;
+            );
             if let Some(post_attention_norm) = &layer.post_attention_norm {
-                attn = post_attention_norm.forward(&rank3(&attn)?).into_dyn();
+                attn = post_attention_norm.forward(&attn);
             }
-            let x = layer
-                .ffn_norm
-                .forward_residual(&rank3(&attn)?, &rank3(&residual)?)
-                .into_dyn();
+            let x = layer.ffn_norm.forward_residual(&attn, &residual);
             if layer.post_ffn_norm.is_none() {
                 if let Some(layer_out) = layer
                     .feed_forward_variant
-                    .forward_add_residuals(&x, &attn, &residual)?
+                    .forward_add_residuals(&x, &attn, &residual)
                 {
                     layer_in = layer_out;
                     continue;
                 }
             }
-            let mut x = layer.feed_forward_variant.forward(&x)?;
+            let mut x = layer.feed_forward_variant.forward(&x);
             if let Some(post_ffn_norm) = &layer.post_ffn_norm {
-                x = post_ffn_norm.forward(&rank3(&x)?).into_dyn();
+                x = post_ffn_norm.forward(&x);
             }
-            layer_in = x.add(&attn)?.add(&residual)?;
+            layer_in = x.add(&attn).add(&residual);
         }
         if !want_logits {
-            // A prefill step's product is its KV writes; the head is not run.
-            return Ok(layer_in);
+            return None;
         }
-        let x = self.norm.forward(&rank3(&layer_in)?).into_dyn();
-        let hidden_size = x.dim(2);
-        let hidden = x.reshape_dims(&[Dim::Const(1), hidden_size])?;
-        self.output.q_mat_mul(&hidden)
+        let x = self.norm.forward(&layer_in);
+        let hidden = x.reshape_dims([Dim::Const(1), x.extent(2)]);
+        Some(hidden.q_mat_mul(&self.output))
     }
 
     pub(crate) fn forward_last_hidden_f32(
@@ -663,8 +635,8 @@ impl Model {
         tokens: &[u32],
         device: &Device,
         mut cache: Option<&mut LlamaCache>,
-    ) -> Result<Tensor> {
-        let encoded = self.encode_tokens(tokens, device, cache.as_deref_mut())?;
+    ) -> Result<Tensor<2>> {
+        let encoded = self.encode_tokens(tokens, device, cache.as_deref_mut());
         if encoded.seq_len <= 1 {
             return self.forward_last_hidden_from_embeddings(encoded, device, cache);
         }
@@ -683,7 +655,7 @@ impl Model {
         let mut last = None;
         for i in 0..seq_len {
             let step = EncodedTokens {
-                embeddings: embeddings.narrow(1, i, 1)?,
+                embeddings: embeddings.narrow(1, i, 1),
                 seq_len: 1,
                 index_pos: index_pos + i,
             };
@@ -701,7 +673,7 @@ impl Model {
         encoded: EncodedTokens,
         device: &Device,
         mut cache: Option<&mut LlamaCache>,
-    ) -> Result<Tensor> {
+    ) -> Result<Tensor<2>> {
         let EncodedTokens {
             embeddings: mut layer_in,
             seq_len,
@@ -711,52 +683,49 @@ impl Model {
 
         for (i, layer) in self.layers.iter().enumerate() {
             let residual = layer_in.clone();
-            let x = layer.attention_norm.forward(&rank3(&layer_in)?).into_dyn();
+            let x = layer.attention_norm.forward(&layer_in);
             let cache_block = cache.as_deref_mut().map(|c| &mut c.blocks[i]);
             let k_len = cache_block
                 .as_ref()
                 .and_then(|c| c.len().as_const())
                 .unwrap_or(0) as usize
                 + seq_len;
-            let mask = self.mask_for(&graph, seq_len, k_len, layer.sliding_window_size)?;
+            let (kind, mask) = self.mask_for(&graph, seq_len, k_len, layer.sliding_window_size)?;
             let mut attn = layer.forward(
                 &x,
-                (mask.0, mask.1.as_ref()),
+                (kind, mask.as_ref()),
                 index_pos,
                 None,
                 cache_block,
-            )?;
+            );
             if let Some(post_attention_norm) = &layer.post_attention_norm {
-                attn = post_attention_norm.forward(&rank3(&attn)?).into_dyn();
+                attn = post_attention_norm.forward(&attn);
             }
 
             // MLP over RMSNorm(attention_output + residual). The fused path
             // avoids materializing the mid-block residual add just to feed
             // normalization.
-            let x = layer
-                .ffn_norm
-                .forward_residual(&rank3(&attn)?, &rank3(&residual)?)
-                .into_dyn();
+            let x = layer.ffn_norm.forward_residual(&attn, &residual);
             if layer.post_ffn_norm.is_none() {
                 if let Some(layer_out) = layer
                     .feed_forward_variant
-                    .forward_add_residuals(&x, &attn, &residual)?
+                    .forward_add_residuals(&x, &attn, &residual)
                 {
                     layer_in = layer_out;
                     continue;
                 }
             }
-            let mut x = layer.feed_forward_variant.forward(&x)?;
+            let mut x = layer.feed_forward_variant.forward(&x);
             if let Some(post_ffn_norm) = &layer.post_ffn_norm {
-                x = post_ffn_norm.forward(&rank3(&x)?).into_dyn();
+                x = post_ffn_norm.forward(&x);
             }
-            layer_in = x.add(&attn)?.add(&residual)?;
+            layer_in = x.add(&attn).add(&residual);
         }
-        let x = self.norm.forward(&rank3(&layer_in)?).into_dyn();
+        let x = self.norm.forward(&layer_in);
         // The last token's hidden state, as `[1, hidden]`.
-        let hidden_size = x.dim(2);
-        x.narrow(1, seq_len - 1, 1)?
-            .reshape_dims(&[Dim::Const(1), hidden_size])
+        let hidden_size = x.extent(2);
+        Ok(x.narrow(1, seq_len - 1, 1)
+            .reshape_dims([Dim::Const(1), hidden_size]))
     }
 
     #[allow(dead_code)]

@@ -256,7 +256,7 @@ impl ForwardTrace {
 }
 
 struct PreparedForwardLogits {
-    logits: fusor2::tensor::Dyn,
+    logits: fusor2::Tensor<2>,
     len: usize,
     trace: ForwardTrace,
 }
