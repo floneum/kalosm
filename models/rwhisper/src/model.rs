@@ -1,8 +1,6 @@
 use flate2::{write::ZlibEncoder, Compression};
 use fusor2::cache::TensorCache;
-use fusor2::device::Device;
-use fusor2::tensor::Dyn as Tensor;
-use fusor2::{Dim, Error};
+use fusor2::{stack, Device, Error, Tensor};
 use futures_channel::mpsc::UnboundedSender;
 use rand::{
     distr::{weighted::WeightedIndex, Distribution},
@@ -168,20 +166,7 @@ impl WhisperInner {
         let mel = audio::pcm_to_mel(&self.config, &pcm_data, &self.mel_filters);
         let mel_len = mel.len();
         let n_mels = self.config.num_mel_bins;
-        let mel = match Tensor::from_elements(
-            self.device.graph().handle(),
-            &[
-                Dim::Const(n_mels as u64),
-                Dim::Const((mel_len / n_mels) as u64),
-            ],
-            &mel,
-        ) {
-            Ok(mel) => mel,
-            Err(err) => {
-                tracing::error!("Error uploading mel spectrogram: {err}");
-                return;
-            }
-        };
+        let mel = Tensor::from_slice(&self.device, [n_mels, mel_len / n_mels], &mel);
 
         if let Some(language) = language {
             if let Err(err) = self.decoder.set_language_token(language) {
@@ -213,7 +198,7 @@ struct Decoder {
     model: ModelType,
     rng: rand::rngs::StdRng,
     tokenizer: Tokenizer,
-    suppress_tokens: Tensor,
+    suppress_tokens: Tensor<1>,
     sot_token: u32,
     transcribe_token: u32,
     translate_token: u32,
@@ -247,11 +232,8 @@ impl Decoder {
                 }
             })
             .collect();
-        let suppress_tokens = Tensor::from_elements(
-            device.graph().handle(),
-            &[Dim::Const(suppress_tokens.len() as u64)],
-            &suppress_tokens,
-        )?;
+        let suppress_tokens =
+            Tensor::from_slice(device, [suppress_tokens.len()], &suppress_tokens);
         let sot_token = token_id(&tokenizer, SOT_TOKEN)?;
         let transcribe_token = token_id(&tokenizer, TRANSCRIBE_TOKEN)?;
         let translate_token = token_id(&tokenizer, TRANSLATE_TOKEN)?;
@@ -315,17 +297,15 @@ impl Decoder {
             .chain(std::iter::once(self.eot_token))
     }
 
-    fn encode(&mut self, mel: &Tensor) -> fusor2::Result<Tensor> {
-        let tensor = match &mut self.model {
-            ModelType::Quantized(model) => model.encoder.forward(mel)?,
-        };
-
-        Ok(tensor)
+    fn encode(&mut self, mel: &Tensor<3>) -> Tensor<3> {
+        match &mut self.model {
+            ModelType::Quantized(model) => model.encoder.forward(mel),
+        }
     }
 
     async fn decode(
         &mut self,
-        audio_features: &Tensor,
+        audio_features: &Tensor<2>,
         temperature: f64,
         task: Task,
         previous_tokens: &[u32],
@@ -348,7 +328,7 @@ impl Decoder {
         // The tokens that are queued for decoding
         let mut queued_tokens = tokens.clone();
         let mut cache = TextDecoderCache::new();
-        let mut attention_output: Option<Vec<TensorCache>> = None;
+        let mut attention_output: Option<Vec<TensorCache<4>>> = None;
         for i in 0..sample_len {
             let ys = match &mut self.model {
                 ModelType::Quantized(model) => {
@@ -384,7 +364,7 @@ impl Decoder {
                         audio_features,
                         &mut cache,
                         attention_output.as_deref_mut(),
-                    )?;
+                    );
 
                     // The quantized model caches tokens, so the queued tokens
                     // have been consumed.
@@ -398,23 +378,19 @@ impl Decoder {
             if i == 0 {
                 let probs = match &mut self.model {
                     ModelType::Quantized(model) => {
-                        let first = ys.narrow(1, 0, 1)?;
-                        let logits = model.decoder.final_linear(&first)?;
-                        logits.squeeze(0)?.squeeze(0)?.softmax(0)?.to_vec_f32()?
+                        let first = ys.narrow(1, 0, 1).squeeze::<2>(0).squeeze::<1>(0);
+                        let logits = model.decoder.final_linear(&first);
+                        logits.softmax(0).to_vec_f32()
                     }
                 };
                 no_speech_prob = probs[self.no_speech_token as usize] as f64;
             }
 
-            let seq_len = ys
-                .dim(1)
-                .as_const()
-                .ok_or_else(|| err_msg("decoder output length must be constant"))?
-                as usize;
+            let seq_len = ys.dim(1);
             let logits = match &mut self.model {
                 ModelType::Quantized(model) => {
-                    let last = ys.narrow(1, seq_len - 1, 1)?;
-                    model.decoder.final_linear(&last)?.squeeze(0)?.squeeze(0)?
+                    let last = ys.narrow(1, seq_len - 1, 1).squeeze::<2>(0).squeeze::<1>(0);
+                    model.decoder.final_linear(&last)
                 }
             };
 
@@ -425,16 +401,16 @@ impl Decoder {
             // - If the sum of the probabilities of timestamps is higher than any other tokens,
             //   only consider timestamps when sampling.
             // https://github.com/openai/whisper/blob/e8622f9afc4eba139bf796c210f5c01081000472/whisper/decoding.py#L439
-            let logits = logits.add(&self.suppress_tokens)?;
+            let logits = logits.add(&self.suppress_tokens);
             // The plain softmax of the suppressed logits; used both to sample
             // at zero temperature and to report the sampled token's
             // probability.
-            let probs = logits.softmax(0)?.to_vec_f32()?;
+            let probs = logits.softmax(0).to_vec_f32();
             let next_token = if temperature > 0f64 {
                 let prs = logits
-                    .div_scalar(temperature as f32)?
-                    .softmax(0)?
-                    .to_vec_f32()?;
+                    .div_scalar(temperature as f32)
+                    .softmax(0)
+                    .to_vec_f32();
                 let logits_v = self.apply_timestamp_rules(prs, &tokens, task.without_timestamps);
                 // Weights may be NaN if decoding fails
                 let distr = WeightedIndex::new(&logits_v)
@@ -485,7 +461,7 @@ impl Decoder {
                 vec![token_mask],
                 attention_output,
             )
-            .await?;
+            .await;
             if let [timestamps] = result.as_slice() {
                 token_timestamps = Some(timestamps.clone());
             }
@@ -585,7 +561,7 @@ impl Decoder {
 
     async fn decode_with_fallback(
         &mut self,
-        audio_features: &Tensor,
+        audio_features: &Tensor<2>,
         task: Task,
         previous_tokens: &[u32],
         n_frames: usize,
@@ -616,7 +592,7 @@ impl Decoder {
 
     async fn run(
         &mut self,
-        mel: &Tensor,
+        mel: &Tensor<2>,
         audio_frames: usize,
         task: Task,
         mut result: UnboundedSender<Segment>,
@@ -624,10 +600,7 @@ impl Decoder {
         // TODO: This should be dynamic based on how much memory the model uses and how much memory is available
         const MAX_CHUNKS: usize = 1;
 
-        let content_frames = mel
-            .dim(1)
-            .as_const()
-            .ok_or_else(|| err_msg("mel frame count must be constant"))? as usize;
+        let content_frames = mel.dim(1);
         let mut seek = 0;
         let start_time = cfg!(not(target_arch = "wasm32")).then(Instant::now);
         let mut chunk_indices = Vec::new();
@@ -645,17 +618,17 @@ impl Decoder {
                     break;
                 }
                 chunk_indices.push(seek..seek + segment_size);
-                let mel_segment = mel.narrow(1, seek, segment_size)?;
+                let mel_segment = mel.narrow(1, seek, segment_size);
                 chunked.push(mel_segment);
                 seek += segment_size;
             }
 
             // Encode all of the chunks
-            let batched_mel_segment = Tensor::stack(&chunked, 0)?;
+            let batched_mel_segment: Tensor<3> = stack(chunked.iter().cloned(), 0);
 
-            let batched_audio_features = self.encode(&batched_mel_segment)?;
+            let batched_audio_features = self.encode(&batched_mel_segment);
 
-            let split = batched_audio_features.chunk(chunk_indices.len(), 0)?;
+            let split = batched_audio_features.chunk(chunk_indices.len(), 0);
 
             // Tokens that are remaining in the last chunk's sentence fragment
             let mut tokens_in_sentence_fragment = Vec::new();
@@ -672,12 +645,12 @@ impl Decoder {
                 // Squeeze the batch dimension since decode_with_fallback expects a 2D
                 // tensor, and re-leaf the encoder output so the decode steps do not
                 // replay the encoder graph.
-                let audio_features_2d = audio_features.squeeze(0)?;
+                let audio_features_2d = audio_features.squeeze::<2>(0);
                 self.model
                     .device()
                     .session()
-                    .resolve(std::slice::from_ref(&audio_features_2d))?;
-                let audio_features_2d = audio_features_2d.detach()?;
+                    .resolve(&[audio_features_2d.clone().into_dyn()])?;
+                let audio_features_2d = audio_features_2d.detach();
 
                 let mut dr = self
                     .decode_with_fallback(

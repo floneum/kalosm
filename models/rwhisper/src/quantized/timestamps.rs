@@ -1,92 +1,75 @@
 // Based on an upstream Whisper DTW implementation with optimizations and refactoring.
 // https://rtavenar.github.io/blog/dtw.html is a good resource for understanding the dtw algorithm
 
-use fusor2::tensor::Dyn as Tensor;
+use fusor2::{stack, Minus2, Tensor};
 use std::num::NonZeroUsize;
 
 use crate::config::{HOP_LENGTH, N_FRAMES, SAMPLE_RATE};
 
-/// Returns the token-level timestamps as a tensor of shape batch x timestamps
+/// Returns the token-level timestamps as `batch x timestamps`.
 pub(super) async fn extract_timestamps(
     // A list of (layer, head) pairs to use for timestamp determination
     alignment_heads: &[[usize; 2]],
-    cross_attentions: &[Tensor],
+    // Per-layer `[batch, heads, tokens, frames]` cross-attention scores
+    cross_attentions: &[Tensor<4>],
     filter_width: NonZeroUsize,
     n_frames: usize,
     mask: Vec<Vec<bool>>,
-) -> fusor2::Result<Vec<Vec<f32>>> {
+) -> Vec<Vec<f32>> {
     // Select relevant cross-attention heads
-    let mut tensors_to_stack = Vec::new();
+    let mut tensors_to_stack: Vec<Tensor<3>> = Vec::new();
     for [layer, head] in alignment_heads.iter().copied() {
         if let Some(attn) = cross_attentions.get(layer) {
-            let narrowed = attn.narrow(1, head, 1)?;
-            let squeezed = narrowed.squeeze(1)?;
-            tensors_to_stack.push(squeezed);
+            tensors_to_stack.push(attn.narrow(1, head, 1).squeeze(1));
         }
     }
-    let stacked = Tensor::stack(&tensors_to_stack, 0)?;
-    let permuted = stacked.permute(&[1, 0, 2, 3])?;
-    let weights = permuted.narrow(3, 0, n_frames.min(N_FRAMES) / 2)?;
+    let stacked: Tensor<4> = stack(tensors_to_stack, 0);
+    let permuted = stacked.permute([1, 0, 2, 3]);
+    let weights = permuted.narrow(3, 0, n_frames.min(N_FRAMES) / 2);
 
-    if (0..weights.rank()).any(|i| weights.dim(i).as_const() == Some(0)) {
+    if weights.shape().contains(&0) {
         // No tokens to be aligned
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
     // Normalize
-    let weights = weights.softmax_last_dim()?;
+    let weights = weights.softmax_last_dim();
 
     // Smooth
-    let token_axis = weights.rank() - 2;
-    let var_sqrt = weights.var_keepdim(token_axis)?.pow_scalar(0.5)?;
+    let var_sqrt = weights.var_keepdim(Minus2).pow_scalar(0.5);
     let weights = median_filter(
         filter_width,
         weights
-            .sub_(&weights.mean_keepdim(token_axis)?)?
-            .div_(&var_sqrt)?,
-    )?;
+            .sub_::<4, 4, _>(&weights.mean_keepdim(Minus2))
+            .div_::<4, 4, _>(&var_sqrt),
+    );
 
-    let cost = weights.mean(1)?;
+    let cost: Tensor<3> = weights.mean(1);
 
     // Do the timewarp
     let mut results = Vec::new();
-    let n_batch = weights
-        .dim(0)
-        .as_const()
-        .expect("attention batch extent is constant") as usize;
+    let [n_batch, _, tokens, frames] = weights.shape();
     for batch_idx in 0..n_batch {
         // Exclude any tokens in the mask
-        let neg_cost = cost.mul_scalar(-1.0f32)?;
-        let batch_index_cost_2d = neg_cost.narrow(0, batch_idx, 1)?.squeeze(0)?;
-        let batch_index_cost_slice = batch_index_cost_2d.as_slice()?;
-        let shape = batch_index_cost_slice.shape();
-        let (rows, cols) = (
-            shape[0].as_const().unwrap() as usize,
-            shape[1].as_const().unwrap() as usize,
-        );
-        let batch_index_cost = (0..rows)
-            .map(|i| {
-                (0..cols)
-                    .map(|j| batch_index_cost_slice.get::<f32>(&[i, j]).unwrap())
-                    .collect()
-            })
-            .collect::<Vec<Vec<_>>>();
-        let batch_index_cost = batch_index_cost
-            .into_iter()
+        let neg_cost = cost.mul_scalar(-1.0f32);
+        let flat = neg_cost.narrow(0, batch_idx, 1).squeeze::<2>(0).to_flat();
+        debug_assert_eq!(flat.len(), tokens * frames);
+        let batch_index_cost = flat
+            .chunks(frames)
             .enumerate()
-            .filter_map(|(i, v)| {
+            .filter_map(|(i, row)| {
                 // Check bounds before accessing mask to avoid panics
                 if i < mask.get(batch_idx).map(|m| m.len()).unwrap_or(0) && mask[batch_idx][i] {
-                    Some(v)
+                    Some(row.to_vec())
                 } else {
                     None
                 }
             })
             .collect::<Vec<_>>();
         if batch_index_cost.is_empty() || batch_index_cost[0].is_empty() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
-        let (text_indices, time_indices) = dynamic_time_warp(batch_index_cost)?;
+        let (text_indices, time_indices) = dynamic_time_warp(batch_index_cost);
 
         let jumps = std::iter::once(true)
             .chain(
@@ -106,11 +89,11 @@ pub(super) async fn extract_timestamps(
 
         results.push(jumps.collect())
     }
-    Ok(results)
+    results
 }
 
 /// Computes the lowest cost warping path through the provided cost matrix
-fn dynamic_time_warp(matrix: Vec<Vec<f32>>) -> fusor2::Result<(Vec<f32>, Vec<f32>)> {
+fn dynamic_time_warp(matrix: Vec<Vec<f32>>) -> (Vec<f32>, Vec<f32>) {
     #[derive(Debug, Clone, Copy)]
     enum Action {
         Match,
@@ -184,11 +167,11 @@ fn dynamic_time_warp(matrix: Vec<Vec<f32>>) -> fusor2::Result<(Vec<f32>, Vec<f32
     xs.reverse();
     ys.reverse();
 
-    Ok((xs, ys))
+    (xs, ys)
 }
 
-fn median_filter(_filter_width: NonZeroUsize, weights: Tensor) -> fusor2::Result<Tensor> {
+fn median_filter(_filter_width: NonZeroUsize, weights: Tensor<4>) -> Tensor<4> {
     // TODO: Implement proper median filtering for timestamp smoothing
     // For now, return the weights unchanged
-    Ok(weights)
+    weights
 }
