@@ -7,6 +7,17 @@ use fusor2::tensor::Dyn as Tensor;
 use fusor2::{QMatrix, Result};
 use fusor2::Dim;
 
+/// The const-rank spelling of a `[batch, heads, seq, head_dim]` value.
+///
+/// This module threads the runtime-rank `Dyn` tensor; the caches and the
+/// norms take `fusor2::Tensor<4>`. Converting at the boundary keeps the
+/// conversion in one named place rather than at each of the six call sites.
+type Tensor4 = fusor2::Tensor<4, f32>;
+
+fn rank4(t: &Tensor) -> Result<Tensor4> {
+    Tensor4::try_from_dyn(t.clone())
+}
+
 const MINUS1: usize = usize::MAX;
 
 /// `t.narrow` with `MINUS1` meaning the last axis.
@@ -258,11 +269,11 @@ impl SeparateAttention {
 
         let mut query = split_heads(&query_states, b_sz, seq_len, num_heads, head_dim)?;
         if let Some(norm) = &self.attention_q_norm {
-            query = norm.forward(&query)?;
+            query = norm.forward(&rank4(&query)?).into_dyn();
         }
         let mut key = split_heads(&key_states, b_sz, seq_len, num_key_value_heads, head_dim)?;
         if let Some(norm) = &self.attention_k_norm {
-            key = norm.forward(&key)?;
+            key = norm.forward(&rank4(&key)?).into_dyn();
         }
         let value = split_heads(&value_states, b_sz, seq_len, num_key_value_heads, head_dim)?;
 
@@ -372,7 +383,10 @@ impl LlamaAttention {
                 // Fixed mode: the append is a scatter into a persistent
                 // buffer; a windowed layer is a ring, so eviction is the
                 // write itself and no keep_last runs.
-                cache.append(&key_states, &value_states)?
+                {
+                    let (k, v) = cache.append(&rank4(&key_states)?, &rank4(&value_states)?);
+                    (k.into_dyn(), v.into_dyn())
+                }
             }
             Some(cache) => {
                 // The first append stores the value itself, and ours is a
@@ -385,13 +399,14 @@ impl LlamaAttention {
                 } else {
                     (key_states, value_states)
                 };
-                let (k, v) = cache.append(&key_states, &value_states)?;
+                let (k, v) = cache.append(&rank4(&key_states)?, &rank4(&value_states)?);
+                let (k, v) = (k.into_dyn(), v.into_dyn());
                 // Sliding-window layers keep only the newest `window` keys:
                 // on decode (`q_len == 1`) evicting *before* attention leaves
                 // exactly the keys the window admits, so no mask is needed.
                 if let (Some(window), 1) = (self.sliding_window_size, q_len) {
-                    let k = cache.k.keep_last(window as u64)?.unwrap_or(k);
-                    let v = cache.v.keep_last(window as u64)?.unwrap_or(v);
+                    let k = cache.k.keep_last(window as u64).map_or(k, Tensor4::into_dyn);
+                    let v = cache.v.keep_last(window as u64).map_or(v, Tensor4::into_dyn);
                     (k, v)
                 } else {
                     (k, v)
@@ -415,8 +430,8 @@ impl LlamaAttention {
         if q_len > 1 {
             if let (Some(window), Some(cache)) = (self.sliding_window_size, cache.as_deref_mut()) {
                 if !cache.is_fixed() {
-                    cache.k.keep_last(window as u64)?;
-                    cache.v.keep_last(window as u64)?;
+                    cache.k.keep_last(window as u64);
+                    cache.v.keep_last(window as u64);
                 }
             }
         }

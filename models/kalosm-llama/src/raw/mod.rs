@@ -19,6 +19,16 @@ use fusor2::{Dtype, QMatrix, Result};
 use fusor2_gguf::{GgufValue, RawTensorBytes, ShardedVarBuilder};
 use fusor2::Dim;
 
+/// The const-rank spellings this module converts to at a layer or cache
+/// boundary. The hidden state is `[batch, seq, hidden]` and a norm's scale is
+/// `[hidden]`; the module itself threads the runtime-rank `Dyn`.
+type Tensor1 = fusor2::Tensor<1, f32>;
+type Tensor3 = fusor2::Tensor<3, f32>;
+
+fn rank3(t: &Tensor) -> Result<Tensor3> {
+    Tensor3::try_from_dyn(t.clone())
+}
+
 mod attention_layer;
 pub mod cache;
 mod rope;
@@ -161,7 +171,10 @@ impl Model {
 
         let decode_norm = |raw: RawTensorBytes, eps: f64| -> Result<fusor2::layers::RmsNorm> {
             let weight = dense_1d(&graph, &raw)?;
-            Ok(fusor2::layers::RmsNorm::new(Some(weight), eps as f32))
+            Ok(fusor2::layers::RmsNorm::new(
+                Some(Tensor1::try_from_dyn(weight)?),
+                eps as f32,
+            ))
         };
 
         // Get the eos and bos tokens from the metadata
@@ -520,7 +533,10 @@ impl Model {
             Dim::Const(k_len as u64),
             window.map(|w| w as u64),
         )?;
-        Ok((MaskKind::QkMask, mask.tensor().cloned()))
+        Ok((
+            MaskKind::QkMask,
+            mask.tensor().map(|t| t.clone().into_dyn()),
+        ))
     }
 
     /// The last token's logits as `[1, vocab]`. Deliberately NOT reshaped to
@@ -553,7 +569,7 @@ impl Model {
                 }
                 device.session().resolve(&batch)?;
                 for block in &mut cache.blocks {
-                    block.commit()?;
+                    block.commit();
                 }
                 if want_logits {
                     logits = Some(out);
@@ -601,7 +617,7 @@ impl Model {
 
         for (i, layer) in self.layers.iter().enumerate() {
             let residual = layer_in.clone();
-            let x = layer.attention_norm.forward(&layer_in)?;
+            let x = layer.attention_norm.forward(&rank3(&layer_in)?).into_dyn();
             // One query sees every cached key: structurally maskless.
             let mut attn = layer.forward(
                 &x,
@@ -611,9 +627,12 @@ impl Model {
                 Some(&mut cache.blocks[i]),
             )?;
             if let Some(post_attention_norm) = &layer.post_attention_norm {
-                attn = post_attention_norm.forward(&attn)?;
+                attn = post_attention_norm.forward(&rank3(&attn)?).into_dyn();
             }
-            let x = layer.ffn_norm.forward_residual(&attn, &residual)?;
+            let x = layer
+                .ffn_norm
+                .forward_residual(&rank3(&attn)?, &rank3(&residual)?)
+                .into_dyn();
             if layer.post_ffn_norm.is_none() {
                 if let Some(layer_out) = layer
                     .feed_forward_variant
@@ -625,7 +644,7 @@ impl Model {
             }
             let mut x = layer.feed_forward_variant.forward(&x)?;
             if let Some(post_ffn_norm) = &layer.post_ffn_norm {
-                x = post_ffn_norm.forward(&x)?;
+                x = post_ffn_norm.forward(&rank3(&x)?).into_dyn();
             }
             layer_in = x.add(&attn)?.add(&residual)?;
         }
@@ -633,7 +652,7 @@ impl Model {
             // A prefill step's product is its KV writes; the head is not run.
             return Ok(layer_in);
         }
-        let x = self.norm.forward(&layer_in)?;
+        let x = self.norm.forward(&rank3(&layer_in)?).into_dyn();
         let hidden_size = x.dim(2);
         let hidden = x.reshape_dims(&[Dim::Const(1), hidden_size])?;
         self.output.q_mat_mul(&hidden)
@@ -692,7 +711,7 @@ impl Model {
 
         for (i, layer) in self.layers.iter().enumerate() {
             let residual = layer_in.clone();
-            let x = layer.attention_norm.forward(&layer_in)?;
+            let x = layer.attention_norm.forward(&rank3(&layer_in)?).into_dyn();
             let cache_block = cache.as_deref_mut().map(|c| &mut c.blocks[i]);
             let k_len = cache_block
                 .as_ref()
@@ -708,13 +727,16 @@ impl Model {
                 cache_block,
             )?;
             if let Some(post_attention_norm) = &layer.post_attention_norm {
-                attn = post_attention_norm.forward(&attn)?;
+                attn = post_attention_norm.forward(&rank3(&attn)?).into_dyn();
             }
 
             // MLP over RMSNorm(attention_output + residual). The fused path
             // avoids materializing the mid-block residual add just to feed
             // normalization.
-            let x = layer.ffn_norm.forward_residual(&attn, &residual)?;
+            let x = layer
+                .ffn_norm
+                .forward_residual(&rank3(&attn)?, &rank3(&residual)?)
+                .into_dyn();
             if layer.post_ffn_norm.is_none() {
                 if let Some(layer_out) = layer
                     .feed_forward_variant
@@ -726,11 +748,11 @@ impl Model {
             }
             let mut x = layer.feed_forward_variant.forward(&x)?;
             if let Some(post_ffn_norm) = &layer.post_ffn_norm {
-                x = post_ffn_norm.forward(&x)?;
+                x = post_ffn_norm.forward(&rank3(&x)?).into_dyn();
             }
             layer_in = x.add(&attn)?.add(&residual)?;
         }
-        let x = self.norm.forward(&layer_in)?;
+        let x = self.norm.forward(&rank3(&layer_in)?).into_dyn();
         // The last token's hidden state, as `[1, hidden]`.
         let hidden_size = x.dim(2);
         x.narrow(1, seq_len - 1, 1)?
