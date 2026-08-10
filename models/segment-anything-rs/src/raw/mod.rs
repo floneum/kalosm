@@ -11,10 +11,8 @@
 //! - All other naming is the upstream Meta SegmentAnything PyTorch layout
 //!   (`image_encoder.*`, `prompt_encoder.*`, `mask_decoder.*`).
 
-use fusor2::graph::Graph;
 use fusor2::layers::{LayerNorm, Linear};
-use fusor2::tensor::Dyn as Tensor;
-use fusor2::{Dim, Dtype, QMatrix};
+use fusor2::{Device, Dim, Dtype, Error, QMatrix, Tensor};
 use fusor2_gguf::VarBuilder;
 
 pub mod image_encoder;
@@ -24,52 +22,52 @@ pub mod sam;
 pub mod tiny_vit;
 pub mod transformer;
 
+/// Loading is the fallible boundary: it reads a file. Every `forward` below is
+/// infallible, because a rank or extent mismatch inside one is a bug in the
+/// port, not a condition a caller can act on.
 pub(crate) type Result<T> = fusor2::Result<T>;
 
-/// `&[usize]` -> the `&[Dim]` the runtime-rank API wants.
-pub(crate) fn dims(v: &[usize]) -> Vec<Dim> {
-    v.iter().map(|&d| Dim::Const(d as u64)).collect()
-}
-
-/// Constant extent of axis `i` as a `usize`. SAM shapes are all static.
-pub(crate) fn udim(t: &Tensor, i: usize) -> usize {
-    t.dim(i)
-        .as_const()
-        .expect("SAM tensor extents are constant") as usize
-}
-
-/// One GGUF tensor as a dense `F32` value in `graph`.
+/// One GGUF tensor as a dense `F32` value of the rank the model expects.
 ///
 /// `fusor2_gguf` reverses GGUF's fastest-varying-first extents at read, so
-/// `raw.shape` is already row-major. `F16`/`BF16` entries are cast; a
-/// block-quantized entry goes through `QMatrix` and is dequantized on device.
-pub(crate) fn load_dense(vb: &VarBuilder, graph: &Graph, name: &str) -> Result<Tensor> {
+/// `raw.shape` is already row-major. `F16`/`BF16` entries are cast by
+/// `Tensor::from_raw_bytes`; a block-quantized entry goes through `QMatrix`
+/// and is dequantized on device.
+pub(crate) fn load_dense<const R: usize>(
+    vb: &VarBuilder,
+    device: &Device,
+    name: &str,
+) -> Result<Tensor<R>> {
     let raw = vb.get_raw(name)?;
     if matches!(raw.fmt, Dtype::Q(_)) {
-        return QMatrix::load(vb, graph, name)?.dequantize();
+        let decoded = QMatrix::load(vb, device.graph(), name)?.to_tensor();
+        return Tensor::<R>::try_from_dyn(decoded.into_dyn());
     }
-    let shape: Vec<Dim> = raw.shape.iter().map(|&d| Dim::Const(d)).collect();
-    let dense = Tensor::from_slice(graph.handle(), raw.fmt, &shape, &raw.bytes)?;
-    match raw.fmt {
-        Dtype::F32 => Ok(dense),
-        _ => dense.cast(Dtype::F32),
+    if raw.shape.len() != R {
+        return Err(Error::Shape(format!(
+            "{name} is rank {}, the model expects rank {R}",
+            raw.shape.len()
+        )));
     }
+    let mut shape = [Dim::Const(0); R];
+    for (slot, &d) in shape.iter_mut().zip(raw.shape.iter()) {
+        *slot = Dim::Const(d);
+    }
+    Ok(Tensor::from_raw_bytes(device, raw.fmt, shape, &raw.bytes))
 }
 
 /// `Linear::load` with the bias auto-detected from the file, matching the
 /// reference loader which accepted either spelling.
-pub(crate) fn linear(vb: &VarBuilder, graph: &Graph) -> Result<Linear> {
-    Linear::load(vb, graph.handle(), vb.contains_key("bias"))
+pub(crate) fn linear(vb: &VarBuilder, device: &Device) -> Result<Linear> {
+    Linear::load(vb, device.graph().handle(), vb.contains_key("bias"))
 }
 
 /// LayerNorm over the **channel** axis of a `(B, C, H, W)` tensor - Meta's
 /// `LayerNorm2d`. fusor2's `LayerNorm` normalizes the last axis, so this is a
 /// permute to channels-last, the last-axis norm, and the permute back; all
 /// three are views the compiler is free to fold.
-pub(crate) fn channel_layer_norm(ln: &LayerNorm, x: &Tensor) -> Result<Tensor> {
-    let nhwc = x.permute(&[0, 2, 3, 1])?;
-    let normed = ln.forward(&nhwc)?;
-    normed.permute(&[0, 3, 1, 2])
+pub(crate) fn channel_layer_norm(ln: &LayerNorm, x: &Tensor<4>) -> Tensor<4> {
+    ln.forward(&x.permute([0, 2, 3, 1])).permute([0, 3, 1, 2])
 }
 
 /// Activation function variants used in SAM.
@@ -91,14 +89,14 @@ impl MlpBlock {
     /// provided, are checked against the actual loaded shapes so a mismatch
     /// fails at load time rather than producing wrong outputs.
     pub fn load(
-        graph: &Graph,
+        device: &Device,
         vb: &VarBuilder,
         expected_in: Option<usize>,
         expected_hidden: Option<usize>,
         activation: Activation,
     ) -> Result<Self> {
-        let lin1 = linear(&vb.pp("lin1"), graph)?;
-        let lin2 = linear(&vb.pp("lin2"), graph)?;
+        let lin1 = linear(&vb.pp("lin1"), device)?;
+        let lin2 = linear(&vb.pp("lin2"), device)?;
         if let Some(d_in) = expected_in {
             assert_eq!(
                 lin1.in_features().as_const(),
@@ -130,11 +128,11 @@ impl MlpBlock {
         })
     }
 
-    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = self.lin1.forward(xs)?;
+    pub fn forward<const R: usize>(&self, xs: &Tensor<R>) -> Tensor<R> {
+        let xs = self.lin1.forward(xs);
         let xs = match self.activation {
-            Activation::Gelu => xs.gelu()?,
-            Activation::Relu => xs.relu()?,
+            Activation::Gelu => xs.gelu(),
+            Activation::Relu => xs.relu(),
         };
         self.lin2.forward(&xs)
     }

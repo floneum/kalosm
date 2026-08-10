@@ -1,12 +1,11 @@
 //! TwoWayTransformer for cross-attention between queries and image embeddings.
 
-use fusor2::composite::attention::{attention, MaskKind};
-use fusor2::graph::Graph;
+use fusor2::cache::MaskKind;
 use fusor2::layers::{LayerNorm, Linear};
-use fusor2::tensor::Dyn as Tensor;
+use fusor2::{Device, Tensor};
 use fusor2_gguf::VarBuilder;
 
-use super::{dims, linear, udim, Activation, MlpBlock, Result};
+use super::{linear, Activation, MlpBlock, Result};
 
 struct Attention {
     q_proj: Linear,
@@ -21,16 +20,16 @@ impl Attention {
     /// constructor signature but is currently unused (the projection layout
     /// encodes the downsample).
     fn load(
-        graph: &Graph,
+        device: &Device,
         vb: &VarBuilder,
         embedding_dim: usize,
         num_heads: usize,
         _downsample_rate: usize,
     ) -> Result<Self> {
-        let q_proj = linear(&vb.pp("q_proj"), graph)?;
-        let k_proj = linear(&vb.pp("k_proj"), graph)?;
-        let v_proj = linear(&vb.pp("v_proj"), graph)?;
-        let out_proj = linear(&vb.pp("out_proj"), graph)?;
+        let q_proj = linear(&vb.pp("q_proj"), device)?;
+        let k_proj = linear(&vb.pp("k_proj"), device)?;
+        let v_proj = linear(&vb.pp("v_proj"), device)?;
+        let out_proj = linear(&vb.pp("out_proj"), device)?;
         debug_assert_eq!(
             q_proj.in_features().as_const(),
             Some(embedding_dim as u64),
@@ -60,39 +59,32 @@ impl Attention {
         })
     }
 
-    fn separate_heads(&self, x: &Tensor) -> Result<Tensor> {
-        let b = udim(x, 0);
-        let n = udim(x, 1);
-        let c = udim(x, 2);
+    fn separate_heads(&self, x: &Tensor<3>) -> Tensor<4> {
+        let [b, n, c] = x.shape();
         let c_per_head = c / self.num_heads;
-        x.reshape_dims(&dims(&[b, n, self.num_heads, c_per_head]))?
-            .transpose(1, 2)
+        x.reshape([b, n, self.num_heads, c_per_head]).transpose(1, 2)
     }
 
-    fn recombine_heads(&self, x: &Tensor) -> Result<Tensor> {
-        let b = udim(x, 0);
-        let n_heads = udim(x, 1);
-        let n_tokens = udim(x, 2);
-        let c_per_head = udim(x, 3);
-        x.transpose(1, 2)?
-            .reshape_dims(&dims(&[b, n_tokens, n_heads * c_per_head]))
+    fn recombine_heads(&self, x: &Tensor<4>) -> Tensor<3> {
+        let [b, n_heads, n_tokens, c_per_head] = x.shape();
+        x.transpose(1, 2)
+            .reshape([b, n_tokens, n_heads * c_per_head])
     }
 
-    fn forward(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
-        let q = self.q_proj.forward(q)?;
-        let k = self.k_proj.forward(k)?;
-        let v = self.v_proj.forward(v)?;
+    fn forward(&self, q: &Tensor<3>, k: &Tensor<3>, v: &Tensor<3>) -> Tensor<3> {
+        let q = self.q_proj.forward(q);
+        let k = self.k_proj.forward(k);
+        let v = self.v_proj.forward(v);
 
-        let q = self.separate_heads(&q)?;
-        let k = self.separate_heads(&k)?;
-        let v = self.separate_heads(&v)?;
+        let q = self.separate_heads(&q);
+        let k = self.separate_heads(&k);
+        let v = self.separate_heads(&v);
 
-        let c_per_head = udim(&q, 3);
+        let c_per_head = q.shape()[3];
         let scale = 1.0 / (c_per_head as f32).sqrt();
 
-        let out = attention(&q, &k, &v, MaskKind::None, Some(scale))?;
-        let out = self.recombine_heads(&out)?;
-        self.out_proj.forward(&out)
+        let out = q.attention(&k, &v, MaskKind::None, Some(scale));
+        self.out_proj.forward(&self.recombine_heads(&out))
     }
 }
 
@@ -110,34 +102,35 @@ struct TwoWayAttentionBlock {
 
 impl TwoWayAttentionBlock {
     fn load(
-        graph: &Graph,
+        device: &Device,
         vb: &VarBuilder,
         embedding_dim: usize,
         num_heads: usize,
         mlp_dim: usize,
         skip_first_layer_pe: bool,
     ) -> Result<Self> {
-        let norm1 = LayerNorm::load(&vb.pp("norm1"), graph.handle(), 1e-5)?;
-        let norm2 = LayerNorm::load(&vb.pp("norm2"), graph.handle(), 1e-5)?;
-        let norm3 = LayerNorm::load(&vb.pp("norm3"), graph.handle(), 1e-5)?;
-        let norm4 = LayerNorm::load(&vb.pp("norm4"), graph.handle(), 1e-5)?;
-        let self_attn = Attention::load(graph, &vb.pp("self_attn"), embedding_dim, num_heads, 1)?;
+        let graph = device.graph().handle();
+        let norm1 = LayerNorm::load(&vb.pp("norm1"), graph, 1e-5)?;
+        let norm2 = LayerNorm::load(&vb.pp("norm2"), graph, 1e-5)?;
+        let norm3 = LayerNorm::load(&vb.pp("norm3"), graph, 1e-5)?;
+        let norm4 = LayerNorm::load(&vb.pp("norm4"), graph, 1e-5)?;
+        let self_attn = Attention::load(device, &vb.pp("self_attn"), embedding_dim, num_heads, 1)?;
         let cross_attn_token_to_image = Attention::load(
-            graph,
+            device,
             &vb.pp("cross_attn_token_to_image"),
             embedding_dim,
             num_heads,
             2,
         )?;
         let cross_attn_image_to_token = Attention::load(
-            graph,
+            device,
             &vb.pp("cross_attn_image_to_token"),
             embedding_dim,
             num_heads,
             2,
         )?;
         let mlp = MlpBlock::load(
-            graph,
+            device,
             &vb.pp("mlp"),
             Some(embedding_dim),
             Some(mlp_dim),
@@ -158,41 +151,38 @@ impl TwoWayAttentionBlock {
 
     fn forward(
         &self,
-        queries: &Tensor,
-        keys: &Tensor,
-        query_pe: &Tensor,
-        key_pe: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
+        queries: &Tensor<3>,
+        keys: &Tensor<3>,
+        query_pe: &Tensor<3>,
+        key_pe: &Tensor<3>,
+    ) -> (Tensor<3>, Tensor<3>) {
         // Self attention block
         let queries = if self.skip_first_layer_pe {
-            self.self_attn.forward(queries, queries, queries)?
+            self.self_attn.forward(queries, queries, queries)
         } else {
-            let q = queries.add(query_pe)?;
-            let attn_out = self.self_attn.forward(&q, &q, queries)?;
-            queries.add(&attn_out)?
+            let q = queries.add(query_pe);
+            let attn_out = self.self_attn.forward(&q, &q, queries);
+            queries.add(&attn_out)
         };
-        let queries = self.norm1.forward(&queries)?;
+        let queries = self.norm1.forward(&queries);
 
         // Cross attention block, tokens attending to image embedding
-        let q = queries.add(query_pe)?;
-        let k = keys.add(key_pe)?;
-        let attn_out = self.cross_attn_token_to_image.forward(&q, &k, keys)?;
-        let queries = queries.add(&attn_out)?;
-        let queries = self.norm2.forward(&queries)?;
+        let q = queries.add(query_pe);
+        let k = keys.add(key_pe);
+        let attn_out = self.cross_attn_token_to_image.forward(&q, &k, keys);
+        let queries = self.norm2.forward(&queries.add(&attn_out));
 
         // MLP block
-        let mlp_out = self.mlp.forward(&queries)?;
-        let queries = queries.add(&mlp_out)?;
-        let queries = self.norm3.forward(&queries)?;
+        let mlp_out = self.mlp.forward(&queries);
+        let queries = self.norm3.forward(&queries.add(&mlp_out));
 
         // Cross attention block, image embedding attending to tokens
-        let q = queries.add(query_pe)?;
-        let k = keys.add(key_pe)?;
-        let attn_out = self.cross_attn_image_to_token.forward(&k, &q, &queries)?;
-        let keys = keys.add(&attn_out)?;
-        let keys = self.norm4.forward(&keys)?;
+        let q = queries.add(query_pe);
+        let k = keys.add(key_pe);
+        let attn_out = self.cross_attn_image_to_token.forward(&k, &q, &queries);
+        let keys = self.norm4.forward(&keys.add(&attn_out));
 
-        Ok((queries, keys))
+        (queries, keys)
     }
 }
 
@@ -208,7 +198,7 @@ pub struct TwoWayTransformer {
 
 impl TwoWayTransformer {
     pub fn load(
-        graph: &Graph,
+        device: &Device,
         vb: &VarBuilder,
         depth: usize,
         embedding_dim: usize,
@@ -218,7 +208,7 @@ impl TwoWayTransformer {
         let mut layers = Vec::with_capacity(depth);
         for i in 0..depth {
             let layer = TwoWayAttentionBlock::load(
-                graph,
+                device,
                 &vb.pp(format!("layers.{i}")),
                 embedding_dim,
                 num_heads,
@@ -228,13 +218,14 @@ impl TwoWayTransformer {
             layers.push(layer);
         }
         let final_attn_token_to_image = Attention::load(
-            graph,
+            device,
             &vb.pp("final_attn_token_to_image"),
             embedding_dim,
             num_heads,
             2,
         )?;
-        let norm_final_attn = LayerNorm::load(&vb.pp("norm_final_attn"), graph.handle(), 1e-5)?;
+        let norm_final_attn =
+            LayerNorm::load(&vb.pp("norm_final_attn"), device.graph().handle(), 1e-5)?;
         Ok(Self {
             layers,
             final_attn_token_to_image,
@@ -244,36 +235,28 @@ impl TwoWayTransformer {
 
     pub fn forward(
         &self,
-        image_embedding: &Tensor,
-        image_pe: &Tensor,
-        point_embedding: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
-        let b = udim(image_embedding, 0);
-        let c = udim(image_embedding, 1);
-        let h = udim(image_embedding, 2);
-        let w = udim(image_embedding, 3);
+        image_embedding: &Tensor<4>,
+        image_pe: &Tensor<4>,
+        point_embedding: &Tensor<3>,
+    ) -> (Tensor<3>, Tensor<3>) {
+        let [b, c, h, w] = image_embedding.shape();
 
         // Flatten spatial dims and permute: (B, C, H, W) -> (B, H*W, C)
-        let image_embedding = image_embedding
-            .reshape_dims(&dims(&[b, c, h * w]))?
-            .transpose(1, 2)?;
-        let image_pe = image_pe
-            .reshape_dims(&dims(&[b, c, h * w]))?
-            .transpose(1, 2)?;
+        let image_embedding = image_embedding.reshape([b, c, h * w]).transpose(1, 2);
+        let image_pe = image_pe.reshape([b, c, h * w]).transpose(1, 2);
 
         let mut queries = point_embedding.clone();
         let mut keys = image_embedding;
 
         for layer in &self.layers {
-            (queries, keys) = layer.forward(&queries, &keys, point_embedding, &image_pe)?;
+            (queries, keys) = layer.forward(&queries, &keys, point_embedding, &image_pe);
         }
 
-        let q = queries.add(point_embedding)?;
-        let k = keys.add(&image_pe)?;
-        let attn_out = self.final_attn_token_to_image.forward(&q, &k, &keys)?;
-        let queries = queries.add(&attn_out)?;
-        let queries = self.norm_final_attn.forward(&queries)?;
+        let q = queries.add(point_embedding);
+        let k = keys.add(&image_pe);
+        let attn_out = self.final_attn_token_to_image.forward(&q, &k, &keys);
+        let queries = self.norm_final_attn.forward(&queries.add(&attn_out));
 
-        Ok((queries, keys))
+        (queries, keys)
     }
 }
