@@ -1,9 +1,6 @@
 use fusor2::cache::MaskKind;
-use fusor2::composite::attention::{attention, attention_masked};
-use fusor2::device::Device;
 use fusor2::layers::Linear;
-use fusor2::tensor::Dyn as Tensor;
-use fusor2::{Dim, Result, VarBuilder};
+use fusor2::{Device, Dim, Result, Tensor, VarBuilder};
 
 use super::{additive_key_mask, load_linear};
 
@@ -32,51 +29,44 @@ impl BertSelfAttention {
         })
     }
 
-    /// `[B, L, H] -> [B, heads, L, head_dim]`.
-    fn transpose_for_scores(&self, xs: &Tensor) -> Result<Tensor> {
-        let shape = xs.shape();
-        xs.reshape_dims(&[
-            shape[0],
-            shape[1],
+    /// `[batch, seq, hidden] -> [batch, heads, seq, head_dim]`.
+    fn transpose_for_scores(&self, xs: &Tensor<3>) -> Tensor<4> {
+        let [batch, seq, _] = xs.extents();
+        xs.reshape_dims([
+            batch,
+            seq,
             Dim::Const(self.num_attention_heads as u64),
             Dim::Const(self.attention_head_size as u64),
-        ])?
+        ])
         .transpose(1, 2)
     }
 
     pub(crate) fn forward(
         &self,
-        hidden_states: &Tensor,
-        attention_mask: Option<&Tensor>,
-    ) -> Result<Tensor> {
+        hidden_states: &Tensor<3>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Tensor<3> {
         let _enter = self.span.enter();
         let scale = 1.0 / (self.attention_head_size as f32).sqrt();
-        let query_layer = self.transpose_for_scores(&self.query.forward(hidden_states)?)?;
-        let key_layer = self.transpose_for_scores(&self.key.forward(hidden_states)?)?;
-        let value_layer = self.transpose_for_scores(&self.value.forward(hidden_states)?)?;
+        let query_layer = self.transpose_for_scores(&self.query.forward(hidden_states));
+        let key_layer = self.transpose_for_scores(&self.key.forward(hidden_states));
+        let value_layer = self.transpose_for_scores(&self.value.forward(hidden_states));
 
         let context_layer = match attention_mask {
             Some(attention_mask) => {
-                // `[B, Lk]` validity mask as an additive batch-key mask.
-                let mask = additive_key_mask(attention_mask)?;
-                attention_masked(
-                    &query_layer,
+                // `[batch, key]` validity mask as an additive batch-key mask.
+                let mask = additive_key_mask(attention_mask);
+                query_layer.attention_masked(
                     &key_layer,
                     &value_layer,
                     MaskKind::BatchKeyMask,
                     Some(&mask),
                     Some(scale),
-                )?
+                )
             }
-            None => attention(
-                &query_layer,
-                &key_layer,
-                &value_layer,
-                MaskKind::None,
-                Some(scale),
-            )?,
+            None => query_layer.attention(&key_layer, &value_layer, MaskKind::None, Some(scale)),
         };
-        // `[B, heads, L, head_dim] -> [B, L, H]`.
-        context_layer.transpose(1, 2)?.flatten_last_n(1)
+        // `[batch, heads, seq, head_dim] -> [batch, seq, hidden]`.
+        context_layer.transpose(1, 2).flatten_last_n(1)
     }
 }

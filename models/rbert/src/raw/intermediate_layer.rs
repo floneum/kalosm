@@ -1,7 +1,5 @@
-use fusor2::device::Device;
 use fusor2::layers::Linear;
-use fusor2::tensor::Dyn as Tensor;
-use fusor2::{Result, VarBuilder};
+use fusor2::{Device, Result, Tensor, VarBuilder};
 
 use super::{load_linear, HiddenActLayer};
 
@@ -22,9 +20,9 @@ impl BertIntermediate {
         })
     }
 
-    pub(crate) fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, hidden_states: &Tensor<3>) -> Tensor<3> {
         let _enter = self.span.enter();
-        let hidden_states = self.dense.forward(hidden_states)?;
+        let hidden_states = self.dense.forward(hidden_states);
         self.intermediate_act.forward(&hidden_states)
     }
 }

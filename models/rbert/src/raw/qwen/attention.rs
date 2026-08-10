@@ -1,10 +1,6 @@
 use fusor2::cache::MaskKind;
-use fusor2::composite::attention::{attention, attention_masked};
-use fusor2::composite::rope::rope_normal_pair_fused;
-use fusor2::device::Device;
 use fusor2::layers::RmsNorm;
-use fusor2::tensor::Dyn as Tensor;
-use fusor2::{Dim, Result, VarBuilder};
+use fusor2::{Device, Dim, Result, Tensor, VarBuilder};
 
 use super::model::QwenRope;
 use super::QLinear;
@@ -63,76 +59,67 @@ impl QwenSelfAttention {
         })
     }
 
-    /// `[B, L, heads * head_dim] -> [B, heads, L, head_dim]`.
-    fn split_heads(&self, x: &Tensor, heads: usize) -> Result<Tensor> {
-        let shape = x.shape();
-        x.reshape_dims(&[
-            shape[0],
-            shape[1],
+    /// `[batch, seq, heads * head_dim] -> [batch, heads, seq, head_dim]`.
+    fn split_heads(&self, x: &Tensor<3>, heads: usize) -> Tensor<4> {
+        let [batch, seq, _] = x.extents();
+        x.reshape_dims([
+            batch,
+            seq,
             Dim::Const(heads as u64),
             Dim::Const(self.head_dim as u64),
-        ])?
+        ])
         .transpose(1, 2)
     }
 
     pub fn forward(
         &self,
-        hidden_states: &Tensor,
+        hidden_states: &Tensor<3>,
         rope: &QwenRope,
-        attention_mask: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        let shape = hidden_states.shape();
-        let (b_sz, seq_len) = (shape[0], shape[1]);
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Tensor<3> {
+        let [batch, seq_len, _] = hidden_states.extents();
 
         // Compute Q, K, V projections
-        let mut query_states =
-            self.split_heads(&self.wq.forward(hidden_states)?, self.num_heads)?;
-        let mut key_states = self.split_heads(&self.wk.forward(hidden_states)?, self.num_kv_heads)?;
-        let value_states = self.split_heads(&self.wv.forward(hidden_states)?, self.num_kv_heads)?;
+        let mut query_states = self.split_heads(&self.wq.forward(hidden_states), self.num_heads);
+        let mut key_states = self.split_heads(&self.wk.forward(hidden_states), self.num_kv_heads);
+        let value_states = self.split_heads(&self.wv.forward(hidden_states), self.num_kv_heads);
 
         // Apply optional Q/K normalization
         if let Some(q_norm) = &self.q_norm {
-            query_states = q_norm.forward(&query_states)?;
+            query_states = q_norm.forward(&query_states);
         }
         if let Some(k_norm) = &self.k_norm {
-            key_states = k_norm.forward(&key_states)?;
+            key_states = k_norm.forward(&key_states);
         }
 
-        // Apply RoPE to Q and K (Qwen uses the non-interleaved half layout)
-        let (query_states, key_states) =
-            rope_normal_pair_fused(&query_states, &key_states, &rope.cos, &rope.sin, 0)?;
+        // Apply RoPE to Q and K (Qwen uses the non-interleaved half layout).
+        // One node rotating both, which is what `rope_normal_pair_fused` was.
+        let (query_states, key_states) = query_states.rope_pair(&key_states, &rope.cos, &rope.sin, 0);
 
         // Scaled dot-product attention. Grouped-query attention is handled
         // structurally by the composite: no K/V head expansion here.
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let attn_output = match attention_mask {
             Some(mask) => {
-                let mask = additive_key_mask(mask)?;
-                attention_masked(
-                    &query_states,
+                let mask = additive_key_mask(mask);
+                query_states.attention_masked(
                     &key_states,
                     &value_states,
                     MaskKind::BatchKeyMask,
                     Some(&mask),
                     Some(scale),
-                )?
+                )
             }
-            None => attention(
-                &query_states,
-                &key_states,
-                &value_states,
-                MaskKind::None,
-                Some(scale),
-            )?,
+            None => query_states.attention(&key_states, &value_states, MaskKind::None, Some(scale)),
         };
 
         // Reshape and project output
         let hidden_size = self.num_heads * self.head_dim;
-        let attn_output = attn_output.transpose(1, 2)?.reshape_dims(&[
-            b_sz,
+        let attn_output = attn_output.transpose(1, 2).reshape_dims([
+            batch,
             seq_len,
             Dim::Const(hidden_size as u64),
-        ])?;
+        ]);
 
         self.wo.forward(&attn_output)
     }

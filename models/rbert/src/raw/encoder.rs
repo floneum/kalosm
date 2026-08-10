@@ -1,6 +1,4 @@
-use fusor2::device::Device;
-use fusor2::tensor::Dyn as Tensor;
-use fusor2::{Result, VarBuilder};
+use fusor2::{Device, Result, Tensor, VarBuilder};
 
 use super::BertLayer;
 
@@ -21,15 +19,15 @@ impl BertEncoder {
 
     pub fn forward(
         &self,
-        hidden_states: &Tensor,
-        attention_mask: Option<&Tensor>,
-    ) -> Result<Tensor> {
+        hidden_states: &Tensor<3>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Tensor<3> {
         let _enter = self.span.enter();
         let mut hidden_states = hidden_states.clone();
         // Use a loop rather than a fold as it's easier to modify when adding debug/...
         for layer in self.layers.iter() {
-            hidden_states = layer.forward(&hidden_states, attention_mask)?;
+            hidden_states = layer.forward(&hidden_states, attention_mask);
         }
-        Ok(hidden_states)
+        hidden_states
     }
 }

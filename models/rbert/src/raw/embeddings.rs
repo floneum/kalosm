@@ -2,10 +2,8 @@
 //!
 //! Bert embeddings contain word embeddings, embeddings about the token type and position information.
 
-use fusor2::device::Device;
 use fusor2::layers::{Embedding, LayerNorm};
-use fusor2::tensor::Dyn as Tensor;
-use fusor2::{Dtype, Result, VarBuilder};
+use fusor2::{Device, Result, Tensor, VarBuilder};
 
 // https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L180
 pub(crate) struct BertEmbeddings {
@@ -36,22 +34,25 @@ impl BertEmbeddings {
         })
     }
 
-    pub(crate) fn forward(&self, input_ids: &Tensor, token_type_ids: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(
+        &self,
+        input_ids: &Tensor<2, u32>,
+        token_type_ids: &Tensor<2, u32>,
+    ) -> Tensor<3> {
         let _enter = self.span.enter();
         let seq_len = input_ids
-            .dim(1)
+            .extent(1)
             .as_const()
             .expect("input ids have a const seq len");
-        let input_embeddings = self.word_embeddings.forward(input_ids)?;
-        let token_type_embeddings = self.token_type_embeddings.forward(token_type_ids)?;
-        let mut embeddings = input_embeddings.add(&token_type_embeddings)?;
+        let input_embeddings: Tensor<3> = self.word_embeddings.forward(input_ids);
+        let token_type_embeddings: Tensor<3> = self.token_type_embeddings.forward(token_type_ids);
+        let mut embeddings = input_embeddings.add(&token_type_embeddings);
         if let Some(position_embeddings) = &self.position_embeddings {
-            let graph = input_ids.graph();
             let position_ids =
-                fusor2::tensor::construction::arange(graph, Dtype::U32, 0.0, seq_len as f64)?;
-            let pos_emb = position_embeddings.forward(&position_ids)?;
-            // `[L, H]` broadcasts right-aligned onto `[B, L, H]`.
-            embeddings = embeddings.add_(&pos_emb)?;
+                Tensor::<1, u32>::arange(&input_ids.device(), 0.0f32, seq_len as f32);
+            let pos_emb: Tensor<2> = position_embeddings.forward(&position_ids);
+            // `[seq, hidden]` broadcasts right-aligned onto `[batch, seq, hidden]`.
+            embeddings = embeddings.add_(&pos_emb);
         }
         self.layer_norm.forward(&embeddings)
     }

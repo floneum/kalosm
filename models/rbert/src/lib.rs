@@ -44,14 +44,13 @@
 
 use std::sync::{Arc, RwLock};
 
-use fusor2::tensor::Dyn as Tensor;
-use fusor2::{Dim, Dtype, Result as FusorResult, VarBuilder};
+use fusor2::{Tensor, VarBuilder};
 use kalosm_common::*;
 use kalosm_model_types::ModelLoadingProgress;
 use tokenizers::{Encoding, PaddingDirection, PaddingParams, Tokenizer};
 
 /// The device handle models run on, re-exported from fusor2.
-pub use fusor2::device::Device;
+pub use fusor2::Device;
 
 mod language_model;
 mod raw;
@@ -212,15 +211,16 @@ impl EmbeddingModel {
         }
     }
 
-    /// Forward pass through the model
+    /// Forward pass through the model. `[batch, seq]` ids in, `[batch, seq,
+    /// hidden]` out.
     pub fn forward(
         &self,
-        input_ids: &Tensor,
-        attention_mask: Option<&Tensor>,
-    ) -> FusorResult<Tensor> {
+        input_ids: &Tensor<2, u32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Tensor<3> {
         match self {
             EmbeddingModel::Bert(model) => {
-                let token_type_ids = input_ids.zeros_like()?;
+                let token_type_ids = input_ids.zeros_like();
                 model.forward(input_ids, &token_type_ids, attention_mask)
             }
             EmbeddingModel::Qwen(model) => model.forward(input_ids, attention_mask),
@@ -382,7 +382,7 @@ impl Bert {
         &self,
         sentences: Vec<&str>,
         pooling: Pooling,
-    ) -> Result<Vec<Tensor>, BertError> {
+    ) -> Result<Vec<Tensor<2>>, BertError> {
         let embedding_dim = self.model.embedding_dim();
         // Approximates the quadratic attention memory cost (seq_len^2).
         // Batches are split so that total work stays below this threshold.
@@ -399,7 +399,7 @@ impl Bert {
 
         encodings_with_indices.sort_unstable_by_key(|(_, encoding)| encoding.len());
 
-        let mut combined: Vec<Option<Tensor>> = vec![None; encodings_with_indices.len()];
+        let mut combined: Vec<Option<Tensor<2>>> = vec![None; encodings_with_indices.len()];
         let mut chunks = Vec::new();
         let mut current_chunk_len = 0;
         let mut current_chunk_max_token_len = 0;
@@ -443,11 +443,11 @@ impl Bert {
         &self,
         mut tokens: Vec<Encoding>,
         pooling: Pooling,
-    ) -> Result<Vec<Tensor>, BertError> {
+    ) -> Result<Vec<Tensor<2>>, BertError> {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
-        let graph = self.model.device().graph().handle().clone();
+        let device = self.model.device();
         // Qwen models use last-token pooling and require left padding so the
         // last position always contains the final content token.
         let padding_direction = match pooling {
@@ -463,61 +463,56 @@ impl Bert {
 
         let n_sentences = tokens.len();
         let max_seq_len = self.model.max_seq_len();
-        let token_ids = tokens
-            .iter()
-            .map(|tokens| {
-                let ids = tokens.get_ids();
-                let ids = &ids[..max_seq_len.min(ids.len())];
-                Tensor::from_elements(&graph, &[Dim::Const(ids.len() as u64)], ids)
-            })
-            .collect::<FusorResult<Vec<_>>>()?;
-        let token_ids = Tensor::stack(&token_ids, 0)?;
+        let token_ids = tokens.iter().map(|tokens| {
+            let ids = tokens.get_ids();
+            let ids = &ids[..max_seq_len.min(ids.len())];
+            Tensor::<1, u32>::from_slice(device, [ids.len()], ids)
+        });
+        let token_ids: Tensor<2, u32> = fusor2::stack(token_ids, 0);
 
-        let attention_masks = tokens
-            .iter()
-            .map(|tokens| {
-                let mask = tokens.get_attention_mask();
-                let mask = &mask[..max_seq_len.min(mask.len())];
-                Tensor::from_elements(&graph, &[Dim::Const(mask.len() as u64)], mask)
-            })
-            .collect::<FusorResult<Vec<_>>>()?;
-        let attention_mask = Tensor::stack(&attention_masks, 0)?;
+        let attention_masks = tokens.iter().map(|tokens| {
+            let mask = tokens.get_attention_mask();
+            let mask = &mask[..max_seq_len.min(mask.len())];
+            Tensor::<1, u32>::from_slice(device, [mask.len()], mask)
+        });
+        let attention_mask: Tensor<2, u32> = fusor2::stack(attention_masks, 0);
 
-        let embeddings = self.model.forward(&token_ids, Some(&attention_mask))?;
+        let embeddings = self.model.forward(&token_ids, Some(&attention_mask));
 
         let n_tokens = embeddings
-            .dim(1)
+            .extent(1)
             .as_const()
             .expect("the sequence length is const") as usize;
 
-        let pooled = match pooling {
+        let pooled: Tensor<2> = match pooling {
             Pooling::Mean => {
                 // Take the mean embedding value for all tokens (except padding)
                 // Cast mask u32→f32, unsqueeze to [batch, seq_len, 1] for broadcasting
-                let mask_f32 = attention_mask.cast(Dtype::F32)?;
-                let mask_3d = mask_f32.unsqueeze(2)?;
+                let mask_f32 = attention_mask.cast::<f32>();
+                let mask_3d: Tensor<3> = mask_f32.unsqueeze(2);
                 // Zero out padding positions, sum along seq dim → [batch, hidden_dim]
-                let summed = embeddings.mul_(&mask_3d)?.sum(1)?;
+                let masked: Tensor<3> = embeddings.mul_(&mask_3d);
+                let summed: Tensor<2> = masked.sum(1);
                 // Divide by valid token count [batch, 1] — broadcasts with [batch, hidden_dim]
-                let valid_count = mask_f32.sum_keepdim(1)?;
-                let embeddings = summed.div_(&valid_count)?;
-                normalize_l2(&embeddings)?
+                let valid_count = mask_f32.sum_keepdim(1);
+                let embeddings: Tensor<2> = summed.div_(&valid_count);
+                normalize_l2(&embeddings)
             }
             Pooling::CLS => {
                 // Index into the first token of each sentence which is the CLS token that contains the sentence embedding
-                embeddings.narrow(1, 0, 1)?.squeeze(1)?
+                embeddings.narrow(1, 0, 1).squeeze(1)
             }
             Pooling::Last => {
                 // With left padding, the last token is always at the final position
-                let last = embeddings.narrow(1, n_tokens - 1, 1)?.squeeze(1)?;
-                normalize_l2(&last)?
+                let last: Tensor<2> = embeddings.narrow(1, n_tokens - 1, 1).squeeze(1);
+                normalize_l2(&last)
             }
         };
-        Ok(pooled.chunk(n_sentences, 0)?)
+        Ok(pooled.chunk(n_sentences, 0))
     }
 }
 
-fn normalize_l2(v: &Tensor) -> FusorResult<Tensor> {
-    let sum_sq = v.sqr()?.sum_keepdim(1)?;
-    v.div_(&sum_sq.add_scalar(1e-12f32)?.sqrt()?)
+fn normalize_l2(v: &Tensor<2>) -> Tensor<2> {
+    let sum_sq = v.sqr().sum_keepdim(1);
+    v.div_(&sum_sq.add_scalar(1e-12f32).sqrt())
 }

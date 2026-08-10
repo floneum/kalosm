@@ -1,6 +1,4 @@
-use fusor2::device::Device;
-use fusor2::tensor::Dyn as Tensor;
-use fusor2::{Result, VarBuilder};
+use fusor2::{Device, Result, Tensor, VarBuilder};
 
 use super::{BertAttention, BertIntermediate, BertOutput};
 
@@ -27,12 +25,12 @@ impl BertLayer {
 
     pub(crate) fn forward(
         &self,
-        hidden_states: &Tensor,
-        attention_mask: Option<&Tensor>,
-    ) -> Result<Tensor> {
+        hidden_states: &Tensor<3>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Tensor<3> {
         let _enter = self.span.enter();
-        let attention_output = self.attention.forward(hidden_states, attention_mask)?;
-        let intermediate_output = self.intermediate.forward(&attention_output)?;
+        let attention_output = self.attention.forward(hidden_states, attention_mask);
+        let intermediate_output = self.intermediate.forward(&attention_output);
         self.output.forward(&intermediate_output, &attention_output)
     }
 }

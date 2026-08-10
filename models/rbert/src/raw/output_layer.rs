@@ -1,7 +1,5 @@
-use fusor2::device::Device;
 use fusor2::layers::{LayerNorm, Linear};
-use fusor2::tensor::Dyn as Tensor;
-use fusor2::{Result, VarBuilder};
+use fusor2::{Device, Result, Tensor, VarBuilder};
 
 use super::load_linear;
 
@@ -27,9 +25,9 @@ impl BertOutput {
         })
     }
 
-    pub(crate) fn forward(&self, hidden_states: &Tensor, input_tensor: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, hidden_states: &Tensor<3>, input_tensor: &Tensor<3>) -> Tensor<3> {
         let _enter = self.span.enter();
-        let hidden_states = self.dense.forward(hidden_states)?;
-        self.layer_norm.forward(&hidden_states.add(input_tensor)?)
+        let hidden_states = self.dense.forward(hidden_states);
+        self.layer_norm.forward(&hidden_states.add(input_tensor))
     }
 }

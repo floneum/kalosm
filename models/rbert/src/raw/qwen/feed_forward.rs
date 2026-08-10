@@ -1,6 +1,4 @@
-use fusor2::device::Device;
-use fusor2::tensor::Dyn as Tensor;
-use fusor2::{Result, VarBuilder};
+use fusor2::{Device, Result, Tensor, VarBuilder};
 
 use super::QLinear;
 
@@ -21,10 +19,10 @@ impl QwenFeedForward {
         Ok(Self { gate, up, down })
     }
 
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate.forward(x)?;
-        let up = self.up.forward(x)?;
+    pub fn forward(&self, x: &Tensor<3>) -> Tensor<3> {
+        let gate = self.gate.forward(x);
+        let up = self.up.forward(x);
         // SiLU(gate) * up, then project down
-        self.down.forward(&gate.silu()?.mul(&up)?)
+        self.down.forward(&gate.silu().mul(&up))
     }
 }

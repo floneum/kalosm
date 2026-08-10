@@ -1,7 +1,5 @@
-use fusor2::device::Device;
 use fusor2::layers::RmsNorm;
-use fusor2::tensor::Dyn as Tensor;
-use fusor2::{Result, VarBuilder};
+use fusor2::{Device, Result, Tensor, VarBuilder};
 
 use super::attention::QwenSelfAttention;
 use super::feed_forward::QwenFeedForward;
@@ -41,22 +39,20 @@ impl QwenLayer {
 
     pub fn forward(
         &self,
-        hidden_states: &Tensor,
+        hidden_states: &Tensor<3>,
         rope: &QwenRope,
-        attention_mask: Option<&Tensor>,
-    ) -> Result<Tensor> {
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Tensor<3> {
         // Pre-norm + attention + residual
         let residual = hidden_states;
-        let hidden_states = self.attention_norm.forward(hidden_states)?;
-        let hidden_states = self
-            .attention
-            .forward(&hidden_states, rope, attention_mask)?;
-        let hidden_states = residual.add(&hidden_states)?;
+        let hidden_states = self.attention_norm.forward(hidden_states);
+        let hidden_states = self.attention.forward(&hidden_states, rope, attention_mask);
+        let hidden_states = residual.add(&hidden_states);
 
         // Pre-norm + FFN + residual
         let residual = &hidden_states;
-        let ffn_input = self.ffn_norm.forward(&hidden_states)?;
-        let ffn_output = self.feed_forward.forward(&ffn_input)?;
+        let ffn_input = self.ffn_norm.forward(&hidden_states);
+        let ffn_output = self.feed_forward.forward(&ffn_input);
         residual.add(&ffn_output)
     }
 }
