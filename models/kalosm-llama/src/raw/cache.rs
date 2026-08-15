@@ -1,4 +1,5 @@
 use fusor2::cache::KvCache;
+use fusor2::Tensor;
 
 use super::LlamaConfig;
 
@@ -17,6 +18,18 @@ pub struct LlamaCache {
     pub(crate) tokens: Vec<u32>,
     /// KV cache blocks, one per layer.
     pub(crate) blocks: Vec<KvCache>,
+    /// The logits root of the decode graph, once one has been built against
+    /// *these* blocks' store leaves.
+    ///
+    /// Every decode step used to re-run the whole model builder, and every node
+    /// it minted hash-consed onto one already in the e-graph — 46,978 nodes in,
+    /// 46,978 nodes out, identical ids, for ~2.5 ms of pure rediscovery per
+    /// token. The graph is built once and this holds its root; a step is then a
+    /// leaf write, a `replay_append` per block, and the resolve.
+    ///
+    /// Held here and not on the `Model` because the graph names this cache's
+    /// store leaves: two caches against one model are two graphs.
+    pub(crate) decode_graph: Option<Tensor<2>>,
 }
 
 impl LlamaCache {
@@ -39,6 +52,7 @@ impl LlamaCache {
         Self {
             tokens: Vec::new(),
             blocks,
+            decode_graph: None,
         }
     }
 
@@ -47,5 +61,9 @@ impl LlamaCache {
         for block in &mut self.blocks {
             block.reset()
         }
+        // A reset block has no armed append, so the next step rebuilds anyway;
+        // dropping the root here is what keeps that from being an invariant
+        // spread across two files.
+        self.decode_graph = None;
     }
 }

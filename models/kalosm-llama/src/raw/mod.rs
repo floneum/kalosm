@@ -566,6 +566,13 @@ impl Model {
     /// two on, saturation and extraction are replays and the plan is reused;
     /// only leaf bytes and the length bindings change.
     ///
+    /// Because it is identical, it is built once. `cache.decode_graph` holds
+    /// the root and every later step re-arms the blocks' appends
+    /// ([`fusor2::cache::KvCache::replay_append`]) instead of re-deriving the
+    /// nodes that produced them. A rebuild is still what happens whenever the
+    /// nodes would genuinely differ — a grown store, a reset cache, a first
+    /// step — and it re-establishes the memo.
+    ///
     /// `None` is a prefill step: its product is the KV writes it left in the
     /// caches, and the head is not run.
     fn decode_step(
@@ -586,6 +593,23 @@ impl Model {
             });
         ids.set_elements(&[token]);
         pos.set_elements(&[position as u32]);
+
+        if let Some(logits) = cache.decode_graph.clone() {
+            // Every block or none: a half-advanced cache would silently
+            // disagree with the graph about its own length.
+            if cache.blocks.iter().all(|block| block.can_replay(1)) {
+                for block in &mut cache.blocks {
+                    block
+                        .replay_append(1)
+                        .expect("can_replay was checked for every block");
+                }
+                return want_logits.then_some(logits);
+            }
+        }
+        // The nodes below may not be the memoized ones (a grown store mints a
+        // new leaf), so the memo dies here and is re-established only by a
+        // step that actually builds the head.
+        cache.decode_graph = None;
 
         let mut layer_in = self.tok_embeddings.rows_at(ids).unsqueeze(0);
         if let Some(scale) = self.tok_embedding_scale {
@@ -627,7 +651,9 @@ impl Model {
         }
         let x = self.norm.forward(&layer_in);
         let hidden = x.reshape_dims([Dim::Const(1), x.extent(2)]);
-        Some(hidden.q_mat_mul(&self.output))
+        let logits = hidden.q_mat_mul(&self.output);
+        cache.decode_graph = Some(logits.clone());
+        Some(logits)
     }
 
     pub(crate) fn forward_last_hidden_f32(
