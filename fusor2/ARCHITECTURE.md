@@ -89,12 +89,11 @@ pub enum L1 {
     KScatter  { space, mode: ScatterMode },
     KFlash    { causal: bool, mask: MaskKind, produce: FlashOut, .. },
     KRegion   { members: Vec<L1>, live_outs: SmallVec<[u32; 4]> },
-    KMerged   { segments: SmallVec<[Id; 8]>, category: WaveCat },
     Ext       { def: OpDefId, ops: Vec<Operand>, attrs: AttrId },
 }
 ```
 
-`Family = Coop | Sgemm | Sgemv | GenericFold`. `ScatterMode = Atomic | SortSegment | WgPrivateMerge | OneHotContract`. `FoldStrat` (`Subgroup | WgTree{lane_group} | LoopThenTree`) lives inside `ScheduleDomain`.
+`Family = Coop | Sgemm | Sgemv`. `ScatterMode = Atomic | SortSegment`. `GatherMode = RowPerGroup | QuantizedRows`. `FoldStrat` (`Subgroup | WgTree{lane_group} | LoopThenTree`) lives inside `ScheduleDomain`.
 
 `Operand { src: Id, layout: Layout, access: AccessPlan }` where `AccessPlan = Alias | Gather | Pack{into} | Unflatten(MultiFlattenMap)`. **Access is an attribute of the edge, not of the producing node** — so one consumer may alias a strided parameter slice while another packs it, which is exactly the trainer's flat-parameter / gradient-concat case (constraint 6) and the im2col operand case coexisting in one graph. `MultiFlattenMap` (one `AxisGroup` per logical axis, each a vector of `SubAxis { extent, stride }` decomposed most-significant-first by divmod, zero strides and colliding strides legal) is carried verbatim; plain per-axis strides cannot express a conv window operand.
 
@@ -106,7 +105,7 @@ pub enum L1 {
 3. **A nest's write map must be injective unless the nest declares `combine: Some(c)` with `c.associative`.** One invariant, three jobs: it is the legality rule for scatter-add; it separates the four `Scatter{Add}` lowerings from an illegal in-place write; and applied to a `Window`-derived nest it *is* the proof that a non-overlapping pool's adjoint is an elementwise mask.
 4. A `Fold` dim may not appear with nonzero stride in the write map (a fold dim indexing the output is a scatter, not a reduction).
 5. Every operand's `AccessPlan` satisfies that operand's access predicate. A failed access analysis disqualifies **this rewrite only**, never every tiled lowering of the expression.
-6. `KMerged` segments share a `MergeKey` and carry no `post` epilogue — expressed as a **constructor precondition**, so a merged body with per-segment epilogue identities is *unbuildable*. The illegal state is unrepresentable; the un-merged epilogue-carrying contraction stays a live alternative in the same chain, so merging and epilogue fusion compete on cost instead of one vetoing the other.
+6. A composite node (`KRegion`) carries the linear `MapDomain` its members' shared index space implies, checked against the node's *own inferred shape* rather than against whatever the minting rule wrote — so the geometry is a property of the node instead of a field a rule may drift.
 7. Every node carries `Effect = Pure | InPlace(BufferRole)`. `KScatter{Atomic}` and in-place assign are `InPlace`.
 8. **Allocation is not described at L1.** Buffers are derived from the extracted plan (§4).
 
@@ -193,16 +192,22 @@ No consumer-count check. No duplication veto. If `x` has two consumers, both may
 
 Note also that elementwise-into-elementwise fusion needs **no rule at all**: it is `pre.compose(body)`, a `ScalarExpr` tree substitution inside `Map`.
 
-**R3 — tiling/layout: `tile_contract`.**
+**R3 — tiling/layout: the domain rides on the family mint.**
 
 ```rust
-fn tile_contract(b: &mut Builder, id: Id, n: &Node, f: &Facts) -> Option<Id> {
-    let L1::KContract { family: Family::Coop, .. } = n.op else { return None };
+fn lower_family(b: &mut Builder, id: Id, n: &Node, f: &Facts, family: Family) -> Option<Id> {
     let dom = CoopDomain::legal(n, f.caps());      // filters by arena_plan bytes + lane limits
     if dom.is_empty() { return None }
-    b.union(id, L1::KContract { sched: ScheduleDomain::Coop(dom), ..n.clone() })
+    b.union(id, L1::KContract { family, sched: ScheduleDomain::Coop(dom), .. })
 }
 ```
+
+A separate `tile_contract` rule that upgraded a `ScheduleDomain::Point`
+contraction used to sit here. Nothing ever minted one: `lower_floor.rs` is the
+only source of `ScheduleDomain::Point` and it mints no `KContract`, so the rule
+matched zero nodes over the whole conformance suite and every model, and it is
+deleted. The domain is attached where the family is chosen — the same "replaces
+`Point` instead of competing with it" rule `tile_gather`'s note states.
 
 **One node, not four and not four hundred.** The full legal `(geom × splits × staging_depth)` space is carried on the node and resolved by extraction (§4). This is the resolution of the sharpest disagreement in the panel: minting every point blows the graph to ~90k nodes on a 32-layer transformer; minting a `score_fs`-Pareto top-4 makes a cheap local heuristic *gate* the real cost model, so the true winner may never be minted (the reference's `score_fs` cannot see an epilogue's downstream traffic); and a nested argmin *inside* the node's cost function is circular, because the geometry it picks determines the output's padded strides, which determine every consumer's read traffic and materialization demand. Carrying the complete domain and resolving it as a **move in the global search** is the only formulation that is simultaneously small, complete and non-circular.
 
@@ -242,7 +247,7 @@ rule! { sink_epilogue, L1, tag = Additive,
 
 **One scalar, picoseconds, on a roofline.** Not a lexicographic tuple: the reference's own unit test (`scalar_cost_lets_traffic_outweigh_a_dispatch`) shows the tuple gives the wrong verdict, and its own doc concedes dispatches are 0.2% of modelled time while the tuple will pay unbounded bandwidth to remove one.
 
-`DeviceFacts` carries `launch_ps`, `dram_bytes_per_us`, `llc_bytes`, `wg_bytes_per_us`, `mac_per_us[Fma|Coop|Dp4a][dtype]`, `trans_ps`, `store_ps_per_element`, `saturation_lanes`, `single_buffered_traffic_pct`, `compile_ps_per_kernel`, plus the wgpu limits. `fusor2-cost::calibrate(&dyn Target)` runs seven microbenchmarks (~180 ms, once), caches to `~/.cache/fusor2/facts/<fingerprint>.json`, and falls back to a per-class table only when calibration is disabled. This closes the reference's largest portability liability: five integers fitted on one M2 Max, selected by `backend == Metal && name.starts_with("Apple")`, shared by every other GPU on earth.
+`DeviceFacts` carries `launch_ps`, `dram_bytes_per_us`, `llc_bytes`, `wg_bytes_per_us`, `mac_per_us[Fma|Coop|Dp4a][dtype]`, `trans_ps`, `store_ps_per_element`, `saturation_lanes`, `single_buffered_traffic_pct`, `compile_ps_per_kernel`, plus the wgpu limits. `fusor2-cost::facts::seed_facts(&Caps)` builds them from the capabilities the backend reports, per device *class* and in physical units. This closes the reference's largest portability liability: five integers fitted on one M2 Max, selected by `backend == Metal && name.starts_with("Apple")`, shared by every other GPU on earth.
 
 Per launch: `launch_ps + max(dram_ps, math_ps, wg_ps) + drain_ps`.
 
@@ -271,7 +276,7 @@ pub struct Extraction {
 Cost is evaluated on the **realized DAG** under `(sigma, m, theta)`:
 - A node in `M` pays one write of its bytes; each consumer pays one read.
 - A node not in `M` is inlined into every consumer: it pays its `math_ps` **once per consumer** and no traffic.
-- Launches are the connected components of the realized DAG cut at `M` boundaries and at forced boundaries (index-space mismatch, fold-to-fold dependency, `KMerged` waves).
+- Launches are the connected components of the realized DAG cut at `M` boundaries and at forced boundaries (index-space mismatch, fold-to-fold dependency).
 
 Consumer counts come from the DAG, so **rematerialization is priced exactly** as `saved_write + saved_reads - recompute*(consumers-1)`. The reference's `variant_duplicates_required_producer` hard veto — which makes the whole remat space unreachable — is deleted, not weakened.
 
@@ -456,7 +461,8 @@ The core is **ten L0 nodes over one closed scalar vocabulary**, one L1 op family
 | rope ×6, RopeCache | macros; fused forms are L1 nodes minted by rules |
 | five destructive recognizers and their fixed order | `defn` at construction — there is nothing to recognize |
 | `MatMulParams`, `ShapeSelector`, SGEMM tree, SGEMV table | four order-free lowering rules + candidate generators; family is never stored on a node |
-| sink_unary_chains, form_elementwise_regions, merge_horizontal, alloc_reuse | `sink_epilogue`, `map_into_fold`/`KRegion`, `KMerged`, plan-derived allocation |
+| sink_unary_chains, form_elementwise_regions, alloc_reuse | `sink_epilogue`, `map_into_fold`/`KRegion`, plan-derived allocation |
+| merge_horizontal | **not carried over.** A `KMerged` wave node and three merge rules existed; over the conformance suite, a decode and all four model crates the mint guard refused every candidate (74,488 attempts, 0 waves) and nothing was ever lowered, so the node, its rules and its two lowerings were deleted. Horizontal fusion is available through `KRegion`. |
 | split-K, online softmax, stable variance, log-sum-exp | one `Carrier` + one `fold_split` rule; no combine is named in the core |
 | DispatchPolicy, all 8 `spike_*` flags, `PARALLEL_THRESHOLD`, `graph_flush_threshold` | named `DeviceFacts` fields with a calibration path; per-shape cost terms; measured-better default shipped |
 | rank const generics, 21 witness traits, `ShapeWithOneHole`, `B: Fusion` | runtime rank + `verify_l0`; optional typed façade |

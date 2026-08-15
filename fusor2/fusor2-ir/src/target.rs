@@ -34,8 +34,8 @@ impl fmt::Debug for Artifact {
 }
 
 /// A backend-owned buffer handle. Opaque and `Arc`-shared so [`Target`]
-/// stays object-safe and the pooled allocator can test reuse with
-/// `strong_count == 1`.
+/// stays object-safe and the pooled allocator's `strong_count == 1` reuse
+/// test still works.
 #[derive(Clone)]
 pub struct Buf(Arc<dyn Any + Send + Sync>);
 
@@ -55,6 +55,34 @@ impl Buf {
     pub fn refcount(&self) -> usize {
         Arc::strong_count(&self.0)
     }
+    /// A non-owning handle. Holding one does **not** hold the buffer: the
+    /// pool's `strong_count == 1` reuse test still sees the buffer as free,
+    /// which is what lets a cache key a derived object on [`Self::addr`]
+    /// without pinning the allocation.
+    pub fn downgrade(&self) -> WeakBuf {
+        WeakBuf(Arc::downgrade(&self.0))
+    }
+}
+
+/// A non-owning [`Buf`] handle.
+///
+/// Its purpose is address disambiguation: a live `WeakBuf` keeps the
+/// allocation from being reused, so a `Buf` whose [`Buf::addr`] equals the one
+/// this was taken from *is* that buffer. Without it an address is only valid
+/// while the buffer lives, and a freed-then-reallocated `Buf` can land on it.
+#[derive(Clone)]
+pub struct WeakBuf(std::sync::Weak<dyn Any + Send + Sync>);
+
+impl WeakBuf {
+    pub fn alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+}
+
+impl fmt::Debug for WeakBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WeakBuf(..)")
+    }
 }
 
 impl fmt::Debug for Buf {
@@ -64,8 +92,8 @@ impl fmt::Debug for Buf {
 }
 
 /// The contents of binding 0. **Always a storage buffer**, holding
-/// `[u32 symbolic dims..., f32 uniform scalars...]`. That one buffer is what
-/// keeps host scalars out of the kernel identity: `m * lr_f32` produces a
+/// `[u32 symbolic dims..., f32 uniform scalars...]`. That one buffer kills
+/// the trainer's constraints 1 and 2 together: `m * lr_f32` produces a
 /// `Uniform`, not a baked literal, and a sequence length is a `Sym` read
 /// from binding 0. A uniform-address-space block would break the
 /// derived-bind-group mechanism, which walks storage globals.
@@ -172,76 +200,4 @@ pub trait Target: Send + Sync {
     /// Block until every submitted dispatch has retired. The only host
     /// syncs are this, explicit readback, and the allocator's cap retry.
     fn wait(&self) -> Result<()>;
-}
-
-/// `L1::Ext` lowering: the one escape hatch out of the closed `L0`/`L1` enums,
-/// shared by every target and keyed by the target's name.
-pub mod ext {
-    use super::*;
-    use crate::error::Error;
-    use crate::ir::{OpDefId, OpDefRegistry};
-    use std::sync::RwLock;
-
-    /// The registry `L1::Ext` lowering resolves `OpDefId` against.
-    ///
-    /// [`LowerCtx`] carries the plan, the launch, the graph and the symbol
-    /// list — not the [`OpDefRegistry`] the graph was built with — and
-    /// `Semantics`, which *does* hold one, exposes no accessor for it. So a
-    /// target handed one selected `L1::Ext { def }` reaches that def's
-    /// `lower_per_target` row only through this registry: the embedder installs
-    /// here the same registry it installed on the e-graph's semantics.
-    /// Registration order is id order and must match, which is the same
-    /// contract `CoreSemantics::with_registry` imposes.
-    static DEFS: RwLock<Option<OpDefRegistry>> = RwLock::new(None);
-
-    /// Install the extension registry this process lowers against. Idempotent
-    /// and last-write-wins; a second install with a differently ordered
-    /// registry would silently rename every `OpDefId`, so callers pass the
-    /// registry the graph was built with, unchanged.
-    pub fn install(registry: OpDefRegistry) {
-        *DEFS.write().expect("the OpDef registry lock is poisoned") = Some(registry);
-    }
-
-    /// The installed registry, if the embedder installed one.
-    pub fn installed() -> Option<OpDefRegistry> {
-        DEFS.read()
-            .expect("the OpDef registry lock is poisoned")
-            .clone()
-    }
-
-    /// Lower one registered extension op through its `target` row.
-    pub fn lower(
-        target: &'static str,
-        def: OpDefId,
-        node: &Node,
-        theta: SchedPoint,
-    ) -> Result<KernelIr> {
-        let registry = installed().ok_or_else(|| {
-            Error::Plan(format!(
-                "{def:?} is an extension op, but no OpDefRegistry is installed on the \
-                 \"{target}\" target; call fusor2_ir::target::ext::install"
-            ))
-        })?;
-        let entry = registry
-            .get(def)
-            .ok_or_else(|| Error::Plan(format!("no OpDef is registered as {def:?}")))?;
-        let lower = entry
-            .lower_per_target
-            .iter()
-            .find(|(t, _)| *t == target)
-            .map(|(_, f)| *f)
-            .ok_or_else(|| {
-                Error::Plan(format!(
-                    "OpDef \"{}\" declares no \"{target}\" lowering; its \
-                     lower_per_target names {:?}",
-                    entry.name,
-                    entry
-                        .lower_per_target
-                        .iter()
-                        .map(|(t, _)| *t)
-                        .collect::<Vec<_>>()
-                ))
-            })?;
-        lower(node, &theta)
-    }
 }

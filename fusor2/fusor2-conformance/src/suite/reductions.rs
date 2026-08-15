@@ -1,9 +1,16 @@
-//! Conformance cases for the reductions and their adjoints. `max`/`min` split
-//! the gradient evenly among ties; `product` is zero-aware in three branches.
-//! A reduction whose split and unsplit forms disagree past tolerance means
-//! `fold_split` fired where `NumericContract::reassoc` forbade it.
+//! The 12 reductions, plus the two adjoints whose rule is not "broadcast the
+//! gradient": `max`/`min` split evenly among ties, and `product` is
+//! zero-aware in three branches.
+//!
+//! `Fold`'s structural adjoint reads `combine`, so these are the two rows of
+//! that table that can be wrong in an interesting way. A reduction whose
+//! split and unsplit forms disagree past tolerance means `fold_split` fired
+//! where `NumericContract::reassoc` forbade it.
+//!
+//! Owned by W14.
 
-use fusor2::{Dtype, Session, Tensor};
+use fusor2::{Dtype, Session, };
+use fusor2::tensor::Dyn as Tensor;
 
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
 use crate::harness::{CaseError, CaseResult, Cases, dims};
@@ -49,8 +56,8 @@ fn host_min(row: &[f32]) -> f32 {
 fn host_product(row: &[f32]) -> f32 {
     row.iter().product()
 }
-/// The biased variance, `mean((x - mean)^2)`, which is what the autograd path
-/// computes.
+/// The biased variance, `mean((x - mean)^2)`, which is what the reference
+/// computes on the autograd path.
 fn host_var(row: &[f32]) -> f32 {
     let mean = host_mean(row);
     row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / row.len() as f32
@@ -75,7 +82,9 @@ pub fn cases() -> Cases {
         });
     }
 
-    // A rank-4 reduction over an interior axis.
+    // A rank-4 reduction over an interior axis: the axis-removal bookkeeping
+    // is where a rank-generic `Fold` goes wrong, and the reference has a
+    // dedicated high-rank case for exactly that.
     cases.push("reductions", "sum_high_rank", sum_high_rank);
 
     // The two adjoints whose rule is not "broadcast the gradient".
@@ -83,7 +92,10 @@ pub fn cases() -> Cases {
     cases.push("reductions", "min_ties_split_evenly", min_ties_split_evenly);
     cases.push("reductions", "product_zero_aware", product_zero_aware);
 
-    // `fold_split` is only sound where `NumericContract::reassoc` allows it.
+    // `fold_split` is only sound where `NumericContract::reassoc` allows it:
+    // without the guard the rule declares the split and unsplit forms
+    // value-equal, and extraction swaps them on cost, on an f16 accumulator,
+    // in a system whose acceptance test is a byte-identical QAT export.
     cases.push(
         "reductions",
         "fold_split_agrees_when_reassoc",
@@ -94,15 +106,20 @@ pub fn cases() -> Cases {
     cases
 }
 
-/// Reductions the fold laws were not designed for — k-means assignment,
-/// quantization calibration, sampling temperature, a distillation loss, a
-/// single-bin DFT, a ragged batch — each carrying an independent host oracle.
+/// The generality half: programs the fold laws were **not** designed for.
+///
+/// A law that only derives its motivating example is a recognizer with extra
+/// steps, so each case here is a reduction nobody aimed a rule at — k-means
+/// assignment, quantization calibration, sampling temperature, a distillation
+/// loss, a single-bin DFT, a ragged batch — carrying an independent host
+/// oracle. The oracle is the load-bearing half: a firing assert with no number
+/// behind it is how flash attention was dead for a week.
 pub mod generality {
     use fusor2::{Dtype, Session};
     use fusor2_ir::carrier::{ArgRemap, Carrier};
     use fusor2_ir::scalar::BinOp;
 
-    use fusor2::Tensor;
+    use fusor2::tensor::Dyn as Tensor;
 
     use crate::harness::{CaseError, CaseResult, Cases, dims};
     use crate::suite::support::{Domain, expect_shaped, graph_of, read, upload};
@@ -110,14 +127,14 @@ pub mod generality {
     pub fn cases() -> Cases {
         let mut cases = Cases::new();
         // ABSORB, second clause: a reduction over a reduction whose inner
-        // result is never a buffer.
+        // result is never a buffer. No attention, no softmax, no split.
         cases.push(
             "reductions",
             "kmeans_assignment_min_of_sums",
             kmeans_assignment,
         );
-        // ABSORB under NumericContract::STRICT: a QAT chain every inexact law
-        // must decline on, reduced by a plain sum.
+        // ABSORB under NumericContract::STRICT: the QAT chain every inexact
+        // law must decline on, reduced by a plain sum.
         cases.push(
             "reductions",
             "qat_fake_quant_chain_is_exact",
@@ -132,7 +149,8 @@ pub mod generality {
         );
         cases.push("reductions", "max_of_shifted_is_shifted_max", shifted_max);
         cases.push("reductions", "min_of_negated_is_negated_max", negated_min);
-        // TUPLE: two folds over one axis, read once.
+        // TUPLE: two folds over one axis, read once. Dynamic-range
+        // quantization calibration — no shared algebra between the two.
         cases.push(
             "reductions",
             "min_and_max_in_one_pass",
@@ -141,27 +159,30 @@ pub mod generality {
         // TUPLE / RETARGET's rotation row: a single-bin DFT is two
         // projections of one windowed signal over one axis.
         cases.push("reductions", "goertzel_single_bin_dft", goertzel);
-        // RETARGET: a weighted log-sum-exp, stable where the naive form
-        // overflows.
+        // RETARGET: the trainer's own loss. A weighted log-sum-exp, stable
+        // where the naive form overflows, with no mention of softmax.
         cases.push(
             "reductions",
             "weighted_log_sum_exp_distillation_loss",
             distillation,
         );
-        // STRIP's elide clause: an additive-identity mask over a ragged batch.
+        // STRIP's elide clause: an additive-identity mask over a ragged
+        // batch. Nobody would write a MaskKind variant for this.
         cases.push(
             "reductions",
             "ragged_batch_padding_is_identity",
             ragged_padding,
         );
-        // Launch ceilings, each with the count the named law must reach.
+        // The plan half, for the laws that have not landed on these chains
+        // yet: a ceiling each, with the count the law must reach.
         cases.push(
             "reductions",
             "min_and_max_as_written_plan",
             min_and_max_as_written,
         );
         cases.push("reductions", "weighted_log_sum_exp_plan", distillation_plan);
-        // STRIP on a long plain reduction, at the extents the trainer uses.
+        // STRIP itself, on a long plain reduction: the `at_least(4096)` gate
+        // is gone and this is the tripwire that says so.
         cases.push(
             "reductions",
             "strip_splits_a_long_reduction",
@@ -176,18 +197,20 @@ pub mod generality {
 
     /// The structural half of a generality case.
     ///
-    /// The host oracles pin the numbers; these helpers pin the other half of
-    /// the acceptance bar: **did the law actually fire on the chain the
-    /// frontend emits**. A numeric case passes whether the program was
-    /// rewritten or run naively, so numbers alone cannot tell a landed law
-    /// from a dead one.
+    /// Every case below carries a host oracle already. What it did not carry
+    /// is the other half of the acceptance bar: **did the law actually fire on
+    /// the chain the frontend emits**. A numeric case passes whether the
+    /// program was rewritten or run naively, so a suite of numeric cases
+    /// cannot tell a landed law from a dead one — which is exactly how flash
+    /// attention was unreachable on both backends for a week.
     ///
     /// The graph is rebuilt from scratch for the probe rather than reusing the
     /// one the oracle read back: saturation is idempotent in the e-graph but
     /// not in the *report*, and a report over an already-saturated graph would
     /// count rule applications that fired on the previous pass.
     pub mod structure {
-        use fusor2::{Session, Tensor};
+        use fusor2::{Session, };
+use fusor2::tensor::Dyn as Tensor;
 
         use crate::harness::{CaseError, CaseResult};
         use crate::suite::probe::{Probe, probe};
@@ -203,9 +226,11 @@ pub mod generality {
         /// A law that **must** fire on this program, with the reason its
         /// absence would be a bug rather than a missing feature.
         ///
-        /// Use this only where the law is landed and measured, so a failure
-        /// means a regression rather than a missing feature. The unlanded half
-        /// is [`plan_ceiling`].
+        /// Use this only where the law is landed and measured: an assert for a
+        /// law nobody has written yet is a failing test wearing an
+        /// aspiration's clothes, and a suite full of those cannot tell a
+        /// regression from an unlanded feature. The unlanded half is
+        /// [`ceiling`].
         pub fn must_fire(
             session: &Session,
             build: Build<'_>,
@@ -214,23 +239,6 @@ pub mod generality {
             let p = probe_fresh(session, build)?;
             for (rule, why) in rules {
                 p.require_fired(rule, why)?;
-            }
-            Ok(())
-        }
-
-        /// A law that must **decline** on this program, with the reason.
-        ///
-        /// This is not implied by any number of firing asserts elsewhere: the
-        /// `NumericContract::STRICT` half of the acceptance list is a decline,
-        /// and the acceptance test behind it is a byte-identical export.
-        pub fn must_decline(
-            session: &Session,
-            build: Build<'_>,
-            rules: &[(&str, &str)],
-        ) -> CaseResult {
-            let p = probe_fresh(session, build)?;
-            for (rule, why) in rules {
-                p.require_declined(rule, why)?;
             }
             Ok(())
         }
@@ -255,9 +263,12 @@ pub mod generality {
         /// A launch **ceiling** on the extracted plan, plus the count the law
         /// named must reach.
         ///
-        /// States where a program lands today and forbids getting worse, the
-        /// same shape [`crate::launch_counts::Ceiling`] uses for the attention
-        /// forward shapes.
+        /// States where a program lands today and forbids getting worse. That
+        /// is the only honest shape for a count a landing law is about to
+        /// improve, and it is the same shape
+        /// [`crate::launch_counts::Ceiling`] already uses for the attention
+        /// forward shapes. A ceiling met with room to spare is reported, not
+        /// silently fine.
         pub fn plan_ceiling(
             session: &Session,
             build: Build<'_>,
@@ -280,51 +291,6 @@ pub mod generality {
             Ok(())
         }
 
-        /// An intermediate the plan must **not** allocate a buffer for.
-        ///
-        /// The whole memory win of a fused reduction lives in this bit: if the
-        /// extractor materializes the intermediate every numeric case still
-        /// passes and the kernel is a memory hog.
-        pub fn must_not_materialize(
-            session: &Session,
-            build: Build<'_>,
-            what: &str,
-            elements: u64,
-        ) -> CaseResult {
-            let p = probe_fresh(session, build)?;
-            if p.materializes_elements(elements) {
-                return Err(format!(
-                    "{what}: the extracted plan allocates a buffer of exactly {elements} \
-                     elements, so the intermediate is in the materialized set. Buffers: \
-                     {:?}",
-                    p.buffer_elements()
-                )
-                .into());
-            }
-            Ok(())
-        }
-
-        /// A ceiling on the bytes the plan allocates, for the shapes whose
-        /// claim is about memory rather than launches.
-        pub fn buffer_ceiling(
-            session: &Session,
-            build: Build<'_>,
-            what: &str,
-            bytes: u64,
-            rule: &str,
-        ) -> CaseResult {
-            let p = probe_fresh(session, build)?;
-            let actual = p.buffer_bytes();
-            if actual > bytes {
-                return Err(format!(
-                    "{what}: the extracted plan allocates {actual} bytes, ceiling {bytes}. \
-                     `{rule}` is what removes the intermediate; buffers are {:?}",
-                    p.buffer_elements()
-                )
-                .into());
-            }
-            Ok(())
-        }
     }
 
     /// Nearest-centroid assignment: `min over M of sum over D of (a-b)^2`.
@@ -391,9 +357,12 @@ pub mod generality {
                  the [N, M, D] difference tensor is a buffer",
             )],
         )?;
-        // A ceiling, not the target: `fusor2-cost/src/realize.rs` forces a
-        // boundary on every fold-to-fold edge, so the `[N, M]` distance matrix
-        // is a buffer and the plan is 4 launches. The target is 1.
+        // A ceiling, not the target: the second clause of ABSORB — the
+        // reduction-nesting edge that keeps the `[N, M]` distance matrix out
+        // of the materialized set — is not repaired yet
+        // (`fusor2-cost/src/realize.rs` still forces a boundary on every
+        // fold-to-fold edge), so the distance matrix IS a buffer today. The
+        // measured plan is 4 launches; the target is 1.
         structure::plan_ceiling(
             session,
             &build,
@@ -458,10 +427,12 @@ pub mod generality {
         // THE STRICT ASSERT, both halves on one probe.
         //
         // The exact laws must FIRE here — a `reassoc` guard on `ABSORB` would
-        // kill fusion exactly where it is most needed. The inexact laws must
-        // DECLINE, which is what covers the byte-identical export: a law that
-        // reads `f.numeric(0)` instead of `f.own().numeric` is blind to
-        // operands 1..n on exactly this chain.
+        // kill fusion exactly where it is most needed, and this case is the
+        // guard against someone adding one. The inexact laws must DECLINE, and
+        // asserting the decline is the only thing that covers the byte-
+        // identical export: two new consumers of `reassoc` arrived with this
+        // law set, and a law that reads `f.numeric(0)` instead of
+        // `f.own().numeric` is blind to operands 1..n on exactly this chain.
         let build = |s: &Session| -> Result<Vec<Tensor>, CaseError> {
             let g = graph_of(s);
             let x = upload(g.handle(), &dims(&[ROWS, COLS]), &data)?;
@@ -897,15 +868,18 @@ pub mod generality {
         )
     }
 
+    // -----------------------------------------------------------------------
     // Ceilings for the laws that have not landed on these chains yet
+    // -----------------------------------------------------------------------
 
     /// Two folds over one axis of one operand, as the frontend writes them.
     ///
     /// `min_and_max_in_one_pass` above builds the joint carrier by hand
     /// through `Carrier::tuple`, which proves the *algebra*. This proves the
     /// *law*: what the rule table does when a program simply asks for both
-    /// statistics. That is two launches and two reads of the input; `TUPLE`
-    /// makes it one of each.
+    /// statistics. Today that is two launches and two reads of the input;
+    /// `TUPLE` makes it one of each, and the ceiling is what turns the day it
+    /// lands into a number rather than a silence.
     fn min_and_max_as_written(session: &Session) -> CaseResult {
         const ROWS: u64 = 3;
         const COLS: u64 = 600;
@@ -941,11 +915,11 @@ pub mod generality {
 
     /// A stabilized weighted log-sum-exp, as an ordinary taped chain.
     ///
-    /// `distillation` above pins the number. This pins the plan: ten launches,
-    /// one once `RETARGET` discharges the `max` feedback and `TUPLE` joins the
-    /// running max with the weighted sum. The law is the trainer's own loss
-    /// falling out of an algebra rule — no rule mentions cross-entropy and
-    /// this is not attention.
+    /// `distillation` above pins the number. This pins the plan: ten launches
+    /// today, one once `RETARGET` discharges the `max` feedback and `TUPLE`
+    /// joins the running max with the weighted sum. The law is the trainer's
+    /// own loss falling out of an algebra rule — no rule mentions
+    /// cross-entropy and this is not attention.
     fn distillation_plan(session: &Session) -> CaseResult {
         const ROWS: u64 = 3;
         const CLASSES: u64 = 48;
@@ -985,11 +959,13 @@ pub mod generality {
 
     /// The reduction-domain split, at the extents that actually occur.
     ///
-    /// `STRIP` fires on a plain long sum, which is asserted here because it is
-    /// the law being live at all. What it does *not* reach is a contraction's
-    /// summed axis at `k = 512..2048`: split-K needs the factor to be a point
-    /// of `ScheduleDomain::Fold` rather than a rewrite bounded by the
-    /// workgroup's own lane count, and `FoldDomain` carries no `blocks`.
+    /// The shipped `at_least(4096)` gate is gone, so `STRIP` fires on a plain
+    /// long sum — asserted here, because that is the law being live at all.
+    /// What it does *not* yet reach is a contraction's summed axis at
+    /// `k = 512..2048`: split-K needs the factor to be a point of
+    /// `ScheduleDomain::Fold` rather than a rewrite bounded by the workgroup's
+    /// own lane count, and `FoldDomain` does not carry `blocks` yet. The
+    /// numbers are asserted either way so the day it lands is a diff.
     fn strip_splits_a_long_reduction(session: &Session) -> CaseResult {
         const ROWS: u64 = 4;
         const COLS: u64 = 4096;
@@ -1023,6 +999,8 @@ pub mod generality {
         )
     }
 }
+
+// ---------------------------------------------------------------------------
 
 fn reduction_case(
     session: &Session,
@@ -1093,9 +1071,10 @@ fn sum_high_rank(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// Ties split evenly under `TiePolicy::SplitEvenly`: the incoming gradient is
-/// divided by the tie count, declared as an explicit attribute rather than
-/// left as an implicit convention.
+/// Ties split evenly under `TiePolicy::SplitEvenly`, which is an explicit
+/// attribute rather than an implicit convention: the reference's
+/// `reduction_extrema_keepdim_grad` divides by the tie count, and matching a
+/// reference trainer's numerics has to be a declaration.
 fn extrema_tie_case(session: &Session, is_max: bool) -> CaseResult {
     // Row 0 has a three-way tie at the extremum; row 1 and row 2 have a unique
     // extremum, so the case covers both branches at once.
@@ -1223,9 +1202,9 @@ fn fold_split_agrees(session: &Session) -> CaseResult {
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     let actual = read_scalar(&y)?;
 
-    // f64 reference: the point is that a *split* fold and an unsplit one both
-    // land near the true sum, not that either matches a naive left-to-right
-    // f32 accumulation.
+    // Kahan-summed reference: the point is that a *split* fold and an
+    // unsplit one both land near the true sum, not that either matches a
+    // naive left-to-right f32 accumulation.
     let mut sum = 0.0f64;
     for v in &data {
         sum += *v as f64;
@@ -1325,6 +1304,9 @@ mod tests {
     /// side and a NaN right side), and `MonotoneUp` over `Sqrt`, `Log`, `Asin`,
     /// `Acos` or `Atanh` is the same hazard with `exact_in_float: true`, which
     /// means it would fire under `NumericContract::STRICT`.
+    ///
+    /// A row returns when `ValueFacts` gains a sign lattice, and this test is
+    /// what will notice.
     #[test]
     fn the_homomorphism_table_admits_no_partial_unary() {
         use fusor2_ir::carrier::{HOM_TABLE, HomShape};

@@ -19,6 +19,8 @@
 //! by [`crate::uniformity`], and a conditional barrier is not uniform by
 //! construction here. Barriers inside loops that may break, return, or run a
 //! dynamic number of iterations are recorded but not `guaranteed`.
+//!
+//! Owned by W3.
 
 use std::sync::Arc;
 
@@ -26,7 +28,7 @@ use fusor2_ir::ir::level2::{
     Accumulator, Addr, CoopSrc, ElementType, KernelIr, MemoryLevel, ReduceKind, Stmt, Tile,
     TileExpr, TileExprKind, TileLiteral,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Identity of one tile declaration. Declarations are never interned, so two
 /// same-shaped tiles stay distinct and the arena knows they are two
@@ -349,7 +351,9 @@ pub fn analyze(ir: &KernelIr) -> LivenessInfo {
     LivenessInfo::compute(ir)
 }
 
+// ---------------------------------------------------------------------------
 // Expression traversal — shared with uniformity and the L2 verifier
+// ---------------------------------------------------------------------------
 
 /// Every tile an expression node touches directly, with how it touches it.
 pub fn for_each_tile(kind: &TileExprKind, f: &mut dyn FnMut(&Tile, TileUse)) {
@@ -437,7 +441,9 @@ pub fn for_each_addr_expr(addr: &Addr, f: &mut dyn FnMut(&TileExpr)) {
     }
 }
 
+// ---------------------------------------------------------------------------
 // The walk
+// ---------------------------------------------------------------------------
 
 struct Walk {
     position: u32,
@@ -453,6 +459,10 @@ struct Walk {
     access_kind: AccessKind,
     /// `If` nesting depth: barriers below a conditional are not recorded.
     conditional_depth: u32,
+    /// Nodes already visited in the operand expression in progress. Cleared
+    /// per root expression, so a node shared by two statements is recorded
+    /// at both positions. See [`Walk::visit_expr`].
+    seen: FxHashSet<usize>,
 }
 
 impl Default for Walk {
@@ -467,6 +477,7 @@ impl Default for Walk {
             path: Vec::new(),
             access_kind: AccessKind::Read,
             conditional_depth: 0,
+            seen: FxHashSet::default(),
         }
     }
 }
@@ -502,82 +513,36 @@ impl Walk {
         });
     }
 
-    fn touch_use(&mut self, tile: &Tile, tile_use: TileUse) {
-        self.access_kind = match tile_use {
-            TileUse::Read | TileUse::CoopRead => AccessKind::Read,
-            TileUse::ReadWrite => AccessKind::ReadWrite,
-        };
-        self.touch(tile, matches!(tile_use, TileUse::CoopRead));
-        self.access_kind = AccessKind::Read;
+    /// Record every tile one operand expression touches at the current
+    /// position.
+    ///
+    /// The expression is a **DAG**: one `TileExpr` is handed to every
+    /// consumer of its value, so a node is reached once per edge into it and
+    /// the walk is exponential in the sharing depth — a decode `sgemv_cols`
+    /// body, where one activation window feeds every column accumulator,
+    /// spent hundreds of microseconds here per lowering. Every visit of a
+    /// node at one position records the same `(tile, position, kind)`, and
+    /// duplicate accesses inform nothing downstream (the range is a min/max,
+    /// the hazard pairs dedupe on positions), so visiting each node once is
+    /// the same analysis.
+    fn visit_expr(&mut self, expr: &TileExpr) {
+        self.seen.clear();
+        self.visit_expr_once(expr);
     }
 
-    /// Direct mirror of [`for_each_tile`] then [`for_each_child`]: the node's
-    /// own tile touches first, then its children in the shared fixed order.
-    fn visit_expr(&mut self, expr: &TileExpr) {
-        match expr.kind() {
-            TileExprKind::Literal(_)
-            | TileExprKind::Builtin(_)
-            | TileExprKind::LoadLocal(_)
-            | TileExprKind::CoopZero { .. } => {}
-            TileExprKind::Load {
-                addr, mask, fill, ..
-            } => {
-                self.visit_addr(addr);
-                self.visit_expr(mask);
-                self.visit_expr(fill);
-            }
-            TileExprKind::LoadTile { tile, index } => {
-                self.touch_use(tile, TileUse::Read);
-                self.visit_expr(index);
-            }
-            TileExprKind::Unary { value, .. }
-            | TileExprKind::Round { value, .. }
-            | TileExprKind::Cast { value, .. }
-            | TileExprKind::Bitcast { value, .. } => self.visit_expr(value),
-            TileExprKind::Binary { left, right, .. }
-            | TileExprKind::Compare { left, right, .. }
-            | TileExprKind::Dot { left, right } => {
-                self.visit_expr(left);
-                self.visit_expr(right);
-            }
-            TileExprKind::Select {
-                condition,
-                accept,
-                reject,
-            } => {
-                self.visit_expr(condition);
-                self.visit_expr(accept);
-                self.visit_expr(reject);
-            }
-            TileExprKind::Vec { parts, .. } => {
-                for part in parts {
-                    self.visit_expr(part);
-                }
-            }
-            TileExprKind::VecComponent { vector, .. } => self.visit_expr(vector),
-            TileExprKind::Reduce { kind, value, .. } => {
-                match kind.as_ref() {
-                    ReduceKind::Subgroup => {}
-                    ReduceKind::Workgroup { scratch, .. } | ReduceKind::Loop { scratch, .. } => {
-                        self.touch_use(scratch, TileUse::ReadWrite);
-                    }
-                }
-                self.visit_expr(value);
-            }
-            TileExprKind::CoopLoad { src, .. } => match src.as_ref() {
-                CoopSrc::TileRegion { tile, row, col, .. } => {
-                    self.touch_use(tile, TileUse::CoopRead);
-                    self.visit_expr(row);
-                    self.visit_expr(col);
-                }
-                CoopSrc::BroadcastCol { col, .. } => self.visit_expr(col),
-            },
-            TileExprKind::CoopMma { a, b, c } => {
-                self.visit_expr(a);
-                self.visit_expr(b);
-                self.visit_expr(c);
-            }
+    fn visit_expr_once(&mut self, expr: &TileExpr) {
+        if !self.seen.insert(expr.node_ptr()) {
+            return;
         }
+        for_each_tile(expr.kind(), &mut |tile, tile_use| {
+            self.access_kind = match tile_use {
+                TileUse::Read | TileUse::CoopRead => AccessKind::Read,
+                TileUse::ReadWrite => AccessKind::ReadWrite,
+            };
+            self.touch(tile, matches!(tile_use, TileUse::CoopRead));
+        });
+        self.access_kind = AccessKind::Read;
+        for_each_child(expr.kind(), &mut |child| self.visit_expr_once(child));
     }
 
     fn visit_addr(&mut self, addr: &Addr) {

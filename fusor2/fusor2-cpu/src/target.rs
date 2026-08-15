@@ -1,4 +1,6 @@
 //! [`CpuTarget`] — the [`Target`] implementation.
+//!
+//! Owned by W10.
 
 use fusor2_ir::cost::DeviceFacts;
 use fusor2_ir::device::Caps;
@@ -37,15 +39,16 @@ impl CpuTarget {
 
     /// Compile without going through the opaque [`Artifact`] wrapper.
     ///
-    /// No arena planner is attached; the emitter's sequential packing is legal
-    /// because thread-local scratch aliases freely.
+    /// No arena planner is attached: the emitter's sequential packing is
+    /// always legal here because thread-local scratch aliases freely.
     pub fn compile(&self, ir: &KernelIr) -> std::result::Result<CpuArtifact, EmitError> {
         crate::emit::compile(ir, &self.caps, None)
     }
 }
 
-/// Fallback rate table for a CPU, used when calibration is skipped.
-/// `fusor2-cost::calibrate` replaces every entry with a measured value.
+/// The shipped rate table for a CPU, derived from [`Caps`] so the model stays
+/// coherent and physically dimensioned on a machine it has never seen, rather
+/// than degenerating into a routing constant.
 fn seed_facts(caps: &Caps) -> DeviceFacts {
     let threads = caps.threads.max(1) as u64;
     let lanes = *caps.simd_widths.last().unwrap_or(&4) as u64;
@@ -66,7 +69,7 @@ fn seed_facts(caps: &Caps) -> DeviceFacts {
         saturation_lanes: (threads * lanes * 4) as u32,
         single_buffered_traffic_pct: 100,
         compile_ps_per_kernel: 200_000_000,
-        // Waking a parked worker and joining.
+        // Measured order of magnitude for waking a parked worker and joining.
         thread_wake_ps: 2_000_000,
         caps: caps.clone(),
     }
@@ -118,8 +121,8 @@ impl Target for CpuTarget {
 
     fn alloc(&self, bytes: u64, _persistence: Persistence) -> Result<Buf> {
         // Every load reads a `u32` word, so a buffer whose length is not a
-        // whole number of words has an unreadable tail; native quantized blocks
-        // are 18, 22, 34 and 210 bytes.
+        // whole number of words has an unreadable tail. Native quantized
+        // blocks are 18, 22, 34 and 210 bytes, so this is not a corner case.
         let bytes = bytes.next_multiple_of(4);
         let mut pool = self.pool.lock();
         if let Some(free) = pool.get_mut(&bytes) {

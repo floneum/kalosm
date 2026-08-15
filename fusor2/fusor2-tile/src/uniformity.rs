@@ -1,5 +1,5 @@
-//! Uniformity analysis: the analysis that establishes a barrier sits at a
-//! group-uniform point.
+//! Uniformity analysis. The reference asserts a barrier is at a "guaranteed
+//! uniform" point with no analysis to establish it; this is that analysis.
 //!
 //! A bottom-up classification of every [`TileExpr`], then a statement walk
 //! carrying a predicate-uniformity stack. A `Barrier` (or `StorageBarrier`)
@@ -13,6 +13,8 @@
 //! than from the fact that the tree lowering broadcasts its result — a real
 //! uniform value can therefore be rejected, which costs a barrier placement,
 //! never correctness.
+//!
+//! Owned by W3.
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;
@@ -80,7 +82,10 @@ impl Ctx {
             K::Literal(_) => Uniformity::Uniform,
             K::Builtin(builtin) => match builtin {
                 // Uniform over the workgroup.
-                Builtin::ProgramId(_) | Builtin::SubgroupSize | Builtin::NumSubgroups => {
+                Builtin::ProgramId(_)
+                | Builtin::NumWorkgroups(_)
+                | Builtin::SubgroupSize
+                | Builtin::NumSubgroups => {
                     Uniformity::Uniform
                 }
                 // `SubgroupId` is uniform only *within* a subgroup, so at

@@ -16,7 +16,7 @@ pub struct CoopKind {
     pub k: u32,
 }
 
-/// Subgroup width range. `min == max` is the fixed case every
+/// Subgroup width range. `min == max` is the *fixed* case every
 /// subgroup-size-aware kernel requires.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SubgroupWidths {
@@ -34,16 +34,18 @@ impl SubgroupWidths {
     }
 }
 
-/// The wgpu limits the compiler reads, mirrored so `fusor2-ir` has no wgpu
-/// dependency. Defaults are the WebGPU baseline rather than `adapter.limits()`,
-/// so a plan legal on one device is legal on another. A backend widens a field
-/// only when a selected kernel needs the headroom.
+/// The wgpu limits the compiler actually reads, mirrored so `fusor2-ir` has
+/// no wgpu dependency. Defaults are the **WebGPU baseline**, not
+/// `adapter.limits()`: a plan legal on one device is then legal on another,
+/// and the cost model's filters mean the same thing everywhere. A backend
+/// widens a field only when a selected kernel proves it needs the headroom.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Limits {
     pub max_compute_invocations_per_workgroup: u32,
     pub max_compute_workgroup_size: [u32; 3],
     pub max_compute_workgroups_per_dimension: u32,
-    /// Part of the plan-cache fingerprint: the coop legality filter reads it.
+    /// **Part of the plan-cache fingerprint** — the reference omits it
+    /// while the coop legality filter reads it, a live staleness hazard.
     pub max_compute_workgroup_storage_size: u32,
     pub max_storage_buffers_per_shader_stage: u32,
     pub max_storage_buffer_binding_size: u64,
@@ -71,8 +73,8 @@ pub enum DeviceKind {
     Cpu,
 }
 
-/// Everything a legality predicate may read about a device. Every performance
-/// feature is probed and optional, each with a working fallback
+/// Everything a legality predicate may read about a device. Every
+/// performance feature is probed and optional, each with a working fallback
 /// (shared-memory reduction trees for subgroups, f32 for f16,
 /// sgemm/sgemv/generic fold for cooperative matrix, cold compile, no
 /// profiling).
@@ -92,7 +94,7 @@ pub struct Caps {
     pub workgroup_alias: bool,
     /// Cooperative store of an f32 accumulator into f16 memory (also
     /// `fork-metal`). Without it such a kernel pays a staging tile plus a
-    /// per-lane cast; footprint only, never correctness.
+    /// per-lane cast — footprint, never correctness.
     pub mixed_precision_coop_store: bool,
     pub pipeline_cache: bool,
     pub timestamp_query: bool,
@@ -103,7 +105,7 @@ pub struct Caps {
 }
 
 impl Caps {
-    /// A coop config, a fixed subgroup width, and enough workgroup width.
+    /// A coop config, a *fixed* subgroup width, and enough workgroup width.
     pub fn coop_supported(&self) -> bool {
         !self.coop.is_empty()
             && self.subgroups.is_some_and(|s| s.is_fixed())
@@ -117,8 +119,8 @@ impl Caps {
             .find(|c| c.operand == operand && c.acc == acc)
     }
 
-    /// 32 when subgroups are unsupported: the narrowest width on targeted
-    /// hardware, so a wrong guess only keeps more parallelism.
+    /// 32 when subgroups are unsupported — the narrowest width on hardware
+    /// fusor2 targets, so a wrong guess only keeps more parallelism.
     pub fn subgroup_width(&self) -> u32 {
         self.subgroups.map_or(32, |s| s.assumed())
     }

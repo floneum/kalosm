@@ -1,20 +1,39 @@
-//! The `rule!` macro. Three syntactic forms: a declarative one that names a
-//! rule and its `apply` function, and two structural-pattern forms that
+//! The `rule!` macro. Three syntactic forms: the declarative one, which names
+//! a rule and its `apply` function, and two structural-pattern forms that
 //! destructure an `Op::L0(L0::…)` / `Op::L1(L1::…)` head, bind its fields by
-//! name and emit an early `return None` on mismatch.
+//! name and emit an early `return None` on mismatch. **No proc macro**: four
+//! of the interesting rules enumerate integer tuples and a pattern DSL would
+//! not earn itself there.
+//!
+//! Owned by W2.
 
-/// Declare a `pub const` [`crate::egraph::Rule`] named by its identifier. The
-/// declarative form names a free `apply` function; the `l0 =` / `l1 =` forms
-/// take an inline body, destructure the head into bindings that borrow from
-/// the node, and return `None` on a variant mismatch.
+/// Declare a `pub const` [`crate::egraph::Rule`].
+///
+/// Three forms.
+///
+/// **Declarative** — the rule body is a free function elsewhere:
 ///
 /// ```ignore
 /// rule!(FOLD_SPLIT, level = Level::L0, head = OpTag::Fold,
 ///       tag = RuleTag::Additive, apply = fold_split);
+/// ```
+///
+/// **Structural** — the body is inline and the head is destructured, with an
+/// implicit `return None` when the node is not that variant:
+///
+/// ```ignore
 /// rule!(UNIT_FOLD_COLLAPSE, level = Level::L0, head = OpTag::Fold,
-///       tag = RuleTag::Additive, l0 = Fold { combine, axis, acc, carrier, x },
+///       tag = RuleTag::Additive,
+///       l0 = Fold { combine, axis, acc, carrier, x },
 ///       |b, id, node, f| { … Option<Id> });
 /// ```
+///
+/// `l1 = KFold { … }` is the same against [`crate::ir::level1::L1`]. Bound
+/// fields are *references* into the node, because the driver hands the rule a
+/// borrowed `&Node`.
+///
+/// The rule's `name` is the identifier, so a conformance case can assert it
+/// fired by string without a second registry.
 #[macro_export]
 macro_rules! rule {
     (

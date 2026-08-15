@@ -1,17 +1,33 @@
 //! Every level-generic rewrite rule, and the one table the driver is handed.
 //!
 //! Guards may read only [`crate::egraph::Facts`] — legality, never
-//! profitability. Rule order carries no semantics; the fixed order below is
-//! for reproducibility.
+//! profitability. That restriction is enforced by the API surface rather than
+//! by convention, and it is this design's immune system: the reference's
+//! `consumer_count(input) != 1`, `skip_externally_live`,
+//! `variant_duplicates_required_producer` and `merge_profile -> None` are all
+//! profitability judgements smuggled into legality gates, which is why two
+//! individually profitable optimizations end up jointly illegal there.
 //!
-//! No rule recognizes a frontend node chain or names an algorithm: flash
-//! attention is a `KFold` with a multi-slot carrier reached by general laws.
+//! **Rule order carries no semantics**; the fixed order below exists only for
+//! reproducibility, and `rule_order_is_semantically_inert` asserts it.
+//!
+//! # What is not here
+//!
+//! There were four `flash::*` recognizers. They walked a deep chain on every
+//! `Contract`, `Map` and `Scatter` in the graph looking for the node sequence
+//! `fusor2::composite::attention` happened to emit, which is why they silently
+//! stopped matching when the frontend changed and flash attention was
+//! unreachable on both backends while every test still passed. They are
+//! deleted. Flash attention is a `KFold` with a multi-slot carrier, reached by
+//! the general laws registered below — `ABSORB`, `PROMOTE`, `HOIST`,
+//! `RETARGET`, `TUPLE`, `STRIP` — none of which mentions attention.
+//!
+//! Owned by W2.
 
 pub mod algebra;
 pub mod fusion;
 pub mod layout;
 pub mod lower_floor;
-pub mod merge;
 pub mod promote;
 pub mod rebase;
 pub mod sink;
@@ -23,7 +39,7 @@ use crate::egraph::{Builder, Id, Rule};
 use crate::ir::Op;
 use crate::ir::level0::L0;
 use crate::ir::level1::{AccessPlan, IndexSpace, L1, Operand};
-use crate::scalar::{ScalarExpr, ScalarKind};
+use crate::scalar::ScalarExpr;
 use crate::shape::{Dim, Layout, StrideSpec};
 
 /// Position of a rule in whatever slice was handed to the driver. `RuleId`
@@ -49,9 +65,12 @@ pub static CORE_RULES: &[Rule] = &[
     fusion::MAP_INTO_MAP,
     fusion::FOLD_POST_EPILOGUE,
     fusion::FORM_KREGION,
-    // L1 fold algebra — the carrier laws. `HOIST` and `RETARGET` are separate
-    // entries because the driver's fired set is per `(RuleId, Id)`, so a
-    // merged rule could fire at most once per node.
+    // L1 fold algebra — the carrier laws. `PROMOTE`, `HOIST`, `RETARGET`,
+    // `TUPLE` and `TUPLE_SIBLING` are registered here as stubs so their
+    // owners never have to edit this file. `HOIST` and `RETARGET` are two
+    // entries sharing one dependence query on purpose: the driver's fired
+    // set is per `(RuleId, Id)`, so one merged rule could fire at most once
+    // per node and the second answer would be unreachable.
     promote::PROMOTE,
     rebase::HOIST,
     rebase::RETARGET,
@@ -61,10 +80,6 @@ pub static CORE_RULES: &[Rule] = &[
     sink::SINK_EPILOGUE,
     sink::FOLD_VIEWS_INTO_INDEX,
     sink::FOLD_VIEWS_INTO_FOLD_INDEX,
-    // L1 horizontal merging
-    merge::MERGE_CONTRACT_WAVE,
-    merge::MERGE_ROW_WAVE,
-    merge::MERGE_REGION_WAVE,
     // L1 operand access
     layout::OPERAND_ALIAS,
     layout::OPERAND_GATHER,
@@ -85,13 +100,26 @@ pub static CORE_RULES: &[Rule] = &[
 ];
 
 /// Look a core rule up by the name its `rule!` declaration stringified.
-#[cfg(test)]
-pub(crate) fn rule_id(name: &str) -> Option<RuleId> {
+pub fn rule_id(name: &str) -> Option<RuleId> {
     CORE_RULES
         .iter()
         .position(|r| r.name == name)
         .map(|i| RuleId(i as u16))
 }
+
+/// The core rule at `id`. Panics when `id` is out of range, which can only
+/// happen if a caller mixes ids minted against a different slice.
+pub fn rule(id: RuleId) -> &'static Rule {
+    &CORE_RULES[id.0 as usize]
+}
+
+// ---------------------------------------------------------------------------
+// Shared rule helpers
+//
+// These are the small pieces several rule modules need. They are all pure
+// functions over `Builder`'s read side plus IR values; none of them can reach
+// extraction state.
+// ---------------------------------------------------------------------------
 
 /// An operand read straight out of its producer's dense row-major layout.
 pub(crate) fn alias_operand_of(src: Id, shape: &[Dim]) -> Operand {
@@ -107,11 +135,6 @@ pub(crate) fn ident_expr(dtype: Dtype) -> ScalarExpr {
     ScalarExpr::arg(0, dtype)
 }
 
-/// Whether a `pre`/`post` chain is the identity.
-pub(crate) fn is_ident(e: &ScalarExpr) -> bool {
-    matches!(e.kind(), ScalarKind::Arg(0))
-}
-
 /// The access predicate `map_into_fold` and `map_into_contract` guard on:
 /// `Alias`, `Unflatten` and `Gather` are legal in any space; a `Pack` is
 /// legal only when the packed layout has the consuming space's rank.
@@ -124,9 +147,10 @@ pub(crate) fn access_legal_in(a: &AccessPlan, space: &IndexSpace) -> bool {
 
 /// The elementwise producer shape a fusion rule inlines.
 ///
-/// Equality in this e-graph is not congruent, so an `L0::Map` and the
-/// `L1::KMap` it lowered to share a class while a consuming operand still
-/// names whichever id the frontend built. Both spellings are inlinable.
+/// Equality in this e-graph is **not congruent**, so an `L0::Map` and the
+/// `L1::KMap` it was lowered to are one class but the consuming L1 node's
+/// operand still names whichever id the frontend built. Both spellings
+/// denote the same value, so both are inlinable; this normalizes them.
 pub(crate) struct MapView {
     pub space: IndexSpace,
     pub body: ScalarExpr,
@@ -172,8 +196,9 @@ pub(crate) fn operand_dtypes(b: &Builder<'_>, ops: &[Operand]) -> Vec<Dtype> {
 }
 
 /// Apply a relative restride spec vector to a dense row-major input shape.
-/// Returns `None` when a stride or offset is not decidable.
-pub fn composed_layout(specs: &[StrideSpec], in_shape: &[Dim]) -> Option<Layout> {
+/// Returns `None` when a stride or offset is not decidable, which is what
+/// keeps a symbolic view from being aliased on a guess.
+pub(crate) fn composed_layout(specs: &[StrideSpec], in_shape: &[Dim]) -> Option<Layout> {
     let in_strides = Layout::row_major_strides(in_shape);
     let mut shape: Vec<Dim> = Vec::with_capacity(specs.len());
     let mut strides: Vec<Dim> = Vec::with_capacity(specs.len());
@@ -193,6 +218,95 @@ pub fn composed_layout(specs: &[StrideSpec], in_shape: &[Dim]) -> Option<Layout>
     Layout::from_parts(Dim::Const(offset), &shape, &strides).ok()
 }
 
+/// The plain affine layout a whole view spine denotes over its base, or
+/// `None` when the composition is not expressible as one stride vector.
+///
+/// [`composed_layout`] states one spec vector against a **dense** input;
+/// composing a chain substitutes each stage's strides into the next, so a
+/// narrow → reshape → transpose spine — the shape every rope operand and
+/// attention head split arrives as — collapses to `offset + Σ stride_j · i_j`
+/// over the base buffer. Everything must be const-decidable and every stage's
+/// bounds proof [`BoundsProof::Static`]: a `RuntimeMask` view masks reads the
+/// composed layout could not, and dropping a mask is a wrong value, not a
+/// missed optimization.
+///
+/// A spec that walks past its input axis's extent (an axis-merging reshape)
+/// is only affine when the stage it reads is dense row-major from that axis
+/// inward; elsewhere the walk leaves the axis and the address is not
+/// `stride · i` any more, so the composition declines rather than guesses.
+pub(crate) fn composed_spine_layout(
+    b: &Builder<'_>,
+    spine: &crate::egraph::ViewSpine,
+) -> Option<Layout> {
+    use crate::ir::level0::L0;
+    let base_shape = b.facts_of(spine.base).shape.clone();
+    let mut shape: Vec<u64> = base_shape
+        .iter()
+        .map(|d| d.as_const())
+        .collect::<Option<_>>()?;
+    let mut strides: Vec<u64> = Layout::row_major_strides(&base_shape)
+        .iter()
+        .map(|d| d.as_const())
+        .collect::<Option<_>>()?;
+    let mut offset: u64 = 0;
+    for view in &spine.views {
+        let Op::L0(L0::Restride { specs, bounds, .. }) = &b.node(*view).op else {
+            return None;
+        };
+        if *bounds != crate::shape::BoundsProof::Static {
+            return None;
+        }
+        // Whether the *current* stage is one dense row-major block, which is
+        // the only stage an axis-overrunning spec addresses correctly: there
+        // the stage is a flat window and `k · multiplier · in_stride` is flat
+        // addressing, whatever axis boundaries the walk crosses.
+        let dense = {
+            let mut want = 1u64;
+            let mut ok = true;
+            for i in (0..shape.len()).rev() {
+                // An extent-1 axis is unobservable whatever its stride says.
+                if shape[i] <= 1 {
+                    continue;
+                }
+                if strides[i] != want {
+                    ok = false;
+                    break;
+                }
+                want = want.saturating_mul(shape[i]);
+            }
+            ok
+        };
+        let mut nshape: Vec<u64> = Vec::with_capacity(specs.len());
+        let mut nstrides: Vec<u64> = Vec::with_capacity(specs.len());
+        for s in specs {
+            let idim = s.input_dim as usize;
+            let in_ext = *shape.get(idim)?;
+            let in_stride = *strides.get(idim)?;
+            let size = s.size.as_const()?;
+            let off = s.offset.as_const()?;
+            offset = offset.checked_add(off.checked_mul(in_stride)?)?;
+            if s.multiplier == 0 {
+                nshape.push(size);
+                nstrides.push(0);
+                continue;
+            }
+            let span = u64::from(s.multiplier)
+                .checked_mul(size.saturating_sub(1))?
+                .checked_add(off)?;
+            if span >= in_ext.max(1) && !dense {
+                return None;
+            }
+            nshape.push(size);
+            nstrides.push(in_stride.checked_mul(u64::from(s.multiplier))?);
+        }
+        shape = nshape;
+        strides = nstrides;
+    }
+    let shape: Vec<Dim> = shape.into_iter().map(Dim::Const).collect();
+    let strides: Vec<Dim> = strides.into_iter().map(Dim::Const).collect();
+    Layout::from_parts(Dim::Const(offset), &shape, &strides).ok()
+}
+
 /// Whether a spec vector is the identity view of `in_shape`.
 pub(crate) fn is_identity_specs(specs: &[StrideSpec], in_shape: &[Dim]) -> bool {
     specs.len() == in_shape.len()
@@ -205,11 +319,13 @@ pub(crate) fn is_identity_specs(specs: &[StrideSpec], in_shape: &[Dim]) -> bool 
 }
 
 /// A minimal in-crate [`crate::ir::Semantics`] plus graph constructors, so
-/// every rule module can build a fixture. Its `has_round` STRICT meet is the
-/// only source of STRICT facts the rule-guard tests have.
+/// every rule module can build a fixture without depending on W1's
+/// `CoreSemantics` landing first. Declared inline rather than in a new file:
+/// `src/rules/` is a fixed file set.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use crate::scalar::ScalarKind;
     use crate::device::{Caps, CoopKind, DeviceKind, Limits, SubgroupWidths};
     use crate::dtype::{NumericContract, Persistence};
     use crate::egraph::EGraph;
@@ -236,6 +352,21 @@ pub(crate) mod test_support {
             Persistence::Persistent
         } else {
             Persistence::Step
+        }
+    }
+
+    fn has_round(e: &ScalarExpr) -> bool {
+        match e.kind() {
+            ScalarKind::Round { .. } => true,
+            ScalarKind::Un { x, .. }
+            | ScalarKind::Cast { x, .. }
+            | ScalarKind::Bitcast { x, .. }
+            | ScalarKind::Splat { x, .. } => has_round(x),
+            ScalarKind::Bin { a, b, .. }
+            | ScalarKind::Cmp { a, b, .. }
+            | ScalarKind::Dot { a, b } => has_round(a) || has_round(b),
+            ScalarKind::Select { c, t, f } => has_round(c) || has_round(t) || has_round(f),
+            _ => false,
         }
     }
 
@@ -275,7 +406,6 @@ pub(crate) mod test_support {
                     a.ops.iter().chain(b.ops.iter()).map(|p| p.src).collect()
                 }
                 L1::KRegion { members, .. } => members.iter().copied().collect(),
-                L1::KMerged(m) => m.segments().iter().copied().collect(),
             },
         }
     }
@@ -311,7 +441,7 @@ pub(crate) mod test_support {
                 f.outs = *outs;
                 // A rounding body is the QAT fake-quant path: its value may
                 // not be reassociated or contracted.
-                if expr.has_round() {
+                if has_round(expr) {
                     f.numeric = f.numeric.meet(NumericContract::STRICT);
                 }
                 f
@@ -429,12 +559,6 @@ pub(crate) mod test_support {
                     .ok_or_else(|| Error::Shape("empty region".into()))?;
                 facts(last.dtype, last.shape.clone(), ins)
             }
-            L1::KMerged(_) => {
-                let first = ins
-                    .first()
-                    .ok_or_else(|| Error::Shape("empty wave".into()))?;
-                facts(first.dtype, first.shape.clone(), ins)
-            }
             L1::Ext { .. } => return Err(Error::Legality("no test Ext registry".into())),
         })
     }
@@ -492,6 +616,8 @@ pub(crate) mod test_support {
             threads: 1,
         }
     }
+
+    // ---- graph constructors -------------------------------------------
 
     pub fn buffer(g: &mut EGraph, dtype: Dtype, shape: &[Dim]) -> Id {
         let n = g.len() as u32;
@@ -621,6 +747,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scalar::ScalarKind;
     use crate::egraph::{RuleTag, SaturationBudget, Saturate};
     use crate::ir::{Level, OpTag};
     use crate::rules::test_support as ts;
@@ -650,9 +777,6 @@ mod tests {
             "SINK_EPILOGUE",
             "FOLD_VIEWS_INTO_INDEX",
             "FOLD_VIEWS_INTO_FOLD_INDEX",
-            "MERGE_CONTRACT_WAVE",
-            "MERGE_ROW_WAVE",
-            "MERGE_REGION_WAVE",
             "OPERAND_ALIAS",
             "OPERAND_GATHER",
             "OPERAND_PACK",
@@ -670,14 +794,16 @@ mod tests {
         ];
         let got: Vec<&str> = CORE_RULES.iter().map(|r| r.name).collect();
         assert_eq!(got, expected);
-        assert_eq!(CORE_RULES.len(), 37);
-        // No rule is keyed on a frontend chain or names an algorithm.
+        assert_eq!(CORE_RULES.len(), 34);
+        // No recognizer survives: nothing in the table is keyed on a frontend
+        // chain, and no rule names an algorithm.
         assert!(
             !CORE_RULES.iter().any(|r| r.name.contains("FLASH")),
             "a flash recognizer is back in the table"
         );
         for (i, r) in CORE_RULES.iter().enumerate() {
             assert_eq!(rule_id(r.name), Some(RuleId(i as u16)));
+            assert_eq!(rule(RuleId(i as u16)).name, r.name);
         }
     }
 
@@ -711,9 +837,19 @@ mod tests {
         );
     }
 
-    /// Elementwise-into-elementwise arithmetic is `ScalarExpr::compose`, so no
-    /// `L0::Map`-headed rule produces a second `L0::Map`. The substitution
-    /// itself is `fusion::MAP_INTO_MAP`, headed at `KMap`.
+    /// Test 13. Elementwise-into-elementwise is `ScalarExpr::compose` — the
+    /// *arithmetic* is a tree substitution and no `L0::Map`-headed rule
+    /// produces a second `L0::Map`.
+    ///
+    /// **It is not free, and this test used to claim it was.** The claim was
+    /// that the frontend composes at construction; it does not, and never
+    /// did — `compose` has no caller outside the rules — so
+    /// `Map{exp}(Map{sub}(s, m))` reached extraction as two nodes, and a
+    /// launch is lowered from one node. Three of `attention_forward`'s eight
+    /// dispatches were consecutive elementwise maps over one space. The
+    /// substitution is now `fusion::MAP_INTO_MAP`, headed at `KMap`, which is
+    /// why the `OpTag::Map` roster below is unchanged and the `KMap` one is
+    /// not.
     #[test]
     fn elementwise_into_elementwise_needs_no_rule() {
         let inner = ScalarExpr::un(crate::scalar::UnOp::Exp, ScalarExpr::arg(0, Dtype::F32));
@@ -727,7 +863,9 @@ mod tests {
             other => panic!("expected sqrt(exp(x)), got {other:?}"),
         }
 
-        // The Map-headed rules are the three algebraic ones plus the floor.
+        // No rule fires on a Map whose sole operand is another Map in a way
+        // that produces a third Map: the Map-headed rules are the three
+        // algebraic ones plus the lowering floor.
         let map_headed: Vec<&str> = CORE_RULES
             .iter()
             .filter(|r| r.head == OpTag::Map)
@@ -757,8 +895,8 @@ mod tests {
         assert_eq!(before, 1);
         assert_eq!(l0_maps, 1, "a Map-into-Map alternative was minted");
 
-        // At L1 the class holds a one-operand `KMap` whose body is the
-        // composed expression, reading `x` directly.
+        // At L1 it *is* a rule, and it fires: the class holds a one-operand
+        // `KMap` whose body is the composed expression, reading `x` directly.
         let fused_kmap = members.iter().copied().find(|&m| {
             matches!(&g.node(m).op, Op::L1(L1::KMap { ops, .. }) if ops.len() == 1 && ops[0].src == x)
         });

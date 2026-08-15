@@ -1,27 +1,32 @@
 //! Attention (dense, causal, masked, GQA/MQA, lse, grads) and the RoPE family.
 //!
 //! Every attention case is checked against a host implementation that spells
-//! out the softmax explicitly. `MaskKind::Causal` is structural: no mask tensor
-//! is uploaded.
+//! out the softmax explicitly, so which nest extraction picked is invisible to
+//! the case and visible only in the numbers. `MaskKind::Causal` is *structural*: no mask tensor is
+//! uploaded, so a lowering that silently needs one fails here rather than
+//! reading garbage.
+//!
+//! Owned by W14.
 
 use fusor2::composite::attention::{
     attention, attention_causal, attention_grads, attention_lse, attention_masked,
     attention_with_lse,
 };
 use fusor2::composite::rope::{
-    base_inverse_frequency, rope, rope_fused, rope_interleaved, rope_interleaved_with_position,
-    rope_normal_fused, rope_normal_pair_fused, rope_normal_pair_fused_with_position,
-    rope_pair_fused, rope_pair_fused_with_position, rope_with_position, rotate_half,
+    base_inverse_frequency, rope, rope_interleaved, rope_interleaved_pair,
+    rope_interleaved_pair_with_position, rope_interleaved_with_position, rope_pair,
+    rope_pair_with_position, rope_with_position, rotate_half,
 };
 use fusor2::graph::GraphRef;
-use fusor2::{Dtype, Session, Tensor};
+use fusor2::{Dtype, Session, };
+use fusor2::tensor::Dyn as Tensor;
 use fusor2_ir::ir::level1::MaskKind;
 
 use crate::harness::{CaseError, CaseResult, Cases, dims, from_u32};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
 /// `[B, H, L, Dh]`. `Dh` is even because every RoPE pairing needs it to be,
-/// and `Lq != Lk`.
+/// and `Lq != Lk` so a transposed score index cannot pass.
 const B: usize = 2;
 const H: usize = 2;
 const LQ: usize = 3;
@@ -42,7 +47,7 @@ fn kv_len(heads: usize) -> usize {
     B * heads * LK * DH
 }
 
-/// `1 / sqrt(Dh)`, the default scale.
+/// `1 / sqrt(Dh)`, the scale every case leaves to the default.
 fn default_scale() -> f32 {
     1.0 / (DH as f32).sqrt()
 }
@@ -54,6 +59,10 @@ fn backend_of(session: &Session) -> &'static str {
         "cpu"
     }
 }
+
+// ---------------------------------------------------------------------------
+// Host attention
+// ---------------------------------------------------------------------------
 
 /// `[B, H, Lq, Dh]` output and `[B, H, Lq]` log-sum-exp.
 ///
@@ -105,7 +114,7 @@ fn no_mask(_: usize, _: usize) -> f32 {
 }
 
 /// Causal over `[Lq, Lk]`, right-aligned: query `i` sees keys up to
-/// `i + (Lk - Lq)`.
+/// `i + (Lk - Lq)`, which is the decode-time convention.
 fn causal_mask(i: usize, j: usize) -> f32 {
     if j <= i + (LK - LQ) {
         0.0
@@ -167,6 +176,10 @@ fn host_attention_grads(
     (dq, dk, dv)
 }
 
+// ---------------------------------------------------------------------------
+// Host rope
+// ---------------------------------------------------------------------------
+
 /// The rotation applied to one `[Dh]` head vector at position `p`.
 /// `interleaved` pairs `(2i, 2i+1)`; otherwise pairs `(i, i + Dh/2)`.
 fn host_rope_vec(x: &[f32], cos: &[f32], sin: &[f32], p: usize, interleaved: bool) -> Vec<f32> {
@@ -200,7 +213,7 @@ fn host_rope(x: &[f32], cos: &[f32], sin: &[f32], len: usize, offset: usize, il:
     out
 }
 
-/// The `[max_len, Dh/2]` sin/cos tables.
+/// The `[max_len, Dh/2]` sin/cos tables the rope cases upload.
 fn rope_tables(max_len: usize) -> (Vec<f32>, Vec<f32>) {
     let inv = base_inverse_frequency(DH as u32, 10_000.0);
     let mut cos = Vec::with_capacity(max_len * inv.len());
@@ -213,6 +226,10 @@ fn rope_tables(max_len: usize) -> (Vec<f32>, Vec<f32>) {
     }
     (cos, sin)
 }
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
 
 pub fn cases() -> Cases {
     let mut cases = Cases::new();
@@ -254,8 +271,10 @@ pub fn cases() -> Cases {
         )
     });
 
-    // Structural, on the chain `attention_defn` emits rather than a hand-built
-    // graph.
+    // Structural, on the chain `attention_defn` actually emits — never a
+    // hand-built graph. A rule that silently stops matching the frontend is
+    // how flash attention was unreachable on both backends for a week while
+    // every numeric case still passed.
     cases.push("attention_rope", "attention_defn_saturates", |s| {
         saturation_case(s, false)
     });
@@ -263,7 +282,9 @@ pub fn cases() -> Cases {
         saturation_case(s, true)
     });
 
-    // Launch counts, as ceilings.
+    // Launch counts, as ceilings: where these shapes land today, so a law
+    // that collapses them reports a number and a law that stops firing
+    // reports a regression.
     cases.push("attention_rope", "attention_forward_launch_ceiling", |s| {
         launch_ceiling_case(s, "attention_forward")
     });
@@ -299,7 +320,8 @@ pub fn cases() -> Cases {
         attention_backward,
     );
 
-    // RoPE. Every spelling is checked against the same host rotation.
+    // RoPE. Every spelling is checked against the same host rotation, so an
+    // alias that quietly picked the other pairing is a value failure.
     cases.push("attention_rope", "rope", |s| {
         rope_case(s, "rope", false, 0, rope)
     });
@@ -309,35 +331,24 @@ pub fn cases() -> Cases {
     cases.push("attention_rope", "rope_offset", |s| {
         rope_case(s, "rope_offset", false, 2, rope)
     });
-    cases.push("attention_rope", "rope_fused", |s| {
-        rope_case(s, "rope_fused", true, 0, rope_fused)
+    cases.push("attention_rope", "rope_pair", |s| {
+        rope_pair_case(s, "rope_pair", false, rope_pair)
     });
-    cases.push("attention_rope", "rope_normal_fused", |s| {
-        rope_case(s, "rope_normal_fused", false, 0, rope_normal_fused)
+    cases.push("attention_rope", "rope_interleaved_pair", |s| {
+        rope_pair_case(s, "rope_interleaved_pair", true, rope_interleaved_pair)
     });
-    cases.push("attention_rope", "rope_pair_fused", |s| {
-        rope_pair_case(s, "rope_pair_fused", true, rope_pair_fused)
-    });
-    cases.push("attention_rope", "rope_normal_pair_fused", |s| {
-        rope_pair_case(s, "rope_normal_pair_fused", false, rope_normal_pair_fused)
-    });
-    cases.push("attention_rope", "rope_pair_fused_with_position", |s| {
-        rope_position_pair_case(
-            s,
-            "rope_pair_fused_with_position",
-            true,
-            rope_pair_fused_with_position,
-        )
+    cases.push("attention_rope", "rope_pair_with_position", |s| {
+        rope_position_pair_case(s, "rope_pair_with_position", false, rope_pair_with_position)
     });
     cases.push(
         "attention_rope",
-        "rope_normal_pair_fused_with_position",
+        "rope_interleaved_pair_with_position",
         |s| {
             rope_position_pair_case(
                 s,
-                "rope_normal_pair_fused_with_position",
-                false,
-                rope_normal_pair_fused_with_position,
+                "rope_interleaved_pair_with_position",
+                true,
+                rope_interleaved_pair_with_position,
             )
         },
     );
@@ -367,21 +378,30 @@ pub fn cases() -> Cases {
     cases
 }
 
-/// Asserts on the extracted plan's materialized set that the `[Lq, Lk]` score,
-/// probability and `dp` matrices stay out of it.
+/// The materialization half of the flash acceptance bar.
+///
+/// Gate 5 of the deletion checklist is a `materialized_bytes` assert proving
+/// the `[Lq, Lk]` score, probability and `dp` matrices are **not** in the
+/// extracted plan's materialized set. The entire memory win lives in that bit:
+/// if the extractor materializes them, every numeric case in this file still
+/// passes and the kernel is a memory hog. Launch counts do not cover it — a
+/// one-launch kernel that stages a `[Lq, Lk]` buffer is still one launch.
 mod materialization {
     use fusor2::composite::attention::{
         attention, attention_causal, attention_grads, attention_with_lse,
     };
-    use fusor2::{Session, Tensor};
+    use fusor2::{Session, };
+use fusor2::tensor::Dyn as Tensor;
     use fusor2_ir::ir::level1::MaskKind;
 
     use crate::harness::{CaseError, CaseResult, Cases, dims};
     use crate::suite::reductions::generality::structure;
     use crate::suite::support::{Domain, graph_of, upload};
 
-    /// A shape whose score matrix has a distinct element count from every other
-    /// tensor in the program: `B*H*Lq*Lk = 140`, `q` = 120, `k` and `v` = 168.
+    /// A shape whose score matrix is a *distinct* element count from every
+    /// other tensor in the program, so "no buffer of exactly this many
+    /// elements" is an unambiguous claim. `B*H*Lq*Lk = 2*2*5*7 = 140`, while
+    /// `q` is 2*2*5*6 = 120, `k` and `v` are 2*2*7*6 = 168.
     const B: u64 = 2;
     const H: u64 = 2;
     const LQ: u64 = 5;
@@ -435,8 +455,13 @@ mod materialization {
         Ok((q, k, v))
     }
 
-    /// Counts materialized `[Lq, Lk]` score and probability matrices against a
-    /// ceiling. The fold-to-fold launch boundary forces some to exist.
+    /// Forward: the `[Lq, Lk]` score and probability matrices.
+    ///
+    /// A ceiling today, not the target — `ABSORB`'s reduction-nesting clause
+    /// is what keeps the score matrix out of `M`, and
+    /// `fusor2-cost/src/realize.rs` still forces a launch boundary on every
+    /// fold-to-fold edge, so the buffer is there. The bytes are asserted so
+    /// the day the boundary is repaired is a diff rather than a silence.
     fn forward(session: &Session) -> CaseResult {
         let build = |s: &Session| -> Result<Vec<Tensor>, CaseError> {
             let (q, k, v) = qkv(s)?;
@@ -460,8 +485,8 @@ mod materialization {
         Ok(())
     }
 
-    /// The same count for the score, probability and `dp` matrices across the
-    /// whole `attention_grads` chain.
+    /// Backward: the score, probability and `dp` matrices, across the whole
+    /// `attention_grads` chain.
     fn backward(session: &Session) -> CaseResult {
         let build = |s: &Session| -> Result<Vec<Tensor>, CaseError> {
             let (q, k, v) = qkv(s)?;
@@ -493,8 +518,15 @@ mod materialization {
         Ok(())
     }
 
-    /// Causal attention must not cost more than the dense shape: buffer bytes
-    /// and launch count are both pinned at parity.
+    /// Causal attention must not cost *more* than the dense shape.
+    ///
+    /// The acceptance bar is `work()` for causal at `Lq == Lk` at or under
+    /// 0.6x the dense shape, which is `STRIP`'s elide clause narrowing the
+    /// reduction domain. That clause does not fire yet, so the sharp ratio is
+    /// not assertable — but the *negative* half is, and it is the one that
+    /// catches the failure mode that matters: causal attention silently doing
+    /// **more** work than the kernel being deleted, on a plan nothing
+    /// compares. Buffer bytes and launch count are both pinned at parity.
     fn causal_ratio(session: &Session) -> CaseResult {
         let square = |s: &Session, causal: bool| -> Result<Vec<Tensor>, CaseError> {
             let g = graph_of(s);
@@ -547,6 +579,10 @@ mod materialization {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Attention cases
+// ---------------------------------------------------------------------------
+
 type AttnBuild = fn(&Tensor, &Tensor, &Tensor) -> fusor2::Result<Tensor>;
 
 fn attention_case(
@@ -578,9 +614,12 @@ fn attention_case(
     Ok(())
 }
 
-/// Measure one attention shape's dispatch count against its ceiling. The
-/// values are resolved together, so `attention_with_lse` is charged for both
-/// outputs.
+/// Measure one attention shape's dispatch count against its ceiling.
+///
+/// The values are resolved together, so `attention_with_lse` is charged for
+/// both outputs: `o` and `lse` are two slots of one carrier once the laws
+/// land, which is strictly better than `KFlash`, where they were two
+/// dispatches.
 fn launch_ceiling_case(session: &Session, name: &'static str) -> CaseResult {
     let q_data = Domain::Wide.sample(701, Q_LEN);
     let k_data = Domain::Wide.sample(709, kv_len(H));
@@ -607,6 +646,7 @@ fn launch_ceiling_case(session: &Session, name: &'static str) -> CaseResult {
     };
     crate::launch_counts::check_ceiling(session, name, &values)?;
 
+    // A count with no number behind it is a count of the wrong kernel.
     let (expected, expected_lse) = host_attention(
         &q_data,
         &k_data,
@@ -633,9 +673,17 @@ fn launch_ceiling_case(session: &Session, name: &'static str) -> CaseResult {
     Ok(())
 }
 
-/// Rules that must fire while saturating the chain `attention_defn` emits,
-/// paired with what their absence would mean. Every entry is
-/// backend-independent, so one table serves both sessions.
+/// Rules that **must** fire while saturating the chain `attention_defn`
+/// emits, with what their absence would mean.
+///
+/// This is the firing half of the acceptance bar, and it is stated on the
+/// real frontend chain rather than a hand-built graph on purpose: the
+/// previous flash rules matched a chain the frontend later stopped emitting,
+/// stopped firing, and nothing noticed. Adding a law is one row here.
+///
+/// Every entry is backend-independent; target-specific rules (`LOWER_COOP`,
+/// `SELECT_VECTOR_WIDTH`) are deliberately absent so one table serves both
+/// sessions.
 const REQUIRED_ON_THE_ATTENTION_CHAIN: &[(&str, &str)] = &[
     (
         "LOWER_FOLD",
@@ -657,16 +705,27 @@ const REQUIRED_ON_THE_ATTENTION_CHAIN: &[(&str, &str)] = &[
     ),
 ];
 
-/// Saturate the graph `attention_defn` emits and assert the report: it reached
-/// a fixpoint, no class was truncated, and the application count is at or over
-/// `FLOOR`.
+/// Saturate the graph `attention_defn` actually emits and read the report.
+///
+/// Three asserts, in rising order of what they catch:
+/// * `saturated == true` — the rule table reached a fixpoint inside the
+///   budget, so nothing below is "it did not get that far";
+/// * `truncated.is_empty()` — no class was abandoned mid-chain. Truncation is
+///   never silent, and on this graph it must not happen at all;
+/// * `applications >= FLOOR` — the tripwire. A rule table that stops firing on
+///   the real frontend chain reports a *number*, not a quiet regression. The
+///   floor sits well under the measured value on purpose: laws land and
+///   subsume each other, so the pin catches "attention stopped being
+///   rewritten", not "the count moved".
 fn saturation_case(session: &Session, causal: bool) -> CaseResult {
     use fusor2_ir::egraph::Saturate;
     use fusor2_ir::egraph::SaturationBudget;
     use fusor2_ir::saturate::Driver;
 
-    /// Far under the measured application count, so it fires only when
-    /// attention stops being rewritten at all.
+    /// Measured at 419 (gpu) and 1534 (cpu) applications on the shipped
+    /// table. The floor is far under both on purpose: laws land and subsume
+    /// each other, so this pins "attention stopped being rewritten", not "the
+    /// count moved". The rule table below is the sharp assert.
     const FLOOR: u32 = 64;
 
     let q_data = Domain::Wide.sample(701, Q_LEN);
@@ -747,7 +806,8 @@ fn saturation_case(session: &Session, causal: bool) -> CaseResult {
             .into());
         }
     }
-    // The graph must compute the right numbers after the extra saturation pass.
+    // The graph must still compute the right numbers after the extra
+    // saturation pass: a report is not a result.
     let (expected, _) = host_attention(
         &q_data,
         &k_data,
@@ -760,7 +820,8 @@ fn saturation_case(session: &Session, causal: bool) -> CaseResult {
 }
 
 /// A scale that is not `1/sqrt(Dh)`. The scale is a runtime uniform read from
-/// binding 0, not a baked literal.
+/// binding 0, not a baked literal, so passing a different one must change the
+/// numbers without rebuilding a kernel.
 fn attention_scale_case(session: &Session) -> CaseResult {
     const SCALE: f32 = 0.37;
     let q_data = Domain::Wide.sample(701, Q_LEN);
@@ -780,12 +841,12 @@ fn attention_scale_case(session: &Session) -> CaseResult {
 }
 
 /// A materialized additive `[Lq, Lk]` mask. `QkMask` is the one mask kind that
-/// is not structural, so the tensor has to reach the kernel.
+/// is *not* structural, so the tensor has to reach the kernel.
 fn qk_mask_case(session: &Session) -> CaseResult {
     let q_data = Domain::Wide.sample(727, Q_LEN);
     let k_data = Domain::Wide.sample(733, kv_len(H));
     let v_data = Domain::Wide.sample(739, kv_len(H));
-    // Banded and asymmetric, so a transposed index gives wrong numbers.
+    // Banded and asymmetric, so a transposed index shows up as wrong numbers.
     let mask: Vec<f32> = (0..LQ * LK)
         .map(|n| {
             let (i, j) = (n / LK, n % LK);
@@ -845,7 +906,7 @@ fn lse_case(session: &Session) -> CaseResult {
     let lse = attention_lse(&q, &k, MaskKind::None, None, None)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    // v is unused by lse; zeros satisfy the host helper's shapes.
+    // v is unused by lse; zeros keep the host helper's shapes honest.
     let v_data = vec![0.0f32; kv_len(H)];
     let (_, expected) = host_attention(&q_data, &k_data, &v_data, H, default_scale(), &no_mask);
     let shape = [B as u64, H as u64, LQ as u64];
@@ -873,8 +934,11 @@ fn with_lse_case(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// `attention_grads` against the analytic adjoints. dk and dv are halves of one
-/// `[B, H, 2*Lk, Dh]` buffer handed back as zero-cost views.
+/// `attention_grads` against the analytic adjoints.
+///
+/// dk and dv are halves of one `[B, H, 2*Lk, Dh]` buffer handed back as
+/// zero-cost views, so the element counts prove the halves were sliced the
+/// right way round and the values prove they were not swapped.
 fn grads_case(session: &Session) -> CaseResult {
     let q_data = Domain::Wide.sample(809, Q_LEN);
     let k_data = Domain::Wide.sample(811, kv_len(H));
@@ -899,8 +963,18 @@ fn grads_case(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// The derived backward's dispatch count against its ceiling, with the adjoint
-/// values asserted alongside the count.
+/// The derived backward's dispatch count, against its ceiling.
+///
+/// The forward has had a guarded count since the template was deleted; the
+/// backward has not, and `NAMED_BACKWARD_PINS`'s `launches: 1` for
+/// `attention_grads_kv_single_launch` is a target no case measures. Without
+/// this the chain could stop fusing on the backward and only the numbers would
+/// notice — and the numbers stay right whether the adjoints arrive in 30
+/// dispatches or 60.
+///
+/// The values are asserted alongside the count for the reason
+/// `launch_ceiling_case` states: a count with no number behind it is a count of
+/// the wrong kernel.
 fn grads_launch_ceiling(session: &Session) -> CaseResult {
     let q_data = Domain::Wide.sample(809, Q_LEN);
     let k_data = Domain::Wide.sample(811, kv_len(H));
@@ -969,7 +1043,8 @@ fn grads_gqa_refused(session: &Session) -> CaseResult {
 }
 
 /// The taped backward of the composed attention must agree with the analytic
-/// adjoints.
+/// adjoints. That agreement is what makes `attention_grads` an optimization
+/// rather than a second rule to keep in sync by hand.
 fn attention_backward(session: &Session) -> CaseResult {
     let q_data = Domain::Wide.sample(863, Q_LEN);
     let k_data = Domain::Wide.sample(877, kv_len(H));
@@ -1004,6 +1079,10 @@ fn attention_backward(session: &Session) -> CaseResult {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// RoPE cases
+// ---------------------------------------------------------------------------
+
 type RopeBuild = fn(&Tensor, &Tensor, &Tensor, u64) -> fusor2::Result<Tensor>;
 type RopePairBuild =
     fn(&Tensor, &Tensor, &Tensor, &Tensor, u64) -> fusor2::Result<(Tensor, Tensor)>;
@@ -1012,7 +1091,7 @@ type RopePosPairBuild =
     fn(&Tensor, &Tensor, &Tensor, &Tensor, &Tensor) -> fusor2::Result<(Tensor, Tensor)>;
 
 /// Upload the sin/cos tables covering `max_len` positions, returning both the
-/// device tensors and the host copies.
+/// device tensors and the host copies the reference reads.
 fn upload_tables(
     graph: &GraphRef,
     max_len: usize,
@@ -1043,7 +1122,8 @@ fn rope_case(
     Ok(())
 }
 
-/// q and k rotated in one dispatch. Both outputs are checked.
+/// q and k rotated in one dispatch. Both outputs are checked: a fused pair
+/// that rotates q twice and leaves k alone still returns two tensors.
 fn rope_pair_case(
     session: &Session,
     name: &'static str,
@@ -1082,7 +1162,8 @@ fn host_rope_at(data: &[f32], cos: &[f32], sin: &[f32], pos: &[u32], il: bool) -
 }
 
 /// The decode form: positions live in a rank-1 `u32` tensor so the offset
-/// never round-trips through the host. The positions are not `0..Lq`.
+/// never round-trips through the host. The positions are deliberately not
+/// `0..Lq`, so an implementation that ignores the tensor fails.
 fn rope_position_case(
     session: &Session,
     name: &'static str,
@@ -1148,7 +1229,8 @@ fn rotate_half_case(session: &Session) -> CaseResult {
 }
 
 /// A rotation preserves the norm of every `(a, b)` pair, hence of the whole
-/// head vector. Independent of the sin/cos table.
+/// head vector. Independent of the table, so it catches a sin/cos swap that a
+/// self-consistent host reference would agree with.
 fn rope_norm_preserving(session: &Session) -> CaseResult {
     let x_data = Domain::Wide.sample(941, Q_LEN);
     let graph = graph_of(session);
@@ -1171,8 +1253,9 @@ fn rope_norm_preserving(session: &Session) -> CaseResult {
 }
 
 /// The adjoint of a rotation by theta is the rotation by -theta. Under an
-/// all-ones seed that gives `d/dx_a = cos + sin` and `d/dx_b = cos - sin`,
-/// checked analytically rather than by finite difference.
+/// all-ones seed that gives `d/dx_a = cos + sin` and `d/dx_b = cos - sin` —
+/// checked analytically, because a mis-signed sin term is exactly what
+/// survives a symmetric finite-difference probe at small angles.
 fn rope_backward(session: &Session) -> CaseResult {
     let x_data = Domain::Wide.sample(947, Q_LEN);
     let graph = graph_of(session);
@@ -1237,12 +1320,10 @@ mod tests {
         for wanted in [
             "rope",
             "rope_interleaved",
-            "rope_fused",
-            "rope_normal_fused",
-            "rope_pair_fused",
-            "rope_normal_pair_fused",
-            "rope_pair_fused_with_position",
-            "rope_normal_pair_fused_with_position",
+            "rope_pair",
+            "rope_interleaved_pair",
+            "rope_pair_with_position",
+            "rope_interleaved_pair_with_position",
             "rope_with_position",
             "rope_interleaved_with_position",
             "rotate_half",

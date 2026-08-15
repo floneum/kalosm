@@ -1,5 +1,7 @@
 //! Parameterized layers. Each is a thin struct over a few `Tensor` parameters
 //! and a `forward`; none of them owns a kernel.
+//!
+//! Owned by W13.
 
 pub mod conv;
 pub mod embedding;
@@ -21,17 +23,39 @@ use fusor2_ir::shape::Dim;
 
 use crate::graph::GraphRef;
 use crate::tensor::Tensor;
+use crate::tensor::typed::Element;
 use crate::{Error, Result};
+
+/// A loaded parameter as a const-rank value of the layer's element type.
+///
+/// [`load_dense`] always hands back `F32` — that is what the reference's
+/// `dequantize()` does for every parameter — so a `Linear<f16>` needs one cast
+/// on the way in. Writing it here means the five layer types do not each
+/// repeat it, and it means `Linear::<f16>::load` reads an f32 checkpoint,
+/// which is the case that actually occurs.
+pub(crate) fn as_typed<const R: usize, T: Element>(
+    t: Tensor,
+    what: &str,
+) -> Result<crate::Tensor<R, T>> {
+    let t = if t.dtype() == T::DTYPE {
+        t
+    } else {
+        t.cast(T::DTYPE)?
+    };
+    crate::Tensor::<R, T>::try_from_dyn(t)
+        .map_err(|e| Error::Shape(format!("{what}: {e}")))
+}
 
 /// One GGUF tensor as a dense `F32` value in `graph`.
 ///
 /// `fusor2_gguf` reverses a tensor's extents at read, so `raw.shape` is
-/// already row-major: a `[out, in]` weight is `[out, in]` here, and
-/// `shape()[0]` is `out_features`.
+/// already row-major: a `[out, in]` weight is `[out, in]` here, matching the
+/// reference's `weight.shape()[0] == out_features`.
 ///
 /// A block-quantized entry becomes a `Leaf(Quantized)` plus one `L0::Dequant`
 /// — the decode is a device-side block program, never a host loop. `F16` and
-/// `BF16` entries are cast to `F32`.
+/// `BF16` entries are cast, which is what the reference's `dequantize()` does
+/// for every parameter it hands a layer.
 pub(crate) fn load_dense(vb: &VarBuilder, graph: &GraphRef, name: &str) -> Result<Tensor> {
     let raw = vb.get_raw(name)?;
     let shape: Vec<Dim> = raw.shape.iter().map(|d| Dim::Const(*d)).collect();
@@ -93,6 +117,17 @@ pub(crate) fn load_dense(vb: &VarBuilder, graph: &GraphRef, name: &str) -> Resul
     )
 }
 
+/// A const-rank leaf, for the layer tests. `T::DTYPE` is the leaf's dtype, so
+/// a `Tensor<2, f16>` leaf is an f16 one.
+#[cfg(test)]
+pub(crate) fn test_leaf<const R: usize, T: Element>(
+    g: &crate::graph::Graph,
+    shape: &[u64],
+) -> crate::Tensor<R, T> {
+    let dims: Vec<Dim> = shape.iter().map(|d| Dim::Const(*d)).collect();
+    crate::Tensor::from_dyn(g.leaf("t", &dims, T::DTYPE).expect("leaf"))
+}
+
 /// [`load_dense`], or `None` when the key is absent. A missing key is the
 /// only thing swallowed: a present-but-unreadable entry still errors.
 pub(crate) fn load_optional(
@@ -108,8 +143,9 @@ pub(crate) fn load_optional(
 
 /// A normalization weight or bias as a rank-1 value.
 ///
-/// GGUF writers disagree about whether a norm vector is `[n]` or `[1, n]`, so
-/// a degenerate axis is squeezed rather than refused.
+/// GGUF writers disagree about whether a norm vector is `[n]` or `[1, n]`;
+/// the reference squeezes the degenerate axis rather than refusing, so this
+/// does too.
 pub(crate) fn as_vector(t: Tensor, name: &str) -> Result<Tensor> {
     match t.shape().as_slice() {
         [_] => Ok(t),
@@ -130,10 +166,10 @@ mod tests {
     use fusor2_ir::shape::Dim;
 
     use crate::graph::Graph;
-    use crate::session::{Device, Session};
+    use crate::session::{Backend, Session};
 
     fn graph() -> Graph {
-        Graph::new(&Session::new(Device::cpu().expect("cpu device")).expect("session"))
+        Graph::new(&Session::new(Backend::cpu().expect("cpu device")).expect("session"))
     }
 
     /// A synthetic GGUF file. `parse::fixture` is `#[cfg(test)]`-gated inside

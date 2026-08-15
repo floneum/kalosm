@@ -1,5 +1,5 @@
-//! End-to-end pins for lowering behaviour whose failure mode is a plausible
-//! wrong number rather than an error.
+//! End-to-end pins for four lowering defects, each of which returned a
+//! plausible wrong number rather than an error.
 //!
 //! Every expectation here is hand-computed, and every one runs the real
 //! resolve path on the CPU backend. The conformance suite covers these too;
@@ -11,8 +11,8 @@
 // pins drive the runtime-rank lowering path, which both configurations build;
 // naming it directly is what makes this target compile under either feature
 // set. `Graph` and `Session` are the same type in both, so the root is fine.
-use fusor2::session::Device;
-use fusor2::tensor::Tensor;
+use fusor2::session::Backend as Device;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Graph, Session};
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::shape::{Dim, StrideSpec};
@@ -50,9 +50,9 @@ fn close(got: &[f32], want: &[f32]) {
 
 /// A gather whose index vector is not as long as the axis it indexes.
 ///
-/// The source's outer coordinate has to step by the *source's* stride, not the
-/// output's: scaling by the output's makes row 1 of a `[3,2]` table gathered to
-/// `[3,4]` read row 2 and row 2 read off the end. That is the rope table
+/// The source's outer coordinate has to step by the *source's* stride. Both
+/// backends scaled it by the *output's*, so row 1 of a `[3,2]` table gathered
+/// to `[3,4]` read row 2 and row 2 read off the end. That is the rope table
 /// expansion, and equally `index_select`, upsample and embedding.
 #[test]
 fn a_gather_on_an_inner_axis_uses_the_sources_stride() {
@@ -81,10 +81,10 @@ fn a_gather_on_the_outer_axis_may_repeat_rows() {
 /// A view's base offset must survive being folded into its reader's index map.
 ///
 /// `MultiFlattenMap` is a sum of stride terms with no constant slot, so
-/// `Operand::address_map` takes the offset from the operand's layout, so
-/// `fold_views_into_index` must keep it: a contiguous replacement says offset
-/// 0, which turns a `table[2..]` narrow into the whole table. That is `rope`'s
-/// sequence offset.
+/// `Operand::address_map` takes the offset from the operand's layout.
+/// `fold_views_into_index` replaced that layout with a contiguous one, which
+/// says offset 0 — a `table[2..]` narrow silently became the whole table.
+/// That is `rope`'s sequence offset.
 #[test]
 fn a_narrowed_view_keeps_its_offset_through_a_consumer() {
     let s = session();
@@ -120,9 +120,9 @@ fn a_narrowed_view_keeps_its_offset_through_a_consumer() {
 /// An operand broadcast against its reader's index space may not be folded.
 ///
 /// The folded map's extents are what the divisors are derived from, so a
-/// `[rows, 1]` view read over a `[rows, cols]` space would address
-/// `flat % rows` where `flat / cols` belongs, giving `x * rowsum(x)` the wrong
-/// row's sum in every column but the first.
+/// `[rows, 1]` view read over a `[rows, cols]` space addressed
+/// `flat % rows` where `flat / cols` belonged. `x * rowsum(x)` came back with
+/// the wrong row's sum in every column but the first.
 #[test]
 fn a_broadcast_operand_reads_one_value_per_row() {
     let s = session();
@@ -145,9 +145,9 @@ fn a_broadcast_operand_reads_one_value_per_row() {
 
 /// `sum(softmax(x))` is exactly the row count, in one resolve.
 ///
-/// The broadcast row sum from the case above, seen from the loss side: misread
-/// it and the softmax rows do not sum to one, and every finite difference taken
-/// through them is wrong.
+/// This is the same defect seen from the loss side: with the broadcast row
+/// sum misread, the softmax rows did not sum to one and every finite
+/// difference taken through them was wrong.
 #[test]
 fn softmax_rows_sum_to_one_without_materializing_anything() {
     let s = session();
@@ -162,9 +162,9 @@ fn softmax_rows_sum_to_one_without_materializing_anything() {
 /// A contraction reads each operand through the spec's labels.
 ///
 /// `KContract` records only the products m, n, k and batch, so it cannot tell
-/// a transposed rhs from a plain one; aliasing each operand's own dense layout
-/// would say "space axis i is operand axis i" and read a `[m, k]` activation as
-/// `[k, m]` under `d_rhs`.
+/// a transposed rhs from a plain one; the generic floor aliased each operand's
+/// own dense layout, which says "space axis i is operand axis i". Both read a
+/// `[m, k]` activation as `[k, m]` under `d_rhs`.
 #[test]
 fn a_transposed_contraction_reads_the_right_operand_axes() {
     let s = session();
@@ -215,8 +215,9 @@ fn the_matmul_rhs_adjoint_sums_the_right_axis() {
     close(&db, &want_b);
 }
 
-/// `relu` is flat at the kink: the `max_elementwise` adjoint compares strictly
-/// greater, so a tie sends the gradient nowhere.
+/// `relu` is flat at the kink. The reference differentiates
+/// `max_elementwise(rhs)` to `grad * input.mt(rhs)` — strictly greater — so a
+/// tie sends the gradient nowhere.
 #[test]
 fn relu_has_no_gradient_at_zero() {
     let s = session();
@@ -235,7 +236,7 @@ fn relu_has_no_gradient_at_zero() {
     close(&grad, &[0.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
 }
 
-/// A backward pass may not cross graphs: it is refused rather than indexing one
+/// A backward pass may not cross graphs. It used to panic indexing one
 /// e-graph's arena with the other's `Id`.
 #[test]
 fn a_loss_from_another_graph_is_refused_not_panicked() {

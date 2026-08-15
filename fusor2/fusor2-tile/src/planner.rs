@@ -8,6 +8,8 @@
 //! provably the same number. There is no estimator, therefore no L1/L2
 //! admission mismatch and no "extraction commits a plan that fails L2
 //! verification and silently falls back".
+//!
+//! Owned by W3.
 
 use std::sync::{Arc, OnceLock};
 
@@ -51,27 +53,22 @@ pub struct Planner {
     tiles_memo: RwLock<FxHashMap<TilesKey, u32>>,
 }
 
-static GLOBAL: OnceLock<Arc<Planner>> = OnceLock::new();
+static GLOBAL: OnceLock<Planner> = OnceLock::new();
 
 impl Planner {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The handle `CoreSemantics::new` wants: the process-wide planner, so
-    /// every holder shares one memo instead of re-deriving every plan.
+    /// The handle `CoreSemantics::new` wants.
     pub fn shared() -> Arc<dyn ArenaPlanner> {
-        Self::global_arc().clone()
+        Arc::new(Self::new())
     }
 
     /// The process-wide planner, so `verify_l2` and the emitters share one
     /// memo instead of re-deriving every plan.
     pub fn global() -> &'static Self {
-        Self::global_arc()
-    }
-
-    fn global_arc() -> &'static Arc<Planner> {
-        GLOBAL.get_or_init(|| Arc::new(Self::new()))
+        GLOBAL.get_or_init(Self::new)
     }
 
     pub fn memo_len(&self) -> usize {
@@ -115,11 +112,12 @@ fn plan_key(ir: &KernelIr, live: &LivenessInfo, caps: &Caps) -> PlanKey {
     // statement list, not only on the skeleton above.
     //
     // Structurally, **not** via `Stmt`'s derived `Hash`: `StorageView::hash`
-    // hashes the buffer's address and `LocalDecl`/`TileDecl` hash their `id`,
-    // so two separately-built copies of the same kernel would never agree and
-    // every kernel holding a buffer or a local would miss the memo.
-    // `BodyHasher` substitutes each declaration's first-use ordinal for its
-    // address and is otherwise exact.
+    // hashes the buffer's address, `LocalDecl` and `TileDecl` hash their `id`,
+    // so the derived hash of two separately-built copies of the same kernel
+    // never agreed. That made this memo a total miss for every kernel holding
+    // a buffer or a local — i.e. all of them — and left only the tile-only
+    // test fixture hitting. `BodyHasher` substitutes each declaration's
+    // first-use ordinal for its address and is otherwise exact.
     BodyHasher::default().body(&ir.body, &mut h);
     PlanKey {
         body_hash: h.finish(),
@@ -130,15 +128,63 @@ fn plan_key(ir: &KernelIr, live: &LivenessInfo, caps: &Caps) -> PlanKey {
 /// Hashes an L2 body up to renaming of its buffer, tile and local
 /// declarations.
 ///
-/// Every other field is folded in verbatim, so the key stays exact — two
-/// bodies differing in an operator, a literal or a layout hash apart. Only
-/// *which allocation* a leaf names is
+/// Every other field is folded in verbatim, so the key stays as exact as the
+/// derived `Hash` was — two bodies differing in an operator, a literal or a
+/// layout still hash apart. Only *which allocation* a leaf names is
 /// canonicalized, and that is precisely what `rebind` puts back on retrieval.
+/// A pointer-free identity for a whole kernel: name, block, arena token,
+/// declared buffers (by binding and contents) and the body up to renaming of
+/// its buffer, tile and local declarations.
+///
+/// This exists because `TileExpr`'s cached digest — and therefore any hash
+/// derived from `Stmt` — folds in `Arc` addresses: two byte-identical
+/// lowerings never agree, and worse, a *recycled* allocation can make two
+/// different kernels agree. A pipeline cache keyed on the derived hash
+/// served the wrong compiled kernel depending on allocator behaviour —
+/// observed as nondeterministic wrong values across whole conformance runs.
+pub fn kernel_identity(ir: &KernelIr) -> u128 {
+    let mut lanes = [0u64; 2];
+    for (seed, lane) in lanes.iter_mut().enumerate() {
+        let mut h = FxHasher::default();
+        h.write_u64(seed as u64);
+        ir.name.hash(&mut h);
+        ir.block.hash(&mut h);
+        ir.byte_arena.hash(&mut h);
+        let mut bh = BodyHasher {
+            seed: seed as u64,
+            ..Default::default()
+        };
+        (ir.buffers.len() as u64).hash(&mut h);
+        for b in &ir.buffers {
+            b.binding.hash(&mut h);
+            bh.buffer(b, &mut h);
+        }
+        bh.body(&ir.body, &mut h);
+        *lane = h.finish();
+    }
+    (u128::from(lanes[0]) << 64) | u128::from(lanes[1])
+}
+
 #[derive(Default)]
 struct BodyHasher {
     buffers: FxHashMap<usize, u32>,
     tiles: FxHashMap<usize, u32>,
     locals: FxHashMap<usize, u32>,
+    /// Per-node sub-hash, keyed by [`TileExpr::node_ptr`]. A body is a DAG,
+    /// so expanding it as a tree is exponential in the sharing depth; the
+    /// memo makes the identity a Merkle fold, one hash per distinct node.
+    ///
+    /// Exact, not an approximation: a node's sub-hash is a function of its
+    /// subtree and of the leaf ordinals it names, and an ordinal is
+    /// `or_insert` — assigned on the first visit and stable afterwards — so
+    /// recomputing at the second occurrence would reproduce the memoized
+    /// value byte for byte. Multiplicity survives, because the parent still
+    /// folds the sub-hash in once per edge.
+    memo: FxHashMap<usize, u64>,
+    /// Lane seed, mixed into every sub-hash so the two lanes of
+    /// [`kernel_identity`] stay independent 64-bit hashes rather than
+    /// agreeing on every shared subtree.
+    seed: u64,
 }
 
 fn ptr_of<T>(v: &Arc<T>) -> usize {
@@ -224,7 +270,22 @@ impl BodyHasher {
 
     /// The per-node payload: everything that is neither a child expression
     /// (walked by `for_each_child`) nor an identity already folded in above.
+    /// Fold `e`'s identity into `h`, computing it once per distinct node.
     fn expr(&mut self, e: &TileExpr, h: &mut FxHasher) {
+        let ptr = e.node_ptr();
+        if let Some(cached) = self.memo.get(&ptr) {
+            cached.hash(h);
+            return;
+        }
+        let mut sub = FxHasher::default();
+        sub.write_u64(self.seed);
+        self.expr_uncached(e, &mut sub);
+        let value = sub.finish();
+        self.memo.insert(ptr, value);
+        value.hash(h);
+    }
+
+    fn expr_uncached(&mut self, e: &TileExpr, h: &mut FxHasher) {
         let kind = e.kind();
         std::mem::discriminant(kind).hash(h);
         e.element().hash(h);
@@ -775,9 +836,14 @@ mod tests {
         assert_eq!(planner.memo_len(), 1);
 
         // The *layout* is identical — that is what "deterministic" claims.
-        // Whole plans are not compared: tiles are identity-bearing, so two
-        // allocations of the same shape are two tiles and the two plans name
-        // different ones, as the `ptr_eq` check below demands.
+        //
+        // This used to be `assert_eq!(plan_a, plan_b)`, which held only
+        // because `TileDecl` compared structurally. It is identity-bearing
+        // now, so two allocations of the same shape are two tiles and the two
+        // plans deliberately name different ones — as the `ptr_eq` check
+        // below has always demanded. Comparing whole plans asserted the
+        // opposite of that check and could only pass while tiles had no
+        // identity.
         assert_eq!(plan_a.mode, plan_b.mode);
         assert_eq!(plan_a.total_bytes, plan_b.total_bytes);
         assert_eq!(plan_a.barriers_inserted, plan_b.barriers_inserted);
@@ -801,10 +867,11 @@ mod tests {
     /// A kernel holding a storage buffer and a private local memoizes across
     /// two independent builds.
     ///
-    /// `StorageView` hashes its buffer's *address* and `LocalDecl` hashes its
-    /// `id`, so `Stmt`'s derived `Hash` would give two copies of one kernel two
-    /// different keys; `BodyHasher`'s ordinal substitution is what makes them
-    /// share.
+    /// This is the case the memo never served: `StorageView` hashes its
+    /// buffer's *address* and `LocalDecl` hashes its `id`, so `Stmt`'s derived
+    /// `Hash` gave two copies of one kernel two different keys. Every real
+    /// kernel holds a buffer, so the hit rate was zero and only the tile-only
+    /// fixture above ever exercised a hit.
     #[test]
     fn two_builds_of_one_kernel_with_a_buffer_and_a_local_share_a_plan() {
         fn build(b: &mut TileBuilder) -> KernelIr {

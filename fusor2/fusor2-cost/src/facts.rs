@@ -1,7 +1,15 @@
 //! The shipped per-class seed tables, used before (or instead of)
-//! calibration. Measured anchors seed the GPU class and a cache-derived table
-//! seeds the CPU class. The seed is chosen by `Caps::kind`, never by the
-//! adapter name, and calibration replaces it with on-device measurement.
+//! calibration.
+//!
+//! These exist only as a starting point: `score_fs`'s measured anchors ship
+//! as the seed for the GPU class and a cache-derived table seeds the CPU
+//! class. The reference's five integers fitted on one M2 Max and selected by
+//! `backend == Metal && name.starts_with("Apple")` are the portability
+//! liability this crate closes — **the seed is chosen by `Caps::kind`, never
+//! by the adapter name**, and calibration replaces it with measurement on the
+//! device that will actually run.
+//!
+//! Owned by W6.
 
 use fusor2_ir::cost::{DeviceFacts, RateDtype};
 use fusor2_ir::device::{Caps, DeviceKind};
@@ -10,14 +18,15 @@ use fusor2_ir::device::{Caps, DeviceKind};
 ///
 /// A GPU's half-precision FMA issues at twice the f32 rate, its integer
 /// multiply at half, its cooperative unit at twice its scalar unit, and its
-/// dp4a unit exists only for the two integer slots.
+/// dp4a unit exists only for the two integer slots. One helper builds all
+/// three rows so a seed cannot disagree with itself about a ratio.
 const fn gpu_mac_table(fma_f32: u64, dp4a: u64) -> [[u64; RateDtype::COUNT]; 3] {
     let half = fma_f32 * 2;
     let int = fma_f32 / 2;
     // F32, F16, BF16, U32, I32
     let fma = [fma_f32, half, half, int, int];
     let coop = [fma[0] * 2, fma[1] * 2, fma[2] * 2, fma[3] * 2, fma[4] * 2];
-    // `1` rather than `0` prices a dp4a lowering of a float dtype out of
+    // `1` rather than `0`: it prices a dp4a lowering of a float dtype out of
     // contention without relying on `mac_rate`'s clamp.
     let dp = [1, 1, 1, dp4a, dp4a];
     [fma, coop, dp]
@@ -34,8 +43,14 @@ const fn cpu_mac_table(fma_f32: u64) -> [[u64; RateDtype::COUNT]; 3] {
     [fma, fma, dp]
 }
 
-/// The GPU seed, converted from measured Apple-class matmul anchors. It is the
-/// only calibrated rate vector, so it seeds every GPU until calibration
+/// The GPU seed, converted from the reference's `APPLE_MATMUL_RATES`
+/// (`mac_per_ns: 4450`, `dram_decibytes_per_ns: 3795`,
+/// `workgroup_bytes_per_ns: 700`, `store_fs_per_element: 4000`,
+/// `single_buffered_traffic_pct: 105`) and `occupancy.rs`
+/// (`saturation_lanes = 64 << 10`, `last_level_cache_bytes = 8 MiB`).
+///
+/// This is the only calibrated rate vector that exists, so it seeds *every*
+/// GPU: an unmeasured device gets an honest starting point and calibration
 /// overwrites it.
 ///
 /// Not a `const fn`: [`DeviceFacts`] owns a [`Caps`], which owns a `String`.
@@ -56,13 +71,17 @@ pub fn seed_facts_gpu(caps: &Caps) -> DeviceFacts {
     }
 }
 
-/// The CPU seed. Rates are per-core figures multiplied by `Caps::threads`.
+/// The CPU seed. Rates are per-core figures multiplied by `Caps::threads`,
+/// so a 4-core laptop and a 64-core server get different facts without
+/// either being named.
 ///
-/// `launch_ps` is zero because a CPU kernel is a function call; the pool-wake
-/// cost lives in `thread_wake_ps`. `wg_bytes_per_us` is L1 bandwidth, which is
-/// what a workgroup tile maps onto (thread-local 64-byte-aligned scratch).
-/// `store_ps_per_element` has no CPU measurement and takes the GPU value until
-/// `bench_epilogue_occupancy` overwrites it.
+/// `launch_ps` is zero — a CPU kernel is a function call, and the pool-wake
+/// cost that *does* exist lives in `thread_wake_ps`, where the
+/// parallel-region decision can read it instead of a hardcoded
+/// `PARALLEL_THRESHOLD`. `wg_bytes_per_us` is L1 bandwidth, which is what a
+/// workgroup tile maps onto (thread-local 64-byte-aligned scratch).
+/// `store_ps_per_element` has no per-class CPU measurement; the GPU-class
+/// value seeds it and `bench_epilogue_occupancy` overwrites it.
 pub fn seed_facts_cpu(caps: &Caps) -> DeviceFacts {
     let threads = u64::from(caps.threads.max(1));
     DeviceFacts {
@@ -81,8 +100,11 @@ pub fn seed_facts_cpu(caps: &Caps) -> DeviceFacts {
     }
 }
 
-/// The per-class seed, dispatched on `Caps::kind` and nothing else. A wrong
-/// seed is fixed by calibration, not by matching on `Caps::name`.
+/// The per-class seed, dispatched on `Caps::kind` and nothing else.
+///
+/// **Never on `Caps::name`.** Selecting a rate vector from an adapter string
+/// is the reference's single largest portability liability; the answer to a
+/// wrong seed is calibration, not a longer string table.
 pub fn seed_facts(caps: &Caps) -> DeviceFacts {
     match caps.kind {
         DeviceKind::Gpu => seed_facts_gpu(caps),
@@ -98,7 +120,8 @@ pub(crate) mod tests {
     use fusor2_ir::dtype::Dtype;
 
     /// Apple-class GPU caps: 32-wide fixed subgroups, 1024-lane workgroups,
-    /// 32 KiB of threadgroup memory.
+    /// 32 KiB of threadgroup memory. The residency term in `drain_ps` is
+    /// calibrated against that last number.
     pub(crate) fn gpu_caps(name: &str) -> Caps {
         Caps {
             kind: DeviceKind::Gpu,
@@ -142,8 +165,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// The seed is a function of `kind` alone: a `Caps` whose name says
-    /// "Apple M2 Max" but whose kind says CPU gets the CPU table.
+    /// Test 11. The seed is a function of `kind`, and on the GPU side of
+    /// `kind` alone. A `Caps` whose name says "Apple M2 Max" but whose kind
+    /// says CPU gets the CPU table.
     #[test]
     fn seed_selected_by_kind_not_name() {
         let mislabelled = cpu_caps("Apple M2 Max", 8);
@@ -172,9 +196,10 @@ pub(crate) mod tests {
         assert_eq!(apple.thread_wake_ps, other.thread_wake_ps);
     }
 
-    /// `DeviceFacts::fingerprint` hashes `Caps`, which carries
-    /// `Limits::max_compute_workgroup_storage_size`, the field the coop
-    /// legality filter reads.
+    /// Test 10. `DeviceFacts::fingerprint` hashes `Caps`, which carries
+    /// `Limits::max_compute_workgroup_storage_size` — the field the
+    /// reference omits from its disk-cache salt while the coop legality
+    /// filter reads it.
     #[test]
     fn fingerprint_includes_workgroup_storage() {
         let mut a = gpu_caps("dev");
@@ -190,7 +215,8 @@ pub(crate) mod tests {
         assert_ne!(a.fingerprint(), b.fingerprint());
     }
 
-    /// The published anchors, spelled out so a typo in the table fails here.
+    /// The published anchors, spelled out so a typo in the table is a test
+    /// failure rather than a silent 2x on every matmul decision.
     #[test]
     fn gpu_seed_matches_the_published_anchors() {
         let f = seed_facts(&gpu_caps("dev"));
@@ -211,8 +237,8 @@ pub(crate) mod tests {
         assert_eq!(f.thread_wake_ps, 5_000_000);
     }
 
-    /// Every field has a positive seed; a zero rate would price a whole term
-    /// at nothing.
+    /// Every field has a seed. A zero rate would divide by one and silently
+    /// price a whole term at nothing.
     #[test]
     fn every_rate_is_positive_on_both_classes() {
         for f in [seed_facts(&gpu_caps("g")), seed_facts(&cpu_caps("c", 10))] {

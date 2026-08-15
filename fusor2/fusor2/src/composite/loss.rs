@@ -3,8 +3,13 @@
 //! form, so nobody hand-writes a fused gradient.
 //!
 //! Nothing here is a kernel and nothing here declares an adjoint. Every loss
-//! is a composition of ops that already carry their own backward; the rewrite
-//! recovers `w * sigmoid(x) - z` from the taped softplus chain.
+//! is a composition of ops that already carry their own backward, which is
+//! why the trainer's hand-written `distillation_loss` backward — a
+//! `with_backwards` closure spelling `w * sigmoid(x) - z` — has no counterpart
+//! in this file. The rewrite recovers exactly that expression from the taped
+//! softplus chain.
+//!
+//! Owned by W13.
 
 use crate::tensor::Tensor;
 use crate::{Error, Result};
@@ -89,7 +94,9 @@ pub fn binary_cross_entropy_with_logits(logits: &Tensor, targets: &Tensor) -> Re
 /// ```
 ///
 /// The bracket is host data — [`BceTargets::fold`] — and the multiplier on
-/// the shared `softplus` term is [`BceTargets::softplus_weight`].
+/// the shared `softplus` term is [`BceTargets::softplus_weight`]. This is
+/// `trainer/src/batch.rs::fold_targets` and `trainer/src/main.rs`, moved onto
+/// this side of the API unchanged.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct BceTargets {
     /// Weight of the hard (argmax) term against the teacher's distribution.
@@ -103,7 +110,8 @@ pub struct BceTargets {
 }
 
 impl Default for BceTargets {
-    /// No hard term, no parent term, and 0.05 label smoothing.
+    /// The trainer's defaults: no hard term, no parent term, and the 0.05
+    /// smoothing `main.rs` configures.
     fn default() -> Self {
         Self {
             hard_loss_weight: 0.0,
@@ -123,8 +131,9 @@ impl BceTargets {
     /// One row of folded targets. `teacher` and `parent` are per-class
     /// probabilities; `label` indexes the hard target.
     ///
-    /// The hard term is unconditionally scaled by the teacher's total in-head
-    /// mass.
+    /// The hard term is scaled by the teacher's total in-head mass, which is
+    /// the trainer's `--mass-discounted-hard-labels` behaviour and is
+    /// unconditional there.
     pub fn fold(
         &self,
         teacher: &[f32],
@@ -169,7 +178,7 @@ impl BceTargets {
 /// `w` is [`BceTargets::softplus_weight`] and `z` is a row of
 /// [`BceTargets::fold`]. `rows` is the batch size the mean is taken over; it
 /// is a parameter rather than `logits.dim(0)` so a padded batch still divides
-/// by the live row count.
+/// by the live row count, which is what the trainer does.
 pub fn folded_bce_loss(
     logits: &Tensor,
     targets: &Tensor,
@@ -190,7 +199,7 @@ pub fn folded_bce_loss(
 
 /// Teacher/student distillation: the plain softplus chain.
 ///
-/// One-vs-all rather than softmax-KL: the teacher's
+/// One-vs-all rather than softmax-KL, matching the trainer: the teacher's
 /// per-class probability at `temperature` is `sigmoid(teacher / T)`, and the
 /// student pays [`folded_bce_loss`] against it at the same temperature. The
 /// `T^2` factor restores the gradient scale the division removed, so the
@@ -242,11 +251,11 @@ pub fn mse(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 mod tests {
     use super::*;
     use crate::graph::Graph;
-    use crate::session::{Device, Session};
+    use crate::session::{Backend, Session};
     use crate::{Dim, Dtype};
 
     fn graph() -> Graph {
-        Graph::new(&Session::new(Device::cpu().expect("cpu device")).expect("session"))
+        Graph::new(&Session::new(Backend::cpu().expect("cpu device")).expect("session"))
     }
 
     fn dims(shape: &[u64]) -> Vec<Dim> {
@@ -337,6 +346,8 @@ mod tests {
         1.0 / (1.0 + (-z).exp())
     }
 
+    // -- softmax cross entropy ------------------------------------------------
+
     #[test]
     fn cross_entropy_reduces_the_axis_it_is_given() {
         let g = graph();
@@ -367,6 +378,8 @@ mod tests {
         close(-weighted, lse - row[2], 1e-6);
         close(lse - row[2], 0.232622, 1e-5);
     }
+
+    // -- binary cross entropy -------------------------------------------------
 
     #[test]
     fn bce_is_the_stable_softplus_form() {
@@ -408,6 +421,8 @@ mod tests {
         });
         assert_matches(&analytic, &numeric);
     }
+
+    // -- the folded target ----------------------------------------------------
 
     #[test]
     fn the_folded_target_is_the_trainers_bracket() {
@@ -479,6 +494,8 @@ mod tests {
         assert!(config.fold(&[0.5, 0.5, 0.0], None, 0, &mut short).is_err());
     }
 
+    // -- the folded loss ------------------------------------------------------
+
     #[test]
     fn the_folded_loss_is_the_row_mean_of_the_class_sum() {
         let g = graph();
@@ -496,7 +513,8 @@ mod tests {
         close(read(&loss)[0], want, 1e-4);
     }
 
-    /// The taped chain must produce `w*sigmoid(x) - z` over rows.
+    /// The trainer writes this backward by hand as `w*sigmoid(x) - z` over
+    /// rows. The taped chain has to produce the same numbers.
     ///
     /// Checked on the summand, with the row mean tied to it by the forward
     /// assertion below: the mean is the last thing the loss does, so its
@@ -541,6 +559,8 @@ mod tests {
         let l = upload(&g, &[6], &LOGITS);
         assert!(folded_bce_loss(&l, &l, 1.0, 0).is_err());
     }
+
+    // -- distillation ---------------------------------------------------------
 
     #[test]
     fn distillation_is_the_temperature_scaled_folded_bce() {
@@ -614,6 +634,8 @@ mod tests {
         assert!(warm < cold, "{warm} is not softer than {cold}");
     }
 
+    // -- mean squared error ---------------------------------------------------
+
     #[test]
     fn mse_is_the_mean_square_of_the_difference() {
         let g = graph();
@@ -658,6 +680,8 @@ mod tests {
         let loss = mse(&a, &upload(&g, &[6], &OTHER)).unwrap();
         close(read(&loss)[0], sum / 6.0, 1e-4);
     }
+
+    // -- refusals -------------------------------------------------------------
 
     #[test]
     fn a_loss_refuses_mismatched_shapes() {

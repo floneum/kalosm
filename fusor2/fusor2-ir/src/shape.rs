@@ -5,9 +5,9 @@ use crate::error::{Error, Result};
 use smallvec::SmallVec;
 use std::fmt;
 
-/// A symbolic quantity bound at dispatch, not at compile. Sequence lengths,
-/// batch sizes and tile counts are `SymId`s; they hash as symbols, so one
-/// extracted plan serves a whole shape family.
+/// A symbolic quantity bound at dispatch, never at compile. Sequence
+/// lengths, batch sizes and tile counts are `SymId`s; they hash as symbols,
+/// so one extracted plan serves a whole shape family.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SymId(pub u32);
 
@@ -33,7 +33,7 @@ impl Dim {
     }
 
     /// Decidably at least `n`. Symbolic dims answer `false`, so guards stay
-    /// conservative under symbolic shapes.
+    /// conservative under symbolic shapes by construction.
     pub const fn at_least(self, n: u64) -> bool {
         match self {
             Self::Const(v) => v >= n,
@@ -79,10 +79,11 @@ impl fmt::Display for Dim {
     }
 }
 
-/// A shape: inline up to rank 6, heap past that. No rank ceiling.
+/// A shape: inline up to rank 6, heap past that. No rank ceiling and no
+/// const-generic rank.
 pub type Dims = SmallVec<[Dim; 6]>;
 
-/// A per-axis view spec, composed relative to the current strides.
+/// A per-axis view spec, composed **relative to the current strides**.
 /// `out_stride[i] = if multiplier == 0 { 0 } else { in_stride[input_dim] *
 /// multiplier }`, `out_shape[i] = size`, offset gains
 /// `offset * in_stride[input_dim]`. Every reshape, transpose, permute,
@@ -136,9 +137,9 @@ impl StrideSpec {
     }
 }
 
-/// One windowed axis of an `L0::Window`. Separate from [`StrideSpec`] because
-/// the adjoint needs `window` and `step` as integers: under `Dim::Sym`,
-/// injectivity of a relative stride composition is undecidable.
+/// One windowed axis of an `L0::Window`. Kept separate from [`StrideSpec`]
+/// because the adjoint needs `window` and `step` as *integers*: under
+/// `Dim::Sym`, injectivity of a relative stride composition is undecidable.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SlidingWindow {
     pub axis: u32,
@@ -151,8 +152,8 @@ impl SlidingWindow {
         Self { axis, window, step }
     }
 
-    /// Non-overlapping, which makes the adjoint an elementwise
-    /// mask-and-broadcast rather than a scatter.
+    /// Non-overlapping. The verifier turns this into "the adjoint is an
+    /// elementwise mask-and-broadcast, not a scatter".
     pub const fn is_non_overlapping(self) -> bool {
         self.step >= self.window
     }
@@ -179,7 +180,7 @@ impl Layout {
         }
     }
 
-    /// Explicit layout. Contiguity is derived, not asserted by the caller.
+    /// Explicit layout. Contiguity is derived, never asserted by the caller.
     pub fn from_parts(offset: Dim, shape: &[Dim], strides: &[Dim]) -> Result<Self> {
         if shape.len() != strides.len() {
             return Err(Error::Shape(format!(
@@ -284,8 +285,8 @@ impl MultiFlattenMap {
         self.groups.iter().all(|g| g.sub_axes.len() == 1)
     }
 
-    /// Contiguous unit-stride run length as this axis's coordinate increments,
-    /// the coalescing metric for picking the lane axis.
+    /// Contiguous unit-stride run length as this axis's coordinate
+    /// increments — the coalescing metric for picking the lane axis.
     pub fn axis_unit_run(&self, axis: usize) -> u32 {
         let mut run = 1u32;
         for sub in self.groups[axis].sub_axes.iter().rev() {
@@ -297,8 +298,8 @@ impl MultiFlattenMap {
         run
     }
 
-    /// Divmods a load through this map costs, the term the view-fold-vs-gather
-    /// tradeoff prices.
+    /// Divmods a load through this map costs — the term the
+    /// view-fold-vs-gather tradeoff prices.
     pub fn divmod_ops(&self) -> u64 {
         self.groups
             .iter()
@@ -330,13 +331,18 @@ pub fn singleton_spec(in_rank: usize, next_src: usize) -> StrideSpec {
     }
 }
 
+// ---------------------------------------------------------------------------
+// reshape spec derivation
+// ---------------------------------------------------------------------------
+
 /// Derive the spec vector for a reshape from `in_shape` to `out_shape`.
 ///
-/// The two shapes are walked in lockstep and split into minimal groups of equal
-/// product. A one-to-one group is a plain `dim` spec, so a symbolic extent that
-/// passes through unchanged costs nothing. A merge or split group names the
-/// group's innermost input axis and multiplies its stride by the output axis's
-/// stride within the group.
+/// The two shapes are walked in lockstep and split into minimal groups of
+/// equal product. A one-to-one group is a plain `dim` spec, so a symbolic
+/// extent that passes through unchanged costs nothing. A many-to-one (merge)
+/// or one-to-many (split) group names the group's innermost input axis and
+/// multiplies its stride by the output axis's stride *within the group* —
+/// exactly `Layout::contiguous(new_shape)` when the group is contiguous.
 pub fn reshape_specs(
     in_shape: &[Dim],
     out_shape: &[Dim],
@@ -416,8 +422,8 @@ fn reshape_symbolic(in_shape: &[Dim], out_shape: &[Dim]) -> Error {
 }
 
 /// The one broadcast rule, applied by the frontend before ingestion.
-/// Right-aligned: a source dim is consumed when it equals the target or is 1
-/// (stride 0); unmatched target dims are inserted with stride 0 at any
+/// Right-aligned: a source dim is consumed when it equals the target or is
+/// 1 (stride 0); unmatched target dims are inserted with stride 0 at **any**
 /// position; an unconsumed source dim is an error. There is no implicit
 /// broadcasting inside the IR.
 pub fn broadcast_specs(src: &[Dim], dst: &[Dim]) -> Result<SmallVec<[StrideSpec; 6]>> {
@@ -477,9 +483,10 @@ pub fn broadcast_shapes(a: &[Dim], b: &[Dim]) -> Result<Dims> {
     Ok(out)
 }
 
-/// Whether a restride's bounds are decidable at compile time. `Const` dims are
-/// checked statically; a `Sym` records a runtime mask obligation on the node,
-/// discharged by codegen.
+/// Whether a restride's bounds are decidable at compile time. `Const` dims
+/// are checked statically; a `Sym` records a runtime mask obligation on the
+/// node, discharged by codegen. There is no third case and no user
+/// `assume` — this preserves the invariant licensing trusted shader modules.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BoundsProof {
     Static,

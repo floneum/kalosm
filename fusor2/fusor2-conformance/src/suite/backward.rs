@@ -2,13 +2,17 @@
 //! produce a gradient for it; comparisons differentiate to zero rather than to
 //! nothing.
 //!
-//! Absent is not zero: the tape validates that every
-//! `Parent { requires_grad: true }` receives a gradient, so a missing adjoint
-//! rule and a zero adjoint are different outcomes.
-//! [`crate::compare::assert_all_zero`] tells them apart; `gradient_of`
-//! erroring out is the other signal.
+//! The distinction that organizes this file: **absent is not zero**. The tape
+//! validates that every `Parent { requires_grad: true }` receives a gradient,
+//! so a comparison whose adjoint rule is missing and a comparison whose
+//! adjoint is the zero tensor are different outcomes, and only the second is
+//! correct. [`crate::compare::assert_all_zero`] is the assertion that tells
+//! them apart; `gradient_of` erroring out is the other one.
+//!
+//! Owned by W14.
 
-use fusor2::{Dtype, Session, Tensor};
+use fusor2::{Dtype, Session, };
+use fusor2::tensor::Dyn as Tensor;
 
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
 use crate::harness::{CaseError, CaseResult, Cases, dims};
@@ -31,7 +35,7 @@ type Build = fn(&Tensor) -> fusor2::Result<Tensor>;
 
 /// Unary chains whose adjoint is checked against central differences. Each is
 /// a composition rather than a bare op, so the case exercises the chain rule
-/// through the tape.
+/// through the tape and not just one rule's table row.
 #[rustfmt::skip]
 fn chains() -> Vec<(&'static str, Build, Domain)> {
     vec![
@@ -77,8 +81,6 @@ fn comparisons() -> Vec<(&'static str, Build)> {
         ("lte_tensor", |x| { let s = x.mul_scalar(2.0f32)?; x.lte_tensor(&s) }),
         ("gt_tensor",  |x| { let s = x.mul_scalar(2.0f32)?; x.gt_tensor(&s) }),
         ("gte_tensor", |x| { let s = x.mul_scalar(2.0f32)?; x.gte_tensor(&s) }),
-        ("mt",         |x| x.mt(0.0f32)),
-        ("mte",        |x| x.mte(0.0f32)),
     ]
 }
 
@@ -152,8 +154,8 @@ pub fn cases() -> Cases {
     cases
 }
 
-/// Checks only the adjoint, against central differences; the `elementwise`
-/// area checks the forward.
+/// Forward stays unchecked here — the `elementwise` area owns that — and the
+/// adjoint is compared against central differences.
 fn chain_case(session: &Session, name: &'static str, build: Build, domain: Domain) -> CaseResult {
     let data = domain.sample(1301, LEN);
     let dimv = dims(SHAPE);
@@ -173,8 +175,9 @@ fn chain_case(session: &Session, name: &'static str, build: Build, domain: Domai
     Ok(())
 }
 
-/// A comparison's gradient must be present and zero. `gradient_of` returning
-/// `Err` means no rule fired at all, which is a failure.
+/// A comparison's gradient must be **present and zero**. `gradient_of`
+/// returning `Err` means no rule fired at all, which the tape treats as an
+/// error and so does this case.
 fn zero_grad_case(session: &Session, name: &'static str, build: Build) -> CaseResult {
     let data = Domain::Wide.sample(1303, LEN);
     let graph = graph_of(session);
@@ -382,8 +385,10 @@ fn broadcast_mul_case(session: &Session) -> CaseResult {
 /// `0.5*(1+t) + 0.5*x*(1-t^2)*c*(1+3*0.044715*x^2)` with
 /// `t = tanh(c*(x + 0.044715 x^3))`, `c = sqrt(2/pi)`.
 ///
-/// Checked against the closed form: central differences at 1e-3 do not
-/// separate the tanh approximation's derivative from the exact gelu's.
+/// Checked against the closed form rather than against finite differences:
+/// the tanh approximation's derivative is what a rule that differentiates the
+/// *exact* gelu would get subtly wrong, and central differences at 1e-3 do
+/// not separate the two.
 fn gelu_analytic(session: &Session) -> CaseResult {
     let data = Domain::Custom(-2.5, 2.5).sample(1427, LEN);
     let graph = graph_of(session);
@@ -391,8 +396,8 @@ fn gelu_analytic(session: &Session) -> CaseResult {
     let y = x
         .gelu()
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    // The forward must be the tanh approximation, not the erf one, to match
-    // the analytic derivative below.
+    // The forward must be the tanh approximation, not the erf one, or the
+    // analytic derivative below is being compared against the wrong function.
     let expected: Vec<f32> = data.iter().copied().map(host_gelu).collect();
     expect_values(session, SHAPE, Dtype::F32, &read(&y)?, &expected)?;
     let grad = gradient_of(&graph, &y, &x)?;
@@ -413,7 +418,9 @@ fn host_gelu_grad(x: f32) -> f32 {
     0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * GELU_C * (1.0 + 3.0 * GELU_A * x * x)
 }
 
-/// `relu` is not differentiable at 0; the convention is subgradient 0.
+/// `relu` is not differentiable at 0. The convention is subgradient 0, and
+/// the case pins it: an implementation that answers 1 there makes a dead unit
+/// come back to life.
 fn relu_kink(session: &Session) -> CaseResult {
     let data: Vec<f32> = vec![
         -1.0, -0.5, 0.0, 0.5, 1.0, -2.0, 2.0, 0.0, 0.25, -0.25, 3.0, -3.0,
@@ -433,8 +440,11 @@ fn relu_kink(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// `fake_quant` is opaque forward and the identity backward. Without the
-/// straight-through rule the round inside differentiates to zero everywhere.
+/// QAT: `fake_quant` is opaque forward and the identity backward, and it
+/// needs zero user code — the backward it registers carries it.
+///
+/// Without it the round inside would differentiate to zero everywhere and no
+/// quantization-aware model would train at all.
 fn straight_through_case(session: &Session) -> CaseResult {
     let data = Domain::Custom(-1.0, 1.0).sample(1429, LEN);
     let graph = graph_of(session);
@@ -487,7 +497,8 @@ fn detach_case(session: &Session) -> CaseResult {
 }
 
 /// A value consumed twice must have its two adjoints accumulated before its
-/// own rule fires. The gradient of `x*x + x` is `2x + 1`; firing on the first
+/// own rule fires — that is what the pending-children counter buys. The
+/// gradient of `x*x + x` is `2x + 1`, and a rule that fires on the first
 /// adjoint alone gives `x + 1`.
 fn diamond_case(session: &Session) -> CaseResult {
     let data = Domain::Wide.sample(1439, LEN);
@@ -546,8 +557,8 @@ fn cross_graph(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// A multi-input expression must hand a gradient to every requires-grad
-/// operand, not just `d_lhs`.
+/// A multi-input expression must hand a gradient to *every* requires-grad
+/// operand. The classic failure is a rule that returns only `d_lhs`.
 fn every_parent(session: &Session) -> CaseResult {
     let a_data = Domain::Wide.sample(1459, LEN);
     let b_data = Domain::Wide.sample(1471, LEN);
@@ -604,7 +615,7 @@ mod tests {
             let case = format!("backward::{wanted}_differentiates_to_zero");
             assert!(names.iter().any(|n| *n == case), "{case} is missing");
         }
-        assert_eq!(comparisons().len(), 14, "the twelve plus mt/mte");
+        assert_eq!(comparisons().len(), 12, "one spelling each");
     }
 
     #[test]
@@ -638,8 +649,8 @@ mod tests {
 
     #[test]
     fn the_gelu_derivative_is_the_derivative_of_the_gelu() {
-        // The analytic form agrees with a finite difference of the same
-        // approximation.
+        // The analytic form must agree with a finite difference of the same
+        // approximation, or the case would be pinning a typo.
         let eps = 1e-3f32;
         for x in [-2.0f32, -0.5, 0.0, 0.5, 1.0, 2.5] {
             let numeric = (host_gelu(x + eps) - host_gelu(x - eps)) / (2.0 * eps);
@@ -663,8 +674,8 @@ mod tests {
 
     #[test]
     fn the_clamp_bounds_actually_bite_on_the_sampled_data() {
-        // With Domain::Wide over [-0.5, 0.5) and bounds at +-0.2, both
-        // branches are populated.
+        // Guards the in-case check: with Domain::Wide over [-0.5, 0.5) and
+        // bounds at +-0.2 both branches must be populated.
         let data = Domain::Wide.sample(1307, LEN);
         assert!(data.iter().any(|v| *v > 0.2 || *v < -0.2));
         assert!(data.iter().any(|v| *v > -0.2 && *v < 0.2));

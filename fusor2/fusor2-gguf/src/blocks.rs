@@ -4,6 +4,8 @@
 //! this module selects a layout, and none mentions a device, a capability or a
 //! kernel — `QLayout` is an operand attribute the extractor prices, not a
 //! property this crate decides.
+//!
+//! Owned by W11.
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::{QFmt, QLayout};
@@ -64,7 +66,8 @@ pub struct BlockSpec {
 }
 
 /// Every `(format, layout)` pair fusor2 can decode, in `QFmt::ALL` order with
-/// `Native` first in each pair. Index arithmetic is `fmt as usize * 2 +
+/// `Native` first in each pair. The twelve formats the reference names but
+/// cannot ingest do not appear. Index arithmetic is `fmt as usize * 2 +
 /// layout as usize`; [`block_spec`] relies on it.
 pub static BLOCK_SPECS: &[BlockSpec] = &[
     row(QFmt::Q4_0, QLayout::Native, decode::DECODE_Q4_0_NATIVE),
@@ -199,14 +202,17 @@ pub const fn qh_width(fmt: QFmt) -> u32 {
     }
 }
 
-/// Whether a block's stride is a whole number of u32 words. Reported, never
-/// acted on here: a device that never runs the alignment-sensitive kernel does
-/// not pay the extra bytes of a widened layout.
+/// Whether a block's stride is a whole number of u32 words. This is the single
+/// fact that used to force Q6K into `F32Scales` globally. It is exposed here
+/// and never acted on: a device that never runs the alignment-sensitive kernel
+/// does not pay the extra bytes.
 pub const fn word_aligned(fmt: QFmt, layout: QLayout) -> bool {
     fmt.block_bytes(layout).is_multiple_of(4)
 }
 
+// ---------------------------------------------------------------------------
 // Scalar reference decoder
+// ---------------------------------------------------------------------------
 
 /// Read the `scale`-shaped field at `offset` out of a raw block.
 fn read_scale(block: &[u8], offset: u32, is_f16: bool) -> f32 {
@@ -221,9 +227,11 @@ fn read_scale(block: &[u8], offset: u32, is_f16: bool) -> f32 {
 /// Unpack the 12 packed-scale bytes of a Q4K/Q5K block into eight 6-bit group
 /// scales and eight 6-bit group offsets.
 ///
-/// A six-bit mask on words 0 and 1 gives groups 0-3; the low nibbles of word 2
-/// supply scale bits 0-3 of groups 4-7 and its high nibbles the offset bits
-/// 0-3, with bits 4-5 coming from the top two bits of words 0 and 1.
+/// Ported from `first_scales_min_k4` / `second_scales_min_k4` in the
+/// reference: a six-bit mask on words 0 and 1 gives groups 0-3; the low
+/// nibbles of word 2 supply scale bits 0-3 of groups 4-7 and its high nibbles
+/// the offset bits 0-3, with bits 4-5 coming from the top two bits of words 0
+/// and 1.
 pub fn unpack_k4_scales_offsets(packed: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
     const SIX_BITS: u32 = 0b0011_1111_0011_1111_0011_1111_0011_1111;
     const MSB_TWO: u32 = 0b1100_0000_1100_0000_1100_0000_1100_0000;

@@ -1,12 +1,24 @@
-//! The L2 verifier.
+//! `verify_l2` — the L2 verifier, retained from the reference and extended.
 //!
-//! Checks that every node's cached `ty` equals what inference derives, that
-//! every `Load` is masked or provably in range, that every `Loop` accumulator
-//! is written only inside its own loop body, that every `CoopStore` has a
-//! supported rank-2 layout, plus uniformity, the arena plan, and `f16`/`bf16`
-//! against `caps`.
+//! Seven clauses, in order:
+//! 1. **Full expression type-check.** Every node's cached `ty` equals what
+//!    inference derives, and every structural constraint inference assumes is
+//!    checked explicitly.
+//! 2. **Every `Load` masked or provably in range.** This discipline is the
+//!    *only* thing licensing `create_shader_module_trusted`.
+//! 3. **Every `Loop` accumulator declared** and written nowhere outside its
+//!    loop body.
+//! 4. **`cooperative_store_layout_supported` on every `CoopStore`**, plus
+//!    `Addr::Rc2`. The caller's documented recovery is the per-lane store
+//!    fallback: the emitters lower `CoopStore` to a masked per-lane `Store`
+//!    loop when the predicate fails, so `verify_l2` only rejects a `CoopStore`
+//!    node that survived to L2 with an unsupported layout.
+//! 5. **Uniformity** — the analysis backing "guaranteed uniform" barriers.
+//! 6. **`verify_arena`** against the planner's `arena_plan`.
+//! 7. **`f16`/`bf16` gated on `caps`**, up front, so an f16 handle on a
+//!    non-f16 adapter fails here rather than mis-lowering.
 //!
-//! Load masking is what licenses `create_shader_module_trusted`.
+//! Owned by W3.
 
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
@@ -30,15 +42,16 @@ fn invalid(msg: impl Into<String>) -> Error {
 pub fn verify_l2(ir: &KernelIr, caps: &Caps) -> Result<()> {
     check_dtype_caps(ir, caps)?;
     check_types(ir)?;
-    check_loads(&ir.body)?;
+    check_loads(ir, caps)?;
     check_accumulators(&ir.body)?;
     check_reduce_stmts(&ir.body)?;
     check_coop_stores(&ir.body)?;
     crate::uniformity::verify_uniformity(ir)?;
     let planner = crate::planner::Planner::global();
     let plan = planner.arena_plan(ir, caps)?;
-    // The plan's barrier insertions are applied before emitting, so the arena
-    // is verified against the body the emitter produces.
+    // The plan may have bought its footprint with barrier insertions, which
+    // the emitter is required to apply before emitting; the arena is verified
+    // against the body the emitter will actually produce.
     if plan.barriers_inserted.is_empty() {
         planner.verify_arena(ir, &plan)
     } else {
@@ -49,6 +62,10 @@ pub fn verify_l2(ir: &KernelIr, caps: &Caps) -> Result<()> {
         )
     }
 }
+
+// ---------------------------------------------------------------------------
+// (7) dtype capability gate
+// ---------------------------------------------------------------------------
 
 fn check_dtype_caps(ir: &KernelIr, caps: &Caps) -> Result<()> {
     let mut bad: Option<ScalarElement> = None;
@@ -124,6 +141,10 @@ fn for_each_element(ir: &KernelIr, f: &mut dyn FnMut(ElementType)) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// (1) type inference and check
+// ---------------------------------------------------------------------------
+
 /// Derive the element type of one node from its children's cached types. The
 /// builder uses this to type a node; `verify_l2` re-derives it and compares.
 pub fn infer_kind(kind: &TileExprKind) -> Result<ElementType> {
@@ -137,18 +158,7 @@ pub fn infer_kind(kind: &TileExprKind) -> Result<ElementType> {
             Source::Quantized(_) => ElementType::Scalar(ScalarElement::F32),
         },
         K::LoadTile { tile, .. } => tile.element,
-        // `Unpack2x16Float` takes a packed u32 and yields two f32 lanes; every
-        // other unary is type-preserving.
-        K::Unary { op, value, .. } => {
-            if *op == fusor2_ir::scalar::UnOp::Unpack2x16Float {
-                ElementType::Vector {
-                    scalar: ScalarElement::F32,
-                    lanes: 2,
-                }
-            } else {
-                value.element()
-            }
-        }
+        K::Unary { value, .. } => value.element(),
         K::Binary { left, right, .. } => {
             if left.element() != right.element() {
                 return Err(invalid(format!(
@@ -453,32 +463,140 @@ fn check_types(ir: &KernelIr) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// (2) load masking
+// ---------------------------------------------------------------------------
+
+/// Bounds available to the range prover: the launch geometry, the device's
+/// subgroup width range, and the loop index locals in scope with their
+/// literal trip-count bounds.
+struct BoundEnv {
+    grid: [u32; 3],
+    block: u32,
+    /// `(min, max)` subgroup width, when the device reports one. `None`
+    /// leaves every subgroup builtin unbounded — a device that cannot say
+    /// how wide its subgroups are cannot prove anything indexed by them.
+    subgroups: Option<(u32, u32)>,
+    locals: FxHashMap<usize, u64>,
+}
+
 /// Every `Load` is masked or provably in range.
-pub fn check_loads(body: &[Stmt]) -> Result<()> {
+///
+/// The proof is contextual: `ProgramId(axis) < grid[axis]`, `Lane < block`
+/// (`Builtin::Lane` lowers to `LocalInvocationIndex`, numbered within the
+/// workgroup), and a `Loop`'s index local is `< count` while walking the
+/// loop's accumulator updates and body. That is what lets an exactly-tiled
+/// serial reduction carry a constant-true mask — the form the emitters'
+/// straight-line load paths and the aligned-window sharing algebra require —
+/// instead of a per-element bound check the shape has already discharged.
+pub fn check_loads(ir: &KernelIr, caps: &Caps) -> Result<()> {
+    let mut env = BoundEnv {
+        grid: ir.grid,
+        block: ir.block,
+        subgroups: caps.subgroups.map(|s| (s.min, s.max)),
+        locals: FxHashMap::default(),
+    };
     let mut seen = FxHashSet::default();
+    check_loads_in(&ir.body, &mut env, &mut seen)
+}
+
+fn check_loads_in(
+    body: &[Stmt],
+    env: &mut BoundEnv,
+    seen: &mut FxHashSet<u64>,
+) -> Result<()> {
+    for stmt in body {
+        match stmt {
+            Stmt::Loop {
+                count,
+                index,
+                accumulators,
+                body: inner,
+            } => {
+                // `count` and the accumulator inits evaluate before the
+                // loop, outside the index's scope.
+                if let Some(count) = count {
+                    check_expr_loads(count, env, seen)?;
+                }
+                for Accumulator { init, .. } in accumulators {
+                    check_expr_loads(init, env, seen)?;
+                }
+                let bound = count
+                    .as_ref()
+                    .and_then(|c| max_value(c, env))
+                    .map(|c| c.saturating_sub(1));
+                let prev = match (index.as_ref(), bound) {
+                    (Some(local), Some(bound)) => {
+                        Some((local_key(local), env.locals.insert(local_key(local), bound)))
+                    }
+                    _ => None,
+                };
+                let mut result = Ok(());
+                for Accumulator { update, .. } in accumulators {
+                    if result.is_ok() {
+                        result = check_expr_loads(update, env, seen);
+                    }
+                }
+                if result.is_ok() {
+                    result = check_loads_in(inner, env, seen);
+                }
+                if let Some((key, prev)) = prev {
+                    match prev {
+                        Some(prev) => env.locals.insert(key, prev),
+                        None => env.locals.remove(&key),
+                    };
+                }
+                result?;
+            }
+            Stmt::If {
+                condition,
+                accept,
+                reject,
+            } => {
+                check_expr_loads(condition, env, seen)?;
+                check_loads_in(accept, env, seen)?;
+                check_loads_in(reject, env, seen)?;
+            }
+            other => {
+                let mut result = Ok(());
+                stmt_root_exprs(other, &mut |expr| {
+                    if result.is_ok() {
+                        result = check_expr_loads(expr, env, seen);
+                    }
+                });
+                result?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_expr_loads(
+    expr: &TileExpr,
+    env: &BoundEnv,
+    seen: &mut FxHashSet<u64>,
+) -> Result<()> {
     let mut error: Option<Error> = None;
-    for_each_root_expr(body, &mut |expr| {
-        visit_unique(expr, &mut seen, &mut |node| {
-            if error.is_some() {
-                return;
-            }
-            let TileExprKind::Load {
-                src, addr, mask, ..
-            } = node.kind()
-            else {
-                return;
-            };
-            if !mask.is_constant_true() {
-                return;
-            }
-            if load_in_range(src, addr) {
-                return;
-            }
-            error = Some(Error::Lower(LowerError::UnmaskedLoad(format!(
-                "load with a constant-true mask is not provably in range: {:?}",
-                addr
-            ))));
-        });
+    visit_unique(expr, seen, &mut |node| {
+        if error.is_some() {
+            return;
+        }
+        let TileExprKind::Load {
+            src, addr, mask, ..
+        } = node.kind()
+        else {
+            return;
+        };
+        if !mask.is_constant_true() {
+            return;
+        }
+        if load_in_range(src, addr, env) {
+            return;
+        }
+        error = Some(Error::Lower(LowerError::UnmaskedLoad(format!(
+            "load with a constant-true mask is not provably in range: {:?}",
+            addr
+        ))));
     });
     match error {
         Some(error) => Err(error),
@@ -486,28 +604,29 @@ pub fn check_loads(body: &[Stmt]) -> Result<()> {
     }
 }
 
-fn load_in_range(src: &Source, addr: &Addr) -> bool {
+fn load_in_range(src: &Source, addr: &Addr, env: &BoundEnv) -> bool {
     let layout = match src {
         Source::Storage(view) => &view.layout,
         Source::Quantized(view) => &view.data.layout,
     };
     match addr {
         Addr::Linear(index) => {
-            max_value(index).is_some_and(|max| max < layout.element_count())
+            max_value(index, env).is_some_and(|max| max < layout.element_count())
         }
         Addr::Rc2 { row, col } => {
             if layout.extents.len() != 2 {
                 return false;
             }
-            max_value(row).is_some_and(|max| max < u64::from(layout.extents[0]))
-                && max_value(col).is_some_and(|max| max < u64::from(layout.extents[1]))
+            max_value(row, env).is_some_and(|max| max < u64::from(layout.extents[0]))
+                && max_value(col, env).is_some_and(|max| max < u64::from(layout.extents[1]))
         }
     }
 }
 
-/// A non-negative integer literal, whichever integer type it carries. A
-/// negative literal is not a bound on an unsigned index, so it is undecidable
-/// rather than wrapping.
+/// A non-negative integer literal, whichever integer type it carries.
+///
+/// The `I32` guard mirrors [`max_value`]'s own: a negative literal is not a
+/// bound on an unsigned index, so it stays undecidable rather than wrapping.
 fn literal_u64(expr: &TileExpr) -> Option<u64> {
     match expr.kind() {
         TileExprKind::Literal(TileLiteral::U32(v)) => Some(u64::from(*v)),
@@ -520,32 +639,82 @@ fn literal_u64(expr: &TileExpr) -> Option<u64> {
 /// literal, or an affine/monotone composition of literals; anything reading a
 /// builtin or memory is unbounded and needs a real mask.
 ///
-/// Bit operators are read as their unsigned arithmetic twins: `x >> k` is
-/// `x / 2^k`, `x << k` is `x * 2^k`, and `x & m` is bounded like `x % (m + 1)`
-/// when `m` is `2^k - 1`.
-fn max_value(expr: &TileExpr) -> Option<u64> {
+/// The bit operators are read as their unsigned arithmetic twins — `x >> k` is
+/// `x / 2^k`, `x << k` is `x * 2^k`, `x & m` is bounded like `x % (m + 1)` when
+/// `m` is `2^k - 1` — because otherwise the verifier decides `lane % 32` and
+/// refuses `lane & 31`, which are the same function of `lane`. That asymmetry
+/// is not neutral: it forbids a lowering from spelling an address with the
+/// natural power-of-two wrap, the very form `emit::expr::mod_literal_u32`
+/// rewrites the remainder into one layer down.
+fn max_value(expr: &TileExpr, env: &BoundEnv) -> Option<u64> {
+    use fusor2_ir::ir::level2::{Builtin, WorkgroupAxis};
     use fusor2_ir::scalar::BinOp;
     match expr.kind() {
         TileExprKind::Literal(TileLiteral::U32(v)) => Some(u64::from(*v)),
         TileExprKind::Literal(TileLiteral::I32(v)) if *v >= 0 => Some(*v as u64),
-        TileExprKind::Cast { value, .. } => max_value(value),
+        TileExprKind::Cast { value, .. } => max_value(value, env),
         TileExprKind::Select { accept, reject, .. } => {
-            Some(max_value(accept)?.max(max_value(reject)?))
+            Some(max_value(accept, env)?.max(max_value(reject, env)?))
         }
+        // `Lane` lowers to `LocalInvocationIndex`, numbered within the
+        // workgroup, so it is bounded by the block size on every backend.
+        TileExprKind::Builtin(Builtin::Lane) => Some(u64::from(env.block.max(1)) - 1),
+        // `subgroup_invocation_id < subgroup_size`, and the widest subgroup
+        // the device reports bounds that. The block is *not* a bound here: a
+        // workgroup narrower than the subgroup width still numbers its lanes
+        // within the hardware subgroup.
+        TileExprKind::Builtin(Builtin::SubgroupLane) => {
+            env.subgroups.map(|(_, max)| u64::from(max.max(1)) - 1)
+        }
+        TileExprKind::Builtin(Builtin::SubgroupSize) => {
+            env.subgroups.map(|(_, max)| u64::from(max.max(1)))
+        }
+        // A workgroup of `block` lanes packs at most `ceil(block / min_width)`
+        // subgroups, whichever width in the range the device picks.
+        TileExprKind::Builtin(Builtin::SubgroupId) => env
+            .subgroups
+            .map(|(min, _)| u64::from(env.block.max(1).div_ceil(min.max(1))) - 1),
+        TileExprKind::Builtin(Builtin::NumSubgroups) => env
+            .subgroups
+            .map(|(min, _)| u64::from(env.block.max(1).div_ceil(min.max(1)))),
+        TileExprKind::Builtin(Builtin::ProgramId(axis)) => {
+            let extent = match axis {
+                WorkgroupAxis::X => env.grid[0],
+                WorkgroupAxis::Y => env.grid[1],
+                WorkgroupAxis::Z => env.grid[2],
+            };
+            Some(u64::from(extent.max(1)) - 1)
+        }
+        TileExprKind::Builtin(Builtin::NumWorkgroups(axis)) => {
+            let extent = match axis {
+                WorkgroupAxis::X => env.grid[0],
+                WorkgroupAxis::Y => env.grid[1],
+                WorkgroupAxis::Z => env.grid[2],
+            };
+            Some(u64::from(extent.max(1)))
+        }
+        // A loop index local in scope, bounded by its literal trip count.
+        TileExprKind::LoadLocal(local) => env.locals.get(&local_key(local)).copied(),
         TileExprKind::Binary {
             op, left, right, ..
         } => match op {
-            BinOp::Add => max_value(left)?.checked_add(max_value(right)?),
-            BinOp::Mul => max_value(left)?.checked_mul(max_value(right)?),
-            // Integer subtraction and division only lower the bound.
-            BinOp::Sub | BinOp::Div => max_value(left),
-            BinOp::Rem => Some(max_value(right)?.saturating_sub(1)),
+            BinOp::Add => max_value(left, env)?.checked_add(max_value(right, env)?),
+            BinOp::Mul => max_value(left, env)?.checked_mul(max_value(right, env)?),
+            // Integer subtraction only lowers the bound.
+            BinOp::Sub => max_value(left, env),
+            // Division by a positive literal divides the bound; a dynamic
+            // divisor still only lowers it.
+            BinOp::Div => match literal_u64(right) {
+                Some(d) if d > 0 => Some(max_value(left, env)? / d),
+                _ => max_value(left, env),
+            },
+            BinOp::Rem => Some(max_value(right, env)?.saturating_sub(1)),
             // `x >> k == x / 2^k` at a literal count. A dynamic count still
-            // only lowers the bound.
+            // only lowers the bound, which is the arm this replaces.
             BinOp::Shr => match literal_u64(right) {
-                Some(k) if k < 64 => Some(max_value(left)? >> k),
+                Some(k) if k < 64 => Some(max_value(left, env)? >> k),
                 Some(_) => Some(0),
-                None => max_value(left),
+                None => max_value(left, env),
             },
             // `x << k == x * 2^k`, checked exactly the way `Mul` is.
             BinOp::Shl => {
@@ -553,46 +722,52 @@ fn max_value(expr: &TileExpr) -> Option<u64> {
                 if k >= 64 {
                     return None;
                 }
-                max_value(left)?.checked_mul(1u64 << k)
+                max_value(left, env)?.checked_mul(1u64 << k)
             }
-            // `x & m <= x` and `x & m <= m` for unsigned, so one decidable side
-            // bounds the pair, mask or not a `2^k - 1`.
-            BinOp::BitAnd => match (max_value(left), max_value(right)) {
+            // `x & m <= x` and `x & m <= m` for unsigned, so *one* decidable
+            // side bounds the pair: `& 0xFF` is bounded however unbounded its
+            // left operand is. Stating it as a `min` also covers a mask that
+            // is not `2^k - 1`.
+            BinOp::BitAnd => match (max_value(left, env), max_value(right, env)) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (Some(a), None) | (None, Some(a)) => Some(a),
                 (None, None) => None,
             },
             // Neither `|` nor `^` sets a bit above the highest bit either side
-            // can set, so the bound is that position's all-ones mask.
+            // can set, so the bound is that position's all-ones mask. Note
             // `a | b <= A | B` is false in general (`A = B = 2` admits
-            // `1 | 2 == 3`), so this rounds up to the mask.
+            // `1 | 2 == 3`), which is why this rounds up to the mask.
             BinOp::BitOr | BinOp::BitXor => {
-                let m = max_value(left)?.max(max_value(right)?);
+                let m = max_value(left, env)?.max(max_value(right, env)?);
                 Some(if m == 0 {
                     0
                 } else {
                     u64::MAX >> m.leading_zeros()
                 })
             }
-            BinOp::Min => match (max_value(left), max_value(right)) {
+            BinOp::Min => match (max_value(left, env), max_value(right, env)) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (Some(a), None) | (None, Some(a)) => Some(a),
                 (None, None) => None,
             },
-            BinOp::Max => Some(max_value(left)?.max(max_value(right)?)),
+            BinOp::Max => Some(max_value(left, env)?.max(max_value(right, env)?)),
             _ => None,
         },
         _ => None,
     }
 }
 
+// ---------------------------------------------------------------------------
+// (3) loop accumulators
+// ---------------------------------------------------------------------------
+
 /// Every `Loop` accumulator's `init`/`update` type matches its local, the
 /// local is the accumulator of exactly one loop, and nothing outside that
 /// loop's body writes it.
 ///
-/// [`KernelIr`] carries no local list, so membership in the builder's local
-/// list is checked by [`crate::build::TileBuilder::declares_local`] at
-/// construction.
+/// The stated clause also requires the local to appear in the builder's local
+/// list. [`KernelIr`] carries no local list, so that half is checked by
+/// [`crate::build::TileBuilder::declares_local`] at construction instead.
 pub fn check_accumulators(body: &[Stmt]) -> Result<()> {
     let mut owners: FxHashMap<usize, ()> = FxHashMap::default();
     collect_accumulator_owners(body, &mut owners)?;
@@ -604,11 +779,18 @@ fn local_key(local: &Local) -> usize {
     Arc::as_ptr(local) as *const () as usize
 }
 
+// ---------------------------------------------------------------------------
+// (8) the N-ary reduction
+// ---------------------------------------------------------------------------
+
 /// Every `Stmt::Reduce` is arity-consistent, element-consistent across lanes,
 /// carries one scratch tile per lane where its kind needs scratch, and has a
-/// `merge` reading nothing but its own formals. A node whose `values`,
-/// `merge.body`, `merge.lhs`, `merge.rhs` and `outs` disagree in length is
-/// rejected rather than truncated to its first slot.
+/// `merge` reading nothing but its own formals.
+///
+/// The arity clause is what makes the `accs[0]` bug unrepresentable: there is no
+/// single `TileReduceOp` to resolve for the whole fold, and a node whose
+/// `values`, `merge.body`, `merge.lhs`, `merge.rhs` and `outs` disagree in
+/// length is rejected rather than truncated.
 pub fn check_reduce_stmts(body: &[Stmt]) -> Result<()> {
     let mut error: Option<Error> = None;
     for_each_stmt(body, &mut |stmt| {
@@ -676,9 +858,9 @@ fn check_one_reduce(
             }
         }
     }
-    // `merge` reads only its own formals: no tile, buffer or lane id.
-    // Cross-lane reads of the formals are legal, so this checks the source of
-    // every leaf, not its index.
+    // `merge` reads only its own formals. A merge that reads a tile, a buffer or
+    // a lane id is not a merge; cross-*lane* reads of the formals are legal and
+    // required, so this checks the source of every leaf, not its index.
     let formals: FxHashSet<usize> = merge
         .lhs
         .iter()
@@ -709,7 +891,8 @@ fn check_one_reduce(
             return Err(invalid(format!("a reduction merge reads {bad}")));
         }
     }
-    // Scratch: one tile per lane, and lane 0's is the one the kind names.
+    // Scratch: one tile per lane, and lane 0's is the one the kind names, so a
+    // one-lane reduction is exactly the node it was before this form existed.
     match kind {
         ReduceKind::Subgroup => {
             if !scratch.is_empty() {
@@ -730,8 +913,8 @@ fn check_one_reduce(
             }
         }
     }
-    // `fast` must agree with `merge`, or the collective path runs on a merge
-    // the collective cannot express.
+    // `fast` is derived, so an author-supplied value that disagrees with `merge`
+    // would take the collective path on a merge the collective cannot express.
     if let Some(op) = fast {
         if n != 1 {
             return Err(invalid(format!(
@@ -839,6 +1022,10 @@ fn check_accumulator_writes(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// (4) cooperative store layout
+// ---------------------------------------------------------------------------
+
 /// Every `CoopStore` destination is an affine rank-2 layout with a unit stride
 /// on one side, addressed rank-2.
 pub fn check_coop_stores(body: &[Stmt]) -> Result<()> {
@@ -869,6 +1056,10 @@ pub fn check_coop_stores(body: &[Stmt]) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Traversal helpers
+// ---------------------------------------------------------------------------
+
 /// Every statement in the tree, pre-order.
 pub fn for_each_stmt(body: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
     for stmt in body {
@@ -886,7 +1077,12 @@ pub fn for_each_stmt(body: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
 
 /// Every expression appearing directly in a statement (not its children).
 pub fn for_each_root_expr(body: &[Stmt], f: &mut dyn FnMut(&TileExpr)) {
-    for_each_stmt(body, &mut |stmt| match stmt {
+    for_each_stmt(body, &mut |stmt| stmt_root_exprs(stmt, f));
+}
+
+/// The expressions of one statement, without recursing into nested bodies.
+fn stmt_root_exprs(stmt: &Stmt, f: &mut dyn FnMut(&TileExpr)) {
+    match stmt {
         Stmt::Store {
             addr, value, mask, ..
         }
@@ -940,7 +1136,7 @@ pub fn for_each_root_expr(body: &[Stmt], f: &mut dyn FnMut(&TileExpr)) {
             }
         }
         Stmt::Break | Stmt::Return | Stmt::Barrier | Stmt::StorageBarrier => {}
-    });
+    }
 }
 
 /// Post-order over an expression DAG, visiting each distinct node once.
@@ -1011,7 +1207,9 @@ mod tests {
         let local = b.alloc_local(ScalarElement::F32.element());
         let stmt = b.store_local(local, load);
         b.push(stmt);
-        let ir = b.finish([1, 1, 1], 1, "unmasked");
+        // The prover now bounds `Lane` by the block size, so the block must
+        // exceed the buffer's extent for the load to stay unprovable.
+        let ir = b.finish([1, 1, 1], 64, "unmasked");
         match verify_l2(&ir, &caps_with(|_| {})) {
             Err(Error::Lower(LowerError::UnmaskedLoad(_))) => {}
             other => panic!("expected UnmaskedLoad, got {other:?}"),
@@ -1039,8 +1237,10 @@ mod tests {
         verify_l2(&ir, &caps_with(|_| {})).unwrap();
     }
 
-    /// `lane & 31` and `lane % 32` are the same function of `lane`, so both
-    /// bound an address.
+    /// `lane & 31` and `lane % 32` are the same function of `lane`. The
+    /// verifier used to decide the second and refuse the first, so a lowering
+    /// could not spell an address with the natural power-of-two wrap — the
+    /// very form `mod_literal_u32` rewrites the remainder into one layer down.
     #[test]
     fn a_power_of_two_mask_bounds_an_address_the_way_a_remainder_does() {
         for (op, rhs) in [(BinOp::BitAnd, 31u32), (BinOp::Rem, 32)] {
@@ -1066,25 +1266,37 @@ mod tests {
         }
     }
 
-    /// A shift and a mask compose the way their arithmetic twins do:
-    /// `(word >> 24) & 0xF` is bounded at 15 without any knowledge of `word`.
+    /// A shift and a mask compose the way their arithmetic twins do: the byte
+    /// selector `(word >> 24) & 0xF` that a block decode spells is bounded at
+    /// 15 without any knowledge of `word`, exactly as `(word / 2^24) % 16`
+    /// would be. `Shl` is checked against its `Mul` reading in the same shape.
     #[test]
     fn bit_arithmetic_bounds_compose_like_their_arithmetic_twins() {
         let mut b = TileBuilder::new();
-        let lane = b.builtin(fusor2_ir::ir::level2::Builtin::Lane);
+        let env = BoundEnv {
+            grid: [1, 1, 1],
+            block: 1,
+            subgroups: None,
+            locals: FxHashMap::default(),
+        };
+        // A local outside the env is the genuinely undecidable operand now
+        // that `Lane` itself is bounded by the block.
+        let word_local = b.alloc_local(ScalarElement::U32.element());
+        let word = b.load_local(word_local);
         let twenty_four = b.lit_u32(24);
         let fifteen = b.lit_u32(15);
-        let shifted = b.binary(BinOp::Shr, lane.clone(), twenty_four, NumericContract::RELAXED);
+        let shifted = b.binary(BinOp::Shr, word.clone(), twenty_four, NumericContract::RELAXED);
         let nibble = b.binary(BinOp::BitAnd, shifted, fifteen, NumericContract::RELAXED);
-        assert_eq!(max_value(&nibble), Some(15));
+        assert_eq!(max_value(&nibble, &env), Some(15));
 
-        // `x << k` is `x * 2^k`.
+        // `x << k` is `x * 2^k`: a decidable left operand scales, an
+        // undecidable one stays undecidable.
         let seven = b.lit_u32(7);
         let two = b.lit_u32(2);
         let scaled = b.binary(BinOp::Shl, seven, two.clone(), NumericContract::RELAXED);
-        assert_eq!(max_value(&scaled), Some(28));
-        let unbounded = b.binary(BinOp::Shl, lane, two, NumericContract::RELAXED);
-        assert_eq!(max_value(&unbounded), None);
+        assert_eq!(max_value(&scaled, &env), Some(28));
+        let unbounded = b.binary(BinOp::Shl, word, two, NumericContract::RELAXED);
+        assert_eq!(max_value(&unbounded, &env), None);
     }
 
     #[test]
@@ -1112,8 +1324,8 @@ mod tests {
         assert!(check_accumulators(&ir.body).is_err());
     }
 
-    /// A rank-2 layout whose first axis needs two sub-axes, so it is not
-    /// affine.
+    /// A rank-2 layout whose first axis needs two sub-axes: not affine, so
+    /// the cooperative store predicate must reject it.
     fn non_affine_rc2(buffer: &fusor2_ir::ir::level2::Buffer) -> StorageView {
         use fusor2_ir::shape::{AxisGroup, MultiFlattenMap, SubAxis};
         let indexing = MultiFlattenMap {
@@ -1237,6 +1449,9 @@ mod tests {
         assert!(verify_l2(&ir, &caps_with(|c| c.bf16 = false)).is_err());
         verify_l2(&ir, &caps_with(|c| c.bf16 = true)).unwrap();
     }
+    // -----------------------------------------------------------------------
+    // (8) the N-ary reduction
+    // -----------------------------------------------------------------------
 
     /// A two-lane `Stmt::Reduce` over `(max, sum)`-shaped scratch, built through
     /// the canonical constructor.
@@ -1285,8 +1500,9 @@ mod tests {
         max.tuple(&sum, &ArgRemap::identity(1)).carrier
     }
 
-    /// At one scalar binop slot the constructor returns the same
-    /// `TileExprKind::Reduce` node and pushes no statement.
+    /// The constructor **delegates** at one scalar binop slot: it returns the
+    /// same `TileExprKind::Reduce` node and pushes no statement, so the term the
+    /// emitter sees — and therefore the shader — is untouched.
     #[test]
     fn a_single_slot_carrier_delegates_to_the_collective() {
         use fusor2_ir::carrier::Carrier;
@@ -1328,8 +1544,8 @@ mod tests {
         verify_l2(&ir, &caps_with(|_| {})).unwrap();
     }
 
-    /// A node whose lane counts disagree is rejected rather than truncated to
-    /// its first slot.
+    /// **The `accs[0]` bug, unrepresentable.** A node whose lane counts disagree
+    /// is rejected rather than truncated to its first slot.
     #[test]
     fn a_reduction_with_disagreeing_lane_counts_is_rejected() {
         let mut b = TileBuilder::new();
@@ -1367,7 +1583,8 @@ mod tests {
         assert!(check_reduce_stmts(&body).is_err());
     }
 
-    /// A merge reads its formals and nothing else.
+    /// A merge reads its formals and nothing else: one that reads a lane id is
+    /// not a merge, and one that reads a tile has already raced.
     #[test]
     fn a_merge_reading_outside_its_formals_is_rejected() {
         let mut b = TileBuilder::new();
@@ -1380,7 +1597,8 @@ mod tests {
         merge.body[1] = lane;
         assert!(check_reduce_stmts(&body).is_err());
 
-        // A foreign local is not one of the two partials being merged.
+        // A foreign local is refused for the same reason: it is not one of the
+        // two partials this level is merging.
         let mut b2 = TileBuilder::new();
         let stray = b2.alloc_local(ScalarElement::F32.element());
         let read = b2.load_local(stray);
@@ -1392,8 +1610,9 @@ mod tests {
         assert!(check_reduce_stmts(&body).is_err());
     }
 
-    /// Cross-lane reads are legal: a merge that reads `lhs[0]` from lane 1
-    /// verifies.
+    /// **Cross-lane reads are legal and required.** Flash's running sum and its
+    /// output accumulator both read the running max, so a merge that reads
+    /// `lhs[0]` from lane 1 must verify.
     #[test]
     fn a_merge_reading_a_sibling_lane_is_accepted() {
         let mut b = TileBuilder::new();
@@ -1407,7 +1626,9 @@ mod tests {
         check_reduce_stmts(&body).unwrap();
     }
 
-    /// A `fast` operator that disagrees with `merge` is rejected.
+    /// `fast` is derived, never author-supplied: a value that disagrees with
+    /// `merge` would take the collective path on a merge the collective cannot
+    /// express.
     #[test]
     fn a_claimed_fast_operator_must_match_the_merge() {
         use fusor2_ir::ir::level2::TileReduceOp;
@@ -1467,8 +1688,8 @@ mod tests {
         assert!(check_reduce_stmts(&body).is_err());
     }
 
-    /// Liveness sees every lane's scratch tile, so the arena sizes N tiles per
-    /// reduction rather than one.
+    /// Liveness sees **every** lane's scratch tile, so the arena sizes N tiles
+    /// per reduction rather than one.
     #[test]
     fn liveness_sees_every_lane_scratch_tile() {
         let mut b = TileBuilder::new();

@@ -6,10 +6,14 @@
 //! directions, `round`, `relu`, `sigmoid`, `silu`, `gelu` and `tanh_exact`.
 //! There is no per-op `match` outside [`ScalarKind`].
 //!
-//! Derivatives are written in terms of the operand, never the primal output:
-//! `d(exp)/dx = s * exp(x)`, not `s * out`. `ScalarExpr` is hash-consed, so the
-//! recomputed `exp(x)` is one term inside the same kernel body rather than an
-//! extra operand edge.
+//! **Derivatives are written in terms of the operand, never the primal
+//! output.** `d(exp)/dx = s * exp(x)`, not `s * out`. The two are the same
+//! value; `ScalarExpr` is hash-consed, so the recomputed `exp(x)` is one
+//! term inside the same kernel body rather than an extra operand edge, and
+//! whether the forward `exp` is instead materialized and reread stays the
+//! extractor's materialization bit.
+//!
+//! Owned by W5.
 
 use fusor2_ir::autograd::{Grads, Tape, Val};
 use fusor2_ir::dtype::{Dtype, Splat};
@@ -27,9 +31,10 @@ pub type Partials = SmallVec<[Option<ScalarExpr>; 4]>;
 /// `Arg(i)`, then map the resulting expression over `(grad, inputs...)`.
 ///
 /// Inside [`differentiate`]'s result, `Arg(i)` still denotes primal operand
-/// `i` and `Arg(nargs)` denotes the incoming gradient. Each emitted body is
-/// rebased onto a compact operand list holding only the slots that partial
-/// reads, with the gradient first; unused operands are dropped from `ins`.
+/// `i` and `Arg(nargs)` denotes the incoming gradient. This function
+/// **rebases**: each emitted body is composed onto a compact operand list
+/// holding only the slots that partial actually reads, with the gradient
+/// first. Unused operands are dropped from `ins`.
 pub fn map_adjoint(
     tape: &mut dyn Tape,
     node: &Node,
@@ -45,7 +50,8 @@ pub fn map_adjoint(
     };
     if *outs != 1 {
         // `ScalarExpr` has exactly one result, so a `Map` with `outs > 1`
-        // carries no body describing its extra slots.
+        // carries no body describing its extra slots and nothing in fusor2
+        // constructs one. Refusing is honest; a silent zero is not.
         return Err(Error::Plan(
             "multi-output Map has no per-slot body to differentiate".into(),
         ));
@@ -62,8 +68,9 @@ pub fn map_adjoint(
             grads.push(None);
             continue;
         };
-        // A structurally-zero partial is a zero tensor, not a kernel, so a
-        // comparison's parent still receives a gradient with no dispatch.
+        // A structurally-zero partial is a zero tensor, not a kernel. This
+        // is what makes the twelve comparisons satisfy "every requires-grad
+        // parent receives a gradient" with no special case and no dispatch.
         if is_zero(&partial) {
             grads.push(Some(tape.zeros_like(target)?));
             continue;
@@ -117,12 +124,28 @@ fn rebase(
 }
 
 fn mark_used(e: &ScalarExpr, used: &mut [bool]) {
-    if let ScalarKind::Arg(i) = e.kind()
-        && let Some(slot) = used.get_mut(*i as usize)
-    {
-        *slot = true;
+    match e.kind() {
+        ScalarKind::Arg(i) => {
+            if let Some(slot) = used.get_mut(*i as usize) {
+                *slot = true;
+            }
+        }
+        ScalarKind::Lit(_) | ScalarKind::Uniform(_) | ScalarKind::IndexOf(_) => {}
+        ScalarKind::Un { x, .. }
+        | ScalarKind::Cast { x, .. }
+        | ScalarKind::Bitcast { x, .. }
+        | ScalarKind::Round { x, .. }
+        | ScalarKind::Splat { x, .. } => mark_used(x, used),
+        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
+            mark_used(a, used);
+            mark_used(b, used);
+        }
+        ScalarKind::Select { c, t, f } => {
+            mark_used(c, used);
+            mark_used(t, used);
+            mark_used(f, used);
+        }
     }
-    e.for_each_child(|c| mark_used(c, used));
 }
 
 /// `d(expr)/d(Arg(i))` for every `i < nargs`, seeded with `seed`.
@@ -168,8 +191,9 @@ fn walk(expr: &ScalarExpr, seed: ScalarExpr, out: &mut Partials) {
             walk(b, db, out);
         }
 
-        // A comparison's derivative is identically zero in both operands, which
-        // is still a gradient for the backward walk's purposes.
+        // A comparison's derivative is identically zero in both operands.
+        // This is not decoration: the backward walk requires every
+        // requires-grad parent to receive a gradient, and zero satisfies it.
         ScalarKind::Cmp { a, b, .. } => {
             walk(a, zero_like(a), out);
             walk(b, zero_like(b), out);
@@ -183,13 +207,12 @@ fn walk(expr: &ScalarExpr, seed: ScalarExpr, out: &mut Partials) {
             walk(f, select(c.clone(), zf, seed), out);
         }
 
-        // The gradient casts back to the source dtype, which is what keeps an
-        // f32 master weight under f16 compute.
+        // The whole f32-master / f16-compute recipe, in one line.
         ScalarKind::Cast { x, .. } => walk(x, ScalarExpr::cast(x.dtype(), seed), out),
         ScalarKind::Bitcast { x, .. } => walk(x, ScalarExpr::bitcast(x.dtype(), seed), out),
 
-        // Derivative is 0 almost everywhere; QAT straight-through comes from
-        // the backward `fake_quant` registers on the sugar node.
+        // Derivative is 0 almost everywhere. QAT straight-through comes from
+        // the backward `fake_quant` registers on the sugar node, not from here.
         ScalarKind::Round { x, .. } => walk(x, zero_like(x), out),
 
         ScalarKind::Dot { a, b } => {
@@ -227,7 +250,7 @@ fn unary_derivative(op: UnOp, x: &ScalarExpr, s: &ScalarExpr) -> Option<ScalarEx
     Some(match op {
         UnOp::Exp => mul(s.clone(), un(UnOp::Exp)),
         // The adjoint of an approximate exponential is that same
-        // approximation.
+        // approximation, so the derivative stays as cheap as the forward.
         UnOp::ApproximateExp => mul(s.clone(), un(UnOp::ApproximateExp)),
         UnOp::LessApproximateExp => mul(s.clone(), un(UnOp::LessApproximateExp)),
         UnOp::Exp2 => mul(mul(s.clone(), un(UnOp::Exp2)), k(std::f32::consts::LN_2)),
@@ -304,8 +327,14 @@ fn binary_derivative(
                 ScalarExpr::un(UnOp::Log, a.clone()),
             ),
         ),
-        // Each side gets a strict mask, so a tie sends the gradient nowhere and
-        // `relu = max(x, 0)` differentiates to 0 at x = 0.
+        // Each side gets a **strict** mask, so a tie sends the gradient
+        // nowhere. That is the reference's `max_elementwise`, whose adjoint is
+        // `grad * input.mt(rhs)` (`mt` is `gt_scalar`), and `min_elementwise`,
+        // whose adjoint is `grad * input.lt(rhs)`. The inclusive `Ge`/`Le` this
+        // replaced made `relu = max(x, 0)` differentiate to 1 at x = 0.
+        //
+        // `TiePolicy::FirstWins` is not this: it belongs to `Combine::Max`, the
+        // fold, where exactly one element must own the reduction.
         BinOp::Max => (
             select(ScalarExpr::cmp(CmpOp::Gt, a.clone(), b.clone()), s.clone(), k(0.0)),
             select(ScalarExpr::cmp(CmpOp::Gt, b.clone(), a.clone()), s.clone(), k(0.0)),
@@ -327,8 +356,12 @@ fn binary_derivative(
     }
 }
 
-// Every builder below folds the literal identities it can prove, which keeps a
-// comparison's partial a single `Lit(0)` rather than a tree of multiplies.
+// ------------------------------------------------------------- expr builders
+//
+// Every builder folds the literal identities it can prove, which is what
+// keeps a comparison's partial a single `Lit(0)` instead of a tree of
+// multiplies — and therefore what makes `map_adjoint` emit a zero `Const`
+// tensor rather than a kernel.
 
 fn lit_of(dtype: Dtype, v: f32) -> ScalarExpr {
     let splat = match dtype {
@@ -439,7 +472,9 @@ fn select(c: ScalarExpr, t: ScalarExpr, f: ScalarExpr) -> ScalarExpr {
 }
 
 /// `d(expr)/d(Arg(arg))` with a unit seed, as a `ScalarExpr` over the same
-/// argument list. Comparisons differentiate to a literal zero.
+/// argument list. Comparisons differentiate to a literal zero, which is what
+/// makes "every requires-grad parent receives a gradient" hold without a
+/// special case.
 pub fn d_expr(expr: &ScalarExpr, arg: u32) -> Result<ScalarExpr> {
     let nargs = max_arg(expr).map_or(arg + 1, |m| m.max(arg) + 1);
     let seed = one_of(expr.dtype());
@@ -452,12 +487,25 @@ pub fn d_expr(expr: &ScalarExpr, arg: u32) -> Result<ScalarExpr> {
 
 /// Highest `Arg` index appearing in `expr`.
 pub fn max_arg(expr: &ScalarExpr) -> Option<u32> {
-    let mut out = match expr.kind() {
+    match expr.kind() {
         ScalarKind::Arg(i) => Some(*i),
-        _ => None,
-    };
-    expr.for_each_child(|c| out = out.max(max_arg(c)));
-    out
+        ScalarKind::Lit(_) | ScalarKind::Uniform(_) | ScalarKind::IndexOf(_) => None,
+        ScalarKind::Un { x, .. }
+        | ScalarKind::Cast { x, .. }
+        | ScalarKind::Bitcast { x, .. }
+        | ScalarKind::Round { x, .. }
+        | ScalarKind::Splat { x, .. } => max_arg(x),
+        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
+            match (max_arg(a), max_arg(b)) {
+                (Some(x), Some(y)) => Some(x.max(y)),
+                (v, None) | (None, v) => v,
+            }
+        }
+        ScalarKind::Select { c, t, f } => [max_arg(c), max_arg(t), max_arg(f)]
+            .into_iter()
+            .flatten()
+            .max(),
+    }
 }
 
 #[cfg(test)]
@@ -477,9 +525,84 @@ mod tests {
         ScalarExpr::arg(9, Dtype::F32)
     }
 
-    /// Numeric evaluation of a partial, run with no coordinate vector.
+    /// Numeric evaluation of a partial, for finite-difference checks.
     fn eval(e: &ScalarExpr, args: &[f32]) -> f32 {
-        crate::tape::testing::eval_scalar(e, args, &[])
+        match e.kind() {
+            ScalarKind::Arg(i) => args[*i as usize],
+            ScalarKind::Lit(l) => match l.0 {
+                Splat::F32(v) => v,
+                Splat::F16(b) => half::f16::from_bits(b).to_f32(),
+                Splat::BF16(b) => half::bf16::from_bits(b).to_f32(),
+                Splat::U32(v) => v as f32,
+                Splat::I32(v) => v as f32,
+            },
+            ScalarKind::Uniform(_) | ScalarKind::IndexOf(_) => 0.0,
+            ScalarKind::Un { op, x } => {
+                let v = eval(x, args);
+                match op {
+                    UnOp::Exp
+                    | UnOp::ApproximateExp
+                    | UnOp::LessApproximateExp => v.exp(),
+                    UnOp::Exp2 => v.exp2(),
+                    UnOp::Log => v.ln(),
+                    UnOp::Log2 => v.log2(),
+                    UnOp::Sqrt => v.sqrt(),
+                    UnOp::InverseSqrt => 1.0 / v.sqrt(),
+                    UnOp::Sin => v.sin(),
+                    UnOp::Cos => v.cos(),
+                    UnOp::Tan => v.tan(),
+                    UnOp::Tanh => v.tanh(),
+                    UnOp::Asin => v.asin(),
+                    UnOp::Acos => v.acos(),
+                    UnOp::Atan => v.atan(),
+                    UnOp::Sinh => v.sinh(),
+                    UnOp::Cosh => v.cosh(),
+                    UnOp::Asinh => v.asinh(),
+                    UnOp::Acosh => v.acosh(),
+                    UnOp::Atanh => v.atanh(),
+                    UnOp::Abs => v.abs(),
+                    UnOp::Neg => -v,
+                    UnOp::Unpack2x16Float => v,
+                }
+            }
+            ScalarKind::Bin { op, a, b } => {
+                let (x, y) = (eval(a, args), eval(b, args));
+                match op {
+                    BinOp::Add => x + y,
+                    BinOp::Sub => x - y,
+                    BinOp::Mul => x * y,
+                    BinOp::Div => x / y,
+                    BinOp::Rem => x % y,
+                    BinOp::Pow => x.powf(y),
+                    BinOp::Min => x.min(y),
+                    BinOp::Max => x.max(y),
+                    _ => 0.0,
+                }
+            }
+            ScalarKind::Cmp { op, a, b } => {
+                let (x, y) = (eval(a, args), eval(b, args));
+                let t = match op {
+                    CmpOp::Lt => x < y,
+                    CmpOp::Le => x <= y,
+                    CmpOp::Gt => x > y,
+                    CmpOp::Ge => x >= y,
+                    CmpOp::Eq => x == y,
+                    CmpOp::Ne => x != y,
+                };
+                if t { 1.0 } else { 0.0 }
+            }
+            ScalarKind::Select { c, t, f } => {
+                if eval(c, args) != 0.0 {
+                    eval(t, args)
+                } else {
+                    eval(f, args)
+                }
+            }
+            ScalarKind::Cast { x, .. } | ScalarKind::Bitcast { x, .. } => eval(x, args),
+            ScalarKind::Round { x, .. } => eval(x, args).round(),
+            ScalarKind::Dot { a, b } => eval(a, args) * eval(b, args),
+            ScalarKind::Splat { x, .. } => eval(x, args),
+        }
     }
 
     /// Central difference of `expr` in slot `slot` at `args`.
@@ -565,8 +688,14 @@ mod tests {
         }
     }
 
-    /// A tie sends the gradient to neither side: the masks are strict, so
-    /// `relu = max(x, 0)` differentiates to 0 at x = 0.
+    /// A tie sends the gradient to neither side.
+    ///
+    /// This replaces `max_and_min_break_ties_left`, which asserted the
+    /// inclusive `Ge`/`Le` masks. Those disagree with the reference:
+    /// `fusor/src/autograd/elementwise.rs::max_elementwise` differentiates to
+    /// `grad * input.mt(rhs)` and `min_elementwise` to `grad * input.lt(rhs)`,
+    /// both strict. The observable consequence was `relu = max(x, 0)`
+    /// differentiating to 1 at x = 0 instead of 0.
     #[test]
     fn max_and_min_send_a_tie_to_neither_side() {
         for op in [BinOp::Max, BinOp::Min] {

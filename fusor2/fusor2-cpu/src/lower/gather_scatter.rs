@@ -1,14 +1,30 @@
 //! `KGather` and `KScatter`.
 //!
-//! All four `ScatterMode`s name one map and differ only in strategy, so they
-//! share one nest: one lane per output element, a counted loop over the
-//! updates. Every output element is written by exactly one lane, so no atomic
-//! is needed and the result is bit-reproducible at any thread count.
-//! `OneHotContract` is refused here; it lowers through `KContract`.
+//! Both `ScatterMode`s name one map and differ only in strategy, so on a
+//! target with no f32 atomic they share one nest: **one lane per output
+//! element, a counted loop over the updates**. Every output element is written
+//! by exactly one lane, so no atomic is needed and the result is
+//! bit-reproducible at any thread count — which is the closure of the
+//! reference's total absence of CPU scatter-add, where embedding backward was
+//! an `O(vocab x N x D)` one-hot GEMM.
 //!
-//! Both nests read their lane tiling off `theta`: `tm` elements per lane is
-//! the grid-strided register tile [`crate::lower::map_fold`] runs a `KMap` at,
-//! and on the scatter it amortizes the index read.
+//! **Both nests read their lane tiling off `theta`.** `KGather` and `KScatter`
+//! carry the same elementwise `ScheduleDomain::Map` a `KMap` carries, and both
+//! bodies used to drop it on the floor (`let _ = theta`) and run one element
+//! per lane. `tm` elements per lane is the same grid-strided register tile
+//! [`crate::lower::map_fold`] runs a `KMap` at, and on the scatter it is what
+//! amortizes the index read that dominates the embedding gradient.
+//!
+//! **What this does not fix, measured.** The domain is minted but never
+//! selected: `sigma` keeps the floor-lowered node, whose domain is
+//! `ScheduleDomain::Point`, so `theta` is `SchedPoint::Point` on every gather
+//! and scatter in the conformance suite. `tm` reaches the cost model only
+//! through `resident_lanes`, where a bigger tile is strictly fewer lanes and
+//! so equal-or-worse — a tiled point can tie the untiled node but never beat
+//! it. See the note in `fusor2-gpu/src/lower/gather_scatter.rs` for the two
+//! call sites.
+//!
+//! Owned by W10.
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::error::Error;
@@ -50,14 +66,20 @@ pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> 
 
 /// How many output elements one lane owns, read off `theta`.
 ///
-/// [`SchedPoint::Point`] is the floor lowering's untiled point and answers 1;
-/// any other family on these nodes is refused.
+/// [`SchedPoint::Point`] is the floor lowering's untiled point — the fallback
+/// that guarantees every chain reaches a valid L1 form when the saturation
+/// budget is exhausted — so it is answered with 1 rather than refused. Any
+/// other family on these nodes is a planner bug and says so.
 ///
-/// `MapTiling::dim` does not enter: this backend tiles with a grid stride
-/// (`flat + t * grid.x * block`), so coverage is a bijection with no
-/// divisibility side condition whatever axis the domain named.
+/// `MapTiling::dim` does not enter: this backend tiles with a **grid stride**
+/// (`flat + t * grid.x * block`), exactly as `lower_map` does, so one lane's
+/// elements are a fixed distance apart whatever axis the domain named. That
+/// keeps coverage a bijection with no divisibility side condition, at the
+/// price of not distinguishing two points that differ only in `dim`.
 /// `MapTiling::vector` does not enter either: `emit::pick_width` chooses the
-/// SIMD instantiation from `caps.simd_widths` and the block width.
+/// SIMD instantiation from `caps.simd_widths` and the block width, so a width
+/// asserted here would be a second, disagreeing decision rather than a
+/// consumed one.
 fn lane_tile(theta: SchedPoint) -> Result<u32> {
     match theta {
         SchedPoint::Map(t) => Ok(t.tm.max(1)),
@@ -78,8 +100,9 @@ fn view(buf: &Arc<fusor2_ir::ir::level2::BufferDecl>) -> StorageView {
 
 /// `out[i, rest] = src[idx[i], rest]`, one lane per output element.
 ///
-/// Both `GatherMode`s share this nest, differing only in how many output
-/// elements one lane owns.
+/// Both `GatherMode`s share this nest; they differ only in how many output
+/// elements one lane owns, which is a schedule attribute rather than a
+/// different kernel.
 fn gather(
     caps: &Caps,
     cx: &LowerCtx<'_>,
@@ -102,9 +125,11 @@ fn gather(
     }
     let inner: u32 = extents[axis + 1..].iter().product::<u32>().max(1);
     let out_stride = extents[axis].max(1) * inner;
-    // The gathered axis is the only axis where source and output extents
-    // disagree, so the source's outer coordinate must scale by the source's
-    // own stride.
+    // The source's extent along the gathered axis, which is the *only* axis
+    // where source and output disagree. Scaling the source's outer coordinate
+    // by the output's stride reads the wrong row whenever the index vector is
+    // not exactly as long as the axis it indexes — the common case for a
+    // table expansion, an upsample run or a narrow.
     let src_shape = const_extents(ops[0].layout.shape())?;
     let src_axis = *src_shape
         .get(axis)
@@ -141,8 +166,8 @@ fn gather(
         let within = bin(BinOp::Rem, rest, lit_u32(inner), u32_ty());
 
         let row = idx.at(g, mask.clone());
-        // The gathered coordinate replaces `g`; the outer coordinate steps by
-        // the source's stride.
+        // The gathered coordinate replaces `g`; everything else is unchanged —
+        // but the outer coordinate steps by the *source's* stride.
         let src_index = bin(
             BinOp::Add,
             bin(
@@ -175,36 +200,37 @@ fn gather(
 
 /// `out = base` with `out[.., idx[u], ..] (combine)= upd[.., u, ..]`.
 ///
-/// The nest walks the output, not the updates: the plan gives the value its
-/// own buffer and nothing copies the base in beforehand, so every output
-/// element must be visited.
+/// **The nest walks the output, not the updates.** A `KScatter`'s value is its
+/// *base* with the updates applied, and the plan gives that value its own
+/// buffer — nothing copies the base in beforehand — so a kernel that only
+/// visits the written elements leaves every other one undefined. That is what
+/// made `cat`, `stack`, `pad`, `repeat` and `slice_assign` come back as zeros.
 ///
 /// One lane per output element, a counted loop over the updates, and the
-/// accumulator carried in a register. Each output element is its own only
-/// writer, so the accumulation order is fixed, the result is bit-reproducible
-/// at any thread count, and no f32 atomic is needed.
+/// accumulator carried in a register: the write map is not injective, so the
+/// nest declares an associative `combine` (`verify_l1` invariant 3) and
+/// discharges it by making each output element the *only* writer of itself.
+/// The accumulation order is therefore fixed and the result bit-reproducible
+/// at any thread count — no atomic, on a target that has none for f32.
 ///
-/// `tm` accumulators in one loop share a single `idx[u]` read per update, so
-/// index traffic falls by `tm` while the arithmetic is unchanged.
+/// **`tm` output elements per lane, in one loop.** The counted loop costs one
+/// `idx[u]` read per output element per update; `tm` accumulators in the same
+/// loop share that read, so the index traffic that dominates the embedding
+/// gradient falls by `tm` while the arithmetic is unchanged.
 fn scatter(
     caps: &Caps,
     cx: &LowerCtx<'_>,
     space: &fusor2_ir::ir::level1::IndexSpace,
     axis: u32,
-    mode: ScatterMode,
+    _mode: ScatterMode,
     combine: ScatterCombine,
     ops: &[fusor2_ir::ir::level1::Operand],
     tm: u32,
 ) -> Result<KernelIr> {
-    if mode == ScatterMode::OneHotContract {
-        return Err(Error::Legality(
-            "OneHotContract is present only as the candidate the cost model rejects; it \
-             lowers through KContract, not here"
-                .into(),
-        ));
-    }
-    // Every other mode names a strategy for the same map. This nest needs no
-    // atomic, so `Atomic` is legal even when `caps.atomic_f32` is false.
+    // Either mode names a *strategy* for the same map. This nest needs
+    // no atomic, so `Atomic{Add}` is legal here even though `caps.atomic_f32`
+    // is false: refusing it made every `Set` scatter unrunnable on the CPU,
+    // and refusing `Add` made embedding backward unrunnable.
     if ops.len() < 3 {
         return Err(Error::Legality(
             "a scatter needs base, index and update operands".into(),
@@ -281,8 +307,9 @@ fn scatter(
         );
         let contribution = upd.at(upd_index, live.clone());
         let combined = match combine {
-            // Under `Add`, duplicate indices accumulate. `Set` is reachable
-            // only when the node proved its indices unique.
+            // `Add` duplicates accumulate — normative: an embedding table
+            // receiving one token twice gets the summed gradient. `Set` is only
+            // reachable when the node proved its indices unique.
             ScatterCombine::Add => bin(BinOp::Add, acc.clone(), contribution, elem),
             ScatterCombine::Set => contribution,
         };
@@ -524,7 +551,11 @@ mod tests {
         SchedPoint::Map(MapTiling { dim, tm, vector })
     }
 
-    /// Every point of the domain computes the same answer.
+    // -- the schedule point is read, and reading it changes nothing numeric --
+
+    /// The whole point of the change: `theta` is consumed, and every point of
+    /// the real domain computes the same answer. A tiling that is *read* but
+    /// wrong is worse than one that is ignored, so this runs the kernel.
     #[test]
     fn every_schedule_point_scatters_the_same_values() {
         let want = reference_scatter(64, 8, 32);
@@ -554,8 +585,8 @@ mod tests {
         }
     }
 
-    /// At `tm` the kernel carries `tm` accumulators in one loop and launches
-    /// `tm` times fewer lanes.
+    /// The tiling is not decoration: at `tm` the kernel carries `tm`
+    /// accumulators in one loop and launches `tm` times fewer lanes.
     #[test]
     fn a_tiled_scatter_carries_one_accumulator_per_element_and_a_smaller_grid() {
         // 8,192 output elements: a whole number of 256-lane groups at both
@@ -587,8 +618,9 @@ mod tests {
         assert_eq!(untiled.grid[0], tiled.grid[0] * 4);
     }
 
-    /// `SchedPoint::Point` stays answerable; another family is refused rather
-    /// than silently treated as untiled.
+    /// `SchedPoint::Point` is the floor's guarantee and must stay answerable;
+    /// a point from another family is a planner bug and must not be silently
+    /// treated as untiled.
     #[test]
     fn the_floor_point_is_answered_and_a_foreign_family_is_refused() {
         use fusor2_ir::ir::level1::FoldStrat;
@@ -597,8 +629,10 @@ mod tests {
         assert!(lane_tile(SchedPoint::Fold(FoldStrat::Subgroup)).is_err());
     }
 
-    /// `map_domain`, the generator behind `KScatter::sched`, offers more than
-    /// one tiling on an embedding-gradient shape, and every point lowers.
+    /// The domain these nodes carry is non-trivial on the trainer's embedding
+    /// gradient — 1,024 bins x 768 units, 384 updates — so there is a real
+    /// choice to make. `map_domain` is the generator the scatter rules feed
+    /// `KScatter::sched` from, read here on that exact shape.
     #[test]
     fn the_embedding_gradient_scatter_carries_a_real_domain() {
         let caps = crate::caps::cpu_caps();
@@ -617,8 +651,10 @@ mod tests {
         }
     }
 
-    /// Different device caps generate different domains: SIMD widths multiply
-    /// the domain, and a device with none offers no vectorized point.
+    /// Different device caps generate different domains, so the point a plan
+    /// resolves to is a function of the device rather than of this file. The
+    /// CPU's SIMD widths multiply the domain; a device with none does not
+    /// offer a vectorized point at all.
     #[test]
     fn device_caps_change_the_domain_the_scatter_is_scheduled_over() {
         let mut narrow = crate::caps::cpu_caps().clone();
@@ -641,8 +677,9 @@ mod tests {
         assert_ne!(a.tilings, b.tilings);
     }
 
-    /// The generator does not offer a `tm` the shape cannot fill, so a short
-    /// axis yields fewer points than a long one.
+    /// A shorter axis than the tile is a smaller domain: the generator does
+    /// not offer a `tm` the shape cannot fill, so two shapes reach extraction
+    /// with different candidate sets.
     #[test]
     fn a_short_axis_offers_fewer_points_than_a_long_one() {
         let caps = crate::caps::cpu_caps();
@@ -659,17 +696,4 @@ mod tests {
         assert_eq!(tms(&short), vec![2]);
     }
 
-    /// Every atomic-flavoured mode lowers with `caps.atomic_f32` false, since
-    /// the nest writes each output element from one lane. Only
-    /// `OneHotContract` is refused.
-    #[test]
-    fn every_scatter_mode_but_the_one_hot_contraction_lowers_on_cpu() {
-        use fusor2_ir::ir::level1::ScatterMode;
-        assert!(!crate::caps::cpu_caps().atomic_f32);
-        let lowers_here = |m: ScatterMode| m != ScatterMode::OneHotContract;
-        assert!(lowers_here(ScatterMode::Atomic));
-        assert!(lowers_here(ScatterMode::WgPrivateMerge));
-        assert!(lowers_here(ScatterMode::SortSegment));
-        assert!(!lowers_here(ScatterMode::OneHotContract));
-    }
 }

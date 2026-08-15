@@ -3,6 +3,8 @@
 //! Both storage layouts are legal inputs everywhere; moving between them is
 //! the priced `qrepack` rewrite, so layout never feeds back into routing
 //! through format variants.
+//!
+//! Owned by W13.
 
 use fusor2_gguf::VarBuilder;
 use fusor2_ir::dtype::{Dtype, QFmt, QLayout};
@@ -25,9 +27,15 @@ pub struct QMatrix {
 }
 
 impl QMatrix {
-    /// The `QMatrix` a quantized value denotes, or `None` when the tensor is
-    /// not one. `(fmt, layout, shape)` come from the `LeafKind::Quantized` node
-    /// itself; a quantized value that is not a leaf returns `None`.
+    /// The `QMatrix` a quantized *value* denotes, or `None` when the tensor
+    /// is not one.
+    ///
+    /// Recovers `(fmt, layout, shape)` from the `LeafKind::Quantized` node
+    /// itself, so any quantized tensor — `Graph::quantized`, a GGUF load, a
+    /// concat — gets the same [`Self::dequantize`] class without its caller
+    /// having carried a `QMatrix` around. A quantized value that is not a
+    /// leaf (nothing mints one today) returns `None` and stays on the raw
+    /// path.
     pub fn of_tensor(t: &Tensor) -> Option<Self> {
         if !t.dtype().is_quantized() {
             return None;
@@ -55,10 +63,11 @@ impl QMatrix {
 
     /// A `QMatrix` over raw block bytes, with no file behind it.
     ///
-    /// `shape` is `[rows, cols]` in elements, not blocks; `bytes` is the packed
-    /// block stream for `(fmt, layout)` in row-major block order. The byte count
-    /// is checked against the format table: a short buffer decodes out of
-    /// bounds on device with no diagnostic.
+    /// `shape` is `[rows, cols]` **in elements**, not blocks; `bytes` is the
+    /// packed block stream for `(fmt, layout)` in row-major block order.
+    /// The byte count is checked against the format table rather than
+    /// trusted, because a short buffer decodes out of bounds on device with
+    /// no diagnostic.
     pub fn from_raw_bytes(
         graph: &Graph,
         fmt: QFmt,
@@ -70,7 +79,8 @@ impl QMatrix {
     }
 
     /// [`QMatrix::from_raw_bytes`] against a graph handle rather than a
-    /// [`Graph`].
+    /// [`Graph`]. `concat_rows` builds its result in the graph its inputs
+    /// already live in, and a `QMatrix` only carries the handle.
     fn from_raw_bytes_in(
         graph: &GraphRef,
         fmt: QFmt,
@@ -115,10 +125,13 @@ impl QMatrix {
 
     /// The `[rows, cols]` quantized tensor named `name` under `vb`.
     ///
-    /// GGUF stores a matrix as `[cols, rows]`, fastest-varying extent first, so
-    /// the shape is reversed here. The layout is whatever the file holds,
-    /// always [`QLayout::Native`]; moving to `F32Scales` is the priced
-    /// `qrepack` rewrite.
+    /// `raw.shape` is already row-major: the GGUF parser reverses the file's
+    /// fastest-varying-first dimension order at read (see
+    /// [`fusor2_gguf::GgufTensor`]), so reversing again here would hand back
+    /// a transposed matrix. A rank-1 tensor loads as a single row.
+    /// The layout is whatever the file holds, always [`QLayout::Native`];
+    /// moving to `F32Scales` is the priced `qrepack` rewrite and not a
+    /// loader decision.
     pub fn load(vb: &VarBuilder, graph: &Graph, name: &str) -> Result<Self> {
         let raw = vb.get_raw(name)?;
         let Dtype::Q(fmt) = raw.fmt else {
@@ -127,9 +140,9 @@ impl QMatrix {
                 raw.fmt
             )));
         };
-        let (cols, rows) = match raw.shape.as_slice() {
-            [cols] => (*cols, 1),
-            [cols, rows] => (*cols, *rows),
+        let (rows, cols) = match raw.shape.as_slice() {
+            [cols] => (1, *cols),
+            [rows, cols] => (*rows, *cols),
             other => {
                 return Err(Error::Shape(format!(
                     "{name} has GGUF shape {other:?}; a QMatrix is rank 1 or 2"
@@ -145,19 +158,22 @@ impl QMatrix {
         )
     }
 
-    /// Materialize the dequantized matrix; `q_mat_mul` instead keeps the
-    /// weights quantized inside the kernel.
+    /// Materialize the dequantized matrix. Almost always the wrong thing —
+    /// `q_mat_mul` keeps the weights quantized inside the kernel.
     ///
     /// The sugar node and its definitional `Restride` + `Map` expansion are
-    /// unioned into one class. [`crate::composite::quantized::dequant_defn`]
-    /// returns `None` for the `(fmt, layout)` pairs that need a block program.
+    /// unioned into one class here, so there is nothing to recognize later:
+    /// see [`crate::composite::quantized::dequant_defn`], which returns `None`
+    /// for the `(fmt, layout)` pairs that still need a block program.
     pub fn dequantize(&self) -> Result<Tensor> {
         let graph = self.tensor.graph();
-        // The sugar is minted first, so it takes the lower id and lands in
-        // operand 0 of the `Union`, which is where the `Union` adjoint routes.
-        // The sugar carries the refusal to differentiate quantized weights;
-        // building the defn first routes a gradient into the unpack `Map` and
-        // its `U32` leaves.
+        // The sugar is minted **first**, so it takes the lower id and lands in
+        // operand 0 of the `Union`. Every other composite does the reverse,
+        // and for the reverse reason: there only the `defn` is
+        // differentiable, whereas here it is the *sugar* that carries the
+        // intentional "quantized weights are not trainable" refusal. Building
+        // the defn first would silently route a gradient into the unpack
+        // `Map` and its `U32` leaves.
         let sugar = graph.add_l0(L0::Dequant {
             fmt: self.fmt,
             layout: self.layout,
@@ -166,16 +182,22 @@ impl QMatrix {
         let Some(defn) = crate::composite::quantized::dequant_defn(self)? else {
             return Ok(graph.tensor(sugar));
         };
-        let root = graph.with_egraph(|g| {
+        graph.with_egraph(|g| {
             g.mark_defn(defn);
-            g.union(sugar, defn)
+            Ok(())
         })?;
+        // See `composite::macro_op`: a stable first-union root, so a decode
+        // loop's rebuild keeps one name.
+        let root = graph.union_stable(sugar, defn)?;
         Ok(graph.tensor(root))
     }
 
     /// The `Restride` + `Map` expansion alone, with no `L0::Dequant` in the
     /// class — the `*_slow` spelling [`crate::composite::core_op`] documents.
-    /// The extractor has no alternative here.
+    ///
+    /// The extractor has no alternative here, so a test against this proves
+    /// the bit arithmetic rather than proving which class member happened to
+    /// win.
     pub fn dequantize_slow(&self) -> Result<Tensor> {
         let graph = self.tensor.graph();
         match crate::composite::quantized::dequant_defn(self)? {
@@ -194,16 +216,44 @@ impl QMatrix {
     /// `[.., rows]` out.
     ///
     /// A rank-1 activation is one matrix row, so it routes through a
-    /// `[1, k]` view and reshapes back.
+    /// `[1, k]` view and reshapes back — the same promotion the reference
+    /// makes. A rank-3-or-higher activation is the *same* promotion in the
+    /// other direction: a weight is rank 2 and [`Tensor::matmul_t`] shares no
+    /// batch rank with it, so the leading axes fold into the row axis and are
+    /// restored on the way out. Both `kalosm-llama` and `rwhisper` carried a
+    /// byte-identical private helper doing exactly this because the method
+    /// stopped at rank 2; the views it builds are the views they built.
     pub fn q_mat_mul(&self, act: &Tensor) -> Result<Tensor> {
-        if act.rank() == 1 {
-            let k = act.dim(0);
-            let out = act
-                .reshape_dims(&[Dim::Const(1), k])?
-                .matmul_t(&self.tensor)?;
-            return out.reshape_dims(&[self.rows]);
+        match act.rank() {
+            1 => {
+                let k = act.dim(0);
+                let out = act
+                    .reshape_dims(&[Dim::Const(1), k])?
+                    .matmul_t(&self.tensor)?;
+                out.reshape_dims(&[self.rows])
+            }
+            2 => act.matmul_t(&self.tensor),
+            _ => {
+                let shape = act.shape();
+                let (lead, k) = shape.split_at(shape.len() - 1);
+                let mut rows: u64 = 1;
+                for d in lead {
+                    let Dim::Const(n) = d else {
+                        return Err(Error::Shape(format!(
+                            "a rank-{} activation folds its leading axes into the row axis, \
+                             which needs them constant; {d} is symbolic",
+                            act.rank()
+                        )));
+                    };
+                    rows *= n;
+                }
+                let flat = act.reshape_dims(&[Dim::Const(rows), k[0]])?;
+                let out = flat.matmul_t(&self.tensor)?;
+                let mut back: Vec<Dim> = lead.to_vec();
+                back.push(self.rows);
+                out.reshape_dims(&back)
+            }
         }
-        act.matmul_t(&self.tensor)
     }
 
     /// The rows named by `idx`, decoded to `F32`. `[n]` in, `[n, cols]` out.
@@ -213,11 +263,19 @@ impl QMatrix {
 
     /// The rows named by `idx`, decoded to `dtype`.
     ///
-    /// `Dequant` then `Gather`: which program computes them is the extractor's
-    /// decision. The fused spelling (an `L0::Gather` on axis 0 over the
-    /// quantized leaf, then a `Dequant`) decodes twice, because `infer_l1`
-    /// gives the minted `KGather` its source's `Q(fmt)` dtype while both
-    /// backends' `KGather` bodies already decode through `operand_src`.
+    /// `Dequant` then `Gather`, which is the reference's spelling: the decode
+    /// is a value, the row pick is a value, and which program computes them is
+    /// the extractor's decision rather than this method's.
+    ///
+    /// The fused form is a *member*, not a spelling: `GATHER_QUANTIZED_ROWS`
+    /// matches this `Gather`-of-`Dequant` pair and mints a float-typed
+    /// [`GatherMode::QuantizedRows`] `KGather` reading the quantized leaf
+    /// directly (`infer_l1` gives the mode `F32`, so nothing decodes twice —
+    /// the wrong-values trap an earlier gather-of-quantized-leaf spelling
+    /// fell into). The extractor picks it on cost, which is what deleted the
+    /// 2.1 GB dense-table launch an 8B model's per-token lookup paid.
+    ///
+    /// [`GatherMode::QuantizedRows`]: fusor2_ir::ir::level1::GatherMode::QuantizedRows
     pub fn index_select_rows_to(&self, idx: &Tensor, dtype: Dtype) -> Result<Tensor> {
         if idx.rank() != 1 {
             return Err(Error::Shape(format!(
@@ -246,10 +304,12 @@ impl QMatrix {
 
     /// One matrix stacked from `parts` along rows, without decoding.
     ///
-    /// The block stream is row-major in blocks, so the concatenation is a byte
-    /// append and the result decodes to the concatenation of the parts. Format,
-    /// storage layout and column count must agree; a repack is a separate
-    /// priced rewrite.
+    /// A fused QKV projection is three `[rows_i, cols]` weights read as one
+    /// `[sum rows_i, cols]` weight: the block stream is row-major in blocks,
+    /// so the concatenation is a byte append and the result decodes to the
+    /// concatenation of the parts. Format, storage layout and column count
+    /// must agree — a repack is the priced rewrite, not something a concat
+    /// performs silently.
     pub fn concat_rows(parts: &[&Self]) -> Result<Self> {
         let Some(first) = parts.first().copied() else {
             return Err(Error::Shape(
@@ -311,7 +371,7 @@ impl QMatrix {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Device, Session};
+    use crate::session::{Backend, Session};
     use fusor2_gguf::blocks::{block_fields, cpu_dequantize_block};
     use fusor2_gguf::repack;
     use half::f16;
@@ -319,12 +379,13 @@ mod tests {
     const ROWS: u64 = 3;
 
     fn graph() -> Graph {
-        Graph::new(&Session::new(Device::cpu().unwrap()).unwrap())
+        Graph::new(&Session::new(Backend::cpu().unwrap()).unwrap())
     }
 
-    /// A well-formed block: an explicit finite scale (and min, where the format
-    /// carries one) plus a deterministic payload. A random f16 scale is NaN or
-    /// Inf about once in 2000, and a NaN compares unequal to itself.
+    /// A well-formed block: an explicit finite scale (and min, where the
+    /// format carries one) plus a deterministic payload. A random f16 scale
+    /// is NaN or Inf about once in 2000, and a NaN compares unequal to
+    /// itself.
     fn make_block(fmt: QFmt, layout: QLayout, seed: u32) -> Vec<u8> {
         let fields = block_fields(fmt, layout);
         let mut block = vec![0u8; fmt.block_bytes(layout) as usize];
@@ -416,12 +477,21 @@ mod tests {
         (qm, want)
     }
 
-    /// The `defn` alone, forced, so this tests the bit arithmetic. Equality is
-    /// exact: each decode is an integer widened to f32 times the block's f32
-    /// scale, and `f16_lane`'s bit arithmetic is exact against `f16::to_f32`.
-    /// A decode reads the stream as `u32` words, so a block whose stride is not
-    /// a whole number of words has no expansion; `word_aligned` is that
-    /// predicate and is asserted in both directions.
+    /// The `defn` alone, forced: the extractor cannot fall back to the block
+    /// program, so this is a statement about the bit arithmetic and not about
+    /// which class member happened to win.
+    ///
+    /// Exact equality, not a tolerance: every one of these decodes is an
+    /// integer widened to f32 and multiplied by the block's f32 scale, which
+    /// is bit-for-bit what the scalar reference decoder does.
+    ///
+    /// Both layouts: an f16 scale is decoded by `f16_lane`'s bit arithmetic,
+    /// which is exact against `f16::to_f32`, so `Native` is held to the same
+    /// bit-for-bit bar. What is left of the old layout restriction is the
+    /// **block stride**: a decode reads the stream as `u32` words, so a block
+    /// whose stride is not a whole number of words has no expansion, and
+    /// `word_aligned` is that predicate. It is asserted in both directions so
+    /// a format silently losing its expansion fails here.
     #[test]
     fn the_dequant_defn_decodes_exactly_as_the_reference_block_decoder() {
         let g = graph();
@@ -443,7 +513,8 @@ mod tests {
         }
     }
 
-    /// The sugar and a marked `defn` are both in one class.
+    /// The class shape every other composite is tested for: the sugar and a
+    /// marked `defn`, both in one class.
     #[test]
     fn a_dequant_class_holds_both_the_sugar_and_a_marked_defn() {
         use fusor2_ir::ir::Op;
@@ -467,16 +538,19 @@ mod tests {
         assert!(members >= 2, "expected sugar + defn, got {members}");
         assert_eq!((sugars, defns), (1, 1));
 
-        // The same shape at `Native` wherever the block stride tiles the word
-        // stream: the f16 scales decode through `f16_lane`.
+        // ... and the same shape at `Native`, wherever the block stride tiles
+        // the word stream: the f16 scales decode through `f16_lane`, so this
+        // class holds a real alternative to the block program rather than the
+        // bare sugar it used to.
         let (q4k, _) = matrix(&g, QFmt::Q4K, QLayout::Native);
         let (members, sugars, defns) = shape(&q4k);
         assert!(members >= 2, "expected sugar + defn, got {members}");
         assert_eq!((sugars, defns), (1, 1));
 
         // Q8_0's native block is 34 bytes, so it does not tile the `u32` word
-        // stream a `Restride` reads and the class is the bare sugar. Q4K/Q5K
-        // native are word-aligned and do get a defn.
+        // stream a `Restride` reads: the class is the bare sugar and there is
+        // nothing to force. (Q4K/Q5K native *are* word-aligned and do get a
+        // defn — the layout is not what decides this.)
         let (native, _) = matrix(&g, QFmt::Q8_0, QLayout::Native);
         assert!(native.dequantize_slow().is_err());
         let bare = native.dequantize().unwrap();
@@ -488,8 +562,10 @@ mod tests {
             .unwrap();
     }
 
-    /// The gradient stops at the quantized leaf: the `Union`'s adjoint routes
-    /// to operand 0, the lower id, which is the sugar carrying the refusal.
+    /// The gradient still stops at the quantized leaf. The `Union`'s adjoint
+    /// routes to operand 0, which is the lower id, which is the sugar — the
+    /// one node carrying the refusal. Build the `defn` first and this silently
+    /// becomes a gradient into a `Map` over `U32` leaves.
     #[test]
     fn a_dequantize_with_a_defn_still_refuses_a_gradient() {
         let g = graph();
@@ -501,7 +577,7 @@ mod tests {
     #[test]
     fn the_two_layouts_of_one_matrix_decode_identically() {
         // Layout is a priced operand attribute, not a format variant, so a
-        // repack moves no decoded value.
+        // repack must not move a single decoded value.
         let g = graph();
         for fmt in QFmt::ALL {
             let (native, _) = rows(fmt, QLayout::Native);
@@ -603,6 +679,81 @@ mod tests {
             .leaf("c", &[Dim::Const(2), Dim::Const(k + 32)], Dtype::F32)
             .unwrap();
         assert!(qm.q_mat_mul(&bad).is_err());
+    }
+
+    #[test]
+    fn q_mat_mul_offers_the_word_aligned_twin_exactly_once() {
+        // Q6K's native block is 210 bytes — not a whole number of words — so
+        // `contract_2d` unions a third spelling over the `F32Scales` twin
+        // (`qrepack`'s consuming half). The twin is a *separate leaf*, minted
+        // at most once per source, holding exactly the repacked bytes; an
+        // aligned format (Q4K, 144 B) never mints one — its twin would be the
+        // same addressing arithmetic plus two dead bytes per block.
+        let g = graph();
+        let fmt = QFmt::Q6K;
+        let k = u64::from(fmt.block_elements());
+        let (bytes, _) = rows(fmt, QLayout::Native);
+        let qm = QMatrix::from_raw_bytes(
+            &g,
+            fmt,
+            QLayout::Native,
+            [Dim::Const(ROWS), Dim::Const(k)],
+            &bytes,
+        )
+        .unwrap();
+        let act = g
+            .leaf("a", &[Dim::Const(2), Dim::Const(k)], Dtype::F32)
+            .unwrap();
+        let y = qm.q_mat_mul(&act).unwrap();
+
+        let src = qm.tensor.id();
+        let twin = g
+            .handle()
+            .repacked_leaf_of(src)
+            .unwrap()
+            .expect("a misaligned native block mints a twin");
+        assert_eq!(
+            g.handle().repacked_leaf_of(src).unwrap(),
+            Some(twin),
+            "the twin is memoized, not re-minted"
+        );
+        let mut want = Vec::new();
+        repack::repack(fmt, QLayout::Native, QLayout::F32Scales, &bytes, &mut want).unwrap();
+        assert_eq!(
+            g.handle().leaf_bytes(twin).unwrap(),
+            want,
+            "twin bytes are exactly the Native -> F32Scales repack"
+        );
+        // The twin spelling is a member of the matmul's value class: a
+        // `Contract` whose weight side reads the twin leaf.
+        let unioned = g
+            .handle()
+            .with_egraph(|eg| {
+                let class = eg.class_of(y.id());
+                let twin_class = eg.class_of(twin);
+                Ok(eg.class_ids(class).into_iter().any(|m| match &eg.node(m).op {
+                    fusor2_ir::ir::Op::L0(L0::Contract { b, .. }) => {
+                        eg.class_of(*b) == twin_class
+                    }
+                    _ => false,
+                }))
+            })
+            .unwrap();
+        assert!(unioned, "the contraction over the twin joins the class");
+
+        // Aligned native blocks stay single-spelled.
+        let fmt = QFmt::Q4K;
+        let k = u64::from(fmt.block_elements());
+        let (bytes, _) = rows(fmt, QLayout::Native);
+        let qm = QMatrix::from_raw_bytes(
+            &g,
+            fmt,
+            QLayout::Native,
+            [Dim::Const(ROWS), Dim::Const(k)],
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(g.handle().repacked_leaf_of(qm.tensor.id()).unwrap(), None);
     }
 
     /// `u32` indices as a leaf.

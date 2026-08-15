@@ -1,11 +1,13 @@
-//! Shared contracts for the other fusor2 crates: three IR levels (L0
-//! `tensor`, L1 `nest`, L2 `tile`), an acyclic append-only e-graph spanning
-//! L0/L1, a scalar picosecond cost model, and extraction. Each type here is a
-//! description or a contract a downstream crate implements.
+//! `fusor2-ir` — the shared contracts every other fusor2 crate is written
+//! against. Three levels (L0 `tensor`, L1 `nest`, L2 `tile`), one acyclic
+//! append-only e-graph spanning L0/L1, one scalar picosecond cost model, one
+//! extraction. Almost nothing here decides anything: every type is either a
+//! *description* or a *contract* a downstream crate implements.
 //!
-//! Total inference and verification for the closed `L0`/`L1` enums, plus the
-//! shared rewrite-rule set and its saturation driver, live in [`semantics`],
-//! [`verify_l0`], [`verify_l1`], [`saturate`] and [`rules`].
+//! The two things only the IR can own — total inference/verification for the
+//! closed `L0`/`L1` enums, and the shared rewrite-rule set with its saturation
+//! driver — live in [`semantics`], [`verify_l0`], [`verify_l1`], [`saturate`]
+//! and [`rules`].
 
 pub mod error;
 

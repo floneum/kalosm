@@ -2,7 +2,11 @@
 //!
 //! Every area file returns [`Cases`]; every case runs on **every** session in
 //! [`crate::harness::sessions`], so nothing in the suite mentions a concrete
-//! backend. The shared case shapes live in [`support`] below.
+//! backend. The shared case shapes live in [`support`] below rather than in a
+//! new file, because a new file means a new `pub mod` line in a module list
+//! other agents may also be editing.
+//!
+//! Owned by W14.
 
 pub mod attention_rope;
 pub mod backward;
@@ -50,10 +54,13 @@ pub fn registry() -> Cases {
 /// The registry as a function pointer, which is what `lib.rs` re-exports.
 pub const REGISTRY: fn() -> Cases = registry;
 
+// ---------------------------------------------------------------------------
+
 /// Shared case shapes. Every area file is a table over these.
 pub mod support {
     use fusor2::graph::GraphRef;
-    use fusor2::{Dim, Dtype, Graph, Session, Tensor};
+    use fusor2::{Dim, Dtype, Graph, Session, };
+use fusor2::tensor::Dyn as Tensor;
 
     use crate::compare::{
         self, assert_gradient_matches_finite_difference, finite_difference_gradient,
@@ -135,7 +142,7 @@ pub mod support {
             "cpu"
         };
         let shape: Vec<usize> = shape.iter().map(|n| *n as usize).collect();
-        compare::compare_for(dtype, backend, &shape, expected, actual)?;
+        compare::compare_for(dtype)(backend, &shape, expected, actual)?;
         Ok(())
     }
 
@@ -315,16 +322,9 @@ pub mod support {
         })
     }
 
-    /// A case that checks only a forward, for ops whose adjoint is covered by
-    /// a different case in the same area.
-    pub fn forward_case(
-        area: &'static str,
-        name: &'static str,
-        body: impl Fn(&Session) -> CaseResult + Send + Sync + 'static,
-    ) -> Case {
-        Case::new(area, name, body)
-    }
 }
+
+// ---------------------------------------------------------------------------
 
 /// The structural half of a generality case: saturate the graph the **real
 /// frontend** emits, extract a plan from it, and read both.
@@ -334,8 +334,8 @@ pub mod support {
 /// file:
 ///
 /// * **did the law fire** — [`Probe::fired`], on `report.fired`. A rule that
-///   silently stops matching the frontend's chain leaves a whole kernel family
-///   unreachable while every numeric case still passes;
+///   silently stops matching the frontend's chain is how flash attention was
+///   unreachable on both backends for a week while every numeric case passed;
 /// * **did the law decline** — the same reading, negated. The `STRICT` half of
 ///   the acceptance list is a *decline* assert, and asserting only that a law
 ///   fires somewhere else does not cover it;
@@ -351,7 +351,8 @@ pub mod support {
 /// A probe is never built from a hand-written graph: the caller passes the
 /// tensors a frontend call returned.
 pub mod probe {
-    use fusor2::{Session, Tensor};
+    use fusor2::{Session, };
+use fusor2::tensor::Dyn as Tensor;
     use fusor2_ir::egraph::{Id, Saturate, SaturationBudget, SaturationReport};
     use fusor2_ir::extract::{ExtractBudget, Extractor, Plan};
     use fusor2_ir::ir::level1::SchedPoint;
@@ -368,7 +369,7 @@ pub mod probe {
     /// Saturate and extract the graph `outs` were built in.
     ///
     /// The pipeline is exactly `Session::resolve`'s: the session's own rule
-    /// table, the session's own caps, the same `Driver` and the same
+    /// table, the session's own caps, the shipped `Driver` and the shipped
     /// `LocalSearch`. Anything else would prove a claim about a pipeline
     /// nothing runs.
     pub fn probe(session: &Session, outs: &[Tensor]) -> Result<Probe, CaseError> {
@@ -478,19 +479,6 @@ pub mod probe {
             .into())
         }
 
-        /// Whether the plan allocates a buffer of exactly this many elements.
-        ///
-        /// This is the materialization bit, read on the plan's own buffer list
-        /// rather than on a byte total: an intermediate the extractor inlined
-        /// has no buffer at all, and one it materialized has a buffer whose
-        /// element count is the intermediate's shape.
-        pub fn materializes_elements(&self, elements: u64) -> bool {
-            self.plan
-                .buffers
-                .iter()
-                .any(|b| b.elements.as_const() == Some(elements))
-        }
-
         /// Total bytes the plan allocates.
         pub fn buffer_bytes(&self) -> u64 {
             self.plan
@@ -551,7 +539,7 @@ mod tests {
         assert_eq!(
             before,
             names.len(),
-            "a case name is registered twice; a name filter would run both"
+            "a case name is registered twice; `run_case` would run both"
         );
     }
 

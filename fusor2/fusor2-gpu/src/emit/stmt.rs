@@ -1,5 +1,7 @@
 //! L2 statements -> naga blocks. `Barrier` becomes `controlBarrier`;
 //! `AtomicAdd` becomes `atomicAdd`, or a bitcast compare-exchange loop on f32.
+//!
+//! Owned by W8.
 
 use fusor2_ir::ir::level2::{
     Accumulator, Addr, ElementType, ScalarElement, Source, Stmt, StorageView, Tile, TileExpr,
@@ -27,8 +29,9 @@ impl Emitter<'_> {
 
     /// Emit one statement, then retire the memoized reads it invalidated.
     ///
-    /// The invalidation runs after the body so the statement's own operands
-    /// still see the memo state they were built against.
+    /// The invalidation runs *after* the body so the statement's own operands
+    /// still see the memo state they were built against — a store reads its
+    /// value expression before it writes anything.
     pub fn stmt(&mut self, stmt: &Stmt, out: &mut Block) -> Result<(), EmitError> {
         let result = self.stmt_inner(stmt, out);
         let written = stmt.writes();
@@ -146,8 +149,9 @@ impl Emitter<'_> {
                 );
                 Ok(())
             }
-            // One lane with a hardware operator takes the scalar expression
-            // path, emitting `subgroupAdd` or the shared-memory tree.
+            // The N-ary reduction. One lane with a hardware operator takes the
+            // *existing* expression path, so a single-slot fold that reaches
+            // here emits `subgroupAdd` / the shared-memory tree unchanged.
             Stmt::Reduce {
                 kind,
                 values,
@@ -186,6 +190,8 @@ impl Emitter<'_> {
         }
     }
 
+    // ---- stores ---------------------------------------------------------
+
     fn store(
         &mut self,
         out: &mut Block,
@@ -195,7 +201,7 @@ impl Emitter<'_> {
         mask: &TileExpr,
     ) -> Result<(), EmitError> {
         // A store closes a value scope: nothing computed for the previous
-        // store may be reused, since the next may run under a different
+        // store may be reused, because the next one may run under a different
         // predicate.
         let v = self.expr(value, out)?;
         if mask.is_constant_true() {
@@ -238,8 +244,10 @@ impl Emitter<'_> {
         Ok(())
     }
 
-    /// `AtomicAdd`. U32/I32 are one `atomicAdd`; f32 is a bitcast
-    /// compare-exchange loop, so `caps.atomic_f32` holds on every GPU backend.
+    /// `AtomicAdd`. U32/I32 are one `atomicAdd`; **f32 is a bitcast
+    /// compare-exchange loop**, which is why `caps.atomic_f32` is true on every
+    /// GPU backend and what makes `ScatterMode::Atomic` a live candidate for
+    /// the embedding gradient.
     fn atomic_add(
         &mut self,
         out: &mut Block,
@@ -353,6 +361,8 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    // ---- loops ----------------------------------------------------------
+
     /// A counted loop with SSA-carried accumulators: each accumulator local is
     /// initialised in the surrounding scope, updated at the end of every
     /// iteration, and readable after the loop.
@@ -364,8 +374,12 @@ impl Emitter<'_> {
         accumulators: &[Accumulator],
         body: &[Stmt],
     ) -> Result<(), EmitError> {
-        // Every accumulator is read at the value it had entering the step:
-        // all updates are evaluated first, then all are stored.
+        // **Every accumulator is read at the value it had entering the step,
+        // then all are written.** A loop carrying `(n, mean, m2)` has `mean`'s
+        // update read `n`; writing `n` first makes it read the *new* count, so
+        // the mean drifts and the variance comes back about half right — which
+        // is the worst kind of wrong. One accumulator is unaffected: evaluate,
+        // then store, in that order, exactly as before.
         let inits: Vec<Handle<Expression>> = accumulators
             .iter()
             .map(|acc| self.expr(&acc.init, out))
@@ -466,10 +480,13 @@ impl Emitter<'_> {
         Ok(())
     }
 
-    /// `FillTile` is collective: the emitter selects its vectorized and
-    /// guard-free variants here. Lane enumeration order comes from
-    /// [`fusor2_ir::shape::MultiFlattenMap::axis_unit_run`], so lanes advance
-    /// along the axis with unit-stride runs.
+    // ---- collective tile fill -------------------------------------------
+
+    /// `FillTile` is collective, not sugar: it is the only form whose
+    /// vectorized and guard-free variants the emitter can select. Lane
+    /// enumeration order comes from
+    /// [`fusor2_ir::shape::MultiFlattenMap::axis_unit_run`] — lanes advance
+    /// along the axis whose unit-stride runs they can actually follow.
     fn fill_tile(
         &mut self,
         out: &mut Block,
@@ -544,7 +561,10 @@ impl Emitter<'_> {
             }
             // A block-quantized operand never reaches the collective fill:
             // `stage_operand_tile` stages it one lane at a time as a
-            // `Load` + `StoreTile`, since `pre` runs per element.
+            // `Load` + `StoreTile`, because `pre` has to run per element on
+            // the way in. Verified by probe at a shape that does select
+            // `Family::Coop` for a quantized operand (m=n=256, k=256): the
+            // arm this replaces was never entered.
             Source::Quantized(_) => Err(EmitError::Unsupported(
                 "FillTile's source must be dense storage: a quantized operand \
                  stages through per-lane Load + StoreTile"
@@ -700,8 +720,8 @@ impl Emitter<'_> {
         acc
     }
 
-    /// Store `load(..)` into the tile, or zero when out of bounds, so a partial
-    /// M/N/K tail is safe for an MMA.
+    /// Store `load(..)` into the tile, or zero when out of bounds. Edge tiles
+    /// stay garbage-free so a partial M/N/K tail is safe for an MMA.
     fn guarded_tile_store(
         &mut self,
         out: &mut Block,
@@ -784,7 +804,8 @@ mod tests {
         }
     }
 
-    /// The f32 compare-exchange loop accumulates, and duplicate indices sum.
+    /// Test 10 — the f32 compare-exchange loop accumulates, and duplicate
+    /// indices sum rather than racing to a last write.
     #[test]
     fn atomic_add_f32_cas_accumulates() {
         let ir = atomic_kernel(256, 4, 1, lit_u32(0), lit_f32(1.0));
@@ -810,7 +831,8 @@ mod tests {
         let out = f32s(&run(&gpu, &ir, &no_plan(), &inputs, 1));
         assert_eq!(out[0], 1024.0);
 
-        // A duplicated index in a two-lane scatter yields the sum.
+        // A duplicated index in a two-lane scatter yields the sum, not the
+        // last write.
         let value = TileExpr::new(
             TileExprKind::Cast {
                 value: TileExpr::new(
@@ -962,9 +984,15 @@ mod tests {
     }
 
     /// Re-reading one tile at one index after a barrier and an intervening
-    /// write is a different value, which the hash-cons memo must not answer
-    /// with the first read. The two `LoadTile(t, lane)` trees are structurally
-    /// equal, so only `Stmt::writes`-driven memo invalidation separates them.
+    /// write is a *different* value, and the hash-cons memo must not answer
+    /// it with the first read.
+    ///
+    /// The two `LoadTile(t, lane)` trees here are structurally equal, which
+    /// is the whole point: before `Stmt::writes` drove memo invalidation the
+    /// second one resolved to the first one's SSA handle and the second half
+    /// of the output came back holding the first half's values. Any lowering
+    /// that stages a tile, barriers, consumes it, and stages it again — every
+    /// blocked contraction — sits on this path.
     #[test]
     fn a_tile_reread_after_a_barrier_is_not_the_first_read() {
         let uni = testkit::buffer(0, u32e(), 4, false);

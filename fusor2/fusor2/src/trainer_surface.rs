@@ -13,20 +13,11 @@
 //! rank-generic helpers, the same operator expressions — and a regression is a
 //! compile error in this crate rather than in a downstream build nobody runs.
 //!
-//! The second names the crate **root**, and the root is the one thing
-//! `typed-api` switches (see the crate docs). So the imports below take the
-//! root when the feature is on — which type-checks the re-export the trainer
-//! actually resolves through, not merely the items behind it — and take the
-//! same items through [`crate::root::typed`] when it is off, so the bodies are
-//! still compiled by a default `cargo test --workspace`. The first `use` line
-//! is unconditional: `autograd` is a module path and no feature moves it.
-//!
-//! Two commands cover this file, and they cover different things:
-//!
-//! * `cargo test -p fusor2` — every body, every turbofish, through module
-//!   paths.
-//! * `cargo test -p fusor2 --features typed-api --lib` — the same, plus the
-//!   crate-root re-export. This is the configuration `betlang-train` builds.
+//! The second line names the crate **root**, and the root is now one naming
+//! rather than two: `Tensor` is the const-rank tensor and `Device` the device
+//! that builds it, with no feature to switch. So these imports are the
+//! trainer's, verbatim, with `fusor` spelled as `crate`, and one
+//! `cargo test -p fusor2` covers them.
 //!
 //! Functions named `_compiles` are never called. They exist to be type-checked.
 
@@ -36,15 +27,7 @@ use crate::autograd::{BackwardTarget, Graph, Tensor};
 
 // Byte-identical to the trainer's second `use` line, with `fusor` spelled as
 // `crate`.
-#[cfg(feature = "typed-api")]
 use crate::{Device, Tensor as RawTensor, ToVec, cat};
-
-// The same four items when the root is the runtime-rank pair. `ToVec` is not
-// one of the two names the feature switches, so it keeps the root spelling.
-#[cfg(not(feature = "typed-api"))]
-use crate::ToVec;
-#[cfg(not(feature = "typed-api"))]
-use crate::root::typed::{Device, Tensor as RawTensor, cat};
 
 /// The trainer's architecture constants, at the sizes that matter for typing.
 const EMBED: usize = 24;
@@ -52,7 +35,9 @@ const HASH_COUNT: usize = 3;
 const POOLED: usize = 256;
 const CLASSES: usize = 48;
 
+// ---------------------------------------------------------------------------
 // model.rs
+// ---------------------------------------------------------------------------
 
 struct Params {
     flat: RawTensor<1, f32>,
@@ -141,11 +126,11 @@ impl Model {
         let pooled = Tensor::cat(vec![x.max::<2>(2), x.mean::<2>(2)], 1);
         debug_assert_eq!(pooled.shape(), [rows, POOLED]);
         let hidden = pooled
-            .mat_mul(&self.weight::<2>(7))
+            .matmul(&self.weight::<2>(7))
             .add_::<1, 2>(&self.weight::<1>(8))
             .gelu();
         hidden
-            .mat_mul(&self.weight::<2>(9))
+            .matmul(&self.weight::<2>(9))
             .add_::<1, 2>(&self.weight::<1>(10))
     }
 }
@@ -194,8 +179,8 @@ fn fake_quant_compiles(graph: &Graph, leaf: &Tensor<1>, ternary: bool) -> Tensor
         let nonzero_sum = magnitude.gt_scalar(0.0).sum::<0>(0);
         let nonzero = nonzero_sum.reshape([1]);
         let scale = total
-            .div_::<1, 1, _>(&nonzero.max_elementwise(1.0).into_concrete())
-            .max_elementwise(1e-6)
+            .div_::<1, 1, _>(&nonzero.max_scalar(1.0).into_concrete())
+            .max_scalar(1e-6)
             .into_concrete();
         let normalized = weight.div_::<1, 1, _>(&scale).into_concrete();
         let ternary = normalized.gte_scalar(0.7) - normalized.lte_scalar(-0.7);
@@ -205,7 +190,7 @@ fn fake_quant_compiles(graph: &Graph, leaf: &Tensor<1>, ternary: bool) -> Tensor
             .abs()
             .max::<0>(0)
             .reshape([1])
-            .max_elementwise(1e-6)
+            .max_scalar(1e-6)
             .div_scalar(7.0)
             .into_concrete();
         let normalized = weight.div_::<1, 1, _>(&scale).into_concrete();
@@ -268,7 +253,9 @@ fn hashed_embedding_compiles(
     })
 }
 
+// ---------------------------------------------------------------------------
 // main.rs
+// ---------------------------------------------------------------------------
 
 /// The folded distillation loss, written as one node with an analytic
 /// backward.
@@ -387,7 +374,9 @@ fn profile_compiles(device: &Device) {
     }
 }
 
+// ---------------------------------------------------------------------------
 // optim.rs
+// ---------------------------------------------------------------------------
 
 fn adamw_step_compiles(
     device: &Device,
@@ -417,7 +406,7 @@ fn adamw_step_compiles(
                 .sum::<0>(0)
                 .reshape([1])
                 .sqrt()
-                .max_elementwise(clip_norm)
+                .max_scalar(clip_norm)
                 .into_concrete();
             gradient
                 .mul_::<1, 1, _>(&clip.div_::<1, 1, _>(&norm).into_concrete())
@@ -436,7 +425,9 @@ fn adamw_step_compiles(
     params.flat = (decayed - update).into_concrete();
 }
 
+// ---------------------------------------------------------------------------
 // Spellings the brief enumerates that the bodies above do not reach
+// ---------------------------------------------------------------------------
 
 fn remaining_spellings_compile(device: &Device) {
     let a = RawTensor::<2, f32>::zeros(device, [2, 3]);
@@ -452,7 +443,7 @@ fn remaining_spellings_compile(device: &Device) {
     let graph = Graph::new();
     let t: Tensor<2> = Tensor::constant_from_raw(&graph, a.clone());
     let _: Tensor<2> = t.clamp(-1.0, 1.0);
-    let _: Tensor<2> = t.max_elementwise(0.0);
+    let _: Tensor<2> = t.max_scalar(0.0);
     let _: Tensor<2> = t.lte_scalar(0.5);
     let _: Tensor<2> = t.gte_scalar(0.5);
     let _: Tensor<2> = t.index_select(0, &idx);
@@ -471,32 +462,32 @@ fn remaining_spellings_compile(device: &Device) {
 mod tests {
     use super::*;
 
-    /// The one claim this file cannot type-check: that `lib.rs` still
-    /// *performs* the `typed-api` re-export. Under default features that arm
-    /// is `cfg`-ed out, so no expression can reach it — deleting the two lines
-    /// would leave every test here green while `betlang-train` stopped
-    /// resolving `use fusor::{Device, Tensor as RawTensor, cat}`.
+    /// The root re-exports the trainer resolves against are now
+    /// unconditional, so the `use crate::{Device, Tensor as RawTensor, ToVec,
+    /// cat};` line at the top of this file *is* the check: delete either
+    /// re-export from `lib.rs` and this module stops compiling. Nothing is
+    /// left for a source-text pin to add — the previous one existed only
+    /// because the const-rank root sat behind a `cfg` no default build could
+    /// reach.
     ///
-    /// This is a source-text pin and is deliberately the weakest check in the
-    /// file; it catches deletion, not breakage. The strong check is
-    /// `cargo test -p fusor2 --features typed-api --lib`, which resolves the
-    /// same names for real. The items themselves are already covered under
-    /// both configurations by `crate::root`.
+    /// What a text pin still buys: that the root exports live in `lib.rs`
+    /// rather than having migrated behind a feature again.
     #[test]
-    fn lib_rs_still_re_exports_the_const_rank_root() {
+    fn the_root_names_the_const_rank_tensor_unconditionally() {
         let src = include_str!("lib.rs");
-        for line in [
-            "#[cfg(feature = \"typed-api\")]",
-            "pub use root::typed::{Device, Tensor, cat, stack};",
-        ] {
-            assert!(
-                src.contains(line),
-                "lib.rs no longer contains `{line}`. betlang-train resolves \
-                 `use fusor::{{Device, Tensor as RawTensor, ToVec, cat}}` \
-                 through that re-export; without it the trainer stops \
-                 compiling and nothing else in this crate notices."
-            );
-        }
+        assert!(
+            !src.contains("cfg(feature"),
+            "lib.rs gained a cfg. The crate root is one naming; a feature that \
+             swaps what `Tensor` or `Device` means is what this crate just \
+             removed."
+        );
+        assert!(
+            src.contains("pub use device::Device;")
+                && src.contains("pub use tensor::typed::{Axis, Element, Minus1, Minus2, Tensor, cat, stack};"),
+            "lib.rs no longer re-exports the const-rank root. betlang-train \
+             resolves `use fusor::{{Device, Tensor as RawTensor, ToVec, cat}}` \
+             through it."
+        );
     }
 
     /// The two `use` lines the trainer opens with, and the constructors they
@@ -562,6 +553,7 @@ mod tests {
         assert_eq!(row, [3.0, 4.0]);
     }
 
+    // -----------------------------------------------------------------------
     // The mixed-precision half of the surface
     //
     // Everything above compiles the trainer's spellings. These *run* them, and
@@ -571,7 +563,8 @@ mod tests {
     // cannot see: `crate::Tensor`'s folds and contractions accumulate in
     // `Dtype::compute_dtype`, so they *return* f32 for an f16 operand and
     // leave the narrowing cast to the caller. The const-rank facade is that
-    // caller.
+    // caller. Before it wrote the cast, every one of these panicked.
+    // -----------------------------------------------------------------------
 
     /// Every rank-reducing fold, every keepdim fold and both contractions,
     /// on an f16 operand: the result is f16, and it is the right f16.
@@ -662,18 +655,22 @@ mod tests {
         let a = RawTensor::<1, f32>::from_slice(&device, [2], &[1.0, 2.0]);
         // The value is f32; asserting it is f16 is a bug in the model, and
         // `f32 -> f16` is not the promotion `narrow` undoes.
-        let _: RawTensor<1, half::f16> = RawTensor::new(a.into_inner());
+        let _: RawTensor<1, half::f16> = RawTensor::from_dyn(a.into_inner());
     }
 
     /// The trainer's own `conv_stack_f16` — the literal function mirrored
     /// from `model.rs`, not a paraphrase — run on real values.
     ///
     /// Its `pool` is `reshape(..).max::<3>(3)` on a `Tensor<3, half::f16>`,
-    /// the narrowing fold path. The f32 stack over the same numbers is the
-    /// reference.
+    /// which is the fold that used to panic. The f32 stack over the same
+    /// numbers is the reference.
     ///
     /// The backward is taken too, by
     /// [`a_backward_through_the_f16_convolution_stack_reaches_the_weights`].
+    /// It used to be unreachable: `extremum_adjoint` declared both comparison
+    /// args at the operand dtype while the broadcast fold output is at
+    /// `compute_dtype`, so an f16 max reported `Map body reads Arg(1) as F16
+    /// but the operand is F32`. Fixed in `fusor2-autograd`.
     #[test]
     fn the_trainers_f16_convolution_stack_computes() {
         let _serial = crate::device::test_device_lock();
@@ -755,7 +752,7 @@ mod tests {
     /// `betlang-train --f16`, the whole of it: the trainer's own
     /// `conv_stack_f16` forward *and* the backward through it, landing on the
     /// f32 masters. The pool is `reshape(..).max::<3>(3)` on an f16 operand,
-    /// so this exercises the `Max` adjoint at a narrowed accumulator.
+    /// so this is the `Max` fold whose adjoint used to be unbuildable.
     ///
     /// The f32 stack over the same numbers is the reference. Gradients are
     /// compared with a wide band — three convolutions and three gelus in f16,
@@ -884,7 +881,7 @@ mod tests {
         let w = graph.leaf(RawTensor::<1, f32>::from_slice(&device, [12], &[0.25; 12]));
         let b = graph.leaf(RawTensor::<1, f32>::from_slice(&device, [3], &[1.0, 2.0, 3.0]));
         // (1,4) @ (4,3) = 0.25 * 21 = 5.25, + bias.
-        let hidden = pooled.mat_mul(&w.reshape([4, 3])).add_::<1, 2>(&b.reshape([3]));
+        let hidden = pooled.matmul(&w.reshape([4, 3])).add_::<1, 2>(&b.reshape([3]));
         assert_eq!(hidden.shape(), [1, 3]);
         assert_eq!(hidden.raw().to_flat(), vec![6.25, 7.25, 8.25]);
 

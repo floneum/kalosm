@@ -1,11 +1,18 @@
 //! L2 statements -> the loop nest.
 //!
-//! A barrier must cut the lane loop, or lane-chunk 0 reads tile slots
-//! lane-chunk 31 has not written yet. [`block`] cuts a statement list holding
-//! a barrier at any depth into consecutive [`LaneLoop`]s, pushing the lane
-//! loop into each piece; a list with no barrier becomes one lane loop over the
-//! whole lane range. A barrier inside a uniform `If`/`Loop` splits that body's
-//! list, with the lane loops nested inside it.
+//! **`Barrier` splits the lane loop into two loops over the lane range.**
+//! Mapping it to a no-op miscompiles every workgroup-staged kernel —
+//! `Reduce{WgTree}`, packed-B GEMM tiles, and the flash-attention staging step
+//! — because iteration 0 would read tile slots iteration 31 has not written.
+//!
+//! The split is done here, after statement compilation, by
+//! [`block`]: a statement list containing a barrier at any depth is cut into
+//! consecutive [`LaneLoop`]s and the lane loop is pushed *into* each piece; a
+//! list containing none is wrapped in exactly one lane loop over the whole
+//! lane range. A barrier inside a uniform `If`/`Loop` splits that body's list,
+//! with the lane loops nested inside the `If`/`Loop`.
+//!
+//! Owned by W10.
 
 use fusor2_ir::ir::level2::{ScalarElement, TileReduceOp};
 use fusor2_ir::target::EmitError;
@@ -39,7 +46,8 @@ pub enum CStmt {
         value: Slot,
         mask: Slot,
     },
-    /// An atomic-carrying program runs on a single worker, so the add is an
+    /// Per-thread accumulation is guaranteed by running an atomic-carrying
+    /// program on one worker (see [`crate::launch`]); the add itself is an
     /// ordinary read-modify-write.
     AtomicAdd {
         prep: TapeRange,
@@ -111,13 +119,14 @@ pub enum CStmt {
         iterations: u32,
         index: u16,
     },
-    /// The n-ary cross-lane reduction: one scratch tile per accumulator lane,
-    /// staged per lane chunk, then a log-tree over each group applying `merge`
-    /// at every level and broadcasting the group result back.
+    /// The **N-ary** cross-lane reduction: one scratch tile per accumulator
+    /// lane, staged per lane chunk, then a log-tree over each group applying
+    /// `merge` at every level and broadcasting the group result back.
     ///
     /// `merge` is a tape range evaluated once per tree step with `lhs`/`rhs`
-    /// holding the two partials, `W` pairs at a time. `fast` is the
-    /// single-lane hardware operator, which skips the tape.
+    /// holding the two partials — `W` independent pairs at a time, since a merge
+    /// reads only its formals and therefore vectorizes across pairs. `fast` is
+    /// the single-lane hardware operator, which skips the tape entirely.
     CarrierTree {
         prep: TapeRange,
         tiles: Vec<u16>,
@@ -166,17 +175,17 @@ pub struct LaneLoop {
 /// Partition a compiled statement list at every barrier, pushing the lane loop
 /// into each piece.
 ///
-/// A list with no barrier at any depth yields exactly one [`LaneLoop`].
+/// A list with no barrier at any depth yields exactly one [`LaneLoop`]. This
+/// returning a *vector* is not incidental: it is the barrier split.
 pub fn block(body: &[CStmt], lanes: u32, width: u32) -> Result<Vec<LaneLoop>, EmitError> {
     let mut out: Vec<LaneLoop> = Vec::new();
     let mut run: Vec<CStmt> = Vec::new();
-    // A barrier-free run is wrapped in its `CStmt::Lanes` once, here.
     let flush = |run: &mut Vec<CStmt>, out: &mut Vec<LaneLoop>| {
         if !run.is_empty() {
             out.push(LaneLoop {
                 lanes,
                 width,
-                stmts: vec![CStmt::Lanes(std::mem::take(run))],
+                stmts: std::mem::take(run),
             });
         }
     };
@@ -196,8 +205,9 @@ pub fn block(body: &[CStmt], lanes: u32, width: u32) -> Result<Vec<LaneLoop>, Em
                 reject,
             } => {
                 if !*uniform {
-                    // `verify_uniformity` admits a barrier only under a
-                    // uniform predicate.
+                    // `verify_uniformity` guarantees a barrier only appears
+                    // under a uniform predicate; reaching here means the L2
+                    // verifier was skipped.
                     return Err(EmitError::Validation(
                         "barrier under a divergent `If`".into(),
                     ));
@@ -245,7 +255,8 @@ pub fn block(body: &[CStmt], lanes: u32, width: u32) -> Result<Vec<LaneLoop>, Em
 }
 
 /// Recursively split a nested body, wrapping each barrier-free run in a
-/// [`CStmt::Lanes`], so the lane loop sits inside the control flow.
+/// [`CStmt::Lanes`] so the runner re-enters the lane loop inside the control
+/// flow rather than around it.
 fn nest(body: &[CStmt], lanes: u32, width: u32) -> Result<Vec<CStmt>, EmitError> {
     if !body.iter().any(CStmt::is_collective) {
         return Ok(vec![CStmt::Lanes(body.to_vec())]);
@@ -276,10 +287,7 @@ mod tests {
         let b = vec![dummy_store(), dummy_store()];
         let loops = block(&b, 256, 8).unwrap();
         assert_eq!(loops.len(), 1);
-        match &loops[0].stmts[..] {
-            [CStmt::Lanes(inner)] => assert_eq!(inner.len(), 2),
-            other => panic!("expected one pre-wrapped lane region, got {other:?}"),
-        }
+        assert_eq!(loops[0].stmts.len(), 2);
     }
 
     #[test]

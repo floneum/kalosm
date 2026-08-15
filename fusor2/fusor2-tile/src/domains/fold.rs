@@ -1,14 +1,23 @@
 //! The reduction schedule domain. Workgroup width, lane-group width and
-//! staging depth are *coupled*, so they are one enumeration scored together
-//! rather than three formulas applied in sequence.
+//! staging depth are *coupled* — the reference's staging gate is
+//! `k.div_ceil(k_group) <= work_per_thread`, a function of the lane group
+//! the two earlier greedy formulas already fixed — so they are one
+//! enumeration scored together rather than three formulas applied in
+//! sequence.
+//!
+//! Replaces `static_axis_block` (row_program.rs:895), `lane_group_width`
+//! (:916) and the register-staging gate (:1902).
+//!
+//! Owned by W4.
 
+use fusor2_ir::device::Caps;
 use fusor2_ir::ir::level1::{FoldDomain, FoldStrat};
 use fusor2_ir::shape::Dim;
 use smallvec::SmallVec;
 
 use crate::domains::{DomainCtx, fold_order};
 
-/// Workgroup widths worth generating.
+/// Workgroup widths worth generating, in the reference's own band.
 const BLOCK_CHOICES: [u32; 4] = [32, 64, 128, 256];
 
 /// How many strategies survive. Bounds the move frontier; the cap keeps the
@@ -25,24 +34,33 @@ pub const MAX_BLOCKS: usize = 4;
 /// inner extent stops covering one SIMD register on either backend.
 const MIN_INNER: u64 = 8;
 
-/// The widest split count generated, bounded by the `StrideSpec::multiplier`
-/// band.
+/// The widest split count generated, matching the `StrideSpec::multiplier`
+/// band the shipped blocking search already worked in.
 const MAX_SPLIT: u64 = 64;
 
 /// The workgroup width both emitters actually allocate scratch over — **the
 /// single source of it**.
 ///
-/// Defined in `fusor2-ir` beside [`FoldStrat`] so `verify_l1` admits a
-/// strategy against the same number this domain filters on and the emitters
-/// allocate. Re-exported here so both lowerings and this generator name one
-/// function.
+/// The definition moved to `fusor2-ir` beside [`FoldStrat`] itself, because
+/// `verify_l1` must admit a strategy against the same number this domain
+/// filters on and the emitters allocate. Re-exported here so every existing
+/// call site — both lowerings and this generator — still names one function.
 pub use fusor2_ir::ir::level1::{emitted_block, fold_scratch_bytes};
+
+/// Compatibility entry point kept for the scaffold's `domains::fold_legal`
+/// re-export. `rows` prices the domain; it never filters it.
+pub fn legal(axis_extent: Dim, rows: Dim, caps: &Caps) -> FoldDomain {
+    let _ = rows;
+    let cx = DomainCtx::new(caps, crate::domains::default_planner());
+    fold_domain(axis_extent, &cx)
+}
 
 /// Every legal reduction strategy for an axis of extent `k` on this device,
 /// for a **single-lane** accumulator.
 ///
 /// [`fold_domain_for`] is the general form; this is the `lanes = 1`,
-/// f32-accumulator case, which is what an ordinary `Fold{Add}` needs.
+/// f32-accumulator case every shipped call site is, kept so the emitted
+/// domain of an ordinary `Fold{Add}` is unchanged to the point.
 pub fn fold_domain(k: Dim, cx: &DomainCtx<'_>) -> FoldDomain {
     fold_domain_for(k, 1, 4, cx)
 }
@@ -59,13 +77,15 @@ pub fn fold_domain(k: Dim, cx: &DomainCtx<'_>) -> FoldDomain {
 /// both emitters allocate one scratch tile of `block` elements *per
 /// accumulator lane*, and `verify_l1` reads the same number from the same
 /// arena function, so a strategy over the cap is **unselectable**, not merely
-/// slow: a `verify_plan` failure is a hard assert, not a fallback.
+/// slow. Section 4.2 makes a `verify_plan` failure a hard assert rather than a
+/// fallback, so admitting one mints a crash instead of a slow plan.
 ///
-/// A wide carrier therefore keeps only the schedules that close nothing across
-/// lanes — a `Vector(128)` f32 slot wants 128 KiB against a 32 KiB limit at
-/// every lane group above 1, because the emitted block is floored at 256 lanes
-/// regardless of the lane group. `WgTree { lane_group: 1 }` gives every
-/// invocation a whole output row, so it stages no scratch and survives.
+/// A wide carrier can therefore empty the domain — a `Vector(128)` f32 slot
+/// wants 128 KiB against a 32 KiB limit at every lane group, because the
+/// emitted block is floored at 256 lanes regardless of the lane group. That
+/// is reported honestly as an empty domain rather than papered over: closing
+/// it is one strategy (a row per lane, no scratch and no cross-lane close),
+/// which needs a `FoldStrat` variant this crate cannot add.
 pub fn fold_domain_for(k: Dim, lanes: u64, acc_bytes: u64, cx: &DomainCtx<'_>) -> FoldDomain {
     let caps = cx.caps;
     let max_block = caps.limits.max_compute_invocations_per_workgroup;
@@ -138,15 +158,26 @@ pub fn fold_domain_for(k: Dim, lanes: u64, acc_bytes: u64, cx: &DomainCtx<'_>) -
 /// `Fold{C,a}(x) == Fold{C.as_merge(),a}(Fold{C,a+1}(block(x,a,n)))` may be
 /// instantiated at, `1` (unsplit) first.
 ///
-/// Every factor is generated from the extent alone; which one wins is priced
-/// against the exact arena plan like any other point.
+/// This is a **schedule parameter**, not a constant the rule picks. The
+/// shipped `fold_split` gates on `extent.at_least(4096)` and then takes the
+/// widest power-of-two divisor up to 64, so at every `Lk` the trainer and the
+/// conformance attention cases use — 512, 768, 1024, 2048 — nothing splits at
+/// all and there is no block loop to strip-mine into. Every factor here is
+/// generated from the extent alone; which one wins is priced against the exact
+/// arena plan like any other point.
 ///
-/// `FoldDomain` carries only `strategies`, so nothing consumes these factors:
-/// they become a schedule parameter once it also carries
+/// **This generator has no consumer yet, and the missing piece is one field.**
+/// `FoldDomain` (`fusor2-ir/src/ir/level1.rs`) carries only `strategies`; the
+/// factor becomes a schedule parameter the day it also carries
 /// `blocks: SmallVec<[u32; 4]>` and `SchedPoint::Fold` carries the chosen one.
-/// `fusor2-ir/src/rules/algebra.rs::fold_split` meanwhile mints its own
-/// candidates as e-nodes, bounded by
-/// `extent > max_compute_invocations_per_workgroup`.
+/// Until then `fusor2-ir/src/rules/algebra.rs::fold_split` mints its own
+/// candidates as e-nodes and bounds them by
+/// `extent > max_compute_invocations_per_workgroup`, which is a device fact
+/// rather than the deleted `at_least(4096)` constant but is still a rewrite
+/// picking a factor. Measured consequence: `STRIP` fires on a 4096-element
+/// reduction and does not fire on a contraction's summed axis at
+/// `k = 512..2048`, so split-K at every extent the trainer uses is still
+/// unreachable.
 ///
 /// Legality, not preference:
 /// * the extent must be `Dim::Const` — `StrideSpec::multiplier` is a `u32`, so
@@ -179,7 +210,8 @@ pub fn fold_blocks(k: Dim, cx: &DomainCtx<'_>) -> SmallVec<[u32; 4]> {
 }
 
 /// Move-ordering seed for one split count. The measured band is an inner
-/// segment of 32..=128 elements, so those lead the frontier. **It orders
+/// segment of 32..=128 elements — the reference's own `KV_BLOCK` and split-K
+/// chunk sizes both land there — so those lead the frontier. **It orders
 /// moves; it never gates them.**
 fn block_seed_rank(extent: u64, blocks: u32) -> u8 {
     match extent / u64::from(blocks) {
@@ -189,11 +221,13 @@ fn block_seed_rank(extent: u64, blocks: u32) -> u8 {
     }
 }
 
-/// Move-ordering seed, following measured behaviour: a subgroup collective
-/// when one is available, then a tree over a full-width workgroup, then a
-/// per-lane loop whose trip count sits inside the register budget.
+/// Move-ordering seed. The reference's measured behaviour: a subgroup
+/// collective when one is available, then a tree over a full-width
+/// workgroup, then a per-lane loop whose trip count sits inside the
+/// register budget the reference calls `work_per_thread`.
 pub(crate) fn seed_rank(s: FoldStrat) -> u8 {
-    /// Loop iterations a lane can stage in registers.
+    /// The reference's `RegPressure::ElementwiseFew` budget. Here it orders
+    /// a frontier instead of gating a formula.
     const STAGE_BUDGET: u32 = 4;
     match s {
         FoldStrat::Subgroup => 0,
@@ -282,10 +316,13 @@ mod tests {
         assert_eq!(d.strategies.first(), Some(&FoldStrat::Subgroup));
     }
 
+    // -----------------------------------------------------------------
     // The strip-mine factor
+    // -----------------------------------------------------------------
 
-    /// Every extent the trainer and the conformance attention cases use
-    /// generates at least one split.
+    /// Every extent the trainer and the conformance attention cases use.
+    /// The shipped `extent.at_least(4096)` gate refuses all four, so today
+    /// there is no block loop at any real attention or matmul shape.
     #[test]
     fn real_extents_generate_a_split() {
         let caps = apple_caps();
@@ -305,8 +342,9 @@ mod tests {
         }
     }
 
-    /// `Lk = 512` offers 8 blocks of 64 — the KV block loop shape — and every
-    /// split it offers lands in the measured 32..=128 band, so the frontier
+    /// The named shape: `Lk = 512` offers 8 blocks of 64, which is the KV
+    /// block loop the hand-written flash template hardcoded — and every split
+    /// it does offer lands in the measured 32..=128 band, so the frontier
     /// leads with a real block size rather than a degenerate one.
     #[test]
     fn lk_512_offers_eight_blocks_of_sixty_four() {
@@ -349,10 +387,12 @@ mod tests {
         assert!(fold_blocks(Dim::Const(4096), &cx).len() <= MAX_BLOCKS);
     }
 
+    // -----------------------------------------------------------------
     // The carrier footprint clause
+    // -----------------------------------------------------------------
 
-    /// A single f32 lane fits every lane group, so the general form agrees
-    /// with [`fold_domain`] point for point.
+    /// A single f32 lane fits every lane group, so the general form is the
+    /// shipped domain to the point.
     #[test]
     fn a_scalar_carrier_is_unfiltered() {
         let caps = apple_caps();
@@ -368,11 +408,14 @@ mod tests {
     /// lane group **that closes across lanes**, because the emitted block is
     /// floored at 256 lanes.
     ///
-    /// It is nonetheless schedulable: a one-lane group stages nothing — every
-    /// invocation owns a whole output row and reduces the axis into its own
-    /// accumulator, so the merge is over a group of one — and `WgTree {
-    /// lane_group: 1 }` spells exactly that, with `fold_scratch_bytes`
-    /// reporting 0.
+    /// It is nonetheless schedulable, and this test pins which schedules
+    /// survive rather than that none do. A one-lane group stages nothing —
+    /// every invocation owns a whole output row and reduces the axis into its
+    /// own accumulator, so the merge is over a group of one — and that is the
+    /// row-per-lane strategy this module's doc used to say needed a
+    /// `FoldStrat` variant it could not add. It does not: `WgTree { lane_group:
+    /// 1 }` already spells it and both emitters already lower it, they simply
+    /// allocated the scratch anyway. `fold_scratch_bytes` reports 0 for it now.
     ///
     /// The assertion that matters is that **nothing needing a cross-lane close
     /// survives**: admitting one of those would mint a `verify_plan` crash.

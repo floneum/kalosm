@@ -19,8 +19,11 @@
 //!   full body executed.
 //!
 //! **Insertion** is the other direction: one uniform barrier at a root
-//! boundary can *shrink* the arena by separating two tiles' live ranges.
-//! [`crate::planner::Planner::arena_plan`] consumes the resulting byte delta.
+//! boundary can *shrink* the arena by separating two tiles' live ranges. The
+//! reference computes this delta and throws it away for want of a caller;
+//! [`crate::planner::Planner::arena_plan`] is that caller.
+//!
+//! Owned by W3.
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;
@@ -30,7 +33,9 @@ use rustc_hash::FxHashSet;
 use crate::arena;
 use crate::liveness::{LivenessInfo, TileAccess, analyze};
 
+// ---------------------------------------------------------------------------
 // Elision
+// ---------------------------------------------------------------------------
 
 /// Remove every removable barrier from `ir`. Returns how many were removed.
 pub fn elide_barriers(ir: &mut KernelIr) -> usize {
@@ -187,7 +192,9 @@ fn remove_stmt(body: &mut Vec<Stmt>, path: &[u32]) {
     }
 }
 
+// ---------------------------------------------------------------------------
 // Insertion
+// ---------------------------------------------------------------------------
 
 /// Workgroup bytes the arena needs, taking the smaller of the two packings.
 /// Mode availability is a device question the planner answers; a suggestion

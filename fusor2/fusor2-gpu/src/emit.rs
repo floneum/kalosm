@@ -3,10 +3,13 @@
 //! naga IR is already an IR, so there is no target dialect between L2 and it:
 //! a dialect there would host zero rewrite rules.
 //!
-//! One up-front [`Analysis`] walk decides every capability the module will
-//! declare *before* a single expression is lowered. Gating f16 here rather
-//! than lazily is what makes an f16 handle on a non-f16 adapter fail with
+//! Structure mirrors `tile-ir/src/lower/{mod,setup,block}.rs`: one up-front
+//! [`Analysis`] walk decides every capability the module will declare *before*
+//! a single expression is lowered. Gating f16 here rather than lazily is what
+//! makes an f16 handle on a non-f16 adapter fail with
 //! [`EmitError::MissingCapability`] instead of mis-lowering.
+//!
+//! Owned by W8.
 
 pub mod coop;
 pub mod expr;
@@ -59,15 +62,15 @@ pub struct EmittedModule {
 /// footprint check and the occupancy term read, never a local estimator — that
 /// identity is what makes "extraction commits a plan that fails L2
 /// verification" unstateable.
-pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<naga::Module, EmitError> {
+pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<EmittedModule, EmitError> {
     let planner = fusor2_tile::Planner::shared();
     let plan = <dyn fusor2_ir::ir::level2::ArenaPlanner>::arena_plan(&*planner, ir, caps)
         .map_err(|e| EmitError::Unsupported(format!("arena_plan: {e}")))?;
-    Ok(emit_module(ir, caps, &plan)?.module)
+    emit_module(ir, caps, &plan)
 }
 
-/// Emit with a plan the caller already has, for callers holding the plan from
-/// admission that must not recompute it.
+/// Emit with a plan the caller already has. W9 uses this: it holds the plan
+/// from admission and must not recompute it.
 pub fn emit_module(
     ir: &KernelIr,
     caps: &Caps,
@@ -76,7 +79,32 @@ pub fn emit_module(
     Emitter::new(ir, caps, plan)?.finish()
 }
 
+// ---------------------------------------------------------------------------
 // Analysis
+// ---------------------------------------------------------------------------
+
+/// Whether a `ReduceKind::Workgroup` tree at `group_size` on a `block`-lane
+/// kernel is emitted as the subgroup two-stage (one collective per subgroup,
+/// partials staged through scratch, two barriers) instead of the barrier
+/// tree (`2 + log2(block)` barriers). `width` is the *fixed* subgroup width,
+/// `None` when the device has none: a varying width would make `block/width`
+/// a guess, and a guessed slot count is a race, not a reduction.
+///
+/// Grouped trees (`group_size < block`) and non-scalar/bool elements keep
+/// the tree — the collective reduces the whole subgroup, which crosses group
+/// boundaries, and `subgroupAdd` on bool is undefined.
+pub(crate) fn collective_tree(
+    width: Option<u32>,
+    block: u32,
+    group_size: u32,
+    element: ElementType,
+) -> bool {
+    let Some(w) = width else { return false };
+    matches!(element, ElementType::Scalar(s) if s != ScalarElement::Bool)
+        && group_size == block
+        && block >= w
+        && block.is_multiple_of(w)
+}
 
 /// One walk of the whole body, run before any expression is lowered. Everything
 /// the module declares — types, entry-point arguments, atomic buffer types and
@@ -94,12 +122,19 @@ pub struct Analysis {
     pub subgroup_lane: bool,
     pub subgroup_size: bool,
     pub num_subgroups: bool,
+    pub num_workgroups: bool,
     /// Bindings a `Stmt::AtomicAdd` targets. Typed `array<atomic<T>>` up front.
     pub atomic_buffers: FxHashSet<u32>,
     /// First-use-ordered, deduplicated declaration lists.
     pub buffers: Vec<Buffer>,
     pub tiles: Vec<Tile>,
     pub locals: Vec<Local>,
+    /// The device's fixed subgroup width, when it has one — what decides
+    /// whether a workgroup tree upgrades to the subgroup two-stage
+    /// ([`collective_tree`]), so the walk flags the builtins that path reads.
+    fixed_width: Option<u32>,
+    /// The kernel's workgroup size, for the same decision.
+    block: u32,
 }
 
 impl Analysis {
@@ -112,8 +147,14 @@ impl Analysis {
             || self.num_subgroups
     }
 
-    pub fn run(ir: &KernelIr) -> Self {
+    pub fn run(ir: &KernelIr, caps: &Caps) -> Self {
         let mut a = Self::default();
+        a.fixed_width = caps.subgroups.filter(|s| s.is_fixed()).map(|s| s.assumed());
+        a.block = if ir.block > 0 {
+            ir.block
+        } else {
+            DEFAULT_WORKGROUP_INVOCATIONS
+        };
         let mut seen = Seen::default();
         for buffer in &ir.buffers {
             a.note_buffer(buffer, &mut seen);
@@ -125,6 +166,19 @@ impl Analysis {
         // subgroup id whether or not the body asked for one.
         a.subgroup_id |= a.uses_coop;
         a
+    }
+
+    /// A workgroup tree the emitter will upgrade to the subgroup two-stage
+    /// reads the collective and — past one subgroup — the subgroup id and
+    /// lane, none of which appear in the IR itself.
+    fn note_tree(&mut self, group_size: u32, element: ElementType) {
+        if collective_tree(self.fixed_width, self.block, group_size, element) {
+            self.uses_subgroup_collective = true;
+            if Some(self.block) != self.fixed_width {
+                self.subgroup_id = true;
+                self.subgroup_lane = true;
+            }
+        }
     }
 
     fn note_buffer(&mut self, b: &Buffer, seen: &mut Seen) {
@@ -263,12 +317,24 @@ impl Analysis {
                 kind,
                 values,
                 merge,
+                fast,
                 outs,
                 scratch,
-                ..
             } => {
                 if matches!(&**kind, ReduceKind::Subgroup) {
                     self.uses_subgroup_collective = true;
+                }
+                // A single-slot fold with a hardware operator takes the
+                // expression path (see `Stmt::Reduce` emission), so the same
+                // two-stage upgrade applies to it.
+                if values.len() == 1 && fast.is_some() {
+                    match &**kind {
+                        ReduceKind::Workgroup { group_size, .. }
+                        | ReduceKind::Loop { group_size, .. } => {
+                            self.note_tree(*group_size, values[0].element());
+                        }
+                        ReduceKind::Subgroup => {}
+                    }
                 }
                 if let ReduceKind::Loop { index, .. } = &**kind {
                     self.note_local(index, seen);
@@ -311,6 +377,7 @@ impl Analysis {
                 Builtin::SubgroupLane => self.subgroup_lane = true,
                 Builtin::SubgroupSize => self.subgroup_size = true,
                 Builtin::NumSubgroups => self.num_subgroups = true,
+                Builtin::NumWorkgroups(_) => self.num_workgroups = true,
                 Builtin::Lane | Builtin::ProgramId(_) => {}
             },
             TileExprKind::LoadLocal(l) => self.note_local(l, seen),
@@ -364,10 +431,22 @@ impl Analysis {
             TileExprKind::Reduce { kind, value, .. } => {
                 match &**kind {
                     ReduceKind::Subgroup => self.uses_subgroup_collective = true,
-                    ReduceKind::Workgroup { scratch, .. } => self.note_tile(scratch, seen),
-                    ReduceKind::Loop { index, scratch, .. } => {
+                    ReduceKind::Workgroup {
+                        scratch,
+                        group_size,
+                    } => {
+                        self.note_tile(scratch, seen);
+                        self.note_tree(*group_size, value.element());
+                    }
+                    ReduceKind::Loop {
+                        index,
+                        scratch,
+                        group_size,
+                        ..
+                    } => {
                         self.note_local(index, seen);
                         self.note_tile(scratch, seen);
+                        self.note_tree(*group_size, value.element());
                     }
                 }
                 self.expr(value, seen);
@@ -426,7 +505,9 @@ pub(crate) fn key<T>(v: &std::sync::Arc<T>) -> usize {
     std::sync::Arc::as_ptr(v) as *const () as usize
 }
 
+// ---------------------------------------------------------------------------
 // Scratch
+// ---------------------------------------------------------------------------
 
 /// Demand-allocated private scratch kinds, interned by
 /// `(kind, element, depth)`. Only keys that are actually used allocate.
@@ -441,7 +522,9 @@ pub enum ScratchKind {
     Atomic,
 }
 
+// ---------------------------------------------------------------------------
 // Emitter
+// ---------------------------------------------------------------------------
 
 /// Per-kernel emission state: the naga arenas plus the L2 -> naga handle maps.
 pub struct Emitter<'a> {
@@ -470,8 +553,9 @@ pub struct Emitter<'a> {
     /// spilling through a [`Self::scratch`] local.
     pub(crate) forced_names: Vec<(naga::Handle<naga::Expression>, String)>,
     /// Hash-consed expression memo. `TileExpr: Hash + Eq` is O(1) through its
-    /// cached structural hash, so two identical subtrees built separately
-    /// merge here — which pointer-identity memoization cannot do.
+    /// cached structural hash; this is precisely why the `Shared` node was
+    /// deleted — two identical subtrees built separately merge here, which
+    /// `Rc::as_ptr` memoization structurally cannot do.
     ///
     /// Each entry carries the [`Self::mem_epoch`] it was created at. A key
     /// that reads memory is a hit only while every space it reads is still at
@@ -493,6 +577,8 @@ pub struct Emitter<'a> {
     /// Argument indices of the four optional subgroup builtins, in the fixed
     /// order they are appended.
     pub(crate) subgroup_args: [Option<u32>; 4],
+    /// Argument index of `@builtin(num_workgroups)`, when the body reads it.
+    pub(crate) num_workgroups_arg: Option<u32>,
     pub(crate) depth: u32,
     pub(crate) u32_ty: naga::Handle<naga::Type>,
     pub(crate) u32_vec3_ty: naga::Handle<naga::Type>,
@@ -500,7 +586,7 @@ pub struct Emitter<'a> {
 
 impl<'a> Emitter<'a> {
     pub fn new(ir: &'a KernelIr, caps: &'a Caps, plan: &'a ArenaPlan) -> Result<Self, EmitError> {
-        let analysis = Analysis::run(ir);
+        let analysis = Analysis::run(ir, caps);
 
         // Capability gates, all decided before a single type is interned.
         if analysis.uses_f16 && !caps.f16 {
@@ -555,6 +641,7 @@ impl<'a> Emitter<'a> {
             workgroup_invocations,
             workgroup_size: [workgroup_invocations, 1, 1],
             subgroup_args: [None; 4],
+            num_workgroups_arg: None,
             depth: 0,
             u32_ty: prelude.u32_ty,
             u32_vec3_ty: prelude.u32_vec3_ty,
@@ -587,6 +674,10 @@ impl<'a> Emitter<'a> {
                 self.subgroup_args[slot] = Some(arguments.len() as u32);
                 arguments.push(builtin_arg(self.u32_ty, builtin));
             }
+        }
+        if self.analysis.num_workgroups {
+            self.num_workgroups_arg = Some(arguments.len() as u32);
+            arguments.push(builtin_arg(self.u32_vec3_ty, naga::BuiltIn::NumWorkGroups));
         }
 
         let mut body = naga::Block::new();
@@ -673,7 +764,9 @@ fn builtin_arg(ty: naga::Handle<naga::Type>, builtin: naga::BuiltIn) -> naga::Fu
     }
 }
 
+// ---------------------------------------------------------------------------
 // Test kit
+// ---------------------------------------------------------------------------
 
 /// Fixture builders and a minimal dispatcher, shared by every emit test in
 /// this crate. Test-only: nothing here is compiled into a release build, and
@@ -882,6 +975,8 @@ pub(crate) mod testkit {
             .count()
     }
 
+    // ---- live dispatch -------------------------------------------------
+
     /// A device probed exactly the way the shipped path probes it.
     pub fn gpu() -> Option<crate::device::GpuDevice> {
         crate::device::gpu_blocking(&crate::device::DeviceOptions::default()).ok()
@@ -954,7 +1049,8 @@ pub(crate) mod testkit {
                 buffer
             })
             .collect();
-        let bind_entries = zip_buffers(&emitted.bindings, &buffers).expect("zip buffers");
+        let bind_entries =
+            crate::bindings::zip_buffers(&emitted.bindings, &buffers).expect("zip buffers");
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &layout,
@@ -1007,49 +1103,6 @@ pub(crate) mod testkit {
     /// Binding 0 is always the read-only `Uniforms` storage buffer.
     pub fn uniforms() -> Vec<u8> {
         vec![0u8; 16]
-    }
-
-    /// Zip a derived binding list positionally with the caller's buffers.
-    ///
-    /// **Binding 0 is always the read-only `Uniforms` storage buffer.** A
-    /// module whose binding 0 is writable is rejected here rather than at
-    /// dispatch, and a length mismatch is a validation failure, never a
-    /// silent truncation.
-    pub fn zip_buffers<'a>(
-        slots: &[crate::bindings::BindingDesc],
-        buffers: &'a [wgpu::Buffer],
-    ) -> Result<Vec<wgpu::BindGroupEntry<'a>>, EmitError> {
-        check_uniform_binding(slots)?;
-        if slots.len() != buffers.len() {
-            return Err(EmitError::Validation(format!(
-                "{} derived bindings against {} buffers",
-                slots.len(),
-                buffers.len()
-            )));
-        }
-        Ok(slots
-            .iter()
-            .zip(buffers)
-            .map(|(slot, buffer)| wgpu::BindGroupEntry {
-                binding: slot.binding,
-                resource: buffer.as_entire_binding(),
-            })
-            .collect())
-    }
-
-    /// Assert the `Uniforms` invariant: binding 0 exists and is read-only.
-    pub fn check_uniform_binding(
-        slots: &[crate::bindings::BindingDesc],
-    ) -> Result<(), EmitError> {
-        match slots.first() {
-            Some(first) if first.binding == 0 && first.read_only => Ok(()),
-            Some(first) if first.binding == 0 => Err(EmitError::Validation(
-                "binding 0 is the Uniforms block and must be read-only".into(),
-            )),
-            Some(_) | None => Err(EmitError::Validation(
-                "binding 0 must be the Uniforms storage buffer".into(),
-            )),
-        }
     }
 }
 
@@ -1178,10 +1231,14 @@ mod tests {
         )
     }
 
-    /// One `main`, the right workgroup size, the right argument list.
+    /// Test 6 — one `main`, the right workgroup size, the right argument list.
     #[test]
     fn every_module_has_one_main() {
-        let caps = caps(false, true);
+        // No subgroups: a workgroup tree stays a tree, so none of these
+        // fixtures reads a subgroup builtin. (On a fixed-width device the
+        // tree upgrades to the two-stage and legitimately grows the subgroup
+        // arguments — that shape is pinned by the reduce goldens.)
+        let caps = caps(false, false);
         let (tiles_ir, _, _) = two_tiles();
         for ir in [elementwise(), tree_sum(), tiles_ir] {
             let emitted = emit_module(&ir, &caps, &no_plan()).expect(ir.name);
@@ -1242,7 +1299,7 @@ mod tests {
         );
     }
 
-    /// f16 is gated up front, not lazily.
+    /// Test 4 — f16 is gated up front, not lazily.
     #[test]
     fn f16_without_capability_is_unsupported() {
         let uni = buffer(0, u32e(), 4, false);
@@ -1283,7 +1340,7 @@ mod tests {
         })
     }
 
-    /// The type arena is deterministic.
+    /// Test 13 — the type arena is deterministic.
     #[test]
     fn type_arena_is_deterministic() {
         let caps = caps(false, true);
@@ -1303,7 +1360,7 @@ mod tests {
         assert_eq!(format!("{x:#?}"), format!("{y:#?}"));
     }
 
-    /// The byte arena is a footprint choice, never a numeric one.
+    /// Test 12 — the byte arena is a footprint choice, never a numeric one.
     #[test]
     fn byte_arena_absence_is_only_footprint() {
         let (ir, a, b) = two_tiles();

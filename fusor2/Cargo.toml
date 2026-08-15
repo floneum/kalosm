@@ -58,3 +58,11 @@ naga = "29"
 # `fearless_simd`'s statically-known f32x4/f32x8/f32x16 is what makes a 4x4
 # register accumulator tile expressible; a width-erased API structurally cannot.
 fearless_simd = "0.4"
+
+# Released naga 29.0.4 with one correctness patch: `CooperativeLoad` joins
+# `Load` in `bake_ref_count`, so a simdgroup load referenced once is still
+# baked into a temporary and cannot sink past the barrier its Emit statement
+# ordered it against. Upstreaming tracked; the same fix was verified on the
+# wgpu-fusor fork for fusor v1.
+[patch.crates-io]
+naga = { path = "vendor/naga" }

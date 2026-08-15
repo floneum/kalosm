@@ -2,37 +2,59 @@
 //!
 //! Let `F = KFold{space, axis, vec_axes, carrier C, ops}` with iteration space
 //! `E(F) = space` minus `vec_axes`. Any operand `ops[i]` produced by `P` where
-//! `E(F).covers(space(P))` is absorbed into every slot's lift:
+//! `E(F).covers(space(P))` is absorbed into **every slot's** lift:
 //!
 //! ```text
 //! KFold{C, ops}  ==  KFold{C[lift[k] := lift[k]{Arg(i) := body(P)}], ops[i := ops(P)]}
 //! ```
 //!
-//! Substitution into a lift reassociates nothing, so the law carries no
-//! `reassoc` guard and fires under
-//! [`NumericContract::STRICT`](crate::dtype::NumericContract::STRICT).
+//! Substitution into a lift reassociates nothing: identity, merge,
+//! associativity and every schedule survive unchanged. So this law carries
+//! **no `reassoc` guard** — and requiring one would be a bug, because it would
+//! kill fusion exactly on the QAT/MSQ1 path where
+//! [`NumericContract::STRICT`](crate::dtype::NumericContract::STRICT) holds and
+//! every inexact law declines. That exactness is the sharpest thing about it.
 //!
-//! The matcher is greedy: it walks the maximal chain of absorbable producers
-//! and mints one fold with the fully composed lift. Intermediate partial
-//! absorptions are not minted.
+//! **Greedy.** The matcher walks the maximal chain of absorbable producers and
+//! mints ONE fold with the fully composed lift, so an `n`-map chain collapses
+//! in one round instead of `n`. Intermediate partial absorptions are not
+//! minted: the extractor's materialization set ranges over the *operand edges*
+//! of the two extremes, which is what actually spans the fusion lattice.
 //!
-//! A producer that is itself a reducing nest is left alone; whether to inline
-//! or materialize it is the extractor's decision, not a rewrite.
+//! **The reduction-nesting clause is not a rewrite.** When the producer is
+//! itself a reducing nest, the edge is left alone: inlining it is a nested
+//! loop in one kernel body, materializing it is a buffer, and that is exactly
+//! the extractor's `M` bit. Nothing enters a `ScalarExpr`, so the inner fold
+//! keeps a real `work()` row and the extractor prices its recompute honestly
+//! instead of a `ScalarKind::Dot` reporting one op.
 //!
-//! There is no reader-count check and no duplication veto: a producer read
-//! twice may be absorbed by both readers. `KRegion` is the same rewrite with
-//! `live_outs` non-empty.
+//! There is no reader-count check and no duplication veto. If a producer is
+//! read twice, both readers may absorb it and the pricing crate charges the
+//! recompute once per reader against the write and the reads it deletes —
+//! exactly what the reference's duplication ledger measures and then
+//! discards. `KRegion` is the same rewrite with `live_outs` non-empty.
 //!
-//! [`MAP_INTO_MAP`] is the same law with a `KMap` in the consumer position;
-//! nothing calls `ScalarExpr::compose` at construction, so elementwise chains
-//! need it to reach extraction as one node.
+//! Elementwise-into-elementwise is `ScalarExpr::compose`, a tree
+//! substitution — but **nothing calls it at construction**, so it is a rule
+//! here too: [`MAP_INTO_MAP`], the same law with a `KMap` in the consumer
+//! position. This header used to say the frontend composed inside the `Map`
+//! constructor; it does not and never did (`compose` has no caller outside
+//! this crate's rules), so `Map{exp}(Map{sub}(s, m))` reached extraction as
+//! two nodes and a launch is lowered from **one** node. Three of
+//! `attention_forward`'s eight dispatches were consecutive elementwise maps
+//! over one `[B, H, Lq, Lk]` space.
+//! `rules::tests::elementwise_into_elementwise_needs_no_rule` states both
+//! halves: no `L0::Map`-headed rule mints a second `L0::Map`, and the `KMap`
+//! chain does fuse.
+//!
+//! Owned by W2.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
-use crate::ir::level1::{AccessPlan, ContractSide, IndexSpace, L1, Operand};
+use crate::ir::level1::{AccessPlan, ContractSide, IndexSpace, L1, MapDomain, Operand, ScheduleDomain};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::rules::{MapView, access_legal_in, map_view, operand_dtypes, shift_args};
-use crate::scalar::ScalarExpr;
+use crate::scalar::{ScalarExpr, ScalarKind};
 use crate::shape::{AxisGroup, Dim, Layout, MultiFlattenMap};
 use smallvec::SmallVec;
 
@@ -86,12 +108,42 @@ struct Spliced {
 
 /// Splice `inner` in at `slot` of `ops`.
 ///
-/// The reader's iteration space must cover the producer's, every operand the
-/// producer brings must satisfy the reader's access predicate, and the replaced
-/// operand must be a plain alias whose `AddressMap` is the dense read of the
-/// producer's shape over `space` — an alias alone can read a window, while a
-/// broadcast passes. `space` is the full index space; `iter` is `space` minus
-/// `vec_axes`, and every `ScalarExpr` is written against it.
+/// Legality: the reader's *iteration* space must cover the producer's, and
+/// every operand the producer brings must satisfy the reader's access
+/// predicate. The operand being replaced must be a plain alias, since
+/// absorbing a `Pack` or `Gather` read would silently drop the repack.
+///
+/// `space` is the full index space and `iter` is `space` minus `vec_axes`.
+/// They differ only on a promoted fold: an operand's address map is stated
+/// against the full `space`, while every `ScalarExpr` on the node — including
+/// the body being substituted in — is written against `iter`.
+///
+/// # `AccessPlan::Alias` is not on its own the condition
+///
+/// The substitution is `Arg(slot) := inner.body`, and that body is written
+/// against the producer's **own** coordinate. Dropping the operand is
+/// therefore sound only when the edge reads the producer at the consumer's
+/// iteration coordinate — which an `Alias` does *not* imply. An `Alias` layout
+/// carries an offset and a stride vector, so `x.narrow(0, 0, 3)` reaching a
+/// reader as `Operand { access: Alias, layout: { offset, strides } }` passes
+/// the plan check and reads a window. Splicing across it computes the
+/// producer's body at the reader's coordinate and silently reads the whole
+/// buffer.
+///
+/// That is not hypothetical. On the standard sampler's `[16] -> narrow(3)`
+/// chain the fused spelling makes the one-hot pick select every row, and
+/// `gather_one_hot`'s `sum(one_hot * ids)` returns `0 + 1 + ... + 15 = 120`
+/// for a 16-token vocabulary — an out-of-range token id, on both
+/// `sample_standard_token_respects_top_k` and every other filtered draw. The
+/// fused member sat in the class unselected, so the suite was green; it is
+/// selected the moment extraction searches harder.
+///
+/// The condition [`splice_through_address_map`] states for the promoted case
+/// is the right one for this case too, and it is checked here with the same
+/// helper: the edge's `AddressMap` must be the dense read of the producer's
+/// shape over `space`. A genuine broadcast still passes — [`widen_groups`]
+/// gives stride 0 on every axis the producer does not name — so absorbing a
+/// row statistic across a broadcast edge is unaffected.
 fn splice(
     b: &Builder<'_>,
     ops: &[Operand],
@@ -161,11 +213,13 @@ pub(crate) fn operand_groups(o: &Operand) -> Option<SmallVec<[AxisGroup; 4]>> {
 /// Restate a map stated over the producer's space as one over the consumer's
 /// full `space`.
 ///
-/// The consumer's iteration axes are `space` minus `vec_axes`, in order, and
+/// The consumer's ITERATION axes are `space` minus `vec_axes`, in order, and
 /// the producer's space is a prefix of them. Every axis the producer does not
 /// name — a promoted axis, or a trailing iteration axis past the producer's
-/// rank — contributes stride 0: the producer's value is re-read at every
-/// position of that axis.
+/// rank — contributes stride 0, which is exactly "the producer's value is
+/// re-read at every position of that axis". That is the whole content of this
+/// function and the reason an absorbed producer needs no renumbering: the
+/// coordinate it names is the coordinate it named before.
 pub(crate) fn widen_groups(
     src: &[AxisGroup],
     space: &IndexSpace,
@@ -187,8 +241,9 @@ pub(crate) fn widen_groups(
             continue;
         };
         // A group's sub-extents multiply to the axis it describes. A `1` where
-        // the space has `N` is a broadcast spelled as a unit axis; anything
-        // else does not describe this space.
+        // the space has `N` is a broadcast the layout spelled as a unit axis;
+        // anything else is a map that does not describe this space, and
+        // placing it here would corrupt every divisor to its left.
         let width: u64 = g.sub_axes.iter().try_fold(1u64, |a, s| {
             a.checked_mul(u64::from(s.extent))
         })?;
@@ -203,12 +258,14 @@ pub(crate) fn widen_groups(
     Some(groups)
 }
 
-/// Spell a widened map as an operand.
+/// Spell a widened map as an operand, preferring the **simple** spelling.
 ///
-/// One `AxisGroup` per axis with one sub-axis each is a stride vector, so it is
-/// minted as a plain `Alias` layout over `space`; other rules' dependence
-/// queries and layout checks are written against `Alias`. `Unflatten` spells a
-/// genuine divmod decomposition.
+/// One `AxisGroup` per axis with one sub-axis each is a stride vector and
+/// nothing more, so it is minted as a plain `Alias` layout over `space`. That
+/// is not cosmetic: every other rule's dependence query, projection and
+/// layout check is written against `Alias` first, and a value spelled the
+/// exotic way silently falls out of all of them. `Unflatten` is kept for a
+/// genuine divmod decomposition, which is the case it exists for.
 pub(crate) fn operand_from_groups(
     o: &Operand,
     groups: &[AxisGroup],
@@ -239,10 +296,17 @@ pub(crate) fn operand_from_groups(
 /// iteration coordinate — the condition under which the producer's body may be
 /// substituted for `Arg(slot)` unrenumbered.
 ///
-/// The statement is an `AddressMap` equality against [`dense_read_map`], whose
-/// divisors come from const extents. A `Dim::Sym` axis has no such map, so the
-/// fallback is that the offset be zero; a permuted or strided read over a
-/// symbolic axis is not caught.
+/// The exact statement is an `AddressMap` equality against [`dense_read_map`],
+/// which derives its divisors from const extents. A `Dim::Sym` axis — a decode
+/// step's runtime sequence length — has no such map, and this law reads no
+/// extent, so declining there would refuse the whole symbolic chain
+/// (`rebase::tests::retarget_fires_over_a_symbolic_reduction_length` pins that
+/// it must not). The fallback is the part of the condition that is decidable
+/// without extents: an offset is a window into a larger buffer whatever the
+/// extents are, and dropping it is the failure this guard exists for. A
+/// permuted or strided read over a symbolic axis is **not** caught, and this
+/// is the honest statement of that limit rather than a claim the check is
+/// complete.
 fn reads_producer_densely(
     o: &Operand,
     producer_shape: &[Dim],
@@ -282,13 +346,28 @@ fn dense_read_map(
     .address_map()
 }
 
-/// Absorb across an operand edge carrying a non-trivial address map.
+/// Absorb across an operand edge that carries a non-trivial **address map**.
 ///
-/// The edge must read the producer at the consumer's iteration coordinate;
-/// then the producer's body is substituted unrenumbered and its own operands
-/// restated over the wider space by [`widen_groups`]. That is an equality of
-/// `AddressMap`s, sharper than the prefix `covers` test beside it, and it is
-/// the clause PROMOTE's output needs.
+/// The shipped clause requires `AccessPlan::Alias`, whose rationale is that
+/// absorbing a `Pack` or a `Gather` would silently drop real work. An
+/// `Unflatten` map is neither: it is pure index arithmetic, the same kind a
+/// strided `Alias` layout already carries. What actually has to be true is
+/// that the edge reads the producer **at the consumer's iteration
+/// coordinate** — then the producer's body may be substituted unrenumbered
+/// and each of its own operands restated over the wider space by
+/// [`widen_groups`].
+///
+/// That condition is checked as an equality of `AddressMap`s, which is
+/// strictly sharper than the prefix `covers` test it accompanies: on a shape
+/// where a free axis and the reduced axis happen to share an extent, `covers`
+/// passes spuriously and this check is what rejects the absorption.
+///
+/// This is the clause PROMOTE's output needs. Before promotion the output
+/// nest iterates `[.., Lq, Dh, Lk]` and the probability matrix is read with a
+/// stride-0 `Dh` axis *inside* the iteration domain, so no substitution is
+/// sound. After promotion `Dh` is a carrier axis, the iteration space is the
+/// producer's space exactly, and the same edge becomes absorbable with no
+/// renumbering at all.
 fn splice_through_address_map(
     b: &Builder<'_>,
     ops: &[Operand],
@@ -299,14 +378,19 @@ fn splice_through_address_map(
     vec_axes: &[u32],
 ) -> Option<Spliced> {
     if vec_axes.is_empty() {
-        // With no promoted axis `iter == space` and the Alias path already
-        // covers every edge this one would.
+        // With no promoted axis `iter == space` and the shipped Alias path
+        // already covers every edge this one would. Declining keeps the
+        // unpromoted graph byte-identical.
         return None;
     }
-    // Exact equality, both directions: `covers` is a prefix test, so it admits
-    // a producer of smaller rank broadcast along the consumer's trailing
-    // iteration axes, and widening across that puts the substituted body at a
-    // coordinate the producer never named.
+    // **Exact equality, both directions.** `covers` is a prefix test, so it
+    // also admits a producer of strictly smaller rank whose value is broadcast
+    // along the consumer's trailing iteration axes. Widening across that is
+    // where a measured A/B put the attention backward's `dq` on a wrong value:
+    // the substituted body then has to be re-read at a coordinate the producer
+    // never named, and the operand restatement below is not enough to say so.
+    // The law's own statement of this case is the equal one — the promoted
+    // output nest's iteration space *is* the score space — so require it.
     if !iter.covers(&inner.space) || !inner.space.covers(iter) {
         return None;
     }
@@ -332,13 +416,17 @@ fn splice_through_address_map(
     let mut new_ops: Vec<Operand> = Vec::with_capacity(base + inner.ops.len());
     new_ops.extend(ops.iter().enumerate().filter(|(j, _)| *j != slot).map(|(_, o)| o.clone()));
     for o in &inner.ops {
-        // Collapse a pure view into the layout before widening: a broadcast
-        // spelled as a `Restride` node reaches its edge with a dense layout,
-        // and widening that spelling would state stride 1 on an axis the value
-        // does not vary along.
+        // Collapse a pure view into the layout FIRST, with the same helper the
+        // dependence query uses. The floor spells a broadcast as a `Restride`
+        // node and gives the reading edge a dense layout, so widening the
+        // spelling would state stride 1 on an axis the value does not vary
+        // along — and every downstream invariance query would then answer
+        // "varies" about a row statistic that does not. Collapsing states the
+        // read.
         let (o, _) = crate::rules::rebase::effective(b, o, &inner.space);
         // Allocation is not described at L1, so an edge that collapsed a
         // narrowing view into a non-zero offset is a node `verify_l1` rejects.
+        // Declining here keeps this rule from minting one.
         if !o.layout.offset().known_eq(Dim::Const(0)) {
             return None;
         }
@@ -353,24 +441,126 @@ fn splice_through_address_map(
 
 /// Whether `inner`'s body may be substituted into a nest iterating `iter`.
 ///
-/// `iter.covers(inner.space)` is a prefix test on the iteration space. When the
-/// producer's body reads an `IndexOf`, the two spaces must agree exactly: only
-/// then does the coordinate the body names survive substitution unrenumbered.
+/// `iter.covers(inner.space)` is the shipped prefix test, read on the
+/// **iteration** space. When the producer's body reads an `IndexOf`, the two
+/// spaces must agree exactly: only then does the coordinate the body names
+/// survive substitution unrenumbered. Under the prefix relation alone the
+/// leading axes still line up, but an exact match is what the law states and
+/// it is the condition under which a frontend's `select(IndexOf(j) <= …)`
+/// rides into a carrier as an ordinary predicate.
 fn covers_for_substitution(iter: &IndexSpace, inner: &MapView) -> bool {
     if !iter.covers(&inner.space) {
         return false;
     }
-    !inner.body.reads_index_of() || inner.space.covers(iter)
+    !reads_index_of(&inner.body) || inner.space.covers(iter)
+}
+
+/// Whether `e` names a loop coordinate anywhere.
+fn reads_index_of(e: &ScalarExpr) -> bool {
+    match e.kind() {
+        ScalarKind::IndexOf(_) => true,
+        ScalarKind::Un { x, .. }
+        | ScalarKind::Cast { x, .. }
+        | ScalarKind::Bitcast { x, .. }
+        | ScalarKind::Round { x, .. }
+        | ScalarKind::Splat { x, .. } => reads_index_of(x),
+        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
+            reads_index_of(a) || reads_index_of(b)
+        }
+        ScalarKind::Select { c, t, f } => {
+            reads_index_of(c) || reads_index_of(t) || reads_index_of(f)
+        }
+        ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::Uniform(_) => false,
+    }
 }
 
 /// The first operand slot of `ops` that can be absorbed, spliced.
 ///
-/// A producer that is itself a reducing nest is not matched: [`map_view`] reads
-/// elementwise producers only. [`splice`] is tried first, then
-/// [`splice_through_address_map`], the path a promoted nest needs, where
-/// `space` is one rank wider than `iter`. [`splice`] does not widen onto a
-/// promoted space, so there it produces a node
-/// `verify_l1::check_operand_access` rejects, discarding the whole chain.
+/// A producer that is itself a reducing nest is **not** matched here:
+/// [`map_view`] reads elementwise producers only, so a fold-to-fold edge is
+/// left alone by construction. That is the nesting clause — an edge property
+/// the extractor decides, never a rewrite.
+///
+/// # On a promoted nest this order is wrong, and the measurement says so
+///
+/// [`splice`] is tried first and **wins on a promoted nest**, where it is not
+/// sound: `space` is one rank wider than the `iter` the producer's operands
+/// are written against, so `splice` appends a rank-`|iter|` alias into a
+/// rank-`|space|` nest. `check_operand_access` then rejects the fold —
+/// measured on the frontend's own attention chain as
+/// `operand 2: Alias layout is rank 4 but the index space is rank 5` — and
+/// `absorb` mints **nothing**. That is why ABSORB fires on the promoted
+/// attention output nest and the derivation stalls there.
+///
+/// Dispatching to [`splice_through_address_map`] whenever `vec_axes` is
+/// non-empty fixes it and was measured end to end. It unlocks the whole
+/// chain: the promoted output nest absorbs the softmax divide (4 operands,
+/// access clean), RETARGET goes 2 -> 6, HOIST starts firing, and TUPLE — with
+/// its axis test corrected to compare the *iteration* axis, since a promoted
+/// nest's `axis` is shifted by its carrier axes — goes 0 -> 6 and mints the
+/// `[Scalar, Vector(Dh)]` flash carrier in the rank-5 space.
+///
+/// This dispatch **is** shipped, and it is what makes the hand-written flash
+/// template deletable: `L1::KFlash`, `FlashOut` and
+/// `fusor2-gpu/src/lower/flash.rs` are gone, and attention is derived from
+/// TUPLE / PROMOTE / RETARGET / ABSORB / HOIST / STRIP alone — no rule names
+/// attention or softmax. Measured with it live: every attention case passes on
+/// **both** backends, the forward launch ceilings held at 8 / 10 / 8 the day
+/// this was taken — they are 5 / 6 / 5 now, see
+/// `fusor2-conformance::launch_counts` for the history — and the
+/// `[Lq, Lk]` score, probability and `dp` matrices stay out of the extracted
+/// plan's materialized set, which is the half of the win a launch count cannot
+/// see.
+///
+/// Two defects that once sat behind this dispatch are fixed and are recorded
+/// because both were reached through it rather than caused by it:
+///
+/// * The GPU promoted multi-slot path in `fusor2-gpu/src/lower/map_fold.rs`
+///   computed one output row and no more, so every attention forward read `0`
+///   at `[0, 0, 1, 0]` and `dq[4]` was `0`. The joint exposed that row
+///   mapping; it did not introduce it.
+/// * Extraction priced the joint wrongly on GPU, regressing the counts 8 -> 10
+///   and 10 -> 12.
+///
+/// The exact-equality test in [`splice_through_address_map`] is the other half:
+/// under the prefix `covers` relation alone this dispatch put the attention
+/// backward's `dq` on a wrong value, and that is why the test is stated in
+/// both directions rather than as the prefix the shipped `splice` uses.
+/// # KNOWN GAP: [`splice`] does not widen onto a promoted space
+///
+/// The two paths below restate the producer's operands differently.
+/// [`splice_through_address_map`] pushes each one through [`widen_groups`] onto
+/// the consumer's full `space`; [`splice`] clones them at the producer's own
+/// rank. On an unpromoted consumer that is the same thing. On a promoted one it
+/// is not, and the mismatch is silent in this file and fatal one line later:
+/// `verify_l1::check_operand_access` requires an `Alias` layout's rank to be
+/// the index space's, so [`build_absorbed_fold`] — which checks before minting
+/// — discards **the whole fused chain**, not just the step that widened wrong.
+///
+/// Measured on the attention forward chain, round 4. `ABSORB` reaches the
+/// promoted output accumulator (`KFold` over the key axis with `Dh` promoted,
+/// reading `v`, the shifted exponential and the row sum) through the
+/// address-map path on the first step and this path on the second, and then:
+///
+/// ```text
+/// ABSORB: check_operand_access rejected space=[2,2,3,4,4] vec=[3] ops=3:
+///   operand 2: Alias layout is rank 4 but the index space is rank 5
+/// ```
+///
+/// four times per saturation, on both backends. Teaching `splice` to widen
+/// (the identity when `vec_axes` is empty, so the unpromoted graph stays
+/// byte-identical) mints the node and the extractor selects it: GPU
+/// `attention_forward` 5 -> 4 launches, `attention_with_lse` 6 -> 5,
+/// `attention_grads_all_three` 17 -> 16.
+///
+/// **It is not landed, and the reason is not this rule.** The widened graph is
+/// twice the size (CPU 613 -> 1348 nodes), which halves the extraction move
+/// budget, and at the shipped extractor the plan gets *worse* (5 -> 8
+/// launches) rather than better. It only pays once
+/// `fusor2_cost::extract`'s accept test is the plan's own cost — see the note
+/// there — and that change exposes six latent wrong-value/illegal-plan members
+/// elsewhere. The three landing conditions are recorded in both files so the
+/// next round does not have to rediscover the order.
 fn absorb_step(
     b: &Builder<'_>,
     ops: &[Operand],
@@ -385,9 +575,11 @@ fn absorb_step(
     })
 }
 
-/// Operand-list ceiling. Absorption terminates on its own — each step replaces
-/// one operand by producers with strictly smaller ids — but a producer read
-/// twice by the same chain widens the list, so this bounds the width.
+/// Operand-list ceiling. Absorption terminates on its own — each step
+/// replaces one operand by producers with strictly smaller ids, which is a
+/// decreasing multiset over a well-founded order — but a producer read twice
+/// by the same chain widens the list, so this bounds the term the rule builds
+/// the way `MAX_NODES` bounds the graph.
 const MAX_ABSORBED_OPERANDS: usize = 32;
 
 /// ABSORB, greedy: absorb the maximal chain of elementwise producers into
@@ -414,8 +606,9 @@ fn build_absorbed_fold(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Optio
     if ops.is_empty() {
         return None;
     }
-    // `f.own()` is the meet over every operand; `f.numeric(0)` reads operand
-    // zero alone and is blind on the multi-operand fold this becomes.
+    // `f.own()` is the meet over *every* operand. `f.numeric(0)` reads operand
+    // zero alone and is blind on a multi-operand fold, which is what this
+    // fold becomes the moment it absorbs anything.
     if acc.accum_bits() < f.own().numeric.min_accum_bits {
         return None;
     }
@@ -429,15 +622,28 @@ fn build_absorbed_fold(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Optio
         let Some(spliced) = absorb_step(b, &cur, space, &iter, vec_axes) else {
             break;
         };
-        // Stop at the last operand list the device can bind. One launch is one
-        // bind group, so a fused nest reading more distinct buffers than
-        // `max_storage_buffers_per_shader_stage` allows is a kernel the backend
-        // cannot create.
+        // Stop at the last operand list the device can bind, exactly as
+        // [`map_into_map`] does. This is legality, not thrift: one launch is
+        // one bind group, so a fused nest reading more distinct buffers than
+        // `max_storage_buffers_per_shader_stage` allows is a kernel the
+        // backend cannot create, and extraction has already committed by the
+        // time `create_bind_group_layout` says so.
+        //
+        // The sibling rule has had this since `mirostat2` reached nine
+        // bindings on a limit of eight; this one never did, and the gap is
+        // reachable rather than theoretical. Measured on the attention
+        // backward with a wider absorption landed:
+        // `attention_backward_matches_the_analytic_adjoints [gpu]` failed
+        // `verify_plan` with "launch 15 binds 10 storage buffers — 9 operands
+        // plus the Uniforms block — over the 8-buffer limit". Absorbing one
+        // operand fewer is a plan; a rejected bind group layout is not a
+        // fallback.
         if storage_bindings(b, &spliced.ops) > budget {
             break;
         }
-        // Substituted into every slot's lift: a carrier is one expression per
-        // slot.
+        // Substituted into EVERY slot's lift. A carrier is one expression per
+        // slot; absorbing into slot 0 alone is how a multi-slot fold silently
+        // computes one right answer and one wrong one.
         lift = lift.iter().map(|l| l.compose(&spliced.args)).collect();
         cur = spliced.ops;
         fired = true;
@@ -455,20 +661,41 @@ fn build_absorbed_fold(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Optio
         ops: cur,
         sched: sched.clone(),
     };
-    // Invariant 5: an absorbed operand whose layout does not match this nest's
-    // index space is a node `verify_plan` rejects.
+    // Invariant 5, checked before minting rather than after selecting: an
+    // absorbed operand whose layout does not match this nest's index space is
+    // a node `verify_plan` would reject as a hard assert.
     crate::verify_l1::check_operand_access(&fused).ok()?;
     b.add_l1(fused).ok()
 }
 
-/// Storage bindings one launch rooted at a nest with these operands needs: the
-/// distinct non-free values it reads, its own output, and the `Uniforms` block.
+/// Storage bindings one launch rooted at a nest with these operands needs:
+/// the distinct non-free values it reads, its own output, **and the
+/// `Uniforms` block**.
 ///
 /// `derive_bindings` reserves binding 0 for the uniform block, drops
-/// `LeafRole::Free` reads and deduplicates by value. Two operands naming
-/// different members of one class over-count by one, declining a legal fusion
-/// rather than minting an unbindable kernel. The `Uniforms` block is a storage
-/// buffer and is charged like any other — hence `+ 2`.
+/// `LeafRole::Free` reads (a constant is folded, a uniform lives in binding
+/// 0) and deduplicates by value, so this counts what it counts. Two operands
+/// naming different members of one class would over-count by one — the
+/// conservative direction, which declines a legal fusion rather than minting
+/// an unbindable kernel.
+///
+/// # The `Uniforms` block is a storage buffer
+///
+/// It is not listed by `derive_bindings` and it is not an operand, so it is
+/// easy to leave out of the arithmetic — and leaving it out is exactly a
+/// one-buffer under-count, which is the whole margin this guard has. Every
+/// emitted module declares it in the `storage` address space
+/// (`fusor2_gpu::bindings` derives the bind group by walking storage globals
+/// and rejects a module whose binding 0 is not the read-only `Uniforms`
+/// buffer), so it is charged against
+/// `max_storage_buffers_per_shader_stage` like any other.
+///
+/// Measured, and the reason the `+ 2` is written out rather than folded into
+/// the caller's comparison: with `+ 1` and a move budget large enough to
+/// reach the plan, `normalization::softmax_last_dim` extracted a `KMap` with
+/// seven reads and one write — eight listed bindings, at a limit of eight —
+/// and died in `create_bind_group_layout` needing nine. `verify_plan`'s
+/// clause 7 is the same statement as an assert on the finished plan.
 fn storage_bindings(b: &Builder<'_>, ops: &[Operand]) -> usize {
     let mut seen: SmallVec<[Id; 8]> = SmallVec::new();
     for o in ops {
@@ -492,11 +719,56 @@ fn storage_bindings(b: &Builder<'_>, ops: &[Operand]) -> usize {
 /// MAP_INTO_MAP, greedy: absorb the maximal chain of elementwise producers
 /// into this map's own body and mint ONE map.
 ///
-/// The predicate is `ABSORB`'s and the arithmetic is `ScalarExpr::compose`.
-/// There is no reader-count check. The operand is asked by id, not by class, so
-/// a pure broadcast whose `KMap` spelling sits behind a `Union` can survive as
-/// its own dispatch; offering every class member is a measured regression
-/// against a fixed extraction move budget.
+/// **This is the rule the module header says is unnecessary, and the header
+/// is wrong about the shipped frontend.** `ScalarExpr::compose` is indeed all
+/// the arithmetic there is, but nothing calls it at construction: `compose`
+/// has exactly two callers outside the rules — a test and `shift_args` — so
+/// `Map{exp}(Map{sub}(s, m))` reaches saturation as two nodes and leaves as
+/// two nodes. A launch is lowered from **one** node, so two elementwise nodes
+/// are two dispatches however cheap each is. Measured on the chain
+/// `attention_defn` emits: the scale, the `s - m` shift and the `exp` are
+/// three separate `KMap` launches over one `[B, H, Lq, Lk]` space, and the
+/// probability divide is a fourth.
+///
+/// It is stated as a rule rather than fixed at the frontend for the reason
+/// `rules.rs` gives about the deleted flash recognizers: a law that depends on
+/// which spelling the frontend happens to emit stops firing when the frontend
+/// changes, and nothing notices. This one reads only "my operand is an
+/// elementwise value at a space I cover", which is `ABSORB`'s own predicate
+/// with a `KMap` in the consumer position.
+///
+/// No reader-count check, per this file's contract: if the producer is read
+/// twice, both readers may absorb it and the cost model charges the recompute
+/// against the write and the reads it deletes. The un-absorbed map stays in
+/// the class, so materializing it once remains available at the same price it
+/// had before.
+///
+/// # MEASURED AND REJECTED: asking the operand's class instead of its id
+///
+/// [`map_view`] normalizes the two spellings *one id* can carry. It does not
+/// see across a class: when the frontend builds an `L0::Restride` and
+/// `LOWER_RESTRIDE` mints the `KMap` spelling beside it, the consumer's
+/// operand still names the restride, the `KMap` sits behind a `Union`, and a
+/// `Builder` walks unions downward only — so a pure broadcast (`body =
+/// Arg(0)`) survives as its own dispatch on the attention forward chain. The
+/// obvious repair is to offer every member of the operand's class here.
+///
+/// It was built (a `Builder::class_members` accessor plus a per-member
+/// `find_map`, with a step counter for termination, since a lowered spelling
+/// has a *larger* id than the one the frontend built and the well-founded
+/// descent above no longer holds) and measured. It is a **regression**:
+/// `attention_forward` cpu 7 -> 8 and `attention_with_lse` cpu 8 -> 9, while
+/// gpu improved 7 -> 6 and `attention_causal_forward` cpu 7 -> 6. More
+/// alternatives in the class is not free — the extraction move budget is
+/// fixed, so the local search spends the same number of moves over a wider
+/// frontier and lands somewhere else. Landing it would have traded two
+/// documented CPU regressions for two GPU improvements and read as green,
+/// because each ceiling is the larger of the two backends.
+///
+/// `sink::FOLD_VIEWS_INTO_INDEX` already mints the right alternative for this
+/// shape; what does not happen is the extractor reaching it. That is a search
+/// problem, and `ExtractBudget::default`'s doc records what raising the
+/// budget does and what blocks it.
 pub fn map_into_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::L1(L1::KMap {
         space,
@@ -515,8 +787,12 @@ pub fn map_into_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
     let mut expr = body.clone();
     let mut fired = false;
     // Terminates for `ABSORB`'s reason: every step replaces one operand by
-    // producers with strictly smaller ids. The ceiling bounds the width a
-    // producer read twice by one chain adds, not the depth.
+    // producers with strictly smaller ids, a decreasing multiset over a
+    // well-founded order. The ceiling bounds the *width* a producer read
+    // twice by one chain adds, not the depth.
+    //
+    // `map_view` is asked about the operand's **id**, not its class, and that
+    // is deliberate — see the note on `MEASURED AND REJECTED` below.
     while cur.len() <= MAX_ABSORBED_OPERANDS {
         let Some(spliced) = cur.iter().enumerate().find_map(|(i, o)| {
             let view = map_view(b, o.src)?;
@@ -526,9 +802,14 @@ pub fn map_into_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
         }) else {
             break;
         };
-        // Stop at the last operand list the device can bind: one launch is one
-        // bind group, so a fused map reading more distinct buffers than
-        // `max_storage_buffers_per_shader_stage` allows cannot be created.
+        // Stop at the last operand list the device can bind. This is
+        // legality, not thrift: one launch is one bind group, so a fused map
+        // reading more distinct buffers than
+        // `max_storage_buffers_per_shader_stage` allows is a kernel the
+        // backend cannot create — `mirostat2` reached nine on a limit of
+        // eight and failed in `create_bind_group_layout`, after extraction
+        // had already committed. Absorbing one operand fewer is a plan; a
+        // rejected bind group layout is not a fallback.
         if storage_bindings(b, &spliced.ops) > budget {
             break;
         }
@@ -611,11 +892,44 @@ pub fn map_into_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>
 /// Absorb one elementwise producer into a contraction side, or `None` when
 /// no slot of it reads one.
 ///
-/// The producer's arity is not a condition: [`ContractSide`] holds a list, so a
-/// multi-operand producer's operands join the side's. The slot must be a plain
-/// alias and each operand the producer brings must satisfy the reader's access
-/// predicate over the contraction's `(batch, m, n, k)` space. Every eligible
-/// slot absorbs in one fire; one at a time would not terminate.
+/// # Why the producer's own arity is not a condition
+///
+/// It used to be. This rule required `inner.ops.len() == 1`, because a side
+/// was exactly one [`Operand`] and there was nowhere to put a second edge —
+/// which made the *one* producer worth absorbing permanently ineligible. The
+/// GGUF block decode reads its block stream through several `Restride` views
+/// at once (quant plane, block scale, block minimum, group scales), so it
+/// arrives here with nine operands and no rewrite collapses them to one. The
+/// guard did not restrict absorption to safe cases; it excluded the case.
+///
+/// With [`ContractSide`] holding a list the producer's operands simply join
+/// the side's, and the quantized staging fill stops being a backend special
+/// case. Every *other* condition is unchanged: the slot must be a plain
+/// alias, and each operand the producer brings must satisfy the reader's
+/// access predicate over the contraction's `(batch, m, n, k)` space.
+///
+/// # Every eligible slot absorbs in one fire, and that is not an optimization
+///
+/// The obvious spelling — absorb the first eligible slot and let the additive
+/// rule re-fire — is what a one-operand side could afford. There, absorbing
+/// left the arity at one, so the successors of a node formed a *chain* as
+/// long as the producer chain was deep.
+///
+/// With a list they form a lattice. A side of width `w` with `e` eligible
+/// slots has `e` distinct one-slot successors, each of which has its own
+/// eligible set, so the class fills with every order in which the absorptions
+/// could have been performed — nodes that all denote the same value and
+/// differ only in how far along each edge the rewriting got. Measured: the
+/// `sampling::standard` tests stopped terminating, spinning in `saturate`
+/// with the graph still growing after twenty minutes, because the sampler's
+/// `lm_head` contraction reads a multi-operand `where_cond` chain.
+///
+/// Absorbing every eligible slot at once gives each node exactly one
+/// successor per side, so the successors are a chain again and the node count
+/// is linear in producer depth. What is lost is the *partial* absorptions as
+/// separate alternatives — the class still holds the un-absorbed node (this
+/// rule is additive) and the fully absorbed one, which are the two the cost
+/// model actually chooses between.
 fn absorb_into_side(
     b: &Builder<'_>,
     side: &ContractSide,
@@ -627,9 +941,13 @@ fn absorb_into_side(
         }
         let mut inner = map_view(b, o.src)?;
         // Fold each operand's pure-view spine into its layout before the
-        // splice; the contraction path has no later rule to fold it, so a
-        // carried `Restride` class materializes as its own launch. A spine that
-        // does not compose to an offset-0 plain layout is left alone.
+        // splice. A producer's operand routinely names a `Restride` class —
+        // every broadcast row statistic does — and carrying that class into
+        // the contraction forces it to materialize as its own launch, since
+        // the contraction path has no later rule to fold it. Composed here it
+        // is a stride vector (a broadcast is stride 0) and costs nothing. A
+        // spine that does not compose to an offset-0 plain layout is left
+        // alone: the operand stays legal, just materialized.
         for p in inner.ops.iter_mut() {
             if !matches!(p.access, AccessPlan::Alias) {
                 continue;
@@ -678,17 +996,56 @@ fn absorb_into_side(
         {
             return None;
         }
-        // The edge may read the producer through any axis permutation of its
-        // dense value, and the permutation is carried by permuting every
-        // absorbed operand's own axes with it (see [`permute_layout`]). An edge
-        // that is not a permutation — a window, a broadcast, an offset —
-        // declines.
+        // A producer reading a *quantized* leaf never absorbs. The identity
+        // map `LOWER_DEQUANT` mints is exactly such a producer, and splicing
+        // it recreates a raw-quantized contraction operand — but on whatever
+        // family and orientation this node happens to have, where the block
+        // decode's (row, col) addressing does not hold: absorbed into an
+        // Sgemm with a transposed edge, Q4K's 64x64 case read the wrong
+        // blocks with [0, 0] agreeing by symmetry. The raw-quantized
+        // spelling this would recreate is already in the class (the frontend
+        // unions both), minted by `lower_family` under the one family whose
+        // staging fill is written for it.
+        if inner
+            .ops
+            .iter()
+            .any(|p| b.facts_of(p.src).dtype.is_quantized())
+        {
+            return None;
+        }
+        // Any operand still naming a pure-view class after the fold above is
+        // a refusal, not a pass-through. Its layout was fabricated as the
+        // dense read of the *view's* value (`map_view`'s `L0::Map` spelling
+        // has nothing else to write), and inside a contraction nothing later
+        // re-points it at the base: the view class materializes — or worse,
+        // this side's matrix view reads the base's buffer through the dense
+        // lie. A GGUF block prefix is exactly such a spine (its offset is
+        // what clause 8 stops the fold from absorbing), and carrying it here
+        // is where the Q4K 64x64 conformance case got 61.8 for 108.2.
+        if inner
+            .ops
+            .iter()
+            .any(|p| !b.trace_pure_views(p.src).views.is_empty())
+        {
+            return None;
+        }
+        // The edge may read the producer through any *axis permutation* of
+        // its dense value — `permuted_alias` mints exactly that for a
+        // transposed or batch-reordered contraction operand — and the
+        // permutation must survive absorption. It is carried by permuting
+        // every absorbed operand's own axes with it (see [`permute_layout`]);
+        // an edge that is not a permutation (a window, a broadcast, an
+        // offset) declines, since replacing its layout with the producer's
+        // would silently re-read the whole dense value.
         let perm = dense_permutation(&o.layout, &inner.space.dims)?;
         // A body reading its own coordinates absorbs too: the contraction's
-        // staging loop hands `pre` the operand-axis coordinate vector, and
-        // producer axis `perm[j]` is operand axis `j`, so the axis names shift
-        // by the inverse.
-        if inner.body.reads_index_of() {
+        // staging loop hands `pre` the operand-axis coordinate vector (see
+        // the `coords` argument of each lowering's `eval_scalar`), and
+        // producer axis `perm[j]` is operand axis `j`, so the axis names
+        // shift by the inverse. This is what lets a structural causal mask —
+        // `select(IndexOf(k) <= IndexOf(q) + off, s, -inf)` — ride into the
+        // contraction instead of forcing the masked scores to materialize.
+        if reads_index_of(&inner.body) {
             let mut inv: SmallVec<[u32; 4]> = smallvec::smallvec![0; perm.len()];
             for (j, &i) in perm.iter().enumerate() {
                 inv[i] = j as u32;
@@ -707,7 +1064,9 @@ fn absorb_into_side(
 
     // Retained operands keep their order and take the low arg indices; each
     // absorbed producer's operands are appended in slot order, so a producer
-    // body is shifted by the count of everything placed before it.
+    // body is shifted by the count of everything placed before it. This is
+    // `splice`'s convention, and it keeps one side's numbering independent of
+    // the other's arity.
     let outer_dtypes = operand_dtypes(b, &side.ops);
     let retained = plans.iter().filter(|p| p.is_none()).count();
     let mut ops: SmallVec<[Operand; 2]> = SmallVec::new();
@@ -748,11 +1107,16 @@ fn absorb_into_side(
 /// The axis order in which `layout` reads a dense value of shape `producer`,
 /// or `None` when it is not a pure permutation of it.
 ///
-/// `perm[j] = i` means the edge's axis `j` walks the producer's axis `i`: each
-/// of the layout's `(extent, stride)` pairs must be exactly one producer axis's
-/// `(extent, row-major stride)`, offset zero, every axis claimed once, so a
-/// window, a broadcast or a gather-shaped read fails. Repeated extents stay
-/// unambiguous: equal extents with equal strides address identically.
+/// `perm[j] = i` means the edge's axis `j` walks the producer's axis `i`:
+/// each of the layout's `(extent, stride)` pairs must be exactly one
+/// producer axis's `(extent, row-major stride)`, offset zero, every axis
+/// claimed once. The identity read — the common case — is the identity
+/// permutation. A window (offset), a broadcast (stride 0 where the value has
+/// none) or a gather-shaped read all fail the match and refuse absorption.
+///
+/// Axes may repeat an extent; matching on the *pair* keeps the bijection
+/// unambiguous wherever it matters, because equal extents with equal strides
+/// address identically whichever way they are paired.
 fn dense_permutation(layout: &Layout, producer: &[Dim]) -> Option<SmallVec<[usize; 4]>> {
     if !layout.offset().known_eq(Dim::Const(0)) || layout.rank() != producer.len() {
         return None;
@@ -785,7 +1149,8 @@ fn permute_layout(layout: &Layout, perm: &[usize]) -> Option<Layout> {
 
 /// A single-operand `KMap` reading a `KFold` at the fold's *output* space is
 /// that fold with a longer `post`. This plus [`map_into_fold`] is the whole
-/// of row-program cluster formation.
+/// of row-program cluster formation; the reference's collect / drop-violators
+/// / re-walk fixpoint over reverse-topological roots is deleted.
 pub fn fold_post_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::L1(L1::KMap {
         space, body, ops, ..
@@ -841,6 +1206,17 @@ pub fn fold_post_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_
     b.union(id, extended).ok()
 }
 
+/// The linear schedule domain of a composite whose value is `landed`'s.
+///
+/// `verify_l1` recomputes exactly this from the composite's own inferred
+/// facts, so the two cannot drift.
+pub fn linear_domain_of(b: &Builder<'_>, landed: Id) -> ScheduleDomain {
+    ScheduleDomain::Map(MapDomain::linear_over(
+        b.caps(),
+        &b.facts_of(landed).shape,
+    ))
+}
+
 /// The multi-output form of [`absorb`]: the absorbed producer also escapes,
 /// so the fused chain becomes a `KRegion` naming it in `live_outs`. Because
 /// the region and the plain absorbed fold are both live, emitting the extra
@@ -860,9 +1236,10 @@ pub fn form_kregion(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
     let producer = ops[slot].src;
     let fused = build_absorbed_fold(b, node, f)?;
     let members: SmallVec<[Id; 8]> = smallvec::smallvec![producer, fused];
-    // `live_outs: [0]` names the producer, so the schedule domain is derived
-    // from the producer's index space.
-    let sched = crate::rules::merge::linear_domain_of(b, producer);
+    // `live_outs: [0]` names the producer, so the region lands the producer's
+    // value and that is the index space its schedule domain is derived from —
+    // the same one `verify_l1` recomputes from the region's inferred facts.
+    let sched = linear_domain_of(b, producer);
     let region = b
         .add_l1(L1::KRegion {
             members,
@@ -875,7 +1252,6 @@ pub fn form_kregion(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
 
 #[cfg(test)]
 mod tests {
-    use crate::scalar::ScalarKind;
     use super::*;
     use crate::dtype::Dtype;
     use crate::scalar::BinOp;
@@ -915,9 +1291,10 @@ mod tests {
             .unwrap()
     }
 
-    /// ABSORB fires on a saturated graph greedily: a three-node elementwise
-    /// chain under a reduction becomes one fold reading the buffer, with the
-    /// whole chain in its lift, in one round.
+    /// ABSORB fires on a **saturated** graph, greedily: a three-node
+    /// elementwise chain under a reduction becomes ONE fold reading the
+    /// buffer, with the whole chain in its lift, in one round rather than
+    /// three.
     #[test]
     fn absorb_collapses_a_whole_chain_on_a_saturated_graph() {
         let mut g = ts::graph();
@@ -960,7 +1337,8 @@ mod tests {
         // The merge is untouched — substitution reassociates nothing.
         assert_eq!(fused.kind(), Some(BinOp::Add));
 
-        // The fused lift computes `2 * exp(v)` per element and the fold sums it.
+        // Numerically: the fused lift computes `2 * exp(v)` per element and
+        // the fold sums it, against an expectation computed here.
         let row: Vec<f32> = vec![-1.5, 0.0, 0.25, 2.0, 3.5, -0.75];
         let want: f32 = row.iter().map(|v| 2.0 * v.exp()).sum();
         let got = row.iter().fold(fused.identity_f32(), |acc, v| {
@@ -971,14 +1349,20 @@ mod tests {
             "{got:?} vs {want}"
         );
 
-        // The producers are still live members of their own classes.
+        // The producers are still live, selectable members of their own
+        // classes: this is an alternative, not a replacement.
         assert!(g.chain(m1).contains(&m1));
         assert!(g.chain(m2).contains(&m2));
     }
 
-    /// ABSORB fires under `NumericContract::STRICT`, where every inexact law
-    /// declines: a fake-quant chain `round(clamp(x/s, lo, hi)) * s` reduced by
-    /// a plain `Fold{Add}`.
+    /// **ABSORB fires under `NumericContract::STRICT`**, where every inexact
+    /// law declines.
+    ///
+    /// A QAT fake-quant chain — `round(clamp(x/s, lo, hi)) * s` — reduced by a
+    /// plain `Fold{Add}`. Substitution into a lift reassociates nothing, so a
+    /// `reassoc` guard on this law would kill fusion exactly where it is most
+    /// needed and where the byte-identical export lives. This case is the
+    /// guard against someone adding one.
     #[test]
     fn absorb_fires_on_a_strict_quantized_chain_where_strip_declines() {
         let mut g = ts::graph();
@@ -1029,8 +1413,12 @@ mod tests {
                 _ => None,
             })
             .expect("the quantized chain fused into one fold");
-        // The absorbed lift is the fake-quant body term for term, so the fused
-        // fold computes the same float the unfused chain did.
+        // The numeric statement, spelled exactly: the absorbed lift is the
+        // fake-quant body TERM FOR TERM. Substitution reassociates nothing, so
+        // the fused fold computes the same float the unfused chain did — which
+        // is what a byte-identical export needs and what a tolerance would not
+        // prove. (`carrier::eval` has no `Round` arm, so a host probe could
+        // not check this body at all.)
         assert_eq!(fused.lift[0], fake_quant);
         assert_eq!(fused.merge, ts::binop_carrier(BinOp::Add, Dtype::F32).merge);
         assert_eq!(
@@ -1038,7 +1426,7 @@ mod tests {
             ts::binop_carrier(BinOp::Add, Dtype::F32).identity
         );
 
-        // The inexact law on the same value declines.
+        // The negative half: the inexact law on the same value declines.
         assert_eq!(
             report
                 .fired
@@ -1051,12 +1439,20 @@ mod tests {
         );
     }
 
-    /// Nearest-neighbour assignment,
-    /// `Fold{Min over M}( Fold{Add over D}( (a[n,d] - b[m,d])^2 ) )`:
+    /// **The generality case: nearest-neighbour assignment.** No attention, no
+    /// softmax, no fold splitting, and no rule that mentions any of them.
+    ///
+    /// `Fold{Min over M}( Fold{Add over D}( (a[n,d] - b[m,d])^2 ) )` — k-means
+    /// assignment, k-NN, and the identical fact as never materializing an
+    /// attention score matrix.
+    ///
+    /// Two halves, and the second is the interesting one:
     /// * the squared-difference map is absorbed into the inner reduction, so
     ///   the `[N, M, D]` difference tensor is not an operand of anything;
-    /// * the inner reduction is not absorbed into the outer one, so it stays a
-    ///   node with its own `work()` row.
+    /// * the inner reduction is **not** absorbed into the outer one. A
+    ///   fold-to-fold edge is left alone, so `q.k` stays a real node with a
+    ///   real `work()` row and the extractor prices `D` MACs of recompute
+    ///   rather than the one op a `ScalarKind::Dot` would report.
     #[test]
     fn absorb_fires_on_nearest_neighbour_assignment() {
         use crate::shape::StrideSpec;
@@ -1110,8 +1506,8 @@ mod tests {
         let report = saturate(&mut g);
         assert!(report.saturated, "{report:?}");
 
-        // The [N, M, D] difference tensor is gone from the inner reduction's
-        // operand list.
+        // Half one: the [N, M, D] difference tensor is gone from the inner
+        // reduction's operand list.
         let inner = kfolds_of(&g, dist)
             .into_iter()
             .find_map(|(_, k)| match k {
@@ -1124,14 +1520,14 @@ mod tests {
             })
             .expect("the squared difference was not absorbed");
         assert_eq!(inner.kind(), Some(BinOp::Add));
-        // The lift is (a - b)^2.
+        // Numerically the lift is (a - b)^2, evaluated here against itself.
         for (p, q) in [(1.5f32, -0.5f32), (0.0, 0.0), (2.25, 2.0)] {
             let got = inner.eval_lift(&[p, q]).unwrap()[0];
             assert!((got - (p - q) * (p - q)).abs() < 1e-6);
         }
 
-        // The outer reduction still reads the inner one as an operand edge:
-        // nothing inlined a reduction into a `ScalarExpr`.
+        // Half two: the outer reduction still reads the inner one as an
+        // OPERAND EDGE. Nothing inlined a reduction into a `ScalarExpr`.
         let outers = kfolds_of(&g, assign);
         assert!(!outers.is_empty(), "the assignment did not lower");
         let dist_class = g.class_of(dist);
@@ -1145,7 +1541,8 @@ mod tests {
                 dist_class,
                 "the outer fold stopped reading the inner reduction"
             );
-            // The reduction performed is still the minimum: a `Min` at slot 0.
+            // Whatever else any other law did to this node, the reduction it
+            // performs is still the minimum: a `Min` at every slot 0.
             assert!(
                 carrier.kind() == Some(BinOp::Min)
                     || matches!(
@@ -1161,8 +1558,9 @@ mod tests {
         }
     }
 
-    /// A `KMap` read by two `KFold`s: both folds gain a fused alternative and
-    /// the map is still a live class member. There is no duplication veto.
+    /// Test 4. A `KMap` read by two `KFold`s: both folds gain a fused
+    /// alternative and the map is still a live class member. This is the
+    /// deleted duplication veto.
     #[test]
     fn map_into_fold_fires_with_two_readers() {
         let mut g = ts::graph();
@@ -1212,11 +1610,11 @@ mod tests {
                 crate::scalar::ScalarKind::Un { .. }
             ));
             // The merge is untouched: substitution into a lift reassociates
-            // nothing.
+            // nothing, which is why this law carries no `reassoc` guard.
             assert_eq!(carrier.merge, before.merge);
             assert_eq!(carrier.identity, before.identity);
         }
-        // The producer is still a live member of its own class.
+        // The producer is still a live, selectable member of its own class.
         assert!(g.chain(m).contains(&m));
     }
 
@@ -1285,7 +1683,9 @@ mod tests {
     ///
     /// The substituted body is written against the producer's own coordinate,
     /// so an operand whose `Alias` layout carries an offset reads a window and
-    /// the fused spelling would read the whole buffer.
+    /// the fused spelling would read the whole buffer. Measured consequence
+    /// before the guard: the standard sampler's `narrow` was elided and
+    /// `gather_one_hot` returned the sum of every token id.
     #[test]
     fn map_into_map_refuses_an_operand_that_names_a_window() {
         let mut g = ts::graph();
@@ -1317,7 +1717,7 @@ mod tests {
         );
 
         // The same edge at offset 0 over the producer's own extent is the
-        // dense read the law states.
+        // dense read the law states, and it still fires.
         let dense = ts::kmap(
             &mut g,
             &whole,
@@ -1366,8 +1766,14 @@ mod tests {
     /// `MAP_INTO_MAP` counts the `Uniforms` block against
     /// `max_storage_buffers_per_shader_stage`, so the widest list it will
     /// mint is `limit - 2` distinct reads: those, plus the output, plus the
-    /// block. Both sides of the boundary are asserted: the widest legal list
-    /// fuses, one wider declines.
+    /// block.
+    ///
+    /// The boundary is the test. With the block uncounted the rule accepted
+    /// `limit - 1` reads, which is `limit + 1` storage buffers, and the plan
+    /// reached `create_bind_group_layout` needing nine on a limit of eight —
+    /// `normalization::softmax_last_dim` did exactly that once the extraction
+    /// budget was large enough to select it. So both sides are asserted: the
+    /// widest legal list fuses, one wider declines.
     #[test]
     fn map_into_map_leaves_room_for_the_uniform_block() {
         let limit = ts::caps().limits.max_storage_buffers_per_shader_stage as usize;
@@ -1420,9 +1826,14 @@ mod tests {
         );
     }
 
-    /// The same boundary on the reducing consumer.
-    /// `splice_through_address_map` brings the producer's *whole* operand list
-    /// into a fold, so a nest can outgrow the bind group in one step.
+    /// The same boundary on the reducing consumer. `ABSORB` shipped without
+    /// this check at all while `MAP_INTO_MAP` had it, and the asymmetry is not
+    /// theoretical: `splice_through_address_map` brings the producer's *whole*
+    /// operand list into a fold, so a nest can outgrow the bind group in one
+    /// step. Measured with a wider absorption landed,
+    /// `attention_backward_matches_the_analytic_adjoints` [gpu] failed
+    /// `verify_plan` with "launch 15 binds 10 storage buffers — 9 operands plus
+    /// the Uniforms block — over the 8-buffer limit".
     #[test]
     fn absorb_leaves_room_for_the_uniform_block() {
         use crate::carrier::Carrier;
@@ -1473,8 +1884,9 @@ mod tests {
         );
     }
 
-    /// `storage_bindings` counts distinct reads plus the output plus the
-    /// `Uniforms` block.
+    /// The same statement as an assert on the helper, so a future caller that
+    /// reads `storage_bindings` as "operands plus output" is corrected here
+    /// rather than in `create_bind_group_layout`.
     #[test]
     fn storage_bindings_counts_the_output_and_the_uniform_block() {
         let mut g = ts::graph();

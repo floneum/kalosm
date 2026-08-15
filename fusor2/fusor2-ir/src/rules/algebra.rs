@@ -4,6 +4,8 @@
 //!
 //! Every rule here is `Additive`: the unrewritten form stays live in the same
 //! chain, and which one runs is decided once, later, by extraction.
+//!
+//! Owned by W2.
 
 use crate::dtype::{Dtype, RoundMode, Splat};
 use crate::egraph::{Builder, Facts, Id, RuleTag};
@@ -76,9 +78,9 @@ rule!(
     },
     |b, id, node, f| {
         let _ = node;
-        // Only a single scalar slot whose lift is the bare element: a computing
-        // lift still has to run, and a multi-slot carrier's output carries an
-        // axis that dropping the fold would delete.
+        // Only a single scalar slot whose lift is the bare element: a lift
+        // that computes anything still has to run, and a multi-slot carrier's
+        // output carries an axis that dropping the fold would delete.
         if carrier.width() != 1
             || carrier.slots[0] != crate::carrier::SlotTy::Scalar
             || carrier.lift[0].kind() != &ScalarKind::Arg(0)
@@ -110,15 +112,20 @@ rule!(
     },
 );
 
-/// Two clauses over the reduction domain, minted at the same node because the
-/// driver's fired set is per `(RuleId, Id)`.
+// ---------------------------------------------------------------------------
+// STRIP — two clauses over one object, the reduction domain
+// ---------------------------------------------------------------------------
+
+/// STRIP. Both clauses are about the reduction domain and both are minted at
+/// the same node, because the driver's fired set is per `(RuleId, Id)`.
 ///
-/// * SPLIT — a catamorphism over a concatenation is the merge of the
+/// * **SPLIT** — a catamorphism over a concatenation is the merge of the
 ///   catamorphisms over the segments.
-/// * ELIDE — a block whose lift is identically the carrier's identity
+/// * **ELIDE** — a block whose lift is identically the carrier's identity
 ///   contributes nothing, because `merge(acc, identity) = acc`.
 pub fn strip(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    // ELIDE first: narrowing the domain makes the split cheaper.
+    // ELIDE first: narrowing the domain makes the split cheaper, and both
+    // alternatives stay live in the same class either way.
     let elided = fold_elide(b, node, f).and_then(|x| b.union(id, x).ok());
     let split = fold_split(b, id, node, f);
     split.or(elided)
@@ -126,11 +133,36 @@ pub fn strip(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<
 
 /// SPLIT: `Fold{c, axis}` == `Fold{c.as_merge(), axis} . Fold{c, axis+1} . block(x)`.
 ///
-/// The outer level's elements are partial accumulators, so it uses
-/// [`Carrier::as_merge`] and reads ONE operand carrying the inner fold's
-/// trailing carrier axis. Requires `reassoc`. One blocking view is applied to
-/// every input, and inputs that do not agree on the shape it is stated against
-/// decline.
+/// At a contraction's summed axis this *is* split-K; at a `(max, sum)`
+/// carrier it *is* online softmax; at `(n, mean, m2)` it *is* the stable
+/// variance accumulator — all three fall out with no extra code, because the
+/// carrier rides through untouched and this rule never reads what it means.
+///
+/// The outer level uses [`Carrier::as_merge`]: its elements are partial
+/// **accumulators**, not raw elements, and it reads ONE operand carrying the
+/// inner fold's trailing carrier axis rather than `width` operands. Reusing
+/// the inner carrier applies `lift` to a partial max and silently computes a
+/// wrong value; at a single-slot binop the two spellings coincide, which is
+/// how that bug survived.
+///
+/// The `reassoc` guard is load-bearing. Without it the split and unsplit
+/// forms are declared value-equal, and extraction swaps them on an f16
+/// accumulator, in a system whose acceptance test is a byte-identical QAT
+/// export.
+///
+/// **The `at_least(4096)` gate is gone**, and with it the reason there was no
+/// split-K and no block loop at any length the trainer or the conformance
+/// matmul and attention cases use. What replaces it is smaller and is a device
+/// fact rather than a constant — see the bound in the body — and the block
+/// count is a set of competing alternatives rather than the one divisor the
+/// rule used to pick. Both are stopgaps for `FoldDomain::blocks`; neither is
+/// part of the law.
+///
+/// **Every operand is blocked.** A fold is multi-operand now, so the law's
+/// operand clause is not decoration: one blocking view is applied to each
+/// input, and inputs that do not agree on the shape it is stated against
+/// decline. Reading only `ins[0]` would have silently refused to split every
+/// fold the carrier laws mint.
 fn fold_split(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::L0(L0::Fold {
         carrier,
@@ -141,31 +173,46 @@ fn fold_split(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option
     else {
         return None;
     };
-    // The outer level reads partial accumulators, so the carrier must be
-    // associative. `f.own().numeric` is the meet over every operand.
+    // The outer level reads partial *accumulators*, so it may only exist when
+    // the carrier is associative; `f.own().numeric` is the meet over every
+    // operand, which `f.numeric(0)` is blind to on a multi-operand fold.
     if !carrier.associative || !f.own().numeric.reassoc {
         return None;
     }
     if acc.accum_bits() < f.own().numeric.min_accum_bits {
         return None;
     }
-    // `infer_l0` does not derive `STRICT` from `ScalarKind::Round`, so the meet
-    // above cannot see a rounding lift; read the carrier directly.
-    if carrier.lift.iter().chain(&carrier.merge).any(ScalarExpr::has_round) {
+    // A rounding lift is the QAT fake-quant value. `infer_l0` does not yet
+    // derive `STRICT` from `ScalarKind::Round` (a documented gap in the
+    // semantics crate), so the meet above cannot see it once ABSORB has moved
+    // the rounding *into* the lift. Reading the carrier directly is what
+    // keeps that absorption from laundering a non-reassociable value into a
+    // splittable one.
+    if carrier.lift.iter().any(has_round) || carrier.merge.iter().any(has_round) {
         return None;
     }
     if ins.is_empty() {
         return None;
     }
-    // The law states a two-level split: a level that is itself a level of a
-    // split does not split again, or the rewrite cascades without bound.
+    // The law states a TWO-level split, and both levels are already here: a
+    // level that is itself a level of a split does not split again. Without
+    // this the rewrite cascades — every minted fold is a fresh id, so the
+    // driver offers it the rule again — and one reduction over 65,536
+    // elements grew the graph to 5,819 nodes. The deleted `at_least(4096)`
+    // gate was silently doing this job as well as its own.
     if ins.iter().any(|&x| stands_on_a_split(b, x, 4)) {
         return None;
     }
     let axis = *axis as usize;
     let shape = f.operand(0)?.shape.clone();
-    // One blocking view serves every operand, so they must agree on the shape
-    // it is stated against.
+    // **Every operand is blocked**, which is what makes the law apply to the
+    // multi-operand folds ABSORB and the carrier laws mint rather than only to
+    // the single-operand ones the frontend emits. One blocking view serves all
+    // of them, so they must agree on the shape it is stated against; an
+    // operand at a different shape would need its own view and its own proof
+    // that the two still name the same element, so it declines rather than
+    // guessing. (`fold_elide` already narrows every operand — this is the same
+    // treatment on the other clause.)
     for i in 1..ins.len() {
         let other = &f.operand(i)?.shape;
         if other.len() != shape.len()
@@ -175,10 +222,21 @@ fn fold_split(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option
         }
     }
     // `Dim::Sym` declines: `StrideSpec::multiplier` is a `u32`, so the inner
-    // extent has to be spellable.
+    // extent has to be spellable. That is a limit of `Restride`, not of the
+    // law — a symbolic-length reduction gets every other fold law and not
+    // this one.
     let extent = shape.get(axis)?.as_const()?;
-    // A reduction one workgroup's lanes already cover has nowhere to put a
-    // second level: blocking it buys no parallelism and costs a dispatch.
+    // The one bound left, and it is a DEVICE fact rather than a constant: a
+    // reduction one workgroup's lanes already cover has nowhere to put a
+    // second level, so blocking it buys no parallelism and costs a dispatch.
+    // (It costs a dispatch because `fusor2-cost`'s realize step still forces a
+    // launch boundary on every fold-to-fold edge, so the nested-loop reading
+    // of a split — the one this law is for — is not priceable yet. When that
+    // boundary is repaired and `FoldDomain` carries `blocks`, this bound and
+    // the candidate enumeration below both go away and the whole thing is a
+    // schedule point.) The shipped `at_least(4096)` refused every extent the
+    // trainer and the conformance matmul cases use; this fires at 512 and up
+    // under the WebGPU baseline limit.
     if extent <= u64::from(f.caps().limits.max_compute_invocations_per_workgroup) {
         return None;
     }
@@ -226,9 +284,10 @@ fn fold_split(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option
         }) else {
             continue;
         };
-        // `as_merge` is the carrier with `lift` replaced by the identity
-        // injection `Arg(k)`, reading the one operand that carries the inner
-        // fold's trailing carrier axis.
+        // **The outer level's elements are partial accumulators, not raw
+        // elements**, so it must use `as_merge` — the carrier with `lift`
+        // replaced by the identity injection `Arg(k)`, reading the one
+        // operand that carries the inner fold's trailing carrier axis.
         let Ok(joined) = b.add_l0(L0::Fold {
             carrier: carrier.as_merge(),
             axis: axis as u32,
@@ -237,7 +296,8 @@ fn fold_split(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option
         }) else {
             continue;
         };
-        // Every candidate joins the class; an un-unioned node is unreachable.
+        // Every candidate joins the class. Building the node without unioning
+        // it leaves it unreachable from the root and the choice unmade.
         minted = b.union(id, joined).ok().or(minted);
     }
     minted
@@ -266,8 +326,13 @@ fn stands_on_a_split(b: &Builder<'_>, x: Id, budget: u32) -> bool {
 }
 
 /// Candidate block counts for one extent: the power-of-two divisors, widest
-/// first, capped at [`MAX_SPLIT_CANDIDATES`]. All are minted as alternatives
-/// beside the unsplit form.
+/// first, capped at [`MAX_SPLIT_CANDIDATES`].
+///
+/// This is the piece that belongs in `ScheduleDomain::Fold`. Until
+/// `FoldDomain` carries `blocks`, minting the candidates as alternatives is
+/// what keeps the factor a *decision* rather than a constant the rule picked:
+/// every one of them is priced on the realized DAG, and the unsplit form
+/// stays live beside them.
 const MAX_SPLIT_CANDIDATES: usize = 3;
 
 fn block_candidates(extent: u64) -> SmallVec<[u64; 4]> {
@@ -280,12 +345,21 @@ fn block_candidates(extent: u64) -> SmallVec<[u64; 4]> {
 
 /// ELIDE: a reduction whose lift is the carrier's identity outside a
 /// contiguous range of the reduced axis equals the same reduction over that
-/// range alone, because `merge(acc, identity) = acc`. Padding lifts to the
-/// `Add` identity `0` and causal masking to the `Max` identity `-inf`.
+/// range alone, because `merge(acc, identity) = acc`.
 ///
-/// The range is computed from a predicate affine in `IndexOf(axis)` against a
-/// closed bound. A bound reading a free index narrows the domain per row,
-/// which no `IndexSpace` here can express, and declines.
+/// This is the entire content of a mask. The frontend compiles padding to
+/// `select(IndexOf(a) < valid, x, 0)` and `0` is the `Add` identity; it
+/// compiles causality to `select(.., .., -inf)` and `-inf` is the `Max`
+/// identity while `exp(-inf) = 0` is the `Add` identity. Both are identity
+/// blocks *by construction*, so the compiler skips them by a general law
+/// rather than a `causal: bool` on a bespoke node.
+///
+/// **Decidable, or nothing.** The narrowed range is computed from a predicate
+/// affine in `IndexOf(axis)` against a closed bound. A bound that reads a free
+/// index — the causal `IndexOf(lk) <= IndexOf(lq) + d` — narrows the domain
+/// *per row*, which no `IndexSpace` in this IR can express today; that case
+/// declines rather than guessing, and so does anything `eval_closed` cannot
+/// decide.
 fn fold_elide(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::L0(L0::Fold {
         carrier,
@@ -321,14 +395,17 @@ fn fold_elide(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Option<Id> {
         bodies.push(t.clone());
     }
     let (lo, hi) = true_range(cond.as_ref()?, *axis, extent)?;
-    // An empty range would make the whole fold the identity, a `Const` leaf
-    // rather than a narrowing; decline.
+    // An empty range would make the whole fold the identity — a `Const` leaf,
+    // not a narrowing. Nothing in the suite mints one and the honest spelling
+    // needs a shape; decline instead of guessing.
     if lo >= hi || (lo == 0 && hi == extent) {
         return None;
     }
-    // Narrowing to `[lo, hi)` renumbers the reduced coordinate down by `lo`, so
-    // a body naming that coordinate declines unless the window starts at zero.
-    if lo > 0 && bodies.iter().any(|e| e.reads_index_of_axis(*axis)) {
+    // Narrowing to `[lo, hi)` renumbers the reduced coordinate down by `lo`.
+    // A body that names that coordinate — an ALiBi or positional term — would
+    // silently read the wrong index, so it declines unless the window starts
+    // at zero.
+    if lo > 0 && bodies.iter().any(|e| reads_index_of(e, *axis)) {
         return None;
     }
 
@@ -411,9 +488,51 @@ fn flip(op: CmpOp) -> CmpOp {
     }
 }
 
-/// `Fold{Add, rank-1}(Map{mul(Arg0, Arg1)}(a, b))` also is a `Contract`. The
-/// `mul`+`fold` form stays live in the same class, so a product read twice
-/// keeps both options open.
+/// Whether `e` names the loop coordinate of `axis`.
+fn reads_index_of(e: &ScalarExpr, axis: u32) -> bool {
+    match e.kind() {
+        ScalarKind::IndexOf(a) => *a == axis,
+        ScalarKind::Un { x, .. }
+        | ScalarKind::Cast { x, .. }
+        | ScalarKind::Bitcast { x, .. }
+        | ScalarKind::Round { x, .. }
+        | ScalarKind::Splat { x, .. } => reads_index_of(x, axis),
+        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
+            reads_index_of(a, axis) || reads_index_of(b, axis)
+        }
+        ScalarKind::Select { c, t, f } => {
+            reads_index_of(c, axis) || reads_index_of(t, axis) || reads_index_of(f, axis)
+        }
+        ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::Uniform(_) => false,
+    }
+}
+
+/// Whether `e` rounds anywhere: the one syntactic marker of a value whose
+/// contract forbids reassociation.
+fn has_round(e: &ScalarExpr) -> bool {
+    match e.kind() {
+        ScalarKind::Round { .. } => true,
+        ScalarKind::Un { x, .. }
+        | ScalarKind::Cast { x, .. }
+        | ScalarKind::Bitcast { x, .. }
+        | ScalarKind::Splat { x, .. } => has_round(x),
+        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
+            has_round(a) || has_round(b)
+        }
+        ScalarKind::Select { c, t, f } => has_round(c) || has_round(t) || has_round(f),
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Additive contraction recognition
+// ---------------------------------------------------------------------------
+
+/// `Fold{Add, rank-1}(Map{mul(Arg0, Arg1)}(a, b))` also *is* a `Contract`.
+///
+/// There is no sole-reader gate, no cached check and no `commit_recognized`:
+/// the `mul`+`fold` form stays live in the same class, so a product read
+/// twice keeps both options open and the extractor prices them.
 pub fn recognize_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::L0(L0::Fold {
         carrier,
@@ -427,9 +546,16 @@ pub fn recognize_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_
     if carrier.kind() != Some(BinOp::Add) || carrier.slots.len() != 1 {
         return None;
     }
+    // **Both spellings of "multiply, then sum".**
+    //
     // The product may sit in a separate `Map` the fold reads, or directly in
-    // the carrier's own `lift`, which is what `ABSORB` leaves behind once it
-    // inlines the map. Both forms match.
+    // the carrier's own `lift` — `Carrier::binop(Add).with_lift(mul(Arg0,
+    // Arg1))` is exactly what `lower_generic` mints and what `ABSORB` leaves
+    // behind once it inlines the map into the lift. Matching only the first
+    // spelling made this rule unreachable on any chain fusion had already
+    // touched, which is every interesting one: attention's score matmul
+    // arrives here as the second form and so was never recognized as a
+    // contraction at all.
     let ins: SmallVec<[Id; 2]> = if carrier.lift[0].kind() == &ScalarKind::Arg(0) {
         let &[x] = &fold_ins[..] else {
             return None;
@@ -453,14 +579,31 @@ pub fn recognize_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_
     if rank == 0 || rank > u8::MAX as usize || *axis as usize != rank - 1 {
         return None;
     }
+    // **Read each operand through its broadcast, not around it.**
+    //
+    // Stating both sides with all `rank` labels only describes the aligned
+    // case, where `a` and `b` genuinely hold every axis. The moment either
+    // side reaches the product through a broadcast — which is how *every*
+    // outer-product-shaped contraction is spelled, `Restride` with
+    // `multiplier == 0` — that spec names a contraction over the materialized
+    // broadcast. For attention's scores that is two `[B,H,Lq,Lk,Dh]` operands
+    // where `[B,H,Lq,Dh]` and `[B,H,Lk,Dh]` were meant: 2 GB of operand where
+    // there should be 2 MB, and the extractor rightly declines it, so the fold
+    // stays a rank-5 generic reduce and never reaches `Family::Coop`.
+    //
     // Naming only the axes an operand varies along makes the spec the real
-    // einsum (`bhqd,bhkd->bhqk`). All `rank` labels on both sides would instead
-    // name a contraction over the materialized broadcast.
+    // einsum — `bhqd,bhkd->bhqk` — and every contraction lowering, coop
+    // included, becomes available. Measured on `[1,8,1024,64]` attention: the
+    // score matmul goes from a `KFold` over `[1,8,1024,1024,64]` to a
+    // `KContract{Coop}`, which is the whole of the gap against the reference's
+    // hand-written flash kernel on that half of the chain.
     let (a_src, a_labels) = contract_operand(b, ins[0], rank)?;
     let (b_src, b_labels) = contract_operand(b, ins[1], rank)?;
     let contracted = Label(rank as u8 - 1);
-    // The reduced axis has to be a real shared axis of both operands: where one
-    // side is broadcast along it the fold is a scaled sum, not a contraction.
+    // The reduced axis has to be a real shared axis of both operands. Where
+    // one side is broadcast along it the fold is a scaled sum, not a
+    // contraction, and `verify_l0`'s "every label in >= 2 of {a,b,out}" would
+    // reject the spec anyway.
     if !a_labels.contains(&contracted) || !b_labels.contains(&contracted) {
         return None;
     }
@@ -488,10 +631,12 @@ pub fn recognize_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_
 /// The value a contraction should read for this operand, and the labels it
 /// actually varies along.
 ///
-/// An operand reaching the product through a single broadcasting `Restride` —
-/// every kept axis read densely in order, every dropped axis `multiplier == 0`
-/// — is its base read at the base's own labels. Any other view returns the
-/// operand as given with all `rank` labels.
+/// An operand that reaches the product through a single `Restride` which only
+/// *broadcasts* — every kept axis read densely in order, every dropped axis
+/// `multiplier == 0` — is really its base read at the base's own labels. Any
+/// other view (a permute, a narrowing offset, a strided or multi-node spine)
+/// is left alone: this returns the operand as given with all `rank` labels,
+/// which is the shipped behaviour.
 fn contract_operand(
     b: &Builder<'_>,
     v: Id,
@@ -537,7 +682,7 @@ fn contract_operand(
         return Some((v, all()));
     }
     if labels.len() == rank {
-        // Nothing was broadcast: the aligned case.
+        // Nothing was broadcast; this is the shipped aligned case.
         return Some((v, all()));
     }
     Some((spine.base, labels))
@@ -650,6 +795,10 @@ pub fn contract_reassoc(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>)
         .ok()?;
     b.union(id, joined).ok()
 }
+
+// ---------------------------------------------------------------------------
+// Closed-expression folding and identity elimination
+// ---------------------------------------------------------------------------
 
 /// A `Map` whose body is closed over literals alone also equals a constant
 /// leaf. Additive: the unfolded form survives, so a target that would rather
@@ -1058,9 +1207,15 @@ mod tests {
         ts::binop_carrier(BinOp::Add, Dtype::F32)
     }
 
-    /// The three-slot accumulator a shifted, weighted reduction carries: `m` a
-    /// running reference, `l` the shifted sum, `o` the shifted weighted sum.
-    /// `o`'s merge is character-for-character `l`'s.
+    /// The three-slot accumulator a shifted, weighted reduction carries:
+    /// `m` a running reference, `l` the shifted sum, `o` the shifted weighted
+    /// sum. `o`'s merge is character-for-character `l`'s, because `T` is
+    /// applied once per slot of one module element — which is exactly what
+    /// makes a block split of it a block loop with a per-block rescale, with
+    /// no code anywhere that knows what the slots mean.
+    ///
+    /// Hand-built as a **fixture**. No rule mints it yet; this is the test
+    /// that lands before one does.
     fn mlo(dtype: Dtype) -> Carrier {
         use crate::carrier::SlotTy;
         let e = Carrier::binop_identity(BinOp::Add, dtype).unwrap();
@@ -1117,8 +1272,12 @@ mod tests {
         (r.apply)(&mut b, id, &node, &facts)
     }
 
-    /// Split-K, online softmax and Welford are one rule: only the carrier
-    /// differs.
+    /// Test 1. Split-K, online softmax and Welford are one rule: only the
+    /// carrier differs and the rule never reads what it *means*.
+    ///
+    /// The multi-slot cases are built by `Carrier::tuple` and by the oracle's
+    /// own shift-stabilized carrier, so this exercises the same shapes the
+    /// deleted `Combine::OnlineSoftmax` / `Combine::Welford` named.
     #[test]
     fn fold_split_fires_on_one_two_and_three_slot_carriers() {
         let pair = add()
@@ -1146,14 +1305,18 @@ mod tests {
                 else {
                     panic!("expected a Fold alternative");
                 };
-                // The outer level reads partial accumulators: its lift is the
-                // identity injection, never the inner lift.
+                // **The outer level reads partial accumulators.** Its lift is
+                // the identity injection, never the inner lift; reusing the
+                // inner carrier would apply `lift` to a partial max.
                 assert_eq!(*outer, carrier.as_merge(), "{width} slots");
                 assert_eq!(outer.merge, carrier.merge);
                 for (k, l) in outer.lift.iter().enumerate() {
                     assert_eq!(l.kind(), &ScalarKind::Arg(k as u32));
                 }
-                // One operand, carrying the inner fold's trailing carrier axis.
+                // Fix 2: ONE operand, carrying the inner fold's trailing
+                // carrier axis. `width` operands would overflow
+                // `SmallVec<[Id; 4]>` at a `Vector(64)` slot and make the
+                // operand list a function of the head dimension.
                 assert_eq!(ins.len(), 1, "{width} slots");
                 let expect = 2 + usize::from(width > 1);
                 assert_eq!(g.facts(ins[0]).shape.len(), expect, "{width} slots");
@@ -1161,12 +1324,13 @@ mod tests {
         }
     }
 
-    /// Without `reassoc` the split form is not value-equal.
+    /// Test 2. Without `reassoc` the split form is not value-equal.
     #[test]
     fn fold_split_refuses_non_reassociable() {
         let mut g = ts::graph();
         let raw = ts::buffer(&mut g, Dtype::F32, &[Dim::Const(4), Dim::Const(8192)]);
-        // A `Round` in front makes the folded value non-reassociable.
+        // A `Round` in front makes the folded value non-reassociable — the
+        // QAT fake-quant path, verbatim.
         let strict = ts::map(
             &mut g,
             ScalarExpr::round(RoundMode::HalfAwayFromZero, ScalarExpr::arg(0, Dtype::F32)),
@@ -1178,8 +1342,16 @@ mod tests {
         assert_eq!(g.chain(fid).len(), 1);
     }
 
-    /// The law fires at every real reduction length; a `Dim::Sym` extent
-    /// declines because `StrideSpec::multiplier` is a `u32`.
+    /// STRIP fix 3. **There is no extent gate**, so the law fires at every
+    /// reduction length the trainer and the conformance matmul and attention
+    /// cases actually use. The shipped rule refused anything under 4096: at
+    /// `k = 512..2048` it never fired, so there was no split-K and no KV block
+    /// loop at any real shape, and every derivation that assumed one was
+    /// admissible on paper and unschedulable in fact.
+    ///
+    /// A `Dim::Sym` extent still declines — `StrideSpec::multiplier` is a
+    /// `u32` and a symbolic inner extent cannot be spelled — and that is a
+    /// limit of `Restride`, not of the law.
     #[test]
     fn strip_splits_at_every_real_extent_and_declines_on_sym() {
         for k in [512u64, 768, 1024, 2048] {
@@ -1193,7 +1365,9 @@ mod tests {
             assert!(!split.is_empty(), "k = {k}: no split alternative");
         }
 
-        // 768 = 2^8 * 3, so the power-of-two divisors offered are 64, 32, 16.
+        // One named shape, with the block count asserted. 768 = 2^8 * 3, so
+        // the power-of-two divisors offered are 64, 32 and 16 — nothing else
+        // divides it — and the inner extents are 12, 24 and 48.
         let (mut g, fid) = fold_at(768, add());
         fire(&mut g, fid, &STRIP).unwrap();
         let mut counts: Vec<u64> = g
@@ -1217,9 +1391,12 @@ mod tests {
         assert_eq!(g.chain(fid).len(), 1);
     }
 
-    /// The bound on SPLIT sits at
-    /// `Limits::max_compute_invocations_per_workgroup`: a reduction one
-    /// workgroup's lanes already cover has nowhere to put a second level.
+    /// The one bound left on SPLIT is a **device fact**, not a constant: a
+    /// reduction one workgroup's lanes already cover has nowhere to put a
+    /// second level. It sits exactly at
+    /// `Limits::max_compute_invocations_per_workgroup`, so the same law fires
+    /// at a different length on a different device — which the deleted
+    /// `at_least(4096)` could not do.
     #[test]
     fn split_declines_what_one_workgroup_already_covers() {
         let lanes = u64::from(ts::caps().limits.max_compute_invocations_per_workgroup);
@@ -1233,10 +1410,17 @@ mod tests {
         }
     }
 
-    /// SPLIT blocks every input of a multi-operand fold. The fixture is a
-    /// two-operand `Fold{Add, lift = Arg(0) * Arg(1)}`: the rewrite fires on a
-    /// saturated graph, both operands carry the blocking view, and the
-    /// two-level result equals one sequential pass.
+    /// A fold is **multi-operand**, and SPLIT blocks every one of its inputs.
+    ///
+    /// The fixture is a two-operand `Fold{Add, lift = Arg(0) * Arg(1)}` — a
+    /// dot product, i.e. split-K stated without a `Contract` anywhere — at an
+    /// extent the device bound admits. Reading only `ins[0]` would decline
+    /// here, which would silently refuse to split every fold ABSORB and the
+    /// carrier laws mint, since those are exactly the multi-operand ones.
+    ///
+    /// Three claims: the rewrite fires on a **saturated** graph; both operands
+    /// carry the blocking view (not just the first); and the two-level result
+    /// equals one sequential pass, computed here.
     #[test]
     fn split_blocks_every_operand_of_a_multi_operand_fold() {
         let n = 2048u64;
@@ -1269,7 +1453,8 @@ mod tests {
             report.fired
         );
 
-        // The two-level form, with both operands blocked.
+        // The two-level form, with BOTH operands blocked. The outer level
+        // reads one operand carrying the inner fold's trailing carrier axis.
         let outer = carrier.as_merge();
         let split = g
             .chain(fid)
@@ -1349,10 +1534,13 @@ mod tests {
         assert_eq!(g.chain(fid).len(), 1);
     }
 
-    /// A block-split `(m, l, o)` equals one sequential pass, and the *wrong*
-    /// spelling — the outer level reusing the inner carrier, so `lift` runs on
-    /// a partial accumulator — does not. At a single-slot binop the two
-    /// spellings coincide, so only a multi-slot carrier can tell them apart.
+    /// **The test both proposals demanded, landed before any multi-slot
+    /// carrier reaches a backend:** a block-split `(m, l, o)` equals one
+    /// sequential pass, and the *wrong* spelling — the outer level reusing the
+    /// inner carrier, so `lift` runs on a partial accumulator — does not.
+    ///
+    /// This is the `accs[0]` bug one level up. At a single-slot binop the two
+    /// spellings coincide, so every existing test passes straight through it.
     #[test]
     fn a_block_split_mlo_carrier_equals_one_sequential_pass() {
         let c = mlo(Dtype::F32);
@@ -1409,9 +1597,12 @@ mod tests {
         }
     }
 
-    /// ELIDE narrows a reduction whose lift is the carrier's identity outside
-    /// a decidable range of the reduced axis. The work ratio is asserted
-    /// against the padded extent.
+    /// ELIDE, the affine form. A reduction whose lift is the carrier's
+    /// identity outside a decidable range of the reduced axis narrows to that
+    /// range — ragged-batch padding, with no padding flag on any node.
+    ///
+    /// The work ratio is asserted against the padded extent, because
+    /// "narrowed" that the emitter still walks is not narrowed.
     #[test]
     fn elide_narrows_a_padded_reduction_and_cuts_the_work() {
         let mut g = ts::graph();
@@ -1527,9 +1718,13 @@ mod tests {
         assert!(specs[1].size.known_eq(Dim::Const(24)));
     }
 
-    /// An undecidable predicate does not narrow: a bound reading a free index
-    /// is the causal mask, which narrows per row, and a bound reading a
-    /// `Uniform` is a runtime sequence length.
+    /// The negative half. An **undecidable** predicate does not skip.
+    ///
+    /// Both cases here are real: a bound reading a free index is the causal
+    /// mask `select(IndexOf(lk) <= IndexOf(lq) + d, .., -inf)`, which narrows
+    /// the domain *per row* and no `IndexSpace` in this IR can express; a
+    /// bound reading a `Uniform` is a runtime sequence length. Guessing at
+    /// either is a wrong answer, so the rule declines.
     #[test]
     fn elide_declines_an_undecidable_predicate() {
         let bounds = [
@@ -1671,7 +1866,7 @@ mod tests {
         }
     }
 
-    /// Recognition is additive at every reader count: the class holds
+    /// Test 6. Recognition is additive at every reader count: the class holds
     /// exactly one `Fold` and one `Contract` afterwards, whether the product
     /// is read once or twice.
     #[test]
@@ -1836,7 +2031,7 @@ mod tests {
         assert_eq!(g.facts(alt).shape.len(), 1);
     }
 
-    /// A rule fires at most once per node, so a law whose output is
+    /// Test 10. A rule fires at most once per node, so a law whose output is
     /// itself matchable terminates.
     #[test]
     fn a_rule_fires_at_most_once_per_node() {

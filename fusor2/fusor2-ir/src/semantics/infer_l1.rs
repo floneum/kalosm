@@ -1,5 +1,7 @@
 //! Total inference for the L1 op family. An L1 node's result shape is its
 //! index space minus the reduced axes, and its dtype is the epilogue's.
+//!
+//! Owned by W1.
 
 use crate::dtype::{Dtype, NumericContract, Persistence};
 use crate::error::{Error, Result};
@@ -10,9 +12,10 @@ use crate::shape::{Dim, Dims};
 
 /// Infer the result facts of an L1 node from its operands' facts.
 ///
-/// `L1::Ext` is the one variant this cannot answer alone: its row lives in the
-/// open [`OpDefRegistry`]. Use [`infer_l1_with`] when you have the registry;
-/// this function reports a typed error instead.
+/// `L1::Ext` is the one variant this cannot answer alone — its row lives in
+/// the open [`OpDefRegistry`], which only [`crate::CoreSemantics`] holds. Use
+/// [`infer_l1_with`] when you have the registry; this function reports a
+/// typed error rather than guessing.
 pub fn infer_l1(op: &L1, ins: &[ValueFacts]) -> Result<ValueFacts> {
     infer_l1_inner(op, ins, None)
 }
@@ -37,9 +40,10 @@ fn infer_l1_inner(
         }),
 
         // The reduced axis leaves the shape and the carrier's lane count is
-        // appended when it exceeds one, so slot readback is an ordinary
-        // `Restride`. Promoted axes leave the iteration domain but stay in the
-        // output shape as carrier lanes.
+        // appended when it exceeds one — the convention slot readback is an
+        // ordinary `Restride` of. Promoted axes leave the *iteration* domain
+        // but stay in the output shape as carrier lanes, which is exactly why
+        // `PROMOTE` does not change a node's `ValueFacts` at all.
         L1::KFold {
             space,
             axis,
@@ -81,6 +85,22 @@ fn infer_l1_inner(
         L1::KContract {
             m, n, batch, post, ..
         } => Ok(contract_facts(*m, *n, *batch, post, ins)),
+        // `QuantizedRows` reads the quantized leaf but *decodes* every
+        // element it gathers, so its value is float-typed and step-lived —
+        // inheriting the leaf's `Q(fmt)` dtype is exactly the double-decode
+        // this mode exists to avoid, and inheriting the leaf's persistence
+        // would cache a value that changes with every step's indices.
+        L1::KGather {
+            space,
+            mode: crate::ir::level1::GatherMode::QuantizedRows,
+            ..
+        } => Ok(ValueFacts {
+            dtype: Dtype::F32,
+            shape: space.dims.clone(),
+            numeric: meet(ins),
+            persistence: Persistence::Step,
+            outs: 1,
+        }),
         L1::KGather { space, .. } => Ok(ValueFacts {
             dtype: ins.first().map_or(Dtype::F32, |f| f.dtype),
             shape: space.dims.clone(),
@@ -89,9 +109,13 @@ fn infer_l1_inner(
             outs: 1,
         }),
 
-        // A scatter's value is its base with the updates applied, so its shape
-        // comes from operand 0, never from `space`: `space` is the update
-        // iteration domain `[index_count, ...]`.
+        // A scatter's value is its **base** with the updates applied, so its
+        // shape comes from operand 0 — never from `space`. The two disagree:
+        // `fusor2_tile::rules::scatter` mints the *update* iteration domain
+        // (`[index_count, ...]`), so reading the shape off `space` sized a
+        // 1024-row table's buffer at the 300 tokens that wrote into it, and
+        // every element past the update count came back undefined. `infer_l0`
+        // already says `Scatter` returns the base facts; this has to agree.
         L1::KScatter { space, .. } => match ins.first() {
             Some(base) => Ok(ValueFacts {
                 dtype: base.dtype,
@@ -126,15 +150,6 @@ fn infer_l1_inner(
             })?;
             let mut out = facts.clone();
             out.outs = live_outs.len() as u8;
-            Ok(out)
-        }
-
-        L1::KMerged(m) => {
-            let facts = ins.first().ok_or_else(|| {
-                Error::Shape("a merged wave needs at least one segment's facts".into())
-            })?;
-            let mut out = facts.clone();
-            out.outs = m.segments().len() as u8;
             Ok(out)
         }
 
@@ -188,9 +203,7 @@ mod tests {
     use crate::carrier::{ArgRemap, Carrier};
     use crate::scalar::BinOp;
     use crate::ir::level1::{
-        AccessPlan, ContractSide, Family, IndexSpace, KMerged, MergeKey, MergeSegment, Operand,
-        ScheduleDomain,
-        WaveCat,
+        AccessPlan, ContractSide, Family, IndexSpace, Operand, ScheduleDomain,
     };
     use crate::scalar::ScalarExpr;
     use crate::shape::Layout;
@@ -260,8 +273,10 @@ mod tests {
         assert!(infer_l1(&bad_axis, &[f32s(&[4])]).is_err());
     }
 
-    /// A free axis moving from the iteration domain into the accumulator's data
-    /// space leaves the output shape identical.
+    /// **Promotion does not change the node's facts.** A free axis moving from
+    /// the iteration domain into the accumulator's data space leaves the output
+    /// shape byte-identical, which is the check that catches a botched
+    /// renumbering.
     #[test]
     fn promoting_an_axis_leaves_the_shape_identical() {
         let plain = L1::KFold {
@@ -317,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn kregion_and_kmerged_report_their_arity() {
+    fn kregion_reports_its_arity() {
         let region = L1::KRegion {
             members: smallvec![Id(1), Id(2), Id(3)],
             live_outs: smallvec![1, 2],
@@ -334,32 +349,6 @@ mod tests {
             sched: ScheduleDomain::Point,
         };
         assert!(infer_l1(&bad, &[f32s(&[1])]).is_err());
-
-        let key = MergeKey {
-            m: Dim::Const(4),
-            n: Dim::Const(4),
-            k: Dim::Const(4),
-            batch: Dim::Const(1),
-            splits: 1,
-            dtype: Dtype::F32,
-            family: Family::Coop,
-        };
-        let merged = KMerged::new(
-            WaveCat::Matmul,
-            (0..3).map(|i| MergeSegment {
-                id: Id(i),
-                key,
-                has_epilogue: false,
-            }),
-            ScheduleDomain::Point,
-        )
-        .unwrap();
-        let facts = infer_l1(
-            &L1::KMerged(merged),
-            &[f32s(&[4, 4]), f32s(&[4, 4]), f32s(&[4, 4])],
-        )
-        .unwrap();
-        assert_eq!(facts.outs, 3);
     }
 
     #[test]

@@ -1,4 +1,6 @@
 //! Mirostat v2: surprise-targeting sampling with a running mu.
+//!
+//! Owned by W13.
 
 use crate::Result;
 use crate::tensor::Tensor;
@@ -6,7 +8,7 @@ use crate::tensor::Tensor;
 use super::row;
 use super::top_k::GpuSampledToken;
 
-/// Mirostat v2.
+/// Mirostat v2, as the reference's `mirostat2` kernel implements it.
 ///
 /// Each draw truncates the sorted distribution at the first token whose
 /// surprise `-log2(p)` exceeds `mu`, samples from what is left, and then moves
@@ -38,7 +40,9 @@ impl Mirostat2Sampler {
     ///
     /// The token stays on the device. `mu`, however, is a host `f32` on this
     /// struct, so the updated value has to be read back — one four-byte sync
-    /// per draw. The logits themselves never leave the device.
+    /// per draw. The logits themselves never leave the device. The reference
+    /// avoids even that by keeping `mu` in a device `TensorData`; that is not
+    /// expressible while `mu` is a public `f32` field.
     pub fn sample(&mut self, logits: &Tensor) -> Result<GpuSampledToken> {
         let n = row::row_len(logits)?;
         let graph = logits.graph().clone();
@@ -49,11 +53,11 @@ impl Mirostat2Sampler {
 
         // surprise[r] = -log2(p[r]); non-increasing weights make it
         // non-decreasing, so the tokens failing the mu test are a suffix and
-        // keeping the ones that pass is a prefix cutoff.
+        // "keep the ones that pass" is exactly the reference's cutoff scan.
         let probability = weights.div(&total)?.max_scalar(row::EPSILON)?;
         let surprise = probability.log2()?.neg()?;
         let within = surprise.lte_scalar(self.mu)?;
-        // The cutoff is clamped to at least one candidate.
+        // The reference clamps the cutoff to at least one candidate.
         let keep = within.maximum(&row::first_only(&graph, n)?)?;
         let masked = weights.mul(&keep)?;
 
@@ -61,8 +65,8 @@ impl Mirostat2Sampler {
         let one_hot = row::pick_one_hot(&masked, n, random)?;
         let token = row::gather_one_hot(&one_hot, &sorted_ids)?;
 
-        // The observed surprise is taken against the truncated mass, which is
-        // what `weighted_pick` divides by.
+        // The observed surprise is taken against the *truncated* mass, which
+        // is what `weighted_pick` divides by.
         let cutoff_sum = row::total_of(&masked)?.max_scalar(row::EPSILON)?;
         let picked = row::gather_one_hot(&one_hot, &weights)?;
         let observed = picked
@@ -109,7 +113,7 @@ mod tests {
         }
     }
 
-    /// mu tracks the observed surprise across draws.
+    /// mu is state: it has to track the observed surprise.
     #[test]
     fn mu_moves_with_the_observed_surprise() {
         let values = conformance_row();
@@ -122,9 +126,9 @@ mod tests {
         assert!((sampler.mu - start).abs() > 1e-6, "mu never left {start}");
     }
 
-    /// The update is `mu <- mu - eta * (surprise - tau)`; with a
-    /// one-token-dominant row the surprise is ~0, so mu climbs by about
-    /// `eta * tau` on the first draw.
+    /// The update is the reference's `mu <- mu - eta * (surprise - tau)`, and
+    /// with a one-token-dominant row the surprise is ~0, so mu must climb by
+    /// about `eta * tau` on the first draw.
     #[test]
     fn the_mu_update_follows_the_reference_recurrence() {
         // A row so peaked that the truncated set is a single token, whose
@@ -145,9 +149,10 @@ mod tests {
         );
     }
 
-    /// mu falls when the observed surprise is above tau. Eight equal logits
-    /// give every token a renormalised probability of 1/8 and a surprise of
-    /// exactly 3 bits: `4 - 0.5 * (3 - 2) = 3.5`.
+    /// mu falls when the observed surprise is *above* tau, which is the other
+    /// half of the controller. Eight equal logits give every token a
+    /// renormalised probability of 1/8 and a surprise of exactly 3 bits, so
+    /// the step is fully determined: `4 - 0.5 * (3 - 2) = 3.5`.
     #[test]
     fn a_surprise_above_tau_pulls_mu_down() {
         let (_s, _g, t) = cpu_row(&[1.0f32; 8]);

@@ -1,10 +1,15 @@
-//! Bind groups are derived from the emitted module's storage globals, sorted by
-//! binding, read-only from the absence of `StorageAccess::STORE`, zipped
-//! positionally with the builder's buffer list.
+//! Bind groups are **derived** from the emitted module's storage globals,
+//! sorted by binding, read-only from the absence of `StorageAccess::STORE`,
+//! zipped positionally with the builder's buffer list. Binding order and
+//! codegen therefore cannot drift.
 //!
 //! One `main`, one bind group, whole-buffer bindings. Binding 0 is always the
-//! `Uniforms` storage buffer; this walks storage globals, so a
-//! uniform-address-space block would not be found.
+//! `Uniforms` **storage** buffer — a uniform-address-space block would break
+//! this mechanism, which walks storage globals.
+//!
+//! Owned by W8.
+
+use fusor2_ir::target::EmitError;
 
 /// One derived binding.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15,8 +20,10 @@ pub struct BindingDesc {
     pub name: Option<String>,
 }
 
-/// Walk `module`'s storage globals in binding order. The only source of
-/// binding order in the crate.
+/// Walk `module`'s storage globals in binding order.
+///
+/// This is the only source of binding order in the crate: nothing else may
+/// enumerate buffers for a dispatch.
 pub fn bindings_from_module(module: &naga::Module) -> Vec<BindingDesc> {
     let mut out: Vec<BindingDesc> = module
         .global_variables
@@ -35,6 +42,11 @@ pub fn bindings_from_module(module: &naga::Module) -> Vec<BindingDesc> {
         .collect();
     out.sort_by_key(|b| b.binding);
     out
+}
+
+/// The spec's name for [`bindings_from_module`].
+pub fn derive_bindings(module: &naga::Module) -> Vec<BindingDesc> {
+    bindings_from_module(module)
 }
 
 /// The wgpu layout entries for a derived binding list.
@@ -56,10 +68,49 @@ pub fn layout_entries(bindings: &[BindingDesc]) -> Vec<wgpu::BindGroupLayoutEntr
         .collect()
 }
 
+/// Zip a derived binding list positionally with the caller's buffers.
+///
+/// **Binding 0 is always the read-only `Uniforms` storage buffer.** A module
+/// whose binding 0 is writable is rejected here rather than at dispatch, and a
+/// length mismatch is a validation failure, never a silent truncation.
+pub fn zip_buffers<'a>(
+    slots: &[BindingDesc],
+    buffers: &'a [wgpu::Buffer],
+) -> Result<Vec<wgpu::BindGroupEntry<'a>>, EmitError> {
+    check_uniform_binding(slots)?;
+    if slots.len() != buffers.len() {
+        return Err(EmitError::Validation(format!(
+            "{} derived bindings against {} buffers",
+            slots.len(),
+            buffers.len()
+        )));
+    }
+    Ok(slots
+        .iter()
+        .zip(buffers)
+        .map(|(slot, buffer)| wgpu::BindGroupEntry {
+            binding: slot.binding,
+            resource: buffer.as_entire_binding(),
+        })
+        .collect())
+}
+
+/// Assert the `Uniforms` invariant: binding 0 exists and is read-only.
+pub fn check_uniform_binding(slots: &[BindingDesc]) -> Result<(), EmitError> {
+    match slots.first() {
+        Some(first) if first.binding == 0 && first.read_only => Ok(()),
+        Some(first) if first.binding == 0 => Err(EmitError::Validation(
+            "binding 0 is the Uniforms block and must be read-only".into(),
+        )),
+        Some(_) | None => Err(EmitError::Validation(
+            "binding 0 must be the Uniforms storage buffer".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fusor2_ir::target::EmitError;
     use naga::{
         AddressSpace, ArraySize, GlobalVariable, Module, ResourceBinding, Scalar, Span,
         StorageAccess, Type, TypeInner,
@@ -106,14 +157,12 @@ mod tests {
         module
     }
 
-    /// Bindings are derived and sorted, read-only is inferred, and a bad
-    /// uniform slot is rejected.
+    /// Test 5 — derived, sorted, read-only inferred; mismatches rejected.
     #[test]
     fn bindings_sorted_and_read_only_derived() {
-        use crate::emit::testkit::check_uniform_binding;
         // Declared out of order: 2 (writable), 0, 1.
         let module = module_with(&[(2, true), (0, false), (1, false)]);
-        let slots = bindings_from_module(&module);
+        let slots = derive_bindings(&module);
         assert_eq!(
             slots
                 .iter()
@@ -140,29 +189,29 @@ mod tests {
         );
 
         // A writable binding 0 is refused: binding 0 is the Uniforms block.
-        let bad = bindings_from_module(&module_with(&[(0, true), (1, false)]));
+        let bad = derive_bindings(&module_with(&[(0, true), (1, false)]));
         assert!(matches!(
             check_uniform_binding(&bad),
             Err(EmitError::Validation(_))
         ));
 
         // A module with no binding 0 at all is refused too.
-        let missing = bindings_from_module(&module_with(&[(1, false)]));
+        let missing = derive_bindings(&module_with(&[(1, false)]));
         assert!(matches!(
             check_uniform_binding(&missing),
             Err(EmitError::Validation(_))
         ));
     }
 
-    /// Needs live `wgpu::Buffer`s, so it runs only when an adapter exists.
+    /// The length-mismatch half of test 5 needs live `wgpu::Buffer`s, so it
+    /// runs only when an adapter exists.
     #[test]
     fn zip_length_mismatch_is_a_validation_error() {
-        use crate::emit::testkit::zip_buffers;
         let Ok(gpu) = crate::device::gpu_blocking(&crate::device::DeviceOptions::default()) else {
             eprintln!("no wgpu adapter; skipping");
             return;
         };
-        let slots = bindings_from_module(&module_with(&[(0, false), (1, false), (2, true)]));
+        let slots = derive_bindings(&module_with(&[(0, false), (1, false), (2, true)]));
         let make = |i: u32| {
             gpu.device().create_buffer(&wgpu::BufferDescriptor {
                 label: Some("t"),

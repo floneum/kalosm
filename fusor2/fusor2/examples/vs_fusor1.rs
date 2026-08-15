@@ -10,7 +10,7 @@
 //! region on both sides, matching `fusor-ml/fusor/benches/fused.rs`'s own
 //! methodology.
 
-use fusor2::tensor::Tensor;
+use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Graph, Session};
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::ir::level1::MaskKind;
@@ -100,7 +100,7 @@ fn chain(x: &Tensor, y: &Tensor) -> Result<Tensor, String> {
 }
 
 fn main() {
-    let device = match fusor2::session::Device::gpu_blocking() {
+    let device = match fusor2::session::Backend::gpu_blocking() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("no gpu: {e}");
@@ -111,7 +111,7 @@ fn main() {
     println!("# fusor2 on {}", session.device().name());
     println!("workload\tcold_ms\tmin_ms\tmedian_ms\tlaunches");
 
-    // upload + readback floor, no compute. Both sides move the same
+    // ---- 0. upload + readback floor, no compute. Both sides move the same
     //         bytes, so every row below is this plus its kernel. ----
     {
         let n = 2048usize;
@@ -127,6 +127,7 @@ fn main() {
         row("passthrough_2048", &t);
     }
 
+    // ---- 1. matmul 1024^3 ----
     {
         let n = 2048usize;
         let a = bytes_of(&make(n * n, 0.013, 0.5));
@@ -147,6 +148,7 @@ fn main() {
         row("matmul_2048", &t);
     }
 
+    // ---- 2. matmul + bias + gelu (epilogue fusion) ----
     {
         let n = 2048usize;
         let a = bytes_of(&make(n * n, 0.013, 0.5));
@@ -174,6 +176,7 @@ fn main() {
         row("matmul_epilogue_2048", &t);
     }
 
+    // ---- 3. elementwise chain, 2048^2 ----
     {
         let n = 2048usize;
         let x = bytes_of(&make(n * n, 0.013, 0.9));
@@ -190,6 +193,7 @@ fn main() {
         row("elementwise_chain_2048", &t);
     }
 
+    // ---- 4. softmax last dim, 2048^2 ----
     {
         let n = 2048usize;
         let x = bytes_of(&make(n * n, 0.013, 2.0));
@@ -208,6 +212,7 @@ fn main() {
         row("softmax_2048", &t);
     }
 
+    // ---- 5. rms_norm, 2048^2 ----
     {
         let n = 2048usize;
         let x = bytes_of(&make(n * n, 0.013, 1.0));
@@ -220,7 +225,7 @@ fn main() {
             let w =
                 Tensor::from_slice(g.handle(), Dtype::F32, &wsh, &w).map_err(|e| e.to_string())?;
             let z = x
-                .rms_norm_fused_no_bias(&w, 1e-5)
+                .rms_norm(&w, 1e-5)
                 .map_err(|e| e.to_string())?
                 .sum(1)
                 .map_err(|e| e.to_string())?;
@@ -230,6 +235,7 @@ fn main() {
         row("rms_norm_2048", &t);
     }
 
+    // ---- 6. attention forward, [1,8,512,64] ----
     {
         let shape = [1u64, 8, 1024, 64];
         let numel: usize = shape.iter().product::<u64>() as usize;
@@ -253,10 +259,13 @@ fn main() {
         row("attention_1x8x1024x64", &t);
     }
 
+    // ---- 7. quantized matmul, Q4K weights, LLM-decode shape ----
     //
-    // A quantized contraction is an ordinary `KContract` whose operand happens
-    // to be `Dtype::Q(fmt)`, with the decode folded into the coop staging fill,
-    // so it reaches the cooperative-matrix path like any dense contraction.
+    // The row this whole exercise is for. A quantized contraction used to be a
+    // separate `L1::KQContract` with no `family` field, so it could not reach
+    // the cooperative-matrix path at all — the path that took dense attention
+    // from 27.6 ms to 9.3 ms. With the decode moved into the coop staging fill
+    // it is an ordinary `KContract` whose operand happens to be `Dtype::Q(fmt)`.
     {
         use fusor2_ir::dtype::{QFmt, QLayout};
         let fmt = QFmt::Q4K;
@@ -285,7 +294,7 @@ fn main() {
         row("qmatmul_q4k_256x4096x4096", &t);
     }
 
-    // quantized matvec, Q4K weights, M=1: the LLM decode shape. A
+    // ---- 8. quantized matvec, Q4K weights, M=1: the LLM decode shape. A
     //         materialize-the-weight plan is catastrophic here — one token
     //         cannot amortize a 4096^2 decode — so this row is what forces
     //         the staged-decode member to win extraction. ----

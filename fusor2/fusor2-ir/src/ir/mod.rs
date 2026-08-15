@@ -96,7 +96,6 @@ pub enum OpTag {
     KGather,
     KScatter,
     KRegion,
-    KMerged,
     Ext,
     // structural
     Union,

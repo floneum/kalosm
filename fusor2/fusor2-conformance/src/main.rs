@@ -14,6 +14,15 @@ use fusor2_conformance::exhaustive;
 use fusor2_conformance::harness::{self, Outcome, sessions};
 
 fn main() -> ExitCode {
+    // Race every class member of every launch, value-checking each against
+    // the selected plan. This is what makes a case cover the *class* rather
+    // than whichever member extraction happened to pick — the staged
+    // quantized decode was wrong for months behind cases that compared the
+    // materialize path against itself. Adoption is disabled in this mode, so
+    // dispatch-count assertions stay deterministic.
+    //
+    // SAFETY: set before any thread reads the environment.
+    unsafe { std::env::set_var("FUSOR2_VERIFY_MEMBERS", "1") };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let exhaustive_requested = exhaustive::requested(&args);
     // Everything after the flags is a case-name substring filter.
@@ -28,13 +37,24 @@ fn main() -> ExitCode {
     }
     println!("exhaustive: {exhaustive_requested}");
 
-    let reports = harness::run_filtered(filter.as_deref(), |_| {});
+    let reports = match &filter {
+        Some(f) => harness::Harness::with_filter(f.clone()).run(),
+        None => harness::run_all(|_| {}),
+    };
     let failures = harness::summarize(&reports);
 
     // A run that executed nothing is not a green run.
     let ran = reports.iter().filter(|r| !matches!(r.outcome, Outcome::Skipped(_))).count();
     if ran == 0 {
         println!("nothing ran; refusing to report success");
+        return ExitCode::FAILURE;
+    }
+    let wrong = fusor2::session::wrong_member_count();
+    if wrong > 0 {
+        println!(
+            "{wrong} class member(s) computed wrong values under the member sweep; \
+             every one is a live miscompile extraction could select"
+        );
         return ExitCode::FAILURE;
     }
     if failures == 0 {

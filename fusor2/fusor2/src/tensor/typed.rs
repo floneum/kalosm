@@ -1,13 +1,51 @@
-//! The compile-time-rank tensor. A zero-cost newtype over [`crate::Tensor`]
-//! with no effect on the IR and no rank ceiling.
+//! The compile-time-rank tensor. A zero-cost newtype over [`crate::Tensor`]:
+//! it has **no** effect on the IR, hosts no witness traits, and imposes no
+//! rank ceiling.
 //!
-//! A rank-changing method takes its output rank as an ordinary const parameter
-//! and validates it once; a bad rank is a panic that names the op and carries
-//! the same [`Error`] the runtime-rank [`crate::Tensor`] would have returned.
+//! What is deliberately absent: `LastRank`, `NextRank`, `SmallerRank`,
+//! `LargerRank`, `MaxRank`, `ShapeWithOneHole` and every other rank-relation
+//! witness. A rank-changing method takes its output rank as an ordinary const
+//! parameter and validates it once; a bad rank is a panic that names the op,
+//! never a compile-time trait-resolution puzzle.
+//!
+//! Also absent, and deliberately: the reference's third parameter
+//! `B: Fusion<R, D>`. It exists there to express CPU fusion laziness in the
+//! type system; here the e-graph does that job, and `to_concrete` /
+//! `into_concrete` — whose whole purpose was erasing `B` — are the identity.
+//!
+//! # Why every method panics instead of returning `Result`
+//!
+//! This is the API a model is written in. A forward pass chains thirty ops per
+//! expression and a shape error in any of them is a bug in the model, not a
+//! runtime condition the caller can act on: there is no recovery from "the
+//! bias has rank 2". The runtime-rank [`crate::Tensor`] returns `Result` from
+//! everything and is the layer to use when a shape is data. Every panic here
+//! carries the underlying [`Error`], so the two agree on diagnosis and differ
+//! only on delivery.
+//!
+//! # Mixed precision
 //!
 //! Folds and contractions accumulate in [`Dtype::compute_dtype`], so an f16
-//! operand accumulates in f32; [`narrow_acc`] casts the result back, which
-//! keeps `max` on a `Tensor<R, f16>` a `Tensor<R - 1, f16>`.
+//! operand accumulates in f32; [`narrow_acc`] casts the result back, which is
+//! what keeps `max` on a `Tensor<R, f16>` a `Tensor<R - 1, f16>` the way the
+//! signature and the reference both say. Wide arithmetic, narrow types.
+//!
+//! Both halves of `betlang-train --f16` run. The forward is covered by
+//! `trainer_surface::tests::the_trainers_f16_convolution_stack_computes` and
+//! the backward — including the `max` pool, whose adjoint is the one that used
+//! to be unbuildable — by
+//! `a_backward_through_the_f16_convolution_stack_reaches_the_weights`.
+//!
+//! That backward failed until recently, and the cause was outside this crate:
+//! `extremum_adjoint` in `fusor2-autograd/src/structural.rs` declared both
+//! operands of its argmax comparison at the *operand* dtype while the value it
+//! compares against is the broadcast fold output, which is at `compute_dtype`,
+//! so an f16 `max` or `min` reported `Map body reads Arg(1) as F16 but the
+//! operand is F32`. That adjoint now builds its whole expression at the
+//! accumulator width and narrows once at the end. Nothing in this file changed
+//! for it; the note is kept because the symptom surfaced here.
+//!
+//! Owned by W12.
 
 use std::marker::PhantomData;
 use std::ops::{Add, Div, Mul, Neg, Range, Sub};
@@ -23,14 +61,22 @@ use crate::tensor::readback::{TensorSlice, ToVec};
 use crate::tensor::{Scalar, Tensor as Dyn};
 use crate::{Error, Result};
 
-/// A Rust scalar with a fusor2 dtype. Also spelled [`SimdElement`].
+mod composite;
+mod construct;
+mod ops;
+
+/// A Rust scalar with a fusor2 dtype.
+///
+/// Named `Element`; `SimdElement` is the same trait under the reference's
+/// spelling, kept so a `T: SimdElement` bound written against that API still
+/// resolves.
 pub trait Element: bytemuck::Pod + Copy + Send + Sync + 'static {
     const DTYPE: Dtype;
     /// This value as the backend's splat literal.
     fn splat(self) -> Splat;
 }
 
-/// Alias of [`Element`].
+/// The reference's spelling of [`Element`].
 pub use self::Element as SimdElement;
 
 impl Element for f32 {
@@ -63,6 +109,10 @@ impl Element for i32 {
         Splat::I32(self)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Axis selectors
+// ---------------------------------------------------------------------------
 
 /// An axis argument: a literal index, or one of the from-the-end selectors.
 pub trait Axis<const R: usize> {
@@ -111,6 +161,10 @@ axis_consts! {
     Dim4 = 4; Dim5 = 5; Dim6 = 6; Dim7 = 7;
 }
 
+// ---------------------------------------------------------------------------
+// Tensor
+// ---------------------------------------------------------------------------
+
 /// A [`crate::Tensor`] whose rank and dtype are asserted at construction and
 /// then tracked in the type. `repr(transparent)`: the same size and layout as
 /// the runtime-rank tensor.
@@ -120,7 +174,7 @@ pub struct Tensor<const R: usize, T: Element = f32> {
     _t: PhantomData<T>,
 }
 
-/// Alias of [`Tensor`].
+/// The pre-rename spelling of [`Tensor`].
 pub type Typed<const R: usize, D> = Tensor<R, D>;
 
 impl<const R: usize, T: Element> Clone for Tensor<R, T> {
@@ -163,11 +217,21 @@ fn dims_of<const N: usize>(shape: [usize; N]) -> Vec<Dim> {
     shape.iter().map(|&d| Dim::Const(d as u64)).collect()
 }
 
-/// Undo the accumulator promotion an accumulating op performs, keeping the
-/// const-rank signatures dtype-preserving.
+/// Undo the accumulator promotion an accumulating op performs.
 ///
-/// Narrows exactly the promotion: any other dtype disagreement falls through
-/// to [`Tensor::try_new`], which reports it.
+/// A fold and a contraction accumulate in [`Dtype::compute_dtype`], so an f16
+/// operand comes back f32 — deliberately, and documented as such on
+/// [`crate::Tensor::sum`]: "narrowing back is an explicit `cast` the caller
+/// writes". The const-rank API *is* that caller. Its signatures are
+/// dtype-preserving, matching the reference, where `max` on a
+/// `Tensor<R, f16>` is a `Tensor<R - 1, f16>`, so the cast is written here
+/// once instead of at every model call site. `composite::conv` already does
+/// the same thing after its contraction.
+///
+/// Narrowing exactly the promotion and nothing else: any *other* dtype
+/// disagreement falls through to [`Tensor::try_from_dyn`], which reports it. A
+/// blanket `cast` here would convert a genuine mismatch into a silent
+/// reinterpretation.
 fn narrow_acc<T: Element>(r: Result<Dyn>) -> Result<Dyn> {
     let v = r?;
     if v.dtype() == T::DTYPE || v.dtype() != T::DTYPE.compute_dtype() {
@@ -181,15 +245,20 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 
     /// Wrap a runtime-rank value.
     ///
+    /// Named `from_dyn`, not `new`: the reference spells `Tensor::new(device,
+    /// array)` and a model that ports by changing imports writes that. This is
+    /// the inverse of [`Tensor::into_dyn`] and reads as one.
+    ///
     /// # Panics
-    /// If the rank or dtype disagrees. [`Tensor::try_new`] reports instead.
+    /// If the rank or dtype disagrees. [`Tensor::try_from_dyn`] reports
+    /// instead.
     #[track_caller]
-    pub fn new(raw: Dyn) -> Self {
-        ok("Tensor::new", Self::try_new(raw))
+    pub fn from_dyn(raw: Dyn) -> Self {
+        ok("Tensor::from_dyn", Self::try_from_dyn(raw))
     }
 
-    /// [`Tensor::new`], reporting the mismatch instead of panicking.
-    pub fn try_new(raw: Dyn) -> Result<Self> {
+    /// [`Tensor::from_dyn`], reporting the mismatch instead of panicking.
+    pub fn try_from_dyn(raw: Dyn) -> Result<Self> {
         if raw.rank() != R {
             return Err(Error::Shape(format!(
                 "Tensor<{R}, _>: value has rank {}",
@@ -210,16 +279,21 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     }
 
     #[track_caller]
-    fn wrap<const O: usize, E: Element>(what: &str, r: Result<Dyn>) -> Tensor<O, E> {
+    pub(super) fn wrap<const O: usize, E: Element>(what: &str, r: Result<Dyn>) -> Tensor<O, E> {
         let raw = ok(what, r);
-        ok(what, Tensor::<O, E>::try_new(raw))
+        ok(what, Tensor::<O, E>::try_from_dyn(raw))
     }
 
     /// The runtime-rank value underneath. The IR never saw the wrapper.
     pub fn into_inner(self) -> Dyn {
         self.raw
     }
-    pub fn as_tensor(&self) -> &Dyn {
+    /// Alias of [`Tensor::into_inner`].
+    pub fn into_dyn(self) -> Dyn {
+        self.raw
+    }
+    /// Alias of [`Tensor::as_tensor`].
+    pub fn as_dyn(&self) -> &Dyn {
         &self.raw
     }
     pub fn id(&self) -> Id {
@@ -251,29 +325,81 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         self.shape()[i]
     }
 
-    /// Element count.
+    /// Extents, including the symbolic ones.
+    ///
+    /// [`Tensor::shape`] is the `[usize; R]` a model destructures and it
+    /// panics on a [`Dim::Sym`]; this is the accessor for the code that has
+    /// one. The whole decode-with-one-plan trick is a symbolic sequence
+    /// length, so a KV cache and an attention mask both reach for this.
+    #[track_caller]
+    pub fn extents(&self) -> [Dim; R] {
+        let shape = self.raw.shape();
+        if shape.len() != R {
+            ok::<()>(
+                "Tensor::extents",
+                Err(Error::Shape(format!(
+                    "extents: value has rank {}, not {R}",
+                    shape.len()
+                ))),
+            );
+        }
+        std::array::from_fn(|i| shape[i])
+    }
+
+    /// The extent of one axis, symbolic or not.
+    #[track_caller]
+    pub fn extent(&self, axis: impl Axis<R>) -> Dim {
+        self.extents()[axis.resolve()]
+    }
+
+    /// Element count. Panics on a symbolic extent; [`Tensor::elem_count`] is
+    /// the total form.
     #[track_caller]
     pub fn elements(&self) -> usize {
         self.shape().iter().product()
     }
 
-    /// Alias of [`Tensor::elements`].
+    /// Element count, or `None` when an extent is still symbolic.
+    pub fn elem_count(&self) -> Option<u64> {
+        self.raw.elem_count()
+    }
+
+    /// Replace the bytes of an external leaf in place, leaving every node
+    /// built on top of it — and so the resolved plan — untouched.
+    ///
+    /// This is the per-step token and position update of a decode loop: the
+    /// whole point of one plan per shape is that the leaf changes and the
+    /// program does not.
     #[track_caller]
-    pub fn elem_count(&self) -> usize {
-        self.elements()
+    pub fn set_bytes(&self, bytes: Vec<u8>) {
+        ok("Tensor::set_bytes", self.raw.set_bytes(bytes));
+    }
+
+    /// [`Tensor::set_bytes`] from typed host elements.
+    #[track_caller]
+    pub fn set_elements(&self, data: &[T]) {
+        self.set_bytes(bytemuck::cast_slice(data).to_vec());
     }
 
     /// Re-assert rank and dtype.
     #[track_caller]
     pub fn retype<const O: usize, E: Element>(self) -> Tensor<O, E> {
-        ok("Tensor::retype", Tensor::<O, E>::try_new(self.raw))
+        ok("Tensor::retype", Tensor::<O, E>::try_from_dyn(self.raw))
     }
 
-    /// Identity: the e-graph owns when to materialize.
+    // -- the `B: Fusion` erasers -------------------------------------------
+
+    /// Identity. In the reference this collapsed a lazy fusion expression into
+    /// a concrete buffer; here the e-graph owns that decision, so there is no
+    /// laziness to collapse and the call is a no-op kept so the model reads
+    /// the same.
     ///
-    /// It does not bound the graph — a value that is never re-leafed keeps its
-    /// producers alive. [`Tensor::detach`] cuts that, at the cost of a host
-    /// round-trip.
+    /// What it does **not** do, and the reference's did: bound the graph. A
+    /// value that is never re-leafed keeps its producers alive, so a training
+    /// loop that builds a fresh tape per step accumulates nodes in the ambient
+    /// graph for the process lifetime. Fixing that wants a materialize that
+    /// adopts the resolved device buffer as a leaf without a host round-trip;
+    /// [`Tensor::detach`] is the correct-but-expensive stand-in.
     pub fn into_concrete(self) -> Self {
         self
     }
@@ -289,6 +415,10 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         Self::wrap("detach", self.raw.detach())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Construction from a device
+// ---------------------------------------------------------------------------
 
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// Upload dense host data.
@@ -342,11 +472,22 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         )
     }
 
-    /// Which backend the owning session runs on.
-    pub fn device(&self) -> crate::session::Device {
-        self.raw.device()
+    /// The device this value was built from — the same type
+    /// [`Tensor::zeros`] and [`Tensor::from_slice`] take, so
+    /// `Tensor::zeros(&x.device(), shape)` type-checks.
+    pub fn device(&self) -> Device {
+        Device::of_graph(self.raw.graph())
+    }
+
+    /// Which backend that device runs on.
+    pub fn backend(&self) -> crate::session::Backend {
+        self.raw.backend()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Elementwise
+// ---------------------------------------------------------------------------
 
 /// Rank- and dtype-preserving unaries.
 macro_rules! same {
@@ -355,9 +496,10 @@ macro_rules! same {
             #[doc = concat!("[`crate::Tensor::", stringify!($name), "`], rank and dtype preserved.")]
             #[track_caller]
             pub fn $name(&self) -> Self {
-                // A path, not a method call: the runtime tensor implements
-                // `std::ops::Neg`, which would win the method probe over the
-                // inherent `Result`-returning op.
+                // Spelled as a path, not a method call: the runtime tensor
+                // also implements `std::ops::Neg`, whose by-value pick would
+                // win the method probe over the inherent `Result`-returning
+                // one and hand back an already-unwrapped value.
                 Self::wrap(stringify!($name), Dyn::$name(&self.raw))
             }
         )*}
@@ -413,9 +555,9 @@ macro_rules! same_bin {
             #[doc = concat!("[`crate::Tensor::", stringify!($name), "`], shapes must match.")]
             #[track_caller]
             pub fn $name(&self, rhs: &Self) -> Self {
-                // A path call: the runtime tensor implements
-                // `Add`/`Sub`/`Mul`/`Div`, and a method call would resolve to
-                // the operator, not the op.
+                // A path call, for the same reason `same!` uses one: the
+                // runtime tensor implements `Add`/`Sub`/`Mul`/`Div`, and a
+                // method call would resolve to the operator, not the op.
                 Self::wrap(stringify!($name), Dyn::$name(&self.raw, &rhs.raw))
             }
         )*}
@@ -456,14 +598,15 @@ same_scalar!(
     lte_scalar,
     gt_scalar,
     gte_scalar,
-    mt,
-    mte,
 );
 
 /// The operand slot of a broadcasting binary.
 ///
-/// Denotes whatever names the right-hand tensor. It is inferred from the
-/// argument, so `_` is the only thing a call site writes there.
+/// This is the parameter the reference spelled `B: Fusion<R2, D>`. Dropping it
+/// outright would change `mul_::<1, 1, _>` into an arity error, so the slot
+/// survives as what it always denoted at the call site: "whatever names the
+/// right-hand tensor". It is inferred from the argument; `_` is the only thing
+/// anyone ever wrote there.
 pub trait Operand<const R: usize, T: Element> {
     fn operand(&self) -> &Tensor<R, T>;
 }
@@ -520,18 +663,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         Self::wrap("pow_", self.raw.pow_(&rhs.operand().raw))
     }
 
-    /// Elementwise `max(self, value)`.
-    #[track_caller]
-    pub fn max_elementwise(&self, value: impl Into<Scalar>) -> Self {
-        self.max_scalar(value)
-    }
-
-    /// Elementwise `min(self, value)`.
-    #[track_caller]
-    pub fn min_elementwise(&self, value: impl Into<Scalar>) -> Self {
-        self.min_scalar(value)
-    }
-
     /// Clamp into `[lo, hi]`.
     #[track_caller]
     pub fn clamp(&self, lo: impl Into<Scalar>, hi: impl Into<Scalar>) -> Self {
@@ -565,6 +696,10 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         Self::wrap("round_mode", self.raw.round_mode(mode))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Views
+// ---------------------------------------------------------------------------
 
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// Swap two axes.
@@ -602,7 +737,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     pub fn chunk(&self, chunks: usize, dim: impl Axis<R>) -> Vec<Self> {
         ok("chunk", self.raw.chunk(chunks, dim.resolve()))
             .into_iter()
-            .map(Self::new)
+            .map(Self::from_dyn)
             .collect()
     }
 
@@ -611,12 +746,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     pub fn reshape<const O: usize>(&self, shape: [usize; O]) -> Tensor<O, T> {
         let extents: [Extent; O] = shape.map(Extent::from);
         Self::wrap("reshape", self.raw.reshape(&extents))
-    }
-
-    /// Reshape with [`Extent`] holes.
-    #[track_caller]
-    pub fn reshape_extents<const O: usize>(&self, shape: [Extent; O]) -> Tensor<O, T> {
-        Self::wrap("reshape", self.raw.reshape(&shape))
     }
 
     /// Broadcast into a statically known output rank.
@@ -673,16 +802,11 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     /// Batched matrix product over the last two axes.
     ///
     /// Accumulates in [`Dtype::compute_dtype`] and narrows back, so an f16
-    /// matmul has f32 accumulators.
+    /// matmul has f32 accumulators — the mixed-precision contract, and what
+    /// the cooperative-matrix path wants.
     #[track_caller]
     pub fn matmul(&self, rhs: &Self) -> Self {
         Self::wrap("matmul", narrow_acc::<T>(self.raw.matmul(&rhs.raw)))
-    }
-
-    /// Alias of [`Tensor::matmul`].
-    #[track_caller]
-    pub fn mat_mul(&self, rhs: &Self) -> Self {
-        self.matmul(rhs)
     }
 
     /// Matrix product against a transposed right-hand side.
@@ -692,10 +816,18 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     }
 }
 
-/// Rank-reducing folds; `O` is `R - 1` and the axis is an ordinary argument.
+// ---------------------------------------------------------------------------
+// Folds
+// ---------------------------------------------------------------------------
+
+/// Rank-reducing folds; `O` is `R - 1`.
 ///
-/// The accumulator dtype is [`Dtype::compute_dtype`], not the operand's;
-/// [`narrow_acc`] casts the result back, so the signature is dtype-preserving.
+/// One const parameter — the output rank — and the axis as an ordinary
+/// argument, so `sum::<0>(0)` means what it reads as.
+///
+/// The *accumulator* dtype is [`Dtype::compute_dtype`], not the operand's: an
+/// f16 fold accumulates in f32 and [`narrow`] casts the result back, so the
+/// signature stays dtype-preserving while the arithmetic stays wide.
 macro_rules! reduce {
     ($($name:ident),* $(,)?) => {
         impl<const R: usize, T: Element> Tensor<R, T> {$(
@@ -732,13 +864,20 @@ reduce_keepdim!(
     var_keepdim,
 );
 
+// ---------------------------------------------------------------------------
+// Convolution
+// ---------------------------------------------------------------------------
+
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// `[batch, in_ch, ...spatial]` convolved with `[out_ch, in_ch, ...kernel]`.
     ///
+    /// The three const parameters are the reference's, in its order:
     /// `WEIGHT_RANK` is the kernel's rank, `DIFF` the number of spatial axes
     /// (and so the length of `padding` and `strides`), and `WINDOWED` the rank
-    /// of the sliding-window view the lowering builds, which must be
-    /// `R + DIFF`.
+    /// of the sliding-window view the lowering builds, `R + DIFF`. The
+    /// reference spelled the last as a `LargerRank<R2, DIFF>` witness; here it
+    /// is checked arithmetically, which is the whole of what that witness
+    /// asserted.
     #[track_caller]
     pub fn conv<const WEIGHT_RANK: usize, const DIFF: usize, const WINDOWED: usize>(
         &self,
@@ -784,6 +923,10 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         )
     }
 }
+
+// ---------------------------------------------------------------------------
+// Operators
+// ---------------------------------------------------------------------------
 
 macro_rules! binop {
     ($trait:ident, $method:ident, $inner:ident, $scalar:ident) => {
@@ -853,6 +996,10 @@ impl<const R: usize, T: Element> Neg for &Tensor<R, T> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Concatenation
+// ---------------------------------------------------------------------------
+
 /// Join values along `dim`. Every part keeps its rank.
 ///
 /// Takes an iterator rather than a slice: the parts are usually produced by a
@@ -865,7 +1012,7 @@ where
 {
     let parts: Vec<Dyn> = parts.into_iter().map(Tensor::into_inner).collect();
     let raw = ok("cat", crate::ops::index::cat(&parts, dim));
-    ok("cat", Tensor::try_new(raw))
+    ok("cat", Tensor::try_from_dyn(raw))
 }
 
 /// Stack values into a new axis; output rank `O = R + 1`.
@@ -876,7 +1023,7 @@ where
 {
     let parts: Vec<Dyn> = parts.into_iter().map(Tensor::into_inner).collect();
     let raw = ok("stack", crate::ops::index::stack(&parts, dim));
-    ok("stack", Tensor::try_new(raw))
+    ok("stack", Tensor::try_from_dyn(raw))
 }
 
 impl<const R: usize, T: Element> Tensor<R, T> {
@@ -889,6 +1036,10 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         cat(parts, dim)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Readback
+// ---------------------------------------------------------------------------
 
 /// A host copy of a const-rank value.
 ///
@@ -1018,6 +1169,25 @@ mod tests {
         );
     }
 
+    /// `device()` hands back the type the constructors take.
+    ///
+    /// It used to return `session::Backend` — the backend *selector*, a
+    /// different type than the `&Device` `zeros`/`from_slice` want — so this
+    /// expression did not compile at all and a model had to keep its own
+    /// `Device` threaded alongside every tensor. The round trip must also land
+    /// in the *same* graph: a device that named a different graph would make
+    /// every op between the two values an error.
+    #[test]
+    fn a_values_device_builds_more_values_in_the_same_graph() {
+        let _serial = crate::device::test_device_lock();
+        let device = Device::cpu();
+        let x = Tensor::<2, f32>::zeros(&device, [2, 3]);
+        let y = Tensor::<2, f32>::ones(&x.device(), [2, 3]);
+        assert!(std::sync::Arc::ptr_eq(x.graph(), y.graph()));
+        assert_eq!(Tensor::add(&x, &y).to_flat(), vec![1.0f32; 6]);
+        assert_eq!(x.device().name(), "cpu");
+    }
+
     #[test]
     fn element_dtypes() {
         assert_eq!(<f32 as Element>::DTYPE, Dtype::F32);
@@ -1043,14 +1213,20 @@ mod tests {
         assert!(const_extents::<1>(&[Dim::Const(2), Dim::Const(3)], "t").is_err());
     }
 
+    // -----------------------------------------------------------------------
+    // The surface, exercised directly
     //
-    // This file's own machinery: the rank-changing output parameters, the
-    // `conv` rank arithmetic, the concretization no-ops, and every operator
-    // form. A regression in any of them is a compile error or a wrong value
-    // here.
+    // `crate::trainer_surface` restates `betlang-train`'s spellings and runs
+    // the ones the trainer's own recipe reaches. What follows covers this
+    // file's own machinery instead: the rank-changing output parameters, the
+    // `conv` arithmetic that replaced the reference's witness trait, the
+    // `B: Fusion` erasers, and every operator form. A regression in any of
+    // them is a compile error or a wrong value *here*.
+    // -----------------------------------------------------------------------
 
-    /// `SimdElement` resolves as a bound, and the dtype parameter defaults to
-    /// `f32`, so `Tensor<1>` is `Tensor<1, f32>`.
+    /// `SimdElement` is `Element` under the reference's name, and the dtype
+    /// parameter defaults to `f32`, so `Tensor<1>` is `Tensor<1, f32>`. Both
+    /// are shapes the trainer's signatures depend on.
     ///
     /// Never called: the assertion is that it type-checks.
     #[allow(dead_code)]
@@ -1066,11 +1242,14 @@ mod tests {
         t
     }
 
-    /// `into_concrete` and `to_concrete` are the identity: the value they hand
-    /// back is the *same node*, not a copy of it. If either materialized, the
-    /// e-graph would see a different id and the fake-quant `with_backwards`
-    /// boundary, which is keyed on the node the model handed it, would stop
-    /// matching.
+    /// `into_concrete` and `to_concrete` are the approved identity: the value
+    /// they hand back is the *same node*, not a copy of it.
+    ///
+    /// This is what makes the reference's `B: Fusion<R, D>` droppable — the 29
+    /// trainer call sites whose whole purpose was erasing `B` become no-ops —
+    /// and nothing else asserts it. If either ever materialized, the e-graph
+    /// would see a different id and the fake-quant `with_backwards` boundary,
+    /// which is keyed on the node the model handed it, would stop matching.
     #[test]
     fn the_fusion_erasers_hand_back_the_same_node() {
         let _serial = crate::device::test_device_lock();
@@ -1112,8 +1291,9 @@ mod tests {
         assert_eq!(y.to_flat(), vec![4.5, 8.5, 12.5, 11.5]);
     }
 
-    /// `WINDOWED` is checked arithmetically: it must be `R + DIFF`. A wrong
-    /// one panics naming the op and both ranks.
+    /// `WINDOWED` is checked arithmetically — it must be `R + DIFF` — which is
+    /// the whole of what the reference's `LargerRank<R2, DIFF>` witness
+    /// asserted. A wrong one names the op and both ranks.
     #[test]
     #[should_panic(expected = "has rank 4, not 5")]
     fn conv_rejects_a_windowed_rank_that_is_not_r_plus_diff() {
@@ -1171,7 +1351,7 @@ mod tests {
     }
 
     /// `cat` keeps the rank, `stack` raises it. Both are re-exported at the
-    /// crate root under `typed-api`.
+    /// crate root under `typed-api`, which is how the trainer reaches `cat`.
     #[test]
     fn cat_keeps_the_rank_and_stack_raises_it() {
         let _serial = crate::device::test_device_lock();
@@ -1194,7 +1374,9 @@ mod tests {
     }
 
     /// The operand slot is inferred from the argument, so `_` is the only
-    /// thing a call site ever writes there.
+    /// thing a call site ever writes there — which is what keeps the
+    /// trainer's `mul_::<1, 1, _>` and `mul_::<2, 2, _>` an arity match after
+    /// `B: Fusion<R2, D>` was dropped.
     #[test]
     fn a_broadcasting_binary_infers_its_operand_slot() {
         let _serial = crate::device::test_device_lock();
@@ -1203,6 +1385,7 @@ mod tests {
         let scale = Tensor::<1, f32>::from_slice(&device, [2], &[10.0, 100.0]);
         let one = Tensor::<1, f32>::from_slice(&device, [1], &[2.0]);
 
+        // The trainer's rank-2 spelling, and the rank-1 one from `optim.rs`.
         let scaled: Tensor<2, f32> = rows.mul_::<1, 2, _>(&scale);
         assert_eq!(scaled.to_flat(), vec![10.0, 200.0, 30.0, 400.0]);
         let halved: Tensor<1, f32> = scale.div_::<1, 1, _>(&one);
@@ -1219,7 +1402,8 @@ mod tests {
     }
 
     /// All six operator impls — owned/borrowed on either side, and the `f32`
-    /// right-hand form — mean the same op.
+    /// right-hand form — mean the same op. `optim.rs` writes four of them in
+    /// one expression.
     #[test]
     fn every_operator_form_is_the_same_op() {
         let _serial = crate::device::test_device_lock();
@@ -1273,7 +1457,7 @@ mod tests {
 
     /// `narrow_acc` undoes the accumulator promotion and *only* that. A dtype
     /// disagreement that is not the promotion falls through untouched, so
-    /// `try_new` reports it instead of it being silently reinterpreted.
+    /// `try_from_dyn` reports it instead of it being silently reinterpreted.
     #[test]
     fn narrow_acc_undoes_the_promotion_and_nothing_else() {
         let _serial = crate::device::test_device_lock();
@@ -1293,7 +1477,7 @@ mod tests {
         let ints = Tensor::<1, u32>::from_slice(&device, [2], &[1, 2]);
         let through = narrow_acc::<f32>(Ok(ints.into_inner())).unwrap();
         assert_eq!(through.dtype(), Dtype::U32);
-        assert!(Tensor::<1, f32>::try_new(through).is_err());
+        assert!(Tensor::<1, f32>::try_from_dyn(through).is_err());
     }
 
     /// A host-data length that disagrees with the shape is a panic naming both.
@@ -1304,23 +1488,23 @@ mod tests {
         let _ = Tensor::<2, f32>::from_slice(&device, [2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0]);
     }
 
-    /// `try_new` reports a rank mismatch rather than panicking; `new` panics
+    /// `try_from_dyn` reports a rank mismatch rather than panicking; `new` panics
     /// with the same diagnosis. The two differ only on delivery.
     #[test]
-    fn try_new_and_new_agree_on_diagnosis() {
+    fn try_from_dyn_and_from_dyn_agree_on_diagnosis() {
         let _serial = crate::device::test_device_lock();
         let device = Device::cpu();
         let a = Tensor::<2, f32>::zeros(&device, [2, 3]);
         let raw = a.clone().into_inner();
 
-        let err = Tensor::<3, f32>::try_new(raw.clone()).unwrap_err();
+        let err = Tensor::<3, f32>::try_from_dyn(raw.clone()).unwrap_err();
         assert!(format!("{err}").contains("value has rank 2"), "{err}");
-        let err = Tensor::<2, u32>::try_new(raw.clone()).unwrap_err();
+        let err = Tensor::<2, u32>::try_from_dyn(raw.clone()).unwrap_err();
         assert!(format!("{err}").contains("value has dtype"), "{err}");
 
         // `retype` is the same assertion spelled on a value that already has a
         // wrapper, and a correct one is a no-op.
         assert_eq!(a.clone().retype::<2, f32>().id(), a.id());
-        assert_eq!(Tensor::<2, f32>::new(raw).id(), a.id());
+        assert_eq!(Tensor::<2, f32>::from_dyn(raw).id(), a.id());
     }
 }

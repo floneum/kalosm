@@ -2,8 +2,11 @@
 //! f32 uniform scalars...]` and is a **storage** buffer, because the derived
 //! bind-group mechanism walks storage globals.
 //!
-//! Because of that buffer, `m * lr_f32` produces a `Uniform` rather than a
-//! baked literal, and a sequence length is a `Sym` read from binding 0.
+//! That one buffer kills trainer constraints 1 and 2 together: `m * lr_f32`
+//! produces a `Uniform`, not a baked literal, and a sequence length is a `Sym`
+//! read from binding 0.
+//!
+//! Owned by W9.
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;
@@ -46,6 +49,21 @@ pub struct UniformPack {
 }
 
 impl UniformPack {
+    /// The word layout's identity. The three index maps are derived from the
+    /// three lists below them, so those lists are the whole of it.
+    ///
+    /// A kernel body bakes these slot indices, which is why an artifact's
+    /// cache key carries this and not `Plan::symbols`: two plans that agree
+    /// on the pack emit the same words whatever else differs between them.
+    pub fn digest(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        self.dim_syms.hash(&mut h);
+        self.scalar_syms.hash(&mut h);
+        self.strides.hash(&mut h);
+        h.finish()
+    }
+
     /// Derive the word layout of binding 0 from a plan.
     ///
     /// A symbol appears in exactly one of the two groups: `dim_syms` when any
@@ -291,9 +309,9 @@ mod tests {
         }
     }
 
-    /// Three syms and two uniform scalars: dims pack as LE u32 and scalars as
-    /// LE f32, with `dim_slot`/`scalar_slot` agreeing with `plan.symbols`
-    /// order.
+    /// Test 2: three syms and two uniform scalars produce 20 bytes, dims at
+    /// words 0..3 as LE u32 and scalars at words 3..5 as LE f32, with
+    /// `dim_slot`/`scalar_slot` agreeing with `plan.symbols` order.
     #[test]
     fn uniform_block_layout() {
         let (s0, s1, s2) = (SymId(0), SymId(1), SymId(2));
@@ -333,7 +351,8 @@ mod tests {
         assert_eq!(&bytes[24..28], &1024.0f32.to_le_bytes());
     }
 
-    /// Three syms and two scalars with no derived strides in play: 20 bytes.
+    /// The exact 20-byte shape the spec's test names: three syms and two
+    /// scalars with no derived strides in play.
     #[test]
     fn uniform_block_layout_without_derived_strides() {
         let (s0, s1, s2) = (SymId(0), SymId(1), SymId(2));

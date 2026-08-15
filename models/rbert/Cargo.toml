@@ -9,8 +9,8 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["ai", "llm", "bert", "nlp", "transformers"]
 
 [dependencies]
-fusor2 = { path = "../../fusor2-verified/fusor2" }
-fusor2-gguf = { path = "../../fusor2-verified/fusor2-gguf" }
+fusor2 = { path = "../../fusor2/fusor2" }
+fusor2-gguf = { path = "../../fusor2/fusor2-gguf" }
 tokenizers = { workspace = true, features = ["fancy-regex"] }
 thiserror.workspace = true
 

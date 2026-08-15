@@ -1,6 +1,9 @@
 //! GGUF file parsing: header, metadata key-value table, tensor directory.
 //!
-//! The writer exists only so the reader can be round-trip tested.
+//! Ported from the reference's `gguf/src/lib.rs` header path. The writer is
+//! kept only so the reader can be round-trip tested.
+//!
+//! Owned by W11.
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::{Dtype, QFmt};
@@ -10,6 +13,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 /// GGUF wire format tags. Wider than [`QFmt`] because a file may name a
 /// format fusor2 does not ingest; [`Self::to_qfmt`] is the total gate.
+///
+/// A wire tag is a fact about the *file*, not about the IR, so it lives with
+/// the parser that reads it: nothing in the compiler crates names one.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[allow(non_camel_case_types)]
 #[repr(u32)]
@@ -73,7 +79,7 @@ impl GgmlType {
     }
 }
 
-/// `GGUF`. A byte-reversed spelling is also accepted.
+/// `GGUF`. A byte-reversed spelling is also accepted, as the reference does.
 pub const GGUF_MAGIC_BYTES: [u8; 4] = *b"GGUF";
 
 /// Tensor data starts at the next multiple of this unless the file overrides
@@ -83,6 +89,10 @@ pub const DEFAULT_ALIGNMENT: u64 = 32;
 fn io<E: std::fmt::Display>(e: E) -> Error {
     Error::Io(e.to_string())
 }
+
+// ---------------------------------------------------------------------------
+// Version and primitive reads
+// ---------------------------------------------------------------------------
 
 /// Container version. V1 length-prefixes with u32; V2 and V3 with u64.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -185,8 +195,12 @@ fn write_string<W: Write>(writer: &mut W, value: &str, version: GgufVersion) -> 
     writer.write_all(value.as_bytes()).map_err(io)
 }
 
-/// Wire tag of a metadata value. The numbering is not contiguous: U64/I64/F64
-/// are tagged 10-12, after Bool/String/Array.
+// ---------------------------------------------------------------------------
+// Metadata values
+// ---------------------------------------------------------------------------
+
+/// Wire tag of a metadata value. The numbering is not contiguous — U64/I64/F64
+/// were appended after Bool/String/Array.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum GgufMetadataValueType {
@@ -287,9 +301,14 @@ impl GgufValue {
         }
     }
 
+    widening!(to_u8, u8, U8, U16, U32, U64, I8, I16, I32, I64);
+    widening!(to_i8, i8, I8, I16, I32, I64, U8, U16, U32, U64);
+    widening!(to_u16, u16, U16, U8, U32, U64, I8, I16, I32, I64);
+    widening!(to_i16, i16, I16, I8, I32, I64, U8, U16, U32, U64);
     widening!(to_u32, u32, U32, U8, U16, U64, I8, I16, I32, I64);
     widening!(to_i32, i32, I32, I8, I16, I64, U8, U16, U32, U64);
     widening!(to_u64, u64, U64, U8, U16, U32, I8, I16, I32, I64);
+    widening!(to_i64, i64, I64, I8, I16, I32, U8, U16, U32, U64);
     widening!(to_f32, f32, F32, F64);
     widening!(to_f64, f64, F64, F32);
 
@@ -302,7 +321,8 @@ impl GgufValue {
         }
     }
 
-    /// The string body, or a `Dtype` error.
+    /// The string body, or a `Dtype` error. Named `to_string_value` because
+    /// `to_string` belongs to `Display`.
     pub fn to_string_value(&self) -> Result<&str> {
         match self {
             Self::String(s) => Ok(s),
@@ -386,6 +406,10 @@ impl GgufValue {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GGML type geometry and the ingest gate
+// ---------------------------------------------------------------------------
+
 /// Elements one block of this wire type holds.
 pub const fn ggml_block_elements(ty: GgmlType) -> u64 {
     match ty {
@@ -428,13 +452,18 @@ pub const fn ggml_block_bytes(ty: GgmlType) -> u64 {
 }
 
 /// The total ingest gate: F32, F16 and the six block formats fusor2 decodes
-/// end to end. Everything else is an error naming the tag.
+/// end to end. Everything else is an error naming the tag — not a panic, and
+/// not a silent fallback.
 pub fn ingest_qfmt(ty: GgmlType) -> Result<Dtype> {
     ty.to_dtype()
         .ok_or_else(|| Error::Dtype(format!("gguf type {ty:?} has no ingest path")))
 }
 
-/// One tensor's directory entry. `shape` is reversed at read: GGUF stores
+// ---------------------------------------------------------------------------
+// Tensor directory
+// ---------------------------------------------------------------------------
+
+/// One tensor's directory entry. `shape` is **reversed at read**: GGUF stores
 /// dimensions fastest-varying first, fusor2 uses row-major.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GgufTensor {
@@ -461,6 +490,10 @@ impl GgufTensor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The metadata table
+// ---------------------------------------------------------------------------
+
 /// Header, key-value table and tensor directory of one GGUF file.
 ///
 /// `entries` and `tensors` are ordered `Vec`s rather than maps: the write path
@@ -477,7 +510,7 @@ pub struct GgufMetadata {
 impl GgufMetadata {
     /// Look up a metadata value.
     ///
-    /// A leading `.` makes the lookup a suffix match and the shortest
+    /// A leading `.` makes the lookup a **suffix match** and the shortest
     /// matching key wins, so `.attention.head_count` resolves the
     /// architecture-prefixed `qwen3.attention.head_count` without the caller
     /// knowing the architecture.
@@ -564,21 +597,7 @@ impl GgufMetadata {
         Ok(this)
     }
 
-    /// Read one tensor's raw bytes through a seekable reader.
-    pub fn read_tensor_bytes<R: Read + Seek>(
-        &self,
-        reader: &mut R,
-        tensor: &GgufTensor,
-    ) -> Result<Box<[u8]>> {
-        let mut buf = vec![0u8; tensor.bytes as usize].into_boxed_slice();
-        reader
-            .seek(SeekFrom::Start(self.tensor_data_offset + tensor.offset))
-            .map_err(io)?;
-        reader.read_exact(&mut buf).map_err(io)?;
-        Ok(buf)
-    }
-
-    /// Write the header, table, directory and tensor payloads. Exists only so
+    /// Write the header, table, directory and tensor payloads. Kept only so
     /// [`Self::read`] can be round-trip tested.
     pub fn write<'a, W: Write + Seek>(
         &self,
@@ -627,6 +646,10 @@ impl GgufMetadata {
     }
 }
 
+// ---------------------------------------------------------------------------
+// A whole file
+// ---------------------------------------------------------------------------
+
 enum Backing {
     Mapped(memmap2::Mmap),
     Owned(Box<[u8]>),
@@ -652,7 +675,8 @@ impl Gguf {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let file = std::fs::File::open(path.as_ref()).map_err(io)?;
         // SAFETY: mapping a file the caller named. The usual mmap caveat
-        // applies: concurrent truncation by another process would fault.
+        // applies — concurrent truncation by another process would fault —
+        // and is the contract every mmap-based loader ships with.
         let map = unsafe { memmap2::Mmap::map(&file) }.map_err(io)?;
         Self::with_backing(Backing::Mapped(map))
     }
@@ -896,7 +920,7 @@ mod tests {
     #[test]
     fn value_widening_and_arrays() {
         assert_eq!(GgufValue::I32(7).to_u64().unwrap(), 7);
-        assert_eq!(GgufValue::U8(3).to_i32().unwrap(), 3);
+        assert_eq!(GgufValue::U8(3).to_i16().unwrap(), 3);
         assert_eq!(GgufValue::F64(0.5).to_f32().unwrap(), 0.5);
         assert!(GgufValue::String("x".into()).to_u32().is_err());
         assert!(GgufValue::Bool(true).to_bool().unwrap());

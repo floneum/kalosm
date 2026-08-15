@@ -1,13 +1,17 @@
 //! The elementwise schedule domain: one register-reuse tiling per eligible
 //! dim, plus untiled.
 //!
-//! Nothing is pruned by a cache-residency watermark: a strict `>` against the
-//! LLC size is a cliff — an input one byte under 8 MiB would get no tiling and
-//! one byte over full tiling — and an argmax over invariant bytes alone cannot
-//! see the rest of the launch. Every eligible dim is a candidate here and the
-//! cost model's continuous LLC term sorts them.
+//! `policy.cache_resident(invariant_bytes)` and the argmax-over-invariant-
+//! bytes selection in `core/src/nary_direct.rs:460-481` are **deleted**. A
+//! strict `>` against the LLC watermark is a cliff — an input one byte under
+//! 8 MiB gets no tiling and one byte over gets full tiling — and an argmax
+//! over one term cannot see the rest of the launch. Every eligible dim is a
+//! candidate here and W6's continuous LLC term sorts them.
+//!
+//! Owned by W4.
 
-use fusor2_ir::ir::level1::{AccessPlan, MapDomain, MapTiling};
+use fusor2_ir::device::Caps;
+use fusor2_ir::ir::level1::{AccessPlan, IndexSpace, MapDomain, MapTiling};
 use fusor2_ir::shape::Dim;
 use smallvec::SmallVec;
 
@@ -19,13 +23,20 @@ const TM_CHOICES: [u32; 3] = [2, 4, 8];
 /// How many tilings survive. Bounds the move frontier.
 pub const MAX_TILINGS: usize = 24;
 
+/// Compatibility entry point kept for the scaffold's `domains::map_legal`
+/// re-export.
+pub fn legal(space: &IndexSpace, caps: &Caps) -> MapDomain {
+    let cx = DomainCtx::new(caps, crate::domains::default_planner());
+    map_domain(&space.dims, &[], &cx)
+}
+
 /// Candidate tilings over this index space. `vector` is the SIMD width on
 /// the CPU backend and 1 on GPU.
 ///
 /// The innermost dim is excluded: a thread-local run along it breaks
 /// inter-thread store coalescing, which makes the resulting kernel *wrong
-/// in kind*, not merely slower. That is legality; everything else is a
-/// candidate.
+/// in kind*, not merely slower. That is legality. Everything the reference
+/// decided by watermark is a candidate.
 pub fn map_domain(shape: &[Dim], access: &[AccessPlan], cx: &DomainCtx<'_>) -> MapDomain {
     let widths: SmallVec<[u32; 3]> = if cx.caps.simd_widths.is_empty() {
         SmallVec::from_slice(&[1])
@@ -68,8 +79,9 @@ pub fn map_domain(shape: &[Dim], access: &[AccessPlan], cx: &DomainCtx<'_>) -> M
     }
 }
 
-/// Move-ordering seed: the untiled candidate and `tm = 4` lead the frontier,
-/// everything else follows.
+/// Move-ordering seed. The reference shipped one tiling constant,
+/// `work_per_thread(RegPressure::ElementwiseFew) = 4`, and an untiled
+/// fallback; those two lead the frontier and everything else follows.
 pub(crate) fn seed_rank(t: MapTiling) -> u8 {
     match (t.dim, t.tm) {
         (None, _) => 0,
@@ -98,8 +110,9 @@ mod tests {
         assert!(d.tilings.iter().any(|t| t.dim == Some(1)));
     }
 
-    /// A `[4, 1024]` f32 shape whose invariant operand is 16 KiB — far under
-    /// any LLC watermark — still keeps its tiling candidate.
+    /// A `[4, 1024]` f32 shape whose invariant operand is 16 KiB sits well
+    /// under the reference's 8 MiB `cache_resident` watermark, so the
+    /// reference emits no tiling at all. Here the candidate survives.
     #[test]
     fn cache_resident_does_not_prune() {
         let caps = baseline_caps();

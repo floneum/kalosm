@@ -1,8 +1,11 @@
 //! Block decode programs for the 256-element K-quants.
 //!
-//! `decode` is a `BlockProgram` rather than a `ScalarExpr` because these
-//! formats are not per-element formulas: Q6K's 210-byte non-word-aligned block
-//! carries per-super-block group scales.
+//! These are exactly why `decode` is a `BlockProgram` and not a `ScalarExpr`:
+//! Q6K's 210-byte non-word-aligned block with per-super-block group scales is
+//! not a per-element formula, which is why the reference needs
+//! `Q4KBlockParts` / `Q6KBlockParts`.
+//!
+//! Owned by W11.
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::{QFmt, QLayout};
@@ -19,8 +22,9 @@ use crate::decode::{
 ///
 /// Groups 0-3 take six bits from bytes `0..4` (scale) and `4..8` (offset).
 /// Groups 4-7 take bits 4-5 from the top two bits of those same bytes and bits
-/// 0-3 from the low / high nibble of bytes `8..12`. Unpacking a single dynamic
-/// group index costs three byte loads instead of all twelve.
+/// 0-3 from the low / high nibble of bytes `8..12`. This is
+/// `unpack_k4_scales_offsets` evaluated at one dynamic group index, which is
+/// three byte loads instead of twelve.
 fn k4_group_scale_min(
     args: &BlockDecodeArgs<'_>,
     base: &TileExpr,
@@ -50,6 +54,48 @@ fn k4_group_scale_min(
     let min = sel(high, min_high, min_low);
 
     (scale, min)
+}
+
+/// The whole-word form of the same unpack: three packed words in, eight group
+/// scales and eight group offsets out.
+///
+/// Ported from the reference's `first_scales_min_k4` / `second_scales_min_k4`.
+/// Emitters that decode a whole super-block at once want this; the per-lane
+/// programs below use the group-indexed form instead.
+pub fn unpack_k4_scales_offsets(packed: [TileExpr; 3]) -> ([TileExpr; 8], [TileExpr; 8]) {
+    const SIX_BITS: u32 = 0b0011_1111_0011_1111_0011_1111_0011_1111;
+    const MSB_TWO: u32 = 0b1100_0000_1100_0000_1100_0000_1100_0000;
+    const MSB_SCALES: u32 = 0b0000_1111_0000_1111_0000_1111_0000_1111;
+    const MSB_OFFSET: u32 = 0b1111_0000_1111_0000_1111_0000_1111_0000;
+
+    let [w0, w1, w2] = packed;
+    let first_scales = and_lit(w0.clone(), SIX_BITS);
+    let first_offsets = and_lit(w1.clone(), SIX_BITS);
+    let second_scales = or(
+        shr_lit(and_lit(w0, MSB_TWO), 2),
+        and_lit(w2.clone(), MSB_SCALES),
+    );
+    let second_offsets = or(
+        shr_lit(and_lit(w1, MSB_TWO), 2),
+        shr_lit(and_lit(w2, MSB_OFFSET), 4),
+    );
+
+    let byte_of = |word: &TileExpr, i: u32| and_lit(shr_lit(word.clone(), i * 8), 0xff);
+    let scales = std::array::from_fn(|g| {
+        if g < 4 {
+            byte_of(&first_scales, g as u32)
+        } else {
+            byte_of(&second_scales, g as u32 - 4)
+        }
+    });
+    let offsets = std::array::from_fn(|g| {
+        if g < 4 {
+            byte_of(&first_offsets, g as u32)
+        } else {
+            byte_of(&second_offsets, g as u32 - 4)
+        }
+    });
+    (scales, offsets)
 }
 
 /// `scales[g] * d * q - offsets[g] * dmin`, shared by Q4K and Q5K.
@@ -163,6 +209,10 @@ fn decode_q6k(args: &BlockDecodeArgs<'_>, want: QLayout, name: &'static str) -> 
     let (base, q) = block_base_and_q(args, QFmt::Q6K);
     Ok(finish(args, q6k_lane(args, &fields, &base, &q)))
 }
+
+// ---------------------------------------------------------------------------
+// The six programs
+// ---------------------------------------------------------------------------
 
 /// Q4K, raw GGUF bytes: f16 `d`, f16 `dmin`, 12 packed group scales, 128
 /// nibble bytes.

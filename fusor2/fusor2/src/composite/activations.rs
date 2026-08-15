@@ -1,9 +1,11 @@
 //! `relu`, `sigmoid`, `silu`, `gelu`, `tanh_exact`, `softplus`. Each is one
 //! `Map` with a different `ScalarExpr`; none is a kernel.
 //!
-//! There is no activation opcode here and no activation node in the IR, so
-//! nothing about an activation reaches a kernel cache key except its
-//! expression tree.
+//! There is no activation opcode here and no activation node in the IR. The
+//! reference's 50-variant `NaryOp` discriminant — whose ordering it admits is
+//! load-bearing in kernel cache keys — has nothing to be an ordering of.
+//!
+//! Owned by W13.
 
 use fusor2_autograd::tape::splat_of;
 use fusor2_ir::dtype::Dtype;
@@ -16,8 +18,8 @@ use crate::tensor::Tensor;
 const GELU_C: f32 = 0.797_884_56;
 /// The cubic term's coefficient.
 const GELU_K: f32 = 0.044_715;
-/// WGSL `tanh` overflows f32 past roughly 88, so the argument is clamped at
-/// 15, which is already saturated to 1.0 in f32.
+/// WGSL `tanh` overflows f32 past roughly 88; the reference clamps at 15,
+/// which is already saturated to 1.0 in f32.
 const TANH_CLAMP: f32 = 15.0;
 
 fn lit(dtype: Dtype, v: f32) -> Result<ScalarExpr> {
@@ -42,10 +44,12 @@ fn clamp(x: ScalarExpr, lo: ScalarExpr, hi: ScalarExpr) -> ScalarExpr {
     ScalarExpr::bin(BinOp::Min, ScalarExpr::bin(BinOp::Max, x, lo), hi)
 }
 
+// ---------------------------------------------------------------------------
 // Expression builders
 //
 // Public so a rewrite rule can recognize the exact tree the frontend emits
 // without re-deriving it, and so conformance can compare two spellings.
+// ---------------------------------------------------------------------------
 
 /// `max(x, 0)`.
 pub fn relu_expr(dtype: Dtype) -> Result<ScalarExpr> {
@@ -73,9 +77,9 @@ pub fn silu_expr(dtype: Dtype) -> Result<ScalarExpr> {
 /// `(e^x - e^-x) / (e^x + e^-x)`, written out rather than lowered to the
 /// driver's `tanh`.
 ///
-/// WARP under-saturates the negative tail of the native `tanh`, and the GELU
-/// tail depends on it, so this form is spelled out rather than routed to the
-/// driver's intrinsic.
+/// The reference keeps this as a separate opcode because WARP under-saturates
+/// the negative tail of the native `tanh` and the GELU tail depends on it.
+/// Here it is a different expression tree, which is the whole difference.
 pub fn tanh_exact_expr(dtype: Dtype) -> Result<ScalarExpr> {
     Ok(tanh_exact_of(ScalarExpr::arg(0, dtype)))
 }
@@ -86,7 +90,8 @@ fn tanh_exact_of(x: ScalarExpr) -> ScalarExpr {
     div(sub(p.clone(), n.clone()), add(p, n))
 }
 
-/// The tanh approximation, with three defensive clamps:
+/// The tanh approximation, ported verbatim from the reference including its
+/// three defensive clamps:
 ///
 /// `0.5*x*(1 + clamp(tanh_exact(clamp(c*(x + k*x^3), -15, 15)), -1, 1))`,
 /// with `1 + tanh` clamped to `[0, 2]`.
@@ -174,7 +179,9 @@ pub fn leaky_relu_expr(dtype: Dtype, slope: f32) -> Result<ScalarExpr> {
     ))
 }
 
+// ---------------------------------------------------------------------------
 // The tensor surface
+// ---------------------------------------------------------------------------
 
 impl Tensor {
     fn activation(&self, build: impl FnOnce(Dtype) -> Result<ScalarExpr>) -> Result<Tensor> {
@@ -203,7 +210,7 @@ impl Tensor {
         self.activation(silu_expr)
     }
 
-    /// The tanh approximation, the default GELU form.
+    /// The tanh approximation, matching the reference's default.
     pub fn gelu(&self) -> Result<Tensor> {
         self.activation(gelu_expr)
     }

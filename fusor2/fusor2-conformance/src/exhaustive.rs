@@ -2,31 +2,34 @@
 //! budget, so a domain point the local search never reaches still gets
 //! correctness coverage.
 //!
-//! Two separate claims:
+//! Two separate claims live here and must not be conflated:
 //!
-//! * Every point is correct. For each `SchedPoint` a lowering rule mints, lower
-//!   to `KernelIr`, run `verify_l2` + `verify_arena` + `verify_uniformity`,
-//!   emit, launch, and diff against the CPU reference.
-//! * The chosen point is nearly the best. Across a shape list, the point
-//!   extraction selected must be within [`WITHIN_FRACTION`] of the measured
-//!   best. This is the only place in the suite that measures rather than
-//!   models.
+//! 1. **Every point is correct.** For each `SchedPoint` a lowering rule mints,
+//!    lower to `KernelIr`, run `verify_l2` + `verify_arena` +
+//!    `verify_uniformity`, emit, launch, and diff against the CPU reference. A
+//!    domain point that miscompiles is a bug even if extraction would never
+//!    pick it, because a different device's cost model will.
+//! 2. **The chosen point is nearly the best.** Across a shape list, the point
+//!    extraction selected must be within [`WITHIN_FRACTION`] of the measured
+//!    best. This is the only place in the suite that measures rather than
+//!    models.
+//!
+//! Owned by W14.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fusor2_ir::device::Caps;
 use fusor2_ir::ir::level1::{SchedPoint, ScheduleDomain};
-use fusor2_ir::ir::level2::{ArenaPlanner, KernelIr};
+use fusor2_ir::ir::level2::ArenaPlanner;
 
 use crate::harness::CaseError;
 
 /// The chosen schedule point must be within this fraction of the measured
-/// best. 15% is the spread between neighbouring coop tiles.
+/// best. 15% is the reference's own spread between neighbouring coop tiles.
 pub const WITHIN_FRACTION: f64 = 0.15;
 
-/// Shapes the `--exhaustive` proximity claim is asserted on, spanning every
-/// family a lowering rule mints a domain for.
+/// Shapes the `--exhaustive` proximity claim is asserted on. Eight, per the
+/// acceptance bar, spanning every family a lowering rule mints a domain for.
 pub const PROXIMITY_SHAPES: [(&str, [u64; 3]); 8] = [
     ("coop_4096_cube", [4096, 4096, 4096]),
     ("coop_skinny", [64, 4096, 4096]),
@@ -68,32 +71,6 @@ pub fn sweep_points(
 ) -> Result<(), String> {
     let points: Vec<SchedPoint> = domain.iter().collect();
     sweep(domain, &mut |i| body(points[i]))
-}
-
-/// The three level verifiers every swept point must pass before it is allowed
-/// anywhere near an emitter.
-///
-/// `verify_arena`'s all-pairs recheck re-derives, from liveness facts alone,
-/// that every byte-overlapping tile pair is separated by a guaranteed-uniform
-/// barrier. A failure here is a lowering error, never a runtime race.
-pub fn verify_point(
-    ir: &KernelIr,
-    planner: &dyn ArenaPlanner,
-    caps: &Caps,
-) -> Result<(), CaseError> {
-    // `verify_l2` takes `Caps`: the f16/bf16 gate is a capability question.
-    fusor2_tile::verify_l2(ir, caps)
-        .map_err(|e| -> CaseError { format!("verify_l2: {e}").into() })?;
-    let plan = planner
-        .arena_plan(ir, caps)
-        .map_err(|e| -> CaseError { format!("arena_plan: {e}").into() })?;
-    planner
-        .verify_arena(ir, &plan)
-        .map_err(|e| -> CaseError { format!("verify_arena: {e}").into() })?;
-    planner
-        .verify_uniformity(ir)
-        .map_err(|e| -> CaseError { format!("verify_uniformity: {e}").into() })?;
-    Ok(())
 }
 
 /// One measured point.
@@ -151,8 +128,8 @@ pub fn best(measured: &[Measured]) -> Option<Measured> {
 /// Assert the extractor's choice is within [`WITHIN_FRACTION`] of the
 /// measured best.
 ///
-/// Reported as a fraction rather than a rank, since a rank says nothing about
-/// how much slower the choice is.
+/// Reported as a fraction rather than a rank: being third-fastest out of
+/// 8,300 by 0.4% is fine, and being fastest-but-one by 40% is not.
 pub fn assert_choice_is_near_best(
     shape: &str,
     chosen: SchedPoint,
@@ -196,9 +173,10 @@ pub fn requested(args: &[String]) -> bool {
         })
 }
 
-/// The planner the sweep verifies against: the same memoized `arena_plan`
-/// `verify_l1` and the L2 emitter use. An estimator here would let extraction
-/// commit a plan that fails L2 verification and silently falls back.
+/// The planner the sweep verifies against — the *same* memoized `arena_plan`
+/// `verify_l1` and the L2 emitter use. An estimator here would reintroduce
+/// "extraction commits a plan that fails L2 verification and silently falls
+/// back".
 pub fn planner() -> Arc<dyn ArenaPlanner> {
     fusor2_tile::Planner::shared()
 }

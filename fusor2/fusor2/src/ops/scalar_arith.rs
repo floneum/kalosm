@@ -1,11 +1,13 @@
 //! The scalar-arith ops. The scalar becomes a `ScalarKind::Lit` when it is a
 //! compile-time constant and a `ScalarKind::Uniform` when it is a runtime
 //! value — `m.mul_scalar(lr)` with `lr: Scalar::Uniform(..)` produces a
-//! `Uniform`, never a baked literal.
+//! `Uniform`, never a baked literal, which is trainer constraint 2.
 //!
 //! Every entry here is **one `L0::Map`** carrying a `Lit`/`Uniform` leaf, not
 //! a broadcast const tensor: `clamp` is a single `Min(Max(x, lo), hi)` node,
 //! not two.
+//!
+//! Owned by W12.
 
 use fusor2_ir::scalar::{BinOp, ScalarExpr};
 
@@ -63,19 +65,16 @@ impl Tensor {
     }
     /// `x % s`, truncated toward zero on every dtype.
     ///
-    /// **Not integer-only**, unlike [`Tensor::rem`]: the scalar remainder is
-    /// defined over `f32`, `f16` and `u32`. Both emitters compute a float
-    /// remainder — the CPU as `x - trunc(x / y) * y` and the GPU as WGSL `%`,
-    /// which is the same truncated form Rust's `%` uses. The tensor-tensor
-    /// spelling stays integer-only, pinned by `dtypes::rem_is_u32_only`.
+    /// **Not integer-only**, unlike [`Tensor::rem`]. The reference defines the
+    /// scalar remainder over `f32`, `f16` and `u32`
+    /// (`element_wise.rs:94`, `NaryOp::RRemConst`), and both emitters already
+    /// compute a float remainder — the CPU as `x - trunc(x / y) * y` and the
+    /// GPU as WGSL `%`, which is the same truncated form Rust's `%` uses. The
+    /// tensor-tensor spelling stays integer-only because that is where the
+    /// reference's SIMD coverage stops, and `dtypes::rem_is_u32_only` pins it.
     pub fn rem_scalar(&self, rhs: impl Into<Scalar>) -> Result<Tensor> {
         self.scalar_rhs(BinOp::Rem, rhs)
     }
-    /// `s % x`. See [`Tensor::rem_scalar`].
-    pub fn rrem_scalar(&self, lhs: impl Into<Scalar>) -> Result<Tensor> {
-        self.scalar_lhs(BinOp::Rem, lhs)
-    }
-
     /// `min(max(x, lo), hi)` as **one** `Map`, not two.
     pub fn clamp(&self, lo: impl Into<Scalar>, hi: impl Into<Scalar>) -> Result<Tensor> {
         let dt = self.dtype();
@@ -85,11 +84,6 @@ impl Tensor {
         self.map1(ScalarExpr::bin(BinOp::Min, inner, hi))
     }
 
-    /// Multiply by a rank-0 runtime value carried as a tensor. Prefer
-    /// `mul_scalar(Scalar::Uniform(..))`, which needs no operand at all.
-    pub fn mul_uniform(&self, uniform: &Tensor) -> Result<Tensor> {
-        self.mul_(uniform)
-    }
 }
 
 #[cfg(test)]

@@ -5,7 +5,10 @@
 //! obligation** here: `reassoc: false` forbids the identity elimination,
 //! literal folding and operand reordering that would break
 //! `round(x, HalfAwayFromZero)` on Metal, and `contract: false` forbids fusing
-//! a multiply into an `Fma`.
+//! a multiply into an `Fma`. That is the whole reason the trainer's
+//! 14-chained-comparison `round_small` deletes.
+//!
+//! Owned by W8.
 
 use fusor2_ir::dtype::{NumericContract, RoundMode};
 use fusor2_ir::ir::level2::{
@@ -26,9 +29,11 @@ use super::{
 };
 
 /// The largest finite f32 WGSL will parse back identically.
-pub(crate) const WGSL_SAFE_F32_MAX: f32 = fusor2_tile::build::WGSL_SAFE_F32_MAX;
+pub(crate) const WGSL_SAFE_F32_MAX: f32 = 3.40282e38;
 
+// ---------------------------------------------------------------------------
 // Plumbing
+// ---------------------------------------------------------------------------
 
 impl Emitter<'_> {
     /// Append a *pure* expression (literal, pointer, argument): naga does not
@@ -229,9 +234,11 @@ impl Emitter<'_> {
             .ok_or_else(|| EmitError::Unsupported("local not declared".into()))
     }
 
-    // Literal folding plus power-of-two shift and mask rewrites. These apply
-    // to **index arithmetic only** and are unreachable from any float value,
-    // so no `NumericContract` can observe them.
+    // ---- u32 index peepholes -------------------------------------------
+    // Ported verbatim from `tile-ir/src/lower/math.rs`, power-of-two shift and
+    // mask rewrites included. These apply to **index arithmetic only** and are
+    // unreachable from any float value, so no `NumericContract` can observe
+    // them.
 
     pub(crate) fn u32_literal_of(&self, h: Handle<Expression>) -> Option<u32> {
         match self.exprs[h] {
@@ -329,6 +336,8 @@ impl Emitter<'_> {
         }
         self.bin(body, BinaryOperator::Add, left, right)
     }
+
+    // ---- addressing -----------------------------------------------------
 
     /// Flatten logical coordinates through a [`fusor2_ir::shape::MultiFlattenMap`]:
     /// one divmod chain per axis, most-significant-first, zero strides
@@ -461,6 +470,8 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    // ---- values ---------------------------------------------------------
+
     pub(crate) fn cast_tile_value(
         &mut self,
         body: &mut Block,
@@ -540,9 +551,12 @@ impl Emitter<'_> {
         Ok(self.append(Expression::Literal(lit)))
     }
 
+    // ---- memo scoping ---------------------------------------------------
+
     /// Take the memo cache. Every value it holds is an SSA handle defined in
     /// the *current* block, so a nested block must start empty and the parent
-    /// must get its entries back on exit.
+    /// must get its entries back on exit. This is the scoping property that
+    /// replaces the reference's manual `LoopCacheSnapshot`.
     pub(crate) fn push_scope(&mut self) -> Scope {
         Scope {
             memo: std::mem::take(&mut self.memo),
@@ -586,13 +600,15 @@ pub(crate) fn element_scalar(element: ElementType) -> Result<Scalar, EmitError> 
     super::types::scalar_of(scalar)
 }
 
+// ---------------------------------------------------------------------------
 // Op tables
+// ---------------------------------------------------------------------------
 
 /// All 21 unary math functions. `Neg` is the one `UnaryOperator`.
 pub(crate) fn unary_math(op: UnOp) -> Option<MathFunction> {
     Some(match op {
-        // See `fusor2_ir::scalar::UnOp::ApproximateExp`: distinct nodes, one
-        // target instruction.
+        // See `fusor2_ir::scalar::UnOp::ApproximateExp`: distinct nodes,
+        // one target instruction, exactly as the reference lowers them.
         UnOp::Exp | UnOp::ApproximateExp | UnOp::LessApproximateExp => MathFunction::Exp,
         UnOp::Exp2 => MathFunction::Exp2,
         UnOp::Log => MathFunction::Log,
@@ -657,7 +673,9 @@ pub(crate) fn compare_operator(op: CmpOp) -> BinaryOperator {
     }
 }
 
+// ---------------------------------------------------------------------------
 // Expression lowering
+// ---------------------------------------------------------------------------
 
 impl Emitter<'_> {
     /// Lower one expression, reusing the hash-cons memo so a repeated subtree
@@ -897,6 +915,18 @@ impl Emitter<'_> {
                 };
                 return Ok(self.emit_expr(body, Expression::AccessIndex { base: wg, index }));
             }
+            B::NumWorkgroups(axis) => {
+                let arg = self
+                    .num_workgroups_arg
+                    .ok_or(EmitError::MissingCapability("num_workgroups argument"))?;
+                let nw = self.function_arg(arg);
+                let index = match axis {
+                    fusor2_ir::ir::level2::WorkgroupAxis::X => 0,
+                    fusor2_ir::ir::level2::WorkgroupAxis::Y => 1,
+                    fusor2_ir::ir::level2::WorkgroupAxis::Z => 2,
+                };
+                return Ok(self.emit_expr(body, Expression::AccessIndex { base: nw, index }));
+            }
             B::SubgroupId => 0,
             B::SubgroupLane => 1,
             B::SubgroupSize => 2,
@@ -1055,6 +1085,8 @@ impl Emitter<'_> {
         Some(self.append(Expression::Literal(lit)))
     }
 
+    // ---- loads ----------------------------------------------------------
+
     fn load(
         &mut self,
         body: &mut Block,
@@ -1094,14 +1126,23 @@ impl Emitter<'_> {
                 // it just also performs a discarded in-buffer read. The clamp
                 // bound is the buffer's own element count -- the same bound
                 // `Ctx::load_operand` already builds its masks against.
+                // The clamp bound is the buffer's *runtime* length
+                // (`arrayLength`), never a baked element count: a symbolic
+                // buffer's decl extent would otherwise change the emitted
+                // body per sequence length — one Metal compile per launch
+                // per decode step.
                 let count = view.buffer.layout.element_count();
                 match u32::try_from(count) {
                     Ok(count) if count > 0 => {
                         let index = self.addr_index(body, view, addr)?;
                         let index = self.add_literal_u32(body, index, view.offset);
-                        let last = self.u32_lit(count - 1);
-                        let index = self.math2(body, MathFunction::Min, index, last);
                         let global = self.buffer_global(&view.buffer)?;
+                        let base_for_len = self.global_var(global);
+                        let len =
+                            self.emit_expr(body, Expression::ArrayLength(base_for_len));
+                        let one = self.u32_lit(1);
+                        let last = self.bin(body, BinaryOperator::Subtract, len, one);
+                        let index = self.math2(body, MathFunction::Min, index, last);
                         let base = self.global_var(global);
                         let ptr = self.emit_expr(body, Expression::Access { base, index });
                         let loaded = self.emit_load(body, ptr);
@@ -1116,14 +1157,14 @@ impl Emitter<'_> {
                         // Force the result into a named temporary. A backend
                         // inlines a single-use expression into its consumer,
                         // so an unrolled run of these nests one `select(..)`
-                        // inside the next and a quantized decode chain hits
-                        // Metal's 256-bracket limit ("fatal error: bracket
-                        // nesting level exceeded"). A name caps the nesting at
-                        // one load. It is an SSA binding rather than a spill
-                        // through `scratch_local`, which measures ~3 ms slower
-                        // on 2048-cube matmul: one shared scratch makes an
-                        // unrolled staging run a write-after-write chain in
-                        // the source.
+                        // inside the next; `qcontract`'s decode chain overran
+                        // Metal's 256-bracket limit outright ("fatal error:
+                        // bracket nesting level exceeded"). A name caps the
+                        // nesting at one load. It is an SSA binding rather
+                        // than a spill through `scratch_local`, which measured
+                        // ~3 ms slower on 2048-cube matmul: one shared scratch
+                        // makes an unrolled staging run a write-after-write
+                        // chain in the source.
                         let n = self.forced_names.len();
                         self.forced_names.push((selected, format!("masked_{n}")));
                         Ok(selected)
@@ -1143,22 +1184,128 @@ impl Emitter<'_> {
             }
             Source::Quantized(q) => {
                 let f32_element = ElementType::Scalar(ScalarElement::F32);
-                // The decode program's flat index is `k_base + col + lane`,
-                // so a linear address is the whole of it and the column term
-                // is zero. This is the same convention the CPU emitter reads.
-                let (row, col) = match addr {
-                    Addr::Rc2 { row, col } => (row.clone(), col.clone()),
-                    Addr::Linear(index) => (
-                        index.clone(),
-                        TileExpr::new(
-                            TileExprKind::Literal(TileLiteral::U32(0)),
-                            ElementType::Scalar(ScalarElement::U32),
-                        ),
-                    ),
+                // The block program decodes **one flat element index** into
+                // the weight's own dense element order — the convention the
+                // `L0::Dequant` KMap path established and the only one any
+                // conformance oracle ever verified. An `Rc2` address must
+                // therefore be flattened *through the view's element strides*
+                // before it reaches the program: the matrix view of a
+                // transposed operand carries `[k, n]` extents with strides
+                // `[1, k_extent]`, and handing the program the raw `(row,
+                // col)` pair read the wrong block for every column past the
+                // first. Column 0 agreed by accident — `col = 0` erases the
+                // stride — which is exactly the shape of the wrong values
+                // the 64x64 conformance case caught.
+                let u32_e = ElementType::Scalar(ScalarElement::U32);
+                let flat_of = |coords: [&TileExpr; 2]| -> Result<TileExpr, EmitError> {
+                    let groups = &q.data.layout.indexing.groups;
+                    if groups.len() != 2 {
+                        return Err(EmitError::Unsupported(format!(
+                            "quantized Rc2 read through a rank-{} view",
+                            groups.len()
+                        )));
+                    }
+                    let mut acc: Option<TileExpr> = None;
+                    for (g, coord) in groups.iter().zip(coords) {
+                        let [sub] = &g.sub_axes[..] else {
+                            return Err(EmitError::Unsupported(
+                                "quantized Rc2 read through a split axis".into(),
+                            ));
+                        };
+                        if sub.stride == 0 {
+                            continue;
+                        }
+                        let term = if sub.stride == 1 {
+                            coord.clone()
+                        } else {
+                            TileExpr::new(
+                                TileExprKind::Binary {
+                                    op: fusor2_ir::ir::level2::TileBinaryOp::Mul,
+                                    left: coord.clone(),
+                                    right: TileExpr::new(
+                                        TileExprKind::Literal(TileLiteral::U32(sub.stride)),
+                                        u32_e,
+                                    ),
+                                    numeric: fusor2_ir::dtype::NumericContract::RELAXED,
+                                },
+                                u32_e,
+                            )
+                        };
+                        acc = Some(match acc {
+                            Some(a) => TileExpr::new(
+                                TileExprKind::Binary {
+                                    op: fusor2_ir::ir::level2::TileBinaryOp::Add,
+                                    left: a,
+                                    right: term,
+                                    numeric: fusor2_ir::dtype::NumericContract::RELAXED,
+                                },
+                                u32_e,
+                            ),
+                            None => term,
+                        });
+                    }
+                    Ok(acc.unwrap_or_else(|| {
+                        TileExpr::new(TileExprKind::Literal(TileLiteral::U32(0)), u32_e)
+                    }))
+                };
+                let zero = TileExpr::new(TileExprKind::Literal(TileLiteral::U32(0)), u32_e);
+                let (row, col, element_view) = match addr {
+                    Addr::Rc2 { row, col } => (flat_of([row, col])?, zero, true),
+                    Addr::Linear(index) => (index.clone(), zero, false),
                 };
                 let q = q.clone();
                 if mask.is_constant_true() {
                     return self.decode_one(body, &q, &row, &col);
+                }
+                // Clamp-and-select, never a branch. The decode of a masked
+                // element used to run inside its own `masked_value` block,
+                // and the expression memo is block-scoped — so two elements
+                // of one aligned window could never share their word or
+                // scale loads however equal the subexpressions were. With
+                // the flat index clamped into the value's extent the decode
+                // is a pure expression in the *enclosing* block, the window's
+                // shared subexpressions deduplicate, and the mask survives as
+                // a select on the value. This is the same discipline the
+                // dense storage path already follows (`min(index, len - 1)`).
+                // Only an `Rc2` address rides an element-space view whose
+                // extents bound the flat index; the `Linear` arm's view is
+                // the raw word stream and its extent clamps the wrong unit.
+                let total: u64 = q
+                    .data
+                    .layout
+                    .extents
+                    .iter()
+                    .map(|&e| u64::from(e))
+                    .product();
+                if element_view && total > 0 && total <= u64::from(u32::MAX) {
+                    let clamped = TileExpr::new(
+                        TileExprKind::Binary {
+                            op: fusor2_ir::ir::level2::TileBinaryOp::Min,
+                            left: row,
+                            right: TileExpr::new(
+                                TileExprKind::Literal(TileLiteral::U32(total as u32 - 1)),
+                                u32_e,
+                            ),
+                            numeric: fusor2_ir::dtype::NumericContract::RELAXED,
+                        },
+                        u32_e,
+                    );
+                    let decoded = self.decode_one(body, &q, &clamped, &col)?;
+                    let fill_source = fill.element();
+                    let fill_h = self.expr(fill, body)?;
+                    let fill_h =
+                        self.cast_tile_value(body, fill_h, fill_source, f32_element)?;
+                    let mask_h = self.expr(mask, body)?;
+                    let mask_ty = mask.element();
+                    let mask_h = self.condition_value(body, mask_h, mask_ty)?;
+                    return Ok(self.emit_expr(
+                        body,
+                        Expression::Select {
+                            condition: mask_h,
+                            accept: decoded,
+                            reject: fill_h,
+                        },
+                    ));
                 }
                 let fill_source = fill.element();
                 let fill_h = self.expr(fill, body)?;
@@ -1291,7 +1438,7 @@ mod tests {
         }
     }
 
-    /// The rounding modes are exact, and the `2^23` trick is absent.
+    /// Test 7 — the rounding modes are exact, and the `2^23` trick is absent.
     #[test]
     fn round_modes_are_exact() {
         let inputs = [-2.5f32, -0.5, 0.5, 1.5, 2.5, 6.5, 0.0, -0.0];
@@ -1326,7 +1473,7 @@ mod tests {
         }
     }
 
-    /// `reassoc: false` and `contract: false` survive to the module.
+    /// Test 8 — `reassoc: false` and `contract: false` survive to the module.
     #[test]
     fn reassoc_false_survives() {
         let caps = caps(false, true);
@@ -1550,8 +1697,8 @@ mod tests {
             logic = testkit::bin(BinOp::LogicalOr, logic, cmp, NumericContract::STRICT);
         }
 
-        // Cast in both directions, including the f32 -> u32 and f32 -> i32
-        // pair.
+        // Cast in both directions, including the f32 -> u32 / f32 -> i32 pair
+        // the reference cannot express at all.
         let to_u32 = TileExpr::new(
             TileExprKind::Cast {
                 value: acc.clone(),

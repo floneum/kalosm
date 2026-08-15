@@ -1,10 +1,15 @@
-//! The contraction adjoint: `d(Contract) = (grad x b -> a, a x grad -> b)`,
-//! built from the primal spec's [`fusor2_ir::ir::level0::EinSpec::d_lhs`] and
-//! `d_rhs`, independent of tile geometry.
+//! The one analytic non-elementwise adjoint:
+//! `d(Contract) = (grad x b -> a, a x grad -> b)`, expressed by reusing the
+//! primal spec's [`fusor2_ir::ir::level0::EinSpec::d_lhs`] and `d_rhs`. It
+//! holds regardless of tile geometry, which is exactly why it is stated at L0
+//! and not restated per lowering.
 //!
-//! Transposed-rhs is a spec rather than an op, so this one rule covers
-//! `mat_mul`, `mat_mul_transposed_rhs`, the batched forms, and
-//! `conv`/`grouped_conv`'s `dInput`, `dWeight` and `dBias`.
+//! Because transposed-rhs is a *spec* and not an op, this single rule
+//! subsumes `mat_mul`, `mat_mul_transposed_rhs`, every batched form and —
+//! through the macro `defn` expansions — `conv`/`grouped_conv`'s `dInput`,
+//! `dWeight` and `dBias`. There is no `replay_*` combinator anywhere.
+//!
+//! Owned by W5.
 
 use fusor2_ir::autograd::{Grads, Tape, Val};
 use fusor2_ir::ir::Node;
@@ -41,10 +46,18 @@ pub fn contract_adjoint(
         }
     };
 
-    // A block-quantized operand is not trainable: its adjoint contraction is a
-    // dense f32 tensor over the weight's element grid, which cannot be applied
-    // to a block-quantized buffer. It gets `None`, [`Grads`]'s "does not
-    // require grad".
+    // A block-quantized operand gets `None`, which is what [`Grads`] means by
+    // "a parent that does not require grad". The route is not trainable: an
+    // adjoint contraction for it would produce a dense f32 tensor over the
+    // weight's element grid, and nothing can apply that to a block-quantized
+    // buffer — which is precisely why QAT keeps a separate f32 master copy
+    // rather than a quantized backward kernel.
+    //
+    // Stated here rather than left to fall out of a lowering failure. It used
+    // to hold only because `L1::KQContract` could not lower the `d_rhs` spec;
+    // the moment that contraction found any lowering at all — the generic
+    // floor does — `q_mat_mul_backward_reaches_the_activation_only`'s "a
+    // gradient was produced for a quantized weight" assert fired.
     let da = if tape.facts(a).dtype.is_quantized() {
         None
     } else {
@@ -62,9 +75,12 @@ pub fn contract_adjoint(
     Ok(smallvec::smallvec![da, db])
 }
 
-/// Check that every label appears in at least two of `{a, b, out}` and that no
-/// operand repeats a label. The adjoint rejects an inconsistent derived
-/// partition before adding the node.
+/// `verify_l0` rule 4, restated locally: every label appears in at least two
+/// of `{a, b, out}`, and no operand repeats a label.
+///
+/// This duplicates `fusor2_ir::contract_spec::verify_spec` on purpose — the
+/// adjoint must reject an inconsistent derived partition *before* adding the
+/// node, and the tape cannot depend on a verifier that may not have run.
 pub fn verify_spec(spec: &EinSpec) -> Result<()> {
     for (name, labels) in [("a", &spec.a), ("b", &spec.b), ("out", &spec.out)] {
         let mut seen: SmallVec<[Label; 8]> = SmallVec::new();
@@ -181,6 +197,11 @@ mod tests {
 
     /// A block-quantized weight receives `None`, and the activation beside it
     /// still receives its gradient.
+    ///
+    /// The invariant is stated by the adjoint, not inherited from a lowering
+    /// that happens to fail: any lowering of `a x grad -> b` computes a dense
+    /// f32 tensor over the weight's element grid, which no optimizer can apply
+    /// to a block-quantized buffer.
     #[test]
     fn a_quantized_operand_gets_no_gradient() {
         use fusor2_ir::dtype::{QFmt, QLayout};

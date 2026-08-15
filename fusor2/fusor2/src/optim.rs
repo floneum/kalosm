@@ -2,10 +2,13 @@
 //! never a baked literal — so a learning-rate schedule does not recompile
 //! anything.
 //!
-//! Bias correction is folded into one step size, weight decay applies to the
-//! parameter rather than the gradient, and epsilon is added to `sqrt(v)`
-//! rather than to `v`. The two per-step scalars are uniforms, so a whole
-//! training run compiles one kernel set.
+//! The recipe is `trainer/src/optim.rs` term for term: bias correction folded
+//! into one step size, decoupled weight decay applied to the parameter rather
+//! than to the gradient, and epsilon added to `sqrt(v)` rather than to `v`.
+//! The two per-step scalars are the only things that change between steps, and
+//! both are uniforms, so a whole training run compiles one kernel set.
+//!
+//! Owned by W13.
 
 use std::sync::Arc;
 
@@ -23,7 +26,8 @@ struct Moments {
 }
 
 /// The two scalars a schedule moves. Minted once against the graph the first
-/// [`AdamW::step`] saw, then rebound each step.
+/// [`AdamW::step`] saw and then rebound each step, so changing the learning
+/// rate changes a word in binding 0 and nothing else.
 struct Schedule {
     /// `lr * sqrt(1 - beta2^t) / (1 - beta1^t)`.
     alpha: SymId,
@@ -31,7 +35,12 @@ struct Schedule {
     decay: SymId,
 }
 
-/// Decoupled-weight-decay Adam. The defaults are the Adam paper's.
+/// Decoupled-weight-decay Adam.
+///
+/// The defaults are the Adam paper's. The trainer configures `eps = 1e-7` and
+/// a non-zero `weight_decay` to match `tf.keras.optimizers.AdamW`; both are
+/// public fields, so that is a two-line change at the call site rather than a
+/// second constructor.
 pub struct AdamW {
     pub lr: f32,
     pub beta1: f32,
@@ -69,8 +78,10 @@ impl AdamW {
     /// value must come from one graph — the same graph as the previous call's,
     /// because the moments are values on it.
     ///
-    /// The returned tensors are unresolved expressions. Resolve or read them
-    /// before the next `step`, whose uniforms overwrite this call's.
+    /// The returned tensors are unresolved expressions, as everything in this
+    /// API is. Resolve them (or read them) before the next `step`: the moments
+    /// this call stored are expressions over `grads`, and the next call's
+    /// uniforms overwrite this call's.
     pub fn step(&mut self, params: &[Tensor], grads: &[Tensor]) -> Result<Vec<Tensor>> {
         if params.len() != grads.len() {
             return Err(Error::Shape(format!(
@@ -137,7 +148,7 @@ impl AdamW {
         let t = self.step.min(i32::MAX as u64) as i32;
         let bias1 = 1.0 - self.beta1.powi(t);
         let bias2 = 1.0 - self.beta2.powi(t);
-        // Bias correction folded into the step size.
+        // Bias correction folded into the step size, as Keras does.
         let alpha = self.lr * bias2.sqrt() / bias1;
         let decay = self.lr * self.weight_decay;
 
@@ -189,10 +200,10 @@ impl AdamW {
 
 /// Cosine learning-rate decay with linear warmup.
 ///
-/// `step <= warmup` ramps linearly from 0 to `peak`; after that
-/// `floor + (peak - floor) * 0.5 * (1 + cos(pi * t))` carries it to `floor`
-/// at `total` and holds there. With `warmup = 0` the schedule starts at
-/// `peak`.
+/// `step <= warmup` ramps linearly from 0 to `peak`; after that the Keras
+/// `CosineDecay` shape `floor + (peak - floor) * 0.5 * (1 + cos(pi * t))`
+/// carries it to `floor` at `total` and holds there. With `warmup = 0` the
+/// schedule starts at `peak`.
 pub fn cosine_decay(step: u64, warmup: u64, total: u64, peak: f32, floor: f32) -> f32 {
     if step < warmup {
         return peak * (step as f32 / warmup as f32);
@@ -209,7 +220,8 @@ pub fn cosine_decay(step: u64, warmup: u64, total: u64, peak: f32, floor: f32) -
 
 /// The L2 norm of every gradient taken together, as a rank-0 value.
 ///
-/// A device reduction: nothing here reads a gradient back to the host.
+/// A device reduction: nothing here reads a gradient back to the host, and
+/// the trainer logs this number every step.
 pub fn global_norm(grads: &[Tensor]) -> Result<Tensor> {
     let Some(first) = grads.first() else {
         return Err(Error::Shape("the global norm of no gradients".into()));
@@ -241,7 +253,8 @@ pub fn global_norm(grads: &[Tensor]) -> Result<Tensor> {
 ///
 /// Exactly 1 below the threshold and exactly `max_norm / ||g||` above it, so
 /// the clip is a no-op inside the ball and lands the norm on the cap outside
-/// it.
+/// it. Split out from [`clip_global_norm`] because it is the whole policy;
+/// the rest is one multiply.
 fn clip_scale(grads: &[Tensor], max_norm: f32) -> Result<Tensor> {
     global_norm(grads)?
         .max_scalar(max_norm)?
@@ -269,11 +282,11 @@ pub fn clip_global_norm(grads: &[Tensor], max_norm: f32) -> Result<Vec<Tensor>> 
 mod tests {
     use super::*;
     use crate::graph::Graph;
-    use crate::session::{Device, Session};
+    use crate::session::{Backend, Session};
     use crate::{Dim, Dtype};
 
     fn graph() -> Graph {
-        Graph::new(&Session::new(Device::cpu().expect("cpu device")).expect("session"))
+        Graph::new(&Session::new(Backend::cpu().expect("cpu device")).expect("session"))
     }
 
     fn upload(g: &Graph, shape: &[u64], data: &[f32]) -> Tensor {
@@ -293,8 +306,8 @@ mod tests {
         );
     }
 
-    /// The whole update on the host, one scalar at a time; the reference the
-    /// tensor path is checked against.
+    /// The whole update on the host, one scalar at a time. This is the
+    /// specification; the tensor path below has to reproduce it.
     struct HostAdam {
         m: f32,
         v: f32,
@@ -335,7 +348,7 @@ mod tests {
     }
 
     /// The step size after bias correction is the learning rate, whatever the
-    /// gradient's scale.
+    /// gradient's scale — that is the whole point of folding the correction in.
     #[test]
     fn the_first_step_is_the_learning_rate_at_any_gradient_scale() {
         const LR: f32 = 0.05;
@@ -491,7 +504,8 @@ mod tests {
         let a = upload(&g, &[2], &[1.0, 1.0]);
         assert!(clip_global_norm(std::slice::from_ref(&a), 0.0).is_err());
         assert!(clip_global_norm(std::slice::from_ref(&a), -1.0).is_err());
-        // An empty list has nothing to scale, but no norm either.
+        // An empty list is not an error; there is nothing to scale. Asking
+        // for its norm is, because there is no such number.
         assert!(clip_global_norm(&[], 1.0).unwrap().is_empty());
         assert!(global_norm(&[]).is_err());
     }

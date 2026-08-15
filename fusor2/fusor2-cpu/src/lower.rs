@@ -1,5 +1,7 @@
 //! L1 node + `SchedPoint` -> `KernelIr` for the CPU backend. The same
 //! `KernelIr`, a different emitter.
+//!
+//! Owned by W10.
 
 pub mod contract;
 pub mod gather_scatter;
@@ -16,7 +18,7 @@ use fusor2_ir::ir::level2::{
     WorkgroupAxis,
 };
 use fusor2_ir::ir::{Node, Op};
-use fusor2_ir::scalar::ScalarExpr;
+use fusor2_ir::scalar::{BinOp, ScalarExpr, ScalarKind};
 use fusor2_ir::shape::Dim;
 use fusor2_ir::target::LowerCtx;
 use fusor2_ir::Result;
@@ -60,21 +62,21 @@ pub fn lower(
         }
         L1::KGather { .. } | L1::KScatter { .. } => gather_scatter::lower(caps, node, theta, cx),
         L1::KRegion { members, .. } => compose(caps, members, theta, cx, "cpu_region"),
-        L1::KMerged(wave) => compose(caps, wave.segments(), theta, cx, "cpu_merged"),
         L1::Ext { def, .. } => ext::lower(*def, node, theta),
     }
 }
 
-// Composite nodes: KRegion and KMerged
+// ---------------------------------------------------------------------------
+// Composite nodes: KRegion
+// ---------------------------------------------------------------------------
 
 /// One dispatch running several member kernels.
 ///
-/// `KRegion` and `KMerged` are the same shape to a backend: a list of L1 nodes
-/// the plan asks for in **one** launch. Each member is lowered through the
-/// ordinary dispatch above — so a merged wave of contractions is still the
-/// contraction lowering, not a second copy of it — and the bodies are then
-/// concatenated over one shared grid. That is exactly what a horizontal merge
-/// is: one dispatch, several bodies, the same workgroup index.
+/// A `KRegion` is a list of L1 nodes the plan asks for in **one** launch.
+/// Each member is lowered through the ordinary dispatch above — so a region
+/// over contractions is still the contraction lowering, not a second copy of
+/// it — and the bodies are then concatenated over one shared grid: one
+/// dispatch, several bodies, the same workgroup index.
 ///
 /// Two things make the concatenation sound rather than a splice:
 ///
@@ -89,9 +91,7 @@ pub fn lower(
 ///   upper bound, because its grid is exactly its row count; running it over a
 ///   longer grid without the guard would write past the buffer.
 ///
-/// Members must agree on their lane count. They do whenever the merge rules
-/// mint the node — every segment of a wave shares a `MergeKey`, so every
-/// segment lowers to the same `block` — and when they do not (a `KRegion` over
+/// Members must agree on their lane count. When they do not (a `KRegion` over
 /// an elementwise producer and a fold, whose lane counts are 256 and the
 /// reduced extent) this refuses with a legality answer rather than emitting a
 /// kernel whose reduce scratch is shorter than its lane loop.
@@ -107,8 +107,8 @@ fn compose(
             "a composite node with no members has nothing to lower".into(),
         ));
     }
-    // **The composite's own point.** `L1::KRegion` and `L1::KMerged` carry the
-    // linear `MapDomain` of their members' shared index space, which describes
+    // **The composite's own point.** `L1::KRegion` carries the linear
+    // `MapDomain` of its members' shared index space, which describes
     // the *GPU* body — one guarded pass over a linearized index, `tm` outputs
     // per lane. This backend does not emit that body: it lowers each member
     // through the ordinary dispatch and concatenates, so a register tile at
@@ -243,24 +243,81 @@ fn redirect_stores(
     }
 }
 
+// ---------------------------------------------------------------------------
 // The extension seam
+// ---------------------------------------------------------------------------
 
 /// `L1::Ext` lowering: the one escape hatch out of the closed `L0`/`L1` enums.
-/// The registry itself lives in [`fusor2_ir::target::ext`], shared with every
-/// other target and keyed by the target's name.
 pub mod ext {
     use super::*;
-    use fusor2_ir::ir::OpDefId;
+    use fusor2_ir::ir::{OpDefId, OpDefRegistry};
+    use std::sync::RwLock;
 
-    pub use fusor2_ir::target::ext::{install, installed};
+    /// The registry `L1::Ext` lowering resolves `OpDefId` against.
+    ///
+    /// [`LowerCtx`] carries the plan, the launch, the graph and the symbol
+    /// list — not the [`OpDefRegistry`] the graph was built with — and
+    /// `Semantics`, which *does* hold one, exposes no accessor for it. So a
+    /// target handed one selected `L1::Ext { def }` has no way to reach that
+    /// def's `lower_per_target` row, and `OpDef::lower_per_target` has been
+    /// dead for exactly that reason.
+    ///
+    /// Until `LowerCtx` grows the field, the embedder installs the same
+    /// registry here that it installed on the e-graph's semantics. Registration
+    /// order is id order and must match, which is the same contract
+    /// `CoreSemantics::with_registry` already imposes.
+    static DEFS: RwLock<Option<OpDefRegistry>> = RwLock::new(None);
+
+    /// Install the extension registry this process lowers against. Idempotent
+    /// and last-write-wins; a second install with a differently ordered
+    /// registry would silently rename every `OpDefId`, so callers pass the
+    /// registry the graph was built with, unchanged.
+    pub fn install(registry: OpDefRegistry) {
+        *DEFS.write().expect("the OpDef registry lock is poisoned") = Some(registry);
+    }
+
+    /// The installed registry, if the embedder installed one.
+    pub fn installed() -> Option<OpDefRegistry> {
+        DEFS.read()
+            .expect("the OpDef registry lock is poisoned")
+            .clone()
+    }
 
     /// Lower one registered extension op through its `"cpu"` row.
     pub fn lower(def: OpDefId, node: &Node, theta: SchedPoint) -> Result<KernelIr> {
-        fusor2_ir::target::ext::lower("cpu", def, node, theta)
+        let registry = installed().ok_or_else(|| {
+            Error::Legality(format!(
+                "{def:?} is an extension op, but no OpDefRegistry is installed on the \
+                 CPU target; call fusor2_cpu::lower::ext::install"
+            ))
+        })?;
+        let entry = registry
+            .get(def)
+            .ok_or_else(|| Error::Legality(format!("no OpDef is registered as {def:?}")))?;
+        let lower = entry
+            .lower_per_target
+            .iter()
+            .find(|(target, _)| *target == "cpu")
+            .map(|(_, f)| *f)
+            .ok_or_else(|| {
+                Error::Legality(format!(
+                    "OpDef \"{}\" declares no \"cpu\" lowering; its \
+                     lower_per_target names {:?}",
+                    entry.name,
+                    entry
+                        .lower_per_target
+                        .iter()
+                        .map(|(t, _)| *t)
+                        .collect::<Vec<_>>()
+                ))
+            })?;
+        lower(node, &theta)
     }
 }
 
+// ---------------------------------------------------------------------------
 // Shared construction helpers
+// ---------------------------------------------------------------------------
 
 pub(crate) fn u32_ty() -> ElementType {
     ElementType::Scalar(ScalarElement::U32)
@@ -270,13 +327,26 @@ pub(crate) fn bool_ty() -> ElementType {
 }
 
 pub(crate) fn elem_of(d: Dtype) -> Result<ScalarElement> {
-    d.try_scalar_element().ok_or_else(|| {
-        Error::Legality("a quantized value has no dense element type".into())
+    Ok(match d {
+        Dtype::F32 => ScalarElement::F32,
+        Dtype::F16 => ScalarElement::F16,
+        Dtype::BF16 => ScalarElement::BF16,
+        Dtype::U32 => ScalarElement::U32,
+        Dtype::I32 => ScalarElement::I32,
+        Dtype::Q(_) => {
+            return Err(Error::Legality(
+                "a quantized value has no dense element type".into(),
+            ));
+        }
     })
 }
 
 pub(crate) fn lit_u32(v: u32) -> TileExpr {
     TileExpr::new(TileExprKind::Literal(TileLiteral::U32(v)), u32_ty())
+}
+
+pub(crate) fn lit_true() -> TileExpr {
+    TileExpr::new(TileExprKind::Literal(TileLiteral::Bool(true)), bool_ty())
 }
 
 pub(crate) fn lit_f32(v: f32) -> TileExpr {
@@ -341,7 +411,7 @@ pub(crate) fn global_lane(block: u32) -> TileExpr {
 /// `Arc::ptr_eq`, so a view built from one `Binds` cannot be emitted into a
 /// `KernelIr` whose table was built by a second, structurally identical
 /// `Binds`. That is exactly what happens the moment one launch holds more than
-/// one node — a `KRegion` or a `KMerged` wave, where every member lowers
+/// one node — a `KRegion`, where every member lowers
 /// through its own `Binds::build(cx)`. Interning makes identity follow
 /// content, which is the property the emitter is really asking about.
 fn intern_decl(decl: BufferDecl) -> Arc<BufferDecl> {
@@ -582,7 +652,7 @@ pub(crate) fn scatter_geometry(
     })
 }
 
-/// `flat` run through one operand's [`AddressMap`], via the shared walk.
+/// `flat` run through one operand's [`AddressMap`].
 pub(crate) fn address_of(operand: &Operand, flat: TileExpr, space_total: u64) -> Result<TileExpr> {
     let map = operand.address_map().ok_or_else(|| {
         Error::Legality(
@@ -591,8 +661,27 @@ pub(crate) fn address_of(operand: &Operand, flat: TileExpr, space_total: u64) ->
                 .into(),
         )
     })?;
-    let mut b = fusor2_tile::build::TileBuilder::new();
-    Ok(fusor2_tile::lower::map_address(&mut b, &map, flat, space_total))
+    if map.is_identity_over(space_total) {
+        return Ok(flat);
+    }
+    let mut acc: Option<TileExpr> = (map.offset != 0).then(|| lit_u32(map.offset));
+    for (i, t) in map.terms.iter().enumerate() {
+        let mut e = flat.clone();
+        if t.divisor > 1 {
+            e = bin(BinOp::Div, e, lit_u32(t.divisor), u32_ty());
+        }
+        if map.needs_modulo(i, space_total) {
+            e = bin(BinOp::Rem, e, lit_u32(t.modulus), u32_ty());
+        }
+        if t.stride != 1 {
+            e = bin(BinOp::Mul, e, lit_u32(t.stride), u32_ty());
+        }
+        acc = Some(match acc {
+            Some(a) => bin(BinOp::Add, a, e, u32_ty()),
+            None => e,
+        });
+    }
+    Ok(acc.unwrap_or_else(|| lit_u32(0)))
 }
 
 /// Where one operand's elements come from: a bound buffer, or a constant the
@@ -643,11 +732,40 @@ pub(crate) fn operand_src(cx: &LowerCtx<'_>, binds: &Binds, src: Id) -> Result<O
     Ok(OperandSrc::Buffer(buffer))
 }
 
-pub(crate) use fusor2_tile::lower::qlayout_of;
+/// The storage layout a quantized value carries, read off its `LeafKind`.
+///
+/// Layout is an operand attribute the extractor prices, never a device
+/// branch, so it is recovered from the leaf rather than assumed.
+pub(crate) fn qlayout_of(cx: &LowerCtx<'_>, value: Id) -> Option<QLayout> {
+    let class = cx.graph.class_of(value);
+    cx.graph.class_ids(class).into_iter().find_map(|m| {
+        match &cx.graph.node(m).op {
+            Op::L0(fusor2_ir::ir::level0::L0::Leaf(
+                fusor2_ir::ir::level0::LeafKind::Quantized { layout, .. },
+            )) => Some(*layout),
+            _ => None,
+        }
+    })
+}
 
 pub(crate) fn const_operand(cx: &LowerCtx<'_>, src: Id) -> Option<TileExpr> {
-    let mut b = fusor2_tile::build::TileBuilder::new();
-    fusor2_tile::lower::const_operand(&mut b, cx, src)
+    let fusor2_ir::ir::Op::L0(fusor2_ir::ir::level0::L0::Leaf(
+        fusor2_ir::ir::level0::LeafKind::Const { value, .. },
+    )) = &cx.graph.node(cx.selected(src)).op
+    else {
+        return None;
+    };
+    let (lit, elem) = match *value {
+        fusor2_ir::dtype::Splat::F32(v) => (TileLiteral::F32(v.to_bits()), ScalarElement::F32),
+        fusor2_ir::dtype::Splat::F16(v) => (TileLiteral::F16(v), ScalarElement::F16),
+        fusor2_ir::dtype::Splat::BF16(v) => (TileLiteral::BF16(v), ScalarElement::BF16),
+        fusor2_ir::dtype::Splat::U32(v) => (TileLiteral::U32(v), ScalarElement::U32),
+        fusor2_ir::dtype::Splat::I32(v) => (TileLiteral::I32(v), ScalarElement::I32),
+    };
+    Some(TileExpr::new(
+        TileExprKind::Literal(lit),
+        ElementType::Scalar(elem),
+    ))
 }
 
 /// Translate one `ScalarExpr` body into L2, with `args[i]` supplying operand
@@ -660,58 +778,140 @@ pub(crate) struct Translate<'a> {
 
 impl Translate<'_> {
     pub fn run(&self, e: &ScalarExpr) -> Result<TileExpr> {
-        let mut b = fusor2_tile::build::TileBuilder::new();
-        let mut env = CpuScalarEnv {
-            uniforms: &self.uniforms,
-        };
-        fusor2_tile::lower::eval_scalar(&mut b, &mut env, e, self.args, self.coords)
-    }
-}
-
-/// The CPU's [`fusor2_tile::lower::ScalarEnv`]: a runtime scalar is read from
-/// the uniform block, never baked into the kernel, so a changed scalar does
-/// not recompile. Literals pass through unclamped; the WGSL no-infinity
-/// obligation is the GPU's alone.
-struct CpuScalarEnv<'a> {
-    uniforms: &'a Option<Arc<BufferDecl>>,
-}
-
-impl fusor2_tile::lower::ScalarEnv for CpuScalarEnv<'_> {
-    fn uniform(
-        &mut self,
-        b: &mut fusor2_tile::build::TileBuilder,
-        sym: fusor2_ir::shape::SymId,
-        dtype: Dtype,
-    ) -> Result<TileExpr> {
-        let ub = self
-            .uniforms
-            .clone()
-            .ok_or_else(|| Error::Legality("no uniform block bound".into()))?;
-        let index = b.lit_u32(sym.0);
-        let mask = b.lit_bool(true);
-        let fill = b.lit_u32(0);
-        let view = StorageView {
-            layout: ub.layout.clone(),
-            buffer: ub,
-            offset: 0,
-        };
-        let raw = b.load(Source::Storage(view), Addr::Linear(index), mask, fill);
-        let ty = ElementType::Scalar(elem_of(dtype).unwrap_or(ScalarElement::F32));
-        Ok(b.bitcast(raw, ty))
-    }
-
-    fn literal(
-        &mut self,
-        b: &mut fusor2_tile::build::TileBuilder,
-        value: fusor2_ir::dtype::Splat,
-    ) -> TileExpr {
-        b.lit(match value {
-            fusor2_ir::dtype::Splat::F32(v) => TileLiteral::F32(v.to_bits()),
-            fusor2_ir::dtype::Splat::F16(v) => TileLiteral::F16(v),
-            fusor2_ir::dtype::Splat::BF16(v) => TileLiteral::BF16(v),
-            fusor2_ir::dtype::Splat::U32(v) => TileLiteral::U32(v),
-            fusor2_ir::dtype::Splat::I32(v) => TileLiteral::I32(v),
+        let ty = ElementType::Scalar(elem_of(e.dtype()).unwrap_or(ScalarElement::F32));
+        Ok(match e.kind() {
+            ScalarKind::Arg(i) => self
+                .args
+                .get(*i as usize)
+                .cloned()
+                .ok_or_else(|| Error::Legality(format!("Arg({i}) has no operand")))?,
+            ScalarKind::Lit(l) => TileExpr::new(
+                TileExprKind::Literal(match l.0 {
+                    fusor2_ir::dtype::Splat::F32(v) => TileLiteral::F32(v.to_bits()),
+                    fusor2_ir::dtype::Splat::F16(v) => TileLiteral::F16(v),
+                    fusor2_ir::dtype::Splat::BF16(v) => TileLiteral::BF16(v),
+                    fusor2_ir::dtype::Splat::U32(v) => TileLiteral::U32(v),
+                    fusor2_ir::dtype::Splat::I32(v) => TileLiteral::I32(v),
+                }),
+                ty,
+            ),
+            // A runtime scalar is read from the uniform block, never baked
+            // into the kernel: that is what deletes the trainer's `[1]`-tensor
+            // scalars and its per-step recompiles.
+            ScalarKind::Uniform(sym) => {
+                let ub = self
+                    .uniforms
+                    .clone()
+                    .ok_or_else(|| Error::Legality("no uniform block bound".into()))?;
+                let raw = load(ub, lit_u32(sym.0), lit_true());
+                TileExpr::new(
+                    TileExprKind::Bitcast { value: raw, to: ty },
+                    ty,
+                )
+            }
+            ScalarKind::IndexOf(axis) => self
+                .coords
+                .get(*axis as usize)
+                .cloned()
+                .ok_or_else(|| Error::Legality(format!("IndexOf({axis}) is out of range")))?,
+            ScalarKind::Un { op, x } => TileExpr::new(
+                TileExprKind::Unary {
+                    op: *op,
+                    value: self.run(x)?,
+                    numeric: NumericContract::RELAXED,
+                },
+                ty,
+            ),
+            ScalarKind::Bin { op, a, b } => bin(*op, self.run(a)?, self.run(b)?, ty),
+            ScalarKind::Cmp { op, a, b } => {
+                // Booleans are 1.0/0.0 in the operand dtype at L0, so a
+                // comparison consumed as a value materializes here.
+                let m = cmp(*op, self.run(a)?, self.run(b)?);
+                TileExpr::new(
+                    TileExprKind::Select {
+                        condition: m,
+                        accept: one_of(ty),
+                        reject: zero_of(ty),
+                    },
+                    ty,
+                )
+            }
+            ScalarKind::Select { c, t, f } => {
+                let cond = cmp(
+                    fusor2_ir::scalar::CmpOp::Ne,
+                    self.run(c)?,
+                    zero_of(ty),
+                );
+                TileExpr::new(
+                    TileExprKind::Select {
+                        condition: cond,
+                        accept: self.run(t)?,
+                        reject: self.run(f)?,
+                    },
+                    ty,
+                )
+            }
+            ScalarKind::Cast { to, x } => TileExpr::new(
+                TileExprKind::Cast {
+                    value: self.run(x)?,
+                    to: ElementType::Scalar(elem_of(*to)?),
+                },
+                ty,
+            ),
+            ScalarKind::Bitcast { to, x } => TileExpr::new(
+                TileExprKind::Bitcast {
+                    value: self.run(x)?,
+                    to: ElementType::Scalar(elem_of(*to)?),
+                },
+                ty,
+            ),
+            ScalarKind::Round { mode, x } => TileExpr::new(
+                TileExprKind::Round {
+                    mode: *mode,
+                    value: self.run(x)?,
+                },
+                ty,
+            ),
+            ScalarKind::Dot { a, b } => TileExpr::new(
+                TileExprKind::Dot {
+                    left: self.run(a)?,
+                    right: self.run(b)?,
+                },
+                ty,
+            ),
+            ScalarKind::Splat { lanes, x } => {
+                let v = self.run(x)?;
+                TileExpr::new(
+                    TileExprKind::Vec {
+                        scalar: elem_of(e.dtype())?,
+                        lanes: *lanes,
+                        parts: vec![v; *lanes as usize],
+                    },
+                    ElementType::Vector {
+                        scalar: elem_of(e.dtype())?,
+                        lanes: *lanes,
+                    },
+                )
+            }
         })
+    }
+}
+
+pub(crate) fn zero_of(ty: ElementType) -> TileExpr {
+    match ty {
+        ElementType::Scalar(ScalarElement::U32) | ElementType::Scalar(ScalarElement::I32) => {
+            lit_u32(0)
+        }
+        _ => lit_f32(0.0),
+    }
+}
+
+pub(crate) fn one_of(ty: ElementType) -> TileExpr {
+    match ty {
+        ElementType::Scalar(ScalarElement::U32) | ElementType::Scalar(ScalarElement::I32) => {
+            lit_u32(1)
+        }
+        _ => lit_f32(1.0),
     }
 }
 
@@ -761,8 +961,9 @@ mod tests {
     }
 }
 
-/// End-to-end cover for `L1::Ext`, `KRegion` and `KMerged`. Every case lowers,
-/// compiles, runs on the worker pool and asserts the bytes that came back.
+/// End-to-end cover for the two node kinds this target used to refuse:
+/// `L1::Ext` and `KRegion`. Every case lowers, compiles, runs on the worker
+/// pool and asserts the bytes that came back.
 #[cfg(test)]
 mod composite_tests {
     use super::*;
@@ -773,7 +974,7 @@ mod composite_tests {
     use fusor2_ir::facts::{ValueFacts, Work};
     use fusor2_ir::ir::level0::{BufferId, L0, LeafKind};
     use fusor2_ir::ir::level1::{
-        AccessPlan, Effect, IndexSpace, KMerged, MergeKey, MergeSegment, ScheduleDomain, WaveCat,
+        AccessPlan, Effect, IndexSpace, ScheduleDomain,
     };
     use fusor2_ir::ir::level2::Stmt;
     use fusor2_ir::ir::{AttrId, OpDef, OpDefId, OpDefRegistry, OpTag, VerifyCtx};
@@ -874,6 +1075,8 @@ mod composite_tests {
             .launch(&artifact, ir.grid, binds, &Default::default())
             .unwrap();
     }
+
+    // -- L1::Ext ----------------------------------------------------------
 
     /// A registered extension op's own `"cpu"` lowering: `y = 3 * x`.
     ///
@@ -1054,8 +1257,13 @@ mod composite_tests {
         assert!(msg.contains("gpu_only") && msg.contains("cpu"), "{msg}");
     }
 
+    // -- KRegion -----------------------------------------------------------
+
+    /// Two elementwise members, two live outputs, one dispatch. This is the
+    /// multi-output region the architecture calls "the same rewrite as
+    /// producer inlining, differing only in that it emits an extra buffer".
     /// The domain a composite landing `member`'s value carries — the same
-    /// call `rules::merge` mints it with and `verify_l1` checks it against.
+    /// call `rules::fusion` mints it with and `verify_l1` checks it against.
     fn region_sched(g: &EGraph, member: Id) -> ScheduleDomain {
         ScheduleDomain::Map(fusor2_ir::ir::level1::MapDomain::linear_over(
             crate::caps::cpu_caps(),
@@ -1165,43 +1373,6 @@ mod composite_tests {
         assert_eq!(a, vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0]);
         assert_eq!(b, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
         assert_eq!(stores, 2, "one region, two live outputs, one dispatch");
-    }
-
-    #[test]
-    fn a_kmerged_wave_runs_every_segment_in_one_dispatch() {
-        let mut g = graph();
-        let (x, doubled, plus_one) = two_member_graph(&mut g);
-        let key = MergeKey {
-            m: Dim::Const(8),
-            n: Dim::Const(1),
-            k: Dim::Const(1),
-            batch: Dim::Const(1),
-            splits: 1,
-            dtype: Dtype::F32,
-            family: fusor2_ir::ir::level1::Family::Sgemv,
-        };
-        let wave = KMerged::new(
-            WaveCat::Row,
-            [
-                MergeSegment {
-                    id: doubled,
-                    key,
-                    has_epilogue: false,
-                },
-                MergeSegment {
-                    id: plus_one,
-                    key,
-                    has_epilogue: false,
-                },
-            ],
-            region_sched(&g, doubled),
-        )
-        .unwrap();
-        let merged = g.add(Op::L1(L1::KMerged(wave))).unwrap();
-        let (a, b, stores) = run_composite(&g, merged, x, doubled, plus_one);
-        assert_eq!(a, vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0]);
-        assert_eq!(b, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
-        assert_eq!(stores, 2, "two segments, one dispatch");
     }
 
     /// A composite whose members disagree on their lane count has no

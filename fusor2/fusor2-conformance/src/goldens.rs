@@ -1,15 +1,30 @@
 //! Two golden families: FNV-1a hashes of exact output bytes, and `PlanHash`
-//! goldens over the calibration shape set. There are no golden shader bytes.
+//! goldens over the calibration shape set.
 //!
-//! The recorded tables live in this file as `&'static str` blocks. Both
-//! families print the measured value on mismatch, so a deliberate numeric
-//! change is re-recorded by copying one line.
+//! Note what is *not* here: golden shader bytes. The plan is the cache key, so
+//! there is no `hash_kernel_fields`, no `structural_kernel_key` and no
+//! `key_goldens` — the class of bug where a new decision variable must be
+//! threaded into four hash recipes cannot exist.
+//!
+//! The recorded tables live in this file as `&'static str` blocks rather than
+//! in `goldens/*.txt`. The architecture's `include_str!` shape is equivalent;
+//! it is inlined here because W14's ownership manifest covers `.rs` files
+//! only, and a data file another agent cannot see is worse than a table they
+//! can. Both families print the measured value on mismatch so a *deliberate*
+//! numeric change is re-recorded by copying one line.
+//!
+//! Owned by W14.
 
 use fusor2_ir::extract::PlanHash;
 
 use crate::harness::CaseError;
 
-/// FNV-1a over exact bytes. Not a cryptographic hash.
+// ---------------------------------------------------------------------------
+// Hashing
+// ---------------------------------------------------------------------------
+
+/// FNV-1a, verbatim from `conformance/src/goldens.rs`. Not a cryptographic
+/// hash and not meant to be: it is a cheap total order over exact bytes.
 pub fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for &byte in bytes {
@@ -19,8 +34,9 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The hash of a tensor's exact little-endian f32 bytes. The caller hands
-/// over flattened values, so the hash is layout-independent.
+/// The hash of a tensor's exact little-endian f32 bytes. Layout-independent
+/// by construction: the caller hands over the flattened values, so a stride
+/// change that preserves the logical value does not move the hash.
 pub fn tensor_hash(values: &[f32]) -> u64 {
     let mut bytes = Vec::with_capacity(values.len() * 4);
     for v in values {
@@ -29,6 +45,10 @@ pub fn tensor_hash(values: &[f32]) -> u64 {
     fnv1a(&bytes)
 }
 
+// ---------------------------------------------------------------------------
+// Family (a): output hashes
+// ---------------------------------------------------------------------------
+
 /// One recorded output hash.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct OutputGolden {
@@ -36,8 +56,9 @@ pub struct OutputGolden {
     pub hash: u64,
 }
 
-/// The traces pinned by output hash, by name. An unrecorded name fails with
-/// the measured value rather than passing vacuously.
+/// The four traces the reference pins, by name. Recording is a separate act
+/// from asserting: an unrecorded name fails loudly with the measured value
+/// rather than passing vacuously.
 pub const OUTPUT_GOLDEN_NAMES: [&str; 6] = [
     "attention_gqa_causal_fwd_bwd",
     "bilstm_trace",
@@ -86,7 +107,8 @@ pub fn record_output(name: &str, hash: u64) -> String {
 }
 
 /// Check one output hash against the table. An unrecorded name is a failure,
-/// not a pass.
+/// not a pass: a golden family that silently accepts anything it has not seen
+/// is not a golden family.
 pub fn check_output(name: &str, values: &[f32]) -> Result<(), CaseError> {
     let hash = tensor_hash(values);
     match output_goldens().iter().find(|g| g.name == name) {
@@ -106,6 +128,10 @@ pub fn check_output(name: &str, values: &[f32]) -> Result<(), CaseError> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Family (b): PlanHash goldens
+// ---------------------------------------------------------------------------
+
 /// One golden: a named shape and the plan hash it must extract to.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Golden {
@@ -114,7 +140,8 @@ pub struct Golden {
 }
 
 /// The calibration shape set the `PlanHash` goldens cover: one entry per
-/// kernel family the extractor can select, at one pinned shape.
+/// kernel family the extractor can select, at the shape the reference pins it
+/// at.
 pub const CALIBRATION_SHAPES: [(&str, [u64; 3]); 8] = [
     ("dense_4096_cube", [4096, 4096, 4096]),
     ("gemv_1x4096x4096", [1, 4096, 4096]),
@@ -176,8 +203,16 @@ pub fn check(name: &str, hash: PlanHash) -> Result<(), String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Structural PlanHash asserts
+// ---------------------------------------------------------------------------
+
 /// One plan must serve a whole `Dim::Sym` family: the same L0 term extracted
-/// at three different bindings hashes identically. Needs no recorded constant.
+/// at three different bindings hashes identically.
+///
+/// This needs no recorded constant, which is why it is the load-bearing half
+/// of family (b) — it falsifies "the trainer recompiles per sequence bucket"
+/// directly rather than through a number someone pasted in.
 pub fn assert_one_plan_per_symbolic_family(
     name: &str,
     hashes: &[(u64, PlanHash)],
@@ -206,8 +241,9 @@ pub fn assert_one_plan_per_symbolic_family(
     Ok(())
 }
 
-/// `specialize_dim` must change the hash only after the binding has recurred;
-/// on first sighting the generic symbolic variant wins outright.
+/// `specialize_dim` must change the hash **only after** the binding has
+/// recurred: on first sighting the generic symbolic variant wins outright, so
+/// nothing compiles per length bucket speculatively.
 pub fn assert_specialization_waits_for_reuse(
     name: &str,
     generic: PlanHash,
@@ -247,17 +283,29 @@ mod tests {
     use super::*;
 
     /// The whole `resolve` pipeline — saturate, extract, derive — is a pure
-    /// function of `(graph, device)`. No budget is a wall clock, so the plan
-    /// may not depend on machine load. Runs the pipeline twenty times and
-    /// asserts the plan is identical each time.
+    /// function of `(graph, device)`.
+    ///
+    /// It was not. `SaturationBudget` carried a 2 ms deadline and
+    /// `ExtractBudget` a second one, so which alternatives existed and how
+    /// far the local search got both depended on machine load. A `rms_norm`
+    /// of five lines truncated at 96 of its 134 nodes, at a different node
+    /// each run — and `PlanHash` is the key of a cache the design says is
+    /// valid across processes.
+    ///
+    /// This runs the pipeline the way `Session::resolve` does, twenty times,
+    /// against a graph that used to truncate, and asserts the plan is the
+    /// same plan every time. Twenty repeats on the same core is also twenty
+    /// different wall times, which is exactly the axis the deadlines leaked.
     #[test]
     fn the_same_graph_on_the_same_device_yields_the_same_plan() {
-        use fusor2::{Device, Dim, Dtype, Graph, Session, Tensor};
+        use fusor2::session::Backend;
+        use fusor2::{Dim, Dtype, Graph, Session};
+use fusor2::tensor::Dyn as Tensor;
         use fusor2_ir::egraph::{Id, Saturate, SaturationBudget};
         use fusor2_ir::extract::{ExtractBudget, Extractor};
         use fusor2_ir::saturate::Driver;
 
-        let Ok(cpu) = Device::cpu() else { return };
+        let Ok(cpu) = Backend::cpu() else { return };
         let session = Session::new(cpu).unwrap();
         let caps = session.caps();
         let cost = fusor2_cost::Roofline::new(session.device().target().facts().clone());

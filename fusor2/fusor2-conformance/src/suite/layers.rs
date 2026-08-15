@@ -1,8 +1,13 @@
 //! `Linear`, `Embedding`, `ConvNd`, `LayerNorm`, `RmsNorm`, plus the caches
 //! and the optimizer that sit on top of them.
 //!
-//! Each case asserts two things: that the layer's forward is the composition it
-//! documents, and that gradients reach every parameter it holds.
+//! A layer owns parameters and a `forward`; it owns no kernel. So every case
+//! here is really two assertions: that the layer's forward is the composition
+//! its documentation claims, and that gradients reach **every** parameter it
+//! holds. A layer whose bias never receives a gradient trains to a plausible
+//! but wrong model, and only the second assertion catches it.
+//!
+//! Owned by W14.
 
 use fusor2::composite::loss::{
     binary_cross_entropy_with_logits, distillation_loss, mse, softmax_cross_entropy,
@@ -13,6 +18,21 @@ use fusor2::{Dtype, Session};
 
 use crate::harness::{CaseError, CaseResult, Cases, dims, from_u32};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
+
+/// A runtime-rank value as the const-rank one the layers now take.
+///
+/// The suite uploads through `Dyn` on purpose — a case's shape is data it
+/// reads from its own table — and the layers are `Tensor<R, T>`, so the rank
+/// assertion happens here, once per case, instead of every case being
+/// rewritten around a const shape it does not have.
+fn t<const R: usize>(v: fusor2::tensor::Dyn) -> fusor2::Tensor<R, f32> {
+    fusor2::Tensor::<R, f32>::from_dyn(v)
+}
+
+/// [`t`] for a `u32` index value.
+fn ids<const R: usize>(v: fusor2::tensor::Dyn) -> fusor2::Tensor<R, u32> {
+    fusor2::Tensor::<R, u32>::from_dyn(v)
+}
 
 /// `[ROWS, IN] @ [OUT, IN]^T + [OUT]`.
 const ROWS: usize = 3;
@@ -74,8 +94,9 @@ pub fn cases() -> Cases {
     cases
 }
 
-/// `Linear::forward` is `mat_mul_transposed_rhs` plus a broadcast bias, so
-/// `d_weight` lands in the weight's own `[out, in]` layout.
+/// `Linear::forward` is `mat_mul_transposed_rhs` plus a broadcast bias — the
+/// transposed form specifically, so `d_weight` lands in the weight's own
+/// `[out, in]` layout and the optimizer's flat slice stays a view.
 fn linear_case(session: &Session, bias: bool) -> CaseResult {
     let x_data = Domain::Wide.sample(1501, ROWS * IN);
     let w_data = Domain::Wide.sample(1511, OUT * IN);
@@ -87,10 +108,8 @@ fn linear_case(session: &Session, bias: bool) -> CaseResult {
     let b = bias
         .then(|| upload(graph.handle(), &dims(&[OUT as u64]), &b_data))
         .transpose()?;
-    let layer = Linear::new(w, b);
-    let y = layer
-        .forward(&x)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let layer = Linear::new(t::<2>(w), b.map(t::<1>));
+    let y = layer.forward(&t::<2>(x)).into_dyn();
 
     let expected = host_linear(&x_data, &w_data, bias.then_some(&b_data[..]));
     expect_values(
@@ -114,10 +133,8 @@ fn linear_grads(session: &Session) -> CaseResult {
     let x = upload(graph.handle(), &dims(&[ROWS as u64, IN as u64]), &x_data)?;
     let w = upload(graph.handle(), &dims(&[OUT as u64, IN as u64]), &w_data)?;
     let b = upload(graph.handle(), &dims(&[OUT as u64]), &b_data)?;
-    let layer = Linear::new(w.clone(), Some(b.clone()));
-    let y = layer
-        .forward(&x)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let layer = Linear::new(t::<2>(w.clone()), Some(t::<1>(b.clone())));
+    let y = layer.forward(&t::<2>(x.clone())).into_dyn();
 
     // d_weight[o, i] = sum over rows of x[r, i], independent of o.
     let d_w = gradient_of(&graph, &y, &w)?;
@@ -171,13 +188,11 @@ const TOKENS: &[u32] = &[2, 0, 2, 4];
 fn embedding_layer(session: &Session) -> CaseResult {
     let table = Domain::Wide.sample(1553, VOCAB * EMB);
     let graph = graph_of(session);
-    let t = upload(graph.handle(), &dims(&[VOCAB as u64, EMB as u64]), &table)?;
-    let ids = from_u32(graph.handle(), &dims(&[2, 2]), TOKENS)
+    let table_value = upload(graph.handle(), &dims(&[VOCAB as u64, EMB as u64]), &table)?;
+    let tokens = from_u32(graph.handle(), &dims(&[2, 2]), TOKENS)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let layer = Embedding::new(t);
-    let y = layer
-        .forward(&ids)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let layer = Embedding::new(t::<2>(table_value));
+    let y = layer.forward::<2, 3>(&ids::<2>(tokens)).into_dyn();
 
     let mut expected = Vec::with_capacity(TOKENS.len() * EMB);
     for id in TOKENS {
@@ -194,19 +209,17 @@ fn embedding_layer(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// One token appearing twice gets the summed gradient, inherited from
-/// `Gather`'s declared adjoint.
+/// One token appearing twice gets the summed gradient — the layer inherits
+/// that from `Gather`'s declared adjoint rather than implementing it.
 fn embedding_layer_backward(session: &Session) -> CaseResult {
     let table = Domain::Wide.sample(1559, VOCAB * EMB);
     let graph = graph_of(session);
-    let t = upload(graph.handle(), &dims(&[VOCAB as u64, EMB as u64]), &table)?;
-    let ids = from_u32(graph.handle(), &dims(&[2, 2]), TOKENS)
+    let table_value = upload(graph.handle(), &dims(&[VOCAB as u64, EMB as u64]), &table)?;
+    let tokens = from_u32(graph.handle(), &dims(&[2, 2]), TOKENS)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let layer = Embedding::new(t.clone());
-    let y = layer
-        .forward(&ids)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let grad = gradient_of(&graph, &y, &t)?;
+    let layer = Embedding::new(t::<2>(table_value.clone()));
+    let y = layer.forward::<2, 3>(&ids::<2>(tokens)).into_dyn();
+    let grad = gradient_of(&graph, &y, &table_value)?;
 
     let mut counts = vec![0.0f32; VOCAB];
     for id in TOKENS {
@@ -236,10 +249,8 @@ fn layer_norm_layer(session: &Session) -> CaseResult {
     let x = upload(graph.handle(), &dims(&[ROWS as u64, NORM_W as u64]), &data)?;
     let w = upload(graph.handle(), &dims(&[NORM_W as u64]), &weight)?;
     let b = upload(graph.handle(), &dims(&[NORM_W as u64]), &bias)?;
-    let layer = LayerNorm::new(w, Some(b), EPS);
-    let y = layer
-        .forward(&x)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let layer = LayerNorm::new(t::<1>(w), Some(t::<1>(b)), EPS);
+    let y = layer.forward(&t::<2>(x)).into_dyn();
 
     let mut expected = Vec::with_capacity(ROWS * NORM_W);
     for row in data.chunks(NORM_W) {
@@ -276,10 +287,8 @@ fn layer_norm_nd(session: &Session) -> CaseResult {
         &data,
     )?;
     let w = upload(graph.handle(), &dims(&[BDIM as u64, C as u64]), &weight)?;
-    let layer = LayerNormNd::new(LayerNorm::new(w, None, EPS), 2);
-    let y = layer
-        .forward(&x)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let layer = LayerNormNd::new(LayerNorm::new(t::<2>(w), None, EPS), 2);
+    let y = layer.forward(&t::<3>(x)).into_dyn();
 
     let tail = BDIM * C;
     let mut expected = Vec::with_capacity(data.len());
@@ -308,10 +317,8 @@ fn rms_norm_layer(session: &Session) -> CaseResult {
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(&[ROWS as u64, NORM_W as u64]), &data)?;
     let w = upload(graph.handle(), &dims(&[NORM_W as u64]), &weight)?;
-    let layer = RmsNorm::new(Some(w.clone()), EPS);
-    let y = layer
-        .forward(&x)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let layer = RmsNorm::new(Some(t::<1>(w.clone())), EPS);
+    let y = layer.forward(&t::<2>(x)).into_dyn();
 
     let mut expected = Vec::with_capacity(ROWS * NORM_W);
     for row in data.chunks(NORM_W) {
@@ -360,10 +367,8 @@ fn conv_layer(session: &Session) -> CaseResult {
         &w_data,
     )?;
     let b = upload(graph.handle(), &dims(&[OUT_CH as u64]), &b_data)?;
-    let layer = fusor2::layers::ConvNd::new(w, Some(b));
-    let y = layer
-        .forward(&x)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let layer = fusor2::layers::ConvNd::new(t::<3>(w), Some(t::<1>(b)));
+    let y = layer.forward(&t::<3>(x)).into_dyn();
 
     // No padding, unit stride: the output is WIDTH - K + 1 wide.
     let ow = WIDTH - K + 1;
@@ -389,7 +394,9 @@ fn conv_layer(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// One gradient-descent step on a two-layer MLP reduces the loss.
+/// One gradient-descent step on a two-layer MLP must reduce the loss. This is
+/// the smallest end-to-end statement that the forward, the tape and the
+/// parameter update agree with each other.
 fn mlp_step(session: &Session) -> CaseResult {
     const LR: f32 = 0.05;
     let x_data = Domain::Wide.sample(1621, ROWS * IN);
@@ -401,9 +408,10 @@ fn mlp_step(session: &Session) -> CaseResult {
         let x = upload(graph.handle(), &dims(&[ROWS as u64, IN as u64]), &x_data)?;
         let a = upload(graph.handle(), &dims(&[OUT as u64, IN as u64]), w1)?;
         let b = upload(graph.handle(), &dims(&[OUT as u64]), w2)?;
-        let hidden = Linear::new(a.clone(), None)
-            .forward(&x)
-            .and_then(|h| h.relu())
+        let hidden = Linear::new(t::<2>(a.clone()), None)
+            .forward(&t::<2>(x))
+            .into_dyn()
+            .relu()
             .map_err(|e| -> CaseError { e.to_string().into() })?;
         let out = hidden
             .broadcast_mul(&b)
@@ -522,9 +530,9 @@ fn cross_entropy_grad(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// The folded one-vs-all BCE, written as a plain softplus chain.
-/// `softplus_bce_adjoint` turns its backward into the single-sigmoid form
-/// without changing the numbers.
+/// The folded one-vs-all BCE the trainer's distillation loss is built from.
+/// Written as a plain softplus chain; `softplus_bce_adjoint` is what turns its
+/// backward into the single-sigmoid form, and the numbers must not change.
 fn bce_case(session: &Session) -> CaseResult {
     let logits = Domain::Custom(-3.0, 3.0).sample(1667, ROWS * CLASSES);
     let targets = Domain::Custom(0.0, 1.0).sample(1669, ROWS * CLASSES);
@@ -557,7 +565,7 @@ fn bce_case(session: &Session) -> CaseResult {
         &expected,
     )?;
 
-    // dL/dz = sigmoid(z) - y.
+    // dL/dz = sigmoid(z) - y, which is what the rewrite must preserve.
     let grad = gradient_of(&graph, &loss, &l)?;
     let want: Vec<f32> = logits
         .iter()
@@ -596,7 +604,8 @@ fn distillation_case(session: &Session) -> CaseResult {
     if got.iter().any(|v| !v.is_finite()) {
         return Err("the distillation loss produced a non-finite value".into());
     }
-    // The gradient reaches the student.
+    // The gradient must reach the student and must not reach the teacher's
+    // values as if they were trainable in the same step.
     let d_s = gradient_of(&graph, &loss, &s)?;
     if d_s.iter().all(|v| *v == 0.0) {
         return Err("the student received an identically-zero distillation gradient".into());
@@ -710,8 +719,9 @@ fn clip_case(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// The schedule is host-computed and needs no device, but runs per session so
-/// a backend disagreement would show up.
+/// The schedule is host-computed, so this needs no device at all — but it
+/// runs per session anyway, because a schedule that disagrees between
+/// backends would be a very confusing bug to find later.
 fn cosine_case(_session: &Session) -> CaseResult {
     const WARMUP: u64 = 10;
     const TOTAL: u64 = 100;
@@ -820,6 +830,7 @@ mod tests {
 
     #[test]
     fn the_embedding_tokens_repeat() {
+        // Otherwise `embedding_layer_backward` would prove nothing.
         let mut seen = vec![0u32; VOCAB];
         for t in TOKENS {
             seen[*t as usize] += 1;

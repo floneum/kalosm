@@ -6,11 +6,14 @@
 //! argmax, that a `top_k`/`top_p` filter can never return a token outside the
 //! surviving set, and that the pending forms hand back a device tensor rather
 //! than a host round trip.
+//!
+//! Owned by W14.
 
 use fusor2::sampling::mirostat2::Mirostat2Sampler;
 use fusor2::sampling::standard::{StandardSamplerParams, sample};
 use fusor2::sampling::top_k::top_k_pairs;
-use fusor2::{Dtype, Session, Tensor};
+use fusor2::{Dtype, Session, };
+use fusor2::tensor::Dyn as Tensor;
 
 use crate::harness::{CaseError, CaseResult, Cases, dims};
 use crate::suite::support::{Domain, expect_values, graph_of, read, upload};
@@ -285,8 +288,9 @@ fn nucleus(values: &[f32], p: f32) -> Vec<u32> {
 
 /// `min_p` drops every token whose probability is below `min_p * p_max`.
 ///
-/// The case requests the filter through `StandardSamplerParams` and checks the
-/// draw against the surviving set, the same shape as `top_p_filter`.
+/// `StandardSamplerParams` now carries the knob, so this case requests the
+/// filter and checks the draw against the surviving set, the same shape as
+/// `top_p_filter`.
 fn min_p_filter(session: &Session) -> CaseResult {
     const MIN_P: f32 = 0.2;
     let values = logits();

@@ -1,24 +1,34 @@
 //! Multi-slot folds, on real hardware, on both backends.
 //!
 //! One accumulator per carrier slot, one `merge` per slot, and the answer
-//! compared against the equivalent two-pass algorithm. Every slot is checked.
+//! compared against the two-pass algorithm the carrier replaces. This is the
+//! coverage that was missing, and it is why the `accs[0]` bug survived: the L2
+//! reduction resolved one `TileReduceOp` for a whole fold and updated only slot
+//! 0, so `Fold{(max, sum)}` computed `max(x)` and silently discarded the sum
+//! while every test in the suite passed.
 //!
-//! The two carriers come from `fusor2_ir::carrier::oracle`, the same
-//! definitions that crate's unit tests run on the host evaluator.
+//! The two carriers are the demoted oracles from `fusor2_ir::carrier::oracle` —
+//! the same definitions that crate's unit tests run on the host evaluator, so
+//! there is one spelling of each algorithm and two independent executions of it.
 
-use fusor2::{Dtype, Session, Tensor};
+use fusor2::{Dtype, Session, };
+use fusor2::tensor::Dyn as Tensor;
 use fusor2_ir::carrier::{Carrier, oracle};
 use fusor2_ir::scalar::UnOp;
 
 use crate::harness::{CaseError, CaseResult, Cases, dims};
 use crate::suite::support::{Domain, expect_values, graph_of, read, upload};
 
-/// `[rows, axis]` for the one-pass body: `AXIS` fits inside a lane group.
+/// `[rows, axis]`. `AXIS` deliberately exceeds no lane group: the one-pass body
+/// and the strided loop are separate code paths and `AXIS_LONG` covers the other.
 const ROWS: u64 = 3;
 const AXIS: u64 = 5;
-/// Longer than one pass of the lane group on either backend (256 lanes), so
-/// the per-lane strided loop runs three passes and the tree merges real
-/// partial accumulators rather than one element each.
+/// Longer than one pass of the lane group on **either** backend (256 lanes), so
+/// the per-lane strided loop runs with three passes and the tree merges real
+/// partial accumulators rather than one element each. The distinction is
+/// load-bearing: the loop absorbs elements with `merge(acc, lift(x))` while the
+/// tree merges two accumulators, and a carrier that got only one of the two
+/// right would pass at the short extent.
 const AXIS_LONG: u64 = 600;
 
 pub fn cases() -> Cases {
@@ -32,8 +42,9 @@ pub fn cases() -> Cases {
     for (name, axis) in [("welford", AXIS), ("welford_long", AXIS_LONG)] {
         cases.push("multi_slot", name, move |s| welford_case(s, axis));
     }
-    // A lane group that is not a multiple of the extent merges padded identity
-    // lanes, where an unguarded rescale computes `0 * exp((-inf) - (-inf))`.
+    // The obligation every carrier owes, exercised on a real launch: a lane
+    // group that is not a multiple of the extent merges padded identity lanes,
+    // and an unguarded rescale computes `0 * exp((-inf) - (-inf)) = NaN` there.
     cases.push(
         "multi_slot",
         "identity_lanes_do_not_poison_the_merge",
@@ -65,7 +76,7 @@ fn fold(x: &Tensor, carrier: Carrier) -> Result<Tensor, CaseError> {
 /// plain two-pass max-then-sum.
 ///
 /// Slot 0 is the row max and slot 1 the shifted sum, so `slot0 + ln(slot1)` is
-/// log-sum-exp.
+/// log-sum-exp: the value the two-pass form computes in two traversals.
 fn shift_stabilized_case(session: &Session, axis: u64) -> CaseResult {
     let len = (ROWS * axis) as usize;
     let data = Domain::Wide.sample(211, len);
@@ -82,7 +93,8 @@ fn shift_stabilized_case(session: &Session, axis: u64) -> CaseResult {
     }
     expect_values(session, &[ROWS, 2], Dtype::F32, &actual, &expected)?;
 
-    // The log-sum-exp stays finite where the naive `sum(exp(x))` overflows.
+    // And the value the carrier exists for: a log-sum-exp that stays finite
+    // where the naive `sum(exp(x))` overflows.
     for (i, chunk) in actual.chunks(2).enumerate() {
         let lse = chunk[0] + chunk[1].ln();
         let row = &data[i * axis as usize..(i + 1) * axis as usize];
@@ -97,7 +109,8 @@ fn shift_stabilized_case(session: &Session, axis: u64) -> CaseResult {
 
 /// The `(n, mean, m2)` carrier against a two-pass variance.
 ///
-/// Every slot is checked, not just the one the answer is read from.
+/// Every slot is checked, not just the one the answer is read from: a merge that
+/// updates only slot 0 would still produce a plausible `n`.
 fn welford_case(session: &Session, axis: u64) -> CaseResult {
     let len = (ROWS * axis) as usize;
     let data = Domain::Wide.sample(307, len);
@@ -129,8 +142,11 @@ fn welford_case(session: &Session, axis: u64) -> CaseResult {
 /// A reduced extent of 1 against a whole lane group: every lane but one merges
 /// the identity against the identity.
 ///
-/// `merge(identity, identity) == identity` must hold on a real launch, where
-/// the rescale `l_a * exp(m_a - m)` meets `0 * exp((-inf) - (-inf))`.
+/// `merge(identity, identity) == identity` is checked at
+/// `Builder::intern_carrier`; this is the same obligation on a real launch,
+/// where the rescale `l_a * exp(m_a - m)` meets `0 * exp((-inf) - (-inf))` and
+/// an unguarded spelling returns NaN — and merging `(-inf, NaN)` against a real
+/// partial propagates it into the answer.
 fn identity_lane_case(session: &Session) -> CaseResult {
     let data = vec![2.5f32, -1.0, 7.25];
     let carrier = oracle::shift_stabilized_sum(UnOp::Exp, Dtype::F32);

@@ -1,7 +1,9 @@
 //! The pooled allocator: keyed `(size, usage)` with `strong_count == 1` reuse
-//! and a platform memory ceiling that blocks and retries before failing. On
-//! macOS, exceeding unified memory kills the OS rather than erroring, so the
-//! ceiling is a hard gate.
+//! and a platform memory ceiling that **blocks and retries** before failing.
+//! On macOS, exceeding unified memory kills the OS rather than erroring, which
+//! is why the ceiling is a hard gate and not a warning.
+//!
+//! Owned by W9.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -64,7 +66,33 @@ pub struct BufferPool {
     counters: Mutex<BufferPoolCounters>,
     ceiling_bytes: Mutex<u64>,
     poison: bool,
+    upload_staging: Mutex<Vec<StagingChunk>>,
 }
+
+/// A reusable upload staging buffer, kept mapped between uses.
+///
+/// `queue.write_buffer_with`'s staging is a fresh allocation per call, so a
+/// large upload memcpy runs at page-fault speed — the kernel zero-fill
+/// serializes and neither thread count nor copy width moves it (9.4 MB Q4K
+/// weight: ~1.05 ms serial, ~0.78 ms with 3 threads, on an M2 Max). Writing
+/// into the *same* mapped buffer every time keeps the pages resident; the
+/// chunk is unmapped only for the instant its copy is in flight and
+/// `map_async` re-arms it during the resolve's own wait.
+struct StagingChunk {
+    buffer: wgpu::Buffer,
+    size: u64,
+    /// Armed by the `map_async` callback; cleared while the copy is in
+    /// flight. A chunk whose remap failed simply never re-arms, and uploads
+    /// fall back to the belt.
+    mapped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Staging chunks kept alive at most. Sized by the largest concurrent
+/// uploads a resolve issues; anything past this takes the belt path.
+const UPLOAD_STAGING_CHUNKS: usize = 4;
+/// Below this an upload takes the belt: a small copy is not page-fault bound
+/// and the belt already batches it into the next submit.
+const UPLOAD_STAGING_MIN: u64 = 1 << 20;
 
 impl BufferPool {
     /// Build a pool over a live device.
@@ -82,6 +110,7 @@ impl BufferPool {
             counters: Mutex::new(BufferPoolCounters::default()),
             ceiling_bytes: Mutex::new(ceiling),
             poison: config.poison_allocations,
+            upload_staging: Mutex::new(Vec::new()),
         }
     }
 
@@ -93,7 +122,8 @@ impl BufferPool {
 
     /// Allocate or recycle at an explicit usage set.
     ///
-    /// Blocks and retries at the ceiling rather than failing.
+    /// Blocks and retries at the ceiling rather than failing — one of exactly
+    /// three host syncs in the whole runtime.
     pub fn alloc_with_usage(&self, bytes: u64, usage: wgpu::BufferUsages) -> Result<Buf> {
         let size = padded_copy_size(bytes.max(4));
         let key = PoolKey {
@@ -108,7 +138,8 @@ impl BufferPool {
 
         let ceiling = *self.ceiling_bytes.lock();
         if self.counters.lock().live_bytes.saturating_add(size) > ceiling {
-            // Retire everything in flight, then retry the cache.
+            // Retire everything in flight, then retry the cache. Only after
+            // both fail is the working set genuinely over the cap.
             self.counters.lock().cap_retries += 1;
             self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
             self.reclaim();
@@ -135,6 +166,9 @@ impl BufferPool {
         let gpu = buf
             .downcast_ref::<GpuBuffer>()
             .ok_or_else(|| Error::Device("pool handed back a foreign buffer".into()))?;
+        if size >= UPLOAD_STAGING_MIN && self.upload_via_staging(gpu, data, size) {
+            return Ok(buf);
+        }
         match self.queue.write_buffer_with(
             &gpu.buffer,
             0,
@@ -143,7 +177,7 @@ impl BufferPool {
             Some(mut view) => {
                 // Write straight into the staging belt: the padding tail is
                 // whatever the belt held, so it is zeroed explicitly.
-                view.slice(..data.len()).copy_from_slice(data);
+                parallel_copy(view.slice(..data.len()), data);
                 view.slice(data.len()..).fill(0);
             }
             None => {
@@ -154,6 +188,67 @@ impl BufferPool {
             }
         }
         Ok(buf)
+    }
+
+    /// Upload through the pool's own remappable staging ring. `false` when no
+    /// chunk is ready and the ring is full — the caller takes the belt.
+    ///
+    /// Ordering: the copy is submitted *here*, before the plan's own submit,
+    /// and wgpu executes submissions in order, so a dispatch can never read
+    /// the destination before the copy. The `map_async` re-arm completes on
+    /// any later device poll — every resolve ends in one (readback or
+    /// `poll_wait`), which is what keeps the ring warm with no poll of its
+    /// own.
+    fn upload_via_staging(&self, dst: &GpuBuffer, data: &[u8], size: u64) -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let chunk = {
+            let mut ring = self.upload_staging.lock();
+            if let Some(i) = ring
+                .iter()
+                .position(|c| c.size >= size && c.mapped.load(Ordering::Acquire))
+            {
+                Some(ring.swap_remove(i))
+            } else if ring.len() < UPLOAD_STAGING_CHUNKS {
+                let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("fusor2 upload staging"),
+                    size,
+                    usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: true,
+                });
+                Some(StagingChunk {
+                    buffer,
+                    size,
+                    mapped: Arc::new(AtomicBool::new(true)),
+                })
+            } else {
+                None
+            }
+        };
+        let Some(chunk) = chunk else {
+            return false;
+        };
+        {
+            let mut view = chunk.buffer.slice(0..size).get_mapped_range_mut();
+            parallel_copy(view.slice(..data.len()), data);
+            view.slice(data.len()..).fill(0);
+        }
+        chunk.buffer.unmap();
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fusor2 upload staging copy"),
+            });
+        enc.copy_buffer_to_buffer(&chunk.buffer, 0, &dst.buffer, 0, size);
+        self.queue.submit([enc.finish()]);
+        chunk.mapped.store(false, Ordering::Release);
+        let armed = Arc::clone(&chunk.mapped);
+        chunk.buffer.slice(..).map_async(wgpu::MapMode::Write, move |r| {
+            if r.is_ok() {
+                armed.store(true, Ordering::Release);
+            }
+        });
+        self.upload_staging.lock().push(chunk);
+        true
     }
 
     /// Return a buffer whose only remaining handle is the caller's.
@@ -168,13 +263,25 @@ impl BufferPool {
     /// establish that the device has finished reading the buffer. A buffer whose
     /// last host handle drops while its submission is still in flight is
     /// recycled here and handed to the next allocation, which then writes into
-    /// memory a running kernel is still reading. Under allocation pressure that
-    /// shows up as a single wrong value out of an otherwise correct kernel.
+    /// memory a running kernel is still reading.
     ///
-    /// Recording the `SubmissionIndex` at recycle time and withholding the
-    /// buffer until `device.poll(WaitForSubmissionIndex(..))` has passed it
-    /// would close the window, at the cost of an allocator that deadlocks the
-    /// trainer whenever a submission never completes.
+    /// This is unproven but it is the mechanism that fits the one observation we
+    /// have: `lower::contract::tests::a_narrow_output_stages_the_accumulator`
+    /// returned -0.1060791 against -0.16938101 at
+    /// `CoopGeom { bm: 16, bn: 16, bk: 8, n_passes: 1, subgroups: 2, rg: 1, cg: 2 }`
+    /// staging 2, once, while a conformance run was hammering the same device.
+    /// It has not reproduced since: 500 isolated runs of the IR binary, 15
+    /// GPU-contract runs under cross-process GPU load, 8 full-binary runs under
+    /// CPU load, 7 exclusive full-workspace runs, then 25 further targeted runs
+    /// and 6 full gpu+ir suite rounds under two concurrent conformance runs.
+    /// Allocation pressure is the variable the mechanism predicts and the one
+    /// isolation removes, which is why the failure survives only under load.
+    ///
+    /// The fix, if it recurs: record the `SubmissionIndex` at recycle time and
+    /// withhold the buffer until `device.poll(WaitForSubmissionIndex(..))` has
+    /// passed it. That is deliberately NOT done here — it was not written
+    /// against a reproduction, and an allocator that waits on a submission that
+    /// never completes deadlocks the trainer, which is worse than the bug.
     pub fn recycle(&self, buf: Buf) {
         // `map` ends the borrow before `buf` may be moved into the bucket.
         let Some((size, usage)) = buf
@@ -186,11 +293,17 @@ impl BufferPool {
         let key = PoolKey { size, usage };
         let addr = buf.addr();
         // Everything this pool created is already tracked, so recycling is
-        // dropping the caller's clone; only a foreign handle is adopted. A
-        // tracked buffer has refcount 2 (pool + caller) here, and a caller
-        // holding a further clone simply fails `take_free`'s `refcount() == 1`
-        // test until it drops it. `self.counters` is locked once, outside the
-        // `self.free` critical section: nesting the two deadlocks.
+        // dropping the caller's clone. Only a foreign handle is adopted.
+        // The old `if buf.refcount() != 1 { return; }` guard is gone on
+        // purpose: a tracked buffer has refcount 2 (pool + caller) here, and
+        // a caller that still holds another clone simply fails `take_free`'s
+        // `refcount() == 1` test until it drops it.
+        //
+        // The old `else` arm here also locked `self.counters` twice inside one
+        // assignment — the RHS guard is still alive when the LHS locks, which
+        // is a hard `parking_lot` deadlock. It was unreachable only because
+        // `swap_remove` kept buckets under `FREE_PER_BUCKET`; retention makes
+        // that branch reachable, so it is gone.
         let released = {
             let mut free = self.free.lock();
             let bucket = free.get_or_insert_mut(key, Vec::new);
@@ -238,7 +351,7 @@ impl BufferPool {
         }
         let free = self.free.lock();
         for (_, bucket) in free.iter() {
-            // The pool tracks in-use buffers too; poisoning one would
+            // The pool tracks in-use buffers now; poisoning one would
             // overwrite a live tensor.
             for buf in bucket.iter().filter(|b| b.refcount() == 1) {
                 if let Some(gpu) = buf.downcast_ref::<GpuBuffer>() {
@@ -359,6 +472,55 @@ fn prune_bucket(bucket: &mut Vec<Buf>) -> u64 {
 
 /// Round up to `wgpu::COPY_BUFFER_ALIGNMENT`, which every
 /// `copy_buffer_to_buffer` and `write_buffer_with` requires.
+/// Copy `src` into a staging view with one thread per ~4 MB chunk.
+///
+/// A staging allocation is fresh pages, so a serial `copy_from_slice` runs at
+/// page-fault speed (~9 GB/s measured on an M2 Max for a 9.4 MB Q4K weight —
+/// over 1 ms, the single largest host cost of an upload-per-step workload).
+/// Page faults parallelize almost linearly; threads are only spawned past
+/// [`PARALLEL_COPY_CHUNK`], so small uploads never pay a spawn.
+fn parallel_copy(mut dst: wgpu::WriteOnly<'_, [u8]>, src: &[u8]) {
+    const PARALLEL_COPY_CHUNK: usize = 2 << 20;
+    let threads = if cfg!(target_arch = "wasm32") {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(src.len().div_ceil(PARALLEL_COPY_CHUNK))
+            .min(6)
+    };
+    if threads <= 1 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    /// A base pointer a copy worker may write through. The parent's
+    /// `WriteOnly` view outlives the scope and each worker owns a disjoint
+    /// range, so the writes never alias.
+    struct SendPtr(*mut u8);
+    unsafe impl Send for SendPtr {}
+    let base = dst.as_raw_element_ptr().as_ptr();
+    let per = src.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        for chunk in 0..threads {
+            let start = chunk * per;
+            let end = ((chunk + 1) * per).min(src.len());
+            if start >= end {
+                break;
+            }
+            let part = &src[start..end];
+            let to = SendPtr(unsafe { base.add(start) });
+            scope.spawn(move || {
+                // Rebind the whole struct first: RFC 2229 disjoint capture
+                // would otherwise capture the field `to.0` alone — a bare
+                // pointer, which is not `Send`.
+                let to = to;
+                unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), to.0, part.len()) };
+            });
+        }
+    });
+}
+
 pub fn padded_copy_size(bytes: u64) -> u64 {
     let align = wgpu::COPY_BUFFER_ALIGNMENT;
     bytes.div_ceil(align).max(1) * align
@@ -416,9 +578,12 @@ fn hw_memsize() -> Option<u64> {
 mod tests {
     use super::*;
 
-    // Adapter-gated. These skip cleanly when no GPU is present.
 
-    /// A raw wgpu device at WebGPU baseline limits, independent of capability
+    // -----------------------------------------------------------------------
+    // Adapter-gated. These skip cleanly when no GPU is present.
+    // -----------------------------------------------------------------------
+
+    /// A raw wgpu device at WebGPU baseline limits, independent of W8's
     /// probing so a pool test cannot be broken by a capability change.
     fn baseline_device() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -440,8 +605,8 @@ mod tests {
         Some((Arc::new(device), Arc::new(queue)))
     }
 
-    /// Allocate, drop, reallocate the same `(size, usage)` — `created`
-    /// increments once, `requested` twice.
+    /// Test 10: allocate, drop, reallocate the same `(size, usage)` —
+    /// `created` increments once, `requested` twice.
     #[test]
     fn pool_reuses_on_strong_count_one() {
         let Some((device, queue)) = baseline_device() else {
@@ -484,8 +649,8 @@ mod tests {
         drop((alias, b));
     }
 
-    /// With the ceiling set just under the working set, the allocator polls
-    /// and retries at least once before erroring.
+    /// Test 11: with the ceiling set just under the working set, the allocator
+    /// polls and retries at least once before erroring.
     #[test]
     fn pool_cap_polls_before_failing() {
         let Some((device, queue)) = baseline_device() else {

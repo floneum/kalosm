@@ -1,14 +1,22 @@
 //! F32, F16, BF16, U32, I32 across the whole surface, plus the `widen-compute`
 //! path and mixed-precision accumulators.
 //!
-//! There is no Bool: a comparison returns 1/0 in its operand's own dtype, so
-//! `eq` on a `U32` yields a `U32`. `cast` is differentiable in both
-//! directions, so a gradient arrives back in the master weight's dtype.
+//! Two facts shape this area. There is **no Bool**: a comparison returns
+//! 1/0 in its operand's own dtype, so `eq` on a `U32` yields a `U32`. And
+//! `cast` is differentiable in both directions, which is what makes an f32
+//! master weight with an f16 compute region a routing decision rather than a
+//! separate training mode — the gradient has to arrive back in the master
+//! dtype or the master silently stops learning.
 //!
-//! A device without f16 or bf16 support cannot run those rows; they return
-//! [`crate::harness::skip`], which names the missing capability, never `ok`.
+//! A device without f16 or bf16 support cannot run those rows. They return
+//! [`crate::harness::skip`], so the run log says `skip` and names the missing
+//! capability — never `ok`. An M2 Max has f16 and no bf16, so on this machine
+//! the bf16 rows are reported as not run rather than as passing.
+//!
+//! Owned by W14.
 
-use fusor2::{Dtype, Session, Tensor};
+use fusor2::{Dtype, Session, };
+use fusor2::tensor::Dyn as Tensor;
 use half::{bf16, f16};
 
 use crate::harness::{CaseError, CaseResult, Cases, dims, from_u32, skip};
@@ -39,8 +47,8 @@ fn unsupported(session: &Session, dtype: Dtype) -> Option<String> {
     }
 }
 
-/// The value `v` becomes after a round trip through `dtype`: the reference
-/// every cast case compares against, not the original f32.
+/// The value `v` becomes after a round trip through `dtype`. This is the
+/// reference every cast case compares against — not the original f32.
 fn quantize_to(dtype: Dtype, v: f32) -> f32 {
     match dtype {
         Dtype::F32 => v,
@@ -97,8 +105,9 @@ pub fn cases() -> Cases {
         cases.push("dtypes", name, move |s| roundtrip_case(s, dtype));
     }
 
-    // Every ordered pair of dense dtypes: the forward cast surface is the
-    // whole matrix, including f32->u32 and f16->u32.
+    // Every ordered pair of dense dtypes. The forward cast surface is the
+    // whole matrix, including the f32->u32 and f16->u32 pairs the reference
+    // left open.
     for from in DENSE {
         for to in DENSE {
             if from == to {
@@ -149,7 +158,8 @@ fn dtype_name(dtype: Dtype) -> &'static str {
 }
 
 /// Upload as `dtype`, read back as f32, compare against the host's own
-/// rounding.
+/// rounding. A dtype whose readback path drops precision differently from its
+/// upload path fails here before any op runs.
 fn roundtrip_case(session: &Session, dtype: Dtype) -> CaseResult {
     if let Some(why) = unsupported(session, dtype) {
         return Err(skip(why));
@@ -172,7 +182,9 @@ fn roundtrip_case(session: &Session, dtype: Dtype) -> CaseResult {
     Ok(())
 }
 
-/// One `cast` edge, against the composition of the two host quantizations.
+/// One `cast` edge. The reference is the composition of the two host
+/// quantizations, so a lossy pair is expected to be lossy in exactly the way
+/// the host says.
 fn cast_case(session: &Session, from: Dtype, to: Dtype) -> CaseResult {
     for dtype in [from, to] {
         if let Some(why) = unsupported(session, dtype) {
@@ -199,8 +211,10 @@ fn cast_case(session: &Session, from: Dtype, to: Dtype) -> CaseResult {
 }
 
 /// Mixed precision: an f32 master, an f16 compute region, and the gradient
-/// routed back into the master's dtype. The gradient must be an f32 tensor of
-/// the master's shape.
+/// routed back into the master's dtype.
+///
+/// The gradient must be an f32 tensor of the master's shape. A rule that
+/// leaves it in f16 silently truncates every update the optimizer applies.
 fn cast_backward(session: &Session) -> CaseResult {
     if let Some(why) = unsupported(session, Dtype::F16) {
         return Err(skip(why));
@@ -285,8 +299,8 @@ fn float_arithmetic(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// There is no Bool. A comparison returns 1/0 in the operand's own dtype, so
-/// `u32 == u32` is a `u32` and can be multiplied by a `u32` without a cast.
+/// There is no Bool. A comparison returns 1/0 **in the operand's own dtype**,
+/// so `u32 == u32` is a `u32` and can be multiplied by a `u32` without a cast.
 fn comparison_dtype(session: &Session) -> CaseResult {
     let values: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5];
     let graph = graph_of(session);
@@ -318,7 +332,8 @@ fn comparison_dtype(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// `rem` exists for `u32` only; on floats it is refused.
+/// `rem` exists for `u32` only. On floats it must be refused rather than
+/// lowered to something with a different sign convention per backend.
 fn rem_u32_only(session: &Session) -> CaseResult {
     let graph = graph_of(session);
     let a = from_u32(
@@ -349,8 +364,8 @@ fn rem_u32_only(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// `round`/`floor`/`ceil`/`trunc` are real primitives with an explicit
-/// `RoundMode`, not a chain of comparisons.
+/// Trainer constraint 5: `round`/`floor`/`ceil`/`trunc` are real primitives
+/// with an explicit `RoundMode`, not fourteen comparisons.
 fn round_modes(session: &Session) -> CaseResult {
     // Halves in both signs, so half-to-even and half-away-from-zero differ.
     let data: Vec<f32> = vec![
@@ -407,8 +422,10 @@ fn float_int_round_trip(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// A long f16 sum must accumulate in a wider dtype: summing 4096 values of
-/// magnitude ~1 in f16 stalls past 2048, where the f16 ulp exceeds the addend.
+/// A long f16 sum must accumulate in a wider dtype. Summing 4096 values of
+/// magnitude ~1 in f16 stalls once the running total passes 2048, because the
+/// f16 ulp there exceeds the addend; the result would be roughly half the
+/// right answer.
 fn widening_accumulator(session: &Session) -> CaseResult {
     if let Some(why) = unsupported(session, Dtype::F16) {
         return Err(skip(why));
@@ -523,7 +540,8 @@ mod tests {
 
     #[test]
     fn an_f16_accumulator_really_does_stall() {
-        // Without a wider carrier the sum stops advancing.
+        // The premise of `widening_accumulator`: without a wider carrier the
+        // sum stops advancing, so the case is not testing nothing.
         let mut acc = f16::from_f32(0.0);
         for _ in 0..4096 {
             acc = f16::from_f32(acc.to_f32() + 1.0);

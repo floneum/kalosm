@@ -169,13 +169,16 @@ impl Graph {
     }
 }
 
+// ---------------------------------------------------------------------------
 // Tensor
+// ---------------------------------------------------------------------------
 
 /// A value on the tape.
 pub struct Tensor<const R: usize, T: Element = f32> {
     value: RawTensor<R, T>,
     graph: Graph,
 }
+
 
 impl<const R: usize, T: Element> Clone for Tensor<R, T> {
     fn clone(&self) -> Self {
@@ -266,7 +269,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         F: Fn(RawTensor<R, T>) -> Result<Vec<BackwardTarget>> + 'static,
     {
         let erased: Rule = Arc::new(move |grad: Dyn| {
-            let typed = RawTensor::<R, T>::try_new(grad)?;
+            let typed = RawTensor::<R, T>::try_from_dyn(grad)?;
             rule(typed)
         });
         self.graph
@@ -411,7 +414,7 @@ impl Gradients {
         let raw = self.entries.get(&of.value.id())?.clone();
         Some(crate::device::ok(
             "gradient",
-            RawTensor::<R, T>::try_new(raw),
+            RawTensor::<R, T>::try_from_dyn(raw),
         ))
     }
 
@@ -424,7 +427,9 @@ impl Gradients {
     }
 }
 
+// ---------------------------------------------------------------------------
 // Differentiable ops
+// ---------------------------------------------------------------------------
 
 /// Rank- and dtype-preserving unaries.
 macro_rules! same {
@@ -503,9 +508,9 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 
     /// Broadcasting `a + b`, output rank `O = max(R, R2)`.
     ///
-    /// Two const parameters. The raw tensor's form takes a third, the operand
-    /// slot, which a raw call site turbofishes; here it is fixed to
-    /// `RawTensor<R2, T>`.
+    /// Two const parameters, matching the reference's tape-level binaries.
+    /// The raw tensor's take a third — the operand slot the reference spelled
+    /// `B: Fusion<R2, D>` — because that is what a raw call site turbofishes.
     #[track_caller]
     pub fn add_<const R2: usize, const O: usize>(&self, rhs: &Tensor<R2, T>) -> Tensor<O, T> {
         self.like(
@@ -579,11 +584,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     }
 
     #[track_caller]
-    pub fn max_elementwise(&self, value: impl Into<crate::tensor::Scalar>) -> Self {
-        self.like(self.value.max_elementwise(value))
-    }
-
-    #[track_caller]
     pub fn lte_scalar(&self, s: impl Into<crate::tensor::Scalar>) -> Self {
         self.like(self.value.lte_scalar(s))
     }
@@ -596,12 +596,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     #[track_caller]
     pub fn matmul(&self, rhs: &Self) -> Self {
         self.like(self.value.matmul(&rhs.value))
-    }
-
-    /// Alias for [`Tensor::matmul`].
-    #[track_caller]
-    pub fn mat_mul(&self, rhs: &Self) -> Self {
-        self.matmul(rhs)
     }
 
     /// [`RawTensor::conv`], on the tape.

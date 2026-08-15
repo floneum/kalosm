@@ -1,12 +1,21 @@
-//! Rotary embeddings: the six forms, all macro ops. Fused variants are L1
-//! nodes minted by rules, not a construction-time choice.
+//! Rotary embeddings, all macro ops. Two pairings (`rope` /
+//! `rope_interleaved`), each with a paired form that rotates `q` and `k` under
+//! one node and a `_with_position` form that keeps the offset on device.
 //!
-//! Both pairings are the expression `x*cos + rot(x)*sin` and differ only in
-//! two index vectors; `rot` is one `Gather` along the head axis times a sign
-//! vector.
+//! There is no `*_fused` spelling: fusing is an L1 node minted by a rule, never
+//! a construction-time choice, so `rope_fused` and `rope_normal_fused` were
+//! one-line delegations to `rope_interleaved` and `rope` and are deleted.
 //!
-//! Sequence length is a `Dim::Sym` narrow or a position gather, never a host
+//! Both pairings are the same expression, `x*cos + rot(x)*sin`, and differ
+//! only in two index vectors: `rot` is one `Gather` along the head axis times
+//! a sign vector. The reference spells non-interleaved rope as
+//! `cat(-x2, x1)` and interleaved rope as a reshape-narrow-cat-flatten, which
+//! is four node kinds to say the same permutation.
+//!
+//! Sequence length is a `Dim::Sym` narrow or a position gather — never a host
 //! bucket, so a decode loop recompiles nothing.
+//!
+//! Owned by W13.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt};
 use fusor2_ir::autograd::{Tape, Val};
@@ -81,8 +90,8 @@ enum Rows {
     Positions(Id),
 }
 
-/// Everything the defn needs. Built before the tape opens, because index and
-/// sign leaves carry host bytes.
+/// Everything the defn needs, all created before the tape opens because index
+/// and sign leaves carry host bytes.
 struct RopeOperands {
     perm: Id,
     signs: Id,
@@ -191,7 +200,8 @@ fn rope_defn(
     t.binary(BinOp::Add, a, b)
 }
 
-/// One `Gather` along the head axis, times a sign vector.
+/// One `Gather` along the head axis, times a sign vector. Both pairings are
+/// this; only the two vectors differ.
 fn rotate_defn(t: &mut GraphTape<'_>, x: Val, ops: &RopeOperands) -> Result<Val> {
     let swapped = t.gather(3, x, ops.perm)?;
     let shape = t.shape_of(x);
@@ -242,17 +252,7 @@ pub fn rope_interleaved(x: &Tensor, cos: &Tensor, sin: &Tensor, offset: u64) -> 
     rope_with(x, cos, sin, Pairing::Interleaved, Rows::Offset(offset))
 }
 
-/// Alias for the interleaved form.
-pub fn rope_fused(x: &Tensor, cos: &Tensor, sin: &Tensor, offset: u64) -> Result<Tensor> {
-    rope_interleaved(x, cos, sin, offset)
-}
-
-/// Alias for the non-interleaved form.
-pub fn rope_normal_fused(x: &Tensor, cos: &Tensor, sin: &Tensor, offset: u64) -> Result<Tensor> {
-    rope(x, cos, sin, offset)
-}
-
-/// `cat(-x2, x1)`.
+/// `cat(-x2, x1)`, exposed because callers spell it directly.
 pub fn rotate_half(x: &Tensor) -> Result<Tensor> {
     let graph = &x.graph;
     let facts = graph.facts(x.id);
@@ -284,11 +284,16 @@ pub fn rotate_half(x: &Tensor) -> Result<Tensor> {
     Ok(graph.tensor(id))
 }
 
-/// Rotate `q` and `k` in one node, handed back as two views.
+// ---------------------------------------------------------------------------
+// Paired forms
+// ---------------------------------------------------------------------------
+
+/// Rotate `q` and `k` in **one** node, handed back as two views.
 ///
 /// The heads are concatenated along the head axis, rotated once and narrowed
-/// apart, so there is exactly one producer and each result costs a `Restride`.
-/// Requires matching batch, sequence and head dims.
+/// apart, so there is exactly one producer for a rule to mint a paired kernel
+/// over and the two results cost a `Restride` each. Requires matching batch,
+/// sequence and head dims — the reference asserts the same.
 fn rope_pair_with(
     q: &Tensor,
     k: &Tensor,
@@ -364,17 +369,12 @@ fn narrow_heads(x: &Tensor, start: u64, len: u64) -> Result<Tensor> {
     Ok(x.graph.tensor(id))
 }
 
-pub fn rope_pair_fused(
-    q: &Tensor,
-    k: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    offset: u64,
-) -> Result<(Tensor, Tensor)> {
-    rope_pair_with(q, k, cos, sin, Pairing::Interleaved, Rows::Offset(offset))
-}
-
-pub fn rope_normal_pair_fused(
+/// Rotate `q` and `k` under **one** node, pairing `(i, i + Dh/2)`.
+///
+/// Not a `*_fused` spelling of [`rope`] applied twice: the pair node names both
+/// operands, so the rotation is built once and read back as two views. That is
+/// the only reason this exists beside [`rope`].
+pub fn rope_pair(
     q: &Tensor,
     k: &Tensor,
     cos: &Tensor,
@@ -384,9 +384,31 @@ pub fn rope_normal_pair_fused(
     rope_pair_with(q, k, cos, sin, Pairing::Halves, Rows::Offset(offset))
 }
 
+/// [`rope_pair`] pairing `(2i, 2i + 1)`.
+pub fn rope_interleaved_pair(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    offset: u64,
+) -> Result<(Tensor, Tensor)> {
+    rope_pair_with(q, k, cos, sin, Pairing::Interleaved, Rows::Offset(offset))
+}
+
 /// The decode-loop form: `positions` is a rank-1 `u32` tensor, so the offset
 /// stays on device and the table is never re-sliced on the host.
-pub fn rope_pair_fused_with_position(
+pub fn rope_pair_with_position(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    positions: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    rope_pair_with(q, k, cos, sin, Pairing::Halves, Rows::Positions(positions.id))
+}
+
+/// [`rope_pair_with_position`] pairing `(2i, 2i + 1)`.
+pub fn rope_interleaved_pair_with_position(
     q: &Tensor,
     k: &Tensor,
     cos: &Tensor,
@@ -401,16 +423,6 @@ pub fn rope_pair_fused_with_position(
         Pairing::Interleaved,
         Rows::Positions(positions.id),
     )
-}
-
-pub fn rope_normal_pair_fused_with_position(
-    q: &Tensor,
-    k: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    positions: &Tensor,
-) -> Result<(Tensor, Tensor)> {
-    rope_pair_with(q, k, cos, sin, Pairing::Halves, Rows::Positions(positions.id))
 }
 
 /// Single-value forms against a device-side position vector.
@@ -442,14 +454,14 @@ pub fn rope_interleaved_with_position(
 mod tests {
     use super::*;
     use crate::graph::Graph;
-    use crate::session::{Device, Session};
+    use crate::session::{Backend, Session};
     use fusor2_ir::dtype::Dtype;
     use fusor2_ir::ir::Op;
     use fusor2_ir::ir::level0::L0;
     use fusor2_ir::ir::level1::L1;
 
     fn graph() -> Graph {
-        Graph::new(&Session::new(Device::cpu().unwrap()).unwrap())
+        Graph::new(&Session::new(Backend::cpu().unwrap()).unwrap())
     }
 
     fn leaf(g: &Graph, name: &str, shape: &[u64]) -> Tensor {
@@ -490,8 +502,6 @@ mod tests {
         for y in [
             rope(&x, &cos, &sin, 0).unwrap(),
             rope_interleaved(&x, &cos, &sin, 3).unwrap(),
-            rope_fused(&x, &cos, &sin, 0).unwrap(),
-            rope_normal_fused(&x, &cos, &sin, 0).unwrap(),
         ] {
             assert_eq!(
                 &g.handle().facts(y.id()).shape[..],
@@ -519,7 +529,7 @@ mod tests {
         let k = leaf(&g, "k", &[1, 2, 5, 8]);
         let cos = leaf(&g, "cos", &[16, 4]);
         let sin = leaf(&g, "sin", &[16, 4]);
-        let (qr, kr) = rope_pair_fused(&q, &k, &cos, &sin, 0).unwrap();
+        let (qr, kr) = rope_interleaved_pair(&q, &k, &cos, &sin, 0).unwrap();
         assert_eq!(g.handle().facts(qr.id()).shape, g.handle().facts(q.id()).shape);
         assert_eq!(g.handle().facts(kr.id()).shape, g.handle().facts(k.id()).shape);
 
@@ -541,7 +551,7 @@ mod tests {
         let g = graph();
         let x = leaf(&g, "x", &[1, 2, 4, 8]);
         let cos = leaf(&g, "cos", &[8, 4]);
-        let y = rope_fused(&x, &cos, &cos, 0).unwrap();
+        let y = rope_interleaved(&x, &cos, &cos, 0).unwrap();
         let (n, sugars, defns) = g
             .handle()
             .with_egraph(|eg| {

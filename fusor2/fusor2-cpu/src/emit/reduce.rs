@@ -1,7 +1,10 @@
 //! Cross-lane reductions on CPU: `Reduce{Subgroup}` becomes a horizontal
-//! reduce of one register by `log2(W)` shuffle-reduce steps, and
-//! `Reduce{Workgroup}` becomes a tree over the thread-local scratch tile, with
-//! the segment split supplying the barrier semantics.
+//! reduce of one register by `log2(W)` shuffle-reduce steps — not a scalar
+//! `fold` over bytemuck'd lanes as the reference's `reduce_simd_vec` does —
+//! and `Reduce{Workgroup}` becomes a tree over the thread-local scratch tile,
+//! with the segment split supplying the barrier semantics.
+//!
+//! Owned by W10.
 
 use fusor2_ir::ir::level2::TileReduceOp;
 
@@ -46,8 +49,12 @@ pub fn combine_reg<const W: usize>(op: TileReduceOp, a: Reg<W>, b: Reg<W>) -> Re
     a.zipf(b, |x, y| combine_f32(op, x, y))
 }
 
-/// Horizontal reduce of one register by `log2(W)` butterfly steps, with the
-/// result broadcast back across every lane.
+/// Horizontal reduce of one register by `log2(W)` shuffle-reduce steps, with
+/// the result broadcast back across every lane.
+///
+/// The butterfly shape is what a subgroup collective does on GPU; keeping it
+/// here means `Reduce{Subgroup}` is one node with a strategy parameter on both
+/// backends rather than two different ops.
 #[inline(always)]
 pub fn horizontal<const W: usize>(op: TileReduceOp, v: Reg<W>) -> Reg<W> {
     let mut cur = v.to_f();
@@ -76,8 +83,8 @@ pub fn horizontal_masked<const W: usize>(op: TileReduceOp, v: Reg<W>, mask: Reg<
 }
 
 /// Tree-reduce `values[0..len]` in groups of `group`, writing each group's
-/// result back over the whole group. The `Reduce{Workgroup}` body; the
-/// preceding segment split makes the staged writes visible.
+/// result back over the whole group. This is the `Reduce{Workgroup}` body; the
+/// preceding segment split is what makes the staged writes visible.
 pub fn tree_in_place(op: TileReduceOp, values: &mut [f32], len: usize, group: usize) {
     let group = group.max(1);
     let mut base = 0;

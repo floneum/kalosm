@@ -27,14 +27,3 @@ pollster.workspace = true
 default = ["cpu", "gpu"]
 cpu = []
 gpu = []
-# Re-export the const-rank `tensor::typed::Tensor` and `device::Device` as the
-# crate-root `Tensor` and `Device` instead of the runtime-rank pair. Both views
-# are always compiled and always reachable by module path; this moves two
-# re-exports and nothing else. See the crate docs for why the two `Device::cpu`
-# signatures cannot be one item.
-#
-# NOT ADDITIVE: it changes two names rather than adding any, so
-# `--all-features` is not a valid configuration of this workspace (133 errors
-# in fusor2-conformance, measured). Enable it from the consumer that wants the
-# const-rank root and nowhere else.
-typed-api = []

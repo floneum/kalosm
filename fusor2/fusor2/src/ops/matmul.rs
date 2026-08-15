@@ -1,7 +1,10 @@
 //! Contractions. `matmul`, `mat_mul_transposed_rhs` and every batched form are
-//! one `L0::Contract` with a different `EinSpec`; transposed-rhs is a spec, not
-//! an op. Kernel family, tile geometry, split-K and staging depth are all
-//! extraction decisions that do not exist at this level.
+//! one `L0::Contract` with a different `EinSpec` — **transposed-rhs is a spec,
+//! not an op**, and no `MatMulParams` is ever written onto a node. Kernel
+//! family, tile geometry, split-K and staging depth are all extraction
+//! decisions that do not exist yet at this level.
+//!
+//! Owned by W12.
 
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::ir::level0::{EinSpec, L0, Label};
@@ -47,12 +50,13 @@ impl Tensor {
     /// `[batch.., m, k] @ [batch.., k, n] -> [batch.., m, n]`.
     ///
     /// Batch dims must be pairwise [`fusor2_ir::shape::Dim::known_eq`]: there
-    /// is no implicit batch broadcast, callers `broadcast_as` first.
+    /// is **no implicit batch broadcast**, callers `broadcast_as` first, as
+    /// the reference also requires.
     pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {
         self.contract_2d(rhs, false)
     }
 
-    /// `self @ rhs^T`. The same node as [`Tensor::matmul`]; only `b`'s two
+    /// `self @ rhs^T`. The **same node** as [`Tensor::matmul`]; only `b`'s two
     /// trailing labels swap.
     pub fn matmul_t(&self, rhs: &Tensor) -> Result<Tensor> {
         self.contract_2d(rhs, true)
@@ -61,7 +65,9 @@ impl Tensor {
     fn contract_2d(&self, rhs: &Tensor, transposed_rhs: bool) -> Result<Tensor> {
         // A block-quantized weight is a legal contraction operand on exactly
         // one side: an ordinary `KContract` decodes the blocks on the way into
-        // its staging fill. Two quantized sides has no kernel.
+        // its staging fill, and the extractor prices that against
+        // dequantize-then-contract. Two quantized sides is not a kernel
+        // anybody has.
         let (q_lhs, q_rhs) = (self.dtype().is_quantized(), rhs.dtype().is_quantized());
         if q_lhs && q_rhs {
             return Err(Error::Dtype(
@@ -101,47 +107,82 @@ impl Tensor {
                 rhs.dtype()
             )));
         }
-        // The accumulator is the dense side's compute dtype: a quantized
+        // The accumulator is the *dense* side's compute dtype: a quantized
         // format has none of its own.
         let acc = if q_lhs { rhs.dtype() } else { self.dtype() }.compute_dtype();
         let spec = matmul_spec(batch, transposed_rhs)?;
 
-        // Both spellings of a quantized operand enter the class: the raw Q leaf
-        // is the only path to the staged block decode, and the dequantize class
-        // (`L0::Dequant` unioned with the `Restride` + `Map` expansion) offers
-        // dequantize-once and the absorbed bit-arithmetic members. The
-        // extractor prices the choice per shape.
+        // A quantized side enters the contraction as its *dequantize class*,
+        // not its raw leaf. The class is `L0::Dequant` unioned with the
+        // `Restride` + `Map` definitional expansion (see
+        // `QMatrix::dequantize`), so the extractor prices the format's staged
+        // block decode against the general bit-arithmetic spelling —
+        // `map_into_contract` absorbs the latter's unpack into the
+        // contraction's own operand list, no materialization in either case.
+        // Contracting the raw leaf instead would put exactly one spelling in
+        // the graph: the hand-written block program, reachable by no rewrite
+        // and admitted to `Family::Coop` alone.
         //
         // A quantized value `QMatrix::of_tensor` cannot name (not a leaf, or
-        // rank over 2) falls back to the raw operand rather than erroring.
+        // rank over 2 — today nothing mints either) falls back to the raw
+        // operand, which is the old behavior, not an error.
+        // Both spellings enter the class, not one: contracting the *raw* Q
+        // leaf is the only path to the staged block decode (the coop fill
+        // reads `Source::Quantized` in-place — the M=1 decode-shape winner,
+        // where one token cannot amortize a whole-weight dequantize), and
+        // contracting the *class* is what offers dequantize-once and the
+        // absorbed bit-arithmetic members (the M=256 winner, measured 15x
+        // over decode-per-tile there). Union them and the extractor prices
+        // the choice per shape instead of this method hardcoding either.
         let deq = |t: &Tensor| -> Result<Option<Tensor>> {
             match crate::quantized::QMatrix::of_tensor(t) {
                 Some(q) => Ok(Some(q.dequantize()?)),
                 None => Ok(None),
             }
         };
-        if q_lhs && let Some(w) = deq(self)? {
-            let dense = w.contract(rhs, spec.clone(), acc)?;
-            let staged = self.contract(rhs, spec, acc)?;
-            let root = self
+        // The staged spelling is minted FIRST. Ties in the extractor's seed
+        // break toward the smaller id, and on a graph big enough to exhaust
+        // the pricing budgets every class ties — minting dense-first made the
+        // degenerate pick the dequantize-and-materialize member for every
+        // matmul of an 8B decode (~27 GB of f32 launch roots). Where pricing
+        // is live the order changes nothing; where it is degenerate the
+        // in-place read is the only pick that always fits in memory.
+        // The third spelling is `qrepack`'s consuming half (R8): the same
+        // contraction over the word-aligned `F32Scales` twin of a `Native`
+        // leaf whose block stride is not a whole number of words. The twin is
+        // a *separate leaf* — one value class must denote one buffer — so the
+        // union happens here, on the contractions, and extraction prices the
+        // layout per contraction: only the selected leaf ever uploads.
+        // Minted last: where pricing is degenerate the tie must keep breaking
+        // toward the native staged member, exactly as for `dense` below.
+        let requant = |t: &Tensor| -> Result<Option<Tensor>> {
+            Ok(self
                 .graph
-                .with_egraph(|g| g.union(dense.id, staged.id))?;
+                .repacked_leaf_of(t.id)?
+                .map(|id| self.graph.tensor(id)))
+        };
+        if q_lhs && let Some(w) = deq(self)? {
+            let staged = self.contract(rhs, spec.clone(), acc)?;
+            let dense = w.contract(rhs, spec.clone(), acc)?;
+            // Stable first-union root; see `composite::macro_op`.
+            let root = self.graph.union_stable(staged.id, dense.id)?;
+            if let Some(twin) = requant(self)? {
+                let restaged = twin.contract(rhs, spec, acc)?;
+                self.graph.union_stable(root, restaged.id)?;
+            }
             return Ok(self.graph.tensor(root));
         }
         if q_rhs && let Some(w) = deq(rhs)? {
+            let staged = self.contract(rhs, spec.clone(), acc)?;
             let dense = self.contract(&w, spec.clone(), acc)?;
-            let staged = self.contract(rhs, spec, acc)?;
-            let root = self
-                .graph
-                .with_egraph(|g| g.union(dense.id, staged.id))?;
+            let root = self.graph.union_stable(staged.id, dense.id)?;
+            if let Some(twin) = requant(rhs)? {
+                let restaged = self.contract(&twin, spec, acc)?;
+                self.graph.union_stable(root, restaged.id)?;
+            }
             return Ok(self.graph.tensor(root));
         }
         self.contract(rhs, spec, acc)
-    }
-
-    /// The general contraction escape hatch.
-    pub fn einsum(&self, rhs: &Tensor, spec: EinSpec) -> Result<Tensor> {
-        self.contract(rhs, spec, self.dtype().compute_dtype())
     }
 
     /// The general contraction escape hatch with an explicit accumulator.

@@ -1,6 +1,9 @@
 //! Adapter and device acquisition. Requests WebGPU baseline limits and widens
-//! only what a selected kernel's legality predicate needs, so a plan legal on
-//! one device is legal on another.
+//! only what a selected kernel's legality predicate proves it needs — so a
+//! plan legal on one device is legal on another and the cost model's filters
+//! mean the same thing everywhere.
+//!
+//! Owned by W8.
 
 use fusor2_ir::Result;
 use fusor2_ir::cost::DeviceFacts;
@@ -10,7 +13,7 @@ use fusor2_ir::error::Error;
 use crate::caps::{self, LimitWiden};
 
 /// How to acquire a device. `widen` carries the per-field ceilings a caller
-/// needs; everything else stays at the WebGPU baseline.
+/// has *proved* it needs; everything else stays at the WebGPU baseline.
 #[derive(Clone, Debug, Default)]
 pub struct DeviceOptions {
     pub widen: LimitWiden,
@@ -91,15 +94,27 @@ impl GpuDevice {
 
 /// Pick an adapter, request a device at `baseline ∪ opts.widen`, probe caps.
 ///
-/// `required_limits` is never `adapter.limits()`: asking for the adapter
-/// maximum would make every legality filter device-specific.
+/// `required_limits` is **never** `adapter.limits()`. The reference asks for
+/// the adapter maximum at `core/src/device.rs:461`; that is the bug this
+/// deletes, because it silently makes every legality filter device-specific.
 pub async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pick_adapter(&instance, opts).await?;
     let adapter_info = adapter.get_info();
 
     let features = caps::requested_features(&adapter);
-    let limits = caps::widen_limits(caps::baseline_limits(), opts.widen, &adapter.limits())?;
+    let adapter_limits = adapter.limits();
+    let mut limits = caps::widen_limits(caps::baseline_limits(), opts.widen, &adapter_limits)?;
+    // The two buffer-size ceilings are memory *capacity*, not occupancy
+    // legality: no kernel changes shape because the buffer holding a weight is
+    // bigger, and any 7B+ model has single weights past the WebGPU baseline's
+    // 256 MiB (a Q6K vocab projection is ~430 MB). Take the adapter's
+    // capacity; the workgroup/occupancy limits stay at the baseline so plan
+    // legality still means the same thing on every device.
+    limits.max_buffer_size = limits.max_buffer_size.max(adapter_limits.max_buffer_size);
+    limits.max_storage_buffer_binding_size = limits
+        .max_storage_buffer_binding_size
+        .max(adapter_limits.max_storage_buffer_binding_size);
 
     let descriptor = wgpu::DeviceDescriptor {
         label: Some("fusor2"),
@@ -135,8 +150,9 @@ pub async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
         &coop_props,
         DeviceKind::Gpu,
     );
-    // Rates come from fusor2-cost's shipped per-class seed table;
-    // capabilities are always re-probed.
+    // Rates are calibrated (or loaded from the on-disk cache) by fusor2-cost;
+    // capabilities are always re-probed, so a stale capability set cannot
+    // outlive a driver update.
     let facts = fusor2_cost::facts::seed_facts(&caps);
 
     Ok(GpuDevice {
@@ -156,8 +172,8 @@ pub fn gpu_blocking(opts: &DeviceOptions) -> Result<GpuDevice> {
     pollster::block_on(request_device(opts))
 }
 
-/// Adapter preference order: discrete, then integrated, then virtual, then
-/// CPU, then unknown.
+/// Rank adapters the way the reference does: discrete, then integrated, then
+/// virtual, then CPU, then unknown.
 fn adapter_preference_rank(kind: wgpu::DeviceType) -> u8 {
     match kind {
         wgpu::DeviceType::DiscreteGpu => 0,
@@ -196,7 +212,8 @@ mod tests {
     use super::*;
 
     /// The descriptor's limits are the baseline even when the adapter reports
-    /// far more. Skips when no live adapter exists.
+    /// far more. Run against a live adapter when one exists; skip cleanly
+    /// otherwise, so the naga-only path stays testable on CI without a GPU.
     #[test]
     fn baseline_limits_are_requested_on_a_live_device() {
         let Ok(gpu) = gpu_blocking(&DeviceOptions::default()) else {
@@ -217,7 +234,7 @@ mod tests {
             used.max_compute_workgroups_per_dimension,
             base.max_compute_workgroups_per_dimension
         );
-        // The adapter itself usually reports more.
+        // ... even though the adapter itself usually reports more.
         assert!(
             gpu.adapter().limits().max_compute_workgroup_storage_size
                 >= base.max_compute_workgroup_storage_size

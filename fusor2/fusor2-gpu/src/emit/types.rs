@@ -1,8 +1,11 @@
 //! L2 [`ElementType`] -> naga types, and the workgroup/storage address-space
 //! declarations.
 //!
-//! Types are interned in a fixed order, so emitting the same IR twice produces
-//! a byte-identical module and the plan hash is a usable cache key.
+//! Types are interned in a **fixed order** so the module's type arena is
+//! deterministic: emitting the same IR twice must produce byte-identical
+//! debug output, which is what makes the plan hash a usable cache key.
+//!
+//! Owned by W8.
 
 use fusor2_ir::ir::level2::{
     ArenaMode, BufferAccess, BufferDecl, ElementType, ScalarElement, TileDecl,
@@ -189,8 +192,9 @@ pub fn intern_prelude(
     })
 }
 
-/// Array stride for a workgroup/storage array of `element`. Arena packing and
-/// module emission both read [`ElementType::workgroup_array_stride`].
+/// Array stride for a workgroup/storage array of `element`. The single source
+/// of stride truth: arena packing and module emission both read
+/// [`ElementType::workgroup_array_stride`], so they cannot disagree.
 fn array_stride(element: ElementType) -> Result<u32, EmitError> {
     element
         .workgroup_array_stride()
@@ -295,8 +299,12 @@ pub fn workgroup_global(
     ))
 }
 
-/// Buffers in binding order, so the global-variable arena is independent of
-/// which statement touches which buffer first.
+// ---------------------------------------------------------------------------
+// Emitter-driven declaration
+// ---------------------------------------------------------------------------
+
+/// Buffers in **binding order**, so the global-variable arena is independent
+/// of which statement touches which buffer first.
 pub fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
     let mut buffers = em.analysis.buffers.clone();
     buffers.sort_by_key(|b| b.binding);
@@ -310,12 +318,20 @@ pub fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
 
 /// Workgroup tiles, laid out from the plan.
 ///
-/// `ArenaMode::Regions` groups placements by byte offset and emits one global
-/// per group, typed with the group's canonical element; a heterogeneous group
-/// bitcasts the value at each access, never the address, which is legal only
-/// between 32-bit scalars. `ArenaMode::ByteArena` emits one `array<u32>` arena
-/// indexed from each tile's packed byte offset, limiting a byte-arena tile to
-/// 4-byte scalars. A tile with no placement gets its own allocation.
+/// `ArenaMode::Regions` groups placements by byte offset — tiles that share an
+/// allocation share an offset — and emits one global per group, typed with the
+/// group's canonical element; a heterogeneous group bitcasts the *value* at
+/// each access, never the address, which is legal only between 32-bit scalars.
+///
+/// `ArenaMode::ByteArena` emits one `array<u32>` arena and indexes each tile
+/// from its packed byte offset. Released naga has no `WorkgroupAlias`
+/// decoration, so aliasing is expressed as index arithmetic instead; that
+/// restricts a byte-arena tile to 4-byte scalar elements, which is a footprint
+/// restriction, not a correctness one — a kernel that needs more falls back to
+/// `Regions`.
+///
+/// A tile with no placement gets its own allocation. An empty or partial plan
+/// is therefore always emittable, just larger.
 pub fn create_workgroup_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
     let tiles = em.analysis.tiles.clone();
     let placements: FxHashMap<usize, (u32, u32)> = em
@@ -478,8 +494,9 @@ impl Emitter<'_> {
     /// naga's `UniqueArena`, so this both reuses and registers.
     pub(crate) fn element_type(&mut self, element: ElementType) -> Result<Handle<Type>, EmitError> {
         if element.uses_f16() && !self.analysis.uses_f16 {
-            // The analysis raises `uses_f16` for every f16 that appears in the
-            // IR, so this catches only an f16 the emitter itself synthesized.
+            // Unreachable: the analysis raises `uses_f16` for every f16 that
+            // appears anywhere. Kept as an assertion against a future emitter
+            // that synthesizes an f16 value out of thin air.
             return Err(EmitError::MissingCapability("shader-f16"));
         }
         element_type(&mut self.module, element)

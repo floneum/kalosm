@@ -3,10 +3,14 @@
 //! EXPERIMENTAL_COOPERATIVE_MATRIX -> `Family::Sgemm`, PIPELINE_CACHE -> cold
 //! compile, TIMESTAMP_QUERY -> no profiling.
 //!
-//! Limits are the WebGPU baseline, never `adapter.limits()`, so a plan's
-//! legality does not vary per machine. A caller widens exactly the fields a
-//! selected kernel proves it needs; a widening the adapter cannot supply is an
-//! error, not a silent clamp downwards.
+//! Limits are the **WebGPU baseline**, never `adapter.limits()`. The reference
+//! requests the adapter maximum (`core/src/device.rs:461`), which makes a plan
+//! legal on one device illegal on another and gives the cost model's legality
+//! filters a different meaning per machine. A caller widens exactly the fields
+//! a selected kernel proves it needs, and a widening the adapter cannot supply
+//! is an error rather than a silent clamp downwards.
+//!
+//! Owned by W8.
 
 use fusor2_ir::device::{Caps, CoopKind, DeviceKind, Limits, SubgroupWidths};
 use fusor2_ir::dtype::Dtype;
@@ -23,11 +27,13 @@ pub const FORK_METAL: bool = true;
 #[cfg(not(feature = "fork-metal"))]
 pub const FORK_METAL: bool = false;
 
-/// The WebGPU baseline, not `adapter.limits()`.
+/// The WebGPU baseline. **Not** `adapter.limits()`.
 ///
-/// Starts from wgpu's spec defaults and overwrites, field for field, the limits
-/// the compiler reads from [`fusor2_ir::device::Limits::default()`], so the
-/// wgpu request and the IR's legality model cannot drift apart.
+/// Starts from wgpu's own spec defaults and then overwrites, field for field,
+/// the six limits the compiler actually reads from
+/// [`fusor2_ir::device::Limits::default()`]. Deriving them rather than
+/// re-typing them is what keeps the wgpu request and the IR's legality model
+/// from drifting apart.
 pub fn baseline_limits() -> wgpu::Limits {
     let ir = Limits::default();
     let mut limits = wgpu::Limits::default();
@@ -42,8 +48,8 @@ pub fn baseline_limits() -> wgpu::Limits {
     limits
 }
 
-/// Per-field ceilings a caller proves it needs. `None` leaves the baseline
-/// alone.
+/// Per-field ceilings a caller *proves* it needs. Every field is optional;
+/// `None` leaves the baseline alone.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct LimitWiden {
     pub max_compute_invocations_per_workgroup: Option<u32>,
@@ -77,13 +83,15 @@ impl LimitWiden {
 }
 
 /// Raise only the named fields of `base`, refusing a widening the adapter
-/// cannot supply. The baseline is a floor, so a request below it is a no-op.
+/// cannot supply. A request *below* the baseline is a no-op: the baseline is a
+/// floor, so a plan legal on one device stays legal on another.
 pub fn widen_limits(
     base: wgpu::Limits,
     widen: LimitWiden,
     adapter: &wgpu::Limits,
 ) -> Result<wgpu::Limits> {
     let mut out = base;
+    // (name, requested, current slot, adapter ceiling)
     macro_rules! raise {
         ($field:ident) => {
             if let Some(want) = widen.$field {
@@ -113,9 +121,9 @@ pub fn widen_limits(
     Ok(out)
 }
 
-/// [`widen_limits`] taking a whole `Limits` as the request instead of a
-/// per-field option set. Every field of `needed` that exceeds the baseline is
-/// treated as a proven requirement.
+/// Scaffold-compatible alias for [`widen_limits`], taking a whole `Limits` as
+/// the request instead of a per-field option set. Every field of `needed` that
+/// exceeds the baseline is treated as a proven requirement.
 pub fn widen(base: wgpu::Limits, needed: &wgpu::Limits, adapter: &wgpu::Adapter) -> wgpu::Limits {
     let adapter_limits = adapter.limits();
     let widen = LimitWiden {
@@ -164,9 +172,10 @@ pub fn requested_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     // `device::request_device` supplies. wasm32 requests neither.
     #[cfg(not(target_arch = "wasm32"))]
     want(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
-    // EXPERIMENTAL_WORKGROUP_MEMORY_ALIAS exists only on the wgpu fork. The
-    // byte-arena emitter does not depend on it, so its absence costs packing
-    // density, not correctness.
+    // The second experimental bit, EXPERIMENTAL_WORKGROUP_MEMORY_ALIAS, exists
+    // only on the wgpu fork; released wgpu 29 does not define it. The
+    // byte-arena emitter does not depend on it (see `emit::types`), so its
+    // absence costs packing density, not correctness.
     wanted
 }
 
@@ -177,16 +186,19 @@ pub fn needs_experimental(features: wgpu::Features) -> bool {
 
 /// Apple GPUs advertise a *range* of subgroup sizes even though every shipping
 /// part runs 32-wide. A ranged width makes [`SubgroupWidths::is_fixed`] false,
-/// which disables every cooperative tile and the qgemv fast path.
+/// which disables every cooperative tile and the qgemv fast path. Ported from
+/// `core/src/device.rs::apple_fixed_subgroup_size`.
 fn apple_fixed_subgroup_size(backend: wgpu::Backend, name: &str) -> Option<SubgroupWidths> {
     (backend == wgpu::Backend::Metal && name.starts_with("Apple"))
         .then_some(SubgroupWidths { min: 32, max: 32 })
 }
 
 /// Accept a cooperative-matrix property only in the one shape the lowerer can
-/// emit: `m == n == k == 8 && !saturating_accumulation`, F32/F32 always and
-/// F16/F16 only with `SHADER_F16`. Mixed F16-operand / F32-accumulator is
-/// rejected, so a plan cannot depend on a fork-only numeric behaviour.
+/// emit. Verbatim from `core/src/kernel_selection.rs`:
+/// `m == n == k == 8 && !saturating_accumulation`, F32/F32 always and F16/F16
+/// only with `SHADER_F16`. **Mixed F16-operand / F32-accumulator is rejected**
+/// even where the fork's MSL backend supports it — the cap model refuses it so
+/// a plan cannot depend on a fork-only numeric behaviour.
 pub fn coop_kinds(
     features: wgpu::Features,
     props: &[wgpu::CooperativeMatrixProperties],
@@ -282,12 +294,14 @@ pub fn build_caps(
         limits: ir_limits(limits),
         subgroups,
         f16: features.contains(wgpu::Features::SHADER_F16),
-        // No wgpu backend exposes a bf16 shader type; bf16 values are a storage
-        // dtype widened to f32 for compute by the `widen-compute` rule.
+        // No wgpu backend exposes a bf16 shader type in 29; bf16 values are a
+        // storage dtype widened to f32 for compute by the `widen-compute` rule.
         bf16: false,
         coop: coop_kinds(features, coop_props),
-        // `atomicAdd` on f32 is emitted as a bitcast compare-exchange loop,
-        // which every WebGPU backend supports.
+        // `atomicAdd` on f32 is emitted as a bitcast compare-exchange loop
+        // (see `emit::stmt`), which every WebGPU backend supports. That loop is
+        // what makes `ScatterMode::Atomic` a live candidate for the embedding
+        // gradient.
         atomic_f32: kind == DeviceKind::Gpu,
         workgroup_alias: fork,
         mixed_precision_coop_store: fork,
@@ -299,7 +313,7 @@ pub fn build_caps(
     }
 }
 
-/// Probe a live adapter.
+/// Scaffold-compatible convenience wrapper: probe a live adapter.
 pub fn probe(adapter: &wgpu::Adapter, limits: &wgpu::Limits) -> Caps {
     let info = adapter.get_info();
     let features = requested_features(adapter);
@@ -369,8 +383,8 @@ mod tests {
         wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16
     }
 
-    /// The descriptor's limits equal the IR baseline field for field, even when
-    /// the adapter reports far more.
+    /// Test 1 — the descriptor's limits equal the IR baseline field for field,
+    /// even when the adapter reports far more.
     #[test]
     fn baseline_limits_are_requested() {
         let base = baseline_limits();
@@ -425,6 +439,7 @@ mod tests {
         assert!(matches!(err, Error::Device(_)), "{err}");
     }
 
+    /// Test 2 — the coop filter.
     #[test]
     fn coop_filter_rejects_non_8x8_and_saturating() {
         use wgpu::CooperativeScalarType as S;
@@ -459,6 +474,7 @@ mod tests {
         );
     }
 
+    /// Test 3 — the Apple subgroup override, and what it unlocks.
     #[test]
     fn apple_subgroup_override() {
         use wgpu::CooperativeScalarType as S;

@@ -7,6 +7,8 @@
 //! nothing here re-derives it. Right-aligned: a source dim is consumed when it
 //! equals the target or is 1 (stride 0); unmatched target dims are inserted
 //! with stride 0 at **any** position; an unconsumed source dim is an error.
+//!
+//! Owned by W12.
 
 use fusor2_ir::ir::level0::L0;
 use fusor2_ir::shape::{Dim, Dims, broadcast_shapes, broadcast_specs};
@@ -31,34 +33,18 @@ impl Tensor {
         })
     }
 
-    /// Alias of [`Tensor::broadcast_as`].
+    /// Alias of [`Tensor::broadcast_as`], preserved for source compatibility.
     pub fn expand(&self, target: &[Dim]) -> Result<Tensor> {
         self.broadcast_as(target)
     }
 }
 
 /// Lift both operands to their common shape and report it.
-pub fn broadcast_pair(a: &Tensor, b: &Tensor) -> Result<(Tensor, Tensor, Dims)> {
+pub(crate) fn broadcast_pair(a: &Tensor, b: &Tensor) -> Result<(Tensor, Tensor, Dims)> {
     let out = broadcast_shapes(&a.shape(), &b.shape())?;
     let ba = a.broadcast_as(&out)?;
     let bb = b.broadcast_as(&out)?;
     Ok((ba, bb, out))
-}
-
-/// Insert the `Restride` nodes that lift both operands to their common shape.
-pub fn align(a: &Tensor, b: &Tensor) -> Result<(Tensor, Tensor)> {
-    let (x, y, _) = broadcast_pair(a, b)?;
-    Ok((x, y))
-}
-
-/// Lift one tensor to an explicit target shape.
-pub fn expand_to(x: &Tensor, shape: &[Dim]) -> Result<Tensor> {
-    x.broadcast_as(shape)
-}
-
-/// The shape `a` and `b` broadcast to, without building anything.
-pub fn result_shape(a: &Tensor, b: &Tensor) -> Result<Vec<Dim>> {
-    Ok(broadcast_shapes(&a.shape(), &b.shape())?.to_vec())
 }
 
 #[cfg(test)]

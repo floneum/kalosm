@@ -2,6 +2,8 @@
 //!
 //! Lookup is first-match in shard order, which is stable across runs, for both
 //! tensors and metadata.
+//!
+//! Owned by W11.
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::QLayout;
@@ -9,7 +11,7 @@ use fusor2_ir::error::Error;
 use std::sync::Arc;
 
 use crate::async_read::{AsyncReadRange, expect_len, read_metadata};
-use crate::parse::{GgufMetadata, GgufTensor, GgufValue, ingest_qfmt};
+use crate::parse::{GgufMetadata, GgufValue, ingest_qfmt};
 use crate::varbuilder::{RawTensorBytes, VarBuilder};
 
 /// Several files presented as one namespace.
@@ -59,16 +61,6 @@ impl ShardedVarBuilder {
             .iter()
             .find_map(|s| s.get_metadata(name))
             .ok_or_else(|| Error::Io(format!("no metadata key {name} in any shard")))
-    }
-
-    /// The directory entry plus raw bytes from the first shard that has it.
-    pub fn get_tensor(&self, name: &str) -> Result<(&GgufTensor, &[u8])> {
-        for shard in &self.shards {
-            if shard.contains_key(name) {
-                return shard.get(name);
-            }
-        }
-        Err(Error::Io(format!("no tensor named {name} in any shard")))
     }
 
     /// The owned form the `fusor2` facade ingests.

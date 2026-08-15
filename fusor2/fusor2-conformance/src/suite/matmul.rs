@@ -2,6 +2,8 @@
 //! `lower_coop`, `lower_sgemm`, `lower_sgemv` and `lower_generic` coexist in
 //! one chain — so a case here that produces the right numbers is evidence
 //! that whichever family extraction picked is correct, on both backends.
+//!
+//! Owned by W14.
 
 use fusor2::{Dtype, Session};
 
@@ -18,9 +20,9 @@ pub fn cases() -> Cases {
     cases.push("matmul", "q_mat_mul", |s| quantized_matmul(s, 2));
     cases.push("matmul", "q_mat_mul_rank1", |s| quantized_matmul(s, 1));
     // Split-K at the extents the trainer and this suite actually use. The
-    // `extent.at_least(4096)` gate refuses every one of them, so whether the
-    // reduction runs split or unsplit is a schedule decision these four cases
-    // must not be able to tell apart.
+    // shipped `extent.at_least(4096)` gate refuses every one of them, so
+    // whether the reduction runs split or unsplit is a schedule decision
+    // these four cases must not be able to tell apart.
     for k in SPLIT_K_EXTENTS {
         cases.push("matmul", split_k_name(k), move |s| split_k(s, k));
     }
@@ -31,13 +33,14 @@ pub fn cases() -> Cases {
 /// The structural half: which law fired on a contraction, and what schedule
 /// the extraction resolved for it.
 ///
-/// A contraction is where three register-tiling mechanisms meet —
-/// `SgemmParams{tm,tn}`, `CoopGeom{rg,cg}` and `MapTiling{vector}` — and
-/// `PROMOTE`'s claim is that they are one law at a schedule point. These cases
-/// are stated on a plain
+/// A contraction is the one place where three separately hand-written
+/// register-tiling mechanisms met — `SgemmParams{tm,tn}`, `CoopGeom{rg,cg}`
+/// and `MapTiling{vector}` — and the claim of `PROMOTE` is that they are one
+/// law at a schedule point. These cases are stated on a plain
 /// `[m,k] x [k,n]`: no attention, no multi-slot carrier, no `exp` anywhere.
 mod structural {
-    use fusor2::{Session, Tensor};
+    use fusor2::{Session, };
+use fusor2::tensor::Dyn as Tensor;
 
     use crate::harness::{CaseError, CaseResult, Cases, dims};
     use crate::suite::reductions::generality::structure;
@@ -83,8 +86,8 @@ mod structural {
     fn promotes(session: &Session) -> CaseResult {
         const M: u64 = 64;
         const K: u64 = 128;
-        // 64 columns, not 96: `wide_n_columns` below covers the wider shape,
-        // whose CPU failure has nothing to do with this law.
+        // 64 columns, not 96: `wide_n_columns` below owns the wider shape and
+        // is red on CPU for a reason that has nothing to do with this law.
         const N: u64 = 64;
         let a = Domain::Wide.sample(901, (M * K) as usize);
         let b = Domain::Wide.sample(902, (K * N) as usize);
@@ -155,9 +158,9 @@ mod structural {
     /// not merely select a node that carries a domain.
     ///
     /// Admissibility and selection are different claims: a node can carry
-    /// 8,300 legal points and reach `verify_plan` with none of them chosen,
-    /// which is a hard assert rather than a fallback. This asserts the plan's
-    /// `theta` is non-empty and that at
+    /// 8,300 legal points and reach `verify_plan` with none of them chosen, at
+    /// which point section 4.2 makes the failure a hard assert rather than a
+    /// fallback. This asserts the plan's `theta` is non-empty and that at
     /// least one resolved point is a real contraction geometry rather than
     /// `SchedPoint::Point`.
     fn resolves_theta(session: &Session) -> CaseResult {
@@ -209,11 +212,10 @@ mod structural {
 
     /// Three projections of one activation, each with its own bias.
     ///
-    /// `KMerged::new` refuses any segment with a non-identity `post`, so
-    /// `x@Wq + bq`, `x@Wk + bk`, `x@Wv + bv` cannot become one merged wave
-    /// however the cost model prices it. `TUPLE` does not touch `post` — each
-    /// slot keeps its own — so the triple can instead become one k-loop
-    /// reading `x` once. The plan ceiling is what holds that.
+    /// `x@Wq + bq`, `x@Wk + bk`, `x@Wv + bv` is three launches today.
+    /// `TUPLE` does not touch `post` — each slot keeps its own — so the
+    /// triple can become one k-loop reading `x` once. The target is one
+    /// launch, and the ceiling is what makes that a diff.
     fn qkv_triple(session: &Session) -> CaseResult {
         const ROWS: u64 = 64;
         const IN: u64 = 96;
@@ -663,8 +665,8 @@ mod tests {
         assert_eq!(names.len(), 7 + SPLIT_K_EXTENTS.len() + 4);
     }
 
-    /// Every split-K extent is under the `at_least(4096)` gate. If one drifts
-    /// above it the case stops measuring what it exists for.
+    /// Every split-K extent is under the shipped `at_least(4096)` gate. If
+    /// one drifts above it the case stops measuring what it was written for.
     #[test]
     fn the_split_k_extents_are_all_under_the_shipped_gate() {
         for k in SPLIT_K_EXTENTS {

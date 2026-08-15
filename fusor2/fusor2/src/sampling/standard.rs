@@ -1,4 +1,6 @@
 //! The standard temperature / top-k / top-p / min-p sampler.
+//!
+//! Owned by W13.
 
 use crate::Result;
 use crate::tensor::Tensor;
@@ -42,18 +44,27 @@ impl Default for StandardSamplerParams {
 
 /// Draw one token from a logits row.
 ///
-/// The returned token is a device tensor; the only host input is the seed.
-/// The filters run in order — repetition penalty, temperature, sort, top-k,
-/// min-p, top-p, weighted pick.
+/// Nothing is resolved: the returned token is a device tensor, and the logits
+/// never reach the host. The only host input is the uniform draw, which the
+/// reference also passes in as a `random` parameter.
 ///
-/// A temperature of `0` is greedy: the argmax is rank `0` of the sorted order,
-/// so it survives every filter.
+/// The filters run in the reference's order — repetition penalty, temperature,
+/// sort, top-k, min-p, top-p, weighted pick.
+///
+/// # Deviation from the reference
+///
+/// The reference kernel treats a temperature of `0` as "skip the division" and
+/// still draws randomly. Here `0` is greedy, which is what the conformance
+/// case `sample_standard_token_at_zero_temperature_is_the_argmax` and the
+/// usual meaning of the knob require. Because the argmax is rank `0` of the
+/// sorted order it survives every filter, so short-circuiting to it is
+/// equivalent to sampling a distribution collapsed onto one token.
 pub fn sample(logits: &Tensor, params: StandardSamplerParams) -> Result<GpuSampledToken> {
     let n = row::row_len(logits)?;
     let graph = logits.graph().clone();
 
     // Repetition penalty, then temperature — both on the raw row, before the
-    // sort.
+    // sort, exactly as `top_k_chunk` does them.
     let column = row::sanitized_column(logits, n)?;
     let previous = if params.repetition_penalty > 1.0 {
         row::previous_tokens(&graph)
@@ -97,7 +108,8 @@ fn filtered_pick(sorted_values: &Tensor, k: u64, params: &StandardSamplerParams)
     let weights = row::weights_of(sorted_values, k)?;
     let first = row::first_only(&graph, k)?;
 
-    // min-p compares that ratio directly against the knob: `weight >= min_p`.
+    // min-p compares that ratio directly against the knob, which is the
+    // reference's `weight >= min_p`.
     let keep = if params.min_p > 0.0 {
         weights.gte_scalar(params.min_p)?
     } else {
@@ -105,9 +117,10 @@ fn filtered_pick(sorted_values: &Tensor, k: u64, params: &StandardSamplerParams)
     };
     let survivors = weights.mul(&keep)?;
 
-    // top-p over the min-p-filtered mass, against
-    // `target = filtered_total * top_p`. Every position whose exclusive prefix
-    // is below the target is the shortest prefix reaching it, including the
+    // top-p over the min-p-filtered mass, matching the reference's
+    // `target = filtered_total * top_p`. Keeping every position whose
+    // *exclusive* prefix is still below the target is the same set the
+    // reference's break-on-`cumulative >= target` walk produces, including the
     // token that crosses.
     let keep = if params.top_p < 1.0 {
         let total = row::total_of(&survivors)?;
@@ -119,8 +132,8 @@ fn filtered_pick(sorted_values: &Tensor, k: u64, params: &StandardSamplerParams)
         keep
     };
 
-    // At least one candidate always survives, even when every filter
-    // rejected everything.
+    // The reference forces a cutoff of at least one candidate when every
+    // filter rejected everything.
     let keep = keep.maximum(&first)?;
     let masked = weights.mul(&keep)?;
     row::pick_one_hot(&masked, k, row::unit_random(params.seed))
@@ -235,7 +248,7 @@ mod tests {
                 );
             }
         }
-        // At min_p = 0.6 only the peak survives.
+        // The filter must actually bite: at min_p = 0.6 only the peak survives.
         let params = StandardSamplerParams {
             temperature: 1.0,
             min_p: 0.6,
@@ -328,8 +341,8 @@ mod tests {
         }
     }
 
-    /// The pending token is a one-element `U32` device tensor usable as an
-    /// operand, with nothing resolved.
+    /// The pending form must not resolve anything: the token is a one-element
+    /// `U32` device tensor usable as an operand.
     #[test]
     fn the_pending_token_is_a_usable_device_operand() {
         let values = conformance_row();
@@ -347,7 +360,8 @@ mod tests {
         assert!(pending.value.add_scalar(0u32).is_ok());
     }
 
-    /// The filters nest: min-p first, then top-p over the surviving mass.
+    /// The filters compose the way the reference nests them: min-p first, then
+    /// top-p over the surviving mass.
     #[test]
     fn min_p_and_top_p_compose() {
         let values = conformance_row();

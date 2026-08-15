@@ -6,7 +6,6 @@
 use crate::carrier::Carrier;
 use crate::dtype::Dtype;
 use crate::egraph::Id;
-use crate::error::{Error, Result};
 use crate::ir::{AttrId, OpDefId, OpTag};
 use crate::scalar::ScalarExpr;
 use crate::shape::{Dim, Layout, MultiFlattenMap, SlidingWindow};
@@ -24,8 +23,9 @@ pub enum L1 {
 
     /// A reduction nest over a [`Carrier`]. `space` is
     /// `free.. ++ vec.. ++ [reduced]`; the carrier owns the element
-    /// expression (`lift`), the per-slot identities and the merge, so a
-    /// multi-slot accumulator is expressible.
+    /// expression (`lift`, which is where the old `pre` went), the per-slot
+    /// identities and the merge, so a multi-slot accumulator is expressible
+    /// and there is no `TileReduceOp` to resolve for a whole fold.
     KFold {
         space: IndexSpace,
         axis: u32,
@@ -73,8 +73,7 @@ pub enum L1 {
         sched: ScheduleDomain,
     },
 
-    /// Scatter. Four lowerings coexist; the cost model rejects
-    /// `OneHotContract` at the trainer's shape rather than a rule vetoing.
+    /// Scatter. Both lowerings coexist and compete on cost.
     KScatter {
         space: IndexSpace,
         axis: u32,
@@ -88,14 +87,14 @@ pub enum L1 {
     /// differing only in that it emits an extra buffer.
     ///
     /// `sched` is the members' shared index space walked as one linearized
-    /// body — see [`MapDomain::linear_over`].
+    /// body — see [`MapDomain::linear_over`]. Without it the one node family
+    /// the architecture calls its own fusion primitive would be the one whose
+    /// geometry is not a selection.
     KRegion {
         members: SmallVec<[Id; 8]>,
         live_outs: SmallVec<[u32; 4]>,
         sched: ScheduleDomain,
     },
-
-    KMerged(KMerged),
 
     /// The one open extension point.
     Ext {
@@ -114,7 +113,6 @@ impl L1 {
             Self::KGather { .. } => OpTag::KGather,
             Self::KScatter { .. } => OpTag::KScatter,
             Self::KRegion { .. } => OpTag::KRegion,
-            Self::KMerged(_) => OpTag::KMerged,
             Self::Ext { .. } => OpTag::Ext,
         }
     }
@@ -155,7 +153,6 @@ impl L1 {
             | Self::KGather { sched, .. }
             | Self::KScatter { sched, .. }
             | Self::KRegion { sched, .. } => Some(sched),
-            Self::KMerged(m) => Some(m.schedule()),
             Self::Ext { .. } => None,
         }
     }
@@ -181,16 +178,11 @@ impl IndexSpace {
     /// The legality side of `map_into_fold`: a producer may be inlined only
     /// into a consumer whose space covers it.
     pub fn covers(&self, other: &IndexSpace) -> bool {
-        Self::covers_dims(&self.dims, &other.dims)
-    }
-
-    /// [`Self::covers`] on borrowed dims, for callers that read a node's own
-    /// storage instead of building a space.
-    pub fn covers_dims(covering: &[Dim], covered: &[Dim]) -> bool {
-        covered.len() <= covering.len()
-            && covered
+        other.dims.len() <= self.dims.len()
+            && other
+                .dims
                 .iter()
-                .zip(covering.iter())
+                .zip(self.dims.iter())
                 .all(|(a, b)| a.known_eq(*b))
     }
 
@@ -242,14 +234,19 @@ impl AccessPlan {
 ///
 /// # Why a side is a list
 ///
-/// A side holds several operands so that
-/// [`crate::rules::fusion::map_into_contract`] can absorb a producer that
-/// reads more than one buffer. The producer that matters is the GGUF block
-/// decode: it reads one block stream through several `Restride` views at once
-/// — the quant plane, the block scale, the block minimum, the group scales —
-/// so it is irreducibly multi-edge and no rewrite collapses it. As a list, it
-/// is an ordinary absorbed producer and the quantized staging fill is not a
-/// special case in the backend.
+/// A contraction operand used to be exactly one [`Operand`], which made
+/// `KContract` the only fixed-arity L1 node — `KMap`, `KFold`, `KGather` and
+/// `KScatter` all carry `Vec<Operand>`. That asymmetry is what made
+/// [`crate::rules::fusion::map_into_contract`] bail whenever the producer it
+/// wanted to absorb read more than one buffer: there was nowhere to put the
+/// second edge.
+///
+/// The producer that matters is the GGUF block decode. It reads one block
+/// stream through several `Restride` views at once — the quant plane, the
+/// block scale, the block minimum, the group scales — so it is irreducibly
+/// multi-edge, and no rewrite collapses it. With a side as a list that decode
+/// is an ordinary absorbed producer, and the quantized staging fill stops
+/// being a special case in the backend.
 ///
 /// # Numbering
 ///
@@ -298,17 +295,6 @@ impl ContractSide {
         &self.ops[0]
     }
 
-    /// The sole operand, or `None` once a multi-buffer producer has been
-    /// absorbed. Rules that rewrite *the* operand — rather than each of them
-    /// independently — decline on `None` instead of silently rewriting the
-    /// first of several.
-    pub fn sole(&self) -> Option<&Operand> {
-        match &self.ops[..] {
-            [only] => Some(only),
-            _ => None,
-        }
-    }
-
     pub fn len(&self) -> usize {
         self.ops.len()
     }
@@ -317,16 +303,6 @@ impl ContractSide {
         self.ops.is_empty()
     }
 
-    /// Rebuild with each operand mapped, keeping `pre` and the arg numbering.
-    /// `f` returning `None` for any operand abandons the whole rewrite —
-    /// a side half-repacked reads two layouts for one index.
-    pub fn try_map_ops(&self, f: impl Fn(&Operand) -> Option<Operand>) -> Option<Self> {
-        let ops: Option<SmallVec<[Operand; 2]>> = self.ops.iter().map(f).collect();
-        Some(Self {
-            pre: self.pre.clone(),
-            ops: ops?,
-        })
-    }
 }
 
 /// One divmod term of an operand's index map:
@@ -427,6 +403,38 @@ impl Operand {
         coalesce(&mut terms);
         Some(AddressMap { offset, terms })
     }
+
+    /// Re-spell this edge under another [`AccessPlan`], or decline when the
+    /// re-spelling would read different elements.
+    ///
+    /// `Alias`, `Gather` and `Pack` all derive every address from `layout`,
+    /// so moving between them is sound whatever the extents are — including
+    /// symbolic ones, where the map is undecidable but the *reason* the two
+    /// agree does not read an extent. An `Unflatten` map is the one plan that
+    /// may have been stated **independently** of the layout
+    /// (`rules::sink::fold_operand_views` mints exactly that), so leaving one
+    /// is sound only when the candidate's address map compares equal, and an
+    /// undecidable extent declines.
+    ///
+    /// `rules::layout::operand_alias` pinned this hazard for the `Alias`
+    /// spelling — 29 conformance cases on wrong values when a co-selection
+    /// pass first made the member reachable. The `Gather` and `Pack`
+    /// re-spellings (and the cpu backend's access rules) carried the
+    /// identical hazard; only the extraction budget kept those members
+    /// unselected. Every access-plan rewrite must come through here.
+    pub fn respell(&self, access: AccessPlan) -> Option<Operand> {
+        let out = Operand {
+            src: self.src,
+            layout: self.layout.clone(),
+            access,
+        };
+        match &self.access {
+            AccessPlan::Unflatten(_) => {
+                (out.address_map()? == self.address_map()?).then_some(out)
+            }
+            _ => Some(out),
+        }
+    }
 }
 
 /// Merge adjacent terms that are contiguous in both the logical and the
@@ -457,27 +465,40 @@ pub enum Family {
     Coop,
     Sgemm,
     Sgemv,
-    GenericFold,
 }
 
 /// Gather lowering.
+///
+/// `Vectorized` — one lane moving four elements instead of one — was offered
+/// 554 times over the suite and every model and selected zero times, so it is
+/// deleted; the two survivors are the row nest and the quantized-row nest.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum GatherMode {
     RowPerGroup,
-    Vectorized,
+    /// The gather's source operand is the *quantized leaf itself*, addressed
+    /// in its dense logical element space; both backends' operand loaders run
+    /// the format's decode program at the flat index, so only the gathered
+    /// rows ever decode and no dense table is materialized. Minted only from
+    /// a `Gather`-of-`Dequant` pair (`GATHER_QUANTIZED_ROWS`), so the node is
+    /// float-typed — minting it straight over the leaf would give the class
+    /// the source's `Q(fmt)` dtype and the consuming `Dequant` would decode
+    /// twice.
+    QuantizedRows,
 }
 
-/// Scatter lowering. All four coexist as alternatives; `OneHotContract`
-/// survives only as the candidate the cost model rejects (1.2 GB of traffic
-/// against `WgPrivateMerge`'s 96 KB at the trainer's shape).
+/// Scatter lowering. Both coexist as alternatives and compete on cost.
+///
+/// There used to be four. `WgPrivateMerge` reached the *same* `scatter_dense`
+/// nest as these two on both backends — the mode is not read there — and
+/// `OneHotContract` had no lowering at all: it errored if selected, which is
+/// an alternative extraction can prefer and then fail on. Both were offered 62
+/// times over the conformance suite, never over any model, and selected zero
+/// times anywhere.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ScatterMode {
     /// Guarded on `Caps::atomic_f32`.
     Atomic,
     SortSegment,
-    /// Guarded on `rows * elem_bytes <= max workgroup storage`.
-    WgPrivateMerge,
-    OneHotContract,
 }
 
 /// Attention mask shape.
@@ -487,100 +508,6 @@ pub enum MaskKind {
     QkMask,
     BatchKeyMask,
     Causal,
-}
-
-/// Wave category a merged dispatch belongs to.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum WaveCat {
-    Region,
-    Row,
-    Matmul,
-    MatmulSplitK,
-}
-
-/// The equality every segment of a merged wave must satisfy.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct MergeKey {
-    pub m: Dim,
-    pub n: Dim,
-    pub k: Dim,
-    pub batch: Dim,
-    pub splits: u32,
-    pub dtype: Dtype,
-    pub family: Family,
-}
-
-/// One candidate segment of a merged wave.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct MergeSegment {
-    pub id: Id,
-    pub key: MergeKey,
-    pub has_epilogue: bool,
-}
-
-/// A horizontally merged wave. Fields are private and the constructor
-/// rejects any segment carrying an epilogue, so **a merged body with
-/// per-segment epilogue identities is unbuildable**. The un-merged
-/// epilogue-carrying contraction stays a live alternative in the same
-/// chain, so merging and epilogue fusion compete on cost.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct KMerged {
-    segments: SmallVec<[Id; 8]>,
-    category: WaveCat,
-    key: MergeKey,
-    sched: ScheduleDomain,
-}
-
-impl KMerged {
-    /// Fails when a segment carries an epilogue, when two segments' keys
-    /// differ, or when no segment is supplied.
-    ///
-    /// `sched` is the wave's schedule space: one guarded body per segment
-    /// over the segments' shared index space, walked as one linearized index
-    /// — see [`MapDomain::linear_over`].
-    pub fn new(
-        category: WaveCat,
-        segments: impl IntoIterator<Item = MergeSegment>,
-        sched: ScheduleDomain,
-    ) -> Result<Self> {
-        let segments: SmallVec<[MergeSegment; 8]> = segments.into_iter().collect();
-        let first = segments
-            .first()
-            .ok_or_else(|| Error::Legality("a merged wave needs at least one segment".into()))?;
-        for s in &segments {
-            if s.has_epilogue {
-                return Err(Error::Legality(format!(
-                    "segment {} carries an epilogue and cannot be merged",
-                    s.id
-                )));
-            }
-            if s.key != first.key {
-                return Err(Error::Legality(format!(
-                    "segment {} has a different merge key",
-                    s.id
-                )));
-            }
-        }
-        Ok(Self {
-            key: first.key,
-            segments: segments.iter().map(|s| s.id).collect(),
-            category,
-            sched,
-        })
-    }
-
-    pub fn segments(&self) -> &[Id] {
-        &self.segments
-    }
-    pub const fn category(&self) -> WaveCat {
-        self.category
-    }
-    pub const fn key(&self) -> MergeKey {
-        self.key
-    }
-    pub const fn schedule(&self) -> &ScheduleDomain {
-        &self.sched
-    }
 }
 
 /// Whether a node mutates state. A selected node with [`Effect::InPlace`]
@@ -596,7 +523,9 @@ pub enum Effect {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BufferRole(pub u32);
 
+// ---------------------------------------------------------------------------
 // Schedule domains
+// ---------------------------------------------------------------------------
 
 /// The enumerable schedule-parameter space of one node. **It is not
 /// e-nodes**: minting every point blows the graph up; minting a
@@ -776,7 +705,9 @@ pub struct SgemmParams {
 
 impl SgemmParams {
     /// `tm | bm`, `tn | bn`, 32..=max lanes, staged footprint within the
-    /// workgroup-storage limit.
+    /// workgroup-storage limit. Exactly the predicates the reference
+    /// asserts over its regression tree's leaves — here they *generate*
+    /// candidates instead of validating one.
     pub const fn legal(&self, elem_bytes: u32, max_wg_storage: u32, max_lanes: u32) -> bool {
         if self.tm == 0 || self.tn == 0 || self.bm % self.tm != 0 || self.bn % self.tn != 0 {
             return false;
@@ -788,21 +719,66 @@ impl SgemmParams {
     }
 }
 
-/// Every legal SGEMM tiling. Measured leaves seed move ordering only.
+/// Every legal SGEMM tiling. The 200-line regression tree is deleted; its
+/// measured leaves seed move ordering only.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct SgemmDomain {
     pub params: SmallVec<[SgemmParams; 16]>,
 }
 
-/// SGEMV chunking and vectorization.
+/// SGEMV vectorization and workgroup structure.
+///
+/// There is no `chunk` axis: the k loop's trip count is fully determined by
+/// `k / (lanes * vector)` in both lowerings, so a chunk field could only
+/// multiply the domain with byte-identical kernels — which is exactly what
+/// it did until it was measured doing it (six copies of every cell, each a
+/// separate tune record and race candidate, plus a cost prior ranking the
+/// copies against each other).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SgemvParams {
-    pub chunk: u32,
     pub vector: u32,
     pub subgroups: u32,
+    /// Output columns per workgroup.
+    ///
+    /// `1` is the whole-workgroup structure: every lane of all `subgroups`
+    /// subgroups cooperates on a single output element and the reduction
+    /// crosses the workgroup. `cols > 1` requires `cols % subgroups == 0`
+    /// and a fixed subgroup width: each subgroup owns `cols / subgroups`
+    /// columns end-to-end, all `width` lanes cooperate on each of them, the
+    /// k window of one pass is shared across the subgroup's columns, and the
+    /// reduction never leaves the subgroup.
+    pub cols: u32,
+    /// Runs the lane's k window is split into.
+    ///
+    /// `1` (with `gap == 0`, the canonical spelling) keeps the window as
+    /// `vector` consecutive k elements. `parts > 1` — legal only on the
+    /// multi-column structure — lays the window out as `parts` runs of
+    /// `vector / parts` consecutive elements, run `r` at offset `r * gap`
+    /// from the lane's base, with `gap / run` adjacent lanes' runs packing
+    /// each gap before the window's own runs interleave. The subgroup's pass
+    /// still covers exactly `width * vector` consecutive k; only which lane
+    /// owns which element changes. A split window lets one lane revisit the
+    /// same packed word of a bit-packed operand at several k offsets, so the
+    /// word loads hash-cons to a single evaluation — purely a schedule
+    /// choice, discovered by measurement like every other axis.
+    pub parts: u32,
+    /// K distance between a split window's runs. `0` when `parts == 1`.
+    pub gap: u32,
 }
 
-/// Every legal SGEMV parameterization.
+impl SgemvParams {
+    /// Consecutive elements per run of the lane's k window.
+    pub const fn run(&self) -> u32 {
+        if self.parts <= 1 {
+            self.vector
+        } else {
+            self.vector / self.parts
+        }
+    }
+}
+
+/// Every legal SGEMV parameterization. The 21-arm measured bucket table
+/// (which ignores `n` entirely) is deleted.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct SgemvDomain {
     pub params: SmallVec<[SgemvParams; 16]>,
@@ -877,8 +853,11 @@ pub fn fold_scratch_bytes(
     // and `emitted_block` is floored at the default block regardless of the
     // lane group, so a 24-lane Welford carrier wants 24 KiB and a 64-lane
     // `TN` register tile wants 64 KiB — over any device's limit at *every*
-    // lane group. Without this clause such a carrier's fold domain is empty
-    // and `PROMOTE` mints a nest nothing can schedule.
+    // lane group. Without this clause the fold domain of such a carrier is
+    // empty, `PROMOTE` mints a nest nothing can schedule, and §4.2 turns that
+    // into a hard `verify_plan` failure instead of a slow plan. With it, the
+    // row-per-lane schedule the emitters already lower correctly is also the
+    // one the generator can offer, and register tiling stays derivable.
     if lane_group <= 1 {
         return 0;
     }
@@ -905,20 +884,22 @@ pub struct MapTiling {
     pub vector: u32,
 }
 
-/// Candidate tilings: one per eligible dim, plus untiled.
+/// Candidate tilings: one per eligible dim, plus untiled. Replaces the
+/// strict LLC-watermark cliff and the argmax-invariant-bytes selection.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct MapDomain {
     pub tilings: SmallVec<[MapTiling; 8]>,
 }
 
-/// Outputs per lane worth scoring for a linearized body. A policy constant,
-/// kept beside the generator that reads it rather than in a lowering.
+/// Outputs per lane worth scoring for a linearized body. A *policy* constant,
+/// and it belongs beside the generator that reads it rather than in a
+/// lowering — same rule `fusor2_tile::domains` follows for `BLOCK_CHOICES`.
 const LINEAR_TM_CHOICES: [u32; 3] = [2, 4, 8];
 
 impl MapDomain {
     /// Every tiling worth scoring for a body that walks **one linearized
-    /// index** over `elements` outputs — the shape [`L1::KRegion`] and
-    /// [`L1::KMerged`] both take, on either backend.
+    /// index** over `elements` outputs — the shape [`L1::KRegion`] takes on
+    /// either backend.
     ///
     /// `dim` is always `None` because there is no axis to name: `tm` is the
     /// register tile along the linear index and `vector` is the SIMD width,
@@ -1050,9 +1031,10 @@ mod schedule_tests {
         );
     }
 
-    /// Both composite forms carry a schedule domain, so extraction resolves
-    /// their geometry like every other node's. `Ext` is the only `None`:
-    /// fusor2 cannot enumerate geometries for a lowering it did not write.
+    /// **The gate.** Both composite forms carry a schedule domain, so
+    /// extraction resolves their geometry like every other node's. `Ext` is
+    /// the only `None` left: fusor2 cannot enumerate geometries for a
+    /// lowering it did not write.
     #[test]
     fn every_node_but_ext_declares_a_schedule_domain() {
         let d = ScheduleDomain::Map(MapDomain::linear(&caps(32), 8192));
@@ -1063,27 +1045,6 @@ mod schedule_tests {
         };
         assert_eq!(region.schedule(), Some(&d));
         assert!(region.schedule().unwrap().len() > 1);
-
-        let key = MergeKey {
-            m: Dim::Const(128),
-            n: Dim::Const(64),
-            k: Dim::Const(8),
-            batch: Dim::ONE,
-            splits: 1,
-            dtype: Dtype::F32,
-            family: Family::Sgemm,
-        };
-        let wave = KMerged::new(
-            WaveCat::Region,
-            (1..3).map(|i| MergeSegment {
-                id: Id(i),
-                key,
-                has_epilogue: false,
-            }),
-            d.clone(),
-        )
-        .unwrap();
-        assert_eq!(L1::KMerged(wave).schedule(), Some(&d));
 
         let ext = L1::Ext {
             def: crate::ir::OpDefId(0),

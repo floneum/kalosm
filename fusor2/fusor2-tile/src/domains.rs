@@ -1,14 +1,23 @@
-//! Schedule-domain generators. Each `*_domain` *generates* the complete legal
+//! Schedule-domain generators. Each `legal` *generates* the complete legal
 //! parameter space of one node under one `Caps`, filtered by structural
 //! predicates and the exact [`crate::arena`] footprint.
 //!
-//! No generator picks a point: measured leaves seed move ordering only.
+//! The reference's 200-line SGEMM regression tree and 21-arm SGEMV bucket
+//! table are deleted; their measured leaves seed move ordering only.
+//!
+//! Owned by W4.
 
 pub mod coop;
 pub mod fold;
 pub mod map;
 pub mod sgemm;
 pub mod sgemv;
+
+pub use coop::legal as coop_legal;
+pub use fold::legal as fold_legal;
+pub use map::legal as map_legal;
+pub use sgemm::legal as sgemm_legal;
+pub use sgemv::legal as sgemv_legal;
 
 pub use coop::{coop_domain, coop_tiles, stage_element};
 pub use fold::{emitted_block, fold_blocks, fold_domain, fold_domain_for};
@@ -34,8 +43,9 @@ impl<'a> DomainCtx<'a> {
     }
 }
 
-/// Hard ceiling on split-K candidates. Bounds the candidate count; it is not
-/// a profitability judgement.
+/// Hard ceiling on split-K candidates, matching the reference's
+/// `split_candidates` bound. Bounds the candidate count; it is not a
+/// profitability judgement.
 pub const MAX_SPLITS: u32 = 64;
 
 /// A process-wide memo for a shape-independent candidate table.
@@ -43,10 +53,11 @@ pub const MAX_SPLITS: u32 = 64;
 /// The heavy generators (`coop::candidate_geoms_for`, `sgemm::sgemm_domain`)
 /// are pure functions of `(Caps, element, planner)` — no extent reaches them,
 /// which is the whole point of carrying a domain instead of a chosen point.
-/// Regenerating them per contraction costs 2.3 ms for coop and 0.33 ms for
-/// sgemm — enough that a graph with two matmuls cannot saturate inside any
-/// sensible budget — so the enumeration runs once per device, not once per
-/// node.
+/// Regenerating them per contraction cost 2.3 ms for coop and 0.33 ms for
+/// sgemm, so a graph with two matmuls could not saturate inside *any*
+/// sensible budget and the driver truncated at a wall-clock-dependent point.
+/// Memoizing makes the enumeration lazy in the only sense that matters:
+/// once per device, not once per node.
 pub(crate) struct DomainMemo<K, V> {
     slots: std::sync::Mutex<Vec<(K, V)>>,
 }
@@ -84,8 +95,9 @@ pub(crate) fn planner_id(planner: &dyn ArenaPlanner) -> usize {
     std::ptr::from_ref(planner) as *const () as usize
 }
 
-/// Rank of a point no bench has visited. Far from the measured band and
-/// below 255, so a seed table can still order below it.
+/// Rank of a point no bench has ever visited. Deliberately far from the
+/// measured band and deliberately below 255, so a future seed table can
+/// still order below it.
 pub(crate) const UNMEASURED: u8 = 200;
 
 /// Ascending-tuple tiebreak for the sgemm cap.
@@ -94,8 +106,8 @@ pub(crate) fn sgemm_order(p: &SgemmParams) -> (u32, u32, u32, u32, u32, bool) {
 }
 
 /// Ascending-tuple tiebreak for the sgemv cap.
-pub(crate) fn sgemv_order(p: &SgemvParams) -> (u32, u32, u32) {
-    (p.chunk, p.vector, p.subgroups)
+pub(crate) fn sgemv_order(p: &SgemvParams) -> (u32, u32, u32, u32, u32) {
+    (p.vector, p.subgroups, p.cols, p.parts, p.gap)
 }
 
 /// Ascending-tuple tiebreak for the fold cap.
@@ -115,7 +127,9 @@ pub(crate) fn map_order(t: &MapTiling) -> (u32, u32, u32) {
     (t.dim.map_or(u32::MAX, |d| d), t.tm, t.vector)
 }
 
+// ---------------------------------------------------------------------------
 // The planner the L1 rules reach for when the caller supplies none
+// ---------------------------------------------------------------------------
 
 /// The [`ArenaPlanner`] the rules in [`crate::rules`] reach for: the one
 /// memoized [`crate::Planner`], the same object `verify_l1` admits against
@@ -186,3 +200,4 @@ pub(crate) mod testing {
         caps
     }
 }
+

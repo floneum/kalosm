@@ -9,8 +9,8 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["ai", "segment-anything", "segmentation", "computer-vision"]
 
 [dependencies]
-fusor2 = { path = "../../fusor2-verified/fusor2" }
-fusor2-gguf = { path = "../../fusor2-verified/fusor2-gguf" }
+fusor2 = { path = "../../fusor2/fusor2" }
+fusor2-gguf = { path = "../../fusor2/fusor2-gguf" }
 kalosm-common = { workspace = true }
 kalosm-model-types.workspace = true
 thiserror.workspace = true

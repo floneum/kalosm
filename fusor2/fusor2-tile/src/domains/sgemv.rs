@@ -1,64 +1,219 @@
-//! The SGEMV schedule domain: every legal `(chunk, vector, subgroups)` on the
-//! device, with eleven measured cells acting as move-ordering seeds.
+//! The SGEMV schedule domain. The 21-arm measured bucket table is deleted;
+//! its distinct cells survive as move-ordering seeds only.
 //!
-//! The domain is a pure function of the device. Shape participates in cost
-//! and nowhere else.
+//! The reference's `gemv_parameters(m, _: usize, k)` ignores `n` outright,
+//! so two contractions with wildly different output widths and identical
+//! `(m, k)` get identical vectorization. Here `n` participates in cost and
+//! nowhere else — the domain is a pure function of the device.
+//!
+//! Owned by W4.
 
+use fusor2_ir::device::Caps;
+use fusor2_ir::dtype::Dtype;
 use fusor2_ir::ir::level1::{SgemvDomain, SgemvParams};
+use fusor2_ir::shape::Dim;
 use smallvec::SmallVec;
 
 use crate::domains::{DomainCtx, UNMEASURED, sgemv_order};
 
-const CHUNK_CHOICES: [u32; 6] = [1, 2, 4, 8, 16, 32];
-const VECTOR_CHOICES: [u32; 3] = [1, 2, 4];
+/// Lane k-window widths. The wide entries (32, 64) exist for quantized
+/// operands: a 32-element window amortizes one group-scale decode across the
+/// whole group instead of a quarter of it, and a 64-element window makes the
+/// lane consume **both** packed halves of every data word it touches, so no
+/// word is ever loaded by two lanes. Purely a schedule choice — the block
+/// decode itself is the operand's, shared through hash-consing.
+const VECTOR_CHOICES: [u32; 7] = [1, 2, 4, 8, 16, 32, 64];
 const SUBGROUP_CHOICES: [u32; 6] = [1, 2, 4, 8, 16, 32];
+/// Columns per workgroup. `1` is the whole-workgroup-per-element structure;
+/// the rest hand each subgroup `cols / subgroups` columns (generated only
+/// when that divides, on a fixed-subgroup device).
+const COLS_CHOICES: [u32; 6] = [1, 2, 4, 8, 16, 32];
+/// Accumulator-pressure bound: each lane carries `cols / subgroups`
+/// accumulators plus its activation window, so a subgroup never owns more
+/// than this many columns.
+const MAX_COLS_PER_SUBGROUP: u32 = 8;
+/// Unroll-pressure bound on the multi-column structure: the loop body is
+/// `vector` activation loads plus `vector * (cols / subgroups)` FMAs, all
+/// unrolled. 256 admits the widest window at 4 columns (64 x 4) and the
+/// reference-shaped 32 x 8; past that the body is register spill, not math.
+const MAX_UNROLL: u32 = 256;
+/// Runs a split lane window is laid out as (`1` = consecutive, the only
+/// structure the whole-workgroup path has). A split window revisits the same
+/// packed word of a bit-packed operand at several k offsets, so its word
+/// loads hash-cons to one evaluation — which offsets pay is the operand's
+/// business; the race finds out.
+const PARTS_CHOICES: [u32; 2] = [2, 4];
+/// K distances between a split window's runs. Pure schedule numbers like
+/// `vector`; the divisibility rules in the generator are what make each one
+/// tile the pass exactly.
+const GAP_CHOICES: [u32; 3] = [16, 32, 64];
 
-/// The eleven measured cells. Ordering, never gating.
+/// Measured cells, position = move-ordering rank. `sample_points` offers the
+/// front five of the domain to the race for every key, so the first five
+/// entries must together cover every (shape, dtype) winner — the race picks
+/// per key, the order only has to *reach* each winner, not rank one dtype
+/// over another.
 pub static SEED_CELLS: &[SgemvParams] = &[
-    v(16, 4, 16),
-    v(2, 4, 1),
-    v(8, 4, 2),
-    v(8, 4, 8),
+    // The round-5 FUSOR2_PIN_SGEMV sweep (M2 Max, six 8B-decode qgemv
+    // shapes, kernel spans, warm-cache runs only — a fresh tune cache
+    // re-fights the coop candidates and contaminates the pin): the
+    // 32-window / 4-runs-at-gap-32 gather from rounds 3-4 stands, but the
+    // *block* wants to be tiny. This kernel has no cross-subgroup sharing
+    // at all — no barrier, no workgroup scratch — so 8 subgroups per
+    // workgroup only coarsen the scheduler's packing granularity; 1-2
+    // subgroups at the same cps=2 beat the 256-thread blocks on all six
+    // shapes. cps=1 loses everywhere (halves activation reuse: 65/60 GB/s
+    // on attn) and cps=4 at small blocks spills; cps=2 is the ridge.
+    //
+    // (32,2,4,4,32): 64-thread block — gateup q4k 222, gateup q6k 201,
+    // down q6k 197 (prior best 218/197/178). Worst shape 169.8 (attn q6k).
+    w(32, 2, 4, 4, 32),
+    // (32,1,2,4,32): one subgroup per workgroup — attn q4k 197.5, attn
+    // q6k 175.2, down q4k 221.2 (prior best 189/166/214).
+    w(32, 1, 2, 4, 32),
+    // (32,8,16,4,32): round 4's near-universal 256-thread cell, kept as
+    // the incumbent-safety while the small blocks re-earn their rank in
+    // production.
+    w(32, 8, 16, 4, 32),
+    // (16,8,32,4,32): attn-sized Q6K's round-4 winner (130.2; the
+    // 16-window keeps the Q6K decode inside the unroll budget where
+    // 32-windows spill).
+    w(16, 8, 32, 4, 32),
+    // Unsplit multi-column: the structure for operands where a split window
+    // has nothing to hash-cons (round 2's all-round winner, worst 131 GB/s).
+    v(16, 8, 16),
+    // Runners-up of rounds 2-4, kept as explorer fodder past the race
+    // prefix.
+    w(32, 8, 32, 4, 32),
+    w(16, 8, 16, 4, 32),
+    w(16, 8, 16, 2, 32),
+    w(32, 8, 32, 2, 32),
+    v(32, 8, 32),
     v(16, 4, 1),
+    v(16, 4, 16),
+    v(16, 8, 32),
+    v(8, 8, 32),
+    v(8, 8, 8),
     v(8, 4, 16),
-    v(8, 4, 32),
-    v(32, 2, 8),
-    v(8, 2, 1),
-    v(32, 2, 16),
-    v(32, 2, 32),
+    // The distinct cells of the deleted bucket table (deduped: with no
+    // chunk axis several collapsed into one another).
+    v(4, 16, 1),
+    v(4, 1, 1),
+    v(4, 2, 1),
+    v(4, 8, 1),
+    v(4, 32, 1),
+    v(2, 8, 1),
+    v(2, 1, 1),
+    v(2, 16, 1),
+    v(2, 32, 1),
 ];
 
-const fn v(chunk: u32, vector: u32, subgroups: u32) -> SgemvParams {
+const fn v(vector: u32, subgroups: u32, cols: u32) -> SgemvParams {
+    w(vector, subgroups, cols, 1, 0)
+}
+
+const fn w(vector: u32, subgroups: u32, cols: u32, parts: u32, gap: u32) -> SgemvParams {
     SgemvParams {
-        chunk,
         vector,
         subgroups,
+        cols,
+        parts,
+        gap,
     }
 }
 
-/// Every legal `(chunk, vector, subgroups)` on this device, ordered by
-/// `(seed_rank, chunk, vector, subgroups)`.
+/// Compatibility entry point kept for the scaffold's `domains::sgemv_legal`
+/// re-export. None of `m`, `n`, `k` or `dtype` filters the domain.
+pub fn legal(m: Dim, n: Dim, k: Dim, dtype: Dtype, caps: &Caps) -> SgemvDomain {
+    let _ = (m, n, k, dtype);
+    let cx = DomainCtx::new(caps, crate::domains::default_planner());
+    sgemv_domain(&cx)
+}
+
+/// Every legal `(vector, subgroups, cols, parts, gap)` on this device,
+/// ordered by `(seed_rank, sgemv_order)`.
 pub fn sgemv_domain(cx: &DomainCtx<'_>) -> SgemvDomain {
     let width = cx.caps.subgroup_width();
     let max_lanes = cx.caps.limits.max_compute_invocations_per_workgroup;
+    // The subgroup-per-column structure indexes lanes by `subgroup_id` and
+    // reduces within one subgroup, which is only a static schedule when the
+    // device pins its subgroup width.
+    let fixed_subgroup = cx.caps.subgroups.is_some_and(|s| s.is_fixed());
+
+    // `FUSOR2_PIN_SGEMV="vector,subgroups,cols[,parts,gap]"` restricts
+    // the domain to one cell — the same measurement instrument as
+    // `FUSOR2_PIN_COOP`: it is how the per-shape kernel tables are measured
+    // without the adoption race in the loop. Ordinary runs never set it.
+    let pin: Option<SgemvParams> = std::env::var("FUSOR2_PIN_SGEMV").ok().and_then(|s| {
+        let p: Vec<u32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        match p.len() {
+            3 => Some(v(p[0], p[1], p[2])),
+            5 => Some(w(p[0], p[1], p[2], p[3], p[4])),
+            _ => None,
+        }
+    });
 
     let mut all: Vec<SgemvParams> = Vec::new();
-    for chunk in CHUNK_CHOICES {
-        for vector in VECTOR_CHOICES {
-            for subgroups in SUBGROUP_CHOICES {
-                // The launched block is `subgroups * subgroup_width`; a
-                // block wider than the device's invocation limit cannot be
-                // created at all.
-                if subgroups.saturating_mul(width) > max_lanes {
+    for vector in VECTOR_CHOICES {
+        for subgroups in SUBGROUP_CHOICES {
+            // The launched block is `subgroups * subgroup_width`; a
+            // block wider than the device's invocation limit cannot be
+            // created at all.
+            if subgroups.saturating_mul(width) > max_lanes {
+                continue;
+            }
+            for cols in COLS_CHOICES {
+                if cols > 1
+                    && (!fixed_subgroup
+                        || cols % subgroups != 0
+                        || cols / subgroups > MAX_COLS_PER_SUBGROUP
+                        || vector * (cols / subgroups) > MAX_UNROLL)
+                {
                     continue;
                 }
-                all.push(v(chunk, vector, subgroups));
+                let cell = v(vector, subgroups, cols);
+                if pin.is_none_or(|p| p == cell) {
+                    all.push(cell);
+                }
+                // Split lane windows: only on the multi-column
+                // structure, and only where runs, gap and width tile
+                // the subgroup's pass exactly (the same divisibility
+                // `verify_l1` holds every domain to). The loop body's
+                // size is unchanged — the window still holds `vector`
+                // elements — so the unroll bound above already applies.
+                if cols <= 1 {
+                    continue;
+                }
+                for parts in PARTS_CHOICES {
+                    if vector % parts != 0 {
+                        continue;
+                    }
+                    let run = vector / parts;
+                    for gap in GAP_CHOICES {
+                        if run == 0
+                            || gap % run != 0
+                            || gap <= run
+                            || (width * run) % gap != 0
+                        {
+                            continue;
+                        }
+                        let cell = w(vector, subgroups, cols, parts, gap);
+                        if pin.is_none_or(|p| p == cell) {
+                            all.push(cell);
+                        }
+                    }
+                }
             }
         }
     }
 
     all.sort_by_key(|q| {
-        let rank = if SEED_CELLS.contains(q) { 0 } else { UNMEASURED };
+        // A seed's position is its rank: the front of the domain is the
+        // exact prefix `sample_points` hands the race, in belief order.
+        let rank = SEED_CELLS
+            .iter()
+            .position(|s| s == q)
+            .map_or(UNMEASURED, |i| i as u8);
         (rank, sgemv_order(q))
     });
 
@@ -74,7 +229,7 @@ mod tests {
     use crate::domains::{DomainCtx, default_planner};
 
     #[test]
-    fn all_21_measured_cells_are_generated() {
+    fn all_measured_cells_are_generated() {
         let caps = apple_caps();
         let cx = DomainCtx::new(&caps, default_planner());
         let domain = sgemv_domain(&cx);
@@ -86,12 +241,50 @@ mod tests {
         }
     }
 
-    /// No shape reaches [`sgemv_domain`], so two calls agree.
+    /// Every domain point is a distinct kernel: with the dead chunk axis
+    /// gone, nothing multiplies a cell into byte-identical copies that
+    /// would each claim a tune record and a race slot.
+    #[test]
+    fn no_duplicate_cells() {
+        let caps = apple_caps();
+        let cx = DomainCtx::new(&caps, default_planner());
+        let domain = sgemv_domain(&cx);
+        let mut seen = std::collections::HashSet::new();
+        for p in &domain.params {
+            assert!(seen.insert(*p), "{p:?} generated twice");
+        }
+    }
+
+    /// The race samples domain indices 0..5: the front five must be the
+    /// five believed-best structures, in seed order.
+    #[test]
+    fn race_prefix_is_the_seed_front() {
+        let caps = apple_caps();
+        let cx = DomainCtx::new(&caps, default_planner());
+        let domain = sgemv_domain(&cx);
+        for (i, seed) in SEED_CELLS.iter().take(5).enumerate() {
+            assert_eq!(&domain.params[i], seed, "rank {i}");
+        }
+    }
+
     #[test]
     fn n_is_not_an_input() {
         let caps = apple_caps();
-        let cx = DomainCtx::new(&caps, default_planner());
-        assert_eq!(sgemv_domain(&cx), sgemv_domain(&cx));
+        let a = legal(
+            Dim::Const(1),
+            Dim::Const(64),
+            Dim::Const(4096),
+            Dtype::F32,
+            &caps,
+        );
+        let b = legal(
+            Dim::Const(1),
+            Dim::Const(65536),
+            Dim::Const(4096),
+            Dtype::F32,
+            &caps,
+        );
+        assert_eq!(a, b);
     }
 
     #[test]

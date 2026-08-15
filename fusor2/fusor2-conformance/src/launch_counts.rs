@@ -2,21 +2,26 @@
 //! non-firing fusion rule into a hard test failure rather than a quiet 5-10x
 //! throughput regression.
 //!
-//! The eight named backward shapes are pinned here: `attention_grads`,
-//! `rms_norm_fused`'s backward and the analytic softmax Jacobian are not
-//! written by hand anywhere in fusor2, so they exist only if a rule mints
-//! them.
+//! The eight named backward shapes are pinned here because those are exactly
+//! the hand-fused kernels this design gives up in exchange for deriving them
+//! by rewrite. `attention_grads`, `rms_norm_fused`'s backward and the analytic
+//! softmax Jacobian are not written by hand anywhere in fusor2; they exist
+//! only if a rule mints them.
 //!
-//! [`NAMED_BACKWARD_PINS`] is not wired to the suite: nothing calls
+//! **[`NAMED_BACKWARD_PINS`] is not wired to the suite yet.** Nothing calls
 //! [`check_pin`] on those eight names, so each `launches: 1` states where its
-//! law must land, not what is measured — `attention_grads` resolves in 17
-//! dispatches. [`BACKWARD_CEILINGS`] is the measured half, and
-//! [`check_ceiling`] is what a case calls.
+//! law must land, not what was measured. Reading the table as a live tripwire
+//! is the one mistake it invites: `attention_grads` resolves in **17**
+//! dispatches today, not 1. [`BACKWARD_CEILINGS`] is the measured half, and
+//! [`check_ceiling`] is what a case can call now.
 //!
-//! [`FORWARD_CEILINGS`] and [`FORWARD_PINS`] are wired and are the shapes
-//! actually guarded.
+//! [`FORWARD_CEILINGS`] and [`FORWARD_PINS`] *are* wired, so the shapes whose
+//! counts a landing law is about to move are the ones actually guarded.
+//!
+//! Owned by W14.
 
-use fusor2::{Session, Tensor};
+use fusor2::{Session, };
+use fusor2::tensor::Dyn as Tensor;
 
 use crate::harness::CaseError;
 
@@ -78,7 +83,12 @@ pub struct Pin {
 /// input gradient are different contractions over the same activation, and
 /// only the epilogue sinks.
 pub const NAMED_BACKWARD_PINS: [Pin; 8] = [
-    // These two fuse through the general fold algebra, not a flash template.
+    // These two named the hand-written flash lowerings until the template was
+    // deleted. It was deleted because it was never selected: `lower_kflash`
+    // was measured unreached across the whole suite, so `KFlash` priced worse
+    // than the composed chain at every shape the rule minted it on. What must
+    // fuse them now is the general fold algebra, and naming a rule that no
+    // longer exists would send the next miss looking for a deleted file.
     Pin {
         name: "attention_grads_kv_single_launch",
         launches: 1,
@@ -133,8 +143,9 @@ pub const NAMED_BACKWARD_SHAPES: [&str; 8] = [
     "conv_epilogue_backward_sunk",
 ];
 
-/// Forward shapes whose whole point is that fusion collapses them to one
-/// dispatch.
+/// Forward counts, ported from the reference's `core/tests/recognition.rs` and
+/// `core/tests/fused_reduce.rs`. These are the shapes whose whole point is
+/// that fusion collapses them to one dispatch.
 pub const FORWARD_PINS: [Pin; 3] = [
     Pin {
         name: "dense_matmul_with_epilogue",
@@ -177,21 +188,50 @@ pub struct Ceiling {
 
 /// Forward shapes whose count the fold laws are expected to collapse.
 ///
-/// `attention_with_lse` measures 6 and must become one: the output and the
-/// log-sum-exp are two slots of one carrier.
+/// `attention_with_lse` measures **6** and must become **one**: the output and
+/// the log-sum-exp are two slots of one carrier, which is strictly better than
+/// the `KFlash` node it replaces, where `FlashOut::Output` and
+/// `FlashOut::LogSumExp` were two separate dispatches.
 ///
-/// Each ceiling is the **larger** of the two backends, so one constant serves
-/// both sessions and the slack on the cheaper one is reported by
-/// [`check_ceiling`] rather than hidden:
+/// Every number here was taken by lowering the ceiling to 1 and reading the
+/// measured value back out of the failure; none is a raised ceiling. Each is
+/// the **larger** of the two backends, so one constant serves both sessions
+/// and the slack on the cheaper one is reported by [`check_ceiling`] rather
+/// than hidden:
 ///
 /// | shape | cpu | gpu | ceiling |
 /// |---|---|---|---|
-/// | `attention_forward` | 5 | 4 | 5 |
-/// | `attention_with_lse` | 6 | 5 | 6 |
+/// | `attention_forward` | 5 | 5 | 5 |
+/// | `attention_with_lse` | 6 | 6 | 6 |
 /// | `attention_causal_forward` | 5 | 5 | 5 |
 ///
-/// `attention_causal_forward` is 5 on both backends: the causal chain's extra
-/// `STRIP` step does not collapse.
+/// **The history, because each step is a different kind of win.** 8 / 10 / 8
+/// the day the hand-written flash template was deleted; 7 / 8 / 7 when
+/// `fusion::MAP_INTO_MAP` landed — elementwise-into-elementwise, which this
+/// compiler assumed it got for free, because `ScalarExpr::compose` is the whole
+/// arithmetic but nothing called it at construction; and 5 / 6 / 5 with the
+/// co-selection pass in `fusor2_cost::extract`, which makes the *compound* move
+/// the single-move climb cannot: adopting one slot view of a fused joint alone
+/// is strictly worse than adopting none, so the `(m, l)` carrier every one of
+/// these graphs already contained was unreachable, not absent.
+///
+/// The three cpu/gpu spreads this table used to carry are gone: at 5 / 6 / 5
+/// **both backends agree on all three shapes**, for the first time.
+///
+/// **GPU is 4 / 5 / 5 now and CPU is still 5 / 6 / 5**, with `fusion::splice`'s
+/// KNOWN GAP closed — it widens an absorbed producer's operands onto a
+/// promoted `space` instead of cloning them at the producer's own rank, so
+/// `ABSORB` reaches the promoted output accumulator instead of
+/// `check_operand_access` discarding the whole fused chain. That step needed
+/// `SaturationBudget::max_rounds` 10 -> 13 (the CPU fixpoint moves to 12
+/// because the unlocked chain is deeper and wider) and the fold-footprint
+/// repair in `fold_scratch_bytes`.
+///
+/// **The ceilings stay at the CPU numbers**, per this table's own rule that
+/// each is the larger of the two backends. The spread is back, and it is the
+/// honest reading: the widening pays on GPU only, and why CPU does not follow
+/// is the next question rather than a number to quote. `attention_causal_forward`
+/// is 5 on both: the causal chain's extra `STRIP` step does not collapse here.
 pub const FORWARD_CEILINGS: [Ceiling; 3] = [
     Ceiling {
         name: "attention_forward",
@@ -217,10 +257,27 @@ pub const FORWARD_CEILINGS: [Ceiling; 3] = [
 ///
 /// [`NAMED_BACKWARD_PINS`] states where `attention_grads` **must** land — one
 /// dispatch — and nothing in the suite calls [`check_pin`] on it, so that 1 is
-/// a target, not a measurement. This table is the measurement.
+/// a target, not a measurement. This table is the measurement, and it is the
+/// difference between "the derived backward is one kernel" (it is not) and
+/// "the derived backward does not get worse than the day the template was
+/// deleted" (it does not).
 ///
-/// The count is 17, taken on `grads_case`'s shape with `dq`, `dk` and `dv`
-/// resolved together. GPU measures 16 and CPU 17, so the ceiling is 17.
+/// The count is **17**, taken on `grads_case`'s shape with `dq`, `dk` and `dv`
+/// resolved together. GPU measures **16** once `fusion::splice` widens onto a
+/// promoted space; CPU still measures 17, so the ceiling stays at 17. It was 30/24 the day
+/// the template was deleted, 29/19 once `fusion::MAP_INTO_MAP` landed, and
+/// 17/17 with `fusor2_cost::extract`'s co-selection pass.
+///
+/// The 10-dispatch CPU/GPU spread this doc used to have to apologise for is
+/// gone, and the reason is worth recording: it was never a backend difference.
+/// The two searches were stopping at different local optima of the *same*
+/// graph, and the states they both could not reach were the ones where a fused
+/// joint's slot views are adopted together. Given that move, they converge.
+///
+/// Deleting `L1::KFlash` did not cost these dispatches. `lower_kflash` was
+/// measured unreached across the whole suite — `KFlash` priced worse than the
+/// composed chain at every shape it was minted on — so the backward never
+/// resolved in one launch while the template existed either.
 pub const BACKWARD_CEILINGS: [Ceiling; 1] = [Ceiling {
     name: "attention_grads_all_three",
     launches: 17,
@@ -240,8 +297,9 @@ pub fn ceiling(name: &str) -> Option<Ceiling> {
 /// Resolve `values` and check the count against the named ceiling.
 ///
 /// **At or below** the ceiling passes: a law that collapses the shape is an
-/// improvement, not a failure. Over the ceiling is a regression, and the
-/// message names both the shape and the law that must have stopped firing.
+/// improvement, not a failure, and four laws are landing against this table at
+/// once. Over the ceiling is a regression and the message names both the
+/// shape and the law that must have stopped firing.
 pub fn check_ceiling(session: &Session, name: &str, values: &[Tensor]) -> Result<(), CaseError> {
     let Some(c) = ceiling(name) else {
         return Err(format!("{name} has no launch ceiling").into());
@@ -284,15 +342,6 @@ pub fn pin(name: &str) -> Option<Pin> {
         .chain(FORWARD_PINS.iter())
         .find(|p| p.name == name)
         .copied()
-}
-
-/// Resolve `values` and check the count against the named pin.
-pub fn check_pin(session: &Session, name: &str, values: &[Tensor]) -> Result<(), CaseError> {
-    let Some(pin) = pin(name) else {
-        return Err(format!("{name} is not a pinned shape").into());
-    };
-    let actual = launches_to_resolve(session, values)?;
-    assert_launches(name, pin.launches, actual)
 }
 
 #[cfg(test)]
@@ -370,7 +419,9 @@ mod tests {
 
     /// `attention_with_lse` must not be cheaper than plain attention forward
     /// once the laws land: `o` and `lse` are two slots of **one** carrier, so
-    /// the two shapes converge on the same single dispatch.
+    /// the two shapes converge on the same single dispatch — which is
+    /// strictly better than `KFlash`, where `FlashOut::Output` and
+    /// `FlashOut::LogSumExp` were two dispatches of two kernels.
     #[test]
     fn the_lse_shape_targets_one_dispatch_like_the_plain_one() {
         let plain = ceiling("attention_forward").expect("attention_forward");

@@ -1,23 +1,29 @@
 //! The const-rank facade's device handle.
 //!
-//! [`crate::session::Device`] is the backend selector, an enum over
-//! `CpuTarget`/`GpuTarget` that a [`Session`] is built from. This `Device` is a
-//! backend plus the session and the graph that values built from it live in, so
+//! [`crate::session::Device`] is the *backend selector* — an enum over
+//! `CpuTarget`/`GpuTarget` that a [`Session`] is built from, and every one of
+//! its constructors returns `Result` because acquiring an adapter can fail.
+//! This `Device` is the layer above it: a backend **plus** the session and the
+//! graph that values built from it live in, so
 //! `Tensor::from_slice(device, [n], xs)` needs no graph argument.
 //!
-//! Every fusor2 value is a node in one e-graph and an op across two graphs is
-//! an error. Constructors that take only a `&Device` build into the graph the
-//! most recent device installed; creating a second device replaces it, so
-//! mixing two devices in one process is unsupported here. The runtime-rank API,
-//! where every constructor names its graph, supports it.
+//! # The ambient graph
+//!
+//! Every fusor2 value is a node in one e-graph, and an op across two graphs is
+//! an error. The const-rank API has constructors that take only a `&Device`
+//! and an [`crate::autograd::Graph::new`] that takes nothing at all, so the
+//! graph has to come from somewhere: it is the one this device installed when
+//! it was created. Creating a second device replaces it, which is why mixing
+//! two devices in one process is not supported here — the runtime-rank API,
+//! where every constructor names its graph, is the one that can.
 //!
 //! Nodes accumulate in that graph for the process lifetime; nothing here
-//! collects them.
+//! collects them. See the crate report.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::graph::{Graph, GraphRef};
-use crate::session::{Device as Backend, Session};
+use crate::session::{Backend, Session};
 use crate::Result;
 
 /// One backend, its session and its graph.
@@ -58,7 +64,8 @@ fn install(graph: &Graph) {
 /// The graph a `&Device`-only constructor builds into.
 ///
 /// # Panics
-/// If no device has been created yet.
+/// If no device has been created yet. That is a program-order bug, not a
+/// runtime condition: nothing can have made a tensor either.
 pub(crate) fn ambient_graph() -> Graph {
     ambient()
         .lock()
@@ -79,14 +86,21 @@ impl Inner {
 impl Device {
     /// The CPU backend. One per process.
     ///
-    /// Re-installs the ambient graph on every call, not just the first:
-    /// `CPU.get_or_init` builds the device once, so a `Device::cpu()` after a
-    /// `Device::gpu_blocking()` would otherwise hand back the CPU device while
-    /// leaving the GPU's graph ambient.
+    /// Re-installs the ambient graph on **every** call, not just the first.
+    /// `CPU.get_or_init` builds the device once, and `Inner::new` — the only
+    /// other place that installs — runs once with it, so without this line a
+    /// `Device::cpu()` after a `Device::gpu_blocking()` would hand back the
+    /// CPU device while leaving the GPU's graph ambient. `Graph::new()` would
+    /// then name the GPU graph and `Tensor::from_slice(&cpu, ..)` the CPU one,
+    /// and an op across the two is an error. "Creating a device installs its
+    /// graph" is the documented rule; the cache must not exempt the second
+    /// call from it.
     ///
     /// # Panics
-    /// If the CPU target cannot be built. [`Device::try_cpu`] is the checked
-    /// spelling.
+    /// If the CPU target cannot be built. Infallible in practice — the CPU
+    /// target allocates no adapter — and the const-rank API is panic-on-error
+    /// throughout, so a `Result` here would be the only one a caller had to
+    /// thread. [`Device::try_cpu`] is the checked spelling.
     pub fn cpu() -> Self {
         let device = CPU
             .get_or_init(|| Self::try_cpu().expect("cpu device"))
@@ -100,8 +114,8 @@ impl Device {
         Ok(Self::Cpu(Cpu(Inner::new(Backend::cpu()?)?)))
     }
 
-    /// The GPU backend, blocking on adapter acquisition. `Err` when there is no
-    /// usable adapter.
+    /// The GPU backend, blocking on adapter acquisition. `Err` when there is
+    /// no usable adapter — the caller is expected to fall back.
     pub fn gpu_blocking() -> Result<Self> {
         Ok(Self::Gpu(Gpu(Inner::new(Backend::gpu_blocking()?)?)))
     }
@@ -109,6 +123,53 @@ impl Device {
     /// The GPU backend, awaiting adapter acquisition.
     pub async fn gpu() -> Result<Self> {
         Ok(Self::Gpu(Gpu(Inner::new(Backend::gpu().await?)?)))
+    }
+
+    /// The device a value in `graph` was built from.
+    ///
+    /// [`crate::Tensor::device`] used to hand back [`Backend`] — a *different
+    /// type* than the `&Device` its constructors take, so `Tensor::zeros(t.device(), ..)`
+    /// did not type-check. A value knows its graph, a graph knows its session
+    /// and a session knows its backend, so the device is recoverable exactly;
+    /// the `Arc<Inner>` this mints wraps the very same session and the very
+    /// same graph handle, so it is the same device by every observable — only
+    /// the wrapper is new.
+    pub(crate) fn of_graph(graph: &GraphRef) -> Self {
+        let inner = Arc::new(Inner {
+            session: graph.session().clone(),
+            graph: Graph::from_handle(graph.clone()),
+        });
+        match inner.session.device() {
+            Backend::Cpu(_) => Self::Cpu(Cpu(inner)),
+            Backend::Gpu(_) => Self::Gpu(Gpu(inner)),
+        }
+    }
+
+    /// A CPU device on a **private** graph, for unit tests.
+    ///
+    /// [`Device::cpu`] is one per process and so is its graph: every test that
+    /// builds a value on it adds nodes to one shared e-graph that is never
+    /// reset. That coupling is not hypothetical. Extraction picks among
+    /// cost-*identical* class members, and `L1::KScatter`'s `ScatterMode`s are
+    /// exactly that — an `OpDef`'s `work` is a function of operand and output
+    /// facts only, so the mode is invisible to the cost model and both price
+    /// the same. There used to be four, and one of them,
+    /// `ScatterMode::OneHotContract`, had no lowering on either backend, so
+    /// which member the tie-break landed on decided whether an unrelated
+    /// test's backward compiled at all: adding seven ambient-graph tests to
+    /// `HEAD`, with no library change, was enough to turn `trainer_surface`'s
+    /// f16 convolution backward red. That member is deleted; the tie-break is
+    /// now between two spellings of one kernel.
+    ///
+    /// A unit test of the const-rank *wrapper* has no business depending on
+    /// that, so it gets its own session and graph. Tests that are genuinely
+    /// about the ambient device keep using [`Device::cpu`] under
+    /// [`test_device_lock`].
+    #[cfg(test)]
+    pub(crate) fn private() -> Self {
+        let session = Session::new(Backend::cpu().expect("cpu backend")).expect("session");
+        let graph = Graph::new(&session);
+        Self::of_graph(graph.handle())
     }
 
     fn inner(&self) -> &Arc<Inner> {
@@ -143,7 +204,7 @@ impl Device {
         self.session().device()
     }
 
-    /// Submit whatever is queued, reporting failure.
+    /// Submit whatever is queued. Errors are reported, not swallowed.
     pub fn try_flush(&self) -> Result<()> {
         self.session().flush()
     }
@@ -221,8 +282,8 @@ pub struct KernelProfileRow {
 
 /// One resolve's timing.
 ///
-/// `span_ms` is `None` when the backend could not time the submission, which is
-/// distinct from a zero-length span.
+/// `span_ms` is `None` when the backend could not time the submission — a
+/// profile with no wall clock is not a zero-length one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KernelProfile {
     pub span_ms: Option<f64>,
@@ -250,18 +311,38 @@ impl KernelProfile {
     }
 }
 
-/// Serializes tests that assert on shared device state (the ambient graph,
-/// launch counts). Correctness of concurrent resolves is
-/// `GraphInner::resolve_lock`'s job. Poisoning is ignored, so a
-/// `#[should_panic]` test holding this lock does not fail every test after it.
+/// Serializes tests that build on the process-wide const-rank device.
+///
+/// [`Device::cpu`] is one device, one [`Session`] and one e-graph for the
+/// whole process, so every `#[test]` that resolves through it is a concurrent
+/// user of one graph. That used to be a correctness hazard as well as a
+/// determinism one: `Session::resolve` held the e-graph lock for saturation
+/// and extraction and then dropped it before dispatching, so two threads
+/// interleaved and a readback could observe a device buffer before the plan
+/// that fills it had run — coming back **zero-filled rather than erroring**.
+/// Measured then: 4 bad readbacks in 640 across 8 threads.
+///
+/// That defect is fixed. `GraphInner::resolve_lock` now makes a whole
+/// resolve — and a `read_back`'s resolve *and* readback together — one
+/// section, and `the_shared_device_survives_concurrent_resolves` drives the
+/// same 8-thread load as an assert rather than as a measurement.
+///
+/// This lock remains for what it was always additionally doing: keeping tests
+/// that assert on *shared* device state (the ambient graph, launch counts)
+/// from observing each other. Poisoning is ignored on purpose — a
+/// `#[should_panic]` test holding it would otherwise fail every test after it,
+/// reporting the lock instead of the bug.
 #[cfg(test)]
 pub(crate) fn test_device_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Turn a `Result` from a fallible builder into a panic naming the op that
-/// produced it. The const-rank API is panic-on-error throughout.
+/// Turn a `Result` from a fallible builder into a panic carrying the error.
+///
+/// The const-rank API is panic-on-error by construction: the trainer that
+/// defines it chains forty tensor ops per expression and handles a `Result`
+/// from none of them. Every panic here names the op that produced it.
 #[track_caller]
 pub(crate) fn ok<T>(what: &str, r: Result<T>) -> T {
     match r {
@@ -287,15 +368,24 @@ mod tests {
     fn a_device_installs_the_ambient_graph() {
         let _serial = crate::device::test_device_lock();
         let d = Device::cpu();
-        // Another test may have installed a GPU device since, so this asserts
-        // only that a graph is installed and this device's handle is live.
+        // Some other test may have installed a GPU device since; what is
+        // asserted is that *a* graph is installed and that this device's is a
+        // live one, not that the two are the same object.
         let _ = ambient_graph();
         assert!(Arc::strong_count(d.handle()) >= 1);
     }
 
     /// `Device::cpu()` installs its graph on every call, not only the first.
-    /// Installing any other graph and calling `cpu()` again brings the CPU
-    /// device's graph back.
+    ///
+    /// The cache (`CPU.get_or_init`) builds the device once, and `Inner::new`
+    /// is the only other installer, so a second `cpu()` used to return the CPU
+    /// device while leaving whatever graph was installed last ambient. Then
+    /// `Graph::new()` and `Tensor::from_slice(&cpu, ..)` name different graphs
+    /// and every op across them errors.
+    ///
+    /// Asserted without a GPU: installing any other graph and calling `cpu()`
+    /// again must bring the CPU device's graph back, and that is the same
+    /// property a GPU would exercise.
     #[test]
     fn a_second_cpu_call_reinstalls_its_own_graph() {
         let _serial = crate::device::test_device_lock();
@@ -305,7 +395,7 @@ mod tests {
             cpu.graph().handle()
         ));
 
-        // Stand in for another device having been created since.
+        // Stand in for "some other device was created since".
         let other = Graph::new(cpu.session());
         install(&other);
         assert!(Arc::ptr_eq(ambient_graph().handle(), other.handle()));
@@ -317,10 +407,19 @@ mod tests {
         );
     }
 
-    /// The const-rank API shares one `Session` and one e-graph process-wide, so
-    /// two threads computing on it resolve one graph. Each thread uses a
-    /// distinct constant, so a result belonging to another thread fails as well
-    /// as an unwritten buffer.
+    /// The const-rank API shares one `Session` and one e-graph process-wide,
+    /// so two threads computing on it are two threads resolving one graph.
+    ///
+    /// This is the load that used to produce silent zeros: `resolve` released
+    /// the e-graph lock between extraction and dispatch, and a readback landing
+    /// in that window found an allocated-but-unwritten buffer, saw nothing in
+    /// flight, and downloaded it. Every value here is checked against the
+    /// arithmetic that produced it, so a zero-filled readback is a failure and
+    /// not a rounding question.
+    ///
+    /// 8 threads x 40 rounds is the shape the defect was measured at (4 bad
+    /// readbacks in 640). Each thread uses a distinct constant so a result
+    /// belonging to another thread fails too, not just an unwritten one.
     #[test]
     fn the_shared_device_survives_concurrent_resolves() {
         let _serial = crate::device::test_device_lock();
@@ -336,7 +435,7 @@ mod tests {
                         let mut wrong = Vec::new();
                         for r in 0..ROUNDS {
                             let k = (t * ROUNDS + r) as f32 + 1.0;
-                            let x = crate::root::typed::Tensor::<1, f32>::from_slice(
+                            let x = crate::Tensor::<1, f32>::from_slice(
                                 &device,
                                 [4],
                                 &[k, k + 1.0, k + 2.0, k + 3.0],

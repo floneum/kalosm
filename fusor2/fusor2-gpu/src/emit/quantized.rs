@@ -3,6 +3,8 @@
 //! Formats are **data**: the per-format decode is the `BlockProgram` that
 //! `fusor2-gguf` supplies as a `BlockEmitFn`, invoked here with a
 //! `BlockDecodeArgs`. Adding Q4_1 is a table row over there, not a kernel here.
+//!
+//! Owned by W8.
 
 use fusor2_gguf::blocks::{BlockDecodeArgs, BlockProgram};
 use fusor2_ir::ir::level2::{
@@ -49,6 +51,13 @@ impl Emitter<'_> {
         };
         let decoded = (program.emit)(&args)
             .map_err(|e| EmitError::Unsupported(format!("{} decode: {e}", program.name)))?;
+        // Aligned-window algebra over the decode's index arithmetic. A
+        // lane's consecutive elements differ only in a small literal added
+        // to an aligned base, so after the rewrite their word and scale
+        // subexpressions are *structurally equal* and the emitter's memo
+        // shares the loads — one word read per window, one scale decode per
+        // group, with the block format never appearing in the rule.
+        let decoded = fusor2_ir::ir::level2::simplify_index(&decoded);
         if decoded.element() != f32_element() {
             return Err(EmitError::Unsupported(format!(
                 "{} decode returned {:?}, expected a scalar f32",
@@ -76,9 +85,13 @@ mod tests {
             data: StorageView {
                 buffer: data.clone(),
                 offset: 0,
+                // An `Rc2` address flattens through the view's **element**
+                // layout — the convention every contraction lowering emits —
+                // so the fixture carries the rank-2 element view, not the
+                // raw word stream it predated the convention with.
                 layout: fusor2_ir::ir::level2::TileLayout::contiguous(
                     fusor2_ir::ir::level2::MemoryLevel::Storage,
-                    &[COLS * LANES],
+                    &[1, COLS * LANES],
                 ),
             },
             fmt: QFmt::Q8_0,

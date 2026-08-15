@@ -1,18 +1,22 @@
 //! The three local-search moves and their incremental deltas.
 //!
 //! Each move's delta is recomputed over only the affected launches, via a
-//! union-find over the realized cut. The accept test is always the exact global
-//! cost; the schedule score orders the `RESCHEDULE` frontier but never gates
-//! candidates, so the whole domain stays reachable.
+//! union-find over the realized cut. **The accept test is always the exact
+//! global cost** — the schedule score orders the `RESCHEDULE` frontier, it
+//! never gates candidates, so the full ~8,300-point domain stays reachable.
 //!
-//! `FLIP` is refused when the node is pinned. An `Effect::InPlace` node is
-//! pinned in `M`: inlining an atomic scatter into two consumers would apply it
-//! twice. Purity is a precondition of the materialization move.
+//! `FLIP` is refused when the node is pinned: an `Effect::InPlace` node is
+//! pinned in `M`, because inlining an atomic scatter into two consumers
+//! doubles the embedding gradient. Purity is a *precondition* of the
+//! materialization move, not an afterthought.
+//!
+//! Owned by W7.
 
 use crate::realize::{self, Realized};
 use fusor2_ir::cost::{CostModel, Picoseconds};
 use fusor2_ir::egraph::{ClassId, EGraph, Id};
 use fusor2_ir::extract::{ExtractBudget, Extraction, Move};
+use fusor2_ir::facts::ValueFacts;
 use fusor2_ir::ir::Op;
 use fusor2_ir::ir::level1::{Effect, L1, SchedPoint, ScheduleDomain};
 use fusor2_ir::shape::Layout;
@@ -32,9 +36,9 @@ pub enum Candidate {
 /// Enough state to revert one move exactly.
 #[derive(Clone, Debug)]
 pub enum Undo {
-    /// `node` and `node_was_materialized` are the new member's own prior
+    /// `node` and `node_was_materialized` are the *new* member's own prior
     /// state: a reselect carries `M` across with the selection, so reverting
-    /// puts the new member's bit back as well as the old selection.
+    /// has to put the new member's bit back as well as the old selection.
     Reselect {
         class: ClassId,
         was: Id,
@@ -51,17 +55,27 @@ pub enum Undo {
     },
 }
 
-/// Memo for the `RESCHEDULE` frontier: the sorted point order per
-/// `(node, context_hash)`, so a sweep does not rescore every contraction's
-/// whole domain.
+/// Memo for the `RESCHEDULE` frontier: the per-point score and the sorted
+/// order, both keyed on `(node, context_hash)`. This is what makes an
+/// ~8,300-point `CoopDomain` affordable — without it every sweep would
+/// rescore the whole domain of every contraction.
 #[derive(Default)]
 pub struct SchedCache {
     order: FxHashMap<(Id, u64), Vec<SchedPoint>>,
+    score: FxHashMap<(Id, SchedPoint, u64), Picoseconds>,
 }
 
 impl SchedCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.score.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.score.is_empty()
     }
 
     /// Points of `id`'s domain, cheapest `node_math` first. The full domain
@@ -74,19 +88,28 @@ impl SchedCache {
         cost: &dyn CostModel,
     ) -> &[SchedPoint] {
         if !self.order.contains_key(&(id, context)) {
-            let domain = match &graph.node(id).op {
+            let node = graph.node(id);
+            let ins: SmallVec<[ValueFacts; 4]> = node
+                .children
+                .iter()
+                .map(|c| graph.facts(*c).clone())
+                .collect();
+            let out = graph.facts(id);
+            let domain = match &node.op {
                 Op::L1(l1) => l1.schedule(),
                 _ => None,
             };
             let mut points: Vec<(Picoseconds, usize, SchedPoint)> = match domain {
                 None | Some(ScheduleDomain::Point) => Vec::new(),
-                Some(d) => {
-                    let scan = realize::DomainScan::new(graph, id, cost);
-                    d.iter()
-                        .enumerate()
-                        .map(|(i, theta)| (scan.price(cost, Some(theta)), i, theta))
-                        .collect()
-                }
+                Some(d) => d
+                    .iter()
+                    .enumerate()
+                    .map(|(i, theta)| {
+                        let s = cost.node_math(node, &ins, out, Some(theta));
+                        self.score.insert((id, theta, context), s);
+                        (s, i, theta)
+                    })
+                    .collect(),
             };
             // Ties break by domain index, so the order is total and stable.
             points.sort_by_key(|(s, i, _)| (*s, *i));
@@ -143,8 +166,9 @@ pub fn candidates(
     match mv {
         Move::Reselect(class) => {
             let current = extraction.sigma.get(&class).copied();
-            // Only runnable members; the verifier rejects an un-lowered `L0`
-            // node outright.
+            // Only runnable members: proposing the un-lowered `L0` node would
+            // be a move the objective cannot distinguish and the verifier
+            // rejects outright.
             let mut members = realize::selectable(graph, class, &cost.facts().caps);
             // lb-ascending, ties by smaller id.
             members.sort_by_key(|m| (lb[m.index()], *m));
@@ -156,7 +180,7 @@ pub fn candidates(
         }
         Move::Flip(node) => {
             let on = !extraction.is_materialized(node);
-            // Only leaving `M` needs a guard: a node cut from a consumer by
+            // Only *leaving* `M` needs a guard. A node cut from a consumer by
             // structure has to land in a buffer whatever it costs, or the
             // consumer's launch reads a value nothing ever wrote.
             let blocked = !on
@@ -171,8 +195,11 @@ pub fn candidates(
             let context = context_hash(graph, realized, node);
             for theta in cache.ordered(graph, node, context, cost) {
                 // A point whose footprint is over the device cap is
-                // unselectable, and `has_legal_point` passes as soon as one
-                // point fits, so the per-point test belongs here too.
+                // unselectable, not merely slow: §4.2 makes a lowering refusal
+                // a hard assert, so offering one lets the climb move onto a
+                // state that mints a crash. `has_legal_point` gates the node
+                // and passes as soon as *one* point fits, so the per-point
+                // test has to be here as well.
                 if !realize::point_is_legal(graph, node, *theta, &cost.facts().caps) {
                     continue;
                 }
@@ -200,7 +227,9 @@ pub fn apply(graph: &EGraph, extraction: &mut Extraction, c: Candidate) -> Optio
             extraction.sigma.insert(class, node);
             // `M` is keyed by node, but the decision it records belongs to the
             // class: a value that had to land in a buffer still has to,
-            // whichever member computes it.
+            // whichever member computes it. Without this, reselecting a root's
+            // class silently un-materializes the root and nothing lands
+            // anywhere.
             if extraction.is_materialized(was)
                 && realize::leaf_role(graph, node) == realize::LeafRole::NotLeaf
             {
@@ -299,19 +328,13 @@ pub fn is_pinned(graph: &EGraph, roots: &[Id], id: Id) -> bool {
     graph.semantics().effect(&graph.node(id).op) != Effect::Pure
 }
 
-/// Everything a schedule score depends on besides the point itself: merged
-/// segment count, epilogue signature, operand layouts and the consumer demand
-/// set. Two occurrences of a node in different surroundings do not share a
-/// memo entry.
+/// Everything a schedule score depends on besides the point itself: the
+/// epilogue signature, operand layouts and the consumer demand set. Two
+/// occurrences of the same node in different surroundings therefore do not
+/// share a memo entry.
 pub fn context_hash(graph: &EGraph, realized: &Realized, node: Id) -> u64 {
     let mut h = FxHasher::default();
     let n = graph.node(node);
-
-    let segments = match &n.op {
-        Op::L1(L1::KMerged(m)) => m.segments().len() as u64,
-        _ => 0,
-    };
-    h.write_u64(segments);
 
     match &n.op {
         Op::L1(L1::KContract { a, b, post, .. }) => {
@@ -366,7 +389,7 @@ fn operand_layouts(op: &Op) -> SmallVec<[Layout; 4]> {
             L1::KContract { a, b, .. } => {
                 out.extend(a.ops.iter().chain(b.ops.iter()).map(|o| o.layout.clone()))
             }
-            L1::KRegion { .. } | L1::KMerged(_) => {}
+            L1::KRegion { .. } => {}
         }
     }
     out
@@ -438,8 +461,13 @@ mod tests {
         assert_eq!(ex.is_materialized(target), before);
     }
 
-    /// `M` is keyed by node but the decision belongs to the class, so the
-    /// incoming member of a `RESELECT` inherits the bit.
+    /// `M` is keyed by node but the decision belongs to the class.
+    ///
+    /// The regression: `RESELECT` swapped `sigma` and left `M` alone, so the
+    /// incoming member arrived unmaterialized. On a root's class that means
+    /// nothing lands in a buffer, `verify_plan`'s clause 6 rejects the
+    /// winner, and step 4 of extraction — the whole local search — turns
+    /// every valid plan it touches into an error.
     #[test]
     fn reselect_carries_the_materialized_bit_across_the_swap() {
         let (g, roots, cheap, dear, class) = crate::realize::testkit::seeded_graph();
@@ -462,7 +490,7 @@ mod tests {
     }
 
     /// Every state one `RESELECT` can reach still derives a plan that
-    /// verifies.
+    /// verifies. This is the assertion the desync above actually broke.
     #[test]
     fn every_reselect_state_still_verifies() {
         let (g, roots, _cheap, _dear, class) = crate::realize::testkit::seeded_graph();

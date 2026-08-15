@@ -1,6 +1,6 @@
 [package]
 name = "fusor2-cost"
-description = "fusor2 picosecond roofline, calibration and the one extraction"
+description = "fusor2 picosecond roofline and the one extraction"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

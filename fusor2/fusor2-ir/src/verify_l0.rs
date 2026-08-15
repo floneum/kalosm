@@ -15,12 +15,14 @@
 //!    duplicates accumulate (normative).
 //! 7. `Dequant`: `shape[-1] % fmt.block_elements == 0`.
 //! 8. Every op's `work` varies with shape.
+//!
+//! Owned by W1.
 
 use crate::carrier::{Carrier, probes_for};
 use crate::contract_spec;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
-use crate::facts::ValueFacts;
+use crate::facts::{ValueFacts, Work};
 use crate::ir::level0::{L0, ScatterCombine};
 use crate::ir::{Level, Op, VerifyCtx};
 use crate::semantics::infer_l0::infer_l0;
@@ -285,20 +287,44 @@ pub fn check_restride_bounds(cx: &VerifyCtx<'_>) -> Result<BoundsProof> {
 /// Two documented exemptions: `Leaf` and `Project` are constant-work by
 /// design, and a node whose work is *zero* at both bindings (an identity
 /// `Map`, a `Restride` over an empty value) genuinely performs no
-/// arithmetic. The tripwire targets a **nonzero constant**.
+/// arithmetic. The tripwire targets a **nonzero constant** — the reference's
+/// `Attention { work: 1 }`.
 fn check_work_varies(cx: &VerifyCtx<'_>, op: &L0) -> Result<()> {
     if matches!(op, L0::Leaf(_) | L0::Project { .. }) {
         return Ok(());
     }
+    // Skip when there is no `Const` dim to double: a fully symbolic binding
+    // is priced at 1 everywhere by construction.
+    let has_const = cx
+        .operands
+        .iter()
+        .chain(std::iter::once(cx.result))
+        .flat_map(|f| f.shape.iter())
+        .any(|d| d.as_const().is_some());
+    if !has_const {
+        return Ok(());
+    }
+
     let node_op = &cx.node.op;
-    if !crate::semantics::work::work_varies(
-        |ins, out| work_of(node_op, ins, out),
-        cx.operands,
-        cx.result,
-    ) {
+    let small = work_of(node_op, cx.operands, cx.result);
+    let doubled_ins: Vec<ValueFacts> = cx.operands.iter().map(doubled).collect();
+    let doubled_out = doubled(cx.result);
+    let large = work_of(node_op, &doubled_ins, &doubled_out);
+
+    if small == large && small != Work::default() {
         return Err(fail(cx, "work() does not vary with shape"));
     }
     Ok(())
+}
+
+fn doubled(f: &ValueFacts) -> ValueFacts {
+    let mut out = f.clone();
+    for d in out.shape.iter_mut() {
+        if let Dim::Const(v) = *d {
+            *d = Dim::Const(v.saturating_mul(2));
+        }
+    }
+    out
 }
 
 fn fail(cx: &VerifyCtx<'_>, msg: impl Into<String>) -> Error {
@@ -307,7 +333,6 @@ fn fail(cx: &VerifyCtx<'_>, msg: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use crate::facts::Work;
     use super::*;
     use crate::device::{Caps, DeviceKind, Limits};
     use crate::dtype::{Dtype, NumericContract, QFmt, QLayout, Splat};
@@ -371,6 +396,8 @@ mod tests {
         verify_l0(&cx)
     }
 
+    // ---- Test 4 ----------------------------------------------------------
+
     #[test]
     fn contract_rejects_a_label_only_in_out_and_a_narrow_accumulator() {
         let bad_spec = EinSpec {
@@ -423,6 +450,8 @@ mod tests {
         check(op, &[f32s(&[3, 4]), f32s(&[5, 4])]).unwrap();
     }
 
+    // ---- Test 8 ----------------------------------------------------------
+
     #[test]
     fn scatter_set_needs_unique_indices() {
         let make = |combine, unique| L0::Scatter {
@@ -439,6 +468,8 @@ mod tests {
         check(make(ScatterCombine::Set, true), &ins).unwrap();
         check(make(ScatterCombine::Add, false), &ins).unwrap();
     }
+
+    // ---- Test 9 ----------------------------------------------------------
 
     #[test]
     fn dequant_block_divisibility() {
@@ -459,6 +490,8 @@ mod tests {
         check(op(QFmt::Q4_0), &[q(QFmt::Q4_0, 32)]).unwrap();
         assert!(check(op(QFmt::Q4_0), &[q(QFmt::Q4_0, 33)]).is_err());
     }
+
+    // ---- Invariant 5 -----------------------------------------------------
 
     #[test]
     fn restride_bounds_are_static_or_masked_and_never_both() {
@@ -494,6 +527,8 @@ mod tests {
         };
         check(honest, &[sym]).unwrap();
     }
+
+    // ---- Invariants 2 and 3 ---------------------------------------------
 
     #[test]
     fn map_shape_identity_and_fold_carrier() {
@@ -642,6 +677,8 @@ mod tests {
         let _ = ArgRemap::identity(1);
     }
 
+    // ---- Test 10's first half -------------------------------------------
+
     #[test]
     fn constant_work_tripwire() {
         // The shape of the check, applied directly: a work row that reports
@@ -659,12 +696,17 @@ mod tests {
             }
         }
         let small = f32s(&[4, 4]);
-        assert!(!crate::semantics::work::work_varies(
+        let large = f32s(&[8, 8]);
+        assert!(!crate::semantics::work::work_is_shape_sensitive(
             constant_work,
-            &[],
-            &small
+            (&[], &small),
+            (&[], &large)
         ));
-        assert!(crate::semantics::work::work_varies(real_work, &[], &small));
+        assert!(crate::semantics::work::work_is_shape_sensitive(
+            real_work,
+            (&[], &small),
+            (&[], &large)
+        ));
 
         // And an `OpDef` carrying that row is what the registry would hold.
         let def = OpDef {
@@ -681,7 +723,11 @@ mod tests {
             lower_per_target: &[],
             effect: crate::ir::level1::Effect::Pure,
         };
-        assert!(!crate::semantics::work::work_varies(def.work, &[], &small));
+        assert!(!crate::semantics::work::work_is_shape_sensitive(
+            def.work,
+            (&[], &small),
+            (&[], &large)
+        ));
     }
 
     #[test]

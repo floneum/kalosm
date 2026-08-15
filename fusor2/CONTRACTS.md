@@ -81,7 +81,7 @@ verify_l0  verify_l1  rule_macro  rules{,::*}  saturate
 | the whole tile dialect + `ArenaPlanner` + `KernelIr` | `ir::level2` | |
 | `Id`, `ClassId`, `EGraph`, `Builder`, `Facts`, `Rule`, `RuleTag`, `Saturate` | `egraph` | |
 | `Caps`, `Limits`, `CoopKind`, `DeviceKind` | `device` | `Limits::default()` is the **WebGPU baseline** |
-| `Picoseconds`, `DeviceFacts`, `LaunchPlan`, `CostModel`, `ShapeStats`, `Calibrate` | `cost` | |
+| `Picoseconds`, `DeviceFacts`, `LaunchPlan`, `CostModel`, `ShapeStats` | `cost` | |
 | `Extraction`, `Move`, `ExtractBudget`, `PlanHash`, `Plan`, `Extractor` | `extract` | |
 | `Artifact`, `Buf`, `Uniforms`, `EmitError`, `LowerCtx`, `Target` | `target` | |
 | `Val`, `Grads`, `Tape`, `AdjointFn`, `AdjointKind`, `Adjoint`, `Autograd` | `autograd` | |
@@ -115,10 +115,6 @@ fn node_math(&self, node: &Node, ins: &[ValueFacts], out: &ValueFacts,
 fn traffic(&self, bytes: u64, rereads: u32) -> Picoseconds;
 fn compile_amortized(&self, plan: PlanHash, expected_reuse: u32) -> Picoseconds;
 fn total(&self, extraction: &Extraction, launches: &[LaunchPlan<'_>]) -> Picoseconds;
-
-// cost::Calibrate
-fn calibrate(&self, target: &dyn Target) -> Result<DeviceFacts>;
-fn seed_facts(&self, caps: &Caps) -> DeviceFacts;
 
 // extract::Extractor — object-safe
 fn lower_bound(&self, graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds>;
@@ -263,14 +259,11 @@ share `AdjointFn`'s shape even where `ADJOINTS` marks them `Structural`.
 
 ```rust
 pub struct Roofline;                      // impl CostModel; Roofline::new(DeviceFacts)
-pub struct Calibrator;                    // impl Calibrate; 7 Bench variants
 pub struct LocalSearch;                   // impl Extractor
 pub struct ReplayMemo;                    // get / insert, keyed on ReplayKey
 
 pub mod facts       { pub fn seed_facts(&Caps) -> DeviceFacts; generic_seed(..); }
 pub mod terms       { dram_ps, math_ps, wg_ps, drain_ps, occupancy_scale, swizzle_ps }
-pub mod cache       { pub struct FactsRecord; pub fn load(&Caps) -> Result<Option<DeviceFacts>>;
-                      pub fn store(&DeviceFacts) -> Result<()>; }
 pub mod lower_bound { pub fn lower_bound(&EGraph, &dyn CostModel) -> Vec<Picoseconds>; }
 pub mod realize     { pub struct Realized; realize(..); launches_of(..); forced_boundary(..); }
 pub mod moves       { pub fn frontier(..); apply(..) -> Option<Undo>; undo(..);
@@ -395,13 +388,13 @@ surgical; none changes semantics.
    as the contract listing specifies. Note the explicit path in impls, because
    `crate::Result` is in scope in most files.
 
-4. **`fusor2-cost::cache` uses a `FactsRecord` mirror struct rather than
-   `Serialize`/`Deserialize` on `DeviceFacts`.** Adding serde derives to
-   `fusor2-ir` would put a serialization format in the contracts crate and would
-   persist `Caps`, letting a stale capability set outlive a driver update. Only
-   the measured rates round-trip; `Caps` is re-probed. `load`/`store` therefore
-   read `&Caps` / `&DeviceFacts`, not a raw fingerprint:
-   `load(&Caps) -> Result<Option<DeviceFacts>>`, `store(&DeviceFacts) -> Result<()>`.
+4. **On-disk formats live in `fusor2-cost` as mirror structs, never as serde
+   derives on `fusor2-ir` types.** `fusor2-ir` has no `serde` dependency at all,
+   and must not gain one: deriving on `DeviceFacts` or `Caps` would put a
+   serialization format in the contracts crate and would persist a capability
+   set, letting a stale one outlive a driver update. `fusor2-cost::tune_cache`
+   is the live instance of the pattern — its `Record`/`Disk` mirrors round-trip
+   the verdicts while `Caps` is always re-probed.
 
 5. **The `rule!` macro ships only the declarative arm** described in §2.4. The
    architecture's structural-pattern form is W2's to add; the declarative arm is
@@ -409,9 +402,9 @@ surgical; none changes semantics.
    three `fusor2-autograd` rules and seven `fusor2-cpu` rules, so it must keep
    working.
 
-6. **Rule constants are `SCREAMING_CASE`** (`FOLD_SPLIT`, `TILE_CONTRACT`, …)
+6. **Rule constants are `SCREAMING_CASE`** (`FOLD_SPLIT`, `TILE_FOLD`, …)
    because `rule!` declares a `const`; the *function* keeps the architecture's
-   lowercase name (`fold_split`, `tile_contract`). `Rule::name` is the constant's
+   lowercase name (`fold_split`, `tile_fold`). `Rule::name` is the constant's
    identifier, so conformance asserts fire on `"FOLD_SPLIT"`.
 
 7. **`Extraction::sigma` is `FxHashMap<ClassId, Id>`.** The architecture's §4.1
@@ -435,7 +428,7 @@ surgical; none changes semantics.
 Everything else — every type, field, method name, trait method signature and
 constant in the contracts listing — is verbatim. In particular `L0`'s ten nodes,
 `L1`'s ten variants, the full L2 dialect, `Layout`'s private fields with derived
-contiguity, `KMerged`'s checked constructor, `Splat`'s bitwise eq/hash, and
+contiguity, `Splat`'s bitwise eq/hash, and
 `Limits::default()`'s WebGPU baseline are exactly as specified.
 
 ---

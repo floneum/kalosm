@@ -9,8 +9,8 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["llm", "llama", "mistral", "agents", "nlp"]
 
 [dependencies]
-fusor2 = { path = "../../fusor2-verified/fusor2" }
-fusor2-gguf = { path = "../../fusor2-verified/fusor2-gguf" }
+fusor2 = { path = "../../fusor2/fusor2" }
+fusor2-gguf = { path = "../../fusor2/fusor2-gguf" }
 kalosm-tokenizer.workspace = true
 
 half = { version = "2.3.1" }

@@ -21,7 +21,7 @@ parking_lot.workspace = true
 lru.workspace = true
 pollster.workspace = true
 wgpu.workspace = true
-naga.workspace = true
+naga = { workspace = true, features = ["wgsl-out"] }
 
 [dev-dependencies]
 # `wgsl-out` is test-only: the single-slot fold golden asserts textual equality

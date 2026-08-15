@@ -3,7 +3,10 @@
 //! **Host syncs are exactly three**: explicit readback, explicit
 //! [`Target::wait`](fusor2_ir::target::Target::wait), and the allocator's cap
 //! retry. Back-pressure on in-flight submissions is a runtime policy here
-//! ([`GpuConfig::max_in_flight_submits`]), applied without the caller asking.
+//! ([`GpuConfig::max_in_flight_submits`]), not a `--drain-every` counter in a
+//! training script.
+//!
+//! Owned by W9.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -11,35 +14,54 @@ use std::time::{Duration, Instant};
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;
+use fusor2_ir::extract::{Plan, PlanHash};
 use fusor2_ir::target::{Artifact, Buf, Uniforms};
 use parking_lot::Mutex;
 
 use crate::pool::{BufferPool, GpuBuffer, READBACK_USAGE};
 use crate::target::GpuConfig;
 
-/// Queues shorter than this never bother with a parallel build cohort.
-pub const MIN_PARALLEL_BUILD_QUEUE: usize = 16;
-/// A build that takes longer than this is "cold" and justifies the cohort.
-pub const COLD_BUILD_THRESHOLD: Duration = Duration::from_millis(1);
-/// A cohort is only worth spawning with at least this many items left.
-pub const MIN_PARALLEL_BUILD_REMAINDER: usize = 4;
-/// Past this many dispatches, one compute pass per dispatch.
+/// Past this many dispatches, passes are chunked to [`PASS_CHUNK`] dispatches.
 pub const PASS_CHUNK_THRESHOLD: usize = 1024;
+/// Dispatches per pass once a plan crosses [`PASS_CHUNK_THRESHOLD`].
+pub const PASS_CHUNK: usize = 512;
 /// Metal's per-submit dispatch chunk past the threshold.
 pub const METAL_SUBMIT_CHUNK: usize = 256;
+/// Chunk submits allowed in flight before the encoder waits for the oldest.
+/// Bounds the working set to `METAL_INFLIGHT_CHUNKS * METAL_SUBMIT_CHUNK`
+/// dispatches' transients without ever draining the queue mid-plan.
+pub const METAL_INFLIGHT_CHUNKS: usize = 2;
 /// `poll_wait` spins in `Poll` mode for this long before blocking.
 pub const POLL_SPIN: Duration = Duration::from_millis(2);
 
+// TEMPORARY PROBE — delete before finishing.
+pub static CHUNK_WAIT_US: AtomicU64 = AtomicU64::new(0);
+pub static POLL_WAIT_US: AtomicU64 = AtomicU64::new(0);
+struct ScopeGuard<F: FnMut()>(F);
+impl<F: FnMut()> Drop for ScopeGuard<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+fn scopeguard<F: FnMut()>(f: F) -> ScopeGuard<F> {
+    ScopeGuard(f)
+}
+
+// ---------------------------------------------------------------------------
 // Chunking policy
+// ---------------------------------------------------------------------------
 
 /// Dispatches packed into one compute pass.
 ///
 /// Consecutive dispatches share a pass until the queue gets long enough that
 /// one giant pass starts costing more in driver-side bookkeeping than the pass
-/// boundaries do.
+/// boundaries do. Past the threshold the pass is *chunked*, not dropped to a
+/// pass per dispatch: a Metal pass boundary costs on the order of a small
+/// kernel, and a 2357-launch decode plan spent ~10x its compute in boundary
+/// overhead when every dispatch owned a pass.
 pub const fn dispatches_per_pass(total: usize) -> usize {
     if total >= PASS_CHUNK_THRESHOLD {
-        1
+        PASS_CHUNK
     } else {
         usize::MAX
     }
@@ -55,22 +77,9 @@ pub fn dispatches_per_submit(total: usize, backend: wgpu::Backend) -> usize {
     }
 }
 
-/// Should the remaining builds move to a parallel cohort?
-///
-/// A serial probe runs first: a short queue stays serial, and a long one stays
-/// serial until one build proves cold. That keeps a warm cache off the thread
-/// pool entirely.
-pub fn should_parallelize_build_remainder(
-    queue_len: usize,
-    remaining: usize,
-    last_build: Duration,
-) -> bool {
-    queue_len >= MIN_PARALLEL_BUILD_QUEUE
-        && remaining >= MIN_PARALLEL_BUILD_REMAINDER
-        && last_build > COLD_BUILD_THRESHOLD
-}
-
+// ---------------------------------------------------------------------------
 // Telemetry
+// ---------------------------------------------------------------------------
 
 /// One kernel's aggregated timing across a resolve.
 #[derive(Clone, Debug, PartialEq)]
@@ -127,7 +136,9 @@ impl KernelProfile {
     }
 }
 
+// ---------------------------------------------------------------------------
 // Command records
+// ---------------------------------------------------------------------------
 
 /// One recorded command, in exact plan order.
 pub enum CommandRecord {
@@ -153,8 +164,52 @@ impl CommandRecord {
     }
 }
 
+/// Which dispatches of a traced resolve get timestamp boundary pairs.
+///
+/// A query set holds at most [`wgpu::QUERY_SET_MAX_QUERIES`] slots — 2048
+/// dispatch pairs — and a decode-sized plan is larger than that, so a plan
+/// that cannot be timed whole is timed *at one dispatch*: two slots around
+/// the live dispatch the tuner asked about. That is exactly the number a
+/// per-launch tuning window wants, and it is the only number such a plan can
+/// yield honestly.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TimingMode<'a> {
+    /// Every live dispatch owns slot pair `(2i, 2i+1)`.
+    All,
+    /// Only live dispatch `i` is timed, into slots `(0, 1)`.
+    Focus(usize),
+    /// The live dispatches named (ascending) own slot pairs in list order:
+    /// the `k`-th named dispatch writes `(2k, 2k+1)`. This is how a plan too
+    /// large for a full query set times a *restructuring* candidate: the
+    /// launches the candidate changed are timed together in one resolve and
+    /// judged as a summed window.
+    Sparse(&'a [usize]),
+    /// TEMPORARY PROBE — delete before finishing. Live dispatches
+    /// `[start, start+n)` own slot pairs `(2(i-start), 2(i-start)+1)`, so a
+    /// plan too large for a full query set can be timed in two halves.
+    Range { start: usize, n: usize },
+}
+
+impl TimingMode<'_> {
+    /// Whether live dispatch `ix` must sit alone in its pass so its boundary
+    /// pair brackets that kernel and nothing else (only meaningful without
+    /// in-pass timestamp writes).
+    fn isolates(&self, ix: usize) -> bool {
+        match self {
+            TimingMode::Focus(f) => *f == ix,
+            TimingMode::Sparse(ixs) => ixs.binary_search(&ix).is_ok(),
+            _ => false,
+        }
+    }
+}
+
 /// A compiled GPU artifact: the pipeline plus its derived binding list.
 pub struct GpuArtifact {
+    /// Process-unique, minted at construction and never reused. The bind
+    /// group cache keys on it: an address would be recycled by the allocator
+    /// the moment an artifact is evicted, and the next artifact at that
+    /// address would inherit its bind groups.
+    pub id: u64,
     pub name: &'static str,
     pub pipeline: Arc<wgpu::ComputePipeline>,
     pub layout: Arc<wgpu::BindGroupLayout>,
@@ -164,7 +219,9 @@ pub struct GpuArtifact {
     pub block: u32,
 }
 
+// ---------------------------------------------------------------------------
 // Launcher
+// ---------------------------------------------------------------------------
 
 /// Owns the encoder, the in-flight submission window and the profile buffer.
 pub struct Launcher {
@@ -185,7 +242,42 @@ pub struct Launcher {
     /// Overwritten rather than queued, so draining it cannot steal a caller's
     /// [`Self::take_kernel_profiles`] telemetry.
     last_profile: Mutex<Option<Vec<f64>>>,
+    /// The plan launch index the next traced resolve should time when the
+    /// plan is too large for a full query set. Take-semantics: consumed by
+    /// the next `dispatch_plan`, cleared with the tuning flag.
+    tuning_focus: Mutex<Option<Vec<usize>>>,
+    /// Bind groups by `(artifact id, bound buffer addresses)`.
+    ///
+    /// A bind group is a pure function of its layout and its buffers, and a
+    /// replayed plan binds the same pooled buffers to the same pipelines
+    /// every dispatch — so building 1,731 fresh ones a decode token was 1.3 ms
+    /// of host time per token with nothing submitted. Correctness rests on
+    /// the [`WeakBuf`]s stored beside the entry: an address identifies a
+    /// buffer only while that buffer is alive, so an entry whose weaks have
+    /// all survived was built from exactly these `Buf`s, and one that has
+    /// lost any is dropped rather than served. Weak handles do not hold the
+    /// buffer, so the pool's `strong_count == 1` recycling is unaffected.
+    bind_groups: Mutex<lru::LruCache<BindGroupKey, BindGroupEntry>>,
 }
+
+/// What a cached bind group was built from.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct BindGroupKey {
+    artifact: u64,
+    buffers: smallvec::SmallVec<[usize; 8]>,
+}
+
+struct BindGroupEntry {
+    /// One per key address, in the same order. Alive means the address still
+    /// names the buffer the group was built from.
+    witnesses: smallvec::SmallVec<[fusor2_ir::target::WeakBuf; 8]>,
+    group: Arc<wgpu::BindGroup>,
+}
+
+/// Bind groups retained. Sized above any one plan's launch count for the same
+/// reason [`crate::target::ARTIFACT_CAPACITY`] is: a plan larger than the
+/// cache evicts its own entries every resolve and never hits.
+const BIND_GROUP_CAPACITY: usize = 16_384;
 
 impl Launcher {
     pub fn new(
@@ -206,6 +298,10 @@ impl Launcher {
             profiles: Mutex::new(Vec::new()),
             tuning: AtomicBool::new(false),
             last_profile: Mutex::new(None),
+            tuning_focus: Mutex::new(None),
+            bind_groups: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(BIND_GROUP_CAPACITY).expect("nonzero"),
+            )),
         }
     }
 
@@ -260,14 +356,15 @@ impl Launcher {
         let record = CommandRecord::Dispatch {
             name: gpu.name,
             pipeline: gpu.pipeline.clone(),
-            bind_group: Arc::new(bind_group),
+            bind_group,
             grid,
         };
-        self.encode_command_records(&[record], None)
+        self.encode_command_records(&[record], None, TimingMode::All)
     }
 
-    /// Upload binding 0. Scalars like the learning rate and the sequence
-    /// length are words here, so neither enters a kernel's identity.
+    /// Upload binding 0. This is the whole of trainer constraints 1 and 2: the
+    /// learning rate and the sequence length are words here, so neither enters
+    /// a kernel's identity.
     pub fn write_uniforms(&self, slot0: &Buf, uniforms: &Uniforms) -> Result<()> {
         let gpu = slot0
             .downcast_ref::<GpuBuffer>()
@@ -292,7 +389,7 @@ impl Launcher {
 
     /// Build the one bind group. Entries are positional against the derived
     /// binding list, so binding order and codegen cannot drift.
-    pub fn bind_group(&self, artifact: &GpuArtifact, binds: &[Buf]) -> Result<wgpu::BindGroup> {
+    pub fn bind_group(&self, artifact: &GpuArtifact, binds: &[Buf]) -> Result<Arc<wgpu::BindGroup>> {
         if binds.len() != artifact.bindings.len() {
             return Err(Error::Device(format!(
                 "kernel {} wants {} bindings, the caller presented {}",
@@ -300,6 +397,27 @@ impl Launcher {
                 artifact.bindings.len(),
                 binds.len()
             )));
+        }
+        let key = BindGroupKey {
+            artifact: artifact.id,
+            buffers: binds.iter().map(Buf::addr).collect(),
+        };
+        {
+            let mut cache = self.bind_groups.lock();
+            match cache.get(&key) {
+                // Every witness alive means every address still names the
+                // buffer this group was built from.
+                Some(entry) if entry.witnesses.iter().all(|w| w.alive()) => {
+                    return Ok(Arc::clone(&entry.group));
+                }
+                // A dead witness means an address was reused: drop the entry
+                // rather than serve a group over a buffer that no longer
+                // exists.
+                Some(_) => {
+                    cache.pop(&key);
+                }
+                None => {}
+            }
         }
         let mut entries = Vec::with_capacity(binds.len());
         for ((binding, _read_only), buf) in artifact.bindings.iter().zip(binds) {
@@ -311,11 +429,19 @@ impl Launcher {
                 resource: gpu.buffer.as_entire_binding(),
             });
         }
-        Ok(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let group = Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(artifact.name),
             layout: &artifact.layout,
             entries: &entries,
-        }))
+        }));
+        self.bind_groups.lock().put(
+            key,
+            BindGroupEntry {
+                witnesses: binds.iter().map(Buf::downgrade).collect(),
+                group: Arc::clone(&group),
+            },
+        );
+        Ok(group)
     }
 
     /// One `wgpu::CommandEncoder` per resolve, consecutive dispatches packed
@@ -329,6 +455,7 @@ impl Launcher {
         &self,
         records: &[CommandRecord],
         timestamps: Option<&wgpu::QuerySet>,
+        mode: TimingMode,
     ) -> Result<()> {
         // A dispatch whose grid contains a zero launches nothing and still
         // costs a pass boundary, so it never reaches the encoder.
@@ -340,10 +467,17 @@ impl Launcher {
             .count();
         let per_submit = dispatches_per_submit(total, self.backend);
 
-        let mut query = 0u32;
+        let mut dispatch_ix = 0usize;
         let mut chunk: Vec<&CommandRecord> = Vec::new();
         let mut dispatches_in_chunk = 0usize;
         let mut submits = 0usize;
+        // Metal only: bound the in-flight working set between chunks of a
+        // giant graph. A *sliding window* over submission indices keeps at
+        // most [`METAL_INFLIGHT_CHUNKS`] chunks outstanding while the host
+        // keeps encoding — a full drain here left the GPU idle for every
+        // chunk's encode time, ~10 times per decode step.
+        let mut pending: std::collections::VecDeque<wgpu::SubmissionIndex> =
+            std::collections::VecDeque::new();
 
         for record in live {
             let is_dispatch = matches!(record, CommandRecord::Dispatch { .. });
@@ -352,17 +486,32 @@ impl Launcher {
                 dispatches_in_chunk += 1;
             }
             if dispatches_in_chunk >= per_submit {
-                query = self.encode_one_submit(&chunk, timestamps, query, total)?;
+                let (ix, submitted) =
+                    self.encode_one_submit(&chunk, timestamps, mode, dispatch_ix, total)?;
+                dispatch_ix = ix;
                 chunk.clear();
                 dispatches_in_chunk = 0;
                 submits += 1;
-                // Metal only: bound the in-flight working set between chunks
-                // of a giant graph.
-                self.poll_wait()?;
+                pending.push_back(submitted);
+                if pending.len() > METAL_INFLIGHT_CHUNKS
+                    && let Some(oldest) = pending.pop_front()
+                {
+                    // TEMPORARY PROBE — delete before finishing.
+                    let __w = Instant::now();
+                    self.device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: Some(oldest),
+                            timeout: None,
+                        })
+                        .map_err(|e| {
+                            Error::Device(format!("device wait failed: {e}"))
+                        })?;
+                    CHUNK_WAIT_US.fetch_add(__w.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
             }
         }
         if !chunk.is_empty() || submits == 0 {
-            self.encode_one_submit(&chunk, timestamps, query, total)?;
+            self.encode_one_submit(&chunk, timestamps, mode, dispatch_ix, total)?;
         }
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         self.apply_back_pressure()
@@ -370,23 +519,45 @@ impl Launcher {
 
     /// One `wgpu::CommandEncoder`, consecutive dispatches packed into as few
     /// compute passes as [`dispatches_per_pass`] allows. Returns the next
-    /// timestamp query index.
+    /// timestamp query index and the submission's index.
     fn encode_one_submit(
         &self,
         records: &[&CommandRecord],
         timestamps: Option<&wgpu::QuerySet>,
-        mut query: u32,
+        mode: TimingMode,
+        mut dispatch_ix: usize,
         total: usize,
-    ) -> Result<u32> {
+    ) -> Result<(usize, wgpu::SubmissionIndex)> {
         let inside_passes = self
             .device
             .features()
             .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
+        // The slot pair one live dispatch writes, if any.
+        let slots = |ix: usize| -> Option<u32> {
+            match mode {
+                TimingMode::All => u32::try_from(ix * 2).ok(),
+                TimingMode::Focus(f) if ix == f => Some(0),
+                TimingMode::Focus(_) => None,
+                TimingMode::Sparse(ixs) => ixs
+                    .binary_search(&ix)
+                    .ok()
+                    .and_then(|k| u32::try_from(k * 2).ok()),
+                TimingMode::Range { start, n } if ix >= start && ix < start + n => {
+                    u32::try_from((ix - start) * 2).ok()
+                }
+                TimingMode::Range { .. } => None,
+            }
+        };
         // A pass writes exactly one boundary pair, so packing dispatches into
         // one pass attributes all of their time to the first and leaves every
         // later slot unwritten. Without in-pass writes, one dispatch per pass
-        // is what makes a sample a property of the kernel.
-        let per_pass = if timestamps.is_some() && !inside_passes {
+        // is what makes a sample a property of the kernel — but only for the
+        // dispatches actually being timed: under `Focus` every other dispatch
+        // batches as if untraced.
+        let per_pass = if timestamps.is_some()
+            && !inside_passes
+            && matches!(mode, TimingMode::All | TimingMode::Range { .. })
+        {
             1
         } else {
             dispatches_per_pass(total)
@@ -427,20 +598,44 @@ impl Launcher {
                 CommandRecord::Dispatch { .. } => {
                     let run_start = at;
                     let mut run_end = at;
+                    // Under `Focus`/`Sparse` without in-pass writes a timed
+                    // dispatch must sit alone in its pass, so its boundary
+                    // pair brackets that kernel and nothing else: the run is
+                    // cut just before it and closed right after it.
+                    let cut_at_focus = timestamps.is_some() && !inside_passes;
                     while run_end < records.len()
                         && matches!(records[run_end], CommandRecord::Dispatch { .. })
                         && run_end - run_start < per_pass
                     {
+                        let this = dispatch_ix + (run_end - run_start);
+                        if cut_at_focus && mode.isolates(this) && run_end > run_start {
+                            break;
+                        }
                         run_end += 1;
+                        if cut_at_focus && mode.isolates(this) {
+                            break;
+                        }
                     }
-                    let writes =
-                        timestamps
-                            .filter(|_| !inside_passes)
-                            .map(|set| wgpu::ComputePassTimestampWrites {
-                                query_set: set,
-                                beginning_of_pass_write_index: Some(query),
-                                end_of_pass_write_index: Some(query + 1),
-                            });
+                    // The pass boundary pair, when this run is the one being
+                    // timed: under `All` with per_pass == 1 the run is a
+                    // single dispatch; under `Focus`/`Sparse` only a run
+                    // holding a timed dispatch (alone, by the cut above)
+                    // writes.
+                    let pass_slot = timestamps
+                        .filter(|_| !inside_passes)
+                        .and_then(|_| slots(dispatch_ix))
+                        .filter(|_| {
+                            matches!(mode, TimingMode::All | TimingMode::Range { .. })
+                                || (mode.isolates(dispatch_ix)
+                                    && run_end - run_start == 1)
+                        });
+                    let writes = pass_slot.and_then(|q| {
+                        timestamps.map(|set| wgpu::ComputePassTimestampWrites {
+                            query_set: set,
+                            beginning_of_pass_write_index: Some(q),
+                            end_of_pass_write_index: Some(q + 1),
+                        })
+                    });
                     let mut pass =
                         encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                             label: Some("fusor2 resolve"),
@@ -457,21 +652,24 @@ impl Launcher {
                             unreachable!("the run is all dispatches");
                         };
                         pass.push_debug_group(name);
-                        if let Some(set) = timestamps
+                        let in_pass_slot = timestamps
+                            .filter(|_| inside_passes)
+                            .and_then(|_| slots(dispatch_ix));
+                        if let (Some(set), Some(q)) = (timestamps, in_pass_slot)
                             && inside_passes
                         {
-                            pass.write_timestamp(set, query);
+                            pass.write_timestamp(set, q);
                         }
                         pass.set_pipeline(pipeline);
                         pass.set_bind_group(0, bind_group.as_ref(), &[]);
                         pass.dispatch_workgroups(grid[0], grid[1], grid[2]);
-                        if let Some(set) = timestamps
+                        if let (Some(set), Some(q)) = (timestamps, in_pass_slot)
                             && inside_passes
                         {
-                            pass.write_timestamp(set, query + 1);
+                            pass.write_timestamp(set, q + 1);
                         }
                         pass.pop_debug_group();
-                        query = query.saturating_add(2);
+                        dispatch_ix += 1;
                         self.dispatches.fetch_add(1, Ordering::Relaxed);
                     }
                     drop(pass);
@@ -479,8 +677,8 @@ impl Launcher {
                 }
             }
         }
-        self.queue.submit([encoder.finish()]);
-        Ok(query)
+        let submitted = self.queue.submit([encoder.finish()]);
+        Ok((dispatch_ix, submitted))
     }
 
     /// Block only when the in-flight submission count exceeds the library's
@@ -496,6 +694,11 @@ impl Launcher {
     /// Spin in `Poll` mode for [`POLL_SPIN`], then block.
     pub fn poll_wait(&self) -> Result<()> {
         self.poll_waits.fetch_add(1, Ordering::Relaxed);
+        // TEMPORARY PROBE — delete before finishing.
+        let __w = Instant::now();
+        let _g = scopeguard(move || {
+            POLL_WAIT_US.fetch_add(__w.elapsed().as_micros() as u64, Ordering::Relaxed);
+        });
         let deadline = Instant::now() + POLL_SPIN;
         while Instant::now() < deadline {
             match self.device.poll(wgpu::PollType::Poll) {
@@ -527,7 +730,7 @@ impl Launcher {
                 dst_offset: 0,
                 bytes,
             };
-            self.encode_command_records(&[record], None)?;
+            self.encode_command_records(&[record], None, TimingMode::All)?;
         }
         let gpu = staging
             .downcast_ref::<GpuBuffer>()
@@ -638,6 +841,28 @@ impl Launcher {
     /// Turn the per-dispatch timestamp path on for a tuning pass.
     pub fn set_tuning(&self, on: bool) {
         self.tuning.store(on, Ordering::Relaxed);
+        if !on {
+            *self.tuning_focus.lock() = None;
+        }
+    }
+
+    /// Whether a plan of `dispatches` launches can carry a full per-dispatch
+    /// query set. Past this, only [`TimingMode::Focus`] can time anything.
+    pub fn can_time_whole(&self, dispatches: usize) -> bool {
+        u32::try_from(dispatches.saturating_mul(2))
+            .is_ok_and(|count| count > 0 && count <= wgpu::QUERY_SET_MAX_QUERIES)
+    }
+
+    /// Ask the next traced resolve to time the launches at these **plan
+    /// indices** (ascending) when the plan is too large to time whole.
+    /// Take-semantics. One index is the classic focused launch; several is a
+    /// restructuring candidate's changed window, timed together.
+    pub fn set_tuning_focus(&self, launch_ixs: Option<Vec<usize>>) {
+        *self.tuning_focus.lock() = launch_ixs;
+    }
+
+    pub fn take_tuning_focus(&self) -> Option<Vec<usize>> {
+        self.tuning_focus.lock().take()
     }
 
     /// Whether this resolve must carry timestamps.
@@ -663,7 +888,9 @@ impl Launcher {
     }
 }
 
+// ---------------------------------------------------------------------------
 // Parallel build cursor
+// ---------------------------------------------------------------------------
 
 /// A shared cursor a build cohort drains. Every compiled artifact lives behind
 /// a `OnceLock` on the cached kernel, so racing workers can only duplicate
@@ -683,11 +910,56 @@ impl BuildCursor {
     }
 }
 
+/// A DOT rendering of the realized launch DAG.
+///
+/// Nodes are launches, edges are the buffers one launch writes and another
+/// reads, so the picture is the plan the extractor committed to rather than an
+/// approximation of it.
+pub fn graphvis_dot(plan: &Plan) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("digraph plan {\n  rankdir=TB;\n");
+    for (i, launch) in plan.launches.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "  L{i} [label=\"{} root={} grid={:?} block={}\"];",
+            i, launch.root, launch.grid, launch.block
+        );
+    }
+    for (i, producer) in plan.launches.iter().enumerate() {
+        for (j, consumer) in plan.launches.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            for w in producer
+                .bindings
+                .iter()
+                .filter(|b| b.kind != fusor2_ir::extract::BindKind::Read)
+            {
+                if consumer.bindings.iter().any(|r| r.value == w.value) {
+                    let _ = writeln!(out, "  L{i} -> L{j} [label=\"{}\"];", w.value);
+                }
+            }
+        }
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// The plan's cache key — the `gpu_key` / `key` replacement. The plan **is**
+/// the key, so there is no `hash_kernel_fields` to thread a new decision
+/// variable into.
+pub const fn plan_key(plan: &Plan) -> PlanHash {
+    plan.hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+
+    // -----------------------------------------------------------------------
     // Adapter-gated. These skip cleanly when no GPU is present.
+    // -----------------------------------------------------------------------
 
     fn baseline_launcher() -> Option<Launcher> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -715,9 +987,9 @@ mod tests {
         ))
     }
 
-    /// A resolve that reads nothing back records zero `poll_wait` calls below
-    /// the `max_in_flight_submits` threshold. Above it the library applies
-    /// back-pressure on its own.
+    /// Test 12: a resolve that reads nothing back records zero `poll_wait`
+    /// calls below the `max_in_flight_submits` threshold. Above it the
+    /// library — not the training script — applies back-pressure.
     #[test]
     fn zero_readback_step_never_blocks() {
         let Some(launcher) = baseline_launcher() else {
@@ -726,7 +998,7 @@ mod tests {
         };
         let window = launcher.config().max_in_flight_submits;
         for _ in 0..window {
-            launcher.encode_command_records(&[], None).unwrap();
+            launcher.encode_command_records(&[], None, TimingMode::All).unwrap();
         }
         assert_eq!(
             launcher.poll_wait_count(),
@@ -735,7 +1007,7 @@ mod tests {
         );
 
         // One submission past the window and the library blocks on its own.
-        launcher.encode_command_records(&[], None).unwrap();
+        launcher.encode_command_records(&[], None, TimingMode::All).unwrap();
         assert_eq!(
             launcher.poll_wait_count(),
             1,
@@ -752,7 +1024,7 @@ mod tests {
             return;
         };
         assert_eq!(launcher.dispatch_count(), 0);
-        launcher.encode_command_records(&[], None).unwrap();
+        launcher.encode_command_records(&[], None, TimingMode::All).unwrap();
         assert_eq!(
             launcher.dispatch_count(),
             0,
@@ -760,45 +1032,17 @@ mod tests {
         );
     }
 
-    /// The three `should_parallelize_build_remainder` cases.
-    #[test]
-    fn parallel_build_probe() {
-        // A short queue stays serial no matter how cold the build was.
-        assert!(!should_parallelize_build_remainder(
-            8,
-            8,
-            Duration::from_millis(50)
-        ));
-        // A long queue whose builds are all warm stays serial too.
-        assert!(!should_parallelize_build_remainder(
-            64,
-            60,
-            Duration::from_micros(10)
-        ));
-        // A long queue with a cold build and work left goes parallel.
-        assert!(should_parallelize_build_remainder(
-            64,
-            60,
-            Duration::from_millis(5)
-        ));
-    }
-
-    #[test]
-    fn a_cold_build_with_no_remainder_stays_serial() {
-        assert!(!should_parallelize_build_remainder(
-            64,
-            MIN_PARALLEL_BUILD_REMAINDER - 1,
-            Duration::from_millis(5)
-        ));
-    }
-
-    /// 2048 dispatches on Metal encode as 2048 passes across 8 submits; 512
-    /// dispatches encode as one pass and one submit.
+    /// Test 13: 2048 dispatches on Metal encode as 2048 passes across 8
+    /// submits; 512 dispatches encode as one pass and one submit.
     #[test]
     fn pass_and_submit_chunking() {
-        assert_eq!(dispatches_per_pass(2048), 1);
+        assert_eq!(dispatches_per_pass(2048), PASS_CHUNK);
         assert_eq!(dispatches_per_submit(2048, wgpu::Backend::Metal), 256);
-        assert_eq!(2048 / dispatches_per_pass(2048), 2048, "one pass each");
+        assert_eq!(
+            2048 / dispatches_per_pass(2048),
+            2048 / PASS_CHUNK,
+            "chunked passes, never one pass per dispatch"
+        );
         assert_eq!(
             2048_usize.div_ceil(dispatches_per_submit(2048, wgpu::Backend::Metal)),
             8,
@@ -861,4 +1105,49 @@ mod tests {
         assert!((p.top_names[1].max_us - 30.0).abs() < 1e-9);
     }
 
+    #[test]
+    fn plan_key_is_the_plan_hash() {
+        let plan = Plan {
+            extraction: Default::default(),
+            launches: Vec::new(),
+            buffers: Vec::new(),
+            symbols: Vec::new(),
+            hash: PlanHash(0xabc),
+            cost: Default::default(),
+        };
+        assert_eq!(plan_key(&plan), PlanHash(0xabc));
+    }
+
+    #[test]
+    fn graphvis_names_every_launch() {
+        use fusor2_ir::egraph::Id;
+        use fusor2_ir::extract::{BindKind, BindingPlan, Launch};
+        let launch = |root: u32, value: u32, kind: BindKind| Launch {
+            root: Id(root),
+            members: Default::default(),
+            bindings: vec![BindingPlan {
+                binding: 1,
+                value: Id(value),
+                kind,
+            }],
+            grid: [1, 1, 1],
+            block: 256,
+        };
+        let plan = Plan {
+            extraction: Default::default(),
+            launches: vec![
+                launch(1, 7, BindKind::Write),
+                launch(2, 7, BindKind::Read),
+            ],
+            buffers: Vec::new(),
+            symbols: Vec::new(),
+            hash: PlanHash(0),
+            cost: Default::default(),
+        };
+        let dot = graphvis_dot(&plan);
+        assert!(dot.starts_with("digraph plan {"));
+        assert!(dot.contains("L0"));
+        assert!(dot.contains("L1"));
+        assert!(dot.contains("L0 -> L1"), "the write/read edge must appear");
+    }
 }

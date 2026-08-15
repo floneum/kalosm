@@ -1,10 +1,13 @@
 //! Sampling. These are inference-only, have no adjoint, and enter through
-//! `L1::Ext` + an `OpDef` with one declared cost row.
+//! `L1::Ext` + an `OpDef` with one declared cost row — no core file changes.
+//!
+//! Owned by W13.
 //!
 //! Everything here is built out of ordinary facade ops on the caller's graph,
 //! so a draw is a lazy device value: [`standard::sample`] resolves nothing and
-//! hands back a `U32` token tensor a decode loop can consume directly. The
-//! shapes are matmuls against dense constants rather than broadcasts.
+//! hands back a `U32` token tensor a decode loop can consume directly. See
+//! [`row`] for why the shapes are all matmuls against dense constants rather
+//! than broadcasts.
 
 pub mod mirostat2;
 pub(crate) mod row;
@@ -18,9 +21,10 @@ pub use top_k::{GpuSampledToken, top_k_pairs};
 #[cfg(test)]
 pub(crate) mod test_support {
     use crate::graph::GraphRef;
+    // The backend selector, by module path — see the note in `composite.rs`.
     // `Graph` and `Dtype` are not what `typed-api` switches, so they keep the
     // root spelling.
-    use crate::session::{Device, Session};
+    use crate::session::{Backend, Session};
     use crate::tensor::Tensor;
     use crate::{Dtype, Graph};
 
@@ -29,7 +33,7 @@ pub(crate) mod test_support {
     /// A CPU session, a graph and one uploaded f32 row. The session and graph
     /// are returned because dropping them would take the tensor with them.
     pub(crate) fn cpu_row(values: &[f32]) -> (Session, Graph, Tensor) {
-        let session = Session::new(Device::cpu().expect("a cpu device")).expect("a session");
+        let session = Session::new(Backend::cpu().expect("a cpu device")).expect("a session");
         let graph = Graph::new(&session);
         let t = upload(graph.handle(), values);
         (session, graph, t)

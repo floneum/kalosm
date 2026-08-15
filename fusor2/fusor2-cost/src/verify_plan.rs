@@ -1,6 +1,6 @@
-//! The hard conformance assert on the extraction winner.
+//! `verify_plan` — the hard conformance assert on the extraction winner.
 //!
-//! Seven clauses, each an [`Error::Plan`], never a silent fallback:
+//! Six clauses, each an [`Error::Plan`], **never** a silent fallback:
 //!
 //! 1. every selected non-`Leaf` node is at `Level::L1`;
 //! 2. `theta` is a member of the node's `ScheduleDomain`, the geometry's own
@@ -13,11 +13,13 @@
 //! 5. no `Effect::InPlace` node is inlined;
 //! 6. every root is in `M`, and every `L1::Ext` node can actually run
 //!    somewhere;
-//! 7. every launch's bind group — its operands plus the `Uniforms` block —
+//! 7. every launch's bind group — its operands **plus the `Uniforms` block** —
 //!    fits `max_storage_buffers_per_shader_stage`.
+//!
+//! Owned by W7.
 
 use crate::plan::UNKNOWN_SYM;
-use crate::realize::{self, tiles_for};
+use crate::realize::{self, scalar_element, tiles_for};
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
 use fusor2_ir::egraph::{EGraph, Id};
@@ -35,13 +37,78 @@ use rustc_hash::FxHashMap;
 pub fn verify_plan(graph: &EGraph, plan: &Plan) -> Result<()> {
     check_levels(graph, plan)?;
     check_operands(graph, plan)?;
+    check_operand_spaces(graph, plan)?;
     check_buffers(graph, plan)?;
     check_effect_pinning(graph, plan)?;
     check_roots(graph, plan)?;
     Ok(())
 }
 
-/// All seven clauses. The schedule clause needs the exact planner and the caps
+/// Clause 8: a selected `KFold`'s aliased operands must be addressable by
+/// the fold's own flat index map.
+///
+/// The fold lowerings (both backends) read every operand at every space
+/// point by running the *flat space index* through the operand's own layout
+/// map, unmasked — unlike a `KMap`, whose body may select which operand
+/// contributes per coordinate (`cat`, `pad`), a fold has nowhere to hide a
+/// misaddressed read. That map is exact when the operand is
+///
+/// * a single element (no space-dependent term at all),
+/// * stated over the space itself — full rank, each extent equal to the
+///   space's (a stride-0 axis is a broadcast) or `1`, or
+/// * a **suffix** of the space: each layout dim equal to the corresponding
+///   trailing space dim, so the flat map's divisor/modulus chain lands on
+///   the same coordinates (`weights[n]` under `[m, n]`).
+///
+/// Anything else is read at garbage addresses by every strategy of every
+/// backend. Rule minting does not verify (`Builder::add_l1` is a plain graph
+/// add), and the fold spelling of a matmul carried rank-2 `[m, k]` aliases
+/// under its rank-4 `[b, m, n, k]` space for exactly as long as nothing
+/// between the rule and the dispatch enforced this — extraction shipped it
+/// on the CPU the moment its cost looked best, and the value at `[0,0,0]`
+/// was `a[0,:]·b[0,:]`. This is the static legality bound that makes such a
+/// member fail loudly on every plan, race candidates included, instead of
+/// computing a wrong value.
+pub fn check_operand_spaces(graph: &EGraph, plan: &Plan) -> Result<()> {
+    use fusor2_ir::ir::level1::AccessPlan;
+    for id in selected(plan) {
+        let Op::L1(L1::KFold { space, ops, .. }) = &graph.node(id).op else {
+            continue;
+        };
+        for (i, o) in ops.iter().enumerate() {
+            if o.access != AccessPlan::Alias {
+                continue;
+            }
+            let shape = o.layout.shape();
+            let single = shape.iter().all(|d| d.known_eq(Dim::Const(1)));
+            if single {
+                continue;
+            }
+            let full_rank = shape.len() == space.rank()
+                && shape
+                    .iter()
+                    .zip(&space.dims)
+                    .all(|(l, d)| l.known_eq(*d) || l.known_eq(Dim::Const(1)));
+            let suffix = shape.len() < space.rank()
+                && shape
+                    .iter()
+                    .zip(&space.dims[space.rank() - shape.len()..])
+                    .all(|(l, d)| l.known_eq(*d) || l.known_eq(Dim::Const(1)));
+            if !(full_rank || suffix) {
+                return Err(Error::Plan(format!(
+                    "selected {id}: fold operand {i} aliases a {:?} layout under the \
+                     {:?} index space; the fold's flat index map cannot address it. \
+                     The rule that minted this member states its operands over the \
+                     wrong space — fix the rule, do not route around the member.",
+                    shape, space.dims
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// All six clauses. The schedule clause needs the exact planner and the caps
 /// it was admitted against; the extension clause needs the registry the
 /// e-graph's semantics were built with.
 pub fn verify_plan_with(
@@ -61,9 +128,19 @@ pub fn verify_plan_with(
 /// Clause 7: every launch's bind group fits
 /// `max_storage_buffers_per_shader_stage`.
 ///
-/// The uniform block counts against the limit: `plan::derive_bindings`
-/// reserves binding 0 for `Uniforms` and does not list it, but the block is
-/// emitted in the `storage` address space. The bound is `bindings.len() + 1`.
+/// **The uniform block is one of them.** `plan::derive_bindings` reserves
+/// binding 0 for `Uniforms` and does not list it, but that block is emitted in
+/// the `storage` address space (`fusor2_gpu::bindings` walks storage globals
+/// and requires binding 0 to be the read-only `Uniforms` buffer), so it counts
+/// against the limit like any other. The bound is therefore
+/// `bindings.len() + 1`, and the off-by-one is exactly what let a plan with
+/// eight listed bindings reach `create_bind_group_layout` needing nine.
+///
+/// This is the last line, not the first: `fusion::storage_bindings` is what
+/// keeps the search from *building* such a launch. A rule that widens an
+/// operand list without consulting it lands here instead of in wgpu's
+/// validator, which is the difference between an `Error::Plan` naming the
+/// launch and a panic inside a scoped thread.
 pub fn check_bind_groups(plan: &Plan, caps: &Caps) -> Result<()> {
     let limit = caps.limits.max_storage_buffers_per_shader_stage as usize;
     for (i, launch) in plan.launches.iter().enumerate() {
@@ -85,8 +162,9 @@ pub fn check_bind_groups(plan: &Plan, caps: &Caps) -> Result<()> {
 /// Clause 1: every selected non-leaf node is at L1 — nothing skipped a level.
 pub fn check_levels(graph: &EGraph, plan: &Plan) -> Result<()> {
     for id in selected(plan) {
-        // The same predicate the seed and the move generator select against, so
-        // a violation here means no rule ever lowered the class.
+        // The same predicate the seed and the move generator select against,
+        // so a violation here means no rule ever lowered the class — not that
+        // the search disagreed with the verifier about what "runnable" means.
         if !realize::is_runnable(graph, id) {
             return Err(Error::Plan(format!(
                 "selected {id} is at {} but only L1 nodes are runnable",
@@ -109,6 +187,20 @@ pub fn check_schedules(
     let max_storage = caps.limits.max_compute_workgroup_storage_size;
 
     for id in selected(plan) {
+        // Every lowering indexes the flattened iteration space in u32 —
+        // flat workgroup ids, linear addresses, loop counters — so a space
+        // past u32::MAX is unaddressable, not slow: the fold spelling of a
+        // 2048-cube matmul is 2^33 flat indices and wraps. An addressing
+        // bound like the bind-group limit, checked on every plan the device
+        // will run, race candidates included.
+        if let Op::L1(l1) = &graph.node(id).op
+            && let Some(iters) = l1.iter_space().iterations()
+            && iters > u64::from(u32::MAX)
+        {
+            return Err(Error::Plan(format!(
+                "{id} iterates {iters} elements, past u32 flat addressing"
+            )));
+        }
         let domain = match &graph.node(id).op {
             Op::L1(l1) => l1.schedule(),
             _ => None,
@@ -150,7 +242,7 @@ pub fn check_schedules(
             _ => {}
         }
         let lanes = realize::fold_footprint(graph, id).map(|(l, _)| l);
-        let tiles = tiles_for(Some(theta), graph.facts(id).dtype.scalar_element(), lanes, caps);
+        let tiles = tiles_for(Some(theta), scalar_element(graph.facts(id).dtype), lanes, caps);
         let bytes = arena.workgroup_bytes(&tiles, caps)?;
         if bytes > max_storage {
             return Err(Error::Plan(format!(
@@ -211,10 +303,20 @@ pub fn check_buffers(graph: &EGraph, plan: &Plan) -> Result<()> {
         }
         for (axis, stride) in b.layout.strides().iter().enumerate() {
             if *stride == Dim::Sym(UNKNOWN_SYM) {
-                return Err(Error::Plan(format!(
-                    "buffer for {} has an underivable stride on axis {axis}",
-                    b.value
-                )));
+                // A `row_major_strides` placeholder is legal exactly when it
+                // is derivable at dispatch: the product of every following
+                // extent, each of which must be a constant or a bindable
+                // symbol. `UniformPack::resolve_stride` is the runtime half
+                // of this bound.
+                let derivable = b.layout.shape()[axis + 1..]
+                    .iter()
+                    .all(|d| !matches!(d, Dim::Sym(s) if *s == UNKNOWN_SYM));
+                if !derivable {
+                    return Err(Error::Plan(format!(
+                        "buffer for {} has an underivable stride on axis {axis}",
+                        b.value
+                    )));
+                }
             }
         }
     }
@@ -348,7 +450,7 @@ mod tests {
             .unwrap();
         verify_plan(&g, &plan).unwrap();
 
-        // Force the pin open, as only a broken extractor could.
+        // Force the pin open the way only a broken extractor could.
         plan.extraction.m.set(sc.index(), false);
         assert!(matches!(verify_plan(&g, &plan), Err(Error::Plan(_)),));
     }
@@ -386,8 +488,11 @@ mod tests {
         ));
     }
 
-    /// Clause 7 counts the `Uniforms` block: a launch with `limit` listed
-    /// bindings needs `limit + 1` storage buffers and is rejected.
+    /// Clause 7 counts the `Uniforms` block, and that is the whole point of
+    /// it: `derive_bindings` does not list binding 0, so a launch with
+    /// `limit` listed bindings needs `limit + 1` storage buffers and dies in
+    /// `create_bind_group_layout`. A plan exactly *at* the limit must be
+    /// rejected here, not one over it.
     #[test]
     fn verify_plan_rejects_a_bind_group_that_forgot_the_uniform_block() {
         use fusor2_ir::extract::{BindKind, BindingPlan};

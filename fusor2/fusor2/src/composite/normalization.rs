@@ -1,11 +1,14 @@
-//! softmax x5, rms_norm x4, layer_norm x2. All macro ops over `Fold` + `Map`,
-//! refused into one launch by `fold_split` + `map_into_fold` rather than by a
+//! softmax, rms_norm and layer_norm. All macro ops over `Fold` + `Map`, refused
+//! into one launch by `fold_split` + `map_into_fold` rather than by a
 //! hand-written fused kernel.
 //!
-//! The five softmax spellings share **one** `defn`; `softmax*` mint a sugar
-//! node over it and `softmax_slow*` return the bare expansion. That is the
-//! entire semantic difference between them — there is no second kernel and no
-//! route to pick.
+//! Every softmax spelling shares **one** `defn`, under a sugar node minted in
+//! the same call. There is no second kernel and no route to pick, which is why
+//! the `*_fused` aliases and the `softmax_slow*` hook that used to sit here are
+//! deleted: a name that returns the bare expansion hands the caller a member id
+//! instead of the union spine, which is strictly worse to fuse from.
+//!
+//! Owned by W13.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt, accum_dtype};
 use fusor2_ir::autograd::{Tape, Val};
@@ -16,11 +19,13 @@ use crate::composite::{MacroAttr, MacroOp, NormKind, core_op, macro_op};
 use crate::graph::GraphRef;
 use crate::tensor::Tensor;
 
+// ---------------------------------------------------------------------------
 // Definitional expansions
+// ---------------------------------------------------------------------------
 
 /// `exp(x - max) / sum(exp(x - max))` over `axis`.
 ///
-/// Five entry points share this. One launch comes from `fold_split` plus
+/// Every entry point shares this. One launch comes from `fold_split` plus
 /// `map_into_fold`, never from a kernel that spells softmax.
 pub(crate) fn softmax_defn(t: &mut GraphTape<'_>, x: Val, axis: u32) -> Result<Val> {
     let shape = t.shape_of(x);
@@ -183,7 +188,9 @@ fn last_axis(graph: &GraphRef, x: &Tensor) -> Result<u32> {
         .ok_or_else(|| Error::Shape("a rank-0 value has no last axis".into()))
 }
 
+// ---------------------------------------------------------------------------
 // The tensor surface
+// ---------------------------------------------------------------------------
 
 impl Tensor {
     /// Softmax over `axis`, as a macro op: the sugar node carries the axis so
@@ -203,32 +210,6 @@ impl Tensor {
         self.softmax(last_axis(&self.graph, self)?)
     }
 
-    /// Alias for [`Tensor::softmax_last_dim`]: there is no fused kernel to
-    /// select, only `fold_split` plus `map_into_fold`.
-    pub fn softmax_last_dim_fused(&self) -> Result<Tensor> {
-        self.softmax_last_dim()
-    }
-
-    /// The bare expansion, with no sugar node over it. The only difference
-    /// from [`Tensor::softmax`] is that no rule can read an attribute off it.
-    pub fn softmax_slow(&self, axis: u32) -> Result<Tensor> {
-        let x = self.id;
-        core_op(&self.graph, |t| softmax_defn(t, x, axis))
-    }
-
-    pub fn softmax_slow_last_dim(&self) -> Result<Tensor> {
-        self.softmax_slow(last_axis(&self.graph, self)?)
-    }
-
-    /// Alias for [`Tensor::softmax_slow_last_dim`].
-    pub fn softmax_slow_last(&self) -> Result<Tensor> {
-        self.softmax_slow_last_dim()
-    }
-
-    pub fn softmax_last(&self) -> Result<Tensor> {
-        self.softmax_last_dim()
-    }
-
     pub fn log_softmax(&self, axis: u32) -> Result<Tensor> {
         let x = self.id;
         core_op(&self.graph, |t| log_softmax_defn(t, x, axis))
@@ -243,16 +224,14 @@ impl Tensor {
         self.rms_norm_inner(None, None, eps)
     }
 
-    pub fn rms_norm_fused(&self, weight: &Tensor, bias: &Tensor, eps: f32) -> Result<Tensor> {
+    /// [`Tensor::rms_norm`] with a learned shift as well as a scale. A distinct
+    /// node, not a `*_fused` spelling: `bias` is an operand the expansion reads.
+    pub fn rms_norm_with_bias(&self, weight: &Tensor, bias: &Tensor, eps: f32) -> Result<Tensor> {
         self.rms_norm_inner(Some(weight), Some(bias), eps)
     }
 
-    pub fn rms_norm_fused_no_bias(&self, weight: &Tensor, eps: f32) -> Result<Tensor> {
-        self.rms_norm_inner(Some(weight), None, eps)
-    }
-
     /// The transformer block boundary: `rms_norm(x + residual)`.
-    pub fn rms_norm_residual_fused(
+    pub fn rms_norm_residual(
         &self,
         residual: &Tensor,
         weight: &Tensor,
@@ -309,7 +288,7 @@ impl Tensor {
     }
 
     /// `(x - mean) / sqrt(var + eps) * weight + bias` over the last axis.
-    /// `remove_mean == false` is the RMS-like spelling.
+    /// `remove_mean == false` is the RMS-like spelling the reference keeps.
     pub fn layer_norm(
         &self,
         weight: &Tensor,
@@ -336,17 +315,6 @@ impl Tensor {
         )
     }
 
-    /// Alias for [`Tensor::layer_norm`] with mean removal; the launch count is
-    /// the extractor's answer, not this function's.
-    pub fn layer_norm_last_dim_fused(
-        &self,
-        weight: &Tensor,
-        bias: &Tensor,
-        eps: f32,
-    ) -> Result<Tensor> {
-        self.layer_norm(weight, Some(bias), eps, true)
-    }
-
     /// `mean(x^2)`-free variance over the last axis, for callers that want the
     /// statistic rather than the normalized value.
     pub fn variance_last(&self) -> Result<Tensor> {
@@ -367,14 +335,14 @@ impl Tensor {
 mod tests {
     use super::*;
     use crate::graph::Graph;
-    use crate::session::{Device, Session};
+    use crate::session::{Backend, Session};
     use fusor2_ir::dtype::Dtype;
     use fusor2_ir::ir::Op;
     use fusor2_ir::ir::level1::L1;
     use fusor2_ir::shape::Dim;
 
     fn graph() -> Graph {
-        Graph::new(&Session::new(Device::cpu().unwrap()).unwrap())
+        Graph::new(&Session::new(Backend::cpu().unwrap()).unwrap())
     }
 
     fn x(g: &Graph, shape: &[u64]) -> Tensor {
@@ -387,17 +355,7 @@ mod tests {
         let g = graph();
         let a = x(&g, &[2, 8]);
         let sugar = a.softmax_last_dim().unwrap();
-        let fused = a.softmax_last_dim_fused().unwrap();
-        let slow = a.softmax_slow_last_dim().unwrap();
         let by_axis = a.softmax(1).unwrap();
-
-        // Hash-consing folds the four identical expansions into one node, so
-        // the bare `slow` id is a member of the sugared class.
-        let members = g.handle().with_egraph(|eg| {
-            Ok(eg.members(eg.class_of(sugar.id())))
-        }).unwrap();
-        assert!(members.contains(&slow.id()), "{members:?}");
-        assert_eq!(sugar.id(), fused.id());
         assert_eq!(sugar.id(), by_axis.id());
     }
 
@@ -442,7 +400,7 @@ mod tests {
         let b = g.leaf("b", &[Dim::Const(4)], Dtype::F32).unwrap();
         for y in [
             a.rms_norm(&w, 1e-5).unwrap(),
-            a.rms_norm_fused(&w, &b, 1e-5).unwrap(),
+            a.rms_norm_with_bias(&w, &b, 1e-5).unwrap(),
             a.layer_norm(&w, Some(&b), 1e-5, true).unwrap(),
             a.layer_norm(&w, Some(&b), 1e-5, false).unwrap(),
         ] {

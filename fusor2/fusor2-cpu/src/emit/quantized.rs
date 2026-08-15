@@ -2,12 +2,14 @@
 //! runs — the decode tables are shared, only the emitter differs.
 //!
 //! **There is no per-format code in this file.** A `Source::Quantized` load is
-//! rewritten at *compile* time into ordinary `TileExpr`s by calling
+//! rewritten at *compile* time into ordinary `TileExpr`s by calling W11's
 //! `BlockProgram::emit`, and the resulting tree is compiled by the same tape
 //! builder as everything else. That is what makes a lazy per-element
 //! dequantize inside a fused expression a *fusion alternative* rather than a
 //! materialization: the decode nodes simply become part of the consumer's
 //! tape.
+//!
+//! Owned by W10.
 
 use fusor2_gguf::blocks::BlockDecodeArgs;
 use fusor2_ir::ir::level2::{ElementType, QuantizedView, ScalarElement, TileExpr};

@@ -2,15 +2,18 @@
 //! pending-children counter, dispatching each node through [`crate::ADJOINTS`]
 //! and accumulating into a per-value gradient slot.
 //!
-//! The walk needs the primal's topology, which [`Tape`] does not expose since
-//! a tape only writes. [`backward_into`] snapshots it and is the one-call
-//! form for frontends.
+//! The walk needs the primal's *topology*, which [`Tape`] deliberately does
+//! not expose — a tape only writes. [`Reverse`] therefore carries a cheap
+//! snapshot taken with [`Reverse::over`]; [`backward_into`] is the one-call
+//! form every frontend should use.
+//!
+//! Owned by W5.
 
 use crate::adjoints::adjoint_of;
 use crate::custom::CustomRegistry;
 use crate::structural::structural_adjoint;
 use crate::tape::GraphTape;
-use fusor2_ir::autograd::{AdjointKind, Grads, Tape, Val};
+use fusor2_ir::autograd::{Adjoint, AdjointKind, Autograd, Grads, Tape, Val};
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::{Dtype, NumericContract};
 use fusor2_ir::egraph::{EGraph, Id};
@@ -19,6 +22,7 @@ use fusor2_ir::ir::{Children, Node, Op};
 use fusor2_ir::{Error, Result};
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// A read-only snapshot of the primal graph's structure.
 ///
@@ -47,8 +51,10 @@ impl Topology {
                 &node.op,
                 Op::L0(L0::Leaf(LeafKind::Param { .. } | LeafKind::Buffer { .. }))
             );
-            // Only a float leaf is differentiable. An index buffer is `U32`,
-            // and `Gather`'s adjoint hands it `None`.
+            // Only a float leaf is differentiable. An index buffer is `U32`
+            // and `Gather`'s adjoint correctly hands it `None`; marking it
+            // requires-grad would starve it and turn every embedding
+            // backward into an error.
             *slot = external && graph.facts(id).dtype.is_float();
             nodes.push(node.clone());
             numeric.push(graph.facts(id).numeric);
@@ -82,9 +88,16 @@ impl Topology {
         self.dtype[id.index()]
     }
 
-    /// An externally supplied leaf is where `requires_grad` originates;
-    /// everything else is derived. A float `Buffer` or `Param` qualifies; a
-    /// `Leaf::Const` splat and any integer leaf do not.
+    /// An **externally supplied** leaf is where `requires_grad` originates;
+    /// everything else is derived, never annotated.
+    ///
+    /// A float `Buffer` or `Param` qualifies, matching the reference's
+    /// split: `Graph::leaf` — which is what `Tensor::from_slice` and
+    /// `Graph::tensor` mint — carries `requires_grad = true`, and only
+    /// `Graph::constant` (a `Leaf::Const` splat) does not. Restricting the
+    /// origin to `Param` would make `d loss / d x` for any uploaded input
+    /// come back empty, which is every finite-difference gradient check
+    /// there is. An integer leaf is an index, never a differentiable value.
     pub fn is_param(&self, id: Val) -> bool {
         self.is_param[id.index()]
     }
@@ -92,8 +105,9 @@ impl Topology {
     /// Operands the adjoint walk descends into.
     ///
     /// A `Union` in the forward means a macro op's `defn` was unioned with
-    /// its sugar at construction. Autograd runs pre-saturation and descends
-    /// into operand 0 only, so the adjoint is taken over one class member.
+    /// its sugar at construction. Autograd runs pre-saturation, so it
+    /// descends into operand 0 only — the adjoint is taken once, over one
+    /// member of the class.
     pub fn operands(&self, id: Val) -> Children {
         let node = &self.nodes[id.index()];
         match node.op {
@@ -103,21 +117,77 @@ impl Topology {
     }
 }
 
+/// The shipped autograd.
+#[derive(Default, Debug, Clone)]
+pub struct Reverse {
+    topo: Option<Arc<Topology>>,
+    custom: Option<Arc<CustomRegistry>>,
+}
+
+impl Reverse {
+    /// A `Reverse` with no topology. [`Autograd::backward`] on it reports
+    /// that it needs one; use [`Reverse::over`] or [`backward_into`].
+    pub const fn new() -> Self {
+        Self {
+            topo: None,
+            custom: None,
+        }
+    }
+
+    /// Snapshot `graph`'s structure so the walk can descend it.
+    pub fn over(graph: &EGraph) -> Self {
+        Self {
+            topo: Some(Arc::new(Topology::of(graph))),
+            custom: None,
+        }
+    }
+
+    pub fn topology(&self) -> Option<&Topology> {
+        self.topo.as_deref()
+    }
+}
+
+impl Autograd for Reverse {
+    fn adjoints(&self) -> &'static [Adjoint] {
+        crate::adjoints::ADJOINTS
+    }
+
+    fn backward(
+        &self,
+        tape: &mut dyn Tape,
+        root: Val,
+        seed: Val,
+        wrt: &[Val],
+    ) -> Result<Vec<Option<Val>>> {
+        let topo = self.topo.as_deref().ok_or_else(|| {
+            Error::Plan(
+                "Reverse needs the primal topology: `Tape` exposes no children, \
+                 so build it with Reverse::over(&graph) or call backward_into"
+                    .into(),
+            )
+        })?;
+        walk(topo, self.custom.as_deref(), tape, root, seed, wrt)
+    }
+}
+
 /// Build the backward for `root` into the same graph the forward lives in,
 /// and return one gradient per entry of `wrt`.
 ///
-/// Every returned entry is a real gradient: a `wrt` that receives none is an
-/// `Err` naming it, never a `None`.
+/// Every returned entry is `Some`: a `wrt` that receives no gradient is an
+/// `Err` naming it, never a `None` the caller has to interpret. The `Option`
+/// survives only because [`Autograd::backward`] is declared with it.
 ///
-/// The caller then calls `graph.add_root(g)` for every produced gradient, so
-/// forward and backward are one graph with one root set.
+/// The caller then calls `graph.add_root(g)` for every produced gradient:
+/// forward and backward are one graph with one root set, which is what makes
+/// "save this activation" versus "recompute it" the extractor's
+/// materialization bit rather than a checkpointing pass anybody writes.
 pub fn backward_into(
     graph: &mut EGraph,
     caps: &Caps,
     root: Id,
     seed: Id,
     wrt: &[Id],
-) -> Result<Vec<Id>> {
+) -> Result<Vec<Option<Id>>> {
     backward_into_with(graph, caps, root, seed, wrt, &CustomRegistry::default())
 }
 
@@ -129,12 +199,21 @@ pub fn backward_into_with(
     seed: Id,
     wrt: &[Id],
     custom: &CustomRegistry,
-) -> Result<Vec<Id>> {
+) -> Result<Vec<Option<Id>>> {
     let topo = Topology::of(graph);
     let mut tape = GraphTape::new(graph);
     walk(&topo, Some(custom), &mut tape, root, seed, wrt)
 }
 
+/// Reverse topological order of the primal subgraph reaching `root`. Ids are
+/// monotone, so this is a descending id scan — no DFS, no visited stack
+/// beyond one bitset. Reachability is applied by the caller.
+pub fn reverse_order(root: Val, len: usize) -> Vec<Val> {
+    let top = (root.index() + 1).min(len);
+    (0..top).rev().map(|i| Id(i as u32)).collect()
+}
+
+// ----------------------------------------------------------------- the walk
 
 fn walk(
     topo: &Topology,
@@ -143,7 +222,7 @@ fn walk(
     root: Val,
     seed: Val,
     wrt: &[Val],
-) -> Result<Vec<Val>> {
+) -> Result<Vec<Option<Val>>> {
     let n = topo.len();
     if root.index() >= n {
         return Err(Error::Plan(format!("backward root {root} is not in the graph")));
@@ -152,7 +231,7 @@ fn walk(
         return Ok(Vec::new());
     }
 
-    // Reachability from the root.
+    // 1. Reachability from the root.
     let mut reach = vec![false; n];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -165,9 +244,15 @@ fn walk(
         }
     }
 
-    // `requires_grad` is derived, not annotated: a node requires grad iff it
-    // is a `Param` leaf, it is named in `wrt`, or any operand does. Children
-    // are strictly smaller, so one ascending pass is a fixpoint.
+    // 2. `requires_grad` is derived, not annotated: a node requires grad iff
+    //    it is a `Param` leaf, it is named in `wrt`, or any operand does.
+    //    Children are strictly smaller, so one ascending pass is a fixpoint.
+    //
+    //    `wrt` seeds the set as much as `Param` does. Asking for `d loss/d x`
+    //    *is* the declaration that `x` requires a gradient — otherwise
+    //    `backward_with`'s explicit set could only ever name a subset of the
+    //    parameters and every gradient check against an uploaded input would
+    //    silently come back empty.
     let mut needs = vec![false; n];
     for w in wrt {
         if w.index() < n
@@ -190,16 +275,16 @@ fn walk(
         }
     }
     if !needs[root.index()] {
-        // Nothing on the tape from any `wrt` to the root; every requested
-        // value is reported by name.
+        // Nothing on the tape from any `wrt` to the root. That is never a
+        // silent empty answer: every requested value is reported by name.
         return Err(first_missing(topo, &reach, &needs, wrt, &FxHashMap::default())
             .unwrap_or_else(|| {
                 Error::Plan(format!("backward from {root} reached no requires-grad value"))
             }));
     }
 
-    // One pending counter per requires-grad edge. A node fires exactly once,
-    // with the fully accumulated adjoint.
+    // 3. One pending counter per requires-grad edge. A node fires exactly
+    //    once, with the fully accumulated adjoint.
     let mut pending = vec![0u32; n];
     for i in 0..n {
         if !reach[i] || !needs[i] {
@@ -212,8 +297,8 @@ fn walk(
         }
     }
 
-    // FIFO worklist, seeded at the root. FIFO plus operand-slot order makes
-    // the emitted node ids identical run to run.
+    // 4. FIFO worklist, seeded at the root. FIFO plus operand-slot order is
+    //    what makes the emitted node ids identical run to run.
     let mut grads: FxHashMap<Id, Val> = FxHashMap::default();
     grads.insert(root, seed);
     let mut queue: VecDeque<Id> = VecDeque::new();
@@ -244,14 +329,18 @@ fn walk(
         }
     }
 
-    // Every requested value must have received a gradient, and a missing one
-    // is reported by name.
+    // 5. Every requested value must have received a gradient, and it is
+    //    reported by name. `Option` in the return type is what let a missing
+    //    gradient look like a legitimate zero for as long as it did: the
+    //    caller sees `None`, cannot tell "this value is not on the tape" from
+    //    "a rule dropped this operand", and reads the second as the first.
     if let Some(e) = first_missing(topo, &reach, &needs, wrt, &grads) {
         return Err(e);
     }
 
-    // Every other reachable requires-grad node must have one too: a rule that
-    // omits a requires-grad parent starves its whole subgraph.
+    // Every *other* reachable requires-grad node must have one too: a rule
+    // that omits a requires-grad parent starves its whole subgraph, which is
+    // an error rather than a silent zero even when nobody asked for it.
     for i in 0..n {
         let id = Id(i as u32);
         if reach[i] && needs[i] && !grads.contains_key(&id) {
@@ -259,8 +348,7 @@ fn walk(
         }
     }
 
-    // The starvation check above guarantees every entry of `wrt` is present.
-    Ok(wrt.iter().map(|v| grads[v]).collect())
+    Ok(wrt.iter().map(|v| grads.get(v).copied()).collect())
 }
 
 /// The first requested value that received no gradient, as the error naming
@@ -401,27 +489,38 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_reverse_reports_that_it_needs_a_topology() {
+        let mut g = graph();
+        let x = param(&mut g, &[2]);
+        let s = ones(&mut g, &[2]);
+        let mut tape = GraphTape::new(&mut g);
+        let err = Reverse::new().backward(&mut tape, x, s, &[x]).unwrap_err();
+        assert!(matches!(err, Error::Plan(_)));
+    }
+
+    #[test]
     fn a_leaf_root_returns_its_own_seed() {
         let mut g = graph();
         let x = param(&mut g, &[2]);
         let s = ones(&mut g, &[2]);
         let got = backward_into(&mut g, &caps(), x, s, &[x]).unwrap();
-        assert_eq!(got, vec![s]);
+        assert_eq!(got, vec![Some(s)]);
     }
 
     #[test]
     fn a_constant_wrt_is_an_error_that_names_it() {
         let mut g = graph();
-        // `ones` is a `Leaf::Const` — the one leaf spelling that carries
-        // `requires_grad = false`.
+        // `ones` is a `Leaf::Const` — the reference's `Graph::constant`, the
+        // one leaf spelling that carries `requires_grad = false`.
         let x = ones(&mut g, &[2]);
         let y = {
             let mut t = GraphTape::new(&mut g);
             t.unary(UnOp::Exp, x).unwrap()
         };
         let s = ones(&mut g, &[2]);
-        // Asking for `d y / d constant` is an error that names the value and
-        // says why, rather than a `None` indistinguishable from an adjoint bug.
+        // Asking for `d y / d constant` used to come back `Ok([None])`, which
+        // is the same answer an adjoint bug gives. It is now an error that
+        // names the value and says which of the two it is.
         let err = backward_into(&mut g, &caps(), y, s, &[x]).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains(&x.to_string()), "{msg} must name {x}");
@@ -441,7 +540,7 @@ mod tests {
         };
         let s = ones(&mut g, &[4]);
         let got = backward_into(&mut g, &caps(), y, s, &[x]).unwrap();
-        let dx = got[0];
+        let dx = got[0].expect("a Buffer leaf is trainable");
 
         // d/dx (exp(x) * x) = exp(x) * (x + 1).
         let vals = vec![0.25f32, -1.5, 0.75, 2.0];
@@ -468,7 +567,7 @@ mod tests {
         };
         let s = ones(&mut g, &[3]);
         let got = backward_into(&mut g, &caps(), y, s, &[h]).unwrap();
-        let dh = got[0];
+        let dh = got[0].expect("an interior value named in wrt is seeded");
 
         // d(h*h)/dh = 2h = 2 sin(x).
         let vals = vec![0.3f32, -0.8, 1.1];
@@ -519,10 +618,10 @@ mod tests {
         assert!(backward_into(&mut g, &caps(), x, s, &[]).unwrap().is_empty());
     }
 
-    /// The whole point of the `Err`: the caller gets one gradient per `wrt`
-    /// entry, so a dropped adjoint cannot hide behind a shorter answer.
+    /// The whole point of the `Err`: every entry the caller does get back is
+    /// populated, so `unwrap()` on it cannot hide a dropped adjoint.
     #[test]
-    fn every_wrt_entry_gets_a_gradient() {
+    fn every_returned_entry_is_populated() {
         let mut g = graph();
         let a = buffer(&mut g, &[2]);
         let b = param(&mut g, &[2]);
@@ -532,7 +631,7 @@ mod tests {
         };
         let s = ones(&mut g, &[2]);
         let got = backward_into(&mut g, &caps(), y, s, &[a, b]).unwrap();
-        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(Option::is_some));
     }
 
     /// `y = f(x) + g(x)`: the diamond must fire each rule once, with the
@@ -552,11 +651,13 @@ mod tests {
         let s = ones(&mut g, &[4]);
         let before = g.len();
         let got = backward_into(&mut g, &caps(), y, s, &[x, ex, sx]).unwrap();
-        assert_eq!(got.len(), 3, "x, ex and sx all receive an adjoint");
+        assert!(got[0].is_some(), "x receives the summed adjoint");
+        assert!(got[1].is_some());
+        assert!(got[2].is_some());
         assert!(g.len() > before);
 
         // The gradient reaching `x` is an accumulation of exactly two terms.
-        let dx = got[0];
+        let dx = got[0].unwrap();
         match &g.node(dx).op {
             Op::L0(L0::Map { ins, .. }) => assert_eq!(ins.len(), 2),
             other => panic!("expected an accumulating Map, got {other:?}"),
@@ -576,7 +677,8 @@ mod tests {
         };
         let s = ones(&mut g, &[3]);
         let got = backward_into(&mut g, &caps(), y, s, &[h, x]).unwrap();
-        assert_eq!(got.len(), 2);
+        assert!(got[0].is_some());
+        assert!(got[1].is_some());
     }
 
     #[test]
@@ -601,11 +703,11 @@ mod tests {
         let s = ones(&mut g, &[4, 5]);
         let got = backward_into(&mut g, &caps(), y, s, &[x, w]).unwrap();
         assert_eq!(
-            g.facts(got[0]).shape,
+            g.facts(got[0].unwrap()).shape,
             Dims::from_slice(&[Dim::Const(4), Dim::Const(3)])
         );
         assert_eq!(
-            g.facts(got[1]).shape,
+            g.facts(got[1].unwrap()).shape,
             Dims::from_slice(&[Dim::Const(3), Dim::Const(5)])
         );
     }
@@ -622,7 +724,7 @@ mod tests {
         };
         let s = ones(&mut g, &[4]);
         let got = backward_into(&mut g, &caps(), y, s, &[x]).unwrap();
-        let dx = got[0];
+        let dx = got[0].expect("starvation is impossible: a comparison yields zeros");
         assert!(matches!(
             g.node(dx).op,
             Op::L0(L0::Leaf(LeafKind::Const { .. }))
@@ -641,7 +743,7 @@ mod tests {
         let s = ones(&mut g, &[2]);
         let got = backward_into(&mut g, &caps(), y, s, &[x]).unwrap();
         assert_eq!(
-            g.facts(got[0]).shape,
+            g.facts(got[0].unwrap()).shape,
             Dims::from_slice(&[Dim::Const(2), Dim::Const(8)])
         );
     }
@@ -660,7 +762,7 @@ mod tests {
         let u = g.union(sugar, defn).unwrap();
         let s = ones(&mut g, &[4]);
         let got = backward_into(&mut g, &caps(), u, s, &[x]).unwrap();
-        assert_eq!(got.len(), 1);
+        assert!(got[0].is_some());
     }
 
     #[test]
@@ -680,12 +782,20 @@ mod tests {
         };
         assert_eq!(build(), build());
     }
+
+    #[test]
+    fn reverse_order_is_a_descending_id_scan() {
+        assert_eq!(
+            reverse_order(Id(2), 5),
+            vec![Id(2), Id(1), Id(0)]
+        );
+    }
 }
 
 #[cfg(test)]
 mod train_xor {
-    //! A 2-4-1 MLP trained by plain gradient descent, run entirely inside this
-    //! crate using only [`crate::ADJOINTS`].
+    //! M1's acceptance shape, run entirely inside this crate: a 2-4-1 MLP
+    //! trained by plain gradient descent using only [`crate::ADJOINTS`].
     //!
     //! Every gradient here comes from the seven-row table — the contraction
     //! adjoint for both matmuls, the `Map` differentiator for `tanh` and the
@@ -776,6 +886,10 @@ mod train_xor {
 
         let params = [w1, b1, w2, b2];
         let grads = backward_into(&mut g, &caps(), sq, seed, &params).unwrap();
+        let grad_ids: Vec<Id> = grads
+            .iter()
+            .map(|o| o.expect("every parameter receives a gradient"))
+            .collect();
 
         let mut env: Env = FxHashMap::default();
         env.insert(x, vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
@@ -801,7 +915,7 @@ mod train_xor {
 
         let lr = 0.05f32;
         for _ in 0..4000 {
-            let step: Vec<Vec<f32>> = grads.iter().map(|gid| eval(&g, *gid, &env)).collect();
+            let step: Vec<Vec<f32>> = grad_ids.iter().map(|gid| eval(&g, *gid, &env)).collect();
             for (p, d) in params.iter().zip(&step) {
                 let slot = env.get_mut(p).unwrap();
                 for (v, dv) in slot.iter_mut().zip(d) {
@@ -815,6 +929,7 @@ mod train_xor {
             "xor did not converge: {start} -> {end}"
         );
 
+        // Every output is on the right side of 0.5.
         let out = eval(&g, o_pre, &env);
         let _ = out;
     }

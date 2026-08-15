@@ -1,16 +1,19 @@
-//! Hash-consed L2 term builders, shared by both emitters. Structural sharing
-//! comes from hash-consing the whole L2 term, so two identical subtrees built
-//! separately merge. Hash-consing is scope-free: there is no loop-boundary
-//! snapshot/restore.
+//! Hash-consed L2 term builders, shared by both emitters. `Shared` is deleted
+//! from the dialect: structural sharing comes from hash-consing the whole L2
+//! term, so two identical subtrees built separately merge — which `Rc::as_ptr`
+//! memoization structurally cannot do. There is therefore no loop-boundary
+//! snapshot/restore either: hash-consing is scope-free.
 //!
-//! Declarations are not interned. Two same-shaped tiles stay distinct so the
-//! arena knows they are two allocations, so `alloc_tile`/`alloc_local`/
+//! **Declarations are not interned.** Two same-shaped tiles must stay distinct
+//! so the arena knows they are two allocations, so `alloc_tile`/`alloc_local`/
 //! `alloc_buffer` each mint a fresh `Arc` and push it to an ordered list.
+//!
+//! Owned by W3.
 
 use fusor2_ir::dtype::{NumericContract, RoundMode};
 use fusor2_ir::ir::level2::{
     Accumulator, Addr, Buffer, BufferAccess, BufferDecl, Builtin, CoopMatrixRole,
-    CoopSrc, ElementType, KernelIr, Local, LocalDecl, MemoryLevel, ReduceKind, ScalarElement,
+    CoopSrc, ElementType, KernelIr, Local, LocalDecl, ReduceKind, ScalarElement,
     Source, Stmt, StorageView, Tile, TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileExprKind,
     TileLayout, TileLiteral, TileReduceOp, TileUnaryOp,
 };
@@ -18,11 +21,6 @@ use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-
-/// The largest finite value WGSL can spell. WGSL has no infinite literal and
-/// naga rejects a module holding one, so every `-inf` sentinel is spelled as
-/// this instead; `exp(x - m)` underflows to zero against it just the same.
-pub const WGSL_SAFE_F32_MAX: f32 = 3.40282e38;
 
 type SmallVecTiles = SmallVec<[Tile; 4]>;
 type SmallVecLocals = SmallVec<[Local; 4]>;
@@ -75,6 +73,10 @@ impl TileBuilder {
     pub fn new() -> Self {
         Self::default()
     }
+
+    // -----------------------------------------------------------------
+    // Declarations — never interned
+    // -----------------------------------------------------------------
 
     /// A fresh workgroup/private tile. Two same-shaped tiles stay distinct.
     pub fn alloc_tile(&mut self, element: ElementType, layout: TileLayout) -> Tile {
@@ -138,6 +140,10 @@ impl TileBuilder {
         self.exprs.len()
     }
 
+    // -----------------------------------------------------------------
+    // The hash-cons
+    // -----------------------------------------------------------------
+
     /// Intern one node. Collisions are resolved by comparing the full
     /// [`TileExprKind`]; the hash alone is never trusted.
     pub fn expr(&mut self, kind: TileExprKind, ty: ElementType) -> TileExpr {
@@ -164,6 +170,10 @@ impl TileBuilder {
         self.expr(kind, ty)
     }
 
+    // -----------------------------------------------------------------
+    // Typed value constructors
+    // -----------------------------------------------------------------
+
     pub fn lit(&mut self, value: TileLiteral) -> TileExpr {
         self.infer_expr(TileExprKind::Literal(value))
     }
@@ -172,9 +182,6 @@ impl TileBuilder {
     }
     pub fn lit_u32(&mut self, value: u32) -> TileExpr {
         self.lit(TileLiteral::U32(value))
-    }
-    pub fn lit_i32(&mut self, value: i32) -> TileExpr {
-        self.lit(TileLiteral::I32(value))
     }
     pub fn lit_bool(&mut self, value: bool) -> TileExpr {
         self.lit(TileLiteral::Bool(value))
@@ -200,9 +207,7 @@ impl TileBuilder {
         }
     }
 
-    /// The zero of a scalar element type, used as a load fill and an
-    /// accumulator init.
-    pub fn zero_scalar(&mut self, scalar: ScalarElement) -> TileExpr {
+    fn zero_scalar(&mut self, scalar: ScalarElement) -> TileExpr {
         match scalar {
             ScalarElement::F32 => self.lit(TileLiteral::F32(0)),
             ScalarElement::F16 => self.lit(TileLiteral::F16(0)),
@@ -210,35 +215,6 @@ impl TileBuilder {
             ScalarElement::U32 => self.lit(TileLiteral::U32(0)),
             ScalarElement::I32 => self.lit(TileLiteral::I32(0)),
             ScalarElement::Bool => self.lit(TileLiteral::Bool(false)),
-        }
-    }
-
-    /// The "smaller than anything real" sentinel a max carrier starts from.
-    /// Finite, not `-inf`, since WGSL has no infinite literal. These are the
-    /// same values the GPU emitter's reduce identities use, so a max started
-    /// here and a max started by a `Reduce` agree bit for bit.
-    pub fn neg_inf(&mut self, elem: ScalarElement) -> TileExpr {
-        match elem {
-            ScalarElement::F16 => {
-                self.lit(TileLiteral::F16(half::f16::from_f32(-65504.0).to_bits()))
-            }
-            // bf16 rounds the f32 sentinel straight back to -inf, so take its
-            // own finite extreme.
-            ScalarElement::BF16 => self.lit(TileLiteral::BF16(half::bf16::MIN.to_bits())),
-            _ => self.lit_f32(-WGSL_SAFE_F32_MAX),
-        }
-    }
-
-    /// The `Min` identity, the mirror of [`Self::neg_inf`]: the largest
-    /// finite magnitude, so a min started here and a min started by a
-    /// `Reduce` agree bit for bit.
-    pub fn pos_inf(&mut self, elem: ScalarElement) -> TileExpr {
-        match elem {
-            ScalarElement::F16 => {
-                self.lit(TileLiteral::F16(half::f16::from_f32(65504.0).to_bits()))
-            }
-            ScalarElement::BF16 => self.lit(TileLiteral::BF16(half::bf16::MAX.to_bits())),
-            _ => self.lit_f32(WGSL_SAFE_F32_MAX),
         }
     }
 
@@ -287,25 +263,6 @@ impl TileBuilder {
         })
     }
 
-    pub fn add(&mut self, a: TileExpr, b: TileExpr) -> TileExpr {
-        self.binary(TileBinaryOp::Add, a, b, NumericContract::RELAXED)
-    }
-    pub fn mul(&mut self, a: TileExpr, b: TileExpr) -> TileExpr {
-        self.binary(TileBinaryOp::Mul, a, b, NumericContract::RELAXED)
-    }
-    pub fn sub(&mut self, a: TileExpr, b: TileExpr) -> TileExpr {
-        self.binary(TileBinaryOp::Sub, a, b, NumericContract::RELAXED)
-    }
-    /// `a * b + c` with contraction permitted, the fused-multiply-add the
-    /// emitter is free to issue as one instruction.
-    pub fn fma(&mut self, a: TileExpr, b: TileExpr, c: TileExpr) -> TileExpr {
-        let p = self.mul(a, b);
-        self.add(p, c)
-    }
-    pub fn and(&mut self, a: TileExpr, b: TileExpr) -> TileExpr {
-        self.binary(TileBinaryOp::LogicalAnd, a, b, NumericContract::RELAXED)
-    }
-
     pub fn compare(&mut self, op: TileCompareOp, left: TileExpr, right: TileExpr) -> TileExpr {
         self.infer_expr(TileExprKind::Compare { op, left, right })
     }
@@ -314,12 +271,7 @@ impl TileBuilder {
         self.infer_expr(TileExprKind::Round { mode, value })
     }
 
-    /// An identity cast is elided rather than interned: the emitters spell a
-    /// same-type cast out, so keeping the node would change the shader text.
     pub fn cast(&mut self, value: TileExpr, to: ElementType) -> TileExpr {
-        if value.element() == to {
-            return value;
-        }
         self.infer_expr(TileExprKind::Cast { value, to })
     }
 
@@ -356,13 +308,22 @@ impl TileBuilder {
         })
     }
 
-    /// The N-ary reduction, expressed as a carrier. A carrier that is one
-    /// scalar slot merged by a binop delegates to [`Self::reduce`] and returns
-    /// a one-element vector. Otherwise it allocates one scratch tile, one pair
-    /// of merge formals and one output local per accumulator lane, pushes a
-    /// [`Stmt::Reduce`] into `out`, and returns the per-lane reads. `merge`
-    /// builds lane `i`'s merged expression from the formals; `values` is one
-    /// partial per lane and `scratch_extents` the tile shape one lane needs.
+    /// The **N-ary** reduction, expressed as a carrier.
+    ///
+    /// When the carrier is one scalar slot merged by a binop this **delegates**
+    /// to [`Self::reduce`] and returns a one-element vector: the same
+    /// `TileExprKind::Reduce` node, hence the same hash-consed L2 term, hence
+    /// the same `KernelIr`, the same `PlanHash` and the same shader bytes. A
+    /// single-slot carrier cannot reach the new path at all.
+    ///
+    /// Otherwise it allocates one scratch tile, one pair of merge formals and
+    /// one output local per accumulator **lane**, pushes a [`Stmt::Reduce`] into
+    /// `out`, and returns the per-lane reads. `merge` builds lane `i`'s merged
+    /// expression from the formals; both emitters own the tree that evaluates
+    /// it. `values` must already be one partial per lane.
+    ///
+    /// `scratch_extents` is the tile shape one lane needs — the block width for
+    /// a workgroup tree.
     pub fn reduce_carrier<E>(
         &mut self,
         kind: ReduceKind,
@@ -413,7 +374,8 @@ impl TileBuilder {
             kind: Box::new(kind),
             values: values.iter().cloned().collect(),
             merge: Box::new(fusor2_ir::ir::level2::MergeBody { lhs, rhs, body }),
-            // Only reached when the carrier is not a single scalar binop slot.
+            // Derived, never author-supplied: this arm is only reached when the
+            // carrier is *not* a single scalar binop slot.
             fast: None,
             outs: outs.clone(),
             scratch,
@@ -438,43 +400,13 @@ impl TileBuilder {
         })
     }
 
-    /// An all-zero fragment of the same shape as a cooperative accumulator.
-    pub fn coop_zero(
-        &mut self,
-        role: CoopMatrixRole,
-        scalar: ScalarElement,
-        rows: u32,
-        cols: u32,
-    ) -> TileExpr {
-        self.infer_expr(TileExprKind::CoopZero {
-            role,
-            scalar,
-            rows,
-            cols,
-        })
-    }
-
     pub fn coop_mma(&mut self, a: TileExpr, b: TileExpr, c: TileExpr) -> TileExpr {
         self.infer_expr(TileExprKind::CoopMma { a, b, c })
     }
 
-    /// A private per-invocation local minted without registration, for a
-    /// lowerer that assembles its `KernelIr` itself. Identity-bearing, so not
-    /// interned; [`Self::alloc_local`] is the recording form.
-    pub fn local(&self, element: ElementType) -> Local {
-        Arc::new(LocalDecl::new(element))
-    }
-
-    /// A workgroup tile minted without registration. Also identity-bearing:
-    /// two tiles with the same shape are two allocations the arena may or may
-    /// not overlap. [`Self::alloc_tile_named`] is the recording form.
-    pub fn tile(&self, name: &'static str, element: ElementType, extents: &[u32]) -> Tile {
-        Arc::new(TileDecl::new(
-            element,
-            TileLayout::contiguous(MemoryLevel::Workgroup, extents),
-            name,
-        ))
-    }
+    // -----------------------------------------------------------------
+    // Statement constructors — plain data, never interned
+    // -----------------------------------------------------------------
 
     pub fn store(&self, dst: StorageView, addr: Addr, value: TileExpr, mask: TileExpr) -> Stmt {
         Stmt::Store {
@@ -565,6 +497,10 @@ impl TileBuilder {
         Stmt::Barrier
     }
 
+    // -----------------------------------------------------------------
+    // Body assembly
+    // -----------------------------------------------------------------
+
     pub fn push(&mut self, stmt: Stmt) {
         self.body.push(stmt);
     }
@@ -582,9 +518,10 @@ impl TileBuilder {
     }
 
     /// Close the kernel. Buffers come out in binding order, so the derived
-    /// bind group and the builder's buffer list cannot drift. `byte_arena` is
-    /// always `None`: that token is a device capability only the backend
-    /// lowerers, which hold `Caps`, can mint.
+    /// bind group and the builder's buffer list cannot drift.
+    ///
+    /// Never byte-arena'd: the token is a device capability the backend
+    /// lowerers mint from their own `Caps`, and this builder has none.
     pub fn finish(&mut self, grid: [u32; 3], block: u32, name: &'static str) -> KernelIr {
         KernelIr {
             buffers: self.buffers(),
@@ -597,8 +534,8 @@ impl TileBuilder {
     }
 }
 
-/// Shared test fixture: tile A 8x8 f32 (256 B) and tile B 4x8 f32 (128 B),
-/// touched on either side of a caller-supplied `between`.
+/// The fixture every W3 test suite shares: tile A 8x8 f32 (256 B) and tile B
+/// 4x8 f32 (128 B), touched on either side of a caller-supplied `between`.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
@@ -691,8 +628,8 @@ mod tests {
         b.unary(UnOp::Sqrt, product, NumericContract::RELAXED)
     }
 
-    /// `TileExpr`'s `Arc` is private, but `kind()` borrows out of the
-    /// allocation, so equal `kind()` addresses means `Arc::ptr_eq`.
+    /// `TileExpr`'s `Arc` is private, but `kind()` borrows straight out of the
+    /// allocation, so equal `kind()` addresses *is* `Arc::ptr_eq`.
     fn same_node(a: &TileExpr, b: &TileExpr) -> bool {
         std::ptr::eq(a.kind() as *const TileExprKind, b.kind() as *const TileExprKind)
     }

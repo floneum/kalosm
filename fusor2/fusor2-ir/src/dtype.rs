@@ -2,9 +2,10 @@
 
 use crate::scalar::Lit;
 
-/// Element type of an L0/L1 value. `I32` carries float->int casts, `round`
-/// and sort-key scatter; `BF16` shares the `widen-compute` rule with F16.
-/// There is no `Bool`: comparisons return 1.0/0.0 in the operand dtype.
+/// Element type of an L0/L1 value. Two widenings past the reference's
+/// `{f32, f16, u32}`: `I32` (float->int casts, `round`, sort-key scatter)
+/// and `BF16` (free — shares the `widen-compute` rule with F16). No `Bool`:
+/// comparisons return 1.0/0.0 in the operand dtype, exactly as today.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Dtype {
     F32,
@@ -24,28 +25,6 @@ impl Dtype {
             Self::F32 | Self::U32 | Self::I32 => 4,
             Self::F16 | Self::BF16 => 2,
             Self::Q(_) => 0,
-        }
-    }
-
-    /// The L2 scalar element this dtype computes as. Quantized blocks decode
-    /// to f32, so they stage and accumulate as `ScalarElement::F32`.
-    pub const fn scalar_element(self) -> crate::ir::level2::ScalarElement {
-        use crate::ir::level2::ScalarElement as E;
-        match self {
-            Self::F32 | Self::Q(_) => E::F32,
-            Self::F16 => E::F16,
-            Self::BF16 => E::BF16,
-            Self::U32 => E::U32,
-            Self::I32 => E::I32,
-        }
-    }
-
-    /// [`Self::scalar_element`] for dense dtypes only: a quantized value has
-    /// no dense element type.
-    pub const fn try_scalar_element(self) -> Option<crate::ir::level2::ScalarElement> {
-        match self {
-            Self::Q(_) => None,
-            other => Some(other.scalar_element()),
         }
     }
 
@@ -81,8 +60,9 @@ impl Dtype {
     }
 }
 
-/// The GGUF block formats fusor2 ingests, on both backends. Adding one is a
-/// `BlockSpec` row plus a `BlockProgram`.
+/// The six GGUF block formats fusor2 ingests end to end, on both backends.
+/// The twelve the reference names but cannot ingest do not appear; adding
+/// one is a `BlockSpec` row plus a `BlockProgram`, never a kernel.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[allow(non_camel_case_types)]
 pub enum QFmt {
@@ -131,15 +111,17 @@ impl QFmt {
 }
 
 /// On-device byte layout of a quantized matrix. Both are legal inputs
-/// everywhere; moving between them is the priced `qrepack` rewrite.
+/// *everywhere*; moving between them is the priced `qrepack` rewrite, not a
+/// decision frozen at upload.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum QLayout {
     Native,
     F32Scales,
 }
 
-/// Rounding mode carried on `ScalarKind::Round`. MSQ1 export idempotence
-/// depends on `HalfAwayFromZero`.
+/// Rounding mode carried on `ScalarKind::Round`. A real primitive, so the
+/// trainer's 14-chained-comparison `round_small` deletes;
+/// `HalfAwayFromZero` is what MSQ1 export idempotence depends on.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RoundMode {
     HalfToEven,
@@ -149,19 +131,25 @@ pub enum RoundMode {
     Trunc,
 }
 
-/// What a value's numerics permit. Monotone: no rewrite may lower
+/// What a value's numerics permit. **Monotone**: no rewrite may lower
 /// `min_accum_bits` or `min_operand_bits`, nor enable `reassoc`/`contract`
-/// where a value forbids it. It survives to WGSL as an emitter obligation
-/// against Metal fast math.
+/// where a value forbids it. This makes `fold_split` sound, survives to WGSL
+/// as an emitter obligation against Metal fast math, and stops an epilogue
+/// fusion from narrowing a cooperative kernel's f32 accumulator.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NumericContract {
     pub min_accum_bits: u8,
-    /// Narrowest operand a rewrite may substitute for this value's inputs, in
-    /// bits. `32`, the default, means the operands stay f32.
+    /// Narrowest **operand** a rewrite may substitute for this value's
+    /// inputs, in bits. `32` — the default — means the operands stay f32.
     ///
-    /// A separate axis from `min_accum_bits` and `reassoc`/`contract`, which
-    /// are exact-to-rounding; re-encoding an operand onto a coarser grid is
-    /// not, and costs ~1.7% error at Q8_0.
+    /// A separate axis from `min_accum_bits` and from `reassoc`/`contract`
+    /// because it is a separate kind of permission: reassociating a sum,
+    /// contracting a `mul`+`add` into an FMA and widening an accumulator are
+    /// all exact-to-rounding, while re-encoding an operand onto a coarser
+    /// grid is not. Without it, `reassoc` was being read as licence for the
+    /// int8 activation path, whose error is ~1.7% at Q8_0 —
+    /// four orders of magnitude past anything a rounding permission can
+    /// authorize, and independent of accumulation order.
     pub min_operand_bits: u8,
     pub reassoc: bool,
     pub contract: bool,
@@ -191,9 +179,13 @@ impl NumericContract {
     ///
     /// Weaker than `RELAXED` — `RELAXED.allows(RELAXED_OPERANDS)` — so it
     /// cannot be reached by [`Self::meet`] from values that do not already
-    /// carry it. Nothing in the tree mints it. An int8 dot is admissible only
-    /// as a `Dot4I8`-shaped `ScalarKind` over packed operands inside an
-    /// ordinary `KContract`, guarded by this contract.
+    /// carry it. That is the point: quantizing the activations is an opt-in
+    /// with a measurable accuracy cost, not something a fusion can decide.
+    /// **Nothing in the tree mints it**, so the int8 path is offered nowhere.
+    /// This is the licence kept for it: when an int8 dot returns it must
+    /// return as one mechanism — a `Dot4I8`-shaped `ScalarKind` over packed
+    /// operands inside an ordinary `KContract` — guarded by this contract,
+    /// never as a second contraction node with its own lowerings.
     pub const RELAXED_OPERANDS: Self = Self {
         min_operand_bits: 8,
         ..Self::RELAXED
@@ -290,9 +282,9 @@ impl From<Splat> for Lit {
 mod tests {
     use super::*;
 
-    /// The operand-precision axis sits in the lattice where the other three do:
-    /// `meet` keeps the stricter side, `allows` reads "self is at least as
-    /// strict as other", and f32 operands are the default.
+    /// The operand-precision axis sits in the lattice exactly where the other
+    /// three do: `meet` keeps the stricter side, `allows` reads "self is at
+    /// least as strict as other", and f32 operands are the default.
     #[test]
     fn narrow_operands_are_a_strict_relaxation() {
         assert_eq!(NumericContract::RELAXED.min_operand_bits, 32);
@@ -300,13 +292,15 @@ mod tests {
         assert_eq!(NumericContract::RELAXED_OPERANDS.min_operand_bits, 8);
 
         // One direction only: RELAXED satisfies everything RELAXED_OPERANDS
-        // asks for, never the reverse.
+        // asks for, never the reverse. That asymmetry is the whole guard on
+        // the int8 activation dot.
         assert!(NumericContract::RELAXED.allows(NumericContract::RELAXED_OPERANDS));
         assert!(!NumericContract::RELAXED_OPERANDS.allows(NumericContract::RELAXED));
     }
 
-    /// The licence cannot be manufactured by propagation: one unlicensed input
-    /// takes it away.
+    /// The licence cannot be manufactured by propagation: one unlicensed
+    /// input takes it away, so no fusion can decide to quantize a value's
+    /// operands on its behalf.
     #[test]
     fn meet_cannot_reach_the_licence() {
         let m = NumericContract::RELAXED_OPERANDS.meet(NumericContract::RELAXED);
@@ -325,8 +319,7 @@ mod tests {
         assert_eq!(strict_narrow.min_operand_bits, 32);
     }
 
-    /// The reassociation and contraction axes order independently of the
-    /// operand-precision axis.
+    /// Adding the axis moved nothing that was already there.
     #[test]
     fn the_rounding_axes_are_unmoved() {
         assert!(NumericContract::STRICT.allows(NumericContract::RELAXED));

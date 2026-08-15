@@ -1,18 +1,26 @@
 //! Block decode programs for the 32-element formats, in both storage layouts.
 //!
-//! A decode emits an L2 snippet. Native-layout f16 scales are read through
-//! `Unpack2x16Float`, so no `ScalarElement::F16` appears in an emitted term
-//! and `SHADER_F16` is not required.
+//! A decode is a **block program**, not one scalar expression: it emits an L2
+//! snippet. `Unpack2x16Float` is how native-layout f16 scales are read without
+//! `SHADER_F16` — no `ScalarElement::F16` ever appears in an emitted term.
 //!
-//! `BlockDecodeArgs` carries no row extent: the flat element index a program
-//! decodes is `k_base + col`, with the row stride folded into `col` (typically
-//! `row_index * elements_per_row`) and `k_base` the element offset inside the
-//! row. Block base and intra-block index come from that flat index alone.
+//! ## Addressing convention
+//!
+//! `BlockDecodeArgs` carries no row extent, so the flat element index a
+//! program decodes is `k_base + col`: the caller folds the row stride
+//! into `col` (typically `row_index * elements_per_row`) exactly as the
+//! reference's `quantized_flat_block_base_and_q` does, and `k_base` is the
+//! element offset inside that row. Block base and intra-block index are
+//! recomputed from that flat index alone, so an element anywhere in the row —
+//! including one whose block differs from its neighbour's — decodes correctly
+//! with no notion of a decode width.
 //!
 //! `src` is a plain `u32` storage view. Native blocks are not word-aligned
 //! (18, 22, 34 and 210 bytes), so every field read goes through
 //! [`load_block_byte`], which loads the containing word and shifts the byte
 //! out.
+//!
+//! Owned by W11.
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::{NumericContract, QFmt, QLayout};
@@ -22,6 +30,10 @@ use fusor2_ir::ir::level2::{
 };
 
 use crate::blocks::{BlockDecodeArgs, BlockFields, BlockProgram, block_fields};
+
+// ---------------------------------------------------------------------------
+// Expression builders
+// ---------------------------------------------------------------------------
 
 pub(crate) const U32: ElementType = ElementType::Scalar(ScalarElement::U32);
 pub(crate) const I32: ElementType = ElementType::Scalar(ScalarElement::I32);
@@ -126,6 +138,10 @@ pub(crate) fn signed_byte_f32(byte: TileExpr) -> TileExpr {
     cast(sar, F32)
 }
 
+// ---------------------------------------------------------------------------
+// Block addressing
+// ---------------------------------------------------------------------------
+
 /// Byte base of the block holding the addressed element, and that element's
 /// index inside the block.
 pub(crate) fn block_base_and_q(args: &BlockDecodeArgs<'_>, fmt: QFmt) -> (TileExpr, TileExpr) {
@@ -153,9 +169,11 @@ pub(crate) fn load_word(args: &BlockDecodeArgs<'_>, word_index: TileExpr) -> Til
 }
 
 /// Load one byte of a block: `(base + byte_offset + dynamic) >> 2` selects the
-/// word, `((base + byte_offset + dynamic) & 3) * 8` the shift. Native blocks
-/// are not word-aligned, so the containing word is the only thing the storage
-/// view can address.
+/// word, `((base + byte_offset + dynamic) & 3) * 8` the shift.
+///
+/// Byte addressing over a u32 buffer is not an optimisation choice — Native
+/// blocks are not word-aligned, so the containing word is the only thing the
+/// storage view can address.
 pub(crate) fn load_block_byte(
     args: &BlockDecodeArgs<'_>,
     base: &TileExpr,
@@ -176,9 +194,10 @@ pub(crate) fn load_block_byte(
 /// Read a scale-shaped field as f32.
 ///
 /// The f16 path loads the containing word, applies `Unpack2x16Float` and picks
-/// the half dynamically: a Native block base is not word-aligned, so which
-/// half holds the scale depends on the block index. No f16 element type is
-/// constructed.
+/// the half **dynamically**, because a Native block base is not word-aligned
+/// and which half of the word holds the scale therefore depends on the block
+/// index. No f16 element type is ever constructed, so `SHADER_F16` is not
+/// required.
 pub(crate) fn load_scale_f32(
     args: &BlockDecodeArgs<'_>,
     base: &TileExpr,
@@ -221,8 +240,8 @@ pub(crate) fn load_scale_f32(
 
 /// Apply the load's `mask`/`fill` to the decoded element.
 ///
-/// The result is a scalar, never a one-lane vector: WGSL has vec2/vec3/vec4
-/// only.
+/// The result is the scalar itself, never a one-lane vector — which is not a
+/// type, WGSL having vec2/vec3/vec4 only.
 pub(crate) fn finish(args: &BlockDecodeArgs<'_>, value: TileExpr) -> TileExpr {
     if args.mask.is_constant_true() {
         return value;
@@ -252,8 +271,12 @@ pub(crate) fn expect_layout(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Affine family per-lane formulas
+// ---------------------------------------------------------------------------
+
 /// `q & 15` addresses the byte; `q < 16` takes the low nibble and `q >= 16`
-/// the high nibble: the nibble order is split-half, not adjacent pairs.
+/// the high nibble. This is llama.cpp's split-half order, not adjacent pairs.
 pub(crate) fn nibble_q4(
     args: &BlockDecodeArgs<'_>,
     base: &TileExpr,
@@ -320,6 +343,10 @@ fn decode_affine(
     Ok(finish(args, value))
 }
 
+// ---------------------------------------------------------------------------
+// The six programs
+// ---------------------------------------------------------------------------
+
 /// Q4_0, raw GGUF bytes: f16 scale, 16 nibble-pair bytes, 18 bytes total.
 pub fn decode_q4_0_native(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
     decode_affine(args, QFmt::Q4_0, QLayout::Native, "decode_q4_0_native")
@@ -375,8 +402,10 @@ pub const DECODE_Q8_0_F32: BlockProgram = BlockProgram {
     emit: decode_q8_0_f32,
 };
 
-// A pure-Rust evaluator over the node set these programs build, used to check
-// them against the scalar decoder.
+// ---------------------------------------------------------------------------
+// A pure-Rust evaluator, for testing the emitted programs against the scalar
+// reference decoder. It covers exactly the node set these programs build.
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 pub(crate) mod interp {
@@ -396,8 +425,8 @@ pub(crate) mod interp {
     }
 
     impl V {
-        /// Only `VecComponent` reads this; `Unpack2x16Float` is the one vector
-        /// a decode program builds.
+        /// Only `VecComponent` reads this: `Unpack2x16Float` is the one vector
+        /// a decode program still builds, and it is consumed immediately.
         fn f32s(&self) -> &[f32] {
             match self {
                 V::Vf(v) => v,
@@ -707,8 +736,9 @@ mod tests {
         assert!(decode_q4_0_f32(&args).is_ok());
     }
 
-    /// No emitted node may carry an f16 element type; a native-layout scale is
-    /// read through `Unpack2x16Float` instead.
+    /// No emitted node may carry an f16 element type: the whole point of
+    /// `Unpack2x16Float` is that a native-layout scale is read without
+    /// `SHADER_F16`.
     #[test]
     fn no_f16_element_appears_in_an_emitted_program() {
         fn walk(e: &TileExpr, seen: &mut usize) {

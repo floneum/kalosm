@@ -1,8 +1,12 @@
 //! Cross-lane reductions: subgroup collectives, shared-memory trees, and the
 //! loop-then-tree hybrid. The strategy is a parameter on the node, so it stays
 //! a late capability-driven choice rather than a construction-time one.
+//!
+//! Owned by W8.
 
-use fusor2_ir::ir::level2::{ElementType, ReduceKind, ScalarElement, Tile, TileExpr, TileReduceOp};
+use fusor2_ir::ir::level2::{
+    Builtin, ElementType, ReduceKind, ScalarElement, Tile, TileExpr, TileExprKind, TileReduceOp,
+};
 use fusor2_ir::target::EmitError;
 use naga::{
     Barrier, BinaryOperator, Block, CollectiveOperation, Expression, Handle, MathFunction, Span,
@@ -30,8 +34,13 @@ impl Emitter<'_> {
                 scratch,
                 group_size,
             } => {
+                let element = value.element();
                 let v = self.expr(value, out)?;
-                self.tree_reduce(out, scratch, v, op, *group_size)
+                if self.upgrades_tree(*group_size, element) {
+                    self.collective_tree_reduce(out, scratch, v, op, element)
+                } else {
+                    self.tree_reduce(out, scratch, v, op, *group_size)
+                }
             }
             ReduceKind::Loop {
                 iterations,
@@ -39,10 +48,26 @@ impl Emitter<'_> {
                 scratch,
                 group_size,
             } => {
+                let element = value.element();
                 let acc = self.loop_reduce(out, op, value, *iterations, index)?;
-                self.tree_reduce(out, scratch, acc, op, *group_size)
+                if self.upgrades_tree(*group_size, element) {
+                    self.collective_tree_reduce(out, scratch, acc, op, element)
+                } else {
+                    self.tree_reduce(out, scratch, acc, op, *group_size)
+                }
             }
         }
+    }
+
+    /// The emit-side of [`crate::emit::collective_tree`]: same predicate, this
+    /// kernel's block and this device's fixed width.
+    fn upgrades_tree(&self, group_size: u32, element: ElementType) -> bool {
+        let width = self
+            .caps
+            .subgroups
+            .filter(|s| s.is_fixed())
+            .map(|s| s.assumed());
+        crate::emit::collective_tree(width, self.workgroup_invocations, group_size, element)
     }
 
     /// `Subgroup` — one collective, rejecting the operand shapes a collective
@@ -200,6 +225,76 @@ impl Emitter<'_> {
 
         let result_ptr = self.tile_dynamic_pointer(out, scratch, result_index)?;
         self.load_tile_value(out, scratch, result_ptr)
+    }
+
+    /// The whole-block tree on a fixed-subgroup-width device: **one collective
+    /// per subgroup, the per-subgroup partials staged through the first
+    /// `block/width` scratch slots, and a serial fold every lane performs in
+    /// the same order** — two barriers total against the tree's
+    /// `2 + log2(block)`, which is the difference between a matvec row's
+    /// reduce tail and its whole k-loop on short reductions.
+    ///
+    /// Every lane folds the identical slots in the identical order, so all
+    /// lanes hold the same total — the same guarantee tree lanes get from
+    /// reading `scratch[result_index]`. When one subgroup covers the block the
+    /// collective alone is the reduction: no scratch, no barriers.
+    fn collective_tree_reduce(
+        &mut self,
+        out: &mut Block,
+        scratch: &Tile,
+        value: Handle<Expression>,
+        op: TileReduceOp,
+        element: ElementType,
+    ) -> Result<Handle<Expression>, EmitError> {
+        let width = self.caps.subgroup_width();
+        let block = self.workgroup_invocations;
+        let sub = self.subgroup_reduce(out, value, op, element)?;
+        if block == width {
+            return Ok(sub);
+        }
+        let nsub = block / width;
+        // The leading barrier is load-bearing for the same reason as the
+        // tree's: when the scratch tile is reused inside one kernel, a leader
+        // could otherwise overwrite its slot while another lane still reads
+        // the previous reduction's partials.
+        out.push(
+            Statement::ControlBarrier(Barrier::WORK_GROUP),
+            Span::default(),
+        );
+        let u32e = ElementType::Scalar(ScalarElement::U32);
+        let sid_e = TileExpr::new(TileExprKind::Builtin(Builtin::SubgroupId), u32e);
+        let sid = self.expr(&sid_e, out)?;
+        let slane_e = TileExpr::new(TileExprKind::Builtin(Builtin::SubgroupLane), u32e);
+        let slane = self.expr(&slane_e, out)?;
+        let zero = self.u32_lit(0);
+        let leader = self.bin(out, BinaryOperator::Equal, slane, zero);
+        let scratch_c = scratch.clone();
+        let (accept, ()) = self.nested(move |em, accept| {
+            let ptr = em.tile_dynamic_pointer(accept, &scratch_c, sid)?;
+            em.store_tile_value(accept, &scratch_c, ptr, sub)
+        })?;
+        out.push(
+            Statement::If {
+                condition: leader,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        out.push(
+            Statement::ControlBarrier(Barrier::WORK_GROUP),
+            Span::default(),
+        );
+        let first = self.u32_lit(0);
+        let ptr = self.tile_dynamic_pointer(out, scratch, first)?;
+        let mut total = self.load_tile_value(out, scratch, ptr)?;
+        for i in 1..nsub {
+            let idx = self.u32_lit(i);
+            let ptr = self.tile_dynamic_pointer(out, scratch, idx)?;
+            let v = self.load_tile_value(out, scratch, ptr)?;
+            total = self.combine(out, op, total, v);
+        }
+        Ok(total)
     }
 
     /// The **N-ary** reduction: an explicit log-tree over `lanes * block`
@@ -402,8 +497,8 @@ mod tests {
         }
     }
 
-    /// The `WgTree` fallback and the subgroup collective agree bit-for-bit,
-    /// and the 256-lane tree is exact.
+    /// Test 9 — the `WgTree` fallback and the subgroup collective agree
+    /// bit-for-bit, and the 256-lane tree is exact.
     ///
     /// A subgroup collective reduces within one subgroup, so the two
     /// strategies are compared at the subgroup width; the 256-lane total is
@@ -483,7 +578,8 @@ mod tests {
     /// The emitted WGSL for a plain single-slot fold, as text.
     ///
     /// Set `FUSOR2_WGSL_DUMP=<dir>` to write the four shaders out; that is how
-    /// [`single_slot_reduce_wgsl_is_unchanged`]'s goldens are recorded.
+    /// [`single_slot_reduce_wgsl_is_unchanged`]'s goldens were recorded from the
+    /// tree *before* the N-ary reduction landed.
     fn reduce_wgsl(name: &'static str, ir: &KernelIr) -> String {
         let emitted = emit_module(ir, &caps(false, true), &no_plan()).expect("emits");
         let mut flags = naga::back::wgsl::WriterFlags::empty();
@@ -496,22 +592,27 @@ mod tests {
         text
     }
 
-    /// The fast path is byte-identical: `TileReduceOp::{Sum,Max}` at one scalar
-    /// slot emits a subgroup collective and a shared-memory tree. The assert is
-    /// textual equality of the shader, not numeric agreement: every passing
-    /// fold in the suite goes down this path, and a diff here means the N-ary
-    /// form was built *in place of* the collective rather than beside it.
+    /// **The fast path is byte-identical.** `TileReduceOp::{Sum,Max}` at one
+    /// scalar slot must keep emitting the same subgroup collective and the same
+    /// shared-memory tree it emitted before `Stmt::Reduce` existed. The assert is
+    /// textual equality of the shader, not numeric agreement: every one of the
+    /// passing folds in the suite goes down this path, and a diff here means the
+    /// N-ary form was built *in place of* the collective rather than beside it.
     ///
     /// The goldens are FNV-1a hashes of the exact shader text plus its length, so
     /// a deliberate change is re-recorded by copying one line, and the failure
     /// message prints the text.
     #[test]
     fn single_slot_reduce_wgsl_is_unchanged() {
+        // Re-baselined when the whole-block tree on a fixed-subgroup-width
+        // device became the subgroup two-stage: the wgtree shaders lost the
+        // halving tree's eight barrier rounds and gained `subgroupAdd` plus
+        // the subgroup id/lane arguments (the block is 64 = two subgroups).
         let cases: [(&'static str, u64, usize); 4] = [
             ("sum_subgroup", 0x3b02_cd5a_329c_469b, 495),
-            ("sum_wgtree", 0x32f0_985c_9f9e_51b3, 1861),
+            ("sum_wgtree", 0xa05e_220b_61a6_731a, 837),
             ("max_subgroup", 0x7b04_6317_1c0c_11d6, 495),
-            ("max_wgtree", 0x3564_68e0_a1c7_22bf, 1873),
+            ("max_wgtree", 0x76b0_3d3a_1d4b_4256, 839),
         ];
         // Every shader is emitted before any is asserted, so one dump run
         // records all four.

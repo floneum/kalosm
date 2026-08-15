@@ -1,20 +1,27 @@
 //! Workgroup arena packing, in both modes.
 //!
 //! - [`ArenaMode::Regions`] (portable): tiles pack into per-stride-class typed
-//!   arrays. A region holding two element types is emitted with a class-neutral
-//!   u32 type and every access bitcasts the value, never the address. Only
-//!   32-bit scalars qualify, so `f16`/`bf16` tiles never join a 4-byte region.
+//!   arrays. A region holding two element types is emitted with a
+//!   class-neutral u32 type and every access bitcasts the *value*, never the
+//!   address — legal only for 32-bit scalars, so `f16`/`bf16` tiles never join
+//!   a 4-byte region and no sub-word read-modify-write hazard exists.
 //! - [`ArenaMode::ByteArena`] (needs `caps.workgroup_alias`): one byte arena,
-//!   tiles at byte offsets via interval strip packing, so tiles of different
-//!   strides reuse the same bytes.
+//!   tiles at byte offsets via interval strip packing, so tiles of *different*
+//!   strides (f16 staging next to f32 accumulators) reuse the same bytes.
 //!
-//! In both modes a [`Placement`]'s `[byte_offset, byte_offset + byte_len)`
+//! In **both** modes a [`Placement`]'s `[byte_offset, byte_offset + byte_len)`
 //! means "these bytes": in `Regions` every tile of region `k` reports region
-//! `k`'s base and full length, so one overlap test covers both modes.
+//! `k`'s base and full length, so [`crate::verify_arena`] needs no synthetic
+//! offsets and one overlap test covers both modes.
 //!
 //! Sharing legality is [`LivenessInfo::can_follow_tiles`]. Both packers check
-//! every prior occupant, not just the most recent: the loop-phase arm does not
-//! compose transitively.
+//! **every** prior occupant, not just the most recent: the loop-phase arm does
+//! not compose transitively.
+//!
+//! This is a **closed-form argmin with an independent verifier**, not an
+//! e-graph alternative — marked in the architecture as an honest exclusion.
+//!
+//! Owned by W3.
 
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
@@ -112,6 +119,10 @@ pub fn all_packable(live: &LivenessInfo) -> bool {
     live.iter().all(|tile| stride_class(tile.element).is_some())
 }
 
+// ---------------------------------------------------------------------------
+// Regions
+// ---------------------------------------------------------------------------
+
 struct Region {
     canonical: ElementType,
     elements: u32,
@@ -124,11 +135,14 @@ impl Region {
 }
 
 /// One allocation per stride class, tiles sharing a region when their live
-/// ranges are barrier-separated. Needs no capability and no aliasing proof.
+/// ranges are barrier-separated. The universal fallback: needs no capability
+/// and no aliasing proof.
 pub fn regions(live: &LivenessInfo) -> ArenaPlan {
     let mut regions: Vec<Region> = Vec::new();
-    // Every occupant per region: the loop-phase arm does not compose, so
-    // A->B and B->C do not imply the C->A wrap is covered.
+    // Every occupant per region: the plain interval arm would be sound against
+    // only the most recent occupant (barrier transitivity), but the loop-phase
+    // arm does not compose — A->B and B->C do not imply the C->A wrap is
+    // covered. Regions hold a handful of tiles, so all-occupants costs nothing.
     let mut occupants: Vec<Vec<usize>> = Vec::new();
     // A coop-consumed occupant pins the region's type: widening the canonical
     // would retype the raw pointer its cooperative load/store sees.
@@ -202,6 +216,10 @@ pub fn regions(live: &LivenessInfo) -> ArenaPlan {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Byte arena
+// ---------------------------------------------------------------------------
+
 /// One byte arena, tiles at byte offsets by interval strip packing. Returns
 /// `None` when a tile cannot back an array.
 pub fn byte_arena(live: &LivenessInfo) -> Option<ArenaPlan> {
@@ -264,6 +282,10 @@ pub fn byte_arena(live: &LivenessInfo) -> Option<ArenaPlan> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------
+
 /// Pack under one mode. Fails when the result exceeds
 /// `caps.limits.max_compute_workgroup_storage_size`, or when `ByteArena` is
 /// requested without `caps.workgroup_alias`.
@@ -304,8 +326,9 @@ pub(crate) fn check_budget(plan: &ArenaPlan, ir: &KernelIr, caps: &Caps) -> Resu
 }
 
 /// Bytes a declared tile set needs, without building a body. Delegates to the
-/// shared [`crate::planner::Planner`], the same computation the emitters lay
-/// out with.
+/// shared [`crate::planner::Planner`] so this is the **same** computation the
+/// emitters lay out with — there is no estimator and therefore no L1/L2
+/// admission mismatch.
 pub fn workgroup_bytes(tiles: &Tiles, caps: &Caps) -> Result<u32> {
     use fusor2_ir::ir::level2::ArenaPlanner;
     crate::planner::Planner::global().workgroup_bytes(tiles, caps)

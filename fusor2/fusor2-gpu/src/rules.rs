@@ -2,10 +2,12 @@
 //! geometry. Every L0 rule is inherited from `fusor2-ir`, and every
 //! schedule-domain rule from `fusor2-tile`.
 //!
-//! Every guard below reads [`Facts`] alone: device capabilities, shapes and
-//! dtypes. `Facts` exposes no consumer count, liveness or cost, so a rule that
-//! would not pay still fires and `fusor2-cost` rejects it on realized-DAG
-//! cost.
+//! Every guard below reads [`Facts`] alone — device capabilities, shapes and
+//! dtypes. **None reads a consumer count, liveness or cost**, and none can:
+//! `Facts` structurally does not expose them. A rule that "would not pay"
+//! still fires; `fusor2-cost` rejects it on realized-DAG cost.
+//!
+//! Owned by W9.
 
 use fusor2_ir::egraph::{Builder, Facts, Id, Rule, RuleTag};
 use fusor2_ir::ir::level1::{FoldDomain, FoldStrat, L1, ScheduleDomain, ScatterMode};
@@ -44,9 +46,11 @@ rule!(
     apply = gpu_scatter_atomic,
 );
 
-/// Mint `FoldStrat::Subgroup` into a `KFold`'s domain. Legality is a fixed
-/// subgroup width; a ranged width makes every subgroup-size-aware body treat
-/// the device as variable.
+/// Mint `FoldStrat::Subgroup` into a `KFold`'s domain.
+///
+/// Legality is a *fixed* subgroup width: a ranged width makes every
+/// subgroup-size-aware body treat the device as variable. Whether the
+/// collective beats the tree at this row length is the cost model's call.
 fn gpu_fold_subgroup(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     if !f.caps().subgroups.is_some_and(|s| s.is_fixed()) {
         return None;
@@ -92,9 +96,11 @@ fn gpu_fold_subgroup(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
 
 /// Mint the staged-store cooperative alternative.
 ///
-/// Without mixed-precision cooperative store, an f32-accumulated kernel
-/// writing f16 output stages through a workgroup tile and casts per lane. Both
-/// forms coexist and the cost model prices the extra tile.
+/// Without the fork's mixed-precision cooperative store, an f32-accumulated
+/// kernel writing f16 output must stage through a workgroup tile and cast per
+/// lane. That is a *footprint* difference, so both forms coexist and the cost
+/// model prices the extra tile — it is never a routing decision that sends the
+/// whole contraction to the generic reduce.
 fn gpu_coop_stage_via_tile(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     if f.caps().mixed_precision_coop_store {
         return None;
@@ -148,9 +154,11 @@ fn gpu_coop_stage_via_tile(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'
     b.union(id, alt).ok()
 }
 
-/// Mint `KScatter{Atomic}`. The only legality question is whether the device
-/// has `atomicAdd` on f32 in storage; whether atomics beat the
-/// workgroup-private merge is priced, not guarded.
+/// Mint `KScatter{Atomic}`.
+///
+/// The only legality question is whether the device has `atomicAdd` on f32 in
+/// storage. Whether atomics beat the workgroup-private merge at this bin
+/// count and skew is priced, not guarded.
 fn gpu_scatter_atomic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     if !f.caps().atomic_f32 {
         return None;
@@ -244,7 +252,8 @@ mod tests {
         assert!(!c.subgroups.is_some_and(|s| s.is_fixed()));
     }
 
-    /// `Facts` has no accessor a profitability judgement could use.
+    /// The guards read `Caps` only. This is the compile-time restatement of
+    /// that: `Facts` has no accessor a profitability judgement could use.
     #[test]
     fn facts_exposes_no_profitability_signal() {
         fn _assert_guard_shape(f: &Facts<'_>) {
@@ -252,7 +261,8 @@ mod tests {
             let _ = f.level();
             let _ = f.own();
             let _ = f.operands();
-            // There is no `f.consumers()`, `f.is_live()` or `f.cost()`.
+            // There is deliberately no `f.consumers()`, `f.is_live()` or
+            // `f.cost()` to call here.
         }
     }
 }

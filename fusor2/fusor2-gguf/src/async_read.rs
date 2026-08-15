@@ -1,5 +1,8 @@
 //! The byte-range source an [`crate::sharded::AsyncShardedVarBuilder`] reads
-//! through. Runtime-agnostic: one boxed future, no executor dependency.
+//! through. Deliberately runtime-agnostic: one boxed future, no executor
+//! dependency anywhere in the compiler stack.
+//!
+//! Owned by W11.
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;
@@ -22,8 +25,8 @@ pub trait AsyncReadRange: Send + Sync {
         None
     }
 
-    /// `true` when the source is known to be empty. A source of unknown length
-    /// is not empty.
+    /// `true` when the source is known to be empty. Present because clippy
+    /// asks for it next to `len`; a source of unknown length is not empty.
     fn is_empty(&self) -> bool {
         self.len() == Some(0)
     }
@@ -49,10 +52,12 @@ impl AsyncReadRange for BytesRange {
     }
 }
 
-/// Smallest prefix requested when hunting for the end of a GGUF header.
+/// Smallest prefix we ask for when hunting for the end of a GGUF header.
 const HEADER_PROBE_BYTES: usize = 1 << 16;
-/// Largest prefix pulled before giving up, so a corrupt file cannot drag the
-/// whole model over the wire.
+/// Largest prefix we will pull before giving up. A GGUF header is metadata
+/// plus a tensor directory; 64 MiB covers a tokenizer vocabulary with room to
+/// spare, and refusing past that keeps a corrupt file from pulling the whole
+/// model over the wire.
 const HEADER_LIMIT_BYTES: usize = 64 << 20;
 
 /// Read just enough of `source` to parse its header.
@@ -83,8 +88,10 @@ pub async fn read_metadata(source: &dyn AsyncReadRange) -> Result<GgufMetadata> 
     }
 }
 
-/// A minimal executor for callers that have none. It spins, so it only suits
-/// futures that never yield, such as those over an in-memory source.
+/// A minimal executor for callers that have none — the sync-over-async escape
+/// hatch the sharded loader's tests use. Spins; only sensible for futures that
+/// never actually yield, which is every future this module produces from an
+/// in-memory source.
 pub fn block_on<F: Future>(future: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -107,7 +114,8 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// Turn a short read into a typed error naming the tensor it failed on.
+/// Turn a short read into a typed error, so a truncated shard reports the
+/// tensor it failed on rather than panicking on a slice.
 pub(crate) fn expect_len(bytes: Vec<u8>, want: usize, what: &str) -> Result<Vec<u8>> {
     if bytes.len() == want {
         Ok(bytes)

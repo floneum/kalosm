@@ -1,8 +1,10 @@
-//! The saturation driver: a worklist in creation order over a `(RuleId, Id)`
-//! bitset, bounded by [`SaturationBudget`]. On exhaustion it offers only
-//! [`RuleTag::StrictlyLowering`] rules, so every chain reaches a runnable L1
-//! form: budget exhaustion yields a degraded-but-valid plan, reported in
-//! [`SaturationReport::truncated`], never an error.
+//! The saturation driver: a worklist in creation order over a
+//! `(RuleId, Id)` bitset, bounded by [`SaturationBudget`]. On exhaustion it
+//! offers only [`RuleTag::StrictlyLowering`] rules, guaranteeing every chain
+//! provably reaches a runnable L1 form — budget exhaustion yields a
+//! degraded-but-valid plan, never a hard error. Truncation is never silent.
+//!
+//! Owned by W2.
 
 use crate::device::Caps;
 use crate::egraph::{
@@ -16,7 +18,7 @@ use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::time::Instant;
 
-/// The shipped driver. Targets contribute rules, not a driver.
+/// The shipped driver. Targets contribute rules, never a driver.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct CoreSaturate;
 
@@ -30,7 +32,7 @@ impl CoreSaturate {
 }
 
 /// Dense index of an [`OpTag`], for the O(1) head-dispatch table.
-const TAG_COUNT: usize = 20;
+const TAG_COUNT: usize = 19;
 
 const fn tag_index(tag: OpTag) -> usize {
     match tag {
@@ -50,9 +52,8 @@ const fn tag_index(tag: OpTag) -> usize {
         OpTag::KGather => 13,
         OpTag::KScatter => 14,
         OpTag::KRegion => 15,
-        OpTag::KMerged => 16,
-        OpTag::Ext => 17,
-        OpTag::Union => 18,
+        OpTag::Ext => 16,
+        OpTag::Union => 17,
     }
 }
 
@@ -87,6 +88,9 @@ impl Saturate for CoreSaturate {
         let mut saturated = true;
         let mut rounds = 0u32;
         let mut applications = 0u32;
+        // Where a hard budget (nodes / applications) stopped the walk, if it
+        // did. Everything *before* this creation index was offered.
+        let mut budget_break: Option<usize> = None;
 
         // One rule fires at most once per node. The stride is fixed for the
         // whole call so a bit's index never moves; the set itself grows with
@@ -95,8 +99,13 @@ impl Saturate for CoreSaturate {
         let mut fired = FixedBitSet::with_capacity(rules.len().saturating_mul(64));
 
         // Creation order is already a topological order, because children are
-        // strictly smaller ids.
-        let mut work: VecDeque<Id> = (0..initial).map(|i| Id(i as u32)).collect();
+        // strictly smaller ids. Nodes below the frontier were fully offered in
+        // an earlier pass over this same graph; a rule's applicability depends
+        // only on the node and its (immutable) child facts, so re-offering
+        // them is at best a memo hit and at worst — for rules that mint fresh
+        // ids — an unbounded re-expansion of an already-saturated region.
+        let from = graph.saturation_frontier.min(initial);
+        let mut work: VecDeque<Id> = (from..initial).map(|i| Id(i as u32)).collect();
         let mut next: Vec<Id> = Vec::new();
 
         'rounds: while rounds < budget.max_rounds && !work.is_empty() {
@@ -110,13 +119,12 @@ impl Saturate for CoreSaturate {
                 if candidates.is_empty() {
                     continue;
                 }
-                // A refcount bump, not a copy: the arena entry is immutable,
-                // so the pin stays valid across the `&mut Builder` below.
-                let node = graph.node_arc(id);
+                let node = graph.node(id).clone();
                 let facts = graph.facts_view(id, caps);
                 for &rid in candidates.iter() {
                     if graph.len() >= max_nodes || applications >= budget.max_applications {
                         saturated = false;
+                        budget_break = Some(id.index());
                         let class = graph.class_of(id).0;
                         if !truncated.contains(&class) {
                             truncated.push(class);
@@ -154,13 +162,26 @@ impl Saturate for CoreSaturate {
             saturated = false;
         }
 
-        // The degraded pass runs when a budget was hit and as a final sweep
-        // whenever some chain has no L1 member. A `StrictlyLowering` rule is
-        // idempotent by hash-consing, so re-offering one is a memo hit and this
-        // pass ignores the fired set and the node ceiling.
+        // The degraded pass. Runs when a budget was hit, and unconditionally
+        // as a final sweep whenever some chain has no L1 member. A
+        // `StrictlyLowering` rule is idempotent by hash-consing, so
+        // re-offering one is a memo hit; that is what lets this ignore the
+        // fired set and the node ceiling entirely.
         if !saturated || missing_l1(graph) {
             applications += lower_everything(graph, caps, rules, &by_head, &mut fired_counts);
         }
+
+        // Advance the frontier: nodes below it have been offered every rule.
+        // A full drain (or a mere round exhaustion, whose leftover work is
+        // re-offers of freshly minted members that `lower_everything` has
+        // already made runnable) covers the whole graph; a hard budget break
+        // covers exactly the prefix walked. Without this, every resolve of a
+        // long-lived graph re-offers every historical node, and the rules
+        // that allocate fresh ids re-mint their results each time — measured
+        // as a 276k-node graph doubling on its second resolve.
+        graph.saturation_frontier = budget_break
+            .unwrap_or_else(|| graph.len())
+            .max(graph.saturation_frontier);
 
         let fired_report: Vec<(&'static str, u32)> = rules
             .iter()
@@ -182,27 +203,20 @@ impl Saturate for CoreSaturate {
     }
 }
 
-/// Whether any non-leaf L0 value has no L1 spelling — the extractor's only
-/// contract with saturation.
+/// Whether any non-leaf L0 value still has no L1 spelling. This is the
+/// extractor's only contract with saturation, so it is checked rather than
+/// assumed.
 fn missing_l1(graph: &EGraph) -> bool {
-    // Two linear sweeps over a bitset keyed by class root, instead of
-    // enumerating each node's whole class: first mark every class holding an
-    // L1 member, then look for an L0 value whose class was never marked.
-    let mut has_l1 = FixedBitSet::with_capacity(graph.len());
-    for i in 0..graph.len() {
-        let id = Id(i as u32);
-        let node = graph.node(id);
-        if node.level == Level::L1 && !matches!(node.op, Op::Union(..)) {
-            has_l1.insert(graph.root_of(id).index());
-        }
-    }
     (0..graph.len()).any(|i| {
         let id = Id(i as u32);
         let node = graph.node(id);
         if node.level != Level::L0 || matches!(node.op, Op::L0(crate::ir::level0::L0::Leaf(_))) {
             return false;
         }
-        !has_l1.contains(graph.root_of(id).index())
+        !graph
+            .members(graph.class_of(id))
+            .iter()
+            .any(|&m| graph.level(m) == Level::L1)
     })
 }
 
@@ -227,7 +241,7 @@ fn lower_everything(
         if candidates.is_empty() {
             continue;
         }
-        let node = graph.node_arc(id);
+        let node = graph.node(id).clone();
         let facts = graph.facts_view(id, caps);
         for &rid in candidates.iter() {
             let rule = &rules[rid.0 as usize];
@@ -238,8 +252,8 @@ fn lower_everything(
             let mut builder = graph.builder(caps);
             applications += 1;
             let applied = (rule.apply)(&mut builder, id, &node, &facts);
-            // Only a pass that grew the graph counts as a firing; a memo hit on
-            // an already-lowered node does not.
+            // Only a pass that actually grew the graph counts as a firing;
+            // a memo hit on an already-lowered node is not news.
             if applied.is_some() && graph.len() > before {
                 fired_counts[rid.0 as usize] += 1;
             }
@@ -281,17 +295,21 @@ mod tests {
         (g, vec![prod, f])
     }
 
-    /// The shipped budget. Every term in it is a count, not a clock.
+    /// The shipped budget. Kept as a named helper because the tests below
+    /// used to need a wall clock generous enough for a debug build; the
+    /// budget has no clock in it any more, so there is nothing to relax.
     fn untimed() -> SaturationBudget {
         SaturationBudget::default()
     }
 
     /// A fingerprint of a node's whole subterm, with ids erased.
     ///
-    /// Raw `(op, children)` keys cannot be compared across two rule orders: a
-    /// rewrite that names a freshly minted node (`KRegion::members`,
-    /// `KMerged::segments`) records the id it was given, and ids are a
-    /// creation-order artifact.
+    /// Raw [`NodeKey`]s cannot be compared across two rule orders: a rewrite
+    /// that names a freshly minted node — `KRegion::members` — necessarily
+    /// records the id it was given, and ids
+    /// are a creation-order artifact. Erasing them and recursing over the
+    /// children's fingerprints compares exactly the structure that carries
+    /// meaning.
     fn fingerprints(g: &EGraph) -> FxHashSet<u64> {
         use std::hash::{Hash, Hasher};
         let mut fp: Vec<u64> = Vec::with_capacity(g.len());
@@ -334,7 +352,8 @@ mod tests {
         out
     }
 
-    /// The fixed rule order carries no semantics.
+    /// Test 8. The fixed order exists for reproducibility and carries no
+    /// semantics.
     #[test]
     fn rule_order_is_semantically_inert() {
         let caps = ts::caps();
@@ -360,8 +379,8 @@ mod tests {
         assert_eq!(fa, fb);
     }
 
-    /// Every budget path returns `Ok`, reports the truncation, and leaves every
-    /// original L0 root with an L1 spelling.
+    /// Test 9. Every budget path returns `Ok`, reports the truncation, and
+    /// still leaves every original L0 root with an L1 spelling.
     #[test]
     fn budget_exhaustion_degrades_not_errors() {
         let caps = ts::caps();
@@ -392,9 +411,15 @@ mod tests {
         }
     }
 
-    /// Saturation is a pure function of `(graph, caps, rules, budget)`. Every
-    /// budget term is a count, so two runs reporting different `micros` report
-    /// the same of everything else.
+    /// Saturation is a pure function of `(graph, caps, rules, budget)`.
+    ///
+    /// It was not: the shipped budget carried a 2 ms deadline, and a
+    /// `rms_norm` of five lines truncated at 96 of its 134 nodes at a
+    /// different node every run. Which alternatives exist then depends on
+    /// machine load, and so does the `PlanHash` the cross-process plan cache
+    /// is keyed on. Every budget term is a count now, so this holds by
+    /// construction — and the report proves it, because the run that reports
+    /// the larger `micros` reports the same everything else.
     #[test]
     fn saturation_is_deterministic_under_any_wall_time() {
         let caps = ts::caps();
@@ -416,8 +441,9 @@ mod tests {
             assert_eq!(fp_again, fp);
         }
 
-        // A budget that stops the sweep part way stops it at the same place
-        // every time.
+        // And the *truncated* path is deterministic too, which is the case
+        // the deadline actually broke: a budget that stops the sweep part way
+        // stops it at the same place every time.
         let tight = SaturationBudget {
             max_applications: first.applications / 2,
             ..SaturationBudget::default()
@@ -434,12 +460,21 @@ mod tests {
         }
     }
 
-    /// Acyclicity does not hold structurally. `form_kregion` mints
-    /// `KRegion { members: [producer, fused] }` acyclically and `map_into_fold`
-    /// then unions that hash-consed `fused` into the class, retroactively
-    /// making the region name its own class. The invariant is enforced at
-    /// selection: `fusor2_cost::realize::selectable` drops a self-referential
-    /// member. `KRegion` is the only op allowed to name its own class.
+    /// ARCHITECTURE.md's acyclicity claim, checked rather than assumed.
+    ///
+    /// **It does not hold structurally, and this test says which rule breaks
+    /// it.** `form_kregion` can, and cannot be fixed by a guard: it mints
+    /// `KRegion { members: [producer, fused] }` acyclically, and then
+    /// `map_into_fold` unions that same hash-consed `fused` into the class
+    /// *afterwards*, retroactively making the region name its own class. Any
+    /// rule that names a node which a later union may pull into the reader's
+    /// class has the same shape.
+    ///
+    /// So the invariant is enforced at selection instead:
+    /// `fusor2_cost::realize::selectable` drops a self-referential member
+    /// before it can ever be chosen, which degrades the plan (no region
+    /// fusion) instead of making the class unextractable. What this test
+    /// pins is the boundary: the only violations left are `KRegion`s.
     #[test]
     fn the_only_self_referential_members_left_are_regions() {
         let caps = ts::caps();
@@ -468,15 +503,10 @@ mod tests {
                 );
             }
         }
-        // No `KMerged` of one survives.
-        for i in 0..g.len() {
-            if let Op::L1(L1::KMerged(w)) = &g.node(Id(i as u32)).op {
-                assert!(w.segments().len() >= 2, "a wave of one at %{i}");
-            }
-        }
     }
 
-    /// Hash-consing shares isomorphic layers outright.
+    /// Test 11. Hash-consing shares isomorphic layers outright, replacing the
+    /// reference's bounded plan-sharing window and its debug tripwire.
     #[test]
     fn hash_consing_shares_isomorphic_layers() {
         fn layer(g: &mut EGraph, input: Id, width: usize) -> Id {
@@ -498,7 +528,7 @@ mod tests {
         let first = layer(&mut g, x, 40);
         let after_first = g.len();
         // A second, structurally identical layer over the same input adds
-        // nothing: every subterm hash-conses.
+        // nothing at all: every subterm hash-conses.
         let second = layer(&mut g, x, 40);
         assert_eq!(second, first);
         assert_eq!(g.len(), after_first);
@@ -511,7 +541,8 @@ mod tests {
         assert!(r.saturated);
         let one_layer_nodes = r.final_nodes;
 
-        // A distinct second layer (different input) adds its own nodes.
+        // A genuinely distinct second layer (different input) adds its own
+        // nodes and nothing more.
         let mut h = ts::graph();
         let hx = ts::buffer(&mut h, Dtype::F32, &[Dim::Const(8), Dim::Const(16)]);
         let hy = ts::buffer(&mut h, Dtype::F32, &[Dim::Const(8), Dim::Const(16)]);
@@ -521,19 +552,21 @@ mod tests {
             .saturate(&mut h, &caps, CORE_RULES, untimed())
             .unwrap();
         assert!(r2.saturated);
+        // Two independent layers cost about twice one; the shared graph did
+        // not pay twice.
         assert!(r2.final_nodes > one_layer_nodes);
     }
 
-    /// A synthetic forward+backward graph of trainer size stays inside the
-    /// shipped budget.
+    /// Test 12. A synthetic forward+backward graph of roughly trainer size
+    /// stays inside the shipped budget.
     #[test]
     fn saturation_stays_in_budget_on_a_trainer_sized_graph() {
         let mut g = ts::graph();
         let shape = [Dim::Const(128), Dim::Const(64)];
         let mut layers: Vec<Id> = Vec::new();
         let mut cur = ts::buffer(&mut g, Dtype::F32, &shape);
-        // An elementwise stack, then the same again standing in for the
-        // adjoint.
+        // ~950 forward nodes: an elementwise stack with a reduction every
+        // eighth step, then the same again standing in for the adjoint.
         for step in 0..950u32 {
             cur = ts::map(
                 &mut g,

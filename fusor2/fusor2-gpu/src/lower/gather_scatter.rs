@@ -1,42 +1,58 @@
-//! `KGather`'s three modes and `KScatter`'s four.
+//! `KGather`'s two modes and `KScatter`'s two.
 //!
-//! [`ScatterMode::WgPrivateMerge`] has each workgroup zero a private
-//! `[bins x elem]` tile, accumulate its slice of the updates into it without
-//! atomics, barrier, then issue one atomic add per nonzero bin. Legality
-//! (`bins * elem_bytes <= max_compute_workgroup_storage_size`) is decided
-//! before lowering.
+//! There were three and four. The extra names promised bodies this file never
+//! had — a workgroup-private merge and a one-hot GEMM for the scatter, a
+//! four-wide run for the gather — and the first two reached this same dense
+//! nest while the third was never selected over any workload.
 //!
-//! Both nests read their lane tiling off `theta`; `KGather` and `KScatter`
-//! carry [`fusor2_ir::ir::level1::ScheduleDomain::Map`], the elementwise
-//! register-reuse domain a `KMap` carries.
+//! **Both nests read their lane tiling off `theta`.** `KGather` and `KScatter`
+//! carry [`fusor2_ir::ir::level1::ScheduleDomain::Map`] — the same elementwise
+//! register-reuse domain a `KMap` carries — and both bodies used to ignore it
+//! and run one element per lane at a constant block width. The mode was a
+//! compiler decision and the schedule was not, which is the same failure as
+//! writing a decision into a data structure the next decision cannot un-write:
+//! whichever of the four scatter lowerings won on cost then ran at a constant.
+//!
+//! **What this does not fix, measured.** The domain is minted (`TILE_GATHER`,
+//! `TILE_SCATTER` and the four `SCATTER_*` / three `GATHER_*` rules each carry
+//! a 12-point `MapDomain` on the trainer's embedding shape) but is never
+//! *selected*: `sigma` keeps the floor-lowered node, whose domain is
+//! `ScheduleDomain::Point`, so `theta` on every gather and scatter in the
+//! conformance suite is `SchedPoint::Point`. The reason is on the cost side,
+//! not here — `Roofline::node_math` (fusor2-cost/src/model.rs:224) ignores
+//! `SchedPoint::Map` entirely, and the only channel `tm` and `vector` have
+//! into a launch's price is `geometry_of` -> `resident_lanes`
+//! (fusor2-cost/src/realize.rs:581, :836), where a bigger tile means strictly
+//! fewer lanes and therefore an equal-or-worse occupancy scale. A tiled point
+//! can tie the untiled node but never beat it, and `RESELECT` accepts only
+//! strict improvements. Consuming `theta` is what makes the decision *mean*
+//! something once the model can see it; until then these nests run the
+//! untiled body, which is the same body they ran before.
+//!
+//! Owned by W9.
 
 use fusor2_ir::Result;
+use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::NumericContract;
 use fusor2_ir::error::Error;
+use fusor2_ir::ir::Node;
 use fusor2_ir::ir::level0::ScatterCombine;
-use fusor2_ir::ir::level1::{GatherMode, L1, MapTiling, Operand, SchedPoint, ScatterMode};
+use fusor2_ir::ir::level1::{GatherMode, L1, MapTiling, Operand, SchedPoint};
 use fusor2_ir::ir::level2::{
     Accumulator, Addr, ElementType, KernelIr, ScalarElement, Stmt, TileBinaryOp,
     TileCompareOp, TileExpr,
 };
-use crate::lower::{Ctx, distribute_workgroups};
-use fusor2_tile::domains::emitted_block;
-#[cfg(test)]
 use fusor2_ir::target::LowerCtx;
 
-/// Single-node entry point used by the tests below; production dispatch goes
-/// through `lower::lower_node`.
-#[cfg(test)]
-pub fn lower(
-    caps: &fusor2_ir::device::Caps,
-    node: &fusor2_ir::ir::Node,
-    theta: SchedPoint,
-    cx: &fusor2_ir::target::LowerCtx<'_>,
-) -> Result<KernelIr> {
+use crate::lower::{Ctx, DimBinding, distribute_workgroups};
+use fusor2_tile::domains::emitted_block;
+
+/// Contract-shaped entry point (see CONTRACTS.md §4.10).
+pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     let fusor2_ir::ir::Op::L1(op) = &node.op else {
         return Err(Error::Plan("gather_scatter got a foreign node".into()));
     };
-    let ctx = Ctx::new(caps, cx, crate::lower::DimBinding::new())?;
+    let ctx = Ctx::new(caps, cx, DimBinding::new())?;
     match op {
         L1::KGather { .. } => lower_kgather(ctx, op, theta),
         L1::KScatter { .. } => {
@@ -53,10 +69,17 @@ pub fn lower(
     }
 }
 
+// ---------------------------------------------------------------------------
+// The lane tiling, read off theta
+// ---------------------------------------------------------------------------
+
 /// The register-reuse tiling this launch runs at.
 ///
 /// [`SchedPoint::Point`] is the floor lowering's untiled point and resolves to
-/// one element per lane. Any other family is refused.
+/// one element per lane. That is `rules::lower_floor`'s guarantee that every
+/// chain reaches a valid L1 form when the saturation budget is exhausted, not
+/// a missing case — so it is answered, not refused. Any other family is a
+/// planner bug and says so.
 fn tiling(theta: SchedPoint) -> Result<MapTiling> {
     match theta {
         SchedPoint::Map(t) => Ok(MapTiling {
@@ -75,14 +98,24 @@ fn tiling(theta: SchedPoint) -> Result<MapTiling> {
     }
 }
 
-/// How far apart one lane's `tm` elements sit, and whether the tiling is legal
-/// on this shape.
+/// How far apart one lane's `tm` elements sit, and whether the tiling is
+/// legal at all on this shape.
 ///
 /// A lane owns `tm` elements one step of the tiled axis apart, which is
-/// `stride = prod(extents[axis+1..])` elements in the flattened space. The map
-/// is a bijection when `extents[..=axis].product() >= tm` and, for a `run`-wide
-/// contiguous group, `stride % run == 0`. Failing either, the tile degrades to
-/// 1 rather than the plan failing.
+/// `stride = prod(extents[axis+1..])` elements in the flattened space. Two
+/// conditions make the map from lanes to elements a bijection, and both are
+/// decided here on constants rather than assumed:
+///
+/// * `extents[..=axis].product() >= tm`, or the tiled axis has fewer blocks
+///   than the tile and the lanes stop short of the space (the `bins == 1`
+///   scatter, where a naive tiling silently drops every element past
+///   `total/tm`).
+/// * `stride % run == 0` when a lane also owns a `run`-wide contiguous group,
+///   or the run's residues drift across the tile and elements are written
+///   twice or not at all.
+///
+/// Failing either, the tile degrades to 1 rather than the plan failing: the
+/// schedule point stays selectable and simply buys nothing.
 fn tile_stride(extents: &[u64], axis: usize, tm: u32, run: u32) -> Option<u64> {
     if tm <= 1 || axis + 1 >= extents.len() {
         return None;
@@ -95,12 +128,13 @@ fn tile_stride(extents: &[u64], axis: usize, tm: u32, run: u32) -> Option<u64> {
     Some(stride)
 }
 
-/// The flat element offsets one lane owns, as integers: the arithmetic
+/// The flat element offsets one lane owns, as integers — the arithmetic
 /// [`lane_offset_exprs`] builds in `TileExpr`s, in a form a test can iterate.
 ///
 /// `thread` is the global lane index; `stride` and `tm` come from
 /// [`tile_stride`]; `run` is the contiguous group a vectorized mode reads in
-/// one go.
+/// one go. Read by the coverage test, which is the only place the scheme can
+/// be checked as a whole: an expression tree cannot be iterated over threads.
 #[cfg_attr(not(test), allow(dead_code))]
 fn lane_offsets(thread: u64, stride: u64, tm: u32, run: u32) -> Vec<u64> {
     let run = u64::from(run.max(1));
@@ -121,9 +155,11 @@ fn lane_offsets(thread: u64, stride: u64, tm: u32, run: u32) -> Vec<u64> {
 
 /// How many lanes the tile needs to cover a space of `n` elements.
 ///
-/// Not `n / (tm * run)`: the tiled axis is blocked, so the lane index has to
-/// reach `ceil(blocks / tm)` whole tiles even when the last one is partly
-/// masked, which costs one extra masked tile and covers the space.
+/// **Not `n / (tm * run)`.** The tiled axis is blocked, so the lane index has
+/// to reach `ceil(blocks / tm)` whole tiles even when the last one is partly
+/// masked: at `[13, 8]` with `tm = 2` the naive count is 52 lanes and element
+/// 100 is then written by nobody. Rounding up per block instead costs one
+/// extra masked tile and covers the space.
 fn lane_count(n: u64, stride: Option<u64>, tm: u32, run: u32) -> u64 {
     let run = u64::from(run.max(1));
     match stride {
@@ -145,14 +181,14 @@ fn lane_offset_exprs(
     run: u32,
 ) -> Vec<TileExpr> {
     let base = if run > 1 {
-        let run_e = ctx.b.lit_u32(run);
+        let run_e = ctx.b.u32(run);
         ctx.b.mul(thread, run_e)
     } else {
         thread
     };
     let (tile_base, stride_e, tm) = match stride {
         Some(s) if tm > 1 => {
-            let stride_e = ctx.b.lit_u32(u32::try_from(s).unwrap_or(u32::MAX));
+            let stride_e = ctx.b.u32(u32::try_from(s).unwrap_or(u32::MAX));
             let outer = ctx.b.binary(
                 TileBinaryOp::Div,
                 base.clone(),
@@ -166,7 +202,7 @@ fn lane_offset_exprs(
                 NumericContract::RELAXED,
             );
             let step = {
-                let tm_e = ctx.b.lit_u32(tm);
+                let tm_e = ctx.b.u32(tm);
                 ctx.b.mul(stride_e.clone(), tm_e)
             };
             let scaled = ctx.b.mul(outer, step);
@@ -180,7 +216,7 @@ fn lane_offset_exprs(
         let row = match (&stride_e, t) {
             (_, 0) => tile_base.clone(),
             (Some(s), _) => {
-                let t_e = ctx.b.lit_u32(t);
+                let t_e = ctx.b.u32(t);
                 let off = ctx.b.mul(s.clone(), t_e);
                 ctx.b.add(tile_base.clone(), off)
             }
@@ -190,7 +226,7 @@ fn lane_offset_exprs(
             if r == 0 {
                 out.push(row.clone());
             } else {
-                let r_e = ctx.b.lit_u32(r);
+                let r_e = ctx.b.u32(r);
                 out.push(ctx.b.add(row.clone(), r_e));
             }
         }
@@ -198,11 +234,16 @@ fn lane_offset_exprs(
     out
 }
 
+// ---------------------------------------------------------------------------
+// Gather
+// ---------------------------------------------------------------------------
+
 /// `RowPerGroup` and `Vectorized`, each at the lane tiling `theta` selected.
 ///
-/// The mode fixes the contiguous group one lane reads (`Vectorized`'s four f32
-/// are one `dwordx4`); `theta` fixes how many such groups a lane owns and how
-/// far apart they sit. The two are independent.
+/// The mode fixes the *contiguous* group one lane reads (`Vectorized`'s four
+/// f32 are one `dwordx4`); `theta` fixes how many such groups a lane owns and
+/// how far apart they sit. They are independent, so a vectorized gather is
+/// still register-tiled and a scalar one is not forced to be untiled.
 pub fn lower_kgather(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<KernelIr> {
     let L1::KGather {
         space,
@@ -228,7 +269,8 @@ pub fn lower_kgather(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
     let limits = ctx.caps.limits;
 
     // The output index space, and the one axis on which the source differs
-    // from it.
+    // from it. `axis` was previously ignored and every gather addressed as if
+    // it were axis 0, which is only right when the gathered axis is outermost.
     let mut extents = Vec::with_capacity(space.dims.len());
     for d in &space.dims {
         extents.push(ctx.binding.require(*d)?);
@@ -237,7 +279,8 @@ pub fn lower_kgather(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
         return Err(Error::Plan("gather axis is out of range".into()));
     }
     let n_u64: u64 = extents.iter().copied().product::<u64>().max(1);
-    // `inner`: the elements one gathered coordinate spans, i.e. the row width.
+    // `inner`: the elements one gathered coordinate spans. `width` keeps its
+    // old name for the quantized branch, where it is the row width.
     let inner_u64: u64 = extents[axis + 1..].iter().copied().product::<u64>().max(1);
     let width = u32::try_from(inner_u64)
         .map_err(|_| Error::Plan("gather row width exceeds a u32".into()))?
@@ -255,15 +298,10 @@ pub fn lower_kgather(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
         .map_err(|_| Error::Plan("gather source extent exceeds a u32".into()))?;
     let src_stride = src_axis.max(1) * width;
 
-    // Four elements per lane makes a 4-wide f32 row one `dwordx4`.
-    let run = if matches!(mode, GatherMode::Vectorized) {
-        4
-    } else {
-        1
-    };
-    // `theta` says how many such groups one lane owns, one step of the tiled
-    // axis apart. `dim` names an axis of this node's own `space`, the output
-    // space every address below is decomposed against.
+    let run = 1;
+    // ... and `theta` says how many such groups one lane owns, one step of
+    // the tiled axis apart. `dim` names an axis of this node's own `space`,
+    // which is the output space every address below is decomposed against.
     let tiling = tiling(theta)?;
     let stride = tiling
         .dim
@@ -279,13 +317,14 @@ pub fn lower_kgather(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
 
     let thread = ctx.global_index(block, grid);
     // A vectorized lane owns `run` *consecutive* output elements, so the flat
-    // base steps by `run`.
+    // base steps by `run`. Adding the lane to the column instead made four
+    // threads write the same four elements.
     let offsets = lane_offset_exprs(&mut ctx, thread, stride, tm, run);
 
-    let width_e = ctx.b.lit_u32(width);
-    let out_stride_e = ctx.b.lit_u32(out_stride);
-    let src_stride_e = ctx.b.lit_u32(src_stride);
-    let n_e = ctx.b.lit_u32(u32::try_from(n_u64).unwrap_or(u32::MAX));
+    let width_e = ctx.b.u32(width);
+    let out_stride_e = ctx.b.u32(out_stride);
+    let src_stride_e = ctx.b.u32(src_stride);
+    let n_e = ctx.b.u32(u32::try_from(n_u64).unwrap_or(u32::MAX));
 
     // Split the flat output index into (outer, gathered, within).
     let decompose = |ctx: &mut Ctx<'_>, flat: TileExpr| {
@@ -318,7 +357,11 @@ pub fn lower_kgather(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
 
     let mut body = Vec::new();
     match mode {
-        GatherMode::RowPerGroup | GatherMode::Vectorized => {
+        // `QuantizedRows` shares the scalar nest: `src_addr` is a flat index
+        // into the source's dense logical space either way, and
+        // `load_operand` runs the format's decode program there because the
+        // operand *is* the quantized leaf. Only gathered rows ever decode.
+        GatherMode::RowPerGroup | GatherMode::QuantizedRows => {
             for flat in &offsets {
                 let flat = flat.clone();
                 let (outer, g, within) = decompose(&mut ctx, flat.clone());
@@ -348,34 +391,39 @@ pub fn lower_kgather(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
     Ok(ctx.finish("kgather", grid, block, body))
 }
 
-/// The four `ScatterMode`s name one map and differ only in strategy; all lower
-/// through one nest: one lane per output element, a counted loop over the
-/// updates, costing `O(out x updates)` index comparisons.
+// ---------------------------------------------------------------------------
+// Scatter
+// ---------------------------------------------------------------------------
+
+/// Both `ScatterMode`s name one map and differ only in *strategy*, and on
+/// this runtime they lower through one nest: **one lane per output
+/// element, a counted loop over the updates**.
 ///
-/// The update-parallel forms need the output buffer to already hold the base.
-/// `derive_bindings` gives a `KScatter`'s value its own buffer and nothing
-/// copies the base in, so they would leave every unwritten element undefined.
+/// The update-parallel forms (one lane per update, `atomicAdd` or a
+/// workgroup-private histogram) are correct only when the output buffer
+/// already holds the base. It does not: `derive_bindings` gives a `KScatter`'s
+/// value its own buffer and nothing copies the base in, so an update-parallel
+/// kernel left every unwritten element undefined — which is why `cat`,
+/// `stack`, `pad`, `repeat` and `slice_assign` read back as zeros. Reinstating
+/// them is a **planner** change: an `Effect::InPlace(BufferRole(0))` scatter
+/// has to be given its base operand's buffer, and `fusor2-cost` does not do
+/// that today. Until it does, one nest that reads the base is the only correct
+/// answer, and it costs `O(out x updates)` index comparisons.
 pub fn lower_kscatter(ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Vec<KernelIr>> {
-    let L1::KScatter { mode, .. } = op else {
+    let L1::KScatter { .. } = op else {
         return Err(Error::Plan("lower_kscatter on a non-KScatter node".into()));
     };
-    if *mode == ScatterMode::OneHotContract {
-        return Err(Error::Plan(
-            "OneHotContract is present only as the candidate the cost model rejects; it \
-             lowers through KContract, not here"
-                .into(),
-        ));
-    }
     scatter_dense(ctx, op, tiling(theta)?).map(|k| vec![k])
 }
 
-/// A scatter's destination geometry, read off the base operand rather than off
-/// `space`.
+/// A scatter's destination geometry, read off the **base operand** rather than
+/// off `space`.
 ///
-/// `space` is minted two ways (`rules::lower_floor` hands the output space,
-/// `fusor2_tile::rules::scatter` the update space), so neither the bin count
-/// nor the update count can be read off it. The base operand's layout gives the
-/// destination shape and the index operand's gives the update count.
+/// `space` is minted two ways — `rules::lower_floor` hands the output space,
+/// `fusor2_tile::rules::scatter` hands the update space — so neither the bin
+/// count nor the update count can be read off it. The base operand's layout
+/// gives the destination shape and the index operand's gives the update count,
+/// under either convention.
 struct ScatterShape {
     /// Product of the base extents before the scattered axis.
     outer: u32,
@@ -429,11 +477,23 @@ fn scatter_shape(ctx: &Ctx<'_>, op: &L1) -> Result<ScatterShape> {
 /// lane tiling `theta` selected.
 ///
 /// Every output element is written by exactly one lane, so no atomic is needed
-/// and the result is bit-reproducible at any occupancy. `tm` is the number of
-/// destination bins one lane owns; the `idx[u]` read hash-conses to one
-/// expression serving `tm` accumulators. The bins axis is the only one tileable
-/// without breaking store coalescing. `theta.dim` is not read here: `space` is
-/// minted two ways, so an axis index from it cannot name a destination axis.
+/// and the accumulation order is fixed: the result is bit-reproducible at any
+/// occupancy, which is what `verify_l1`'s associativity obligation asks for.
+///
+/// **`tm` is the number of destination bins one lane owns**, and it is what
+/// makes this nest affordable on the embedding gradient. The loop over the
+/// updates costs one `idx[u]` read per output element per update; with `tm`
+/// bins in one lane the read is hash-consed to *one* expression serving `tm`
+/// accumulators, so the index traffic — the dominant term at
+/// `bins * inner >> updates` — falls by `tm`. The bins axis is also the only
+/// one that can be tiled without breaking store coalescing: consecutive lanes
+/// still write consecutive `inner` positions.
+///
+/// `theta.dim` is deliberately **not** read here. `space` is minted two ways
+/// (`rules::lower_floor` hands the output space, `fusor2_tile::rules::scatter`
+/// hands the update space), so an axis index taken from it cannot be
+/// identified with an axis of the destination this nest walks. `tm` needs no
+/// such identification.
 fn scatter_dense(mut ctx: Ctx<'_>, op: &L1, tiling: MapTiling) -> Result<KernelIr> {
     let L1::KScatter { combine, ops, .. } = op else {
         return Err(Error::Plan("scatter_dense on a non-KScatter node".into()));
@@ -478,12 +538,12 @@ fn scatter_dense(mut ctx: Ctx<'_>, op: &L1, tiling: MapTiling) -> Result<KernelI
 
     let thread = ctx.global_index(block, grid);
     let offsets = lane_offset_exprs(&mut ctx, thread, stride, tm, 1);
-    let bound = ctx.b.lit_u32(u32::try_from(total).unwrap_or(u32::MAX));
+    let bound = ctx.b.u32(u32::try_from(total).unwrap_or(u32::MAX));
 
-    let inner_e = ctx.b.lit_u32(shape.inner);
-    let bins_e = ctx.b.lit_u32(shape.bins);
-    let row_span = ctx.b.lit_u32(shape.bins.saturating_mul(shape.inner).max(1));
-    let updates_e = ctx.b.lit_u32(shape.updates);
+    let inner_e = ctx.b.u32(shape.inner);
+    let bins_e = ctx.b.u32(shape.bins);
+    let row_span = ctx.b.u32(shape.bins.saturating_mul(shape.inner).max(1));
+    let updates_e = ctx.b.u32(shape.updates);
 
     // One index read per update, shared by every accumulator this lane
     // carries: `u_bin` does not depend on the output element, so the `tm`
@@ -539,8 +599,9 @@ fn scatter_dense(mut ctx: Ctx<'_>, op: &L1, tiling: MapTiling) -> Result<KernelI
         };
         let v = ctx.load_operand(&upd, upd_index)?;
         let v = ctx.b.cast(v, ElementType::Scalar(acc_elem));
-        // Under `Add` duplicate indices accumulate. `Set` is reachable only
-        // when the node proved its indices unique.
+        // `Add` duplicates accumulate — normative: an embedding table receiving
+        // one token twice gets the summed gradient. `Set` is only reachable when
+        // the node proved its indices unique.
         let combined = match combine {
             ScatterCombine::Add => ctx.b.add(acc_read.clone(), v),
             ScatterCombine::Set => v,
@@ -562,7 +623,7 @@ fn scatter_dense(mut ctx: Ctx<'_>, op: &L1, tiling: MapTiling) -> Result<KernelI
         });
     }
 
-    let count = ctx.b.lit_u32(shape.updates);
+    let count = ctx.b.u32(shape.updates);
     let mut body = vec![Stmt::Loop {
         count: Some(count),
         index: Some(u_local),
@@ -587,7 +648,8 @@ fn index_and_update(ops: &[Operand]) -> Result<(&Operand, &Operand)> {
     }
 }
 
-/// A host reference scatter-add. Duplicate indices accumulate.
+/// A host reference scatter-add, used by the conformance case that pits the
+/// three `Add` lowerings against each other. Duplicate indices accumulate.
 pub fn reference_scatter_add(
     bins: usize,
     elem: usize,
@@ -610,6 +672,7 @@ pub fn reference_scatter_add(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fusor2_ir::ir::level1::ScatterMode;
     use fusor2_ir::cost::Picoseconds;
     use fusor2_ir::dtype::Dtype;
     use fusor2_ir::egraph::{EGraph, Id};
@@ -625,8 +688,14 @@ mod tests {
     use smallvec::SmallVec;
     use std::sync::Arc;
 
-    /// Every element of the space is written by exactly one lane, at every
-    /// tiling the domain can offer.
+    // -----------------------------------------------------------------------
+    // The address scheme
+    // -----------------------------------------------------------------------
+
+    /// Every element of the space, written by exactly one lane, at every
+    /// tiling the domain can offer. This is the property the whole change
+    /// rests on: a tiling that covers the space twice or not at all is a
+    /// wrong answer that no shape test would notice.
     fn covers_exactly_once(extents: &[u64], axis: usize, tm: u32, run: u32) {
         let n: u64 = extents.iter().product();
         let Some(stride) = tile_stride(extents, axis, tm, run) else {
@@ -656,28 +725,34 @@ mod tests {
                 covers_exactly_once(&[64, 8], 0, tm, run);
                 covers_exactly_once(&[4, 32, 8], 1, tm, run);
                 covers_exactly_once(&[4, 32, 8], 0, tm, run);
-                // Extents that do not divide the tile.
+                // extents that do not divide the tile: the tail is masked,
+                // never doubled.
                 covers_exactly_once(&[13, 8], 0, tm, run);
                 covers_exactly_once(&[7, 5, 12], 1, tm, run);
             }
         }
     }
 
-    /// Both bijection conditions decline to a tile of 1 rather than failing the
-    /// plan.
+    /// The two conditions that make the tile a bijection are checked, not
+    /// assumed. Both decline to 1 rather than failing the plan.
     #[test]
     fn a_tile_that_would_drop_elements_declines() {
-        // Fewer blocks than the tile.
+        // fewer blocks than the tile: 3 rows cannot host a 4-wide tile
         assert_eq!(tile_stride(&[3, 8], 0, 4, 1), None);
-        // One bin.
+        // one bin: the scatter shape where a naive tile drops everything past
+        // total/tm
         assert_eq!(tile_stride(&[1, 1, 768], 1, 4, 1), None);
-        // A 4-wide contiguous run inside a stride that is not a multiple of 4.
+        // a 4-wide contiguous run inside a stride that is not a multiple of 4
         assert_eq!(tile_stride(&[64, 6], 0, 4, 4), None);
         assert_eq!(tile_stride(&[64, 8], 0, 4, 4), Some(8));
-        // The innermost axis is never tiled, and tm = 1 is untiled.
+        // the innermost axis is never tiled, and tm = 1 is untiled
         assert_eq!(tile_stride(&[64, 8], 1, 4, 1), None);
         assert_eq!(tile_stride(&[64, 8], 0, 1, 1), None);
     }
+
+    // -----------------------------------------------------------------------
+    // The lowering reads it
+    // -----------------------------------------------------------------------
 
     fn dims(v: &[u64]) -> SmallVec<[Dim; 6]> {
         v.iter().map(|d| Dim::Const(*d)).collect()
@@ -722,7 +797,8 @@ mod tests {
                 members: smallvec::smallvec![root],
                 bindings,
                 grid: [1, 1, 1],
-                // A placeholder: `lower` recomputes the width off `caps`.
+                // A placeholder: `lower` recomputes the width off `caps`, so
+                // the plan's value is never what the kernel is built with.
                 block: 256,
             }],
             buffers: Vec::new(),
@@ -802,7 +878,8 @@ mod tests {
     }
 
     /// `theta` is read: `tm` bins per lane is `tm` accumulators in the one
-    /// update loop, `tm` stores, and `tm` times fewer lanes launched.
+    /// update loop, `tm` stores, and `tm` times fewer lanes launched. Every
+    /// one of those was a constant before.
     #[test]
     fn the_scatter_reads_its_lane_tile_off_theta() {
         let untiled = scatter_ir(map_point(None, 1, 1), 1024, 8, 16).expect("lowers");
@@ -812,7 +889,7 @@ mod tests {
         assert_eq!(untiled.body.len(), 2);
         assert_eq!(tiled.body.len(), 5);
         assert_eq!(untiled.grid[0], tiled.grid[0] * 4);
-        // The floor's own point is the untiled body.
+        // ... and the floor's own point is still the untiled body, unchanged.
         let floor = scatter_ir(SchedPoint::Point, 1024, 8, 16).expect("lowers");
         assert_eq!(floor.grid, untiled.grid);
         assert_eq!(floor.body.len(), untiled.body.len());
@@ -830,21 +907,10 @@ mod tests {
         assert_eq!(untiled.grid[0], tiled.grid[0] * 4);
     }
 
-    /// The mode's contiguous run and the schedule's tile are independent: a
-    /// vectorized gather at `tm` owns `4 * tm` elements, not one or the other.
-    #[test]
-    fn a_vectorized_gather_keeps_its_run_and_takes_the_tile_too() {
-        let plain = gather_ir(map_point(None, 1, 1), GatherMode::Vectorized, 512, 128, 8)
-            .expect("lowers");
-        let tiled = gather_ir(map_point(Some(0), 4, 1), GatherMode::Vectorized, 512, 128, 8)
-            .expect("lowers");
-        assert_eq!(plain.body.len(), 4, "the 4-wide run survives untiled");
-        assert_eq!(tiled.body.len(), 16, "4 run x 4 tile");
-        assert_eq!(plain.grid[0], tiled.grid[0] * 4);
-    }
-
     /// A tile the shape cannot host degrades to the untiled body instead of
-    /// failing the plan.
+    /// failing the plan: the point stays selectable and simply buys nothing.
+    /// A `bins == 1` scatter is the case that matters — a naive tiling drops
+    /// every element past `total / tm`.
     #[test]
     fn an_unhostable_tile_degrades_instead_of_failing() {
         let one_bin = scatter_ir(map_point(Some(0), 8, 1), 1, 768, 4).expect("lowers");
@@ -854,8 +920,10 @@ mod tests {
         assert_eq!(short.body.len(), 1);
     }
 
-    /// Every point of the domain these nodes carry lowers; a selectable point
-    /// that cannot be lowered makes extraction prefer a plan that then fails.
+    /// The domain these nodes carry is non-trivial on the trainer's embedding
+    /// gradient — 1,024 bins x 768 units, 384 updates — and every point of it
+    /// lowers. A selectable point that cannot be lowered is worse than no
+    /// domain: it makes extraction *prefer* a plan that then fails.
     #[test]
     fn the_embedding_gradient_scatter_carries_a_real_domain_and_all_of_it_lowers() {
         let caps = crate::emit::testkit::caps(false, true);
@@ -871,12 +939,10 @@ mod tests {
             scatter_ir(SchedPoint::Map(*t), 1024, 24, 8).expect("every point lowers");
             gather_ir(SchedPoint::Map(*t), GatherMode::RowPerGroup, 384, 1024, 24)
                 .expect("every point lowers");
-            gather_ir(SchedPoint::Map(*t), GatherMode::Vectorized, 384, 1024, 24)
-                .expect("every point lowers");
         }
     }
 
-    /// A point from another family is refused.
+    /// A point from another family is a planner bug, not a shrug.
     #[test]
     fn a_foreign_schedule_family_is_refused() {
         assert!(tiling(SchedPoint::Point).is_ok());
@@ -884,8 +950,9 @@ mod tests {
         assert!(tiling(SchedPoint::Fold(FoldStrat::Subgroup)).is_err());
     }
 
-    /// Duplicate indices accumulate, and a padding row naming an out-of-range
-    /// bin contributes nothing.
+    /// The semantic half of the `wg_private_merge_scatter_matches_reference`
+    /// case, checkable without an adapter: duplicate indices accumulate, and a
+    /// padding row naming an out-of-range bin contributes nothing.
     #[test]
     fn reference_scatter_add_accumulates_duplicates() {
         let indices = [3u32, 3, 0, 9999];
@@ -906,7 +973,7 @@ mod tests {
 
     #[test]
     fn skewed_bins_still_sum_exactly() {
-        // 7% of the indices forced into one bin.
+        // 7% of the indices forced into one bin, the trainer's worst case.
         let indices: Vec<u32> = (0..1024)
             .map(|i| if i % 14 == 0 { 7 } else { i as u32 })
             .collect();
