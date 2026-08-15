@@ -187,7 +187,7 @@ impl Sam {
             IMAGE_SIZE,
             "low-res mask W ({lr_w}) must divide IMAGE_SIZE ({IMAGE_SIZE})",
         );
-        let upscaled = low_res_mask.upsample_nearest2d(scale_h as u32, scale_w as u32);
+        let upscaled = low_res_mask.upsample_nearest2d(scale_h, scale_w);
 
         // Crop to original size: narrow on H and W dims
         let cropped = upscaled
