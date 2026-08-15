@@ -10,25 +10,30 @@
 use fusor2::sampling::mirostat2::Mirostat2Sampler;
 use fusor2::sampling::standard::{StandardSamplerParams, sample};
 use fusor2::sampling::top_k::top_k_pairs;
-use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;
+use fusor2::{Dtype, Session};
 
-use crate::harness::{CaseError, CaseResult, Cases, dims};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, fuzz_case};
 use crate::suite::support::{Domain, expect_values, graph_of, read, upload};
 
-/// A vocabulary small enough to enumerate on the host.
+/// The fixed vocabulary of the hand-authored tie table.
 const VOCAB: usize = 16;
 
-/// Logits with a clear ordering and one deliberate exact tie, so the tie rule
-/// — larger token id wins — is observable.
-fn logits() -> Vec<f32> {
-    let mut v = Domain::Custom(-3.0, 3.0).sample(2101, VOCAB);
-    // Tokens 4 and 11 tie exactly, at a value that is not the maximum.
-    v[4] = 1.25;
-    v[11] = 1.25;
-    // One unambiguous maximum.
-    v[7] = 5.0;
-    v
+/// Vocabulary range for the sampler cases. The floor of 2 keeps a runner-up
+/// available for the repetition penalty and the top-k filter.
+const VOCAB_SPEC: &[FuzzDim] = &[FuzzDim::Range(2, 128)];
+
+/// Vocabulary range for the top-k ordering cases; k = 1 is legal at vocab 1.
+const TOP_K_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 64)];
+
+/// A floor of 8 keeps "64 seeds all drew the same token" out of reach of an
+/// honest sampler at temperature 2 over logits in [-3, 3].
+const SEED_SPEC: &[FuzzDim] = &[FuzzDim::Range(8, 128)];
+
+/// Random logits over a fuzzed vocabulary. Distinct LCG draws never tie, so
+/// the host ordering is unambiguous; the tie rule has its own fixed case.
+fn fuzzed_logits(seed: u32, vocab: usize) -> Vec<f32> {
+    Domain::Custom(-3.0, 3.0).sample(seed, vocab)
 }
 
 /// `(value, token)` pairs sorted descending, ties broken by the larger token
@@ -56,65 +61,105 @@ fn upload_logits(session: &Session, values: &[f32]) -> Result<(fusor2::Graph, Te
 
 pub fn cases() -> Cases {
     let mut cases = Cases::new();
-    cases.push("sampling", "top_k_pairs_k1", |s| top_k_case(s, 1));
-    cases.push("sampling", "top_k_pairs_k4", |s| top_k_case(s, 4));
-    cases.push("sampling", "top_k_pairs_full_vocabulary", |s| {
-        top_k_case(s, VOCAB)
-    });
+    cases.push_case(fuzz_case(
+        "sampling",
+        "top_k_pairs_k1",
+        TOP_K_SPEC,
+        |s, shape, seed| top_k_case(s, shape[0] as usize, 1, seed),
+    ));
+    cases.push_case(fuzz_case(
+        "sampling",
+        "top_k_pairs_sampled_k",
+        TOP_K_SPEC,
+        |s, shape, seed| {
+            let vocab = shape[0] as usize;
+            let k = Rng::new(seed ^ 0x5eed).range(1, vocab as u64) as usize;
+            top_k_case(s, vocab, k, seed)
+        },
+    ));
+    cases.push_case(fuzz_case(
+        "sampling",
+        "top_k_pairs_full_vocabulary",
+        TOP_K_SPEC,
+        |s, shape, seed| top_k_case(s, shape[0] as usize, shape[0] as usize, seed),
+    ));
     cases.push(
         "sampling",
         "top_k_pairs_breaks_ties_by_larger_token_id",
         tie_rule,
     );
-    cases.push("sampling", "sample_standard_token", standard_case);
-    cases.push(
+    cases.push_case(fuzz_case(
+        "sampling",
+        "sample_standard_token",
+        VOCAB_SPEC,
+        standard_case,
+    ));
+    cases.push_case(fuzz_case(
         "sampling",
         "sample_standard_token_at_zero_temperature_is_the_argmax",
+        VOCAB_SPEC,
         greedy_case,
-    );
-    cases.push(
+    ));
+    cases.push_case(fuzz_case(
         "sampling",
         "sample_standard_token_respects_top_k",
+        VOCAB_SPEC,
         top_k_filter,
-    );
-    cases.push(
+    ));
+    cases.push_case(fuzz_case(
         "sampling",
         "sample_standard_token_respects_top_p",
+        VOCAB_SPEC,
         top_p_filter,
-    );
-    cases.push(
+    ));
+    cases.push_case(fuzz_case(
         "sampling",
         "sample_standard_token_respects_min_p",
+        VOCAB_SPEC,
         min_p_filter,
-    );
-    cases.push(
+    ));
+    cases.push_case(fuzz_case(
         "sampling",
         "sample_standard_token_applies_the_repetition_penalty",
+        VOCAB_SPEC,
         repetition_case,
-    );
-    cases.push(
+    ));
+    cases.push_case(fuzz_case(
         "sampling",
         "sample_standard_token_is_seed_deterministic",
+        SEED_SPEC,
         seed_case,
-    );
-    cases.push("sampling", "sample_mirostat2_token", mirostat_case);
-    cases.push("sampling", "sample_mirostat2_token_updates_mu", mirostat_mu);
-    cases.push(
+    ));
+    cases.push_case(fuzz_case(
+        "sampling",
+        "sample_mirostat2_token",
+        VOCAB_SPEC,
+        mirostat_case,
+    ));
+    cases.push_case(fuzz_case(
+        "sampling",
+        "sample_mirostat2_token_updates_mu",
+        VOCAB_SPEC,
+        mirostat_mu,
+    ));
+    cases.push_case(fuzz_case(
         "sampling",
         "sample_standard_token_pending_stays_on_device",
+        VOCAB_SPEC,
         pending_standard,
-    );
-    cases.push(
+    ));
+    cases.push_case(fuzz_case(
         "sampling",
         "sample_mirostat2_token_pending_stays_on_device",
+        VOCAB_SPEC,
         pending_mirostat,
-    );
+    ));
     cases
 }
 
 /// `top_k_pairs(k)` on a rank-1 f32 row: values descending, indices matching.
-fn top_k_case(session: &Session, k: usize) -> CaseResult {
-    let values = logits();
+fn top_k_case(session: &Session, vocab: usize, k: usize, seed: u32) -> CaseResult {
+    let values = fuzzed_logits(seed, vocab);
     let (_graph, t) = upload_logits(session, &values)?;
     let (got_values, got_indices) = top_k_pairs(&t, k as u32)
         .map_err(|e| -> CaseError { format!("top_k_pairs({k}): {e}").into() })?;
@@ -161,8 +206,9 @@ fn tie_rule(session: &Session) -> CaseResult {
 }
 
 /// A sampled token is always a legal token id.
-fn standard_case(session: &Session) -> CaseResult {
-    let values = logits();
+fn standard_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let vocab = shape[0] as usize;
+    let values = fuzzed_logits(seed, vocab);
     let (_graph, t) = upload_logits(session, &values)?;
     let params = StandardSamplerParams {
         temperature: 1.0,
@@ -173,21 +219,24 @@ fn standard_case(session: &Session) -> CaseResult {
         .map_err(|e| -> CaseError { e.to_string().into() })?
         .to_u32()
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    if token as usize >= VOCAB {
-        return Err(format!("sampled token {token} is outside a vocabulary of {VOCAB}").into());
+    if token as usize >= vocab {
+        return Err(format!("sampled token {token} is outside a vocabulary of {vocab}").into());
     }
     Ok(())
 }
 
 /// Temperature 0 collapses the distribution onto the argmax.
-fn greedy_case(session: &Session) -> CaseResult {
-    let values = logits();
+fn greedy_case(session: &Session, shape: &[u64], data_seed: u32) -> CaseResult {
+    let vocab = shape[0] as usize;
+    let mut values = fuzzed_logits(data_seed, vocab);
     let argmax = values
         .iter()
         .enumerate()
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i as u32)
         .expect("a non-empty row");
+    // The maximum must be unambiguous or the case pins nothing.
+    values[argmax as usize] += 1.0;
 
     let (_graph, t) = upload_logits(session, &values)?;
     for seed in [0u64, 1, 12_345] {
@@ -211,15 +260,17 @@ fn greedy_case(session: &Session) -> CaseResult {
 }
 
 /// With `top_k = n`, only the n highest-scoring tokens can ever be returned.
-fn top_k_filter(session: &Session) -> CaseResult {
-    const K: usize = 3;
-    let values = logits();
-    let allowed: Vec<u32> = host_top_k(&values, K).into_iter().map(|(_, i)| i).collect();
+fn top_k_filter(session: &Session, shape: &[u64], data_seed: u32) -> CaseResult {
+    let vocab = shape[0] as usize;
+    // k < vocab, so the filter always excludes something.
+    let k = Rng::new(data_seed ^ 0x5eed).range(1, vocab as u64 - 1) as usize;
+    let values = fuzzed_logits(data_seed, vocab);
+    let allowed: Vec<u32> = host_top_k(&values, k).into_iter().map(|(_, i)| i).collect();
     let (_graph, t) = upload_logits(session, &values)?;
     for seed in 0..16u64 {
         let params = StandardSamplerParams {
             temperature: 1.5,
-            top_k: K as u32,
+            top_k: k as u32,
             seed,
             ..Default::default()
         };
@@ -229,7 +280,7 @@ fn top_k_filter(session: &Session) -> CaseResult {
             .map_err(|e| -> CaseError { e.to_string().into() })?;
         if !allowed.contains(&token) {
             return Err(format!(
-                "top_k = {K} sampled {token}, which is not in the surviving set {allowed:?}"
+                "top_k = {k} sampled {token}, which is not in the surviving set {allowed:?}"
             )
             .into());
         }
@@ -239,9 +290,10 @@ fn top_k_filter(session: &Session) -> CaseResult {
 
 /// Nucleus sampling: only the smallest prefix of the sorted distribution whose
 /// mass reaches `top_p` may be sampled from.
-fn top_p_filter(session: &Session) -> CaseResult {
+fn top_p_filter(session: &Session, shape: &[u64], data_seed: u32) -> CaseResult {
     const P: f32 = 0.5;
-    let values = logits();
+    let vocab = shape[0] as usize;
+    let values = fuzzed_logits(data_seed, vocab);
     let allowed = nucleus(&values, P);
     let (_graph, t) = upload_logits(session, &values)?;
     for seed in 0..16u64 {
@@ -289,9 +341,10 @@ fn nucleus(values: &[f32], p: f32) -> Vec<u32> {
 /// `StandardSamplerParams` now carries the knob, so this case requests the
 /// filter and checks the draw against the surviving set, the same shape as
 /// `top_p_filter`.
-fn min_p_filter(session: &Session) -> CaseResult {
+fn min_p_filter(session: &Session, shape: &[u64], data_seed: u32) -> CaseResult {
     const MIN_P: f32 = 0.2;
-    let values = logits();
+    let vocab = shape[0] as usize;
+    let values = fuzzed_logits(data_seed, vocab);
     let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = values.iter().map(|v| (v - max).exp()).collect();
     let total: f32 = exps.iter().sum();
@@ -328,10 +381,17 @@ fn min_p_filter(session: &Session) -> CaseResult {
 
 /// A repetition penalty of `r > 1` must make an already-seen token strictly
 /// less likely — at temperature 0 that means the argmax moves off it.
-fn repetition_case(session: &Session) -> CaseResult {
-    let mut values = vec![0.0f32; VOCAB];
-    values[7] = 2.0;
-    values[2] = 1.9;
+fn repetition_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let vocab = shape[0] as usize;
+    // The penalized token and its runner-up are sampled ids; the offset keeps
+    // them distinct.
+    let seen = fill_indices(seed ^ 0x5eed, 1, vocab as u32)[0] as usize;
+    let offset = fill_indices(seed ^ 0x9e37_79b9, 1, vocab as u32 - 1)[0] as usize;
+    let runner = (seen + 1 + offset) % vocab;
+    // The baseline stays below both peaks, so the argmax order is exact.
+    let mut values = Domain::Custom(-1.0, 0.0).sample(seed, vocab);
+    values[seen] = 2.0;
+    values[runner] = 1.9;
     let (_graph, t) = upload_logits(session, &values)?;
 
     let plain = StandardSamplerParams {
@@ -343,8 +403,8 @@ fn repetition_case(session: &Session) -> CaseResult {
         .map_err(|e| -> CaseError { e.to_string().into() })?
         .to_u32()
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    if first != 7 {
-        return Err(format!("the unpenalized argmax is {first}, want 7").into());
+    if first != seen as u32 {
+        return Err(format!("the unpenalized argmax is {first}, want {seen}").into());
     }
 
     let penalized = StandardSamplerParams {
@@ -369,8 +429,9 @@ fn repetition_case(session: &Session) -> CaseResult {
 
 /// The same seed must give the same token, and at least one other seed must
 /// give a different one — otherwise the sampler is not sampling.
-fn seed_case(session: &Session) -> CaseResult {
-    let values = logits();
+fn seed_case(session: &Session, shape: &[u64], data_seed: u32) -> CaseResult {
+    let vocab = shape[0] as usize;
+    let values = fuzzed_logits(data_seed, vocab);
     let (_graph, t) = upload_logits(session, &values)?;
     let draw = |seed: u64| -> Result<u32, CaseError> {
         let params = StandardSamplerParams {
@@ -406,8 +467,9 @@ fn seed_case(session: &Session) -> CaseResult {
 }
 
 /// Mirostat-2 returns a legal token and keeps its mu on device between calls.
-fn mirostat_case(session: &Session) -> CaseResult {
-    let values = logits();
+fn mirostat_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let vocab = shape[0] as usize;
+    let values = fuzzed_logits(seed, vocab);
     let (_graph, t) = upload_logits(session, &values)?;
     let mut sampler = Mirostat2Sampler::new(5.0, 0.1);
     for _ in 0..4 {
@@ -416,7 +478,7 @@ fn mirostat_case(session: &Session) -> CaseResult {
             .map_err(|e| -> CaseError { e.to_string().into() })?
             .to_u32()
             .map_err(|e| -> CaseError { e.to_string().into() })?;
-        if token as usize >= VOCAB {
+        if token as usize >= vocab {
             return Err(format!("mirostat sampled the out-of-range token {token}").into());
         }
     }
@@ -425,8 +487,9 @@ fn mirostat_case(session: &Session) -> CaseResult {
 
 /// mu is state: it must move as the sampler observes surprise, or the target
 /// perplexity is never reached.
-fn mirostat_mu(session: &Session) -> CaseResult {
-    let values = logits();
+fn mirostat_mu(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let vocab = shape[0] as usize;
+    let values = fuzzed_logits(seed, vocab);
     let (_graph, t) = upload_logits(session, &values)?;
     let mut sampler = Mirostat2Sampler::new(3.0, 0.5);
     let start = sampler.mu;
@@ -451,8 +514,8 @@ fn mirostat_mu(session: &Session) -> CaseResult {
 /// The pending form hands back a `GpuSampledToken` whose `value` is a device
 /// tensor. A decode loop reads it as an operand, so nothing in the step
 /// touches the host.
-fn pending_standard(session: &Session) -> CaseResult {
-    let values = logits();
+fn pending_standard(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let values = fuzzed_logits(seed, shape[0] as usize);
     let (_graph, t) = upload_logits(session, &values)?;
     let pending = sample(
         &t,
@@ -466,8 +529,8 @@ fn pending_standard(session: &Session) -> CaseResult {
     check_pending(&pending.value)
 }
 
-fn pending_mirostat(session: &Session) -> CaseResult {
-    let values = logits();
+fn pending_mirostat(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let values = fuzzed_logits(seed, shape[0] as usize);
     let (_graph, t) = upload_logits(session, &values)?;
     let mut sampler = Mirostat2Sampler::new(5.0, 0.1);
     let pending = sampler
@@ -502,6 +565,18 @@ fn check_pending(token: &Tensor) -> CaseResult {
 mod tests {
     use super::*;
 
+    /// Logits with a clear ordering and one deliberate exact tie, so the tie
+    /// rule — larger token id wins — is observable by the host helpers.
+    fn logits() -> Vec<f32> {
+        let mut v = Domain::Custom(-3.0, 3.0).sample(2101, VOCAB);
+        // Tokens 4 and 11 tie exactly, at a value that is not the maximum.
+        v[4] = 1.25;
+        v[11] = 1.25;
+        // One unambiguous maximum.
+        v[7] = 5.0;
+        v
+    }
+
     fn registered() -> Vec<String> {
         cases().names().iter().map(|n| (*n).to_string()).collect()
     }
@@ -514,7 +589,7 @@ mod tests {
     fn every_sampler_entry_point_is_registered() {
         let names = registered();
         for wanted in [
-            "top_k_pairs_k4",
+            "top_k_pairs_sampled_k",
             "sample_standard_token",
             "sample_mirostat2_token",
             "sample_standard_token_pending_stays_on_device",

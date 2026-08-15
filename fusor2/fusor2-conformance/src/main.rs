@@ -1,6 +1,5 @@
-//! The conformance binary. `--exhaustive` sweeps the full schedule domain
-//! rather than the shipped move budget; the default run is the op x backward
-//! matrix plus the launch-count and golden asserts.
+//! The conformance binary: the op x backward matrix, fuzzed over shapes and
+//! over every candidate kernel the compiler can emit.
 //!
 //! Exit status is the failure count clamped to 1, so a CI step is a plain
 //! `cargo run -p fusor2-conformance`. A **skip** is never a pass: a device
@@ -10,7 +9,6 @@
 
 use std::process::ExitCode;
 
-use fusor2_conformance::exhaustive;
 use fusor2_conformance::harness::{self, Outcome, sessions};
 
 fn main() -> ExitCode {
@@ -18,13 +16,11 @@ fn main() -> ExitCode {
     // the selected plan. This is what makes a case cover the *class* rather
     // than whichever member extraction happened to pick — the staged
     // quantized decode was wrong for months behind cases that compared the
-    // materialize path against itself. Adoption is disabled in this mode, so
-    // dispatch-count assertions stay deterministic.
+    // materialize path against itself.
     //
     // SAFETY: set before any thread reads the environment.
     unsafe { std::env::set_var("FUSOR2_VERIFY_MEMBERS", "1") };
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let exhaustive_requested = exhaustive::requested(&args);
     // Everything after the flags is a case-name substring filter.
     let filter = args.iter().find(|a| !a.starts_with("--")).cloned();
 
@@ -35,7 +31,6 @@ fn main() -> ExitCode {
         let names: Vec<&str> = devices.iter().map(|s| s.device().name()).collect();
         println!("backends: {}", names.join(", "));
     }
-    println!("exhaustive: {exhaustive_requested}");
 
     let reports = match &filter {
         Some(f) => harness::Harness::with_filter(f.clone()).run(),

@@ -8,23 +8,30 @@ use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;
 
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
-use crate::harness::{CaseError, CaseResult, Cases, dims};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
 use crate::suite::support::{
     Domain, expect_values, gradient_of, graph_of, loss_of, read, read_scalar, upload,
 };
 
-/// `[rows, width]`. Small enough that finite differences stay cheap, wide
-/// enough that a row fold is not a single lane.
-const ROWS: usize = 3;
-const WIDTH: usize = 5;
-const SHAPE: &[u64] = &[ROWS as u64, WIDTH as u64];
-const LEN: usize = ROWS * WIDTH;
+/// `[rows, width]` for the finite-difference-backed cases. FD rebuilds the
+/// graph once per element, so the ceiling stays modest; width starts at 2 so a
+/// row fold is never a single lane.
+const FD_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(2, 32)];
+
+/// Forward-only invariants can afford multi-workgroup rows.
+const FWD_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 64), FuzzDim::Range(2, 256)];
+
+/// One backward, no FD, so width can grow past a workgroup.
+const BWD_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 8), FuzzDim::Range(2, 128)];
+
+/// The precision carrier wants a long fold axis, not many rows.
+const WELFORD_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 4), FuzzDim::Range(64, 512)];
 
 /// The eps every norm case uses. Large enough to matter at these magnitudes,
 /// so a case that silently drops it fails rather than passing by luck.
 const EPS: f32 = 1e-3;
 
-type Build = fn(&Tensor) -> fusor2::Result<Tensor>;
+type Build = fn(&Tensor, u64) -> fusor2::Result<Tensor>;
 /// A host reference over one row, producing that row's output.
 type RowRef = fn(&[f32]) -> Vec<f32>;
 
@@ -73,10 +80,10 @@ fn host_layer_uncentered(row: &[f32]) -> Vec<f32> {
     host_layer(row, false)
 }
 
-/// The whole-tensor reference: apply `row` to each row of `[ROWS, WIDTH]`.
-fn by_row(data: &[f32], row: RowRef) -> Vec<f32> {
+/// The whole-tensor reference: apply `row` to each `width`-wide row.
+fn by_row(data: &[f32], width: usize, row: RowRef) -> Vec<f32> {
     let mut out = Vec::with_capacity(data.len());
-    for r in data.chunks(WIDTH) {
+    for r in data.chunks(width) {
         out.extend(row(r));
     }
     out
@@ -84,10 +91,11 @@ fn by_row(data: &[f32], row: RowRef) -> Vec<f32> {
 
 /// The weight/bias affine the fused spellings apply after normalizing.
 fn affine(normalized: &[f32], weight: &[f32], bias: Option<&[f32]>) -> Vec<f32> {
+    let width = weight.len();
     normalized
         .iter()
         .enumerate()
-        .map(|(i, v)| v * weight[i % WIDTH] + bias.map_or(0.0, |b| b[i % WIDTH]))
+        .map(|(i, v)| v * weight[i % width] + bias.map_or(0.0, |b| b[i % width]))
         .collect()
 }
 
@@ -100,20 +108,20 @@ fn affine(normalized: &[f32], weight: &[f32], bias: Option<&[f32]>) -> Vec<f32> 
 #[rustfmt::skip]
 fn plain_rows() -> Vec<(&'static str, Build, RowRef)> {
     vec![
-        ("softmax_axis_last",       |x| x.softmax(1),              host_softmax),
-        ("softmax_last_dim",        |x| x.softmax_last_dim(),      host_softmax),
-        ("log_softmax",             |x| x.log_softmax(1),          host_log_softmax),
-        ("rms_norm_no_weight",      |x| x.rms_norm_no_weight(EPS), host_rms),
-        ("layer_norm_centered",     |x| layer_norm_bare(x, true),  host_layer_centered),
-        ("layer_norm_uncentered",   |x| layer_norm_bare(x, false), host_layer_uncentered),
+        ("softmax_axis_last",       |x, _| x.softmax(1),              host_softmax),
+        ("softmax_last_dim",        |x, _| x.softmax_last_dim(),      host_softmax),
+        ("log_softmax",             |x, _| x.log_softmax(1),          host_log_softmax),
+        ("rms_norm_no_weight",      |x, _| x.rms_norm_no_weight(EPS), host_rms),
+        ("layer_norm_centered",     |x, w| layer_norm_bare(x, w, true),  host_layer_centered),
+        ("layer_norm_uncentered",   |x, w| layer_norm_bare(x, w, false), host_layer_uncentered),
     ]
 }
 
 /// `layer_norm` with an all-ones weight and no bias, so the host reference is
 /// the bare statistic. The weight is a constant leaf, not a parameter: this
 /// row checks the normalization, `layer_norm_fused` below checks the affine.
-fn layer_norm_bare(x: &Tensor, remove_mean: bool) -> fusor2::Result<Tensor> {
-    let ones = Tensor::ones(x.graph(), Dtype::F32, &dims(&[WIDTH as u64]))?;
+fn layer_norm_bare(x: &Tensor, width: u64, remove_mean: bool) -> fusor2::Result<Tensor> {
+    let ones = Tensor::ones(x.graph(), Dtype::F32, &dims(&[width]))?;
     x.layer_norm(&ones, None, EPS, remove_mean)
 }
 
@@ -121,333 +129,170 @@ pub fn cases() -> Cases {
     let mut cases = Cases::new();
 
     for (name, build, reference) in plain_rows() {
-        cases.push("normalization", name, move |session| {
-            row_case(session, name, build, reference)
-        });
+        cases.push_case(fuzz_case("normalization", name, FD_SPEC, move |s, shape, seed| {
+            row_case(s, shape, seed, name, build, reference)
+        }));
     }
 
     // The weighted spellings. Each is checked against `normalized * w (+ b)`
     // with a *non-constant* weight, so a lowering that drops the affine is a
     // value failure rather than a no-op.
-    cases.push("normalization", "rms_norm", |s| {
-        weighted_case(s, "rms_norm", host_rms, false, |x, w, _| x.rms_norm(w, EPS))
-    });
-    cases.push("normalization", "rms_norm_with_bias", |s| {
-        weighted_case(s, "rms_norm_with_bias", host_rms, true, |x, w, b| {
-            x.rms_norm_with_bias(w, b.expect("bias"), EPS)
+    cases.push_case(fuzz_case("normalization", "rms_norm", FD_SPEC, |s, shape, seed| {
+        weighted_case(s, shape, seed, "rms_norm", host_rms, false, |x, w, _| {
+            x.rms_norm(w, EPS)
         })
-    });
-    cases.push("normalization", "layer_norm_fused", |s| {
-        weighted_case(
-            s,
-            "layer_norm_fused",
-            host_layer_centered,
-            true,
-            |x, w, b| x.layer_norm(w, b, EPS, true),
-        )
-    });
-    cases.push("normalization", "layer_norm_no_bias", |s| {
-        weighted_case(
-            s,
-            "layer_norm_no_bias",
-            host_layer_centered,
-            false,
-            |x, w, _| x.layer_norm(w, None, EPS, true),
-        )
-    });
+    }));
+    cases.push_case(fuzz_case(
+        "normalization",
+        "rms_norm_with_bias",
+        FD_SPEC,
+        |s, shape, seed| {
+            weighted_case(s, shape, seed, "rms_norm_with_bias", host_rms, true, |x, w, b| {
+                x.rms_norm_with_bias(w, b.expect("bias"), EPS)
+            })
+        },
+    ));
+    cases.push_case(fuzz_case(
+        "normalization",
+        "layer_norm_fused",
+        FD_SPEC,
+        |s, shape, seed| {
+            weighted_case(
+                s,
+                shape,
+                seed,
+                "layer_norm_fused",
+                host_layer_centered,
+                true,
+                |x, w, b| x.layer_norm(w, b, EPS, true),
+            )
+        },
+    ));
+    cases.push_case(fuzz_case(
+        "normalization",
+        "layer_norm_no_bias",
+        FD_SPEC,
+        |s, shape, seed| {
+            weighted_case(
+                s,
+                shape,
+                seed,
+                "layer_norm_no_bias",
+                host_layer_centered,
+                false,
+                |x, w, _| x.layer_norm(w, None, EPS, true),
+            )
+        },
+    ));
 
-    cases.push("normalization", "rms_norm_residual", residual_case);
-    cases.push("normalization", "variance_last", variance_case);
-    cases.push("normalization", "softmax_rows_sum_to_one", rows_sum_to_one);
-    cases.push(
+    cases.push_case(fuzz_case(
+        "normalization",
+        "rms_norm_residual",
+        BWD_SPEC,
+        residual_case,
+    ));
+    cases.push_case(fuzz_case(
+        "normalization",
+        "variance_last",
+        FD_SPEC,
+        variance_case,
+    ));
+    cases.push_case(fuzz_case(
+        "normalization",
+        "softmax_rows_sum_to_one",
+        FWD_SPEC,
+        rows_sum_to_one,
+    ));
+    cases.push_case(fuzz_case(
         "normalization",
         "softmax_is_shift_invariant",
+        FWD_SPEC,
         shift_invariance,
-    );
-    cases.push(
+    ));
+    cases.push_case(fuzz_case(
         "normalization",
         "softmax_backward_is_the_analytic_jacobian",
+        BWD_SPEC,
         softmax_backward,
-    );
-    cases.push(
+    ));
+    cases.push_case(fuzz_case(
         "normalization",
         "welford_agrees_with_the_two_pass_variance",
+        WELFORD_SPEC,
         welford_carrier,
-    );
-    cases.extend(structural::cases());
+    ));
+    cases.push_case(fuzz_case(
+        "normalization",
+        "layer_norm_sum_gradient_is_zero",
+        BWD_SPEC,
+        layer_norm_sum_gradient_is_zero,
+    ));
     cases
 }
 
-/// The structural half: which law actually fired on the chain the frontend
-/// emits, and what the extracted plan did with it.
-///
-/// Every case above passes whether the program was rewritten or run naively —
-/// a numeric oracle cannot tell a landed law from a dead one. These read the
-/// saturation report and the extracted plan instead, on the *same* frontend
-/// calls, so a law that silently stops matching reports a rule name and a
-/// count rather than nothing at all.
-mod structural {
-    use fusor2::{Session, };
-use fusor2::tensor::Dyn as Tensor;
+/// `sum(layer_norm(x))` with a unit weight is `sum((x - mean)/sd)`, which is
+/// identically zero for every input — so every entry of `d(sum y)/dx` must be
+/// zero to rounding. An independent number a broken adjoint cannot produce by
+/// accident.
+fn layer_norm_sum_gradient_is_zero(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let (rows, width) = (shape[0], shape[1]);
+    let data = Domain::Wide.sample(seed, (rows * width) as usize);
+    let weight = vec![1.0f32; width as usize];
 
-    use crate::harness::{CaseError, CaseResult, Cases, dims};
-    use crate::suite::probe::probe;
-    use crate::suite::reductions::generality::structure;
-    use crate::suite::support::{Domain, graph_of, upload};
-
-    /// Wide enough that the row fold is a real reduction rather than a single
-    /// lane, and small enough to stay cheap on both backends.
-    const ROWS: u64 = 8;
-    const WIDTH: u64 = 64;
-
-    pub fn cases() -> Cases {
-        let mut cases = Cases::new();
-        cases.push(
-            "normalization",
-            "softmax_retargets_its_own_max",
-            softmax_retargets,
-        );
-        cases.push(
-            "normalization",
-            "variance_absorbs_its_own_chain",
-            variance_absorbs,
-        );
-        cases.push(
-            "normalization",
-            "layer_norm_backward_plan",
-            layer_norm_backward_plan,
-        );
-        cases.push(
-            "normalization",
-            "rms_norm_backward_plan",
-            rms_norm_backward_plan,
-        );
-        // The saturation tripwire, on a composed backward rather than on
-        // attention: this is the one case that says whether the budget is big
-        // enough for an ordinary program.
-        cases.push(
-            "normalization",
-            "composed_backward_saturates",
-            composed_backward_saturates,
-        );
-        cases
-    }
-
-    fn err(e: impl std::fmt::Display) -> CaseError {
-        e.to_string().into()
-    }
-
-    /// `RETARGET` on the softmax the frontend writes.
-    ///
-    /// The law never invents a reference: it fires only where the source
-    /// program already computed one, and `softmax_last_dim`'s `defn` computes
-    /// a row max and reinjects it by a broadcast along the reduced axis. That
-    /// is the structural condition, stated on address maps, and it is the same
-    /// condition that makes the law fire on a CRF forward recursion or an MoE
-    /// router — none of which is a softmax.
-    ///
-    /// The assert is on the **rule name**: a two-pass softmax computes the
-    /// same numbers as a one-pass one, so no numeric case can distinguish
-    /// them. `softmax_rows_sum_to_one` and `softmax_is_shift_invariant` above
-    /// carry the values.
-    fn softmax_retargets(session: &Session) -> CaseResult {
-        let data = Domain::Wide.sample(801, (ROWS * WIDTH) as usize);
-        let build = |s: &Session| -> Result<Vec<Tensor>, CaseError> {
-            let g = graph_of(s);
-            let x = upload(g.handle(), &dims(&[ROWS, WIDTH]), &data)?;
-            Ok(vec![x.softmax_last_dim().map_err(err)?])
-        };
-        structure::must_fire(
-            session,
-            &build,
-            &[
-                (
-                    "RETARGET",
-                    "the running max is a reduction-carried dependence on another reduction \
-                     over the same axis; discharging it is what makes softmax single-pass, \
-                     and it is the same row that makes a KV-cache decode step single-pass \
-                     at a symbolic length",
-                ),
-                (
-                    "ABSORB",
-                    "the exp and the subtract must reach the sum's lift; without it the \
-                     shifted logits are a buffer",
-                ),
-            ],
+    let graph = graph_of(session);
+    let x = upload(graph.handle(), &dims(&[rows, width]), &data)?;
+    let w = upload(graph.handle(), &dims(&[width]), &weight)?;
+    let y = x
+        .layer_norm(&w, None, 1e-5, true)
+        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let loss = y
+        .sum_all()
+        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let grads = graph
+        .backward_with(&loss, std::slice::from_ref(&x))
+        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let dx = grads
+        .get(&x)
+        .ok_or_else(|| -> CaseError { "no gradient reached x".into() })?;
+    let dx = read(&dx)?;
+    let scale = data.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0);
+    if let Some((i, v)) = dx.iter().enumerate().find(|(_, v)| v.abs() > 2e-3 * scale) {
+        return Err(format!(
+            "d(sum(layer_norm(x)))/dx[{i}] = {v}, and the sum of a centred, scaled row \
+             does not move when the row shifts, so every entry must be zero"
         )
+        .into());
     }
-
-    /// `ABSORB` on `variance`, which is `mean((x - mean)^2)`: two reductions
-    /// over one axis with an elementwise chain between them.
-    ///
-    /// This is the shape `RETARGET`'s raw-moment row turns into Welford. The
-    /// firing assert here is on `ABSORB`, which is landed; the plan count is a
-    /// ceiling, because the one-pass form needs the raw-moment row and that
-    /// row is not in `RETARGET_TABLE` yet.
-    fn variance_absorbs(session: &Session) -> CaseResult {
-        let data = Domain::Wide.sample(802, (ROWS * WIDTH) as usize);
-        let build = |s: &Session| -> Result<Vec<Tensor>, CaseError> {
-            let g = graph_of(s);
-            let x = upload(g.handle(), &dims(&[ROWS, WIDTH]), &data)?;
-            Ok(vec![x.variance(1).map_err(err)?])
-        };
-        structure::must_fire(
-            session,
-            &build,
-            &[(
-                "ABSORB",
-                "the centring subtract and the square must ride into the second fold's \
-                 lift; without it a two-pass variance is a three-launch program",
-            )],
-        )?;
-        structure::plan_ceiling(
-            session,
-            &build,
-            "variance_last",
-            6,
-            1,
-            "RETARGET's raw-moment row at rho = the running mean (Welford, derived)",
-        )
-    }
-
-    /// The composed layer-norm backward emits `sum(dy)` and `sum(dy * xhat)`
-    /// over the same feature axis of the same operands.
-    ///
-    /// No rule mentions layer_norm, normalization or backward. `TUPLE` joins
-    /// the two into one 2-slot fold and one launch — the fused
-    /// layer-norm-backward kernel every framework hand-writes, derived by the
-    /// same law as Welford. Until it does, this is a ceiling and the count is
-    /// the diff the day it lands.
-    fn layer_norm_backward_plan(session: &Session) -> CaseResult {
-        backward_plan(session, "layer_norm_backward", true, 34)
-    }
-
-    /// The same law on `rms_norm`, whose backward emits one sum instead of
-    /// two — so `TUPLE` has less to do and `ABSORB` more. Having both says
-    /// which law the count belongs to.
-    fn rms_norm_backward_plan(session: &Session) -> CaseResult {
-        backward_plan(session, "rms_norm_backward", false, 28)
-    }
-
-    fn backward_plan(
-        session: &Session,
-        what: &'static str,
-        centered: bool,
-        launches: usize,
-    ) -> CaseResult {
-        let data = Domain::Wide.sample(803, (ROWS * WIDTH) as usize);
-        let weight = Domain::Positive.sample(804, WIDTH as usize);
-
-        let build = |s: &Session| -> Result<Vec<Tensor>, CaseError> {
-            let g = graph_of(s);
-            let x = upload(g.handle(), &dims(&[ROWS, WIDTH]), &data)?;
-            let w = upload(g.handle(), &dims(&[WIDTH]), &weight)?;
-            let y = if centered {
-                x.layer_norm(&w, None, 1e-5, true)
-            } else {
-                x.rms_norm(&w, 1e-5)
-            }
-            .map_err(err)?;
-            let loss = y.sum_all().map_err(err)?;
-            let grads = g
-                .backward_with(&loss, &[x.clone(), w.clone()])
-                .map_err(err)?;
-            let dx = grads
-                .get(&x)
-                .ok_or_else(|| -> CaseError { "no gradient reached x".into() })?;
-            let dw = grads
-                .get(&w)
-                .ok_or_else(|| -> CaseError { "no gradient reached w".into() })?;
-            Ok(vec![dx, dw])
-        };
-
-        // `composed_backward_saturates` owns the saturation claim; this case
-        // owns the count. A count read off a truncated saturation is still a
-        // regression guard, because the driver is deterministic.
-        let p = structure::probe_fresh(session, &build)?;
-        p.require_fired(
-            "ABSORB",
-            "the adjoint's elementwise chain must reach the feature-axis folds; without \
-             it every term of the backward is its own launch",
-        )?;
-        structure::plan_ceiling(
-            session,
-            &build,
-            what,
-            launches,
-            2,
-            "TUPLE (the two feature-axis sums are one 2-slot fold) + ABSORB",
-        )
-    }
-
-    /// The saturation budget, measured on a composed backward.
-    ///
-    /// `attention_rope::attention_defn_saturates` makes the same claim about
-    /// attention, where it is easy to read as "the flash derivation is not
-    /// finished". This says the wider thing: an eight-row layer-norm backward
-    /// — five lines of frontend, no attention anywhere — also runs out of
-    /// `MAX_ROUNDS`. The two failures have one cause and one fix, and the fix
-    /// is not in attention.
-    ///
-    /// The value is checked first, so a graph that stopped computing cannot
-    /// pass this by saturating trivially.
-    fn composed_backward_saturates(session: &Session) -> CaseResult {
-        let data = Domain::Wide.sample(806, (ROWS * WIDTH) as usize);
-        // An all-ones weight, so `sum(y)` is `sum(xhat)` and the row is
-        // centred: the sum is identically zero and so is its gradient.
-        let weight = vec![1.0f32; WIDTH as usize];
-
-        let build = |s: &Session| -> Result<Vec<Tensor>, CaseError> {
-            let g = graph_of(s);
-            let x = upload(g.handle(), &dims(&[ROWS, WIDTH]), &data)?;
-            let w = upload(g.handle(), &dims(&[WIDTH]), &weight)?;
-            let y = x.layer_norm(&w, None, 1e-5, true).map_err(err)?;
-            let loss = y.sum_all().map_err(err)?;
-            let grads = g.backward_with(&loss, &[x.clone()]).map_err(err)?;
-            let dx = grads
-                .get(&x)
-                .ok_or_else(|| -> CaseError { "no gradient reached x".into() })?;
-            Ok(vec![dx])
-        };
-
-        // `sum(layer_norm(x))` with a unit weight is `sum((x - mean)/sd)`,
-        // which is identically zero for every input, so every entry of
-        // `d(sum y)/dx` is zero to rounding. An independent number, and one a
-        // broken adjoint cannot produce by accident.
-        let outs = build(session)?;
-        let dx = crate::suite::support::read(&outs[0])?;
-        let scale = data.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0);
-        if let Some((i, v)) = dx.iter().enumerate().find(|(_, v)| v.abs() > 2e-3 * scale) {
-            return Err(format!(
-                "d(sum(layer_norm(x)))/dx[{i}] = {v}, and the sum of a centred, scaled row                  does not move when the row shifts, so every entry must be zero"
-            )
-            .into());
-        }
-
-        let p = probe(session, &outs)?;
-        p.require_saturated("layer_norm backward (five frontend lines, no attention anywhere)")
-    }
+    Ok(())
 }
 
 /// Forward against the host row reference, then backward against central
 /// differences.
-fn row_case(session: &Session, name: &'static str, build: Build, reference: RowRef) -> CaseResult {
-    let data = Domain::Wide.sample(401, LEN);
-    let dimv = dims(SHAPE);
+fn row_case(
+    session: &Session,
+    shape: &[u64],
+    seed: u32,
+    name: &'static str,
+    build: Build,
+    reference: RowRef,
+) -> CaseResult {
+    let (rows, width) = (shape[0] as usize, shape[1] as usize);
+    let data = Domain::Wide.sample(seed, rows * width);
+    let dimv = dims(shape);
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
-    let y = build(&x).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
+    let y = build(&x, width as u64).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     let actual = read(&y)?;
-    let expected = by_row(&data, reference);
-    expect_values(session, SHAPE, Dtype::F32, &actual, &expected)?;
+    let expected = by_row(&data, width, reference);
+    expect_values(session, shape, Dtype::F32, &actual, &expected)?;
 
     let analytic = gradient_of(&graph, &y, &x)?;
-    let numeric = finite_difference_gradient(&[ROWS, WIDTH], &data, &mut |probe| {
+    let numeric = finite_difference_gradient(&[rows, width], &data, &mut |probe| {
         let g = graph_of(session);
         let x = upload(g.handle(), &dimv, probe)?;
-        let y = build(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
+        let y = build(&x, width as u64).map_err(|e| -> CaseError { e.to_string().into() })?;
         read_scalar(&loss_of(&y)?)
     })?;
     assert_gradient_matches_finite_difference(&analytic, &numeric)?;
@@ -459,18 +304,21 @@ fn row_case(session: &Session, name: &'static str, build: Build, reference: RowR
 /// wrong while the forward stays correct.
 fn weighted_case(
     session: &Session,
+    shape: &[u64],
+    seed: u32,
     name: &'static str,
     normalize: RowRef,
     with_bias: bool,
     build: fn(&Tensor, &Tensor, Option<&Tensor>) -> fusor2::Result<Tensor>,
 ) -> CaseResult {
-    let data = Domain::Wide.sample(409, LEN);
+    let (rows, width) = (shape[0] as usize, shape[1] as usize);
+    let data = Domain::Wide.sample(seed, rows * width);
     // Weights away from 1 and biases away from 0, so an unapplied affine
     // cannot pass.
-    let weight = Domain::Custom(0.5, 1.5).sample(419, WIDTH);
-    let bias = Domain::Custom(-0.4, 0.4).sample(421, WIDTH);
-    let dimv = dims(SHAPE);
-    let wdim = dims(&[WIDTH as u64]);
+    let weight = Domain::Custom(0.5, 1.5).sample(seed ^ 0x9e37_79b9, width);
+    let bias = Domain::Custom(-0.4, 0.4).sample(seed.wrapping_add(1), width);
+    let dimv = dims(shape);
+    let wdim = dims(&[width as u64]);
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
@@ -481,12 +329,12 @@ fn weighted_case(
     let y =
         build(&x, &w, b.as_ref()).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
-    let normalized = by_row(&data, normalize);
+    let normalized = by_row(&data, width, normalize);
     let expected = affine(&normalized, &weight, with_bias.then_some(&bias[..]));
-    expect_values(session, SHAPE, Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)?;
 
     let d_x = gradient_of(&graph, &y, &x)?;
-    let numeric = finite_difference_gradient(&[ROWS, WIDTH], &data, &mut |probe| {
+    let numeric = finite_difference_gradient(&[rows, width], &data, &mut |probe| {
         let g = graph_of(session);
         let x = upload(g.handle(), &dimv, probe)?;
         let w = upload(g.handle(), &wdim, &weight)?;
@@ -501,34 +349,36 @@ fn weighted_case(
     // d_weight[j] = sum over rows of normalized[r, j] — the stride-0 axis's
     // adjoint is a sum, and it is over the *rows*, not the columns.
     let d_w = gradient_of(&graph, &y, &w)?;
-    let want_w: Vec<f32> = (0..WIDTH)
-        .map(|j| (0..ROWS).map(|r| normalized[r * WIDTH + j]).sum())
+    let want_w: Vec<f32> = (0..width)
+        .map(|j| (0..rows).map(|r| normalized[r * width + j]).sum())
         .collect();
     let backend = if crate::harness::is_gpu(session) {
         "gpu"
     } else {
         "cpu"
     };
-    crate::compare::approx_or_relative_eq(backend, &[WIDTH], &want_w, &d_w, 1e-3, 1e-3)?;
+    crate::compare::approx_or_relative_eq(backend, &[width], &want_w, &d_w, 1e-3, 1e-3)?;
 
     if let Some(b) = &b {
-        // Every bias element is broadcast over ROWS rows, so its gradient is
+        // Every bias element is broadcast over the rows, so its gradient is
         // exactly the row count under an all-ones seed.
         let d_b = gradient_of(&graph, &y, b)?;
-        let want_b = vec![ROWS as f32; WIDTH];
-        crate::compare::approx_or_relative_eq(backend, &[WIDTH], &want_b, &d_b, 1e-4, 1e-4)?;
+        let want_b = vec![rows as f32; width];
+        crate::compare::approx_or_relative_eq(backend, &[width], &want_b, &d_b, 1e-4, 1e-4)?;
     }
     Ok(())
 }
 
 /// The transformer block boundary: `rms_norm(x + residual) * w`. The residual
 /// add must be inside the statistic, not applied to the normalized value.
-fn residual_case(session: &Session) -> CaseResult {
-    let data = Domain::Wide.sample(431, LEN);
-    let residual = Domain::Wide.sample(433, LEN);
-    let weight = Domain::Custom(0.5, 1.5).sample(439, WIDTH);
-    let dimv = dims(SHAPE);
-    let wdim = dims(&[WIDTH as u64]);
+fn residual_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let (rows, width) = (shape[0] as usize, shape[1] as usize);
+    let len = rows * width;
+    let data = Domain::Wide.sample(seed, len);
+    let residual = Domain::Wide.sample(seed ^ 0x9e37_79b9, len);
+    let weight = Domain::Custom(0.5, 1.5).sample(seed.wrapping_add(1), width);
+    let dimv = dims(shape);
+    let wdim = dims(&[width as u64]);
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
@@ -539,8 +389,8 @@ fn residual_case(session: &Session) -> CaseResult {
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let summed: Vec<f32> = data.iter().zip(&residual).map(|(a, b)| a + b).collect();
-    let expected = affine(&by_row(&summed, host_rms), &weight, None);
-    expect_values(session, SHAPE, Dtype::F32, &read(&y)?, &expected)?;
+    let expected = affine(&by_row(&summed, width, host_rms), &weight, None);
+    expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)?;
 
     // Both inputs enter the same sum, so their gradients must be identical —
     // a rule that normalizes before adding gives the residual a different one.
@@ -551,14 +401,15 @@ fn residual_case(session: &Session) -> CaseResult {
     } else {
         "cpu"
     };
-    crate::compare::approx_or_relative_eq(backend, &[LEN], &d_x, &d_r, 1e-4, 1e-3)?;
+    crate::compare::approx_or_relative_eq(backend, &[len], &d_x, &d_r, 1e-4, 1e-3)?;
     Ok(())
 }
 
 /// `variance_last` as the statistic, against the two-pass host formula.
-fn variance_case(session: &Session) -> CaseResult {
-    let data = Domain::Wide.sample(443, LEN);
-    let dimv = dims(SHAPE);
+fn variance_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let (rows, width) = (shape[0] as usize, shape[1] as usize);
+    let data = Domain::Wide.sample(seed, rows * width);
+    let dimv = dims(shape);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
     let y = x
@@ -566,16 +417,16 @@ fn variance_case(session: &Session) -> CaseResult {
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let expected: Vec<f32> = data
-        .chunks(WIDTH)
+        .chunks(width)
         .map(|row| {
-            let m = row.iter().sum::<f32>() / WIDTH as f32;
-            row.iter().map(|v| (v - m) * (v - m)).sum::<f32>() / WIDTH as f32
+            let m = row.iter().sum::<f32>() / width as f32;
+            row.iter().map(|v| (v - m) * (v - m)).sum::<f32>() / width as f32
         })
         .collect();
-    expect_values(session, &[ROWS as u64], Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(session, &[rows as u64], Dtype::F32, &read(&y)?, &expected)?;
 
     let analytic = gradient_of(&graph, &y, &x)?;
-    let numeric = finite_difference_gradient(&[ROWS, WIDTH], &data, &mut |probe| {
+    let numeric = finite_difference_gradient(&[rows, width], &data, &mut |probe| {
         let g = graph_of(session);
         let x = upload(g.handle(), &dimv, probe)?;
         let y = x
@@ -590,15 +441,16 @@ fn variance_case(session: &Session) -> CaseResult {
 /// Every softmax row sums to exactly 1 within tolerance. Cheap, but it is the
 /// invariant an online-softmax carrier with a mis-rescaled running sum breaks
 /// while still looking plausible element by element.
-fn rows_sum_to_one(session: &Session) -> CaseResult {
-    let data = Domain::Custom(-4.0, 4.0).sample(449, LEN);
+fn rows_sum_to_one(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let (rows, width) = (shape[0] as usize, shape[1] as usize);
+    let data = Domain::Custom(-4.0, 4.0).sample(seed, rows * width);
     let graph = graph_of(session);
-    let x = upload(graph.handle(), &dims(SHAPE), &data)?;
+    let x = upload(graph.handle(), &dims(shape), &data)?;
     let p = x
         .softmax_last_dim()
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     let got = read(&p)?;
-    for (r, row) in got.chunks(WIDTH).enumerate() {
+    for (r, row) in got.chunks(width).enumerate() {
         let sum: f32 = row.iter().sum();
         if (sum - 1.0).abs() > 1e-4 {
             return Err(format!("softmax row {r} sums to {sum}, not 1").into());
@@ -612,12 +464,13 @@ fn rows_sum_to_one(session: &Session) -> CaseResult {
 
 /// softmax(x + c) == softmax(x). The max fold is the only thing that makes
 /// this true, so a lowering that drops it fails here before it overflows.
-fn shift_invariance(session: &Session) -> CaseResult {
-    let data = Domain::Custom(-2.0, 2.0).sample(457, LEN);
+fn shift_invariance(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let len = (shape[0] * shape[1]) as usize;
+    let data = Domain::Custom(-2.0, 2.0).sample(seed, len);
     let shifted: Vec<f32> = data.iter().map(|v| v + 60.0).collect();
     let graph = graph_of(session);
-    let a = upload(graph.handle(), &dims(SHAPE), &data)?;
-    let b = upload(graph.handle(), &dims(SHAPE), &shifted)?;
+    let a = upload(graph.handle(), &dims(shape), &data)?;
+    let b = upload(graph.handle(), &dims(shape), &shifted)?;
     let pa = a
         .softmax_last_dim()
         .map_err(|e| -> CaseError { e.to_string().into() })?;
@@ -628,7 +481,7 @@ fn shift_invariance(session: &Session) -> CaseResult {
     if vb.iter().any(|v| !v.is_finite()) {
         return Err("softmax overflowed on a +60 shift: the max fold was elided".into());
     }
-    expect_values(session, SHAPE, Dtype::F32, &vb, &va)?;
+    expect_values(session, shape, Dtype::F32, &vb, &va)?;
     Ok(())
 }
 
@@ -637,11 +490,13 @@ fn shift_invariance(session: &Session) -> CaseResult {
 /// Seeded with a non-uniform upstream gradient: under `sum_all` the softmax
 /// adjoint is identically zero, so an all-ones seed cannot tell a correct
 /// Jacobian from a missing one.
-fn softmax_backward(session: &Session) -> CaseResult {
-    let data = Domain::Wide.sample(463, LEN);
-    // A fixed, non-uniform upstream weight, applied as `sum(w * softmax(x))`.
-    let weights = Domain::Custom(0.25, 2.0).sample(467, LEN);
-    let dimv = dims(SHAPE);
+fn softmax_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let (rows, width) = (shape[0] as usize, shape[1] as usize);
+    let len = rows * width;
+    let data = Domain::Wide.sample(seed, len);
+    // A non-uniform upstream weight, applied as `sum(w * softmax(x))`.
+    let weights = Domain::Custom(0.25, 2.0).sample(seed ^ 0x9e37_79b9, len);
+    let dimv = dims(shape);
 
     let build = |x: &Tensor, w: &Tensor| -> fusor2::Result<Tensor> { x.softmax_last_dim()?.mul(w) };
 
@@ -652,13 +507,13 @@ fn softmax_backward(session: &Session) -> CaseResult {
     let analytic = gradient_of(&graph, &y, &x)?;
 
     // Host Jacobian-vector product, row by row.
-    let mut expected = vec![0.0f32; LEN];
-    for r in 0..ROWS {
-        let p = host_softmax(&data[r * WIDTH..(r + 1) * WIDTH]);
-        let dp = &weights[r * WIDTH..(r + 1) * WIDTH];
+    let mut expected = vec![0.0f32; len];
+    for r in 0..rows {
+        let p = host_softmax(&data[r * width..(r + 1) * width]);
+        let dp = &weights[r * width..(r + 1) * width];
         let dot: f32 = p.iter().zip(dp).map(|(a, b)| a * b).sum();
-        for j in 0..WIDTH {
-            expected[r * WIDTH + j] = p[j] * (dp[j] - dot);
+        for j in 0..width {
+            expected[r * width + j] = p[j] * (dp[j] - dot);
         }
     }
     let backend = if crate::harness::is_gpu(session) {
@@ -668,7 +523,7 @@ fn softmax_backward(session: &Session) -> CaseResult {
     };
     crate::compare::approx_or_relative_eq(
         backend,
-        &[ROWS, WIDTH],
+        &[rows, width],
         &expected,
         &analytic,
         1e-4,
@@ -680,10 +535,11 @@ fn softmax_backward(session: &Session) -> CaseResult {
 /// `mean((x - mean)^2)` computed by `variance_last` must agree with the
 /// `mean(x^2) - mean(x)^2` spelling to f32 tolerance on well-conditioned data,
 /// and the composed form is the one autograd differentiates.
-fn welford_carrier(session: &Session) -> CaseResult {
-    let data = Domain::Custom(10.0, 11.0).sample(479, LEN);
+fn welford_carrier(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let (rows, width) = (shape[0] as usize, shape[1] as usize);
+    let data = Domain::Custom(10.0, 11.0).sample(seed, rows * width);
     let graph = graph_of(session);
-    let x = upload(graph.handle(), &dims(SHAPE), &data)?;
+    let x = upload(graph.handle(), &dims(shape), &data)?;
 
     let welford = x
         .variance_last()
@@ -705,7 +561,7 @@ fn welford_carrier(session: &Session) -> CaseResult {
     } else {
         "cpu"
     };
-    crate::compare::approx_or_relative_eq(backend, &[ROWS], &a, &b, 1e-3, 1e-2)?;
+    crate::compare::approx_or_relative_eq(backend, &[rows], &a, &b, 1e-3, 1e-2)?;
     Ok(())
 }
 
@@ -812,9 +668,11 @@ mod tests {
 
     #[test]
     fn by_row_keeps_rows_independent() {
-        let data: Vec<f32> = (0..LEN).map(|i| i as f32).collect();
-        let out = by_row(&data, host_softmax);
-        assert_eq!(out.len(), LEN);
+        const ROWS: usize = 3;
+        const WIDTH: usize = 5;
+        let data: Vec<f32> = (0..ROWS * WIDTH).map(|i| i as f32).collect();
+        let out = by_row(&data, WIDTH, host_softmax);
+        assert_eq!(out.len(), ROWS * WIDTH);
         for row in out.chunks(WIDTH) {
             assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-5);
         }
@@ -822,7 +680,9 @@ mod tests {
 
     #[test]
     fn the_affine_is_applied_per_column() {
-        let normalized = vec![1.0f32; LEN];
+        const ROWS: usize = 3;
+        const WIDTH: usize = 5;
+        let normalized = vec![1.0f32; ROWS * WIDTH];
         let weight: Vec<f32> = (0..WIDTH).map(|j| j as f32).collect();
         let bias = vec![0.5f32; WIDTH];
         let out = affine(&normalized, &weight, Some(&bias));

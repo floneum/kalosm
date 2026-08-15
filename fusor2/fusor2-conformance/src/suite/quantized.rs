@@ -17,12 +17,45 @@ use fusor2_gguf::repack;
 use fusor2_ir::dtype::{QFmt, QLayout};
 use half::f16;
 
-use crate::harness::{CaseError, CaseResult, Cases, dims, from_u32};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, from_u32, fuzz_case};
 use crate::suite::support::{Domain, expect_values, graph_of, read, upload};
 
-/// Rows of the quantized weight. One block per row keeps the host reference a
-/// straight `chunks(block_bytes)` walk.
+/// Rows of the quantized weight in the fixed cases. One block per row keeps
+/// the host reference a straight `chunks(block_bytes)` walk.
 const ROWS: u64 = 3;
+
+/// `[rows, blocks-per-row]` for the fuzzed decode cases. `k` is always
+/// `blocks * block_elements()`, so the K axis stays block-aligned by
+/// construction rather than by a sampled extent happening to divide.
+const DEQUANT_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(1, 4)];
+
+/// `[batch, rows, blocks-per-row]` for the fuzzed matmul cases.
+const QMATMUL_SPEC: &[FuzzDim] = &[
+    FuzzDim::Range(1, 4),
+    FuzzDim::Range(1, 6),
+    FuzzDim::Range(1, 4),
+];
+
+/// `[blocks]` for the repack round trips: the repack walks a flat block
+/// stream, so the only extent is how many blocks it crosses.
+const REPACK_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 8)];
+
+/// `[rows]` for the layout-agreement case, one block per row.
+const LAYOUTS_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 4)];
+
+/// `[batch, rows, blocks-per-row]` for the backward case; small, because the
+/// host reference sums over every row per activation element.
+const BACKWARD_SPEC: &[FuzzDim] = &[
+    FuzzDim::Range(1, 3),
+    FuzzDim::Range(1, 4),
+    FuzzDim::Range(1, 2),
+];
+
+/// `fuzz_case` keys its per-run seed off the case name for the life of the
+/// process, so a formatted per-format name is leaked once at registration.
+fn leak(name: String) -> &'static str {
+    Box::leak(name.into_boxed_str())
+}
 
 fn backend_of(session: &Session) -> &'static str {
     if crate::harness::is_gpu(session) {
@@ -98,9 +131,11 @@ fn matrix_from_parts(
     fmt: QFmt,
     layout: QLayout,
     bytes: &[u8],
+    rows: u64,
+    cols: u64,
 ) -> Result<QMatrix, CaseError> {
-    let cols = fusor2::Dim::Const(fmt.block_elements() as u64);
-    let rows = fusor2::Dim::Const(ROWS);
+    let cols = fusor2::Dim::Const(cols);
+    let rows = fusor2::Dim::Const(rows);
     let tensor = graph
         .quantized(fmt, layout, [rows, cols], bytes)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
@@ -118,8 +153,13 @@ pub fn cases() -> Cases {
 
     for fmt in QFmt::ALL {
         for layout in [QLayout::Native, QLayout::F32Scales] {
-            let name = format!("dequantize_{}_{}", fmt_name(fmt), layout_name(layout));
-            cases.push("quantized", name, move |s| dequantize_case(s, fmt, layout));
+            let name = leak(format!("dequantize_{}_{}", fmt_name(fmt), layout_name(layout)));
+            cases.push_case(fuzz_case(
+                "quantized",
+                name,
+                DEQUANT_SPEC,
+                move |s, shape, seed| dequantize_case(s, fmt, layout, shape, seed),
+            ));
         }
     }
     // The same decode forced through the `Restride` + `Map` expansion, with
@@ -141,30 +181,42 @@ pub fn cases() -> Cases {
         }
     }
     for fmt in QFmt::ALL {
-        let name = format!("qmatmul_{}", fmt_name(fmt));
-        cases.push("quantized", name, move |s| qmatmul_case(s, fmt));
+        let name = leak(format!("qmatmul_{}", fmt_name(fmt)));
+        cases.push_case(fuzz_case(
+            "quantized",
+            name,
+            QMATMUL_SPEC,
+            move |s, shape, seed| qmatmul_case(s, fmt, shape, seed),
+        ));
     }
     for fmt in QFmt::ALL {
-        let name = format!("repack_round_trip_{}", fmt_name(fmt));
-        cases.push("quantized", name, move |s| repack_case(s, fmt));
+        let name = leak(format!("repack_round_trip_{}", fmt_name(fmt)));
+        cases.push_case(fuzz_case(
+            "quantized",
+            name,
+            REPACK_SPEC,
+            move |s, shape, seed| repack_case(s, fmt, shape, seed),
+        ));
     }
 
-    cases.push(
+    cases.push_case(fuzz_case(
         "quantized",
         "both_layouts_decode_to_the_same_values",
+        LAYOUTS_SPEC,
         layouts_agree,
-    );
+    ));
     cases.push(
         "quantized",
         "every_format_declares_its_block_bytes",
         block_bytes_declared,
     );
     cases.push("quantized", "block_fields_tile_the_block", fields_tile);
-    cases.push(
+    cases.push_case(fuzz_case(
         "quantized",
         "q_mat_mul_backward_reaches_the_activation_only",
+        BACKWARD_SPEC,
         qmatmul_backward,
-    );
+    ));
     for fmt in QFmt::ALL {
         let name = format!("qmatmul_coop_shape_{}", fmt_name(fmt));
         cases.push("quantized", name, move |s| qmatmul_coop_shape(s, fmt));
@@ -423,16 +475,27 @@ fn layout_name(layout: QLayout) -> &'static str {
     }
 }
 
-/// The device dequantize against the scalar reference decoder.
-fn dequantize_case(session: &Session, fmt: QFmt, layout: QLayout) -> CaseResult {
-    let (bytes, expected) = quantized_rows(fmt, layout);
+/// The device dequantize against the scalar reference decoder. `shape` is
+/// `[rows, blocks-per-row]` from [`DEQUANT_SPEC`]; the block stream is
+/// row-major in blocks, so `rows * blocks` consecutive blocks decode to a
+/// `[rows, blocks * block_elements]` matrix.
+fn dequantize_case(
+    session: &Session,
+    fmt: QFmt,
+    layout: QLayout,
+    shape: &[u64],
+    seed: u32,
+) -> CaseResult {
+    let (rows, blocks) = (shape[0], shape[1]);
+    let k = blocks * fmt.block_elements() as u64;
+    let (bytes, expected) = block_rows(fmt, layout, seed, (rows * blocks) as usize);
     let graph = graph_of(session);
-    let qm = matrix_from_parts(&graph, fmt, layout, &bytes)?;
+    let qm = matrix_from_parts(&graph, fmt, layout, &bytes, rows, k)?;
     let dense = qm
         .dequantize()
         .map_err(|e| -> CaseError { format!("{fmt:?}/{layout:?}: {e}").into() })?;
 
-    let shape = [ROWS, fmt.block_elements() as u64];
+    let shape = [rows, k];
     let got = read(&dense)?;
     if got.len() != expected.len() {
         return Err(format!(
@@ -461,7 +524,7 @@ fn dequantize_case(session: &Session, fmt: QFmt, layout: QLayout) -> CaseResult 
 fn dequantize_defn_case(session: &Session, fmt: QFmt, layout: QLayout) -> CaseResult {
     let (bytes, expected) = quantized_rows(fmt, layout);
     let graph = graph_of(session);
-    let qm = matrix_from_parts(&graph, fmt, layout, &bytes)?;
+    let qm = matrix_from_parts(&graph, fmt, layout, &bytes, ROWS, fmt.block_elements() as u64)?;
     let dense = qm
         .dequantize_slow()
         .map_err(|e| -> CaseError { format!("{fmt:?}/{layout:?}: {e}").into() })?;
@@ -483,26 +546,25 @@ fn dequantize_defn_case(session: &Session, fmt: QFmt, layout: QLayout) -> CaseRe
 /// An activation against a quantized weight. The result must equal the dense
 /// matmul against the *reference-decoded* weight — which program extraction
 /// picked is invisible here, which is the point.
-fn qmatmul_case(session: &Session, fmt: QFmt) -> CaseResult {
-    const BATCH: usize = 2;
+fn qmatmul_case(session: &Session, fmt: QFmt, shape: &[u64], seed: u32) -> CaseResult {
+    let (batch, rows, blocks) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
     let layout = QLayout::Native;
-    let k = fmt.block_elements() as usize;
-    let (bytes, weights) = quantized_rows(fmt, layout);
-    let act = Domain::Wide.sample(2011, BATCH * k);
+    let k = blocks * fmt.block_elements() as usize;
+    let (bytes, weights) = block_rows(fmt, layout, seed, rows * blocks);
+    let act = Domain::Wide.sample(seed ^ 0x9e37_79b9, batch * k);
 
     let graph = graph_of(session);
-    let qm = matrix_from_parts(&graph, fmt, layout, &bytes)?;
-    let a = upload(graph.handle(), &dims(&[BATCH as u64, k as u64]), &act)?;
+    let qm = matrix_from_parts(&graph, fmt, layout, &bytes, rows as u64, k as u64)?;
+    let a = upload(graph.handle(), &dims(&[batch as u64, k as u64]), &act)?;
     // The weight is `[rows, k]`, so the contraction is against its transpose.
     let y = a
         .matmul_t(&qm.tensor)
         .map_err(|e| -> CaseError { format!("{fmt:?}: {e}").into() })?;
 
-    let mut expected = vec![0.0f32; BATCH * ROWS as usize];
-    for b in 0..BATCH {
-        for r in 0..ROWS as usize {
-            expected[b * ROWS as usize + r] =
-                (0..k).map(|t| act[b * k + t] * weights[r * k + t]).sum();
+    let mut expected = vec![0.0f32; batch * rows];
+    for b in 0..batch {
+        for r in 0..rows {
+            expected[b * rows + r] = (0..k).map(|t| act[b * k + t] * weights[r * k + t]).sum();
         }
     }
     // A quantized dot accumulates in f32 over up to 256 terms, so the bar is
@@ -510,7 +572,7 @@ fn qmatmul_case(session: &Session, fmt: QFmt) -> CaseResult {
     let got = read(&y)?;
     crate::compare::approx_or_relative_eq(
         backend_of(session),
-        &[BATCH, ROWS as usize],
+        &[batch, rows],
         &expected,
         &got,
         1e-3,
@@ -571,29 +633,29 @@ fn qgemv_grid_past_the_dimension_cap(session: &Session) -> CaseResult {
 /// Gradients flow to the activation only. The weight is quantized and
 /// non-trainable through this route — that is exactly why QAT keeps a separate
 /// f32 master rather than a quantized backward kernel.
-fn qmatmul_backward(session: &Session) -> CaseResult {
-    const BATCH: usize = 2;
+fn qmatmul_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let (batch, rows, blocks) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
     let fmt = QFmt::Q8_0;
     let layout = QLayout::Native;
-    let k = fmt.block_elements() as usize;
-    let (bytes, weights) = quantized_rows(fmt, layout);
-    let act = Domain::Wide.sample(2017, BATCH * k);
+    let k = blocks * fmt.block_elements() as usize;
+    let (bytes, weights) = block_rows(fmt, layout, seed, rows * blocks);
+    let act = Domain::Wide.sample(seed ^ 0x9e37_79b9, batch * k);
 
     let graph = graph_of(session);
-    let qm = matrix_from_parts(&graph, fmt, layout, &bytes)?;
-    let a = upload(graph.handle(), &dims(&[BATCH as u64, k as u64]), &act)?;
+    let qm = matrix_from_parts(&graph, fmt, layout, &bytes, rows as u64, k as u64)?;
+    let a = upload(graph.handle(), &dims(&[batch as u64, k as u64]), &act)?;
     let y = a
         .matmul_t(&qm.tensor)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     // d_act[b, t] = sum over rows of w[r, t], under an all-ones seed.
     let d_a = crate::suite::support::gradient_of(&graph, &y, &a)?;
-    let want: Vec<f32> = (0..BATCH * k)
-        .map(|n| (0..ROWS as usize).map(|r| weights[r * k + n % k]).sum())
+    let want: Vec<f32> = (0..batch * k)
+        .map(|n| (0..rows).map(|r| weights[r * k + n % k]).sum())
         .collect();
     crate::compare::approx_or_relative_eq(
         backend_of(session),
-        &[BATCH, k],
+        &[batch, k],
         &want,
         &d_a,
         1e-3,
@@ -613,8 +675,9 @@ fn qmatmul_backward(session: &Session) -> CaseResult {
 
 /// `Native -> F32Scales -> Native` must be byte-identical, and the forward
 /// direction must decode to the same values.
-fn repack_case(_session: &Session, fmt: QFmt) -> CaseResult {
-    let (native, values) = quantized_rows(fmt, QLayout::Native);
+fn repack_case(_session: &Session, fmt: QFmt, shape: &[u64], seed: u32) -> CaseResult {
+    let blocks = shape[0] as usize;
+    let (native, values) = block_rows(fmt, QLayout::Native, seed, blocks);
 
     let mut widened = Vec::new();
     repack(
@@ -625,7 +688,7 @@ fn repack_case(_session: &Session, fmt: QFmt) -> CaseResult {
         &mut widened,
     )
     .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let want_len = ROWS as usize * fmt.block_bytes(QLayout::F32Scales) as usize;
+    let want_len = blocks * fmt.block_bytes(QLayout::F32Scales) as usize;
     if widened.len() != want_len {
         return Err(format!(
             "{fmt:?} repacked to {} bytes, want {want_len}",
@@ -637,8 +700,8 @@ fn repack_case(_session: &Session, fmt: QFmt) -> CaseResult {
     // The widened blocks decode to the same values.
     let elements = fmt.block_elements() as usize;
     let stride = fmt.block_bytes(QLayout::F32Scales) as usize;
-    let mut decoded = vec![0.0f32; ROWS as usize * elements];
-    for r in 0..ROWS as usize {
+    let mut decoded = vec![0.0f32; blocks * elements];
+    for r in 0..blocks {
         cpu_dequantize_block(
             fmt,
             QLayout::F32Scales,
@@ -669,9 +732,11 @@ fn repack_case(_session: &Session, fmt: QFmt) -> CaseResult {
 
 /// Both layouts are legal inputs everywhere, so a matrix uploaded in either
 /// one must produce the same numbers on the same device.
-fn layouts_agree(session: &Session) -> CaseResult {
+fn layouts_agree(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let rows = shape[0];
     for fmt in QFmt::ALL {
-        let (native, _) = quantized_rows(fmt, QLayout::Native);
+        let be = fmt.block_elements() as u64;
+        let (native, _) = block_rows(fmt, QLayout::Native, seed, rows as usize);
         let mut widened = Vec::new();
         repack(
             fmt,
@@ -683,10 +748,10 @@ fn layouts_agree(session: &Session) -> CaseResult {
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
         let graph = graph_of(session);
-        let a = matrix_from_parts(&graph, fmt, QLayout::Native, &native)?
+        let a = matrix_from_parts(&graph, fmt, QLayout::Native, &native, rows, be)?
             .dequantize()
             .map_err(|e| -> CaseError { format!("{fmt:?} native: {e}").into() })?;
-        let b = matrix_from_parts(&graph, fmt, QLayout::F32Scales, &widened)?
+        let b = matrix_from_parts(&graph, fmt, QLayout::F32Scales, &widened, rows, be)?
             .dequantize()
             .map_err(|e| -> CaseError { format!("{fmt:?} f32 scales: {e}").into() })?;
         let (va, vb) = (read(&a)?, read(&b)?);
@@ -784,7 +849,7 @@ fn index_select_rows(session: &Session) -> CaseResult {
             let cols = fmt.block_elements() as usize;
             let (bytes, decoded) = quantized_rows(fmt, layout);
             let graph = graph_of(session);
-            let qm = matrix_from_parts(&graph, fmt, layout, &bytes)?;
+            let qm = matrix_from_parts(&graph, fmt, layout, &bytes, ROWS, cols as u64)?;
             let idx = from_u32(graph.handle(), &dims(&[PICKS.len() as u64]), PICKS)
                 .map_err(|e| -> CaseError { e.to_string().into() })?;
 
@@ -853,7 +918,14 @@ fn index_select_rows(session: &Session) -> CaseResult {
     let graph = graph_of(session);
     let fmt = QFmt::Q8_0;
     let (bytes, _) = quantized_rows(fmt, QLayout::Native);
-    let qm = matrix_from_parts(&graph, fmt, QLayout::Native, &bytes)?;
+    let qm = matrix_from_parts(
+        &graph,
+        fmt,
+        QLayout::Native,
+        &bytes,
+        ROWS,
+        fmt.block_elements() as u64,
+    )?;
     let square = from_u32(graph.handle(), &dims(&[2, 2]), &[0, 1, 2, 0])
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     if qm.index_select_rows(&square).is_ok() {

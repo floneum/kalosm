@@ -16,11 +16,29 @@ use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;
 use half::{bf16, f16};
 
-use crate::harness::{CaseError, CaseResult, Cases, dims, from_u32, skip};
+use crate::harness::{
+    CaseError, CaseResult, Cases, FuzzDim, dims, fill_indices, fill_range, from_u32, fuzz_case,
+    skip,
+};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
-const SHAPE: &[u64] = &[2, 6];
-const LEN: usize = 12;
+/// The rank-2 shape every table-driven case here runs at. The tables are over
+/// dtypes, not shapes, so one shared spec fuzzes them all.
+const SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(1, 32)];
+
+/// The widening-sum length: long enough that an f16 accumulator provably
+/// stalls (its ulp passes 1 at 2048), forward-only so it can go long.
+const ACCUM_SPEC: &[FuzzDim] = &[FuzzDim::Range(4096, 16384)];
+
+fn len_of(shape: &[u64]) -> usize {
+    shape.iter().product::<u64>() as usize
+}
+
+/// `fuzz_case` keys its per-run seed off the case name for the life of the
+/// process, so a formatted per-dtype name is leaked once at registration.
+fn leak(name: String) -> &'static str {
+    Box::leak(name.into_boxed_str())
+}
 
 /// The five dense dtypes. `Q(..)` is only ever a leaf dtype and lives in the
 /// `quantized` area.
@@ -98,8 +116,10 @@ pub fn cases() -> Cases {
     // against the host's own quantization of the same values.
     for dtype in DENSE {
         let dtype = *dtype;
-        let name = format!("roundtrip_{}", dtype_name(dtype));
-        cases.push("dtypes", name, move |s| roundtrip_case(s, dtype));
+        let name = leak(format!("roundtrip_{}", dtype_name(dtype)));
+        cases.push_case(fuzz_case("dtypes", name, SPEC, move |s, shape, seed| {
+            roundtrip_case(s, dtype, shape, seed)
+        }));
     }
 
     // Every ordered pair of dense dtypes. The forward cast surface is the
@@ -111,35 +131,51 @@ pub fn cases() -> Cases {
                 continue;
             }
             let (from, to) = (*from, *to);
-            let name = format!("cast_{}_to_{}", dtype_name(from), dtype_name(to));
-            cases.push("dtypes", name, move |s| cast_case(s, from, to));
+            let name = leak(format!("cast_{}_to_{}", dtype_name(from), dtype_name(to)));
+            cases.push_case(fuzz_case("dtypes", name, SPEC, move |s, shape, seed| {
+                cast_case(s, from, to, shape, seed)
+            }));
         }
     }
 
-    cases.push(
+    cases.push_case(fuzz_case(
         "dtypes",
         "cast_backward_returns_to_the_master_dtype",
+        SPEC,
         cast_backward,
-    );
-    cases.push(
+    ));
+    cases.push_case(fuzz_case(
         "dtypes",
         "cast_round_trip_through_f16_is_stable",
+        SPEC,
         f16_round_trip,
-    );
-    cases.push(
+    ));
+    cases.push_case(fuzz_case(
         "dtypes",
         "arithmetic_in_every_float_dtype",
+        SPEC,
         float_arithmetic,
-    );
-    cases.push(
+    ));
+    cases.push_case(fuzz_case(
         "dtypes",
         "comparison_returns_the_operand_dtype",
+        SPEC,
         comparison_dtype,
-    );
-    cases.push("dtypes", "rem_is_u32_only", rem_u32_only);
-    cases.push("dtypes", "round_modes", round_modes);
-    cases.push("dtypes", "float_to_int_and_back", float_int_round_trip);
-    cases.push("dtypes", "sum_widens_its_accumulator", widening_accumulator);
+    ));
+    cases.push_case(fuzz_case("dtypes", "rem_is_u32_only", SPEC, rem_u32_only));
+    cases.push_case(fuzz_case("dtypes", "round_modes", SPEC, round_modes));
+    cases.push_case(fuzz_case(
+        "dtypes",
+        "float_to_int_and_back",
+        SPEC,
+        float_int_round_trip,
+    ));
+    cases.push_case(fuzz_case(
+        "dtypes",
+        "sum_widens_its_accumulator",
+        ACCUM_SPEC,
+        widening_accumulator,
+    ));
     cases
 }
 
@@ -157,16 +193,17 @@ fn dtype_name(dtype: Dtype) -> &'static str {
 /// Upload as `dtype`, read back as f32, compare against the host's own
 /// rounding. A dtype whose readback path drops precision differently from its
 /// upload path fails here before any op runs.
-fn roundtrip_case(session: &Session, dtype: Dtype) -> CaseResult {
+fn roundtrip_case(session: &Session, dtype: Dtype, shape: &[u64], seed: u32) -> CaseResult {
     if let Some(why) = unsupported(session, dtype) {
         return Err(skip(why));
     }
+    let len = len_of(shape);
     let data = match dtype {
-        Dtype::U32 | Dtype::I32 => integral(1201, LEN),
-        _ => Domain::Wide.sample(1201, LEN),
+        Dtype::U32 | Dtype::I32 => integral(seed, len),
+        _ => Domain::Wide.sample(seed, len),
     };
     let graph = graph_of(session);
-    let x = upload_as(graph.handle(), dtype, SHAPE, &data)?;
+    let x = upload_as(graph.handle(), dtype, shape, &data)?;
     if x.dtype() != dtype {
         return Err(format!(
             "uploaded as {dtype:?} but the tensor reports {:?}",
@@ -175,14 +212,14 @@ fn roundtrip_case(session: &Session, dtype: Dtype) -> CaseResult {
         .into());
     }
     let expected: Vec<f32> = data.iter().map(|v| quantize_to(dtype, *v)).collect();
-    expect_values(session, SHAPE, dtype, &read(&x)?, &expected)?;
+    expect_values(session, shape, dtype, &read(&x)?, &expected)?;
     Ok(())
 }
 
 /// One `cast` edge. The reference is the composition of the two host
 /// quantizations, so a lossy pair is expected to be lossy in exactly the way
 /// the host says.
-fn cast_case(session: &Session, from: Dtype, to: Dtype) -> CaseResult {
+fn cast_case(session: &Session, from: Dtype, to: Dtype, shape: &[u64], seed: u32) -> CaseResult {
     for dtype in [from, to] {
         if let Some(why) = unsupported(session, dtype) {
             return Err(skip(why));
@@ -190,9 +227,9 @@ fn cast_case(session: &Session, from: Dtype, to: Dtype) -> CaseResult {
     }
     // Integers only, so the case measures the cast rather than the rounding
     // of an arbitrary float into a 5-bit exponent.
-    let data = integral(1213, LEN);
+    let data = integral(seed, len_of(shape));
     let graph = graph_of(session);
-    let x = upload_as(graph.handle(), from, SHAPE, &data)?;
+    let x = upload_as(graph.handle(), from, shape, &data)?;
     let y = x
         .cast(to)
         .map_err(|e| -> CaseError { format!("cast {from:?} -> {to:?}: {e}").into() })?;
@@ -203,7 +240,7 @@ fn cast_case(session: &Session, from: Dtype, to: Dtype) -> CaseResult {
         .iter()
         .map(|v| quantize_to(to, quantize_to(from, *v)))
         .collect();
-    expect_values(session, SHAPE, to, &read(&y)?, &expected)?;
+    expect_values(session, shape, to, &read(&y)?, &expected)?;
     Ok(())
 }
 
@@ -212,13 +249,14 @@ fn cast_case(session: &Session, from: Dtype, to: Dtype) -> CaseResult {
 ///
 /// The gradient must be an f32 tensor of the master's shape. A rule that
 /// leaves it in f16 silently truncates every update the optimizer applies.
-fn cast_backward(session: &Session) -> CaseResult {
+fn cast_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     if let Some(why) = unsupported(session, Dtype::F16) {
         return Err(skip(why));
     }
-    let data = Domain::Custom(0.5, 2.0).sample(1217, LEN);
+    let len = len_of(shape);
+    let data = Domain::Custom(0.5, 2.0).sample(seed, len);
     let graph = graph_of(session);
-    let master = upload(graph.handle(), &dims(SHAPE), &data)?;
+    let master = upload(graph.handle(), &dims(shape), &data)?;
     let half = master
         .cast(Dtype::F16)
         .and_then(|h| h.mul(&h))
@@ -228,28 +266,29 @@ fn cast_backward(session: &Session) -> CaseResult {
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let grad = gradient_of(&graph, &back, &master)?;
-    if grad.len() != LEN {
+    if grad.len() != len {
         return Err(format!(
-            "the master gradient has {} elements, want {LEN}",
+            "the master gradient has {} elements, want {len}",
             grad.len()
         )
         .into());
     }
     // d(x^2)/dx = 2x, computed in f16 and returned in f32.
     let want: Vec<f32> = data.iter().map(|v| 2.0 * v).collect();
-    crate::compare::approx_or_relative_eq(backend_of(session), &[LEN], &want, &grad, 2e-2, 5e-3)?;
+    crate::compare::approx_or_relative_eq(backend_of(session), &[len], &want, &grad, 2e-2, 5e-3)?;
     Ok(())
 }
 
 /// f32 -> f16 -> f32 must be idempotent: the second trip changes nothing,
 /// because the value is already representable.
-fn f16_round_trip(session: &Session) -> CaseResult {
+fn f16_round_trip(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     if let Some(why) = unsupported(session, Dtype::F16) {
         return Err(skip(why));
     }
-    let data = Domain::Wide.sample(1223, LEN);
+    let len = len_of(shape);
+    let data = Domain::Wide.sample(seed, len);
     let graph = graph_of(session);
-    let x = upload(graph.handle(), &dims(SHAPE), &data)?;
+    let x = upload(graph.handle(), &dims(shape), &data)?;
     let once = x
         .cast(Dtype::F16)
         .and_then(|h| h.cast(Dtype::F32))
@@ -260,22 +299,23 @@ fn f16_round_trip(session: &Session) -> CaseResult {
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     // Exact: the second trip is a no-op on an already-representable value.
     let (a, b) = (read(&once)?, read(&twice)?);
-    crate::compare::exact_eq(backend_of(session), &[LEN], &a, &b)?;
+    crate::compare::exact_eq(backend_of(session), &[len], &a, &b)?;
     Ok(())
 }
 
 /// `a * b + a` in each float dtype, against the host computed at that dtype's
 /// own precision.
-fn float_arithmetic(session: &Session) -> CaseResult {
-    let lhs = Domain::Custom(0.25, 2.0).sample(1229, LEN);
-    let rhs = Domain::Custom(0.25, 2.0).sample(1231, LEN);
+fn float_arithmetic(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let len = len_of(shape);
+    let lhs = Domain::Custom(0.25, 2.0).sample(seed, len);
+    let rhs = Domain::Custom(0.25, 2.0).sample(seed ^ 0x9e37_79b9, len);
     for dtype in [Dtype::F32, Dtype::F16, Dtype::BF16] {
         if unsupported(session, dtype).is_some() {
             continue;
         }
         let graph = graph_of(session);
-        let a = upload_as(graph.handle(), dtype, SHAPE, &lhs)?;
-        let b = upload_as(graph.handle(), dtype, SHAPE, &rhs)?;
+        let a = upload_as(graph.handle(), dtype, shape, &lhs)?;
+        let b = upload_as(graph.handle(), dtype, shape, &rhs)?;
         let y = a
             .mul(&b)
             .and_then(|p| p.add(&a))
@@ -291,17 +331,18 @@ fn float_arithmetic(session: &Session) -> CaseResult {
                 quantize_to(dtype, quantize_to(dtype, x * y) + x)
             })
             .collect();
-        expect_values(session, SHAPE, dtype, &read(&y)?, &expected)?;
+        expect_values(session, shape, dtype, &read(&y)?, &expected)?;
     }
     Ok(())
 }
 
 /// There is no Bool. A comparison returns 1/0 **in the operand's own dtype**,
 /// so `u32 == u32` is a `u32` and can be multiplied by a `u32` without a cast.
-fn comparison_dtype(session: &Session) -> CaseResult {
-    let values: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5];
+fn comparison_dtype(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    // Values in [0, 8) straddle the >= 3 threshold, so both mask values occur.
+    let values = fill_indices(seed, len_of(shape), 8);
     let graph = graph_of(session);
-    let x = from_u32(graph.handle(), &dims(SHAPE), &values)
+    let x = from_u32(graph.handle(), &dims(shape), &values)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     let mask = x
         .gte_scalar(3u32)
@@ -315,7 +356,7 @@ fn comparison_dtype(session: &Session) -> CaseResult {
         .into());
     }
     let expected: Vec<f32> = values.iter().map(|v| f32::from(*v >= 3)).collect();
-    expect_values(session, SHAPE, Dtype::U32, &read(&mask)?, &expected)?;
+    expect_values(session, shape, Dtype::U32, &read(&mask)?, &expected)?;
 
     // The mask is usable as an operand at its own dtype, without a cast.
     let gated = x
@@ -325,35 +366,33 @@ fn comparison_dtype(session: &Session) -> CaseResult {
         .iter()
         .map(|v| if *v >= 3 { *v as f32 } else { 0.0 })
         .collect();
-    expect_values(session, SHAPE, Dtype::U32, &read(&gated)?, &want)?;
+    expect_values(session, shape, Dtype::U32, &read(&gated)?, &want)?;
     Ok(())
 }
 
 /// `rem` exists for `u32` only. On floats it must be refused rather than
 /// lowered to something with a different sign convention per backend.
-fn rem_u32_only(session: &Session) -> CaseResult {
+fn rem_u32_only(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let len = len_of(shape);
+    // The divisor must be nonzero; the dividends must cross it in both
+    // directions so the remainder is not the identity.
+    let divisor = crate::harness::Rng::new(seed ^ 0x5eed).range(1, 9) as u32;
+    let values = fill_indices(seed, len, 64);
     let graph = graph_of(session);
-    let a = from_u32(
-        graph.handle(),
-        &dims(SHAPE),
-        &[7, 8, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6],
-    )
-    .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let b = from_u32(graph.handle(), &dims(SHAPE), &[5; LEN])
+    let a = from_u32(graph.handle(), &dims(shape), &values)
+        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let b = from_u32(graph.handle(), &dims(shape), &vec![divisor; len])
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     let y = a
         .rem(&b)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let expected: Vec<f32> = [7u32, 8, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6]
-        .iter()
-        .map(|v| (v % 5) as f32)
-        .collect();
-    expect_values(session, SHAPE, Dtype::U32, &read(&y)?, &expected)?;
+    let expected: Vec<f32> = values.iter().map(|v| (v % divisor) as f32).collect();
+    expect_values(session, shape, Dtype::U32, &read(&y)?, &expected)?;
 
     let f = upload(
         graph.handle(),
-        &dims(SHAPE),
-        &Domain::Positive.sample(1237, LEN),
+        &dims(shape),
+        &Domain::Positive.sample(seed ^ 0x9e37_79b9, len),
     )?;
     if f.rem(&f).is_ok() {
         return Err("rem was accepted on f32; the reference defines it for u32 only".into());
@@ -363,13 +402,16 @@ fn rem_u32_only(session: &Session) -> CaseResult {
 
 /// Trainer constraint 5: `round`/`floor`/`ceil`/`trunc` are real primitives
 /// with an explicit `RoundMode`, not fourteen comparisons.
-fn round_modes(session: &Session) -> CaseResult {
-    // Halves in both signs, so half-to-even and half-away-from-zero differ.
-    let data: Vec<f32> = vec![
-        -2.5, -1.5, -0.5, -0.25, 0.25, 0.5, 1.5, 2.5, 3.5, -3.5, 1.25, -1.25,
-    ];
+fn round_modes(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let len = len_of(shape);
+    // The quarter grid over [-4, 4]: exact in f32, lands halves in both signs,
+    // which is where half-to-even and half-away-from-zero differ.
+    let data: Vec<f32> = fill_indices(seed, len, 33)
+        .into_iter()
+        .map(|i| (i as f32 - 16.0) / 4.0)
+        .collect();
     let graph = graph_of(session);
-    let x = upload(graph.handle(), &dims(SHAPE), &data)?;
+    let x = upload(graph.handle(), &dims(shape), &data)?;
 
     let rows: [(&str, fn(&Tensor) -> fusor2::Result<Tensor>, fn(f32) -> f32); 5] = [
         ("floor", |t| t.floor(), f32::floor),
@@ -381,7 +423,7 @@ fn round_modes(session: &Session) -> CaseResult {
     for (name, build, reference) in rows {
         let y = build(&x).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
         let expected: Vec<f32> = data.iter().copied().map(reference).collect();
-        crate::compare::exact_eq(backend_of(session), &[LEN], &expected, &read(&y)?)
+        crate::compare::exact_eq(backend_of(session), &[len], &expected, &read(&y)?)
             .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
     }
     Ok(())
@@ -404,18 +446,18 @@ fn host_round_even(v: f32) -> f32 {
 
 /// float -> int -> float is truncation toward zero, and the pair composes to
 /// the host's own `trunc`.
-fn float_int_round_trip(session: &Session) -> CaseResult {
-    let data: Vec<f32> = vec![
-        -3.7, -2.2, -1.5, -0.9, 0.0, 0.4, 1.5, 2.2, 3.7, 4.9, -0.1, 7.99,
-    ];
+fn float_int_round_trip(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let len = len_of(shape);
+    // Both signs, so truncation toward zero differs from floor.
+    let data = fill_range(seed, len, -8.0, 8.0);
     let graph = graph_of(session);
-    let x = upload(graph.handle(), &dims(SHAPE), &data)?;
+    let x = upload(graph.handle(), &dims(shape), &data)?;
     let y = x
         .cast(Dtype::I32)
         .and_then(|i| i.cast(Dtype::F32))
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     let expected: Vec<f32> = data.iter().map(|v| v.trunc()).collect();
-    crate::compare::exact_eq(backend_of(session), &[LEN], &expected, &read(&y)?)?;
+    crate::compare::exact_eq(backend_of(session), &[len], &expected, &read(&y)?)?;
     Ok(())
 }
 
@@ -423,22 +465,22 @@ fn float_int_round_trip(session: &Session) -> CaseResult {
 /// magnitude ~1 in f16 stalls once the running total passes 2048, because the
 /// f16 ulp there exceeds the addend; the result would be roughly half the
 /// right answer.
-fn widening_accumulator(session: &Session) -> CaseResult {
+fn widening_accumulator(session: &Session, shape: &[u64], _seed: u32) -> CaseResult {
     if let Some(why) = unsupported(session, Dtype::F16) {
         return Err(skip(why));
     }
-    const N: u64 = 4096;
-    let data = vec![1.0f32; N as usize];
+    let n = shape[0];
+    let data = vec![1.0f32; n as usize];
     let graph = graph_of(session);
-    let x = upload_as(graph.handle(), Dtype::F16, &[N], &data)?;
+    let x = upload_as(graph.handle(), Dtype::F16, &[n], &data)?;
     let y = x
         .sum(0)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     let got = read(&y)?;
     let total = got.first().copied().unwrap_or(f32::NAN);
-    if (total - N as f32).abs() > 1.0 {
+    if (total - n as f32).abs() > 1.0 {
         return Err(format!(
-            "an f16 sum of {N} ones gave {total}: the accumulator did not widen, so the \
+            "an f16 sum of {n} ones gave {total}: the accumulator did not widen, so the \
              running total stalled once its ulp exceeded 1"
         )
         .into());

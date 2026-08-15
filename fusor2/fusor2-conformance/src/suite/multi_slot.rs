@@ -11,36 +11,36 @@
 //! the same definitions that crate's unit tests run on the host evaluator, so
 //! there is one spelling of each algorithm and two independent executions of it.
 
-use fusor2::{Dtype, Session, };
+use fusor2::{Dtype, Session};
 use fusor2::tensor::Dyn as Tensor;
 use fusor2_ir::carrier::{Carrier, oracle};
 use fusor2_ir::scalar::UnOp;
 
-use crate::harness::{CaseError, CaseResult, Cases, dims};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
 use crate::suite::support::{Domain, expect_values, graph_of, read, upload};
 
-/// `[rows, axis]`. `AXIS` deliberately exceeds no lane group: the one-pass body
-/// and the strided loop are separate code paths and `AXIS_LONG` covers the other.
-const ROWS: u64 = 3;
-const AXIS: u64 = 5;
+/// `[rows, axis]`, axis at most one pass of the lane group: the one-pass body
+/// and the strided loop are separate code paths and `LONG_SPEC` covers the
+/// other.
+const SHORT_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(1, 64)];
 /// Longer than one pass of the lane group on **either** backend (256 lanes), so
-/// the per-lane strided loop runs with three passes and the tree merges real
+/// the per-lane strided loop runs multiple passes and the tree merges real
 /// partial accumulators rather than one element each. The distinction is
 /// load-bearing: the loop absorbs elements with `merge(acc, lift(x))` while the
 /// tree merges two accumulators, and a carrier that got only one of the two
 /// right would pass at the short extent.
-const AXIS_LONG: u64 = 600;
+const LONG_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(300, 2000)];
 
 pub fn cases() -> Cases {
     let mut cases = Cases::new();
-    for (name, axis) in [
-        ("shift_stabilized_sum", AXIS),
-        ("shift_stabilized_sum_long", AXIS_LONG),
+    for (name, spec) in [
+        ("shift_stabilized_sum", SHORT_SPEC),
+        ("shift_stabilized_sum_long", LONG_SPEC),
     ] {
-        cases.push("multi_slot", name, move |s| shift_stabilized_case(s, axis));
+        cases.push_case(fuzz_case("multi_slot", name, spec, shift_stabilized_case));
     }
-    for (name, axis) in [("welford", AXIS), ("welford_long", AXIS_LONG)] {
-        cases.push("multi_slot", name, move |s| welford_case(s, axis));
+    for (name, spec) in [("welford", SHORT_SPEC), ("welford_long", LONG_SPEC)] {
+        cases.push_case(fuzz_case("multi_slot", name, spec, welford_case));
     }
     // The obligation every carrier owes, exercised on a real launch: a lane
     // group that is not a multiple of the extent merges padded identity lanes,
@@ -77,21 +77,21 @@ fn fold(x: &Tensor, carrier: Carrier) -> Result<Tensor, CaseError> {
 ///
 /// Slot 0 is the row max and slot 1 the shifted sum, so `slot0 + ln(slot1)` is
 /// log-sum-exp: the value the two-pass form computes in two traversals.
-fn shift_stabilized_case(session: &Session, axis: u64) -> CaseResult {
-    let len = (ROWS * axis) as usize;
-    let data = Domain::Wide.sample(211, len);
+fn shift_stabilized_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let (rows, axis) = (shape[0], shape[1]);
+    let data = Domain::Wide.sample(seed, (rows * axis) as usize);
     let carrier = oracle::shift_stabilized_sum(UnOp::Exp, Dtype::F32);
-    let actual = run_fold(session, carrier, ROWS, axis, &data)?;
+    let actual = run_fold(session, carrier, rows, axis, &data)?;
 
     // Two passes: the max, then the sum of the shifted exponentials.
-    let mut expected = Vec::with_capacity((ROWS * 2) as usize);
+    let mut expected = Vec::with_capacity((rows * 2) as usize);
     for row in data.chunks(axis as usize) {
         let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let l: f32 = row.iter().map(|v| (v - m).exp()).sum();
         expected.push(m);
         expected.push(l);
     }
-    expect_values(session, &[ROWS, 2], Dtype::F32, &actual, &expected)?;
+    expect_values(session, &[rows, 2], Dtype::F32, &actual, &expected)?;
 
     // And the value the carrier exists for: a log-sum-exp that stays finite
     // where the naive `sum(exp(x))` overflows.
@@ -111,20 +111,20 @@ fn shift_stabilized_case(session: &Session, axis: u64) -> CaseResult {
 ///
 /// Every slot is checked, not just the one the answer is read from: a merge that
 /// updates only slot 0 would still produce a plausible `n`.
-fn welford_case(session: &Session, axis: u64) -> CaseResult {
-    let len = (ROWS * axis) as usize;
-    let data = Domain::Wide.sample(307, len);
+fn welford_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let (rows, axis) = (shape[0], shape[1]);
+    let data = Domain::Wide.sample(seed, (rows * axis) as usize);
     let carrier = oracle::welford(Dtype::F32);
-    let actual = run_fold(session, carrier, ROWS, axis, &data)?;
+    let actual = run_fold(session, carrier, rows, axis, &data)?;
 
-    let mut expected = Vec::with_capacity((ROWS * 3) as usize);
+    let mut expected = Vec::with_capacity((rows * 3) as usize);
     for row in data.chunks(axis as usize) {
         let n = row.len() as f32;
         let mean = row.iter().sum::<f32>() / n;
         let m2: f32 = row.iter().map(|v| (v - mean) * (v - mean)).sum();
         expected.extend([n, mean, m2]);
     }
-    expect_values(session, &[ROWS, 3], Dtype::F32, &actual, &expected)?;
+    expect_values(session, &[rows, 3], Dtype::F32, &actual, &expected)?;
 
     // `m2 / n` is the biased variance the two-pass form computes.
     for (i, chunk) in actual.chunks(3).enumerate() {

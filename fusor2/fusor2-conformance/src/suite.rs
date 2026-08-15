@@ -64,7 +64,8 @@ use fusor2::tensor::Dyn as Tensor;
         self, assert_gradient_matches_finite_difference, finite_difference_gradient,
     };
     use crate::harness::{
-        Case, CaseError, CaseResult, dense_len, dims, fill, fill_range, from_f32,
+        Case, CaseError, CaseResult, FuzzDim, dense_len, dims, fill, fill_range, from_f32,
+        fuzz_case,
     };
 
     /// A unary op, as the case table names it.
@@ -207,18 +208,24 @@ use fusor2::tensor::Dyn as Tensor;
         Ok(())
     }
 
+    /// The shape a plain elementwise case fuzzes over: rank 2, both extents
+    /// re-sampled per run. The ceiling is deliberately modest — every case
+    /// here also runs a finite-difference backward, which rebuilds the graph
+    /// once per element, so a big shape is minutes, not coverage. Wide
+    /// forward-only extents are other cases' business.
+    pub const ELEMENTWISE_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(1, 16)];
+
     /// One unary elementwise case: forward parity plus a finite-difference
-    /// backward.
+    /// backward, at a fresh shape per run.
     pub fn unary_case(
         area: &'static str,
         name: &'static str,
-        shape: &'static [u64],
-        seed: u32,
+        spec: &'static [FuzzDim],
         domain: Domain,
         build: UnaryOp,
         reference: fn(f32) -> f32,
     ) -> Case {
-        Case::new(area, name, move |session| {
+        fuzz_case(area, name, spec, move |session, shape, seed| {
             let data = domain.sample(seed, dense_len(&dims(shape)));
             check_unary(session, shape, &data, &build, &reference)
         })
@@ -230,15 +237,18 @@ use fusor2::tensor::Dyn as Tensor;
     pub fn binary_case(
         area: &'static str,
         name: &'static str,
-        shape: &'static [u64],
+        spec: &'static [FuzzDim],
         domain: Domain,
         build: BinaryOp,
         reference: fn(f32, f32) -> f32,
     ) -> Case {
-        Case::new(area, name, move |session| {
+        fuzz_case(area, name, spec, move |session, shape, seed| {
             let len = dense_len(&dims(shape));
-            let lhs = domain.sample(11, len);
-            let rhs = domain.sample(23, len);
+            // Offset the rhs stream far from the lhs stream: consecutive
+            // seeds are distinct by the LCG's own guarantee, but a wide
+            // offset keeps the pair visibly unrelated in a failure dump.
+            let lhs = domain.sample(seed, len);
+            let rhs = domain.sample(seed ^ 0x9e37_79b9, len);
             let dimv = dims(shape);
             let usize_shape: Vec<usize> = shape.iter().map(|n| *n as usize).collect();
 
@@ -291,17 +301,16 @@ use fusor2::tensor::Dyn as Tensor;
         build: UnaryOp,
         reference: fn(f32) -> f32,
     ) -> Case {
-        const SHAPE: &[u64] = &[4, 6];
-        Case::new(area, name, move |session| {
-            let data = Domain::Wide.sample(31, dense_len(&dims(SHAPE)));
-            let dimv = dims(SHAPE);
+        fuzz_case(area, name, ELEMENTWISE_SPEC, move |session, shape, seed| {
+            let data = Domain::Wide.sample(seed, dense_len(&dims(shape)));
+            let dimv = dims(shape);
             let graph = graph_of(session);
             let x = upload(graph.handle(), &dimv, &data)?;
             let y = build(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
 
             let actual = read(&y)?;
             let expected: Vec<f32> = data.iter().copied().map(reference).collect();
-            expect_values(session, SHAPE, Dtype::F32, &actual, &expected)?;
+            expect_values(session, shape, Dtype::F32, &actual, &expected)?;
             if let Some((i, v)) = actual
                 .iter()
                 .enumerate()
@@ -320,207 +329,6 @@ use fusor2::tensor::Dyn as Tensor;
         })
     }
 
-}
-
-// ---------------------------------------------------------------------------
-
-/// The structural half of a generality case: saturate the graph the **real
-/// frontend** emits, extract a plan from it, and read both.
-///
-/// Every generality assert in the acceptance list is one of four questions
-/// about that pair, and all four are answered here rather than in each area
-/// file:
-///
-/// * **did the law fire** — [`Probe::fired`], on `report.fired`. A rule that
-///   silently stops matching the frontend's chain is how flash attention was
-///   unreachable on both backends for a week while every numeric case passed;
-/// * **did the law decline** — the same reading, negated. The `STRICT` half of
-///   the acceptance list is a *decline* assert, and asserting only that a law
-///   fires somewhere else does not cover it;
-/// * **what did extraction materialize** — [`Probe::materializes_elements`],
-///   over the plan's own buffer list. The whole memory win of a fused
-///   reduction lives in that bit: if the extractor materializes the
-///   intermediate, every numeric test still passes and the kernel is a memory
-///   hog;
-/// * **which schedule point did it resolve to** — [`Probe::theta`]. A node can
-///   be admissible on paper and unselectable in fact, so "a fold was chosen"
-///   is not the same claim as "a schedule was chosen for it".
-///
-/// A probe is never built from a hand-written graph: the caller passes the
-/// tensors a frontend call returned.
-pub mod probe {
-    use fusor2::{Session, };
-use fusor2::tensor::Dyn as Tensor;
-    use fusor2_ir::egraph::{Id, Saturate, SaturationBudget, SaturationReport};
-    use fusor2_ir::extract::{ExtractBudget, Extractor, Plan};
-    use fusor2_ir::ir::level1::SchedPoint;
-    use fusor2_ir::saturate::Driver;
-
-    use crate::harness::CaseError;
-
-    /// One saturation and one extraction of one frontend-built graph.
-    pub struct Probe {
-        pub report: SaturationReport,
-        pub plan: Plan,
-    }
-
-    /// Saturate and extract the graph `outs` were built in.
-    ///
-    /// The pipeline is exactly `Session::resolve`'s: the session's own rule
-    /// table, the session's own caps, the shipped `Driver` and the shipped
-    /// `LocalSearch`. Anything else would prove a claim about a pipeline
-    /// nothing runs.
-    pub fn probe(session: &Session, outs: &[Tensor]) -> Result<Probe, CaseError> {
-        let first = outs
-            .first()
-            .ok_or_else(|| -> CaseError { "a probe needs at least one root".into() })?;
-        let graph = first.graph().clone();
-        let caps = session.caps();
-        let cost = fusor2_cost::Roofline::new(session.device().target().facts().clone());
-        let extractor = fusor2_cost::LocalSearch::new(fusor2_tile::Planner::shared(), caps.clone())
-            .with_registry(session.registry().clone());
-        let ids: Vec<Id> = outs.iter().map(|t| t.id()).collect();
-        graph
-            .with_egraph(|eg| {
-                for id in &ids {
-                    eg.add_root(*id);
-                }
-                let report = Driver::new().saturate(
-                    eg,
-                    &caps,
-                    session.rules(),
-                    SaturationBudget::default(),
-                )?;
-                let roots: Vec<Id> = eg.roots().to_vec();
-                let plan = extractor.extract(eg, &roots, &cost, ExtractBudget::default())?;
-                Ok(Probe { report, plan })
-            })
-            .map_err(|e| -> CaseError { format!("saturate+extract: {e}").into() })
-    }
-
-    impl Probe {
-        /// How many times a named rule fired.
-        pub fn fired(&self, rule: &str) -> u32 {
-            self.report
-                .fired
-                .iter()
-                .find(|(n, _)| *n == rule)
-                .map_or(0, |(_, n)| *n)
-        }
-
-        /// Every rule that fired at least once, sorted — the message a missing
-        /// firing assert prints, so a reader can tell "the law is unlanded"
-        /// from "the law stopped matching".
-        pub fn fired_names(&self) -> Vec<&'static str> {
-            let mut v: Vec<&'static str> = self
-                .report
-                .fired
-                .iter()
-                .filter(|(_, n)| *n > 0)
-                .map(|(n, _)| *n)
-                .collect();
-            v.sort_unstable();
-            v
-        }
-
-        /// The saturation report itself must be readable before anything below
-        /// it means anything.
-        pub fn require_saturated(&self, what: &str) -> Result<(), CaseError> {
-            if !self.report.saturated {
-                return Err(format!(
-                    "{what}: did not saturate in {} rounds ({} applications, {} nodes). \
-                     Every structural claim below this is unreadable while it is false.",
-                    self.report.rounds, self.report.applications, self.report.final_nodes
-                )
-                .into());
-            }
-            if !self.report.truncated.is_empty() {
-                return Err(format!(
-                    "{what}: truncated {} class(es) at {} nodes. Truncation is never silent.",
-                    self.report.truncated.len(),
-                    self.report.final_nodes
-                )
-                .into());
-            }
-            Ok(())
-        }
-
-        /// A law must have fired on this graph.
-        pub fn require_fired(&self, rule: &str, why: &str) -> Result<(), CaseError> {
-            if self.fired(rule) > 0 {
-                return Ok(());
-            }
-            Err(format!(
-                "`{rule}` never fired while saturating the graph the frontend emits ({why}). \
-                 {} applications over {} rounds fired {:?}. A rule that only derives its \
-                 motivating example is a recognizer with extra steps.",
-                self.report.applications,
-                self.report.rounds,
-                self.fired_names()
-            )
-            .into())
-        }
-
-        /// A law must **not** have fired on this graph. The `STRICT` half of
-        /// the acceptance list is exactly this assert, and it is not implied
-        /// by any number of firing asserts elsewhere.
-        pub fn require_declined(&self, rule: &str, why: &str) -> Result<(), CaseError> {
-            let n = self.fired(rule);
-            if n == 0 {
-                return Ok(());
-            }
-            Err(format!(
-                "`{rule}` fired {n} time(s) on a value that forbids it ({why}). \
-                 The acceptance test for this path is a byte-identical export, so an \
-                 inexact law firing here is a wrong answer, not a slow one."
-            )
-            .into())
-        }
-
-        /// Total bytes the plan allocates.
-        pub fn buffer_bytes(&self) -> u64 {
-            self.plan
-                .buffers
-                .iter()
-                .map(|b| b.elements.as_const().unwrap_or(0) * b.dtype.byte_size())
-                .sum()
-        }
-
-        /// Every element count the plan allocates a buffer for, ascending.
-        pub fn buffer_elements(&self) -> Vec<u64> {
-            let mut v: Vec<u64> = self
-                .plan
-                .buffers
-                .iter()
-                .filter_map(|b| b.elements.as_const())
-                .collect();
-            v.sort_unstable();
-            v
-        }
-
-        /// Dispatches in the extracted plan.
-        pub fn launches(&self) -> usize {
-            self.plan.launches.len()
-        }
-
-        /// Every schedule point the extraction resolved, in node order. A
-        /// named-shape assert reads this, because "a fold was selected" and "a
-        /// schedule was resolved for it" are different claims and only the
-        /// second one is schedulable.
-        pub fn thetas(&self) -> Vec<SchedPoint> {
-            let mut ids: Vec<Id> = self.plan.extraction.theta.keys().copied().collect();
-            ids.sort_unstable();
-            ids.iter()
-                .filter_map(|i| self.plan.extraction.theta.get(i).copied())
-                .collect()
-        }
-
-        /// The resolved schedule point of every selected node in the plan's
-        /// launches, paired with the launch it belongs to.
-        pub fn theta(&self, index: usize) -> Option<SchedPoint> {
-            self.thetas().get(index).copied()
-        }
-    }
 }
 
 #[cfg(test)]

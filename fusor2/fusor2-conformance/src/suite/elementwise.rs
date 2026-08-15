@@ -12,15 +12,17 @@ use crate::compare::{
     assert_all_zero, assert_gradient_matches_finite_difference, finite_difference_gradient,
     relative_eq,
 };
-use crate::harness::{CaseError, CaseResult, Cases, dense_len, dims, is_gpu};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dense_len, dims, fuzz_case, is_gpu};
 use crate::suite::support::{
-    BinaryOp, Domain, UnaryOp, binary_case, comparison_case, expect_values, gradient_of, graph_of,
-    loss_of, read, read_scalar, unary_case, upload,
+    BinaryOp, Domain, ELEMENTWISE_SPEC, UnaryOp, binary_case, comparison_case, expect_values,
+    gradient_of, graph_of, loss_of, read, read_scalar, unary_case, upload,
 };
 
-/// Shape every elementwise case runs at. Small, because each backward case
-/// pays `2 * 24` graph rebuilds for finite differences.
-const SHAPE: &[u64] = &[4, 6];
+/// The forward-only rows take no gradient, so they can afford multi-workgroup
+/// extents. The floor is a real constraint: [`non_vacuous`] needs enough
+/// samples that a random draw cannot land entirely on the op's identity
+/// interval.
+const FORWARD_SPEC: &[FuzzDim] = &[FuzzDim::Range(4, 8), FuzzDim::Range(8, 64)];
 
 /// `(e^x - e^-x) / (e^x + e^-x)`, the form `tanh_exact` names. A separate
 /// expression from `tanh`, not an alias: the reference needs it where a
@@ -181,8 +183,7 @@ pub fn cases() -> Cases {
         cases.push_case(unary_case(
             "elementwise",
             name,
-            SHAPE,
-            17,
+            ELEMENTWISE_SPEC,
             domain,
             op,
             reference,
@@ -192,29 +193,33 @@ pub fn cases() -> Cases {
         cases.push_case(unary_case(
             "elementwise",
             name,
-            SHAPE,
-            19,
+            ELEMENTWISE_SPEC,
             domain,
             op,
             reference,
         ));
     }
     for (name, domain, op, reference) in forward_only() {
-        cases.push("elementwise", name, move |session| {
-            let data = domain.sample(29, dense_len(&dims(SHAPE)));
-            non_vacuous(name, &data, reference)?;
-            let graph = graph_of(session);
-            let x = upload(graph.handle(), &dims(SHAPE), &data)?;
-            let y = op(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
-            let expected: Vec<f32> = data.iter().copied().map(reference).collect();
-            expect_values(session, SHAPE, Dtype::F32, &read(&y)?, &expected)
-        });
+        cases.push_case(fuzz_case(
+            "elementwise",
+            name,
+            FORWARD_SPEC,
+            move |session, shape, seed| {
+                let data = domain.sample(seed, dense_len(&dims(shape)));
+                non_vacuous(name, &data, reference)?;
+                let graph = graph_of(session);
+                let x = upload(graph.handle(), &dims(shape), &data)?;
+                let y = op(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
+                let expected: Vec<f32> = data.iter().copied().map(reference).collect();
+                expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)
+            },
+        ));
     }
     for (name, domain, op, reference) in binaries() {
         cases.push_case(binary_case(
             "elementwise",
             name,
-            SHAPE,
+            ELEMENTWISE_SPEC,
             domain,
             op,
             reference,
@@ -224,32 +229,48 @@ pub fn cases() -> Cases {
         cases.push_case(comparison_case("elementwise", name, op, reference));
     }
     for (name, op, reference) in tensor_comparisons() {
-        cases.push("elementwise", name, move |session| {
-            tensor_comparison_case(session, name, op, reference)
-        });
+        cases.push_case(fuzz_case(
+            "elementwise",
+            name,
+            ELEMENTWISE_SPEC,
+            move |session, shape, seed| {
+                tensor_comparison_case(session, name, shape, seed, op, reference)
+            },
+        ));
     }
     for (name, op, reference) in broadcasting() {
-        cases.push("elementwise", name, move |session| {
-            broadcast_case(session, op, reference)
-        });
+        cases.push_case(fuzz_case(
+            "elementwise",
+            name,
+            ELEMENTWISE_SPEC,
+            move |session, shape, seed| broadcast_case(session, shape, seed, op, reference),
+        ));
     }
 
     // The two GPU-approximate exponentials. Their point is that they are *not*
     // `exp`, so they get a relative bound rather than an elementwise
     // reference: an implementation that quietly aliased them to `exp` would
     // pass a strict comparison and hide the missing expression.
-    cases.push("elementwise", "approximate_exp", |session| {
-        approximate_exp_case(session, "approximate_exp", 5e-3)
-    });
-    cases.push("elementwise", "less_approximate_exp", |session| {
-        approximate_exp_case(session, "less_approximate_exp", 5e-2)
-    });
+    cases.push_case(fuzz_case(
+        "elementwise",
+        "approximate_exp",
+        ELEMENTWISE_SPEC,
+        |session, shape, seed| approximate_exp_case(session, "approximate_exp", shape, seed, 5e-3),
+    ));
+    cases.push_case(fuzz_case(
+        "elementwise",
+        "less_approximate_exp",
+        ELEMENTWISE_SPEC,
+        |session, shape, seed| {
+            approximate_exp_case(session, "less_approximate_exp", shape, seed, 5e-2)
+        },
+    ));
 
     // The two elementwise extrema, whose adjoint is a mask rather than zero.
     cases.push_case(binary_case(
         "elementwise",
         "max_elementwise",
-        SHAPE,
+        ELEMENTWISE_SPEC,
         Domain::Wide,
         |a, b| a.maximum(b),
         f32::max,
@@ -257,7 +278,7 @@ pub fn cases() -> Cases {
     cases.push_case(binary_case(
         "elementwise",
         "min_elementwise",
-        SHAPE,
+        ELEMENTWISE_SPEC,
         Domain::Wide,
         |a, b| a.minimum(b),
         f32::min,
@@ -266,24 +287,45 @@ pub fn cases() -> Cases {
     // The operator surface. Separate cases because a chained expression is a
     // different `ScalarExpr::compose` shape than a single op, and composition
     // *is* elementwise fusion.
-    cases.push("elementwise", "std_ops_add_sub", |s| {
-        expr_case(s, |a, b| a.add(b)?.sub(b), |x, y| (x + y) - y)
-    });
-    cases.push("elementwise", "std_ops_mul_div", |s| {
-        expr_case(s, |a, b| a.mul(b)?.div(b), |x, y| (x * y) / y)
-    });
-    cases.push("elementwise", "std_ops_neg", |s| {
-        expr_case(s, |a, b| a.neg()?.sub(b), |x, y| -x - y)
-    });
-    cases.push("elementwise", "std_ops_scalar", |s| {
-        expr_case(
-            s,
-            |a, b| a.mul_scalar(3.0)?.add_scalar(-1.0)?.sub(b),
-            |x, y| (x * 3.0 - 1.0) - y,
-        )
-    });
+    cases.push_case(fuzz_case(
+        "elementwise",
+        "std_ops_add_sub",
+        ELEMENTWISE_SPEC,
+        |s, shape, seed| expr_case(s, shape, seed, |a, b| a.add(b)?.sub(b), |x, y| (x + y) - y),
+    ));
+    cases.push_case(fuzz_case(
+        "elementwise",
+        "std_ops_mul_div",
+        ELEMENTWISE_SPEC,
+        |s, shape, seed| expr_case(s, shape, seed, |a, b| a.mul(b)?.div(b), |x, y| (x * y) / y),
+    ));
+    cases.push_case(fuzz_case(
+        "elementwise",
+        "std_ops_neg",
+        ELEMENTWISE_SPEC,
+        |s, shape, seed| expr_case(s, shape, seed, |a, b| a.neg()?.sub(b), |x, y| -x - y),
+    ));
+    cases.push_case(fuzz_case(
+        "elementwise",
+        "std_ops_scalar",
+        ELEMENTWISE_SPEC,
+        |s, shape, seed| {
+            expr_case(
+                s,
+                shape,
+                seed,
+                |a, b| a.mul_scalar(3.0)?.add_scalar(-1.0)?.sub(b),
+                |x, y| (x * 3.0 - 1.0) - y,
+            )
+        },
+    ));
 
-    cases.push("elementwise", "where_cond", where_cond_case);
+    cases.push_case(fuzz_case(
+        "elementwise",
+        "where_cond",
+        ELEMENTWISE_SPEC,
+        where_cond_case,
+    ));
     cases
 }
 
@@ -299,18 +341,20 @@ fn backend_of(session: &Session) -> &'static str {
 fn tensor_comparison_case(
     session: &Session,
     name: &'static str,
+    shape: &[u64],
+    seed: u32,
     op: BinaryOp,
     reference: fn(f32, f32) -> f32,
 ) -> CaseResult {
-    let len = dense_len(&dims(SHAPE));
-    let lhs = Domain::Wide.sample(41, len);
+    let len = dense_len(&dims(shape));
+    let lhs = Domain::Wide.sample(seed, len);
     // Half the rows share a value with `lhs`, so the equality comparisons are
     // not vacuously all-zero.
-    let mut rhs = Domain::Wide.sample(43, len);
+    let mut rhs = Domain::Wide.sample(seed ^ 0x9e37_79b9, len);
     for i in (0..len).step_by(2) {
         rhs[i] = lhs[i];
     }
-    let dimv = dims(SHAPE);
+    let dimv = dims(shape);
 
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dimv, &lhs)?;
@@ -323,7 +367,7 @@ fn tensor_comparison_case(
         .zip(&rhs)
         .map(|(x, y)| reference(*x, *y))
         .collect();
-    expect_values(session, SHAPE, Dtype::F32, &actual, &expected)?;
+    expect_values(session, shape, Dtype::F32, &actual, &expected)?;
 
     assert_all_zero(name, &gradient_of(&graph, &y, &a)?)?;
     assert_all_zero(name, &gradient_of(&graph, &y, &b)?)?;
@@ -335,38 +379,43 @@ fn tensor_comparison_case(
 /// No implicit broadcasting exists at L0 — the frontend emits
 /// `Restride { multiplier: 0 }` — so this is really a test that the frontend's
 /// right-aligned rules hold *and* that a stride-0 axis's adjoint is a sum over
-/// that axis. A rule that forgot the sum would hand a `[4, 6]` gradient to a
-/// `[6]` leaf.
-fn broadcast_case(session: &Session, op: BinaryOp, reference: fn(f32, f32) -> f32) -> CaseResult {
-    const ROWS: u64 = 4;
-    const COLS: u64 = 6;
-    let lhs = Domain::Positive.sample(53, (ROWS * COLS) as usize);
-    let rhs = Domain::Positive.sample(59, COLS as usize);
+/// that axis. A rule that forgot the sum would hand a `[rows, cols]` gradient
+/// to a `[cols]` leaf.
+fn broadcast_case(
+    session: &Session,
+    shape: &[u64],
+    seed: u32,
+    op: BinaryOp,
+    reference: fn(f32, f32) -> f32,
+) -> CaseResult {
+    let (rows, cols) = (shape[0], shape[1]);
+    let lhs = Domain::Positive.sample(seed, (rows * cols) as usize);
+    let rhs = Domain::Positive.sample(seed ^ 0x9e37_79b9, cols as usize);
 
     let graph = graph_of(session);
-    let a = upload(graph.handle(), &dims(&[ROWS, COLS]), &lhs)?;
-    let b = upload(graph.handle(), &dims(&[COLS]), &rhs)?;
+    let a = upload(graph.handle(), &dims(&[rows, cols]), &lhs)?;
+    let b = upload(graph.handle(), &dims(&[cols]), &rhs)?;
     let y = op(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let actual = read(&y)?;
-    let expected: Vec<f32> = (0..(ROWS * COLS) as usize)
-        .map(|i| reference(lhs[i], rhs[i % COLS as usize]))
+    let expected: Vec<f32> = (0..(rows * cols) as usize)
+        .map(|i| reference(lhs[i], rhs[i % cols as usize]))
         .collect();
-    expect_values(session, &[ROWS, COLS], Dtype::F32, &actual, &expected)?;
+    expect_values(session, &[rows, cols], Dtype::F32, &actual, &expected)?;
 
     let d_rhs = gradient_of(&graph, &y, &b)?;
-    if d_rhs.len() != COLS as usize {
+    if d_rhs.len() != cols as usize {
         return Err(format!(
-            "the broadcast operand's gradient has {} elements, not {COLS}: a stride-0 \
+            "the broadcast operand's gradient has {} elements, not {cols}: a stride-0 \
              axis's adjoint is a sum over that axis",
             d_rhs.len()
         )
         .into());
     }
-    let numeric = finite_difference_gradient(&[COLS as usize], &rhs, &mut |probe| {
+    let numeric = finite_difference_gradient(&[cols as usize], &rhs, &mut |probe| {
         let g = graph_of(session);
-        let a = upload(g.handle(), &dims(&[ROWS, COLS]), &lhs)?;
-        let b = upload(g.handle(), &dims(&[COLS]), probe)?;
+        let a = upload(g.handle(), &dims(&[rows, cols]), &lhs)?;
+        let b = upload(g.handle(), &dims(&[cols]), probe)?;
         let y = op(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
         read_scalar(&loss_of(&y)?)
     })?;
@@ -377,13 +426,15 @@ fn broadcast_case(session: &Session, op: BinaryOp, reference: fn(f32, f32) -> f3
 /// A two-operand expression checked forward and on the left gradient.
 fn expr_case(
     session: &Session,
+    shape: &[u64],
+    seed: u32,
     build: fn(&Tensor, &Tensor) -> fusor2::Result<Tensor>,
     reference: fn(f32, f32) -> f32,
 ) -> CaseResult {
-    let len = dense_len(&dims(SHAPE));
-    let lhs = Domain::Positive.sample(61, len);
-    let rhs = Domain::Positive.sample(67, len);
-    let dimv = dims(SHAPE);
+    let len = dense_len(&dims(shape));
+    let lhs = Domain::Positive.sample(seed, len);
+    let rhs = Domain::Positive.sample(seed ^ 0x9e37_79b9, len);
+    let dimv = dims(shape);
 
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dimv, &lhs)?;
@@ -396,7 +447,7 @@ fn expr_case(
         .zip(&rhs)
         .map(|(x, y)| reference(*x, *y))
         .collect();
-    expect_values(session, SHAPE, Dtype::F32, &actual, &expected)?;
+    expect_values(session, shape, Dtype::F32, &actual, &expected)?;
 
     let analytic = gradient_of(&graph, &y, &a)?;
     let numeric = finite_difference_gradient(&[len], &lhs, &mut |probe| {
@@ -417,10 +468,16 @@ fn expr_case(
 /// yet, so this case reports the missing entry point by name rather than
 /// aliasing to `exp` and passing vacuously — an alias would make the case
 /// green while the expression that justifies its existence was absent.
-fn approximate_exp_case(session: &Session, name: &'static str, tol: f32) -> CaseResult {
-    let len = dense_len(&dims(SHAPE));
-    let data = Domain::Wide.sample(71, len);
-    let dimv = dims(SHAPE);
+fn approximate_exp_case(
+    session: &Session,
+    name: &'static str,
+    shape: &[u64],
+    seed: u32,
+    tol: f32,
+) -> CaseResult {
+    let len = dense_len(&dims(shape));
+    let data = Domain::Wide.sample(seed, len);
+    let dimv = dims(shape);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
 
@@ -460,16 +517,16 @@ fn approximate_exp_op(x: &Tensor, name: &str) -> Option<fusor2::Result<Tensor>> 
 /// `where_cond`: condition, on_true and on_false all share one shape and one
 /// dtype, because there is no bool. The condition receives a zero gradient and
 /// the branches receive the mask and its complement.
-fn where_cond_case(session: &Session) -> CaseResult {
-    let len = dense_len(&dims(SHAPE));
+fn where_cond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let len = dense_len(&dims(shape));
     let cond: Vec<f32> = Domain::Wide
-        .sample(73, len)
+        .sample(seed, len)
         .iter()
         .map(|v| f32::from(*v > 0.0))
         .collect();
-    let on_true = Domain::Wide.sample(79, len);
-    let on_false = Domain::Wide.sample(83, len);
-    let dimv = dims(SHAPE);
+    let on_true = Domain::Wide.sample(seed ^ 0x9e37_79b9, len);
+    let on_false = Domain::Wide.sample(seed.wrapping_add(1), len);
+    let dimv = dims(shape);
 
     let graph = graph_of(session);
     let c = upload(graph.handle(), &dimv, &cond)?;
@@ -489,7 +546,7 @@ fn where_cond_case(session: &Session) -> CaseResult {
             }
         })
         .collect();
-    expect_values(session, SHAPE, Dtype::F32, &actual, &expected)?;
+    expect_values(session, shape, Dtype::F32, &actual, &expected)?;
 
     assert_all_zero("where_cond condition", &gradient_of(&graph, &y, &c)?)?;
 
@@ -528,8 +585,8 @@ mod tests {
     /// green, or it is decoration.
     #[test]
     fn non_vacuous_rejects_a_domain_where_the_op_is_the_identity() {
-        let len = dense_len(&dims(SHAPE));
-        // Verbatim what `scalar_arith()` samples for these three rows.
+        let len = 96; // the largest shape `ELEMENTWISE_SPEC` can sample
+        // The domain `scalar_arith()` samples for these three rows.
         let vacuous = Domain::Custom(0.2, 1.5).sample(19, len);
         for (name, reference) in [
             ("abs", f32::abs as fn(f32) -> f32),
@@ -547,7 +604,7 @@ mod tests {
     /// second way to fail.
     #[test]
     fn every_forward_only_row_actually_exercises_its_op() {
-        let len = dense_len(&dims(SHAPE));
+        let len = 32; // the smallest shape `FORWARD_SPEC` can sample
         for (name, domain, _, reference) in forward_only() {
             let data = domain.sample(29, len);
             non_vacuous(name, &data, reference)

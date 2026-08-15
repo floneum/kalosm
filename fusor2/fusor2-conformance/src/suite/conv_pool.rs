@@ -10,20 +10,89 @@ use fusor2::composite::pool::PoolSize;
 use fusor2::{Dim, Dtype, Session};
 
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
-use crate::harness::{CaseError, CaseResult, Cases, dims};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
 use crate::suite::support::{
     Domain, expect_values, gradient_of, graph_of, loss_of, read, read_scalar, upload,
 };
 
+// Spatial extents start at 3 so they never fall under the kernel extent
+// (kernels sample from [1, 3]). conv1d runs a finite-difference gradient over
+// the weight, so its channel counts stay small.
+const CONV1D_SPEC: &[FuzzDim] = &[
+    FuzzDim::Range(1, 2),
+    FuzzDim::Range(1, 3),
+    FuzzDim::Range(3, 8),
+    FuzzDim::Range(1, 3),
+    FuzzDim::Range(1, 3),
+];
+const CONV2D_SPEC: &[FuzzDim] = &[
+    FuzzDim::Range(1, 2),
+    FuzzDim::Range(1, 3),
+    FuzzDim::Range(3, 10),
+    FuzzDim::Range(3, 10),
+    FuzzDim::Range(1, 3),
+    FuzzDim::Range(1, 3),
+];
+// Groups must divide both channel counts: per-group counts are sampled and
+// multiplied.
+const GROUPED_CONV_SPEC: &[FuzzDim] = &[
+    FuzzDim::Range(1, 2),
+    FuzzDim::Range(1, 3),
+    FuzzDim::Range(1, 3),
+    FuzzDim::Range(1, 3),
+    FuzzDim::Range(3, 8),
+    FuzzDim::Range(1, 3),
+];
+// The length is `window * positions`, so the non-overlapping pool always
+// tiles it exactly.
+const POOL_SPEC: &[FuzzDim] = &[
+    FuzzDim::Range(1, 4),
+    FuzzDim::Range(1, 4),
+    FuzzDim::Range(1, 4),
+];
+const UPSAMPLE_SPEC: &[FuzzDim] = &[
+    FuzzDim::Range(1, 3),
+    FuzzDim::Range(1, 4),
+    FuzzDim::Range(1, 4),
+    FuzzDim::Range(1, 3),
+];
+
 pub fn cases() -> Cases {
     let mut cases = Cases::new();
-    cases.push("conv_pool", "conv1d", conv1d);
-    cases.push("conv_pool", "conv2d_strided", conv2d_strided);
-    cases.push("conv_pool", "grouped_conv", grouped_conv);
-    cases.push("conv_pool", "pool", |s| pool_case(s, Pool::Avg));
-    cases.push("conv_pool", "pool_max", |s| pool_case(s, Pool::Max));
-    cases.push("conv_pool", "pool_min", |s| pool_case(s, Pool::Min));
-    cases.push("conv_pool", "upsample_nearest2d", upsample_nearest2d);
+    cases.push_case(fuzz_case("conv_pool", "conv1d", CONV1D_SPEC, conv1d));
+    cases.push_case(fuzz_case(
+        "conv_pool",
+        "conv2d_strided",
+        CONV2D_SPEC,
+        conv2d_strided,
+    ));
+    cases.push_case(fuzz_case(
+        "conv_pool",
+        "grouped_conv",
+        GROUPED_CONV_SPEC,
+        grouped_conv,
+    ));
+    cases.push_case(fuzz_case("conv_pool", "pool", POOL_SPEC, |s, sh, seed| {
+        pool_case(s, Pool::Avg, sh, seed)
+    }));
+    cases.push_case(fuzz_case(
+        "conv_pool",
+        "pool_max",
+        POOL_SPEC,
+        |s, sh, seed| pool_case(s, Pool::Max, sh, seed),
+    ));
+    cases.push_case(fuzz_case(
+        "conv_pool",
+        "pool_min",
+        POOL_SPEC,
+        |s, sh, seed| pool_case(s, Pool::Min, sh, seed),
+    ));
+    cases.push_case(fuzz_case(
+        "conv_pool",
+        "upsample_nearest2d",
+        UPSAMPLE_SPEC,
+        upsample_nearest2d,
+    ));
     cases.push(
         "conv_pool",
         "pool_max_non_overlapping_adjoint_is_mask",
@@ -71,47 +140,40 @@ fn host_conv1d(
     (out_len, out)
 }
 
-fn conv1d(session: &Session) -> CaseResult {
-    const BATCH: usize = 2;
-    const IN_CH: usize = 3;
-    const LEN: usize = 8;
-    const OUT_CH: usize = 4;
-    const K: usize = 3;
-    let x_data = Domain::Wide.sample(401, BATCH * IN_CH * LEN);
-    let w_data = Domain::Wide.sample(409, OUT_CH * IN_CH * K);
-    let b_data = Domain::Wide.sample(419, OUT_CH);
+fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let [batch, in_ch, len, out_ch, k] = [
+        shape[0] as usize,
+        shape[1] as usize,
+        shape[2] as usize,
+        shape[3] as usize,
+        shape[4] as usize,
+    ];
+    let x_data = Domain::Wide.sample(seed, batch * in_ch * len);
+    let w_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, out_ch * in_ch * k);
+    let b_data = Domain::Wide.sample(seed.wrapping_add(1), out_ch);
 
     let graph = graph_of(session);
     let x = upload(
         graph.handle(),
-        &dims(&[BATCH as u64, IN_CH as u64, LEN as u64]),
+        &dims(&[batch as u64, in_ch as u64, len as u64]),
         &x_data,
     )?;
     let w = upload(
         graph.handle(),
-        &dims(&[OUT_CH as u64, IN_CH as u64, K as u64]),
+        &dims(&[out_ch as u64, in_ch as u64, k as u64]),
         &w_data,
     )?;
-    let b = upload(graph.handle(), &dims(&[OUT_CH as u64]), &b_data)?;
+    let b = upload(graph.handle(), &dims(&[out_ch as u64]), &b_data)?;
 
-    let y = fusor2::composite::conv::conv(&x, &w, Some(&b), &[1], &[K as u32 / 2], &[1])
+    let y = fusor2::composite::conv::conv(&x, &w, Some(&b), &[1], &[k as u32 / 2], &[1])
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let (out_len, expected) = host_conv1d(
-        &x_data,
-        &w_data,
-        &b_data,
-        BATCH,
-        IN_CH,
-        LEN,
-        OUT_CH,
-        K,
-        K / 2,
-        1,
+        &x_data, &w_data, &b_data, batch, in_ch, len, out_ch, k, k / 2, 1,
     );
     expect_values(
         session,
-        &[BATCH as u64, OUT_CH as u64, out_len as u64],
+        &[batch as u64, out_ch as u64, out_len as u64],
         Dtype::F32,
         &read(&y)?,
         &expected,
@@ -121,7 +183,7 @@ fn conv1d(session: &Session) -> CaseResult {
     // likely to be wrong when conv is a `Window` + `Contract` composition
     // rather than a hand-written kernel.
     let d_bias = gradient_of(&graph, &y, &b)?;
-    let want = (BATCH * out_len) as f32;
+    let want = (batch * out_len) as f32;
     for (i, v) in d_bias.iter().enumerate() {
         if (v - want).abs() > 1e-3 * want {
             return Err(format!("conv1d bias gradient {i} is {v}, want {want}").into());
@@ -129,20 +191,20 @@ fn conv1d(session: &Session) -> CaseResult {
     }
 
     let d_w = gradient_of(&graph, &y, &w)?;
-    let numeric = finite_difference_gradient(&[OUT_CH * IN_CH * K], &w_data, &mut |probe| {
+    let numeric = finite_difference_gradient(&[out_ch * in_ch * k], &w_data, &mut |probe| {
         let g = graph_of(session);
         let x = upload(
             g.handle(),
-            &dims(&[BATCH as u64, IN_CH as u64, LEN as u64]),
+            &dims(&[batch as u64, in_ch as u64, len as u64]),
             &x_data,
         )?;
         let w = upload(
             g.handle(),
-            &dims(&[OUT_CH as u64, IN_CH as u64, K as u64]),
+            &dims(&[out_ch as u64, in_ch as u64, k as u64]),
             probe,
         )?;
-        let b = upload(g.handle(), &dims(&[OUT_CH as u64]), &b_data)?;
-        let y = fusor2::composite::conv::conv(&x, &w, Some(&b), &[1], &[K as u32 / 2], &[1])
+        let b = upload(g.handle(), &dims(&[out_ch as u64]), &b_data)?;
+        let y = fusor2::composite::conv::conv(&x, &w, Some(&b), &[1], &[k as u32 / 2], &[1])
             .map_err(|e| -> CaseError { e.to_string().into() })?;
         read_scalar(&loss_of(&y)?)
     })?;
@@ -150,48 +212,58 @@ fn conv1d(session: &Session) -> CaseResult {
     Ok(())
 }
 
-fn conv2d_strided(session: &Session) -> CaseResult {
-    const BATCH: u64 = 1;
-    const IN_CH: u64 = 2;
-    const H: u64 = 6;
-    const W: u64 = 6;
-    const OUT_CH: u64 = 3;
-    const K: u64 = 3;
-    let x_data = Domain::Wide.sample(421, (BATCH * IN_CH * H * W) as usize);
-    let w_data = Domain::Wide.sample(431, (OUT_CH * IN_CH * K * K) as usize);
+fn conv2d_strided(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let [batch, in_ch, h, w_ext, out_ch, k] = [
+        shape[0] as usize,
+        shape[1] as usize,
+        shape[2] as usize,
+        shape[3] as usize,
+        shape[4] as usize,
+        shape[5] as usize,
+    ];
+    let x_data = Domain::Wide.sample(seed, batch * in_ch * h * w_ext);
+    let w_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, out_ch * in_ch * k * k);
 
     let graph = graph_of(session);
-    let x = upload(graph.handle(), &dims(&[BATCH, IN_CH, H, W]), &x_data)?;
-    let w = upload(graph.handle(), &dims(&[OUT_CH, IN_CH, K, K]), &w_data)?;
+    let x = upload(
+        graph.handle(),
+        &dims(&[batch as u64, in_ch as u64, h as u64, w_ext as u64]),
+        &x_data,
+    )?;
+    let w = upload(
+        graph.handle(),
+        &dims(&[out_ch as u64, in_ch as u64, k as u64, k as u64]),
+        &w_data,
+    )?;
     let y = fusor2::composite::conv::conv(&x, &w, None, &[2, 2], &[0, 0], &[1, 1])
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let out_h = ((H - K) / 2 + 1) as usize;
-    let out_w = ((W - K) / 2 + 1) as usize;
-    let mut expected = vec![0.0f32; (BATCH * OUT_CH) as usize * out_h * out_w];
-    for oc in 0..OUT_CH as usize {
-        for oh in 0..out_h {
-            for ow in 0..out_w {
-                let mut acc = 0.0f32;
-                for ic in 0..IN_CH as usize {
-                    for kh in 0..K as usize {
-                        for kw in 0..K as usize {
-                            let ih = oh * 2 + kh;
-                            let iw = ow * 2 + kw;
-                            acc += x_data[(ic * H as usize + ih) * W as usize + iw]
-                                * w_data[((oc * IN_CH as usize + ic) * K as usize + kh)
-                                    * K as usize
-                                    + kw];
+    let out_h = (h - k) / 2 + 1;
+    let out_w = (w_ext - k) / 2 + 1;
+    let mut expected = vec![0.0f32; batch * out_ch * out_h * out_w];
+    for b in 0..batch {
+        for oc in 0..out_ch {
+            for oh in 0..out_h {
+                for ow in 0..out_w {
+                    let mut acc = 0.0f32;
+                    for ic in 0..in_ch {
+                        for kh in 0..k {
+                            for kw in 0..k {
+                                let ih = oh * 2 + kh;
+                                let iw = ow * 2 + kw;
+                                acc += x_data[((b * in_ch + ic) * h + ih) * w_ext + iw]
+                                    * w_data[((oc * in_ch + ic) * k + kh) * k + kw];
+                            }
                         }
                     }
+                    expected[((b * out_ch + oc) * out_h + oh) * out_w + ow] = acc;
                 }
-                expected[(oc * out_h + oh) * out_w + ow] = acc;
             }
         }
     }
     expect_values(
         session,
-        &[BATCH, OUT_CH, out_h as u64, out_w as u64],
+        &[batch as u64, out_ch as u64, out_h as u64, out_w as u64],
         Dtype::F32,
         &read(&y)?,
         &expected,
@@ -200,48 +272,64 @@ fn conv2d_strided(session: &Session) -> CaseResult {
 }
 
 /// PyTorch grouped layout: `weight` is `[out_ch, in_ch / groups, ...kernel]`.
-fn grouped_conv(session: &Session) -> CaseResult {
-    const BATCH: u64 = 1;
-    const IN_CH: u64 = 4;
-    const LEN: u64 = 8;
-    const OUT_CH: u64 = 4;
-    const K: u64 = 3;
-    const GROUPS: u32 = 2;
-    let per_group_in = IN_CH / GROUPS as u64;
+/// `shape` is `[batch, groups, per_group_in, per_group_out, len, k]` — the
+/// per-group channel counts are sampled and multiplied so groups always
+/// divides both.
+fn grouped_conv(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let [batch, groups, per_group_in, per_group_out, len, k] = [
+        shape[0] as usize,
+        shape[1] as usize,
+        shape[2] as usize,
+        shape[3] as usize,
+        shape[4] as usize,
+        shape[5] as usize,
+    ];
+    let in_ch = groups * per_group_in;
+    let out_ch = groups * per_group_out;
 
-    let x_data = Domain::Wide.sample(433, (BATCH * IN_CH * LEN) as usize);
-    let w_data = Domain::Wide.sample(439, (OUT_CH * per_group_in * K) as usize);
+    let x_data = Domain::Wide.sample(seed, batch * in_ch * len);
+    let w_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, out_ch * per_group_in * k);
 
     let graph = graph_of(session);
-    let x = upload(graph.handle(), &dims(&[BATCH, IN_CH, LEN]), &x_data)?;
-    let w = upload(graph.handle(), &dims(&[OUT_CH, per_group_in, K]), &w_data)?;
-    let y = fusor2::composite::conv::grouped_conv(&x, &w, None, &[1], &[1], &[1], GROUPS)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let x = upload(
+        graph.handle(),
+        &dims(&[batch as u64, in_ch as u64, len as u64]),
+        &x_data,
+    )?;
+    let w = upload(
+        graph.handle(),
+        &dims(&[out_ch as u64, per_group_in as u64, k as u64]),
+        &w_data,
+    )?;
+    let y =
+        fusor2::composite::conv::grouped_conv(&x, &w, None, &[1], &[1], &[1], groups as u32)
+            .map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let out_len = (LEN as usize + 2 - K as usize) + 1;
-    let per_group_out = (OUT_CH / GROUPS as u64) as usize;
-    let mut expected = vec![0.0f32; OUT_CH as usize * out_len];
-    for oc in 0..OUT_CH as usize {
-        let group = oc / per_group_out;
-        for o in 0..out_len {
-            let mut acc = 0.0f32;
-            for ic in 0..per_group_in as usize {
-                for t in 0..K as usize {
-                    let pos = (o + t) as isize - 1;
-                    if pos < 0 || pos >= LEN as isize {
-                        continue;
+    let out_len = len + 2 - k + 1;
+    let mut expected = vec![0.0f32; batch * out_ch * out_len];
+    for b in 0..batch {
+        for oc in 0..out_ch {
+            let group = oc / per_group_out;
+            for o in 0..out_len {
+                let mut acc = 0.0f32;
+                for ic in 0..per_group_in {
+                    for t in 0..k {
+                        let pos = (o + t) as isize - 1;
+                        if pos < 0 || pos >= len as isize {
+                            continue;
+                        }
+                        let channel = group * per_group_in + ic;
+                        acc += x_data[(b * in_ch + channel) * len + pos as usize]
+                            * w_data[(oc * per_group_in + ic) * k + t];
                     }
-                    let channel = group * per_group_in as usize + ic;
-                    acc += x_data[channel * LEN as usize + pos as usize]
-                        * w_data[(oc * per_group_in as usize + ic) * K as usize + t];
                 }
+                expected[(b * out_ch + oc) * out_len + o] = acc;
             }
-            expected[oc * out_len + o] = acc;
         }
     }
     expect_values(
         session,
-        &[BATCH, OUT_CH, out_len as u64],
+        &[batch as u64, out_ch as u64, out_len as u64],
         Dtype::F32,
         &read(&y)?,
         &expected,
@@ -256,43 +344,35 @@ enum Pool {
     Avg,
 }
 
-/// A non-overlapping pool over the last axis of `[1, 2, 8]`.
-fn pool_case(session: &Session, kind: Pool) -> CaseResult {
-    const CH: usize = 2;
-    const LEN: usize = 8;
-    const WINDOW: usize = 4;
-    let data = Domain::Wide.sample(443, CH * LEN);
+/// A non-overlapping pool over the last axis of `[1, ch, window * positions]`.
+fn pool_case(session: &Session, kind: Pool, shape: &[u64], seed: u32) -> CaseResult {
+    let [ch, window, positions] = [shape[0] as usize, shape[1] as usize, shape[2] as usize];
+    let len = window * positions;
+    let data = Domain::Wide.sample(seed, ch * len);
 
     let graph = graph_of(session);
-    let x = upload(graph.handle(), &dims(&[1, CH as u64, LEN as u64]), &data)?;
+    let x = upload(graph.handle(), &dims(&[1, ch as u64, len as u64]), &data)?;
     let y = match kind {
-        Pool::Max => {
-            fusor2::composite::pool::pool_max(&x, &[PoolSize::new(WINDOW as u32, WINDOW as u32)])
-        }
-        Pool::Min => {
-            fusor2::composite::pool::pool_min(&x, &[PoolSize::new(WINDOW as u32, WINDOW as u32)])
-        }
-        Pool::Avg => {
-            fusor2::composite::pool::pool_avg(&x, &[PoolSize::new(WINDOW as u32, WINDOW as u32)])
-        }
+        Pool::Max => fusor2::composite::pool::pool_max(&x, &[PoolSize::new(window, window)]),
+        Pool::Min => fusor2::composite::pool::pool_min(&x, &[PoolSize::new(window, window)]),
+        Pool::Avg => fusor2::composite::pool::pool_avg(&x, &[PoolSize::new(window, window)]),
     }
     .map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let positions = LEN / WINDOW;
-    let mut expected = Vec::with_capacity(CH * positions);
-    for c in 0..CH {
+    let mut expected = Vec::with_capacity(ch * positions);
+    for c in 0..ch {
         for p in 0..positions {
-            let window = &data[c * LEN + p * WINDOW..c * LEN + (p + 1) * WINDOW];
+            let win = &data[c * len + p * window..c * len + (p + 1) * window];
             expected.push(match kind {
-                Pool::Max => window.iter().copied().fold(f32::NEG_INFINITY, f32::max),
-                Pool::Min => window.iter().copied().fold(f32::INFINITY, f32::min),
-                Pool::Avg => window.iter().sum::<f32>() / WINDOW as f32,
+                Pool::Max => win.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+                Pool::Min => win.iter().copied().fold(f32::INFINITY, f32::min),
+                Pool::Avg => win.iter().sum::<f32>() / window as f32,
             });
         }
     }
     expect_values(
         session,
-        &[1, CH as u64, positions as u64],
+        &[1, ch as u64, positions as u64],
         Dtype::F32,
         &read(&y)?,
         &expected,
@@ -314,7 +394,7 @@ fn non_overlapping_adjoint_is_mask(session: &Session) -> CaseResult {
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(&[1, 1, LEN as u64]), &data)?;
-    let y = fusor2::composite::pool::pool_max(&x, &[PoolSize::new(WINDOW as u32, WINDOW as u32)])
+    let y = fusor2::composite::pool::pool_max(&x, &[PoolSize::new(WINDOW, WINDOW)])
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let grad = gradient_of(&graph, &y, &x)?;
@@ -362,47 +442,45 @@ fn non_overlapping_adjoint_is_mask(session: &Session) -> CaseResult {
     Ok(())
 }
 
-fn upsample_nearest2d(session: &Session) -> CaseResult {
-    const C: u64 = 2;
-    const H: u64 = 2;
-    const W: u64 = 3;
-    const SCALE: u64 = 2;
-    let data = Domain::Wide.sample(449, (C * H * W) as usize);
+fn upsample_nearest2d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    let [c, h, w, scale] = [shape[0], shape[1], shape[2], shape[3]];
+    let data = Domain::Wide.sample(seed, (c * h * w) as usize);
 
     let graph = graph_of(session);
-    let x = upload(graph.handle(), &dims(&[1, C, H, W]), &data)?;
+    let x = upload(graph.handle(), &dims(&[1, c, h, w]), &data)?;
     let y = fusor2::composite::upsample::upsample_nearest(
         &x,
         &[
             Dim::Const(1),
-            Dim::Const(C),
-            Dim::Const(H * SCALE),
-            Dim::Const(W * SCALE),
+            Dim::Const(c),
+            Dim::Const(h * scale),
+            Dim::Const(w * scale),
         ],
     )
     .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let mut expected = Vec::new();
-    for c in 0..C as usize {
-        for h in 0..(H * SCALE) as usize {
-            for w in 0..(W * SCALE) as usize {
+    for ci in 0..c as usize {
+        for hi in 0..(h * scale) as usize {
+            for wi in 0..(w * scale) as usize {
                 expected.push(
-                    data[(c * H as usize + h / SCALE as usize) * W as usize + w / SCALE as usize],
+                    data[(ci * h as usize + hi / scale as usize) * w as usize
+                        + wi / scale as usize],
                 );
             }
         }
     }
     expect_values(
         session,
-        &[1, C, H * SCALE, W * SCALE],
+        &[1, c, h * scale, w * scale],
         Dtype::F32,
         &read(&y)?,
         &expected,
     )?;
 
-    // Each source element feeds `SCALE^2` outputs, so its gradient is that.
+    // Each source element feeds `scale^2` outputs, so its gradient is that.
     let grad = gradient_of(&graph, &y, &x)?;
-    let want = (SCALE * SCALE) as f32;
+    let want = (scale * scale) as f32;
     if let Some((i, v)) = grad
         .iter()
         .enumerate()

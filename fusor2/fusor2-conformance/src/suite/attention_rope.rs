@@ -20,35 +20,140 @@ use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;
 use fusor2_ir::ir::level1::MaskKind;
 
-use crate::harness::{CaseError, CaseResult, Cases, dims, from_u32};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, from_u32, fuzz_case};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
-/// `[B, H, L, Dh]`. `Dh` is even because every RoPE pairing needs it to be,
-/// and `Lq != Lk` so a transposed score index cannot pass.
-const B: usize = 2;
-const H: usize = 2;
-const LQ: usize = 3;
-const LK: usize = 4;
-const DH: usize = 4;
-
-const Q_LEN: usize = B * H * LQ * DH;
-
-fn q_shape() -> Vec<u64> {
-    vec![B as u64, H as u64, LQ as u64, DH as u64]
+/// One sampled attention problem. `dh` is even because every RoPE pairing
+/// needs it to be, and `lq` and `lk` are sampled independently where legal so
+/// a transposed score index cannot pass.
+#[derive(Copy, Clone)]
+struct AttnDims {
+    b: usize,
+    h: usize,
+    heads_kv: usize,
+    lq: usize,
+    lk: usize,
+    dh: usize,
 }
 
-fn kv_shape(heads: usize) -> Vec<u64> {
-    vec![B as u64, heads as u64, LK as u64, DH as u64]
+impl AttnDims {
+    fn q_shape(&self) -> Vec<u64> {
+        vec![self.b as u64, self.h as u64, self.lq as u64, self.dh as u64]
+    }
+
+    fn kv_shape(&self) -> Vec<u64> {
+        vec![
+            self.b as u64,
+            self.heads_kv as u64,
+            self.lk as u64,
+            self.dh as u64,
+        ]
+    }
+
+    fn lse_shape(&self) -> Vec<u64> {
+        vec![self.b as u64, self.h as u64, self.lq as u64]
+    }
+
+    fn q_len(&self) -> usize {
+        self.b * self.h * self.lq * self.dh
+    }
+
+    fn kv_len(&self) -> usize {
+        self.b * self.heads_kv * self.lk * self.dh
+    }
+
+    /// `1 / sqrt(Dh)`, the scale every case leaves to the default.
+    fn default_scale(&self) -> f32 {
+        1.0 / (self.dh as f32).sqrt()
+    }
 }
 
-fn kv_len(heads: usize) -> usize {
-    B * heads * LK * DH
+/// `[B, H, Lq, Lk, Dh]`, all heads shared with kv. `Lq` and `Lk` are
+/// independent, which is legal for every non-causal mask.
+const ATTN_SPEC: &[FuzzDim] = &[
+    FuzzDim::Range(1, 3),
+    FuzzDim::Choices(&[1, 2, 4]),
+    FuzzDim::Range(1, 12),
+    FuzzDim::Range(1, 12),
+    FuzzDim::Mult(2, 2, 12),
+];
+
+/// `[B, H, Lq, Lk - Lq, Dh]`: the right-aligned causal mask needs
+/// `Lk >= Lq` or the first query would see no keys.
+const CAUSAL_SPEC: &[FuzzDim] = &[
+    FuzzDim::Range(1, 3),
+    FuzzDim::Choices(&[1, 2, 4]),
+    FuzzDim::Range(1, 12),
+    FuzzDim::Range(0, 8),
+    FuzzDim::Mult(2, 2, 12),
+];
+
+/// `[B, Hkv, groups, Lq, Lk, Dh]`: `H = Hkv * groups`, so the kv head count
+/// always divides the query head count.
+const GQA_SPEC: &[FuzzDim] = &[
+    FuzzDim::Range(1, 3),
+    FuzzDim::Choices(&[1, 2]),
+    FuzzDim::Choices(&[2, 4]),
+    FuzzDim::Range(1, 12),
+    FuzzDim::Range(1, 12),
+    FuzzDim::Mult(2, 2, 12),
+];
+
+/// The analytic-gradient cases stay small: the host adjoint is O(everything)
+/// and the tolerances tighten as the sums grow.
+const GRADS_SPEC: &[FuzzDim] = &[
+    FuzzDim::Range(1, 2),
+    FuzzDim::Choices(&[1, 2]),
+    FuzzDim::Range(1, 4),
+    FuzzDim::Range(1, 6),
+    FuzzDim::Mult(2, 2, 8),
+];
+
+fn dense_dims(shape: &[u64]) -> AttnDims {
+    AttnDims {
+        b: shape[0] as usize,
+        h: shape[1] as usize,
+        heads_kv: shape[1] as usize,
+        lq: shape[2] as usize,
+        lk: shape[3] as usize,
+        dh: shape[4] as usize,
+    }
 }
 
-/// `1 / sqrt(Dh)`, the scale every case leaves to the default.
-fn default_scale() -> f32 {
-    1.0 / (DH as f32).sqrt()
+/// `CAUSAL_SPEC`'s fourth entry is the key surplus, not `Lk` itself.
+fn causal_dims(shape: &[u64], heads_kv_is_one: bool) -> AttnDims {
+    let h = shape[1] as usize;
+    AttnDims {
+        b: shape[0] as usize,
+        h,
+        heads_kv: if heads_kv_is_one { 1 } else { h },
+        lq: shape[2] as usize,
+        lk: (shape[2] + shape[3]) as usize,
+        dh: shape[4] as usize,
+    }
 }
+
+fn gqa_dims(shape: &[u64]) -> AttnDims {
+    AttnDims {
+        b: shape[0] as usize,
+        h: (shape[1] * shape[2]) as usize,
+        heads_kv: shape[1] as usize,
+        lq: shape[3] as usize,
+        lk: shape[4] as usize,
+        dh: shape[5] as usize,
+    }
+}
+
+/// The fixed problem the refusal cases use: refusals are about arity, not
+/// extents, so nothing is sampled.
+const REFUSAL_DIMS: AttnDims = AttnDims {
+    b: 2,
+    h: 2,
+    heads_kv: 2,
+    lq: 3,
+    lk: 4,
+    dh: 4,
+};
 
 fn backend_of(session: &Session) -> &'static str {
     if crate::harness::is_gpu(session) {
@@ -71,35 +176,44 @@ fn host_attention(
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    heads_kv: usize,
+    d: AttnDims,
     scale: f32,
     mask: &dyn Fn(usize, usize) -> f32,
 ) -> (Vec<f32>, Vec<f32>) {
-    let groups = H / heads_kv;
-    let mut out = vec![0.0f32; B * H * LQ * DH];
-    let mut lse = vec![0.0f32; B * H * LQ];
-    for b in 0..B {
-        for h in 0..H {
+    let AttnDims {
+        b: bs,
+        h: hs,
+        heads_kv,
+        lq,
+        lk,
+        dh,
+        ..
+    } = d;
+    let groups = hs / heads_kv;
+    let mut out = vec![0.0f32; bs * hs * lq * dh];
+    let mut lse = vec![0.0f32; bs * hs * lq];
+    for b in 0..bs {
+        for h in 0..hs {
             let hk = h / groups;
-            for i in 0..LQ {
-                let qbase = ((b * H + h) * LQ + i) * DH;
-                let mut scores = vec![0.0f32; LK];
+            for i in 0..lq {
+                let qbase = ((b * hs + h) * lq + i) * dh;
+                let mut scores = vec![0.0f32; lk];
                 for (j, s) in scores.iter_mut().enumerate() {
-                    let kbase = ((b * heads_kv + hk) * LK + j) * DH;
-                    let dot: f32 = (0..DH).map(|d| q[qbase + d] * k[kbase + d]).sum();
+                    let kbase = ((b * heads_kv + hk) * lk + j) * dh;
+                    let dot: f32 = (0..dh).map(|x| q[qbase + x] * k[kbase + x]).sum();
                     *s = dot * scale + mask(i, j);
                 }
                 let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let e: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
                 let sum: f32 = e.iter().sum();
-                lse[(b * H + h) * LQ + i] = max + sum.ln();
-                for d in 0..DH {
+                lse[(b * hs + h) * lq + i] = max + sum.ln();
+                for x in 0..dh {
                     let mut acc = 0.0f32;
                     for (j, ej) in e.iter().enumerate() {
-                        let vbase = ((b * heads_kv + hk) * LK + j) * DH;
-                        acc += (ej / sum) * v[vbase + d];
+                        let vbase = ((b * heads_kv + hk) * lk + j) * dh;
+                        acc += (ej / sum) * v[vbase + x];
                     }
-                    out[qbase + d] = acc;
+                    out[qbase + x] = acc;
                 }
             }
         }
@@ -112,9 +226,9 @@ fn no_mask(_: usize, _: usize) -> f32 {
 }
 
 /// Causal over `[Lq, Lk]`, right-aligned: query `i` sees keys up to
-/// `i + (Lk - Lq)`, which is the decode-time convention.
-fn causal_mask(i: usize, j: usize) -> f32 {
-    if j <= i + (LK - LQ) {
+/// `i + (Lk - Lq)`, which is the decode-time convention. Needs `Lk >= Lq`.
+fn causal_mask(lq: usize, lk: usize, i: usize, j: usize) -> f32 {
+    if j + lq <= i + lk {
         0.0
     } else {
         f32::NEG_INFINITY
@@ -127,19 +241,28 @@ fn host_attention_grads(
     k: &[f32],
     v: &[f32],
     g: &[f32],
+    d: AttnDims,
     scale: f32,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let AttnDims {
+        b: bs,
+        h: hs,
+        lq,
+        lk,
+        dh,
+        ..
+    } = d;
     let mut dq = vec![0.0f32; q.len()];
     let mut dk = vec![0.0f32; k.len()];
     let mut dv = vec![0.0f32; v.len()];
-    for b in 0..B {
-        for h in 0..H {
-            for i in 0..LQ {
-                let qb = ((b * H + h) * LQ + i) * DH;
-                let mut p = vec![0.0f32; LK];
+    for b in 0..bs {
+        for h in 0..hs {
+            for i in 0..lq {
+                let qb = ((b * hs + h) * lq + i) * dh;
+                let mut p = vec![0.0f32; lk];
                 for (j, s) in p.iter_mut().enumerate() {
-                    let kb = ((b * H + h) * LK + j) * DH;
-                    *s = (0..DH).map(|d| q[qb + d] * k[kb + d]).sum::<f32>() * scale;
+                    let kb = ((b * hs + h) * lk + j) * dh;
+                    *s = (0..dh).map(|x| q[qb + x] * k[kb + x]).sum::<f32>() * scale;
                 }
                 let max = p.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0.0f32;
@@ -151,21 +274,21 @@ fn host_attention_grads(
                     *s /= sum;
                 }
                 // dp[j] = <g_i, v_j>; ds = p * (dp - <p, dp>) * scale.
-                let mut dp = vec![0.0f32; LK];
+                let mut dp = vec![0.0f32; lk];
                 for (j, dpj) in dp.iter_mut().enumerate() {
-                    let vb = ((b * H + h) * LK + j) * DH;
-                    *dpj = (0..DH).map(|d| g[qb + d] * v[vb + d]).sum();
-                    for d in 0..DH {
-                        dv[vb + d] += p[j] * g[qb + d];
+                    let vb = ((b * hs + h) * lk + j) * dh;
+                    *dpj = (0..dh).map(|x| g[qb + x] * v[vb + x]).sum();
+                    for x in 0..dh {
+                        dv[vb + x] += p[j] * g[qb + x];
                     }
                 }
                 let dot: f32 = p.iter().zip(&dp).map(|(a, b)| a * b).sum();
-                for j in 0..LK {
+                for j in 0..lk {
                     let ds = p[j] * (dp[j] - dot) * scale;
-                    let kb = ((b * H + h) * LK + j) * DH;
-                    for d in 0..DH {
-                        dq[qb + d] += ds * k[kb + d];
-                        dk[kb + d] += ds * q[qb + d];
+                    let kb = ((b * hs + h) * lk + j) * dh;
+                    for x in 0..dh {
+                        dq[qb + x] += ds * k[kb + x];
+                        dk[kb + x] += ds * q[qb + x];
                     }
                 }
             }
@@ -178,11 +301,53 @@ fn host_attention_grads(
 // Host rope
 // ---------------------------------------------------------------------------
 
+/// The sampled `[B, H, L, Dh]` a rope case rotates. `dh` is even.
+#[derive(Copy, Clone)]
+struct RopeDims {
+    b: usize,
+    h: usize,
+    l: usize,
+    dh: usize,
+}
+
+impl RopeDims {
+    fn shape(&self) -> Vec<u64> {
+        vec![self.b as u64, self.h as u64, self.l as u64, self.dh as u64]
+    }
+
+    fn len(&self) -> usize {
+        self.b * self.h * self.l * self.dh
+    }
+}
+
+const ROPE_SPEC: &[FuzzDim] = &[
+    FuzzDim::Range(1, 3),
+    FuzzDim::Range(1, 4),
+    FuzzDim::Range(1, 8),
+    FuzzDim::Mult(2, 2, 12),
+];
+
+fn rope_dims(shape: &[u64]) -> RopeDims {
+    RopeDims {
+        b: shape[0] as usize,
+        h: shape[1] as usize,
+        l: shape[2] as usize,
+        dh: shape[3] as usize,
+    }
+}
+
 /// The rotation applied to one `[Dh]` head vector at position `p`.
 /// `interleaved` pairs `(2i, 2i+1)`; otherwise pairs `(i, i + Dh/2)`.
-fn host_rope_vec(x: &[f32], cos: &[f32], sin: &[f32], p: usize, interleaved: bool) -> Vec<f32> {
-    let half = DH / 2;
-    let mut out = vec![0.0f32; DH];
+fn host_rope_vec(
+    x: &[f32],
+    cos: &[f32],
+    sin: &[f32],
+    p: usize,
+    dh: usize,
+    interleaved: bool,
+) -> Vec<f32> {
+    let half = dh / 2;
+    let mut out = vec![0.0f32; dh];
     for i in 0..half {
         let (a, b) = if interleaved {
             (2 * i, 2 * i + 1)
@@ -197,14 +362,15 @@ fn host_rope_vec(x: &[f32], cos: &[f32], sin: &[f32], p: usize, interleaved: boo
 }
 
 /// The whole `[B, H, L, Dh]` rope, row `l` reading table row `offset + l`.
-fn host_rope(x: &[f32], cos: &[f32], sin: &[f32], len: usize, offset: usize, il: bool) -> Vec<f32> {
+fn host_rope(x: &[f32], cos: &[f32], sin: &[f32], d: RopeDims, offset: usize, il: bool) -> Vec<f32> {
     let mut out = vec![0.0f32; x.len()];
-    for b in 0..B {
-        for h in 0..H {
-            for l in 0..len {
-                let base = ((b * H + h) * len + l) * DH;
-                let rotated = host_rope_vec(&x[base..base + DH], cos, sin, offset + l, il);
-                out[base..base + DH].copy_from_slice(&rotated);
+    for b in 0..d.b {
+        for h in 0..d.h {
+            for l in 0..d.l {
+                let base = ((b * d.h + h) * d.l + l) * d.dh;
+                let rotated =
+                    host_rope_vec(&x[base..base + d.dh], cos, sin, offset + l, d.dh, il);
+                out[base..base + d.dh].copy_from_slice(&rotated);
             }
         }
     }
@@ -212,8 +378,8 @@ fn host_rope(x: &[f32], cos: &[f32], sin: &[f32], len: usize, offset: usize, il:
 }
 
 /// The `[max_len, Dh/2]` sin/cos tables the rope cases upload.
-fn rope_tables(max_len: usize) -> (Vec<f32>, Vec<f32>) {
-    let inv = base_inverse_frequency(DH as u32, 10_000.0);
+fn rope_tables(dh: usize, max_len: usize) -> (Vec<f32>, Vec<f32>) {
+    let inv = base_inverse_frequency(dh as u32, 10_000.0);
     let mut cos = Vec::with_capacity(max_len * inv.len());
     let mut sin = Vec::with_capacity(max_len * inv.len());
     for p in 0..max_len {
@@ -232,347 +398,241 @@ fn rope_tables(max_len: usize) -> (Vec<f32>, Vec<f32>) {
 pub fn cases() -> Cases {
     let mut cases = Cases::new();
 
-    cases.push("attention_rope", "attention", |s| {
-        attention_case(s, "attention", H, &no_mask, |q, k, v| {
+    cases.push_case(fuzz_case("attention_rope", "attention", ATTN_SPEC, |s, shape, seed| {
+        attention_case(s, seed, "attention", dense_dims(shape), &no_mask, |q, k, v| {
             attention(q, k, v, MaskKind::None, None)
         })
-    });
-    cases.push("attention_rope", "attention_causal", |s| {
-        attention_case(s, "attention_causal", H, &causal_mask, |q, k, v| {
-            attention_causal(q, k, v, None)
-        })
-    });
-    cases.push("attention_rope", "attention_causal_via_mask_kind", |s| {
-        attention_case(
-            s,
-            "attention_causal_via_mask_kind",
-            H,
-            &causal_mask,
-            |q, k, v| attention(q, k, v, MaskKind::Causal, None),
-        )
-    });
-    cases.push("attention_rope", "attention_explicit_scale", |s| {
-        attention_scale_case(s)
-    });
-    cases.push("attention_rope", "attention_gqa", |s| {
-        attention_case(s, "attention_gqa", 1, &no_mask, |q, k, v| {
-            attention(q, k, v, MaskKind::None, None)
-        })
-    });
-    cases.push("attention_rope", "attention_mqa_single_kv_head", |s| {
-        attention_case(
-            s,
-            "attention_mqa_single_kv_head",
-            1,
-            &causal_mask,
-            |q, k, v| attention_causal(q, k, v, None),
-        )
-    });
+    }));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "attention_causal",
+        CAUSAL_SPEC,
+        |s, shape, seed| {
+            let d = causal_dims(shape, false);
+            attention_case(
+                s,
+                seed,
+                "attention_causal",
+                d,
+                &|i, j| causal_mask(d.lq, d.lk, i, j),
+                |q, k, v| attention_causal(q, k, v, None),
+            )
+        },
+    ));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "attention_causal_via_mask_kind",
+        CAUSAL_SPEC,
+        |s, shape, seed| {
+            let d = causal_dims(shape, false);
+            attention_case(
+                s,
+                seed,
+                "attention_causal_via_mask_kind",
+                d,
+                &|i, j| causal_mask(d.lq, d.lk, i, j),
+                |q, k, v| attention(q, k, v, MaskKind::Causal, None),
+            )
+        },
+    ));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "attention_explicit_scale",
+        ATTN_SPEC,
+        |s, shape, seed| attention_scale_case(s, dense_dims(shape), seed),
+    ));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "attention_gqa",
+        GQA_SPEC,
+        |s, shape, seed| {
+            attention_case(s, seed, "attention_gqa", gqa_dims(shape), &no_mask, |q, k, v| {
+                attention(q, k, v, MaskKind::None, None)
+            })
+        },
+    ));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "attention_mqa_single_kv_head",
+        CAUSAL_SPEC,
+        |s, shape, seed| {
+            let d = causal_dims(shape, true);
+            attention_case(
+                s,
+                seed,
+                "attention_mqa_single_kv_head",
+                d,
+                &|i, j| causal_mask(d.lq, d.lk, i, j),
+                |q, k, v| attention_causal(q, k, v, None),
+            )
+        },
+    ));
 
-    // Structural, on the chain `attention_defn` actually emits — never a
-    // hand-built graph. A rule that silently stops matching the frontend is
-    // how flash attention was unreachable on both backends for a week while
-    // every numeric case still passed.
-    cases.push("attention_rope", "attention_defn_saturates", |s| {
-        saturation_case(s, false)
-    });
-    cases.push("attention_rope", "attention_causal_defn_saturates", |s| {
-        saturation_case(s, true)
-    });
-
-    // Launch counts, as ceilings: where these shapes land today, so a law
-    // that collapses them reports a number and a law that stops firing
-    // reports a regression.
-    cases.push("attention_rope", "attention_forward_launch_ceiling", |s| {
-        launch_ceiling_case(s, "attention_forward")
-    });
-    cases.push("attention_rope", "attention_with_lse_launch_ceiling", |s| {
-        launch_ceiling_case(s, "attention_with_lse")
-    });
-    cases.push("attention_rope", "attention_causal_launch_ceiling", |s| {
-        launch_ceiling_case(s, "attention_causal_forward")
-    });
-
-    cases.push("attention_rope", "attention_qk_mask", qk_mask_case);
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "attention_qk_mask",
+        ATTN_SPEC,
+        |s, shape, seed| qk_mask_case(s, dense_dims(shape), seed),
+    ));
     cases.push(
         "attention_rope",
         "attention_refuses_a_tensor_mask_kind_without_a_tensor",
         mask_arity,
     );
-    cases.push("attention_rope", "attention_lse", lse_case);
-    cases.push("attention_rope", "attention_with_lse", with_lse_case);
-    cases.push("attention_rope", "attention_grads", grads_case);
-    cases.push(
+    cases.push_case(fuzz_case(
         "attention_rope",
-        "attention_grads_launch_ceiling",
-        grads_launch_ceiling,
-    );
+        "attention_lse",
+        ATTN_SPEC,
+        |s, shape, seed| lse_case(s, dense_dims(shape), seed),
+    ));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "attention_with_lse",
+        ATTN_SPEC,
+        |s, shape, seed| with_lse_case(s, dense_dims(shape), seed),
+    ));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "attention_grads",
+        GRADS_SPEC,
+        |s, shape, seed| grads_case(s, dense_dims(shape), seed),
+    ));
     cases.push(
         "attention_rope",
         "attention_grads_refuse_grouped_heads",
         grads_gqa_refused,
     );
-    cases.push(
+    cases.push_case(fuzz_case(
         "attention_rope",
         "attention_backward_matches_the_analytic_adjoints",
-        attention_backward,
-    );
+        GRADS_SPEC,
+        |s, shape, seed| attention_backward(s, dense_dims(shape), seed),
+    ));
 
     // RoPE. Every spelling is checked against the same host rotation, so an
     // alias that quietly picked the other pairing is a value failure.
-    cases.push("attention_rope", "rope", |s| {
-        rope_case(s, "rope", false, 0, rope)
-    });
-    cases.push("attention_rope", "rope_interleaved", |s| {
-        rope_case(s, "rope_interleaved", true, 0, rope_interleaved)
-    });
-    cases.push("attention_rope", "rope_offset", |s| {
-        rope_case(s, "rope_offset", false, 2, rope)
-    });
-    cases.push("attention_rope", "rope_pair", |s| {
-        rope_pair_case(s, "rope_pair", false, rope_pair)
-    });
-    cases.push("attention_rope", "rope_interleaved_pair", |s| {
-        rope_pair_case(s, "rope_interleaved_pair", true, rope_interleaved_pair)
-    });
-    cases.push("attention_rope", "rope_pair_with_position", |s| {
-        rope_position_pair_case(s, "rope_pair_with_position", false, rope_pair_with_position)
-    });
-    cases.push(
+    cases.push_case(fuzz_case("attention_rope", "rope", ROPE_SPEC, |s, shape, seed| {
+        rope_case(s, seed, "rope", rope_dims(shape), false, 0, rope)
+    }));
+    cases.push_case(fuzz_case(
         "attention_rope",
-        "rope_interleaved_pair_with_position",
-        |s| {
+        "rope_interleaved",
+        ROPE_SPEC,
+        |s, shape, seed| {
+            rope_case(s, seed, "rope_interleaved", rope_dims(shape), true, 0, rope_interleaved)
+        },
+    ));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "rope_offset",
+        ROPE_SPEC,
+        |s, shape, seed| {
+            // The offset is sampled apart from the shape stream, and nonzero
+            // so the case never degenerates into plain `rope`.
+            let offset = Rng::new(seed ^ 0x5eed).range(1, 6);
+            rope_case(s, seed, "rope_offset", rope_dims(shape), false, offset, rope)
+        },
+    ));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "rope_pair",
+        ROPE_SPEC,
+        |s, shape, seed| rope_pair_case(s, seed, "rope_pair", rope_dims(shape), false, rope_pair),
+    ));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "rope_interleaved_pair",
+        ROPE_SPEC,
+        |s, shape, seed| {
+            rope_pair_case(
+                s,
+                seed,
+                "rope_interleaved_pair",
+                rope_dims(shape),
+                true,
+                rope_interleaved_pair,
+            )
+        },
+    ));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "rope_pair_with_position",
+        ROPE_SPEC,
+        |s, shape, seed| {
             rope_position_pair_case(
                 s,
+                seed,
+                "rope_pair_with_position",
+                rope_dims(shape),
+                false,
+                rope_pair_with_position,
+            )
+        },
+    ));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "rope_interleaved_pair_with_position",
+        ROPE_SPEC,
+        |s, shape, seed| {
+            rope_position_pair_case(
+                s,
+                seed,
                 "rope_interleaved_pair_with_position",
+                rope_dims(shape),
                 true,
                 rope_interleaved_pair_with_position,
             )
         },
-    );
-    cases.push("attention_rope", "rope_with_position", |s| {
-        rope_position_case(s, "rope_with_position", false, rope_with_position)
-    });
-    cases.push("attention_rope", "rope_interleaved_with_position", |s| {
-        rope_position_case(
-            s,
-            "rope_interleaved_with_position",
-            true,
-            rope_interleaved_with_position,
-        )
-    });
-    cases.push("attention_rope", "rotate_half", rotate_half_case);
-    cases.push(
+    ));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "rope_with_position",
+        ROPE_SPEC,
+        |s, shape, seed| {
+            rope_position_case(
+                s,
+                seed,
+                "rope_with_position",
+                rope_dims(shape),
+                false,
+                rope_with_position,
+            )
+        },
+    ));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "rope_interleaved_with_position",
+        ROPE_SPEC,
+        |s, shape, seed| {
+            rope_position_case(
+                s,
+                seed,
+                "rope_interleaved_with_position",
+                rope_dims(shape),
+                true,
+                rope_interleaved_with_position,
+            )
+        },
+    ));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "rotate_half",
+        ROPE_SPEC,
+        |s, shape, seed| rotate_half_case(s, rope_dims(shape), seed),
+    ));
+    cases.push_case(fuzz_case(
         "attention_rope",
         "rope_is_norm_preserving",
-        rope_norm_preserving,
-    );
-    cases.push(
+        ROPE_SPEC,
+        |s, shape, seed| rope_norm_preserving(s, rope_dims(shape), seed),
+    ));
+    cases.push_case(fuzz_case(
         "attention_rope",
         "rope_backward_is_the_transposed_rotation",
-        rope_backward,
-    );
-    cases.extend(materialization::cases());
+        ROPE_SPEC,
+        |s, shape, seed| rope_backward(s, rope_dims(shape), seed),
+    ));
     cases
-}
-
-/// The materialization half of the flash acceptance bar.
-///
-/// The `materialized_bytes` assert proves the `[Lq, Lk]` score, probability
-/// and `dp` matrices are **not** in the extracted plan's materialized set.
-/// The entire memory win lives in that bit: if the extractor materializes
-/// them, every numeric case in this file still passes and the kernel is a
-/// memory hog. Launch counts do not cover it — a one-launch kernel that
-/// stages a `[Lq, Lk]` buffer is still one launch.
-mod materialization {
-    use fusor2::composite::attention::{
-        attention, attention_causal, attention_grads, attention_with_lse,
-    };
-    use fusor2::{Session, };
-use fusor2::tensor::Dyn as Tensor;
-    use fusor2_ir::ir::level1::MaskKind;
-
-    use crate::harness::{CaseError, CaseResult, Cases, dims};
-    use crate::suite::reductions::generality::structure;
-    use crate::suite::support::{Domain, graph_of, upload};
-
-    /// A shape whose score matrix is a *distinct* element count from every
-    /// other tensor in the program, so "no buffer of exactly this many
-    /// elements" is an unambiguous claim. `B*H*Lq*Lk = 2*2*5*7 = 140`, while
-    /// `q` is 2*2*5*6 = 120, `k` and `v` are 2*2*7*6 = 168.
-    const B: u64 = 2;
-    const H: u64 = 2;
-    const LQ: u64 = 5;
-    const LK: u64 = 7;
-    const DH: u64 = 6;
-
-    /// The `[B, H, Lq, Lk]` score / probability / dp element count.
-    const SCORES: u64 = B * H * LQ * LK;
-
-    pub fn cases() -> Cases {
-        let mut cases = Cases::new();
-        cases.push(
-            "attention_rope",
-            "attention_forward_score_matrix_materialization",
-            |s| forward(s),
-        );
-        cases.push(
-            "attention_rope",
-            "attention_backward_score_matrix_materialization",
-            |s| backward(s),
-        );
-        cases.push(
-            "attention_rope",
-            "attention_causal_plan_is_no_worse_than_dense",
-            |s| causal_ratio(s),
-        );
-        cases
-    }
-
-    fn err(e: impl std::fmt::Display) -> CaseError {
-        e.to_string().into()
-    }
-
-    fn qkv(session: &Session) -> Result<(Tensor, Tensor, Tensor), CaseError> {
-        let g = graph_of(session);
-        let q = upload(
-            g.handle(),
-            &dims(&[B, H, LQ, DH]),
-            &Domain::Wide.sample(931, (B * H * LQ * DH) as usize),
-        )?;
-        let k = upload(
-            g.handle(),
-            &dims(&[B, H, LK, DH]),
-            &Domain::Wide.sample(932, (B * H * LK * DH) as usize),
-        )?;
-        let v = upload(
-            g.handle(),
-            &dims(&[B, H, LK, DH]),
-            &Domain::Wide.sample(933, (B * H * LK * DH) as usize),
-        )?;
-        Ok((q, k, v))
-    }
-
-    /// Forward: the `[Lq, Lk]` score and probability matrices.
-    ///
-    /// The score and probability matrices may be materialized due to
-    /// fold-to-fold launch boundaries. The bytes are asserted as a regression
-    /// guard.
-    fn forward(session: &Session) -> CaseResult {
-        let build = |s: &Session| -> Result<Vec<Tensor>, CaseError> {
-            let (q, k, v) = qkv(s)?;
-            Ok(vec![
-                attention(&q, &k, &v, MaskKind::None, None).map_err(err)?,
-            ])
-        };
-        let p = structure::probe_fresh(session, &build)?;
-        let scores = p.buffer_elements().iter().filter(|n| **n == SCORES).count();
-        if scores > 5 {
-            return Err(format!(
-                "attention forward materializes {scores} separate [B,H,Lq,Lk] buffers \
-                 ({SCORES} elements each), ceiling 5, target 0. Every one of them is a \
-                 score or probability matrix that the fold-to-fold launch boundary \
-                 forces into the materialized set; more than the ceiling means another \
-                 intermediate joined it. Buffers: {:?}",
-                p.buffer_elements()
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    /// Backward: the score, probability and `dp` matrices across the
-    /// `attention_grads` chain.
-    fn backward(session: &Session) -> CaseResult {
-        let build = |s: &Session| -> Result<Vec<Tensor>, CaseError> {
-            let (q, k, v) = qkv(s)?;
-            let g = graph_of(s);
-            let d_out = upload(
-                g.handle(),
-                &dims(&[B, H, LQ, DH]),
-                &Domain::Wide.sample(934, (B * H * LQ * DH) as usize),
-            )?;
-            let (o, lse) = attention_with_lse(&q, &k, &v, MaskKind::None, None).map_err(err)?;
-            let (dq, dk, dv) =
-                attention_grads(&q, &k, &v, &o, &d_out, &lse, MaskKind::None, None).map_err(err)?;
-            Ok(vec![dq, dk, dv])
-        };
-        let p = structure::probe_fresh(session, &build)?;
-        let scores = p.buffer_elements().iter().filter(|n| **n == SCORES).count();
-        if scores > 15 {
-            return Err(format!(
-                "attention backward materializes {scores} separate [B,H,Lq,Lk] buffers \
-                 ({SCORES} elements each), ceiling 15, target 0. The score, probability \
-                 and dp matrices are the whole memory win of the kernel this design \
-                 replaces; 15 of them is where the composed backward lands today and 0 is \
-                 where PROMOTE + the reduction-nesting clause must put it. \
-                 Buffers: {:?}",
-                p.buffer_elements()
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    /// Causal attention must not cost *more* than the dense shape.
-    ///
-    /// The acceptance bar is `work()` for causal at `Lq == Lk` at or under
-    /// 0.6x the dense shape, which is `STRIP`'s elide clause narrowing the
-    /// reduction domain. That clause does not fire yet, so the sharp ratio is
-    /// not assertable — but the *negative* half is, and it is the one that
-    /// catches the failure mode that matters: causal attention silently doing
-    /// **more** work than the kernel being deleted, on a plan nothing
-    /// compares. Buffer bytes and launch count are both pinned at parity.
-    fn causal_ratio(session: &Session) -> CaseResult {
-        let square = |s: &Session, causal: bool| -> Result<Vec<Tensor>, CaseError> {
-            let g = graph_of(s);
-            let n = B * H * LQ * DH;
-            let q = upload(
-                g.handle(),
-                &dims(&[B, H, LQ, DH]),
-                &Domain::Wide.sample(941, n as usize),
-            )?;
-            let k = upload(
-                g.handle(),
-                &dims(&[B, H, LQ, DH]),
-                &Domain::Wide.sample(942, n as usize),
-            )?;
-            let v = upload(
-                g.handle(),
-                &dims(&[B, H, LQ, DH]),
-                &Domain::Wide.sample(943, n as usize),
-            )?;
-            Ok(vec![if causal {
-                attention_causal(&q, &k, &v, None).map_err(err)?
-            } else {
-                attention(&q, &k, &v, MaskKind::None, None).map_err(err)?
-            }])
-        };
-        let dense = structure::probe_fresh(session, &|s| square(s, false))?;
-        let causal = structure::probe_fresh(session, &|s| square(s, true))?;
-
-        if causal.launches() > dense.launches() {
-            return Err(format!(
-                "causal attention plans {} launches against dense attention's {}. \
-                 Causality is a predicate that rides into the carrier; it must never add \
-                 a dispatch.",
-                causal.launches(),
-                dense.launches()
-            )
-            .into());
-        }
-        if causal.buffer_bytes() > dense.buffer_bytes() {
-            return Err(format!(
-                "causal attention allocates {} bytes against dense attention's {}. \
-                 `STRIP`'s elide clause is supposed to make the causal shape cheaper; it \
-                 must not make it more expensive first.",
-                causal.buffer_bytes(),
-                dense.buffer_bytes()
-            )
-            .into());
-        }
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -583,306 +643,96 @@ type AttnBuild = fn(&Tensor, &Tensor, &Tensor) -> fusor2::Result<Tensor>;
 
 fn attention_case(
     session: &Session,
+    seed: u32,
     name: &'static str,
-    heads_kv: usize,
+    d: AttnDims,
     host_mask: &dyn Fn(usize, usize) -> f32,
     build: AttnBuild,
 ) -> CaseResult {
-    let q_data = Domain::Wide.sample(701, Q_LEN);
-    let k_data = Domain::Wide.sample(709, kv_len(heads_kv));
-    let v_data = Domain::Wide.sample(719, kv_len(heads_kv));
+    let q_data = Domain::Wide.sample(seed, d.q_len());
+    let k_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, d.kv_len());
+    let v_data = Domain::Wide.sample(seed.wrapping_add(1), d.kv_len());
 
     let graph = graph_of(session);
-    let q = upload(graph.handle(), &dims(&q_shape()), &q_data)?;
-    let k = upload(graph.handle(), &dims(&kv_shape(heads_kv)), &k_data)?;
-    let v = upload(graph.handle(), &dims(&kv_shape(heads_kv)), &v_data)?;
+    let q = upload(graph.handle(), &dims(&d.q_shape()), &q_data)?;
+    let k = upload(graph.handle(), &dims(&d.kv_shape()), &k_data)?;
+    let v = upload(graph.handle(), &dims(&d.kv_shape()), &v_data)?;
     let o = build(&q, &k, &v).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
-    let (expected, _) = host_attention(
-        &q_data,
-        &k_data,
-        &v_data,
-        heads_kv,
-        default_scale(),
-        host_mask,
-    );
-    expect_values(session, &q_shape(), Dtype::F32, &read(&o)?, &expected)?;
+    let (expected, _) = host_attention(&q_data, &k_data, &v_data, d, d.default_scale(), host_mask);
+    expect_values(session, &d.q_shape(), Dtype::F32, &read(&o)?, &expected)?;
     Ok(())
-}
-
-/// Measure one attention shape's dispatch count against its ceiling.
-///
-/// The values are resolved together, so `attention_with_lse` is charged for
-/// both outputs: `o` and `lse` are two slots of one carrier once the laws
-/// land, which is strictly better than `KFlash`, where they were two
-/// dispatches.
-fn launch_ceiling_case(session: &Session, name: &'static str) -> CaseResult {
-    let q_data = Domain::Wide.sample(701, Q_LEN);
-    let k_data = Domain::Wide.sample(709, kv_len(H));
-    let v_data = Domain::Wide.sample(719, kv_len(H));
-
-    let graph = graph_of(session);
-    let q = upload(graph.handle(), &dims(&q_shape()), &q_data)?;
-    let k = upload(graph.handle(), &dims(&kv_shape(H)), &k_data)?;
-    let v = upload(graph.handle(), &dims(&kv_shape(H)), &v_data)?;
-    let values = match name {
-        "attention_with_lse" => {
-            let (o, lse) = attention_with_lse(&q, &k, &v, MaskKind::None, None)
-                .map_err(|e| -> CaseError { e.to_string().into() })?;
-            vec![o, lse]
-        }
-        "attention_causal_forward" => vec![
-            attention_causal(&q, &k, &v, None)
-                .map_err(|e| -> CaseError { e.to_string().into() })?,
-        ],
-        _ => vec![
-            attention(&q, &k, &v, MaskKind::None, None)
-                .map_err(|e| -> CaseError { e.to_string().into() })?,
-        ],
-    };
-    crate::launch_counts::check_ceiling(session, name, &values)?;
-
-    // A count with no number behind it is a count of the wrong kernel.
-    let (expected, expected_lse) = host_attention(
-        &q_data,
-        &k_data,
-        &v_data,
-        H,
-        default_scale(),
-        if name == "attention_causal_forward" {
-            &causal_mask
-        } else {
-            &no_mask
-        },
-    );
-    expect_values(
-        session,
-        &q_shape(),
-        Dtype::F32,
-        &read(&values[0])?,
-        &expected,
-    )?;
-    if let Some(lse) = values.get(1) {
-        let shape = [B as u64, H as u64, LQ as u64];
-        expect_values(session, &shape, Dtype::F32, &read(lse)?, &expected_lse)?;
-    }
-    Ok(())
-}
-
-/// Rules that **must** fire while saturating the chain `attention_defn`
-/// emits, with what their absence would mean.
-///
-/// This is the firing half of the acceptance bar, and it is stated on the
-/// real frontend chain rather than a hand-built graph on purpose: the
-/// previous flash rules matched a chain the frontend later stopped emitting,
-/// stopped firing, and nothing noticed. Adding a law is one row here.
-///
-/// Every entry is backend-independent; target-specific rules (`LOWER_COOP`,
-/// `SELECT_VECTOR_WIDTH`) are deliberately absent so one table serves both
-/// sessions.
-const REQUIRED_ON_THE_ATTENTION_CHAIN: &[(&str, &str)] = &[
-    (
-        "LOWER_FOLD",
-        "the floor that guarantees the softmax's reductions reach a runnable form",
-    ),
-    (
-        "LOWER_CONTRACT_GENERIC",
-        "the floor that turns q.k and p.v into nests; without it there is no fold to fuse into",
-    ),
-    (
-        "ABSORB",
-        "the fusion law: a reduction absorbs a producer whose index space it covers. \
-         This is what collapses the softmax chain into one lift",
-    ),
-    (
-        "TILE_FOLD",
-        "the reduction's schedule domain. Without it every fold in attention reaches \
-         extraction with no schedule decision to make and the emitter's default stands",
-    ),
-];
-
-/// Saturate the graph `attention_defn` actually emits and read the report.
-///
-/// Three asserts, in rising order of what they catch:
-/// * `saturated == true` — the rule table reached a fixpoint inside the
-///   budget, so nothing below is "it did not get that far";
-/// * `truncated.is_empty()` — no class was abandoned mid-chain. Truncation is
-///   never silent, and on this graph it must not happen at all;
-/// * `applications >= FLOOR` — the tripwire. A rule table that stops firing on
-///   the real frontend chain reports a *number*, not a quiet regression. The
-///   floor sits well under the measured value on purpose: laws land and
-///   subsume each other, so the pin catches "attention stopped being
-///   rewritten", not "the count moved".
-fn saturation_case(session: &Session, causal: bool) -> CaseResult {
-    use fusor2_ir::egraph::Saturate;
-    use fusor2_ir::egraph::SaturationBudget;
-    use fusor2_ir::saturate::Driver;
-
-    /// Measured at 419 (gpu) and 1534 (cpu) applications on the shipped
-    /// table. The floor is far under both on purpose: laws land and subsume
-    /// each other, so this pins "attention stopped being rewritten", not "the
-    /// count moved". The rule table below is the sharp assert.
-    const FLOOR: u32 = 64;
-
-    let q_data = Domain::Wide.sample(701, Q_LEN);
-    let k_data = Domain::Wide.sample(709, kv_len(H));
-    let v_data = Domain::Wide.sample(719, kv_len(H));
-
-    let graph = graph_of(session);
-    let q = upload(graph.handle(), &dims(&q_shape()), &q_data)?;
-    let k = upload(graph.handle(), &dims(&kv_shape(H)), &k_data)?;
-    let v = upload(graph.handle(), &dims(&kv_shape(H)), &v_data)?;
-    let o = if causal {
-        attention_causal(&q, &k, &v, None)
-    } else {
-        attention(&q, &k, &v, MaskKind::None, None)
-    }
-    .map_err(|e| -> CaseError { e.to_string().into() })?;
-
-    let caps = session.caps();
-    let rules = session.rules().to_vec();
-    let report = graph
-        .handle()
-        .with_egraph(|g| {
-            g.add_root(o.id());
-            Driver::new()
-                .saturate(g, &caps, &rules, SaturationBudget::default())
-                .map_err(Into::into)
-        })
-        .map_err(|e| -> CaseError { format!("saturating attention: {e}").into() })?;
-
-    if !report.saturated {
-        return Err(format!(
-            "attention{} did not saturate in {} rounds ({} applications, {} nodes). \
-             Every structural claim below this is unreadable while it is false.",
-            if causal { " (causal)" } else { "" },
-            report.rounds,
-            report.applications,
-            report.final_nodes
-        )
-        .into());
-    }
-    if !report.truncated.is_empty() {
-        return Err(format!(
-            "attention{} truncated {} class(es) at {} nodes: {:?}. Truncation is never \
-             silent, and on the frontend's own chain it must not happen at all.",
-            if causal { " (causal)" } else { "" },
-            report.truncated.len(),
-            report.final_nodes,
-            report.truncated
-        )
-        .into());
-    }
-    if report.applications < FLOOR {
-        return Err(format!(
-            "attention{} drew only {} rule applications over {} rounds, under the {FLOOR} \
-             floor. A rule that silently stops matching the frontend's chain is how flash \
-             attention was unreachable on both backends for a week.",
-            if causal { " (causal)" } else { "" },
-            report.applications,
-            report.rounds
-        )
-        .into());
-    }
-    for (rule, why) in REQUIRED_ON_THE_ATTENTION_CHAIN {
-        if report
-            .fired
-            .iter()
-            .find(|(n, _)| n == rule)
-            .is_none_or(|(_, n)| *n == 0)
-        {
-            return Err(format!(
-                "`{rule}` never fired while saturating the chain `attention_defn` emits \
-                 ({why}). {} applications over {} rounds, and this rule was not one of \
-                 them: {:?}. A rule that silently stops matching the frontend is how flash \
-                 attention was unreachable on both backends for a week while every numeric \
-                 case still passed.",
-                report.applications, report.rounds, report.fired
-            )
-            .into());
-        }
-    }
-    // The graph must still compute the right numbers after the extra
-    // saturation pass: a report is not a result.
-    let (expected, _) = host_attention(
-        &q_data,
-        &k_data,
-        &v_data,
-        H,
-        default_scale(),
-        if causal { &causal_mask } else { &no_mask },
-    );
-    expect_values(session, &q_shape(), Dtype::F32, &read(&o)?, &expected)
 }
 
 /// A scale that is not `1/sqrt(Dh)`. The scale is a runtime uniform read from
 /// binding 0, not a baked literal, so passing a different one must change the
 /// numbers without rebuilding a kernel.
-fn attention_scale_case(session: &Session) -> CaseResult {
+fn attention_scale_case(session: &Session, d: AttnDims, seed: u32) -> CaseResult {
     const SCALE: f32 = 0.37;
-    let q_data = Domain::Wide.sample(701, Q_LEN);
-    let k_data = Domain::Wide.sample(709, kv_len(H));
-    let v_data = Domain::Wide.sample(719, kv_len(H));
+    let q_data = Domain::Wide.sample(seed, d.q_len());
+    let k_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, d.kv_len());
+    let v_data = Domain::Wide.sample(seed.wrapping_add(1), d.kv_len());
 
     let graph = graph_of(session);
-    let q = upload(graph.handle(), &dims(&q_shape()), &q_data)?;
-    let k = upload(graph.handle(), &dims(&kv_shape(H)), &k_data)?;
-    let v = upload(graph.handle(), &dims(&kv_shape(H)), &v_data)?;
+    let q = upload(graph.handle(), &dims(&d.q_shape()), &q_data)?;
+    let k = upload(graph.handle(), &dims(&d.kv_shape()), &k_data)?;
+    let v = upload(graph.handle(), &dims(&d.kv_shape()), &v_data)?;
     let o = attention(&q, &k, &v, MaskKind::None, Some(SCALE))
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let (expected, _) = host_attention(&q_data, &k_data, &v_data, H, SCALE, &no_mask);
-    expect_values(session, &q_shape(), Dtype::F32, &read(&o)?, &expected)?;
+    let (expected, _) = host_attention(&q_data, &k_data, &v_data, d, SCALE, &no_mask);
+    expect_values(session, &d.q_shape(), Dtype::F32, &read(&o)?, &expected)?;
     Ok(())
 }
 
 /// A materialized additive `[Lq, Lk]` mask. `QkMask` is the one mask kind that
 /// is *not* structural, so the tensor has to reach the kernel.
-fn qk_mask_case(session: &Session) -> CaseResult {
-    let q_data = Domain::Wide.sample(727, Q_LEN);
-    let k_data = Domain::Wide.sample(733, kv_len(H));
-    let v_data = Domain::Wide.sample(739, kv_len(H));
+fn qk_mask_case(session: &Session, d: AttnDims, seed: u32) -> CaseResult {
+    let q_data = Domain::Wide.sample(seed, d.q_len());
+    let k_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, d.kv_len());
+    let v_data = Domain::Wide.sample(seed.wrapping_add(1), d.kv_len());
     // Banded and asymmetric, so a transposed index shows up as wrong numbers.
-    let mask: Vec<f32> = (0..LQ * LK)
+    let mask: Vec<f32> = (0..d.lq * d.lk)
         .map(|n| {
-            let (i, j) = (n / LK, n % LK);
+            let (i, j) = (n / d.lk, n % d.lk);
             if j > i { -1.0e4 } else { 0.25 * (i as f32) }
         })
         .collect();
 
     let graph = graph_of(session);
-    let q = upload(graph.handle(), &dims(&q_shape()), &q_data)?;
-    let k = upload(graph.handle(), &dims(&kv_shape(H)), &k_data)?;
-    let v = upload(graph.handle(), &dims(&kv_shape(H)), &v_data)?;
-    let m = upload(graph.handle(), &dims(&[LQ as u64, LK as u64]), &mask)?;
+    let q = upload(graph.handle(), &dims(&d.q_shape()), &q_data)?;
+    let k = upload(graph.handle(), &dims(&d.kv_shape()), &k_data)?;
+    let v = upload(graph.handle(), &dims(&d.kv_shape()), &v_data)?;
+    let m = upload(graph.handle(), &dims(&[d.lq as u64, d.lk as u64]), &mask)?;
     let o = attention_masked(&q, &k, &v, MaskKind::QkMask, Some(&m), None)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let (expected, _) = host_attention(&q_data, &k_data, &v_data, H, default_scale(), &|i, j| {
-        mask[i * LK + j]
+    let (expected, _) = host_attention(&q_data, &k_data, &v_data, d, d.default_scale(), &|i, j| {
+        mask[i * d.lk + j]
     });
-    expect_values(session, &q_shape(), Dtype::F32, &read(&o)?, &expected)?;
+    expect_values(session, &d.q_shape(), Dtype::F32, &read(&o)?, &expected)?;
     Ok(())
 }
 
 /// `QkMask` and `BatchKeyMask` without a mask tensor must be refused at
 /// construction: only `None` and `Causal` are structural.
 fn mask_arity(session: &Session) -> CaseResult {
+    let d = REFUSAL_DIMS;
     let graph = graph_of(session);
     let q = upload(
         graph.handle(),
-        &dims(&q_shape()),
-        &Domain::Wide.sample(743, Q_LEN),
+        &dims(&d.q_shape()),
+        &Domain::Wide.sample(743, d.q_len()),
     )?;
     let k = upload(
         graph.handle(),
-        &dims(&kv_shape(H)),
-        &Domain::Wide.sample(751, kv_len(H)),
+        &dims(&d.kv_shape()),
+        &Domain::Wide.sample(751, d.kv_len()),
     )?;
     let v = upload(
         graph.handle(),
-        &dims(&kv_shape(H)),
-        &Domain::Wide.sample(757, kv_len(H)),
+        &dims(&d.kv_shape()),
+        &Domain::Wide.sample(757, d.kv_len()),
     )?;
     for kind in [MaskKind::QkMask, MaskKind::BatchKeyMask] {
         if attention(&q, &k, &v, kind, None).is_ok() {
@@ -892,41 +742,39 @@ fn mask_arity(session: &Session) -> CaseResult {
     Ok(())
 }
 
-fn lse_case(session: &Session) -> CaseResult {
-    let q_data = Domain::Wide.sample(761, Q_LEN);
-    let k_data = Domain::Wide.sample(769, kv_len(H));
+fn lse_case(session: &Session, d: AttnDims, seed: u32) -> CaseResult {
+    let q_data = Domain::Wide.sample(seed, d.q_len());
+    let k_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, d.kv_len());
 
     let graph = graph_of(session);
-    let q = upload(graph.handle(), &dims(&q_shape()), &q_data)?;
-    let k = upload(graph.handle(), &dims(&kv_shape(H)), &k_data)?;
+    let q = upload(graph.handle(), &dims(&d.q_shape()), &q_data)?;
+    let k = upload(graph.handle(), &dims(&d.kv_shape()), &k_data)?;
     let lse = attention_lse(&q, &k, MaskKind::None, None, None)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     // v is unused by lse; zeros keep the host helper's shapes honest.
-    let v_data = vec![0.0f32; kv_len(H)];
-    let (_, expected) = host_attention(&q_data, &k_data, &v_data, H, default_scale(), &no_mask);
-    let shape = [B as u64, H as u64, LQ as u64];
-    expect_values(session, &shape, Dtype::F32, &read(&lse)?, &expected)?;
+    let v_data = vec![0.0f32; d.kv_len()];
+    let (_, expected) = host_attention(&q_data, &k_data, &v_data, d, d.default_scale(), &no_mask);
+    expect_values(session, &d.lse_shape(), Dtype::F32, &read(&lse)?, &expected)?;
     Ok(())
 }
 
-fn with_lse_case(session: &Session) -> CaseResult {
-    let q_data = Domain::Wide.sample(773, Q_LEN);
-    let k_data = Domain::Wide.sample(787, kv_len(H));
-    let v_data = Domain::Wide.sample(797, kv_len(H));
+fn with_lse_case(session: &Session, d: AttnDims, seed: u32) -> CaseResult {
+    let q_data = Domain::Wide.sample(seed, d.q_len());
+    let k_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, d.kv_len());
+    let v_data = Domain::Wide.sample(seed.wrapping_add(1), d.kv_len());
 
     let graph = graph_of(session);
-    let q = upload(graph.handle(), &dims(&q_shape()), &q_data)?;
-    let k = upload(graph.handle(), &dims(&kv_shape(H)), &k_data)?;
-    let v = upload(graph.handle(), &dims(&kv_shape(H)), &v_data)?;
+    let q = upload(graph.handle(), &dims(&d.q_shape()), &q_data)?;
+    let k = upload(graph.handle(), &dims(&d.kv_shape()), &k_data)?;
+    let v = upload(graph.handle(), &dims(&d.kv_shape()), &v_data)?;
     let (o, lse) = attention_with_lse(&q, &k, &v, MaskKind::None, None)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let (want_o, want_lse) =
-        host_attention(&q_data, &k_data, &v_data, H, default_scale(), &no_mask);
-    expect_values(session, &q_shape(), Dtype::F32, &read(&o)?, &want_o)?;
-    let lse_shape = [B as u64, H as u64, LQ as u64];
-    expect_values(session, &lse_shape, Dtype::F32, &read(&lse)?, &want_lse)?;
+        host_attention(&q_data, &k_data, &v_data, d, d.default_scale(), &no_mask);
+    expect_values(session, &d.q_shape(), Dtype::F32, &read(&o)?, &want_o)?;
+    expect_values(session, &d.lse_shape(), Dtype::F32, &read(&lse)?, &want_lse)?;
     Ok(())
 }
 
@@ -935,102 +783,67 @@ fn with_lse_case(session: &Session) -> CaseResult {
 /// dk and dv are halves of one `[B, H, 2*Lk, Dh]` buffer handed back as
 /// zero-cost views, so the element counts prove the halves were sliced the
 /// right way round and the values prove they were not swapped.
-fn grads_case(session: &Session) -> CaseResult {
-    let q_data = Domain::Wide.sample(809, Q_LEN);
-    let k_data = Domain::Wide.sample(811, kv_len(H));
-    let v_data = Domain::Wide.sample(821, kv_len(H));
-    let g_data = Domain::Wide.sample(823, Q_LEN);
+fn grads_case(session: &Session, d: AttnDims, seed: u32) -> CaseResult {
+    let q_data = Domain::Wide.sample(seed, d.q_len());
+    let k_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, d.kv_len());
+    let v_data = Domain::Wide.sample(seed.wrapping_add(1), d.kv_len());
+    let g_data = Domain::Wide.sample(seed ^ 0x5eed, d.q_len());
 
     let graph = graph_of(session);
-    let q = upload(graph.handle(), &dims(&q_shape()), &q_data)?;
-    let k = upload(graph.handle(), &dims(&kv_shape(H)), &k_data)?;
-    let v = upload(graph.handle(), &dims(&kv_shape(H)), &v_data)?;
-    let g = upload(graph.handle(), &dims(&q_shape()), &g_data)?;
+    let q = upload(graph.handle(), &dims(&d.q_shape()), &q_data)?;
+    let k = upload(graph.handle(), &dims(&d.kv_shape()), &k_data)?;
+    let v = upload(graph.handle(), &dims(&d.kv_shape()), &v_data)?;
+    let g = upload(graph.handle(), &dims(&d.q_shape()), &g_data)?;
     let (o, lse) = attention_with_lse(&q, &k, &v, MaskKind::None, None)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     let (dq, dk, dv) = attention_grads(&q, &k, &v, &o, &g, &lse, MaskKind::None, None)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let (want_dq, want_dk, want_dv) =
-        host_attention_grads(&q_data, &k_data, &v_data, &g_data, default_scale());
-    expect_values(session, &q_shape(), Dtype::F32, &read(&dq)?, &want_dq)?;
-    expect_values(session, &kv_shape(H), Dtype::F32, &read(&dk)?, &want_dk)?;
-    expect_values(session, &kv_shape(H), Dtype::F32, &read(&dv)?, &want_dv)?;
-    Ok(())
-}
-
-/// The derived backward's dispatch count, against its ceiling.
-///
-/// The forward has had a guarded count since the template was deleted; the
-/// backward has not, and `NAMED_BACKWARD_PINS`'s `launches: 1` for
-/// `attention_grads_kv_single_launch` is a target no case measures. Without
-/// this the chain could stop fusing on the backward and only the numbers would
-/// notice — and the numbers stay right whether the adjoints arrive in 30
-/// dispatches or 60.
-///
-/// The values are asserted alongside the count for the reason
-/// `launch_ceiling_case` states: a count with no number behind it is a count of
-/// the wrong kernel.
-fn grads_launch_ceiling(session: &Session) -> CaseResult {
-    let q_data = Domain::Wide.sample(809, Q_LEN);
-    let k_data = Domain::Wide.sample(811, kv_len(H));
-    let v_data = Domain::Wide.sample(821, kv_len(H));
-    let g_data = Domain::Wide.sample(823, Q_LEN);
-
-    let graph = graph_of(session);
-    let q = upload(graph.handle(), &dims(&q_shape()), &q_data)?;
-    let k = upload(graph.handle(), &dims(&kv_shape(H)), &k_data)?;
-    let v = upload(graph.handle(), &dims(&kv_shape(H)), &v_data)?;
-    let g = upload(graph.handle(), &dims(&q_shape()), &g_data)?;
-    let (o, lse) = attention_with_lse(&q, &k, &v, MaskKind::None, None)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let (dq, dk, dv) = attention_grads(&q, &k, &v, &o, &g, &lse, MaskKind::None, None)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-
-    let values = [dq.clone(), dk.clone(), dv.clone()];
-    crate::launch_counts::check_ceiling(session, "attention_grads_all_three", &values)?;
-
-    let (want_dq, want_dk, want_dv) =
-        host_attention_grads(&q_data, &k_data, &v_data, &g_data, default_scale());
-    expect_values(session, &q_shape(), Dtype::F32, &read(&dq)?, &want_dq)?;
-    expect_values(session, &kv_shape(H), Dtype::F32, &read(&dk)?, &want_dk)?;
-    expect_values(session, &kv_shape(H), Dtype::F32, &read(&dv)?, &want_dv)?;
+        host_attention_grads(&q_data, &k_data, &v_data, &g_data, d, d.default_scale());
+    expect_values(session, &d.q_shape(), Dtype::F32, &read(&dq)?, &want_dq)?;
+    expect_values(session, &d.kv_shape(), Dtype::F32, &read(&dk)?, &want_dk)?;
+    expect_values(session, &d.kv_shape(), Dtype::F32, &read(&dv)?, &want_dv)?;
     Ok(())
 }
 
 /// Grouped queries must be expanded by the caller; `attention_grads` refuses
 /// them rather than silently summing over the group.
 fn grads_gqa_refused(session: &Session) -> CaseResult {
+    let d = AttnDims {
+        heads_kv: 1,
+        ..REFUSAL_DIMS
+    };
     let graph = graph_of(session);
     let q = upload(
         graph.handle(),
-        &dims(&q_shape()),
-        &Domain::Wide.sample(827, Q_LEN),
+        &dims(&d.q_shape()),
+        &Domain::Wide.sample(827, d.q_len()),
     )?;
     let k = upload(
         graph.handle(),
-        &dims(&kv_shape(1)),
-        &Domain::Wide.sample(829, kv_len(1)),
+        &dims(&d.kv_shape()),
+        &Domain::Wide.sample(829, d.kv_len()),
     )?;
     let v = upload(
         graph.handle(),
-        &dims(&kv_shape(1)),
-        &Domain::Wide.sample(839, kv_len(1)),
+        &dims(&d.kv_shape()),
+        &Domain::Wide.sample(839, d.kv_len()),
     )?;
     let g = upload(
         graph.handle(),
-        &dims(&q_shape()),
-        &Domain::Wide.sample(853, Q_LEN),
+        &dims(&d.q_shape()),
+        &Domain::Wide.sample(853, d.q_len()),
     )?;
     let o = upload(
         graph.handle(),
-        &dims(&q_shape()),
-        &Domain::Wide.sample(859, Q_LEN),
+        &dims(&d.q_shape()),
+        &Domain::Wide.sample(859, d.q_len()),
     )?;
     let lse = upload(
         graph.handle(),
-        &dims(&[B as u64, H as u64, LQ as u64]),
-        &Domain::Wide.sample(857, B * H * LQ),
+        &dims(&d.lse_shape()),
+        &Domain::Wide.sample(857, d.b * d.h * d.lq),
     )?;
     if attention_grads(&q, &k, &v, &o, &g, &lse, MaskKind::None, None).is_ok() {
         return Err("attention_grads accepted H != Hkv; the caller must expand first".into());
@@ -1041,21 +854,21 @@ fn grads_gqa_refused(session: &Session) -> CaseResult {
 /// The taped backward of the composed attention must agree with the analytic
 /// adjoints. That agreement is what makes `attention_grads` an optimization
 /// rather than a second rule to keep in sync by hand.
-fn attention_backward(session: &Session) -> CaseResult {
-    let q_data = Domain::Wide.sample(863, Q_LEN);
-    let k_data = Domain::Wide.sample(877, kv_len(H));
-    let v_data = Domain::Wide.sample(881, kv_len(H));
-    let ones = vec![1.0f32; Q_LEN];
+fn attention_backward(session: &Session, d: AttnDims, seed: u32) -> CaseResult {
+    let q_data = Domain::Wide.sample(seed, d.q_len());
+    let k_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, d.kv_len());
+    let v_data = Domain::Wide.sample(seed.wrapping_add(1), d.kv_len());
+    let ones = vec![1.0f32; d.q_len()];
 
     let graph = graph_of(session);
-    let q = upload(graph.handle(), &dims(&q_shape()), &q_data)?;
-    let k = upload(graph.handle(), &dims(&kv_shape(H)), &k_data)?;
-    let v = upload(graph.handle(), &dims(&kv_shape(H)), &v_data)?;
+    let q = upload(graph.handle(), &dims(&d.q_shape()), &q_data)?;
+    let k = upload(graph.handle(), &dims(&d.kv_shape()), &k_data)?;
+    let v = upload(graph.handle(), &dims(&d.kv_shape()), &v_data)?;
     let o = attention(&q, &k, &v, MaskKind::None, None)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let (want_dq, want_dk, want_dv) =
-        host_attention_grads(&q_data, &k_data, &v_data, &ones, default_scale());
+        host_attention_grads(&q_data, &k_data, &v_data, &ones, d, d.default_scale());
     for (label, tensor, want) in [
         ("dq", &q, &want_dq),
         ("dk", &k, &want_dk),
@@ -1090,10 +903,11 @@ type RopePosPairBuild =
 /// device tensors and the host copies the reference reads.
 fn upload_tables(
     graph: &GraphRef,
+    dh: usize,
     max_len: usize,
 ) -> Result<(Tensor, Tensor, Vec<f32>, Vec<f32>), CaseError> {
-    let (cos, sin) = rope_tables(max_len);
-    let shape = dims(&[max_len as u64, (DH / 2) as u64]);
+    let (cos, sin) = rope_tables(dh, max_len);
+    let shape = dims(&[max_len as u64, (dh / 2) as u64]);
     let ct = upload(graph, &shape, &cos)?;
     let st = upload(graph, &shape, &sin)?;
     Ok((ct, st, cos, sin))
@@ -1101,20 +915,22 @@ fn upload_tables(
 
 fn rope_case(
     session: &Session,
+    seed: u32,
     name: &'static str,
+    d: RopeDims,
     interleaved: bool,
     offset: u64,
     build: RopeBuild,
 ) -> CaseResult {
-    let x_data = Domain::Wide.sample(883, Q_LEN);
+    let x_data = Domain::Wide.sample(seed, d.len());
     let graph = graph_of(session);
-    let (ct, st, cos, sin) = upload_tables(graph.handle(), LQ + offset as usize)?;
-    let x = upload(graph.handle(), &dims(&q_shape()), &x_data)?;
+    let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, d.l + offset as usize)?;
+    let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
     let y =
         build(&x, &ct, &st, offset).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
-    let expected = host_rope(&x_data, &cos, &sin, LQ, offset as usize, interleaved);
-    expect_values(session, &q_shape(), Dtype::F32, &read(&y)?, &expected)?;
+    let expected = host_rope(&x_data, &cos, &sin, d, offset as usize, interleaved);
+    expect_values(session, &d.shape(), Dtype::F32, &read(&y)?, &expected)?;
     Ok(())
 }
 
@@ -1122,120 +938,140 @@ fn rope_case(
 /// that rotates q twice and leaves k alone still returns two tensors.
 fn rope_pair_case(
     session: &Session,
+    seed: u32,
     name: &'static str,
+    d: RopeDims,
     interleaved: bool,
     build: RopePairBuild,
 ) -> CaseResult {
-    let q_data = Domain::Wide.sample(887, Q_LEN);
-    let k_data = Domain::Wide.sample(907, Q_LEN);
+    let q_data = Domain::Wide.sample(seed, d.len());
+    let k_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, d.len());
     let graph = graph_of(session);
-    let (ct, st, cos, sin) = upload_tables(graph.handle(), LQ)?;
-    let q = upload(graph.handle(), &dims(&q_shape()), &q_data)?;
-    let k = upload(graph.handle(), &dims(&q_shape()), &k_data)?;
+    let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, d.l)?;
+    let q = upload(graph.handle(), &dims(&d.shape()), &q_data)?;
+    let k = upload(graph.handle(), &dims(&d.shape()), &k_data)?;
     let (rq, rk) =
         build(&q, &k, &ct, &st, 0).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
-    let want_q = host_rope(&q_data, &cos, &sin, LQ, 0, interleaved);
-    let want_k = host_rope(&k_data, &cos, &sin, LQ, 0, interleaved);
-    expect_values(session, &q_shape(), Dtype::F32, &read(&rq)?, &want_q)?;
-    expect_values(session, &q_shape(), Dtype::F32, &read(&rk)?, &want_k)?;
+    let want_q = host_rope(&q_data, &cos, &sin, d, 0, interleaved);
+    let want_k = host_rope(&k_data, &cos, &sin, d, 0, interleaved);
+    expect_values(session, &d.shape(), Dtype::F32, &read(&rq)?, &want_q)?;
+    expect_values(session, &d.shape(), Dtype::F32, &read(&rk)?, &want_k)?;
     Ok(())
 }
 
 /// Rotate each row by the position its `u32` entry names.
-fn host_rope_at(data: &[f32], cos: &[f32], sin: &[f32], pos: &[u32], il: bool) -> Vec<f32> {
+fn host_rope_at(data: &[f32], cos: &[f32], sin: &[f32], pos: &[u32], d: RopeDims, il: bool) -> Vec<f32> {
     let mut expected = vec![0.0f32; data.len()];
-    for b in 0..B {
-        for h in 0..H {
-            for l in 0..LQ {
-                let base = ((b * H + h) * LQ + l) * DH;
-                let rot = host_rope_vec(&data[base..base + DH], cos, sin, pos[l] as usize, il);
-                expected[base..base + DH].copy_from_slice(&rot);
+    for b in 0..d.b {
+        for h in 0..d.h {
+            for l in 0..d.l {
+                let base = ((b * d.h + h) * d.l + l) * d.dh;
+                let rot = host_rope_vec(
+                    &data[base..base + d.dh],
+                    cos,
+                    sin,
+                    pos[l] as usize,
+                    d.dh,
+                    il,
+                );
+                expected[base..base + d.dh].copy_from_slice(&rot);
             }
         }
     }
     expected
 }
 
+/// A position per row, deliberately not `0..L`, so an implementation that
+/// ignores the tensor fails. Every position stays inside the uploaded table.
+fn sample_positions(seed: u32, l: usize, max_len: usize) -> Vec<u32> {
+    fill_indices(seed ^ 0x5eed, l, max_len as u32)
+}
+
 /// The decode form: positions live in a rank-1 `u32` tensor so the offset
-/// never round-trips through the host. The positions are deliberately not
-/// `0..Lq`, so an implementation that ignores the tensor fails.
+/// never round-trips through the host.
 fn rope_position_case(
     session: &Session,
+    seed: u32,
     name: &'static str,
+    d: RopeDims,
     interleaved: bool,
     build: RopePosBuild,
 ) -> CaseResult {
-    let x_data = Domain::Wide.sample(911, Q_LEN);
-    let positions: Vec<u32> = vec![3, 0, 5];
+    let x_data = Domain::Wide.sample(seed, d.len());
+    let max_len = d.l + 8;
+    let positions = sample_positions(seed, d.l, max_len);
     let graph = graph_of(session);
-    let (ct, st, cos, sin) = upload_tables(graph.handle(), 8)?;
-    let x = upload(graph.handle(), &dims(&q_shape()), &x_data)?;
-    let p = from_u32(graph.handle(), &dims(&[LQ as u64]), &positions)
+    let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, max_len)?;
+    let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
+    let p = from_u32(graph.handle(), &dims(&[d.l as u64]), &positions)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     let y = build(&x, &ct, &st, &p).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
-    let expected = host_rope_at(&x_data, &cos, &sin, &positions, interleaved);
-    expect_values(session, &q_shape(), Dtype::F32, &read(&y)?, &expected)?;
+    let expected = host_rope_at(&x_data, &cos, &sin, &positions, d, interleaved);
+    expect_values(session, &d.shape(), Dtype::F32, &read(&y)?, &expected)?;
     Ok(())
 }
 
 fn rope_position_pair_case(
     session: &Session,
+    seed: u32,
     name: &'static str,
+    d: RopeDims,
     interleaved: bool,
     build: RopePosPairBuild,
 ) -> CaseResult {
-    let q_data = Domain::Wide.sample(919, Q_LEN);
-    let k_data = Domain::Wide.sample(929, Q_LEN);
-    let positions: Vec<u32> = vec![1, 4, 2];
+    let q_data = Domain::Wide.sample(seed, d.len());
+    let k_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, d.len());
+    let max_len = d.l + 8;
+    let positions = sample_positions(seed, d.l, max_len);
     let graph = graph_of(session);
-    let (ct, st, cos, sin) = upload_tables(graph.handle(), 8)?;
-    let q = upload(graph.handle(), &dims(&q_shape()), &q_data)?;
-    let k = upload(graph.handle(), &dims(&q_shape()), &k_data)?;
-    let p = from_u32(graph.handle(), &dims(&[LQ as u64]), &positions)
+    let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, max_len)?;
+    let q = upload(graph.handle(), &dims(&d.shape()), &q_data)?;
+    let k = upload(graph.handle(), &dims(&d.shape()), &k_data)?;
+    let p = from_u32(graph.handle(), &dims(&[d.l as u64]), &positions)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     let (rq, rk) =
         build(&q, &k, &ct, &st, &p).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     for (data, got) in [(&q_data, &rq), (&k_data, &rk)] {
-        let expected = host_rope_at(data, &cos, &sin, &positions, interleaved);
-        expect_values(session, &q_shape(), Dtype::F32, &read(got)?, &expected)?;
+        let expected = host_rope_at(data, &cos, &sin, &positions, d, interleaved);
+        expect_values(session, &d.shape(), Dtype::F32, &read(got)?, &expected)?;
     }
     Ok(())
 }
 
 /// `rotate_half(x) = cat(-x2, x1)` over the head axis.
-fn rotate_half_case(session: &Session) -> CaseResult {
-    let x_data = Domain::Wide.sample(937, Q_LEN);
+fn rotate_half_case(session: &Session, d: RopeDims, seed: u32) -> CaseResult {
+    let x_data = Domain::Wide.sample(seed, d.len());
     let graph = graph_of(session);
-    let x = upload(graph.handle(), &dims(&q_shape()), &x_data)?;
+    let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
     let y = rotate_half(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let half = DH / 2;
-    let mut expected = vec![0.0f32; Q_LEN];
-    for base in (0..Q_LEN).step_by(DH) {
+    let half = d.dh / 2;
+    let mut expected = vec![0.0f32; d.len()];
+    for base in (0..d.len()).step_by(d.dh) {
         for i in 0..half {
             expected[base + i] = -x_data[base + half + i];
             expected[base + half + i] = x_data[base + i];
         }
     }
-    expect_values(session, &q_shape(), Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(session, &d.shape(), Dtype::F32, &read(&y)?, &expected)?;
     Ok(())
 }
 
 /// A rotation preserves the norm of every `(a, b)` pair, hence of the whole
 /// head vector. Independent of the table, so it catches a sin/cos swap that a
 /// self-consistent host reference would agree with.
-fn rope_norm_preserving(session: &Session) -> CaseResult {
-    let x_data = Domain::Wide.sample(941, Q_LEN);
+fn rope_norm_preserving(session: &Session, d: RopeDims, seed: u32) -> CaseResult {
+    let x_data = Domain::Wide.sample(seed, d.len());
     let graph = graph_of(session);
-    let (ct, st, _, _) = upload_tables(graph.handle(), LQ)?;
-    let x = upload(graph.handle(), &dims(&q_shape()), &x_data)?;
+    let (ct, st, _, _) = upload_tables(graph.handle(), d.dh, d.l)?;
+    let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
     let y = rope(&x, &ct, &st, 0).map_err(|e| -> CaseError { e.to_string().into() })?;
     let got = read(&y)?;
-    for (head, chunk) in got.chunks(DH).enumerate() {
-        let src = &x_data[head * DH..head * DH + DH];
+    for (head, chunk) in got.chunks(d.dh).enumerate() {
+        let src = &x_data[head * d.dh..head * d.dh + d.dh];
         let a: f32 = chunk.iter().map(|v| v * v).sum();
         let b: f32 = src.iter().map(|v| v * v).sum();
         if (a - b).abs() > 1e-3 * b.max(1.0) {
@@ -1252,20 +1088,20 @@ fn rope_norm_preserving(session: &Session) -> CaseResult {
 /// all-ones seed that gives `d/dx_a = cos + sin` and `d/dx_b = cos - sin` —
 /// checked analytically, because a mis-signed sin term is exactly what
 /// survives a symmetric finite-difference probe at small angles.
-fn rope_backward(session: &Session) -> CaseResult {
-    let x_data = Domain::Wide.sample(947, Q_LEN);
+fn rope_backward(session: &Session, d: RopeDims, seed: u32) -> CaseResult {
+    let x_data = Domain::Wide.sample(seed, d.len());
     let graph = graph_of(session);
-    let (ct, st, cos, sin) = upload_tables(graph.handle(), LQ)?;
-    let x = upload(graph.handle(), &dims(&q_shape()), &x_data)?;
+    let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, d.l)?;
+    let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
     let y = rope(&x, &ct, &st, 0).map_err(|e| -> CaseError { e.to_string().into() })?;
     let got = gradient_of(&graph, &y, &x)?;
 
-    let half = DH / 2;
-    let mut want = vec![0.0f32; Q_LEN];
-    for b in 0..B {
-        for h in 0..H {
-            for l in 0..LQ {
-                let base = ((b * H + h) * LQ + l) * DH;
+    let half = d.dh / 2;
+    let mut want = vec![0.0f32; d.len()];
+    for b in 0..d.b {
+        for h in 0..d.h {
+            for l in 0..d.l {
+                let base = ((b * d.h + h) * d.l + l) * d.dh;
                 for i in 0..half {
                     let (c, s) = (cos[l * half + i], sin[l * half + i]);
                     want[base + i] = c + s;
@@ -1274,13 +1110,16 @@ fn rope_backward(session: &Session) -> CaseResult {
             }
         }
     }
-    crate::compare::approx_or_relative_eq(backend_of(session), &[Q_LEN], &want, &got, 1e-4, 1e-4)?;
+    crate::compare::approx_or_relative_eq(backend_of(session), &[d.len()], &want, &got, 1e-4, 1e-4)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fixed problem every host self-check runs at.
+    const TD: AttnDims = REFUSAL_DIMS;
 
     fn registered() -> Vec<String> {
         cases().names().iter().map(|n| (*n).to_string()).collect()
@@ -1332,45 +1171,49 @@ mod tests {
     fn the_host_attention_rows_are_convex_combinations_of_v() {
         // With q = 0 every score is equal, so each output row is the mean of v
         // and the log-sum-exp is ln(Lk).
-        let q = vec![0.0f32; Q_LEN];
-        let k = vec![1.0f32; kv_len(H)];
-        let v: Vec<f32> = (0..kv_len(H)).map(|i| (i % 7) as f32).collect();
-        let (out, lse) = host_attention(&q, &k, &v, H, default_scale(), &no_mask);
-        for b in 0..B {
-            for h in 0..H {
-                for d in 0..DH {
-                    let want: f32 = (0..LK)
-                        .map(|j| v[((b * H + h) * LK + j) * DH + d])
+        let q = vec![0.0f32; TD.q_len()];
+        let k = vec![1.0f32; TD.kv_len()];
+        let v: Vec<f32> = (0..TD.kv_len()).map(|i| (i % 7) as f32).collect();
+        let (out, lse) = host_attention(&q, &k, &v, TD, TD.default_scale(), &no_mask);
+        for b in 0..TD.b {
+            for h in 0..TD.h {
+                for d in 0..TD.dh {
+                    let want: f32 = (0..TD.lk)
+                        .map(|j| v[((b * TD.h + h) * TD.lk + j) * TD.dh + d])
                         .sum::<f32>()
-                        / LK as f32;
-                    let got = out[((b * H + h) * LQ) * DH + d];
+                        / TD.lk as f32;
+                    let got = out[((b * TD.h + h) * TD.lq) * TD.dh + d];
                     assert!((got - want).abs() < 1e-5, "{got} vs {want}");
                 }
             }
         }
         for value in lse {
-            assert!((value - (LK as f32).ln()).abs() < 1e-5, "{value}");
+            assert!((value - (TD.lk as f32).ln()).abs() < 1e-5, "{value}");
         }
     }
 
     #[test]
     fn the_causal_mask_is_right_aligned() {
         // Lq = 3, Lk = 4: query 0 sees keys 0..=1, query 2 sees all four.
-        assert_eq!(causal_mask(0, 1), 0.0);
-        assert!(causal_mask(0, 2).is_infinite());
-        assert_eq!(causal_mask(2, 3), 0.0);
+        assert_eq!(causal_mask(3, 4, 0, 1), 0.0);
+        assert!(causal_mask(3, 4, 0, 2).is_infinite());
+        assert_eq!(causal_mask(3, 4, 2, 3), 0.0);
     }
 
     #[test]
     fn the_gqa_expansion_shares_one_kv_head() {
-        let q = vec![0.0f32; Q_LEN];
-        let k = vec![1.0f32; kv_len(1)];
-        let v: Vec<f32> = (0..kv_len(1)).map(|i| i as f32).collect();
-        let (out, _) = host_attention(&q, &k, &v, 1, default_scale(), &no_mask);
-        for b in 0..B {
-            for d in 0..DH {
-                let h0 = out[(b * H * LQ) * DH + d];
-                let h1 = out[((b * H + 1) * LQ) * DH + d];
+        let d = AttnDims {
+            heads_kv: 1,
+            ..TD
+        };
+        let q = vec![0.0f32; d.q_len()];
+        let k = vec![1.0f32; d.kv_len()];
+        let v: Vec<f32> = (0..d.kv_len()).map(|i| i as f32).collect();
+        let (out, _) = host_attention(&q, &k, &v, d, d.default_scale(), &no_mask);
+        for b in 0..d.b {
+            for x in 0..d.dh {
+                let h0 = out[(b * d.h * d.lq) * d.dh + x];
+                let h1 = out[((b * d.h + 1) * d.lq) * d.dh + x];
                 assert!((h0 - h1).abs() < 1e-5, "GQA heads disagree: {h0} vs {h1}");
             }
         }
@@ -1378,32 +1221,35 @@ mod tests {
 
     #[test]
     fn the_host_rope_is_a_rotation() {
-        let (cos, sin) = rope_tables(4);
+        const DH: usize = 4;
+        let (cos, sin) = rope_tables(DH, 4);
         let x: Vec<f32> = (0..DH).map(|i| (i + 1) as f32).collect();
         for il in [false, true] {
             for p in 0..4 {
-                let y = host_rope_vec(&x, &cos, &sin, p, il);
+                let y = host_rope_vec(&x, &cos, &sin, p, DH, il);
                 let a: f32 = x.iter().map(|v| v * v).sum();
                 let b: f32 = y.iter().map(|v| v * v).sum();
                 assert!((a - b).abs() < 1e-4, "p={p} il={il}: {a} vs {b}");
             }
         }
         // Position 0 is the identity: cos 0 = 1, sin 0 = 0.
-        assert_eq!(host_rope_vec(&x, &cos, &sin, 0, false), x);
+        assert_eq!(host_rope_vec(&x, &cos, &sin, 0, DH, false), x);
     }
 
     #[test]
     fn the_two_pairings_are_different_functions() {
-        let (cos, sin) = rope_tables(3);
+        const DH: usize = 4;
+        let (cos, sin) = rope_tables(DH, 3);
         let x: Vec<f32> = (0..DH).map(|i| (i + 1) as f32).collect();
         assert_ne!(
-            host_rope_vec(&x, &cos, &sin, 1, false),
-            host_rope_vec(&x, &cos, &sin, 1, true),
+            host_rope_vec(&x, &cos, &sin, 1, DH, false),
+            host_rope_vec(&x, &cos, &sin, 1, DH, true),
         );
     }
 
     #[test]
     fn the_inverse_frequency_table_is_decreasing_and_half_width() {
+        const DH: usize = 4;
         let inv = base_inverse_frequency(DH as u32, 10_000.0);
         assert_eq!(inv.len(), DH / 2);
         assert!(inv.windows(2).all(|w| w[0] > w[1]), "{inv:?}");
@@ -1412,29 +1258,35 @@ mod tests {
 
     #[test]
     fn host_rope_at_reads_the_position_vector() {
-        let (cos, sin) = rope_tables(8);
-        let data: Vec<f32> = (0..Q_LEN).map(|i| i as f32).collect();
+        let d = RopeDims {
+            b: 2,
+            h: 2,
+            l: 3,
+            dh: 4,
+        };
+        let (cos, sin) = rope_tables(d.dh, 8);
+        let data: Vec<f32> = (0..d.len()).map(|i| i as f32).collect();
         // Position 0 everywhere is the identity.
-        assert_eq!(host_rope_at(&data, &cos, &sin, &[0, 0, 0], false), data);
+        assert_eq!(host_rope_at(&data, &cos, &sin, &[0, 0, 0], d, false), data);
         // A different position vector must change the answer.
-        assert_ne!(host_rope_at(&data, &cos, &sin, &[3, 0, 5], false), data);
+        assert_ne!(host_rope_at(&data, &cos, &sin, &[3, 0, 5], d, false), data);
     }
 
     #[test]
     fn the_host_grads_agree_with_a_finite_difference_of_the_host_forward() {
-        let q: Vec<f32> = (0..Q_LEN).map(|i| ((i % 5) as f32 - 2.0) * 0.1).collect();
-        let k: Vec<f32> = (0..kv_len(H))
+        let q: Vec<f32> = (0..TD.q_len()).map(|i| ((i % 5) as f32 - 2.0) * 0.1).collect();
+        let k: Vec<f32> = (0..TD.kv_len())
             .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
             .collect();
-        let v: Vec<f32> = (0..kv_len(H))
+        let v: Vec<f32> = (0..TD.kv_len())
             .map(|i| ((i % 3) as f32 - 1.0) * 0.1)
             .collect();
-        let g = vec![1.0f32; Q_LEN];
-        let s = default_scale();
-        let (dq, dk, dv) = host_attention_grads(&q, &k, &v, &g, s);
+        let g = vec![1.0f32; TD.q_len()];
+        let s = TD.default_scale();
+        let (dq, dk, dv) = host_attention_grads(&q, &k, &v, &g, TD, s);
         let eps = 1e-3f32;
         let sum = |q: &[f32], k: &[f32], v: &[f32]| -> f32 {
-            host_attention(q, k, v, H, s, &no_mask).0.iter().sum()
+            host_attention(q, k, v, TD, s, &no_mask).0.iter().sum()
         };
         for probe in [0usize, 5, 17] {
             for (label, base, analytic) in [("dq", &q, &dq), ("dk", &k, &dk), ("dv", &v, &dv)] {

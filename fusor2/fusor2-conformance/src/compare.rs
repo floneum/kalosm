@@ -362,6 +362,20 @@ fn refined_partial(
         // Their average, and the plain central difference when the two half
         // steps are the equal ones f32 usually gives.
         let central = (up - down) / (h_up + h_down);
+        // The resolution floor. The loss's own ulp divided by the step is the
+        // smallest slope this eps can distinguish from zero; once that
+        // exceeds `FD_ABS_TOL`, nothing measured at this step — agreement
+        // included — is evidence. Shrinking past the floor is how a
+        // sum-of-log-softmax loss of magnitude ~400 "converged" on a
+        // quantization artifact: both perturbed losses rounded to the same
+        // neighbour of `base`, the two slopes agreed on the same wrong
+        // number, and the loop returned it as a derivative. The best
+        // resolvable estimate is the honest answer; when even the first and
+        // largest step is under the floor, its central is all there is.
+        let quantum = base.abs().max(f32::MIN_POSITIVE) * f32::EPSILON;
+        if quantum > FD_ABS_TOL * (h_up + h_down) {
+            return Ok(best.map_or(central, |(_, c)| c));
+        }
         let disagreement = (slope_up - slope_down).abs();
         let allowed = FD_ABS_TOL + FD_REL_TOL * slope_up.abs().max(slope_down.abs());
         if disagreement <= allowed {

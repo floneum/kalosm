@@ -346,6 +346,143 @@ pub fn fill_indices(seed: u32, len: usize, modulus: u32) -> Vec<u32> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Shape fuzzing
+// ---------------------------------------------------------------------------
+
+/// How many times a fuzzed case re-samples its shapes and data. Every run of
+/// one case sees a different size, so an op that is correct only at its
+/// authoring shape fails by the second run. `FUSOR2_CONFORMANCE_RUNS`
+/// overrides, and `1` degenerates to fusor1's single-sample style.
+pub fn runs() -> u32 {
+    static RUNS: OnceLock<u32> = OnceLock::new();
+    *RUNS.get_or_init(|| {
+        std::env::var("FUSOR2_CONFORMANCE_RUNS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(3)
+    })
+}
+
+/// The seed a case's run draws everything from: FNV-1a over the case name
+/// plus the run index. Deterministic and distinct per (case, run), so a
+/// failure report naming the case and run reproduces the exact shapes and
+/// data with no state carried between cases.
+pub fn case_seed(name: &str, run: u32) -> u32 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.bytes().chain(run.to_le_bytes()) {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    // Fold to 32 bits without losing the high half.
+    (h ^ (h >> 32)) as u32
+}
+
+/// A deterministic RNG over the same LCG as [`fill`], for shape sampling.
+/// Kept separate from the data stream so adding a dimension to a spec does
+/// not shift every operand's values.
+pub struct Rng {
+    state: u64,
+}
+
+impl Rng {
+    pub fn new(seed: u32) -> Self {
+        // One warm-up step so nearby seeds separate immediately.
+        let mut rng = Self {
+            state: seed as u64,
+        };
+        rng.next_bits();
+        rng
+    }
+
+    fn next_bits(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.state >> 33
+    }
+
+    /// A value in `[lo, hi]`, inclusive on both ends.
+    pub fn range(&mut self, lo: u64, hi: u64) -> u64 {
+        debug_assert!(lo <= hi, "empty range [{lo}, {hi}]");
+        lo + self.next_bits() % (hi - lo + 1)
+    }
+
+    /// One element of a non-empty list.
+    pub fn choose(&mut self, items: &[u64]) -> u64 {
+        items[(self.next_bits() % items.len() as u64) as usize]
+    }
+}
+
+/// One dimension of a fuzzed shape.
+#[derive(Copy, Clone, Debug)]
+pub enum FuzzDim {
+    /// Always this extent (an op-mandated size, e.g. a quantized block).
+    Fixed(u64),
+    /// Any extent in `[lo, hi]`, inclusive.
+    Range(u64, u64),
+    /// A multiple of `step` in `[lo, hi]`, for alignment-constrained axes
+    /// (quantized K must be a block multiple, attention lengths that must
+    /// stay flash-aligned). `lo` and `hi` are themselves multiples.
+    Mult(u64, u64, u64),
+    /// One of an explicit extent list.
+    Choices(&'static [u64]),
+}
+
+impl FuzzDim {
+    pub fn sample(&self, rng: &mut Rng) -> u64 {
+        match *self {
+            FuzzDim::Fixed(n) => n,
+            FuzzDim::Range(lo, hi) => rng.range(lo, hi),
+            FuzzDim::Mult(step, lo, hi) => {
+                debug_assert!(step > 0 && lo % step == 0 && hi % step == 0);
+                rng.range(lo / step, hi / step) * step
+            }
+            FuzzDim::Choices(items) => rng.choose(items),
+        }
+    }
+}
+
+/// Sample every dimension of `spec`, in order.
+pub fn sample_shape(rng: &mut Rng, spec: &[FuzzDim]) -> Vec<u64> {
+    spec.iter().map(|d| d.sample(rng)).collect()
+}
+
+/// Build one fuzzed case: `body` runs [`runs`] times, each with a fresh shape
+/// sampled from `spec` and a distinct data seed. A failing run names its run
+/// index and the sampled shape, so any failure reproduces exactly from the
+/// report line.
+///
+/// `body(session, shape, seed)` draws its operand data from `seed` (and any
+/// derived seeds like `seed + 1`); the harness owns which seed a run gets.
+pub fn fuzz_case(
+    area: &'static str,
+    name: &'static str,
+    spec: &'static [FuzzDim],
+    body: impl Fn(&Session, &[u64], u32) -> CaseResult + Send + Sync + 'static,
+) -> Case {
+    Case::new(area, name, move |session| {
+        for run in 0..runs() {
+            let seed = case_seed(name, run);
+            let shape = sample_shape(&mut Rng::new(seed), spec);
+            body(session, &shape, seed).map_err(|e| -> CaseError {
+                // A skip must stay a skip: the marker is a prefix, so the run
+                // context goes after it, not in front of it.
+                let message = e.to_string();
+                match message.strip_prefix(SKIP_PREFIX) {
+                    Some(why) => skip(format!("run {run} at shape {shape:?}: {why}")),
+                    None => {
+                        format!("run {run} at shape {shape:?} (seed {seed}): {message}").into()
+                    }
+                }
+            })?;
+        }
+        Ok(())
+    })
+}
+
 /// Element count of a fully constant shape. Panics on a symbolic extent: the
 /// host-side references need a concrete length, and a `Dim::Sym` here is a
 /// bug in the case rather than in the compiler.
@@ -772,5 +909,90 @@ mod tests {
     #[test]
     fn dims_builds_constant_extents() {
         assert_eq!(dense_len(&dims(&[2, 3, 4])), 24);
+    }
+
+    #[test]
+    fn fuzz_dims_sample_inside_their_own_domains() {
+        let mut rng = Rng::new(7);
+        for _ in 0..256 {
+            assert_eq!(FuzzDim::Fixed(5).sample(&mut rng), 5);
+            let r = FuzzDim::Range(2, 9).sample(&mut rng);
+            assert!((2..=9).contains(&r), "{r} left [2, 9]");
+            let m = FuzzDim::Mult(32, 32, 256).sample(&mut rng);
+            assert!(m % 32 == 0 && (32..=256).contains(&m), "{m}");
+            let c = FuzzDim::Choices(&[1, 8, 64]).sample(&mut rng);
+            assert!([1, 8, 64].contains(&c), "{c}");
+        }
+    }
+
+    #[test]
+    fn a_range_actually_varies() {
+        let mut rng = Rng::new(3);
+        let samples: std::collections::HashSet<u64> =
+            (0..64).map(|_| FuzzDim::Range(1, 16).sample(&mut rng)).collect();
+        assert!(samples.len() > 4, "only {} distinct extents in 64 draws", samples.len());
+    }
+
+    #[test]
+    fn case_seeds_separate_by_name_and_run() {
+        assert_ne!(case_seed("a::x", 0), case_seed("a::x", 1));
+        assert_ne!(case_seed("a::x", 0), case_seed("a::y", 0));
+        assert_eq!(case_seed("a::x", 2), case_seed("a::x", 2));
+    }
+
+    #[test]
+    fn a_failing_fuzz_run_names_its_run_and_shape() {
+        // The whole point of deriving everything from (name, run): the report
+        // line alone reproduces the failure.
+        let case = fuzz_case("demo", "boom", &[FuzzDim::Range(1, 4)], |_, shape, _| {
+            Err(format!("bad at {shape:?}").into())
+        });
+        let sessions = sessions();
+        let Some(session) = sessions.first() else {
+            return;
+        };
+        match run_one(&case, session) {
+            Outcome::Fail(message) => {
+                assert!(message.contains("run 0 at shape ["), "{message}");
+                assert!(message.contains("seed "), "{message}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_skip_survives_the_fuzz_wrapper() {
+        // A device that cannot run a row must stay a skip when the row is
+        // fuzzed: burying the marker under the run context turned the whole
+        // bf16 matrix into failures.
+        let case = fuzz_case("demo", "no_bf16", &[FuzzDim::Fixed(2)], |_, _, _| {
+            Err(skip("this adapter has no bf16 support"))
+        });
+        let sessions = sessions();
+        let Some(session) = sessions.first() else {
+            return;
+        };
+        match run_one(&case, session) {
+            Outcome::Skipped(why) => assert!(why.contains("no bf16 support"), "{why}"),
+            other => panic!("expected a skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_passing_fuzz_case_runs_every_run() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let case = {
+            let hits = hits.clone();
+            fuzz_case("demo", "count", &[FuzzDim::Fixed(2)], move |_, _, _| {
+                hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            })
+        };
+        let sessions = sessions();
+        let Some(session) = sessions.first() else {
+            return;
+        };
+        assert_eq!(run_one(&case, session), Outcome::Pass);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), runs());
     }
 }
