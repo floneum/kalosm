@@ -3,13 +3,7 @@
 //! Measures the qgemv launch's own GPU timestamp span — not wall clock — for
 //! each decode-plan matmul shape, Q4K and Q6K, and prints effective GB/s
 //! computed from the quantized byte volume the kernel actually reads (the
-//! stored block stream; the f32 activation row is <0.1% of it and excluded on
-//! both sides of the comparison).
-//!
-//! The reference column comes from the companion example in the fusor-ml
-//! workspace: `fusor-ml/core/examples/qgemv_bench.rs` (run with
-//! `FUSOR_TRACE_GPU_KERNELS=1`). Both examples build bit-identical weights
-//! and activations, so the printed `y[0..2]` must agree across the two.
+//! stored block stream; the f32 activation row is <0.1% of it and excluded).
 //!
 //! Run: FUSOR2_TUNE_CACHE=/tmp/qgemv_bench_tune.json \
 //!      cargo run --release -p fusor2 --example qgemv_bench

@@ -1,8 +1,5 @@
 //! The two gather lowerings. `index_select`, `embedding`, `gather_last`
-//! and `i()` are all one `L0::Gather`, so they share these two
-//! alternatives.
-//!
-//! Owned by W4.
+//! and `i()` are all one `L0::Gather`, so they share these two alternatives.
 
 use fusor2_ir::egraph::{Builder, Facts, Id, RuleTag};
 use fusor2_ir::ir::level0::L0;

@@ -3,8 +3,6 @@
 //! not an op**, and no `MatMulParams` is ever written onto a node. Kernel
 //! family, tile geometry, split-K and staging depth are all extraction
 //! decisions that do not exist yet at this level.
-//!
-//! Owned by W12.
 
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::ir::level0::{EinSpec, L0, Label};
@@ -49,9 +47,8 @@ pub fn matmul_spec(batch: usize, transposed_rhs: bool) -> Result<EinSpec> {
 impl Tensor {
     /// `[batch.., m, k] @ [batch.., k, n] -> [batch.., m, n]`.
     ///
-    /// Batch dims must be pairwise [`fusor2_ir::shape::Dim::known_eq`]: there
-    /// is **no implicit batch broadcast**, callers `broadcast_as` first, as
-    /// the reference also requires.
+    /// Batch dims must be pairwise [`fusor2_ir::shape::Dim::known_eq`]; there
+    /// is no implicit batch broadcast.
     pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {
         self.contract_2d(rhs, false)
     }
@@ -114,47 +111,18 @@ impl Tensor {
 
         // A quantized side enters the contraction as its *dequantize class*,
         // not its raw leaf. The class is `L0::Dequant` unioned with the
-        // `Restride` + `Map` definitional expansion (see
-        // `QMatrix::dequantize`), so the extractor prices the format's staged
-        // block decode against the general bit-arithmetic spelling —
-        // `map_into_contract` absorbs the latter's unpack into the
-        // contraction's own operand list, no materialization in either case.
-        // Contracting the raw leaf instead would put exactly one spelling in
-        // the graph: the hand-written block program, reachable by no rewrite
-        // and admitted to `Family::Coop` alone.
-        //
-        // A quantized value `QMatrix::of_tensor` cannot name (not a leaf, or
-        // rank over 2 — today nothing mints either) falls back to the raw
-        // operand, which is the old behavior, not an error.
-        // Both spellings enter the class, not one: contracting the *raw* Q
-        // leaf is the only path to the staged block decode (the coop fill
-        // reads `Source::Quantized` in-place — the M=1 decode-shape winner,
-        // where one token cannot amortize a whole-weight dequantize), and
-        // contracting the *class* is what offers dequantize-once and the
-        // absorbed bit-arithmetic members (the M=256 winner, measured 15x
-        // over decode-per-tile there). Union them and the extractor prices
-        // the choice per shape instead of this method hardcoding either.
+        // `Restride` + `Map` definitional expansion (see `QMatrix::dequantize`).
+        // A quantized value that `QMatrix::of_tensor` cannot name falls back
+        // to the raw operand. Both spellings enter the class so the extractor
+        // can price the choice per shape.
         let deq = |t: &Tensor| -> Result<Option<Tensor>> {
             match crate::quantized::QMatrix::of_tensor(t) {
                 Some(q) => Ok(Some(q.dequantize()?)),
                 None => Ok(None),
             }
         };
-        // The staged spelling is minted FIRST. Ties in the extractor's seed
-        // break toward the smaller id, and on a graph big enough to exhaust
-        // the pricing budgets every class ties — minting dense-first made the
-        // degenerate pick the dequantize-and-materialize member for every
-        // matmul of an 8B decode (~27 GB of f32 launch roots). Where pricing
-        // is live the order changes nothing; where it is degenerate the
-        // in-place read is the only pick that always fits in memory.
-        // The third spelling is `qrepack`'s consuming half (R8): the same
-        // contraction over the word-aligned `F32Scales` twin of a `Native`
-        // leaf whose block stride is not a whole number of words. The twin is
-        // a *separate leaf* — one value class must denote one buffer — so the
-        // union happens here, on the contractions, and extraction prices the
-        // layout per contraction: only the selected leaf ever uploads.
-        // Minted last: where pricing is degenerate the tie must keep breaking
-        // toward the native staged member, exactly as for `dense` below.
+        // For repacked quantized formats, also union in a contraction over
+        // the word-aligned scales twin.
         let requant = |t: &Tensor| -> Result<Option<Tensor>> {
             Ok(self
                 .graph

@@ -1,6 +1,4 @@
 //! [`CpuTarget`] — the [`Target`] implementation.
-//!
-//! Owned by W10.
 
 use fusor2_ir::cost::DeviceFacts;
 use fusor2_ir::device::Caps;

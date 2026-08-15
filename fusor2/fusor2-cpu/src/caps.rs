@@ -1,7 +1,5 @@
 //! ISA and cache detection. The detected `Level` is cached in a `OnceLock` and
 //! dispatched **once per kernel launch**, not per row.
-//!
-//! Owned by W10.
 
 use fusor2_ir::device::{Caps, DeviceKind, Limits, SubgroupWidths};
 use smallvec::smallvec;

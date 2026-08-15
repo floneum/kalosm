@@ -9,8 +9,8 @@
 //! materialization bit. Nobody writes a checkpointing pass and there is no
 //! user annotation.
 //!
-//! Seven [`ADJOINTS`] entries. No tape, no `Arc<dyn Fn>` closures, no
-//! type-erased downcasts, no `replay_*` combinators.
+//! Seven [`ADJOINTS`] entries. No `Arc<dyn Fn>` closures, no
+//! type-erased downcasts.
 
 pub mod adjoints;
 pub mod backward;

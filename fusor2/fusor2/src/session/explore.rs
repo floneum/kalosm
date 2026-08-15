@@ -26,8 +26,7 @@
 //!
 //! **No correctness machinery.** Every arm is a `verify_plan`-checked plan
 //! over members of the same e-classes, and every member of a class computes
-//! the same value — that is the compiler's invariant, enforced at the source
-//! (see DOCTRINE.md). Selection here is pure performance. This is also why a
+//! the same value — that is the compiler's invariant. Selection here is pure performance. This is also why a
 //! substitution is safe on an *impure* plan (the decode step's KV append):
 //! the arm runs once, **instead of** the incumbent, so the plan's one write
 //! happens exactly once either way — unlike the cold race, which re-runs a
@@ -315,7 +314,7 @@ impl ArmSet {
     /// sliding window whose verdict is already in, and a warm tune cache
     /// makes that the common case: every label of every heavy launch already
     /// carries its `MIN_OBS` samples from past processes, so opening a field
-    /// used to mean building sixteen candidates to re-measure sixteen
+    /// means building sixteen candidates to re-measure sixteen
     /// answers. The read is `launch_sigs[ix]` — an arm that turns out to
     /// restructure files elsewhere, reads zero here, and so counts as thin.
     fn worth_building(

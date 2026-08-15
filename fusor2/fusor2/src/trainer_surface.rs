@@ -1,23 +1,10 @@
 //! The trainer's API surface, spelled exactly as the trainer spells it.
 //!
 //! `betlang-train` consumes fusor2 through exactly two `use` lines and never
-//! handles a `Result` from a tensor op:
-//!
-//! ```ignore
-//! use fusor::autograd::{BackwardTarget, Graph, Tensor};
-//! use fusor::{Device, Tensor as RawTensor, ToVec, cat};
-//! ```
-//!
-//! Its `.rs` files are the gate: not one of them may move. So the shapes it
-//! depends on are restated here — the same turbofish arities, the same
-//! rank-generic helpers, the same operator expressions — and a regression is a
-//! compile error in this crate rather than in a downstream build nobody runs.
-//!
-//! The second line names the crate **root**, and the root is now one naming
-//! rather than two: `Tensor` is the const-rank tensor and `Device` the device
-//! that builds it, with no feature to switch. So these imports are the
-//! trainer's, verbatim, with `fusor` spelled as `crate`, and one
-//! `cargo test -p fusor2` covers them.
+//! handles a `Result` from a tensor op. The shapes it depends on are restated
+//! here — the same turbofish arities, the same rank-generic helpers, the same
+//! operator expressions — and a regression is a compile error in this crate
+//! rather than in a downstream build.
 //!
 //! Functions named `_compiles` are never called. They exist to be type-checked.
 
@@ -662,15 +649,10 @@ mod tests {
     /// from `model.rs`, not a paraphrase — run on real values.
     ///
     /// Its `pool` is `reshape(..).max::<3>(3)` on a `Tensor<3, half::f16>`,
-    /// which is the fold that used to panic. The f32 stack over the same
-    /// numbers is the reference.
+    /// which is the fold under test.
     ///
-    /// The backward is taken too, by
+    /// The backward is tested too in
     /// [`a_backward_through_the_f16_convolution_stack_reaches_the_weights`].
-    /// It used to be unreachable: `extremum_adjoint` declared both comparison
-    /// args at the operand dtype while the broadcast fold output is at
-    /// `compute_dtype`, so an f16 max reported `Map body reads Arg(1) as F16
-    /// but the operand is F32`. Fixed in `fusor2-autograd`.
     #[test]
     fn the_trainers_f16_convolution_stack_computes() {
         let _serial = crate::device::test_device_lock();
@@ -752,13 +734,12 @@ mod tests {
     /// `betlang-train --f16`, the whole of it: the trainer's own
     /// `conv_stack_f16` forward *and* the backward through it, landing on the
     /// f32 masters. The pool is `reshape(..).max::<3>(3)` on an f16 operand,
-    /// so this is the `Max` fold whose adjoint used to be unbuildable.
+    /// so this exercises the `Max` fold adjoint.
     ///
-    /// The f32 stack over the same numbers is the reference. Gradients are
-    /// compared with a wide band — three convolutions and three gelus in f16,
-    /// differentiated, compound the 11-bit mantissa a long way — but the point
-    /// is not the third digit. It is that the backward exists, reaches every
-    /// weight, and does not come back zero.
+    /// Gradients are compared with a wide band — three convolutions and three
+    /// gelus in f16, differentiated, compound the 11-bit mantissa a long way.
+    /// The point is that the backward exists, reaches every weight, and does not
+    /// come back zero.
     #[test]
     fn a_backward_through_the_f16_convolution_stack_reaches_the_weights() {
         let _serial = crate::device::test_device_lock();

@@ -3,24 +3,10 @@
 //!
 //! ## The schedule
 //!
-//! The body used to run at a hardcoded `BLOCK = 256` and take `_theta`, so
-//! the compiler decided to fuse by cost and then executed the fused kernel at
-//! a fixed geometry — the one node family the architecture calls its own
-//! fusion primitive was the one opting out of late decision-making.
-//!
-//! It now carries a `sched` field, so
-//! [`fusor2_ir::ir::level1::L1::schedule`] returns its domain and extraction
-//! resolves it like any other node's. [`region_domain`] is this crate's
-//! spelling of that domain — it is [`MapDomain::linear`], the one generator
-//! `fusor2-ir` mints the field with and `verify_l1` checks it against — and
-//! the body consumes the selected [`MapTiling`]: `tm` outputs per lane at
-//! stride `block`, over a workgroup width that is a whole number of subgroups
-//! and never wider than the work there is. Nothing here is a constant any
-//! more: the last one, the `256` ceiling, is
-//! `fusor2_tile::domains::emitted_block`, which is where the fold domain that
-//! prices the width already reads it.
-//!
-//! Owned by W9.
+//! The body carries a `sched` field, so extraction resolves it like any other
+//! node's, and the body consumes the selected [`MapTiling`]. The workgroup width
+//! is a whole number of subgroups, never wider than the work there is, computed
+//! via [`block_for`].
 
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
@@ -41,18 +27,8 @@ use crate::lower::{Ctx, DimBinding, distribute_workgroups};
 
 /// The workgroup width for a linear body needing `lanes` lanes: a whole
 /// number of subgroups, never wider than the work and never wider than the
-/// device allows.
-///
-/// This is the term that used to be the constant 256. A 64-row region
-/// launched 256 lanes and idled three quarters of them on every workgroup;
-/// an 8-element region launched 256 lanes for 8 stores.
-///
-/// The ceiling is [`fusor2_tile::domains::emitted_block`] at a lane group of
-/// one — the single source of the default width, shared with the fold domain
-/// that prices it and with the CPU backend, so the policy number lives beside
-/// `BLOCK_CHOICES` rather than being re-spelled here. Past it the
-/// guard-per-segment shape stops paying anyway: every workgroup evaluates
-/// every segment's guard, so a wider group buys idle lanes, not occupancy.
+/// device allows. The ceiling is [`fusor2_tile::domains::emitted_block`],
+/// shared with the fold domain.
 pub fn block_for(caps: &Caps, lanes: u64) -> u32 {
     let cap = fusor2_tile::domains::emitted_block(1, caps)
         .min(caps.limits.max_compute_workgroup_size[0])
@@ -110,7 +86,7 @@ fn tiling_of(theta: SchedPoint) -> Result<MapTiling> {
     }
 }
 
-/// Contract-shaped entry point (see CONTRACTS.md §4.10).
+/// Lowering entry point.
 pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     let fusor2_ir::ir::Op::L1(op) = &node.op else {
         return Err(Error::Plan("region got a foreign node".into()));

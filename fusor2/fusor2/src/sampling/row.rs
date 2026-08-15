@@ -2,8 +2,6 @@
 //! from: a descending sort with the declared tie rule, prefix scans, and the
 //! weighted pick.
 //!
-//! Owned by W13.
-//!
 //! # Why this is matmul and dense constants rather than broadcasts
 //!
 //! Every shape here is either `[n, 1]`, `[1, n]` or `[n, n]`, and every
@@ -16,10 +14,8 @@
 //! that is fixed in the two `lower` crates, anything built on `broadcast_as`,
 //! `expand` or `repeat` is silently wrong, so nothing here uses them.
 //!
-//! The cost is `O(V^2)` work for a vocabulary of `V`, against the reference's
-//! chunked `O(V log V)` bitonic pass. That is fine for the conformance
-//! vocabularies and wrong for a real one; see the module note on
-//! [`sort_desc`].
+//! The cost is `O(V^2)` work for a vocabulary of `V`. This works fine for
+//! the conformance vocabularies; see the module note on [`sort_desc`].
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, Weak};
@@ -30,17 +26,14 @@ use crate::graph::{GraphInner, GraphRef};
 use crate::tensor::Tensor;
 use crate::{Dim, Dtype, Error, Result};
 
-/// The sentinel a non-finite logit is replaced by, matching the reference's
-/// `NEG_MAX_F32`. It sorts below every real logit and its `exp` underflows to
-/// zero, so such a token can never be drawn.
+/// The sentinel a non-finite logit is replaced by. It sorts below every real
+/// logit and its `exp` underflows to zero, so such a token can never be drawn.
 pub(crate) const NEG_MAX: f32 = -f32::MAX;
 
-/// Guards a division by an all-zero weight total, as the reference's
-/// `epsilon` does.
+/// Guards a division by an all-zero weight total.
 pub(crate) const EPSILON: f32 = 1.0e-20;
 
-/// The reference's `GPU_SAMPLER_PREVIOUS_TOKENS`: how far back the repetition
-/// penalty looks.
+/// How far back the repetition penalty looks.
 pub(crate) const PREVIOUS_TOKENS: usize = 64;
 
 pub(crate) fn dims(v: &[u64]) -> Vec<Dim> {

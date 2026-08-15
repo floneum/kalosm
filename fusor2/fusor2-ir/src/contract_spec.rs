@@ -5,8 +5,6 @@
 //! `fusor2-tile`'s contraction domains. `matmul`, `mat_mul_transposed_rhs` and
 //! every batched form differ only in the spec, so this module is the whole of
 //! "transposed-rhs is a spec, not an op".
-//!
-//! Owned by W1.
 
 use crate::error::{Error, Result};
 use crate::ir::level0::{EinSpec, Label};

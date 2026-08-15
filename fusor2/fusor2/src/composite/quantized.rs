@@ -21,16 +21,13 @@
 //! `qrepack` — already priced — is the bridge. No byte-addressed load and no
 //! format-specific alignment code appears here.
 //!
-//! An f16 scale is **not** part of that gate, though it used to be believed to
-//! be: see [`f16_lane`], which decodes a half out of a word in pure
-//! `ScalarExpr` arithmetic. The half-word offset it needs is [`scale_field`],
-//! the 2-aligned counterpart of [`field_word`].
+//! An f16 scale is **not** part of that gate: see [`f16_lane`], which decodes
+//! a half out of a word in pure `ScalarExpr` arithmetic. The half-word offset
+//! it needs is [`scale_field`], the 2-aligned counterpart of [`field_word`].
 //!
 //! No format constant is written here. Block strides come from
 //! `QFmt::block_bytes`, field offsets from `fusor2_gguf::blocks::block_fields`
 //! — the crate that parses the files and is where format knowledge stops.
-//!
-//! Owned by W13.
 
 use fusor2_autograd::tape::TapeExt;
 use fusor2_ir::Result;
@@ -63,8 +60,8 @@ fn field_word(byte_offset: u32) -> Option<u64> {
 ///
 /// **No format knowledge**: it is `offset / 4` and `(offset % 4) / 2`. An f16
 /// field only has to be 2-aligned, which is why this is not [`field_word`];
-/// that difference is the whole reason [`QLayout::Native`] used to be
-/// unreachable at the offset level, on top of the arithmetic reason
+/// that difference is what keeps [`QLayout::Native`]
+/// reachable at the offset level, on top of the arithmetic reason
 /// [`f16_lane`] solves.
 fn scale_field(byte_offset: u32, is_f16: bool) -> Option<(u64, Option<u32>)> {
     if is_f16 {
@@ -121,10 +118,10 @@ fn scaled(q: ScalarExpr, bias: f32, scale_word: ScalarExpr) -> ScalarExpr {
 /// One IEEE-754 binary16 lane of `word`, as an `f32`, in pure scalar
 /// arithmetic.
 ///
-/// This is what the module note used to say did not exist: "f16 scales have no
-/// `Map` spelling", which kept every [`QLayout::Native`] row on a
-/// `BlockProgram`. The obstacle was never expressiveness — it was reaching for
-/// the wrong primitive. `Unpack2x16Float` yields a two-lane *vector*, and
+/// This is the `Map` spelling of an f16 scale — the thing that keeps a
+/// [`QLayout::Native`] row off a
+/// `BlockProgram`. The trick is reaching for
+/// the right primitive: `Unpack2x16Float` yields a two-lane *vector*, and
 /// picking a lane needs `VecComponent`, which exists only at L2; `ScalarExpr`
 /// is scalar by construction and has no projection.
 ///

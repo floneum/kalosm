@@ -6,8 +6,6 @@
 //! argmax, that a `top_k`/`top_p` filter can never return a token outside the
 //! surviving set, and that the pending forms hand back a device tensor rather
 //! than a host round trip.
-//!
-//! Owned by W14.
 
 use fusor2::sampling::mirostat2::Mirostat2Sampler;
 use fusor2::sampling::standard::{StandardSamplerParams, sample};

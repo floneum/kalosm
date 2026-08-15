@@ -1,11 +1,7 @@
 //! `relu`, `sigmoid`, `silu`, `gelu`, `tanh_exact`, `softplus`. Each is one
 //! `Map` with a different `ScalarExpr`; none is a kernel.
 //!
-//! There is no activation opcode here and no activation node in the IR. The
-//! reference's 50-variant `NaryOp` discriminant — whose ordering it admits is
-//! load-bearing in kernel cache keys — has nothing to be an ordering of.
-//!
-//! Owned by W13.
+//! There is no activation opcode here and no activation node in the IR.
 
 use fusor2_autograd::tape::splat_of;
 use fusor2_ir::dtype::Dtype;
@@ -18,8 +14,7 @@ use crate::tensor::Tensor;
 const GELU_C: f32 = 0.797_884_56;
 /// The cubic term's coefficient.
 const GELU_K: f32 = 0.044_715;
-/// WGSL `tanh` overflows f32 past roughly 88; the reference clamps at 15,
-/// which is already saturated to 1.0 in f32.
+/// Clamp value to avoid numerical issues with `tanh`.
 const TANH_CLAMP: f32 = 15.0;
 
 fn lit(dtype: Dtype, v: f32) -> Result<ScalarExpr> {

@@ -3,8 +3,6 @@
 //! make one of them legal. `sliding_window_view` is the one exception: it
 //! mints `L0::Window`, because its adjoint is decided by two integers and
 //! injectivity of a relative stride composition is undecidable under `Sym`.
-//!
-//! Owned by W12.
 
 use std::ops::Range;
 
@@ -96,8 +94,7 @@ impl Tensor {
     ///
     /// Refuses a target whose element count disagrees, and refuses to merge
     /// axes across a symbolic extent (the merged size would not be a `Dim`).
-    /// Like the reference's `Layout::reshape`, correctness relies on the value
-    /// being contiguous over each merged group.
+    /// Correctness relies on the value being contiguous over each merged group.
     pub fn reshape(&self, shape: &[Extent]) -> Result<Tensor> {
         let target = self.resolve_extents(shape)?;
         let specs = reshape_specs(&self.shape(), &target)?;

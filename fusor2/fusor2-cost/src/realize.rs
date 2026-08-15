@@ -5,13 +5,6 @@
 //! dependency). Consumer counts come from the DAG,
 //! which is what makes rematerialization priced exactly as
 //! `saved_write + saved_reads - recompute * (consumers - 1)`.
-//!
-//! There is **no duplication veto anywhere in this file**. The reference's
-//! `variant_duplicates_required_producer` is deleted, not weakened: a producer
-//! read by two consumers may be inlined into both and pays its recompute
-//! twice, against the saved write and the two saved reads.
-//!
-//! Owned by W7.
 
 use fusor2_ir::cost::{CostModel, LaunchPlan, Picoseconds};
 use fusor2_ir::device::Caps;
@@ -528,8 +521,8 @@ pub const fn scalar_element(d: Dtype) -> ScalarElement {
 /// node. Both emitters allocate one scratch tile of
 /// [`fusor2_ir::ir::level1::emitted_block`] elements **per lane**, so a
 /// promoted carrier's scratch is `lanes` times a scalar fold's and a call that
-/// passes `1` under-counts it by exactly that factor. That under-count is what
-/// let `verify_plan` admit a plan the GPU then refused to lower.
+/// passes `1` under-counts it by exactly that factor. That under-count lets
+/// `verify_plan` admit a plan the GPU then refuses to lower.
 pub fn tiles_for(
     theta: Option<SchedPoint>,
     elem: ScalarElement,
@@ -607,9 +600,8 @@ fn fold_lane_group(theta: Option<SchedPoint>, caps: &Caps) -> u32 {
         // promoted lowerings read `_ => max_block` for a point that is not a
         // fold strategy, so a `ScheduleDomain::Point` fold closes over the
         // whole workgroup and stages `lanes * block * acc_bytes`. Reporting 1
-        // here used to be harmless because `fold_scratch_bytes` ignored the
-        // distinction; now that a one-lane group means "stages nothing", it
-        // would under-count a `Point` fold's footprint to zero and admit a
+        // here — a one-lane group means "stages nothing" — would under-count
+        // a `Point` fold's footprint to zero and admit a
         // plan the emitter cannot lay out. Over-counting on a subgroup device
         // is the safe direction and costs only an unselected alternative.
         _ => fusor2_ir::ir::level1::emitted_block(1, caps),
@@ -1229,10 +1221,9 @@ pub fn domain_of(graph: &EGraph, id: Id) -> Option<&ScheduleDomain> {
 
 // ---------------------------------------------------------------------------
 
-/// Test-only stand-ins for the crates that are still mid-flight: a total
+/// Test-only stand-ins: a total
 /// [`Semantics`], a trivial exact [`ArenaPlanner`] and a linear
-/// [`CostModel`]. They live here rather than in a shared file because W7 owns
-/// no module list; every test module in this crate reaches them through
+/// [`CostModel`]. Every test module in this crate reaches them through
 /// `crate::realize::testkit`.
 #[cfg(test)]
 pub(crate) mod testkit {
@@ -1556,10 +1547,9 @@ pub(crate) mod testkit {
                 // Uniform across sgemv points, deliberately: fresh
                 // candidates are stable-sorted by this prior, so any
                 // per-point variation reorders the belief-ordered offer
-                // ahead of measurement — the same tie-break defect the
-                // offer-order fix removed. The axis that used to vary it
-                // (`chunk`) never reached a lowering; 32 is what the whole
-                // seed front priced at when it was `4 * chunk` at chunk 8,
+                // ahead of measurement. `chunk` never reaches a lowering,
+                // so it must not vary this; 32 is what the whole
+                // seed front priced at,
                 // measured adopting the right cells.
                 Some(SchedPoint::Sgemv(_)) => 1_000 + 32,
                 Some(SchedPoint::Map(t)) => 1_000 + 1_000 * t.tm.max(1) as u64,
@@ -1778,11 +1768,10 @@ mod tests {
     /// into its consumer, because a launch is lowered from one node and the
     /// emitters cannot inline a second member.
     ///
-    /// CHANGED ASSERTION — the seeded chain previously asserted
-    /// `components.len() == 1`. That is the M3 fusion goal and it is **not**
-    /// satisfied: it is blocked on emitter-side inlining of a multi-member
+    /// The seeded chain does **not** assert `components.len() == 1`: that
+    /// fusion goal is blocked on emitter-side inlining of a multi-member
     /// launch. The first half of this test pins the cut semantics that do
-    /// still hold; the second pins what the seed now guarantees.
+    /// hold; the second pins what the seed guarantees.
     #[test]
     fn a_chain_of_maps_is_one_launch_when_m_allows_it() {
         let (graph, roots) = chain_graph(3);

@@ -30,24 +30,14 @@
 //!
 //! There is no reader-count check and no duplication veto. If a producer is
 //! read twice, both readers may absorb it and the pricing crate charges the
-//! recompute once per reader against the write and the reads it deletes —
-//! exactly what the reference's duplication ledger measures and then
-//! discards. `KRegion` is the same rewrite with `live_outs` non-empty.
+//! recompute once per reader against the write and the reads it deletes.
+//! `KRegion` is the same rewrite with `live_outs` non-empty.
 //!
 //! Elementwise-into-elementwise is `ScalarExpr::compose`, a tree
 //! substitution — but **nothing calls it at construction**, so it is a rule
 //! here too: [`MAP_INTO_MAP`], the same law with a `KMap` in the consumer
-//! position. This header used to say the frontend composed inside the `Map`
-//! constructor; it does not and never did (`compose` has no caller outside
-//! this crate's rules), so `Map{exp}(Map{sub}(s, m))` reached extraction as
-//! two nodes and a launch is lowered from **one** node. Three of
-//! `attention_forward`'s eight dispatches were consecutive elementwise maps
-//! over one `[B, H, Lq, Lk]` space.
-//! `rules::tests::elementwise_into_elementwise_needs_no_rule` states both
-//! halves: no `L0::Map`-headed rule mints a second `L0::Map`, and the `KMap`
-//! chain does fuse.
-//!
-//! Owned by W2.
+//! position. `Map{exp}(Map{sub}(s, m))` is lowered from one node at L1 as a
+//! `KMap`.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
 use crate::ir::level1::{AccessPlan, ContractSide, IndexSpace, L1, MapDomain, Operand, ScheduleDomain};
@@ -894,13 +884,13 @@ pub fn map_into_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>
 ///
 /// # Why the producer's own arity is not a condition
 ///
-/// It used to be. This rule required `inner.ops.len() == 1`, because a side
-/// was exactly one [`Operand`] and there was nowhere to put a second edge —
-/// which made the *one* producer worth absorbing permanently ineligible. The
+/// Requiring `inner.ops.len() == 1` would make the *one* producer worth
+/// absorbing permanently ineligible. The
 /// GGUF block decode reads its block stream through several `Restride` views
 /// at once (quant plane, block scale, block minimum, group scales), so it
-/// arrives here with nine operands and no rewrite collapses them to one. The
-/// guard did not restrict absorption to safe cases; it excluded the case.
+/// arrives here with nine operands and no rewrite collapses them to one. Such
+/// a guard would not restrict absorption to safe cases; it would exclude the
+/// case.
 ///
 /// With [`ContractSide`] holding a list the producer's operands simply join
 /// the side's, and the quantized staging fill stops being a backend special

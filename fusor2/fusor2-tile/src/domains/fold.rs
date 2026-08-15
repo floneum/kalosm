@@ -1,14 +1,6 @@
 //! The reduction schedule domain. Workgroup width, lane-group width and
-//! staging depth are *coupled* — the reference's staging gate is
-//! `k.div_ceil(k_group) <= work_per_thread`, a function of the lane group
-//! the two earlier greedy formulas already fixed — so they are one
-//! enumeration scored together rather than three formulas applied in
-//! sequence.
-//!
-//! Replaces `static_axis_block` (row_program.rs:895), `lane_group_width`
-//! (:916) and the register-staging gate (:1902).
-//!
-//! Owned by W4.
+//! staging depth are *coupled* — they are one enumeration scored together
+//! rather than three formulas applied in sequence.
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::ir::level1::{FoldDomain, FoldStrat};
@@ -412,10 +404,10 @@ mod tests {
     /// survive rather than that none do. A one-lane group stages nothing —
     /// every invocation owns a whole output row and reduces the axis into its
     /// own accumulator, so the merge is over a group of one — and that is the
-    /// row-per-lane strategy this module's doc used to say needed a
-    /// `FoldStrat` variant it could not add. It does not: `WgTree { lane_group:
-    /// 1 }` already spells it and both emitters already lower it, they simply
-    /// allocated the scratch anyway. `fold_scratch_bytes` reports 0 for it now.
+    /// row-per-lane strategy. No new `FoldStrat` variant is needed: `WgTree {
+    /// lane_group:
+    /// 1 }` already spells it and both emitters lower it.
+    /// `fold_scratch_bytes` reports 0 for it.
     ///
     /// The assertion that matters is that **nothing needing a cross-lane close
     /// survives**: admitting one of those would mint a `verify_plan` crash.

@@ -6,8 +6,6 @@
 //! the k-loop prologue and epilogue; when the device cannot host a
 //! mixed-precision cooperative store the accumulator stages through a
 //! workgroup tile with a per-lane cast — footprint, never correctness.
-//!
-//! Owned by W9.
 
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
@@ -28,7 +26,7 @@ use fusor2_ir::target::LowerCtx;
 
 use crate::lower::{Ctx, DimBinding, StagedSource, distribute_workgroups, scalar_element};
 
-/// Contract-shaped entry point (see CONTRACTS.md §4.10).
+/// Lowering entry point.
 pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     let fusor2_ir::ir::Op::L1(op) = &node.op else {
         return Err(Error::Plan("contract was handed a foreign node".into()));
@@ -109,14 +107,8 @@ fn shape_of(ctx: &Ctx<'_>, op: &L1) -> Result<Shape> {
     })
 }
 
-/// Grid swizzle group along M.
-///
-/// The reference branches on two private byte constants (`LLC_CLASS`,
-/// `SMALL_B`) unrelated to `Device::last_level_cache_bytes()`. Here the group
-/// is a pure function of the plan-carried geometry: the number of M blocks one
-/// traversal of the N blocks keeps resident. When `SchedPoint::Coop` grows the
-/// `swizzle` field W6/W7 compute from `llc_bytes`, this reads that instead —
-/// see `needsFromOthers`.
+/// Grid swizzle group along M: the number of M blocks one traversal of the N
+/// blocks keeps resident, computed from the plan-carried geometry.
 pub fn swizzle_group_m(geom: CoopGeom, n: u32) -> u32 {
     let n_blocks = n.div_ceil(geom.bn.max(1)).max(1);
     n_blocks.clamp(1, 8)
@@ -203,11 +195,11 @@ impl CoopShape {
 /// `splits > 1` is **refused**, not lowered. A split contraction is two
 /// launches — `splits` partial slices, then a combine — and `GpuTarget` builds
 /// exactly one artifact per plan launch: `build_one` takes `kernels.remove(0)`
-/// and drops the rest on the floor. The combine that used to be built here
-/// therefore never ran once, and what came back was the `k / splits`-long
-/// prefix of the reduction wearing the answer's shape. Measured on a plain
-/// `[65,1024] x [1024,96]`, where cost picks `splits: 64`: every one of 6240
-/// elements wrong. Restoring it needs `GpuTarget::build_one` (and the
+/// and drops the rest on the floor. A combine built here would never run,
+/// and what came back would be the `k / splits`-long
+/// prefix of the reduction wearing the answer's shape — on a plain
+/// `[65,1024] x [1024,96]`, where cost picks `splits: 64`, every one of 6240
+/// elements wrong. Supporting it needs `GpuTarget::build_one` (and the
 /// `LaunchWork` queue behind it) to launch every kernel `lower_node` returns,
 /// in order, sharing one buffer binding — and then a combine that reads
 /// `splits` slices of `batch * padded_m * padded_n` elements each, applies
@@ -1101,10 +1093,8 @@ pub fn lower_sgemm(ctx: Ctx<'_>, op: &L1, p: SgemmParams) -> Result<KernelIr> {
 /// point that reaches the always-legal generic body is one output element per
 /// lane, at the widest workgroup the *device* admits.
 ///
-/// Both used to be **parameters** of `contract_rows`, which took a
-/// `_theta` it never read: the caller passed a written-in `256` and
-/// `lower_sgemm` recomputed the lane count beside the point that already
-/// implied it, so nothing stopped a caller pairing one point's `tn` with
+/// Deriving both from `theta` here, rather than taking them as parameters,
+/// stops a caller pairing one point's `tn` with
 /// another point's block width.
 fn row_tiling(theta: SchedPoint, caps: &Caps) -> (u32, u32) {
     let max_lanes = caps.limits.max_compute_invocations_per_workgroup.max(1);
@@ -1330,10 +1320,10 @@ pub fn lower_sgemv(mut ctx: Ctx<'_>, op: &L1, p: SgemvParams) -> Result<KernelIr
     // side's `pre` combines them.
     // Staged sources at the same matrix split the other families use: A is
     // `[batch * m, k]` and B is `[batch * k, n]`, whatever ranks those
-    // extents are spread across. It used to split every operand at axis 1
-    // (`matrix_view(o, 1)`) and address B with no batch term at all, so any
-    // batched contraction summed the wrong operands — the member sweep is
-    // what surfaced it. A quantized operand decodes at the same coordinates
+    // extents are spread across. Splitting every operand at axis 1
+    // (`matrix_view(o, 1)`) and addressing B with no batch term would make
+    // any batched contraction sum the wrong
+    // operands. A quantized operand decodes at the same coordinates
     // through `contract_stage_source`, which is the M = 1 decode family.
     let a_rows = shape.batch.saturating_mul(shape.m).max(1);
     let b_rows = shape.batch.saturating_mul(shape.k).max(1);
@@ -1529,11 +1519,10 @@ pub fn lower_sgemv(mut ctx: Ctx<'_>, op: &L1, p: SgemvParams) -> Result<KernelIr
 
     // The loop advances `block * vector` elements of k per iteration — that
     // is the stride the body actually indexes with — so that is what the
-    // count divides by. It used to divide by `chunk` as well, while no term
-    // in the body ever multiplied by it: every `chunk > 1` point summed the
-    // first `1/chunk` of the reduction and silently dropped the rest. The
-    // member sweep caught it the first time it ran; nothing else ever had,
-    // because extraction never picked those points for a value-checked case.
+    // count divides by. Dividing by `chunk` as well — no term
+    // in the body ever multiplies by it — would make every `chunk > 1` point
+    // sum the
+    // first `1/chunk` of the reduction and silently drop the rest.
     // `chunk` stays a schedule knob in name only until a kernel gives it a
     // meaning the body honors.
     let chunks = shape.k.div_ceil((block * vector).max(1)).max(1);

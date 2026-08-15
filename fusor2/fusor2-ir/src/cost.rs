@@ -13,10 +13,7 @@ use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 
-/// Modelled time in picoseconds. One scalar, not a lexicographic tuple: the
-/// reference's own unit test shows the tuple gives the wrong verdict, and
-/// its own doc concedes dispatches are 0.2% of modelled time while the
-/// tuple will pay unbounded bandwidth to remove one.
+/// Modelled time in picoseconds. One scalar, not a lexicographic tuple.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Picoseconds(pub u64);
 

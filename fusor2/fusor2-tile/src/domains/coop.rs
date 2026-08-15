@@ -6,14 +6,9 @@
 //! determines the output's padded strides and therefore every consumer's
 //! read traffic.
 //!
-//! The reference's nine-row `COOP_TILE_TABLE` is **generated**, not ported:
-//! every `(bm, bn, bk, subgroups, n_passes)` whose closed-form subgroup
+//! Every `(bm, bn, bk, subgroups, n_passes)` whose closed-form subgroup
 //! split exists, whose lanes fit, and whose *exact* arena footprint fits is
-//! a candidate. The `padded_macs * 4 > useful_macs * 5` routing guard and
-//! the `single_buffered` exclusion are deleted — padded MACs already enter
-//! the issue term.
-//!
-//! Owned by W4.
+//! a candidate.
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::Dtype;
@@ -134,65 +129,8 @@ static GEOM_MEMO: crate::domains::DomainMemo<
     SmallVec<[CoopGeom; 16]>,
 > = crate::domains::DomainMemo::new();
 
-/// # MEASURED: no cost term ranks these, and no analytical term fixed it
-///
-/// Every one of the ~5,700 points this domain carries prices **identically**
-/// under the shipped cost model. `math_ps` counts MACs, which a tiling does not
-/// change; `dram_ps` reads a reread factor derived from the index space, which
-/// a tiling does not change either. So the seed takes the argmin by domain
-/// index — whatever this function emits first — and no `RESCHEDULE` can tell
-/// the difference to move off it. A 2048-cube matmul runs at `bm=16, bn=16`.
-///
-/// The tile is worth real time. Measured by pinning one geometry at a time
-/// through [`PIN_ENV`] on an Apple M2 Max, f32, against this workspace's
-/// `vs_fusor1` example (median ms):
-///
-/// | geom | `matmul` 2048-cube | attention `[1,8,1024,64]` |
-/// |---|---|---|
-/// | `16x16x8`   | **20.5** | 12.96 |
-/// | `32x32x8`   | 21.2 | 17.13 |
-/// | `64x64x8`   | 59.9 | 39.56 |
-/// | `64x64x16`  | 102.7 | **7.91** |
-/// | `128x64x8`  | 42.8 | **7.90** |
-/// | `128x128x8` | 38.6 | 9.51 |
-///
-/// **The optimum is shape-dependent and the two orderings are inverted**: the
-/// square matmul wants the narrowest tile in the set, attention one of the
-/// widest. That is why every analytical term tried against these numbers
-/// failed — four of them, each either tying (changing nothing) or regressing
-/// matmul by 2-3x: a blocked-GEMM reread count charged to `dram_ps`
-/// (matmul 20 -> 41 ms), a per-tile roofline in `node_math` (20 -> 35 ms, and
-/// it moved `argmin_member`'s *family* choice because the lower bound is built
-/// on `node_math`), the same term in the exact launch cost (no change, the
-/// tile never moved), and a device-wide `max(compute, load)` (20 -> 41 ms and
-/// Coop abandoned entirely).
-///
-/// # The trap, and why a measured table is not a drop-in either
-///
-/// Reordering this domain so a measured winner sits first was built and
-/// measured too, and it **flips the family**: putting `128x64x8` first makes
-/// the seed adopt that point, the exact cost then prefers `Sgemv` over the
-/// whole `Coop` node, and attention's `1024x1024x64` contraction — Coop at
-/// baseline — lands on a matrix-*vector* kernel. So the pin sweep above is not
-/// measuring tiles in isolation; part of that 12.96 -> 7.90 is a family flip.
-///
-/// The conclusion is that **selection here is not a tile problem, it is a
-/// ranking problem across tiles and families at once**, and the cost model can
-/// separate neither. The field's answer is measurement: PyTorch Inductor's
-/// `max-autotune` and Triton's `@triton.autotune` benchmark every candidate and
-/// cache the winner; TVM/Ansor learns an XGBoost model over 164 features;
-/// Halide's auto-scheduler uses 27 hand-built terms with *learned*
-/// coefficients. The one analytical model that ranks GEMM tiles well —
-/// tritonBLAS, arXiv:2512.04226, at 94.7% of exhaustive search — needs a
-/// two-level cache-hit-rate model with per-level bandwidths and a wave/tail
-/// occupancy term. `DeviceFacts` carries one `llc_bytes` and one
-/// `dram_bytes_per_us` and cannot express it.
-///
-/// Landing this properly means autotuning at the *plan* level — time the
-/// candidate plans, not the candidate tiles — so the family and the geometry
-/// are ranked by the same measurement, keyed by caps fingerprint the way
-/// `fusor2_cost::tune_cache` already keys its verdicts. Ordering this list
-/// alone is not enough.
+/// Every one of the ~5,700 points this domain carries is generated as a candidate.
+/// The optimum is shape-dependent.
 fn candidate_geoms_for(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopGeom; 16]> {
     let key = (
         cx.caps.clone(),
@@ -275,28 +213,7 @@ pub const fn stage_element(operand: Dtype) -> ScalarElement {
 /// The workgroup tiles one staged operand pair declares: a `bm x (bk + 1)`
 /// A tile and a `bk x (bn / n_passes + 1)` B tile, each less the pad after
 /// its final row, which is never addressed. The `+1` is the shared-memory
-/// bank-conflict pad, verbatim from `DenseCoopMatmulTile::stage_pair_elements`.
-///
-/// **This is not the tile set the emitters lay out, and the comment that
-/// said it was, was wrong.** `verify_l1::coop_tiles` is the documented single
-/// source — `check_schedule_domain` and `semantics::work` both call it, and
-/// `fusor2-gpu`'s `lower_coop` now declares exactly its shapes: an unpadded
-/// `[bm, bk]` A tile and `[bk, bn_pass]` B tile, **replicated `staging`
-/// times**, plus an f32 accumulator tile when the store element is narrower.
-/// Two consequences, in opposite directions:
-///
-/// - at `staging == 1` this formula is the *stricter* of the two (it charges
-///   `bm + bk - 2` elements of bank pad the emitter does not allocate), so
-///   every geometry it admits does fit;
-/// - at `staging == 2` it is the *looser* one by nearly 2x, so a geometry
-///   admitted here can be one `check_schedule_domain` rejects and one whose
-///   arena the emitter cannot pack.
-///
-/// Nothing exercises the second case today — every coop point the conformance
-/// suite resolves is `staging: 1` at `16x16x8` — and closing it means
-/// filtering the geometry list at the deepest staging depth the domain will
-/// offer, which moves the admitted set for every contraction on the device.
-/// That is a measurement, not a patch, so it is stated rather than done.
+/// bank-conflict pad.
 pub fn coop_tiles(geom: CoopGeom, stage: ScalarElement) -> Tiles {
     let bn_pass = geom.bn / geom.n_passes.max(1);
     let a_elems = geom.bm * (geom.bk + 1) - 1;

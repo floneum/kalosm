@@ -4,8 +4,6 @@
 //!
 //! Every rule here is `Additive`: the unrewritten form stays live in the same
 //! chain, and which one runs is decided once, later, by extraction.
-//!
-//! Owned by W2.
 
 use crate::dtype::{Dtype, RoundMode, Splat};
 use crate::egraph::{Builder, Facts, Id, RuleTag};
@@ -154,8 +152,8 @@ pub fn strip(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<
 /// split-K and no block loop at any length the trainer or the conformance
 /// matmul and attention cases use. What replaces it is smaller and is a device
 /// fact rather than a constant — see the bound in the body — and the block
-/// count is a set of competing alternatives rather than the one divisor the
-/// rule used to pick. Both are stopgaps for `FoldDomain::blocks`; neither is
+/// count is a set of competing alternatives rather than one pre-picked
+/// divisor. Both are stopgaps for `FoldDomain::blocks`; neither is
 /// part of the law.
 ///
 /// **Every operand is blocked.** A fold is multi-operand now, so the law's

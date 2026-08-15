@@ -1,16 +1,14 @@
 //! The three local-search moves and their incremental deltas.
 //!
 //! Each move's delta is recomputed over only the affected launches, via a
-//! union-find over the realized cut. **The accept test is always the exact
-//! global cost** — the schedule score orders the `RESCHEDULE` frontier, it
-//! never gates candidates, so the full ~8,300-point domain stays reachable.
+//! union-find over the realized cut. The accept test is always the exact
+//! global cost — the schedule score orders the `RESCHEDULE` frontier, it
+//! never gates candidates, so the full domain stays reachable.
 //!
 //! `FLIP` is refused when the node is pinned: an `Effect::InPlace` node is
 //! pinned in `M`, because inlining an atomic scatter into two consumers
-//! doubles the embedding gradient. Purity is a *precondition* of the
-//! materialization move, not an afterthought.
-//!
-//! Owned by W7.
+//! doubles the embedding gradient. Purity is a precondition of the
+//! materialization move.
 
 use crate::realize::{self, Realized};
 use fusor2_ir::cost::{CostModel, Picoseconds};

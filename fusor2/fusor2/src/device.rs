@@ -127,13 +127,10 @@ impl Device {
 
     /// The device a value in `graph` was built from.
     ///
-    /// [`crate::Tensor::device`] used to hand back [`Backend`] — a *different
-    /// type* than the `&Device` its constructors take, so `Tensor::zeros(t.device(), ..)`
-    /// did not type-check. A value knows its graph, a graph knows its session
-    /// and a session knows its backend, so the device is recoverable exactly;
-    /// the `Arc<Inner>` this mints wraps the very same session and the very
-    /// same graph handle, so it is the same device by every observable — only
-    /// the wrapper is new.
+    /// A value knows its graph, a graph knows its session and a session knows
+    /// its backend, so the device is recoverable exactly; the `Arc<Inner>` this
+    /// mints wraps the very same session and the very same graph handle, so it
+    /// is the same device by every observable.
     pub(crate) fn of_graph(graph: &GraphRef) -> Self {
         let inner = Arc::new(Inner {
             session: graph.session().clone(),
@@ -153,13 +150,11 @@ impl Device {
     /// cost-*identical* class members, and `L1::KScatter`'s `ScatterMode`s are
     /// exactly that — an `OpDef`'s `work` is a function of operand and output
     /// facts only, so the mode is invisible to the cost model and both price
-    /// the same. There used to be four, and one of them,
-    /// `ScatterMode::OneHotContract`, had no lowering on either backend, so
-    /// which member the tie-break landed on decided whether an unrelated
-    /// test's backward compiled at all: adding seven ambient-graph tests to
-    /// `HEAD`, with no library change, was enough to turn `trainer_surface`'s
-    /// f16 convolution backward red. That member is deleted; the tie-break is
-    /// now between two spellings of one kernel.
+    /// the same. Every member here must therefore lower on both backends: a
+    /// mode without a lowering would let which member the tie-break landed on
+    /// decide whether an unrelated
+    /// test's backward compiled at all. The tie-break is
+    /// between two spellings of one kernel.
     ///
     /// A unit test of the const-rank *wrapper* has no business depending on
     /// that, so it gets its own session and graph. Tests that are genuinely
@@ -315,17 +310,13 @@ impl KernelProfile {
 ///
 /// [`Device::cpu`] is one device, one [`Session`] and one e-graph for the
 /// whole process, so every `#[test]` that resolves through it is a concurrent
-/// user of one graph. That used to be a correctness hazard as well as a
-/// determinism one: `Session::resolve` held the e-graph lock for saturation
-/// and extraction and then dropped it before dispatching, so two threads
-/// interleaved and a readback could observe a device buffer before the plan
-/// that fills it had run — coming back **zero-filled rather than erroring**.
-/// Measured then: 4 bad readbacks in 640 across 8 threads.
-///
-/// That defect is fixed. `GraphInner::resolve_lock` now makes a whole
+/// user of one graph. `GraphInner::resolve_lock` makes a whole
 /// resolve — and a `read_back`'s resolve *and* readback together — one
-/// section, and `the_shared_device_survives_concurrent_resolves` drives the
-/// same 8-thread load as an assert rather than as a measurement.
+/// section: dropping the e-graph lock between extraction and dispatch would
+/// let two threads interleave and a readback observe a device buffer before
+/// the plan that fills it has run — coming back **zero-filled rather than
+/// erroring**. `the_shared_device_survives_concurrent_resolves` drives an
+/// 8-thread load as an assert.
 ///
 /// This lock remains for what it was always additionally doing: keeping tests
 /// that assert on *shared* device state (the ambient graph, launch counts)
@@ -378,7 +369,8 @@ mod tests {
     /// `Device::cpu()` installs its graph on every call, not only the first.
     ///
     /// The cache (`CPU.get_or_init`) builds the device once, and `Inner::new`
-    /// is the only other installer, so a second `cpu()` used to return the CPU
+    /// is the only other installer; installing only on the first call would
+    /// have a second `cpu()` return the CPU
     /// device while leaving whatever graph was installed last ambient. Then
     /// `Graph::new()` and `Tensor::from_slice(&cpu, ..)` name different graphs
     /// and every op across them errors.
@@ -410,10 +402,10 @@ mod tests {
     /// The const-rank API shares one `Session` and one e-graph process-wide,
     /// so two threads computing on it are two threads resolving one graph.
     ///
-    /// This is the load that used to produce silent zeros: `resolve` released
-    /// the e-graph lock between extraction and dispatch, and a readback landing
-    /// in that window found an allocated-but-unwritten buffer, saw nothing in
-    /// flight, and downloaded it. Every value here is checked against the
+    /// This is the load that produces silent zeros if `resolve` releases
+    /// the e-graph lock between extraction and dispatch: a readback landing
+    /// in that window finds an allocated-but-unwritten buffer, sees nothing in
+    /// flight, and downloads it. Every value here is checked against the
     /// arithmetic that produced it, so a zero-filled readback is a failure and
     /// not a rounding question.
     ///

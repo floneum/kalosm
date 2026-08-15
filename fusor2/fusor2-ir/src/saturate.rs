@@ -3,8 +3,6 @@
 //! offers only [`RuleTag::StrictlyLowering`] rules, guaranteeing every chain
 //! provably reaches a runnable L1 form — budget exhaustion yields a
 //! degraded-but-valid plan, never a hard error. Truncation is never silent.
-//!
-//! Owned by W2.
 
 use crate::device::Caps;
 use crate::egraph::{
@@ -295,9 +293,7 @@ mod tests {
         (g, vec![prod, f])
     }
 
-    /// The shipped budget. Kept as a named helper because the tests below
-    /// used to need a wall clock generous enough for a debug build; the
-    /// budget has no clock in it any more, so there is nothing to relax.
+    /// The shipped budget.
     fn untimed() -> SaturationBudget {
         SaturationBudget::default()
     }
@@ -412,14 +408,7 @@ mod tests {
     }
 
     /// Saturation is a pure function of `(graph, caps, rules, budget)`.
-    ///
-    /// It was not: the shipped budget carried a 2 ms deadline, and a
-    /// `rms_norm` of five lines truncated at 96 of its 134 nodes at a
-    /// different node every run. Which alternatives exist then depends on
-    /// machine load, and so does the `PlanHash` the cross-process plan cache
-    /// is keyed on. Every budget term is a count now, so this holds by
-    /// construction — and the report proves it, because the run that reports
-    /// the larger `micros` reports the same everything else.
+    /// Every budget term is a count, so this holds by construction.
     #[test]
     fn saturation_is_deterministic_under_any_wall_time() {
         let caps = ts::caps();
@@ -460,21 +449,9 @@ mod tests {
         }
     }
 
-    /// ARCHITECTURE.md's acyclicity claim, checked rather than assumed.
-    ///
-    /// **It does not hold structurally, and this test says which rule breaks
-    /// it.** `form_kregion` can, and cannot be fixed by a guard: it mints
-    /// `KRegion { members: [producer, fused] }` acyclically, and then
-    /// `map_into_fold` unions that same hash-consed `fused` into the class
-    /// *afterwards*, retroactively making the region name its own class. Any
-    /// rule that names a node which a later union may pull into the reader's
-    /// class has the same shape.
-    ///
-    /// So the invariant is enforced at selection instead:
-    /// `fusor2_cost::realize::selectable` drops a self-referential member
-    /// before it can ever be chosen, which degrades the plan (no region
-    /// fusion) instead of making the class unextractable. What this test
-    /// pins is the boundary: the only violations left are `KRegion`s.
+    /// Self-referential members are only `KRegion`s. The invariant is enforced
+    /// at selection time by `fusor2_cost::realize::selectable`, which drops
+    /// such members before they can be chosen.
     #[test]
     fn the_only_self_referential_members_left_are_regions() {
         let caps = ts::caps();
@@ -505,8 +482,7 @@ mod tests {
         }
     }
 
-    /// Test 11. Hash-consing shares isomorphic layers outright, replacing the
-    /// reference's bounded plan-sharing window and its debug tripwire.
+    /// Test 11. Hash-consing shares isomorphic layers outright.
     #[test]
     fn hash_consing_shares_isomorphic_layers() {
         fn layer(g: &mut EGraph, input: Id, width: usize) -> Id {

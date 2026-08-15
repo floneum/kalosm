@@ -5,8 +5,6 @@
 //! the case and visible only in the numbers. `MaskKind::Causal` is *structural*: no mask tensor is
 //! uploaded, so a lowering that silently needs one fails here rather than
 //! reading garbage.
-//!
-//! Owned by W14.
 
 use fusor2::composite::attention::{
     attention, attention_causal, attention_grads, attention_lse, attention_masked,
@@ -380,12 +378,12 @@ pub fn cases() -> Cases {
 
 /// The materialization half of the flash acceptance bar.
 ///
-/// Gate 5 of the deletion checklist is a `materialized_bytes` assert proving
-/// the `[Lq, Lk]` score, probability and `dp` matrices are **not** in the
-/// extracted plan's materialized set. The entire memory win lives in that bit:
-/// if the extractor materializes them, every numeric case in this file still
-/// passes and the kernel is a memory hog. Launch counts do not cover it — a
-/// one-launch kernel that stages a `[Lq, Lk]` buffer is still one launch.
+/// The `materialized_bytes` assert proves the `[Lq, Lk]` score, probability
+/// and `dp` matrices are **not** in the extracted plan's materialized set.
+/// The entire memory win lives in that bit: if the extractor materializes
+/// them, every numeric case in this file still passes and the kernel is a
+/// memory hog. Launch counts do not cover it — a one-launch kernel that
+/// stages a `[Lq, Lk]` buffer is still one launch.
 mod materialization {
     use fusor2::composite::attention::{
         attention, attention_causal, attention_grads, attention_with_lse,
@@ -457,11 +455,9 @@ use fusor2::tensor::Dyn as Tensor;
 
     /// Forward: the `[Lq, Lk]` score and probability matrices.
     ///
-    /// A ceiling today, not the target — `ABSORB`'s reduction-nesting clause
-    /// is what keeps the score matrix out of `M`, and
-    /// `fusor2-cost/src/realize.rs` still forces a launch boundary on every
-    /// fold-to-fold edge, so the buffer is there. The bytes are asserted so
-    /// the day the boundary is repaired is a diff rather than a silence.
+    /// The score and probability matrices may be materialized due to
+    /// fold-to-fold launch boundaries. The bytes are asserted as a regression
+    /// guard.
     fn forward(session: &Session) -> CaseResult {
         let build = |s: &Session| -> Result<Vec<Tensor>, CaseError> {
             let (q, k, v) = qkv(s)?;
@@ -485,7 +481,7 @@ use fusor2::tensor::Dyn as Tensor;
         Ok(())
     }
 
-    /// Backward: the score, probability and `dp` matrices, across the whole
+    /// Backward: the score, probability and `dp` matrices across the
     /// `attention_grads` chain.
     fn backward(session: &Session) -> CaseResult {
         let build = |s: &Session| -> Result<Vec<Tensor>, CaseError> {

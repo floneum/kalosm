@@ -1,7 +1,5 @@
 //! `Linear`: `x @ Wt (+ b)`. The bias add is an epilogue the extractor fuses
 //! or does not, on cost.
-//!
-//! Owned by W13.
 
 use fusor2_gguf::VarBuilder;
 use fusor2_ir::shape::Dim;

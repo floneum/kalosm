@@ -2,11 +2,8 @@
 //! binaries, the std-ops surface, `where_cond` and all 12 comparisons.
 //!
 //! Every one of these is one `Map` with a different `ScalarExpr`, so this
-//! suite is really a `ScalarExpr` test: `NaryOp`'s 50-variant discriminant —
-//! whose ordering the reference admits is load-bearing in kernel cache keys —
-//! does not exist, and a table this wide passing is the evidence.
-//!
-//! Owned by W14.
+//! suite is really a `ScalarExpr` test. A table this wide passing is evidence
+//! that the scalar expression variants are working correctly.
 
 use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;
@@ -449,8 +446,8 @@ fn approximate_exp_case(session: &Session, name: &'static str, tol: f32) -> Case
 
 /// Resolve the approximate-exponential entry point by name.
 ///
-/// Both are their own `UnOp` now (`UnOp::ApproximateExp` /
-/// `UnOp::LessApproximateExp`), so this is no longer an alias for `exp` — the
+/// Both are their own `UnOp` (`UnOp::ApproximateExp` /
+/// `UnOp::LessApproximateExp`), not aliases for `exp` — the
 /// equivalence test below pins that they hash-cons to different nodes.
 fn approximate_exp_op(x: &Tensor, name: &str) -> Option<fusor2::Result<Tensor>> {
     match name {

@@ -5,8 +5,6 @@
 //! backend. The shared case shapes live in [`support`] below rather than in a
 //! new file, because a new file means a new `pub mod` line in a module list
 //! other agents may also be editing.
-//!
-//! Owned by W14.
 
 pub mod attention_rope;
 pub mod backward;

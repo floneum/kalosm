@@ -10,8 +10,6 @@
 //! `QLayout` is deliberately *not* a property of a format: both layouts are
 //! legal inputs for all six, so every value case runs twice and the repack
 //! between them has to be byte-exact in both directions.
-//!
-//! Owned by W14.
 
 use fusor2::{Dtype, QMatrix, Session};
 use fusor2_gguf::blocks::{block_fields, cpu_dequantize_block, word_aligned};
@@ -525,9 +523,9 @@ fn qmatmul_case(session: &Session, fmt: QFmt) -> CaseResult {
 /// dimension holds (65,535), so `distribute_workgroups` folds the grid onto a
 /// second slab.
 ///
-/// Sgemv used to address that fold with a raw `ProgramId(X)`: every slab-1
-/// workgroup recomputed slab 0's rows and every row past the fold was never
-/// written — wrong values on exactly the lm_head-sized matvecs, format
+/// An sgemv addressing that fold with a raw `ProgramId(X)` has every slab-1
+/// workgroup recompute slab 0's rows and never write any row past the fold
+/// — wrong values on exactly the lm_head-sized matvecs, format
 /// independent, from 65,536 rows up. The harness sets
 /// `FUSOR2_VERIFY_MEMBERS`, so this geometry races **every** contraction
 /// family and each one proves it linearizes the workgroup id against the grid

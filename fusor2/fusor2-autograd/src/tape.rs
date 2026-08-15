@@ -1,8 +1,6 @@
 //! [`GraphTape`]: the [`Tape`] implementation over a `&mut EGraph`. Every
 //! method appends L0 nodes to the *same* graph the forward lives in, which is
 //! what makes checkpointing an extraction decision.
-//!
-//! Owned by W5.
 
 use fusor2_ir::autograd::{Tape, Val};
 use fusor2_ir::dtype::{Dtype, Splat};
@@ -437,15 +435,11 @@ pub(crate) mod testing {
     //! difference of the forward it claims to differentiate.
     //!
     //! The `Semantics` is the **real** [`CoreSemantics`], not a stand-in.
-    //! It used to be a local duplicate, written while `fusor2-ir::semantics`
-    //! was still landing, and the duplicate had drifted in the one place that
-    //! mattered: it inferred a float `Fold`'s output as the *operand* dtype
-    //! (`if f.dtype.is_float() { f.dtype } else { acc }`) where `infer_fold`
-    //! returns `acc`. Since `accum_dtype` floors every f16/bf16 fold at f32,
-    //! that one line hid every narrow-float adjoint bug in this crate from
-    //! every test in it — a `max` fold on f16 really does hand its adjoint an
-    //! f32 output, and the duplicate said otherwise. `verify` was also a
-    //! blanket `Ok(())`, so `verify_l0` never ran on a graph an adjoint built.
+    //! That matters for dtype inference: `infer_fold` returns `acc`, and
+    //! `accum_dtype` floors every f16/bf16 fold at f32, so a `max` fold on
+    //! f16 really does hand its adjoint an f32 output — a stand-in inferring
+    //! the operand dtype would hide every narrow-float adjoint bug in this
+    //! crate. It also means `verify_l0` runs on every graph an adjoint builds.
     //!
     //! [`SumArenaPlanner`] is the planner because this crate builds L0 only:
     //! no L1 node is ever added, so no arena is ever planned.

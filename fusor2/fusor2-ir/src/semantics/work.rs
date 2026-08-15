@@ -1,14 +1,10 @@
-//! `work()` rows for every op. **Never a constant**: the verifier rejects a
-//! registration whose work does not vary with shape, so the reference's
-//! `Attention { materialized_bytes: 0, work: 1 }` placeholder cannot recur.
-//! `index_ops` is exactly the term the view-fold-vs-gather tradeoff needs.
+//! `work()` rows for every op. The verifier rejects a registration whose work
+//! does not vary with shape. `index_ops` is exactly the term the view-fold-vs-gather
+//! tradeoff needs.
 //!
-//! Symbolic dims price as `1`. That is deliberate: a `Sym` extent is bound at
-//! dispatch, so a shape-family plan is costed at its smallest legal binding
-//! and the specialised variant — which knows the real extent — is the one that
-//! can out-price it.
-//!
-//! Owned by W1.
+//! Symbolic dims price as `1`. A `Sym` extent is bound at dispatch, so a
+//! shape-family plan is costed at its smallest legal binding and the specialised
+//! variant — which knows the real extent — is the one that can out-price it.
 
 use crate::contract_spec;
 use crate::facts::{ValueFacts, Work};
@@ -248,12 +244,10 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             // selected. Filtering `vec_axes` out is the correct row and is a
             // no-op on every unpromoted node.
             //
-            // This row was previously left knowingly wrong, on the belief that
-            // correcting it produced a wrong value in
-            // `normalization::composed_backward_saturates [gpu]` (a layer_norm
-            // adjoint reading -2.0558887 where every entry must be zero) and so
-            // implied a second latent defect in the promoted path. **That
-            // diagnosis was wrong and the fix is restored.** Measured:
+            // A wrong value in `normalization::composed_backward_saturates
+            // [gpu]` (a layer_norm adjoint reading -2.0558887 where every
+            // entry must be zero) that surfaces with this row correct is
+            // **not** a defect in the promoted path. Measured:
             //
             //   - CPU selects a promoted nest here (vec_axes=[0], axis=1),
             //     lowers it, and is CORRECT.
@@ -266,11 +260,11 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             //   - Denying `Caps::coop_supported` with this row corrected makes
             //     the case pass.
             //
-            // So the wrong value is a pre-existing defect in the GPU
-            // cooperative-matrix contraction at that geometry, which correcting
-            // this row merely perturbs extraction into selecting. It is not in
-            // the promoted path, and pricing promotion wrongly to avoid it was
-            // a cost model encoding a legality decision — which §3 forbids.
+            // So the wrong value is a defect in the GPU cooperative-matrix
+            // contraction at that geometry, which correcting
+            // this row merely perturbs extraction into selecting. Pricing
+            // promotion wrongly to avoid it would be
+            // a cost model encoding a legality decision.
             let ein = space
                 .dims
                 .iter()

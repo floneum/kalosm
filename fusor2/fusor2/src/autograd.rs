@@ -41,8 +41,7 @@ pub use fusor2_ir::autograd::{GradientSlot, Parent};
 /// How many boundary hops one backward may take before it is a cycle.
 ///
 /// A hop is either one user rule or one partial reverse walk, and the counter
-/// is a cycle guard rather than a budget: the wordseq student, the largest
-/// model this API is exercised on, takes about thirty for eleven parameters.
+/// is a cycle guard rather than a budget.
 const MAX_BOUNDARY_HOPS: usize = 512;
 
 /// One gradient the user's [`Tensor::with_backwards`] rule produced, and the

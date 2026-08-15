@@ -4926,7 +4926,6 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "fearless_simd",
- "fusor2-cost",
  "fusor2-gguf",
  "fusor2-ir",
  "fusor2-tile",
@@ -4940,7 +4939,6 @@ dependencies = [
 name = "fusor2-gguf"
 version = "0.1.0"
 dependencies = [
- "bytemuck",
  "fusor2-ir",
  "half",
  "memmap2",
@@ -4952,7 +4950,6 @@ dependencies = [
 name = "fusor2-gpu"
 version = "0.1.0"
 dependencies = [
- "bytemuck",
  "fusor2-cost",
  "fusor2-gguf",
  "fusor2-ir",
@@ -4981,9 +4978,7 @@ dependencies = [
 name = "fusor2-tile"
 version = "0.1.0"
 dependencies = [
- "fixedbitset 0.5.7",
  "fusor2-ir",
- "half",
  "parking_lot",
  "rustc-hash 2.1.2",
  "smallvec 1.15.1",

@@ -47,9 +47,9 @@
 //! the CPU's `f32xW` lane tile, a scatter's private per-bin accumulator, a
 //! `(value, index)` max-pool carrier — is the same firing at a different node.
 //!
-//! Owned by W4. [`CORE_RULES`](crate::rules::CORE_RULES) registers `PROMOTE`;
+//! [`CORE_RULES`](crate::rules::CORE_RULES) registers `PROMOTE`;
 //! it does **not** register [`PROMOTE_FLATTEN`], because the table's length is
-//! asserted in the file that owns it and this one may not edit it.
+//! fixed.
 
 use crate::carrier::{Carrier, SlotTy};
 use crate::device::Caps;

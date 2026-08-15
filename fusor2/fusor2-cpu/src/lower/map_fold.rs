@@ -5,8 +5,6 @@
 //! `SchedPoint::Fold(FoldStrat)` and lowers all three: `Subgroup` to a
 //! horizontal reduce, `WgTree` to a tree over a scratch tile, and
 //! `LoopThenTree` to per-lane loop accumulation followed by that tree.
-//!
-//! Owned by W10.
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::error::Error;
@@ -407,8 +405,8 @@ fn lower_fold_carrier(
         .max(1);
     let rows = (outer as u64) * (inner as u64);
     // Same rule as the single-slot body: the width comes off the resolved
-    // point. This used to take `_theta` and allocate a written-in 256, so a
-    // multi-lane carrier ignored every schedule decision extraction made.
+    // point, so a multi-lane carrier honors the schedule decision extraction
+    // made.
     let strat = match theta {
         SchedPoint::Fold(s) => s,
         _ => FoldStrat::WgTree {

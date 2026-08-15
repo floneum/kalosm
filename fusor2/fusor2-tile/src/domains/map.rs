@@ -1,14 +1,5 @@
 //! The elementwise schedule domain: one register-reuse tiling per eligible
-//! dim, plus untiled.
-//!
-//! `policy.cache_resident(invariant_bytes)` and the argmax-over-invariant-
-//! bytes selection in `core/src/nary_direct.rs:460-481` are **deleted**. A
-//! strict `>` against the LLC watermark is a cliff — an input one byte under
-//! 8 MiB gets no tiling and one byte over gets full tiling — and an argmax
-//! over one term cannot see the rest of the launch. Every eligible dim is a
-//! candidate here and W6's continuous LLC term sorts them.
-//!
-//! Owned by W4.
+//! dim, plus untiled. Every eligible dim is a candidate.
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::ir::level1::{AccessPlan, IndexSpace, MapDomain, MapTiling};

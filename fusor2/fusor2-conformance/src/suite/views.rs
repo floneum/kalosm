@@ -6,8 +6,6 @@
 //! the adjoint routes each element's gradient back to the element it came
 //! from — which for a broadcast axis is a sum and for an overlapping window is
 //! a scatter.
-//!
-//! Owned by W14.
 
 use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;

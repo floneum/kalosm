@@ -1,8 +1,6 @@
 //! `Session` and `Backend`. The session owns the target, the cost model, the
 //! extractor and the plan cache; `resolve` is the one place saturation,
 //! extraction and dispatch happen.
-//!
-//! Owned by W13.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -76,8 +74,8 @@ const TUNE_MARGIN: f64 = 0.08;
 /// wide. Every entry is a live miscompile: a member of some e-class whose
 /// value disagrees with its siblings', which extraction could select on some
 /// machine. The race already detects these — it value-checks every candidate
-/// it times — but detection used to be a silent skip plus a `Verdict::Wrong`
-/// in the tune cache, which is how a wrong staged decode stayed green for as
+/// it times — and detection must be loud: a silent skip would let a wrong
+/// staged decode stay green for as
 /// long as no case's *selected* member happened to be the broken one. The
 /// conformance harness races every class member (`FUSOR2_VERIFY_MEMBERS`) and
 /// fails the run when this is nonzero.
@@ -1764,8 +1762,8 @@ impl Drop for TuningClock<'_> {
     }
 }
 
-/// Byte-identical, or — for f32 — within 1e-3 of the reference's own
-/// magnitude. NaN fails the comparison and is therefore rejected.
+/// Byte-identical, or — for f32 — within 1e-3 relative magnitude. NaN fails
+/// the comparison and is therefore rejected.
 fn agrees(dtype: Dtype, a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -1896,8 +1894,7 @@ fn restate_layout(
         // readback failed outright, which is how a whisper decode step died
         // re-leafing its caches.
         //
-        // Shortest run first, so every factoring this used to find it still
-        // finds, and finds the same way; the longer runs are only reached
+        // Shortest run first; the longer runs are only reached
         // once the singleton reading has failed the remainder.
         let mut prod = 1u64;
         for take in 1..=r_ext.len() {

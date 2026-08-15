@@ -3,12 +3,7 @@
 //! hand-written fused kernel.
 //!
 //! Every softmax spelling shares **one** `defn`, under a sugar node minted in
-//! the same call. There is no second kernel and no route to pick, which is why
-//! the `*_fused` aliases and the `softmax_slow*` hook that used to sit here are
-//! deleted: a name that returns the bare expansion hands the caller a member id
-//! instead of the union spine, which is strictly worse to fuse from.
-//!
-//! Owned by W13.
+//! the same call. There is no second kernel and no route to pick.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt, accum_dtype};
 use fusor2_ir::autograd::{Tape, Val};
@@ -288,7 +283,7 @@ impl Tensor {
     }
 
     /// `(x - mean) / sqrt(var + eps) * weight + bias` over the last axis.
-    /// `remove_mean == false` is the RMS-like spelling the reference keeps.
+    /// `remove_mean == false` is the RMS-like spelling.
     pub fn layer_norm(
         &self,
         weight: &Tensor,

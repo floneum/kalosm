@@ -1,12 +1,4 @@
-//! The SGEMV schedule domain. The 21-arm measured bucket table is deleted;
-//! its distinct cells survive as move-ordering seeds only.
-//!
-//! The reference's `gemv_parameters(m, _: usize, k)` ignores `n` outright,
-//! so two contractions with wildly different output widths and identical
-//! `(m, k)` get identical vectorization. Here `n` participates in cost and
-//! nowhere else — the domain is a pure function of the device.
-//!
-//! Owned by W4.
+//! The SGEMV schedule domain. The domain is a pure function of the device.
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::Dtype;

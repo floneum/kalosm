@@ -6,8 +6,6 @@
 //! not expose — a tape only writes. [`Reverse`] therefore carries a cheap
 //! snapshot taken with [`Reverse::over`]; [`backward_into`] is the one-call
 //! form every frontend should use.
-//!
-//! Owned by W5.
 
 use crate::adjoints::adjoint_of;
 use crate::custom::CustomRegistry;
@@ -91,13 +89,11 @@ impl Topology {
     /// An **externally supplied** leaf is where `requires_grad` originates;
     /// everything else is derived, never annotated.
     ///
-    /// A float `Buffer` or `Param` qualifies, matching the reference's
-    /// split: `Graph::leaf` — which is what `Tensor::from_slice` and
-    /// `Graph::tensor` mint — carries `requires_grad = true`, and only
-    /// `Graph::constant` (a `Leaf::Const` splat) does not. Restricting the
-    /// origin to `Param` would make `d loss / d x` for any uploaded input
-    /// come back empty, which is every finite-difference gradient check
-    /// there is. An integer leaf is an index, never a differentiable value.
+    /// A float `Buffer` or `Param` qualifies; only a `Leaf::Const` does not.
+    /// Restricting the origin to `Param` would make `d loss / d x` for any
+    /// uploaded input come back empty, which is every finite-difference
+    /// gradient check there is. An integer leaf is an index, never a
+    /// differentiable value.
     pub fn is_param(&self, id: Val) -> bool {
         self.is_param[id.index()]
     }
@@ -518,9 +514,7 @@ mod tests {
             t.unary(UnOp::Exp, x).unwrap()
         };
         let s = ones(&mut g, &[2]);
-        // Asking for `d y / d constant` used to come back `Ok([None])`, which
-        // is the same answer an adjoint bug gives. It is now an error that
-        // names the value and says which of the two it is.
+        // Asking for `d y / d constant` returns an error that names the value.
         let err = backward_into(&mut g, &caps(), y, s, &[x]).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains(&x.to_string()), "{msg} must name {x}");

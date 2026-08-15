@@ -13,8 +13,6 @@
 //!   binding change — which is what lets a decode loop replay one plan per
 //!   token. After the step's resolve, [`TensorCache::commit`] re-points the
 //!   leaf at the buffer the scatter produced (no host round trip).
-//!
-//! Owned by W13.
 
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::ir::level0::{L0, LeafKind};
@@ -63,8 +61,7 @@ struct FixedState {
 
 /// A growable append-only tensor cache along one axis.
 ///
-/// `R` is the rank of the values it holds and `T` their element type,
-/// matching the reference's `TensorCache<const R: usize, D: SimdElement>`.
+/// `R` is the rank of the values it holds and `T` their element type.
 /// Both default to the decode shape — a rank-4 `[batch, heads, seq, dim]` f32
 /// cache — so `TensorCache` alone still names it. The axis is a runtime
 /// argument, not a const parameter: a cross-attention cache and a self-

@@ -2,12 +2,7 @@
 //! tensor: the compiler skips upper-triangle Q.K work without loading
 //! anything. `MaskCache` exists only for the genuinely data-dependent kinds.
 //!
-//! The reference builds a `[n, n]` `-inf` triangle for every distinct sequence
-//! length, uploads it, memoizes it, and then *left-pads it with zeros* when
-//! decoding at an offset — at which point it stops being causal at all and the
-//! `is_strict_causal` fast path turns itself off. Here the same three
-//! situations are three answers from [`MaskCache::get`], and two of them
-//! upload nothing:
+//! [`MaskCache::get`] returns three kinds of answers depending on the situation:
 //!
 //! * a square block is [`MaskKind::Causal`];
 //! * `q_len == 1` against a cache of `k_len` keys sees every key, so it is
@@ -15,8 +10,6 @@
 //! * anything else — a chunk of `q_len > 1` queries at an offset into a longer
 //!   key axis — is genuinely rectangular and needs a tensor, which is what
 //!   [`MaskCache::materialized`] builds and what `entries` memoizes.
-//!
-//! Owned by W13.
 
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::ir::level1::MaskKind;
@@ -30,10 +23,9 @@ use crate::{Error, Result, Tensor};
 
 /// A mask as attention consumes it.
 ///
-/// `T` is the element type of the materialized case, defaulting to `f32`, as
-/// the reference's `MaskCache<D: SimdElement>` is generic. The rank is fixed
-/// at 2: a materialized mask is `[Lq, Lk]` and broadcasts over the batch and
-/// head axes, so there is nothing for a rank parameter to vary.
+/// `T` is the element type of the materialized case, defaulting to `f32`.
+/// The rank is fixed at 2: a materialized mask is `[Lq, Lk]` and broadcasts
+/// over the batch and head axes.
 #[derive(Clone)]
 pub enum AttentionMask<T: Element = f32> {
     /// Structural; no tensor is materialized.

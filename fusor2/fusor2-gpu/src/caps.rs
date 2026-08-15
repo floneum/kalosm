@@ -3,14 +3,10 @@
 //! EXPERIMENTAL_COOPERATIVE_MATRIX -> `Family::Sgemm`, PIPELINE_CACHE -> cold
 //! compile, TIMESTAMP_QUERY -> no profiling.
 //!
-//! Limits are the **WebGPU baseline**, never `adapter.limits()`. The reference
-//! requests the adapter maximum (`core/src/device.rs:461`), which makes a plan
-//! legal on one device illegal on another and gives the cost model's legality
-//! filters a different meaning per machine. A caller widens exactly the fields
-//! a selected kernel proves it needs, and a widening the adapter cannot supply
-//! is an error rather than a silent clamp downwards.
-//!
-//! Owned by W8.
+//! Limits are the **WebGPU baseline**, never `adapter.limits()`, ensuring plans
+//! remain legal across all devices. A caller widens exactly the fields a selected
+//! kernel proves it needs, and a widening the adapter cannot supply is an error
+//! rather than a silent clamp downwards.
 
 use fusor2_ir::device::{Caps, CoopKind, DeviceKind, Limits, SubgroupWidths};
 use fusor2_ir::dtype::Dtype;

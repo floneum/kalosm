@@ -1049,9 +1049,8 @@ pub fn eval(e: &ScalarExpr, args: &[f32]) -> Option<f32> {
 
 #[doc(hidden)]
 pub mod oracle {
-    //! The two hand-written algorithms that used to be `Combine` variants,
-    //! demoted to **test fixtures**: the carriers the laws derive must match
-    //! them term for term.
+    //! Two hand-written algorithms kept as **test fixtures**: the carriers
+    //! the laws derive must match them term for term.
     //!
     //! **Nothing in the compiler may call these.** They are `pub` only so that
     //! `fusor2-conformance` runs the same two carriers on real hardware that

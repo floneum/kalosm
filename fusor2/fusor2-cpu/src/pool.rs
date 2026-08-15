@@ -3,12 +3,8 @@
 //! (`DeviceFacts::thread_wake_ps`) — which deletes
 //! `PARALLEL_THRESHOLD = 16_777_216`.
 //!
-//! Threads are created once at pool init and never per call. That spawn cost
-//! is exactly why the reference sets a 16-million-element threshold before it
-//! will parallelize anything; with a persistent pool the break-even is a few
-//! microseconds of work and the constant has nothing to guard.
-//!
-//! Owned by W10.
+//! Threads are created once at pool init and never per call; with a persistent
+//! pool the break-even is a few microseconds of work.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;

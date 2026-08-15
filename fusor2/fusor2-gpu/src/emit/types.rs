@@ -4,8 +4,6 @@
 //! Types are interned in a **fixed order** so the module's type arena is
 //! deterministic: emitting the same IR twice must produce byte-identical
 //! debug output, which is what makes the plan hash a usable cache key.
-//!
-//! Owned by W8.
 
 use fusor2_ir::ir::level2::{
     ArenaMode, BufferAccess, BufferDecl, ElementType, ScalarElement, TileDecl,

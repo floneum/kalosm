@@ -1,7 +1,5 @@
 //! 64-byte-aligned buffers, so a `f32x16` load is never split across a cache
 //! line and a workgroup tile can be addressed as a raw byte arena.
-//!
-//! Owned by W10.
 
 use fusor2_ir::error::Error;
 use fusor2_ir::Result;

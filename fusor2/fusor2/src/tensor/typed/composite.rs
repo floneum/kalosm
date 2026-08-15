@@ -1,36 +1,8 @@
 //! The op library, as methods.
 //!
-//! This file is the ergonomic half of the port. A model reaching three module
-//! levels deep for something the reference had as a method —
-//! `composite::attention::attention_masked(&q, &k, &v, ..)?` — is the tell
-//! that the port is unfinished; here it is `q.attention_masked(&k, &v, ..)`.
-//! The free functions stay where they are, at the [`Dyn`] layer, and every
-//! method below calls one. No math is re-implemented.
-//!
-//! # Why there is no `*_fused` family
-//!
-//! There used to be one, at the [`Dyn`] layer, and it is gone from the whole
-//! crate rather than merely hidden from this one. `rope_fused`,
-//! `rope_normal_fused`, `softmax_last_dim_fused`, `softmax_last`,
-//! `rms_norm_fused_no_bias` and
-//! `layer_norm_last_dim_fused` were *one-line delegations* to the natural
-//! spelling: a macro op unions its sugar node with the `defn` expansion in the
-//! same call, so both names minted the identical node and how many kernels it
-//! launches is the extractor's answer. Each is deleted, and each had a
-//! conformance case whose natural-spelling twin already covers the numerics.
-//!
-//! The names that survive lost only a suffix that named a kernel rather than an
-//! operand:
-//!
-//! - `rms_norm_fused` is [`Tensor::rms_norm_with_bias`] — `bias` is a real
-//!   operand, not a fusion hint.
-//! - `rms_norm_residual_fused` is [`Tensor::rms_norm_residual`].
-//! - `rope_normal_pair_fused` is [`Tensor::rope_pair`] and `rope_pair_fused` is
-//!   [`Tensor::rope_interleaved_pair`], matching `rope`/`rope_interleaved`.
-//!   These rotate `q` and `k` in **one** node and hand back two views, which is
-//!   not something the single form composes to.
-//!
-//! Owned by W12.
+//! This file provides ergonomic method-style access to operations. The free
+//! functions stay where they are, at the [`Dyn`] layer, and every method below
+//! calls one. No math is re-implemented.
 
 use crate::composite::PoolReduce;
 use crate::composite::attention::MaskKind;
@@ -138,9 +110,8 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     /// Scaled dot-product attention, `self` being the queries.
     ///
     /// `scale` is `Option` because `None` means "the head dimension's
-    /// `1/sqrt(d)`", which the graph reads off the shape — the reference made
-    /// every caller compute it. Grouped-query attention is inferred from the
-    /// head counts of `self` and `k`.
+    /// `1/sqrt(d)`", which the graph reads off the shape. Grouped-query
+    /// attention is inferred from the head counts of `self` and `k`.
     #[track_caller]
     pub fn attention(&self, k: &Self, v: &Self, mask: MaskKind, scale: Option<f32>) -> Self {
         Self::wrap(
@@ -162,8 +133,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     /// Attention against a materialized additive mask.
     ///
     /// The mask's rank is its own parameter: a `[Lq, Lk]` mask and a
-    /// `[B, 1, Lq, Lk]` one are both ordinary here, and the reference's
-    /// hard-coded `Tensor<2, T>` could not say the second.
+    /// `[B, 1, Lq, Lk]` one are both ordinary here.
     #[track_caller]
     pub fn attention_masked<const MR: usize>(
         &self,
@@ -213,10 +183,8 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     /// [`Tensor::rope`] on `self` and `k` in **one** node, handing back two
     /// views of it.
     ///
-    /// This is the reference's `rope_normal_pair_fused` without the suffix.
-    /// Unlike the rest of the `*_fused` family it is not an alias: q and k
-    /// share the table read and the rotation, and calling [`Tensor::rope`]
-    /// twice is a different graph.
+    /// Unlike calling [`Tensor::rope`] twice, q and k share the table read and
+    /// the rotation, so this is a different graph.
     #[track_caller]
     pub fn rope_pair(
         &self,
@@ -357,8 +325,8 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     /// four (`DIFF`, `R2`, `R3`, `O`) plus seven witness bounds in the
     /// reference: the intermediate window/unsqueeze/flatten ranks are the
     /// lowering's business, not the caller's. The reduction is a
-    /// [`PoolReduce`] value rather than the reference's `fn` pointer so the
-    /// node can carry it as an attribute and its adjoint can read it.
+    /// [`PoolReduce`] value so the node can carry it as an attribute and its
+    /// adjoint can read it.
     #[track_caller]
     pub fn pool<const DIFF: usize>(
         &self,
@@ -420,10 +388,10 @@ impl<T: Element> Tensor<4, T> {
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// `self @ weights^T`, reading the block-quantized weight in place.
     ///
-    /// The receiver is the **activation**, matching the reference. The
-    /// inverted `QMatrix::q_mat_mul(&act)` spelling reads backwards in a
-    /// forward pass — `x.q_mat_mul(&self.wq)` is the projection — and it stays
-    /// as the `Dyn`-layer entry point underneath this.
+    /// The receiver is the **activation**. The inverted `QMatrix::q_mat_mul(&act)`
+    /// spelling reads backwards in a forward pass — `x.q_mat_mul(&self.wq)` is
+    /// the projection — and it stays as the `Dyn`-layer entry point underneath
+    /// this.
     ///
     /// A rank-1 activation is one matrix row and routes through a `[1, k]`
     /// view, so the output rank matches the input rank.

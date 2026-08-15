@@ -1,16 +1,12 @@
 //! Operand access alternatives. Access is an attribute of the *edge*, so one
 //! reader may alias a strided parameter slice while another packs it — the
 //! flat-parameter / gradient-concat case and the im2col operand case
-//! coexisting in one graph. `LayoutPass`'s `unwrap_or_else(Layout::contiguous)`
-//! has no analogue here: there is no default, only alternatives that compete.
+//! coexisting in one graph.
 //!
 //! Each rule mints **one** alternative of the *reading* node with **one**
 //! operand's access changed. `Rule::head` is a single tag, so the four rules
-//! are spread across the two most common readers: three on `KMap`, where the
-//! trainer's flat-parameter slices and conv window operands live, and the
-//! pack rule on `KContract`, where a B-operand repack pays for itself.
-//!
-//! Owned by W2.
+//! are spread across the two most common readers: three on `KMap` and the
+//! pack rule on `KContract`.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
 use crate::ir::level1::{AccessPlan, ContractSide, L1, Operand};

@@ -6,8 +6,6 @@
 //! `stack`, `pad_axis`, `repeat` and `resize` are all a `Leaf(Const)` fill
 //! plus one scatter per source, and `unique: true` is provable because the
 //! written regions are disjoint by construction.
-//!
-//! Owned by W12.
 
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
@@ -47,8 +45,7 @@ impl Tensor {
     /// Row lookup into a rank-2 embedding table with rank-N `u32` indices:
     /// `[..ids] -> [..ids, width]`.
     ///
-    /// Its backward is a `Scatter{Add}`, so the trainer's hand-written
-    /// three-level sorted gather-and-sum deletes.
+    /// Its backward is a `Scatter{Add}`.
     pub fn embedding(&self, ids: &Tensor) -> Result<Tensor> {
         if self.rank() != 2 {
             return Err(Error::Shape(format!(
@@ -66,9 +63,8 @@ impl Tensor {
     /// One element per row of a rank-2 value: `[rows, width]` picked by a
     /// rank-1 `[rows]` index into `[rows]`.
     ///
-    /// Verbatim from the reference's `autograd/indexing.rs`: build the row
-    /// offsets `0, width, 2*width, ...`, add the per-row column, and gather
-    /// out of the flattened table.
+    /// Build the row offsets `0, width, 2*width, ...`, add the per-row column,
+    /// and gather out of the flattened table.
     pub fn gather_last(&self, idx: &Tensor) -> Result<Tensor> {
         if self.rank() != 2 {
             return Err(Error::Shape(format!(
@@ -123,13 +119,8 @@ impl Tensor {
         unique: bool,
     ) -> Result<Tensor> {
         self.check_axis(axis, "scatter")?;
-        // `verify_l0` rule 6 rejects this node, but nothing on the production
-        // path runs the verifier — `EGraph::add` infers facts and hash-conses
-        // and never calls `Semantics::verify` — so the illegal node was built
-        // and only its *lowering* would have noticed, by which point the
-        // caller has no way to supply the proof. Enforced here because this
-        // is the surface the proof is supplied at; the general repair is to
-        // give `EGraph::add` a `Caps` and verify every node it interns.
+        // Enforce `Scatter{Set}` uniqueness here; the API-level proof is
+        // supplied at this function.
         if matches!(combine, ScatterCombine::Set) && !unique {
             return Err(Error::Shape(
                 "Scatter{Set} with possibly-duplicate indices; declare unique: true or use \
@@ -375,15 +366,8 @@ impl Tensor {
 
         // When the removed axis is picked at 0 the dropped axis contributes no
         // offset, so the whole thing collapses into one `Restride`.
-        //
-        // Otherwise it takes two. `StrideSpec::offset` is scaled by
-        // `in_stride[input_dim]`, so a dropped axis's `k * stride[removed]`
-        // can only ride on a spec that *names* `removed` — and there is no
-        // such output axis once it is dropped. Re-basing another axis onto
-        // `removed`'s stride would express it, but only under an assumed
-        // contiguous input, which is exactly the relative-composition
-        // property `Restride` exists to preserve. Two nodes is the honest
-        // encoding; the reference does the same.
+        // Otherwise it takes two, to preserve the relative-composition
+        // property that `Restride` depends on.
         if ranges[removed].start == 0 {
             let specs: Vec<fusor2_ir::shape::StrideSpec> = ranges
                 .iter()

@@ -3,13 +3,9 @@
 //!
 //! These exist only as a starting point: `score_fs`'s measured anchors ship
 //! as the seed for the GPU class and a cache-derived table seeds the CPU
-//! class. The reference's five integers fitted on one M2 Max and selected by
-//! `backend == Metal && name.starts_with("Apple")` are the portability
-//! liability this crate closes — **the seed is chosen by `Caps::kind`, never
-//! by the adapter name**, and calibration replaces it with measurement on the
-//! device that will actually run.
-//!
-//! Owned by W6.
+//! class. The seed is chosen by `Caps::kind`, never by the adapter name,
+//! and calibration replaces it with measurement on the device that will
+//! actually run.
 
 use fusor2_ir::cost::{DeviceFacts, RateDtype};
 use fusor2_ir::device::{Caps, DeviceKind};

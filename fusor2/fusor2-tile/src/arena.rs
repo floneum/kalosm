@@ -19,9 +19,7 @@
 //! not compose transitively.
 //!
 //! This is a **closed-form argmin with an independent verifier**, not an
-//! e-graph alternative — marked in the architecture as an honest exclusion.
-//!
-//! Owned by W3.
+//! e-graph alternative.
 
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;

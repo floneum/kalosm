@@ -1,12 +1,4 @@
 //! R6 — the two `Scatter` lowerings, both coexisting.
-//!
-//! There were four. `WgPrivateMerge` named a private-accumulator strategy that
-//! no backend ever implemented — it reached the same dense nest as these two —
-//! and `OneHotContract` named a one-hot GEMM that neither backend lowers at
-//! all. Neither was ever selected, and an alternative with no lowering is one
-//! extraction can prefer and then fail on.
-//!
-//! Owned by W4.
 
 use fusor2_ir::egraph::{Builder, Facts, Id, RuleTag};
 use fusor2_ir::ir::level0::{L0, ScatterCombine};

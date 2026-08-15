@@ -1,30 +1,14 @@
 //! `KGather` and `KScatter`.
 //!
-//! Both `ScatterMode`s name one map and differ only in strategy, so on a
-//! target with no f32 atomic they share one nest: **one lane per output
-//! element, a counted loop over the updates**. Every output element is written
-//! by exactly one lane, so no atomic is needed and the result is
-//! bit-reproducible at any thread count — which is the closure of the
-//! reference's total absence of CPU scatter-add, where embedding backward was
-//! an `O(vocab x N x D)` one-hot GEMM.
+//! Both `ScatterMode`s name one map and differ only in strategy. On a target
+//! with no f32 atomic they share one nest: one lane per output element, a
+//! counted loop over the updates. Every output element is written by exactly one
+//! lane, so no atomic is needed and the result is bit-reproducible.
 //!
-//! **Both nests read their lane tiling off `theta`.** `KGather` and `KScatter`
-//! carry the same elementwise `ScheduleDomain::Map` a `KMap` carries, and both
-//! bodies used to drop it on the floor (`let _ = theta`) and run one element
-//! per lane. `tm` elements per lane is the same grid-strided register tile
-//! [`crate::lower::map_fold`] runs a `KMap` at, and on the scatter it is what
-//! amortizes the index read that dominates the embedding gradient.
-//!
-//! **What this does not fix, measured.** The domain is minted but never
-//! selected: `sigma` keeps the floor-lowered node, whose domain is
-//! `ScheduleDomain::Point`, so `theta` is `SchedPoint::Point` on every gather
-//! and scatter in the conformance suite. `tm` reaches the cost model only
-//! through `resident_lanes`, where a bigger tile is strictly fewer lanes and
-//! so equal-or-worse — a tiled point can tie the untiled node but never beat
-//! it. See the note in `fusor2-gpu/src/lower/gather_scatter.rs` for the two
-//! call sites.
-//!
-//! Owned by W10.
+//! Both nests read their lane tiling off `theta`. `KGather` and `KScatter` carry
+//! the same elementwise `ScheduleDomain::Map` a `KMap` carries, and can use
+//! `tm` elements per lane like the grid-strided register tile in `map_fold`,
+//! amortizing the index read in scatter workloads.
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::error::Error;

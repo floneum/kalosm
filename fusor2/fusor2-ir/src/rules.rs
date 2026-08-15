@@ -2,27 +2,10 @@
 //!
 //! Guards may read only [`crate::egraph::Facts`] — legality, never
 //! profitability. That restriction is enforced by the API surface rather than
-//! by convention, and it is this design's immune system: the reference's
-//! `consumer_count(input) != 1`, `skip_externally_live`,
-//! `variant_duplicates_required_producer` and `merge_profile -> None` are all
-//! profitability judgements smuggled into legality gates, which is why two
-//! individually profitable optimizations end up jointly illegal there.
+//! by convention.
 //!
 //! **Rule order carries no semantics**; the fixed order below exists only for
 //! reproducibility, and `rule_order_is_semantically_inert` asserts it.
-//!
-//! # What is not here
-//!
-//! There were four `flash::*` recognizers. They walked a deep chain on every
-//! `Contract`, `Map` and `Scatter` in the graph looking for the node sequence
-//! `fusor2::composite::attention` happened to emit, which is why they silently
-//! stopped matching when the frontend changed and flash attention was
-//! unreachable on both backends while every test still passed. They are
-//! deleted. Flash attention is a `KFold` with a multi-slot carrier, reached by
-//! the general laws registered below — `ABSORB`, `PROMOTE`, `HOIST`,
-//! `RETARGET`, `TUPLE`, `STRIP` — none of which mentions attention.
-//!
-//! Owned by W2.
 
 pub mod algebra;
 pub mod fusion;
@@ -319,8 +302,8 @@ pub(crate) fn is_identity_specs(specs: &[StrideSpec], in_shape: &[Dim]) -> bool 
 }
 
 /// A minimal in-crate [`crate::ir::Semantics`] plus graph constructors, so
-/// every rule module can build a fixture without depending on W1's
-/// `CoreSemantics` landing first. Declared inline rather than in a new file:
+/// every rule module can build a fixture without depending on
+/// `CoreSemantics`. Declared inline rather than in a new file:
 /// `src/rules/` is a fixed file set.
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -841,15 +824,8 @@ mod tests {
     /// *arithmetic* is a tree substitution and no `L0::Map`-headed rule
     /// produces a second `L0::Map`.
     ///
-    /// **It is not free, and this test used to claim it was.** The claim was
-    /// that the frontend composes at construction; it does not, and never
-    /// did — `compose` has no caller outside the rules — so
-    /// `Map{exp}(Map{sub}(s, m))` reached extraction as two nodes, and a
-    /// launch is lowered from one node. Three of `attention_forward`'s eight
-    /// dispatches were consecutive elementwise maps over one space. The
-    /// substitution is now `fusion::MAP_INTO_MAP`, headed at `KMap`, which is
-    /// why the `OpTag::Map` roster below is unchanged and the `KMap` one is
-    /// not.
+    /// `compose` is called by the rules, so `Map{exp}(Map{sub}(s, m))` is
+    /// lowered from one `KMap` node via `fusion::MAP_INTO_MAP`.
     #[test]
     fn elementwise_into_elementwise_needs_no_rule() {
         let inner = ScalarExpr::un(crate::scalar::UnOp::Exp, ScalarExpr::arg(0, Dtype::F32));

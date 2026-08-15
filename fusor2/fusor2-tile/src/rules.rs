@@ -2,13 +2,7 @@
 //! order-free contraction family rules plus `unfuse_coop_epilogue`, the
 //! four `Scatter` lowerings, the two gather lowerings.
 //!
-//! `ShapeSelector`'s first-match ordering is structurally impossible here:
-//! all the families coexist in one chain and compete on cost. The
-//! `padded_macs * 4 > useful_macs * 5` routing guard is **deleted**,
-//! because padded MACs already enter the issue term — a badly padded coop
-//! tile loses to sgemv on cost instead of being routed around it.
-//!
-//! Owned by W4.
+//! All the families coexist in one chain and compete on cost.
 
 pub mod contract;
 pub mod gather;
@@ -241,9 +235,9 @@ pub static SCHED_RULES: &[Rule] = TILE_RULES;
 
 #[cfg(test)]
 pub(crate) mod testing {
-    //! A minimal [`Semantics`] and a graph fixture, so W4's rule tests
+    //! A minimal [`Semantics`] and a graph fixture, so rule tests
     //! exercise the real rule bodies against a real [`EGraph`] without
-    //! waiting for W1's `CoreSemantics` to land. Inference here is only as
+    //! depending on `CoreSemantics`. Inference here is only as
     //! precise as the guards under test read.
 
     use fusor2_ir::Result;
@@ -849,10 +843,10 @@ mod tests {
     /// `space = [rows, dh, k]` with `vec_axes = [1]` and the reduced axis last
     /// is what PROMOTE mints and what both backends lower per promoted
     /// position (`fusor2-gpu/src/lower/map_fold.rs`,
-    /// `fusor2-cpu/src/lower/map_fold.rs`). It used to be refused here by a
-    /// blanket `!vec_axes.is_empty()` bail dating from when neither backend
-    /// had that lowering, so the whole point of PROMOTE arrived at extraction
-    /// on `ScheduleDomain::Point` and got the emitter's default lane group
+    /// `fusor2-cpu/src/lower/map_fold.rs`). A blanket
+    /// `!vec_axes.is_empty()` bail here
+    /// would send the whole point of PROMOTE to extraction
+    /// on `ScheduleDomain::Point`, getting the emitter's default lane group
     /// rather than a selection.
     ///
     /// This asserts on the **rule**, not on the table, so it fails if
@@ -967,7 +961,7 @@ mod tests {
         // A 128-lane carrier cannot close across lanes on this device, but it
         // can still run row-per-lane, so TILE_FOLD *does* attach a domain —
         // every point of which must be a one-lane group. Declining outright
-        // here is what used to make the node unschedulable and its class
+        // here would make the node unschedulable and its class
         // fall back to a `verify_plan` crash.
         assert!(
             fx.chain(fold)
@@ -984,8 +978,7 @@ mod tests {
         );
     }
 
-    /// Gather and scatter reach the floor at [`ScheduleDomain::Point`] and no
-    /// rule used to upgrade them without also committing a `mode`. Each must
+    /// Gather and scatter reach the floor at [`ScheduleDomain::Point`]. Each must
     /// leave a chain member carrying a real domain **at the floor's own
     /// mode**, because the mode and the schedule were one pre-committed choice
     /// and splitting them is the point.

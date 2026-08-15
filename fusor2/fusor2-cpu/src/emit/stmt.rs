@@ -1,18 +1,14 @@
 //! L2 statements -> the loop nest.
 //!
-//! **`Barrier` splits the lane loop into two loops over the lane range.**
-//! Mapping it to a no-op miscompiles every workgroup-staged kernel —
-//! `Reduce{WgTree}`, packed-B GEMM tiles, and the flash-attention staging step
-//! — because iteration 0 would read tile slots iteration 31 has not written.
+//! `Barrier` splits the lane loop into two loops over the lane range, ensuring
+//! iteration 0 does not read tile slots that a later iteration has not written.
 //!
-//! The split is done here, after statement compilation, by
-//! [`block`]: a statement list containing a barrier at any depth is cut into
-//! consecutive [`LaneLoop`]s and the lane loop is pushed *into* each piece; a
-//! list containing none is wrapped in exactly one lane loop over the whole
-//! lane range. A barrier inside a uniform `If`/`Loop` splits that body's list,
-//! with the lane loops nested inside the `If`/`Loop`.
-//!
-//! Owned by W10.
+//! The split is done here, after statement compilation, by [`block`]: a
+//! statement list containing a barrier at any depth is cut into consecutive
+//! [`LaneLoop`]s and the lane loop is pushed into each piece; a list containing
+//! none is wrapped in exactly one lane loop over the whole lane range. A barrier
+//! inside a uniform `If`/`Loop` splits that body's list, with the lane loops
+//! nested inside the `If`/`Loop`.
 
 use fusor2_ir::ir::level2::{ScalarElement, TileReduceOp};
 use fusor2_ir::target::EmitError;

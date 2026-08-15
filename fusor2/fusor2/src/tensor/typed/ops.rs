@@ -6,18 +6,9 @@
 //! panic instead of returning `Result`. If a value here disagrees with the
 //! `Dyn` one, the bug is in `crate::ops`, not in this file.
 //!
-//! What the signatures change, and why:
-//!
-//! - **Output rank is a const parameter, never a witness trait.** A rank
-//!   change is `flatten_last_n::<2>(2)`, checked once by
-//!   [`Tensor::try_from_dyn`] with a panic that names the op. The reference
-//!   spelled the same thing as `SmallerRank<DIFF, O, D>` and made a wrong rank
-//!   a trait-resolution puzzle.
-//! - **Axes are `impl Axis<R>`**, so `Minus1` goes anywhere a `usize` does.
-//! - **Arrays, not slices, where the rank is known.** `repeat([2, 1, 3])` on a
-//!   rank-3 value cannot be given the wrong length.
-//!
-//! Owned by W12.
+//! Output rank is a const parameter. Axes are `impl Axis<R>` so `Minus1` goes
+//! anywhere a `usize` does. Arrays, not slices, where the rank is known, so
+//! `repeat([2, 1, 3])` on a rank-3 value cannot be given the wrong length.
 
 use fusor2_ir::shape::Dim;
 
@@ -81,7 +72,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     }
 
     /// Insert several length-1 axes at once; output rank `O = R + DIFF`. The
-    /// positions are in the *output*, as the reference has them.
+    /// positions are in the *output*.
     #[track_caller]
     pub fn unsqueeze_dims<const DIFF: usize, const O: usize>(
         &self,
@@ -115,8 +106,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         Self::wrap("pad_axis", self.as_dyn().pad_axis(axis.resolve(), padding))
     }
 
-    /// [`Tensor::pad_axis`] with the two sides spelled out, which is the
-    /// reference's signature and what the models write.
+    /// [`Tensor::pad_axis`] with the two sides spelled out explicitly.
     #[track_caller]
     pub fn pad_with_zeros(&self, axis: impl Axis<R>, left: usize, right: usize) -> Self {
         Self::wrap(
@@ -143,9 +133,8 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     /// Row lookup: `[.., n]` of ids against a `[vocab, dim]` table gives
     /// `[.., n, dim]`, so `O = IDS + 1`.
     ///
-    /// The receiver is the *table*, matching the reference and
-    /// [`Dyn::embedding`]; `index_select` is the same gather with the axis
-    /// named.
+    /// The receiver is the *table*. [`Dyn::embedding`] is the same gather with
+    /// the axis named.
     #[track_caller]
     pub fn embedding<const IDS: usize, const O: usize>(
         &self,

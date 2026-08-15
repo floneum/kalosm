@@ -8,8 +8,7 @@
 //!
 //! `BlockDecodeArgs` carries no row extent, so the flat element index a
 //! program decodes is `k_base + col`: the caller folds the row stride
-//! into `col` (typically `row_index * elements_per_row`) exactly as the
-//! reference's `quantized_flat_block_base_and_q` does, and `k_base` is the
+//! into `col` (typically `row_index * elements_per_row`), and `k_base` is the
 //! element offset inside that row. Block base and intra-block index are
 //! recomputed from that flat index alone, so an element anywhere in the row —
 //! including one whose block differs from its neighbour's — decodes correctly
@@ -19,8 +18,6 @@
 //! (18, 22, 34 and 210 bytes), so every field read goes through
 //! [`load_block_byte`], which loads the containing word and shifts the byte
 //! out.
-//!
-//! Owned by W11.
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::{NumericContract, QFmt, QLayout};

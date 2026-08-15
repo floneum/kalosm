@@ -236,8 +236,8 @@ fn relu_has_no_gradient_at_zero() {
     close(&grad, &[0.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
 }
 
-/// A backward pass may not cross graphs. It used to panic indexing one
-/// e-graph's arena with the other's `Id`.
+/// A backward pass may not cross graphs — it must refuse, not panic indexing
+/// one e-graph's arena with the other's `Id`.
 #[test]
 fn a_loss_from_another_graph_is_refused_not_panicked() {
     let s = session();

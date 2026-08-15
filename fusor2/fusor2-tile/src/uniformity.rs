@@ -1,20 +1,11 @@
-//! Uniformity analysis. The reference asserts a barrier is at a "guaranteed
-//! uniform" point with no analysis to establish it; this is that analysis.
-//!
-//! A bottom-up classification of every [`TileExpr`], then a statement walk
-//! carrying a predicate-uniformity stack. A `Barrier` (or `StorageBarrier`)
-//! under a non-uniform predicate is
+//! Uniformity analysis. A bottom-up classification of every [`TileExpr`],
+//! then a statement walk carrying a predicate-uniformity stack. A `Barrier`
+//! (or `StorageBarrier`) under a non-uniform predicate is
 //! [`LowerError::NonUniformBarrier`][fusor2_ir::ir::level2::LowerError::NonUniformBarrier].
 //!
 //! The classification is conservative in the direction that fails lowering
 //! rather than racing: anything read from memory, any lane-indexed builtin,
-//! any subgroup collective and any cooperative fragment is `NonUniform`. In
-//! particular a workgroup tree reduction is classified from its input rather
-//! than from the fact that the tree lowering broadcasts its result — a real
-//! uniform value can therefore be rejected, which costs a barrier placement,
-//! never correctness.
-//!
-//! Owned by W3.
+//! any subgroup collective and any cooperative fragment is `NonUniform`.
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;

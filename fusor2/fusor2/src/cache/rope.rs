@@ -6,7 +6,6 @@
 //! [`base_inverse_frequency`] is shared with the rope op itself, so the table
 //! and the kernel cannot drift apart.
 //!
-//! Owned by W13.
 
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::shape::Dim;
@@ -20,10 +19,8 @@ use crate::{Error, Result, Tensor};
 
 /// Precomputed rotary sin/cos, extended lazily as the sequence grows.
 ///
-/// `T` is the table's element type. The reference's `RopeCache` has no
-/// parameter at all and is f32-only, which forces an f16 model to cast the
-/// table at every step; here the cast happens once per upload. The rank is
-/// fixed at 2 — the table is `[rows, head_dim / 2]` by construction.
+/// `T` is the table's element type. The rank is fixed at 2 — the table is
+/// `[rows, head_dim / 2]` by construction.
 pub struct RopeCache<T: Element = f32> {
     pub sin: Tensor<2, T>,
     pub cos: Tensor<2, T>,

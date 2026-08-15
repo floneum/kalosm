@@ -8,8 +8,6 @@
 //! extents and offsets is undecidable, so a `Restride`-based encoding would
 //! degrade a non-overlapping max-pool to a scatter on exactly the
 //! symbolic-shape path the design exists to enable.
-//!
-//! Owned by W5.
 
 use crate::tape::{TapeExt, const_numel, const_row_major};
 use fusor2_ir::autograd::{Grads, Tape, Val};
@@ -339,10 +337,8 @@ fn window_view_adjoint(
 /// Adjoint of `Gather` is `Scatter{Add}`; the index operand gets no gradient.
 ///
 /// **Trainer constraint 3.** Duplicates accumulate, so the embedding table
-/// receiving one token twice gets the summed gradient. The one-hot matmul
-/// the reference builds here does not appear anywhere in this crate — it
-/// survives only as one of `Scatter{Add}`'s four lowerings, kept so the cost
-/// model can reject it.
+/// receiving one token twice gets the summed gradient. The adjoint is one of
+/// `Scatter{Add}`'s four lowerings, kept so the cost model can reject it.
 pub fn gather_adjoint(
     tape: &mut dyn Tape,
     node: &Node,

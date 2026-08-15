@@ -1,15 +1,12 @@
 //! The one analytic non-elementwise adjoint:
 //! `d(Contract) = (grad x b -> a, a x grad -> b)`, expressed by reusing the
 //! primal spec's [`fusor2_ir::ir::level0::EinSpec::d_lhs`] and `d_rhs`. It
-//! holds regardless of tile geometry, which is exactly why it is stated at L0
-//! and not restated per lowering.
+//! holds regardless of tile geometry, stated at L0 and not restated per lowering.
 //!
-//! Because transposed-rhs is a *spec* and not an op, this single rule
-//! subsumes `mat_mul`, `mat_mul_transposed_rhs`, every batched form and —
-//! through the macro `defn` expansions — `conv`/`grouped_conv`'s `dInput`,
-//! `dWeight` and `dBias`. There is no `replay_*` combinator anywhere.
-//!
-//! Owned by W5.
+//! Because transposed-rhs is a *spec* and not an op, this rule subsumes
+//! `mat_mul`, `mat_mul_transposed_rhs`, every batched form and — through the
+//! macro `defn` expansions — `conv`/`grouped_conv`'s `dInput`, `dWeight` and
+//! `dBias`.
 
 use fusor2_ir::autograd::{Grads, Tape, Val};
 use fusor2_ir::ir::Node;
@@ -52,12 +49,6 @@ pub fn contract_adjoint(
     // weight's element grid, and nothing can apply that to a block-quantized
     // buffer — which is precisely why QAT keeps a separate f32 master copy
     // rather than a quantized backward kernel.
-    //
-    // Stated here rather than left to fall out of a lowering failure. It used
-    // to hold only because `L1::KQContract` could not lower the `d_rhs` spec;
-    // the moment that contraction found any lowering at all — the generic
-    // floor does — `q_mat_mul_backward_reaches_the_activation_only`'s "a
-    // gradient was produced for a quantized weight" assert fired.
     let da = if tape.facts(a).dtype.is_quantized() {
         None
     } else {

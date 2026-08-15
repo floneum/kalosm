@@ -1,4 +1,4 @@
-//! `verify_l2` — the L2 verifier, retained from the reference and extended.
+//! `verify_l2` — the L2 verifier.
 //!
 //! Seven clauses, in order:
 //! 1. **Full expression type-check.** Every node's cached `ty` equals what
@@ -17,8 +17,6 @@
 //! 6. **`verify_arena`** against the planner's `arena_plan`.
 //! 7. **`f16`/`bf16` gated on `caps`**, up front, so an f16 handle on a
 //!    non-f16 adapter fails here rather than mis-lowering.
-//!
-//! Owned by W3.
 
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
@@ -1237,9 +1235,9 @@ mod tests {
         verify_l2(&ir, &caps_with(|_| {})).unwrap();
     }
 
-    /// `lane & 31` and `lane % 32` are the same function of `lane`. The
-    /// verifier used to decide the second and refuse the first, so a lowering
-    /// could not spell an address with the natural power-of-two wrap — the
+    /// `lane & 31` and `lane % 32` are the same function of `lane`. A
+    /// verifier refusing the mask form would keep a lowering
+    /// from spelling an address with the natural power-of-two wrap — the
     /// very form `mod_literal_u32` rewrites the remainder into one layer down.
     #[test]
     fn a_power_of_two_mask_bounds_an_address_the_way_a_remainder_does() {

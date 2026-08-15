@@ -4,8 +4,6 @@
 //! one graph with one root set**, which is what makes gradient checkpointing
 //! the extractor's materialization bit. Nobody writes a checkpointing pass and
 //! there is no user annotation.
-//!
-//! Owned by W13.
 
 use std::sync::Arc;
 

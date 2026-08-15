@@ -7,13 +7,8 @@
 //! threaded into four hash recipes cannot exist.
 //!
 //! The recorded tables live in this file as `&'static str` blocks rather than
-//! in `goldens/*.txt`. The architecture's `include_str!` shape is equivalent;
-//! it is inlined here because W14's ownership manifest covers `.rs` files
-//! only, and a data file another agent cannot see is worse than a table they
-//! can. Both families print the measured value on mismatch so a *deliberate*
-//! numeric change is re-recorded by copying one line.
-//!
-//! Owned by W14.
+//! in external data files. Both families print the measured value on mismatch
+//! so a *deliberate* numeric change is re-recorded by copying one line.
 
 use fusor2_ir::extract::PlanHash;
 
@@ -293,7 +288,7 @@ mod tests {
     /// valid across processes.
     ///
     /// This runs the pipeline the way `Session::resolve` does, twenty times,
-    /// against a graph that used to truncate, and asserts the plan is the
+    /// against a graph deep enough for the budget to bite, and asserts the plan is the
     /// same plan every time. Twenty repeats on the same core is also twenty
     /// different wall times, which is exactly the axis the deadlines leaked.
     #[test]

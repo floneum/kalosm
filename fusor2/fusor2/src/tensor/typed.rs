@@ -2,16 +2,10 @@
 //! it has **no** effect on the IR, hosts no witness traits, and imposes no
 //! rank ceiling.
 //!
-//! What is deliberately absent: `LastRank`, `NextRank`, `SmallerRank`,
-//! `LargerRank`, `MaxRank`, `ShapeWithOneHole` and every other rank-relation
-//! witness. A rank-changing method takes its output rank as an ordinary const
+//! A rank-changing method takes its output rank as an ordinary const
 //! parameter and validates it once; a bad rank is a panic that names the op,
-//! never a compile-time trait-resolution puzzle.
-//!
-//! Also absent, and deliberately: the reference's third parameter
-//! `B: Fusion<R, D>`. It exists there to express CPU fusion laziness in the
-//! type system; here the e-graph does that job, and `to_concrete` /
-//! `into_concrete` — whose whole purpose was erasing `B` — are the identity.
+//! never a trait-resolution puzzle. The e-graph handles fusion, so no fusion
+//! parameter is needed.
 //!
 //! # Why every method panics instead of returning `Result`
 //!
@@ -26,26 +20,8 @@
 //! # Mixed precision
 //!
 //! Folds and contractions accumulate in [`Dtype::compute_dtype`], so an f16
-//! operand accumulates in f32; [`narrow_acc`] casts the result back, which is
-//! what keeps `max` on a `Tensor<R, f16>` a `Tensor<R - 1, f16>` the way the
-//! signature and the reference both say. Wide arithmetic, narrow types.
-//!
-//! Both halves of `betlang-train --f16` run. The forward is covered by
-//! `trainer_surface::tests::the_trainers_f16_convolution_stack_computes` and
-//! the backward — including the `max` pool, whose adjoint is the one that used
-//! to be unbuildable — by
-//! `a_backward_through_the_f16_convolution_stack_reaches_the_weights`.
-//!
-//! That backward failed until recently, and the cause was outside this crate:
-//! `extremum_adjoint` in `fusor2-autograd/src/structural.rs` declared both
-//! operands of its argmax comparison at the *operand* dtype while the value it
-//! compares against is the broadcast fold output, which is at `compute_dtype`,
-//! so an f16 `max` or `min` reported `Map body reads Arg(1) as F16 but the
-//! operand is F32`. That adjoint now builds its whole expression at the
-//! accumulator width and narrows once at the end. Nothing in this file changed
-//! for it; the note is kept because the symptom surfaced here.
-//!
-//! Owned by W12.
+//! operand accumulates in f32; [`narrow_acc`] casts the result back. Wide
+//! arithmetic, narrow types.
 
 use std::marker::PhantomData;
 use std::ops::{Add, Div, Mul, Neg, Range, Sub};
@@ -67,16 +43,14 @@ mod ops;
 
 /// A Rust scalar with a fusor2 dtype.
 ///
-/// Named `Element`; `SimdElement` is the same trait under the reference's
-/// spelling, kept so a `T: SimdElement` bound written against that API still
-/// resolves.
+/// `SimdElement` is an alias for compatibility with other spellings.
 pub trait Element: bytemuck::Pod + Copy + Send + Sync + 'static {
     const DTYPE: Dtype;
     /// This value as the backend's splat literal.
     fn splat(self) -> Splat;
 }
 
-/// The reference's spelling of [`Element`].
+/// An alias for [`Element`].
 pub use self::Element as SimdElement;
 
 impl Element for f32 {
@@ -221,12 +195,11 @@ fn dims_of<const N: usize>(shape: [usize; N]) -> Vec<Dim> {
 ///
 /// A fold and a contraction accumulate in [`Dtype::compute_dtype`], so an f16
 /// operand comes back f32 — deliberately, and documented as such on
-/// [`crate::Tensor::sum`]: "narrowing back is an explicit `cast` the caller
-/// writes". The const-rank API *is* that caller. Its signatures are
-/// dtype-preserving, matching the reference, where `max` on a
-/// `Tensor<R, f16>` is a `Tensor<R - 1, f16>`, so the cast is written here
-/// once instead of at every model call site. `composite::conv` already does
-/// the same thing after its contraction.
+/// [`crate::Tensor::sum`]. The const-rank API narrows the result back. Its
+/// signatures are dtype-preserving: `max` on a `Tensor<R, f16>` is a
+/// `Tensor<R - 1, f16>`, so the cast is written here once instead of at every
+/// model call site. `composite::conv` already does the same thing after its
+/// contraction.
 ///
 /// Narrowing exactly the promotion and nothing else: any *other* dtype
 /// disagreement falls through to [`Tensor::try_from_dyn`], which reports it. A
@@ -245,9 +218,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 
     /// Wrap a runtime-rank value.
     ///
-    /// Named `from_dyn`, not `new`: the reference spells `Tensor::new(device,
-    /// array)` and a model that ports by changing imports writes that. This is
-    /// the inverse of [`Tensor::into_dyn`] and reads as one.
+    /// The inverse of [`Tensor::into_dyn`].
     ///
     /// # Panics
     /// If the rank or dtype disagrees. [`Tensor::try_from_dyn`] reports
@@ -389,16 +360,12 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 
     // -- the `B: Fusion` erasers -------------------------------------------
 
-    /// Identity. In the reference this collapsed a lazy fusion expression into
-    /// a concrete buffer; here the e-graph owns that decision, so there is no
-    /// laziness to collapse and the call is a no-op kept so the model reads
-    /// the same.
-    ///
-    /// What it does **not** do, and the reference's did: bound the graph. A
-    /// value that is never re-leafed keeps its producers alive, so a training
-    /// loop that builds a fresh tape per step accumulates nodes in the ambient
-    /// graph for the process lifetime. Fixing that wants a materialize that
-    /// adopts the resolved device buffer as a leaf without a host round-trip;
+    /// Identity. The e-graph owns fusion decisions, so there is no laziness to
+    /// collapse and the call is a no-op kept for API compatibility. A value that
+    /// is never re-leafed keeps its producers alive, so a training loop that
+    /// builds a fresh tape per step accumulates nodes in the ambient graph for
+    /// the process lifetime. Fixing that wants a materialize that adopts the
+    /// resolved device buffer as a leaf without a host round-trip;
     /// [`Tensor::detach`] is the correct-but-expensive stand-in.
     pub fn into_concrete(self) -> Self {
         self
@@ -602,11 +569,8 @@ same_scalar!(
 
 /// The operand slot of a broadcasting binary.
 ///
-/// This is the parameter the reference spelled `B: Fusion<R2, D>`. Dropping it
-/// outright would change `mul_::<1, 1, _>` into an arity error, so the slot
-/// survives as what it always denoted at the call site: "whatever names the
-/// right-hand tensor". It is inferred from the argument; `_` is the only thing
-/// anyone ever wrote there.
+/// This slot is inferred from the argument and survives to keep call-site
+/// ergonomics. `_` is the only thing anyone ever wrote there.
 pub trait Operand<const R: usize, T: Element> {
     fn operand(&self) -> &Tensor<R, T>;
 }
@@ -871,13 +835,10 @@ reduce_keepdim!(
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// `[batch, in_ch, ...spatial]` convolved with `[out_ch, in_ch, ...kernel]`.
     ///
-    /// The three const parameters are the reference's, in its order:
-    /// `WEIGHT_RANK` is the kernel's rank, `DIFF` the number of spatial axes
-    /// (and so the length of `padding` and `strides`), and `WINDOWED` the rank
-    /// of the sliding-window view the lowering builds, `R + DIFF`. The
-    /// reference spelled the last as a `LargerRank<R2, DIFF>` witness; here it
-    /// is checked arithmetically, which is the whole of what that witness
-    /// asserted.
+    /// Three const parameters: `WEIGHT_RANK` is the kernel's rank, `DIFF` the
+    /// number of spatial axes (and so the length of `padding` and `strides`),
+    /// and `WINDOWED` the rank of the sliding-window view the lowering builds,
+    /// `R + DIFF`. This is checked arithmetically.
     #[track_caller]
     pub fn conv<const WEIGHT_RANK: usize, const DIFF: usize, const WINDOWED: usize>(
         &self,
@@ -1171,9 +1132,9 @@ mod tests {
 
     /// `device()` hands back the type the constructors take.
     ///
-    /// It used to return `session::Backend` — the backend *selector*, a
-    /// different type than the `&Device` `zeros`/`from_slice` want — so this
-    /// expression did not compile at all and a model had to keep its own
+    /// Returning `session::Backend` — the backend *selector*, a
+    /// different type than the `&Device` `zeros`/`from_slice` want — would
+    /// keep this expression from compiling and force a model to keep its own
     /// `Device` threaded alongside every tensor. The round trip must also land
     /// in the *same* graph: a device that named a different graph would make
     /// every op between the two values an error.
@@ -1219,14 +1180,12 @@ mod tests {
     // `crate::trainer_surface` restates `betlang-train`'s spellings and runs
     // the ones the trainer's own recipe reaches. What follows covers this
     // file's own machinery instead: the rank-changing output parameters, the
-    // `conv` arithmetic that replaced the reference's witness trait, the
-    // `B: Fusion` erasers, and every operator form. A regression in any of
-    // them is a compile error or a wrong value *here*.
+    // `conv` arithmetic, the `B: Fusion` erasers, and every operator form.
+    // A regression in any of them is a compile error or a wrong value *here*.
     // -----------------------------------------------------------------------
 
-    /// `SimdElement` is `Element` under the reference's name, and the dtype
-    /// parameter defaults to `f32`, so `Tensor<1>` is `Tensor<1, f32>`. Both
-    /// are shapes the trainer's signatures depend on.
+    /// The dtype parameter defaults to `f32`, so `Tensor<1>` is `Tensor<1, f32>`.
+    /// This is a shape the trainer's signatures depend on.
     ///
     /// Never called: the assertion is that it type-checks.
     #[allow(dead_code)]
@@ -1243,13 +1202,10 @@ mod tests {
     }
 
     /// `into_concrete` and `to_concrete` are the approved identity: the value
-    /// they hand back is the *same node*, not a copy of it.
-    ///
-    /// This is what makes the reference's `B: Fusion<R, D>` droppable — the 29
-    /// trainer call sites whose whole purpose was erasing `B` become no-ops —
-    /// and nothing else asserts it. If either ever materialized, the e-graph
-    /// would see a different id and the fake-quant `with_backwards` boundary,
-    /// which is keyed on the node the model handed it, would stop matching.
+    /// they hand back is the *same node*, not a copy of it. If either ever
+    /// materialized, the e-graph would see a different id and the fake-quant
+    /// `with_backwards` boundary, which is keyed on the node the model handed
+    /// it, would stop matching.
     #[test]
     fn the_fusion_erasers_hand_back_the_same_node() {
         let _serial = crate::device::test_device_lock();
@@ -1291,9 +1247,8 @@ mod tests {
         assert_eq!(y.to_flat(), vec![4.5, 8.5, 12.5, 11.5]);
     }
 
-    /// `WINDOWED` is checked arithmetically — it must be `R + DIFF` — which is
-    /// the whole of what the reference's `LargerRank<R2, DIFF>` witness
-    /// asserted. A wrong one names the op and both ranks.
+    /// `WINDOWED` is checked arithmetically — it must be `R + DIFF`. A wrong one
+    /// names the op and both ranks.
     #[test]
     #[should_panic(expected = "has rank 4, not 5")]
     fn conv_rejects_a_windowed_rank_that_is_not_r_plus_diff() {

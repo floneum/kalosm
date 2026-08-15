@@ -2,8 +2,6 @@
 //! only what a selected kernel's legality predicate proves it needs — so a
 //! plan legal on one device is legal on another and the cost model's filters
 //! mean the same thing everywhere.
-//!
-//! Owned by W8.
 
 use fusor2_ir::Result;
 use fusor2_ir::cost::DeviceFacts;
@@ -94,9 +92,8 @@ impl GpuDevice {
 
 /// Pick an adapter, request a device at `baseline ∪ opts.widen`, probe caps.
 ///
-/// `required_limits` is **never** `adapter.limits()`. The reference asks for
-/// the adapter maximum at `core/src/device.rs:461`; that is the bug this
-/// deletes, because it silently makes every legality filter device-specific.
+/// `required_limits` is **never** `adapter.limits()`, so plan legality
+/// means the same thing on every device.
 pub async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pick_adapter(&instance, opts).await?;
@@ -172,7 +169,7 @@ pub fn gpu_blocking(opts: &DeviceOptions) -> Result<GpuDevice> {
     pollster::block_on(request_device(opts))
 }
 
-/// Rank adapters the way the reference does: discrete, then integrated, then
+/// Rank adapters: discrete, then integrated, then
 /// virtual, then CPU, then unknown.
 fn adapter_preference_rank(kind: wgpu::DeviceType) -> u8 {
     match kind {

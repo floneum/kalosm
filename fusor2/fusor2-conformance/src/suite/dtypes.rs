@@ -10,10 +10,7 @@
 //!
 //! A device without f16 or bf16 support cannot run those rows. They return
 //! [`crate::harness::skip`], so the run log says `skip` and names the missing
-//! capability — never `ok`. An M2 Max has f16 and no bf16, so on this machine
-//! the bf16 rows are reported as not run rather than as passing.
-//!
-//! Owned by W14.
+//! capability — never `ok`.
 
 use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;

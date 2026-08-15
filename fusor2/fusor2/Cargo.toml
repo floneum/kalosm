@@ -22,8 +22,3 @@ half.workspace = true
 bytemuck.workspace = true
 parking_lot.workspace = true
 pollster.workspace = true
-
-[features]
-default = ["cpu", "gpu"]
-cpu = []
-gpu = []

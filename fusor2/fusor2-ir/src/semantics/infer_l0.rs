@@ -1,7 +1,5 @@
 //! Total shape/dtype/numeric/persistence inference for the ten L0 nodes.
 //! Never panics; every failure is an [`crate::Error`].
-//!
-//! Owned by W1.
 
 use crate::carrier::Carrier;
 use crate::contract_spec;

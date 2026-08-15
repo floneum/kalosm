@@ -3,19 +3,11 @@
 //!
 //! `causal` is structural on the sugar node, so the compiler skips
 //! upper-triangle Q.K work **without loading a mask tensor** — while the
-//! decomposition is simultaneously present for algebra and autograd. There is
-//! no fused attention node: `KFlash` and its hand-written GPU kernel were
-//! deleted after `lower_kflash` was measured unreached across the whole
-//! suite, so the composed form is not one alternative among several — it is
-//! the only one, and the fold algebra is what has to collapse it.
+//! decomposition is simultaneously present for algebra and autograd.
 //!
-//! Grouped-query attention expands nothing. The reference reshapes,
-//! broadcasts and reshapes K and V up to `H` heads — a materializing round
-//! trip. Here `q`'s head axis is **split** into `(Hkv, g)`, which is a legal
-//! restride at any strides, and `g` becomes a free axis of the contraction.
+//! Grouped-query attention splits `q`'s head axis into `(Hkv, g)`, which is a
+//! legal restride at any strides, and `g` becomes a free axis of the contraction.
 //! The `EinSpec` does the rest.
-//!
-//! Owned by W13.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt, accum_dtype, splat_of};
 use fusor2_ir::autograd::{Tape, Val};

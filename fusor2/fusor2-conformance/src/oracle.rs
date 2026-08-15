@@ -10,8 +10,6 @@
 //! `realize`, the same `CostModel::total` on the same realized DAG, the same
 //! `lower_bound` for pruning, the same `derive_plan`. The only difference is
 //! that where `LocalSearch` walks a move frontier, this enumerates.
-//!
-//! Owned by W14.
 
 use std::sync::Arc;
 

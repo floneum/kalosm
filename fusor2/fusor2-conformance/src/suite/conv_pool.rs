@@ -2,12 +2,9 @@
 //!
 //! The case that earns this file is `pool_max_non_overlapping_adjoint_is_mask`:
 //! `Window`'s structural adjoint reads two integers, and `step >= window`
-//! proves the adjoint is an elementwise mask-and-broadcast. That proof is what
-//! deletes the trainer's reshape-as-maxpool workaround, so the assert is that
+//! proves the adjoint is an elementwise mask-and-broadcast. That proof is that
 //! the adjoint graph contains **no** `Scatter` node — not merely that the
 //! numbers come out right, which they would either way.
-//!
-//! Owned by W14.
 
 use fusor2::composite::pool::PoolSize;
 use fusor2::{Dim, Dtype, Session};

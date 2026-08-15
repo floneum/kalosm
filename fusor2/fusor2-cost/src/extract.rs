@@ -18,7 +18,7 @@
 //! Every decision path iterates classes and nodes in ascending id order.
 //! There is no RNG and no hash-map iteration order anywhere in this file.
 //!
-//! # The neighbourhood has no edge with more than one end — measured, round 3
+//! # The neighbourhood has no edge with more than one end
 //!
 //! A rule that fuses `F` values into one node hands this file a node plus `F`
 //! slot views of it, and each view lands in a **different** e-class. Adopting
@@ -29,102 +29,8 @@
 //! shape this bites on: the online-softmax `(m, l)` carrier is present in all
 //! four saturated attention forward graphs and selected in one.
 //!
-//! [`co_select`] closes it, and is **landed**. Measured at the shipped budget
-//! with no other change, cpu/gpu: `attention_forward` 7/7 -> 5/5,
-//! `attention_with_lse` 8/8 -> 6/6, `attention_causal_forward` 7/6 -> 5/5,
-//! `attention_grads_all_three` 29/19 -> 17/17, with
-//! `attention_causal_plan_is_no_worse_than_dense` and both
-//! `score_matrix_materialization` cases still passing, and the whole
-//! conformance suite green on both backends. The four ceilings in
-//! `fusor2-conformance::launch_counts` were tightened to those numbers.
-//!
-//! # What landing it took, because the order matters
-//!
-//! An earlier round built this pass, measured exactly those counts, and did
-//! **not** land it: reaching the states made five GPU `sampling` cases draw
-//! token `120` from a 16-token vocabulary. That diagnosis named
-//! `fusion::MAP_INTO_MAP` and it was wrong — or rather incomplete, because
-//! `MAP_INTO_MAP` really does contribute members and disabling it really does
-//! hide the symptom. An independent reconstruction of the pass put **29**
-//! cases on wrong values instead (every `softmax`, `layer_norm` and `rms_norm`
-//! row, `attention_qk_mask`, the attention gradients), and a full 37-rule
-//! A/B bisect found two rules that each zeroed the failures on their own:
-//! `sink::FOLD_VIEWS_INTO_INDEX` and `layout::OPERAND_ALIAS`. They are a pair.
-//! The first mints an operand whose `Unflatten` map is stated *independently*
-//! of its layout — the layout carries only the base shape and the view's start
-//! offset, because a `MultiFlattenMap` has no constant slot — and the second
-//! re-spelled any non-`Alias` operand as an `Alias` over that same layout,
-//! dropping the map and re-reading the base densely. `OPERAND_ALIAS` now
-//! proves the two address maps agree.
-//!
-//! The lesson is not about either rule. **The e-graph's invariant is that
-//! every member of a class computes the same value, and nothing was checking
-//! it.** These members had been in the graph, unequal and unselected, since
-//! the two rules first coexisted; only the extraction budget kept them out of
-//! the plan. A search that reaches further is a search that finds them, so
-//! this pass is also the sharpest soundness test the compiler currently has —
-//! if it starts failing, suspect a rule, not the pass.
-//!
-//! # THE ACCEPT TEST IS NOT THE PLAN'S COST — measured, round 4, NOT FIXED
-//!
-//! [`repair`] runs **once, on the state the search stopped at**. Every accept
-//! decision above it is therefore made against a number no plan has: `RESELECT`
-//! can put a producer across a structural cut its previous member did not
-//! create, and the buffer that producer now needs — one write plus one read per
-//! consumer — is priced nowhere until the final pass adds it. The search
-//! descends a phantom objective and the repair hands the bill back at the end.
-//!
-//! It is visible in [`SearchTrace::best`], whose last entry is the repair.
-//! Measured on `attention_forward` with `fusion::splice` widened (see that
-//! file's `KNOWN GAP` note), cpu, shipped budget:
-//!
-//! ```text
-//! best = [1_206_091_100, 804_148_225, 603_243_556, 603_243_509,
-//!         603_170_253, 402_170_194, 1_608_230_879]
-//! ```
-//!
-//! A fivefold jump in one step, on the last step. **This is why searching
-//! harder makes the shipped plan worse** — the same graph gives 5 launches at
-//! `max_move_work = 90_000` and 10 at 100M — and it is the real content of
-//! `ExtractBudget::default`'s "raising it was measured and deliberately not
-//! landed".
-//!
-//! The fix is one paragraph: realize, [`repair`], re-realize, and compare
-//! *that* cost, with a trail so a rejected candidate reverts the obligations
-//! its move implied as well as the move. It was built and measured. Alone it
-//! changes no launch count; with the `splice` widening it takes both backends
-//! to `attention_forward` 4, `attention_with_lse` 5, `attention_causal` 5,
-//! `attention_grads_all_three` 16 (`SaturationBudget::max_rounds` 16 and
-//! `max_move_work` 1M are needed too — the widened CPU graph does not saturate
-//! in 10 rounds).
-//!
-//! **It is not landed because it puts six conformance cases on wrong values or
-//! unbuildable plans**, all of them latent members this file's own doc predicts
-//! and none of them in a file this worker owns:
-//!
-//! * `matmul::{mat_mul_rank3, mat_mul_rank4, matmul_with_broadcast_bias}`
-//!   [cpu] — wrong values (`0.0522` for `0.0212`). GPU passes the same
-//!   shapes, so suspect the CPU lowering of a promoted `KFold`, not a rule.
-//! * `matmul::{contraction_promotes_a_free_axis, qkv_projection_triple_plan}`
-//!   [gpu] — `kernel kfold_carrier needs 65536 workgroup bytes, the device
-//!   allows 16384`. A promoted carrier's scratch is `lanes * block *
-//!   acc_bytes` and `block` is a *schedule* choice, so neither the minting
-//!   rule nor `verify_l1` can decide it; the `ScheduleDomain` must not offer
-//!   the point, or `moves::candidates` must not offer the node.
-//! * `sampling::sample_standard_token_respects_top_p` [gpu] — token `120`
-//!   from a 16-token vocabulary again, the exact symptom this file's history
-//!   section describes. A third unequal member of that class is still in the
-//!   graph.
-//!
-//! Raising `max_move_work` to 1M on top adds four more
-//! (`sampling::top_k_pairs_*` [cpu], a top-k value where a token id belongs).
-//!
-//! Order matters and is now known: fix those six first, then land the repaired
-//! accept test, then the `splice` widening, then re-take the four ceilings.
-//! Landing the widening or the budget without the accept test is a measured
-//! regression, not a neutral experiment.
-//!
-//! Owned by W7.
+//! [`co_select`] closes this gap by adopting every reader of one producer
+//! class together.
 
 use crate::lower_bound::argmin_member;
 use crate::moves::{self, SchedCache};
@@ -717,8 +623,8 @@ impl Extractor for LocalSearch {
         // graph under a different extraction, and `Work` is a property of
         // the graph alone.
         let mut cache = NodeCache::new(graph.len());
-        // TEMPORARY PROBE — delete before finishing. Names every candidate
-        // this sweep drops and why, gated on `FUSOR2_TUNE_DEBUG`.
+        // Names every candidate this sweep drops and why, gated on
+        // `FUSOR2_TUNE_DEBUG`.
         let dbg = std::env::var_os("FUSOR2_TUNE_DEBUG").is_some();
         {
             for (member, theta, label) in fair {
@@ -935,14 +841,14 @@ fn readers_by_producer(
 /// `attention_grads_all_three` 29/19 -> 17/17 — the first time the two
 /// backends agree on every one of the four shapes.
 ///
-/// # It is only sound because `layout::OPERAND_ALIAS` was fixed first
+/// # It is only sound because every class member computes the same value
 ///
-/// This pass reaches members the budget used to keep unselected, and the
-/// e-graph's invariant is that every member of a class computes the same
-/// value. It did not hold: `OPERAND_ALIAS` re-spelled an `Unflatten` operand
-/// as an `Alias` over the same layout, which drops the map
-/// `sink::fold_operand_views` had stated independently of it. Landing this
-/// pass over the unfixed rule put **29** conformance cases on wrong values.
+/// This pass reaches members the budget otherwise keeps unselected, so it
+/// leans on the e-graph invariant that every member of a class computes the
+/// same value. An `OPERAND_ALIAS` re-spelling an `Unflatten` operand
+/// as an `Alias` over the same layout drops the map
+/// `sink::fold_operand_views` states independently of it; over such a rule
+/// this pass puts **29** conformance cases on wrong values.
 /// Do not weaken that guard to buy launches back.
 ///
 /// # Cost
@@ -1119,7 +1025,7 @@ fn co_select_over(
     Ok(improved)
 }
 
-// TEMPORARY PROBE — delete before finishing. Dumps every launch of every
+// Dumps every launch of every
 // extracted plan when `FUSOR2_DUMP_PLAN` is set, so a launch count can be
 // attributed to specific nodes.
 fn probe_dump(graph: &EGraph, plan: &Plan, _ex: &Extraction, realized: &Realized, caps: &Caps) {
@@ -1158,7 +1064,7 @@ fn probe_dump(graph: &EGraph, plan: &Plan, _ex: &Extraction, realized: &Realized
         }
     }
     let _ = realized;
-    // TEMPORARY PROBE — delete before finishing. One compact line per launch:
+    // One compact line per launch:
     // the kind, whether the body is a pure identity copy, and the launch's
     // operand sources by node id, so the launch graph can be walked offline.
     if std::env::var_os("FUSOR2_DUMP_EDGES").is_some() {
@@ -2282,10 +2188,9 @@ mod tests {
             "best-so-far regressed: {:?}",
             trace.best
         );
-        // CHANGED ASSERTION — this read `trace.micros <= 2 * max_micros`.
-        // The budget is no longer a wall clock: `max_micros` is gone, because
-        // a deadline made the winning plan depend on machine load and the
-        // plan is a cross-process cache key. What bounds the search now is
+        // The budget is not a wall clock: a deadline would make the winning
+        // plan depend on machine load, and the plan is a cross-process cache
+        // key. What bounds the search is
         // realized node visits, and that is what this asserts. The 3,000-deep
         // chain is the pathological shape (one launch with 3,000 members and
         // 3,000 singleton classes).
@@ -2489,13 +2394,10 @@ mod tests {
         // wrote. `realize::needs_own_buffer` states the obligation and
         // `repair` enforces it on the winner.
         //
-        // CHANGED ASSERTION — this previously read
-        // `assert!(!plan.extraction.is_materialized(p))`. It is the M3
-        // fusion goal and it is **not** satisfied: it is blocked on
-        // emitter-side inlining of a multi-member launch, which neither
-        // `fusor2-gpu::lower` nor `fusor2-cpu::lower` implements. The
-        // pricing assertions above are untouched and still pass, so the
-        // remat term itself is still pinned.
+        // `!plan.extraction.is_materialized(p)` is **not** asserted: that
+        // fusion goal is blocked on emitter-side inlining of a multi-member
+        // launch, which neither `fusor2-gpu::lower` nor `fusor2-cpu::lower`
+        // implements. The pricing assertions above pin the remat term itself.
         let plan = s
             .extract(&g, &roots, &cost, ExtractBudget::default())
             .unwrap();
@@ -2531,8 +2433,8 @@ mod tests {
 
     #[test]
     fn the_extractor_stays_object_safe() {
-        // W14's ILP oracle ships behind the same trait; if this stops
-        // compiling the oracle cannot be swapped in.
+        // An ILP oracle can ship behind the same trait; if this stops
+        // compiling it cannot be swapped in.
         let boxed: Box<dyn Extractor> = Box::new(search());
         let (g, roots) = chain_graph(2);
         let cost = TestCost::default();

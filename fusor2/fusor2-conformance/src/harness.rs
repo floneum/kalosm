@@ -6,8 +6,6 @@
 //! should surface as a named failure rather than aborting the whole matrix.
 //! That is also why [`run_one`] wraps each case in `catch_unwind`: an
 //! unfinished op in a dependency is one red row, not a dead run.
-//!
-//! Owned by W14.
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -696,9 +694,9 @@ mod tests {
     fn guard_turns_a_panic_into_a_named_failure() {
         // The whole reason `guard` exists: an unfinished op elsewhere in the
         // workspace must be one red row, not a dead run.
-        let outcome = guard(|| panic!("todo!(\"W13: conv\")"));
+        let outcome = guard(|| panic!("todo!(\"conv\")"));
         match outcome {
-            Outcome::Fail(message) => assert!(message.contains("W13: conv"), "{message}"),
+            Outcome::Fail(message) => assert!(message.contains("conv"), "{message}"),
             other => panic!("expected a failure, got {other:?}"),
         }
     }

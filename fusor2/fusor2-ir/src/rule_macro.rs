@@ -4,8 +4,6 @@
 //! name and emit an early `return None` on mismatch. **No proc macro**: four
 //! of the interesting rules enumerate integer tuples and a pattern DSL would
 //! not earn itself there.
-//!
-//! Owned by W2.
 
 /// Declare a `pub const` [`crate::egraph::Rule`].
 ///

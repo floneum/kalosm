@@ -1,7 +1,5 @@
 //! L2 statements -> naga blocks. `Barrier` becomes `controlBarrier`;
 //! `AtomicAdd` becomes `atomicAdd`, or a bitcast compare-exchange loop on f32.
-//!
-//! Owned by W8.
 
 use fusor2_ir::ir::level2::{
     Accumulator, Addr, ElementType, ScalarElement, Source, Stmt, StorageView, Tile, TileExpr,

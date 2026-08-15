@@ -11,14 +11,8 @@
 //! Each reads only [`Facts`], and each takes `NumericContract::reassoc` as its
 //! legality guard, because every one of them re-associates float arithmetic.
 //!
-//! The architecture calls these a tripwire backed by `resolves_in::<N>` asserts
-//! on eight named backward shapes. **Those asserts are not in the suite yet**,
-//! so nothing outside this file notices a rule that stops firing. The
-//! `on_a_real_tape` module below is the standing substitute: it differentiates
-//! a primal and fires the rule on the node the walk emitted, which is how the
-//! shape mismatch in [`logistic_normalize`] was found.
-//!
-//! Owned by W5.
+//! The `on_a_real_tape` module below verifies each rule fires on the nodes the
+//! adjoint walk emits, not just hand-built patterns.
 
 use fusor2_ir::egraph::{Builder, Facts, Id, Rule, RuleTag};
 use fusor2_ir::ir::level0::{EinSpec, L0, Label};
@@ -893,9 +887,7 @@ mod on_a_real_tape {
         }
     }
 
-    /// The scaled form is the whole point: `(g / (1 + e)) * e` is what the
-    /// differentiator writes, and the bare `e / (1 + e)` it used to require
-    /// never appears.
+    /// The scaled form is what the differentiator writes: `(g / (1 + e)) * e`.
     #[test]
     fn the_bare_quotient_alone_is_not_what_a_tape_emits() {
         let d = Dtype::F32;

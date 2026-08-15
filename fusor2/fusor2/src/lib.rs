@@ -32,9 +32,6 @@
 //! family on this surface: `x.rms_norm(w, eps)` and a hypothetical
 //! `rms_norm_fused` would mint the same node, and how many kernels it launches
 //! is the extractor's answer, not the caller's.
-//!
-//! The intended surface, item by item and with what was deliberately left off
-//! it, is `API.md` at the workspace root.
 
 pub mod autograd;
 mod broadcast;
@@ -50,8 +47,8 @@ pub mod sampling;
 pub mod session;
 pub mod tensor;
 
-/// `API.md`, restated as `use` lines, so the document and the crate cannot
-/// drift. Test-only: it defines no public item.
+/// The intended public surface, restated as `use` lines, so it cannot
+/// silently drift. Test-only: it defines no public item.
 #[cfg(test)]
 mod api_surface;
 

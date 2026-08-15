@@ -1,6 +1,4 @@
 //! Mirostat v2: surprise-targeting sampling with a running mu.
-//!
-//! Owned by W13.
 
 use crate::Result;
 use crate::tensor::Tensor;
@@ -8,7 +6,7 @@ use crate::tensor::Tensor;
 use super::row;
 use super::top_k::GpuSampledToken;
 
-/// Mirostat v2, as the reference's `mirostat2` kernel implements it.
+/// Mirostat v2 sampler.
 ///
 /// Each draw truncates the sorted distribution at the first token whose
 /// surprise `-log2(p)` exceeds `mu`, samples from what is left, and then moves
@@ -40,9 +38,7 @@ impl Mirostat2Sampler {
     ///
     /// The token stays on the device. `mu`, however, is a host `f32` on this
     /// struct, so the updated value has to be read back — one four-byte sync
-    /// per draw. The logits themselves never leave the device. The reference
-    /// avoids even that by keeping `mu` in a device `TensorData`; that is not
-    /// expressible while `mu` is a public `f32` field.
+    /// per draw. The logits themselves never leave the device.
     pub fn sample(&mut self, logits: &Tensor) -> Result<GpuSampledToken> {
         let n = row::row_len(logits)?;
         let graph = logits.graph().clone();
@@ -52,12 +48,11 @@ impl Mirostat2Sampler {
         let total = row::fanout(&row::total_of(&weights)?, n)?.max_scalar(row::EPSILON)?;
 
         // surprise[r] = -log2(p[r]); non-increasing weights make it
-        // non-decreasing, so the tokens failing the mu test are a suffix and
-        // "keep the ones that pass" is exactly the reference's cutoff scan.
+        // non-decreasing, so the tokens failing the mu test are a suffix.
         let probability = weights.div(&total)?.max_scalar(row::EPSILON)?;
         let surprise = probability.log2()?.neg()?;
         let within = surprise.lte_scalar(self.mu)?;
-        // The reference clamps the cutoff to at least one candidate.
+        // Clamp the cutoff to at least one candidate.
         let keep = within.maximum(&row::first_only(&graph, n)?)?;
         let masked = weights.mul(&keep)?;
 

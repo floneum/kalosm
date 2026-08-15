@@ -1,12 +1,7 @@
 //! `KMap` and `KFold`: the elementwise and reduction loop nests.
 //!
-//! Both read their geometry **off `theta`**. The reference derives the same
-//! numbers from three greedy formulas (`static_axis_block`,
-//! `lane_group_width`, `split_lane_groups`) plus an LLC-watermark gate and an
-//! argmax over invariant bytes; here W7 already scored the whole domain
-//! against the realized DAG, so there is nothing left to decide.
-//!
-//! Owned by W9.
+//! Both read their geometry **off `theta`**, which has been scored against
+//! the realized DAG.
 
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
@@ -26,7 +21,7 @@ use fusor2_ir::target::LowerCtx;
 use crate::lower::{Ctx, DimBinding, grid_for, scalar_element};
 use fusor2_tile::domains::emitted_block;
 
-/// Contract-shaped entry point (see CONTRACTS.md §4.10).
+/// Lowering entry point.
 pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     let ctx = Ctx::new(caps, cx, DimBinding::new())?;
     match &node.op {
@@ -107,7 +102,7 @@ pub fn lower_kmap(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Kernel
                 )));
             }
             // A thread-local run along the innermost axis breaks inter-thread
-            // store coalescing, which is why W7's domain never offers it.
+            // store coalescing, which is why the fold domain never offers it.
             if axis + 1 == space.rank() {
                 return Err(Error::Plan(
                     "map tiling on the innermost axis destroys store coalescing".into(),
@@ -129,9 +124,8 @@ pub fn lower_kmap(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Kernel
                 ctx.b.add(scaled, inner)
             };
 
-            // Hoist every operand whose access does not vary along `dim`.
-            // This is the reference's register-reuse body with its
-            // LLC-watermark gate removed: W7 already priced the reuse.
+            // Hoist every operand whose access does not vary along `dim`;
+            // the cost model already priced the reuse.
             let mut hoisted: Vec<Option<TileExpr>> = Vec::with_capacity(ops.len());
             for operand in ops {
                 if operand_is_invariant(operand, axis) {

@@ -1,7 +1,5 @@
 //! [`GpuTarget`] — the [`Target`] implementation tying device, lowering,
 //! emission, the pool, the plan cache and the launcher together.
-//!
-//! Owned by W9.
 
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
@@ -196,7 +194,6 @@ type VerifySlot = Arc<parking_lot::Mutex<bool>>;
 /// than inheriting an error it cannot clone.
 type PipelineSlot = Arc<parking_lot::Mutex<Option<Artifact>>>;
 
-// TEMPORARY PROBE — delete before finishing.
 static LAST_EXIT: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
 pub static COMPILE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LOWER_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -327,8 +324,7 @@ impl GpuTarget {
         Self::from_device(device, config)
     }
 
-    /// Build over an already-requested device. This is the entry point W8's
-    /// `DeviceSetup` feeds.
+    /// Build over an already-requested device.
     pub fn from_device(device: Arc<GpuDevice>, config: GpuConfig) -> Result<Self> {
         let wgpu_device = Arc::new(device.device().clone());
         let queue = Arc::new(device.queue().clone());
@@ -589,7 +585,6 @@ impl GpuTarget {
                     None => self.pipeline_for(&l.ir, l.ph)?,
                 };
                 let i = cold[j];
-                // TEMPORARY PROBE — delete before finishing.
                 if gap && std::env::var_os("FUSOR2_COLDLIST").is_some() {
                     let gs = l.binding.grid_derivation(l.ir.grid, &self.caps().limits);
                     eprintln!(
@@ -689,8 +684,8 @@ impl GpuTarget {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
         {
-            // TEMPORARY PROBE — delete before finishing. Times live dispatches
-            // `[start, start+cap)` of an over-cap plan and prints each span.
+            // Times live dispatches `[start, start+cap)` of an over-cap plan
+            // and prints each span.
             let live = records.iter().filter(|r| !r.is_empty_dispatch()).count();
             let cap = (wgpu::QUERY_SET_MAX_QUERIES as usize / 2).min(live.saturating_sub(start));
             if cap == 0 {
@@ -771,7 +766,6 @@ impl GpuTarget {
                 return Ok(());
             }
             if let TimingMode::Range { start, n } = mode {
-                // TEMPORARY PROBE — delete before finishing.
                 let samples = self.launcher.read_timestamps(&self.pool, set, n)?;
                 let names: Vec<&'static str> = work
                     .iter()
@@ -840,8 +834,8 @@ impl GpuTarget {
     /// lookup; what it costs is nothing next to the lowering and the shader
     /// compile it decides against.
     ///
-    /// `binding` is the resolve's, built once and handed down. It used to be
-    /// rebuilt here — a fresh `FxHashMap` and two `Arc<Mutex>` per *launch*,
+    /// `binding` is the resolve's, built once and handed down: rebuilding it
+    /// here would cost a fresh `FxHashMap` and two `Arc<Mutex>` per *launch*,
     /// 1,731 of them a decode token, to fold a grid.
     fn cached_artifact(
         &self,
@@ -948,7 +942,6 @@ impl GpuTarget {
     /// tier first. Called with the body's [`pipeline_hash`] slot held, so at
     /// most one worker is ever inside it for a given body.
     fn compile_body(&self, ir: &KernelIr, ph: u128) -> Result<Artifact> {
-        // TEMPORARY PROBE — delete before finishing.
         let __t = Instant::now();
         let _g = scopeguard_compile(__t);
         let share = !no_pipeline_share();
@@ -1014,7 +1007,6 @@ impl GpuTarget {
         let binding = crate::lower::DimBinding::from_pairs(
             binds.dims.iter().map(|(k, v)| (*k, *v)),
         );
-        // TEMPORARY PROBE — delete before finishing.
         let __tl = Instant::now();
         let mut kernels =
             crate::lower::lower_node(self.caps(), node, theta, &cx, binding.clone(), pack.clone())?;
@@ -1040,7 +1032,6 @@ impl GpuTarget {
         };
         let mut done = slot.lock();
         if !*done {
-            // TEMPORARY PROBE — delete before finishing.
             let __tv = Instant::now();
             fusor2_tile::verify_l2(&ir, self.caps())?;
             VERIFY_US.fetch_add(

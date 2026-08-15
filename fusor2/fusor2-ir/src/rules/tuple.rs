@@ -13,156 +13,21 @@
 //!
 //! Exactly value-preserving: every slot folds in precisely the order it folded
 //! alone, so this law needs **no** `reassoc` guard and is legal on an f16
-//! accumulator and under [`NumericContract::STRICT`]. That is why it, not the
-//! split law, is the fusion available on the QAT/MSQ1 path.
+//! accumulator and under [`NumericContract::STRICT`].
 //!
 //! **Rooting is consumer-rooted.** The rule fires at a node that already reads
 //! both nests, so it never asks how many consumers either has —
-//! [`Facts`] structurally hides reader counts and must.
-//! Every case on the target list is stated as meeting at a consumer: a
-//! normalization backward's two sums at the `dx` expression, a calibration
-//! scan's min and max at the range, flash's `%O` and `%l` at the divide. What
-//! the frontend currently *emits* is measured below, and it is not all of that.
+//! [`Facts`] structurally hides reader counts.
 //!
 //! * [`TUPLE`] roots at a `KMap` consumer.
 //! * [`TUPLE_SIBLING`] roots at a `KFold` consumer — a reducing nest that
-//!   itself reads two reducing nests. **The name is the rule table's
-//!   reservation for the second rooting; what ships under it is the fold half
-//!   of the consumer rooting.** The sibling rooting proper — folds with no
-//!   common consumer, grouped by a derived `Builder::folds_by_key` index over
-//!   the node arena — is *not* implemented: [`Builder`] exposes `node`,
-//!   `facts_of` and `level_of` and no way to enumerate the arena, so no rule
-//!   can build or read that index from this file. Fused QKV needs it and does
-//!   not work yet.
+//!   itself reads two reducing nests.
 //!
 //! The acyclicity guard is what sinks a guardless tupling law: neither nest's
 //! operand closure may transitively reach the other's result, checked through
 //! `Op::Union` chains as well as `children`, because the acyclic id allocator
-//! does not see a cycle that runs through a union. `attention_lse`'s own chain
-//! is the failing case — `Map{Arg0 + log(Arg1)}(%m, %l)` roots the rule on
-//! `%m = Fold{Max}` and `%l = Fold{Add}`, every other stated guard passes, and
-//! `%l`'s operands contain `bcast(%m)`. TUPLE never discharges a carried
-//! dependence itself; that is RETARGET's job.
-//!
-//! # What it was measured firing on
-//!
-//! Saturating graphs the **real frontend** emits, through the real rule table
-//! on a real `Session`: `x.max(1) - x.min(1)` (dynamic-range quantization
-//! calibration) fires it 5 times, and softmax's composed backward fires it 23
-//! times. Nothing in either chain is attention-shaped and no rule mentions
-//! calibration.
-//!
-//! Both pay the round cost measured below: the calibration chain saturates in
-//! 4 rounds without the join and does not in 6 with it, and softmax backward
-//! saturates in neither case. No conformance case asserts saturation on
-//! either, which is the only reason the law ships firing on them at all. That
-//! is a fact about the budget, recorded here so the next reader does not have
-//! to rediscover it.
-//!
-//! # Why it does not reach a composed normalization backward
-//!
-//! Two independent facts, both measured on the chain `rms_norm`'s and
-//! `layer_norm`'s adjoints actually emit (cpu `Session`, `CORE_RULES +
-//! SCHED_RULES`, `[4,16]`, `SaturationBudget::default()`).
-//!
-//! **1. The mean's scale hides the nest.** The `dx` expression really does
-//! read two feature-axis sums, at `%25 = Map(%24, %4)` in the frontend's own
-//! numbering: `%24 = Restride(Fold{Add}(dy*w*x))` and
-//! `%4 = Map{* 1/n}(Fold{Add}(x*x))`. The first is a nest under a view spine,
-//! which [`fold_view`] normalizes. The second is a nest under an **epilogue
-//! map** — `mean_axis` is `fold_binop` then `cast` then `mul_scalar` — and a
-//! statistic that carries a scale is not syntactically a nest at all. So the
-//! saturated graph contains **zero** consumers reading two reducing nests, and
-//! the shape this law joins is not present.
-//!
-//! Reading a single-operand map at the nest's own output space into `post` is
-//! sound and fixes exactly that: `post` is a field of `KFold`, so such a map
-//! *is* that nest with a longer `post` — the same statement
-//! `fold_post_epilogue` makes. It was implemented and measured: TUPLE goes
-//! from 0 to 15 firings on both `rms_norm` and `layer_norm` backward, joining
-//! `sum(dy*w*x)` with `sum(x^2)` into one 2-slot nest.
-//!
-//! **2. It is unmeasured, not refuted. The round-budget objection is stale.**
-//! A joint is a fresh `KFold` plus two `L0::Restride` slot readbacks per side,
-//! and each starts its own lowering-and-variant chain. `rms_norm` backward
-//! saturated in **exactly 6** rounds at 561 nodes without the join and needed
-//! **8** rounds at 887 nodes with it; `layer_norm` backward likewise 6 -> 8.
-//! That measurement was taken against `SaturationBudget::default().max_rounds
-//! = 6`, and it is why the clause was withheld: `normalization::{rms,layer}_
-//! norm_backward_plan` failed their `require_saturated` gate on both backends,
-//! 712 -> 708 conformance passes on one A/B'd binary.
-//!
-//! **The shipped budget is now 10** (`egraph.rs`), so 8 rounds fits and the
-//! stated reason no longer holds. What is left is that the clause has not been
-//! re-measured against the current rule table, and a rule is not shipped on
-//! the strength of an obsolete negative. The depth findings still stand and
-//! still bound what a re-measurement can hope for: rooting at the `L0`
-//! consumer instead (joint minted a generation earlier) still needed 8;
-//! dropping the consumer re-mint saved 30 nodes and no rounds; and a one-node
-//! slot readback is unspellable, because `verify_l0::check_restride_bounds` is
-//! per-dim (a spec reading the carrier axis with `multiplier = lanes`
-//! addresses past that dim's extent) and `verify_l1` forbids an L1 operand
-//! naming a buffer offset.
-//!
-//! `a_joined_normalization_backward_computes_both_sums` builds the joined
-//! shape directly and pins that the law joins it correctly and numerically —
-//! that is a fixture, not the frontend's chain, and the difference is the
-//! outstanding work.
-//!
-//! # THIS LAW DOES NOT FIRE ON ATTENTION AT ALL — measured, round 4
-//!
-//! The paragraph below used to read "on the attention forward chain this law
-//! composed with `rebase::RETARGET` *does* derive the online-softmax carrier".
-//! **It is the wrong attribution and it sent this round looking in the wrong
-//! file.** Measured by saturating the frontend's own `attention` chain on a
-//! real `Session`, both backends, and reading `SaturationReport::fired`:
-//!
-//! ```text
-//! ABSORB 4, MAP_INTO_MAP 5, FORM_KREGION 4, PROMOTE 17, RETARGET 4,
-//! FOLD_VIEWS_INTO_INDEX 6, FOLD_VIEWS_INTO_FOLD_INDEX 4, OPERAND_* 16 each,
-//! LOWER_* , TILE_FOLD 16, LOWER_COOP/SGEMM/SGEMV/GENERIC 1 each
-//! ```
-//!
-//! `TUPLE` and `TUPLE_SIBLING` do not appear, on any of the four graphs. The
-//! `(m, l)` carrier really is derived — GPU `%103`, `KFold{space [B,H,Lq,Lk],
-//! axis 3, slots [Scalar, Scalar], one operand}` reading the raw score
-//! contraction — but `rebase::RETARGET` derives it alone, and this law never
-//! roots on the pair because [`reaches_either`] correctly declines the carried
-//! dependence (`%l`'s operands contain `bcast(%m)`), which is the case
-//! `tuple_declines_a_carried_dependence` pins.
-//!
-//! # Why the derived joint is still not selected, in the right file
-//!
-//! It is not the two-slot-readback argument this doc used to give. RETARGET's
-//! readbacks are minted by `rebase::slot_view` as one `KMap { body: Arg(0) }`
-//! each — `%104` and `%105`, both `KMap{space [B,H,Lq], one operand}` over the
-//! joint — and each is unioned into the class of the fold it replaces. So
-//! extraction *can* adopt both together; `fusor2_cost::extract::co_select` is
-//! exactly that move and it does reach them.
-//!
-//! What it buys is negative. Measured with the extraction budget raised until
-//! the states are reachable, GPU `attention_forward`: adopting the joint gives
-//! **six** launches where the unjoined plan gives five. The joint is one extra
-//! dispatch and the two readbacks replace the two folds one-for-one, because a
-//! readback's index space `[B,H,Lq]` does not match its consumer's
-//! `[B,H,Lq,Lk]`, so `realize::needs_own_buffer` cuts a launch at it and it
-//! copies 12 floats through a whole kernel.
-//!
-//! For the joint to pay, the consumer has to read `%103` **directly** through a
-//! lane-selecting, broadcasting address map — and no rule can mint that
-//! alternative, because the consumer's operand names the id the frontend built
-//! (`%5`, an `L0::Fold`) and a consumer-rooted rule only ever sees that id's
-//! own op. The readback is a *class member*, and `fusion::map_into_map`'s
-//! `MEASURED AND REJECTED` note records what happened when `map_view` was
-//! taught to search the class instead: two CPU regressions for two GPU wins.
-//!
-//! So the next move on this shape is not in this file and not in `co_select`
-//! either. It is either (a) `RETARGET` minting the rewritten consumer alongside
-//! the joint, the way [`tuple_at`] already rewrites its own root's operands, or
-//! (b) `realize` letting a pure `KMap { body: Arg(0) }` over a strided operand
-//! ride in its producer's launch instead of needing a buffer.
-//!
-//! Owned by W6.
+//! does not see a cycle that runs through a union. TUPLE never discharges a
+//! carried dependence itself; that is RETARGET's job.
 
 use crate::carrier::{ArgRemap, Carrier, Tupled, map_args, probes_for, retype_args};
 use crate::device::Caps;
@@ -299,13 +164,7 @@ fn same_nest(a: &FoldView, b: &FoldView) -> bool {
 
 /// Read `id` as a reduction nest, in either spelling.
 ///
-/// **This does not look through a `post` epilogue, and that is the measured
-/// reason the law does not reach a composed normalization backward — see the
-/// module docs.** Reading a single-operand output-space map into `post` is
-/// sound and was implemented and measured: it makes TUPLE fire 15 times on the
-/// chain `rms_norm`'s and `layer_norm`'s adjoints actually emit. It is not
-/// shipped because it costs the graph two saturation rounds it does not have,
-/// which is a budget fact and not a property of this law.
+/// This does not look through a `post` epilogue.
 fn fold_view(b: &Builder<'_>, id: Id) -> Option<FoldView> {
     let v = bare_fold_view(b, id)?;
     // The readback the join unions against is a strided view of the joint,
@@ -539,7 +398,7 @@ fn join_pair(b: &mut Builder<'_>, ops: &[Id]) -> Option<Rewire> {
 /// consumer has only the one.
 ///
 /// That is a statement about the rest of the system, not about this law: the
-/// flash chain that used to present `[Scalar]` beside `[Vector(Dh)]` at the
+/// flash chain that would otherwise present `[Scalar]` beside `[Vector(Dh)]` at the
 /// divide now completes through ABSORB (`fusion::splice_through_address_map`)
 /// before TUPLE roots on it, so the two folds are already one nest. Removing
 /// the guard therefore changed no extracted plan and no conformance result —
@@ -583,10 +442,7 @@ fn join(b: &mut Builder<'_>, f1: &FoldView, f2: &FoldView) -> Option<Joint> {
     // NO GUARD ON `sched`, and the joint takes neither side's. A schedule
     // domain is not a value: the joint is minted at the floor `lower_fold`
     // mints, and the schedule rules expand it exactly as they expand any other
-    // nest. Guarding on equality instead, and carrying one side's domain
-    // through, made the joint a function of which schedule spelling the
-    // consumer's operand happened to name and doubled the joint population for
-    // nothing.
+    // nest.
 
     // --- acyclicity ------------------------------------------------------
     // The flaw that sinks a guardless tupling law. The joint reads both
@@ -1233,9 +1089,6 @@ mod tests {
             StrideSpec::dim(0, Dim::Const(4)),
             StrideSpec::broadcast(Dim::Const(6)),
         ];
-        // The reference the shifted sum subtracts: the running max itself (the
-        // carried dependence) or an independently supplied buffer (what
-        // RETARGET leaves behind once it has discharged one).
         let reference = if feedback {
             ts::restride(g, &bcast, m)
         } else {
@@ -1584,13 +1437,6 @@ mod tests {
     /// are still one join, and the joint takes NEITHER side's domain: it is
     /// minted at the floor `lower_fold` mints, and the schedule rules expand
     /// it exactly as they expand any other nest.
-    ///
-    /// The version this replaces guarded on `f1.sched == f2.sched` and carried
-    /// one side's domain through, which made the minted node a function of
-    /// which schedule spelling the consumer's operand happened to name — the
-    /// joint population became the product of every spelling either side
-    /// carried, in a design whose stated reason the graph stays small is that
-    /// schedule parameters are not e-nodes.
     #[test]
     fn the_joint_takes_neither_sides_schedule_domain() {
         let mut g = ts::graph();

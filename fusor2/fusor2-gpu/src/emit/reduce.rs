@@ -1,8 +1,6 @@
 //! Cross-lane reductions: subgroup collectives, shared-memory trees, and the
 //! loop-then-tree hybrid. The strategy is a parameter on the node, so it stays
 //! a late capability-driven choice rather than a construction-time one.
-//!
-//! Owned by W8.
 
 use fusor2_ir::ir::level2::{
     Builtin, ElementType, ReduceKind, ScalarElement, Tile, TileExpr, TileExprKind, TileReduceOp,

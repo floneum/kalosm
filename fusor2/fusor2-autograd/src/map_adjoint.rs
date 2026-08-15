@@ -12,8 +12,6 @@
 //! term inside the same kernel body rather than an extra operand edge, and
 //! whether the forward `exp` is instead materialized and reread stays the
 //! extractor's materialization bit.
-//!
-//! Owned by W5.
 
 use fusor2_ir::autograd::{Grads, Tape, Val};
 use fusor2_ir::dtype::{Dtype, Splat};
@@ -327,11 +325,7 @@ fn binary_derivative(
                 ScalarExpr::un(UnOp::Log, a.clone()),
             ),
         ),
-        // Each side gets a **strict** mask, so a tie sends the gradient
-        // nowhere. That is the reference's `max_elementwise`, whose adjoint is
-        // `grad * input.mt(rhs)` (`mt` is `gt_scalar`), and `min_elementwise`,
-        // whose adjoint is `grad * input.lt(rhs)`. The inclusive `Ge`/`Le` this
-        // replaced made `relu = max(x, 0)` differentiate to 1 at x = 0.
+        // Each side gets a strict mask, so a tie sends the gradient nowhere.
         //
         // `TiePolicy::FirstWins` is not this: it belongs to `Combine::Max`, the
         // fold, where exactly one element must own the reduction.
@@ -689,13 +683,6 @@ mod tests {
     }
 
     /// A tie sends the gradient to neither side.
-    ///
-    /// This replaces `max_and_min_break_ties_left`, which asserted the
-    /// inclusive `Ge`/`Le` masks. Those disagree with the reference:
-    /// `fusor/src/autograd/elementwise.rs::max_elementwise` differentiates to
-    /// `grad * input.mt(rhs)` and `min_elementwise` to `grad * input.lt(rhs)`,
-    /// both strict. The observable consequence was `relu = max(x, 0)`
-    /// differentiating to 1 at x = 0 instead of 0.
     #[test]
     fn max_and_min_send_a_tie_to_neither_side() {
         for op in [BinOp::Max, BinOp::Min] {

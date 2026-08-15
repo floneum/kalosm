@@ -15,8 +15,6 @@
 //!    somewhere;
 //! 7. every launch's bind group — its operands **plus the `Uniforms` block** —
 //!    fits `max_storage_buffers_per_shader_stage`.
-//!
-//! Owned by W7.
 
 use crate::plan::UNKNOWN_SYM;
 use crate::realize::{self, scalar_element, tiles_for};

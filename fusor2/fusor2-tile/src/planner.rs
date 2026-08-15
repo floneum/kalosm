@@ -5,11 +5,7 @@
 //! `caps.fingerprint()`. `workgroup_bytes` synthesizes a minimal body over a
 //! candidate geometry's tiles and runs the *same* function, so `verify_l1`'s
 //! admission test, the L1 occupancy term and the L2 emitter's layout are
-//! provably the same number. There is no estimator, therefore no L1/L2
-//! admission mismatch and no "extraction commits a plan that fails L2
-//! verification and silently falls back".
-//!
-//! Owned by W3.
+//! provably the same number.
 
 use std::sync::{Arc, OnceLock};
 
@@ -837,13 +833,11 @@ mod tests {
 
         // The *layout* is identical — that is what "deterministic" claims.
         //
-        // This used to be `assert_eq!(plan_a, plan_b)`, which held only
-        // because `TileDecl` compared structurally. It is identity-bearing
-        // now, so two allocations of the same shape are two tiles and the two
+        // `assert_eq!(plan_a, plan_b)` would be wrong: `TileDecl` is
+        // identity-bearing, so two allocations of the same shape are two
+        // tiles and the two
         // plans deliberately name different ones — as the `ptr_eq` check
-        // below has always demanded. Comparing whole plans asserted the
-        // opposite of that check and could only pass while tiles had no
-        // identity.
+        // below demands.
         assert_eq!(plan_a.mode, plan_b.mode);
         assert_eq!(plan_a.total_bytes, plan_b.total_bytes);
         assert_eq!(plan_a.barriers_inserted, plan_b.barriers_inserted);

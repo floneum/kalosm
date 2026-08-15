@@ -7,8 +7,6 @@
 //! repeat *and* an unread row, because an index set that happens to be a
 //! permutation cannot tell a correct scatter-add from a scatter-set, and one
 //! with full coverage cannot tell an explicit zero from a missing gradient.
-//!
-//! Owned by W14.
 
 use fusor2::{Dtype, Session};
 

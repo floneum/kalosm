@@ -2,15 +2,12 @@
 //!
 //! `KernelIr` is **compiled**, not interpreted per element. [`compile`] lowers
 //! one kernel into a [`Program`]: a flat SSA `tape` plus a list of segments.
-//! Flattening the hash-consed `TileExpr` DAG into the tape *is* the CSE that
-//! replaces the reference's deleted `Shared` node and its `Rc::as_ptr` memo.
+//! Flattening the hash-consed `TileExpr` DAG into the tape is the CSE.
 //!
 //! One grid point is one workgroup. `block` lanes are walked in chunks of `W`,
 //! and `Stmt::Barrier` lowers to a **segment split** (see
 //! [`stmt::block`]) so a lane chunk can never read a tile slot a later chunk
 //! has not written.
-//!
-//! Owned by W10.
 
 pub mod access;
 pub mod expr;

@@ -13,5 +13,4 @@ fusor2-ir.workspace = true
 smallvec.workspace = true
 rustc-hash.workspace = true
 half.workspace = true
-bytemuck.workspace = true
 memmap2.workspace = true

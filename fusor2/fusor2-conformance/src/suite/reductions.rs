@@ -6,8 +6,6 @@
 //! that table that can be wrong in an interesting way. A reduction whose
 //! split and unsplit forms disagree past tolerance means `fold_split` fired
 //! where `NumericContract::reassoc` forbade it.
-//!
-//! Owned by W14.
 
 use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;

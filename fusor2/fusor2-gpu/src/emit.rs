@@ -8,8 +8,6 @@
 //! a single expression is lowered. Gating f16 here rather than lazily is what
 //! makes an f16 handle on a non-f16 adapter fail with
 //! [`EmitError::MissingCapability`] instead of mis-lowering.
-//!
-//! Owned by W8.
 
 pub mod coop;
 pub mod expr;
@@ -69,8 +67,7 @@ pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<EmittedModule, EmitError> {
     emit_module(ir, caps, &plan)
 }
 
-/// Emit with a plan the caller already has. W9 uses this: it holds the plan
-/// from admission and must not recompute it.
+/// Emit with a plan the caller already has, which must not be recomputed.
 pub fn emit_module(
     ir: &KernelIr,
     caps: &Caps,

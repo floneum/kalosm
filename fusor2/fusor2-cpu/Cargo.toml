@@ -11,7 +11,6 @@ repository.workspace = true
 [dependencies]
 fusor2-ir.workspace = true
 fusor2-tile.workspace = true
-fusor2-cost.workspace = true
 fusor2-gguf.workspace = true
 smallvec.workspace = true
 rustc-hash.workspace = true

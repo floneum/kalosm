@@ -1,17 +1,13 @@
 //! The plan cache: memory LRU plus a disk tier, salted by exe identity and the
-//! `DeviceFacts` fingerprint — which **includes**
-//! `max_compute_workgroup_storage_size`, a field the reference omits while its
-//! coop legality filter reads it, a live staleness hazard.
+//! `DeviceFacts` fingerprint — which includes `max_compute_workgroup_storage_size`.
 //!
 //! A [`CachedKernelPlan`] is bufferless: the compiled template plus, per
 //! binding slot, the caller-buffer index it wants, plus, per caller position,
 //! the first position holding the same buffer. `record_plan` refuses (silently,
 //! returning `None`) to record a kernel that binds a buffer the caller did not
 //! present, and [`binding_shape_matches`] requires the caller's aliasing
-//! pattern to reproduce the recorded one **exactly** — a kernel body is only
+//! pattern to reproduce the recorded one exactly — a kernel body is only
 //! correct for callers with the identical aliasing pattern.
-//!
-//! Owned by W9.
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -503,10 +499,9 @@ mod tests {
         }
     }
 
-    /// Test 9: two `DeviceFacts` differing **only** in
+    /// Test 9: two `DeviceFacts` differing in
     /// `max_compute_workgroup_storage_size` must land in different salt
-    /// directories. The reference omits this field while its coop legality
-    /// filter reads it.
+    /// directories.
     #[test]
     fn disk_salt_includes_workgroup_storage() {
         let a = disk_salt(&facts(16384));

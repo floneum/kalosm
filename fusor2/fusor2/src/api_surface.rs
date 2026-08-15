@@ -1,13 +1,12 @@
-//! `API.md`, restated as `use` lines.
+//! The intended public surface, restated as `use` lines.
 //!
-//! The intended public surface is written down in `API.md` at the workspace
-//! root. A document drifts; a `use` line does not. Every item that file says
-//! is public is named here, so deleting or moving one is a compile error in
-//! this crate rather than a discovery made by a downstream build.
+//! Every item the crate means to export is named here, so deleting or moving
+//! one is a compile error in this crate rather than a discovery made by a
+//! downstream build.
 //!
 //! It is equally a check in the *other* direction, and that is the harder one
-//! to keep: nothing is listed here that `API.md` does not list. When an item
-//! goes back on the surface, it goes in both files or in neither.
+//! to keep: nothing is listed here that is not meant to be public. An item
+//! goes on the surface here and in the crate root together, or in neither.
 //!
 //! Test-only. It defines no public item and calls nothing.
 
@@ -49,10 +48,9 @@ const ROOT_TENSOR_IS_THE_CONST_RANK_ONE: fn(crate::tensor::typed::Tensor<2, f32>
 const ROOT_DEVICE_IS_THE_SESSIONS_OWNER: fn(crate::device::Device) -> Device = |d| d;
 const DYN_IS_THE_RUNTIME_RANK_TENSOR: fn(crate::tensor::Dyn) -> Dyn = |t| t;
 
-/// § 6 and § 7, as signatures. Each is a coercion from the item to the shape
-/// `API.md` says it has, so a changed rank parameter, a changed element
-/// parameter or a `Result` creeping back into a forward is a compile error
-/// here.
+/// Signatures as coercions that compile only when types match the expected shapes,
+/// so a changed rank parameter, a changed element parameter or a `Result`
+/// creeping back into a forward is a compile error here.
 ///
 /// Never called.
 const OPS_ARE_METHODS_ON_THE_CONST_RANK_TENSOR: fn(&Tensor<4>, &Tensor<4>, &Tensor<2>) = |q, v, t| {
@@ -73,8 +71,7 @@ const OPS_ARE_METHODS_ON_THE_CONST_RANK_TENSOR: fn(&Tensor<4>, &Tensor<4>, &Tens
     let _: Vec<f32> = t.to_vec_f32();
 };
 
-/// § 7: the layer and cache parameters, and that a `forward` is rank-generic
-/// over the activation and infallible.
+/// Layer and cache parameters, with rank-generic `forward` methods.
 const LAYERS_AND_CACHES_ARE_GENERIC: fn() = || {
     fn linear<T: Element, const R: usize>(l: &Linear<T>, x: &Tensor<R, T>) -> Tensor<R, T> {
         l.forward(x)
@@ -136,9 +133,8 @@ mod tests {
 
     /// `Tensor::device()` returns the type the constructors take.
     ///
-    /// The prose reason this matters is in `API.md` § 3; the mechanical one is
-    /// that this expression is what a model writes when it builds a value
-    /// beside another, and until this change it did not compile.
+    /// This expression is what a model writes when it builds a value
+    /// beside another.
     #[test]
     fn a_device_round_trips_through_a_value() {
         let _serial = crate::device::test_device_lock();
@@ -150,8 +146,7 @@ mod tests {
         let _: &Dyn = x.as_dyn();
     }
 
-    /// The root is one naming. `API.md` § 3 says the `typed-api` feature is
-    /// deleted; `Cargo.toml` is where that is true or not.
+    /// The `typed-api` feature is deleted.
     #[test]
     fn the_crate_declares_no_api_switching_feature() {
         let manifest = include_str!("../Cargo.toml");

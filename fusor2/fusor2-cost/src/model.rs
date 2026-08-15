@@ -6,17 +6,10 @@
 //!
 //! T1 and T2 are **summed** inside the `max` because they contend for the
 //! same per-core issue and load/store slots; DRAM overlaps them; the combine
-//! dispatch sits behind its own barrier and adds. That summation is what
-//! makes the Apple anchors rank correctly and is `cost.rs:272`.
+//! dispatch sits behind its own barrier and adds.
 //!
-//! One scalar. **Never a lexicographic tuple**: the reference's own unit
-//! test shows the tuple gives the wrong verdict, and its own doc concedes
-//! dispatches are 0.2% of modelled time while the tuple will pay unbounded
-//! bandwidth to remove one. **Never a precision term**: precision is a
-//! verifier property (`NumericContract`), because a time-only model
-//! eliminates f32 everywhere.
-//!
-//! Owned by W6.
+//! One scalar. Precision is a verifier property (`NumericContract`), not a
+//! cost term, because a time-only model eliminates f32 everywhere.
 
 use crate::terms;
 use fusor2_ir::cost::{CostModel, DeviceFacts, LaunchPlan, MacUnit, Picoseconds, ShapeStats};
@@ -120,7 +113,7 @@ impl Roofline {
     /// and the device fingerprint.
     ///
     /// This is a *stand-in*. The authoritative `PlanHash` is
-    /// `plan::plan_hash` over the whole realized term (W7); a launch alone
+    /// `plan::plan_hash` over the whole realized term; a launch alone
     /// cannot see that term. It is derived here rather than read off
     /// [`LaunchPlan`] because that struct carries no hash — reported as a
     /// contract gap.
@@ -391,9 +384,8 @@ mod tests {
 
     /// The launch a cooperative contraction at one schedule point produces,
     /// with every quantity derived exactly the way `score_fs` derives its
-    /// own. This is the arithmetic W1's `work()` and W7's `realize()` will
-    /// own; reproducing it here means the anchors test measures the cost
-    /// model rather than a stub.
+    /// own. Reproducing the arithmetic of `work()` and `realize()` here means
+    /// the anchors test measures the cost model rather than a stub.
     #[allow(clippy::too_many_arguments)]
     fn coop_case(
         p: Profile,
@@ -483,7 +475,7 @@ mod tests {
     }
 
     /// Best cost of one profile on one contraction, minimized over its legal
-    /// split counts and staging depths exactly as the reference does.
+    /// split counts and staging depths.
     fn best_cost(model: &Roofline, p: Profile, m: u32, k: u32, n: u32, elem_bytes: u64) -> u64 {
         let max_storage = model.facts.caps.limits.max_compute_workgroup_storage_size;
         let mut best = u64::MAX;

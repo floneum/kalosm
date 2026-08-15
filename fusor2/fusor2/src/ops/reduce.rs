@@ -3,8 +3,6 @@
 //! a `Map`. Nothing here chooses a reduction strategy — `fold_split` is the
 //! single rule that turns any of them into a two-stage reduction when the
 //! extractor decides the axis is long enough to pay for it.
-//!
-//! Owned by W12.
 
 use fusor2_ir::carrier::Carrier;
 use fusor2_ir::ir::level0::{L0, TiePolicy};
@@ -76,8 +74,7 @@ impl Tensor {
     pub fn min(&self, axis: usize) -> Result<Tensor> {
         self.fold(BinOp::Min, Some(TiePolicy::SplitEvenly), axis)
     }
-    /// Maximum with an explicit tie policy. Parity with a reference trainer
-    /// is a declaration, not an accident.
+    /// Maximum with an explicit tie policy.
     pub fn max_with_tie(&self, axis: usize, tie: TiePolicy) -> Result<Tensor> {
         self.fold(BinOp::Max, Some(tie), axis)
     }

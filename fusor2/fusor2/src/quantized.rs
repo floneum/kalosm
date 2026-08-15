@@ -3,8 +3,6 @@
 //! Both storage layouts are legal inputs everywhere; moving between them is
 //! the priced `qrepack` rewrite, so layout never feeds back into routing
 //! through format variants.
-//!
-//! Owned by W13.
 
 use fusor2_gguf::VarBuilder;
 use fusor2_ir::dtype::{Dtype, QFmt, QLayout};
@@ -215,14 +213,9 @@ impl QMatrix {
     /// which is the orientation a GGUF weight is stored in. `[.., k]` in,
     /// `[.., rows]` out.
     ///
-    /// A rank-1 activation is one matrix row, so it routes through a
-    /// `[1, k]` view and reshapes back — the same promotion the reference
-    /// makes. A rank-3-or-higher activation is the *same* promotion in the
-    /// other direction: a weight is rank 2 and [`Tensor::matmul_t`] shares no
-    /// batch rank with it, so the leading axes fold into the row axis and are
-    /// restored on the way out. Both `kalosm-llama` and `rwhisper` carried a
-    /// byte-identical private helper doing exactly this because the method
-    /// stopped at rank 2; the views it builds are the views they built.
+    /// A rank-1 activation routes through a `[1, k]` view and reshapes back.
+    /// A rank-3-or-higher activation folds leading axes into the row axis
+    /// (since the weight is rank 2) and restores them on the way out.
     pub fn q_mat_mul(&self, act: &Tensor) -> Result<Tensor> {
         match act.rank() {
             1 => {
@@ -263,17 +256,13 @@ impl QMatrix {
 
     /// The rows named by `idx`, decoded to `dtype`.
     ///
-    /// `Dequant` then `Gather`, which is the reference's spelling: the decode
-    /// is a value, the row pick is a value, and which program computes them is
-    /// the extractor's decision rather than this method's.
+    /// `Dequant` then `Gather`: the decode is a value, the row pick is a
+    /// value, and which program computes them is the extractor's decision.
     ///
     /// The fused form is a *member*, not a spelling: `GATHER_QUANTIZED_ROWS`
     /// matches this `Gather`-of-`Dequant` pair and mints a float-typed
     /// [`GatherMode::QuantizedRows`] `KGather` reading the quantized leaf
-    /// directly (`infer_l1` gives the mode `F32`, so nothing decodes twice —
-    /// the wrong-values trap an earlier gather-of-quantized-leaf spelling
-    /// fell into). The extractor picks it on cost, which is what deleted the
-    /// 2.1 GB dense-table launch an 8B model's per-token lookup paid.
+    /// directly.
     ///
     /// [`GatherMode::QuantizedRows`]: fusor2_ir::ir::level1::GatherMode::QuantizedRows
     pub fn index_select_rows_to(&self, idx: &Tensor, dtype: Dtype) -> Result<Tensor> {
@@ -540,8 +529,7 @@ mod tests {
 
         // ... and the same shape at `Native`, wherever the block stride tiles
         // the word stream: the f16 scales decode through `f16_lane`, so this
-        // class holds a real alternative to the block program rather than the
-        // bare sugar it used to.
+        // class holds a real alternative to the block program.
         let (q4k, _) = matrix(&g, QFmt::Q4K, QLayout::Native);
         let (members, sugars, defns) = shape(&q4k);
         assert!(members >= 2, "expected sugar + defn, got {members}");

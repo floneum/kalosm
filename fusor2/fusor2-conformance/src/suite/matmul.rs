@@ -2,8 +2,6 @@
 //! `lower_coop`, `lower_sgemm`, `lower_sgemv` and `lower_generic` coexist in
 //! one chain — so a case here that produces the right numbers is evidence
 //! that whichever family extraction picked is correct, on both backends.
-//!
-//! Owned by W14.
 
 use fusor2::{Dtype, Session};
 

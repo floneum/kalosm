@@ -6,8 +6,6 @@
 //! symbolic-shape path too, where injectivity of a relative stride
 //! composition is undecidable and a `Restride`-based pool would have to
 //! degrade to a scatter.
-//!
-//! Owned by W13.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt, accum_dtype};
 use fusor2_ir::autograd::{Tape, Val};

@@ -1,35 +1,8 @@
 //! `KGather`'s two modes and `KScatter`'s two.
 //!
-//! There were three and four. The extra names promised bodies this file never
-//! had — a workgroup-private merge and a one-hot GEMM for the scatter, a
-//! four-wide run for the gather — and the first two reached this same dense
-//! nest while the third was never selected over any workload.
-//!
-//! **Both nests read their lane tiling off `theta`.** `KGather` and `KScatter`
-//! carry [`fusor2_ir::ir::level1::ScheduleDomain::Map`] — the same elementwise
-//! register-reuse domain a `KMap` carries — and both bodies used to ignore it
-//! and run one element per lane at a constant block width. The mode was a
-//! compiler decision and the schedule was not, which is the same failure as
-//! writing a decision into a data structure the next decision cannot un-write:
-//! whichever of the four scatter lowerings won on cost then ran at a constant.
-//!
-//! **What this does not fix, measured.** The domain is minted (`TILE_GATHER`,
-//! `TILE_SCATTER` and the four `SCATTER_*` / three `GATHER_*` rules each carry
-//! a 12-point `MapDomain` on the trainer's embedding shape) but is never
-//! *selected*: `sigma` keeps the floor-lowered node, whose domain is
-//! `ScheduleDomain::Point`, so `theta` on every gather and scatter in the
-//! conformance suite is `SchedPoint::Point`. The reason is on the cost side,
-//! not here — `Roofline::node_math` (fusor2-cost/src/model.rs:224) ignores
-//! `SchedPoint::Map` entirely, and the only channel `tm` and `vector` have
-//! into a launch's price is `geometry_of` -> `resident_lanes`
-//! (fusor2-cost/src/realize.rs:581, :836), where a bigger tile means strictly
-//! fewer lanes and therefore an equal-or-worse occupancy scale. A tiled point
-//! can tie the untiled node but never beat it, and `RESELECT` accepts only
-//! strict improvements. Consuming `theta` is what makes the decision *mean*
-//! something once the model can see it; until then these nests run the
-//! untiled body, which is the same body they ran before.
-//!
-//! Owned by W9.
+//! Both nests read their lane tiling off `theta`. Currently the cost model does
+//! not select tiled points, so `theta` is typically `SchedPoint::Point` and
+//! bodies run one element per lane.
 
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
@@ -47,7 +20,7 @@ use fusor2_ir::target::LowerCtx;
 use crate::lower::{Ctx, DimBinding, distribute_workgroups};
 use fusor2_tile::domains::emitted_block;
 
-/// Contract-shaped entry point (see CONTRACTS.md §4.10).
+/// Lowering entry point.
 pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     let fusor2_ir::ir::Op::L1(op) = &node.op else {
         return Err(Error::Plan("gather_scatter got a foreign node".into()));
@@ -269,8 +242,8 @@ pub fn lower_kgather(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
     let limits = ctx.caps.limits;
 
     // The output index space, and the one axis on which the source differs
-    // from it. `axis` was previously ignored and every gather addressed as if
-    // it were axis 0, which is only right when the gathered axis is outermost.
+    // from it. Addressing every gather as if `axis` were 0 is only right
+    // when the gathered axis is outermost.
     let mut extents = Vec::with_capacity(space.dims.len());
     for d in &space.dims {
         extents.push(ctx.binding.require(*d)?);

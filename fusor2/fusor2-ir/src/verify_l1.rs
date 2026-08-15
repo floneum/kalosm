@@ -17,8 +17,6 @@
 //! 7. Every node carries an `Effect`.
 //! 8. Allocation is *not* described at L1; a node claiming a buffer is an
 //!    error.
-//!
-//! Owned by W1.
 
 use crate::carrier::SlotTy;
 use crate::device::Caps;

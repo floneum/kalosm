@@ -1,14 +1,9 @@
 //! `conv` and `grouped_conv` as macro ops over `Window` + `Contract`.
 //!
-//! There is no im2col reshape here. The reference flattens `(in_ch, kernel...)`
-//! into one axis so a 2-D matmul can read it, and then needs a
-//! `MultiFlattenMap` operand access to undo the flatten at load time. An
-//! `EinSpec` contracts over **several** labels directly, so the windowed view
+//! An `EinSpec` contracts over **several** labels directly, so the windowed view
 //! is contracted in place: `c` and every `k` label are contracted, `p` labels
 //! are free, and the operand's non-affine index map is the L1 lowering's
-//! business rather than a shape the frontend has to invent.
-//!
-//! Owned by W13.
+//! business.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt};
 use fusor2_ir::autograd::{Tape, Val};

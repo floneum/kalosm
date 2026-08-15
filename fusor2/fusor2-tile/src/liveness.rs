@@ -19,8 +19,6 @@
 //! by [`crate::uniformity`], and a conditional barrier is not uniform by
 //! construction here. Barriers inside loops that may break, return, or run a
 //! dynamic number of iterations are recorded but not `guaranteed`.
-//!
-//! Owned by W3.
 
 use std::sync::Arc;
 

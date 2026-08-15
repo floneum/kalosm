@@ -12,6 +12,4 @@ repository.workspace = true
 fusor2-ir.workspace = true
 smallvec.workspace = true
 rustc-hash.workspace = true
-fixedbitset.workspace = true
-half.workspace = true
 parking_lot.workspace = true

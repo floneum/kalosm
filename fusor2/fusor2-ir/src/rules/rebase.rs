@@ -33,8 +33,6 @@
 //! one merged rule.** The driver's fired set is per `(RuleId, Id)`, so a single
 //! rule could fire at most once per node and whichever answer it declined to
 //! mint would be unreachable.
-//!
-//! Owned by W5.
 
 use crate::carrier::{
     Carrier, HOM_TABLE, HomRow, HomShape, RETARGET_TABLE, RetargetRow, SlotTy, is_total_on,
@@ -2318,7 +2316,7 @@ mod tests {
     /// **The firing test on a real saturated graph.** The derived carrier is
     /// compared term for term with the demoted `shift_stabilized_sum` oracle —
     /// including the `safe_delta` guard — so this asserts the law *derives*
-    /// what a hand-written algorithm used to be, rather than merely agreeing
+    /// the hand-written algorithm, rather than merely agreeing
     /// with it numerically.
     #[test]
     fn retarget_derives_the_shift_carrier_on_a_saturated_graph() {

@@ -3,14 +3,6 @@
 //!
 //! Every normalization here is a row program over the last axis: a max fold, a
 //! map, a sum fold and a divide.
-//!
-//! The counts dropped when the `*_fused` aliases and `softmax_slow*` were
-//! deleted: each was a one-line delegation into the same e-class, so its case
-//! only ever re-tested the twin beside it. That the macro node and its `defn`
-//! agree is the `FUSOR2_VERIFY_MEMBERS` sweep's job, and it sweeps every
-//! class, not this one.
-//!
-//! Owned by W14.
 
 use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;

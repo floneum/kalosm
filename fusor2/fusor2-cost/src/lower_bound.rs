@@ -7,13 +7,6 @@
 //! pays math `k` times where `lb` pays once; a materialized node's true cost
 //! pays math plus traffic where `lb` pays math. So it is a valid seed *and* a
 //! valid branch-and-bound prune.
-//!
-//! The alternative seed — assume everything shared is materialized — is not a
-//! lower bound at all: it maximizes launch count and pays a write plus a read
-//! for every edge the optimal fused cut deletes, which is precisely the
-//! conv-epilogue shape the trainer is made of.
-//!
-//! Owned by W7.
 
 use fusor2_ir::cost::{CostModel, Picoseconds};
 use fusor2_ir::device::Caps;
@@ -107,12 +100,12 @@ pub fn lower_bound_scoped(
 ///
 /// # Postorder, not ascending id order
 ///
-/// The sweep used to walk `ids` ascending. On suite graphs that converges in
-/// two passes, but `union(a, b)` allocates an id *above* both operands, so on
+/// Walking `ids` ascending converges in
+/// two passes on suite graphs, but `union(a, b)` allocates an id *above* both operands, so on
 /// a deep model graph a consumer routinely reads a child class whose union
 /// root has the **larger** id — one pass of staleness per such inversion,
 /// and a 32-layer decode chain crosses thousands of them against
-/// [`MAX_PASSES`]` = 8`. The bound never converged there, and the error was
+/// [`MAX_PASSES`]` = 8`. The bound never converges there, and the error is
 /// not uniform: two members of one class read their children at different
 /// sweep positions, so the earlier-created member summed values one pass
 /// staler — systematically *smaller* — than its later-minted sibling. That
@@ -235,8 +228,8 @@ pub fn argmin_member(
     if crate::realize::is_singleton(graph, class) {
         return class.0;
     }
-    // TEMPORARY PROBE — delete before finishing. `FUSOR2_SEED_DEBUG=<id>`
-    // prints every selectable member's seed key for that class.
+    // `FUSOR2_SEED_DEBUG=<id>` prints every selectable member's seed key for
+    // that class.
     if let Ok(want) = std::env::var("FUSOR2_SEED_DEBUG")
         && want == class.0.index().to_string()
     {

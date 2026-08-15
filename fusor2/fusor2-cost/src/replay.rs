@@ -1,13 +1,6 @@
 //! The replay memo, keyed on the *extraction inputs* rather than a structural
 //! fingerprint. Validity is "the inputs are identical", not "a fingerprint
-//! matches", so a training loop can no longer freeze step 1's decisions
-//! forever.
-//!
-//! This is affordable precisely because the trainer reads nothing back and the
-//! host runs several steps ahead: a ~1.4 ms re-extraction never lands on the
-//! critical path.
-//!
-//! Owned by W7.
+//! matches".
 
 use fusor2_ir::Result;
 use fusor2_ir::egraph::{EGraph, Id};
@@ -367,9 +360,9 @@ mod tests {
     }
 
     /// The key has to be injective over the term. Two graphs whose only
-    /// difference is a leaf's rank used to share one key, so the second
-    /// replayed the first's plan — with `BufferPlan`s of the wrong rank and
-    /// `Id`s that named different nodes.
+    /// difference is a leaf's rank must not share one key: the second
+    /// would replay the first's plan — with `BufferPlan`s of the wrong rank
+    /// and `Id`s that named different nodes.
     #[test]
     fn a_different_leaf_shape_is_a_different_key() {
         use crate::realize::testkit::{buffer, kmap, new_graph};

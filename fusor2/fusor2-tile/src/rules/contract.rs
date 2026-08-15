@@ -3,12 +3,7 @@
 //!
 //! `lower_family` mints **one node, not four and not four hundred**: the
 //! full legal `(geom x splits x staging)` space rides on the node and is
-//! resolved by extraction. `family` is never stored on an L0 op, and
-//! `ShapeSelector`'s first-match ordering is structurally impossible — all
-//! three families are unioned into one chain unconditionally and compete on
-//! cost.
-//!
-//! Owned by W4.
+//! resolved by extraction.
 
 use fusor2_ir::contract_spec::partition;
 use fusor2_ir::dtype::Dtype;
@@ -280,8 +275,8 @@ fn compute_dtype(d: Dtype) -> Dtype {
 ///
 /// **The m/n/k families no longer read this.** Teaching `KContract` to carry
 /// per-operand layouts — which is all `permuted_alias` does, since `Operand`
-/// already holds a strided `Layout` — restored the fast path for exactly the
-/// shapes this used to send to the floor, and it is where attention's cost
+/// already holds a strided `Layout` — keeps the fast path for exactly the
+/// shapes that would otherwise go to the floor, and it is where attention's cost
 /// was: `q @ k^T` is `bhqd,bhkd->bhqk`, non-canonical in `b`, so Coop, SGEMM
 /// and SGEMV all declined and the score matmul ran as a rank-5 generic reduce
 /// beside a `p @ v` that got Coop. On `[1,8,1024,64]` that was **26.0 ms ->
@@ -485,7 +480,7 @@ pub fn lower_generic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
     // `check_operand_access` pins an `Alias` layout's rank and extents to
     // the index space for exactly this reason: every lowering addresses a
     // `KFold`'s operands through their own layout maps, so an operand
-    // stated over some *other* space (this rule used to alias the value's
+    // stated over some *other* space (e.g. aliasing the value's
     // own `[batch, m, k]` shape) is read at garbage addresses by every
     // strategy of every backend — the member-race sweep caught the fold
     // spelling of a `[2,3]x[3,2]` matmul returning `a[0,:]·b[0,:]`, the

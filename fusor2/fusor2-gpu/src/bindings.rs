@@ -6,8 +6,6 @@
 //! One `main`, one bind group, whole-buffer bindings. Binding 0 is always the
 //! `Uniforms` **storage** buffer — a uniform-address-space block would break
 //! this mechanism, which walks storage globals.
-//!
-//! Owned by W8.
 
 use fusor2_ir::target::EmitError;
 

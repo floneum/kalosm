@@ -1,13 +1,9 @@
-//! `with_backwards` — the user-facing escape hatch, carried over verbatim
-//! because a few callers want it, and needed by nothing the trainer does.
+//! `with_backwards` — a user-facing escape hatch for custom gradients.
 //!
 //! [`fusor2_ir::autograd::GradientSlot`] is a bare node id, never a tensor
 //! handle: a closure capturing a graph handle would close an `Arc` cycle
 //! pinning every cached activation for the process lifetime. Here the rule
-//! is a plain `fn` pointer, so the hazard is not merely avoided by
-//! convention — it is unrepresentable.
-//!
-//! Owned by W5.
+//! is a plain `fn` pointer, so the hazard is unrepresentable.
 
 use fusor2_ir::autograd::{AdjointFn, BackwardTarget, GradientSlot, Grads, Parent, Tape, Val};
 use fusor2_ir::ir::Node;

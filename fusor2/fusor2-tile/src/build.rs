@@ -1,14 +1,10 @@
-//! Hash-consed L2 term builders, shared by both emitters. `Shared` is deleted
-//! from the dialect: structural sharing comes from hash-consing the whole L2
-//! term, so two identical subtrees built separately merge — which `Rc::as_ptr`
-//! memoization structurally cannot do. There is therefore no loop-boundary
-//! snapshot/restore either: hash-consing is scope-free.
+//! Hash-consed L2 term builders, shared by both emitters. Structural sharing
+//! comes from hash-consing the whole L2 term, so two identical subtrees built
+//! separately merge.
 //!
 //! **Declarations are not interned.** Two same-shaped tiles must stay distinct
 //! so the arena knows they are two allocations, so `alloc_tile`/`alloc_local`/
 //! `alloc_buffer` each mint a fresh `Arc` and push it to an ordered list.
-//!
-//! Owned by W3.
 
 use fusor2_ir::dtype::{NumericContract, RoundMode};
 use fusor2_ir::ir::level2::{
@@ -534,7 +530,7 @@ impl TileBuilder {
     }
 }
 
-/// The fixture every W3 test suite shares: tile A 8x8 f32 (256 B) and tile B
+/// The fixture the test suites share: tile A 8x8 f32 (256 B) and tile B
 /// 4x8 f32 (128 B), touched on either side of a caller-supplied `between`.
 #[cfg(test)]
 pub(crate) mod fixtures {

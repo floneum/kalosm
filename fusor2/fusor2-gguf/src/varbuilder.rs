@@ -4,8 +4,6 @@
 //! `get` returns **bytes**, not a device tensor: this crate has no device and
 //! no `Target`. The `fusor2` facade turns a [`RawTensorBytes`] into a
 //! `LeafKind::Quantized` leaf and lets extraction decide whether to repack it.
-//!
-//! Owned by W11.
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::{Dtype, QLayout};

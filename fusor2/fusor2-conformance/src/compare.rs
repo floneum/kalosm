@@ -4,8 +4,6 @@
 //! Ported from `conformance/src/comparison.rs`, with the const-generic rank
 //! erased: `fusor2::Tensor` has runtime rank, so a comparison takes a flat
 //! slice plus the shape and reports a multi-dimensional index on failure.
-//!
-//! Owned by W14.
 
 use std::fmt::{self, Debug, Display};
 

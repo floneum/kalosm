@@ -1,12 +1,9 @@
 //! Const-rank constructors.
 //!
-//! Everything here takes a `&Device` and mints a leaf, matching the
-//! reference: `Tensor::new(&device, [[1., 2.], [3., 4.]])`,
+//! Everything here takes a `&Device` and mints a leaf: `Tensor::new(&device, [[1., 2.], [3., 4.]])`,
 //! `Tensor::arange(&device, 0., 10.)`, `Tensor::full(&device, [2, 2], 1.5)`.
 //! `zeros`, `ones`, `splat` and `from_slice` live in the parent module beside
 //! the type.
-//!
-//! Owned by W12.
 
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::shape::Dim;
@@ -19,9 +16,9 @@ use crate::tensor::Dyn;
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// A value from a nested Rust array: `Tensor::new(&device, [[1., 2.]])`.
     ///
-    /// This is the reference's `Tensor::new` and the reason wrapping a
-    /// runtime-rank value is spelled [`Tensor::from_dyn`] rather than `new` —
-    /// a model that ports by changing imports writes this one.
+    /// The reason wrapping a runtime-rank value is spelled
+    /// [`Tensor::from_dyn`] rather than `new` is so a model that ports by
+    /// changing imports uses this one.
     #[track_caller]
     pub fn new<A: FromArray>(device: &Device, data: A) -> Self {
         Self::wrap("Tensor::new", Dyn::new(device.handle(), data))
@@ -29,9 +26,8 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 
     /// Every element `value`.
     ///
-    /// Identical to [`Tensor::splat`] but with the reference's argument order,
-    /// shape before value, so it reads beside `zeros`/`ones`. Folded into the
-    /// kernel; never a buffer.
+    /// Takes shape before value, matching [`Tensor::zeros`] and [`Tensor::ones`].
+    /// Folded into the kernel; never a buffer.
     #[track_caller]
     pub fn full(device: &Device, shape: [usize; R], value: T) -> Self {
         Self::wrap(
@@ -113,12 +109,8 @@ impl<T: Element> Tensor<1, T> {
 
     /// `[start, start + step, .., end)`.
     ///
-    /// The bounds are `impl Into<f64>` rather than `T`: the reference forced
-    /// `arange::<u32>` to be written with `u32` literals while every call site
-    /// had `usize` lengths in hand. `f64` and not [`Scalar`] because the
-    /// sequence is built **on the host** — these are not kernel literals, and
-    /// typing them as one meant a `Scalar::Uniform` could be passed where no
-    /// value exists yet, which the wrapper then had to reject at runtime.
+    /// The bounds are `impl Into<f64>` rather than `T`. `f64` is used because the
+    /// sequence is built **on the host** — these are not kernel literals.
     #[track_caller]
     pub fn arange_step(
         device: &Device,

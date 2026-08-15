@@ -1,7 +1,5 @@
 //! Parameterized layers. Each is a thin struct over a few `Tensor` parameters
 //! and a `forward`; none of them owns a kernel.
-//!
-//! Owned by W13.
 
 pub mod conv;
 pub mod embedding;

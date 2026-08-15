@@ -1,8 +1,6 @@
 //! Sampling. These are inference-only, have no adjoint, and enter through
 //! `L1::Ext` + an `OpDef` with one declared cost row — no core file changes.
 //!
-//! Owned by W13.
-//!
 //! Everything here is built out of ordinary facade ops on the caller's graph,
 //! so a draw is a lazy device value: [`standard::sample`] resolves nothing and
 //! hands back a `U32` token tensor a decode loop can consume directly. See

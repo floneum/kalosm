@@ -1,25 +1,7 @@
-//! The individual roofline terms, `core/src/matmul/cost.rs::score_fs` ported
-//! term for term.
+//! The individual roofline terms.
 //!
-//! Everything here is integer arithmetic on `u128`. Candidates tie exactly —
-//! the tile table is built from powers of two and several terms are
-//! invariant to `n_passes` by construction — so the argmin has to be
-//! bit-reproducible across platforms, which a floating `powf` is not.
-//!
-//! `score_fs` maps on one for one: T1 -> [`math_ps`], T2 -> [`wg_ps`],
-//! T3 -> [`drain_ps`], T4 -> [`dram_ps`] under the `max`, T5 ->
-//! [`combine_ps`], and the cube-root occupancy shortfall ->
-//! [`occupancy_scale_num_den`].
-//!
-//! Two things the reference has are deliberately absent. There is no
-//! `padded_macs * 4 > useful_macs * 5` routing guard: padded MACs enter
-//! [`math_ps`] through `Work::macs` computed on the padded tile, so an
-//! over-padded cooperative candidate simply prices above sgemv instead of
-//! being routed around it. And the strict `<` LLC watermark is gone —
-//! [`dram_ps`] interpolates, so one byte over the line cannot flip a tiling
-//! plan.
-//!
-//! Owned by W6.
+//! Everything here is integer arithmetic on `u128`. Candidates tie exactly,
+//! so the argmin has to be bit-reproducible across platforms.
 
 use fusor2_ir::cost::{DeviceFacts, MacUnit, Picoseconds};
 use fusor2_ir::dtype::Dtype;
@@ -275,10 +257,9 @@ mod tests {
         }
 
         // Asymptote. `eff = bytes + (r-1)*(bytes - llc)` is 9.4% short of a
-        // full `r * bytes` at 8x the cache and within 1% by ~75x. The W6
-        // spec asserts 1% at 8x; that is the stated formula's arithmetic,
-        // not its intent, so both points are pinned here and the deviation
-        // is reported rather than papered over.
+        // full `r * bytes` at 8x the cache and within 1% by ~75x. Both
+        // points are pinned here and the deviation is reported rather than
+        // papered over.
         let full = |b: u64, r: u32| {
             (u128::from(b) * u128::from(r) * PS_PER_US / u128::from(f.dram_bytes_per_us)) as f64
         };

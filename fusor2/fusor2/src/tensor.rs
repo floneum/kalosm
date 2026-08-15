@@ -1,8 +1,6 @@
 //! The one tensor type: runtime rank, runtime dtype, one node id.
 //!
-//! Owned by W12.
-//!
-//! # The surface this item consumes from W13 (`graph.rs`, `session.rs`)
+//! # The surface this item consumes from `graph.rs` and `session.rs`
 //!
 //! Nothing else in `fusor2/src/tensor*`, `fusor2/src/ops/*` or
 //! `fusor2/src/broadcast.rs` touches the e-graph directly. Everything routes

@@ -82,7 +82,7 @@ fn row(name: &str, t: &Timing) {
     );
 }
 
-/// A 20-op elementwise chain, identical to the reference harness's.
+/// A 20-op elementwise chain.
 fn chain(x: &Tensor, y: &Tensor) -> Result<Tensor, String> {
     let mut z = x.add(y).map_err(|e| e.to_string())?;
     for _ in 0..5 {
@@ -260,12 +260,6 @@ fn main() {
     }
 
     // ---- 7. quantized matmul, Q4K weights, LLM-decode shape ----
-    //
-    // The row this whole exercise is for. A quantized contraction used to be a
-    // separate `L1::KQContract` with no `family` field, so it could not reach
-    // the cooperative-matrix path at all — the path that took dense attention
-    // from 27.6 ms to 9.3 ms. With the decode moved into the coop staging fill
-    // it is an ordinary `KContract` whose operand happens to be `Dtype::Q(fmt)`.
     {
         use fusor2_ir::dtype::{QFmt, QLayout};
         let fmt = QFmt::Q4K;
@@ -294,10 +288,7 @@ fn main() {
         row("qmatmul_q4k_256x4096x4096", &t);
     }
 
-    // ---- 8. quantized matvec, Q4K weights, M=1: the LLM decode shape. A
-    //         materialize-the-weight plan is catastrophic here — one token
-    //         cannot amortize a 4096^2 decode — so this row is what forces
-    //         the staged-decode member to win extraction. ----
+    // ---- 8. quantized matvec, Q4K weights, M=1: the LLM decode shape ----
     {
         use fusor2_ir::dtype::{QFmt, QLayout};
         let fmt = QFmt::Q4K;

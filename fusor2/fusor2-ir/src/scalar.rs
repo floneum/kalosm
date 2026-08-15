@@ -13,11 +13,8 @@ use std::sync::Arc;
 pub enum UnOp {
     Exp,
     /// `exp` under a relaxed accuracy contract. A **distinct node**, not sugar
-    /// for [`UnOp::Exp`]: the reference keeps `NaryOp::ApproximateExp` separate
-    /// so hash-consing cannot merge it with a strict `exp`, and lowers both to
-    /// the target's exponential (`nary_direct.rs:1126`). Same here — the
-    /// contract is a *permission* to substitute a cheaper sequence, and no
-    /// backend currently takes it.
+    /// for [`UnOp::Exp`]. The contract is a *permission* to substitute a
+    /// cheaper sequence, and no backend currently takes it.
     ApproximateExp,
     /// Medium-accuracy `exp`. See [`UnOp::ApproximateExp`].
     LessApproximateExp,

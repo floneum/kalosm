@@ -2,8 +2,6 @@
 //! binaries. Every one of these is **one `L0::Map` with a different
 //! `ScalarExpr`** — there is no 50-variant opcode enum whose discriminant
 //! ordering ends up load-bearing in a kernel cache key.
-//!
-//! Owned by W12.
 
 use fusor2_ir::scalar::{BinOp, ScalarExpr, UnOp};
 
@@ -73,18 +71,14 @@ impl Tensor {
         self.map1(ScalarExpr::bin(BinOp::Sub, pos, neg))
     }
 
-    // NOTE: `tanh_exact` lives in W13's `composite/activations.rs`, which
-    // builds the exact `(e^x - e^-x) / (e^x + e^-x)` form. Defining it here
-    // as `Un(Tanh)` under a STRICT contract would collide, and L0 has no
-    // carrier for a per-node `NumericContract` anyway — see the crate report.
+    // L0 has no carrier for a per-node `NumericContract`.
 
     /// `exp` under a relaxed accuracy contract.
     ///
     /// Its **own** [`UnOp`], not sugar for [`Tensor::exp`]: hash-consing would
     /// otherwise merge a relaxed exponential with a strict one and a target
     /// could never substitute a cheaper sequence for the first without
-    /// changing the second. Both currently lower to the target's exponential,
-    /// which is what the reference does with `NaryOp::ApproximateExp`.
+    /// changing the second.
     pub fn approximate_exp(&self) -> Result<Tensor> {
         self.map1(ScalarExpr::un(UnOp::ApproximateExp, self.arg0()))
     }
@@ -124,8 +118,7 @@ impl Tensor {
     pub fn div(&self, rhs: &Tensor) -> Result<Tensor> {
         self.bin_same(rhs, BinOp::Div, "div")
     }
-    /// Elementwise `a % b`. Integer only, matching the reference's SIMD
-    /// coverage.
+    /// Elementwise `a % b`. Integer only.
     pub fn rem(&self, rhs: &Tensor) -> Result<Tensor> {
         if !self.dtype().is_int() {
             return Err(Error::Dtype(format!(
@@ -284,9 +277,7 @@ mod tests {
         }
     }
 
-    /// The three exponentials are three nodes. They were all `UnOp::Exp`, so
-    /// `approximate_exp(x)` and `exp(x)` hash-consed to one value and the
-    /// accuracy contract had nowhere to live.
+    /// The three exponentials are three distinct nodes.
     #[test]
     fn the_three_exponentials_are_three_distinct_nodes() {
         let a = ScalarExpr::arg(0, Dtype::F32);

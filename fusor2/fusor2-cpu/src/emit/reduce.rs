@@ -1,10 +1,7 @@
 //! Cross-lane reductions on CPU: `Reduce{Subgroup}` becomes a horizontal
-//! reduce of one register by `log2(W)` shuffle-reduce steps — not a scalar
-//! `fold` over bytemuck'd lanes as the reference's `reduce_simd_vec` does —
-//! and `Reduce{Workgroup}` becomes a tree over the thread-local scratch tile,
+//! reduce of one register by `log2(W)` shuffle-reduce steps, and
+//! `Reduce{Workgroup}` becomes a tree over the thread-local scratch tile,
 //! with the segment split supplying the barrier semantics.
-//!
-//! Owned by W10.
 
 use fusor2_ir::ir::level2::TileReduceOp;
 

@@ -8,8 +8,6 @@
 //! `with_backwards` closure spelling `w * sigmoid(x) - z` — has no counterpart
 //! in this file. The rewrite recovers exactly that expression from the taped
 //! softplus chain.
-//!
-//! Owned by W13.
 
 use crate::tensor::Tensor;
 use crate::{Error, Result};

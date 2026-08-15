@@ -2,20 +2,14 @@
 //!
 //! This is the SSA tape. One [`Instr`] per distinct `TileExprKind` node, one
 //! register slot per node; flattening the hash-consed DAG in topological order
-//! **is** the CSE that replaces the reference's deleted `Shared` node and its
-//! `Rc::as_ptr` memo.
+//! is the CSE.
 //!
 //! The register file is `[u32; W]` with `W` a const generic resolved once per
-//! launch, so an `MxN` register accumulator tile is expressible — a
-//! width-erased vector type structurally cannot express one, which is the root
-//! cause of the reference's `[E; MAX_SIMD_LANES = 64]` spill in every
-//! comparison, every transcendental and every strided gather.
+//! launch, so an `MxN` register accumulator tile is expressible.
 //!
 //! `ElementType::Scalar(F16|BF16)` loads widen to `F32` registers and stores
 //! narrow: that is the emitter half of the `widen-compute` rule, and it is why
 //! there is no one-lane `F16Scalar` here.
-//!
-//! Owned by W10.
 
 use fusor2_ir::dtype::RoundMode;
 use fusor2_ir::ir::level2::{ScalarElement, TileReduceOp};

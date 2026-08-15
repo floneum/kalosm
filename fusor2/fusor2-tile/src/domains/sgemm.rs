@@ -1,9 +1,5 @@
 //! The SGEMM schedule domain. [`SgemmParams::legal`] holds exactly the four
-//! predicates the reference asserts over its regression tree's leaves
-//! (`core/src/matmul/mod.rs:600-623`); here they **generate** candidates
-//! instead of validating one, and the 200-line tree is deleted.
-//!
-//! Owned by W4.
+//! predicates for candidate generation.
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::Dtype;

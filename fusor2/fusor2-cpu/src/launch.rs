@@ -3,8 +3,6 @@
 //! per row: `dispatch!` establishes the target features around the whole grid
 //! traversal, and the lane width `W` is a const generic inside it, so an `MxN`
 //! register accumulator tile survives all the way into the innermost body.
-//!
-//! Owned by W10.
 
 use fusor2_ir::error::Error;
 use fusor2_ir::target::{Buf, Uniforms};

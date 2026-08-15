@@ -1,8 +1,6 @@
 //! The byte-range source an [`crate::sharded::AsyncShardedVarBuilder`] reads
 //! through. Deliberately runtime-agnostic: one boxed future, no executor
 //! dependency anywhere in the compiler stack.
-//!
-//! Owned by W11.
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;

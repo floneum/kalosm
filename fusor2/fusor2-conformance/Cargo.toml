@@ -13,16 +13,11 @@ publish = false
 fusor2.workspace = true
 fusor2-ir.workspace = true
 fusor2-tile.workspace = true
-fusor2-autograd.workspace = true
 fusor2-cost.workspace = true
 fusor2-gguf.workspace = true
-fusor2-gpu.workspace = true
-fusor2-cpu.workspace = true
-smallvec.workspace = true
 rustc-hash.workspace = true
 fixedbitset.workspace = true
 half.workspace = true
-rand.workspace = true
 
 [[bin]]
 name = "fusor2-conformance"

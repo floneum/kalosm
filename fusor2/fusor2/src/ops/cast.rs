@@ -4,12 +4,8 @@
 //! loss scale are ordinary graph structure rather than a supported
 //! configuration.
 //!
-//! Every pair among `{F32, F16, BF16, U32, I32}` is legal, **including the
-//! `f32 -> u32` and `f16 -> u32` the reference is missing**, and
-//! `round`/`floor`/`ceil`/`trunc` are real primitives, which is what deletes
-//! the trainer's 14-comparison `round_small`.
-//!
-//! Owned by W12.
+//! Every pair among `{F32, F16, BF16, U32, I32}` is legal, and
+//! `round`/`floor`/`ceil`/`trunc` are real primitives.
 
 use fusor2_ir::dtype::{Dtype, RoundMode};
 use fusor2_ir::scalar::{BinOp, ScalarExpr};
@@ -101,10 +97,10 @@ impl Tensor {
     /// QAT fake-quant forward: `round(x / scale).clamp(-levels, levels) *
     /// scale`, with `scale` broadcast in.
     ///
-    /// **One `Map`, then one straight-through registration.** The four-node
-    /// chain this used to build differentiated node by node, and the `round`
-    /// in the middle has a zero derivative everywhere, so the gradient died
-    /// there and no QAT model could train. A straight-through rule routes the
+    /// **One `Map`, then one straight-through registration.** A four-node
+    /// chain would differentiate node by node, and the `round`
+    /// in the middle has a zero derivative everywhere, so the gradient would
+    /// die there and no QAT model could train. A straight-through rule routes the
     /// incoming gradient to operand 0 unchanged — which requires operand 0 to
     /// *be* `x`, hence the single fused map rather than the chain.
     ///

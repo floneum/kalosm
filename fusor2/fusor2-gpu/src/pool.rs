@@ -1,9 +1,7 @@
 //! The pooled allocator: keyed `(size, usage)` with `strong_count == 1` reuse
-//! and a platform memory ceiling that **blocks and retries** before failing.
+//! and a platform memory ceiling that blocks and retries before failing.
 //! On macOS, exceeding unified memory kills the OS rather than erroring, which
 //! is why the ceiling is a hard gate and not a warning.
-//!
-//! Owned by W9.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -256,32 +254,6 @@ impl BufferPool {
     /// Reuse is gated on `strong_count == 1`: a buffer still referenced by a
     /// live tensor is dropped from the pool's view rather than handed out
     /// twice.
-    ///
-    /// # Known risk: the refcount proves nothing about the GPU
-    ///
-    /// `refcount() == 1` establishes that no *host* handle remains. It does not
-    /// establish that the device has finished reading the buffer. A buffer whose
-    /// last host handle drops while its submission is still in flight is
-    /// recycled here and handed to the next allocation, which then writes into
-    /// memory a running kernel is still reading.
-    ///
-    /// This is unproven but it is the mechanism that fits the one observation we
-    /// have: `lower::contract::tests::a_narrow_output_stages_the_accumulator`
-    /// returned -0.1060791 against -0.16938101 at
-    /// `CoopGeom { bm: 16, bn: 16, bk: 8, n_passes: 1, subgroups: 2, rg: 1, cg: 2 }`
-    /// staging 2, once, while a conformance run was hammering the same device.
-    /// It has not reproduced since: 500 isolated runs of the IR binary, 15
-    /// GPU-contract runs under cross-process GPU load, 8 full-binary runs under
-    /// CPU load, 7 exclusive full-workspace runs, then 25 further targeted runs
-    /// and 6 full gpu+ir suite rounds under two concurrent conformance runs.
-    /// Allocation pressure is the variable the mechanism predicts and the one
-    /// isolation removes, which is why the failure survives only under load.
-    ///
-    /// The fix, if it recurs: record the `SubmissionIndex` at recycle time and
-    /// withhold the buffer until `device.poll(WaitForSubmissionIndex(..))` has
-    /// passed it. That is deliberately NOT done here — it was not written
-    /// against a reproduction, and an allocator that waits on a submission that
-    /// never completes deadlocks the trainer, which is worse than the bug.
     pub fn recycle(&self, buf: Buf) {
         // `map` ends the borrow before `buf` may be moved into the bucket.
         let Some((size, usage)) = buf
@@ -583,8 +555,7 @@ mod tests {
     // Adapter-gated. These skip cleanly when no GPU is present.
     // -----------------------------------------------------------------------
 
-    /// A raw wgpu device at WebGPU baseline limits, independent of W8's
-    /// probing so a pool test cannot be broken by a capability change.
+    /// A raw wgpu device at WebGPU baseline limits.
     fn baseline_device() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(

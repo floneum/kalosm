@@ -10,8 +10,6 @@
 //! Without the `fork-metal` mixed-precision cooperative store, an
 //! f32-accumulated f16-output kernel pays a staging tile plus a per-lane cast:
 //! footprint and a staging pass, never correctness.
-//!
-//! Owned by W8.
 
 use fusor2_ir::ir::level2::{
     Addr, CoopMatrixRole, CoopSrc, ElementType, ScalarElement, StorageView, Tile, TileExpr,

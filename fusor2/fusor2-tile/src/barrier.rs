@@ -19,11 +19,8 @@
 //!   full body executed.
 //!
 //! **Insertion** is the other direction: one uniform barrier at a root
-//! boundary can *shrink* the arena by separating two tiles' live ranges. The
-//! reference computes this delta and throws it away for want of a caller;
-//! [`crate::planner::Planner::arena_plan`] is that caller.
-//!
-//! Owned by W3.
+//! boundary can *shrink* the arena by separating two tiles' live ranges.
+//! [`crate::planner::Planner::arena_plan`] computes and uses this delta.
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;

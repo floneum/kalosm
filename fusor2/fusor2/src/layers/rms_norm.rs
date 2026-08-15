@@ -1,7 +1,5 @@
 //! `RmsNorm`. Its fused form is what `fold_split` + `map_into_fold` produce;
 //! there is no fused kernel to select.
-//!
-//! Owned by W13.
 
 use fusor2_gguf::VarBuilder;
 

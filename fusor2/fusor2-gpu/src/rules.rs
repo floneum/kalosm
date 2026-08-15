@@ -3,11 +3,9 @@
 //! schedule-domain rule from `fusor2-tile`.
 //!
 //! Every guard below reads [`Facts`] alone — device capabilities, shapes and
-//! dtypes. **None reads a consumer count, liveness or cost**, and none can:
-//! `Facts` structurally does not expose them. A rule that "would not pay"
+//! dtypes. None reads a consumer count, liveness or cost:
+//! `Facts` structurally does not expose them. A rule that would not pay
 //! still fires; `fusor2-cost` rejects it on realized-DAG cost.
-//!
-//! Owned by W9.
 
 use fusor2_ir::egraph::{Builder, Facts, Id, Rule, RuleTag};
 use fusor2_ir::ir::level1::{FoldDomain, FoldStrat, L1, ScheduleDomain, ScatterMode};

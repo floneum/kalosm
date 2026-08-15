@@ -1,6 +1,4 @@
 //! `LayerNorm` over the last axis and `LayerNormNd` over a trailing group.
-//!
-//! Owned by W13.
 
 use fusor2_gguf::VarBuilder;
 use fusor2_ir::shape::Dim;

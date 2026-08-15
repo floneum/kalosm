@@ -15,8 +15,6 @@
 //!    duplicates accumulate (normative).
 //! 7. `Dequant`: `shape[-1] % fmt.block_elements == 0`.
 //! 8. Every op's `work` varies with shape.
-//!
-//! Owned by W1.
 
 use crate::carrier::{Carrier, probes_for};
 use crate::contract_spec;

@@ -2,10 +2,7 @@
 //! shaped fills.
 //!
 //! `zeros`/`ones`/`splat`/`full` mint an `L0::Leaf(LeafKind::Const)` — **no
-//! upload and no kernel**. `arange` is built host-side and uploaded once,
-//! exactly as the reference does.
-//!
-//! Owned by W12.
+//! upload and no kernel**. `arange` is built host-side and uploaded once.
 
 
 use fusor2_ir::dtype::{Dtype, Splat};

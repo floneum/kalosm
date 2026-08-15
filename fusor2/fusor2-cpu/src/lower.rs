@@ -1,7 +1,5 @@
 //! L1 node + `SchedPoint` -> `KernelIr` for the CPU backend. The same
 //! `KernelIr`, a different emitter.
-//!
-//! Owned by W10.
 
 pub mod contract;
 pub mod gather_scatter;
@@ -961,7 +959,7 @@ mod tests {
     }
 }
 
-/// End-to-end cover for the two node kinds this target used to refuse:
+/// End-to-end cover for
 /// `L1::Ext` and `KRegion`. Every case lowers, compiles, runs on the worker
 /// pool and asserts the bytes that came back.
 #[cfg(test)]

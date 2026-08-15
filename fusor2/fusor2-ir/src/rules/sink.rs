@@ -1,12 +1,5 @@
 //! R5 — reader-rooted sinking. A pattern may match a *spine*
-//! ([`crate::egraph::Builder::trace_pure_views`]), which is what makes the
-//! reference's self-declared "single clearest structural gap"
-//! (`sink_unary_chains_into_matmuls`, impossible there because "a generator
-//! may only return a new variant for the node it was asked about") a
-//! single-rooted rule here. No multi-root rule form is needed anywhere, and
-//! the reference's private-view-chain sole-reader walk is deleted outright.
-//!
-//! Owned by W2.
+//! ([`crate::egraph::Builder::trace_pure_views`]).
 
 use crate::dtype::Dtype;
 use crate::egraph::{Builder, Facts, Id, RuleTag};

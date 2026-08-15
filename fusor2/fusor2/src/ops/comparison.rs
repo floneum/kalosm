@@ -1,10 +1,7 @@
 //! The 12 comparisons. Results are 1.0/0.0 in the operand dtype; there is no
 //! boolean dtype at L0, which is what preserves `where_cond` verbatim.
 //!
-//! `CmpOp::Ne` exists, so `ne` is one node — the reference's `eq(s).eq(0)`
-//! double comparison has nothing to work around.
-//!
-//! Owned by W12.
+//! `CmpOp::Ne` exists, so `ne` is one node.
 
 use fusor2_ir::scalar::{CmpOp, ScalarExpr};
 
@@ -104,7 +101,7 @@ mod tests {
         }
     }
 
-    /// `Ne` is a primitive; nothing needs `eq(s).eq(0)`.
+    /// `Ne` is a primitive.
     #[test]
     fn ne_is_one_node() {
         let e = ScalarExpr::cmp(

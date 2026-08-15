@@ -10,8 +10,6 @@
 //! `upsample`, `pool` and `q_mat_mul` need no entry: they are macro ops whose
 //! `defn` expansion into core L0 is present from node zero, so their adjoints
 //! are the composition of core adjoints, automatically.
-//!
-//! Owned by W5.
 
 use fusor2_ir::autograd::{Adjoint, AdjointKind};
 use fusor2_ir::ir::{OpDefId, OpDefRegistry, OpTag};

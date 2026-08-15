@@ -2,13 +2,10 @@
 //!
 //! Both layouts are legal inputs everywhere; moving between them is a priced
 //! rewrite (`qrepack`, amortized over `Persistence::Persistent`), so a device
-//! that never runs the alignment-sensitive kernel no longer pays the extra
-//! bytes to satisfy that kernel's addressing requirement.
+//! that never runs the alignment-sensitive kernel can avoid the extra bytes.
 //!
 //! Nothing here chooses a layout. `repack` moves bytes between two layouts the
 //! caller names; R8 prices the move.
-//!
-//! Owned by W11.
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::{QFmt, QLayout};

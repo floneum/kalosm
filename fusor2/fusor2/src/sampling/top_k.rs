@@ -1,7 +1,5 @@
 //! Top-k over a logits row, and the on-device sampled-token handle that lets a
 //! decode loop avoid a host round trip.
-//!
-//! Owned by W13.
 
 use crate::Result;
 use crate::tensor::Tensor;
@@ -32,8 +30,7 @@ impl GpuSampledToken {
 /// `(values, indices)` of the k largest entries along the last axis.
 ///
 /// The order is value descending, and **on an exact tie the larger token id
-/// comes first** — the reference's `better_candidate` rule. `values` is `F32`
-/// and `indices` is `U32`, both of shape `[k]`.
+/// comes first**. `values` is `F32` and `indices` is `U32`, both of shape `[k]`.
 ///
 /// A non-finite logit is treated as `-f32::MAX`, so `NaN` and the infinities
 /// sort below every real token and are reported with that sentinel as their

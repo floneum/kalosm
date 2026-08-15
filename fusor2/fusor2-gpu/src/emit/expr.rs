@@ -5,10 +5,7 @@
 //! obligation** here: `reassoc: false` forbids the identity elimination,
 //! literal folding and operand reordering that would break
 //! `round(x, HalfAwayFromZero)` on Metal, and `contract: false` forbids fusing
-//! a multiply into an `Fma`. That is the whole reason the trainer's
-//! 14-chained-comparison `round_small` deletes.
-//!
-//! Owned by W8.
+//! a multiply into an `Fma`.
 
 use fusor2_ir::dtype::{NumericContract, RoundMode};
 use fusor2_ir::ir::level2::{
@@ -1257,9 +1254,9 @@ impl Emitter<'_> {
                 if mask.is_constant_true() {
                     return self.decode_one(body, &q, &row, &col);
                 }
-                // Clamp-and-select, never a branch. The decode of a masked
-                // element used to run inside its own `masked_value` block,
-                // and the expression memo is block-scoped — so two elements
+                // Clamp-and-select, never a branch. Decoding a masked
+                // element inside its own `masked_value` block would defeat
+                // the block-scoped expression memo — two elements
                 // of one aligned window could never share their word or
                 // scale loads however equal the subexpressions were. With
                 // the flat index clamped into the value's extent the decode

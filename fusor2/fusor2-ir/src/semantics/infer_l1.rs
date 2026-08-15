@@ -1,7 +1,5 @@
 //! Total inference for the L1 op family. An L1 node's result shape is its
 //! index space minus the reduced axes, and its dtype is the epilogue's.
-//!
-//! Owned by W1.
 
 use crate::dtype::{Dtype, NumericContract, Persistence};
 use crate::error::{Error, Result};

@@ -6,12 +6,8 @@
 //! L2 storage views.
 //!
 //! **Operand layouts are never re-derived.** Every layout comes from
-//! `Plan::buffers[..].layout`, which the extractor established; the
-//! reference's exact-stride equality test and its silent generic-reduce
-//! fallback are deleted, because a mismatch here is a broken plan
-//! ([`Error::Plan`]), not a routing decision.
-//!
-//! Owned by W9.
+//! `Plan::buffers[..].layout`, which the extractor established; a mismatch
+//! is a broken plan ([`Error::Plan`]).
 
 pub mod contract;
 pub mod gather_scatter;
@@ -530,7 +526,7 @@ pub const fn scalar_element(dtype: Dtype) -> ScalarElement {
 /// pointer-keyed memoization structurally cannot do.
 ///
 /// This is a superset of `fusor2_tile::build::TileBuilder`'s surface (which
-/// covers only the eight nodes W3 needed first). When that builder grows the
+/// covers only a subset of the nodes). When that builder grows the
 /// remaining constructors this type should become a thin alias for it; the
 /// memo semantics are identical because both key on
 /// [`TileExpr::structural_hash`].
@@ -1320,14 +1316,13 @@ impl<'a> Ctx<'a> {
     /// against **this launch's** grid.
     ///
     /// `grid` must be the same `[x, y, z]` the kernel is dispatched with — the
-    /// one handed to [`Ctx::finish`]. It used to be
-    /// `max_compute_workgroups_per_dimension` instead, on the assumption that
-    /// `distribute_workgroups` saturates `x` before opening a second slab. It
-    /// does the opposite, and deliberately: it picks the slab count first and
+    /// one handed to [`Ctx::finish`], not `max_compute_workgroups_per_dimension`:
+    /// `distribute_workgroups` does not saturate `x` before opening a second
+    /// slab. It picks the slab count first and
     /// sizes `x` to the slab, so 122,880 groups dispatch as `[61440, 2, 1]`.
-    /// Reading `gy * 65535` off that grid put every workgroup past the first
-    /// slab at a wildly out-of-range index, masked itself out, and left the
-    /// tail of the output untouched — silently, for any launch over the
+    /// Reading `gy * 65535` off that grid would put every workgroup past the
+    /// first slab at a wildly out-of-range index, mask itself out, and leave
+    /// the tail of the output untouched — silently, for any launch over the
     /// per-dimension limit.
     pub fn global_index(&mut self, block: u32, grid: [u32; 3]) -> TileExpr {
         use fusor2_ir::ir::level2::WorkgroupAxis;

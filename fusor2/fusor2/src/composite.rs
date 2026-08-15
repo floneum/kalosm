@@ -4,8 +4,6 @@
 //! `spike_no_recognition` all evaporate, and the structural attributes a
 //! pattern match would have to re-derive (`MaskKind::Causal`) stay on the
 //! node.
-//!
-//! Owned by W13.
 
 pub mod activations;
 pub mod attention;
@@ -579,11 +577,8 @@ mod constant_identity {
 
     /// Two index vectors of the same length are two different values.
     ///
-    /// `index_leaf` used to name every leaf `BufferId(u32::MAX)`, so the
-    /// hash-cons key was `(U32, [len])` and the second `set_leaf_bytes`
-    /// overwrote the first. Rope mints `perm` and `expand` at the same length
-    /// in the same call, which is how its rotation permutation became its
-    /// table-expansion vector.
+    /// Rope mints `perm` and `expand` at the same length in the same call,
+    /// so this ensures they hash-cons into separate nodes.
     #[test]
     fn two_index_leaves_of_one_length_are_two_nodes() {
         let g = graph();
@@ -611,9 +606,9 @@ mod constant_identity {
         );
     }
 
-    /// Every leaf name in one graph comes from one allocator. Three private
-    /// counters used to hand out overlapping `BufferId`s, one of them starting
-    /// at exactly the `u32::MAX` the constant leaves hardcoded.
+    /// Every leaf name in one graph comes from one allocator. Separate private
+    /// counters would hand out overlapping `BufferId`s — one of them starting
+    /// at exactly the `u32::MAX` the constant leaves hardcode.
     #[test]
     fn uploads_and_constants_never_share_a_buffer_name() {
         use fusor2_ir::dtype::Dtype;

@@ -234,19 +234,11 @@ impl AccessPlan {
 ///
 /// # Why a side is a list
 ///
-/// A contraction operand used to be exactly one [`Operand`], which made
-/// `KContract` the only fixed-arity L1 node — `KMap`, `KFold`, `KGather` and
-/// `KScatter` all carry `Vec<Operand>`. That asymmetry is what made
-/// [`crate::rules::fusion::map_into_contract`] bail whenever the producer it
-/// wanted to absorb read more than one buffer: there was nowhere to put the
-/// second edge.
-///
-/// The producer that matters is the GGUF block decode. It reads one block
-/// stream through several `Restride` views at once — the quant plane, the
-/// block scale, the block minimum, the group scales — so it is irreducibly
-/// multi-edge, and no rewrite collapses it. With a side as a list that decode
-/// is an ordinary absorbed producer, and the quantized staging fill stops
-/// being a special case in the backend.
+/// A side carries multiple operands so producers that read more than one
+/// buffer can be absorbed. The GGUF block decode reads one block stream through
+/// several `Restride` views at once — the quant plane, the block scale, the
+/// block minimum, the group scales — so it is irreducibly multi-edge and
+/// benefits from a side as a list of operands.
 ///
 /// # Numbering
 ///
@@ -487,13 +479,6 @@ pub enum GatherMode {
 }
 
 /// Scatter lowering. Both coexist as alternatives and compete on cost.
-///
-/// There used to be four. `WgPrivateMerge` reached the *same* `scatter_dense`
-/// nest as these two on both backends — the mode is not read there — and
-/// `OneHotContract` had no lowering at all: it errored if selected, which is
-/// an alternative extraction can prefer and then fail on. Both were offered 62
-/// times over the conformance suite, never over any model, and selected zero
-/// times anywhere.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ScatterMode {
     /// Guarded on `Caps::atomic_f32`.
@@ -705,9 +690,7 @@ pub struct SgemmParams {
 
 impl SgemmParams {
     /// `tm | bm`, `tn | bn`, 32..=max lanes, staged footprint within the
-    /// workgroup-storage limit. Exactly the predicates the reference
-    /// asserts over its regression tree's leaves — here they *generate*
-    /// candidates instead of validating one.
+    /// workgroup-storage limit.
     pub const fn legal(&self, elem_bytes: u32, max_wg_storage: u32, max_lanes: u32) -> bool {
         if self.tm == 0 || self.tn == 0 || self.bm % self.tm != 0 || self.bn % self.tn != 0 {
             return false;
@@ -719,21 +702,13 @@ impl SgemmParams {
     }
 }
 
-/// Every legal SGEMM tiling. The 200-line regression tree is deleted; its
-/// measured leaves seed move ordering only.
+/// Every legal SGEMM tiling.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct SgemmDomain {
     pub params: SmallVec<[SgemmParams; 16]>,
 }
 
 /// SGEMV vectorization and workgroup structure.
-///
-/// There is no `chunk` axis: the k loop's trip count is fully determined by
-/// `k / (lanes * vector)` in both lowerings, so a chunk field could only
-/// multiply the domain with byte-identical kernels — which is exactly what
-/// it did until it was measured doing it (six copies of every cell, each a
-/// separate tune record and race candidate, plus a cost prior ranking the
-/// copies against each other).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SgemvParams {
     pub vector: u32,
@@ -777,8 +752,7 @@ impl SgemvParams {
     }
 }
 
-/// Every legal SGEMV parameterization. The 21-arm measured bucket table
-/// (which ignores `n` entirely) is deleted.
+/// Every legal SGEMV parameterization.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct SgemvDomain {
     pub params: SmallVec<[SgemvParams; 16]>,

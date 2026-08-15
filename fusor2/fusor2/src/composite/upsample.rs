@@ -1,13 +1,8 @@
 //! Nearest and bilinear upsampling, macro ops over `Gather` and `Map`.
 //!
-//! The reference reshapes to `[b, c, h, 1, w, 1]`, broadcasts and reshapes
-//! back. That last reshape merges a stride-0 axis into a real one, which is
-//! not a view: it only works because the reference materializes. Here the
-//! same value is one `Gather` per axis with a repeated index run — a real
-//! node, whose adjoint is the `Scatter{Add}` that sums the duplicated
+//! This value is one `Gather` per axis with a repeated index run — a real
+//! node, whose adjoint is the `ScatterAdd` that sums the duplicated
 //! positions, with four lowerings underneath it.
-//!
-//! Owned by W13.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt};
 use fusor2_ir::autograd::{Tape, Val};

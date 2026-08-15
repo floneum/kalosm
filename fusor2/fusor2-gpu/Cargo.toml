@@ -16,7 +16,6 @@ fusor2-gguf.workspace = true
 smallvec.workspace = true
 rustc-hash.workspace = true
 half.workspace = true
-bytemuck.workspace = true
 parking_lot.workspace = true
 lru.workspace = true
 pollster.workspace = true

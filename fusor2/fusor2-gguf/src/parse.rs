@@ -1,9 +1,6 @@
 //! GGUF file parsing: header, metadata key-value table, tensor directory.
 //!
-//! Ported from the reference's `gguf/src/lib.rs` header path. The writer is
-//! kept only so the reader can be round-trip tested.
-//!
-//! Owned by W11.
+//! The writer is kept for round-trip testing.
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::{Dtype, QFmt};
@@ -79,7 +76,7 @@ impl GgmlType {
     }
 }
 
-/// `GGUF`. A byte-reversed spelling is also accepted, as the reference does.
+/// `GGUF`. A byte-reversed spelling is also accepted.
 pub const GGUF_MAGIC_BYTES: [u8; 4] = *b"GGUF";
 
 /// Tensor data starts at the next multiple of this unless the file overrides

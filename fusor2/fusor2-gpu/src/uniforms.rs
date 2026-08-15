@@ -1,12 +1,9 @@
 //! Packing binding 0. It holds `[u32 symbolic dims..., u32 derived strides...,
-//! f32 uniform scalars...]` and is a **storage** buffer, because the derived
+//! f32 uniform scalars...]` and is a storage buffer, because the derived
 //! bind-group mechanism walks storage globals.
 //!
-//! That one buffer kills trainer constraints 1 and 2 together: `m * lr_f32`
-//! produces a `Uniform`, not a baked literal, and a sequence length is a `Sym`
-//! read from binding 0.
-//!
-//! Owned by W9.
+//! Binding 0 carries symbolic dimensions and scalars that would otherwise
+//! need to be baked literals or constants.
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;

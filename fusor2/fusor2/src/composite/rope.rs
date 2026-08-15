@@ -2,20 +2,12 @@
 //! `rope_interleaved`), each with a paired form that rotates `q` and `k` under
 //! one node and a `_with_position` form that keeps the offset on device.
 //!
-//! There is no `*_fused` spelling: fusing is an L1 node minted by a rule, never
-//! a construction-time choice, so `rope_fused` and `rope_normal_fused` were
-//! one-line delegations to `rope_interleaved` and `rope` and are deleted.
-//!
 //! Both pairings are the same expression, `x*cos + rot(x)*sin`, and differ
 //! only in two index vectors: `rot` is one `Gather` along the head axis times
-//! a sign vector. The reference spells non-interleaved rope as
-//! `cat(-x2, x1)` and interleaved rope as a reshape-narrow-cat-flatten, which
-//! is four node kinds to say the same permutation.
+//! a sign vector.
 //!
 //! Sequence length is a `Dim::Sym` narrow or a position gather — never a host
 //! bucket, so a decode loop recompiles nothing.
-//!
-//! Owned by W13.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt};
 use fusor2_ir::autograd::{Tape, Val};

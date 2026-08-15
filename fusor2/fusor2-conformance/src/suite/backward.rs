@@ -8,8 +8,6 @@
 //! adjoint is the zero tensor are different outcomes, and only the second is
 //! correct. [`crate::compare::assert_all_zero`] is the assertion that tells
 //! them apart; `gradient_of` erroring out is the other one.
-//!
-//! Owned by W14.
 
 use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;

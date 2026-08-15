@@ -1,6 +1,4 @@
 //! `ConvNd`: rank-generic convolution over the `Window` + `Contract` macro op.
-//!
-//! Owned by W13.
 
 use fusor2_gguf::VarBuilder;
 use smallvec::SmallVec;

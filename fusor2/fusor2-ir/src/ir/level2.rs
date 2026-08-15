@@ -1,9 +1,6 @@
-//! L2 `tile` — one kernel body. The reference's `tile-ir` near-verbatim with
-//! four changes: `Shared` is **deleted** (structural sharing is the hash-cons,
-//! so two identical subtrees built separately merge — which `Rc::as_ptr`
-//! memoization structurally cannot); [`Stmt::AtomicAdd`] is added;
-//! `NumericContract` rides on `Unary`/`Binary`; and `bf16` joins
-//! [`ScalarElement`]. Element type is runtime data, never a marker type.
+//! L2 `tile` — one kernel body. Structural sharing is the hash-cons, so two
+//! identical subtrees built separately merge. [`Stmt::AtomicAdd`] is supported.
+//! Element type is runtime data, never a marker type.
 //!
 //! L2 is produced *after* extraction and is not part of the e-graph. Barrier
 //! elision and arena packing stay closed-form argmins here with an independent
@@ -994,19 +991,14 @@ pub struct Tiles {
 
 /// The result of workgroup-arena planning. `arena_plan` is a **pure
 /// memoized function** of `(geom, dtype, caps)` and the *same* function
-/// `verify_l1` admits against and the L2 emitter lays out with. There is no
-/// estimator, therefore no L1/L2 admission mismatch and no "extraction
-/// commits a plan that fails L2 verification and silently falls back".
-/// `total_bytes` feeds both the footprint check and the occupancy term,
-/// closing the feedback loop the reference leaves open.
+/// `verify_l1` admits against and the L2 emitter lays out with. `total_bytes`
+/// feeds both the footprint check and the occupancy term.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ArenaPlan {
     pub mode: ArenaMode,
     pub total_bytes: u32,
     pub placements: SmallVec<[Placement; 8]>,
-    /// Root-level statement indices where a barrier was inserted, best
-    /// first. The reference computes this delta and throws it away for want
-    /// of a caller; here it has one.
+    /// Root-level statement indices where a barrier was inserted, best first.
     pub barriers_inserted: SmallVec<[u32; 4]>,
 }
 
@@ -1036,8 +1028,7 @@ pub trait ArenaPlanner: Send + Sync {
     fn verify_arena(&self, ir: &KernelIr, plan: &ArenaPlan) -> Result<()>;
 
     /// A `Barrier` may not appear under an `If` whose predicate is
-    /// non-uniform over the group. The reference asserts "guaranteed" with
-    /// no analysis to establish it; this is that analysis.
+    /// non-uniform over the group.
     fn verify_uniformity(&self, ir: &KernelIr) -> Result<()>;
 }
 

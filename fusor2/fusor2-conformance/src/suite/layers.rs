@@ -6,8 +6,6 @@
 //! its documentation claims, and that gradients reach **every** parameter it
 //! holds. A layer whose bias never receives a gradient trains to a plausible
 //! but wrong model, and only the second assertion catches it.
-//!
-//! Owned by W14.
 
 use fusor2::composite::loss::{
     binary_cross_entropy_with_logits, distillation_loss, mse, softmax_cross_entropy,

@@ -13,8 +13,6 @@
 //!    extraction selected must be within [`WITHIN_FRACTION`] of the measured
 //!    best. This is the only place in the suite that measures rather than
 //!    models.
-//!
-//! Owned by W14.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,7 +23,7 @@ use fusor2_ir::ir::level2::ArenaPlanner;
 use crate::harness::CaseError;
 
 /// The chosen schedule point must be within this fraction of the measured
-/// best. 15% is the reference's own spread between neighbouring coop tiles.
+/// best.
 pub const WITHIN_FRACTION: f64 = 0.15;
 
 /// Shapes the `--exhaustive` proximity claim is asserted on. Eight, per the

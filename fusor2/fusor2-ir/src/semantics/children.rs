@@ -1,8 +1,6 @@
 //! Operand ids of every `Op`, in the order inference, verification, work
 //! accounting and the cost model all expect. The one place that order is
 //! written down.
-//!
-//! Owned by W1.
 
 use crate::ir::level0::L0;
 use crate::ir::level1::L1;

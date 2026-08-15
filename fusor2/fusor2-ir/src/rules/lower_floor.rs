@@ -1,27 +1,17 @@
 //! The [`crate::egraph::RuleTag::StrictlyLowering`] floor: one trivial,
 //! always-legal L0 -> L1 lowering per L0 op. These are what the driver falls
-//! back to when a saturation budget is exhausted, and they are what makes
-//! "budget exhaustion yields a degraded-but-valid plan, never a hard error"
-//! true rather than aspirational.
+//! back to when a saturation budget is exhausted.
 //!
 //! Every one emits [`ScheduleDomain::Point`]: the floor depends on no
-//! schedule generator, so it is available before any target has contributed a
-//! rule. Every one is trivially correct and trivially slow. `Leaf` needs no
+//! schedule generator. Every one is trivially correct and trivially slow. `Leaf` needs no
 //! rule.
 //!
 //! # This module is the only place `ScheduleDomain::Point` is minted
 //!
-//! `Point` is not a schedule — it is the *absence* of one, the marker the
-//! schedule rules match on to say "no target has spoken for this node yet".
-//! Any rule free to spell it inline is a rule free to declare a node
-//! unschedulable by accident, and the question "who decided this node's
-//! schedule?" stops having a single answer. So a rule that needs to mint a
+//! `Point` is the marker the schedule rules match on. A rule that needs to mint a
 //! nest carrying no schedule of its own calls [`floor_map`],
 //! [`floor_alias_map`] or [`floor_fold`], and a descriptor that needs the
-//! value calls [`floor_sched`]. Those four, plus the nine lowerings in this
-//! file, are every occurrence in the IR crate.
-//!
-//! Owned by W2.
+//! value calls [`floor_sched`].
 
 use crate::dtype::Dtype;
 use crate::egraph::{Builder, Facts, Id, RuleTag};

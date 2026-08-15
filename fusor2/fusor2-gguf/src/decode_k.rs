@@ -2,10 +2,7 @@
 //!
 //! These are exactly why `decode` is a `BlockProgram` and not a `ScalarExpr`:
 //! Q6K's 210-byte non-word-aligned block with per-super-block group scales is
-//! not a per-element formula, which is why the reference needs
-//! `Q4KBlockParts` / `Q6KBlockParts`.
-//!
-//! Owned by W11.
+//! not a per-element formula.
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::{QFmt, QLayout};

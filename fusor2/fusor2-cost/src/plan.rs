@@ -1,19 +1,12 @@
 //! Plan derivation: buffers, bindings, symbols and the plan hash.
 //!
-//! **Allocation is derived from the plan**: for each node in `M`,
+//! Allocation is derived from the plan: for each node in `M`,
 //! [`buffer_layout`] gives the padded strides the selected geometry needs,
-//! including split-K scratch slices. `hardware_matmul_prep`'s exact-stride
-//! equality test and its silent generic-reduce fallback become an invariant
-//! the extractor establishes rather than a runtime test. A value not in `M`
-//! gets no buffer at all, which subsumes the reference's `BufferLedger`.
+//! including split-K scratch slices. A value not in `M` gets no buffer at all.
 //!
-//! **The plan is the cache key.** `Dim::Sym` and `LeafKind::Uniform` hash as
-//! the symbol's *index*, not its bound value, so one plan serves a whole
-//! shape family. There is no `hash_kernel_fields`, no
-//! `kernel_cache_key_with_dispatch`, no `structural_kernel_key` and no golden
-//! byte files.
-//!
-//! Owned by W7.
+//! The plan is the cache key. `Dim::Sym` and `LeafKind::Uniform` hash as
+//! the symbol's index, not its bound value, so one plan serves a whole
+//! shape family.
 
 use crate::realize::{self, Component, Realized};
 use fusor2_ir::Result;
@@ -191,10 +184,10 @@ pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Resul
     //
     // That distance is the product of every padded extent, batch axes
     // included — it is exactly the row-major stride a prepended axis gets,
-    // `strides[0] * padded[0]`. It used to be `padded_m * padded_n`, which is
-    // one batch element rather than one partial: with any leading batch axis,
-    // partial `s` began inside partial `s-1` and every batch past the first
-    // aliased.
+    // `strides[0] * padded[0]`. One batch element (`padded_m * padded_n`)
+    // would not do: with any leading batch axis,
+    // partial `s` would begin inside partial `s-1` and every batch past the
+    // first would alias.
     let strides = Layout::row_major_strides(&padded);
     let slice = match (
         strides.first().and_then(|s| s.as_const()),
@@ -930,9 +923,9 @@ mod tests {
 
     /// One partial is one *whole* output, batch axes included.
     ///
-    /// The stride used to be `padded_m * padded_n`, which is one batch
-    /// element. At `[3, 512, 512]` that put partial 1 at offset 262,144 —
-    /// inside partial 0's batch 1 — so a batched split-K summed each
+    /// A stride of one batch element (`padded_m * padded_n`) would put
+    /// partial 1 at offset 262,144 for `[3, 512, 512]` —
+    /// inside partial 0's batch 1 — so a batched split-K would sum each
     /// partial into the next one's batch instead of into itself.
     #[test]
     fn split_k_scratch_slice_spans_the_whole_batch() {

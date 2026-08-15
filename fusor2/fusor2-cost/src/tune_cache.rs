@@ -54,22 +54,11 @@ use std::path::{Path, PathBuf};
 /// Candidates whose recorded score is worse than `best * SKIP_RATIO` are not
 /// rebuilt on later resolves.
 ///
-/// **Deliberately unbounded, and this is now a settled result rather than a
-/// pending experiment.** See [`RERACE_PER_RESOLVE`] for the measurement: a
-/// per-launch score being *honest* does not make per-launch pruning *sound*,
-/// because the plan optimum is not the per-launch argmin.
-///
-/// Re-measured at 3.0 on the current footing — per-launch GPU spans, per-kernel
-/// keys, this device's own converged file — pruning drops 6 of 7 correct
-/// candidates on the 2048-cube and 9 of 10 on attention's `q@k^T`, always
-/// keeping each launch's own best. Cold collapsed (matmul 1.38 s -> 0.08 s,
-/// attention 2.12 s -> 0.15 s) and **attention's median went 2.57 -> 4.52 ms**,
-/// the same regression the 1.5x and 3.0x attempts hit when the score was a
-/// whole-plan wall time. The cause is different and structural: attention is
-/// six launches whose choices interact, and cutting each launch's field to its
-/// own argmin denies the coordinate descent the combination that wins. That is
-/// the same reason `Combo` records a *joint* measurement rather than assembling
-/// per-launch minima.
+/// Unbounded: a launch's candidate field cannot be narrowed on that launch's own
+/// score, because the plan optimum is not the per-launch argmin. Multi-launch
+/// plans have interdependent choices, so taking the per-launch minima independently
+/// assembles a configuration never actually run. This is why `Combo` records a
+/// *joint* measurement rather than assembling per-launch minima.
 pub const SKIP_RATIO: f64 = f64::INFINITY;
 
 /// How many never-measured variants one tuning race will spend time on: the
@@ -91,45 +80,10 @@ pub const WINDOW: usize = 8;
 
 /// How many already-known variants one resolve re-races, best-scored first.
 ///
-/// **Still unbounded, and the reason is no longer the one it used to be.**
-///
-/// Originally a score here was a *whole-plan* wall time attributed to a single
-/// launch. The tuner is a coordinate descent that carries an incumbent, so the
-/// same variant clocked differently depending on when its turn came, and the
-/// score was not a property of `(launch, variant)` at all. Four ways of
-/// exploiting it were built and measured, and every one traded quality for
-/// compile time:
-///
-/// | policy | cold | attention |
-/// |---|---|---|
-/// | prune at `best * 1.5` | 55-65 ms | 4.2 ms |
-/// | prune at `best * 3.0` | 260-280 ms | 4.2 ms |
-/// | re-race best 6 | 280-930 ms | 2.7-5.6 ms, unstable |
-/// | **no bound (shipped)** | 1.9-2.3 s | **2.73 ms** |
-///
-/// That table was read as a record of a *measurement* defect, so both causes
-/// were removed — the score became the launch's own GPU span (see [`Record`]),
-/// and the key that span is filed under became one that names a kernel rather
-/// than a root (see `fusor2_cost::extract::launch_signature`). Both bounds were
-/// then re-measured on that footing, and **the table reproduced**:
-///
-/// | policy, honest per-launch spans | cold matmul / attention | attention median |
-/// |---|---|---|
-/// | `SKIP_RATIO` 3.0 + re-race 6 | 0.08 s / 0.15 s | 4.52, 4.53 ms |
-/// | re-race 6 alone | 0.79 s / 0.51 s | 2.69, **4.55** ms — unstable |
-/// | **no bound (shipped)** | 1.37 s / 2.12 s | **2.57, 2.59 ms** |
-///
-/// So the defect was never the score's honesty. **A launch's candidate field
-/// cannot be narrowed on that launch's own score, because the plan optimum is
-/// not the per-launch argmin.** Attention is six launches whose choices
-/// interact; keeping only each launch's locally-best points denies the descent
-/// the combination that wins, and the loss is the same ~1.9 ms whether the
-/// number doing the narrowing was noise or a perfectly measured kernel span.
-/// This is the same fact `Combo` exists for.
-///
-/// A bound here is therefore not blocked on better *measurement*. It is blocked
-/// on a candidate ordering that is a property of the plan rather than of one
-/// launch — a joint sweep, or a cheap model of the interaction.
+/// Unbounded: a launch's candidate field cannot be narrowed on that launch's own
+/// score, because the plan optimum is not the per-launch argmin. Multi-launch
+/// plans have interdependent choices; narrowing each launch's field independently
+/// denies the descent the combination that actually wins.
 pub const RERACE_PER_RESOLVE: usize = usize::MAX;
 
 /// What this device learned about one `(launch, variant)` pair.
@@ -216,29 +170,9 @@ struct Combo {
     score: u64,
 }
 
-/// The unit [`Record::nanos`] is written in.
-///
-/// Bumped whenever that meaning changes, because the old and new units are the
-/// same order of magnitude and would sort against each other in silence: a
-/// format-1 file holds ~1e6 parts-per-million of a base plan, a format-2 file
-/// holds a 2 ms kernel as 2_000_000 ns. A file at any other format is read as
-/// an empty cache, which costs one tuning pass and never a wrong ordering.
-///
-/// Bumped to 3: format 2 filed a variant that produced *wrong values* as if it
-/// were simply fast, so `best()` in such a file is frequently a kernel that
-/// computes a different function, and nothing in a format-2 file distinguishes
-/// the two.
-///
-/// Bumped to 4: format 3's keys were a function of the launch *root* only, so
-/// launches with different reduced extents or different fused bodies shared an
-/// entry and [`TuneCache::record`]'s minimum-merge filed the cheapest one's
-/// span for all of them. Those records name kernels that cannot be identified.
-///
-/// Bumped to 5: a record became an observation *window* rather than a single
-/// all-time minimum, so production samples can both feed the prior and age a
-/// stale minimum out. A format-4 `nanos` cannot be told apart from a window
-/// of one, but the semantics differ (it was a min over an unbounded past), so
-/// the file is dropped like every other stale format.
+/// The unit [`Record::nanos`] is written in. A file at a different format is
+/// read as an empty cache. Mismatch is never a wrong ordering, only a single
+/// re-tuning pass.
 pub const FORMAT: u32 = 5;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

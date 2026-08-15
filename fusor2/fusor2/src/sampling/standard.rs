@@ -1,6 +1,4 @@
 //! The standard temperature / top-k / top-p / min-p sampler.
-//!
-//! Owned by W13.
 
 use crate::Result;
 use crate::tensor::Tensor;
@@ -45,11 +43,10 @@ impl Default for StandardSamplerParams {
 /// Draw one token from a logits row.
 ///
 /// Nothing is resolved: the returned token is a device tensor, and the logits
-/// never reach the host. The only host input is the uniform draw, which the
-/// reference also passes in as a `random` parameter.
+/// never reach the host. The only host input is the uniform draw.
 ///
-/// The filters run in the reference's order — repetition penalty, temperature,
-/// sort, top-k, min-p, top-p, weighted pick.
+/// The filters run in order: repetition penalty, temperature, sort, top-k,
+/// min-p, top-p, weighted pick.
 ///
 /// # Deviation from the reference
 ///
@@ -108,8 +105,7 @@ fn filtered_pick(sorted_values: &Tensor, k: u64, params: &StandardSamplerParams)
     let weights = row::weights_of(sorted_values, k)?;
     let first = row::first_only(&graph, k)?;
 
-    // min-p compares that ratio directly against the knob, which is the
-    // reference's `weight >= min_p`.
+    // min-p compares that ratio directly against the knob.
     let keep = if params.min_p > 0.0 {
         weights.gte_scalar(params.min_p)?
     } else {
@@ -117,11 +113,9 @@ fn filtered_pick(sorted_values: &Tensor, k: u64, params: &StandardSamplerParams)
     };
     let survivors = weights.mul(&keep)?;
 
-    // top-p over the min-p-filtered mass, matching the reference's
-    // `target = filtered_total * top_p`. Keeping every position whose
-    // *exclusive* prefix is still below the target is the same set the
-    // reference's break-on-`cumulative >= target` walk produces, including the
-    // token that crosses.
+    // top-p over the min-p-filtered mass. Keeping every position whose
+    // *exclusive* prefix is still below the target, including the token that
+    // crosses.
     let keep = if params.top_p < 1.0 {
         let total = row::total_of(&survivors)?;
         let target = row::fanout(&total, k)?.mul_scalar(params.top_p.max(0.0))?;
@@ -132,8 +126,8 @@ fn filtered_pick(sorted_values: &Tensor, k: u64, params: &StandardSamplerParams)
         keep
     };
 
-    // The reference forces a cutoff of at least one candidate when every
-    // filter rejected everything.
+    // Force a cutoff of at least one candidate when every filter rejected
+    // everything.
     let keep = keep.maximum(&first)?;
     let masked = weights.mul(&keep)?;
     row::pick_one_hot(&masked, k, row::unit_random(params.seed))

@@ -2,24 +2,14 @@
 //! bias/gelu/dequant epilogues fuse into the k-loop. No external BLAS — one in
 //! the critical path makes epilogue fusion structurally impossible.
 //!
-//! The nest is the shape of betlang's `conv1d_block4_group16`: a `TM x TN`
-//! register tile whose accumulators are `Stmt::Loop` accumulators, so they stay
-//! resident across the whole k nest and never reload. Because the accumulators
-//! are **in the IR**, `pre_a`, `pre_b` and `post` fuse into the k-loop
-//! epilogue, which is exactly what delegating to `gemm` cannot do.
+//! The nest is a `TM x TN` register tile whose accumulators are `Stmt::Loop`
+//! accumulators, staying resident across the whole k nest and never reloading.
+//! Because the accumulators are in the IR, `pre_a`, `pre_b` and `post` fuse
+//! into the k-loop epilogue.
 //!
-//! **The tile is `theta`'s and the grid covers the whole output.** What was
-//! here took the lane count from a written-in `CONTRACT_BLOCK = 64` and
-//! launched one workgroup per `(batch, m block)` with the lanes covering the
-//! whole n axis, so nothing ever wrote output column 64 and up: `[4,8] x
-//! [8,96]` came back with 127 of its 384 entries at exactly 0.0 and
-//! `[128,512] x [512,128]` with half of them wrong — every dense CPU layer
-//! wider than 64 units was silently wrong. The column block is a grid axis
-//! now, so coverage is `ceil(m / rows) * ceil(n / cols)` blocks whatever the
-//! tile is, and the tile itself is read out of the resolved schedule point
-//! rather than written here.
-//!
-//! Owned by W10.
+//! The tile shape comes from `theta` (the schedule point), and the grid covers
+//! the whole output with coverage `ceil(m / rows) * ceil(n / cols)` blocks
+//! whatever the tile is.
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::error::Error;
@@ -411,9 +401,8 @@ fn build(
     // Address both operands through their own layouts. `permuted_alias` in
     // `fusor2-tile` mints a non-contiguous `Alias` for any contraction whose
     // spec is not already in kernel axis order, and reading that densely is a
-    // miscompile, not a slowdown. A contiguous layout collapses to exactly the
-    // dense strides this kernel used to hardcode, so every previously-working
-    // plan emits byte-identical text.
+    // miscompile, not a slowdown. A contiguous layout collapses to plain
+    // dense strides.
     //
     // A side is a list of operands, each with its own buffer and its own
     // layout, all addressed by that side's `(batch, row, k)` or
@@ -664,7 +653,7 @@ mod tests {
         // Extents that do not cover the geometry are refused, not padded.
         let small = Layout::contiguous(&[Dim::Const(4), Dim::Const(4)]);
         assert_eq!(collapsed_strides(&small, [1, 8, 4]), None);
-        // Unchanged: the dense cases this kernel used to hardcode.
+        // The plain dense cases.
         let dense_a = Layout::contiguous(&[Dim::Const(3), Dim::Const(8), Dim::Const(5)]);
         assert_eq!(collapsed_strides(&dense_a, [3, 8, 5]), Some([40, 5, 1]));
         assert_eq!(collapsed_strides(&dense_a, [24, 5, 1]), Some([5, 1, 0]));

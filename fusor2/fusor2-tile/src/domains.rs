@@ -1,11 +1,6 @@
 //! Schedule-domain generators. Each `legal` *generates* the complete legal
 //! parameter space of one node under one `Caps`, filtered by structural
 //! predicates and the exact [`crate::arena`] footprint.
-//!
-//! The reference's 200-line SGEMM regression tree and 21-arm SGEMV bucket
-//! table are deleted; their measured leaves seed move ordering only.
-//!
-//! Owned by W4.
 
 pub mod coop;
 pub mod fold;

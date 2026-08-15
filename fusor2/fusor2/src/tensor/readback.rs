@@ -5,8 +5,6 @@
 //! indexing honours **offset and strides** rather than assuming contiguity.
 //! Every accessor is total: a symbolic extent that never got bound is an
 //! `Err`/`None`, never a panic.
-//!
-//! Owned by W12.
 
 use std::fmt;
 use std::marker::PhantomData;

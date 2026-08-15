@@ -1,7 +1,5 @@
 //! `Embedding`: a `Gather` whose adjoint is a `Scatter{Add}` with four
 //! coexisting lowerings. No hand-written backward.
-//!
-//! Owned by W13.
 
 use fusor2_gguf::VarBuilder;
 use fusor2_ir::shape::Dim;

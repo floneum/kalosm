@@ -4,11 +4,7 @@
 //!
 //! "Independent" is load-bearing — this recomputes [`LivenessInfo`] from the
 //! body rather than reusing the packer's conclusion, and it checks **all**
-//! pairs where the packer's placement loop checked incrementally. A packing
-//! bug therefore surfaces as a lowering-time error rather than as a data race
-//! on one vendor.
-//!
-//! Owned by W3.
+//! pairs where the packer's placement loop checked incrementally.
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;

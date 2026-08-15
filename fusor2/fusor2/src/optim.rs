@@ -2,13 +2,11 @@
 //! never a baked literal — so a learning-rate schedule does not recompile
 //! anything.
 //!
-//! The recipe is `trainer/src/optim.rs` term for term: bias correction folded
-//! into one step size, decoupled weight decay applied to the parameter rather
-//! than to the gradient, and epsilon added to `sqrt(v)` rather than to `v`.
-//! The two per-step scalars are the only things that change between steps, and
-//! both are uniforms, so a whole training run compiles one kernel set.
-//!
-//! Owned by W13.
+//! Bias correction is folded into the step size, weight decay is decoupled and
+//! applied to the parameter rather than the gradient, and epsilon is added to
+//! `sqrt(v)` rather than to `v`. The two per-step scalars are the only things
+//! that change between steps and both are uniforms, so a whole training run
+//! compiles one kernel set.
 
 use std::sync::Arc;
 

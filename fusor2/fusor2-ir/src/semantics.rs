@@ -1,8 +1,6 @@
 //! [`CoreSemantics`]: the single [`Semantics`] implementation covering the
 //! closed `L0`/`L1` enums plus the open [`OpDefRegistry`]. Total inference,
 //! work rows, effects and the two level verifiers hang off this type.
-//!
-//! Owned by W1.
 
 pub mod children;
 pub mod infer_l0;

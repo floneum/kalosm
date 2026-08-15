@@ -1,12 +1,6 @@
 //! The four strided-access lowerings, selected **once at compile time** from
-//! the `TileLayout` / `MultiFlattenMap`, never per vector.
-//!
-//! The reference re-evaluates `if self.layout.is_contiguous()` inside the hot
-//! loop and falls to a per-lane scalar gather through a `[E; 64]` stack buffer.
-//! Here the form is a property of the emitted `Instr`, so the inner loop has no
-//! branch at all.
-//!
-//! Owned by W10.
+//! the `TileLayout` / `MultiFlattenMap`, never per vector. The form is a
+//! property of the emitted `Instr`, so the inner loop has no branch.
 
 use fusor2_ir::ir::level2::{Addr, Builtin, TileExpr, TileExprKind, TileLayout, TileLiteral};
 use fusor2_ir::scalar::BinOp;

@@ -5,8 +5,6 @@
 //! retry. Back-pressure on in-flight submissions is a runtime policy here
 //! ([`GpuConfig::max_in_flight_submits`]), not a `--drain-every` counter in a
 //! training script.
-//!
-//! Owned by W9.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -34,7 +32,6 @@ pub const METAL_INFLIGHT_CHUNKS: usize = 2;
 /// `poll_wait` spins in `Poll` mode for this long before blocking.
 pub const POLL_SPIN: Duration = Duration::from_millis(2);
 
-// TEMPORARY PROBE — delete before finishing.
 pub static CHUNK_WAIT_US: AtomicU64 = AtomicU64::new(0);
 pub static POLL_WAIT_US: AtomicU64 = AtomicU64::new(0);
 struct ScopeGuard<F: FnMut()>(F);
@@ -184,7 +181,7 @@ pub enum TimingMode<'a> {
     /// launches the candidate changed are timed together in one resolve and
     /// judged as a summed window.
     Sparse(&'a [usize]),
-    /// TEMPORARY PROBE — delete before finishing. Live dispatches
+    /// Live dispatches
     /// `[start, start+n)` own slot pairs `(2(i-start), 2(i-start)+1)`, so a
     /// plan too large for a full query set can be timed in two halves.
     Range { start: usize, n: usize },
@@ -496,7 +493,6 @@ impl Launcher {
                 if pending.len() > METAL_INFLIGHT_CHUNKS
                     && let Some(oldest) = pending.pop_front()
                 {
-                    // TEMPORARY PROBE — delete before finishing.
                     let __w = Instant::now();
                     self.device
                         .poll(wgpu::PollType::Wait {
@@ -694,7 +690,6 @@ impl Launcher {
     /// Spin in `Poll` mode for [`POLL_SPIN`], then block.
     pub fn poll_wait(&self) -> Result<()> {
         self.poll_waits.fetch_add(1, Ordering::Relaxed);
-        // TEMPORARY PROBE — delete before finishing.
         let __w = Instant::now();
         let _g = scopeguard(move || {
             POLL_WAIT_US.fetch_add(__w.elapsed().as_micros() as u64, Ordering::Relaxed);

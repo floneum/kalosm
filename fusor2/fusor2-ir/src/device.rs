@@ -44,8 +44,7 @@ pub struct Limits {
     pub max_compute_invocations_per_workgroup: u32,
     pub max_compute_workgroup_size: [u32; 3],
     pub max_compute_workgroups_per_dimension: u32,
-    /// **Part of the plan-cache fingerprint** — the reference omits it
-    /// while the coop legality filter reads it, a live staleness hazard.
+    /// Part of the plan-cache fingerprint.
     pub max_compute_workgroup_storage_size: u32,
     pub max_storage_buffers_per_shader_stage: u32,
     pub max_storage_buffer_binding_size: u64,
