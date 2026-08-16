@@ -2,22 +2,23 @@
 //! schedule-parameter space of one node.
 //!
 //! Owns the Kernel algorithms (liveness, workgroup arena packing, barrier
-//! elision/insertion argmin, all-pairs arena verification, uniformity analysis,
-//! full Kernel type-check) and the hash-consed Kernel term builders both emitters share.
+//! insertion argmin, all-pairs arena verification, uniformity analysis, and
+//! full Kernel type-checking.
 //! Also owns the schedule-domain generators and the Launch lowering rules that
 //! consult them, because a rule whose legality filter is exact workgroup bytes
 //! must live with the function that computes them.
 
-pub mod arena;
-pub mod barrier;
-pub mod build;
+#![warn(unreachable_pub)]
+
+mod arena;
+mod barrier;
 pub mod domains;
-pub mod liveness;
+mod liveness;
 pub mod planner;
 pub mod rules;
-pub mod uniformity;
-pub mod verify_arena;
-pub mod verify_kernel;
+mod uniformity;
+mod verify_arena;
+mod verify_kernel;
 
 pub use planner::Planner;
 pub use rules::SCHED_RULES;

@@ -5,12 +5,12 @@
 //! what makes an f16 handle on a non-f16 adapter fail with
 //! [`EmitError::MissingCapability`] instead of mis-lowering.
 
-pub mod coop;
-pub mod expr;
-pub mod quantized;
-pub mod reduce;
-pub mod stmt;
-pub mod types;
+pub(crate) mod coop;
+pub(crate) mod expr;
+pub(crate) mod quantized;
+pub(crate) mod reduce;
+pub(crate) mod stmt;
+pub(crate) mod types;
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::ir::kernel::{
@@ -23,11 +23,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::bindings::{BindingDesc, bindings_from_module};
 
 /// `@builtin(local_invocation_index)`, always argument 0.
-pub const LOCAL_INVOCATION_INDEX_ARG: u32 = 0;
+pub(crate) const LOCAL_INVOCATION_INDEX_ARG: u32 = 0;
 /// `@builtin(workgroup_id)`, always argument 1.
-pub const WORKGROUP_ID_ARG: u32 = 1;
+pub(crate) const WORKGROUP_ID_ARG: u32 = 1;
 /// Lanes assumed when `KernelIr::block` is zero.
-pub const DEFAULT_WORKGROUP_INVOCATIONS: u32 = 256;
+pub(crate) const DEFAULT_WORKGROUP_INVOCATIONS: u32 = 256;
 
 /// The memory spaces a memo entry is stamped against, in stamp order.
 pub(crate) const MEM_SPACES: [MemReads; 3] =
@@ -64,7 +64,7 @@ pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<EmittedModule, EmitError> {
 }
 
 /// Emit with a plan the caller already has, which must not be recomputed.
-pub fn emit_module(
+pub(crate) fn emit_module(
     ir: &KernelIr,
     caps: &Caps,
     plan: &ArenaPlan,
@@ -99,7 +99,7 @@ pub(crate) fn collective_tree(
 /// the module declares — types, entry-point arguments, atomic buffer types and
 /// the validation capability set — is decided here.
 #[derive(Debug, Default)]
-pub struct Analysis {
+pub(crate) struct Analysis {
     pub uses_f16: bool,
     pub uses_bf16: bool,
     /// A `u32` holding two packed f16s is unpacked with `Unpack2x16Float`,
@@ -128,7 +128,7 @@ pub struct Analysis {
 
 impl Analysis {
     /// Whether the module needs the `SUBGROUP` validation capability.
-    pub fn uses_subgroups(&self) -> bool {
+    pub(crate) fn uses_subgroups(&self) -> bool {
         self.uses_subgroup_collective
             || self.subgroup_id
             || self.subgroup_lane
@@ -136,7 +136,7 @@ impl Analysis {
             || self.num_subgroups
     }
 
-    pub fn run(ir: &KernelIr, caps: &Caps) -> Self {
+    pub(crate) fn run(ir: &KernelIr, caps: &Caps) -> Self {
         let mut a = Self::default();
         a.fixed_width = caps.subgroups.filter(|s| s.is_fixed()).map(|s| s.assumed());
         a.block = if ir.block > 0 {
@@ -497,18 +497,16 @@ pub(crate) fn key<T>(v: &std::sync::Arc<T>) -> usize {
 /// Demand-allocated private scratch kinds, interned by
 /// `(kind, element, depth)`. Only keys that are actually used allocate.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ScratchKind {
+pub(crate) enum ScratchKind {
     LoopIndex,
     /// A masked-value spill local (one per masked load/reduce).
     Value,
     /// A reduce-accumulator spill local; deepens with nesting.
     Spill,
-    /// An atomic compare-exchange loop's `old`/`ok` slots.
-    Atomic,
 }
 
 /// Per-kernel emission state: the naga arenas plus the Kernel -> naga handle maps.
-pub struct Emitter<'a> {
+pub(crate) struct Emitter<'a> {
     pub caps: &'a Caps,
     pub module: naga::Module,
     pub(crate) ir: &'a KernelIr,
@@ -564,7 +562,7 @@ pub struct Emitter<'a> {
 }
 
 impl<'a> Emitter<'a> {
-    pub fn new(ir: &'a KernelIr, caps: &'a Caps, plan: &'a ArenaPlan) -> Result<Self, EmitError> {
+    pub(crate) fn new(ir: &'a KernelIr, caps: &'a Caps, plan: &'a ArenaPlan) -> Result<Self, EmitError> {
         let analysis = Analysis::run(ir, caps);
 
         // Capability gates, all decided before a single type is interned.
@@ -628,7 +626,7 @@ impl<'a> Emitter<'a> {
     }
 
     /// Build the globals, the one `main` entry point, and validate.
-    pub fn finish(mut self) -> Result<EmittedModule, EmitError> {
+    pub(crate) fn finish(mut self) -> Result<EmittedModule, EmitError> {
         types::create_storage_globals(&mut self)?;
         types::create_workgroup_globals(&mut self)?;
         types::create_private_locals(&mut self)?;
@@ -714,7 +712,7 @@ impl<'a> Emitter<'a> {
     /// Run naga's validator with exactly the capabilities the analysis raised.
     /// A failure here is a compiler bug, not a user error — it is what licenses
     /// the trusted shader-module path, and it is never a silent fallback.
-    pub fn validate(&self) -> Result<naga::valid::ModuleInfo, EmitError> {
+    pub(crate) fn validate(&self) -> Result<naga::valid::ModuleInfo, EmitError> {
         use naga::valid::Capabilities as C;
         let mut caps = C::empty();
         if self.analysis.uses_f16 {
@@ -740,646 +738,5 @@ fn builtin_arg(ty: naga::Handle<naga::Type>, builtin: naga::BuiltIn) -> naga::Fu
         name: None,
         ty,
         binding: Some(naga::Binding::BuiltIn(builtin)),
-    }
-}
-
-/// Fixture builders and a minimal dispatcher, shared by every emit test in
-/// this crate. The launcher proper lives in `crate::launch`.
-#[cfg(test)]
-pub(crate) mod testkit {
-    use super::*;
-    use fusor2_ir::device::{Caps, DeviceKind, Limits, SubgroupWidths};
-    use fusor2_ir::ir::kernel::{
-        ArenaMode, BufferAccess, BufferDecl, LocalDecl, MemoryLevel, Placement, StorageView,
-        TileDecl, TileLayout, TileLiteral,
-    };
-    use std::sync::Arc;
-
-    pub fn f32e() -> ElementType {
-        ElementType::Scalar(ScalarElement::F32)
-    }
-    pub fn u32e() -> ElementType {
-        ElementType::Scalar(ScalarElement::U32)
-    }
-    pub fn boole() -> ElementType {
-        ElementType::Scalar(ScalarElement::Bool)
-    }
-    pub fn f16e() -> ElementType {
-        ElementType::Scalar(ScalarElement::F16)
-    }
-
-    pub fn caps(f16: bool, subgroups: bool) -> Caps {
-        Caps {
-            kind: DeviceKind::Gpu,
-            name: "test".into(),
-            limits: Limits::default(),
-            subgroups: subgroups.then_some(SubgroupWidths { min: 32, max: 32 }),
-            f16,
-            bf16: false,
-            coop: Default::default(),
-            atomic_f32: true,
-            workgroup_alias: false,
-            mixed_precision_coop_store: false,
-            pipeline_cache: false,
-            timestamp_query: false,
-            simd_widths: Default::default(),
-            threads: 1,
-        }
-    }
-
-    pub fn buffer(binding: u32, element: ElementType, len: u32, write: bool) -> Buffer {
-        Arc::new(BufferDecl {
-            binding,
-            element,
-            layout: TileLayout::contiguous(MemoryLevel::Storage, &[len]),
-            access: if write {
-                BufferAccess::ReadWrite
-            } else {
-                BufferAccess::Read
-            },
-        })
-    }
-
-    pub fn view(buffer: &Buffer, extents: &[u32]) -> StorageView {
-        StorageView {
-            buffer: buffer.clone(),
-            offset: 0,
-            layout: TileLayout::contiguous(MemoryLevel::Storage, extents),
-        }
-    }
-
-    pub fn tile(element: ElementType, extents: &[u32]) -> Tile {
-        Arc::new(TileDecl::new(
-            element,
-            TileLayout::contiguous(MemoryLevel::Workgroup, extents),
-            "t",
-        ))
-    }
-
-    pub fn local(element: ElementType) -> Local {
-        Arc::new(LocalDecl::new(element))
-    }
-
-    pub fn lit_u32(v: u32) -> TileExpr {
-        TileExpr::new(TileExprKind::Literal(TileLiteral::U32(v)), u32e())
-    }
-    pub fn lit_f32(v: f32) -> TileExpr {
-        TileExpr::new(TileExprKind::Literal(TileLiteral::F32(v.to_bits())), f32e())
-    }
-    pub fn tru() -> TileExpr {
-        TileExpr::new(TileExprKind::Literal(TileLiteral::Bool(true)), boole())
-    }
-    pub fn lane() -> TileExpr {
-        TileExpr::new(TileExprKind::Builtin(Builtin::Lane), u32e())
-    }
-    pub fn load(v: &StorageView, index: TileExpr) -> TileExpr {
-        let element = v.buffer.element;
-        TileExpr::new(
-            TileExprKind::Load {
-                src: Source::Storage(v.clone()),
-                addr: Box::new(Addr::Linear(index)),
-                mask: tru(),
-                fill: lit_f32(0.0),
-            },
-            element,
-        )
-    }
-    pub fn store(v: &StorageView, index: TileExpr, value: TileExpr) -> Stmt {
-        Stmt::Store {
-            dst: v.clone(),
-            addr: Addr::Linear(index),
-            value,
-            mask: tru(),
-        }
-    }
-    pub fn un(op: fusor2_ir::scalar::UnOp, x: TileExpr) -> TileExpr {
-        let ty = x.element();
-        TileExpr::new(
-            TileExprKind::Unary {
-                op,
-                value: x,
-                numeric: fusor2_ir::dtype::NumericContract::RELAXED,
-            },
-            ty,
-        )
-    }
-    pub fn bin(
-        op: fusor2_ir::scalar::BinOp,
-        a: TileExpr,
-        b: TileExpr,
-        numeric: fusor2_ir::dtype::NumericContract,
-    ) -> TileExpr {
-        let ty = a.element();
-        TileExpr::new(
-            TileExprKind::Binary {
-                op,
-                left: a,
-                right: b,
-                numeric,
-            },
-            ty,
-        )
-    }
-
-    /// The plan a kernel with no shared tiles gets: every tile keeps its own
-    /// allocation.
-    pub fn no_plan() -> ArenaPlan {
-        ArenaPlan {
-            mode: ArenaMode::Regions,
-            total_bytes: 0,
-            placements: Default::default(),
-            barriers_inserted: Default::default(),
-        }
-    }
-
-    /// A `Regions` plan that puts every listed tile in one shared allocation.
-    pub fn shared_region(tiles: &[Tile]) -> ArenaPlan {
-        let mut placements = smallvec::SmallVec::new();
-        let mut total = 0u32;
-        for t in tiles {
-            let bytes =
-                t.layout.element_count() as u32 * t.element.workgroup_array_stride().unwrap_or(4);
-            total = total.max(bytes);
-            placements.push(Placement {
-                tile: t.clone(),
-                byte_offset: 0,
-                byte_len: bytes,
-            });
-        }
-        ArenaPlan {
-            mode: ArenaMode::Regions,
-            total_bytes: total,
-            placements,
-            barriers_inserted: Default::default(),
-        }
-    }
-
-    /// A `ByteArena` plan that packs the listed tiles end to end.
-    pub fn byte_arena(tiles: &[Tile]) -> ArenaPlan {
-        let mut placements = smallvec::SmallVec::new();
-        let mut offset = 0u32;
-        for t in tiles {
-            let bytes =
-                t.layout.element_count() as u32 * t.element.workgroup_array_stride().unwrap_or(4);
-            placements.push(Placement {
-                tile: t.clone(),
-                byte_offset: offset,
-                byte_len: bytes,
-            });
-            offset += bytes;
-        }
-        ArenaPlan {
-            mode: ArenaMode::ByteArena,
-            total_bytes: offset,
-            placements,
-            barriers_inserted: Default::default(),
-        }
-    }
-
-    /// The one `main` function of an emitted module.
-    pub fn main_fn(module: &naga::Module) -> &naga::Function {
-        &module.entry_points[0].function
-    }
-
-    pub fn count_exprs(module: &naga::Module, f: impl Fn(&naga::Expression) -> bool) -> usize {
-        main_fn(module)
-            .expressions
-            .iter()
-            .filter(|(_, e)| f(e))
-            .count()
-    }
-
-    /// A device probed exactly the way the shipped path probes it.
-    pub fn gpu() -> Option<crate::device::GpuDevice> {
-        crate::device::gpu_blocking(&crate::device::DeviceOptions::default()).ok()
-    }
-
-    /// Emit, compile and dispatch `ir`, returning binding `out`'s contents.
-    ///
-    /// `inputs` is positional against the derived binding list, so the test
-    /// exercises the same derivation the launcher does.
-    pub fn run(
-        gpu: &crate::device::GpuDevice,
-        ir: &KernelIr,
-        plan: &ArenaPlan,
-        inputs: &[Vec<u8>],
-        out: usize,
-    ) -> Vec<u8> {
-        run_emitted(
-            gpu,
-            ir,
-            emit_module(ir, gpu.caps(), plan).expect("emit"),
-            inputs,
-            out,
-        )
-    }
-
-    /// As [`run`], for a module the caller already emitted.
-    pub fn run_emitted(
-        gpu: &crate::device::GpuDevice,
-        ir: &KernelIr,
-        emitted: EmittedModule,
-        inputs: &[Vec<u8>],
-        out: usize,
-    ) -> Vec<u8> {
-        let device = gpu.device();
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(ir.name),
-            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(emitted.module)),
-        });
-        let entries = crate::bindings::layout_entries(&emitted.bindings);
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &entries,
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: None,
-            layout: Some(&pipeline_layout),
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        let buffers: Vec<wgpu::Buffer> = inputs
-            .iter()
-            .map(|bytes| {
-                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: None,
-                    size: bytes.len().max(4) as u64,
-                    usage: wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_SRC
-                        | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                gpu.queue().write_buffer(&buffer, 0, bytes);
-                buffer
-            })
-            .collect();
-        let bind_entries =
-            crate::bindings::zip_buffers(&emitted.bindings, &buffers).expect("zip buffers");
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &bind_entries,
-        });
-
-        let size = inputs[out].len() as u64;
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(ir.grid[0], ir.grid[1], ir.grid[2]);
-        }
-        encoder.copy_buffer_to_buffer(&buffers[out], 0, &staging, 0, size);
-        gpu.queue().submit(Some(encoder.finish()));
-
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        rx.recv().expect("map").expect("map ok");
-        let data = slice.get_mapped_range().to_vec();
-        staging.unmap();
-        data
-    }
-
-    pub fn f32s(bytes: &[u8]) -> Vec<f32> {
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
-    pub fn bytes_of(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|v| v.to_le_bytes()).collect()
-    }
-    /// Binding 0 is always the read-only `Uniforms` storage buffer.
-    pub fn uniforms() -> Vec<u8> {
-        vec![0u8; 16]
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::testkit::*;
-    use super::*;
-    use fusor2_ir::dtype::NumericContract;
-    use fusor2_ir::ir::kernel::{ArenaMode, ReduceKind, TileReduceOp};
-    use fusor2_ir::scalar::{BinOp, UnOp};
-
-    /// out[lane] = exp(in[lane]) + 1
-    fn elementwise() -> KernelIr {
-        let uni = buffer(0, u32e(), 4, false);
-        let src = buffer(1, f32e(), 256, false);
-        let dst = buffer(2, f32e(), 256, true);
-        let sv = view(&src, &[256]);
-        let dv = view(&dst, &[256]);
-        let value = bin(
-            BinOp::Add,
-            un(UnOp::Exp, load(&sv, lane())),
-            lit_f32(1.0),
-            NumericContract::RELAXED,
-        );
-        KernelIr {
-            buffers: vec![uni, src, dst],
-            grid: [1, 1, 1],
-            block: 256,
-            body: vec![store(&dv, lane(), value)],
-            byte_arena: None,
-            name: "elementwise",
-        }
-    }
-
-    /// A workgroup-tree sum written by lane 0.
-    fn tree_sum() -> KernelIr {
-        let uni = buffer(0, u32e(), 4, false);
-        let src = buffer(1, f32e(), 256, false);
-        let dst = buffer(2, f32e(), 1, true);
-        let sv = view(&src, &[256]);
-        let dv = view(&dst, &[1]);
-        let scratch = tile(f32e(), &[256]);
-        let total = TileExpr::new(
-            TileExprKind::Reduce {
-                op: TileReduceOp::Sum,
-                kind: Box::new(ReduceKind::Workgroup {
-                    scratch,
-                    group_size: 256,
-                }),
-                value: load(&sv, lane()),
-            },
-            f32e(),
-        );
-        let is_zero = TileExpr::new(
-            TileExprKind::Compare {
-                op: fusor2_ir::scalar::CmpOp::Eq,
-                left: lane(),
-                right: lit_u32(0),
-            },
-            boole(),
-        );
-        KernelIr {
-            buffers: vec![uni, src, dst],
-            grid: [1, 1, 1],
-            block: 256,
-            body: vec![Stmt::Store {
-                dst: dv,
-                addr: Addr::Linear(lit_u32(0)),
-                value: total,
-                mask: is_zero,
-            }],
-            byte_arena: None,
-            name: "tree_sum",
-        }
-    }
-
-    /// Two workgroup tiles that a plan may or may not share.
-    fn two_tiles() -> (KernelIr, Tile, Tile) {
-        let uni = buffer(0, u32e(), 4, false);
-        let dst = buffer(1, f32e(), 256, true);
-        let dv = view(&dst, &[256]);
-        let a = tile(f32e(), &[256]);
-        let b = tile(f32e(), &[256]);
-        let body = vec![
-            Stmt::StoreTile {
-                dst: a.clone(),
-                index: lane(),
-                value: lit_f32(2.0),
-            },
-            Stmt::Barrier,
-            Stmt::StoreTile {
-                dst: b.clone(),
-                index: lane(),
-                value: TileExpr::new(
-                    TileExprKind::LoadTile {
-                        tile: a.clone(),
-                        index: lane(),
-                    },
-                    f32e(),
-                ),
-            },
-            Stmt::Barrier,
-            store(
-                &dv,
-                lane(),
-                TileExpr::new(
-                    TileExprKind::LoadTile {
-                        tile: b.clone(),
-                        index: lane(),
-                    },
-                    f32e(),
-                ),
-            ),
-        ];
-        (
-            KernelIr {
-                buffers: vec![uni, dst],
-                grid: [1, 1, 1],
-                block: 256,
-                body,
-                byte_arena: None,
-                name: "two_tiles",
-            },
-            a,
-            b,
-        )
-    }
-
-    /// Test 6 — one `main`, the right workgroup size, the right argument list.
-    #[test]
-    fn every_module_has_one_main() {
-        // No subgroups: a workgroup tree stays a tree, so none of these
-        // fixtures reads a subgroup builtin. (On a fixed-width device the
-        // tree upgrades to the two-stage and legitimately grows the subgroup
-        // arguments — that shape is pinned by the reduce goldens.)
-        let caps = caps(false, false);
-        let (tiles_ir, _, _) = two_tiles();
-        for ir in [elementwise(), tree_sum(), tiles_ir] {
-            let emitted = emit_module(&ir, &caps, &no_plan()).expect(ir.name);
-            let m = &emitted.module;
-            assert_eq!(m.entry_points.len(), 1, "{}", ir.name);
-            assert_eq!(m.entry_points[0].name, "main");
-            assert_eq!(m.entry_points[0].stage, naga::ShaderStage::Compute);
-            assert_eq!(m.entry_points[0].workgroup_size, [ir.block, 1, 1]);
-            let args = &main_fn(m).arguments;
-            assert!(args.len() >= 2);
-            assert_eq!(
-                args[0].binding,
-                Some(naga::Binding::BuiltIn(naga::BuiltIn::LocalInvocationIndex))
-            );
-            assert_eq!(
-                args[1].binding,
-                Some(naga::Binding::BuiltIn(naga::BuiltIn::WorkGroupId))
-            );
-            // Subgroup arguments appear only when the body uses them; none of
-            // these fixtures does.
-            assert_eq!(args.len(), 2, "{} grew a subgroup argument", ir.name);
-            assert!(!emitted.subgroups);
-        }
-    }
-
-    /// A subgroup collective is the one fixture that grows argument 2.
-    #[test]
-    fn subgroup_args_appear_only_when_used() {
-        let uni = buffer(0, u32e(), 4, false);
-        let src = buffer(1, f32e(), 256, false);
-        let dst = buffer(2, f32e(), 1, true);
-        let sv = view(&src, &[256]);
-        let dv = view(&dst, &[1]);
-        let total = TileExpr::new(
-            TileExprKind::Reduce {
-                op: TileReduceOp::Sum,
-                kind: Box::new(ReduceKind::Subgroup),
-                value: load(&sv, lane()),
-            },
-            f32e(),
-        );
-        let ir = KernelIr {
-            buffers: vec![uni, src, dst],
-            grid: [1, 1, 1],
-            block: 32,
-            body: vec![store(&dv, lit_u32(0), total)],
-            byte_arena: None,
-            name: "subgroup_sum",
-        };
-        let emitted = emit_module(&ir, &caps(false, true), &no_plan()).expect("emit");
-        assert!(emitted.subgroups);
-        // A collective needs no builtin argument of its own.
-        assert_eq!(main_fn(&emitted.module).arguments.len(), 2);
-        // ... and the module must fail on a device without subgroups.
-        assert_eq!(
-            emit_module(&ir, &caps(false, false), &no_plan()).unwrap_err(),
-            EmitError::MissingCapability("subgroups")
-        );
-    }
-
-    /// Test 4 — f16 is gated up front, not lazily.
-    #[test]
-    fn f16_without_capability_is_unsupported() {
-        let uni = buffer(0, u32e(), 4, false);
-        let src = buffer(1, f16e(), 256, false);
-        let dst = buffer(2, f16e(), 256, true);
-        let sv = view(&src, &[256]);
-        let dv = view(&dst, &[256]);
-        let ir = KernelIr {
-            buffers: vec![uni, src, dst],
-            grid: [1, 1, 1],
-            block: 256,
-            body: vec![store(&dv, lane(), load(&sv, lane()))],
-            byte_arena: None,
-            name: "f16_copy",
-        };
-        assert_eq!(
-            emit_module(&ir, &caps(false, true), &no_plan()).unwrap_err(),
-            EmitError::MissingCapability("shader-f16")
-        );
-
-        // With the capability it emits, and the 2-byte float appears.
-        let ok = emit_module(&ir, &caps(true, true), &no_plan()).expect("f16 emit");
-        assert!(has_two_byte_float(&ok.module));
-        // A kernel that never mentions f16 never interns one.
-        let plain = emit_module(&elementwise(), &caps(true, true), &no_plan()).expect("emit");
-        assert!(!has_two_byte_float(&plain.module));
-    }
-
-    fn has_two_byte_float(module: &naga::Module) -> bool {
-        module.types.iter().any(|(_, t)| {
-            matches!(
-                t.inner,
-                naga::TypeInner::Scalar(naga::Scalar {
-                    kind: naga::ScalarKind::Float,
-                    width: 2
-                })
-            )
-        })
-    }
-
-    /// Test 13 — the type arena is deterministic.
-    #[test]
-    fn type_arena_is_deterministic() {
-        let caps = caps(false, true);
-        for ir in [elementwise(), tree_sum()] {
-            let a = emit_module(&ir, &caps, &no_plan()).expect("a").module;
-            let b = emit_module(&ir, &caps, &no_plan()).expect("b").module;
-            assert_eq!(format!("{a:#?}"), format!("{b:#?}"), "{}", ir.name);
-        }
-        // Two structurally identical IRs built independently agree as well,
-        // which is what the hash-consed memo buys over pointer identity.
-        let x = emit_module(&elementwise(), &caps, &no_plan())
-            .expect("x")
-            .module;
-        let y = emit_module(&elementwise(), &caps, &no_plan())
-            .expect("y")
-            .module;
-        assert_eq!(format!("{x:#?}"), format!("{y:#?}"));
-    }
-
-    /// Test 12 — the byte arena is a footprint choice, never a numeric one.
-    #[test]
-    fn byte_arena_absence_is_only_footprint() {
-        let (ir, a, b) = two_tiles();
-        let regions = shared_region(&[a.clone(), b.clone()]);
-        let arena = byte_arena(&[a, b]);
-        assert_eq!(regions.mode, ArenaMode::Regions);
-        assert_eq!(arena.mode, ArenaMode::ByteArena);
-        // Only the footprint differs: the shared region overlaps the two
-        // tiles, the byte arena packs them end to end.
-        assert!(arena.total_bytes > regions.total_bytes);
-
-        let caps = caps(false, true);
-        let m_regions = emit_module(&ir, &caps, &regions).expect("regions");
-        let m_arena = emit_module(&ir, &caps, &arena).expect("arena");
-        // No `WorkgroupAlias` is emitted in either module: released naga has
-        // no such decoration, so the arena is index arithmetic instead.
-        assert_eq!(workgroup_globals(&m_regions.module), 1);
-        assert_eq!(workgroup_globals(&m_arena.module), 1);
-
-        let Some(gpu) = gpu() else {
-            eprintln!("no wgpu adapter; skipping the numeric half");
-            return;
-        };
-        let inputs = vec![uniforms(), bytes_of(&[0.0; 256])];
-        let out_regions = f32s(&run(&gpu, &ir, &regions, &inputs, 1));
-        let out_arena = f32s(&run(&gpu, &ir, &arena, &inputs, 1));
-        assert_eq!(out_regions, vec![2.0f32; 256]);
-        assert_eq!(out_regions, out_arena);
-    }
-
-    fn workgroup_globals(module: &naga::Module) -> usize {
-        module
-            .global_variables
-            .iter()
-            .filter(|(_, g)| g.space == naga::AddressSpace::WorkGroup)
-            .count()
-    }
-
-    /// A kernel wider than the baseline's invocation limit is refused rather
-    /// than silently clamped.
-    #[test]
-    fn oversize_block_is_a_limit_error() {
-        let mut ir = elementwise();
-        ir.block = 1024;
-        assert!(matches!(
-            emit_module(&ir, &caps(false, true), &no_plan()),
-            Err(EmitError::LimitExceeded(_))
-        ));
     }
 }

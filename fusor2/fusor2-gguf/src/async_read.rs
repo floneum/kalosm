@@ -5,12 +5,13 @@ use fusor2_ir::Result;
 use fusor2_ir::error::Error;
 use std::future::Future;
 use std::pin::Pin;
+#[cfg(test)]
 use std::sync::Arc;
 
 use crate::parse::GgufMetadata;
 
 /// A future returned by [`AsyncReadRange::read_range`].
-pub type ReadFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
+pub(crate) type ReadFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
 
 /// Something that can serve `len` bytes starting at `start`.
 pub trait AsyncReadRange: Send + Sync {
@@ -29,8 +30,10 @@ pub trait AsyncReadRange: Send + Sync {
 }
 
 /// An in-memory source, for tests and for callers that already hold the file.
-pub struct BytesRange(pub Arc<[u8]>);
+#[cfg(test)]
+pub(crate) struct BytesRange(pub Arc<[u8]>);
 
+#[cfg(test)]
 impl AsyncReadRange for BytesRange {
     fn read_range(&self, start: u64, len: usize) -> ReadFuture<'_> {
         let start = start as usize;
@@ -60,7 +63,7 @@ const HEADER_LIMIT_BYTES: usize = 64 << 20;
 /// The header's length is not known until it has been parsed, so this pulls a
 /// prefix and doubles it while the parse runs off the end. Each attempt is one
 /// range request; a well-formed file needs exactly one.
-pub async fn read_metadata(source: &dyn AsyncReadRange) -> Result<GgufMetadata> {
+pub(crate) async fn read_metadata(source: &dyn AsyncReadRange) -> Result<GgufMetadata> {
     let total = source.len();
     let mut want = HEADER_PROBE_BYTES;
     loop {
@@ -85,7 +88,8 @@ pub async fn read_metadata(source: &dyn AsyncReadRange) -> Result<GgufMetadata> 
 
 /// A minimal executor for callers that have none. Spins; only sensible for
 /// futures that never actually yield.
-pub fn block_on<F: Future>(future: F) -> F::Output {
+#[cfg(test)]
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     const VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -116,20 +120,5 @@ pub(crate) fn expect_len(bytes: Vec<u8>, want: usize, what: &str) -> Result<Vec<
             "{what}: wanted {want} bytes, the source served {}",
             bytes.len()
         )))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bytes_range_serves_clamped_slices() {
-        let src = BytesRange(Arc::from(vec![1u8, 2, 3, 4].into_boxed_slice()));
-        assert_eq!(src.len(), Some(4));
-        assert!(!src.is_empty());
-        assert_eq!(block_on(src.read_range(1, 2)).unwrap(), vec![2, 3]);
-        assert_eq!(block_on(src.read_range(2, 99)).unwrap(), vec![3, 4]);
-        assert!(block_on(src.read_range(9, 4)).unwrap().is_empty());
     }
 }

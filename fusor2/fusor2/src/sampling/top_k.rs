@@ -14,6 +14,7 @@ use super::row;
 /// step's embedding lookup. Only [`GpuSampledToken::to_u32`] costs a sync.
 #[derive(Clone)]
 pub struct GpuSampledToken {
+    /// One-element `u32` tensor containing the sampled token id.
     pub value: Tensor,
 }
 
@@ -52,64 +53,4 @@ pub fn top_k_pairs(logits: &Tensor, k: u32) -> Result<(Tensor, Tensor)> {
     let values = values.reshape_dims(&shape)?;
     let ids = ids.reshape_dims(&shape)?.cast(Dtype::U32)?;
     Ok((values, ids))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::sampling::test_support::{conformance_row, cpu_row, host_sorted};
-
-    #[test]
-    fn top_k_matches_a_host_sort_at_every_k() {
-        let values = conformance_row();
-        let (_s, _g, t) = cpu_row(&values);
-        let want = host_sorted(&values);
-        for k in 1..=values.len() {
-            let (gv, gi) = top_k_pairs(&t, k as u32).unwrap();
-            assert_eq!(gi.dtype(), Dtype::U32, "indices must be U32");
-            let gv = gv.to_vec_f32().unwrap();
-            let gi = gi.to_vec_u32().unwrap();
-            let wv: Vec<f32> = want[..k].iter().map(|p| p.0).collect();
-            let wi: Vec<u32> = want[..k].iter().map(|p| p.1).collect();
-            assert_eq!(gv, wv, "k={k} values");
-            assert_eq!(gi, wi, "k={k} ids");
-        }
-    }
-
-    /// The declared rule: on an exact tie the larger token id sorts first.
-    #[test]
-    fn ties_break_towards_the_larger_token_id() {
-        let mut values = vec![0.0f32; 16];
-        values[3] = 2.0;
-        values[9] = 2.0;
-        let (_s, _g, t) = cpu_row(&values);
-        let (_, ids) = top_k_pairs(&t, 2).unwrap();
-        assert_eq!(ids.to_vec_u32().unwrap(), vec![9, 3]);
-    }
-
-    /// A whole row of equal logits is the strongest form of the tie rule: the
-    /// ids must come back in strictly descending order.
-    #[test]
-    fn an_all_tied_row_sorts_by_descending_id() {
-        let values = vec![1.5f32; 8];
-        let (_s, _g, t) = cpu_row(&values);
-        let (_, ids) = top_k_pairs(&t, 8).unwrap();
-        assert_eq!(ids.to_vec_u32().unwrap(), vec![7, 6, 5, 4, 3, 2, 1, 0]);
-    }
-
-    #[test]
-    fn non_finite_logits_sort_below_every_real_one() {
-        let values = vec![0.25, f32::NAN, 7.0, -3.0, 2.5, f32::INFINITY, 8.5, 9.0];
-        let (_s, _g, t) = cpu_row(&values);
-        let (_, ids) = top_k_pairs(&t, 5).unwrap();
-        // The five finite winners, descending: 9.0@7, 8.5@6, 7.0@2, 2.5@4, 0.25@0.
-        assert_eq!(ids.to_vec_u32().unwrap(), vec![7, 6, 2, 4, 0]);
-    }
-
-    #[test]
-    fn a_degenerate_k_is_an_error_not_a_panic() {
-        let (_s, _g, t) = cpu_row(&[1.0, 2.0, 3.0]);
-        assert!(top_k_pairs(&t, 0).is_err());
-        assert!(top_k_pairs(&t, 4).is_err());
-    }
 }

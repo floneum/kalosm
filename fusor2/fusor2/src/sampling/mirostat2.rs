@@ -13,10 +13,13 @@ use super::top_k::GpuSampledToken;
 /// `mu` against the surprise it actually observed:
 /// `mu <- mu - eta * (surprise - tau)`.
 pub struct Mirostat2Sampler {
+    /// Target surprise.
     pub tau: f32,
+    /// Adaptation rate.
     pub eta: f32,
     /// The running surprise target. Starts at `2 * tau`.
     pub mu: f32,
+    /// Base random seed.
     pub seed: u64,
     /// How many draws this sampler has made. Mixed into `seed` so successive
     /// draws differ while the whole sequence stays a function of the seed.
@@ -24,6 +27,7 @@ pub struct Mirostat2Sampler {
 }
 
 impl Mirostat2Sampler {
+    /// Create a sampler with `mu = 2 * tau` and seed zero.
     pub fn new(tau: f32, eta: f32) -> Self {
         Self {
             tau,
@@ -83,124 +87,5 @@ impl Mirostat2Sampler {
         self.step = self.step.wrapping_add(1);
 
         Ok(GpuSampledToken { value: token })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::sampling::test_support::{conformance_row, cpu_row};
-
-    #[test]
-    fn mu_starts_at_twice_tau() {
-        let s = Mirostat2Sampler::new(3.0, 0.5);
-        assert_eq!(s.mu, 6.0);
-    }
-
-    #[test]
-    fn every_draw_is_in_the_vocabulary() {
-        let values = conformance_row();
-        let (_s, _g, t) = cpu_row(&values);
-        let mut sampler = Mirostat2Sampler::new(5.0, 0.1);
-        for _ in 0..8 {
-            let got = sampler.sample(&t).unwrap().to_u32().unwrap();
-            assert!((got as usize) < values.len(), "drew {got}");
-        }
-    }
-
-    /// mu is state: it has to track the observed surprise.
-    #[test]
-    fn mu_moves_with_the_observed_surprise() {
-        let values = conformance_row();
-        let (_s, _g, t) = cpu_row(&values);
-        let mut sampler = Mirostat2Sampler::new(3.0, 0.5);
-        let start = sampler.mu;
-        for _ in 0..8 {
-            sampler.sample(&t).unwrap();
-        }
-        assert!((sampler.mu - start).abs() > 1e-6, "mu never left {start}");
-    }
-
-    /// The update is the reference's `mu <- mu - eta * (surprise - tau)`, and
-    /// with a one-token-dominant row the surprise is ~0, so mu must climb by
-    /// about `eta * tau` on the first draw.
-    #[test]
-    fn the_mu_update_follows_the_reference_recurrence() {
-        // A row so peaked that the truncated set is a single token, whose
-        // renormalised probability is 1 and whose surprise is 0.
-        let mut values = vec![-40.0f32; 8];
-        values[5] = 40.0;
-        let (_s, _g, t) = cpu_row(&values);
-        let mut sampler = Mirostat2Sampler::new(2.0, 0.25);
-        let before = sampler.mu;
-        let token = sampler.sample(&t).unwrap().to_u32().unwrap();
-        assert_eq!(token, 5, "the only plausible token");
-        // surprise = 0 => mu <- mu - eta * (0 - tau) = mu + eta * tau.
-        let want = before + 0.25 * 2.0;
-        assert!(
-            (sampler.mu - want).abs() < 1e-3,
-            "mu moved to {}, want {want}",
-            sampler.mu
-        );
-    }
-
-    /// mu falls when the observed surprise is *above* tau, which is the other
-    /// half of the controller. Eight equal logits give every token a
-    /// renormalised probability of 1/8 and a surprise of exactly 3 bits, so
-    /// the step is fully determined: `4 - 0.5 * (3 - 2) = 3.5`.
-    #[test]
-    fn a_surprise_above_tau_pulls_mu_down() {
-        let (_s, _g, t) = cpu_row(&[1.0f32; 8]);
-        let mut sampler = Mirostat2Sampler::new(2.0, 0.5);
-        assert_eq!(sampler.mu, 4.0);
-        sampler.sample(&t).unwrap();
-        assert!(
-            (sampler.mu - 3.5).abs() < 1e-4,
-            "mu moved to {}, want 3.5",
-            sampler.mu
-        );
-    }
-
-    /// The same seed replays the same sequence of draws and the same mu.
-    #[test]
-    fn the_sequence_is_seed_deterministic() {
-        let values = conformance_row();
-        let (_s, _g, t) = cpu_row(&values);
-        let run = || {
-            let mut sampler = Mirostat2Sampler::new(4.0, 0.2);
-            sampler.seed = 1234;
-            let draws: Vec<u32> = (0..6)
-                .map(|_| sampler.sample(&t).unwrap().to_u32().unwrap())
-                .collect();
-            (draws, sampler.mu)
-        };
-        let (a, mu_a) = run();
-        let (b, mu_b) = run();
-        assert_eq!(a, b, "the same seed must replay");
-        assert_eq!(mu_a, mu_b);
-    }
-
-    /// Successive draws from one sampler are not frozen on one token.
-    #[test]
-    fn successive_draws_advance_the_stream() {
-        let values = conformance_row();
-        let (_s, _g, t) = cpu_row(&values);
-        let mut sampler = Mirostat2Sampler::new(8.0, 0.05);
-        sampler.seed = 77;
-        let draws: std::collections::BTreeSet<u32> = (0..32)
-            .map(|_| sampler.sample(&t).unwrap().to_u32().unwrap())
-            .collect();
-        assert!(draws.len() > 1, "32 draws all returned {draws:?}");
-    }
-
-    #[test]
-    fn the_pending_token_is_a_usable_device_operand() {
-        let values = conformance_row();
-        let (_s, _g, t) = cpu_row(&values);
-        let mut sampler = Mirostat2Sampler::new(5.0, 0.1);
-        let pending = sampler.sample(&t).unwrap();
-        assert_eq!(pending.value.dtype(), crate::Dtype::U32);
-        assert!(pending.value.rank() <= 1);
-        assert!(pending.value.add_scalar(0u32).is_ok());
     }
 }

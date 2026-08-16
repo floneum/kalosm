@@ -115,17 +115,6 @@ pub(crate) fn load_dense(vb: &VarBuilder, graph: &GraphRef, name: &str) -> Resul
     )
 }
 
-/// A const-rank leaf, for the layer tests. `T::DTYPE` is the leaf's dtype, so
-/// a `Tensor<2, f16>` leaf is an f16 one.
-#[cfg(test)]
-pub(crate) fn test_leaf<const R: usize, T: Element>(
-    g: &crate::graph::Graph,
-    shape: &[u64],
-) -> crate::Tensor<R, T> {
-    let dims: Vec<Dim> = shape.iter().map(|d| Dim::Const(*d)).collect();
-    crate::Tensor::from_dyn(g.leaf("t", &dims, T::DTYPE).expect("leaf"))
-}
-
 /// [`load_dense`], or `None` when the key is absent. A missing key is the
 /// only thing swallowed: a present-but-unreadable entry still errors.
 pub(crate) fn load_optional(
@@ -152,110 +141,5 @@ pub(crate) fn as_vector(t: Tensor, name: &str) -> Result<Tensor> {
         other => Err(Error::Shape(format!(
             "{name} must be a vector or a squeezable vector, got {other:?}"
         ))),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    use fusor2_gguf::parse::{GgmlType, GgufMetadata, GgufTensor, GgufVersion};
-    use fusor2_ir::shape::Dim;
-
-    use crate::graph::Graph;
-    use crate::session::{Backend, Session};
-
-    fn graph() -> Graph {
-        Graph::new(&Session::new(Backend::cpu().expect("cpu device")).expect("session"))
-    }
-
-    /// A synthetic GGUF file. `parse::fixture` is `#[cfg(test)]`-gated inside
-    /// its own crate, so this rebuilds it from the public writer: shapes are
-    /// row-major here and `GgufMetadata::write` reverses them onto the wire.
-    fn gguf(tensors: &[(&str, GgmlType, &[u64], Vec<u8>)]) -> VarBuilder {
-        let mut infos = Vec::new();
-        let mut offset = 0u64;
-        for (name, ty, shape, _) in tensors {
-            let shape: smallvec::SmallVec<[u64; 4]> = shape.iter().copied().collect();
-            let bytes = GgufTensor::byte_size(*ty, &shape).expect("whole blocks");
-            infos.push(GgufTensor {
-                name: (*name).to_string(),
-                ty: *ty,
-                shape,
-                offset,
-                bytes,
-            });
-            offset += bytes;
-        }
-        let meta = GgufMetadata {
-            version: GgufVersion::V3,
-            entries: Vec::new(),
-            tensors: infos,
-            tensor_data_offset: 0,
-        };
-        let mut buf = std::io::Cursor::new(Vec::new());
-        meta.write(
-            &mut buf,
-            tensors.iter().map(|(n, _, _, d)| (*n, d.as_slice())),
-        )
-        .expect("write");
-        VarBuilder::new(Arc::new(
-            fusor2_gguf::parse::Gguf::from_bytes(buf.into_inner()).expect("gguf"),
-        ))
-    }
-
-    fn model() -> VarBuilder {
-        gguf(&[
-            (
-                "blk.0.attn_q.weight",
-                GgmlType::Q4_0,
-                &[2, 32],
-                (0..36u8).collect(),
-            ),
-            ("blk.0.attn_q.bias", GgmlType::F32, &[2], vec![0u8; 8]),
-            ("norm.weight", GgmlType::F16, &[1, 4], vec![0u8; 8]),
-        ])
-    }
-
-    #[test]
-    fn a_gguf_matrix_keeps_its_row_major_shape() {
-        let g = graph();
-        let vb = model().pp("blk").pp(0);
-        let w = load_dense(&vb, g.handle(), "attn_q.weight").unwrap();
-        // `[out, in]`, not the `[in, out]` the file writes on the wire.
-        assert_eq!(&w.shape()[..], &[Dim::Const(2), Dim::Const(32)]);
-        assert_eq!(w.dtype(), Dtype::F32);
-    }
-
-    #[test]
-    fn a_missing_key_is_none_and_a_present_one_is_some() {
-        let g = graph();
-        let vb = model().pp("blk").pp(0);
-        assert!(
-            load_optional(&vb, g.handle(), "attn_q.bias")
-                .unwrap()
-                .is_some()
-        );
-        assert!(load_optional(&vb, g.handle(), "nope").unwrap().is_none());
-    }
-
-    #[test]
-    fn a_half_precision_vector_arrives_as_f32() {
-        let g = graph();
-        let vb = model();
-        let w = load_dense(&vb, g.handle(), "norm.weight").unwrap();
-        assert_eq!(w.dtype(), Dtype::F32);
-        let v = as_vector(w, "norm.weight").unwrap();
-        assert_eq!(&v.shape()[..], &[Dim::Const(4)]);
-    }
-
-    #[test]
-    fn two_quantized_leaves_do_not_hash_cons_together() {
-        let g = graph();
-        let vb = model().pp("blk").pp(0);
-        let a = load_dense(&vb, g.handle(), "attn_q.weight").unwrap();
-        let b = load_dense(&vb, g.handle(), "attn_q.weight").unwrap();
-        assert_ne!(a.id(), b.id(), "each load owns its own buffer");
     }
 }

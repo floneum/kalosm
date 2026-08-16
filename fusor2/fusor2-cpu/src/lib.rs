@@ -7,14 +7,16 @@
 //! `Barrier` to a no-op miscompiles every kernel that stages through workgroup
 //! memory.
 
-pub mod alloc;
-pub mod caps;
-pub mod emit;
-pub mod launch;
-pub mod lower;
-pub mod pool;
-pub mod rules;
-pub mod target;
+#![warn(unreachable_pub)]
+
+mod alloc;
+mod caps;
+mod emit;
+mod launch;
+mod lower;
+mod pool;
+mod rules;
+mod target;
 
 pub use alloc::AlignedBuf;
 pub use caps::CpuCaps;

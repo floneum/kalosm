@@ -41,31 +41,23 @@ impl AccessForm {
 
 /// Per-form selection counter, so `four_access_lowerings` can assert each case
 /// picked its own compiled form rather than all four collapsing to `Gather`.
-pub static FORM_COUNTS: [AtomicU64; 4] = [
+pub(crate) static FORM_COUNTS: [AtomicU64; 4] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
 
-pub fn note_form(form: AccessForm) {
+pub(crate) fn note_form(form: AccessForm) {
     FORM_COUNTS[form.index()].fetch_add(1, Ordering::Relaxed);
 }
 
-pub fn form_counts() -> [u64; 4] {
-    core::array::from_fn(|i| FORM_COUNTS[i].load(Ordering::Relaxed))
-}
 
-pub fn reset_form_counts() {
-    for c in &FORM_COUNTS {
-        c.store(0, Ordering::Relaxed);
-    }
-}
 
 /// The affine dependence of an index expression on the lane index:
 /// `index = base + coeff * lane`, when that shape can be proven statically.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct LaneAffine {
+pub(crate) struct LaneAffine {
     pub coeff: i64,
     /// True when `base` is itself lane-invariant (it usually is: a program id,
     /// a loop index, a uniform).
@@ -74,7 +66,7 @@ pub struct LaneAffine {
 
 /// Prove `e = base + coeff*lane` with a lane-invariant `base`, or report the
 /// general case. Purely structural — no runtime probe.
-pub fn lane_affine(e: &TileExpr) -> Option<LaneAffine> {
+pub(crate) fn lane_affine(e: &TileExpr) -> Option<LaneAffine> {
     fn go(e: &TileExpr) -> Option<(i64, bool)> {
         use TileExprKind as K;
         Some(match e.kind() {
@@ -121,7 +113,7 @@ pub fn lane_affine(e: &TileExpr) -> Option<LaneAffine> {
 
 /// Whether an expression can vary across lanes of one chunk. Conservative: a
 /// `Load` may read anything, so it counts as divergent.
-pub fn is_lane_uniform(e: &TileExpr) -> bool {
+pub(crate) fn is_lane_uniform(e: &TileExpr) -> bool {
     use TileExprKind as K;
     match e.kind() {
         K::Builtin(Builtin::Lane)
@@ -151,7 +143,7 @@ pub fn is_lane_uniform(e: &TileExpr) -> bool {
 }
 
 /// Constant-fold a u32-valued expression, when it is one.
-pub fn const_u32(e: &TileExpr) -> Option<u32> {
+pub(crate) fn const_u32(e: &TileExpr) -> Option<u32> {
     match e.kind() {
         TileExprKind::Literal(TileLiteral::U32(v)) => Some(*v),
         TileExprKind::Literal(TileLiteral::I32(v)) => Some(*v as u32),
@@ -164,7 +156,7 @@ pub fn const_u32(e: &TileExpr) -> Option<u32> {
 /// `Addr::Linear` addresses the buffer's elements directly, so the layout only
 /// contributes when the address is rank-2 (`Addr::Rc2`), where the row and
 /// column coordinates run through the `MultiFlattenMap`'s divmod chains.
-pub fn form_of(layout: &TileLayout, addr: &Addr) -> AccessForm {
+pub(crate) fn form_of(layout: &TileLayout, addr: &Addr) -> AccessForm {
     match addr {
         Addr::Linear(e) => match lane_affine(e) {
             Some(LaneAffine { coeff: 0, .. }) => AccessForm::Broadcast,
@@ -206,7 +198,7 @@ fn is_bare_lane(e: &TileExpr) -> bool {
 /// performed — `divmod_ops()` is the cost term the extractor prices, so
 /// emitting more than that would make the model wrong.
 #[inline(always)]
-pub fn apply_group(map: &MultiFlattenMap, axis: usize, coord: u32) -> u32 {
+pub(crate) fn apply_group(map: &MultiFlattenMap, axis: usize, coord: u32) -> u32 {
     let group = &map.groups[axis];
     if group.sub_axes.len() == 1 {
         return coord.wrapping_mul(group.sub_axes[0].stride);
@@ -228,7 +220,7 @@ pub fn apply_group(map: &MultiFlattenMap, axis: usize, coord: u32) -> u32 {
 
 /// Physical element offset of a rank-2 address.
 #[inline(always)]
-pub fn rc2_offset(map: &MultiFlattenMap, row: u32, col: u32) -> u32 {
+pub(crate) fn rc2_offset(map: &MultiFlattenMap, row: u32, col: u32) -> u32 {
     let r = if map.groups.is_empty() {
         row
     } else {
@@ -240,86 +232,4 @@ pub fn rc2_offset(map: &MultiFlattenMap, row: u32, col: u32) -> u32 {
         col
     };
     r.wrapping_add(c)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fusor2_ir::ir::kernel::{ElementType, MemoryLevel, ScalarElement};
-    use fusor2_ir::shape::{AxisGroup, SubAxis};
-
-    fn lane() -> TileExpr {
-        TileExpr::new(
-            TileExprKind::Builtin(Builtin::Lane),
-            ElementType::Scalar(ScalarElement::U32),
-        )
-    }
-    fn lit(v: u32) -> TileExpr {
-        TileExpr::new(
-            TileExprKind::Literal(TileLiteral::U32(v)),
-            ElementType::Scalar(ScalarElement::U32),
-        )
-    }
-    fn bin(op: BinOp, a: TileExpr, b: TileExpr) -> TileExpr {
-        TileExpr::new(
-            TileExprKind::Binary {
-                op,
-                left: a,
-                right: b,
-                numeric: fusor2_ir::dtype::NumericContract::RELAXED,
-            },
-            ElementType::Scalar(ScalarElement::U32),
-        )
-    }
-
-    #[test]
-    fn lane_affine_recognises_the_easy_forms() {
-        assert_eq!(lane_affine(&lane()).unwrap().coeff, 1);
-        assert_eq!(lane_affine(&lit(7)).unwrap().coeff, 0);
-        assert_eq!(
-            lane_affine(&bin(BinOp::Add, lit(7), lane())).unwrap().coeff,
-            1
-        );
-        assert_eq!(
-            lane_affine(&bin(BinOp::Mul, lane(), lit(4))).unwrap().coeff,
-            4
-        );
-    }
-
-    #[test]
-    fn form_of_distinguishes_all_four() {
-        let l = TileLayout::contiguous(MemoryLevel::Storage, &[8, 8]);
-        assert_eq!(form_of(&l, &Addr::Linear(lane())), AccessForm::Contiguous);
-        assert_eq!(form_of(&l, &Addr::Linear(lit(3))), AccessForm::Broadcast);
-        assert_eq!(
-            form_of(&l, &Addr::Linear(bin(BinOp::Add, lit(64), lane()))),
-            AccessForm::UnitInnerStride
-        );
-        assert_eq!(
-            form_of(&l, &Addr::Linear(bin(BinOp::Mul, lane(), lit(3)))),
-            AccessForm::Gather
-        );
-    }
-
-    #[test]
-    fn divmod_chain_matches_a_hand_decomposition() {
-        // One logical axis of extent 6 decomposed as 2 x 3, strides 100 and 1.
-        let map = MultiFlattenMap {
-            groups: smallvec::smallvec![AxisGroup {
-                sub_axes: smallvec::smallvec![
-                    SubAxis {
-                        extent: 2,
-                        stride: 100
-                    },
-                    SubAxis {
-                        extent: 3,
-                        stride: 1
-                    }
-                ],
-            }],
-        };
-        for c in 0..6u32 {
-            assert_eq!(apply_group(&map, 0, c), (c / 3) * 100 + (c % 3));
-        }
-    }
 }

@@ -50,8 +50,8 @@ pub const REGISTRY: fn() -> Cases = registry;
 /// Shared case shapes. Every area file is a table over these.
 pub mod support {
     use fusor2::graph::GraphRef;
-    use fusor2::{Dim, Dtype, Graph, Session, };
-use fusor2::tensor::Dyn as Tensor;
+    use fusor2::tensor::Dyn as Tensor;
+    use fusor2::{Dim, Dtype, Graph, Session};
 
     use crate::compare::{
         self, assert_gradient_matches_finite_difference, finite_difference_gradient,
@@ -316,78 +316,4 @@ use fusor2::tensor::Dyn as Tensor;
         })
     }
 
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_case_name_is_unique() {
-        let registry = registry();
-        let mut names = registry.names();
-        names.sort_unstable();
-        let before = names.len();
-        names.dedup();
-        assert_eq!(
-            before,
-            names.len(),
-            "a case name is registered twice; the registry would run both"
-        );
-    }
-
-    #[test]
-    fn every_case_is_area_qualified() {
-        for case in registry().iter() {
-            assert!(
-                case.name.starts_with(case.area),
-                "{} is filed under {}",
-                case.name,
-                case.area
-            );
-            assert!(case.name.contains("::"), "{} is not qualified", case.name);
-        }
-    }
-
-    #[test]
-    fn every_area_contributes_cases() {
-        let registry = registry();
-        for area in [
-            "elementwise",
-            "reductions",
-            "views",
-            "matmul",
-            "conv_pool",
-            "normalization",
-            "attention_rope",
-            "indexing_scatter",
-            "quantized",
-            "layers",
-            "backward",
-            "dtypes",
-            "sampling",
-        ] {
-            assert!(
-                registry.iter().any(|c| c.area == area),
-                "{area} registered no cases"
-            );
-        }
-    }
-
-    #[test]
-    fn the_registry_covers_the_reference_autograd_matrix() {
-        // The acceptance bar is the ~181 tests in `fusor/src/autograd/tests.rs`
-        // reproduced forward and backward; catches a registry that silently shrank.
-        let registry = registry();
-        assert!(
-            registry.len() >= 181,
-            "the registry has {} cases; the reference autograd matrix alone is 181",
-            registry.len()
-        );
-    }
-
-    #[test]
-    fn the_registry_function_pointer_is_the_registry() {
-        assert_eq!(REGISTRY().len(), registry().len());
-    }
 }

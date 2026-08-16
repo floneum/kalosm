@@ -8,14 +8,16 @@
 //! Adding Q4_1 is a table row plus a block program — not a kernel and not a
 //! selector arm.
 
-pub mod async_read;
+#![warn(unreachable_pub)]
+
+mod async_read;
 pub mod blocks;
-pub mod decode;
-pub mod decode_k;
+mod decode;
+mod decode_k;
 pub mod parse;
 pub mod repack;
-pub mod sharded;
-pub mod varbuilder;
+mod sharded;
+mod varbuilder;
 
 pub use blocks::{BLOCK_SPECS, block_spec};
 pub use parse::{GgmlType, Gguf, GgufMetadata, GgufTensor, GgufValue};

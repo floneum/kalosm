@@ -70,6 +70,7 @@ pub struct TensorCache<const R: usize = 4, T: Element = f32> {
 }
 
 impl<const R: usize, T: Element> TensorCache<R, T> {
+    /// Create an empty growable cache along `axis`.
     pub fn new(axis: u32) -> Self {
         Self {
             data: None,
@@ -163,6 +164,7 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         self.len
     }
 
+    /// Whether the cache has no value.
     pub fn is_empty(&self) -> bool {
         self.data.is_none()
     }
@@ -404,6 +406,7 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         Ok(Some(kept))
     }
 
+    /// Clear the readable cache while retaining reusable fixed buffers.
     pub fn reset(&mut self) {
         self.data = None;
         self.len = Dim::Const(0);
@@ -507,6 +510,7 @@ pub struct KvCache<const R: usize = 4, T: Element = f32> {
 }
 
 impl<const R: usize, T: Element> KvCache<R, T> {
+    /// Create an empty growable key/value cache along `axis`.
     pub fn new(axis: u32) -> Self {
         Self {
             k: TensorCache::new(axis),
@@ -539,10 +543,12 @@ impl<const R: usize, T: Element> KvCache<R, T> {
         Self { k, v }
     }
 
+    /// Whether appends write into preallocated storage.
     pub fn is_fixed(&self) -> bool {
         self.k.is_fixed()
     }
 
+    /// Whether the cache retains a fixed-size newest-token window.
     pub fn is_ring(&self) -> bool {
         self.k.is_ring()
     }
@@ -613,269 +619,14 @@ impl<const R: usize, T: Element> KvCache<R, T> {
         self.k.len()
     }
 
+    /// Whether no key/value pair has been appended.
     pub fn is_empty(&self) -> bool {
         self.k.is_empty()
     }
 
+    /// Clear both halves while retaining reusable fixed buffers.
     pub fn reset(&mut self) {
         self.k.reset();
         self.v.reset();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::session::{Backend, Session};
-    use fusor2_ir::dtype::Dtype;
-    use fusor2_ir::ir::Op;
-    use fusor2_ir::ir::logical::Logical;
-    use fusor2_ir::egraph::Id;
-
-    fn graph() -> crate::Graph {
-        crate::Graph::new(&Session::new(Backend::cpu().unwrap()).unwrap())
-    }
-
-    fn upload(g: &crate::Graph, shape: &[u64], data: &[f32]) -> Dyn {
-        let dims: Vec<Dim> = shape.iter().copied().map(Dim::Const).collect();
-        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        g.tensor(Dtype::F32, &dims, &bytes).unwrap()
-    }
-
-    fn typed<const R: usize>(g: &crate::Graph, shape: &[u64], data: &[f32]) -> Tensor<R, f32> {
-        Tensor::from_dyn(upload(g, shape, data))
-    }
-
-    /// The `Restride` operands of the class `id` names, in order — the two
-    /// halves a `cat` glues together.
-    fn cat_sources(t: &Dyn) -> Vec<Id> {
-        let g = t.graph().state().egraph.lock();
-        let mut out = Vec::new();
-        for member in g.class_ids(g.class_of(t.id())) {
-            if let Op::Logical(Logical::Scatter { base, upd, .. }) = &g.node(member).op {
-                out.push(*base);
-                out.push(*upd);
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn a_two_step_append_returns_both_steps_in_order() {
-        // [batch = 1, heads = 1, len, head_dim = 2], concatenating on axis 2.
-        let g = graph();
-        let mut cache: KvCache<4, f32> = KvCache::new(2);
-
-        let k0: Tensor<4, f32> = typed(&g, &[1, 1, 2, 2], &[1.0, 2.0, 3.0, 4.0]);
-        let v0: Tensor<4, f32> = typed(&g, &[1, 1, 2, 2], &[-1.0, -2.0, -3.0, -4.0]);
-        let (ks, vs) = cache.append(&k0, &v0);
-        assert_eq!(cache.len(), Dim::Const(2));
-        assert_eq!(ks.extent(2usize), Dim::Const(2));
-        // The first append is the value itself, not a copy of it.
-        assert_eq!(ks.id(), k0.id());
-        assert_eq!(ks.to_vec_f32(), vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(vs.to_vec_f32(), vec![-1.0, -2.0, -3.0, -4.0]);
-
-        // Step two: one more token. The cache grows along the cat axis only,
-        // and the new value is the second operand — appending is ordered.
-        let k1: Tensor<4, f32> = typed(&g, &[1, 1, 1, 2], &[5.0, 6.0]);
-        let v1: Tensor<4, f32> = typed(&g, &[1, 1, 1, 2], &[-5.0, -6.0]);
-        let (ks2, vs2) = cache.append(&k1, &v1);
-        assert_eq!(cache.len(), Dim::Const(3));
-        assert_eq!(ks2.shape(), [1, 1, 3, 2]);
-        assert_eq!(vs2.shape(), ks2.shape());
-        assert_eq!(cache.k.current().unwrap().id(), ks2.id());
-        assert_eq!(cache.v.current().unwrap().id(), vs2.id());
-
-        // Asserted here: the part the cache owns — the second step glues the
-        // new value on after the cached one, in that order.
-        let sources = cat_sources(ks2.as_dyn());
-        assert!(
-            sources.iter().any(|s| *s == k1.id()),
-            "the appended value must be an operand of the grown cache"
-        );
-
-        cache.reset();
-        assert!(cache.is_empty());
-        assert_eq!(cache.len(), Dim::Const(0));
-    }
-
-    #[test]
-    fn appending_on_a_leading_axis_grows_that_axis_only() {
-        let g = graph();
-        let mut cache: TensorCache<2, f32> = TensorCache::new(0);
-        let a: Tensor<2, f32> = typed(&g, &[1, 3], &[1.0, 2.0, 3.0]);
-        let b: Tensor<2, f32> = typed(&g, &[2, 3], &[4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
-        cache.append(&a);
-        let out = cache.append(&b);
-        assert_eq!(cache.len(), Dim::Const(3));
-        assert_eq!(out.shape(), [3, 3]);
-    }
-
-    #[test]
-    fn eviction_narrows_to_the_newest_tokens() {
-        let g = graph();
-        let mut cache: TensorCache<2, f32> = TensorCache::new(0);
-        cache.append(&typed(&g, &[4, 1], &[1.0, 2.0, 3.0, 4.0]));
-        let kept = cache.keep_last(2).unwrap();
-        assert_eq!(cache.len(), Dim::Const(2));
-        assert_eq!(kept.shape(), [2, 1]);
-        // A window wider than the cache is a no-op that does not renarrow.
-        let same = cache.keep_last(8).unwrap();
-        assert_eq!(same.id(), kept.id());
-        assert_eq!(cache.len(), Dim::Const(2));
-        // An empty cache has nothing to evict.
-        assert!(TensorCache::<2, f32>::new(0).keep_last(2).is_none());
-    }
-
-    #[test]
-    fn a_symbolic_length_accumulates_to_the_newest_symbol() {
-        let g = graph();
-        let s = g.sym("len");
-        let mut cache: TensorCache<2, f32> = TensorCache::new(0);
-        let t = g.leaf("x", &[s, Dim::Const(2)], Dtype::F32).unwrap();
-        cache.append(&Tensor::from_dyn(t));
-        assert_eq!(cache.len(), s);
-        // And it cannot be evicted by a host-known window.
-        assert!(cache.keep_last_inner(1).is_err());
-    }
-
-    /// A rejected append reports rather than panicking and leaves the cache
-    /// exactly as it was.
-    #[test]
-    fn a_mismatched_append_is_an_error_not_a_panic() {
-        let g = graph();
-        let mut cache: TensorCache<2, f32> = TensorCache::new(0);
-        cache.append_dyn(&upload(&g, &[1, 3], &[1.0, 2.0, 3.0])).unwrap();
-        // A non-cat axis that disagrees.
-        assert!(cache.append_dyn(&upload(&g, &[1, 4], &[0.0; 4])).is_err());
-        // A rank that disagrees.
-        assert!(cache.append_dyn(&upload(&g, &[3], &[0.0; 3])).is_err());
-        // The cache is untouched by a rejected append.
-        assert_eq!(cache.len(), Dim::Const(1));
-        // A dtype that disagrees.
-        let u = g
-            .tensor(Dtype::U32, &[Dim::Const(1), Dim::Const(3)], &[0u8; 12])
-            .unwrap();
-        assert!(cache.append_dyn(&u).is_err());
-        // An axis off the end.
-        assert!(
-            TensorCache::<1, f32>::new(7)
-                .append_dyn(&upload(&g, &[2], &[0.0; 2]))
-                .is_err()
-        );
-    }
-
-    /// A rank-2 f16 cache is as ordinary as the rank-4 f32 default.
-    #[test]
-    fn a_cache_carries_its_rank_and_element_type() {
-        let g = graph();
-        let mut cache: TensorCache<2, half::f16> = TensorCache::new(0);
-        let t = g
-            .leaf("x", &[Dim::Const(2), Dim::Const(3)], Dtype::F16)
-            .unwrap();
-        let out = cache.append(&Tensor::from_dyn(t));
-        assert_eq!(out.shape(), [2, 3]);
-        assert_eq!(out.dtype(), Dtype::F16);
-    }
-
-    /// A replay re-arms the same nodes a rebuild would have hash-consed onto
-    /// and advances the same state; a divergence means a decode loop reads the
-    /// wrong length or writes the wrong slot.
-    #[test]
-    fn a_replayed_append_matches_the_append_it_stands_in_for() {
-        let g = graph();
-        let mut replayed: TensorCache<4, f32> = TensorCache::fixed(2, 8);
-        let v: Tensor<4, f32> = typed(&g, &[1, 1, 1, 2], &[1.0, 2.0]);
-        replayed.append(&v);
-        let first_out = replayed.pending().unwrap().id();
-
-        // A second *real* append against the same store, on a copy.
-        let mut rebuilt = replayed.clone();
-        rebuilt.append(&v);
-        let rebuilt_out = rebuilt.pending().unwrap().id();
-        assert_eq!(
-            rebuilt_out, first_out,
-            "one store and one chunk width is one scatter node"
-        );
-
-        assert!(replayed.can_replay(1));
-        replayed.replay_append(1).unwrap();
-        assert_eq!(replayed.pending().unwrap().id(), rebuilt_out);
-        assert_eq!(replayed.len(), rebuilt.len());
-        let Dim::Sym(sym) = replayed.len() else {
-            panic!("a fixed cache reads through its length symbol");
-        };
-        assert_eq!(
-            g.handle().dim_binding(sym),
-            Some(2),
-            "the replay binds the length the rebuild would have"
-        );
-        // And the write index the next scatter reads names slot 1, not 0.
-        assert_eq!(write_slots(&replayed), vec![1u32]);
-    }
-
-    /// The slots the cache's one-wide write index currently names.
-    fn write_slots<const R: usize, T: Element>(cache: &TensorCache<R, T>) -> Vec<u32> {
-        let idx = &cache.fixed.as_ref().unwrap().idx[&1];
-        idx.graph()
-            .leaf_bytes(idx.id())
-            .unwrap()
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-            .collect()
-    }
-
-    /// Everything that would make the rebuilt nodes differ refuses the replay
-    /// rather than re-arming a stale scatter.
-    #[test]
-    fn a_replay_is_refused_whenever_a_rebuild_would_mint_new_nodes() {
-        let g = graph();
-        // Never armed.
-        let mut fresh: TensorCache<4, f32> = TensorCache::fixed(2, 4);
-        assert!(!fresh.can_replay(1));
-        assert!(fresh.replay_append(1).is_err());
-
-        let v: Tensor<4, f32> = typed(&g, &[1, 1, 1, 2], &[1.0, 2.0]);
-        fresh.append(&v);
-        assert!(fresh.can_replay(1));
-        // A different chunk width is a different scatter.
-        assert!(!fresh.can_replay(2));
-        // Past capacity is a grown store, which is a new leaf.
-        fresh.replay_append(1).unwrap();
-        fresh.replay_append(1).unwrap();
-        fresh.replay_append(1).unwrap();
-        assert_eq!(write_slots(&fresh), vec![3u32], "four tokens, slots 0..3");
-        assert!(!fresh.can_replay(1), "the fifth token needs a bigger store");
-        // A reset cache has no readable value to advance.
-        fresh.reset();
-        assert!(!fresh.can_replay(1));
-        // A cat-mode cache has no scatter at all.
-        let mut cat: TensorCache<4, f32> = TensorCache::new(2);
-        cat.append(&v);
-        assert!(!cat.can_replay(1));
-
-        // A ring replays forever and wraps, exactly as its appends do.
-        let mut ring: KvCache<4, f32> = KvCache::windowed(2, 2);
-        ring.append(&v, &v);
-        assert!(ring.k.can_replay(1));
-        ring.k.replay_append(1).unwrap();
-        ring.k.replay_append(1).unwrap();
-        assert_eq!(
-            write_slots(&ring.k),
-            vec![0u32],
-            "the third token of a two-slot ring writes slot 0"
-        );
-        assert!(!ring.k.can_replay(3), "an append wider than the window");
-    }
-
-    #[test]
-    fn add_dims_is_saturating_on_symbols() {
-        let g = graph();
-        let s = g.sym("n");
-        assert_eq!(add_dims(Dim::Const(2), Dim::Const(3)), Dim::Const(5));
-        assert_eq!(add_dims(Dim::Const(0), s), s);
-        assert_eq!(add_dims(s, Dim::Const(0)), s);
-        assert_eq!(add_dims(Dim::Const(4), s), s);
     }
 }

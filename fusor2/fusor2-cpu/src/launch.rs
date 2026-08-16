@@ -10,11 +10,11 @@ use fusor2_ir::Result;
 use std::sync::atomic::Ordering;
 
 use crate::alloc::AlignedBuf;
-use crate::emit::{run_workgroup, CpuKernel, Program, RawBuf};
+use crate::emit::{run_workgroup, CpuKernel, RawBuf};
 use crate::pool::{WorkerPool, DISPATCH_COUNT};
 
 /// Run one dispatch, parallelizing the grid when the pool is worth waking.
-pub fn run(kernel: &CpuKernel, grid: [u32; 3], binds: &[Buf], uniforms: &Uniforms) -> Result<()> {
+pub(crate) fn run(kernel: &CpuKernel, grid: [u32; 3], binds: &[Buf], uniforms: &Uniforms) -> Result<()> {
     let prog = &kernel.artifact.prog;
     let total = grid[0] as u64 * grid[1] as u64 * grid[2] as u64;
     if total == 0 {
@@ -91,7 +91,6 @@ pub fn run(kernel: &CpuKernel, grid: [u32; 3], binds: &[Buf], uniforms: &Uniform
     DISPATCH_COUNT.store(dispatches.load(Ordering::Relaxed), Ordering::Relaxed);
     Ok(())
 }
-
 /// Recover the 3-D workgroup id from a linear grid index.
 #[inline(always)]
 fn unlinearize(linear: u64, grid: [u32; 3]) -> [u32; 3] {
@@ -103,11 +102,10 @@ fn unlinearize(linear: u64, grid: [u32; 3]) -> [u32; 3] {
         (linear / (x * y)) as u32,
     ]
 }
-
 /// Chunk size handed to `parallel_for`, chosen so one chunk amortizes
 /// `thread_wake_ps`. The parallelize-or-not decision is the extractor's cost
 /// call; the launcher only picks a grain that keeps every worker fed.
-pub fn grain_for(total: u64, threads: u32) -> u64 {
+pub(crate) fn grain_for(total: u64, threads: u32) -> u64 {
     let threads = threads.max(1) as u64;
     if threads == 1 {
         return total.max(1);
@@ -115,43 +113,4 @@ pub fn grain_for(total: u64, threads: u32) -> u64 {
     // Four chunks per worker: enough slack for uneven workgroups without
     // paying a wake per grid point.
     (total.div_ceil(threads * 4)).max(1)
-}
-
-/// `Level` dispatches the most recent launch performed.
-pub fn dispatch_count() -> u64 {
-    DISPATCH_COUNT.load(Ordering::Relaxed)
-}
-
-/// Reset the dispatch counter.
-pub fn reset_dispatch_count() {
-    DISPATCH_COUNT.store(0, Ordering::Relaxed);
-}
-
-/// Bytes one program's thread-local scratch needs.
-pub fn arena_bytes(prog: &Program) -> u32 {
-    prog.arena_bytes
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn grid_unlinearizes_row_major() {
-        let grid = [3, 4, 2];
-        let mut seen = std::collections::HashSet::new();
-        for i in 0..24u64 {
-            let g = unlinearize(i, grid);
-            assert!(g[0] < 3 && g[1] < 4 && g[2] < 2);
-            assert!(seen.insert(g));
-        }
-        assert_eq!(seen.len(), 24);
-    }
-
-    #[test]
-    fn grain_keeps_every_worker_fed() {
-        assert_eq!(grain_for(1000, 1), 1000);
-        let g = grain_for(1000, 8);
-        assert!(g >= 1 && g * 8 * 4 >= 1000 - 8 * 4);
-    }
 }

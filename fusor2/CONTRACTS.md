@@ -1,11 +1,12 @@
-# fusor2 — Contracts for implementers
+# fusor2 — archived scaffold contracts
 
-This is the scaffold's promise to the fourteen implementation work items. Every
-signature listed here exists and compiles today. **Do not change a signature in
-this document without saying so in your return value** — a dozen agents are
-coding against it in parallel.
+This records the original scaffold contract for the fourteen implementation
+work items. It is historical: module visibility and façade names have changed
+since those work items landed, so the signatures below are not a supported API
+inventory. See [`API.md`](./API.md) for the current public façade and the crate
+roots for current internal seams.
 
-Read [`ARCHITECTURE.md`](./ARCHITECTURE.md) for *why*. This file is *what*.
+Read [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the current design rationale.
 
 ---
 

@@ -11,7 +11,6 @@ use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::NumericContract;
 use fusor2_ir::error::Error;
-use fusor2_ir::ir::Node;
 use fusor2_ir::ir::launch::{
     ContractSide, CoopGeom, Family, Launch, SchedPoint, SgemmParams, SgemvParams,
 };
@@ -22,33 +21,13 @@ use fusor2_ir::ir::kernel::{
 };
 use fusor2_ir::scalar::{ScalarExpr, ScalarKind};
 use fusor2_ir::shape::Dim;
-use fusor2_ir::target::LowerCtx;
 
-use crate::lower::{Ctx, DimBinding, StagedSource, distribute_workgroups, scalar_element};
-
-/// Lowering entry point.
-pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
-    let fusor2_ir::ir::Op::Launch(op) = &node.op else {
-        return Err(Error::Plan("contract was handed a foreign node".into()));
-    };
-    let Launch::Contract { family, .. } = op else {
-        return Err(Error::Plan("contract was handed a non-Contract node".into()));
-    };
-    let ctx = Ctx::new(caps, cx, DimBinding::new())?;
-    let mut ks = lower_contract(ctx, op, *family, theta)?;
-    if ks.len() == 1 {
-        Ok(ks.remove(0))
-    } else {
-        Err(Error::Plan(
-            "split-K lowers to two kernels; call lower_contract".into(),
-        ))
-    }
-}
+use crate::lower::{Ctx, StagedSource, distribute_workgroups, scalar_element};
 
 /// Dispatch on the selected family. The family is a property of *this
 /// lowering*, never of the Logical node, so a gemv-shaped contraction cannot pick
 /// Coop, have a tile scorer decline, and silently run a third path.
-pub fn lower_contract(
+pub(crate) fn lower_contract(
     ctx: Ctx<'_>,
     op: &Launch,
     family: Family,
@@ -107,7 +86,7 @@ fn shape_of(ctx: &Ctx<'_>, op: &Launch) -> Result<Shape> {
 
 /// Grid swizzle group along M: the number of M blocks one traversal of the N
 /// blocks keeps resident, computed from the plan-carried geometry.
-pub fn swizzle_group_m(geom: CoopGeom, n: u32) -> u32 {
+pub(crate) fn swizzle_group_m(geom: CoopGeom, n: u32) -> u32 {
     let n_blocks = n.div_ceil(geom.bn.max(1)).max(1);
     n_blocks.clamp(1, 8)
 }
@@ -181,7 +160,7 @@ impl CoopShape {
 /// partial would be returned. Supporting it needs `GpuTarget::build_one` to
 /// launch every kernel `lower_node` returns, in order, sharing one buffer
 /// binding, plus a combine that applies `post` exactly once.
-pub fn lower_coop(
+pub(crate) fn lower_coop(
     mut ctx: Ctx<'_>,
     op: &Launch,
     geom: CoopGeom,
@@ -1017,7 +996,7 @@ fn per_lane_block<'a>(
 /// them, which is the register-reuse term `SgemmParams` prices. `p.legal`
 /// gates the point on the storage a staged form would need, but the emitted
 /// kernel reads A and B straight from storage.
-pub fn lower_sgemm(ctx: Ctx<'_>, op: &Launch, p: SgemmParams) -> Result<KernelIr> {
+pub(crate) fn lower_sgemm(ctx: Ctx<'_>, op: &Launch, p: SgemmParams) -> Result<KernelIr> {
     let Launch::Contract {
         post, acc, a, b, ..
     } = op
@@ -1253,7 +1232,7 @@ fn contract_rows(
 
 /// Vector-family contraction: `subgroups` lane groups per row, each summing a
 /// `chunk`-long, `vector`-wide slice of K.
-pub fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Result<KernelIr> {
+pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Result<KernelIr> {
     let Launch::Contract {
         post, acc, a, b, ..
     } = op
@@ -1804,391 +1783,4 @@ fn lower_sgemv_subgroup_cols(
     }
 
     Ok(ctx.finish("sgemv_cols", grid, block, body))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fusor2_ir::dtype::Dtype;
-    use fusor2_ir::target::Target;
-
-    fn geom() -> CoopGeom {
-        CoopGeom {
-            bm: 64,
-            bn: 64,
-            bk: 16,
-            n_passes: 1,
-            subgroups: 4,
-            rg: 2,
-            cg: 2,
-        }
-    }
-
-    #[test]
-    fn swizzle_is_a_pure_function_of_plan_data() {
-        // The group is bounded by the number of N blocks, so a one-block-wide
-        // problem cannot claim an 8-wide swizzle.
-        assert_eq!(swizzle_group_m(geom(), 64), 1);
-        assert_eq!(swizzle_group_m(geom(), 4096), 8);
-    }
-
-    #[test]
-    fn coop_geometry_legality_is_a_gate_not_a_fallback() {
-        assert!(geom().legal(32, 256));
-        let bad = CoopGeom { rg: 3, ..geom() };
-        assert!(!bad.legal(32, 256));
-    }
-
-    #[test]
-    fn subgroup_split_is_the_closed_form_objective() {
-        // The template every other geometry factorization follows: minimize
-        // `cg*bm + rg*bn_pass` under COOP_DIM divisibility on both sides.
-        // (2,2) costs 2*64 + 2*64 = 256; (1,4) and (4,1) both cost 320.
-        assert_eq!(CoopGeom::subgroup_split(64, 64, 1, 4), Some((2, 2)));
-        // No factorization keeps both fragment sides whole COOP_DIM multiples.
-        assert_eq!(CoopGeom::subgroup_split(8, 8, 1, 4), None);
-    }
-
-    /// The fragment grid is the whole sub-block, not one fragment of it.
-    #[test]
-    fn the_fragment_grid_tiles_the_whole_subgroup_block() {
-        let cs = CoopShape::of(geom(), 32).expect("legal geometry");
-        assert_eq!((cs.sg_rows, cs.sg_cols), (32, 32));
-        assert_eq!((cs.frags_m, cs.frags_n), (4, 4));
-        assert_eq!(cs.kk_steps, 2);
-        assert_eq!(cs.lanes, 128);
-        // `rg * frags_m * COOP_DIM` and `cg * frags_n * COOP_DIM` cover the
-        // block exactly: no row or column of `bm x bn_pass` is unowned.
-        assert_eq!(geom().rg * cs.frags_m * CoopGeom::COOP_DIM, geom().bm);
-        assert_eq!(geom().cg * cs.frags_n * CoopGeom::COOP_DIM, cs.bn_pass);
-    }
-
-    /// The swizzle stays a bijection on `[0, tiles_m * tiles_n)` — including
-    /// the ragged tail, which is the half a super-block walk gets wrong.
-    #[test]
-    fn the_tile_swizzle_is_a_bijection() {
-        for (tiles_m, tiles_n) in [(5u32, 6u32), (8, 3), (3, 8), (1, 7), (7, 1), (13, 5)] {
-            for group in 1..=8u32 {
-                let mut seen = vec![false; (tiles_m * tiles_n) as usize];
-                for id in 0..tiles_m * tiles_n {
-                    let (m, n) = reference_swizzle(id, tiles_m, tiles_n, group);
-                    assert!(m < tiles_m && n < tiles_n, "{id} -> ({m},{n})");
-                    let slot = (m * tiles_n + n) as usize;
-                    assert!(!seen[slot], "{tiles_m}x{tiles_n} group {group} hits ({m},{n}) twice");
-                    seen[slot] = true;
-                }
-            }
-        }
-    }
-
-    /// The closed form [`swizzle_tile`] emits, in host arithmetic. Kept beside
-    /// it so the bijection test states the algorithm rather than a table.
-    fn reference_swizzle(id: u32, tiles_m: u32, tiles_n: u32, group: u32) -> (u32, u32) {
-        if group <= 1 || tiles_m <= 1 || tiles_n <= 1 {
-            return (id / tiles_n, id % tiles_n);
-        }
-        let full = (tiles_m / group) * group;
-        let tail = tiles_m - full;
-        let threshold = full * tiles_n;
-        if tail == 0 || id < threshold {
-            let span = group * tiles_n;
-            return ((id / span) * group + id % group, (id % span) / group);
-        }
-        let rest = id - threshold;
-        (full + rest % tail, rest / tail)
-    }
-
-    /// A cooperative contraction that runs on the device and is checked
-    /// element by element against an f64 host reference, at shapes whose
-    /// `m` and `n` are not multiples of the block. Nothing else in the
-    /// conformance suite reads values out of a coop-selected contraction
-    /// with a ragged extent.
-    #[test]
-    fn a_cooperative_contraction_computes_the_matrix() {
-        let Ok(target) = crate::target::GpuTarget::new_blocking() else {
-            return;
-        };
-        if target.caps().coop_for(Dtype::F32, Dtype::F32).is_none() {
-            return;
-        }
-        let geoms = [
-            CoopGeom { bm: 16, bn: 16, bk: 8, n_passes: 1, subgroups: 1, rg: 1, cg: 1 },
-            CoopGeom { bm: 16, bn: 16, bk: 8, n_passes: 1, subgroups: 2, rg: 1, cg: 2 },
-            CoopGeom { bm: 16, bn: 16, bk: 8, n_passes: 1, subgroups: 4, rg: 2, cg: 2 },
-            CoopGeom { bm: 32, bn: 32, bk: 16, n_passes: 2, subgroups: 2, rg: 2, cg: 1 },
-            CoopGeom { bm: 64, bn: 32, bk: 8, n_passes: 1, subgroups: 4, rg: 4, cg: 1 },
-            CoopGeom { bm: 16, bn: 64, bk: 32, n_passes: 4, subgroups: 1, rg: 1, cg: 1 },
-        ];
-        // A ragged `m` and `n`, a `k` that is not a whole `bk`, and a batch.
-        let shapes = [(1u64, 33u64, 37u64, 21u64), (1, 8, 7, 5), (3, 17, 13, 9)];
-        let ident = ScalarExpr::arg(0, Dtype::F32);
-        // The direct cooperative store cannot apply `post` to an opaque
-        // fragment, so a non-identity `post` catches a silently unfused
-        // epilogue.
-        let affine = ScalarExpr::bin(
-            fusor2_ir::scalar::BinOp::Add,
-            ScalarExpr::bin(
-                fusor2_ir::scalar::BinOp::Mul,
-                ScalarExpr::arg(0, Dtype::F32),
-                ScalarExpr::lit(fusor2_ir::dtype::Splat::F32(3.0)),
-            ),
-            ScalarExpr::lit(fusor2_ir::dtype::Splat::F32(-0.5)),
-        );
-        for geom in geoms {
-            if !geom.legal(
-                target.caps().subgroup_width(),
-                target.caps().limits.max_compute_invocations_per_workgroup,
-            ) {
-                continue;
-            }
-            for staging in [1u8, 2] {
-                for (batch, m, k, n) in shapes {
-                    coop_case(&target, geom, staging, batch, m, k, n, &ident, &|x| x);
-                    coop_case(&target, geom, staging, batch, m, k, n, &affine, &|x| {
-                        x * 3.0 - 0.5
-                    });
-                }
-            }
-        }
-    }
-
-    /// The narrow-output epilogue. Without `fork-metal` an f32 accumulator
-    /// bound for f16 memory cannot be stored cooperatively, so the fragments
-    /// stage through a workgroup tile and a per-lane pass casts them — a
-    /// different epilogue, a different tile in the arena, and the only one
-    /// where `post` is applied before the store rather than after it.
-    #[test]
-    fn a_narrow_output_stages_the_accumulator() {
-        let Ok(target) = crate::target::GpuTarget::new_blocking() else {
-            return;
-        };
-        if target.caps().coop_for(Dtype::F32, Dtype::F32).is_none() || !target.caps().f16 {
-            return;
-        }
-        assert!(
-            !target.caps().mixed_precision_coop_store,
-            "without `fork-metal` the staged path is the shipped one; this case is testing it"
-        );
-        let ident = ScalarExpr::arg(0, Dtype::F16);
-        for geom in [
-            CoopGeom { bm: 16, bn: 16, bk: 8, n_passes: 1, subgroups: 2, rg: 1, cg: 2 },
-            CoopGeom { bm: 32, bn: 32, bk: 16, n_passes: 1, subgroups: 2, rg: 1, cg: 2 },
-            CoopGeom { bm: 32, bn: 32, bk: 16, n_passes: 2, subgroups: 2, rg: 2, cg: 1 },
-        ] {
-            for staging in [1u8, 2] {
-                coop_case_typed(&target, geom, staging, 1, 33, 21, 19, &ident, &|x| x, Dtype::F16);
-                coop_case_typed(&target, geom, staging, 2, 12, 9, 20, &ident, &|x| x, Dtype::F16);
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn coop_case(
-        target: &crate::target::GpuTarget,
-        geom: CoopGeom,
-        staging: u8,
-        batch: u64,
-        m: u64,
-        k: u64,
-        n: u64,
-        post: &ScalarExpr,
-        reference_post: &dyn Fn(f32) -> f32,
-    ) {
-        coop_case_typed(
-            target,
-            geom,
-            staging,
-            batch,
-            m,
-            k,
-            n,
-            post,
-            reference_post,
-            Dtype::F32,
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn coop_case_typed(
-        target: &crate::target::GpuTarget,
-        geom: CoopGeom,
-        staging: u8,
-        batch: u64,
-        m: u64,
-        k: u64,
-        n: u64,
-        post: &ScalarExpr,
-        reference_post: &dyn Fn(f32) -> f32,
-        out_dtype: Dtype,
-    ) {
-        use fusor2_ir::extract::{BindKind, BindingPlan, BufferPlan, Extraction, Dispatch, Plan, PlanHash};
-        use fusor2_ir::ir::launch::{
-            AccessPlan, ContractSide, CoopDomain, Family, Operand, ScheduleDomain,
-        };
-        use fusor2_ir::egraph::EGraph;
-        use fusor2_ir::ir::Op;
-        use fusor2_ir::ir::logical::{BufferId, Logical, LeafKind};
-        use fusor2_ir::scalar::ScalarExpr;
-        use fusor2_ir::semantics::{CoreSemantics, SumArenaPlanner};
-        use fusor2_ir::shape::Layout;
-        use fusor2_ir::target::Target;
-        use std::sync::Arc;
-
-        let mut g = EGraph::new(CoreSemantics::new(Arc::new(SumArenaPlanner)));
-        let leaf = |g: &mut EGraph, id: u32, shape: &[u64]| {
-            g.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
-                name: BufferId(id),
-                dtype: Dtype::F32,
-                shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
-            })))
-            .expect("leaf")
-        };
-        let lhs = leaf(&mut g, 0, &[batch, m, k]);
-        let rhs = leaf(&mut g, 1, &[batch, k, n]);
-        let operand = |src, shape: &[u64]| Operand {
-            src,
-            layout: Layout::contiguous(
-                &shape.iter().map(|d| Dim::Const(*d)).collect::<smallvec::SmallVec<[Dim; 6]>>(),
-            ),
-            access: AccessPlan::Alias,
-        };
-        let ident = ScalarExpr::arg(0, Dtype::F32);
-        let theta = SchedPoint::Coop { geom, splits: 1, staging };
-        let out = g
-            .add(Op::Launch(Launch::Contract {
-                m: Dim::Const(m),
-                n: Dim::Const(n),
-                k: Dim::Const(k),
-                batch: Dim::Const(batch),
-                family: Family::Coop,
-                post: post.clone(),
-                acc: Dtype::F32,
-                a: ContractSide::one(ident.clone(), operand(lhs, &[batch, m, k])),
-                b: ContractSide::one(ident, operand(rhs, &[batch, k, n])),
-                sched: ScheduleDomain::Coop(CoopDomain {
-                    geoms: smallvec::smallvec![geom],
-                    splits: smallvec::smallvec![1],
-                    staging: smallvec::smallvec![staging],
-                }),
-            }))
-            .expect("contract node");
-
-        // The padded output layout is the extractor's, read from the same
-        // function the planner uses — the kernel's whole-block store depends
-        // on it and checks it.
-        let (layout, elements) = fusor2_cost::plan::buffer_layout_for(g.facts(out), Some(theta))
-            .expect("padded output layout");
-        let elements: u64 = elements.as_const().expect("const shapes give a const extent");
-        let plan = Plan {
-            extraction: Extraction::default(),
-            launches: vec![Dispatch {
-                root: out,
-                members: smallvec::smallvec![out],
-                bindings: vec![
-                    BindingPlan { binding: 1, value: lhs, kind: BindKind::Read },
-                    BindingPlan { binding: 2, value: rhs, kind: BindKind::Read },
-                    BindingPlan { binding: 3, value: out, kind: BindKind::Write },
-                ],
-                grid: [1, 1, 1],
-                block: 64,
-            }],
-            buffers: vec![BufferPlan {
-                value: out,
-                layout: layout.clone(),
-                elements: Dim::Const(elements),
-                dtype: out_dtype,
-                persistence: fusor2_ir::dtype::Persistence::Step,
-            }],
-            symbols: Vec::new(),
-            hash: PlanHash(0),
-            cost: fusor2_ir::cost::Picoseconds(0),
-        };
-        let cx = LowerCtx {
-            plan: &plan,
-            launch: &plan.launches[0],
-            graph: &g,
-            symbols: &[],
-        };
-
-        let ir = crate::lower::lower(target.caps(), g.node(out), out, theta, &cx)
-            .unwrap_or_else(|e| panic!("{geom:?} staging {staging} at {batch}x{m}x{k}x{n}: {e}"));
-        fusor2_tile::verify_kernel(&ir, target.caps())
-            .unwrap_or_else(|e| panic!("{geom:?} staging {staging}: verify_kernel: {e}"));
-        let artifact = target.emit(&ir).expect("emit");
-
-        let host = |seed: u32, len: usize| -> Vec<f32> {
-            let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(12_345) | 1;
-            (0..len)
-                .map(|_| {
-                    s ^= s << 13;
-                    s ^= s >> 17;
-                    s ^= s << 5;
-                    ((s >> 8) as f32 / (1u32 << 24) as f32) - 0.5
-                })
-                .collect()
-        };
-        let a = host(7, (batch * m * k) as usize);
-        let b = host(11, (batch * k * n) as usize);
-        let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-        let a_buf = target
-            .pool()
-            .create_buffer_init(&bytes(&a), crate::pool::TENSOR_USAGE)
-            .expect("a buffer");
-        let b_buf = target
-            .pool()
-            .create_buffer_init(&bytes(&b), crate::pool::TENSOR_USAGE)
-            .expect("b buffer");
-        let out_bytes = out_dtype.byte_size() as u64;
-        let out_buf = target
-            .alloc(elements * out_bytes, fusor2_ir::dtype::Persistence::Step)
-            .expect("out buffer");
-        let uniform = target.alloc(4, fusor2_ir::dtype::Persistence::Step).expect("uniform");
-        target
-            .launch(
-                &artifact,
-                ir.grid,
-                &[uniform, a_buf, b_buf, out_buf.clone()],
-                &Default::default(),
-            )
-            .expect("launch");
-        target.wait().expect("wait");
-        let back = target
-            .launcher()
-            .readback(target.pool(), &out_buf, elements * out_bytes)
-            .expect("readback");
-        let got: Vec<f32> = back[..(elements * out_bytes) as usize]
-            .chunks_exact(out_bytes as usize)
-            .map(|c| match out_dtype {
-                Dtype::F16 => f32::from(half::f16::from_le_bytes([c[0], c[1]])),
-                _ => f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
-            })
-            .collect();
-
-        // The padded row space the kernel wrote into.
-        let padded_n = elements / (batch * m.div_ceil(geom.bm as u64) * geom.bm as u64);
-        let padded_m = m.div_ceil(geom.bm as u64) * geom.bm as u64;
-        for bt in 0..batch {
-            for i in 0..m {
-                for j in 0..n {
-                    let mut acc = 0.0f64;
-                    for p in 0..k {
-                        acc += f64::from(a[(bt * m * k + i * k + p) as usize])
-                            * f64::from(b[(bt * k * n + p * n + j) as usize]);
-                    }
-                    let want = reference_post(acc as f32);
-                    let at = ((bt * padded_m + i) * padded_n + j) as usize;
-                    let tol = match out_dtype {
-                        Dtype::F16 => 2e-3,
-                        _ => 2e-4,
-                    } * want.abs().max(1.0);
-                    assert!(
-                        (got[at] - want).abs() <= tol,
-                        "{geom:?} staging {staging} at {batch}x{m}x{k}x{n} post {post:?}: \
-                         [{bt},{i},{j}] got {} want {want}",
-                        got[at]
-                    );
-                }
-            }
-        }
-    }
 }

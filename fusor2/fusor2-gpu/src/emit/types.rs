@@ -21,7 +21,7 @@ use super::{Analysis, Emitter, key};
 /// `global[base_index + tile_index]`, with the value bitcast between
 /// `canonical` and the tile's own element when a region is heterogeneous.
 #[derive(Copy, Clone, Debug)]
-pub struct TileBacking {
+pub(crate) struct TileBacking {
     pub global: Handle<GlobalVariable>,
     pub canonical: ElementType,
     pub base_index: u32,
@@ -29,7 +29,7 @@ pub struct TileBacking {
 
 /// The two prelude handles the entry point itself needs. Everything else is
 /// looked up through naga's `UniqueArena`, which interns structurally.
-pub struct Prelude {
+pub(crate) struct Prelude {
     pub u32_ty: Handle<Type>,
     pub u32_vec3_ty: Handle<Type>,
 }
@@ -39,7 +39,7 @@ pub struct Prelude {
 /// `BF16` has no naga 29 representation: it is a storage-only dtype whose
 /// compute form the `widen-compute` Launch rule produces, so it must never reach
 /// Kernel as a value type.
-pub fn scalar_of(scalar: ScalarElement) -> Result<Scalar, EmitError> {
+pub(crate) fn scalar_of(scalar: ScalarElement) -> Result<Scalar, EmitError> {
     Ok(match scalar {
         ScalarElement::F32 => Scalar::F32,
         ScalarElement::F16 => Scalar::F16,
@@ -109,7 +109,7 @@ fn insert(module: &mut naga::Module, inner: TypeInner) -> Handle<Type> {
 }
 
 /// Register (or reuse) the naga type for one element type.
-pub fn element_type(
+pub(crate) fn element_type(
     module: &mut naga::Module,
     element: ElementType,
 ) -> Result<Handle<Type>, EmitError> {
@@ -119,7 +119,7 @@ pub fn element_type(
 /// Intern the prelude in a fixed order: f32, f32x2/3/4, i32, i32x4, u32,
 /// u32x2/3/4, bool, boolx2/3/4, then the f16 quad only when the analysis says
 /// it is used, then every cooperative-matrix element the locals list mentions.
-pub fn intern_prelude(
+pub(crate) fn intern_prelude(
     module: &mut naga::Module,
     analysis: &Analysis,
 ) -> Result<Prelude, EmitError> {
@@ -241,7 +241,7 @@ fn atomic_array_type(
 ///
 /// The array is typed `array<atomic<..>>` when the analysis found a
 /// [`fusor2_ir::ir::kernel::Stmt::AtomicAdd`] on this binding.
-pub fn storage_global_with(
+pub(crate) fn storage_global_with(
     module: &mut naga::Module,
     decl: &BufferDecl,
     atomic: bool,
@@ -275,7 +275,7 @@ pub fn storage_global_with(
 ///
 /// `byte_offset` is accepted for signature compatibility with the packed-arena
 /// caller; a standalone tile always starts at zero.
-pub fn workgroup_global(
+pub(crate) fn workgroup_global(
     module: &mut naga::Module,
     decl: &TileDecl,
     byte_offset: u32,
@@ -299,7 +299,7 @@ pub fn workgroup_global(
 
 /// Buffers in binding order, so the global-variable arena is independent
 /// of which statement touches which buffer first.
-pub fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
+pub(crate) fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
     let mut buffers = em.analysis.buffers.clone();
     buffers.sort_by_key(|b| b.binding);
     for buffer in &buffers {
@@ -325,7 +325,7 @@ pub fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
 ///
 /// A tile with no placement gets its own allocation. An empty or partial plan
 /// is therefore always emittable, just larger.
-pub fn create_workgroup_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
+pub(crate) fn create_workgroup_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
     let tiles = em.analysis.tiles.clone();
     let placements: FxHashMap<usize, (u32, u32)> = em
         .plan
@@ -465,7 +465,7 @@ fn canonical_element(members: &[&fusor2_ir::ir::kernel::Tile]) -> Result<Element
 }
 
 /// Program locals, in first-use order.
-pub fn create_private_locals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
+pub(crate) fn create_private_locals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
     let locals = em.analysis.locals.clone();
     for local in &locals {
         let ty = element_type(&mut em.module, local.element)?;

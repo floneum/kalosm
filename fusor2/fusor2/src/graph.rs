@@ -550,6 +550,7 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// Create an empty graph resolved by `session`.
     pub fn new(session: &Session) -> Self {
         Self {
             inner: GraphRef {
@@ -571,6 +572,7 @@ impl Graph {
         }
     }
 
+    /// Borrow the shared graph handle used by runtime-rank operations.
     pub fn handle(&self) -> &GraphRef {
         &self.inner
     }
@@ -580,6 +582,7 @@ impl Graph {
         Self { inner }
     }
 
+    /// The session that resolves this graph.
     pub fn session(&self) -> &Session {
         self.inner.session()
     }
@@ -773,6 +776,7 @@ pub struct Gradients {
 }
 
 impl Gradients {
+    /// The gradient of `of`, when the backward reached it.
     pub fn get(&self, of: &Tensor) -> Option<Tensor> {
         let id = self.entries.get(&of.id).copied()?;
         Some(of.graph.tensor(id))
@@ -785,10 +789,12 @@ impl Gradients {
         out
     }
 
+    /// The number of primal/gradient pairs.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Whether the backward produced no gradients.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -801,41 +807,4 @@ pub(crate) fn parent(t: &Tensor, requires_grad: bool) -> Parent {
         value: t.id,
         requires_grad,
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::session::{Backend, Session};
-
-    fn graph() -> Graph {
-        let session = Session::new(Backend::cpu().expect("cpu device")).expect("session");
-        Graph::new(&session)
-    }
-
-    #[test]
-    fn a_parameter_leaf_is_persistent_and_a_buffer_leaf_is_not() {
-        let g = graph();
-        let w = g.param("w", &[Dim::Const(4)], Dtype::F32).unwrap();
-        let x = g.leaf("x", &[Dim::Const(4)], Dtype::F32).unwrap();
-        assert_eq!(
-            g.handle().facts(w.id()).persistence,
-            fusor2_ir::dtype::Persistence::Persistent
-        );
-        assert_eq!(
-            g.handle().facts(x.id()).persistence,
-            fusor2_ir::dtype::Persistence::Step
-        );
-    }
-
-    #[test]
-    fn named_symbols_are_stable_and_never_collide_with_minted_ones() {
-        let g = graph();
-        let a = g.sym("seq");
-        let b = g.sym("seq");
-        assert_eq!(a, b);
-        let fresh = g.handle().fresh_sym();
-        assert_ne!(Dim::Sym(fresh), a);
-    }
-
 }

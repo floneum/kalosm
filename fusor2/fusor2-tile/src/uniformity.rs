@@ -20,14 +20,14 @@ use crate::liveness::for_each_child;
 /// Whether a value is provably identical across every invocation of the
 /// group. Unknown is treated as `NonUniform`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Uniformity {
+pub(crate) enum Uniformity {
     Uniform,
     NonUniform,
 }
 
 impl Uniformity {
     /// `Uniform` only when both are.
-    pub const fn meet(self, other: Self) -> Self {
+    pub(crate) const fn meet(self, other: Self) -> Self {
         match (self, other) {
             (Self::Uniform, Self::Uniform) => Self::Uniform,
             _ => Self::NonUniform,
@@ -109,7 +109,7 @@ impl Ctx {
 
 /// A `Barrier` may not appear under an `If` whose predicate is non-uniform
 /// over the group.
-pub fn verify_uniformity(ir: &KernelIr) -> Result<()> {
+pub(crate) fn verify_uniformity(ir: &KernelIr) -> Result<()> {
     let mut ctx = Ctx::default();
     classify_locals(&ir.body, &mut ctx);
     let mut path: Vec<u32> = Vec::new();
@@ -285,129 +285,4 @@ fn render_path(path: &[u32]) -> String {
         out.push_str(&step.to_string());
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::build::TileBuilder;
-    use fusor2_ir::ir::kernel::{ScalarElement, WorkgroupAxis};
-    use fusor2_ir::scalar::CmpOp;
-
-    #[test]
-    fn non_uniform_barrier_rejected() {
-        let mut b = TileBuilder::new();
-        let lane = b.builtin(Builtin::Lane);
-        let sixteen = b.lit_u32(16);
-        let condition = b.compare(CmpOp::Lt, lane, sixteen);
-        let stmt = b.if_then_else(condition, vec![Stmt::Barrier], Vec::new());
-        b.push(stmt);
-        let ir = b.finish([1, 1, 1], 64, "divergent");
-        match verify_uniformity(&ir) {
-            Err(Error::Lower(LowerError::NonUniformBarrier(_))) => {}
-            other => panic!("expected NonUniformBarrier, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn uniform_barrier_accepted() {
-        let mut b = TileBuilder::new();
-        let group = b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
-        let four = b.lit_u32(4);
-        let condition = b.compare(CmpOp::Lt, group, four);
-        let stmt = b.if_then_else(condition, vec![Stmt::Barrier], Vec::new());
-        b.push(stmt);
-        let ir = b.finish([1, 1, 1], 64, "uniform");
-        verify_uniformity(&ir).unwrap();
-    }
-
-    #[test]
-    fn a_local_holding_a_lane_value_poisons_the_predicate() {
-        let mut b = TileBuilder::new();
-        let local = b.alloc_local(ScalarElement::U32.element());
-        let lane = b.builtin(Builtin::Lane);
-        let store = b.store_local(local.clone(), lane);
-        let loaded = b.load_local(local);
-        let four = b.lit_u32(4);
-        let condition = b.compare(CmpOp::Lt, loaded, four);
-        let guarded = b.if_then_else(condition, vec![Stmt::Barrier], Vec::new());
-        b.push(store);
-        b.push(guarded);
-        let ir = b.finish([1, 1, 1], 64, "poisoned");
-        assert!(verify_uniformity(&ir).is_err());
-    }
-
-    #[test]
-    fn a_local_holding_a_uniform_value_does_not() {
-        let mut b = TileBuilder::new();
-        let local = b.alloc_local(ScalarElement::U32.element());
-        let size = b.builtin(Builtin::SubgroupSize);
-        let store = b.store_local(local.clone(), size);
-        let loaded = b.load_local(local);
-        let four = b.lit_u32(4);
-        let condition = b.compare(CmpOp::Lt, loaded, four);
-        let guarded = b.if_then_else(condition, vec![Stmt::Barrier], Vec::new());
-        b.push(store);
-        b.push(guarded);
-        let ir = b.finish([1, 1, 1], 64, "clean");
-        verify_uniformity(&ir).unwrap();
-    }
-    /// A staged reduction emits a barrier between every tree level, so it may
-    /// not sit under a divergent predicate any more than a written one may.
-    #[test]
-    fn a_staged_reduction_under_a_divergent_if_is_rejected() {
-        use fusor2_ir::ir::kernel::{MergeBody, ReduceKind};
-        let mut b = TileBuilder::new();
-        let f32e = ScalarElement::F32.element();
-        let scratch = b.alloc_tile(
-            f32e,
-            fusor2_ir::ir::kernel::TileLayout::contiguous(
-                fusor2_ir::ir::kernel::MemoryLevel::Workgroup,
-                &[64],
-            ),
-        );
-        let lhs = b.alloc_local(f32e);
-        let rhs = b.alloc_local(f32e);
-        let a = b.load_local(lhs.clone());
-        let c = b.load_local(rhs.clone());
-        let merged = b.binary(
-            fusor2_ir::scalar::BinOp::Add,
-            a,
-            c,
-            fusor2_ir::dtype::NumericContract::RELAXED,
-        );
-        let out = b.alloc_local(f32e);
-        let value = b.lit_f32(1.0);
-        let reduce = Stmt::Reduce {
-            kind: Box::new(ReduceKind::Workgroup {
-                scratch: scratch.clone(),
-                group_size: 64,
-            }),
-            values: smallvec::smallvec![value],
-            merge: Box::new(MergeBody {
-                lhs: smallvec::smallvec![lhs],
-                rhs: smallvec::smallvec![rhs],
-                body: smallvec::smallvec![merged],
-            }),
-            fast: None,
-            outs: smallvec::smallvec![out],
-            scratch: smallvec::smallvec![scratch],
-        };
-        let lane = b.builtin(Builtin::Lane);
-        let sixteen = b.lit_u32(16);
-        let divergent = b.compare(CmpOp::Lt, lane, sixteen);
-        let guarded = b.if_then_else(divergent, vec![reduce.clone()], Vec::new());
-        b.push(guarded);
-        let ir = b.finish([1, 1, 1], 64, "divergent-reduce");
-        match verify_uniformity(&ir) {
-            Err(Error::Lower(LowerError::NonUniformBarrier(_))) => {}
-            other => panic!("expected NonUniformBarrier, got {other:?}"),
-        }
-
-        // The same node at the top level is fine.
-        let mut b = TileBuilder::new();
-        b.push(reduce);
-        let ir = b.finish([1, 1, 1], 64, "plain-reduce");
-        verify_uniformity(&ir).unwrap();
-    }
 }

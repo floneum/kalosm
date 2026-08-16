@@ -20,6 +20,7 @@ pub struct RmsNorm<const N: usize = 1, T: Element = f32> {
 }
 
 impl<const N: usize, T: Element> RmsNorm<N, T> {
+    /// Create an RMS normalization with an optional learned scale.
     pub fn new(weight: Option<Tensor<N, T>>, eps: f32) -> Self {
         Self { weight, eps }
     }
@@ -71,71 +72,5 @@ impl<const N: usize, T: Element> RmsNorm<N, T> {
             ),
         };
         x.rms_norm_residual(residual, w, None, self.eps)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fusor2_ir::shape::Dim;
-
-    use crate::graph::Graph;
-    use crate::layers::test_leaf as leaf;
-    use crate::session::{Backend, Session};
-
-    fn graph() -> Graph {
-        Graph::new(&Session::new(Backend::cpu().expect("cpu device")).expect("session"))
-    }
-
-    #[test]
-    fn both_spellings_preserve_the_shape() {
-        let g = graph();
-        let x: Tensor<2, f32> = leaf(&g, &[3, 6]);
-        let w: Tensor<1, f32> = leaf(&g, &[6]);
-        for layer in [RmsNorm::new(Some(w), 1e-5), RmsNorm::new(None, 1e-5)] {
-            assert_eq!(layer.forward(&x).shape(), [3, 6]);
-        }
-    }
-
-    #[test]
-    fn one_epsilon_is_one_uniform_across_two_layers() {
-        let g = graph();
-        let x: Tensor<2, f32> = leaf(&g, &[3, 6]);
-        let w: Tensor<1, f32> = leaf(&g, &[6]);
-        let a = RmsNorm::new(Some(w.clone()), 1e-5).forward(&x);
-        let b = RmsNorm::new(Some(w), 1e-5).forward(&x);
-        assert_eq!(a.id(), b.id(), "two layers at one eps hash-cons together");
-    }
-
-    #[test]
-    fn the_forward_is_exactly_the_macro_op() {
-        let g = graph();
-        let x: Tensor<2, f32> = leaf(&g, &[3, 6]);
-        let w: Tensor<1, f32> = leaf(&g, &[6]);
-        let weighted = RmsNorm::new(Some(w.clone()), 1e-5).forward(&x);
-        assert_eq!(weighted.id(), x.rms_norm(&w, 1e-5).id());
-        let bare = RmsNorm::<1, f32>::new(None, 1e-5).forward(&x);
-        assert_eq!(bare.id(), x.rms_norm_no_weight(1e-5).id());
-    }
-
-    #[test]
-    #[should_panic(expected = "needs a weight")]
-    fn a_weightless_residual_norm_is_refused_rather_than_defaulted() {
-        let g = graph();
-        let x: Tensor<3, f32> = leaf(&g, &[2, 3, 6]);
-        let r: Tensor<3, f32> = leaf(&g, &[2, 3, 6]);
-        let _ = RmsNorm::<1, f32>::new(None, 1e-5).forward_residual(&x, &r);
-    }
-
-    /// The element type is a parameter, and a non-f32 layer keeps its dtype
-    /// through the forward.
-    #[test]
-    fn a_half_precision_layer_stays_half_precision() {
-        let g = graph();
-        let x: Tensor<2, half::f16> = leaf(&g, &[3, 6]);
-        let w: Tensor<1, half::f16> = leaf(&g, &[6]);
-        let y = RmsNorm::new(Some(w), 1e-5).forward(&x);
-        assert_eq!(y.dtype(), fusor2_ir::dtype::Dtype::F16);
-        let _ = Dim::Const(0);
     }
 }

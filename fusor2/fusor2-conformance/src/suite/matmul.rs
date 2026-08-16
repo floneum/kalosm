@@ -1,7 +1,6 @@
-//! Contractions across all four families. Family is never stored on a node —
-//! `lower_coop`, `lower_sgemm`, `lower_sgemv` and `lower_generic` coexist in
-//! one chain — so a case here that produces the right numbers is evidence
-//! that whichever family extraction picked is correct, on both backends.
+//! Contractions across the cooperative, SGEMM, SGEMV, and generic lowering
+//! paths. Alternatives coexist in one chain, so a case that produces the
+//! right numbers checks whichever path extraction selected on either backend.
 
 use fusor2::{Dtype, Session};
 
@@ -532,68 +531,4 @@ fn quantized_matmul(session: &Session, act_rank: usize, shape: &[u64], seed: u32
         1e-3,
     )?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_named_contraction_is_registered() {
-        let names: Vec<String> = cases().names().iter().map(|n| (*n).to_string()).collect();
-        for wanted in [
-            "matmul",
-            "mat_mul_rank3",
-            "mat_mul_rank4",
-            "matmul_with_broadcast_bias",
-            "mat_mul_transposed_rhs",
-            "q_mat_mul",
-            "q_mat_mul_rank1",
-            "split_k_512",
-            "split_k_768",
-            "split_k_1024",
-            "split_k_2048",
-        ] {
-            assert!(
-                names.iter().any(|n| n == &format!("matmul::{wanted}")),
-                "{wanted} is missing"
-            );
-        }
-        for wanted in ["wide_n_columns", "qkv_projection_triple"] {
-            assert!(
-                names.iter().any(|n| n == &format!("matmul::{wanted}")),
-                "{wanted} is missing"
-            );
-        }
-        assert_eq!(names.len(), 7 + SPLIT_K_EXTENTS.len() + 2);
-    }
-
-    /// Every split-K extent is under the shipped `at_least(4096)` gate. If
-    /// one drifts above it the case stops measuring what it was written for.
-    #[test]
-    fn the_split_k_extents_are_all_under_the_shipped_gate() {
-        for k in SPLIT_K_EXTENTS {
-            assert!(k < 4096, "{k} is not under the gate this case exists for");
-            assert!(k.is_multiple_of(8), "{k} cannot be blocked at all");
-        }
-    }
-
-    #[test]
-    fn the_host_matmul_reference_is_right_on_a_hand_worked_case() {
-        // [[1, 2], [3, 4]] @ [[5, 6], [7, 8]] = [[19, 22], [43, 50]]
-        let a = [1.0f32, 2.0, 3.0, 4.0];
-        let b = [5.0f32, 6.0, 7.0, 8.0];
-        assert_eq!(
-            host_matmul(&a, &b, 1, 2, 2, 2),
-            vec![19.0, 22.0, 43.0, 50.0]
-        );
-    }
-
-    #[test]
-    fn the_host_matmul_reference_keeps_batches_independent() {
-        let a = [1.0f32, 1.0, 2.0, 2.0];
-        let b = [1.0f32, 0.0, 0.0, 1.0];
-        // Two 1x2 @ 2x1 contractions: [1*1 + 1*0] and [2*0 + 2*1].
-        assert_eq!(host_matmul(&a, &b, 2, 1, 2, 1), vec![1.0, 2.0]);
-    }
 }

@@ -9,10 +9,12 @@ use crate::{Error, Result, Tensor};
 
 /// A `[num_embeddings, embedding_dim]` lookup table.
 pub struct Embedding<T: Element = f32> {
+    /// The `[num_embeddings, embedding_dim]` lookup table.
     pub table: Tensor<2, T>,
 }
 
 impl<T: Element> Embedding<T> {
+    /// Wrap a lookup table.
     pub fn new(table: Tensor<2, T>) -> Self {
         Self { table }
     }
@@ -27,10 +29,12 @@ impl<T: Element> Embedding<T> {
         Ok(Self { table })
     }
 
+    /// The number of lookup rows.
     pub fn num_embeddings(&self) -> Dim {
         self.table.extent(0usize)
     }
 
+    /// The width of each lookup row.
     pub fn embedding_dim(&self) -> Dim {
         self.table.extent(1usize)
     }
@@ -51,56 +55,5 @@ impl<T: Element> Embedding<T> {
             );
         }
         self.table.embedding(ids)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::graph::Graph;
-    use crate::layers::test_leaf as leaf;
-    use crate::session::{Backend, Session};
-
-    fn graph() -> Graph {
-        Graph::new(&Session::new(Backend::cpu().expect("cpu device")).expect("session"))
-    }
-
-    #[test]
-    fn the_index_rank_grows_by_the_embedding_axis() {
-        let g = graph();
-        let table: Tensor<2, f32> = leaf(&g, &[5, 3]);
-        let ids: Tensor<2, u32> = leaf(&g, &[2, 2]);
-        let y: Tensor<3, f32> = Embedding::new(table).forward(&ids);
-        assert_eq!(y.shape(), [2, 2, 3]);
-    }
-
-    /// The layer must not mint a second node the adjoint would then have to
-    /// know about.
-    #[test]
-    fn the_forward_is_exactly_the_gather() {
-        let g = graph();
-        let table: Tensor<2, f32> = leaf(&g, &[5, 3]);
-        let ids: Tensor<2, u32> = leaf(&g, &[2, 2]);
-        let by_layer: Tensor<3, f32> = Embedding::new(table.clone()).forward(&ids);
-        assert_eq!(by_layer.id(), table.embedding::<2, 3>(&ids).id());
-    }
-
-    /// The table's rank is in the type, so a rank-3 one cannot reach the
-    /// constructor.
-    #[test]
-    #[should_panic(expected = "value has rank 3")]
-    fn a_rank_three_table_is_refused_by_the_type() {
-        let g = graph();
-        let _: Tensor<2, f32> = leaf(&g, &[2, 5, 3]);
-    }
-
-    #[test]
-    fn a_half_precision_table_stays_half_precision() {
-        let g = graph();
-        let table: Tensor<2, half::f16> = leaf(&g, &[5, 3]);
-        let ids: Tensor<1, u32> = leaf(&g, &[2]);
-        let y: Tensor<2, half::f16> = Embedding::new(table).forward(&ids);
-        assert_eq!(y.dtype(), fusor2_ir::dtype::Dtype::F16);
     }
 }

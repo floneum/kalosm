@@ -9,17 +9,19 @@
 //! `max_compute_workgroup_storage_size`), and an encoder/submission model
 //! whose only host syncs are readback, explicit wait and the allocator retry.
 
-pub mod bindings;
-pub mod caps;
-pub mod device;
-pub mod emit;
+#![warn(unreachable_pub)]
+
+mod bindings;
+mod caps;
+mod device;
+mod emit;
 pub mod launch;
-pub mod lower;
-pub mod plan_cache;
+mod lower;
+mod plan_cache;
 pub mod pool;
-pub mod rules;
+mod rules;
 pub mod target;
-pub mod uniforms;
+mod uniforms;
 
 pub use bindings::{BindingDesc, bindings_from_module};
 pub use device::GpuDevice;

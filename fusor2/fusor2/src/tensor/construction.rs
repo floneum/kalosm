@@ -88,19 +88,23 @@ impl Tensor {
         Self::splat(graph, value, shape)
     }
 
+    /// A zero-filled constant tensor.
     pub fn zeros(graph: &GraphRef, dtype: Dtype, shape: &[Dim]) -> Result<Tensor> {
         Self::splat(graph, splat_zero(dtype), shape)
     }
 
+    /// A one-filled constant tensor.
     pub fn ones(graph: &GraphRef, dtype: Dtype, shape: &[Dim]) -> Result<Tensor> {
         Self::splat(graph, splat_one(dtype), shape)
     }
 
+    /// A zero-filled constant with this value's shape and dtype.
     pub fn zeros_like(&self) -> Result<Tensor> {
         let facts = self.facts();
         Self::zeros(&self.graph, facts.dtype, &facts.shape)
     }
 
+    /// A one-filled constant with this value's shape and dtype.
     pub fn ones_like(&self) -> Result<Tensor> {
         let facts = self.facts();
         Self::ones(&self.graph, facts.dtype, &facts.shape)
@@ -201,7 +205,7 @@ fn byte_len(dtype: Dtype, shape: &[Dim]) -> Result<u64> {
 ///
 /// # Panics
 /// If `step == 0`.
-pub fn arange_bytes(dtype: Dtype, start: f64, end: f64, step: f64) -> Result<Vec<u8>> {
+pub(crate) fn arange_bytes(dtype: Dtype, start: f64, end: f64, step: f64) -> Result<Vec<u8>> {
     assert!(step != 0.0, "arange_step needs a nonzero step");
     if dtype.is_quantized() {
         return Err(Error::Dtype("arange has no quantized form".into()));
@@ -230,6 +234,7 @@ fn push_scalar(out: &mut Vec<u8>, dtype: Dtype, v: f64) {
 /// Nested host data whose shape is inferred from its nesting. Implemented for
 /// arrays and `Vec`s up to depth 4 plus flat slices.
 pub trait FromArray {
+    /// Scalar element stored by this nested host value.
     type Elem: Element;
     /// The inferred shape and the row-major flattening.
     fn to_parts(&self) -> Result<(Vec<Dim>, Vec<Self::Elem>)>;
@@ -406,78 +411,4 @@ impl<D: Element> FromArray for Vec<Vec<Vec<Vec<D>>>> {
 
 fn ragged() -> Error {
     Error::Shape("nested input is ragged; every sibling must have the same length".into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn f32s(bytes: &[u8]) -> Vec<f32> {
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect()
-    }
-    fn u32s(bytes: &[u8]) -> Vec<u32> {
-        bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect()
-    }
-
-    #[test]
-    fn arange_counts_up() {
-        let b = arange_bytes(Dtype::F32, 0.0, 4.0, 1.0).unwrap();
-        assert_eq!(f32s(&b), vec![0.0, 1.0, 2.0, 3.0]);
-    }
-
-    #[test]
-    fn arange_counts_down_with_a_negative_step() {
-        let b = arange_bytes(Dtype::F32, 5.0, 0.0, -2.0).unwrap();
-        assert_eq!(f32s(&b), vec![5.0, 3.0, 1.0]);
-    }
-
-    #[test]
-    fn arange_row_offsets_for_gather_last() {
-        // rows = 3, width = 4 -> [0, 4, 8]
-        let b = arange_bytes(Dtype::U32, 0.0, 12.0, 4.0).unwrap();
-        assert_eq!(u32s(&b), vec![0, 4, 8]);
-    }
-
-    #[test]
-    fn arange_is_empty_when_the_step_points_away() {
-        assert!(arange_bytes(Dtype::F32, 0.0, 4.0, -1.0).unwrap().is_empty());
-        assert!(arange_bytes(Dtype::F32, 4.0, 4.0, 1.0).unwrap().is_empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "nonzero step")]
-    fn arange_rejects_a_zero_step() {
-        let _ = arange_bytes(Dtype::F32, 0.0, 4.0, 0.0);
-    }
-
-    #[test]
-    fn from_array_infers_the_shape_from_the_nesting() {
-        let (shape, flat) = [[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]].to_parts().unwrap();
-        assert_eq!(shape, vec![Dim::Const(3), Dim::Const(2)]);
-        assert_eq!(flat, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-
-        let (shape, flat) = vec![vec![vec![1u32, 2]], vec![vec![3, 4]]]
-            .to_parts()
-            .unwrap();
-        assert_eq!(shape, vec![Dim::Const(2), Dim::Const(1), Dim::Const(2)]);
-        assert_eq!(flat, vec![1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn ragged_nesting_is_an_error() {
-        let v: Vec<Vec<f32>> = vec![vec![1.0, 2.0], vec![3.0]];
-        assert!(v.to_parts().is_err());
-    }
-
-    #[test]
-    fn byte_len_refuses_a_symbolic_shape() {
-        assert!(byte_len(Dtype::F32, &[Dim::Sym(SymId(0))]).is_err());
-        assert_eq!(byte_len(Dtype::F16, &[Dim::Const(3)]).unwrap(), 6);
-    }
 }

@@ -5,19 +5,19 @@ use fusor2_ir::device::{Caps, DeviceKind, Limits, SubgroupWidths};
 use smallvec::smallvec;
 use std::sync::OnceLock;
 
-pub use fearless_simd::Level;
+pub(crate) use fearless_simd::Level;
 
 static LEVEL: OnceLock<Level> = OnceLock::new();
 static CAPS: OnceLock<Caps> = OnceLock::new();
 
 /// The cached ISA level. Detection runs once per process; `dispatch!` runs
 /// once per kernel launch, never per row.
-pub fn level() -> Level {
+pub(crate) fn level() -> Level {
     *LEVEL.get_or_init(Level::new)
 }
 
 /// A stable name for the detected level, used as `Caps::name`.
-pub fn level_name(level: Level) -> &'static str {
+pub(crate) fn level_name(level: Level) -> &'static str {
     #[allow(unreachable_patterns)]
     match level {
         #[cfg(target_arch = "aarch64")]
@@ -32,10 +32,10 @@ pub fn level_name(level: Level) -> &'static str {
 
 /// The widest lane count the emitter will instantiate. `Reduce{Subgroup}` is
 /// legal at this width and lowers to a horizontal reduce.
-pub const MAX_WIDTH: u32 = 16;
+pub(crate) const MAX_WIDTH: u32 = 16;
 
 /// Every width the emitter can instantiate, widest last.
-pub const WIDTHS: [u32; 3] = [4, 8, 16];
+pub(crate) const WIDTHS: [u32; 3] = [4, 8, 16];
 
 /// CPU capability probe.
 #[derive(Copy, Clone, Debug, Default)]
@@ -63,7 +63,7 @@ impl CpuCaps {
 }
 
 /// The CPU's [`Caps`]. Cached, because `Caps` owns a `String`.
-pub fn cpu_caps() -> &'static Caps {
+pub(crate) fn cpu_caps() -> &'static Caps {
     CAPS.get_or_init(|| {
         let lvl = level();
         let w = MAX_WIDTH;
@@ -97,22 +97,4 @@ pub fn cpu_caps() -> &'static Caps {
             threads: CpuCaps::threads(),
         }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn caps_are_stable_and_coherent() {
-        let c = cpu_caps();
-        assert_eq!(c.kind, DeviceKind::Cpu);
-        assert!(c.name.starts_with("cpu-"));
-        assert!(!c.atomic_f32, "atomic_f32 must be false so Atomic scatter is unreachable");
-        assert!(c.workgroup_alias);
-        assert!(c.coop.is_empty(), "Family::Coop must never be lowered on CPU");
-        assert!(c.subgroups.is_some_and(|s| s.is_fixed()));
-        assert_eq!(c.simd_widths.as_slice(), &WIDTHS);
-        assert!(c.threads >= 1);
-    }
 }

@@ -9,7 +9,7 @@
 ///
 /// **Declarative** — the rule body is a free function elsewhere:
 ///
-/// ```ignore
+/// ```text
 /// rule!(FOLD_SPLIT, level = Level::Logical, head = OpTag::Fold,
 ///       tag = RuleTag::Additive, apply = fold_split);
 /// ```
@@ -17,7 +17,7 @@
 /// **Structural** — the body is inline and the head is destructured, with an
 /// implicit `return None` when the node is not that variant:
 ///
-/// ```ignore
+/// ```text
 /// rule!(UNIT_FOLD_COLLAPSE, level = Level::Logical, head = OpTag::Fold,
 ///       tag = RuleTag::Additive,
 ///       l0 = Fold { combine, axis, acc, carrier, x },

@@ -1,6 +1,6 @@
 [package]
 name = "fusor2"
-description = "fusor2 user-facing facade: one runtime-rank Tensor, layers, Graph/Session, optimizers"
+description = "fusor2 user-facing facade: const-rank tensors, layers, sessions, and optimizers"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

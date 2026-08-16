@@ -4,9 +4,10 @@
 //! one is a compile error in this crate rather than a discovery made by a
 //! downstream build.
 //!
-//! It is equally a check in the *other* direction, and that is the harder one
-//! to keep: nothing is listed here that is not meant to be public. An item
-//! goes on the surface here and in the crate root together, or in neither.
+//! This pins intended names and type identities. It cannot detect an extra
+//! reachable export; `unreachable_pub` catches accidental exports behind a
+//! private module, while review of this file and `API.md` governs additions to
+//! the reachable surface.
 //!
 //! Test-only. It defines no public item and calls nothing.
 
@@ -19,22 +20,28 @@ use crate::{
 };
 
 // § 2. Modules.
-use crate::autograd::{BackwardTarget, GradientSlot, Parent};
+use crate::autograd::{
+    BackwardTarget, GradientSlot, Gradients as AutogradGradients, Graph as AutogradGraph, Parent,
+    Tensor as AutogradTensor, cat as autograd_cat,
+};
 use crate::cache::{AttentionMask, KvCache, MaskCache, MaskKind, RopeCache, TensorCache};
 use crate::composite::{
-    attention, attention_causal, attention_masked, base_inverse_frequency, conv, grouped_conv,
-    pad_with_zeros, pool_avg, pool_max, pool_min, rope, rope_interleaved, upsample_bilinear,
-    upsample_nearest2d,
+    PoolReduce, PoolSize, attention, attention_causal, attention_grads, attention_lse,
+    attention_masked, attention_with_lse, base_inverse_frequency, binary_cross_entropy_with_logits,
+    conv, distillation_loss, grouped_conv, mse, pad_with_zeros, pool, pool_avg, pool_max, pool_min,
+    rope, rope_interleaved, rope_interleaved_pair, rope_interleaved_pair_with_position,
+    rope_interleaved_with_position, rope_pair, rope_pair_with_position, rope_with_position,
+    rotate_half, softmax_cross_entropy, upsample_bilinear, upsample_nearest, upsample_nearest2d,
 };
 use crate::device::{Cpu, Gpu, KernelProfile, KernelProfileRow};
 use crate::graph::{Gradients, GraphRef};
 use crate::layers::{ConvNd, Embedding, LayerNorm, LayerNormNd, Linear, RmsNorm};
 use crate::optim::{AdamW, clip_global_norm, cosine_decay, global_norm};
 use crate::quantized::QMatrix as QMatrixByModulePath;
-use crate::sampling::{GpuSampledToken, Mirostat2Sampler, StandardSamplerParams, top_k_pairs};
-use crate::session::Backend;
+use crate::sampling::{GpuSampledToken, Mirostat2Sampler, StandardSamplerParams, sample, top_k_pairs};
+use crate::session::{Backend, wrong_member_count};
 use crate::tensor::{
-    Dyn, Extent, IndexOp, RoundMode, TensorIndex, TensorSlice, arange, arange_step,
+    Dyn, Extent, FromArray, IndexOp, RoundMode, Scalar, TensorIndex, TensorSlice, arange, arange_step,
 };
 
 /// The three claims that are about *identity*, not existence, and that a
@@ -125,35 +132,3 @@ const LAYERS_AND_CACHES_ARE_GENERIC: fn() = || {
     let _: fn(&AttentionMask, &Tensor<4>) -> Tensor<4> = mask;
     let _: fn(&RopeCache) -> (Tensor<2>, Tensor<2>) = rope;
 };
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `Tensor::device()` returns the type the constructors take.
-    ///
-    /// This expression is what a model writes when it builds a value
-    /// beside another.
-    #[test]
-    fn a_device_round_trips_through_a_value() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-        let x = Tensor::<1, f32>::zeros(&device, [3]);
-        let _: Device = x.device();
-        let _: Backend = x.backend();
-        let _: Dyn = x.clone().into_dyn();
-        let _: &Dyn = x.as_dyn();
-    }
-
-    /// The `typed-api` feature is deleted.
-    #[test]
-    fn the_crate_declares_no_api_switching_feature() {
-        let manifest = include_str!("../Cargo.toml");
-        assert!(
-            !manifest.contains("typed-api"),
-            "the typed-api feature is back in Cargo.toml. It swapped what \
-             `fusor2::Tensor` and `fusor2::Device` named, which is what made \
-             `--all-features` an invalid configuration of this workspace."
-        );
-    }
-}

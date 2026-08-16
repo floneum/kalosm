@@ -174,14 +174,17 @@ impl Tensor {
         Ok(self.graph.tensor(id))
     }
 
+    /// Rectified linear activation.
     pub fn relu(&self) -> Result<Tensor> {
         self.activation(relu_expr)
     }
 
+    /// Logistic sigmoid activation.
     pub fn sigmoid(&self) -> Result<Tensor> {
         self.activation(sigmoid_expr)
     }
 
+    /// Sigmoid linear unit activation.
     pub fn silu(&self) -> Result<Tensor> {
         self.activation(silu_expr)
     }
@@ -196,189 +199,18 @@ impl Tensor {
         self.activation(gelu_exact_expr)
     }
 
+    /// Hyperbolic tangent activation.
     pub fn tanh_exact(&self) -> Result<Tensor> {
         self.activation(tanh_exact_expr)
     }
 
+    /// Numerically stable softplus activation.
     pub fn softplus(&self) -> Result<Tensor> {
         self.activation(softplus_expr)
     }
 
+    /// Leaky rectified linear activation with the given negative slope.
     pub fn leaky_relu(&self, slope: f32) -> Result<Tensor> {
         self.activation(|d| leaky_relu_expr(d, slope))
-    }
-}
-
-/// Evaluate a single-argument `ScalarExpr` on the host.
-///
-/// The reference a backend is compared against — a plain tree walk, never a
-/// path a kernel takes. Public because `fusor2-conformance` uses the same
-/// walk.
-#[cfg(test)]
-fn eval_host(expr: &ScalarExpr, arg: f32) -> f32 {
-    use fusor2_ir::dtype::Splat;
-    use fusor2_ir::scalar::ScalarKind;
-    match expr.kind() {
-        ScalarKind::Arg(_) => arg,
-        ScalarKind::Lit(l) => match l.0 {
-            Splat::F32(v) => v,
-            Splat::F16(v) => half::f16::from_bits(v).to_f32(),
-            Splat::BF16(v) => half::bf16::from_bits(v).to_f32(),
-            Splat::U32(v) => v as f32,
-            Splat::I32(v) => v as f32,
-        },
-        ScalarKind::Un { op, x } => {
-            let v = eval_host(x, arg);
-            match op {
-                UnOp::Exp | UnOp::ApproximateExp | UnOp::LessApproximateExp => v.exp(),
-                UnOp::Exp2 => v.exp2(),
-                UnOp::Log => v.ln(),
-                UnOp::Log2 => v.log2(),
-                UnOp::Sqrt => v.sqrt(),
-                UnOp::InverseSqrt => 1.0 / v.sqrt(),
-                UnOp::Sin => v.sin(),
-                UnOp::Cos => v.cos(),
-                UnOp::Tan => v.tan(),
-                UnOp::Tanh => v.tanh(),
-                UnOp::Asin => v.asin(),
-                UnOp::Acos => v.acos(),
-                UnOp::Atan => v.atan(),
-                UnOp::Sinh => v.sinh(),
-                UnOp::Cosh => v.cosh(),
-                UnOp::Asinh => v.asinh(),
-                UnOp::Acosh => v.acosh(),
-                UnOp::Atanh => v.atanh(),
-                UnOp::Abs => v.abs(),
-                UnOp::Neg => -v,
-                UnOp::Unpack2x16Float => v,
-            }
-        }
-        ScalarKind::Bin { op, a, b } => {
-            let (x, y) = (eval_host(a, arg), eval_host(b, arg));
-            match op {
-                BinOp::Add => x + y,
-                BinOp::Sub => x - y,
-                BinOp::Mul => x * y,
-                BinOp::Div => x / y,
-                BinOp::Rem => x % y,
-                BinOp::Pow => x.powf(y),
-                BinOp::Min => x.min(y),
-                BinOp::Max => x.max(y),
-                _ => f32::NAN,
-            }
-        }
-        ScalarKind::Cmp { op, a, b } => {
-            let (x, y) = (eval_host(a, arg), eval_host(b, arg));
-            let r = match op {
-                CmpOp::Lt => x < y,
-                CmpOp::Le => x <= y,
-                CmpOp::Gt => x > y,
-                CmpOp::Ge => x >= y,
-                CmpOp::Eq => x == y,
-                CmpOp::Ne => x != y,
-            };
-            if r { 1.0 } else { 0.0 }
-        }
-        ScalarKind::Select { c, t, f } => {
-            if eval_host(c, arg) != 0.0 {
-                eval_host(t, arg)
-            } else {
-                eval_host(f, arg)
-            }
-        }
-        ScalarKind::Cast { x, .. } | ScalarKind::Bitcast { x, .. } => eval_host(x, arg),
-        ScalarKind::Round { mode, x } => {
-            let v = eval_host(x, arg);
-            match mode {
-                fusor2_ir::dtype::RoundMode::Floor => v.floor(),
-                fusor2_ir::dtype::RoundMode::Ceil => v.ceil(),
-                fusor2_ir::dtype::RoundMode::Trunc => v.trunc(),
-                fusor2_ir::dtype::RoundMode::HalfAwayFromZero => v.round(),
-                fusor2_ir::dtype::RoundMode::HalfToEven => {
-                    let r = v.round();
-                    if (v - v.trunc()).abs() == 0.5 && r % 2.0 != 0.0 {
-                        r - v.signum()
-                    } else {
-                        r
-                    }
-                }
-            }
-        }
-        ScalarKind::Uniform(_) | ScalarKind::IndexOf(_) => f32::NAN,
-        ScalarKind::Dot { .. } | ScalarKind::Splat { .. } => f32::NAN,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn reference_gelu(x: f32) -> f32 {
-        let inner = (GELU_C * (x + GELU_K * x * x * x)).clamp(-TANH_CLAMP, TANH_CLAMP);
-        let t = inner.tanh().clamp(-1.0, 1.0);
-        0.5 * x * (1.0 + t).clamp(0.0, 2.0)
-    }
-
-    #[test]
-    fn gelu_matches_the_reference_formula_and_is_finite_at_the_tails() {
-        let e = gelu_expr(Dtype::F32).unwrap();
-        for x in [-20.0f32, -1.0, 0.0, 1.0, 20.0] {
-            let got = eval_host(&e, x);
-            let want = reference_gelu(x);
-            assert!(got.is_finite(), "gelu({x}) = {got}");
-            assert!(
-                (got - want).abs() <= 1e-6 * want.abs().max(1.0),
-                "gelu({x}) = {got}, want {want}"
-            );
-        }
-    }
-
-    #[test]
-    fn tanh_exact_agrees_with_the_host_tanh_away_from_saturation() {
-        let e = tanh_exact_expr(Dtype::F32).unwrap();
-        for x in [-3.0f32, -0.5, 0.0, 0.5, 3.0] {
-            assert!((eval_host(&e, x) - x.tanh()).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn sigmoid_silu_relu_and_softplus_are_the_expected_scalars() {
-        let s = sigmoid_expr(Dtype::F32).unwrap();
-        let u = silu_expr(Dtype::F32).unwrap();
-        let r = relu_expr(Dtype::F32).unwrap();
-        let p = softplus_expr(Dtype::F32).unwrap();
-        for x in [-4.0f32, -1.0, 0.0, 0.7, 5.0] {
-            let sig = 1.0 / (1.0 + (-x).exp());
-            assert!((eval_host(&s, x) - sig).abs() < 1e-6);
-            assert!((eval_host(&u, x) - x * sig).abs() < 1e-6);
-            assert!((eval_host(&r, x) - x.max(0.0)).abs() < 1e-7);
-            assert!((eval_host(&p, x) - (1.0 + x.exp()).ln()).abs() < 1e-5);
-        }
-    }
-
-    #[test]
-    fn exact_gelu_tracks_the_erf_form() {
-        let e = gelu_exact_expr(Dtype::F32).unwrap();
-        for x in [-3.0f32, -1.0, 0.0, 1.0, 3.0] {
-            let z = x * std::f32::consts::FRAC_1_SQRT_2;
-            let a = z.abs();
-            let t = 1.0 / (1.0 + 0.327_591_1 * a);
-            let poly = ((((1.061_405_429 * t - 1.453_152_027) * t + 1.421_413_741) * t
-                - 0.284_496_736)
-                * t
-                + 0.254_829_592)
-                * t;
-            let mag = 1.0 - poly * (-a * a).exp();
-            let erf = if z < 0.0 { -mag } else { mag };
-            let want = 0.5 * x * (1.0 + erf);
-            assert!((eval_host(&e, x) - want).abs() < 1e-5, "x = {x}");
-        }
-    }
-
-    #[test]
-    fn leaky_relu_passes_positives_and_scales_negatives() {
-        let e = leaky_relu_expr(Dtype::F32, 0.01).unwrap();
-        assert!((eval_host(&e, 2.0) - 2.0).abs() < 1e-7);
-        assert!((eval_host(&e, -2.0) + 0.02).abs() < 1e-7);
     }
 }

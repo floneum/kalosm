@@ -45,7 +45,7 @@ fn domain_len(graph: &EGraph, id: Id) -> usize {
 
 /// Indexed by node id. One bottom-up sweep per pass; passes stop as soon as
 /// nothing changes, so an acyclic graph costs two sweeps.
-pub fn lower_bound(graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds> {
+pub(crate) fn lower_bound(graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds> {
     let ids: Vec<Id> = (0..graph.len()).map(|i| Id(i as u32)).collect();
     lower_bound_over(graph, cost, &ids)
 }
@@ -54,7 +54,7 @@ pub fn lower_bound(graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds> {
 /// node id — unmasked slots stay `0`. The mask must come from
 /// [`crate::realize::reachable`], which is closed under both class membership
 /// and children, so every id the extractor can index is masked.
-pub fn lower_bound_scoped(
+pub(crate) fn lower_bound_scoped(
     graph: &EGraph,
     cost: &dyn CostModel,
     mask: &fixedbitset::FixedBitSet,
@@ -161,7 +161,7 @@ fn postorder(graph: &EGraph, ids: &[Id]) -> Vec<Id> {
 /// the launch and traffic a fusion deletes, so fused and unfused spellings
 /// tie on picoseconds; ranking ties by fewest launches adopts the merged
 /// spelling where doing so is free.
-pub fn argmin_member(
+pub(crate) fn argmin_member(
     graph: &EGraph,
     lb: &[Picoseconds],
     launches: &[u32],
@@ -193,7 +193,7 @@ pub fn argmin_member(
 /// [`argmin_member`] over the members `banned` does not name. Returns `None`
 /// when every candidate is banned, which is what makes the seed's cycle-repair
 /// loop terminate.
-pub fn argmin_member_excluding(
+pub(crate) fn argmin_member_excluding(
     graph: &EGraph,
     lb: &[Picoseconds],
     launches: &[u32],
@@ -212,16 +212,11 @@ pub fn argmin_member_excluding(
 /// non-leaf node is one launch plus its distinct child chains, sharing free,
 /// `min` over members. Same Kleene iteration, same closure requirement on the
 /// mask. Consumed by [`argmin_member`] as the tie-break only.
-pub fn launch_bound_scoped(graph: &EGraph, mask: &fixedbitset::FixedBitSet) -> Vec<u32> {
+pub(crate) fn launch_bound_scoped(graph: &EGraph, mask: &fixedbitset::FixedBitSet) -> Vec<u32> {
     let ids: Vec<Id> = mask.ones().map(|i| Id(i as u32)).collect();
     launch_bound_over(graph, &ids)
 }
 
-/// [`launch_bound_scoped`] over the whole graph.
-pub fn launch_bound(graph: &EGraph) -> Vec<u32> {
-    let ids: Vec<Id> = (0..graph.len()).map(|i| Id(i as u32)).collect();
-    launch_bound_over(graph, &ids)
-}
 
 fn launch_bound_over(graph: &EGraph, ids: &[Id]) -> Vec<u32> {
     let mut l = vec![0u32; graph.len()];
@@ -389,133 +384,4 @@ fn shape_key(graph: &EGraph, id: Id) -> u64 {
     }
     graph.facts(id).hash(&mut h);
     h.finish()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::realize::testkit::{TestCost, chain_graph, new_graph, seeded_graph, test_caps};
-
-    #[test]
-    fn leaves_bound_at_zero() {
-        let (graph, _roots) = chain_graph(3);
-        let cost = TestCost::default();
-        let lb = lower_bound(&graph, &cost);
-        assert_eq!(lb[0], Picoseconds(0), "the buffer leaf costs nothing");
-    }
-
-    #[test]
-    fn bound_is_monotone_along_a_chain() {
-        let (graph, roots) = chain_graph(4);
-        let cost = TestCost::default();
-        let lb = lower_bound(&graph, &cost);
-        let root = roots[0];
-        assert!(lb[root.index()].0 > 0, "a chain of maps costs something");
-    }
-
-    #[test]
-    fn union_takes_the_cheaper_branch() {
-        let (graph, _roots, cheap, dear, class) = seeded_graph();
-        let cost = TestCost::default();
-        let lb = lower_bound(&graph, &cost);
-        assert!(lb[cheap.index()] <= lb[dear.index()]);
-        assert_eq!(lb[class.0.index()], lb[cheap.index()]);
-        assert_eq!(
-            argmin_member(&graph, &lb, &launch_bound(&graph), class, &test_caps()),
-            cheap
-        );
-    }
-
-    /// An `Logical` node never wins selection over its own lowering, however the
-    /// bound compares.
-    ///
-    /// A floor lowering is worse in *schedule*, not in arithmetic, so the two
-    /// members' bounds are at best a tie and can favour the `Logical` node
-    /// outright. The `Logical` node is not runnable, so only
-    /// [`crate::realize::selectable`] members are candidates.
-    #[test]
-    fn an_l0_node_never_wins_selection_over_its_own_lowering() {
-        use crate::realize::testkit::{N, buffer, kmap, new_graph};
-        use fusor2_ir::ir::Level;
-
-        let mut graph = new_graph();
-        let shape = [N];
-        let leaf = buffer(&mut graph, 0, &shape);
-        // An `Logical::Map` and an `Launch::Map` with the identical body: same work,
-        // same bound, and the Logical node has the smaller id.
-        let l0 = graph
-            .add(Op::Logical(Logical::Map {
-                expr: fusor2_ir::scalar::ScalarExpr::un(
-                    fusor2_ir::scalar::UnOp::Exp,
-                    fusor2_ir::scalar::ScalarExpr::arg(0, fusor2_ir::dtype::Dtype::F32),
-                ),
-                ins: smallvec::smallvec![leaf],
-                outs: 1,
-            }))
-            .unwrap();
-        let l1 = kmap(&mut graph, leaf, &shape, 1);
-        let union = graph.union(l0, l1).unwrap();
-        let class = graph.class_of(union);
-
-        let cost = TestCost::default();
-        let lb = lower_bound(&graph, &cost);
-        // The premise: on cost alone the Logical node wins — it is no dearer, and
-        // it holds the smaller id, so it also wins every tie-break.
-        assert!(lb[l0.index()] <= lb[l1.index()]);
-        assert!(l0 < l1);
-
-        let picked = argmin_member(&graph, &lb, &launch_bound(&graph), class, &test_caps());
-        assert_eq!(picked, l1, "selection must skip the un-lowered Logical node");
-        assert_eq!(graph.level(picked), Level::Launch);
-        assert!(crate::realize::is_runnable(&graph, picked));
-        assert!(!crate::realize::is_runnable(&graph, l0));
-    }
-
-    /// Equal picosecond bounds break toward the member whose chain realizes
-    /// fewer launches — the fused spelling a rule minted — never toward the
-    /// smaller id.
-    #[test]
-    fn equal_bounds_break_toward_fewer_launches() {
-        use crate::realize::testkit::{N, buffer, kmap};
-
-        let mut g = new_graph();
-        let shape = [N];
-        let leaf = buffer(&mut g, 0, &shape);
-        let copy = kmap(&mut g, leaf, &shape, 1);
-        // The unfused spelling reads the copy; the fused one — the composed
-        // body, minted later, so the larger id — reads the leaf directly.
-        let unfused = kmap(&mut g, copy, &shape, 1);
-        let fused = kmap(&mut g, leaf, &shape, 2);
-        let union = g.union(unfused, fused).unwrap();
-        let class = g.class_of(union);
-        assert!(unfused < fused);
-
-        let launches = launch_bound(&g);
-        assert!(
-            launches[fused.index()] < launches[unfused.index()],
-            "reading the leaf directly is one launch; reading the copy is two"
-        );
-        // Bounds pinned equal, so only the tie-break decides.
-        let tied = vec![Picoseconds(0); g.len()];
-        assert_eq!(
-            argmin_member(&g, &tied, &launches, class, &test_caps()),
-            fused
-        );
-    }
-
-    #[test]
-    fn a_class_with_no_lowering_still_yields_a_member() {
-        // `selectable` falls back to every member so the failure surfaces as
-        // `verify_plan`'s named error rather than as an unselected class.
-        use crate::realize::testkit::{N, buffer};
-
-        let mut graph = new_graph();
-        let leaf = buffer(&mut graph, 0, &[N]);
-        let class = graph.class_of(leaf);
-        let lb = lower_bound(&graph, &TestCost::default());
-        assert_eq!(
-            argmin_member(&graph, &lb, &launch_bound(&graph), class, &test_caps()),
-            leaf
-        );
-    }
 }

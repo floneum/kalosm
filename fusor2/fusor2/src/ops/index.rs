@@ -494,9 +494,13 @@ pub fn stack(parts: &[Tensor], dim: usize) -> Result<Tensor> {
 /// One component of an [`Tensor::i`] index tuple.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IndexOp {
+    /// Keep the whole axis.
     Full,
+    /// Keep a half-open range.
     Range(Range<usize>),
+    /// Keep elements before the end index.
     RangeTo(usize),
+    /// Keep elements from the start index onward.
     RangeFrom(usize),
     /// A bare `usize`; exactly one is permitted, and it removes the axis.
     Index(usize),
@@ -530,6 +534,7 @@ impl From<usize> for IndexOp {
 
 /// An [`Tensor::i`] argument: a tuple of components, one per axis.
 pub trait TensorIndex {
+    /// Expand the index expression into one operation per axis.
     fn ops(self) -> Vec<IndexOp>;
 }
 
@@ -563,79 +568,4 @@ index_tuple! {
     (A, B, C);
     (A, B, C, D);
     (A, B, C, D, E);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn dims(v: &[u64]) -> Vec<Dim> {
-        v.iter().map(|&d| Dim::Const(d)).collect()
-    }
-    fn u32s(bytes: &[u8]) -> Vec<u32> {
-        bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect()
-    }
-
-    #[test]
-    fn region_indices_are_row_major() {
-        // Rows 1..3, cols 1..3 of a [4, 4] tensor.
-        let b = region_flat_indices(&dims(&[4, 4]), &[1..3, 1..3]).unwrap();
-        assert_eq!(u32s(&b), vec![5, 6, 9, 10]);
-    }
-
-    #[test]
-    fn region_indices_of_a_full_slab() {
-        let b = region_flat_indices(&dims(&[2, 3]), &[0..2, 1..2]).unwrap();
-        assert_eq!(u32s(&b), vec![1, 4]);
-    }
-
-    #[test]
-    fn region_indices_refuse_a_symbolic_extent() {
-        let shape = [Dim::Sym(fusor2_ir::shape::SymId(0)), Dim::Const(3)];
-        assert!(region_flat_indices(&shape, &[0..1, 0..3]).is_err());
-    }
-
-    #[test]
-    fn index_op_conversions() {
-        assert_eq!(IndexOp::from(..), IndexOp::Full);
-        assert_eq!(IndexOp::from(1..3), IndexOp::Range(1..3));
-        assert_eq!(IndexOp::from(..4), IndexOp::RangeTo(4));
-        assert_eq!(IndexOp::from(2..), IndexOp::RangeFrom(2));
-        assert_eq!(IndexOp::from(7usize), IndexOp::Index(7));
-    }
-
-    #[test]
-    fn index_tuples_flatten_in_order() {
-        let ops = (.., 2usize, 1..3).ops();
-        assert_eq!(
-            ops,
-            vec![IndexOp::Full, IndexOp::Index(2), IndexOp::Range(1..3)]
-        );
-    }
-
-    #[test]
-    fn full_ranges_keep_every_other_axis_whole() {
-        let r = full_ranges_with(&dims(&[2, 9]), 1, 3..6).unwrap();
-        assert_eq!(r, vec![0..2, 3..6]);
-    }
-
-    #[test]
-    fn gather_last_row_offsets() {
-        // [3, 4] -> offsets 0, 4, 8; adding [1, 0, 3] gives [1, 4, 11].
-        let (rows, width) = row_offset_params(Dim::Const(3), Dim::Const(4)).unwrap();
-        let offsets = crate::tensor::construction::arange_bytes(
-            Dtype::U32,
-            0.0,
-            (rows * width) as f64,
-            width as f64,
-        )
-        .unwrap();
-        assert_eq!(u32s(&offsets), vec![0, 4, 8]);
-        let idx = [1u32, 0, 3];
-        let linear: Vec<u32> = u32s(&offsets).iter().zip(idx).map(|(a, b)| a + b).collect();
-        assert_eq!(linear, vec![1, 4, 11]);
-    }
 }

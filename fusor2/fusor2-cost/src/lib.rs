@@ -9,17 +9,19 @@
 //! Precision is **not** a cost term — it is a verifier property
 //! (`NumericContract`), because a time-only model eliminates f32 everywhere.
 
+#![warn(unreachable_pub)]
+
 pub mod tune_cache;
 pub mod extract;
 pub mod facts;
-pub mod lower_bound;
-pub mod model;
-pub mod moves;
+mod lower_bound;
+mod model;
+mod moves;
 pub mod plan;
 pub mod realize;
 pub mod replay;
-pub mod terms;
-pub mod verify_plan;
+mod terms;
+mod verify_plan;
 
 pub use extract::LocalSearch;
 pub use model::Roofline;

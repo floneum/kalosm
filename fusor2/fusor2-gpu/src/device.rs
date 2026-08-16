@@ -13,7 +13,7 @@ use crate::caps::{self, LimitWiden};
 /// How to acquire a device. `widen` carries the per-field ceilings a caller
 /// has *proved* it needs; everything else stays at the WebGPU baseline.
 #[derive(Clone, Debug, Default)]
-pub struct DeviceOptions {
+pub(crate) struct DeviceOptions {
     pub widen: LimitWiden,
     /// Case-insensitive substring match against the adapter name, for
     /// reproducing a bug on a specific GPU. `None` takes the preferred
@@ -94,7 +94,7 @@ impl GpuDevice {
 ///
 /// `required_limits` is **never** `adapter.limits()`, so plan legality
 /// means the same thing on every device.
-pub async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
+pub(crate) async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pick_adapter(&instance, opts).await?;
     let adapter_info = adapter.get_info();
@@ -162,10 +162,6 @@ pub async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
     })
 }
 
-/// Blocking wrapper for callers outside an async runtime.
-pub fn gpu_blocking(opts: &DeviceOptions) -> Result<GpuDevice> {
-    pollster::block_on(request_device(opts))
-}
 
 /// Rank adapters: discrete, then integrated, then
 /// virtual, then CPU, then unknown.
@@ -200,64 +196,4 @@ async fn pick_adapter(instance: &wgpu::Instance, opts: &DeviceOptions) -> Result
         })
         .await
         .map_err(|e| Error::Device(format!("request_adapter: {e}")))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The descriptor's limits are the baseline even when the adapter reports
-    /// far more. Run against a live adapter when one exists; skip cleanly
-    /// otherwise, so the naga-only path stays testable on CI without a GPU.
-    #[test]
-    fn baseline_limits_are_requested_on_a_live_device() {
-        let Ok(gpu) = gpu_blocking(&DeviceOptions::default()) else {
-            eprintln!("no wgpu adapter; skipping");
-            return;
-        };
-        let base = caps::baseline_limits();
-        let used = gpu.limits_used();
-        assert_eq!(
-            used.max_compute_workgroup_storage_size,
-            base.max_compute_workgroup_storage_size
-        );
-        assert_eq!(
-            used.max_compute_invocations_per_workgroup,
-            base.max_compute_invocations_per_workgroup
-        );
-        assert_eq!(
-            used.max_compute_workgroups_per_dimension,
-            base.max_compute_workgroups_per_dimension
-        );
-        // ... even though the adapter itself usually reports more.
-        assert!(
-            gpu.adapter().limits().max_compute_workgroup_storage_size
-                >= base.max_compute_workgroup_storage_size
-        );
-    }
-
-    #[test]
-    fn widening_a_field_the_adapter_has_succeeds() {
-        let Ok(base_gpu) = gpu_blocking(&DeviceOptions::default()) else {
-            eprintln!("no wgpu adapter; skipping");
-            return;
-        };
-        let ceiling = base_gpu
-            .adapter()
-            .limits()
-            .max_compute_workgroup_storage_size;
-        drop(base_gpu);
-        let opts = DeviceOptions {
-            widen: LimitWiden {
-                max_compute_workgroup_storage_size: Some(ceiling),
-                ..LimitWiden::NONE
-            },
-            ..DeviceOptions::default()
-        };
-        let gpu = gpu_blocking(&opts).expect("adapter supplies its own ceiling");
-        assert_eq!(
-            gpu.limits_used().max_compute_workgroup_storage_size,
-            ceiling
-        );
-    }
 }

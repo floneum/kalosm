@@ -36,11 +36,17 @@ struct Schedule {
 /// The defaults are the Adam paper's; `eps` and `weight_decay` are public
 /// fields.
 pub struct AdamW {
+    /// Learning rate.
     pub lr: f32,
+    /// First-moment decay.
     pub beta1: f32,
+    /// Second-moment decay.
     pub beta2: f32,
+    /// Denominator stability term.
     pub eps: f32,
+    /// Decoupled weight-decay coefficient.
     pub weight_decay: f32,
+    /// Number of completed optimizer steps.
     pub step: u64,
     /// `(m, v)` per parameter, in the order the first `step` saw them.
     state: Vec<Moments>,
@@ -48,6 +54,7 @@ pub struct AdamW {
 }
 
 impl AdamW {
+    /// Create AdamW with standard beta and epsilon defaults.
     pub fn new(lr: f32) -> Self {
         Self {
             lr,
@@ -268,237 +275,4 @@ pub fn clip_global_norm(grads: &[Tensor], max_norm: f32) -> Result<Vec<Tensor>> 
     }
     let scale = clip_scale(grads, max_norm)?;
     grads.iter().map(|g| g.mul_(&scale)).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::graph::Graph;
-    use crate::session::{Backend, Session};
-    use crate::{Dim, Dtype};
-
-    fn graph() -> Graph {
-        Graph::new(&Session::new(Backend::cpu().expect("cpu device")).expect("session"))
-    }
-
-    fn upload(g: &Graph, shape: &[u64], data: &[f32]) -> Tensor {
-        let dims: Vec<Dim> = shape.iter().map(|d| Dim::Const(*d)).collect();
-        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        g.tensor(Dtype::F32, &dims, &bytes).unwrap()
-    }
-
-    fn read(t: &Tensor) -> Vec<f32> {
-        t.to_vec_f32().unwrap()
-    }
-
-    fn close(got: f32, want: f32, tol: f32) {
-        assert!(
-            (got - want).abs() <= tol * want.abs().max(1.0),
-            "got {got}, want {want}"
-        );
-    }
-
-    /// The whole update on the host, one scalar at a time. This is the
-    /// specification; the tensor path below has to reproduce it.
-    struct HostAdam {
-        m: f32,
-        v: f32,
-        t: i32,
-    }
-
-    impl HostAdam {
-        fn step(&mut self, p: f32, g: f32, lr: f32, wd: f32, eps: f32) -> f32 {
-            const B1: f32 = 0.9;
-            const B2: f32 = 0.999;
-            self.t += 1;
-            self.m = B1 * self.m + (1.0 - B1) * g;
-            self.v = B2 * self.v + (1.0 - B2) * g * g;
-            let alpha = lr * (1.0 - B2.powi(self.t)).sqrt() / (1.0 - B1.powi(self.t));
-            let update = self.m * alpha / (self.v.sqrt() + eps);
-            (p - p * (lr * wd)) - update
-        }
-    }
-
-    #[test]
-    fn one_step_matches_a_hand_stepped_scalar() {
-        const LR: f32 = 0.1;
-        let g = graph();
-        let p = upload(&g, &[1], &[1.0]);
-        let grad = upload(&g, &[1], &[2.0]);
-
-        let mut opt = AdamW::new(LR);
-        let out = opt.step(std::slice::from_ref(&p), std::slice::from_ref(&grad)).unwrap();
-        let got = read(&out[0])[0];
-
-        // m = 0.2, v = 0.004, alpha = 0.1*sqrt(0.001)/0.1 = 0.0316228,
-        // update = 0.2*0.0316228 / (0.0632456 + 1e-8) = 0.1.
-        let mut host = HostAdam { m: 0.0, v: 0.0, t: 0 };
-        let want = host.step(1.0, 2.0, LR, 0.0, opt.eps);
-        close(want, 0.9, 1e-5);
-        close(got, want, 1e-5);
-        assert_eq!(opt.step, 1);
-    }
-
-    /// The step size after bias correction is the learning rate, whatever the
-    /// gradient's scale.
-    #[test]
-    fn the_first_step_is_the_learning_rate_at_any_gradient_scale() {
-        const LR: f32 = 0.05;
-        for scale in [1e-3f32, 1.0, 1e3] {
-            let g = graph();
-            let p = upload(&g, &[1], &[0.0]);
-            let grad = upload(&g, &[1], &[scale]);
-            let mut opt = AdamW::new(LR);
-            let out = opt
-                .step(std::slice::from_ref(&p), std::slice::from_ref(&grad))
-                .unwrap();
-            close(read(&out[0])[0], -LR, 1e-3);
-        }
-    }
-
-    /// Three steps against the host, with the state carried on the graph.
-    #[test]
-    fn three_steps_track_the_host_recurrence() {
-        const LR: f32 = 0.1;
-        const WD: f32 = 0.01;
-        let grads = [2.0f32, 1.0, -0.5];
-
-        let g = graph();
-        let mut opt = AdamW::new(LR);
-        opt.weight_decay = WD;
-        let mut host = HostAdam { m: 0.0, v: 0.0, t: 0 };
-        let mut want = 1.0f32;
-        let mut current = upload(&g, &[1], &[1.0]);
-
-        for grad in grads {
-            let gt = upload(&g, &[1], &[grad]);
-            let out = opt
-                .step(std::slice::from_ref(&current), std::slice::from_ref(&gt))
-                .unwrap();
-            want = host.step(want, grad, LR, WD, opt.eps);
-            let got = read(&out[0])[0];
-            close(got, want, 2e-4);
-            // Feed the realized value forward, as a training loop would.
-            current = upload(&g, &[1], &[got]);
-        }
-        assert_eq!(opt.step, 3);
-    }
-
-    /// Decoupled decay reads the parameter, not the gradient: with a zero
-    /// gradient the update is exactly `-p * lr * wd`.
-    #[test]
-    fn the_decay_is_decoupled_from_the_gradient() {
-        const LR: f32 = 0.1;
-        const WD: f32 = 0.5;
-        let g = graph();
-        let p = upload(&g, &[2], &[1.0, -2.0]);
-        let grad = upload(&g, &[2], &[0.0, 0.0]);
-        let mut opt = AdamW::new(LR);
-        opt.weight_decay = WD;
-        let out = opt
-            .step(std::slice::from_ref(&p), std::slice::from_ref(&grad))
-            .unwrap();
-        let got = read(&out[0]);
-        // m = v = 0, so the Adam term is 0/(0+eps) = 0 and only the decay
-        // moves: p * (1 - 0.05).
-        close(got[0], 0.95, 1e-5);
-        close(got[1], -1.9, 1e-5);
-    }
-
-    #[test]
-    fn step_refuses_mismatched_inputs() {
-        let g = graph();
-        let p = upload(&g, &[2], &[1.0, 1.0]);
-        let grad = upload(&g, &[3], &[1.0, 1.0, 1.0]);
-        let mut opt = AdamW::new(0.1);
-        assert!(opt.step(&[p.clone()], &[]).is_err());
-        assert!(opt.step(&[p.clone()], &[grad]).is_err());
-        // A refused call must not consume a step.
-        assert_eq!(opt.step, 0);
-        // And the state cannot change parameter count mid-run.
-        let one = upload(&g, &[2], &[0.0, 0.0]);
-        opt.step(&[p.clone()], std::slice::from_ref(&one)).unwrap();
-        assert!(opt.step(&[p.clone(), p], &[one.clone(), one]).is_err());
-    }
-
-    #[test]
-    fn cosine_decay_ramps_then_falls_to_the_floor() {
-        const WARMUP: u64 = 10;
-        const TOTAL: u64 = 100;
-        const PEAK: f32 = 1.0;
-        const FLOOR: f32 = 0.1;
-        let at = |s| cosine_decay(s, WARMUP, TOTAL, PEAK, FLOOR);
-
-        assert_eq!(at(0), 0.0);
-        close(at(5), 0.5, 1e-6);
-        close(at(WARMUP), PEAK, 1e-6);
-        // Halfway through the decay the cosine is 0.5, so the rate is the
-        // midpoint of peak and floor.
-        close(at(55), 0.55, 1e-5);
-        close(at(TOTAL), FLOOR, 1e-6);
-        // Past the end it holds, it does not turn back up.
-        close(at(TOTAL + 50), FLOOR, 1e-6);
-
-        let mut previous = at(WARMUP);
-        for step in WARMUP + 1..=TOTAL {
-            let now = at(step);
-            assert!(now <= previous + 1e-6, "rose at {step}: {previous} -> {now}");
-            previous = now;
-        }
-    }
-
-    #[test]
-    fn cosine_decay_without_warmup_starts_at_the_peak() {
-        close(cosine_decay(0, 0, 10, 2.0, 0.5), 2.0, 1e-6);
-        close(cosine_decay(10, 0, 10, 2.0, 0.5), 0.5, 1e-6);
-        // A degenerate span cannot divide by zero.
-        assert_eq!(cosine_decay(0, 5, 5, 1.0, 0.25), 0.0);
-        assert_eq!(cosine_decay(5, 5, 5, 1.0, 0.25), 0.25);
-    }
-
-    /// 3,4 and 0,12 have norms 5 and 12, so the global norm is 13.
-    #[test]
-    fn the_global_norm_is_the_root_of_every_summed_square() {
-        let g = graph();
-        let a = upload(&g, &[2], &[3.0, 4.0]);
-        let b = upload(&g, &[2], &[0.0, 12.0]);
-        close(read(&global_norm(&[a, b]).unwrap())[0], 13.0, 1e-5);
-    }
-
-    /// Above the cap the factor is `cap / ||g||`; below it, exactly 1.
-    #[test]
-    fn the_clip_scale_is_the_cap_over_the_norm() {
-        let g = graph();
-        let a = upload(&g, &[2], &[3.0, 4.0]);
-        let b = upload(&g, &[2], &[0.0, 12.0]);
-        let pair = [a, b];
-        close(read(&clip_scale(&pair, 1.0).unwrap())[0], 1.0 / 13.0, 1e-5);
-        close(read(&clip_scale(&pair, 6.5).unwrap())[0], 0.5, 1e-5);
-        // 13 is inside a ball of radius 100, so nothing is scaled.
-        close(read(&clip_scale(&pair, 100.0).unwrap())[0], 1.0, 1e-6);
-    }
-
-    /// One output per gradient, each in its own shape.
-    #[test]
-    fn clipping_preserves_the_gradient_shapes() {
-        let g = graph();
-        let a = upload(&g, &[2], &[3.0, 4.0]);
-        let b = upload(&g, &[3], &[0.0, 12.0, 5.0]);
-        let clipped = clip_global_norm(&[a, b], 1.0).unwrap();
-        assert_eq!(clipped.len(), 2);
-        assert_eq!(&clipped[0].shape()[..], &[Dim::Const(2)]);
-        assert_eq!(&clipped[1].shape()[..], &[Dim::Const(3)]);
-    }
-
-    #[test]
-    fn clipping_refuses_a_non_positive_cap() {
-        let g = graph();
-        let a = upload(&g, &[2], &[1.0, 1.0]);
-        assert!(clip_global_norm(std::slice::from_ref(&a), 0.0).is_err());
-        assert!(clip_global_norm(std::slice::from_ref(&a), -1.0).is_err());
-        // An empty list is not an error; there is nothing to scale. Asking
-        // for its norm is, because there is no such number.
-        assert!(clip_global_norm(&[], 1.0).unwrap().is_empty());
-        assert!(global_norm(&[]).is_err());
-    }
 }

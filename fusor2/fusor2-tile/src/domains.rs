@@ -1,6 +1,6 @@
 //! Schedule-domain generators. Each `legal` *generates* the complete legal
 //! parameter space of one node under one `Caps`, filtered by structural
-//! predicates and the exact [`crate::arena`] footprint.
+//! predicates and the exact `arena` footprint.
 
 pub mod coop;
 pub mod fold;
@@ -15,7 +15,7 @@ pub use sgemm::legal as sgemm_legal;
 pub use sgemv::legal as sgemv_legal;
 
 pub use coop::{coop_domain, coop_tiles, stage_element};
-pub use fold::{emitted_block, fold_blocks, fold_domain, fold_domain_for};
+pub use fold::{emitted_block, fold_domain, fold_domain_for};
 pub use map::map_domain;
 pub use sgemm::sgemm_domain;
 pub use sgemv::sgemv_domain;
@@ -122,65 +122,3 @@ pub(crate) fn map_order(t: &MapTiling) -> (u32, u32, u32) {
 pub fn default_planner() -> &'static dyn ArenaPlanner {
     crate::Planner::global()
 }
-
-#[cfg(test)]
-pub(crate) mod testing {
-    //! Shared `Caps` fixtures for the domain and rule tests.
-
-    use fusor2_ir::device::{Caps, CoopKind, DeviceKind, Limits, SubgroupWidths};
-    use fusor2_ir::dtype::Dtype;
-    use smallvec::smallvec;
-
-    /// WebGPU baseline limits, subgroups fixed at 32, f32 coop available.
-    pub fn baseline_caps() -> Caps {
-        Caps {
-            kind: DeviceKind::Gpu,
-            name: "baseline".into(),
-            limits: Limits::default(),
-            subgroups: Some(SubgroupWidths { min: 32, max: 32 }),
-            f16: true,
-            bf16: false,
-            coop: smallvec![
-                CoopKind {
-                    operand: Dtype::F32,
-                    acc: Dtype::F32,
-                    m: 8,
-                    n: 8,
-                    k: 8
-                },
-                CoopKind {
-                    operand: Dtype::F16,
-                    acc: Dtype::F16,
-                    m: 8,
-                    n: 8,
-                    k: 8
-                },
-            ],
-            atomic_f32: true,
-            workgroup_alias: false,
-            mixed_precision_coop_store: false,
-            pipeline_cache: false,
-            timestamp_query: false,
-            simd_widths: smallvec![1],
-            threads: 1,
-        }
-    }
-
-    /// Apple-class: 32 KiB threadgroup memory, 1024 lanes, subgroup 32.
-    pub fn apple_caps() -> Caps {
-        let mut caps = baseline_caps();
-        caps.name = "Apple M2 Max".into();
-        caps.limits.max_compute_invocations_per_workgroup = 1024;
-        caps.limits.max_compute_workgroup_size = [1024, 1024, 64];
-        caps.limits.max_compute_workgroup_storage_size = 32768;
-        caps
-    }
-
-    /// Apple-class with no cooperative-matrix configurations at all.
-    pub fn no_coop_caps() -> Caps {
-        let mut caps = apple_caps();
-        caps.coop = smallvec![];
-        caps
-    }
-}
-

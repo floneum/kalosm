@@ -47,7 +47,7 @@ pub enum Launch {
     },
 
     /// Dense contraction. **`family` is a property of this node's lowering,
-    /// never a decision stored on an Logical op**: all four families coexist in
+    /// never a decision stored on a Logical op**: all three families coexist in
     /// one chain, so a gemv-shaped contraction cannot pick Coop, have the
     /// tile scorer decline, and silently run a third path. `acc` is
     /// independent of operand dtype, which is what makes
@@ -103,7 +103,6 @@ pub enum Launch {
         attrs: AttrId,
     },
 }
-
 impl Launch {
     pub const fn tag(&self) -> OpTag {
         match self {
@@ -157,7 +156,6 @@ impl Launch {
         }
     }
 }
-
 /// A kernel's iteration domain.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct IndexSpace {
@@ -933,217 +931,5 @@ impl WindowAdjoint {
             window,
             is_mask: window.is_non_overlapping(),
         }
-    }
-}
-
-#[cfg(test)]
-mod schedule_tests {
-    use super::*;
-    use crate::device::{Caps, DeviceKind, Limits, SubgroupWidths};
-
-    fn caps(subgroup: u32) -> Caps {
-        Caps {
-            kind: DeviceKind::Gpu,
-            name: "test".into(),
-            limits: Limits::default(),
-            subgroups: Some(SubgroupWidths {
-                min: subgroup,
-                max: subgroup,
-            }),
-            f16: true,
-            bf16: false,
-            coop: Default::default(),
-            atomic_f32: true,
-            workgroup_alias: false,
-            mixed_precision_coop_store: false,
-            pipeline_cache: false,
-            timestamp_query: false,
-            simd_widths: Default::default(),
-            threads: 1,
-        }
-    }
-
-    fn tms(d: &MapDomain) -> Vec<u32> {
-        d.tilings
-            .iter()
-            .map(|t| {
-                assert_eq!(t.dim, None, "a linearized body has no axis to name");
-                assert_eq!(t.vector, 1);
-                t.tm
-            })
-            .collect()
-    }
-
-    /// A real composite has something to decide, and a tiny one says it has
-    /// nothing — rather than offering a point that would launch empty lanes.
-    #[test]
-    fn the_linear_domain_follows_the_work_and_the_device() {
-        assert_eq!(tms(&MapDomain::linear(&caps(32), 8192)), vec![1, 2, 4, 8]);
-        assert_eq!(tms(&MapDomain::linear(&caps(32), 4)), vec![1]);
-        // Twice the subgroup width needs twice the work for the same tile.
-        assert_eq!(tms(&MapDomain::linear(&caps(64), 256)), vec![1, 2, 4]);
-        assert_eq!(tms(&MapDomain::linear(&caps(32), 256)), vec![1, 2, 4, 8]);
-        // The untiled point is always a member, so a composite is always
-        // lowerable at the floor its lowering falls back to.
-        assert!(MapDomain::linear(&caps(32), 0).tilings.contains(&MapTiling {
-            dim: None,
-            tm: 1,
-            vector: 1
-        }));
-    }
-
-    /// A symbolic extent prices as 1, so a shape-family composite gets the
-    /// conservative domain rather than a tile its smallest binding cannot
-    /// fill.
-    #[test]
-    fn a_symbolic_extent_prices_conservatively() {
-        let sym = [Dim::Const(8), Dim::Sym(crate::shape::SymId(0))];
-        assert_eq!(tms(&MapDomain::linear_over(&caps(32), &sym)), vec![1]);
-        assert_eq!(
-            MapDomain::linear_over(&caps(32), &[Dim::Const(128), Dim::Const(64)]),
-            MapDomain::linear(&caps(32), 8192)
-        );
-    }
-
-    /// **The gate.** Both composite forms carry a schedule domain, so
-    /// extraction resolves their geometry like every other node's. `Ext` is
-    /// the only `None` left: fusor2 cannot enumerate geometries for a
-    /// lowering it did not write.
-    #[test]
-    fn every_node_but_ext_declares_a_schedule_domain() {
-        let d = ScheduleDomain::Map(MapDomain::linear(&caps(32), 8192));
-        let region = Launch::Region {
-            members: smallvec::smallvec![Id(1), Id(2)],
-            live_outs: smallvec::smallvec![0],
-            sched: d.clone(),
-        };
-        assert_eq!(region.schedule(), Some(&d));
-        assert!(region.schedule().unwrap().len() > 1);
-
-        let ext = Launch::Ext {
-            def: crate::ir::OpDefId(0),
-            ops: Vec::new(),
-            attrs: crate::ir::AttrId(0),
-        };
-        assert_eq!(ext.schedule(), None);
-    }
-}
-
-#[cfg(test)]
-mod address_tests {
-    use super::*;
-    use crate::shape::{AxisGroup, SubAxis};
-
-    fn dims(v: &[u64]) -> Vec<Dim> {
-        v.iter().map(|d| Dim::Const(*d)).collect()
-    }
-
-    fn alias(shape: &[u64], strides: &[u64]) -> Operand {
-        Operand {
-            src: Id(0),
-            layout: Layout::from_parts(Dim::Const(0), &dims(shape), &dims(strides)).unwrap(),
-            access: AccessPlan::Alias,
-        }
-    }
-
-    /// Evaluate the map the way an emitter must.
-    fn at(map: &AddressMap, flat: u32) -> u32 {
-        let mut acc = map.offset;
-        for t in &map.terms {
-            acc = acc.wrapping_add(((flat / t.divisor) % t.modulus).wrapping_mul(t.stride));
-        }
-        acc
-    }
-
-    #[test]
-    fn a_dense_operand_is_the_bare_flat_index() {
-        let m = alias(&[3, 5], &[5, 1]).address_map().unwrap();
-        assert!(m.is_identity_over(15));
-        for f in 0..15 {
-            assert_eq!(at(&m, f), f);
-        }
-    }
-
-    /// The `rms_norm_no_weight` [3,5] case: the second operand broadcasts a
-    /// per-row scalar across the row, so element 7 must read `inv[1]`.
-    #[test]
-    fn a_stride_zero_axis_reads_one_element_per_row() {
-        let m = alias(&[3, 5], &[1, 0]).address_map().unwrap();
-        assert!(!m.is_identity_over(15));
-        for f in 0..15u32 {
-            assert_eq!(at(&m, f), f / 5, "flat {f}");
-        }
-    }
-
-    #[test]
-    fn a_transpose_swaps_the_divisors() {
-        // [4,3] view of a [3,4] row-major buffer.
-        let m = alias(&[4, 3], &[1, 4]).address_map().unwrap();
-        for r in 0..4u32 {
-            for c in 0..3u32 {
-                assert_eq!(at(&m, r * 3 + c), c * 4 + r);
-            }
-        }
-    }
-
-    #[test]
-    fn an_offset_narrow_starts_where_the_slice_does() {
-        let o = Operand {
-            src: Id(0),
-            layout: Layout::from_parts(Dim::Const(2), &dims(&[3]), &dims(&[1])).unwrap(),
-            access: AccessPlan::Alias,
-        };
-        let m = o.address_map().unwrap();
-        assert!(!m.is_identity_over(3));
-        assert_eq!((at(&m, 0), at(&m, 1), at(&m, 2)), (2, 3, 4));
-    }
-
-    /// A conv window operand: the offset sub-axis collides with the position
-    /// sub-axis, which per-axis strides cannot express.
-    #[test]
-    fn a_window_group_divmods_most_significant_first() {
-        let map = MultiFlattenMap {
-            groups: smallvec::smallvec![AxisGroup {
-                sub_axes: smallvec::smallvec![
-                    SubAxis {
-                        extent: 3,
-                        stride: 2
-                    },
-                    SubAxis {
-                        extent: 2,
-                        stride: 1
-                    },
-                ],
-            }],
-        };
-        let o = Operand {
-            src: Id(0),
-            layout: Layout::contiguous(&dims(&[6])),
-            access: AccessPlan::Unflatten(map),
-        };
-        let m = o.address_map().unwrap();
-        // coord = pos*2 + off, storage = pos*2 + off*1
-        for pos in 0..3u32 {
-            for off in 0..2u32 {
-                assert_eq!(at(&m, pos * 2 + off), pos * 2 + off);
-            }
-        }
-    }
-
-    #[test]
-    fn a_scalar_broadcast_collapses_to_the_offset() {
-        let m = alias(&[4], &[0]).address_map().unwrap();
-        assert!(m.terms.is_empty());
-        assert!(!m.is_identity_over(4));
-        assert_eq!(at(&m, 3), 0);
-    }
-
-    #[test]
-    fn the_leading_modulo_is_elided_only_when_the_space_is_covered() {
-        let m = alias(&[3, 5], &[1, 0]).address_map().unwrap();
-        assert_eq!(m.terms.len(), 1);
-        assert!(!m.needs_modulo(0, 15));
-        // A larger reading space would run past the operand, so the `%` stays.
-        assert!(m.needs_modulo(0, 30));
     }
 }

@@ -6,8 +6,10 @@
 //!
 //! The two things only the IR can own — total inference/verification for the
 //! closed `Logical`/`Launch` enums, and the shared rewrite-rule set with its saturation
-//! driver — live in [`semantics`], [`verify_l0`], [`verify_launch`], [`saturate`]
+//! driver — live in [`semantics`], [`verify_l0()`], [`verify_launch()`], [`saturate`]
 //! and [`rules`].
+
+#![warn(unreachable_pub)]
 
 pub mod error;
 
@@ -28,10 +30,10 @@ pub mod autograd;
 pub mod carrier;
 pub mod contract_spec;
 pub mod semantics;
-pub mod verify_l0;
+mod verify_l0;
 pub mod verify_launch;
 
-pub mod rule_macro;
+mod rule_macro;
 pub mod rules;
 pub mod saturate;
 

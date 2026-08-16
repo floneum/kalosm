@@ -1,4 +1,4 @@
-//! Reverse mode as an Logical -> Logical transform. Seven adjoint entries.
+//! Reverse mode as a Logical -> Logical transform. Seven adjoint entries.
 
 use crate::dtype::Dtype;
 use crate::egraph::Id;

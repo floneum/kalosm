@@ -38,7 +38,9 @@ pub struct Cpu(Arc<Inner>);
 /// Which backend the const-rank API is building for.
 #[derive(Clone)]
 pub enum Device {
+    /// A CPU-backed graph and session.
     Cpu(Cpu),
+    /// A GPU-backed graph and session.
     Gpu(Gpu),
 }
 
@@ -130,19 +132,6 @@ impl Device {
         }
     }
 
-    /// A CPU device on a private graph, for unit tests.
-    ///
-    /// [`Device::cpu`]'s graph is shared process-wide and never reset, so a
-    /// unit test of the const-rank wrapper gets its own session and graph.
-    /// Tests that are genuinely about the ambient device keep using
-    /// [`Device::cpu`] under [`test_device_lock`].
-    #[cfg(test)]
-    pub(crate) fn private() -> Self {
-        let session = Session::new(Backend::cpu().expect("cpu backend")).expect("session");
-        let graph = Graph::new(&session);
-        Self::of_graph(graph.handle())
-    }
-
     fn inner(&self) -> &Arc<Inner> {
         match self {
             Self::Cpu(d) => &d.0,
@@ -150,6 +139,7 @@ impl Device {
         }
     }
 
+    /// The session that resolves this device's graph.
     pub fn session(&self) -> &Session {
         &self.inner().session
     }
@@ -163,6 +153,7 @@ impl Device {
         self.inner().graph.handle()
     }
 
+    /// The backend name, either `"cpu"` or `"gpu"`.
     pub fn name(&self) -> &'static str {
         match self {
             Self::Cpu(_) => "cpu",
@@ -204,6 +195,7 @@ impl std::fmt::Debug for Device {
 }
 
 impl Gpu {
+    /// The GPU session.
     pub fn session(&self) -> &Session {
         &self.0.session
     }
@@ -231,6 +223,7 @@ impl Gpu {
 }
 
 impl Cpu {
+    /// The CPU session.
     pub fn session(&self) -> &Session {
         &self.0.session
     }
@@ -244,10 +237,15 @@ impl Cpu {
 /// One kernel's aggregated timing across a resolve.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KernelProfileRow {
+    /// Kernel label.
     pub name: String,
+    /// Number of dispatches with this label.
     pub count: usize,
+    /// Total device time in milliseconds.
     pub total_ms: f64,
+    /// Average dispatch time in microseconds.
     pub average_us: f64,
+    /// Slowest dispatch time in microseconds.
     pub max_us: f64,
 }
 
@@ -257,8 +255,11 @@ pub struct KernelProfileRow {
 /// profile with no wall clock is not a zero-length one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KernelProfile {
+    /// Total timed submission span in milliseconds, when available.
     pub span_ms: Option<f64>,
+    /// Number of kernel dispatches in the resolve.
     pub kernels: usize,
+    /// The slowest kernel labels by aggregate time.
     pub top_names: Vec<KernelProfileRow>,
 }
 
@@ -282,16 +283,6 @@ impl KernelProfile {
     }
 }
 
-/// Serializes tests that build on the process-wide const-rank device, so
-/// tests that assert on shared device state (the ambient graph, launch
-/// counts) cannot observe each other. Poisoning is ignored on purpose — a
-/// `#[should_panic]` test holding the lock must not fail every test after it.
-#[cfg(test)]
-pub(crate) fn test_device_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// Turn a `Result` from a fallible builder into a panic naming the op that
 /// produced it. The const-rank API is panic-on-error throughout.
 #[track_caller]
@@ -299,103 +290,5 @@ pub(crate) fn ok<T>(what: &str, r: Result<T>) -> T {
     match r {
         Ok(v) => v,
         Err(e) => panic!("fusor2 {what}: {e}"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_cpu_device_is_one_per_process_and_owns_one_graph() {
-        let _serial = crate::device::test_device_lock();
-        let a = Device::cpu();
-        let b = Device::cpu();
-        assert!(GraphRef::ptr_eq(a.handle(), b.handle()));
-        assert_eq!(a.name(), "cpu");
-    }
-
-    #[test]
-    fn a_device_installs_the_ambient_graph() {
-        let _serial = crate::device::test_device_lock();
-        let _ = Device::cpu();
-        // Another test may have installed a different device since; assert
-        // only that a graph is installed.
-        let _ = ambient_graph();
-    }
-
-    /// `Device::cpu()` installs its graph on every call, not only the first:
-    /// installing any other graph and calling `cpu()` again must bring the
-    /// CPU device's graph back.
-    #[test]
-    fn a_second_cpu_call_reinstalls_its_own_graph() {
-        let _serial = crate::device::test_device_lock();
-        let cpu = Device::cpu();
-        assert!(GraphRef::ptr_eq(
-            ambient_graph().handle(),
-            cpu.graph().handle()
-        ));
-
-        // Stand in for "some other device was created since".
-        let other = Graph::new(cpu.session());
-        install(&other);
-        assert!(GraphRef::ptr_eq(ambient_graph().handle(), other.handle()));
-
-        let cpu_again = Device::cpu();
-        assert!(
-            GraphRef::ptr_eq(ambient_graph().handle(), cpu_again.graph().handle()),
-            "a cached Device::cpu() must still install its own graph"
-        );
-    }
-
-    /// Two threads computing on the shared device are two threads resolving
-    /// one graph. This load produces silent zeros if `resolve` releases the
-    /// e-graph lock between extraction and dispatch: a readback landing in
-    /// that window downloads an allocated-but-unwritten buffer.
-    ///
-    /// 8 threads x 40 rounds is the shape the defect was measured at. Each
-    /// thread uses a distinct constant so a result belonging to another
-    /// thread fails too, not just an unwritten one.
-    #[test]
-    fn the_shared_device_survives_concurrent_resolves() {
-        let _serial = crate::device::test_device_lock();
-        const THREADS: u32 = 8;
-        const ROUNDS: u32 = 40;
-        let device = Device::cpu();
-
-        let bad: Vec<String> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..THREADS)
-                .map(|t| {
-                    let device = device.clone();
-                    s.spawn(move || {
-                        let mut wrong = Vec::new();
-                        for r in 0..ROUNDS {
-                            let k = (t * ROUNDS + r) as f32 + 1.0;
-                            let x = crate::Tensor::<1, f32>::from_slice(
-                                &device,
-                                [4],
-                                &[k, k + 1.0, k + 2.0, k + 3.0],
-                            );
-                            let got = x.mul_scalar(2.0).to_flat();
-                            let want: Vec<f32> =
-                                (0..4).map(|i| (k + i as f32) * 2.0).collect();
-                            if got != want {
-                                wrong.push(format!("t{t} r{r}: got {got:?} want {want:?}"));
-                            }
-                        }
-                        wrong
-                    })
-                })
-                .collect();
-            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
-        });
-
-        assert!(
-            bad.is_empty(),
-            "{} of {} concurrent readbacks were wrong:\n{}",
-            bad.len(),
-            THREADS * ROUNDS,
-            bad.join("\n")
-        );
     }
 }

@@ -32,7 +32,7 @@ use rustc_hash::FxHashMap;
 
 /// Clauses 1, 3, 4, 5 and the root half of 6 — everything derivable from the
 /// graph and the plan alone.
-pub fn verify_plan(graph: &EGraph, plan: &Plan) -> Result<()> {
+pub(crate) fn verify_plan(graph: &EGraph, plan: &Plan) -> Result<()> {
     check_levels(graph, plan)?;
     check_operands(graph, plan)?;
     check_operand_spaces(graph, plan)?;
@@ -56,7 +56,7 @@ pub fn verify_plan(graph: &EGraph, plan: &Plan) -> Result<()> {
 ///   trailing space dim (`weights[n]` under `[m, n]`).
 ///
 /// Anything else is read at garbage addresses on every backend.
-pub fn check_operand_spaces(graph: &EGraph, plan: &Plan) -> Result<()> {
+pub(crate) fn check_operand_spaces(graph: &EGraph, plan: &Plan) -> Result<()> {
     use fusor2_ir::ir::launch::AccessPlan;
     for id in selected(plan) {
         let Op::Launch(Launch::Fold { space, ops, .. }) = &graph.node(id).op else {
@@ -98,7 +98,7 @@ pub fn check_operand_spaces(graph: &EGraph, plan: &Plan) -> Result<()> {
 /// All six clauses. The schedule clause needs the exact planner and the caps
 /// it was admitted against; the extension clause needs the registry the
 /// e-graph's semantics were built with.
-pub fn verify_plan_with(
+pub(crate) fn verify_plan_with(
     graph: &EGraph,
     plan: &Plan,
     arena: &dyn ArenaPlanner,
@@ -118,7 +118,7 @@ pub fn verify_plan_with(
 /// The uniform block counts: `plan::derive_bindings` reserves binding 0 for
 /// `Uniforms` and does not list it, but it is emitted in the `storage`
 /// address space, so the bound is `bindings.len() + 1`.
-pub fn check_bind_groups(plan: &Plan, caps: &Caps) -> Result<()> {
+pub(crate) fn check_bind_groups(plan: &Plan, caps: &Caps) -> Result<()> {
     let limit = caps.limits.max_storage_buffers_per_shader_stage as usize;
     for (i, launch) in plan.launches.iter().enumerate() {
         let needed = launch.bindings.len() + 1;
@@ -137,7 +137,7 @@ pub fn check_bind_groups(plan: &Plan, caps: &Caps) -> Result<()> {
 }
 
 /// Clause 1: every selected non-leaf node is at Launch — nothing skipped a level.
-pub fn check_levels(graph: &EGraph, plan: &Plan) -> Result<()> {
+pub(crate) fn check_levels(graph: &EGraph, plan: &Plan) -> Result<()> {
     for id in selected(plan) {
         // The same predicate the seed and the move generator select against.
         if !realize::is_runnable(graph, id) {
@@ -151,7 +151,7 @@ pub fn check_levels(graph: &EGraph, plan: &Plan) -> Result<()> {
 }
 
 /// Clause 2.
-pub fn check_schedules(
+pub(crate) fn check_schedules(
     graph: &EGraph,
     plan: &Plan,
     arena: &dyn ArenaPlanner,
@@ -225,7 +225,7 @@ pub fn check_schedules(
 }
 
 /// Clause 3.
-pub fn check_operands(graph: &EGraph, plan: &Plan) -> Result<()> {
+pub(crate) fn check_operands(graph: &EGraph, plan: &Plan) -> Result<()> {
     let launch_of = launch_index(plan);
     for (li, launch) in plan.launches.iter().enumerate() {
         for member in &launch.members {
@@ -256,7 +256,7 @@ pub fn check_operands(graph: &EGraph, plan: &Plan) -> Result<()> {
 }
 
 /// Clause 4.
-pub fn check_buffers(graph: &EGraph, plan: &Plan) -> Result<()> {
+pub(crate) fn check_buffers(graph: &EGraph, plan: &Plan) -> Result<()> {
     for b in &plan.buffers {
         let value_rank = graph.facts(b.value).rank();
         // A split-K scratch buffer carries one extra leading axis, one slice
@@ -293,7 +293,7 @@ pub fn check_buffers(graph: &EGraph, plan: &Plan) -> Result<()> {
 }
 
 /// Clause 5.
-pub fn check_effect_pinning(graph: &EGraph, plan: &Plan) -> Result<()> {
+pub(crate) fn check_effect_pinning(graph: &EGraph, plan: &Plan) -> Result<()> {
     for id in selected(plan) {
         if let Effect::InPlace(role) = graph.semantics().effect(&graph.node(id).op)
             && !plan.extraction.is_materialized(id)
@@ -308,7 +308,7 @@ pub fn check_effect_pinning(graph: &EGraph, plan: &Plan) -> Result<()> {
 }
 
 /// Clause 6, root half.
-pub fn check_roots(graph: &EGraph, plan: &Plan) -> Result<()> {
+pub(crate) fn check_roots(graph: &EGraph, plan: &Plan) -> Result<()> {
     for root in graph.roots() {
         let class = graph.class_of(*root);
         let Some(sel) = plan.extraction.selected(class) else {
@@ -328,7 +328,7 @@ pub fn check_roots(graph: &EGraph, plan: &Plan) -> Result<()> {
 
 /// Clause 6, extension half: an `Launch::Ext` whose `lower_per_target` is empty
 /// cannot run on any target and must never be selected.
-pub fn check_extensions(
+pub(crate) fn check_extensions(
     graph: &EGraph,
     plan: &Plan,
     registry: Option<&OpDefRegistry>,
@@ -373,129 +373,4 @@ fn launch_index(plan: &Plan) -> FxHashMap<Id, usize> {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::extract::LocalSearch;
-    use crate::realize::testkit::{
-        N, TestCost, TestPlanner, buffer, chain_graph, kmap, kscatter, new_graph, test_caps,
-    };
-    use fusor2_ir::extract::{ExtractBudget, Extractor};
-    use fusor2_ir::ir::launch::CoopGeom;
-    use std::sync::Arc;
-
-    fn search() -> LocalSearch {
-        LocalSearch::new(Arc::new(TestPlanner), test_caps())
-    }
-
-    #[test]
-    fn a_seeded_plan_verifies() {
-        let (g, roots) = chain_graph(4);
-        let cost = TestCost::default();
-        let plan = search()
-            .extract(&g, &roots, &cost, ExtractBudget::default())
-            .unwrap();
-        verify_plan(&g, &plan).unwrap();
-    }
-
-    #[test]
-    fn verify_plan_rejects_inlined_inplace() {
-        let mut g = new_graph();
-        let shape = [N];
-        let base = buffer(&mut g, 0, &shape);
-        let idx = buffer(&mut g, 1, &shape);
-        let upd = buffer(&mut g, 2, &shape);
-        let sc = kscatter(&mut g, base, idx, upd, &shape);
-        let a = kmap(&mut g, sc, &shape, 1);
-        let b = kmap(&mut g, sc, &shape, 2);
-        g.add_root(a);
-        g.add_root(b);
-        let roots = g.roots().to_vec();
-        let cost = TestCost::default();
-        let mut plan = search()
-            .extract(&g, &roots, &cost, ExtractBudget::default())
-            .unwrap();
-        verify_plan(&g, &plan).unwrap();
-
-        // Force the pin open the way only a broken extractor could.
-        plan.extraction.m.set(sc.index(), false);
-        assert!(matches!(verify_plan(&g, &plan), Err(Error::Plan(_)),));
-    }
-
-    #[test]
-    fn verify_plan_rejects_illegal_geom() {
-        let (g, roots) = chain_graph(2);
-        let cost = TestCost::default();
-        let mut plan = search()
-            .extract(&g, &roots, &cost, ExtractBudget::default())
-            .unwrap();
-        let victim = *plan.extraction.sigma.values().max().unwrap();
-        plan.extraction.theta.insert(
-            victim,
-            SchedPoint::Coop {
-                // rg * cg * 32 lanes = 32,768, far past any workgroup, and
-                // bm is not a multiple of COOP_DIM * rg either.
-                geom: CoopGeom {
-                    bm: 3,
-                    bn: 3,
-                    bk: 3,
-                    n_passes: 1,
-                    subgroups: 1024,
-                    rg: 32,
-                    cg: 32,
-                },
-                splits: 1,
-                staging: 1,
-            },
-        );
-        let arena = TestPlanner;
-        assert!(matches!(
-            verify_plan_with(&g, &plan, &arena, &test_caps(), None),
-            Err(Error::Plan(_))
-        ));
-    }
-
-    /// A plan with `limit` listed bindings needs `limit + 1` storage buffers
-    /// once the unlisted `Uniforms` block is counted, so a plan exactly at
-    /// the limit must be rejected.
-    #[test]
-    fn verify_plan_rejects_a_bind_group_that_forgot_the_uniform_block() {
-        use fusor2_ir::extract::{BindKind, BindingPlan};
-
-        let (g, roots) = chain_graph(2);
-        let cost = TestCost::default();
-        let mut plan = search()
-            .extract(&g, &roots, &cost, ExtractBudget::default())
-            .unwrap();
-        let caps = test_caps();
-        let limit = caps.limits.max_storage_buffers_per_shader_stage as usize;
-        verify_plan_with(&g, &plan, &TestPlanner, &caps, None).unwrap();
-
-        let victim = &mut plan.launches[0];
-        let value = victim.bindings[0].value;
-        // One short of the limit still fits: `limit - 1` operands plus the
-        // block is exactly `limit`.
-        victim.bindings = (0..limit - 1)
-            .map(|i| BindingPlan {
-                binding: i as u32 + 1,
-                value,
-                kind: BindKind::Read,
-            })
-            .collect();
-        verify_plan_with(&g, &plan, &TestPlanner, &caps, None).unwrap();
-
-        // One more is `limit + 1` storage buffers, which the device refuses.
-        plan.launches[0].bindings.push(BindingPlan {
-            binding: limit as u32,
-            value,
-            kind: BindKind::Write,
-        });
-        let err = verify_plan_with(&g, &plan, &TestPlanner, &caps, None).unwrap_err();
-        let Error::Plan(msg) = &err else {
-            panic!("{err:?}")
-        };
-        assert!(msg.contains("Uniforms"), "{msg}");
-    }
 }

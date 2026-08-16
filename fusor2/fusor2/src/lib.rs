@@ -24,6 +24,8 @@
 //! sugar node with its `defn` expansion in the same call; how many kernels an
 //! op launches is the extractor's answer, not the caller's.
 
+#![warn(missing_docs, unreachable_pub)]
+
 pub mod autograd;
 mod broadcast;
 pub mod cache;

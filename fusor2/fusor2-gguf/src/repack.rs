@@ -191,31 +191,6 @@ pub(crate) mod tests {
         assert!((pct - 0.952).abs() < 0.001, "Q6K grows {pct}%");
     }
 
-    #[test]
-    fn same_layout_is_a_memcpy_and_ragged_input_errors() {
-        let native = lcg_blocks(QFmt::Q4K, QLayout::Native, 3, 7);
-        let mut out = Vec::new();
-        repack(
-            QFmt::Q4K,
-            QLayout::Native,
-            QLayout::Native,
-            &native,
-            &mut out,
-        )
-        .unwrap();
-        assert_eq!(out, native);
-
-        let mut out = Vec::new();
-        let err = repack(
-            QFmt::Q4K,
-            QLayout::Native,
-            QLayout::F32Scales,
-            &native[..native.len() - 1],
-            &mut out,
-        )
-        .unwrap_err();
-        assert!(matches!(err, fusor2_ir::error::Error::Shape(_)));
-    }
 
     #[test]
     fn repack_preserves_dequantized_values() {

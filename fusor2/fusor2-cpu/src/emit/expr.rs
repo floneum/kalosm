@@ -17,7 +17,7 @@ use fusor2_ir::scalar::{BinOp, CmpOp, UnOp};
 use super::access::AccessForm;
 
 /// A tape register index.
-pub type Slot = u32;
+pub(crate) type Slot = u32;
 
 /// Compute type of a register. Storage-only narrow floats never appear: they
 /// widen on load and narrow on store.
@@ -214,7 +214,7 @@ pub enum UniformSrc {
 /// `dispatch!` established.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(align(32))]
-pub struct Reg<const W: usize>(pub [u32; W]);
+pub(crate) struct Reg<const W: usize>(pub [u32; W]);
 
 impl<const W: usize> Default for Reg<W> {
     fn default() -> Self {
@@ -224,31 +224,31 @@ impl<const W: usize> Default for Reg<W> {
 
 impl<const W: usize> Reg<W> {
     #[inline(always)]
-    pub fn splat_bits(bits: u32) -> Self {
+    pub(crate) fn splat_bits(bits: u32) -> Self {
         Self([bits; W])
     }
     #[inline(always)]
-    pub fn splat_f32(v: f32) -> Self {
+    pub(crate) fn splat_f32(v: f32) -> Self {
         Self([v.to_bits(); W])
     }
     #[inline(always)]
-    pub fn splat_u32(v: u32) -> Self {
+    pub(crate) fn splat_u32(v: u32) -> Self {
         Self([v; W])
     }
     #[inline(always)]
-    pub fn f(self, i: usize) -> f32 {
+    pub(crate) fn f(self, i: usize) -> f32 {
         f32::from_bits(self.0[i])
     }
     #[inline(always)]
-    pub fn u(self, i: usize) -> u32 {
+    pub(crate) fn u(self, i: usize) -> u32 {
         self.0[i]
     }
     #[inline(always)]
-    pub fn i(self, i: usize) -> i32 {
+    pub(crate) fn i(self, i: usize) -> i32 {
         self.0[i] as i32
     }
     #[inline(always)]
-    pub fn from_f(v: [f32; W]) -> Self {
+    pub(crate) fn from_f(v: [f32; W]) -> Self {
         let mut o = [0u32; W];
         for k in 0..W {
             o[k] = v[k].to_bits();
@@ -256,7 +256,7 @@ impl<const W: usize> Reg<W> {
         Self(o)
     }
     #[inline(always)]
-    pub fn to_f(self) -> [f32; W] {
+    pub(crate) fn to_f(self) -> [f32; W] {
         let mut o = [0f32; W];
         for k in 0..W {
             o[k] = f32::from_bits(self.0[k]);
@@ -265,7 +265,7 @@ impl<const W: usize> Reg<W> {
     }
     /// Elementwise f32 map.
     #[inline(always)]
-    pub fn mapf(self, f: impl Fn(f32) -> f32) -> Self {
+    pub(crate) fn mapf(self, f: impl Fn(f32) -> f32) -> Self {
         let mut o = [0u32; W];
         for k in 0..W {
             o[k] = f(f32::from_bits(self.0[k])).to_bits();
@@ -274,7 +274,7 @@ impl<const W: usize> Reg<W> {
     }
     /// Elementwise f32 zip.
     #[inline(always)]
-    pub fn zipf(self, b: Self, f: impl Fn(f32, f32) -> f32) -> Self {
+    pub(crate) fn zipf(self, b: Self, f: impl Fn(f32, f32) -> f32) -> Self {
         let mut o = [0u32; W];
         for k in 0..W {
             o[k] = f(f32::from_bits(self.0[k]), f32::from_bits(b.0[k])).to_bits();
@@ -282,7 +282,7 @@ impl<const W: usize> Reg<W> {
         Self(o)
     }
     #[inline(always)]
-    pub fn zipu(self, b: Self, f: impl Fn(u32, u32) -> u32) -> Self {
+    pub(crate) fn zipu(self, b: Self, f: impl Fn(u32, u32) -> u32) -> Self {
         let mut o = [0u32; W];
         for k in 0..W {
             o[k] = f(self.0[k], b.0[k]);
@@ -290,7 +290,7 @@ impl<const W: usize> Reg<W> {
         Self(o)
     }
     #[inline(always)]
-    pub fn zipi(self, b: Self, f: impl Fn(i32, i32) -> i32) -> Self {
+    pub(crate) fn zipi(self, b: Self, f: impl Fn(i32, i32) -> i32) -> Self {
         let mut o = [0u32; W];
         for k in 0..W {
             o[k] = f(self.0[k] as i32, b.0[k] as i32) as u32;
@@ -299,7 +299,7 @@ impl<const W: usize> Reg<W> {
     }
     /// Per-lane select on a `0`/`!0` mask.
     #[inline(always)]
-    pub fn select(mask: Self, t: Self, f: Self) -> Self {
+    pub(crate) fn select(mask: Self, t: Self, f: Self) -> Self {
         let mut o = [0u32; W];
         for k in 0..W {
             o[k] = (t.0[k] & mask.0[k]) | (f.0[k] & !mask.0[k]);
@@ -310,9 +310,9 @@ impl<const W: usize> Reg<W> {
 
 const LN2_HI: f32 = 0.693_145_75;
 const LN2_LO: f32 = 1.428_606_8e-6;
-const LOG2_E: f32 = 1.442_695_04;
-const LN2: f32 = 0.693_147_18;
-const PI_2_HI: f32 = 1.570_796_3;
+const LOG2_E: f32 = std::f32::consts::LOG2_E;
+const LN2: f32 = std::f32::consts::LN_2;
+const PI_2_HI: f32 = std::f32::consts::FRAC_PI_2;
 const PI_2_MID: f32 = 7.549_789_4e-8;
 const PI_2_LO: f32 = 5.390_302_6e-15;
 const TWO_OVER_PI: f32 = 0.636_619_78;
@@ -336,7 +336,7 @@ fn ldexp(x: f32, n: i32) -> f32 {
 
 /// Round to nearest, ties to even, without a libm call.
 #[inline(always)]
-pub fn rint(x: f32) -> f32 {
+pub(crate) fn rint(x: f32) -> f32 {
     let t = trunc(x);
     let frac = x - t;
     let a = frac.abs();
@@ -353,7 +353,7 @@ pub fn rint(x: f32) -> f32 {
 }
 
 #[inline(always)]
-pub fn trunc(x: f32) -> f32 {
+pub(crate) fn trunc(x: f32) -> f32 {
     if !(x.abs() < 8_388_608.0) {
         // |x| >= 2^23 (or NaN): already integral, or not representable.
         return x;
@@ -362,19 +362,19 @@ pub fn trunc(x: f32) -> f32 {
 }
 
 #[inline(always)]
-pub fn floorf(x: f32) -> f32 {
+pub(crate) fn floorf(x: f32) -> f32 {
     let t = trunc(x);
     if x < 0.0 && t != x { t - 1.0 } else { t }
 }
 
 #[inline(always)]
-pub fn ceilf(x: f32) -> f32 {
+pub(crate) fn ceilf(x: f32) -> f32 {
     let t = trunc(x);
     if x > 0.0 && t != x { t + 1.0 } else { t }
 }
 
 #[inline(always)]
-pub fn round_half_away(x: f32) -> f32 {
+pub(crate) fn round_half_away(x: f32) -> f32 {
     let t = trunc(x);
     let a = (x - t).abs();
     if a >= 0.5 {
@@ -385,7 +385,7 @@ pub fn round_half_away(x: f32) -> f32 {
 }
 
 #[inline(always)]
-pub fn round_mode(mode: RoundMode, x: f32) -> f32 {
+pub(crate) fn round_mode(mode: RoundMode, x: f32) -> f32 {
     match mode {
         RoundMode::HalfToEven => rint(x),
         RoundMode::HalfAwayFromZero => round_half_away(x),
@@ -412,7 +412,7 @@ fn exp_poly(r: f32) -> f32 {
 
 /// `e^x`: Cody–Waite reduction plus the degree-8 polynomial above.
 #[inline(always)]
-pub fn expf(x: f32) -> f32 {
+pub(crate) fn expf(x: f32) -> f32 {
     if x > 88.72 {
         return f32::INFINITY;
     }
@@ -426,7 +426,7 @@ pub fn expf(x: f32) -> f32 {
 
 /// `2^x`.
 #[inline(always)]
-pub fn exp2f(x: f32) -> f32 {
+pub(crate) fn exp2f(x: f32) -> f32 {
     if x > 127.9 {
         return f32::INFINITY;
     }
@@ -440,7 +440,7 @@ pub fn exp2f(x: f32) -> f32 {
 
 /// `log(1 + u)`, accurate near zero.
 #[inline(always)]
-pub fn log1pf(u: f32) -> f32 {
+pub(crate) fn log1pf(u: f32) -> f32 {
     if u <= -1.0 {
         return if u == -1.0 { f32::NEG_INFINITY } else { f32::NAN };
     }
@@ -465,7 +465,7 @@ fn frexp_norm(x: f32) -> (f32, i32) {
     let bits = x.to_bits();
     let mut e = ((bits >> 23) & 0xFF) as i32 - 127;
     let mut m = f32::from_bits((bits & 0x007F_FFFF) | 0x3F80_0000);
-    if m > 1.414_213_6 {
+    if m > std::f32::consts::SQRT_2 {
         m *= 0.5;
         e += 1;
     }
@@ -475,7 +475,7 @@ fn frexp_norm(x: f32) -> (f32, i32) {
 /// Natural log by mantissa/exponent split plus a degree-13 odd polynomial in
 /// `s = (m-1)/(m+1)`.
 #[inline(always)]
-pub fn logf(x: f32) -> f32 {
+pub(crate) fn logf(x: f32) -> f32 {
     if x < 0.0 {
         return f32::NAN;
     }
@@ -507,7 +507,7 @@ pub fn logf(x: f32) -> f32 {
 }
 
 #[inline(always)]
-pub fn log2f(x: f32) -> f32 {
+pub(crate) fn log2f(x: f32) -> f32 {
     if x <= 0.0 || !x.is_finite() {
         return logf(x) * LOG2_E;
     }
@@ -530,7 +530,7 @@ pub fn log2f(x: f32) -> f32 {
 }
 
 #[inline(always)]
-pub fn powf(x: f32, y: f32) -> f32 {
+pub(crate) fn powf(x: f32, y: f32) -> f32 {
     if y == 0.0 {
         return 1.0;
     }
@@ -581,7 +581,7 @@ fn cos_poly(r: f32) -> f32 {
 }
 
 #[inline(always)]
-pub fn sinf(x: f32) -> f32 {
+pub(crate) fn sinf(x: f32) -> f32 {
     if !x.is_finite() {
         return f32::NAN;
     }
@@ -595,7 +595,7 @@ pub fn sinf(x: f32) -> f32 {
 }
 
 #[inline(always)]
-pub fn cosf(x: f32) -> f32 {
+pub(crate) fn cosf(x: f32) -> f32 {
     if !x.is_finite() {
         return f32::NAN;
     }
@@ -609,7 +609,7 @@ pub fn cosf(x: f32) -> f32 {
 }
 
 #[inline(always)]
-pub fn tanf(x: f32) -> f32 {
+pub(crate) fn tanf(x: f32) -> f32 {
     if !x.is_finite() {
         return f32::NAN;
     }
@@ -622,7 +622,7 @@ pub fn tanf(x: f32) -> f32 {
 /// `tanh` by the [7/8] Padé rational near zero and the `exp` identity outside
 /// it, so the relative error stays flat across the whole line.
 #[inline(always)]
-pub fn tanhf(x: f32) -> f32 {
+pub(crate) fn tanhf(x: f32) -> f32 {
     let a = x.abs();
     if a < 0.55 {
         let z = x * x;
@@ -639,19 +639,19 @@ pub fn tanhf(x: f32) -> f32 {
 }
 
 #[inline(always)]
-pub fn sqrtf(x: f32) -> f32 {
+pub(crate) fn sqrtf(x: f32) -> f32 {
     // A single hardware instruction, not a libm call.
     x.sqrt()
 }
 
 #[inline(always)]
-pub fn rsqrtf(x: f32) -> f32 {
+pub(crate) fn rsqrtf(x: f32) -> f32 {
     1.0 / x.sqrt()
 }
 
 /// Cephes single-precision `asin`, with the exact argument reduction at 0.5.
 #[inline(always)]
-pub fn asinf(x: f32) -> f32 {
+pub(crate) fn asinf(x: f32) -> f32 {
     let a = x.abs();
     if a > 1.0 {
         return f32::NAN;
@@ -673,7 +673,7 @@ pub fn asinf(x: f32) -> f32 {
 }
 
 #[inline(always)]
-pub fn acosf(x: f32) -> f32 {
+pub(crate) fn acosf(x: f32) -> f32 {
     if x > 0.5 {
         // Keeps relative accuracy as the result approaches zero.
         2.0 * asinf(sqrtf(0.5 - 0.5 * x))
@@ -686,7 +686,7 @@ pub fn acosf(x: f32) -> f32 {
 
 /// Cephes single-precision `atan`.
 #[inline(always)]
-pub fn atanf(x: f32) -> f32 {
+pub(crate) fn atanf(x: f32) -> f32 {
     let a = x.abs();
     let (a, y) = if a > 2.414_213_6 {
         (-1.0 / a, PI_2_HI + PI_2_MID)
@@ -705,7 +705,7 @@ pub fn atanf(x: f32) -> f32 {
 }
 
 #[inline(always)]
-pub fn sinhf(x: f32) -> f32 {
+pub(crate) fn sinhf(x: f32) -> f32 {
     let a = x.abs();
     if a < 1.0 {
         let z = x * x;
@@ -723,13 +723,13 @@ pub fn sinhf(x: f32) -> f32 {
 }
 
 #[inline(always)]
-pub fn coshf(x: f32) -> f32 {
+pub(crate) fn coshf(x: f32) -> f32 {
     let e = expf(x.abs());
     0.5 * (e + 1.0 / e)
 }
 
 #[inline(always)]
-pub fn asinhf(x: f32) -> f32 {
+pub(crate) fn asinhf(x: f32) -> f32 {
     let a = x.abs();
     let r = if a < 1.0 {
         log1pf(a + a * a / (1.0 + sqrtf(1.0 + a * a)))
@@ -740,7 +740,7 @@ pub fn asinhf(x: f32) -> f32 {
 }
 
 #[inline(always)]
-pub fn acoshf(x: f32) -> f32 {
+pub(crate) fn acoshf(x: f32) -> f32 {
     if x < 1.0 {
         return f32::NAN;
     }
@@ -753,7 +753,7 @@ pub fn acoshf(x: f32) -> f32 {
 }
 
 #[inline(always)]
-pub fn atanhf(x: f32) -> f32 {
+pub(crate) fn atanhf(x: f32) -> f32 {
     let a = x.abs();
     if a >= 1.0 {
         return if a == 1.0 {
@@ -768,7 +768,7 @@ pub fn atanhf(x: f32) -> f32 {
 
 /// Apply a unary op elementwise across a register.
 #[inline(always)]
-pub fn apply_un<const W: usize>(op: UnOp, ty: NumTy, x: Reg<W>) -> Reg<W> {
+pub(crate) fn apply_un<const W: usize>(op: UnOp, ty: NumTy, x: Reg<W>) -> Reg<W> {
     match (op, ty) {
         (UnOp::Neg, NumTy::F32) => Reg(core::array::from_fn(|k| x.0[k] ^ 0x8000_0000)),
         (UnOp::Abs, NumTy::F32) => Reg(core::array::from_fn(|k| x.0[k] & 0x7FFF_FFFF)),
@@ -809,7 +809,7 @@ pub fn apply_un<const W: usize>(op: UnOp, ty: NumTy, x: Reg<W>) -> Reg<W> {
 
 /// Apply a binary op elementwise across two registers.
 #[inline(always)]
-pub fn apply_bin<const W: usize>(op: BinOp, ty: NumTy, a: Reg<W>, b: Reg<W>) -> Reg<W> {
+pub(crate) fn apply_bin<const W: usize>(op: BinOp, ty: NumTy, a: Reg<W>, b: Reg<W>) -> Reg<W> {
     match ty {
         NumTy::F32 => match op {
             BinOp::Add => a.zipf(b, |x, y| x + y),
@@ -867,7 +867,7 @@ pub fn apply_bin<const W: usize>(op: BinOp, ty: NumTy, a: Reg<W>, b: Reg<W>) -> 
 /// All six comparisons, producing a lane mask. Materialization to 1.0/0.0 is a
 /// separate instruction, minted only when the mask is consumed as a value.
 #[inline(always)]
-pub fn apply_cmp<const W: usize>(op: CmpOp, ty: NumTy, a: Reg<W>, b: Reg<W>) -> Reg<W> {
+pub(crate) fn apply_cmp<const W: usize>(op: CmpOp, ty: NumTy, a: Reg<W>, b: Reg<W>) -> Reg<W> {
     let mut o = [0u32; W];
     for k in 0..W {
         let t = match ty {
@@ -912,7 +912,7 @@ pub fn apply_cmp<const W: usize>(op: CmpOp, ty: NumTy, a: Reg<W>, b: Reg<W>) -> 
 
 /// Numeric conversion between compute types.
 #[inline(always)]
-pub fn apply_cast<const W: usize>(from: NumTy, to: NumTy, x: Reg<W>) -> Reg<W> {
+pub(crate) fn apply_cast<const W: usize>(from: NumTy, to: NumTy, x: Reg<W>) -> Reg<W> {
     if from == to {
         return x;
     }
@@ -941,7 +941,7 @@ pub fn apply_cast<const W: usize>(from: NumTy, to: NumTy, x: Reg<W>) -> Reg<W> {
 /// Narrow to a storage element and widen back — a `Cast` to `F16`/`BF16` when
 /// the register file only holds f32.
 #[inline(always)]
-pub fn apply_narrow<const W: usize>(to: ScalarElement, x: Reg<W>) -> Reg<W> {
+pub(crate) fn apply_narrow<const W: usize>(to: ScalarElement, x: Reg<W>) -> Reg<W> {
     match to {
         ScalarElement::F16 => x.mapf(|v| half::f16::from_f32(v).to_f32()),
         ScalarElement::BF16 => x.mapf(|v| half::bf16::from_f32(v).to_f32()),
@@ -955,7 +955,7 @@ pub fn apply_narrow<const W: usize>(to: ScalarElement, x: Reg<W>) -> Reg<W> {
 /// # Safety
 /// `index` must be inside the buffer `base` points at.
 #[inline(always)]
-pub unsafe fn read_elem(elem: ScalarElement, base: *const u8, index: usize) -> u32 {
+pub(crate) unsafe fn read_elem(elem: ScalarElement, base: *const u8, index: usize) -> u32 {
     unsafe {
         match elem {
             ScalarElement::F32 | ScalarElement::U32 | ScalarElement::I32 | ScalarElement::Bool => {
@@ -979,7 +979,7 @@ pub unsafe fn read_elem(elem: ScalarElement, base: *const u8, index: usize) -> u
 /// `index` must be inside the buffer `base` points at, and no other thread may
 /// be writing the same element (`verify_launch` invariant 3).
 #[inline(always)]
-pub unsafe fn write_elem(elem: ScalarElement, base: *mut u8, index: usize, bits: u32) {
+pub(crate) unsafe fn write_elem(elem: ScalarElement, base: *mut u8, index: usize, bits: u32) {
     unsafe {
         match elem {
             ScalarElement::F32 | ScalarElement::U32 | ScalarElement::I32 | ScalarElement::Bool => {
@@ -994,113 +994,5 @@ pub unsafe fn write_elem(elem: ScalarElement, base: *mut u8, index: usize, bits:
                 (base as *mut u16).add(index).write_unaligned(v);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn rel(a: f32, b: f32) -> f32 {
-        if a == b {
-            return 0.0;
-        }
-        (a - b).abs() / b.abs().max(1.0)
-    }
-
-    #[test]
-    fn transcendentals_match_libm() {
-        let n = 4096usize;
-        let mut worst: Vec<(&str, f32)> = Vec::new();
-        macro_rules! sweep {
-            ($name:literal, $lo:expr, $hi:expr, $ours:expr, $ref:expr) => {{
-                let mut w = 0f32;
-                for i in 0..n {
-                    let x = $lo + ($hi - $lo) * (i as f32) / ((n - 1) as f32);
-                    let got: f32 = ($ours)(x);
-                    let want: f32 = ($ref)(x as f64) as f32;
-                    w = w.max(rel(got, want));
-                }
-                worst.push(($name, w));
-            }};
-        }
-        sweep!("exp", -20.0f32, 20.0f32, expf, |x: f64| x.exp());
-        sweep!("exp2", -30.0f32, 30.0f32, exp2f, |x: f64| x.exp2());
-        sweep!("log", 1e-6f32, 1e6f32, logf, |x: f64| x.ln());
-        sweep!("log2", 1e-6f32, 1e6f32, log2f, |x: f64| x.log2());
-        sweep!("sqrt", 0.0f32, 1e6f32, sqrtf, |x: f64| x.sqrt());
-        sweep!("inverse_sqrt", 1e-3f32, 1e3f32, rsqrtf, |x: f64| 1.0 / x.sqrt());
-        sweep!("sin", -12.0f32, 12.0f32, sinf, |x: f64| x.sin());
-        sweep!("cos", -12.0f32, 12.0f32, cosf, |x: f64| x.cos());
-        sweep!("tan", -1.4f32, 1.4f32, tanf, |x: f64| x.tan());
-        sweep!("tanh", -12.0f32, 12.0f32, tanhf, |x: f64| x.tanh());
-        sweep!("asin", -0.999f32, 0.999f32, asinf, |x: f64| x.asin());
-        sweep!("acos", -0.999f32, 0.999f32, acosf, |x: f64| x.acos());
-        sweep!("atan", -50.0f32, 50.0f32, atanf, |x: f64| x.atan());
-        sweep!("sinh", -10.0f32, 10.0f32, sinhf, |x: f64| x.sinh());
-        sweep!("cosh", -10.0f32, 10.0f32, coshf, |x: f64| x.cosh());
-        sweep!("asinh", -50.0f32, 50.0f32, asinhf, |x: f64| x.asinh());
-        sweep!("acosh", 1.0001f32, 50.0f32, acoshf, |x: f64| x.acosh());
-        sweep!("atanh", -0.995f32, 0.995f32, atanhf, |x: f64| x.atanh());
-        sweep!("abs", -10.0f32, 10.0f32, f32::abs, |x: f64| x.abs());
-        sweep!("neg", -10.0f32, 10.0f32, |x: f32| -x, |x: f64| -x);
-        sweep!("pow", 0.01f32, 20.0f32, |x: f32| powf(x, 1.7), |x: f64| x
-            .powf(1.7));
-
-        for (name, e) in &worst {
-            assert!(*e <= 1e-6, "{name}: max relative error {e:e} exceeds 1e-6");
-        }
-        assert_eq!(worst.len(), 21);
-    }
-
-    #[test]
-    fn round_modes_are_exact() {
-        assert_eq!(round_half_away(0.5), 1.0);
-        assert_eq!(round_half_away(-0.5), -1.0);
-        assert_eq!(round_half_away(2.5), 3.0);
-        assert_eq!(round_half_away(-2.5), -3.0);
-        assert_eq!(rint(0.5), 0.0);
-        assert_eq!(rint(1.5), 2.0);
-        assert_eq!(rint(2.5), 2.0);
-        assert_eq!(floorf(-1.2), -2.0);
-        assert_eq!(ceilf(-1.2), -1.0);
-        assert_eq!(trunc(-1.9), -1.0);
-        // Ties away from zero at every half-integer in [-8, 8]: what MSQ1
-        // export idempotence depends on.
-        for i in -16i32..=16 {
-            if i % 2 == 0 {
-                continue;
-            }
-            let x = i as f32 * 0.5;
-            let r = round_half_away(x);
-            assert_eq!(r.abs(), x.abs() + 0.5, "round({x}) = {r}");
-            assert_eq!(r.signum(), x.signum());
-        }
-    }
-
-    #[test]
-    fn comparisons_vectorize() {
-        let a: Reg<8> = Reg::from_f([1.0, -2.0, 3.5, 0.0, -0.0, 7.0, 1e9, -1e9]);
-        let b: Reg<8> = Reg::from_f([1.0, 2.0, -3.5, 0.0, 0.0, 6.0, 1e9, 1e9]);
-        let m = apply_cmp(CmpOp::Lt, NumTy::F32, a, b);
-        let want = [false, true, false, false, false, false, false, true];
-        for k in 0..8 {
-            assert_eq!(m.0[k] != 0, want[k], "lane {k}");
-        }
-    }
-
-    #[test]
-    fn f16_bf16_widen_to_f32_registers() {
-        let x: Reg<4> = Reg::from_f([1.5, -0.25, 3.0, 100.0]);
-        let n = apply_narrow(ScalarElement::F16, x);
-        for k in 0..4 {
-            assert_eq!(n.f(k), half::f16::from_f32(x.f(k)).to_f32());
-        }
-        let n = apply_narrow(ScalarElement::BF16, x);
-        for k in 0..4 {
-            assert_eq!(n.f(k), half::bf16::from_f32(x.f(k)).to_f32());
-        }
-        assert_eq!(NumTy::of(ScalarElement::F16), NumTy::F32);
-        assert_eq!(NumTy::of(ScalarElement::BF16), NumTy::F32);
     }
 }

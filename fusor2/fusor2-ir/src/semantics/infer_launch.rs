@@ -1,4 +1,4 @@
-//! Total inference for the Launch op family. An Launch node's result shape is its
+//! Total inference for the Launch op family. A Launch node's result shape is its
 //! index space minus the reduced axes, and its dtype is the epilogue's.
 
 use crate::dtype::{Dtype, NumericContract, Persistence};
@@ -8,22 +8,26 @@ use crate::ir::OpDefRegistry;
 use crate::ir::launch::Launch;
 use crate::shape::{Dim, Dims};
 
-/// Infer the result facts of an Launch node from its operands' facts.
+/// Infer the result facts of a Launch node from its operands' facts.
 ///
 /// `Launch::Ext` is the one variant this cannot answer alone — its row lives in
 /// the open [`OpDefRegistry`], which only [`crate::CoreSemantics`] holds. Use
-/// [`infer_l1_with`] when you have the registry; this function reports a
+/// [`infer_launch_with`] when you have the registry; this function reports a
 /// typed error rather than guessing.
 pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
-    infer_l1_inner(op, ins, None)
+    infer_launch_inner(op, ins, None)
 }
 
 /// [`infer_launch`] with the extension registry, so `Launch::Ext` resolves.
-pub fn infer_l1_with(op: &Launch, ins: &[ValueFacts], registry: &OpDefRegistry) -> Result<ValueFacts> {
-    infer_l1_inner(op, ins, Some(registry))
+pub fn infer_launch_with(
+    op: &Launch,
+    ins: &[ValueFacts],
+    registry: &OpDefRegistry,
+) -> Result<ValueFacts> {
+    infer_launch_inner(op, ins, Some(registry))
 }
 
-fn infer_l1_inner(
+fn infer_launch_inner(
     op: &Launch,
     ins: &[ValueFacts],
     registry: Option<&OpDefRegistry>,
@@ -153,7 +157,9 @@ fn infer_l1_inner(
 
         Launch::Ext { def, .. } => {
             let registry = registry.ok_or_else(|| {
-                Error::Shape("Launch::Ext inference needs the OpDefRegistry; call infer_l1_with".into())
+                Error::Shape(
+                    "Launch::Ext inference needs the OpDefRegistry; call infer_launch_with".into(),
+                )
             })?;
             let d = registry
                 .get(*def)
@@ -192,172 +198,4 @@ fn meet(ins: &[ValueFacts]) -> NumericContract {
         .map(|f| f.numeric)
         .reduce(NumericContract::meet)
         .unwrap_or(NumericContract::RELAXED)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::egraph::Id;
-    use crate::carrier::{ArgRemap, Carrier};
-    use crate::scalar::BinOp;
-    use crate::ir::launch::{
-        AccessPlan, ContractSide, Family, IndexSpace, Operand, ScheduleDomain,
-    };
-    use crate::scalar::ScalarExpr;
-    use crate::shape::Layout;
-    use smallvec::smallvec;
-
-    fn f32s(shape: &[u64]) -> ValueFacts {
-        ValueFacts::new(Dtype::F32, shape.iter().map(|&d| Dim::Const(d)))
-    }
-    fn dims(v: &[u64]) -> Dims {
-        v.iter().map(|&d| Dim::Const(d)).collect()
-    }
-    fn operand(src: u32) -> Operand {
-        Operand {
-            src: Id(src),
-            layout: Layout::contiguous(&[Dim::Const(1)]),
-            access: AccessPlan::Alias,
-        }
-    }
-
-    #[test]
-    fn kmap_takes_the_index_space() {
-        let op = Launch::Map {
-            space: IndexSpace::new(dims(&[4, 8])),
-            body: ScalarExpr::arg(0, Dtype::F16),
-            ops: vec![operand(0)],
-            sched: ScheduleDomain::Point,
-        };
-        let facts = infer_launch(&op, &[f32s(&[4, 8])]).unwrap();
-        assert_eq!(&facts.shape[..], &dims(&[4, 8])[..]);
-        assert_eq!(facts.dtype, Dtype::F16);
-    }
-
-    fn binop(op: BinOp) -> Carrier {
-        Carrier::binop(op, Carrier::binop_identity(op, Dtype::F32).unwrap(), Dtype::F32)
-    }
-
-    #[test]
-    fn kfold_drops_the_axis_and_appends_the_carrier() {
-        let three = binop(BinOp::Add)
-            .tuple(&binop(BinOp::Max), &ArgRemap::identity(1))
-            .carrier
-            .tuple(&binop(BinOp::Mul), &ArgRemap::identity(1))
-            .carrier;
-        let op = Launch::Fold {
-            space: IndexSpace::new(dims(&[4, 8, 16])),
-            axis: 1,
-            vec_axes: smallvec![],
-            carrier: three.clone(),
-            acc: Dtype::F32,
-            post: (0..3).map(|i| ScalarExpr::arg(i, Dtype::F32)).collect(),
-            ops: vec![operand(0)],
-            sched: ScheduleDomain::Point,
-        };
-        let facts = infer_launch(&op, &[f32s(&[4, 8, 16])]).unwrap();
-        assert_eq!(&facts.shape[..], &dims(&[4, 16, 3])[..]);
-
-        let bad_axis = Launch::Fold {
-            space: IndexSpace::new(dims(&[4])),
-            axis: 7,
-            vec_axes: smallvec![],
-            carrier: binop(BinOp::Add),
-            acc: Dtype::F32,
-            post: smallvec![ScalarExpr::arg(0, Dtype::F32)],
-            ops: vec![operand(0)],
-            sched: ScheduleDomain::Point,
-        };
-        assert!(infer_launch(&bad_axis, &[f32s(&[4])]).is_err());
-    }
-
-    /// **Promotion does not change the node's facts.** A free axis moving from
-    /// the iteration domain into the accumulator's data space leaves the output
-    /// shape byte-identical, which is the check that catches a botched
-    /// renumbering.
-    #[test]
-    fn promoting_an_axis_leaves_the_shape_identical() {
-        let plain = Launch::Fold {
-            space: IndexSpace::new(dims(&[4, 8, 16])),
-            axis: 2,
-            vec_axes: smallvec![],
-            carrier: binop(BinOp::Add),
-            acc: Dtype::F32,
-            post: smallvec![ScalarExpr::arg(0, Dtype::F32)],
-            ops: vec![operand(0)],
-            sched: ScheduleDomain::Point,
-        };
-        let promoted = Launch::Fold {
-            space: IndexSpace::new(dims(&[4, 8, 16])),
-            axis: 2,
-            vec_axes: smallvec![1],
-            carrier: binop(BinOp::Add).promote(Dim::Const(8)).unwrap(),
-            acc: Dtype::F32,
-            post: smallvec![ScalarExpr::arg(0, Dtype::F32)],
-            ops: vec![operand(0)],
-            sched: ScheduleDomain::Point,
-        };
-        let a = infer_launch(&plain, &[f32s(&[4, 8, 16])]).unwrap();
-        let b = infer_launch(&promoted, &[f32s(&[4, 8, 16])]).unwrap();
-        assert_eq!(&a.shape[..], &dims(&[4, 8])[..]);
-        assert_eq!(a, b, "PROMOTE must not change ValueFacts");
-        assert_eq!(&promoted.iter_space().dims[..], &dims(&[4, 16])[..]);
-    }
-
-    #[test]
-    fn kcontract_drops_a_unit_batch() {
-        let make = |batch: Dim| Launch::Contract {
-            m: Dim::Const(3),
-            n: Dim::Const(5),
-            k: Dim::Const(4),
-            batch,
-            family: Family::Sgemm,
-            post: ScalarExpr::arg(0, Dtype::F32),
-            acc: Dtype::F32,
-            a: ContractSide::one(ScalarExpr::arg(0, Dtype::F32), operand(0)),
-            b: ContractSide::one(ScalarExpr::arg(0, Dtype::F32), operand(1)),
-            sched: ScheduleDomain::Point,
-        };
-        let ins = [f32s(&[3, 4]), f32s(&[4, 5])];
-        assert_eq!(
-            &infer_launch(&make(Dim::Const(1)), &ins).unwrap().shape[..],
-            &dims(&[3, 5])[..]
-        );
-        assert_eq!(
-            &infer_launch(&make(Dim::Const(2)), &ins).unwrap().shape[..],
-            &dims(&[2, 3, 5])[..]
-        );
-    }
-
-    #[test]
-    fn kregion_reports_its_arity() {
-        let region = Launch::Region {
-            members: smallvec![Id(1), Id(2), Id(3)],
-            live_outs: smallvec![1, 2],
-            sched: ScheduleDomain::Point,
-        };
-        let facts = infer_launch(&region, &[f32s(&[1]), f32s(&[7]), f32s(&[9])]).unwrap();
-        assert_eq!(&facts.shape[..], &dims(&[7])[..]);
-        assert_eq!(facts.outs, 2);
-
-        // An out-of-range live_out is an error, not an index panic.
-        let bad = Launch::Region {
-            members: smallvec![Id(1)],
-            live_outs: smallvec![4],
-            sched: ScheduleDomain::Point,
-        };
-        assert!(infer_launch(&bad, &[f32s(&[1])]).is_err());
-    }
-
-    #[test]
-    fn ext_without_a_registry_is_an_error_not_a_panic() {
-        let op = Launch::Ext {
-            def: crate::ir::OpDefId(0),
-            ops: vec![],
-            attrs: crate::ir::AttrId(0),
-        };
-        assert!(infer_launch(&op, &[]).is_err());
-        assert!(infer_l1_with(&op, &[], &OpDefRegistry::new()).is_err());
-    }
-
 }

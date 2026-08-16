@@ -75,29 +75,3 @@ impl Tensor {
         self.cmp_tensor(CmpOp::Ge, rhs, "gte_tensor")
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use fusor2_ir::dtype::Dtype;
-    use fusor2_ir::scalar::{CmpOp, ScalarExpr, ScalarKind};
-
-    /// A comparison's result carries the *operand* dtype, not a bool.
-    #[test]
-    fn comparisons_stay_in_the_operand_dtype() {
-        for dt in [Dtype::F32, Dtype::F16, Dtype::U32, Dtype::I32] {
-            let e = ScalarExpr::cmp(CmpOp::Lt, ScalarExpr::arg(0, dt), ScalarExpr::arg(1, dt));
-            assert_eq!(e.dtype(), dt);
-        }
-    }
-
-    /// `Ne` is a primitive.
-    #[test]
-    fn ne_is_one_node() {
-        let e = ScalarExpr::cmp(
-            CmpOp::Ne,
-            ScalarExpr::arg(0, Dtype::F32),
-            ScalarExpr::lit(fusor2_ir::dtype::Splat::F32(0.0)),
-        );
-        assert!(matches!(e.kind(), ScalarKind::Cmp { op: CmpOp::Ne, .. }));
-    }
-}

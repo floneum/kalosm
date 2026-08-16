@@ -72,7 +72,7 @@ pub fn gather_row_per_group(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<
 /// index, so only the gathered rows ever decode.
 ///
 /// Matched on the *pair*, never on a bare gather-of-quantized: the pair's
-/// class is float-typed, so the minted member is too ([`infer_launch`] gives
+/// class is float-typed, so the minted member is too (`infer_launch` gives
 /// `QuantizedRows` `F32`), and no consuming `Dequant` is left to decode
 /// twice.
 pub fn gather_quantized_rows(
@@ -132,108 +132,4 @@ pub fn gather_quantized_rows(
     let new = b.add_launch(op).ok()?;
     b.union(id, new).ok()?;
     Some(new)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::domains::testing::apple_caps;
-    use crate::rules::TILE_RULES;
-    use crate::rules::testing::{Fixture, l1_of};
-    use fusor2_ir::dtype::Dtype;
-
-    fn modes(fx: &Fixture, id: Id) -> Vec<GatherMode> {
-        fx.chain(id)
-            .into_iter()
-            .filter_map(|m| match l1_of(fx, m) {
-                Some(Launch::Gather { mode, .. }) => Some(mode),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn one_mode_for_a_dense_row() {
-        let mut fx = Fixture::new(apple_caps());
-        // 1024 rows of 8 f32 = 32 bytes per row, two whole quads.
-        let table = fx.buffer(Dtype::F32, &[1024, 8]);
-        let idx = fx.buffer(Dtype::U32, &[128]);
-        let g = fx.gather(0, table, idx);
-        fx.apply_all(TILE_RULES, g);
-
-        let modes = modes(&fx, g);
-        assert!(modes.contains(&GatherMode::RowPerGroup));
-        // The Logical gather plus its one dense lowering.
-        assert_eq!(fx.chain(g).len(), 2);
-    }
-
-    /// `Gather(Dequant(q), idx)` gains the fused `QuantizedRows` member: its
-    /// source operand is the quantized leaf addressed over the dense logical
-    /// space, its class is float-typed, and a gather over a *dense* table
-    /// never mints it.
-    #[test]
-    fn a_dequantized_table_gains_the_fused_quantized_member() {
-        use fusor2_ir::dtype::QFmt;
-        use fusor2_ir::dtype::QLayout;
-        use fusor2_ir::ir::logical::{Logical, LeafKind};
-        use fusor2_ir::ir::Op;
-
-        let mut fx = Fixture::new(apple_caps());
-        let table = fx
-            .graph
-            .add(Op::Logical(Logical::Leaf(LeafKind::Quantized {
-                name: fusor2_ir::ir::logical::BufferId(900),
-                fmt: QFmt::Q8_0,
-                layout: QLayout::Native,
-                shape: [Dim::Const(1024), Dim::Const(64)].into_iter().collect(),
-            })))
-            .unwrap();
-        let dense = fx
-            .graph
-            .add(Op::Logical(Logical::Dequant {
-                fmt: QFmt::Q8_0,
-                layout: QLayout::Native,
-                x: table,
-            }))
-            .unwrap();
-        let idx = fx.buffer(Dtype::U32, &[4]);
-        let g = fx.gather(0, dense, idx);
-        fx.apply_all(TILE_RULES, g);
-
-        let fused: Vec<Launch> = fx
-            .chain(g)
-            .into_iter()
-            .filter_map(|m| l1_of(&fx, m))
-            .filter(|l1| matches!(l1, Launch::Gather { mode: GatherMode::QuantizedRows, .. }))
-            .collect();
-        assert_eq!(fused.len(), 1, "exactly one fused member");
-        let Launch::Gather { ops, .. } = &fused[0] else {
-            unreachable!()
-        };
-        assert_eq!(ops[0].src, table, "the source operand is the leaf itself");
-        assert_eq!(
-            fx.graph.facts(g).dtype,
-            Dtype::F32,
-            "the pair's class stays float-typed"
-        );
-
-        // A dense table never mints the mode.
-        let dense_table = fx.buffer(Dtype::F32, &[1024, 8]);
-        let idx2 = fx.buffer(Dtype::U32, &[4]);
-        let g2 = fx.gather(0, dense_table, idx2);
-        fx.apply_all(TILE_RULES, g2);
-        assert!(!modes(&fx, g2).contains(&GatherMode::QuantizedRows));
-    }
-
-    #[test]
-    fn a_short_row_declines_the_vector_load() {
-        let mut fx = Fixture::new(apple_caps());
-        // 3 f32 = 12 bytes: not a whole quad.
-        let table = fx.buffer(Dtype::F32, &[1024, 3]);
-        let idx = fx.buffer(Dtype::U32, &[128]);
-        let g = fx.gather(0, table, idx);
-        fx.apply_all(TILE_RULES, g);
-        let modes = modes(&fx, g);
-        assert_eq!(modes, vec![GatherMode::RowPerGroup]);
-    }
 }

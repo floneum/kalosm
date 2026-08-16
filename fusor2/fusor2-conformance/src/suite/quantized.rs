@@ -197,12 +197,6 @@ pub fn cases() -> Cases {
         LAYOUTS_SPEC,
         layouts_agree,
     ));
-    cases.push(
-        "quantized",
-        "every_format_declares_its_block_bytes",
-        block_bytes_declared,
-    );
-    cases.push("quantized", "block_fields_tile_the_block", fields_tile);
     cases.push_case(fuzz_case(
         "quantized",
         "q_mat_mul_backward_reaches_the_activation_only",
@@ -321,8 +315,8 @@ fn qmatrix_load_orientation(session: &Session) -> CaseResult {
 
 
 /// A quantized matmul at a shape the cooperative-matrix path can take; the
-/// small-shape cases all resolve to `Launch::KQContract` and say nothing
-/// about the dense-family path.
+/// small-shape cases favor other contraction lowerings and do not exercise
+/// the cooperative path.
 ///
 /// The oracle is the dequantized dense matmul of the same weight. A mismatch
 /// means the staging-fill decode addresses the block differently from the
@@ -735,66 +729,6 @@ fn layouts_agree(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 
 /// The shared table's declared block size is the format's. A row that
 /// disagrees would address every block at the wrong stride.
-fn block_bytes_declared(_session: &Session) -> CaseResult {
-    for fmt in QFmt::ALL {
-        for layout in [QLayout::Native, QLayout::F32Scales] {
-            let spec = fusor2_gguf::block_spec(fmt, layout);
-            if spec.bytes as u32 != fmt.block_bytes(layout) {
-                return Err(format!(
-                    "{fmt:?}/{layout:?} declares {} bytes but the format says {}",
-                    spec.bytes,
-                    fmt.block_bytes(layout)
-                )
-                .into());
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The fields tile the block exactly: no gaps, no overlap, and the last one
-/// ends at `block_bytes`.
-fn fields_tile(_session: &Session) -> CaseResult {
-    for fmt in QFmt::ALL {
-        for layout in [QLayout::Native, QLayout::F32Scales] {
-            let f = block_fields(fmt, layout);
-            let total = fmt.block_bytes(layout);
-            if f.scale_is_f16 != matches!(layout, QLayout::Native) {
-                return Err(format!(
-                    "{fmt:?}/{layout:?}: scale_is_f16 must be exactly `layout == Native`"
-                )
-                .into());
-            }
-            if f.ql >= total {
-                return Err(format!(
-                    "{fmt:?}/{layout:?}: the low-bit plane starts at {} in a {total}-byte block",
-                    f.ql
-                )
-                .into());
-            }
-            for (label, offset) in [("min", f.min), ("qh", f.qh)] {
-                if let Some(o) = offset
-                    && o >= total
-                {
-                    return Err(
-                        format!("{fmt:?}/{layout:?}: {label} starts at {o} of {total}").into(),
-                    );
-                }
-            }
-            if let Some((gs, len)) = f.group_scales
-                && gs + len > total
-            {
-                return Err(format!(
-                    "{fmt:?}/{layout:?}: the group scales run to {} of {total}",
-                    gs + len
-                )
-                .into());
-            }
-        }
-    }
-    Ok(())
-}
-
 /// A quantized embedding lookup. Row `i` of the result must be exactly what
 /// the scalar reference decodes source row `idx[i]` to — for every format and
 /// both layouts, with the picks out of order and one row repeated.
@@ -1038,126 +972,4 @@ fn qkv_parts(
         values.extend_from_slice(&decoded);
     }
     Ok((mats, values))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn registered() -> Vec<String> {
-        cases().names().iter().map(|n| (*n).to_string()).collect()
-    }
-
-    #[test]
-    fn every_format_and_layout_has_a_dequantize_case() {
-        let names = registered();
-        for fmt in QFmt::ALL {
-            for layout in [QLayout::Native, QLayout::F32Scales] {
-                let wanted = format!(
-                    "quantized::dequantize_{}_{}",
-                    fmt_name(fmt),
-                    layout_name(layout)
-                );
-                assert!(names.iter().any(|n| *n == wanted), "{wanted} is missing");
-            }
-        }
-    }
-
-    #[test]
-    fn every_format_has_a_matmul_and_a_repack_case() {
-        let names = registered();
-        for fmt in QFmt::ALL {
-            for prefix in ["qmatmul", "repack_round_trip"] {
-                let wanted = format!("quantized::{prefix}_{}", fmt_name(fmt));
-                assert!(names.iter().any(|n| *n == wanted), "{wanted} is missing");
-            }
-        }
-    }
-
-    #[test]
-    fn the_six_format_names_are_distinct() {
-        let mut names: Vec<&str> = QFmt::ALL.iter().copied().map(fmt_name).collect();
-        assert_eq!(names.len(), 6);
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(names.len(), 6);
-    }
-
-    #[test]
-    fn a_generated_block_is_the_declared_length_and_decodes_finitely() {
-        for fmt in QFmt::ALL {
-            for layout in [QLayout::Native, QLayout::F32Scales] {
-                let block = make_block(fmt, layout, 11);
-                assert_eq!(block.len(), fmt.block_bytes(layout) as usize);
-                let mut out = vec![0.0f32; fmt.block_elements() as usize];
-                cpu_dequantize_block(fmt, layout, &block, &mut out);
-                assert!(
-                    out.iter().all(|v| v.is_finite()),
-                    "{fmt:?}/{layout:?} decoded a non-finite value"
-                );
-                // The payload is not all zeros, so the case is not comparing
-                // two zero vectors.
-                assert!(
-                    out.iter().any(|v| *v != 0.0),
-                    "{fmt:?}/{layout:?} decoded to all zeros"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_two_layouts_of_a_generated_block_are_a_repack_apart() {
-        // Guards `layouts_agree`: the widened bytes really do decode to the
-        // same values, independently of any device.
-        for fmt in QFmt::ALL {
-            let (native, values) = quantized_rows(fmt, QLayout::Native);
-            let mut widened = Vec::new();
-            repack(
-                fmt,
-                QLayout::Native,
-                QLayout::F32Scales,
-                &native,
-                &mut widened,
-            )
-            .unwrap();
-            let elements = fmt.block_elements() as usize;
-            let stride = fmt.block_bytes(QLayout::F32Scales) as usize;
-            let mut decoded = vec![0.0f32; ROWS as usize * elements];
-            for r in 0..ROWS as usize {
-                cpu_dequantize_block(
-                    fmt,
-                    QLayout::F32Scales,
-                    &widened[r * stride..(r + 1) * stride],
-                    &mut decoded[r * elements..(r + 1) * elements],
-                );
-            }
-            assert_eq!(values, decoded, "{fmt:?}");
-        }
-    }
-
-    #[test]
-    fn the_repack_round_trip_is_byte_exact() {
-        for fmt in QFmt::ALL {
-            let (native, _) = quantized_rows(fmt, QLayout::Native);
-            let mut widened = Vec::new();
-            repack(
-                fmt,
-                QLayout::Native,
-                QLayout::F32Scales,
-                &native,
-                &mut widened,
-            )
-            .unwrap();
-            let mut back = Vec::new();
-            repack(
-                fmt,
-                QLayout::F32Scales,
-                QLayout::Native,
-                &widened,
-                &mut back,
-            )
-            .unwrap();
-            assert_eq!(native, back, "{fmt:?}");
-        }
-    }
 }

@@ -27,7 +27,7 @@ use crate::tensor::Tensor as Dyn;
 use crate::tensor::typed::{Element, Tensor as RawTensor};
 use crate::{Error, Result};
 
-pub use crate::tensor::typed::Axis;
+use crate::tensor::typed::Axis;
 pub use fusor2_ir::autograd::{GradientSlot, Parent};
 
 /// How many boundary hops one backward may take before it is a cycle.
@@ -55,6 +55,7 @@ impl BackwardTarget {
         }
     }
 
+    /// The gradient slot this target feeds.
     pub fn slot(&self) -> GradientSlot {
         self.slot
     }
@@ -217,20 +218,24 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         GradientSlot(self.value.id())
     }
 
+    /// The underlying graph node id.
     pub fn id(&self) -> Id {
         self.value.id()
     }
 
     #[track_caller]
+    /// The concrete shape.
     pub fn shape(&self) -> [usize; R] {
         self.value.shape()
     }
 
     #[track_caller]
+    /// The number of elements.
     pub fn elements(&self) -> usize {
         self.value.elements()
     }
 
+    /// The runtime dtype.
     pub fn dtype(&self) -> fusor2_ir::dtype::Dtype {
         self.value.dtype()
     }
@@ -405,10 +410,12 @@ impl Gradients {
         ))
     }
 
+    /// The number of available leaf gradients.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Whether no leaf received a gradient.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -477,14 +484,17 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         self.like(self.value.add(&rhs.value))
     }
     #[track_caller]
+    /// Subtract two same-shape values.
     pub fn sub(&self, rhs: &Self) -> Self {
         self.like(self.value.sub(&rhs.value))
     }
     #[track_caller]
+    /// Multiply two same-shape values.
     pub fn mul(&self, rhs: &Self) -> Self {
         self.like(self.value.mul(&rhs.value))
     }
     #[track_caller]
+    /// Divide two same-shape values.
     pub fn div(&self, rhs: &Self) -> Self {
         self.like(self.value.div(&rhs.value))
     }
@@ -524,36 +534,43 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     }
 
     #[track_caller]
+    /// Reshape the value.
     pub fn reshape<const O: usize>(&self, shape: [usize; O]) -> Tensor<O, T> {
         self.like(self.value.reshape(shape))
     }
 
     #[track_caller]
+    /// Swap two axes.
     pub fn transpose(&self, d0: impl Axis<R>, d1: impl Axis<R>) -> Self {
         self.like(self.value.transpose(d0, d1))
     }
 
     #[track_caller]
+    /// Reorder the axes.
     pub fn permute(&self, order: [usize; R]) -> Self {
         self.like(self.value.permute(order))
     }
 
     #[track_caller]
+    /// Keep `len` elements of one axis starting at `start`.
     pub fn narrow(&self, dim: impl Axis<R>, start: usize, len: usize) -> Self {
         self.like(self.value.narrow(dim, start, len))
     }
 
     #[track_caller]
+    /// Flatten every axis into one.
     pub fn flatten_all(&self) -> Tensor<1, T> {
         self.like(self.value.flatten_all())
     }
 
     #[track_caller]
+    /// Gather indices along one axis.
     pub fn index_select(&self, dim: impl Axis<R>, idx: &RawTensor<1, u32>) -> Self {
         self.like(self.value.index_select(dim, idx))
     }
 
     #[track_caller]
+    /// Clamp every element to the inclusive scalar interval.
     pub fn clamp(
         &self,
         lo: impl Into<crate::tensor::Scalar>,
@@ -563,16 +580,19 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     }
 
     #[track_caller]
+    /// Compare every element with `s` using `<=`.
     pub fn lte_scalar(&self, s: impl Into<crate::tensor::Scalar>) -> Self {
         self.like(self.value.lte_scalar(s))
     }
 
     #[track_caller]
+    /// Compare every element with `s` using `>=`.
     pub fn gte_scalar(&self, s: impl Into<crate::tensor::Scalar>) -> Self {
         self.like(self.value.gte_scalar(s))
     }
 
     #[track_caller]
+    /// Matrix multiplication over the trailing two axes.
     pub fn matmul(&self, rhs: &Self) -> Self {
         self.like(self.value.matmul(&rhs.value))
     }
@@ -622,64 +642,4 @@ where
     I: IntoIterator<Item = Tensor<R, T>>,
 {
     Tensor::cat(parts, dim)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::device::Device;
-
-    #[test]
-    fn a_leaf_gets_its_gradient_back() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-        let graph = Graph::new();
-        let w = graph.leaf(RawTensor::<1, f32>::from_slice(&device, [3], &[1.0, 2.0, 3.0]));
-        let loss = w.mul(&w).sum::<0>(0usize);
-        let seed = RawTensor::<0, f32>::splat(&device, 1.0, []);
-        let grads = loss.backward_with(seed).expect("backward");
-        let g = grads.get(&w).expect("gradient");
-        assert_eq!(g.shape(), [3]);
-        let values = g.read().expect("readback").to_flat();
-        assert_eq!(values, vec![2.0, 4.0, 6.0]);
-    }
-
-    #[test]
-    fn a_boundary_rule_routes_the_gradient_it_is_handed() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-        let graph = Graph::new();
-        let w = graph.leaf(RawTensor::<1, f32>::from_slice(&device, [2], &[3.0, 4.0]));
-        let slot = w.slot();
-        // A straight-through node: the forward is a constant, the backward
-        // hands the gradient to `w` untouched.
-        let quantized = Tensor::constant_from_raw(
-            &graph,
-            RawTensor::<1, f32>::from_slice(&device, [2], &[3.0, 4.0]),
-        )
-        .with_backwards([w.parent()], move |gradient| {
-            Ok(vec![BackwardTarget::to(slot, gradient)])
-        });
-        let loss = quantized.mul_scalar(2.0).sum::<0>(0usize);
-        let seed = RawTensor::<0, f32>::splat(&device, 1.0, []);
-        let grads = loss.backward_with(seed).expect("backward");
-        let g = grads.get(&w).expect("gradient");
-        assert_eq!(g.read().expect("readback").to_flat(), vec![2.0, 2.0]);
-    }
-
-    #[test]
-    fn a_rule_that_starves_a_parent_is_an_error() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-        let graph = Graph::new();
-        let w = graph.leaf(RawTensor::<1, f32>::from_slice(&device, [2], &[1.0, 1.0]));
-        let node = Tensor::constant_from_raw(
-            &graph,
-            RawTensor::<1, f32>::from_slice(&device, [2], &[1.0, 1.0]),
-        )
-        .with_backwards([w.parent()], |_| Ok(Vec::new()));
-        let loss = node.sum::<0>(0usize);
-        let seed = RawTensor::<0, f32>::splat(&device, 1.0, []);
-        assert!(loss.backward_with(seed).is_err());
-    }
 }

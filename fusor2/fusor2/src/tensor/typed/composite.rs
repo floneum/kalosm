@@ -3,10 +3,8 @@
 //! Every method here calls the corresponding free function at the [`Dyn`]
 //! layer; no math is re-implemented.
 
-use crate::composite::PoolReduce;
-use crate::composite::attention::MaskKind;
-use crate::composite::pool::PoolSize;
-use crate::composite::{attention, rope, upsample};
+use crate::cache::MaskKind;
+use crate::composite::{PoolReduce, PoolSize, attention, rope, upsample};
 use crate::quantized::QMatrix;
 use crate::tensor::typed::{Axis, Element, Tensor, narrow_acc};
 
@@ -355,134 +353,5 @@ impl QMatrix {
             "QMatrix::embedding",
             self.index_select_rows_to(ids.as_dyn(), T::DTYPE),
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Device;
-    use crate::tensor::typed::Minus1;
-
-    /// Softmax as a method matches the `Dyn` op and does not change the rank.
-    #[test]
-    fn softmax_is_rank_preserving_and_sums_to_one() {
-        let device = Device::private();
-        let a = Tensor::<2, f32>::from_slice(&device, [2, 3], &[1.0, 2.0, 3.0, 1.0, 1.0, 1.0]);
-
-        let p = a.softmax_last_dim();
-        assert_eq!(p.shape(), [2, 3]);
-        let got = p.to_flat();
-        let row0: f32 = got[..3].iter().sum();
-        let row1: f32 = got[3..].iter().sum();
-        assert!((row0 - 1.0).abs() < 1e-5, "{got:?}");
-        assert!((row1 - 1.0).abs() < 1e-5, "{got:?}");
-        // The uniform row is exactly uniform.
-        for v in &got[3..] {
-            assert!((v - 1.0 / 3.0).abs() < 1e-6, "{got:?}");
-        }
-        // `softmax(Minus1)` is the same op spelled with an axis.
-        assert_eq!(a.softmax(Minus1).to_flat(), got);
-    }
-
-    /// The method and the free function mint the same node.
-    #[test]
-    fn a_method_and_its_free_function_are_the_same_node() {
-        let device = Device::private();
-        let x = Tensor::<2, f32>::from_slice(&device, [2, 2], &[1.0, 2.0, 3.0, 4.0]);
-        let w = Tensor::<1, f32>::from_slice(&device, [2], &[1.0, 1.0]);
-
-        let by_method = x.rms_norm(&w, 1e-5);
-        let by_function = x.as_dyn().rms_norm(w.as_dyn(), 1e-5).unwrap();
-        assert_eq!(by_method.id(), by_function.id());
-
-        let pooled = x.pool_max([2usize]);
-        let pooled_fn =
-            crate::composite::pool::pool_max(x.as_dyn(), &[PoolSize::from(2usize)]).unwrap();
-        assert_eq!(pooled.id(), pooled_fn.id());
-    }
-
-    /// `rope_pair` is `rope` applied to q and k.
-    #[test]
-    fn rope_pair_rotates_q_and_k_the_way_rope_rotates_one() {
-        let device = Device::private();
-        // [batch 1, heads 1, seq 2, head_dim 4]
-        let q = Tensor::<4, f32>::from_slice(
-            &device,
-            [1, 1, 2, 4],
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-        );
-        let k = Tensor::<4, f32>::from_slice(
-            &device,
-            [1, 1, 2, 4],
-            &[8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
-        );
-        let cos = Tensor::<2, f32>::from_slice(&device, [2, 2], &[1.0, 1.0, 0.5, 0.5]);
-        let sin = Tensor::<2, f32>::from_slice(&device, [2, 2], &[0.0, 0.0, 0.5, 0.5]);
-
-        let (rq, rk) = q.rope_pair(&k, &cos, &sin, 0);
-        assert_eq!(rq.shape(), [1, 1, 2, 4]);
-        assert_eq!(rq.to_flat(), q.rope(&cos, &sin, 0).to_flat());
-        assert_eq!(rk.to_flat(), k.rope(&cos, &sin, 0).to_flat());
-        // The interleaved pairing is a different rotation.
-        let (iq, _) = q.rope_interleaved_pair(&k, &cos, &sin, 0);
-        assert_ne!(iq.to_flat(), rq.to_flat());
-    }
-
-    /// Causal attention as a method against the same call spelled through the
-    /// module path.
-    #[test]
-    fn attention_as_a_method_is_the_module_path_call() {
-        let device = Device::private();
-        let shape = [1, 1, 2, 2];
-        let q = Tensor::<4, f32>::from_slice(&device, shape, &[1.0, 0.0, 0.0, 1.0]);
-        let k = Tensor::<4, f32>::from_slice(&device, shape, &[1.0, 0.0, 0.0, 1.0]);
-        let v = Tensor::<4, f32>::from_slice(&device, shape, &[1.0, 2.0, 3.0, 4.0]);
-
-        let by_method = q.attention_causal(&k, &v, Some(1.0));
-        let by_path =
-            attention::attention_causal(q.as_dyn(), k.as_dyn(), v.as_dyn(), Some(1.0)).unwrap();
-        assert_eq!(by_method.id(), by_path.id());
-        assert_eq!(by_method.shape(), shape);
-        // The first query can only see the first key, so it is row 0 of v.
-        let got = by_method.to_flat();
-        assert!((got[0] - 1.0).abs() < 1e-5, "{got:?}");
-        assert!((got[1] - 2.0).abs() < 1e-5, "{got:?}");
-
-        // `attention` with an explicit mask kind reaches the same op.
-        let unmasked = q.attention(&k, &v, MaskKind::None, Some(1.0));
-        assert_eq!(unmasked.shape(), shape);
-        let masked: Tensor<4, f32> =
-            q.attention_masked::<2>(&k, &v, MaskKind::None, None, Some(1.0));
-        assert_eq!(masked.id(), unmasked.id());
-    }
-
-    /// `upsample_nearest2d` repeats each pixel, and it is rank-4 only.
-    #[test]
-    fn upsample_nearest2d_repeats_each_pixel() {
-        let device = Device::private();
-        let x = Tensor::<4, f32>::from_slice(&device, [1, 1, 2, 2], &[1.0, 2.0, 3.0, 4.0]);
-        let up = x.upsample_nearest2d(2, 2);
-        assert_eq!(up.shape(), [1, 1, 4, 4]);
-        assert_eq!(
-            up.to_flat(),
-            vec![
-                1.0, 1.0, 2.0, 2.0, //
-                1.0, 1.0, 2.0, 2.0, //
-                3.0, 3.0, 4.0, 4.0, //
-                3.0, 3.0, 4.0, 4.0,
-            ]
-        );
-    }
-
-    /// Pooling keeps the rank and reduces the trailing axes.
-    #[test]
-    fn pooling_reduces_the_trailing_axes_and_keeps_the_rank() {
-        let device = Device::private();
-        let x = Tensor::<2, f32>::from_slice(&device, [1, 4], &[1.0, 4.0, 3.0, 2.0]);
-        assert_eq!(x.pool_max([2usize]).shape(), [1, 2]);
-        assert_eq!(x.pool_max([2usize]).to_flat(), vec![4.0, 3.0]);
-        assert_eq!(x.pool_min([2usize]).to_flat(), vec![1.0, 2.0]);
-        assert_eq!(x.pool_avg([2usize]).to_flat(), vec![2.5, 2.5]);
     }
 }

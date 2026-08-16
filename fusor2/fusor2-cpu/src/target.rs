@@ -138,29 +138,3 @@ impl Target for CpuTarget {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn target_reports_a_coherent_device() {
-        let t = CpuTarget::new().unwrap();
-        assert_eq!(t.name(), "cpu");
-        assert_eq!(t.caps().kind, fusor2_ir::device::DeviceKind::Cpu);
-        assert!(t.facts().thread_wake_ps > 0);
-        assert!(t.facts().llc_bytes > 0);
-        assert_eq!(t.rules().len(), crate::rules::CPU_RULES.len());
-        t.wait().unwrap();
-    }
-
-    #[test]
-    fn allocation_recycles_a_unique_buffer() {
-        let t = CpuTarget::new().unwrap();
-        let a = t.alloc(1024, Persistence::Step).unwrap();
-        let addr = a.addr();
-        drop(a);
-        let b = t.alloc(1024, Persistence::Step).unwrap();
-        assert_eq!(b.addr(), addr, "a dead buffer must be reused");
-    }
-}

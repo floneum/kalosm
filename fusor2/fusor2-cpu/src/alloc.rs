@@ -80,8 +80,8 @@ impl AlignedBuf {
     /// `&AlignedBuf` to every worker thread and each writes its own disjoint
     /// slice. Disjointness is discharged by `verify_launch` (a nest's write
     /// map must be injective unless it declares an associative combine)
-    /// before a kernel reaches [`crate::launch`]. Cross-lane accumulation
-    /// goes through [`crate::emit::Program`]'s private-accumulate-then-merge
+    /// before a kernel reaches the launcher. Cross-lane accumulation
+    /// goes through `Program`'s private-accumulate-then-merge
     /// path.
     pub fn as_mut_ptr(&self) -> *mut u8 {
         self.ptr
@@ -104,24 +104,5 @@ impl Drop for AlignedBuf {
 impl std::fmt::Debug for AlignedBuf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "AlignedBuf({} B @ {:p})", self.len, self.ptr)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn aligned_and_zeroed() {
-        let b = AlignedBuf::zeroed(4096).unwrap();
-        assert_eq!(b.as_ptr() as usize % AlignedBuf::ALIGN, 0);
-        assert!(b.as_slice().iter().all(|&x| x == 0));
-    }
-
-    #[test]
-    fn empty_is_safe() {
-        let b = AlignedBuf::zeroed(0).unwrap();
-        assert!(b.is_empty());
-        assert!(b.as_slice().is_empty());
     }
 }

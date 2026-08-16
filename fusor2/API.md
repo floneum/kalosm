@@ -37,17 +37,17 @@ use fusor2::{Tensor, Device, Graph, Session, QMatrix, VarBuilder, Dim, Dtype, Er
 
 | Module | Contents that are public, and why |
 | --- | --- |
-| `tensor` | `Dyn` — the runtime-rank, `Result`-returning tensor. The **escape hatch**, reachable by `Tensor::into_dyn`/`as_dyn`, for code where a rank or a dtype is genuinely data. Also `Extent`, `RoundMode`, `IndexOp`/`TensorIndex`, `arange`/`arange_step`, `TensorSlice`, `ToVec`, `Element`/`Axis` (re-exported to the root). |
+| `tensor` | `Dyn` — the runtime-rank, `Result`-returning tensor. The **escape hatch**, reachable by `Tensor::into_dyn`/`as_dyn`, for code where a rank or a dtype is genuinely data. Also `Extent`, `RoundMode`, `IndexOp`/`TensorIndex`, `arange`/`arange_step`, `TensorSlice`, `ToVec`, `FromArray`, `Scalar`, and `Element`/`Axis` (re-exported to the root). |
 | `device` | `Device`, `Cpu`, `Gpu`, `KernelProfile`, `KernelProfileRow`. The profile types are how a trainer reads per-kernel timings. |
 | `session` | `Session`, `Backend` (the CPU/GPU *selector* — `Session::new(Backend::gpu_blocking()?)`), `wrong_member_count`. Tuning policy is private. |
 | `graph` | `Graph`, `GraphRef`, `Gradients`. |
 | `layers` | `Linear`, `RmsNorm`, `LayerNorm`, `LayerNormNd`, `Embedding`, `ConvNd`. Every model crate uses these. |
 | `cache` | `KvCache`, `TensorCache`, `MaskCache`, `AttentionMask`, `MaskKind`, `RopeCache`. The decode-loop state every model threads. |
 | `quantized` | `QMatrix`. |
-| `composite` | The flat op library at the `Dyn` layer: attention, rope, conv, pool, loss, upsample. Its implementation submodules are private; the **model-facing** entry points are methods on `Tensor` (§4). |
-| `autograd` | The differentiable const-rank tensor, the tape, `with_backwards`, `BackwardTarget`, `GradientSlot`. `betlang-train`'s first `use` line. |
+| `composite` | The flat op library at the `Dyn` layer: attention, rope, conv, pool (`PoolSize`/`PoolReduce`), loss, and upsample. Its implementation submodules are private; the **model-facing** entry points are methods on `Tensor` (§4). |
+| `autograd` | The differentiable const-rank `Tensor` and `Graph`, `Gradients`, `with_backwards`, `BackwardTarget`, `GradientSlot`, `Parent`, and `cat`. `betlang-train`'s first `use` line. |
 | `optim` | `AdamW`, `cosine_decay`, `global_norm`, `clip_global_norm`. No in-workspace consumer; `betlang-train` is the out-of-workspace one. |
-| `sampling` | `StandardSamplerParams`, `Mirostat2Sampler`, `top_k_pairs`, `GpuSampledToken`. `kalosm-llama` calls `top_k_pairs`. |
+| `sampling` | `StandardSamplerParams`, `Mirostat2Sampler`, `sample`, `top_k_pairs`, `GpuSampledToken`. `kalosm-llama` calls `top_k_pairs`. |
 
 ## 3. Removed from the public surface
 
@@ -71,7 +71,7 @@ Landed in this change:
 | `cache::{kv,mask,rope}`, `layers::*`, `sampling::*`, `tensor::{construction,readback,typed}`, `composite::*` submodules | Private. Their intended items are re-exported once from the parent module, eliminating duplicate paths. |
 | compatibility aliases (`mat_mul`, `square`, `variance`, `broadcast_*`, `ge_scalar`/`le_scalar`) | Deleted. Callers use `matmul`, `sqr`, `var`, `add_`/`sub_`/`mul_`/`div_`/`pow_`, and `gte_scalar`/`lte_scalar`. |
 
-One item went the other way. `composite::MaskKind` was previously a *private*
+One item went the other way. `cache::MaskKind` was previously a *private*
 `use` of `fusor2_ir::ir::launch::MaskKind`, so `attention_masked` took an
 argument no caller could spell — `segment-anything-rs` had two lines that
 could not compile against any version of this crate. It is a `pub use` now.

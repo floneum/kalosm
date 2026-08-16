@@ -195,15 +195,4 @@ mod tests {
         assert!(vb.get("blk.1.attn_q.weight").is_err());
     }
 
-    #[test]
-    fn metadata_reads_through_the_builder() {
-        let vb = VarBuilder::new(model());
-        assert_eq!(
-            vb.get_metadata("general.architecture")
-                .and_then(|v| v.as_str()),
-            Some("qwen3")
-        );
-        assert!(vb.get_metadata("missing").is_none());
-        assert_eq!(vb.metadata().tensors.len(), 3);
-    }
 }

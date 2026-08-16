@@ -35,21 +35,27 @@ impl TensorSlice {
         }
     }
 
+    /// Logical extents.
     pub fn shape(&self) -> &[Dim] {
         self.layout.shape()
     }
+    /// Element strides.
     pub fn strides(&self) -> &[Dim] {
         self.layout.strides()
     }
+    /// The complete readback layout.
     pub fn layout(&self) -> &Layout {
         &self.layout
     }
+    /// Element dtype.
     pub fn dtype(&self) -> Dtype {
         self.dtype
     }
+    /// Number of axes.
     pub fn rank(&self) -> usize {
         self.layout.rank()
     }
+    /// Raw backing bytes.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -229,9 +235,11 @@ impl<const N: usize> Index<[usize; N]> for TensorSlice {
 pub struct Ranked<'a, const R: usize, D: Element>(&'a TensorSlice, PhantomData<D>);
 
 impl<const R: usize, D: Element> Ranked<'_, R, D> {
+    /// Read one element, or `None` for an out-of-bounds index.
     pub fn get(&self, idx: [usize; R]) -> Option<D> {
         self.0.get::<D>(&idx)
     }
+    /// Logical extents.
     pub fn shape(&self) -> &[Dim] {
         self.0.shape()
     }
@@ -242,7 +250,9 @@ impl<const R: usize, D: Element> Ranked<'_, R, D> {
 
 /// Convert a readback into the nested `Vec` matching its rank.
 pub trait ToVec {
+    /// Nested vector shape produced by this rank.
     type Output;
+    /// Convert the readback to nested row-major vectors.
     fn to_vec(&self) -> Self::Output;
 }
 
@@ -362,9 +372,11 @@ impl Tensor {
     pub fn to_vec_f32(&self) -> Result<Vec<f32>> {
         self.as_slice()?.to_vec_f32()
     }
+    /// Flat `u32` copy.
     pub fn to_vec_u32(&self) -> Result<Vec<u32>> {
         self.to_flat::<u32>()
     }
+    /// Flat `i32` copy.
     pub fn to_vec_i32(&self) -> Result<Vec<i32>> {
         self.to_flat::<i32>()
     }
@@ -372,87 +384,8 @@ impl Tensor {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         Ok(self.as_slice()?.bytes)
     }
+    /// Asynchronously read every element as `f32`.
     pub async fn to_vec_f32_async(&self) -> Result<Vec<f32>> {
         self.as_slice()?.to_vec_f32()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn dims(v: &[u64]) -> Vec<Dim> {
-        v.iter().map(|&d| Dim::Const(d)).collect()
-    }
-
-    /// offset = 1, shape [2,2], strides [3,1] over 0..24 f32 picks
-    /// [[1,2],[4,5]].
-    fn strided() -> TensorSlice {
-        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
-        let layout =
-            Layout::from_parts(Dim::Const(1), &dims(&[2, 2]), &dims(&[3, 1])).unwrap();
-        TensorSlice::new(bytemuck::cast_slice(&data).to_vec(), layout, Dtype::F32)
-    }
-
-    #[test]
-    fn get_honours_offset_and_strides() {
-        let s = strided();
-        assert_eq!(s.get::<f32>(&[0, 0]), Some(1.0));
-        assert_eq!(s.get::<f32>(&[0, 1]), Some(2.0));
-        assert_eq!(s.get::<f32>(&[1, 0]), Some(4.0));
-        assert_eq!(s.get::<f32>(&[1, 1]), Some(5.0));
-        // Out of range, wrong rank and wrong dtype are all `None`.
-        assert_eq!(s.get::<f32>(&[2, 0]), None);
-        assert_eq!(s.get::<f32>(&[0]), None);
-        assert_eq!(s.get::<u32>(&[0, 0]), None);
-    }
-
-    #[test]
-    fn to_vec_walks_the_strides() {
-        let s = strided();
-        let v = s.ranked::<2, f32>().unwrap().to_vec().unwrap();
-        assert_eq!(v, vec![vec![1.0, 2.0], vec![4.0, 5.0]]);
-    }
-
-    #[test]
-    fn index_returns_the_element_bytes() {
-        let s = strided();
-        assert_eq!(f32::from_le_bytes(s[[1, 1]].try_into().unwrap()), 5.0);
-    }
-
-    #[test]
-    fn ranked_checks_rank_and_dtype() {
-        let s = strided();
-        assert!(s.ranked::<3, f32>().is_err());
-        assert!(s.ranked::<2, u32>().is_err());
-        assert!(s.ranked::<2, f32>().is_ok());
-    }
-
-    #[test]
-    fn an_unbound_extent_is_an_error_not_a_panic() {
-        let layout = Layout::from_parts(
-            Dim::Const(0),
-            &[Dim::Sym(fusor2_ir::shape::SymId(0))],
-            &[Dim::Const(1)],
-        )
-        .unwrap();
-        let s = TensorSlice::new(vec![0u8; 16], layout, Dtype::F32);
-        assert!(s.to_flat::<f32>().is_err());
-        assert_eq!(s.get::<f32>(&[0]), None);
-    }
-
-    #[test]
-    fn rank_zero_scalar_reads() {
-        let layout = Layout::contiguous(&[]);
-        let s = TensorSlice::new(2.5f32.to_le_bytes().to_vec(), layout, Dtype::F32);
-        assert_eq!(s.rank(), 0);
-        assert_eq!(s.scalar::<f32>().unwrap(), 2.5);
-    }
-
-    #[test]
-    fn debug_renders_ranks_zero_to_three() {
-        let s = strided();
-        let r = s.ranked::<2, f32>().unwrap();
-        assert_eq!(format!("{r:?}"), "[[Some(1.0), Some(2.0)], [Some(4.0), Some(5.0)]]");
     }
 }

@@ -1,6 +1,10 @@
-# SIMPLIFY — second-pass deletion census
+# SIMPLIFY — archived second-pass deletion census
 
-Census phase only. **Nothing was deleted for this document.** Every claim below
+> Historical measurement record, not the current API contract. See
+> [`API.md`](./API.md) for the supported façade. Current crate roots enforce
+> `unreachable_pub`, and the façade additionally enforces `missing_docs`.
+
+Census phase only. **Nothing was deleted during this census.** Every claim below
 is backed by pasted output from a token scan over both workspaces, a compile
 experiment (run and then reverted), or a call-graph fact. The first campaign's
 ranked list is exhausted (its seal is commit `ef3f07d`; −3,440 net Rust lines,

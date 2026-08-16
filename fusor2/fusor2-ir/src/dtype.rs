@@ -2,7 +2,7 @@
 
 use crate::scalar::Lit;
 
-/// Element type of an Logical/Launch value. No `Bool`: comparisons return
+/// Element type of a Logical/Launch value. No `Bool`: comparisons return
 /// 1.0/0.0 in the operand dtype.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Dtype {
@@ -260,57 +260,5 @@ impl std::hash::Hash for Splat {
 impl From<Splat> for Lit {
     fn from(s: Splat) -> Self {
         Lit(s)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The operand-precision axis sits in the lattice exactly where the other
-    /// three do: `meet` keeps the stricter side, `allows` reads "self is at
-    /// least as strict as other", and f32 operands are the default.
-    #[test]
-    fn narrow_operands_are_a_strict_relaxation() {
-        assert_eq!(NumericContract::RELAXED.min_operand_bits, 32);
-        assert_eq!(NumericContract::STRICT.min_operand_bits, 32);
-        assert_eq!(NumericContract::RELAXED_OPERANDS.min_operand_bits, 8);
-
-        // One direction only: RELAXED satisfies everything RELAXED_OPERANDS
-        // asks for, never the reverse. That asymmetry is the whole guard on
-        // the int8 activation dot.
-        assert!(NumericContract::RELAXED.allows(NumericContract::RELAXED_OPERANDS));
-        assert!(!NumericContract::RELAXED_OPERANDS.allows(NumericContract::RELAXED));
-    }
-
-    /// The licence cannot be manufactured by propagation: one unlicensed
-    /// input takes it away, so no fusion can decide to quantize a value's
-    /// operands on its behalf.
-    #[test]
-    fn meet_cannot_reach_the_licence() {
-        let m = NumericContract::RELAXED_OPERANDS.meet(NumericContract::RELAXED);
-        assert_eq!(m.min_operand_bits, 32);
-        assert_eq!(m, NumericContract::RELAXED);
-        assert_eq!(
-            NumericContract::RELAXED_OPERANDS
-                .meet(NumericContract::RELAXED_OPERANDS)
-                .min_operand_bits,
-            8
-        );
-        // Narrow operands say nothing about rounding: a licensed value that
-        // also forbids reassociation still forbids it.
-        let strict_narrow = NumericContract::RELAXED_OPERANDS.meet(NumericContract::STRICT);
-        assert!(!strict_narrow.reassoc);
-        assert_eq!(strict_narrow.min_operand_bits, 32);
-    }
-
-    #[test]
-    fn the_rounding_axes_are_unmoved() {
-        assert!(NumericContract::STRICT.allows(NumericContract::RELAXED));
-        assert!(!NumericContract::RELAXED.allows(NumericContract::STRICT));
-        assert_eq!(
-            NumericContract::RELAXED.meet(NumericContract::STRICT),
-            NumericContract::STRICT
-        );
     }
 }

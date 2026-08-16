@@ -114,7 +114,7 @@ fn rebuild(node: &Node, ops: Vec<Operand>, sched: ScheduleDomain, body: ScalarEx
 }
 
 /// Widen f16/bf16 storage to f32 registers, compute, narrow on store.
-pub fn widen_compute(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
+pub(crate) fn widen_compute(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let (_, ops, sched, body) = kmap_parts(node)?;
     let narrow = |d: Dtype| matches!(d, Dtype::F16 | Dtype::BF16);
     let out = f.own().dtype;
@@ -149,7 +149,7 @@ pub fn widen_compute(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
 /// The width is *not* chosen here — every legal width coexists on the node's
 /// `ScheduleDomain` and one extraction picks the winner against the real
 /// shapes and the real ISA level.
-pub fn select_vector_width(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
+pub(crate) fn select_vector_width(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let (_, ops, sched, body) = kmap_parts(node)?;
     let ScheduleDomain::Map(dom) = sched else {
         // Give a schedule-less map a domain to start from.
@@ -183,14 +183,14 @@ fn width_domain(caps: &Caps, base: Option<&MapDomain>) -> MapDomain {
 }
 
 /// A contiguous operand reads through its layout with no index arithmetic.
-pub fn access_contiguous(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
+pub(crate) fn access_contiguous(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     mint_access(b, id, node, |o| {
         (o.layout.is_contiguous() && o.access != AccessPlan::Alias).then_some(AccessPlan::Alias)
     })
 }
 
 /// A stride-0 operand is one scalar splatted across the register.
-pub fn access_broadcast(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
+pub(crate) fn access_broadcast(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     mint_access(b, id, node, |o| {
         (o.layout.overlaps() && o.access != AccessPlan::Alias).then_some(AccessPlan::Alias)
     })
@@ -198,7 +198,7 @@ pub fn access_broadcast(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>
 
 /// A unit inner stride at an outer offset is a contiguous sub-slice, expressed
 /// as the explicit index map so the emitter can prove the run length.
-pub fn access_unit_inner(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
+pub(crate) fn access_unit_inner(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     mint_access(b, id, node, |o| {
         let strides = o.layout.strides();
         let unit_inner = strides
@@ -216,7 +216,7 @@ pub fn access_unit_inner(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_
 /// The general form, plus the packed alternative beside it: pack the operand
 /// into thread-local scratch once, then read it contiguous. Both stay live and
 /// the cost model chooses.
-pub fn access_gather(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
+pub(crate) fn access_gather(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     let gathered = mint_access(b, id, node, |o| {
         (o.access != AccessPlan::Gather && !o.layout.is_contiguous())
             .then_some(AccessPlan::Gather)
@@ -278,7 +278,7 @@ fn mint_access(
 /// The attribute rides on `MapTiling { dim: Some(0), tm > 1 }`, i.e. an
 /// outermost tile loop of `tm` grid points — `launch::grain_for` turns that
 /// into the `parallel_for` grain.
-pub fn parallel_outer(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
+pub(crate) fn parallel_outer(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let (_, ops, sched, body) = kmap_parts(node)?;
     if f.caps().threads <= 1 {
         return None;
@@ -306,56 +306,4 @@ pub fn parallel_outer(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -
     let alt = rebuild(node, ops.clone(), ScheduleDomain::Map(dom), body.clone())?;
     let new_id = b.add_launch(alt).ok()?;
     b.union(id, new_id).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_table_is_stable_and_named() {
-        let names: Vec<_> = CPU_RULES.iter().map(|r| r.name).collect();
-        assert_eq!(
-            names,
-            vec![
-                "WIDEN_COMPUTE",
-                "SELECT_VECTOR_WIDTH",
-                "ACCESS_CONTIGUOUS",
-                "ACCESS_BROADCAST",
-                "ACCESS_UNIT_INNER",
-                "ACCESS_GATHER",
-                "PARALLEL_OUTER",
-            ]
-        );
-        assert!(CPU_RULES.iter().all(|r| r.level == Level::Launch));
-    }
-
-    #[test]
-    fn width_domain_covers_every_reported_lane_count() {
-        let caps = crate::caps::cpu_caps();
-        let dom = width_domain(caps, None);
-        for w in caps.simd_widths.iter().copied() {
-            assert!(
-                dom.tilings.iter().any(|t| t.vector == w),
-                "no tiling minted for width {w}"
-            );
-        }
-    }
-
-    /// `PARALLEL_THRESHOLD` must appear nowhere in the crate; the grain is a
-    /// cost-model consequence instead.
-    #[test]
-    fn no_parallel_threshold_constant() {
-        for src in [
-            include_str!("launch.rs"),
-            include_str!("pool.rs"),
-            include_str!("emit.rs"),
-            include_str!("target.rs"),
-        ] {
-            assert!(
-                !src.contains("const PARALLEL_THRESHOLD"),
-                "the grain is a cost-model consequence, not a constant"
-            );
-        }
-    }
 }

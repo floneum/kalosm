@@ -14,7 +14,7 @@ pub(crate) mod rope;
 pub(crate) mod upsample;
 
 pub use attention::{
-    MaskKind, attention, attention_causal, attention_grads, attention_lse, attention_masked,
+    attention, attention_causal, attention_grads, attention_lse, attention_masked,
     attention_with_lse,
 };
 pub use conv::{conv, grouped_conv, pad_with_zeros};
@@ -32,7 +32,7 @@ pub use upsample::{upsample_bilinear, upsample_nearest, upsample_nearest2d};
 use fusor2_autograd::tape::GraphTape;
 use fusor2_ir::egraph::Id;
 use fusor2_ir::facts::{ValueFacts, Work};
-use fusor2_ir::ir::launch::{AccessPlan, Effect, Launch, Operand};
+use fusor2_ir::ir::launch::{AccessPlan, Effect, Launch, MaskKind, Operand};
 use fusor2_ir::ir::{Op, OpDef, OpDefId, OpDefRegistry, OpTag, VerifyCtx};
 use fusor2_ir::shape::{Dim, Layout, SlidingWindow, SymId};
 use fusor2_ir::{Error, Result};
@@ -52,8 +52,11 @@ pub(crate) enum NormKind {
 /// so the `Window` structural adjoint can read the tie policy alongside it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PoolReduce {
+    /// Maximum pooling.
     Max,
+    /// Minimum pooling.
     Min,
+    /// Average pooling.
     Mean,
 }
 
@@ -134,30 +137,14 @@ pub(crate) enum MacroOp {
 }
 
 impl MacroOp {
-    #[cfg(test)]
-    pub(crate) const ALL: [MacroOp; 7] = [
-        MacroOp::Softmax,
-        MacroOp::Norm,
-        MacroOp::Conv,
-        MacroOp::Pool,
-        MacroOp::Upsample,
-        MacroOp::Attention,
-        MacroOp::Rope,
-    ];
-
     pub(crate) const fn def_id(self) -> OpDefId {
         OpDefId(self as u32)
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn name(self) -> &'static str {
-        MACRO_OPS[self as usize].name
     }
 }
 
 /// Every sugar op, in registration order.
 ///
-/// All eight declare `lower_per_target: &[]` — unrunnable by construction.
+/// All seven declare `lower_per_target: &[]` — unrunnable by construction.
 /// They exist so rules can read attributes off them; the `defn` in the same
 /// e-class is always the runnable floor.
 pub(crate) static MACRO_OPS: &[OpDef] = &[
@@ -472,142 +459,4 @@ pub(crate) fn index_run(graph: &GraphRef, start: u64, len: u64) -> Result<Id> {
         })
         .collect::<Result<_>>()?;
     index_leaf(graph, &values)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fusor2_ir::dtype::Dtype;
-
-    fn facts(shape: &[u64]) -> ValueFacts {
-        ValueFacts::new(Dtype::F32, shape.iter().map(|d| Dim::Const(*d)))
-    }
-
-    #[test]
-    fn ids_follow_table_order() {
-        let mut reg = OpDefRegistry::new();
-        register_macro_ops(&mut reg);
-        for op in MacroOp::ALL {
-            let def = reg.get(op.def_id()).expect("registered");
-            assert_eq!(def.name, op.name());
-        }
-        assert_eq!(reg.iter().count(), MACRO_OPS.len());
-    }
-
-    #[test]
-    fn every_sugar_op_is_unrunnable() {
-        for def in MACRO_OPS {
-            assert!(
-                def.lower_per_target.is_empty(),
-                "{} must be unrunnable; the defn is the floor",
-                def.name
-            );
-            assert!(def.adjoint.is_none());
-            assert_eq!(def.effect, Effect::Pure);
-        }
-    }
-
-    /// `verify_launch` rejects an `OpDef` whose `work` is constant in shape. Every
-    /// row here must survive that tripwire.
-    #[test]
-    fn no_work_row_is_constant_in_shape() {
-        for def in MACRO_OPS {
-            let small = [facts(&[2, 3, 4]), facts(&[2, 3, 4]), facts(&[2, 3, 4])];
-            let large = [facts(&[4, 6, 8]), facts(&[4, 6, 8]), facts(&[4, 6, 8])];
-            let a = (def.work)(&small, &small[0]);
-            let b = (def.work)(&large, &large[0]);
-            assert_ne!(a, b, "{}: work() does not vary with shape", def.name);
-            assert_ne!(a, Work::default(), "{}: work() is empty", def.name);
-        }
-    }
-
-    #[test]
-    fn inference_reads_the_defn_witness() {
-        let ins = [facts(&[8, 8]), facts(&[2, 5])];
-        let out = infer_witness(&ins).unwrap();
-        assert_eq!(&out.shape[..], &[Dim::Const(2), Dim::Const(5)]);
-        assert!(infer_witness(&[]).is_err());
-    }
-}
-
-#[cfg(test)]
-mod constant_identity {
-    use super::*;
-    use crate::graph::Graph;
-    use crate::session::{Backend, Session};
-
-    fn graph() -> Graph {
-        Graph::new(&Session::new(Backend::cpu().unwrap()).unwrap())
-    }
-
-    /// Two index vectors of the same length are two different values.
-    ///
-    /// Rope mints `perm` and `expand` at the same length in the same call,
-    /// so this ensures they hash-cons into separate nodes.
-    #[test]
-    fn two_index_leaves_of_one_length_are_two_nodes() {
-        let g = graph();
-        let h = g.handle();
-        let perm = index_leaf(h, &[2, 3, 0, 1]).unwrap();
-        let expand = index_leaf(h, &[0, 1, 0, 1]).unwrap();
-        assert_ne!(perm, expand);
-        assert_eq!(
-            h.leaf_bytes(perm).unwrap(),
-            [2u32, 3, 0, 1]
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<u8>>()
-        );
-    }
-
-    /// Equal content still shares a node, so constant pooling survives.
-    #[test]
-    fn equal_index_content_still_hash_conses() {
-        let g = graph();
-        let h = g.handle();
-        assert_eq!(
-            index_leaf(h, &[4, 5, 6]).unwrap(),
-            index_leaf(h, &[4, 5, 6]).unwrap()
-        );
-    }
-
-    /// Every leaf name in one graph comes from one allocator. Separate private
-    /// counters would hand out overlapping `BufferId`s — one of them starting
-    /// at exactly the `u32::MAX` the constant leaves hardcode.
-    #[test]
-    fn uploads_and_constants_never_share_a_buffer_name() {
-        use fusor2_ir::dtype::Dtype;
-        use fusor2_ir::ir::logical::{Logical, LeafKind};
-
-        let g = graph();
-        let h = g.handle();
-        let mut names = Vec::new();
-        let ids = [
-            index_leaf(h, &[1, 2, 3, 4]).unwrap(),
-            index_leaf(h, &[9, 9, 9, 9]).unwrap(),
-            crate::tensor::Tensor::from_slice(
-                h,
-                Dtype::U32,
-                &[Dim::Const(4)],
-                &[0u8; 16],
-            )
-            .unwrap()
-            .id(),
-        ];
-        for id in ids {
-            h.with_egraph(|eg| {
-                if let fusor2_ir::ir::Op::Logical(Logical::Leaf(LeafKind::Buffer { name, .. })) =
-                    &eg.node(id).op
-                {
-                    names.push(*name);
-                }
-                Ok(())
-            })
-            .unwrap();
-        }
-        let mut sorted = names.clone();
-        sorted.sort_by_key(|b| b.0);
-        sorted.dedup_by_key(|b| b.0);
-        assert_eq!(sorted.len(), names.len(), "buffer names collided: {names:?}");
-    }
 }

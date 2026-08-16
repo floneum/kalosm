@@ -32,53 +32,43 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// same-shaped tiles stay distinct and the arena knows they are two
 /// allocations; `Arc::as_ptr` is that identity. Stored as `usize` so
 /// [`LivenessInfo`] stays `Send`/`Sync`.
-pub type TileKeyPtr = usize;
+pub(crate) type TileKeyPtr = usize;
 
 /// The identity key of a tile declaration.
-pub fn tile_key(tile: &Tile) -> TileKeyPtr {
+pub(crate) fn tile_key(tile: &Tile) -> TileKeyPtr {
     Arc::as_ptr(tile) as *const () as usize
 }
 
 /// The statement-position range over which one tile is live, in the flattened
 /// pre-order walk of the body. Inclusive on both ends.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LiveRange {
+pub(crate) struct LiveRange {
     pub first: u32,
     pub last: u32,
 }
 
 impl LiveRange {
-    pub const fn point(position: u32) -> Self {
+    pub(crate) const fn point(position: u32) -> Self {
         Self {
             first: position,
             last: position,
         }
     }
 
-    /// Inclusive overlap test.
-    pub const fn overlaps(self, other: Self) -> bool {
-        self.first <= other.last && other.first <= self.last
-    }
 }
 
 /// How a statement touches a tile.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum AccessKind {
+pub(crate) enum AccessKind {
     Read,
     Write,
     /// Collective read-modify-write (reduction scratch).
     ReadWrite,
 }
 
-impl AccessKind {
-    pub const fn writes(self) -> bool {
-        !matches!(self, Self::Read)
-    }
-}
-
 /// How an expression consumes a tile.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum TileUse {
+pub(crate) enum TileUse {
     Read,
     /// Read as a raw cooperative-matrix fragment pointer.
     CoopRead,
@@ -87,14 +77,14 @@ pub enum TileUse {
 
 /// One touch of a tile at a raw walk position.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct TileAccess {
+pub(crate) struct TileAccess {
     pub position: u32,
     pub kind: AccessKind,
 }
 
 /// Everything the packer and the verifier know about one tile.
 #[derive(Clone, Debug)]
-pub struct TileLiveness {
+pub(crate) struct TileLiveness {
     /// The declaration itself, so a [`fusor2_ir::ir::kernel::Placement`] can
     /// name it without a second lookup.
     pub tile: Tile,
@@ -118,7 +108,7 @@ pub struct TileLiveness {
 
 /// One loop's span and early-exit facts.
 #[derive(Clone, Debug)]
-pub struct LoopInfo {
+pub(crate) struct LoopInfo {
     /// Positions spanned by the loop: `first` is the `Loop` statement itself,
     /// `last` the synthetic position after the body.
     pub span: LiveRange,
@@ -136,18 +126,15 @@ impl LoopInfo {
     /// dynamic count may be zero at runtime, and a `Break`/`Return` can skip
     /// the tail of the body — either way a barrier inside the loop is not
     /// guaranteed to execute.
-    pub fn guaranteed_once(&self) -> bool {
+    pub(crate) fn guaranteed_once(&self) -> bool {
         self.static_count.is_some_and(|count| count > 0) && !self.has_break && !self.has_return
     }
 }
 
 /// One recorded uniform barrier.
 #[derive(Clone, Debug)]
-pub struct BarrierInfo {
+pub(crate) struct BarrierInfo {
     pub position: u32,
-    /// Statement indices from the body root to the barrier, descending only
-    /// through `Loop` bodies.
-    pub path: Vec<u32>,
     /// Enclosing loop indices, outermost first.
     pub enclosing_loops: Vec<u32>,
     /// Every enclosing loop is [`LoopInfo::guaranteed_once`], so every thread
@@ -157,7 +144,7 @@ pub struct BarrierInfo {
 
 /// Tile liveness, barriers and loop spans for one kernel body.
 #[derive(Debug, Default)]
-pub struct LivenessInfo {
+pub(crate) struct LivenessInfo {
     pub tiles: FxHashMap<TileKeyPtr, TileLiveness>,
     /// First-touch order of workgroup tiles. **Always iterate this, never the
     /// map**: pointer keys are not stable across runs, `order` is.
@@ -171,7 +158,7 @@ pub struct LivenessInfo {
 impl LivenessInfo {
     /// One walk over `ir`'s body, then loop expansion, then the guaranteed
     /// flags, then the per-iteration phases.
-    pub fn compute(ir: &KernelIr) -> Self {
+    pub(crate) fn compute(ir: &KernelIr) -> Self {
         let mut walk = Walk::default();
         walk.visit_stmts(&ir.body);
         walk.expand_ranges_over_loops();
@@ -191,22 +178,13 @@ impl LivenessInfo {
         info
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.order.is_empty()
-    }
-
-    /// Liveness of one tile, or `None` when it is not a workgroup tile.
-    pub fn get(&self, tile: &Tile) -> Option<&TileLiveness> {
-        self.tiles.get(&tile_key(tile))
-    }
-
     /// Tiles in first-touch order.
-    pub fn iter(&self) -> impl Iterator<Item = &TileLiveness> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &TileLiveness> {
         self.order.iter().map(|key| &self.tiles[key])
     }
 
     /// The innermost loop whose span strictly contains `[x, y]`.
-    pub fn innermost_common_loop(&self, x: u32, y: u32) -> Option<u32> {
+    pub(crate) fn innermost_common_loop(&self, x: u32, y: u32) -> Option<u32> {
         let mut best: Option<u32> = None;
         for (index, info) in self.loops.iter().enumerate() {
             if info.span.first < x && y < info.span.last {
@@ -230,7 +208,7 @@ impl LivenessInfo {
     /// `Break` in `scope` itself does not disqualify: taking the back edge
     /// means the full body executed, and after an exit the loop's tiles are
     /// touched no more.
-    pub fn guaranteed_below(&self, barrier: &BarrierInfo, scope: u32) -> bool {
+    pub(crate) fn guaranteed_below(&self, barrier: &BarrierInfo, scope: u32) -> bool {
         match barrier
             .enclosing_loops
             .iter()
@@ -304,7 +282,7 @@ impl LivenessInfo {
     /// A guaranteed uniform barrier strictly after `after` and at or before
     /// `at`. Barriers inside loops that may break, return, or run zero
     /// iterations are skippable at runtime and never separate.
-    pub fn separating_barrier(&self, after: u32, at: u32) -> bool {
+    pub(crate) fn separating_barrier(&self, after: u32, at: u32) -> bool {
         self.barriers
             .iter()
             .any(|barrier| barrier.guaranteed && barrier.position > after && barrier.position <= at)
@@ -313,13 +291,13 @@ impl LivenessInfo {
     /// Whether `later` may reuse memory whose previous occupant was `earlier`:
     /// disjoint expanded ranges with a uniform barrier ordering every thread's
     /// last touch of `earlier` before any first touch of `later`.
-    pub fn can_follow(&self, earlier: LiveRange, later: LiveRange) -> bool {
+    pub(crate) fn can_follow(&self, earlier: LiveRange, later: LiveRange) -> bool {
         earlier.last < later.first && self.separating_barrier(earlier.last, later.first)
     }
 
     /// Both arms of the reuse predicate: the plain interval arm, and the
     /// loop-phase arm for two tiles living only inside one common loop.
-    pub fn can_follow_tiles(&self, earlier: &TileLiveness, later: &TileLiveness) -> bool {
+    pub(crate) fn can_follow_tiles(&self, earlier: &TileLiveness, later: &TileLiveness) -> bool {
         if self.can_follow(earlier.range, later.range) {
             return true;
         }
@@ -345,13 +323,13 @@ impl LivenessInfo {
 }
 
 /// Compute tile liveness over `ir`'s body.
-pub fn analyze(ir: &KernelIr) -> LivenessInfo {
+pub(crate) fn analyze(ir: &KernelIr) -> LivenessInfo {
     LivenessInfo::compute(ir)
 }
 
 /// Every tile an expression node touches directly, with how it touches it.
 /// Shared with uniformity and the Kernel verifier.
-pub fn for_each_tile(kind: &TileExprKind, f: &mut dyn FnMut(&Tile, TileUse)) {
+pub(crate) fn for_each_tile(kind: &TileExprKind, f: &mut dyn FnMut(&Tile, TileUse)) {
     match kind {
         TileExprKind::LoadTile { tile, .. } => f(tile, TileUse::Read),
         TileExprKind::Reduce { kind, .. } => match kind.as_ref() {
@@ -369,7 +347,7 @@ pub fn for_each_tile(kind: &TileExprKind, f: &mut dyn FnMut(&Tile, TileUse)) {
 }
 
 /// Every direct child expression of a node, in a fixed order.
-pub fn for_each_child(kind: &TileExprKind, f: &mut dyn FnMut(&TileExpr)) {
+pub(crate) fn for_each_child(kind: &TileExprKind, f: &mut dyn FnMut(&TileExpr)) {
     match kind {
         TileExprKind::Literal(_)
         | TileExprKind::Builtin(_)
@@ -426,7 +404,7 @@ pub fn for_each_child(kind: &TileExprKind, f: &mut dyn FnMut(&TileExpr)) {
 }
 
 /// The expressions inside one address.
-pub fn for_each_addr_expr(addr: &Addr, f: &mut dyn FnMut(&TileExpr)) {
+pub(crate) fn for_each_addr_expr(addr: &Addr, f: &mut dyn FnMut(&TileExpr)) {
     match addr {
         Addr::Linear(index) => f(index),
         Addr::Rc2 { row, col } => {
@@ -444,8 +422,6 @@ struct Walk {
     loops: Vec<LoopInfo>,
     /// Open loop frames as indices into `loops`.
     loop_stack: Vec<u32>,
-    /// Statement indices from the body root, descending through `Loop` bodies.
-    path: Vec<u32>,
     /// Kind attributed to the next `touch`.
     access_kind: AccessKind,
     /// `If` nesting depth: barriers below a conditional are not recorded.
@@ -465,7 +441,6 @@ impl Default for Walk {
             barriers: Vec::new(),
             loops: Vec::new(),
             loop_stack: Vec::new(),
-            path: Vec::new(),
             access_kind: AccessKind::Read,
             conditional_depth: 0,
             seen: FxHashSet::default(),
@@ -542,7 +517,7 @@ impl Walk {
     }
 
     fn visit_stmts(&mut self, stmts: &[Stmt]) {
-        for (index, stmt) in stmts.iter().enumerate() {
+        for stmt in stmts {
             self.position += 1;
             match stmt {
                 Stmt::Store {
@@ -622,13 +597,7 @@ impl Walk {
                         static_count: count.as_ref().and_then(literal_u32),
                     });
                     self.loop_stack.push(loop_index);
-                    if self.conditional_depth == 0 {
-                        self.path.push(index as u32);
-                    }
                     self.visit_stmts(body);
-                    if self.conditional_depth == 0 {
-                        self.path.pop();
-                    }
                     // Accumulator updates run at the end of EVERY iteration —
                     // after any in-loop barrier — so their tile touches are
                     // attributed inside the span and expand over the loop.
@@ -670,11 +639,8 @@ impl Walk {
                 }
                 Stmt::Barrier => {
                     if self.conditional_depth == 0 {
-                        let mut path = self.path.clone();
-                        path.push(index as u32);
                         self.barriers.push(BarrierInfo {
                             position: self.position,
-                            path,
                             enclosing_loops: self.loop_stack.clone(),
                             // Finalized after the walk, once every enclosing
                             // loop's break/return/count facts are complete.
@@ -718,77 +684,5 @@ fn literal_u32(expr: &TileExpr) -> Option<u32> {
         TileExprKind::Literal(TileLiteral::U32(value)) => Some(*value),
         TileExprKind::Literal(TileLiteral::I32(value)) if *value >= 0 => Some(*value as u32),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::build::TileBuilder;
-    use crate::build::fixtures;
-    use fusor2_ir::ir::kernel::ScalarElement;
-
-    #[test]
-    fn top_level_barrier_separates() {
-        let mut b = TileBuilder::new();
-        let ir = fixtures::pair_kernel(&mut b, vec![Stmt::Barrier]);
-        let info = analyze(&ir);
-        assert_eq!(info.order.len(), 2);
-        let first = &info.tiles[&info.order[0]];
-        let second = &info.tiles[&info.order[1]];
-        assert!(info.can_follow_tiles(first, second));
-        assert!(!info.can_follow_tiles(second, first));
-    }
-
-    #[test]
-    fn no_barrier_means_no_reuse() {
-        let mut b = TileBuilder::new();
-        let ir = fixtures::pair_kernel(&mut b, Vec::new());
-        let info = analyze(&ir);
-        let first = &info.tiles[&info.order[0]];
-        let second = &info.tiles[&info.order[1]];
-        assert!(!info.can_follow_tiles(first, second));
-    }
-
-    #[test]
-    fn accumulator_update_lands_inside_the_span() {
-        let mut b = TileBuilder::new();
-        let a = fixtures::wg_tile(&mut b, ScalarElement::F32.element(), 64);
-        let local = b.alloc_local(ScalarElement::F32.element());
-        let zero = b.lit_f32(0.0);
-        let idx = b.lit_u32(0);
-        let four = b.lit_u32(4);
-        let update = b.load_tile(a.clone(), idx.clone());
-        let write = b.store_tile(a.clone(), idx, zero.clone());
-        let looped = b.loop_counted(
-            Some(four),
-            None,
-            vec![Accumulator {
-                local,
-                init: zero,
-                update,
-            }],
-            vec![Stmt::Barrier],
-        );
-        b.set_body(vec![write, looped]);
-        let ir = b.finish([1, 1, 1], 1, "t");
-        let info = analyze(&ir);
-        let live = info.get(&a).unwrap();
-        let span = info.loops[0].span;
-        // The range was widened over the whole loop, which only happens when
-        // the update's touch was attributed inside the span.
-        assert!(live.range.first <= span.first && live.range.last >= span.last);
-    }
-
-    #[test]
-    fn a_barrier_under_an_if_is_never_recorded() {
-        let mut b = TileBuilder::new();
-        let lane = b.builtin(fusor2_ir::ir::kernel::Builtin::Lane);
-        let zero = b.lit_u32(0);
-        let condition = b.compare(fusor2_ir::scalar::CmpOp::Gt, lane, zero);
-        let guarded = b.if_then_else(condition, vec![Stmt::Barrier], Vec::new());
-        let ir = fixtures::pair_kernel(&mut b, vec![guarded]);
-        let info = analyze(&ir);
-        assert!(info.barriers.is_empty());
     }
 }

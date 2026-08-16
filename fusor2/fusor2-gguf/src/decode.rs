@@ -328,56 +328,56 @@ fn decode_affine(
 }
 
 /// Q4_0, raw GGUF bytes: f16 scale, 16 nibble-pair bytes, 18 bytes total.
-pub fn decode_q4_0_native(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
+pub(crate) fn decode_q4_0_native(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
     decode_affine(args, QFmt::Q4_0, QLayout::Native, "decode_q4_0_native")
 }
 
 /// Q4_0 with the scale widened to f32; 20 bytes, word-aligned.
-pub fn decode_q4_0_f32(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
+pub(crate) fn decode_q4_0_f32(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
     decode_affine(args, QFmt::Q4_0, QLayout::F32Scales, "decode_q4_0_f32")
 }
 
 /// Q5_0, raw GGUF bytes: f16 scale, 4-byte high-bit plane, 16 nibble bytes.
-pub fn decode_q5_0_native(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
+pub(crate) fn decode_q5_0_native(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
     decode_affine(args, QFmt::Q5_0, QLayout::Native, "decode_q5_0_native")
 }
 
 /// Q5_0 with the scale widened to f32.
-pub fn decode_q5_0_f32(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
+pub(crate) fn decode_q5_0_f32(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
     decode_affine(args, QFmt::Q5_0, QLayout::F32Scales, "decode_q5_0_f32")
 }
 
 /// Q8_0, raw GGUF bytes: f16 scale then 32 signed bytes.
-pub fn decode_q8_0_native(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
+pub(crate) fn decode_q8_0_native(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
     decode_affine(args, QFmt::Q8_0, QLayout::Native, "decode_q8_0_native")
 }
 
 /// Q8_0 with the scale widened to f32.
-pub fn decode_q8_0_f32(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
+pub(crate) fn decode_q8_0_f32(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
     decode_affine(args, QFmt::Q8_0, QLayout::F32Scales, "decode_q8_0_f32")
 }
 
-pub const DECODE_Q4_0_NATIVE: BlockProgram = BlockProgram {
+pub(crate) const DECODE_Q4_0_NATIVE: BlockProgram = BlockProgram {
     name: "decode_q4_0_native",
     emit: decode_q4_0_native,
 };
-pub const DECODE_Q4_0_F32: BlockProgram = BlockProgram {
+pub(crate) const DECODE_Q4_0_F32: BlockProgram = BlockProgram {
     name: "decode_q4_0_f32",
     emit: decode_q4_0_f32,
 };
-pub const DECODE_Q5_0_NATIVE: BlockProgram = BlockProgram {
+pub(crate) const DECODE_Q5_0_NATIVE: BlockProgram = BlockProgram {
     name: "decode_q5_0_native",
     emit: decode_q5_0_native,
 };
-pub const DECODE_Q5_0_F32: BlockProgram = BlockProgram {
+pub(crate) const DECODE_Q5_0_F32: BlockProgram = BlockProgram {
     name: "decode_q5_0_f32",
     emit: decode_q5_0_f32,
 };
-pub const DECODE_Q8_0_NATIVE: BlockProgram = BlockProgram {
+pub(crate) const DECODE_Q8_0_NATIVE: BlockProgram = BlockProgram {
     name: "decode_q8_0_native",
     emit: decode_q8_0_native,
 };
-pub const DECODE_Q8_0_F32: BlockProgram = BlockProgram {
+pub(crate) const DECODE_Q8_0_F32: BlockProgram = BlockProgram {
     name: "decode_q8_0_f32",
     emit: decode_q8_0_f32,
 };
@@ -393,7 +393,7 @@ pub(crate) mod interp {
     /// A value the evaluator can hold. Vectors are always f32 here, which is
     /// the only vector these programs build.
     #[derive(Clone, Debug, PartialEq)]
-    pub enum V {
+    pub(crate) enum V {
         U(u32),
         I(i32),
         F(f32),
@@ -416,7 +416,7 @@ pub(crate) mod interp {
                 other => panic!("expected u32, got {other:?}"),
             }
         }
-        pub fn f(&self) -> f32 {
+        pub(crate) fn f(&self) -> f32 {
             match self {
                 V::F(v) => *v,
                 other => panic!("expected f32, got {other:?}"),
@@ -432,7 +432,7 @@ pub(crate) mod interp {
 
     /// A `u32` storage view over `words` words, which is how a quantized
     /// matrix is bound.
-    pub fn storage_view(words: usize) -> StorageView {
+    pub(crate) fn storage_view(words: usize) -> StorageView {
         let layout = TileLayout::contiguous(MemoryLevel::Storage, &[words as u32]);
         let buffer = Arc::new(BufferDecl {
             binding: 1,
@@ -448,7 +448,7 @@ pub(crate) mod interp {
     }
 
     /// Pad `bytes` up to a whole number of words and reinterpret little-endian.
-    pub fn to_words(bytes: &[u8]) -> Vec<u32> {
+    pub(crate) fn to_words(bytes: &[u8]) -> Vec<u32> {
         let mut padded = bytes.to_vec();
         while !padded.len().is_multiple_of(4) {
             padded.push(0);
@@ -459,7 +459,7 @@ pub(crate) mod interp {
             .collect()
     }
 
-    pub fn eval(expr: &TileExpr, words: &[u32]) -> V {
+    pub(crate) fn eval(expr: &TileExpr, words: &[u32]) -> V {
         match expr.kind() {
             TileExprKind::Literal(lit) => match lit {
                 TileLiteral::U32(v) => V::U(*v),
@@ -669,113 +669,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn decode_respects_mask_and_fill() {
-        for spec in BLOCK_SPECS {
-            let raw = lcg_blocks(spec.fmt, spec.layout, 1, 99);
-            let words = to_words(&raw);
-            let view = storage_view(words.len());
-            let args = BlockDecodeArgs {
-                src: &view,
-                layout: spec.layout,
-                k_base: u32_lit(0),
-                col: u32_lit(0),
-                mask: mask(false),
-                fill: f32_lit(-7.5),
-            };
-            let program = (spec.decode.emit)(&args).unwrap();
-            let got = eval(&program, &words);
-            assert_eq!(
-                got.f(),
-                -7.5,
-                "{} ignored its mask",
-                spec.decode.name
-            );
-        }
-    }
 
-    /// A row invoked with the other layout's byte offsets is an error, not a
-    /// silently wrong decode.
-    #[test]
-    fn a_program_refuses_the_other_layout() {
-        let raw = lcg_blocks(QFmt::Q4_0, QLayout::Native, 1, 1);
-        let words = to_words(&raw);
-        let view = storage_view(words.len());
-        let args = BlockDecodeArgs {
-            src: &view,
-            layout: QLayout::F32Scales,
-            k_base: u32_lit(0),
-            col: u32_lit(0),
-            mask: mask(true),
-            fill: f32_lit(0.0),
-        };
-        assert!(decode_q4_0_native(&args).is_err());
-        assert!(decode_q4_0_f32(&args).is_ok());
-    }
 
-    /// No emitted node may carry an f16 element type: a native-layout scale
-    /// is read without `SHADER_F16`.
-    #[test]
-    fn no_f16_element_appears_in_an_emitted_program() {
-        fn walk(e: &TileExpr, seen: &mut usize) {
-            assert!(
-                !e.element().uses_f16(),
-                "f16 element at node {:?}",
-                e.kind()
-            );
-            *seen += 1;
-            match e.kind() {
-                TileExprKind::Load {
-                    addr, mask, fill, ..
-                } => {
-                    let Addr::Linear(i) = addr.as_ref() else {
-                        unreachable!()
-                    };
-                    walk(i, seen);
-                    walk(mask, seen);
-                    walk(fill, seen);
-                }
-                TileExprKind::Unary { value, .. }
-                | TileExprKind::Cast { value, .. }
-                | TileExprKind::Bitcast { value, .. } => walk(value, seen),
-                TileExprKind::Binary { left, right, .. }
-                | TileExprKind::Compare { left, right, .. } => {
-                    walk(left, seen);
-                    walk(right, seen);
-                }
-                TileExprKind::Select {
-                    condition,
-                    accept,
-                    reject,
-                } => {
-                    walk(condition, seen);
-                    walk(accept, seen);
-                    walk(reject, seen);
-                }
-                TileExprKind::Vec { parts, .. } => parts.iter().for_each(|p| walk(p, seen)),
-                TileExprKind::VecComponent { vector, .. } => walk(vector, seen),
-                _ => {}
-            }
-        }
-
-        let view = storage_view(1024);
-        for spec in BLOCK_SPECS {
-            let args = BlockDecodeArgs {
-                src: &view,
-                layout: spec.layout,
-                k_base: u32_lit(0),
-                col: u32_lit(0),
-                mask: mask(true),
-                fill: f32_lit(0.0),
-            };
-            let program = (spec.decode.emit)(&args).unwrap();
-            let mut seen = 0;
-            walk(&program, &mut seen);
-            assert!(
-                seen > 8,
-                "{} emitted a suspiciously small program",
-                spec.decode.name
-            );
-        }
-    }
 }

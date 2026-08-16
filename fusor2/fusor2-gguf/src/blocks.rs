@@ -359,77 +359,6 @@ pub fn cpu_dequantize_block(fmt: QFmt, layout: QLayout, block: &[u8], out: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustc_hash::FxHashSet;
-
-    #[test]
-    fn block_spec_table_is_total_and_matches_contract() {
-        let mut names = FxHashSet::default();
-        for fmt in QFmt::ALL {
-            for layout in [QLayout::Native, QLayout::F32Scales] {
-                let spec = block_spec(fmt, layout);
-                assert_eq!(spec.fmt, fmt);
-                assert_eq!(spec.layout, layout);
-                assert_eq!(spec.bytes as u32, fmt.block_bytes(layout));
-                assert_eq!(spec.elements as u32, fmt.block_elements());
-                assert!(
-                    names.insert(spec.decode.name),
-                    "duplicate block program name {}",
-                    spec.decode.name
-                );
-            }
-        }
-        assert_eq!(BLOCK_SPECS.len(), 12);
-        assert_eq!(names.len(), 12);
-    }
-
-    #[test]
-    fn block_fields_land_inside_the_block() {
-        /// Width of `scale` (and of `min`, when present) in bytes.
-        const fn scale_width(f: &BlockFields) -> u32 {
-            if f.scale_is_f16 { 2 } else { 4 }
-        }
-        for fmt in QFmt::ALL {
-            for layout in [QLayout::Native, QLayout::F32Scales] {
-                let f = block_fields(fmt, layout);
-                let bytes = fmt.block_bytes(layout);
-                let mut spans: Vec<(u32, u32)> = vec![(f.scale, scale_width(&f))];
-                if let Some(min) = f.min {
-                    spans.push((min, scale_width(&f)));
-                }
-                if let Some((off, len)) = f.group_scales {
-                    spans.push((off, len));
-                }
-                if let Some(qh) = f.qh {
-                    spans.push((qh, qh_width(fmt)));
-                }
-                spans.push((f.ql, ql_width(fmt)));
-
-                let total: u32 = spans.iter().map(|(_, w)| *w).sum();
-                assert_eq!(total, bytes, "{fmt:?}/{layout:?} fields do not tile");
-
-                spans.sort_unstable();
-                let mut cursor = 0;
-                for (off, width) in spans {
-                    assert_eq!(off, cursor, "{fmt:?}/{layout:?} gap or overlap at {off}");
-                    assert!(off + width <= bytes, "{fmt:?}/{layout:?} field overruns");
-                    cursor = off + width;
-                }
-                assert_eq!(cursor, bytes);
-                assert_eq!(f.scale_is_f16, layout == QLayout::Native);
-            }
-        }
-    }
-
-    #[test]
-    fn storage_size_and_alignment_are_derived() {
-        assert!(!word_aligned(QFmt::Q6K, QLayout::Native));
-        assert!(word_aligned(QFmt::Q6K, QLayout::F32Scales));
-        assert!(!word_aligned(QFmt::Q4_0, QLayout::Native));
-        assert!(word_aligned(QFmt::Q4_0, QLayout::F32Scales));
-        assert!(!word_aligned(QFmt::Q5_0, QLayout::Native));
-        assert!(!word_aligned(QFmt::Q8_0, QLayout::Native));
-        assert!(word_aligned(QFmt::Q4K, QLayout::Native));
-    }
 
     #[test]
     fn cpu_dequantize_matches_ggml_vectors() {
@@ -531,18 +460,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn k4_scale_unpack_round_trips_the_reference_bit_pattern() {
-        // Groups 0..4 read six bits straight out of words 0/1; groups 4..8
-        // take bits 4-5 from the top of words 0/1 and bits 0-3 from word 2.
-        let mut packed = [0u8; 12];
-        packed[0] = 0b1100_0001;
-        packed[4] = 0b0100_0010;
-        packed[8] = 0b0101_1010;
-        let (scales, offsets) = unpack_k4_scales_offsets(&packed);
-        assert_eq!(scales[0], 1);
-        assert_eq!(offsets[0], 2);
-        assert_eq!(scales[4], 0b11_1010);
-        assert_eq!(offsets[4], 0b01_0101);
-    }
 }

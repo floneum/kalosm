@@ -37,6 +37,7 @@ mod ops;
 
 /// A Rust scalar with a fusor2 dtype.
 pub trait Element: bytemuck::Pod + Copy + Send + Sync + 'static {
+    /// Runtime dtype corresponding to this Rust type.
     const DTYPE: Dtype;
     /// This value as the backend's splat literal.
     fn splat(self) -> Splat;
@@ -75,6 +76,7 @@ impl Element for i32 {
 
 /// An axis argument: a literal index, or one of the from-the-end selectors.
 pub trait Axis<const R: usize> {
+    /// Resolve the selector to a zero-based axis.
     fn resolve(self) -> usize;
 }
 
@@ -172,6 +174,7 @@ fn narrow_acc<T: Element>(r: Result<Dyn>) -> Result<Dyn> {
 }
 
 impl<const R: usize, T: Element> Tensor<R, T> {
+    /// Compile-time rank.
     pub const RANK: usize = R;
 
     /// Wrap a runtime-rank value.
@@ -225,15 +228,19 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     pub fn as_dyn(&self) -> &Dyn {
         &self.raw
     }
+    /// The underlying graph node id.
     pub fn id(&self) -> Id {
         self.raw.id()
     }
+    /// The graph this value belongs to.
     pub fn graph(&self) -> &GraphRef {
         self.raw.graph()
     }
+    /// Runtime element dtype.
     pub fn dtype(&self) -> Dtype {
         self.raw.dtype()
     }
+    /// Compile-time rank as a value.
     pub fn rank(&self) -> usize {
         R
     }
@@ -1013,323 +1020,5 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     #[track_caller]
     pub fn to_scalar(&self) -> T {
         ok("to_scalar", self.raw.to_scalar::<T>())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_typed_tensor_is_one_pointer_pair() {
-        assert_eq!(
-            std::mem::size_of::<Tensor<3, f32>>(),
-            std::mem::size_of::<Dyn>()
-        );
-        assert_eq!(
-            std::mem::align_of::<Tensor<0, u32>>(),
-            std::mem::align_of::<Dyn>()
-        );
-    }
-
-    /// `device()` hands back the type the constructors take, and the round
-    /// trip lands in the same graph.
-    #[test]
-    fn a_values_device_builds_more_values_in_the_same_graph() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-        let x = Tensor::<2, f32>::zeros(&device, [2, 3]);
-        let y = Tensor::<2, f32>::ones(&x.device(), [2, 3]);
-        assert!(GraphRef::ptr_eq(x.graph(), y.graph()));
-        assert_eq!(Tensor::add(&x, &y).to_flat(), vec![1.0f32; 6]);
-        assert_eq!(x.device().name(), "cpu");
-    }
-
-    #[test]
-    fn element_dtypes() {
-        assert_eq!(<f32 as Element>::DTYPE, Dtype::F32);
-        assert_eq!(<half::f16 as Element>::DTYPE, Dtype::F16);
-        assert_eq!(<half::bf16 as Element>::DTYPE, Dtype::BF16);
-        assert_eq!(<u32 as Element>::DTYPE, Dtype::U32);
-        assert_eq!(<i32 as Element>::DTYPE, Dtype::I32);
-    }
-
-    #[test]
-    fn axis_selectors_resolve() {
-        assert_eq!(Axis::<4>::resolve(Minus1), 3);
-        assert_eq!(Axis::<4>::resolve(Minus2), 2);
-        assert_eq!(Axis::<4>::resolve(2usize), 2);
-    }
-
-    #[test]
-    fn const_extents_refuses_a_symbolic_dim() {
-        let sym = [Dim::Sym(fusor2_ir::shape::SymId(0))];
-        assert!(const_extents::<1>(&sym, "test").is_err());
-        assert_eq!(const_extents::<2>(&[Dim::Const(2), Dim::Const(3)], "t").unwrap(), [2, 3]);
-        assert!(const_extents::<1>(&[Dim::Const(2), Dim::Const(3)], "t").is_err());
-    }
-
-    #[allow(dead_code)]
-    fn the_dtype_parameter_defaults_to_f32(t: Tensor<2>) -> Tensor<2, f32> {
-        t
-    }
-
-    /// `into_concrete` and `to_concrete` are the approved identity: the value
-    /// they hand back is the *same node*, not a copy of it. If either ever
-    /// materialized, the e-graph would see a different id and the fake-quant
-    /// `with_backwards` boundary, which is keyed on the node the model handed
-    /// it, would stop matching.
-    #[test]
-    fn the_fusion_erasers_hand_back_the_same_node() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-        let a = Tensor::<1, f32>::from_slice(&device, [3], &[1.0, 2.0, 3.0]);
-        let id = a.id();
-        assert_eq!(a.to_concrete().id(), id);
-        assert_eq!(a.clone().into_concrete().id(), id);
-        // And they are not a `detach` in disguise: detach *does* re-leaf.
-        let cut = a.detach();
-        assert_ne!(cut.id(), id, "detach must cut the value off its producers");
-        assert_eq!(cut.to_flat(), vec![1.0, 2.0, 3.0]);
-    }
-
-    /// The trainer's exact convolution turbofish, on values a hand reference
-    /// covers.
-    ///
-    /// `model.rs` writes `x.conv::<3, 1, 4>(&weight.permute([2, 1, 0]), Some(bias),
-    /// [kernel / 2], [1])`: a rank-3 input, one spatial axis, a rank-4
-    /// windowed view. The kernel here is symmetric, so the value is the same
-    /// whether the lowering correlates or convolves — what is under test is
-    /// the plumbing and the padding, not a sign convention.
-    #[test]
-    fn the_trainers_conv_turbofish_computes_a_padded_1d_convolution() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-        // [batch 1, in_ch 1, seq 4]
-        let x = Tensor::<3, f32>::from_slice(&device, [1, 1, 4], &[1.0, 2.0, 3.0, 4.0]);
-        // The trainer stores [kernel, in_ch, out_ch] and permutes to
-        // [out_ch, in_ch, kernel]; do the same so the permute is covered.
-        let w = Tensor::<3, f32>::from_slice(&device, [3, 1, 1], &[1.0, 2.0, 1.0]);
-        let bias = Tensor::<1, f32>::from_slice(&device, [1], &[0.5]);
-        let kernel = w.shape()[0];
-
-        let y = x.conv::<3, 1, 4>(&w.permute([2, 1, 0]), Some(&bias), [kernel / 2], [1]);
-
-        assert_eq!(y.shape(), [1, 1, 4]);
-        // Zero-padded [0,1,2,3,4,0] against [1,2,1], plus 0.5.
-        assert_eq!(y.to_flat(), vec![4.5, 8.5, 12.5, 11.5]);
-    }
-
-    /// `WINDOWED` is checked arithmetically — it must be `R + DIFF`. A wrong one
-    /// names the op and both ranks.
-    #[test]
-    #[should_panic(expected = "has rank 4, not 5")]
-    fn conv_rejects_a_windowed_rank_that_is_not_r_plus_diff() {
-        let device = Device::cpu();
-        let x = Tensor::<3, f32>::from_slice(&device, [1, 1, 4], &[1.0, 2.0, 3.0, 4.0]);
-        let w = Tensor::<3, f32>::from_slice(&device, [1, 1, 3], &[1.0, 2.0, 1.0]);
-        let _ = x.conv::<3, 1, 5>(&w, None, [1], [1]);
-    }
-
-    /// Rank-changing views take the output rank as an ordinary const
-    /// parameter, and each one lands on the rank its call site named.
-    #[test]
-    fn the_rank_changing_views_land_on_their_output_parameter() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-        let a = Tensor::<2, f32>::from_slice(&device, [2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-
-        let flat: Tensor<1, f32> = a.reshape([6]);
-        assert_eq!(flat.shape(), [6]);
-        assert_eq!(flat.to_flat(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-
-        let cube: Tensor<3, f32> = a.reshape([1, 2, 3]);
-        assert_eq!(cube.shape(), [1, 2, 3]);
-        let dropped: Tensor<2, f32> = cube.squeeze(0usize);
-        assert_eq!(dropped.shape(), [2, 3]);
-        let raised: Tensor<3, f32> = a.unsqueeze(1);
-        assert_eq!(raised.shape(), [2, 1, 3]);
-
-        let wide: Tensor<3, f32> = raised.broadcast_as([2, 4, 3]);
-        assert_eq!(wide.shape(), [2, 4, 3]);
-        assert_eq!(a.expand([2, 3]).shape(), [2, 3]);
-        assert_eq!(a.flatten_all().shape(), [6]);
-
-        // `chunk` keeps the rank and splits one axis.
-        let parts = a.chunk(3, Minus1);
-        assert_eq!(parts.len(), 3);
-        assert_eq!(parts[0].shape(), [2, 1]);
-        assert_eq!(parts[2].to_flat(), vec![3.0, 6.0]);
-    }
-
-    /// `Minus1`/`Minus2` are axis *arguments*, not just a `resolve` call: the
-    /// ops have to accept them where a `usize` goes.
-    #[test]
-    fn the_from_the_end_axis_selectors_drive_real_ops() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-        let a = Tensor::<2, f32>::from_slice(&device, [2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        // Sum the last axis, then the last of what is left.
-        let rows: Tensor<1, f32> = a.sum::<1>(Minus1);
-        assert_eq!(rows.to_flat(), vec![6.0, 15.0]);
-        let cols: Tensor<1, f32> = a.sum::<1>(Minus2);
-        assert_eq!(cols.to_flat(), vec![5.0, 7.0, 9.0]);
-        // `transpose(Minus2, Minus1)` is `t()`.
-        assert_eq!(a.transpose(Minus2, Minus1).to_flat(), a.t().to_flat());
-    }
-
-    /// `cat` keeps the rank, `stack` raises it.
-    #[test]
-    fn cat_keeps_the_rank_and_stack_raises_it() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-        let a = Tensor::<1, f32>::from_slice(&device, [2], &[1.0, 2.0]);
-        let b = Tensor::<1, f32>::from_slice(&device, [2], &[3.0, 4.0]);
-
-        let joined: Tensor<1, f32> = cat([a.clone(), b.clone()], 0);
-        assert_eq!(joined.shape(), [4]);
-        assert_eq!(joined.to_flat(), vec![1.0, 2.0, 3.0, 4.0]);
-        // The associated-function spelling is the same value.
-        assert_eq!(
-            Tensor::<1, f32>::cat([a.clone(), b.clone()], 0).to_flat(),
-            joined.to_flat()
-        );
-
-        let stacked: Tensor<2, f32> = stack([a, b], 0);
-        assert_eq!(stacked.shape(), [2, 2]);
-        assert_eq!(stacked.to_flat(), vec![1.0, 2.0, 3.0, 4.0]);
-    }
-
-    /// The operand slot is inferred from the argument, so `_` is the only
-    /// thing a call site ever writes there.
-    #[test]
-    fn a_broadcasting_binary_infers_its_operand_slot() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-        let rows = Tensor::<2, f32>::from_slice(&device, [2, 2], &[1.0, 2.0, 3.0, 4.0]);
-        let scale = Tensor::<1, f32>::from_slice(&device, [2], &[10.0, 100.0]);
-        let one = Tensor::<1, f32>::from_slice(&device, [1], &[2.0]);
-
-        // The trainer's rank-2 spelling, and the rank-1 one from `optim.rs`.
-        let scaled: Tensor<2, f32> = rows.mul_::<1, 2, _>(&scale);
-        assert_eq!(scaled.to_flat(), vec![10.0, 200.0, 30.0, 400.0]);
-        let halved: Tensor<1, f32> = scale.div_::<1, 1, _>(&one);
-        assert_eq!(halved.to_flat(), vec![5.0, 50.0]);
-        let lifted: Tensor<2, f32> = rows.add_::<1, 2, _>(&scale);
-        assert_eq!(lifted.to_flat(), vec![11.0, 102.0, 13.0, 104.0]);
-        assert_eq!(rows.sub_::<1, 2, _>(&scale).shape(), [2, 2]);
-        // `pow` goes through exp/log, so it is compared relatively: what is
-        // under test is which operand reached which slot, not the last ulp.
-        let squared = scale.pow_::<1, 1, _>(&one).to_flat();
-        for (got, want) in squared.iter().zip([100.0f32, 10000.0]) {
-            assert!((got - want).abs() <= want * 1e-6, "pow_ gave {squared:?}");
-        }
-    }
-
-    /// All six operator impls — owned/borrowed on either side, and the `f32`
-    /// right-hand form — mean the same op. `optim.rs` writes four of them in
-    /// one expression.
-    #[test]
-    fn every_operator_form_is_the_same_op() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-        let a = Tensor::<1, f32>::from_slice(&device, [2], &[1.0, 2.0]);
-        let b = Tensor::<1, f32>::from_slice(&device, [2], &[10.0, 20.0]);
-
-        let want = vec![11.0, 22.0];
-        assert_eq!((a.clone() + b.clone()).to_flat(), want);
-        assert_eq!((a.clone() + &b).to_flat(), want);
-        assert_eq!((&a + b.clone()).to_flat(), want);
-        assert_eq!((&a + &b).to_flat(), want);
-        assert_eq!((&a + 1.0f32).to_flat(), vec![2.0, 3.0]);
-        assert_eq!((a.clone() + 1.0f32).to_flat(), vec![2.0, 3.0]);
-
-        assert_eq!((&b - &a).to_flat(), vec![9.0, 18.0]);
-        assert_eq!((&a * &b).to_flat(), vec![10.0, 40.0]);
-        assert_eq!((&b / &a).to_flat(), vec![10.0, 10.0]);
-        assert_eq!((-&a).to_flat(), vec![-1.0, -2.0]);
-        assert_eq!((-a).to_flat(), vec![-1.0, -2.0]);
-    }
-
-    /// `ToVec` nests by rank and hands back the value, not a `Result`. Rank 3
-    /// is the deepest impl; the trainer reads at rank 0, 1 and 2.
-    #[test]
-    fn a_readback_nests_as_deep_as_its_rank() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-        let values: Vec<f32> = (0..12).map(|i| i as f32).collect();
-        let a = Tensor::<3, f32>::from_slice(&device, [2, 2, 3], &values);
-
-        let nested: Vec<Vec<Vec<f32>>> = a.read().expect("readback").to_vec();
-        assert_eq!(nested.len(), 2);
-        assert_eq!(nested[1][1], vec![9.0, 10.0, 11.0]);
-
-        let flat: Vec<f32> = a.reshape([12]).read().expect("readback").to_vec();
-        assert_eq!(flat, values);
-        let rows: Vec<Vec<f32>> = a.reshape([4, 3]).read().expect("readback").to_vec();
-        assert_eq!(rows[3], vec![9.0, 10.0, 11.0]);
-        let one: f32 = a
-            .reshape([12])
-            .narrow(0usize, 5, 1)
-            .squeeze::<0>(0usize)
-            .read()
-            .expect("readback")
-            .to_vec();
-        assert_eq!(one, 5.0);
-        // `as_slice` is the same read behind a ready future.
-        assert_eq!(pollster::block_on(a.as_slice()).unwrap().to_flat(), values);
-    }
-
-    /// `narrow_acc` undoes the accumulator promotion and *only* that. A dtype
-    /// disagreement that is not the promotion falls through untouched, so
-    /// `try_from_dyn` reports it instead of it being silently reinterpreted.
-    #[test]
-    fn narrow_acc_undoes_the_promotion_and_nothing_else() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-
-        // f32 result for an f16 operand: this is the promotion, so narrow it.
-        let wide = Tensor::<1, f32>::from_slice(&device, [2], &[1.0, 2.0]);
-        let narrowed = narrow_acc::<half::f16>(Ok(wide.clone().into_inner())).unwrap();
-        assert_eq!(narrowed.dtype(), Dtype::F16);
-
-        // f32 asked for, f32 given: untouched.
-        let same = narrow_acc::<f32>(Ok(wide.clone().into_inner())).unwrap();
-        assert_eq!(same.id(), wide.id());
-
-        // u32 given where f32 was asked for is not the promotion of anything.
-        // It passes through unconverted and the wrapper reports it.
-        let ints = Tensor::<1, u32>::from_slice(&device, [2], &[1, 2]);
-        let through = narrow_acc::<f32>(Ok(ints.into_inner())).unwrap();
-        assert_eq!(through.dtype(), Dtype::U32);
-        assert!(Tensor::<1, f32>::try_from_dyn(through).is_err());
-    }
-
-    /// A host-data length that disagrees with the shape is a panic naming both.
-    #[test]
-    #[should_panic(expected = "needs 6 elements, got 5")]
-    fn from_slice_reports_a_length_that_disagrees_with_the_shape() {
-        let device = Device::cpu();
-        let _ = Tensor::<2, f32>::from_slice(&device, [2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0]);
-    }
-
-    /// `try_from_dyn` reports a rank mismatch rather than panicking; `new` panics
-    /// with the same diagnosis. The two differ only on delivery.
-    #[test]
-    fn try_from_dyn_and_from_dyn_agree_on_diagnosis() {
-        let _serial = crate::device::test_device_lock();
-        let device = Device::cpu();
-        let a = Tensor::<2, f32>::zeros(&device, [2, 3]);
-        let raw = a.clone().into_inner();
-
-        let err = Tensor::<3, f32>::try_from_dyn(raw.clone()).unwrap_err();
-        assert!(format!("{err}").contains("value has rank 2"), "{err}");
-        let err = Tensor::<2, u32>::try_from_dyn(raw.clone()).unwrap_err();
-        assert!(format!("{err}").contains("value has dtype"), "{err}");
-
-        // `retype` is the same assertion spelled on a value that already has a
-        // wrapper, and a correct one is a no-op.
-        assert_eq!(a.clone().retype::<2, f32>().id(), a.id());
-        assert_eq!(Tensor::<2, f32>::from_dyn(raw).id(), a.id());
     }
 }

@@ -1,4 +1,4 @@
-//! `fusor2-autograd` — reverse mode as an Logical -> Logical transform whose output is
+//! `fusor2-autograd` — reverse mode as a Logical -> Logical transform whose output is
 //! ingested **together with the forward as one graph with one root set**.
 //!
 //! *Why Logical*: adjoints are facts about tensor algebra. `d(Contract) =
@@ -12,13 +12,15 @@
 //! Seven [`ADJOINTS`] entries. No `Arc<dyn Fn>` closures, no
 //! type-erased downcasts.
 
-pub mod adjoints;
+#![warn(unreachable_pub)]
+
+mod adjoints;
 pub mod backward;
-pub mod contract;
+mod contract;
 pub mod custom;
-pub mod map_adjoint;
-pub mod rules;
-pub mod structural;
+mod map_adjoint;
+mod rules;
+mod structural;
 pub mod tape;
 
 pub use adjoints::ADJOINTS;

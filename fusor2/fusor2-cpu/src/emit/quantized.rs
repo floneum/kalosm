@@ -18,7 +18,7 @@ fn f32_ty() -> ElementType {
 
 /// Look up the shared decode program and run it for the single element at
 /// `(k_base, col)`, yielding an ordinary scalar expression.
-pub fn expand_dequantize(
+pub(crate) fn expand_dequantize(
     src: &QuantizedView,
     k_base: &TileExpr,
     col: &TileExpr,

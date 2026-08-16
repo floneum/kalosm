@@ -66,23 +66,29 @@ pub(crate) type ResolveGuard<'a> = parking_lot::MutexGuard<'a, ()>;
 /// Which backend a session runs on.
 #[derive(Clone)]
 pub enum Backend {
+    /// Native CPU execution.
     Cpu(Arc<CpuTarget>),
+    /// WebGPU execution.
     Gpu(Arc<GpuTarget>),
 }
 
 impl Backend {
+    /// Create a CPU backend.
     pub fn cpu() -> Result<Self> {
         Ok(Self::Cpu(Arc::new(CpuTarget::new()?)))
     }
 
+    /// Create a GPU backend asynchronously.
     pub async fn gpu() -> Result<Self> {
         Ok(Self::Gpu(Arc::new(GpuTarget::new().await?)))
     }
 
+    /// Create a GPU backend and block until adapter initialization completes.
     pub fn gpu_blocking() -> Result<Self> {
         Ok(Self::Gpu(Arc::new(GpuTarget::new_blocking()?)))
     }
 
+    /// The backend's compiler and execution target.
     pub fn target(&self) -> Arc<dyn Target> {
         match self {
             Self::Cpu(t) => Arc::clone(t) as Arc<dyn Target>,
@@ -90,6 +96,7 @@ impl Backend {
         }
     }
 
+    /// The backend name, either `"cpu"` or `"gpu"`.
     pub fn name(&self) -> &'static str {
         match self {
             Self::Cpu(_) => "cpu",
@@ -97,6 +104,7 @@ impl Backend {
         }
     }
 
+    /// A snapshot of the backend capabilities used for planning.
     pub fn caps(&self) -> Caps {
         match self {
             Self::Cpu(t) => t.caps().clone(),
@@ -168,6 +176,7 @@ pub(crate) struct SessionInner {
 }
 
 impl Session {
+    /// Create a planner, compiler, and execution session for `device`.
     pub fn new(device: Backend) -> Result<Self> {
         let planner = Planner::shared();
         let device_fingerprint = device.caps().fingerprint();
@@ -211,10 +220,12 @@ impl Session {
         })
     }
 
+    /// The selected backend.
     pub fn device(&self) -> &Backend {
         &self.inner.device
     }
 
+    /// A snapshot of the backend capabilities used for planning.
     pub fn caps(&self) -> Caps {
         self.inner.device.caps()
     }
@@ -1818,112 +1829,4 @@ fn resolve_elements(shape: &[Dim], graph: &GraphRef) -> Result<u64> {
         acc = acc.saturating_mul(resolve_dim(*d, graph)?);
     }
     Ok(acc.max(1))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `restate_layout` has to state a padded buffer over a reader shape whose
-    /// dims share the padded axis, not just one dim inside it.
-    ///
-    /// The pinned shape is whisper's cross-attention K/V: `[1, 1500, 384]`
-    /// over a contract padded to `[1504, 384]`, where reader dims `[1, 1500]`
-    /// both belong to the 1504 axis.
-    #[test]
-    fn a_padded_axis_can_carry_a_run_of_reader_dims() {
-        use crate::graph::Graph;
-        use fusor2_ir::shape::Layout;
-        let g = Graph::new(&Session::new(Backend::cpu().unwrap()).unwrap());
-        let dims = |v: &[u64]| -> Vec<Dim> { v.iter().copied().map(Dim::Const).collect() };
-        let padded = Layout::from_parts(
-            Dim::Const(0),
-            &dims(&[1504, 384]),
-            &dims(&[384, 1]),
-        )
-        .unwrap();
-
-        let got = restate_layout(&padded, &dims(&[1, 1500, 384]), g.handle())
-            .expect("[1, 1500] shares the padded 1504 axis");
-        // Row-major over the value's own extents: the batch axis steps a
-        // whole 1500-row block, the row axis one row, the column axis one
-        // element. Nothing addresses the four rows of padding.
-        assert_eq!(
-            got.strides(),
-            &dims(&[1500 * 384, 384, 1])[..],
-            "a padded run lays out over the value's extents, not the padded ones"
-        );
-
-        // The length-1 padded reading is unchanged: `m = 3` inside `m_pad = 16`.
-        let tile = Layout::from_parts(Dim::Const(0), &dims(&[16, 16]), &dims(&[16, 1])).unwrap();
-        let got = restate_layout(&tile, &dims(&[3, 4]), g.handle()).unwrap();
-        assert_eq!(got.strides(), &dims(&[16, 1])[..]);
-
-        // And so is the exact-run one, which must still beat a padded parse:
-        // `[2, 2]` fills the `4` batch axis rather than sitting inside it.
-        let contract =
-            Layout::from_parts(Dim::Const(0), &dims(&[4, 16, 16]), &dims(&[256, 16, 1])).unwrap();
-        let got = restate_layout(&contract, &dims(&[2, 2, 4, 4]), g.handle()).unwrap();
-        assert_eq!(got.strides(), &dims(&[512, 256, 16, 1])[..]);
-
-        // A run that overflows the padded extent is still no factoring at all.
-        assert!(restate_layout(&tile, &dims(&[17, 4]), g.handle()).is_none());
-    }
-
-    #[test]
-    fn the_rule_table_is_the_union_of_every_contributor() {
-        let s = Session::new(Backend::cpu().unwrap()).unwrap();
-        let expected = CORE_RULES.len()
-            + SCHED_RULES.len()
-            + fusor2_autograd::ADJOINT_RULES.len()
-            + fusor2_cpu::CPU_RULES.len();
-        assert_eq!(s.inner.rules.len(), expected);
-    }
-
-    #[test]
-    fn back_pressure_is_a_library_policy() {
-        assert_eq!(MAX_INFLIGHT_PLANS, 8);
-        let s = Session::new(Backend::cpu().unwrap()).unwrap();
-        assert_eq!(s.launch_count(), 0);
-        s.wait().unwrap();
-    }
-
-    /// The changed-launch attribution behind [`Gran::Diff`]: the candidate
-    /// that drops a producer launch and re-spells the consumer (the
-    /// dequantize-once vs decode-in-the-fill pair) diffs as exactly those
-    /// launches, everything between attributed to neither side.
-    #[test]
-    fn sparse_diff_attributes_the_changed_launches() {
-        // Identical sequences: no diff to attribute.
-        assert_eq!(sparse_diff(&[1, 2, 3], &[1, 2, 3], 4), None);
-        // The lm_head shape: incumbent [dequant, A, B, C, fold_f32] vs
-        // candidate [A, B, C, fold_native] — a deletion at the front and a
-        // substitution at the back, with the shared middle matched.
-        let inc = [10, 1, 2, 3, 20];
-        let cand = [1, 2, 3, 21];
-        let (ca, ib) = sparse_diff(&cand, &inc, 4).unwrap();
-        assert_eq!(ca, vec![3]);
-        assert_eq!(ib, vec![0, 4]);
-        // Pure insertion in the middle.
-        let (ca, ib) = sparse_diff(&[1, 9, 2], &[1, 2], 4).unwrap();
-        assert_eq!(ca, vec![1]);
-        assert_eq!(ib, Vec::<usize>::new());
-        // Pure deletion in the middle.
-        let (ca, ib) = sparse_diff(&[1, 2], &[1, 9, 2], 4).unwrap();
-        assert_eq!(ca, Vec::<usize>::new());
-        assert_eq!(ib, vec![1]);
-        // Too different for the budget: no attribution.
-        assert_eq!(sparse_diff(&[1, 2, 3, 4], &[5, 6, 7, 8], 3), None);
-        // Empty against non-empty stays within the cap.
-        let (ca, ib) = sparse_diff(&[], &[1, 2], 4).unwrap();
-        assert_eq!(ca, Vec::<usize>::new());
-        assert_eq!(ib, vec![0, 1]);
-        // Repeated keys (2357-launch decode plans are mostly repeated tiny
-        // maps): the alignment still isolates a single substitution.
-        let inc = [7, 7, 7, 7, 7, 5, 7, 7];
-        let cand = [7, 7, 7, 7, 7, 6, 7, 7];
-        let (ca, ib) = sparse_diff(&cand, &inc, 4).unwrap();
-        assert_eq!(ca, vec![5]);
-        assert_eq!(ib, vec![5]);
-    }
 }

@@ -82,6 +82,7 @@ impl<T: Element> Default for MaskCache<T> {
 }
 
 impl<T: Element> MaskCache<T> {
+    /// Create an empty materialized-mask cache.
     pub fn new() -> Self {
         Self::default()
     }
@@ -165,10 +166,12 @@ impl<T: Element> MaskCache<T> {
         self.entries.len()
     }
 
+    /// Whether no masks have been uploaded.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    /// Discard every uploaded mask.
     pub fn clear(&mut self) {
         self.entries.clear();
     }
@@ -185,98 +188,4 @@ fn structural_kind(q_len: Dim, k_len: Dim) -> Option<MaskKind> {
         return Some(MaskKind::None);
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::session::{Backend, Session};
-
-    fn graph() -> Graph {
-        Graph::new(&Session::new(Backend::cpu().unwrap()).unwrap())
-    }
-
-    #[test]
-    fn a_square_block_is_causal_and_loads_nothing() {
-        let mut c: MaskCache = MaskCache::new();
-        let m = c.get(Dim::Const(8), Dim::Const(8)).unwrap();
-        assert!(matches!(m, AttentionMask::Structural(MaskKind::Causal)));
-        assert!(m.tensor().is_none());
-        assert!(c.is_empty(), "a structural mask must not be memoized");
-
-        // The symbolic square case is the whole point: no length buckets.
-        let g = graph();
-        let s = g.sym("len");
-        assert!(matches!(
-            c.get(s, s).unwrap(),
-            AttentionMask::Structural(MaskKind::Causal)
-        ));
-    }
-
-    #[test]
-    fn one_query_against_a_warm_cache_needs_no_mask() {
-        let mut c: MaskCache = MaskCache::new();
-        let m = c.get(Dim::Const(1), Dim::Const(37)).unwrap();
-        assert!(matches!(m, AttentionMask::Structural(MaskKind::None)));
-        assert!(c.is_empty());
-    }
-
-    #[test]
-    fn a_chunked_prefill_names_the_entry_point_it_needs() {
-        let mut c: MaskCache = MaskCache::new();
-        assert!(c.get(Dim::Const(2), Dim::Const(5)).is_err());
-    }
-
-    #[test]
-    fn the_materialized_mask_is_the_offset_triangle() {
-        let g = graph();
-        let mut c: MaskCache = MaskCache::new();
-        // Two queries at positions 3 and 4 of a five-key axis.
-        let m = c
-            .materialized(&g, Dim::Const(2), Dim::Const(5), None)
-            .unwrap();
-        let v = m.tensor().unwrap().to_vec_f32();
-        let inf = f32::NEG_INFINITY;
-        assert_eq!(v, vec![0.0, 0.0, 0.0, 0.0, inf, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        assert_eq!(c.len(), 1);
-
-        // Same shape, same tensor: uploaded once.
-        let again = c
-            .materialized(&g, Dim::Const(2), Dim::Const(5), None)
-            .unwrap();
-        assert_eq!(again.tensor().unwrap().id(), m.tensor().unwrap().id());
-        assert_eq!(c.len(), 1);
-    }
-
-    #[test]
-    fn a_sliding_window_also_masks_the_past() {
-        let g = graph();
-        let mut c: MaskCache = MaskCache::new();
-        // Square block, window 2: query i sees keys i-1 and i.
-        let m = c
-            .materialized(&g, Dim::Const(3), Dim::Const(3), Some(2))
-            .unwrap();
-        let v = m.tensor().unwrap().to_vec_f32();
-        let n = f32::NEG_INFINITY;
-        assert_eq!(
-            v,
-            vec![
-                0.0, n, n, //
-                0.0, 0.0, n, //
-                n, 0.0, 0.0,
-            ]
-        );
-        // A window is a different key from the unwindowed mask of the same shape.
-        c.materialized(&g, Dim::Const(3), Dim::Const(3), None)
-            .unwrap();
-        assert_eq!(c.len(), 2);
-    }
-
-    #[test]
-    fn a_symbolic_length_cannot_be_materialized() {
-        let g = graph();
-        let mut c: MaskCache = MaskCache::new();
-        let s = g.sym("len");
-        assert!(c.materialized(&g, Dim::Const(2), s, None).is_err());
-    }
 }

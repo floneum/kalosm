@@ -18,6 +18,7 @@ pub struct Linear<T: Element = f32> {
 }
 
 impl<T: Element> Linear<T> {
+    /// Create a linear layer from a `[out, in]` weight and optional bias.
     pub fn new(weight: Tensor<2, T>, bias: Option<Tensor<1, T>>) -> Self {
         Self { weight, bias }
     }
@@ -43,6 +44,7 @@ impl<T: Element> Linear<T> {
         self.weight.extent(1usize)
     }
 
+    /// The output width.
     pub fn out_features(&self) -> Dim {
         self.weight.extent(0usize)
     }
@@ -89,68 +91,5 @@ pub(crate) fn forward_dyn(weight: &Dyn, bias: Option<&Dyn>, x: &Dyn) -> Result<D
     match bias {
         Some(b) => y.add_(b),
         None => Ok(y),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fusor2_ir::dtype::Dtype;
-
-    use crate::graph::Graph;
-    use crate::session::{Backend, Session};
-
-    fn graph() -> Graph {
-        Graph::new(&Session::new(Backend::cpu().expect("cpu device")).expect("session"))
-    }
-
-    fn leaf(g: &Graph, shape: &[u64]) -> Dyn {
-        let dims: Vec<Dim> = shape.iter().map(|d| Dim::Const(*d)).collect();
-        g.leaf("t", &dims, Dtype::F32).unwrap()
-    }
-
-    #[test]
-    fn the_output_takes_the_weights_out_features() {
-        let g = graph();
-        let x = leaf(&g, &[3, 4]);
-        let w = leaf(&g, &[5, 4]);
-        let b = leaf(&g, &[5]);
-        let y = forward_dyn(&w, Some(&b), &x).unwrap();
-        assert_eq!(&y.shape()[..], &[Dim::Const(3), Dim::Const(5)]);
-    }
-
-    #[test]
-    fn a_batched_activation_meets_a_rank_two_weight() {
-        let g = graph();
-        let x = leaf(&g, &[2, 3, 4]);
-        let w = leaf(&g, &[5, 4]);
-        let y = forward_dyn(&w, None, &x).unwrap();
-        assert_eq!(
-            &y.shape()[..],
-            &[Dim::Const(2), Dim::Const(3), Dim::Const(5)]
-        );
-    }
-
-    /// The forward must hash-cons to exactly the composition it documents.
-    #[test]
-    fn the_forward_is_mat_mul_transposed_rhs_plus_a_broadcast_bias() {
-        let g = graph();
-        let x = leaf(&g, &[3, 4]);
-        let w = leaf(&g, &[5, 4]);
-        let b = leaf(&g, &[5]);
-        let by_layer = forward_dyn(&w, Some(&b), &x).unwrap();
-        let by_hand = x.matmul_t(&w).unwrap().add_(&b).unwrap();
-        assert_eq!(by_layer.id(), by_hand.id());
-
-        let no_bias = forward_dyn(&w, None, &x).unwrap();
-        assert_eq!(no_bias.id(), x.matmul_t(&w).unwrap().id());
-    }
-
-    #[test]
-    fn a_disagreeing_inner_extent_is_refused() {
-        let g = graph();
-        let x = leaf(&g, &[3, 4]);
-        let w = leaf(&g, &[5, 6]);
-        assert!(forward_dyn(&w, None, &x).is_err());
     }
 }

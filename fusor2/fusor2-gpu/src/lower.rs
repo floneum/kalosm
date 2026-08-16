@@ -9,10 +9,10 @@
 //! `Plan::buffers[..].layout`, which the extractor established; a mismatch
 //! is a broken plan ([`Error::Plan`]).
 
-pub mod contract;
-pub mod gather_scatter;
-pub mod map_fold;
-pub mod region;
+pub(crate) mod contract;
+pub(crate) mod gather_scatter;
+pub(crate) mod map_fold;
+pub(crate) mod region;
 
 use fusor2_ir::Result;
 use fusor2_ir::device::{Caps, Limits};
@@ -37,17 +37,16 @@ use std::sync::Arc;
 use crate::uniforms::UniformPack;
 
 /// Binding index of the always-present uniform block.
-pub const UNIFORM_BINDING: u32 = 0;
+pub(crate) const UNIFORM_BINDING: u32 = 0;
 
 /// One staged input of a contraction side: a memory source, or a `Const`
 /// leaf already folded to its literal.
 #[derive(Clone)]
-pub enum StagedSource {
+pub(crate) enum StagedSource {
     Mem(Source),
     Const(TileExpr),
 }
-
-pub fn bound_layout(cx: &LowerCtx<'_>, value: Id) -> (Layout, Dtype) {
+pub(crate) fn bound_layout(cx: &LowerCtx<'_>, value: Id) -> (Layout, Dtype) {
     let value = cx.selected(value);
     match cx.plan.buffers.iter().find(|b| b.value == value) {
         Some(b) => (b.layout.clone(), b.dtype),
@@ -57,7 +56,6 @@ pub fn bound_layout(cx: &LowerCtx<'_>, value: Id) -> (Layout, Dtype) {
         }
     }
 }
-
 /// The step-invariant decl extent: constants multiply, symbolic dims count
 /// as 1. Storage globals are runtime-sized arrays, in-range masks are built
 /// from the plan layout's `Dim`s, and the emitter's clamp reads
@@ -94,7 +92,7 @@ fn decl_elements(layout: &Layout) -> u64 {
 /// never reads a symbol is shared across every binding, which is what makes
 /// a decode step's length change recompile nothing.
 #[derive(Clone, Debug, Default)]
-pub struct DimBinding {
+pub(crate) struct DimBinding {
     values: FxHashMap<SymId, u64>,
     consulted: std::sync::Arc<parking_lot::Mutex<rustc_hash::FxHashSet<SymId>>>,
     /// Symbols read *only* to fold the dispatch grid, and the
@@ -121,17 +119,17 @@ struct GridReads {
 /// This is the whole of a dispatch grid's dependence on the binding: replaying
 /// it at another binding is exactly what re-lowering would have computed.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GridSpec {
+pub(crate) struct GridSpec {
     pub space: IndexSpace,
     pub block: u32,
 }
 
 impl DimBinding {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub fn from_pairs(pairs: impl IntoIterator<Item = (SymId, u64)>) -> Self {
+    pub(crate) fn from_pairs(pairs: impl IntoIterator<Item = (SymId, u64)>) -> Self {
         Self {
             values: pairs.into_iter().collect(),
             grid: Default::default(),
@@ -139,11 +137,7 @@ impl DimBinding {
         }
     }
 
-    pub fn bind(&mut self, sym: SymId, value: u64) {
-        self.values.insert(sym, value);
-    }
-
-    pub fn get(&self, sym: SymId) -> Option<u64> {
+    pub(crate) fn get(&self, sym: SymId) -> Option<u64> {
         let hit = self.values.get(&sym).copied();
         if hit.is_some() {
             self.consulted.lock().insert(sym);
@@ -151,19 +145,8 @@ impl DimBinding {
         hit
     }
 
-    /// Every symbol whose value has been handed out through this binding (or
-    /// any clone of it), sorted. Shared across clones deliberately:
-    /// `lower_node` takes the binding by value and the caller keeps a clone.
-    pub fn consulted(&self) -> Vec<SymId> {
-        self.body_consulted(false)
-    }
-
-    pub fn values(&self) -> &FxHashMap<SymId, u64> {
-        &self.values
-    }
-
     /// Concrete extent of a dim, or `None` when the symbol is unbound.
-    pub fn resolve(&self, dim: Dim) -> Option<u64> {
+    pub(crate) fn resolve(&self, dim: Dim) -> Option<u64> {
         match dim {
             Dim::Const(v) => Some(v),
             Dim::Sym(s) => self.get(s),
@@ -172,7 +155,7 @@ impl DimBinding {
 
     /// Concrete extent, or `Error::Plan`. Grid computation cannot proceed on
     /// an unbound symbol and must not guess one.
-    pub fn require(&self, dim: Dim) -> Result<u64> {
+    pub(crate) fn require(&self, dim: Dim) -> Result<u64> {
         self.resolve(dim)
             .ok_or_else(|| Error::Plan(format!("dim {dim} is unbound at dispatch")))
     }
@@ -201,7 +184,7 @@ impl DimBinding {
     /// reproduce the grid the lowering finished with — means the grid is not
     /// replayable from here, and [`Self::consulted`] then reports the grid's
     /// symbols too so the cache keys on them.
-    pub fn grid_derivation(&self, grid: [u32; 3], limits: &Limits) -> Option<GridSpec> {
+    pub(crate) fn grid_derivation(&self, grid: [u32; 3], limits: &Limits) -> Option<GridSpec> {
         let spec = {
             let g = self.grid.lock();
             let mut specs = g.specs.iter();
@@ -219,7 +202,7 @@ impl DimBinding {
     /// Grid-only reads are excluded exactly when [`Self::grid_derivation`]
     /// yields a replay for them; otherwise they are folded back in, because a
     /// grid nobody can recompute must be rebuilt.
-    pub fn body_consulted(&self, replayable: bool) -> Vec<SymId> {
+    pub(crate) fn body_consulted(&self, replayable: bool) -> Vec<SymId> {
         let mut out: rustc_hash::FxHashSet<SymId> = self.consulted.lock().clone();
         if !replayable {
             out.extend(self.grid.lock().symbols.iter().copied());
@@ -231,7 +214,7 @@ impl DimBinding {
 }
 
 /// The dispatch grid for an index space at a given workgroup width.
-pub fn grid_for(
+pub(crate) fn grid_for(
     space: &IndexSpace,
     block: u32,
     binding: &DimBinding,
@@ -247,7 +230,7 @@ pub fn grid_for(
 /// Fold a grid without recording the fold. [`grid_for`] is this plus the
 /// record the artifact cache replays; a caller that already *holds* a
 /// [`GridSpec`] is evaluating that record, not making a new one.
-pub fn grid_from(
+pub(crate) fn grid_from(
     space: &IndexSpace,
     block: u32,
     binding: &DimBinding,
@@ -271,7 +254,7 @@ pub fn grid_from(
 
 /// An N-D strided operand seen as a 2-D matrix.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MatrixView {
+pub(crate) struct MatrixView {
     pub rows: u32,
     pub cols: u32,
     pub offset: u32,
@@ -293,7 +276,7 @@ pub struct MatrixView {
 /// is 1 has *no* axes on that side, and its operand is a one-column (or
 /// one-row) matrix. An empty side contributes a single index of 0, so its
 /// stride never enters an address.
-pub fn flatten_matrix_layout_split(
+pub(crate) fn flatten_matrix_layout_split(
     layout: &Layout,
     row_dims: usize,
     binding: &DimBinding,
@@ -405,7 +388,7 @@ pub fn flatten_matrix_layout_split(
 /// position whose prefix multiplies to `rows` and whose suffix multiplies to
 /// `cols`. The longest qualifying prefix is taken, which pins the choice when
 /// an extent-1 axis makes two positions equivalent.
-pub fn matrix_split_for(
+pub(crate) fn matrix_split_for(
     layout: &Layout,
     binding: &DimBinding,
     rows: u64,
@@ -430,7 +413,7 @@ pub fn matrix_split_for(
 }
 
 /// `u32` words a block-quantized value of `elements` elements occupies.
-pub fn quantized_words(fmt: fusor2_ir::dtype::QFmt, layout: QLayout, elements: u64) -> u64 {
+pub(crate) fn quantized_words(fmt: fusor2_ir::dtype::QFmt, layout: QLayout, elements: u64) -> u64 {
     let blocks = elements.div_ceil(u64::from(fmt.block_elements()).max(1));
     (blocks * u64::from(fmt.block_bytes(layout))).div_ceil(4)
 }
@@ -438,7 +421,7 @@ pub fn quantized_words(fmt: fusor2_ir::dtype::QFmt, layout: QLayout, elements: u
 /// The storage layout a quantized value carries, read off its `LeafKind`.
 /// Layout is a priced operand attribute, never a device branch, so it is
 /// recovered from the leaf rather than assumed.
-pub fn qlayout_of(cx: &LowerCtx<'_>, value: Id) -> Option<QLayout> {
+pub(crate) fn qlayout_of(cx: &LowerCtx<'_>, value: Id) -> Option<QLayout> {
     let class = cx.graph.class_of(value);
     cx.graph
         .class_ids(class)
@@ -453,7 +436,7 @@ pub fn qlayout_of(cx: &LowerCtx<'_>, value: Id) -> Option<QLayout> {
 
 /// Logical/Launch dtype to Kernel element. Quantized weights bind as plain `u32` storage;
 /// their decode is arithmetic over those words, never a buffer type.
-pub const fn scalar_element(dtype: Dtype) -> ScalarElement {
+pub(crate) const fn scalar_element(dtype: Dtype) -> ScalarElement {
     match dtype {
         Dtype::F32 => ScalarElement::F32,
         Dtype::F16 => ScalarElement::F16,
@@ -466,7 +449,7 @@ pub const fn scalar_element(dtype: Dtype) -> ScalarElement {
 /// Hash-consing Kernel term builder: two identical subtrees built separately
 /// return the same `Arc`.
 #[derive(Default)]
-pub struct Kernel {
+pub(crate) struct Kernel {
     memo: FxHashMap<u64, SmallVec<[TileExpr; 2]>>,
 }
 
@@ -478,7 +461,7 @@ pub struct Kernel {
 /// `-3.40282e38` is the same sentinel `emit::expr`'s reduce identities
 /// already use, and `exp(x - m)` underflows to zero against it exactly as
 /// it would against a real infinity.
-pub fn finite_f32(v: f32) -> f32 {
+pub(crate) fn finite_f32(v: f32) -> f32 {
     if v.is_infinite() {
         if v.is_sign_negative() {
             -crate::emit::expr::WGSL_SAFE_F32_MAX
@@ -494,7 +477,7 @@ pub fn finite_f32(v: f32) -> f32 {
 
 /// [`finite_f32`] on the f16 bit pattern: 0x7C00 / 0xFC00 are the
 /// infinities, 65504 the largest finite magnitude.
-pub fn finite_f16(bits: u16) -> u16 {
+pub(crate) fn finite_f16(bits: u16) -> u16 {
     let v = half::f16::from_bits(bits);
     if v.is_infinite() || v.is_nan() {
         half::f16::from_f32(if v.is_sign_negative() && v.is_infinite() {
@@ -511,7 +494,7 @@ pub fn finite_f16(bits: u16) -> u16 {
 }
 
 /// [`finite_f32`] on the bf16 bit pattern.
-pub fn finite_bf16(bits: u16) -> u16 {
+pub(crate) fn finite_bf16(bits: u16) -> u16 {
     let v = half::bf16::from_bits(bits);
     if v.is_nan() {
         return half::bf16::ZERO.to_bits();
@@ -529,7 +512,7 @@ pub fn finite_bf16(bits: u16) -> u16 {
 }
 
 impl Kernel {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -543,7 +526,7 @@ impl Kernel {
         expr
     }
 
-    pub fn lit(&mut self, value: TileLiteral) -> TileExpr {
+    pub(crate) fn lit(&mut self, value: TileLiteral) -> TileExpr {
         let ty = match value {
             TileLiteral::F32(_) => ScalarElement::F32,
             TileLiteral::F16(_) => ScalarElement::F16,
@@ -555,21 +538,21 @@ impl Kernel {
         self.intern(TileExprKind::Literal(value), ty.element())
     }
 
-    pub fn f32(&mut self, v: f32) -> TileExpr {
+    pub(crate) fn f32(&mut self, v: f32) -> TileExpr {
         self.lit(TileLiteral::F32(v.to_bits()))
     }
-    pub fn u32(&mut self, v: u32) -> TileExpr {
+    pub(crate) fn u32(&mut self, v: u32) -> TileExpr {
         self.lit(TileLiteral::U32(v))
     }
-    pub fn i32(&mut self, v: i32) -> TileExpr {
+    pub(crate) fn i32(&mut self, v: i32) -> TileExpr {
         self.lit(TileLiteral::I32(v))
     }
-    pub fn bool(&mut self, v: bool) -> TileExpr {
+    pub(crate) fn bool(&mut self, v: bool) -> TileExpr {
         self.lit(TileLiteral::Bool(v))
     }
     /// The zero of an element type, used as a load fill and an accumulator
     /// init.
-    pub fn zero(&mut self, elem: ScalarElement) -> TileExpr {
+    pub(crate) fn zero(&mut self, elem: ScalarElement) -> TileExpr {
         match elem {
             ScalarElement::F32 => self.f32(0.0),
             ScalarElement::F16 => self.lit(TileLiteral::F16(0)),
@@ -586,7 +569,7 @@ impl Kernel {
     /// so a max started here and a max started by a `Reduce` agree bit for
     /// bit, and `exp(x - m)` underflows to zero exactly as it would against
     /// a real infinity.
-    pub fn neg_inf(&mut self, elem: ScalarElement) -> TileExpr {
+    pub(crate) fn neg_inf(&mut self, elem: ScalarElement) -> TileExpr {
         match elem {
             ScalarElement::F16 => {
                 self.lit(TileLiteral::F16(half::f16::from_f32(-65504.0).to_bits()))
@@ -601,7 +584,7 @@ impl Kernel {
     /// The `Min` identity, the mirror of [`Kernel::neg_inf`]: the largest
     /// finite magnitude, matching `emit::expr`'s reduce identities bit for
     /// bit.
-    pub fn pos_inf(&mut self, elem: ScalarElement) -> TileExpr {
+    pub(crate) fn pos_inf(&mut self, elem: ScalarElement) -> TileExpr {
         match elem {
             ScalarElement::F16 => {
                 self.lit(TileLiteral::F16(half::f16::from_f32(65504.0).to_bits()))
@@ -611,19 +594,19 @@ impl Kernel {
         }
     }
 
-    pub fn builtin(&mut self, b: Builtin) -> TileExpr {
+    pub(crate) fn builtin(&mut self, b: Builtin) -> TileExpr {
         self.intern(
             TileExprKind::Builtin(b),
             ElementType::Scalar(ScalarElement::U32),
         )
     }
 
-    pub fn load_local(&mut self, local: Local) -> TileExpr {
+    pub(crate) fn load_local(&mut self, local: Local) -> TileExpr {
         let ty = local.element;
         self.intern(TileExprKind::LoadLocal(local), ty)
     }
 
-    pub fn load(&mut self, src: Source, addr: Addr, mask: TileExpr, fill: TileExpr) -> TileExpr {
+    pub(crate) fn load(&mut self, src: Source, addr: Addr, mask: TileExpr, fill: TileExpr) -> TileExpr {
         let ty = match &src {
             Source::Storage(v) => v.buffer.element,
             // A quantized load decodes to f32 before it is ever a value.
@@ -640,12 +623,12 @@ impl Kernel {
         )
     }
 
-    pub fn load_tile(&mut self, tile: Tile, index: TileExpr) -> TileExpr {
+    pub(crate) fn load_tile(&mut self, tile: Tile, index: TileExpr) -> TileExpr {
         let ty = tile.element;
         self.intern(TileExprKind::LoadTile { tile, index }, ty)
     }
 
-    pub fn unary(&mut self, op: TileUnaryOp, value: TileExpr, numeric: NumericContract) -> TileExpr {
+    pub(crate) fn unary(&mut self, op: TileUnaryOp, value: TileExpr, numeric: NumericContract) -> TileExpr {
         let ty = if op == TileUnaryOp::Unpack2x16Float {
             ElementType::Vector {
                 scalar: ScalarElement::F32,
@@ -664,7 +647,7 @@ impl Kernel {
         )
     }
 
-    pub fn binary(
+    pub(crate) fn binary(
         &mut self,
         op: TileBinaryOp,
         left: TileExpr,
@@ -683,30 +666,30 @@ impl Kernel {
         )
     }
 
-    pub fn add(&mut self, a: TileExpr, b: TileExpr) -> TileExpr {
+    pub(crate) fn add(&mut self, a: TileExpr, b: TileExpr) -> TileExpr {
         self.binary(TileBinaryOp::Add, a, b, NumericContract::RELAXED)
     }
-    pub fn mul(&mut self, a: TileExpr, b: TileExpr) -> TileExpr {
+    pub(crate) fn mul(&mut self, a: TileExpr, b: TileExpr) -> TileExpr {
         self.binary(TileBinaryOp::Mul, a, b, NumericContract::RELAXED)
     }
-    pub fn sub(&mut self, a: TileExpr, b: TileExpr) -> TileExpr {
+    pub(crate) fn sub(&mut self, a: TileExpr, b: TileExpr) -> TileExpr {
         self.binary(TileBinaryOp::Sub, a, b, NumericContract::RELAXED)
     }
     /// `a * b + c` with contraction permitted, the fused-multiply-add the
     /// emitter is free to issue as one instruction.
-    pub fn fma(&mut self, a: TileExpr, b: TileExpr, c: TileExpr) -> TileExpr {
+    pub(crate) fn fma(&mut self, a: TileExpr, b: TileExpr, c: TileExpr) -> TileExpr {
         let p = self.mul(a, b);
         self.add(p, c)
     }
 
-    pub fn compare(&mut self, op: TileCompareOp, left: TileExpr, right: TileExpr) -> TileExpr {
+    pub(crate) fn compare(&mut self, op: TileCompareOp, left: TileExpr, right: TileExpr) -> TileExpr {
         self.intern(
             TileExprKind::Compare { op, left, right },
             ElementType::Scalar(ScalarElement::Bool),
         )
     }
 
-    pub fn and(&mut self, a: TileExpr, b: TileExpr) -> TileExpr {
+    pub(crate) fn and(&mut self, a: TileExpr, b: TileExpr) -> TileExpr {
         self.intern(
             TileExprKind::Binary {
                 op: TileBinaryOp::LogicalAnd,
@@ -718,18 +701,18 @@ impl Kernel {
         )
     }
 
-    pub fn cast(&mut self, value: TileExpr, to: ElementType) -> TileExpr {
+    pub(crate) fn cast(&mut self, value: TileExpr, to: ElementType) -> TileExpr {
         if value.element() == to {
             return value;
         }
         self.intern(TileExprKind::Cast { value, to }, to)
     }
 
-    pub fn bitcast(&mut self, value: TileExpr, to: ElementType) -> TileExpr {
+    pub(crate) fn bitcast(&mut self, value: TileExpr, to: ElementType) -> TileExpr {
         self.intern(TileExprKind::Bitcast { value, to }, to)
     }
 
-    pub fn select(&mut self, condition: TileExpr, accept: TileExpr, reject: TileExpr) -> TileExpr {
+    pub(crate) fn select(&mut self, condition: TileExpr, accept: TileExpr, reject: TileExpr) -> TileExpr {
         let ty = accept.element();
         self.intern(
             TileExprKind::Select {
@@ -741,7 +724,7 @@ impl Kernel {
         )
     }
 
-    pub fn vector(&mut self, scalar: ScalarElement, parts: Vec<TileExpr>) -> TileExpr {
+    pub(crate) fn vector(&mut self, scalar: ScalarElement, parts: Vec<TileExpr>) -> TileExpr {
         let lanes = parts.len() as u32;
         self.intern(
             TileExprKind::Vec {
@@ -753,18 +736,7 @@ impl Kernel {
         )
     }
 
-    pub fn component(&mut self, vector: TileExpr, component: u32) -> TileExpr {
-        let ty = match vector.element() {
-            ElementType::Vector { scalar, .. } => ElementType::Scalar(scalar),
-            other => other,
-        };
-        self.intern(
-            TileExprKind::VecComponent { vector, component },
-            ty,
-        )
-    }
-
-    pub fn dot(&mut self, left: TileExpr, right: TileExpr) -> TileExpr {
+    pub(crate) fn dot(&mut self, left: TileExpr, right: TileExpr) -> TileExpr {
         let ty = match left.element() {
             ElementType::Vector { scalar, .. } => ElementType::Scalar(scalar),
             other => other,
@@ -772,12 +744,12 @@ impl Kernel {
         self.intern(TileExprKind::Dot { left, right }, ty)
     }
 
-    pub fn round(&mut self, mode: fusor2_ir::dtype::RoundMode, value: TileExpr) -> TileExpr {
+    pub(crate) fn round(&mut self, mode: fusor2_ir::dtype::RoundMode, value: TileExpr) -> TileExpr {
         let ty = value.element();
         self.intern(TileExprKind::Round { mode, value }, ty)
     }
 
-    pub fn reduce(&mut self, op: TileReduceOp, kind: ReduceKind, value: TileExpr) -> TileExpr {
+    pub(crate) fn reduce(&mut self, op: TileReduceOp, kind: ReduceKind, value: TileExpr) -> TileExpr {
         let ty = value.element();
         self.intern(
             TileExprKind::Reduce {
@@ -789,7 +761,7 @@ impl Kernel {
         )
     }
 
-    pub fn coop_load(
+    pub(crate) fn coop_load(
         &mut self,
         role: CoopMatrixRole,
         scalar: ScalarElement,
@@ -815,7 +787,7 @@ impl Kernel {
     }
 
     /// An all-zero fragment of the same shape as a cooperative accumulator.
-    pub fn coop_zero(
+    pub(crate) fn coop_zero(
         &mut self,
         role: CoopMatrixRole,
         scalar: ScalarElement,
@@ -838,20 +810,20 @@ impl Kernel {
         )
     }
 
-    pub fn coop_mma(&mut self, a: TileExpr, b: TileExpr, c: TileExpr) -> TileExpr {
+    pub(crate) fn coop_mma(&mut self, a: TileExpr, b: TileExpr, c: TileExpr) -> TileExpr {
         let ty = c.element();
         self.intern(TileExprKind::CoopMma { a, b, c }, ty)
     }
 
     /// A private per-invocation local. Locals are identity-bearing, so they
     /// are deliberately *not* interned.
-    pub fn local(&self, element: ElementType) -> Local {
+    pub(crate) fn local(&self, element: ElementType) -> Local {
         Arc::new(LocalDecl::new(element))
     }
 
     /// A workgroup tile. Also identity-bearing: two tiles with the same shape
     /// are two allocations the arena may or may not overlap.
-    pub fn tile(&self, name: &'static str, element: ElementType, extents: &[u32]) -> Tile {
+    pub(crate) fn tile(&self, name: &'static str, element: ElementType, extents: &[u32]) -> Tile {
         Arc::new(TileDecl::new(
             element,
             TileLayout::contiguous(MemoryLevel::Workgroup, extents),
@@ -862,7 +834,7 @@ impl Kernel {
 
 /// Per-kernel lowering state: the buffer table in binding order, the uniform
 /// word layout, and the Kernel builder.
-pub struct Ctx<'a> {
+pub(crate) struct Ctx<'a> {
     pub caps: &'a Caps,
     pub cx: &'a LowerCtx<'a>,
     pub b: Kernel,
@@ -875,26 +847,12 @@ pub struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    /// Build the buffer table for one launch.
-    ///
-    /// Binding 0 is the uniform block; every plan binding follows in
-    /// `BindingPlan::binding` order at `1 + position`. Reserving slot 0 is
-    /// what lets a kernel read a symbolic extent without the extent entering
-    /// its identity.
-    pub fn new(caps: &'a Caps, cx: &'a LowerCtx<'a>, binding: DimBinding) -> Result<Self> {
-        Self::with_pack(
-            caps,
-            cx,
-            binding,
-            std::sync::Arc::new(UniformPack::new(cx.plan)),
-        )
-    }
-
-    /// [`Self::new`] with the plan's binding-0 word layout supplied.
+    /// Build the buffer table for one launch with the plan's binding-0 word
+    /// layout supplied.
     ///
     /// The pack is a function of the plan alone, so a caller that lowers more
     /// than one launch of one plan derives it once and hands it down.
-    pub fn with_pack(
+    pub(crate) fn with_pack(
         caps: &'a Caps,
         cx: &'a LowerCtx<'a>,
         binding: DimBinding,
@@ -962,7 +920,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// The bound buffer for a plan value.
-    pub fn buffer(&self, value: Id) -> Result<Buffer> {
+    pub(crate) fn buffer(&self, value: Id) -> Result<Buffer> {
         let slot = self
             .slot_of
             .get(&value)
@@ -973,16 +931,16 @@ impl<'a> Ctx<'a> {
     /// The `BufferPlan` layout for a value. **Never re-derived** where the
     /// plan has one — that is the padded stride set the extractor committed
     /// to. See [`bound_layout`] for the leaf case.
-    pub fn plan_layout(&self, value: Id) -> Result<Layout> {
+    pub(crate) fn plan_layout(&self, value: Id) -> Result<Layout> {
         Ok(bound_layout(self.cx, value).0)
     }
 
-    pub fn plan_dtype(&self, value: Id) -> Result<Dtype> {
+    pub(crate) fn plan_dtype(&self, value: Id) -> Result<Dtype> {
         Ok(bound_layout(self.cx, value).1)
     }
 
     /// A flat rank-1 view of a value's buffer, for elementwise access.
-    pub fn linear_view(&self, value: Id) -> Result<fusor2_ir::ir::kernel::StorageView> {
+    pub(crate) fn linear_view(&self, value: Id) -> Result<fusor2_ir::ir::kernel::StorageView> {
         let buffer = self.buffer(value)?;
         let layout = buffer.layout.clone();
         Ok(fusor2_ir::ir::kernel::StorageView {
@@ -994,7 +952,7 @@ impl<'a> Ctx<'a> {
 
     /// A 2-D matrix view of an operand, split at `row_dims`, built from the
     /// plan's layout.
-    pub fn matrix_view(
+    pub(crate) fn matrix_view(
         &self,
         operand: &Operand,
         row_dims: usize,
@@ -1123,7 +1081,7 @@ impl<'a> Ctx<'a> {
     /// costs the decode math on the way into shared memory and nothing else.
     /// The staging tile, the fragments, the MMA and the arena footprint are the
     /// dense ones.
-    pub fn contract_stage_source(
+    pub(crate) fn contract_stage_source(
         &mut self,
         operand: &Operand,
         view: &fusor2_ir::ir::kernel::StorageView,
@@ -1148,7 +1106,7 @@ impl<'a> Ctx<'a> {
     /// index and differ only in strides, so each gets its own view and all of
     /// them are loaded at the same coordinate before the side's `pre` runs
     /// over the results.
-    pub fn contract_side_sources(
+    pub(crate) fn contract_side_sources(
         &mut self,
         side: &ContractSide,
         rows: u32,
@@ -1169,7 +1127,7 @@ impl<'a> Ctx<'a> {
             .collect()
     }
 
-    pub fn contract_operand_view(
+    pub(crate) fn contract_operand_view(
         &self,
         operand: &Operand,
         rows: u32,
@@ -1181,7 +1139,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// Read a `u32` word out of binding 0.
-    pub fn uniform_word(&mut self, slot: u32) -> TileExpr {
+    pub(crate) fn uniform_word(&mut self, slot: u32) -> TileExpr {
         let view = fusor2_ir::ir::kernel::StorageView {
             buffer: self.buffers[0].clone(),
             offset: 0,
@@ -1196,7 +1154,7 @@ impl<'a> Ctx<'a> {
 
     /// A `u32` expression for a dim: a literal when constant, a binding-0 word
     /// when symbolic. A sequence length is a word, never a baked constant.
-    pub fn dim_expr(&mut self, dim: Dim) -> Result<TileExpr> {
+    pub(crate) fn dim_expr(&mut self, dim: Dim) -> Result<TileExpr> {
         match dim {
             Dim::Const(v) => {
                 let v = u32::try_from(v)
@@ -1215,7 +1173,7 @@ impl<'a> Ctx<'a> {
 
     /// An `f32` expression for a runtime scalar: `m * lr` reads a word, so a
     /// learning-rate change recompiles nothing.
-    pub fn scalar_expr(&mut self, sym: SymId) -> Result<TileExpr> {
+    pub(crate) fn scalar_expr(&mut self, sym: SymId) -> Result<TileExpr> {
         let slot = self
             .pack
             .scalar_slot(sym)
@@ -1238,7 +1196,7 @@ impl<'a> Ctx<'a> {
     /// first slab at a wildly out-of-range index, mask itself out, and leave
     /// the tail of the output untouched — silently, for any launch over the
     /// per-dimension limit.
-    pub fn global_index(&mut self, block: u32, grid: [u32; 3]) -> TileExpr {
+    pub(crate) fn global_index(&mut self, block: u32, grid: [u32; 3]) -> TileExpr {
         use fusor2_ir::ir::kernel::WorkgroupAxis;
         let lane = self.b.builtin(Builtin::Lane);
         let gx = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
@@ -1263,7 +1221,7 @@ impl<'a> Ctx<'a> {
 
     /// The value this launch writes: the launch root when it is bound for
     /// writing, else the first writable binding.
-    pub fn output(&self) -> Result<Id> {
+    pub(crate) fn output(&self) -> Result<Id> {
         let root = self.cx.launch.root;
         if self
             .cx
@@ -1286,7 +1244,7 @@ impl<'a> Ctx<'a> {
     /// Per-axis coordinates of a flat index over `space`, most-significant
     /// axis first. One divmod per axis past the innermost, exactly as the
     /// index-op cost term prices.
-    pub fn coords_from_linear(
+    pub(crate) fn coords_from_linear(
         &mut self,
         linear: TileExpr,
         space: &IndexSpace,
@@ -1316,7 +1274,7 @@ impl<'a> Ctx<'a> {
     /// space coordinates `IndexOf` reads. Comparisons return 1.0/0.0 in the
     /// operand's own dtype, matching Logical semantics — Kernel's `Bool` exists only
     /// between the compare and the select.
-    pub fn eval_scalar(
+    pub(crate) fn eval_scalar(
         &mut self,
         expr: &fusor2_ir::scalar::ScalarExpr,
         args: &[TileExpr],
@@ -1439,7 +1397,7 @@ impl<'a> Ctx<'a> {
     /// nests). Everything whose index *is* the space coordinate must come
     /// through here: a stride-0 broadcast axis, a transposed view, a narrowed
     /// slice and a conv window all disagree with the bare flat index.
-    pub fn load_mapped(
+    pub(crate) fn load_mapped(
         &mut self,
         operand: &Operand,
         flat: TileExpr,
@@ -1450,7 +1408,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// `flat` run through one operand's index map.
-    pub fn operand_address(
+    pub(crate) fn operand_address(
         &mut self,
         operand: &Operand,
         flat: TileExpr,
@@ -1691,7 +1649,7 @@ impl<'a> Ctx<'a> {
     /// Load one operand at an already-computed **storage** element index. The
     /// mask is the plan's runtime bounds obligation; a load is never emitted
     /// unmasked unless the extent is a compile-time multiple of the block.
-    pub fn load_operand(&mut self, operand: &Operand, index: TileExpr) -> Result<TileExpr> {
+    pub(crate) fn load_operand(&mut self, operand: &Operand, index: TileExpr) -> Result<TileExpr> {
         // A `Leaf::Const` is folded into the kernel: no buffer, no binding,
         // no traffic. That is exactly what `LeafRole::Free` means in the
         // plan, so `derive_bindings` never emits one and loading it would
@@ -1816,7 +1774,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// Finish a kernel body into a [`KernelIr`].
-    pub fn finish(self, name: &'static str, grid: [u32; 3], block: u32, body: Vec<Stmt>) -> KernelIr {
+    pub(crate) fn finish(self, name: &'static str, grid: [u32; 3], block: u32, body: Vec<Stmt>) -> KernelIr {
         KernelIr {
             buffers: self.buffers,
             grid,
@@ -1837,7 +1795,7 @@ impl<'a> Ctx<'a> {
 /// One match over `Launch` into the eight submodule entry points. Every arm gets a
 /// real body: there is no "unsupported, fall back" path, because the extractor
 /// already proved the node selectable on this target.
-pub fn lower_node(
+pub(crate) fn lower_node(
     caps: &Caps,
     node: &Node,
     theta: SchedPoint,
@@ -1864,7 +1822,7 @@ pub fn lower_node(
 }
 
 /// `Launch::Ext` lowering: the one escape hatch out of the closed `Logical`/`Launch` enums.
-pub mod ext {
+pub(crate) mod ext {
     use super::*;
     use fusor2_ir::ir::{OpDefId, OpDefRegistry};
     use std::sync::RwLock;
@@ -1877,23 +1835,15 @@ pub mod ext {
     /// Registration order is id order and must match.
     static DEFS: RwLock<Option<OpDefRegistry>> = RwLock::new(None);
 
-    /// Install the extension registry this process lowers against. Idempotent
-    /// and last-write-wins; a second install with a differently ordered
-    /// registry would silently rename every `OpDefId`, so callers pass the
-    /// registry the graph was built with, unchanged.
-    pub fn install(registry: OpDefRegistry) {
-        *DEFS.write().expect("the OpDef registry lock is poisoned") = Some(registry);
-    }
-
     /// The installed registry, if the embedder installed one.
-    pub fn installed() -> Option<OpDefRegistry> {
+    pub(crate) fn installed() -> Option<OpDefRegistry> {
         DEFS.read()
             .expect("the OpDef registry lock is poisoned")
             .clone()
     }
 
     /// Lower one registered extension op through its `"gpu"` row.
-    pub fn lower(def: OpDefId, node: &Node, theta: SchedPoint) -> Result<KernelIr> {
+    pub(crate) fn lower(def: OpDefId, node: &Node, theta: SchedPoint) -> Result<KernelIr> {
         let registry = installed().ok_or_else(|| {
             Error::Plan(format!(
                 "{def:?} is an extension op, but no OpDefRegistry is installed on the \
@@ -1929,7 +1879,7 @@ pub mod ext {
 /// The [`fusor2_ir::target::Target`] contract returns exactly one `KernelIr`
 /// per node; families that need two launches (split-K, sort-then-segment) are
 /// driven through [`lower_node`] by the executor, which binds their scratch.
-pub fn lower(
+pub(crate) fn lower(
     caps: &Caps,
     node: &Node,
     id: Id,
@@ -1948,486 +1898,5 @@ pub fn lower(
             node.op.tag() as u32,
             kernels.len()
         )))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The linearization every lowering applies to `@builtin(workgroup_id)`
-    /// must be `gx + gy*X + gz*X*Y` **of the dispatched grid**, and
-    /// `max_compute_workgroups_per_dimension` is not `X`.
-    ///
-    /// `distribute_workgroups` picks the slab count first and sizes `x` to the
-    /// slab, so `x < max_per_dim` for most launches that need a second slab.
-    /// `Ctx::global_index` used the limit as the stride; every workgroup off
-    /// the first slab then computed an index far past the end, masked itself
-    /// out, and left that part of the output at its prior contents.
-    #[test]
-    fn the_workgroup_linearization_uses_the_grid_not_the_limit() {
-        const MAX: u32 = 65535;
-        for total in [1u32, 6, 65535, 65536, 122_880, 200_000, 4_000_000] {
-            let [x, y, z] = distribute_workgroups(total, MAX);
-            // Every group in `0..total` is hit exactly once by the grid walk.
-            let mut seen = vec![false; total as usize];
-            for gz in 0..z {
-                for gy in 0..y {
-                    for gx in 0..x {
-                        let id = u64::from(gx)
-                            + u64::from(gy) * u64::from(x)
-                            + u64::from(gz) * u64::from(x) * u64::from(y);
-                        if let Some(slot) = seen.get_mut(id as usize) {
-                            assert!(!*slot, "{total}: group {id} visited twice");
-                            *slot = true;
-                        }
-                    }
-                }
-            }
-            assert!(seen.iter().all(|s| *s), "{total}: a group was never visited");
-        }
-
-        // ...and the limit really is the wrong stride: at 6 groups the grid is
-        // [3, 2, 1], so `gy * MAX` sends the whole second row out of range.
-        let grid = distribute_workgroups(6u32, 4);
-        assert_eq!(grid, [3, 2, 1]);
-        assert_ne!(grid[0], 4, "the slab width is not the per-dimension limit");
-    }
-
-    /// WGSL has no infinite literal and naga rejects a module holding one,
-    /// so every `-inf` the frontend hands down — a causal mask's reject arm, a
-    /// max fold's identity — has to arrive as the largest finite magnitude.
-    #[test]
-    fn an_infinite_literal_is_clamped_to_something_wgsl_can_spell() {
-        assert!(finite_f32(f32::NEG_INFINITY).is_finite());
-        assert!(finite_f32(f32::INFINITY).is_finite());
-        assert!(finite_f32(f32::NEG_INFINITY) < -3.0e38);
-        assert!(finite_f32(f32::INFINITY) > 3.0e38);
-        assert_eq!(finite_f32(-2.5), -2.5);
-        assert_eq!(finite_f32(f32::NAN), 0.0);
-
-        let neg = half::f16::from_bits(finite_f16(half::f16::NEG_INFINITY.to_bits()));
-        assert!(neg.is_finite() && neg.to_f32() <= -65504.0);
-        let bneg = half::bf16::from_bits(finite_bf16(half::bf16::NEG_INFINITY.to_bits()));
-        assert!(bneg.is_finite() && bneg.to_f32() < -3.0e38);
-
-        // The max-carrier sentinel agrees with `emit::expr`'s reduce identity,
-        // so a max started by hand and one started by a `Reduce` match.
-        let mut b = Kernel::new();
-        let sentinel = b.neg_inf(ScalarElement::F32);
-        let expected = b.f32(-crate::emit::expr::WGSL_SAFE_F32_MAX);
-        assert_eq!(sentinel, expected);
-    }
-
-    #[test]
-    fn hash_consing_merges_separately_built_subtrees() {
-        let mut b = Kernel::new();
-        let a1 = {
-            let x = b.f32(2.0);
-            let y = b.f32(3.0);
-            b.add(x, y)
-        };
-        let a2 = {
-            let x = b.f32(2.0);
-            let y = b.f32(3.0);
-            b.add(x, y)
-        };
-        assert_eq!(a1, a2);
-        assert_eq!(a1.structural_hash(), a2.structural_hash());
-    }
-
-    #[test]
-    fn affine_flatten_uses_plain_strides() {
-        let binding = DimBinding::new();
-        let layout = Layout::contiguous(&[Dim::Const(4), Dim::Const(8), Dim::Const(16)]);
-        let view = flatten_matrix_layout_split(&layout, 2, &binding).unwrap();
-        assert_eq!(view.rows, 32);
-        assert_eq!(view.cols, 16);
-        assert!(view.layout.is_affine(), "an affine side must stay affine");
-        assert_eq!(view.layout.indexing.groups[0].sub_axes[0].stride, 16);
-        assert_eq!(view.layout.indexing.groups[1].sub_axes[0].stride, 1);
-    }
-
-    #[test]
-    fn non_affine_flatten_emits_sub_axes_and_drops_extent_one() {
-        let binding = DimBinding::new();
-        // A transposed batch prefix: axis 0 does not merge with axis 1.
-        let layout = Layout::from_parts(
-            Dim::Const(0),
-            &[Dim::Const(3), Dim::Const(1), Dim::Const(5), Dim::Const(7)],
-            &[
-                Dim::Const(1),
-                Dim::Const(0),
-                Dim::Const(21),
-                Dim::Const(3),
-            ],
-        )
-        .unwrap();
-        let view = flatten_matrix_layout_split(&layout, 2, &binding).unwrap();
-        assert_eq!(view.rows, 3);
-        assert_eq!(view.cols, 35);
-        // The extent-1 axis is dropped, saving a divmod per load.
-        assert_eq!(view.layout.indexing.groups[0].sub_axes.len(), 1);
-        assert_eq!(view.layout.indexing.groups[0].sub_axes[0].extent, 3);
-    }
-
-    #[test]
-    fn a_split_past_the_rank_is_a_plan_error() {
-        let binding = DimBinding::new();
-        let layout = Layout::contiguous(&[Dim::Const(4), Dim::Const(8)]);
-        assert!(matches!(
-            flatten_matrix_layout_split(&layout, 3, &binding),
-            Err(Error::Plan(_))
-        ));
-    }
-
-    /// A contraction whose `n` extent is 1 has no `n` axes, so its B operand
-    /// is a one-column matrix: the split lands *on* the rank, not inside it.
-    /// The empty side must contribute nothing to the address.
-    #[test]
-    fn a_degenerate_split_is_a_one_row_or_one_column_matrix() {
-        let binding = DimBinding::new();
-        let layout = Layout::contiguous(&[Dim::Const(4), Dim::Const(8)]);
-
-        let cols = flatten_matrix_layout_split(&layout, 2, &binding).unwrap();
-        assert_eq!((cols.rows, cols.cols), (32, 1));
-        assert!(cols.layout.is_affine());
-        // Row `r` is element `r`; the empty column side has stride 0.
-        assert_eq!(cols.layout.indexing.groups[0].sub_axes[0].stride, 1);
-        assert_eq!(cols.layout.indexing.groups[1].sub_axes[0].stride, 0);
-
-        let rows = flatten_matrix_layout_split(&layout, 0, &binding).unwrap();
-        assert_eq!((rows.rows, rows.cols), (1, 32));
-        assert_eq!(rows.layout.indexing.groups[0].sub_axes[0].stride, 0);
-        assert_eq!(rows.layout.indexing.groups[1].sub_axes[0].stride, 1);
-    }
-
-    /// The split a contraction operand needs comes from its `(rows, cols)`
-    /// element counts, never from its rank: a batched `[b, m, k]` A splits at
-    /// 2, and a `[b, k]` B of an `n = 1` contraction splits at 2 as well —
-    /// both of which `rank - 1` gets wrong.
-    #[test]
-    fn matrix_split_comes_from_the_extents_not_the_rank() {
-        let binding = DimBinding::new();
-        let a = Layout::contiguous(&[Dim::Const(3), Dim::Const(4), Dim::Const(5)]);
-        assert_eq!(matrix_split_for(&a, &binding, 12, 5).unwrap(), 2);
-        assert_eq!(matrix_split_for(&a, &binding, 3, 20).unwrap(), 1);
-        assert_eq!(matrix_split_for(&a, &binding, 60, 1).unwrap(), 3);
-        assert_eq!(matrix_split_for(&a, &binding, 1, 60).unwrap(), 0);
-
-        // `sum(x * x, 1)` over `[3, 5]`: batch 3, m 1, n 1, k 5. A is
-        // `[batch * m, k] = [3, 5]` and B is `[batch * k, n] = [15, 1]`.
-        let x = Layout::contiguous(&[Dim::Const(3), Dim::Const(5)]);
-        assert_eq!(matrix_split_for(&x, &binding, 3, 5).unwrap(), 1);
-        assert_eq!(matrix_split_for(&x, &binding, 15, 1).unwrap(), 2);
-
-        assert!(matches!(
-            matrix_split_for(&x, &binding, 7, 2),
-            Err(Error::Plan(_))
-        ));
-    }
-
-    #[test]
-    fn grid_for_respects_the_per_dimension_limit() {
-        let limits = Limits::default();
-        let space = IndexSpace::new([Dim::Const(1024), Dim::Const(1024)]);
-        let grid = grid_for(&space, 256, &DimBinding::new(), &limits).unwrap();
-        let launched = u64::from(grid[0]) * u64::from(grid[1]) * u64::from(grid[2]);
-        assert!(launched >= (1024 * 1024) / 256);
-        assert!(grid.iter().all(|d| *d <= limits.max_compute_workgroups_per_dimension));
-    }
-
-    #[test]
-    fn grid_for_needs_every_symbol_bound() {
-        let limits = Limits::default();
-        let space = IndexSpace::new([Dim::Sym(SymId(0))]);
-        assert!(grid_for(&space, 64, &DimBinding::new(), &limits).is_err());
-        let bound = DimBinding::from_pairs([(SymId(0), 512)]);
-        assert_eq!(grid_for(&space, 64, &bound, &limits).unwrap(), [8, 1, 1]);
-    }
-
-    /// The same plan at three sequence lengths produces three grids and one
-    /// kernel identity, because the extent never enters the body.
-    #[test]
-    fn sequence_length_only_moves_the_grid() {
-        let limits = Limits::default();
-        let space = IndexSpace::new([Dim::Sym(SymId(0)), Dim::Const(64)]);
-        let grids: Vec<_> = [256u64, 512, 768]
-            .into_iter()
-            .map(|n| {
-                grid_for(
-                    &space,
-                    256,
-                    &DimBinding::from_pairs([(SymId(0), n)]),
-                    &limits,
-                )
-                .unwrap()
-            })
-            .collect();
-        assert_eq!(grids, vec![[64, 1, 1], [128, 1, 1], [192, 1, 1]]);
-    }
-}
-
-
-/// End-to-end cover for the extension seam: a registered `OpDef` lowering to
-/// real WGSL, dispatching on the adapter, and returning the numbers it
-/// computed.
-#[cfg(test)]
-mod ext_tests {
-    use super::*;
-    use fusor2_ir::dtype::Persistence;
-    use fusor2_ir::egraph::EGraph;
-    use fusor2_ir::extract::{
-        BindKind, BindingPlan, Extraction, Dispatch, Plan, PlanHash,
-    };
-    use fusor2_ir::facts::{ValueFacts, Work};
-    use fusor2_ir::ir::logical::{BufferId, Logical, LeafKind};
-    use fusor2_ir::ir::launch::{AccessPlan, Effect};
-    use fusor2_ir::ir::kernel::{
-        Addr, BufferAccess, BufferDecl, MemoryLevel, Source, StorageView, TileLayout,
-    };
-    use fusor2_ir::ir::{AttrId, OpDef, OpDefId, OpDefRegistry, OpTag, VerifyCtx};
-    use fusor2_ir::semantics::{CoreSemantics, SumArenaPlanner};
-    use fusor2_ir::shape::Layout;
-    use fusor2_ir::ir::kernel::WorkgroupAxis;
-    use fusor2_ir::target::Target;
-    use std::sync::Arc;
-
-    const N: u32 = 8;
-
-    /// The registered op's own `"gpu"` lowering: `y = 3 * x`. It builds the
-    /// whole `KernelIr` from the node, which is all `lower_per_target` offers,
-    /// and nothing in `fusor2-gpu` knows what "triple" means.
-    ///
-    /// `theta` is read rather than dropped. `Launch::schedule` returns `None` for
-    /// `Ext` — fusor2 cannot enumerate geometries for an `OpDef`-supplied
-    /// lowering — so extraction owes this seam `SchedPoint::Point` and nothing
-    /// else. Matching it states that contract instead of assuming it: an `Ext`
-    /// handed a `Fold` or `Sgemm` point means the schedule space grew a case
-    /// `schedule()` does not describe, and the seam should say so rather than
-    /// silently lower against a geometry it never read.
-    fn lower_triple(node: &Node, theta: &SchedPoint) -> Result<KernelIr> {
-        let SchedPoint::Point = theta else {
-            return Err(Error::Plan(
-                format!("Ext lowerings take SchedPoint::Point; got {theta:?}").into(),
-            ));
-        };
-        let Op::Launch(Launch::Ext { ops, .. }) = &node.op else {
-            return Err(Error::Plan("triple got a foreign node".into()));
-        };
-        let n: u32 = ops
-            .first()
-            .ok_or_else(|| Error::Plan("triple needs an operand".into()))?
-            .layout
-            .shape()
-            .iter()
-            .map(|d| d.as_const().unwrap_or(1) as u32)
-            .product();
-        let f32e = ElementType::Scalar(ScalarElement::F32);
-        let decl = |binding, element, len: u32, access| {
-            Arc::new(BufferDecl {
-                binding,
-                element,
-                layout: TileLayout::contiguous(MemoryLevel::Storage, &[len]),
-                access,
-            })
-        };
-        let uniforms = decl(
-            0,
-            ElementType::Scalar(ScalarElement::U32),
-            1,
-            BufferAccess::Read,
-        );
-        let input = decl(1, f32e, n, BufferAccess::Read);
-        let output = decl(2, f32e, n, BufferAccess::ReadWrite);
-
-        let mut b = Kernel::new();
-        let block = 64u32;
-        let gid = b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
-        let lane = b.builtin(Builtin::Lane);
-        let stride = b.u32(block);
-        let base = b.mul(gid, stride);
-        let index = b.add(base, lane);
-        let bound = b.u32(n);
-        let mask = b.compare(TileCompareOp::Lt, index.clone(), bound);
-        let fill = b.zero(ScalarElement::F32);
-        let view = |d: &Arc<BufferDecl>| StorageView {
-            layout: d.layout.clone(),
-            buffer: Arc::clone(d),
-            offset: 0,
-        };
-        let x = b.load(
-            Source::Storage(view(&input)),
-            Addr::Linear(index.clone()),
-            mask.clone(),
-            fill,
-        );
-        let three = b.f32(3.0);
-        let value = b.mul(x, three);
-        Ok(KernelIr {
-            buffers: vec![uniforms, input, output.clone()],
-            grid: [n.div_ceil(block).max(1), 1, 1],
-            block,
-            body: vec![Stmt::Store {
-                dst: view(&output),
-                addr: Addr::Linear(index),
-                value,
-                mask,
-            }],
-            byte_arena: None,
-            name: "triple",
-        })
-    }
-
-    fn registry() -> OpDefRegistry {
-        fn infer(ins: &[ValueFacts]) -> Result<ValueFacts> {
-            ins.first()
-                .cloned()
-                .ok_or_else(|| Error::Shape("triple needs an operand".into()))
-        }
-        fn work(_: &[ValueFacts], out: &ValueFacts) -> Work {
-            let n = out.elements().unwrap_or(1);
-            Work {
-                macs: n,
-                transcendentals: 0,
-                index_ops: n,
-                wg_bytes: 0,
-            }
-        }
-        fn verify(_: &VerifyCtx<'_>) -> Result<()> {
-            Ok(())
-        }
-        let mut r = OpDefRegistry::new();
-        r.register(OpDef {
-            name: "triple",
-            tag: OpTag::Ext,
-            verify,
-            infer,
-            work,
-            adjoint: None,
-            lower_per_target: &[("gpu", lower_triple)],
-            effect: Effect::Pure,
-        });
-        r
-    }
-
-    #[test]
-    fn a_registered_op_def_lowers_emits_and_dispatches() {
-        let reg = registry();
-        ext::install(reg.clone());
-        let mut g = EGraph::new(CoreSemantics::with_registry(
-            Arc::new(SumArenaPlanner),
-            reg,
-        ));
-        let x = g
-            .add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
-                name: BufferId(0),
-                dtype: fusor2_ir::dtype::Dtype::F32,
-                shape: smallvec::smallvec![Dim::Const(N as u64)],
-            })))
-            .unwrap();
-        let ops = vec![Operand {
-            src: x,
-            layout: Layout::contiguous(&g.facts(x).shape),
-            access: AccessPlan::Alias,
-        }];
-        let e = g
-            .add(Op::Launch(Launch::Ext {
-                def: OpDefId(0),
-                ops,
-                attrs: AttrId(0),
-            }))
-            .unwrap();
-
-        let plan = Plan {
-            extraction: Extraction::default(),
-            launches: vec![Dispatch {
-                root: e,
-                members: smallvec::smallvec![e],
-                bindings: vec![
-                    BindingPlan {
-                        binding: 1,
-                        value: x,
-                        kind: BindKind::Read,
-                    },
-                    BindingPlan {
-                        binding: 2,
-                        value: e,
-                        kind: BindKind::Write,
-                    },
-                ],
-                grid: [1, 1, 1],
-                block: 64,
-            }],
-            buffers: Vec::new(),
-            symbols: Vec::new(),
-            hash: PlanHash(0),
-            cost: fusor2_ir::cost::Picoseconds(0),
-        };
-        let cx = LowerCtx {
-            plan: &plan,
-            launch: &plan.launches[0],
-            graph: &g,
-            symbols: &[],
-        };
-
-        let target = crate::target::GpuTarget::new_blocking().unwrap();
-        let ir = lower(target.caps(), g.node(e), e, SchedPoint::Point, &cx).unwrap();
-        assert_eq!(ir.name, "triple", "the OpDef's own lowering must run");
-
-        let artifact = target.emit(&ir).unwrap();
-        let data: Vec<f32> = (1..=N).map(|v| v as f32).collect();
-        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let input = target
-            .pool()
-            .create_buffer_init(&bytes, crate::pool::TENSOR_USAGE)
-            .unwrap();
-        let out = target
-            .alloc((N as u64) * 4, Persistence::Step)
-            .unwrap();
-        let uniform = target.alloc(4, Persistence::Step).unwrap();
-        target
-            .launch(
-                &artifact,
-                ir.grid,
-                &[uniform, input, out.clone()],
-                &Default::default(),
-            )
-            .unwrap();
-        target.wait().unwrap();
-        let back = target
-            .launcher()
-            .readback(target.pool(), &out, (N as u64) * 4)
-            .unwrap();
-        let got: Vec<f32> = back[..(N as usize) * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        assert_eq!(got, vec![3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0, 24.0]);
-
-        // And an op with no `"gpu"` row is a plan answer naming the op, never
-        // a panic and never a silent fallback.
-        let mut empty = OpDefRegistry::new();
-        empty.register(OpDef {
-            name: "cpu_only",
-            tag: OpTag::Ext,
-            verify: |_| Ok(()),
-            infer: |ins: &[ValueFacts]| {
-                ins.first()
-                    .cloned()
-                    .ok_or_else(|| Error::Shape("no operand".into()))
-            },
-            work: |_, out: &ValueFacts| Work {
-                macs: out.elements().unwrap_or(1),
-                ..Work::default()
-            },
-            adjoint: None,
-            lower_per_target: &[],
-            effect: Effect::Pure,
-        });
-        ext::install(empty);
-        let err = ext::lower(OpDefId(0), g.node(e), SchedPoint::Point).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("cpu_only") && msg.contains("gpu"), "{msg}");
     }
 }

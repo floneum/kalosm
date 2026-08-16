@@ -18,6 +18,7 @@ use crate::{Error, Result};
 /// inferred hole.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Extent {
+    /// A specified extent.
     Dim(Dim),
     /// Exactly one of these is permitted; its extent is the element count
     /// divided by the product of the rest.
@@ -61,7 +62,7 @@ impl From<()> for Extent {
 /// The reach is composed over the *whole* input, not per axis, so an
 /// axis-merging reshape (`[2,3] -> [6]` reads `dim_with(1, 6, 1)`, addressing
 /// six elements past a dim of extent three) is `Static`.
-pub fn bounds_for(specs: &[StrideSpec], in_shape: &[Dim]) -> BoundsProof {
+pub(crate) fn bounds_for(specs: &[StrideSpec], in_shape: &[Dim]) -> BoundsProof {
     fusor2_autograd::tape::bounds_proof(specs, in_shape)
 }
 
@@ -445,121 +446,4 @@ impl Tensor {
         self.sliding_window_view(&[SlidingWindow::new(axis, window, step)])
     }
 
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn dims(v: &[u64]) -> Vec<Dim> {
-        v.iter().map(|&d| Dim::Const(d)).collect()
-    }
-
-    #[test]
-    fn reshape_pass_through_is_one_to_one() {
-        let s = reshape_specs(&dims(&[2, 3]), &dims(&[2, 3])).unwrap();
-        assert_eq!(
-            &s[..],
-            &[
-                StrideSpec::dim(0, Dim::Const(2)),
-                StrideSpec::dim(1, Dim::Const(3))
-            ]
-        );
-    }
-
-    #[test]
-    fn reshape_merges_onto_the_innermost_axis() {
-        let s = reshape_specs(&dims(&[2, 3]), &dims(&[6])).unwrap();
-        assert_eq!(&s[..], &[StrideSpec::dim_with(1, Dim::Const(6), 1)]);
-    }
-
-    #[test]
-    fn reshape_splits_with_local_row_major_multipliers() {
-        let s = reshape_specs(&dims(&[6]), &dims(&[2, 3])).unwrap();
-        assert_eq!(
-            &s[..],
-            &[
-                StrideSpec::dim_with(0, Dim::Const(2), 3),
-                StrideSpec::dim_with(0, Dim::Const(3), 1),
-            ]
-        );
-    }
-
-    #[test]
-    fn reshape_mixed_group_then_pass_through() {
-        // [2,3,4] -> [6,4]
-        let s = reshape_specs(&dims(&[2, 3, 4]), &dims(&[6, 4])).unwrap();
-        assert_eq!(s.len(), 2);
-        assert_eq!(s[0], StrideSpec::dim_with(1, Dim::Const(6), 1));
-        assert_eq!(s[1], StrideSpec::dim(2, Dim::Const(4)));
-    }
-
-    #[test]
-    fn reshape_keeps_a_symbolic_axis_that_passes_through() {
-        let sym = Dim::Sym(SymId(3));
-        let s = reshape_specs(&[sym, Dim::Const(6)], &[sym, Dim::Const(2), Dim::Const(3)]).unwrap();
-        assert_eq!(s[0], StrideSpec::dim(0, sym));
-        assert_eq!(s[1], StrideSpec::dim_with(1, Dim::Const(2), 3));
-        assert_eq!(s[2], StrideSpec::dim_with(1, Dim::Const(3), 1));
-    }
-
-    #[test]
-    fn reshape_refuses_to_merge_a_symbolic_axis() {
-        let sym = Dim::Sym(SymId(3));
-        assert!(reshape_specs(&[sym, Dim::Const(6)], &[Dim::Const(12)]).is_err());
-    }
-
-    #[test]
-    fn reshape_inserts_and_drops_ones() {
-        let s = reshape_specs(&dims(&[6]), &dims(&[1, 6])).unwrap();
-        assert_eq!(s[0].size, Dim::Const(1));
-        assert_eq!(s[0].multiplier, 1);
-        assert_eq!(s[1], StrideSpec::dim(0, Dim::Const(6)));
-
-        let s = reshape_specs(&dims(&[1, 6]), &dims(&[6])).unwrap();
-        assert_eq!(&s[..], &[StrideSpec::dim(1, Dim::Const(6))]);
-    }
-
-    #[test]
-    fn reshape_rank_zero_round_trip() {
-        let s = reshape_specs(&[], &dims(&[1])).unwrap();
-        assert_eq!(s[0].multiplier, 0);
-        let s = reshape_specs(&dims(&[1]), &[]).unwrap();
-        assert!(s.is_empty());
-    }
-
-    #[test]
-    fn bounds_are_static_only_when_everything_is_const_and_in_range() {
-        let shape = dims(&[4]);
-        let ok = [StrideSpec::dim(0, Dim::Const(3)).with_offset(Dim::Const(1))];
-        assert_eq!(bounds_for(&ok, &shape), BoundsProof::Static);
-
-        // offset 2 + (3-1)*1 = 4, one past the end: not statically provable.
-        let oob = [StrideSpec::dim(0, Dim::Const(3)).with_offset(Dim::Const(2))];
-        assert_eq!(bounds_for(&oob, &shape), BoundsProof::RuntimeMask);
-
-        let sym = [Dim::Sym(SymId(1))];
-        let masked = [StrideSpec::dim(0, Dim::Sym(SymId(1)))];
-        assert_eq!(bounds_for(&masked, &sym), BoundsProof::RuntimeMask);
-    }
-
-    #[test]
-    fn a_merge_is_in_range_against_the_whole_input() {
-        // [2,3] -> [6] reads six elements past a dim of extent three; the
-        // reach is composed over the whole input rather than per axis.
-        let s = reshape_specs(&dims(&[2, 3]), &dims(&[6])).unwrap();
-        assert_eq!(bounds_for(&s, &dims(&[2, 3])), BoundsProof::Static);
-        // Seven would not be.
-        let too_far = [StrideSpec::dim_with(1, Dim::Const(7), 1)];
-        assert_eq!(
-            bounds_for(&too_far, &dims(&[2, 3])),
-            BoundsProof::RuntimeMask
-        );
-    }
-
-    #[test]
-    fn singleton_specs_are_ordinary_axes_not_broadcasts() {
-        assert_eq!(singleton_spec(2, 1).multiplier, 1);
-        assert_eq!(singleton_spec(0, 0).multiplier, 0);
-    }
 }

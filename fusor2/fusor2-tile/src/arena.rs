@@ -22,7 +22,7 @@ use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
 use fusor2_ir::error::Error;
 use fusor2_ir::ir::kernel::{
-    ArenaMode, ArenaPlan, ElementType, KernelIr, Placement, ScalarElement, Tiles,
+    ArenaMode, ArenaPlan, ElementType, KernelIr, Placement, ScalarElement,
 };
 use smallvec::SmallVec;
 
@@ -32,13 +32,13 @@ use crate::liveness::{LivenessInfo, TileLiveness};
 /// data, 16 B of stride) never mixes with vec4 and value bitcasts stay
 /// per-component.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct StrideClass {
+pub(crate) struct StrideClass {
     pub stride: u32,
     pub lanes: u32,
 }
 
 /// The stride class of an element, or `None` when it cannot back an array.
-pub fn stride_class(element: ElementType) -> Option<StrideClass> {
+pub(crate) fn stride_class(element: ElementType) -> Option<StrideClass> {
     let stride = element.workgroup_array_stride()?;
     let lanes = match element {
         ElementType::Vector { lanes, .. } => lanes,
@@ -48,7 +48,7 @@ pub fn stride_class(element: ElementType) -> Option<StrideClass> {
 }
 
 /// The scalar backing an element, or `None` for a cooperative fragment.
-pub fn scalar_of(element: ElementType) -> Option<ScalarElement> {
+pub(crate) fn scalar_of(element: ElementType) -> Option<ScalarElement> {
     match element {
         ElementType::Scalar(scalar) | ElementType::Vector { scalar, .. } => Some(scalar),
         ElementType::CoopMatrix { .. } => None,
@@ -59,7 +59,7 @@ pub fn scalar_of(element: ElementType) -> Option<ScalarElement> {
 /// types always; otherwise the same stride class with a value-level bitcast
 /// between them. Only 4-byte scalars qualify, so a 2-byte `f16`/`bf16` tile
 /// never joins a 4-byte region.
-pub fn bitcast_compatible(a: ElementType, b: ElementType) -> bool {
+pub(crate) fn bitcast_compatible(a: ElementType, b: ElementType) -> bool {
     if a == b {
         return true;
     }
@@ -73,7 +73,7 @@ pub fn bitcast_compatible(a: ElementType, b: ElementType) -> bool {
 
 /// The canonical emission type for a heterogeneous region of this class: the
 /// u32-shaped type.
-pub fn neutral(class: StrideClass) -> ElementType {
+pub(crate) fn neutral(class: StrideClass) -> ElementType {
     if class.lanes == 1 {
         ElementType::Scalar(ScalarElement::U32)
     } else {
@@ -97,7 +97,7 @@ fn element_stride(element: ElementType) -> u32 {
 
 /// Whether the kernel mixes array stride widths. Without that, the byte
 /// arena's 16-byte rounding makes it a strict loss.
-pub fn mixes_stride_widths(live: &LivenessInfo) -> bool {
+pub(crate) fn mixes_stride_widths(live: &LivenessInfo) -> bool {
     let mut strides: SmallVec<[u32; 4]> = SmallVec::new();
     for tile in live.iter() {
         if let Some(stride) = tile.element.workgroup_array_stride()
@@ -110,7 +110,7 @@ pub fn mixes_stride_widths(live: &LivenessInfo) -> bool {
 }
 
 /// Whether every tile can back an array at all.
-pub fn all_packable(live: &LivenessInfo) -> bool {
+pub(crate) fn all_packable(live: &LivenessInfo) -> bool {
     live.iter().all(|tile| stride_class(tile.element).is_some())
 }
 
@@ -128,7 +128,7 @@ impl Region {
 /// One allocation per stride class, tiles sharing a region when their live
 /// ranges are barrier-separated. The universal fallback: needs no capability
 /// and no aliasing proof.
-pub fn regions(live: &LivenessInfo) -> ArenaPlan {
+pub(crate) fn regions(live: &LivenessInfo) -> ArenaPlan {
     let mut regions: Vec<Region> = Vec::new();
     // Check every occupant per region: the loop-phase arm does not compose —
     // A->B and B->C do not imply the C->A wrap is covered.
@@ -207,7 +207,7 @@ pub fn regions(live: &LivenessInfo) -> ArenaPlan {
 
 /// One byte arena, tiles at byte offsets by interval strip packing. Returns
 /// `None` when a tile cannot back an array.
-pub fn byte_arena(live: &LivenessInfo) -> Option<ArenaPlan> {
+pub(crate) fn byte_arena(live: &LivenessInfo) -> Option<ArenaPlan> {
     if !all_packable(live) {
         return None;
     }
@@ -267,34 +267,6 @@ pub fn byte_arena(live: &LivenessInfo) -> Option<ArenaPlan> {
     })
 }
 
-/// Pack under one mode. Fails when the result exceeds
-/// `caps.limits.max_compute_workgroup_storage_size`, or when `ByteArena` is
-/// requested without `caps.workgroup_alias`.
-pub fn pack(
-    ir: &KernelIr,
-    live: &LivenessInfo,
-    mode: ArenaMode,
-    caps: &Caps,
-) -> Result<ArenaPlan> {
-    let plan = match mode {
-        ArenaMode::Regions => regions(live),
-        ArenaMode::ByteArena => {
-            if !caps.workgroup_alias {
-                return Err(Error::Legality(
-                    "byte-arena packing needs the workgroup-alias capability".into(),
-                ));
-            }
-            byte_arena(live).ok_or_else(|| {
-                Error::Legality(
-                    "byte-arena packing needs every tile to back a workgroup array".into(),
-                )
-            })?
-        }
-    };
-    check_budget(&plan, ir, caps)?;
-    Ok(plan)
-}
-
 pub(crate) fn check_budget(plan: &ArenaPlan, ir: &KernelIr, caps: &Caps) -> Result<()> {
     let budget = caps.limits.max_compute_workgroup_storage_size;
     if plan.total_bytes > budget {
@@ -304,54 +276,4 @@ pub(crate) fn check_budget(plan: &ArenaPlan, ir: &KernelIr, caps: &Caps) -> Resu
         )));
     }
     Ok(())
-}
-
-/// Bytes a declared tile set needs, without building a body. Delegates to the
-/// shared [`crate::planner::Planner`] so this is the **same** computation the
-/// emitters lay out with — there is no estimator and therefore no Launch/Kernel
-/// admission mismatch.
-pub fn workgroup_bytes(tiles: &Tiles, caps: &Caps) -> Result<u32> {
-    use fusor2_ir::ir::kernel::ArenaPlanner;
-    crate::planner::Planner::global().workgroup_bytes(tiles, caps)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn f16_never_joins_a_four_byte_region() {
-        let f32e = ElementType::Scalar(ScalarElement::F32);
-        let u32e = ElementType::Scalar(ScalarElement::U32);
-        let f16e = ElementType::Scalar(ScalarElement::F16);
-        let bf16e = ElementType::Scalar(ScalarElement::BF16);
-        assert!(bitcast_compatible(f32e, u32e));
-        assert!(!bitcast_compatible(f32e, f16e));
-        assert!(!bitcast_compatible(f32e, bf16e));
-        // bf16 and f16 share a stride class but are 2-byte scalars, so they
-        // may not join either.
-        assert!(!bitcast_compatible(f16e, bf16e));
-        assert!(bitcast_compatible(bf16e, bf16e));
-    }
-
-    #[test]
-    fn neutral_is_the_u32_shape() {
-        assert_eq!(
-            neutral(StrideClass {
-                stride: 4,
-                lanes: 1
-            }),
-            ElementType::Scalar(ScalarElement::U32)
-        );
-        assert_eq!(
-            neutral(StrideClass {
-                stride: 16,
-                lanes: 4
-            }),
-            ElementType::Vector {
-                scalar: ScalarElement::U32,
-                lanes: 4
-            }
-        );
-    }
 }

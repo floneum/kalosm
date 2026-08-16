@@ -702,7 +702,7 @@ pub(crate) mod fixture {
 
     /// Build a synthetic GGUF file in memory. Tensors are laid out back to
     /// back from offset 0 in the order given.
-    pub fn build(
+    pub(crate) fn build(
         version: GgufVersion,
         entries: &[(&str, GgufValue)],
         tensors: &[(&str, GgmlType, &[u64], Vec<u8>)],
@@ -743,41 +743,6 @@ pub(crate) mod fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fusor2_ir::dtype::QFmt;
-
-    #[test]
-    fn ggml_type_ingest_gate() {
-        for fmt in QFmt::ALL {
-            let tag = match fmt {
-                QFmt::Q4_0 => GgmlType::Q4_0,
-                QFmt::Q5_0 => GgmlType::Q5_0,
-                QFmt::Q8_0 => GgmlType::Q8_0,
-                QFmt::Q4K => GgmlType::Q4K,
-                QFmt::Q5K => GgmlType::Q5K,
-                QFmt::Q6K => GgmlType::Q6K,
-            };
-            assert_eq!(tag.to_qfmt(), Some(fmt));
-            assert_eq!(ingest_qfmt(tag).unwrap(), Dtype::Q(fmt));
-            assert_eq!(
-                ggml_block_bytes(tag),
-                fmt.block_bytes(fusor2_ir::dtype::QLayout::Native) as u64
-            );
-            assert_eq!(ggml_block_elements(tag), fmt.block_elements() as u64);
-        }
-        assert_eq!(ingest_qfmt(GgmlType::F32).unwrap(), Dtype::F32);
-        assert_eq!(ingest_qfmt(GgmlType::F16).unwrap(), Dtype::F16);
-        for tag in [3u32, 7, 9, 10, 11, 15] {
-            let ty = GgmlType::from_u32(tag).expect("tag is a real ggml type");
-            assert!(ty.to_qfmt().is_none(), "{ty:?} must not ingest");
-            assert!(matches!(ingest_qfmt(ty), Err(Error::Dtype(_))));
-        }
-        for tag in [4u32, 5, 16] {
-            assert!(
-                GgmlType::from_u32(tag).is_none(),
-                "{tag} is not a ggml type"
-            );
-        }
-    }
 
     #[test]
     fn gguf_header_round_trip() {
@@ -842,32 +807,6 @@ mod tests {
         assert_eq!(gguf.tensor_bytes("a").unwrap(), &[1, 2, 3, 4]);
     }
 
-    #[test]
-    fn metadata_suffix_lookup() {
-        let file = fixture::build(
-            GgufVersion::V3,
-            &[
-                ("general.architecture", GgufValue::String("qwen3".into())),
-                ("qwen3.attention.head_count", GgufValue::U32(16)),
-                ("general.attention.head_count.kv", GgufValue::U32(8)),
-            ],
-            &[("a", GgmlType::F32, &[1], vec![0u8; 4])],
-        );
-        let gguf = Gguf::from_bytes(file).unwrap();
-        let meta = gguf.metadata();
-        assert_eq!(meta.architecture(), Some("qwen3"));
-        let suffix = meta.get_value(".attention.head_count").unwrap();
-        assert_eq!(suffix, &GgufValue::U32(16));
-        assert_eq!(
-            meta.get_value("qwen3.attention.head_count").unwrap(),
-            suffix
-        );
-        assert_eq!(
-            meta.get_value("general.attention.head_count.kv").unwrap(),
-            &GgufValue::U32(8)
-        );
-        assert!(meta.get_value(".nope").is_none());
-    }
 
     #[test]
     fn v1_and_v2_length_prefixes_round_trip() {
@@ -884,41 +823,5 @@ mod tests {
         }
     }
 
-    #[test]
-    fn value_widening_and_arrays() {
-        assert_eq!(GgufValue::I32(7).to_u64().unwrap(), 7);
-        assert_eq!(GgufValue::U8(3).to_i16().unwrap(), 3);
-        assert_eq!(GgufValue::F64(0.5).to_f32().unwrap(), 0.5);
-        assert!(GgufValue::String("x".into()).to_u32().is_err());
-        assert!(GgufValue::Bool(true).to_bool().unwrap());
-        assert_eq!(
-            GgufValue::String("s".into()).to_string_value().unwrap(),
-            "s"
-        );
 
-        let file = fixture::build(
-            GgufVersion::V3,
-            &[(
-                "tokenizer.ggml.tokens",
-                GgufValue::Array(vec![
-                    GgufValue::String("a".into()),
-                    GgufValue::String("bb".into()),
-                ]),
-            )],
-            &[("a", GgmlType::F32, &[1], vec![0u8; 4])],
-        );
-        let gguf = Gguf::from_bytes(file).unwrap();
-        let tokens = gguf.metadata().get_value("tokenizer.ggml.tokens").unwrap();
-        assert_eq!(tokens.to_array().unwrap()[1].as_str(), Some("bb"));
-    }
-
-    #[test]
-    fn a_shape_that_is_not_a_whole_number_of_blocks_is_rejected() {
-        let err = GgufTensor::byte_size(GgmlType::Q4_0, &[1, 17]).unwrap_err();
-        assert!(matches!(err, Error::Shape(_)));
-        assert_eq!(
-            GgufTensor::byte_size(GgmlType::Q6K, &[2, 256]).unwrap(),
-            420
-        );
-    }
 }

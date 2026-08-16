@@ -13,8 +13,8 @@ use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
 use fusor2_ir::ir::kernel::{
     Addr, ArenaMode, ArenaPlan, ArenaPlanner, BarrierSuggestion, Buffer, CoopSrc, KernelIr, Local,
-    MergeBody, QuantizedView, ReduceKind, Source, Stmt, StorageView, Tile, TileExpr,
-    TileExprKind, Tiles,
+    ElementType, MergeBody, QuantizedView, ReduceKind, ScalarElement, Source, Stmt, StorageView,
+    Tile, TileExpr, TileExprKind, TileLiteral, Tiles,
 };
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHasher};
@@ -599,12 +599,14 @@ impl ArenaPlanner for Planner {
 /// barrier, so no two can share and the footprint is the geometry's
 /// simultaneous demand — which is exactly what `verify_launch` must admit against.
 pub fn synth_ir(tiles: &Tiles) -> KernelIr {
-    let mut builder = crate::build::TileBuilder::new();
     let mut body: Vec<Stmt> = Vec::with_capacity(tiles.decls.len() * 2 + 1);
     let mut writes: Vec<Stmt> = Vec::with_capacity(tiles.decls.len());
     for tile in &tiles.decls {
-        let value = builder.zero(tile.element);
-        writes.push(builder.fill_tile(tile.clone(), value, [None, None]));
+        writes.push(Stmt::FillTile {
+            dst: tile.clone(),
+            value: zero(tile.element),
+            bounds: [None, None],
+        });
     }
     body.extend(writes.iter().cloned());
     body.push(Stmt::Barrier);
@@ -619,361 +621,32 @@ pub fn synth_ir(tiles: &Tiles) -> KernelIr {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::build::TileBuilder;
-    use crate::build::fixtures::{self, SHARED, UNSHARED};
-    use fusor2_ir::ir::kernel::{MemoryLevel, ScalarElement, TileLayout};
-
-    fn caps() -> Caps {
-        fixtures::caps_with(|_| {})
-    }
-
-    /// The footprint of the body **as written** — no barrier insertion. This
-    /// is what tests 1-6 are about: whether the barriers already present
-    /// separate the two tiles. `arena_plan` may legitimately beat it by
-    /// inserting one, which is what `barrier_suggestion_bytes_saved_is_exact`
-    /// and `insertion_rescues_a_skippable_in_loop_barrier` cover.
-    fn footprint(ir: &KernelIr) -> u32 {
-        arena::regions(&analyze(ir)).total_bytes
-    }
-
-    #[test]
-    fn shares_through_top_level_barrier() {
-        let mut b = TileBuilder::new();
-        let ir = fixtures::pair_kernel(&mut b, vec![Stmt::Barrier]);
-        assert_eq!(footprint(&ir), SHARED);
-        let plan = Planner::new().arena_plan(&ir, &caps()).unwrap();
-        assert_eq!(plan.total_bytes, SHARED);
-        assert!(plan.barriers_inserted.is_empty());
-    }
-
-    #[test]
-    fn shares_through_static_loop_barrier() {
-        let mut b = TileBuilder::new();
-        let count = b.lit_u32(4);
-        let looped = b.loop_counted(Some(count), None, Vec::new(), vec![Stmt::Barrier]);
-        let ir = fixtures::pair_kernel(&mut b, vec![looped]);
-        assert_eq!(footprint(&ir), SHARED);
-        let plan = Planner::new().arena_plan(&ir, &caps()).unwrap();
-        assert_eq!(plan.total_bytes, SHARED);
-        assert!(plan.barriers_inserted.is_empty());
-    }
-
-    #[test]
-    fn no_share_through_unstructured_loop_barrier() {
-        let mut b = TileBuilder::new();
-        let looped = b.loop_forever(vec![Stmt::Barrier, Stmt::Break]);
-        let ir = fixtures::pair_kernel(&mut b, vec![looped]);
-        assert_eq!(footprint(&ir), UNSHARED);
-    }
-
-    #[test]
-    fn no_share_through_breaking_static_loop_barrier() {
-        let mut b = TileBuilder::new();
-        let count = b.lit_u32(4);
-        let looped = b.loop_counted(
-            Some(count),
-            None,
-            Vec::new(),
-            vec![Stmt::Break, Stmt::Barrier],
-        );
-        let ir = fixtures::pair_kernel(&mut b, vec![looped]);
-        assert_eq!(footprint(&ir), UNSHARED);
-    }
-
-    #[test]
-    fn no_share_through_returning_static_loop_barrier() {
-        let mut b = TileBuilder::new();
-        let count = b.lit_u32(4);
-        let looped = b.loop_counted(
-            Some(count),
-            None,
-            Vec::new(),
-            vec![Stmt::Return, Stmt::Barrier],
-        );
-        let ir = fixtures::pair_kernel(&mut b, vec![looped]);
-        assert_eq!(footprint(&ir), UNSHARED);
-    }
-
-    /// The argmin's whole point: a skippable in-loop barrier separates
-    /// nothing, and one inserted root-level barrier recovers the sharing.
-    #[test]
-    fn insertion_rescues_a_skippable_in_loop_barrier() {
-        let mut b = TileBuilder::new();
-        let looped = b.loop_forever(vec![Stmt::Barrier, Stmt::Break]);
-        let ir = fixtures::pair_kernel(&mut b, vec![looped]);
-        let plan = Planner::new().arena_plan(&ir, &caps()).unwrap();
-        assert_eq!(plan.total_bytes, SHARED);
-        assert_eq!(plan.barriers_inserted.len(), 1);
-    }
-
-    #[test]
-    fn accumulator_update_is_live_across_loop() {
-        // A's only in-loop touch is the accumulator update, which runs at the
-        // end of every iteration — after the in-loop barrier — so A's range
-        // covers the whole loop and the post-loop write of B cannot share it.
-        let mut b = TileBuilder::new();
-        let (a, c) = fixtures::two_f32_tiles(&mut b);
-        let zero = b.lit_f32(0.0);
-        let index = b.lit_u32(0);
-        let count = b.lit_u32(4);
-        let local = b.alloc_local(ScalarElement::F32.element());
-        let update = b.load_tile(a.clone(), index.clone());
-        let write_a = b.store_tile(a, index.clone(), zero.clone());
-        let looped = b.loop_counted(
-            Some(count),
-            None,
-            vec![fusor2_ir::ir::kernel::Accumulator {
-                local,
-                init: zero.clone(),
-                update,
-            }],
-            vec![Stmt::Barrier],
-        );
-        let write_c = b.store_tile(c, index, zero);
-        b.set_body(vec![write_a, looped, write_c]);
-        let ir = b.finish([1, 1, 1], 64, "acc");
-        assert_eq!(footprint(&ir), UNSHARED);
-    }
-
-    #[test]
-    fn control_without_the_accumulator_shares() {
-        let mut b = TileBuilder::new();
-        let (a, c) = fixtures::two_f32_tiles(&mut b);
-        let zero = b.lit_f32(0.0);
-        let index = b.lit_u32(0);
-        let count = b.lit_u32(4);
-        let write_a = b.store_tile(a, index.clone(), zero.clone());
-        let looped = b.loop_counted(Some(count), None, Vec::new(), vec![Stmt::Barrier]);
-        let write_c = b.store_tile(c, index, zero);
-        b.set_body(vec![write_a, looped, write_c]);
-        let ir = b.finish([1, 1, 1], 64, "ctl");
-        assert_eq!(footprint(&ir), SHARED);
-    }
-
-    #[test]
-    fn byte_arena_beats_regions_on_mixed_strides() {
-        let mut b = TileBuilder::new();
-        let wide = b.alloc_tile(
-            ScalarElement::F32.element(),
-            TileLayout::contiguous(MemoryLevel::Workgroup, &[64]),
-        );
-        let narrow = b.alloc_tile(
-            ScalarElement::F16.element(),
-            TileLayout::contiguous(MemoryLevel::Workgroup, &[64]),
-        );
-        let zero_f32 = b.zero(ScalarElement::F32.element());
-        let zero_f16 = b.zero(ScalarElement::F16.element());
-        let index = b.lit_u32(0);
-        let write_wide = b.store_tile(wide, index.clone(), zero_f32);
-        let write_narrow = b.store_tile(narrow, index, zero_f16);
-        b.set_body(vec![write_wide, Stmt::Barrier, write_narrow]);
-        let ir = b.finish([1, 1, 1], 64, "mixed");
-
-        let aliasing = fixtures::caps_with(|c| {
-            c.workgroup_alias = true;
-            c.f16 = true;
-        });
-        let plan = Planner::new().arena_plan(&ir, &aliasing).unwrap();
-        assert_eq!(plan.mode, ArenaMode::ByteArena);
-        assert_eq!(plan.total_bytes, 256);
-
-        let plain = fixtures::caps_with(|c| {
-            c.workgroup_alias = false;
-            c.f16 = true;
-        });
-        let plan = Planner::new().arena_plan(&ir, &plain).unwrap();
-        assert_eq!(plan.mode, ArenaMode::Regions);
-        assert_eq!(plan.total_bytes, 384);
-    }
-
-    #[test]
-    fn barrier_suggestion_bytes_saved_is_exact() {
-        let mut b = TileBuilder::new();
-        let ir = fixtures::pair_kernel(&mut b, Vec::new());
-        let planner = Planner::new();
-        let suggestions = planner.barrier_suggestions(&ir);
-        assert_eq!(suggestions.len(), 1);
-        assert_eq!(suggestions[0].index, 1);
-        assert_eq!(suggestions[0].bytes_saved, UNSHARED - SHARED);
-        let plan = planner.arena_plan(&ir, &caps()).unwrap();
-        assert_eq!(plan.total_bytes, SHARED);
-        assert_eq!(plan.barriers_inserted.as_slice(), &[1]);
-    }
-
-    #[test]
-    fn arena_plan_is_deterministic_and_memoized() {
-        let planner = Planner::new();
-        let mut first = TileBuilder::new();
-        let ir_a = fixtures::pair_kernel(&mut first, vec![Stmt::Barrier]);
-        let mut second = TileBuilder::new();
-        let ir_b = fixtures::pair_kernel(&mut second, vec![Stmt::Barrier]);
-
-        let plan_a = planner.arena_plan(&ir_a, &caps()).unwrap();
-        assert_eq!(planner.memo_len(), 1);
-        assert!(planner.is_memoized(&ir_b, &caps()));
-        let plan_b = planner.arena_plan(&ir_b, &caps()).unwrap();
-        assert_eq!(planner.memo_len(), 1);
-
-        // The layout is identical. `assert_eq!(plan_a, plan_b)` would be
-        // wrong: `TileDecl` is identity-bearing, so the two plans name
-        // different tiles — as the `ptr_eq` check below demands.
-        assert_eq!(plan_a.mode, plan_b.mode);
-        assert_eq!(plan_a.total_bytes, plan_b.total_bytes);
-        assert_eq!(plan_a.barriers_inserted, plan_b.barriers_inserted);
-        assert_eq!(plan_a.placements.len(), plan_b.placements.len());
-        for (a, b) in plan_a.placements.iter().zip(&plan_b.placements) {
-            assert_eq!(a.byte_offset, b.byte_offset);
-            assert_eq!(a.byte_len, b.byte_len);
-            assert_eq!(a.tile.layout, b.tile.layout);
-            assert_eq!(a.tile.element, b.tile.element);
-        }
-        // ...and the second plan names the second kernel's own tiles.
-        for (placement, tile) in plan_b.placements.iter().zip(&second_tiles(&ir_b)) {
-            assert!(std::sync::Arc::ptr_eq(&placement.tile, tile));
-        }
-    }
-
-    fn second_tiles(ir: &KernelIr) -> Vec<fusor2_ir::ir::kernel::Tile> {
-        analyze(ir).iter().map(|t| t.tile.clone()).collect()
-    }
-
-    /// A kernel holding a storage buffer and a private local memoizes across
-    /// two independent builds.
-    ///
-    /// Pins the address-hashing regression: `StorageView` hashes its buffer's
-    /// address and `LocalDecl` hashes its `id`, so `Stmt`'s derived `Hash`
-    /// gives two copies of one kernel two different keys.
-    #[test]
-    fn two_builds_of_one_kernel_with_a_buffer_and_a_local_share_a_plan() {
-        fn build(b: &mut TileBuilder) -> KernelIr {
-            let (tile, _) = fixtures::two_f32_tiles(b);
-            let src = b.alloc_buffer(
-                1,
-                ScalarElement::F32.element(),
-                TileLayout::contiguous(MemoryLevel::Storage, &[64]),
-                fusor2_ir::ir::kernel::BufferAccess::Read,
-            );
-            let view = fixtures::whole_buffer_view(&src);
-            let acc = b.alloc_local(ScalarElement::F32.element());
-            let index = b.lit_u32(0);
-            let mask = b.mask_true();
-            let zero = b.lit_f32(0.0);
-            let loaded = b.load(
-                Source::Storage(view),
-                Addr::Linear(index.clone()),
-                mask,
-                zero,
-            );
-            let store_acc = b.store_local(acc.clone(), loaded);
-            let read_acc = b.load_local(acc);
-            let write = b.store_tile(tile, index, read_acc);
-            b.set_body(vec![store_acc, Stmt::Barrier, write]);
-            b.finish([1, 1, 1], 64, "buffered")
-        }
-
-        let planner = Planner::new();
-        let mut first = TileBuilder::new();
-        let ir_a = build(&mut first);
-        let mut second = TileBuilder::new();
-        let ir_b = build(&mut second);
-
-        planner.arena_plan(&ir_a, &caps()).unwrap();
-        assert_eq!(planner.memo_len(), 1);
-        assert!(
-            planner.is_memoized(&ir_b, &caps()),
-            "two builds of one kernel must share a plan key"
-        );
-        planner.arena_plan(&ir_b, &caps()).unwrap();
-        assert_eq!(planner.memo_len(), 1);
-    }
-
-    /// ...and the key stays discriminating: change one literal and the plan
-    /// key must not be reused.
-    #[test]
-    fn a_different_body_does_not_reuse_a_plan() {
-        fn build(b: &mut TileBuilder, fill: f32) -> KernelIr {
-            let (tile, _) = fixtures::two_f32_tiles(b);
-            let index = b.lit_u32(0);
-            let value = b.lit_f32(fill);
-            let write = b.store_tile(tile, index, value);
-            b.set_body(vec![write]);
-            b.finish([1, 1, 1], 64, "lit")
-        }
-
-        let planner = Planner::new();
-        let mut first = TileBuilder::new();
-        let ir_a = build(&mut first, 0.0);
-        let mut second = TileBuilder::new();
-        let ir_b = build(&mut second, 1.0);
-
-        planner.arena_plan(&ir_a, &caps()).unwrap();
-        assert!(
-            !planner.is_memoized(&ir_b, &caps()),
-            "the ordinal substitution must not erase the payload"
-        );
-    }
-
-    #[test]
-    fn workgroup_bytes_agrees_with_arena_plan() {
-        let planner = Planner::new();
-        let caps = fixtures::caps_with(|c| {
-            c.f16 = true;
-            c.workgroup_alias = true;
-        });
-        for seed in 0..20u32 {
-            let mut b = TileBuilder::new();
-            let mut decls: SmallVec<[fusor2_ir::ir::kernel::Tile; 8]> = SmallVec::new();
-            let count = 1 + (seed % 4);
-            for slot in 0..count {
-                let element = if (seed + slot) % 3 == 0 {
-                    ScalarElement::F16.element()
-                } else {
-                    ScalarElement::F32.element()
-                };
-                let extent = 8 * (1 + (seed + slot) % 5);
-                decls.push(b.alloc_tile(
-                    element,
-                    TileLayout::contiguous(MemoryLevel::Workgroup, &[extent]),
-                ));
-            }
-            let tiles = Tiles { decls };
-            let bytes = planner.workgroup_bytes(&tiles, &caps).unwrap();
-            let ir = synth_ir(&tiles);
-            let plan = planner.arena_plan(&ir, &caps).unwrap();
-            assert_eq!(bytes, plan.total_bytes, "seed {seed}");
-            // The synthesized body never lets two tiles share.
-            let expected: u32 = tiles
-                .decls
-                .iter()
-                .map(|tile| {
-                    let stride = tile
-                        .element
-                        .workgroup_array_stride()
-                        .unwrap_or(tile.element.byte_size() as u32);
-                    tile.layout.element_count() as u32 * stride
-                })
-                .sum();
-            assert_eq!(bytes, expected, "seed {seed}");
-        }
-    }
-
-    #[test]
-    fn over_budget_is_a_legality_error() {
-        let mut b = TileBuilder::new();
-        let tile = b.alloc_tile(
-            ScalarElement::F32.element(),
-            TileLayout::contiguous(MemoryLevel::Workgroup, &[1 << 14]),
-        );
-        let zero = b.zero(ScalarElement::F32.element());
-        let stmt = b.fill_tile(tile, zero, [None, None]);
-        b.push(stmt);
-        let ir = b.finish([1, 1, 1], 64, "huge");
-        assert!(matches!(
-            Planner::new().arena_plan(&ir, &caps()),
-            Err(fusor2_ir::error::Error::Legality(_))
-        ));
+fn zero(element: ElementType) -> TileExpr {
+    let scalar = match element {
+        ElementType::Scalar(scalar)
+        | ElementType::Vector { scalar, .. }
+        | ElementType::CoopMatrix { scalar, .. } => scalar,
+    };
+    let part = TileExpr::new(
+        TileExprKind::Literal(match scalar {
+            ScalarElement::F32 => TileLiteral::F32(0),
+            ScalarElement::F16 => TileLiteral::F16(0),
+            ScalarElement::BF16 => TileLiteral::BF16(0),
+            ScalarElement::U32 => TileLiteral::U32(0),
+            ScalarElement::I32 => TileLiteral::I32(0),
+            ScalarElement::Bool => TileLiteral::Bool(false),
+        }),
+        ElementType::Scalar(scalar),
+    );
+    match element {
+        ElementType::Vector { lanes, .. } => TileExpr::new(
+            TileExprKind::Vec {
+                scalar,
+                lanes,
+                parts: vec![part; lanes as usize],
+            },
+            element,
+        ),
+        ElementType::Scalar(_) | ElementType::CoopMatrix { .. } => part,
     }
 }

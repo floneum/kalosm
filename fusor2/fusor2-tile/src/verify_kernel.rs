@@ -145,7 +145,7 @@ fn for_each_element(ir: &KernelIr, f: &mut dyn FnMut(ElementType)) {
 
 /// Derive the element type of one node from its children's cached types. The
 /// builder uses this to type a node; `verify_kernel` re-derives it and compares.
-pub fn infer_kind(kind: &TileExprKind) -> Result<ElementType> {
+pub(crate) fn infer_kind(kind: &TileExprKind) -> Result<ElementType> {
     use TileExprKind as K;
     Ok(match kind {
         K::Literal(lit) => ElementType::Scalar(literal_scalar(*lit)),
@@ -487,7 +487,7 @@ struct BoundEnv {
 /// serial reduction carry a constant-true mask — the form the emitters'
 /// straight-line load paths and the aligned-window sharing algebra require —
 /// instead of a per-element bound check the shape has already discharged.
-pub fn check_loads(ir: &KernelIr, caps: &Caps) -> Result<()> {
+pub(crate) fn check_loads(ir: &KernelIr, caps: &Caps) -> Result<()> {
     let mut env = BoundEnv {
         grid: ir.grid,
         block: ir.block,
@@ -763,10 +763,9 @@ fn max_value(expr: &TileExpr, env: &BoundEnv) -> Option<u64> {
 /// local is the accumulator of exactly one loop, and nothing outside that
 /// loop's body writes it.
 ///
-/// The stated clause also requires the local to appear in the builder's local
-/// list. [`KernelIr`] carries no local list, so that half is checked by
-/// [`crate::build::TileBuilder::declares_local`] at construction instead.
-pub fn check_accumulators(body: &[Stmt]) -> Result<()> {
+/// [`KernelIr`] carries no separate local-declaration list, so ownership is
+/// established by the accumulator that introduces each local.
+pub(crate) fn check_accumulators(body: &[Stmt]) -> Result<()> {
     let mut owners: FxHashMap<usize, ()> = FxHashMap::default();
     collect_accumulator_owners(body, &mut owners)?;
     let mut scope: Vec<usize> = Vec::new();
@@ -789,7 +788,7 @@ fn local_key(local: &Local) -> usize {
 /// single `TileReduceOp` to resolve for the whole fold, and a node whose
 /// `values`, `merge.body`, `merge.lhs`, `merge.rhs` and `outs` disagree in
 /// length is rejected rather than truncated.
-pub fn check_reduce_stmts(body: &[Stmt]) -> Result<()> {
+pub(crate) fn check_reduce_stmts(body: &[Stmt]) -> Result<()> {
     let mut error: Option<Error> = None;
     for_each_stmt(body, &mut |stmt| {
         if error.is_some() {
@@ -929,7 +928,7 @@ fn check_one_reduce(
 }
 
 /// `merge.body[0] == binary(op.binary(), load(lhs), load(rhs))`, exactly.
-pub fn is_plain_binary(
+pub(crate) fn is_plain_binary(
     body: &TileExpr,
     op: fusor2_ir::ir::kernel::TileReduceOp,
     lhs: &Local,
@@ -1026,7 +1025,7 @@ fn check_accumulator_writes(
 
 /// Every `CoopStore` destination is an affine rank-2 layout with a unit stride
 /// on one side, addressed rank-2.
-pub fn check_coop_stores(body: &[Stmt]) -> Result<()> {
+pub(crate) fn check_coop_stores(body: &[Stmt]) -> Result<()> {
     let mut error: Option<Error> = None;
     for_each_stmt(body, &mut |stmt| {
         if error.is_some() {
@@ -1059,7 +1058,7 @@ pub fn check_coop_stores(body: &[Stmt]) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Every statement in the tree, pre-order.
-pub fn for_each_stmt(body: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
+pub(crate) fn for_each_stmt(body: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
     for stmt in body {
         f(stmt);
         match stmt {
@@ -1074,7 +1073,7 @@ pub fn for_each_stmt(body: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
 }
 
 /// Every expression appearing directly in a statement (not its children).
-pub fn for_each_root_expr(body: &[Stmt], f: &mut dyn FnMut(&TileExpr)) {
+pub(crate) fn for_each_root_expr(body: &[Stmt], f: &mut dyn FnMut(&TileExpr)) {
     for_each_stmt(body, &mut |stmt| stmt_root_exprs(stmt, f));
 }
 
@@ -1138,7 +1137,7 @@ fn stmt_root_exprs(stmt: &Stmt, f: &mut dyn FnMut(&TileExpr)) {
 }
 
 /// Post-order over an expression DAG, visiting each distinct node once.
-pub fn visit_unique(
+pub(crate) fn visit_unique(
     expr: &TileExpr,
     seen: &mut FxHashSet<u64>,
     f: &mut dyn FnMut(&TileExpr),
@@ -1152,561 +1151,4 @@ pub fn visit_unique(
         visit_unique(child, seen, f);
     }
     f(expr);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::build::TileBuilder;
-    use crate::build::fixtures::{caps_with, whole_buffer_view, wg_tile};
-    use fusor2_ir::dtype::NumericContract;
-    use fusor2_ir::ir::kernel::{BufferAccess, MemoryLevel, StorageView, TileLayout};
-    use fusor2_ir::scalar::BinOp;
-
-    #[test]
-    fn well_typed_kernel_verifies() {
-        let mut b = TileBuilder::new();
-        let tile = wg_tile(&mut b, ScalarElement::F32.element(), 64);
-        let zero = b.lit_f32(0.0);
-        let index = b.lit_u32(0);
-        let stmt = b.store_tile(tile, index, zero);
-        b.push(stmt);
-        let ir = b.finish([1, 1, 1], 64, "ok");
-        verify_kernel(&ir, &caps_with(|_| {})).unwrap();
-    }
-
-    #[test]
-    fn mistyped_binary_is_rejected() {
-        let mut b = TileBuilder::new();
-        let a = b.lit_f32(1.0);
-        let c = b.lit_u32(1);
-        let sum = b.binary(BinOp::Add, a, c, NumericContract::RELAXED);
-        let local = b.alloc_local(ScalarElement::F32.element());
-        let stmt = b.store_local(local, sum);
-        b.push(stmt);
-        let ir = b.finish([1, 1, 1], 1, "bad");
-        assert!(verify_kernel(&ir, &caps_with(|_| {})).is_err());
-    }
-
-    #[test]
-    fn unmasked_dynamic_load_rejected() {
-        let mut b = TileBuilder::new();
-        let buffer = b.alloc_buffer(
-            0,
-            ScalarElement::F32.element(),
-            TileLayout::contiguous(MemoryLevel::Storage, &[16]),
-            BufferAccess::Read,
-        );
-        let view = whole_buffer_view(&buffer);
-        let lane = b.builtin(fusor2_ir::ir::kernel::Builtin::Lane);
-        let mask = b.mask_true();
-        let fill = b.lit_f32(0.0);
-        let load = b.load(Source::Storage(view), Addr::Linear(lane), mask, fill);
-        let local = b.alloc_local(ScalarElement::F32.element());
-        let stmt = b.store_local(local, load);
-        b.push(stmt);
-        // The prover now bounds `Lane` by the block size, so the block must
-        // exceed the buffer's extent for the load to stay unprovable.
-        let ir = b.finish([1, 1, 1], 64, "unmasked");
-        match verify_kernel(&ir, &caps_with(|_| {})) {
-            Err(Error::Lower(LowerError::UnmaskedLoad(_))) => {}
-            other => panic!("expected UnmaskedLoad, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn literal_load_is_provably_in_range() {
-        let mut b = TileBuilder::new();
-        let buffer = b.alloc_buffer(
-            0,
-            ScalarElement::F32.element(),
-            TileLayout::contiguous(MemoryLevel::Storage, &[16]),
-            BufferAccess::Read,
-        );
-        let view = whole_buffer_view(&buffer);
-        let index = b.lit_u32(15);
-        let mask = b.mask_true();
-        let fill = b.lit_f32(0.0);
-        let load = b.load(Source::Storage(view), Addr::Linear(index), mask, fill);
-        let local = b.alloc_local(ScalarElement::F32.element());
-        let stmt = b.store_local(local, load);
-        b.push(stmt);
-        let ir = b.finish([1, 1, 1], 1, "in-range");
-        verify_kernel(&ir, &caps_with(|_| {})).unwrap();
-    }
-
-    /// `lane & 31` and `lane % 32` are the same function of `lane`. A
-    /// verifier refusing the mask form would keep a lowering
-    /// from spelling an address with the natural power-of-two wrap — the
-    /// very form `mod_literal_u32` rewrites the remainder into one layer down.
-    #[test]
-    fn a_power_of_two_mask_bounds_an_address_the_way_a_remainder_does() {
-        for (op, rhs) in [(BinOp::BitAnd, 31u32), (BinOp::Rem, 32)] {
-            let mut b = TileBuilder::new();
-            let buffer = b.alloc_buffer(
-                0,
-                ScalarElement::F32.element(),
-                TileLayout::contiguous(MemoryLevel::Storage, &[32]),
-                BufferAccess::Read,
-            );
-            let view = whole_buffer_view(&buffer);
-            let lane = b.builtin(fusor2_ir::ir::kernel::Builtin::Lane);
-            let k = b.lit_u32(rhs);
-            let index = b.binary(op, lane, k, NumericContract::RELAXED);
-            let mask = b.mask_true();
-            let fill = b.lit_f32(0.0);
-            let load = b.load(Source::Storage(view), Addr::Linear(index), mask, fill);
-            let local = b.alloc_local(ScalarElement::F32.element());
-            let stmt = b.store_local(local, load);
-            b.push(stmt);
-            let ir = b.finish([1, 1, 1], 32, "wrap");
-            verify_kernel(&ir, &caps_with(|_| {})).unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
-        }
-    }
-
-    /// A shift and a mask compose the way their arithmetic twins do: the byte
-    /// selector `(word >> 24) & 0xF` that a block decode spells is bounded at
-    /// 15 without any knowledge of `word`, exactly as `(word / 2^24) % 16`
-    /// would be. `Shl` is checked against its `Mul` reading in the same shape.
-    #[test]
-    fn bit_arithmetic_bounds_compose_like_their_arithmetic_twins() {
-        let mut b = TileBuilder::new();
-        let env = BoundEnv {
-            grid: [1, 1, 1],
-            block: 1,
-            subgroups: None,
-            locals: FxHashMap::default(),
-        };
-        // A local outside the env is the genuinely undecidable operand now
-        // that `Lane` itself is bounded by the block.
-        let word_local = b.alloc_local(ScalarElement::U32.element());
-        let word = b.load_local(word_local);
-        let twenty_four = b.lit_u32(24);
-        let fifteen = b.lit_u32(15);
-        let shifted = b.binary(BinOp::Shr, word.clone(), twenty_four, NumericContract::RELAXED);
-        let nibble = b.binary(BinOp::BitAnd, shifted, fifteen, NumericContract::RELAXED);
-        assert_eq!(max_value(&nibble, &env), Some(15));
-
-        // `x << k` is `x * 2^k`: a decidable left operand scales, an
-        // undecidable one stays undecidable.
-        let seven = b.lit_u32(7);
-        let two = b.lit_u32(2);
-        let scaled = b.binary(BinOp::Shl, seven, two.clone(), NumericContract::RELAXED);
-        assert_eq!(max_value(&scaled, &env), Some(28));
-        let unbounded = b.binary(BinOp::Shl, word, two, NumericContract::RELAXED);
-        assert_eq!(max_value(&unbounded, &env), None);
-    }
-
-    #[test]
-    fn undeclared_accumulator_rejected() {
-        let mut b = TileBuilder::new();
-        let local = b.alloc_local(ScalarElement::F32.element());
-        let zero = b.lit_f32(0.0);
-        let one = b.lit_f32(1.0);
-        let four = b.lit_u32(4);
-        // The accumulator is also written from outside the loop body.
-        let outer = b.store_local(local.clone(), one.clone());
-        let looped = b.loop_counted(
-            Some(four),
-            None,
-            vec![Accumulator {
-                local,
-                init: zero,
-                update: one,
-            }],
-            Vec::new(),
-        );
-        b.push(outer);
-        b.push(looped);
-        let ir = b.finish([1, 1, 1], 1, "acc");
-        assert!(check_accumulators(&ir.body).is_err());
-    }
-
-    /// A rank-2 layout whose first axis needs two sub-axes: not affine, so
-    /// the cooperative store predicate must reject it.
-    fn non_affine_rc2(buffer: &fusor2_ir::ir::kernel::Buffer) -> StorageView {
-        use fusor2_ir::shape::{AxisGroup, MultiFlattenMap, SubAxis};
-        let indexing = MultiFlattenMap {
-            groups: smallvec::smallvec![
-                AxisGroup {
-                    sub_axes: smallvec::smallvec![
-                        SubAxis {
-                            extent: 4,
-                            stride: 16
-                        },
-                        SubAxis {
-                            extent: 2,
-                            stride: 8
-                        }
-                    ],
-                },
-                AxisGroup::affine(8, 1),
-            ],
-        };
-        StorageView {
-            buffer: buffer.clone(),
-            offset: 0,
-            layout: TileLayout {
-                extents: smallvec::smallvec![8, 8],
-                indexing,
-                level: MemoryLevel::Storage,
-            },
-        }
-    }
-
-    #[test]
-    fn coop_store_non_affine_layout_rejected() {
-        let mut b = TileBuilder::new();
-        let buffer = b.alloc_buffer(
-            0,
-            ScalarElement::F32.element(),
-            TileLayout::contiguous(MemoryLevel::Storage, &[8, 8]),
-            BufferAccess::ReadWrite,
-        );
-        let view = non_affine_rc2(&buffer);
-        let source = whole_buffer_view(&buffer);
-        let zero = b.lit_u32(0);
-        let acc = b.coop_load(
-            CoopMatrixRole::C,
-            ScalarElement::F32,
-            8,
-            8,
-            CoopSrc::BroadcastCol {
-                src: source,
-                col: zero.clone(),
-            },
-        );
-        let stmt = b.coop_store(
-            acc,
-            view,
-            Addr::Rc2 {
-                row: zero.clone(),
-                col: zero,
-            },
-        );
-        b.push(stmt);
-        let ir = b.finish([1, 1, 1], 64, "coop");
-        match check_coop_stores(&ir.body) {
-            Err(Error::Lower(LowerError::CoopStoreLayout(_))) => {}
-            other => panic!("expected CoopStoreLayout, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn coop_store_needs_a_rank_two_address() {
-        let mut b = TileBuilder::new();
-        let buffer = b.alloc_buffer(
-            0,
-            ScalarElement::F32.element(),
-            TileLayout::contiguous(MemoryLevel::Storage, &[8, 8]),
-            BufferAccess::ReadWrite,
-        );
-        let view = whole_buffer_view(&buffer);
-        let zero = b.lit_u32(0);
-        let acc = b.coop_load(
-            CoopMatrixRole::C,
-            ScalarElement::F32,
-            8,
-            8,
-            CoopSrc::BroadcastCol {
-                src: view.clone(),
-                col: zero.clone(),
-            },
-        );
-        let stmt = b.coop_store(acc, view, Addr::Linear(zero));
-        b.push(stmt);
-        let ir = b.finish([1, 1, 1], 64, "coop-linear");
-        assert!(check_coop_stores(&ir.body).is_err());
-    }
-
-    #[test]
-    fn f16_without_caps_rejected() {
-        let mut b = TileBuilder::new();
-        let tile = wg_tile(&mut b, ScalarElement::F16.element(), 64);
-        let zero = b.zero(ScalarElement::F16.element());
-        let index = b.lit_u32(0);
-        let stmt = b.store_tile(tile, index, zero);
-        b.push(stmt);
-        let ir = b.finish([1, 1, 1], 64, "f16");
-        match verify_kernel(&ir, &caps_with(|c| c.f16 = false)) {
-            Err(Error::Legality(_)) => {}
-            other => panic!("expected Legality, got {other:?}"),
-        }
-        verify_kernel(&ir, &caps_with(|c| c.f16 = true)).unwrap();
-    }
-
-    #[test]
-    fn bf16_without_caps_rejected() {
-        let mut b = TileBuilder::new();
-        let tile = wg_tile(&mut b, ScalarElement::BF16.element(), 64);
-        let zero = b.zero(ScalarElement::BF16.element());
-        let index = b.lit_u32(0);
-        let stmt = b.store_tile(tile, index, zero);
-        b.push(stmt);
-        let ir = b.finish([1, 1, 1], 64, "bf16");
-        assert!(verify_kernel(&ir, &caps_with(|c| c.bf16 = false)).is_err());
-        verify_kernel(&ir, &caps_with(|c| c.bf16 = true)).unwrap();
-    }
-    // -----------------------------------------------------------------------
-    // (8) the N-ary reduction
-    // -----------------------------------------------------------------------
-
-    /// A two-lane `Stmt::Reduce` over `(max, sum)`-shaped scratch, built through
-    /// the canonical constructor.
-    fn two_lane_reduce(b: &mut TileBuilder) -> Vec<Stmt> {
-        let f32e = ScalarElement::F32.element();
-        let a = b.lit_f32(1.0);
-        let c = b.lit_f32(2.0);
-        let scratch = wg_tile(b, f32e, 64);
-        let mut out = Vec::new();
-        let _reads = b
-            .reduce_carrier::<String>(
-                fusor2_ir::ir::kernel::ReduceKind::Workgroup {
-                    scratch,
-                    group_size: 64,
-                },
-                &two_slot_carrier(),
-                &[a, c],
-                &[64],
-                &mut out,
-                |b, i, lhs, rhs| {
-                    Ok(b.binary(
-                        if i == 0 { BinOp::Max } else { BinOp::Add },
-                        lhs[i].clone(),
-                        rhs[i].clone(),
-                        NumericContract::RELAXED,
-                    ))
-                },
-            )
-            .unwrap();
-        out
-    }
-
-    fn two_slot_carrier() -> fusor2_ir::carrier::Carrier {
-        use fusor2_ir::carrier::{ArgRemap, Carrier};
-        use fusor2_ir::dtype::Dtype;
-        let max = Carrier::binop(
-            BinOp::Max,
-            Carrier::binop_identity(BinOp::Max, Dtype::F32).unwrap(),
-            Dtype::F32,
-        );
-        let sum = Carrier::binop(
-            BinOp::Add,
-            Carrier::binop_identity(BinOp::Add, Dtype::F32).unwrap(),
-            Dtype::F32,
-        );
-        max.tuple(&sum, &ArgRemap::identity(1)).carrier
-    }
-
-    /// The constructor **delegates** at one scalar binop slot: it returns the
-    /// same `TileExprKind::Reduce` node and pushes no statement, so the term the
-    /// emitter sees — and therefore the shader — is untouched.
-    #[test]
-    fn a_single_slot_carrier_delegates_to_the_collective() {
-        use fusor2_ir::carrier::Carrier;
-        use fusor2_ir::dtype::Dtype;
-        let mut b = TileBuilder::new();
-        let value = b.lit_f32(3.0);
-        let sum = Carrier::binop(
-            BinOp::Add,
-            Carrier::binop_identity(BinOp::Add, Dtype::F32).unwrap(),
-            Dtype::F32,
-        );
-        let mut out = Vec::new();
-        let reads = b
-            .reduce_carrier::<String>(
-                fusor2_ir::ir::kernel::ReduceKind::Subgroup,
-                &sum,
-                std::slice::from_ref(&value),
-                &[64],
-                &mut out,
-                |_, _, _, _| unreachable!("the fast path never builds a merge"),
-            )
-            .unwrap();
-        assert!(out.is_empty(), "the fast path pushes no statement");
-        assert_eq!(reads.len(), 1);
-        let direct = b.reduce(
-            fusor2_ir::ir::kernel::TileReduceOp::Sum,
-            fusor2_ir::ir::kernel::ReduceKind::Subgroup,
-            value,
-        );
-        assert_eq!(reads[0], direct, "the delegated node must hash-cons together");
-    }
-
-    #[test]
-    fn a_well_formed_two_lane_reduction_verifies() {
-        let mut b = TileBuilder::new();
-        let body = two_lane_reduce(&mut b);
-        b.set_body(body);
-        let ir = b.finish([1, 1, 1], 64, "two-lane");
-        verify_kernel(&ir, &caps_with(|_| {})).unwrap();
-    }
-
-    /// **The `accs[0]` bug, unrepresentable.** A node whose lane counts disagree
-    /// is rejected rather than truncated to its first slot.
-    #[test]
-    fn a_reduction_with_disagreeing_lane_counts_is_rejected() {
-        let mut b = TileBuilder::new();
-        let mut body = two_lane_reduce(&mut b);
-        let Stmt::Reduce { values, .. } = &mut body[0] else {
-            panic!("expected a reduce");
-        };
-        values.pop();
-        assert!(check_reduce_stmts(&body).is_err());
-
-        let mut body = two_lane_reduce(&mut b);
-        let Stmt::Reduce { outs, .. } = &mut body[0] else {
-            panic!("expected a reduce");
-        };
-        outs.pop();
-        assert!(check_reduce_stmts(&body).is_err());
-
-        let mut body = two_lane_reduce(&mut b);
-        let Stmt::Reduce { merge, .. } = &mut body[0] else {
-            panic!("expected a reduce");
-        };
-        merge.lhs.pop();
-        assert!(check_reduce_stmts(&body).is_err());
-    }
-
-    /// One scratch tile per lane, and lane 0's is the one the kind names.
-    #[test]
-    fn a_reduction_missing_a_scratch_tile_is_rejected() {
-        let mut b = TileBuilder::new();
-        let mut body = two_lane_reduce(&mut b);
-        let Stmt::Reduce { scratch, .. } = &mut body[0] else {
-            panic!("expected a reduce");
-        };
-        scratch.pop();
-        assert!(check_reduce_stmts(&body).is_err());
-    }
-
-    /// A merge reads its formals and nothing else: one that reads a lane id is
-    /// not a merge, and one that reads a tile has already raced.
-    #[test]
-    fn a_merge_reading_outside_its_formals_is_rejected() {
-        let mut b = TileBuilder::new();
-        let lane = b.builtin(fusor2_ir::ir::kernel::Builtin::Lane);
-        let lane = b.cast(lane, ScalarElement::F32.element());
-        let mut body = two_lane_reduce(&mut b);
-        let Stmt::Reduce { merge, .. } = &mut body[0] else {
-            panic!("expected a reduce");
-        };
-        merge.body[1] = lane;
-        assert!(check_reduce_stmts(&body).is_err());
-
-        // A foreign local is refused for the same reason: it is not one of the
-        // two partials this level is merging.
-        let mut b2 = TileBuilder::new();
-        let stray = b2.alloc_local(ScalarElement::F32.element());
-        let read = b2.load_local(stray);
-        let mut body = two_lane_reduce(&mut b2);
-        let Stmt::Reduce { merge, .. } = &mut body[0] else {
-            panic!("expected a reduce");
-        };
-        merge.body[0] = read;
-        assert!(check_reduce_stmts(&body).is_err());
-    }
-
-    /// **Cross-lane reads are legal and required.** Flash's running sum and its
-    /// output accumulator both read the running max, so a merge that reads
-    /// `lhs[0]` from lane 1 must verify.
-    #[test]
-    fn a_merge_reading_a_sibling_lane_is_accepted() {
-        let mut b = TileBuilder::new();
-        let mut body = two_lane_reduce(&mut b);
-        let Stmt::Reduce { merge, .. } = &mut body[0] else {
-            panic!("expected a reduce");
-        };
-        let m = b.load_local(merge.lhs[0].clone());
-        let l = b.load_local(merge.rhs[1].clone());
-        merge.body[1] = b.binary(BinOp::Add, m, l, NumericContract::RELAXED);
-        check_reduce_stmts(&body).unwrap();
-    }
-
-    /// `fast` is derived, never author-supplied: a value that disagrees with
-    /// `merge` would take the collective path on a merge the collective cannot
-    /// express.
-    #[test]
-    fn a_claimed_fast_operator_must_match_the_merge() {
-        use fusor2_ir::ir::kernel::TileReduceOp;
-        let mut b = TileBuilder::new();
-        let mut body = two_lane_reduce(&mut b);
-        let Stmt::Reduce { fast, .. } = &mut body[0] else {
-            panic!("expected a reduce");
-        };
-        *fast = Some(TileReduceOp::Sum);
-        assert!(
-            check_reduce_stmts(&body).is_err(),
-            "two lanes cannot claim one hardware operator"
-        );
-
-        // One lane whose merge is `Max` may not claim `Sum`.
-        let mut b = TileBuilder::new();
-        let f32e = ScalarElement::F32.element();
-        let lhs = b.alloc_local(f32e);
-        let rhs = b.alloc_local(f32e);
-        let a = b.load_local(lhs.clone());
-        let c = b.load_local(rhs.clone());
-        let merged = b.binary(BinOp::Max, a, c, NumericContract::RELAXED);
-        let scratch = wg_tile(&mut b, f32e, 64);
-        let value = b.lit_f32(1.0);
-        let out_local = b.alloc_local(f32e);
-        let mk = |fast| Stmt::Reduce {
-            kind: Box::new(fusor2_ir::ir::kernel::ReduceKind::Workgroup {
-                scratch: scratch.clone(),
-                group_size: 64,
-            }),
-            values: smallvec::smallvec![value.clone()],
-            merge: Box::new(fusor2_ir::ir::kernel::MergeBody {
-                lhs: smallvec::smallvec![lhs.clone()],
-                rhs: smallvec::smallvec![rhs.clone()],
-                body: smallvec::smallvec![merged.clone()],
-            }),
-            fast,
-            outs: smallvec::smallvec![out_local.clone()],
-            scratch: smallvec::smallvec![scratch.clone()],
-        };
-        assert!(check_reduce_stmts(&[mk(Some(TileReduceOp::Sum))]).is_err());
-        check_reduce_stmts(&[mk(Some(TileReduceOp::Max))]).unwrap();
-        check_reduce_stmts(&[mk(None)]).unwrap();
-    }
-
-    /// Element agreement across a lane: the value, both formals, the merged
-    /// expression and the output are one accumulator.
-    #[test]
-    fn a_lane_whose_output_element_disagrees_is_rejected() {
-        let mut b = TileBuilder::new();
-        let wrong = b.alloc_local(ScalarElement::U32.element());
-        let mut body = two_lane_reduce(&mut b);
-        let Stmt::Reduce { outs, .. } = &mut body[0] else {
-            panic!("expected a reduce");
-        };
-        outs[1] = wrong;
-        assert!(check_reduce_stmts(&body).is_err());
-    }
-
-    /// Liveness sees **every** lane's scratch tile, so the arena sizes N tiles
-    /// per reduction rather than one.
-    #[test]
-    fn liveness_sees_every_lane_scratch_tile() {
-        let mut b = TileBuilder::new();
-        let body = two_lane_reduce(&mut b);
-        b.set_body(body);
-        let ir = b.finish([1, 1, 1], 64, "two-lane");
-        let live = crate::liveness::analyze(&ir);
-        assert_eq!(
-            live.order.len(),
-            2,
-            "a two-lane reduction owns two scratch tiles"
-        );
-        for key in &live.order {
-            let t = &live.tiles[key];
-            assert!(
-                t.accesses
-                    .iter()
-                    .any(|a| a.kind == crate::liveness::AccessKind::ReadWrite)
-            );
-        }
-    }
 }

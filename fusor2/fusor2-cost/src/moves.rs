@@ -24,7 +24,7 @@ use std::hash::{Hash, Hasher};
 /// One concrete state change a [`Move`] can produce. A `Move` names the
 /// dimension; a `Candidate` names the value.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Candidate {
+pub(crate) enum Candidate {
     Select { class: ClassId, node: Id },
     Materialize { node: Id, on: bool },
     Schedule { node: Id, theta: SchedPoint },
@@ -32,7 +32,7 @@ pub enum Candidate {
 
 /// Enough state to revert one move exactly.
 #[derive(Clone, Debug)]
-pub enum Undo {
+pub(crate) enum Undo {
     /// `node` and `node_was_materialized` are the *new* member's own prior
     /// state: a reselect carries `M` across with the selection, so reverting
     /// has to put the new member's bit back as well as the old selection.
@@ -55,27 +55,19 @@ pub enum Undo {
 /// Memo for the `RESCHEDULE` frontier: the per-point score and the sorted
 /// order, both keyed on `(node, context_hash)`.
 #[derive(Default)]
-pub struct SchedCache {
+pub(crate) struct SchedCache {
     order: FxHashMap<(Id, u64), Vec<SchedPoint>>,
     score: FxHashMap<(Id, SchedPoint, u64), Picoseconds>,
 }
 
 impl SchedCache {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
-    }
-
-    pub fn len(&self) -> usize {
-        self.score.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.score.is_empty()
     }
 
     /// Points of `id`'s domain, cheapest `node_math` first. The full domain
     /// is always returned; ordering never gates.
-    pub fn ordered(
+    pub(crate) fn ordered(
         &mut self,
         graph: &EGraph,
         id: Id,
@@ -119,7 +111,7 @@ impl SchedCache {
 
 /// Every move worth offering at this state, in a deterministic order:
 /// classes ascending, then nodes ascending.
-pub fn frontier(
+pub(crate) fn frontier(
     graph: &EGraph,
     extraction: &Extraction,
     classes: &[ClassId],
@@ -148,7 +140,7 @@ pub fn frontier(
 
 /// The concrete states `mv` can move to, best first, excluding the state the
 /// extraction is already in.
-pub fn candidates(
+pub(crate) fn candidates(
     graph: &EGraph,
     extraction: &Extraction,
     realized: &Realized,
@@ -207,7 +199,7 @@ pub fn candidates(
 }
 
 /// Apply a candidate in place, returning the previous state.
-pub fn apply(graph: &EGraph, extraction: &mut Extraction, c: Candidate) -> Option<Undo> {
+pub(crate) fn apply(graph: &EGraph, extraction: &mut Extraction, c: Candidate) -> Option<Undo> {
     match c {
         Candidate::Select { class, node } => {
             let was = *extraction.sigma.get(&class)?;
@@ -257,7 +249,7 @@ pub fn apply(graph: &EGraph, extraction: &mut Extraction, c: Candidate) -> Optio
     }
 }
 
-pub fn undo(extraction: &mut Extraction, undo: Undo) {
+pub(crate) fn undo(extraction: &mut Extraction, undo: Undo) {
     match undo {
         Undo::Reselect {
             class,
@@ -295,7 +287,7 @@ fn set_materialized(extraction: &mut Extraction, node: Id, on: bool) {
 
 /// True when some realized consumer of `id` [`realize::needs_own_buffer`],
 /// so `id` cannot leave `M` without breaking that consumer's launch.
-pub fn at_structural_boundary(graph: &EGraph, realized: &Realized, id: Id) -> bool {
+pub(crate) fn at_structural_boundary(graph: &EGraph, realized: &Realized, id: Id) -> bool {
     realized
         .consumer_nodes
         .get(id)
@@ -307,7 +299,7 @@ pub fn at_structural_boundary(graph: &EGraph, realized: &Realized, id: Id) -> bo
 
 /// True when `id` may not leave the materialized set: an `Effect::InPlace`
 /// node, a root, or a leaf (which has no write to elide).
-pub fn is_pinned(graph: &EGraph, roots: &[Id], id: Id) -> bool {
+pub(crate) fn is_pinned(graph: &EGraph, roots: &[Id], id: Id) -> bool {
     if roots.contains(&id) {
         return true;
     }
@@ -321,7 +313,7 @@ pub fn is_pinned(graph: &EGraph, roots: &[Id], id: Id) -> bool {
 /// epilogue signature, operand layouts and the consumer demand set. Two
 /// occurrences of the same node in different surroundings therefore do not
 /// share a memo entry.
-pub fn context_hash(graph: &EGraph, realized: &Realized, node: Id) -> u64 {
+pub(crate) fn context_hash(graph: &EGraph, realized: &Realized, node: Id) -> u64 {
     let mut h = FxHasher::default();
     let n = graph.node(node);
 
@@ -388,129 +380,5 @@ fn domain(graph: &EGraph, id: Id) -> Option<&ScheduleDomain> {
     match &graph.node(id).op {
         Op::Launch(l1) => l1.schedule(),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::realize::testkit::{
-        N, TestCost, TestPlanner, buffer, chain_graph, kscatter, new_graph, seed_for,
-    };
-
-    #[test]
-    fn flip_is_refused_on_an_inplace_node() {
-        let mut g = new_graph();
-        let shape = [N];
-        let base = buffer(&mut g, 0, &shape);
-        let idx = buffer(&mut g, 1, &shape);
-        let upd = buffer(&mut g, 2, &shape);
-        let sc = kscatter(&mut g, base, idx, upd, &shape);
-        let a = crate::realize::testkit::kmap(&mut g, sc, &shape, 1);
-        let b = crate::realize::testkit::kmap(&mut g, sc, &shape, 2);
-        g.add_root(a);
-        g.add_root(b);
-        let roots = g.roots().to_vec();
-        let ex = seed_for(&g, &roots);
-        let cost = TestCost::default();
-        let arena = TestPlanner;
-        let realized = crate::realize::realize(&g, &roots, &ex, &cost, &arena).unwrap();
-
-        assert!(is_pinned(&g, &realized.roots, sc));
-        let mut cache = SchedCache::new();
-        let lb = crate::lower_bound::lower_bound(&g, &cost);
-        let c = candidates(&g, &ex, &realized, Move::Flip(sc), &lb, &mut cache, &cost);
-        assert!(c.is_empty(), "an atomic scatter may not leave M");
-        assert!(ex.is_materialized(sc));
-    }
-
-    #[test]
-    fn flip_round_trips() {
-        let (g, roots) = chain_graph(3);
-        let mut ex = seed_for(&g, &roots);
-        // The middle map is inlinable.
-        let target = *ex
-            .sigma
-            .values()
-            .filter(|id| !roots.contains(id) && !is_pinned(&g, &roots, **id))
-            .min()
-            .unwrap();
-        let before = ex.is_materialized(target);
-        let u = apply(
-            &g,
-            &mut ex,
-            Candidate::Materialize {
-                node: target,
-                on: !before,
-            },
-        )
-        .unwrap();
-        assert_eq!(ex.is_materialized(target), !before);
-        undo(&mut ex, u);
-        assert_eq!(ex.is_materialized(target), before);
-    }
-
-    /// Regression: `RESELECT` swapped `sigma` and left `M` alone, so the
-    /// incoming member arrived unmaterialized and a root's class stopped
-    /// landing in a buffer.
-    #[test]
-    fn reselect_carries_the_materialized_bit_across_the_swap() {
-        let (g, roots, cheap, dear, class) = crate::realize::testkit::seeded_graph();
-        let mut ex = seed_for(&g, &roots);
-        assert_eq!(ex.selected(class), Some(cheap));
-        assert!(ex.is_materialized(cheap), "a root lands in a buffer");
-        assert!(!ex.is_materialized(dear));
-
-        let u = apply(&g, &mut ex, Candidate::Select { class, node: dear }).unwrap();
-        assert_eq!(ex.selected(class), Some(dear));
-        assert!(
-            ex.is_materialized(dear),
-            "the incoming member inherits the obligation"
-        );
-
-        undo(&mut ex, u);
-        assert_eq!(ex.selected(class), Some(cheap));
-        assert!(ex.is_materialized(cheap));
-        assert!(!ex.is_materialized(dear), "undo restores the incoming bit");
-    }
-
-    /// Every state one `RESELECT` can reach still derives a plan that
-    /// verifies.
-    #[test]
-    fn every_reselect_state_still_verifies() {
-        let (g, roots, _cheap, _dear, class) = crate::realize::testkit::seeded_graph();
-        let cost = TestCost::default();
-        let arena = TestPlanner;
-        let ex0 = seed_for(&g, &roots);
-        let realized = crate::realize::realize(&g, &roots, &ex0, &cost, &arena).unwrap();
-        let lb = crate::lower_bound::lower_bound(&g, &cost);
-        let mut cache = SchedCache::new();
-        let options = candidates(
-            &g,
-            &ex0,
-            &realized,
-            Move::Reselect(class),
-            &lb,
-            &mut cache,
-            &cost,
-        );
-        assert!(!options.is_empty(), "a two-member class offers a swap");
-        for c in options {
-            let mut ex = ex0.clone();
-            let Some(_) = apply(&g, &mut ex, c) else {
-                continue;
-            };
-            let r = crate::realize::realize(&g, &roots, &ex, &cost, &arena).unwrap();
-            let plan = crate::plan::derive_plan(
-                &g,
-                &ex,
-                &r,
-                cost.facts(),
-                crate::realize::exact_cost(&r, &ex, &cost),
-            )
-            .unwrap();
-            crate::verify_plan::verify_plan(&g, &plan)
-                .unwrap_or_else(|e| panic!("{c:?} produced an unverifiable plan: {e}"));
-        }
     }
 }

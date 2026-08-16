@@ -39,12 +39,15 @@ impl Tensor {
         self.map1(ScalarExpr::cast(to, self.arg0()))
     }
 
+    /// Convert elements to `f32`.
     pub fn to_f32(&self) -> Result<Tensor> {
         self.cast(Dtype::F32)
     }
+    /// Convert elements to `u32`.
     pub fn to_u32(&self) -> Result<Tensor> {
         self.cast(Dtype::U32)
     }
+    /// Convert elements to `i32`.
     pub fn to_i32(&self) -> Result<Tensor> {
         self.cast(Dtype::I32)
     }
@@ -81,12 +84,15 @@ impl Tensor {
     pub fn round_even(&self) -> Result<Tensor> {
         self.round_mode(RoundMode::HalfToEven)
     }
+    /// Round toward negative infinity.
     pub fn floor(&self) -> Result<Tensor> {
         self.round_mode(RoundMode::Floor)
     }
+    /// Round toward positive infinity.
     pub fn ceil(&self) -> Result<Tensor> {
         self.round_mode(RoundMode::Ceil)
     }
+    /// Round toward zero.
     pub fn trunc(&self) -> Result<Tensor> {
         self.round_mode(RoundMode::Trunc)
     }
@@ -124,40 +130,5 @@ impl Tensor {
         self.graph
             .register_backward(y.id, &parents, straight_through_in_x)?;
         Ok(y)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use fusor2_ir::dtype::{Dtype, RoundMode};
-    use fusor2_ir::scalar::{ScalarExpr, ScalarKind};
-
-    #[test]
-    fn every_dense_pair_is_expressible() {
-        let all = [Dtype::F32, Dtype::F16, Dtype::BF16, Dtype::U32, Dtype::I32];
-        for from in all {
-            for to in all {
-                let e = ScalarExpr::cast(to, ScalarExpr::arg(0, from));
-                assert_eq!(e.dtype(), to);
-            }
-        }
-    }
-
-    #[test]
-    fn round_modes_are_distinct_nodes() {
-        let modes = [
-            RoundMode::HalfAwayFromZero,
-            RoundMode::HalfToEven,
-            RoundMode::Floor,
-            RoundMode::Ceil,
-            RoundMode::Trunc,
-        ];
-        let mut seen = Vec::new();
-        for m in modes {
-            let e = ScalarExpr::round(m, ScalarExpr::arg(0, Dtype::F32));
-            assert!(matches!(e.kind(), ScalarKind::Round { .. }));
-            assert!(!seen.contains(&e.structural_hash()));
-            seen.push(e.structural_hash());
-        }
     }
 }

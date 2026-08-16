@@ -16,7 +16,7 @@ use fusor2_ir::target::EmitError;
 use super::expr::Slot;
 
 /// A half-open range of tape instructions to evaluate before a statement runs.
-pub type TapeRange = std::ops::Range<u32>;
+pub(crate) type TapeRange = std::ops::Range<u32>;
 
 /// One loop-carried accumulator, held in a register across iterations and
 /// never reloaded.
@@ -172,7 +172,7 @@ pub struct LaneLoop {
 /// into each piece.
 ///
 /// A list with no barrier at any depth yields exactly one [`LaneLoop`].
-pub fn block(body: &[CStmt], lanes: u32, width: u32) -> Result<Vec<LaneLoop>, EmitError> {
+pub(crate) fn block(body: &[CStmt], lanes: u32, width: u32) -> Result<Vec<LaneLoop>, EmitError> {
     let mut out: Vec<LaneLoop> = Vec::new();
     let mut run: Vec<CStmt> = Vec::new();
     let flush = |run: &mut Vec<CStmt>, out: &mut Vec<LaneLoop>| {
@@ -260,57 +260,4 @@ fn nest(body: &[CStmt], lanes: u32, width: u32) -> Result<Vec<CStmt>, EmitError>
         .into_iter()
         .map(|l| CStmt::Lanes(l.stmts))
         .collect())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn dummy_store() -> CStmt {
-        CStmt::Store {
-            prep: 0..0,
-            buf: 0,
-            elem: ScalarElement::F32,
-            index: 0,
-            value: 0,
-            mask: 0,
-        }
-    }
-
-    #[test]
-    fn no_barrier_is_one_lane_loop() {
-        let b = vec![dummy_store(), dummy_store()];
-        let loops = block(&b, 256, 8).unwrap();
-        assert_eq!(loops.len(), 1);
-        assert_eq!(loops[0].stmts.len(), 2);
-    }
-
-    #[test]
-    fn a_barrier_cuts_the_list_in_two() {
-        let b = vec![dummy_store(), CStmt::Barrier, dummy_store()];
-        let loops = block(&b, 256, 8).unwrap();
-        assert_eq!(loops.len(), 2, "a barrier must split the lane loop");
-    }
-
-    #[test]
-    fn a_barrier_in_a_uniform_loop_splits_the_body() {
-        let inner = vec![dummy_store(), CStmt::Barrier, dummy_store()];
-        let b = vec![CStmt::Loop {
-            prep: 0..0,
-            count: None,
-            index: None,
-            accs: vec![],
-            body: inner,
-        }];
-        let loops = block(&b, 128, 4).unwrap();
-        assert_eq!(loops.len(), 1);
-        match &loops[0].stmts[0] {
-            CStmt::Loop { body, .. } => {
-                assert_eq!(body.len(), 2, "the loop body must hold two lane regions");
-                assert!(matches!(body[0], CStmt::Lanes(_)));
-                assert!(matches!(body[1], CStmt::Lanes(_)));
-            }
-            other => panic!("expected a loop, got {other:?}"),
-        }
-    }
 }

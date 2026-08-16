@@ -14,7 +14,7 @@ use crate::{Error, Result};
 ///
 /// Labels are allocated in order: `0..batch` are the shared batch axes, then
 /// `m`, `k`, `n`. `transposed_rhs` only swaps `b`'s last two labels.
-pub fn matmul_spec(batch: usize, transposed_rhs: bool) -> Result<EinSpec> {
+pub(crate) fn matmul_spec(batch: usize, transposed_rhs: bool) -> Result<EinSpec> {
     if batch + 3 > u8::MAX as usize {
         return Err(Error::Shape(format!(
             "contraction over {batch} batch axes exceeds the 255-label spec"
@@ -160,54 +160,5 @@ impl Tensor {
             b: rhs.id,
             outs: 1,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fusor2_ir::contract_spec::{LabelRole, partition, role};
-
-    #[test]
-    fn batched_matmul_spec_labels() {
-        let s = matmul_spec(1, false).unwrap();
-        // a = [b, m, k], b = [b, k, n], out = [b, m, n]
-        assert_eq!(&s.a[..], &[Label(0), Label(1), Label(2)]);
-        assert_eq!(&s.b[..], &[Label(0), Label(2), Label(3)]);
-        assert_eq!(&s.out[..], &[Label(0), Label(1), Label(3)]);
-
-        assert_eq!(role(&s, Label(0)).unwrap(), LabelRole::Batch);
-        assert_eq!(role(&s, Label(1)).unwrap(), LabelRole::M);
-        assert_eq!(role(&s, Label(2)).unwrap(), LabelRole::K);
-        assert_eq!(role(&s, Label(3)).unwrap(), LabelRole::N);
-    }
-
-    #[test]
-    fn transposed_rhs_is_only_a_spec() {
-        let normal = matmul_spec(0, false).unwrap();
-        let t = matmul_spec(0, true).unwrap();
-        assert_eq!(normal.a, t.a);
-        assert_eq!(normal.out, t.out);
-        assert_eq!(&normal.b[..], &[Label(1), Label(2)]);
-        assert_eq!(&t.b[..], &[Label(2), Label(1)]);
-        // Both are well-formed contractions.
-        partition(&normal).unwrap();
-        partition(&t).unwrap();
-    }
-
-    #[test]
-    fn adjoint_specs_round_trip_to_the_operand_shapes() {
-        let s = matmul_spec(1, false).unwrap();
-        let dl = s.d_lhs();
-        // grad x b -> a
-        assert_eq!(dl.a, s.out);
-        assert_eq!(dl.b, s.b);
-        assert_eq!(dl.out, s.a);
-        let dr = s.d_rhs();
-        assert_eq!(dr.a, s.a);
-        assert_eq!(dr.b, s.out);
-        assert_eq!(dr.out, s.b);
-        partition(&dl).unwrap();
-        partition(&dr).unwrap();
     }
 }

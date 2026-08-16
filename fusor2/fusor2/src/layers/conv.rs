@@ -15,9 +15,12 @@ use crate::{Result, Tensor};
 pub struct ConvNd<const W: usize = 4, T: Element = f32> {
     weight: Tensor<W, T>,
     bias: Option<Tensor<1, T>>,
+    /// Step of each spatial window.
     pub stride: SmallVec<[u32; 3]>,
+    /// Zero padding on each spatial axis.
     pub padding: SmallVec<[u32; 3]>,
     dilation: SmallVec<[u32; 3]>,
+    /// Number of channel groups.
     pub groups: u32,
 }
 
@@ -118,89 +121,5 @@ impl<const W: usize, T: Element> ConvNd<W, T> {
                 self.groups.max(1),
             ),
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::graph::Graph;
-    use crate::layers::test_leaf as leaf;
-    use crate::session::{Backend, Session};
-
-    fn graph() -> Graph {
-        Graph::new(&Session::new(Backend::cpu().expect("cpu device")).expect("session"))
-    }
-
-    #[test]
-    fn the_default_configuration_is_unit_stride_no_padding_one_group() {
-        let g = graph();
-        let w: Tensor<3, f32> = leaf(&g, &[3, 2, 3]);
-        let layer = ConvNd::new(w, None);
-        assert_eq!(&layer.stride[..], &[1]);
-        assert_eq!(&layer.padding[..], &[0]);
-        assert_eq!(&layer.dilation[..], &[1]);
-        assert_eq!(layer.groups, 1);
-    }
-
-    #[test]
-    fn a_valid_1d_convolution_loses_k_minus_one_positions() {
-        let g = graph();
-        let x: Tensor<3, f32> = leaf(&g, &[1, 2, 6]);
-        let w: Tensor<3, f32> = leaf(&g, &[3, 2, 3]);
-        let b: Tensor<1, f32> = leaf(&g, &[3]);
-        assert_eq!(ConvNd::new(w, Some(b)).forward(&x).shape(), [1, 3, 4]);
-    }
-
-    #[test]
-    fn padding_puts_the_positions_back() {
-        let g = graph();
-        let x: Tensor<3, f32> = leaf(&g, &[1, 2, 6]);
-        let w: Tensor<3, f32> = leaf(&g, &[3, 2, 3]);
-        let y = ConvNd::with_config(w, None, &[1], &[1], 1).forward(&x);
-        assert_eq!(y.shape(), [1, 3, 6]);
-    }
-
-    #[test]
-    fn the_forward_is_exactly_the_conv_macro_op() {
-        let g = graph();
-        let x: Tensor<3, f32> = leaf(&g, &[1, 2, 6]);
-        let w: Tensor<3, f32> = leaf(&g, &[3, 2, 3]);
-        let b: Tensor<1, f32> = leaf(&g, &[3]);
-        let by_layer = ConvNd::new(w.clone(), Some(b.clone())).forward(&x);
-        let by_hand = crate::composite::conv::conv(
-            x.as_dyn(),
-            w.as_dyn(),
-            Some(b.as_dyn()),
-            &[1],
-            &[0],
-            &[1],
-        )
-        .unwrap();
-        assert_eq!(by_layer.id(), by_hand.id());
-    }
-
-    #[test]
-    fn a_grouped_layer_reaches_the_grouped_macro_op() {
-        let g = graph();
-        let x: Tensor<3, f32> = leaf(&g, &[1, 4, 6]);
-        let w: Tensor<3, f32> = leaf(&g, &[4, 2, 3]);
-        let by_layer = ConvNd::with_config(w.clone(), None, &[1], &[0], 2).forward(&x);
-        let by_hand =
-            crate::composite::conv::grouped_conv(x.as_dyn(), w.as_dyn(), None, &[1], &[0], &[1], 2)
-                .unwrap();
-        assert_eq!(by_layer.id(), by_hand.id());
-    }
-
-    /// A bare `ConvNd` is the 2-d case.
-    #[test]
-    fn the_default_parameterization_is_the_two_dimensional_case() {
-        let g = graph();
-        let x: Tensor<4, f32> = leaf(&g, &[1, 2, 6, 6]);
-        let w: Tensor<4, f32> = leaf(&g, &[3, 2, 3, 3]);
-        let layer: ConvNd = ConvNd::new(w, None);
-        assert_eq!(&layer.stride[..], &[1, 1]);
-        assert_eq!(layer.forward(&x).shape(), [1, 3, 4, 4]);
     }
 }

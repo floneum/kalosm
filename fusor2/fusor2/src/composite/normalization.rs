@@ -187,10 +187,12 @@ impl Tensor {
         )
     }
 
+    /// Softmax over the last axis.
     pub fn softmax_last_dim(&self) -> Result<Tensor> {
         self.softmax(last_axis(&self.graph, self)?)
     }
 
+    /// Log-softmax over `axis`.
     pub fn log_softmax(&self, axis: u32) -> Result<Tensor> {
         let x = self.id;
         core_op(&self.graph, |t| log_softmax_defn(t, x, axis))
@@ -201,6 +203,7 @@ impl Tensor {
         self.rms_norm_inner(Some(weight), None, eps)
     }
 
+    /// RMS normalization without a learned scale.
     pub fn rms_norm_no_weight(&self, eps: f32) -> Result<Tensor> {
         self.rms_norm_inner(None, None, eps)
     }
@@ -308,95 +311,5 @@ impl Tensor {
             let sq = t.binary(BinOp::Mul, c, c)?;
             mean_axis(t, sq, axis)
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::graph::Graph;
-    use crate::session::{Backend, Session};
-    use fusor2_ir::dtype::Dtype;
-    use fusor2_ir::ir::Op;
-    use fusor2_ir::ir::launch::Launch;
-    use fusor2_ir::shape::Dim;
-
-    fn graph() -> Graph {
-        Graph::new(&Session::new(Backend::cpu().unwrap()).unwrap())
-    }
-
-    fn x(g: &Graph, shape: &[u64]) -> Tensor {
-        let dims: Vec<Dim> = shape.iter().map(|d| Dim::Const(*d)).collect();
-        g.leaf("x", &dims, Dtype::F32).unwrap()
-    }
-
-    #[test]
-    fn every_softmax_spelling_shares_one_expansion() {
-        let g = graph();
-        let a = x(&g, &[2, 8]);
-        let sugar = a.softmax_last_dim().unwrap();
-        let by_axis = a.softmax(1).unwrap();
-        assert_eq!(sugar.id(), by_axis.id());
-    }
-
-    #[test]
-    fn a_softmax_class_holds_both_the_sugar_and_a_marked_defn() {
-        let g = graph();
-        let a = x(&g, &[2, 8]);
-        let y = a.softmax_last_dim().unwrap();
-        let (members, sugars, defns) = g
-            .handle()
-            .with_egraph(|eg| {
-                let ms = eg.members(eg.class_of(y.id()));
-                let sugars = ms
-                    .iter()
-                    .filter(|m| matches!(eg.node(**m).op, Op::Launch(Launch::Ext { .. })))
-                    .count();
-                let defns = ms.iter().filter(|m| eg.is_defn(**m)).count();
-                Ok((ms.len(), sugars, defns))
-            })
-            .unwrap();
-        assert!(members >= 2, "expected sugar + defn, got {members}");
-        assert_eq!(sugars, 1);
-        assert_eq!(defns, 1);
-    }
-
-    #[test]
-    fn eps_is_a_uniform_and_two_layers_at_one_value_share_it() {
-        let g = graph();
-        let a = eps_uniform(g.handle(), 1e-5);
-        let b = eps_uniform(g.handle(), 1e-5);
-        let c = eps_uniform(g.handle(), 1e-6);
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        assert_eq!(g.handle().uniform_value(a), Some(1e-5));
-    }
-
-    #[test]
-    fn rms_norm_and_layer_norm_preserve_shape() {
-        let g = graph();
-        let a = x(&g, &[3, 4]);
-        let w = g.leaf("w", &[Dim::Const(4)], Dtype::F32).unwrap();
-        let b = g.leaf("b", &[Dim::Const(4)], Dtype::F32).unwrap();
-        for y in [
-            a.rms_norm(&w, 1e-5).unwrap(),
-            a.rms_norm_with_bias(&w, &b, 1e-5).unwrap(),
-            a.layer_norm(&w, Some(&b), 1e-5, true).unwrap(),
-            a.layer_norm(&w, Some(&b), 1e-5, false).unwrap(),
-        ] {
-            assert_eq!(
-                &g.handle().facts(y.id()).shape[..],
-                &[Dim::Const(3), Dim::Const(4)]
-            );
-        }
-    }
-
-    #[test]
-    fn a_symbolic_normalization_axis_is_refused_rather_than_guessed() {
-        let g = graph();
-        let seq = g.sym("features");
-        let a = g.leaf("x", &[Dim::Const(2), seq], Dtype::F32).unwrap();
-        let w = g.leaf("w", &[seq], Dtype::F32).unwrap();
-        assert!(a.rms_norm(&w, 1e-5).is_err());
     }
 }

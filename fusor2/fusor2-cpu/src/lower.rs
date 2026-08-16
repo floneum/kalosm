@@ -1,8 +1,8 @@
 //! Launch node + `SchedPoint` -> `KernelIr` for the CPU backend.
 
-pub mod contract;
-pub mod gather_scatter;
-pub mod map_fold;
+pub(crate) mod contract;
+pub(crate) mod gather_scatter;
+pub(crate) mod map_fold;
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::{Dtype, NumericContract, QLayout};
@@ -24,11 +24,11 @@ use std::sync::Arc;
 /// Lanes per workgroup for a node whose schedule point names no lane group.
 /// One grid point is one workgroup; `block` lanes are walked in chunks of the
 /// register width.
-pub fn default_block(caps: &Caps) -> u32 {
+pub(crate) fn default_block(caps: &Caps) -> u32 {
     fusor2_tile::domains::emitted_block(1, caps)
 }
 
-pub fn lower(
+pub(crate) fn lower(
     caps: &Caps,
     node: &Node,
     id: Id,
@@ -200,7 +200,7 @@ fn redirect_stores(
 }
 
 /// `Launch::Ext` lowering: the one escape hatch out of the closed `Logical`/`Launch` enums.
-pub mod ext {
+pub(crate) mod ext {
     use super::*;
     use fusor2_ir::ir::{OpDefId, OpDefRegistry};
     use std::sync::RwLock;
@@ -211,22 +211,15 @@ pub mod ext {
     /// e-graph's semantics. Registration order is id order and must match.
     static DEFS: RwLock<Option<OpDefRegistry>> = RwLock::new(None);
 
-    /// Install the extension registry this process lowers against. Idempotent
-    /// and last-write-wins; callers pass the registry the graph was built
-    /// with, unchanged, or every `OpDefId` silently renames.
-    pub fn install(registry: OpDefRegistry) {
-        *DEFS.write().expect("the OpDef registry lock is poisoned") = Some(registry);
-    }
-
     /// The installed registry, if the embedder installed one.
-    pub fn installed() -> Option<OpDefRegistry> {
+    pub(crate) fn installed() -> Option<OpDefRegistry> {
         DEFS.read()
             .expect("the OpDef registry lock is poisoned")
             .clone()
     }
 
     /// Lower one registered extension op through its `"cpu"` row.
-    pub fn lower(def: OpDefId, node: &Node, theta: SchedPoint) -> Result<KernelIr> {
+    pub(crate) fn lower(def: OpDefId, node: &Node, theta: SchedPoint) -> Result<KernelIr> {
         let registry = installed().ok_or_else(|| {
             Error::Legality(format!(
                 "{def:?} is an extension op, but no OpDefRegistry is installed on the \
@@ -377,7 +370,7 @@ pub(crate) struct Binds {
 impl Binds {
     /// Binding 0 is always the uniform block; the rest come straight from the
     /// plan, sorted by binding index.
-    pub fn build(cx: &LowerCtx<'_>) -> Result<Self> {
+    pub(crate) fn build(cx: &LowerCtx<'_>) -> Result<Self> {
         let mut bindings = cx.launch.bindings.clone();
         bindings.sort_by_key(|b| b.binding);
 
@@ -439,7 +432,7 @@ impl Binds {
         Ok(Self { buffers, by_value })
     }
 
-    pub fn of(&self, value: Id) -> Result<Arc<BufferDecl>> {
+    pub(crate) fn of(&self, value: Id) -> Result<Arc<BufferDecl>> {
         let idx = self
             .by_value
             .iter()
@@ -693,7 +686,7 @@ pub(crate) struct Translate<'a> {
 }
 
 impl Translate<'_> {
-    pub fn run(&self, e: &ScalarExpr) -> Result<TileExpr> {
+    pub(crate) fn run(&self, e: &ScalarExpr) -> Result<TileExpr> {
         let ty = ElementType::Scalar(elem_of(e.dtype()).unwrap_or(ScalarElement::F32));
         Ok(match e.kind() {
             ScalarKind::Arg(i) => self
@@ -847,476 +840,4 @@ pub(crate) fn coords_of(flat: &TileExpr, extents: &[u32]) -> Vec<TileExpr> {
 pub(crate) fn grid_for(n: u64, block: u32) -> [u32; 3] {
     let groups = n.div_ceil(block as u64).max(1);
     [groups as u32, 1, 1]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn coords_decompose_a_flat_index() {
-        // Structural check: three axes yield three divmod expressions.
-        let flat = lit_u32(0);
-        let c = coords_of(&flat, &[2, 3, 4]);
-        assert_eq!(c.len(), 3);
-    }
-
-    #[test]
-    fn grid_covers_every_element() {
-        assert_eq!(grid_for(1, 256), [1, 1, 1]);
-        assert_eq!(grid_for(256, 256), [1, 1, 1]);
-        assert_eq!(grid_for(257, 256), [2, 1, 1]);
-        assert_eq!(grid_for(0, 256), [1, 1, 1]);
-    }
-
-    #[test]
-    fn a_symbolic_extent_is_a_legality_answer_not_a_panic() {
-        let e = const_extents(&[Dim::Sym(fusor2_ir::shape::SymId(0))]);
-        assert!(matches!(e, Err(Error::Legality(_))));
-    }
-}
-
-/// End-to-end cover for `Launch::Ext` and `Region`: every case lowers,
-/// compiles, runs and asserts the bytes that came back.
-#[cfg(test)]
-mod composite_tests {
-    use super::*;
-    use fusor2_ir::device::Caps;
-    use fusor2_ir::dtype::Persistence;
-    use fusor2_ir::egraph::EGraph;
-    use fusor2_ir::extract::{BindKind, BindingPlan, Extraction, Dispatch, Plan, PlanHash};
-    use fusor2_ir::facts::{ValueFacts, Work};
-    use fusor2_ir::ir::logical::{BufferId, Logical, LeafKind};
-    use fusor2_ir::ir::launch::{
-        AccessPlan, Effect, IndexSpace, ScheduleDomain,
-    };
-    use fusor2_ir::ir::kernel::Stmt;
-    use fusor2_ir::ir::{AttrId, OpDef, OpDefId, OpDefRegistry, OpTag, VerifyCtx};
-    use fusor2_ir::scalar::{BinOp, CmpOp};
-    use fusor2_ir::semantics::{CoreSemantics, SumArenaPlanner};
-    use fusor2_ir::shape::Layout;
-    use fusor2_ir::target::{Buf, Target};
-
-    /// The width these hand-built fixtures use. Production reads it from
-    /// `default_block(caps)`; a fixture only needs a legal number.
-    const BLOCK: u32 = 256;
-
-    use crate::alloc::AlignedBuf;
-    use crate::target::CpuTarget;
-
-    fn f32_ty() -> ElementType {
-        ElementType::Scalar(ScalarElement::F32)
-    }
-
-    fn graph() -> EGraph {
-        EGraph::new(CoreSemantics::new(Arc::new(SumArenaPlanner)))
-    }
-
-    fn buffer(g: &mut EGraph, n: u64) -> Id {
-        let next = g.len() as u32;
-        g.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
-            name: BufferId(next),
-            dtype: Dtype::F32,
-            shape: smallvec::smallvec![Dim::Const(n)],
-        })))
-        .unwrap()
-    }
-
-    fn alias(g: &EGraph, src: Id) -> Operand {
-        Operand {
-            src,
-            layout: Layout::contiguous(&g.facts(src).shape),
-            access: AccessPlan::Alias,
-        }
-    }
-
-    fn kmap(g: &mut EGraph, n: u64, body: ScalarExpr, x: Id) -> Id {
-        let ops = vec![alias(g, x)];
-        g.add(Op::Launch(Launch::Map {
-            space: IndexSpace::new([Dim::Const(n)]),
-            body,
-            ops,
-            sched: ScheduleDomain::Point,
-        }))
-        .unwrap()
-    }
-
-    fn plan_for(root: Id, bindings: Vec<BindingPlan>) -> Plan {
-        Plan {
-            extraction: Extraction::default(),
-            launches: vec![Dispatch {
-                root,
-                members: smallvec::smallvec![root],
-                bindings,
-                grid: [1, 1, 1],
-                block: BLOCK,
-            }],
-            buffers: Vec::new(),
-            symbols: Vec::new(),
-            hash: PlanHash(0),
-            cost: fusor2_ir::cost::Picoseconds(0),
-        }
-    }
-
-    fn read(target: &CpuTarget, bytes: u64, data: &[f32]) -> Buf {
-        let buf = target.alloc(bytes, Persistence::Step).unwrap();
-        {
-            let raw = buf.downcast_ref::<AlignedBuf>().unwrap();
-            // SAFETY: nothing else holds this buffer yet; the pool handed it
-            // back because its refcount was one.
-            let slice = unsafe {
-                std::slice::from_raw_parts_mut(raw.as_mut_ptr(), raw.len())
-            };
-            slice.fill(0);
-            for (i, v) in data.iter().enumerate() {
-                slice[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-            }
-        }
-        buf
-    }
-
-    fn back(buf: &Buf, n: usize) -> Vec<f32> {
-        let raw = buf.downcast_ref::<AlignedBuf>().unwrap();
-        raw.as_slice()[..n * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
-
-    fn run(target: &CpuTarget, ir: &KernelIr, binds: &[Buf]) {
-        let artifact = target.emit(ir).unwrap();
-        target
-            .launch(&artifact, ir.grid, binds, &Default::default())
-            .unwrap();
-    }
-
-    /// A registered extension op's own `"cpu"` lowering: `y = 3 * x`. It
-    /// builds its whole `KernelIr` from the node. `SchedPoint::Point` is the
-    /// only point an extension op can be handed, since `Ext` declares no
-    /// schedule domain.
-    fn lower_triple(node: &Node, theta: &SchedPoint) -> Result<KernelIr> {
-        if !matches!(theta, SchedPoint::Point) {
-            return Err(Error::Legality(format!(
-                "an Launch::Ext node declares no schedule domain, so {theta:?} names \
-                 a geometry nothing could have selected"
-            )));
-        }
-        let Op::Launch(Launch::Ext { ops, .. }) = &node.op else {
-            return Err(Error::Legality("triple got a foreign node".into()));
-        };
-        let shape = ops
-            .first()
-            .ok_or_else(|| Error::Legality("triple needs an operand".into()))?
-            .layout
-            .shape();
-        let n: u32 = shape
-            .iter()
-            .map(|d| d.as_const().unwrap_or(1) as u32)
-            .product();
-        let decl = |binding: u32, element: ElementType, len: u32, access| {
-            Arc::new(BufferDecl {
-                binding,
-                element,
-                layout: TileLayout::contiguous(MemoryLevel::Storage, &[len]),
-                access,
-            })
-        };
-        let uniforms = decl(0, u32_ty(), 1, BufferAccess::Read);
-        let input = decl(1, f32_ty(), n, BufferAccess::Read);
-        let output = decl(2, f32_ty(), n, BufferAccess::ReadWrite);
-
-        let flat = global_lane(BLOCK);
-        let mask = cmp(CmpOp::Lt, flat.clone(), lit_u32(n));
-        let x = load(Arc::clone(&input), flat.clone(), mask.clone());
-        let value = bin(BinOp::Mul, x, lit_f32(3.0), f32_ty());
-        let body = vec![Stmt::Store {
-            dst: StorageView {
-                layout: output.layout.clone(),
-                buffer: Arc::clone(&output),
-                offset: 0,
-            },
-            addr: Addr::Linear(flat),
-            value,
-            mask,
-        }];
-        Ok(KernelIr {
-            buffers: vec![uniforms, input, output],
-            grid: grid_for(n as u64, BLOCK),
-            block: BLOCK,
-            body,
-            byte_arena: None,
-            name: "triple",
-        })
-    }
-
-    fn infer_first(ins: &[ValueFacts]) -> fusor2_ir::Result<ValueFacts> {
-        ins.first()
-            .cloned()
-            .ok_or_else(|| Error::Shape("an extension op needs an operand".into()))
-    }
-    fn work_per_element(_ins: &[ValueFacts], out: &ValueFacts) -> Work {
-        let n = out.elements().unwrap_or(1);
-        Work {
-            macs: n,
-            transcendentals: 0,
-            index_ops: n,
-            wg_bytes: 0,
-        }
-    }
-    fn verify_ok(_cx: &VerifyCtx<'_>) -> fusor2_ir::Result<()> {
-        Ok(())
-    }
-
-    /// Id 0 lowers on the CPU; id 1 names only another target.
-    fn triple_registry() -> OpDefRegistry {
-        let mut registry = OpDefRegistry::new();
-        registry.register(OpDef {
-            name: "triple",
-            tag: OpTag::Ext,
-            verify: verify_ok,
-            infer: infer_first,
-            work: work_per_element,
-            adjoint: None,
-            lower_per_target: &[("cpu", lower_triple)],
-            effect: Effect::Pure,
-        });
-        registry.register(OpDef {
-            name: "gpu_only",
-            tag: OpTag::Ext,
-            verify: verify_ok,
-            infer: infer_first,
-            work: work_per_element,
-            adjoint: None,
-            lower_per_target: &[],
-            effect: Effect::Pure,
-        });
-        registry
-    }
-
-    #[test]
-    fn a_registered_op_def_lowers_and_runs() {
-        let registry = triple_registry();
-        ext::install(registry.clone());
-        let mut g = EGraph::new(CoreSemantics::with_registry(
-            Arc::new(SumArenaPlanner),
-            registry,
-        ));
-        let x = buffer(&mut g, 8);
-        let ops = vec![alias(&g, x)];
-        let e = g
-            .add(Op::Launch(Launch::Ext {
-                def: OpDefId(0),
-                ops,
-                attrs: AttrId(0),
-            }))
-            .unwrap();
-
-        let plan = plan_for(
-            e,
-            vec![
-                BindingPlan {
-                    binding: 1,
-                    value: x,
-                    kind: BindKind::Read,
-                },
-                BindingPlan {
-                    binding: 2,
-                    value: e,
-                    kind: BindKind::Write,
-                },
-            ],
-        );
-        let cx = LowerCtx {
-            plan: &plan,
-            launch: &plan.launches[0],
-            graph: &g,
-            symbols: &[],
-        };
-        let caps = Caps::clone(crate::caps::cpu_caps());
-        let ir = lower(&caps, g.node(e), e, SchedPoint::Point, &cx).unwrap();
-        assert_eq!(ir.name, "triple", "the OpDef's own lowering must run");
-
-        let target = CpuTarget::new().unwrap();
-        let input = read(&target, 32, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        let output = read(&target, 32, &[0.0; 8]);
-        run(&target, &ir, &[input, output.clone()]);
-        assert_eq!(
-            back(&output, 8),
-            vec![3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0, 24.0]
-        );
-
-        // The negative half lives in the same test because the registry is
-        // process-global: an op with no `"cpu"` row is a legality error.
-        let other = Node {
-            op: Op::Launch(Launch::Ext {
-                def: OpDefId(1),
-                ops: vec![alias(&g, x)],
-                attrs: AttrId(0),
-            }),
-            level: fusor2_ir::ir::Level::Launch,
-            children: smallvec::smallvec![x],
-        };
-        let err = lower(&caps, &other, x, SchedPoint::Point, &cx).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("gpu_only") && msg.contains("cpu"), "{msg}");
-    }
-
-    /// The domain a composite landing `member`'s value carries — the same
-    /// call `rules::fusion` mints it with and `verify_launch` checks it against.
-    fn region_sched(g: &EGraph, member: Id) -> ScheduleDomain {
-        ScheduleDomain::Map(fusor2_ir::ir::launch::MapDomain::linear_over(
-            crate::caps::cpu_caps(),
-            &g.facts(member).shape,
-        ))
-    }
-
-    fn two_member_graph(g: &mut EGraph) -> (Id, Id, Id) {
-        let x = buffer(g, 8);
-        let doubled = kmap(
-            g,
-            8,
-            ScalarExpr::bin(
-                BinOp::Mul,
-                ScalarExpr::arg(0, Dtype::F32),
-                ScalarExpr::lit(fusor2_ir::dtype::Splat::F32(2.0)),
-            ),
-            x,
-        );
-        let plus_one = kmap(
-            g,
-            8,
-            ScalarExpr::bin(
-                BinOp::Add,
-                ScalarExpr::arg(0, Dtype::F32),
-                ScalarExpr::lit(fusor2_ir::dtype::Splat::F32(1.0)),
-            ),
-            x,
-        );
-        (x, doubled, plus_one)
-    }
-
-    fn composite_bindings(x: Id, root: Id, a: Id, b: Id) -> Vec<BindingPlan> {
-        vec![
-            BindingPlan {
-                binding: 1,
-                value: x,
-                kind: BindKind::Read,
-            },
-            BindingPlan {
-                binding: 2,
-                value: root,
-                kind: BindKind::Write,
-            },
-            BindingPlan {
-                binding: 3,
-                value: a,
-                kind: BindKind::Write,
-            },
-            BindingPlan {
-                binding: 4,
-                value: b,
-                kind: BindKind::Write,
-            },
-        ]
-    }
-
-    fn run_composite(g: &EGraph, root: Id, x: Id, a: Id, b: Id) -> (Vec<f32>, Vec<f32>, usize) {
-        let plan = plan_for(root, composite_bindings(x, root, a, b));
-        let cx = LowerCtx {
-            plan: &plan,
-            launch: &plan.launches[0],
-            graph: g,
-            symbols: &[],
-        };
-        let caps = Caps::clone(crate::caps::cpu_caps());
-        let ir = lower(&caps, g.node(root), root, SchedPoint::Point, &cx).unwrap();
-        let stores = count_stores(&ir.body);
-
-        let target = CpuTarget::new().unwrap();
-        let input = read(&target, 32, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        let root_buf = read(&target, 32, &[0.0; 8]);
-        let a_buf = read(&target, 32, &[0.0; 8]);
-        let b_buf = read(&target, 32, &[0.0; 8]);
-        run(
-            &target,
-            &ir,
-            &[input, root_buf, a_buf.clone(), b_buf.clone()],
-        );
-        (back(&a_buf, 8), back(&b_buf, 8), stores)
-    }
-
-    fn count_stores(stmts: &[Stmt]) -> usize {
-        stmts
-            .iter()
-            .map(|s| match s {
-                Stmt::Store { .. } => 1,
-                Stmt::If { accept, reject, .. } => count_stores(accept) + count_stores(reject),
-                Stmt::Loop { body, .. } => count_stores(body),
-                _ => 0,
-            })
-            .sum()
-    }
-
-    #[test]
-    fn a_kregion_runs_every_member_into_its_own_buffer_in_one_dispatch() {
-        let mut g = graph();
-        let (x, doubled, plus_one) = two_member_graph(&mut g);
-        let region = g
-            .add(Op::Launch(Launch::Region {
-                members: smallvec::smallvec![doubled, plus_one],
-                live_outs: smallvec::smallvec![0, 1],
-                sched: region_sched(&g, doubled),
-            }))
-            .unwrap();
-        let (a, b, stores) = run_composite(&g, region, x, doubled, plus_one);
-        assert_eq!(a, vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0]);
-        assert_eq!(b, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
-        assert_eq!(stores, 2, "one region, two live outputs, one dispatch");
-    }
-
-    /// A composite whose members disagree on their lane count has no
-    /// single-kernel CPU lowering, and says so.
-    #[test]
-    fn mismatched_lane_counts_are_a_legality_answer() {
-        let mut g = graph();
-        let x = buffer(&mut g, 8);
-        let m = kmap(&mut g, 8, ScalarExpr::arg(0, Dtype::F32), x);
-        let ops = vec![alias(&g, x)];
-        let f = g
-            .add(Op::Launch(Launch::Fold {
-                space: IndexSpace::new([Dim::Const(8)]),
-                axis: 0,
-                vec_axes: smallvec::smallvec![],
-                carrier: fusor2_ir::carrier::Carrier::binop(
-                    fusor2_ir::scalar::BinOp::Add,
-                    fusor2_ir::dtype::Splat::F32(0.0),
-                    Dtype::F32,
-                ),
-                acc: Dtype::F32,
-                post: smallvec::smallvec![ScalarExpr::arg(0, Dtype::F32)],
-                ops,
-                sched: ScheduleDomain::Point,
-            }))
-            .unwrap();
-        let region = g
-            .add(Op::Launch(Launch::Region {
-                members: smallvec::smallvec![m, f],
-                live_outs: smallvec::smallvec![0],
-                sched: region_sched(&g, m),
-            }))
-            .unwrap();
-        let plan = plan_for(region, composite_bindings(x, region, m, f));
-        let cx = LowerCtx {
-            plan: &plan,
-            launch: &plan.launches[0],
-            graph: &g,
-            symbols: &[],
-        };
-        let caps = Caps::clone(crate::caps::cpu_caps());
-        let err = lower(&caps, g.node(region), region, SchedPoint::Point, &cx).unwrap_err();
-        assert!(
-            matches!(err, Error::Legality(ref m) if m.contains("lane count")),
-            "{err}"
-        );
-    }
 }

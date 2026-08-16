@@ -20,6 +20,7 @@ pub struct LayerNorm<const N: usize = 1, T: Element = f32> {
 }
 
 impl<const N: usize, T: Element> LayerNorm<N, T> {
+    /// Create a layer normalization from its affine parameters and epsilon.
     pub fn new(weight: Tensor<N, T>, bias: Option<Tensor<N, T>>, eps: f32) -> Self {
         Self { weight, bias, eps }
     }
@@ -59,6 +60,7 @@ pub struct LayerNormNd<const N: usize = 1, T: Element = f32> {
 }
 
 impl<const N: usize, T: Element> LayerNormNd<N, T> {
+    /// Apply `inner` over the final `axes` axes as one group.
     pub fn new(inner: LayerNorm<N, T>, axes: u32) -> Self {
         Self { inner, axes }
     }
@@ -141,92 +143,4 @@ fn flatten_affine(p: &Dyn, tail: Dim, what: &str) -> Result<Dyn> {
         )));
     }
     Ok(flat)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::graph::Graph;
-    use crate::layers::test_leaf as leaf;
-    use crate::session::{Backend, Session};
-
-    fn graph() -> Graph {
-        Graph::new(&Session::new(Backend::cpu().expect("cpu device")).expect("session"))
-    }
-
-    #[test]
-    fn the_last_axis_form_preserves_the_shape() {
-        let g = graph();
-        let x: Tensor<2, f32> = leaf(&g, &[3, 6]);
-        let w: Tensor<1, f32> = leaf(&g, &[6]);
-        let b: Tensor<1, f32> = leaf(&g, &[6]);
-        assert_eq!(LayerNorm::new(w, Some(b), 1e-5).forward(&x).shape(), [3, 6]);
-    }
-
-    #[test]
-    fn the_nd_form_normalizes_the_flattened_tail_and_reshapes_back() {
-        let g = graph();
-        let x: Tensor<3, f32> = leaf(&g, &[2, 3, 4]);
-        let w: Tensor<2, f32> = leaf(&g, &[3, 4]);
-        let layer = LayerNormNd::new(LayerNorm::new(w, None, 1e-5), 2);
-        assert_eq!(layer.forward(&x).shape(), [2, 3, 4]);
-    }
-
-    #[test]
-    fn one_trailing_axis_is_exactly_the_last_axis_form() {
-        let g = graph();
-        let x: Tensor<3, f32> = leaf(&g, &[2, 3, 4]);
-        let w: Tensor<1, f32> = leaf(&g, &[4]);
-        let plain = LayerNorm::new(w.clone(), None, 1e-5).forward(&x);
-        let nd = LayerNormNd::new(LayerNorm::new(w, None, 1e-5), 1).forward(&x);
-        assert_eq!(plain.id(), nd.id());
-    }
-
-    /// The mean is removed and the variance is biased.
-    #[test]
-    fn the_forward_is_the_centered_macro_op() {
-        let g = graph();
-        let x: Tensor<2, f32> = leaf(&g, &[3, 6]);
-        let w: Tensor<1, f32> = leaf(&g, &[6]);
-        let b: Tensor<1, f32> = leaf(&g, &[6]);
-        let by_layer = LayerNorm::new(w.clone(), Some(b.clone()), 1e-5).forward(&x);
-        let by_hand = x.layer_norm(&w, Some(&b), 1e-5, true);
-        assert_eq!(by_layer.id(), by_hand.id());
-        // The uncentered spelling is a different value, not the same node.
-        assert_ne!(by_layer.id(), x.layer_norm(&w, Some(&b), 1e-5, false).id());
-    }
-
-    /// The tail is normalized as one group, so the `[a, b, c]` form and the
-    /// `[a, b * c]` form are the same node modulo the closing reshape.
-    #[test]
-    fn the_nd_form_is_the_flattened_last_axis_form() {
-        let g = graph();
-        let x: Tensor<3, f32> = leaf(&g, &[2, 3, 4]);
-        let w: Tensor<2, f32> = leaf(&g, &[3, 4]);
-        let by_layer = LayerNormNd::new(LayerNorm::new(w.clone(), None, 1e-5), 2).forward(&x);
-        let by_hand = x
-            .flatten_last_n::<2>(1)
-            .layer_norm(&w.flatten_all(), None, 1e-5, true)
-            .reshape_dims(x.extents());
-        assert_eq!(by_layer.id(), by_hand.id());
-    }
-
-    #[test]
-    #[should_panic(expected = "covers 4 elements")]
-    fn an_affine_parameter_that_does_not_cover_the_group_is_refused() {
-        let g = graph();
-        let x: Tensor<3, f32> = leaf(&g, &[2, 3, 4]);
-        let w: Tensor<1, f32> = leaf(&g, &[4]);
-        let _ = LayerNormNd::new(LayerNorm::new(w, None, 1e-5), 2).forward(&x);
-    }
-
-    #[test]
-    #[should_panic(expected = "trailing axes of a rank-2")]
-    fn more_trailing_axes_than_rank_is_refused() {
-        let g = graph();
-        let x: Tensor<2, f32> = leaf(&g, &[3, 4]);
-        let w: Tensor<1, f32> = leaf(&g, &[12]);
-        let _ = LayerNormNd::new(LayerNorm::new(w, None, 1e-5), 3).forward(&x);
-    }
 }

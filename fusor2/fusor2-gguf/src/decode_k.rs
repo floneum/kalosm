@@ -47,44 +47,6 @@ fn k4_group_scale_min(
     (scale, min)
 }
 
-/// The whole-word form of the same unpack: three packed words in, eight group
-/// scales and eight group offsets out.
-pub fn unpack_k4_scales_offsets(packed: [TileExpr; 3]) -> ([TileExpr; 8], [TileExpr; 8]) {
-    const SIX_BITS: u32 = 0b0011_1111_0011_1111_0011_1111_0011_1111;
-    const MSB_TWO: u32 = 0b1100_0000_1100_0000_1100_0000_1100_0000;
-    const MSB_SCALES: u32 = 0b0000_1111_0000_1111_0000_1111_0000_1111;
-    const MSB_OFFSET: u32 = 0b1111_0000_1111_0000_1111_0000_1111_0000;
-
-    let [w0, w1, w2] = packed;
-    let first_scales = and_lit(w0.clone(), SIX_BITS);
-    let first_offsets = and_lit(w1.clone(), SIX_BITS);
-    let second_scales = or(
-        shr_lit(and_lit(w0, MSB_TWO), 2),
-        and_lit(w2.clone(), MSB_SCALES),
-    );
-    let second_offsets = or(
-        shr_lit(and_lit(w1, MSB_TWO), 2),
-        shr_lit(and_lit(w2, MSB_OFFSET), 4),
-    );
-
-    let byte_of = |word: &TileExpr, i: u32| and_lit(shr_lit(word.clone(), i * 8), 0xff);
-    let scales = std::array::from_fn(|g| {
-        if g < 4 {
-            byte_of(&first_scales, g as u32)
-        } else {
-            byte_of(&second_scales, g as u32 - 4)
-        }
-    });
-    let offsets = std::array::from_fn(|g| {
-        if g < 4 {
-            byte_of(&first_offsets, g as u32)
-        } else {
-            byte_of(&second_offsets, g as u32 - 4)
-        }
-    });
-    (scales, offsets)
-}
-
 /// `scales[g] * d * q - offsets[g] * dmin`, shared by Q4K and Q5K.
 fn k4_lane(
     args: &BlockDecodeArgs<'_>,
@@ -199,56 +161,56 @@ fn decode_q6k(args: &BlockDecodeArgs<'_>, want: QLayout, name: &'static str) -> 
 
 /// Q4K, raw GGUF bytes: f16 `d`, f16 `dmin`, 12 packed group scales, 128
 /// nibble bytes.
-pub fn decode_q4k_native(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
+pub(crate) fn decode_q4k_native(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
     decode_k4(args, QFmt::Q4K, QLayout::Native, "decode_q4k_native")
 }
 
 /// Q4K with `d`/`dmin` widened to f32.
-pub fn decode_q4k_f32(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
+pub(crate) fn decode_q4k_f32(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
     decode_k4(args, QFmt::Q4K, QLayout::F32Scales, "decode_q4k_f32")
 }
 
 /// Q5K, raw GGUF bytes: Q4K plus a 32-byte high-bit plane.
-pub fn decode_q5k_native(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
+pub(crate) fn decode_q5k_native(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
     decode_k4(args, QFmt::Q5K, QLayout::Native, "decode_q5k_native")
 }
 
 /// Q5K with `d`/`dmin` widened to f32.
-pub fn decode_q5k_f32(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
+pub(crate) fn decode_q5k_f32(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
     decode_k4(args, QFmt::Q5K, QLayout::F32Scales, "decode_q5k_f32")
 }
 
 /// Q6K, raw GGUF bytes: the 210-byte block that is not word-aligned.
-pub fn decode_q6k_native(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
+pub(crate) fn decode_q6k_native(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
     decode_q6k(args, QLayout::Native, "decode_q6k_native")
 }
 
 /// Q6K with the super-block scale widened to f32; 212 bytes, word-aligned.
-pub fn decode_q6k_f32(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
+pub(crate) fn decode_q6k_f32(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
     decode_q6k(args, QLayout::F32Scales, "decode_q6k_f32")
 }
 
-pub const DECODE_Q4K_NATIVE: BlockProgram = BlockProgram {
+pub(crate) const DECODE_Q4K_NATIVE: BlockProgram = BlockProgram {
     name: "decode_q4k_native",
     emit: decode_q4k_native,
 };
-pub const DECODE_Q4K_F32: BlockProgram = BlockProgram {
+pub(crate) const DECODE_Q4K_F32: BlockProgram = BlockProgram {
     name: "decode_q4k_f32",
     emit: decode_q4k_f32,
 };
-pub const DECODE_Q5K_NATIVE: BlockProgram = BlockProgram {
+pub(crate) const DECODE_Q5K_NATIVE: BlockProgram = BlockProgram {
     name: "decode_q5k_native",
     emit: decode_q5k_native,
 };
-pub const DECODE_Q5K_F32: BlockProgram = BlockProgram {
+pub(crate) const DECODE_Q5K_F32: BlockProgram = BlockProgram {
     name: "decode_q5k_f32",
     emit: decode_q5k_f32,
 };
-pub const DECODE_Q6K_NATIVE: BlockProgram = BlockProgram {
+pub(crate) const DECODE_Q6K_NATIVE: BlockProgram = BlockProgram {
     name: "decode_q6k_native",
     emit: decode_q6k_native,
 };
-pub const DECODE_Q6K_F32: BlockProgram = BlockProgram {
+pub(crate) const DECODE_Q6K_F32: BlockProgram = BlockProgram {
     name: "decode_q6k_f32",
     emit: decode_q6k_f32,
 };

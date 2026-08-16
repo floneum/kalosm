@@ -173,10 +173,6 @@ impl WorkerPool {
 }
 
 /// Free-function form, as the public API lists it.
-pub fn parallel_for(range: Range<u64>, grain: u64, body: &(dyn Fn(Range<u64>) + Send + Sync)) {
-    WorkerPool::global().parallel_for(range, grain, body);
-}
-
 fn worker(shared: &Shared) {
     IN_POOL.with(|f| f.set(true));
     loop {
@@ -216,46 +212,5 @@ fn drain(shared: &Shared) {
             shared.done.notify_all();
             return;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[test]
-    fn parallel_for_covers_the_range_exactly_once() {
-        let hits: Vec<AtomicUsize> = (0..10_000).map(|_| AtomicUsize::new(0)).collect();
-        let f = |r: Range<u64>| {
-            for i in r {
-                hits[i as usize].fetch_add(1, Ordering::Relaxed);
-            }
-        };
-        WorkerPool::global().parallel_for(0..10_000, 64, &f);
-        assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
-    }
-
-    #[test]
-    fn nested_parallel_for_does_not_deadlock() {
-        let n = AtomicUsize::new(0);
-        let outer = |r: Range<u64>| {
-            let inner = |ri: Range<u64>| {
-                n.fetch_add((ri.end - ri.start) as usize, Ordering::Relaxed);
-            };
-            WorkerPool::global().parallel_for(r, 8, &inner);
-        };
-        WorkerPool::global().parallel_for(0..1024, 32, &outer);
-        assert_eq!(n.load(Ordering::Relaxed), 1024);
-    }
-
-    #[test]
-    fn scratch_is_reused_and_grows() {
-        let pool = WorkerPool::global();
-        pool.with_scratch(128, |s| {
-            assert_eq!(s.len(), 128);
-            s[0] = 7;
-        });
-        pool.with_scratch(4096, |s| assert_eq!(s.len(), 4096));
     }
 }

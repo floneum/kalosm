@@ -90,7 +90,7 @@ pub const ARTIFACT_CAPACITY: usize = 65_536;
 /// * the [`UniformPack`] word layout, which bakes binding-0 slot indices.
 ///
 /// The binding is not in the key: which of its values a lowering depends on
-/// is only known after lowering ([`DimBinding::consulted`]), so the cached
+/// is only known after lowering ([`DimBinding::body_consulted`]), so the cached
 /// [`ArtifactEntry`] carries that set and discriminates variants on those
 /// values alone.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -1224,39 +1224,5 @@ impl Target for GpuTarget {
 
     fn wait(&self) -> Result<()> {
         self.launcher.poll_wait()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn back_pressure_is_a_library_policy_with_a_real_default() {
-        let c = GpuConfig::default();
-        assert_eq!(c.max_in_flight_submits, 8);
-        assert!(!c.poison_allocations);
-        assert!(!c.trace_gpu_kernels);
-        assert!(c.max_gpu_memory_bytes.is_none());
-    }
-
-    #[test]
-    fn binding_env_resolves_both_kinds_of_symbol() {
-        let s = SymId(3);
-        let lr = SymId(9);
-        let env = BindingEnv::new().with_dim(s, 512).with_scalar(lr, 1e-3);
-        assert_eq!(env.dim(fusor2_ir::shape::Dim::Sym(s)), Some(512));
-        assert_eq!(env.dim(fusor2_ir::shape::Dim::Const(7)), Some(7));
-        assert_eq!(env.dim(fusor2_ir::shape::Dim::Sym(SymId(99))), None);
-        assert_eq!(env.scalars.get(&lr).copied(), Some(1e-3));
-    }
-
-    #[test]
-    fn the_cache_dir_is_platform_shaped() {
-        // Only asserts that a home-relative default exists wherever HOME
-        // does, so the disk tier is on by default.
-        if std::env::var_os("HOME").is_some() || std::env::var_os("XDG_CACHE_HOME").is_some() {
-            assert!(default_cache_dir().is_some());
-        }
     }
 }

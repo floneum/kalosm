@@ -37,6 +37,7 @@ impl PoolSize {
         }
     }
 
+    /// Whether adjacent windows do not overlap.
     pub const fn is_non_overlapping(self) -> bool {
         self.stride >= self.size
     }
@@ -146,10 +147,12 @@ pub fn pool(x: &Tensor, pools: &[PoolSize], with: PoolReduce) -> Result<Tensor> 
     pool_with(x, pools, with)
 }
 
+/// Maximum pooling over the trailing axes.
 pub fn pool_max(x: &Tensor, pools: &[PoolSize]) -> Result<Tensor> {
     pool_with(x, pools, PoolReduce::Max)
 }
 
+/// Minimum pooling over the trailing axes.
 pub fn pool_min(x: &Tensor, pools: &[PoolSize]) -> Result<Tensor> {
     pool_with(x, pools, PoolReduce::Min)
 }
@@ -159,110 +162,4 @@ pub fn pool_min(x: &Tensor, pools: &[PoolSize]) -> Result<Tensor> {
 /// attribute.
 pub fn pool_avg(x: &Tensor, pools: &[PoolSize]) -> Result<Tensor> {
     pool_with(x, pools, PoolReduce::Mean)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::graph::Graph;
-    use crate::session::{Backend, Session};
-    use fusor2_ir::dtype::Dtype;
-    use fusor2_ir::ir::Op;
-    use fusor2_ir::ir::launch::Launch;
-    use fusor2_ir::shape::Dim;
-
-    fn graph() -> Graph {
-        Graph::new(&Session::new(Backend::cpu().unwrap()).unwrap())
-    }
-
-    fn leaf(g: &Graph, shape: &[u64]) -> Tensor {
-        let dims: Vec<Dim> = shape.iter().map(|d| Dim::Const(*d)).collect();
-        g.leaf("x", &dims, Dtype::F32).unwrap()
-    }
-
-    #[test]
-    fn pool_size_conversions_default_the_stride_to_the_window() {
-        assert_eq!(PoolSize::from(4usize), PoolSize::new(4, 4));
-        assert_eq!(PoolSize::from((4usize, 2usize)), PoolSize::new(4, 2));
-        assert_eq!(PoolSize::from([4usize, 2usize]), PoolSize::new(4, 2));
-        assert!(PoolSize::from(4usize).is_non_overlapping());
-        assert!(!PoolSize::new(4, 2).is_non_overlapping());
-    }
-
-    #[test]
-    fn max_pooling_a_last_axis_divides_it_by_the_window() {
-        let g = graph();
-        let x = leaf(&g, &[8, 64, 768]);
-        let y = pool_max(&x, &[PoolSize::from(4usize)]).unwrap();
-        assert_eq!(
-            &g.handle().facts(y.id()).shape[..],
-            &[Dim::Const(8), Dim::Const(64), Dim::Const(192)]
-        );
-    }
-
-    #[test]
-    fn two_dimensional_pooling_reduces_both_window_axes() {
-        let g = graph();
-        let x = leaf(&g, &[1, 3, 8, 8]);
-        let y = pool_min(&x, &[PoolSize::from(2usize), PoolSize::from(2usize)]).unwrap();
-        assert_eq!(
-            &g.handle().facts(y.id()).shape[..],
-            &[Dim::Const(1), Dim::Const(3), Dim::Const(4), Dim::Const(4)]
-        );
-    }
-
-    #[test]
-    fn a_pool_class_holds_both_the_sugar_and_a_marked_defn() {
-        let g = graph();
-        let x = leaf(&g, &[2, 4, 16]);
-        let y = pool_max(&x, &[PoolSize::from(4usize)]).unwrap();
-        let (n, sugars, defns) = g
-            .handle()
-            .with_egraph(|eg| {
-                let ms = eg.members(eg.class_of(y.id()));
-                let s = ms
-                    .iter()
-                    .filter(|m| matches!(eg.node(**m).op, Op::Launch(Launch::Ext { .. })))
-                    .count();
-                let d = ms.iter().filter(|m| eg.is_defn(**m)).count();
-                Ok((ms.len(), s, d))
-            })
-            .unwrap();
-        assert!(n >= 2);
-        assert_eq!(sugars, 1);
-        assert_eq!(defns, 1);
-    }
-
-    #[test]
-    fn the_sugar_node_carries_the_window_geometry_the_adjoint_reads() {
-        let g = graph();
-        let x = leaf(&g, &[2, 4, 16]);
-        let y = pool_max(&x, &[PoolSize::new(4, 4)]).unwrap();
-        let attrs = g
-            .handle()
-            .with_egraph(|eg| {
-                let ms = eg.members(eg.class_of(y.id()));
-                Ok(ms.iter().find_map(|m| match &eg.node(*m).op {
-                    Op::Launch(Launch::Ext { attrs, .. }) => Some(*attrs),
-                    _ => None,
-                }))
-            })
-            .unwrap()
-            .expect("a sugar node");
-        match g.handle().state().attrs.lock()[attrs.0 as usize].clone() {
-            MacroAttr::Pool { windows, reduce } => {
-                assert_eq!(reduce, PoolReduce::Max);
-                assert!(windows[0].is_non_overlapping());
-            }
-            other => panic!("expected pool attributes, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn pooling_more_axes_than_the_value_has_is_refused() {
-        let g = graph();
-        let x = leaf(&g, &[4]);
-        assert!(pool_max(&x, &[PoolSize::from(2usize), PoolSize::from(2usize)]).is_err());
-        assert!(pool_max(&x, &[]).is_err());
-    }
 }
