@@ -568,7 +568,11 @@ fn scatter_set_unproven(session: &Session) -> CaseResult {
     )?;
     let i = from_u32(graph.handle(), &dims(&[2]), &[0u32, 4])
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let u = upload(graph.handle(), &dims(&[2, 3]), &Domain::Wide.sample(1091, 6))?;
+    let u = upload(
+        graph.handle(),
+        &dims(&[2, 3]),
+        &Domain::Wide.sample(1091, 6),
+    )?;
     if b.scatter_set(0, &i, &u, false).is_ok() {
         return Err(
             "scatter_set accepted an index without a uniqueness proof; the result \

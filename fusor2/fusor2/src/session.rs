@@ -16,8 +16,8 @@ use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::{Dtype, Persistence};
 use fusor2_ir::egraph::{EGraph, Id, Rule, Saturate, SaturationBudget, SaturationDelta};
 use fusor2_ir::extract::{ExtractBudget, Extractor, Plan, ReplayKey};
-use fusor2_ir::ir::logical::{Logical, LeafKind};
 use fusor2_ir::ir::launch::Effect;
+use fusor2_ir::ir::logical::{LeafKind, Logical};
 use fusor2_ir::ir::{Op, OpDefRegistry, Semantics};
 use fusor2_ir::saturate::Driver;
 use fusor2_ir::shape::Dim;
@@ -529,8 +529,7 @@ impl Session {
             .filter(|l| {
                 l.shape() != &facts.shape[..]
                     || !l.offset().known_eq(fusor2_ir::shape::Dim::Const(0))
-                    || l.strides()
-                        != &fusor2_ir::shape::Layout::row_major_strides(l.shape())[..]
+                    || l.strides() != &fusor2_ir::shape::Layout::row_major_strides(l.shape())[..]
             })
             .map(|l| {
                 restate_layout(&l, &facts.shape, graph).ok_or_else(|| {
@@ -567,12 +566,7 @@ impl Session {
         let mut out = Vec::with_capacity(count * elem as usize);
         let mut idx = vec![0u64; extents.len()];
         for _ in 0..count {
-            let flat = base
-                + idx
-                    .iter()
-                    .zip(&strides)
-                    .map(|(i, s)| i * s)
-                    .sum::<u64>();
+            let flat = base + idx.iter().zip(&strides).map(|(i, s)| i * s).sum::<u64>();
             let start = (flat * elem) as usize;
             let end = start + elem as usize;
             match raw.get(start..end) {
@@ -671,7 +665,11 @@ impl Session {
             }
             let elements = resolve_buffer_elements(buffer.elements, &buffer.layout, graph)?;
             let bytes = (elements * buffer.dtype.byte_size()).max(4);
-            let buf = self.inner.device.target().alloc(bytes, buffer.persistence)?;
+            let buf = self
+                .inner
+                .device
+                .target()
+                .alloc(bytes, buffer.persistence)?;
             to_bind.push((
                 buffer.value,
                 buf.clone(),
@@ -824,21 +822,19 @@ impl Session {
         let leaf = {
             let g = graph.state().egraph.lock();
             match &g.node(id).op {
-                Op::Logical(Logical::Leaf(k @ (LeafKind::Const { .. } | LeafKind::Uniform { .. }))) => {
-                    k.clone()
-                }
+                Op::Logical(Logical::Leaf(
+                    k @ (LeafKind::Const { .. } | LeafKind::Uniform { .. }),
+                )) => k.clone(),
                 _ => return Ok(None),
             }
         };
         let facts = graph.facts(id);
         let unit = match &leaf {
             LeafKind::Const { value, .. } => splat_bytes(*value),
-            LeafKind::Uniform { sym, .. } => {
-                splat_bytes(fusor2_autograd::tape::splat_of(
-                    facts.dtype,
-                    graph.uniform_value(*sym).unwrap_or(0.0),
-                )?)
-            }
+            LeafKind::Uniform { sym, .. } => splat_bytes(fusor2_autograd::tape::splat_of(
+                facts.dtype,
+                graph.uniform_value(*sym).unwrap_or(0.0),
+            )?),
             _ => return Ok(None),
         };
         let elements = resolve_elements(&facts.shape, graph)? as usize;
@@ -913,11 +909,14 @@ impl Session {
             return Ok(base);
         }
 
-        // Measurements are scored on the kernel's own GPU span, which needs
-        // the per-dispatch timestamp path on for the pass and off after it.
-        let _clock = TuningClock::new(&self.inner.device);
+        // A member sweep is a correctness pass, not a benchmark: its timings
+        // are discarded below, so one execution covers each candidate. Normal
+        // autotuning keeps the repeated samples and per-dispatch timestamps it
+        // needs for stable comparisons.
+        let repetitions = if verify_members { 1 } else { TUNE_RUNS };
+        let _clock = (!verify_members).then(|| TuningClock::new(&self.inner.device));
 
-        let Some(reference) = self.timed_run(guard, graph, &base, values)? else {
+        let Some(reference) = self.timed_run(guard, graph, &base, values, repetitions)? else {
             return Ok(base);
         };
         // The plan's identity across processes: every launch signature in
@@ -1024,7 +1023,9 @@ impl Session {
             };
             for (label, candidate) in variants {
                 let candidate = Arc::new(candidate);
-                let Ok(Some(sample)) = self.timed_run(guard, graph, &candidate, values) else {
+                let Ok(Some(sample)) =
+                    self.timed_run(guard, graph, &candidate, values, repetitions)
+                else {
                     continue;
                 };
                 let sample_ns = plan_ns(&sample);
@@ -1132,8 +1133,7 @@ impl Session {
                 if log {
                     eprintln!(
                         "[tune]   L{ix} {sample_ns:.0} ns  (own {} ns, {} ns wall)  {label}{}{}",
-                        launch_ns(&sample, ix)
-                            .map_or_else(|| "-".to_string(), |ns| ns.to_string()),
+                        launch_ns(&sample, ix).map_or_else(|| "-".to_string(), |ns| ns.to_string()),
                         sample.nanos,
                         if ok { "" } else { "  REJECTED: wrong values" },
                         if aligned {
@@ -1188,7 +1188,7 @@ impl Session {
         Ok(best)
     }
 
-    /// Run `plan` [`TUNE_RUNS`] times, keep the fastest, and read every
+    /// Run `plan` `repetitions` times, keep the fastest, and read every
     /// requested value back. `None` when nothing was readable.
     fn timed_run(
         &self,
@@ -1196,10 +1196,11 @@ impl Session {
         graph: &GraphRef,
         plan: &Plan,
         values: &[Tensor],
+        repetitions: usize,
     ) -> Result<Option<TuneSample>> {
         let mut nanos = u64::MAX;
         let mut gpu_us: Option<Vec<f64>> = None;
-        for _ in 0..TUNE_RUNS {
+        for _ in 0..repetitions {
             let t = Instant::now();
             self.run(graph, plan, values)?;
             self.inner.device.target().wait()?;
@@ -1341,7 +1342,10 @@ impl SaturationMemo {
         // than the whole node budget is still worth keeping.
         while entries.len() > 1
             && (entries.len() > SATURATION_MEMO_CAPACITY
-                || entries.iter().map(|d| d.prefix() + d.added()).sum::<usize>()
+                || entries
+                    .iter()
+                    .map(|d| d.prefix() + d.added())
+                    .sum::<usize>()
                     > SATURATION_MEMO_NODES)
         {
             entries.remove(0);
@@ -1375,19 +1379,16 @@ fn plans_align(candidate: &Plan, incumbent: &Plan, ix: usize) -> bool {
             .enumerate()
             .all(|(j, (c, b))| {
                 j == ix
-                    || (c.root == b.root
-                        && c.grid == b.grid
-                        && c.block == b.block
-                        && {
-                            // Member *order* is a realization detail —
-                            // `launch_signature` sorts for the same reason —
-                            // but the member set is the work.
-                            let mut cm: Vec<Id> = c.members.to_vec();
-                            let mut bm: Vec<Id> = b.members.to_vec();
-                            cm.sort_unstable();
-                            bm.sort_unstable();
-                            cm == bm
-                        })
+                    || (c.root == b.root && c.grid == b.grid && c.block == b.block && {
+                        // Member *order* is a realization detail —
+                        // `launch_signature` sorts for the same reason —
+                        // but the member set is the work.
+                        let mut cm: Vec<Id> = c.members.to_vec();
+                        let mut bm: Vec<Id> = b.members.to_vec();
+                        cm.sort_unstable();
+                        bm.sort_unstable();
+                        cm == bm
+                    })
             })
 }
 
@@ -1402,9 +1403,7 @@ fn batch_aligns(candidate: &Plan, incumbent: &Plan, swaps: &[(usize, String)]) -
             .iter()
             .zip(&incumbent.launches)
             .enumerate()
-            .all(|(j, (c, b))| {
-                swaps.iter().any(|(s, _)| *s == j) || launch_key(c) == launch_key(b)
-            })
+            .all(|(j, (c, b))| swaps.iter().any(|(s, _)| *s == j) || launch_key(c) == launch_key(b))
 }
 
 /// One launch's identity for plan diffing, hashed: the same fields
@@ -1667,12 +1666,7 @@ fn restate_layout(
     // exactly filling the padded 16 — and only the remainder decides which
     // reading was right, so a greedy walk mis-factors exactly the shapes a
     // backward pass produces.
-    fn assign(
-        l_ext: &[u64],
-        l_str: &[u64],
-        r_ext: &[u64],
-        strides: &mut Vec<u64>,
-    ) -> bool {
+    fn assign(l_ext: &[u64], l_str: &[u64], r_ext: &[u64], strides: &mut Vec<u64>) -> bool {
         let Some((&ext, l_rest)) = l_ext.split_first() else {
             // Layout exhausted: only unit reader dims may remain.
             if r_ext.iter().all(|&e| e == 1) {

@@ -14,7 +14,9 @@ use fusor2::layers::{Embedding, LayerNorm, LayerNormNd, Linear, RmsNorm};
 use fusor2::optim::{AdamW, clip_global_norm, cosine_decay};
 use fusor2::{Dtype, Session};
 
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fill_indices, from_u32, fuzz_case};
+use crate::harness::{
+    CaseError, CaseResult, Cases, FuzzDim, dims, fill_indices, from_u32, fuzz_case,
+};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
 /// A runtime-rank value as the const-rank one the layers take.
@@ -75,9 +77,12 @@ fn host_linear(
 
 pub fn cases() -> Cases {
     let mut cases = Cases::new();
-    cases.push_case(fuzz_case("layers", "linear_with_bias", LINEAR_SPEC, |s, sh, seed| {
-        linear_case(s, true, sh, seed)
-    }));
+    cases.push_case(fuzz_case(
+        "layers",
+        "linear_with_bias",
+        LINEAR_SPEC,
+        |s, sh, seed| linear_case(s, true, sh, seed),
+    ));
     cases.push_case(fuzz_case(
         "layers",
         "linear_without_bias",
@@ -225,7 +230,14 @@ fn linear_case(session: &Session, bias: bool, shape: &[u64], seed: u32) -> CaseR
     let layer = Linear::new(t::<2>(w), b.map(t::<1>));
     let y = layer.forward(&t::<2>(x)).into_dyn();
 
-    let expected = host_linear(&x_data, &w_data, bias.then_some(&b_data[..]), rows, inn, out);
+    let expected = host_linear(
+        &x_data,
+        &w_data,
+        bias.then_some(&b_data[..]),
+        rows,
+        inn,
+        out,
+    );
     expect_values(
         session,
         &[rows as u64, out as u64],

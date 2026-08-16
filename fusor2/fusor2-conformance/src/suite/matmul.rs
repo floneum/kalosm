@@ -81,9 +81,12 @@ pub fn cases() -> Cases {
         BROADCAST_BIAS_SPEC,
         broadcast_bias,
     ));
-    cases.push_case(fuzz_case("matmul", "q_mat_mul", QMATMUL_SPEC, |s, sh, seed| {
-        quantized_matmul(s, 2, sh, seed)
-    }));
+    cases.push_case(fuzz_case(
+        "matmul",
+        "q_mat_mul",
+        QMATMUL_SPEC,
+        |s, sh, seed| quantized_matmul(s, 2, sh, seed),
+    ));
     cases.push_case(fuzz_case(
         "matmul",
         "q_mat_mul_rank1",
@@ -448,7 +451,9 @@ fn quantized_matmul(session: &Session, act_rank: usize, shape: &[u64], seed: u32
     let mut weights = vec![0.0f32; rows as usize * k];
     for r in 0..rows as usize {
         let mut block = vec![0u8; block_bytes];
-        let mut state = seed.wrapping_add(7919 + r as u32).wrapping_mul(2_654_435_761);
+        let mut state = seed
+            .wrapping_add(7919 + r as u32)
+            .wrapping_mul(2_654_435_761);
         for slot in block.iter_mut() {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             *slot = (state >> 24) as u8;

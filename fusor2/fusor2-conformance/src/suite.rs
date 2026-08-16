@@ -120,6 +120,26 @@ pub mod support {
             .map_err(|e| -> CaseError { format!("sum_all: {e}").into() })
     }
 
+    /// Re-evaluate a scalar loss after replacing one f32 input leaf.
+    ///
+    /// Finite differences visit many values at one fixed shape. Reusing the
+    /// graph preserves every perturbation and dispatch while avoiding a fresh
+    /// graph build, saturation and extraction for each point.
+    pub fn read_probe_loss(input: &Tensor, loss: &Tensor, probe: &[f32]) -> Result<f32, CaseError> {
+        let mut bytes = Vec::with_capacity(std::mem::size_of_val(probe));
+        for value in probe {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        input
+            .set_bytes(bytes)
+            .map_err(|e| -> CaseError { e.to_string().into() })?;
+        // `resolve` deliberately returns early for an already-materialized
+        // root. The input update invalidates its leaf buffer; invalidate the
+        // requested loss as well so this perturbation executes the plan.
+        loss.clear_device_buf();
+        read_scalar(loss)
+    }
+
     /// Compare against a host-side reference at `dtype`'s tolerance.
     pub fn expect_values(
         session: &Session,
@@ -160,20 +180,6 @@ pub mod support {
         read(&g)
     }
 
-    /// Rebuild the graph at `probe` and return `sum(build(x))`. The loss
-    /// closure finite differences drive.
-    fn probe_loss(
-        session: &Session,
-        shape: &[Dim],
-        probe: &[f32],
-        build: &dyn Fn(&Tensor) -> fusor2::Result<Tensor>,
-    ) -> Result<f32, CaseError> {
-        let graph = graph_of(session);
-        let x = upload(graph.handle(), shape, probe)?;
-        let y = build(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
-        read_scalar(&loss_of(&y)?)
-    }
-
     /// Forward against a host reference, then backward against central
     /// differences. The shape every elementwise case takes.
     pub fn check_unary(
@@ -194,8 +200,12 @@ pub mod support {
 
         let analytic = gradient_of(&graph, &y, &x)?;
         let usize_shape: Vec<usize> = shape.iter().map(|n| *n as usize).collect();
+        let probe_graph = graph_of(session);
+        let probe_x = upload(probe_graph.handle(), &dimv, data)?;
+        let probe_y = build(&probe_x).map_err(|e| -> CaseError { e.to_string().into() })?;
+        let probe_loss = loss_of(&probe_y)?;
         let numeric = finite_difference_gradient(&usize_shape, data, &mut |probe| {
-            probe_loss(session, &dimv, probe, build)
+            read_probe_loss(&probe_x, &probe_loss, probe)
         })?;
         assert_gradient_matches_finite_difference(&analytic, &numeric)?;
         Ok(())
@@ -203,7 +213,7 @@ pub mod support {
 
     /// The shape a plain elementwise case fuzzes over: rank 2, both extents
     /// re-sampled per run. Extents stay small because every case also runs a
-    /// finite-difference backward, which rebuilds the graph once per element.
+    /// finite-difference backward at every element.
     pub const ELEMENTWISE_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(1, 16)];
 
     /// One unary elementwise case: forward parity plus a finite-difference
@@ -255,22 +265,24 @@ pub mod support {
             expect_values(session, shape, Dtype::F32, &actual, &expected)?;
 
             let d_lhs = gradient_of(&graph, &y, &a)?;
+            let lhs_graph = graph_of(session);
+            let lhs_a = upload(lhs_graph.handle(), &dimv, &lhs)?;
+            let lhs_b = upload(lhs_graph.handle(), &dimv, &rhs)?;
+            let lhs_y = build(&lhs_a, &lhs_b).map_err(|e| -> CaseError { e.to_string().into() })?;
+            let lhs_loss = loss_of(&lhs_y)?;
             let numeric_lhs = finite_difference_gradient(&usize_shape, &lhs, &mut |probe| {
-                let g = graph_of(session);
-                let a = upload(g.handle(), &dimv, probe)?;
-                let b = upload(g.handle(), &dimv, &rhs)?;
-                let y = build(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
-                read_scalar(&loss_of(&y)?)
+                read_probe_loss(&lhs_a, &lhs_loss, probe)
             })?;
             assert_gradient_matches_finite_difference(&d_lhs, &numeric_lhs)?;
 
             let d_rhs = gradient_of(&graph, &y, &b)?;
+            let rhs_graph = graph_of(session);
+            let rhs_a = upload(rhs_graph.handle(), &dimv, &lhs)?;
+            let rhs_b = upload(rhs_graph.handle(), &dimv, &rhs)?;
+            let rhs_y = build(&rhs_a, &rhs_b).map_err(|e| -> CaseError { e.to_string().into() })?;
+            let rhs_loss = loss_of(&rhs_y)?;
             let numeric_rhs = finite_difference_gradient(&usize_shape, &rhs, &mut |probe| {
-                let g = graph_of(session);
-                let a = upload(g.handle(), &dimv, &lhs)?;
-                let b = upload(g.handle(), &dimv, probe)?;
-                let y = build(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
-                read_scalar(&loss_of(&y)?)
+                read_probe_loss(&rhs_b, &rhs_loss, probe)
             })?;
             assert_gradient_matches_finite_difference(&d_rhs, &numeric_rhs)?;
             Ok(())
@@ -315,5 +327,4 @@ pub mod support {
             Ok(())
         })
     }
-
 }

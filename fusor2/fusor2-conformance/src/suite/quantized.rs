@@ -146,7 +146,11 @@ pub fn cases() -> Cases {
 
     for fmt in QFmt::ALL {
         for layout in [QLayout::Native, QLayout::F32Scales] {
-            let name = leak(format!("dequantize_{}_{}", fmt_name(fmt), layout_name(layout)));
+            let name = leak(format!(
+                "dequantize_{}_{}",
+                fmt_name(fmt),
+                layout_name(layout)
+            ));
             cases.push_case(fuzz_case(
                 "quantized",
                 name,
@@ -246,7 +250,7 @@ pub fn cases() -> Cases {
 /// still decodes to the same flat values, and only the dims betray the swap.
 fn qmatrix_load_orientation(session: &Session) -> CaseResult {
     use fusor2::Dim;
-    use fusor2_gguf::{Gguf, GgmlType, GgufMetadata, GgufTensor, VarBuilder};
+    use fusor2_gguf::{GgmlType, Gguf, GgufMetadata, GgufTensor, VarBuilder};
 
     let fmt = QFmt::Q4K;
     let layout = QLayout::Native;
@@ -313,7 +317,6 @@ fn qmatrix_load_orientation(session: &Session) -> CaseResult {
     Ok(())
 }
 
-
 /// A quantized matmul at a shape the cooperative-matrix path can take; the
 /// small-shape cases favor other contraction lowerings and do not exercise
 /// the cooperative path.
@@ -336,13 +339,21 @@ fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
     let blocks = ((k / be) * N) as usize;
     let (bytes, _) = block_rows(fmt, layout, 3301, blocks);
     let w = graph
-        .quantized(fmt, layout, [fusor2::Dim::Const(N), fusor2::Dim::Const(k)], &bytes)
+        .quantized(
+            fmt,
+            layout,
+            [fusor2::Dim::Const(N), fusor2::Dim::Const(k)],
+            &bytes,
+        )
         .map_err(|e| -> CaseError { format!("{fmt:?}: {e}").into() })?;
 
     let act = Domain::Wide.sample(3301, (M * k) as usize);
     let a = upload(graph.handle(), &dims(&[M, k]), &act)?;
 
-    let got = read(&a.matmul_t(&w).map_err(|e| -> CaseError { e.to_string().into() })?)?;
+    let got = read(
+        &a.matmul_t(&w)
+            .map_err(|e| -> CaseError { e.to_string().into() })?,
+    )?;
 
     // The oracle: the same contraction against the dequantized weight.
     let qm = QMatrix {
@@ -355,7 +366,10 @@ fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
     let dense = qm
         .dequantize()
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let want = read(&a.matmul_t(&dense).map_err(|e| -> CaseError { e.to_string().into() })?)?;
+    let want = read(
+        &a.matmul_t(&dense)
+            .map_err(|e| -> CaseError { e.to_string().into() })?,
+    )?;
 
     crate::compare::approx_or_relative_eq(
         backend_of(session),
@@ -490,7 +504,14 @@ fn dequantize_case(
 fn dequantize_defn_case(session: &Session, fmt: QFmt, layout: QLayout) -> CaseResult {
     let (bytes, expected) = quantized_rows(fmt, layout);
     let graph = graph_of(session);
-    let qm = matrix_from_parts(&graph, fmt, layout, &bytes, ROWS, fmt.block_elements() as u64)?;
+    let qm = matrix_from_parts(
+        &graph,
+        fmt,
+        layout,
+        &bytes,
+        ROWS,
+        fmt.block_elements() as u64,
+    )?;
     let dense = qm
         .dequantize_slow()
         .map_err(|e| -> CaseError { format!("{fmt:?}/{layout:?}: {e}").into() })?;

@@ -2,17 +2,18 @@
 //! gradient": `max`/`min` split evenly among ties, and `product` is
 //! zero-aware in three branches.
 
-use fusor2::{Dtype, Session};
 use fusor2::tensor::Dyn as Tensor;
+use fusor2::{Dtype, Session};
 
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
 use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fuzz_case};
 use crate::suite::support::{
-    Domain, expect_values, gradient_of, graph_of, loss_of, read, read_scalar, upload,
+    Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, read_scalar,
+    upload,
 };
 
 /// `[rows, axis]`. Every table case runs a finite-difference backward, which
-/// rebuilds the graph once per element, so the ceiling stays small.
+/// perturbs every element, so the ceiling stays small.
 const SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 4), FuzzDim::Range(1, 8)];
 
 type Reduce = fn(&Tensor) -> fusor2::Result<Tensor>;
@@ -674,11 +675,12 @@ fn reduction_case(
     expect_values(session, &out_shape, Dtype::F32, &actual, &expected)?;
 
     let analytic = gradient_of(&graph, &y, &x)?;
+    let probe_graph = graph_of(session);
+    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
+    let probe_y = op(&probe_x).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[rows as usize, axis as usize], &data, &mut |p| {
-        let g = graph_of(session);
-        let x = upload(g.handle(), &dimv, p)?;
-        let y = op(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
-        read_scalar(&loss_of(&y)?)
+        read_probe_loss(&probe_x, &probe_loss, p)
     })?;
     assert_gradient_matches_finite_difference(&analytic, &numeric)?;
     Ok(())

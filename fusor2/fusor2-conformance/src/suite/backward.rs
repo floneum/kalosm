@@ -15,7 +15,7 @@ use fusor2::{Dtype, Session};
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
 use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
 use crate::suite::support::{
-    Domain, ELEMENTWISE_SPEC, expect_values, gradient_of, graph_of, loss_of, read, read_scalar,
+    Domain, ELEMENTWISE_SPEC, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss,
     upload,
 };
 
@@ -194,7 +194,11 @@ pub fn cases() -> Cases {
         ANALYTIC_SPEC,
         seeded_case,
     ));
-    cases.push("backward", "backward_across_two_graphs_is_refused", cross_graph);
+    cases.push(
+        "backward",
+        "backward_across_two_graphs_is_refused",
+        cross_graph,
+    );
     cases.push_case(fuzz_case(
         "backward",
         "a_gradient_reaches_every_requires_grad_parent",
@@ -221,11 +225,12 @@ fn chain_case(
     let y = build(&x, shape).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     let analytic = gradient_of(&graph, &y, &x)?;
+    let probe_graph = graph_of(session);
+    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
+    let probe_y = build(&probe_x, shape).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&usize_shape(shape), &data, &mut |probe| {
-        let g = graph_of(session);
-        let x = upload(g.handle(), &dimv, probe)?;
-        let y = build(&x, shape).map_err(|e| -> CaseError { e.to_string().into() })?;
-        read_scalar(&loss_of(&y)?)
+        read_probe_loss(&probe_x, &probe_loss, probe)
     })?;
     assert_gradient_matches_finite_difference(&analytic, &numeric)
         .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;

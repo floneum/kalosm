@@ -4,17 +4,17 @@
 //! Every normalization here is a row program over the last axis: a max fold, a
 //! map, a sum fold and a divide.
 
-use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;
+use fusor2::{Dtype, Session};
 
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
 use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
 use crate::suite::support::{
-    Domain, expect_values, gradient_of, graph_of, loss_of, read, read_scalar, upload,
+    Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, upload,
 };
 
-/// `[rows, width]` for the finite-difference-backed cases. FD rebuilds the
-/// graph once per element, so the ceiling stays modest; width starts at 2 so a
+/// `[rows, width]` for the finite-difference-backed cases. The ceiling stays
+/// modest because every input element is perturbed; width starts at 2 so a
 /// row fold is never a single lane.
 const FD_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(2, 32)];
 
@@ -121,27 +121,41 @@ pub fn cases() -> Cases {
     let mut cases = Cases::new();
 
     for (name, build, reference) in plain_rows() {
-        cases.push_case(fuzz_case("normalization", name, FD_SPEC, move |s, shape, seed| {
-            row_case(s, shape, seed, name, build, reference)
-        }));
+        cases.push_case(fuzz_case(
+            "normalization",
+            name,
+            FD_SPEC,
+            move |s, shape, seed| row_case(s, shape, seed, name, build, reference),
+        ));
     }
 
     // The weighted spellings. Each is checked against `normalized * w (+ b)`
     // with a *non-constant* weight, so a lowering that drops the affine is a
     // value failure rather than a no-op.
-    cases.push_case(fuzz_case("normalization", "rms_norm", FD_SPEC, |s, shape, seed| {
-        weighted_case(s, shape, seed, "rms_norm", host_rms, false, |x, w, _| {
-            x.rms_norm(w, EPS)
-        })
-    }));
+    cases.push_case(fuzz_case(
+        "normalization",
+        "rms_norm",
+        FD_SPEC,
+        |s, shape, seed| {
+            weighted_case(s, shape, seed, "rms_norm", host_rms, false, |x, w, _| {
+                x.rms_norm(w, EPS)
+            })
+        },
+    ));
     cases.push_case(fuzz_case(
         "normalization",
         "rms_norm_with_bias",
         FD_SPEC,
         |s, shape, seed| {
-            weighted_case(s, shape, seed, "rms_norm_with_bias", host_rms, true, |x, w, b| {
-                x.rms_norm_with_bias(w, b.expect("bias"), EPS)
-            })
+            weighted_case(
+                s,
+                shape,
+                seed,
+                "rms_norm_with_bias",
+                host_rms,
+                true,
+                |x, w, b| x.rms_norm_with_bias(w, b.expect("bias"), EPS),
+            )
         },
     ));
     cases.push_case(fuzz_case(
@@ -281,11 +295,13 @@ fn row_case(
     expect_values(session, shape, Dtype::F32, &actual, &expected)?;
 
     let analytic = gradient_of(&graph, &y, &x)?;
+    let probe_graph = graph_of(session);
+    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
+    let probe_y =
+        build(&probe_x, width as u64).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[rows, width], &data, &mut |probe| {
-        let g = graph_of(session);
-        let x = upload(g.handle(), &dimv, probe)?;
-        let y = build(&x, width as u64).map_err(|e| -> CaseError { e.to_string().into() })?;
-        read_scalar(&loss_of(&y)?)
+        read_probe_loss(&probe_x, &probe_loss, probe)
     })?;
     assert_gradient_matches_finite_difference(&analytic, &numeric)?;
     Ok(())
@@ -326,15 +342,17 @@ fn weighted_case(
     expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)?;
 
     let d_x = gradient_of(&graph, &y, &x)?;
+    let probe_graph = graph_of(session);
+    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
+    let probe_w = upload(probe_graph.handle(), &wdim, &weight)?;
+    let probe_b = with_bias
+        .then(|| upload(probe_graph.handle(), &wdim, &bias))
+        .transpose()?;
+    let probe_y = build(&probe_x, &probe_w, probe_b.as_ref())
+        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[rows, width], &data, &mut |probe| {
-        let g = graph_of(session);
-        let x = upload(g.handle(), &dimv, probe)?;
-        let w = upload(g.handle(), &wdim, &weight)?;
-        let b = with_bias
-            .then(|| upload(g.handle(), &wdim, &bias))
-            .transpose()?;
-        let y = build(&x, &w, b.as_ref()).map_err(|e| -> CaseError { e.to_string().into() })?;
-        read_scalar(&loss_of(&y)?)
+        read_probe_loss(&probe_x, &probe_loss, probe)
     })?;
     assert_gradient_matches_finite_difference(&d_x, &numeric)?;
 
@@ -418,13 +436,14 @@ fn variance_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     expect_values(session, &[rows as u64], Dtype::F32, &read(&y)?, &expected)?;
 
     let analytic = gradient_of(&graph, &y, &x)?;
+    let probe_graph = graph_of(session);
+    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
+    let probe_y = probe_x
+        .variance_last()
+        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[rows, width], &data, &mut |probe| {
-        let g = graph_of(session);
-        let x = upload(g.handle(), &dimv, probe)?;
-        let y = x
-            .variance_last()
-            .map_err(|e| -> CaseError { e.to_string().into() })?;
-        read_scalar(&loss_of(&y)?)
+        read_probe_loss(&probe_x, &probe_loss, probe)
     })?;
     assert_gradient_matches_finite_difference(&analytic, &numeric)?;
     Ok(())

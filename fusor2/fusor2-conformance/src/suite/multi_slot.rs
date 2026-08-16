@@ -9,8 +9,8 @@
 //! The two carriers are the oracles from `fusor2_ir::carrier::oracle` —
 //! the same definitions that crate's unit tests run on the host evaluator.
 
-use fusor2::{Dtype, Session};
 use fusor2::tensor::Dyn as Tensor;
+use fusor2::{Dtype, Session};
 use fusor2_ir::carrier::{Carrier, oracle};
 use fusor2_ir::scalar::UnOp;
 

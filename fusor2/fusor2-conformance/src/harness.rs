@@ -11,8 +11,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use fusor2::graph::GraphRef;
 use fusor2::session::Backend;
-use fusor2::{Dim, Dtype, Session};
 use fusor2::tensor::Dyn as Tensor;
+use fusor2::{Dim, Dtype, Session};
 
 /// Error returned by a conformance case.
 pub type CaseError = Box<dyn std::error::Error>;
@@ -343,9 +343,7 @@ pub struct Rng {
 impl Rng {
     pub fn new(seed: u32) -> Self {
         // One warm-up step so nearby seeds separate immediately.
-        let mut rng = Self {
-            state: seed as u64,
-        };
+        let mut rng = Self { state: seed as u64 };
         rng.next_bits();
         rng
     }
@@ -427,9 +425,7 @@ pub fn fuzz_case(
                 let message = e.to_string();
                 match message.strip_prefix(SKIP_PREFIX) {
                     Some(why) => skip(format!("run {run} at shape {shape:?}: {why}")),
-                    None => {
-                        format!("run {run} at shape {shape:?} (seed {seed}): {message}").into()
-                    }
+                    None => format!("run {run} at shape {shape:?} (seed {seed}): {message}").into(),
                 }
             })?;
         }

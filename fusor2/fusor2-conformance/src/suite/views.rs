@@ -15,12 +15,12 @@ use fusor2::{Dtype, Session};
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
 use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fuzz_case};
 use crate::suite::support::{
-    Domain, expect_values, gradient_of, graph_of, loss_of, read, read_scalar, upload,
+    Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, upload,
 };
 
 /// The rank-3 source spec. Every single-input case also runs a
-/// finite-difference backward, which rebuilds the graph once per element, so
-/// the ceiling stays at 64 elements.
+/// finite-difference backward at every element, so the ceiling stays at 64
+/// elements.
 const SPEC3: &[FuzzDim] = &[
     FuzzDim::Range(1, 4),
     FuzzDim::Range(1, 4),
@@ -159,11 +159,12 @@ fn check_view(
     expect_values(session, &out_shape, Dtype::F32, &actual, &expected)?;
 
     let analytic = gradient_of(&graph, &y, &x)?;
+    let probe_graph = graph_of(session);
+    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
+    let probe_y = build(&probe_x).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[len], &data, &mut |probe| {
-        let g = graph_of(session);
-        let x = upload(g.handle(), &dimv, probe)?;
-        let y = build(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
-        read_scalar(&loss_of(&y)?)
+        read_probe_loss(&probe_x, &probe_loss, probe)
     })?;
     assert_gradient_matches_finite_difference(&analytic, &numeric)?;
     Ok(())
@@ -177,22 +178,14 @@ pub fn cases() -> Cases {
         let mut rng = Rng::new(seed ^ 0x5eed);
         let len = rng.range(1, c) as usize;
         let start = rng.range(0, c - len as u64) as usize;
-        check_view(
-            s,
-            shape,
-            seed,
-            &|x| x.narrow(2, start, len),
-            &|d| ref_slice(d, shape, 2, start, len),
-        )
+        check_view(s, shape, seed, &|x| x.narrow(2, start, len), &|d| {
+            ref_slice(d, shape, 2, start, len)
+        })
     }));
 
     cases.push_case(fuzz_case("views", "expand", SPEC3, |s, shape, seed| {
         let e = Rng::new(seed ^ 0x5eed).range(2, 5);
-        let (a, b, c) = (
-            shape[0] as usize,
-            shape[1] as usize,
-            shape[2] as usize,
-        );
+        let (a, b, c) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
         check_view(
             s,
             shape,
@@ -215,22 +208,13 @@ pub fn cases() -> Cases {
 
     cases.push_case(fuzz_case("views", "repeat", SPEC3, |s, shape, seed| {
         let r = Rng::new(seed ^ 0x5eed).range(2, 3) as usize;
-        check_view(
-            s,
-            shape,
-            seed,
-            &|x| x.repeat(&[r, 1, 1]),
-            &|d| {
-                let mut out = Vec::with_capacity(r * d.len());
-                for _ in 0..r {
-                    out.extend_from_slice(d);
-                }
-                (
-                    vec![r as u64 * shape[0], shape[1], shape[2]],
-                    out,
-                )
-            },
-        )
+        check_view(s, shape, seed, &|x| x.repeat(&[r, 1, 1]), &|d| {
+            let mut out = Vec::with_capacity(r * d.len());
+            for _ in 0..r {
+                out.extend_from_slice(d);
+            }
+            (vec![r as u64 * shape[0], shape[1], shape[2]], out)
+        })
     }));
 
     // Any factorization of the element count is a legal resize; `[c, a*b]`
@@ -246,13 +230,9 @@ pub fn cases() -> Cases {
     }));
 
     cases.push_case(fuzz_case("views", "restride", SPEC3, |s, shape, seed| {
-        check_view(
-            s,
-            shape,
-            seed,
-            &|x| x.permute(&[2, 0, 1]),
-            &|d| ref_permute(d, shape, &[2, 0, 1]),
-        )
+        check_view(s, shape, seed, &|x| x.permute(&[2, 0, 1]), &|d| {
+            ref_permute(d, shape, &[2, 0, 1])
+        })
     }));
 
     cases.push_case(fuzz_case(
@@ -262,13 +242,9 @@ pub fn cases() -> Cases {
         |s, shape, seed| {
             let c = shape[2];
             let w = Rng::new(seed ^ 0x5eed).range(2, c - 1);
-            check_view(
-                s,
-                shape,
-                seed,
-                &|x| x.windows(2, w as u32, 1),
-                &|d| ref_windows(d, shape, w as usize, 1),
-            )
+            check_view(s, shape, seed, &|x| x.windows(2, w as u32, 1), &|d| {
+                ref_windows(d, shape, w as usize, 1)
+            })
         },
     ));
 
@@ -277,13 +253,9 @@ pub fn cases() -> Cases {
         "restride_layout",
         SPEC3,
         |s, shape, seed| {
-            check_view(
-                s,
-                shape,
-                seed,
-                &|x| x.transpose(0, 2),
-                &|d| ref_permute(d, shape, &[2, 1, 0]),
-            )
+            check_view(s, shape, seed, &|x| x.transpose(0, 2), &|d| {
+                ref_permute(d, shape, &[2, 1, 0])
+            })
         },
     ));
 
@@ -323,13 +295,9 @@ pub fn cases() -> Cases {
     ));
 
     cases.push_case(fuzz_case("views", "squeeze", SPEC3, |s, shape, seed| {
-        check_view(
-            s,
-            shape,
-            seed,
-            &|x| x.unsqueeze(1)?.squeeze(1),
-            &|d| (shape.to_vec(), d.to_vec()),
-        )
+        check_view(s, shape, seed, &|x| x.unsqueeze(1)?.squeeze(1), &|d| {
+            (shape.to_vec(), d.to_vec())
+        })
     }));
 
     cases.push_case(fuzz_case(
@@ -348,13 +316,9 @@ pub fn cases() -> Cases {
     ));
 
     cases.push_case(fuzz_case("views", "unsqueeze", SPEC3, |s, shape, seed| {
-        check_view(
-            s,
-            shape,
-            seed,
-            &|x| x.unsqueeze(1),
-            &|d| (vec![shape[0], 1, shape[1], shape[2]], d.to_vec()),
-        )
+        check_view(s, shape, seed, &|x| x.unsqueeze(1), &|d| {
+            (vec![shape[0], 1, shape[1], shape[2]], d.to_vec())
+        })
     }));
 
     cases.push_case(fuzz_case(
@@ -362,13 +326,9 @@ pub fn cases() -> Cases {
         "unsqueeze_dims",
         SPEC3,
         |s, shape, seed| {
-            check_view(
-                s,
-                shape,
-                seed,
-                &|x| x.unsqueeze(0)?.unsqueeze(4),
-                &|d| (vec![1, shape[0], shape[1], shape[2], 1], d.to_vec()),
-            )
+            check_view(s, shape, seed, &|x| x.unsqueeze(0)?.unsqueeze(4), &|d| {
+                (vec![1, shape[0], shape[1], shape[2], 1], d.to_vec())
+            })
         },
     ));
 
@@ -377,13 +337,9 @@ pub fn cases() -> Cases {
         "flatten_all",
         SPEC3,
         |s, shape, seed| {
-            check_view(
-                s,
-                shape,
-                seed,
-                &|x| x.flatten_all(),
-                &|d| (vec![shape[0] * shape[1] * shape[2]], d.to_vec()),
-            )
+            check_view(s, shape, seed, &|x| x.flatten_all(), &|d| {
+                (vec![shape[0] * shape[1] * shape[2]], d.to_vec())
+            })
         },
     ));
 
@@ -392,13 +348,9 @@ pub fn cases() -> Cases {
         "flatten_first_n",
         SPEC3,
         |s, shape, seed| {
-            check_view(
-                s,
-                shape,
-                seed,
-                &|x| x.flatten(0, 1),
-                &|d| (vec![shape[0] * shape[1], shape[2]], d.to_vec()),
-            )
+            check_view(s, shape, seed, &|x| x.flatten(0, 1), &|d| {
+                (vec![shape[0] * shape[1], shape[2]], d.to_vec())
+            })
         },
     ));
 
@@ -407,13 +359,9 @@ pub fn cases() -> Cases {
         "flatten_last_n",
         SPEC3,
         |s, shape, seed| {
-            check_view(
-                s,
-                shape,
-                seed,
-                &|x| x.flatten(1, 2),
-                &|d| (vec![shape[0], shape[1] * shape[2]], d.to_vec()),
-            )
+            check_view(s, shape, seed, &|x| x.flatten(1, 2), &|d| {
+                (vec![shape[0], shape[1] * shape[2]], d.to_vec())
+            })
         },
     ));
 
@@ -421,13 +369,9 @@ pub fn cases() -> Cases {
         let mut rng = Rng::new(seed ^ 0x5eed);
         let lo = rng.range(0, 2) as usize;
         let hi = rng.range(0, 2) as usize;
-        check_view(
-            s,
-            shape,
-            seed,
-            &|x| x.pad_axis(2, (lo, hi)),
-            &|d| ref_pad(d, shape, 2, lo, hi),
-        )
+        check_view(s, shape, seed, &|x| x.pad_axis(2, (lo, hi)), &|d| {
+            ref_pad(d, shape, 2, lo, hi)
+        })
     }));
 
     cases.push_case(fuzz_case(
@@ -438,35 +382,23 @@ pub fn cases() -> Cases {
             let mut rng = Rng::new(seed ^ 0x5eed);
             let lo = rng.range(0, 2) as usize;
             let hi = rng.range(0, 2) as usize;
-            check_view(
-                s,
-                shape,
-                seed,
-                &|x| x.pad_with_zeros(0, lo, hi),
-                &|d| ref_pad(d, shape, 0, lo, hi),
-            )
+            check_view(s, shape, seed, &|x| x.pad_with_zeros(0, lo, hi), &|d| {
+                ref_pad(d, shape, 0, lo, hi)
+            })
         },
     ));
 
     cases.push_case(fuzz_case("views", "t", SPEC3, |s, shape, seed| {
-        check_view(
-            s,
-            shape,
-            seed,
-            &|x| x.transpose(1, 2),
-            &|d| ref_permute(d, shape, &[0, 2, 1]),
-        )
+        check_view(s, shape, seed, &|x| x.transpose(1, 2), &|d| {
+            ref_permute(d, shape, &[0, 2, 1])
+        })
     }));
 
     cases.push_case(fuzz_case("views", "chunk", SPEC3, |s, shape, seed| {
         let len = Rng::new(seed ^ 0x5eed).range(1, shape[1]) as usize;
-        check_view(
-            s,
-            shape,
-            seed,
-            &|x| x.narrow(1, 0, len),
-            &|d| ref_slice(d, shape, 1, 0, len),
-        )
+        check_view(s, shape, seed, &|x| x.narrow(1, 0, len), &|d| {
+            ref_slice(d, shape, 1, 0, len)
+        })
     }));
 
     // `cat` along each of the three axes, at both ranks the reference covers.
@@ -622,10 +554,7 @@ fn slice_assign_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult 
         &patch_data,
     )?;
     let y = base
-        .slice_assign(
-            &[start0..start0 + len0, start1..start1 + len1],
-            &patch,
-        )
+        .slice_assign(&[start0..start0 + len0, start1..start1 + len1], &patch)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let actual = read(&y)?;
@@ -641,8 +570,8 @@ fn slice_assign_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult 
     let d_base = gradient_of(&graph, &y, &base)?;
     for row in 0..rows {
         for col in 0..cols {
-            let inside = (start0..start0 + len0).contains(&row)
-                && (start1..start1 + len1).contains(&col);
+            let inside =
+                (start0..start0 + len0).contains(&row) && (start1..start1 + len1).contains(&col);
             let want = f32::from(!inside);
             let got = d_base[row * cols + col];
             if (got - want).abs() > 1e-5 {

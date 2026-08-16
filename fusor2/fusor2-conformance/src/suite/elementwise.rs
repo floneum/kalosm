@@ -4,8 +4,8 @@
 //! Every one of these is one `Map` with a different `ScalarExpr`, so this
 //! suite is really a `ScalarExpr` test.
 
-use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;
+use fusor2::{Dtype, Session};
 
 use crate::compare::{
     assert_all_zero, assert_gradient_matches_finite_difference, finite_difference_gradient,
@@ -14,7 +14,7 @@ use crate::compare::{
 use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dense_len, dims, fuzz_case, is_gpu};
 use crate::suite::support::{
     BinaryOp, Domain, ELEMENTWISE_SPEC, UnaryOp, binary_case, comparison_case, expect_values,
-    gradient_of, graph_of, loss_of, read, read_scalar, unary_case, upload,
+    gradient_of, graph_of, loss_of, read, read_probe_loss, unary_case, upload,
 };
 
 /// The forward-only rows take no gradient, so they can afford multi-workgroup
@@ -389,12 +389,13 @@ fn broadcast_case(
         )
         .into());
     }
+    let probe_graph = graph_of(session);
+    let probe_a = upload(probe_graph.handle(), &dims(&[rows, cols]), &lhs)?;
+    let probe_b = upload(probe_graph.handle(), &dims(&[cols]), &rhs)?;
+    let probe_y = op(&probe_a, &probe_b).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[cols as usize], &rhs, &mut |probe| {
-        let g = graph_of(session);
-        let a = upload(g.handle(), &dims(&[rows, cols]), &lhs)?;
-        let b = upload(g.handle(), &dims(&[cols]), probe)?;
-        let y = op(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
-        read_scalar(&loss_of(&y)?)
+        read_probe_loss(&probe_b, &probe_loss, probe)
     })?;
     assert_gradient_matches_finite_difference(&d_rhs, &numeric)?;
     Ok(())
@@ -427,12 +428,13 @@ fn expr_case(
     expect_values(session, shape, Dtype::F32, &actual, &expected)?;
 
     let analytic = gradient_of(&graph, &y, &a)?;
+    let probe_graph = graph_of(session);
+    let probe_a = upload(probe_graph.handle(), &dimv, &lhs)?;
+    let probe_b = upload(probe_graph.handle(), &dimv, &rhs)?;
+    let probe_y = build(&probe_a, &probe_b).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[len], &lhs, &mut |probe| {
-        let g = graph_of(session);
-        let a = upload(g.handle(), &dimv, probe)?;
-        let b = upload(g.handle(), &dimv, &rhs)?;
-        let y = build(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
-        read_scalar(&loss_of(&y)?)
+        read_probe_loss(&probe_a, &probe_loss, probe)
     })?;
     assert_gradient_matches_finite_difference(&analytic, &numeric)?;
     Ok(())

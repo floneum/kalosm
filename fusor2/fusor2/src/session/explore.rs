@@ -225,9 +225,7 @@ impl ArmSet {
             .map(|l| launch_signature(&g, l))
             .collect();
         let incumbent_labels: Vec<String> = (0..incumbent.launches.len())
-            .map(|ix| {
-                incumbent_signature(&g, incumbent, ix).unwrap_or_else(|| "base".to_string())
-            })
+            .map(|ix| incumbent_signature(&g, incumbent, ix).unwrap_or_else(|| "base".to_string()))
             .collect();
         // Heaviest work first: `pending` pops from the back, so it is stored
         // ascending by work.
@@ -469,11 +467,12 @@ impl Session {
         // Advance the frontier: when the current launch's field is explored
         // out (every arm has MIN_OBS window samples), open the next launch's.
         // Opening a field names its candidates and builds none of them.
-        if set
-            .arms
-            .iter()
-            .all(|a| self.inner.tune.observations(set.arm_field(a).0, set.arm_field(a).1) >= MIN_OBS)
-        {
+        if set.arms.iter().all(|a| {
+            self.inner
+                .tune
+                .observations(set.arm_field(a).0, set.arm_field(a).1)
+                >= MIN_OBS
+        }) {
             set.arms.clear();
             while let Some(ix) = set.pending.pop() {
                 let labels = {
@@ -594,7 +593,9 @@ impl Session {
         };
         // Time exactly the launches the comparison reads; only a whole-plan
         // arm leaves the focus unset.
-        if !run.whole && let Backend::Gpu(t) = &self.inner.device {
+        if !run.whole
+            && let Backend::Gpu(t) = &self.inner.device
+        {
             t.launcher().set_tuning_focus(Some(focus));
         }
         Some(run)
@@ -935,8 +936,7 @@ impl Session {
                     .collect();
                 let labels: Vec<String> = (0..current.launches.len())
                     .map(|ix| {
-                        incumbent_signature(&g, &current, ix)
-                            .unwrap_or_else(|| "base".to_string())
+                        incumbent_signature(&g, &current, ix).unwrap_or_else(|| "base".to_string())
                     })
                     .collect();
                 let works: Vec<u64> = (0..current.launches.len())

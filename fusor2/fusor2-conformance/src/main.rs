@@ -37,7 +37,10 @@ fn main() -> ExitCode {
     let failures = harness::summarize(&reports);
 
     // A run that executed nothing is not a green run.
-    let ran = reports.iter().filter(|r| !matches!(r.outcome, Outcome::Skipped(_))).count();
+    let ran = reports
+        .iter()
+        .filter(|r| !matches!(r.outcome, Outcome::Skipped(_)))
+        .count();
     if ran == 0 {
         println!("nothing ran; refusing to report success");
         return ExitCode::FAILURE;

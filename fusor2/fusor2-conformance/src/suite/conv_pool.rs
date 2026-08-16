@@ -5,15 +5,14 @@
 //! graph contains no `Scatter` node.
 
 use fusor2::composite::{
-    PoolSize, conv, grouped_conv as grouped_conv_op, pool_avg, pool_max, pool_min,
-    upsample_nearest,
+    PoolSize, conv, grouped_conv as grouped_conv_op, pool_avg, pool_max, pool_min, upsample_nearest,
 };
 use fusor2::{Dim, Dtype, Session};
 
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
 use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
 use crate::suite::support::{
-    Domain, expect_values, gradient_of, graph_of, loss_of, read, read_scalar, upload,
+    Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, upload,
 };
 
 // Spatial extents start at 3 so they never fall under the kernel extent
@@ -168,7 +167,16 @@ fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let (out_len, expected) = host_conv1d(
-        &x_data, &w_data, &b_data, batch, in_ch, len, out_ch, k, k / 2, 1,
+        &x_data,
+        &w_data,
+        &b_data,
+        batch,
+        in_ch,
+        len,
+        out_ch,
+        k,
+        k / 2,
+        1,
     );
     expect_values(
         session,
@@ -188,22 +196,30 @@ fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     }
 
     let d_w = gradient_of(&graph, &y, &w)?;
+    let probe_graph = graph_of(session);
+    let probe_x = upload(
+        probe_graph.handle(),
+        &dims(&[batch as u64, in_ch as u64, len as u64]),
+        &x_data,
+    )?;
+    let probe_w = upload(
+        probe_graph.handle(),
+        &dims(&[out_ch as u64, in_ch as u64, k as u64]),
+        &w_data,
+    )?;
+    let probe_b = upload(probe_graph.handle(), &dims(&[out_ch as u64]), &b_data)?;
+    let probe_y = conv(
+        &probe_x,
+        &probe_w,
+        Some(&probe_b),
+        &[1],
+        &[k as u32 / 2],
+        &[1],
+    )
+    .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[out_ch * in_ch * k], &w_data, &mut |probe| {
-        let g = graph_of(session);
-        let x = upload(
-            g.handle(),
-            &dims(&[batch as u64, in_ch as u64, len as u64]),
-            &x_data,
-        )?;
-        let w = upload(
-            g.handle(),
-            &dims(&[out_ch as u64, in_ch as u64, k as u64]),
-            probe,
-        )?;
-        let b = upload(g.handle(), &dims(&[out_ch as u64]), &b_data)?;
-        let y = conv(&x, &w, Some(&b), &[1], &[k as u32 / 2], &[1])
-            .map_err(|e| -> CaseError { e.to_string().into() })?;
-        read_scalar(&loss_of(&y)?)
+        read_probe_loss(&probe_w, &probe_loss, probe)
     })?;
     assert_gradient_matches_finite_difference(&d_w, &numeric)?;
     Ok(())
@@ -298,9 +314,8 @@ fn grouped_conv(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         &dims(&[out_ch as u64, per_group_in as u64, k as u64]),
         &w_data,
     )?;
-    let y =
-        grouped_conv_op(&x, &w, None, &[1], &[1], &[1], groups as u32)
-            .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = grouped_conv_op(&x, &w, None, &[1], &[1], &[1], groups as u32)
+        .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let out_len = len + 2 - k + 1;
     let mut expected = vec![0.0f32; batch * out_ch * out_len];

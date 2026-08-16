@@ -8,17 +8,18 @@
 
 use fusor2::composite::{
     attention, attention_causal, attention_grads, attention_lse, attention_masked,
-    attention_with_lse,
-    base_inverse_frequency, rope, rope_interleaved, rope_interleaved_pair,
+    attention_with_lse, base_inverse_frequency, rope, rope_interleaved, rope_interleaved_pair,
     rope_interleaved_pair_with_position, rope_interleaved_with_position, rope_pair,
     rope_pair_with_position, rope_with_position, rotate_half,
 };
 use fusor2::graph::GraphRef;
-use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;
+use fusor2::{Dtype, Session};
 use fusor2_ir::ir::launch::MaskKind;
 
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, from_u32, fuzz_case};
+use crate::harness::{
+    CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, from_u32, fuzz_case,
+};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
 /// One sampled attention problem. `dh` is even because every RoPE pairing
@@ -352,14 +353,20 @@ fn host_rope_vec(
 }
 
 /// The whole `[B, H, L, Dh]` rope, row `l` reading table row `offset + l`.
-fn host_rope(x: &[f32], cos: &[f32], sin: &[f32], d: RopeDims, offset: usize, il: bool) -> Vec<f32> {
+fn host_rope(
+    x: &[f32],
+    cos: &[f32],
+    sin: &[f32],
+    d: RopeDims,
+    offset: usize,
+    il: bool,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; x.len()];
     for b in 0..d.b {
         for h in 0..d.h {
             for l in 0..d.l {
                 let base = ((b * d.h + h) * d.l + l) * d.dh;
-                let rotated =
-                    host_rope_vec(&x[base..base + d.dh], cos, sin, offset + l, d.dh, il);
+                let rotated = host_rope_vec(&x[base..base + d.dh], cos, sin, offset + l, d.dh, il);
                 out[base..base + d.dh].copy_from_slice(&rotated);
             }
         }
@@ -384,11 +391,21 @@ fn rope_tables(dh: usize, max_len: usize) -> (Vec<f32>, Vec<f32>) {
 pub fn cases() -> Cases {
     let mut cases = Cases::new();
 
-    cases.push_case(fuzz_case("attention_rope", "attention", ATTN_SPEC, |s, shape, seed| {
-        attention_case(s, seed, "attention", dense_dims(shape), &no_mask, |q, k, v| {
-            attention(q, k, v, MaskKind::None, None)
-        })
-    }));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "attention",
+        ATTN_SPEC,
+        |s, shape, seed| {
+            attention_case(
+                s,
+                seed,
+                "attention",
+                dense_dims(shape),
+                &no_mask,
+                |q, k, v| attention(q, k, v, MaskKind::None, None),
+            )
+        },
+    ));
     cases.push_case(fuzz_case(
         "attention_rope",
         "attention_causal",
@@ -432,9 +449,14 @@ pub fn cases() -> Cases {
         "attention_gqa",
         GQA_SPEC,
         |s, shape, seed| {
-            attention_case(s, seed, "attention_gqa", gqa_dims(shape), &no_mask, |q, k, v| {
-                attention(q, k, v, MaskKind::None, None)
-            })
+            attention_case(
+                s,
+                seed,
+                "attention_gqa",
+                gqa_dims(shape),
+                &no_mask,
+                |q, k, v| attention(q, k, v, MaskKind::None, None),
+            )
         },
     ));
     cases.push_case(fuzz_case(
@@ -496,15 +518,26 @@ pub fn cases() -> Cases {
     ));
 
     // Every rope spelling is checked against the same host rotation.
-    cases.push_case(fuzz_case("attention_rope", "rope", ROPE_SPEC, |s, shape, seed| {
-        rope_case(s, seed, "rope", rope_dims(shape), false, 0, rope)
-    }));
+    cases.push_case(fuzz_case(
+        "attention_rope",
+        "rope",
+        ROPE_SPEC,
+        |s, shape, seed| rope_case(s, seed, "rope", rope_dims(shape), false, 0, rope),
+    ));
     cases.push_case(fuzz_case(
         "attention_rope",
         "rope_interleaved",
         ROPE_SPEC,
         |s, shape, seed| {
-            rope_case(s, seed, "rope_interleaved", rope_dims(shape), true, 0, rope_interleaved)
+            rope_case(
+                s,
+                seed,
+                "rope_interleaved",
+                rope_dims(shape),
+                true,
+                0,
+                rope_interleaved,
+            )
         },
     ));
     cases.push_case(fuzz_case(
@@ -515,7 +548,15 @@ pub fn cases() -> Cases {
             // The offset is sampled apart from the shape stream, and nonzero
             // so the case never degenerates into plain `rope`.
             let offset = Rng::new(seed ^ 0x5eed).range(1, 6);
-            rope_case(s, seed, "rope_offset", rope_dims(shape), false, offset, rope)
+            rope_case(
+                s,
+                seed,
+                "rope_offset",
+                rope_dims(shape),
+                false,
+                offset,
+                rope,
+            )
         },
     ));
     cases.push_case(fuzz_case(
@@ -937,7 +978,14 @@ fn rope_pair_case(
 }
 
 /// Rotate each row by the position its `u32` entry names.
-fn host_rope_at(data: &[f32], cos: &[f32], sin: &[f32], pos: &[u32], d: RopeDims, il: bool) -> Vec<f32> {
+fn host_rope_at(
+    data: &[f32],
+    cos: &[f32],
+    sin: &[f32],
+    pos: &[u32],
+    d: RopeDims,
+    il: bool,
+) -> Vec<f32> {
     let mut expected = vec![0.0f32; data.len()];
     for b in 0..d.b {
         for h in 0..d.h {
@@ -1086,6 +1134,13 @@ fn rope_backward(session: &Session, d: RopeDims, seed: u32) -> CaseResult {
             }
         }
     }
-    crate::compare::approx_or_relative_eq(backend_of(session), &[d.len()], &want, &got, 1e-4, 1e-4)?;
+    crate::compare::approx_or_relative_eq(
+        backend_of(session),
+        &[d.len()],
+        &want,
+        &got,
+        1e-4,
+        1e-4,
+    )?;
     Ok(())
 }

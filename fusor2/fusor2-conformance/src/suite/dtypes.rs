@@ -10,8 +10,8 @@
 //! [`crate::harness::skip`], so the run log says `skip` and names the missing
 //! capability — never `ok`.
 
-use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;
+use fusor2::{Dtype, Session};
 use half::{bf16, f16};
 
 use crate::harness::{
