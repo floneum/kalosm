@@ -6,8 +6,8 @@
 //!
 //! This pins intended names and type identities. It cannot detect an extra
 //! reachable export; `unreachable_pub` catches accidental exports behind a
-//! private module, while review of this file and `API.md` governs additions to
-//! the reachable surface.
+//! private module, while review of this file governs additions to the
+//! reachable surface.
 //!
 //! Test-only. It defines no public item and calls nothing.
 

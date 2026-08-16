@@ -376,9 +376,8 @@ codegen-units = 1
 [profile.dev.package."*"]
 opt-level = 3
 
-# fusor's kernels need released naga 29 plus one correctness patch
-# (`CooperativeLoad` in `bake_ref_count`, so a simdgroup load cannot sink past
-# its barrier). Patch tables only apply from the build root, so the vendored
-# copy is named here as well as in fusor's own workspace.
+# Fusor's kernels use Naga from the ealmloff/wgpu fork, including the
+# `CooperativeLoad` correctness fix in `bake_ref_count`. Patch tables only apply
+# from the build root, so the same revision is named in Fusor's own workspace.
 [patch.crates-io]
-naga = { path = "fusor/vendor/naga" }
+naga = { git = "https://github.com/ealmloff/wgpu", rev = "c4f55cabaadc22b942c1dd8894bf85f17f2718dc" }

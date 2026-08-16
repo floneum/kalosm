@@ -59,10 +59,8 @@ naga = "29"
 # register accumulator tile expressible; a width-erased API structurally cannot.
 fearless_simd = "0.4"
 
-# Released naga 29.0.4 with one correctness patch: `CooperativeLoad` joins
-# `Load` in `bake_ref_count`, so a simdgroup load referenced once is still
-# baked into a temporary and cannot sink past the barrier its Emit statement
-# ordered it against. Upstreaming tracked; the same fix was verified on the
-# historical wgpu fork used by the removed implementation.
+# Use Naga from the ealmloff/wgpu fork. It includes the
+# `CooperativeLoad` correctness fix in `bake_ref_count`, so a simdgroup load
+# referenced once cannot sink past the barrier that ordered it.
 [patch.crates-io]
-naga = { path = "vendor/naga" }
+naga = { git = "https://github.com/ealmloff/wgpu", rev = "c4f55cabaadc22b942c1dd8894bf85f17f2718dc" }

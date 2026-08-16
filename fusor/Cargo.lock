@@ -493,7 +493,8 @@ dependencies = [
 
 [[package]]
 name = "naga"
-version = "29.0.4"
+version = "29.0.3"
+source = "git+https://github.com/ealmloff/wgpu?rev=c4f55cabaadc22b942c1dd8894bf85f17f2718dc#c4f55cabaadc22b942c1dd8894bf85f17f2718dc"
 dependencies = [
  "arrayvec",
  "bit-set",
